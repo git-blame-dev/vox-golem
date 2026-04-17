@@ -30,15 +30,41 @@ pub enum OpencodePromptError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpencodeCommandSpec {
     executable_path: PathBuf,
+    output_format: OpencodeOutputFormat,
     args: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpencodeRunResult {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<i32>,
+}
+
+impl OpencodeRunResult {
+    pub fn succeeded(&self) -> bool {
+        self.exit_code == Some(0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpencodeOutputFormat {
+    Default,
+    Json,
 }
 
 impl OpencodeCommandSpec {
     pub fn new(executable_path: impl Into<PathBuf>, prompt: OpencodePrompt) -> Self {
         Self {
             executable_path: executable_path.into(),
-            args: vec![prompt.text().to_string()],
+            output_format: OpencodeOutputFormat::Default,
+            args: vec![String::from("run"), prompt.text().to_string()],
         }
+    }
+
+    pub fn with_output_format(mut self, output_format: OpencodeOutputFormat) -> Self {
+        self.output_format = output_format;
+        self
     }
 
     pub fn executable_path(&self) -> &Path {
@@ -51,16 +77,71 @@ impl OpencodeCommandSpec {
 
     pub fn to_command(&self) -> Command {
         let mut command = Command::new(&self.executable_path);
-        command.args(&self.args);
+
+        if self.output_format == OpencodeOutputFormat::Json {
+            command.args(["run", "--format", "json"]);
+            command.args(&self.args[1..]);
+        } else {
+            command.args(&self.args);
+        }
+
         command
     }
 }
 
+pub fn run_opencode(spec: &OpencodeCommandSpec) -> std::io::Result<OpencodeRunResult> {
+    let output = spec.to_command().output()?;
+
+    Ok(OpencodeRunResult {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        exit_code: output.status.code(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{OpencodeCommandSpec, OpencodePrompt, OpencodePromptError};
+    use super::{
+        run_opencode, OpencodeCommandSpec, OpencodeOutputFormat, OpencodePrompt,
+        OpencodePromptError,
+    };
     use std::ffi::OsStr;
+    use std::fs;
     use std::path::Path;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> Self {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos();
+
+            let path = std::env::temp_dir().join(format!(
+                "voxgolem-opencode-tests-{}-{stamp}",
+                std::process::id()
+            ));
+
+            fs::create_dir_all(&path).expect("temporary test directory should be creatable");
+
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 
     #[test]
     fn rejects_blank_prompts() {
@@ -79,7 +160,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_direct_argument_command_spec() {
+    fn builds_run_command_spec() {
         let prompt = OpencodePrompt::new("open the release checklist")
             .expect("non-empty prompt should be accepted");
         let spec = OpencodeCommandSpec::new("C:/Program Files/OpenCode/opencode.exe", prompt);
@@ -88,7 +169,13 @@ mod tests {
             spec.executable_path(),
             Path::new("C:/Program Files/OpenCode/opencode.exe")
         );
-        assert_eq!(spec.args(), &[String::from("open the release checklist")]);
+        assert_eq!(
+            spec.args(),
+            &[
+                String::from("run"),
+                String::from("open the release checklist")
+            ]
+        );
     }
 
     #[test]
@@ -101,7 +188,79 @@ mod tests {
         assert_eq!(command.get_program(), OsStr::new("opencode.exe"));
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
-            vec![OsStr::new("say hello && remove nothing")]
+            vec![OsStr::new("run"), OsStr::new("say hello && remove nothing")]
         );
+    }
+
+    #[test]
+    fn can_request_json_output_for_programmatic_runs() {
+        let prompt = OpencodePrompt::new("summarize the transcript")
+            .expect("non-empty prompt should be accepted");
+        let spec = OpencodeCommandSpec::new("opencode.exe", prompt)
+            .with_output_format(OpencodeOutputFormat::Json);
+        let command = spec.to_command();
+
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![
+                OsStr::new("run"),
+                OsStr::new("--format"),
+                OsStr::new("json"),
+                OsStr::new("summarize the transcript"),
+            ]
+        );
+    }
+
+    #[test]
+    fn captures_stdout_stderr_and_exit_code_from_process() {
+        let temp = TempDir::new();
+        let executable = create_fake_opencode(
+            temp.path(),
+            "printf 'stdout:%s|%s\\n' \"$1\" \"$2\"; printf 'stderr:%s\\n' \"$1\" 1>&2",
+        );
+        let prompt = OpencodePrompt::new("summarize the transcript")
+            .expect("non-empty prompt should be accepted");
+        let spec = OpencodeCommandSpec::new(executable, prompt);
+
+        let result = run_opencode(&spec).expect("fake executable should run");
+
+        assert_eq!(result.stdout, "stdout:run|summarize the transcript\n");
+        assert_eq!(result.stderr, "stderr:run\n");
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.succeeded());
+    }
+
+    #[test]
+    fn preserves_non_zero_exit_codes() {
+        let temp = TempDir::new();
+        let executable = create_fake_opencode(temp.path(), "printf 'bad prompt' 1>&2; exit 7");
+        let prompt = OpencodePrompt::new("summarize the transcript")
+            .expect("non-empty prompt should be accepted");
+        let spec = OpencodeCommandSpec::new(executable, prompt);
+
+        let result = run_opencode(&spec).expect("fake executable should run");
+
+        assert_eq!(result.stdout, "");
+        assert_eq!(result.stderr, "bad prompt");
+        assert_eq!(result.exit_code, Some(7));
+        assert!(!result.succeeded());
+    }
+
+    fn create_fake_opencode(directory: &Path, body: &str) -> PathBuf {
+        let executable = directory.join("fake-opencode.sh");
+        let script = format!("#!/bin/sh\n{body}\n");
+
+        fs::write(&executable, script).expect("fake executable should be written");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let permissions = fs::Permissions::from_mode(0o755);
+            fs::set_permissions(&executable, permissions)
+                .expect("fake executable should be marked executable");
+        }
+
+        executable
     }
 }
