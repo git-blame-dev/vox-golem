@@ -7,6 +7,8 @@ export type RuntimeEvent =
   | 'submit_prompt'
   | 'response_ready'
   | 'reset_to_sleeping'
+  | 'fail'
+  | 'recover_from_error'
 
 export function transitionRuntimeStatus(
   current: RuntimeStatus,
@@ -29,6 +31,10 @@ export function transitionRuntimeStatus(
         : current
     case 'reset_to_sleeping':
       return current === 'result_ready' ? 'sleeping' : current
+    case 'fail':
+      return 'error'
+    case 'recover_from_error':
+      return current === 'error' ? 'sleeping' : current
     default:
       return current
   }

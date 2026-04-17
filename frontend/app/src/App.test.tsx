@@ -125,6 +125,45 @@ describe('App', () => {
     expect(container.textContent).toContain('stderr:\nwarning output')
   })
 
+  it('moves runtime to error when opencode exits non-zero', async () => {
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'assets/start-listening.mp3',
+              stop_listening: 'assets/stop-listening.mp3',
+            },
+          }
+        }
+
+        return {
+          stdout: '',
+          stderr: 'bad prompt',
+          exit_code: 7,
+        }
+      },
+    }
+
+    const { container } = await renderApp()
+    const composer = getComposer(container)
+    const sendButton = getSendButton(container)
+
+    await act(async () => {
+      setTextAreaValue(composer, 'Bad prompt')
+    })
+
+    await act(async () => {
+      sendButton.click()
+      await Promise.resolve()
+    })
+
+    expect(container.textContent).toContain('Runtime: error')
+    expect(container.textContent).toContain('stderr:\nbad prompt')
+    expect(container.textContent).toContain('exit_code:\n7')
+  })
+
   it('plays the configured start-listening cue path from startup state', async () => {
     const playedSources: string[] = []
 
