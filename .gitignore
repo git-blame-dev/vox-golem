@@ -1,0 +1,17 @@
+target/
+apps/windows-tauri/src-tauri/gen/
+
+node_modules/
+dist/
+.vite/
+coverage/
+
+models/
+
+*.log
+
+.env
+.env.*
+config.toml
+.DS_Store
+Thumbs.db
