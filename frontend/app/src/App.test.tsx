@@ -6,6 +6,7 @@ import App from './App'
 
 const mountedContainers: HTMLElement[] = []
 const mountedRoots: Root[] = []
+const originalAudio = globalThis.Audio
 
 afterEach(() => {
   for (const root of mountedRoots) {
@@ -20,6 +21,17 @@ afterEach(() => {
 
   mountedRoots.length = 0
   mountedContainers.length = 0
+
+  if (originalAudio === undefined) {
+    Reflect.deleteProperty(globalThis, 'Audio')
+  } else {
+    Object.defineProperty(globalThis, 'Audio', {
+      configurable: true,
+      value: originalAudio,
+    })
+  }
+
+  Reflect.deleteProperty(window, '__TAURI_INTERNALS__')
 })
 
 describe('App', () => {
@@ -71,6 +83,48 @@ describe('App', () => {
 
     expect(container.textContent).toContain('Placeholder response for: Line one')
   })
+
+  it('plays the configured start-listening cue path from startup state', async () => {
+    const playedSources: string[] = []
+
+    class FakeAudio {
+      private readonly source: string
+
+      constructor(source: string) {
+        this.source = source
+      }
+
+      play(): Promise<void> {
+        playedSources.push(this.source)
+        return Promise.resolve()
+      }
+    }
+
+    Object.defineProperty(globalThis, 'Audio', {
+      configurable: true,
+      value: FakeAudio,
+    })
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async () => ({
+        kind: 'ready',
+        cue_asset_paths: {
+          start_listening: 'test-assets/configured-start.mp3',
+          stop_listening: 'test-assets/configured-stop.mp3',
+        },
+      }),
+    }
+
+    const { container } = await renderApp()
+    const startListeningButton = getControlButton(container, 'Start listening')
+
+    await act(async () => {
+      startListeningButton.click()
+      await Promise.resolve()
+    })
+
+    expect(playedSources).toEqual(['test-assets/configured-start.mp3'])
+  })
 })
 
 async function renderApp(): Promise<{ container: HTMLElement }> {
@@ -106,6 +160,20 @@ function getSendButton(container: HTMLElement): HTMLButtonElement {
 
   if (button === null) {
     throw new Error('Missing send button')
+  }
+
+  return button
+}
+
+function getControlButton(
+  container: HTMLElement,
+  label: 'Start listening' | 'Mark silence' | 'Mark result ready' | 'Reset to idle',
+): HTMLButtonElement {
+  const buttons = Array.from(container.querySelectorAll<HTMLButtonElement>('button'))
+  const button = buttons.find((candidate) => candidate.textContent?.trim() === label)
+
+  if (button === undefined) {
+    throw new Error(`Missing ${label} control button`)
   }
 
   return button

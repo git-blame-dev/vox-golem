@@ -8,13 +8,13 @@ describe('playCue', () => {
     await playCue(
       'start_listening',
       {
-        startListening: '/assets/start-listening.mp3',
-        stopListening: '/assets/stop-listening.mp3',
+        startListening: 'assets/start-listening.mp3',
+        stopListening: 'assets/stop-listening.mp3',
       },
       { play },
     )
 
-    expect(play).toHaveBeenCalledWith('/assets/start-listening.mp3')
+    expect(play).toHaveBeenCalledWith('assets/start-listening.mp3')
   })
 
   it('fails clearly when a configured cue asset path is missing', async () => {
@@ -24,7 +24,7 @@ describe('playCue', () => {
       playCue(
         'stop_listening',
         {
-          startListening: '/assets/start-listening.mp3',
+          startListening: 'assets/start-listening.mp3',
           stopListening: '',
         },
         { play },

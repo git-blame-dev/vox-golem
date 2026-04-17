@@ -3,16 +3,11 @@ import type { FormEvent, KeyboardEvent } from 'react'
 import { ChatBubble } from './components/ChatBubble'
 import { playCue } from './lib/audioCues'
 import { shouldSubmitComposer } from './lib/composer'
-import { loadStartupState } from './lib/startupState'
+import { DEFAULT_CUE_ASSET_PATHS, loadStartupState } from './lib/startupState'
 import { createPlaceholderReply, getInitialMessages } from './state/appShell'
 import { cueForTransition, transitionRuntimeStatus } from './state/runtimeMachine'
 import type { ChatMessage, RuntimeStatus, StartupState } from './types/chat'
 import './App.css'
-
-const CUE_ASSET_PATHS = {
-  startListening: '/assets/start-listening.mp3',
-  stopListening: '/assets/stop-listening.mp3',
-} as const
 
 function App() {
   const [startupState, setStartupState] = useState<StartupState>({ kind: 'loading' })
@@ -57,6 +52,10 @@ function App() {
     (runtimeStatus === 'processing' || runtimeStatus === 'executing')
   const canResetToIdle =
     startupState.kind === 'ready' && runtimeStatus === 'result_ready'
+  const cueAssetPaths =
+    startupState.kind === 'ready'
+      ? startupState.cueAssetPaths
+      : DEFAULT_CUE_ASSET_PATHS
 
   const applyTransition = (
     previousStatus: RuntimeStatus,
@@ -73,7 +72,7 @@ function App() {
     const cueType = cueForTransition(previousStatus, nextStatus)
 
     if (cueType !== null) {
-      void playCue(cueType, CUE_ASSET_PATHS).catch((error: unknown) => {
+      void playCue(cueType, cueAssetPaths).catch((error: unknown) => {
         const message = error instanceof Error ? error.message : 'Unknown cue playback error'
 
         setRuntimeStatus('error')
