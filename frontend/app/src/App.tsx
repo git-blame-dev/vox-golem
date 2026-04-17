@@ -131,10 +131,11 @@ function App() {
     try {
       const result = await executePrompt(prompt)
       const nextMessages = createExecutionMessages(result)
+      const hasStructuredError = result.events.some((event) => event.kind === 'error')
 
       setMessages((currentMessages) => [...currentMessages, ...nextMessages])
 
-      if (result.exitCode === null || result.exitCode === 0) {
+      if (!hasStructuredError && (result.exitCode === null || result.exitCode === 0)) {
         applyTransition(executingStatus, 'response_ready')
       } else {
         applyTransition(executingStatus, 'fail')

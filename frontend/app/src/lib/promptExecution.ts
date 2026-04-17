@@ -1,17 +1,17 @@
 import { getTauriInternals } from './tauri'
-import type { PromptExecutionResult } from '../types/chat'
+import type { PromptExecutionEvent, PromptExecutionResult } from '../types/chat'
 
 export function parsePromptExecutionResult(payload: unknown): PromptExecutionResult {
   if (!isRecord(payload)) {
     throw new Error('Prompt execution payload must be an object')
   }
 
-  const stdout = payload['stdout']
+  const events = payload['events']
   const stderr = payload['stderr']
   const exitCode = payload['exit_code']
 
-  if (typeof stdout !== 'string') {
-    throw new Error('Prompt execution payload must include stdout')
+  if (!Array.isArray(events)) {
+    throw new Error('Prompt execution payload must include events')
   }
 
   if (typeof stderr !== 'string') {
@@ -23,7 +23,7 @@ export function parsePromptExecutionResult(payload: unknown): PromptExecutionRes
   }
 
   return {
-    stdout,
+    events: events.map(parsePromptExecutionEvent),
     stderr,
     exitCode,
   }
@@ -46,10 +46,51 @@ export async function executePrompt(prompt: string): Promise<PromptExecutionResu
 
 function createFallbackResult(prompt: string): PromptExecutionResult {
   return {
-    stdout: `Placeholder response for: ${prompt}`,
+    events: [
+      {
+        kind: 'text',
+        text: `Placeholder response for: ${prompt}`,
+      },
+    ],
     stderr: '',
     exitCode: 0,
   }
+}
+
+function parsePromptExecutionEvent(payload: unknown): PromptExecutionEvent {
+  if (!isRecord(payload)) {
+    throw new Error('Prompt execution event must be an object')
+  }
+
+  if (payload['kind'] === 'text') {
+    const text = payload['text']
+
+    if (typeof text !== 'string') {
+      throw new Error('Text event must include text')
+    }
+
+    return {
+      kind: 'text',
+      text,
+    }
+  }
+
+  if (payload['kind'] === 'error') {
+    const name = payload['name']
+    const message = payload['message']
+
+    if (typeof name !== 'string' || typeof message !== 'string') {
+      throw new Error('Error event must include name and message')
+    }
+
+    return {
+      kind: 'error',
+      name,
+      message,
+    }
+  }
+
+  throw new Error('Prompt execution event contains an unsupported kind')
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

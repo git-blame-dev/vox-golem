@@ -11,8 +11,12 @@ export interface CueAssetPaths {
   readonly stopListening: string
 }
 
+export type PromptExecutionEvent =
+  | { readonly kind: 'text'; readonly text: string }
+  | { readonly kind: 'error'; readonly name: string; readonly message: string }
+
 export interface PromptExecutionResult {
-  readonly stdout: string
+  readonly events: readonly PromptExecutionEvent[]
   readonly stderr: string
   readonly exitCode: number | null
 }
