@@ -1,18 +1,9 @@
+import { getTauriInternals } from './tauri'
 import type { CueAssetPaths, StartupState } from '../types/chat'
 
 export const DEFAULT_CUE_ASSET_PATHS: CueAssetPaths = {
   startListening: 'assets/start-listening.mp3',
   stopListening: 'assets/stop-listening.mp3',
-}
-
-interface TauriInternals {
-  readonly invoke: (command: string, args?: unknown) => Promise<unknown>
-}
-
-declare global {
-  interface Window {
-    __TAURI_INTERNALS__?: TauriInternals
-  }
 }
 
 export function parseStartupState(payload: unknown): StartupState {
@@ -51,9 +42,9 @@ export async function loadStartupState(): Promise<StartupState> {
     }
   }
 
-  const tauriInternals = window.__TAURI_INTERNALS__
+  const tauriInternals = getTauriInternals()
 
-  if (!tauriInternals || typeof tauriInternals.invoke !== 'function') {
+  if (tauriInternals === null) {
     return {
       kind: 'ready',
       cueAssetPaths: DEFAULT_CUE_ASSET_PATHS,
