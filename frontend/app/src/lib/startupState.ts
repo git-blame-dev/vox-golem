@@ -1,5 +1,5 @@
 import { getTauriInternals } from './tauri'
-import type { CueAssetPaths, StartupState } from '../types/chat'
+import type { BackendRuntimePhase, CueAssetPaths, StartupState } from '../types/chat'
 
 export const DEFAULT_CUE_ASSET_PATHS: CueAssetPaths = {
   startListening: 'assets/start-listening.mp3',
@@ -15,6 +15,7 @@ export function parseStartupState(payload: unknown): StartupState {
     return {
       kind: 'ready',
       cueAssetPaths: parseCueAssetPaths(payload['cue_asset_paths']),
+      runtimePhase: parseRuntimePhase(payload['runtime_phase']),
     }
   }
 
@@ -39,6 +40,7 @@ export async function loadStartupState(): Promise<StartupState> {
     return {
       kind: 'ready',
       cueAssetPaths: DEFAULT_CUE_ASSET_PATHS,
+      runtimePhase: 'sleeping',
     }
   }
 
@@ -48,6 +50,7 @@ export async function loadStartupState(): Promise<StartupState> {
     return {
       kind: 'ready',
       cueAssetPaths: DEFAULT_CUE_ASSET_PATHS,
+      runtimePhase: 'sleeping',
     }
   }
 
@@ -61,6 +64,22 @@ export async function loadStartupState(): Promise<StartupState> {
       message,
     }
   }
+}
+
+function parseRuntimePhase(payload: unknown): BackendRuntimePhase {
+  if (
+    payload === 'initializing' ||
+    payload === 'sleeping' ||
+    payload === 'listening' ||
+    payload === 'processing' ||
+    payload === 'executing' ||
+    payload === 'result_ready' ||
+    payload === 'error'
+  ) {
+    return payload
+  }
+
+  throw new Error('Startup ready payload must include a supported runtime phase')
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

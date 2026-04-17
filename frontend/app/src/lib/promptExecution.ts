@@ -1,5 +1,9 @@
 import { getTauriInternals } from './tauri'
-import type { PromptExecutionEvent, PromptExecutionResult } from '../types/chat'
+import type {
+  BackendRuntimePhase,
+  PromptExecutionEvent,
+  PromptExecutionResult,
+} from '../types/chat'
 
 export function parsePromptExecutionResult(payload: unknown): PromptExecutionResult {
   if (!isRecord(payload)) {
@@ -9,6 +13,7 @@ export function parsePromptExecutionResult(payload: unknown): PromptExecutionRes
   const events = payload['events']
   const stderr = payload['stderr']
   const exitCode = payload['exit_code']
+  const runtimePhase = payload['runtime_phase']
 
   if (!Array.isArray(events)) {
     throw new Error('Prompt execution payload must include events')
@@ -26,6 +31,7 @@ export function parsePromptExecutionResult(payload: unknown): PromptExecutionRes
     events: events.map(parsePromptExecutionEvent),
     stderr,
     exitCode,
+    runtimePhase: parseRuntimePhase(runtimePhase),
   }
 }
 
@@ -54,6 +60,7 @@ function createFallbackResult(prompt: string): PromptExecutionResult {
     ],
     stderr: '',
     exitCode: 0,
+    runtimePhase: 'result_ready',
   }
 }
 
@@ -148,4 +155,20 @@ function parsePromptExecutionEvent(payload: unknown): PromptExecutionEvent {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
+}
+
+function parseRuntimePhase(payload: unknown): BackendRuntimePhase {
+  if (
+    payload === 'initializing' ||
+    payload === 'sleeping' ||
+    payload === 'listening' ||
+    payload === 'processing' ||
+    payload === 'executing' ||
+    payload === 'result_ready' ||
+    payload === 'error'
+  ) {
+    return payload
+  }
+
+  throw new Error('Prompt execution payload must include a supported runtime phase')
 }

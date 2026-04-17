@@ -14,6 +14,18 @@ struct AppState {
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RuntimePhasePayload {
+    Initializing,
+    Sleeping,
+    Listening,
+    Processing,
+    Executing,
+    ResultReady,
+    Error,
+}
+
+#[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum PromptExecutionEventPayload {
     Text {
@@ -42,6 +54,7 @@ struct PromptExecutionPayload {
     events: Vec<PromptExecutionEventPayload>,
     stderr: String,
     exit_code: Option<i32>,
+    runtime_phase: RuntimePhasePayload,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -55,6 +68,7 @@ struct CueAssetPathsPayload {
 enum StartupStatePayload {
     Ready {
         cue_asset_paths: CueAssetPathsPayload,
+        runtime_phase: RuntimePhasePayload,
     },
     Error {
         message: String,
@@ -114,6 +128,8 @@ fn submit_prompt(
         completion_event,
     )?;
 
+    let runtime_phase = current_runtime_phase(&app_state.session_state)?;
+
     Ok(PromptExecutionPayload {
         events: result
             .events
@@ -154,6 +170,7 @@ fn submit_prompt(
             .collect(),
         stderr: result.stderr,
         exit_code: result.exit_code,
+        runtime_phase,
     })
 }
 
@@ -175,6 +192,7 @@ fn build_app_state() -> AppState {
                         start_listening: config.start_listening_cue.to_string_lossy().into_owned(),
                         stop_listening: config.stop_listening_cue.to_string_lossy().into_owned(),
                     },
+                    runtime_phase: RuntimePhasePayload::Sleeping,
                 },
                 runtime_config: Some(config),
                 session_config,
@@ -199,6 +217,30 @@ fn build_app_state() -> AppState {
                 session_state: Mutex::new(session_state),
             }
         }
+    }
+}
+
+fn current_runtime_phase(
+    session_state: &Mutex<voxgolem_core::session::SessionState>,
+) -> Result<RuntimePhasePayload, String> {
+    let guard = session_state
+        .lock()
+        .map_err(|_| String::from("session state lock is poisoned"))?;
+
+    Ok(to_runtime_phase_payload(guard.runtime().phase()))
+}
+
+fn to_runtime_phase_payload(
+    runtime_phase: voxgolem_core::runtime::RuntimePhase,
+) -> RuntimePhasePayload {
+    match runtime_phase {
+        voxgolem_core::runtime::RuntimePhase::Initializing => RuntimePhasePayload::Initializing,
+        voxgolem_core::runtime::RuntimePhase::Sleeping => RuntimePhasePayload::Sleeping,
+        voxgolem_core::runtime::RuntimePhase::Listening => RuntimePhasePayload::Listening,
+        voxgolem_core::runtime::RuntimePhase::Processing => RuntimePhasePayload::Processing,
+        voxgolem_core::runtime::RuntimePhase::Executing => RuntimePhasePayload::Executing,
+        voxgolem_core::runtime::RuntimePhase::ResultReady => RuntimePhasePayload::ResultReady,
+        voxgolem_core::runtime::RuntimePhase::Error => RuntimePhasePayload::Error,
     }
 }
 
@@ -266,7 +308,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::prompt_result_error_message;
+    use super::{prompt_result_error_message, to_runtime_phase_payload, RuntimePhasePayload};
 
     #[test]
     fn prompt_result_error_message_prefers_non_zero_exit_code() {
@@ -313,5 +355,13 @@ mod tests {
         };
 
         assert_eq!(prompt_result_error_message(&result), None);
+    }
+
+    #[test]
+    fn maps_core_runtime_phase_to_payload() {
+        assert!(matches!(
+            to_runtime_phase_payload(voxgolem_core::runtime::RuntimePhase::Processing),
+            RuntimePhasePayload::Processing
+        ));
     }
 }
