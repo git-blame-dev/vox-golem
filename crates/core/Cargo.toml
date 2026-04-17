@@ -1,0 +1,10 @@
+[package]
+name = "voxgolem-core"
+edition.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[lints]
+workspace = true

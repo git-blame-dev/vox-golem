@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+  "apps/windows-tauri/src-tauri",
+  "crates/audio",
+  "crates/core",
+  "crates/model",
+  "crates/platform"
+]
+
+[workspace.package]
+edition = "2021"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = "deny"

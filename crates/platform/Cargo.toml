@@ -1,0 +1,8 @@
+[package]
+name = "voxgolem-platform"
+edition.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,8 @@
+[package]
+name = "voxgolem-audio"
+edition.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
