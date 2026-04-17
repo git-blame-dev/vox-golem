@@ -1,0 +1,5 @@
+wake_word_wav = "C:\\Users\\you\\AppData\\Roaming\\VoxGolem\\wake-word.wav"
+parakeet_model_dir = "C:\\Users\\you\\AppData\\Roaming\\VoxGolem\\parakeet-v2"
+opencode_path = "C:\\Program Files\\OpenCode\\opencode.exe"
+start_listening_cue = "assets/start-listening.mp3"
+stop_listening_cue = "assets/stop-listening.mp3"

@@ -6,9 +6,14 @@ export interface ChatMessage {
   readonly content: string
 }
 
+export interface CueAssetPaths {
+  readonly startListening: string
+  readonly stopListening: string
+}
+
 export type StartupState =
   | { readonly kind: 'loading' }
-  | { readonly kind: 'ready' }
+  | { readonly kind: 'ready'; readonly cueAssetPaths: CueAssetPaths }
   | { readonly kind: 'error'; readonly message: string }
 
 export type RuntimeStatus =

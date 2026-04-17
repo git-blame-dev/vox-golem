@@ -41,25 +41,48 @@ impl Display for ConfigError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissingAppData => {
-                write!(formatter, "APPDATA is missing; cannot resolve %APPDATA%\\VoxGolem\\config.toml")
+                write!(
+                    formatter,
+                    "APPDATA is missing; cannot resolve %APPDATA%\\VoxGolem\\config.toml"
+                )
             }
             Self::MissingConfigFile { path } => {
                 write!(formatter, "config file not found: {}", path.display())
             }
             Self::ReadConfigFailed { path, details } => {
-                write!(formatter, "failed to read config file {}: {details}", path.display())
+                write!(
+                    formatter,
+                    "failed to read config file {}: {details}",
+                    path.display()
+                )
             }
             Self::ParseConfigFailed { path, details } => {
-                write!(formatter, "failed to parse config file {}: {details}", path.display())
+                write!(
+                    formatter,
+                    "failed to parse config file {}: {details}",
+                    path.display()
+                )
             }
             Self::MissingFile { field, path } => {
-                write!(formatter, "invalid `{field}` path; expected an existing file: {}", path.display())
+                write!(
+                    formatter,
+                    "invalid `{field}` path; expected an existing file: {}",
+                    path.display()
+                )
             }
             Self::MissingDirectory { field, path } => {
-                write!(formatter, "invalid `{field}` path; expected an existing directory: {}", path.display())
+                write!(
+                    formatter,
+                    "invalid `{field}` path; expected an existing directory: {}",
+                    path.display()
+                )
             }
             Self::MissingExecutable { path } => {
-                write!(formatter, "invalid `opencode_path`; expected an existing executable file: {}", path.display())
+                write!(
+                    formatter,
+                    "invalid `opencode_path`; expected an existing executable file: {}",
+                    path.display()
+                )
             }
         }
     }
@@ -68,8 +91,7 @@ impl Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 pub fn default_config_path() -> Result<PathBuf, ConfigError> {
-    let app_data =
-        std::env::var_os("APPDATA").ok_or(ConfigError::MissingAppData)?;
+    let app_data = std::env::var_os("APPDATA").ok_or(ConfigError::MissingAppData)?;
 
     Ok(PathBuf::from(app_data)
         .join(WINDOWS_CONFIG_DIR)
@@ -81,6 +103,10 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
         Some(path) => path.to_path_buf(),
         None => default_config_path()?,
     };
+    let config_dir = config_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
 
     let config_contents = match fs::read_to_string(&config_path) {
         Ok(contents) => contents,
@@ -102,19 +128,33 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
         }
     })?;
 
-    validate_existing_file(&raw_config.wake_word_wav, "wake_word_wav")?;
-    validate_existing_directory(&raw_config.parakeet_model_dir, "parakeet_model_dir")?;
-    validate_existing_file(&raw_config.start_listening_cue, "start_listening_cue")?;
-    validate_existing_file(&raw_config.stop_listening_cue, "stop_listening_cue")?;
-    validate_existing_executable(&raw_config.opencode_path)?;
+    let wake_word_wav = resolve_config_path(&config_dir, raw_config.wake_word_wav);
+    let parakeet_model_dir = resolve_config_path(&config_dir, raw_config.parakeet_model_dir);
+    let opencode_path = resolve_config_path(&config_dir, raw_config.opencode_path);
+    let start_listening_cue = resolve_config_path(&config_dir, raw_config.start_listening_cue);
+    let stop_listening_cue = resolve_config_path(&config_dir, raw_config.stop_listening_cue);
+
+    validate_existing_file(&wake_word_wav, "wake_word_wav")?;
+    validate_existing_directory(&parakeet_model_dir, "parakeet_model_dir")?;
+    validate_existing_file(&start_listening_cue, "start_listening_cue")?;
+    validate_existing_file(&stop_listening_cue, "stop_listening_cue")?;
+    validate_existing_executable(&opencode_path)?;
 
     Ok(RuntimeConfig {
-        wake_word_wav: raw_config.wake_word_wav,
-        parakeet_model_dir: raw_config.parakeet_model_dir,
-        opencode_path: raw_config.opencode_path,
-        start_listening_cue: raw_config.start_listening_cue,
-        stop_listening_cue: raw_config.stop_listening_cue,
+        wake_word_wav,
+        parakeet_model_dir,
+        opencode_path,
+        start_listening_cue,
+        stop_listening_cue,
     })
+}
+
+fn resolve_config_path(config_dir: &Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        config_dir.join(path)
+    }
 }
 
 fn validate_existing_file(path: &Path, field: &'static str) -> Result<(), ConfigError> {
@@ -172,8 +212,7 @@ mod tests {
                 std::process::id()
             ));
 
-            fs::create_dir_all(&path)
-                .expect("temporary test directory should be creatable");
+            fs::create_dir_all(&path).expect("temporary test directory should be creatable");
 
             Self { path }
         }
@@ -207,26 +246,19 @@ mod tests {
         let temp = TempDir::new();
         let config_path = temp.path().join("config.toml");
 
-        fs::write(
-            &config_path,
-            "wake_word_wav = [\"unexpected array\"]",
-        )
-        .expect("invalid config fixture should be written");
+        fs::write(&config_path, "wake_word_wav = [\"unexpected array\"]")
+            .expect("invalid config fixture should be written");
 
         let result = load_runtime_config(Some(&config_path));
 
-        assert!(matches!(
-            result,
-            Err(ConfigError::ParseConfigFailed { .. })
-        ));
+        assert!(matches!(result, Err(ConfigError::ParseConfigFailed { .. })));
     }
 
     #[test]
     fn reports_missing_required_wake_word_file() {
         let temp = TempDir::new();
         let model_dir = temp.path().join("models");
-        fs::create_dir_all(&model_dir)
-            .expect("model directory fixture should be created");
+        fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
 
         let opencode_path = temp.path().join("opencode.exe");
         create_file(&opencode_path);
@@ -273,8 +305,7 @@ mod tests {
         let config_path = temp.path().join("config.toml");
 
         create_file(&wake_word);
-        fs::create_dir_all(&model_dir)
-            .expect("model directory fixture should be created");
+        fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
         create_file(&opencode_path);
         create_file(&start_cue);
         create_file(&stop_cue);
@@ -296,14 +327,46 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[test]
+    fn resolves_relative_cue_paths_against_config_directory() {
+        let temp = TempDir::new();
+        let wake_word = temp.path().join("wake-word.wav");
+        let model_dir = temp.path().join("models");
+        let opencode_path = temp.path().join("opencode.exe");
+        let start_cue = temp.path().join("assets/start-listening.mp3");
+        let stop_cue = temp.path().join("assets/stop-listening.mp3");
+        let config_path = temp.path().join("config.toml");
+
+        create_file(&wake_word);
+        fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
+        create_file(&opencode_path);
+        create_file(&start_cue);
+        create_file(&stop_cue);
+
+        fs::write(
+            &config_path,
+            format!(
+                "wake_word_wav = \"{}\"\nparakeet_model_dir = \"{}\"\nopencode_path = \"{}\"\nstart_listening_cue = \"assets/start-listening.mp3\"\nstop_listening_cue = \"assets/stop-listening.mp3\"\n",
+                escape_path(&wake_word),
+                escape_path(&model_dir),
+                escape_path(&opencode_path),
+            ),
+        )
+        .expect("config fixture should be written");
+
+        let result = load_runtime_config(Some(&config_path))
+            .expect("relative cue paths should resolve from config directory");
+
+        assert_eq!(result.start_listening_cue, start_cue);
+        assert_eq!(result.stop_listening_cue, stop_cue);
+    }
+
     fn create_file(path: &Path) {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .expect("parent directory should be created");
+            fs::create_dir_all(parent).expect("parent directory should be created");
         }
 
-        fs::write(path, b"fixture")
-            .expect("file fixture should be written");
+        fs::write(path, b"fixture").expect("file fixture should be written");
     }
 
     fn render_config(

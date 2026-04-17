@@ -1,5 +1,9 @@
 # Local workflow artifacts
 tasks/
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.claude/
 
 # Rust build outputs
 target/

@@ -1,9 +1,6 @@
-export type CueType = 'start_listening' | 'stop_listening'
+import type { CueAssetPaths } from '../types/chat'
 
-export interface CueAssetPaths {
-  readonly startListening: string
-  readonly stopListening: string
-}
+export type CueType = 'start_listening' | 'stop_listening'
 
 export interface CuePlayer {
   play(source: string): Promise<void>
