@@ -9,12 +9,12 @@ describe('parsePromptExecutionResult', () => {
   it('parses a valid execution payload', () => {
     expect(
       parsePromptExecutionResult({
-        stdout: 'done',
+        events: [{ kind: 'text', text: 'done' }],
         stderr: '',
         exit_code: 0,
       }),
     ).toEqual({
-      stdout: 'done',
+      events: [{ kind: 'text', text: 'done' }],
       stderr: '',
       exitCode: 0,
     })
@@ -28,7 +28,7 @@ describe('parsePromptExecutionResult', () => {
 describe('executePrompt', () => {
   it('uses fallback output when tauri internals are unavailable', async () => {
     await expect(executePrompt('Draft release notes')).resolves.toEqual({
-      stdout: 'Placeholder response for: Draft release notes',
+      events: [{ kind: 'text', text: 'Placeholder response for: Draft release notes' }],
       stderr: '',
       exitCode: 0,
     })
@@ -41,7 +41,7 @@ describe('executePrompt', () => {
         expect(args).toEqual({ prompt: 'Draft release notes' })
 
         return {
-          stdout: 'OpenCode response',
+          events: [{ kind: 'text', text: 'OpenCode response' }],
           stderr: '',
           exit_code: 0,
         }
@@ -49,7 +49,7 @@ describe('executePrompt', () => {
     }
 
     await expect(executePrompt('Draft release notes')).resolves.toEqual({
-      stdout: 'OpenCode response',
+      events: [{ kind: 'text', text: 'OpenCode response' }],
       stderr: '',
       exitCode: 0,
     })

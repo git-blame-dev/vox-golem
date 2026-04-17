@@ -4,8 +4,15 @@
 use serde::Serialize;
 
 #[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PromptExecutionEventPayload {
+    Text { text: String },
+    Error { name: String, message: String },
+}
+
+#[derive(Clone, Debug, Serialize)]
 struct PromptExecutionPayload {
-    stdout: String,
+    events: Vec<PromptExecutionEventPayload>,
     stderr: String,
     exit_code: Option<i32>,
 }
@@ -38,12 +45,24 @@ fn submit_prompt(prompt: String) -> Result<PromptExecutionPayload, String> {
         voxgolem_core::config::load_runtime_config(None).map_err(|error| error.to_string())?;
     let prompt = voxgolem_platform::opencode::OpencodePrompt::new(prompt)
         .map_err(|error| format!("invalid prompt: {error:?}"))?;
-    let spec = voxgolem_platform::opencode::OpencodeCommandSpec::new(config.opencode_path, prompt);
-    let result = voxgolem_platform::opencode::run_opencode(&spec)
+    let spec = voxgolem_platform::opencode::OpencodeCommandSpec::new(config.opencode_path, prompt)
+        .with_output_format(voxgolem_platform::opencode::OpencodeOutputFormat::Json);
+    let result = voxgolem_platform::opencode::run_opencode_json(&spec)
         .map_err(|error| format!("failed to execute opencode: {error}"))?;
 
     Ok(PromptExecutionPayload {
-        stdout: result.stdout,
+        events: result
+            .events
+            .into_iter()
+            .map(|event| match event {
+                voxgolem_platform::opencode::OpencodeJsonEvent::Text { text } => {
+                    PromptExecutionEventPayload::Text { text }
+                }
+                voxgolem_platform::opencode::OpencodeJsonEvent::Error { name, message } => {
+                    PromptExecutionEventPayload::Error { name, message }
+                }
+            })
+            .collect(),
         stderr: result.stderr,
         exit_code: result.exit_code,
     })

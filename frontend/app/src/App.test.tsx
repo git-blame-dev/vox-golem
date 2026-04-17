@@ -49,7 +49,7 @@ describe('App', () => {
     })
 
     expect(container.textContent).toContain('Draft release notes')
-    expect(container.textContent).toContain('stdout:\nPlaceholder response for: Draft release notes')
+    expect(container.textContent).toContain('Placeholder response for: Draft release notes')
   })
 
   it('submits from Enter and ignores Shift+Enter', async () => {
@@ -70,7 +70,7 @@ describe('App', () => {
       )
     })
 
-    expect(container.textContent).not.toContain('stdout:\nPlaceholder response for: Line one')
+    expect(container.textContent).not.toContain('Placeholder response for: Line one')
 
     await act(async () => {
       composer.dispatchEvent(
@@ -81,7 +81,7 @@ describe('App', () => {
       )
     })
 
-    expect(container.textContent).toContain('stdout:\nPlaceholder response for: Line one')
+    expect(container.textContent).toContain('Placeholder response for: Line one')
   })
 
   it('renders tauri prompt execution output when submit command succeeds', async () => {
@@ -101,7 +101,7 @@ describe('App', () => {
         expect(args).toEqual({ prompt: 'Draft release notes' })
 
         return {
-          stdout: 'OpenCode response',
+          events: [{ kind: 'text', text: 'OpenCode response' }],
           stderr: 'warning output',
           exit_code: 0,
         }
@@ -121,7 +121,7 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(container.textContent).toContain('stdout:\nOpenCode response')
+    expect(container.textContent).toContain('OpenCode response')
     expect(container.textContent).toContain('stderr:\nwarning output')
   })
 
@@ -139,7 +139,7 @@ describe('App', () => {
         }
 
         return {
-          stdout: '',
+          events: [],
           stderr: 'bad prompt',
           exit_code: 7,
         }
@@ -162,6 +162,50 @@ describe('App', () => {
     expect(container.textContent).toContain('Runtime: error')
     expect(container.textContent).toContain('stderr:\nbad prompt')
     expect(container.textContent).toContain('exit_code:\n7')
+  })
+
+  it('moves runtime to error when opencode emits a structured error event', async () => {
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'assets/start-listening.mp3',
+              stop_listening: 'assets/stop-listening.mp3',
+            },
+          }
+        }
+
+        return {
+          events: [
+            {
+              kind: 'error',
+              name: 'APIError',
+              message: 'Provider failed',
+            },
+          ],
+          stderr: '',
+          exit_code: 0,
+        }
+      },
+    }
+
+    const { container } = await renderApp()
+    const composer = getComposer(container)
+    const sendButton = getSendButton(container)
+
+    await act(async () => {
+      setTextAreaValue(composer, 'Bad prompt')
+    })
+
+    await act(async () => {
+      sendButton.click()
+      await Promise.resolve()
+    })
+
+    expect(container.textContent).toContain('Runtime: error')
+    expect(container.textContent).toContain('opencode_error:\nAPIError: Provider failed')
   })
 
   it('plays the configured start-listening cue path from startup state', async () => {

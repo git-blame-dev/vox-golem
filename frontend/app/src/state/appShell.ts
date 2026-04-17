@@ -18,14 +18,22 @@ export function createExecutionMessages(
 ): readonly ChatMessage[] {
   const messages: ChatMessage[] = []
 
-  const stdout = result.stdout.trim()
   const stderr = result.stderr.trim()
 
-  if (stdout.length > 0) {
+  for (const event of result.events) {
+    if (event.kind === 'text') {
+      messages.push({
+        id: `assistant-${Date.now()}-${messages.length}`,
+        role: 'assistant',
+        content: event.text,
+      })
+      continue
+    }
+
     messages.push({
-      id: `assistant-${Date.now()}`,
-      role: 'assistant',
-      content: `stdout:\n${stdout}`,
+      id: `system-error-${Date.now()}-${messages.length}`,
+      role: 'system',
+      content: `opencode_error:\n${event.name}: ${event.message}`,
     })
   }
 

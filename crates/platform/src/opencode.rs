@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use serde::Deserialize;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpencodePrompt {
     text: String,
@@ -40,6 +42,42 @@ pub struct OpencodeRunResult {
     pub stderr: String,
     pub exit_code: Option<i32>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpencodeJsonRunResult {
+    pub events: Vec<OpencodeJsonEvent>,
+    pub stderr: String,
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpencodeJsonEvent {
+    Text { text: String },
+    Error { name: String, message: String },
+}
+
+#[derive(Debug)]
+pub enum OpencodeJsonRunError {
+    Io(std::io::Error),
+    InvalidJsonLine { line_number: usize, details: String },
+}
+
+impl std::fmt::Display for OpencodeJsonRunError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "{error}"),
+            Self::InvalidJsonLine {
+                line_number,
+                details,
+            } => write!(
+                formatter,
+                "invalid OpenCode JSON event on line {line_number}: {details}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OpencodeJsonRunError {}
 
 impl OpencodeRunResult {
     pub fn succeeded(&self) -> bool {
@@ -99,11 +137,113 @@ pub fn run_opencode(spec: &OpencodeCommandSpec) -> std::io::Result<OpencodeRunRe
     })
 }
 
+pub fn run_opencode_json(
+    spec: &OpencodeCommandSpec,
+) -> Result<OpencodeJsonRunResult, OpencodeJsonRunError> {
+    let output = spec
+        .to_command()
+        .output()
+        .map_err(OpencodeJsonRunError::Io)?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    Ok(OpencodeJsonRunResult {
+        events: parse_json_events(&stdout)?,
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        exit_code: output.status.code(),
+    })
+}
+
+fn parse_json_events(stdout: &str) -> Result<Vec<OpencodeJsonEvent>, OpencodeJsonRunError> {
+    let mut events = Vec::new();
+
+    for (line_index, line) in stdout.lines().enumerate() {
+        let trimmed = line.trim();
+
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let raw_event = serde_json::from_str::<RawJsonEvent>(trimmed).map_err(|error| {
+            OpencodeJsonRunError::InvalidJsonLine {
+                line_number: line_index + 1,
+                details: error.to_string(),
+            }
+        })?;
+
+        match raw_event {
+            RawJsonEvent::Text { part, .. } => {
+                let text = part.text.trim();
+
+                if !text.is_empty() {
+                    events.push(OpencodeJsonEvent::Text {
+                        text: text.to_string(),
+                    });
+                }
+            }
+            RawJsonEvent::Error { error, .. } => {
+                let message = error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.message.as_deref())
+                    .unwrap_or(&error.name)
+                    .to_string();
+
+                events.push(OpencodeJsonEvent::Error {
+                    name: error.name,
+                    message,
+                });
+            }
+            RawJsonEvent::Other => {}
+        }
+    }
+
+    Ok(events)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum RawJsonEvent {
+    #[serde(rename = "text")]
+    Text {
+        part: RawTextPart,
+        #[serde(rename = "timestamp")]
+        _timestamp: u64,
+        #[serde(rename = "sessionID")]
+        _session_id: String,
+    },
+    #[serde(rename = "error")]
+    Error {
+        error: RawErrorPayload,
+        #[serde(rename = "timestamp")]
+        _timestamp: u64,
+        #[serde(rename = "sessionID")]
+        _session_id: String,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTextPart {
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawErrorPayload {
+    name: String,
+    data: Option<RawErrorData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawErrorData {
+    message: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        run_opencode, OpencodeCommandSpec, OpencodeOutputFormat, OpencodePrompt,
-        OpencodePromptError,
+        run_opencode, run_opencode_json, OpencodeCommandSpec, OpencodeJsonEvent,
+        OpencodeJsonRunError, OpencodeOutputFormat, OpencodePrompt, OpencodePromptError,
     };
     use std::ffi::OsStr;
     use std::fs;
@@ -244,6 +384,53 @@ mod tests {
         assert_eq!(result.stderr, "bad prompt");
         assert_eq!(result.exit_code, Some(7));
         assert!(!result.succeeded());
+    }
+
+    #[test]
+    fn parses_minimal_json_events_and_ignores_other_event_types() {
+        let temp = TempDir::new();
+        let executable = create_fake_opencode(
+            temp.path(),
+            "printf '%s\n' '{\"type\":\"text\",\"timestamp\":1,\"sessionID\":\"ses_1\",\"part\":{\"text\":\"Hello from OpenCode\"}}' '{\"type\":\"step_start\",\"timestamp\":2,\"sessionID\":\"ses_1\",\"part\":{}}' '{\"type\":\"error\",\"timestamp\":3,\"sessionID\":\"ses_1\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"Provider failed\"}}}'",
+        );
+        let prompt = OpencodePrompt::new("summarize the transcript")
+            .expect("non-empty prompt should be accepted");
+        let spec = OpencodeCommandSpec::new(executable, prompt)
+            .with_output_format(OpencodeOutputFormat::Json);
+
+        let result = run_opencode_json(&spec).expect("fake json executable should run");
+
+        assert_eq!(
+            result.events,
+            vec![
+                OpencodeJsonEvent::Text {
+                    text: "Hello from OpenCode".to_string(),
+                },
+                OpencodeJsonEvent::Error {
+                    name: "APIError".to_string(),
+                    message: "Provider failed".to_string(),
+                },
+            ]
+        );
+        assert_eq!(result.stderr, "");
+        assert_eq!(result.exit_code, Some(0));
+    }
+
+    #[test]
+    fn reports_invalid_json_lines() {
+        let temp = TempDir::new();
+        let executable = create_fake_opencode(temp.path(), "printf '%s\n' 'not json at all'");
+        let prompt = OpencodePrompt::new("summarize the transcript")
+            .expect("non-empty prompt should be accepted");
+        let spec = OpencodeCommandSpec::new(executable, prompt)
+            .with_output_format(OpencodeOutputFormat::Json);
+
+        let result = run_opencode_json(&spec);
+
+        assert!(matches!(
+            result,
+            Err(OpencodeJsonRunError::InvalidJsonLine { line_number: 1, .. })
+        ));
     }
 
     fn create_fake_opencode(directory: &Path, body: &str) -> PathBuf {

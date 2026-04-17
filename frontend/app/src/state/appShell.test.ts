@@ -5,27 +5,43 @@ describe('createExecutionMessages', () => {
   it('creates assistant and system messages for stdout and stderr output', () => {
     expect(
       createExecutionMessages({
-        stdout: 'OpenCode response',
+        events: [{ kind: 'text', text: 'OpenCode response' }],
         stderr: 'warning output',
         exitCode: 0,
       }).map((message) => message.content),
-    ).toEqual(['stdout:\nOpenCode response', 'stderr:\nwarning output'])
+    ).toEqual(['OpenCode response', 'stderr:\nwarning output'])
   })
 
   it('includes a non-zero exit code label', () => {
     expect(
       createExecutionMessages({
-        stdout: '',
+        events: [],
         stderr: 'bad prompt',
         exitCode: 7,
       }).map((message) => message.content),
     ).toEqual(['stderr:\nbad prompt', 'exit_code:\n7'])
   })
 
+  it('creates a system message for structured opencode errors', () => {
+    expect(
+      createExecutionMessages({
+        events: [
+          {
+            kind: 'error',
+            name: 'APIError',
+            message: 'Provider failed',
+          },
+        ],
+        stderr: '',
+        exitCode: 0,
+      }).map((message) => message.content),
+    ).toEqual(['opencode_error:\nAPIError: Provider failed'])
+  })
+
   it('returns fallback message when no output is produced', () => {
     expect(
       createExecutionMessages({
-        stdout: '',
+        events: [],
         stderr: '',
         exitCode: 0,
       }).map((message) => message.content),
