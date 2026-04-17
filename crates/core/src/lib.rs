@@ -2,6 +2,7 @@
 #![deny(unused_must_use)]
 
 pub mod config;
+pub mod runtime;
 
 pub const APP_NAME: &str = "VoxGolem";
 
