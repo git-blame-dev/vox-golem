@@ -5,11 +5,20 @@ describe('createExecutionMessages', () => {
   it('creates assistant and system messages for stdout and stderr output', () => {
     expect(
       createExecutionMessages({
-        events: [{ kind: 'text', text: 'OpenCode response' }],
+        events: [
+          { kind: 'step_start' },
+          { kind: 'text', text: 'OpenCode response' },
+          { kind: 'step_finish', reason: 'stop' },
+        ],
         stderr: 'warning output',
         exitCode: 0,
       }).map((message) => message.content),
-    ).toEqual(['OpenCode response', 'stderr:\nwarning output'])
+    ).toEqual([
+      'step_start:\nOpenCode started a run step.',
+      'OpenCode response',
+      'step_finish:\nstop',
+      'stderr:\nwarning output',
+    ])
   })
 
   it('includes a non-zero exit code label', () => {
@@ -63,5 +72,15 @@ describe('createExecutionMessages', () => {
         exitCode: 0,
       }).map((message) => message.content),
     ).toEqual(['OpenCode returned no output.'])
+  })
+
+  it('renders step finish fallback text when no reason is provided', () => {
+    expect(
+      createExecutionMessages({
+        events: [{ kind: 'step_finish', reason: null }],
+        stderr: '',
+        exitCode: 0,
+      }).map((message) => message.content),
+    ).toEqual(['step_finish:\nOpenCode finished a run step.'])
   })
 })

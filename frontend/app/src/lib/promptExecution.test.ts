@@ -11,6 +11,8 @@ describe('parsePromptExecutionResult', () => {
       parsePromptExecutionResult({
         events: [
           { kind: 'text', text: 'done' },
+          { kind: 'step_start' },
+          { kind: 'step_finish', reason: 'stop' },
           { kind: 'tool_use', tool: 'bash', status: 'completed', detail: 'Shows status' },
         ],
         stderr: '',
@@ -19,6 +21,8 @@ describe('parsePromptExecutionResult', () => {
     ).toEqual({
       events: [
         { kind: 'text', text: 'done' },
+        { kind: 'step_start' },
+        { kind: 'step_finish', reason: 'stop' },
         { kind: 'tool_use', tool: 'bash', status: 'completed', detail: 'Shows status' },
       ],
       stderr: '',

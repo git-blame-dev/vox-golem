@@ -30,6 +30,27 @@ export function createExecutionMessages(
       continue
     }
 
+    if (event.kind === 'step_start') {
+      messages.push({
+        id: `system-step-start-${Date.now()}-${messages.length}`,
+        role: 'system',
+        content: 'step_start:\nOpenCode started a run step.',
+      })
+      continue
+    }
+
+    if (event.kind === 'step_finish') {
+      messages.push({
+        id: `system-step-finish-${Date.now()}-${messages.length}`,
+        role: 'system',
+        content:
+          event.reason === null
+            ? 'step_finish:\nOpenCode finished a run step.'
+            : `step_finish:\n${event.reason}`,
+      })
+      continue
+    }
+
     if (event.kind === 'tool_use') {
       messages.push({
         id: `system-tool-${Date.now()}-${messages.length}`,
