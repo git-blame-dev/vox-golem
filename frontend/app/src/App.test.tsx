@@ -246,14 +246,22 @@ describe('App', () => {
     })
 
     window.__TAURI_INTERNALS__ = {
-      invoke: async () => ({
-        kind: 'ready',
-        cue_asset_paths: {
-          start_listening: 'test-assets/configured-start.mp3',
-          stop_listening: 'test-assets/configured-stop.mp3',
-        },
-        runtime_phase: 'sleeping',
-      }),
+      invoke: async (command) => {
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'test-assets/configured-start.mp3',
+              stop_listening: 'test-assets/configured-stop.mp3',
+            },
+            runtime_phase: 'sleeping',
+          }
+        }
+
+        return {
+          runtime_phase: 'listening',
+        }
+      },
     }
 
     const { container } = await renderApp()
@@ -265,6 +273,7 @@ describe('App', () => {
     })
 
     expect(playedSources).toEqual(['test-assets/configured-start.mp3'])
+    expect(container.textContent).toContain('Runtime: listening')
   })
 })
 
