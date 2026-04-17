@@ -58,6 +58,11 @@ struct PromptExecutionPayload {
 }
 
 #[derive(Clone, Debug, Serialize)]
+struct RuntimePhaseResponsePayload {
+    runtime_phase: RuntimePhasePayload,
+}
+
+#[derive(Clone, Debug, Serialize)]
 struct CueAssetPathsPayload {
     start_listening: String,
     stop_listening: String,
@@ -174,6 +179,71 @@ fn submit_prompt(
     })
 }
 
+#[tauri::command]
+fn begin_listening(
+    app_state: tauri::State<'_, AppState>,
+) -> Result<RuntimePhaseResponsePayload, String> {
+    apply_session_transition(
+        &app_state.session_state,
+        app_state.session_config,
+        voxgolem_core::session::SessionEvent::WakeWordDetected { now_ms: 0 },
+    )?;
+
+    Ok(RuntimePhaseResponsePayload {
+        runtime_phase: current_runtime_phase(&app_state.session_state)?,
+    })
+}
+
+#[tauri::command]
+fn mark_silence(
+    app_state: tauri::State<'_, AppState>,
+) -> Result<RuntimePhaseResponsePayload, String> {
+    let silence_deadline =
+        current_silence_deadline(&app_state.session_state, app_state.session_config)?;
+
+    apply_session_transition(
+        &app_state.session_state,
+        app_state.session_config,
+        voxgolem_core::session::SessionEvent::SilenceCheck {
+            now_ms: silence_deadline,
+        },
+    )?;
+
+    Ok(RuntimePhaseResponsePayload {
+        runtime_phase: current_runtime_phase(&app_state.session_state)?,
+    })
+}
+
+#[tauri::command]
+fn mark_result_ready(
+    app_state: tauri::State<'_, AppState>,
+) -> Result<RuntimePhaseResponsePayload, String> {
+    apply_session_transition(
+        &app_state.session_state,
+        app_state.session_config,
+        voxgolem_core::session::SessionEvent::PromptCompleted,
+    )?;
+
+    Ok(RuntimePhaseResponsePayload {
+        runtime_phase: current_runtime_phase(&app_state.session_state)?,
+    })
+}
+
+#[tauri::command]
+fn reset_session(
+    app_state: tauri::State<'_, AppState>,
+) -> Result<RuntimePhaseResponsePayload, String> {
+    apply_session_transition(
+        &app_state.session_state,
+        app_state.session_config,
+        voxgolem_core::session::SessionEvent::ResetToIdle,
+    )?;
+
+    Ok(RuntimePhaseResponsePayload {
+        runtime_phase: current_runtime_phase(&app_state.session_state)?,
+    })
+}
+
 fn build_app_state() -> AppState {
     let session_config = default_session_config();
 
@@ -228,6 +298,18 @@ fn current_runtime_phase(
         .map_err(|_| String::from("session state lock is poisoned"))?;
 
     Ok(to_runtime_phase_payload(guard.runtime().phase()))
+}
+
+fn current_silence_deadline(
+    session_state: &Mutex<voxgolem_core::session::SessionState>,
+    session_config: voxgolem_core::session::SessionConfig,
+) -> Result<u64, String> {
+    let guard = session_state
+        .lock()
+        .map_err(|_| String::from("session state lock is poisoned"))?;
+
+    let last_activity_ms = guard.voice_turn().last_activity_ms().unwrap_or(0);
+    Ok(last_activity_ms.saturating_add(session_config.voice_turn().silence_timeout_ms()))
 }
 
 fn to_runtime_phase_payload(
@@ -296,9 +378,17 @@ fn prompt_result_error_message(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app_state = build_app_state();
-    let builder = tauri::Builder::default()
-        .manage(app_state)
-        .invoke_handler(tauri::generate_handler![get_startup_state, submit_prompt]);
+    let builder =
+        tauri::Builder::default()
+            .manage(app_state)
+            .invoke_handler(tauri::generate_handler![
+                get_startup_state,
+                submit_prompt,
+                begin_listening,
+                mark_silence,
+                mark_result_ready,
+                reset_session
+            ]);
 
     if let Err(error) = builder.run(tauri::generate_context!()) {
         eprintln!("failed to run vox-golem tauri shell: {error}");
@@ -308,7 +398,11 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{prompt_result_error_message, to_runtime_phase_payload, RuntimePhasePayload};
+    use super::{
+        current_silence_deadline, default_session_config, prompt_result_error_message,
+        to_runtime_phase_payload, RuntimePhasePayload, DEFAULT_SILENCE_TIMEOUT_MS,
+    };
+    use std::sync::Mutex;
 
     #[test]
     fn prompt_result_error_message_prefers_non_zero_exit_code() {
@@ -363,5 +457,28 @@ mod tests {
             to_runtime_phase_payload(voxgolem_core::runtime::RuntimePhase::Processing),
             RuntimePhasePayload::Processing
         ));
+    }
+
+    #[test]
+    fn current_silence_deadline_uses_last_activity_plus_timeout() {
+        let session_config = default_session_config();
+        let session_state = voxgolem_core::session::apply_session_event(
+            &voxgolem_core::session::SessionState::new(),
+            session_config,
+            voxgolem_core::session::SessionEvent::StartupValidated,
+        )
+        .expect("startup validation should succeed");
+        let listening_state = voxgolem_core::session::apply_session_event(
+            &session_state,
+            session_config,
+            voxgolem_core::session::SessionEvent::WakeWordDetected { now_ms: 100 },
+        )
+        .expect("wake word should start listening");
+        let locked_state = Mutex::new(listening_state);
+
+        assert_eq!(
+            current_silence_deadline(&locked_state, session_config),
+            Ok(DEFAULT_SILENCE_TIMEOUT_MS + 100)
+        );
     }
 }

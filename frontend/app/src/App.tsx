@@ -4,6 +4,7 @@ import { ChatBubble } from './components/ChatBubble'
 import { playCue } from './lib/audioCues'
 import { shouldSubmitComposer } from './lib/composer'
 import { executePrompt } from './lib/promptExecution'
+import { invokeRuntimeControl } from './lib/runtimeControl'
 import { DEFAULT_CUE_ASSET_PATHS, loadStartupState } from './lib/startupState'
 import { createExecutionMessages, getInitialMessages } from './state/appShell'
 import { cueForTransition, transitionRuntimeStatus } from './state/runtimeMachine'
@@ -97,6 +98,34 @@ function App() {
     return nextStatus
   }
 
+  const applyRuntimeStatus = (nextStatus: RuntimeStatus): RuntimeStatus => {
+    if (nextStatus === runtimeStatus) {
+      return runtimeStatus
+    }
+
+    setRuntimeStatus(nextStatus)
+
+    const cueType = cueForTransition(runtimeStatus, nextStatus)
+
+    if (cueType !== null) {
+      void playCue(cueType, cueAssetPaths).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : 'Unknown cue playback error'
+
+        setRuntimeStatus('error')
+        setMessages((currentMessages) => [
+          ...currentMessages,
+          {
+            id: `system-cue-error-${Date.now()}`,
+            role: 'system',
+            content: `Cue playback error: ${message}`,
+          },
+        ])
+      })
+    }
+
+    return nextStatus
+  }
+
   const transitionFromCurrentStatus = (
     event: Parameters<typeof transitionRuntimeStatus>[1],
   ): void => {
@@ -105,6 +134,38 @@ function App() {
     }
 
     applyTransition(runtimeStatus, event)
+  }
+
+  const syncRuntimeControl = async (
+    command: 'begin_listening' | 'mark_silence' | 'mark_result_ready' | 'reset_session',
+    fallbackEvent: Parameters<typeof transitionRuntimeStatus>[1],
+  ): Promise<void> => {
+    if (startupState.kind !== 'ready') {
+      return
+    }
+
+    try {
+      const runtimePhase = await invokeRuntimeControl(command)
+
+      if (runtimePhase === null) {
+        transitionFromCurrentStatus(fallbackEvent)
+        return
+      }
+
+      applyRuntimeStatus(toRuntimeStatus(runtimePhase))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Runtime control failed'
+
+      setRuntimeStatus('error')
+      setMessages((currentMessages) => [
+        ...currentMessages,
+        {
+          id: `system-runtime-control-error-${Date.now()}`,
+          role: 'system',
+          content: `Runtime control error: ${message}`,
+        },
+      ])
+    }
   }
 
   const sendPrompt = async (): Promise<void> => {
@@ -138,7 +199,7 @@ function App() {
       const nextMessages = createExecutionMessages(result)
 
       setMessages((currentMessages) => [...currentMessages, ...nextMessages])
-      setRuntimeStatus(toRuntimeStatus(result.runtimePhase))
+      applyRuntimeStatus(toRuntimeStatus(result.runtimePhase))
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Prompt execution failed'
 
@@ -183,7 +244,9 @@ function App() {
           <button
             type="button"
             className="shell__control"
-            onClick={() => transitionFromCurrentStatus('begin_listening')}
+            onClick={() => {
+              void syncRuntimeControl('begin_listening', 'begin_listening')
+            }}
             disabled={!canStartListening}
           >
             Start listening
@@ -191,7 +254,9 @@ function App() {
           <button
             type="button"
             className="shell__control"
-            onClick={() => transitionFromCurrentStatus('end_listening')}
+            onClick={() => {
+              void syncRuntimeControl('mark_silence', 'end_listening')
+            }}
             disabled={!canMarkSilence}
           >
             Mark silence
@@ -199,7 +264,9 @@ function App() {
           <button
             type="button"
             className="shell__control"
-            onClick={() => transitionFromCurrentStatus('response_ready')}
+            onClick={() => {
+              void syncRuntimeControl('mark_result_ready', 'response_ready')
+            }}
             disabled={!canMarkResultReady}
           >
             Mark result ready
@@ -207,11 +274,12 @@ function App() {
           <button
             type="button"
             className="shell__control"
-            onClick={() =>
-              transitionFromCurrentStatus(
+            onClick={() => {
+              void syncRuntimeControl(
+                'reset_session',
                 runtimeStatus === 'error' ? 'recover_from_error' : 'reset_to_sleeping',
               )
-            }
+            }}
             disabled={!canResetToIdle}
           >
             Reset to idle
