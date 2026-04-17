@@ -17,10 +17,14 @@ describe('invokeRuntimeControl', () => {
 
         return {
           runtime_phase: 'listening',
+          transcription_ready_samples: null,
         }
       },
     }
 
-    await expect(invokeRuntimeControl('begin_listening')).resolves.toBe('listening')
+    await expect(invokeRuntimeControl('begin_listening')).resolves.toEqual({
+      runtimePhase: 'listening',
+      transcriptionReadySamples: null,
+    })
   })
 })

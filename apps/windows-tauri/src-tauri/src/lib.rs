@@ -62,6 +62,7 @@ struct PromptExecutionPayload {
 #[derive(Clone, Debug, Serialize)]
 struct RuntimePhaseResponsePayload {
     runtime_phase: RuntimePhasePayload,
+    transcription_ready_samples: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -195,6 +196,7 @@ fn begin_listening(
 
     Ok(RuntimePhaseResponsePayload {
         runtime_phase: current_runtime_phase(&app_state.voice_pipeline_state)?,
+        transcription_ready_samples: None,
     })
 }
 
@@ -207,7 +209,7 @@ fn mark_silence(
         app_state.voice_pipeline_config,
     )?;
 
-    apply_voice_pipeline_transition(
+    let action = apply_voice_pipeline_transition(
         &app_state.voice_pipeline_state,
         app_state.voice_pipeline_config,
         voxgolem_core::voice_pipeline::VoicePipelineEvent::SilenceCheck {
@@ -217,6 +219,7 @@ fn mark_silence(
 
     Ok(RuntimePhaseResponsePayload {
         runtime_phase: current_runtime_phase(&app_state.voice_pipeline_state)?,
+        transcription_ready_samples: transcription_ready_samples(&action),
     })
 }
 
@@ -232,6 +235,7 @@ fn mark_result_ready(
 
     Ok(RuntimePhaseResponsePayload {
         runtime_phase: current_runtime_phase(&app_state.voice_pipeline_state)?,
+        transcription_ready_samples: None,
     })
 }
 
@@ -247,6 +251,7 @@ fn reset_session(
 
     Ok(RuntimePhaseResponsePayload {
         runtime_phase: current_runtime_phase(&app_state.voice_pipeline_state)?,
+        transcription_ready_samples: None,
     })
 }
 
@@ -359,12 +364,12 @@ fn apply_voice_pipeline_transition(
     voice_pipeline_state: &Mutex<voxgolem_core::voice_pipeline::VoicePipelineState>,
     voice_pipeline_config: voxgolem_core::voice_pipeline::VoicePipelineConfig,
     event: voxgolem_core::voice_pipeline::VoicePipelineEvent,
-) -> Result<(), String> {
+) -> Result<voxgolem_core::voice_pipeline::VoicePipelineAction, String> {
     let mut guard = voice_pipeline_state
         .lock()
         .map_err(|_| String::from("voice pipeline lock is poisoned"))?;
 
-    let (next_state, _) = voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
+    let (next_state, action) = voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
         &guard,
         voice_pipeline_config,
         event,
@@ -372,7 +377,7 @@ fn apply_voice_pipeline_transition(
     .map_err(|error| format!("voice pipeline transition failed: {error:?}"))?;
 
     *guard = next_state;
-    Ok(())
+    Ok(action)
 }
 
 fn apply_voice_pipeline_event_or_panic(
@@ -403,6 +408,17 @@ fn prompt_result_error_message(
     })
 }
 
+fn transcription_ready_samples(
+    action: &voxgolem_core::voice_pipeline::VoicePipelineAction,
+) -> Option<usize> {
+    match action {
+        voxgolem_core::voice_pipeline::VoicePipelineAction::FinishedUtterance {
+            transcription_input,
+        } => Some(transcription_input.samples().len()),
+        _ => None,
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app_state = build_app_state();
@@ -428,7 +444,8 @@ pub fn run() {
 mod tests {
     use super::{
         current_silence_deadline, default_voice_pipeline_config, prompt_result_error_message,
-        to_runtime_phase_payload, RuntimePhasePayload, DEFAULT_SILENCE_TIMEOUT_MS,
+        to_runtime_phase_payload, transcription_ready_samples, RuntimePhasePayload,
+        DEFAULT_SILENCE_TIMEOUT_MS,
     };
     use std::sync::Mutex;
 
@@ -509,5 +526,18 @@ mod tests {
             current_silence_deadline(&locked_state, voice_pipeline_config),
             Ok(DEFAULT_SILENCE_TIMEOUT_MS + 100)
         );
+    }
+
+    #[test]
+    fn transcription_ready_samples_reads_finished_utterance_length() {
+        let action = voxgolem_core::voice_pipeline::VoicePipelineAction::FinishedUtterance {
+            transcription_input: voxgolem_model::parakeet::ParakeetTranscriptionInput::new(
+                voxgolem_model::parakeet::PARAKEET_SAMPLE_RATE_HZ,
+                vec![0.1, 0.2, 0.3],
+            )
+            .expect("valid transcription input"),
+        };
+
+        assert_eq!(transcription_ready_samples(&action), Some(3));
     }
 }

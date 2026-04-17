@@ -258,8 +258,16 @@ describe('App', () => {
           }
         }
 
+        if (command === 'begin_listening') {
+          return {
+            runtime_phase: 'listening',
+            transcription_ready_samples: null,
+          }
+        }
+
         return {
-          runtime_phase: 'listening',
+          runtime_phase: 'processing',
+          transcription_ready_samples: 3200,
         }
       },
     }
@@ -274,6 +282,16 @@ describe('App', () => {
 
     expect(playedSources).toEqual(['test-assets/configured-start.mp3'])
     expect(container.textContent).toContain('Runtime: listening')
+
+    const markSilenceButton = getControlButton(container, 'Mark silence')
+
+    await act(async () => {
+      markSilenceButton.click()
+      await Promise.resolve()
+    })
+
+    expect(container.textContent).toContain('Runtime: processing')
+    expect(container.textContent).toContain('transcription_ready:\n3200 samples captured')
   })
 })
 
