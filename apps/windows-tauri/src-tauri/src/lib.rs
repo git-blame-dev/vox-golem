@@ -6,8 +6,18 @@ use serde::Serialize;
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum PromptExecutionEventPayload {
-    Text { text: String },
-    Error { name: String, message: String },
+    Text {
+        text: String,
+    },
+    Error {
+        name: String,
+        message: String,
+    },
+    ToolUse {
+        tool: String,
+        status: String,
+        detail: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -61,6 +71,22 @@ fn submit_prompt(prompt: String) -> Result<PromptExecutionPayload, String> {
                 voxgolem_platform::opencode::OpencodeJsonEvent::Error { name, message } => {
                     PromptExecutionEventPayload::Error { name, message }
                 }
+                voxgolem_platform::opencode::OpencodeJsonEvent::ToolUse {
+                    tool,
+                    status,
+                    detail,
+                } => PromptExecutionEventPayload::ToolUse {
+                    tool,
+                    status: match status {
+                        voxgolem_platform::opencode::OpencodeToolUseStatus::Completed => {
+                            "completed".to_string()
+                        }
+                        voxgolem_platform::opencode::OpencodeToolUseStatus::Error => {
+                            "error".to_string()
+                        }
+                    },
+                    detail,
+                },
             })
             .collect(),
         stderr: result.stderr,

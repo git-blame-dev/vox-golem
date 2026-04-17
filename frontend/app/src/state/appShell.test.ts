@@ -38,6 +38,23 @@ describe('createExecutionMessages', () => {
     ).toEqual(['opencode_error:\nAPIError: Provider failed'])
   })
 
+  it('creates a system message for structured tool-use events', () => {
+    expect(
+      createExecutionMessages({
+        events: [
+          {
+            kind: 'tool_use',
+            tool: 'bash',
+            status: 'completed',
+            detail: 'Shows working tree status',
+          },
+        ],
+        stderr: '',
+        exitCode: 0,
+      }).map((message) => message.content),
+    ).toEqual(['tool_use:\nbash (completed)\nShows working tree status'])
+  })
+
   it('returns fallback message when no output is produced', () => {
     expect(
       createExecutionMessages({

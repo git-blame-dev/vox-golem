@@ -52,8 +52,24 @@ pub struct OpencodeJsonRunResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpencodeJsonEvent {
-    Text { text: String },
-    Error { name: String, message: String },
+    Text {
+        text: String,
+    },
+    Error {
+        name: String,
+        message: String,
+    },
+    ToolUse {
+        tool: String,
+        status: OpencodeToolUseStatus,
+        detail: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpencodeToolUseStatus {
+    Completed,
+    Error,
 }
 
 #[derive(Debug)]
@@ -193,6 +209,34 @@ fn parse_json_events(stdout: &str) -> Result<Vec<OpencodeJsonEvent>, OpencodeJso
                     message,
                 });
             }
+            RawJsonEvent::ToolUse { part, .. } => match part.state {
+                RawToolState::Completed { title, output } => {
+                    let detail = if title.trim().is_empty() {
+                        output.trim().to_string()
+                    } else {
+                        title
+                    };
+
+                    if !detail.is_empty() {
+                        events.push(OpencodeJsonEvent::ToolUse {
+                            tool: part.tool,
+                            status: OpencodeToolUseStatus::Completed,
+                            detail,
+                        });
+                    }
+                }
+                RawToolState::Error { error } => {
+                    let detail = error.trim();
+
+                    if !detail.is_empty() {
+                        events.push(OpencodeJsonEvent::ToolUse {
+                            tool: part.tool,
+                            status: OpencodeToolUseStatus::Error,
+                            detail: detail.to_string(),
+                        });
+                    }
+                }
+            },
             RawJsonEvent::Other => {}
         }
     }
@@ -219,6 +263,14 @@ enum RawJsonEvent {
         #[serde(rename = "sessionID")]
         _session_id: String,
     },
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        part: RawToolUsePart,
+        #[serde(rename = "timestamp")]
+        _timestamp: u64,
+        #[serde(rename = "sessionID")]
+        _session_id: String,
+    },
     #[serde(other)]
     Other,
 }
@@ -239,11 +291,27 @@ struct RawErrorData {
     message: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RawToolUsePart {
+    tool: String,
+    state: RawToolState,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "status")]
+enum RawToolState {
+    #[serde(rename = "completed")]
+    Completed { title: String, output: String },
+    #[serde(rename = "error")]
+    Error { error: String },
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         run_opencode, run_opencode_json, OpencodeCommandSpec, OpencodeJsonEvent,
         OpencodeJsonRunError, OpencodeOutputFormat, OpencodePrompt, OpencodePromptError,
+        OpencodeToolUseStatus,
     };
     use std::ffi::OsStr;
     use std::fs;
@@ -391,7 +459,7 @@ mod tests {
         let temp = TempDir::new();
         let executable = create_fake_opencode(
             temp.path(),
-            "printf '%s\n' '{\"type\":\"text\",\"timestamp\":1,\"sessionID\":\"ses_1\",\"part\":{\"text\":\"Hello from OpenCode\"}}' '{\"type\":\"step_start\",\"timestamp\":2,\"sessionID\":\"ses_1\",\"part\":{}}' '{\"type\":\"error\",\"timestamp\":3,\"sessionID\":\"ses_1\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"Provider failed\"}}}'",
+            "printf '%s\n' '{\"type\":\"text\",\"timestamp\":1,\"sessionID\":\"ses_1\",\"part\":{\"text\":\"Hello from OpenCode\"}}' '{\"type\":\"tool_use\",\"timestamp\":2,\"sessionID\":\"ses_1\",\"part\":{\"tool\":\"bash\",\"state\":{\"status\":\"completed\",\"title\":\"Shows working tree status\",\"output\":\"On branch main\"}}}' '{\"type\":\"step_start\",\"timestamp\":3,\"sessionID\":\"ses_1\",\"part\":{}}' '{\"type\":\"error\",\"timestamp\":4,\"sessionID\":\"ses_1\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"Provider failed\"}}}'",
         );
         let prompt = OpencodePrompt::new("summarize the transcript")
             .expect("non-empty prompt should be accepted");
@@ -405,6 +473,11 @@ mod tests {
             vec![
                 OpencodeJsonEvent::Text {
                     text: "Hello from OpenCode".to_string(),
+                },
+                OpencodeJsonEvent::ToolUse {
+                    tool: "bash".to_string(),
+                    status: OpencodeToolUseStatus::Completed,
+                    detail: "Shows working tree status".to_string(),
                 },
                 OpencodeJsonEvent::Error {
                     name: "APIError".to_string(),
@@ -431,6 +504,30 @@ mod tests {
             result,
             Err(OpencodeJsonRunError::InvalidJsonLine { line_number: 1, .. })
         ));
+    }
+
+    #[test]
+    fn parses_tool_use_error_events() {
+        let temp = TempDir::new();
+        let executable = create_fake_opencode(
+            temp.path(),
+            "printf '%s\n' '{\"type\":\"tool_use\",\"timestamp\":1,\"sessionID\":\"ses_1\",\"part\":{\"tool\":\"bash\",\"state\":{\"status\":\"error\",\"error\":\"command failed\"}}}'",
+        );
+        let prompt = OpencodePrompt::new("summarize the transcript")
+            .expect("non-empty prompt should be accepted");
+        let spec = OpencodeCommandSpec::new(executable, prompt)
+            .with_output_format(OpencodeOutputFormat::Json);
+
+        let result = run_opencode_json(&spec).expect("fake json executable should run");
+
+        assert_eq!(
+            result.events,
+            vec![OpencodeJsonEvent::ToolUse {
+                tool: "bash".to_string(),
+                status: OpencodeToolUseStatus::Error,
+                detail: "command failed".to_string(),
+            }]
+        );
     }
 
     fn create_fake_opencode(directory: &Path, body: &str) -> PathBuf {
