@@ -160,11 +160,29 @@ pub fn apply_runtime_event(
     Ok(next_state)
 }
 
+pub fn reset_runtime_to_idle(state: &RuntimeState) -> Result<RuntimeState, RuntimeTransitionError> {
+    match state.phase() {
+        RuntimePhase::Initializing => Err(RuntimeTransitionError {
+            phase: RuntimePhase::Initializing,
+            event: RuntimeEventKind::ResetToIdle,
+        }),
+        RuntimePhase::Error => apply_runtime_event(state, RuntimeEvent::RecoverFromError),
+        RuntimePhase::Sleeping
+        | RuntimePhase::Listening
+        | RuntimePhase::Processing
+        | RuntimePhase::Executing
+        | RuntimePhase::ResultReady => Ok(RuntimeState {
+            phase: RuntimePhase::Sleeping,
+            last_error: None,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_runtime_event, RuntimeEvent, RuntimeEventKind, RuntimePhase, RuntimeState,
-        RuntimeTransitionError,
+        apply_runtime_event, reset_runtime_to_idle, RuntimeEvent, RuntimeEventKind, RuntimePhase,
+        RuntimeState, RuntimeTransitionError,
     };
 
     #[test]
@@ -287,5 +305,33 @@ mod tests {
                 event: RuntimeEventKind::SubmitPrompt,
             }
         );
+    }
+
+    #[test]
+    fn reset_runtime_to_idle_clears_active_execution_states() {
+        let state = RuntimeState {
+            phase: RuntimePhase::Executing,
+            last_error: None,
+        };
+
+        let next =
+            reset_runtime_to_idle(&state).expect("executing should be resettable back to sleeping");
+
+        assert_eq!(next.phase(), RuntimePhase::Sleeping);
+        assert_eq!(next.last_error(), None);
+    }
+
+    #[test]
+    fn reset_runtime_to_idle_recovers_error() {
+        let state = RuntimeState {
+            phase: RuntimePhase::Error,
+            last_error: Some("provider failed".to_string()),
+        };
+
+        let next =
+            reset_runtime_to_idle(&state).expect("error should be resettable back to sleeping");
+
+        assert_eq!(next.phase(), RuntimePhase::Sleeping);
+        assert_eq!(next.last_error(), None);
     }
 }
