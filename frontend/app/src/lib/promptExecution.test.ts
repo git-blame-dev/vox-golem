@@ -11,6 +11,7 @@ describe('parsePromptExecutionResult', () => {
       parsePromptExecutionResult({
         events: [
           { kind: 'text', text: 'done' },
+          { kind: 'reasoning', text: 'Need to inspect the repo state first' },
           { kind: 'step_start' },
           { kind: 'step_finish', reason: 'stop' },
           { kind: 'tool_use', tool: 'bash', status: 'completed', detail: 'Shows status' },
@@ -21,6 +22,7 @@ describe('parsePromptExecutionResult', () => {
     ).toEqual({
       events: [
         { kind: 'text', text: 'done' },
+        { kind: 'reasoning', text: 'Need to inspect the repo state first' },
         { kind: 'step_start' },
         { kind: 'step_finish', reason: 'stop' },
         { kind: 'tool_use', tool: 'bash', status: 'completed', detail: 'Shows status' },

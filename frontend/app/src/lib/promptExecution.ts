@@ -75,6 +75,19 @@ function parsePromptExecutionEvent(payload: unknown): PromptExecutionEvent {
     }
   }
 
+  if (payload['kind'] === 'reasoning') {
+    const text = payload['text']
+
+    if (typeof text !== 'string') {
+      throw new Error('Reasoning event must include text')
+    }
+
+    return {
+      kind: 'reasoning',
+      text,
+    }
+  }
+
   if (payload['kind'] === 'step_start') {
     return {
       kind: 'step_start',

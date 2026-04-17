@@ -55,6 +55,9 @@ pub enum OpencodeJsonEvent {
     Text {
         text: String,
     },
+    Reasoning {
+        text: String,
+    },
     StepStart,
     StepFinish {
         reason: Option<String>,
@@ -200,6 +203,15 @@ fn parse_json_events(stdout: &str) -> Result<Vec<OpencodeJsonEvent>, OpencodeJso
                     });
                 }
             }
+            RawJsonEvent::Reasoning { part, .. } => {
+                let text = part.text.trim();
+
+                if !text.is_empty() {
+                    events.push(OpencodeJsonEvent::Reasoning {
+                        text: text.to_string(),
+                    });
+                }
+            }
             RawJsonEvent::StepStart { .. } => {
                 events.push(OpencodeJsonEvent::StepStart);
             }
@@ -278,6 +290,14 @@ enum RawJsonEvent {
     #[serde(rename = "error")]
     Error {
         error: RawErrorPayload,
+        #[serde(rename = "timestamp")]
+        _timestamp: u64,
+        #[serde(rename = "sessionID")]
+        _session_id: String,
+    },
+    #[serde(rename = "reasoning")]
+    Reasoning {
+        part: RawTextPart,
         #[serde(rename = "timestamp")]
         _timestamp: u64,
         #[serde(rename = "sessionID")]
@@ -511,6 +531,9 @@ mod tests {
                 OpencodeJsonEvent::Text {
                     text: "Hello from OpenCode".to_string(),
                 },
+                OpencodeJsonEvent::Reasoning {
+                    text: "Need to inspect the repo state first".to_string(),
+                },
                 OpencodeJsonEvent::StepStart,
                 OpencodeJsonEvent::StepFinish {
                     reason: Some("stop".to_string()),
@@ -642,12 +665,12 @@ mod tests {
 
     #[cfg(windows)]
     fn json_events_script() -> &'static str {
-        "echo {\"type\":\"text\",\"timestamp\":1,\"sessionID\":\"ses_1\",\"part\":{\"text\":\"Hello from OpenCode\"}}\necho {\"type\":\"step_start\",\"timestamp\":2,\"sessionID\":\"ses_1\"}\necho {\"type\":\"step_finish\",\"timestamp\":3,\"sessionID\":\"ses_1\",\"part\":{\"reason\":\"stop\"}}\necho {\"type\":\"tool_use\",\"timestamp\":4,\"sessionID\":\"ses_1\",\"part\":{\"tool\":\"bash\",\"state\":{\"status\":\"completed\",\"title\":\"Shows working tree status\",\"output\":\"On branch main\"}}}\necho {\"type\":\"error\",\"timestamp\":5,\"sessionID\":\"ses_1\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"Provider failed\"}}}"
+        "echo {\"type\":\"text\",\"timestamp\":1,\"sessionID\":\"ses_1\",\"part\":{\"text\":\"Hello from OpenCode\"}}\necho {\"type\":\"reasoning\",\"timestamp\":2,\"sessionID\":\"ses_1\",\"part\":{\"text\":\"Need to inspect the repo state first\"}}\necho {\"type\":\"step_start\",\"timestamp\":3,\"sessionID\":\"ses_1\"}\necho {\"type\":\"step_finish\",\"timestamp\":4,\"sessionID\":\"ses_1\",\"part\":{\"reason\":\"stop\"}}\necho {\"type\":\"tool_use\",\"timestamp\":5,\"sessionID\":\"ses_1\",\"part\":{\"tool\":\"bash\",\"state\":{\"status\":\"completed\",\"title\":\"Shows working tree status\",\"output\":\"On branch main\"}}}\necho {\"type\":\"error\",\"timestamp\":6,\"sessionID\":\"ses_1\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"Provider failed\"}}}"
     }
 
     #[cfg(not(windows))]
     fn json_events_script() -> &'static str {
-        "printf '%s\\n' '{\"type\":\"text\",\"timestamp\":1,\"sessionID\":\"ses_1\",\"part\":{\"text\":\"Hello from OpenCode\"}}' '{\"type\":\"step_start\",\"timestamp\":2,\"sessionID\":\"ses_1\"}' '{\"type\":\"step_finish\",\"timestamp\":3,\"sessionID\":\"ses_1\",\"part\":{\"reason\":\"stop\"}}' '{\"type\":\"tool_use\",\"timestamp\":4,\"sessionID\":\"ses_1\",\"part\":{\"tool\":\"bash\",\"state\":{\"status\":\"completed\",\"title\":\"Shows working tree status\",\"output\":\"On branch main\"}}}' '{\"type\":\"error\",\"timestamp\":5,\"sessionID\":\"ses_1\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"Provider failed\"}}}'"
+        "printf '%s\\n' '{\"type\":\"text\",\"timestamp\":1,\"sessionID\":\"ses_1\",\"part\":{\"text\":\"Hello from OpenCode\"}}' '{\"type\":\"reasoning\",\"timestamp\":2,\"sessionID\":\"ses_1\",\"part\":{\"text\":\"Need to inspect the repo state first\"}}' '{\"type\":\"step_start\",\"timestamp\":3,\"sessionID\":\"ses_1\"}' '{\"type\":\"step_finish\",\"timestamp\":4,\"sessionID\":\"ses_1\",\"part\":{\"reason\":\"stop\"}}' '{\"type\":\"tool_use\",\"timestamp\":5,\"sessionID\":\"ses_1\",\"part\":{\"tool\":\"bash\",\"state\":{\"status\":\"completed\",\"title\":\"Shows working tree status\",\"output\":\"On branch main\"}}}' '{\"type\":\"error\",\"timestamp\":6,\"sessionID\":\"ses_1\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"Provider failed\"}}}'"
     }
 
     #[cfg(windows)]
