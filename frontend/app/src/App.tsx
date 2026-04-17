@@ -7,7 +7,12 @@ import { executePrompt } from './lib/promptExecution'
 import { DEFAULT_CUE_ASSET_PATHS, loadStartupState } from './lib/startupState'
 import { createExecutionMessages, getInitialMessages } from './state/appShell'
 import { cueForTransition, transitionRuntimeStatus } from './state/runtimeMachine'
-import type { ChatMessage, RuntimeStatus, StartupState } from './types/chat'
+import type {
+  BackendRuntimePhase,
+  ChatMessage,
+  RuntimeStatus,
+  StartupState,
+} from './types/chat'
 import './App.css'
 
 function App() {
@@ -27,7 +32,7 @@ function App() {
       }
 
       setStartupState(nextState)
-      setRuntimeStatus(nextState.kind === 'ready' ? 'sleeping' : 'error')
+      setRuntimeStatus(nextState.kind === 'ready' ? toRuntimeStatus(nextState.runtimePhase) : 'error')
     })
 
     return () => {
@@ -131,15 +136,9 @@ function App() {
     try {
       const result = await executePrompt(prompt)
       const nextMessages = createExecutionMessages(result)
-      const hasStructuredError = result.events.some((event) => event.kind === 'error')
 
       setMessages((currentMessages) => [...currentMessages, ...nextMessages])
-
-      if (!hasStructuredError && (result.exitCode === null || result.exitCode === 0)) {
-        applyTransition(executingStatus, 'response_ready')
-      } else {
-        applyTransition(executingStatus, 'fail')
-      }
+      setRuntimeStatus(toRuntimeStatus(result.runtimePhase))
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Prompt execution failed'
 
@@ -248,6 +247,10 @@ function App() {
       </form>
     </div>
   )
+}
+
+function toRuntimeStatus(runtimePhase: BackendRuntimePhase): RuntimeStatus {
+  return runtimePhase
 }
 
 export default App

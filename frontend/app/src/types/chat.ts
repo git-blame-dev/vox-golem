@@ -11,6 +11,15 @@ export interface CueAssetPaths {
   readonly stopListening: string
 }
 
+export type BackendRuntimePhase =
+  | 'initializing'
+  | 'sleeping'
+  | 'listening'
+  | 'processing'
+  | 'executing'
+  | 'result_ready'
+  | 'error'
+
 export type PromptExecutionEvent =
   | { readonly kind: 'text'; readonly text: string }
   | { readonly kind: 'reasoning'; readonly text: string }
@@ -28,11 +37,16 @@ export interface PromptExecutionResult {
   readonly events: readonly PromptExecutionEvent[]
   readonly stderr: string
   readonly exitCode: number | null
+  readonly runtimePhase: BackendRuntimePhase
 }
 
 export type StartupState =
   | { readonly kind: 'loading' }
-  | { readonly kind: 'ready'; readonly cueAssetPaths: CueAssetPaths }
+  | {
+      readonly kind: 'ready'
+      readonly cueAssetPaths: CueAssetPaths
+      readonly runtimePhase: BackendRuntimePhase
+    }
   | { readonly kind: 'error'; readonly message: string }
 
 export type RuntimeStatus =

@@ -94,6 +94,7 @@ describe('App', () => {
               start_listening: 'assets/start-listening.mp3',
               stop_listening: 'assets/stop-listening.mp3',
             },
+            runtime_phase: 'sleeping',
           }
         }
 
@@ -110,6 +111,7 @@ describe('App', () => {
           ],
           stderr: 'warning output',
           exit_code: 0,
+          runtime_phase: 'result_ready',
         }
       },
     }
@@ -145,6 +147,7 @@ describe('App', () => {
               start_listening: 'assets/start-listening.mp3',
               stop_listening: 'assets/stop-listening.mp3',
             },
+            runtime_phase: 'sleeping',
           }
         }
 
@@ -152,6 +155,7 @@ describe('App', () => {
           events: [],
           stderr: 'bad prompt',
           exit_code: 7,
+          runtime_phase: 'error',
         }
       },
     }
@@ -184,6 +188,7 @@ describe('App', () => {
               start_listening: 'assets/start-listening.mp3',
               stop_listening: 'assets/stop-listening.mp3',
             },
+            runtime_phase: 'sleeping',
           }
         }
 
@@ -197,6 +202,7 @@ describe('App', () => {
           ],
           stderr: '',
           exit_code: 0,
+          runtime_phase: 'error',
         }
       },
     }
@@ -246,6 +252,7 @@ describe('App', () => {
           start_listening: 'test-assets/configured-start.mp3',
           stop_listening: 'test-assets/configured-stop.mp3',
         },
+        runtime_phase: 'sleeping',
       }),
     }
 

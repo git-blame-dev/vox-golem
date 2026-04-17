@@ -14,10 +14,12 @@ describe('parseStartupState', () => {
           start_listening: 'assets/start-listening.mp3',
           stop_listening: 'assets/stop-listening.mp3',
         },
+        runtime_phase: 'sleeping',
       }),
     ).toEqual({
       kind: 'ready',
       cueAssetPaths: DEFAULT_CUE_ASSET_PATHS,
+      runtimePhase: 'sleeping',
     })
   })
 
@@ -49,6 +51,7 @@ describe('loadStartupState', () => {
     await expect(loadStartupState()).resolves.toEqual({
       kind: 'ready',
       cueAssetPaths: DEFAULT_CUE_ASSET_PATHS,
+      runtimePhase: 'sleeping',
     })
   })
 
@@ -60,6 +63,7 @@ describe('loadStartupState', () => {
           start_listening: 'configured/start.mp3',
           stop_listening: 'configured/stop.mp3',
         },
+        runtime_phase: 'sleeping',
       }),
     }
 
@@ -69,6 +73,7 @@ describe('loadStartupState', () => {
         startListening: 'configured/start.mp3',
         stopListening: 'configured/stop.mp3',
       },
+      runtimePhase: 'sleeping',
     })
   })
 
