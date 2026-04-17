@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod runtime;
+pub mod voice_turn;
 
 pub const APP_NAME: &str = "VoxGolem";
 
