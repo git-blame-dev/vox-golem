@@ -1,14 +1,5 @@
+import { getTauriInternals } from './tauri'
 import type { PromptExecutionResult } from '../types/chat'
-
-interface TauriInternals {
-  readonly invoke: (command: string, args?: unknown) => Promise<unknown>
-}
-
-declare global {
-  interface Window {
-    __TAURI_INTERNALS__?: TauriInternals
-  }
-}
 
 export function parsePromptExecutionResult(payload: unknown): PromptExecutionResult {
   if (!isRecord(payload)) {
@@ -43,9 +34,9 @@ export async function executePrompt(prompt: string): Promise<PromptExecutionResu
     return createFallbackResult(prompt)
   }
 
-  const tauriInternals = window.__TAURI_INTERNALS__
+  const tauriInternals = getTauriInternals()
 
-  if (!tauriInternals || typeof tauriInternals.invoke !== 'function') {
+  if (tauriInternals === null) {
     return createFallbackResult(prompt)
   }
 
