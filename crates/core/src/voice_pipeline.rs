@@ -55,6 +55,7 @@ pub enum VoicePipelineEvent {
     WakeWordDetected { now_ms: u64 },
     RecordListeningFrame { frame: Vec<f32> },
     SilenceCheck { now_ms: u64 },
+    SubmitPrompt,
     PromptCompleted,
     PromptFailed { message: String },
     ResetToIdle,
@@ -167,6 +168,21 @@ pub fn apply_voice_pipeline_event(
             };
 
             Ok((VoicePipelineState { session, capture }, action))
+        }
+        VoicePipelineEvent::SubmitPrompt => {
+            let session = apply_session_event(
+                state.session(),
+                config.session(),
+                SessionEvent::SubmitPrompt,
+            )
+            .map_err(VoicePipelineError::Session)?;
+            let mut capture = state.capture.clone();
+            capture.reset();
+
+            Ok((
+                VoicePipelineState { session, capture },
+                VoicePipelineAction::None,
+            ))
         }
         VoicePipelineEvent::PromptCompleted => {
             let session = apply_session_event(
@@ -350,6 +366,29 @@ mod tests {
         );
         assert!(!failed_state.capture().capturing_utterance());
         assert_eq!(failed_state.capture().utterance_len(), 0);
+        assert_eq!(action, VoicePipelineAction::None);
+    }
+
+    #[test]
+    fn submit_prompt_moves_runtime_to_executing_from_sleeping() {
+        let config = pipeline_config();
+        let (ready_state, _) = apply_voice_pipeline_event(
+            &VoicePipelineState::new(config).expect("pipeline should initialize"),
+            config,
+            VoicePipelineEvent::StartupValidated,
+        )
+        .expect("startup validation should succeed");
+
+        let (executing_state, action) =
+            apply_voice_pipeline_event(&ready_state, config, VoicePipelineEvent::SubmitPrompt)
+                .expect("submit prompt should enter executing");
+
+        assert_eq!(
+            executing_state.session().runtime().phase(),
+            RuntimePhase::Executing
+        );
+        assert!(!executing_state.capture().capturing_utterance());
+        assert_eq!(executing_state.capture().utterance_len(), 0);
         assert_eq!(action, VoicePipelineAction::None);
     }
 
