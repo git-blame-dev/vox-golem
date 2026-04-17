@@ -1,16 +1,22 @@
 use crate::runtime::RuntimePhase;
 use crate::session::{apply_session_event, SessionConfig, SessionEvent, SessionState};
 use crate::turn_capture::{TurnCaptureConfig, TurnCaptureState};
+use voxgolem_model::parakeet::{ParakeetTranscriptionInput, TranscriptionInputError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VoicePipelineConfig {
     session: SessionConfig,
     capture: TurnCaptureConfig,
+    sample_rate_hz: u32,
 }
 
 impl VoicePipelineConfig {
-    pub fn new(session: SessionConfig, capture: TurnCaptureConfig) -> Self {
-        Self { session, capture }
+    pub fn new(session: SessionConfig, capture: TurnCaptureConfig, sample_rate_hz: u32) -> Self {
+        Self {
+            session,
+            capture,
+            sample_rate_hz,
+        }
     }
 
     pub fn session(&self) -> SessionConfig {
@@ -19,6 +25,10 @@ impl VoicePipelineConfig {
 
     pub fn capture(&self) -> TurnCaptureConfig {
         self.capture
+    }
+
+    pub fn sample_rate_hz(&self) -> u32 {
+        self.sample_rate_hz
     }
 }
 
@@ -65,13 +75,16 @@ pub enum VoicePipelineEvent {
 pub enum VoicePipelineAction {
     None,
     StartedListening,
-    FinishedUtterance { audio: Vec<f32> },
+    FinishedUtterance {
+        transcription_input: ParakeetTranscriptionInput,
+    },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum VoicePipelineError {
     Session(crate::session::SessionTransitionError),
     Capture(voxgolem_audio::buffers::AudioBufferError),
+    TranscriptionInput(TranscriptionInputError),
 }
 
 pub fn apply_voice_pipeline_event(
@@ -160,8 +173,14 @@ pub fn apply_voice_pipeline_event(
             let action = if previous_phase == RuntimePhase::Listening
                 && session.runtime().phase() == RuntimePhase::Processing
             {
+                let transcription_input = ParakeetTranscriptionInput::new(
+                    config.sample_rate_hz(),
+                    capture.finish_utterance(),
+                )
+                .map_err(VoicePipelineError::TranscriptionInput)?;
+
                 VoicePipelineAction::FinishedUtterance {
-                    audio: capture.finish_utterance(),
+                    transcription_input,
                 }
             } else {
                 VoicePipelineAction::None
@@ -235,16 +254,20 @@ mod tests {
     use crate::session::SessionConfig;
     use crate::turn_capture::TurnCaptureConfig;
     use crate::voice_turn::VoiceTurnConfig;
+    use voxgolem_model::parakeet::{
+        ParakeetTranscriptionInput, TranscriptionInputError, PARAKEET_SAMPLE_RATE_HZ,
+    };
 
     use super::{
-        apply_voice_pipeline_event, VoicePipelineAction, VoicePipelineConfig, VoicePipelineEvent,
-        VoicePipelineState,
+        apply_voice_pipeline_event, VoicePipelineAction, VoicePipelineConfig, VoicePipelineError,
+        VoicePipelineEvent, VoicePipelineState,
     };
 
     fn pipeline_config() -> VoicePipelineConfig {
         VoicePipelineConfig::new(
             SessionConfig::new(VoiceTurnConfig::new(1_200).expect("valid silence timeout")),
             TurnCaptureConfig::new(4, 16).expect("valid turn capture config"),
+            PARAKEET_SAMPLE_RATE_HZ,
         )
     }
 
@@ -330,8 +353,58 @@ mod tests {
         assert_eq!(
             action,
             VoicePipelineAction::FinishedUtterance {
-                audio: vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+                transcription_input: ParakeetTranscriptionInput::new(
+                    PARAKEET_SAMPLE_RATE_HZ,
+                    vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+                )
+                .expect("captured utterance should become valid transcription input"),
             }
+        );
+    }
+
+    #[test]
+    fn silence_returns_transcription_input_error_for_wrong_sample_rate() {
+        let config = VoicePipelineConfig::new(
+            SessionConfig::new(VoiceTurnConfig::new(1_200).expect("valid silence timeout")),
+            TurnCaptureConfig::new(4, 16).expect("valid turn capture config"),
+            44_100,
+        );
+        let (ready_state, _) = apply_voice_pipeline_event(
+            &VoicePipelineState::new(config).expect("pipeline should initialize"),
+            config,
+            VoicePipelineEvent::StartupValidated,
+        )
+        .expect("startup validation should succeed");
+        let (sleeping_state, _) = apply_voice_pipeline_event(
+            &ready_state,
+            config,
+            VoicePipelineEvent::RecordSleepingFrame {
+                frame: vec![0.1, 0.2],
+            },
+        )
+        .expect("sleeping frame should be recorded");
+        let (listening_state, _) = apply_voice_pipeline_event(
+            &sleeping_state,
+            config,
+            VoicePipelineEvent::WakeWordDetected { now_ms: 100 },
+        )
+        .expect("wake word should start listening");
+
+        let error = apply_voice_pipeline_event(
+            &listening_state,
+            config,
+            VoicePipelineEvent::SilenceCheck { now_ms: 1_300 },
+        )
+        .expect_err("wrong sample rate should fail transcription input validation");
+
+        assert_eq!(
+            error,
+            VoicePipelineError::TranscriptionInput(
+                TranscriptionInputError::UnsupportedSampleRate {
+                    expected_hz: PARAKEET_SAMPLE_RATE_HZ,
+                    received_hz: 44_100,
+                }
+            )
         );
     }
 

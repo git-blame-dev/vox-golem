@@ -351,6 +351,7 @@ fn default_voice_pipeline_config() -> voxgolem_core::voice_pipeline::VoicePipeli
     voxgolem_core::voice_pipeline::VoicePipelineConfig::new(
         voxgolem_core::session::SessionConfig::new(voice_turn),
         capture,
+        voxgolem_model::parakeet::PARAKEET_SAMPLE_RATE_HZ,
     )
 }
 

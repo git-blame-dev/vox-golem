@@ -3982,6 +3982,7 @@ dependencies = [
  "serde",
  "toml 0.8.23",
  "voxgolem-audio",
+ "voxgolem-model",
 ]
 
 [[package]]
