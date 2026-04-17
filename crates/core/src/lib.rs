@@ -5,6 +5,7 @@ pub mod config;
 pub mod runtime;
 pub mod session;
 pub mod turn_capture;
+pub mod voice_pipeline;
 pub mod voice_turn;
 
 pub const APP_NAME: &str = "VoxGolem";
