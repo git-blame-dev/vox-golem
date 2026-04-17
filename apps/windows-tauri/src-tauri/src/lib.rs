@@ -2,10 +2,15 @@
 #![deny(unused_must_use)]
 
 use serde::Serialize;
+use std::sync::Mutex;
+
+const DEFAULT_SILENCE_TIMEOUT_MS: u64 = 1_200;
 
 struct AppState {
     startup_state: StartupStatePayload,
     runtime_config: Option<voxgolem_core::config::RuntimeConfig>,
+    session_config: voxgolem_core::session::SessionConfig,
+    session_state: Mutex<voxgolem_core::session::SessionState>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -66,6 +71,12 @@ fn submit_prompt(
     prompt: String,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<PromptExecutionPayload, String> {
+    apply_session_transition(
+        &app_state.session_state,
+        app_state.session_config,
+        voxgolem_core::session::SessionEvent::SubmitPrompt,
+    )?;
+
     let config = app_state
         .runtime_config
         .as_ref()
@@ -75,8 +86,33 @@ fn submit_prompt(
     let spec =
         voxgolem_platform::opencode::OpencodeCommandSpec::new(config.opencode_path.clone(), prompt)
             .with_output_format(voxgolem_platform::opencode::OpencodeOutputFormat::Json);
-    let result = voxgolem_platform::opencode::run_opencode_json(&spec)
-        .map_err(|error| format!("failed to execute opencode: {error}"))?;
+    let result = match voxgolem_platform::opencode::run_opencode_json(&spec) {
+        Ok(result) => result,
+        Err(error) => {
+            apply_session_transition(
+                &app_state.session_state,
+                app_state.session_config,
+                voxgolem_core::session::SessionEvent::PromptFailed {
+                    message: error.to_string(),
+                },
+            )?;
+
+            return Err(format!("failed to execute opencode: {error}"));
+        }
+    };
+
+    let result_error = prompt_result_error_message(&result);
+
+    let completion_event = match result_error {
+        Some(message) => voxgolem_core::session::SessionEvent::PromptFailed { message },
+        None => voxgolem_core::session::SessionEvent::PromptCompleted,
+    };
+
+    apply_session_transition(
+        &app_state.session_state,
+        app_state.session_config,
+        completion_event,
+    )?;
 
     Ok(PromptExecutionPayload {
         events: result
@@ -122,23 +158,97 @@ fn submit_prompt(
 }
 
 fn build_app_state() -> AppState {
+    let session_config = default_session_config();
+
     match voxgolem_core::config::load_runtime_config(None) {
-        Ok(config) => AppState {
-            startup_state: StartupStatePayload::Ready {
-                cue_asset_paths: CueAssetPathsPayload {
-                    start_listening: config.start_listening_cue.to_string_lossy().into_owned(),
-                    stop_listening: config.stop_listening_cue.to_string_lossy().into_owned(),
+        Ok(config) => {
+            let session_state = apply_session_event_or_panic(
+                voxgolem_core::session::SessionState::new(),
+                session_config,
+                voxgolem_core::session::SessionEvent::StartupValidated,
+                "startup validation should initialize the session to sleeping",
+            );
+
+            AppState {
+                startup_state: StartupStatePayload::Ready {
+                    cue_asset_paths: CueAssetPathsPayload {
+                        start_listening: config.start_listening_cue.to_string_lossy().into_owned(),
+                        stop_listening: config.stop_listening_cue.to_string_lossy().into_owned(),
+                    },
                 },
-            },
-            runtime_config: Some(config),
-        },
-        Err(error) => AppState {
-            startup_state: StartupStatePayload::Error {
-                message: error.to_string(),
-            },
-            runtime_config: None,
-        },
+                runtime_config: Some(config),
+                session_config,
+                session_state: Mutex::new(session_state),
+            }
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let session_state = apply_session_event_or_panic(
+                voxgolem_core::session::SessionState::new(),
+                session_config,
+                voxgolem_core::session::SessionEvent::StartupFailed {
+                    message: message.clone(),
+                },
+                "startup failure should initialize the session to error",
+            );
+
+            AppState {
+                startup_state: StartupStatePayload::Error { message },
+                runtime_config: None,
+                session_config,
+                session_state: Mutex::new(session_state),
+            }
+        }
     }
+}
+
+fn default_session_config() -> voxgolem_core::session::SessionConfig {
+    let voice_turn = voxgolem_core::voice_turn::VoiceTurnConfig::new(DEFAULT_SILENCE_TIMEOUT_MS)
+        .expect("silence timeout constant should be valid");
+
+    voxgolem_core::session::SessionConfig::new(voice_turn)
+}
+
+fn apply_session_transition(
+    session_state: &Mutex<voxgolem_core::session::SessionState>,
+    session_config: voxgolem_core::session::SessionConfig,
+    event: voxgolem_core::session::SessionEvent,
+) -> Result<(), String> {
+    let mut guard = session_state
+        .lock()
+        .map_err(|_| String::from("session state lock is poisoned"))?;
+
+    let next_state = voxgolem_core::session::apply_session_event(&guard, session_config, event)
+        .map_err(|error| format!("session transition failed: {error:?}"))?;
+
+    *guard = next_state;
+    Ok(())
+}
+
+fn apply_session_event_or_panic(
+    state: voxgolem_core::session::SessionState,
+    config: voxgolem_core::session::SessionConfig,
+    event: voxgolem_core::session::SessionEvent,
+    message: &str,
+) -> voxgolem_core::session::SessionState {
+    voxgolem_core::session::apply_session_event(&state, config, event).expect(message)
+}
+
+fn prompt_result_error_message(
+    result: &voxgolem_platform::opencode::OpencodeJsonRunResult,
+) -> Option<String> {
+    if let Some(exit_code) = result.exit_code {
+        if exit_code != 0 {
+            return Some(format!("opencode exited with code {exit_code}"));
+        }
+    }
+
+    result.events.iter().find_map(|event| match event {
+        voxgolem_platform::opencode::OpencodeJsonEvent::Error { message, .. } => {
+            Some(message.clone())
+        }
+        _ => None,
+    })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -151,5 +261,57 @@ pub fn run() {
     if let Err(error) = builder.run(tauri::generate_context!()) {
         eprintln!("failed to run vox-golem tauri shell: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prompt_result_error_message;
+
+    #[test]
+    fn prompt_result_error_message_prefers_non_zero_exit_code() {
+        let result = voxgolem_platform::opencode::OpencodeJsonRunResult {
+            events: vec![voxgolem_platform::opencode::OpencodeJsonEvent::Error {
+                name: "APIError".to_string(),
+                message: "provider failed".to_string(),
+            }],
+            stderr: String::new(),
+            exit_code: Some(7),
+        };
+
+        assert_eq!(
+            prompt_result_error_message(&result),
+            Some("opencode exited with code 7".to_string())
+        );
+    }
+
+    #[test]
+    fn prompt_result_error_message_uses_structured_error_when_exit_code_is_zero() {
+        let result = voxgolem_platform::opencode::OpencodeJsonRunResult {
+            events: vec![voxgolem_platform::opencode::OpencodeJsonEvent::Error {
+                name: "APIError".to_string(),
+                message: "provider failed".to_string(),
+            }],
+            stderr: String::new(),
+            exit_code: Some(0),
+        };
+
+        assert_eq!(
+            prompt_result_error_message(&result),
+            Some("provider failed".to_string())
+        );
+    }
+
+    #[test]
+    fn prompt_result_error_message_returns_none_for_successful_run() {
+        let result = voxgolem_platform::opencode::OpencodeJsonRunResult {
+            events: vec![voxgolem_platform::opencode::OpencodeJsonEvent::Text {
+                text: "done".to_string(),
+            }],
+            stderr: String::new(),
+            exit_code: Some(0),
+        };
+
+        assert_eq!(prompt_result_error_message(&result), None);
     }
 }
