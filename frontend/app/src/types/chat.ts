@@ -11,6 +11,12 @@ export interface CueAssetPaths {
   readonly stopListening: string
 }
 
+export interface PromptExecutionResult {
+  readonly stdout: string
+  readonly stderr: string
+  readonly exitCode: number | null
+}
+
 export type StartupState =
   | { readonly kind: 'loading' }
   | { readonly kind: 'ready'; readonly cueAssetPaths: CueAssetPaths }
