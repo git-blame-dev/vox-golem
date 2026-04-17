@@ -37,6 +37,14 @@ export function createExecutionMessages(
     })
   }
 
+  if (result.exitCode !== null && result.exitCode !== 0) {
+    messages.push({
+      id: `system-exit-${Date.now()}`,
+      role: 'system',
+      content: `exit_code:\n${result.exitCode}`,
+    })
+  }
+
   if (messages.length > 0) {
     return messages
   }
