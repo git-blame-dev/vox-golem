@@ -1,11 +1,18 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { FormEvent, KeyboardEvent } from 'react'
 import { ChatBubble } from './components/ChatBubble'
+import { playCue } from './lib/audioCues'
 import { shouldSubmitComposer } from './lib/composer'
 import { loadStartupState } from './lib/startupState'
 import { createPlaceholderReply, getInitialMessages } from './state/appShell'
+import { cueForTransition, transitionRuntimeStatus } from './state/runtimeMachine'
 import type { ChatMessage, RuntimeStatus, StartupState } from './types/chat'
 import './App.css'
+
+const CUE_ASSET_PATHS = {
+  startListening: '/assets/start-listening.mp3',
+  stopListening: '/assets/stop-listening.mp3',
+} as const
 
 function App() {
   const [startupState, setStartupState] = useState<StartupState>({ kind: 'loading' })
@@ -33,9 +40,66 @@ function App() {
   }, [])
 
   const canSend = useMemo(
-    () => startupState.kind === 'ready' && composerValue.trim().length > 0,
-    [composerValue, startupState.kind],
+    () =>
+      startupState.kind === 'ready' &&
+      (runtimeStatus === 'sleeping' || runtimeStatus === 'result_ready') &&
+      composerValue.trim().length > 0,
+    [composerValue, runtimeStatus, startupState.kind],
   )
+
+  const canStartListening =
+    startupState.kind === 'ready' &&
+    (runtimeStatus === 'sleeping' || runtimeStatus === 'result_ready')
+  const canMarkSilence =
+    startupState.kind === 'ready' && runtimeStatus === 'listening'
+  const canMarkResultReady =
+    startupState.kind === 'ready' &&
+    (runtimeStatus === 'processing' || runtimeStatus === 'executing')
+  const canResetToIdle =
+    startupState.kind === 'ready' && runtimeStatus === 'result_ready'
+
+  const applyTransition = (
+    previousStatus: RuntimeStatus,
+    event: Parameters<typeof transitionRuntimeStatus>[1],
+  ): RuntimeStatus => {
+    const nextStatus = transitionRuntimeStatus(previousStatus, event)
+
+    if (nextStatus === previousStatus) {
+      return previousStatus
+    }
+
+    setRuntimeStatus(nextStatus)
+
+    const cueType = cueForTransition(previousStatus, nextStatus)
+
+    if (cueType !== null) {
+      void playCue(cueType, CUE_ASSET_PATHS).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : 'Unknown cue playback error'
+
+        setRuntimeStatus('error')
+        setMessages((currentMessages) => [
+          ...currentMessages,
+          {
+            id: `system-cue-error-${Date.now()}`,
+            role: 'system',
+            content: `Cue playback error: ${message}`,
+          },
+        ])
+      })
+    }
+
+    return nextStatus
+  }
+
+  const transitionFromCurrentStatus = (
+    event: Parameters<typeof transitionRuntimeStatus>[1],
+  ): void => {
+    if (startupState.kind !== 'ready') {
+      return
+    }
+
+    applyTransition(runtimeStatus, event)
+  }
 
   const sendPrompt = (): void => {
     if (startupState.kind !== 'ready') {
@@ -48,6 +112,12 @@ function App() {
       return
     }
 
+    const executingStatus = applyTransition(runtimeStatus, 'submit_prompt')
+
+    if (executingStatus === runtimeStatus) {
+      return
+    }
+
     const userMessage: ChatMessage = {
       id: `user-${Date.now()}`,
       role: 'user',
@@ -56,14 +126,13 @@ function App() {
 
     const placeholderReply = createPlaceholderReply(prompt)
 
-    setRuntimeStatus('executing')
     setMessages((currentMessages) => [
       ...currentMessages,
       userMessage,
       placeholderReply,
     ])
     setComposerValue('')
-    setRuntimeStatus('sleeping')
+    applyTransition(executingStatus, 'response_ready')
   }
 
   const onSubmit = (event: FormEvent<HTMLFormElement>): void => {
@@ -91,6 +160,40 @@ function App() {
         {startupState.kind === 'error' ? (
           <p className="shell__error">Startup error: {startupState.message}</p>
         ) : null}
+        <div className="shell__controls" role="group" aria-label="Runtime controls">
+          <button
+            type="button"
+            className="shell__control"
+            onClick={() => transitionFromCurrentStatus('begin_listening')}
+            disabled={!canStartListening}
+          >
+            Start listening
+          </button>
+          <button
+            type="button"
+            className="shell__control"
+            onClick={() => transitionFromCurrentStatus('end_listening')}
+            disabled={!canMarkSilence}
+          >
+            Mark silence
+          </button>
+          <button
+            type="button"
+            className="shell__control"
+            onClick={() => transitionFromCurrentStatus('response_ready')}
+            disabled={!canMarkResultReady}
+          >
+            Mark result ready
+          </button>
+          <button
+            type="button"
+            className="shell__control"
+            onClick={() => transitionFromCurrentStatus('reset_to_sleeping')}
+            disabled={!canResetToIdle}
+          >
+            Reset to idle
+          </button>
+        </div>
       </header>
 
       <main className="conversation" aria-live="polite">

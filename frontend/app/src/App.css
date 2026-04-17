@@ -42,6 +42,28 @@
   font-size: 0.9rem;
 }
 
+.shell__controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.8rem;
+}
+
+.shell__control {
+  border: 1px solid #9eb2cb;
+  background: #edf3fa;
+  color: #17324f;
+  border-radius: 0.6rem;
+  font-size: 0.78rem;
+  padding: 0.35rem 0.6rem;
+  cursor: pointer;
+}
+
+.shell__control:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
+}
+
 .conversation {
   overflow-y: auto;
   padding: 1.25rem 1.5rem;
