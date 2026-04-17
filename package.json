@@ -1,0 +1,16 @@
+{
+  "name": "vox-golem",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "bun@1.3.9",
+  "workspaces": [
+    "frontend/app"
+  ],
+  "scripts": {
+    "dev": "bun run --cwd frontend/app dev",
+    "typecheck": "bun run --cwd frontend/app typecheck",
+    "lint": "bun run --cwd frontend/app lint",
+    "test": "bun run --cwd frontend/app test",
+    "build": "bun run --cwd frontend/app build"
+  }
+}

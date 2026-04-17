@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "VoxGolem",
+  "version": "0.1.0",
+  "identifier": "dev.gitblame.voxgolem",
+  "build": {
+    "beforeDevCommand": "bun run --cwd ../../../frontend/app dev",
+    "beforeBuildCommand": "bun run --cwd ../../../frontend/app build",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../../../frontend/app/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "VoxGolem",
+        "width": 1200,
+        "height": 800,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all"
+  }
+}

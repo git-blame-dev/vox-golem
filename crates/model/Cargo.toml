@@ -1,0 +1,8 @@
+[package]
+name = "voxgolem-model"
+edition.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
