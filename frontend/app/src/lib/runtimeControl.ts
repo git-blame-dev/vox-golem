@@ -7,9 +7,14 @@ export type RuntimeControlCommand =
   | 'mark_result_ready'
   | 'reset_session'
 
+export interface RuntimeControlResult {
+  readonly runtimePhase: BackendRuntimePhase
+  readonly transcriptionReadySamples: number | null
+}
+
 export async function invokeRuntimeControl(
   command: RuntimeControlCommand,
-): Promise<BackendRuntimePhase | null> {
+): Promise<RuntimeControlResult | null> {
   if (typeof window === 'undefined') {
     return null
   }
@@ -24,12 +29,14 @@ export async function invokeRuntimeControl(
   return parseRuntimePhaseResponse(payload)
 }
 
-function parseRuntimePhaseResponse(payload: unknown): BackendRuntimePhase {
+function parseRuntimePhaseResponse(payload: unknown): RuntimeControlResult {
   if (typeof payload !== 'object' || payload === null) {
     throw new Error('Runtime control payload must be an object')
   }
 
-  const runtimePhase = (payload as Record<string, unknown>)['runtime_phase']
+  const record = payload as Record<string, unknown>
+  const runtimePhase = record['runtime_phase']
+  const transcriptionReadySamples = record['transcription_ready_samples']
 
   if (
     runtimePhase === 'initializing' ||
@@ -40,7 +47,19 @@ function parseRuntimePhaseResponse(payload: unknown): BackendRuntimePhase {
     runtimePhase === 'result_ready' ||
     runtimePhase === 'error'
   ) {
-    return runtimePhase
+    if (
+      typeof transcriptionReadySamples !== 'number' &&
+      transcriptionReadySamples !== null &&
+      transcriptionReadySamples !== undefined
+    ) {
+      throw new Error('Runtime control payload must include a numeric or null transcription sample count')
+    }
+
+    return {
+      runtimePhase,
+      transcriptionReadySamples:
+        typeof transcriptionReadySamples === 'number' ? transcriptionReadySamples : null,
+    }
   }
 
   throw new Error('Runtime control payload must include a supported runtime phase')

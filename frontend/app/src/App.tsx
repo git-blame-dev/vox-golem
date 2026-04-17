@@ -152,7 +152,18 @@ function App() {
         return
       }
 
-      applyRuntimeStatus(toRuntimeStatus(runtimePhase))
+      applyRuntimeStatus(toRuntimeStatus(runtimePhase.runtimePhase))
+
+      if (runtimePhase.transcriptionReadySamples !== null) {
+        setMessages((currentMessages) => [
+          ...currentMessages,
+          {
+            id: `system-transcription-ready-${Date.now()}`,
+            role: 'system',
+            content: `transcription_ready:\n${runtimePhase.transcriptionReadySamples} samples captured`,
+          },
+        ])
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Runtime control failed'
 
