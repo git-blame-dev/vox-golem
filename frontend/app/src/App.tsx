@@ -52,7 +52,8 @@ function App() {
     startupState.kind === 'ready' &&
     (runtimeStatus === 'processing' || runtimeStatus === 'executing')
   const canResetToIdle =
-    startupState.kind === 'ready' && runtimeStatus === 'result_ready'
+    startupState.kind === 'ready' &&
+    (runtimeStatus === 'result_ready' || runtimeStatus === 'error')
   const cueAssetPaths =
     startupState.kind === 'ready'
       ? startupState.cueAssetPaths
@@ -76,7 +77,7 @@ function App() {
       void playCue(cueType, cueAssetPaths).catch((error: unknown) => {
         const message = error instanceof Error ? error.message : 'Unknown cue playback error'
 
-        setRuntimeStatus('error')
+        applyTransition(nextStatus, 'fail')
         setMessages((currentMessages) => [
           ...currentMessages,
           {
@@ -132,11 +133,16 @@ function App() {
       const nextMessages = createExecutionMessages(result)
 
       setMessages((currentMessages) => [...currentMessages, ...nextMessages])
-      applyTransition(executingStatus, 'response_ready')
+
+      if (result.exitCode === null || result.exitCode === 0) {
+        applyTransition(executingStatus, 'response_ready')
+      } else {
+        applyTransition(executingStatus, 'fail')
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Prompt execution failed'
 
-      setRuntimeStatus('error')
+      applyTransition(executingStatus, 'fail')
       setMessages((currentMessages) => [
         ...currentMessages,
         {
@@ -201,7 +207,11 @@ function App() {
           <button
             type="button"
             className="shell__control"
-            onClick={() => transitionFromCurrentStatus('reset_to_sleeping')}
+            onClick={() =>
+              transitionFromCurrentStatus(
+                runtimeStatus === 'error' ? 'recover_from_error' : 'reset_to_sleeping',
+              )
+            }
             disabled={!canResetToIdle}
           >
             Reset to idle

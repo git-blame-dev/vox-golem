@@ -17,6 +17,14 @@ describe('transitionRuntimeStatus', () => {
   it('transitions to result_ready when response arrives', () => {
     expect(transitionRuntimeStatus('executing', 'response_ready')).toBe('result_ready')
   })
+
+  it('transitions to error on failure', () => {
+    expect(transitionRuntimeStatus('executing', 'fail')).toBe('error')
+  })
+
+  it('recovers from error back to sleeping', () => {
+    expect(transitionRuntimeStatus('error', 'recover_from_error')).toBe('sleeping')
+  })
 })
 
 describe('cueForTransition', () => {
