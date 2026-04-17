@@ -55,6 +55,10 @@ pub enum OpencodeJsonEvent {
     Text {
         text: String,
     },
+    StepStart,
+    StepFinish {
+        reason: Option<String>,
+    },
     Error {
         name: String,
         message: String,
@@ -196,6 +200,22 @@ fn parse_json_events(stdout: &str) -> Result<Vec<OpencodeJsonEvent>, OpencodeJso
                     });
                 }
             }
+            RawJsonEvent::StepStart { .. } => {
+                events.push(OpencodeJsonEvent::StepStart);
+            }
+            RawJsonEvent::StepFinish { part, .. } => {
+                let reason = part.reason.and_then(|value| {
+                    let trimmed = value.trim();
+
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                });
+
+                events.push(OpencodeJsonEvent::StepFinish { reason });
+            }
             RawJsonEvent::Error { error, .. } => {
                 let message = error
                     .data
@@ -263,6 +283,21 @@ enum RawJsonEvent {
         #[serde(rename = "sessionID")]
         _session_id: String,
     },
+    #[serde(rename = "step_start")]
+    StepStart {
+        #[serde(rename = "timestamp")]
+        _timestamp: u64,
+        #[serde(rename = "sessionID")]
+        _session_id: String,
+    },
+    #[serde(rename = "step_finish")]
+    StepFinish {
+        part: RawStepFinishPart,
+        #[serde(rename = "timestamp")]
+        _timestamp: u64,
+        #[serde(rename = "sessionID")]
+        _session_id: String,
+    },
     #[serde(rename = "tool_use")]
     ToolUse {
         part: RawToolUsePart,
@@ -295,6 +330,11 @@ struct RawErrorData {
 struct RawToolUsePart {
     tool: String,
     state: RawToolState,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawStepFinishPart {
+    reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -471,6 +511,10 @@ mod tests {
                 OpencodeJsonEvent::Text {
                     text: "Hello from OpenCode".to_string(),
                 },
+                OpencodeJsonEvent::StepStart,
+                OpencodeJsonEvent::StepFinish {
+                    reason: Some("stop".to_string()),
+                },
                 OpencodeJsonEvent::ToolUse {
                     tool: "bash".to_string(),
                     status: OpencodeToolUseStatus::Completed,
@@ -521,6 +565,23 @@ mod tests {
                 status: OpencodeToolUseStatus::Error,
                 detail: "command failed".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn parses_step_finish_without_reason() {
+        let temp = TempDir::new();
+        let executable = create_fake_opencode(temp.path(), step_finish_without_reason_script());
+        let prompt = OpencodePrompt::new("summarize the transcript")
+            .expect("non-empty prompt should be accepted");
+        let spec = OpencodeCommandSpec::new(executable, prompt)
+            .with_output_format(OpencodeOutputFormat::Json);
+
+        let result = run_opencode_json(&spec).expect("fake json executable should run");
+
+        assert_eq!(
+            result.events,
+            vec![OpencodeJsonEvent::StepFinish { reason: None }]
         );
     }
 
@@ -581,12 +642,12 @@ mod tests {
 
     #[cfg(windows)]
     fn json_events_script() -> &'static str {
-        "echo {\"type\":\"text\",\"timestamp\":1,\"sessionID\":\"ses_1\",\"part\":{\"text\":\"Hello from OpenCode\"}}\necho {\"type\":\"tool_use\",\"timestamp\":2,\"sessionID\":\"ses_1\",\"part\":{\"tool\":\"bash\",\"state\":{\"status\":\"completed\",\"title\":\"Shows working tree status\",\"output\":\"On branch main\"}}}\necho {\"type\":\"step_start\",\"timestamp\":3,\"sessionID\":\"ses_1\",\"part\":{}}\necho {\"type\":\"error\",\"timestamp\":4,\"sessionID\":\"ses_1\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"Provider failed\"}}}"
+        "echo {\"type\":\"text\",\"timestamp\":1,\"sessionID\":\"ses_1\",\"part\":{\"text\":\"Hello from OpenCode\"}}\necho {\"type\":\"step_start\",\"timestamp\":2,\"sessionID\":\"ses_1\"}\necho {\"type\":\"step_finish\",\"timestamp\":3,\"sessionID\":\"ses_1\",\"part\":{\"reason\":\"stop\"}}\necho {\"type\":\"tool_use\",\"timestamp\":4,\"sessionID\":\"ses_1\",\"part\":{\"tool\":\"bash\",\"state\":{\"status\":\"completed\",\"title\":\"Shows working tree status\",\"output\":\"On branch main\"}}}\necho {\"type\":\"error\",\"timestamp\":5,\"sessionID\":\"ses_1\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"Provider failed\"}}}"
     }
 
     #[cfg(not(windows))]
     fn json_events_script() -> &'static str {
-        "printf '%s\\n' '{\"type\":\"text\",\"timestamp\":1,\"sessionID\":\"ses_1\",\"part\":{\"text\":\"Hello from OpenCode\"}}' '{\"type\":\"tool_use\",\"timestamp\":2,\"sessionID\":\"ses_1\",\"part\":{\"tool\":\"bash\",\"state\":{\"status\":\"completed\",\"title\":\"Shows working tree status\",\"output\":\"On branch main\"}}}' '{\"type\":\"step_start\",\"timestamp\":3,\"sessionID\":\"ses_1\",\"part\":{}}' '{\"type\":\"error\",\"timestamp\":4,\"sessionID\":\"ses_1\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"Provider failed\"}}}'"
+        "printf '%s\\n' '{\"type\":\"text\",\"timestamp\":1,\"sessionID\":\"ses_1\",\"part\":{\"text\":\"Hello from OpenCode\"}}' '{\"type\":\"step_start\",\"timestamp\":2,\"sessionID\":\"ses_1\"}' '{\"type\":\"step_finish\",\"timestamp\":3,\"sessionID\":\"ses_1\",\"part\":{\"reason\":\"stop\"}}' '{\"type\":\"tool_use\",\"timestamp\":4,\"sessionID\":\"ses_1\",\"part\":{\"tool\":\"bash\",\"state\":{\"status\":\"completed\",\"title\":\"Shows working tree status\",\"output\":\"On branch main\"}}}' '{\"type\":\"error\",\"timestamp\":5,\"sessionID\":\"ses_1\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"Provider failed\"}}}'"
     }
 
     #[cfg(windows)]
@@ -607,5 +668,15 @@ mod tests {
     #[cfg(not(windows))]
     fn tool_error_json_script() -> &'static str {
         "printf '%s\\n' '{\"type\":\"tool_use\",\"timestamp\":1,\"sessionID\":\"ses_1\",\"part\":{\"tool\":\"bash\",\"state\":{\"status\":\"error\",\"error\":\"command failed\"}}}'"
+    }
+
+    #[cfg(windows)]
+    fn step_finish_without_reason_script() -> &'static str {
+        "echo {\"type\":\"step_finish\",\"timestamp\":1,\"sessionID\":\"ses_1\",\"part\":{}}"
+    }
+
+    #[cfg(not(windows))]
+    fn step_finish_without_reason_script() -> &'static str {
+        "printf '%s\\n' '{\"type\":\"step_finish\",\"timestamp\":1,\"sessionID\":\"ses_1\",\"part\":{}}'"
     }
 }

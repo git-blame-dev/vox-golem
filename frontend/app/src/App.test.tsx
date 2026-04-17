@@ -102,8 +102,10 @@ describe('App', () => {
 
         return {
           events: [
+            { kind: 'step_start' },
             { kind: 'tool_use', tool: 'bash', status: 'completed', detail: 'Shows working tree status' },
             { kind: 'text', text: 'OpenCode response' },
+            { kind: 'step_finish', reason: 'stop' },
           ],
           stderr: 'warning output',
           exit_code: 0,
@@ -124,8 +126,10 @@ describe('App', () => {
       await Promise.resolve()
     })
 
+    expect(container.textContent).toContain('step_start:\nOpenCode started a run step.')
     expect(container.textContent).toContain('tool_use:\nbash (completed)\nShows working tree status')
     expect(container.textContent).toContain('OpenCode response')
+    expect(container.textContent).toContain('step_finish:\nstop')
     expect(container.textContent).toContain('stderr:\nwarning output')
   })
 

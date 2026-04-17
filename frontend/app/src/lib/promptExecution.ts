@@ -75,6 +75,25 @@ function parsePromptExecutionEvent(payload: unknown): PromptExecutionEvent {
     }
   }
 
+  if (payload['kind'] === 'step_start') {
+    return {
+      kind: 'step_start',
+    }
+  }
+
+  if (payload['kind'] === 'step_finish') {
+    const reason = payload['reason']
+
+    if (typeof reason !== 'string' && reason !== null) {
+      throw new Error('Step-finish event must include a string or null reason')
+    }
+
+    return {
+      kind: 'step_finish',
+      reason,
+    }
+  }
+
   if (payload['kind'] === 'error') {
     const name = payload['name']
     const message = payload['message']

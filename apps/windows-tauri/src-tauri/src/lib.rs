@@ -14,6 +14,10 @@ enum PromptExecutionEventPayload {
     Text {
         text: String,
     },
+    StepStart,
+    StepFinish {
+        reason: Option<String>,
+    },
     Error {
         name: String,
         message: String,
@@ -78,6 +82,12 @@ fn submit_prompt(
             .map(|event| match event {
                 voxgolem_platform::opencode::OpencodeJsonEvent::Text { text } => {
                     PromptExecutionEventPayload::Text { text }
+                }
+                voxgolem_platform::opencode::OpencodeJsonEvent::StepStart => {
+                    PromptExecutionEventPayload::StepStart
+                }
+                voxgolem_platform::opencode::OpencodeJsonEvent::StepFinish { reason } => {
+                    PromptExecutionEventPayload::StepFinish { reason }
                 }
                 voxgolem_platform::opencode::OpencodeJsonEvent::Error { name, message } => {
                     PromptExecutionEventPayload::Error { name, message }
