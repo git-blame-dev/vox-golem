@@ -1,0 +1,24 @@
+# Local workflow artifacts
+tasks/
+
+# Rust build outputs
+target/
+
+# Frontend/build outputs
+node_modules/
+dist/
+.vite/
+coverage/
+
+# Local AI/runtime artifacts
+models/
+recordings/
+
+# Logs
+*.log
+
+# Environment and OS noise
+.env
+.env.*
+.DS_Store
+Thumbs.db
