@@ -103,6 +103,7 @@ describe('App', () => {
         return {
           events: [
             { kind: 'step_start' },
+            { kind: 'reasoning', text: 'Need to inspect the repo state first' },
             { kind: 'tool_use', tool: 'bash', status: 'completed', detail: 'Shows working tree status' },
             { kind: 'text', text: 'OpenCode response' },
             { kind: 'step_finish', reason: 'stop' },
@@ -127,6 +128,7 @@ describe('App', () => {
     })
 
     expect(container.textContent).toContain('step_start:\nOpenCode started a run step.')
+    expect(container.textContent).toContain('reasoning:\nNeed to inspect the repo state first')
     expect(container.textContent).toContain('tool_use:\nbash (completed)\nShows working tree status')
     expect(container.textContent).toContain('OpenCode response')
     expect(container.textContent).toContain('step_finish:\nstop')

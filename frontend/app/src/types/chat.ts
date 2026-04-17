@@ -13,6 +13,7 @@ export interface CueAssetPaths {
 
 export type PromptExecutionEvent =
   | { readonly kind: 'text'; readonly text: string }
+  | { readonly kind: 'reasoning'; readonly text: string }
   | { readonly kind: 'step_start' }
   | { readonly kind: 'step_finish'; readonly reason: string | null }
   | { readonly kind: 'error'; readonly name: string; readonly message: string }

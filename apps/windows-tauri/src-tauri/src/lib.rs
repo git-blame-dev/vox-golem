@@ -14,6 +14,9 @@ enum PromptExecutionEventPayload {
     Text {
         text: String,
     },
+    Reasoning {
+        text: String,
+    },
     StepStart,
     StepFinish {
         reason: Option<String>,
@@ -82,6 +85,9 @@ fn submit_prompt(
             .map(|event| match event {
                 voxgolem_platform::opencode::OpencodeJsonEvent::Text { text } => {
                     PromptExecutionEventPayload::Text { text }
+                }
+                voxgolem_platform::opencode::OpencodeJsonEvent::Reasoning { text } => {
+                    PromptExecutionEventPayload::Reasoning { text }
                 }
                 voxgolem_platform::opencode::OpencodeJsonEvent::StepStart => {
                     PromptExecutionEventPayload::StepStart

@@ -30,6 +30,15 @@ export function createExecutionMessages(
       continue
     }
 
+    if (event.kind === 'reasoning') {
+      messages.push({
+        id: `system-reasoning-${Date.now()}-${messages.length}`,
+        role: 'system',
+        content: `reasoning:\n${event.text}`,
+      })
+      continue
+    }
+
     if (event.kind === 'step_start') {
       messages.push({
         id: `system-step-start-${Date.now()}-${messages.length}`,

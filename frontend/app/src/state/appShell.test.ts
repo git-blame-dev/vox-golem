@@ -7,6 +7,7 @@ describe('createExecutionMessages', () => {
       createExecutionMessages({
         events: [
           { kind: 'step_start' },
+          { kind: 'reasoning', text: 'Need to inspect the repo state first' },
           { kind: 'text', text: 'OpenCode response' },
           { kind: 'step_finish', reason: 'stop' },
         ],
@@ -15,6 +16,7 @@ describe('createExecutionMessages', () => {
       }).map((message) => message.content),
     ).toEqual([
       'step_start:\nOpenCode started a run step.',
+      'reasoning:\nNeed to inspect the repo state first',
       'OpenCode response',
       'step_finish:\nstop',
       'stderr:\nwarning output',
