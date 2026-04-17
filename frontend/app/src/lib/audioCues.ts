@@ -11,7 +11,7 @@ export async function playCue(
   cueAssetPaths: CueAssetPaths,
   cuePlayer: CuePlayer = createBrowserCuePlayer(),
 ): Promise<void> {
-  const source = resolveCueSource(cueType, cueAssetPaths)
+  const source = resolveCuePlaybackSource(resolveCueSource(cueType, cueAssetPaths))
   await cuePlayer.play(source)
 }
 
@@ -44,4 +44,28 @@ function resolveCueSource(cueType: CueType, cueAssetPaths: CueAssetPaths): strin
   }
 
   return source
+}
+
+function resolveCuePlaybackSource(source: string): string {
+  if (isWindowsAbsolutePath(source)) {
+    return `file:///${encodeURI(source.replace(/\\/g, '/'))}`
+  }
+
+  if (isUrlLikeSource(source)) {
+    return source
+  }
+
+  if (source.startsWith('/')) {
+    return `file://${encodeURI(source)}`
+  }
+
+  return source
+}
+
+function isWindowsAbsolutePath(source: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(source)
+}
+
+function isUrlLikeSource(source: string): boolean {
+  return /^[A-Za-z][A-Za-z\d+.-]*:/.test(source)
 }

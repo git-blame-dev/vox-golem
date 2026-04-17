@@ -3,6 +3,11 @@
 
 use serde::Serialize;
 
+struct AppState {
+    startup_state: StartupStatePayload,
+    runtime_config: Option<voxgolem_core::config::RuntimeConfig>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum PromptExecutionEventPayload {
@@ -45,18 +50,24 @@ enum StartupStatePayload {
 }
 
 #[tauri::command]
-fn get_startup_state(startup_state: tauri::State<'_, StartupStatePayload>) -> StartupStatePayload {
-    startup_state.inner().clone()
+fn get_startup_state(app_state: tauri::State<'_, AppState>) -> StartupStatePayload {
+    app_state.startup_state.clone()
 }
 
 #[tauri::command]
-fn submit_prompt(prompt: String) -> Result<PromptExecutionPayload, String> {
-    let config =
-        voxgolem_core::config::load_runtime_config(None).map_err(|error| error.to_string())?;
+fn submit_prompt(
+    prompt: String,
+    app_state: tauri::State<'_, AppState>,
+) -> Result<PromptExecutionPayload, String> {
+    let config = app_state
+        .runtime_config
+        .as_ref()
+        .ok_or_else(|| String::from("startup config is not ready"))?;
     let prompt = voxgolem_platform::opencode::OpencodePrompt::new(prompt)
         .map_err(|error| format!("invalid prompt: {error:?}"))?;
-    let spec = voxgolem_platform::opencode::OpencodeCommandSpec::new(config.opencode_path, prompt)
-        .with_output_format(voxgolem_platform::opencode::OpencodeOutputFormat::Json);
+    let spec =
+        voxgolem_platform::opencode::OpencodeCommandSpec::new(config.opencode_path.clone(), prompt)
+            .with_output_format(voxgolem_platform::opencode::OpencodeOutputFormat::Json);
     let result = voxgolem_platform::opencode::run_opencode_json(&spec)
         .map_err(|error| format!("failed to execute opencode: {error}"))?;
 
@@ -94,25 +105,31 @@ fn submit_prompt(prompt: String) -> Result<PromptExecutionPayload, String> {
     })
 }
 
-fn resolve_startup_state() -> StartupStatePayload {
+fn build_app_state() -> AppState {
     match voxgolem_core::config::load_runtime_config(None) {
-        Ok(config) => StartupStatePayload::Ready {
-            cue_asset_paths: CueAssetPathsPayload {
-                start_listening: config.start_listening_cue.to_string_lossy().into_owned(),
-                stop_listening: config.stop_listening_cue.to_string_lossy().into_owned(),
+        Ok(config) => AppState {
+            startup_state: StartupStatePayload::Ready {
+                cue_asset_paths: CueAssetPathsPayload {
+                    start_listening: config.start_listening_cue.to_string_lossy().into_owned(),
+                    stop_listening: config.stop_listening_cue.to_string_lossy().into_owned(),
+                },
             },
+            runtime_config: Some(config),
         },
-        Err(error) => StartupStatePayload::Error {
-            message: error.to_string(),
+        Err(error) => AppState {
+            startup_state: StartupStatePayload::Error {
+                message: error.to_string(),
+            },
+            runtime_config: None,
         },
     }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let startup_state = resolve_startup_state();
+    let app_state = build_app_state();
     let builder = tauri::Builder::default()
-        .manage(startup_state)
+        .manage(app_state)
         .invoke_handler(tauri::generate_handler![get_startup_state, submit_prompt]);
 
     if let Err(error) = builder.run(tauri::generate_context!()) {
