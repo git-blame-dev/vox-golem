@@ -14,6 +14,12 @@ export interface CueAssetPaths {
 export type PromptExecutionEvent =
   | { readonly kind: 'text'; readonly text: string }
   | { readonly kind: 'error'; readonly name: string; readonly message: string }
+  | {
+      readonly kind: 'tool_use'
+      readonly tool: string
+      readonly status: 'completed' | 'error'
+      readonly detail: string
+    }
 
 export interface PromptExecutionResult {
   readonly events: readonly PromptExecutionEvent[]

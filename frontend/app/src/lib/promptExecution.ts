@@ -90,6 +90,27 @@ function parsePromptExecutionEvent(payload: unknown): PromptExecutionEvent {
     }
   }
 
+  if (payload['kind'] === 'tool_use') {
+    const tool = payload['tool']
+    const status = payload['status']
+    const detail = payload['detail']
+
+    if (
+      typeof tool !== 'string' ||
+      (status !== 'completed' && status !== 'error') ||
+      typeof detail !== 'string'
+    ) {
+      throw new Error('Tool-use event must include tool, status, and detail')
+    }
+
+    return {
+      kind: 'tool_use',
+      tool,
+      status,
+      detail,
+    }
+  }
+
   throw new Error('Prompt execution event contains an unsupported kind')
 }
 

@@ -9,12 +9,18 @@ describe('parsePromptExecutionResult', () => {
   it('parses a valid execution payload', () => {
     expect(
       parsePromptExecutionResult({
-        events: [{ kind: 'text', text: 'done' }],
+        events: [
+          { kind: 'text', text: 'done' },
+          { kind: 'tool_use', tool: 'bash', status: 'completed', detail: 'Shows status' },
+        ],
         stderr: '',
         exit_code: 0,
       }),
     ).toEqual({
-      events: [{ kind: 'text', text: 'done' }],
+      events: [
+        { kind: 'text', text: 'done' },
+        { kind: 'tool_use', tool: 'bash', status: 'completed', detail: 'Shows status' },
+      ],
       stderr: '',
       exitCode: 0,
     })

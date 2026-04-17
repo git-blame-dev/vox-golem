@@ -30,6 +30,15 @@ export function createExecutionMessages(
       continue
     }
 
+    if (event.kind === 'tool_use') {
+      messages.push({
+        id: `system-tool-${Date.now()}-${messages.length}`,
+        role: 'system',
+        content: `tool_use:\n${event.tool} (${event.status})\n${event.detail}`,
+      })
+      continue
+    }
+
     messages.push({
       id: `system-error-${Date.now()}-${messages.length}`,
       role: 'system',
