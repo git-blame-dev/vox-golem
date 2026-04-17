@@ -5,12 +5,14 @@ use serde::Serialize;
 use std::sync::Mutex;
 
 const DEFAULT_SILENCE_TIMEOUT_MS: u64 = 1_200;
+const DEFAULT_PREROLL_MAX_SAMPLES: usize = 4_000;
+const DEFAULT_UTTERANCE_MAX_SAMPLES: usize = 160_000;
 
 struct AppState {
     startup_state: StartupStatePayload,
     runtime_config: Option<voxgolem_core::config::RuntimeConfig>,
-    session_config: voxgolem_core::session::SessionConfig,
-    session_state: Mutex<voxgolem_core::session::SessionState>,
+    voice_pipeline_config: voxgolem_core::voice_pipeline::VoicePipelineConfig,
+    voice_pipeline_state: Mutex<voxgolem_core::voice_pipeline::VoicePipelineState>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -90,10 +92,10 @@ fn submit_prompt(
     prompt: String,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<PromptExecutionPayload, String> {
-    apply_session_transition(
-        &app_state.session_state,
-        app_state.session_config,
-        voxgolem_core::session::SessionEvent::SubmitPrompt,
+    apply_voice_pipeline_transition(
+        &app_state.voice_pipeline_state,
+        app_state.voice_pipeline_config,
+        voxgolem_core::voice_pipeline::VoicePipelineEvent::SubmitPrompt,
     )?;
 
     let config = app_state
@@ -108,10 +110,10 @@ fn submit_prompt(
     let result = match voxgolem_platform::opencode::run_opencode_json(&spec) {
         Ok(result) => result,
         Err(error) => {
-            apply_session_transition(
-                &app_state.session_state,
-                app_state.session_config,
-                voxgolem_core::session::SessionEvent::PromptFailed {
+            apply_voice_pipeline_transition(
+                &app_state.voice_pipeline_state,
+                app_state.voice_pipeline_config,
+                voxgolem_core::voice_pipeline::VoicePipelineEvent::PromptFailed {
                     message: error.to_string(),
                 },
             )?;
@@ -123,17 +125,19 @@ fn submit_prompt(
     let result_error = prompt_result_error_message(&result);
 
     let completion_event = match result_error {
-        Some(message) => voxgolem_core::session::SessionEvent::PromptFailed { message },
-        None => voxgolem_core::session::SessionEvent::PromptCompleted,
+        Some(message) => {
+            voxgolem_core::voice_pipeline::VoicePipelineEvent::PromptFailed { message }
+        }
+        None => voxgolem_core::voice_pipeline::VoicePipelineEvent::PromptCompleted,
     };
 
-    apply_session_transition(
-        &app_state.session_state,
-        app_state.session_config,
+    apply_voice_pipeline_transition(
+        &app_state.voice_pipeline_state,
+        app_state.voice_pipeline_config,
         completion_event,
     )?;
 
-    let runtime_phase = current_runtime_phase(&app_state.session_state)?;
+    let runtime_phase = current_runtime_phase(&app_state.voice_pipeline_state)?;
 
     Ok(PromptExecutionPayload {
         events: result
@@ -183,14 +187,14 @@ fn submit_prompt(
 fn begin_listening(
     app_state: tauri::State<'_, AppState>,
 ) -> Result<RuntimePhaseResponsePayload, String> {
-    apply_session_transition(
-        &app_state.session_state,
-        app_state.session_config,
-        voxgolem_core::session::SessionEvent::WakeWordDetected { now_ms: 0 },
+    apply_voice_pipeline_transition(
+        &app_state.voice_pipeline_state,
+        app_state.voice_pipeline_config,
+        voxgolem_core::voice_pipeline::VoicePipelineEvent::WakeWordDetected { now_ms: 0 },
     )?;
 
     Ok(RuntimePhaseResponsePayload {
-        runtime_phase: current_runtime_phase(&app_state.session_state)?,
+        runtime_phase: current_runtime_phase(&app_state.voice_pipeline_state)?,
     })
 }
 
@@ -198,19 +202,21 @@ fn begin_listening(
 fn mark_silence(
     app_state: tauri::State<'_, AppState>,
 ) -> Result<RuntimePhaseResponsePayload, String> {
-    let silence_deadline =
-        current_silence_deadline(&app_state.session_state, app_state.session_config)?;
+    let silence_deadline = current_silence_deadline(
+        &app_state.voice_pipeline_state,
+        app_state.voice_pipeline_config,
+    )?;
 
-    apply_session_transition(
-        &app_state.session_state,
-        app_state.session_config,
-        voxgolem_core::session::SessionEvent::SilenceCheck {
+    apply_voice_pipeline_transition(
+        &app_state.voice_pipeline_state,
+        app_state.voice_pipeline_config,
+        voxgolem_core::voice_pipeline::VoicePipelineEvent::SilenceCheck {
             now_ms: silence_deadline,
         },
     )?;
 
     Ok(RuntimePhaseResponsePayload {
-        runtime_phase: current_runtime_phase(&app_state.session_state)?,
+        runtime_phase: current_runtime_phase(&app_state.voice_pipeline_state)?,
     })
 }
 
@@ -218,14 +224,14 @@ fn mark_silence(
 fn mark_result_ready(
     app_state: tauri::State<'_, AppState>,
 ) -> Result<RuntimePhaseResponsePayload, String> {
-    apply_session_transition(
-        &app_state.session_state,
-        app_state.session_config,
-        voxgolem_core::session::SessionEvent::PromptCompleted,
+    apply_voice_pipeline_transition(
+        &app_state.voice_pipeline_state,
+        app_state.voice_pipeline_config,
+        voxgolem_core::voice_pipeline::VoicePipelineEvent::PromptCompleted,
     )?;
 
     Ok(RuntimePhaseResponsePayload {
-        runtime_phase: current_runtime_phase(&app_state.session_state)?,
+        runtime_phase: current_runtime_phase(&app_state.voice_pipeline_state)?,
     })
 }
 
@@ -233,26 +239,27 @@ fn mark_result_ready(
 fn reset_session(
     app_state: tauri::State<'_, AppState>,
 ) -> Result<RuntimePhaseResponsePayload, String> {
-    apply_session_transition(
-        &app_state.session_state,
-        app_state.session_config,
-        voxgolem_core::session::SessionEvent::ResetToIdle,
+    apply_voice_pipeline_transition(
+        &app_state.voice_pipeline_state,
+        app_state.voice_pipeline_config,
+        voxgolem_core::voice_pipeline::VoicePipelineEvent::ResetToIdle,
     )?;
 
     Ok(RuntimePhaseResponsePayload {
-        runtime_phase: current_runtime_phase(&app_state.session_state)?,
+        runtime_phase: current_runtime_phase(&app_state.voice_pipeline_state)?,
     })
 }
 
 fn build_app_state() -> AppState {
-    let session_config = default_session_config();
+    let voice_pipeline_config = default_voice_pipeline_config();
 
     match voxgolem_core::config::load_runtime_config(None) {
         Ok(config) => {
-            let session_state = apply_session_event_or_panic(
-                voxgolem_core::session::SessionState::new(),
-                session_config,
-                voxgolem_core::session::SessionEvent::StartupValidated,
+            let voice_pipeline_state = apply_voice_pipeline_event_or_panic(
+                voxgolem_core::voice_pipeline::VoicePipelineState::new(voice_pipeline_config)
+                    .expect("voice pipeline should initialize with valid constants"),
+                voice_pipeline_config,
+                voxgolem_core::voice_pipeline::VoicePipelineEvent::StartupValidated,
                 "startup validation should initialize the session to sleeping",
             );
 
@@ -265,16 +272,17 @@ fn build_app_state() -> AppState {
                     runtime_phase: RuntimePhasePayload::Sleeping,
                 },
                 runtime_config: Some(config),
-                session_config,
-                session_state: Mutex::new(session_state),
+                voice_pipeline_config,
+                voice_pipeline_state: Mutex::new(voice_pipeline_state),
             }
         }
         Err(error) => {
             let message = error.to_string();
-            let session_state = apply_session_event_or_panic(
-                voxgolem_core::session::SessionState::new(),
-                session_config,
-                voxgolem_core::session::SessionEvent::StartupFailed {
+            let voice_pipeline_state = apply_voice_pipeline_event_or_panic(
+                voxgolem_core::voice_pipeline::VoicePipelineState::new(voice_pipeline_config)
+                    .expect("voice pipeline should initialize with valid constants"),
+                voice_pipeline_config,
+                voxgolem_core::voice_pipeline::VoicePipelineEvent::StartupFailed {
                     message: message.clone(),
                 },
                 "startup failure should initialize the session to error",
@@ -283,33 +291,38 @@ fn build_app_state() -> AppState {
             AppState {
                 startup_state: StartupStatePayload::Error { message },
                 runtime_config: None,
-                session_config,
-                session_state: Mutex::new(session_state),
+                voice_pipeline_config,
+                voice_pipeline_state: Mutex::new(voice_pipeline_state),
             }
         }
     }
 }
 
 fn current_runtime_phase(
-    session_state: &Mutex<voxgolem_core::session::SessionState>,
+    voice_pipeline_state: &Mutex<voxgolem_core::voice_pipeline::VoicePipelineState>,
 ) -> Result<RuntimePhasePayload, String> {
-    let guard = session_state
+    let guard = voice_pipeline_state
         .lock()
-        .map_err(|_| String::from("session state lock is poisoned"))?;
+        .map_err(|_| String::from("voice pipeline lock is poisoned"))?;
 
-    Ok(to_runtime_phase_payload(guard.runtime().phase()))
+    Ok(to_runtime_phase_payload(guard.session().runtime().phase()))
 }
 
 fn current_silence_deadline(
-    session_state: &Mutex<voxgolem_core::session::SessionState>,
-    session_config: voxgolem_core::session::SessionConfig,
+    voice_pipeline_state: &Mutex<voxgolem_core::voice_pipeline::VoicePipelineState>,
+    voice_pipeline_config: voxgolem_core::voice_pipeline::VoicePipelineConfig,
 ) -> Result<u64, String> {
-    let guard = session_state
+    let guard = voice_pipeline_state
         .lock()
-        .map_err(|_| String::from("session state lock is poisoned"))?;
+        .map_err(|_| String::from("voice pipeline lock is poisoned"))?;
 
-    let last_activity_ms = guard.voice_turn().last_activity_ms().unwrap_or(0);
-    Ok(last_activity_ms.saturating_add(session_config.voice_turn().silence_timeout_ms()))
+    let last_activity_ms = guard.session().voice_turn().last_activity_ms().unwrap_or(0);
+    Ok(last_activity_ms.saturating_add(
+        voice_pipeline_config
+            .session()
+            .voice_turn()
+            .silence_timeout_ms(),
+    ))
 }
 
 fn to_runtime_phase_payload(
@@ -326,36 +339,50 @@ fn to_runtime_phase_payload(
     }
 }
 
-fn default_session_config() -> voxgolem_core::session::SessionConfig {
+fn default_voice_pipeline_config() -> voxgolem_core::voice_pipeline::VoicePipelineConfig {
     let voice_turn = voxgolem_core::voice_turn::VoiceTurnConfig::new(DEFAULT_SILENCE_TIMEOUT_MS)
         .expect("silence timeout constant should be valid");
+    let capture = voxgolem_core::turn_capture::TurnCaptureConfig::new(
+        DEFAULT_PREROLL_MAX_SAMPLES,
+        DEFAULT_UTTERANCE_MAX_SAMPLES,
+    )
+    .expect("turn capture constants should be valid");
 
-    voxgolem_core::session::SessionConfig::new(voice_turn)
+    voxgolem_core::voice_pipeline::VoicePipelineConfig::new(
+        voxgolem_core::session::SessionConfig::new(voice_turn),
+        capture,
+    )
 }
 
-fn apply_session_transition(
-    session_state: &Mutex<voxgolem_core::session::SessionState>,
-    session_config: voxgolem_core::session::SessionConfig,
-    event: voxgolem_core::session::SessionEvent,
+fn apply_voice_pipeline_transition(
+    voice_pipeline_state: &Mutex<voxgolem_core::voice_pipeline::VoicePipelineState>,
+    voice_pipeline_config: voxgolem_core::voice_pipeline::VoicePipelineConfig,
+    event: voxgolem_core::voice_pipeline::VoicePipelineEvent,
 ) -> Result<(), String> {
-    let mut guard = session_state
+    let mut guard = voice_pipeline_state
         .lock()
-        .map_err(|_| String::from("session state lock is poisoned"))?;
+        .map_err(|_| String::from("voice pipeline lock is poisoned"))?;
 
-    let next_state = voxgolem_core::session::apply_session_event(&guard, session_config, event)
-        .map_err(|error| format!("session transition failed: {error:?}"))?;
+    let (next_state, _) = voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
+        &guard,
+        voice_pipeline_config,
+        event,
+    )
+    .map_err(|error| format!("voice pipeline transition failed: {error:?}"))?;
 
     *guard = next_state;
     Ok(())
 }
 
-fn apply_session_event_or_panic(
-    state: voxgolem_core::session::SessionState,
-    config: voxgolem_core::session::SessionConfig,
-    event: voxgolem_core::session::SessionEvent,
+fn apply_voice_pipeline_event_or_panic(
+    state: voxgolem_core::voice_pipeline::VoicePipelineState,
+    config: voxgolem_core::voice_pipeline::VoicePipelineConfig,
+    event: voxgolem_core::voice_pipeline::VoicePipelineEvent,
     message: &str,
-) -> voxgolem_core::session::SessionState {
-    voxgolem_core::session::apply_session_event(&state, config, event).expect(message)
+) -> voxgolem_core::voice_pipeline::VoicePipelineState {
+    voxgolem_core::voice_pipeline::apply_voice_pipeline_event(&state, config, event)
+        .expect(message)
+        .0
 }
 
 fn prompt_result_error_message(
@@ -399,7 +426,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        current_silence_deadline, default_session_config, prompt_result_error_message,
+        current_silence_deadline, default_voice_pipeline_config, prompt_result_error_message,
         to_runtime_phase_payload, RuntimePhasePayload, DEFAULT_SILENCE_TIMEOUT_MS,
     };
     use std::sync::Mutex;
@@ -461,23 +488,24 @@ mod tests {
 
     #[test]
     fn current_silence_deadline_uses_last_activity_plus_timeout() {
-        let session_config = default_session_config();
-        let session_state = voxgolem_core::session::apply_session_event(
-            &voxgolem_core::session::SessionState::new(),
-            session_config,
-            voxgolem_core::session::SessionEvent::StartupValidated,
+        let voice_pipeline_config = default_voice_pipeline_config();
+        let voice_pipeline_state = voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
+            &voxgolem_core::voice_pipeline::VoicePipelineState::new(voice_pipeline_config)
+                .expect("voice pipeline should initialize"),
+            voice_pipeline_config,
+            voxgolem_core::voice_pipeline::VoicePipelineEvent::StartupValidated,
         )
         .expect("startup validation should succeed");
-        let listening_state = voxgolem_core::session::apply_session_event(
-            &session_state,
-            session_config,
-            voxgolem_core::session::SessionEvent::WakeWordDetected { now_ms: 100 },
+        let listening_state = voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
+            &voice_pipeline_state.0,
+            voice_pipeline_config,
+            voxgolem_core::voice_pipeline::VoicePipelineEvent::WakeWordDetected { now_ms: 100 },
         )
         .expect("wake word should start listening");
-        let locked_state = Mutex::new(listening_state);
+        let locked_state = Mutex::new(listening_state.0);
 
         assert_eq!(
-            current_silence_deadline(&locked_state, session_config),
+            current_silence_deadline(&locked_state, voice_pipeline_config),
             Ok(DEFAULT_SILENCE_TIMEOUT_MS + 100)
         );
     }
