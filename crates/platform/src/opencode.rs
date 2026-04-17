@@ -422,18 +422,18 @@ mod tests {
     #[test]
     fn captures_stdout_stderr_and_exit_code_from_process() {
         let temp = TempDir::new();
-        let executable = create_fake_opencode(
-            temp.path(),
-            "printf 'stdout:%s|%s\\n' \"$1\" \"$2\"; printf 'stderr:%s\\n' \"$1\" 1>&2",
-        );
+        let executable = create_fake_opencode(temp.path(), successful_run_script());
         let prompt = OpencodePrompt::new("summarize the transcript")
             .expect("non-empty prompt should be accepted");
         let spec = OpencodeCommandSpec::new(executable, prompt);
 
         let result = run_opencode(&spec).expect("fake executable should run");
 
-        assert_eq!(result.stdout, "stdout:run|summarize the transcript\n");
-        assert_eq!(result.stderr, "stderr:run\n");
+        assert_eq!(
+            result.stdout,
+            format!("stdout:run|summarize the transcript{}", platform_newline())
+        );
+        assert_eq!(result.stderr, format!("stderr:run{}", platform_newline()));
         assert_eq!(result.exit_code, Some(0));
         assert!(result.succeeded());
     }
@@ -441,7 +441,7 @@ mod tests {
     #[test]
     fn preserves_non_zero_exit_codes() {
         let temp = TempDir::new();
-        let executable = create_fake_opencode(temp.path(), "printf 'bad prompt' 1>&2; exit 7");
+        let executable = create_fake_opencode(temp.path(), failing_run_script());
         let prompt = OpencodePrompt::new("summarize the transcript")
             .expect("non-empty prompt should be accepted");
         let spec = OpencodeCommandSpec::new(executable, prompt);
@@ -449,7 +449,7 @@ mod tests {
         let result = run_opencode(&spec).expect("fake executable should run");
 
         assert_eq!(result.stdout, "");
-        assert_eq!(result.stderr, "bad prompt");
+        assert_eq!(result.stderr, format!("bad prompt{}", platform_newline()));
         assert_eq!(result.exit_code, Some(7));
         assert!(!result.succeeded());
     }
@@ -457,10 +457,7 @@ mod tests {
     #[test]
     fn parses_minimal_json_events_and_ignores_other_event_types() {
         let temp = TempDir::new();
-        let executable = create_fake_opencode(
-            temp.path(),
-            "printf '%s\n' '{\"type\":\"text\",\"timestamp\":1,\"sessionID\":\"ses_1\",\"part\":{\"text\":\"Hello from OpenCode\"}}' '{\"type\":\"tool_use\",\"timestamp\":2,\"sessionID\":\"ses_1\",\"part\":{\"tool\":\"bash\",\"state\":{\"status\":\"completed\",\"title\":\"Shows working tree status\",\"output\":\"On branch main\"}}}' '{\"type\":\"step_start\",\"timestamp\":3,\"sessionID\":\"ses_1\",\"part\":{}}' '{\"type\":\"error\",\"timestamp\":4,\"sessionID\":\"ses_1\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"Provider failed\"}}}'",
-        );
+        let executable = create_fake_opencode(temp.path(), json_events_script());
         let prompt = OpencodePrompt::new("summarize the transcript")
             .expect("non-empty prompt should be accepted");
         let spec = OpencodeCommandSpec::new(executable, prompt)
@@ -492,7 +489,7 @@ mod tests {
     #[test]
     fn reports_invalid_json_lines() {
         let temp = TempDir::new();
-        let executable = create_fake_opencode(temp.path(), "printf '%s\n' 'not json at all'");
+        let executable = create_fake_opencode(temp.path(), invalid_json_script());
         let prompt = OpencodePrompt::new("summarize the transcript")
             .expect("non-empty prompt should be accepted");
         let spec = OpencodeCommandSpec::new(executable, prompt)
@@ -509,10 +506,7 @@ mod tests {
     #[test]
     fn parses_tool_use_error_events() {
         let temp = TempDir::new();
-        let executable = create_fake_opencode(
-            temp.path(),
-            "printf '%s\n' '{\"type\":\"tool_use\",\"timestamp\":1,\"sessionID\":\"ses_1\",\"part\":{\"tool\":\"bash\",\"state\":{\"status\":\"error\",\"error\":\"command failed\"}}}'",
-        );
+        let executable = create_fake_opencode(temp.path(), tool_error_json_script());
         let prompt = OpencodePrompt::new("summarize the transcript")
             .expect("non-empty prompt should be accepted");
         let spec = OpencodeCommandSpec::new(executable, prompt)
@@ -531,7 +525,14 @@ mod tests {
     }
 
     fn create_fake_opencode(directory: &Path, body: &str) -> PathBuf {
+        #[cfg(windows)]
+        let executable = directory.join("fake-opencode.cmd");
+        #[cfg(not(windows))]
         let executable = directory.join("fake-opencode.sh");
+
+        #[cfg(windows)]
+        let script = format!("@echo off\r\n{body}\r\n");
+        #[cfg(not(windows))]
         let script = format!("#!/bin/sh\n{body}\n");
 
         fs::write(&executable, script).expect("fake executable should be written");
@@ -546,5 +547,65 @@ mod tests {
         }
 
         executable
+    }
+
+    #[cfg(windows)]
+    fn platform_newline() -> &'static str {
+        "\r\n"
+    }
+
+    #[cfg(not(windows))]
+    fn platform_newline() -> &'static str {
+        "\n"
+    }
+
+    #[cfg(windows)]
+    fn successful_run_script() -> &'static str {
+        "echo stdout:%1^|%~2\n1>&2 echo stderr:%1"
+    }
+
+    #[cfg(not(windows))]
+    fn successful_run_script() -> &'static str {
+        "printf 'stdout:%s|%s\\n' \"$1\" \"$2\"; printf 'stderr:%s\\n' \"$1\" 1>&2"
+    }
+
+    #[cfg(windows)]
+    fn failing_run_script() -> &'static str {
+        "1>&2 echo bad prompt\nexit /b 7"
+    }
+
+    #[cfg(not(windows))]
+    fn failing_run_script() -> &'static str {
+        "printf 'bad prompt' 1>&2; exit 7"
+    }
+
+    #[cfg(windows)]
+    fn json_events_script() -> &'static str {
+        "echo {\"type\":\"text\",\"timestamp\":1,\"sessionID\":\"ses_1\",\"part\":{\"text\":\"Hello from OpenCode\"}}\necho {\"type\":\"tool_use\",\"timestamp\":2,\"sessionID\":\"ses_1\",\"part\":{\"tool\":\"bash\",\"state\":{\"status\":\"completed\",\"title\":\"Shows working tree status\",\"output\":\"On branch main\"}}}\necho {\"type\":\"step_start\",\"timestamp\":3,\"sessionID\":\"ses_1\",\"part\":{}}\necho {\"type\":\"error\",\"timestamp\":4,\"sessionID\":\"ses_1\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"Provider failed\"}}}"
+    }
+
+    #[cfg(not(windows))]
+    fn json_events_script() -> &'static str {
+        "printf '%s\\n' '{\"type\":\"text\",\"timestamp\":1,\"sessionID\":\"ses_1\",\"part\":{\"text\":\"Hello from OpenCode\"}}' '{\"type\":\"tool_use\",\"timestamp\":2,\"sessionID\":\"ses_1\",\"part\":{\"tool\":\"bash\",\"state\":{\"status\":\"completed\",\"title\":\"Shows working tree status\",\"output\":\"On branch main\"}}}' '{\"type\":\"step_start\",\"timestamp\":3,\"sessionID\":\"ses_1\",\"part\":{}}' '{\"type\":\"error\",\"timestamp\":4,\"sessionID\":\"ses_1\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"Provider failed\"}}}'"
+    }
+
+    #[cfg(windows)]
+    fn invalid_json_script() -> &'static str {
+        "echo not json at all"
+    }
+
+    #[cfg(not(windows))]
+    fn invalid_json_script() -> &'static str {
+        "printf '%s\\n' 'not json at all'"
+    }
+
+    #[cfg(windows)]
+    fn tool_error_json_script() -> &'static str {
+        "echo {\"type\":\"tool_use\",\"timestamp\":1,\"sessionID\":\"ses_1\",\"part\":{\"tool\":\"bash\",\"state\":{\"status\":\"error\",\"error\":\"command failed\"}}}"
+    }
+
+    #[cfg(not(windows))]
+    fn tool_error_json_script() -> &'static str {
+        "printf '%s\\n' '{\"type\":\"tool_use\",\"timestamp\":1,\"sessionID\":\"ses_1\",\"part\":{\"tool\":\"bash\",\"state\":{\"status\":\"error\",\"error\":\"command failed\"}}}'"
     }
 }
