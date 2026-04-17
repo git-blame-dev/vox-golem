@@ -3,8 +3,9 @@ import type { FormEvent, KeyboardEvent } from 'react'
 import { ChatBubble } from './components/ChatBubble'
 import { playCue } from './lib/audioCues'
 import { shouldSubmitComposer } from './lib/composer'
+import { executePrompt } from './lib/promptExecution'
 import { DEFAULT_CUE_ASSET_PATHS, loadStartupState } from './lib/startupState'
-import { createPlaceholderReply, getInitialMessages } from './state/appShell'
+import { createExecutionMessages, getInitialMessages } from './state/appShell'
 import { cueForTransition, transitionRuntimeStatus } from './state/runtimeMachine'
 import type { ChatMessage, RuntimeStatus, StartupState } from './types/chat'
 import './App.css'
@@ -100,7 +101,7 @@ function App() {
     applyTransition(runtimeStatus, event)
   }
 
-  const sendPrompt = (): void => {
+  const sendPrompt = async (): Promise<void> => {
     if (startupState.kind !== 'ready') {
       return
     }
@@ -123,20 +124,33 @@ function App() {
       content: prompt,
     }
 
-    const placeholderReply = createPlaceholderReply(prompt)
-
-    setMessages((currentMessages) => [
-      ...currentMessages,
-      userMessage,
-      placeholderReply,
-    ])
+    setMessages((currentMessages) => [...currentMessages, userMessage])
     setComposerValue('')
-    applyTransition(executingStatus, 'response_ready')
+
+    try {
+      const result = await executePrompt(prompt)
+      const nextMessages = createExecutionMessages(result)
+
+      setMessages((currentMessages) => [...currentMessages, ...nextMessages])
+      applyTransition(executingStatus, 'response_ready')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Prompt execution failed'
+
+      setRuntimeStatus('error')
+      setMessages((currentMessages) => [
+        ...currentMessages,
+        {
+          id: `system-exec-error-${Date.now()}`,
+          role: 'system',
+          content: `Execution error: ${message}`,
+        },
+      ])
+    }
   }
 
   const onSubmit = (event: FormEvent<HTMLFormElement>): void => {
     event.preventDefault()
-    sendPrompt()
+    void sendPrompt()
   }
 
   const onComposerKeyDown = (
@@ -147,7 +161,7 @@ function App() {
     }
 
     event.preventDefault()
-    sendPrompt()
+    void sendPrompt()
   }
 
   return (
