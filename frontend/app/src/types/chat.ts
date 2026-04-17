@@ -14,7 +14,8 @@ export type StartupState =
 export type RuntimeStatus =
   | 'initializing'
   | 'sleeping'
-  | 'recording'
+  | 'listening'
   | 'processing'
   | 'executing'
+  | 'result_ready'
   | 'error'
