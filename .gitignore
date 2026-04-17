@@ -24,5 +24,6 @@ recordings/
 # Environment and OS noise
 .env
 .env.*
+config.toml
 .DS_Store
 Thumbs.db
