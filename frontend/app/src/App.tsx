@@ -1,8 +1,10 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent, KeyboardEvent } from 'react'
 import { ChatBubble } from './components/ChatBubble'
 import { playCue } from './lib/audioCues'
 import { shouldSubmitComposer } from './lib/composer'
+import { startLiveAudioSource } from './lib/liveAudioSource'
+import type { LiveAudioSource } from './lib/liveAudioSource'
 import { executePrompt } from './lib/promptExecution'
 import {
   ingestAudioFrame,
@@ -24,9 +26,12 @@ function App() {
   const [startupState, setStartupState] = useState<StartupState>({ kind: 'loading' })
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus>('initializing')
   const [composerValue, setComposerValue] = useState('')
+  const [micStarting, setMicStarting] = useState(false)
+  const [micActive, setMicActive] = useState(false)
   const [messages, setMessages] = useState<readonly ChatMessage[]>(() =>
     getInitialMessages(),
   )
+  const liveAudioSourceRef = useRef<LiveAudioSource | null>(null)
 
   useEffect(() => {
     let active = true
@@ -42,6 +47,13 @@ function App() {
 
     return () => {
       active = false
+    }
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      liveAudioSourceRef.current?.stop()
+      liveAudioSourceRef.current = null
     }
   }, [])
 
@@ -65,6 +77,7 @@ function App() {
   const canResetToIdle =
     startupState.kind === 'ready' &&
     (runtimeStatus === 'result_ready' || runtimeStatus === 'error')
+  const canToggleMic = startupState.kind === 'ready' && !micStarting
   const canIngestTestFrame = startupState.kind === 'ready'
   const cueAssetPaths =
     startupState.kind === 'ready'
@@ -247,6 +260,77 @@ function App() {
     }
   }
 
+  const stopLiveAudio = (content: string): void => {
+    liveAudioSourceRef.current?.stop()
+    liveAudioSourceRef.current = null
+    setMicStarting(false)
+    setMicActive(false)
+    setMessages((currentMessages) => [
+      ...currentMessages,
+      {
+        id: `system-live-audio-${Date.now()}`,
+        role: 'system',
+        content,
+      },
+    ])
+  }
+
+  const reportLiveAudioError = (error: unknown): void => {
+    const message = error instanceof Error ? error.message : 'Live audio capture failed'
+
+    stopLiveAudio(`live_audio_error:\n${message}`)
+  }
+
+  const startMic = async (): Promise<void> => {
+    if (startupState.kind !== 'ready' || liveAudioSourceRef.current !== null || micStarting) {
+      return
+    }
+
+    setMicStarting(true)
+
+    try {
+      const liveAudioSource = await startLiveAudioSource({
+        onFrame: async (frame) => {
+          try {
+            const status = await ingestAudioFrame(frame)
+
+            if (status !== null) {
+              applyRuntimeStatus(toRuntimeStatus(status.runtimePhase))
+            }
+          } catch (error) {
+            setRuntimeStatus('error')
+            throw error
+          }
+        },
+        onError: reportLiveAudioError,
+      })
+
+      liveAudioSourceRef.current = liveAudioSource
+      setMicStarting(false)
+      setMicActive(true)
+      setMessages((currentMessages) => [
+        ...currentMessages,
+        {
+          id: `system-live-audio-${Date.now()}`,
+          role: 'system',
+          content: 'live_audio:\ndefault microphone started',
+        },
+      ])
+    } catch (error) {
+      setMicStarting(false)
+      reportLiveAudioError(error)
+    }
+  }
+
+  const toggleMic = (): void => {
+    if (micActive) {
+      stopLiveAudio('live_audio:\ndefault microphone stopped')
+      return
+    }
+
+    void startMic()
+  }
+
   const sendPrompt = async (): Promise<void> => {
     if (startupState.kind !== 'ready') {
       return
@@ -320,6 +404,14 @@ function App() {
           <p className="shell__error">Startup error: {startupState.message}</p>
         ) : null}
         <div className="shell__controls" role="group" aria-label="Runtime controls">
+          <button
+            type="button"
+            className="shell__control"
+            onClick={toggleMic}
+            disabled={!canToggleMic}
+          >
+            {micStarting ? 'Starting mic...' : micActive ? 'Stop mic' : 'Start mic'}
+          </button>
           <button
             type="button"
             className="shell__control"

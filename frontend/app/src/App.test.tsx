@@ -1,8 +1,11 @@
 import { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import type { Root } from 'react-dom/client'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import * as liveAudioSourceModule from './lib/liveAudioSource'
 import App from './App'
+
+const startLiveAudioSourceMock = vi.spyOn(liveAudioSourceModule, 'startLiveAudioSource')
 
 const mountedContainers: HTMLElement[] = []
 const mountedRoots: Root[] = []
@@ -34,6 +37,7 @@ afterEach(() => {
 
   Reflect.deleteProperty(window, '__TAURI_INTERNALS__')
   Date.now = originalDateNow
+  startLiveAudioSourceMock.mockReset()
 })
 
 describe('App', () => {
@@ -373,6 +377,99 @@ describe('App', () => {
       'audio_frame_status:\npreroll=3 utterance=0 capturing=false',
     )
   })
+
+  it('starts and stops default microphone capture and forwards live frames', async () => {
+    const stop = vi.fn()
+    let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
+
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      onFrame = options.onFrame
+      return { stop }
+    })
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command, args) => {
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'assets/start-listening.mp3',
+              stop_listening: 'assets/stop-listening.mp3',
+            },
+            runtime_phase: 'sleeping',
+          }
+        }
+
+        expect(command).toBe('ingest_audio_frame')
+        expect(args).toEqual({ frame: [0.1, 0.2, 0.3] })
+
+        return {
+          runtime_phase: 'sleeping',
+          capturing_utterance: false,
+          preroll_samples: 3,
+          utterance_samples: 0,
+        }
+      },
+    }
+
+    const { container } = await renderApp()
+    const startMicButton = getControlButton(container, 'Start mic')
+
+    await act(async () => {
+      startMicButton.click()
+      await Promise.resolve()
+    })
+
+    expect(startLiveAudioSourceMock).toHaveBeenCalledTimes(1)
+    expect(container.textContent).toContain('live_audio:\ndefault microphone started')
+
+    await act(async () => {
+      await onFrame?.([0.1, 0.2, 0.3])
+      await Promise.resolve()
+    })
+
+    expect(container.textContent).toContain('Runtime: sleeping')
+
+    const stopMicButton = getControlButton(container, 'Stop mic')
+
+    await act(async () => {
+      stopMicButton.click()
+      await Promise.resolve()
+    })
+
+    expect(stop).toHaveBeenCalledTimes(1)
+    expect(container.textContent).toContain('live_audio:\ndefault microphone stopped')
+  })
+
+  it('shows microphone capture errors without changing the backend contract', async () => {
+    startLiveAudioSourceMock.mockRejectedValue(new Error('Permission denied'))
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        expect(command).toBe('get_startup_state')
+
+        return {
+          kind: 'ready',
+          cue_asset_paths: {
+            start_listening: 'assets/start-listening.mp3',
+            stop_listening: 'assets/stop-listening.mp3',
+          },
+          runtime_phase: 'sleeping',
+        }
+      },
+    }
+
+    const { container } = await renderApp()
+    const startMicButton = getControlButton(container, 'Start mic')
+
+    await act(async () => {
+      startMicButton.click()
+      await Promise.resolve()
+    })
+
+    expect(container.textContent).toContain('live_audio_error:\nPermission denied')
+    expect(container.textContent).toContain('Start mic')
+  })
 })
 
 async function renderApp(): Promise<{ container: HTMLElement }> {
@@ -416,6 +513,8 @@ function getSendButton(container: HTMLElement): HTMLButtonElement {
 function getControlButton(
   container: HTMLElement,
   label:
+    | 'Start mic'
+    | 'Stop mic'
     | 'Start listening'
     | 'Record speech activity'
     | 'Mark silence'
