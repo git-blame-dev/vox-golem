@@ -4,7 +4,11 @@ import { ChatBubble } from './components/ChatBubble'
 import { playCue } from './lib/audioCues'
 import { shouldSubmitComposer } from './lib/composer'
 import { executePrompt } from './lib/promptExecution'
-import { ingestAudioFrame, invokeRuntimeControl } from './lib/runtimeControl'
+import {
+  ingestAudioFrame,
+  invokeRuntimeControl,
+} from './lib/runtimeControl'
+import type { RuntimeControlArgs, RuntimeControlResult } from './lib/runtimeControl'
 import { DEFAULT_CUE_ASSET_PATHS, loadStartupState } from './lib/startupState'
 import { createExecutionMessages, getInitialMessages } from './state/appShell'
 import { cueForTransition, transitionRuntimeStatus } from './state/runtimeMachine'
@@ -54,6 +58,7 @@ function App() {
     (runtimeStatus === 'sleeping' || runtimeStatus === 'result_ready')
   const canMarkSilence =
     startupState.kind === 'ready' && runtimeStatus === 'listening'
+  const canRecordSpeechActivity = canMarkSilence
   const canMarkResultReady =
     startupState.kind === 'ready' &&
     (runtimeStatus === 'processing' || runtimeStatus === 'executing')
@@ -137,40 +142,60 @@ function App() {
     applyTransition(runtimeStatus, event)
   }
 
+  const applyRuntimeControlResult = (runtimePhase: RuntimeControlResult): void => {
+    applyRuntimeStatus(toRuntimeStatus(runtimePhase.runtimePhase))
+
+    const lastActivityText =
+      runtimePhase.lastActivityMs === null ? 'none' : String(runtimePhase.lastActivityMs)
+    const nextMessages: ChatMessage[] = [
+      {
+        id: `system-runtime-control-status-${Date.now()}`,
+        role: 'system',
+        content: `runtime_control_status:\npreroll=${runtimePhase.prerollSamples} utterance=${runtimePhase.utteranceSamples} capturing=${String(runtimePhase.capturingUtterance)} last_activity=${lastActivityText}`,
+      },
+    ]
+
+    if (runtimePhase.transcriptionReadySamples !== null) {
+      nextMessages.push({
+        id: `system-transcription-ready-${Date.now()}`,
+        role: 'system',
+        content: `transcription_ready:\n${runtimePhase.transcriptionReadySamples} samples captured`,
+      })
+    }
+
+    setMessages((currentMessages) => [...currentMessages, ...nextMessages])
+  }
+
   const syncRuntimeControl = async (
-    command: 'begin_listening' | 'mark_silence' | 'mark_result_ready' | 'reset_session',
-    fallbackEvent: Parameters<typeof transitionRuntimeStatus>[1],
+    command:
+      | 'begin_listening'
+      | 'record_speech_activity'
+      | 'mark_silence'
+      | 'mark_result_ready'
+      | 'reset_session',
+    options: {
+      readonly args?: RuntimeControlArgs
+      readonly fallbackEvent?: Parameters<typeof transitionRuntimeStatus>[1]
+    } = {},
   ): Promise<void> => {
     if (startupState.kind !== 'ready') {
       return
     }
 
+    const { args, fallbackEvent } = options
+
     try {
-      const runtimePhase = await invokeRuntimeControl(command)
+      const runtimePhase = await invokeRuntimeControl(command, args)
 
       if (runtimePhase === null) {
-        transitionFromCurrentStatus(fallbackEvent)
+        if (fallbackEvent !== undefined) {
+          transitionFromCurrentStatus(fallbackEvent)
+        }
+
         return
       }
 
-      applyRuntimeStatus(toRuntimeStatus(runtimePhase.runtimePhase))
-      const nextMessages: ChatMessage[] = [
-        {
-          id: `system-runtime-control-status-${Date.now()}`,
-          role: 'system',
-          content: `runtime_control_status:\npreroll=${runtimePhase.prerollSamples} utterance=${runtimePhase.utteranceSamples} capturing=${String(runtimePhase.capturingUtterance)}`,
-        },
-      ]
-
-      if (runtimePhase.transcriptionReadySamples !== null) {
-        nextMessages.push({
-          id: `system-transcription-ready-${Date.now()}`,
-          role: 'system',
-          content: `transcription_ready:\n${runtimePhase.transcriptionReadySamples} samples captured`,
-        })
-      }
-
-      setMessages((currentMessages) => [...currentMessages, ...nextMessages])
+      applyRuntimeControlResult(runtimePhase)
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Runtime control failed'
 
@@ -299,7 +324,7 @@ function App() {
             type="button"
             className="shell__control"
             onClick={() => {
-              void syncRuntimeControl('begin_listening', 'begin_listening')
+              void syncRuntimeControl('begin_listening', { fallbackEvent: 'begin_listening' })
             }}
             disabled={!canStartListening}
           >
@@ -309,7 +334,19 @@ function App() {
             type="button"
             className="shell__control"
             onClick={() => {
-              void syncRuntimeControl('mark_silence', 'end_listening')
+              void syncRuntimeControl('record_speech_activity', {
+                args: { nowMs: Date.now() },
+              })
+            }}
+            disabled={!canRecordSpeechActivity}
+          >
+            Record speech activity
+          </button>
+          <button
+            type="button"
+            className="shell__control"
+            onClick={() => {
+              void syncRuntimeControl('mark_silence', { fallbackEvent: 'end_listening' })
             }}
             disabled={!canMarkSilence}
           >
@@ -319,7 +356,7 @@ function App() {
             type="button"
             className="shell__control"
             onClick={() => {
-              void syncRuntimeControl('mark_result_ready', 'response_ready')
+              void syncRuntimeControl('mark_result_ready', { fallbackEvent: 'response_ready' })
             }}
             disabled={!canMarkResultReady}
           >
@@ -331,7 +368,10 @@ function App() {
             onClick={() => {
               void syncRuntimeControl(
                 'reset_session',
-                runtimeStatus === 'error' ? 'recover_from_error' : 'reset_to_sleeping',
+                {
+                  fallbackEvent:
+                    runtimeStatus === 'error' ? 'recover_from_error' : 'reset_to_sleeping',
+                },
               )
             }}
             disabled={!canResetToIdle}

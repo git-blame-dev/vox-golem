@@ -251,6 +251,33 @@ mod tests {
     }
 
     #[test]
+    fn speech_detected_while_listening_refreshes_activity_without_changing_runtime() {
+        let ready = apply_session_event(
+            &SessionState::new(),
+            session_config(),
+            SessionEvent::StartupValidated,
+        )
+        .expect("startup validation should succeed");
+        let listening = apply_session_event(
+            &ready,
+            session_config(),
+            SessionEvent::WakeWordDetected { now_ms: 100 },
+        )
+        .expect("wake word should start listening");
+
+        let next = apply_session_event(
+            &listening,
+            session_config(),
+            SessionEvent::SpeechDetected { now_ms: 450 },
+        )
+        .expect("speech while listening should refresh activity");
+
+        assert_eq!(next.runtime().phase(), RuntimePhase::Listening);
+        assert!(next.voice_turn().listening());
+        assert_eq!(next.voice_turn().last_activity_ms(), Some(450));
+    }
+
+    #[test]
     fn typed_prompt_flow_resets_voice_turn_and_enters_executing() {
         let ready = apply_session_event(
             &SessionState::new(),

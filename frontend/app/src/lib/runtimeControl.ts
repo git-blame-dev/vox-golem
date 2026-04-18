@@ -3,6 +3,7 @@ import type { BackendRuntimePhase } from '../types/chat'
 
 export type RuntimeControlCommand =
   | 'begin_listening'
+  | 'record_speech_activity'
   | 'mark_silence'
   | 'mark_result_ready'
   | 'reset_session'
@@ -10,6 +11,7 @@ export type RuntimeControlCommand =
 export interface RuntimeControlResult {
   readonly runtimePhase: BackendRuntimePhase
   readonly transcriptionReadySamples: number | null
+  readonly lastActivityMs: number | null
   readonly capturingUtterance: boolean
   readonly prerollSamples: number
   readonly utteranceSamples: number
@@ -22,8 +24,13 @@ export interface AudioFrameStatus {
   readonly utteranceSamples: number
 }
 
+export interface RuntimeControlArgs {
+  readonly nowMs?: number
+}
+
 export async function invokeRuntimeControl(
   command: RuntimeControlCommand,
+  args?: RuntimeControlArgs,
 ): Promise<RuntimeControlResult | null> {
   if (typeof window === 'undefined') {
     return null
@@ -35,7 +42,10 @@ export async function invokeRuntimeControl(
     return null
   }
 
-  const payload = await tauriInternals.invoke(command)
+  const payload =
+    args === undefined
+      ? await tauriInternals.invoke(command)
+      : await tauriInternals.invoke(command, args)
   return parseRuntimePhaseResponse(payload)
 }
 
@@ -64,6 +74,11 @@ function parseRuntimePhaseResponse(payload: unknown): RuntimeControlResult {
   const record = payload as Record<string, unknown>
   const runtimePhase = record['runtime_phase']
   const transcriptionReadySamples = record['transcription_ready_samples']
+  if (!('last_activity_ms' in record)) {
+    throw new Error('Runtime control payload must include last_activity_ms')
+  }
+
+  const lastActivityMs = record['last_activity_ms']
 
   if (
     runtimePhase === 'initializing' ||
@@ -82,6 +97,13 @@ function parseRuntimePhaseResponse(payload: unknown): RuntimeControlResult {
       throw new Error('Runtime control payload must include a numeric or null transcription sample count')
     }
 
+    if (
+      typeof lastActivityMs !== 'number' &&
+      lastActivityMs !== null
+    ) {
+      throw new Error('Runtime control payload must include a numeric or null last activity timestamp')
+    }
+
     const capturingUtterance = record['capturing_utterance']
     const prerollSamples = record['preroll_samples']
     const utteranceSamples = record['utterance_samples']
@@ -98,6 +120,7 @@ function parseRuntimePhaseResponse(payload: unknown): RuntimeControlResult {
       runtimePhase,
       transcriptionReadySamples:
         typeof transcriptionReadySamples === 'number' ? transcriptionReadySamples : null,
+      lastActivityMs: typeof lastActivityMs === 'number' ? lastActivityMs : null,
       capturingUtterance,
       prerollSamples,
       utteranceSamples,

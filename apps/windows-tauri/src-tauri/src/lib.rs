@@ -63,6 +63,7 @@ struct PromptExecutionPayload {
 struct RuntimePhaseResponsePayload {
     runtime_phase: RuntimePhasePayload,
     transcription_ready_samples: Option<usize>,
+    last_activity_ms: Option<u64>,
     capturing_utterance: bool,
     preroll_samples: usize,
     utterance_samples: usize,
@@ -203,6 +204,22 @@ fn begin_listening(
         &app_state.voice_pipeline_state,
         app_state.voice_pipeline_config,
         voxgolem_core::voice_pipeline::VoicePipelineEvent::WakeWordDetected { now_ms: 0 },
+    )?;
+
+    Ok(RuntimePhaseResponsePayload {
+        ..current_runtime_phase_response(&app_state.voice_pipeline_state, None)?
+    })
+}
+
+#[tauri::command]
+fn record_speech_activity(
+    now_ms: u64,
+    app_state: tauri::State<'_, AppState>,
+) -> Result<RuntimePhaseResponsePayload, String> {
+    apply_voice_pipeline_transition(
+        &app_state.voice_pipeline_state,
+        app_state.voice_pipeline_config,
+        voxgolem_core::voice_pipeline::VoicePipelineEvent::SpeechDetected { now_ms },
     )?;
 
     Ok(RuntimePhaseResponsePayload {
@@ -373,6 +390,7 @@ fn current_runtime_phase_response(
     Ok(RuntimePhaseResponsePayload {
         runtime_phase: to_runtime_phase_payload(guard.session().runtime().phase()),
         transcription_ready_samples,
+        last_activity_ms: guard.session().voice_turn().last_activity_ms(),
         capturing_utterance: guard.capture().capturing_utterance(),
         preroll_samples: guard.capture().preroll_len(),
         utterance_samples: guard.capture().utterance_len(),
@@ -489,6 +507,7 @@ pub fn run() {
                 get_startup_state,
                 submit_prompt,
                 begin_listening,
+                record_speech_activity,
                 ingest_audio_frame,
                 mark_silence,
                 mark_result_ready,
@@ -567,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn current_silence_deadline_uses_last_activity_plus_timeout() {
+    fn current_silence_deadline_uses_refreshed_speech_activity_plus_timeout() {
         let voice_pipeline_config = default_voice_pipeline_config();
         let voice_pipeline_state = voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
             &voxgolem_core::voice_pipeline::VoicePipelineState::new(voice_pipeline_config)
@@ -582,11 +601,17 @@ mod tests {
             voxgolem_core::voice_pipeline::VoicePipelineEvent::WakeWordDetected { now_ms: 100 },
         )
         .expect("wake word should start listening");
-        let locked_state = Mutex::new(listening_state.0);
+        let refreshed_state = voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
+            &listening_state.0,
+            voice_pipeline_config,
+            voxgolem_core::voice_pipeline::VoicePipelineEvent::SpeechDetected { now_ms: 450 },
+        )
+        .expect("speech activity should refresh listening deadline");
+        let locked_state = Mutex::new(refreshed_state.0);
 
         assert_eq!(
             current_silence_deadline(&locked_state, voice_pipeline_config),
-            Ok(DEFAULT_SILENCE_TIMEOUT_MS + 100)
+            Ok(DEFAULT_SILENCE_TIMEOUT_MS + 450)
         );
     }
 
@@ -650,6 +675,7 @@ mod tests {
         let payload = RuntimePhaseResponsePayload {
             runtime_phase: RuntimePhasePayload::Processing,
             transcription_ready_samples: Some(3200),
+            last_activity_ms: Some(450),
             capturing_utterance: false,
             preroll_samples: 3,
             utterance_samples: 0,
@@ -658,6 +684,7 @@ mod tests {
         assert_eq!(payload.preroll_samples, 3);
         assert_eq!(payload.utterance_samples, 0);
         assert!(!payload.capturing_utterance);
+        assert_eq!(payload.last_activity_ms, Some(450));
         assert_eq!(payload.transcription_ready_samples, Some(3200));
     }
 
@@ -685,6 +712,7 @@ mod tests {
             Ok(RuntimePhaseResponsePayload {
                 runtime_phase: RuntimePhasePayload::Sleeping,
                 transcription_ready_samples: Some(2),
+                last_activity_ms: None,
                 capturing_utterance: false,
                 preroll_samples: 2,
                 utterance_samples: 0,
