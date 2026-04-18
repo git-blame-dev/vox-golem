@@ -248,6 +248,20 @@ pub fn apply_voice_pipeline_event(
     }
 }
 
+pub fn ingest_audio_frame(
+    state: &VoicePipelineState,
+    config: VoicePipelineConfig,
+    frame: Vec<f32>,
+) -> Result<VoicePipelineState, VoicePipelineError> {
+    let event = if state.session().runtime().phase() == RuntimePhase::Listening {
+        VoicePipelineEvent::RecordListeningFrame { frame }
+    } else {
+        VoicePipelineEvent::RecordSleepingFrame { frame }
+    };
+
+    apply_voice_pipeline_event(state, config, event).map(|(next_state, _)| next_state)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::runtime::RuntimePhase;
@@ -259,8 +273,8 @@ mod tests {
     };
 
     use super::{
-        apply_voice_pipeline_event, VoicePipelineAction, VoicePipelineConfig, VoicePipelineError,
-        VoicePipelineEvent, VoicePipelineState,
+        apply_voice_pipeline_event, ingest_audio_frame, VoicePipelineAction, VoicePipelineConfig,
+        VoicePipelineError, VoicePipelineEvent, VoicePipelineState,
     };
 
     fn pipeline_config() -> VoicePipelineConfig {
@@ -492,5 +506,45 @@ mod tests {
         assert!(!reset_state.capture().capturing_utterance());
         assert_eq!(reset_state.capture().utterance_len(), 0);
         assert_eq!(action, VoicePipelineAction::None);
+    }
+
+    #[test]
+    fn ingest_audio_frame_routes_sleeping_audio_into_preroll() {
+        let config = pipeline_config();
+        let (ready_state, _) = apply_voice_pipeline_event(
+            &VoicePipelineState::new(config).expect("pipeline should initialize"),
+            config,
+            VoicePipelineEvent::StartupValidated,
+        )
+        .expect("startup validation should succeed");
+
+        let next_state = ingest_audio_frame(&ready_state, config, vec![0.1, 0.2, 0.3])
+            .expect("sleeping audio frame should be routed into preroll");
+
+        assert_eq!(next_state.capture().preroll_len(), 3);
+        assert_eq!(next_state.capture().utterance_len(), 0);
+    }
+
+    #[test]
+    fn ingest_audio_frame_routes_listening_audio_into_utterance() {
+        let config = pipeline_config();
+        let (ready_state, _) = apply_voice_pipeline_event(
+            &VoicePipelineState::new(config).expect("pipeline should initialize"),
+            config,
+            VoicePipelineEvent::StartupValidated,
+        )
+        .expect("startup validation should succeed");
+        let (listening_state, _) = apply_voice_pipeline_event(
+            &ready_state,
+            config,
+            VoicePipelineEvent::WakeWordDetected { now_ms: 100 },
+        )
+        .expect("wake word should start listening");
+
+        let next_state = ingest_audio_frame(&listening_state, config, vec![0.5, 0.6])
+            .expect("listening audio frame should be routed into utterance");
+
+        assert_eq!(next_state.capture().utterance_len(), 2);
+        assert_eq!(next_state.capture().preroll_len(), 0);
     }
 }
