@@ -15,11 +15,15 @@ describe('parseStartupState', () => {
           stop_listening: 'assets/stop-listening.mp3',
         },
         runtime_phase: 'sleeping',
+        voice_input_available: true,
+        voice_input_error: null,
       }),
     ).toEqual({
       kind: 'ready',
       cueAssetPaths: DEFAULT_CUE_ASSET_PATHS,
       runtimePhase: 'sleeping',
+      voiceInputAvailable: true,
+      voiceInputError: null,
     })
   })
 
@@ -37,7 +41,7 @@ describe('parseStartupState', () => {
 
   it('throws when ready payload omits cue paths', () => {
     expect(() => parseStartupState({ kind: 'ready' })).toThrow(
-      'Startup ready payload must include cue asset paths',
+      'Startup ready payload must include voice_input_available',
     )
   })
 
@@ -52,6 +56,8 @@ describe('loadStartupState', () => {
       kind: 'ready',
       cueAssetPaths: DEFAULT_CUE_ASSET_PATHS,
       runtimePhase: 'sleeping',
+      voiceInputAvailable: true,
+      voiceInputError: null,
     })
   })
 
@@ -64,6 +70,8 @@ describe('loadStartupState', () => {
           stop_listening: 'configured/stop.mp3',
         },
         runtime_phase: 'sleeping',
+        voice_input_available: false,
+        voice_input_error: 'Parakeet failed to initialize',
       }),
     }
 
@@ -74,6 +82,8 @@ describe('loadStartupState', () => {
         stopListening: 'configured/stop.mp3',
       },
       runtimePhase: 'sleeping',
+      voiceInputAvailable: false,
+      voiceInputError: 'Parakeet failed to initialize',
     })
   })
 

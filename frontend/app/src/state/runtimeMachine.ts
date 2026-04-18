@@ -22,7 +22,7 @@ export function transitionRuntimeStatus(
     case 'end_listening':
       return current === 'listening' ? 'processing' : current
     case 'submit_prompt':
-      return current === 'sleeping' || current === 'result_ready'
+      return current === 'sleeping' || current === 'processing' || current === 'result_ready'
         ? 'executing'
         : current
     case 'response_ready':

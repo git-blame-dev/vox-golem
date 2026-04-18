@@ -1,5 +1,5 @@
 import { getTauriInternals } from './tauri'
-import type { BackendRuntimePhase } from '../types/chat'
+import type { BackendRuntimePhase, RuntimeControlResult } from '../types/chat'
 
 export type RuntimeControlCommand =
   | 'begin_listening'
@@ -7,15 +7,6 @@ export type RuntimeControlCommand =
   | 'mark_silence'
   | 'mark_result_ready'
   | 'reset_session'
-
-export interface RuntimeControlResult {
-  readonly runtimePhase: BackendRuntimePhase
-  readonly transcriptionReadySamples: number | null
-  readonly lastActivityMs: number | null
-  readonly capturingUtterance: boolean
-  readonly prerollSamples: number
-  readonly utteranceSamples: number
-}
 
 export interface AudioFrameStatus {
   readonly runtimePhase: BackendRuntimePhase
@@ -74,6 +65,12 @@ function parseRuntimePhaseResponse(payload: unknown): RuntimeControlResult {
   const record = payload as Record<string, unknown>
   const runtimePhase = record['runtime_phase']
   const transcriptionReadySamples = record['transcription_ready_samples']
+
+  if (!('transcript_text' in record)) {
+    throw new Error('Runtime control payload must include transcript_text')
+  }
+
+  const transcriptText = record['transcript_text']
   if (!('last_activity_ms' in record)) {
     throw new Error('Runtime control payload must include last_activity_ms')
   }
@@ -95,6 +92,14 @@ function parseRuntimePhaseResponse(payload: unknown): RuntimeControlResult {
       transcriptionReadySamples !== undefined
     ) {
       throw new Error('Runtime control payload must include a numeric or null transcription sample count')
+    }
+
+    if (
+      typeof transcriptText !== 'string' &&
+      transcriptText !== null &&
+      transcriptText !== undefined
+    ) {
+      throw new Error('Runtime control payload must include a string or null transcript_text')
     }
 
     if (
@@ -120,6 +125,7 @@ function parseRuntimePhaseResponse(payload: unknown): RuntimeControlResult {
       runtimePhase,
       transcriptionReadySamples:
         typeof transcriptionReadySamples === 'number' ? transcriptionReadySamples : null,
+      transcriptText: typeof transcriptText === 'string' ? transcriptText : null,
       lastActivityMs: typeof lastActivityMs === 'number' ? lastActivityMs : null,
       capturingUtterance,
       prerollSamples,

@@ -10,7 +10,7 @@ import {
   ingestAudioFrame,
   invokeRuntimeControl,
 } from './lib/runtimeControl'
-import type { RuntimeControlArgs, RuntimeControlResult } from './lib/runtimeControl'
+import type { RuntimeControlArgs } from './lib/runtimeControl'
 import { DEFAULT_CUE_ASSET_PATHS, loadStartupState } from './lib/startupState'
 import {
   createVoiceActivityState,
@@ -22,6 +22,7 @@ import { cueForTransition, transitionRuntimeStatus } from './state/runtimeMachin
 import type {
   BackendRuntimePhase,
   ChatMessage,
+  RuntimeControlResult,
   RuntimeStatus,
   StartupState,
 } from './types/chat'
@@ -79,9 +80,10 @@ function App() {
 
   const canStartListening =
     startupState.kind === 'ready' &&
+    startupState.voiceInputAvailable &&
     (runtimeStatus === 'sleeping' || runtimeStatus === 'result_ready')
   const canMarkSilence =
-    startupState.kind === 'ready' && runtimeStatus === 'listening'
+    startupState.kind === 'ready' && startupState.voiceInputAvailable && runtimeStatus === 'listening'
   const canRecordSpeechActivity = canMarkSilence
   const canMarkResultReady =
     startupState.kind === 'ready' &&
@@ -89,8 +91,9 @@ function App() {
   const canResetToIdle =
     startupState.kind === 'ready' &&
     (runtimeStatus === 'result_ready' || runtimeStatus === 'error')
-  const canToggleMic = startupState.kind === 'ready' && !micStarting
-  const canIngestTestFrame = startupState.kind === 'ready'
+  const canToggleMic =
+    startupState.kind === 'ready' && startupState.voiceInputAvailable && !micStarting
+  const canIngestTestFrame = startupState.kind === 'ready' && startupState.voiceInputAvailable
   const cueAssetPaths =
     startupState.kind === 'ready'
       ? startupState.cueAssetPaths
@@ -216,6 +219,14 @@ function App() {
       })
     }
 
+    if (runtimePhase.transcriptText !== null) {
+      nextMessages.push({
+        id: `system-transcript-${Date.now()}`,
+        role: 'system',
+        content: `transcript:\n${runtimePhase.transcriptText}`,
+      })
+    }
+
     setMessages((currentMessages) => [...currentMessages, ...nextMessages])
   }
 
@@ -231,9 +242,9 @@ function App() {
       readonly fallbackEvent?: Parameters<typeof transitionRuntimeStatus>[1]
       readonly quiet?: boolean
     } = {},
-  ): Promise<void> => {
+  ): Promise<RuntimeControlResult | null> => {
     if (startupStateRef.current.kind !== 'ready') {
-      return
+      return null
     }
 
     const { args, fallbackEvent, quiet } = options
@@ -246,10 +257,11 @@ function App() {
           transitionFromCurrentStatus(fallbackEvent)
         }
 
-        return
+        return null
       }
 
       applyRuntimeControlResult(runtimePhase, quiet === undefined ? {} : { quiet })
+      return runtimePhase
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Runtime control failed'
 
@@ -262,7 +274,81 @@ function App() {
           content: `Runtime control error: ${message}`,
         },
       ])
+      return null
     }
+  }
+
+  const runPrompt = async (
+    prompt: string,
+    source: 'typed' | 'voice',
+  ): Promise<void> => {
+    if (startupStateRef.current.kind !== 'ready') {
+      return
+    }
+
+    const trimmedPrompt = prompt.trim()
+
+    if (trimmedPrompt.length === 0) {
+      return
+    }
+
+    const currentStatus = runtimeStatusRef.current
+    const executingStatus = applyTransition(currentStatus, 'submit_prompt')
+
+    if (executingStatus === currentStatus) {
+      return
+    }
+
+    setMessages((currentMessages) => [
+      ...currentMessages,
+      {
+        id: `user-${Date.now()}`,
+        role: 'user',
+        content: trimmedPrompt,
+      },
+    ])
+
+    if (source === 'typed') {
+      setComposerValue('')
+    }
+
+    try {
+      const result = await executePrompt(trimmedPrompt)
+      const nextMessages = createExecutionMessages(result)
+
+      setMessages((currentMessages) => [...currentMessages, ...nextMessages])
+      applyRuntimeStatus(toRuntimeStatus(result.runtimePhase))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Prompt execution failed'
+
+      applyTransition(executingStatus, 'fail')
+      setMessages((currentMessages) => [
+        ...currentMessages,
+        {
+          id: `system-exec-error-${Date.now()}`,
+          role: 'system',
+          content: `Execution error: ${message}`,
+        },
+      ])
+    }
+  }
+
+  const maybeRunVoiceTranscript = (
+    runtimePhase: RuntimeControlResult | null,
+  ): void => {
+    if (runtimePhase === null || runtimePhase.transcriptText === null) {
+      return
+    }
+
+    void runPrompt(runtimePhase.transcriptText, 'voice')
+  }
+
+  const handleMarkSilence = async (): Promise<void> => {
+    const runtimePhase = await syncRuntimeControl('mark_silence', {
+      fallbackEvent: 'end_listening',
+    })
+
+    maybeRunVoiceTranscript(runtimePhase)
   }
 
   const ingestTestFrame = async (): Promise<void> => {
@@ -362,9 +448,7 @@ function App() {
                     quiet: true,
                   })
                 } else if (voiceActivityUpdate.shouldMarkSilence) {
-                  await syncRuntimeControl('mark_silence', {
-                    fallbackEvent: 'end_listening',
-                  })
+                  await handleMarkSilence()
                 }
               }
             }
@@ -422,40 +506,7 @@ function App() {
       return
     }
 
-    const executingStatus = applyTransition(runtimeStatus, 'submit_prompt')
-
-    if (executingStatus === runtimeStatus) {
-      return
-    }
-
-    const userMessage: ChatMessage = {
-      id: `user-${Date.now()}`,
-      role: 'user',
-      content: prompt,
-    }
-
-    setMessages((currentMessages) => [...currentMessages, userMessage])
-    setComposerValue('')
-
-    try {
-      const result = await executePrompt(prompt)
-      const nextMessages = createExecutionMessages(result)
-
-      setMessages((currentMessages) => [...currentMessages, ...nextMessages])
-      applyRuntimeStatus(toRuntimeStatus(result.runtimePhase))
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Prompt execution failed'
-
-      applyTransition(executingStatus, 'fail')
-      setMessages((currentMessages) => [
-        ...currentMessages,
-        {
-          id: `system-exec-error-${Date.now()}`,
-          role: 'system',
-          content: `Execution error: ${message}`,
-        },
-      ])
-    }
+    await runPrompt(prompt, 'typed')
   }
 
   const onSubmit = (event: FormEvent<HTMLFormElement>): void => {
@@ -482,6 +533,11 @@ function App() {
         <p className="shell__status">Runtime: {runtimeStatus}</p>
         {startupState.kind === 'error' ? (
           <p className="shell__error">Startup error: {startupState.message}</p>
+        ) : null}
+        {startupState.kind === 'ready' && !startupState.voiceInputAvailable ? (
+          <p className="shell__error">
+            Voice input unavailable: {startupState.voiceInputError ?? 'Parakeet failed to initialize'}
+          </p>
         ) : null}
         <div className="shell__controls" role="group" aria-label="Runtime controls">
           <button
@@ -518,7 +574,7 @@ function App() {
             type="button"
             className="shell__control"
             onClick={() => {
-              void syncRuntimeControl('mark_silence', { fallbackEvent: 'end_listening' })
+              void handleMarkSilence()
             }}
             disabled={!canMarkSilence}
           >

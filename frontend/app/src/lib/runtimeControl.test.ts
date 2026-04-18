@@ -18,6 +18,7 @@ describe('invokeRuntimeControl', () => {
         return {
           runtime_phase: 'listening',
           transcription_ready_samples: null,
+          transcript_text: null,
           last_activity_ms: 100,
           capturing_utterance: true,
           preroll_samples: 3,
@@ -29,6 +30,7 @@ describe('invokeRuntimeControl', () => {
     await expect(invokeRuntimeControl('begin_listening')).resolves.toEqual({
       runtimePhase: 'listening',
       transcriptionReadySamples: null,
+      transcriptText: null,
       lastActivityMs: 100,
       capturingUtterance: true,
       prerollSamples: 3,
@@ -45,6 +47,7 @@ describe('invokeRuntimeControl', () => {
         return {
           runtime_phase: 'listening',
           transcription_ready_samples: null,
+          transcript_text: null,
           last_activity_ms: 101,
           capturing_utterance: true,
           preroll_samples: 4,
@@ -56,6 +59,7 @@ describe('invokeRuntimeControl', () => {
     await expect(invokeRuntimeControl('record_speech_activity', { nowMs: 101 })).resolves.toEqual({
       runtimePhase: 'listening',
       transcriptionReadySamples: null,
+      transcriptText: null,
       lastActivityMs: 101,
       capturingUtterance: true,
       prerollSamples: 4,
@@ -91,6 +95,7 @@ describe('invokeRuntimeControl', () => {
       invoke: async () => ({
         runtime_phase: 'listening',
         transcription_ready_samples: null,
+        transcript_text: null,
         last_activity_ms: 100,
       }),
     }
@@ -105,6 +110,7 @@ describe('invokeRuntimeControl', () => {
       invoke: async () => ({
         runtime_phase: 'listening',
         transcription_ready_samples: null,
+        transcript_text: null,
         capturing_utterance: true,
         preroll_samples: 3,
         utterance_samples: 5,
@@ -114,5 +120,46 @@ describe('invokeRuntimeControl', () => {
     await expect(invokeRuntimeControl('begin_listening')).rejects.toThrow(
       'Runtime control payload must include last_activity_ms',
     )
+  })
+
+  it('rejects runtime control payloads missing transcript text', async () => {
+    window.__TAURI_INTERNALS__ = {
+      invoke: async () => ({
+        runtime_phase: 'processing',
+        transcription_ready_samples: 3200,
+        last_activity_ms: null,
+        capturing_utterance: false,
+        preroll_samples: 3,
+        utterance_samples: 0,
+      }),
+    }
+
+    await expect(invokeRuntimeControl('mark_silence')).rejects.toThrow(
+      'Runtime control payload must include transcript_text',
+    )
+  })
+
+  it('parses transcript text from runtime control payloads', async () => {
+    window.__TAURI_INTERNALS__ = {
+      invoke: async () => ({
+        runtime_phase: 'processing',
+        transcription_ready_samples: 3200,
+        transcript_text: 'Draft release notes',
+        last_activity_ms: null,
+        capturing_utterance: false,
+        preroll_samples: 3,
+        utterance_samples: 0,
+      }),
+    }
+
+    await expect(invokeRuntimeControl('mark_silence')).resolves.toEqual({
+      runtimePhase: 'processing',
+      transcriptionReadySamples: 3200,
+      transcriptText: 'Draft release notes',
+      lastActivityMs: null,
+      capturingUtterance: false,
+      prerollSamples: 3,
+      utteranceSamples: 0,
+    })
   })
 })

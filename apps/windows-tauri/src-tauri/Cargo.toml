@@ -12,6 +12,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 rustpotter = "3.0.2"
 serde = { version = "1", features = ["derive"] }
 tauri = { version = "2" }
+transcribe-rs = { version = "0.3", features = ["onnx"] }
 voxgolem-audio = { path = "../../../crates/audio" }
 voxgolem-core = { path = "../../../crates/core" }
 voxgolem-model = { path = "../../../crates/model" }

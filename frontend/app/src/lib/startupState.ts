@@ -12,10 +12,23 @@ export function parseStartupState(payload: unknown): StartupState {
   }
 
   if (payload['kind'] === 'ready') {
+    const voiceInputAvailable = payload['voice_input_available']
+    const voiceInputError = payload['voice_input_error']
+
+    if (typeof voiceInputAvailable !== 'boolean') {
+      throw new Error('Startup ready payload must include voice_input_available')
+    }
+
+    if (typeof voiceInputError !== 'string' && voiceInputError !== null) {
+      throw new Error('Startup ready payload must include a string or null voice_input_error')
+    }
+
     return {
       kind: 'ready',
       cueAssetPaths: parseCueAssetPaths(payload['cue_asset_paths']),
       runtimePhase: parseRuntimePhase(payload['runtime_phase']),
+      voiceInputAvailable,
+      voiceInputError,
     }
   }
 
@@ -37,21 +50,25 @@ export function parseStartupState(payload: unknown): StartupState {
 
 export async function loadStartupState(): Promise<StartupState> {
   if (typeof window === 'undefined') {
-    return {
-      kind: 'ready',
-      cueAssetPaths: DEFAULT_CUE_ASSET_PATHS,
-      runtimePhase: 'sleeping',
-    }
+      return {
+        kind: 'ready',
+        cueAssetPaths: DEFAULT_CUE_ASSET_PATHS,
+        runtimePhase: 'sleeping',
+        voiceInputAvailable: true,
+        voiceInputError: null,
+      }
   }
 
   const tauriInternals = getTauriInternals()
 
   if (tauriInternals === null) {
-    return {
-      kind: 'ready',
-      cueAssetPaths: DEFAULT_CUE_ASSET_PATHS,
-      runtimePhase: 'sleeping',
-    }
+      return {
+        kind: 'ready',
+        cueAssetPaths: DEFAULT_CUE_ASSET_PATHS,
+        runtimePhase: 'sleeping',
+        voiceInputAvailable: true,
+        voiceInputError: null,
+      }
   }
 
   try {

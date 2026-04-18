@@ -323,6 +323,34 @@ mod tests {
     }
 
     #[test]
+    fn submit_prompt_from_processing_enters_executing() {
+        let ready = apply_session_event(
+            &SessionState::new(),
+            session_config(),
+            SessionEvent::StartupValidated,
+        )
+        .expect("startup validation should succeed");
+        let listening = apply_session_event(
+            &ready,
+            session_config(),
+            SessionEvent::WakeWordDetected { now_ms: 100 },
+        )
+        .expect("wake word should start listening");
+        let processing = apply_session_event(
+            &listening,
+            session_config(),
+            SessionEvent::SilenceCheck { now_ms: 1_300 },
+        )
+        .expect("silence timeout should stop listening");
+
+        let next = apply_session_event(&processing, session_config(), SessionEvent::SubmitPrompt)
+            .expect("processing should transition to executing");
+
+        assert_eq!(next.runtime().phase(), RuntimePhase::Executing);
+        assert!(!next.voice_turn().listening());
+    }
+
+    #[test]
     fn prompt_failure_enters_error_and_clears_voice_turn() {
         let ready = apply_session_event(
             &SessionState::new(),
