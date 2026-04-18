@@ -262,6 +262,9 @@ describe('App', () => {
           return {
             runtime_phase: 'listening',
             transcription_ready_samples: null,
+            capturing_utterance: true,
+            preroll_samples: 4,
+            utterance_samples: 4,
           }
         }
 
@@ -269,6 +272,9 @@ describe('App', () => {
           return {
             runtime_phase: 'processing',
             transcription_ready_samples: 3200,
+            capturing_utterance: false,
+            preroll_samples: 4,
+            utterance_samples: 0,
           }
         }
 
@@ -291,6 +297,9 @@ describe('App', () => {
 
     expect(playedSources).toEqual(['test-assets/configured-start.mp3'])
     expect(container.textContent).toContain('Runtime: listening')
+    expect(container.textContent).toContain(
+      'runtime_control_status:\npreroll=4 utterance=4 capturing=true',
+    )
 
     const markSilenceButton = getControlButton(container, 'Mark silence')
 
@@ -300,6 +309,12 @@ describe('App', () => {
     })
 
     expect(container.textContent).toContain('Runtime: processing')
+    expect(container.textContent).toContain(
+      'runtime_control_status:\npreroll=4 utterance=0 capturing=false',
+    )
+    expect(container.textContent).not.toContain(
+      'runtime_control_status:\npreroll=undefined utterance=undefined capturing=undefined',
+    )
     expect(container.textContent).toContain('transcription_ready:\n3200 samples captured')
 
     const ingestTestFrameButton = getControlButton(container, 'Ingest test frame')

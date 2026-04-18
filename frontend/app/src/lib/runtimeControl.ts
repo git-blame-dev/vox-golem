@@ -10,6 +10,9 @@ export type RuntimeControlCommand =
 export interface RuntimeControlResult {
   readonly runtimePhase: BackendRuntimePhase
   readonly transcriptionReadySamples: number | null
+  readonly capturingUtterance: boolean
+  readonly prerollSamples: number
+  readonly utteranceSamples: number
 }
 
 export interface AudioFrameStatus {
@@ -79,10 +82,25 @@ function parseRuntimePhaseResponse(payload: unknown): RuntimeControlResult {
       throw new Error('Runtime control payload must include a numeric or null transcription sample count')
     }
 
+    const capturingUtterance = record['capturing_utterance']
+    const prerollSamples = record['preroll_samples']
+    const utteranceSamples = record['utterance_samples']
+
+    if (typeof capturingUtterance !== 'boolean') {
+      throw new Error('Runtime control payload must include capturing_utterance')
+    }
+
+    if (typeof prerollSamples !== 'number' || typeof utteranceSamples !== 'number') {
+      throw new Error('Runtime control payload must include numeric sample counts')
+    }
+
     return {
       runtimePhase,
       transcriptionReadySamples:
         typeof transcriptionReadySamples === 'number' ? transcriptionReadySamples : null,
+      capturingUtterance,
+      prerollSamples,
+      utteranceSamples,
     }
   }
 
