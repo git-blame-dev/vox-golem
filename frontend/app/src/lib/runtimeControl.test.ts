@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { invokeRuntimeControl } from './runtimeControl'
+import { ingestAudioFrame, invokeRuntimeControl } from './runtimeControl'
 
 afterEach(() => {
   Reflect.deleteProperty(window, '__TAURI_INTERNALS__')
@@ -25,6 +25,29 @@ describe('invokeRuntimeControl', () => {
     await expect(invokeRuntimeControl('begin_listening')).resolves.toEqual({
       runtimePhase: 'listening',
       transcriptionReadySamples: null,
+    })
+  })
+
+  it('parses audio frame status payloads from tauri commands', async () => {
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command, args) => {
+        expect(command).toBe('ingest_audio_frame')
+        expect(args).toEqual({ frame: [0.1, 0.2, 0.3] })
+
+        return {
+          runtime_phase: 'sleeping',
+          capturing_utterance: false,
+          preroll_samples: 3,
+          utterance_samples: 0,
+        }
+      },
+    }
+
+    await expect(ingestAudioFrame([0.1, 0.2, 0.3])).resolves.toEqual({
+      runtimePhase: 'sleeping',
+      capturingUtterance: false,
+      prerollSamples: 3,
+      utteranceSamples: 0,
     })
   })
 })
