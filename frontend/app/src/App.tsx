@@ -12,6 +12,11 @@ import {
 } from './lib/runtimeControl'
 import type { RuntimeControlArgs, RuntimeControlResult } from './lib/runtimeControl'
 import { DEFAULT_CUE_ASSET_PATHS, loadStartupState } from './lib/startupState'
+import {
+  createVoiceActivityState,
+  syncVoiceActivityState,
+  updateVoiceActivityState,
+} from './lib/voiceActivity'
 import { createExecutionMessages, getInitialMessages } from './state/appShell'
 import { cueForTransition, transitionRuntimeStatus } from './state/runtimeMachine'
 import type {
@@ -33,6 +38,9 @@ function App() {
   )
   const liveAudioSourceRef = useRef<LiveAudioSource | null>(null)
   const appActiveRef = useRef(true)
+  const runtimeStatusRef = useRef<RuntimeStatus>('initializing')
+  const startupStateRef = useRef<StartupState>({ kind: 'loading' })
+  const voiceActivityStateRef = useRef(createVoiceActivityState())
 
   useEffect(() => {
     let active = true
@@ -42,7 +50,9 @@ function App() {
         return
       }
 
+      startupStateRef.current = nextState
       setStartupState(nextState)
+      runtimeStatusRef.current = nextState.kind === 'ready' ? toRuntimeStatus(nextState.runtimePhase) : 'error'
       setRuntimeStatus(nextState.kind === 'ready' ? toRuntimeStatus(nextState.runtimePhase) : 'error')
     })
 
@@ -96,7 +106,12 @@ function App() {
       return previousStatus
     }
 
+    runtimeStatusRef.current = nextStatus
     setRuntimeStatus(nextStatus)
+
+    if (nextStatus !== 'listening') {
+      voiceActivityStateRef.current = createVoiceActivityState()
+    }
 
     const cueType = cueForTransition(previousStatus, nextStatus)
 
@@ -120,19 +135,26 @@ function App() {
   }
 
   const applyRuntimeStatus = (nextStatus: RuntimeStatus): RuntimeStatus => {
-    if (nextStatus === runtimeStatus) {
-      return runtimeStatus
+    const previousStatus = runtimeStatusRef.current
+
+    if (nextStatus === previousStatus) {
+      return previousStatus
     }
 
+    runtimeStatusRef.current = nextStatus
     setRuntimeStatus(nextStatus)
 
-    const cueType = cueForTransition(runtimeStatus, nextStatus)
+    if (nextStatus !== 'listening') {
+      voiceActivityStateRef.current = createVoiceActivityState()
+    }
+
+    const cueType = cueForTransition(previousStatus, nextStatus)
 
     if (cueType !== null) {
       void playCue(cueType, cueAssetPaths).catch((error: unknown) => {
         const message = error instanceof Error ? error.message : 'Unknown cue playback error'
 
-        setRuntimeStatus('error')
+        enterRuntimeError()
         setMessages((currentMessages) => [
           ...currentMessages,
           {
@@ -147,18 +169,34 @@ function App() {
     return nextStatus
   }
 
+  const enterRuntimeError = (): void => {
+    runtimeStatusRef.current = 'error'
+    voiceActivityStateRef.current = createVoiceActivityState()
+    setRuntimeStatus('error')
+  }
+
   const transitionFromCurrentStatus = (
     event: Parameters<typeof transitionRuntimeStatus>[1],
   ): void => {
-    if (startupState.kind !== 'ready') {
+    if (startupStateRef.current.kind !== 'ready') {
       return
     }
 
-    applyTransition(runtimeStatus, event)
+    applyTransition(runtimeStatusRef.current, event)
   }
 
-  const applyRuntimeControlResult = (runtimePhase: RuntimeControlResult): void => {
+  const applyRuntimeControlResult = (
+    runtimePhase: RuntimeControlResult,
+    options: {
+      readonly quiet?: boolean
+    } = {},
+  ): void => {
+    const { quiet = false } = options
     applyRuntimeStatus(toRuntimeStatus(runtimePhase.runtimePhase))
+
+    if (quiet) {
+      return
+    }
 
     const lastActivityText =
       runtimePhase.lastActivityMs === null ? 'none' : String(runtimePhase.lastActivityMs)
@@ -191,13 +229,14 @@ function App() {
     options: {
       readonly args?: RuntimeControlArgs
       readonly fallbackEvent?: Parameters<typeof transitionRuntimeStatus>[1]
+      readonly quiet?: boolean
     } = {},
   ): Promise<void> => {
-    if (startupState.kind !== 'ready') {
+    if (startupStateRef.current.kind !== 'ready') {
       return
     }
 
-    const { args, fallbackEvent } = options
+    const { args, fallbackEvent, quiet } = options
 
     try {
       const runtimePhase = await invokeRuntimeControl(command, args)
@@ -210,11 +249,11 @@ function App() {
         return
       }
 
-      applyRuntimeControlResult(runtimePhase)
+      applyRuntimeControlResult(runtimePhase, quiet === undefined ? {} : { quiet })
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Runtime control failed'
 
-      setRuntimeStatus('error')
+      enterRuntimeError()
       setMessages((currentMessages) => [
         ...currentMessages,
         {
@@ -250,7 +289,7 @@ function App() {
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Audio frame ingestion failed'
 
-      setRuntimeStatus('error')
+      enterRuntimeError()
       setMessages((currentMessages) => [
         ...currentMessages,
         {
@@ -265,6 +304,7 @@ function App() {
   const stopLiveAudio = (content: string): void => {
     liveAudioSourceRef.current?.stop()
     liveAudioSourceRef.current = null
+    voiceActivityStateRef.current = createVoiceActivityState()
     setMicStarting(false)
     setMicActive(false)
     setMessages((currentMessages) => [
@@ -284,7 +324,7 @@ function App() {
   }
 
   const startMic = async (): Promise<void> => {
-    if (startupState.kind !== 'ready' || liveAudioSourceRef.current !== null || micStarting) {
+    if (startupStateRef.current.kind !== 'ready' || liveAudioSourceRef.current !== null || micStarting) {
       return
     }
 
@@ -294,13 +334,42 @@ function App() {
       const liveAudioSource = await startLiveAudioSource({
         onFrame: async (frame) => {
           try {
+            const nowMs = Date.now()
             const status = await ingestAudioFrame(frame)
 
             if (status !== null) {
-              applyRuntimeStatus(toRuntimeStatus(status.runtimePhase))
+              const nextStatus = toRuntimeStatus(status.runtimePhase)
+
+              applyRuntimeStatus(nextStatus)
+              voiceActivityStateRef.current = syncVoiceActivityState(
+                voiceActivityStateRef.current,
+                nextStatus,
+                nowMs,
+              )
+
+              if (nextStatus === 'listening') {
+                const voiceActivityUpdate = updateVoiceActivityState(
+                  voiceActivityStateRef.current,
+                  frame,
+                  nowMs,
+                )
+
+                voiceActivityStateRef.current = voiceActivityUpdate.state
+
+                if (voiceActivityUpdate.shouldRecordSpeechActivity) {
+                  await syncRuntimeControl('record_speech_activity', {
+                    args: { nowMs },
+                    quiet: true,
+                  })
+                } else if (voiceActivityUpdate.shouldMarkSilence) {
+                  await syncRuntimeControl('mark_silence', {
+                    fallbackEvent: 'end_listening',
+                  })
+                }
+              }
             }
           } catch (error) {
-            setRuntimeStatus('error')
+            enterRuntimeError()
             throw error
           }
         },
