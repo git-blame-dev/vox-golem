@@ -441,6 +441,113 @@ describe('App', () => {
     expect(container.textContent).toContain('live_audio:\ndefault microphone stopped')
   })
 
+  it('automatically records speech activity and marks silence from live audio', async () => {
+    const stop = vi.fn()
+    let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
+    const invokedCommands: string[] = []
+    let nowMs = 1_000
+
+    class FakeAudio {
+      play(): Promise<void> {
+        return Promise.resolve()
+      }
+    }
+
+    Date.now = () => nowMs
+    Object.defineProperty(globalThis, 'Audio', {
+      configurable: true,
+      value: FakeAudio,
+    })
+
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      onFrame = options.onFrame
+      return { stop }
+    })
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command, args) => {
+        invokedCommands.push(command)
+
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'assets/start-listening.mp3',
+              stop_listening: 'assets/stop-listening.mp3',
+            },
+            runtime_phase: 'sleeping',
+          }
+        }
+
+        if (command === 'ingest_audio_frame') {
+          return {
+            runtime_phase: 'listening',
+            capturing_utterance: true,
+            preroll_samples: 4,
+            utterance_samples: 4,
+          }
+        }
+
+        if (command === 'record_speech_activity') {
+          expect(args).toEqual({ nowMs: 1_000 })
+
+          return {
+            runtime_phase: 'listening',
+            transcription_ready_samples: null,
+            last_activity_ms: 1_000,
+            capturing_utterance: true,
+            preroll_samples: 4,
+            utterance_samples: 4,
+          }
+        }
+
+        expect(command).toBe('mark_silence')
+
+        return {
+          runtime_phase: 'processing',
+          transcription_ready_samples: 3200,
+          last_activity_ms: null,
+          capturing_utterance: false,
+          preroll_samples: 4,
+          utterance_samples: 0,
+        }
+      },
+    }
+
+    const { container } = await renderApp()
+    const startMicButton = getControlButton(container, 'Start mic')
+
+    await act(async () => {
+      startMicButton.click()
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      await onFrame?.([0.04, -0.04, 0.04, -0.04])
+      await Promise.resolve()
+    })
+
+    nowMs = 2_300
+
+    await act(async () => {
+      await onFrame?.([0.001, -0.001, 0.001, -0.001])
+      await Promise.resolve()
+    })
+
+    expect(invokedCommands).toEqual([
+      'get_startup_state',
+      'ingest_audio_frame',
+      'record_speech_activity',
+      'ingest_audio_frame',
+      'mark_silence',
+    ])
+    expect(container.textContent).toContain('Runtime: processing')
+    expect(container.textContent).toContain('transcription_ready:\n3200 samples captured')
+    expect(container.textContent).not.toContain(
+      'runtime_control_status:\npreroll=4 utterance=4 capturing=true last_activity=1000',
+    )
+  })
+
   it('shows microphone capture errors without changing the backend contract', async () => {
     startLiveAudioSourceMock.mockRejectedValue(new Error('Permission denied'))
 

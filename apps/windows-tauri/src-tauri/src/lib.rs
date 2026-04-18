@@ -3,6 +3,7 @@
 
 use serde::Serialize;
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 mod wake_word;
 
@@ -301,7 +302,11 @@ fn ingest_audio_frame(
         guard.session().runtime().phase(),
         voxgolem_core::runtime::RuntimePhase::Sleeping
     ) {
-        process_wake_word_frame(&app_state.wake_word_runtime, &frame)?
+        if process_wake_word_frame(&app_state.wake_word_runtime, &frame)?.is_some() {
+            Some(current_time_ms()?)
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -453,6 +458,13 @@ fn reset_wake_word_runtime(
         .map_err(|_| String::from("wake word runtime lock is poisoned"))?;
     guard.reset();
     Ok(())
+}
+
+fn current_time_ms() -> Result<u64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .map_err(|error| format!("system clock is before unix epoch: {error}"))
 }
 
 fn ingest_audio_frame_with_optional_wake_word_detection(
