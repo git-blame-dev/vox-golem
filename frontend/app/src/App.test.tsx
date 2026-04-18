@@ -265,9 +265,18 @@ describe('App', () => {
           }
         }
 
+        if (command === 'mark_silence') {
+          return {
+            runtime_phase: 'processing',
+            transcription_ready_samples: 3200,
+          }
+        }
+
         return {
           runtime_phase: 'processing',
-          transcription_ready_samples: 3200,
+          capturing_utterance: false,
+          preroll_samples: 3,
+          utterance_samples: 0,
         }
       },
     }
@@ -292,6 +301,17 @@ describe('App', () => {
 
     expect(container.textContent).toContain('Runtime: processing')
     expect(container.textContent).toContain('transcription_ready:\n3200 samples captured')
+
+    const ingestTestFrameButton = getControlButton(container, 'Ingest test frame')
+
+    await act(async () => {
+      ingestTestFrameButton.click()
+      await Promise.resolve()
+    })
+
+    expect(container.textContent).toContain(
+      'audio_frame_status:\npreroll=3 utterance=0 capturing=false',
+    )
   })
 })
 
@@ -335,7 +355,12 @@ function getSendButton(container: HTMLElement): HTMLButtonElement {
 
 function getControlButton(
   container: HTMLElement,
-  label: 'Start listening' | 'Mark silence' | 'Mark result ready' | 'Reset to idle',
+  label:
+    | 'Start listening'
+    | 'Mark silence'
+    | 'Mark result ready'
+    | 'Reset to idle'
+    | 'Ingest test frame',
 ): HTMLButtonElement {
   const buttons = Array.from(container.querySelectorAll<HTMLButtonElement>('button'))
   const button = buttons.find((candidate) => candidate.textContent?.trim() === label)

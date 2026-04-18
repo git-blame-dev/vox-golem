@@ -4,7 +4,7 @@ import { ChatBubble } from './components/ChatBubble'
 import { playCue } from './lib/audioCues'
 import { shouldSubmitComposer } from './lib/composer'
 import { executePrompt } from './lib/promptExecution'
-import { invokeRuntimeControl } from './lib/runtimeControl'
+import { ingestAudioFrame, invokeRuntimeControl } from './lib/runtimeControl'
 import { DEFAULT_CUE_ASSET_PATHS, loadStartupState } from './lib/startupState'
 import { createExecutionMessages, getInitialMessages } from './state/appShell'
 import { cueForTransition, transitionRuntimeStatus } from './state/runtimeMachine'
@@ -60,6 +60,7 @@ function App() {
   const canResetToIdle =
     startupState.kind === 'ready' &&
     (runtimeStatus === 'result_ready' || runtimeStatus === 'error')
+  const canIngestTestFrame = startupState.kind === 'ready'
   const cueAssetPaths =
     startupState.kind === 'ready'
       ? startupState.cueAssetPaths
@@ -174,6 +175,42 @@ function App() {
           id: `system-runtime-control-error-${Date.now()}`,
           role: 'system',
           content: `Runtime control error: ${message}`,
+        },
+      ])
+    }
+  }
+
+  const ingestTestFrame = async (): Promise<void> => {
+    if (startupState.kind !== 'ready') {
+      return
+    }
+
+    try {
+      const status = await ingestAudioFrame([0.1, 0.2, 0.3])
+
+      if (status === null) {
+        return
+      }
+
+      applyRuntimeStatus(toRuntimeStatus(status.runtimePhase))
+      setMessages((currentMessages) => [
+        ...currentMessages,
+        {
+          id: `system-audio-frame-${Date.now()}`,
+          role: 'system',
+          content: `audio_frame_status:\npreroll=${status.prerollSamples} utterance=${status.utteranceSamples} capturing=${String(status.capturingUtterance)}`,
+        },
+      ])
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Audio frame ingestion failed'
+
+      setRuntimeStatus('error')
+      setMessages((currentMessages) => [
+        ...currentMessages,
+        {
+          id: `system-audio-frame-error-${Date.now()}`,
+          role: 'system',
+          content: `Audio frame ingestion error: ${message}`,
         },
       ])
     }
@@ -294,6 +331,16 @@ function App() {
             disabled={!canResetToIdle}
           >
             Reset to idle
+          </button>
+          <button
+            type="button"
+            className="shell__control"
+            onClick={() => {
+              void ingestTestFrame()
+            }}
+            disabled={!canIngestTestFrame}
+          >
+            Ingest test frame
           </button>
         </div>
       </header>
