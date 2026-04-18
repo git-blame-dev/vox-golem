@@ -6,12 +6,14 @@ use std::path::{Path, PathBuf};
 
 const WINDOWS_CONFIG_DIR: &str = "VoxGolem";
 const WINDOWS_CONFIG_FILE: &str = "config.toml";
+const DEFAULT_SILERO_VAD_MODEL: &str = "models/silero-vad.onnx";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     wake_word_wav: PathBuf,
     parakeet_model_dir: PathBuf,
+    silero_vad_model: Option<PathBuf>,
     opencode_path: PathBuf,
     start_listening_cue: PathBuf,
     stop_listening_cue: PathBuf,
@@ -21,6 +23,7 @@ struct RawConfig {
 pub struct RuntimeConfig {
     pub wake_word_wav: PathBuf,
     pub parakeet_model_dir: PathBuf,
+    pub silero_vad_model: PathBuf,
     pub opencode_path: PathBuf,
     pub start_listening_cue: PathBuf,
     pub stop_listening_cue: PathBuf,
@@ -130,12 +133,19 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
 
     let wake_word_wav = resolve_config_path(&config_dir, raw_config.wake_word_wav);
     let parakeet_model_dir = resolve_config_path(&config_dir, raw_config.parakeet_model_dir);
+    let silero_vad_model = resolve_config_path(
+        &config_dir,
+        raw_config
+            .silero_vad_model
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_SILERO_VAD_MODEL)),
+    );
     let opencode_path = resolve_config_path(&config_dir, raw_config.opencode_path);
     let start_listening_cue = resolve_config_path(&config_dir, raw_config.start_listening_cue);
     let stop_listening_cue = resolve_config_path(&config_dir, raw_config.stop_listening_cue);
 
     validate_existing_file(&wake_word_wav, "wake_word_wav")?;
     validate_existing_directory(&parakeet_model_dir, "parakeet_model_dir")?;
+    validate_existing_file(&silero_vad_model, "silero_vad_model")?;
     validate_existing_file(&start_listening_cue, "start_listening_cue")?;
     validate_existing_file(&stop_listening_cue, "stop_listening_cue")?;
     validate_existing_executable(&opencode_path)?;
@@ -143,6 +153,7 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
     Ok(RuntimeConfig {
         wake_word_wav,
         parakeet_model_dir,
+        silero_vad_model,
         opencode_path,
         start_listening_cue,
         stop_listening_cue,
@@ -258,7 +269,9 @@ mod tests {
     fn reports_missing_required_wake_word_file() {
         let temp = TempDir::new();
         let model_dir = temp.path().join("models");
+        let silero_vad_model = model_dir.join("silero-vad.onnx");
         fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
+        create_file(&silero_vad_model);
 
         let opencode_path = temp.path().join("opencode.exe");
         create_file(&opencode_path);
@@ -276,6 +289,7 @@ mod tests {
             render_config(
                 &missing_wake_word,
                 &model_dir,
+                &silero_vad_model,
                 &opencode_path,
                 &start_cue,
                 &stop_cue,
@@ -295,10 +309,48 @@ mod tests {
     }
 
     #[test]
-    fn loads_valid_config() {
+    fn defaults_missing_silero_vad_model_to_models_directory() {
         let temp = TempDir::new();
         let wake_word = temp.path().join("wake-word.wav");
         let model_dir = temp.path().join("models");
+        let default_silero_vad_model = model_dir.join("silero-vad.onnx");
+        let opencode_path = temp.path().join("opencode.exe");
+        let start_cue = temp.path().join("assets/start-listening.mp3");
+        let stop_cue = temp.path().join("assets/stop-listening.mp3");
+        let config_path = temp.path().join("config.toml");
+
+        create_file(&wake_word);
+        fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
+        create_file(&default_silero_vad_model);
+        create_file(&opencode_path);
+        create_file(&start_cue);
+        create_file(&stop_cue);
+
+        fs::write(
+            &config_path,
+            format!(
+                "wake_word_wav = \"{}\"\nparakeet_model_dir = \"{}\"\nopencode_path = \"{}\"\nstart_listening_cue = \"{}\"\nstop_listening_cue = \"{}\"\n",
+                escape_path(&wake_word),
+                escape_path(&model_dir),
+                escape_path(&opencode_path),
+                escape_path(&start_cue),
+                escape_path(&stop_cue),
+            ),
+        )
+        .expect("config fixture should be written");
+
+        let result = load_runtime_config(Some(&config_path))
+            .expect("config without silero_vad_model should use default path");
+
+        assert_eq!(result.silero_vad_model, default_silero_vad_model);
+    }
+
+    #[test]
+    fn reports_missing_required_silero_vad_model_file() {
+        let temp = TempDir::new();
+        let wake_word = temp.path().join("wake-word.wav");
+        let model_dir = temp.path().join("models");
+        let missing_silero_vad_model = model_dir.join("missing-silero-vad.onnx");
         let opencode_path = temp.path().join("opencode.exe");
         let start_cue = temp.path().join("assets/start-listening.mp3");
         let stop_cue = temp.path().join("assets/stop-listening.mp3");
@@ -315,6 +367,7 @@ mod tests {
             render_config(
                 &wake_word,
                 &model_dir,
+                &missing_silero_vad_model,
                 &opencode_path,
                 &start_cue,
                 &stop_cue,
@@ -324,14 +377,21 @@ mod tests {
 
         let result = load_runtime_config(Some(&config_path));
 
-        assert!(result.is_ok());
+        assert_eq!(
+            result,
+            Err(ConfigError::MissingFile {
+                field: "silero_vad_model",
+                path: missing_silero_vad_model,
+            })
+        );
     }
 
     #[test]
-    fn resolves_relative_cue_paths_against_config_directory() {
+    fn loads_valid_config() {
         let temp = TempDir::new();
         let wake_word = temp.path().join("wake-word.wav");
         let model_dir = temp.path().join("models");
+        let silero_vad_model = model_dir.join("silero-vad.onnx");
         let opencode_path = temp.path().join("opencode.exe");
         let start_cue = temp.path().join("assets/start-listening.mp3");
         let stop_cue = temp.path().join("assets/stop-listening.mp3");
@@ -339,6 +399,46 @@ mod tests {
 
         create_file(&wake_word);
         fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
+        create_file(&silero_vad_model);
+        create_file(&opencode_path);
+        create_file(&start_cue);
+        create_file(&stop_cue);
+
+        fs::write(
+            &config_path,
+            render_config(
+                &wake_word,
+                &model_dir,
+                &silero_vad_model,
+                &opencode_path,
+                &start_cue,
+                &stop_cue,
+            ),
+        )
+        .expect("config fixture should be written");
+
+        let result = load_runtime_config(Some(&config_path));
+
+        assert_eq!(
+            result.expect("valid config should load").silero_vad_model,
+            silero_vad_model
+        );
+    }
+
+    #[test]
+    fn resolves_relative_cue_paths_against_config_directory() {
+        let temp = TempDir::new();
+        let wake_word = temp.path().join("wake-word.wav");
+        let model_dir = temp.path().join("models");
+        let silero_vad_model = temp.path().join("models/silero-vad.onnx");
+        let opencode_path = temp.path().join("opencode.exe");
+        let start_cue = temp.path().join("assets/start-listening.mp3");
+        let stop_cue = temp.path().join("assets/stop-listening.mp3");
+        let config_path = temp.path().join("config.toml");
+
+        create_file(&wake_word);
+        fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
+        create_file(&silero_vad_model);
         create_file(&opencode_path);
         create_file(&start_cue);
         create_file(&stop_cue);
@@ -346,7 +446,7 @@ mod tests {
         fs::write(
             &config_path,
             format!(
-                "wake_word_wav = \"{}\"\nparakeet_model_dir = \"{}\"\nopencode_path = \"{}\"\nstart_listening_cue = \"assets/start-listening.mp3\"\nstop_listening_cue = \"assets/stop-listening.mp3\"\n",
+                "wake_word_wav = \"{}\"\nparakeet_model_dir = \"{}\"\nsilero_vad_model = \"models/silero-vad.onnx\"\nopencode_path = \"{}\"\nstart_listening_cue = \"assets/start-listening.mp3\"\nstop_listening_cue = \"assets/stop-listening.mp3\"\n",
                 escape_path(&wake_word),
                 escape_path(&model_dir),
                 escape_path(&opencode_path),
@@ -372,14 +472,19 @@ mod tests {
     fn render_config(
         wake_word_wav: &Path,
         parakeet_model_dir: &Path,
+        silero_vad_model: &Path,
         opencode_path: &Path,
         start_listening_cue: &Path,
         stop_listening_cue: &Path,
     ) -> String {
+        let silero_vad_model_line =
+            format!("silero_vad_model = \"{}\"\n", escape_path(silero_vad_model));
+
         format!(
-            "wake_word_wav = \"{}\"\nparakeet_model_dir = \"{}\"\nopencode_path = \"{}\"\nstart_listening_cue = \"{}\"\nstop_listening_cue = \"{}\"\n",
+            "wake_word_wav = \"{}\"\nparakeet_model_dir = \"{}\"\n{}opencode_path = \"{}\"\nstart_listening_cue = \"{}\"\nstop_listening_cue = \"{}\"\n",
             escape_path(wake_word_wav),
             escape_path(parakeet_model_dir),
+            silero_vad_model_line,
             escape_path(opencode_path),
             escape_path(start_listening_cue),
             escape_path(stop_listening_cue),
