@@ -59,10 +59,13 @@ struct PromptExecutionPayload {
     runtime_phase: RuntimePhasePayload,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 struct RuntimePhaseResponsePayload {
     runtime_phase: RuntimePhasePayload,
     transcription_ready_samples: Option<usize>,
+    capturing_utterance: bool,
+    preroll_samples: usize,
+    utterance_samples: usize,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -203,8 +206,7 @@ fn begin_listening(
     )?;
 
     Ok(RuntimePhaseResponsePayload {
-        runtime_phase: current_runtime_phase(&app_state.voice_pipeline_state)?,
-        transcription_ready_samples: None,
+        ..current_runtime_phase_response(&app_state.voice_pipeline_state, None)?
     })
 }
 
@@ -226,8 +228,10 @@ fn mark_silence(
     )?;
 
     Ok(RuntimePhaseResponsePayload {
-        runtime_phase: current_runtime_phase(&app_state.voice_pipeline_state)?,
-        transcription_ready_samples: transcription_ready_samples(&action),
+        ..current_runtime_phase_response(
+            &app_state.voice_pipeline_state,
+            transcription_ready_samples(&action),
+        )?
     })
 }
 
@@ -242,8 +246,7 @@ fn mark_result_ready(
     )?;
 
     Ok(RuntimePhaseResponsePayload {
-        runtime_phase: current_runtime_phase(&app_state.voice_pipeline_state)?,
-        transcription_ready_samples: None,
+        ..current_runtime_phase_response(&app_state.voice_pipeline_state, None)?
     })
 }
 
@@ -258,8 +261,7 @@ fn reset_session(
     )?;
 
     Ok(RuntimePhaseResponsePayload {
-        runtime_phase: current_runtime_phase(&app_state.voice_pipeline_state)?,
-        transcription_ready_samples: None,
+        ..current_runtime_phase_response(&app_state.voice_pipeline_state, None)?
     })
 }
 
@@ -358,6 +360,23 @@ fn current_silence_deadline(
             .voice_turn()
             .silence_timeout_ms(),
     ))
+}
+
+fn current_runtime_phase_response(
+    voice_pipeline_state: &Mutex<voxgolem_core::voice_pipeline::VoicePipelineState>,
+    transcription_ready_samples: Option<usize>,
+) -> Result<RuntimePhaseResponsePayload, String> {
+    let guard = voice_pipeline_state
+        .lock()
+        .map_err(|_| String::from("voice pipeline lock is poisoned"))?;
+
+    Ok(RuntimePhaseResponsePayload {
+        runtime_phase: to_runtime_phase_payload(guard.session().runtime().phase()),
+        transcription_ready_samples,
+        capturing_utterance: guard.capture().capturing_utterance(),
+        preroll_samples: guard.capture().preroll_len(),
+        utterance_samples: guard.capture().utterance_len(),
+    })
 }
 
 fn to_runtime_phase_payload(
@@ -485,9 +504,10 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_status_payload, current_silence_deadline, default_voice_pipeline_config,
-        prompt_result_error_message, to_runtime_phase_payload, transcription_ready_samples,
-        AudioFrameStatusPayload, RuntimePhasePayload, DEFAULT_SILENCE_TIMEOUT_MS,
+        capture_status_payload, current_runtime_phase_response, current_silence_deadline,
+        default_voice_pipeline_config, prompt_result_error_message, to_runtime_phase_payload,
+        transcription_ready_samples, AudioFrameStatusPayload, RuntimePhasePayload,
+        RuntimePhaseResponsePayload, DEFAULT_SILENCE_TIMEOUT_MS,
     };
     use std::sync::Mutex;
 
@@ -622,6 +642,53 @@ mod tests {
                 preroll_samples: 3,
                 utterance_samples: 5,
             }
+        );
+    }
+
+    #[test]
+    fn runtime_phase_response_payload_can_hold_capture_status() {
+        let payload = RuntimePhaseResponsePayload {
+            runtime_phase: RuntimePhasePayload::Processing,
+            transcription_ready_samples: Some(3200),
+            capturing_utterance: false,
+            preroll_samples: 3,
+            utterance_samples: 0,
+        };
+
+        assert_eq!(payload.preroll_samples, 3);
+        assert_eq!(payload.utterance_samples, 0);
+        assert!(!payload.capturing_utterance);
+        assert_eq!(payload.transcription_ready_samples, Some(3200));
+    }
+
+    #[test]
+    fn current_runtime_phase_response_reads_single_snapshot() {
+        let voice_pipeline_config = default_voice_pipeline_config();
+        let ready_state = voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
+            &voxgolem_core::voice_pipeline::VoicePipelineState::new(voice_pipeline_config)
+                .expect("voice pipeline should initialize"),
+            voice_pipeline_config,
+            voxgolem_core::voice_pipeline::VoicePipelineEvent::StartupValidated,
+        )
+        .expect("startup validation should succeed")
+        .0;
+        let preroll_state = voxgolem_core::voice_pipeline::ingest_audio_frame(
+            &ready_state,
+            voice_pipeline_config,
+            vec![0.1, 0.2],
+        )
+        .expect("sleeping frame should be recorded");
+        let locked_state = Mutex::new(preroll_state);
+
+        assert_eq!(
+            current_runtime_phase_response(&locked_state, Some(2)),
+            Ok(RuntimePhaseResponsePayload {
+                runtime_phase: RuntimePhasePayload::Sleeping,
+                transcription_ready_samples: Some(2),
+                capturing_utterance: false,
+                preroll_samples: 2,
+                utterance_samples: 0,
+            })
         );
     }
 }

@@ -18,6 +18,9 @@ describe('invokeRuntimeControl', () => {
         return {
           runtime_phase: 'listening',
           transcription_ready_samples: null,
+          capturing_utterance: true,
+          preroll_samples: 3,
+          utterance_samples: 5,
         }
       },
     }
@@ -25,6 +28,9 @@ describe('invokeRuntimeControl', () => {
     await expect(invokeRuntimeControl('begin_listening')).resolves.toEqual({
       runtimePhase: 'listening',
       transcriptionReadySamples: null,
+      capturingUtterance: true,
+      prerollSamples: 3,
+      utteranceSamples: 5,
     })
   })
 
@@ -49,5 +55,18 @@ describe('invokeRuntimeControl', () => {
       prerollSamples: 3,
       utteranceSamples: 0,
     })
+  })
+
+  it('rejects runtime control payloads missing capture fields', async () => {
+    window.__TAURI_INTERNALS__ = {
+      invoke: async () => ({
+        runtime_phase: 'listening',
+        transcription_ready_samples: null,
+      }),
+    }
+
+    await expect(invokeRuntimeControl('begin_listening')).rejects.toThrow(
+      'Runtime control payload must include capturing_utterance',
+    )
   })
 })

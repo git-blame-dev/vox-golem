@@ -154,17 +154,23 @@ function App() {
       }
 
       applyRuntimeStatus(toRuntimeStatus(runtimePhase.runtimePhase))
+      const nextMessages: ChatMessage[] = [
+        {
+          id: `system-runtime-control-status-${Date.now()}`,
+          role: 'system',
+          content: `runtime_control_status:\npreroll=${runtimePhase.prerollSamples} utterance=${runtimePhase.utteranceSamples} capturing=${String(runtimePhase.capturingUtterance)}`,
+        },
+      ]
 
       if (runtimePhase.transcriptionReadySamples !== null) {
-        setMessages((currentMessages) => [
-          ...currentMessages,
-          {
-            id: `system-transcription-ready-${Date.now()}`,
-            role: 'system',
-            content: `transcription_ready:\n${runtimePhase.transcriptionReadySamples} samples captured`,
-          },
-        ])
+        nextMessages.push({
+          id: `system-transcription-ready-${Date.now()}`,
+          role: 'system',
+          content: `transcription_ready:\n${runtimePhase.transcriptionReadySamples} samples captured`,
+        })
       }
+
+      setMessages((currentMessages) => [...currentMessages, ...nextMessages])
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Runtime control failed'
 
