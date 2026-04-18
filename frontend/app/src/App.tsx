@@ -32,6 +32,7 @@ function App() {
     getInitialMessages(),
   )
   const liveAudioSourceRef = useRef<LiveAudioSource | null>(null)
+  const appActiveRef = useRef(true)
 
   useEffect(() => {
     let active = true
@@ -52,6 +53,7 @@ function App() {
 
   useEffect(() => {
     return () => {
+      appActiveRef.current = false
       liveAudioSourceRef.current?.stop()
       liveAudioSourceRef.current = null
     }
@@ -305,6 +307,11 @@ function App() {
         onError: reportLiveAudioError,
       })
 
+      if (!appActiveRef.current) {
+        liveAudioSource.stop()
+        return
+      }
+
       liveAudioSourceRef.current = liveAudioSource
       setMicStarting(false)
       setMicActive(true)
@@ -317,6 +324,10 @@ function App() {
         },
       ])
     } catch (error) {
+      if (!appActiveRef.current) {
+        return
+      }
+
       setMicStarting(false)
       reportLiveAudioError(error)
     }
