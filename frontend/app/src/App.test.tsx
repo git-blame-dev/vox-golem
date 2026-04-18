@@ -326,6 +326,7 @@ describe('App', () => {
 
         return {
           runtime_phase: 'processing',
+          transcription_ready_samples: null,
           transcript_text: null,
           last_activity_ms: null,
           capturing_utterance: false,
@@ -419,6 +420,9 @@ describe('App', () => {
 
         return {
           runtime_phase: 'sleeping',
+          transcription_ready_samples: null,
+          transcript_text: null,
+          last_activity_ms: null,
           capturing_utterance: false,
           preroll_samples: 3,
           utterance_samples: 0,
@@ -455,7 +459,7 @@ describe('App', () => {
     expect(container.textContent).toContain('live_audio:\ndefault microphone stopped')
   })
 
-  it('automatically records speech activity and marks silence from live audio', async () => {
+  it('automatically marks silence from backend speech activity updates', async () => {
     const stop = vi.fn()
     let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
     const invokedCommands: string[] = []
@@ -479,7 +483,7 @@ describe('App', () => {
     })
 
     window.__TAURI_INTERNALS__ = {
-      invoke: async (command, args) => {
+      invoke: async (command) => {
         invokedCommands.push(command)
 
         if (command === 'get_startup_state') {
@@ -496,17 +500,6 @@ describe('App', () => {
         }
 
         if (command === 'ingest_audio_frame') {
-          return {
-            runtime_phase: 'listening',
-            capturing_utterance: true,
-            preroll_samples: 4,
-            utterance_samples: 4,
-          }
-        }
-
-        if (command === 'record_speech_activity') {
-          expect(args).toEqual({ nowMs: 1_000 })
-
           return {
             runtime_phase: 'listening',
             transcription_ready_samples: null,
@@ -555,7 +548,6 @@ describe('App', () => {
     expect(invokedCommands).toEqual([
       'get_startup_state',
       'ingest_audio_frame',
-      'record_speech_activity',
       'ingest_audio_frame',
       'mark_silence',
     ])
@@ -607,15 +599,6 @@ describe('App', () => {
         }
 
         if (command === 'ingest_audio_frame') {
-          return {
-            runtime_phase: 'listening',
-            capturing_utterance: true,
-            preroll_samples: 4,
-            utterance_samples: 4,
-          }
-        }
-
-        if (command === 'record_speech_activity') {
           return {
             runtime_phase: 'listening',
             transcription_ready_samples: null,
@@ -674,7 +657,6 @@ describe('App', () => {
     expect(invokedCommands).toEqual([
       'get_startup_state',
       'ingest_audio_frame',
-      'record_speech_activity',
       'ingest_audio_frame',
       'mark_silence',
       'submit_prompt',

@@ -23,7 +23,7 @@ VoxGolem is a local AI voice assistant that listens hands-free, stops automatica
 - Runtime/core: Rust + `tokio`
 - Audio capture/handoff: `cpal` + `ringbuf`
 - Wake-word detection: `rustpotter`
-- End-of-speech detection: `silero-vad-rs`
+- End-of-speech detection: Silero VAD ONNX via `ort`
 - Local transcription: `transcribe-rs` (Parakeet v2)
 - Configuration: `serde` + `toml`
 

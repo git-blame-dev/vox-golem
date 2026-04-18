@@ -1,5 +1,6 @@
 wake_word_wav = "wake-word.wav"
 parakeet_model_dir = "models/parakeet-v2"
+silero_vad_model = "models/silero-vad.onnx"
 opencode_path = "opencode/opencode.exe"
 start_listening_cue = "assets/start-listening.mp3"
 stop_listening_cue = "assets/stop-listening.mp3"

@@ -430,24 +430,15 @@ function App() {
               voiceActivityStateRef.current = syncVoiceActivityState(
                 voiceActivityStateRef.current,
                 nextStatus,
-                nowMs,
+                status.lastActivityMs,
               )
 
               if (nextStatus === 'listening') {
-                const voiceActivityUpdate = updateVoiceActivityState(
-                  voiceActivityStateRef.current,
-                  frame,
-                  nowMs,
-                )
+                const voiceActivityUpdate = updateVoiceActivityState(voiceActivityStateRef.current, nowMs)
 
                 voiceActivityStateRef.current = voiceActivityUpdate.state
 
-                if (voiceActivityUpdate.shouldRecordSpeechActivity) {
-                  await syncRuntimeControl('record_speech_activity', {
-                    args: { nowMs },
-                    quiet: true,
-                  })
-                } else if (voiceActivityUpdate.shouldMarkSilence) {
+                if (voiceActivityUpdate.shouldMarkSilence) {
                   await handleMarkSilence()
                 }
               }

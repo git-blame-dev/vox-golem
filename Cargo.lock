@@ -4853,6 +4853,8 @@ name = "vox-golem-windows"
 version = "0.0.0"
 dependencies = [
  "hound",
+ "ndarray",
+ "ort",
  "rustpotter",
  "serde",
  "tauri",

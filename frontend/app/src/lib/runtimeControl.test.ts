@@ -75,6 +75,9 @@ describe('invokeRuntimeControl', () => {
 
         return {
           runtime_phase: 'sleeping',
+          transcription_ready_samples: null,
+          transcript_text: null,
+          last_activity_ms: null,
           capturing_utterance: false,
           preroll_samples: 3,
           utterance_samples: 0,
@@ -84,6 +87,9 @@ describe('invokeRuntimeControl', () => {
 
     await expect(ingestAudioFrame([0.1, 0.2, 0.3])).resolves.toEqual({
       runtimePhase: 'sleeping',
+      transcriptionReadySamples: null,
+      transcriptText: null,
+      lastActivityMs: null,
       capturingUtterance: false,
       prerollSamples: 3,
       utteranceSamples: 0,
