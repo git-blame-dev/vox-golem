@@ -2,6 +2,8 @@
 
 VoxGolem is a local AI voice assistant that listens hands-free, stops automatically, and combines multiple frontier models for fast answers that improve in real time.
 
+The Windows-first baseline MVP voice path is now in place: live mic capture feeds wake-word detection, backend-owned VAD, local Parakeet transcription, and the existing `opencode` execution path.
+
 ## 🚀 What It Does
 
 - Captures voice with wake word plus automatic stop after silence.
@@ -30,7 +32,17 @@ VoxGolem is a local AI voice assistant that listens hands-free, stops automatica
 ## 🗺️ Roadmap Checklist
 
 - ✅ Foundation complete (public repo, architecture direction, MVP plan).
-- ⬜ Chat shell complete (top conversation view + bottom composer with keyboard send).
-- ⬜ Voice pipeline complete (wake-word, silence stop, local Parakeet v2 STT).
-- ⬜ Execution pipeline complete (`opencode` direct args + labeled output).
+- ✅ Chat shell complete (top conversation view + bottom composer with keyboard send).
+- ✅ Voice pipeline complete (wake-word, silence stop, local Parakeet v2 STT).
+- ✅ Execution pipeline complete (`opencode` direct args + labeled output).
 - ⬜ Progressive response mode complete (fast first answer, background refinement updates).
+
+## ⚙️ Required Local Assets
+
+The Windows runtime expects these configured local assets in `%APPDATA%\VoxGolem\config.toml`:
+
+- `wake_word_wav`: wake-word reference clip for `rustpotter`
+- `parakeet_model_dir`: local Parakeet v2 model directory
+- `silero_vad_model`: local Silero VAD ONNX file
+- `start_listening_cue` and `stop_listening_cue`: cue audio files
+- `opencode_path`: local `opencode` executable

@@ -183,7 +183,7 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(container.textContent).toContain('Runtime: error')
+    expect(container.textContent).toContain('Status: Error')
     expect(container.textContent).toContain('stderr:\nbad prompt')
     expect(container.textContent).toContain('exit_code:\n7')
   })
@@ -232,13 +232,12 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(container.textContent).toContain('Runtime: error')
+    expect(container.textContent).toContain('Status: Error')
     expect(container.textContent).toContain('opencode_error:\nAPIError: Provider failed')
   })
 
   it('plays the configured start-listening cue path from startup state', async () => {
     const playedSources: string[] = []
-    let recordedSpeechActivityMs: number | null = null
 
     class FakeAudio {
       private readonly source: string
@@ -264,7 +263,7 @@ describe('App', () => {
     }
 
     window.__TAURI_INTERNALS__ = {
-      invoke: async (command, args) => {
+      invoke: async (command) => {
         if (command === 'get_startup_state') {
           return {
             kind: 'ready',
@@ -284,28 +283,6 @@ describe('App', () => {
             transcription_ready_samples: null,
             transcript_text: null,
             last_activity_ms: 100,
-            capturing_utterance: true,
-            preroll_samples: 4,
-            utterance_samples: 4,
-          }
-        }
-
-        if (command === 'record_speech_activity') {
-          if (
-            typeof args !== 'object' ||
-            args === null ||
-            typeof (args as { nowMs?: unknown }).nowMs !== 'number'
-          ) {
-            throw new Error('record_speech_activity must include a numeric nowMs')
-          }
-
-          recordedSpeechActivityMs = (args as { nowMs: number }).nowMs
-
-          return {
-            runtime_phase: 'listening',
-            transcription_ready_samples: null,
-            transcript_text: null,
-            last_activity_ms: recordedSpeechActivityMs,
             capturing_utterance: true,
             preroll_samples: 4,
             utterance_samples: 4,
@@ -345,22 +322,9 @@ describe('App', () => {
     })
 
     expect(playedSources).toEqual(['test-assets/configured-start.mp3'])
-    expect(container.textContent).toContain('Runtime: listening')
+    expect(container.textContent).toContain('Status: Listening')
     expect(container.textContent).toContain(
-      'runtime_control_status:\npreroll=4 utterance=4 capturing=true last_activity=100',
-    )
-
-    const recordSpeechActivityButton = getControlButton(container, 'Record speech activity')
-
-    await act(async () => {
-      recordSpeechActivityButton.click()
-      await Promise.resolve()
-    })
-
-    expect(container.textContent).toContain('Runtime: listening')
-    expect(recordedSpeechActivityMs).not.toBeNull()
-    expect(container.textContent).toContain(
-      `runtime_control_status:\npreroll=4 utterance=4 capturing=true last_activity=${String(recordedSpeechActivityMs)}`,
+      'Speech is being captured. Stop talking and the assistant will transcribe automatically.',
     )
 
     const markSilenceButton = getControlButton(container, 'Mark silence')
@@ -370,25 +334,8 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(container.textContent).toContain('Runtime: processing')
-    expect(container.textContent).toContain(
-      'runtime_control_status:\npreroll=4 utterance=0 capturing=false last_activity=none',
-    )
-    expect(container.textContent).not.toContain(
-      'runtime_control_status:\npreroll=undefined utterance=undefined capturing=undefined last_activity=undefined',
-    )
+    expect(container.textContent).toContain('Status: Transcribing')
     expect(container.textContent).toContain('transcription_ready:\n3200 samples captured')
-
-    const ingestTestFrameButton = getControlButton(container, 'Ingest test frame')
-
-    await act(async () => {
-      ingestTestFrameButton.click()
-      await Promise.resolve()
-    })
-
-    expect(container.textContent).toContain(
-      'audio_frame_status:\npreroll=3 utterance=0 capturing=false',
-    )
   })
 
   it('starts and stops default microphone capture and forwards live frames', async () => {
@@ -446,7 +393,7 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(container.textContent).toContain('Runtime: sleeping')
+    expect(container.textContent).toContain('Status: Waiting')
 
     const stopMicButton = getControlButton(container, 'Stop mic')
 
@@ -551,11 +498,8 @@ describe('App', () => {
       'ingest_audio_frame',
       'mark_silence',
     ])
-    expect(container.textContent).toContain('Runtime: processing')
+    expect(container.textContent).toContain('Status: Transcribing')
     expect(container.textContent).toContain('transcription_ready:\n3200 samples captured')
-    expect(container.textContent).not.toContain(
-      'runtime_control_status:\npreroll=4 utterance=4 capturing=true last_activity=1000',
-    )
   })
 
   it('submits the transcribed voice prompt after silence', async () => {
@@ -664,7 +608,7 @@ describe('App', () => {
     expect(container.textContent).toContain('transcript:\nOpen the pull request')
     expect(container.textContent).toContain('Open the pull request')
     expect(container.textContent).toContain('Voice execution response')
-    expect(container.textContent).toContain('Runtime: result_ready')
+    expect(container.textContent).toContain('Status: Ready')
   })
 
   it('shows microphone capture errors without changing the backend contract', async () => {
@@ -744,11 +688,9 @@ function getControlButton(
     | 'Start mic'
     | 'Stop mic'
     | 'Start listening'
-    | 'Record speech activity'
     | 'Mark silence'
     | 'Mark result ready'
-    | 'Reset to idle'
-    | 'Ingest test frame',
+    | 'Reset to idle',
 ): HTMLButtonElement {
   const buttons = Array.from(container.querySelectorAll<HTMLButtonElement>('button'))
   const button = buttons.find((candidate) => candidate.textContent?.trim() === label)
