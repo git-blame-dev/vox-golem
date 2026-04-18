@@ -15,7 +15,7 @@ struct AppState {
     voice_pipeline_state: Mutex<voxgolem_core::voice_pipeline::VoicePipelineState>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum RuntimePhasePayload {
     Initializing,
@@ -63,6 +63,14 @@ struct PromptExecutionPayload {
 struct RuntimePhaseResponsePayload {
     runtime_phase: RuntimePhasePayload,
     transcription_ready_samples: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct AudioFrameStatusPayload {
+    runtime_phase: RuntimePhasePayload,
+    capturing_utterance: bool,
+    preroll_samples: usize,
+    utterance_samples: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -255,6 +263,28 @@ fn reset_session(
     })
 }
 
+#[tauri::command]
+fn ingest_audio_frame(
+    frame: Vec<f32>,
+    app_state: tauri::State<'_, AppState>,
+) -> Result<AudioFrameStatusPayload, String> {
+    let mut guard = app_state
+        .voice_pipeline_state
+        .lock()
+        .map_err(|_| String::from("voice pipeline lock is poisoned"))?;
+
+    let next_state = voxgolem_core::voice_pipeline::ingest_audio_frame(
+        &guard,
+        app_state.voice_pipeline_config,
+        frame,
+    )
+    .map_err(|error| format!("voice pipeline frame ingestion failed: {error:?}"))?;
+
+    *guard = next_state;
+
+    Ok(capture_status_payload(&guard))
+}
+
 fn build_app_state() -> AppState {
     let voice_pipeline_config = default_voice_pipeline_config();
 
@@ -344,6 +374,17 @@ fn to_runtime_phase_payload(
     }
 }
 
+fn capture_status_payload(
+    voice_pipeline_state: &voxgolem_core::voice_pipeline::VoicePipelineState,
+) -> AudioFrameStatusPayload {
+    AudioFrameStatusPayload {
+        runtime_phase: to_runtime_phase_payload(voice_pipeline_state.session().runtime().phase()),
+        capturing_utterance: voice_pipeline_state.capture().capturing_utterance(),
+        preroll_samples: voice_pipeline_state.capture().preroll_len(),
+        utterance_samples: voice_pipeline_state.capture().utterance_len(),
+    }
+}
+
 fn default_voice_pipeline_config() -> voxgolem_core::voice_pipeline::VoicePipelineConfig {
     let voice_turn = voxgolem_core::voice_turn::VoiceTurnConfig::new(DEFAULT_SILENCE_TIMEOUT_MS)
         .expect("silence timeout constant should be valid");
@@ -429,6 +470,7 @@ pub fn run() {
                 get_startup_state,
                 submit_prompt,
                 begin_listening,
+                ingest_audio_frame,
                 mark_silence,
                 mark_result_ready,
                 reset_session
@@ -443,9 +485,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        current_silence_deadline, default_voice_pipeline_config, prompt_result_error_message,
-        to_runtime_phase_payload, transcription_ready_samples, RuntimePhasePayload,
-        DEFAULT_SILENCE_TIMEOUT_MS,
+        capture_status_payload, current_silence_deadline, default_voice_pipeline_config,
+        prompt_result_error_message, to_runtime_phase_payload, transcription_ready_samples,
+        AudioFrameStatusPayload, RuntimePhasePayload, DEFAULT_SILENCE_TIMEOUT_MS,
     };
     use std::sync::Mutex;
 
@@ -539,5 +581,47 @@ mod tests {
         };
 
         assert_eq!(transcription_ready_samples(&action), Some(3));
+    }
+
+    #[test]
+    fn capture_status_payload_reflects_preroll_and_utterance_lengths() {
+        let voice_pipeline_config = default_voice_pipeline_config();
+        let ready_state = voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
+            &voxgolem_core::voice_pipeline::VoicePipelineState::new(voice_pipeline_config)
+                .expect("voice pipeline should initialize"),
+            voice_pipeline_config,
+            voxgolem_core::voice_pipeline::VoicePipelineEvent::StartupValidated,
+        )
+        .expect("startup validation should succeed")
+        .0;
+        let preroll_state = voxgolem_core::voice_pipeline::ingest_audio_frame(
+            &ready_state,
+            voice_pipeline_config,
+            vec![0.1, 0.2, 0.3],
+        )
+        .expect("sleeping frame should be recorded");
+        let listening_state = voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
+            &preroll_state,
+            voice_pipeline_config,
+            voxgolem_core::voice_pipeline::VoicePipelineEvent::WakeWordDetected { now_ms: 100 },
+        )
+        .expect("wake word should start listening")
+        .0;
+        let utterance_state = voxgolem_core::voice_pipeline::ingest_audio_frame(
+            &listening_state,
+            voice_pipeline_config,
+            vec![0.4, 0.5],
+        )
+        .expect("listening frame should be recorded");
+
+        assert_eq!(
+            capture_status_payload(&utterance_state),
+            AudioFrameStatusPayload {
+                runtime_phase: RuntimePhasePayload::Listening,
+                capturing_utterance: true,
+                preroll_samples: 3,
+                utterance_samples: 5,
+            }
+        );
     }
 }
