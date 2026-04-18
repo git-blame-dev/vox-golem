@@ -14,6 +14,10 @@ describe('transitionRuntimeStatus', () => {
     expect(transitionRuntimeStatus('sleeping', 'submit_prompt')).toBe('executing')
   })
 
+  it('transitions voice prompt flow from processing to executing', () => {
+    expect(transitionRuntimeStatus('processing', 'submit_prompt')).toBe('executing')
+  })
+
   it('transitions to result_ready when response arrives', () => {
     expect(transitionRuntimeStatus('executing', 'response_ready')).toBe('result_ready')
   })

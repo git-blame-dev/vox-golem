@@ -46,6 +46,8 @@ export type StartupState =
       readonly kind: 'ready'
       readonly cueAssetPaths: CueAssetPaths
       readonly runtimePhase: BackendRuntimePhase
+      readonly voiceInputAvailable: boolean
+      readonly voiceInputError: string | null
     }
   | { readonly kind: 'error'; readonly message: string }
 
@@ -57,3 +59,13 @@ export type RuntimeStatus =
   | 'executing'
   | 'result_ready'
   | 'error'
+
+export interface RuntimeControlResult {
+  readonly runtimePhase: BackendRuntimePhase
+  readonly transcriptionReadySamples: number | null
+  readonly transcriptText: string | null
+  readonly lastActivityMs: number | null
+  readonly capturingUtterance: boolean
+  readonly prerollSamples: number
+  readonly utteranceSamples: number
+}

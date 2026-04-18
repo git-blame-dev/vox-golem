@@ -121,6 +121,7 @@ pub fn apply_runtime_event(
         },
         RuntimeEvent::SubmitPrompt
             if current_phase == RuntimePhase::Sleeping
+                || current_phase == RuntimePhase::Processing
                 || current_phase == RuntimePhase::ResultReady =>
         {
             RuntimeState {
@@ -253,6 +254,19 @@ mod tests {
 
         assert_eq!(executing.phase(), RuntimePhase::Executing);
         assert_eq!(result.phase(), RuntimePhase::ResultReady);
+    }
+
+    #[test]
+    fn voice_prompt_flow_can_enter_executing_from_processing() {
+        let state = RuntimeState {
+            phase: RuntimePhase::Processing,
+            last_error: None,
+        };
+
+        let executing = apply_runtime_event(&state, RuntimeEvent::SubmitPrompt)
+            .expect("processing should transition to executing");
+
+        assert_eq!(executing.phase(), RuntimePhase::Executing);
     }
 
     #[test]
