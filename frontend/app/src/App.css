@@ -36,6 +36,29 @@
   font-size: 0.95rem;
 }
 
+.shell__phase {
+  margin: 0.35rem 0 0;
+  color: #4b6077;
+  font-size: 0.9rem;
+  max-width: 48rem;
+}
+
+.shell__badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin-top: 0.75rem;
+}
+
+.shell__badge {
+  border: 1px solid #c7d9f5;
+  background: #f3f8ff;
+  color: #23405f;
+  border-radius: 999px;
+  padding: 0.2rem 0.55rem;
+  font-size: 0.78rem;
+}
+
 .shell__error {
   margin: 0.55rem 0 0;
   color: #8c1d18;
@@ -47,6 +70,16 @@
   flex-wrap: wrap;
   gap: 0.5rem;
   margin-top: 0.8rem;
+}
+
+.shell__manual-controls {
+  margin-top: 0.85rem;
+}
+
+.shell__manual-controls summary {
+  cursor: pointer;
+  color: #2f4a66;
+  font-size: 0.85rem;
 }
 
 .shell__control {

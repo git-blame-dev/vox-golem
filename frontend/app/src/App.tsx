@@ -84,7 +84,6 @@ function App() {
     (runtimeStatus === 'sleeping' || runtimeStatus === 'result_ready')
   const canMarkSilence =
     startupState.kind === 'ready' && startupState.voiceInputAvailable && runtimeStatus === 'listening'
-  const canRecordSpeechActivity = canMarkSilence
   const canMarkResultReady =
     startupState.kind === 'ready' &&
     (runtimeStatus === 'processing' || runtimeStatus === 'executing')
@@ -93,11 +92,12 @@ function App() {
     (runtimeStatus === 'result_ready' || runtimeStatus === 'error')
   const canToggleMic =
     startupState.kind === 'ready' && startupState.voiceInputAvailable && !micStarting
-  const canIngestTestFrame = startupState.kind === 'ready' && startupState.voiceInputAvailable
   const cueAssetPaths =
     startupState.kind === 'ready'
       ? startupState.cueAssetPaths
       : DEFAULT_CUE_ASSET_PATHS
+  const runtimeLabel = getRuntimeLabel(runtimeStatus)
+  const runtimeDetail = getRuntimeDetail(runtimeStatus, startupState, micActive)
 
   const applyTransition = (
     previousStatus: RuntimeStatus,
@@ -201,15 +201,7 @@ function App() {
       return
     }
 
-    const lastActivityText =
-      runtimePhase.lastActivityMs === null ? 'none' : String(runtimePhase.lastActivityMs)
-    const nextMessages: ChatMessage[] = [
-      {
-        id: `system-runtime-control-status-${Date.now()}`,
-        role: 'system',
-        content: `runtime_control_status:\npreroll=${runtimePhase.prerollSamples} utterance=${runtimePhase.utteranceSamples} capturing=${String(runtimePhase.capturingUtterance)} last_activity=${lastActivityText}`,
-      },
-    ]
+    const nextMessages: ChatMessage[] = []
 
     if (runtimePhase.transcriptionReadySamples !== null) {
       nextMessages.push({
@@ -351,42 +343,6 @@ function App() {
     maybeRunVoiceTranscript(runtimePhase)
   }
 
-  const ingestTestFrame = async (): Promise<void> => {
-    if (startupState.kind !== 'ready') {
-      return
-    }
-
-    try {
-      const status = await ingestAudioFrame([0.1, 0.2, 0.3])
-
-      if (status === null) {
-        return
-      }
-
-      applyRuntimeStatus(toRuntimeStatus(status.runtimePhase))
-      setMessages((currentMessages) => [
-        ...currentMessages,
-        {
-          id: `system-audio-frame-${Date.now()}`,
-          role: 'system',
-          content: `audio_frame_status:\npreroll=${status.prerollSamples} utterance=${status.utteranceSamples} capturing=${String(status.capturingUtterance)}`,
-        },
-      ])
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Audio frame ingestion failed'
-
-      enterRuntimeError()
-      setMessages((currentMessages) => [
-        ...currentMessages,
-        {
-          id: `system-audio-frame-error-${Date.now()}`,
-          role: 'system',
-          content: `Audio frame ingestion error: ${message}`,
-        },
-      ])
-    }
-  }
-
   const stopLiveAudio = (content: string): void => {
     liveAudioSourceRef.current?.stop()
     liveAudioSourceRef.current = null
@@ -521,7 +477,14 @@ function App() {
       <header className="shell__header">
         <p className="shell__eyebrow">VoxGolem</p>
         <h1>Windows Tauri MVP Shell</h1>
-        <p className="shell__status">Runtime: {runtimeStatus}</p>
+        <p className="shell__status">Status: {runtimeLabel}</p>
+        <p className="shell__phase">{runtimeDetail}</p>
+        <div className="shell__badges" aria-label="Runtime badges">
+          <span className="shell__badge">Mic {micActive ? 'on' : 'off'}</span>
+          <span className="shell__badge">
+            Voice {startupState.kind === 'ready' && startupState.voiceInputAvailable ? 'ready' : 'limited'}
+          </span>
+        </div>
         {startupState.kind === 'error' ? (
           <p className="shell__error">Startup error: {startupState.message}</p>
         ) : null}
@@ -543,48 +506,6 @@ function App() {
             type="button"
             className="shell__control"
             onClick={() => {
-              void syncRuntimeControl('begin_listening', { fallbackEvent: 'begin_listening' })
-            }}
-            disabled={!canStartListening}
-          >
-            Start listening
-          </button>
-          <button
-            type="button"
-            className="shell__control"
-            onClick={() => {
-              void syncRuntimeControl('record_speech_activity', {
-                args: { nowMs: Date.now() },
-              })
-            }}
-            disabled={!canRecordSpeechActivity}
-          >
-            Record speech activity
-          </button>
-          <button
-            type="button"
-            className="shell__control"
-            onClick={() => {
-              void handleMarkSilence()
-            }}
-            disabled={!canMarkSilence}
-          >
-            Mark silence
-          </button>
-          <button
-            type="button"
-            className="shell__control"
-            onClick={() => {
-              void syncRuntimeControl('mark_result_ready', { fallbackEvent: 'response_ready' })
-            }}
-            disabled={!canMarkResultReady}
-          >
-            Mark result ready
-          </button>
-          <button
-            type="button"
-            className="shell__control"
-            onClick={() => {
               void syncRuntimeControl(
                 'reset_session',
                 {
@@ -597,17 +518,42 @@ function App() {
           >
             Reset to idle
           </button>
-          <button
-            type="button"
-            className="shell__control"
-            onClick={() => {
-              void ingestTestFrame()
-            }}
-            disabled={!canIngestTestFrame}
-          >
-            Ingest test frame
-          </button>
         </div>
+        <details className="shell__manual-controls">
+          <summary>Manual fallback controls</summary>
+          <div className="shell__controls" role="group" aria-label="Manual fallback controls">
+            <button
+              type="button"
+              className="shell__control"
+              onClick={() => {
+                void syncRuntimeControl('begin_listening', { fallbackEvent: 'begin_listening' })
+              }}
+              disabled={!canStartListening}
+            >
+              Start listening
+            </button>
+            <button
+              type="button"
+              className="shell__control"
+              onClick={() => {
+                void handleMarkSilence()
+              }}
+              disabled={!canMarkSilence}
+            >
+              Mark silence
+            </button>
+            <button
+              type="button"
+              className="shell__control"
+              onClick={() => {
+                void syncRuntimeControl('mark_result_ready', { fallbackEvent: 'response_ready' })
+              }}
+              disabled={!canMarkResultReady}
+            >
+              Mark result ready
+            </button>
+          </div>
+        </details>
       </header>
 
       <main className="conversation" aria-live="polite">
@@ -642,6 +588,58 @@ function App() {
 
 function toRuntimeStatus(runtimePhase: BackendRuntimePhase): RuntimeStatus {
   return runtimePhase
+}
+
+function getRuntimeLabel(runtimeStatus: RuntimeStatus): string {
+  switch (runtimeStatus) {
+    case 'initializing':
+      return 'Starting up'
+    case 'sleeping':
+      return 'Waiting'
+    case 'listening':
+      return 'Listening'
+    case 'processing':
+      return 'Transcribing'
+    case 'executing':
+      return 'Running'
+    case 'result_ready':
+      return 'Ready'
+    case 'error':
+      return 'Error'
+  }
+}
+
+function getRuntimeDetail(
+  runtimeStatus: RuntimeStatus,
+  startupState: StartupState,
+  micActive: boolean,
+): string {
+  if (startupState.kind === 'error') {
+    return 'Configuration or startup failed before voice services could begin.'
+  }
+
+  if (startupState.kind === 'ready' && !startupState.voiceInputAvailable) {
+    return 'Typed prompts still work, but local voice input needs the configured wake-word, VAD, and STT assets.'
+  }
+
+  switch (runtimeStatus) {
+    case 'initializing':
+      return 'Loading runtime services and local voice assets.'
+    case 'sleeping':
+      return micActive
+        ? 'Mic is live and waiting for the wake word or manual fallback controls.'
+        : 'Start the mic to listen hands-free, or use typed prompts below.'
+    case 'listening':
+      return 'Speech is being captured. Stop talking and the assistant will transcribe automatically.'
+    case 'processing':
+      return 'The captured voice turn is being transcribed locally before execution.'
+    case 'executing':
+      return 'OpenCode is running the request now.'
+    case 'result_ready':
+      return 'The last result finished successfully. You can speak again or send another typed prompt.'
+    case 'error':
+      return 'The last voice or execution step failed. Reset to idle to recover.'
+  }
 }
 
 export default App
