@@ -4,6 +4,8 @@
 use serde::Serialize;
 use std::sync::Mutex;
 
+mod wake_word;
+
 const DEFAULT_SILENCE_TIMEOUT_MS: u64 = 1_200;
 const DEFAULT_PREROLL_MAX_SAMPLES: usize = 4_000;
 const DEFAULT_UTTERANCE_MAX_SAMPLES: usize = 160_000;
@@ -13,6 +15,7 @@ struct AppState {
     runtime_config: Option<voxgolem_core::config::RuntimeConfig>,
     voice_pipeline_config: voxgolem_core::voice_pipeline::VoicePipelineConfig,
     voice_pipeline_state: Mutex<voxgolem_core::voice_pipeline::VoicePipelineState>,
+    wake_word_runtime: Option<Mutex<wake_word::WakeWordRuntime>>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -200,8 +203,9 @@ fn submit_prompt(
 fn begin_listening(
     app_state: tauri::State<'_, AppState>,
 ) -> Result<RuntimePhaseResponsePayload, String> {
-    apply_voice_pipeline_transition(
+    apply_voice_pipeline_transition_with_wake_word_reset(
         &app_state.voice_pipeline_state,
+        &app_state.wake_word_runtime,
         app_state.voice_pipeline_config,
         voxgolem_core::voice_pipeline::VoicePipelineEvent::WakeWordDetected { now_ms: 0 },
     )?;
@@ -271,8 +275,9 @@ fn mark_result_ready(
 fn reset_session(
     app_state: tauri::State<'_, AppState>,
 ) -> Result<RuntimePhaseResponsePayload, String> {
-    apply_voice_pipeline_transition(
+    apply_voice_pipeline_transition_with_wake_word_reset(
         &app_state.voice_pipeline_state,
+        &app_state.wake_word_runtime,
         app_state.voice_pipeline_config,
         voxgolem_core::voice_pipeline::VoicePipelineEvent::ResetToIdle,
     )?;
@@ -292,12 +297,21 @@ fn ingest_audio_frame(
         .lock()
         .map_err(|_| String::from("voice pipeline lock is poisoned"))?;
 
-    let next_state = voxgolem_core::voice_pipeline::ingest_audio_frame(
+    let wake_word_now_ms = if matches!(
+        guard.session().runtime().phase(),
+        voxgolem_core::runtime::RuntimePhase::Sleeping
+    ) {
+        process_wake_word_frame(&app_state.wake_word_runtime, &frame)?
+    } else {
+        None
+    };
+
+    let next_state = ingest_audio_frame_with_optional_wake_word_detection(
         &guard,
         app_state.voice_pipeline_config,
         frame,
-    )
-    .map_err(|error| format!("voice pipeline frame ingestion failed: {error:?}"))?;
+        wake_word_now_ms,
+    )?;
 
     *guard = next_state;
 
@@ -309,6 +323,15 @@ fn build_app_state() -> AppState {
 
     match voxgolem_core::config::load_runtime_config(None) {
         Ok(config) => {
+            let wake_word_runtime = match wake_word::WakeWordRuntime::new(&config.wake_word_wav) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    return build_startup_error_app_state(
+                        voice_pipeline_config,
+                        format!("failed to initialize wake word detector: {error}"),
+                    );
+                }
+            };
             let voice_pipeline_state = apply_voice_pipeline_event_or_panic(
                 voxgolem_core::voice_pipeline::VoicePipelineState::new(voice_pipeline_config)
                     .expect("voice pipeline should initialize with valid constants"),
@@ -328,27 +351,33 @@ fn build_app_state() -> AppState {
                 runtime_config: Some(config),
                 voice_pipeline_config,
                 voice_pipeline_state: Mutex::new(voice_pipeline_state),
+                wake_word_runtime: Some(Mutex::new(wake_word_runtime)),
             }
         }
-        Err(error) => {
-            let message = error.to_string();
-            let voice_pipeline_state = apply_voice_pipeline_event_or_panic(
-                voxgolem_core::voice_pipeline::VoicePipelineState::new(voice_pipeline_config)
-                    .expect("voice pipeline should initialize with valid constants"),
-                voice_pipeline_config,
-                voxgolem_core::voice_pipeline::VoicePipelineEvent::StartupFailed {
-                    message: message.clone(),
-                },
-                "startup failure should initialize the session to error",
-            );
+        Err(error) => build_startup_error_app_state(voice_pipeline_config, error.to_string()),
+    }
+}
 
-            AppState {
-                startup_state: StartupStatePayload::Error { message },
-                runtime_config: None,
-                voice_pipeline_config,
-                voice_pipeline_state: Mutex::new(voice_pipeline_state),
-            }
-        }
+fn build_startup_error_app_state(
+    voice_pipeline_config: voxgolem_core::voice_pipeline::VoicePipelineConfig,
+    message: String,
+) -> AppState {
+    let voice_pipeline_state = apply_voice_pipeline_event_or_panic(
+        voxgolem_core::voice_pipeline::VoicePipelineState::new(voice_pipeline_config)
+            .expect("voice pipeline should initialize with valid constants"),
+        voice_pipeline_config,
+        voxgolem_core::voice_pipeline::VoicePipelineEvent::StartupFailed {
+            message: message.clone(),
+        },
+        "startup failure should initialize the session to error",
+    );
+
+    AppState {
+        startup_state: StartupStatePayload::Error { message },
+        runtime_config: None,
+        voice_pipeline_config,
+        voice_pipeline_state: Mutex::new(voice_pipeline_state),
+        wake_word_runtime: None,
     }
 }
 
@@ -395,6 +424,66 @@ fn current_runtime_phase_response(
         preroll_samples: guard.capture().preroll_len(),
         utterance_samples: guard.capture().utterance_len(),
     })
+}
+
+fn process_wake_word_frame(
+    wake_word_runtime: &Option<Mutex<wake_word::WakeWordRuntime>>,
+    frame: &[f32],
+) -> Result<Option<u64>, String> {
+    let Some(wake_word_runtime) = wake_word_runtime else {
+        return Ok(None);
+    };
+
+    let mut guard = wake_word_runtime
+        .lock()
+        .map_err(|_| String::from("wake word runtime lock is poisoned"))?;
+
+    Ok(guard.process_sleeping_frame(frame))
+}
+
+fn reset_wake_word_runtime(
+    wake_word_runtime: &Option<Mutex<wake_word::WakeWordRuntime>>,
+) -> Result<(), String> {
+    let Some(wake_word_runtime) = wake_word_runtime else {
+        return Ok(());
+    };
+
+    let mut guard = wake_word_runtime
+        .lock()
+        .map_err(|_| String::from("wake word runtime lock is poisoned"))?;
+    guard.reset();
+    Ok(())
+}
+
+fn ingest_audio_frame_with_optional_wake_word_detection(
+    voice_pipeline_state: &voxgolem_core::voice_pipeline::VoicePipelineState,
+    voice_pipeline_config: voxgolem_core::voice_pipeline::VoicePipelineConfig,
+    frame: Vec<f32>,
+    wake_word_now_ms: Option<u64>,
+) -> Result<voxgolem_core::voice_pipeline::VoicePipelineState, String> {
+    let mut next_state = voxgolem_core::voice_pipeline::ingest_audio_frame(
+        voice_pipeline_state,
+        voice_pipeline_config,
+        frame,
+    )
+    .map_err(|error| format!("voice pipeline frame ingestion failed: {error:?}"))?;
+
+    if matches!(
+        voice_pipeline_state.session().runtime().phase(),
+        voxgolem_core::runtime::RuntimePhase::Sleeping
+    ) {
+        if let Some(now_ms) = wake_word_now_ms {
+            next_state = voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
+                &next_state,
+                voice_pipeline_config,
+                voxgolem_core::voice_pipeline::VoicePipelineEvent::WakeWordDetected { now_ms },
+            )
+            .map_err(|error| format!("wake word transition failed: {error:?}"))?
+            .0;
+        }
+    }
+
+    Ok(next_state)
 }
 
 fn to_runtime_phase_payload(
@@ -455,6 +544,29 @@ fn apply_voice_pipeline_transition(
     .map_err(|error| format!("voice pipeline transition failed: {error:?}"))?;
 
     *guard = next_state;
+    Ok(action)
+}
+
+fn apply_voice_pipeline_transition_with_wake_word_reset(
+    voice_pipeline_state: &Mutex<voxgolem_core::voice_pipeline::VoicePipelineState>,
+    wake_word_runtime: &Option<Mutex<wake_word::WakeWordRuntime>>,
+    voice_pipeline_config: voxgolem_core::voice_pipeline::VoicePipelineConfig,
+    event: voxgolem_core::voice_pipeline::VoicePipelineEvent,
+) -> Result<voxgolem_core::voice_pipeline::VoicePipelineAction, String> {
+    let mut voice_pipeline_guard = voice_pipeline_state
+        .lock()
+        .map_err(|_| String::from("voice pipeline lock is poisoned"))?;
+
+    reset_wake_word_runtime(wake_word_runtime)?;
+
+    let (next_state, action) = voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
+        &voice_pipeline_guard,
+        voice_pipeline_config,
+        event,
+    )
+    .map_err(|error| format!("voice pipeline transition failed: {error:?}"))?;
+
+    *voice_pipeline_guard = next_state;
     Ok(action)
 }
 
@@ -523,11 +635,14 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_status_payload, current_runtime_phase_response, current_silence_deadline,
-        default_voice_pipeline_config, prompt_result_error_message, to_runtime_phase_payload,
+        build_startup_error_app_state, capture_status_payload, current_runtime_phase_response,
+        current_silence_deadline, default_voice_pipeline_config,
+        ingest_audio_frame_with_optional_wake_word_detection, process_wake_word_frame,
+        prompt_result_error_message, reset_wake_word_runtime, to_runtime_phase_payload,
         transcription_ready_samples, AudioFrameStatusPayload, RuntimePhasePayload,
         RuntimePhaseResponsePayload, DEFAULT_SILENCE_TIMEOUT_MS,
     };
+    use crate::wake_word::WakeWordRuntime;
     use std::sync::Mutex;
 
     #[test]
@@ -718,5 +833,81 @@ mod tests {
                 utterance_samples: 0,
             })
         );
+    }
+
+    #[test]
+    fn ingest_audio_frame_can_promote_sleeping_to_listening_when_wake_word_detects() {
+        let voice_pipeline_config = default_voice_pipeline_config();
+        let ready_state = voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
+            &voxgolem_core::voice_pipeline::VoicePipelineState::new(voice_pipeline_config)
+                .expect("voice pipeline should initialize"),
+            voice_pipeline_config,
+            voxgolem_core::voice_pipeline::VoicePipelineEvent::StartupValidated,
+        )
+        .expect("startup validation should succeed")
+        .0;
+        let listening_state = ingest_audio_frame_with_optional_wake_word_detection(
+            &ready_state,
+            voice_pipeline_config,
+            vec![0.1, 0.2, 0.3],
+            Some(100),
+        )
+        .expect("wake word detection should promote sleeping to listening");
+
+        assert_eq!(
+            listening_state.session().runtime().phase(),
+            voxgolem_core::runtime::RuntimePhase::Listening
+        );
+        assert!(listening_state.capture().capturing_utterance());
+        assert_eq!(listening_state.capture().preroll_len(), 3);
+        assert_eq!(listening_state.capture().utterance_len(), 3);
+    }
+
+    #[test]
+    fn process_wake_word_frame_is_a_no_op_without_runtime() {
+        assert_eq!(process_wake_word_frame(&None, &[0.1, 0.2]), Ok(None));
+    }
+
+    #[test]
+    fn reset_wake_word_runtime_is_a_no_op_without_runtime() {
+        assert_eq!(reset_wake_word_runtime(&None), Ok(()));
+    }
+
+    #[test]
+    fn build_startup_error_app_state_tracks_error_runtime_and_no_wake_word_runtime() {
+        let app_state = build_startup_error_app_state(
+            default_voice_pipeline_config(),
+            "wake word init failed".to_string(),
+        );
+
+        assert!(matches!(
+            app_state.startup_state,
+            super::StartupStatePayload::Error { .. }
+        ));
+        assert!(app_state.runtime_config.is_none());
+        assert!(app_state.wake_word_runtime.is_none());
+    }
+
+    #[test]
+    fn wake_word_runtime_can_initialize_from_sample_wav() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let wake_word_path = temp_dir.path().join("wake-word.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer =
+            hound::WavWriter::create(&wake_word_path, spec).expect("wav should be created");
+
+        for _ in 0..(16_000 / 4) {
+            writer
+                .write_sample(0.05_f32)
+                .expect("sample should be written");
+        }
+        writer.finalize().expect("wav should finalize");
+
+        WakeWordRuntime::new(&wake_word_path).expect("wake word runtime should initialize");
     }
 }
