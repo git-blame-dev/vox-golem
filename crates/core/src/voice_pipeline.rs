@@ -63,6 +63,7 @@ pub enum VoicePipelineEvent {
     StartupFailed { message: String },
     RecordSleepingFrame { frame: Vec<f32> },
     WakeWordDetected { now_ms: u64 },
+    SpeechDetected { now_ms: u64 },
     RecordListeningFrame { frame: Vec<f32> },
     SilenceCheck { now_ms: u64 },
     SubmitPrompt,
@@ -146,6 +147,18 @@ pub fn apply_voice_pipeline_event(
                 VoicePipelineAction::StartedListening,
             ))
         }
+        VoicePipelineEvent::SpeechDetected { now_ms } => Ok((
+            VoicePipelineState {
+                session: apply_session_event(
+                    state.session(),
+                    config.session(),
+                    SessionEvent::SpeechDetected { now_ms },
+                )
+                .map_err(VoicePipelineError::Session)?,
+                capture: state.capture.clone(),
+            },
+            VoicePipelineAction::None,
+        )),
         VoicePipelineEvent::RecordListeningFrame { frame } => {
             let mut capture = state.capture.clone();
             capture
@@ -374,6 +387,56 @@ mod tests {
                 .expect("captured utterance should become valid transcription input"),
             }
         );
+    }
+
+    #[test]
+    fn speech_detected_refreshes_activity_and_delays_silence_timeout() {
+        let config = pipeline_config();
+        let (ready_state, _) = apply_voice_pipeline_event(
+            &VoicePipelineState::new(config).expect("pipeline should initialize"),
+            config,
+            VoicePipelineEvent::StartupValidated,
+        )
+        .expect("startup validation should succeed");
+        let (listening_state, _) = apply_voice_pipeline_event(
+            &ready_state,
+            config,
+            VoicePipelineEvent::WakeWordDetected { now_ms: 100 },
+        )
+        .expect("wake word should start listening");
+
+        let (refreshed_state, action) = apply_voice_pipeline_event(
+            &listening_state,
+            config,
+            VoicePipelineEvent::SpeechDetected { now_ms: 450 },
+        )
+        .expect("speech should refresh listening activity");
+
+        assert_eq!(
+            refreshed_state.session().voice_turn().last_activity_ms(),
+            Some(450)
+        );
+        assert_eq!(action, VoicePipelineAction::None);
+
+        let (still_listening_state, action) = apply_voice_pipeline_event(
+            &refreshed_state,
+            config,
+            VoicePipelineEvent::SilenceCheck { now_ms: 1_300 },
+        )
+        .expect("refreshed activity should delay silence timeout");
+
+        assert_eq!(
+            still_listening_state.session().runtime().phase(),
+            RuntimePhase::Listening
+        );
+        assert_eq!(
+            still_listening_state
+                .session()
+                .voice_turn()
+                .last_activity_ms(),
+            Some(450)
+        );
+        assert_eq!(action, VoicePipelineAction::None);
     }
 
     #[test]

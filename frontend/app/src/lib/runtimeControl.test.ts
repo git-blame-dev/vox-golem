@@ -18,6 +18,7 @@ describe('invokeRuntimeControl', () => {
         return {
           runtime_phase: 'listening',
           transcription_ready_samples: null,
+          last_activity_ms: 100,
           capturing_utterance: true,
           preroll_samples: 3,
           utterance_samples: 5,
@@ -28,9 +29,37 @@ describe('invokeRuntimeControl', () => {
     await expect(invokeRuntimeControl('begin_listening')).resolves.toEqual({
       runtimePhase: 'listening',
       transcriptionReadySamples: null,
+      lastActivityMs: 100,
       capturingUtterance: true,
       prerollSamples: 3,
       utteranceSamples: 5,
+    })
+  })
+
+  it('parses speech activity payloads from tauri commands', async () => {
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command, args) => {
+        expect(command).toBe('record_speech_activity')
+        expect(args).toEqual({ nowMs: 101 })
+
+        return {
+          runtime_phase: 'listening',
+          transcription_ready_samples: null,
+          last_activity_ms: 101,
+          capturing_utterance: true,
+          preroll_samples: 4,
+          utterance_samples: 4,
+        }
+      },
+    }
+
+    await expect(invokeRuntimeControl('record_speech_activity', { nowMs: 101 })).resolves.toEqual({
+      runtimePhase: 'listening',
+      transcriptionReadySamples: null,
+      lastActivityMs: 101,
+      capturingUtterance: true,
+      prerollSamples: 4,
+      utteranceSamples: 4,
     })
   })
 
@@ -62,11 +91,28 @@ describe('invokeRuntimeControl', () => {
       invoke: async () => ({
         runtime_phase: 'listening',
         transcription_ready_samples: null,
+        last_activity_ms: 100,
       }),
     }
 
     await expect(invokeRuntimeControl('begin_listening')).rejects.toThrow(
       'Runtime control payload must include capturing_utterance',
+    )
+  })
+
+  it('rejects runtime control payloads missing last activity', async () => {
+    window.__TAURI_INTERNALS__ = {
+      invoke: async () => ({
+        runtime_phase: 'listening',
+        transcription_ready_samples: null,
+        capturing_utterance: true,
+        preroll_samples: 3,
+        utterance_samples: 5,
+      }),
+    }
+
+    await expect(invokeRuntimeControl('begin_listening')).rejects.toThrow(
+      'Runtime control payload must include last_activity_ms',
     )
   })
 })
