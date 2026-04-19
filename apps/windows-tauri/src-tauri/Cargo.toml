@@ -1,5 +1,5 @@
 [package]
-name = "vox-golem-windows"
+name = "vox-golem"
 edition.workspace = true
 publish = false
 build = "build.rs"
@@ -13,7 +13,7 @@ ndarray = "0.17"
 ort = { version = "=2.0.0-rc.12", features = ["ndarray"] }
 rustpotter = "3.0.2"
 serde = { version = "1", features = ["derive"] }
-tauri = { version = "2" }
+tauri = { version = "2", features = [] }
 transcribe-rs = { version = "=0.3.11", features = ["onnx"] }
 voxgolem-audio = { path = "../../../crates/audio" }
 voxgolem-core = { path = "../../../crates/core" }
@@ -21,7 +21,7 @@ voxgolem-model = { path = "../../../crates/model" }
 voxgolem-platform = { path = "../../../crates/platform" }
 
 [build-dependencies]
-tauri-build = { version = "2" }
+tauri-build = { version = "2", features = [] }
 
 [dev-dependencies]
 hound = "3"
