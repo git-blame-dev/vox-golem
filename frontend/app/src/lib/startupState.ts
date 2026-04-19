@@ -2,8 +2,8 @@ import { getTauriInternals } from './tauri'
 import type { BackendRuntimePhase, CueAssetPaths, StartupState } from '../types/chat'
 
 export const DEFAULT_CUE_ASSET_PATHS: CueAssetPaths = {
-  startListening: 'assets/start-listening.mp3',
-  stopListening: 'assets/stop-listening.mp3',
+  startListening: 'resources/start-listening.mp3',
+  stopListening: 'resources/stop-listening.mp3',
 }
 
 export function parseStartupState(payload: unknown): StartupState {
