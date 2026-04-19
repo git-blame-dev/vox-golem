@@ -1,25 +1,17 @@
 import { describe, expect, it, vi } from 'vitest'
 import { playCue } from './audioCues'
+import { DEFAULT_CUE_ASSET_PATHS } from './startupState'
 
-const WINDOWS_CUE_PATH =
-  'C:\\Users\\user\\AppData\\Roaming\\VoxGolem\\assets\\start-listening.mp3'
-const WINDOWS_CUE_FILE_URL =
-  'file:///C:/Users/user/AppData/Roaming/VoxGolem/assets/start-listening.mp3'
+const WINDOWS_CUE_PATH = 'C:\\bundle\\start-listening.mp3'
+const WINDOWS_CUE_FILE_URL = 'file:///C:/bundle/start-listening.mp3'
 
 describe('playCue', () => {
   it('plays the configured start-listening cue', async () => {
     const play = vi.fn(async () => undefined)
 
-    await playCue(
-      'start_listening',
-      {
-        startListening: 'assets/start-listening.mp3',
-        stopListening: 'assets/stop-listening.mp3',
-      },
-      { play },
-    )
+    await playCue('start_listening', DEFAULT_CUE_ASSET_PATHS, { play })
 
-    expect(play).toHaveBeenCalledWith('assets/start-listening.mp3')
+    expect(play).toHaveBeenCalledWith(DEFAULT_CUE_ASSET_PATHS.startListening)
   })
 
   it('fails clearly when a configured cue asset path is missing', async () => {
@@ -29,7 +21,7 @@ describe('playCue', () => {
       playCue(
         'stop_listening',
         {
-          startListening: 'assets/start-listening.mp3',
+          startListening: DEFAULT_CUE_ASSET_PATHS.startListening,
           stopListening: '',
         },
         { play },
@@ -44,7 +36,7 @@ describe('playCue', () => {
       'start_listening',
       {
         startListening: WINDOWS_CUE_PATH,
-        stopListening: 'assets/stop-listening.mp3',
+        stopListening: DEFAULT_CUE_ASSET_PATHS.stopListening,
       },
       { play },
     )
@@ -59,7 +51,7 @@ describe('playCue', () => {
       'start_listening',
       {
         startListening: WINDOWS_CUE_FILE_URL,
-        stopListening: 'assets/stop-listening.mp3',
+        stopListening: DEFAULT_CUE_ASSET_PATHS.stopListening,
       },
       { play },
     )
