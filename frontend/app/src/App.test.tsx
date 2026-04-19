@@ -97,8 +97,8 @@ describe('App', () => {
           return {
             kind: 'ready',
             cue_asset_paths: {
-              start_listening: 'assets/start-listening.mp3',
-              stop_listening: 'assets/stop-listening.mp3',
+              start_listening: 'resources/start-listening.mp3',
+              stop_listening: 'resources/stop-listening.mp3',
             },
             runtime_phase: 'sleeping',
             voice_input_available: true,
@@ -152,8 +152,8 @@ describe('App', () => {
           return {
             kind: 'ready',
             cue_asset_paths: {
-              start_listening: 'assets/start-listening.mp3',
-              stop_listening: 'assets/stop-listening.mp3',
+              start_listening: 'resources/start-listening.mp3',
+              stop_listening: 'resources/stop-listening.mp3',
             },
             runtime_phase: 'sleeping',
             voice_input_available: true,
@@ -195,8 +195,8 @@ describe('App', () => {
           return {
             kind: 'ready',
             cue_asset_paths: {
-              start_listening: 'assets/start-listening.mp3',
-              stop_listening: 'assets/stop-listening.mp3',
+              start_listening: 'resources/start-listening.mp3',
+              stop_listening: 'resources/stop-listening.mp3',
             },
             runtime_phase: 'sleeping',
             voice_input_available: true,
@@ -353,8 +353,8 @@ describe('App', () => {
           return {
             kind: 'ready',
             cue_asset_paths: {
-              start_listening: 'assets/start-listening.mp3',
-              stop_listening: 'assets/stop-listening.mp3',
+              start_listening: 'resources/start-listening.mp3',
+              stop_listening: 'resources/stop-listening.mp3',
             },
             runtime_phase: 'sleeping',
             voice_input_available: true,
@@ -437,8 +437,8 @@ describe('App', () => {
           return {
             kind: 'ready',
             cue_asset_paths: {
-              start_listening: 'assets/start-listening.mp3',
-              stop_listening: 'assets/stop-listening.mp3',
+              start_listening: 'resources/start-listening.mp3',
+              stop_listening: 'resources/stop-listening.mp3',
             },
             runtime_phase: 'sleeping',
             voice_input_available: true,
@@ -533,8 +533,8 @@ describe('App', () => {
           return {
             kind: 'ready',
             cue_asset_paths: {
-              start_listening: 'assets/start-listening.mp3',
-              stop_listening: 'assets/stop-listening.mp3',
+              start_listening: 'resources/start-listening.mp3',
+              stop_listening: 'resources/stop-listening.mp3',
             },
             runtime_phase: 'sleeping',
             voice_input_available: true,
@@ -621,8 +621,8 @@ describe('App', () => {
         return {
           kind: 'ready',
           cue_asset_paths: {
-            start_listening: 'assets/start-listening.mp3',
-            stop_listening: 'assets/stop-listening.mp3',
+            start_listening: 'resources/start-listening.mp3',
+            stop_listening: 'resources/stop-listening.mp3',
           },
           runtime_phase: 'sleeping',
           voice_input_available: true,

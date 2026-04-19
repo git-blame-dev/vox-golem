@@ -25,6 +25,10 @@
   },
   "bundle": {
     "active": true,
+    "resources": [
+      "resources/start-listening.mp3",
+      "resources/stop-listening.mp3"
+    ],
     "targets": "all"
   }
 }

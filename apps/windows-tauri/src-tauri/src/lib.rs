@@ -4,6 +4,7 @@
 use serde::Serialize;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::{path::BaseDirectory, Manager};
 
 mod transcription;
 mod voice_activity;
@@ -346,8 +347,12 @@ fn ingest_audio_frame(
     Ok(runtime_phase_response_from_state(&guard, None, None))
 }
 
-fn build_app_state() -> AppState {
+fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
     let voice_pipeline_config = default_voice_pipeline_config();
+    let cue_asset_paths = match resolve_bundled_cue_asset_paths(app) {
+        Ok(cue_asset_paths) => cue_asset_paths,
+        Err(error) => return build_startup_error_app_state(voice_pipeline_config, error),
+    };
 
     match voxgolem_core::config::load_runtime_config(None) {
         Ok(config) => {
@@ -400,10 +405,7 @@ fn build_app_state() -> AppState {
 
             AppState {
                 startup_state: StartupStatePayload::Ready {
-                    cue_asset_paths: CueAssetPathsPayload {
-                        start_listening: config.start_listening_cue.to_string_lossy().into_owned(),
-                        stop_listening: config.stop_listening_cue.to_string_lossy().into_owned(),
-                    },
+                    cue_asset_paths,
                     runtime_phase: RuntimePhasePayload::Sleeping,
                     voice_input_available,
                     voice_input_error,
@@ -418,6 +420,24 @@ fn build_app_state() -> AppState {
         }
         Err(error) => build_startup_error_app_state(voice_pipeline_config, error.to_string()),
     }
+}
+
+fn resolve_bundled_cue_asset_paths<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<CueAssetPathsPayload, String> {
+    let start_listening = app
+        .path()
+        .resolve("resources/start-listening.mp3", BaseDirectory::Resource)
+        .map_err(|error| format!("failed to resolve bundled start-listening cue: {error}"))?;
+    let stop_listening = app
+        .path()
+        .resolve("resources/stop-listening.mp3", BaseDirectory::Resource)
+        .map_err(|error| format!("failed to resolve bundled stop-listening cue: {error}"))?;
+
+    Ok(CueAssetPathsPayload {
+        start_listening: start_listening.to_string_lossy().into_owned(),
+        stop_listening: stop_listening.to_string_lossy().into_owned(),
+    })
 }
 
 fn build_startup_error_app_state(
@@ -797,20 +817,22 @@ fn build_mark_silence_response(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let app_state = build_app_state();
-    let builder =
-        tauri::Builder::default()
-            .manage(app_state)
-            .invoke_handler(tauri::generate_handler![
-                get_startup_state,
-                submit_prompt,
-                begin_listening,
-                record_speech_activity,
-                ingest_audio_frame,
-                mark_silence,
-                mark_result_ready,
-                reset_session
-            ]);
+    let builder = tauri::Builder::default()
+        .setup(|app| {
+            let app_state = build_app_state(app.handle());
+            app.manage(app_state);
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            get_startup_state,
+            submit_prompt,
+            begin_listening,
+            record_speech_activity,
+            ingest_audio_frame,
+            mark_silence,
+            mark_result_ready,
+            reset_session
+        ]);
 
     if let Err(error) = builder.run(tauri::generate_context!()) {
         eprintln!("failed to run vox-golem tauri shell: {error}");
