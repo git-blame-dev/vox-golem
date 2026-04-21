@@ -10,7 +10,7 @@ mod transcription;
 mod voice_activity;
 mod wake_word;
 
-const DEFAULT_SILENCE_TIMEOUT_MS: u64 = 1_200;
+const DEFAULT_SILENCE_TIMEOUT_MS: u64 = 2_500;
 const DEFAULT_PREROLL_MAX_SAMPLES: usize = 4_000;
 const DEFAULT_UTTERANCE_MAX_SAMPLES: usize = 160_000;
 
@@ -427,16 +427,30 @@ fn resolve_bundled_cue_asset_paths<R: tauri::Runtime>(
 ) -> Result<CueAssetPathsPayload, String> {
     let start_listening = app
         .path()
-        .resolve("resources/start-listening.mp3", BaseDirectory::Resource)
+        .resolve("resources/start-listening.wav", BaseDirectory::Resource)
         .map_err(|error| format!("failed to resolve bundled start-listening cue: {error}"))?;
     let stop_listening = app
         .path()
-        .resolve("resources/stop-listening.mp3", BaseDirectory::Resource)
+        .resolve("resources/stop-listening.wav", BaseDirectory::Resource)
         .map_err(|error| format!("failed to resolve bundled stop-listening cue: {error}"))?;
 
+    if !start_listening.is_file() {
+        return Err(format!(
+            "bundled start-listening cue is missing at {}",
+            start_listening.display()
+        ));
+    }
+
+    if !stop_listening.is_file() {
+        return Err(format!(
+            "bundled stop-listening cue is missing at {}",
+            stop_listening.display()
+        ));
+    }
+
     Ok(CueAssetPathsPayload {
-        start_listening: start_listening.to_string_lossy().into_owned(),
-        stop_listening: stop_listening.to_string_lossy().into_owned(),
+        start_listening: String::from("resources/start-listening.wav"),
+        stop_listening: String::from("resources/stop-listening.wav"),
     })
 }
 

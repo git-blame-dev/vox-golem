@@ -2,8 +2,8 @@ import { describe, expect, it, vi } from 'vitest'
 import { playCue } from './audioCues'
 import { DEFAULT_CUE_ASSET_PATHS } from './startupState'
 
-const WINDOWS_CUE_PATH = 'C:\\bundle\\start-listening.mp3'
-const WINDOWS_CUE_FILE_URL = 'file:///C:/bundle/start-listening.mp3'
+const WINDOWS_CUE_PATH = 'C:\\bundle\\start-listening.wav'
+const WINDOWS_CUE_FILE_URL = 'file:///C:/bundle/start-listening.wav'
 
 describe('playCue', () => {
   it('plays the configured start-listening cue', async () => {
@@ -42,6 +42,28 @@ describe('playCue', () => {
     )
 
     expect(play).toHaveBeenCalledWith(WINDOWS_CUE_FILE_URL)
+  })
+
+  it('uses tauri convertFileSrc when available for local files', async () => {
+    const play = vi.fn(async () => undefined)
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async () => null,
+      convertFileSrc: (filePath) => `asset://localhost/${encodeURIComponent(filePath)}`,
+    }
+
+    await playCue(
+      'start_listening',
+      {
+        startListening: WINDOWS_CUE_PATH,
+        stopListening: DEFAULT_CUE_ASSET_PATHS.stopListening,
+      },
+      { play },
+    )
+
+    expect(play).toHaveBeenCalledWith(
+      `asset://localhost/${encodeURIComponent(WINDOWS_CUE_PATH)}`,
+    )
   })
 
   it('preserves already-url cue sources', async () => {

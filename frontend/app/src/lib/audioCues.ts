@@ -1,4 +1,5 @@
 import type { CueAssetPaths } from '../types/chat'
+import { convertTauriFileSrc } from './tauri'
 
 export type CueType = 'start_listening' | 'stop_listening'
 
@@ -11,7 +12,9 @@ export async function playCue(
   cueAssetPaths: CueAssetPaths,
   cuePlayer: CuePlayer = createBrowserCuePlayer(),
 ): Promise<void> {
-  const source = resolveCuePlaybackSource(resolveCueSource(cueType, cueAssetPaths))
+  const configuredSource = resolveCueSource(cueType, cueAssetPaths)
+  const source = resolveCuePlaybackSource(configuredSource)
+
   await cuePlayer.play(source)
 }
 
@@ -23,10 +26,40 @@ export function createBrowserCuePlayer(): CuePlayer {
       }
 
       const element = new Audio(source)
+
+      element.onerror = () => {
+        console.error('[cue] audio element reported an error', {
+          source,
+          currentSrc: element.currentSrc,
+          networkState: element.networkState,
+          readyState: element.readyState,
+          error: element.error
+            ? {
+                code: element.error.code,
+                message: element.error.message,
+              }
+            : null,
+        })
+      }
+
       const playback = element.play()
 
       if (playback !== undefined) {
-        await playback
+        try {
+          await playback
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+
+          console.error('[cue] audio playback failed', {
+            source,
+            currentSrc: element.currentSrc,
+            networkState: element.networkState,
+            readyState: element.readyState,
+            error,
+          })
+
+          throw new Error(`Audio playback failed for source ${source}: ${message}`)
+        }
       }
     },
   }
@@ -47,16 +80,24 @@ function resolveCueSource(cueType: CueType, cueAssetPaths: CueAssetPaths): strin
 }
 
 function resolveCuePlaybackSource(source: string): string {
+  if (isWindowsAbsolutePath(source) || source.startsWith('/')) {
+    const convertedSource = convertTauriFileSrc(source)
+
+    if (convertedSource !== null) {
+      return convertedSource
+    }
+  }
+
   if (isWindowsAbsolutePath(source)) {
     return `file:///${encodeURI(source.replace(/\\/g, '/'))}`
   }
 
-  if (isUrlLikeSource(source)) {
-    return source
-  }
-
   if (source.startsWith('/')) {
     return `file://${encodeURI(source)}`
+  }
+
+  if (isUrlLikeSource(source)) {
+    return source
   }
 
   return source
