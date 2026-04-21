@@ -612,6 +612,91 @@ describe('App', () => {
     expect(container.textContent).toContain('Mic on')
   })
 
+  it('returns to waiting when mark_silence transcription fails', async () => {
+    const stop = vi.fn()
+    let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
+    const invokedCommands: string[] = []
+    let nowMs = 1_000
+
+    class FakeAudio {
+      play(): Promise<void> {
+        return Promise.resolve()
+      }
+    }
+
+    Date.now = () => nowMs
+    Object.defineProperty(globalThis, 'Audio', {
+      configurable: true,
+      value: FakeAudio,
+    })
+
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      onFrame = options.onFrame
+      return { stop }
+    })
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        invokedCommands.push(command)
+
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: true,
+            voice_input_error: null,
+          }
+        }
+
+        if (command === 'ingest_audio_frame') {
+          return {
+            runtime_phase: 'listening',
+            transcription_ready_samples: null,
+            transcript_text: null,
+            last_activity_ms: 1_000,
+            capturing_utterance: true,
+            preroll_samples: 4,
+            utterance_samples: 4,
+          }
+        }
+
+        if (command === 'mark_silence') {
+          throw 'utterance transcription failed: InvalidTranscript(EmptyText)'
+        }
+
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+
+    await act(async () => {
+      await onFrame?.([0.04, -0.04, 0.04, -0.04])
+      await Promise.resolve()
+    })
+
+    nowMs = 3_600
+
+    await act(async () => {
+      await onFrame?.([0.001, -0.001, 0.001, -0.001])
+      await Promise.resolve()
+    })
+
+    expect(invokedCommands).toEqual([
+      'get_startup_state',
+      'ingest_audio_frame',
+      'ingest_audio_frame',
+      'mark_silence',
+    ])
+    expect(container.textContent).toContain('Runtime control error (mark_silence): utterance transcription failed: InvalidTranscript(EmptyText)')
+    expect(container.textContent).toContain('Status: Waiting')
+    expect(container.textContent).toContain('Mic on')
+  })
+
   it('waits for the stop cue before starting silence processing', async () => {
     const stop = vi.fn()
     let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
