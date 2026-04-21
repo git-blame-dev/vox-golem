@@ -311,7 +311,7 @@ function App() {
     } catch (error) {
       const message = toDisplayErrorMessage(error)
 
-      enterRuntimeError()
+      recoverFromRuntimeControlError(command)
       setMessages((currentMessages) => [
         ...currentMessages,
         {
@@ -322,6 +322,17 @@ function App() {
       ])
       return null
     }
+  }
+
+  const recoverFromRuntimeControlError = (
+    command: 'begin_listening' | 'record_speech_activity' | 'mark_silence' | 'mark_result_ready' | 'reset_session',
+  ): void => {
+    if (command === 'mark_silence') {
+      applyRuntimeStatus('sleeping')
+      return
+    }
+
+    enterRuntimeError()
   }
 
   const runPrompt = async (
