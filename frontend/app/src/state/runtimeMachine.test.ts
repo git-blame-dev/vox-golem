@@ -36,11 +36,8 @@ describe('cueForTransition', () => {
     expect(cueForTransition('sleeping', 'listening')).toBe('start_listening')
   })
 
-  it('requests stop-listening cue for listening to processing', () => {
-    expect(cueForTransition('listening', 'processing')).toBe('stop_listening')
-  })
-
   it('does not request a cue for unrelated transitions', () => {
+    expect(cueForTransition('listening', 'processing')).toBe(null)
     expect(cueForTransition('processing', 'result_ready')).toBe(null)
   })
 })

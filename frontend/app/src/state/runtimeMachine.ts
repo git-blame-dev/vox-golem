@@ -48,9 +48,5 @@ export function cueForTransition(
     return 'start_listening'
   }
 
-  if (previous === 'listening' && next === 'processing') {
-    return 'stop_listening'
-  }
-
   return null
 }
