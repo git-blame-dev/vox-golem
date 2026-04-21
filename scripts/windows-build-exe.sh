@@ -122,6 +122,10 @@ if errorlevel 1 (
 
 cd /d "%TAURI_DIR%"
 
+echo [windows-build-exe] stopping running VoxGolem executables
+powershell.exe -NoProfile -NonInteractive -Command ^
+  "\$stopped = \$false; \$names = @('vox-golem', 'vox-golem-windows'); foreach (\$name in \$names) { \$procs = Get-Process -Name \$name -ErrorAction SilentlyContinue; if (\$null -ne \$procs) { \$procs | Stop-Process -Force -ErrorAction SilentlyContinue; \$stopped = \$true } }; if (\$stopped) { Start-Sleep -Seconds 1 }" >nul
+
 echo [windows-build-exe] cargo tauri build --no-bundle
 "%CARGO_TAURI_EXE%" build --config "%TAURI_BUILD_CONFIG%" --no-bundle
 if errorlevel 1 exit /b 1
