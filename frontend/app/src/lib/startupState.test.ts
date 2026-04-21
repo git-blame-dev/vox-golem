@@ -11,8 +11,8 @@ describe('parseStartupState', () => {
       parseStartupState({
         kind: 'ready',
         cue_asset_paths: {
-          start_listening: 'resources/start-listening.mp3',
-          stop_listening: 'resources/stop-listening.mp3',
+          start_listening: 'resources/start-listening.wav',
+          stop_listening: 'resources/stop-listening.wav',
         },
         runtime_phase: 'sleeping',
         voice_input_available: true,
@@ -20,7 +20,10 @@ describe('parseStartupState', () => {
       }),
     ).toEqual({
       kind: 'ready',
-      cueAssetPaths: DEFAULT_CUE_ASSET_PATHS,
+      cueAssetPaths: {
+        startListening: 'resources/start-listening.wav',
+        stopListening: 'resources/stop-listening.wav',
+      },
       runtimePhase: 'sleeping',
       voiceInputAvailable: true,
       voiceInputError: null,
