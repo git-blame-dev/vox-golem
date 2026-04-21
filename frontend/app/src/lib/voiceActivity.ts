@@ -1,6 +1,6 @@
 import type { RuntimeStatus } from '../types/chat'
 
-const SILENCE_TIMEOUT_MS = 1_200
+const SILENCE_TIMEOUT_MS = 2_500
 
 export interface VoiceActivityState {
   readonly lastActivityMs: number | null
