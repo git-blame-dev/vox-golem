@@ -133,6 +133,28 @@ function App() {
   const runtimeLabel = getRuntimeLabel(runtimeStatus)
   const runtimeDetail = getRuntimeDetail(runtimeStatus, startupState, micActive, autoStopOnSilence)
 
+  const reportCuePlaybackError = (cueType: 'start_listening' | 'stop_listening', error: unknown): void => {
+    const message = error instanceof Error ? error.message : 'Unknown cue playback error'
+
+    console.error('[cue] playback failure', {
+      cueType,
+      cueAssetPaths,
+      runtimeStatus: runtimeStatusRef.current,
+      error,
+    })
+
+    setMessages((currentMessages) => [
+      ...currentMessages,
+      {
+        id: `system-cue-error-${Date.now()}`,
+        role: 'system',
+        content:
+          `Cue playback error: ${message} ` +
+          `[cue=${cueType}, startCue=${cueAssetPaths.startListening}, stopCue=${cueAssetPaths.stopListening}]`,
+      },
+    ])
+  }
+
   const applyTransition = (
     previousStatus: RuntimeStatus,
     event: Parameters<typeof transitionRuntimeStatus>[1],
@@ -154,8 +176,6 @@ function App() {
 
     if (cueType !== null) {
       void playCue(cueType, cueAssetPaths).catch((error: unknown) => {
-        const message = error instanceof Error ? error.message : 'Unknown cue playback error'
-
         console.error('[cue] playback failure during transition', {
           cueType,
           cueAssetPaths,
@@ -165,16 +185,7 @@ function App() {
         })
 
         applyTransition(nextStatus, 'fail')
-        setMessages((currentMessages) => [
-          ...currentMessages,
-          {
-            id: `system-cue-error-${Date.now()}`,
-            role: 'system',
-            content:
-              `Cue playback error: ${message} ` +
-              `[cue=${cueType}, startCue=${cueAssetPaths.startListening}, stopCue=${cueAssetPaths.stopListening}]`,
-          },
-        ])
+        reportCuePlaybackError(cueType, error)
       })
     }
 
@@ -199,8 +210,6 @@ function App() {
 
     if (cueType !== null) {
       void playCue(cueType, cueAssetPaths).catch((error: unknown) => {
-        const message = error instanceof Error ? error.message : 'Unknown cue playback error'
-
         console.error('[cue] playback failure while applying runtime status', {
           cueType,
           cueAssetPaths,
@@ -210,16 +219,7 @@ function App() {
         })
 
         enterRuntimeError()
-        setMessages((currentMessages) => [
-          ...currentMessages,
-          {
-            id: `system-cue-error-${Date.now()}`,
-            role: 'system',
-            content:
-              `Cue playback error: ${message} ` +
-              `[cue=${cueType}, startCue=${cueAssetPaths.startListening}, stopCue=${cueAssetPaths.stopListening}]`,
-          },
-        ])
+        reportCuePlaybackError(cueType, error)
       })
     }
 
@@ -397,6 +397,12 @@ function App() {
   }
 
   const handleMarkSilence = async (): Promise<void> => {
+    try {
+      await playCue('stop_listening', cueAssetPaths)
+    } catch (error) {
+      reportCuePlaybackError('stop_listening', error)
+    }
+
     const runtimePhase = await syncRuntimeControl('mark_silence', {
       fallbackEvent: 'end_listening',
     })
