@@ -1,9 +1,9 @@
-import { getTauriInternals } from './tauri'
+import { hasInjectedTauriInternals, invokeTauriCommand } from './tauri'
 import type { BackendRuntimePhase, CueAssetPaths, StartupState } from '../types/chat'
 
 export const DEFAULT_CUE_ASSET_PATHS: CueAssetPaths = {
-  startListening: 'resources/start-listening.mp3',
-  stopListening: 'resources/stop-listening.mp3',
+  startListening: 'resources/start-listening.wav',
+  stopListening: 'resources/stop-listening.wav',
 }
 
 export function parseStartupState(payload: unknown): StartupState {
@@ -50,36 +50,37 @@ export function parseStartupState(payload: unknown): StartupState {
 
 export async function loadStartupState(): Promise<StartupState> {
   if (typeof window === 'undefined') {
-      return {
-        kind: 'ready',
-        cueAssetPaths: DEFAULT_CUE_ASSET_PATHS,
-        runtimePhase: 'sleeping',
-        voiceInputAvailable: true,
-        voiceInputError: null,
-      }
-  }
-
-  const tauriInternals = getTauriInternals()
-
-  if (tauriInternals === null) {
-      return {
-        kind: 'ready',
-        cueAssetPaths: DEFAULT_CUE_ASSET_PATHS,
-        runtimePhase: 'sleeping',
-        voiceInputAvailable: true,
-        voiceInputError: null,
-      }
+    return buildDefaultStartupState()
   }
 
   try {
-    const payload = await tauriInternals.invoke('get_startup_state')
+    const payload = await invokeTauriCommand('get_startup_state')
     return parseStartupState(payload)
   } catch (error) {
+    console.error('[startup] failed to load startup state', {
+      error,
+      hasInjectedTauriInternals: hasInjectedTauriInternals(),
+    })
+
+    if (!hasInjectedTauriInternals()) {
+      return buildDefaultStartupState()
+    }
+
     const message = error instanceof Error ? error.message : 'Failed to load startup state'
     return {
       kind: 'error',
       message,
     }
+  }
+}
+
+function buildDefaultStartupState(): StartupState {
+  return {
+    kind: 'ready',
+    cueAssetPaths: DEFAULT_CUE_ASSET_PATHS,
+    runtimePhase: 'sleeping',
+    voiceInputAvailable: true,
+    voiceInputError: null,
   }
 }
 
@@ -97,10 +98,6 @@ function parseRuntimePhase(payload: unknown): BackendRuntimePhase {
   }
 
   throw new Error('Startup ready payload must include a supported runtime phase')
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null
 }
 
 function parseCueAssetPaths(payload: unknown): CueAssetPaths {
@@ -123,4 +120,8 @@ function parseCueAssetPaths(payload: unknown): CueAssetPaths {
     startListening,
     stopListening,
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
 }

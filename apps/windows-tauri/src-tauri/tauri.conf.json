@@ -20,14 +20,20 @@
       }
     ],
     "security": {
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$RESOURCE/**"
+        ]
+      },
       "csp": null
     }
   },
   "bundle": {
     "active": true,
     "resources": [
-      "resources/start-listening.mp3",
-      "resources/stop-listening.mp3"
+      "resources/start-listening.wav",
+      "resources/stop-listening.wav"
     ],
     "targets": "all"
   }
