@@ -612,6 +612,127 @@ describe('App', () => {
     expect(container.textContent).toContain('Mic on')
   })
 
+  it('waits for the stop cue before starting silence processing', async () => {
+    const stop = vi.fn()
+    let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
+    const invokedCommands: string[] = []
+    let nowMs = 1_000
+    let hasPendingStopCue = false
+    let resolveStopCue: () => void = () => {
+      throw new Error('stop cue was not pending')
+    }
+
+    class FakeAudio {
+      source: string
+
+      constructor(source: string) {
+        this.source = source
+      }
+
+      play(): Promise<void> {
+        if (this.source === 'resources/stop-listening.wav') {
+          return new Promise<void>((resolve) => {
+            hasPendingStopCue = true
+            resolveStopCue = resolve
+          })
+        }
+
+        return Promise.resolve()
+      }
+    }
+
+    Date.now = () => nowMs
+    Object.defineProperty(globalThis, 'Audio', {
+      configurable: true,
+      value: FakeAudio,
+    })
+
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      onFrame = options.onFrame
+      return { stop }
+    })
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        invokedCommands.push(command)
+
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: true,
+            voice_input_error: null,
+          }
+        }
+
+        if (command === 'ingest_audio_frame') {
+          return {
+            runtime_phase: 'listening',
+            transcription_ready_samples: null,
+            transcript_text: null,
+            last_activity_ms: 1_000,
+            capturing_utterance: true,
+            preroll_samples: 4,
+            utterance_samples: 4,
+          }
+        }
+
+        expect(command).toBe('mark_silence')
+
+        return {
+          runtime_phase: 'processing',
+          transcription_ready_samples: 3200,
+          transcript_text: null,
+          last_activity_ms: null,
+          capturing_utterance: false,
+          preroll_samples: 4,
+          utterance_samples: 0,
+        }
+      },
+    }
+
+    await renderApp()
+
+    await act(async () => {
+      await onFrame?.([0.04, -0.04, 0.04, -0.04])
+      await Promise.resolve()
+    })
+
+    nowMs = 3_600
+
+    let pendingFrame: Promise<void> | void
+    await act(async () => {
+      pendingFrame = onFrame?.([0.001, -0.001, 0.001, -0.001])
+      await Promise.resolve()
+    })
+
+    expect(invokedCommands).toEqual([
+      'get_startup_state',
+      'ingest_audio_frame',
+      'ingest_audio_frame',
+    ])
+
+    if (hasPendingStopCue) {
+      resolveStopCue()
+    }
+
+    await act(async () => {
+      await pendingFrame
+      await Promise.resolve()
+    })
+
+    expect(invokedCommands).toEqual([
+      'get_startup_state',
+      'ingest_audio_frame',
+      'ingest_audio_frame',
+      'mark_silence',
+    ])
+  })
+
   it('shows microphone capture errors without changing the backend contract', async () => {
     startLiveAudioSourceMock.mockRejectedValue(new Error('Permission denied'))
 
