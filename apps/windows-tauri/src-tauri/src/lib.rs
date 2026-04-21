@@ -251,11 +251,25 @@ fn mark_silence(
             now_ms: silence_deadline,
         },
     )?;
+
+    let transcript_text = match transcribe_finished_utterance(&action, &app_state.parakeet_runtime) {
+        Ok(transcript_text) => transcript_text,
+        Err(error) => {
+            reset_voice_pipeline_to_waiting(
+                &app_state.voice_pipeline_state,
+                &app_state.wake_word_runtime,
+                &app_state.voice_activity_runtime,
+                app_state.voice_pipeline_config,
+            )?;
+
+            return Err(error);
+        }
+    };
+
     build_mark_silence_response(
         &app_state.voice_pipeline_state,
-        app_state.voice_pipeline_config,
         &action,
-        transcribe_finished_utterance(&action, &app_state.parakeet_runtime),
+        transcript_text,
     )
 }
 
@@ -803,30 +817,31 @@ fn transcribe_finished_utterance(
 
 fn build_mark_silence_response(
     voice_pipeline_state: &Mutex<voxgolem_core::voice_pipeline::VoicePipelineState>,
-    voice_pipeline_config: voxgolem_core::voice_pipeline::VoicePipelineConfig,
     action: &voxgolem_core::voice_pipeline::VoicePipelineAction,
-    transcript_text: Result<Option<String>, String>,
+    transcript_text: Option<String>,
 ) -> Result<RuntimePhaseResponsePayload, String> {
-    let transcript_text = match transcript_text {
-        Ok(transcript_text) => transcript_text,
-        Err(error) => {
-            apply_voice_pipeline_transition(
-                voice_pipeline_state,
-                voice_pipeline_config,
-                voxgolem_core::voice_pipeline::VoicePipelineEvent::PromptFailed {
-                    message: error.clone(),
-                },
-            )?;
-
-            return Err(error);
-        }
-    };
-
     current_runtime_phase_response(
         voice_pipeline_state,
         transcription_ready_samples(action),
         transcript_text,
     )
+}
+
+fn reset_voice_pipeline_to_waiting(
+    voice_pipeline_state: &Mutex<voxgolem_core::voice_pipeline::VoicePipelineState>,
+    wake_word_runtime: &Option<Mutex<wake_word::WakeWordRuntime>>,
+    voice_activity_runtime: &Option<Mutex<voice_activity::VoiceActivityRuntime>>,
+    voice_pipeline_config: voxgolem_core::voice_pipeline::VoicePipelineConfig,
+) -> Result<(), String> {
+    apply_voice_pipeline_transition_with_input_runtime_reset(
+        voice_pipeline_state,
+        wake_word_runtime,
+        voice_activity_runtime,
+        voice_pipeline_config,
+        voxgolem_core::voice_pipeline::VoicePipelineEvent::ResetToIdle,
+    )?;
+
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -860,8 +875,9 @@ mod tests {
         apply_optional_speech_activity, build_mark_silence_response, build_startup_error_app_state,
         current_runtime_phase_response, current_silence_deadline, default_voice_pipeline_config,
         ingest_audio_frame_with_optional_wake_word_detection, process_wake_word_frame,
-        prompt_result_error_message, reset_wake_word_runtime, runtime_phase_response_from_state,
-        to_runtime_phase_payload, transcribe_finished_utterance, transcription_ready_samples,
+        prompt_result_error_message, reset_voice_pipeline_to_waiting, reset_wake_word_runtime,
+        runtime_phase_response_from_state, to_runtime_phase_payload, transcribe_finished_utterance,
+        transcription_ready_samples,
         RuntimePhasePayload, RuntimePhaseResponsePayload, DEFAULT_SILENCE_TIMEOUT_MS,
     };
     use crate::wake_word::WakeWordRuntime;
@@ -1153,9 +1169,8 @@ mod tests {
         assert_eq!(
             build_mark_silence_response(
                 &locked_state,
-                voice_pipeline_config,
                 &action,
-                Ok(Some("draft release notes".to_string())),
+                Some("draft release notes".to_string()),
             ),
             Ok(RuntimePhaseResponsePayload {
                 runtime_phase: RuntimePhasePayload::Processing,
@@ -1170,7 +1185,7 @@ mod tests {
     }
 
     #[test]
-    fn build_mark_silence_response_forces_runtime_error_on_transcription_failure() {
+    fn reset_voice_pipeline_to_waiting_returns_runtime_to_sleeping() {
         let voice_pipeline_config = default_voice_pipeline_config();
         let processing_state = voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
             &voxgolem_core::voice_pipeline::VoicePipelineState::new(voice_pipeline_config)
@@ -1201,28 +1216,14 @@ mod tests {
         .expect("silence should move runtime to processing")
         .0;
         let locked_state = Mutex::new(processing_state);
-        let action = voxgolem_core::voice_pipeline::VoicePipelineAction::FinishedUtterance {
-            transcription_input: voxgolem_model::parakeet::ParakeetTranscriptionInput::new(
-                voxgolem_model::parakeet::PARAKEET_SAMPLE_RATE_HZ,
-                vec![0.1, 0.2, 0.3],
-            )
-            .expect("valid transcription input"),
-        };
 
-        assert_eq!(
-            build_mark_silence_response(
-                &locked_state,
-                voice_pipeline_config,
-                &action,
-                Err(String::from("parakeet runtime is not ready")),
-            ),
-            Err(String::from("parakeet runtime is not ready"))
-        );
+        reset_voice_pipeline_to_waiting(&locked_state, &None, &None, voice_pipeline_config)
+            .expect("reset to waiting should succeed");
         assert_eq!(
             current_runtime_phase_response(&locked_state, None, None)
                 .expect("runtime snapshot should succeed")
                 .runtime_phase,
-            RuntimePhasePayload::Error
+            RuntimePhasePayload::Sleeping
         );
     }
 
