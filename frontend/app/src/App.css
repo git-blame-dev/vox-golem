@@ -76,6 +76,19 @@
   margin-top: 0.85rem;
 }
 
+.shell__toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin-top: 0.8rem;
+  color: #2f4a66;
+  font-size: 0.85rem;
+}
+
+.shell__toggle input {
+  margin: 0;
+}
+
 .shell__manual-controls summary {
   cursor: pointer;
   color: #2f4a66;

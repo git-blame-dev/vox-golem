@@ -97,8 +97,8 @@ describe('App', () => {
           return {
             kind: 'ready',
             cue_asset_paths: {
-              start_listening: 'resources/start-listening.mp3',
-              stop_listening: 'resources/stop-listening.mp3',
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
             },
             runtime_phase: 'sleeping',
             voice_input_available: true,
@@ -152,8 +152,8 @@ describe('App', () => {
           return {
             kind: 'ready',
             cue_asset_paths: {
-              start_listening: 'resources/start-listening.mp3',
-              stop_listening: 'resources/stop-listening.mp3',
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
             },
             runtime_phase: 'sleeping',
             voice_input_available: true,
@@ -195,8 +195,8 @@ describe('App', () => {
           return {
             kind: 'ready',
             cue_asset_paths: {
-              start_listening: 'resources/start-listening.mp3',
-              stop_listening: 'resources/stop-listening.mp3',
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
             },
             runtime_phase: 'sleeping',
             voice_input_available: true,
@@ -327,13 +327,17 @@ describe('App', () => {
       'Speech is being captured. Stop talking and the assistant will transcribe automatically.',
     )
 
-    const markSilenceButton = getControlButton(container, 'Mark silence')
+    const stopListeningButton = getControlButton(container, 'Stop listening and process')
 
     await act(async () => {
-      markSilenceButton.click()
+      stopListeningButton.click()
       await Promise.resolve()
     })
 
+    expect(playedSources).toEqual([
+      'test-assets/configured-start.mp3',
+      'test-assets/configured-stop.mp3',
+    ])
     expect(container.textContent).toContain('Status: Transcribing')
     expect(container.textContent).toContain('transcription_ready:\n3200 samples captured')
   })
@@ -353,8 +357,8 @@ describe('App', () => {
           return {
             kind: 'ready',
             cue_asset_paths: {
-              start_listening: 'resources/start-listening.mp3',
-              stop_listening: 'resources/stop-listening.mp3',
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
             },
             runtime_phase: 'sleeping',
             voice_input_available: true,
@@ -378,12 +382,6 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    const startMicButton = getControlButton(container, 'Start mic')
-
-    await act(async () => {
-      startMicButton.click()
-      await Promise.resolve()
-    })
 
     expect(startLiveAudioSourceMock).toHaveBeenCalledTimes(1)
     expect(container.textContent).toContain('live_audio:\ndefault microphone started')
@@ -437,8 +435,8 @@ describe('App', () => {
           return {
             kind: 'ready',
             cue_asset_paths: {
-              start_listening: 'resources/start-listening.mp3',
-              stop_listening: 'resources/stop-listening.mp3',
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
             },
             runtime_phase: 'sleeping',
             voice_input_available: true,
@@ -473,19 +471,13 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    const startMicButton = getControlButton(container, 'Start mic')
-
-    await act(async () => {
-      startMicButton.click()
-      await Promise.resolve()
-    })
 
     await act(async () => {
       await onFrame?.([0.04, -0.04, 0.04, -0.04])
       await Promise.resolve()
     })
 
-    nowMs = 2_300
+    nowMs = 3_600
 
     await act(async () => {
       await onFrame?.([0.001, -0.001, 0.001, -0.001])
@@ -502,7 +494,7 @@ describe('App', () => {
     expect(container.textContent).toContain('transcription_ready:\n3200 samples captured')
   })
 
-  it('submits the transcribed voice prompt after silence', async () => {
+  it('submits the transcribed voice prompt after silence and returns to wake-word waiting', async () => {
     const stop = vi.fn()
     let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
     const invokedCommands: string[] = []
@@ -533,8 +525,8 @@ describe('App', () => {
           return {
             kind: 'ready',
             cue_asset_paths: {
-              start_listening: 'resources/start-listening.mp3',
-              stop_listening: 'resources/stop-listening.mp3',
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
             },
             runtime_phase: 'sleeping',
             voice_input_available: true,
@@ -566,32 +558,39 @@ describe('App', () => {
           }
         }
 
-        expect(command).toBe('submit_prompt')
-        expect(args).toEqual({ prompt: 'Open the pull request' })
+        if (command === 'submit_prompt') {
+          expect(args).toEqual({ prompt: 'Open the pull request' })
+
+          return {
+            events: [{ kind: 'text', text: 'Voice execution response' }],
+            stderr: '',
+            exit_code: 0,
+            runtime_phase: 'result_ready',
+          }
+        }
+
+        expect(command).toBe('reset_session')
 
         return {
-          events: [{ kind: 'text', text: 'Voice execution response' }],
-          stderr: '',
-          exit_code: 0,
-          runtime_phase: 'result_ready',
+          runtime_phase: 'sleeping',
+          transcription_ready_samples: null,
+          transcript_text: null,
+          last_activity_ms: null,
+          capturing_utterance: false,
+          preroll_samples: 4,
+          utterance_samples: 0,
         }
       },
     }
 
     const { container } = await renderApp()
-    const startMicButton = getControlButton(container, 'Start mic')
-
-    await act(async () => {
-      startMicButton.click()
-      await Promise.resolve()
-    })
 
     await act(async () => {
       await onFrame?.([0.04, -0.04, 0.04, -0.04])
       await Promise.resolve()
     })
 
-    nowMs = 2_300
+    nowMs = 3_600
 
     await act(async () => {
       await onFrame?.([0.001, -0.001, 0.001, -0.001])
@@ -604,11 +603,13 @@ describe('App', () => {
       'ingest_audio_frame',
       'mark_silence',
       'submit_prompt',
+      'reset_session',
     ])
     expect(container.textContent).toContain('transcript:\nOpen the pull request')
     expect(container.textContent).toContain('Open the pull request')
     expect(container.textContent).toContain('Voice execution response')
-    expect(container.textContent).toContain('Status: Ready')
+    expect(container.textContent).toContain('Status: Waiting')
+    expect(container.textContent).toContain('Mic on')
   })
 
   it('shows microphone capture errors without changing the backend contract', async () => {
@@ -621,8 +622,8 @@ describe('App', () => {
         return {
           kind: 'ready',
           cue_asset_paths: {
-            start_listening: 'resources/start-listening.mp3',
-            stop_listening: 'resources/stop-listening.mp3',
+            start_listening: 'resources/start-listening.wav',
+            stop_listening: 'resources/stop-listening.wav',
           },
           runtime_phase: 'sleeping',
           voice_input_available: true,
@@ -632,15 +633,162 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    const startMicButton = getControlButton(container, 'Start mic')
-
-    await act(async () => {
-      startMicButton.click()
-      await Promise.resolve()
-    })
 
     expect(container.textContent).toContain('live_audio_error:\nPermission denied')
     expect(container.textContent).toContain('Start mic')
+  })
+
+  it('auto-starts microphone capture when voice input is ready', async () => {
+    const stop = vi.fn()
+
+    startLiveAudioSourceMock.mockResolvedValue({ stop })
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        expect(command).toBe('get_startup_state')
+
+        return {
+          kind: 'ready',
+          cue_asset_paths: {
+            start_listening: 'resources/start-listening.wav',
+            stop_listening: 'resources/stop-listening.wav',
+          },
+          runtime_phase: 'sleeping',
+          voice_input_available: true,
+          voice_input_error: null,
+        }
+      },
+    }
+
+    const { container } = await renderApp()
+
+    expect(startLiveAudioSourceMock).toHaveBeenCalledTimes(1)
+    expect(container.textContent).toContain('live_audio:\ndefault microphone started')
+    expect(getControlButton(container, 'Start listening').disabled).toBe(true)
+  })
+
+  it('does not auto-stop on silence when the toggle is disabled', async () => {
+    const stop = vi.fn()
+    let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
+    const invokedCommands: string[] = []
+    let nowMs = 1_000
+
+    class FakeAudio {
+      play(): Promise<void> {
+        return Promise.resolve()
+      }
+    }
+
+    Date.now = () => nowMs
+    Object.defineProperty(globalThis, 'Audio', {
+      configurable: true,
+      value: FakeAudio,
+    })
+
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      onFrame = options.onFrame
+      return { stop }
+    })
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        invokedCommands.push(command)
+
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: true,
+            voice_input_error: null,
+          }
+        }
+
+        if (command === 'ingest_audio_frame') {
+          return {
+            runtime_phase: 'listening',
+            transcription_ready_samples: null,
+            transcript_text: null,
+            last_activity_ms: 1_000,
+            capturing_utterance: true,
+            preroll_samples: 4,
+            utterance_samples: 4,
+          }
+        }
+
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+
+    await act(async () => {
+      getAutoStopToggle(container).click()
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      await onFrame?.([0.04, -0.04, 0.04, -0.04])
+      await Promise.resolve()
+    })
+
+    nowMs = 3_600
+
+    await act(async () => {
+      await onFrame?.([0.001, -0.001, 0.001, -0.001])
+      await Promise.resolve()
+    })
+
+    expect(invokedCommands).toEqual([
+      'get_startup_state',
+      'ingest_audio_frame',
+      'ingest_audio_frame',
+    ])
+    expect(container.textContent).toContain('Status: Listening')
+    expect(container.textContent).toContain(
+      'Speech is being captured. Use Stop listening and process when you are done talking.',
+    )
+  })
+
+  it('surfaces raw runtime control rejection messages', async () => {
+    startLiveAudioSourceMock.mockRejectedValue(new Error('Permission denied'))
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: true,
+            voice_input_error: null,
+          }
+        }
+
+        if (command === 'begin_listening') {
+          throw 'invalid transition: begin_listening from listening'
+        }
+
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+
+    await act(async () => {
+      getControlButton(container, 'Start listening').click()
+      await Promise.resolve()
+    })
+
+    expect(container.textContent).toContain(
+      'Runtime control error (begin_listening): invalid transition: begin_listening from listening',
+    )
   })
 })
 
@@ -655,9 +803,11 @@ async function renderApp(): Promise<{ container: HTMLElement }> {
     root.render(<App />)
   })
 
-  await act(async () => {
-    await Promise.resolve()
-  })
+  for (let index = 0; index < 5; index += 1) {
+    await act(async () => {
+      await Promise.resolve()
+    })
+  }
 
   return { container }
 }
@@ -687,8 +837,8 @@ function getControlButton(
   label:
     | 'Start mic'
     | 'Stop mic'
+    | 'Stop listening and process'
     | 'Start listening'
-    | 'Mark silence'
     | 'Mark result ready'
     | 'Reset to idle',
 ): HTMLButtonElement {
@@ -700,6 +850,16 @@ function getControlButton(
   }
 
   return button
+}
+
+function getAutoStopToggle(container: HTMLElement): HTMLInputElement {
+  const toggle = container.querySelector<HTMLInputElement>('input[type="checkbox"]')
+
+  if (toggle === null) {
+    throw new Error('Missing auto stop on silence toggle')
+  }
+
+  return toggle
 }
 
 function setTextAreaValue(textArea: HTMLTextAreaElement, value: string): void {

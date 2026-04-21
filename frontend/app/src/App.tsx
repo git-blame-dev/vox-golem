@@ -32,6 +32,7 @@ function App() {
   const [startupState, setStartupState] = useState<StartupState>({ kind: 'loading' })
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus>('initializing')
   const [composerValue, setComposerValue] = useState('')
+  const [autoStopOnSilence, setAutoStopOnSilence] = useState(true)
   const [micStarting, setMicStarting] = useState(false)
   const [micActive, setMicActive] = useState(false)
   const [messages, setMessages] = useState<readonly ChatMessage[]>(() =>
@@ -39,6 +40,8 @@ function App() {
   )
   const liveAudioSourceRef = useRef<LiveAudioSource | null>(null)
   const appActiveRef = useRef(true)
+  const autoStopOnSilenceRef = useRef(true)
+  const micAutoStartedRef = useRef(false)
   const runtimeStatusRef = useRef<RuntimeStatus>('initializing')
   const startupStateRef = useRef<StartupState>({ kind: 'loading' })
   const voiceActivityStateRef = useRef(createVoiceActivityState())
@@ -55,6 +58,31 @@ function App() {
       setStartupState(nextState)
       runtimeStatusRef.current = nextState.kind === 'ready' ? toRuntimeStatus(nextState.runtimePhase) : 'error'
       setRuntimeStatus(nextState.kind === 'ready' ? toRuntimeStatus(nextState.runtimePhase) : 'error')
+
+      if (nextState.kind === 'ready') {
+        setMessages((currentMessages) => [
+          ...currentMessages,
+          {
+            id: `system-startup-ready-${Date.now()}`,
+            role: 'system',
+            content:
+              `Startup ready: runtime=${nextState.runtimePhase}, ` +
+              `startCue=${nextState.cueAssetPaths.startListening}, ` +
+              `stopCue=${nextState.cueAssetPaths.stopListening}`,
+          },
+        ])
+      }
+
+      if (nextState.kind === 'error') {
+        setMessages((currentMessages) => [
+          ...currentMessages,
+          {
+            id: `system-startup-error-${Date.now()}`,
+            role: 'system',
+            content: `Startup error: ${nextState.message}`,
+          },
+        ])
+      }
     })
 
     return () => {
@@ -81,6 +109,7 @@ function App() {
   const canStartListening =
     startupState.kind === 'ready' &&
     startupState.voiceInputAvailable &&
+    !micActive &&
     (runtimeStatus === 'sleeping' || runtimeStatus === 'result_ready')
   const canMarkSilence =
     startupState.kind === 'ready' && startupState.voiceInputAvailable && runtimeStatus === 'listening'
@@ -96,8 +125,13 @@ function App() {
     startupState.kind === 'ready'
       ? startupState.cueAssetPaths
       : DEFAULT_CUE_ASSET_PATHS
+
+  useEffect(() => {
+    autoStopOnSilenceRef.current = autoStopOnSilence
+  }, [autoStopOnSilence])
+
   const runtimeLabel = getRuntimeLabel(runtimeStatus)
-  const runtimeDetail = getRuntimeDetail(runtimeStatus, startupState, micActive)
+  const runtimeDetail = getRuntimeDetail(runtimeStatus, startupState, micActive, autoStopOnSilence)
 
   const applyTransition = (
     previousStatus: RuntimeStatus,
@@ -122,13 +156,23 @@ function App() {
       void playCue(cueType, cueAssetPaths).catch((error: unknown) => {
         const message = error instanceof Error ? error.message : 'Unknown cue playback error'
 
+        console.error('[cue] playback failure during transition', {
+          cueType,
+          cueAssetPaths,
+          runtimeStatusBefore: previousStatus,
+          runtimeStatusAfter: nextStatus,
+          error,
+        })
+
         applyTransition(nextStatus, 'fail')
         setMessages((currentMessages) => [
           ...currentMessages,
           {
             id: `system-cue-error-${Date.now()}`,
             role: 'system',
-            content: `Cue playback error: ${message}`,
+            content:
+              `Cue playback error: ${message} ` +
+              `[cue=${cueType}, startCue=${cueAssetPaths.startListening}, stopCue=${cueAssetPaths.stopListening}]`,
           },
         ])
       })
@@ -157,13 +201,23 @@ function App() {
       void playCue(cueType, cueAssetPaths).catch((error: unknown) => {
         const message = error instanceof Error ? error.message : 'Unknown cue playback error'
 
+        console.error('[cue] playback failure while applying runtime status', {
+          cueType,
+          cueAssetPaths,
+          runtimeStatusBefore: previousStatus,
+          runtimeStatusAfter: nextStatus,
+          error,
+        })
+
         enterRuntimeError()
         setMessages((currentMessages) => [
           ...currentMessages,
           {
             id: `system-cue-error-${Date.now()}`,
             role: 'system',
-            content: `Cue playback error: ${message}`,
+            content:
+              `Cue playback error: ${message} ` +
+              `[cue=${cueType}, startCue=${cueAssetPaths.startListening}, stopCue=${cueAssetPaths.stopListening}]`,
           },
         ])
       })
@@ -255,7 +309,7 @@ function App() {
       applyRuntimeControlResult(runtimePhase, quiet === undefined ? {} : { quiet })
       return runtimePhase
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Runtime control failed'
+      const message = toDisplayErrorMessage(error)
 
       enterRuntimeError()
       setMessages((currentMessages) => [
@@ -263,7 +317,7 @@ function App() {
         {
           id: `system-runtime-control-error-${Date.now()}`,
           role: 'system',
-          content: `Runtime control error: ${message}`,
+          content: `Runtime control error (${command}): ${message}`,
         },
       ])
       return null
@@ -310,6 +364,13 @@ function App() {
 
       setMessages((currentMessages) => [...currentMessages, ...nextMessages])
       applyRuntimeStatus(toRuntimeStatus(result.runtimePhase))
+
+      if (liveAudioSourceRef.current !== null && result.runtimePhase === 'result_ready') {
+        await syncRuntimeControl('reset_session', {
+          fallbackEvent: 'reset_to_sleeping',
+          quiet: true,
+        })
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Prompt execution failed'
 
@@ -389,7 +450,7 @@ function App() {
                 status.lastActivityMs,
               )
 
-              if (nextStatus === 'listening') {
+              if (nextStatus === 'listening' && autoStopOnSilenceRef.current) {
                 const voiceActivityUpdate = updateVoiceActivityState(voiceActivityStateRef.current, nowMs)
 
                 voiceActivityStateRef.current = voiceActivityUpdate.state
@@ -442,6 +503,21 @@ function App() {
     void startMic()
   }
 
+  useEffect(() => {
+    if (
+      startupState.kind !== 'ready' ||
+      !startupState.voiceInputAvailable ||
+      micActive ||
+      micStarting ||
+      micAutoStartedRef.current
+    ) {
+      return
+    }
+
+    micAutoStartedRef.current = true
+    void startMic()
+  }, [micActive, micStarting, startupState])
+
   const sendPrompt = async (): Promise<void> => {
     if (startupState.kind !== 'ready') {
       return
@@ -484,6 +560,7 @@ function App() {
           <span className="shell__badge">
             Voice {startupState.kind === 'ready' && startupState.voiceInputAvailable ? 'ready' : 'limited'}
           </span>
+          <span className="shell__badge">Auto stop {autoStopOnSilence ? 'on' : 'off'}</span>
         </div>
         {startupState.kind === 'error' ? (
           <p className="shell__error">Startup error: {startupState.message}</p>
@@ -506,6 +583,16 @@ function App() {
             type="button"
             className="shell__control"
             onClick={() => {
+              void handleMarkSilence()
+            }}
+            disabled={!canMarkSilence}
+          >
+            Stop listening and process
+          </button>
+          <button
+            type="button"
+            className="shell__control"
+            onClick={() => {
               void syncRuntimeControl(
                 'reset_session',
                 {
@@ -519,6 +606,15 @@ function App() {
             Reset to idle
           </button>
         </div>
+        <label className="shell__toggle">
+          <input
+            type="checkbox"
+            checked={autoStopOnSilence}
+            onChange={(event) => setAutoStopOnSilence(event.target.checked)}
+            disabled={startupState.kind !== 'ready' || !startupState.voiceInputAvailable}
+          />
+          <span>Auto stop on silence</span>
+        </label>
         <details className="shell__manual-controls">
           <summary>Manual fallback controls</summary>
           <div className="shell__controls" role="group" aria-label="Manual fallback controls">
@@ -531,16 +627,6 @@ function App() {
               disabled={!canStartListening}
             >
               Start listening
-            </button>
-            <button
-              type="button"
-              className="shell__control"
-              onClick={() => {
-                void handleMarkSilence()
-              }}
-              disabled={!canMarkSilence}
-            >
-              Mark silence
             </button>
             <button
               type="button"
@@ -590,6 +676,18 @@ function toRuntimeStatus(runtimePhase: BackendRuntimePhase): RuntimeStatus {
   return runtimePhase
 }
 
+function toDisplayErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message
+  }
+
+  if (typeof error === 'string') {
+    return error
+  }
+
+  return String(error)
+}
+
 function getRuntimeLabel(runtimeStatus: RuntimeStatus): string {
   switch (runtimeStatus) {
     case 'initializing':
@@ -613,6 +711,7 @@ function getRuntimeDetail(
   runtimeStatus: RuntimeStatus,
   startupState: StartupState,
   micActive: boolean,
+  autoStopOnSilence: boolean,
 ): string {
   if (startupState.kind === 'error') {
     return 'Configuration or startup failed before voice services could begin.'
@@ -630,7 +729,9 @@ function getRuntimeDetail(
         ? 'Mic is live and waiting for the wake word or manual fallback controls.'
         : 'Start the mic to listen hands-free, or use typed prompts below.'
     case 'listening':
-      return 'Speech is being captured. Stop talking and the assistant will transcribe automatically.'
+      return autoStopOnSilence
+        ? 'Speech is being captured. Stop talking and the assistant will transcribe automatically.'
+        : 'Speech is being captured. Use Stop listening and process when you are done talking.'
     case 'processing':
       return 'The captured voice turn is being transcribed locally before execution.'
     case 'executing':
