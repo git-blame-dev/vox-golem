@@ -6,7 +6,6 @@ export type RuntimeEvent =
   | 'end_listening'
   | 'submit_prompt'
   | 'response_ready'
-  | 'reset_to_sleeping'
   | 'fail'
   | 'recover_from_error'
 
@@ -16,21 +15,15 @@ export function transitionRuntimeStatus(
 ): RuntimeStatus {
   switch (event) {
     case 'begin_listening':
-      return current === 'sleeping' || current === 'result_ready'
-        ? 'listening'
-        : current
+      return current === 'sleeping' ? 'listening' : current
     case 'end_listening':
       return current === 'listening' ? 'processing' : current
     case 'submit_prompt':
-      return current === 'sleeping' || current === 'processing' || current === 'result_ready'
-        ? 'executing'
-        : current
+      return current === 'sleeping' || current === 'processing' ? 'executing' : current
     case 'response_ready':
       return current === 'processing' || current === 'executing'
-        ? 'result_ready'
+        ? 'sleeping'
         : current
-    case 'reset_to_sleeping':
-      return current === 'result_ready' ? 'sleeping' : current
     case 'fail':
       return 'error'
     case 'recover_from_error':

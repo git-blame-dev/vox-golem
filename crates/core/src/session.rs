@@ -294,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_completion_from_processing_enters_result_ready() {
+    fn prompt_completion_from_processing_returns_to_sleeping() {
         let ready = apply_session_event(
             &SessionState::new(),
             session_config(),
@@ -316,9 +316,9 @@ mod tests {
 
         let next =
             apply_session_event(&processing, session_config(), SessionEvent::PromptCompleted)
-                .expect("processing should transition to result ready");
+                .expect("processing should transition back to sleeping");
 
-        assert_eq!(next.runtime().phase(), RuntimePhase::ResultReady);
+        assert_eq!(next.runtime().phase(), RuntimePhase::Sleeping);
         assert!(!next.voice_turn().listening());
     }
 

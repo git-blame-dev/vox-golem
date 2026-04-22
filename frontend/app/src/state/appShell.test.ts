@@ -13,7 +13,7 @@ describe('createExecutionMessages', () => {
         ],
         stderr: 'warning output',
         exitCode: 0,
-        runtimePhase: 'result_ready',
+        runtimePhase: 'sleeping',
       }).map((message) => message.content),
     ).toEqual([
       'step_start:\nOpenCode started a run step.',
@@ -65,7 +65,7 @@ describe('createExecutionMessages', () => {
         ],
         stderr: '',
         exitCode: 0,
-        runtimePhase: 'result_ready',
+        runtimePhase: 'sleeping',
       }).map((message) => message.content),
     ).toEqual(['tool_use:\nbash (completed)\nShows working tree status'])
   })
@@ -76,7 +76,7 @@ describe('createExecutionMessages', () => {
         events: [],
         stderr: '',
         exitCode: 0,
-        runtimePhase: 'result_ready',
+        runtimePhase: 'sleeping',
       }).map((message) => message.content),
     ).toEqual(['OpenCode returned no output.'])
   })
@@ -87,7 +87,7 @@ describe('createExecutionMessages', () => {
         events: [{ kind: 'step_finish', reason: null }],
         stderr: '',
         exitCode: 0,
-        runtimePhase: 'result_ready',
+        runtimePhase: 'sleeping',
       }).map((message) => message.content),
     ).toEqual(['step_finish:\nOpenCode finished a run step.'])
   })

@@ -5,7 +5,6 @@ pub enum RuntimePhase {
     Listening,
     Processing,
     Executing,
-    ResultReady,
     Error,
 }
 
@@ -106,9 +105,7 @@ pub fn apply_runtime_event(
                 last_error: Some(message),
             }
         }
-        RuntimeEvent::BeginListening
-            if current_phase == RuntimePhase::Sleeping
-                || current_phase == RuntimePhase::ResultReady =>
+        RuntimeEvent::BeginListening if current_phase == RuntimePhase::Sleeping =>
         {
             RuntimeState {
                 phase: RuntimePhase::Listening,
@@ -121,8 +118,7 @@ pub fn apply_runtime_event(
         },
         RuntimeEvent::SubmitPrompt
             if current_phase == RuntimePhase::Sleeping
-                || current_phase == RuntimePhase::Processing
-                || current_phase == RuntimePhase::ResultReady =>
+                || current_phase == RuntimePhase::Processing =>
         {
             RuntimeState {
                 phase: RuntimePhase::Executing,
@@ -134,14 +130,10 @@ pub fn apply_runtime_event(
                 || current_phase == RuntimePhase::Executing =>
         {
             RuntimeState {
-                phase: RuntimePhase::ResultReady,
+                phase: RuntimePhase::Sleeping,
                 last_error: None,
             }
         }
-        RuntimeEvent::ResetToIdle if current_phase == RuntimePhase::ResultReady => RuntimeState {
-            phase: RuntimePhase::Sleeping,
-            last_error: None,
-        },
         RuntimeEvent::Fail { message } => RuntimeState {
             phase: RuntimePhase::Error,
             last_error: Some(message),
@@ -171,8 +163,7 @@ pub fn reset_runtime_to_idle(state: &RuntimeState) -> Result<RuntimeState, Runti
         RuntimePhase::Sleeping
         | RuntimePhase::Listening
         | RuntimePhase::Processing
-        | RuntimePhase::Executing
-        | RuntimePhase::ResultReady => Ok(RuntimeState {
+        | RuntimePhase::Executing => Ok(RuntimeState {
             phase: RuntimePhase::Sleeping,
             last_error: None,
         }),
@@ -222,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn walks_voice_flow_from_sleeping_to_result_ready() {
+    fn walks_voice_flow_from_sleeping_back_to_sleeping() {
         let state = RuntimeState {
             phase: RuntimePhase::Sleeping,
             last_error: None,
@@ -233,15 +224,15 @@ mod tests {
         let processing = apply_runtime_event(&listening, RuntimeEvent::EndListening)
             .expect("listening should transition to processing");
         let result = apply_runtime_event(&processing, RuntimeEvent::ResponseReady)
-            .expect("processing should transition to result_ready");
+            .expect("processing should transition back to sleeping");
 
         assert_eq!(listening.phase(), RuntimePhase::Listening);
         assert_eq!(processing.phase(), RuntimePhase::Processing);
-        assert_eq!(result.phase(), RuntimePhase::ResultReady);
+        assert_eq!(result.phase(), RuntimePhase::Sleeping);
     }
 
     #[test]
-    fn walks_typed_prompt_flow_from_sleeping_to_result_ready() {
+    fn walks_typed_prompt_flow_from_sleeping_back_to_sleeping() {
         let state = RuntimeState {
             phase: RuntimePhase::Sleeping,
             last_error: None,
@@ -250,10 +241,10 @@ mod tests {
         let executing = apply_runtime_event(&state, RuntimeEvent::SubmitPrompt)
             .expect("sleeping should transition to executing");
         let result = apply_runtime_event(&executing, RuntimeEvent::ResponseReady)
-            .expect("executing should transition to result_ready");
+            .expect("executing should transition back to sleeping");
 
         assert_eq!(executing.phase(), RuntimePhase::Executing);
-        assert_eq!(result.phase(), RuntimePhase::ResultReady);
+        assert_eq!(result.phase(), RuntimePhase::Sleeping);
     }
 
     #[test]
