@@ -1,6 +1,6 @@
-const PROCESSOR_BUFFER_SIZE = 4096
+const PROCESSOR_BUFFER_SIZE = 1024
 const TARGET_SAMPLE_RATE = 16_000
-const OUTPUT_CHUNK_SIZE = 1_600
+const OUTPUT_CHUNK_SIZE = 480
 
 export interface LiveAudioSource {
   stop(): void
