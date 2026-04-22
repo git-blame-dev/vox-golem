@@ -1,5 +1,5 @@
 # Local voice assets
-wake_word_wav = "wake-word.wav"
+wake_word_dir = "wake-word"
 parakeet_model_dir = "models/parakeet-v2"
 silero_vad_model = "models/silero-vad.onnx"
 

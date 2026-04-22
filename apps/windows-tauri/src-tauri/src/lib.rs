@@ -251,7 +251,8 @@ fn mark_silence(
         },
     )?;
 
-    let transcript_text = match transcribe_finished_utterance(&action, &app_state.parakeet_runtime) {
+    let transcript_text = match transcribe_finished_utterance(&action, &app_state.parakeet_runtime)
+    {
         Ok(transcript_text) => transcript_text,
         Err(error) => {
             reset_voice_pipeline_to_waiting(
@@ -265,11 +266,7 @@ fn mark_silence(
         }
     };
 
-    build_mark_silence_response(
-        &app_state.voice_pipeline_state,
-        &action,
-        transcript_text,
-    )
+    build_mark_silence_response(&app_state.voice_pipeline_state, &action, transcript_text)
 }
 
 #[tauri::command]
@@ -354,7 +351,7 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
 
     match voxgolem_core::config::load_runtime_config(None) {
         Ok(config) => {
-            let wake_word_runtime = match wake_word::WakeWordRuntime::new(&config.wake_word_wav) {
+            let wake_word_runtime = match wake_word::WakeWordRuntime::new(&config.wake_word_dir) {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     return build_startup_error_app_state(
@@ -859,8 +856,8 @@ mod tests {
         ingest_audio_frame_with_optional_wake_word_detection, process_wake_word_frame,
         prompt_result_error_message, reset_voice_pipeline_to_waiting, reset_wake_word_runtime,
         runtime_phase_response_from_state, to_runtime_phase_payload, transcribe_finished_utterance,
-        transcription_ready_samples,
-        RuntimePhasePayload, RuntimePhaseResponsePayload, DEFAULT_SILENCE_TIMEOUT_MS,
+        transcription_ready_samples, RuntimePhasePayload, RuntimePhaseResponsePayload,
+        DEFAULT_SILENCE_TIMEOUT_MS,
     };
     use crate::wake_word::WakeWordRuntime;
     use std::sync::Mutex;
@@ -1263,9 +1260,11 @@ mod tests {
     }
 
     #[test]
-    fn wake_word_runtime_can_initialize_from_sample_wav() {
+    fn wake_word_runtime_can_initialize_from_sample_directory() {
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let wake_word_path = temp_dir.path().join("wake-word.wav");
+        let wake_word_dir = temp_dir.path().join("wake-word");
+        std::fs::create_dir_all(&wake_word_dir).expect("wake word directory should be created");
+        let wake_word_path = wake_word_dir.join("01.wav");
         let spec = hound::WavSpec {
             channels: 1,
             sample_rate: 16_000,
@@ -1282,6 +1281,6 @@ mod tests {
         }
         writer.finalize().expect("wav should finalize");
 
-        WakeWordRuntime::new(&wake_word_path).expect("wake word runtime should initialize");
+        WakeWordRuntime::new(&wake_word_dir).expect("wake word runtime should initialize");
     }
 }

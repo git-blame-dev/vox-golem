@@ -11,7 +11,7 @@ const DEFAULT_SILERO_VAD_MODEL: &str = "models/silero-vad.onnx";
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
-    wake_word_wav: PathBuf,
+    wake_word_dir: PathBuf,
     parakeet_model_dir: PathBuf,
     silero_vad_model: Option<PathBuf>,
     opencode_path: PathBuf,
@@ -23,7 +23,7 @@ struct RawConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeConfig {
-    pub wake_word_wav: PathBuf,
+    pub wake_word_dir: PathBuf,
     pub parakeet_model_dir: PathBuf,
     pub silero_vad_model: PathBuf,
     pub opencode_path: PathBuf,
@@ -131,7 +131,7 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
         }
     })?;
 
-    let wake_word_wav = resolve_config_path(&config_dir, raw_config.wake_word_wav);
+    let wake_word_dir = resolve_config_path(&config_dir, raw_config.wake_word_dir);
     let parakeet_model_dir = resolve_config_path(&config_dir, raw_config.parakeet_model_dir);
     let silero_vad_model = resolve_config_path(
         &config_dir,
@@ -141,13 +141,13 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
     );
     let opencode_path = resolve_config_path(&config_dir, raw_config.opencode_path);
 
-    validate_existing_file(&wake_word_wav, "wake_word_wav")?;
+    validate_existing_directory(&wake_word_dir, "wake_word_dir")?;
     validate_existing_directory(&parakeet_model_dir, "parakeet_model_dir")?;
     validate_existing_file(&silero_vad_model, "silero_vad_model")?;
     validate_existing_executable(&opencode_path)?;
 
     Ok(RuntimeConfig {
-        wake_word_wav,
+        wake_word_dir,
         parakeet_model_dir,
         silero_vad_model,
         opencode_path,
@@ -251,7 +251,7 @@ mod tests {
         let temp = TempDir::new();
         let config_path = temp.path().join("config.toml");
 
-        fs::write(&config_path, "wake_word_wav = [\"unexpected array\"]")
+        fs::write(&config_path, "wake_word_dir = [\"unexpected array\"]")
             .expect("invalid config fixture should be written");
 
         let result = load_runtime_config(Some(&config_path));
@@ -260,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_missing_required_wake_word_file() {
+    fn reports_missing_required_wake_word_directory() {
         let temp = TempDir::new();
         let model_dir = temp.path().join("models");
         let silero_vad_model = model_dir.join("silero-vad.onnx");
@@ -270,13 +270,13 @@ mod tests {
         let opencode_path = temp.path().join("opencode.exe");
         create_file(&opencode_path);
 
-        let missing_wake_word = temp.path().join("missing-wake-word.wav");
+        let missing_wake_word_dir = temp.path().join("missing-wake-word");
         let config_path = temp.path().join("config.toml");
 
         fs::write(
             &config_path,
             render_config(
-                &missing_wake_word,
+                &missing_wake_word_dir,
                 &model_dir,
                 &silero_vad_model,
                 &opencode_path,
@@ -288,9 +288,9 @@ mod tests {
 
         assert_eq!(
             result,
-            Err(ConfigError::MissingFile {
-                field: "wake_word_wav",
-                path: missing_wake_word,
+            Err(ConfigError::MissingDirectory {
+                field: "wake_word_dir",
+                path: missing_wake_word_dir,
             })
         );
     }
@@ -298,13 +298,13 @@ mod tests {
     #[test]
     fn defaults_missing_silero_vad_model_to_models_directory() {
         let temp = TempDir::new();
-        let wake_word = temp.path().join("wake-word.wav");
+        let wake_word_dir = temp.path().join("wake-word");
         let model_dir = temp.path().join("models");
         let default_silero_vad_model = model_dir.join("silero-vad.onnx");
         let opencode_path = temp.path().join("opencode.exe");
         let config_path = temp.path().join("config.toml");
 
-        create_file(&wake_word);
+        fs::create_dir_all(&wake_word_dir).expect("wake word directory fixture should be created");
         fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
         create_file(&default_silero_vad_model);
         create_file(&opencode_path);
@@ -312,8 +312,8 @@ mod tests {
         fs::write(
             &config_path,
             format!(
-                "wake_word_wav = \"{}\"\nparakeet_model_dir = \"{}\"\nopencode_path = \"{}\"\n",
-                escape_path(&wake_word),
+                "wake_word_dir = \"{}\"\nparakeet_model_dir = \"{}\"\nopencode_path = \"{}\"\n",
+                escape_path(&wake_word_dir),
                 escape_path(&model_dir),
                 escape_path(&opencode_path),
             ),
@@ -329,20 +329,20 @@ mod tests {
     #[test]
     fn reports_missing_required_silero_vad_model_file() {
         let temp = TempDir::new();
-        let wake_word = temp.path().join("wake-word.wav");
+        let wake_word_dir = temp.path().join("wake-word");
         let model_dir = temp.path().join("models");
         let missing_silero_vad_model = model_dir.join("missing-silero-vad.onnx");
         let opencode_path = temp.path().join("opencode.exe");
         let config_path = temp.path().join("config.toml");
 
-        create_file(&wake_word);
+        fs::create_dir_all(&wake_word_dir).expect("wake word directory fixture should be created");
         fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
         create_file(&opencode_path);
 
         fs::write(
             &config_path,
             render_config(
-                &wake_word,
+                &wake_word_dir,
                 &model_dir,
                 &missing_silero_vad_model,
                 &opencode_path,
@@ -364,20 +364,25 @@ mod tests {
     #[test]
     fn loads_valid_config() {
         let temp = TempDir::new();
-        let wake_word = temp.path().join("wake-word.wav");
+        let wake_word_dir = temp.path().join("wake-word");
         let model_dir = temp.path().join("models");
         let silero_vad_model = model_dir.join("silero-vad.onnx");
         let opencode_path = temp.path().join("opencode.exe");
         let config_path = temp.path().join("config.toml");
 
-        create_file(&wake_word);
+        fs::create_dir_all(&wake_word_dir).expect("wake word directory fixture should be created");
         fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
         create_file(&silero_vad_model);
         create_file(&opencode_path);
 
         fs::write(
             &config_path,
-            render_config(&wake_word, &model_dir, &silero_vad_model, &opencode_path),
+            render_config(
+                &wake_word_dir,
+                &model_dir,
+                &silero_vad_model,
+                &opencode_path,
+            ),
         )
         .expect("config fixture should be written");
 
@@ -398,7 +403,7 @@ mod tests {
     }
 
     fn render_config(
-        wake_word_wav: &Path,
+        wake_word_dir: &Path,
         parakeet_model_dir: &Path,
         silero_vad_model: &Path,
         opencode_path: &Path,
@@ -407,8 +412,8 @@ mod tests {
             format!("silero_vad_model = \"{}\"\n", escape_path(silero_vad_model));
 
         format!(
-            "wake_word_wav = \"{}\"\nparakeet_model_dir = \"{}\"\n{}opencode_path = \"{}\"\n",
-            escape_path(wake_word_wav),
+            "wake_word_dir = \"{}\"\nparakeet_model_dir = \"{}\"\n{}opencode_path = \"{}\"\n",
+            escape_path(wake_word_dir),
             escape_path(parakeet_model_dir),
             silero_vad_model_line,
             escape_path(opencode_path),
