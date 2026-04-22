@@ -60,7 +60,7 @@ function createFallbackResult(prompt: string): PromptExecutionResult {
     ],
     stderr: '',
     exitCode: 0,
-    runtimePhase: 'result_ready',
+    runtimePhase: 'sleeping',
   }
 }
 
@@ -164,7 +164,6 @@ function parseRuntimePhase(payload: unknown): BackendRuntimePhase {
     payload === 'listening' ||
     payload === 'processing' ||
     payload === 'executing' ||
-    payload === 'result_ready' ||
     payload === 'error'
   ) {
     return payload

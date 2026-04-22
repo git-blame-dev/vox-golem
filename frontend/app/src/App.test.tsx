@@ -119,7 +119,7 @@ describe('App', () => {
           ],
           stderr: 'warning output',
           exit_code: 0,
-          runtime_phase: 'result_ready',
+          runtime_phase: 'sleeping',
         }
       },
     }
@@ -565,21 +565,11 @@ describe('App', () => {
             events: [{ kind: 'text', text: 'Voice execution response' }],
             stderr: '',
             exit_code: 0,
-            runtime_phase: 'result_ready',
+            runtime_phase: 'sleeping',
           }
         }
 
-        expect(command).toBe('reset_session')
-
-        return {
-          runtime_phase: 'sleeping',
-          transcription_ready_samples: null,
-          transcript_text: null,
-          last_activity_ms: null,
-          capturing_utterance: false,
-          preroll_samples: 4,
-          utterance_samples: 0,
-        }
+        throw new Error(`unexpected command: ${command}`)
       },
     }
 
@@ -603,7 +593,6 @@ describe('App', () => {
       'ingest_audio_frame',
       'mark_silence',
       'submit_prompt',
-      'reset_session',
     ])
     expect(container.textContent).toContain('transcript:\nOpen the pull request')
     expect(container.textContent).toContain('Open the pull request')
@@ -1045,7 +1034,6 @@ function getControlButton(
     | 'Stop mic'
     | 'Stop listening and process'
     | 'Start listening'
-    | 'Mark result ready'
     | 'Reset to idle',
 ): HTMLButtonElement {
   const buttons = Array.from(container.querySelectorAll<HTMLButtonElement>('button'))

@@ -5,7 +5,6 @@ export type RuntimeControlCommand =
   | 'begin_listening'
   | 'record_speech_activity'
   | 'mark_silence'
-  | 'mark_result_ready'
   | 'reset_session'
 
 export interface RuntimeControlArgs {
@@ -76,7 +75,6 @@ function parseRuntimePhaseResponse(payload: unknown): RuntimeControlResult {
     runtimePhase === 'listening' ||
     runtimePhase === 'processing' ||
     runtimePhase === 'executing' ||
-    runtimePhase === 'result_ready' ||
     runtimePhase === 'error'
   ) {
     if (

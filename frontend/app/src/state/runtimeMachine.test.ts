@@ -18,8 +18,8 @@ describe('transitionRuntimeStatus', () => {
     expect(transitionRuntimeStatus('processing', 'submit_prompt')).toBe('executing')
   })
 
-  it('transitions to result_ready when response arrives', () => {
-    expect(transitionRuntimeStatus('executing', 'response_ready')).toBe('result_ready')
+  it('returns to sleeping when response arrives', () => {
+    expect(transitionRuntimeStatus('executing', 'response_ready')).toBe('sleeping')
   })
 
   it('transitions to error on failure', () => {
@@ -38,6 +38,6 @@ describe('cueForTransition', () => {
 
   it('does not request a cue for unrelated transitions', () => {
     expect(cueForTransition('listening', 'processing')).toBe(null)
-    expect(cueForTransition('processing', 'result_ready')).toBe(null)
+    expect(cueForTransition('processing', 'sleeping')).toBe(null)
   })
 })

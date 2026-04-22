@@ -17,7 +17,6 @@ export type BackendRuntimePhase =
   | 'listening'
   | 'processing'
   | 'executing'
-  | 'result_ready'
   | 'error'
 
 export type PromptExecutionEvent =
@@ -57,7 +56,6 @@ export type RuntimeStatus =
   | 'listening'
   | 'processing'
   | 'executing'
-  | 'result_ready'
   | 'error'
 
 export interface RuntimeControlResult {
