@@ -41,7 +41,7 @@ The Windows-first baseline MVP voice path is now in place: live mic capture feed
 
 The Windows runtime expects these configured local assets in `%APPDATA%\VoxGolem\config.toml`:
 
-- `wake_word_wav`: wake-word reference clip for `rustpotter`
+- `wake_word_dir`: directory of wake-word reference clips for `rustpotter`
 - `parakeet_model_dir`: local Parakeet v2 model directory
 - `silero_vad_model`: local Silero VAD ONNX file
 - `start_listening_cue` and `stop_listening_cue`: cue audio files
