@@ -18,7 +18,7 @@ describe('parsePromptExecutionResult', () => {
         ],
         stderr: '',
         exit_code: 0,
-        runtime_phase: 'result_ready',
+        runtime_phase: 'sleeping',
       }),
     ).toEqual({
       events: [
@@ -30,7 +30,7 @@ describe('parsePromptExecutionResult', () => {
       ],
       stderr: '',
       exitCode: 0,
-      runtimePhase: 'result_ready',
+      runtimePhase: 'sleeping',
     })
   })
 
@@ -45,7 +45,7 @@ describe('executePrompt', () => {
       events: [{ kind: 'text', text: 'Placeholder response for: Draft release notes' }],
       stderr: '',
       exitCode: 0,
-      runtimePhase: 'result_ready',
+      runtimePhase: 'sleeping',
     })
   })
 
@@ -59,7 +59,7 @@ describe('executePrompt', () => {
           events: [{ kind: 'text', text: 'OpenCode response' }],
           stderr: '',
           exit_code: 0,
-          runtime_phase: 'result_ready',
+          runtime_phase: 'sleeping',
         }
       },
     }
@@ -68,7 +68,7 @@ describe('executePrompt', () => {
       events: [{ kind: 'text', text: 'OpenCode response' }],
       stderr: '',
       exitCode: 0,
-      runtimePhase: 'result_ready',
+      runtimePhase: 'sleeping',
     })
   })
 })

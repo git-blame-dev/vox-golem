@@ -91,7 +91,6 @@ function parseRuntimePhase(payload: unknown): BackendRuntimePhase {
     payload === 'listening' ||
     payload === 'processing' ||
     payload === 'executing' ||
-    payload === 'result_ready' ||
     payload === 'error'
   ) {
     return payload

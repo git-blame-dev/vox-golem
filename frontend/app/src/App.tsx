@@ -101,7 +101,7 @@ function App() {
   const canSend = useMemo(
     () =>
       startupState.kind === 'ready' &&
-      (runtimeStatus === 'sleeping' || runtimeStatus === 'result_ready') &&
+      runtimeStatus === 'sleeping' &&
       composerValue.trim().length > 0,
     [composerValue, runtimeStatus, startupState.kind],
   )
@@ -110,15 +110,10 @@ function App() {
     startupState.kind === 'ready' &&
     startupState.voiceInputAvailable &&
     !micActive &&
-    (runtimeStatus === 'sleeping' || runtimeStatus === 'result_ready')
+    runtimeStatus === 'sleeping'
   const canMarkSilence =
     startupState.kind === 'ready' && startupState.voiceInputAvailable && runtimeStatus === 'listening'
-  const canMarkResultReady =
-    startupState.kind === 'ready' &&
-    (runtimeStatus === 'processing' || runtimeStatus === 'executing')
-  const canResetToIdle =
-    startupState.kind === 'ready' &&
-    (runtimeStatus === 'result_ready' || runtimeStatus === 'error')
+  const canResetToIdle = startupState.kind === 'ready' && runtimeStatus === 'error'
   const canToggleMic =
     startupState.kind === 'ready' && startupState.voiceInputAvailable && !micStarting
   const cueAssetPaths =
@@ -281,7 +276,6 @@ function App() {
       | 'begin_listening'
       | 'record_speech_activity'
       | 'mark_silence'
-      | 'mark_result_ready'
       | 'reset_session',
     options: {
       readonly args?: RuntimeControlArgs
@@ -325,7 +319,7 @@ function App() {
   }
 
   const recoverFromRuntimeControlError = (
-    command: 'begin_listening' | 'record_speech_activity' | 'mark_silence' | 'mark_result_ready' | 'reset_session',
+    command: 'begin_listening' | 'record_speech_activity' | 'mark_silence' | 'reset_session',
   ): void => {
     if (command === 'mark_silence') {
       applyRuntimeStatus('sleeping')
@@ -375,13 +369,6 @@ function App() {
 
       setMessages((currentMessages) => [...currentMessages, ...nextMessages])
       applyRuntimeStatus(toRuntimeStatus(result.runtimePhase))
-
-      if (liveAudioSourceRef.current !== null && result.runtimePhase === 'result_ready') {
-        await syncRuntimeControl('reset_session', {
-          fallbackEvent: 'reset_to_sleeping',
-          quiet: true,
-        })
-      }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Prompt execution failed'
 
@@ -613,8 +600,7 @@ function App() {
               void syncRuntimeControl(
                 'reset_session',
                 {
-                  fallbackEvent:
-                    runtimeStatus === 'error' ? 'recover_from_error' : 'reset_to_sleeping',
+                  fallbackEvent: 'recover_from_error',
                 },
               )
             }}
@@ -644,16 +630,6 @@ function App() {
               disabled={!canStartListening}
             >
               Start listening
-            </button>
-            <button
-              type="button"
-              className="shell__control"
-              onClick={() => {
-                void syncRuntimeControl('mark_result_ready', { fallbackEvent: 'response_ready' })
-              }}
-              disabled={!canMarkResultReady}
-            >
-              Mark result ready
             </button>
           </div>
         </details>
@@ -717,8 +693,6 @@ function getRuntimeLabel(runtimeStatus: RuntimeStatus): string {
       return 'Transcribing'
     case 'executing':
       return 'Running'
-    case 'result_ready':
-      return 'Ready'
     case 'error':
       return 'Error'
   }
@@ -753,8 +727,6 @@ function getRuntimeDetail(
       return 'The captured voice turn is being transcribed locally before execution.'
     case 'executing':
       return 'OpenCode is running the request now.'
-    case 'result_ready':
-      return 'The last result finished successfully. You can speak again or send another typed prompt.'
     case 'error':
       return 'The last voice or execution step failed. Reset to idle to recover.'
   }

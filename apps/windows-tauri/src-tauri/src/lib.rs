@@ -32,7 +32,6 @@ enum RuntimePhasePayload {
     Listening,
     Processing,
     Executing,
-    ResultReady,
     Error,
 }
 
@@ -271,21 +270,6 @@ fn mark_silence(
         &action,
         transcript_text,
     )
-}
-
-#[tauri::command]
-fn mark_result_ready(
-    app_state: tauri::State<'_, AppState>,
-) -> Result<RuntimePhaseResponsePayload, String> {
-    apply_voice_pipeline_transition(
-        &app_state.voice_pipeline_state,
-        app_state.voice_pipeline_config,
-        voxgolem_core::voice_pipeline::VoicePipelineEvent::PromptCompleted,
-    )?;
-
-    Ok(RuntimePhaseResponsePayload {
-        ..current_runtime_phase_response(&app_state.voice_pipeline_state, None, None)?
-    })
 }
 
 #[tauri::command]
@@ -686,7 +670,6 @@ fn to_runtime_phase_payload(
         voxgolem_core::runtime::RuntimePhase::Listening => RuntimePhasePayload::Listening,
         voxgolem_core::runtime::RuntimePhase::Processing => RuntimePhasePayload::Processing,
         voxgolem_core::runtime::RuntimePhase::Executing => RuntimePhasePayload::Executing,
-        voxgolem_core::runtime::RuntimePhase::ResultReady => RuntimePhasePayload::ResultReady,
         voxgolem_core::runtime::RuntimePhase::Error => RuntimePhasePayload::Error,
     }
 }
@@ -859,7 +842,6 @@ pub fn run() {
             record_speech_activity,
             ingest_audio_frame,
             mark_silence,
-            mark_result_ready,
             reset_session
         ]);
 
