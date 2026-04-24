@@ -2,10 +2,12 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { createVoiceTelemetryRecorder } from './voiceTelemetry'
 
 const TELEMETRY_STORAGE_KEY = 'voxgolem.voiceTelemetry'
+const ORIGINAL_URL = window.location.href
 
 afterEach(() => {
   window.localStorage.removeItem(TELEMETRY_STORAGE_KEY)
   Reflect.deleteProperty(window, '__VOXGOLEM_VOICE_TELEMETRY__')
+  window.history.replaceState({}, '', ORIGINAL_URL)
 })
 
 describe('createVoiceTelemetryRecorder', () => {
@@ -47,6 +49,29 @@ describe('createVoiceTelemetryRecorder', () => {
       },
     ])
     expect(window.__VOXGOLEM_VOICE_TELEMETRY__?.snapshot().events).toHaveLength(1)
+  })
+
+  it('enables telemetry when query flag is present', () => {
+    window.history.replaceState({}, '', `${window.location.pathname}?voiceTelemetry=1`)
+    const recorder = createVoiceTelemetryRecorder()
+
+    expect(recorder.enabled).toBe(true)
+
+    const frameId = recorder.nextFrameId(3000)
+    recorder.record('frontend_frame_captured', {
+      atMs: 3000,
+      frameId,
+      details: { sampleCount: 240 },
+    })
+
+    expect(recorder.snapshot().events).toEqual([
+      {
+        event: 'frontend_frame_captured',
+        atMs: 3000,
+        frameId,
+        details: { sampleCount: 240 },
+      },
+    ])
   })
 
   it('drops oldest events after max capacity', () => {
