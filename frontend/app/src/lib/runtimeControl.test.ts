@@ -35,6 +35,7 @@ describe('invokeRuntimeControl', () => {
       capturingUtterance: true,
       prerollSamples: 3,
       utteranceSamples: 5,
+      telemetry: null,
     })
   })
 
@@ -64,6 +65,7 @@ describe('invokeRuntimeControl', () => {
       capturingUtterance: true,
       prerollSamples: 4,
       utteranceSamples: 4,
+      telemetry: null,
     })
   })
 
@@ -93,6 +95,55 @@ describe('invokeRuntimeControl', () => {
       capturingUtterance: false,
       prerollSamples: 3,
       utteranceSamples: 0,
+      telemetry: null,
+    })
+  })
+
+  it('passes telemetry frame id when provided for ingest calls', async () => {
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command, args) => {
+        expect(command).toBe('ingest_audio_frame')
+        expect(args).toEqual({
+          frame: [0.1, 0.2, 0.3],
+          telemetryFrameId: 'frame-1000-1',
+        })
+
+        return {
+          runtime_phase: 'sleeping',
+          transcription_ready_samples: null,
+          transcript_text: null,
+          last_activity_ms: null,
+          capturing_utterance: false,
+          preroll_samples: 3,
+          utterance_samples: 0,
+          telemetry: {
+            frame_id: 'frame-1000-1',
+            backend_ingest_started_ms: 1002,
+            backend_ingest_completed_ms: 1005,
+            wake_detected_ms: null,
+          },
+        }
+      },
+    }
+
+    await expect(
+      ingestAudioFrame([0.1, 0.2, 0.3], { telemetryFrameId: 'frame-1000-1' }),
+    ).resolves.toEqual({
+      runtimePhase: 'sleeping',
+      transcriptionReadySamples: null,
+      transcriptText: null,
+      lastActivityMs: null,
+      capturingUtterance: false,
+      prerollSamples: 3,
+      utteranceSamples: 0,
+      telemetry: {
+        frameId: 'frame-1000-1',
+        backendIngestStartedMs: 1002,
+        backendIngestCompletedMs: 1005,
+        wakeDetectedMs: null,
+        transcriptionStartedMs: null,
+        transcriptionCompletedMs: null,
+      },
     })
   })
 
@@ -166,6 +217,72 @@ describe('invokeRuntimeControl', () => {
       capturingUtterance: false,
       prerollSamples: 3,
       utteranceSamples: 0,
+      telemetry: null,
     })
+  })
+
+  it('parses mark_silence transcription telemetry and forwards telemetry frame id args', async () => {
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command, args) => {
+        expect(command).toBe('mark_silence')
+        expect(args).toEqual({ telemetryFrameId: 'frame-4321-2' })
+
+        return {
+          runtime_phase: 'processing',
+          transcription_ready_samples: 3200,
+          transcript_text: 'Draft release notes',
+          last_activity_ms: null,
+          capturing_utterance: false,
+          preroll_samples: 3,
+          utterance_samples: 0,
+          telemetry: {
+            frame_id: 'frame-4321-2',
+            transcription_started_ms: 5000,
+            transcription_completed_ms: 5120,
+          },
+        }
+      },
+    }
+
+    await expect(
+      invokeRuntimeControl('mark_silence', { telemetryFrameId: 'frame-4321-2' }),
+    ).resolves.toEqual({
+      runtimePhase: 'processing',
+      transcriptionReadySamples: 3200,
+      transcriptText: 'Draft release notes',
+      lastActivityMs: null,
+      capturingUtterance: false,
+      prerollSamples: 3,
+      utteranceSamples: 0,
+      telemetry: {
+        frameId: 'frame-4321-2',
+        backendIngestStartedMs: null,
+        backendIngestCompletedMs: null,
+        wakeDetectedMs: null,
+        transcriptionStartedMs: 5000,
+        transcriptionCompletedMs: 5120,
+      },
+    })
+  })
+
+  it('rejects malformed telemetry payload fields', async () => {
+    window.__TAURI_INTERNALS__ = {
+      invoke: async () => ({
+        runtime_phase: 'sleeping',
+        transcription_ready_samples: null,
+        transcript_text: null,
+        last_activity_ms: null,
+        capturing_utterance: false,
+        preroll_samples: 0,
+        utterance_samples: 0,
+        telemetry: {
+          frame_id: 7,
+        },
+      }),
+    }
+
+    await expect(ingestAudioFrame([0.1])).rejects.toThrow(
+      'Runtime control telemetry field frame_id must be a string or null',
+    )
   })
 })

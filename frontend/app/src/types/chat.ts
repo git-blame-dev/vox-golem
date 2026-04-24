@@ -66,4 +66,14 @@ export interface RuntimeControlResult {
   readonly capturingUtterance: boolean
   readonly prerollSamples: number
   readonly utteranceSamples: number
+  readonly telemetry: RuntimeControlTelemetry | null
+}
+
+export interface RuntimeControlTelemetry {
+  readonly frameId: string | null
+  readonly backendIngestStartedMs: number | null
+  readonly backendIngestCompletedMs: number | null
+  readonly wakeDetectedMs: number | null
+  readonly transcriptionStartedMs: number | null
+  readonly transcriptionCompletedMs: number | null
 }
