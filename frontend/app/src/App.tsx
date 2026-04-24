@@ -12,6 +12,7 @@ import {
 } from './lib/runtimeControl'
 import type { RuntimeControlArgs } from './lib/runtimeControl'
 import { DEFAULT_CUE_ASSET_PATHS, loadStartupState } from './lib/startupState'
+import { createVoiceTelemetryRecorder } from './lib/voiceTelemetry'
 import {
   createVoiceActivityState,
   syncVoiceActivityState,
@@ -45,6 +46,13 @@ function App() {
   const runtimeStatusRef = useRef<RuntimeStatus>('initializing')
   const startupStateRef = useRef<StartupState>({ kind: 'loading' })
   const voiceActivityStateRef = useRef(createVoiceActivityState())
+  const voiceTelemetryRef = useRef<ReturnType<typeof createVoiceTelemetryRecorder> | null>(null)
+
+  if (voiceTelemetryRef.current === null) {
+    voiceTelemetryRef.current = createVoiceTelemetryRecorder()
+  }
+
+  const voiceTelemetry = voiceTelemetryRef.current
 
   useEffect(() => {
     let active = true
@@ -170,18 +178,34 @@ function App() {
     const cueType = cueForTransition(previousStatus, nextStatus)
 
     if (cueType !== null) {
-      void playCue(cueType, cueAssetPaths).catch((error: unknown) => {
-        console.error('[cue] playback failure during transition', {
+      voiceTelemetry.record('cue_play_requested', {
+        details: {
           cueType,
-          cueAssetPaths,
-          runtimeStatusBefore: previousStatus,
-          runtimeStatusAfter: nextStatus,
-          error,
-        })
-
-        applyTransition(nextStatus, 'fail')
-        reportCuePlaybackError(cueType, error)
+          source: 'apply_transition',
+        },
       })
+
+      void playCue(cueType, cueAssetPaths)
+        .then(() => {
+          voiceTelemetry.record('cue_play_started', {
+            details: {
+              cueType,
+              source: 'apply_transition',
+            },
+          })
+        })
+        .catch((error: unknown) => {
+          console.error('[cue] playback failure during transition', {
+            cueType,
+            cueAssetPaths,
+            runtimeStatusBefore: previousStatus,
+            runtimeStatusAfter: nextStatus,
+            error,
+          })
+
+          applyTransition(nextStatus, 'fail')
+          reportCuePlaybackError(cueType, error)
+        })
     }
 
     return nextStatus
@@ -204,21 +228,80 @@ function App() {
     const cueType = cueForTransition(previousStatus, nextStatus)
 
     if (cueType !== null) {
-      void playCue(cueType, cueAssetPaths).catch((error: unknown) => {
-        console.error('[cue] playback failure while applying runtime status', {
+      voiceTelemetry.record('cue_play_requested', {
+        details: {
           cueType,
-          cueAssetPaths,
-          runtimeStatusBefore: previousStatus,
-          runtimeStatusAfter: nextStatus,
-          error,
-        })
-
-        enterRuntimeError()
-        reportCuePlaybackError(cueType, error)
+          source: 'apply_runtime_status',
+        },
       })
+
+      void playCue(cueType, cueAssetPaths)
+        .then(() => {
+          voiceTelemetry.record('cue_play_started', {
+            details: {
+              cueType,
+              source: 'apply_runtime_status',
+            },
+          })
+        })
+        .catch((error: unknown) => {
+          console.error('[cue] playback failure while applying runtime status', {
+            cueType,
+            cueAssetPaths,
+            runtimeStatusBefore: previousStatus,
+            runtimeStatusAfter: nextStatus,
+            error,
+          })
+
+          enterRuntimeError()
+          reportCuePlaybackError(cueType, error)
+        })
     }
 
     return nextStatus
+  }
+
+  const recordRuntimeControlTelemetry = (runtimePhase: RuntimeControlResult): void => {
+    const telemetry = runtimePhase.telemetry
+
+    if (telemetry === null) {
+      return
+    }
+
+    if (telemetry.backendIngestStartedMs !== null) {
+      voiceTelemetry.record('backend_ingest_started', {
+        atMs: telemetry.backendIngestStartedMs,
+        frameId: telemetry.frameId,
+      })
+    }
+
+    if (telemetry.backendIngestCompletedMs !== null) {
+      voiceTelemetry.record('backend_ingest_completed', {
+        atMs: telemetry.backendIngestCompletedMs,
+        frameId: telemetry.frameId,
+      })
+    }
+
+    if (telemetry.wakeDetectedMs !== null) {
+      voiceTelemetry.record('wake_detected', {
+        atMs: telemetry.wakeDetectedMs,
+        frameId: telemetry.frameId,
+      })
+    }
+
+    if (telemetry.transcriptionStartedMs !== null) {
+      voiceTelemetry.record('transcription_started', {
+        atMs: telemetry.transcriptionStartedMs,
+        frameId: telemetry.frameId,
+      })
+    }
+
+    if (telemetry.transcriptionCompletedMs !== null) {
+      voiceTelemetry.record('transcription_completed', {
+        atMs: telemetry.transcriptionCompletedMs,
+        frameId: telemetry.frameId,
+      })
+    }
   }
 
   const enterRuntimeError = (): void => {
@@ -244,7 +327,17 @@ function App() {
     } = {},
   ): void => {
     const { quiet = false } = options
-    applyRuntimeStatus(toRuntimeStatus(runtimePhase.runtimePhase))
+    const previousStatus = runtimeStatusRef.current
+    const nextStatus = toRuntimeStatus(runtimePhase.runtimePhase)
+
+    applyRuntimeStatus(nextStatus)
+    recordRuntimeControlTelemetry(runtimePhase)
+
+    if (previousStatus !== 'listening' && nextStatus === 'listening') {
+      voiceTelemetry.record('runtime_status_set_listening', {
+        frameId: runtimePhase.telemetry?.frameId ?? null,
+      })
+    }
 
     if (quiet) {
       return
@@ -394,16 +487,35 @@ function App() {
     void runPrompt(runtimePhase.transcriptText, 'voice')
   }
 
-  const handleMarkSilence = async (): Promise<void> => {
+  const handleMarkSilence = async (telemetryFrameId: string | null = null): Promise<void> => {
+    voiceTelemetry.record('cue_play_requested', {
+      details: {
+        cueType: 'stop_listening',
+        source: 'mark_silence',
+      },
+    })
+
     try {
       await playCue('stop_listening', cueAssetPaths)
+      voiceTelemetry.record('cue_play_started', {
+        details: {
+          cueType: 'stop_listening',
+          source: 'mark_silence',
+        },
+      })
     } catch (error) {
       reportCuePlaybackError('stop_listening', error)
     }
 
-    const runtimePhase = await syncRuntimeControl('mark_silence', {
-      fallbackEvent: 'end_listening',
-    })
+    const runtimePhase = await syncRuntimeControl(
+      'mark_silence',
+      telemetryFrameId === null
+        ? { fallbackEvent: 'end_listening' }
+        : {
+            args: { telemetryFrameId },
+            fallbackEvent: 'end_listening',
+          },
+    )
 
     maybeRunVoiceTranscript(runtimePhase)
   }
@@ -442,12 +554,28 @@ function App() {
         onFrame: async (frame) => {
           try {
             const nowMs = Date.now()
-            const status = await ingestAudioFrame(frame)
+            const frameId = voiceTelemetry.nextFrameId(nowMs)
+
+            voiceTelemetry.record('frontend_frame_captured', {
+              atMs: nowMs,
+              frameId,
+              details: {
+                sampleCount: frame.length,
+              },
+            })
+            voiceTelemetry.record('frontend_frame_sent', {
+              frameId,
+            })
+
+            const status = await ingestAudioFrame(
+              frame,
+              frameId === null ? {} : { telemetryFrameId: frameId },
+            )
 
             if (status !== null) {
               const nextStatus = toRuntimeStatus(status.runtimePhase)
 
-              applyRuntimeStatus(nextStatus)
+              applyRuntimeControlResult(status, { quiet: true })
               voiceActivityStateRef.current = syncVoiceActivityState(
                 voiceActivityStateRef.current,
                 nextStatus,
@@ -460,7 +588,7 @@ function App() {
                 voiceActivityStateRef.current = voiceActivityUpdate.state
 
                 if (voiceActivityUpdate.shouldMarkSilence) {
-                  await handleMarkSilence()
+                  await handleMarkSilence(frameId)
                 }
               }
             }
@@ -520,6 +648,7 @@ function App() {
 
     micAutoStartedRef.current = true
     void startMic()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [micActive, micStarting, startupState])
 
   const sendPrompt = async (): Promise<void> => {

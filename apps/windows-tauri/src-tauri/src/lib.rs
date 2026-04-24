@@ -76,6 +76,17 @@ struct RuntimePhaseResponsePayload {
     capturing_utterance: bool,
     preroll_samples: usize,
     utterance_samples: usize,
+    telemetry: Option<RuntimeTelemetryPayload>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct RuntimeTelemetryPayload {
+    frame_id: Option<String>,
+    backend_ingest_started_ms: Option<u64>,
+    backend_ingest_completed_ms: Option<u64>,
+    wake_detected_ms: Option<u64>,
+    transcription_started_ms: Option<u64>,
+    transcription_completed_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -236,6 +247,7 @@ fn record_speech_activity(
 
 #[tauri::command]
 fn mark_silence(
+    telemetry_frame_id: Option<String>,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<RuntimePhaseResponsePayload, String> {
     let silence_deadline = current_silence_deadline(
@@ -250,6 +262,16 @@ fn mark_silence(
             now_ms: silence_deadline,
         },
     )?;
+
+    let should_measure_transcription = matches!(
+        action,
+        voxgolem_core::voice_pipeline::VoicePipelineAction::FinishedUtterance { .. }
+    );
+    let transcription_started_ms = if should_measure_transcription {
+        Some(current_time_ms()?)
+    } else {
+        None
+    };
 
     let transcript_text = match transcribe_finished_utterance(&action, &app_state.parakeet_runtime)
     {
@@ -266,7 +288,25 @@ fn mark_silence(
         }
     };
 
-    build_mark_silence_response(&app_state.voice_pipeline_state, &action, transcript_text)
+    let transcription_completed_ms = if should_measure_transcription {
+        Some(current_time_ms()?)
+    } else {
+        None
+    };
+
+    build_mark_silence_response(
+        &app_state.voice_pipeline_state,
+        &action,
+        transcript_text,
+        Some(RuntimeTelemetryPayload {
+            frame_id: telemetry_frame_id,
+            backend_ingest_started_ms: None,
+            backend_ingest_completed_ms: None,
+            wake_detected_ms: None,
+            transcription_started_ms,
+            transcription_completed_ms,
+        }),
+    )
 }
 
 #[tauri::command]
@@ -289,8 +329,10 @@ fn reset_session(
 #[tauri::command]
 fn ingest_audio_frame(
     frame: Vec<f32>,
+    telemetry_frame_id: Option<String>,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<RuntimePhaseResponsePayload, String> {
+    let backend_ingest_started_ms = current_time_ms()?;
     let mut guard = app_state
         .voice_pipeline_state
         .lock()
@@ -339,7 +381,21 @@ fn ingest_audio_frame(
 
     *guard = next_state;
 
-    Ok(runtime_phase_response_from_state(&guard, None, None))
+    let backend_ingest_completed_ms = current_time_ms()?;
+
+    Ok(runtime_phase_response_from_state(
+        &guard,
+        None,
+        None,
+        Some(RuntimeTelemetryPayload {
+            frame_id: telemetry_frame_id,
+            backend_ingest_started_ms: Some(backend_ingest_started_ms),
+            backend_ingest_completed_ms: Some(backend_ingest_completed_ms),
+            wake_detected_ms: wake_word_now_ms,
+            transcription_started_ms: None,
+            transcription_completed_ms: None,
+        }),
+    ))
 }
 
 fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
@@ -514,6 +570,7 @@ fn current_runtime_phase_response(
         &guard,
         transcription_ready_samples,
         transcript_text,
+        None,
     ))
 }
 
@@ -521,6 +578,7 @@ fn runtime_phase_response_from_state(
     voice_pipeline_state: &voxgolem_core::voice_pipeline::VoicePipelineState,
     transcription_ready_samples: Option<usize>,
     transcript_text: Option<String>,
+    telemetry: Option<RuntimeTelemetryPayload>,
 ) -> RuntimePhaseResponsePayload {
     RuntimePhaseResponsePayload {
         runtime_phase: to_runtime_phase_payload(voice_pipeline_state.session().runtime().phase()),
@@ -533,6 +591,7 @@ fn runtime_phase_response_from_state(
         capturing_utterance: voice_pipeline_state.capture().capturing_utterance(),
         preroll_samples: voice_pipeline_state.capture().preroll_len(),
         utterance_samples: voice_pipeline_state.capture().utterance_len(),
+        telemetry,
     }
 }
 
@@ -799,12 +858,18 @@ fn build_mark_silence_response(
     voice_pipeline_state: &Mutex<voxgolem_core::voice_pipeline::VoicePipelineState>,
     action: &voxgolem_core::voice_pipeline::VoicePipelineAction,
     transcript_text: Option<String>,
+    telemetry: Option<RuntimeTelemetryPayload>,
 ) -> Result<RuntimePhaseResponsePayload, String> {
-    current_runtime_phase_response(
-        voice_pipeline_state,
+    let guard = voice_pipeline_state
+        .lock()
+        .map_err(|_| String::from("voice pipeline lock is poisoned"))?;
+
+    Ok(runtime_phase_response_from_state(
+        &guard,
         transcription_ready_samples(action),
         transcript_text,
-    )
+        telemetry,
+    ))
 }
 
 fn reset_voice_pipeline_to_waiting(
@@ -857,7 +922,7 @@ mod tests {
         prompt_result_error_message, reset_voice_pipeline_to_waiting, reset_wake_word_runtime,
         runtime_phase_response_from_state, to_runtime_phase_payload, transcribe_finished_utterance,
         transcription_ready_samples, RuntimePhasePayload, RuntimePhaseResponsePayload,
-        DEFAULT_SILENCE_TIMEOUT_MS,
+        RuntimeTelemetryPayload, DEFAULT_SILENCE_TIMEOUT_MS,
     };
     use crate::wake_word::WakeWordRuntime;
     use std::sync::Mutex;
@@ -992,7 +1057,7 @@ mod tests {
         .expect("listening frame should be recorded");
 
         assert_eq!(
-            runtime_phase_response_from_state(&utterance_state, None, None),
+            runtime_phase_response_from_state(&utterance_state, None, None, None),
             RuntimePhaseResponsePayload {
                 runtime_phase: RuntimePhasePayload::Listening,
                 transcription_ready_samples: None,
@@ -1001,6 +1066,7 @@ mod tests {
                 capturing_utterance: true,
                 preroll_samples: 3,
                 utterance_samples: 5,
+                telemetry: None,
             }
         );
     }
@@ -1015,6 +1081,7 @@ mod tests {
             capturing_utterance: false,
             preroll_samples: 3,
             utterance_samples: 0,
+            telemetry: None,
         };
 
         assert_eq!(payload.preroll_samples, 3);
@@ -1025,6 +1092,39 @@ mod tests {
         assert_eq!(
             payload.transcript_text.as_deref(),
             Some("open the pull request")
+        );
+    }
+
+    #[test]
+    fn runtime_phase_response_payload_can_hold_telemetry_fields() {
+        let payload = RuntimePhaseResponsePayload {
+            runtime_phase: RuntimePhasePayload::Listening,
+            transcription_ready_samples: None,
+            transcript_text: None,
+            last_activity_ms: Some(100),
+            capturing_utterance: true,
+            preroll_samples: 3,
+            utterance_samples: 5,
+            telemetry: Some(RuntimeTelemetryPayload {
+                frame_id: Some("frame-1".to_string()),
+                backend_ingest_started_ms: Some(110),
+                backend_ingest_completed_ms: Some(120),
+                wake_detected_ms: Some(118),
+                transcription_started_ms: None,
+                transcription_completed_ms: None,
+            }),
+        };
+
+        assert_eq!(
+            payload.telemetry,
+            Some(RuntimeTelemetryPayload {
+                frame_id: Some("frame-1".to_string()),
+                backend_ingest_started_ms: Some(110),
+                backend_ingest_completed_ms: Some(120),
+                wake_detected_ms: Some(118),
+                transcription_started_ms: None,
+                transcription_completed_ms: None,
+            })
         );
     }
 
@@ -1061,6 +1161,7 @@ mod tests {
                 capturing_utterance: false,
                 preroll_samples: 2,
                 utterance_samples: 0,
+                telemetry: None,
             })
         );
     }
@@ -1132,7 +1233,9 @@ mod tests {
         let processing_state = voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
             &processing_state,
             voice_pipeline_config,
-            voxgolem_core::voice_pipeline::VoicePipelineEvent::SilenceCheck { now_ms: 1_300 },
+            voxgolem_core::voice_pipeline::VoicePipelineEvent::SilenceCheck {
+                now_ms: DEFAULT_SILENCE_TIMEOUT_MS + 101,
+            },
         )
         .expect("silence should move runtime to processing")
         .0;
@@ -1150,6 +1253,14 @@ mod tests {
                 &locked_state,
                 &action,
                 Some("draft release notes".to_string()),
+                Some(RuntimeTelemetryPayload {
+                    frame_id: Some("frame-2".to_string()),
+                    backend_ingest_started_ms: None,
+                    backend_ingest_completed_ms: None,
+                    wake_detected_ms: None,
+                    transcription_started_ms: Some(2000),
+                    transcription_completed_ms: Some(2100),
+                }),
             ),
             Ok(RuntimePhaseResponsePayload {
                 runtime_phase: RuntimePhasePayload::Processing,
@@ -1159,6 +1270,14 @@ mod tests {
                 capturing_utterance: false,
                 preroll_samples: 0,
                 utterance_samples: 0,
+                telemetry: Some(RuntimeTelemetryPayload {
+                    frame_id: Some("frame-2".to_string()),
+                    backend_ingest_started_ms: None,
+                    backend_ingest_completed_ms: None,
+                    wake_detected_ms: None,
+                    transcription_started_ms: Some(2000),
+                    transcription_completed_ms: Some(2100),
+                }),
             })
         );
     }
@@ -1190,7 +1309,9 @@ mod tests {
         let processing_state = voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
             &processing_state,
             voice_pipeline_config,
-            voxgolem_core::voice_pipeline::VoicePipelineEvent::SilenceCheck { now_ms: 1_300 },
+            voxgolem_core::voice_pipeline::VoicePipelineEvent::SilenceCheck {
+                now_ms: DEFAULT_SILENCE_TIMEOUT_MS + 101,
+            },
         )
         .expect("silence should move runtime to processing")
         .0;
