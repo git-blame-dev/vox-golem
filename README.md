@@ -49,3 +49,9 @@ The Windows runtime expects these configured local assets in `%APPDATA%\VoxGolem
 - `response_backend`: backend selector, currently `opencode` or `llama_cpp`
 - `[opencode].path`: local `opencode` executable when `response_backend = "opencode"`
 - `[llama_cpp].server_path`, `[llama_cpp].host`, `[llama_cpp].port`, and `[llama_cpp].fast_model_path`: local llama.cpp runtime fields when `response_backend = "llama_cpp"`
+
+For the current local Gemma desktop path, `%APPDATA%\VoxGolem` also needs:
+
+- `SOUL.md`
+- `models/llama/gemma-3-1b-it-Q4_K_M.gguf`
+- `llama/bin/llama-server.exe`
