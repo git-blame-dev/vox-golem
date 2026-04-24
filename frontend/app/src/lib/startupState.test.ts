@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { DEFAULT_CUE_ASSET_PATHS, loadStartupState, parseStartupState } from './startupState'
+import { DEFAULT_CUE_ASSET_PATHS, isStartupStateSettled, loadStartupState, parseStartupState } from './startupState'
 
 afterEach(() => {
   Reflect.deleteProperty(window, '__TAURI_INTERNALS__')
@@ -42,6 +42,32 @@ describe('parseStartupState', () => {
     })
   })
 
+  it('returns warming state for valid warming payload', () => {
+    expect(
+      parseStartupState({
+        kind: 'warming_model',
+        cue_asset_paths: {
+          start_listening: 'resources/start-listening.wav',
+          stop_listening: 'resources/stop-listening.wav',
+        },
+        runtime_phase: 'initializing',
+        voice_input_available: true,
+        voice_input_error: null,
+        message: 'Loading local Gemma model...',
+      }),
+    ).toEqual({
+      kind: 'warming_model',
+      cueAssetPaths: {
+        startListening: 'resources/start-listening.wav',
+        stopListening: 'resources/stop-listening.wav',
+      },
+      runtimePhase: 'initializing',
+      voiceInputAvailable: true,
+      voiceInputError: null,
+      message: 'Loading local Gemma model...',
+    })
+  })
+
   it('throws when ready payload omits cue paths', () => {
     expect(() => parseStartupState({ kind: 'ready' })).toThrow(
       'Startup ready payload must include voice_input_available',
@@ -50,6 +76,39 @@ describe('parseStartupState', () => {
 
   it('throws for unsupported payloads', () => {
     expect(() => parseStartupState({ kind: 'loading' })).toThrow()
+  })
+})
+
+describe('isStartupStateSettled', () => {
+  it('returns false while the model is warming', () => {
+    expect(
+      isStartupStateSettled({
+        kind: 'warming_model',
+        cueAssetPaths: DEFAULT_CUE_ASSET_PATHS,
+        runtimePhase: 'initializing',
+        voiceInputAvailable: true,
+        voiceInputError: null,
+        message: 'Loading local Gemma model...',
+      }),
+    ).toBe(false)
+  })
+
+  it('returns true for ready and error states', () => {
+    expect(
+      isStartupStateSettled({
+        kind: 'ready',
+        cueAssetPaths: DEFAULT_CUE_ASSET_PATHS,
+        runtimePhase: 'sleeping',
+        voiceInputAvailable: true,
+        voiceInputError: null,
+      }),
+    ).toBe(true)
+    expect(
+      isStartupStateSettled({
+        kind: 'error',
+        message: 'startup failed',
+      }),
+    ).toBe(true)
   })
 })
 
