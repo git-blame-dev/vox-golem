@@ -161,6 +161,7 @@ function parseRuntimeControlTelemetry(payload: unknown): RuntimeControlTelemetry
     'backend_ingest_completed_ms',
   )
   const wakeDetectedMs = parseTelemetryOptionalNumber(record['wake_detected_ms'], 'wake_detected_ms')
+  const wakeConfidence = parseTelemetryOptionalNumber(record['wake_confidence'], 'wake_confidence')
   const transcriptionStartedMs = parseTelemetryOptionalNumber(
     record['transcription_started_ms'],
     'transcription_started_ms',
@@ -175,6 +176,7 @@ function parseRuntimeControlTelemetry(payload: unknown): RuntimeControlTelemetry
     backendIngestStartedMs,
     backendIngestCompletedMs,
     wakeDetectedMs,
+    wakeConfidence,
     transcriptionStartedMs,
     transcriptionCompletedMs,
   }
