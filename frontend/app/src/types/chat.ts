@@ -42,6 +42,14 @@ export interface PromptExecutionResult {
 export type StartupState =
   | { readonly kind: 'loading' }
   | {
+      readonly kind: 'warming_model'
+      readonly cueAssetPaths: CueAssetPaths
+      readonly runtimePhase: BackendRuntimePhase
+      readonly voiceInputAvailable: boolean
+      readonly voiceInputError: string | null
+      readonly message: string
+    }
+  | {
       readonly kind: 'ready'
       readonly cueAssetPaths: CueAssetPaths
       readonly runtimePhase: BackendRuntimePhase

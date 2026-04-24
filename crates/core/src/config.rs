@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 const WINDOWS_CONFIG_DIR: &str = "VoxGolem";
 const WINDOWS_CONFIG_FILE: &str = "config.toml";
+const WINDOWS_SOUL_FILE: &str = "SOUL.md";
 const DEFAULT_SILERO_VAD_MODEL: &str = "models/silero-vad.onnx";
 
 #[derive(Debug, Clone, Deserialize)]
@@ -14,11 +15,39 @@ struct RawConfig {
     wake_word_model_path: PathBuf,
     parakeet_model_dir: PathBuf,
     silero_vad_model: Option<PathBuf>,
-    opencode_path: PathBuf,
+    response_backend: RawResponseBackend,
+    #[serde(default)]
+    opencode: Option<RawOpencodeConfig>,
+    #[serde(default)]
+    llama_cpp: Option<RawLlamaCppConfig>,
     #[serde(default, rename = "start_listening_cue")]
     _start_listening_cue: Option<PathBuf>,
     #[serde(default, rename = "stop_listening_cue")]
     _stop_listening_cue: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RawResponseBackend {
+    Opencode,
+    LlamaCpp,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOpencodeConfig {
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLlamaCppConfig {
+    server_path: PathBuf,
+    host: String,
+    port: u16,
+    fast_model_path: PathBuf,
+    #[serde(default)]
+    quality_model_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,7 +55,21 @@ pub struct RuntimeConfig {
     pub wake_word_model_path: PathBuf,
     pub parakeet_model_dir: PathBuf,
     pub silero_vad_model: PathBuf,
-    pub opencode_path: PathBuf,
+    pub response_backend: ResponseBackendConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResponseBackendConfig {
+    Opencode {
+        path: PathBuf,
+    },
+    LlamaCpp {
+        server_path: PathBuf,
+        host: String,
+        port: u16,
+        fast_model_path: PathBuf,
+        quality_model_path: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,7 +80,8 @@ pub enum ConfigError {
     ParseConfigFailed { path: PathBuf, details: String },
     MissingFile { field: &'static str, path: PathBuf },
     MissingDirectory { field: &'static str, path: PathBuf },
-    MissingExecutable { path: PathBuf },
+    MissingExecutable { field: &'static str, path: PathBuf },
+    MissingBackendConfig { backend: &'static str },
 }
 
 impl Display for ConfigError {
@@ -80,11 +124,17 @@ impl Display for ConfigError {
                     path.display()
                 )
             }
-            Self::MissingExecutable { path } => {
+            Self::MissingExecutable { field, path } => {
                 write!(
                     formatter,
-                    "invalid `opencode_path`; expected an existing executable file: {}",
+                    "invalid `{field}` path; expected an existing executable file: {}",
                     path.display()
+                )
+            }
+            Self::MissingBackendConfig { backend } => {
+                write!(
+                    formatter,
+                    "missing configuration table for selected backend `{backend}`"
                 )
             }
         }
@@ -94,11 +144,17 @@ impl Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 pub fn default_config_path() -> Result<PathBuf, ConfigError> {
+    Ok(default_app_data_dir()?.join(WINDOWS_CONFIG_FILE))
+}
+
+pub fn default_soul_path() -> Result<PathBuf, ConfigError> {
+    Ok(default_app_data_dir()?.join(WINDOWS_SOUL_FILE))
+}
+
+fn default_app_data_dir() -> Result<PathBuf, ConfigError> {
     let app_data = std::env::var_os("APPDATA").ok_or(ConfigError::MissingAppData)?;
 
-    Ok(PathBuf::from(app_data)
-        .join(WINDOWS_CONFIG_DIR)
-        .join(WINDOWS_CONFIG_FILE))
+    Ok(PathBuf::from(app_data).join(WINDOWS_CONFIG_DIR))
 }
 
 pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig, ConfigError> {
@@ -126,7 +182,7 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
 
     let raw_config = toml::from_str::<RawConfig>(&config_contents).map_err(|error| {
         ConfigError::ParseConfigFailed {
-            path: config_path,
+            path: config_path.clone(),
             details: error.to_string(),
         }
     })?;
@@ -139,18 +195,62 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
             .silero_vad_model
             .unwrap_or_else(|| PathBuf::from(DEFAULT_SILERO_VAD_MODEL)),
     );
-    let opencode_path = resolve_config_path(&config_dir, raw_config.opencode_path);
 
     validate_existing_file(&wake_word_model_path, "wake_word_model_path")?;
     validate_existing_directory(&parakeet_model_dir, "parakeet_model_dir")?;
     validate_existing_file(&silero_vad_model, "silero_vad_model")?;
-    validate_existing_executable(&opencode_path)?;
+
+    let response_backend = match raw_config.response_backend {
+        RawResponseBackend::Opencode => {
+            let raw_opencode = raw_config
+                .opencode
+                .ok_or(ConfigError::MissingBackendConfig {
+                    backend: "opencode",
+                })?;
+            let path = resolve_config_path(&config_dir, raw_opencode.path);
+            validate_existing_executable(&path, "opencode.path")?;
+
+            ResponseBackendConfig::Opencode { path }
+        }
+        RawResponseBackend::LlamaCpp => {
+            let raw_llama_cpp = raw_config
+                .llama_cpp
+                .ok_or(ConfigError::MissingBackendConfig {
+                    backend: "llama_cpp",
+                })?;
+            let server_path = resolve_config_path(&config_dir, raw_llama_cpp.server_path);
+            let host = raw_llama_cpp.host.trim().to_string();
+            let port = raw_llama_cpp.port;
+            let fast_model_path = resolve_config_path(&config_dir, raw_llama_cpp.fast_model_path);
+            let quality_model_path = raw_llama_cpp
+                .quality_model_path
+                .map(|path| resolve_config_path(&config_dir, path));
+
+            if host.is_empty() {
+                return Err(ConfigError::ParseConfigFailed {
+                    path: config_path.clone(),
+                    details: String::from("llama_cpp.host must not be empty"),
+                });
+            }
+
+            validate_existing_executable(&server_path, "llama_cpp.server_path")?;
+            validate_existing_file(&fast_model_path, "llama_cpp.fast_model_path")?;
+
+            ResponseBackendConfig::LlamaCpp {
+                server_path,
+                host,
+                port,
+                fast_model_path,
+                quality_model_path,
+            }
+        }
+    };
 
     Ok(RuntimeConfig {
         wake_word_model_path,
         parakeet_model_dir,
         silero_vad_model,
-        opencode_path,
+        response_backend,
     })
 }
 
@@ -184,19 +284,20 @@ fn validate_existing_directory(path: &Path, field: &'static str) -> Result<(), C
     })
 }
 
-fn validate_existing_executable(path: &Path) -> Result<(), ConfigError> {
+fn validate_existing_executable(path: &Path, field: &'static str) -> Result<(), ConfigError> {
     if path.is_file() {
         return Ok(());
     }
 
     Err(ConfigError::MissingExecutable {
+        field,
         path: path.to_path_buf(),
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{load_runtime_config, ConfigError};
+    use super::{load_runtime_config, ConfigError, ResponseBackendConfig};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -267,18 +368,17 @@ mod tests {
         let temp = TempDir::new();
         let model_dir = temp.path().join("models");
         let silero_vad_model = model_dir.join("silero-vad.onnx");
+        let opencode_path = temp.path().join("opencode.exe");
+        let config_path = temp.path().join("config.toml");
+        let missing_wake_word_model_path = model_dir.join("hey_livekit.onnx");
+
         fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
         create_file(&silero_vad_model);
-
-        let opencode_path = temp.path().join("opencode.exe");
         create_file(&opencode_path);
-
-        let missing_wake_word_model_path = model_dir.join("hey_livekit.onnx");
-        let config_path = temp.path().join("config.toml");
 
         fs::write(
             &config_path,
-            render_config(
+            render_opencode_config(
                 &missing_wake_word_model_path,
                 &model_dir,
                 &silero_vad_model,
@@ -315,13 +415,13 @@ mod tests {
         fs::write(
             &config_path,
             format!(
-                "wake_word_model_path = \"{}\"\nparakeet_model_dir = \"{}\"\nopencode_path = \"{}\"\n",
+                "wake_word_model_path = \"{}\"\nparakeet_model_dir = \"{}\"\nresponse_backend = \"opencode\"\n\n[opencode]\npath = \"{}\"\n",
                 escape_path(&wake_word_model_path),
                 escape_path(&model_dir),
                 escape_path(&opencode_path),
             ),
         )
-        .expect("config fixture should be written");
+        .expect("config without silero_vad_model should be written");
 
         let result = load_runtime_config(Some(&config_path))
             .expect("config without silero_vad_model should use default path");
@@ -344,7 +444,7 @@ mod tests {
 
         fs::write(
             &config_path,
-            render_config(
+            render_opencode_config(
                 &wake_word_model_path,
                 &model_dir,
                 &missing_silero_vad_model,
@@ -365,7 +465,73 @@ mod tests {
     }
 
     #[test]
-    fn loads_valid_config() {
+    fn reports_missing_backend_table_for_selected_backend() {
+        let temp = TempDir::new();
+        let model_dir = temp.path().join("models");
+        let wake_word_model_path = model_dir.join("hey_livekit.onnx");
+        let silero_vad_model = model_dir.join("silero-vad.onnx");
+        let config_path = temp.path().join("config.toml");
+
+        fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
+        create_file(&wake_word_model_path);
+        create_file(&silero_vad_model);
+
+        fs::write(
+            &config_path,
+            format!(
+                "wake_word_model_path = \"{}\"\nparakeet_model_dir = \"{}\"\nsilero_vad_model = \"{}\"\nresponse_backend = \"llama_cpp\"\n",
+                escape_path(&wake_word_model_path),
+                escape_path(&model_dir),
+                escape_path(&silero_vad_model),
+            ),
+        )
+        .expect("config fixture should be written");
+
+        let result = load_runtime_config(Some(&config_path));
+
+        assert_eq!(
+            result,
+            Err(ConfigError::MissingBackendConfig {
+                backend: "llama_cpp",
+            })
+        );
+    }
+
+    #[test]
+    fn reports_missing_opencode_table_for_selected_backend() {
+        let temp = TempDir::new();
+        let model_dir = temp.path().join("models");
+        let wake_word_model_path = model_dir.join("hey_livekit.onnx");
+        let silero_vad_model = model_dir.join("silero-vad.onnx");
+        let config_path = temp.path().join("config.toml");
+
+        fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
+        create_file(&wake_word_model_path);
+        create_file(&silero_vad_model);
+
+        fs::write(
+            &config_path,
+            format!(
+                "wake_word_model_path = \"{}\"\nparakeet_model_dir = \"{}\"\nsilero_vad_model = \"{}\"\nresponse_backend = \"opencode\"\n",
+                escape_path(&wake_word_model_path),
+                escape_path(&model_dir),
+                escape_path(&silero_vad_model),
+            ),
+        )
+        .expect("config fixture should be written");
+
+        let result = load_runtime_config(Some(&config_path));
+
+        assert_eq!(
+            result,
+            Err(ConfigError::MissingBackendConfig {
+                backend: "opencode",
+            })
+        );
+    }
+
+    #[test]
+    fn loads_valid_opencode_backend_config() {
         let temp = TempDir::new();
         let model_dir = temp.path().join("models");
         let wake_word_model_path = model_dir.join("hey_livekit.onnx");
@@ -380,7 +546,7 @@ mod tests {
 
         fs::write(
             &config_path,
-            render_config(
+            render_opencode_config(
                 &wake_word_model_path,
                 &model_dir,
                 &silero_vad_model,
@@ -389,11 +555,58 @@ mod tests {
         )
         .expect("config fixture should be written");
 
-        let result = load_runtime_config(Some(&config_path));
+        let result = load_runtime_config(Some(&config_path)).expect("valid config should load");
 
         assert_eq!(
-            result.expect("valid config should load").silero_vad_model,
-            silero_vad_model
+            result.response_backend,
+            ResponseBackendConfig::Opencode {
+                path: opencode_path,
+            }
+        );
+    }
+
+    #[test]
+    fn loads_valid_llama_cpp_backend_config() {
+        let temp = TempDir::new();
+        let model_dir = temp.path().join("models");
+        let wake_word_model_path = model_dir.join("hey_livekit.onnx");
+        let silero_vad_model = model_dir.join("silero-vad.onnx");
+        let llama_dir = temp.path().join("llama");
+        let server_path = llama_dir.join("llama-server.exe");
+        let fast_model_path = model_dir.join("gemma-3-1b-it-Q4_K_M.gguf");
+        let config_path = temp.path().join("config.toml");
+
+        fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
+        fs::create_dir_all(&llama_dir).expect("llama directory fixture should be created");
+        create_file(&wake_word_model_path);
+        create_file(&silero_vad_model);
+        create_file(&server_path);
+        create_file(&fast_model_path);
+
+        fs::write(
+            &config_path,
+            render_llama_cpp_config(
+                &wake_word_model_path,
+                &model_dir,
+                &silero_vad_model,
+                &server_path,
+                &fast_model_path,
+                None,
+            ),
+        )
+        .expect("config fixture should be written");
+
+        let result = load_runtime_config(Some(&config_path)).expect("valid config should load");
+
+        assert_eq!(
+            result.response_backend,
+            ResponseBackendConfig::LlamaCpp {
+                server_path,
+                host: String::from("127.0.0.1"),
+                port: 11_435,
+                fast_model_path,
+                quality_model_path: None,
+            }
         );
     }
 
@@ -405,21 +618,41 @@ mod tests {
         fs::write(path, b"fixture").expect("file fixture should be written");
     }
 
-    fn render_config(
+    fn render_opencode_config(
         wake_word_model_path: &Path,
         parakeet_model_dir: &Path,
         silero_vad_model: &Path,
         opencode_path: &Path,
     ) -> String {
-        let silero_vad_model_line =
-            format!("silero_vad_model = \"{}\"\n", escape_path(silero_vad_model));
-
         format!(
-            "wake_word_model_path = \"{}\"\nparakeet_model_dir = \"{}\"\n{}opencode_path = \"{}\"\n",
+            "wake_word_model_path = \"{}\"\nparakeet_model_dir = \"{}\"\nsilero_vad_model = \"{}\"\nresponse_backend = \"opencode\"\n\n[opencode]\npath = \"{}\"\n",
             escape_path(wake_word_model_path),
             escape_path(parakeet_model_dir),
-            silero_vad_model_line,
+            escape_path(silero_vad_model),
             escape_path(opencode_path),
+        )
+    }
+
+    fn render_llama_cpp_config(
+        wake_word_model_path: &Path,
+        parakeet_model_dir: &Path,
+        silero_vad_model: &Path,
+        server_path: &Path,
+        fast_model_path: &Path,
+        quality_model_path: Option<&Path>,
+    ) -> String {
+        let quality_model_line = quality_model_path.map_or(String::new(), |path| {
+            format!("quality_model_path = \"{}\"\n", escape_path(path))
+        });
+
+        format!(
+            "wake_word_model_path = \"{}\"\nparakeet_model_dir = \"{}\"\nsilero_vad_model = \"{}\"\nresponse_backend = \"llama_cpp\"\n\n[llama_cpp]\nserver_path = \"{}\"\nhost = \"127.0.0.1\"\nport = 11435\nfast_model_path = \"{}\"\n{}",
+            escape_path(wake_word_model_path),
+            escape_path(parakeet_model_dir),
+            escape_path(silero_vad_model),
+            escape_path(server_path),
+            escape_path(fast_model_path),
+            quality_model_line,
         )
     }
 

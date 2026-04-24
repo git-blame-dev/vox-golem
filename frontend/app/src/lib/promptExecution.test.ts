@@ -34,6 +34,22 @@ describe('parsePromptExecutionResult', () => {
     })
   })
 
+  it('parses a valid local-backend execution payload with null exit code', () => {
+    expect(
+      parsePromptExecutionResult({
+        events: [{ kind: 'text', text: 'Local Gemma response' }],
+        stderr: '',
+        exit_code: null,
+        runtime_phase: 'sleeping',
+      }),
+    ).toEqual({
+      events: [{ kind: 'text', text: 'Local Gemma response' }],
+      stderr: '',
+      exitCode: null,
+      runtimePhase: 'sleeping',
+    })
+  })
+
   it('throws for invalid payload shape', () => {
     expect(() => parsePromptExecutionResult({ stdout: 'done' })).toThrow()
   })
@@ -68,6 +84,29 @@ describe('executePrompt', () => {
       events: [{ kind: 'text', text: 'OpenCode response' }],
       stderr: '',
       exitCode: 0,
+      runtimePhase: 'sleeping',
+    })
+  })
+
+  it('uses tauri prompt execution when the local backend returns null exit code', async () => {
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command, args) => {
+        expect(command).toBe('submit_prompt')
+        expect(args).toEqual({ prompt: 'Draft release notes' })
+
+        return {
+          events: [{ kind: 'text', text: 'Local Gemma response' }],
+          stderr: '',
+          exit_code: null,
+          runtime_phase: 'sleeping',
+        }
+      },
+    }
+
+    await expect(executePrompt('Draft release notes')).resolves.toEqual({
+      events: [{ kind: 'text', text: 'Local Gemma response' }],
+      stderr: '',
+      exitCode: null,
       runtimePhase: 'sleeping',
     })
   })

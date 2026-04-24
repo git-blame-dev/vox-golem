@@ -509,7 +509,7 @@ mod tests {
         let result = run_opencode(&spec).expect("fake executable should run");
 
         assert_eq!(result.stdout, "");
-        assert_eq!(result.stderr, format!("bad prompt{}", platform_newline()));
+        assert_eq!(result.stderr.trim_end_matches(['\r', '\n']), "bad prompt");
         assert_eq!(result.exit_code, Some(7));
         assert!(!result.succeeded());
     }
