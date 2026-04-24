@@ -68,7 +68,7 @@ struct PromptExecutionPayload {
     runtime_phase: RuntimePhasePayload,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 struct RuntimePhaseResponsePayload {
     runtime_phase: RuntimePhasePayload,
     transcription_ready_samples: Option<usize>,
@@ -80,12 +80,13 @@ struct RuntimePhaseResponsePayload {
     telemetry: Option<RuntimeTelemetryPayload>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 struct RuntimeTelemetryPayload {
     frame_id: Option<String>,
     backend_ingest_started_ms: Option<u64>,
     backend_ingest_completed_ms: Option<u64>,
     wake_detected_ms: Option<u64>,
+    wake_confidence: Option<f32>,
     transcription_started_ms: Option<u64>,
     transcription_completed_ms: Option<u64>,
 }
@@ -304,6 +305,7 @@ fn mark_silence(
             backend_ingest_started_ms: None,
             backend_ingest_completed_ms: None,
             wake_detected_ms: None,
+            wake_confidence: None,
             transcription_started_ms,
             transcription_completed_ms,
         }),
@@ -344,18 +346,15 @@ fn ingest_audio_frame(
         voxgolem_core::runtime::RuntimePhase::Listening
     );
 
-    let wake_word_now_ms = if matches!(
+    let wake_word_detection = if matches!(
         guard.session().runtime().phase(),
         voxgolem_core::runtime::RuntimePhase::Sleeping
     ) {
-        if process_wake_word_frame(&app_state.wake_word_runtime, &frame)?.is_some() {
-            Some(now_ms)
-        } else {
-            None
-        }
+        process_wake_word_frame(&app_state.wake_word_runtime, &frame)?
     } else {
         None
     };
+    let wake_word_now_ms = wake_word_event_timestamp(now_ms, wake_word_detection);
     let speech_detected = if started_listening {
         process_voice_activity_frame(&app_state.voice_activity_runtime, &frame)?
     } else {
@@ -393,6 +392,7 @@ fn ingest_audio_frame(
             backend_ingest_started_ms: Some(backend_ingest_started_ms),
             backend_ingest_completed_ms: Some(backend_ingest_completed_ms),
             wake_detected_ms: wake_word_now_ms,
+            wake_confidence: wake_word_detection.map(|detection| detection.confidence),
             transcription_started_ms: None,
             transcription_completed_ms: None,
         }),
@@ -600,7 +600,7 @@ fn runtime_phase_response_from_state(
 fn process_wake_word_frame(
     wake_word_runtime: &Option<Mutex<wake_word::WakeWordRuntime>>,
     frame: &[f32],
-) -> Result<Option<u64>, String> {
+) -> Result<Option<wake_word::WakeWordDetection>, String> {
     let Some(wake_word_runtime) = wake_word_runtime else {
         return Ok(None);
     };
@@ -670,29 +670,34 @@ fn ingest_audio_frame_with_optional_wake_word_detection(
     frame: Vec<f32>,
     wake_word_now_ms: Option<u64>,
 ) -> Result<voxgolem_core::voice_pipeline::VoicePipelineState, String> {
-    let mut next_state = voxgolem_core::voice_pipeline::ingest_audio_frame(
-        voice_pipeline_state,
-        voice_pipeline_config,
-        frame,
-    )
-    .map_err(|error| format!("voice pipeline frame ingestion failed: {error:?}"))?;
-
     if matches!(
         voice_pipeline_state.session().runtime().phase(),
         voxgolem_core::runtime::RuntimePhase::Sleeping
     ) {
         if let Some(now_ms) = wake_word_now_ms {
-            next_state = voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
-                &next_state,
+            let listening_state = voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
+                voice_pipeline_state,
                 voice_pipeline_config,
                 voxgolem_core::voice_pipeline::VoicePipelineEvent::WakeWordDetected { now_ms },
             )
             .map_err(|error| format!("wake word transition failed: {error:?}"))?
             .0;
+
+            return voxgolem_core::voice_pipeline::ingest_audio_frame(
+                &listening_state,
+                voice_pipeline_config,
+                frame,
+            )
+            .map_err(|error| format!("voice pipeline frame ingestion failed: {error:?}"));
         }
     }
 
-    Ok(next_state)
+    voxgolem_core::voice_pipeline::ingest_audio_frame(
+        voice_pipeline_state,
+        voice_pipeline_config,
+        frame,
+    )
+    .map_err(|error| format!("voice pipeline frame ingestion failed: {error:?}"))
 }
 
 fn apply_optional_speech_activity(
@@ -717,6 +722,13 @@ fn apply_optional_speech_activity(
     )
     .map(|(next_state, _)| next_state)
     .map_err(|error| format!("speech activity transition failed: {error:?}"))
+}
+
+fn wake_word_event_timestamp(
+    now_ms: u64,
+    wake_word_detection: Option<wake_word::WakeWordDetection>,
+) -> Option<u64> {
+    wake_word_detection.map(|_| now_ms)
 }
 
 fn to_runtime_phase_payload(
@@ -923,10 +935,10 @@ mod tests {
         ingest_audio_frame_with_optional_wake_word_detection, process_wake_word_frame,
         prompt_result_error_message, reset_voice_pipeline_to_waiting, reset_wake_word_runtime,
         runtime_phase_response_from_state, to_runtime_phase_payload, transcribe_finished_utterance,
-        transcription_ready_samples, RuntimePhasePayload, RuntimePhaseResponsePayload,
-        RuntimeTelemetryPayload, DEFAULT_SILENCE_TIMEOUT_MS,
+        transcription_ready_samples, wake_word_event_timestamp, RuntimePhasePayload,
+        RuntimePhaseResponsePayload, RuntimeTelemetryPayload, DEFAULT_SILENCE_TIMEOUT_MS,
     };
-    use crate::wake_word::WakeWordRuntime;
+    use crate::wake_word::{WakeWordDetection, WakeWordRuntime};
     use std::sync::Mutex;
 
     #[test]
@@ -1067,7 +1079,7 @@ mod tests {
                 last_activity_ms: Some(100),
                 capturing_utterance: true,
                 preroll_samples: 3,
-                utterance_samples: 5,
+                utterance_samples: 2,
                 telemetry: None,
             }
         );
@@ -1108,6 +1120,7 @@ mod tests {
             backend_ingest_started_ms: Some(110),
             backend_ingest_completed_ms: Some(120),
             wake_detected_ms: Some(118),
+            wake_confidence: Some(0.72),
             transcription_started_ms: None,
             transcription_completed_ms: None,
         };
@@ -1253,6 +1266,7 @@ mod tests {
                     backend_ingest_started_ms: None,
                     backend_ingest_completed_ms: None,
                     wake_detected_ms: None,
+                    wake_confidence: None,
                     transcription_started_ms: Some(2000),
                     transcription_completed_ms: Some(2100),
                 }),
@@ -1270,6 +1284,7 @@ mod tests {
                     backend_ingest_started_ms: None,
                     backend_ingest_completed_ms: None,
                     wake_detected_ms: None,
+                    wake_confidence: None,
                     transcription_started_ms: Some(2000),
                     transcription_completed_ms: Some(2100),
                 }),
@@ -1323,7 +1338,7 @@ mod tests {
     }
 
     #[test]
-    fn ingest_audio_frame_can_promote_sleeping_to_listening_when_wake_word_detects() {
+    fn ingest_audio_frame_wake_detection_starts_listening_without_seeding_preroll() {
         let voice_pipeline_config = default_voice_pipeline_config();
         let ready_state = voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
             &voxgolem_core::voice_pipeline::VoicePipelineState::new(voice_pipeline_config)
@@ -1346,7 +1361,7 @@ mod tests {
             voxgolem_core::runtime::RuntimePhase::Listening
         );
         assert!(listening_state.capture().capturing_utterance());
-        assert_eq!(listening_state.capture().preroll_len(), 3);
+        assert_eq!(listening_state.capture().preroll_len(), 0);
         assert_eq!(listening_state.capture().utterance_len(), 3);
     }
 
@@ -1395,5 +1410,20 @@ mod tests {
             .expect("missing model file should fail");
 
         assert!(error.contains("failed to load wake word model"));
+    }
+
+    #[test]
+    fn wake_word_event_timestamp_uses_backend_now_ms() {
+        assert_eq!(
+            wake_word_event_timestamp(
+                42_000,
+                Some(WakeWordDetection {
+                    detected_at_ms: 60,
+                    confidence: 0.73,
+                }),
+            ),
+            Some(42_000)
+        );
+        assert_eq!(wake_word_event_timestamp(42_000, None), None);
     }
 }

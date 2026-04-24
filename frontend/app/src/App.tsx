@@ -34,6 +34,7 @@ function App() {
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus>('initializing')
   const [composerValue, setComposerValue] = useState('')
   const [autoStopOnSilence, setAutoStopOnSilence] = useState(true)
+  const [wakeConfidence, setWakeConfidence] = useState<number | null>(null)
   const [micStarting, setMicStarting] = useState(false)
   const [micActive, setMicActive] = useState(false)
   const [messages, setMessages] = useState<readonly ChatMessage[]>(() =>
@@ -173,6 +174,7 @@ function App() {
 
     if (nextStatus !== 'listening') {
       voiceActivityStateRef.current = createVoiceActivityState()
+      setWakeConfidence(null)
     }
 
     const cueType = cueForTransition(previousStatus, nextStatus)
@@ -223,6 +225,7 @@ function App() {
 
     if (nextStatus !== 'listening') {
       voiceActivityStateRef.current = createVoiceActivityState()
+      setWakeConfidence(null)
     }
 
     const cueType = cueForTransition(previousStatus, nextStatus)
@@ -307,6 +310,7 @@ function App() {
   const enterRuntimeError = (): void => {
     runtimeStatusRef.current = 'error'
     voiceActivityStateRef.current = createVoiceActivityState()
+    setWakeConfidence(null)
     setRuntimeStatus('error')
   }
 
@@ -332,6 +336,10 @@ function App() {
 
     applyRuntimeStatus(nextStatus)
     recordRuntimeControlTelemetry(runtimePhase)
+
+    if (runtimePhase.telemetry?.wakeConfidence !== null && runtimePhase.telemetry?.wakeConfidence !== undefined) {
+      setWakeConfidence(runtimePhase.telemetry.wakeConfidence)
+    }
 
     if (previousStatus !== 'listening' && nextStatus === 'listening') {
       voiceTelemetry.record('runtime_status_set_listening', {
@@ -694,6 +702,9 @@ function App() {
             Voice {startupState.kind === 'ready' && startupState.voiceInputAvailable ? 'ready' : 'limited'}
           </span>
           <span className="shell__badge">Auto stop {autoStopOnSilence ? 'on' : 'off'}</span>
+          {runtimeStatus === 'listening' && wakeConfidence !== null ? (
+            <span className="shell__badge">Wake trigger score {wakeConfidence.toFixed(3)}</span>
+          ) : null}
         </div>
         {startupState.kind === 'error' ? (
           <p className="shell__error">Startup error: {startupState.message}</p>
