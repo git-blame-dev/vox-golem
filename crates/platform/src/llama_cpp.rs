@@ -169,6 +169,8 @@ impl LlamaCppRuntime {
                 spec.host(),
                 "--port",
                 &spec.port().to_string(),
+                "--parallel",
+                "1",
                 "-m",
                 &spec.model_path().to_string_lossy(),
                 "-a",
