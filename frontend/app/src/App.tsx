@@ -40,6 +40,7 @@ function App() {
   const [messages, setMessages] = useState<readonly ChatMessage[]>(() =>
     getInitialMessages(),
   )
+  const conversationRef = useRef<HTMLElement | null>(null)
   const liveAudioSourceRef = useRef<LiveAudioSource | null>(null)
   const appActiveRef = useRef(true)
   const autoStopOnSilenceRef = useRef(true)
@@ -106,6 +107,21 @@ function App() {
       liveAudioSourceRef.current = null
     }
   }, [])
+
+  useEffect(() => {
+    const conversation = conversationRef.current
+
+    if (conversation === null) {
+      return
+    }
+
+    if (typeof conversation.scrollTo === 'function') {
+      conversation.scrollTo({ top: conversation.scrollHeight })
+      return
+    }
+
+    conversation.scrollTop = conversation.scrollHeight
+  }, [messages])
 
   const canSend = useMemo(
     () =>
@@ -775,7 +791,7 @@ function App() {
         </details>
       </header>
 
-      <main className="conversation" aria-live="polite">
+      <main ref={conversationRef} className="conversation" aria-live="polite">
         {messages.map((message) => (
           <ChatBubble key={message.id} message={message} />
         ))}

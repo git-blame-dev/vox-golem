@@ -41,6 +41,32 @@ afterEach(() => {
 })
 
 describe('App', () => {
+  it('auto-follows the latest message when conversation grows', async () => {
+    const { container } = await renderApp()
+    const composer = getComposer(container)
+    const sendButton = getSendButton(container)
+    const conversation = getConversation(container)
+    const scrollToSpy = vi.fn()
+
+    Object.defineProperty(conversation, 'scrollTo', {
+      configurable: true,
+      value: scrollToSpy,
+    })
+
+    const baselineCalls = scrollToSpy.mock.calls.length
+
+    await act(async () => {
+      setTextAreaValue(composer, 'Scroll check prompt')
+    })
+
+    await act(async () => {
+      sendButton.click()
+      await Promise.resolve()
+    })
+
+    expect(scrollToSpy.mock.calls.length).toBeGreaterThan(baselineCalls)
+  })
+
   it('submits from send button and renders prompt/response history', async () => {
     const { container } = await renderApp()
     const composer = getComposer(container)
@@ -1072,6 +1098,16 @@ function getComposer(container: HTMLElement): HTMLTextAreaElement {
   }
 
   return composer
+}
+
+function getConversation(container: HTMLElement): HTMLElement {
+  const conversation = container.querySelector<HTMLElement>('main.conversation')
+
+  if (conversation === null) {
+    throw new Error('Missing conversation timeline')
+  }
+
+  return conversation
 }
 
 function getSendButton(container: HTMLElement): HTMLButtonElement {
