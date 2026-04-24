@@ -44,5 +44,8 @@ The Windows runtime expects these configured local assets in `%APPDATA%\VoxGolem
 - `wake_word_model_path`: LiveKit-compatible wake-word classifier `.onnx` file
 - `parakeet_model_dir`: local Parakeet v2 model directory
 - `silero_vad_model`: local Silero VAD ONNX file
+- `SOUL.md`: assistant identity and response-style prompt file at `%APPDATA%\VoxGolem\SOUL.md`
 - `start_listening_cue` and `stop_listening_cue`: cue audio files
-- `opencode_path`: local `opencode` executable
+- `response_backend`: backend selector, currently `opencode` or `llama_cpp`
+- `[opencode].path`: local `opencode` executable when `response_backend = "opencode"`
+- `[llama_cpp].server_path`, `[llama_cpp].host`, `[llama_cpp].port`, and `[llama_cpp].fast_model_path`: local llama.cpp runtime fields when `response_backend = "llama_cpp"`

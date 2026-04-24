@@ -11,6 +11,33 @@ export function parseStartupState(payload: unknown): StartupState {
     throw new Error('Startup payload must be an object')
   }
 
+  if (payload['kind'] === 'warming_model') {
+    const voiceInputAvailable = payload['voice_input_available']
+    const voiceInputError = payload['voice_input_error']
+    const message = payload['message']
+
+    if (typeof voiceInputAvailable !== 'boolean') {
+      throw new Error('Startup warming payload must include voice_input_available')
+    }
+
+    if (typeof voiceInputError !== 'string' && voiceInputError !== null) {
+      throw new Error('Startup warming payload must include a string or null voice_input_error')
+    }
+
+    if (typeof message !== 'string' || message.length === 0) {
+      throw new Error('Startup warming payload must include a message')
+    }
+
+    return {
+      kind: 'warming_model',
+      cueAssetPaths: parseCueAssetPaths(payload['cue_asset_paths']),
+      runtimePhase: parseRuntimePhase(payload['runtime_phase']),
+      voiceInputAvailable,
+      voiceInputError,
+      message,
+    }
+  }
+
   if (payload['kind'] === 'ready') {
     const voiceInputAvailable = payload['voice_input_available']
     const voiceInputError = payload['voice_input_error']
@@ -82,6 +109,10 @@ function buildDefaultStartupState(): StartupState {
     voiceInputAvailable: true,
     voiceInputError: null,
   }
+}
+
+export function isStartupStateSettled(state: StartupState): boolean {
+  return state.kind === 'ready' || state.kind === 'error'
 }
 
 function parseRuntimePhase(payload: unknown): BackendRuntimePhase {

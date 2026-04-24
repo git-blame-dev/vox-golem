@@ -2,7 +2,8 @@
 #![deny(unused_must_use)]
 
 use serde::Serialize;
-use std::sync::Mutex;
+use std::fs;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{path::BaseDirectory, Manager};
 
@@ -14,15 +15,19 @@ mod wake_word;
 const DEFAULT_SILENCE_TIMEOUT_MS: u64 = 2_500;
 const DEFAULT_PREROLL_MAX_SAMPLES: usize = 4_000;
 const DEFAULT_UTTERANCE_MAX_SAMPLES: usize = 4_800_000;
+const LLAMA_CPP_MODEL_ALIAS: &str = "default";
+const LLAMA_CPP_MAX_TOKENS: u16 = 256;
 
 struct AppState {
-    startup_state: StartupStatePayload,
+    startup_state: Arc<Mutex<StartupStatePayload>>,
     runtime_config: Option<voxgolem_core::config::RuntimeConfig>,
     voice_pipeline_config: voxgolem_core::voice_pipeline::VoicePipelineConfig,
     voice_pipeline_state: Mutex<voxgolem_core::voice_pipeline::VoicePipelineState>,
     wake_word_runtime: Option<Mutex<wake_word::WakeWordRuntime>>,
     voice_activity_runtime: Option<Mutex<voice_activity::VoiceActivityRuntime>>,
     parakeet_runtime: Option<Mutex<transcription::ParakeetRuntime>>,
+    llama_cpp_runtime: Arc<Mutex<Option<voxgolem_platform::llama_cpp::LlamaCppRuntime>>>,
+    llama_cpp_system_prompt: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -68,6 +73,13 @@ struct PromptExecutionPayload {
     runtime_phase: RuntimePhasePayload,
 }
 
+struct PromptExecutionOutcome {
+    events: Vec<PromptExecutionEventPayload>,
+    stderr: String,
+    exit_code: Option<i32>,
+    error_message: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq)]
 struct RuntimePhaseResponsePayload {
     runtime_phase: RuntimePhasePayload,
@@ -100,6 +112,13 @@ struct CueAssetPathsPayload {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum StartupStatePayload {
+    WarmingModel {
+        cue_asset_paths: CueAssetPathsPayload,
+        runtime_phase: RuntimePhasePayload,
+        voice_input_available: bool,
+        voice_input_error: Option<String>,
+        message: String,
+    },
     Ready {
         cue_asset_paths: CueAssetPathsPayload,
         runtime_phase: RuntimePhasePayload,
@@ -113,7 +132,11 @@ enum StartupStatePayload {
 
 #[tauri::command]
 fn get_startup_state(app_state: tauri::State<'_, AppState>) -> StartupStatePayload {
-    app_state.startup_state.clone()
+    app_state
+        .startup_state
+        .lock()
+        .expect("startup state lock should not be poisoned")
+        .clone()
 }
 
 #[tauri::command]
@@ -131,29 +154,28 @@ fn submit_prompt(
         .runtime_config
         .as_ref()
         .ok_or_else(|| String::from("startup config is not ready"))?;
-    let prompt = voxgolem_platform::opencode::OpencodePrompt::new(prompt)
-        .map_err(|error| format!("invalid prompt: {error:?}"))?;
-    let spec =
-        voxgolem_platform::opencode::OpencodeCommandSpec::new(config.opencode_path.clone(), prompt)
-            .with_output_format(voxgolem_platform::opencode::OpencodeOutputFormat::Json);
-    let result = match voxgolem_platform::opencode::run_opencode_json(&spec) {
-        Ok(result) => result,
+    let prompt = validate_prompt_text(prompt)?;
+    let outcome = match execute_prompt_backend(
+        config,
+        &prompt,
+        &app_state.llama_cpp_runtime,
+        app_state.llama_cpp_system_prompt.as_deref(),
+    ) {
+        Ok(outcome) => outcome,
         Err(error) => {
             apply_voice_pipeline_transition(
                 &app_state.voice_pipeline_state,
                 app_state.voice_pipeline_config,
                 voxgolem_core::voice_pipeline::VoicePipelineEvent::PromptFailed {
-                    message: error.to_string(),
+                    message: error.clone(),
                 },
             )?;
 
-            return Err(format!("failed to execute opencode: {error}"));
+            return Err(error);
         }
     };
 
-    let result_error = prompt_result_error_message(&result);
-
-    let completion_event = match result_error {
+    let completion_event = match outcome.error_message.clone() {
         Some(message) => {
             voxgolem_core::voice_pipeline::VoicePipelineEvent::PromptFailed { message }
         }
@@ -169,45 +191,9 @@ fn submit_prompt(
     let runtime_phase = current_runtime_phase(&app_state.voice_pipeline_state)?;
 
     Ok(PromptExecutionPayload {
-        events: result
-            .events
-            .into_iter()
-            .map(|event| match event {
-                voxgolem_platform::opencode::OpencodeJsonEvent::Text { text } => {
-                    PromptExecutionEventPayload::Text { text }
-                }
-                voxgolem_platform::opencode::OpencodeJsonEvent::Reasoning { text } => {
-                    PromptExecutionEventPayload::Reasoning { text }
-                }
-                voxgolem_platform::opencode::OpencodeJsonEvent::StepStart => {
-                    PromptExecutionEventPayload::StepStart
-                }
-                voxgolem_platform::opencode::OpencodeJsonEvent::StepFinish { reason } => {
-                    PromptExecutionEventPayload::StepFinish { reason }
-                }
-                voxgolem_platform::opencode::OpencodeJsonEvent::Error { name, message } => {
-                    PromptExecutionEventPayload::Error { name, message }
-                }
-                voxgolem_platform::opencode::OpencodeJsonEvent::ToolUse {
-                    tool,
-                    status,
-                    detail,
-                } => PromptExecutionEventPayload::ToolUse {
-                    tool,
-                    status: match status {
-                        voxgolem_platform::opencode::OpencodeToolUseStatus::Completed => {
-                            "completed".to_string()
-                        }
-                        voxgolem_platform::opencode::OpencodeToolUseStatus::Error => {
-                            "error".to_string()
-                        }
-                    },
-                    detail,
-                },
-            })
-            .collect(),
-        stderr: result.stderr,
-        exit_code: result.exit_code,
+        events: outcome.events,
+        stderr: outcome.stderr,
+        exit_code: outcome.exit_code,
         runtime_phase,
     })
 }
@@ -448,6 +434,87 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
             } else {
                 Some(voice_input_errors.join("\n"))
             };
+            let llama_cpp_system_prompt = match &config.response_backend {
+                voxgolem_core::config::ResponseBackendConfig::LlamaCpp { .. } => {
+                    match load_llama_cpp_system_prompt() {
+                        Ok(prompt) => Some(prompt),
+                        Err(error) => {
+                            return build_startup_error_app_state(
+                                voice_pipeline_config,
+                                format!("failed to load SOUL.md: {error}"),
+                            );
+                        }
+                    }
+                }
+                voxgolem_core::config::ResponseBackendConfig::Opencode { .. } => None,
+            };
+            let startup_state = Arc::new(Mutex::new(match &config.response_backend {
+                voxgolem_core::config::ResponseBackendConfig::LlamaCpp { .. } => {
+                    StartupStatePayload::WarmingModel {
+                        cue_asset_paths: cue_asset_paths.clone(),
+                        runtime_phase: RuntimePhasePayload::Initializing,
+                        voice_input_available,
+                        voice_input_error: voice_input_error.clone(),
+                        message: String::from("Loading local Gemma model..."),
+                    }
+                }
+                voxgolem_core::config::ResponseBackendConfig::Opencode { .. } => {
+                    StartupStatePayload::Ready {
+                        cue_asset_paths: cue_asset_paths.clone(),
+                        runtime_phase: RuntimePhasePayload::Sleeping,
+                        voice_input_available,
+                        voice_input_error: voice_input_error.clone(),
+                    }
+                }
+            }));
+            let llama_cpp_runtime = Arc::new(Mutex::new(None));
+            if let voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
+                server_path,
+                host,
+                port,
+                fast_model_path,
+                ..
+            } = &config.response_backend
+            {
+                let startup_state = Arc::clone(&startup_state);
+                let llama_cpp_runtime = Arc::clone(&llama_cpp_runtime);
+                let cue_asset_paths = cue_asset_paths.clone();
+                let voice_input_error = voice_input_error.clone();
+                let server_spec = voxgolem_platform::llama_cpp::LlamaCppServerSpec::new(
+                    server_path.clone(),
+                    fast_model_path.clone(),
+                    host.clone(),
+                    *port,
+                    LLAMA_CPP_MODEL_ALIAS,
+                );
+
+                std::thread::spawn(move || {
+                    let next_state =
+                        match voxgolem_platform::llama_cpp::LlamaCppRuntime::start(server_spec) {
+                            Ok(runtime) => {
+                                if let Ok(mut guard) = llama_cpp_runtime.lock() {
+                                    *guard = Some(runtime);
+                                }
+
+                                StartupStatePayload::Ready {
+                                    cue_asset_paths,
+                                    runtime_phase: RuntimePhasePayload::Sleeping,
+                                    voice_input_available,
+                                    voice_input_error,
+                                }
+                            }
+                            Err(error) => StartupStatePayload::Error {
+                                message: format!(
+                                    "failed to initialize local llama.cpp runtime: {error}"
+                                ),
+                            },
+                        };
+
+                    if let Ok(mut guard) = startup_state.lock() {
+                        *guard = next_state;
+                    }
+                });
+            }
             let voice_pipeline_state = apply_voice_pipeline_event_or_panic(
                 voxgolem_core::voice_pipeline::VoicePipelineState::new(voice_pipeline_config)
                     .expect("voice pipeline should initialize with valid constants"),
@@ -457,18 +524,15 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
             );
 
             AppState {
-                startup_state: StartupStatePayload::Ready {
-                    cue_asset_paths,
-                    runtime_phase: RuntimePhasePayload::Sleeping,
-                    voice_input_available,
-                    voice_input_error,
-                },
+                startup_state,
                 runtime_config: Some(config),
                 voice_pipeline_config,
                 voice_pipeline_state: Mutex::new(voice_pipeline_state),
                 wake_word_runtime: Some(Mutex::new(wake_word_runtime)),
                 voice_activity_runtime,
                 parakeet_runtime,
+                llama_cpp_runtime,
+                llama_cpp_system_prompt,
             }
         }
         Err(error) => build_startup_error_app_state(voice_pipeline_config, error.to_string()),
@@ -522,14 +586,30 @@ fn build_startup_error_app_state(
     );
 
     AppState {
-        startup_state: StartupStatePayload::Error { message },
+        startup_state: Arc::new(Mutex::new(StartupStatePayload::Error { message })),
         runtime_config: None,
         voice_pipeline_config,
         voice_pipeline_state: Mutex::new(voice_pipeline_state),
         wake_word_runtime: None,
         voice_activity_runtime: None,
         parakeet_runtime: None,
+        llama_cpp_runtime: Arc::new(Mutex::new(None)),
+        llama_cpp_system_prompt: None,
     }
+}
+
+fn load_llama_cpp_system_prompt() -> Result<String, String> {
+    let soul_path =
+        voxgolem_core::config::default_soul_path().map_err(|error| error.to_string())?;
+    let contents = fs::read_to_string(&soul_path)
+        .map_err(|error| format!("{}: {error}", soul_path.display()))?;
+    let trimmed = contents.trim();
+
+    if trimmed.is_empty() {
+        return Err(format!("{} is empty", soul_path.display()));
+    }
+
+    Ok(trimmed.to_string())
 }
 
 fn current_runtime_phase(
@@ -833,6 +913,112 @@ fn prompt_result_error_message(
     })
 }
 
+fn validate_prompt_text(prompt: String) -> Result<String, String> {
+    if prompt.trim().is_empty() {
+        return Err(String::from("invalid prompt: prompt must not be empty"));
+    }
+
+    Ok(prompt)
+}
+
+fn execute_prompt_backend(
+    config: &voxgolem_core::config::RuntimeConfig,
+    prompt: &str,
+    llama_cpp_runtime: &Arc<Mutex<Option<voxgolem_platform::llama_cpp::LlamaCppRuntime>>>,
+    llama_cpp_system_prompt: Option<&str>,
+) -> Result<PromptExecutionOutcome, String> {
+    match &config.response_backend {
+        voxgolem_core::config::ResponseBackendConfig::Opencode { path } => {
+            let prompt = voxgolem_platform::opencode::OpencodePrompt::new(prompt.to_string())
+                .map_err(|error| format!("invalid prompt: {error:?}"))?;
+            let spec = voxgolem_platform::opencode::OpencodeCommandSpec::new(path.clone(), prompt)
+                .with_output_format(voxgolem_platform::opencode::OpencodeOutputFormat::Json);
+            let result = voxgolem_platform::opencode::run_opencode_json(&spec)
+                .map_err(|error| format!("failed to execute opencode: {error}"))?;
+            let error_message = prompt_result_error_message(&result);
+            let voxgolem_platform::opencode::OpencodeJsonRunResult {
+                events,
+                stderr,
+                exit_code,
+            } = result;
+
+            Ok(PromptExecutionOutcome {
+                events: map_opencode_events(events),
+                stderr,
+                exit_code,
+                error_message,
+            })
+        }
+        voxgolem_core::config::ResponseBackendConfig::LlamaCpp { .. } => {
+            let system_prompt =
+                llama_cpp_system_prompt.ok_or_else(|| String::from("SOUL.md is not loaded"))?;
+            let mut guard = llama_cpp_runtime
+                .lock()
+                .map_err(|_| String::from("local llama.cpp runtime lock is poisoned"))?;
+            let runtime = guard
+                .as_mut()
+                .ok_or_else(|| String::from("local Gemma model is still warming up"))?;
+            let response = runtime
+                .chat(
+                    &voxgolem_platform::llama_cpp::LlamaCppPrompt::new(prompt.to_string())
+                        .with_system_prompt(system_prompt)
+                        .with_max_tokens(LLAMA_CPP_MAX_TOKENS),
+                )
+                .map_err(|error| format!("failed to execute local llama.cpp prompt: {error}"))?;
+
+            Ok(PromptExecutionOutcome {
+                events: vec![PromptExecutionEventPayload::Text {
+                    text: response.text,
+                }],
+                stderr: String::new(),
+                exit_code: None,
+                error_message: None,
+            })
+        }
+    }
+}
+
+fn map_opencode_events(
+    events: Vec<voxgolem_platform::opencode::OpencodeJsonEvent>,
+) -> Vec<PromptExecutionEventPayload> {
+    events
+        .into_iter()
+        .map(|event| match event {
+            voxgolem_platform::opencode::OpencodeJsonEvent::Text { text } => {
+                PromptExecutionEventPayload::Text { text }
+            }
+            voxgolem_platform::opencode::OpencodeJsonEvent::Reasoning { text } => {
+                PromptExecutionEventPayload::Reasoning { text }
+            }
+            voxgolem_platform::opencode::OpencodeJsonEvent::StepStart => {
+                PromptExecutionEventPayload::StepStart
+            }
+            voxgolem_platform::opencode::OpencodeJsonEvent::StepFinish { reason } => {
+                PromptExecutionEventPayload::StepFinish { reason }
+            }
+            voxgolem_platform::opencode::OpencodeJsonEvent::Error { name, message } => {
+                PromptExecutionEventPayload::Error { name, message }
+            }
+            voxgolem_platform::opencode::OpencodeJsonEvent::ToolUse {
+                tool,
+                status,
+                detail,
+            } => PromptExecutionEventPayload::ToolUse {
+                tool,
+                status: match status {
+                    voxgolem_platform::opencode::OpencodeToolUseStatus::Completed => {
+                        "completed".to_string()
+                    }
+                    voxgolem_platform::opencode::OpencodeToolUseStatus::Error => {
+                        "error".to_string()
+                    }
+                },
+                detail,
+            },
+        })
+        .collect()
+}
+
 fn transcription_ready_samples(
     action: &voxgolem_core::voice_pipeline::VoicePipelineAction,
 ) -> Option<usize> {
@@ -932,14 +1118,19 @@ mod tests {
     use super::{
         apply_optional_speech_activity, build_mark_silence_response, build_startup_error_app_state,
         current_runtime_phase_response, current_silence_deadline, default_voice_pipeline_config,
-        ingest_audio_frame_with_optional_wake_word_detection, process_wake_word_frame,
-        prompt_result_error_message, reset_voice_pipeline_to_waiting, reset_wake_word_runtime,
+        execute_prompt_backend, ingest_audio_frame_with_optional_wake_word_detection,
+        load_llama_cpp_system_prompt, process_wake_word_frame, prompt_result_error_message,
+        reset_voice_pipeline_to_waiting, reset_wake_word_runtime,
         runtime_phase_response_from_state, to_runtime_phase_payload, transcribe_finished_utterance,
         transcription_ready_samples, wake_word_event_timestamp, RuntimePhasePayload,
         RuntimePhaseResponsePayload, RuntimeTelemetryPayload, DEFAULT_SILENCE_TIMEOUT_MS,
     };
     use crate::wake_word::{WakeWordDetection, WakeWordRuntime};
-    use std::sync::Mutex;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
 
     #[test]
     fn prompt_result_error_message_prefers_non_zero_exit_code() {
@@ -986,6 +1177,164 @@ mod tests {
         };
 
         assert_eq!(prompt_result_error_message(&result), None);
+    }
+
+    #[test]
+    fn execute_prompt_backend_uses_local_llama_runtime_for_fast_backend() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("listener address should exist")
+            .port();
+
+        let server_thread = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("request should connect");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .expect("read timeout should be configurable");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+
+            loop {
+                let read_len = stream
+                    .read(&mut buffer)
+                    .expect("request should be readable");
+                if read_len == 0 {
+                    break;
+                }
+
+                request.extend_from_slice(&buffer[..read_len]);
+                if String::from_utf8_lossy(&request).contains("\"model\":\"default\"") {
+                    break;
+                }
+            }
+
+            let request_text = String::from_utf8_lossy(&request);
+
+            assert!(request_text.starts_with("POST /v1/chat/completions HTTP/1.1"));
+            assert!(request_text.contains("\"model\":\"default\""));
+            assert!(request_text.contains("say hi"));
+
+            let body = "{\"choices\":[{\"message\":{\"content\":\"Local Gemma says hi\"}}]}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n{:X}\r\n{}\r\n0\r\n\r\n",
+                body.len(),
+                body,
+            );
+
+            stream
+                .write_all(response.as_bytes())
+                .expect("response should be writable");
+        });
+
+        let config = voxgolem_core::config::RuntimeConfig {
+            wake_word_model_path: PathBuf::from("wake.onnx"),
+            parakeet_model_dir: PathBuf::from("parakeet"),
+            silero_vad_model: PathBuf::from("vad.onnx"),
+            response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
+                server_path: PathBuf::from("llama-server.exe"),
+                host: String::from("127.0.0.1"),
+                port,
+                fast_model_path: PathBuf::from("fast.gguf"),
+                quality_model_path: None,
+            },
+        };
+        let runtime = Arc::new(Mutex::new(Some(
+            voxgolem_platform::llama_cpp::LlamaCppRuntime::attach(
+                voxgolem_platform::llama_cpp::LlamaCppServerSpec::new(
+                    "llama-server.exe",
+                    "fast.gguf",
+                    "127.0.0.1",
+                    port,
+                    "default",
+                ),
+            ),
+        )));
+
+        let outcome = execute_prompt_backend(&config, "say hi", &runtime, Some("You are JARVIS."))
+            .expect("local backend should succeed");
+
+        server_thread.join().expect("server thread should complete");
+
+        assert_eq!(outcome.stderr, "");
+        assert_eq!(outcome.exit_code, None);
+        assert_eq!(outcome.error_message, None);
+        assert_eq!(outcome.events.len(), 1);
+        assert!(matches!(
+            &outcome.events[0],
+            super::PromptExecutionEventPayload::Text { text } if text == "Local Gemma says hi"
+        ));
+    }
+
+    #[test]
+    fn execute_prompt_backend_reports_warming_error_when_llama_runtime_is_unavailable() {
+        let config = voxgolem_core::config::RuntimeConfig {
+            wake_word_model_path: PathBuf::from("wake.onnx"),
+            parakeet_model_dir: PathBuf::from("parakeet"),
+            silero_vad_model: PathBuf::from("vad.onnx"),
+            response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
+                server_path: PathBuf::from("llama-server.exe"),
+                host: String::from("127.0.0.1"),
+                port: 11_435,
+                fast_model_path: PathBuf::from("fast.gguf"),
+                quality_model_path: None,
+            },
+        };
+        let runtime = Arc::new(Mutex::new(None));
+
+        assert!(matches!(
+            execute_prompt_backend(&config, "say hi", &runtime, Some("You are JARVIS.")),
+            Err(message) if message == "local Gemma model is still warming up"
+        ));
+    }
+
+    #[test]
+    fn execute_prompt_backend_reports_missing_soul_prompt_for_llama_backend() {
+        let config = voxgolem_core::config::RuntimeConfig {
+            wake_word_model_path: PathBuf::from("wake.onnx"),
+            parakeet_model_dir: PathBuf::from("parakeet"),
+            silero_vad_model: PathBuf::from("vad.onnx"),
+            response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
+                server_path: PathBuf::from("llama-server.exe"),
+                host: String::from("127.0.0.1"),
+                port: 11_435,
+                fast_model_path: PathBuf::from("fast.gguf"),
+                quality_model_path: None,
+            },
+        };
+        let runtime = Arc::new(Mutex::new(None));
+
+        assert!(matches!(
+            execute_prompt_backend(&config, "say hi", &runtime, None),
+            Err(message) if message == "SOUL.md is not loaded"
+        ));
+    }
+
+    #[test]
+    fn load_llama_cpp_system_prompt_reads_soul_file_from_appdata() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let appdata_path = temp_dir.path().join("VoxGolem");
+        std::fs::create_dir_all(&appdata_path).expect("appdata path should be creatable");
+        std::fs::write(
+            appdata_path.join("SOUL.md"),
+            "  You are JARVIS, concise and precise.  ",
+        )
+        .expect("SOUL.md should be writable");
+
+        let previous_appdata = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", temp_dir.path());
+
+        let result = load_llama_cpp_system_prompt();
+
+        match previous_appdata {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+
+        assert_eq!(
+            result.expect("SOUL.md should load"),
+            "You are JARVIS, concise and precise."
+        );
     }
 
     #[test]
@@ -1393,7 +1742,10 @@ mod tests {
         );
 
         assert!(matches!(
-            app_state.startup_state,
+            *app_state
+                .startup_state
+                .lock()
+                .expect("startup state lock should not be poisoned"),
             super::StartupStatePayload::Error { .. }
         ));
         assert!(app_state.runtime_config.is_none());

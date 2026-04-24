@@ -11,7 +11,7 @@ import {
   invokeRuntimeControl,
 } from './lib/runtimeControl'
 import type { RuntimeControlArgs } from './lib/runtimeControl'
-import { DEFAULT_CUE_ASSET_PATHS, loadStartupState } from './lib/startupState'
+import { DEFAULT_CUE_ASSET_PATHS, isStartupStateSettled, loadStartupState } from './lib/startupState'
 import { createVoiceTelemetryRecorder } from './lib/voiceTelemetry'
 import {
   createVoiceActivityState,
@@ -59,41 +59,54 @@ function App() {
   useEffect(() => {
     let active = true
 
-    void loadStartupState().then((nextState) => {
-      if (!active) {
-        return
-      }
+    void (async () => {
+      while (active) {
+        const nextState = await loadStartupState()
 
-      startupStateRef.current = nextState
-      setStartupState(nextState)
-      runtimeStatusRef.current = nextState.kind === 'ready' ? toRuntimeStatus(nextState.runtimePhase) : 'error'
-      setRuntimeStatus(nextState.kind === 'ready' ? toRuntimeStatus(nextState.runtimePhase) : 'error')
+        if (!active) {
+          return
+        }
 
-      if (nextState.kind === 'ready') {
-        setMessages((currentMessages) => [
-          ...currentMessages,
-          {
-            id: `system-startup-ready-${Date.now()}`,
-            role: 'system',
-            content:
-              `Startup ready: runtime=${nextState.runtimePhase}, ` +
-              `startCue=${nextState.cueAssetPaths.startListening}, ` +
-              `stopCue=${nextState.cueAssetPaths.stopListening}`,
-          },
-        ])
-      }
+        const previousKind = startupStateRef.current.kind
+        startupStateRef.current = nextState
+        setStartupState(nextState)
 
-      if (nextState.kind === 'error') {
-        setMessages((currentMessages) => [
-          ...currentMessages,
-          {
-            id: `system-startup-error-${Date.now()}`,
-            role: 'system',
-            content: `Startup error: ${nextState.message}`,
-          },
-        ])
+        const nextRuntimeStatus = startupStateToRuntimeStatus(nextState)
+        runtimeStatusRef.current = nextRuntimeStatus
+        setRuntimeStatus(nextRuntimeStatus)
+
+        if (nextState.kind === 'ready' && previousKind !== 'ready') {
+          setMessages((currentMessages) => [
+            ...currentMessages,
+            {
+              id: `system-startup-ready-${Date.now()}`,
+              role: 'system',
+              content:
+                `Startup ready: runtime=${nextState.runtimePhase}, ` +
+                `startCue=${nextState.cueAssetPaths.startListening}, ` +
+                `stopCue=${nextState.cueAssetPaths.stopListening}`,
+            },
+          ])
+        }
+
+        if (nextState.kind === 'error' && previousKind !== 'error') {
+          setMessages((currentMessages) => [
+            ...currentMessages,
+            {
+              id: `system-startup-error-${Date.now()}`,
+              role: 'system',
+              content: `Startup error: ${nextState.message}`,
+            },
+          ])
+        }
+
+        if (isStartupStateSettled(nextState)) {
+          return
+        }
+
+        await new Promise((resolve) => window.setTimeout(resolve, 500))
       }
-    })
+    })()
 
     return () => {
       active = false
@@ -864,6 +877,10 @@ function getRuntimeDetail(
     return 'Configuration or startup failed before voice services could begin.'
   }
 
+  if (startupState.kind === 'warming_model') {
+    return startupState.message
+  }
+
   if (startupState.kind === 'ready' && !startupState.voiceInputAvailable) {
     return 'Typed prompts still work, but local voice input needs the configured wake-word, VAD, and STT assets.'
   }
@@ -882,10 +899,22 @@ function getRuntimeDetail(
     case 'processing':
       return 'The captured voice turn is being transcribed locally before execution.'
     case 'executing':
-      return 'OpenCode is running the request now.'
+      return 'A local or configured response backend is generating the answer now.'
     case 'error':
       return 'The last voice or execution step failed. Reset to idle to recover.'
   }
+}
+
+function startupStateToRuntimeStatus(startupState: StartupState): RuntimeStatus {
+  if (startupState.kind === 'error') {
+    return 'error'
+  }
+
+  if (startupState.kind === 'loading') {
+    return 'initializing'
+  }
+
+  return toRuntimeStatus(startupState.runtimePhase)
 }
 
 export default App

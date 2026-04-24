@@ -262,6 +262,99 @@ describe('App', () => {
     expect(container.textContent).toContain('opencode_error:\nAPIError: Provider failed')
   })
 
+  it('polls startup state while the local model is warming and becomes ready later', async () => {
+    let startupCalls = 0
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        if (command !== 'get_startup_state') {
+          throw new Error(`unexpected command: ${command}`)
+        }
+
+        startupCalls += 1
+        if (startupCalls === 1) {
+          return {
+            kind: 'warming_model',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'initializing',
+            voice_input_available: true,
+            voice_input_error: null,
+            message: 'Loading local Gemma model...',
+          }
+        }
+
+        return {
+          kind: 'ready',
+          cue_asset_paths: {
+            start_listening: 'resources/start-listening.wav',
+            stop_listening: 'resources/stop-listening.wav',
+          },
+          runtime_phase: 'sleeping',
+          voice_input_available: true,
+          voice_input_error: null,
+        }
+      },
+    }
+
+    const { container } = await renderApp()
+
+    expect(container.textContent).toContain('Status: Starting up')
+    expect(container.textContent).toContain('Loading local Gemma model...')
+
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 600))
+    })
+
+    expect(container.textContent).toContain('Status: Waiting')
+    expect(container.textContent).toContain('Startup ready: runtime=sleeping')
+  })
+
+  it('surfaces an error if the model warming state later fails', async () => {
+    let startupCalls = 0
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        if (command !== 'get_startup_state') {
+          throw new Error(`unexpected command: ${command}`)
+        }
+
+        startupCalls += 1
+        if (startupCalls === 1) {
+          return {
+            kind: 'warming_model',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'initializing',
+            voice_input_available: true,
+            voice_input_error: null,
+            message: 'Loading local Gemma model...',
+          }
+        }
+
+        return {
+          kind: 'error',
+          message: 'failed to initialize local llama.cpp runtime: boom',
+        }
+      },
+    }
+
+    const { container } = await renderApp()
+
+    expect(container.textContent).toContain('Loading local Gemma model...')
+
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 600))
+    })
+
+    expect(container.textContent).toContain('Status: Error')
+    expect(container.textContent).toContain('Startup error: failed to initialize local llama.cpp runtime: boom')
+  })
+
   it('plays the configured start-listening cue path from startup state', async () => {
     const playedSources: string[] = []
 
@@ -647,7 +740,7 @@ describe('App', () => {
           return {
             events: [{ kind: 'text', text: 'Voice execution response' }],
             stderr: '',
-            exit_code: 0,
+            exit_code: null,
             runtime_phase: 'sleeping',
           }
         }
