@@ -105,13 +105,10 @@ pub fn apply_runtime_event(
                 last_error: Some(message),
             }
         }
-        RuntimeEvent::BeginListening if current_phase == RuntimePhase::Sleeping =>
-        {
-            RuntimeState {
-                phase: RuntimePhase::Listening,
-                last_error: None,
-            }
-        }
+        RuntimeEvent::BeginListening if current_phase == RuntimePhase::Sleeping => RuntimeState {
+            phase: RuntimePhase::Listening,
+            last_error: None,
+        },
         RuntimeEvent::EndListening if current_phase == RuntimePhase::Listening => RuntimeState {
             phase: RuntimePhase::Processing,
             last_error: None,
