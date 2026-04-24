@@ -24,7 +24,7 @@ The Windows-first baseline MVP voice path is now in place: live mic capture feed
 - Frontend: React, strict TypeScript, Vite, Bun tooling
 - Runtime/core: Rust + `tokio`
 - Audio capture/handoff: `cpal` + `ringbuf`
-- Wake-word detection: `rustpotter`
+- Wake-word detection: `livekit-wakeword`
 - End-of-speech detection: Silero VAD ONNX via `ort`
 - Local transcription: `transcribe-rs` (Parakeet v2)
 - Configuration: `serde` + `toml`
@@ -41,7 +41,7 @@ The Windows-first baseline MVP voice path is now in place: live mic capture feed
 
 The Windows runtime expects these configured local assets in `%APPDATA%\VoxGolem\config.toml`:
 
-- `wake_word_dir`: directory of wake-word reference clips for `rustpotter`
+- `wake_word_model_path`: LiveKit-compatible wake-word classifier `.onnx` file
 - `parakeet_model_dir`: local Parakeet v2 model directory
 - `silero_vad_model`: local Silero VAD ONNX file
 - `start_listening_cue` and `stop_listening_cue`: cue audio files
