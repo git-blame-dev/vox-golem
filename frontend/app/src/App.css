@@ -8,7 +8,14 @@
   backdrop-filter: blur(8px);
   display: grid;
   grid-template-rows: auto 1fr auto;
-  min-height: calc(100vh - 3rem);
+  height: calc(100vh - 3rem);
+  overflow: hidden;
+}
+
+@supports (height: 100dvh) {
+  .shell {
+    height: calc(100dvh - 3rem);
+  }
 }
 
 .shell__header {
@@ -112,6 +119,7 @@
 
 .conversation {
   overflow-y: auto;
+  min-height: 0;
   padding: 1.25rem 1.5rem;
   display: flex;
   flex-direction: column;
@@ -219,7 +227,13 @@
   .shell {
     width: calc(100% - 1rem);
     margin: 0.5rem auto;
-    min-height: calc(100vh - 1rem);
+    height: calc(100vh - 1rem);
+  }
+
+  @supports (height: 100dvh) {
+    .shell {
+      height: calc(100dvh - 1rem);
+    }
   }
 
   .shell__header,
