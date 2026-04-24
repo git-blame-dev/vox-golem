@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{path::BaseDirectory, Manager};
 
+mod livekit_wakeword;
 mod transcription;
 mod voice_activity;
 mod wake_word;
@@ -407,15 +408,16 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
 
     match voxgolem_core::config::load_runtime_config(None) {
         Ok(config) => {
-            let wake_word_runtime = match wake_word::WakeWordRuntime::new(&config.wake_word_dir) {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    return build_startup_error_app_state(
-                        voice_pipeline_config,
-                        format!("failed to initialize wake word detector: {error}"),
-                    );
-                }
-            };
+            let wake_word_runtime =
+                match wake_word::WakeWordRuntime::new(&config.wake_word_model_path) {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        return build_startup_error_app_state(
+                            voice_pipeline_config,
+                            format!("failed to initialize wake word detector: {error}"),
+                        );
+                    }
+                };
             let mut voice_input_errors = Vec::new();
             let parakeet_runtime =
                 match transcription::ParakeetRuntime::load(&config.parakeet_model_dir) {
@@ -607,7 +609,7 @@ fn process_wake_word_frame(
         .lock()
         .map_err(|_| String::from("wake word runtime lock is poisoned"))?;
 
-    Ok(guard.process_sleeping_frame(frame))
+    guard.process_sleeping_frame(frame)
 }
 
 fn reset_wake_word_runtime(
@@ -1354,6 +1356,16 @@ mod tests {
     }
 
     #[test]
+    fn process_wake_word_frame_propagates_detector_errors() {
+        let runtime = Some(Mutex::new(WakeWordRuntime::new_failing_for_test()));
+
+        assert_eq!(
+            process_wake_word_frame(&runtime, &[0.0; 8]),
+            Err(String::from("synthetic wake word scorer failure"))
+        );
+    }
+
+    #[test]
     fn reset_wake_word_runtime_is_a_no_op_without_runtime() {
         assert_eq!(reset_wake_word_runtime(&None), Ok(()));
     }
@@ -1374,27 +1386,14 @@ mod tests {
     }
 
     #[test]
-    fn wake_word_runtime_can_initialize_from_sample_directory() {
+    fn wake_word_runtime_reports_missing_model_file() {
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let wake_word_dir = temp_dir.path().join("wake-word");
-        std::fs::create_dir_all(&wake_word_dir).expect("wake word directory should be created");
-        let wake_word_path = wake_word_dir.join("01.wav");
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate: 16_000,
-            bits_per_sample: 32,
-            sample_format: hound::SampleFormat::Float,
-        };
-        let mut writer =
-            hound::WavWriter::create(&wake_word_path, spec).expect("wav should be created");
+        let wake_word_model_path = temp_dir.path().join("missing-hey-livekit.onnx");
 
-        for _ in 0..(16_000 / 4) {
-            writer
-                .write_sample(0.05_f32)
-                .expect("sample should be written");
-        }
-        writer.finalize().expect("wav should finalize");
+        let error = WakeWordRuntime::new(&wake_word_model_path)
+            .err()
+            .expect("missing model file should fail");
 
-        WakeWordRuntime::new(&wake_word_dir).expect("wake word runtime should initialize");
+        assert!(error.contains("failed to load wake word model"));
     }
 }
