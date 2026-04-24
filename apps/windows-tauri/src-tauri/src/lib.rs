@@ -13,7 +13,7 @@ mod wake_word;
 
 const DEFAULT_SILENCE_TIMEOUT_MS: u64 = 2_500;
 const DEFAULT_PREROLL_MAX_SAMPLES: usize = 4_000;
-const DEFAULT_UTTERANCE_MAX_SAMPLES: usize = 160_000;
+const DEFAULT_UTTERANCE_MAX_SAMPLES: usize = 4_800_000;
 
 struct AppState {
     startup_state: StartupStatePayload,
