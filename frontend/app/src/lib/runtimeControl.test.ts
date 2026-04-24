@@ -285,4 +285,23 @@ describe('invokeRuntimeControl', () => {
       'Runtime control telemetry field frame_id must be a string or null',
     )
   })
+
+  it('rejects telemetry payloads that are not objects', async () => {
+    window.__TAURI_INTERNALS__ = {
+      invoke: async () => ({
+        runtime_phase: 'sleeping',
+        transcription_ready_samples: null,
+        transcript_text: null,
+        last_activity_ms: null,
+        capturing_utterance: false,
+        preroll_samples: 0,
+        utterance_samples: 0,
+        telemetry: 'bad-telemetry',
+      }),
+    }
+
+    await expect(ingestAudioFrame([0.1])).rejects.toThrow(
+      'Runtime control payload telemetry must be an object when present',
+    )
+  })
 })

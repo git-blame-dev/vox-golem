@@ -1013,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn transcription_ready_samples_reads_finished_utterance_length() {
+    fn invariant_transcription_ready_samples_matches_finished_utterance_length() {
         let action = voxgolem_core::voice_pipeline::VoicePipelineAction::FinishedUtterance {
             transcription_input: voxgolem_model::parakeet::ParakeetTranscriptionInput::new(
                 voxgolem_model::parakeet::PARAKEET_SAMPLE_RATE_HZ,
@@ -1072,60 +1072,53 @@ mod tests {
     }
 
     #[test]
-    fn runtime_phase_response_payload_can_hold_capture_status() {
-        let payload = RuntimePhaseResponsePayload {
-            runtime_phase: RuntimePhasePayload::Processing,
-            transcription_ready_samples: Some(3200),
-            transcript_text: Some("open the pull request".to_string()),
-            last_activity_ms: Some(450),
-            capturing_utterance: false,
-            preroll_samples: 3,
-            utterance_samples: 0,
-            telemetry: None,
+    fn contract_runtime_phase_response_from_state_surfaces_telemetry() {
+        let voice_pipeline_config = default_voice_pipeline_config();
+        let ready_state = voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
+            &voxgolem_core::voice_pipeline::VoicePipelineState::new(voice_pipeline_config)
+                .expect("voice pipeline should initialize"),
+            voice_pipeline_config,
+            voxgolem_core::voice_pipeline::VoicePipelineEvent::StartupValidated,
+        )
+        .expect("startup validation should succeed")
+        .0;
+        let preroll_state = voxgolem_core::voice_pipeline::ingest_audio_frame(
+            &ready_state,
+            voice_pipeline_config,
+            vec![0.1, 0.2, 0.3],
+        )
+        .expect("sleeping frame should be recorded");
+        let listening_state = voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
+            &preroll_state,
+            voice_pipeline_config,
+            voxgolem_core::voice_pipeline::VoicePipelineEvent::WakeWordDetected { now_ms: 100 },
+        )
+        .expect("wake word should start listening")
+        .0;
+        let utterance_state = voxgolem_core::voice_pipeline::ingest_audio_frame(
+            &listening_state,
+            voice_pipeline_config,
+            vec![0.4, 0.5],
+        )
+        .expect("listening frame should be recorded");
+        let telemetry = RuntimeTelemetryPayload {
+            frame_id: Some("frame-1".to_string()),
+            backend_ingest_started_ms: Some(110),
+            backend_ingest_completed_ms: Some(120),
+            wake_detected_ms: Some(118),
+            transcription_started_ms: None,
+            transcription_completed_ms: None,
         };
 
-        assert_eq!(payload.preroll_samples, 3);
-        assert_eq!(payload.utterance_samples, 0);
-        assert!(!payload.capturing_utterance);
-        assert_eq!(payload.last_activity_ms, Some(450));
-        assert_eq!(payload.transcription_ready_samples, Some(3200));
-        assert_eq!(
-            payload.transcript_text.as_deref(),
-            Some("open the pull request")
+        let response = runtime_phase_response_from_state(
+            &utterance_state,
+            None,
+            None,
+            Some(telemetry.clone()),
         );
-    }
 
-    #[test]
-    fn runtime_phase_response_payload_can_hold_telemetry_fields() {
-        let payload = RuntimePhaseResponsePayload {
-            runtime_phase: RuntimePhasePayload::Listening,
-            transcription_ready_samples: None,
-            transcript_text: None,
-            last_activity_ms: Some(100),
-            capturing_utterance: true,
-            preroll_samples: 3,
-            utterance_samples: 5,
-            telemetry: Some(RuntimeTelemetryPayload {
-                frame_id: Some("frame-1".to_string()),
-                backend_ingest_started_ms: Some(110),
-                backend_ingest_completed_ms: Some(120),
-                wake_detected_ms: Some(118),
-                transcription_started_ms: None,
-                transcription_completed_ms: None,
-            }),
-        };
-
-        assert_eq!(
-            payload.telemetry,
-            Some(RuntimeTelemetryPayload {
-                frame_id: Some("frame-1".to_string()),
-                backend_ingest_started_ms: Some(110),
-                backend_ingest_completed_ms: Some(120),
-                wake_detected_ms: Some(118),
-                transcription_started_ms: None,
-                transcription_completed_ms: None,
-            })
-        );
+        assert_eq!(response.runtime_phase, RuntimePhasePayload::Listening);
+        assert_eq!(response.telemetry, Some(telemetry));
     }
 
     #[test]
