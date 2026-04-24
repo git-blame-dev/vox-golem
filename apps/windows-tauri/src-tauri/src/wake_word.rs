@@ -3,12 +3,19 @@ use std::path::Path;
 
 const DETECTOR_SAMPLE_RATE_HZ: u64 = 16_000;
 const DETECTOR_INPUT_SAMPLE_RATE_HZ: u32 = 16_000;
-const DETECTOR_CHUNK_SAMPLES: usize = 1_440;
+const DETECTOR_CHUNK_SAMPLES: usize = 1_280;
 const DETECTOR_WINDOW_SAMPLES: usize = 32_000;
-const DETECTION_THRESHOLD: f32 = 0.5;
+const DETECTION_THRESHOLD: f32 = 0.68;
+const DETECTION_REQUIRED_CONSECUTIVE_HITS: usize = 1;
 
 pub struct WakeWordRuntime {
     inner: BufferedWakeWordRuntime<LiveKitDetector<Box<dyn WakeWordScorer + Send>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WakeWordDetection {
+    pub detected_at_ms: u64,
+    pub confidence: f32,
 }
 
 impl WakeWordRuntime {
@@ -20,7 +27,10 @@ impl WakeWordRuntime {
         })
     }
 
-    pub fn process_sleeping_frame(&mut self, frame: &[f32]) -> Result<Option<u64>, String> {
+    pub fn process_sleeping_frame(
+        &mut self,
+        frame: &[f32],
+    ) -> Result<Option<WakeWordDetection>, String> {
         self.inner.process_sleeping_frame(frame)
     }
 
@@ -36,6 +46,7 @@ impl WakeWordRuntime {
                 4,
                 8,
                 DETECTION_THRESHOLD,
+                1,
             )),
         }
     }
@@ -43,7 +54,7 @@ impl WakeWordRuntime {
 
 trait WakeWordDetector {
     fn samples_per_frame(&self) -> usize;
-    fn process_samples(&mut self, samples: &[f32]) -> Result<bool, String>;
+    fn process_samples(&mut self, samples: &[f32]) -> Result<Option<f32>, String>;
     fn reset(&mut self);
 }
 
@@ -62,7 +73,10 @@ impl<D: WakeWordDetector> BufferedWakeWordRuntime<D> {
         }
     }
 
-    fn process_sleeping_frame(&mut self, frame: &[f32]) -> Result<Option<u64>, String> {
+    fn process_sleeping_frame(
+        &mut self,
+        frame: &[f32],
+    ) -> Result<Option<WakeWordDetection>, String> {
         self.pending_samples.extend_from_slice(frame);
 
         let samples_per_frame = self.detector.samples_per_frame();
@@ -70,11 +84,11 @@ impl<D: WakeWordDetector> BufferedWakeWordRuntime<D> {
 
         while self.pending_samples.len().saturating_sub(consumed_samples) >= samples_per_frame {
             let frame_end = consumed_samples.saturating_add(samples_per_frame);
-            let detected = match self
+            let detection_score = match self
                 .detector
                 .process_samples(&self.pending_samples[consumed_samples..frame_end])
             {
-                Ok(detected) => detected,
+                Ok(detection_score) => detection_score,
                 Err(error) => {
                     self.pending_samples.drain(..frame_end);
                     self.detector.reset();
@@ -87,10 +101,13 @@ impl<D: WakeWordDetector> BufferedWakeWordRuntime<D> {
                 .saturating_add(samples_per_frame as u64);
             consumed_samples = frame_end;
 
-            if detected {
+            if let Some(confidence) = detection_score {
                 self.pending_samples.clear();
                 self.detector.reset();
-                return Ok(Some(samples_to_ms(self.processed_samples)));
+                return Ok(Some(WakeWordDetection {
+                    detected_at_ms: samples_to_ms(self.processed_samples),
+                    confidence,
+                }));
             }
         }
 
@@ -157,6 +174,9 @@ struct LiveKitDetector<S> {
     samples_per_frame: usize,
     window_samples: usize,
     detection_threshold: f32,
+    required_consecutive_hits: usize,
+    consecutive_hits: usize,
+    consecutive_floor_score: Option<f32>,
 }
 
 impl<S: WakeWordScorer> LiveKitDetector<S> {
@@ -166,6 +186,7 @@ impl<S: WakeWordScorer> LiveKitDetector<S> {
             DETECTOR_CHUNK_SAMPLES,
             DETECTOR_WINDOW_SAMPLES,
             DETECTION_THRESHOLD,
+            DETECTION_REQUIRED_CONSECUTIVE_HITS,
         )
     }
 
@@ -174,6 +195,7 @@ impl<S: WakeWordScorer> LiveKitDetector<S> {
         samples_per_frame: usize,
         window_samples: usize,
         detection_threshold: f32,
+        required_consecutive_hits: usize,
     ) -> Self {
         Self {
             scorer,
@@ -181,6 +203,9 @@ impl<S: WakeWordScorer> LiveKitDetector<S> {
             samples_per_frame,
             window_samples,
             detection_threshold,
+            required_consecutive_hits,
+            consecutive_hits: 0,
+            consecutive_floor_score: None,
         }
     }
 }
@@ -190,7 +215,7 @@ impl<S: WakeWordScorer> WakeWordDetector for LiveKitDetector<S> {
         self.samples_per_frame
     }
 
-    fn process_samples(&mut self, samples: &[f32]) -> Result<bool, String> {
+    fn process_samples(&mut self, samples: &[f32]) -> Result<Option<f32>, String> {
         self.rolling_samples
             .extend(samples.iter().copied().map(normalize_sample_to_i16));
 
@@ -200,15 +225,32 @@ impl<S: WakeWordScorer> WakeWordDetector for LiveKitDetector<S> {
         }
 
         if self.rolling_samples.len() < self.window_samples {
-            return Ok(false);
+            return Ok(None);
         }
 
         let score = self.scorer.score(&self.rolling_samples)?;
-        Ok(score >= self.detection_threshold)
+        if score >= self.detection_threshold {
+            self.consecutive_floor_score = Some(
+                self.consecutive_floor_score
+                    .map_or(score, |current_floor| current_floor.min(score)),
+            );
+            self.consecutive_hits = self.consecutive_hits.saturating_add(1);
+            if self.consecutive_hits >= self.required_consecutive_hits {
+                return Ok(Some(self.consecutive_floor_score.unwrap_or(score)));
+            }
+
+            return Ok(None);
+        }
+
+        self.consecutive_hits = 0;
+        self.consecutive_floor_score = None;
+        Ok(None)
     }
 
     fn reset(&mut self) {
         self.rolling_samples.clear();
+        self.consecutive_hits = 0;
+        self.consecutive_floor_score = None;
     }
 }
 
@@ -230,7 +272,7 @@ fn samples_to_ms(samples: u64) -> u64 {
 mod tests {
     use super::{
         normalize_sample_to_i16, samples_to_ms, BufferedWakeWordRuntime, LiveKitDetector,
-        WakeWordDetector, WakeWordRuntime, WakeWordScorer,
+        WakeWordDetection, WakeWordDetector, WakeWordRuntime, WakeWordScorer, DETECTION_THRESHOLD,
     };
     use hound::WavReader;
     use std::path::{Path, PathBuf};
@@ -248,12 +290,12 @@ mod tests {
             self.samples_per_frame
         }
 
-        fn process_samples(&mut self, _samples: &[f32]) -> Result<bool, String> {
+        fn process_samples(&mut self, _samples: &[f32]) -> Result<Option<f32>, String> {
             self.call_count += 1;
             if self.error_on_call == Some(self.call_count) {
                 return Err(String::from("synthetic detector failure"));
             }
-            Ok(self.detect_on_call == Some(self.call_count))
+            Ok((self.detect_on_call == Some(self.call_count)).then_some(0.91))
         }
 
         fn reset(&mut self) {
@@ -286,14 +328,14 @@ mod tests {
             self.samples_per_frame
         }
 
-        fn process_samples(&mut self, _samples: &[f32]) -> Result<bool, String> {
+        fn process_samples(&mut self, _samples: &[f32]) -> Result<Option<f32>, String> {
             self.call_count += 1;
             if !self.errored && self.call_count == 2 {
                 self.errored = true;
                 return Err(String::from("synthetic detector failure"));
             }
 
-            Ok(false)
+            Ok(None)
         }
 
         fn reset(&mut self) {
@@ -332,7 +374,10 @@ mod tests {
 
         assert_eq!(
             runtime.process_sleeping_frame(&vec![0.0; 1_600]),
-            Ok(Some(60))
+            Ok(Some(WakeWordDetection {
+                detected_at_ms: 60,
+                confidence: 0.91,
+            }))
         );
         assert!(runtime.pending_samples.is_empty());
         assert_eq!(runtime.processed_samples, 960);
@@ -371,12 +416,15 @@ mod tests {
             scores: vec![0.8],
             seen_chunks: Vec::new(),
         };
-        let mut detector = LiveKitDetector::with_settings(scorer, 4, 8, 0.5);
+        let mut detector = LiveKitDetector::with_settings(scorer, 4, 8, 0.5, 1);
 
-        assert_eq!(detector.process_samples(&[0.1, 0.2, 0.3, 0.4]), Ok(false));
+        assert_eq!(detector.process_samples(&[0.1, 0.2, 0.3, 0.4]), Ok(None));
         assert!(detector.scorer.seen_chunks.is_empty());
 
-        assert_eq!(detector.process_samples(&[0.5, 0.6, 0.7, 0.8]), Ok(true));
+        assert_eq!(
+            detector.process_samples(&[0.5, 0.6, 0.7, 0.8]),
+            Ok(Some(0.8))
+        );
         assert_eq!(detector.scorer.seen_chunks.len(), 1);
         assert_eq!(detector.scorer.seen_chunks[0].len(), 8);
     }
@@ -387,11 +435,11 @@ mod tests {
             scores: vec![0.2, 0.2],
             seen_chunks: Vec::new(),
         };
-        let mut detector = LiveKitDetector::with_settings(scorer, 4, 8, 0.5);
+        let mut detector = LiveKitDetector::with_settings(scorer, 4, 8, 0.5, 1);
 
-        assert_eq!(detector.process_samples(&[0.0, 0.1, 0.2, 0.3]), Ok(false));
-        assert_eq!(detector.process_samples(&[0.4, 0.5, 0.6, 0.7]), Ok(false));
-        assert_eq!(detector.process_samples(&[0.8, 0.9, 1.0, -1.0]), Ok(false));
+        assert_eq!(detector.process_samples(&[0.0, 0.1, 0.2, 0.3]), Ok(None));
+        assert_eq!(detector.process_samples(&[0.4, 0.5, 0.6, 0.7]), Ok(None));
+        assert_eq!(detector.process_samples(&[0.8, 0.9, 1.0, -1.0]), Ok(None));
 
         assert_eq!(detector.scorer.seen_chunks.len(), 2);
         assert_eq!(
@@ -465,6 +513,9 @@ mod tests {
         }
 
         assert!(detected.is_some());
+        assert!(
+            detected.map(|result| result.confidence).unwrap_or_default() >= DETECTION_THRESHOLD
+        );
     }
 
     #[test]
@@ -485,6 +536,42 @@ mod tests {
         }
 
         assert_eq!(detected, None);
+    }
+
+    #[test]
+    fn behavior_detector_requires_three_consecutive_hits() {
+        let scorer = FakeScorer {
+            scores: vec![0.7, 0.4, 0.72, 0.75, 0.8],
+            seen_chunks: Vec::new(),
+        };
+        let mut detector = LiveKitDetector::with_settings(scorer, 4, 8, 0.62, 3);
+
+        assert_eq!(detector.process_samples(&[0.1, 0.2, 0.3, 0.4]), Ok(None));
+        assert_eq!(detector.process_samples(&[0.5, 0.6, 0.7, 0.8]), Ok(None));
+        assert_eq!(detector.process_samples(&[0.1, 0.2, 0.3, 0.4]), Ok(None));
+        assert_eq!(detector.process_samples(&[0.5, 0.6, 0.7, 0.8]), Ok(None));
+        assert_eq!(detector.process_samples(&[0.1, 0.2, 0.3, 0.4]), Ok(None));
+        assert_eq!(
+            detector.process_samples(&[0.5, 0.6, 0.7, 0.8]),
+            Ok(Some(0.72))
+        );
+    }
+
+    #[test]
+    fn behavior_detector_reports_floor_score_across_triggering_streak() {
+        let scorer = FakeScorer {
+            scores: vec![0.95, 0.7, 0.99],
+            seen_chunks: Vec::new(),
+        };
+        let mut detector = LiveKitDetector::with_settings(scorer, 4, 8, 0.62, 3);
+
+        assert_eq!(detector.process_samples(&[0.1, 0.2, 0.3, 0.4]), Ok(None));
+        assert_eq!(detector.process_samples(&[0.5, 0.6, 0.7, 0.8]), Ok(None));
+        assert_eq!(detector.process_samples(&[0.1, 0.2, 0.3, 0.4]), Ok(None));
+        assert_eq!(
+            detector.process_samples(&[0.5, 0.6, 0.7, 0.8]),
+            Ok(Some(0.7))
+        );
     }
 
     fn fixtures_dir() -> PathBuf {

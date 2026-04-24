@@ -138,9 +138,7 @@ pub fn apply_voice_pipeline_event(
             )
             .map_err(VoicePipelineError::Session)?;
             let mut capture = state.capture.clone();
-            capture
-                .begin_utterance()
-                .map_err(VoicePipelineError::Capture)?;
+            capture.begin_utterance_without_preroll();
 
             Ok((
                 VoicePipelineState { session, capture },
@@ -299,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn wake_word_starts_listening_and_seeds_preroll() {
+    fn wake_word_starts_listening_without_seeding_sleeping_preroll() {
         let config = pipeline_config();
         let (ready_state, _) = apply_voice_pipeline_event(
             &VoicePipelineState::new(config).expect("pipeline should initialize"),
@@ -328,8 +326,59 @@ mod tests {
             RuntimePhase::Listening
         );
         assert!(listening_state.capture().capturing_utterance());
-        assert_eq!(listening_state.capture().utterance_len(), 4);
+        assert_eq!(listening_state.capture().utterance_len(), 0);
         assert_eq!(action, VoicePipelineAction::StartedListening);
+    }
+
+    #[test]
+    fn behavior_wake_word_detected_does_not_seed_sleeping_preroll_into_utterance() {
+        let config = pipeline_config();
+        let (ready_state, _) = apply_voice_pipeline_event(
+            &VoicePipelineState::new(config).expect("pipeline should initialize"),
+            config,
+            VoicePipelineEvent::StartupValidated,
+        )
+        .expect("startup validation should succeed");
+        let (sleeping_state, _) = apply_voice_pipeline_event(
+            &ready_state,
+            config,
+            VoicePipelineEvent::RecordSleepingFrame {
+                frame: vec![0.9, 0.8, 0.7, 0.6],
+            },
+        )
+        .expect("sleeping frame should be recorded");
+        let (listening_state, _) = apply_voice_pipeline_event(
+            &sleeping_state,
+            config,
+            VoicePipelineEvent::WakeWordDetected { now_ms: 100 },
+        )
+        .expect("wake word should start listening");
+        let (recording_state, _) = apply_voice_pipeline_event(
+            &listening_state,
+            config,
+            VoicePipelineEvent::RecordListeningFrame {
+                frame: vec![0.1, 0.2],
+            },
+        )
+        .expect("listening frame should be recorded");
+
+        let (_, action) = apply_voice_pipeline_event(
+            &recording_state,
+            config,
+            VoicePipelineEvent::SilenceCheck { now_ms: 1_300 },
+        )
+        .expect("silence timeout should finish the utterance");
+
+        assert_eq!(
+            action,
+            VoicePipelineAction::FinishedUtterance {
+                transcription_input: ParakeetTranscriptionInput::new(
+                    PARAKEET_SAMPLE_RATE_HZ,
+                    vec![0.1, 0.2],
+                )
+                .expect("captured utterance should become valid transcription input"),
+            }
+        );
     }
 
     #[test]
@@ -382,7 +431,7 @@ mod tests {
             VoicePipelineAction::FinishedUtterance {
                 transcription_input: ParakeetTranscriptionInput::new(
                     PARAKEET_SAMPLE_RATE_HZ,
-                    vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+                    vec![0.5, 0.6],
                 )
                 .expect("captured utterance should become valid transcription input"),
             }

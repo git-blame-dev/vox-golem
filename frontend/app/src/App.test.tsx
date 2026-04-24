@@ -342,6 +342,63 @@ describe('App', () => {
     expect(container.textContent).toContain('transcription_ready:\n3200 samples captured')
   })
 
+  it('shows wake confidence badge while listening when telemetry includes wake confidence', async () => {
+    class FakeAudio {
+      play(): Promise<void> {
+        return Promise.resolve()
+      }
+    }
+
+    Object.defineProperty(globalThis, 'Audio', {
+      configurable: true,
+      value: FakeAudio,
+    })
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: true,
+            voice_input_error: null,
+          }
+        }
+
+        if (command === 'begin_listening') {
+          return {
+            runtime_phase: 'listening',
+            transcription_ready_samples: null,
+            transcript_text: null,
+            last_activity_ms: 100,
+            capturing_utterance: true,
+            preroll_samples: 0,
+            utterance_samples: 3,
+            telemetry: {
+              wake_detected_ms: 100,
+              wake_confidence: 0.67,
+            },
+          }
+        }
+
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+
+    await act(async () => {
+      getControlButton(container, 'Start listening').click()
+      await Promise.resolve()
+    })
+
+    expect(container.textContent).toContain('Wake trigger score 0.670')
+  })
+
   it('starts and stops default microphone capture and forwards live frames', async () => {
     const stop = vi.fn()
     let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null

@@ -74,6 +74,7 @@ export interface RuntimeControlTelemetry {
   readonly backendIngestStartedMs: number | null
   readonly backendIngestCompletedMs: number | null
   readonly wakeDetectedMs: number | null
+  readonly wakeConfidence: number | null
   readonly transcriptionStartedMs: number | null
   readonly transcriptionCompletedMs: number | null
 }

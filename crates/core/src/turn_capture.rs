@@ -69,6 +69,11 @@ impl TurnCaptureState {
         Ok(())
     }
 
+    pub fn begin_utterance_without_preroll(&mut self) {
+        self.utterance.clear();
+        self.capturing_utterance = true;
+    }
+
     pub fn record_listening_frame(&mut self, frame: &[f32]) -> Result<(), AudioBufferError> {
         if !self.capturing_utterance {
             return Ok(());
@@ -194,5 +199,21 @@ mod tests {
         assert!(!state.capturing_utterance());
         assert_eq!(state.utterance_len(), 0);
         assert_eq!(state.preroll_len(), 4);
+    }
+
+    #[test]
+    fn begin_utterance_without_preroll_ignores_sleeping_buffer_samples() {
+        let config = TurnCaptureConfig::new(4, 8).expect("valid capture config");
+        let mut state = TurnCaptureState::new(config).expect("capture state should initialize");
+
+        state.record_sleeping_frame(&[0.1, 0.2, 0.3, 0.4]);
+        state.begin_utterance_without_preroll();
+        state
+            .record_listening_frame(&[0.5, 0.6])
+            .expect("listening frame should fit");
+
+        assert_eq!(state.preroll_len(), 4);
+        assert_eq!(state.utterance_len(), 2);
+        assert_eq!(state.finish_utterance(), vec![0.5, 0.6]);
     }
 }
