@@ -176,7 +176,7 @@ impl LlamaCppRuntime {
                 "-ngl",
                 "all",
                 "-c",
-                "4096",
+                "8192",
                 "--no-webui",
             ])
             .stdin(Stdio::null())

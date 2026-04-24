@@ -16,7 +16,24 @@ const DEFAULT_SILENCE_TIMEOUT_MS: u64 = 2_500;
 const DEFAULT_PREROLL_MAX_SAMPLES: usize = 4_000;
 const DEFAULT_UTTERANCE_MAX_SAMPLES: usize = 4_800_000;
 const LLAMA_CPP_MODEL_ALIAS: &str = "default";
-const LLAMA_CPP_MAX_TOKENS: u16 = 256;
+const LLAMA_CPP_MAX_TOKENS: u16 = 512;
+const LLAMA_CPP_CONTEXT_WINDOW_TOKENS: usize = 8_192;
+const LLAMA_CPP_CONTEXT_SAFETY_MARGIN_TOKENS: usize = 512;
+const LLAMA_CPP_CHAT_WRAPPER_TOKENS: usize = 64;
+const LLAMA_CPP_ROLLOVER_REASON: &str =
+    "Context budget reached; started a new local Gemma conversation for this reply.";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LlamaConversationTurn {
+    user: String,
+    assistant: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LlamaPromptInput {
+    user_prompt: String,
+    rolled_over: bool,
+}
 
 struct AppState {
     startup_state: Arc<Mutex<StartupStatePayload>>,
@@ -27,6 +44,7 @@ struct AppState {
     voice_activity_runtime: Option<Mutex<voice_activity::VoiceActivityRuntime>>,
     parakeet_runtime: Option<Mutex<transcription::ParakeetRuntime>>,
     llama_cpp_runtime: Arc<Mutex<Option<voxgolem_platform::llama_cpp::LlamaCppRuntime>>>,
+    llama_cpp_conversation: Mutex<Vec<LlamaConversationTurn>>,
     llama_cpp_system_prompt: Option<String>,
 }
 
@@ -159,6 +177,7 @@ fn submit_prompt(
         config,
         &prompt,
         &app_state.llama_cpp_runtime,
+        &app_state.llama_cpp_conversation,
         app_state.llama_cpp_system_prompt.as_deref(),
     ) {
         Ok(outcome) => outcome,
@@ -309,6 +328,10 @@ fn reset_session(
         app_state.voice_pipeline_config,
         voxgolem_core::voice_pipeline::VoicePipelineEvent::ResetToIdle,
     )?;
+
+    if let Ok(mut conversation) = app_state.llama_cpp_conversation.lock() {
+        conversation.clear();
+    }
 
     Ok(RuntimePhaseResponsePayload {
         ..current_runtime_phase_response(&app_state.voice_pipeline_state, None, None)?
@@ -532,6 +555,7 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                 voice_activity_runtime,
                 parakeet_runtime,
                 llama_cpp_runtime,
+                llama_cpp_conversation: Mutex::new(Vec::new()),
                 llama_cpp_system_prompt,
             }
         }
@@ -594,6 +618,7 @@ fn build_startup_error_app_state(
         voice_activity_runtime: None,
         parakeet_runtime: None,
         llama_cpp_runtime: Arc::new(Mutex::new(None)),
+        llama_cpp_conversation: Mutex::new(Vec::new()),
         llama_cpp_system_prompt: None,
     }
 }
@@ -925,6 +950,7 @@ fn execute_prompt_backend(
     config: &voxgolem_core::config::RuntimeConfig,
     prompt: &str,
     llama_cpp_runtime: &Arc<Mutex<Option<voxgolem_platform::llama_cpp::LlamaCppRuntime>>>,
+    llama_cpp_conversation: &Mutex<Vec<LlamaConversationTurn>>,
     llama_cpp_system_prompt: Option<&str>,
 ) -> Result<PromptExecutionOutcome, String> {
     match &config.response_backend {
@@ -952,30 +978,164 @@ fn execute_prompt_backend(
         voxgolem_core::config::ResponseBackendConfig::LlamaCpp { .. } => {
             let system_prompt =
                 llama_cpp_system_prompt.ok_or_else(|| String::from("SOUL.md is not loaded"))?;
+            let conversation_snapshot = llama_cpp_conversation
+                .lock()
+                .map_err(|_| String::from("local llama.cpp conversation lock is poisoned"))?
+                .clone();
+            let prompt_input =
+                build_llama_prompt_input(system_prompt, prompt, &conversation_snapshot);
+            let LlamaPromptInput {
+                mut user_prompt,
+                rolled_over: initially_rolled_over,
+            } = prompt_input;
             let mut guard = llama_cpp_runtime
                 .lock()
                 .map_err(|_| String::from("local llama.cpp runtime lock is poisoned"))?;
             let runtime = guard
                 .as_mut()
                 .ok_or_else(|| String::from("local Gemma model is still warming up"))?;
-            let response = runtime
-                .chat(
-                    &voxgolem_platform::llama_cpp::LlamaCppPrompt::new(prompt.to_string())
-                        .with_system_prompt(system_prompt)
-                        .with_max_tokens(LLAMA_CPP_MAX_TOKENS),
-                )
-                .map_err(|error| format!("failed to execute local llama.cpp prompt: {error}"))?;
+            let mut rolled_over = initially_rolled_over;
+            let can_retry_with_reset = !conversation_snapshot.is_empty() && !rolled_over;
+            let response = match runtime.chat(
+                &voxgolem_platform::llama_cpp::LlamaCppPrompt::new(user_prompt.clone())
+                    .with_system_prompt(system_prompt)
+                    .with_max_tokens(LLAMA_CPP_MAX_TOKENS),
+            ) {
+                Ok(response) => response,
+                Err(error)
+                    if can_retry_with_reset
+                        && is_llama_context_overflow_error(&error.to_string()) =>
+                {
+                    user_prompt = render_llama_user_prompt(&[], prompt);
+                    rolled_over = true;
+                    runtime
+                        .chat(
+                            &voxgolem_platform::llama_cpp::LlamaCppPrompt::new(
+                                user_prompt.clone(),
+                            )
+                            .with_system_prompt(system_prompt)
+                            .with_max_tokens(LLAMA_CPP_MAX_TOKENS),
+                        )
+                        .map_err(|retry_error| {
+                            format!(
+                                "failed to execute local llama.cpp prompt after conversation reset: {retry_error}; initial error: {error}"
+                            )
+                        })?
+                }
+                Err(error) => {
+                    return Err(format!("failed to execute local llama.cpp prompt: {error}"));
+                }
+            };
+
+            let assistant_text = response.text;
+            let mut conversation = llama_cpp_conversation
+                .lock()
+                .map_err(|_| String::from("local llama.cpp conversation lock is poisoned"))?;
+            if rolled_over {
+                conversation.clear();
+            }
+            conversation.push(LlamaConversationTurn {
+                user: prompt.to_string(),
+                assistant: assistant_text.clone(),
+            });
+
+            let mut events = Vec::new();
+            if rolled_over {
+                events.push(PromptExecutionEventPayload::Reasoning {
+                    text: LLAMA_CPP_ROLLOVER_REASON.to_string(),
+                });
+            }
+            events.push(PromptExecutionEventPayload::Text {
+                text: assistant_text,
+            });
 
             Ok(PromptExecutionOutcome {
-                events: vec![PromptExecutionEventPayload::Text {
-                    text: response.text,
-                }],
+                events,
                 stderr: String::new(),
                 exit_code: None,
                 error_message: None,
             })
         }
     }
+}
+
+fn build_llama_prompt_input(
+    system_prompt: &str,
+    prompt: &str,
+    conversation: &[LlamaConversationTurn],
+) -> LlamaPromptInput {
+    let user_prompt = render_llama_user_prompt(conversation, prompt);
+    if estimate_llama_input_tokens(system_prompt, &user_prompt) <= llama_cpp_input_token_limit() {
+        return LlamaPromptInput {
+            user_prompt,
+            rolled_over: false,
+        };
+    }
+
+    if conversation.is_empty() {
+        return LlamaPromptInput {
+            user_prompt,
+            rolled_over: false,
+        };
+    }
+
+    LlamaPromptInput {
+        user_prompt: render_llama_user_prompt(&[], prompt),
+        rolled_over: true,
+    }
+}
+
+fn render_llama_user_prompt(conversation: &[LlamaConversationTurn], prompt: &str) -> String {
+    if conversation.is_empty() {
+        return prompt.to_string();
+    }
+
+    let mut rendered = String::from("Conversation so far:\n");
+    for turn in conversation {
+        rendered.push_str("User: ");
+        rendered.push_str(&turn.user);
+        rendered.push('\n');
+        rendered.push_str("Assistant: ");
+        rendered.push_str(&turn.assistant);
+        rendered.push_str("\n\n");
+    }
+    rendered.push_str("Current user message:\n");
+    rendered.push_str(prompt);
+    rendered
+}
+
+fn llama_cpp_input_token_limit() -> usize {
+    LLAMA_CPP_CONTEXT_WINDOW_TOKENS
+        .saturating_sub(usize::from(LLAMA_CPP_MAX_TOKENS))
+        .saturating_sub(LLAMA_CPP_CONTEXT_SAFETY_MARGIN_TOKENS)
+}
+
+fn estimate_llama_input_tokens(system_prompt: &str, user_prompt: &str) -> usize {
+    estimate_text_tokens(system_prompt)
+        .saturating_add(estimate_text_tokens(user_prompt))
+        .saturating_add(LLAMA_CPP_CHAT_WRAPPER_TOKENS)
+}
+
+fn estimate_text_tokens(text: &str) -> usize {
+    let char_count = text.chars().count();
+    if char_count == 0 {
+        0
+    } else {
+        char_count.div_ceil(4)
+    }
+}
+
+fn is_llama_context_overflow_error(error_message: &str) -> bool {
+    let normalized = error_message.to_ascii_lowercase();
+    let has_status = normalized.contains("status 400") || normalized.contains("status 413");
+    let mentions_context = normalized.contains("context");
+    let mentions_overflow = normalized.contains("exceed")
+        || normalized.contains("too long")
+        || normalized.contains("limit")
+        || normalized.contains("maximum")
+        || normalized.contains("window");
+
+    has_status && mentions_context && mentions_overflow
 }
 
 fn map_opencode_events(
@@ -1116,14 +1276,16 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_optional_speech_activity, build_mark_silence_response, build_startup_error_app_state,
-        current_runtime_phase_response, current_silence_deadline, default_voice_pipeline_config,
-        execute_prompt_backend, ingest_audio_frame_with_optional_wake_word_detection,
-        load_llama_cpp_system_prompt, process_wake_word_frame, prompt_result_error_message,
-        reset_voice_pipeline_to_waiting, reset_wake_word_runtime,
+        apply_optional_speech_activity, build_llama_prompt_input, build_mark_silence_response,
+        build_startup_error_app_state, current_runtime_phase_response, current_silence_deadline,
+        default_voice_pipeline_config, execute_prompt_backend,
+        ingest_audio_frame_with_optional_wake_word_detection, is_llama_context_overflow_error,
+        llama_cpp_input_token_limit, load_llama_cpp_system_prompt, process_wake_word_frame,
+        prompt_result_error_message, reset_voice_pipeline_to_waiting, reset_wake_word_runtime,
         runtime_phase_response_from_state, to_runtime_phase_payload, transcribe_finished_utterance,
-        transcription_ready_samples, wake_word_event_timestamp, RuntimePhasePayload,
-        RuntimePhaseResponsePayload, RuntimeTelemetryPayload, DEFAULT_SILENCE_TIMEOUT_MS,
+        transcription_ready_samples, wake_word_event_timestamp, LlamaConversationTurn,
+        PromptExecutionEventPayload, RuntimePhasePayload, RuntimePhaseResponsePayload,
+        RuntimeTelemetryPayload, DEFAULT_SILENCE_TIMEOUT_MS, LLAMA_CPP_ROLLOVER_REASON,
     };
     use crate::wake_word::{WakeWordDetection, WakeWordRuntime};
     use std::io::{Read, Write};
@@ -1250,9 +1412,16 @@ mod tests {
                 ),
             ),
         )));
+        let conversation = Mutex::new(Vec::<LlamaConversationTurn>::new());
 
-        let outcome = execute_prompt_backend(&config, "say hi", &runtime, Some("You are JARVIS."))
-            .expect("local backend should succeed");
+        let outcome = execute_prompt_backend(
+            &config,
+            "say hi",
+            &runtime,
+            &conversation,
+            Some("You are JARVIS."),
+        )
+        .expect("local backend should succeed");
 
         server_thread.join().expect("server thread should complete");
 
@@ -1281,9 +1450,16 @@ mod tests {
             },
         };
         let runtime = Arc::new(Mutex::new(None));
+        let conversation = Mutex::new(Vec::<LlamaConversationTurn>::new());
 
         assert!(matches!(
-            execute_prompt_backend(&config, "say hi", &runtime, Some("You are JARVIS.")),
+            execute_prompt_backend(
+                &config,
+                "say hi",
+                &runtime,
+                &conversation,
+                Some("You are JARVIS."),
+            ),
             Err(message) if message == "local Gemma model is still warming up"
         ));
     }
@@ -1303,11 +1479,375 @@ mod tests {
             },
         };
         let runtime = Arc::new(Mutex::new(None));
+        let conversation = Mutex::new(Vec::<LlamaConversationTurn>::new());
 
         assert!(matches!(
-            execute_prompt_backend(&config, "say hi", &runtime, None),
+            execute_prompt_backend(&config, "say hi", &runtime, &conversation, None),
             Err(message) if message == "SOUL.md is not loaded"
         ));
+    }
+
+    #[test]
+    fn build_llama_prompt_input_keeps_history_when_under_budget() {
+        let conversation = vec![LlamaConversationTurn {
+            user: "first user prompt".to_string(),
+            assistant: "first assistant reply".to_string(),
+        }];
+
+        let prompt_input = build_llama_prompt_input("system", "second prompt", &conversation);
+
+        assert!(!prompt_input.rolled_over);
+        assert!(prompt_input.user_prompt.contains("Conversation so far:"));
+        assert!(prompt_input.user_prompt.contains("first user prompt"));
+        assert!(prompt_input.user_prompt.contains("first assistant reply"));
+        assert!(prompt_input
+            .user_prompt
+            .contains("Current user message:\nsecond prompt"));
+    }
+
+    #[test]
+    fn build_llama_prompt_input_rolls_over_when_history_exceeds_budget() {
+        let oversized = "x".repeat(llama_cpp_input_token_limit() * 8);
+        let conversation = vec![LlamaConversationTurn {
+            user: oversized.clone(),
+            assistant: oversized,
+        }];
+
+        let prompt_input = build_llama_prompt_input("system", "fresh prompt", &conversation);
+
+        assert!(prompt_input.rolled_over);
+        assert_eq!(prompt_input.user_prompt, "fresh prompt");
+    }
+
+    #[test]
+    fn is_llama_context_overflow_error_detects_window_overflow_messages() {
+        assert!(is_llama_context_overflow_error(
+            "status 400: context window exceeded"
+        ));
+    }
+
+    #[test]
+    fn is_llama_context_overflow_error_rejects_non_overflow_context_messages() {
+        assert!(!is_llama_context_overflow_error(
+            "status 400: context serialization failed"
+        ));
+    }
+
+    #[test]
+    fn execute_prompt_backend_rolls_over_history_and_emits_reasoning_event() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("listener address should exist")
+            .port();
+
+        let server_thread = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("request should connect");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .expect("read timeout should be configurable");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+
+            loop {
+                let read_len = stream
+                    .read(&mut buffer)
+                    .expect("request should be readable");
+                if read_len == 0 {
+                    break;
+                }
+
+                request.extend_from_slice(&buffer[..read_len]);
+                if String::from_utf8_lossy(&request).contains("\"model\":\"default\"") {
+                    break;
+                }
+            }
+
+            let body = "{\"choices\":[{\"message\":{\"content\":\"Local Gemma says hi\"}}]}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n{:X}\r\n{}\r\n0\r\n\r\n",
+                body.len(),
+                body,
+            );
+
+            stream
+                .write_all(response.as_bytes())
+                .expect("response should be writable");
+        });
+
+        let config = voxgolem_core::config::RuntimeConfig {
+            wake_word_model_path: PathBuf::from("wake.onnx"),
+            parakeet_model_dir: PathBuf::from("parakeet"),
+            silero_vad_model: PathBuf::from("vad.onnx"),
+            response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
+                server_path: PathBuf::from("llama-server.exe"),
+                host: String::from("127.0.0.1"),
+                port,
+                fast_model_path: PathBuf::from("fast.gguf"),
+                quality_model_path: None,
+            },
+        };
+        let runtime = Arc::new(Mutex::new(Some(
+            voxgolem_platform::llama_cpp::LlamaCppRuntime::attach(
+                voxgolem_platform::llama_cpp::LlamaCppServerSpec::new(
+                    "llama-server.exe",
+                    "fast.gguf",
+                    "127.0.0.1",
+                    port,
+                    "default",
+                ),
+            ),
+        )));
+        let oversized = "y".repeat(llama_cpp_input_token_limit() * 8);
+        let conversation = Mutex::new(vec![LlamaConversationTurn {
+            user: oversized.clone(),
+            assistant: oversized,
+        }]);
+
+        let outcome = execute_prompt_backend(
+            &config,
+            "say hi",
+            &runtime,
+            &conversation,
+            Some("You are JARVIS."),
+        )
+        .expect("local backend should succeed");
+
+        server_thread.join().expect("server thread should complete");
+
+        assert_eq!(outcome.events.len(), 2);
+        assert!(matches!(
+            &outcome.events[0],
+            PromptExecutionEventPayload::Reasoning { text }
+                if text == LLAMA_CPP_ROLLOVER_REASON
+        ));
+        assert!(matches!(
+            &outcome.events[1],
+            PromptExecutionEventPayload::Text { text } if text == "Local Gemma says hi"
+        ));
+
+        let conversation = conversation
+            .lock()
+            .expect("conversation lock should not be poisoned");
+        assert_eq!(conversation.len(), 1);
+        assert_eq!(conversation[0].user, "say hi");
+        assert_eq!(conversation[0].assistant, "Local Gemma says hi");
+    }
+
+    #[test]
+    fn execute_prompt_backend_retries_with_reset_after_context_overflow() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("listener address should exist")
+            .port();
+
+        let server_thread = thread::spawn(move || {
+            let mut attempt = 0;
+            while attempt < 2 {
+                let (mut stream, _) = listener.accept().expect("request should connect");
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .expect("read timeout should be configurable");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+
+                loop {
+                    let read_len = stream
+                        .read(&mut buffer)
+                        .expect("request should be readable");
+                    if read_len == 0 {
+                        break;
+                    }
+
+                    request.extend_from_slice(&buffer[..read_len]);
+                    if String::from_utf8_lossy(&request).contains("\"model\":\"default\"") {
+                        break;
+                    }
+                }
+
+                let request_text = String::from_utf8_lossy(&request);
+                if attempt == 0 {
+                    assert!(request_text.contains("Conversation so far:"));
+                    let body =
+                        "{\"error\":{\"message\":\"context window exceeded for this prompt\"}}";
+                    let response = format!(
+                        "HTTP/1.1 400 Bad Request\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n{:X}\r\n{}\r\n0\r\n\r\n",
+                        body.len(),
+                        body,
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .expect("error response should be writable");
+                } else {
+                    assert!(!request_text.contains("Conversation so far:"));
+                    assert!(request_text.contains("say hi"));
+                    let body = "{\"choices\":[{\"message\":{\"content\":\"Recovered response\"}}]}";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n{:X}\r\n{}\r\n0\r\n\r\n",
+                        body.len(),
+                        body,
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .expect("success response should be writable");
+                }
+
+                attempt += 1;
+            }
+        });
+
+        let config = voxgolem_core::config::RuntimeConfig {
+            wake_word_model_path: PathBuf::from("wake.onnx"),
+            parakeet_model_dir: PathBuf::from("parakeet"),
+            silero_vad_model: PathBuf::from("vad.onnx"),
+            response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
+                server_path: PathBuf::from("llama-server.exe"),
+                host: String::from("127.0.0.1"),
+                port,
+                fast_model_path: PathBuf::from("fast.gguf"),
+                quality_model_path: None,
+            },
+        };
+        let runtime = Arc::new(Mutex::new(Some(
+            voxgolem_platform::llama_cpp::LlamaCppRuntime::attach(
+                voxgolem_platform::llama_cpp::LlamaCppServerSpec::new(
+                    "llama-server.exe",
+                    "fast.gguf",
+                    "127.0.0.1",
+                    port,
+                    "default",
+                ),
+            ),
+        )));
+        let conversation = Mutex::new(vec![LlamaConversationTurn {
+            user: "prior turn".to_string(),
+            assistant: "prior answer".to_string(),
+        }]);
+
+        let outcome = execute_prompt_backend(
+            &config,
+            "say hi",
+            &runtime,
+            &conversation,
+            Some("You are JARVIS."),
+        )
+        .expect("local backend should succeed after retry");
+
+        server_thread.join().expect("server thread should complete");
+
+        assert_eq!(outcome.events.len(), 2);
+        assert!(matches!(
+            &outcome.events[0],
+            PromptExecutionEventPayload::Reasoning { text }
+                if text == LLAMA_CPP_ROLLOVER_REASON
+        ));
+        assert!(matches!(
+            &outcome.events[1],
+            PromptExecutionEventPayload::Text { text } if text == "Recovered response"
+        ));
+
+        let conversation = conversation
+            .lock()
+            .expect("conversation lock should not be poisoned");
+        assert_eq!(conversation.len(), 1);
+        assert_eq!(conversation[0].user, "say hi");
+        assert_eq!(conversation[0].assistant, "Recovered response");
+    }
+
+    #[test]
+    fn execute_prompt_backend_does_not_retry_on_non_overflow_context_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("listener address should exist")
+            .port();
+
+        let server_thread = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("request should connect");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .expect("read timeout should be configurable");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+
+            loop {
+                let read_len = stream
+                    .read(&mut buffer)
+                    .expect("request should be readable");
+                if read_len == 0 {
+                    break;
+                }
+
+                request.extend_from_slice(&buffer[..read_len]);
+                if String::from_utf8_lossy(&request).contains("\"model\":\"default\"") {
+                    break;
+                }
+            }
+
+            let body = "{\"error\":{\"message\":\"context serialization failed\"}}";
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n{:X}\r\n{}\r\n0\r\n\r\n",
+                body.len(),
+                body,
+            );
+
+            stream
+                .write_all(response.as_bytes())
+                .expect("error response should be writable");
+        });
+
+        let config = voxgolem_core::config::RuntimeConfig {
+            wake_word_model_path: PathBuf::from("wake.onnx"),
+            parakeet_model_dir: PathBuf::from("parakeet"),
+            silero_vad_model: PathBuf::from("vad.onnx"),
+            response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
+                server_path: PathBuf::from("llama-server.exe"),
+                host: String::from("127.0.0.1"),
+                port,
+                fast_model_path: PathBuf::from("fast.gguf"),
+                quality_model_path: None,
+            },
+        };
+        let runtime = Arc::new(Mutex::new(Some(
+            voxgolem_platform::llama_cpp::LlamaCppRuntime::attach(
+                voxgolem_platform::llama_cpp::LlamaCppServerSpec::new(
+                    "llama-server.exe",
+                    "fast.gguf",
+                    "127.0.0.1",
+                    port,
+                    "default",
+                ),
+            ),
+        )));
+        let conversation = Mutex::new(vec![LlamaConversationTurn {
+            user: "prior turn".to_string(),
+            assistant: "prior answer".to_string(),
+        }]);
+
+        let outcome = execute_prompt_backend(
+            &config,
+            "say hi",
+            &runtime,
+            &conversation,
+            Some("You are JARVIS."),
+        );
+
+        server_thread.join().expect("server thread should complete");
+
+        assert!(matches!(
+            outcome,
+            Err(message)
+                if message.contains("failed to execute local llama.cpp prompt")
+                    && !message.contains("after conversation reset")
+        ));
+
+        let conversation = conversation
+            .lock()
+            .expect("conversation lock should not be poisoned");
+        assert_eq!(conversation.len(), 1);
+        assert_eq!(conversation[0].user, "prior turn");
+        assert_eq!(conversation[0].assistant, "prior answer");
     }
 
     #[test]
