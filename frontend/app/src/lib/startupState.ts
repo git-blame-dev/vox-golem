@@ -1,5 +1,11 @@
 import { hasInjectedTauriInternals, invokeTauriCommand } from './tauri'
-import type { BackendRuntimePhase, CueAssetPaths, StartupState } from '../types/chat'
+import type {
+  BackendRuntimePhase,
+  CueAssetPaths,
+  ResponseProfile,
+  ResponseProfileState,
+  StartupState,
+} from '../types/chat'
 
 export const DEFAULT_SILENCE_TIMEOUT_MS = 1_500
 
@@ -7,6 +13,9 @@ export const DEFAULT_CUE_ASSET_PATHS: CueAssetPaths = {
   startListening: 'resources/start-listening.wav',
   stopListening: 'resources/stop-listening.wav',
 }
+
+export const DEFAULT_SUPPORTED_RESPONSE_PROFILES: readonly ResponseProfile[] = ['fast']
+export const DEFAULT_SELECTED_RESPONSE_PROFILE: ResponseProfile = 'fast'
 
 export function parseStartupState(payload: unknown): StartupState {
   if (!isRecord(payload)) {
@@ -31,6 +40,8 @@ export function parseStartupState(payload: unknown): StartupState {
       throw new Error('Startup warming payload must include a message')
     }
 
+    const responseProfileState = parseResponseProfileState(payload)
+
     return {
       kind: 'warming_model',
       cueAssetPaths: parseCueAssetPaths(payload['cue_asset_paths']),
@@ -39,6 +50,8 @@ export function parseStartupState(payload: unknown): StartupState {
       voiceInputError,
       silenceTimeoutMs,
       message,
+      selectedResponseProfile: responseProfileState.selectedResponseProfile,
+      supportedResponseProfiles: responseProfileState.supportedResponseProfiles,
     }
   }
 
@@ -55,6 +68,8 @@ export function parseStartupState(payload: unknown): StartupState {
       throw new Error('Startup ready payload must include a string or null voice_input_error')
     }
 
+    const responseProfileState = parseResponseProfileState(payload)
+
     return {
       kind: 'ready',
       cueAssetPaths: parseCueAssetPaths(payload['cue_asset_paths']),
@@ -62,6 +77,8 @@ export function parseStartupState(payload: unknown): StartupState {
       voiceInputAvailable,
       voiceInputError,
       silenceTimeoutMs,
+      selectedResponseProfile: responseProfileState.selectedResponseProfile,
+      supportedResponseProfiles: responseProfileState.supportedResponseProfiles,
     }
   }
 
@@ -115,6 +132,34 @@ function buildDefaultStartupState(): StartupState {
     voiceInputAvailable: true,
     voiceInputError: null,
     silenceTimeoutMs: DEFAULT_SILENCE_TIMEOUT_MS,
+    selectedResponseProfile: DEFAULT_SELECTED_RESPONSE_PROFILE,
+    supportedResponseProfiles: DEFAULT_SUPPORTED_RESPONSE_PROFILES,
+  }
+}
+
+export function parseResponseProfileState(payload: unknown): ResponseProfileState {
+  if (!isRecord(payload)) {
+    throw new Error('Response profile payload must be an object')
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(payload, 'selected_response_profile')) {
+    throw new Error('Startup payload must include selected_response_profile')
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(payload, 'supported_response_profiles')) {
+    throw new Error('Startup payload must include supported_response_profiles')
+  }
+
+  const selectedResponseProfile = parseResponseProfile(payload['selected_response_profile'])
+  const supportedResponseProfiles = parseSupportedResponseProfiles(payload['supported_response_profiles'])
+
+  if (!supportedResponseProfiles.includes(selectedResponseProfile)) {
+    throw new Error('Selected response profile must be present in supported_response_profiles')
+  }
+
+  return {
+    selectedResponseProfile,
+    supportedResponseProfiles,
   }
 }
 
@@ -165,6 +210,28 @@ function parseSilenceTimeoutMs(payload: unknown): number {
   }
 
   return payload
+}
+
+function parseResponseProfile(payload: unknown): ResponseProfile {
+  if (payload === 'fast' || payload === 'quality') {
+    return payload
+  }
+
+  throw new Error('Startup payload must include a supported selected_response_profile')
+}
+
+function parseSupportedResponseProfiles(payload: unknown): readonly ResponseProfile[] {
+  if (!Array.isArray(payload)) {
+    throw new Error('Startup payload must include supported_response_profiles')
+  }
+
+  const profiles = payload.map(parseResponseProfile)
+
+  if (profiles.length === 0) {
+    throw new Error('Startup payload must include at least one supported_response_profile')
+  }
+
+  return Array.from(new Set(profiles))
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
