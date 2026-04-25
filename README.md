@@ -49,10 +49,13 @@ The Windows runtime expects these configured local assets in `%APPDATA%\VoxGolem
 - `start_listening_cue` and `stop_listening_cue`: cue audio files
 - `response_backend`: backend selector, currently `opencode` or `llama_cpp`
 - `[opencode].path`: local `opencode` executable when `response_backend = "opencode"`
-- `[llama_cpp].server_path`, `[llama_cpp].host`, `[llama_cpp].port`, and `[llama_cpp].fast_model_path`: local llama.cpp runtime fields when `response_backend = "llama_cpp"`
+- `[llama_cpp].server_path`, `[llama_cpp].host`, `[llama_cpp].port`, and `[llama_cpp].fast_model_path`: required local llama.cpp runtime fields when `response_backend = "llama_cpp"`
+- `[llama_cpp].quality_model_path`: optional local llama.cpp model path that enables the `quality` profile
 
 For the current local Gemma desktop path, `%APPDATA%\VoxGolem` also needs:
 
 - `SOUL.md`
 - `models/llama/gemma-3-1b-it-Q4_K_M.gguf`
+- `models/llama/google_gemma-3-4b-it-Q6_K_L.gguf`
 - `llama/bin/llama-server.exe`
+- `state.toml` (written by the app, stores `selected_response_profile = "fast" | "quality"`)
