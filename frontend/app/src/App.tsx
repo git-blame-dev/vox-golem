@@ -911,6 +911,9 @@ function App() {
             Voice input unavailable: {startupState.voiceInputError ?? 'Parakeet failed to initialize'}
           </p>
         ) : null}
+        {startupState.kind === 'warming_model' ? (
+          <p className="shell__loading">Model loading: {startupState.message}</p>
+        ) : null}
         <div className="shell__toggles-line">
           {responseProfileState !== null ? (
             <div className="shell__controls" role="group" aria-label="Response profile controls">

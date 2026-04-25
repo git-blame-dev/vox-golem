@@ -195,6 +195,70 @@ describe('App', () => {
     expect(select.value).toBe('quality')
   })
 
+  it('shows model loading indicator while profile switching is in progress', async () => {
+    let selectedProfile: 'fast' | 'quality' = 'fast'
+    let switchCommandPending = false
+    let resolveSwitchCommand: () => void = () => {
+      throw new Error('Expected pending switch command resolver')
+    }
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command, args) => {
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: true,
+            voice_input_error: null,
+            silence_timeout_ms: 1500,
+            selected_response_profile: selectedProfile,
+            supported_response_profiles: ['fast', 'quality'],
+          }
+        }
+
+        if (command === 'switch_response_profile') {
+          expect(args).toEqual({ profile: 'quality' })
+
+          return await new Promise((resolve) => {
+            switchCommandPending = true
+            resolveSwitchCommand = () => {
+              switchCommandPending = false
+              selectedProfile = 'quality'
+              resolve({
+                selected_response_profile: 'quality',
+                supported_response_profiles: ['fast', 'quality'],
+              })
+            }
+          })
+        }
+
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    const select = getResponseProfileSelect(container)
+
+    await act(async () => {
+      setSelectValue(select, 'quality')
+      await Promise.resolve()
+    })
+
+    expect(container.textContent).toContain('Model loading: Switching response profile to Quality...')
+    expect(switchCommandPending).toBe(true)
+
+    await act(async () => {
+      resolveSwitchCommand()
+      await Promise.resolve()
+    })
+
+    expect(select.value).toBe('quality')
+  })
+
   it('restores previous profile and surfaces an error when profile switching fails', async () => {
     const invokedCommands: string[] = []
     let startupStateCallCount = 0
