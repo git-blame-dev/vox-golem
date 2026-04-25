@@ -14,3 +14,4 @@ server_path = "llama/bin/llama-server.exe"
 host = "127.0.0.1"
 port = 11435
 fast_model_path = "models/llama/gemma-3-1b-it-Q4_K_M.gguf"
+quality_model_path = "models/llama/google_gemma-3-4b-it-Q6_K_L.gguf"

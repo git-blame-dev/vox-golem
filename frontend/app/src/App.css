@@ -53,6 +53,12 @@
   font-size: 0.9rem;
 }
 
+.shell__loading {
+  margin: 0.55rem 0 0;
+  color: #2f4a66;
+  font-size: 0.9rem;
+}
+
 .shell__controls {
   display: flex;
   flex-wrap: wrap;
