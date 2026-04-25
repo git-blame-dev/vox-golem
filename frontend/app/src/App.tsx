@@ -11,7 +11,12 @@ import {
   invokeRuntimeControl,
 } from './lib/runtimeControl'
 import type { RuntimeControlArgs } from './lib/runtimeControl'
-import { DEFAULT_CUE_ASSET_PATHS, isStartupStateSettled, loadStartupState } from './lib/startupState'
+import {
+  DEFAULT_CUE_ASSET_PATHS,
+  DEFAULT_SILENCE_TIMEOUT_MS,
+  isStartupStateSettled,
+  loadStartupState,
+} from './lib/startupState'
 import { createVoiceTelemetryRecorder } from './lib/voiceTelemetry'
 import {
   createVoiceActivityState,
@@ -55,6 +60,17 @@ function App() {
   }
 
   const voiceTelemetry = voiceTelemetryRef.current
+
+  const currentSilenceTimeoutMs = (): number => {
+    if (
+      startupStateRef.current.kind === 'ready' ||
+      startupStateRef.current.kind === 'warming_model'
+    ) {
+      return startupStateRef.current.silenceTimeoutMs
+    }
+
+    return DEFAULT_SILENCE_TIMEOUT_MS
+  }
 
   useEffect(() => {
     let active = true
@@ -620,7 +636,11 @@ function App() {
               )
 
               if (nextStatus === 'listening' && autoStopOnSilenceRef.current) {
-                const voiceActivityUpdate = updateVoiceActivityState(voiceActivityStateRef.current, nowMs)
+                const voiceActivityUpdate = updateVoiceActivityState(
+                  voiceActivityStateRef.current,
+                  nowMs,
+                  currentSilenceTimeoutMs(),
+                )
 
                 voiceActivityStateRef.current = voiceActivityUpdate.state
 

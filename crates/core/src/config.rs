@@ -8,6 +8,8 @@ const WINDOWS_CONFIG_DIR: &str = "VoxGolem";
 const WINDOWS_CONFIG_FILE: &str = "config.toml";
 const WINDOWS_SOUL_FILE: &str = "SOUL.md";
 const DEFAULT_SILERO_VAD_MODEL: &str = "models/silero-vad.onnx";
+const DEFAULT_SILENCE_TIMEOUT_MS: u64 = 1_500;
+const MAX_JS_SAFE_INTEGER_U64: u64 = 9_007_199_254_740_991;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -15,6 +17,8 @@ struct RawConfig {
     wake_word_model_path: PathBuf,
     parakeet_model_dir: PathBuf,
     silero_vad_model: Option<PathBuf>,
+    #[serde(default = "default_silence_timeout_ms")]
+    silence_timeout_ms: u64,
     response_backend: RawResponseBackend,
     #[serde(default)]
     opencode: Option<RawOpencodeConfig>,
@@ -55,6 +59,7 @@ pub struct RuntimeConfig {
     pub wake_word_model_path: PathBuf,
     pub parakeet_model_dir: PathBuf,
     pub silero_vad_model: PathBuf,
+    pub silence_timeout_ms: u64,
     pub response_backend: ResponseBackendConfig,
 }
 
@@ -195,6 +200,23 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
             .silero_vad_model
             .unwrap_or_else(|| PathBuf::from(DEFAULT_SILERO_VAD_MODEL)),
     );
+    let silence_timeout_ms = raw_config.silence_timeout_ms;
+
+    if silence_timeout_ms == 0 {
+        return Err(ConfigError::ParseConfigFailed {
+            path: config_path.clone(),
+            details: String::from("silence_timeout_ms must be greater than zero"),
+        });
+    }
+
+    if silence_timeout_ms > MAX_JS_SAFE_INTEGER_U64 {
+        return Err(ConfigError::ParseConfigFailed {
+            path: config_path.clone(),
+            details: String::from(
+                "silence_timeout_ms must be less than or equal to 9_007_199_254_740_991",
+            ),
+        });
+    }
 
     validate_existing_file(&wake_word_model_path, "wake_word_model_path")?;
     validate_existing_directory(&parakeet_model_dir, "parakeet_model_dir")?;
@@ -250,8 +272,13 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
         wake_word_model_path,
         parakeet_model_dir,
         silero_vad_model,
+        silence_timeout_ms,
         response_backend,
     })
+}
+
+fn default_silence_timeout_ms() -> u64 {
+    DEFAULT_SILENCE_TIMEOUT_MS
 }
 
 fn resolve_config_path(config_dir: &Path, path: PathBuf) -> PathBuf {
@@ -427,6 +454,108 @@ mod tests {
             .expect("config without silero_vad_model should use default path");
 
         assert_eq!(result.silero_vad_model, default_silero_vad_model);
+        assert_eq!(result.silence_timeout_ms, 1_500);
+    }
+
+    #[test]
+    fn reports_parse_failure_for_zero_silence_timeout() {
+        let temp = TempDir::new();
+        let model_dir = temp.path().join("models");
+        let wake_word_model_path = model_dir.join("hey_livekit.onnx");
+        let silero_vad_model = model_dir.join("silero-vad.onnx");
+        let opencode_path = temp.path().join("opencode.exe");
+        let config_path = temp.path().join("config.toml");
+
+        fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
+        create_file(&wake_word_model_path);
+        create_file(&silero_vad_model);
+        create_file(&opencode_path);
+
+        fs::write(
+            &config_path,
+            format!(
+                "wake_word_model_path = \"{}\"\nparakeet_model_dir = \"{}\"\nsilero_vad_model = \"{}\"\nsilence_timeout_ms = 0\nresponse_backend = \"opencode\"\n\n[opencode]\npath = \"{}\"\n",
+                escape_path(&wake_word_model_path),
+                escape_path(&model_dir),
+                escape_path(&silero_vad_model),
+                escape_path(&opencode_path),
+            ),
+        )
+        .expect("config fixture should be written");
+
+        let result = load_runtime_config(Some(&config_path));
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::ParseConfigFailed { details, .. })
+                if details.contains("silence_timeout_ms must be greater than zero")
+        ));
+    }
+
+    #[test]
+    fn loads_custom_silence_timeout() {
+        let temp = TempDir::new();
+        let model_dir = temp.path().join("models");
+        let wake_word_model_path = model_dir.join("hey_livekit.onnx");
+        let silero_vad_model = model_dir.join("silero-vad.onnx");
+        let opencode_path = temp.path().join("opencode.exe");
+        let config_path = temp.path().join("config.toml");
+
+        fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
+        create_file(&wake_word_model_path);
+        create_file(&silero_vad_model);
+        create_file(&opencode_path);
+
+        fs::write(
+            &config_path,
+            format!(
+                "wake_word_model_path = \"{}\"\nparakeet_model_dir = \"{}\"\nsilero_vad_model = \"{}\"\nsilence_timeout_ms = 1750\nresponse_backend = \"opencode\"\n\n[opencode]\npath = \"{}\"\n",
+                escape_path(&wake_word_model_path),
+                escape_path(&model_dir),
+                escape_path(&silero_vad_model),
+                escape_path(&opencode_path),
+            ),
+        )
+        .expect("config fixture should be written");
+
+        let result = load_runtime_config(Some(&config_path)).expect("valid config should load");
+
+        assert_eq!(result.silence_timeout_ms, 1_750);
+    }
+
+    #[test]
+    fn reports_parse_failure_for_silence_timeout_above_js_safe_integer() {
+        let temp = TempDir::new();
+        let model_dir = temp.path().join("models");
+        let wake_word_model_path = model_dir.join("hey_livekit.onnx");
+        let silero_vad_model = model_dir.join("silero-vad.onnx");
+        let opencode_path = temp.path().join("opencode.exe");
+        let config_path = temp.path().join("config.toml");
+
+        fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
+        create_file(&wake_word_model_path);
+        create_file(&silero_vad_model);
+        create_file(&opencode_path);
+
+        fs::write(
+            &config_path,
+            format!(
+                "wake_word_model_path = \"{}\"\nparakeet_model_dir = \"{}\"\nsilero_vad_model = \"{}\"\nsilence_timeout_ms = 9007199254740992\nresponse_backend = \"opencode\"\n\n[opencode]\npath = \"{}\"\n",
+                escape_path(&wake_word_model_path),
+                escape_path(&model_dir),
+                escape_path(&silero_vad_model),
+                escape_path(&opencode_path),
+            ),
+        )
+        .expect("config fixture should be written");
+
+        let result = load_runtime_config(Some(&config_path));
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::ParseConfigFailed { details, .. })
+                if details.contains("silence_timeout_ms must be less than or equal to 9_007_199_254_740_991")
+        ));
     }
 
     #[test]

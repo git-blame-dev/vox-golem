@@ -47,6 +47,7 @@ export type StartupState =
       readonly runtimePhase: BackendRuntimePhase
       readonly voiceInputAvailable: boolean
       readonly voiceInputError: string | null
+      readonly silenceTimeoutMs: number
       readonly message: string
     }
   | {
@@ -55,6 +56,7 @@ export type StartupState =
       readonly runtimePhase: BackendRuntimePhase
       readonly voiceInputAvailable: boolean
       readonly voiceInputError: string | null
+      readonly silenceTimeoutMs: number
     }
   | { readonly kind: 'error'; readonly message: string }
 

@@ -44,6 +44,7 @@ The Windows runtime expects these configured local assets in `%APPDATA%\VoxGolem
 - `wake_word_model_path`: LiveKit-compatible wake-word classifier `.onnx` file
 - `parakeet_model_dir`: local Parakeet v2 model directory
 - `silero_vad_model`: local Silero VAD ONNX file
+- `silence_timeout_ms`: milliseconds of inactivity before listening transitions to processing (default `1500`)
 - `SOUL.md`: assistant identity and response-style prompt file at `%APPDATA%\VoxGolem\SOUL.md`
 - `start_listening_cue` and `stop_listening_cue`: cue audio files
 - `response_backend`: backend selector, currently `opencode` or `llama_cpp`

@@ -43,12 +43,12 @@ describe('voiceActivity', () => {
   it('requests silence only after sustained inactivity', () => {
     const listeningState = { lastActivityMs: 100, silenceMarked: false }
 
-    expect(updateVoiceActivityState(listeningState, 2_599)).toEqual({
+    expect(updateVoiceActivityState(listeningState, 1_599, 1_500)).toEqual({
       state: listeningState,
       shouldMarkSilence: false,
     })
 
-    expect(updateVoiceActivityState(listeningState, 2_600)).toEqual({
+    expect(updateVoiceActivityState(listeningState, 1_600, 1_500)).toEqual({
       state: {
         lastActivityMs: 100,
         silenceMarked: true,

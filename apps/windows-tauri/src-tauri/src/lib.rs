@@ -12,7 +12,7 @@ mod transcription;
 mod voice_activity;
 mod wake_word;
 
-const DEFAULT_SILENCE_TIMEOUT_MS: u64 = 2_500;
+const DEFAULT_SILENCE_TIMEOUT_MS: u64 = 1_500;
 const DEFAULT_PREROLL_MAX_SAMPLES: usize = 4_000;
 const DEFAULT_UTTERANCE_MAX_SAMPLES: usize = 4_800_000;
 const LLAMA_CPP_MODEL_ALIAS: &str = "default";
@@ -135,6 +135,7 @@ enum StartupStatePayload {
         runtime_phase: RuntimePhasePayload,
         voice_input_available: bool,
         voice_input_error: Option<String>,
+        silence_timeout_ms: u64,
         message: String,
     },
     Ready {
@@ -142,6 +143,7 @@ enum StartupStatePayload {
         runtime_phase: RuntimePhasePayload,
         voice_input_available: bool,
         voice_input_error: Option<String>,
+        silence_timeout_ms: u64,
     },
     Error {
         message: String,
@@ -409,14 +411,16 @@ fn ingest_audio_frame(
 }
 
 fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
-    let voice_pipeline_config = default_voice_pipeline_config();
+    let fallback_voice_pipeline_config = default_voice_pipeline_config();
     let cue_asset_paths = match resolve_bundled_cue_asset_paths(app) {
         Ok(cue_asset_paths) => cue_asset_paths,
-        Err(error) => return build_startup_error_app_state(voice_pipeline_config, error),
+        Err(error) => return build_startup_error_app_state(fallback_voice_pipeline_config, error),
     };
 
     match voxgolem_core::config::load_runtime_config(None) {
         Ok(config) => {
+            let voice_pipeline_config =
+                voice_pipeline_config_with_silence_timeout(config.silence_timeout_ms);
             let wake_word_runtime =
                 match wake_word::WakeWordRuntime::new(&config.wake_word_model_path) {
                     Ok(runtime) => runtime,
@@ -478,6 +482,7 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                         runtime_phase: RuntimePhasePayload::Initializing,
                         voice_input_available,
                         voice_input_error: voice_input_error.clone(),
+                        silence_timeout_ms: config.silence_timeout_ms,
                         message: String::from("Loading local Gemma model..."),
                     }
                 }
@@ -487,6 +492,7 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                         runtime_phase: RuntimePhasePayload::Sleeping,
                         voice_input_available,
                         voice_input_error: voice_input_error.clone(),
+                        silence_timeout_ms: config.silence_timeout_ms,
                     }
                 }
             }));
@@ -503,6 +509,7 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                 let llama_cpp_runtime = Arc::clone(&llama_cpp_runtime);
                 let cue_asset_paths = cue_asset_paths.clone();
                 let voice_input_error = voice_input_error.clone();
+                let silence_timeout_ms = config.silence_timeout_ms;
                 let server_spec = voxgolem_platform::llama_cpp::LlamaCppServerSpec::new(
                     server_path.clone(),
                     fast_model_path.clone(),
@@ -524,6 +531,7 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                                     runtime_phase: RuntimePhasePayload::Sleeping,
                                     voice_input_available,
                                     voice_input_error,
+                                    silence_timeout_ms,
                                 }
                             }
                             Err(error) => StartupStatePayload::Error {
@@ -559,7 +567,9 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                 llama_cpp_system_prompt,
             }
         }
-        Err(error) => build_startup_error_app_state(voice_pipeline_config, error.to_string()),
+        Err(error) => {
+            build_startup_error_app_state(fallback_voice_pipeline_config, error.to_string())
+        }
     }
 }
 
@@ -850,7 +860,13 @@ fn to_runtime_phase_payload(
 }
 
 fn default_voice_pipeline_config() -> voxgolem_core::voice_pipeline::VoicePipelineConfig {
-    let voice_turn = voxgolem_core::voice_turn::VoiceTurnConfig::new(DEFAULT_SILENCE_TIMEOUT_MS)
+    voice_pipeline_config_with_silence_timeout(DEFAULT_SILENCE_TIMEOUT_MS)
+}
+
+fn voice_pipeline_config_with_silence_timeout(
+    silence_timeout_ms: u64,
+) -> voxgolem_core::voice_pipeline::VoicePipelineConfig {
+    let voice_turn = voxgolem_core::voice_turn::VoiceTurnConfig::new(silence_timeout_ms)
         .expect("silence timeout constant should be valid");
     let capture = voxgolem_core::turn_capture::TurnCaptureConfig::new(
         DEFAULT_PREROLL_MAX_SAMPLES,
@@ -1393,6 +1409,7 @@ mod tests {
             wake_word_model_path: PathBuf::from("wake.onnx"),
             parakeet_model_dir: PathBuf::from("parakeet"),
             silero_vad_model: PathBuf::from("vad.onnx"),
+            silence_timeout_ms: 1_500,
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
                 host: String::from("127.0.0.1"),
@@ -1441,6 +1458,7 @@ mod tests {
             wake_word_model_path: PathBuf::from("wake.onnx"),
             parakeet_model_dir: PathBuf::from("parakeet"),
             silero_vad_model: PathBuf::from("vad.onnx"),
+            silence_timeout_ms: 1_500,
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
                 host: String::from("127.0.0.1"),
@@ -1470,6 +1488,7 @@ mod tests {
             wake_word_model_path: PathBuf::from("wake.onnx"),
             parakeet_model_dir: PathBuf::from("parakeet"),
             silero_vad_model: PathBuf::from("vad.onnx"),
+            silence_timeout_ms: 1_500,
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
                 host: String::from("127.0.0.1"),
@@ -1579,6 +1598,7 @@ mod tests {
             wake_word_model_path: PathBuf::from("wake.onnx"),
             parakeet_model_dir: PathBuf::from("parakeet"),
             silero_vad_model: PathBuf::from("vad.onnx"),
+            silence_timeout_ms: 1_500,
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
                 host: String::from("127.0.0.1"),
@@ -1701,6 +1721,7 @@ mod tests {
             wake_word_model_path: PathBuf::from("wake.onnx"),
             parakeet_model_dir: PathBuf::from("parakeet"),
             silero_vad_model: PathBuf::from("vad.onnx"),
+            silence_timeout_ms: 1_500,
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
                 host: String::from("127.0.0.1"),
@@ -1801,6 +1822,7 @@ mod tests {
             wake_word_model_path: PathBuf::from("wake.onnx"),
             parakeet_model_dir: PathBuf::from("parakeet"),
             silero_vad_model: PathBuf::from("vad.onnx"),
+            silence_timeout_ms: 1_500,
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
                 host: String::from("127.0.0.1"),
