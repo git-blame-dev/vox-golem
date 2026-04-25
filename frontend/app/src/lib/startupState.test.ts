@@ -18,6 +18,8 @@ describe('parseStartupState', () => {
         voice_input_available: true,
         voice_input_error: null,
         silence_timeout_ms: 1500,
+        selected_response_profile: 'fast',
+        supported_response_profiles: ['fast', 'quality'],
       }),
     ).toEqual({
       kind: 'ready',
@@ -29,6 +31,8 @@ describe('parseStartupState', () => {
       voiceInputAvailable: true,
       voiceInputError: null,
       silenceTimeoutMs: 1500,
+      selectedResponseProfile: 'fast',
+      supportedResponseProfiles: ['fast', 'quality'],
     })
   })
 
@@ -57,6 +61,8 @@ describe('parseStartupState', () => {
         voice_input_error: null,
         silence_timeout_ms: 1500,
         message: 'Loading local Gemma model...',
+        selected_response_profile: 'quality',
+        supported_response_profiles: ['fast', 'quality'],
       }),
     ).toEqual({
       kind: 'warming_model',
@@ -69,7 +75,97 @@ describe('parseStartupState', () => {
       voiceInputError: null,
       silenceTimeoutMs: 1500,
       message: 'Loading local Gemma model...',
+      selectedResponseProfile: 'quality',
+      supportedResponseProfiles: ['fast', 'quality'],
     })
+  })
+
+  it('throws when startup payload omits selected response profile', () => {
+    expect(() =>
+      parseStartupState({
+        kind: 'ready',
+        cue_asset_paths: {
+          start_listening: 'resources/start-listening.wav',
+          stop_listening: 'resources/stop-listening.wav',
+        },
+        runtime_phase: 'sleeping',
+        voice_input_available: true,
+        voice_input_error: null,
+        silence_timeout_ms: 1500,
+        supported_response_profiles: ['fast', 'quality'],
+      }),
+    ).toThrow('Startup payload must include selected_response_profile')
+  })
+
+  it('throws when startup payload omits supported response profiles', () => {
+    expect(() =>
+      parseStartupState({
+        kind: 'ready',
+        cue_asset_paths: {
+          start_listening: 'resources/start-listening.wav',
+          stop_listening: 'resources/stop-listening.wav',
+        },
+        runtime_phase: 'sleeping',
+        voice_input_available: true,
+        voice_input_error: null,
+        silence_timeout_ms: 1500,
+        selected_response_profile: 'fast',
+      }),
+    ).toThrow('Startup payload must include supported_response_profiles')
+  })
+
+  it('throws when selected response profile is not listed as supported', () => {
+    expect(() =>
+      parseStartupState({
+        kind: 'ready',
+        cue_asset_paths: {
+          start_listening: 'resources/start-listening.wav',
+          stop_listening: 'resources/stop-listening.wav',
+        },
+        runtime_phase: 'sleeping',
+        voice_input_available: true,
+        voice_input_error: null,
+        silence_timeout_ms: 1500,
+        selected_response_profile: 'quality',
+        supported_response_profiles: ['fast'],
+      }),
+    ).toThrow('Selected response profile must be present in supported_response_profiles')
+  })
+
+  it('throws when supported response profiles is empty', () => {
+    expect(() =>
+      parseStartupState({
+        kind: 'ready',
+        cue_asset_paths: {
+          start_listening: 'resources/start-listening.wav',
+          stop_listening: 'resources/stop-listening.wav',
+        },
+        runtime_phase: 'sleeping',
+        voice_input_available: true,
+        voice_input_error: null,
+        silence_timeout_ms: 1500,
+        selected_response_profile: 'fast',
+        supported_response_profiles: [],
+      }),
+    ).toThrow('Startup payload must include at least one supported_response_profile')
+  })
+
+  it('throws when startup payload includes unsupported response profile tokens', () => {
+    expect(() =>
+      parseStartupState({
+        kind: 'ready',
+        cue_asset_paths: {
+          start_listening: 'resources/start-listening.wav',
+          stop_listening: 'resources/stop-listening.wav',
+        },
+        runtime_phase: 'sleeping',
+        voice_input_available: true,
+        voice_input_error: null,
+        silence_timeout_ms: 1500,
+        selected_response_profile: 'turbo',
+        supported_response_profiles: ['fast', 'turbo'],
+      }),
+    ).toThrow('Startup payload must include a supported selected_response_profile')
   })
 
   it('throws when ready payload omits cue paths', () => {
@@ -125,6 +221,8 @@ describe('isStartupStateSettled', () => {
         voiceInputError: null,
         silenceTimeoutMs: 1500,
         message: 'Loading local Gemma model...',
+        selectedResponseProfile: 'quality',
+        supportedResponseProfiles: ['fast', 'quality'],
       }),
     ).toBe(false)
   })
@@ -138,6 +236,8 @@ describe('isStartupStateSettled', () => {
         voiceInputAvailable: true,
         voiceInputError: null,
         silenceTimeoutMs: 1500,
+        selectedResponseProfile: 'quality',
+        supportedResponseProfiles: ['fast', 'quality'],
       }),
     ).toBe(true)
     expect(
@@ -158,6 +258,8 @@ describe('loadStartupState', () => {
       voiceInputAvailable: true,
       voiceInputError: null,
       silenceTimeoutMs: 1500,
+      selectedResponseProfile: 'fast',
+      supportedResponseProfiles: ['fast'],
     })
   })
 
@@ -173,6 +275,8 @@ describe('loadStartupState', () => {
         voice_input_available: false,
         voice_input_error: 'Parakeet failed to initialize',
         silence_timeout_ms: 2300,
+        selected_response_profile: 'fast',
+        supported_response_profiles: ['fast', 'quality'],
       }),
     }
 
@@ -186,6 +290,8 @@ describe('loadStartupState', () => {
       voiceInputAvailable: false,
       voiceInputError: 'Parakeet failed to initialize',
       silenceTimeoutMs: 2300,
+      selectedResponseProfile: 'fast',
+      supportedResponseProfiles: ['fast', 'quality'],
     })
   })
 

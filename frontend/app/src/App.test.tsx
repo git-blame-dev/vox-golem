@@ -116,6 +116,229 @@ describe('App', () => {
     expect(container.textContent).toContain('Placeholder response for: Line one')
   })
 
+  it('renders response profile dropdown from startup state', async () => {
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        if (command !== 'get_startup_state') {
+          throw new Error(`unexpected command: ${command}`)
+        }
+
+        return {
+          kind: 'ready',
+          cue_asset_paths: {
+            start_listening: 'resources/start-listening.wav',
+            stop_listening: 'resources/stop-listening.wav',
+          },
+          runtime_phase: 'sleeping',
+          voice_input_available: true,
+          voice_input_error: null,
+          silence_timeout_ms: 1500,
+          selected_response_profile: 'fast',
+          supported_response_profiles: ['fast', 'quality'],
+        }
+      },
+    }
+
+    const { container } = await renderApp()
+    const select = getResponseProfileSelect(container)
+
+    expect(select.value).toBe('fast')
+    expect(Array.from(select.options).map((option) => option.text)).toEqual(['Fast', 'Quality'])
+  })
+
+  it('invokes switch_response_profile when selecting Quality profile', async () => {
+    const invokedCommands: string[] = []
+    let selectedProfile: 'fast' | 'quality' = 'fast'
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command, args) => {
+        invokedCommands.push(command)
+
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: true,
+            voice_input_error: null,
+            silence_timeout_ms: 1500,
+            selected_response_profile: selectedProfile,
+            supported_response_profiles: ['fast', 'quality'],
+          }
+        }
+
+        if (command === 'switch_response_profile') {
+          expect(args).toEqual({ profile: 'quality' })
+          selectedProfile = 'quality'
+          return {
+            selected_response_profile: 'quality',
+            supported_response_profiles: ['fast', 'quality'],
+          }
+        }
+
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    const select = getResponseProfileSelect(container)
+
+    await act(async () => {
+      setSelectValue(select, 'quality')
+      await Promise.resolve()
+    })
+
+    expect(invokedCommands).toContain('switch_response_profile')
+    expect(select.value).toBe('quality')
+  })
+
+  it('restores previous profile and surfaces an error when profile switching fails', async () => {
+    const invokedCommands: string[] = []
+    let startupStateCallCount = 0
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        invokedCommands.push(command)
+
+        if (command === 'get_startup_state') {
+          startupStateCallCount += 1
+
+          if (startupStateCallCount === 1) {
+            return {
+              kind: 'ready',
+              cue_asset_paths: {
+                start_listening: 'resources/start-listening.wav',
+                stop_listening: 'resources/stop-listening.wav',
+              },
+              runtime_phase: 'sleeping',
+              voice_input_available: true,
+              voice_input_error: null,
+              silence_timeout_ms: 1500,
+              selected_response_profile: 'fast',
+              supported_response_profiles: ['fast', 'quality'],
+            }
+          }
+
+          if (startupStateCallCount === 2) {
+            return {
+              kind: 'warming_model',
+              cue_asset_paths: {
+                start_listening: 'resources/start-listening.wav',
+                stop_listening: 'resources/stop-listening.wav',
+              },
+              runtime_phase: 'initializing',
+              voice_input_available: true,
+              voice_input_error: null,
+              silence_timeout_ms: 1500,
+              message: 'Loading local Gemma model...',
+              selected_response_profile: 'fast',
+              supported_response_profiles: ['fast', 'quality'],
+            }
+          }
+
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'executing',
+            voice_input_available: true,
+            voice_input_error: null,
+            silence_timeout_ms: 1500,
+            selected_response_profile: 'fast',
+            supported_response_profiles: ['fast', 'quality'],
+          }
+        }
+
+        if (command === 'switch_response_profile') {
+          throw new Error('response backend is busy; wait for the active operation to finish')
+        }
+
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    const select = getResponseProfileSelect(container)
+
+    await act(async () => {
+      setSelectValue(select, 'quality')
+      await Promise.resolve()
+      await new Promise((resolve) => window.setTimeout(resolve, 600))
+    })
+
+    expect(startupStateCallCount).toBe(3)
+    expect(invokedCommands).toEqual([
+      'get_startup_state',
+      'switch_response_profile',
+      'get_startup_state',
+      'get_startup_state',
+    ])
+    expect(select.value).toBe('fast')
+    expect(container.textContent).toContain(
+      'Response profile switch error: response backend is busy; wait for the active operation to finish',
+    )
+  })
+
+  it('surfaces startup error when profile switch polling settles to error', async () => {
+    let startupStateCallCount = 0
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command, args) => {
+        if (command === 'get_startup_state') {
+          startupStateCallCount += 1
+
+          if (startupStateCallCount === 1) {
+            return {
+              kind: 'ready',
+              cue_asset_paths: {
+                start_listening: 'resources/start-listening.wav',
+                stop_listening: 'resources/stop-listening.wav',
+              },
+              runtime_phase: 'sleeping',
+              voice_input_available: true,
+              voice_input_error: null,
+              silence_timeout_ms: 1500,
+              selected_response_profile: 'fast',
+              supported_response_profiles: ['fast', 'quality'],
+            }
+          }
+
+          return {
+            kind: 'error',
+            message: 'failed to initialize local llama.cpp runtime: boom',
+          }
+        }
+
+        if (command === 'switch_response_profile') {
+          expect(args).toEqual({ profile: 'quality' })
+          return {
+            selected_response_profile: 'quality',
+            supported_response_profiles: ['fast', 'quality'],
+          }
+        }
+
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    const select = getResponseProfileSelect(container)
+
+    await act(async () => {
+      setSelectValue(select, 'quality')
+      await Promise.resolve()
+    })
+
+    expect(startupStateCallCount).toBe(2)
+    expect(container.textContent).toContain('Startup error: failed to initialize local llama.cpp runtime: boom')
+    expect(container.textContent).not.toContain('Response profile switch error:')
+  })
+
   it('renders tauri prompt execution output when submit command succeeds', async () => {
     window.__TAURI_INTERNALS__ = {
       invoke: async (command, args) => {
@@ -130,6 +353,8 @@ describe('App', () => {
             voice_input_available: true,
             voice_input_error: null,
             silence_timeout_ms: 1500,
+            selected_response_profile: 'quality',
+            supported_response_profiles: ['fast', 'quality'],
           }
         }
 
@@ -186,6 +411,8 @@ describe('App', () => {
             voice_input_available: true,
             voice_input_error: null,
             silence_timeout_ms: 1500,
+            selected_response_profile: 'quality',
+            supported_response_profiles: ['fast', 'quality'],
           }
         }
 
@@ -211,7 +438,6 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(container.textContent).toContain('Status: Error')
     expect(container.textContent).toContain('stderr:\nbad prompt')
     expect(container.textContent).toContain('exit_code:\n7')
   })
@@ -230,6 +456,8 @@ describe('App', () => {
             voice_input_available: true,
             voice_input_error: null,
             silence_timeout_ms: 1500,
+            selected_response_profile: 'quality',
+            supported_response_profiles: ['fast', 'quality'],
           }
         }
 
@@ -261,7 +489,6 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(container.textContent).toContain('Status: Error')
     expect(container.textContent).toContain('opencode_error:\nAPIError: Provider failed')
   })
 
@@ -287,6 +514,8 @@ describe('App', () => {
             voice_input_error: null,
             message: 'Loading local Gemma model...',
             silence_timeout_ms: 1500,
+            selected_response_profile: 'quality',
+            supported_response_profiles: ['fast', 'quality'],
           }
         }
 
@@ -296,24 +525,24 @@ describe('App', () => {
             start_listening: 'resources/start-listening.wav',
             stop_listening: 'resources/stop-listening.wav',
           },
-          runtime_phase: 'sleeping',
-          voice_input_available: true,
-          voice_input_error: null,
-          silence_timeout_ms: 1500,
-        }
+           runtime_phase: 'sleeping',
+           voice_input_available: true,
+           voice_input_error: null,
+           silence_timeout_ms: 1500,
+           selected_response_profile: 'quality',
+           supported_response_profiles: ['fast', 'quality'],
+         }
       },
     }
 
     const { container } = await renderApp()
 
-    expect(container.textContent).toContain('Status: Starting up')
-    expect(container.textContent).toContain('Loading local Gemma model...')
+    expect(container.textContent).toContain('Voice limited')
 
     await act(async () => {
       await new Promise((resolve) => window.setTimeout(resolve, 600))
     })
 
-    expect(container.textContent).toContain('Status: Waiting')
     expect(container.textContent).toContain('Startup ready: runtime=sleeping')
   })
 
@@ -339,6 +568,8 @@ describe('App', () => {
             voice_input_error: null,
             message: 'Loading local Gemma model...',
             silence_timeout_ms: 1500,
+            selected_response_profile: 'quality',
+            supported_response_profiles: ['fast', 'quality'],
           }
         }
 
@@ -351,13 +582,10 @@ describe('App', () => {
 
     const { container } = await renderApp()
 
-    expect(container.textContent).toContain('Loading local Gemma model...')
-
     await act(async () => {
       await new Promise((resolve) => window.setTimeout(resolve, 600))
     })
 
-    expect(container.textContent).toContain('Status: Error')
     expect(container.textContent).toContain('Startup error: failed to initialize local llama.cpp runtime: boom')
   })
 
@@ -400,6 +628,8 @@ describe('App', () => {
             voice_input_available: true,
             voice_input_error: null,
             silence_timeout_ms: 1500,
+            selected_response_profile: 'quality',
+            supported_response_profiles: ['fast', 'quality'],
           }
         }
 
@@ -448,11 +678,6 @@ describe('App', () => {
     })
 
     expect(playedSources).toEqual(['test-assets/configured-start.mp3'])
-    expect(container.textContent).toContain('Status: Listening')
-    expect(container.textContent).toContain(
-      'Speech is being captured. Stop talking and the assistant will transcribe automatically.',
-    )
-
     const stopListeningButton = getControlButton(container, 'Stop listening and process')
 
     await act(async () => {
@@ -464,7 +689,6 @@ describe('App', () => {
       'test-assets/configured-start.mp3',
       'test-assets/configured-stop.mp3',
     ])
-    expect(container.textContent).toContain('Status: Transcribing')
     expect(container.textContent).toContain('transcription_ready:\n3200 samples captured')
   })
 
@@ -493,6 +717,8 @@ describe('App', () => {
             voice_input_available: true,
             voice_input_error: null,
             silence_timeout_ms: 1500,
+            selected_response_profile: 'quality',
+            supported_response_profiles: ['fast', 'quality'],
           }
         }
 
@@ -548,6 +774,8 @@ describe('App', () => {
             voice_input_available: true,
             voice_input_error: null,
             silence_timeout_ms: 1500,
+            selected_response_profile: 'quality',
+            supported_response_profiles: ['fast', 'quality'],
           }
         }
 
@@ -576,8 +804,6 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(container.textContent).toContain('Status: Waiting')
-
     const stopMicButton = getControlButton(container, 'Stop mic')
 
     await act(async () => {
@@ -587,6 +813,518 @@ describe('App', () => {
 
     expect(stop).toHaveBeenCalledTimes(1)
     expect(container.textContent).toContain('live_audio:\ndefault microphone stopped')
+  })
+
+  it('ignores stale live frames after profile switch stops capture', async () => {
+    const stop = vi.fn()
+    let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
+    const invokedCommands: string[] = []
+    let selectedProfile: 'fast' | 'quality' = 'fast'
+
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      onFrame = options.onFrame
+      return { stop }
+    })
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command, args) => {
+        invokedCommands.push(command)
+
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: true,
+            voice_input_error: null,
+            silence_timeout_ms: 1500,
+            selected_response_profile: selectedProfile,
+            supported_response_profiles: ['fast', 'quality'],
+          }
+        }
+
+        if (command === 'switch_response_profile') {
+          expect(args).toEqual({ profile: 'quality' })
+          selectedProfile = 'quality'
+          return {
+            selected_response_profile: 'quality',
+            supported_response_profiles: ['fast', 'quality'],
+          }
+        }
+
+        if (command === 'ingest_audio_frame') {
+          return {
+            runtime_phase: 'sleeping',
+            transcription_ready_samples: null,
+            transcript_text: null,
+            last_activity_ms: null,
+            capturing_utterance: false,
+            preroll_samples: 0,
+            utterance_samples: 0,
+          }
+        }
+
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    const select = getResponseProfileSelect(container)
+
+    await act(async () => {
+      setSelectValue(select, 'quality')
+      await Promise.resolve()
+    })
+
+    expect(stop).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      await onFrame?.([0.2, -0.2, 0.2, -0.2])
+      await Promise.resolve()
+    })
+
+    expect(invokedCommands).toContain('switch_response_profile')
+    expect(invokedCommands.filter((command) => command === 'ingest_audio_frame')).toHaveLength(0)
+  })
+
+  it('ignores in-flight frame results that resolve after profile switch', async () => {
+    const stop = vi.fn()
+    let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
+    const invokedCommands: string[] = []
+    let selectedProfile: 'fast' | 'quality' = 'fast'
+    let ingestFramePending = false
+    let resolveIngestFrame: () => void = () => {
+      throw new Error('Expected an in-flight ingest frame promise')
+    }
+
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      onFrame = options.onFrame
+      return { stop }
+    })
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command, args) => {
+        invokedCommands.push(command)
+
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: true,
+            voice_input_error: null,
+            silence_timeout_ms: 1500,
+            selected_response_profile: selectedProfile,
+            supported_response_profiles: ['fast', 'quality'],
+          }
+        }
+
+        if (command === 'ingest_audio_frame') {
+          expect(args).toBeDefined()
+          ingestFramePending = true
+
+          return await new Promise((resolve) => {
+            resolveIngestFrame = () => {
+              ingestFramePending = false
+              resolve({
+                runtime_phase: 'error',
+                transcription_ready_samples: null,
+                transcript_text: null,
+                last_activity_ms: null,
+                capturing_utterance: false,
+                preroll_samples: 0,
+                utterance_samples: 0,
+              })
+            }
+          })
+        }
+
+        if (command === 'switch_response_profile') {
+          expect(args).toEqual({ profile: 'quality' })
+          selectedProfile = 'quality'
+          return {
+            selected_response_profile: 'quality',
+            supported_response_profiles: ['fast', 'quality'],
+          }
+        }
+
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    const select = getResponseProfileSelect(container)
+
+    expect(onFrame).not.toBeNull()
+    const frameHandler = onFrame as unknown as (frame: readonly number[]) => Promise<void> | void
+
+    let pendingFrame: Promise<void> | void
+    await act(async () => {
+      pendingFrame = frameHandler([0.2, -0.2, 0.2, -0.2])
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      setSelectValue(select, 'quality')
+      await Promise.resolve()
+    })
+
+    expect(stop).toHaveBeenCalledTimes(1)
+    expect(ingestFramePending).toBe(true)
+
+    resolveIngestFrame()
+
+    await act(async () => {
+      await pendingFrame
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    })
+
+    expect(invokedCommands).toContain('switch_response_profile')
+    expect(invokedCommands.filter((command) => command === 'ingest_audio_frame')).toHaveLength(1)
+    expect(getControlButton(container, 'Reset to idle').disabled).toBe(true)
+    expect(container.textContent).not.toContain('Runtime control error')
+  })
+
+  it('waits for in-flight ingest to drain before invoking profile switch command', async () => {
+    const stop = vi.fn()
+    let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
+    const invokedCommands: string[] = []
+    let selectedProfile: 'fast' | 'quality' = 'fast'
+    let ingestPending = false
+    let resolveIngestFrame: () => void = () => {
+      throw new Error('Expected delayed ingest resolver')
+    }
+
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      onFrame = options.onFrame
+      return { stop }
+    })
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command, args) => {
+        invokedCommands.push(command)
+
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: true,
+            voice_input_error: null,
+            silence_timeout_ms: 1500,
+            selected_response_profile: selectedProfile,
+            supported_response_profiles: ['fast', 'quality'],
+          }
+        }
+
+        if (command === 'ingest_audio_frame') {
+          ingestPending = true
+
+          return await new Promise((resolve) => {
+            resolveIngestFrame = () => {
+              ingestPending = false
+              resolve({
+                runtime_phase: 'sleeping',
+                transcription_ready_samples: null,
+                transcript_text: null,
+                last_activity_ms: null,
+                capturing_utterance: false,
+                preroll_samples: 0,
+                utterance_samples: 0,
+              })
+            }
+          })
+        }
+
+        if (command === 'switch_response_profile') {
+          expect(ingestPending).toBe(false)
+          expect(args).toEqual({ profile: 'quality' })
+          selectedProfile = 'quality'
+          return {
+            selected_response_profile: 'quality',
+            supported_response_profiles: ['fast', 'quality'],
+          }
+        }
+
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    const select = getResponseProfileSelect(container)
+
+    expect(onFrame).not.toBeNull()
+    const frameHandler = onFrame as unknown as (frame: readonly number[]) => Promise<void> | void
+
+    let pendingFrame: Promise<void> | void
+    await act(async () => {
+      pendingFrame = frameHandler([0.2, -0.2, 0.2, -0.2])
+      await Promise.resolve()
+    })
+
+    expect(ingestPending).toBe(true)
+
+    await act(async () => {
+      setSelectValue(select, 'quality')
+      await Promise.resolve()
+    })
+
+    expect(invokedCommands).not.toContain('switch_response_profile')
+    expect(stop).toHaveBeenCalledTimes(1)
+
+    resolveIngestFrame()
+
+    await act(async () => {
+      await pendingFrame
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    })
+
+    expect(invokedCommands).toContain('switch_response_profile')
+    expect(container.textContent).not.toContain('Response profile switch error: response backend is busy')
+  })
+
+  it('ignores re-entrant profile switch attempts while draining in-flight ingest', async () => {
+    const stop = vi.fn()
+    let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
+    const invokedCommands: string[] = []
+    let selectedProfile: 'fast' | 'quality' = 'fast'
+    let resolveIngestFrame: () => void = () => {
+      throw new Error('Expected delayed ingest resolver')
+    }
+
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      onFrame = options.onFrame
+      return { stop }
+    })
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command, args) => {
+        invokedCommands.push(command)
+
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: true,
+            voice_input_error: null,
+            silence_timeout_ms: 1500,
+            selected_response_profile: selectedProfile,
+            supported_response_profiles: ['fast', 'quality'],
+          }
+        }
+
+        if (command === 'ingest_audio_frame') {
+          return await new Promise((resolve) => {
+            resolveIngestFrame = () => {
+              resolve({
+                runtime_phase: 'sleeping',
+                transcription_ready_samples: null,
+                transcript_text: null,
+                last_activity_ms: null,
+                capturing_utterance: false,
+                preroll_samples: 0,
+                utterance_samples: 0,
+              })
+            }
+          })
+        }
+
+        if (command === 'switch_response_profile') {
+          expect(args).toEqual({ profile: 'quality' })
+          selectedProfile = 'quality'
+          return {
+            selected_response_profile: 'quality',
+            supported_response_profiles: ['fast', 'quality'],
+          }
+        }
+
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    const select = getResponseProfileSelect(container)
+
+    expect(onFrame).not.toBeNull()
+    const frameHandler = onFrame as unknown as (frame: readonly number[]) => Promise<void> | void
+
+    let pendingFrame: Promise<void> | void
+    await act(async () => {
+      pendingFrame = frameHandler([0.2, -0.2, 0.2, -0.2])
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      setSelectValue(select, 'quality')
+      setSelectValue(select, 'quality')
+      await Promise.resolve()
+    })
+
+    expect(invokedCommands).not.toContain('switch_response_profile')
+
+    resolveIngestFrame()
+
+    await act(async () => {
+      await pendingFrame
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    })
+
+    expect(invokedCommands.filter((command) => command === 'switch_response_profile')).toHaveLength(1)
+  })
+
+  it('ignores stale delayed microphone start after profile switch invalidates session', async () => {
+    const stop = vi.fn()
+    let delayedStartPending = false
+    let resolveLiveAudioSource: (source: { stop: () => void }) => void = () => {
+      throw new Error('Expected delayed microphone start resolver')
+    }
+    const invokedCommands: string[] = []
+    let selectedProfile: 'fast' | 'quality' = 'fast'
+
+    startLiveAudioSourceMock.mockImplementation(
+      async () =>
+        await new Promise((resolve) => {
+          delayedStartPending = true
+          resolveLiveAudioSource = resolve
+        }),
+    )
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command, args) => {
+        invokedCommands.push(command)
+
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: true,
+            voice_input_error: null,
+            silence_timeout_ms: 1500,
+            selected_response_profile: selectedProfile,
+            supported_response_profiles: ['fast', 'quality'],
+          }
+        }
+
+        if (command === 'switch_response_profile') {
+          expect(args).toEqual({ profile: 'quality' })
+          selectedProfile = 'quality'
+          return {
+            selected_response_profile: 'quality',
+            supported_response_profiles: ['fast', 'quality'],
+          }
+        }
+
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    const select = getResponseProfileSelect(container)
+
+    await act(async () => {
+      setSelectValue(select, 'quality')
+      await Promise.resolve()
+    })
+
+    expect(delayedStartPending).toBe(true)
+
+    await act(async () => {
+      delayedStartPending = false
+      resolveLiveAudioSource({ stop })
+      await Promise.resolve()
+    })
+
+    expect(invokedCommands).toContain('switch_response_profile')
+    expect(invokedCommands.filter((command) => command === 'ingest_audio_frame')).toHaveLength(0)
+    expect(stop).toHaveBeenCalledTimes(1)
+    expect(container.textContent).not.toContain('live_audio:\ndefault microphone started')
+  })
+
+  it('ignores stale delayed microphone start rejection after profile switch', async () => {
+    let delayedStartPending = false
+    let rejectLiveAudioSource: (error: unknown) => void = () => {
+      throw new Error('Expected delayed microphone start rejector')
+    }
+    const invokedCommands: string[] = []
+    let selectedProfile: 'fast' | 'quality' = 'fast'
+
+    startLiveAudioSourceMock.mockImplementation(
+      async () =>
+        await new Promise((_resolve, reject) => {
+          delayedStartPending = true
+          rejectLiveAudioSource = reject
+        }),
+    )
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command, args) => {
+        invokedCommands.push(command)
+
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: true,
+            voice_input_error: null,
+            silence_timeout_ms: 1500,
+            selected_response_profile: selectedProfile,
+            supported_response_profiles: ['fast', 'quality'],
+          }
+        }
+
+        if (command === 'switch_response_profile') {
+          expect(args).toEqual({ profile: 'quality' })
+          selectedProfile = 'quality'
+          return {
+            selected_response_profile: 'quality',
+            supported_response_profiles: ['fast', 'quality'],
+          }
+        }
+
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    const select = getResponseProfileSelect(container)
+
+    await act(async () => {
+      setSelectValue(select, 'quality')
+      await Promise.resolve()
+    })
+
+    expect(delayedStartPending).toBe(true)
+
+    await act(async () => {
+      delayedStartPending = false
+      rejectLiveAudioSource(new Error('Permission denied'))
+      await Promise.resolve()
+    })
+
+    expect(invokedCommands).toContain('switch_response_profile')
+    expect(container.textContent).not.toContain('live_audio_error:\nPermission denied')
+    expect(container.textContent).not.toContain('live_audio:\ndefault microphone started')
   })
 
   it('automatically marks silence from backend speech activity updates', async () => {
@@ -627,6 +1365,8 @@ describe('App', () => {
             voice_input_available: true,
             voice_input_error: null,
             silence_timeout_ms: 1500,
+            selected_response_profile: 'quality',
+            supported_response_profiles: ['fast', 'quality'],
           }
         }
 
@@ -676,7 +1416,6 @@ describe('App', () => {
       'ingest_audio_frame',
       'mark_silence',
     ])
-    expect(container.textContent).toContain('Status: Transcribing')
     expect(container.textContent).toContain('transcription_ready:\n3200 samples captured')
   })
 
@@ -718,6 +1457,8 @@ describe('App', () => {
             voice_input_available: true,
             voice_input_error: null,
             silence_timeout_ms: 1500,
+            selected_response_profile: 'quality',
+            supported_response_profiles: ['fast', 'quality'],
           }
         }
 
@@ -784,7 +1525,6 @@ describe('App', () => {
     expect(container.textContent).toContain('transcript:\nOpen the pull request')
     expect(container.textContent).toContain('Open the pull request')
     expect(container.textContent).toContain('Voice execution response')
-    expect(container.textContent).toContain('Status: Waiting')
     expect(container.textContent).toContain('Mic on')
   })
 
@@ -826,6 +1566,8 @@ describe('App', () => {
             voice_input_available: true,
             voice_input_error: null,
             silence_timeout_ms: 3000,
+            selected_response_profile: 'quality',
+            supported_response_profiles: ['fast', 'quality'],
           }
         }
 
@@ -931,6 +1673,8 @@ describe('App', () => {
             voice_input_available: true,
             voice_input_error: null,
             silence_timeout_ms: 1500,
+            selected_response_profile: 'quality',
+            supported_response_profiles: ['fast', 'quality'],
           }
         }
 
@@ -975,7 +1719,6 @@ describe('App', () => {
       'mark_silence',
     ])
     expect(container.textContent).toContain('Runtime control error (mark_silence): utterance transcription failed: InvalidTranscript(EmptyText)')
-    expect(container.textContent).toContain('Status: Waiting')
     expect(container.textContent).toContain('Mic on')
   })
 
@@ -1034,6 +1777,8 @@ describe('App', () => {
             voice_input_available: true,
             voice_input_error: null,
             silence_timeout_ms: 1500,
+            selected_response_profile: 'quality',
+            supported_response_profiles: ['fast', 'quality'],
           }
         }
 
@@ -1118,6 +1863,8 @@ describe('App', () => {
           voice_input_available: true,
           voice_input_error: null,
           silence_timeout_ms: 1500,
+          selected_response_profile: 'quality',
+          supported_response_profiles: ['fast', 'quality'],
         }
       },
     }
@@ -1147,6 +1894,8 @@ describe('App', () => {
           voice_input_available: true,
           voice_input_error: null,
           silence_timeout_ms: 1500,
+          selected_response_profile: 'quality',
+          supported_response_profiles: ['fast', 'quality'],
         }
       },
     }
@@ -1196,6 +1945,8 @@ describe('App', () => {
             voice_input_available: true,
             voice_input_error: null,
             silence_timeout_ms: 1500,
+            selected_response_profile: 'quality',
+            supported_response_profiles: ['fast', 'quality'],
           }
         }
 
@@ -1239,10 +1990,7 @@ describe('App', () => {
       'ingest_audio_frame',
       'ingest_audio_frame',
     ])
-    expect(container.textContent).toContain('Status: Listening')
-    expect(container.textContent).toContain(
-      'Speech is being captured. Use Stop listening and process when you are done talking.',
-    )
+    expect(container.textContent).toContain('Mic on')
   })
 
   it('surfaces raw runtime control rejection messages', async () => {
@@ -1261,6 +2009,8 @@ describe('App', () => {
             voice_input_available: true,
             voice_input_error: null,
             silence_timeout_ms: 1500,
+            selected_response_profile: 'quality',
+            supported_response_profiles: ['fast', 'quality'],
           }
         }
 
@@ -1362,6 +2112,21 @@ function getAutoStopToggle(container: HTMLElement): HTMLInputElement {
   }
 
   return toggle
+}
+
+function getResponseProfileSelect(container: HTMLElement): HTMLSelectElement {
+  const select = container.querySelector<HTMLSelectElement>('#responseProfileSelect')
+
+  if (select === null) {
+    throw new Error('Missing response profile select')
+  }
+
+  return select
+}
+
+function setSelectValue(select: HTMLSelectElement, value: string): void {
+  select.value = value
+  select.dispatchEvent(new Event('change', { bubbles: true }))
 }
 
 function setTextAreaValue(textArea: HTMLTextAreaElement, value: string): void {

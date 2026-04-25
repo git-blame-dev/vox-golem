@@ -1,9 +1,12 @@
 #![forbid(unsafe_code)]
 #![deny(unused_must_use)]
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
-use std::sync::{Arc, Mutex};
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{path::BaseDirectory, Manager};
 
@@ -20,6 +23,7 @@ const LLAMA_CPP_MAX_TOKENS: u16 = 512;
 const LLAMA_CPP_CONTEXT_WINDOW_TOKENS: usize = 8_192;
 const LLAMA_CPP_CONTEXT_SAFETY_MARGIN_TOKENS: usize = 512;
 const LLAMA_CPP_CHAT_WRAPPER_TOKENS: usize = 64;
+const RESPONSE_PROFILE_STATE_FILE: &str = "state.toml";
 const LLAMA_CPP_ROLLOVER_REASON: &str =
     "Context budget reached; started a new local Gemma conversation for this reply.";
 
@@ -38,6 +42,10 @@ struct LlamaPromptInput {
 struct AppState {
     startup_state: Arc<Mutex<StartupStatePayload>>,
     runtime_config: Option<voxgolem_core::config::RuntimeConfig>,
+    selected_response_profile: Arc<Mutex<ResponseProfilePayload>>,
+    supported_response_profiles: Vec<ResponseProfilePayload>,
+    response_profile_switch_generation: Arc<AtomicU64>,
+    response_backend_operation_lock: Mutex<()>,
     voice_pipeline_config: voxgolem_core::voice_pipeline::VoicePipelineConfig,
     voice_pipeline_state: Mutex<voxgolem_core::voice_pipeline::VoicePipelineState>,
     wake_word_runtime: Option<Mutex<wake_word::WakeWordRuntime>>,
@@ -57,6 +65,19 @@ enum RuntimePhasePayload {
     Processing,
     Executing,
     Error,
+}
+
+impl RuntimePhasePayload {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Initializing => "initializing",
+            Self::Sleeping => "sleeping",
+            Self::Listening => "listening",
+            Self::Processing => "processing",
+            Self::Executing => "executing",
+            Self::Error => "error",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -127,6 +148,28 @@ struct CueAssetPathsPayload {
     stop_listening: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ResponseProfilePayload {
+    Fast,
+    Quality,
+}
+
+impl ResponseProfilePayload {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Quality => "quality",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct SwitchResponseProfilePayload {
+    selected_response_profile: ResponseProfilePayload,
+    supported_response_profiles: Vec<ResponseProfilePayload>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum StartupStatePayload {
@@ -137,6 +180,8 @@ enum StartupStatePayload {
         voice_input_error: Option<String>,
         silence_timeout_ms: u64,
         message: String,
+        selected_response_profile: ResponseProfilePayload,
+        supported_response_profiles: Vec<ResponseProfilePayload>,
     },
     Ready {
         cue_asset_paths: CueAssetPathsPayload,
@@ -144,6 +189,8 @@ enum StartupStatePayload {
         voice_input_available: bool,
         voice_input_error: Option<String>,
         silence_timeout_ms: u64,
+        selected_response_profile: ResponseProfilePayload,
+        supported_response_profiles: Vec<ResponseProfilePayload>,
     },
     Error {
         message: String,
@@ -160,10 +207,177 @@ fn get_startup_state(app_state: tauri::State<'_, AppState>) -> StartupStatePaylo
 }
 
 #[tauri::command]
+fn switch_response_profile(
+    profile: ResponseProfilePayload,
+    app_state: tauri::State<'_, AppState>,
+) -> Result<SwitchResponseProfilePayload, String> {
+    let _operation_guard =
+        try_lock_response_backend_operation(&app_state.response_backend_operation_lock)?;
+    let supported_response_profiles = app_state.supported_response_profiles.clone();
+    if !supported_response_profiles.contains(&profile) {
+        return Err(format!(
+            "response profile `{}` is not supported",
+            profile.as_str()
+        ));
+    }
+
+    ensure_startup_ready_for_profile_switch(&app_state.startup_state)?;
+
+    let response = SwitchResponseProfilePayload {
+        selected_response_profile: profile,
+        supported_response_profiles: supported_response_profiles.clone(),
+    };
+
+    let current_profile = *app_state
+        .selected_response_profile
+        .lock()
+        .map_err(|_| String::from("selected response profile lock is poisoned"))?;
+    if current_profile == profile {
+        return Ok(response);
+    }
+
+    ensure_response_profile_switch_runtime_is_idle(&app_state.voice_pipeline_state)?;
+
+    let switch_generation = app_state
+        .response_profile_switch_generation
+        .fetch_add(1, Ordering::SeqCst)
+        .saturating_add(1);
+
+    if let Ok(mut conversation) = app_state.llama_cpp_conversation.lock() {
+        conversation.clear();
+    }
+
+    let Some(config) = app_state.runtime_config.as_ref() else {
+        return Ok(response);
+    };
+
+    let voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
+        server_path,
+        host,
+        port,
+        fast_model_path,
+        quality_model_path,
+    } = &config.response_backend
+    else {
+        return Ok(response);
+    };
+
+    let model_path = model_path_for_profile(profile, fast_model_path, quality_model_path.as_ref())?
+        .to_path_buf();
+    let previous_model_path = model_path_for_profile(
+        current_profile,
+        fast_model_path,
+        quality_model_path.as_ref(),
+    )?
+    .to_path_buf();
+    let startup_snapshot = startup_snapshot_for_profile_switch(
+        &app_state.startup_state,
+        profile,
+        supported_response_profiles,
+    )?;
+
+    {
+        let mut runtime = app_state
+            .llama_cpp_runtime
+            .lock()
+            .map_err(|_| String::from("local llama.cpp runtime lock is poisoned"))?;
+        *runtime = None;
+    }
+
+    let startup_state = Arc::clone(&app_state.startup_state);
+    let llama_cpp_runtime = Arc::clone(&app_state.llama_cpp_runtime);
+    let selected_response_profile = Arc::clone(&app_state.selected_response_profile);
+    let response_profile_switch_generation =
+        Arc::clone(&app_state.response_profile_switch_generation);
+    let server_spec = voxgolem_platform::llama_cpp::LlamaCppServerSpec::new(
+        server_path.clone(),
+        model_path,
+        host.clone(),
+        *port,
+        LLAMA_CPP_MODEL_ALIAS,
+    );
+    let fallback_server_spec = voxgolem_platform::llama_cpp::LlamaCppServerSpec::new(
+        server_path.clone(),
+        previous_model_path,
+        host.clone(),
+        *port,
+        LLAMA_CPP_MODEL_ALIAS,
+    );
+
+    if let Ok(mut startup_guard) = startup_state.lock() {
+        *startup_guard = StartupStatePayload::WarmingModel {
+            cue_asset_paths: startup_snapshot.cue_asset_paths.clone(),
+            runtime_phase: RuntimePhasePayload::Initializing,
+            voice_input_available: startup_snapshot.voice_input_available,
+            voice_input_error: startup_snapshot.voice_input_error.clone(),
+            silence_timeout_ms: startup_snapshot.silence_timeout_ms,
+            message: String::from("Loading local Gemma model..."),
+            selected_response_profile: profile,
+            supported_response_profiles: startup_snapshot.supported_response_profiles.clone(),
+        };
+    }
+
+    std::thread::spawn(move || {
+        let start_result = voxgolem_platform::llama_cpp::LlamaCppRuntime::start(server_spec);
+        if response_profile_switch_generation.load(Ordering::SeqCst) != switch_generation {
+            return;
+        }
+
+        let next_state = match start_result {
+            Ok(runtime) => {
+                if let Ok(mut guard) = llama_cpp_runtime.lock() {
+                    *guard = Some(runtime);
+                }
+
+                if let Err(error) = persist_selected_response_profile(profile) {
+                    eprintln!("failed to persist response profile state: {error}");
+                }
+
+                if let Ok(mut selected) = selected_response_profile.lock() {
+                    *selected = profile;
+                }
+
+                startup_ready_state_from_snapshot(&startup_snapshot, profile)
+            }
+            Err(error) => match voxgolem_platform::llama_cpp::LlamaCppRuntime::start(
+                fallback_server_spec,
+            ) {
+                Ok(runtime) => {
+                    if let Ok(mut guard) = llama_cpp_runtime.lock() {
+                        *guard = Some(runtime);
+                    }
+
+                    if let Ok(mut selected) = selected_response_profile.lock() {
+                        *selected = current_profile;
+                    }
+
+                    startup_ready_state_from_snapshot(&startup_snapshot, current_profile)
+                }
+                Err(restore_error) => StartupStatePayload::Error {
+                    message: format!(
+                        "failed to initialize local llama.cpp runtime: {error}; failed to restore previous profile runtime: {restore_error}"
+                    ),
+                },
+            },
+        };
+
+        if let Ok(mut guard) = startup_state.lock() {
+            *guard = next_state;
+        }
+    });
+
+    Ok(response)
+}
+
+#[tauri::command]
 fn submit_prompt(
     prompt: String,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<PromptExecutionPayload, String> {
+    let _operation_guard =
+        lock_response_backend_operation(&app_state.response_backend_operation_lock)?;
+    ensure_startup_ready_for_prompt(&app_state.startup_state)?;
+
     apply_voice_pipeline_transition(
         &app_state.voice_pipeline_state,
         app_state.voice_pipeline_config,
@@ -223,6 +437,9 @@ fn submit_prompt(
 fn begin_listening(
     app_state: tauri::State<'_, AppState>,
 ) -> Result<RuntimePhaseResponsePayload, String> {
+    let _operation_guard =
+        lock_response_backend_operation(&app_state.response_backend_operation_lock)?;
+    ensure_startup_ready_for_prompt(&app_state.startup_state)?;
     let now_ms = current_time_ms()?;
 
     apply_voice_pipeline_transition_with_input_runtime_reset(
@@ -243,6 +460,9 @@ fn record_speech_activity(
     now_ms: u64,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<RuntimePhaseResponsePayload, String> {
+    let _operation_guard =
+        lock_response_backend_operation(&app_state.response_backend_operation_lock)?;
+    ensure_startup_ready_for_prompt(&app_state.startup_state)?;
     apply_voice_pipeline_transition(
         &app_state.voice_pipeline_state,
         app_state.voice_pipeline_config,
@@ -259,6 +479,9 @@ fn mark_silence(
     telemetry_frame_id: Option<String>,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<RuntimePhaseResponsePayload, String> {
+    let _operation_guard =
+        lock_response_backend_operation(&app_state.response_backend_operation_lock)?;
+    ensure_startup_ready_for_prompt(&app_state.startup_state)?;
     let silence_deadline = current_silence_deadline(
         &app_state.voice_pipeline_state,
         app_state.voice_pipeline_config,
@@ -323,6 +546,9 @@ fn mark_silence(
 fn reset_session(
     app_state: tauri::State<'_, AppState>,
 ) -> Result<RuntimePhaseResponsePayload, String> {
+    let _operation_guard =
+        lock_response_backend_operation(&app_state.response_backend_operation_lock)?;
+    ensure_startup_ready_for_prompt(&app_state.startup_state)?;
     apply_voice_pipeline_transition_with_input_runtime_reset(
         &app_state.voice_pipeline_state,
         &app_state.wake_word_runtime,
@@ -346,6 +572,15 @@ fn ingest_audio_frame(
     telemetry_frame_id: Option<String>,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<RuntimePhaseResponsePayload, String> {
+    let maybe_operation_guard =
+        try_lock_response_backend_operation_or_busy(&app_state.response_backend_operation_lock)?;
+    if maybe_operation_guard.is_none() {
+        return Ok(RuntimePhaseResponsePayload {
+            ..current_runtime_phase_response(&app_state.voice_pipeline_state, None, None)?
+        });
+    }
+    let _operation_guard = maybe_operation_guard;
+    ensure_startup_ready_for_prompt(&app_state.startup_state)?;
     let backend_ingest_started_ms = current_time_ms()?;
     let mut guard = app_state
         .voice_pipeline_state
@@ -410,6 +645,197 @@ fn ingest_audio_frame(
     ))
 }
 
+#[derive(Clone)]
+struct StartupSnapshot {
+    cue_asset_paths: CueAssetPathsPayload,
+    voice_input_available: bool,
+    voice_input_error: Option<String>,
+    silence_timeout_ms: u64,
+    supported_response_profiles: Vec<ResponseProfilePayload>,
+}
+
+fn startup_ready_state_from_snapshot(
+    startup_snapshot: &StartupSnapshot,
+    selected_response_profile: ResponseProfilePayload,
+) -> StartupStatePayload {
+    StartupStatePayload::Ready {
+        cue_asset_paths: startup_snapshot.cue_asset_paths.clone(),
+        runtime_phase: RuntimePhasePayload::Sleeping,
+        voice_input_available: startup_snapshot.voice_input_available,
+        voice_input_error: startup_snapshot.voice_input_error.clone(),
+        silence_timeout_ms: startup_snapshot.silence_timeout_ms,
+        selected_response_profile,
+        supported_response_profiles: startup_snapshot.supported_response_profiles.clone(),
+    }
+}
+
+fn startup_snapshot_for_profile_switch(
+    startup_state: &Arc<Mutex<StartupStatePayload>>,
+    profile: ResponseProfilePayload,
+    supported_response_profiles: Vec<ResponseProfilePayload>,
+) -> Result<StartupSnapshot, String> {
+    let startup_state = startup_state
+        .lock()
+        .map_err(|_| String::from("startup state lock should not be poisoned"))?;
+
+    match &*startup_state {
+        StartupStatePayload::WarmingModel {
+            cue_asset_paths,
+            voice_input_available,
+            voice_input_error,
+            silence_timeout_ms,
+            ..
+        }
+        | StartupStatePayload::Ready {
+            cue_asset_paths,
+            voice_input_available,
+            voice_input_error,
+            silence_timeout_ms,
+            ..
+        } => Ok(StartupSnapshot {
+            cue_asset_paths: cue_asset_paths.clone(),
+            voice_input_available: *voice_input_available,
+            voice_input_error: voice_input_error.clone(),
+            silence_timeout_ms: *silence_timeout_ms,
+            supported_response_profiles,
+        }),
+        StartupStatePayload::Error { .. } => Err(format!(
+            "cannot switch response profile `{}` while startup is in error",
+            profile.as_str()
+        )),
+    }
+}
+
+fn supported_response_profiles(
+    backend: &voxgolem_core::config::ResponseBackendConfig,
+) -> Vec<ResponseProfilePayload> {
+    let mut profiles = vec![ResponseProfilePayload::Fast];
+    if let voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
+        quality_model_path: Some(_),
+        ..
+    } = backend
+    {
+        profiles.push(ResponseProfilePayload::Quality);
+    }
+
+    profiles
+}
+
+fn default_response_profile() -> ResponseProfilePayload {
+    ResponseProfilePayload::Fast
+}
+
+fn model_path_for_profile<'a>(
+    profile: ResponseProfilePayload,
+    fast_model_path: &'a Path,
+    quality_model_path: Option<&'a PathBuf>,
+) -> Result<&'a Path, String> {
+    match profile {
+        ResponseProfilePayload::Fast => Ok(fast_model_path),
+        ResponseProfilePayload::Quality => quality_model_path
+            .map(PathBuf::as_path)
+            .ok_or_else(|| String::from("response profile `quality` is not supported")),
+    }
+}
+
+fn resolve_selected_response_profile(
+    supported_response_profiles: &[ResponseProfilePayload],
+) -> ResponseProfilePayload {
+    let default_profile = default_response_profile();
+    let persisted_profile = load_selected_response_profile().unwrap_or_else(|error| {
+        eprintln!("failed to read response profile state: {error}");
+        None
+    });
+
+    let selected = persisted_profile
+        .filter(|profile| supported_response_profiles.contains(profile))
+        .unwrap_or(default_profile);
+
+    if persisted_profile != Some(selected) {
+        if let Err(error) = persist_selected_response_profile(selected) {
+            eprintln!("failed to persist response profile state: {error}");
+        }
+    }
+
+    selected
+}
+
+fn response_profile_state_path() -> Result<PathBuf, String> {
+    let config_path = voxgolem_core::config::default_config_path()
+        .map_err(|error| format!("failed to resolve %APPDATA%\\VoxGolem\\config.toml: {error}"))?;
+
+    Ok(config_path.with_file_name(RESPONSE_PROFILE_STATE_FILE))
+}
+
+fn load_selected_response_profile() -> Result<Option<ResponseProfilePayload>, String> {
+    let state_path = response_profile_state_path()?;
+    let contents = match fs::read_to_string(&state_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "failed to read response profile state {}: {error}",
+                state_path.display()
+            ));
+        }
+    };
+
+    parse_selected_response_profile(&contents)
+}
+
+fn parse_selected_response_profile(
+    contents: &str,
+) -> Result<Option<ResponseProfilePayload>, String> {
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("selected_response_profile") {
+            let Some(value) = value.trim_start().strip_prefix('=') else {
+                return Err(String::from(
+                    "invalid state.toml: expected `selected_response_profile = \"...\"`",
+                ));
+            };
+
+            let value = value.trim().trim_matches('"').to_ascii_lowercase();
+            return match value.as_str() {
+                "fast" => Ok(Some(ResponseProfilePayload::Fast)),
+                "quality" => Ok(Some(ResponseProfilePayload::Quality)),
+                _ => Err(format!(
+                    "invalid state.toml: unsupported selected_response_profile `{value}`"
+                )),
+            };
+        }
+    }
+
+    Ok(None)
+}
+
+fn persist_selected_response_profile(profile: ResponseProfilePayload) -> Result<(), String> {
+    let state_path = response_profile_state_path()?;
+    if let Some(parent) = state_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create response profile state directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+
+    fs::write(
+        &state_path,
+        format!("selected_response_profile = \"{}\"\n", profile.as_str()),
+    )
+    .map_err(|error| {
+        format!(
+            "failed to write response profile state {}: {error}",
+            state_path.display()
+        )
+    })
+}
+
 fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
     let fallback_voice_pipeline_config = default_voice_pipeline_config();
     let cue_asset_paths = match resolve_bundled_cue_asset_paths(app) {
@@ -421,6 +847,15 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
         Ok(config) => {
             let voice_pipeline_config =
                 voice_pipeline_config_with_silence_timeout(config.silence_timeout_ms);
+            let supported_response_profiles = supported_response_profiles(&config.response_backend);
+            let selected_response_profile = Arc::new(Mutex::new(
+                resolve_selected_response_profile(&supported_response_profiles),
+            ));
+            let selected_profile_at_startup = selected_response_profile
+                .lock()
+                .map(|guard| *guard)
+                .unwrap_or_else(|_| default_response_profile());
+            let response_profile_switch_generation = Arc::new(AtomicU64::new(0));
             let wake_word_runtime =
                 match wake_word::WakeWordRuntime::new(&config.wake_word_model_path) {
                     Ok(runtime) => runtime,
@@ -484,6 +919,8 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                         voice_input_error: voice_input_error.clone(),
                         silence_timeout_ms: config.silence_timeout_ms,
                         message: String::from("Loading local Gemma model..."),
+                        selected_response_profile: selected_profile_at_startup,
+                        supported_response_profiles: supported_response_profiles.clone(),
                     }
                 }
                 voxgolem_core::config::ResponseBackendConfig::Opencode { .. } => {
@@ -493,6 +930,8 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                         voice_input_available,
                         voice_input_error: voice_input_error.clone(),
                         silence_timeout_ms: config.silence_timeout_ms,
+                        selected_response_profile: selected_profile_at_startup,
+                        supported_response_profiles: supported_response_profiles.clone(),
                     }
                 }
             }));
@@ -502,44 +941,66 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                 host,
                 port,
                 fast_model_path,
-                ..
+                quality_model_path,
             } = &config.response_backend
             {
                 let startup_state = Arc::clone(&startup_state);
                 let llama_cpp_runtime = Arc::clone(&llama_cpp_runtime);
+                let response_profile_switch_generation =
+                    Arc::clone(&response_profile_switch_generation);
+                let startup_generation = response_profile_switch_generation.load(Ordering::SeqCst);
                 let cue_asset_paths = cue_asset_paths.clone();
                 let voice_input_error = voice_input_error.clone();
                 let silence_timeout_ms = config.silence_timeout_ms;
+                let selected_response_profile = selected_profile_at_startup;
+                let supported_response_profiles = supported_response_profiles.clone();
+                let model_path = match model_path_for_profile(
+                    selected_response_profile,
+                    fast_model_path,
+                    quality_model_path.as_ref(),
+                ) {
+                    Ok(path) => path.to_path_buf(),
+                    Err(_) => fast_model_path.clone(),
+                };
                 let server_spec = voxgolem_platform::llama_cpp::LlamaCppServerSpec::new(
                     server_path.clone(),
-                    fast_model_path.clone(),
+                    model_path,
                     host.clone(),
                     *port,
                     LLAMA_CPP_MODEL_ALIAS,
                 );
 
                 std::thread::spawn(move || {
-                    let next_state =
-                        match voxgolem_platform::llama_cpp::LlamaCppRuntime::start(server_spec) {
-                            Ok(runtime) => {
-                                if let Ok(mut guard) = llama_cpp_runtime.lock() {
-                                    *guard = Some(runtime);
-                                }
+                    let start_result =
+                        voxgolem_platform::llama_cpp::LlamaCppRuntime::start(server_spec);
+                    if response_profile_switch_generation.load(Ordering::SeqCst)
+                        != startup_generation
+                    {
+                        return;
+                    }
 
-                                StartupStatePayload::Ready {
-                                    cue_asset_paths,
-                                    runtime_phase: RuntimePhasePayload::Sleeping,
-                                    voice_input_available,
-                                    voice_input_error,
-                                    silence_timeout_ms,
-                                }
+                    let next_state = match start_result {
+                        Ok(runtime) => {
+                            if let Ok(mut guard) = llama_cpp_runtime.lock() {
+                                *guard = Some(runtime);
                             }
-                            Err(error) => StartupStatePayload::Error {
-                                message: format!(
-                                    "failed to initialize local llama.cpp runtime: {error}"
-                                ),
-                            },
-                        };
+
+                            StartupStatePayload::Ready {
+                                cue_asset_paths,
+                                runtime_phase: RuntimePhasePayload::Sleeping,
+                                voice_input_available,
+                                voice_input_error,
+                                silence_timeout_ms,
+                                selected_response_profile,
+                                supported_response_profiles,
+                            }
+                        }
+                        Err(error) => StartupStatePayload::Error {
+                            message: format!(
+                                "failed to initialize local llama.cpp runtime: {error}"
+                            ),
+                        },
+                    };
 
                     if let Ok(mut guard) = startup_state.lock() {
                         *guard = next_state;
@@ -557,6 +1018,10 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
             AppState {
                 startup_state,
                 runtime_config: Some(config),
+                selected_response_profile,
+                supported_response_profiles,
+                response_profile_switch_generation,
+                response_backend_operation_lock: Mutex::new(()),
                 voice_pipeline_config,
                 voice_pipeline_state: Mutex::new(voice_pipeline_state),
                 wake_word_runtime: Some(Mutex::new(wake_word_runtime)),
@@ -622,6 +1087,10 @@ fn build_startup_error_app_state(
     AppState {
         startup_state: Arc::new(Mutex::new(StartupStatePayload::Error { message })),
         runtime_config: None,
+        selected_response_profile: Arc::new(Mutex::new(default_response_profile())),
+        supported_response_profiles: vec![default_response_profile()],
+        response_profile_switch_generation: Arc::new(AtomicU64::new(0)),
+        response_backend_operation_lock: Mutex::new(()),
         voice_pipeline_config,
         voice_pipeline_state: Mutex::new(voice_pipeline_state),
         wake_word_runtime: None,
@@ -655,6 +1124,87 @@ fn current_runtime_phase(
         .map_err(|_| String::from("voice pipeline lock is poisoned"))?;
 
     Ok(to_runtime_phase_payload(guard.session().runtime().phase()))
+}
+
+fn ensure_response_profile_switch_runtime_is_idle(
+    voice_pipeline_state: &Mutex<voxgolem_core::voice_pipeline::VoicePipelineState>,
+) -> Result<(), String> {
+    let runtime_phase = current_runtime_phase(voice_pipeline_state)?;
+
+    if runtime_phase != RuntimePhasePayload::Sleeping {
+        return Err(format!(
+            "response profile switch is only allowed while runtime is sleeping; current phase is {}",
+            runtime_phase.as_str()
+        ));
+    }
+
+    Ok(())
+}
+
+fn ensure_startup_ready_for_prompt(
+    startup_state: &Arc<Mutex<StartupStatePayload>>,
+) -> Result<(), String> {
+    let startup_state = startup_state
+        .lock()
+        .map_err(|_| String::from("startup state lock should not be poisoned"))?;
+
+    match &*startup_state {
+        StartupStatePayload::Ready { .. } => Ok(()),
+        StartupStatePayload::WarmingModel { .. } => {
+            Err(String::from("local Gemma model is still warming up"))
+        }
+        StartupStatePayload::Error { message } => Err(format!("startup error: {message}")),
+    }
+}
+
+fn ensure_startup_ready_for_profile_switch(
+    startup_state: &Arc<Mutex<StartupStatePayload>>,
+) -> Result<(), String> {
+    let startup_state = startup_state
+        .lock()
+        .map_err(|_| String::from("startup state lock should not be poisoned"))?;
+
+    match &*startup_state {
+        StartupStatePayload::Ready { .. } => Ok(()),
+        StartupStatePayload::WarmingModel { .. } => Err(String::from(
+            "response backend is busy; wait for the active operation to finish",
+        )),
+        StartupStatePayload::Error { message } => Err(format!("startup error: {message}")),
+    }
+}
+
+fn lock_response_backend_operation<'a>(
+    operation_lock: &'a Mutex<()>,
+) -> Result<MutexGuard<'a, ()>, String> {
+    operation_lock
+        .lock()
+        .map_err(|_| String::from("response backend operation lock is poisoned"))
+}
+
+fn try_lock_response_backend_operation<'a>(
+    operation_lock: &'a Mutex<()>,
+) -> Result<MutexGuard<'a, ()>, String> {
+    match operation_lock.try_lock() {
+        Ok(guard) => Ok(guard),
+        Err(TryLockError::WouldBlock) => Err(String::from(
+            "response backend is busy; wait for the active operation to finish",
+        )),
+        Err(TryLockError::Poisoned(_)) => {
+            Err(String::from("response backend operation lock is poisoned"))
+        }
+    }
+}
+
+fn try_lock_response_backend_operation_or_busy<'a>(
+    operation_lock: &'a Mutex<()>,
+) -> Result<Option<MutexGuard<'a, ()>>, String> {
+    match operation_lock.try_lock() {
+        Ok(guard) => Ok(Some(guard)),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Poisoned(_)) => {
+            Err(String::from("response backend operation lock is poisoned"))
+        }
+    }
 }
 
 fn current_silence_deadline(
@@ -1275,6 +1825,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_startup_state,
+            switch_response_profile,
             submit_prompt,
             begin_listening,
             record_speech_activity,
@@ -1294,21 +1845,26 @@ mod tests {
     use super::{
         apply_optional_speech_activity, build_llama_prompt_input, build_mark_silence_response,
         build_startup_error_app_state, current_runtime_phase_response, current_silence_deadline,
-        default_voice_pipeline_config, execute_prompt_backend,
+        default_response_profile, default_voice_pipeline_config, execute_prompt_backend,
         ingest_audio_frame_with_optional_wake_word_detection, is_llama_context_overflow_error,
-        llama_cpp_input_token_limit, load_llama_cpp_system_prompt, process_wake_word_frame,
-        prompt_result_error_message, reset_voice_pipeline_to_waiting, reset_wake_word_runtime,
-        runtime_phase_response_from_state, to_runtime_phase_payload, transcribe_finished_utterance,
+        llama_cpp_input_token_limit, load_llama_cpp_system_prompt, model_path_for_profile,
+        parse_selected_response_profile, persist_selected_response_profile,
+        process_wake_word_frame, prompt_result_error_message, reset_voice_pipeline_to_waiting,
+        reset_wake_word_runtime, response_profile_state_path, runtime_phase_response_from_state,
+        supported_response_profiles, to_runtime_phase_payload, transcribe_finished_utterance,
         transcription_ready_samples, wake_word_event_timestamp, LlamaConversationTurn,
-        PromptExecutionEventPayload, RuntimePhasePayload, RuntimePhaseResponsePayload,
-        RuntimeTelemetryPayload, DEFAULT_SILENCE_TIMEOUT_MS, LLAMA_CPP_ROLLOVER_REASON,
+        PromptExecutionEventPayload, ResponseProfilePayload, RuntimePhasePayload,
+        RuntimePhaseResponsePayload, RuntimeTelemetryPayload, DEFAULT_SILENCE_TIMEOUT_MS,
+        LLAMA_CPP_ROLLOVER_REASON,
     };
     use crate::wake_word::{WakeWordDetection, WakeWordRuntime};
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    static APPDATA_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn prompt_result_error_message_prefers_non_zero_exit_code() {
@@ -1874,6 +2430,9 @@ mod tests {
 
     #[test]
     fn load_llama_cpp_system_prompt_reads_soul_file_from_appdata() {
+        let _appdata_lock = APPDATA_ENV_LOCK
+            .lock()
+            .expect("APPDATA test lock should not be poisoned");
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let appdata_path = temp_dir.path().join("VoxGolem");
         std::fs::create_dir_all(&appdata_path).expect("appdata path should be creatable");
@@ -1900,11 +2459,198 @@ mod tests {
     }
 
     #[test]
+    fn supported_response_profiles_includes_quality_when_configured() {
+        let profiles =
+            supported_response_profiles(&voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
+                server_path: PathBuf::from("llama-server.exe"),
+                host: String::from("127.0.0.1"),
+                port: 11_435,
+                fast_model_path: PathBuf::from("fast.gguf"),
+                quality_model_path: Some(PathBuf::from("quality.gguf")),
+            });
+
+        assert_eq!(
+            profiles,
+            vec![
+                ResponseProfilePayload::Fast,
+                ResponseProfilePayload::Quality
+            ]
+        );
+    }
+
+    #[test]
+    fn model_path_for_profile_rejects_quality_when_missing() {
+        let result = model_path_for_profile(
+            ResponseProfilePayload::Quality,
+            Path::new("fast.gguf"),
+            None,
+        );
+
+        assert_eq!(
+            result,
+            Err(String::from("response profile `quality` is not supported"))
+        );
+    }
+
+    #[test]
+    fn parse_selected_response_profile_supports_fast_and_quality() {
+        assert_eq!(
+            parse_selected_response_profile("selected_response_profile = \"fast\"\n")
+                .expect("fast profile should parse"),
+            Some(ResponseProfilePayload::Fast)
+        );
+        assert_eq!(
+            parse_selected_response_profile("selected_response_profile = \"quality\"\n")
+                .expect("quality profile should parse"),
+            Some(ResponseProfilePayload::Quality)
+        );
+    }
+
+    #[test]
+    fn persist_selected_response_profile_writes_state_file_in_appdata() {
+        let _appdata_lock = APPDATA_ENV_LOCK
+            .lock()
+            .expect("APPDATA test lock should not be poisoned");
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let previous_appdata = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", temp_dir.path());
+
+        persist_selected_response_profile(ResponseProfilePayload::Quality)
+            .expect("profile state should be written");
+        let state_path = response_profile_state_path().expect("state path should resolve");
+        let state_contents =
+            std::fs::read_to_string(&state_path).expect("state file should be readable");
+
+        match previous_appdata {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+
+        assert!(state_path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .ends_with("VoxGolem/state.toml"));
+        assert_eq!(state_contents, "selected_response_profile = \"quality\"\n");
+    }
+
+    #[test]
+    fn default_response_profile_stays_fast() {
+        assert_eq!(default_response_profile(), ResponseProfilePayload::Fast);
+    }
+
+    #[test]
     fn maps_core_runtime_phase_to_payload() {
         assert!(matches!(
             to_runtime_phase_payload(voxgolem_core::runtime::RuntimePhase::Processing),
             RuntimePhasePayload::Processing
         ));
+    }
+
+    #[test]
+    fn contract_response_profile_switch_requires_sleeping_runtime_phase() {
+        let voice_pipeline_config = default_voice_pipeline_config();
+        let voice_pipeline_state = Mutex::new(
+            voxgolem_core::voice_pipeline::VoicePipelineState::new(voice_pipeline_config)
+                .expect("voice pipeline should initialize"),
+        );
+
+        super::apply_voice_pipeline_transition(
+            &voice_pipeline_state,
+            voice_pipeline_config,
+            voxgolem_core::voice_pipeline::VoicePipelineEvent::StartupValidated,
+        )
+        .expect("startup validation should set runtime to sleeping");
+        assert_eq!(
+            super::ensure_response_profile_switch_runtime_is_idle(&voice_pipeline_state),
+            Ok(())
+        );
+
+        super::apply_voice_pipeline_transition(
+            &voice_pipeline_state,
+            voice_pipeline_config,
+            voxgolem_core::voice_pipeline::VoicePipelineEvent::SubmitPrompt,
+        )
+        .expect("submit prompt should move runtime to executing");
+        assert_eq!(
+            super::ensure_response_profile_switch_runtime_is_idle(&voice_pipeline_state),
+            Err(String::from(
+                "response profile switch is only allowed while runtime is sleeping; current phase is executing"
+            ))
+        );
+    }
+
+    #[test]
+    fn contract_response_profile_switch_lock_rejects_busy_backend_operation() {
+        let operation_lock = Mutex::new(());
+        let _submit_guard = super::lock_response_backend_operation(&operation_lock)
+            .expect("lock should be acquired");
+
+        match super::try_lock_response_backend_operation(&operation_lock) {
+            Ok(_) => panic!("try_lock should report an active backend operation"),
+            Err(message) => assert_eq!(
+                message,
+                String::from("response backend is busy; wait for the active operation to finish")
+            ),
+        };
+    }
+
+    #[test]
+    fn contract_ingest_lock_can_drop_frames_while_backend_is_busy() {
+        let operation_lock = Mutex::new(());
+        let _submit_guard = super::lock_response_backend_operation(&operation_lock)
+            .expect("lock should be acquired");
+
+        let maybe_guard = super::try_lock_response_backend_operation_or_busy(&operation_lock)
+            .expect("busy lock should not return a hard error");
+        assert!(maybe_guard.is_none());
+    }
+
+    #[test]
+    fn contract_response_profile_switch_requires_ready_startup_state() {
+        let warming_state = Arc::new(Mutex::new(super::StartupStatePayload::WarmingModel {
+            cue_asset_paths: super::CueAssetPathsPayload {
+                start_listening: String::from("resources/start-listening.wav"),
+                stop_listening: String::from("resources/stop-listening.wav"),
+            },
+            runtime_phase: RuntimePhasePayload::Initializing,
+            voice_input_available: true,
+            voice_input_error: None,
+            silence_timeout_ms: DEFAULT_SILENCE_TIMEOUT_MS,
+            message: String::from("Loading local Gemma model..."),
+            selected_response_profile: ResponseProfilePayload::Quality,
+            supported_response_profiles: vec![
+                ResponseProfilePayload::Fast,
+                ResponseProfilePayload::Quality,
+            ],
+        }));
+
+        assert_eq!(
+            super::ensure_startup_ready_for_profile_switch(&warming_state),
+            Err(String::from(
+                "response backend is busy; wait for the active operation to finish"
+            ))
+        );
+
+        let ready_state = Arc::new(Mutex::new(super::StartupStatePayload::Ready {
+            cue_asset_paths: super::CueAssetPathsPayload {
+                start_listening: String::from("resources/start-listening.wav"),
+                stop_listening: String::from("resources/stop-listening.wav"),
+            },
+            runtime_phase: RuntimePhasePayload::Sleeping,
+            voice_input_available: true,
+            voice_input_error: None,
+            silence_timeout_ms: DEFAULT_SILENCE_TIMEOUT_MS,
+            selected_response_profile: ResponseProfilePayload::Fast,
+            supported_response_profiles: vec![
+                ResponseProfilePayload::Fast,
+                ResponseProfilePayload::Quality,
+            ],
+        }));
+
+        assert_eq!(
+            super::ensure_startup_ready_for_profile_switch(&ready_state),
+            Ok(())
+        );
     }
 
     #[test]

@@ -11,6 +11,13 @@ export interface CueAssetPaths {
   readonly stopListening: string
 }
 
+export type ResponseProfile = 'fast' | 'quality'
+
+export interface ResponseProfileState {
+  readonly selectedResponseProfile: ResponseProfile
+  readonly supportedResponseProfiles: readonly ResponseProfile[]
+}
+
 export type BackendRuntimePhase =
   | 'initializing'
   | 'sleeping'
@@ -49,6 +56,8 @@ export type StartupState =
       readonly voiceInputError: string | null
       readonly silenceTimeoutMs: number
       readonly message: string
+      readonly selectedResponseProfile: ResponseProfile
+      readonly supportedResponseProfiles: readonly ResponseProfile[]
     }
   | {
       readonly kind: 'ready'
@@ -57,6 +66,8 @@ export type StartupState =
       readonly voiceInputAvailable: boolean
       readonly voiceInputError: string | null
       readonly silenceTimeoutMs: number
+      readonly selectedResponseProfile: ResponseProfile
+      readonly supportedResponseProfiles: readonly ResponseProfile[]
     }
   | { readonly kind: 'error'; readonly message: string }
 
