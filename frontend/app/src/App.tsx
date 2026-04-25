@@ -17,6 +17,7 @@ import {
   isStartupStateSettled,
   loadStartupState,
 } from './lib/startupState'
+import { invokeTauriCommand } from './lib/tauri'
 import { createVoiceTelemetryRecorder } from './lib/voiceTelemetry'
 import {
   createVoiceActivityState,
@@ -29,6 +30,7 @@ import type {
   BackendRuntimePhase,
   ChatMessage,
   RuntimeControlResult,
+  ResponseProfile,
   RuntimeStatus,
   StartupState,
 } from './types/chat'
@@ -40,6 +42,7 @@ function App() {
   const [composerValue, setComposerValue] = useState('')
   const [autoStopOnSilence, setAutoStopOnSilence] = useState(true)
   const [wakeConfidence, setWakeConfidence] = useState<number | null>(null)
+  const [isSwitchingResponseProfile, setIsSwitchingResponseProfile] = useState(false)
   const [micStarting, setMicStarting] = useState(false)
   const [micActive, setMicActive] = useState(false)
   const [messages, setMessages] = useState<readonly ChatMessage[]>(() =>
@@ -47,6 +50,9 @@ function App() {
   )
   const conversationRef = useRef<HTMLElement | null>(null)
   const liveAudioSourceRef = useRef<LiveAudioSource | null>(null)
+  const liveAudioSessionIdRef = useRef(0)
+  const liveAudioInFlightFramesRef = useRef(0)
+  const isSwitchingResponseProfileRef = useRef(false)
   const appActiveRef = useRef(true)
   const autoStopOnSilenceRef = useRef(true)
   const micAutoStartedRef = useRef(false)
@@ -72,6 +78,12 @@ function App() {
     return DEFAULT_SILENCE_TIMEOUT_MS
   }
 
+  const waitForInFlightLiveAudioFrames = async (): Promise<void> => {
+    while (appActiveRef.current && liveAudioInFlightFramesRef.current > 0) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  }
+
   useEffect(() => {
     let active = true
 
@@ -84,12 +96,7 @@ function App() {
         }
 
         const previousKind = startupStateRef.current.kind
-        startupStateRef.current = nextState
-        setStartupState(nextState)
-
-        const nextRuntimeStatus = startupStateToRuntimeStatus(nextState)
-        runtimeStatusRef.current = nextRuntimeStatus
-        setRuntimeStatus(nextRuntimeStatus)
+        applyStartupState(nextState)
 
         if (nextState.kind === 'ready' && previousKind !== 'ready') {
           setMessages((currentMessages) => [
@@ -132,6 +139,7 @@ function App() {
   useEffect(() => {
     return () => {
       appActiveRef.current = false
+      liveAudioSessionIdRef.current += 1
       liveAudioSourceRef.current?.stop()
       liveAudioSourceRef.current = null
     }
@@ -174,13 +182,35 @@ function App() {
     startupState.kind === 'ready'
       ? startupState.cueAssetPaths
       : DEFAULT_CUE_ASSET_PATHS
+  const responseProfileState =
+    startupState.kind === 'ready' || startupState.kind === 'warming_model'
+      ? {
+          selected: startupState.selectedResponseProfile,
+          supported: startupState.supportedResponseProfiles,
+        }
+      : null
+  const canSwitchResponseProfile =
+    startupState.kind === 'ready' &&
+    runtimeStatus === 'sleeping' &&
+    !micStarting &&
+    !isSwitchingResponseProfile
 
   useEffect(() => {
     autoStopOnSilenceRef.current = autoStopOnSilence
   }, [autoStopOnSilence])
 
-  const runtimeLabel = getRuntimeLabel(runtimeStatus)
-  const runtimeDetail = getRuntimeDetail(runtimeStatus, startupState, micActive, autoStopOnSilence)
+  useEffect(() => {
+    isSwitchingResponseProfileRef.current = isSwitchingResponseProfile
+  }, [isSwitchingResponseProfile])
+
+  const applyStartupState = (nextState: StartupState): void => {
+    startupStateRef.current = nextState
+    setStartupState(nextState)
+
+    const nextRuntimeStatus = startupStateToRuntimeStatus(nextState)
+    runtimeStatusRef.current = nextRuntimeStatus
+    setRuntimeStatus(nextRuntimeStatus)
+  }
 
   const reportCuePlaybackError = (cueType: 'start_listening' | 'stop_listening', error: unknown): void => {
     const message = error instanceof Error ? error.message : 'Unknown cue playback error'
@@ -573,20 +603,24 @@ function App() {
     maybeRunVoiceTranscript(runtimePhase)
   }
 
-  const stopLiveAudio = (content: string): void => {
+  const stopLiveAudio = (content: string | null = null): void => {
+    liveAudioSessionIdRef.current += 1
     liveAudioSourceRef.current?.stop()
     liveAudioSourceRef.current = null
     voiceActivityStateRef.current = createVoiceActivityState()
     setMicStarting(false)
     setMicActive(false)
-    setMessages((currentMessages) => [
-      ...currentMessages,
-      {
-        id: `system-live-audio-${Date.now()}`,
-        role: 'system',
-        content,
-      },
-    ])
+
+    if (content !== null) {
+      setMessages((currentMessages) => [
+        ...currentMessages,
+        {
+          id: `system-live-audio-${Date.now()}`,
+          role: 'system',
+          content,
+        },
+      ])
+    }
   }
 
   const reportLiveAudioError = (error: unknown): void => {
@@ -600,11 +634,20 @@ function App() {
       return
     }
 
+    const liveAudioSessionId = liveAudioSessionIdRef.current + 1
+    liveAudioSessionIdRef.current = liveAudioSessionId
+
     setMicStarting(true)
 
     try {
       const liveAudioSource = await startLiveAudioSource({
         onFrame: async (frame) => {
+          if (liveAudioSessionId !== liveAudioSessionIdRef.current) {
+            return
+          }
+
+          liveAudioInFlightFramesRef.current += 1
+
           try {
             const nowMs = Date.now()
             const frameId = voiceTelemetry.nextFrameId(nowMs)
@@ -624,6 +667,10 @@ function App() {
               frame,
               frameId === null ? {} : { telemetryFrameId: frameId },
             )
+
+            if (liveAudioSessionId !== liveAudioSessionIdRef.current) {
+              return
+            }
 
             if (status !== null) {
               const nextStatus = toRuntimeStatus(status.runtimePhase)
@@ -650,14 +697,20 @@ function App() {
               }
             }
           } catch (error) {
+            if (liveAudioSessionId !== liveAudioSessionIdRef.current) {
+              return
+            }
+
             enterRuntimeError()
             throw error
+          } finally {
+            liveAudioInFlightFramesRef.current = Math.max(0, liveAudioInFlightFramesRef.current - 1)
           }
         },
         onError: reportLiveAudioError,
       })
 
-      if (!appActiveRef.current) {
+      if (!appActiveRef.current || liveAudioSessionId !== liveAudioSessionIdRef.current) {
         liveAudioSource.stop()
         return
       }
@@ -674,7 +727,7 @@ function App() {
         },
       ])
     } catch (error) {
-      if (!appActiveRef.current) {
+      if (!appActiveRef.current || liveAudioSessionId !== liveAudioSessionIdRef.current) {
         return
       }
 
@@ -690,6 +743,104 @@ function App() {
     }
 
     void startMic()
+  }
+
+  const switchResponseProfile = async (profile: ResponseProfile): Promise<void> => {
+    if (startupStateRef.current.kind !== 'ready') {
+      return
+    }
+
+    if (isSwitchingResponseProfileRef.current) {
+      return
+    }
+
+    const currentState = startupStateRef.current
+
+    if (currentState.selectedResponseProfile === profile) {
+      return
+    }
+
+    isSwitchingResponseProfileRef.current = true
+    setIsSwitchingResponseProfile(true)
+
+    const shouldReportMicStopForSwitch =
+      micActive || micStarting || liveAudioSourceRef.current !== null
+    stopLiveAudio(
+      shouldReportMicStopForSwitch
+        ? 'live_audio:\ndefault microphone stopped for profile switch'
+        : null,
+    )
+
+    await waitForInFlightLiveAudioFrames()
+
+    const settleStartupState = async (): Promise<void> => {
+      while (true) {
+        if (!appActiveRef.current) {
+          return
+        }
+
+        const nextState = await loadStartupState()
+
+        if (!appActiveRef.current) {
+          return
+        }
+
+        applyStartupState(nextState)
+
+        if (isStartupStateSettled(nextState)) {
+          break
+        }
+
+        await new Promise((resolve) => window.setTimeout(resolve, 500))
+      }
+    }
+
+    const warmingState: StartupState = {
+      kind: 'warming_model',
+      cueAssetPaths: currentState.cueAssetPaths,
+      runtimePhase: 'initializing',
+      voiceInputAvailable: currentState.voiceInputAvailable,
+      voiceInputError: currentState.voiceInputError,
+      silenceTimeoutMs: currentState.silenceTimeoutMs,
+      message: `Switching response profile to ${getResponseProfileLabel(profile)}...`,
+      selectedResponseProfile: profile,
+      supportedResponseProfiles: currentState.supportedResponseProfiles,
+    }
+
+    startupStateRef.current = warmingState
+    setStartupState(warmingState)
+    runtimeStatusRef.current = 'initializing'
+    setRuntimeStatus('initializing')
+
+    try {
+      await invokeTauriCommand('switch_response_profile', { profile })
+
+      await settleStartupState()
+    } catch (error) {
+      try {
+        await settleStartupState()
+      } catch {
+        if (appActiveRef.current) {
+          applyStartupState(currentState)
+        }
+      }
+
+      if (appActiveRef.current) {
+        setMessages((currentMessages) => [
+          ...currentMessages,
+          {
+            id: `system-switch-profile-error-${Date.now()}`,
+            role: 'system',
+            content: `Response profile switch error: ${toDisplayErrorMessage(error)}`,
+          },
+        ])
+      }
+    } finally {
+      isSwitchingResponseProfileRef.current = false
+      if (appActiveRef.current) {
+        setIsSwitchingResponseProfile(false)
+      }
+    }
   }
 
   useEffect(() => {
@@ -742,9 +893,6 @@ function App() {
     <div className="shell">
       <header className="shell__header">
         <p className="shell__eyebrow">VoxGolem</p>
-        <h1>Windows Tauri MVP Shell</h1>
-        <p className="shell__status">Status: {runtimeLabel}</p>
-        <p className="shell__phase">{runtimeDetail}</p>
         <div className="shell__badges" aria-label="Runtime badges">
           <span className="shell__badge">Mic {micActive ? 'on' : 'off'}</span>
           <span className="shell__badge">
@@ -763,6 +911,48 @@ function App() {
             Voice input unavailable: {startupState.voiceInputError ?? 'Parakeet failed to initialize'}
           </p>
         ) : null}
+        <div className="shell__toggles-line">
+          {responseProfileState !== null ? (
+            <div className="shell__controls" role="group" aria-label="Response profile controls">
+              <label className="shell__select-field" htmlFor="responseProfileSelect">
+                Response profile
+              </label>
+              <select
+                id="responseProfileSelect"
+                className="shell__select"
+                value={responseProfileState.selected}
+                disabled={!canSwitchResponseProfile || responseProfileState.supported.length < 2}
+                onChange={(event) => {
+                  const nextProfile = parseResponseProfileValue(event.target.value)
+                  if (nextProfile === null || !responseProfileState.supported.includes(nextProfile)) {
+                    return
+                  }
+
+                  void switchResponseProfile(nextProfile)
+                }}
+              >
+                {RESPONSE_PROFILE_ORDER.map((profile) => (
+                  <option
+                    key={profile}
+                    value={profile}
+                    disabled={!responseProfileState.supported.includes(profile)}
+                  >
+                    {getResponseProfileLabel(profile)}
+                  </option>
+                ))}
+              </select>
+            </div>
+          ) : null}
+          <label className="shell__toggle">
+            <input
+              type="checkbox"
+              checked={autoStopOnSilence}
+              onChange={(event) => setAutoStopOnSilence(event.target.checked)}
+              disabled={startupState.kind !== 'ready' || !startupState.voiceInputAvailable}
+            />
+            <span>Auto stop on silence</span>
+          </label>
+        </div>
         <div className="shell__controls" role="group" aria-label="Runtime controls">
           <button
             type="button"
@@ -798,15 +988,6 @@ function App() {
             Reset to idle
           </button>
         </div>
-        <label className="shell__toggle">
-          <input
-            type="checkbox"
-            checked={autoStopOnSilence}
-            onChange={(event) => setAutoStopOnSilence(event.target.checked)}
-            disabled={startupState.kind !== 'ready' || !startupState.voiceInputAvailable}
-          />
-          <span>Auto stop on silence</span>
-        </label>
         <details className="shell__manual-controls">
           <summary>Manual fallback controls</summary>
           <div className="shell__controls" role="group" aria-label="Manual fallback controls">
@@ -858,6 +1039,20 @@ function toRuntimeStatus(runtimePhase: BackendRuntimePhase): RuntimeStatus {
   return runtimePhase
 }
 
+const RESPONSE_PROFILE_ORDER: readonly ResponseProfile[] = ['fast', 'quality']
+
+function getResponseProfileLabel(profile: ResponseProfile): 'Fast' | 'Quality' {
+  return profile === 'fast' ? 'Fast' : 'Quality'
+}
+
+function parseResponseProfileValue(value: string): ResponseProfile | null {
+  if (value === 'fast' || value === 'quality') {
+    return value
+  }
+
+  return null
+}
+
 function toDisplayErrorMessage(error: unknown): string {
   if (error instanceof Error) {
     return error.message
@@ -868,61 +1063,6 @@ function toDisplayErrorMessage(error: unknown): string {
   }
 
   return String(error)
-}
-
-function getRuntimeLabel(runtimeStatus: RuntimeStatus): string {
-  switch (runtimeStatus) {
-    case 'initializing':
-      return 'Starting up'
-    case 'sleeping':
-      return 'Waiting'
-    case 'listening':
-      return 'Listening'
-    case 'processing':
-      return 'Transcribing'
-    case 'executing':
-      return 'Running'
-    case 'error':
-      return 'Error'
-  }
-}
-
-function getRuntimeDetail(
-  runtimeStatus: RuntimeStatus,
-  startupState: StartupState,
-  micActive: boolean,
-  autoStopOnSilence: boolean,
-): string {
-  if (startupState.kind === 'error') {
-    return 'Configuration or startup failed before voice services could begin.'
-  }
-
-  if (startupState.kind === 'warming_model') {
-    return startupState.message
-  }
-
-  if (startupState.kind === 'ready' && !startupState.voiceInputAvailable) {
-    return 'Typed prompts still work, but local voice input needs the configured wake-word, VAD, and STT assets.'
-  }
-
-  switch (runtimeStatus) {
-    case 'initializing':
-      return 'Loading runtime services and local voice assets.'
-    case 'sleeping':
-      return micActive
-        ? 'Mic is live and waiting for the wake word or manual fallback controls.'
-        : 'Start the mic to listen hands-free, or use typed prompts below.'
-    case 'listening':
-      return autoStopOnSilence
-        ? 'Speech is being captured. Stop talking and the assistant will transcribe automatically.'
-        : 'Speech is being captured. Use Stop listening and process when you are done talking.'
-    case 'processing':
-      return 'The captured voice turn is being transcribed locally before execution.'
-    case 'executing':
-      return 'A local or configured response backend is generating the answer now.'
-    case 'error':
-      return 'The last voice or execution step failed. Reset to idle to recover.'
-  }
 }
 
 function startupStateToRuntimeStatus(startupState: StartupState): RuntimeStatus {
