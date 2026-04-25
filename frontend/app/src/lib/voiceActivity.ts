@@ -1,7 +1,5 @@
 import type { RuntimeStatus } from '../types/chat'
 
-const SILENCE_TIMEOUT_MS = 2_500
-
 export interface VoiceActivityState {
   readonly lastActivityMs: number | null
   readonly silenceMarked: boolean
@@ -45,6 +43,7 @@ export function syncVoiceActivityState(
 export function updateVoiceActivityState(
   state: VoiceActivityState,
   nowMs: number,
+  silenceTimeoutMs: number,
 ): VoiceActivityUpdate {
   if (state.lastActivityMs === null || state.silenceMarked) {
     return {
@@ -53,7 +52,7 @@ export function updateVoiceActivityState(
     }
   }
 
-  if (nowMs - state.lastActivityMs < SILENCE_TIMEOUT_MS) {
+  if (nowMs - state.lastActivityMs < silenceTimeoutMs) {
     return {
       state,
       shouldMarkSilence: false,

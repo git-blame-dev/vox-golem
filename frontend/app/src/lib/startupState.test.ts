@@ -17,6 +17,7 @@ describe('parseStartupState', () => {
         runtime_phase: 'sleeping',
         voice_input_available: true,
         voice_input_error: null,
+        silence_timeout_ms: 1500,
       }),
     ).toEqual({
       kind: 'ready',
@@ -27,6 +28,7 @@ describe('parseStartupState', () => {
       runtimePhase: 'sleeping',
       voiceInputAvailable: true,
       voiceInputError: null,
+      silenceTimeoutMs: 1500,
     })
   })
 
@@ -53,6 +55,7 @@ describe('parseStartupState', () => {
         runtime_phase: 'initializing',
         voice_input_available: true,
         voice_input_error: null,
+        silence_timeout_ms: 1500,
         message: 'Loading local Gemma model...',
       }),
     ).toEqual({
@@ -64,14 +67,46 @@ describe('parseStartupState', () => {
       runtimePhase: 'initializing',
       voiceInputAvailable: true,
       voiceInputError: null,
+      silenceTimeoutMs: 1500,
       message: 'Loading local Gemma model...',
     })
   })
 
   it('throws when ready payload omits cue paths', () => {
-    expect(() => parseStartupState({ kind: 'ready' })).toThrow(
+    expect(() => parseStartupState({ kind: 'ready', silence_timeout_ms: 1500 })).toThrow(
       'Startup ready payload must include voice_input_available',
     )
+  })
+
+  it('throws when startup payload omits silence timeout', () => {
+    expect(() =>
+      parseStartupState({
+        kind: 'ready',
+        cue_asset_paths: {
+          start_listening: 'resources/start-listening.wav',
+          stop_listening: 'resources/stop-listening.wav',
+        },
+        runtime_phase: 'sleeping',
+        voice_input_available: true,
+        voice_input_error: null,
+      }),
+    ).toThrow('Startup payload must include a positive integer `silence_timeout_ms`')
+  })
+
+  it('throws when startup payload includes non-safe silence timeout value', () => {
+    expect(() =>
+      parseStartupState({
+        kind: 'ready',
+        cue_asset_paths: {
+          start_listening: 'resources/start-listening.wav',
+          stop_listening: 'resources/stop-listening.wav',
+        },
+        runtime_phase: 'sleeping',
+        voice_input_available: true,
+        voice_input_error: null,
+        silence_timeout_ms: 9_007_199_254_740_992,
+      }),
+    ).toThrow('Startup payload must include a positive integer `silence_timeout_ms`')
   })
 
   it('throws for unsupported payloads', () => {
@@ -88,6 +123,7 @@ describe('isStartupStateSettled', () => {
         runtimePhase: 'initializing',
         voiceInputAvailable: true,
         voiceInputError: null,
+        silenceTimeoutMs: 1500,
         message: 'Loading local Gemma model...',
       }),
     ).toBe(false)
@@ -101,6 +137,7 @@ describe('isStartupStateSettled', () => {
         runtimePhase: 'sleeping',
         voiceInputAvailable: true,
         voiceInputError: null,
+        silenceTimeoutMs: 1500,
       }),
     ).toBe(true)
     expect(
@@ -120,6 +157,7 @@ describe('loadStartupState', () => {
       runtimePhase: 'sleeping',
       voiceInputAvailable: true,
       voiceInputError: null,
+      silenceTimeoutMs: 1500,
     })
   })
 
@@ -134,6 +172,7 @@ describe('loadStartupState', () => {
         runtime_phase: 'sleeping',
         voice_input_available: false,
         voice_input_error: 'Parakeet failed to initialize',
+        silence_timeout_ms: 2300,
       }),
     }
 
@@ -146,6 +185,7 @@ describe('loadStartupState', () => {
       runtimePhase: 'sleeping',
       voiceInputAvailable: false,
       voiceInputError: 'Parakeet failed to initialize',
+      silenceTimeoutMs: 2300,
     })
   })
 
