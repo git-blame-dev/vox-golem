@@ -1,6 +1,8 @@
 import { hasInjectedTauriInternals, invokeTauriCommand } from './tauri'
 import type { BackendRuntimePhase, CueAssetPaths, StartupState } from '../types/chat'
 
+export const DEFAULT_SILENCE_TIMEOUT_MS = 1_500
+
 export const DEFAULT_CUE_ASSET_PATHS: CueAssetPaths = {
   startListening: 'resources/start-listening.wav',
   stopListening: 'resources/stop-listening.wav',
@@ -14,6 +16,7 @@ export function parseStartupState(payload: unknown): StartupState {
   if (payload['kind'] === 'warming_model') {
     const voiceInputAvailable = payload['voice_input_available']
     const voiceInputError = payload['voice_input_error']
+    const silenceTimeoutMs = parseSilenceTimeoutMs(payload['silence_timeout_ms'])
     const message = payload['message']
 
     if (typeof voiceInputAvailable !== 'boolean') {
@@ -34,6 +37,7 @@ export function parseStartupState(payload: unknown): StartupState {
       runtimePhase: parseRuntimePhase(payload['runtime_phase']),
       voiceInputAvailable,
       voiceInputError,
+      silenceTimeoutMs,
       message,
     }
   }
@@ -41,6 +45,7 @@ export function parseStartupState(payload: unknown): StartupState {
   if (payload['kind'] === 'ready') {
     const voiceInputAvailable = payload['voice_input_available']
     const voiceInputError = payload['voice_input_error']
+    const silenceTimeoutMs = parseSilenceTimeoutMs(payload['silence_timeout_ms'])
 
     if (typeof voiceInputAvailable !== 'boolean') {
       throw new Error('Startup ready payload must include voice_input_available')
@@ -56,6 +61,7 @@ export function parseStartupState(payload: unknown): StartupState {
       runtimePhase: parseRuntimePhase(payload['runtime_phase']),
       voiceInputAvailable,
       voiceInputError,
+      silenceTimeoutMs,
     }
   }
 
@@ -108,6 +114,7 @@ function buildDefaultStartupState(): StartupState {
     runtimePhase: 'sleeping',
     voiceInputAvailable: true,
     voiceInputError: null,
+    silenceTimeoutMs: DEFAULT_SILENCE_TIMEOUT_MS,
   }
 }
 
@@ -150,6 +157,14 @@ function parseCueAssetPaths(payload: unknown): CueAssetPaths {
     startListening,
     stopListening,
   }
+}
+
+function parseSilenceTimeoutMs(payload: unknown): number {
+  if (typeof payload !== 'number' || !Number.isSafeInteger(payload) || payload <= 0) {
+    throw new Error('Startup payload must include a positive integer `silence_timeout_ms`')
+  }
+
+  return payload
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

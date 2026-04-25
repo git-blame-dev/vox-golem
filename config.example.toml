@@ -2,6 +2,7 @@
 wake_word_model_path = "models/hey_livekit.onnx"
 parakeet_model_dir = "models/parakeet-v2"
 silero_vad_model = "models/silero-vad.onnx"
+silence_timeout_ms = 1500
 
 response_backend = "opencode"
 
