@@ -89,10 +89,6 @@
   white-space: nowrap;
 }
 
-.shell__manual-controls {
-  margin-top: 0.85rem;
-}
-
 .shell__toggle {
   display: inline-flex;
   align-items: center;
@@ -104,12 +100,6 @@
 
 .shell__toggle input {
   margin: 0;
-}
-
-.shell__manual-controls summary {
-  cursor: pointer;
-  color: #2f4a66;
-  font-size: 0.85rem;
 }
 
 .shell__control {
@@ -198,13 +188,6 @@
   border-top: 1px solid #e1e5eb;
   padding: 1rem 1.5rem 1.2rem;
   background: #fbfdff;
-}
-
-.composer__label {
-  display: block;
-  font-size: 0.82rem;
-  color: #2f4a66;
-  margin-bottom: 0.4rem;
 }
 
 .composer__input {
