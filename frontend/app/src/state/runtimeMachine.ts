@@ -2,7 +2,6 @@ import type { CueType } from '../lib/audioCues'
 import type { RuntimeStatus } from '../types/chat'
 
 export type RuntimeEvent =
-  | 'begin_listening'
   | 'end_listening'
   | 'submit_prompt'
   | 'response_ready'
@@ -14,8 +13,6 @@ export function transitionRuntimeStatus(
   event: RuntimeEvent,
 ): RuntimeStatus {
   switch (event) {
-    case 'begin_listening':
-      return current === 'sleeping' ? 'listening' : current
     case 'end_listening':
       return current === 'listening' ? 'processing' : current
     case 'submit_prompt':

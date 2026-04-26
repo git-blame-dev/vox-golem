@@ -2,12 +2,12 @@ import { describe, expect, it } from 'vitest'
 import { cueForTransition, transitionRuntimeStatus } from './runtimeMachine'
 
 describe('transitionRuntimeStatus', () => {
-  it('transitions from sleeping to listening on begin_listening', () => {
-    expect(transitionRuntimeStatus('sleeping', 'begin_listening')).toBe('listening')
-  })
-
   it('transitions from listening to processing on end_listening', () => {
     expect(transitionRuntimeStatus('listening', 'end_listening')).toBe('processing')
+  })
+
+  it('keeps status unchanged for invalid end_listening transition', () => {
+    expect(transitionRuntimeStatus('sleeping', 'end_listening')).toBe('sleeping')
   })
 
   it('transitions typed prompt flow from sleeping to executing', () => {

@@ -7,13 +7,13 @@ afterEach(() => {
 
 describe('invokeRuntimeControl', () => {
   it('returns null when tauri internals are unavailable', async () => {
-    await expect(invokeRuntimeControl('begin_listening')).resolves.toBeNull()
+    await expect(invokeRuntimeControl('reset_session')).resolves.toBeNull()
   })
 
   it('parses runtime phase payloads from tauri commands', async () => {
     window.__TAURI_INTERNALS__ = {
       invoke: async (command) => {
-        expect(command).toBe('begin_listening')
+        expect(command).toBe('reset_session')
 
         return {
           runtime_phase: 'listening',
@@ -27,7 +27,7 @@ describe('invokeRuntimeControl', () => {
       },
     }
 
-    await expect(invokeRuntimeControl('begin_listening')).resolves.toEqual({
+    await expect(invokeRuntimeControl('reset_session')).resolves.toEqual({
       runtimePhase: 'listening',
       transcriptionReadySamples: null,
       transcriptText: null,
@@ -159,7 +159,7 @@ describe('invokeRuntimeControl', () => {
       }),
     }
 
-    await expect(invokeRuntimeControl('begin_listening')).rejects.toThrow(
+    await expect(invokeRuntimeControl('reset_session')).rejects.toThrow(
       'Runtime control payload must include capturing_utterance',
     )
   })
@@ -176,7 +176,7 @@ describe('invokeRuntimeControl', () => {
       }),
     }
 
-    await expect(invokeRuntimeControl('begin_listening')).rejects.toThrow(
+    await expect(invokeRuntimeControl('reset_session')).rejects.toThrow(
       'Runtime control payload must include last_activity_ms',
     )
   })
