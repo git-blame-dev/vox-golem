@@ -434,28 +434,6 @@ fn submit_prompt(
 }
 
 #[tauri::command]
-fn begin_listening(
-    app_state: tauri::State<'_, AppState>,
-) -> Result<RuntimePhaseResponsePayload, String> {
-    let _operation_guard =
-        lock_response_backend_operation(&app_state.response_backend_operation_lock)?;
-    ensure_startup_ready_for_prompt(&app_state.startup_state)?;
-    let now_ms = current_time_ms()?;
-
-    apply_voice_pipeline_transition_with_input_runtime_reset(
-        &app_state.voice_pipeline_state,
-        &app_state.wake_word_runtime,
-        &app_state.voice_activity_runtime,
-        app_state.voice_pipeline_config,
-        voxgolem_core::voice_pipeline::VoicePipelineEvent::WakeWordDetected { now_ms },
-    )?;
-
-    Ok(RuntimePhaseResponsePayload {
-        ..current_runtime_phase_response(&app_state.voice_pipeline_state, None, None)?
-    })
-}
-
-#[tauri::command]
 fn record_speech_activity(
     now_ms: u64,
     app_state: tauri::State<'_, AppState>,
@@ -1827,7 +1805,6 @@ pub fn run() {
             get_startup_state,
             switch_response_profile,
             submit_prompt,
-            begin_listening,
             record_speech_activity,
             ingest_audio_frame,
             mark_silence,
