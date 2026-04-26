@@ -2,7 +2,6 @@ import { getTauriInternals } from './tauri'
 import type { RuntimeControlResult, RuntimeControlTelemetry } from '../types/chat'
 
 export type RuntimeControlCommand =
-  | 'begin_listening'
   | 'record_speech_activity'
   | 'mark_silence'
   | 'reset_session'
