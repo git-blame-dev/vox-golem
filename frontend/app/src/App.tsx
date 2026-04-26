@@ -168,11 +168,6 @@ function App() {
     [composerValue, runtimeStatus, startupState.kind],
   )
 
-  const canStartListening =
-    startupState.kind === 'ready' &&
-    startupState.voiceInputAvailable &&
-    !micActive &&
-    runtimeStatus === 'sleeping'
   const canMarkSilence =
     startupState.kind === 'ready' && startupState.voiceInputAvailable && runtimeStatus === 'listening'
   const canResetToIdle = startupState.kind === 'ready' && runtimeStatus === 'error'
@@ -449,8 +444,6 @@ function App() {
 
   const syncRuntimeControl = async (
     command:
-      | 'begin_listening'
-      | 'record_speech_activity'
       | 'mark_silence'
       | 'reset_session',
     options: {
@@ -495,7 +488,7 @@ function App() {
   }
 
   const recoverFromRuntimeControlError = (
-    command: 'begin_listening' | 'record_speech_activity' | 'mark_silence' | 'reset_session',
+    command: 'mark_silence' | 'reset_session',
   ): void => {
     if (command === 'mark_silence') {
       applyRuntimeStatus('sleeping')
@@ -991,21 +984,6 @@ function App() {
             Reset to idle
           </button>
         </div>
-        <details className="shell__manual-controls">
-          <summary>Manual fallback controls</summary>
-          <div className="shell__controls" role="group" aria-label="Manual fallback controls">
-            <button
-              type="button"
-              className="shell__control"
-              onClick={() => {
-                void syncRuntimeControl('begin_listening', { fallbackEvent: 'begin_listening' })
-              }}
-              disabled={!canStartListening}
-            >
-              Start listening
-            </button>
-          </div>
-        </details>
       </header>
 
       <main ref={conversationRef} className="conversation" aria-live="polite">
@@ -1015,12 +993,10 @@ function App() {
       </main>
 
       <form className="composer" onSubmit={onSubmit}>
-        <label className="composer__label" htmlFor="promptComposer">
-          Prompt
-        </label>
         <textarea
           id="promptComposer"
           className="composer__input"
+          aria-label="Prompt"
           value={composerValue}
           onChange={(event) => setComposerValue(event.target.value)}
           onKeyDown={onComposerKeyDown}

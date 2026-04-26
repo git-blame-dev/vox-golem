@@ -654,6 +654,8 @@ describe('App', () => {
   })
 
   it('plays the configured start-listening cue path from startup state', async () => {
+    const stop = vi.fn()
+    let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
     const playedSources: string[] = []
 
     class FakeAudio {
@@ -679,6 +681,11 @@ describe('App', () => {
       return nowMs
     }
 
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      onFrame = options.onFrame
+      return { stop }
+    })
+
     window.__TAURI_INTERNALS__ = {
       invoke: async (command) => {
         if (command === 'get_startup_state') {
@@ -697,7 +704,7 @@ describe('App', () => {
           }
         }
 
-        if (command === 'begin_listening') {
+        if (command === 'ingest_audio_frame') {
           return {
             runtime_phase: 'listening',
             transcription_ready_samples: null,
@@ -734,10 +741,14 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    const startListeningButton = getControlButton(container, 'Start listening')
 
     await act(async () => {
-      startListeningButton.click()
+      getAutoStopToggle(container).click()
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      await onFrame?.([0.04, -0.04, 0.04, -0.04])
       await Promise.resolve()
     })
 
@@ -757,6 +768,9 @@ describe('App', () => {
   })
 
   it('shows wake confidence badge while listening when telemetry includes wake confidence', async () => {
+    const stop = vi.fn()
+    let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
+
     class FakeAudio {
       play(): Promise<void> {
         return Promise.resolve()
@@ -766,6 +780,11 @@ describe('App', () => {
     Object.defineProperty(globalThis, 'Audio', {
       configurable: true,
       value: FakeAudio,
+    })
+
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      onFrame = options.onFrame
+      return { stop }
     })
 
     window.__TAURI_INTERNALS__ = {
@@ -786,12 +805,12 @@ describe('App', () => {
           }
         }
 
-        if (command === 'begin_listening') {
+        if (command === 'ingest_audio_frame') {
           return {
             runtime_phase: 'listening',
             transcription_ready_samples: null,
             transcript_text: null,
-            last_activity_ms: 100,
+            last_activity_ms: Date.now(),
             capturing_utterance: true,
             preroll_samples: 0,
             utterance_samples: 3,
@@ -809,7 +828,7 @@ describe('App', () => {
     const { container } = await renderApp()
 
     await act(async () => {
-      getControlButton(container, 'Start listening').click()
+      await onFrame?.([0.04, -0.04, 0.04, -0.04])
       await Promise.resolve()
     })
 
@@ -1968,7 +1987,8 @@ describe('App', () => {
 
     expect(startLiveAudioSourceMock).toHaveBeenCalledTimes(1)
     expect(container.textContent).toContain('live_audio:\ndefault microphone started')
-    expect(getControlButton(container, 'Start listening').disabled).toBe(true)
+    expect(container.querySelector('details.shell__manual-controls')).toBeNull()
+    expect(getControlButton(container, 'Stop listening and process').disabled).toBe(true)
   })
 
   it('does not auto-stop on silence when the toggle is disabled', async () => {
@@ -2058,7 +2078,24 @@ describe('App', () => {
   })
 
   it('surfaces raw runtime control rejection messages', async () => {
-    startLiveAudioSourceMock.mockRejectedValue(new Error('Permission denied'))
+    const stop = vi.fn()
+    let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
+
+    class FakeAudio {
+      play(): Promise<void> {
+        return Promise.resolve()
+      }
+    }
+
+    Object.defineProperty(globalThis, 'Audio', {
+      configurable: true,
+      value: FakeAudio,
+    })
+
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      onFrame = options.onFrame
+      return { stop }
+    })
 
     window.__TAURI_INTERNALS__ = {
       invoke: async (command) => {
@@ -2078,8 +2115,20 @@ describe('App', () => {
           }
         }
 
-        if (command === 'begin_listening') {
-          throw 'invalid transition: begin_listening from listening'
+        if (command === 'ingest_audio_frame') {
+          return {
+            runtime_phase: 'listening',
+            transcription_ready_samples: null,
+            transcript_text: null,
+            last_activity_ms: 1_000,
+            capturing_utterance: true,
+            preroll_samples: 4,
+            utterance_samples: 4,
+          }
+        }
+
+        if (command === 'mark_silence') {
+          throw 'utterance transcription failed: InvalidTranscript(EmptyText)'
         }
 
         throw new Error(`unexpected command: ${command}`)
@@ -2089,12 +2138,17 @@ describe('App', () => {
     const { container } = await renderApp()
 
     await act(async () => {
-      getControlButton(container, 'Start listening').click()
+      await onFrame?.([0.04, -0.04, 0.04, -0.04])
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      getControlButton(container, 'Stop listening and process').click()
       await Promise.resolve()
     })
 
     expect(container.textContent).toContain(
-      'Runtime control error (begin_listening): invalid transition: begin_listening from listening',
+      'Runtime control error (mark_silence): utterance transcription failed: InvalidTranscript(EmptyText)',
     )
   })
 })
@@ -2155,7 +2209,6 @@ function getControlButton(
     | 'Start mic'
     | 'Stop mic'
     | 'Stop listening and process'
-    | 'Start listening'
     | 'Reset to idle',
 ): HTMLButtonElement {
   const buttons = Array.from(container.querySelectorAll<HTMLButtonElement>('button'))
