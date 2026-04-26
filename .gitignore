@@ -1,5 +1,6 @@
 # Local workflow artifacts
 tasks/
+notes/
 AGENTS.md
 CLAUDE.md
 GEMINI.md
