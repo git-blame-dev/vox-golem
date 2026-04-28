@@ -1,6 +1,6 @@
 # VoxGolem
 
-VoxGolem is a local AI voice assistant that listens hands-free, stops automatically, and combines multiple frontier models for fast answers that improve in real time.
+VoxGolem is a local AI voice assistant that listens hands-free, stops automatically, and runs local model profiles so you can trade speed for reasoning depth.
 
 The Windows-first baseline MVP voice path is now in place: live mic capture feeds wake-word detection, backend-owned VAD, local Parakeet transcription, and the existing `opencode` execution path.
 
@@ -9,6 +9,7 @@ The Windows-first baseline MVP voice path is now in place: live mic capture feed
 - Captures voice with wake word plus automatic stop after silence.
 - Supports typed prompts in the same chat-style interface.
 - Shows transcript, verification state, and labeled command output.
+- Runs local Gemma-class profiles with a fast mode and a smarter slower mode.
 
 ## 🧠 Architecture Decisions
 
@@ -27,7 +28,8 @@ The Windows-first baseline MVP voice path is now in place: live mic capture feed
 - Wake-word detection: `livekit-wakeword`
 - End-of-speech detection: Silero VAD ONNX via `ort`
 - Local transcription: `transcribe-rs` (Parakeet v2)
-- Configuration: `serde` + `toml`
+- Local model inference: `llama.cpp` (`llama-server`) + GGUF models
+- Local model families: Gemma 3 and Gemma 4 profile variants
 
 ## 🗺️ Roadmap Checklist
 
@@ -35,27 +37,30 @@ The Windows-first baseline MVP voice path is now in place: live mic capture feed
 - ✅ Chat shell complete (top conversation view + bottom composer with keyboard send).
 - ✅ Voice pipeline complete (wake-word, silence stop, local Parakeet v2 STT).
 - ✅ Execution pipeline complete (`opencode` direct args + labeled output).
+- ✅ Local AI profile toggle complete (fast profile vs quality profile with local models).
 - ⬜ Progressive response mode complete (fast first answer, background refinement updates).
+- ⬜ Dual-profile simultaneous answering (run fast and quality models together, then update the response live as each model returns).
+- ⬜ Realistic voice output toggle (short, succinct spoken answers while preserving longer detailed text responses in chat).
+- ⬜ Android version.
 
 ## ⚙️ Required Local Assets
 
-The Windows runtime expects these configured local assets in `%APPDATA%\VoxGolem\config.toml`:
+The Windows runtime expects these local assets in `%APPDATA%\VoxGolem`:
 
-- `wake_word_model_path`: LiveKit-compatible wake-word classifier `.onnx` file
-- `parakeet_model_dir`: local Parakeet v2 model directory
-- `silero_vad_model`: local Silero VAD ONNX file
-- `silence_timeout_ms`: milliseconds of inactivity before listening transitions to processing (default `1500`)
-- `SOUL.md`: assistant identity and response-style prompt file at `%APPDATA%\VoxGolem\SOUL.md`
-- `start_listening_cue` and `stop_listening_cue`: cue audio files
-- `response_backend`: backend selector, currently `opencode` or `llama_cpp`
-- `[opencode].path`: local `opencode` executable when `response_backend = "opencode"`
-- `[llama_cpp].server_path`, `[llama_cpp].host`, `[llama_cpp].port`, and `[llama_cpp].fast_model_path`: required local llama.cpp runtime fields when `response_backend = "llama_cpp"`
-- `[llama_cpp].quality_model_path`: optional local llama.cpp model path that enables the `quality` profile
+- `SOUL.md`: assistant identity and response-style prompt file
+- `models/hey_livekit.onnx`: wake-word classifier
+- `models/parakeet-v2`: local Parakeet v2 model directory
+- `models/silero-vad.onnx`: local Silero VAD ONNX file
+- `llama/bin/llama-server.exe`: local llama.cpp runtime binary
+- `models/llama/*`: GGUF model files for fast and quality profile choices
+- `start-listening.wav` and `stop-listening.wav` (optional cue audio)
+- `state.toml` (app-managed selected profile state)
 
-For the current local Gemma desktop path, `%APPDATA%\VoxGolem` also needs:
+For a current local Gemma desktop setup, common model choices include:
 
-- `SOUL.md`
 - `models/llama/gemma-3-1b-it-Q4_K_M.gguf`
-- `models/llama/google_gemma-3-4b-it-Q6_K_L.gguf`
-- `llama/bin/llama-server.exe`
-- `state.toml` (written by the app, stores `selected_response_profile = "fast" | "quality"`)
+- `models/llama/gemma-3-1b-it-Q8_0.gguf`
+- `models/llama/google_gemma-4-E2B-it-Q2_K.gguf`
+- `models/llama/google_gemma-4-E2B-it-Q3_K_S.gguf`
+- `models/llama/google_gemma-4-E2B-it-Q8_0.gguf`
+- `models/llama/google_gemma-4-E4B-it-Q8_0.gguf`
