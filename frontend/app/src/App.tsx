@@ -1005,9 +1005,21 @@ function App() {
         />
         <div className="composer__actions">
           <span className="composer__hint">Enter to send, Shift+Enter for newline</span>
-          <button type="submit" className="composer__button" disabled={!canSend}>
-            Send
-          </button>
+          <div className="composer__send-side">
+            {wakeConfidence !== null ? (
+              <div
+                className={wakeConfidence >= 0.7 ? 'composer__wake composer__wake--high' : wakeConfidence >= 0.4 ? 'composer__wake composer__wake--medium' : 'composer__wake composer__wake--low'}
+                aria-live="polite"
+              >
+                <span className="composer__wake-primary">
+                  wake: {(wakeConfidence * 100).toFixed(0)}%
+                </span>
+              </div>
+            ) : null}
+            <button type="submit" className="composer__button" disabled={!canSend}>
+              Send
+            </button>
+          </div>
         </div>
       </form>
     </div>
