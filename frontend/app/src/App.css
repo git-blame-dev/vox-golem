@@ -221,6 +221,45 @@
   font-size: 0.8rem;
 }
 
+.composer__send-side {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.composer__wake {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 0.05rem;
+  padding: 0.2rem 0.45rem;
+  border-radius: 0.55rem;
+  border: 1px solid #c7d9f5;
+  background: #f3f8ff;
+  min-width: 6.2rem;
+}
+
+.composer__wake-primary {
+  font-size: 0.72rem;
+  line-height: 1.1;
+  color: #17324f;
+  font-weight: 600;
+}
+
+.composer__wake--low {
+  border-color: #d8dbe0;
+  background: #f8f9fb;
+}
+
+.composer__wake--medium {
+  border-color: #e5c37a;
+  background: #fff6e0;
+}
+
+.composer__wake--high {
+  border-color: #91d1ad;
+  background: #e9f8ef;
+}
+
 .composer__button {
   border: none;
   border-radius: 0.65rem;
@@ -259,6 +298,11 @@
   .composer__actions {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .composer__send-side {
+    width: 100%;
+    justify-content: space-between;
   }
 
   .composer__button {
