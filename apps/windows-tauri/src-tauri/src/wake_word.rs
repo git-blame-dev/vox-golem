@@ -5,8 +5,20 @@ const DETECTOR_SAMPLE_RATE_HZ: u64 = 16_000;
 const DETECTOR_INPUT_SAMPLE_RATE_HZ: u32 = 16_000;
 const DETECTOR_CHUNK_SAMPLES: usize = 1_280;
 const DETECTOR_WINDOW_SAMPLES: usize = 32_000;
+#[cfg(test)]
 const DETECTION_THRESHOLD: f32 = 0.68;
 const DETECTION_REQUIRED_CONSECUTIVE_HITS: usize = 1;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WakeWordScore {
+    pub label: String,
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WakeWordScoreSnapshot {
+    pub top_scores: Vec<WakeWordScore>,
+}
 
 pub struct WakeWordRuntime {
     inner: BufferedWakeWordRuntime<LiveKitDetector<Box<dyn WakeWordScorer + Send>>>,
@@ -19,11 +31,12 @@ pub struct WakeWordDetection {
 }
 
 impl WakeWordRuntime {
-    pub fn new(wake_word_model_path: &Path) -> Result<Self, String> {
+    pub fn new(wake_word_model_path: &Path, detection_threshold: f32) -> Result<Self, String> {
         Ok(Self {
-            inner: BufferedWakeWordRuntime::new(LiveKitDetector::new(Box::new(
-                LiveKitScorer::new(wake_word_model_path)?,
-            ))),
+            inner: BufferedWakeWordRuntime::new(LiveKitDetector::new(
+                Box::new(LiveKitScorer::new(wake_word_model_path)?),
+                detection_threshold,
+            )),
         })
     }
 
@@ -32,6 +45,10 @@ impl WakeWordRuntime {
         frame: &[f32],
     ) -> Result<Option<WakeWordDetection>, String> {
         self.inner.process_sleeping_frame(frame)
+    }
+
+    pub fn latest_score_snapshot(&self) -> Option<WakeWordScoreSnapshot> {
+        self.inner.latest_score_snapshot()
     }
 
     pub fn reset(&mut self) {
@@ -55,6 +72,7 @@ impl WakeWordRuntime {
 trait WakeWordDetector {
     fn samples_per_frame(&self) -> usize;
     fn process_samples(&mut self, samples: &[f32]) -> Result<Option<f32>, String>;
+    fn latest_score_snapshot(&self) -> Option<WakeWordScoreSnapshot>;
     fn reset(&mut self);
 }
 
@@ -122,14 +140,18 @@ impl<D: WakeWordDetector> BufferedWakeWordRuntime<D> {
         self.pending_samples.clear();
         self.detector.reset();
     }
+
+    fn latest_score_snapshot(&self) -> Option<WakeWordScoreSnapshot> {
+        self.detector.latest_score_snapshot()
+    }
 }
 
 trait WakeWordScorer: Send {
-    fn score(&mut self, audio_chunk: &[i16]) -> Result<f32, String>;
+    fn score(&mut self, audio_chunk: &[i16]) -> Result<WakeWordScoreSnapshot, String>;
 }
 
 impl WakeWordScorer for Box<dyn WakeWordScorer + Send> {
-    fn score(&mut self, audio_chunk: &[i16]) -> Result<f32, String> {
+    fn score(&mut self, audio_chunk: &[i16]) -> Result<WakeWordScoreSnapshot, String> {
         self.as_mut().score(audio_chunk)
     }
 }
@@ -151,19 +173,31 @@ impl LiveKitScorer {
 }
 
 impl WakeWordScorer for LiveKitScorer {
-    fn score(&mut self, audio_chunk: &[i16]) -> Result<f32, String> {
+    fn score(&mut self, audio_chunk: &[i16]) -> Result<WakeWordScoreSnapshot, String> {
         let predictions = self
             .model
             .predict(audio_chunk)
             .map_err(|error| format!("wake word prediction failed: {error}"))?;
 
-        Ok(predictions.values().copied().fold(0.0, f32::max))
+        let mut top_scores = predictions
+            .into_iter()
+            .map(|(label, confidence)| WakeWordScore { label, confidence })
+            .collect::<Vec<_>>();
+        top_scores.sort_by(|left, right| {
+            right
+                .confidence
+                .partial_cmp(&left.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        top_scores.truncate(2);
+
+        Ok(WakeWordScoreSnapshot { top_scores })
     }
 }
 
 #[cfg(test)]
 impl WakeWordScorer for AlwaysFailScorer {
-    fn score(&mut self, _audio_chunk: &[i16]) -> Result<f32, String> {
+    fn score(&mut self, _audio_chunk: &[i16]) -> Result<WakeWordScoreSnapshot, String> {
         Err(String::from("synthetic wake word scorer failure"))
     }
 }
@@ -177,15 +211,16 @@ struct LiveKitDetector<S> {
     required_consecutive_hits: usize,
     consecutive_hits: usize,
     consecutive_floor_score: Option<f32>,
+    last_score_snapshot: Option<WakeWordScoreSnapshot>,
 }
 
 impl<S: WakeWordScorer> LiveKitDetector<S> {
-    fn new(scorer: S) -> Self {
+    fn new(scorer: S, detection_threshold: f32) -> Self {
         Self::with_settings(
             scorer,
             DETECTOR_CHUNK_SAMPLES,
             DETECTOR_WINDOW_SAMPLES,
-            DETECTION_THRESHOLD,
+            detection_threshold,
             DETECTION_REQUIRED_CONSECUTIVE_HITS,
         )
     }
@@ -206,6 +241,7 @@ impl<S: WakeWordScorer> LiveKitDetector<S> {
             required_consecutive_hits,
             consecutive_hits: 0,
             consecutive_floor_score: None,
+            last_score_snapshot: None,
         }
     }
 }
@@ -228,7 +264,13 @@ impl<S: WakeWordScorer> WakeWordDetector for LiveKitDetector<S> {
             return Ok(None);
         }
 
-        let score = self.scorer.score(&self.rolling_samples)?;
+        let score_snapshot = self.scorer.score(&self.rolling_samples)?;
+        let score = score_snapshot
+            .top_scores
+            .first()
+            .map(|entry| entry.confidence)
+            .unwrap_or(0.0);
+        self.last_score_snapshot = Some(score_snapshot);
         if score >= self.detection_threshold {
             self.consecutive_floor_score = Some(
                 self.consecutive_floor_score
@@ -247,10 +289,15 @@ impl<S: WakeWordScorer> WakeWordDetector for LiveKitDetector<S> {
         Ok(None)
     }
 
+    fn latest_score_snapshot(&self) -> Option<WakeWordScoreSnapshot> {
+        self.last_score_snapshot.clone()
+    }
+
     fn reset(&mut self) {
         self.rolling_samples.clear();
         self.consecutive_hits = 0;
         self.consecutive_floor_score = None;
+        self.last_score_snapshot = None;
     }
 }
 
@@ -272,7 +319,8 @@ fn samples_to_ms(samples: u64) -> u64 {
 mod tests {
     use super::{
         normalize_sample_to_i16, samples_to_ms, BufferedWakeWordRuntime, LiveKitDetector,
-        WakeWordDetection, WakeWordDetector, WakeWordRuntime, WakeWordScorer, DETECTION_THRESHOLD,
+        WakeWordDetection, WakeWordDetector, WakeWordRuntime, WakeWordScore, WakeWordScoreSnapshot,
+        WakeWordScorer, DETECTION_THRESHOLD,
     };
     use hound::WavReader;
     use std::path::{Path, PathBuf};
@@ -302,6 +350,10 @@ mod tests {
             self.call_count = 0;
             self.reset_count += 1;
         }
+
+        fn latest_score_snapshot(&self) -> Option<WakeWordScoreSnapshot> {
+            None
+        }
     }
 
     struct FakeScorer {
@@ -317,9 +369,14 @@ mod tests {
     }
 
     impl WakeWordScorer for FakeScorer {
-        fn score(&mut self, audio_chunk: &[i16]) -> Result<f32, String> {
+        fn score(&mut self, audio_chunk: &[i16]) -> Result<WakeWordScoreSnapshot, String> {
             self.seen_chunks.push(audio_chunk.to_vec());
-            Ok(self.scores.remove(0))
+            Ok(WakeWordScoreSnapshot {
+                top_scores: vec![WakeWordScore {
+                    label: String::from("fake"),
+                    confidence: self.scores.remove(0),
+                }],
+            })
         }
     }
 
@@ -341,6 +398,10 @@ mod tests {
         fn reset(&mut self) {
             self.call_count = 0;
             self.reset_count += 1;
+        }
+
+        fn latest_score_snapshot(&self) -> Option<WakeWordScoreSnapshot> {
+            None
         }
     }
 
@@ -497,8 +558,11 @@ mod tests {
 
     #[test]
     fn real_runtime_detects_positive_fixture_with_framed_audio() {
-        let mut runtime = WakeWordRuntime::new(&fixtures_dir().join("hey_livekit.onnx"))
-            .expect("official livekit classifier should load");
+        let mut runtime = WakeWordRuntime::new(
+            &fixtures_dir().join("hey_livekit.onnx"),
+            DETECTION_THRESHOLD,
+        )
+        .expect("official livekit classifier should load");
         let mut samples = read_wav_f32(&fixtures_dir().join("positive.wav"));
         samples.extend(vec![0.0; 1_440]);
 
@@ -520,8 +584,11 @@ mod tests {
 
     #[test]
     fn real_runtime_ignores_negative_fixture_with_framed_audio() {
-        let mut runtime = WakeWordRuntime::new(&fixtures_dir().join("hey_livekit.onnx"))
-            .expect("official livekit classifier should load");
+        let mut runtime = WakeWordRuntime::new(
+            &fixtures_dir().join("hey_livekit.onnx"),
+            DETECTION_THRESHOLD,
+        )
+        .expect("official livekit classifier should load");
         let mut samples = read_wav_f32(&fixtures_dir().join("negative.wav"));
         samples.extend(vec![0.0; 1_440]);
 

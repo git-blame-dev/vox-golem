@@ -14,7 +14,12 @@ use crate::livekit_wakeword::{
 pub struct WakeWordModel {
     mel_model: MelspectrogramModel,
     emb_model: EmbeddingModel,
-    classifiers: HashMap<String, ort::session::Session>,
+    classifiers: HashMap<String, ClassifierModel>,
+}
+
+struct ClassifierModel {
+    session: ort::session::Session,
+    output_name: String,
 }
 
 impl WakeWordModel {
@@ -56,8 +61,14 @@ impl WakeWordModel {
         };
 
         let session = build_session_from_file(path)?;
-        validate_classifier_contract(&session)?;
-        self.classifiers.insert(name, session);
+        let output_name = validate_classifier_contract(&session)?;
+        self.classifiers.insert(
+            name,
+            ClassifierModel {
+                session,
+                output_name,
+            },
+        );
         Ok(())
     }
 
@@ -102,10 +113,10 @@ impl WakeWordModel {
         let emb_input = emb_sequence.insert_axis(Axis(0));
 
         let mut predictions = HashMap::new();
-        for (name, session) in &mut self.classifiers {
+        for (name, classifier) in &mut self.classifiers {
             let tensor = Tensor::from_array(emb_input.clone())?;
-            let outputs = session.run(ort::inputs!["embeddings" => tensor])?;
-            let raw = outputs["score"].try_extract_array::<f32>()?;
+            let outputs = classifier.session.run(ort::inputs![tensor])?;
+            let raw = outputs[classifier.output_name.as_str()].try_extract_array::<f32>()?;
             let score = raw.iter().copied().next().unwrap_or(0.0);
             predictions.insert(name.clone(), score);
         }
@@ -121,14 +132,23 @@ impl WakeWordModel {
     }
 }
 
-fn validate_classifier_contract(session: &ort::session::Session) -> Result<(), WakeWordError> {
+fn validate_classifier_contract(session: &ort::session::Session) -> Result<String, WakeWordError> {
     let input = session
         .inputs()
         .iter()
         .find(|input| input.name() == "embeddings")
+        .or_else(|| {
+            let inputs = session.inputs();
+            if inputs.len() == 1 {
+                inputs.first()
+            } else {
+                None
+            }
+        })
         .ok_or_else(|| {
             WakeWordError::InvalidModelContract(
-                "classifier model is missing expected `embeddings` input".to_string(),
+                "classifier model is missing expected `embeddings` input (and no single-input fallback available)"
+                    .to_string(),
             )
         })?;
     let input_shape = input.dtype().tensor_shape().ok_or_else(|| {
@@ -152,9 +172,18 @@ fn validate_classifier_contract(session: &ort::session::Session) -> Result<(), W
         .outputs()
         .iter()
         .find(|output| output.name() == "score")
+        .or_else(|| {
+            let outputs = session.outputs();
+            if outputs.len() == 1 {
+                outputs.first()
+            } else {
+                None
+            }
+        })
         .ok_or_else(|| {
             WakeWordError::InvalidModelContract(
-                "classifier model is missing expected `score` output".to_string(),
+                "classifier model is missing expected `score` output (and no single-output fallback available)"
+                    .to_string(),
             )
         })?;
     let output_shape = output.dtype().tensor_shape().ok_or_else(|| {
@@ -168,7 +197,7 @@ fn validate_classifier_contract(session: &ort::session::Session) -> Result<(), W
         )));
     }
 
-    Ok(())
+    Ok(output.name().to_string())
 }
 
 #[cfg(test)]
