@@ -9,6 +9,7 @@ const WINDOWS_CONFIG_FILE: &str = "config.toml";
 const WINDOWS_SOUL_FILE: &str = "SOUL.md";
 const DEFAULT_SILERO_VAD_MODEL: &str = "models/silero-vad.onnx";
 const DEFAULT_SILENCE_TIMEOUT_MS: u64 = 1_500;
+const DEFAULT_WAKE_WORD_DETECTION_THRESHOLD: f32 = 0.68;
 const MAX_JS_SAFE_INTEGER_U64: u64 = 9_007_199_254_740_991;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -19,6 +20,8 @@ struct RawConfig {
     silero_vad_model: Option<PathBuf>,
     #[serde(default = "default_silence_timeout_ms")]
     silence_timeout_ms: u64,
+    #[serde(default = "default_wake_word_detection_threshold")]
+    wake_word_detection_threshold: f32,
     response_backend: RawResponseBackend,
     #[serde(default)]
     opencode: Option<RawOpencodeConfig>,
@@ -54,12 +57,13 @@ struct RawLlamaCppConfig {
     quality_model_path: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfig {
     pub wake_word_model_path: PathBuf,
     pub parakeet_model_dir: PathBuf,
     pub silero_vad_model: PathBuf,
     pub silence_timeout_ms: u64,
+    pub wake_word_detection_threshold: f32,
     pub response_backend: ResponseBackendConfig,
 }
 
@@ -201,6 +205,7 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
             .unwrap_or_else(|| PathBuf::from(DEFAULT_SILERO_VAD_MODEL)),
     );
     let silence_timeout_ms = raw_config.silence_timeout_ms;
+    let wake_word_detection_threshold = raw_config.wake_word_detection_threshold;
 
     if silence_timeout_ms == 0 {
         return Err(ConfigError::ParseConfigFailed {
@@ -214,6 +219,22 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
             path: config_path.clone(),
             details: String::from(
                 "silence_timeout_ms must be less than or equal to 9_007_199_254_740_991",
+            ),
+        });
+    }
+
+    if !wake_word_detection_threshold.is_finite() {
+        return Err(ConfigError::ParseConfigFailed {
+            path: config_path.clone(),
+            details: String::from("wake_word_detection_threshold must be a finite number"),
+        });
+    }
+
+    if !(0.0..=1.0).contains(&wake_word_detection_threshold) {
+        return Err(ConfigError::ParseConfigFailed {
+            path: config_path.clone(),
+            details: String::from(
+                "wake_word_detection_threshold must be between 0.0 and 1.0 inclusive",
             ),
         });
     }
@@ -273,12 +294,17 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
         parakeet_model_dir,
         silero_vad_model,
         silence_timeout_ms,
+        wake_word_detection_threshold,
         response_backend,
     })
 }
 
 fn default_silence_timeout_ms() -> u64 {
     DEFAULT_SILENCE_TIMEOUT_MS
+}
+
+fn default_wake_word_detection_threshold() -> f32 {
+    DEFAULT_WAKE_WORD_DETECTION_THRESHOLD
 }
 
 fn resolve_config_path(config_dir: &Path, path: PathBuf) -> PathBuf {

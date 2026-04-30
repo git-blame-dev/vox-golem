@@ -834,8 +834,10 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                 .map(|guard| *guard)
                 .unwrap_or_else(|_| default_response_profile());
             let response_profile_switch_generation = Arc::new(AtomicU64::new(0));
-            let wake_word_runtime =
-                match wake_word::WakeWordRuntime::new(&config.wake_word_model_path) {
+            let wake_word_runtime = match wake_word::WakeWordRuntime::new(
+                &config.wake_word_model_path,
+                config.wake_word_detection_threshold,
+            ) {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         return build_startup_error_app_state(
@@ -1943,6 +1945,7 @@ mod tests {
             parakeet_model_dir: PathBuf::from("parakeet"),
             silero_vad_model: PathBuf::from("vad.onnx"),
             silence_timeout_ms: 1_500,
+            wake_word_detection_threshold: 0.68,
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
                 host: String::from("127.0.0.1"),
@@ -1992,6 +1995,7 @@ mod tests {
             parakeet_model_dir: PathBuf::from("parakeet"),
             silero_vad_model: PathBuf::from("vad.onnx"),
             silence_timeout_ms: 1_500,
+            wake_word_detection_threshold: 0.68,
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
                 host: String::from("127.0.0.1"),
@@ -2022,6 +2026,7 @@ mod tests {
             parakeet_model_dir: PathBuf::from("parakeet"),
             silero_vad_model: PathBuf::from("vad.onnx"),
             silence_timeout_ms: 1_500,
+            wake_word_detection_threshold: 0.68,
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
                 host: String::from("127.0.0.1"),
@@ -2132,6 +2137,7 @@ mod tests {
             parakeet_model_dir: PathBuf::from("parakeet"),
             silero_vad_model: PathBuf::from("vad.onnx"),
             silence_timeout_ms: 1_500,
+            wake_word_detection_threshold: 0.68,
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
                 host: String::from("127.0.0.1"),
@@ -2255,6 +2261,7 @@ mod tests {
             parakeet_model_dir: PathBuf::from("parakeet"),
             silero_vad_model: PathBuf::from("vad.onnx"),
             silence_timeout_ms: 1_500,
+            wake_word_detection_threshold: 0.68,
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
                 host: String::from("127.0.0.1"),
@@ -2356,6 +2363,7 @@ mod tests {
             parakeet_model_dir: PathBuf::from("parakeet"),
             silero_vad_model: PathBuf::from("vad.onnx"),
             silence_timeout_ms: 1_500,
+            wake_word_detection_threshold: 0.68,
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
                 host: String::from("127.0.0.1"),
@@ -3042,7 +3050,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let wake_word_model_path = temp_dir.path().join("missing-hey-livekit.onnx");
 
-        let error = WakeWordRuntime::new(&wake_word_model_path)
+        let error = WakeWordRuntime::new(&wake_word_model_path, 0.68)
             .err()
             .expect("missing model file should fail");
 
