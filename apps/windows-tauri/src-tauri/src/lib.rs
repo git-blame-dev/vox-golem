@@ -12,6 +12,8 @@ use tauri::{path::BaseDirectory, Manager};
 
 mod livekit_wakeword;
 mod transcription;
+#[allow(dead_code)]
+mod tts;
 mod voice_activity;
 mod wake_word;
 
@@ -170,6 +172,12 @@ struct SwitchResponseProfilePayload {
     supported_response_profiles: Vec<ResponseProfilePayload>,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct SetTtsEnabledPayload {
+    enabled: bool,
+    sample_rate_hz: u32,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum StartupStatePayload {
@@ -204,6 +212,14 @@ fn get_startup_state(app_state: tauri::State<'_, AppState>) -> StartupStatePaylo
         .lock()
         .expect("startup state lock should not be poisoned")
         .clone()
+}
+
+#[tauri::command]
+fn set_tts_enabled(enabled: bool) -> SetTtsEnabledPayload {
+    SetTtsEnabledPayload {
+        enabled,
+        sample_rate_hz: 22_050,
+    }
 }
 
 #[tauri::command]
@@ -1805,6 +1821,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_startup_state,
+            set_tts_enabled,
             switch_response_profile,
             submit_prompt,
             record_speech_activity,

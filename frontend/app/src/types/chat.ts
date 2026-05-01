@@ -54,21 +54,23 @@ export type StartupState =
       readonly runtimePhase: BackendRuntimePhase
       readonly voiceInputAvailable: boolean
       readonly voiceInputError: string | null
-      readonly silenceTimeoutMs: number
-      readonly message: string
-      readonly selectedResponseProfile: ResponseProfile
-      readonly supportedResponseProfiles: readonly ResponseProfile[]
-    }
-  | {
-      readonly kind: 'ready'
-      readonly cueAssetPaths: CueAssetPaths
+  readonly silenceTimeoutMs: number
+  readonly message: string
+  readonly selectedResponseProfile: ResponseProfile
+  readonly supportedResponseProfiles: readonly ResponseProfile[]
+  readonly ttsEnabled: boolean
+}
+| {
+  readonly kind: 'ready'
+  readonly cueAssetPaths: CueAssetPaths
       readonly runtimePhase: BackendRuntimePhase
       readonly voiceInputAvailable: boolean
-      readonly voiceInputError: string | null
-      readonly silenceTimeoutMs: number
-      readonly selectedResponseProfile: ResponseProfile
-      readonly supportedResponseProfiles: readonly ResponseProfile[]
-    }
+  readonly voiceInputError: string | null
+  readonly silenceTimeoutMs: number
+  readonly selectedResponseProfile: ResponseProfile
+  readonly supportedResponseProfiles: readonly ResponseProfile[]
+  readonly ttsEnabled: boolean
+}
   | { readonly kind: 'error'; readonly message: string }
 
 export type RuntimeStatus =
