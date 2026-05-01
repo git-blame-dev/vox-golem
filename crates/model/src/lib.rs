@@ -2,3 +2,4 @@
 #![deny(unused_must_use)]
 
 pub mod parakeet;
+pub mod tts;

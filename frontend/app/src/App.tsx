@@ -41,6 +41,7 @@ function App() {
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus>('initializing')
   const [composerValue, setComposerValue] = useState('')
   const [autoStopOnSilence, setAutoStopOnSilence] = useState(true)
+  const [ttsEnabled, setTtsEnabled] = useState(false)
   const [wakeConfidence, setWakeConfidence] = useState<number | null>(null)
   const [isSwitchingResponseProfile, setIsSwitchingResponseProfile] = useState(false)
   const [micStarting, setMicStarting] = useState(false)
@@ -189,6 +190,7 @@ function App() {
     runtimeStatus === 'sleeping' &&
     !micStarting &&
     !isSwitchingResponseProfile
+  const canToggleTts = startupState.kind === 'ready' && !isSwitchingResponseProfile
 
   useEffect(() => {
     autoStopOnSilenceRef.current = autoStopOnSilence
@@ -201,6 +203,11 @@ function App() {
   const applyStartupState = (nextState: StartupState): void => {
     startupStateRef.current = nextState
     setStartupState(nextState)
+    if (nextState.kind === 'ready' || nextState.kind === 'warming_model') {
+      setTtsEnabled(nextState.ttsEnabled)
+    } else {
+      setTtsEnabled(false)
+    }
 
     const nextRuntimeStatus = startupStateToRuntimeStatus(nextState)
     runtimeStatusRef.current = nextRuntimeStatus
@@ -798,6 +805,7 @@ function App() {
       message: `Switching response profile to ${getResponseProfileLabel(profile)}...`,
       selectedResponseProfile: profile,
       supportedResponseProfiles: currentState.supportedResponseProfiles,
+      ttsEnabled: currentState.ttsEnabled,
     }
 
     startupStateRef.current = warmingState
@@ -833,6 +841,32 @@ function App() {
       if (appActiveRef.current) {
         setIsSwitchingResponseProfile(false)
       }
+    }
+  }
+
+  const toggleTts = async (enabled: boolean): Promise<void> => {
+    try {
+      const payload = await invokeTauriCommand('set_tts_enabled', { enabled })
+
+      if (
+        typeof payload === 'object' &&
+        payload !== null &&
+        'enabled' in payload &&
+        typeof payload.enabled === 'boolean'
+      ) {
+        setTtsEnabled(payload.enabled)
+      } else {
+        setTtsEnabled(enabled)
+      }
+    } catch (error) {
+      setMessages((currentMessages) => [
+        ...currentMessages,
+        {
+          id: `system-tts-toggle-error-${Date.now()}`,
+          role: 'system',
+          content: `TTS toggle error: ${toDisplayErrorMessage(error)}`,
+        },
+      ])
     }
   }
 
@@ -1004,7 +1038,18 @@ function App() {
           rows={3}
         />
         <div className="composer__actions">
-          <span className="composer__hint">Enter to send, Shift+Enter for newline</span>
+          <label className="shell__toggle" htmlFor="tts-toggle">
+            <input
+              id="tts-toggle"
+              type="checkbox"
+              checked={ttsEnabled}
+              disabled={!canToggleTts}
+              onChange={(event) => {
+                void toggleTts(event.target.checked)
+              }}
+            />
+            <span>TTS</span>
+          </label>
           <div className="composer__send-side">
             {wakeConfidence !== null ? (
               <div

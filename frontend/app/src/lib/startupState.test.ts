@@ -33,6 +33,7 @@ describe('parseStartupState', () => {
       silenceTimeoutMs: 1500,
       selectedResponseProfile: 'fast',
       supportedResponseProfiles: ['fast', 'quality'],
+      ttsEnabled: false,
     })
   })
 
@@ -77,6 +78,7 @@ describe('parseStartupState', () => {
       message: 'Loading local Gemma model...',
       selectedResponseProfile: 'quality',
       supportedResponseProfiles: ['fast', 'quality'],
+      ttsEnabled: false,
     })
   })
 
@@ -223,6 +225,7 @@ describe('isStartupStateSettled', () => {
         message: 'Loading local Gemma model...',
         selectedResponseProfile: 'quality',
         supportedResponseProfiles: ['fast', 'quality'],
+        ttsEnabled: false,
       }),
     ).toBe(false)
   })
@@ -238,6 +241,7 @@ describe('isStartupStateSettled', () => {
         silenceTimeoutMs: 1500,
         selectedResponseProfile: 'quality',
         supportedResponseProfiles: ['fast', 'quality'],
+        ttsEnabled: false,
       }),
     ).toBe(true)
     expect(
@@ -260,6 +264,7 @@ describe('loadStartupState', () => {
       silenceTimeoutMs: 1500,
       selectedResponseProfile: 'fast',
       supportedResponseProfiles: ['fast'],
+      ttsEnabled: false,
     })
   })
 
@@ -292,6 +297,7 @@ describe('loadStartupState', () => {
       silenceTimeoutMs: 2300,
       selectedResponseProfile: 'fast',
       supportedResponseProfiles: ['fast', 'quality'],
+      ttsEnabled: false,
     })
   })
 

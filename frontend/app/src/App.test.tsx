@@ -116,6 +116,54 @@ describe('App', () => {
     expect(container.textContent).toContain('Placeholder response for: Line one')
   })
 
+  it('replaces composer hint with a TTS toggle and invokes backend toggle command', async () => {
+    const invoked: string[] = []
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command, args) => {
+        invoked.push(command)
+
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: true,
+            voice_input_error: null,
+            silence_timeout_ms: 1500,
+            selected_response_profile: 'fast',
+            supported_response_profiles: ['fast', 'quality'],
+            tts_enabled: false,
+          }
+        }
+
+        if (command === 'set_tts_enabled') {
+          expect(args).toEqual({ enabled: true })
+          return { enabled: true, sample_rate_hz: 22050 }
+        }
+
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    const ttsToggle = getTtsToggle(container)
+
+    expect(container.textContent).not.toContain('Enter to send, Shift+Enter for newline')
+    expect(ttsToggle.checked).toBe(false)
+
+    await act(async () => {
+      ttsToggle.click()
+      await Promise.resolve()
+    })
+
+    expect(invoked).toContain('set_tts_enabled')
+    expect(ttsToggle.checked).toBe(true)
+  })
+
   it('renders response profile dropdown from startup state', async () => {
     window.__TAURI_INTERNALS__ = {
       invoke: async (command) => {
@@ -2222,10 +2270,20 @@ function getControlButton(
 }
 
 function getAutoStopToggle(container: HTMLElement): HTMLInputElement {
-  const toggle = container.querySelector<HTMLInputElement>('input[type="checkbox"]')
+  const toggle = container.querySelector<HTMLInputElement>('.shell__toggle input[type="checkbox"]')
 
   if (toggle === null) {
     throw new Error('Missing auto stop on silence toggle')
+  }
+
+  return toggle
+}
+
+function getTtsToggle(container: HTMLElement): HTMLInputElement {
+  const toggle = container.querySelector<HTMLInputElement>('#tts-toggle')
+
+  if (toggle === null) {
+    throw new Error('Missing TTS toggle')
   }
 
   return toggle

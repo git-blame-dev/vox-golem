@@ -27,6 +27,7 @@ export function parseStartupState(payload: unknown): StartupState {
     const voiceInputError = payload['voice_input_error']
     const silenceTimeoutMs = parseSilenceTimeoutMs(payload['silence_timeout_ms'])
     const message = payload['message']
+    const ttsEnabled = parseTtsEnabled(payload['tts_enabled'])
 
     if (typeof voiceInputAvailable !== 'boolean') {
       throw new Error('Startup warming payload must include voice_input_available')
@@ -52,6 +53,7 @@ export function parseStartupState(payload: unknown): StartupState {
       message,
       selectedResponseProfile: responseProfileState.selectedResponseProfile,
       supportedResponseProfiles: responseProfileState.supportedResponseProfiles,
+      ttsEnabled,
     }
   }
 
@@ -59,6 +61,7 @@ export function parseStartupState(payload: unknown): StartupState {
     const voiceInputAvailable = payload['voice_input_available']
     const voiceInputError = payload['voice_input_error']
     const silenceTimeoutMs = parseSilenceTimeoutMs(payload['silence_timeout_ms'])
+    const ttsEnabled = parseTtsEnabled(payload['tts_enabled'])
 
     if (typeof voiceInputAvailable !== 'boolean') {
       throw new Error('Startup ready payload must include voice_input_available')
@@ -79,6 +82,7 @@ export function parseStartupState(payload: unknown): StartupState {
       silenceTimeoutMs,
       selectedResponseProfile: responseProfileState.selectedResponseProfile,
       supportedResponseProfiles: responseProfileState.supportedResponseProfiles,
+      ttsEnabled,
     }
   }
 
@@ -134,6 +138,7 @@ function buildDefaultStartupState(): StartupState {
     silenceTimeoutMs: DEFAULT_SILENCE_TIMEOUT_MS,
     selectedResponseProfile: DEFAULT_SELECTED_RESPONSE_PROFILE,
     supportedResponseProfiles: DEFAULT_SUPPORTED_RESPONSE_PROFILES,
+    ttsEnabled: false,
   }
 }
 
@@ -232,6 +237,18 @@ function parseSupportedResponseProfiles(payload: unknown): readonly ResponseProf
   }
 
   return Array.from(new Set(profiles))
+}
+
+function parseTtsEnabled(payload: unknown): boolean {
+  if (payload === undefined) {
+    return false
+  }
+
+  if (typeof payload !== 'boolean') {
+    throw new Error('Startup payload field `tts_enabled` must be a boolean when present')
+  }
+
+  return payload
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
