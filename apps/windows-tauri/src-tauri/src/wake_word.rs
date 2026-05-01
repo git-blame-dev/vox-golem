@@ -47,10 +47,6 @@ impl WakeWordRuntime {
         self.inner.process_sleeping_frame(frame)
     }
 
-    pub fn latest_score_snapshot(&self) -> Option<WakeWordScoreSnapshot> {
-        self.inner.latest_score_snapshot()
-    }
-
     pub fn reset(&mut self) {
         self.inner.reset();
     }
@@ -72,7 +68,6 @@ impl WakeWordRuntime {
 trait WakeWordDetector {
     fn samples_per_frame(&self) -> usize;
     fn process_samples(&mut self, samples: &[f32]) -> Result<Option<f32>, String>;
-    fn latest_score_snapshot(&self) -> Option<WakeWordScoreSnapshot>;
     fn reset(&mut self);
 }
 
@@ -141,9 +136,6 @@ impl<D: WakeWordDetector> BufferedWakeWordRuntime<D> {
         self.detector.reset();
     }
 
-    fn latest_score_snapshot(&self) -> Option<WakeWordScoreSnapshot> {
-        self.detector.latest_score_snapshot()
-    }
 }
 
 trait WakeWordScorer: Send {
@@ -211,7 +203,6 @@ struct LiveKitDetector<S> {
     required_consecutive_hits: usize,
     consecutive_hits: usize,
     consecutive_floor_score: Option<f32>,
-    last_score_snapshot: Option<WakeWordScoreSnapshot>,
 }
 
 impl<S: WakeWordScorer> LiveKitDetector<S> {
@@ -241,7 +232,6 @@ impl<S: WakeWordScorer> LiveKitDetector<S> {
             required_consecutive_hits,
             consecutive_hits: 0,
             consecutive_floor_score: None,
-            last_score_snapshot: None,
         }
     }
 }
@@ -270,7 +260,6 @@ impl<S: WakeWordScorer> WakeWordDetector for LiveKitDetector<S> {
             .first()
             .map(|entry| entry.confidence)
             .unwrap_or(0.0);
-        self.last_score_snapshot = Some(score_snapshot);
         if score >= self.detection_threshold {
             self.consecutive_floor_score = Some(
                 self.consecutive_floor_score
@@ -289,15 +278,10 @@ impl<S: WakeWordScorer> WakeWordDetector for LiveKitDetector<S> {
         Ok(None)
     }
 
-    fn latest_score_snapshot(&self) -> Option<WakeWordScoreSnapshot> {
-        self.last_score_snapshot.clone()
-    }
-
     fn reset(&mut self) {
         self.rolling_samples.clear();
         self.consecutive_hits = 0;
         self.consecutive_floor_score = None;
-        self.last_score_snapshot = None;
     }
 }
 
@@ -351,9 +335,6 @@ mod tests {
             self.reset_count += 1;
         }
 
-        fn latest_score_snapshot(&self) -> Option<WakeWordScoreSnapshot> {
-            None
-        }
     }
 
     struct FakeScorer {
@@ -400,9 +381,6 @@ mod tests {
             self.reset_count += 1;
         }
 
-        fn latest_score_snapshot(&self) -> Option<WakeWordScoreSnapshot> {
-            None
-        }
     }
 
     #[test]
