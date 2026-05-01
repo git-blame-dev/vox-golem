@@ -838,14 +838,14 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                 &config.wake_word_model_path,
                 config.wake_word_detection_threshold,
             ) {
-                    Ok(runtime) => runtime,
-                    Err(error) => {
-                        return build_startup_error_app_state(
-                            voice_pipeline_config,
-                            format!("failed to initialize wake word detector: {error}"),
-                        );
-                    }
-                };
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    return build_startup_error_app_state(
+                        voice_pipeline_config,
+                        format!("failed to initialize wake word detector: {error}"),
+                    );
+                }
+            };
             let mut voice_input_errors = Vec::new();
             let parakeet_runtime =
                 match transcription::ParakeetRuntime::load(&config.parakeet_model_dir) {

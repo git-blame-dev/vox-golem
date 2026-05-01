@@ -135,7 +135,6 @@ impl<D: WakeWordDetector> BufferedWakeWordRuntime<D> {
         self.pending_samples.clear();
         self.detector.reset();
     }
-
 }
 
 trait WakeWordScorer: Send {
@@ -334,7 +333,6 @@ mod tests {
             self.call_count = 0;
             self.reset_count += 1;
         }
-
     }
 
     struct FakeScorer {
@@ -380,7 +378,6 @@ mod tests {
             self.call_count = 0;
             self.reset_count += 1;
         }
-
     }
 
     #[test]
