@@ -159,6 +159,10 @@ impl LocalTtsRuntime {
         self.sample_rate_hz
     }
 
+    pub fn is_available(&self) -> bool {
+        self.sender.is_some()
+    }
+
     pub fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::Relaxed);
     }

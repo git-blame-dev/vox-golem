@@ -10,6 +10,7 @@ const startLiveAudioSourceMock = vi.spyOn(liveAudioSourceModule, 'startLiveAudio
 const mountedContainers: HTMLElement[] = []
 const mountedRoots: Root[] = []
 const originalAudio = globalThis.Audio
+const originalAudioContext = globalThis.AudioContext
 const originalDateNow = Date.now
 
 afterEach(() => {
@@ -32,6 +33,15 @@ afterEach(() => {
     Object.defineProperty(globalThis, 'Audio', {
       configurable: true,
       value: originalAudio,
+    })
+  }
+
+  if (originalAudioContext === undefined) {
+    Reflect.deleteProperty(globalThis, 'AudioContext')
+  } else {
+    Object.defineProperty(globalThis, 'AudioContext', {
+      configurable: true,
+      value: originalAudioContext,
     })
   }
 
@@ -131,7 +141,7 @@ describe('App', () => {
               stop_listening: 'resources/stop-listening.wav',
             },
             runtime_phase: 'sleeping',
-            voice_input_available: true,
+            voice_input_available: false,
             voice_input_error: null,
             silence_timeout_ms: 1500,
             selected_response_profile: 'fast',
@@ -162,6 +172,111 @@ describe('App', () => {
 
     expect(invoked).toContain('set_tts_enabled')
     expect(ttsToggle.checked).toBe(true)
+  })
+
+  it('synthesizes assistant response when TTS is enabled', async () => {
+    const invoked: string[] = []
+
+    class FakeAudioContext {
+      destination = {} as AudioDestinationNode
+
+      createBuffer(_channels: number, _length: number, _sampleRate: number): AudioBuffer {
+        return {
+          copyToChannel: () => {},
+        } as unknown as AudioBuffer
+      }
+
+      createBufferSource(): AudioBufferSourceNode {
+        return {
+          buffer: null,
+          connect: () => {},
+          onended: null,
+          start: function start(this: AudioBufferSourceNode) {
+            this.onended?.(new Event('ended'))
+          },
+        } as unknown as AudioBufferSourceNode
+      }
+
+      async close(): Promise<void> {}
+    }
+
+    Object.defineProperty(globalThis, 'AudioContext', {
+      configurable: true,
+      value: FakeAudioContext,
+    })
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command, args) => {
+        invoked.push(command)
+
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: true,
+            voice_input_error: null,
+            silence_timeout_ms: 1500,
+            selected_response_profile: 'fast',
+            supported_response_profiles: ['fast', 'quality'],
+            tts_enabled: false,
+          }
+        }
+
+        if (command === 'set_tts_enabled') {
+          return { enabled: true, sample_rate_hz: 22050 }
+        }
+
+        if (command === 'submit_prompt') {
+          expect(args).toEqual({ prompt: 'Hello voice' })
+          return {
+            events: [{ kind: 'text', text: 'Placeholder response for: Hello voice' }],
+            stderr: '',
+            exit_code: 0,
+            runtime_phase: 'sleeping',
+          }
+        }
+
+        if (command === 'synthesize_local_tts') {
+          expect(args).toEqual({ text: 'Placeholder response for: Hello voice' })
+          return {
+            pcm_f32: [0.0, 0.1, -0.1],
+            sample_rate_hz: 22050,
+            duration_ms: 1,
+          }
+        }
+
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    const ttsToggle = getTtsToggle(container)
+    const composer = getComposer(container)
+    const sendButton = getSendButton(container)
+
+    await act(async () => {
+      ttsToggle.click()
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      setTextAreaValue(composer, 'Hello voice')
+    })
+
+    await act(async () => {
+      sendButton.click()
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+
+    expect(invoked).toContain('synthesize_local_tts')
   })
 
   it('renders response profile dropdown from startup state', async () => {
