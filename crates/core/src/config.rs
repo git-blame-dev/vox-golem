@@ -10,6 +10,9 @@ const WINDOWS_SOUL_FILE: &str = "SOUL.md";
 const DEFAULT_SILERO_VAD_MODEL: &str = "models/silero-vad.onnx";
 const DEFAULT_SILENCE_TIMEOUT_MS: u64 = 1_500;
 const DEFAULT_WAKE_WORD_DETECTION_THRESHOLD: f32 = 0.68;
+const DEFAULT_TTS_WORKER_COUNT: usize = 1;
+const DEFAULT_TTS_MAX_QUEUE: usize = 8;
+const DEFAULT_TTS_SAMPLE_RATE_HZ: u32 = 22_050;
 const MAX_JS_SAFE_INTEGER_U64: u64 = 9_007_199_254_740_991;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -27,6 +30,8 @@ struct RawConfig {
     opencode: Option<RawOpencodeConfig>,
     #[serde(default)]
     llama_cpp: Option<RawLlamaCppConfig>,
+    #[serde(default)]
+    tts: Option<RawTtsConfig>,
     #[serde(default, rename = "start_listening_cue")]
     _start_listening_cue: Option<PathBuf>,
     #[serde(default, rename = "stop_listening_cue")]
@@ -57,6 +62,20 @@ struct RawLlamaCppConfig {
     quality_model_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTtsConfig {
+    #[serde(default)]
+    enabled: bool,
+    model_path: PathBuf,
+    #[serde(default = "default_tts_worker_count")]
+    worker_count: usize,
+    #[serde(default = "default_tts_max_queue")]
+    max_queue: usize,
+    #[serde(default = "default_tts_sample_rate_hz")]
+    sample_rate_hz: u32,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfig {
     pub wake_word_model_path: PathBuf,
@@ -64,7 +83,17 @@ pub struct RuntimeConfig {
     pub silero_vad_model: PathBuf,
     pub silence_timeout_ms: u64,
     pub wake_word_detection_threshold: f32,
+    pub local_tts: LocalTtsConfig,
     pub response_backend: ResponseBackendConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalTtsConfig {
+    pub enabled: bool,
+    pub model_path: PathBuf,
+    pub worker_count: usize,
+    pub max_queue: usize,
+    pub sample_rate_hz: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,6 +272,54 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
     validate_existing_directory(&parakeet_model_dir, "parakeet_model_dir")?;
     validate_existing_file(&silero_vad_model, "silero_vad_model")?;
 
+    let local_tts = match raw_config.tts {
+        Some(raw_tts) => {
+            let model_path = resolve_config_path(&config_dir, raw_tts.model_path);
+            validate_existing_file(&model_path, "tts.model_path")?;
+
+            if raw_tts.worker_count == 0 {
+                return Err(ConfigError::ParseConfigFailed {
+                    path: config_path.clone(),
+                    details: String::from("tts.worker_count must be greater than zero"),
+                });
+            }
+
+            if raw_tts.max_queue == 0 {
+                return Err(ConfigError::ParseConfigFailed {
+                    path: config_path.clone(),
+                    details: String::from("tts.max_queue must be greater than zero"),
+                });
+            }
+
+            if raw_tts.sample_rate_hz == 0 {
+                return Err(ConfigError::ParseConfigFailed {
+                    path: config_path.clone(),
+                    details: String::from("tts.sample_rate_hz must be greater than zero"),
+                });
+            }
+
+            LocalTtsConfig {
+                enabled: raw_tts.enabled,
+                model_path,
+                worker_count: raw_tts.worker_count,
+                max_queue: raw_tts.max_queue,
+                sample_rate_hz: raw_tts.sample_rate_hz,
+            }
+        }
+        None => {
+            let model_path =
+                resolve_config_path(&config_dir, PathBuf::from("models/tts/jarvis.onnx"));
+
+            LocalTtsConfig {
+                enabled: false,
+                model_path,
+                worker_count: DEFAULT_TTS_WORKER_COUNT,
+                max_queue: DEFAULT_TTS_MAX_QUEUE,
+                sample_rate_hz: DEFAULT_TTS_SAMPLE_RATE_HZ,
+            }
+        }
+    };
+
     let response_backend = match raw_config.response_backend {
         RawResponseBackend::Opencode => {
             let raw_opencode = raw_config
@@ -295,6 +372,7 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
         silero_vad_model,
         silence_timeout_ms,
         wake_word_detection_threshold,
+        local_tts,
         response_backend,
     })
 }
@@ -305,6 +383,18 @@ fn default_silence_timeout_ms() -> u64 {
 
 fn default_wake_word_detection_threshold() -> f32 {
     DEFAULT_WAKE_WORD_DETECTION_THRESHOLD
+}
+
+fn default_tts_worker_count() -> usize {
+    DEFAULT_TTS_WORKER_COUNT
+}
+
+fn default_tts_max_queue() -> usize {
+    DEFAULT_TTS_MAX_QUEUE
+}
+
+fn default_tts_sample_rate_hz() -> u32 {
+    DEFAULT_TTS_SAMPLE_RATE_HZ
 }
 
 fn resolve_config_path(config_dir: &Path, path: PathBuf) -> PathBuf {
@@ -718,6 +808,83 @@ mod tests {
                 path: opencode_path,
             }
         );
+    }
+
+    #[test]
+    fn reports_missing_required_tts_model_file() {
+        let temp = TempDir::new();
+        let model_dir = temp.path().join("models");
+        let wake_word_model_path = model_dir.join("hey_livekit.onnx");
+        let silero_vad_model = model_dir.join("silero-vad.onnx");
+        let missing_tts_model_path = model_dir.join("tts").join("jarvis.onnx");
+        let opencode_path = temp.path().join("opencode.exe");
+        let config_path = temp.path().join("config.toml");
+
+        fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
+        create_file(&wake_word_model_path);
+        create_file(&silero_vad_model);
+        create_file(&opencode_path);
+
+        fs::write(
+            &config_path,
+            format!(
+                "wake_word_model_path = \"{}\"\nparakeet_model_dir = \"{}\"\nsilero_vad_model = \"{}\"\nresponse_backend = \"opencode\"\n\n[opencode]\npath = \"{}\"\n\n[tts]\nenabled = true\nmodel_path = \"{}\"\nworker_count = 1\nmax_queue = 8\nsample_rate_hz = 22050\n",
+                escape_path(&wake_word_model_path),
+                escape_path(&model_dir),
+                escape_path(&silero_vad_model),
+                escape_path(&opencode_path),
+                escape_path(&missing_tts_model_path),
+            ),
+        )
+        .expect("config fixture should be written");
+
+        let result = load_runtime_config(Some(&config_path));
+
+        assert_eq!(
+            result,
+            Err(ConfigError::MissingFile {
+                field: "tts.model_path",
+                path: missing_tts_model_path,
+            })
+        );
+    }
+
+    #[test]
+    fn loads_valid_tts_config_when_present() {
+        let temp = TempDir::new();
+        let model_dir = temp.path().join("models");
+        let wake_word_model_path = model_dir.join("hey_livekit.onnx");
+        let silero_vad_model = model_dir.join("silero-vad.onnx");
+        let tts_model_path = model_dir.join("tts").join("jarvis.onnx");
+        let opencode_path = temp.path().join("opencode.exe");
+        let config_path = temp.path().join("config.toml");
+
+        fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
+        create_file(&wake_word_model_path);
+        create_file(&silero_vad_model);
+        create_file(&tts_model_path);
+        create_file(&opencode_path);
+
+        fs::write(
+            &config_path,
+            format!(
+                "wake_word_model_path = \"{}\"\nparakeet_model_dir = \"{}\"\nsilero_vad_model = \"{}\"\nresponse_backend = \"opencode\"\n\n[opencode]\npath = \"{}\"\n\n[tts]\nenabled = true\nmodel_path = \"{}\"\nworker_count = 2\nmax_queue = 16\nsample_rate_hz = 24000\n",
+                escape_path(&wake_word_model_path),
+                escape_path(&model_dir),
+                escape_path(&silero_vad_model),
+                escape_path(&opencode_path),
+                escape_path(&tts_model_path),
+            ),
+        )
+        .expect("config fixture should be written");
+
+        let result = load_runtime_config(Some(&config_path)).expect("valid config should load");
+
+        assert!(result.local_tts.enabled);
+        assert_eq!(result.local_tts.model_path, tts_model_path);
+        assert_eq!(result.local_tts.worker_count, 2);
+        assert_eq!(result.local_tts.max_queue, 16);
+        assert_eq!(result.local_tts.sample_rate_hz, 24_000);
     }
 
     #[test]

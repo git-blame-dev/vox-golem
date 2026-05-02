@@ -545,6 +545,15 @@ function App() {
 
       setMessages((currentMessages) => [...currentMessages, ...nextMessages])
       applyRuntimeStatus(toRuntimeStatus(result.runtimePhase))
+
+      const assistantMessage = [...nextMessages].reverse().find((message) => message.role === 'assistant')
+      if (
+        ttsEnabled &&
+        assistantMessage !== undefined &&
+        assistantMessage.content.trim().length > 0
+      ) {
+        void synthesizeAndPlayAssistantReply(assistantMessage.content)
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Prompt execution failed'
 
@@ -555,6 +564,57 @@ function App() {
           id: `system-exec-error-${Date.now()}`,
           role: 'system',
           content: `Execution error: ${message}`,
+        },
+      ])
+    }
+  }
+
+  const synthesizeAndPlayAssistantReply = async (text: string): Promise<void> => {
+    try {
+      const payload = await invokeTauriCommand('synthesize_local_tts', { text })
+
+      if (
+        !isRecord(payload) ||
+        !Array.isArray(payload['pcm_f32']) ||
+        typeof payload['sample_rate_hz'] !== 'number' ||
+        payload['sample_rate_hz'] <= 0 ||
+        !Number.isFinite(payload['sample_rate_hz'])
+      ) {
+        throw new Error('TTS synthesis payload is invalid')
+      }
+
+      const audioContext = new AudioContext()
+      const sampleRate = Math.trunc(payload['sample_rate_hz'])
+      const pcm = Float32Array.from(
+        payload['pcm_f32'].map((sample) =>
+          typeof sample === 'number' && Number.isFinite(sample) ? sample : 0,
+        ),
+      )
+
+      if (pcm.length === 0) {
+        await audioContext.close()
+        return
+      }
+
+      const buffer = audioContext.createBuffer(1, pcm.length, sampleRate)
+      buffer.copyToChannel(pcm, 0)
+      const source = audioContext.createBufferSource()
+      source.buffer = buffer
+      source.connect(audioContext.destination)
+
+      await new Promise<void>((resolve) => {
+        source.onended = () => resolve()
+        source.start()
+      })
+
+      await audioContext.close()
+    } catch (error) {
+      setMessages((currentMessages) => [
+        ...currentMessages,
+        {
+          id: `system-tts-synthesis-error-${Date.now()}`,
+          role: 'system',
+          content: `TTS synthesis error: ${toDisplayErrorMessage(error)}`,
         },
       ])
     }
@@ -845,6 +905,9 @@ function App() {
   }
 
   const toggleTts = async (enabled: boolean): Promise<void> => {
+    const previousEnabled = ttsEnabled
+    setTtsEnabled(enabled)
+
     try {
       const payload = await invokeTauriCommand('set_tts_enabled', { enabled })
 
@@ -859,6 +922,7 @@ function App() {
         setTtsEnabled(enabled)
       }
     } catch (error) {
+      setTtsEnabled(previousEnabled)
       setMessages((currentMessages) => [
         ...currentMessages,
         {
@@ -1099,6 +1163,10 @@ function toDisplayErrorMessage(error: unknown): string {
   }
 
   return String(error)
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
 }
 
 function startupStateToRuntimeStatus(startupState: StartupState): RuntimeStatus {

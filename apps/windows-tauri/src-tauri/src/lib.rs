@@ -53,6 +53,7 @@ struct AppState {
     wake_word_runtime: Option<Mutex<wake_word::WakeWordRuntime>>,
     voice_activity_runtime: Option<Mutex<voice_activity::VoiceActivityRuntime>>,
     parakeet_runtime: Option<Mutex<transcription::ParakeetRuntime>>,
+    local_tts_runtime: Option<tts::LocalTtsRuntime>,
     llama_cpp_runtime: Arc<Mutex<Option<voxgolem_platform::llama_cpp::LlamaCppRuntime>>>,
     llama_cpp_conversation: Mutex<Vec<LlamaConversationTurn>>,
     llama_cpp_system_prompt: Option<String>,
@@ -178,6 +179,13 @@ struct SetTtsEnabledPayload {
     sample_rate_hz: u32,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct SynthesizeLocalTtsPayload {
+    pcm_f32: Vec<f32>,
+    sample_rate_hz: u32,
+    duration_ms: u64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum StartupStatePayload {
@@ -190,6 +198,7 @@ enum StartupStatePayload {
         message: String,
         selected_response_profile: ResponseProfilePayload,
         supported_response_profiles: Vec<ResponseProfilePayload>,
+        tts_enabled: bool,
     },
     Ready {
         cue_asset_paths: CueAssetPathsPayload,
@@ -199,6 +208,7 @@ enum StartupStatePayload {
         silence_timeout_ms: u64,
         selected_response_profile: ResponseProfilePayload,
         supported_response_profiles: Vec<ResponseProfilePayload>,
+        tts_enabled: bool,
     },
     Error {
         message: String,
@@ -215,11 +225,44 @@ fn get_startup_state(app_state: tauri::State<'_, AppState>) -> StartupStatePaylo
 }
 
 #[tauri::command]
-fn set_tts_enabled(enabled: bool) -> SetTtsEnabledPayload {
-    SetTtsEnabledPayload {
-        enabled,
-        sample_rate_hz: 22_050,
+fn set_tts_enabled(
+    enabled: bool,
+    app_state: tauri::State<'_, AppState>,
+) -> Result<SetTtsEnabledPayload, String> {
+    let runtime = app_state
+        .local_tts_runtime
+        .as_ref()
+        .ok_or_else(|| String::from("local tts runtime is not available"))?;
+
+    if enabled && !runtime.is_available() {
+        return Err(String::from("local tts runtime is not available"));
     }
+
+    runtime.set_enabled(enabled);
+
+    Ok(SetTtsEnabledPayload {
+        enabled: runtime.is_enabled(),
+        sample_rate_hz: runtime.sample_rate_hz(),
+    })
+}
+
+#[tauri::command]
+fn synthesize_local_tts(
+    text: String,
+    app_state: tauri::State<'_, AppState>,
+) -> Result<SynthesizeLocalTtsPayload, String> {
+    let runtime = app_state
+        .local_tts_runtime
+        .as_ref()
+        .ok_or_else(|| String::from("local tts runtime is not available"))?;
+
+    let audio = runtime.synthesize(&text)?;
+
+    Ok(SynthesizeLocalTtsPayload {
+        pcm_f32: audio.pcm_f32,
+        sample_rate_hz: audio.sample_rate_hz,
+        duration_ms: audio.duration_ms,
+    })
 }
 
 #[tauri::command]
@@ -330,6 +373,7 @@ fn switch_response_profile(
             message: String::from("Loading local Gemma model..."),
             selected_response_profile: profile,
             supported_response_profiles: startup_snapshot.supported_response_profiles.clone(),
+            tts_enabled: startup_snapshot.tts_enabled,
         };
     }
 
@@ -645,6 +689,7 @@ struct StartupSnapshot {
     voice_input_available: bool,
     voice_input_error: Option<String>,
     silence_timeout_ms: u64,
+    tts_enabled: bool,
     supported_response_profiles: Vec<ResponseProfilePayload>,
 }
 
@@ -660,6 +705,7 @@ fn startup_ready_state_from_snapshot(
         silence_timeout_ms: startup_snapshot.silence_timeout_ms,
         selected_response_profile,
         supported_response_profiles: startup_snapshot.supported_response_profiles.clone(),
+        tts_enabled: startup_snapshot.tts_enabled,
     }
 }
 
@@ -678,6 +724,7 @@ fn startup_snapshot_for_profile_switch(
             voice_input_available,
             voice_input_error,
             silence_timeout_ms,
+            tts_enabled,
             ..
         }
         | StartupStatePayload::Ready {
@@ -685,12 +732,14 @@ fn startup_snapshot_for_profile_switch(
             voice_input_available,
             voice_input_error,
             silence_timeout_ms,
+            tts_enabled,
             ..
         } => Ok(StartupSnapshot {
             cue_asset_paths: cue_asset_paths.clone(),
             voice_input_available: *voice_input_available,
             voice_input_error: voice_input_error.clone(),
             silence_timeout_ms: *silence_timeout_ms,
+            tts_enabled: *tts_enabled,
             supported_response_profiles,
         }),
         StartupStatePayload::Error { .. } => Err(format!(
@@ -862,6 +911,16 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                     );
                 }
             };
+            let local_tts_runtime = match initialize_local_tts_runtime(&config.local_tts) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    return build_startup_error_app_state(voice_pipeline_config, error);
+                }
+            };
+            let tts_enabled = local_tts_runtime
+                .as_ref()
+                .map(tts::LocalTtsRuntime::is_enabled)
+                .unwrap_or(false);
             let mut voice_input_errors = Vec::new();
             let parakeet_runtime =
                 match transcription::ParakeetRuntime::load(&config.parakeet_model_dir) {
@@ -917,6 +976,7 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                         message: String::from("Loading local Gemma model..."),
                         selected_response_profile: selected_profile_at_startup,
                         supported_response_profiles: supported_response_profiles.clone(),
+                        tts_enabled,
                     }
                 }
                 voxgolem_core::config::ResponseBackendConfig::Opencode { .. } => {
@@ -928,6 +988,7 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                         silence_timeout_ms: config.silence_timeout_ms,
                         selected_response_profile: selected_profile_at_startup,
                         supported_response_profiles: supported_response_profiles.clone(),
+                        tts_enabled,
                     }
                 }
             }));
@@ -989,6 +1050,7 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                                 silence_timeout_ms,
                                 selected_response_profile,
                                 supported_response_profiles,
+                                tts_enabled,
                             }
                         }
                         Err(error) => StartupStatePayload::Error {
@@ -1023,6 +1085,7 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                 wake_word_runtime: Some(Mutex::new(wake_word_runtime)),
                 voice_activity_runtime,
                 parakeet_runtime,
+                local_tts_runtime,
                 llama_cpp_runtime,
                 llama_cpp_conversation: Mutex::new(Vec::new()),
                 llama_cpp_system_prompt,
@@ -1030,6 +1093,29 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
         }
         Err(error) => {
             build_startup_error_app_state(fallback_voice_pipeline_config, error.to_string())
+        }
+    }
+}
+
+fn initialize_local_tts_runtime(
+    config: &voxgolem_core::config::LocalTtsConfig,
+) -> Result<Option<tts::LocalTtsRuntime>, String> {
+    let spec = tts::LocalTtsRuntimeSpec {
+        enabled: config.enabled,
+        model_path: Some(config.model_path.clone()),
+        worker_count: config.worker_count,
+        max_queue: config.max_queue,
+        sample_rate_hz: config.sample_rate_hz,
+    };
+
+    match tts::LocalTtsRuntime::new(spec) {
+        Ok(runtime) => Ok(Some(runtime)),
+        Err(error) if config.enabled => {
+            Err(format!("failed to initialize local tts runtime: {error}"))
+        }
+        Err(error) => {
+            eprintln!("local tts runtime unavailable while disabled: {error}");
+            Ok(None)
         }
     }
 }
@@ -1092,6 +1178,7 @@ fn build_startup_error_app_state(
         wake_word_runtime: None,
         voice_activity_runtime: None,
         parakeet_runtime: None,
+        local_tts_runtime: None,
         llama_cpp_runtime: Arc::new(Mutex::new(None)),
         llama_cpp_conversation: Mutex::new(Vec::new()),
         llama_cpp_system_prompt: None,
@@ -1822,6 +1909,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_startup_state,
             set_tts_enabled,
+            synthesize_local_tts,
             switch_response_profile,
             submit_prompt,
             record_speech_activity,
@@ -1963,6 +2051,13 @@ mod tests {
             silero_vad_model: PathBuf::from("vad.onnx"),
             silence_timeout_ms: 1_500,
             wake_word_detection_threshold: 0.68,
+            local_tts: voxgolem_core::config::LocalTtsConfig {
+                enabled: false,
+                model_path: PathBuf::from("models/tts/jarvis.onnx"),
+                worker_count: 1,
+                max_queue: 8,
+                sample_rate_hz: 22_050,
+            },
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
                 host: String::from("127.0.0.1"),
@@ -2013,6 +2108,13 @@ mod tests {
             silero_vad_model: PathBuf::from("vad.onnx"),
             silence_timeout_ms: 1_500,
             wake_word_detection_threshold: 0.68,
+            local_tts: voxgolem_core::config::LocalTtsConfig {
+                enabled: false,
+                model_path: PathBuf::from("models/tts/jarvis.onnx"),
+                worker_count: 1,
+                max_queue: 8,
+                sample_rate_hz: 22_050,
+            },
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
                 host: String::from("127.0.0.1"),
@@ -2044,6 +2146,13 @@ mod tests {
             silero_vad_model: PathBuf::from("vad.onnx"),
             silence_timeout_ms: 1_500,
             wake_word_detection_threshold: 0.68,
+            local_tts: voxgolem_core::config::LocalTtsConfig {
+                enabled: false,
+                model_path: PathBuf::from("models/tts/jarvis.onnx"),
+                worker_count: 1,
+                max_queue: 8,
+                sample_rate_hz: 22_050,
+            },
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
                 host: String::from("127.0.0.1"),
@@ -2155,6 +2264,13 @@ mod tests {
             silero_vad_model: PathBuf::from("vad.onnx"),
             silence_timeout_ms: 1_500,
             wake_word_detection_threshold: 0.68,
+            local_tts: voxgolem_core::config::LocalTtsConfig {
+                enabled: false,
+                model_path: PathBuf::from("models/tts/jarvis.onnx"),
+                worker_count: 1,
+                max_queue: 8,
+                sample_rate_hz: 22_050,
+            },
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
                 host: String::from("127.0.0.1"),
@@ -2279,6 +2395,13 @@ mod tests {
             silero_vad_model: PathBuf::from("vad.onnx"),
             silence_timeout_ms: 1_500,
             wake_word_detection_threshold: 0.68,
+            local_tts: voxgolem_core::config::LocalTtsConfig {
+                enabled: false,
+                model_path: PathBuf::from("models/tts/jarvis.onnx"),
+                worker_count: 1,
+                max_queue: 8,
+                sample_rate_hz: 22_050,
+            },
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
                 host: String::from("127.0.0.1"),
@@ -2381,6 +2504,13 @@ mod tests {
             silero_vad_model: PathBuf::from("vad.onnx"),
             silence_timeout_ms: 1_500,
             wake_word_detection_threshold: 0.68,
+            local_tts: voxgolem_core::config::LocalTtsConfig {
+                enabled: false,
+                model_path: PathBuf::from("models/tts/jarvis.onnx"),
+                worker_count: 1,
+                max_queue: 8,
+                sample_rate_hz: 22_050,
+            },
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
                 host: String::from("127.0.0.1"),
@@ -2624,6 +2754,7 @@ mod tests {
                 ResponseProfilePayload::Fast,
                 ResponseProfilePayload::Quality,
             ],
+            tts_enabled: false,
         }));
 
         assert_eq!(
@@ -2647,6 +2778,7 @@ mod tests {
                 ResponseProfilePayload::Fast,
                 ResponseProfilePayload::Quality,
             ],
+            tts_enabled: false,
         }));
 
         assert_eq!(
