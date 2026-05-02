@@ -1,3 +1,5 @@
+use std::env;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -197,6 +199,8 @@ impl LocalTtsRuntime {
 
 impl KokoroOnnxEngine {
     fn new(model_path: &Path, sample_rate_hz: u32) -> Result<Self, String> {
+        ensure_windows_cuda_path_for_onnxruntime();
+
         let mut builder = ort::session::Session::builder()
             .map_err(|error| format!("failed to create local tts ONNX session builder: {error}"))?
             .with_execution_providers([ort::ep::CUDA::default().build().error_on_failure()])
@@ -222,6 +226,69 @@ impl KokoroOnnxEngine {
             _session: session,
             sample_rate_hz,
         })
+    }
+}
+
+fn ensure_windows_cuda_path_for_onnxruntime() {
+    #[cfg(not(windows))]
+    {
+        return;
+    }
+
+    #[cfg(windows)]
+    {
+        let mut candidates = Vec::<PathBuf>::new();
+
+        if let Some(cuda_path) = env::var_os("CUDA_PATH") {
+            let bin = PathBuf::from(cuda_path).join("bin");
+            if bin.is_dir() {
+                candidates.push(bin);
+            }
+        }
+
+        let standard_cuda_root =
+            PathBuf::from(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA");
+        if let Ok(entries) = standard_cuda_root.read_dir() {
+            let mut versioned_cuda_dirs = entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().is_dir())
+                .filter_map(|entry| {
+                    let file_name = entry.file_name();
+                    let value = file_name.to_string_lossy();
+                    let version = value.strip_prefix('v')?;
+                    let parsed = version
+                        .split('.')
+                        .map(|part| part.parse::<u32>().ok())
+                        .collect::<Option<Vec<u32>>>()?;
+
+                    Some((parsed, entry.path()))
+                })
+                .collect::<Vec<(Vec<u32>, PathBuf)>>();
+
+            versioned_cuda_dirs
+                .sort_by(|(left_version, _), (right_version, _)| right_version.cmp(left_version));
+
+            for (_, dir) in versioned_cuda_dirs {
+                let bin = dir.join("bin");
+                if bin.is_dir() {
+                    candidates.push(bin);
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            return;
+        }
+
+        let mut combined = OsString::new();
+        for candidate in &candidates {
+            combined.push(candidate.as_os_str());
+            combined.push(";");
+        }
+
+        let existing_path = env::var_os("PATH").unwrap_or_default();
+        combined.push(existing_path);
+        env::set_var("PATH", combined);
     }
 }
 
