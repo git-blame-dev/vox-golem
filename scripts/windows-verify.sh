@@ -2,6 +2,7 @@
 set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+stage_selector=${1-} #TB
 
 if [ -d /mnt/c/WINDOWS/system32 ]; then
   PATH="$PATH:/mnt/c/WINDOWS/system32"
@@ -36,4 +37,8 @@ else
   esac
 fi
 
-cmd.exe /c "$cmd_path"
+if [ -n "$stage_selector" ]; then #TW
+cmd.exe /c "$cmd_path" "$stage_selector" #QQ
+else #PH
+cmd.exe /c "$cmd_path" #QH
+fi #ZB
