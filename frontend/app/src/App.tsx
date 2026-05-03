@@ -570,6 +570,8 @@ function App() {
   }
 
   const synthesizeAndPlayAssistantReply = async (text: string): Promise<void> => {
+    let audioContext: AudioContext | null = null
+
     try {
       const payload = await invokeTauriCommand('synthesize_local_tts', { text })
 
@@ -583,7 +585,10 @@ function App() {
         throw new Error('TTS synthesis payload is invalid')
       }
 
-      const audioContext = new AudioContext()
+      audioContext = new AudioContext()
+      if (audioContext.state === 'suspended') {
+        await audioContext.resume()
+      }
       const sampleRate = Math.trunc(payload['sample_rate_hz'])
       const pcm = Float32Array.from(
         payload['pcm_f32'].map((sample) =>
@@ -592,7 +597,6 @@ function App() {
       )
 
       if (pcm.length === 0) {
-        await audioContext.close()
         return
       }
 
@@ -606,8 +610,6 @@ function App() {
         source.onended = () => resolve()
         source.start()
       })
-
-      await audioContext.close()
     } catch (error) {
       setMessages((currentMessages) => [
         ...currentMessages,
@@ -617,6 +619,10 @@ function App() {
           content: `TTS synthesis error: ${toDisplayErrorMessage(error)}`,
         },
       ])
+    } finally {
+      if (audioContext !== null) {
+        await audioContext.close().catch(() => undefined)
+      }
     }
   }
 

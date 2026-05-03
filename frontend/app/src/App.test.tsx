@@ -177,8 +177,11 @@ describe('App', () => {
   it('synthesizes assistant response when TTS is enabled', async () => {
     const invoked: string[] = []
 
+    let resumeCallCount = 0
+
     class FakeAudioContext {
       destination = {} as AudioDestinationNode
+      state: AudioContextState = 'suspended'
 
       createBuffer(_channels: number, _length: number, _sampleRate: number): AudioBuffer {
         return {
@@ -195,6 +198,11 @@ describe('App', () => {
             this.onended?.(new Event('ended'))
           },
         } as unknown as AudioBufferSourceNode
+      }
+
+      async resume(): Promise<void> {
+        resumeCallCount += 1
+        this.state = 'running'
       }
 
       async close(): Promise<void> {}
@@ -277,6 +285,7 @@ describe('App', () => {
     })
 
     expect(invoked).toContain('synthesize_local_tts')
+    expect(resumeCallCount).toBe(1)
   })
 
   it('renders response profile dropdown from startup state', async () => {
