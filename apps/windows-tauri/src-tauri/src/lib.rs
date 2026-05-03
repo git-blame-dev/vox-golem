@@ -2,11 +2,12 @@
 #![deny(unused_must_use)]
 
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::io::ErrorKind;
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{path::BaseDirectory, Manager};
 
 mod livekit_wakeword;
@@ -25,6 +26,8 @@ const LLAMA_CPP_CONTEXT_WINDOW_TOKENS: usize = 8_192;
 const LLAMA_CPP_CONTEXT_SAFETY_MARGIN_TOKENS: usize = 512;
 const LLAMA_CPP_CHAT_WRAPPER_TOKENS: usize = 64;
 const RESPONSE_PROFILE_STATE_FILE: &str = "state.toml";
+const RUNTIME_LOG_DIR: &str = "logs";
+const RUNTIME_LOG_FILE: &str = "runtime.log";
 const LLAMA_CPP_ROLLOVER_REASON: &str =
     "Context budget reached; started a new local Gemma conversation for this reply.";
 
@@ -243,14 +246,17 @@ fn set_tts_enabled(
             match initialize_local_tts_runtime(&config.local_tts, true) {
                 Ok(runtime) => {
                     *runtime_guard = runtime;
+                    log_tts_runtime_event("runtime enabled");
                 }
                 Err(error) => {
+                    log_tts_runtime_event(&format!("runtime enable failed: {error}"));
                     return Err(error);
                 }
             }
         }
     } else {
         *runtime_guard = None;
+        log_tts_runtime_event("runtime disabled and unloaded");
     }
 
     persist_tts_enabled(enabled)?;
@@ -276,11 +282,15 @@ fn synthesize_local_tts(
         .local_tts_runtime
         .lock()
         .map_err(|_| String::from("local tts runtime lock is poisoned"))?;
-    let runtime = runtime_guard
-        .as_ref()
-        .ok_or_else(|| String::from("local tts runtime is not available"))?;
+    let runtime = runtime_guard.as_ref().ok_or_else(|| {
+        log_tts_runtime_event("synthesis rejected: runtime unavailable");
+        String::from("local tts runtime is not available")
+    })?;
 
-    let audio = runtime.synthesize(&text)?;
+    let audio = runtime.synthesize(&text).map_err(|error| {
+        log_tts_runtime_event(&format!("synthesis failed: {error}"));
+        error
+    })?;
 
     Ok(SynthesizeLocalTtsPayload {
         pcm_f32: audio.pcm_f32,
@@ -843,6 +853,51 @@ fn response_profile_state_path() -> Result<PathBuf, String> {
     Ok(config_path.with_file_name(RESPONSE_PROFILE_STATE_FILE))
 }
 
+fn runtime_log_path() -> Result<PathBuf, String> {
+    let config_path = voxgolem_core::config::default_config_path()
+        .map_err(|error| format!("failed to resolve %APPDATA%\\VoxGolem\\config.toml: {error}"))?;
+
+    Ok(config_path
+        .with_file_name(RUNTIME_LOG_DIR)
+        .join(RUNTIME_LOG_FILE))
+}
+
+fn append_tts_runtime_log_line(message: &str) -> Result<(), String> {
+    let log_path = runtime_log_path()?;
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create runtime log directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|error| format!("failed to open runtime log {}: {error}", log_path.display()))?;
+
+    writeln!(file, "{timestamp_ms} [tts] {message}").map_err(|error| {
+        format!(
+            "failed to append runtime log {}: {error}",
+            log_path.display()
+        )
+    })
+}
+
+fn log_tts_runtime_event(message: &str) {
+    if let Err(error) = append_tts_runtime_log_line(message) {
+        eprintln!("failed to append tts runtime log: {error}");
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct PersistedState {
     selected_response_profile: Option<ResponseProfilePayload>,
@@ -1207,6 +1262,7 @@ fn initialize_local_tts_runtime(
     enabled: bool,
 ) -> Result<Option<tts::LocalTtsRuntime>, String> {
     if !enabled {
+        log_tts_runtime_event("runtime initialization skipped: disabled");
         return Ok(None);
     }
 
@@ -1219,8 +1275,15 @@ fn initialize_local_tts_runtime(
     };
 
     match tts::LocalTtsRuntime::new(spec) {
-        Ok(runtime) => Ok(Some(runtime)),
-        Err(error) => Err(format!("failed to initialize local tts runtime: {error}")),
+        Ok(runtime) => {
+            log_tts_runtime_event("runtime initialized successfully");
+            Ok(Some(runtime))
+        }
+        Err(error) => {
+            let message = format!("failed to initialize local tts runtime: {error}");
+            log_tts_runtime_event(&message);
+            Err(message)
+        }
     }
 }
 
@@ -2039,7 +2102,7 @@ mod tests {
         model_path_for_profile, parse_persisted_state, persist_selected_response_profile,
         persist_tts_enabled, process_wake_word_frame, prompt_result_error_message,
         reset_voice_pipeline_to_waiting, reset_wake_word_runtime, resolve_effective_tts_enabled,
-        response_profile_state_path, runtime_phase_response_from_state,
+        response_profile_state_path, runtime_log_path, runtime_phase_response_from_state,
         supported_response_profiles, to_runtime_phase_payload, transcribe_finished_utterance,
         transcription_ready_samples, wake_word_event_timestamp, LlamaConversationTurn,
         PromptExecutionEventPayload, ResponseProfilePayload, RuntimePhasePayload,
@@ -2846,6 +2909,50 @@ mod tests {
             .replace('\\', "/")
             .ends_with("VoxGolem/state.toml"));
         assert_eq!(state_contents, "selected_response_profile = \"quality\"\n");
+    }
+
+    #[test]
+    fn runtime_log_path_resolves_in_appdata_logs_directory() {
+        let _appdata_lock = APPDATA_ENV_LOCK
+            .lock()
+            .expect("APPDATA test lock should not be poisoned");
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let previous_appdata = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", temp_dir.path());
+
+        let log_path = runtime_log_path().expect("runtime log path should resolve");
+
+        match previous_appdata {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+
+        assert!(log_path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .ends_with("VoxGolem/logs/runtime.log"));
+    }
+
+    #[test]
+    fn append_tts_runtime_log_line_writes_tts_tagged_entry() {
+        let _appdata_lock = APPDATA_ENV_LOCK
+            .lock()
+            .expect("APPDATA test lock should not be poisoned");
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let previous_appdata = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", temp_dir.path());
+
+        super::append_tts_runtime_log_line("runtime initialized successfully")
+            .expect("runtime log write should succeed");
+        let log_path = runtime_log_path().expect("runtime log path should resolve");
+        let contents = std::fs::read_to_string(&log_path).expect("runtime log should be readable");
+
+        match previous_appdata {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+
+        assert!(contents.contains("[tts] runtime initialized successfully"));
     }
 
     #[test]
