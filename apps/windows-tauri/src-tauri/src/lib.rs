@@ -7,7 +7,6 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{path::BaseDirectory, Manager};
 
 mod livekit_wakeword;
@@ -53,7 +52,7 @@ struct AppState {
     wake_word_runtime: Option<Mutex<wake_word::WakeWordRuntime>>,
     voice_activity_runtime: Option<Mutex<voice_activity::VoiceActivityRuntime>>,
     parakeet_runtime: Option<Mutex<transcription::ParakeetRuntime>>,
-    local_tts_runtime: Option<tts::LocalTtsRuntime>,
+    local_tts_runtime: Mutex<Option<tts::LocalTtsRuntime>>,
     llama_cpp_runtime: Arc<Mutex<Option<voxgolem_platform::llama_cpp::LlamaCppRuntime>>>,
     llama_cpp_conversation: Mutex<Vec<LlamaConversationTurn>>,
     llama_cpp_system_prompt: Option<String>,
@@ -229,20 +228,42 @@ fn set_tts_enabled(
     enabled: bool,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<SetTtsEnabledPayload, String> {
-    let runtime = app_state
-        .local_tts_runtime
+    let config = app_state
+        .runtime_config
         .as_ref()
-        .ok_or_else(|| String::from("local tts runtime is not available"))?;
+        .ok_or_else(|| String::from("startup config is not ready"))?;
 
-    if enabled && !runtime.is_available() {
-        return Err(String::from("local tts runtime is not available"));
+    let mut runtime_guard = app_state
+        .local_tts_runtime
+        .lock()
+        .map_err(|_| String::from("local tts runtime lock is poisoned"))?;
+
+    if enabled {
+        if runtime_guard.is_none() {
+            match initialize_local_tts_runtime(&config.local_tts, true) {
+                Ok(runtime) => {
+                    *runtime_guard = runtime;
+                }
+                Err(error) => {
+                    return Err(error);
+                }
+            }
+        }
+    } else {
+        *runtime_guard = None;
     }
 
-    runtime.set_enabled(enabled);
+    persist_tts_enabled(enabled)?;
+    set_startup_tts_enabled(&app_state.startup_state, enabled);
+
+    let sample_rate_hz = runtime_guard
+        .as_ref()
+        .map(tts::LocalTtsRuntime::sample_rate_hz)
+        .unwrap_or(config.local_tts.sample_rate_hz);
 
     Ok(SetTtsEnabledPayload {
-        enabled: runtime.is_enabled(),
-        sample_rate_hz: runtime.sample_rate_hz(),
+        enabled,
+        sample_rate_hz,
     })
 }
 
@@ -251,8 +272,11 @@ fn synthesize_local_tts(
     text: String,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<SynthesizeLocalTtsPayload, String> {
-    let runtime = app_state
+    let runtime_guard = app_state
         .local_tts_runtime
+        .lock()
+        .map_err(|_| String::from("local tts runtime lock is poisoned"))?;
+    let runtime = runtime_guard
         .as_ref()
         .ok_or_else(|| String::from("local tts runtime is not available"))?;
 
@@ -803,6 +827,15 @@ fn resolve_selected_response_profile(
     selected
 }
 
+fn resolve_effective_tts_enabled(default_enabled: bool) -> bool {
+    let persisted_tts_enabled = load_persisted_tts_enabled().unwrap_or_else(|error| {
+        eprintln!("failed to read tts state: {error}");
+        None
+    });
+
+    persisted_tts_enabled.unwrap_or(default_enabled)
+}
+
 fn response_profile_state_path() -> Result<PathBuf, String> {
     let config_path = voxgolem_core::config::default_config_path()
         .map_err(|error| format!("failed to resolve %APPDATA%\\VoxGolem\\config.toml: {error}"))?;
@@ -810,25 +843,15 @@ fn response_profile_state_path() -> Result<PathBuf, String> {
     Ok(config_path.with_file_name(RESPONSE_PROFILE_STATE_FILE))
 }
 
-fn load_selected_response_profile() -> Result<Option<ResponseProfilePayload>, String> {
-    let state_path = response_profile_state_path()?;
-    let contents = match fs::read_to_string(&state_path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(format!(
-                "failed to read response profile state {}: {error}",
-                state_path.display()
-            ));
-        }
-    };
-
-    parse_selected_response_profile(&contents)
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PersistedState {
+    selected_response_profile: Option<ResponseProfilePayload>,
+    tts_enabled: Option<bool>,
 }
 
-fn parse_selected_response_profile(
-    contents: &str,
-) -> Result<Option<ResponseProfilePayload>, String> {
+fn parse_persisted_state(contents: &str) -> Result<PersistedState, String> {
+    let mut state = PersistedState::default();
+
     for raw_line in contents.lines() {
         let line = raw_line.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
@@ -843,20 +866,58 @@ fn parse_selected_response_profile(
             };
 
             let value = value.trim().trim_matches('"').to_ascii_lowercase();
-            return match value.as_str() {
-                "fast" => Ok(Some(ResponseProfilePayload::Fast)),
-                "quality" => Ok(Some(ResponseProfilePayload::Quality)),
-                _ => Err(format!(
-                    "invalid state.toml: unsupported selected_response_profile `{value}`"
-                )),
+            state.selected_response_profile = match value.as_str() {
+                "fast" => Some(ResponseProfilePayload::Fast),
+                "quality" => Some(ResponseProfilePayload::Quality),
+                _ => {
+                    return Err(format!(
+                        "invalid state.toml: unsupported selected_response_profile `{value}`"
+                    ));
+                }
+            };
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("tts_enabled") {
+            let Some(value) = value.trim_start().strip_prefix('=') else {
+                return Err(String::from(
+                    "invalid state.toml: expected `tts_enabled = true|false`",
+                ));
+            };
+
+            let value = value.trim().trim_matches('"').to_ascii_lowercase();
+            state.tts_enabled = match value.as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => {
+                    return Err(format!(
+                        "invalid state.toml: unsupported tts_enabled `{value}`"
+                    ));
+                }
             };
         }
     }
 
-    Ok(None)
+    Ok(state)
 }
 
-fn persist_selected_response_profile(profile: ResponseProfilePayload) -> Result<(), String> {
+fn load_persisted_state() -> Result<PersistedState, String> {
+    let state_path = response_profile_state_path()?;
+    let contents = match fs::read_to_string(&state_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(PersistedState::default()),
+        Err(error) => {
+            return Err(format!(
+                "failed to read response profile state {}: {error}",
+                state_path.display()
+            ));
+        }
+    };
+
+    parse_persisted_state(&contents)
+}
+
+fn persist_state(state: PersistedState) -> Result<(), String> {
     let state_path = response_profile_state_path()?;
     if let Some(parent) = state_path.parent() {
         fs::create_dir_all(parent).map_err(|error| {
@@ -867,16 +928,61 @@ fn persist_selected_response_profile(profile: ResponseProfilePayload) -> Result<
         })?;
     }
 
-    fs::write(
-        &state_path,
-        format!("selected_response_profile = \"{}\"\n", profile.as_str()),
-    )
-    .map_err(|error| {
+    let mut lines = Vec::<String>::new();
+    if let Some(profile) = state.selected_response_profile {
+        lines.push(format!(
+            "selected_response_profile = \"{}\"",
+            profile.as_str()
+        ));
+    }
+    if let Some(tts_enabled) = state.tts_enabled {
+        lines.push(format!("tts_enabled = {tts_enabled}"));
+    }
+
+    let contents = if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    };
+
+    fs::write(&state_path, contents).map_err(|error| {
         format!(
             "failed to write response profile state {}: {error}",
             state_path.display()
         )
     })
+}
+
+fn load_selected_response_profile() -> Result<Option<ResponseProfilePayload>, String> {
+    Ok(load_persisted_state()?.selected_response_profile)
+}
+
+fn persist_selected_response_profile(profile: ResponseProfilePayload) -> Result<(), String> {
+    let mut persisted = load_persisted_state().unwrap_or_default();
+    persisted.selected_response_profile = Some(profile);
+    persist_state(persisted)
+}
+
+fn load_persisted_tts_enabled() -> Result<Option<bool>, String> {
+    Ok(load_persisted_state()?.tts_enabled)
+}
+
+fn persist_tts_enabled(enabled: bool) -> Result<(), String> {
+    let mut persisted = load_persisted_state().unwrap_or_default();
+    persisted.tts_enabled = Some(enabled);
+    persist_state(persisted)
+}
+
+fn set_startup_tts_enabled(startup_state: &Arc<Mutex<StartupStatePayload>>, enabled: bool) {
+    if let Ok(mut guard) = startup_state.lock() {
+        match &mut *guard {
+            StartupStatePayload::WarmingModel { tts_enabled, .. }
+            | StartupStatePayload::Ready { tts_enabled, .. } => {
+                *tts_enabled = enabled;
+            }
+            StartupStatePayload::Error { .. } => {}
+        }
+    }
 }
 
 fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
@@ -911,16 +1017,15 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                     );
                 }
             };
-            let local_tts_runtime = match initialize_local_tts_runtime(&config.local_tts) {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    return build_startup_error_app_state(voice_pipeline_config, error);
-                }
-            };
-            let tts_enabled = local_tts_runtime
-                .as_ref()
-                .map(tts::LocalTtsRuntime::is_enabled)
-                .unwrap_or(false);
+            let effective_tts_enabled = resolve_effective_tts_enabled(config.local_tts.enabled);
+            let local_tts_runtime =
+                match initialize_local_tts_runtime(&config.local_tts, effective_tts_enabled) {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        return build_startup_error_app_state(voice_pipeline_config, error);
+                    }
+                };
+            let tts_enabled = local_tts_runtime.is_some();
             let mut voice_input_errors = Vec::new();
             let parakeet_runtime =
                 match transcription::ParakeetRuntime::load(&config.parakeet_model_dir) {
@@ -1085,7 +1190,7 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                 wake_word_runtime: Some(Mutex::new(wake_word_runtime)),
                 voice_activity_runtime,
                 parakeet_runtime,
-                local_tts_runtime,
+                local_tts_runtime: Mutex::new(local_tts_runtime),
                 llama_cpp_runtime,
                 llama_cpp_conversation: Mutex::new(Vec::new()),
                 llama_cpp_system_prompt,
@@ -1099,9 +1204,14 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
 
 fn initialize_local_tts_runtime(
     config: &voxgolem_core::config::LocalTtsConfig,
+    enabled: bool,
 ) -> Result<Option<tts::LocalTtsRuntime>, String> {
+    if !enabled {
+        return Ok(None);
+    }
+
     let spec = tts::LocalTtsRuntimeSpec {
-        enabled: config.enabled,
+        enabled: true,
         model_path: Some(config.model_path.clone()),
         worker_count: config.worker_count,
         max_queue: config.max_queue,
@@ -1110,13 +1220,7 @@ fn initialize_local_tts_runtime(
 
     match tts::LocalTtsRuntime::new(spec) {
         Ok(runtime) => Ok(Some(runtime)),
-        Err(error) if config.enabled => {
-            Err(format!("failed to initialize local tts runtime: {error}"))
-        }
-        Err(error) => {
-            eprintln!("local tts runtime unavailable while disabled: {error}");
-            Ok(None)
-        }
+        Err(error) => Err(format!("failed to initialize local tts runtime: {error}")),
     }
 }
 
@@ -1178,7 +1282,7 @@ fn build_startup_error_app_state(
         wake_word_runtime: None,
         voice_activity_runtime: None,
         parakeet_runtime: None,
-        local_tts_runtime: None,
+        local_tts_runtime: Mutex::new(None),
         llama_cpp_runtime: Arc::new(Mutex::new(None)),
         llama_cpp_conversation: Mutex::new(Vec::new()),
         llama_cpp_system_prompt: None,
@@ -1931,10 +2035,11 @@ mod tests {
         build_startup_error_app_state, current_runtime_phase_response, current_silence_deadline,
         default_response_profile, default_voice_pipeline_config, execute_prompt_backend,
         ingest_audio_frame_with_optional_wake_word_detection, is_llama_context_overflow_error,
-        llama_cpp_input_token_limit, load_llama_cpp_system_prompt, model_path_for_profile,
-        parse_selected_response_profile, persist_selected_response_profile,
-        process_wake_word_frame, prompt_result_error_message, reset_voice_pipeline_to_waiting,
-        reset_wake_word_runtime, response_profile_state_path, runtime_phase_response_from_state,
+        llama_cpp_input_token_limit, load_llama_cpp_system_prompt, load_persisted_tts_enabled,
+        model_path_for_profile, parse_persisted_state, persist_selected_response_profile,
+        persist_tts_enabled, process_wake_word_frame, prompt_result_error_message,
+        reset_voice_pipeline_to_waiting, reset_wake_word_runtime, resolve_effective_tts_enabled,
+        response_profile_state_path, runtime_phase_response_from_state,
         supported_response_profiles, to_runtime_phase_payload, transcribe_finished_utterance,
         transcription_ready_samples, wake_word_event_timestamp, LlamaConversationTurn,
         PromptExecutionEventPayload, ResponseProfilePayload, RuntimePhasePayload,
@@ -2625,17 +2730,95 @@ mod tests {
     }
 
     #[test]
-    fn parse_selected_response_profile_supports_fast_and_quality() {
+    fn parse_persisted_state_supports_fast_and_quality() {
         assert_eq!(
-            parse_selected_response_profile("selected_response_profile = \"fast\"\n")
-                .expect("fast profile should parse"),
+            parse_persisted_state("selected_response_profile = \"fast\"\n")
+                .expect("fast profile should parse")
+                .selected_response_profile,
             Some(ResponseProfilePayload::Fast)
         );
         assert_eq!(
-            parse_selected_response_profile("selected_response_profile = \"quality\"\n")
-                .expect("quality profile should parse"),
+            parse_persisted_state("selected_response_profile = \"quality\"\n")
+                .expect("quality profile should parse")
+                .selected_response_profile,
             Some(ResponseProfilePayload::Quality)
         );
+    }
+
+    #[test]
+    fn parse_persisted_state_reads_profile_and_tts_flag() {
+        let persisted =
+            parse_persisted_state("selected_response_profile = \"fast\"\ntts_enabled = true\n")
+                .expect("state should parse");
+
+        assert_eq!(
+            persisted.selected_response_profile,
+            Some(ResponseProfilePayload::Fast)
+        );
+        assert_eq!(persisted.tts_enabled, Some(true));
+    }
+
+    #[test]
+    fn load_persisted_tts_enabled_reads_boolean_flag_from_state_file() {
+        let _appdata_lock = APPDATA_ENV_LOCK
+            .lock()
+            .expect("APPDATA test lock should not be poisoned");
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let previous_appdata = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", temp_dir.path());
+
+        persist_tts_enabled(true).expect("tts flag should be written");
+        let persisted = load_persisted_tts_enabled().expect("tts flag should load");
+
+        match previous_appdata {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+
+        assert_eq!(persisted, Some(true));
+    }
+
+    #[test]
+    fn persist_selected_response_profile_preserves_tts_enabled_flag() {
+        let _appdata_lock = APPDATA_ENV_LOCK
+            .lock()
+            .expect("APPDATA test lock should not be poisoned");
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let previous_appdata = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", temp_dir.path());
+
+        persist_tts_enabled(true).expect("tts flag should be written");
+        persist_selected_response_profile(ResponseProfilePayload::Quality)
+            .expect("profile state should be written");
+
+        let persisted = load_persisted_tts_enabled().expect("tts flag should load");
+
+        match previous_appdata {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+
+        assert_eq!(persisted, Some(true));
+    }
+
+    #[test]
+    fn resolve_effective_tts_enabled_prefers_persisted_state() {
+        let _appdata_lock = APPDATA_ENV_LOCK
+            .lock()
+            .expect("APPDATA test lock should not be poisoned");
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let previous_appdata = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", temp_dir.path());
+
+        persist_tts_enabled(true).expect("tts flag should be written");
+        let effective = resolve_effective_tts_enabled(false);
+
+        match previous_appdata {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+
+        assert!(effective);
     }
 
     #[test]
