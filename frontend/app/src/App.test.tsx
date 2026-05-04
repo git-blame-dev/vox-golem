@@ -200,6 +200,13 @@ describe('App', () => {
         } as unknown as AudioBufferSourceNode
       }
 
+      createGain(): GainNode {
+        return {
+          gain: { value: 1 } as AudioParam,
+          connect: () => {},
+        } as unknown as GainNode
+      }
+
       async resume(): Promise<void> {
         resumeCallCount += 1
         this.state = 'running'
