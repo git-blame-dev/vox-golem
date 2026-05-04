@@ -14,6 +14,7 @@ import type { RuntimeControlArgs } from './lib/runtimeControl'
 import {
   DEFAULT_CUE_ASSET_PATHS,
   DEFAULT_SILENCE_TIMEOUT_MS,
+  DEFAULT_TTS_OUTPUT_GAIN_DB,
   isStartupStateSettled,
   loadStartupState,
 } from './lib/startupState'
@@ -77,6 +78,17 @@ function App() {
     }
 
     return DEFAULT_SILENCE_TIMEOUT_MS
+  }
+
+  const currentTtsOutputGainDb = (): number => {
+    if (
+      startupStateRef.current.kind === 'ready' ||
+      startupStateRef.current.kind === 'warming_model'
+    ) {
+      return startupStateRef.current.ttsOutputGainDb
+    }
+
+    return DEFAULT_TTS_OUTPUT_GAIN_DB
   }
 
   const waitForInFlightLiveAudioFrames = async (): Promise<void> => {
@@ -591,9 +603,10 @@ function App() {
       }
       const sampleRate = Math.trunc(payload['sample_rate_hz'])
       const pcm = Float32Array.from(
-        payload['pcm_f32'].map((sample) =>
-          typeof sample === 'number' && Number.isFinite(sample) ? sample : 0,
-        ),
+        payload['pcm_f32'].map((sample) => {
+          const finiteSample = typeof sample === 'number' && Number.isFinite(sample) ? sample : 0
+          return Math.max(-1, Math.min(1, finiteSample))
+        }),
       )
 
       if (pcm.length === 0) {
@@ -604,7 +617,10 @@ function App() {
       buffer.copyToChannel(pcm, 0)
       const source = audioContext.createBufferSource()
       source.buffer = buffer
-      source.connect(audioContext.destination)
+      const gainNode = audioContext.createGain()
+      gainNode.gain.value = Math.pow(10, currentTtsOutputGainDb() / 20)
+      source.connect(gainNode)
+      gainNode.connect(audioContext.destination)
 
       await new Promise<void>((resolve) => {
         source.onended = () => resolve()
@@ -872,6 +888,7 @@ function App() {
       selectedResponseProfile: profile,
       supportedResponseProfiles: currentState.supportedResponseProfiles,
       ttsEnabled: currentState.ttsEnabled,
+      ttsOutputGainDb: currentState.ttsOutputGainDb,
     }
 
     startupStateRef.current = warmingState

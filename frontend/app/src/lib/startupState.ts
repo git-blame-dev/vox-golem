@@ -8,6 +8,7 @@ import type {
 } from '../types/chat'
 
 export const DEFAULT_SILENCE_TIMEOUT_MS = 1_500
+export const DEFAULT_TTS_OUTPUT_GAIN_DB = 3
 
 export const DEFAULT_CUE_ASSET_PATHS: CueAssetPaths = {
   startListening: 'resources/start-listening.wav',
@@ -28,6 +29,7 @@ export function parseStartupState(payload: unknown): StartupState {
     const silenceTimeoutMs = parseSilenceTimeoutMs(payload['silence_timeout_ms'])
     const message = payload['message']
     const ttsEnabled = parseTtsEnabled(payload['tts_enabled'])
+    const ttsOutputGainDb = parseTtsOutputGainDb(payload['tts_output_gain_db'])
 
     if (typeof voiceInputAvailable !== 'boolean') {
       throw new Error('Startup warming payload must include voice_input_available')
@@ -54,6 +56,7 @@ export function parseStartupState(payload: unknown): StartupState {
       selectedResponseProfile: responseProfileState.selectedResponseProfile,
       supportedResponseProfiles: responseProfileState.supportedResponseProfiles,
       ttsEnabled,
+      ttsOutputGainDb,
     }
   }
 
@@ -62,6 +65,7 @@ export function parseStartupState(payload: unknown): StartupState {
     const voiceInputError = payload['voice_input_error']
     const silenceTimeoutMs = parseSilenceTimeoutMs(payload['silence_timeout_ms'])
     const ttsEnabled = parseTtsEnabled(payload['tts_enabled'])
+    const ttsOutputGainDb = parseTtsOutputGainDb(payload['tts_output_gain_db'])
 
     if (typeof voiceInputAvailable !== 'boolean') {
       throw new Error('Startup ready payload must include voice_input_available')
@@ -83,6 +87,7 @@ export function parseStartupState(payload: unknown): StartupState {
       selectedResponseProfile: responseProfileState.selectedResponseProfile,
       supportedResponseProfiles: responseProfileState.supportedResponseProfiles,
       ttsEnabled,
+      ttsOutputGainDb,
     }
   }
 
@@ -139,6 +144,7 @@ function buildDefaultStartupState(): StartupState {
     selectedResponseProfile: DEFAULT_SELECTED_RESPONSE_PROFILE,
     supportedResponseProfiles: DEFAULT_SUPPORTED_RESPONSE_PROFILES,
     ttsEnabled: false,
+    ttsOutputGainDb: DEFAULT_TTS_OUTPUT_GAIN_DB,
   }
 }
 
@@ -246,6 +252,18 @@ function parseTtsEnabled(payload: unknown): boolean {
 
   if (typeof payload !== 'boolean') {
     throw new Error('Startup payload field `tts_enabled` must be a boolean when present')
+  }
+
+  return payload
+}
+
+function parseTtsOutputGainDb(payload: unknown): number {
+  if (payload === undefined) {
+    return DEFAULT_TTS_OUTPUT_GAIN_DB
+  }
+
+  if (typeof payload !== 'number' || !Number.isFinite(payload)) {
+    throw new Error('Startup payload field `tts_output_gain_db` must be a finite number when present')
   }
 
   return payload
