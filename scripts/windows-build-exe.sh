@@ -116,8 +116,34 @@ if not exist "%CARGO_TAURI_EXE%" (
 
 call "%VCVARSBAT%" -arch=x64 -host_arch=x64 >nul
 if errorlevel 1 (
-  >&2 echo Failed to initialize the MSVC developer shell.
-  exit /b 1
+>&2 echo Failed to initialize the MSVC developer shell.
+exit /b 1
+)
+
+set "LLVM_BIN="
+if defined LIBCLANG_PATH set "LLVM_BIN=%LIBCLANG_PATH%"
+if not defined LLVM_BIN if exist "%ProgramFiles%\LLVM\bin\libclang.dll" set "LLVM_BIN=%ProgramFiles%\LLVM\bin"
+if not defined LLVM_BIN if exist "%ProgramW6432%\LLVM\bin\libclang.dll" set "LLVM_BIN=%ProgramW6432%\LLVM\bin"
+if defined LLVM_BIN (
+set "LIBCLANG_PATH=%LLVM_BIN%"
+set "PATH=%LLVM_BIN%;%PATH%"
+)
+
+set "CMAKE_BIN="
+if exist "%ProgramFiles%\CMake\bin\cmake.exe" set "CMAKE_BIN=%ProgramFiles%\CMake\bin"
+if not defined CMAKE_BIN if exist "%ProgramFiles(x86)%\CMake\bin\cmake.exe" set "CMAKE_BIN=%ProgramFiles(x86)%\CMake\bin"
+if defined CMAKE_BIN set "PATH=%CMAKE_BIN%;%PATH%"
+
+where cmake >nul 2>&1
+if errorlevel 1 (
+>&2 echo CMake was not found in PATH. Install Kitware.CMake or add CMake\bin to PATH.
+exit /b 1
+)
+
+where libclang.dll >nul 2>&1
+if errorlevel 1 if not defined LIBCLANG_PATH (
+>&2 echo libclang.dll was not found. Install LLVM.LLVM or set LIBCLANG_PATH to LLVM\bin.
+exit /b 1
 )
 
 cd /d "%TAURI_DIR%"
