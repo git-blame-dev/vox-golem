@@ -1182,7 +1182,6 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                 let silence_timeout_ms = config.silence_timeout_ms;
                 let selected_response_profile = selected_profile_at_startup;
                 let supported_response_profiles = supported_response_profiles.clone();
-                let tts_output_gain_db = tts_output_gain_db;
                 let model_path = match model_path_for_profile(
                     selected_response_profile,
                     fast_model_path,
@@ -2249,6 +2248,7 @@ mod tests {
                 max_queue: 8,
                 sample_rate_hz: 22_050,
                 max_duration_s: 300,
+                output_gain_db: 3.0,
             },
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
@@ -2307,6 +2307,7 @@ mod tests {
                 max_queue: 8,
                 sample_rate_hz: 22_050,
                 max_duration_s: 300,
+                output_gain_db: 3.0,
             },
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
@@ -2346,6 +2347,7 @@ mod tests {
                 max_queue: 8,
                 sample_rate_hz: 22_050,
                 max_duration_s: 300,
+                output_gain_db: 3.0,
             },
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
@@ -2465,6 +2467,7 @@ mod tests {
                 max_queue: 8,
                 sample_rate_hz: 22_050,
                 max_duration_s: 300,
+                output_gain_db: 3.0,
             },
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
@@ -2597,6 +2600,7 @@ mod tests {
                 max_queue: 8,
                 sample_rate_hz: 22_050,
                 max_duration_s: 300,
+                output_gain_db: 3.0,
             },
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
@@ -2707,6 +2711,7 @@ mod tests {
                 max_queue: 8,
                 sample_rate_hz: 22_050,
                 max_duration_s: 300,
+                output_gain_db: 3.0,
             },
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
