@@ -56,10 +56,11 @@ export type StartupState =
       readonly voiceInputError: string | null
   readonly silenceTimeoutMs: number
   readonly message: string
-  readonly selectedResponseProfile: ResponseProfile
-  readonly supportedResponseProfiles: readonly ResponseProfile[]
-  readonly ttsEnabled: boolean
-}
+    readonly selectedResponseProfile: ResponseProfile
+    readonly supportedResponseProfiles: readonly ResponseProfile[]
+    readonly ttsEnabled: boolean
+    readonly ttsOutputGainDb: number
+  }
 | {
   readonly kind: 'ready'
   readonly cueAssetPaths: CueAssetPaths
@@ -67,11 +68,12 @@ export type StartupState =
       readonly voiceInputAvailable: boolean
   readonly voiceInputError: string | null
   readonly silenceTimeoutMs: number
-  readonly selectedResponseProfile: ResponseProfile
-  readonly supportedResponseProfiles: readonly ResponseProfile[]
-  readonly ttsEnabled: boolean
-}
-  | { readonly kind: 'error'; readonly message: string }
+    readonly selectedResponseProfile: ResponseProfile
+    readonly supportedResponseProfiles: readonly ResponseProfile[]
+    readonly ttsEnabled: boolean
+    readonly ttsOutputGainDb: number
+  }
+| { readonly kind: 'error'; readonly message: string }
 
 export type RuntimeStatus =
   | 'initializing'

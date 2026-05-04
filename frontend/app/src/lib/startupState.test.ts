@@ -34,6 +34,7 @@ describe('parseStartupState', () => {
       selectedResponseProfile: 'fast',
       supportedResponseProfiles: ['fast', 'quality'],
       ttsEnabled: false,
+      ttsOutputGainDb: 3,
     })
   })
 
@@ -46,6 +47,39 @@ describe('parseStartupState', () => {
     ).toEqual({
       kind: 'error',
       message: 'config file not found',
+    })
+  })
+
+  it('parses explicit tts_output_gain_db from ready payload', () => {
+    expect(
+      parseStartupState({
+        kind: 'ready',
+        cue_asset_paths: {
+          start_listening: 'resources/start-listening.wav',
+          stop_listening: 'resources/stop-listening.wav',
+        },
+        runtime_phase: 'sleeping',
+        voice_input_available: true,
+        voice_input_error: null,
+        silence_timeout_ms: 1500,
+        selected_response_profile: 'fast',
+        supported_response_profiles: ['fast', 'quality'],
+        tts_output_gain_db: 6,
+      }),
+    ).toEqual({
+      kind: 'ready',
+      cueAssetPaths: {
+        startListening: 'resources/start-listening.wav',
+        stopListening: 'resources/stop-listening.wav',
+      },
+      runtimePhase: 'sleeping',
+      voiceInputAvailable: true,
+      voiceInputError: null,
+      silenceTimeoutMs: 1500,
+      selectedResponseProfile: 'fast',
+      supportedResponseProfiles: ['fast', 'quality'],
+      ttsEnabled: false,
+      ttsOutputGainDb: 6,
     })
   })
 
@@ -79,6 +113,7 @@ describe('parseStartupState', () => {
       selectedResponseProfile: 'quality',
       supportedResponseProfiles: ['fast', 'quality'],
       ttsEnabled: false,
+      ttsOutputGainDb: 3,
     })
   })
 
@@ -226,6 +261,7 @@ describe('isStartupStateSettled', () => {
         selectedResponseProfile: 'quality',
         supportedResponseProfiles: ['fast', 'quality'],
         ttsEnabled: false,
+        ttsOutputGainDb: 3,
       }),
     ).toBe(false)
   })
@@ -242,6 +278,7 @@ describe('isStartupStateSettled', () => {
         selectedResponseProfile: 'quality',
         supportedResponseProfiles: ['fast', 'quality'],
         ttsEnabled: false,
+        ttsOutputGainDb: 3,
       }),
     ).toBe(true)
     expect(
@@ -265,6 +302,7 @@ describe('loadStartupState', () => {
       selectedResponseProfile: 'fast',
       supportedResponseProfiles: ['fast'],
       ttsEnabled: false,
+      ttsOutputGainDb: 3,
     })
   })
 
@@ -298,6 +336,7 @@ describe('loadStartupState', () => {
       selectedResponseProfile: 'fast',
       supportedResponseProfiles: ['fast', 'quality'],
       ttsEnabled: false,
+      ttsOutputGainDb: 3,
     })
   })
 

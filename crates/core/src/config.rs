@@ -13,6 +13,10 @@ const DEFAULT_WAKE_WORD_DETECTION_THRESHOLD: f32 = 0.68;
 const DEFAULT_TTS_WORKER_COUNT: usize = 1;
 const DEFAULT_TTS_MAX_QUEUE: usize = 8;
 const DEFAULT_TTS_SAMPLE_RATE_HZ: u32 = 22_050;
+const DEFAULT_TTS_MAX_DURATION_S: u64 = 300;
+const DEFAULT_TTS_OUTPUT_GAIN_DB: f32 = 3.0;
+const MIN_TTS_OUTPUT_GAIN_DB: f32 = -24.0;
+const MAX_TTS_OUTPUT_GAIN_DB: f32 = 24.0;
 const MAX_JS_SAFE_INTEGER_U64: u64 = 9_007_199_254_740_991;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -74,6 +78,10 @@ struct RawTtsConfig {
     max_queue: usize,
     #[serde(default = "default_tts_sample_rate_hz")]
     sample_rate_hz: u32,
+    #[serde(default = "default_tts_max_duration_s")]
+    max_duration_s: u64,
+    #[serde(default = "default_tts_output_gain_db")]
+    output_gain_db: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -87,13 +95,15 @@ pub struct RuntimeConfig {
     pub response_backend: ResponseBackendConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LocalTtsConfig {
     pub enabled: bool,
     pub model_path: PathBuf,
     pub worker_count: usize,
     pub max_queue: usize,
     pub sample_rate_hz: u32,
+    pub max_duration_s: u64,
+    pub output_gain_db: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,12 +308,38 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
                 });
             }
 
+            if raw_tts.max_duration_s == 0 {
+                return Err(ConfigError::ParseConfigFailed {
+                    path: config_path.clone(),
+                    details: String::from("tts.max_duration_s must be greater than zero"),
+                });
+            }
+
+            if !raw_tts.output_gain_db.is_finite() {
+                return Err(ConfigError::ParseConfigFailed {
+                    path: config_path.clone(),
+                    details: String::from("tts.output_gain_db must be a finite number"),
+                });
+            }
+
+            if !(MIN_TTS_OUTPUT_GAIN_DB..=MAX_TTS_OUTPUT_GAIN_DB).contains(&raw_tts.output_gain_db)
+            {
+                return Err(ConfigError::ParseConfigFailed {
+                    path: config_path.clone(),
+                    details: format!(
+                        "tts.output_gain_db must be between {MIN_TTS_OUTPUT_GAIN_DB} and {MAX_TTS_OUTPUT_GAIN_DB} inclusive"
+                    ),
+                });
+            }
+
             LocalTtsConfig {
                 enabled: raw_tts.enabled,
                 model_path,
                 worker_count: raw_tts.worker_count,
                 max_queue: raw_tts.max_queue,
                 sample_rate_hz: raw_tts.sample_rate_hz,
+                max_duration_s: raw_tts.max_duration_s,
+                output_gain_db: raw_tts.output_gain_db,
             }
         }
         None => {
@@ -316,6 +352,8 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
                 worker_count: DEFAULT_TTS_WORKER_COUNT,
                 max_queue: DEFAULT_TTS_MAX_QUEUE,
                 sample_rate_hz: DEFAULT_TTS_SAMPLE_RATE_HZ,
+                max_duration_s: DEFAULT_TTS_MAX_DURATION_S,
+                output_gain_db: DEFAULT_TTS_OUTPUT_GAIN_DB,
             }
         }
     };
@@ -395,6 +433,14 @@ fn default_tts_max_queue() -> usize {
 
 fn default_tts_sample_rate_hz() -> u32 {
     DEFAULT_TTS_SAMPLE_RATE_HZ
+}
+
+fn default_tts_max_duration_s() -> u64 {
+    DEFAULT_TTS_MAX_DURATION_S
+}
+
+fn default_tts_output_gain_db() -> f32 {
+    DEFAULT_TTS_OUTPUT_GAIN_DB
 }
 
 fn resolve_config_path(config_dir: &Path, path: PathBuf) -> PathBuf {
@@ -868,7 +914,7 @@ mod tests {
         fs::write(
             &config_path,
             format!(
-                "wake_word_model_path = \"{}\"\nparakeet_model_dir = \"{}\"\nsilero_vad_model = \"{}\"\nresponse_backend = \"opencode\"\n\n[opencode]\npath = \"{}\"\n\n[tts]\nenabled = true\nmodel_path = \"{}\"\nworker_count = 2\nmax_queue = 16\nsample_rate_hz = 24000\n",
+                "wake_word_model_path = \"{}\"\nparakeet_model_dir = \"{}\"\nsilero_vad_model = \"{}\"\nresponse_backend = \"opencode\"\n\n[opencode]\npath = \"{}\"\n\n[tts]\nenabled = true\nmodel_path = \"{}\"\nworker_count = 2\nmax_queue = 16\nsample_rate_hz = 24000\nmax_duration_s = 360\noutput_gain_db = 6.0\n",
                 escape_path(&wake_word_model_path),
                 escape_path(&model_dir),
                 escape_path(&silero_vad_model),
@@ -885,6 +931,88 @@ mod tests {
         assert_eq!(result.local_tts.worker_count, 2);
         assert_eq!(result.local_tts.max_queue, 16);
         assert_eq!(result.local_tts.sample_rate_hz, 24_000);
+        assert_eq!(result.local_tts.max_duration_s, 360);
+        assert_eq!(result.local_tts.output_gain_db, 6.0);
+    }
+
+    #[test]
+    fn reports_invalid_tts_max_duration_when_zero() {
+        let temp = TempDir::new();
+        let model_dir = temp.path().join("models");
+        let wake_word_model_path = model_dir.join("hey_livekit.onnx");
+        let silero_vad_model = model_dir.join("silero-vad.onnx");
+        let tts_model_path = model_dir.join("tts").join("jarvis.onnx");
+        let opencode_path = temp.path().join("opencode.exe");
+        let config_path = temp.path().join("config.toml");
+
+        fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
+        create_file(&wake_word_model_path);
+        create_file(&silero_vad_model);
+        create_file(&tts_model_path);
+        create_file(&opencode_path);
+
+        fs::write(
+            &config_path,
+            format!(
+                "wake_word_model_path = \"{}\"\nparakeet_model_dir = \"{}\"\nsilero_vad_model = \"{}\"\nresponse_backend = \"opencode\"\n\n[opencode]\npath = \"{}\"\n\n[tts]\nenabled = true\nmodel_path = \"{}\"\nworker_count = 2\nmax_queue = 16\nsample_rate_hz = 24000\nmax_duration_s = 0\n",
+                escape_path(&wake_word_model_path),
+                escape_path(&model_dir),
+                escape_path(&silero_vad_model),
+                escape_path(&opencode_path),
+                escape_path(&tts_model_path),
+            ),
+        )
+        .expect("config fixture should be written");
+
+        let result = load_runtime_config(Some(&config_path));
+
+        assert_eq!(
+            result,
+            Err(ConfigError::ParseConfigFailed {
+                path: config_path,
+                details: String::from("tts.max_duration_s must be greater than zero"),
+            })
+        );
+    }
+
+    #[test]
+    fn reports_invalid_tts_output_gain_db_when_out_of_range() {
+        let temp = TempDir::new();
+        let model_dir = temp.path().join("models");
+        let wake_word_model_path = model_dir.join("hey_livekit.onnx");
+        let silero_vad_model = model_dir.join("silero-vad.onnx");
+        let tts_model_path = model_dir.join("tts").join("jarvis.onnx");
+        let opencode_path = temp.path().join("opencode.exe");
+        let config_path = temp.path().join("config.toml");
+
+        fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
+        create_file(&wake_word_model_path);
+        create_file(&silero_vad_model);
+        create_file(&tts_model_path);
+        create_file(&opencode_path);
+
+        fs::write(
+            &config_path,
+            format!(
+                "wake_word_model_path = \"{}\"\nparakeet_model_dir = \"{}\"\nsilero_vad_model = \"{}\"\nresponse_backend = \"opencode\"\n\n[opencode]\npath = \"{}\"\n\n[tts]\nenabled = true\nmodel_path = \"{}\"\nworker_count = 2\nmax_queue = 16\nsample_rate_hz = 24000\nmax_duration_s = 360\noutput_gain_db = 100.0\n",
+                escape_path(&wake_word_model_path),
+                escape_path(&model_dir),
+                escape_path(&silero_vad_model),
+                escape_path(&opencode_path),
+                escape_path(&tts_model_path),
+            ),
+        )
+        .expect("config fixture should be written");
+
+        let result = load_runtime_config(Some(&config_path));
+
+        assert_eq!(
+            result,
+            Err(ConfigError::ParseConfigFailed {
+                path: config_path,
+                details: String::from("tts.output_gain_db must be between -24 and 24 inclusive",),
+            })
+        );
     }
 
     #[test]

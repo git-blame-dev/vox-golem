@@ -201,6 +201,7 @@ enum StartupStatePayload {
         selected_response_profile: ResponseProfilePayload,
         supported_response_profiles: Vec<ResponseProfilePayload>,
         tts_enabled: bool,
+        tts_output_gain_db: f32,
     },
     Ready {
         cue_asset_paths: CueAssetPathsPayload,
@@ -211,6 +212,7 @@ enum StartupStatePayload {
         selected_response_profile: ResponseProfilePayload,
         supported_response_profiles: Vec<ResponseProfilePayload>,
         tts_enabled: bool,
+        tts_output_gain_db: f32,
     },
     Error {
         message: String,
@@ -408,6 +410,7 @@ fn switch_response_profile(
             selected_response_profile: profile,
             supported_response_profiles: startup_snapshot.supported_response_profiles.clone(),
             tts_enabled: startup_snapshot.tts_enabled,
+            tts_output_gain_db: startup_snapshot.tts_output_gain_db,
         };
     }
 
@@ -724,6 +727,7 @@ struct StartupSnapshot {
     voice_input_error: Option<String>,
     silence_timeout_ms: u64,
     tts_enabled: bool,
+    tts_output_gain_db: f32,
     supported_response_profiles: Vec<ResponseProfilePayload>,
 }
 
@@ -740,6 +744,7 @@ fn startup_ready_state_from_snapshot(
         selected_response_profile,
         supported_response_profiles: startup_snapshot.supported_response_profiles.clone(),
         tts_enabled: startup_snapshot.tts_enabled,
+        tts_output_gain_db: startup_snapshot.tts_output_gain_db,
     }
 }
 
@@ -759,6 +764,7 @@ fn startup_snapshot_for_profile_switch(
             voice_input_error,
             silence_timeout_ms,
             tts_enabled,
+            tts_output_gain_db,
             ..
         }
         | StartupStatePayload::Ready {
@@ -767,6 +773,7 @@ fn startup_snapshot_for_profile_switch(
             voice_input_error,
             silence_timeout_ms,
             tts_enabled,
+            tts_output_gain_db,
             ..
         } => Ok(StartupSnapshot {
             cue_asset_paths: cue_asset_paths.clone(),
@@ -774,6 +781,7 @@ fn startup_snapshot_for_profile_switch(
             voice_input_error: voice_input_error.clone(),
             silence_timeout_ms: *silence_timeout_ms,
             tts_enabled: *tts_enabled,
+            tts_output_gain_db: *tts_output_gain_db,
             supported_response_profiles,
         }),
         StartupStatePayload::Error { .. } => Err(format!(
@@ -1081,6 +1089,7 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                     }
                 };
             let tts_enabled = local_tts_runtime.is_some();
+            let tts_output_gain_db = config.local_tts.output_gain_db;
             let mut voice_input_errors = Vec::new();
             let parakeet_runtime =
                 match transcription::ParakeetRuntime::load(&config.parakeet_model_dir) {
@@ -1137,6 +1146,7 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                         selected_response_profile: selected_profile_at_startup,
                         supported_response_profiles: supported_response_profiles.clone(),
                         tts_enabled,
+                        tts_output_gain_db,
                     }
                 }
                 voxgolem_core::config::ResponseBackendConfig::Opencode { .. } => {
@@ -1149,6 +1159,7 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                         selected_response_profile: selected_profile_at_startup,
                         supported_response_profiles: supported_response_profiles.clone(),
                         tts_enabled,
+                        tts_output_gain_db,
                     }
                 }
             }));
@@ -1171,6 +1182,7 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                 let silence_timeout_ms = config.silence_timeout_ms;
                 let selected_response_profile = selected_profile_at_startup;
                 let supported_response_profiles = supported_response_profiles.clone();
+                let tts_output_gain_db = tts_output_gain_db;
                 let model_path = match model_path_for_profile(
                     selected_response_profile,
                     fast_model_path,
@@ -1211,6 +1223,7 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                                 selected_response_profile,
                                 supported_response_profiles,
                                 tts_enabled,
+                                tts_output_gain_db,
                             }
                         }
                         Err(error) => StartupStatePayload::Error {
@@ -1266,12 +1279,22 @@ fn initialize_local_tts_runtime(
         return Ok(None);
     }
 
+    if let Some(strict_espeak_root) = tts::resolve_strict_windows_espeak_data_directory()
+        .map_err(|error| format!("failed to resolve strict eSpeak data root: {error}"))?
+    {
+        log_tts_runtime_event(&format!(
+            "resolved strict eSpeak data root: {}",
+            strict_espeak_root.display()
+        ));
+    }
+
     let spec = tts::LocalTtsRuntimeSpec {
         enabled: true,
         model_path: Some(config.model_path.clone()),
         worker_count: config.worker_count,
         max_queue: config.max_queue,
         sample_rate_hz: config.sample_rate_hz,
+        max_duration_s: config.max_duration_s,
     };
 
     match tts::LocalTtsRuntime::new(spec) {
@@ -2225,6 +2248,7 @@ mod tests {
                 worker_count: 1,
                 max_queue: 8,
                 sample_rate_hz: 22_050,
+                max_duration_s: 300,
             },
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
@@ -2282,6 +2306,7 @@ mod tests {
                 worker_count: 1,
                 max_queue: 8,
                 sample_rate_hz: 22_050,
+                max_duration_s: 300,
             },
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
@@ -2320,6 +2345,7 @@ mod tests {
                 worker_count: 1,
                 max_queue: 8,
                 sample_rate_hz: 22_050,
+                max_duration_s: 300,
             },
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
@@ -2438,6 +2464,7 @@ mod tests {
                 worker_count: 1,
                 max_queue: 8,
                 sample_rate_hz: 22_050,
+                max_duration_s: 300,
             },
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
@@ -2569,6 +2596,7 @@ mod tests {
                 worker_count: 1,
                 max_queue: 8,
                 sample_rate_hz: 22_050,
+                max_duration_s: 300,
             },
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
@@ -2678,6 +2706,7 @@ mod tests {
                 worker_count: 1,
                 max_queue: 8,
                 sample_rate_hz: 22_050,
+                max_duration_s: 300,
             },
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
@@ -3045,6 +3074,7 @@ mod tests {
                 ResponseProfilePayload::Quality,
             ],
             tts_enabled: false,
+            tts_output_gain_db: 3.0,
         }));
 
         assert_eq!(
@@ -3069,6 +3099,7 @@ mod tests {
                 ResponseProfilePayload::Quality,
             ],
             tts_enabled: false,
+            tts_output_gain_db: 3.0,
         }));
 
         assert_eq!(

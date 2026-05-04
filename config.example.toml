@@ -23,3 +23,5 @@ model_path = "models/tts/jarvis.onnx"
 worker_count = 1
 max_queue = 8
 sample_rate_hz = 22050
+max_duration_s = 300
+output_gain_db = 3
