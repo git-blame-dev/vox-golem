@@ -119,6 +119,19 @@ echo [windows-verify] cargo test
 exit /b %errorlevel%
 
 :run_build
+echo [windows-verify] bun install
+cd /d "%REPO_ROOT%"
+call bun install
+if errorlevel 1 exit /b 1
+
+echo [windows-verify] bun run --cwd frontend/app build
+cd /d "%REPO_ROOT%"
+call bun run --cwd frontend/app build
+if errorlevel 1 exit /b 1
+
+set "TAURI_VERIFY_CONFIG=%TEMP%\voxgolem-tauri-verify-config-%RANDOM%%RANDOM%.json"
+> "%TAURI_VERIFY_CONFIG%" echo {"build":{"beforeBuildCommand":"cmd /c exit 0"}}
+
 echo [windows-verify] cargo tauri build --no-bundle
 set "CARGO_TAURI_EXE=%USERPROFILE%\.cargo\bin\cargo-tauri.exe"
 if not exist "%CARGO_TAURI_EXE%" (
@@ -131,5 +144,7 @@ set "CARGO_TAURI_EXE=cargo-tauri.exe"
 )
 set "TAURI_DIR=%REPO_ROOT%\apps\windows-tauri\src-tauri"
 cd /d "%TAURI_DIR%"
-"%CARGO_TAURI_EXE%" build --no-bundle
-exit /b %errorlevel%
+"%CARGO_TAURI_EXE%" build --config "%TAURI_VERIFY_CONFIG%" --no-bundle
+set "TAURI_BUILD_STATUS=%errorlevel%"
+del "%TAURI_VERIFY_CONFIG%" >nul 2>nul
+exit /b %TAURI_BUILD_STATUS%
