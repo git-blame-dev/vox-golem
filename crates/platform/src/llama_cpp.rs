@@ -156,6 +156,13 @@ impl std::error::Error for LlamaCppRuntimeError {}
 
 impl LlamaCppRuntime {
     pub fn start(spec: LlamaCppServerSpec) -> Result<Self, LlamaCppRuntimeError> {
+        if matches!(
+            send_http_request(spec.host(), spec.port(), "GET", "/health", None),
+            Ok(response) if response.status_code == 200
+        ) {
+            return Ok(Self::attach(spec));
+        }
+
         let executable_parent = spec.executable_path().parent().ok_or_else(|| {
             LlamaCppRuntimeError::MissingExecutableParent {
                 path: spec.executable_path().to_path_buf(),
@@ -482,9 +489,15 @@ struct ChatCompletionAssistantMessage {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_chat_completion_request, decode_chunked_body, parse_http_response, LlamaCppPrompt,
-        LlamaCppServerSpec,
+        build_chat_completion_request, decode_chunked_body, parse_http_response, send_http_request,
+        LlamaCppPrompt, LlamaCppRuntime, LlamaCppServerSpec,
     };
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn parse_http_response_reads_content_length_body() {
@@ -526,5 +539,59 @@ mod tests {
         assert_eq!(request.messages[0].content, "be concise");
         assert_eq!(request.messages[1].role, "user");
         assert_eq!(request.messages[1].content, "hello");
+    }
+
+    #[test]
+    fn start_reuses_running_server_and_does_not_stop_external_server_behavior() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("listener should expose local addr")
+            .port();
+        listener
+            .set_nonblocking(true)
+            .expect("listener should allow nonblocking mode");
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_for_thread = Arc::clone(&shutdown);
+        let server_thread = thread::spawn(move || {
+            while !shutdown_for_thread.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request_buffer = [0_u8; 1024];
+                        let _ = stream.read(&mut request_buffer);
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        );
+                        let _ = stream.flush();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("test server accept failed: {error}"),
+                }
+            }
+        });
+
+        let spec = LlamaCppServerSpec::new(
+            "llama-server.exe",
+            "model.gguf",
+            "127.0.0.1",
+            port,
+            "default",
+        );
+
+        let runtime =
+            LlamaCppRuntime::start(spec).expect("runtime should attach to running server");
+        drop(runtime);
+
+        let response = send_http_request("127.0.0.1", port, "GET", "/health", None)
+            .expect("health request should succeed after runtime drop");
+        assert_eq!(response.status_code, 200);
+
+        shutdown.store(true, Ordering::SeqCst);
+        server_thread
+            .join()
+            .expect("server thread should exit cleanly");
     }
 }
