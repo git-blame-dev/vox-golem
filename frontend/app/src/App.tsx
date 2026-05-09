@@ -181,9 +181,6 @@ function App() {
     [composerValue, runtimeStatus, startupState.kind],
   )
 
-  const canMarkSilence =
-    startupState.kind === 'ready' && startupState.voiceInputAvailable && runtimeStatus === 'listening'
-  const canResetToIdle = startupState.kind === 'ready' && runtimeStatus === 'error'
   const canToggleMic =
     startupState.kind === 'ready' && startupState.voiceInputAvailable && !micStarting
   const cueAssetPaths =
@@ -462,9 +459,7 @@ function App() {
   }
 
   const syncRuntimeControl = async (
-    command:
-      | 'mark_silence'
-      | 'reset_session',
+    command: 'mark_silence',
     options: {
       readonly args?: RuntimeControlArgs
       readonly fallbackEvent?: Parameters<typeof transitionRuntimeStatus>[1]
@@ -493,7 +488,7 @@ function App() {
     } catch (error) {
       const message = toDisplayErrorMessage(error)
 
-      recoverFromRuntimeControlError(command)
+      recoverFromRuntimeControlError()
       setMessages((currentMessages) => [
         ...currentMessages,
         {
@@ -506,15 +501,8 @@ function App() {
     }
   }
 
-  const recoverFromRuntimeControlError = (
-    command: 'mark_silence' | 'reset_session',
-  ): void => {
-    if (command === 'mark_silence') {
-      applyRuntimeStatus('sleeping')
-      return
-    }
-
-    enterRuntimeError()
+  const recoverFromRuntimeControlError = (): void => {
+    applyRuntimeStatus('sleeping')
   }
 
   const runPrompt = async (
@@ -1005,107 +993,6 @@ function App() {
 
   return (
     <div className="shell">
-      <header className="shell__header">
-        <p className="shell__eyebrow">VoxGolem</p>
-        <div className="shell__badges" aria-label="Runtime badges">
-          <span className="shell__badge">Mic {micActive ? 'on' : 'off'}</span>
-          <span className="shell__badge">
-            Voice {startupState.kind === 'ready' && startupState.voiceInputAvailable ? 'ready' : 'limited'}
-          </span>
-          <span className="shell__badge">Auto stop {autoStopOnSilence ? 'on' : 'off'}</span>
-          {runtimeStatus === 'listening' && wakeConfidence !== null ? (
-            <span className="shell__badge">Wake trigger score {wakeConfidence.toFixed(3)}</span>
-          ) : null}
-        </div>
-        {startupState.kind === 'error' ? (
-          <p className="shell__error">Startup error: {startupState.message}</p>
-        ) : null}
-        {startupState.kind === 'ready' && !startupState.voiceInputAvailable ? (
-          <p className="shell__error">
-            Voice input unavailable: {startupState.voiceInputError ?? 'Parakeet failed to initialize'}
-          </p>
-        ) : null}
-        {startupState.kind === 'warming_model' ? (
-          <p className="shell__loading">Model loading: {startupState.message}</p>
-        ) : null}
-        <div className="shell__toggles-line">
-          {responseProfileState !== null ? (
-            <div className="shell__controls" role="group" aria-label="Response profile controls">
-              <label className="shell__select-field" htmlFor="responseProfileSelect">
-                Response profile
-              </label>
-              <select
-                id="responseProfileSelect"
-                className="shell__select"
-                value={responseProfileState.selected}
-                disabled={!canSwitchResponseProfile || responseProfileState.supported.length < 2}
-                onChange={(event) => {
-                  const nextProfile = parseResponseProfileValue(event.target.value)
-                  if (nextProfile === null || !responseProfileState.supported.includes(nextProfile)) {
-                    return
-                  }
-
-                  void switchResponseProfile(nextProfile)
-                }}
-              >
-                {RESPONSE_PROFILE_ORDER.map((profile) => (
-                  <option
-                    key={profile}
-                    value={profile}
-                    disabled={!responseProfileState.supported.includes(profile)}
-                  >
-                    {getResponseProfileLabel(profile)}
-                  </option>
-                ))}
-              </select>
-            </div>
-          ) : null}
-          <label className="shell__toggle">
-            <input
-              type="checkbox"
-              checked={autoStopOnSilence}
-              onChange={(event) => setAutoStopOnSilence(event.target.checked)}
-              disabled={startupState.kind !== 'ready' || !startupState.voiceInputAvailable}
-            />
-            <span>Auto stop on silence</span>
-          </label>
-        </div>
-        <div className="shell__controls" role="group" aria-label="Runtime controls">
-          <button
-            type="button"
-            className="shell__control"
-            onClick={toggleMic}
-            disabled={!canToggleMic}
-          >
-            {micStarting ? 'Starting mic...' : micActive ? 'Stop mic' : 'Start mic'}
-          </button>
-          <button
-            type="button"
-            className="shell__control"
-            onClick={() => {
-              void handleMarkSilence()
-            }}
-            disabled={!canMarkSilence}
-          >
-            Stop listening and process
-          </button>
-          <button
-            type="button"
-            className="shell__control"
-            onClick={() => {
-              void syncRuntimeControl(
-                'reset_session',
-                {
-                  fallbackEvent: 'recover_from_error',
-                },
-              )
-            }}
-            disabled={!canResetToIdle}
-          >
-            Reset to idle
-          </button>
-        </div>
-      </header>
 
       <main ref={conversationRef} className="conversation" aria-live="polite">
         {messages.map((message) => (
@@ -1124,7 +1011,54 @@ function App() {
           placeholder="Type a prompt..."
           rows={3}
         />
+        {startupState.kind === 'error' ? (
+          <p className="shell__error">Startup error: {startupState.message}</p>
+        ) : null}
+        {startupState.kind === 'ready' && !startupState.voiceInputAvailable ? (
+          <p className="shell__error">
+            Voice input unavailable: {startupState.voiceInputError ?? 'Parakeet failed to initialize'}
+          </p>
+        ) : null}
+        {startupState.kind === 'warming_model' ? (
+          <p className="shell__loading">Model loading: {startupState.message}</p>
+        ) : null}
         <div className="composer__actions">
+          {responseProfileState !== null ? (
+            <select
+              id="responseProfileSelect"
+              className="shell__select"
+              aria-label="Response profile"
+              value={responseProfileState.selected}
+              disabled={!canSwitchResponseProfile || responseProfileState.supported.length < 2}
+              onChange={(event) => {
+                const nextProfile = parseResponseProfileValue(event.target.value)
+                if (nextProfile === null || !responseProfileState.supported.includes(nextProfile)) {
+                  return
+                }
+
+                void switchResponseProfile(nextProfile)
+              }}
+            >
+              {RESPONSE_PROFILE_ORDER.map((profile) => (
+                <option
+                  key={profile}
+                  value={profile}
+                  disabled={!responseProfileState.supported.includes(profile)}
+                >
+                  {getResponseProfileLabel(profile)}
+                </option>
+              ))}
+            </select>
+          ) : null}
+          <label className="shell__toggle">
+            <input
+              type="checkbox"
+              checked={autoStopOnSilence}
+              onChange={(event) => setAutoStopOnSilence(event.target.checked)}
+              disabled={startupState.kind !== 'ready' || !startupState.voiceInputAvailable}
+            />
+            <span>Auto Stop</span>
+          </label>
           <label className="shell__toggle" htmlFor="tts-toggle">
             <input
               id="tts-toggle"
@@ -1137,6 +1071,14 @@ function App() {
             />
             <span>TTS</span>
           </label>
+          <button
+            type="button"
+            className="shell__control"
+            onClick={toggleMic}
+            disabled={!canToggleMic}
+          >
+            {micStarting ? 'Starting mic...' : micActive ? 'Stop mic' : 'Start mic'}
+          </button>
           <div className="composer__send-side">
             {wakeConfidence !== null ? (
               <div

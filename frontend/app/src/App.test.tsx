@@ -56,6 +56,8 @@ describe('App', () => {
     const composer = getComposer(container)
     const sendButton = getSendButton(container)
     const conversation = getConversation(container)
+    expect(container.querySelector('.shell__header')).toBeNull()
+    expect(conversation).toBeTruthy()
     const scrollToSpy = vi.fn()
 
     Object.defineProperty(conversation, 'scrollTo', {
@@ -183,7 +185,7 @@ describe('App', () => {
       destination = {} as AudioDestinationNode
       state: AudioContextState = 'suspended'
 
-      createBuffer(_channels: number, _length: number, _sampleRate: number): AudioBuffer {
+    createBuffer(): AudioBuffer {
         return {
           copyToChannel: () => {},
         } as unknown as AudioBuffer
@@ -780,7 +782,7 @@ describe('App', () => {
 
     const { container } = await renderApp()
 
-    expect(container.textContent).toContain('Voice limited')
+    expect(container.textContent).toContain('Model loading: Loading local Gemma model...')
 
     await act(async () => {
       await new Promise((resolve) => window.setTimeout(resolve, 600))
@@ -922,20 +924,15 @@ describe('App', () => {
     const { container } = await renderApp()
 
     await act(async () => {
-      getAutoStopToggle(container).click()
-      await Promise.resolve()
-    })
-
-    await act(async () => {
       await onFrame?.([0.04, -0.04, 0.04, -0.04])
       await Promise.resolve()
     })
 
     expect(playedSources).toEqual(['test-assets/configured-start.mp3'])
-    const stopListeningButton = getControlButton(container, 'Stop listening and process')
+    nowMs = 2_000
 
     await act(async () => {
-      stopListeningButton.click()
+      await onFrame?.([0.001, -0.001, 0.001, -0.001])
       await Promise.resolve()
     })
 
@@ -1011,7 +1008,7 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(container.textContent).toContain('Wake trigger score 0.670')
+    expect(container.textContent).toContain('wake: 67%')
   })
 
   it('starts and stops default microphone capture and forwards live frames', async () => {
@@ -1249,7 +1246,7 @@ describe('App', () => {
 
     expect(invokedCommands).toContain('switch_response_profile')
     expect(invokedCommands.filter((command) => command === 'ingest_audio_frame')).toHaveLength(1)
-    expect(getControlButton(container, 'Reset to idle').disabled).toBe(true)
+    expect(container.textContent).not.toContain('Reset to idle')
     expect(container.textContent).not.toContain('Runtime control error')
   })
 
@@ -1787,7 +1784,7 @@ describe('App', () => {
     expect(container.textContent).toContain('transcript:\nOpen the pull request')
     expect(container.textContent).toContain('Open the pull request')
     expect(container.textContent).toContain('Voice execution response')
-    expect(container.textContent).toContain('Mic on')
+    expect(container.textContent).toContain('Stop mic')
   })
 
   it('uses configured startup silence timeout for auto-stop timing', async () => {
@@ -1981,7 +1978,7 @@ describe('App', () => {
       'mark_silence',
     ])
     expect(container.textContent).toContain('Runtime control error (mark_silence): utterance transcription failed: InvalidTranscript(EmptyText)')
-    expect(container.textContent).toContain('Mic on')
+    expect(container.textContent).toContain('Stop mic')
   })
 
   it('waits for the stop cue before starting silence processing', async () => {
@@ -2167,7 +2164,7 @@ describe('App', () => {
     expect(startLiveAudioSourceMock).toHaveBeenCalledTimes(1)
     expect(container.textContent).toContain('live_audio:\ndefault microphone started')
     expect(container.querySelector('details.shell__manual-controls')).toBeNull()
-    expect(getControlButton(container, 'Stop listening and process').disabled).toBe(true)
+    expect(container.textContent).not.toContain('Stop listening and process')
   })
 
   it('does not auto-stop on silence when the toggle is disabled', async () => {
@@ -2253,12 +2250,13 @@ describe('App', () => {
       'ingest_audio_frame',
       'ingest_audio_frame',
     ])
-    expect(container.textContent).toContain('Mic on')
+    expect(container.textContent).toContain('Stop mic')
   })
 
   it('surfaces raw runtime control rejection messages', async () => {
     const stop = vi.fn()
     let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
+    let nowMs = 1_000
 
     class FakeAudio {
       play(): Promise<void> {
@@ -2270,6 +2268,8 @@ describe('App', () => {
       configurable: true,
       value: FakeAudio,
     })
+
+    Date.now = () => nowMs
 
     startLiveAudioSourceMock.mockImplementation(async (options) => {
       onFrame = options.onFrame
@@ -2321,8 +2321,10 @@ describe('App', () => {
       await Promise.resolve()
     })
 
+    nowMs = 3_000
+
     await act(async () => {
-      getControlButton(container, 'Stop listening and process').click()
+      await onFrame?.([0.001, -0.001, 0.001, -0.001])
       await Promise.resolve()
     })
 
@@ -2384,11 +2386,7 @@ function getSendButton(container: HTMLElement): HTMLButtonElement {
 
 function getControlButton(
   container: HTMLElement,
-  label:
-    | 'Start mic'
-    | 'Stop mic'
-    | 'Stop listening and process'
-    | 'Reset to idle',
+  label: 'Start mic' | 'Stop mic',
 ): HTMLButtonElement {
   const buttons = Array.from(container.querySelectorAll<HTMLButtonElement>('button'))
   const button = buttons.find((candidate) => candidate.textContent?.trim() === label)
@@ -2401,7 +2399,9 @@ function getControlButton(
 }
 
 function getAutoStopToggle(container: HTMLElement): HTMLInputElement {
-  const toggle = container.querySelector<HTMLInputElement>('.shell__toggle input[type="checkbox"]')
+  const labels = Array.from(container.querySelectorAll<HTMLLabelElement>('label.shell__toggle'))
+  const autoStopLabel = labels.find((label) => label.textContent?.includes('Auto Stop'))
+  const toggle = autoStopLabel?.querySelector<HTMLInputElement>('input[type="checkbox"]') ?? null
 
   if (toggle === null) {
     throw new Error('Missing auto stop on silence toggle')

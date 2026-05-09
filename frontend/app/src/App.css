@@ -7,7 +7,7 @@
   box-shadow: 0 20px 45px rgba(10, 21, 38, 0.12);
   backdrop-filter: blur(8px);
   display: grid;
-  grid-template-rows: auto 1fr auto;
+  grid-template-rows: 1fr auto;
   height: calc(100vh - 3rem);
   overflow: hidden;
 }
@@ -18,84 +18,25 @@
   }
 }
 
-.shell__header {
-  padding: 1.25rem 1.5rem;
-  border-bottom: 1px solid #e1e5eb;
-}
-
-.shell__eyebrow {
-  margin: 0;
-  font-size: 0.75rem;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: #4f667f;
-}
-
-.shell__badges {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.45rem;
-  margin-top: 0.75rem;
-}
-
-.shell__badge {
-  border: 1px solid #c7d9f5;
-  background: #f3f8ff;
-  color: #23405f;
-  border-radius: 999px;
-  padding: 0.2rem 0.55rem;
-  font-size: 0.78rem;
-}
-
 .shell__error {
-  margin: 0.55rem 0 0;
+  margin: 0;
   color: #8c1d18;
   font-size: 0.9rem;
 }
 
 .shell__loading {
-  margin: 0.55rem 0 0;
+  margin: 0;
   color: #2f4a66;
   font-size: 0.9rem;
-}
-
-.shell__controls {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-  margin-top: 0.8rem;
-}
-
-.shell__toggles-line {
-  display: flex;
-  align-items: center;
-  flex-wrap: nowrap;
-  gap: 0.8rem;
-  margin-top: 0.8rem;
-  overflow-x: auto;
-}
-
-.shell__toggles-line .shell__controls,
-.shell__toggles-line .shell__toggle {
-  margin-top: 0;
-}
-
-.shell__toggles-line .shell__controls {
-  flex-wrap: nowrap;
-}
-
-.shell__toggles-line .shell__toggle,
-.shell__toggles-line .shell__select-field {
-  white-space: nowrap;
 }
 
 .shell__toggle {
   display: inline-flex;
   align-items: center;
   gap: 0.45rem;
-  margin-top: 0.8rem;
   color: #2f4a66;
   font-size: 0.85rem;
+  white-space: nowrap;
 }
 
 .shell__toggle input {
@@ -110,17 +51,12 @@
   font-size: 0.78rem;
   padding: 0.35rem 0.6rem;
   cursor: pointer;
+  white-space: nowrap;
 }
 
 .shell__control:disabled {
   opacity: 0.48;
   cursor: not-allowed;
-}
-
-.shell__select-field {
-  align-self: center;
-  color: #2f4a66;
-  font-size: 0.82rem;
 }
 
 .shell__select {
@@ -130,6 +66,7 @@
   border-radius: 0.6rem;
   font-size: 0.78rem;
   padding: 0.35rem 0.6rem;
+  max-width: 12rem;
 }
 
 .shell__select:disabled {
@@ -211,8 +148,8 @@
 .composer__actions {
   margin-top: 0.7rem;
   display: flex;
-  justify-content: space-between;
   align-items: center;
+  flex-wrap: wrap;
   gap: 0.6rem;
 }
 
@@ -225,6 +162,7 @@
   display: inline-flex;
   align-items: center;
   gap: 0.5rem;
+  margin-left: auto;
 }
 
 .composer__wake {
@@ -288,7 +226,6 @@
     }
   }
 
-  .shell__header,
   .conversation,
   .composer {
     padding-left: 1rem;
@@ -296,12 +233,12 @@
   }
 
   .composer__actions {
-    flex-direction: column;
     align-items: stretch;
   }
 
   .composer__send-side {
     width: 100%;
+    margin-left: 0;
     justify-content: space-between;
   }
 
