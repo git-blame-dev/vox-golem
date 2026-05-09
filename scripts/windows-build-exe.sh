@@ -9,16 +9,25 @@ usage() {
 Windows build helper for VoxGolem.
 
 Usage:
-  windows-build-exe.sh         Build the native VoxGolem.exe.
+windows-build-exe.sh                 Build standalone native VoxGolem.exe (no bundle).
+windows-build-exe.sh --bundle        Build bundled release installer artifacts (NSIS).
 EOF
 }
 
+build_mode="no-bundle"
+
 case "${1-}" in
-  "" ) ;;
-  -h|--help|/? )
-    usage
-    exit 0
-    ;;
+"" ) ;;
+--bundle|--release )
+build_mode="bundle"
+;;
+--no-bundle|--standalone )
+build_mode="no-bundle"
+;;
+-h|--help|/? )
+usage
+exit 0
+;;
   * )
     printf 'Unknown argument: %s\n\n' "$1" >&2
     usage >&2
@@ -58,6 +67,7 @@ mkdir -p "$repo_root/target"
 
 tauri_build_config="$repo_root/target/voxgolem-tauri-build-config.json"
 temp_cmd="$repo_root/target/windows-build-exe-temp.cmd"
+tauri_icon_ico="$repo_root/apps/windows-tauri/src-tauri/icons/icon.ico"
 
 cleanup() {
   rm -f "$temp_cmd" "$tauri_build_config"
@@ -65,12 +75,23 @@ cleanup() {
 
 trap cleanup EXIT HUP INT TERM
 
-printf '%s\n' '{"build":{"beforeBuildCommand":"cmd /c exit 0"}}' > "$tauri_build_config"
-
 repo_root_win=$(wslpath -w "$repo_root")
 tauri_dir_win=$(wslpath -w "$repo_root/apps/windows-tauri/src-tauri")
 tauri_build_config_win=$(wslpath -w "$tauri_build_config")
 temp_cmd_win=$(wslpath -w "$temp_cmd")
+tauri_icon_ico_win=$(wslpath -w "$tauri_icon_ico" | tr '\\' '/')
+
+cat > "$tauri_build_config" <<EOF
+{"build":{"beforeBuildCommand":"cmd /c exit 0"},"bundle":{"icon":["$tauri_icon_ico_win"]}}
+EOF
+
+if [ "$build_mode" = "bundle" ]; then
+tauri_build_log="cargo tauri build"
+tauri_build_args='--config "%TAURI_BUILD_CONFIG%" --bundles nsis'
+else
+tauri_build_log="cargo tauri build --no-bundle"
+tauri_build_args='--config "%TAURI_BUILD_CONFIG%" --no-bundle'
+fi
 
 cat > "$temp_cmd" <<EOF
 @echo off
@@ -152,8 +173,8 @@ echo [windows-build-exe] stopping running VoxGolem executables
 powershell.exe -NoProfile -NonInteractive -Command ^
   "\$stopped = \$false; \$names = @('vox-golem', 'vox-golem-windows'); foreach (\$name in \$names) { \$procs = Get-Process -Name \$name -ErrorAction SilentlyContinue; if (\$null -ne \$procs) { \$procs | Stop-Process -Force -ErrorAction SilentlyContinue; \$stopped = \$true } }; if (\$stopped) { Start-Sleep -Seconds 1 }" >nul
 
-echo [windows-build-exe] cargo tauri build --no-bundle
-"%CARGO_TAURI_EXE%" build --config "%TAURI_BUILD_CONFIG%" --no-bundle
+echo [windows-build-exe] $tauri_build_log
+"%CARGO_TAURI_EXE%" build $tauri_build_args
 if errorlevel 1 exit /b 1
 
 echo [windows-build-exe] Built native app executable:
