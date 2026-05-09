@@ -1,5 +1,7 @@
 # VoxGolem
 
+[![Linux CI](https://github.com/git-blame-dev/vox-golem/actions/workflows/linux-ci.yml/badge.svg?branch=main)](https://github.com/git-blame-dev/vox-golem/actions/workflows/linux-ci.yml)
+
 VoxGolem is a local AI voice assistant that listens hands-free, stops automatically, and runs local model profiles so you can trade speed for reasoning depth.
 
 The Windows-first baseline MVP voice path is now in place: live mic capture feeds wake-word detection, backend-owned VAD, local Parakeet transcription, and the existing `opencode` execution path.
