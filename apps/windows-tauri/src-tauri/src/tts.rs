@@ -421,11 +421,6 @@ fn ensure_windows_espeak_data_directory_env() -> Result<(), String> {
 }
 
 fn ensure_windows_cuda_path_for_onnxruntime() {
-    #[cfg(not(windows))]
-    {
-        return;
-    }
-
     #[cfg(windows)]
     {
         let mut candidates = Vec::<PathBuf>::new();
