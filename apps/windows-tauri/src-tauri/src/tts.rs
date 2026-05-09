@@ -1,4 +1,5 @@
 use std::env;
+#[cfg(windows)]
 use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Path, PathBuf};
