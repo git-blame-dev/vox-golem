@@ -371,12 +371,13 @@ fn switch_response_profile(
         supported_response_profiles,
     )?;
 
-    {
-        let mut runtime = app_state
-            .llama_cpp_runtime
-            .lock()
-            .map_err(|_| String::from("local llama.cpp runtime lock is poisoned"))?;
-        *runtime = None;
+    let previous_runtime = app_state
+        .llama_cpp_runtime
+        .lock()
+        .map_err(|_| String::from("local llama.cpp runtime lock is poisoned"))?
+        .take();
+    if let Some(mut runtime) = previous_runtime {
+        runtime.shutdown_owned();
     }
 
     let startup_state = Arc::clone(&app_state.startup_state);
@@ -417,13 +418,23 @@ fn switch_response_profile(
     std::thread::spawn(move || {
         let start_result = voxgolem_platform::llama_cpp::LlamaCppRuntime::start(server_spec);
         if response_profile_switch_generation.load(Ordering::SeqCst) != switch_generation {
+            shutdown_llama_start_result(start_result);
             return;
         }
 
         let next_state = match start_result {
             Ok(runtime) => {
-                if let Ok(mut guard) = llama_cpp_runtime.lock() {
-                    *guard = Some(runtime);
+                if !store_llama_runtime_if_current(
+                    runtime,
+                    &llama_cpp_runtime,
+                    &response_profile_switch_generation,
+                    switch_generation,
+                ) {
+                    return;
+                }
+
+                if response_profile_switch_generation.load(Ordering::SeqCst) != switch_generation {
+                    return;
                 }
 
                 if let Err(error) = persist_selected_response_profile(profile) {
@@ -436,27 +447,49 @@ fn switch_response_profile(
 
                 startup_ready_state_from_snapshot(&startup_snapshot, profile)
             }
-            Err(error) => match voxgolem_platform::llama_cpp::LlamaCppRuntime::start(
-                fallback_server_spec,
-            ) {
-                Ok(runtime) => {
-                    if let Ok(mut guard) = llama_cpp_runtime.lock() {
-                        *guard = Some(runtime);
-                    }
-
-                    if let Ok(mut selected) = selected_response_profile.lock() {
-                        *selected = current_profile;
-                    }
-
-                    startup_ready_state_from_snapshot(&startup_snapshot, current_profile)
+            Err(error) => {
+                let restore_result =
+                    voxgolem_platform::llama_cpp::LlamaCppRuntime::start(fallback_server_spec);
+                if response_profile_switch_generation.load(Ordering::SeqCst) != switch_generation {
+                    shutdown_llama_start_result(restore_result);
+                    return;
                 }
-                Err(restore_error) => StartupStatePayload::Error {
-                    message: format!(
-                        "failed to initialize local llama.cpp runtime: {error}; failed to restore previous profile runtime: {restore_error}"
-                    ),
-                },
-            },
+
+                match restore_result {
+                    Ok(runtime) => {
+                        if !store_llama_runtime_if_current(
+                            runtime,
+                            &llama_cpp_runtime,
+                            &response_profile_switch_generation,
+                            switch_generation,
+                        ) {
+                            return;
+                        }
+
+                        if response_profile_switch_generation.load(Ordering::SeqCst)
+                            != switch_generation
+                        {
+                            return;
+                        }
+
+                        if let Ok(mut selected) = selected_response_profile.lock() {
+                            *selected = current_profile;
+                        }
+
+                        startup_ready_state_from_snapshot(&startup_snapshot, current_profile)
+                    }
+                    Err(restore_error) => StartupStatePayload::Error {
+                        message: format!(
+                            "failed to initialize local llama.cpp runtime: {error}; failed to restore previous profile runtime: {restore_error}"
+                        ),
+                    },
+                }
+            }
         };
+
+        if response_profile_switch_generation.load(Ordering::SeqCst) != switch_generation {
+            return;
+        }
 
         if let Ok(mut guard) = startup_state.lock() {
             *guard = next_state;
@@ -1204,13 +1237,19 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                     if response_profile_switch_generation.load(Ordering::SeqCst)
                         != startup_generation
                     {
+                        shutdown_llama_start_result(start_result);
                         return;
                     }
 
                     let next_state = match start_result {
                         Ok(runtime) => {
-                            if let Ok(mut guard) = llama_cpp_runtime.lock() {
-                                *guard = Some(runtime);
+                            if !store_llama_runtime_if_current(
+                                runtime,
+                                &llama_cpp_runtime,
+                                &response_profile_switch_generation,
+                                startup_generation,
+                            ) {
+                                return;
                             }
 
                             StartupStatePayload::Ready {
@@ -1231,6 +1270,12 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                             ),
                         },
                     };
+
+                    if response_profile_switch_generation.load(Ordering::SeqCst)
+                        != startup_generation
+                    {
+                        return;
+                    }
 
                     if let Ok(mut guard) = startup_state.lock() {
                         *guard = next_state;
@@ -2087,6 +2132,66 @@ fn reset_voice_pipeline_to_waiting(
     Ok(())
 }
 
+fn shutdown_llama_cpp_runtime_for_exit(app_state: &AppState) {
+    app_state
+        .response_profile_switch_generation
+        .fetch_add(1, Ordering::SeqCst);
+
+    let runtime = app_state
+        .llama_cpp_runtime
+        .lock()
+        .map(|mut guard| guard.take())
+        .unwrap_or(None);
+
+    if let Some(mut runtime) = runtime {
+        runtime.shutdown_owned();
+    }
+}
+
+fn shutdown_llama_start_result(
+    start_result: Result<
+        voxgolem_platform::llama_cpp::LlamaCppRuntime,
+        voxgolem_platform::llama_cpp::LlamaCppRuntimeError,
+    >,
+) {
+    if let Ok(mut runtime) = start_result {
+        runtime.shutdown_owned();
+    }
+}
+
+fn store_llama_runtime_if_current(
+    mut runtime: voxgolem_platform::llama_cpp::LlamaCppRuntime,
+    llama_cpp_runtime: &Arc<Mutex<Option<voxgolem_platform::llama_cpp::LlamaCppRuntime>>>,
+    response_profile_switch_generation: &Arc<AtomicU64>,
+    expected_generation: u64,
+) -> bool {
+    if response_profile_switch_generation.load(Ordering::SeqCst) != expected_generation {
+        runtime.shutdown_owned();
+        return false;
+    }
+
+    let Ok(mut guard) = llama_cpp_runtime.lock() else {
+        runtime.shutdown_owned();
+        return false;
+    };
+
+    if response_profile_switch_generation.load(Ordering::SeqCst) != expected_generation {
+        runtime.shutdown_owned();
+        return false;
+    }
+
+    *guard = Some(runtime);
+
+    if response_profile_switch_generation.load(Ordering::SeqCst) != expected_generation {
+        if let Some(mut stale_runtime) = guard.take() {
+            stale_runtime.shutdown_owned();
+        }
+        return false;
+    }
+
+    true
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
@@ -2107,10 +2212,20 @@ pub fn run() {
             reset_session
         ]);
 
-    if let Err(error) = builder.run(tauri::generate_context!()) {
-        eprintln!("failed to run vox-golem tauri shell: {error}");
-        std::process::exit(1);
-    }
+    let app = match builder.build(tauri::generate_context!()) {
+        Ok(app) => app,
+        Err(error) => {
+            eprintln!("failed to build vox-golem tauri shell: {error}");
+            std::process::exit(1);
+        }
+    };
+
+    app.run(|app_handle, event| {
+        if matches!(event, tauri::RunEvent::Exit) {
+            let app_state = app_handle.state::<AppState>();
+            shutdown_llama_cpp_runtime_for_exit(&app_state);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -2125,11 +2240,11 @@ mod tests {
         persist_tts_enabled, process_wake_word_frame, prompt_result_error_message,
         reset_voice_pipeline_to_waiting, reset_wake_word_runtime, resolve_effective_tts_enabled,
         response_profile_state_path, runtime_log_path, runtime_phase_response_from_state,
-        supported_response_profiles, to_runtime_phase_payload, transcribe_finished_utterance,
-        transcription_ready_samples, wake_word_event_timestamp, LlamaConversationTurn,
-        PromptExecutionEventPayload, ResponseProfilePayload, RuntimePhasePayload,
-        RuntimePhaseResponsePayload, RuntimeTelemetryPayload, DEFAULT_SILENCE_TIMEOUT_MS,
-        LLAMA_CPP_ROLLOVER_REASON,
+        shutdown_llama_cpp_runtime_for_exit, supported_response_profiles, to_runtime_phase_payload,
+        transcribe_finished_utterance, transcription_ready_samples, wake_word_event_timestamp,
+        LlamaConversationTurn, PromptExecutionEventPayload, ResponseProfilePayload,
+        RuntimePhasePayload, RuntimePhaseResponsePayload, RuntimeTelemetryPayload,
+        DEFAULT_SILENCE_TIMEOUT_MS, LLAMA_CPP_ROLLOVER_REASON,
     };
     use crate::wake_word::{WakeWordDetection, WakeWordRuntime};
     use std::io::{Read, Write};
@@ -2139,6 +2254,28 @@ mod tests {
     use std::thread;
 
     static APPDATA_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn shutdown_llama_cpp_runtime_for_exit_invalidates_pending_startups_behavior() {
+        let app_state = build_startup_error_app_state(
+            default_voice_pipeline_config(),
+            String::from("startup failed"),
+        );
+
+        shutdown_llama_cpp_runtime_for_exit(&app_state);
+
+        assert_eq!(
+            app_state
+                .response_profile_switch_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(app_state
+            .llama_cpp_runtime
+            .lock()
+            .expect("runtime lock should not be poisoned")
+            .is_none());
+    }
 
     #[test]
     fn prompt_result_error_message_prefers_non_zero_exit_code() {

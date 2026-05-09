@@ -4696,6 +4696,7 @@ version = "0.0.0"
 dependencies = [
  "serde",
  "serde_json",
+ "win32job",
 ]
 
 [[package]]
@@ -4990,6 +4991,16 @@ dependencies = [
  "home",
  "once_cell",
  "rustix 0.38.44",
+]
+
+[[package]]
+name = "win32job"
+version = "2.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c6a6724ccfbf34154a8691bd868b0fcd2be2ca3f7b47b32614654f1a01b191c"
+dependencies = [
+ "thiserror 1.0.69",
+ "windows",
 ]
 
 [[package]]

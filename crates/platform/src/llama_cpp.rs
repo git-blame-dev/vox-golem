@@ -7,6 +7,12 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+use std::os::windows::{io::AsRawHandle, process::CommandExt};
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -61,6 +67,8 @@ impl LlamaCppServerSpec {
 pub struct LlamaCppRuntime {
     spec: LlamaCppServerSpec,
     child: Option<Child>,
+    #[cfg(windows)]
+    process_job: Option<win32job::Job>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +107,7 @@ pub struct LlamaCppChatResponse {
 pub enum LlamaCppRuntimeError {
     MissingExecutableParent { path: PathBuf },
     SpawnFailed { details: String },
+    ProcessJobFailed { details: String },
     StartupTimedOut { host: String, port: u16 },
     ServerExited { exit_code: Option<i32> },
     HttpFailed { details: String },
@@ -119,6 +128,12 @@ impl Display for LlamaCppRuntimeError {
             }
             Self::SpawnFailed { details } => {
                 write!(formatter, "failed to start llama.cpp server: {details}")
+            }
+            Self::ProcessJobFailed { details } => {
+                write!(
+                    formatter,
+                    "failed to supervise llama.cpp server process: {details}"
+                )
             }
             Self::StartupTimedOut { host, port } => {
                 write!(
@@ -169,7 +184,8 @@ impl LlamaCppRuntime {
             }
         })?;
 
-        let child = Command::new(spec.executable_path())
+        let mut command = Command::new(spec.executable_path());
+        command
             .current_dir(executable_parent)
             .args([
                 "--host",
@@ -190,22 +206,59 @@ impl LlamaCppRuntime {
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        configure_llama_server_command(&mut command);
+
+        let mut child = command
             .spawn()
             .map_err(|error| LlamaCppRuntimeError::SpawnFailed {
                 details: error.to_string(),
             })?;
 
+        #[cfg(windows)]
+        let process_job = create_owned_process_job(&child).inspect_err(|_| {
+            let _ = child.kill();
+            let _ = child.wait();
+        })?;
+        #[cfg(not(windows))]
+        create_owned_process_job(&child).inspect_err(|_| {
+            let _ = child.kill();
+            let _ = child.wait();
+        })?;
+
         let mut runtime = Self {
             spec,
             child: Some(child),
+            #[cfg(windows)]
+            process_job,
         };
         runtime.wait_until_ready()?;
         Ok(runtime)
     }
 
     pub fn attach(spec: LlamaCppServerSpec) -> Self {
-        Self { spec, child: None }
+        Self {
+            spec,
+            child: None,
+            #[cfg(windows)]
+            process_job: None,
+        }
+    }
+
+    pub fn is_owned(&self) -> bool {
+        self.child.is_some()
+    }
+
+    pub fn shutdown_owned(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        #[cfg(windows)]
+        {
+            self.process_job = None;
+        }
     }
 
     pub fn chat(
@@ -286,11 +339,40 @@ impl LlamaCppRuntime {
 
 impl Drop for LlamaCppRuntime {
     fn drop(&mut self) {
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        self.shutdown_owned();
     }
+}
+
+fn configure_llama_server_command(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = command;
+}
+
+#[cfg(windows)]
+fn create_owned_process_job(child: &Child) -> Result<Option<win32job::Job>, LlamaCppRuntimeError> {
+    let mut limit_info = win32job::ExtendedLimitInfo::new();
+    limit_info.limit_kill_on_job_close();
+
+    let job = win32job::Job::create_with_limit_info(&limit_info).map_err(|error| {
+        LlamaCppRuntimeError::ProcessJobFailed {
+            details: error.to_string(),
+        }
+    })?;
+    job.assign_process(child.as_raw_handle() as isize)
+        .map_err(|error| LlamaCppRuntimeError::ProcessJobFailed {
+            details: error.to_string(),
+        })?;
+
+    Ok(Some(job))
+}
+
+#[cfg(not(windows))]
+fn create_owned_process_job(_child: &Child) -> Result<(), LlamaCppRuntimeError> {
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -583,6 +665,7 @@ mod tests {
 
         let runtime =
             LlamaCppRuntime::start(spec).expect("runtime should attach to running server");
+        assert!(!runtime.is_owned());
         drop(runtime);
 
         let response = send_http_request("127.0.0.1", port, "GET", "/health", None)
