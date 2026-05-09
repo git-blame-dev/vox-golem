@@ -1,6 +1,7 @@
 # VoxGolem
 
 [![Linux CI](https://github.com/git-blame-dev/vox-golem/actions/workflows/linux-ci.yml/badge.svg?branch=main)](https://github.com/git-blame-dev/vox-golem/actions/workflows/linux-ci.yml)
+[![Windows CI](https://github.com/git-blame-dev/vox-golem/actions/workflows/windows-ci.yml/badge.svg?branch=main)](https://github.com/git-blame-dev/vox-golem/actions/workflows/windows-ci.yml)
 
 VoxGolem is a local AI voice assistant that listens hands-free, stops automatically, and runs local model profiles so you can trade speed for reasoning depth.
 
