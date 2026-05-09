@@ -119,6 +119,17 @@ echo [windows-verify] cargo test
 exit /b %errorlevel%
 
 :run_build
-echo [windows-verify] cargo build
-"%CARGO_EXE%" build
+echo [windows-verify] cargo tauri build --no-bundle
+set "CARGO_TAURI_EXE=%USERPROFILE%\.cargo\bin\cargo-tauri.exe"
+if not exist "%CARGO_TAURI_EXE%" (
+where cargo-tauri.exe >nul 2>nul
+if errorlevel 1 (
+>&2 echo Tauri CLI was not found. Install it with: cargo install tauri-cli --version "^2"
+exit /b 1
+)
+set "CARGO_TAURI_EXE=cargo-tauri.exe"
+)
+set "TAURI_DIR=%REPO_ROOT%\apps\windows-tauri\src-tauri"
+cd /d "%TAURI_DIR%"
+"%CARGO_TAURI_EXE%" build --no-bundle
 exit /b %errorlevel%
