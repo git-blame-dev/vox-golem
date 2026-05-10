@@ -187,9 +187,9 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
         with:
           path: ${{ github.workspace }}\.sccache
-          key: sccache-windows-tauri-${{ runner.os }}-stable-${{ env.SCCACHE_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          key: sccache-windows-tauri-v2-${{ runner.os }}-stable-${{ env.SCCACHE_VERSION }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            sccache-windows-tauri-${{ runner.os }}-stable-${{ env.SCCACHE_VERSION }}-
+            sccache-windows-tauri-v2-${{ runner.os }}-stable-${{ env.SCCACHE_VERSION }}-
 
       - name: Configure sccache
         shell: pwsh
@@ -201,9 +201,12 @@ jobs:
           }
           $sccacheDir = Join-Path $env:GITHUB_WORKSPACE ".sccache"
           New-Item -ItemType Directory -Force $sccacheDir | Out-Null
-          "RUSTC_WRAPPER=$sccacheExe" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "SCCACHE_DIR=$sccacheDir" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "SCCACHE_CACHE_SIZE=2G" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $env:RUSTC_WRAPPER = $sccacheExe
+          $env:SCCACHE_DIR = $sccacheDir
+          $env:SCCACHE_CACHE_SIZE = "2G"
+          "RUSTC_WRAPPER=$env:RUSTC_WRAPPER" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "SCCACHE_DIR=$env:SCCACHE_DIR" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "SCCACHE_CACHE_SIZE=$env:SCCACHE_CACHE_SIZE" | Out-File -FilePath $env:GITHUB_ENV -Append
           & $sccacheExe --version
           & $sccacheExe --zero-stats
 
