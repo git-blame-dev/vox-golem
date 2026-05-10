@@ -28,6 +28,7 @@ const LLAMA_CPP_CHAT_WRAPPER_TOKENS: usize = 64;
 const RESPONSE_PROFILE_STATE_FILE: &str = "state.toml";
 const RUNTIME_LOG_DIR: &str = "logs";
 const RUNTIME_LOG_FILE: &str = "runtime.log";
+const RUNTIME_LOG_MESSAGE_MAX_CHARS: usize = 16_384;
 const LLAMA_CPP_ROLLOVER_REASON: &str =
     "Context budget reached; started a new local Gemma conversation for this reply.";
 
@@ -117,6 +118,38 @@ struct PromptExecutionPayload {
     runtime_phase: RuntimePhasePayload,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FrontendRuntimeDiagnosticKind {
+    FrontendNotice,
+    Cue,
+    RuntimeControl,
+    Execution,
+    Tts,
+    Audio,
+    Profile,
+}
+
+impl FrontendRuntimeDiagnosticKind {
+    fn as_log_subsystem(self) -> &'static str {
+        match self {
+            Self::FrontendNotice => "frontend",
+            Self::Cue => "cue",
+            Self::RuntimeControl => "runtime-control",
+            Self::Execution => "execution",
+            Self::Tts => "tts",
+            Self::Audio => "audio",
+            Self::Profile => "profile",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct FrontendRuntimeDiagnosticPayload {
+    kind: FrontendRuntimeDiagnosticKind,
+    detail: String,
+}
+
 struct PromptExecutionOutcome {
     events: Vec<PromptExecutionEventPayload>,
     stderr: String,
@@ -165,6 +198,42 @@ impl ResponseProfilePayload {
         match self {
             Self::Fast => "fast",
             Self::Quality => "quality",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum UiTextSizePayload {
+    Small,
+    Medium,
+    Large,
+    ExtraLarge,
+}
+
+impl UiTextSizePayload {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Small => "small",
+            Self::Medium => "medium",
+            Self::Large => "large",
+            Self::ExtraLarge => "extra_large",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum UiThemePayload {
+    Light,
+    Dark,
+}
+
+impl UiThemePayload {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Dark => "dark",
         }
     }
 }
@@ -245,20 +314,23 @@ fn set_tts_enabled(
 
     if enabled {
         if runtime_guard.is_none() {
-            match initialize_local_tts_runtime(&config.local_tts, true) {
+            match initialize_local_tts_runtime(&config.local_tts, true, config.logging.enabled) {
                 Ok(runtime) => {
                     *runtime_guard = runtime;
-                    log_tts_runtime_event("runtime enabled");
+                    log_tts_runtime_event(config.logging.enabled, "runtime enabled");
                 }
                 Err(error) => {
-                    log_tts_runtime_event(&format!("runtime enable failed: {error}"));
+                    log_tts_runtime_event(
+                        config.logging.enabled,
+                        &format!("runtime enable failed: {error}"),
+                    );
                     return Err(error);
                 }
             }
         }
     } else {
         *runtime_guard = None;
-        log_tts_runtime_event("runtime disabled and unloaded");
+        log_tts_runtime_event(config.logging.enabled, "runtime disabled and unloaded");
     }
 
     persist_tts_enabled(enabled)?;
@@ -280,17 +352,28 @@ fn synthesize_local_tts(
     text: String,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<SynthesizeLocalTtsPayload, String> {
+    let runtime_file_logging_enabled = app_state
+        .runtime_config
+        .as_ref()
+        .map(|config| config.logging.enabled)
+        .unwrap_or(false);
     let runtime_guard = app_state
         .local_tts_runtime
         .lock()
         .map_err(|_| String::from("local tts runtime lock is poisoned"))?;
     let runtime = runtime_guard.as_ref().ok_or_else(|| {
-        log_tts_runtime_event("synthesis rejected: runtime unavailable");
+        log_tts_runtime_event(
+            runtime_file_logging_enabled,
+            "synthesis rejected: runtime unavailable",
+        );
         String::from("local tts runtime is not available")
     })?;
 
     let audio = runtime.synthesize(&text).map_err(|error| {
-        log_tts_runtime_event(&format!("synthesis failed: {error}"));
+        log_tts_runtime_event(
+            runtime_file_logging_enabled,
+            &format!("synthesis failed: {error}"),
+        );
         error
     })?;
 
@@ -299,6 +382,46 @@ fn synthesize_local_tts(
         sample_rate_hz: audio.sample_rate_hz,
         duration_ms: audio.duration_ms,
     })
+}
+
+#[tauri::command]
+fn record_frontend_runtime_diagnostic(
+    event: FrontendRuntimeDiagnosticPayload,
+    app_state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let runtime_file_logging_enabled = app_state
+        .runtime_config
+        .as_ref()
+        .map(|config| config.logging.enabled)
+        .unwrap_or(false);
+
+    append_runtime_log_line(
+        runtime_file_logging_enabled,
+        event.kind.as_log_subsystem(),
+        &event.detail,
+    )
+}
+
+#[tauri::command]
+fn get_ui_text_size() -> Result<UiTextSizePayload, String> {
+    Ok(load_persisted_ui_text_size()?.unwrap_or(default_ui_text_size()))
+}
+
+#[tauri::command]
+fn set_ui_text_size(text_size: UiTextSizePayload) -> Result<UiTextSizePayload, String> {
+    persist_ui_text_size(text_size)?;
+    Ok(text_size)
+}
+
+#[tauri::command]
+fn get_ui_theme() -> Result<UiThemePayload, String> {
+    Ok(load_persisted_ui_theme()?.unwrap_or(default_ui_theme()))
+}
+
+#[tauri::command]
+fn set_ui_theme(theme: UiThemePayload) -> Result<UiThemePayload, String> {
+    persist_ui_theme(theme)?;
+    Ok(theme)
 }
 
 #[tauri::command]
@@ -843,6 +966,14 @@ fn default_response_profile() -> ResponseProfilePayload {
     ResponseProfilePayload::Fast
 }
 
+fn default_ui_text_size() -> UiTextSizePayload {
+    UiTextSizePayload::Medium
+}
+
+fn default_ui_theme() -> UiThemePayload {
+    UiThemePayload::Dark
+}
+
 fn model_path_for_profile<'a>(
     profile: ResponseProfilePayload,
     fast_model_path: &'a Path,
@@ -903,7 +1034,11 @@ fn runtime_log_path() -> Result<PathBuf, String> {
         .join(RUNTIME_LOG_FILE))
 }
 
-fn append_tts_runtime_log_line(message: &str) -> Result<(), String> {
+fn append_runtime_log_line(enabled: bool, subsystem: &str, message: &str) -> Result<(), String> {
+    if !enabled {
+        return Ok(());
+    }
+
     let log_path = runtime_log_path()?;
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent).map_err(|error| {
@@ -925,7 +1060,13 @@ fn append_tts_runtime_log_line(message: &str) -> Result<(), String> {
         .open(&log_path)
         .map_err(|error| format!("failed to open runtime log {}: {error}", log_path.display()))?;
 
-    writeln!(file, "{timestamp_ms} [tts] {message}").map_err(|error| {
+    writeln!(
+        file,
+        "{timestamp_ms} [{}] {}",
+        sanitize_log_subsystem(subsystem),
+        sanitize_log_message(message)
+    )
+    .map_err(|error| {
         format!(
             "failed to append runtime log {}: {error}",
             log_path.display()
@@ -933,8 +1074,47 @@ fn append_tts_runtime_log_line(message: &str) -> Result<(), String> {
     })
 }
 
-fn log_tts_runtime_event(message: &str) {
-    if let Err(error) = append_tts_runtime_log_line(message) {
+fn append_tts_runtime_log_line(enabled: bool, message: &str) -> Result<(), String> {
+    append_runtime_log_line(enabled, "tts", message)
+}
+
+fn sanitize_log_subsystem(subsystem: &str) -> String {
+    let sanitized: String = subsystem
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || *character == '_' || *character == '-'
+        })
+        .take(32)
+        .collect();
+
+    if sanitized.is_empty() {
+        return String::from("runtime");
+    }
+
+    sanitized
+}
+
+fn sanitize_log_message(message: &str) -> String {
+    let mut characters = message.chars();
+    let mut sanitized = String::new();
+
+    for character in characters.by_ref().take(RUNTIME_LOG_MESSAGE_MAX_CHARS) {
+        match character {
+            '\r' => sanitized.push_str("\\r"),
+            '\n' => sanitized.push_str("\\n"),
+            _ => sanitized.push(character),
+        }
+    }
+
+    if characters.next().is_some() {
+        sanitized.push_str("…[truncated]");
+    }
+
+    sanitized
+}
+
+fn log_tts_runtime_event(enabled: bool, message: &str) {
+    if let Err(error) = append_tts_runtime_log_line(enabled, message) {
         eprintln!("failed to append tts runtime log: {error}");
     }
 }
@@ -943,6 +1123,8 @@ fn log_tts_runtime_event(message: &str) {
 struct PersistedState {
     selected_response_profile: Option<ResponseProfilePayload>,
     tts_enabled: Option<bool>,
+    ui_text_size: Option<UiTextSizePayload>,
+    ui_theme: Option<UiThemePayload>,
 }
 
 fn parse_persisted_state(contents: &str) -> Result<PersistedState, String> {
@@ -991,6 +1173,48 @@ fn parse_persisted_state(contents: &str) -> Result<PersistedState, String> {
                     ));
                 }
             };
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("ui_text_size") {
+            let Some(value) = value.trim_start().strip_prefix('=') else {
+                return Err(String::from(
+                    "invalid state.toml: expected `ui_text_size = \"...\"`",
+                ));
+            };
+
+            let value = value.trim().trim_matches('"').to_ascii_lowercase();
+            state.ui_text_size = match value.as_str() {
+                "small" => Some(UiTextSizePayload::Small),
+                "medium" => Some(UiTextSizePayload::Medium),
+                "large" => Some(UiTextSizePayload::Large),
+                "extra_large" => Some(UiTextSizePayload::ExtraLarge),
+                _ => {
+                    return Err(format!(
+                        "invalid state.toml: unsupported ui_text_size `{value}`"
+                    ));
+                }
+            };
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("ui_theme") {
+            let Some(value) = value.trim_start().strip_prefix('=') else {
+                return Err(String::from(
+                    "invalid state.toml: expected `ui_theme = \"...\"`",
+                ));
+            };
+
+            let value = value.trim().trim_matches('"').to_ascii_lowercase();
+            state.ui_theme = match value.as_str() {
+                "light" => Some(UiThemePayload::Light),
+                "dark" => Some(UiThemePayload::Dark),
+                _ => {
+                    return Err(format!(
+                        "invalid state.toml: unsupported ui_theme `{value}`"
+                    ));
+                }
+            };
         }
     }
 
@@ -1034,6 +1258,12 @@ fn persist_state(state: PersistedState) -> Result<(), String> {
     if let Some(tts_enabled) = state.tts_enabled {
         lines.push(format!("tts_enabled = {tts_enabled}"));
     }
+    if let Some(ui_text_size) = state.ui_text_size {
+        lines.push(format!("ui_text_size = \"{}\"", ui_text_size.as_str()));
+    }
+    if let Some(ui_theme) = state.ui_theme {
+        lines.push(format!("ui_theme = \"{}\"", ui_theme.as_str()));
+    }
 
     let contents = if lines.is_empty() {
         String::new()
@@ -1066,6 +1296,26 @@ fn load_persisted_tts_enabled() -> Result<Option<bool>, String> {
 fn persist_tts_enabled(enabled: bool) -> Result<(), String> {
     let mut persisted = load_persisted_state().unwrap_or_default();
     persisted.tts_enabled = Some(enabled);
+    persist_state(persisted)
+}
+
+fn load_persisted_ui_text_size() -> Result<Option<UiTextSizePayload>, String> {
+    Ok(load_persisted_state()?.ui_text_size)
+}
+
+fn persist_ui_text_size(text_size: UiTextSizePayload) -> Result<(), String> {
+    let mut persisted = load_persisted_state().unwrap_or_default();
+    persisted.ui_text_size = Some(text_size);
+    persist_state(persisted)
+}
+
+fn load_persisted_ui_theme() -> Result<Option<UiThemePayload>, String> {
+    Ok(load_persisted_state()?.ui_theme)
+}
+
+fn persist_ui_theme(theme: UiThemePayload) -> Result<(), String> {
+    let mut persisted = load_persisted_state().unwrap_or_default();
+    persisted.ui_theme = Some(theme);
     persist_state(persisted)
 }
 
@@ -1114,13 +1364,16 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
                 }
             };
             let effective_tts_enabled = resolve_effective_tts_enabled(config.local_tts.enabled);
-            let local_tts_runtime =
-                match initialize_local_tts_runtime(&config.local_tts, effective_tts_enabled) {
-                    Ok(runtime) => runtime,
-                    Err(error) => {
-                        return build_startup_error_app_state(voice_pipeline_config, error);
-                    }
-                };
+            let local_tts_runtime = match initialize_local_tts_runtime(
+                &config.local_tts,
+                effective_tts_enabled,
+                config.logging.enabled,
+            ) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    return build_startup_error_app_state(voice_pipeline_config, error);
+                }
+            };
             let tts_enabled = local_tts_runtime.is_some();
             let tts_output_gain_db = config.local_tts.output_gain_db;
             let mut voice_input_errors = Vec::new();
@@ -1317,19 +1570,26 @@ fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
 fn initialize_local_tts_runtime(
     config: &voxgolem_core::config::LocalTtsConfig,
     enabled: bool,
+    runtime_file_logging_enabled: bool,
 ) -> Result<Option<tts::LocalTtsRuntime>, String> {
     if !enabled {
-        log_tts_runtime_event("runtime initialization skipped: disabled");
+        log_tts_runtime_event(
+            runtime_file_logging_enabled,
+            "runtime initialization skipped: disabled",
+        );
         return Ok(None);
     }
 
     if let Some(strict_espeak_root) = tts::resolve_strict_windows_espeak_data_directory()
         .map_err(|error| format!("failed to resolve strict eSpeak data root: {error}"))?
     {
-        log_tts_runtime_event(&format!(
-            "resolved strict eSpeak data root: {}",
-            strict_espeak_root.display()
-        ));
+        log_tts_runtime_event(
+            runtime_file_logging_enabled,
+            &format!(
+                "resolved strict eSpeak data root: {}",
+                strict_espeak_root.display()
+            ),
+        );
     }
 
     let spec = tts::LocalTtsRuntimeSpec {
@@ -1343,12 +1603,15 @@ fn initialize_local_tts_runtime(
 
     match tts::LocalTtsRuntime::new(spec) {
         Ok(runtime) => {
-            log_tts_runtime_event("runtime initialized successfully");
+            log_tts_runtime_event(
+                runtime_file_logging_enabled,
+                "runtime initialized successfully",
+            );
             Ok(Some(runtime))
         }
         Err(error) => {
             let message = format!("failed to initialize local tts runtime: {error}");
-            log_tts_runtime_event(&message);
+            log_tts_runtime_event(runtime_file_logging_enabled, &message);
             Err(message)
         }
     }
@@ -2204,7 +2467,12 @@ pub fn run() {
             get_startup_state,
             set_tts_enabled,
             synthesize_local_tts,
+            get_ui_text_size,
+            set_ui_text_size,
+            get_ui_theme,
+            set_ui_theme,
             switch_response_profile,
+            record_frontend_runtime_diagnostic,
             submit_prompt,
             record_speech_activity,
             ingest_audio_frame,
@@ -2235,15 +2503,17 @@ mod tests {
         build_startup_error_app_state, current_runtime_phase_response, current_silence_deadline,
         default_response_profile, default_voice_pipeline_config, execute_prompt_backend,
         ingest_audio_frame_with_optional_wake_word_detection, is_llama_context_overflow_error,
-        llama_cpp_input_token_limit, load_llama_cpp_system_prompt, load_persisted_tts_enabled,
+        llama_cpp_input_token_limit, load_llama_cpp_system_prompt, load_persisted_state,
+        load_persisted_tts_enabled, load_persisted_ui_text_size, load_persisted_ui_theme,
         model_path_for_profile, parse_persisted_state, persist_selected_response_profile,
-        persist_tts_enabled, process_wake_word_frame, prompt_result_error_message,
-        reset_voice_pipeline_to_waiting, reset_wake_word_runtime, resolve_effective_tts_enabled,
-        response_profile_state_path, runtime_log_path, runtime_phase_response_from_state,
-        shutdown_llama_cpp_runtime_for_exit, supported_response_profiles, to_runtime_phase_payload,
-        transcribe_finished_utterance, transcription_ready_samples, wake_word_event_timestamp,
-        LlamaConversationTurn, PromptExecutionEventPayload, ResponseProfilePayload,
-        RuntimePhasePayload, RuntimePhaseResponsePayload, RuntimeTelemetryPayload,
+        persist_tts_enabled, persist_ui_text_size, persist_ui_theme, process_wake_word_frame,
+        prompt_result_error_message, reset_voice_pipeline_to_waiting, reset_wake_word_runtime,
+        resolve_effective_tts_enabled, response_profile_state_path, runtime_log_path,
+        runtime_phase_response_from_state, shutdown_llama_cpp_runtime_for_exit,
+        supported_response_profiles, to_runtime_phase_payload, transcribe_finished_utterance,
+        transcription_ready_samples, wake_word_event_timestamp, LlamaConversationTurn,
+        PromptExecutionEventPayload, ResponseProfilePayload, RuntimePhasePayload,
+        RuntimePhaseResponsePayload, RuntimeTelemetryPayload, UiTextSizePayload, UiThemePayload,
         DEFAULT_SILENCE_TIMEOUT_MS, LLAMA_CPP_ROLLOVER_REASON,
     };
     use crate::wake_word::{WakeWordDetection, WakeWordRuntime};
@@ -2387,6 +2657,7 @@ mod tests {
                 max_duration_s: 300,
                 output_gain_db: 3.0,
             },
+            logging: voxgolem_core::config::LoggingConfig { enabled: false },
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
                 host: String::from("127.0.0.1"),
@@ -2446,6 +2717,7 @@ mod tests {
                 max_duration_s: 300,
                 output_gain_db: 3.0,
             },
+            logging: voxgolem_core::config::LoggingConfig { enabled: false },
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
                 host: String::from("127.0.0.1"),
@@ -2486,6 +2758,7 @@ mod tests {
                 max_duration_s: 300,
                 output_gain_db: 3.0,
             },
+            logging: voxgolem_core::config::LoggingConfig { enabled: false },
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
                 host: String::from("127.0.0.1"),
@@ -2606,6 +2879,7 @@ mod tests {
                 max_duration_s: 300,
                 output_gain_db: 3.0,
             },
+            logging: voxgolem_core::config::LoggingConfig { enabled: false },
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
                 host: String::from("127.0.0.1"),
@@ -2739,6 +3013,7 @@ mod tests {
                 max_duration_s: 300,
                 output_gain_db: 3.0,
             },
+            logging: voxgolem_core::config::LoggingConfig { enabled: false },
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
                 host: String::from("127.0.0.1"),
@@ -2850,6 +3125,7 @@ mod tests {
                 max_duration_s: 300,
                 output_gain_db: 3.0,
             },
+            logging: voxgolem_core::config::LoggingConfig { enabled: false },
             response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
                 server_path: PathBuf::from("llama-server.exe"),
                 host: String::from("127.0.0.1"),
@@ -2993,6 +3269,50 @@ mod tests {
     }
 
     #[test]
+    fn parse_persisted_state_reads_ui_text_size() {
+        let persisted = parse_persisted_state(
+            "selected_response_profile = \"fast\"\ntts_enabled = true\nui_text_size = \"extra_large\"\n",
+        )
+        .expect("state should parse");
+
+        assert_eq!(persisted.ui_text_size, Some(UiTextSizePayload::ExtraLarge));
+    }
+
+    #[test]
+    fn parse_persisted_state_reads_ui_theme() {
+        let persisted = parse_persisted_state(
+            "selected_response_profile = \"fast\"\ntts_enabled = true\nui_text_size = \"large\"\nui_theme = \"dark\"\n",
+        )
+        .expect("state should parse");
+
+        assert_eq!(persisted.ui_theme, Some(UiThemePayload::Dark));
+    }
+
+    #[test]
+    fn parse_persisted_state_rejects_invalid_ui_text_size() {
+        let result = parse_persisted_state("ui_text_size = \"giant\"\n");
+
+        assert_eq!(
+            result,
+            Err(String::from(
+                "invalid state.toml: unsupported ui_text_size `giant`"
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_persisted_state_rejects_invalid_ui_theme() {
+        let result = parse_persisted_state("ui_theme = \"sepia\"\n");
+
+        assert_eq!(
+            result,
+            Err(String::from(
+                "invalid state.toml: unsupported ui_theme `sepia`"
+            ))
+        );
+    }
+
+    #[test]
     fn load_persisted_tts_enabled_reads_boolean_flag_from_state_file() {
         let _appdata_lock = APPDATA_ENV_LOCK
             .lock()
@@ -3010,6 +3330,46 @@ mod tests {
         }
 
         assert_eq!(persisted, Some(true));
+    }
+
+    #[test]
+    fn load_persisted_ui_text_size_reads_text_size_flag_from_state_file() {
+        let _appdata_lock = APPDATA_ENV_LOCK
+            .lock()
+            .expect("APPDATA test lock should not be poisoned");
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let previous_appdata = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", temp_dir.path());
+
+        persist_ui_text_size(UiTextSizePayload::Large).expect("text size should be written");
+        let persisted = load_persisted_ui_text_size().expect("text size should load");
+
+        match previous_appdata {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+
+        assert_eq!(persisted, Some(UiTextSizePayload::Large));
+    }
+
+    #[test]
+    fn load_persisted_ui_theme_reads_theme_flag_from_state_file() {
+        let _appdata_lock = APPDATA_ENV_LOCK
+            .lock()
+            .expect("APPDATA test lock should not be poisoned");
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let previous_appdata = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", temp_dir.path());
+
+        persist_ui_theme(UiThemePayload::Light).expect("theme should be written");
+        let persisted = load_persisted_ui_theme().expect("theme should load");
+
+        match previous_appdata {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+
+        assert_eq!(persisted, Some(UiThemePayload::Light));
     }
 
     #[test]
@@ -3033,6 +3393,64 @@ mod tests {
         }
 
         assert_eq!(persisted, Some(true));
+    }
+
+    #[test]
+    fn persist_ui_text_size_preserves_profile_and_tts_enabled_flags() {
+        let _appdata_lock = APPDATA_ENV_LOCK
+            .lock()
+            .expect("APPDATA test lock should not be poisoned");
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let previous_appdata = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", temp_dir.path());
+
+        persist_selected_response_profile(ResponseProfilePayload::Quality)
+            .expect("profile state should be written");
+        persist_tts_enabled(true).expect("tts flag should be written");
+        persist_ui_text_size(UiTextSizePayload::Small).expect("text size should be written");
+        let persisted = load_persisted_state().expect("persisted state should load");
+
+        match previous_appdata {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+
+        assert_eq!(
+            persisted.selected_response_profile,
+            Some(ResponseProfilePayload::Quality)
+        );
+        assert_eq!(persisted.tts_enabled, Some(true));
+        assert_eq!(persisted.ui_text_size, Some(UiTextSizePayload::Small));
+    }
+
+    #[test]
+    fn persist_ui_theme_preserves_existing_state_flags() {
+        let _appdata_lock = APPDATA_ENV_LOCK
+            .lock()
+            .expect("APPDATA test lock should not be poisoned");
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let previous_appdata = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", temp_dir.path());
+
+        persist_selected_response_profile(ResponseProfilePayload::Quality)
+            .expect("profile state should be written");
+        persist_tts_enabled(true).expect("tts flag should be written");
+        persist_ui_text_size(UiTextSizePayload::ExtraLarge).expect("text size should be written");
+        persist_ui_theme(UiThemePayload::Dark).expect("theme should be written");
+        let persisted = load_persisted_state().expect("persisted state should load");
+
+        match previous_appdata {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+
+        assert_eq!(
+            persisted.selected_response_profile,
+            Some(ResponseProfilePayload::Quality)
+        );
+        assert_eq!(persisted.tts_enabled, Some(true));
+        assert_eq!(persisted.ui_text_size, Some(UiTextSizePayload::ExtraLarge));
+        assert_eq!(persisted.ui_theme, Some(UiThemePayload::Dark));
     }
 
     #[test]
@@ -3113,7 +3531,7 @@ mod tests {
         let previous_appdata = std::env::var_os("APPDATA");
         std::env::set_var("APPDATA", temp_dir.path());
 
-        super::append_tts_runtime_log_line("runtime initialized successfully")
+        super::append_tts_runtime_log_line(true, "runtime initialized successfully")
             .expect("runtime log write should succeed");
         let log_path = runtime_log_path().expect("runtime log path should resolve");
         let contents = std::fs::read_to_string(&log_path).expect("runtime log should be readable");
@@ -3124,6 +3542,42 @@ mod tests {
         }
 
         assert!(contents.contains("[tts] runtime initialized successfully"));
+    }
+
+    #[test]
+    fn append_tts_runtime_log_line_skips_file_when_disabled() {
+        let _appdata_lock = APPDATA_ENV_LOCK
+            .lock()
+            .expect("APPDATA test lock should not be poisoned");
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let previous_appdata = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", temp_dir.path());
+
+        super::append_tts_runtime_log_line(false, "runtime initialized successfully")
+            .expect("disabled runtime log write should be a no-op");
+        let log_path = runtime_log_path().expect("runtime log path should resolve");
+
+        match previous_appdata {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+
+        assert!(!log_path.exists());
+    }
+
+    #[test]
+    fn runtime_log_message_escapes_line_breaks_and_caps_length() {
+        let message = format!(
+            "first\r\n{}",
+            "x".repeat(super::RUNTIME_LOG_MESSAGE_MAX_CHARS)
+        );
+
+        let sanitized = super::sanitize_log_message(&message);
+
+        assert!(sanitized.starts_with("first\\r\\n"));
+        assert!(sanitized.ends_with("…[truncated]"));
+        assert!(!sanitized.contains('\n'));
+        assert!(!sanitized.contains('\r'));
     }
 
     #[test]

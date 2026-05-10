@@ -36,6 +36,8 @@ struct RawConfig {
     llama_cpp: Option<RawLlamaCppConfig>,
     #[serde(default)]
     tts: Option<RawTtsConfig>,
+    #[serde(default)]
+    logging: Option<RawLoggingConfig>,
     #[serde(default, rename = "start_listening_cue")]
     _start_listening_cue: Option<PathBuf>,
     #[serde(default, rename = "stop_listening_cue")]
@@ -84,6 +86,13 @@ struct RawTtsConfig {
     output_gain_db: f32,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLoggingConfig {
+    #[serde(default)]
+    enabled: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfig {
     pub wake_word_model_path: PathBuf,
@@ -92,7 +101,13 @@ pub struct RuntimeConfig {
     pub silence_timeout_ms: u64,
     pub wake_word_detection_threshold: f32,
     pub local_tts: LocalTtsConfig,
+    pub logging: LoggingConfig,
     pub response_backend: ResponseBackendConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoggingConfig {
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -358,6 +373,13 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
         }
     };
 
+    let logging = LoggingConfig {
+        enabled: raw_config
+            .logging
+            .map(|raw_logging| raw_logging.enabled)
+            .unwrap_or(false),
+    };
+
     let response_backend = match raw_config.response_backend {
         RawResponseBackend::Opencode => {
             let raw_opencode = raw_config
@@ -411,6 +433,7 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
         silence_timeout_ms,
         wake_word_detection_threshold,
         local_tts,
+        logging,
         response_backend,
     })
 }
@@ -617,6 +640,70 @@ mod tests {
 
         assert_eq!(result.silero_vad_model, default_silero_vad_model);
         assert_eq!(result.silence_timeout_ms, 1_500);
+        assert!(!result.logging.enabled);
+    }
+
+    #[test]
+    fn defaults_runtime_file_logging_to_disabled() {
+        let temp = TempDir::new();
+        let model_dir = temp.path().join("models");
+        let wake_word_model_path = model_dir.join("hey_livekit.onnx");
+        let silero_vad_model = model_dir.join("silero-vad.onnx");
+        let opencode_path = temp.path().join("opencode.exe");
+        let config_path = temp.path().join("config.toml");
+
+        fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
+        create_file(&wake_word_model_path);
+        create_file(&silero_vad_model);
+        create_file(&opencode_path);
+
+        fs::write(
+            &config_path,
+            render_opencode_config(
+                &wake_word_model_path,
+                &model_dir,
+                &silero_vad_model,
+                &opencode_path,
+            ),
+        )
+        .expect("config fixture should be written");
+
+        let result = load_runtime_config(Some(&config_path)).expect("valid config should load");
+
+        assert!(!result.logging.enabled);
+    }
+
+    #[test]
+    fn loads_runtime_file_logging_when_enabled() {
+        let temp = TempDir::new();
+        let model_dir = temp.path().join("models");
+        let wake_word_model_path = model_dir.join("hey_livekit.onnx");
+        let silero_vad_model = model_dir.join("silero-vad.onnx");
+        let opencode_path = temp.path().join("opencode.exe");
+        let config_path = temp.path().join("config.toml");
+
+        fs::create_dir_all(&model_dir).expect("model directory fixture should be created");
+        create_file(&wake_word_model_path);
+        create_file(&silero_vad_model);
+        create_file(&opencode_path);
+
+        fs::write(
+            &config_path,
+            format!(
+                "{}\n[logging]\nenabled = true\n",
+                render_opencode_config(
+                    &wake_word_model_path,
+                    &model_dir,
+                    &silero_vad_model,
+                    &opencode_path,
+                )
+            ),
+        )
+        .expect("config fixture should be written");
+
+        let result = load_runtime_config(Some(&config_path)).expect("valid config should load");
+
+        assert!(result.logging.enabled);
     }
 
     #[test]
