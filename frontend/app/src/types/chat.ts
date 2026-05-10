@@ -1,9 +1,21 @@
 export type MessageRole = 'system' | 'user' | 'assistant'
 
+export type TranscriptRole = Exclude<MessageRole, 'system'>
+
 export interface ChatMessage {
   readonly id: string
   readonly role: MessageRole
   readonly content: string
+}
+
+export interface TranscriptMessage {
+  readonly id: string
+  readonly role: TranscriptRole
+  readonly content: string
+}
+
+export function isTranscriptMessage(message: ChatMessage): message is TranscriptMessage {
+  return message.role !== 'system'
 }
 
 export interface CueAssetPaths {
