@@ -27,6 +27,7 @@ import {
 } from './lib/voiceActivity'
 import { createExecutionMessages, getInitialMessages } from './state/appShell'
 import { cueForTransition, transitionRuntimeStatus } from './state/runtimeMachine'
+import { isTranscriptMessage } from './types/chat'
 import type {
   BackendRuntimePhase,
   ChatMessage,
@@ -49,6 +50,10 @@ function App() {
   const [micActive, setMicActive] = useState(false)
   const [messages, setMessages] = useState<readonly ChatMessage[]>(() =>
     getInitialMessages(),
+  )
+  const visibleMessages = useMemo(
+    () => messages.filter(isTranscriptMessage),
+    [messages],
   )
   const conversationRef = useRef<HTMLElement | null>(null)
   const liveAudioSourceRef = useRef<LiveAudioSource | null>(null)
@@ -171,7 +176,7 @@ function App() {
     }
 
     conversation.scrollTop = conversation.scrollHeight
-  }, [messages])
+  }, [visibleMessages])
 
   const canSend = useMemo(
     () =>
@@ -995,7 +1000,7 @@ function App() {
     <div className="shell">
 
       <main ref={conversationRef} className="conversation" aria-live="polite">
-        {messages.map((message) => (
+        {visibleMessages.map((message) => (
           <ChatBubble key={message.id} message={message} />
         ))}
       </main>
