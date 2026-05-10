@@ -37,12 +37,29 @@ import type {
   ResponseProfile,
   RuntimeStatus,
   StartupState,
+  UiTextSize,
   UserNotice,
 } from './types/chat'
 import './App.css'
 
 const NOTICE_AUTO_DISMISS_MS = 4_000
 const MAX_NOTICE_QUEUE_LENGTH = 3
+const UI_TEXT_SIZE_STEPS: readonly UiTextSize[] = ['small', 'medium', 'large', 'extra_large']
+const DEFAULT_UI_TEXT_SIZE: UiTextSize = 'medium'
+
+const UI_TEXT_SIZE_LABELS: Record<UiTextSize, string> = {
+  small: 'Small',
+  medium: 'Medium',
+  large: 'Large',
+  extra_large: 'Extra Large',
+}
+
+const UI_TEXT_SIZE_PERCENTAGES: Record<UiTextSize, string> = {
+  small: '90%',
+  medium: '100%',
+  large: '112.5%',
+  extra_large: '125%',
+}
 
 type RuntimeDiagnosticKind =
   | 'frontend_notice'
@@ -64,6 +81,8 @@ function App() {
   const [micStarting, setMicStarting] = useState(false)
   const [micActive, setMicActive] = useState(false)
   const [notices, setNotices] = useState<readonly UserNotice[]>([])
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [uiTextSize, setUiTextSize] = useState<UiTextSize>(DEFAULT_UI_TEXT_SIZE)
   const [messages, setMessages] = useState<readonly ChatMessage[]>(() =>
     getInitialMessages(),
   )
@@ -72,6 +91,9 @@ function App() {
     [messages],
   )
   const conversationRef = useRef<HTMLElement | null>(null)
+  const settingsButtonRef = useRef<HTMLButtonElement | null>(null)
+  const settingsPanelRef = useRef<HTMLElement | null>(null)
+  const settingsCloseButtonRef = useRef<HTMLButtonElement | null>(null)
   const liveAudioSourceRef = useRef<LiveAudioSource | null>(null)
   const liveAudioSessionIdRef = useRef(0)
   const liveAudioInFlightFramesRef = useRef(0)
@@ -89,6 +111,12 @@ function App() {
   }
 
   const voiceTelemetry = voiceTelemetryRef.current
+
+  const closeSettings = useCallback((): void => {
+    setSettingsOpen(false)
+    window.setTimeout(() => settingsButtonRef.current?.focus(), 0)
+  }, [])
+
   const recordRuntimeDiagnostic = useCallback((kind: RuntimeDiagnosticKind, detail: string): void => {
     void invokeTauriCommand('record_frontend_runtime_diagnostic', {
       event: {
@@ -134,6 +162,60 @@ function App() {
 
     return () => window.clearTimeout(timeoutId)
   }, [notices])
+
+  useEffect(() => {
+    if (!settingsOpen) {
+      return
+    }
+
+    settingsCloseButtonRef.current?.focus()
+  }, [settingsOpen])
+
+  useEffect(() => {
+    let active = true
+
+    void invokeTauriCommand('get_ui_text_size')
+      .then((payload) => {
+        if (!active) {
+          return
+        }
+
+        setUiTextSize(parseUiTextSize(payload))
+      })
+      .catch(() => undefined)
+
+    return () => {
+      active = false
+    }
+  }, [])
+
+  const persistUiTextSize = async (nextTextSize: UiTextSize, previousTextSize: UiTextSize): Promise<void> => {
+    setUiTextSize(nextTextSize)
+
+    try {
+      const payload = await invokeTauriCommand('set_ui_text_size', { textSize: nextTextSize })
+      setUiTextSize(parseUiTextSize(payload))
+    } catch (error) {
+      setUiTextSize(previousTextSize)
+      addNotice({
+        tone: 'error',
+        title: 'Setting not saved',
+        message: toDisplayErrorMessage(error),
+      })
+    }
+  }
+
+  const adjustUiTextSize = (direction: -1 | 1): void => {
+    const currentIndex = UI_TEXT_SIZE_STEPS.indexOf(uiTextSize)
+    const nextIndex = Math.max(0, Math.min(UI_TEXT_SIZE_STEPS.length - 1, currentIndex + direction))
+    const nextTextSize = UI_TEXT_SIZE_STEPS[nextIndex]
+
+    if (nextTextSize === undefined || nextTextSize === uiTextSize) {
+      return
+    }
+
+    void persistUiTextSize(nextTextSize, uiTextSize)
+  }
 
 
   const currentSilenceTimeoutMs = (): number => {
@@ -1059,9 +1141,49 @@ function App() {
     event.preventDefault()
     void sendPrompt()
   }
+  const onSettingsKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      closeSettings()
+      return
+    }
+
+    if (event.key !== 'Tab') {
+      return
+    }
+
+    const focusableElements = Array.from(
+      settingsPanelRef.current?.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ) ?? [],
+    )
+
+    const firstElement = focusableElements[0]
+    const lastElement = focusableElements.at(-1)
+
+    if (firstElement === undefined || lastElement === undefined) {
+      return
+    }
+
+    if (event.shiftKey && document.activeElement === firstElement) {
+      event.preventDefault()
+      lastElement.focus()
+      return
+    }
+
+    if (!event.shiftKey && document.activeElement === lastElement) {
+      event.preventDefault()
+      firstElement.focus()
+    }
+  }
+
+  const uiTextSizeIndex = Math.max(0, UI_TEXT_SIZE_STEPS.indexOf(uiTextSize))
+  const canDecreaseTextSize = uiTextSizeIndex > 0
+  const canIncreaseTextSize = uiTextSizeIndex < UI_TEXT_SIZE_STEPS.length - 1
+
 
   return (
-    <div className="shell">
+    <div className="shell" data-ui-text-size={uiTextSize}>
 
       <main ref={conversationRef} className="conversation" aria-live="polite">
         {visibleMessages.map((message) => (
@@ -1070,6 +1192,68 @@ function App() {
       </main>
 
       <UserNoticeToast notice={notices[0] ?? null} />
+
+      {settingsOpen ? (
+        <div
+          className="settings-overlay"
+          onMouseDown={closeSettings}
+          onKeyDown={onSettingsKeyDown}
+        >
+          <section
+            ref={settingsPanelRef}
+            className="settings-panel"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="settings-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="settings-panel__header">
+              <div>
+                <h2 id="settings-title">Settings</h2>
+                <p>Adjust the app text size live.</p>
+              </div>
+              <button
+                ref={settingsCloseButtonRef}
+                type="button"
+                className="settings-panel__close"
+                onClick={closeSettings}
+                aria-label="Close settings"
+              >
+                ×
+              </button>
+            </div>
+            <div className="settings-panel__row">
+              <div>
+                <strong>Text size</strong>
+                <p className="settings-panel__hint">Applies to chat, composer, and controls.</p>
+              </div>
+              <div className="settings-panel__stepper" aria-label="Text size controls">
+                <button
+                  type="button"
+                  className="settings-panel__step-button"
+                  onClick={() => adjustUiTextSize(-1)}
+                  disabled={!canDecreaseTextSize}
+                  aria-label="Decrease text size"
+                >
+                  −
+                </button>
+                <span className="settings-panel__size" aria-live="polite">
+                  {UI_TEXT_SIZE_LABELS[uiTextSize]} ({UI_TEXT_SIZE_PERCENTAGES[uiTextSize]})
+                </span>
+                <button
+                  type="button"
+                  className="settings-panel__step-button"
+                  onClick={() => adjustUiTextSize(1)}
+                  disabled={!canIncreaseTextSize}
+                  aria-label="Increase text size"
+                >
+                  +
+                </button>
+              </div>
+            </div>
+          </section>
+        </div>
+      ) : null}
 
       <form className="composer" onSubmit={onSubmit}>
         <textarea
@@ -1161,6 +1345,18 @@ function App() {
                 </span>
               </div>
             ) : null}
+            <button
+              ref={settingsButtonRef}
+              type="button"
+              className="shell__control shell__settings-button"
+              onClick={() => setSettingsOpen(true)}
+              aria-label="Settings"
+              aria-haspopup="dialog"
+              aria-expanded={settingsOpen}
+              title="Settings"
+            >
+              ⚙
+            </button>
             <button type="submit" className="composer__button" disabled={!canSend}>
               Send
             </button>
@@ -1176,6 +1372,19 @@ function toRuntimeStatus(runtimePhase: BackendRuntimePhase): RuntimeStatus {
 }
 
 const RESPONSE_PROFILE_ORDER: readonly ResponseProfile[] = ['fast', 'quality']
+
+function parseUiTextSize(value: unknown): UiTextSize {
+  if (
+    value === 'small' ||
+    value === 'medium' ||
+    value === 'large' ||
+    value === 'extra_large'
+  ) {
+    return value
+  }
+
+  return DEFAULT_UI_TEXT_SIZE
+}
 
 function getResponseProfileLabel(profile: ResponseProfile): 'Fast' | 'Quality' {
   return profile === 'fast' ? 'Fast' : 'Quality'
