@@ -107,9 +107,6 @@ jobs:
     name: Tauri Linux smoke build
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    needs:
-      - frontend
-      - rust
 
     steps:
       - name: Checkout repository
@@ -157,6 +154,13 @@ jobs:
             cargo-tauri-${{ runner.os }}-
             cargo-${{ runner.os }}-
 
+      - name: Cache Tauri CLI
+        id: cache-tauri-cli
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: ~/.cargo/bin/cargo-tauri
+          key: tauri-cli-${{ runner.os }}-${{ env.TAURI_CLI_VERSION }}
+
       - name: Install frontend dependencies
         run: bun install --frozen-lockfile
 
@@ -164,7 +168,11 @@ jobs:
         run: bun run build
 
       - name: Install Tauri CLI
+        if: steps.cache-tauri-cli.outputs.cache-hit != 'true'
         run: cargo install tauri-cli --version "$TAURI_CLI_VERSION" --locked
+
+      - name: Verify Tauri CLI
+        run: cargo tauri --version
 
       - name: Build Tauri app without bundling
         run: |
