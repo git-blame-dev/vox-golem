@@ -18,6 +18,7 @@ env:
   BUN_VERSION: 1.3.9
   CARGO_TERM_COLOR: always
   LLVM_VERSION: 22.1.0
+  SCCACHE_VERSION: 0.10.0
   TAURI_CLI_VERSION: 2.11.1
 
 jobs:
@@ -167,6 +168,54 @@ jobs:
         shell: pwsh
         run: cargo tauri --version
 
+      - name: Cache sccache binary
+        id: cache-sccache-bin
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: ${{ github.workspace }}\.tools\sccache\bin\sccache.exe
+          key: sccache-bin-${{ runner.os }}-${{ env.SCCACHE_VERSION }}
+
+      - name: Install sccache
+        if: steps.cache-sccache-bin.outputs.cache-hit != 'true'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $installRoot = Join-Path $env:GITHUB_WORKSPACE ".tools\sccache"
+          cargo install sccache --version "$env:SCCACHE_VERSION" --locked --root "$installRoot"
+
+      - name: Cache sccache artifacts
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: ${{ github.workspace }}\.sccache
+          key: sccache-windows-tauri-${{ runner.os }}-stable-${{ env.SCCACHE_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            sccache-windows-tauri-${{ runner.os }}-stable-${{ env.SCCACHE_VERSION }}-
+
+      - name: Configure sccache
+        shell: pwsh
+        run: |
+          $sccacheExe = Join-Path $env:GITHUB_WORKSPACE ".tools\sccache\bin\sccache.exe"
+          if (-not (Test-Path $sccacheExe)) {
+            Write-Warning "sccache is unavailable; continuing without RUSTC_WRAPPER."
+            exit 0
+          }
+          $sccacheDir = Join-Path $env:GITHUB_WORKSPACE ".sccache"
+          New-Item -ItemType Directory -Force $sccacheDir | Out-Null
+          "RUSTC_WRAPPER=$sccacheExe" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "SCCACHE_DIR=$sccacheDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "SCCACHE_CACHE_SIZE=2G" | Out-File -FilePath $env:GITHUB_ENV -Append
+          & $sccacheExe --version
+          & $sccacheExe --zero-stats
+
       - name: Build Windows Tauri app without bundling
         shell: cmd
         run: scripts\windows-verify.cmd build
+
+      - name: Report sccache stats
+        if: always()
+        shell: pwsh
+        run: |
+          $sccacheExe = Join-Path $env:GITHUB_WORKSPACE ".tools\sccache\bin\sccache.exe"
+          if (Test-Path $sccacheExe) {
+            & $sccacheExe --show-stats
+          }
