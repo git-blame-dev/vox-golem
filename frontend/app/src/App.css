@@ -441,6 +441,12 @@
   background: #e9f8ef;
 }
 
+.composer__wake--low .composer__wake-primary,
+.composer__wake--medium .composer__wake-primary,
+.composer__wake--high .composer__wake-primary {
+  color: #17324f;
+}
+
 .composer__button {
   border: none;
   border-radius: 0.65rem;
