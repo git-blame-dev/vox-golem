@@ -104,13 +104,12 @@ jobs:
           cargo --version
           bun --version
 
-      - name: Cache Cargo registry and build output
+      - name: Cache Cargo registry
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
         with:
           path: |
             ~/.cargo/git
             ~/.cargo/registry
-            target
           key: cargo-windows-tauri-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-windows-tauri-${{ runner.os }}-
