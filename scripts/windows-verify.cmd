@@ -130,9 +130,7 @@ call bun run --cwd frontend/app build
 if errorlevel 1 exit /b 1
 
 set "TAURI_VERIFY_CONFIG=%TEMP%\voxgolem-tauri-verify-config-%RANDOM%%RANDOM%.json"
-> "%TAURI_VERIFY_CONFIG%" echo {"build":{"beforeBuildCommand":"cmd /c exit 0"}}
 
-echo [windows-verify] cargo tauri build --no-bundle
 set "CARGO_TAURI_EXE=%USERPROFILE%\.cargo\bin\cargo-tauri.exe"
 if not exist "%CARGO_TAURI_EXE%" (
 where cargo-tauri.exe >nul 2>nul
@@ -143,9 +141,18 @@ exit /b 1
 set "CARGO_TAURI_EXE=cargo-tauri.exe"
 )
 set "TAURI_DIR=%REPO_ROOT%\apps\windows-tauri\src-tauri"
+set "TAURI_ICON_ICO=%TAURI_DIR%\icons\icon.ico"
+if not exist "%TAURI_ICON_ICO%" (
+>&2 echo Tauri icon was not found: %TAURI_ICON_ICO%
+exit /b 1
+)
+set "TAURI_ICON_JSON=%TAURI_ICON_ICO:\=/%"
+> "%TAURI_VERIFY_CONFIG%" echo {"build":{"beforeBuildCommand":"cmd /c exit 0"},"bundle":{"icon":["%TAURI_ICON_JSON%"]}}
+
 call :stop_locked_release_app
 if errorlevel 1 exit /b 1
 cd /d "%TAURI_DIR%"
+echo [windows-verify] cargo tauri build --no-bundle
 "%CARGO_TAURI_EXE%" build --config "%TAURI_VERIFY_CONFIG%" --no-bundle
 set "TAURI_BUILD_STATUS=%errorlevel%"
 del "%TAURI_VERIFY_CONFIG%" >nul 2>nul
@@ -153,5 +160,5 @@ exit /b %TAURI_BUILD_STATUS%
 
 :stop_locked_release_app
 set "VOXGOLEM_TARGET_EXE=%REPO_ROOT%\target\release\vox-golem.exe"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$target = [System.IO.Path]::GetFullPath($env:VOXGOLEM_TARGET_EXE); Get-Process -Name 'vox-golem' -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $target } | ForEach-Object { Write-Host ('[windows-verify] Stopping locked release app process {0}' -f $_.Id); Stop-Process -Id $_.Id -Force -ErrorAction Stop }"
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'SilentlyContinue'; $target = [System.IO.Path]::GetFullPath($env:VOXGOLEM_TARGET_EXE); Get-Process -Name 'vox-golem' -ErrorAction SilentlyContinue | Where-Object { try { $_.Path -and ([System.IO.Path]::GetFullPath($_.Path) -eq $target) } catch { $false } } | ForEach-Object { Write-Host ('[windows-verify] Stopping locked release app process {0}' -f $_.Id); Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }; exit 0"
 exit /b %errorlevel%
