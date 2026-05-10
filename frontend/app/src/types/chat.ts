@@ -32,6 +32,8 @@ export interface CueAssetPaths {
 
 export type ResponseProfile = 'fast' | 'quality'
 
+export type UiTextSize = 'small' | 'medium' | 'large' | 'extra_large'
+
 export interface ResponseProfileState {
   readonly selectedResponseProfile: ResponseProfile
   readonly supportedResponseProfiles: readonly ResponseProfile[]
