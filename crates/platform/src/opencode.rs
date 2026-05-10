@@ -377,7 +377,10 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     struct TempDir {
         path: PathBuf,
@@ -389,13 +392,13 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("system time should be after unix epoch")
                 .as_nanos();
-
+            let sequence = TEMP_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "voxgolem-opencode-tests-{}-{stamp}",
+                "voxgolem-opencode-tests-{}-{stamp}-{sequence}",
                 std::process::id()
             ));
 
-            fs::create_dir_all(&path).expect("temporary test directory should be creatable");
+            fs::create_dir(&path).expect("temporary test directory should be creatable");
 
             Self { path }
         }
