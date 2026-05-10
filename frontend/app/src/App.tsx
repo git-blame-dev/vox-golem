@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent, KeyboardEvent } from 'react'
 import { ChatBubble } from './components/ChatBubble'
+import { UserNoticeToast } from './components/UserNoticeToast'
 import { playCue } from './lib/audioCues'
 import { shouldSubmitComposer } from './lib/composer'
 import { startLiveAudioSource } from './lib/liveAudioSource'
@@ -31,12 +32,26 @@ import { isTranscriptMessage } from './types/chat'
 import type {
   BackendRuntimePhase,
   ChatMessage,
+  PromptExecutionResult,
   RuntimeControlResult,
   ResponseProfile,
   RuntimeStatus,
   StartupState,
+  UserNotice,
 } from './types/chat'
 import './App.css'
+
+const NOTICE_AUTO_DISMISS_MS = 4_000
+const MAX_NOTICE_QUEUE_LENGTH = 3
+
+type RuntimeDiagnosticKind =
+  | 'frontend_notice'
+  | 'cue'
+  | 'runtime_control'
+  | 'execution'
+  | 'tts'
+  | 'audio'
+  | 'profile'
 
 function App() {
   const [startupState, setStartupState] = useState<StartupState>({ kind: 'loading' })
@@ -48,6 +63,7 @@ function App() {
   const [isSwitchingResponseProfile, setIsSwitchingResponseProfile] = useState(false)
   const [micStarting, setMicStarting] = useState(false)
   const [micActive, setMicActive] = useState(false)
+  const [notices, setNotices] = useState<readonly UserNotice[]>([])
   const [messages, setMessages] = useState<readonly ChatMessage[]>(() =>
     getInitialMessages(),
   )
@@ -73,6 +89,52 @@ function App() {
   }
 
   const voiceTelemetry = voiceTelemetryRef.current
+  const recordRuntimeDiagnostic = useCallback((kind: RuntimeDiagnosticKind, detail: string): void => {
+    void invokeTauriCommand('record_frontend_runtime_diagnostic', {
+      event: {
+        kind,
+        detail,
+      },
+    }).catch(() => undefined)
+  }, [])
+
+  const addNotice = useCallback((notice: Omit<UserNotice, 'id'>): void => {
+    setNotices((currentNotices) => {
+      const nextNotice = {
+        ...notice,
+        id: `notice-${Date.now()}-${currentNotices.length}`,
+      }
+
+      if (currentNotices.length < MAX_NOTICE_QUEUE_LENGTH) {
+        return [...currentNotices, nextNotice]
+      }
+
+      const activeNotice = currentNotices[0]
+      if (activeNotice === undefined) {
+        return [nextNotice]
+      }
+
+      return [
+        activeNotice,
+        ...currentNotices.slice(-(MAX_NOTICE_QUEUE_LENGTH - 2)),
+        nextNotice,
+      ]
+    })
+    recordRuntimeDiagnostic('frontend_notice', `${notice.title}: ${notice.message}`)
+  }, [recordRuntimeDiagnostic])
+
+  useEffect(() => {
+    if (notices.length === 0) {
+      return undefined
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setNotices((currentNotices) => currentNotices.slice(1))
+    }, NOTICE_AUTO_DISMISS_MS)
+
+    return () => window.clearTimeout(timeoutId)
+  }, [notices])
+
 
   const currentSilenceTimeoutMs = (): number => {
     if (
@@ -131,14 +193,11 @@ function App() {
         }
 
         if (nextState.kind === 'error' && previousKind !== 'error') {
-          setMessages((currentMessages) => [
-            ...currentMessages,
-            {
-              id: `system-startup-error-${Date.now()}`,
-              role: 'system',
-              content: `Startup error: ${nextState.message}`,
-            },
-          ])
+          addNotice({
+            tone: 'error',
+            title: 'Startup failed',
+            message: nextState.message,
+          })
         }
 
         if (isStartupStateSettled(nextState)) {
@@ -152,7 +211,7 @@ function App() {
     return () => {
       active = false
     }
-  }, [])
+  }, [addNotice])
 
   useEffect(() => {
     return () => {
@@ -238,16 +297,15 @@ function App() {
       error,
     })
 
-    setMessages((currentMessages) => [
-      ...currentMessages,
-      {
-        id: `system-cue-error-${Date.now()}`,
-        role: 'system',
-        content:
-          `Cue playback error: ${message} ` +
-          `[cue=${cueType}, startCue=${cueAssetPaths.startListening}, stopCue=${cueAssetPaths.stopListening}]`,
-      },
-    ])
+    recordRuntimeDiagnostic(
+      'cue',
+      `Cue playback error: ${message} [cue=${cueType}, startCue=${cueAssetPaths.startListening}, stopCue=${cueAssetPaths.stopListening}]`,
+    )
+    addNotice({
+      tone: 'error',
+      title: 'Cue playback failed',
+      message,
+    })
   }
 
   const applyTransition = (
@@ -494,14 +552,12 @@ function App() {
       const message = toDisplayErrorMessage(error)
 
       recoverFromRuntimeControlError()
-      setMessages((currentMessages) => [
-        ...currentMessages,
-        {
-          id: `system-runtime-control-error-${Date.now()}`,
-          role: 'system',
-          content: `Runtime control error (${command}): ${message}`,
-        },
-      ])
+      addNotice({
+        tone: 'error',
+        title: 'Runtime control failed',
+        message,
+      })
+      recordRuntimeDiagnostic('runtime_control', `Runtime control error (${command}): ${message}`)
       return null
     }
   }
@@ -552,6 +608,10 @@ function App() {
       applyRuntimeStatus(toRuntimeStatus(result.runtimePhase))
 
       const assistantMessage = [...nextMessages].reverse().find((message) => message.role === 'assistant')
+      if (assistantMessage === undefined) {
+        addNotice(createPromptExecutionNotice(result))
+      }
+
       if (
         ttsEnabled &&
         assistantMessage !== undefined &&
@@ -563,14 +623,12 @@ function App() {
       const message = error instanceof Error ? error.message : 'Prompt execution failed'
 
       applyTransition(executingStatus, 'fail')
-      setMessages((currentMessages) => [
-        ...currentMessages,
-        {
-          id: `system-exec-error-${Date.now()}`,
-          role: 'system',
-          content: `Execution error: ${message}`,
-        },
-      ])
+      addNotice({
+        tone: 'error',
+        title: 'Response failed',
+        message,
+      })
+      recordRuntimeDiagnostic('execution', `Execution error: ${message}`)
     }
   }
 
@@ -620,14 +678,14 @@ function App() {
         source.start()
       })
     } catch (error) {
-      setMessages((currentMessages) => [
-        ...currentMessages,
-        {
-          id: `system-tts-synthesis-error-${Date.now()}`,
-          role: 'system',
-          content: `TTS synthesis error: ${toDisplayErrorMessage(error)}`,
-        },
-      ])
+      const message = toDisplayErrorMessage(error)
+
+      addNotice({
+        tone: 'error',
+        title: 'TTS playback failed',
+        message,
+      })
+      recordRuntimeDiagnostic('tts', `TTS synthesis error: ${message}`)
     } finally {
       if (audioContext !== null) {
         await audioContext.close().catch(() => undefined)
@@ -701,7 +759,13 @@ function App() {
   const reportLiveAudioError = (error: unknown): void => {
     const message = error instanceof Error ? error.message : 'Live audio capture failed'
 
-    stopLiveAudio(`live_audio_error:\n${message}`)
+    recordRuntimeDiagnostic('audio', `Live audio error: ${message}`)
+    addNotice({
+      tone: 'error',
+      title: 'Microphone unavailable',
+      message,
+    })
+    stopLiveAudio()
   }
 
   const startMic = async (): Promise<void> => {
@@ -903,14 +967,14 @@ function App() {
       }
 
       if (appActiveRef.current) {
-        setMessages((currentMessages) => [
-          ...currentMessages,
-          {
-            id: `system-switch-profile-error-${Date.now()}`,
-            role: 'system',
-            content: `Response profile switch error: ${toDisplayErrorMessage(error)}`,
-          },
-        ])
+        const message = toDisplayErrorMessage(error)
+
+        addNotice({
+          tone: 'error',
+          title: 'Profile switch failed',
+          message,
+        })
+        recordRuntimeDiagnostic('profile', `Response profile switch error: ${message}`)
       }
     } finally {
       isSwitchingResponseProfileRef.current = false
@@ -938,15 +1002,15 @@ function App() {
         setTtsEnabled(enabled)
       }
     } catch (error) {
+      const message = toDisplayErrorMessage(error)
+
       setTtsEnabled(previousEnabled)
-      setMessages((currentMessages) => [
-        ...currentMessages,
-        {
-          id: `system-tts-toggle-error-${Date.now()}`,
-          role: 'system',
-          content: `TTS toggle error: ${toDisplayErrorMessage(error)}`,
-        },
-      ])
+      addNotice({
+        tone: 'error',
+        title: 'TTS setting failed',
+        message,
+      })
+      recordRuntimeDiagnostic('tts', `TTS toggle error: ${message}`)
     }
   }
 
@@ -1004,6 +1068,8 @@ function App() {
           <ChatBubble key={message.id} message={message} />
         ))}
       </main>
+
+      <UserNoticeToast notice={notices[0] ?? null} />
 
       <form className="composer" onSubmit={onSubmit}>
         <textarea
@@ -1133,6 +1199,27 @@ function toDisplayErrorMessage(error: unknown): string {
   }
 
   return String(error)
+}
+
+function createPromptExecutionNotice(result: PromptExecutionResult): Omit<UserNotice, 'id'> {
+  const hasExecutionFailure =
+    (result.exitCode !== null && result.exitCode !== 0) ||
+    result.stderr.trim().length > 0 ||
+    result.events.some((event) => event.kind === 'error')
+
+  if (hasExecutionFailure) {
+    return {
+      tone: 'error',
+      title: 'Response failed',
+      message: 'The response could not be completed. Try again.',
+    }
+  }
+
+  return {
+    tone: 'info',
+    title: 'No response',
+    message: 'No response was returned. Try again.',
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

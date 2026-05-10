@@ -70,15 +70,15 @@ describe('createExecutionMessages', () => {
     ).toEqual(['tool_use:\nbash (completed)\nShows working tree status'])
   })
 
-  it('returns fallback message when no output is produced', () => {
+  it('returns a hidden system fallback when no output is produced', () => {
     expect(
       createExecutionMessages({
         events: [],
         stderr: '',
         exitCode: 0,
         runtimePhase: 'sleeping',
-      }).map((message) => message.content),
-    ).toEqual(['OpenCode returned no output.'])
+      }).map((message) => ({ role: message.role, content: message.content })),
+    ).toEqual([{ role: 'system', content: 'OpenCode returned no output.' }])
   })
 
   it('renders step finish fallback text when no reason is provided', () => {

@@ -98,8 +98,8 @@ export function createExecutionMessages(
 
   return [
     {
-      id: `assistant-${Date.now()}`,
-      role: 'assistant',
+      id: `system-no-output-${Date.now()}`,
+      role: 'system',
       content: 'OpenCode returned no output.',
     },
   ]
