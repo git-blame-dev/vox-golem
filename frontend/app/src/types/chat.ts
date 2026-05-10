@@ -14,6 +14,13 @@ export interface TranscriptMessage {
   readonly content: string
 }
 
+export interface UserNotice {
+  readonly id: string
+  readonly tone: 'info' | 'warning' | 'error'
+  readonly title: string
+  readonly message: string
+}
+
 export function isTranscriptMessage(message: ChatMessage): message is TranscriptMessage {
   return message.role !== 'system'
 }
