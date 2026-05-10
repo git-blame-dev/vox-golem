@@ -179,6 +179,73 @@ describe('App', () => {
     expect(invoked).toContainEqual({ command: 'set_ui_text_size', args: { textSize: 'medium' } })
   })
 
+  it('keeps an immediate text-size change when delayed persisted settings load later', async () => {
+    let resolvePersistedTextSize: (value: string) => void = () => undefined
+    const persistedTextSize = new Promise<string>((resolve) => {
+      resolvePersistedTextSize = resolve
+    })
+    let textSize = 'medium'
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command, args) => {
+        if (command === 'get_ui_text_size') {
+          return persistedTextSize
+        }
+
+        if (command === 'set_ui_text_size') {
+          if (!isRecord(args) || typeof args['textSize'] !== 'string') {
+            throw new Error('textSize argument is required')
+          }
+
+          textSize = args['textSize']
+          return textSize
+        }
+
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: false,
+            voice_input_error: null,
+            silence_timeout_ms: 1500,
+            selected_response_profile: 'fast',
+            supported_response_profiles: ['fast', 'quality'],
+            tts_enabled: false,
+          }
+        }
+
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    const shell = getShell(container)
+
+    await act(async () => {
+      getButtonByLabel(container, 'Settings').click()
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      getButtonByLabel(container, 'Increase text size').click()
+      await Promise.resolve()
+    })
+
+    expect(shell.dataset['uiTextSize']).toBe('large')
+
+    await act(async () => {
+      resolvePersistedTextSize('small')
+      await persistedTextSize
+      await Promise.resolve()
+    })
+
+    expect(shell.dataset['uiTextSize']).toBe('large')
+  })
+
   it('starts in persisted dark mode and toggles to light mode', async () => {
     const invoked: Array<{ command: string; args: unknown }> = []
     let theme = 'dark'
@@ -235,6 +302,68 @@ describe('App', () => {
     expect(shell.dataset['uiTheme']).toBe('light')
     expect(getButtonByLabel(container, 'Switch to dark mode').textContent).toBe('☾')
     expect(invoked).toContainEqual({ command: 'set_ui_theme', args: { theme: 'light' } })
+  })
+
+  it('keeps an immediate theme toggle when delayed persisted theme loads later', async () => {
+    let resolvePersistedTheme: (value: string) => void = () => undefined
+    const persistedTheme = new Promise<string>((resolve) => {
+      resolvePersistedTheme = resolve
+    })
+    let theme = 'dark'
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command, args) => {
+        if (command === 'get_ui_theme') {
+          return persistedTheme
+        }
+
+        if (command === 'set_ui_theme') {
+          if (!isRecord(args) || typeof args['theme'] !== 'string') {
+            throw new Error('theme argument is required')
+          }
+
+          theme = args['theme']
+          return theme
+        }
+
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: false,
+            voice_input_error: null,
+            silence_timeout_ms: 1500,
+            selected_response_profile: 'fast',
+            supported_response_profiles: ['fast', 'quality'],
+            tts_enabled: false,
+          }
+        }
+
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    const shell = getShell(container)
+
+    await act(async () => {
+      getButtonByLabel(container, 'Switch to light mode').click()
+      await Promise.resolve()
+    })
+
+    expect(shell.dataset['uiTheme']).toBe('light')
+
+    await act(async () => {
+      resolvePersistedTheme('dark')
+      await persistedTheme
+      await Promise.resolve()
+    })
+
+    expect(shell.dataset['uiTheme']).toBe('light')
   })
 
   it('defaults to dark mode when persisted theme is unsupported', async () => {

@@ -100,6 +100,8 @@ function App() {
   const liveAudioSourceRef = useRef<LiveAudioSource | null>(null)
   const liveAudioSessionIdRef = useRef(0)
   const liveAudioInFlightFramesRef = useRef(0)
+  const uiTextSizeHydrationOverriddenRef = useRef(false)
+  const uiThemeHydrationOverriddenRef = useRef(false)
   const isSwitchingResponseProfileRef = useRef(false)
   const appActiveRef = useRef(true)
   const autoStopOnSilenceRef = useRef(true)
@@ -179,7 +181,7 @@ function App() {
 
     void invokeTauriCommand('get_ui_text_size')
       .then((payload) => {
-        if (!active) {
+        if (!active || uiTextSizeHydrationOverriddenRef.current) {
           return
         }
 
@@ -205,7 +207,7 @@ function App() {
 
     void invokeTauriCommand('get_ui_theme')
       .then((payload) => {
-        if (!active) {
+        if (!active || uiThemeHydrationOverriddenRef.current) {
           return
         }
 
@@ -219,6 +221,7 @@ function App() {
   }, [])
 
   const persistUiTextSize = async (nextTextSize: UiTextSize, previousTextSize: UiTextSize): Promise<void> => {
+    uiTextSizeHydrationOverriddenRef.current = true
     setUiTextSize(nextTextSize)
 
     try {
@@ -247,6 +250,7 @@ function App() {
   }
 
   const persistUiTheme = async (nextTheme: UiTheme, previousTheme: UiTheme): Promise<void> => {
+    uiThemeHydrationOverriddenRef.current = true
     setUiTheme(nextTheme)
 
     try {
