@@ -38,6 +38,7 @@ import type {
   RuntimeStatus,
   StartupState,
   UiTextSize,
+  UiTheme,
   UserNotice,
 } from './types/chat'
 import './App.css'
@@ -47,6 +48,7 @@ const MAX_NOTICE_QUEUE_LENGTH = 3
 const UI_TEXT_SIZE_STEPS: readonly UiTextSize[] = ['small', 'medium', 'large', 'extra_large']
 const DEFAULT_UI_TEXT_SIZE: UiTextSize = 'medium'
 
+const DEFAULT_UI_THEME: UiTheme = 'dark'
 const UI_TEXT_SIZE_LABELS: Record<UiTextSize, string> = {
   small: 'Small',
   medium: 'Medium',
@@ -83,6 +85,7 @@ function App() {
   const [notices, setNotices] = useState<readonly UserNotice[]>([])
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [uiTextSize, setUiTextSize] = useState<UiTextSize>(DEFAULT_UI_TEXT_SIZE)
+  const [uiTheme, setUiTheme] = useState<UiTheme>(DEFAULT_UI_THEME)
   const [messages, setMessages] = useState<readonly ChatMessage[]>(() =>
     getInitialMessages(),
   )
@@ -188,6 +191,32 @@ function App() {
       active = false
     }
   }, [])
+  useEffect(() => {
+    document.documentElement.dataset['uiTheme'] = uiTheme
+
+    return () => {
+      delete document.documentElement.dataset['uiTheme']
+    }
+  }, [uiTheme])
+
+  useEffect(() => {
+    let active = true
+
+    void invokeTauriCommand('get_ui_theme')
+      .then((payload) => {
+        if (!active) {
+          return
+        }
+
+        setUiTheme(parseUiTheme(payload))
+      })
+      .catch(() => undefined)
+
+    return () => {
+      active = false
+    }
+  }, [])
+
 
   const persistUiTextSize = async (nextTextSize: UiTextSize, previousTextSize: UiTextSize): Promise<void> => {
     setUiTextSize(nextTextSize)
@@ -215,6 +244,26 @@ function App() {
     }
 
     void persistUiTextSize(nextTextSize, uiTextSize)
+  }
+  const persistUiTheme = async (nextTheme: UiTheme, previousTheme: UiTheme): Promise<void> => {
+    setUiTheme(nextTheme)
+
+    try {
+      const payload = await invokeTauriCommand('set_ui_theme', { theme: nextTheme })
+      setUiTheme(parseUiTheme(payload))
+    } catch (error) {
+      setUiTheme(previousTheme)
+      addNotice({
+        tone: 'error',
+        title: 'Theme not saved',
+        message: toDisplayErrorMessage(error),
+      })
+    }
+  }
+
+  const toggleUiTheme = (): void => {
+    const nextTheme = uiTheme === 'dark' ? 'light' : 'dark'
+    void persistUiTheme(nextTheme, uiTheme)
   }
 
 
@@ -1180,10 +1229,12 @@ function App() {
   const uiTextSizeIndex = Math.max(0, UI_TEXT_SIZE_STEPS.indexOf(uiTextSize))
   const canDecreaseTextSize = uiTextSizeIndex > 0
   const canIncreaseTextSize = uiTextSizeIndex < UI_TEXT_SIZE_STEPS.length - 1
+  const nextUiThemeLabel = uiTheme === 'dark' ? 'light' : 'dark'
+  const themeToggleLabel = `Switch to ${nextUiThemeLabel} mode`
 
 
   return (
-    <div className="shell" data-ui-text-size={uiTextSize}>
+    <div className="shell" data-ui-text-size={uiTextSize} data-ui-theme={uiTheme}>
 
       <main ref={conversationRef} className="conversation" aria-live="polite">
         {visibleMessages.map((message) => (
@@ -1346,6 +1397,15 @@ function App() {
               </div>
             ) : null}
             <button
+              type="button"
+              className="shell__control shell__theme-button"
+              onClick={toggleUiTheme}
+              aria-label={themeToggleLabel}
+              title={themeToggleLabel}
+            >
+              {uiTheme === 'dark' ? '☀' : '☾'}
+            </button>
+            <button
               ref={settingsButtonRef}
               type="button"
               className="shell__control shell__settings-button"
@@ -1384,6 +1444,14 @@ function parseUiTextSize(value: unknown): UiTextSize {
   }
 
   return DEFAULT_UI_TEXT_SIZE
+}
+
+function parseUiTheme(value: unknown): UiTheme {
+  if (value === 'light' || value === 'dark') {
+    return value
+  }
+
+  return DEFAULT_UI_THEME
 }
 
 function getResponseProfileLabel(profile: ResponseProfile): 'Fast' | 'Quality' {

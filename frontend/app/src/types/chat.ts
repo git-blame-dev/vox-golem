@@ -34,6 +34,8 @@ export type ResponseProfile = 'fast' | 'quality'
 
 export type UiTextSize = 'small' | 'medium' | 'large' | 'extra_large'
 
+export type UiTheme = 'light' | 'dark'
+
 export interface ResponseProfileState {
   readonly selectedResponseProfile: ResponseProfile
   readonly supportedResponseProfiles: readonly ResponseProfile[]
