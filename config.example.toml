@@ -7,6 +7,9 @@ wake_word_detection_threshold = 0.68
 
 response_backend = "opencode"
 
+[logging]
+enabled = false
+
 [opencode]
 path = "opencode/opencode.exe"
 
