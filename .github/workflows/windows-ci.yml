@@ -49,11 +49,15 @@ jobs:
           restore-keys: |
             cargo-windows-${{ runner.os }}-
 
-      - name: Install LLVM/libclang
+      - name: Ensure LLVM/libclang
         shell: pwsh
         run: |
-          choco install llvm --version "$env:LLVM_VERSION" -y --no-progress
-          "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          $llvmBin = "C:\Program Files\LLVM\bin"
+          if (-not (Test-Path "$llvmBin\libclang.dll")) {
+            choco install llvm --version "$env:LLVM_VERSION" -y --no-progress
+          }
+          $llvmBin | Out-File -FilePath $env:GITHUB_PATH -Append
+          "LIBCLANG_PATH=$llvmBin" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Check Windows prerequisites
         shell: cmd
@@ -77,8 +81,6 @@ jobs:
     name: Windows Tauri smoke build
     runs-on: windows-latest
     timeout-minutes: 60
-    needs:
-      - windows-rust
 
     steps:
       - name: Checkout repository
@@ -123,11 +125,22 @@ jobs:
           restore-keys: |
             bun-windows-${{ runner.os }}-
 
-      - name: Install LLVM/libclang
+      - name: Cache Tauri CLI
+        id: cache-tauri-cli
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: ~/.cargo/bin/cargo-tauri.exe
+          key: tauri-cli-${{ runner.os }}-${{ env.TAURI_CLI_VERSION }}
+
+      - name: Ensure LLVM/libclang
         shell: pwsh
         run: |
-          choco install llvm --version "$env:LLVM_VERSION" -y --no-progress
-          "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          $llvmBin = "C:\Program Files\LLVM\bin"
+          if (-not (Test-Path "$llvmBin\libclang.dll")) {
+            choco install llvm --version "$env:LLVM_VERSION" -y --no-progress
+          }
+          $llvmBin | Out-File -FilePath $env:GITHUB_PATH -Append
+          "LIBCLANG_PATH=$llvmBin" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Install frontend dependencies
         shell: pwsh
@@ -146,8 +159,13 @@ jobs:
         run: bun run test
 
       - name: Install Tauri CLI
+        if: steps.cache-tauri-cli.outputs.cache-hit != 'true'
         shell: pwsh
         run: cargo install tauri-cli --version "$env:TAURI_CLI_VERSION" --locked
+
+      - name: Verify Tauri CLI
+        shell: pwsh
+        run: cargo tauri --version
 
       - name: Build Windows Tauri app without bundling
         shell: cmd
