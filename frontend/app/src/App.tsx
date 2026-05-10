@@ -47,8 +47,8 @@ const NOTICE_AUTO_DISMISS_MS = 4_000
 const MAX_NOTICE_QUEUE_LENGTH = 3
 const UI_TEXT_SIZE_STEPS: readonly UiTextSize[] = ['small', 'medium', 'large', 'extra_large']
 const DEFAULT_UI_TEXT_SIZE: UiTextSize = 'medium'
-
 const DEFAULT_UI_THEME: UiTheme = 'dark'
+
 const UI_TEXT_SIZE_LABELS: Record<UiTextSize, string> = {
   small: 'Small',
   medium: 'Medium',
@@ -82,10 +82,10 @@ function App() {
   const [isSwitchingResponseProfile, setIsSwitchingResponseProfile] = useState(false)
   const [micStarting, setMicStarting] = useState(false)
   const [micActive, setMicActive] = useState(false)
-  const [notices, setNotices] = useState<readonly UserNotice[]>([])
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [uiTextSize, setUiTextSize] = useState<UiTextSize>(DEFAULT_UI_TEXT_SIZE)
   const [uiTheme, setUiTheme] = useState<UiTheme>(DEFAULT_UI_THEME)
+  const [notices, setNotices] = useState<readonly UserNotice[]>([])
   const [messages, setMessages] = useState<readonly ChatMessage[]>(() =>
     getInitialMessages(),
   )
@@ -191,6 +191,7 @@ function App() {
       active = false
     }
   }, [])
+
   useEffect(() => {
     document.documentElement.dataset['uiTheme'] = uiTheme
 
@@ -216,7 +217,6 @@ function App() {
       active = false
     }
   }, [])
-
 
   const persistUiTextSize = async (nextTextSize: UiTextSize, previousTextSize: UiTextSize): Promise<void> => {
     setUiTextSize(nextTextSize)
@@ -245,6 +245,7 @@ function App() {
 
     void persistUiTextSize(nextTextSize, uiTextSize)
   }
+
   const persistUiTheme = async (nextTheme: UiTheme, previousTheme: UiTheme): Promise<void> => {
     setUiTheme(nextTheme)
 
@@ -265,7 +266,6 @@ function App() {
     const nextTheme = uiTheme === 'dark' ? 'light' : 'dark'
     void persistUiTheme(nextTheme, uiTheme)
   }
-
 
   const currentSilenceTimeoutMs = (): number => {
     if (
@@ -293,6 +293,20 @@ function App() {
     while (appActiveRef.current && liveAudioInFlightFramesRef.current > 0) {
       await new Promise((resolve) => setTimeout(resolve, 10))
     }
+  }
+
+  const applyStartupState = (nextState: StartupState): void => {
+    startupStateRef.current = nextState
+    setStartupState(nextState)
+    if (nextState.kind === 'ready' || nextState.kind === 'warming_model') {
+      setTtsEnabled(nextState.ttsEnabled)
+    } else {
+      setTtsEnabled(false)
+    }
+
+    const nextRuntimeStatus = startupStateToRuntimeStatus(nextState)
+    runtimeStatusRef.current = nextRuntimeStatus
+    setRuntimeStatus(nextRuntimeStatus)
   }
 
   useEffect(() => {
@@ -403,20 +417,6 @@ function App() {
   useEffect(() => {
     isSwitchingResponseProfileRef.current = isSwitchingResponseProfile
   }, [isSwitchingResponseProfile])
-
-  const applyStartupState = (nextState: StartupState): void => {
-    startupStateRef.current = nextState
-    setStartupState(nextState)
-    if (nextState.kind === 'ready' || nextState.kind === 'warming_model') {
-      setTtsEnabled(nextState.ttsEnabled)
-    } else {
-      setTtsEnabled(false)
-    }
-
-    const nextRuntimeStatus = startupStateToRuntimeStatus(nextState)
-    runtimeStatusRef.current = nextRuntimeStatus
-    setRuntimeStatus(nextRuntimeStatus)
-  }
 
   const reportCuePlaybackError = (cueType: 'start_listening' | 'stop_listening', error: unknown): void => {
     const message = error instanceof Error ? error.message : 'Unknown cue playback error'
@@ -635,7 +635,7 @@ function App() {
 
     if (runtimePhase.transcriptionReadySamples !== null) {
       nextMessages.push({
-        id: `system-transcription-ready-${Date.now()}`,
+        id: 'system-transcription-ready',
         role: 'system',
         content: `transcription_ready:\n${runtimePhase.transcriptionReadySamples} samples captured`,
       })
@@ -643,7 +643,7 @@ function App() {
 
     if (runtimePhase.transcriptText !== null) {
       nextMessages.push({
-        id: `system-transcript-${Date.now()}`,
+        id: 'system-transcript',
         role: 'system',
         content: `transcript:\n${runtimePhase.transcriptText}`,
       })
@@ -1190,6 +1190,7 @@ function App() {
     event.preventDefault()
     void sendPrompt()
   }
+
   const onSettingsKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
     if (event.key === 'Escape') {
       event.preventDefault()
@@ -1231,7 +1232,6 @@ function App() {
   const canIncreaseTextSize = uiTextSizeIndex < UI_TEXT_SIZE_STEPS.length - 1
   const nextUiThemeLabel = uiTheme === 'dark' ? 'light' : 'dark'
   const themeToggleLabel = `Switch to ${nextUiThemeLabel} mode`
-
 
   return (
     <div className="shell" data-ui-text-size={uiTextSize} data-ui-theme={uiTheme}>
@@ -1433,6 +1433,18 @@ function toRuntimeStatus(runtimePhase: BackendRuntimePhase): RuntimeStatus {
 
 const RESPONSE_PROFILE_ORDER: readonly ResponseProfile[] = ['fast', 'quality']
 
+function getResponseProfileLabel(profile: ResponseProfile): 'Fast' | 'Quality' {
+  return profile === 'fast' ? 'Fast' : 'Quality'
+}
+
+function parseResponseProfileValue(value: string): ResponseProfile | null {
+  if (value === 'fast' || value === 'quality') {
+    return value
+  }
+
+  return null
+}
+
 function parseUiTextSize(value: unknown): UiTextSize {
   if (
     value === 'small' ||
@@ -1452,18 +1464,6 @@ function parseUiTheme(value: unknown): UiTheme {
   }
 
   return DEFAULT_UI_THEME
-}
-
-function getResponseProfileLabel(profile: ResponseProfile): 'Fast' | 'Quality' {
-  return profile === 'fast' ? 'Fast' : 'Quality'
-}
-
-function parseResponseProfileValue(value: string): ResponseProfile | null {
-  if (value === 'fast' || value === 'quality') {
-    return value
-  }
-
-  return null
 }
 
 function toDisplayErrorMessage(error: unknown): string {

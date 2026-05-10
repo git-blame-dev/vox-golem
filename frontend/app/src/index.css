@@ -4,12 +4,19 @@
   font-family: 'Space Grotesk', 'Segoe UI', sans-serif;
   line-height: 1.5;
   font-weight: 400;
-  color: #122131;
-  background-color: #e8edf3;
+  color: #e7edf7;
+  background-color: #000207;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  color-scheme: dark;
+}
+
+:root[data-ui-theme='light'] {
+  color: #122131;
+  background-color: #e8edf3;
+  color-scheme: light;
 }
 
 * {
@@ -19,6 +26,14 @@
 body {
   margin: 0;
   min-height: 100vh;
+  background:
+    radial-gradient(circle at 12% 18%, rgba(34, 96, 138, 0.12), transparent 40%),
+    radial-gradient(circle at 86% 12%, rgba(104, 125, 151, 0.06), transparent 44%),
+    radial-gradient(circle at 50% 100%, rgba(39, 31, 90, 0.11), transparent 48%),
+    linear-gradient(160deg, #000207 0%, #050912 52%, #010208 100%);
+}
+
+:root[data-ui-theme='light'] body {
   background:
     radial-gradient(circle at 12% 18%, rgba(68, 107, 149, 0.28), transparent 40%),
     radial-gradient(circle at 88% 12%, rgba(179, 197, 144, 0.26), transparent 45%),

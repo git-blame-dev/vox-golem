@@ -46,7 +46,9 @@ afterEach(() => {
   }
 
   Reflect.deleteProperty(window, '__TAURI_INTERNALS__')
+  delete document.documentElement.dataset['uiTheme']
   Date.now = originalDateNow
+  vi.useRealTimers()
   startLiveAudioSourceMock.mockReset()
 })
 
@@ -96,6 +98,383 @@ describe('App', () => {
     expect(container.textContent).toContain('Placeholder response for: Draft release notes')
   })
 
+  it('starts with an empty chat transcript', async () => {
+    const { container } = await renderApp()
+    const conversation = getConversation(container)
+
+    expect(conversation.textContent).toBe('')
+  })
+
+  it('opens settings and live-updates persisted app text size', async () => {
+    const invoked: Array<{ command: string; args: unknown }> = []
+    let textSize = 'medium'
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command, args) => {
+        invoked.push({ command, args })
+
+        if (command === 'get_ui_text_size') {
+          return textSize
+        }
+
+        if (command === 'set_ui_text_size') {
+          if (!isRecord(args) || typeof args['textSize'] !== 'string') {
+            throw new Error('textSize argument is required')
+          }
+
+          textSize = args['textSize']
+          return textSize
+        }
+
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: false,
+            voice_input_error: null,
+            silence_timeout_ms: 1500,
+            selected_response_profile: 'fast',
+            supported_response_profiles: ['fast', 'quality'],
+            tts_enabled: false,
+          }
+        }
+
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    const shell = getShell(container)
+
+    expect(shell.dataset['uiTextSize']).toBe('medium')
+
+    await act(async () => {
+      getButtonByLabel(container, 'Settings').click()
+      await Promise.resolve()
+    })
+
+    expect(container.textContent).toContain('Text size')
+    expect(container.textContent).toContain('Medium (100%)')
+
+    await act(async () => {
+      getButtonByLabel(container, 'Increase text size').click()
+      await Promise.resolve()
+    })
+
+    expect(shell.dataset['uiTextSize']).toBe('large')
+    expect(container.textContent).toContain('Large (112.5%)')
+
+    await act(async () => {
+      getButtonByLabel(container, 'Decrease text size').click()
+      await Promise.resolve()
+    })
+
+    expect(shell.dataset['uiTextSize']).toBe('medium')
+    expect(container.textContent).toContain('Medium (100%)')
+    expect(invoked).toContainEqual({ command: 'set_ui_text_size', args: { textSize: 'large' } })
+    expect(invoked).toContainEqual({ command: 'set_ui_text_size', args: { textSize: 'medium' } })
+  })
+
+  it('starts in persisted dark mode and toggles to light mode', async () => {
+    const invoked: Array<{ command: string; args: unknown }> = []
+    let theme = 'dark'
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command, args) => {
+        invoked.push({ command, args })
+
+        if (command === 'get_ui_theme') {
+          return theme
+        }
+
+        if (command === 'set_ui_theme') {
+          if (!isRecord(args) || typeof args['theme'] !== 'string') {
+            throw new Error('theme argument is required')
+          }
+
+          theme = args['theme']
+          return theme
+        }
+
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: false,
+            voice_input_error: null,
+            silence_timeout_ms: 1500,
+            selected_response_profile: 'fast',
+            supported_response_profiles: ['fast', 'quality'],
+            tts_enabled: false,
+          }
+        }
+
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    const shell = getShell(container)
+
+    expect(shell.dataset['uiTheme']).toBe('dark')
+    expect(getButtonByLabel(container, 'Switch to light mode').textContent).toBe('☀')
+
+    await act(async () => {
+      getButtonByLabel(container, 'Switch to light mode').click()
+      await Promise.resolve()
+    })
+
+    expect(shell.dataset['uiTheme']).toBe('light')
+    expect(getButtonByLabel(container, 'Switch to dark mode').textContent).toBe('☾')
+    expect(invoked).toContainEqual({ command: 'set_ui_theme', args: { theme: 'light' } })
+  })
+
+  it('defaults to dark mode when persisted theme is unsupported', async () => {
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        if (command === 'get_ui_theme') {
+          return 'solarized'
+        }
+
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: false,
+            voice_input_error: null,
+            silence_timeout_ms: 1500,
+            selected_response_profile: 'fast',
+            supported_response_profiles: ['fast', 'quality'],
+            tts_enabled: false,
+          }
+        }
+
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+
+    expect(getShell(container).dataset['uiTheme']).toBe('dark')
+    expect(getButtonByLabel(container, 'Switch to light mode').textContent).toBe('☀')
+  })
+
+  it('reverts theme and shows a notice when theme persistence fails', async () => {
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        if (command === 'get_ui_theme') {
+          return 'dark'
+        }
+
+        if (command === 'set_ui_theme') {
+          throw new Error('theme write failed')
+        }
+
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: false,
+            voice_input_error: null,
+            silence_timeout_ms: 1500,
+            selected_response_profile: 'fast',
+            supported_response_profiles: ['fast', 'quality'],
+            tts_enabled: false,
+          }
+        }
+
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+
+    await act(async () => {
+      getButtonByLabel(container, 'Switch to light mode').click()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(getShell(container).dataset['uiTheme']).toBe('dark')
+    expect(container.textContent).toContain('Theme not saved')
+    expect(container.textContent).toContain('theme write failed')
+  })
+
+  it('reverts text size and shows a notice when settings persistence fails', async () => {
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        if (command === 'get_ui_text_size') {
+          return 'medium'
+        }
+
+        if (command === 'set_ui_text_size') {
+          throw new Error('state write failed')
+        }
+
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: false,
+            voice_input_error: null,
+            silence_timeout_ms: 1500,
+            selected_response_profile: 'fast',
+            supported_response_profiles: ['fast', 'quality'],
+            tts_enabled: false,
+          }
+        }
+
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    const shell = getShell(container)
+
+    await act(async () => {
+      getButtonByLabel(container, 'Settings').click()
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      getButtonByLabel(container, 'Increase text size').click()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(shell.dataset['uiTextSize']).toBe('medium')
+    expect(container.textContent).toContain('Setting not saved')
+    expect(container.textContent).toContain('state write failed')
+  })
+
+  it('supports keyboard focus and Escape close for the settings overlay', async () => {
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        if (command === 'get_ui_text_size') {
+          return 'medium'
+        }
+
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: false,
+            voice_input_error: null,
+            silence_timeout_ms: 1500,
+            selected_response_profile: 'fast',
+            supported_response_profiles: ['fast', 'quality'],
+            tts_enabled: false,
+          }
+        }
+
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    const settingsButton = getButtonByLabel(container, 'Settings')
+
+    await act(async () => {
+      settingsButton.click()
+      await Promise.resolve()
+    })
+
+    const closeButton = getButtonByLabel(container, 'Close settings')
+    expect(document.activeElement).toBe(closeButton)
+
+    await act(async () => {
+      closeButton.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+      await new Promise((resolve) => window.setTimeout(resolve, 0))
+    })
+
+    expect(container.textContent).not.toContain('Adjust the app text size live.')
+    expect(document.activeElement).toBe(settingsButton)
+  })
+
+  it('falls back to medium when persisted text size is unsupported', async () => {
+    let textSize = 'giant'
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command, args) => {
+        if (command === 'get_ui_text_size') {
+          return textSize
+        }
+
+        if (command === 'set_ui_text_size') {
+          if (!isRecord(args) || typeof args['textSize'] !== 'string') {
+            throw new Error('textSize argument is required')
+          }
+
+          textSize = args['textSize']
+          return textSize
+        }
+
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: false,
+            voice_input_error: null,
+            silence_timeout_ms: 1500,
+            selected_response_profile: 'fast',
+            supported_response_profiles: ['fast', 'quality'],
+            tts_enabled: false,
+          }
+        }
+
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    const shell = getShell(container)
+
+    expect(shell.dataset['uiTextSize']).toBe('medium')
+
+    await act(async () => {
+      getButtonByLabel(container, 'Settings').click()
+      await Promise.resolve()
+    })
+
+    expect(container.textContent).toContain('Medium (100%)')
+
+    await act(async () => {
+      getButtonByLabel(container, 'Increase text size').click()
+      await Promise.resolve()
+    })
+
+    expect(shell.dataset['uiTextSize']).toBe('large')
+    expect(container.textContent).toContain('Large (112.5%)')
+  })
+
   it('submits from Enter and ignores Shift+Enter', async () => {
     const { container } = await renderApp()
     const composer = getComposer(container)
@@ -143,7 +522,7 @@ describe('App', () => {
               stop_listening: 'resources/stop-listening.wav',
             },
             runtime_phase: 'sleeping',
-            voice_input_available: false,
+            voice_input_available: true,
             voice_input_error: null,
             silence_timeout_ms: 1500,
             selected_response_profile: 'fast',
@@ -440,7 +819,7 @@ describe('App', () => {
     expect(select.value).toBe('quality')
   })
 
-  it('restores previous profile and surfaces an error when profile switching fails', async () => {
+  it('restores previous profile and hides profile switch errors from chat', async () => {
     const invokedCommands: string[] = []
     let startupStateCallCount = 0
 
@@ -459,7 +838,7 @@ describe('App', () => {
                 stop_listening: 'resources/stop-listening.wav',
               },
               runtime_phase: 'sleeping',
-              voice_input_available: true,
+              voice_input_available: false,
               voice_input_error: null,
               silence_timeout_ms: 1500,
               selected_response_profile: 'fast',
@@ -475,7 +854,7 @@ describe('App', () => {
                 stop_listening: 'resources/stop-listening.wav',
               },
               runtime_phase: 'initializing',
-              voice_input_available: true,
+              voice_input_available: false,
               voice_input_error: null,
               silence_timeout_ms: 1500,
               message: 'Loading local Gemma model...',
@@ -491,7 +870,7 @@ describe('App', () => {
               stop_listening: 'resources/stop-listening.wav',
             },
             runtime_phase: 'executing',
-            voice_input_available: true,
+            voice_input_available: false,
             voice_input_error: null,
             silence_timeout_ms: 1500,
             selected_response_profile: 'fast',
@@ -517,14 +896,15 @@ describe('App', () => {
     })
 
     expect(startupStateCallCount).toBe(3)
-    expect(invokedCommands).toEqual([
+    expect(nonDiagnosticCommands(invokedCommands)).toEqual([
       'get_startup_state',
       'switch_response_profile',
       'get_startup_state',
       'get_startup_state',
     ])
     expect(select.value).toBe('fast')
-    expect(container.textContent).toContain(
+    expect(container.textContent).toContain('Profile switch failed')
+    expect(container.textContent).not.toContain(
       'Response profile switch error: response backend is busy; wait for the active operation to finish',
     )
   })
@@ -584,7 +964,7 @@ describe('App', () => {
     expect(container.textContent).not.toContain('Response profile switch error:')
   })
 
-  it('renders tauri prompt execution output when submit command succeeds', async () => {
+  it('renders only user and assistant prompt execution output when submit command succeeds', async () => {
     window.__TAURI_INTERNALS__ = {
       invoke: async (command, args) => {
         if (command === 'get_startup_state') {
@@ -595,7 +975,7 @@ describe('App', () => {
               stop_listening: 'resources/stop-listening.wav',
             },
             runtime_phase: 'sleeping',
-            voice_input_available: true,
+            voice_input_available: false,
             voice_input_error: null,
             silence_timeout_ms: 1500,
             selected_response_profile: 'quality',
@@ -634,12 +1014,60 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(container.textContent).toContain('step_start:\nOpenCode started a run step.')
-    expect(container.textContent).toContain('reasoning:\nNeed to inspect the repo state first')
-    expect(container.textContent).toContain('tool_use:\nbash (completed)\nShows working tree status')
+    expect(container.textContent).toContain('Draft release notes')
+    expect(container.textContent).not.toContain('step_start:\nOpenCode started a run step.')
+    expect(container.textContent).not.toContain('reasoning:\nNeed to inspect the repo state first')
+    expect(container.textContent).not.toContain('tool_use:\nbash (completed)\nShows working tree status')
     expect(container.textContent).toContain('OpenCode response')
-    expect(container.textContent).toContain('step_finish:\nstop')
-    expect(container.textContent).toContain('stderr:\nwarning output')
+    expect(container.textContent).not.toContain('step_finish:\nstop')
+    expect(container.textContent).not.toContain('stderr:\nwarning output')
+  })
+
+  it('does not render no-output execution fallback as an assistant message', async () => {
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: false,
+            voice_input_error: null,
+            silence_timeout_ms: 1500,
+            selected_response_profile: 'quality',
+            supported_response_profiles: ['fast', 'quality'],
+          }
+        }
+
+        return {
+          events: [],
+          stderr: '',
+          exit_code: 0,
+          runtime_phase: 'sleeping',
+        }
+      },
+    }
+
+    const { container } = await renderApp()
+    const composer = getComposer(container)
+    const sendButton = getSendButton(container)
+
+    await act(async () => {
+      setTextAreaValue(composer, 'No output prompt')
+    })
+
+    await act(async () => {
+      sendButton.click()
+      await Promise.resolve()
+    })
+
+    expect(container.textContent).toContain('No output prompt')
+    expect(container.textContent).not.toContain('OpenCode returned no output.')
+    expect(container.textContent).toContain('No response')
+    expect(container.textContent).toContain('No response was returned. Try again.')
   })
 
   it('moves runtime to error when opencode exits non-zero', async () => {
@@ -683,8 +1111,9 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(container.textContent).toContain('stderr:\nbad prompt')
-    expect(container.textContent).toContain('exit_code:\n7')
+    expect(container.textContent).toContain('Bad prompt')
+    expect(container.textContent).not.toContain('stderr:\nbad prompt')
+    expect(container.textContent).not.toContain('exit_code:\n7')
   })
 
   it('moves runtime to error when opencode emits a structured error event', async () => {
@@ -734,7 +1163,8 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(container.textContent).toContain('opencode_error:\nAPIError: Provider failed')
+    expect(container.textContent).toContain('Bad prompt')
+    expect(container.textContent).not.toContain('opencode_error:\nAPIError: Provider failed')
   })
 
   it('polls startup state while the local model is warming and becomes ready later', async () => {
@@ -788,7 +1218,7 @@ describe('App', () => {
       await new Promise((resolve) => window.setTimeout(resolve, 600))
     })
 
-    expect(container.textContent).toContain('Startup ready: runtime=sleeping')
+    expect(container.textContent).not.toContain('Startup ready: runtime=sleeping')
   })
 
   it('surfaces an error if the model warming state later fails', async () => {
@@ -940,7 +1370,7 @@ describe('App', () => {
       'test-assets/configured-start.mp3',
       'test-assets/configured-stop.mp3',
     ])
-    expect(container.textContent).toContain('transcription_ready:\n3200 samples captured')
+    expect(container.textContent).not.toContain('transcription_ready:\n3200 samples captured')
   })
 
   it('shows wake confidence badge while listening when telemetry includes wake confidence', async () => {
@@ -1056,7 +1486,7 @@ describe('App', () => {
     const { container } = await renderApp()
 
     expect(startLiveAudioSourceMock).toHaveBeenCalledTimes(1)
-    expect(container.textContent).toContain('live_audio:\ndefault microphone started')
+    expect(container.textContent).not.toContain('live_audio:\ndefault microphone started')
 
     await act(async () => {
       await onFrame?.([0.1, 0.2, 0.3])
@@ -1071,7 +1501,7 @@ describe('App', () => {
     })
 
     expect(stop).toHaveBeenCalledTimes(1)
-    expect(container.textContent).toContain('live_audio:\ndefault microphone stopped')
+    expect(container.textContent).not.toContain('live_audio:\ndefault microphone stopped')
   })
 
   it('ignores stale live frames after profile switch stops capture', async () => {
@@ -1669,13 +2099,13 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(invokedCommands).toEqual([
+    expect(nonDiagnosticCommands(invokedCommands)).toEqual([
       'get_startup_state',
       'ingest_audio_frame',
       'ingest_audio_frame',
       'mark_silence',
     ])
-    expect(container.textContent).toContain('transcription_ready:\n3200 samples captured')
+    expect(container.textContent).not.toContain('transcription_ready:\n3200 samples captured')
   })
 
   it('submits the transcribed voice prompt after silence and returns to wake-word waiting', async () => {
@@ -1774,14 +2204,14 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(invokedCommands).toEqual([
+    expect(nonDiagnosticCommands(invokedCommands)).toEqual([
       'get_startup_state',
       'ingest_audio_frame',
       'ingest_audio_frame',
       'mark_silence',
       'submit_prompt',
     ])
-    expect(container.textContent).toContain('transcript:\nOpen the pull request')
+    expect(container.textContent).not.toContain('transcript:\nOpen the pull request')
     expect(container.textContent).toContain('Open the pull request')
     expect(container.textContent).toContain('Voice execution response')
     expect(container.textContent).toContain('Stop mic')
@@ -1872,7 +2302,7 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(invokedCommands).toEqual([
+    expect(nonDiagnosticCommands(invokedCommands)).toEqual([
       'get_startup_state',
       'ingest_audio_frame',
       'ingest_audio_frame',
@@ -1885,7 +2315,7 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(invokedCommands).toEqual([
+    expect(nonDiagnosticCommands(invokedCommands)).toEqual([
       'get_startup_state',
       'ingest_audio_frame',
       'ingest_audio_frame',
@@ -1971,13 +2401,16 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(invokedCommands).toEqual([
+    expect(nonDiagnosticCommands(invokedCommands)).toEqual([
       'get_startup_state',
       'ingest_audio_frame',
       'ingest_audio_frame',
       'mark_silence',
     ])
-    expect(container.textContent).toContain('Runtime control error (mark_silence): utterance transcription failed: InvalidTranscript(EmptyText)')
+    expect(container.textContent).not.toContain(
+      'Runtime control error (mark_silence): utterance transcription failed: InvalidTranscript(EmptyText)',
+    )
+    expect(container.textContent).toContain('Runtime control failed')
     expect(container.textContent).toContain('Stop mic')
   })
 
@@ -2082,7 +2515,7 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(invokedCommands).toEqual([
+    expect(nonDiagnosticCommands(invokedCommands)).toEqual([
       'get_startup_state',
       'ingest_audio_frame',
       'ingest_audio_frame',
@@ -2097,7 +2530,7 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(invokedCommands).toEqual([
+    expect(nonDiagnosticCommands(invokedCommands)).toEqual([
       'get_startup_state',
       'ingest_audio_frame',
       'ingest_audio_frame',
@@ -2105,7 +2538,7 @@ describe('App', () => {
     ])
   })
 
-  it('shows microphone capture errors without changing the backend contract', async () => {
+  it('hides microphone capture errors from chat without changing the backend contract', async () => {
     startLiveAudioSourceMock.mockRejectedValue(new Error('Permission denied'))
 
     window.__TAURI_INTERNALS__ = {
@@ -2130,7 +2563,8 @@ describe('App', () => {
 
     const { container } = await renderApp()
 
-    expect(container.textContent).toContain('live_audio_error:\nPermission denied')
+    expect(container.textContent).toContain('Microphone unavailable')
+    expect(container.textContent).not.toContain('live_audio_error:\nPermission denied')
     expect(container.textContent).toContain('Start mic')
   })
 
@@ -2162,7 +2596,7 @@ describe('App', () => {
     const { container } = await renderApp()
 
     expect(startLiveAudioSourceMock).toHaveBeenCalledTimes(1)
-    expect(container.textContent).toContain('live_audio:\ndefault microphone started')
+    expect(container.textContent).not.toContain('live_audio:\ndefault microphone started')
     expect(container.querySelector('details.shell__manual-controls')).toBeNull()
     expect(container.textContent).not.toContain('Stop listening and process')
   })
@@ -2245,7 +2679,7 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(invokedCommands).toEqual([
+    expect(nonDiagnosticCommands(invokedCommands)).toEqual([
       'get_startup_state',
       'ingest_audio_frame',
       'ingest_audio_frame',
@@ -2253,7 +2687,7 @@ describe('App', () => {
     expect(container.textContent).toContain('Stop mic')
   })
 
-  it('surfaces raw runtime control rejection messages', async () => {
+  it('hides raw runtime control rejection messages from chat', async () => {
     const stop = vi.fn()
     let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
     let nowMs = 1_000
@@ -2328,7 +2762,7 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(container.textContent).toContain(
+    expect(container.textContent).not.toContain(
       'Runtime control error (mark_silence): utterance transcription failed: InvalidTranscript(EmptyText)',
     )
   })
@@ -2364,6 +2798,16 @@ function getComposer(container: HTMLElement): HTMLTextAreaElement {
   return composer
 }
 
+function getShell(container: HTMLElement): HTMLElement {
+  const shell = container.querySelector<HTMLElement>('.shell')
+
+  if (shell === null) {
+    throw new Error('Missing app shell')
+  }
+
+  return shell
+}
+
 function getConversation(container: HTMLElement): HTMLElement {
   const conversation = container.querySelector<HTMLElement>('main.conversation')
 
@@ -2379,6 +2823,16 @@ function getSendButton(container: HTMLElement): HTMLButtonElement {
 
   if (button === null) {
     throw new Error('Missing send button')
+  }
+
+  return button
+}
+
+function getButtonByLabel(container: HTMLElement, label: string): HTMLButtonElement {
+  const button = container.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`)
+
+  if (button === null) {
+    throw new Error(`Missing ${label} button`)
   }
 
   return button
@@ -2435,6 +2889,18 @@ function setSelectValue(select: HTMLSelectElement, value: string): void {
   select.dispatchEvent(new Event('change', { bubbles: true }))
 }
 
+function nonDiagnosticCommands(commands: readonly string[]): readonly string[] {
+  return commands.filter(
+    (command) =>
+      command !== 'write_runtime_log' &&
+      command !== 'record_frontend_runtime_diagnostic' &&
+      command !== 'get_ui_text_size' &&
+      command !== 'set_ui_text_size' &&
+      command !== 'get_ui_theme' &&
+      command !== 'set_ui_theme',
+  )
+}
+
 function setTextAreaValue(textArea: HTMLTextAreaElement, value: string): void {
   const descriptor = Object.getOwnPropertyDescriptor(
     HTMLTextAreaElement.prototype,
@@ -2447,4 +2913,8 @@ function setTextAreaValue(textArea: HTMLTextAreaElement, value: string): void {
 
   descriptor.set.call(textArea, value)
   textArea.dispatchEvent(new Event('input', { bubbles: true }))
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
 }
