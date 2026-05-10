@@ -143,8 +143,15 @@ exit /b 1
 set "CARGO_TAURI_EXE=cargo-tauri.exe"
 )
 set "TAURI_DIR=%REPO_ROOT%\apps\windows-tauri\src-tauri"
+call :stop_locked_release_app
+if errorlevel 1 exit /b 1
 cd /d "%TAURI_DIR%"
 "%CARGO_TAURI_EXE%" build --config "%TAURI_VERIFY_CONFIG%" --no-bundle
 set "TAURI_BUILD_STATUS=%errorlevel%"
 del "%TAURI_VERIFY_CONFIG%" >nul 2>nul
 exit /b %TAURI_BUILD_STATUS%
+
+:stop_locked_release_app
+set "VOXGOLEM_TARGET_EXE=%REPO_ROOT%\target\release\vox-golem.exe"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$target = [System.IO.Path]::GetFullPath($env:VOXGOLEM_TARGET_EXE); Get-Process -Name 'vox-golem' -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $target } | ForEach-Object { Write-Host ('[windows-verify] Stopping locked release app process {0}' -f $_.Id); Stop-Process -Id $_.Id -Force -ErrorAction Stop }"
+exit /b %errorlevel%
