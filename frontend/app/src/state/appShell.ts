@@ -43,7 +43,7 @@ export function createExecutionMessages(
       messages.push({
         id: `system-step-start-${Date.now()}-${messages.length}`,
         role: 'system',
-        content: 'step_start:\nOpenCode started a run step.',
+        content: 'step_start:\nOpenCode backend started a run step.',
       })
       continue
     }
@@ -54,7 +54,7 @@ export function createExecutionMessages(
         role: 'system',
         content:
           event.reason === null
-            ? 'step_finish:\nOpenCode finished a run step.'
+            ? 'step_finish:\nOpenCode backend finished a run step.'
             : `step_finish:\n${event.reason}`,
       })
       continue
@@ -100,7 +100,7 @@ export function createExecutionMessages(
     {
       id: `system-no-output-${Date.now()}`,
       role: 'system',
-      content: 'OpenCode returned no output.',
+      content: 'OpenCode backend returned no output.',
     },
   ]
 }

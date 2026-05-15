@@ -16,7 +16,7 @@ describe('createExecutionMessages', () => {
         runtimePhase: 'sleeping',
       }).map((message) => message.content),
     ).toEqual([
-      'step_start:\nOpenCode started a run step.',
+      'step_start:\nOpenCode backend started a run step.',
       'reasoning:\nNeed to inspect the repo state first',
       'OpenCode response',
       'step_finish:\nstop',
@@ -35,7 +35,7 @@ describe('createExecutionMessages', () => {
     ).toEqual(['stderr:\nbad prompt', 'exit_code:\n7'])
   })
 
-  it('creates a system message for structured opencode errors', () => {
+  it('creates a system message for structured OpenCode errors', () => {
     expect(
       createExecutionMessages({
         events: [
@@ -78,7 +78,7 @@ describe('createExecutionMessages', () => {
         exitCode: 0,
         runtimePhase: 'sleeping',
       }).map((message) => ({ role: message.role, content: message.content })),
-    ).toEqual([{ role: 'system', content: 'OpenCode returned no output.' }])
+    ).toEqual([{ role: 'system', content: 'OpenCode backend returned no output.' }])
   })
 
   it('renders step finish fallback text when no reason is provided', () => {
@@ -89,6 +89,6 @@ describe('createExecutionMessages', () => {
         exitCode: 0,
         runtimePhase: 'sleeping',
       }).map((message) => message.content),
-    ).toEqual(['step_finish:\nOpenCode finished a run step.'])
+    ).toEqual(['step_finish:\nOpenCode backend finished a run step.'])
   })
 })

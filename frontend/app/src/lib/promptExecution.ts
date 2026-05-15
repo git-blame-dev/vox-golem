@@ -55,7 +55,7 @@ function createFallbackResult(prompt: string): PromptExecutionResult {
     events: [
       {
         kind: 'text',
-        text: `Placeholder response for: ${prompt}`,
+        text: `Browser preview only — no backend response was generated. Prompt: ${prompt}`,
       },
     ],
     stderr: '',

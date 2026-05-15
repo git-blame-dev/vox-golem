@@ -58,7 +58,12 @@ describe('parsePromptExecutionResult', () => {
 describe('executePrompt', () => {
   it('uses fallback output when tauri internals are unavailable', async () => {
     await expect(executePrompt('Draft release notes')).resolves.toEqual({
-      events: [{ kind: 'text', text: 'Placeholder response for: Draft release notes' }],
+      events: [
+        {
+          kind: 'text',
+          text: 'Browser preview only — no backend response was generated. Prompt: Draft release notes',
+        },
+      ],
       stderr: '',
       exitCode: 0,
       runtimePhase: 'sleeping',

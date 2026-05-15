@@ -95,7 +95,9 @@ describe('App', () => {
     })
 
     expect(container.textContent).toContain('Draft release notes')
-    expect(container.textContent).toContain('Placeholder response for: Draft release notes')
+    expect(container.textContent).toContain(
+      'Browser preview only — no backend response was generated. Prompt: Draft release notes',
+    )
   })
 
   it('starts with an empty chat transcript', async () => {
@@ -622,7 +624,9 @@ describe('App', () => {
       )
     })
 
-    expect(container.textContent).not.toContain('Placeholder response for: Line one')
+    expect(container.textContent).not.toContain(
+      'Browser preview only — no backend response was generated. Prompt: Line one',
+    )
 
     await act(async () => {
       composer.dispatchEvent(
@@ -633,7 +637,9 @@ describe('App', () => {
       )
     })
 
-    expect(container.textContent).toContain('Placeholder response for: Line one')
+    expect(container.textContent).toContain(
+      'Browser preview only — no backend response was generated. Prompt: Line one',
+    )
   })
 
   it('replaces composer hint with a TTS toggle and invokes backend toggle command', async () => {
@@ -758,7 +764,12 @@ describe('App', () => {
         if (command === 'submit_prompt') {
           expect(args).toEqual({ prompt: 'Hello voice' })
           return {
-            events: [{ kind: 'text', text: 'Placeholder response for: Hello voice' }],
+            events: [
+              {
+                kind: 'text',
+                text: 'Browser preview only — no backend response was generated. Prompt: Hello voice',
+              },
+            ],
             stderr: '',
             exit_code: 0,
             runtime_phase: 'sleeping',
@@ -766,7 +777,9 @@ describe('App', () => {
         }
 
         if (command === 'synthesize_local_tts') {
-          expect(args).toEqual({ text: 'Placeholder response for: Hello voice' })
+          expect(args).toEqual({
+            text: 'Browser preview only — no backend response was generated. Prompt: Hello voice',
+          })
           return {
             pcm_f32: [0.0, 0.1, -0.1],
             sample_rate_hz: 22050,
@@ -1144,7 +1157,7 @@ describe('App', () => {
     })
 
     expect(container.textContent).toContain('Draft release notes')
-    expect(container.textContent).not.toContain('step_start:\nOpenCode started a run step.')
+    expect(container.textContent).not.toContain('step_start:\nOpenCode backend started a run step.')
     expect(container.textContent).not.toContain('reasoning:\nNeed to inspect the repo state first')
     expect(container.textContent).not.toContain('tool_use:\nbash (completed)\nShows working tree status')
     expect(container.textContent).toContain('OpenCode response')
@@ -1194,7 +1207,7 @@ describe('App', () => {
     })
 
     expect(container.textContent).toContain('No output prompt')
-    expect(container.textContent).not.toContain('OpenCode returned no output.')
+    expect(container.textContent).not.toContain('OpenCode backend returned no output.')
     expect(container.textContent).toContain('No response')
     expect(container.textContent).toContain('No response was returned. Try again.')
   })
