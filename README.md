@@ -1,7 +1,7 @@
 # VoxGolem
 
-[![Linux CI](https://github.com/git-blame-dev/vox-golem/actions/workflows/linux-ci.yml/badge.svg?branch=main)](https://github.com/git-blame-dev/vox-golem/actions/workflows/linux-ci.yml)
-[![Windows CI](https://github.com/git-blame-dev/vox-golem/actions/workflows/windows-ci.yml/badge.svg?branch=main)](https://github.com/git-blame-dev/vox-golem/actions/workflows/windows-ci.yml)
+[![CI](https://github.com/git-blame-dev/vox-golem/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/git-blame-dev/vox-golem/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/git-blame-dev/vox-golem?label=release)](https://github.com/git-blame-dev/vox-golem/releases/latest)
 
 A Windows-first local AI voice assistant for hands-free coding workflows with private speech capture, transcription, and local model profiles.
 
