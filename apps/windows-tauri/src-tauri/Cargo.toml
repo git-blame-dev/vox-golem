@@ -9,6 +9,7 @@ name = "vox_golem_windows_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
+base64 = "0.22"
 espeak-rs = { version = "0.1.9", default-features = false }
 ndarray = "0.17"
 ort = { version = "=2.0.0-rc.12", features = ["ndarray", "cuda"] }
