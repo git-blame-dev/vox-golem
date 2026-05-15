@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![deny(unused_must_use)]
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
@@ -8,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{path::BaseDirectory, Manager};
+use tauri::Manager;
 
 mod livekit_wakeword;
 mod transcription;
@@ -31,6 +32,9 @@ const RUNTIME_LOG_FILE: &str = "runtime.log";
 const RUNTIME_LOG_MESSAGE_MAX_CHARS: usize = 16_384;
 const LLAMA_CPP_ROLLOVER_REASON: &str =
     "Context budget reached; started a new local Gemma conversation for this reply.";
+const CUE_AUDIO_DATA_URL_PREFIX: &str = "data:audio/wav;base64,";
+const START_LISTENING_CUE_WAV: &[u8] = include_bytes!("../resources/start-listening.wav");
+const STOP_LISTENING_CUE_WAV: &[u8] = include_bytes!("../resources/stop-listening.wav");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LlamaConversationTurn {
@@ -1331,12 +1335,9 @@ fn set_startup_tts_enabled(startup_state: &Arc<Mutex<StartupStatePayload>>, enab
     }
 }
 
-fn build_app_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppState {
+fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
     let fallback_voice_pipeline_config = default_voice_pipeline_config();
-    let cue_asset_paths = match resolve_bundled_cue_asset_paths(app) {
-        Ok(cue_asset_paths) => cue_asset_paths,
-        Err(error) => return build_startup_error_app_state(fallback_voice_pipeline_config, error),
-    };
+    let cue_asset_paths = embedded_cue_asset_paths();
 
     match voxgolem_core::config::load_runtime_config(None) {
         Ok(config) => {
@@ -1617,36 +1618,18 @@ fn initialize_local_tts_runtime(
     }
 }
 
-fn resolve_bundled_cue_asset_paths<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-) -> Result<CueAssetPathsPayload, String> {
-    let start_listening = app
-        .path()
-        .resolve("resources/start-listening.wav", BaseDirectory::Resource)
-        .map_err(|error| format!("failed to resolve bundled start-listening cue: {error}"))?;
-    let stop_listening = app
-        .path()
-        .resolve("resources/stop-listening.wav", BaseDirectory::Resource)
-        .map_err(|error| format!("failed to resolve bundled stop-listening cue: {error}"))?;
-
-    if !start_listening.is_file() {
-        return Err(format!(
-            "bundled start-listening cue is missing at {}",
-            start_listening.display()
-        ));
+fn embedded_cue_asset_paths() -> CueAssetPathsPayload {
+    CueAssetPathsPayload {
+        start_listening: cue_audio_data_url(START_LISTENING_CUE_WAV),
+        stop_listening: cue_audio_data_url(STOP_LISTENING_CUE_WAV),
     }
+}
 
-    if !stop_listening.is_file() {
-        return Err(format!(
-            "bundled stop-listening cue is missing at {}",
-            stop_listening.display()
-        ));
-    }
-
-    Ok(CueAssetPathsPayload {
-        start_listening: String::from("resources/start-listening.wav"),
-        stop_listening: String::from("resources/stop-listening.wav"),
-    })
+fn cue_audio_data_url(bytes: &[u8]) -> String {
+    format!(
+        "{CUE_AUDIO_DATA_URL_PREFIX}{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )
 }
 
 fn build_startup_error_app_state(
@@ -3650,6 +3633,20 @@ mod tests {
         let maybe_guard = super::try_lock_response_backend_operation_or_busy(&operation_lock)
             .expect("busy lock should not return a hard error");
         assert!(maybe_guard.is_none());
+    }
+
+    #[test]
+    fn contract_cue_assets_are_embedded_data_urls() {
+        let cue_asset_paths = super::embedded_cue_asset_paths();
+
+        assert!(cue_asset_paths
+            .start_listening
+            .starts_with(super::CUE_AUDIO_DATA_URL_PREFIX));
+        assert!(cue_asset_paths
+            .stop_listening
+            .starts_with(super::CUE_AUDIO_DATA_URL_PREFIX));
+        assert!(!cue_asset_paths.start_listening.contains("resources/"));
+        assert!(!cue_asset_paths.stop_listening.contains("resources/"));
     }
 
     #[test]

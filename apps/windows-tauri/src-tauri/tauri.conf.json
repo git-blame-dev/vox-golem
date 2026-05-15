@@ -34,10 +34,6 @@
     "icon": [
       "icons/icon.ico"
     ],
-    "resources": [
-      "resources/start-listening.wav",
-      "resources/stop-listening.wav"
-    ],
     "targets": "all"
   }
 }
