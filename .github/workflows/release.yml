@@ -41,7 +41,48 @@ jobs:
           version="v${date_part}.${GITHUB_RUN_NUMBER}"
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
+      - name: Determine release scope
+        id: release_scope
+        shell: bash
+        env:
+          TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          previous_tag="$(git describe --tags --abbrev=0 "${TARGET_SHA}^" 2>/dev/null || true)"
+
+          if [ -z "$previous_tag" ]; then
+            printf 'No previous tag found; publishing initial release.\n'
+            printf 'previous_tag=\n' >> "$GITHUB_OUTPUT"
+            printf 'should_publish=true\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          changed_files="$(git diff --name-only "${previous_tag}..${TARGET_SHA}")"
+          has_release_relevant_change=false
+
+          while IFS= read -r path; do
+            [ -n "$path" ] || continue
+
+            case "$path" in
+              .github/*|.gitignore|README.md|docs/*)
+                ;;
+              *)
+                has_release_relevant_change=true
+                ;;
+            esac
+          done <<EOF
+          $changed_files
+          EOF
+
+          printf 'Changed files since %s:\n%s\n' "$previous_tag" "$changed_files"
+          printf 'previous_tag=%s\n' "$previous_tag" >> "$GITHUB_OUTPUT"
+          printf 'should_publish=%s\n' "$has_release_relevant_change" >> "$GITHUB_OUTPUT"
+
+      - name: Skip release
+        if: steps.release_scope.outputs.should_publish != 'true'
+        run: printf '%s\n' 'Skipping release because only workflow or docs files changed.'
+
       - name: Download Windows app artifact from CI
+        if: steps.release_scope.outputs.should_publish == 'true'
         uses: actions/download-artifact@v4
         with:
           name: vox-golem-windows-app
@@ -50,6 +91,7 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
 
       - name: Create release zip
+        if: steps.release_scope.outputs.should_publish == 'true'
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
@@ -57,6 +99,7 @@ jobs:
           (cd package && zip -r -D "../dist/vox-golem-${VERSION}.zip" VoxGolem)
 
       - name: Verify release zip contents
+        if: steps.release_scope.outputs.should_publish == 'true'
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
@@ -67,7 +110,53 @@ jobs:
           EOF
           diff -u expected.txt actual.txt
 
+      - name: Generate release notes
+        if: steps.release_scope.outputs.should_publish == 'true'
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
+          PREVIOUS_TAG: ${{ steps.release_scope.outputs.previous_tag }}
+        run: |
+          if [ -n "$PREVIOUS_TAG" ]; then
+            commit_range="${PREVIOUS_TAG}..${TARGET_SHA}"
+            compare_url="https://github.com/${GITHUB_REPOSITORY}/compare/${PREVIOUS_TAG}...${VERSION}"
+          else
+            commit_range="$TARGET_SHA"
+            compare_url=""
+          fi
+
+          commit_lines="$(git log --reverse --pretty=format:'- %s (%h)' "$commit_range")"
+
+          {
+            printf '## Changes\n\n'
+
+            if [ -n "$commit_lines" ]; then
+              printf '%s\n' "$commit_lines"
+            else
+              printf -- '- No commit changes detected.\n'
+            fi
+
+            printf '\n## Artifacts\n\n'
+            printf -- "- Windows app: \`VoxGolem/vox-golem.exe\`\n"
+            printf -- "- Config template: \`VoxGolem/config.toml\`\n"
+
+            printf '\n## Verification\n\n'
+            printf -- "- CI \`frontend-checks\`\n"
+            printf -- "- CI \`windows-rust-checks\`\n"
+            printf -- "- CI \`windows-build\`\n"
+
+            printf '\n## Full changelog\n\n'
+
+            if [ -n "$compare_url" ]; then
+              printf '%s\n' "$compare_url"
+            else
+              printf 'Initial release from %s.\n' "$TARGET_SHA"
+            fi
+          } > release-notes.md
+
       - name: Publish release
+        if: steps.release_scope.outputs.should_publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
@@ -76,5 +165,5 @@ jobs:
           gh release create "$VERSION" dist/*.zip \
             --target "$TARGET_SHA" \
             --title "VoxGolem ${VERSION}" \
-            --generate-notes \
+            --notes-file release-notes.md \
             --latest
