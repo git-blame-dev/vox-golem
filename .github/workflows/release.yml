@@ -14,7 +14,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_sha || github.sha }}
+  group: release-main
   cancel-in-progress: false
 
 jobs:
@@ -24,7 +24,9 @@ jobs:
     timeout-minutes: 10
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_branch == 'main'
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
 
     steps:
       - name: Check out repository
@@ -46,13 +48,64 @@ jobs:
         shell: bash
         env:
           TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          previous_tag="$(git describe --tags --abbrev=0 "${TARGET_SHA}^" 2>/dev/null || true)"
+          git fetch --tags --force
+
+          previous_tag="$(git describe --tags --match 'v[0-9]*' --abbrev=0 "${TARGET_SHA}^" 2>/dev/null || true)"
+
+          if git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null; then
+            tag_target="$(git rev-list -n 1 "$VERSION")"
+            if [ "$tag_target" != "$TARGET_SHA" ]; then
+              printf 'Refusing to publish %s because tag %s already points at %s.\n' "$TARGET_SHA" "$VERSION" "$tag_target" >&2
+              exit 1
+            fi
+          fi
+
+          existing_release_tags="$(git tag --points-at "$TARGET_SHA" --list 'v[0-9]*' || true)"
+          if [ -z "$existing_release_tags" ]; then
+            existing_release_tags="$(gh api "repos/${REPOSITORY}/releases" --paginate --jq ".[] | select(.target_commitish == \"${TARGET_SHA}\") | .tag_name" | head -n 1)"
+          fi
+
+          if [ -n "$existing_release_tags" ]; then
+            while IFS= read -r existing_tag; do
+              [ -n "$existing_tag" ] || continue
+
+              release_assets="$(gh release view "$existing_tag" --repo "$REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null || true)"
+              missing_assets=false
+
+              for required_asset in "vox-golem-${existing_tag}.zip" 'SHA256SUMS'; do
+                if ! printf '%s\n' "$release_assets" | grep -Fxq "$required_asset"; then
+                  printf 'Existing release %s is missing required asset %s.\n' "$existing_tag" "$required_asset" >&2
+                  missing_assets=true
+                fi
+              done
+
+              if [ "$missing_assets" = true ]; then
+                printf 'Refusing to create a second release for %s while %s is incomplete.\n' "$TARGET_SHA" "$existing_tag" >&2
+                exit 1
+              fi
+
+              printf 'Release %s already targets %s; skipping duplicate release.\n' "$existing_tag" "$TARGET_SHA"
+              {
+                printf 'previous_tag=%s\n' "$previous_tag"
+                printf 'should_publish=false\n'
+                printf 'skip_reason=%s\n' "release ${existing_tag} already targets this commit"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            done <<EOF
+          $existing_release_tags
+          EOF
+          fi
 
           if [ -z "$previous_tag" ]; then
             printf 'No previous tag found; publishing initial release.\n'
-            printf 'previous_tag=\n' >> "$GITHUB_OUTPUT"
-            printf 'should_publish=true\n' >> "$GITHUB_OUTPUT"
+            {
+              printf 'previous_tag=\n'
+              printf 'should_publish=true\n'
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -74,12 +127,31 @@ jobs:
           EOF
 
           printf 'Changed files since %s:\n%s\n' "$previous_tag" "$changed_files"
-          printf 'previous_tag=%s\n' "$previous_tag" >> "$GITHUB_OUTPUT"
-          printf 'should_publish=%s\n' "$has_release_relevant_change" >> "$GITHUB_OUTPUT"
+          {
+            printf 'previous_tag=%s\n' "$previous_tag"
+            printf 'should_publish=%s\n' "$has_release_relevant_change"
+            if [ "$has_release_relevant_change" != true ]; then
+              printf 'skip_reason=%s\n' 'only workflow or docs files changed'
+            fi
+          } >> "$GITHUB_OUTPUT"
 
       - name: Skip release
         if: steps.release_scope.outputs.should_publish != 'true'
-        run: printf '%s\n' 'Skipping release because only workflow or docs files changed.'
+        run: |
+          printf 'Skipping release: %s.\n' "${{ steps.release_scope.outputs.skip_reason }}"
+
+      - name: Confirm main still targets released commit
+        if: steps.release_scope.outputs.should_publish == 'true'
+        env:
+          TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          git fetch origin main
+          current_main="$(git rev-parse FETCH_HEAD)"
+
+          if [ "$current_main" != "$TARGET_SHA" ]; then
+            printf 'Refusing to publish %s because origin/main is now %s.\n' "$TARGET_SHA" "$current_main" >&2
+            exit 1
+          fi
 
       - name: Download Windows app artifact from CI
         if: steps.release_scope.outputs.should_publish == 'true'
@@ -100,15 +172,92 @@ jobs:
 
       - name: Verify release zip contents
         if: steps.release_scope.outputs.should_publish == 'true'
+        shell: bash
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          zipinfo -1 "dist/vox-golem-${VERSION}.zip" | sort > actual.txt
-          cat > expected.txt <<'EOF'
-          VoxGolem/config.toml
-          VoxGolem/vox-golem.exe
-          EOF
-          diff -u expected.txt actual.txt
+          zip_path="dist/vox-golem-${VERSION}.zip"
+          mapfile -t actual_files < <(zipinfo -1 "$zip_path" | sort)
+
+          printf 'Packaged files in %s:\n' "$zip_path"
+          printf '%s\n' "${actual_files[@]}"
+
+          required_files=(
+            "VoxGolem/config.toml"
+            "VoxGolem/vox-golem.exe"
+            "VoxGolem/onnxruntime_providers_cuda.dll"
+            "VoxGolem/onnxruntime_providers_shared.dll"
+            "VoxGolem/cublas64_12.dll"
+            "VoxGolem/cublasLt64_12.dll"
+            "VoxGolem/cudart64_12.dll"
+            "VoxGolem/cudnn64_9.dll"
+            "VoxGolem/cudnn_adv64_9.dll"
+            "VoxGolem/cudnn_cnn64_9.dll"
+            "VoxGolem/cudnn_engines_precompiled64_9.dll"
+            "VoxGolem/cudnn_engines_runtime_compiled64_9.dll"
+            "VoxGolem/cudnn_graph64_9.dll"
+            "VoxGolem/cudnn_heuristic64_9.dll"
+            "VoxGolem/cudnn_ops64_9.dll"
+            "VoxGolem/cufft64_11.dll"
+          )
+
+          missing_files=()
+          for required_file in "${required_files[@]}"; do
+            found=false
+            for actual_file in "${actual_files[@]}"; do
+              if [ "$actual_file" = "$required_file" ]; then
+                found=true
+                break
+              fi
+            done
+
+            if [ "$found" != true ]; then
+              missing_files+=("$required_file")
+            fi
+          done
+
+          if [ "${#missing_files[@]}" -gt 0 ]; then
+            printf 'Missing required release files:\n' >&2
+            printf '%s\n' "${missing_files[@]}" >&2
+            exit 1
+          fi
+
+          allowed_files=(
+            "${required_files[@]}"
+            "VoxGolem/DirectML.dll"
+            "VoxGolem/onnxruntime.dll"
+            "VoxGolem/onnxruntime_providers_nv_tensorrt_rtx.dll"
+            "VoxGolem/onnxruntime_providers_tensorrt.dll"
+          )
+
+          unexpected_files=()
+          for actual_file in "${actual_files[@]}"; do
+            allowed=false
+            for allowed_file in "${allowed_files[@]}"; do
+              if [ "$actual_file" = "$allowed_file" ]; then
+                allowed=true
+                break
+              fi
+            done
+
+            if [ "$allowed" != true ]; then
+              unexpected_files+=("$actual_file")
+            fi
+          done
+
+          if [ "${#unexpected_files[@]}" -gt 0 ]; then
+            printf 'Unexpected release files:\n' >&2
+            printf '%s\n' "${unexpected_files[@]}" >&2
+            exit 1
+          fi
+
+      - name: Generate release checksums
+        if: steps.release_scope.outputs.should_publish == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cd dist
+          sha256sum "vox-golem-${VERSION}.zip" > SHA256SUMS
 
       - name: Generate release notes
         if: steps.release_scope.outputs.should_publish == 'true'
@@ -140,6 +289,8 @@ jobs:
             printf '\n## Artifacts\n\n'
             printf -- "- Windows app: \`VoxGolem/vox-golem.exe\`\n"
             printf -- "- Config template: \`VoxGolem/config.toml\`\n"
+            printf -- "- CUDA/cuDNN runtime DLLs staged beside the app executable\n"
+            printf -- "- Checksums: \`SHA256SUMS\`\n"
 
             printf '\n## Verification\n\n'
             printf -- "- CI \`frontend-checks\`\n"
@@ -162,7 +313,15 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
           TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
-          gh release create "$VERSION" dist/*.zip \
+          git fetch origin main
+          current_main="$(git rev-parse FETCH_HEAD)"
+
+          if [ "$current_main" != "$TARGET_SHA" ]; then
+            printf 'Refusing to publish %s because origin/main is now %s.\n' "$TARGET_SHA" "$current_main" >&2
+            exit 1
+          fi
+
+          gh release create "$VERSION" dist/* \
             --target "$TARGET_SHA" \
             --title "VoxGolem ${VERSION}" \
             --notes-file release-notes.md \
