@@ -1,6 +1,4 @@
 use std::env;
-#[cfg(windows)]
-use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -271,7 +269,7 @@ impl PiperOnnxEngine {
 
         ensure_windows_espeak_data_directory_env()?;
 
-        ensure_windows_cuda_path_for_onnxruntime();
+        ensure_windows_tts_cuda_runtime_dlls_beside_current_exe()?;
 
         let mut builder = ort::session::Session::builder()
             .map_err(|error| format!("failed to create local tts ONNX session builder: {error}"))?
@@ -420,61 +418,60 @@ fn ensure_windows_espeak_data_directory_env() -> Result<(), String> {
     Ok(())
 }
 
-fn ensure_windows_cuda_path_for_onnxruntime() {
+const TTS_CUDA_RUNTIME_DLLS: &[&str] = &[
+    "cublasLt64_12.dll",
+    "cublas64_12.dll",
+    "cufft64_11.dll",
+    "cudart64_12.dll",
+    "cudnn64_9.dll",
+    "cudnn_adv64_9.dll",
+    "cudnn_cnn64_9.dll",
+    "cudnn_engines_precompiled64_9.dll",
+    "cudnn_engines_runtime_compiled64_9.dll",
+    "cudnn_graph64_9.dll",
+    "cudnn_heuristic64_9.dll",
+    "cudnn_ops64_9.dll",
+    "onnxruntime_providers_cuda.dll",
+    "onnxruntime_providers_shared.dll",
+];
+
+fn verify_tts_cuda_runtime_dlls_in_dir(executable_dir: &Path) -> Result<(), String> {
+    let missing_dlls = TTS_CUDA_RUNTIME_DLLS
+        .iter()
+        .copied()
+        .filter(|dll_name| !executable_dir.join(dll_name).is_file())
+        .collect::<Vec<_>>();
+
+    if missing_dlls.is_empty() {
+        return Ok(());
+    }
+
+    Err(format!(
+    "local tts CUDA runtime DLLs are missing beside the current executable in {}: {}. Copy the missing DLLs into that directory before starting VoxGolem.",
+    executable_dir.display(),
+    missing_dlls.join(", ")
+))
+}
+
+fn ensure_windows_tts_cuda_runtime_dlls_beside_current_exe() -> Result<(), String> {
+    #[cfg(not(windows))]
+    {
+        Ok(())
+    }
+
     #[cfg(windows)]
     {
-        let mut candidates = Vec::<PathBuf>::new();
+        let executable_path = env::current_exe().map_err(|error| {
+            format!("failed to resolve current executable for local tts CUDA DLL check: {error}")
+        })?;
+        let executable_dir = executable_path.parent().ok_or_else(|| {
+            format!(
+                "failed to resolve current executable directory for local tts CUDA DLL check: {}",
+                executable_path.display()
+            )
+        })?;
 
-        if let Some(cuda_path) = env::var_os("CUDA_PATH") {
-            let bin = PathBuf::from(cuda_path).join("bin");
-            if bin.is_dir() {
-                candidates.push(bin);
-            }
-        }
-
-        let standard_cuda_root =
-            PathBuf::from(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA");
-        if let Ok(entries) = standard_cuda_root.read_dir() {
-            let mut versioned_cuda_dirs = entries
-                .filter_map(Result::ok)
-                .filter(|entry| entry.path().is_dir())
-                .filter_map(|entry| {
-                    let file_name = entry.file_name();
-                    let value = file_name.to_string_lossy();
-                    let version = value.strip_prefix('v')?;
-                    let parsed = version
-                        .split('.')
-                        .map(|part| part.parse::<u32>().ok())
-                        .collect::<Option<Vec<u32>>>()?;
-
-                    Some((parsed, entry.path()))
-                })
-                .collect::<Vec<(Vec<u32>, PathBuf)>>();
-
-            versioned_cuda_dirs
-                .sort_by(|(left_version, _), (right_version, _)| right_version.cmp(left_version));
-
-            for (_, dir) in versioned_cuda_dirs {
-                let bin = dir.join("bin");
-                if bin.is_dir() {
-                    candidates.push(bin);
-                }
-            }
-        }
-
-        if candidates.is_empty() {
-            return;
-        }
-
-        let mut combined = OsString::new();
-        for candidate in &candidates {
-            combined.push(candidate.as_os_str());
-            combined.push(";");
-        }
-
-        let existing_path = env::var_os("PATH").unwrap_or_default();
-        combined.push(existing_path);
-        env::set_var("PATH", combined);
+        verify_tts_cuda_runtime_dlls_in_dir(executable_dir)
     }
 }
 
@@ -778,6 +775,41 @@ mod tests {
         let error = super::load_piper_voice_config(&model_path)
             .expect_err("missing .onnx.json companion must fail");
         assert!(error.contains("tts model config must exist alongside model"));
+    }
+
+    #[test]
+    fn contract_cuda_runtime_dll_check_lists_missing_executable_directory_dlls() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        fs::write(temp_dir.path().join("cublas64_12.dll"), b"fixture")
+            .expect("present dll fixture should be written");
+
+        let error = super::verify_tts_cuda_runtime_dlls_in_dir(temp_dir.path())
+            .expect_err("missing CUDA runtime DLLs should fail before provider init");
+
+        assert!(
+            error.contains("local tts CUDA runtime DLLs are missing beside the current executable")
+        );
+        assert!(error.contains("cublasLt64_12.dll"));
+        assert!(error.contains("cufft64_11.dll"));
+        assert!(error.contains("cudart64_12.dll"));
+        assert!(error.contains("cudnn64_9.dll"));
+        assert!(error.contains("cudnn_ops64_9.dll"));
+        assert!(error.contains("onnxruntime_providers_cuda.dll"));
+        assert!(error.contains("onnxruntime_providers_shared.dll"));
+        assert!(!error.contains("CUDA_PATH"));
+        assert!(!error.contains("PATH"));
+    }
+
+    #[test]
+    fn contract_cuda_runtime_dll_check_accepts_complete_executable_directory() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        for dll_name in super::TTS_CUDA_RUNTIME_DLLS {
+            fs::write(temp_dir.path().join(dll_name), b"fixture")
+                .expect("dll fixture should be written");
+        }
+
+        super::verify_tts_cuda_runtime_dlls_in_dir(temp_dir.path())
+            .expect("complete CUDA runtime DLL set should pass preflight");
     }
 
     #[test]
