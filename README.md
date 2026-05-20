@@ -1,4 +1,4 @@
-# VoxGolem
+# 🎙️ Vox Golem
 
 [![CI](https://github.com/git-blame-dev/vox-golem/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/git-blame-dev/vox-golem/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/git-blame-dev/vox-golem?label=release)](https://github.com/git-blame-dev/vox-golem/releases/latest)
