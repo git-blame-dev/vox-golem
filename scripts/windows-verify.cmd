@@ -119,6 +119,11 @@ echo [windows-verify] cargo test
 exit /b %errorlevel%
 
 :run_build
+if not defined VOXGOLEM_CUDA_RUNTIME_DIR (
+>&2 echo VOXGOLEM_CUDA_RUNTIME_DIR must be set before running the Windows build stage.
+exit /b 1
+)
+
 echo [windows-verify] bun install
 cd /d "%REPO_ROOT%"
 call bun install
@@ -149,16 +154,14 @@ exit /b 1
 set "TAURI_ICON_JSON=%TAURI_ICON_ICO:\=/%"
 > "%TAURI_VERIFY_CONFIG%" echo {"build":{"beforeBuildCommand":"cmd /c exit 0"},"bundle":{"icon":["%TAURI_ICON_JSON%"]}}
 
-call :stop_locked_release_app
+set "VOXGOLEM_TARGET_EXE=%REPO_ROOT%\target\release\vox-golem.exe"
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'SilentlyContinue'; $target = [System.IO.Path]::GetFullPath($env:VOXGOLEM_TARGET_EXE); Get-Process -Name 'vox-golem' -ErrorAction SilentlyContinue | Where-Object { try { $_.Path -and ([System.IO.Path]::GetFullPath($_.Path) -eq $target) } catch { $false } } | ForEach-Object { Write-Host ('[windows-verify] Stopping locked release app process {0}' -f $_.Id); Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }; exit 0"
 if errorlevel 1 exit /b 1
 cd /d "%TAURI_DIR%"
 echo [windows-verify] cargo tauri build --no-bundle
 "%CARGO_TAURI_EXE%" build --config "%TAURI_VERIFY_CONFIG%" --no-bundle
 set "TAURI_BUILD_STATUS=%errorlevel%"
 del "%TAURI_VERIFY_CONFIG%" >nul 2>nul
-exit /b %TAURI_BUILD_STATUS%
-
-:stop_locked_release_app
-set "VOXGOLEM_TARGET_EXE=%REPO_ROOT%\target\release\vox-golem.exe"
-powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'SilentlyContinue'; $target = [System.IO.Path]::GetFullPath($env:VOXGOLEM_TARGET_EXE); Get-Process -Name 'vox-golem' -ErrorAction SilentlyContinue | Where-Object { try { $_.Path -and ([System.IO.Path]::GetFullPath($_.Path) -eq $target) } catch { $false } } | ForEach-Object { Write-Host ('[windows-verify] Stopping locked release app process {0}' -f $_.Id); Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }; exit 0"
+if not "%TAURI_BUILD_STATUS%"=="0" exit /b %TAURI_BUILD_STATUS%
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%SCRIPT_DIR%windows-package-runtime.ps1" -Mode StageRelease -RepoRoot "%REPO_ROOT%"
 exit /b %errorlevel%

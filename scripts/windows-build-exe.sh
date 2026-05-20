@@ -102,6 +102,11 @@ set "TAURI_DIR=$tauri_dir_win"
 set "OUTPUT_EXE=$repo_root_win\target\release\vox-golem.exe"
 set "TAURI_BUILD_CONFIG=$tauri_build_config_win"
 
+if not defined VOXGOLEM_CUDA_RUNTIME_DIR (
+>&2 echo VOXGOLEM_CUDA_RUNTIME_DIR must be set before building the standalone Windows app.
+exit /b 1
+)
+
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 set "VCVARSBAT="
 set "VSINSTALL="
@@ -175,6 +180,10 @@ powershell.exe -NoProfile -NonInteractive -Command ^
 
 echo [windows-build-exe] $tauri_build_log
 "%CARGO_TAURI_EXE%" build $tauri_build_args
+if errorlevel 1 exit /b 1
+
+echo [windows-build-exe] staging Windows runtime DLLs
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%REPO_ROOT%\scripts\windows-package-runtime.ps1" -Mode StageRelease -RepoRoot "%REPO_ROOT%"
 if errorlevel 1 exit /b 1
 
 echo [windows-build-exe] Built native app executable:
