@@ -81,6 +81,15 @@ check-pc-tools:
 	@command -v cargo-tauri >/dev/null || { printf '%s\n' 'Missing Tauri CLI. Install with: cargo install tauri-cli --version 2.11.1 --locked' >&2; exit 1; }
 	@command -v cmake >/dev/null || { printf '%s\n' 'Missing cmake. Install CMake before running make pc.' >&2; exit 1; }
 	@command -v ninja >/dev/null || { printf '%s\n' 'Missing ninja. cargo-xwin requires Ninja for CMake crates.' >&2; exit 1; }
+	@command -v clang-cl >/dev/null || { printf '%s\n' 'Missing clang-cl. Install LLVM/Clang 19 or newer before running make pc.' >&2; exit 1; }
+	@clang_version="$$(clang-cl --version | { read -r first_line; printf '%s\n' "$$first_line"; })"; \
+		clang_major="$${clang_version#* version }"; \
+		clang_major="$${clang_major%%.*}"; \
+		case "$$clang_major" in ''|*[!0-9]*) clang_major=0 ;; esac; \
+		if [ "$$clang_major" -lt 19 ]; then \
+			printf 'clang-cl 19 or newer is required for the Windows STL used by cargo-xwin; found: %s\n' "$$clang_version" >&2; \
+			exit 1; \
+		fi
 	@command -v llvm-rc >/dev/null || { printf '%s\n' 'Missing llvm-rc. Install LLVM tools before running make pc.' >&2; exit 1; }
 	@command -v llvm-mt >/dev/null || { printf '%s\n' 'Missing llvm-mt. Install LLVM tools before running make pc.' >&2; exit 1; }
 	@command -v llvm-lib >/dev/null || { printf '%s\n' 'Missing llvm-lib. Install LLVM tools before running make pc.' >&2; exit 1; }
