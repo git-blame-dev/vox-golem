@@ -130,16 +130,14 @@ jobs:
           fi
 
           changed_files="$(git diff --name-only "${previous_tag}..${TARGET_SHA}")"
-          has_release_relevant_change=false
+          has_release_artifact_input_change=false
 
           while IFS= read -r path; do
             [ -n "$path" ] || continue
 
             case "$path" in
-              .github/*|.gitignore|README.md|docs/*)
-                ;;
-              *)
-                has_release_relevant_change=true
+              Makefile|apps/*|crates/*|frontend/*|Cargo.toml|Cargo.lock|bun.lock|package.json|tsconfig.base.json|config.example.toml)
+                has_release_artifact_input_change=true
                 ;;
             esac
           done <<EOF
@@ -149,9 +147,9 @@ jobs:
           printf 'Changed files since %s:\n%s\n' "$previous_tag" "$changed_files"
           {
             printf 'previous_tag=%s\n' "$previous_tag"
-            printf 'should_publish=%s\n' "$has_release_relevant_change"
-            if [ "$has_release_relevant_change" != true ]; then
-              printf 'skip_reason=%s\n' 'only workflow or docs files changed'
+            printf 'should_publish=%s\n' "$has_release_artifact_input_change"
+            if [ "$has_release_artifact_input_change" != true ]; then
+              printf 'skip_reason=%s\n' 'no release artifact inputs changed'
             fi
           } >> "$GITHUB_OUTPUT"
 

@@ -1,6 +1,7 @@
 target/
 apps/windows-tauri/src-tauri/gen/
 .deps/
+package/
 
 node_modules/
 dist/
