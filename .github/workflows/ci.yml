@@ -112,7 +112,7 @@ jobs:
           curl --retry 5 --retry-delay 2 --retry-all-errors -fsSL https://apt.llvm.org/llvm.sh -o llvm.sh
           chmod +x llvm.sh
           sudo ./llvm.sh "${LLVM_MAJOR_VERSION}"
-          sudo apt-get install -y --no-install-recommends cmake ninja-build unzip clang-${LLVM_MAJOR_VERSION} lld-${LLVM_MAJOR_VERSION} llvm-${LLVM_MAJOR_VERSION} llvm-${LLVM_MAJOR_VERSION}-tools
+          sudo apt-get install -y --no-install-recommends cmake ninja-build unzip "clang-${LLVM_MAJOR_VERSION}" "lld-${LLVM_MAJOR_VERSION}" "llvm-${LLVM_MAJOR_VERSION}" "llvm-${LLVM_MAJOR_VERSION}-tools"
           printf '/usr/lib/llvm-%s/bin\n' "${LLVM_MAJOR_VERSION}" >> "$GITHUB_PATH"
 
       - name: Cache Bun packages
