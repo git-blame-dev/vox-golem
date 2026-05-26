@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "identifier": "dev.gitblame.voxgolem",
   "build": {
-    "beforeDevCommand": "bun run --cwd ../../../frontend/app dev",
-    "beforeBuildCommand": "bun run --cwd ../../../frontend/app build",
+    "beforeDevCommand": "bun run --cwd frontend/app dev",
+    "beforeBuildCommand": "bun run --cwd frontend/app build",
     "devUrl": "http://localhost:5173",
     "frontendDist": "../../../frontend/app/dist"
   },

@@ -29,14 +29,14 @@ The app is built around local components and explicit runtime configuration. Bac
 - **Rust core:** Rust workspace for Tauri commands, audio/model/platform crates, and local process orchestration.
 - **Voice pipeline:** wake-word detection, voice activity detection, local Parakeet transcription, and app-managed capture state.
 - **Local integrations:** `opencode` command execution and `llama.cpp` server profiles.
-- **CI / release:** GitHub Actions for frontend checks, Windows Rust checks, Windows build artifacts, and release publishing.
+- **CI / release:** Linux-hosted GitHub Actions for checks, Windows cross-build artifacts, and release publishing.
 
 ## 🧠 Engineering Highlights
 
 - Uses a typed runtime state machine so listening, processing, executing, error, and recovery states are explicit in the UI flow.
 - Keeps local asset paths and backend selection in `%APPDATA%\VoxGolem\config.toml` instead of hard-coding user machine paths.
 - Parses structured `opencode` JSON events into labeled assistant/system output for reviewer-friendly command traces.
-- Separates frontend parsing/state tests from Rust runtime tests and Windows packaging checks in CI.
+- Separates frontend parsing/state tests from Rust runtime checks and Linux-hosted Windows artifact packaging in CI.
 - Packages Windows release artifacts with a config template and verifies expected runtime DLLs before publishing.
 
 ## 🏗️ Architecture
@@ -68,7 +68,7 @@ Key directories:
 - `crates/model/` - local model and transcription-related runtime code.
 - `crates/core/` - prompt execution, backend routing, and shared runtime behavior.
 - `crates/platform/` - platform-specific runtime integration.
-- `scripts/` - Windows verification, packaging, and release support scripts.
+- `Makefile` - canonical local and CI command surface for checks, Windows cross-builds, and release staging.
 
 ## 🚀 Getting Started
 
@@ -77,6 +77,7 @@ Key directories:
 - Windows runtime environment.
 - Bun for frontend development scripts.
 - Rust stable toolchain for workspace checks and Tauri builds.
+- Linux build tools for Windows cross-builds: `cargo-xwin`, Tauri CLI, CMake, Ninja, LLVM tools, `lld`, `curl`, and `unzip`.
 - Local model/runtime assets referenced by `%APPDATA%\VoxGolem\config.toml`.
 
 ### Configure local assets
@@ -98,35 +99,40 @@ Key directories:
 ### Install and verify
 
 ```bash
-bun install
-bun run typecheck
-bun run lint
-bun run test
-bun run build
+make test
 ```
 
 Run the frontend development shell when you need live UI iteration:
 
 ```bash
-bun run dev
+make app-dev
 ```
 
-Windows runtime validation and packaging are handled through the repository's Windows workflow scripts and GitHub Actions.
+Build the portable Windows app from Linux:
+
+```bash
+make pc
+```
+
+Stage the user-testable release files locally:
+
+```bash
+make dist
+```
+
+Staged files are written to `dist/VoxGolem/`, matching the GitHub Actions artifact layout.
 
 ## ✅ Testing
 
 Local checks cover frontend type safety, linting, UI state, startup parsing, runtime control, prompt execution parsing, voice-flow behavior, and production frontend build output.
 
 ```bash
-bun run typecheck
-bun run lint
-bun run test
-bun run build
+make test
 ```
 
-CI also runs Windows Rust formatting, Clippy, tests, and a Windows Tauri build through `scripts\windows-verify.cmd`.
+CI runs `make test` on Linux and builds the Windows artifact with `make pc-dist` on Linux.
 
-CI proves formatting, linting, tests, and Windows build/package creation; final microphone, audio-device, and GPU/runtime behavior still requires manual validation on a Windows machine.
+CI proves formatting, linting, tests, and Linux-hosted Windows build/package creation; final microphone, audio-device, WebView, GPU/runtime, and model behavior still requires manual validation on a Windows machine.
 
 ## 📦 Releases / Artifacts
 
@@ -134,9 +140,17 @@ CI proves formatting, linting, tests, and Windows build/package creation; final 
 
 The packaged artifact includes the Windows executable, `config.toml` template, CUDA/cuDNN runtime DLLs, and required runtime DLLs verified by the workflow.
 
+Local staging uses the same layout:
+
+```text
+dist/VoxGolem/config.toml
+dist/VoxGolem/vox-golem.exe
+dist/VoxGolem/*.dll
+```
+
 ## ⚠️ Limitations
 
-- Windows-only runtime target; Linux is used for some development workflows but is not the supported app runtime.
+- Windows-only runtime target; Linux is used to build and package the Windows artifact but is not the supported app runtime.
 - Requires local model/runtime assets that are not bundled in the source tree.
 - Voice quality, latency, and backend behavior depend on the user's configured models and machine.
 - Windows runtime readiness should be validated from the generated Windows artifact, not inferred from frontend-only checks.
