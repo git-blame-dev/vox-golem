@@ -39,8 +39,28 @@ jobs:
         id: version
         shell: bash
         run: |
+          git fetch --tags --force
+
           date_part="$(date -u +'%Y.%m.%d')"
-          version="v${date_part}.${GITHUB_RUN_NUMBER}"
+          next_daily_number=1
+
+          while IFS= read -r tag; do
+            suffix="${tag##*.}"
+            case "$suffix" in
+              ''|*[!0-9]*)
+                continue
+                ;;
+            esac
+
+            suffix_number=$((10#$suffix))
+            if [ "$suffix_number" -ge "$next_daily_number" ]; then
+              next_daily_number=$((suffix_number + 1))
+            fi
+          done <<EOF
+          $(git tag --list "v${date_part}.*")
+          EOF
+
+          version="v${date_part}.${next_daily_number}"
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
       - name: Determine release scope
