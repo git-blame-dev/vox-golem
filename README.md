@@ -77,7 +77,7 @@ Key directories:
 - Windows runtime environment.
 - Bun for frontend development scripts.
 - Rust stable toolchain for workspace checks and Tauri builds.
-- Linux build tools for Windows cross-builds: `cargo-xwin`, Tauri CLI, CMake, Ninja, LLVM tools, `lld`, `curl`, and `unzip`.
+- Linux build tools for Windows cross-builds: `cargo-xwin`, Tauri CLI, CMake, Ninja, LLVM/Clang 19+ tools, `lld`, `curl`, and `unzip`.
 - Local model/runtime assets referenced by `%APPDATA%\VoxGolem\config.toml`.
 
 ### Configure local assets
