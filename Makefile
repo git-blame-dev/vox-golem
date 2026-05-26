@@ -11,6 +11,7 @@ CROSS_SHIM_DIR := $(CURDIR)/target/cross-shims
 ESPEAK_COMPAT_HEADER := $(CROSS_SHIM_DIR)/espeak_windows_compat.h
 STDCXX_IMPORT_LIB := $(IMPORT_LIB_DIR)/stdc++.lib
 DIRECTML_IMPORT_LIB := $(IMPORT_LIB_DIR)/DirectML.lib
+PATHCCH_IMPORT_LIB := $(IMPORT_LIB_DIR)/PathCch.lib
 CUDA_RUNTIME_FLAVOR ?= onnxruntime-1.24.2-cu12-cudnn9
 CUDA_RUNTIME_DIR := $(CURDIR)/.deps/cuda-runtime/$(CUDA_RUNTIME_FLAVOR)/bin
 
@@ -96,7 +97,7 @@ check-pc-tools:
 	@command -v llvm-dlltool >/dev/null || { printf '%s\n' 'Missing llvm-dlltool. Install LLVM tools before running make pc.' >&2; exit 1; }
 	@command -v lld-link >/dev/null || { printf '%s\n' 'Missing lld-link. Install lld before running make pc.' >&2; exit 1; }
 
-pc: check-pc-tools $(ESPEAK_COMPAT_HEADER) $(STDCXX_IMPORT_LIB) $(DIRECTML_IMPORT_LIB)
+pc: check-pc-tools $(ESPEAK_COMPAT_HEADER) $(STDCXX_IMPORT_LIB) $(DIRECTML_IMPORT_LIB) $(PATHCCH_IMPORT_LIB)
 	bun install --frozen-lockfile
 	CMAKE_GENERATOR=Ninja \
 	TARGET_CFLAGS="$${TARGET_CFLAGS:+$${TARGET_CFLAGS} }/FI$(ESPEAK_COMPAT_HEADER)" \
@@ -162,6 +163,35 @@ $(DIRECTML_IMPORT_LIB):
 		'DMLCreateDevice' \
 		'DMLCreateDevice1' > '$(IMPORT_LIB_DIR)/DirectML.def'
 	llvm-dlltool -m i386:x86-64 -d '$(IMPORT_LIB_DIR)/DirectML.def' -l '$@'
+
+$(PATHCCH_IMPORT_LIB):
+	@mkdir -p '$(IMPORT_LIB_DIR)'
+	@printf '%s\n' \
+		'LIBRARY PathCch.dll' \
+		'EXPORTS' \
+		'PathAllocCanonicalize' \
+		'PathAllocCombine' \
+		'PathCchAddBackslash' \
+		'PathCchAddBackslashEx' \
+		'PathCchAddExtension' \
+		'PathCchAppend' \
+		'PathCchAppendEx' \
+		'PathCchCanonicalize' \
+		'PathCchCanonicalizeEx' \
+		'PathCchCombine' \
+		'PathCchCombineEx' \
+		'PathCchFindExtension' \
+		'PathCchIsRoot' \
+		'PathCchRemoveBackslash' \
+		'PathCchRemoveBackslashEx' \
+		'PathCchRemoveExtension' \
+		'PathCchRemoveFileSpec' \
+		'PathCchRenameExtension' \
+		'PathCchSkipRoot' \
+		'PathCchStripPrefix' \
+		'PathCchStripToRoot' \
+		'PathIsUNCEx' > '$(IMPORT_LIB_DIR)/PathCch.def'
+	llvm-dlltool -m i386:x86-64 -d '$(IMPORT_LIB_DIR)/PathCch.def' -l '$@'
 
 $(CUDA_RUNTIME_DIR)/.complete:
 	@command -v curl >/dev/null || { printf '%s\n' 'Missing curl. Install curl before staging runtime DLLs.' >&2; exit 1; }
