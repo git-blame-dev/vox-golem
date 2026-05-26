@@ -17,11 +17,6 @@ env:
   ACTIONLINT_VERSION: 1.7.12
   BUN_VERSION: 1.3.9
   CARGO_TERM_COLOR: always
-  CUDA_REDIST_VERSION: 12.9.1
-  CUDA_RUNTIME_FLAVOR: onnxruntime-1.24.2-cu12-cudnn9
-  CUDNN_REDIST_VERSION: 9.10.0
-  LLVM_VERSION: 22.1.0
-  SCCACHE_VERSION: 0.10.0
   TAURI_CLI_VERSION: 2.11.1
 
 jobs:
@@ -44,14 +39,22 @@ jobs:
       - name: Run actionlint
         run: ./actionlint
 
-  frontend-checks:
-    name: Frontend checks
+  linux-checks:
+    name: Linux checks
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
+    needs:
+      - workflow-lint
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Set up Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - name: Use stable Rust
+        run: rustup default stable
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
@@ -66,343 +69,90 @@ jobs:
           restore-keys: |
             bun-${{ runner.os }}-
 
-      - name: Install frontend dependencies
-        run: bun install --frozen-lockfile
-
-      - name: Typecheck frontend
-        run: bun run typecheck
-
-      - name: Lint frontend
-        run: bun run lint
-
-      - name: Test frontend
-        run: bun run test
-
-      - name: Build frontend
-        run: bun run build
-
-  windows-rust-checks:
-    name: Windows Rust checks
-    runs-on: windows-2025
-    timeout-minutes: 60
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-
-      - name: Set up Rust
-        shell: pwsh
-        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
-
-      - name: Use stable Rust
-        shell: pwsh
-        run: rustup default stable
-
-      - name: Cache Cargo registry and build output
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
-        with:
-          path: |
-            ~/.cargo/git
-            ~/.cargo/registry
-            target
-          key: cargo-windows-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-windows-${{ runner.os }}-
-
-      - name: Ensure LLVM/libclang
-        shell: pwsh
-        run: |
-          $llvmBin = "C:\Program Files\LLVM\bin"
-          if (-not (Test-Path "$llvmBin\libclang.dll")) {
-            choco install llvm --version "$env:LLVM_VERSION" -y --no-progress
-          }
-          $llvmBin | Out-File -FilePath $env:GITHUB_PATH -Append
-          "LIBCLANG_PATH=$llvmBin" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Check Windows prerequisites
-        shell: cmd
-        run: |
-          where cmake
-          where libclang.dll
-
-      - name: Check Rust formatting
-        shell: cmd
-        run: scripts\windows-verify.cmd fmt
-
-      - name: Lint Rust workspace
-        shell: cmd
-        run: scripts\windows-verify.cmd clippy
-
-      - name: Test Rust workspace
-        shell: cmd
-        run: scripts\windows-verify.cmd test
-
-  windows-build:
-    name: Windows build
-    runs-on: windows-2025
-    timeout-minutes: 60
-    needs:
-      - frontend-checks
-      - windows-rust-checks
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-
-      - name: Set up Rust
-        shell: pwsh
-        run: rustup toolchain install stable --profile minimal
-
-      - name: Use stable Rust
-        shell: pwsh
-        run: rustup default stable
-
-      - name: Set up Bun
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
-        with:
-          bun-version: ${{ env.BUN_VERSION }}
-
-      - name: Report Windows toolchain versions
-        shell: pwsh
-        run: |
-          rustc --version
-          cargo --version
-          bun --version
-
       - name: Cache Cargo registry
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
         with:
           path: |
             ~/.cargo/git
             ~/.cargo/registry
-          key: cargo-windows-tauri-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-linux-checks-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-windows-tauri-${{ runner.os }}-
-            cargo-windows-${{ runner.os }}-
+            cargo-linux-checks-${{ runner.os }}-
+
+      - name: Run deterministic checks
+        run: make test
+
+  windows-artifact:
+    name: Windows artifact from Linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    needs:
+      - linux-checks
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add x86_64-pc-windows-msvc
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake curl ninja-build llvm lld unzip
 
       - name: Cache Bun packages
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
         with:
           path: ~/.bun/install/cache
-          key: bun-windows-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
           restore-keys: |
-            bun-windows-${{ runner.os }}-
+            bun-${{ runner.os }}-
 
-      - name: Cache Tauri CLI
-        id: cache-tauri-cli
+      - name: Cache Cargo registry and cross caches
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
         with:
-          path: ~/.cargo/bin/cargo-tauri.exe
-          key: tauri-cli-${{ runner.os }}-${{ env.TAURI_CLI_VERSION }}
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            ~/.cache/cargo-xwin
+            ~/.cache/ort.pyke.io
+          key: cargo-linux-windows-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-linux-windows-${{ runner.os }}-
+            cargo-linux-checks-${{ runner.os }}-
+
+      - name: Cache Cargo tools
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: |
+            ~/.cargo/bin/cargo-xwin
+            ~/.cargo/bin/cargo-tauri
+          key: cargo-tools-${{ runner.os }}-tauri-${{ env.TAURI_CLI_VERSION }}
+
+      - name: Install Cargo build tools
+        run: |
+          command -v cargo-xwin >/dev/null || cargo install cargo-xwin --locked
+          command -v cargo-tauri >/dev/null || cargo install tauri-cli --version "${TAURI_CLI_VERSION}" --locked
 
       - name: Cache CUDA runtime dependencies
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
         with:
-          path: .deps/cuda-runtime/${{ env.CUDA_RUNTIME_FLAVOR }}
-          key: cuda-runtime-v2-${{ runner.os }}-${{ env.CUDA_RUNTIME_FLAVOR }}-cuda-${{ env.CUDA_REDIST_VERSION }}-cudnn-${{ env.CUDNN_REDIST_VERSION }}
-
-      - name: Ensure LLVM/libclang
-        shell: pwsh
-        run: |
-          $llvmBin = "C:\Program Files\LLVM\bin"
-          if (-not (Test-Path "$llvmBin\libclang.dll")) {
-            choco install llvm --version "$env:LLVM_VERSION" -y --no-progress
-          }
-          $llvmBin | Out-File -FilePath $env:GITHUB_PATH -Append
-          "LIBCLANG_PATH=$llvmBin" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Install Tauri CLI
-        if: steps.cache-tauri-cli.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: cargo install tauri-cli --version "$env:TAURI_CLI_VERSION" --locked
-
-      - name: Verify Tauri CLI
-        shell: pwsh
-        run: cargo tauri --version
-
-      - name: Prepare CUDA runtime dependencies
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $runtimeDir = Join-Path $env:GITHUB_WORKSPACE ".deps\cuda-runtime\$env:CUDA_RUNTIME_FLAVOR\bin"
-          New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
-
-          $requiredFiles = @(
-            "cublas64_12.dll",
-            "cublasLt64_12.dll",
-            "cudart64_12.dll",
-            "cudnn64_9.dll",
-            "cudnn_adv64_9.dll",
-            "cudnn_cnn64_9.dll",
-            "cudnn_engines_precompiled64_9.dll",
-            "cudnn_engines_runtime_compiled64_9.dll",
-            "cudnn_graph64_9.dll",
-            "cudnn_heuristic64_9.dll",
-            "cudnn_ops64_9.dll",
-            "cufft64_11.dll"
-          )
-          $missingCachedFiles = @($requiredFiles | Where-Object { -not (Test-Path (Join-Path $runtimeDir $_)) })
-          if ($missingCachedFiles.Count -eq 0) {
-            "VOXGOLEM_CUDA_RUNTIME_DIR=$runtimeDir" | Out-File -FilePath $env:GITHUB_ENV -Append
-            Get-ChildItem -File $runtimeDir | Sort-Object Name | Select-Object Name, Length
-            exit 0
-          }
-
-          if (Test-Path $runtimeDir) {
-            Remove-Item -Path (Join-Path $runtimeDir "*") -Recurse -Force
-          }
-
-          function Save-RedistPackage($package) {
-            $packageUri = [Uri]::new($package.Url)
-            $archiveName = Split-Path $packageUri.LocalPath -Leaf
-            $archivePath = Join-Path $env:RUNNER_TEMP $archiveName
-            $extractName = $archiveName -replace '\.zip$', ''
-            $extractRoot = Join-Path $env:RUNNER_TEMP $extractName
-
-            Invoke-WebRequest -Uri $packageUri.AbsoluteUri -OutFile $archivePath
-            $actualHash = (Get-FileHash -Algorithm SHA256 -Path $archivePath).Hash.ToLowerInvariant()
-            if ($actualHash -ne $package.Sha256.ToLowerInvariant()) {
-              throw "SHA256 mismatch for $archiveName. Expected $($package.Sha256), got $actualHash."
-            }
-
-            if (Test-Path $extractRoot) {
-              Remove-Item -Recurse -Force $extractRoot
-            }
-            Expand-Archive -Path $archivePath -DestinationPath $extractRoot -Force
-
-            foreach ($pattern in $package.DllPatterns) {
-              $matches = Get-ChildItem -Path $extractRoot -Recurse -File -Filter $pattern
-              if (-not $matches) {
-                throw "No DLLs matched $pattern in $archiveName."
-              }
-              foreach ($match in $matches) {
-                Copy-Item -Path $match.FullName -Destination (Join-Path $runtimeDir $match.Name) -Force
-              }
-            }
-          }
-
-          $packages = @(
-            @{
-              Url = "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.9.79-archive.zip"
-              Sha256 = "179e9c43b0735ffe67207b3da556eb5a0c50f3047961882b7657d3b822d34ef8"
-              DllPatterns = @("cudart64_12.dll")
-            },
-            @{
-              Url = "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-12.9.1.4-archive.zip"
-              Sha256 = "d534d98b0b453a98914dbf3adf47d7e84b55037abf02f87466439e1dcef581ed"
-              DllPatterns = @("cublas64_12.dll", "cublasLt64_12.dll")
-            },
-            @{
-              Url = "https://developer.download.nvidia.com/compute/cuda/redist/libcufft/windows-x86_64/libcufft-windows-x86_64-11.4.1.4-archive.zip"
-              Sha256 = "f26f80bb9abff3269c548e1559e8c2b4ba58ccb8acc6095bbc6404fc962d4b80"
-              DllPatterns = @("cufft64_11.dll")
-            },
-            @{
-              Url = "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.10.0.56_cuda12-archive.zip"
-              Sha256 = "214f21e4a6fdc7121b2463f55937ebf097ab7c96232c3d575b39b9b030503fca"
-              DllPatterns = @("cudnn*.dll")
-            }
-          )
-
-          foreach ($package in $packages) {
-            Save-RedistPackage -package $package
-          }
-
-          $missingFiles = @($requiredFiles | Where-Object { -not (Test-Path (Join-Path $runtimeDir $_)) })
-          if ($missingFiles.Count -gt 0) {
-            throw "CUDA runtime directory is missing required files: $($missingFiles -join ', ')"
-          }
-
-          "VOXGOLEM_CUDA_RUNTIME_DIR=$runtimeDir" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Get-ChildItem -File $runtimeDir | Sort-Object Name | Select-Object Name, Length
-
-      - name: Cache sccache binary
-        id: cache-sccache-bin
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
-        with:
-          path: ${{ github.workspace }}\.tools\sccache\bin\sccache.exe
-          key: sccache-bin-${{ runner.os }}-${{ env.SCCACHE_VERSION }}
-
-      - name: Install sccache
-        if: steps.cache-sccache-bin.outputs.cache-hit != 'true'
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          $installRoot = Join-Path $env:GITHUB_WORKSPACE ".tools\sccache"
-          cargo install sccache --version "$env:SCCACHE_VERSION" --locked --root "$installRoot"
-
-      - name: Cache sccache artifacts
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
-        with:
-          path: ${{ github.workspace }}\.sccache
-          key: sccache-windows-tauri-v2-${{ runner.os }}-stable-${{ env.SCCACHE_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          path: .deps/cuda-runtime
+          key: cuda-runtime-${{ runner.os }}-${{ hashFiles('Makefile') }}
           restore-keys: |
-            sccache-windows-tauri-v2-${{ runner.os }}-stable-${{ env.SCCACHE_VERSION }}-
+            cuda-runtime-${{ runner.os }}-
 
-      - name: Configure sccache
-        shell: pwsh
-        run: |
-          $sccacheExe = Join-Path $env:GITHUB_WORKSPACE ".tools\sccache\bin\sccache.exe"
-          if (-not (Test-Path $sccacheExe)) {
-            Write-Warning "sccache is unavailable; continuing without RUSTC_WRAPPER."
-            exit 0
-          }
-          $sccacheDir = Join-Path $env:GITHUB_WORKSPACE ".sccache"
-          New-Item -ItemType Directory -Force $sccacheDir | Out-Null
-          $env:RUSTC_WRAPPER = $sccacheExe
-          $env:SCCACHE_DIR = $sccacheDir
-          $env:SCCACHE_CACHE_SIZE = "2G"
-          "RUSTC_WRAPPER=$env:RUSTC_WRAPPER" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "SCCACHE_DIR=$env:SCCACHE_DIR" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "SCCACHE_CACHE_SIZE=$env:SCCACHE_CACHE_SIZE" | Out-File -FilePath $env:GITHUB_ENV -Append
-          & $sccacheExe --version
-          & $sccacheExe --zero-stats
-
-      - name: Build Windows Tauri app without bundling
-        shell: cmd
-        run: scripts\windows-verify.cmd build
-
-      - name: Package Windows release files
-        shell: pwsh
-        run: |
-          $packageScript = Join-Path $env:GITHUB_WORKSPACE "scripts\windows-package-runtime.ps1"
-          if (-not (Test-Path $packageScript)) {
-            throw "Missing packaging helper: $packageScript"
-          }
-
-          & $packageScript -Mode PackageDist
-
-          $distDir = Join-Path $env:GITHUB_WORKSPACE "dist\VoxGolem"
-          $requiredFiles = @(
-            "config.toml",
-            "vox-golem.exe",
-            "onnxruntime_providers_cuda.dll",
-            "onnxruntime_providers_shared.dll",
-            "cublas64_12.dll",
-            "cublasLt64_12.dll",
-            "cudart64_12.dll",
-            "cudnn64_9.dll",
-            "cudnn_adv64_9.dll",
-            "cudnn_cnn64_9.dll",
-            "cudnn_engines_precompiled64_9.dll",
-            "cudnn_engines_runtime_compiled64_9.dll",
-            "cudnn_graph64_9.dll",
-            "cudnn_heuristic64_9.dll",
-            "cudnn_ops64_9.dll",
-            "cufft64_11.dll"
-          )
-          $missingFiles = @($requiredFiles | Where-Object { -not (Test-Path (Join-Path $distDir $_)) })
-          if ($missingFiles.Count -gt 0) {
-            throw "Packaged Windows release is missing required files: $($missingFiles -join ', ')"
-          }
-
-          Get-ChildItem -Recurse -File $distDir |
-            Sort-Object FullName |
-            ForEach-Object {
-              $relativePath = Resolve-Path -Path $_.FullName -Relative
-              "$relativePath`t$($_.Length)"
-            }
+      - name: Build and stage Windows release files
+        run: make pc-dist
 
       - name: Upload Windows release files
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -412,12 +162,3 @@ jobs:
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
-
-      - name: Report sccache stats
-        if: always()
-        shell: pwsh
-        run: |
-          $sccacheExe = Join-Path $env:GITHUB_WORKSPACE ".tools\sccache\bin\sccache.exe"
-          if (Test-Path $sccacheExe) {
-            & $sccacheExe --show-stats
-          }

@@ -313,9 +313,9 @@ jobs:
             printf -- "- Checksums: \`SHA256SUMS\`\n"
 
             printf '\n## Verification\n\n'
-            printf -- "- CI \`frontend-checks\`\n"
-            printf -- "- CI \`windows-rust-checks\`\n"
-            printf -- "- CI \`windows-build\`\n"
+            printf -- "- CI \`workflow-lint\`\n"
+            printf -- "- CI \`linux-checks\`\n"
+            printf -- "- CI \`windows-artifact\`\n"
 
             printf '\n## Full changelog\n\n'
 
