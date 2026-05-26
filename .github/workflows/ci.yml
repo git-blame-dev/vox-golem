@@ -2,9 +2,18 @@ name: CI
 
 on:
   pull_request:
+    paths-ignore:
+      - .gitignore
+      - README.md
+      - docs/**
   push:
     branches:
       - main
+    paths-ignore:
+      - .gitignore
+      - README.md
+      - docs/**
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -17,6 +26,7 @@ env:
   ACTIONLINT_VERSION: 1.7.12
   BUN_VERSION: 1.3.9
   CARGO_TERM_COLOR: always
+  CARGO_XWIN_VERSION: 0.22.0
   LLVM_MAJOR_VERSION: 20
   TAURI_CLI_VERSION: 2.11.1
 
@@ -57,6 +67,13 @@ jobs:
       - name: Use stable Rust
         run: rustup default stable
 
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: vox-golem-linux-checks-${{ runner.os }}
+          workspaces: |
+            . -> target
+
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
@@ -70,16 +87,6 @@ jobs:
           restore-keys: |
             bun-${{ runner.os }}-
 
-      - name: Cache Cargo registry
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
-        with:
-          path: |
-            ~/.cargo/git
-            ~/.cargo/registry
-          key: cargo-linux-checks-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-linux-checks-${{ runner.os }}-
-
       - name: Run deterministic checks
         run: make test
 
@@ -87,6 +94,7 @@ jobs:
     name: Windows artifact from Linux
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     needs:
       - linux-checks
 
@@ -99,6 +107,13 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup target add x86_64-pc-windows-msvc
+
+      - name: Cache Rust cross-build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: vox-golem-windows-${{ runner.os }}-${{ env.CARGO_XWIN_VERSION }}
+          workspaces: |
+            . -> target
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
@@ -123,18 +138,15 @@ jobs:
           restore-keys: |
             bun-${{ runner.os }}-
 
-      - name: Cache Cargo registry and cross caches
+      - name: Cache cross-build dependency caches
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
         with:
           path: |
-            ~/.cargo/git
-            ~/.cargo/registry
             ~/.cache/cargo-xwin
             ~/.cache/ort.pyke.io
-          key: cargo-linux-windows-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          key: cross-deps-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Makefile') }}
           restore-keys: |
-            cargo-linux-windows-${{ runner.os }}-
-            cargo-linux-checks-${{ runner.os }}-
+            cross-deps-${{ runner.os }}-
 
       - name: Cache Cargo tools
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
@@ -142,12 +154,14 @@ jobs:
           path: |
             ~/.cargo/bin/cargo-xwin
             ~/.cargo/bin/cargo-tauri
-          key: cargo-tools-${{ runner.os }}-tauri-${{ env.TAURI_CLI_VERSION }}
+          key: cargo-tools-${{ runner.os }}-tauri-${{ env.TAURI_CLI_VERSION }}-xwin-${{ env.CARGO_XWIN_VERSION }}
 
       - name: Install Cargo build tools
         run: |
-          command -v cargo-xwin >/dev/null || cargo install cargo-xwin --locked
+          command -v cargo-xwin >/dev/null || cargo install cargo-xwin --version "${CARGO_XWIN_VERSION}" --locked
           command -v cargo-tauri >/dev/null || cargo install tauri-cli --version "${TAURI_CLI_VERSION}" --locked
+          cargo-xwin --version
+          cargo-tauri --version
 
       - name: Cache CUDA runtime dependencies
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae

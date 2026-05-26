@@ -140,7 +140,7 @@ app-dev:
 	bun run dev
 
 clean:
-	rm -rf '$(CURDIR)/dist' '$(CURDIR)/target' '$(CURDIR)/frontend/app/dist'
+	rm -rf '$(CURDIR)/dist' '$(CURDIR)/package' '$(CURDIR)/target' '$(CURDIR)/frontend/app/dist'
 
 $(ESPEAK_COMPAT_HEADER):
 	@mkdir -p '$(CROSS_SHIM_DIR)'
