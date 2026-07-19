@@ -5,152 +5,133 @@ import type {
   PromptExecutionResult,
 } from '../types/chat'
 
-export function parsePromptExecutionResult(payload: unknown): PromptExecutionResult {
-  if (!isRecord(payload)) {
-    throw new Error('Prompt execution payload must be an object')
-  }
-
-  const events = payload['events']
-  const stderr = payload['stderr']
-  const exitCode = payload['exit_code']
-  const runtimePhase = payload['runtime_phase']
-
-  if (!Array.isArray(events)) {
-    throw new Error('Prompt execution payload must include events')
-  }
-
-  if (typeof stderr !== 'string') {
-    throw new Error('Prompt execution payload must include stderr')
-  }
-
-  if (typeof exitCode !== 'number' && exitCode !== null) {
-    throw new Error('Prompt execution payload must include a numeric or null exit code')
-  }
-
-  return {
-    events: events.map(parsePromptExecutionEvent),
-    stderr,
-    exitCode,
-    runtimePhase: parseRuntimePhase(runtimePhase),
-  }
-}
-
-export async function executePrompt(prompt: string): Promise<PromptExecutionResult> {
-  if (typeof window === 'undefined') {
-    return createFallbackResult(prompt)
-  }
-
-  const tauriInternals = getTauriInternals()
-
-  if (tauriInternals === null) {
-    return createFallbackResult(prompt)
-  }
-
-  const payload = await tauriInternals.invoke('submit_prompt', { prompt })
-  return parsePromptExecutionResult(payload)
-}
-
-function createFallbackResult(prompt: string): PromptExecutionResult {
-  return {
-    events: [
-      {
-        kind: 'text',
-        text: `Browser preview only — no backend response was generated. Prompt: ${prompt}`,
-      },
-    ],
-    stderr: '',
-    exitCode: 0,
-    runtimePhase: 'sleeping',
-  }
-}
-
-function parsePromptExecutionEvent(payload: unknown): PromptExecutionEvent {
+export function parsePromptExecutionEvent(payload: unknown): PromptExecutionEvent {
   if (!isRecord(payload)) {
     throw new Error('Prompt execution event must be an object')
   }
 
-  if (payload['kind'] === 'text') {
+  const requestId = payload['request_id']
+  const kind = payload['kind']
+  if (typeof requestId !== 'string' || typeof kind !== 'string') {
+    throw new Error('Prompt execution event must include request_id and kind')
+  }
+
+  if (kind === 'text' || kind === 'reasoning') {
     const text = payload['text']
-
     if (typeof text !== 'string') {
-      throw new Error('Text event must include text')
+      throw new Error(`${kind} event must include text`)
     }
-
-    return {
-      kind: 'text',
-      text,
-    }
+    return { requestId, kind, text }
   }
 
-  if (payload['kind'] === 'reasoning') {
-    const text = payload['text']
-
-    if (typeof text !== 'string') {
-      throw new Error('Reasoning event must include text')
-    }
-
-    return {
-      kind: 'reasoning',
-      text,
-    }
-  }
-
-  if (payload['kind'] === 'step_start') {
-    return {
-      kind: 'step_start',
-    }
-  }
-
-  if (payload['kind'] === 'step_finish') {
-    const reason = payload['reason']
-
-    if (typeof reason !== 'string' && reason !== null) {
-      throw new Error('Step-finish event must include a string or null reason')
-    }
-
-    return {
-      kind: 'step_finish',
-      reason,
-    }
-  }
-
-  if (payload['kind'] === 'error') {
-    const name = payload['name']
+  if (kind === 'status') {
     const message = payload['message']
-
-    if (typeof name !== 'string' || typeof message !== 'string') {
-      throw new Error('Error event must include name and message')
+    if (typeof message !== 'string') {
+      throw new Error('Status event must include message')
     }
-
-    return {
-      kind: 'error',
-      name,
-      message,
-    }
+    return { requestId, kind, message }
   }
 
-  if (payload['kind'] === 'tool_use') {
+  if (kind === 'tool') {
     const tool = payload['tool']
     const status = payload['status']
     const detail = payload['detail']
-
-    if (
-      typeof tool !== 'string' ||
-      (status !== 'completed' && status !== 'error') ||
-      typeof detail !== 'string'
-    ) {
-      throw new Error('Tool-use event must include tool, status, and detail')
+    if (typeof tool !== 'string' || !isToolStatus(status) || typeof detail !== 'string') {
+      throw new Error('Tool event must include tool, status, and detail')
     }
+    return { requestId, kind, tool, status, detail }
+  }
 
+  if (kind === 'error') {
+    const message = payload['message']
+    if (typeof message !== 'string') {
+      throw new Error('Error event must include message')
+    }
+    return { requestId, kind, message }
+  }
+
+  if (kind === 'completed' || kind === 'cancelled') {
     return {
-      kind: 'tool_use',
-      tool,
-      status,
-      detail,
+      requestId,
+      kind,
+      runtimePhase: parseRuntimePhase(payload['runtime_phase']),
     }
   }
 
   throw new Error('Prompt execution event contains an unsupported kind')
+}
+
+export function parsePromptExecutionResult(payload: unknown): PromptExecutionResult {
+  if (!isRecord(payload)) {
+    throw new Error('Prompt execution result must be an object')
+  }
+  const requestId = payload['request_id']
+  const outcome = payload['outcome']
+  const errorMessage = payload['error_message']
+  if (
+    typeof requestId !== 'string' ||
+    (outcome !== 'completed' && outcome !== 'cancelled' && outcome !== 'error') ||
+    (errorMessage !== undefined && errorMessage !== null && typeof errorMessage !== 'string')
+  ) {
+    throw new Error('Prompt execution result must include request_id and outcome')
+  }
+  return {
+    requestId,
+    runtimePhase: parseRuntimePhase(payload['runtime_phase']),
+    outcome,
+    errorMessage: typeof errorMessage === 'string' ? errorMessage : null,
+  }
+}
+
+export async function executePrompt(
+  requestId: string,
+  prompt: string,
+  onEvent: (event: PromptExecutionEvent) => void,
+): Promise<PromptExecutionResult> {
+  const tauri = typeof window === 'undefined' ? null : getTauriInternals()
+  if (tauri === null) {
+    onEvent({
+      requestId,
+      kind: 'text',
+      text: `Browser preview only — no backend response was generated. Prompt: ${prompt}`,
+    })
+    return {
+      requestId,
+      runtimePhase: 'sleeping',
+      outcome: 'completed',
+      errorMessage: null,
+    }
+  }
+
+  if (tauri.listen === undefined) {
+    throw new Error('Prompt execution requires streaming listener support')
+  }
+
+  const unlisten = await tauri.listen('prompt-execution-event', (event) => {
+    try {
+      const parsed = parsePromptExecutionEvent(event.payload)
+      if (parsed.requestId === requestId) {
+        onEvent(parsed)
+      }
+    } catch {
+      // Ignore malformed external events; the correlated command result remains authoritative.
+    }
+  })
+
+  try {
+    const payload = await tauri.invoke('submit_prompt', { requestId, prompt })
+    const result = parsePromptExecutionResult(payload)
+    if (result.requestId !== requestId) {
+      throw new Error('Prompt response request ID did not match the active request')
+    }
+    return result
+  } finally {
+    unlisten()
+  }
+}
+
+function isToolStatus(value: unknown): value is 'pending' | 'running' | 'completed' | 'error' {
+  return value === 'pending' || value === 'running' || value === 'completed' || value === 'error'
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -168,6 +149,5 @@ function parseRuntimePhase(payload: unknown): BackendRuntimePhase {
   ) {
     return payload
   }
-
-  throw new Error('Prompt execution payload must include a supported runtime phase')
+  throw new Error('Prompt payload must include a supported runtime phase')
 }

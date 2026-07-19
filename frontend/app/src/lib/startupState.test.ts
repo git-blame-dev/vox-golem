@@ -33,6 +33,7 @@ describe('parseStartupState', () => {
       silenceTimeoutMs: 1500,
       selectedResponseProfile: 'fast',
       supportedResponseProfiles: ['fast', 'quality'],
+      promptCancellationAvailable: false,
       ttsEnabled: false,
       ttsOutputGainDb: 3,
     })
@@ -78,6 +79,7 @@ describe('parseStartupState', () => {
       silenceTimeoutMs: 1500,
       selectedResponseProfile: 'fast',
       supportedResponseProfiles: ['fast', 'quality'],
+      promptCancellationAvailable: false,
       ttsEnabled: false,
       ttsOutputGainDb: 6,
     })
@@ -112,6 +114,7 @@ describe('parseStartupState', () => {
       message: 'Loading local Gemma model...',
       selectedResponseProfile: 'quality',
       supportedResponseProfiles: ['fast', 'quality'],
+      promptCancellationAvailable: false,
       ttsEnabled: false,
       ttsOutputGainDb: 3,
     })
@@ -260,6 +263,7 @@ describe('isStartupStateSettled', () => {
         message: 'Loading local Gemma model...',
         selectedResponseProfile: 'quality',
         supportedResponseProfiles: ['fast', 'quality'],
+        promptCancellationAvailable: false,
         ttsEnabled: false,
         ttsOutputGainDb: 3,
       }),
@@ -277,6 +281,7 @@ describe('isStartupStateSettled', () => {
         silenceTimeoutMs: 1500,
         selectedResponseProfile: 'quality',
         supportedResponseProfiles: ['fast', 'quality'],
+        promptCancellationAvailable: false,
         ttsEnabled: false,
         ttsOutputGainDb: 3,
       }),
@@ -301,6 +306,7 @@ describe('loadStartupState', () => {
       silenceTimeoutMs: 1500,
       selectedResponseProfile: 'fast',
       supportedResponseProfiles: ['fast'],
+      promptCancellationAvailable: false,
       ttsEnabled: false,
       ttsOutputGainDb: 3,
     })
@@ -335,6 +341,7 @@ describe('loadStartupState', () => {
       silenceTimeoutMs: 2300,
       selectedResponseProfile: 'fast',
       supportedResponseProfiles: ['fast', 'quality'],
+      promptCancellationAvailable: false,
       ttsEnabled: false,
       ttsOutputGainDb: 3,
     })

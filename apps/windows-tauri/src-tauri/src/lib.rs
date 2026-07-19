@@ -2,14 +2,16 @@
 #![deny(unused_must_use)]
 
 use base64::Engine;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
-use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::Manager;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tauri::{Emitter, Manager};
 
 mod livekit_wakeword;
 mod transcription;
@@ -30,6 +32,8 @@ const RESPONSE_PROFILE_STATE_FILE: &str = "state.toml";
 const RUNTIME_LOG_DIR: &str = "logs";
 const RUNTIME_LOG_FILE: &str = "runtime.log";
 const RUNTIME_LOG_MESSAGE_MAX_CHARS: usize = 16_384;
+const OPENCODE_PROMPT_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(300);
+const OPENCODE_PROMPT_CANCELLATION_TIMEOUT: Duration = Duration::from_secs(5);
 const LLAMA_CPP_ROLLOVER_REASON: &str =
     "Context budget reached; started a new local Gemma conversation for this reply.";
 const CUE_AUDIO_DATA_URL_PREFIX: &str = "data:audio/wav;base64,";
@@ -64,6 +68,19 @@ struct AppState {
     llama_cpp_runtime: Arc<Mutex<Option<voxgolem_platform::llama_cpp::LlamaCppRuntime>>>,
     llama_cpp_conversation: Mutex<Vec<LlamaConversationTurn>>,
     llama_cpp_system_prompt: Option<String>,
+    opencode_server: Arc<Mutex<Option<voxgolem_platform::opencode::OpencodeServer>>>,
+    active_prompt: Arc<Mutex<Option<ActivePrompt>>>,
+    active_prompt_generation: AtomicU64,
+}
+
+#[derive(Clone)]
+struct ActivePrompt {
+    request_id: String,
+    generation: u64,
+    cancelled: Arc<AtomicBool>,
+    cancellation_signal: Arc<tokio::sync::Notify>,
+    completion_signal: Arc<tokio::sync::Notify>,
+    client: voxgolem_platform::opencode::OpencodeClient,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -99,19 +116,30 @@ enum PromptExecutionEventPayload {
     Reasoning {
         text: String,
     },
-    StepStart,
-    StepFinish {
-        reason: Option<String>,
-    },
-    Error {
-        name: String,
+    Status {
         message: String,
     },
-    ToolUse {
+    Tool {
         tool: String,
         status: String,
         detail: String,
     },
+    Error {
+        message: String,
+    },
+    Completed {
+        runtime_phase: RuntimePhasePayload,
+    },
+    Cancelled {
+        runtime_phase: RuntimePhasePayload,
+    },
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PromptEventEnvelope {
+    request_id: String,
+    #[serde(flatten)]
+    event: PromptExecutionEventPayload,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -273,6 +301,7 @@ enum StartupStatePayload {
         message: String,
         selected_response_profile: ResponseProfilePayload,
         supported_response_profiles: Vec<ResponseProfilePayload>,
+        prompt_cancellation_available: bool,
         tts_enabled: bool,
         tts_output_gain_db: f32,
     },
@@ -284,6 +313,7 @@ enum StartupStatePayload {
         silence_timeout_ms: u64,
         selected_response_profile: ResponseProfilePayload,
         supported_response_profiles: Vec<ResponseProfilePayload>,
+        prompt_cancellation_available: bool,
         tts_enabled: bool,
         tts_output_gain_db: f32,
     },
@@ -537,6 +567,7 @@ fn switch_response_profile(
             message: String::from("Loading local Gemma model..."),
             selected_response_profile: profile,
             supported_response_profiles: startup_snapshot.supported_response_profiles.clone(),
+            prompt_cancellation_available: false,
             tts_enabled: startup_snapshot.tts_enabled,
             tts_output_gain_db: startup_snapshot.tts_output_gain_db,
         };
@@ -626,8 +657,7 @@ fn switch_response_profile(
     Ok(response)
 }
 
-#[tauri::command]
-fn submit_prompt(
+fn submit_prompt_sync(
     prompt: String,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<PromptExecutionPayload, String> {
@@ -688,6 +718,398 @@ fn submit_prompt(
         exit_code: outcome.exit_code,
         runtime_phase,
     })
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PromptFinalPayload {
+    request_id: String,
+    runtime_phase: RuntimePhasePayload,
+    outcome: String,
+    error_message: Option<String>,
+}
+
+enum OpencodePromptResult {
+    Completed,
+    Cancelled,
+    Failed(String),
+}
+
+struct OpencodeStreamContext<'a> {
+    app: &'a tauri::AppHandle,
+    active_prompt: &'a Mutex<Option<ActivePrompt>>,
+    request_id: &'a str,
+    generation: u64,
+    client: &'a voxgolem_platform::opencode::OpencodeClient,
+    cancelled: &'a AtomicBool,
+    cancellation_signal: &'a tokio::sync::Notify,
+}
+
+#[tauri::command]
+async fn submit_prompt(
+    request_id: String,
+    prompt: String,
+    app: tauri::AppHandle,
+    app_state: tauri::State<'_, AppState>,
+) -> Result<PromptFinalPayload, String> {
+    ensure_startup_ready_for_prompt(&app_state.startup_state)?;
+    if request_id.trim().is_empty() {
+        return Err(String::from("request ID must not be empty"));
+    }
+    let prompt = validate_prompt_text(prompt)?;
+    let is_opencode = matches!(
+        app_state
+            .runtime_config
+            .as_ref()
+            .map(|config| &config.response_backend),
+        Some(voxgolem_core::config::ResponseBackendConfig::Opencode { .. })
+    );
+    let registered_prompt = {
+        let server = app_state
+            .opencode_server
+            .lock()
+            .map_err(|_| String::from("opencode server lock is poisoned"))?;
+        server
+            .as_ref()
+            .map(|server| {
+                let client = server.client();
+                register_active_prompt(
+                    &app_state.active_prompt,
+                    &app_state.active_prompt_generation,
+                    &request_id,
+                    client.clone(),
+                )
+                .map(|registration| (client, registration))
+            })
+            .transpose()?
+    };
+    let Some((client, (generation, cancelled, cancellation_signal))) = registered_prompt else {
+        if is_opencode {
+            return Err(String::from("OpenCode server is not available"));
+        }
+        let result = match submit_prompt_sync(prompt, app_state.clone()) {
+            Ok(result) => result,
+            Err(error) => {
+                emit_prompt_event(
+                    &app,
+                    &request_id,
+                    PromptExecutionEventPayload::Error {
+                        message: error.clone(),
+                    },
+                )?;
+                return Err(error);
+            }
+        };
+        let phase = result.runtime_phase.clone();
+        for event in result.events {
+            emit_prompt_event(&app, &request_id, event)?;
+        }
+        emit_prompt_event(
+            &app,
+            &request_id,
+            PromptExecutionEventPayload::Completed {
+                runtime_phase: phase.clone(),
+            },
+        )?;
+        return Ok(PromptFinalPayload {
+            request_id,
+            runtime_phase: phase,
+            outcome: "completed".into(),
+            error_message: None,
+        });
+    };
+    if let Err(error) = apply_voice_pipeline_transition(
+        &app_state.voice_pipeline_state,
+        app_state.voice_pipeline_config,
+        voxgolem_core::voice_pipeline::VoicePipelineEvent::SubmitPrompt,
+    ) {
+        clear_active_prompt(&app_state.active_prompt, &request_id, generation)?;
+        return Err(error);
+    }
+
+    let result = stream_opencode_prompt(
+        OpencodeStreamContext {
+            app: &app,
+            active_prompt: &app_state.active_prompt,
+            request_id: &request_id,
+            generation,
+            client: &client,
+            cancelled: &cancelled,
+            cancellation_signal: &cancellation_signal,
+        },
+        &prompt,
+    )
+    .await;
+    let still_owned = clear_active_prompt(&app_state.active_prompt, &request_id, generation)?;
+    if !still_owned {
+        let phase = current_runtime_phase(&app_state.voice_pipeline_state)?;
+        emit_prompt_event(
+            &app,
+            &request_id,
+            PromptExecutionEventPayload::Cancelled {
+                runtime_phase: phase.clone(),
+            },
+        )?;
+        return Ok(PromptFinalPayload {
+            request_id,
+            runtime_phase: phase,
+            outcome: String::from("cancelled"),
+            error_message: None,
+        });
+    }
+
+    let (outcome, event, error_message) = match result {
+        OpencodePromptResult::Completed => {
+            apply_voice_pipeline_transition(
+                &app_state.voice_pipeline_state,
+                app_state.voice_pipeline_config,
+                voxgolem_core::voice_pipeline::VoicePipelineEvent::PromptCompleted,
+            )?;
+            let phase = current_runtime_phase(&app_state.voice_pipeline_state)?;
+            (
+                "completed",
+                PromptExecutionEventPayload::Completed {
+                    runtime_phase: phase,
+                },
+                None,
+            )
+        }
+        OpencodePromptResult::Cancelled => {
+            ensure_cancelled_prompt_is_sleeping(&app_state)?;
+            let phase = current_runtime_phase(&app_state.voice_pipeline_state)?;
+            (
+                "cancelled",
+                PromptExecutionEventPayload::Cancelled {
+                    runtime_phase: phase,
+                },
+                None,
+            )
+        }
+        OpencodePromptResult::Failed(message) => {
+            apply_voice_pipeline_transition(
+                &app_state.voice_pipeline_state,
+                app_state.voice_pipeline_config,
+                voxgolem_core::voice_pipeline::VoicePipelineEvent::PromptFailed {
+                    message: message.clone(),
+                },
+            )?;
+            (
+                "error",
+                PromptExecutionEventPayload::Error {
+                    message: message.clone(),
+                },
+                Some(message),
+            )
+        }
+    };
+    let phase = current_runtime_phase(&app_state.voice_pipeline_state)?;
+    emit_prompt_event(&app, &request_id, event)?;
+    Ok(PromptFinalPayload {
+        request_id,
+        runtime_phase: phase,
+        outcome: outcome.to_string(),
+        error_message,
+    })
+}
+
+fn emit_prompt_event(
+    app: &tauri::AppHandle,
+    request_id: &str,
+    event: PromptExecutionEventPayload,
+) -> Result<(), String> {
+    app.emit(
+        "prompt-execution-event",
+        PromptEventEnvelope {
+            request_id: request_id.to_string(),
+            event,
+        },
+    )
+    .map_err(|error| format!("failed to emit prompt event: {error}"))
+}
+
+fn register_active_prompt(
+    active_prompt: &Mutex<Option<ActivePrompt>>,
+    generation_counter: &AtomicU64,
+    request_id: &str,
+    client: voxgolem_platform::opencode::OpencodeClient,
+) -> Result<(u64, Arc<AtomicBool>, Arc<tokio::sync::Notify>), String> {
+    let mut active = active_prompt
+        .lock()
+        .map_err(|_| String::from("active prompt lock is poisoned"))?;
+    if active.is_some() {
+        return Err(String::from("another prompt is already active"));
+    }
+    let generation = generation_counter
+        .fetch_add(1, Ordering::SeqCst)
+        .saturating_add(1);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancellation_signal = Arc::new(tokio::sync::Notify::new());
+    let completion_signal = Arc::new(tokio::sync::Notify::new());
+    *active = Some(ActivePrompt {
+        request_id: request_id.to_string(),
+        generation,
+        cancelled: Arc::clone(&cancelled),
+        cancellation_signal: Arc::clone(&cancellation_signal),
+        completion_signal,
+        client,
+    });
+    Ok((generation, cancelled, cancellation_signal))
+}
+
+fn clear_active_prompt(
+    active_prompt: &Mutex<Option<ActivePrompt>>,
+    request_id: &str,
+    generation: u64,
+) -> Result<bool, String> {
+    let mut active = active_prompt
+        .lock()
+        .map_err(|_| String::from("active prompt lock is poisoned"))?;
+    if active
+        .as_ref()
+        .is_some_and(|active| active.request_id == request_id && active.generation == generation)
+    {
+        let completed = active.take().expect("active prompt should exist");
+        completed.completion_signal.notify_one();
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn is_active_prompt(
+    active_prompt: &Mutex<Option<ActivePrompt>>,
+    request_id: &str,
+    generation: u64,
+) -> Result<bool, String> {
+    active_prompt
+        .lock()
+        .map_err(|_| String::from("active prompt lock is poisoned"))
+        .map(|active| {
+            active.as_ref().is_some_and(|active| {
+                active.request_id == request_id && active.generation == generation
+            })
+        })
+}
+
+async fn stream_opencode_prompt(
+    context: OpencodeStreamContext<'_>,
+    prompt: &str,
+) -> OpencodePromptResult {
+    let message_id = format!(
+        "msg_voxgolem_{}_{}",
+        context.generation,
+        current_time_ms().unwrap_or(0)
+    );
+    let prompt = match voxgolem_platform::opencode::OpencodePrompt::new(prompt.to_string()) {
+        Ok(prompt) => prompt.with_message_id(message_id.clone()),
+        Err(error) => return OpencodePromptResult::Failed(format!("invalid prompt: {error:?}")),
+    };
+    let events = match context.client.events_for_message(message_id).await {
+        Ok(events) => events,
+        Err(error) => return OpencodePromptResult::Failed(error.to_string()),
+    };
+    futures_util::pin_mut!(events);
+    if let Err(error) = context.client.prompt(&prompt).await {
+        return OpencodePromptResult::Failed(error.to_string());
+    }
+
+    loop {
+        let still_active = is_active_prompt(
+            context.active_prompt,
+            context.request_id,
+            context.generation,
+        )
+        .unwrap_or(false);
+        if context.cancelled.load(Ordering::SeqCst) || !still_active {
+            return OpencodePromptResult::Cancelled;
+        }
+        let event = tokio::select! {
+            _ = context.cancellation_signal.notified() => {
+                return OpencodePromptResult::Cancelled;
+            }
+            event = tokio::time::timeout(OPENCODE_PROMPT_INACTIVITY_TIMEOUT, events.next()) => {
+                match event {
+                    Ok(Some(event)) => event,
+                    Ok(None) => {
+                        return OpencodePromptResult::Failed(String::from(
+                            "OpenCode event stream closed before completion",
+                        ));
+                    }
+                    Err(_) => {
+                        let _ = context.client.abort().await;
+                        return OpencodePromptResult::Failed(String::from(
+                            "OpenCode prompt timed out waiting for activity",
+                        ));
+                    }
+                }
+            }
+        };
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => return OpencodePromptResult::Failed(error.to_string()),
+        };
+        let payload = match event {
+            voxgolem_platform::opencode::OpencodeEvent::Text(text) => {
+                PromptExecutionEventPayload::Text { text }
+            }
+            voxgolem_platform::opencode::OpencodeEvent::Reasoning(text) => {
+                PromptExecutionEventPayload::Reasoning { text }
+            }
+            voxgolem_platform::opencode::OpencodeEvent::Status(message) => {
+                PromptExecutionEventPayload::Status { message }
+            }
+            voxgolem_platform::opencode::OpencodeEvent::Tool {
+                name,
+                status,
+                detail,
+            } => PromptExecutionEventPayload::Tool {
+                tool: name,
+                status: format!("{status:?}").to_ascii_lowercase(),
+                detail,
+            },
+            voxgolem_platform::opencode::OpencodeEvent::Error(message) => {
+                return OpencodePromptResult::Failed(message);
+            }
+            voxgolem_platform::opencode::OpencodeEvent::Completed => {
+                return OpencodePromptResult::Completed;
+            }
+        };
+        if let Err(error) = emit_prompt_event(context.app, context.request_id, payload) {
+            return OpencodePromptResult::Failed(error);
+        }
+    }
+}
+
+fn ensure_cancelled_prompt_is_sleeping(app_state: &AppState) -> Result<(), String> {
+    if current_runtime_phase(&app_state.voice_pipeline_state)? != RuntimePhasePayload::Sleeping {
+        reset_voice_pipeline_to_waiting(
+            &app_state.voice_pipeline_state,
+            &app_state.wake_word_runtime,
+            &app_state.voice_activity_runtime,
+            app_state.voice_pipeline_config,
+        )?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn cancel_prompt(
+    request_id: String,
+    app_state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let active = app_state
+        .active_prompt
+        .lock()
+        .map_err(|_| String::from("active prompt lock is poisoned"))?
+        .clone();
+    let active = active
+        .filter(|active| active.request_id == request_id)
+        .ok_or_else(|| String::from("prompt request is no longer active"))?;
+    active.cancelled.store(true, Ordering::SeqCst);
+    active.cancellation_signal.notify_one();
+    active
+        .client
+        .abort()
+        .await
+        .map_err(|error| format!("failed to abort OpenCode prompt: {error}"))
 }
 
 #[tauri::command]
@@ -778,27 +1200,114 @@ fn mark_silence(
 }
 
 #[tauri::command]
-fn reset_session(
+async fn reset_session(
     app_state: tauri::State<'_, AppState>,
 ) -> Result<RuntimePhaseResponsePayload, String> {
-    let _operation_guard =
-        lock_response_backend_operation(&app_state.response_backend_operation_lock)?;
     ensure_startup_ready_for_prompt(&app_state.startup_state)?;
-    apply_voice_pipeline_transition_with_input_runtime_reset(
-        &app_state.voice_pipeline_state,
-        &app_state.wake_word_runtime,
-        &app_state.voice_activity_runtime,
-        app_state.voice_pipeline_config,
-        voxgolem_core::voice_pipeline::VoicePipelineEvent::ResetToIdle,
-    )?;
+    let is_opencode = matches!(
+        app_state
+            .runtime_config
+            .as_ref()
+            .map(|config| &config.response_backend),
+        Some(voxgolem_core::config::ResponseBackendConfig::Opencode { .. })
+    );
 
-    if let Ok(mut conversation) = app_state.llama_cpp_conversation.lock() {
-        conversation.clear();
+    if is_opencode {
+        reset_opencode_session(&app_state).await?;
+    } else {
+        reset_llama_session(&app_state)?;
     }
+
+    reset_runtime_session(&app_state)?;
 
     Ok(RuntimePhaseResponsePayload {
         ..current_runtime_phase_response(&app_state.voice_pipeline_state, None, None)?
     })
+}
+
+fn reset_runtime_session(app_state: &AppState) -> Result<(), String> {
+    if current_runtime_phase(&app_state.voice_pipeline_state)? == RuntimePhasePayload::Sleeping {
+        reset_wake_word_runtime(&app_state.wake_word_runtime)?;
+        reset_voice_activity_runtime(&app_state.voice_activity_runtime)?;
+        return Ok(());
+    }
+    reset_voice_pipeline_to_waiting(
+        &app_state.voice_pipeline_state,
+        &app_state.wake_word_runtime,
+        &app_state.voice_activity_runtime,
+        app_state.voice_pipeline_config,
+    )
+}
+
+fn reset_llama_session(app_state: &AppState) -> Result<(), String> {
+    let _operation_guard =
+        lock_response_backend_operation(&app_state.response_backend_operation_lock)?;
+    app_state
+        .llama_cpp_conversation
+        .lock()
+        .map_err(|_| String::from("local llama.cpp conversation lock is poisoned"))?
+        .clear();
+    Ok(())
+}
+
+async fn reset_opencode_session(app_state: &AppState) -> Result<(), String> {
+    let mut server = app_state
+        .opencode_server
+        .lock()
+        .map_err(|_| String::from("opencode server lock is poisoned"))?
+        .take()
+        .ok_or_else(|| String::from("OpenCode server is not available"))?;
+    let active = app_state
+        .active_prompt
+        .lock()
+        .map_err(|_| String::from("active prompt lock is poisoned"))?
+        .clone();
+    let cancellation_result = async {
+        let Some(active) = active else {
+            return Ok(());
+        };
+
+        cancel_and_wait_for_prompt(
+            &active.cancelled,
+            &active.cancellation_signal,
+            &active.completion_signal,
+        )
+        .await
+    }
+    .await;
+    let server_reset_result = server
+        .reset()
+        .await
+        .map_err(|error| format!("failed to reset OpenCode session: {error}"));
+    let reset_result = match (cancellation_result, server_reset_result) {
+        (Ok(()), result) => result,
+        (Err(cancellation_error), Ok(())) => Err(cancellation_error),
+        (Err(cancellation_error), Err(reset_error)) => {
+            Err(format!("{cancellation_error}; {reset_error}"))
+        }
+    };
+    app_state
+        .opencode_server
+        .lock()
+        .map_err(|_| String::from("opencode server lock is poisoned"))?
+        .replace(server);
+    reset_result
+}
+
+async fn cancel_and_wait_for_prompt(
+    cancelled: &AtomicBool,
+    cancellation_signal: &tokio::sync::Notify,
+    completion_signal: &tokio::sync::Notify,
+) -> Result<(), String> {
+    cancelled.store(true, Ordering::SeqCst);
+    cancellation_signal.notify_one();
+    tokio::time::timeout(
+        OPENCODE_PROMPT_CANCELLATION_TIMEOUT,
+        completion_signal.notified(),
+    )
+    .await
+    .map_err(|_| String::from("timed out waiting for the active prompt to stop"))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -903,6 +1412,7 @@ fn startup_ready_state_from_snapshot(
         silence_timeout_ms: startup_snapshot.silence_timeout_ms,
         selected_response_profile,
         supported_response_profiles: startup_snapshot.supported_response_profiles.clone(),
+        prompt_cancellation_available: false,
         tts_enabled: startup_snapshot.tts_enabled,
         tts_output_gain_db: startup_snapshot.tts_output_gain_db,
     }
@@ -1432,6 +1942,7 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
                         message: String::from("Loading local Gemma model..."),
                         selected_response_profile: selected_profile_at_startup,
                         supported_response_profiles: supported_response_profiles.clone(),
+                        prompt_cancellation_available: false,
                         tts_enabled,
                         tts_output_gain_db,
                     }
@@ -1445,6 +1956,7 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
                         silence_timeout_ms: config.silence_timeout_ms,
                         selected_response_profile: selected_profile_at_startup,
                         supported_response_profiles: supported_response_profiles.clone(),
+                        prompt_cancellation_available: true,
                         tts_enabled,
                         tts_output_gain_db,
                     }
@@ -1514,6 +2026,7 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
                                 silence_timeout_ms,
                                 selected_response_profile,
                                 supported_response_profiles,
+                                prompt_cancellation_available: false,
                                 tts_enabled,
                                 tts_output_gain_db,
                             }
@@ -1560,6 +2073,9 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
                 llama_cpp_runtime,
                 llama_cpp_conversation: Mutex::new(Vec::new()),
                 llama_cpp_system_prompt,
+                opencode_server: Arc::new(Mutex::new(None)),
+                active_prompt: Arc::new(Mutex::new(None)),
+                active_prompt_generation: AtomicU64::new(0),
             }
         }
         Err(error) => {
@@ -1662,6 +2178,9 @@ fn build_startup_error_app_state(
         llama_cpp_runtime: Arc::new(Mutex::new(None)),
         llama_cpp_conversation: Mutex::new(Vec::new()),
         llama_cpp_system_prompt: None,
+        opencode_server: Arc::new(Mutex::new(None)),
+        active_prompt: Arc::new(Mutex::new(None)),
+        active_prompt_generation: AtomicU64::new(0),
     }
 }
 
@@ -2050,23 +2569,6 @@ fn apply_voice_pipeline_event_or_panic(
         .0
 }
 
-fn prompt_result_error_message(
-    result: &voxgolem_platform::opencode::OpencodeJsonRunResult,
-) -> Option<String> {
-    if let Some(exit_code) = result.exit_code {
-        if exit_code != 0 {
-            return Some(format!("opencode exited with code {exit_code}"));
-        }
-    }
-
-    result.events.iter().find_map(|event| match event {
-        voxgolem_platform::opencode::OpencodeJsonEvent::Error { message, .. } => {
-            Some(message.clone())
-        }
-        _ => None,
-    })
-}
-
 fn validate_prompt_text(prompt: String) -> Result<String, String> {
     if prompt.trim().is_empty() {
         return Err(String::from("invalid prompt: prompt must not be empty"));
@@ -2083,27 +2585,9 @@ fn execute_prompt_backend(
     llama_cpp_system_prompt: Option<&str>,
 ) -> Result<PromptExecutionOutcome, String> {
     match &config.response_backend {
-        voxgolem_core::config::ResponseBackendConfig::Opencode { path } => {
-            let prompt = voxgolem_platform::opencode::OpencodePrompt::new(prompt.to_string())
-                .map_err(|error| format!("invalid prompt: {error:?}"))?;
-            let spec = voxgolem_platform::opencode::OpencodeCommandSpec::new(path.clone(), prompt)
-                .with_output_format(voxgolem_platform::opencode::OpencodeOutputFormat::Json);
-            let result = voxgolem_platform::opencode::run_opencode_json(&spec)
-                .map_err(|error| format!("failed to execute opencode: {error}"))?;
-            let error_message = prompt_result_error_message(&result);
-            let voxgolem_platform::opencode::OpencodeJsonRunResult {
-                events,
-                stderr,
-                exit_code,
-            } = result;
-
-            Ok(PromptExecutionOutcome {
-                events: map_opencode_events(events),
-                stderr,
-                exit_code,
-                error_message,
-            })
-        }
+        voxgolem_core::config::ResponseBackendConfig::Opencode { .. } => Err(String::from(
+            "OpenCode prompts require the persistent streaming runtime",
+        )),
         voxgolem_core::config::ResponseBackendConfig::LlamaCpp { .. } => {
             let system_prompt =
                 llama_cpp_system_prompt.ok_or_else(|| String::from("SOUL.md is not loaded"))?;
@@ -2267,47 +2751,6 @@ fn is_llama_context_overflow_error(error_message: &str) -> bool {
     has_status && mentions_context && mentions_overflow
 }
 
-fn map_opencode_events(
-    events: Vec<voxgolem_platform::opencode::OpencodeJsonEvent>,
-) -> Vec<PromptExecutionEventPayload> {
-    events
-        .into_iter()
-        .map(|event| match event {
-            voxgolem_platform::opencode::OpencodeJsonEvent::Text { text } => {
-                PromptExecutionEventPayload::Text { text }
-            }
-            voxgolem_platform::opencode::OpencodeJsonEvent::Reasoning { text } => {
-                PromptExecutionEventPayload::Reasoning { text }
-            }
-            voxgolem_platform::opencode::OpencodeJsonEvent::StepStart => {
-                PromptExecutionEventPayload::StepStart
-            }
-            voxgolem_platform::opencode::OpencodeJsonEvent::StepFinish { reason } => {
-                PromptExecutionEventPayload::StepFinish { reason }
-            }
-            voxgolem_platform::opencode::OpencodeJsonEvent::Error { name, message } => {
-                PromptExecutionEventPayload::Error { name, message }
-            }
-            voxgolem_platform::opencode::OpencodeJsonEvent::ToolUse {
-                tool,
-                status,
-                detail,
-            } => PromptExecutionEventPayload::ToolUse {
-                tool,
-                status: match status {
-                    voxgolem_platform::opencode::OpencodeToolUseStatus::Completed => {
-                        "completed".to_string()
-                    }
-                    voxgolem_platform::opencode::OpencodeToolUseStatus::Error => {
-                        "error".to_string()
-                    }
-                },
-                detail,
-            },
-        })
-        .collect()
-}
-
 fn transcription_ready_samples(
     action: &voxgolem_core::voice_pipeline::VoicePipelineAction,
 ) -> Option<usize> {
@@ -2443,6 +2886,30 @@ pub fn run() {
     let builder = tauri::Builder::default()
         .setup(|app| {
             let app_state = build_app_state(app.handle());
+            if let Some(config) = app_state.runtime_config.as_ref() {
+                if let voxgolem_core::config::ResponseBackendConfig::Opencode { path } =
+                    &config.response_backend
+                {
+                    match tauri::async_runtime::block_on(
+                        voxgolem_platform::opencode::OpencodeServer::start(
+                            voxgolem_platform::opencode::OpencodeServerConfig::new(path),
+                        ),
+                    ) {
+                        Ok(server) => {
+                            *app_state
+                                .opencode_server
+                                .lock()
+                                .expect("opencode server lock") = Some(server)
+                        }
+                        Err(error) => {
+                            *app_state.startup_state.lock().expect("startup state lock") =
+                                StartupStatePayload::Error {
+                                    message: format!("failed to start OpenCode server: {error}"),
+                                }
+                        }
+                    }
+                }
+            }
             app.manage(app_state);
             Ok(())
         })
@@ -2457,6 +2924,7 @@ pub fn run() {
             switch_response_profile,
             record_frontend_runtime_diagnostic,
             submit_prompt,
+            cancel_prompt,
             record_speech_activity,
             ingest_audio_frame,
             mark_silence,
@@ -2475,6 +2943,14 @@ pub fn run() {
         if matches!(event, tauri::RunEvent::Exit) {
             let app_state = app_handle.state::<AppState>();
             shutdown_llama_cpp_runtime_for_exit(&app_state);
+            let opencode_server = app_state
+                .opencode_server
+                .lock()
+                .expect("opencode server lock")
+                .take();
+            if let Some(server) = opencode_server {
+                let _ = tauri::async_runtime::block_on(server.shutdown());
+            }
         }
     });
 }
@@ -2490,14 +2966,14 @@ mod tests {
         load_persisted_tts_enabled, load_persisted_ui_text_size, load_persisted_ui_theme,
         model_path_for_profile, parse_persisted_state, persist_selected_response_profile,
         persist_tts_enabled, persist_ui_text_size, persist_ui_theme, process_wake_word_frame,
-        prompt_result_error_message, reset_voice_pipeline_to_waiting, reset_wake_word_runtime,
-        resolve_effective_tts_enabled, response_profile_state_path, runtime_log_path,
-        runtime_phase_response_from_state, shutdown_llama_cpp_runtime_for_exit,
-        supported_response_profiles, to_runtime_phase_payload, transcribe_finished_utterance,
-        transcription_ready_samples, wake_word_event_timestamp, LlamaConversationTurn,
-        PromptExecutionEventPayload, ResponseProfilePayload, RuntimePhasePayload,
-        RuntimePhaseResponsePayload, RuntimeTelemetryPayload, UiTextSizePayload, UiThemePayload,
-        DEFAULT_SILENCE_TIMEOUT_MS, LLAMA_CPP_ROLLOVER_REASON,
+        reset_voice_pipeline_to_waiting, reset_wake_word_runtime, resolve_effective_tts_enabled,
+        response_profile_state_path, runtime_log_path, runtime_phase_response_from_state,
+        shutdown_llama_cpp_runtime_for_exit, supported_response_profiles, to_runtime_phase_payload,
+        transcribe_finished_utterance, transcription_ready_samples, wake_word_event_timestamp,
+        LlamaConversationTurn, PromptEventEnvelope, PromptExecutionEventPayload,
+        ResponseProfilePayload, RuntimePhasePayload, RuntimePhaseResponsePayload,
+        RuntimeTelemetryPayload, UiTextSizePayload, UiThemePayload, DEFAULT_SILENCE_TIMEOUT_MS,
+        LLAMA_CPP_ROLLOVER_REASON,
     };
     use crate::wake_word::{WakeWordDetection, WakeWordRuntime};
     use std::io::{Read, Write};
@@ -2531,50 +3007,61 @@ mod tests {
     }
 
     #[test]
-    fn prompt_result_error_message_prefers_non_zero_exit_code() {
-        let result = voxgolem_platform::opencode::OpencodeJsonRunResult {
-            events: vec![voxgolem_platform::opencode::OpencodeJsonEvent::Error {
-                name: "APIError".to_string(),
-                message: "provider failed".to_string(),
-            }],
-            stderr: String::new(),
-            exit_code: Some(7),
-        };
+    fn prompt_event_envelope_serializes_flattened_stream_contract() {
+        let payload = serde_json::to_value(PromptEventEnvelope {
+            request_id: String::from("request-7"),
+            event: PromptExecutionEventPayload::Tool {
+                tool: String::from("bash"),
+                status: String::from("running"),
+                detail: String::from("Checking status"),
+            },
+        })
+        .expect("prompt event should serialize");
 
+        assert_eq!(payload["request_id"], "request-7");
+        assert_eq!(payload["kind"], "tool");
+        assert_eq!(payload["tool"], "bash");
+        assert_eq!(payload["status"], "running");
+        assert_eq!(payload["detail"], "Checking status");
+    }
+
+    #[test]
+    fn main_capability_grants_only_event_listener_permissions() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/main.json"))
+                .expect("main capability should contain valid JSON");
+
+        assert_eq!(capability["identifier"], "main");
+        assert_eq!(capability["windows"], serde_json::json!(["main"]));
         assert_eq!(
-            prompt_result_error_message(&result),
-            Some("opencode exited with code 7".to_string())
+            capability["permissions"],
+            serde_json::json!(["core:event:allow-listen", "core:event:allow-unlisten"])
         );
     }
 
     #[test]
-    fn prompt_result_error_message_uses_structured_error_when_exit_code_is_zero() {
-        let result = voxgolem_platform::opencode::OpencodeJsonRunResult {
-            events: vec![voxgolem_platform::opencode::OpencodeJsonEvent::Error {
-                name: "APIError".to_string(),
-                message: "provider failed".to_string(),
-            }],
-            stderr: String::new(),
-            exit_code: Some(0),
-        };
+    fn prompt_reset_waits_for_active_prompt_completion() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancellation_signal = Arc::new(tokio::sync::Notify::new());
+        let completion_signal = Arc::new(tokio::sync::Notify::new());
 
-        assert_eq!(
-            prompt_result_error_message(&result),
-            Some("provider failed".to_string())
-        );
-    }
+        tauri::async_runtime::block_on(async {
+            let observer = tauri::async_runtime::spawn({
+                let cancelled = Arc::clone(&cancelled);
+                let cancellation_signal = Arc::clone(&cancellation_signal);
+                let completion_signal = Arc::clone(&completion_signal);
+                async move {
+                    cancellation_signal.notified().await;
+                    assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+                    completion_signal.notify_one();
+                }
+            });
 
-    #[test]
-    fn prompt_result_error_message_returns_none_for_successful_run() {
-        let result = voxgolem_platform::opencode::OpencodeJsonRunResult {
-            events: vec![voxgolem_platform::opencode::OpencodeJsonEvent::Text {
-                text: "done".to_string(),
-            }],
-            stderr: String::new(),
-            exit_code: Some(0),
-        };
-
-        assert_eq!(prompt_result_error_message(&result), None);
+            super::cancel_and_wait_for_prompt(&cancelled, &cancellation_signal, &completion_signal)
+                .await
+                .expect("reset should observe prompt completion");
+            observer.await.expect("observer task should finish");
+        });
     }
 
     #[test]
@@ -3666,6 +4153,7 @@ mod tests {
                 ResponseProfilePayload::Fast,
                 ResponseProfilePayload::Quality,
             ],
+            prompt_cancellation_available: false,
             tts_enabled: false,
             tts_output_gain_db: 3.0,
         }));
@@ -3691,6 +4179,7 @@ mod tests {
                 ResponseProfilePayload::Fast,
                 ResponseProfilePayload::Quality,
             ],
+            prompt_cancellation_available: false,
             tts_enabled: false,
             tts_output_gain_db: 3.0,
         }));

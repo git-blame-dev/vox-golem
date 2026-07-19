@@ -3,10 +3,19 @@ import {
   invoke as tauriInvoke,
   isTauri,
 } from '@tauri-apps/api/core'
+import { listen as tauriListen } from '@tauri-apps/api/event'
+
+export interface TauriEvent {
+  readonly payload: unknown
+}
 
 export interface TauriInternals {
   readonly invoke: (command: string, args?: unknown) => Promise<unknown>
   readonly convertFileSrc?: (filePath: string, protocol?: string) => string
+  readonly listen?: (
+    event: string,
+    handler: (event: TauriEvent) => void,
+  ) => Promise<() => void>
 }
 
 declare global {
@@ -21,8 +30,18 @@ export function getTauriInternals(): TauriInternals | null {
   }
 
   const tauriInternals = window.__TAURI_INTERNALS__
+  const nativeTauriInternals = tauriInternals as
+    | (TauriInternals & { readonly transformCallback?: unknown })
+    | undefined
 
-  if (tauriInternals && typeof tauriInternals.invoke === 'function') {
+  if (typeof nativeTauriInternals?.transformCallback === 'function') {
+    return createTauriApi()
+  }
+
+  if (
+    tauriInternals &&
+    typeof tauriInternals.invoke === 'function'
+  ) {
     return tauriInternals
   }
 
@@ -30,9 +49,14 @@ export function getTauriInternals(): TauriInternals | null {
     return null
   }
 
+  return createTauriApi()
+}
+
+function createTauriApi(): TauriInternals {
   return {
     invoke: (command, args) => tauriInvoke(command, args as Parameters<typeof tauriInvoke>[1]),
     convertFileSrc: tauriConvertFileSrc,
+    listen: (event, handler) => tauriListen(event, handler),
   }
 }
 

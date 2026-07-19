@@ -691,6 +691,7 @@ describe('App', () => {
   })
 
   it('synthesizes assistant response when TTS is enabled', async () => {
+    let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
     const invoked: string[] = []
 
     let resumeCallCount = 0
@@ -737,6 +738,10 @@ describe('App', () => {
     })
 
     window.__TAURI_INTERNALS__ = {
+      listen: async (_event, handler) => {
+        promptEventHandler = handler
+        return () => undefined
+      },
       invoke: async (command, args) => {
         invoked.push(command)
 
@@ -762,23 +767,19 @@ describe('App', () => {
         }
 
         if (command === 'submit_prompt') {
-          expect(args).toEqual({ prompt: 'Hello voice' })
+          expect(args).toMatchObject({ requestId: expect.any(String), prompt: 'Hello voice' })
+          promptEventHandler?.({ payload: { request_id: (args as { requestId: string }).requestId, kind: 'text', text: 'Voice response' } })
           return {
-            events: [
-              {
-                kind: 'text',
-                text: 'Browser preview only — no backend response was generated. Prompt: Hello voice',
-              },
-            ],
-            stderr: '',
-            exit_code: 0,
+            request_id: (args as { requestId: string }).requestId,
+            outcome: 'completed',
+            error_message: null,
             runtime_phase: 'sleeping',
           }
         }
 
         if (command === 'synthesize_local_tts') {
           expect(args).toEqual({
-            text: 'Browser preview only — no backend response was generated. Prompt: Hello voice',
+            text: 'Voice response',
           })
           return {
             pcm_f32: [0.0, 0.1, -0.1],
@@ -812,6 +813,8 @@ describe('App', () => {
 
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 0))
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      await new Promise((resolve) => setTimeout(resolve, 10))
     })
 
     expect(invoked).toContain('synthesize_local_tts')
@@ -1107,7 +1110,12 @@ describe('App', () => {
   })
 
   it('renders only user and assistant prompt execution output when submit command succeeds', async () => {
+    let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
     window.__TAURI_INTERNALS__ = {
+      listen: async (_event, handler) => {
+        promptEventHandler = handler
+        return () => undefined
+      },
       invoke: async (command, args) => {
         if (command === 'get_startup_state') {
           return {
@@ -1126,18 +1134,15 @@ describe('App', () => {
         }
 
         expect(command).toBe('submit_prompt')
-        expect(args).toEqual({ prompt: 'Draft release notes' })
+          expect(args).toMatchObject({ requestId: expect.any(String), prompt: 'Draft release notes' })
+        promptEventHandler?.({
+          payload: { request_id: args && (args as { requestId: string }).requestId, kind: 'text', text: 'OpenCode response' },
+        })
 
         return {
-          events: [
-            { kind: 'step_start' },
-            { kind: 'reasoning', text: 'Need to inspect the repo state first' },
-            { kind: 'tool_use', tool: 'bash', status: 'completed', detail: 'Shows working tree status' },
-            { kind: 'text', text: 'OpenCode response' },
-            { kind: 'step_finish', reason: 'stop' },
-          ],
-          stderr: 'warning output',
-          exit_code: 0,
+          request_id: (args as { requestId: string }).requestId,
+          outcome: 'completed',
+          error_message: null,
           runtime_phase: 'sleeping',
         }
       },
@@ -1157,17 +1162,13 @@ describe('App', () => {
     })
 
     expect(container.textContent).toContain('Draft release notes')
-    expect(container.textContent).not.toContain('step_start:\nOpenCode backend started a run step.')
-    expect(container.textContent).not.toContain('reasoning:\nNeed to inspect the repo state first')
-    expect(container.textContent).not.toContain('tool_use:\nbash (completed)\nShows working tree status')
     expect(container.textContent).toContain('OpenCode response')
-    expect(container.textContent).not.toContain('step_finish:\nstop')
-    expect(container.textContent).not.toContain('stderr:\nwarning output')
   })
 
   it('does not render no-output execution fallback as an assistant message', async () => {
     window.__TAURI_INTERNALS__ = {
-      invoke: async (command) => {
+      listen: async () => () => undefined,
+      invoke: async (command, args) => {
         if (command === 'get_startup_state') {
           return {
             kind: 'ready',
@@ -1185,9 +1186,9 @@ describe('App', () => {
         }
 
         return {
-          events: [],
-          stderr: '',
-          exit_code: 0,
+          request_id: (args as { requestId: string }).requestId,
+          outcome: 'completed',
+          error_message: null,
           runtime_phase: 'sleeping',
         }
       },
@@ -1212,9 +1213,16 @@ describe('App', () => {
     expect(container.textContent).toContain('No response was returned. Try again.')
   })
 
-  it('moves runtime to error when opencode exits non-zero', async () => {
+  it('streams correlated deltas into one assistant bubble and ignores stale events', async () => {
+    let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
+    let finishPrompt: ((value: unknown) => void) | undefined
+    let activeRequestId = ''
     window.__TAURI_INTERNALS__ = {
-      invoke: async (command) => {
+      listen: async (_event, handler) => {
+        promptEventHandler = handler
+        return () => undefined
+      },
+      invoke: async (command, args) => {
         if (command === 'get_startup_state') {
           return {
             kind: 'ready',
@@ -1223,43 +1231,80 @@ describe('App', () => {
               stop_listening: 'resources/stop-listening.wav',
             },
             runtime_phase: 'sleeping',
-            voice_input_available: true,
+            voice_input_available: false,
             voice_input_error: null,
             silence_timeout_ms: 1500,
-            selected_response_profile: 'quality',
-            supported_response_profiles: ['fast', 'quality'],
+            selected_response_profile: 'fast',
+            supported_response_profiles: ['fast'],
+            prompt_cancellation_available: true,
           }
         }
-
-        return {
-          events: [],
-          stderr: 'bad prompt',
-          exit_code: 7,
-          runtime_phase: 'error',
+        if (command === 'submit_prompt') {
+          if (
+            typeof args === 'object' &&
+            args !== null &&
+            'requestId' in args &&
+            typeof args.requestId === 'string'
+          ) {
+            activeRequestId = args.requestId
+          }
+          return new Promise((resolve) => {
+            finishPrompt = resolve
+          })
         }
+        return null
       },
     }
 
     const { container } = await renderApp()
-    const composer = getComposer(container)
-    const sendButton = getSendButton(container)
-
     await act(async () => {
-      setTextAreaValue(composer, 'Bad prompt')
-    })
-
-    await act(async () => {
-      sendButton.click()
+      setTextAreaValue(getComposer(container), 'Stream this')
+      getSendButton(container).click()
       await Promise.resolve()
     })
+    const stopButton = Array.from(container.querySelectorAll('button')).find(
+      (button) => button.textContent === 'Stop',
+    )
+    expect(stopButton).toBeDefined()
 
-    expect(container.textContent).toContain('Bad prompt')
-    expect(container.textContent).not.toContain('stderr:\nbad prompt')
-    expect(container.textContent).not.toContain('exit_code:\n7')
+    await act(async () => {
+      promptEventHandler?.({
+        payload: { request_id: 'stale-request', kind: 'text', text: 'Wrong' },
+      })
+      const submitCall = promptEventHandler
+      expect(submitCall).toBeDefined()
+      expect(container.querySelectorAll('.message--assistant')).toHaveLength(0)
+    })
+
+    expect(activeRequestId).not.toBe('')
+    await act(async () => {
+      promptEventHandler?.({
+        payload: { request_id: activeRequestId, kind: 'text', text: 'Hello' },
+      })
+      promptEventHandler?.({
+        payload: { request_id: activeRequestId, kind: 'text', text: ' world' },
+      })
+    })
+
+    const assistantMessages = container.querySelectorAll('.message--assistant')
+    expect(assistantMessages).toHaveLength(1)
+    expect(assistantMessages[0]?.textContent).toContain('Hello world')
+    expect(container.textContent).not.toContain('Wrong')
+
+    await act(async () => {
+      finishPrompt?.({
+        request_id: activeRequestId,
+        runtime_phase: 'sleeping',
+        outcome: 'completed',
+      })
+      await Promise.resolve()
+    })
+    expect(container.textContent).not.toContain('Executing prompt')
   })
 
-  it('moves runtime to error when opencode emits a structured error event', async () => {
+  it('shows string errors rejected by the Tauri prompt command', async () => {
     window.__TAURI_INTERNALS__ = {
+      listen: async () => () => undefined,
       invoke: async (command) => {
         if (command === 'get_startup_state') {
           return {
@@ -1269,7 +1314,189 @@ describe('App', () => {
               stop_listening: 'resources/stop-listening.wav',
             },
             runtime_phase: 'sleeping',
-            voice_input_available: true,
+            voice_input_available: false,
+            voice_input_error: null,
+            silence_timeout_ms: 1500,
+            selected_response_profile: 'fast',
+            supported_response_profiles: ['fast'],
+            prompt_cancellation_available: true,
+          }
+        }
+        if (command === 'submit_prompt') {
+          throw 'OpenCode server is not available'
+        }
+        return null
+      },
+    }
+
+    const { container } = await renderApp()
+    await act(async () => {
+      setTextAreaValue(getComposer(container), 'Trigger failure')
+      getSendButton(container).click()
+      await Promise.resolve()
+    })
+
+    expect(container.textContent).toContain('Response failed')
+    expect(container.textContent).toContain('OpenCode server is not available')
+  })
+
+  it('shows authoritative OpenCode errors from the final prompt result', async () => {
+    window.__TAURI_INTERNALS__ = {
+      listen: async () => () => undefined,
+      invoke: async (command, args) => {
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: false,
+            voice_input_error: null,
+            silence_timeout_ms: 1500,
+            selected_response_profile: 'fast',
+            supported_response_profiles: ['fast'],
+            prompt_cancellation_available: true,
+          }
+        }
+        if (
+          command === 'submit_prompt' &&
+          typeof args === 'object' &&
+          args !== null &&
+          'requestId' in args &&
+          typeof args.requestId === 'string'
+        ) {
+          return {
+            request_id: args.requestId,
+            runtime_phase: 'error',
+            outcome: 'error',
+            error_message: 'OpenCode provider authentication failed',
+          }
+        }
+        return null
+      },
+    }
+
+    const { container } = await renderApp()
+    await act(async () => {
+      setTextAreaValue(getComposer(container), 'Trigger provider failure')
+      getSendButton(container).click()
+      await Promise.resolve()
+    })
+
+    expect(container.textContent).toContain('Response failed')
+    expect(container.textContent).toContain('OpenCode provider authentication failed')
+  })
+
+  it('cancels an active stream with Escape and leaves no empty assistant bubble', async () => {
+    let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
+    let finishPrompt: ((value: unknown) => void) | undefined
+    let activeRequestId = ''
+    let cancelledRequestId = ''
+    window.__TAURI_INTERNALS__ = {
+      listen: async (_event, handler) => {
+        promptEventHandler = handler
+        return () => undefined
+      },
+      invoke: async (command, args) => {
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: false,
+            voice_input_error: null,
+            silence_timeout_ms: 1500,
+            selected_response_profile: 'fast',
+            supported_response_profiles: ['fast'],
+            prompt_cancellation_available: true,
+          }
+        }
+        if (command === 'submit_prompt') {
+          if (
+            typeof args === 'object' &&
+            args !== null &&
+            'requestId' in args &&
+            typeof args.requestId === 'string'
+          ) {
+            activeRequestId = args.requestId
+          }
+          return new Promise((resolve) => {
+            finishPrompt = resolve
+          })
+        }
+        if (command === 'cancel_prompt') {
+          if (
+            typeof args === 'object' &&
+            args !== null &&
+            'requestId' in args &&
+            typeof args.requestId === 'string'
+          ) {
+            cancelledRequestId = args.requestId
+          }
+          return null
+        }
+        return null
+      },
+    }
+
+    const { container } = await renderApp()
+    await act(async () => {
+      setTextAreaValue(getComposer(container), 'Cancel this')
+      getSendButton(container).click()
+      await Promise.resolve()
+    })
+    expect(container.textContent).toContain('Stop')
+
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
+      await Promise.resolve()
+    })
+    expect(cancelledRequestId).toBe(activeRequestId)
+    expect(container.textContent).toContain('Stopping')
+
+    await act(async () => {
+      promptEventHandler?.({
+        payload: {
+          request_id: activeRequestId,
+          kind: 'cancelled',
+          runtime_phase: 'sleeping',
+        },
+      })
+      finishPrompt?.({
+        request_id: activeRequestId,
+        runtime_phase: 'sleeping',
+        outcome: 'cancelled',
+      })
+      await Promise.resolve()
+    })
+
+    expect(container.querySelectorAll('.message--assistant')).toHaveLength(0)
+    expect(container.textContent).toContain('Response cancelled')
+    expect(container.textContent).not.toContain('Stopping')
+  })
+
+  it('uses a correlated stream error when the final result has no message', async () => {
+    let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
+    window.__TAURI_INTERNALS__ = {
+      listen: async (_event, handler) => {
+        promptEventHandler = handler
+        return () => undefined
+      },
+      invoke: async (command, args) => {
+        if (command === 'get_startup_state') {
+          return {
+            kind: 'ready',
+            cue_asset_paths: {
+              start_listening: 'resources/start-listening.wav',
+              stop_listening: 'resources/stop-listening.wav',
+            },
+            runtime_phase: 'sleeping',
+            voice_input_available: false,
             voice_input_error: null,
             silence_timeout_ms: 1500,
             selected_response_profile: 'quality',
@@ -1277,17 +1504,20 @@ describe('App', () => {
           }
         }
 
+        expect(command).toBe('submit_prompt')
+        const requestId = (args as { requestId: string }).requestId
+        promptEventHandler?.({
+          payload: {
+            request_id: requestId,
+            kind: 'error',
+            message: 'Provider failed',
+          },
+        })
         return {
-          events: [
-            {
-              kind: 'error',
-              name: 'APIError',
-              message: 'Provider failed',
-            },
-          ],
-          stderr: '',
-          exit_code: 0,
+          request_id: requestId,
           runtime_phase: 'error',
+          outcome: 'error',
+          error_message: null,
         }
       },
     }
@@ -1306,7 +1536,8 @@ describe('App', () => {
     })
 
     expect(container.textContent).toContain('Bad prompt')
-    expect(container.textContent).not.toContain('opencode_error:\nAPIError: Provider failed')
+    expect(container.textContent).toContain('Response failed')
+    expect(container.textContent).toContain('Provider failed')
   })
 
   it('polls startup state while the local model is warming and becomes ready later', async () => {
@@ -1506,6 +1737,7 @@ describe('App', () => {
     await act(async () => {
       await onFrame?.([0.001, -0.001, 0.001, -0.001])
       await Promise.resolve()
+      await new Promise((resolve) => setTimeout(resolve, 0))
     })
 
     expect(playedSources).toEqual([
@@ -2252,6 +2484,7 @@ describe('App', () => {
 
   it('submits the transcribed voice prompt after silence and returns to wake-word waiting', async () => {
     const stop = vi.fn()
+    let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
     let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
     const invokedCommands: string[] = []
     let nowMs = 1_000
@@ -2274,6 +2507,10 @@ describe('App', () => {
     })
 
     window.__TAURI_INTERNALS__ = {
+      listen: async (_event, handler) => {
+        promptEventHandler = handler
+        return () => undefined
+      },
       invoke: async (command, args) => {
         invokedCommands.push(command)
 
@@ -2318,12 +2555,15 @@ describe('App', () => {
         }
 
         if (command === 'submit_prompt') {
-          expect(args).toEqual({ prompt: 'Open the pull request' })
+          expect(args).toMatchObject({ requestId: expect.any(String), prompt: 'Open the pull request' })
+          promptEventHandler?.({
+            payload: { request_id: (args as { requestId: string }).requestId, kind: 'text', text: 'Voice execution response' },
+          })
 
           return {
-            events: [{ kind: 'text', text: 'Voice execution response' }],
-            stderr: '',
-            exit_code: null,
+            request_id: (args as { requestId: string }).requestId,
+            outcome: 'completed',
+            error_message: null,
             runtime_phase: 'sleeping',
           }
         }
