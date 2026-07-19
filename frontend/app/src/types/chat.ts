@@ -50,23 +50,27 @@ export type BackendRuntimePhase =
   | 'error'
 
 export type PromptExecutionEvent =
-  | { readonly kind: 'text'; readonly text: string }
-  | { readonly kind: 'reasoning'; readonly text: string }
-  | { readonly kind: 'step_start' }
-  | { readonly kind: 'step_finish'; readonly reason: string | null }
-  | { readonly kind: 'error'; readonly name: string; readonly message: string }
+  | { readonly requestId: string; readonly kind: 'text' | 'reasoning'; readonly text: string }
+  | { readonly requestId: string; readonly kind: 'status'; readonly message: string }
   | {
-      readonly kind: 'tool_use'
+      readonly requestId: string
+      readonly kind: 'tool'
       readonly tool: string
-      readonly status: 'completed' | 'error'
+      readonly status: 'pending' | 'running' | 'completed' | 'error'
       readonly detail: string
+    }
+  | { readonly requestId: string; readonly kind: 'error'; readonly message: string }
+  | {
+      readonly requestId: string
+      readonly kind: 'completed' | 'cancelled'
+      readonly runtimePhase: BackendRuntimePhase
     }
 
 export interface PromptExecutionResult {
-  readonly events: readonly PromptExecutionEvent[]
-  readonly stderr: string
-  readonly exitCode: number | null
+  readonly requestId: string
   readonly runtimePhase: BackendRuntimePhase
+  readonly outcome: 'completed' | 'cancelled' | 'error'
+  readonly errorMessage: string | null
 }
 
 export type StartupState =
@@ -81,6 +85,7 @@ export type StartupState =
   readonly message: string
     readonly selectedResponseProfile: ResponseProfile
     readonly supportedResponseProfiles: readonly ResponseProfile[]
+    readonly promptCancellationAvailable: boolean
     readonly ttsEnabled: boolean
     readonly ttsOutputGainDb: number
   }
@@ -93,6 +98,7 @@ export type StartupState =
   readonly silenceTimeoutMs: number
     readonly selectedResponseProfile: ResponseProfile
     readonly supportedResponseProfiles: readonly ResponseProfile[]
+    readonly promptCancellationAvailable: boolean
     readonly ttsEnabled: boolean
     readonly ttsOutputGainDb: number
   }

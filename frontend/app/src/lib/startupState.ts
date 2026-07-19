@@ -55,6 +55,7 @@ export function parseStartupState(payload: unknown): StartupState {
       message,
       selectedResponseProfile: responseProfileState.selectedResponseProfile,
       supportedResponseProfiles: responseProfileState.supportedResponseProfiles,
+      promptCancellationAvailable: payload['prompt_cancellation_available'] === true,
       ttsEnabled,
       ttsOutputGainDb,
     }
@@ -86,6 +87,7 @@ export function parseStartupState(payload: unknown): StartupState {
       silenceTimeoutMs,
       selectedResponseProfile: responseProfileState.selectedResponseProfile,
       supportedResponseProfiles: responseProfileState.supportedResponseProfiles,
+      promptCancellationAvailable: payload['prompt_cancellation_available'] === true,
       ttsEnabled,
       ttsOutputGainDb,
     }
@@ -143,6 +145,7 @@ function buildDefaultStartupState(): StartupState {
     silenceTimeoutMs: DEFAULT_SILENCE_TIMEOUT_MS,
     selectedResponseProfile: DEFAULT_SELECTED_RESPONSE_PROFILE,
     supportedResponseProfiles: DEFAULT_SUPPORTED_RESPONSE_PROFILES,
+    promptCancellationAvailable: false,
     ttsEnabled: false,
     ttsOutputGainDb: DEFAULT_TTS_OUTPUT_GAIN_DB,
   }

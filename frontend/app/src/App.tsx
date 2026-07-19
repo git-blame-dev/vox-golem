@@ -26,13 +26,12 @@ import {
   syncVoiceActivityState,
   updateVoiceActivityState,
 } from './lib/voiceActivity'
-import { createExecutionMessages, getInitialMessages } from './state/appShell'
+import { getInitialMessages } from './state/appShell'
 import { cueForTransition, transitionRuntimeStatus } from './state/runtimeMachine'
 import { isTranscriptMessage } from './types/chat'
 import type {
   BackendRuntimePhase,
   ChatMessage,
-  PromptExecutionResult,
   RuntimeControlResult,
   ResponseProfile,
   RuntimeStatus,
@@ -89,6 +88,16 @@ function App() {
   const [messages, setMessages] = useState<readonly ChatMessage[]>(() =>
     getInitialMessages(),
   )
+  const [promptActivity, setPromptActivity] = useState<string | null>(null)
+  const [promptState, setPromptState] = useState<'idle' | 'executing' | 'stopping'>('idle')
+  const promptRef = useRef<{
+    id: string
+    assistantId: string
+    text: string
+    error: string | null
+    terminal: boolean
+    tts: boolean
+  } | null>(null)
   const visibleMessages = useMemo(
     () => messages.filter(isTranscriptMessage),
     [messages],
@@ -193,6 +202,29 @@ function App() {
       active = false
     }
   }, [])
+
+  useEffect(() => {
+    const onEscape = (event: globalThis.KeyboardEvent) => {
+      if (
+        event.key === 'Escape' &&
+        !settingsOpen &&
+        startupState.kind === 'ready' &&
+        startupState.promptCancellationAvailable
+      ) {
+        const active = promptRef.current
+        if (active !== null && !active.terminal && promptState !== 'stopping') {
+          setPromptState('stopping')
+          void invokeTauriCommand('cancel_prompt', { requestId: active.id }).catch(() => {
+            if (promptRef.current === active && !active.terminal) {
+              setPromptState('executing')
+            }
+          })
+        }
+      }
+    }
+    window.addEventListener('keydown', onEscape)
+    return () => window.removeEventListener('keydown', onEscape)
+  }, [promptState, settingsOpen, startupState])
 
   useEffect(() => {
     document.documentElement.dataset['uiTheme'] = uiTheme
@@ -722,6 +754,19 @@ function App() {
       return
     }
 
+    // eslint-disable-next-line react-hooks/purity
+    const requestId = `request-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    const assistantId = `assistant-${requestId}`
+    promptRef.current = {
+      id: requestId,
+      assistantId,
+      text: '',
+      error: null,
+      terminal: false,
+      tts: ttsEnabled,
+    }
+    setPromptState('executing')
+    setPromptActivity('Executing prompt…')
     setMessages((currentMessages) => [
       ...currentMessages,
       {
@@ -735,28 +780,100 @@ function App() {
       setComposerValue('')
     }
 
-    try {
-      const result = await executePrompt(trimmedPrompt)
-      const nextMessages = createExecutionMessages(result)
-
-      setMessages((currentMessages) => [...currentMessages, ...nextMessages])
-      applyRuntimeStatus(toRuntimeStatus(result.runtimePhase))
-
-      const assistantMessage = [...nextMessages].reverse().find((message) => message.role === 'assistant')
-      if (assistantMessage === undefined) {
-        addNotice(createPromptExecutionNotice(result))
+    const handleEvent = (event: import('./types/chat').PromptExecutionEvent): void => {
+      const active = promptRef.current
+      if (active === null || active.id !== event.requestId || active.terminal) {
+        return
       }
-
+      if (event.kind === 'text') {
+        active.text += event.text
+        setMessages((current) => {
+          const index = current.findIndex((message) => message.id === active.assistantId)
+          if (index < 0) {
+            return [...current, { id: active.assistantId, role: 'assistant', content: event.text }]
+          }
+          return current.map((message, messageIndex) =>
+            messageIndex === index
+              ? { ...message, content: message.content + event.text }
+              : message,
+          )
+        })
+      }
+      if (event.kind === 'reasoning') {
+        setPromptActivity(`Reasoning: ${event.text}`)
+      }
+      if (event.kind === 'status') {
+        setPromptActivity(event.message)
+      }
+      if (event.kind === 'tool') {
+        setPromptActivity(
+          `${event.tool}: ${event.status}${event.detail ? ` - ${event.detail}` : ''}`,
+        )
+      }
+      if (event.kind === 'error') {
+        active.error = event.message
+        setPromptActivity(event.message)
+      }
+    }
+    try {
+      const result = await executePrompt(requestId, trimmedPrompt, handleEvent)
+      const active = promptRef.current
       if (
-        ttsEnabled &&
-        assistantMessage !== undefined &&
-        assistantMessage.content.trim().length > 0
+        active === null ||
+        active.id !== requestId ||
+        result.requestId !== requestId ||
+        active.terminal
       ) {
-        void synthesizeAndPlayAssistantReply(assistantMessage.content)
+        return
+      }
+      active.terminal = true
+      promptRef.current = null
+      setPromptState('idle')
+      setPromptActivity(null)
+      applyRuntimeStatus(toRuntimeStatus(result.runtimePhase))
+      if (result.outcome !== 'completed') {
+        setMessages((current) =>
+          current.filter(
+            (message) => message.id !== assistantId || message.content.trim().length > 0,
+          ),
+        )
+        addNotice({
+          tone: result.outcome === 'error' ? 'error' : 'info',
+          title: result.outcome === 'error' ? 'Response failed' : 'Response cancelled',
+          message:
+            result.outcome === 'error'
+              ? result.errorMessage ?? active.error ?? 'The response could not be completed. Try again.'
+              : 'The response was cancelled.',
+        })
+      } else if (active.text.trim().length === 0) {
+        addNotice({
+          tone: 'info',
+          title: 'No response',
+          message: 'No response was returned. Try again.',
+        })
+      } else if (active.tts) {
+        void synthesizeAndPlayAssistantReply(active.text)
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Prompt execution failed'
+      const message =
+        error instanceof Error
+          ? error.message
+          : typeof error === 'string' && error.trim().length > 0
+            ? error
+            : 'Prompt execution failed'
 
+      const active = promptRef.current
+      if (active === null || active.id !== requestId) {
+        return
+      }
+      active.terminal = true
+      promptRef.current = null
+      setMessages((current) =>
+        current.filter(
+          (chatMessage) =>
+            chatMessage.id !== active.assistantId || chatMessage.content.trim().length > 0,
+        ),
+      )
       applyTransition(executingStatus, 'fail')
       addNotice({
         tone: 'error',
@@ -764,7 +881,20 @@ function App() {
         message,
       })
       recordRuntimeDiagnostic('execution', `Execution error: ${message}`)
+      setPromptState('idle')
+      setPromptActivity(null)
     }
+  }
+
+  const cancelPrompt = (): void => {
+    const active = promptRef.current
+    if (active === null || active.terminal || promptState === 'stopping') return
+    setPromptState('stopping')
+    void invokeTauriCommand('cancel_prompt', { requestId: active.id }).catch(() => {
+      if (promptRef.current === active && !active.terminal) {
+        setPromptState('executing')
+      }
+    })
   }
 
   const synthesizeAndPlayAssistantReply = async (text: string): Promise<void> => {
@@ -1079,6 +1209,7 @@ function App() {
       message: `Switching response profile to ${getResponseProfileLabel(profile)}...`,
       selectedResponseProfile: profile,
       supportedResponseProfiles: currentState.supportedResponseProfiles,
+      promptCancellationAvailable: currentState.promptCancellationAvailable,
       ttsEnabled: currentState.ttsEnabled,
       ttsOutputGainDb: currentState.ttsOutputGainDb,
     }
@@ -1390,6 +1521,18 @@ function App() {
             {micStarting ? 'Starting mic...' : micActive ? 'Stop mic' : 'Start mic'}
           </button>
           <div className="composer__send-side">
+            {promptState !== 'idle' &&
+            startupState.kind === 'ready' &&
+            startupState.promptCancellationAvailable ? (
+              <button
+                type="button"
+                className="shell__control"
+                onClick={cancelPrompt}
+                disabled={promptState === 'stopping'}
+              >
+                {promptState === 'stopping' ? 'Stopping…' : 'Stop'}
+              </button>
+            ) : null}
             {wakeConfidence !== null ? (
               <div
                 className={wakeConfidence >= 0.7 ? 'composer__wake composer__wake--high' : wakeConfidence >= 0.4 ? 'composer__wake composer__wake--medium' : 'composer__wake composer__wake--low'}
@@ -1425,6 +1568,7 @@ function App() {
               Send
             </button>
           </div>
+          {promptActivity !== null ? <div className="composer__status" role="status" aria-live="polite">{promptActivity}</div> : null}
         </div>
       </form>
     </div>
@@ -1480,27 +1624,6 @@ function toDisplayErrorMessage(error: unknown): string {
   }
 
   return String(error)
-}
-
-function createPromptExecutionNotice(result: PromptExecutionResult): Omit<UserNotice, 'id'> {
-  const hasExecutionFailure =
-    (result.exitCode !== null && result.exitCode !== 0) ||
-    result.stderr.trim().length > 0 ||
-    result.events.some((event) => event.kind === 'error')
-
-  if (hasExecutionFailure) {
-    return {
-      tone: 'error',
-      title: 'Response failed',
-      message: 'The response could not be completed. Try again.',
-    }
-  }
-
-  return {
-    tone: 'info',
-    title: 'No response',
-    message: 'No response was returned. Try again.',
-  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
