@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use espeak_rs::text_to_phonemes;
 use serde::Deserialize;
@@ -17,6 +18,20 @@ pub struct LocalTtsRuntimeSpec {
     pub max_queue: usize,
     pub sample_rate_hz: u32,
     pub max_duration_s: u64,
+    pub provider_policy: TtsProviderPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TtsProviderPolicy {
+    Auto,
+    Cuda,
+    Cpu,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TtsActualProvider {
+    Cuda,
+    Cpu,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -33,10 +48,21 @@ pub struct LocalTtsRuntime {
     max_duration_ms: u64,
     sender: Option<mpsc::SyncSender<SynthesisJob>>,
     _workers: Vec<thread::JoinHandle<()>>,
+    actual_provider: Option<TtsActualProvider>,
 }
 
-type SynthesisEngineFactory =
-    Arc<dyn Fn(PathBuf, u32) -> Result<Box<dyn SynthesisEngine>, String> + Send + Sync>;
+const MAX_TTS_INPUT_BYTES: usize = 4096;
+const MAX_SYNTHESIS_WAIT_MS: u64 = 10 * 60 * 1_000;
+
+type SynthesisEngineFactory = Arc<
+    dyn Fn(
+            PathBuf,
+            u32,
+            TtsProviderPolicy,
+        ) -> Result<(Box<dyn SynthesisEngine>, TtsActualProvider), String>
+        + Send
+        + Sync,
+>;
 
 trait SynthesisEngine: Send {
     fn synthesize(&mut self, text: &str) -> Result<LocalTtsAudio, String>;
@@ -88,6 +114,7 @@ struct PiperInferenceConfig {
 struct SynthesisJob {
     text: String,
     response: mpsc::Sender<Result<LocalTtsAudio, String>>,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl LocalTtsRuntime {
@@ -141,13 +168,15 @@ impl LocalTtsRuntime {
                 max_duration_ms,
                 sender: None,
                 _workers: Vec::new(),
+                actual_provider: None,
             });
         }
 
         let (sender, receiver) = mpsc::sync_channel::<SynthesisJob>(spec.max_queue);
         let shared_receiver = Arc::new(Mutex::new(receiver));
         let mut workers = Vec::with_capacity(spec.worker_count);
-        let (init_tx, init_rx) = mpsc::channel::<Result<(), String>>();
+        let (init_tx, init_rx) = mpsc::channel::<Result<TtsActualProvider, String>>();
+        let provider_policy = spec.provider_policy;
         let model_path = model_path.expect("model path must exist for enabled runtime");
 
         for _ in 0..spec.worker_count {
@@ -157,16 +186,18 @@ impl LocalTtsRuntime {
             let worker_engine_factory = Arc::clone(&engine_factory);
             let worker_init_tx = init_tx.clone();
             workers.push(thread::spawn(move || {
-                let mut engine = match worker_engine_factory(worker_model_path, sample_rate_hz) {
-                    Ok(engine) => {
-                        let _ = worker_init_tx.send(Ok(()));
-                        engine
-                    }
-                    Err(error) => {
-                        let _ = worker_init_tx.send(Err(error));
-                        return;
-                    }
-                };
+                let mut engine =
+                    match worker_engine_factory(worker_model_path, sample_rate_hz, provider_policy)
+                    {
+                        Ok((engine, provider)) => {
+                            let _ = worker_init_tx.send(Ok(provider));
+                            engine
+                        }
+                        Err(error) => {
+                            let _ = worker_init_tx.send(Err(error));
+                            return;
+                        }
+                    };
 
                 loop {
                     let next_job = {
@@ -180,6 +211,9 @@ impl LocalTtsRuntime {
                     let Ok(job) = next_job else {
                         return;
                     };
+                    if job.cancelled.load(Ordering::Relaxed) {
+                        continue;
+                    }
 
                     let result = engine.synthesize(&job.text);
                     let _ = job.response.send(result);
@@ -188,11 +222,18 @@ impl LocalTtsRuntime {
         }
 
         drop(init_tx);
+        let mut actual_provider = None;
         for _ in 0..spec.worker_count {
             let init_result = init_rx
                 .recv()
                 .map_err(|_| String::from("failed to initialize local tts worker runtime"))?;
-            init_result?;
+            let provider = init_result?;
+            if actual_provider.is_some_and(|selected| selected != provider) {
+                return Err(String::from(
+                    "local tts workers selected inconsistent execution providers",
+                ));
+            }
+            actual_provider = Some(provider);
         }
 
         Ok(Self {
@@ -201,6 +242,7 @@ impl LocalTtsRuntime {
             max_duration_ms,
             sender: Some(sender),
             _workers: workers,
+            actual_provider,
         })
     }
 
@@ -216,6 +258,10 @@ impl LocalTtsRuntime {
         self.sender.is_some()
     }
 
+    pub fn actual_provider(&self) -> Option<TtsActualProvider> {
+        self.actual_provider
+    }
+
     pub fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::Relaxed);
     }
@@ -229,22 +275,42 @@ impl LocalTtsRuntime {
         if text.is_empty() {
             return Err(String::from("tts text must not be empty"));
         }
+        if text.len() > MAX_TTS_INPUT_BYTES {
+            return Err(format!(
+                "tts text exceeds maximum of {MAX_TTS_INPUT_BYTES} bytes"
+            ));
+        }
 
         let Some(sender) = self.sender.as_ref() else {
             return Err(String::from("tts runtime is not available"));
         };
 
         let (response_tx, response_rx) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
         sender
-            .send(SynthesisJob {
+            .try_send(SynthesisJob {
                 text: text.to_string(),
                 response: response_tx,
+                cancelled: Arc::clone(&cancelled),
             })
-            .map_err(|_| String::from("failed to enqueue local tts synthesis request"))?;
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => String::from("local tts synthesis queue is full"),
+                mpsc::TrySendError::Disconnected(_) => {
+                    String::from("failed to enqueue local tts synthesis request")
+                }
+            })?;
 
-        let audio = response_rx
-            .recv()
-            .map_err(|_| String::from("failed to receive local tts synthesis result"))??;
+        let wait_ms = self
+            .max_duration_ms
+            .saturating_add(30_000)
+            .min(MAX_SYNTHESIS_WAIT_MS);
+        let audio = match response_rx.recv_timeout(Duration::from_millis(wait_ms)) {
+            Ok(result) => result?,
+            Err(_) => {
+                cancelled.store(true, Ordering::Relaxed);
+                return Err(String::from("local tts synthesis timed out"));
+            }
+        };
 
         if audio.duration_ms > self.max_duration_ms {
             return Err(format!(
@@ -253,12 +319,20 @@ impl LocalTtsRuntime {
             ));
         }
 
+        if !self.is_enabled() {
+            return Err(String::from("tts was disabled during synthesis"));
+        }
+
         Ok(audio)
     }
 }
 
 impl PiperOnnxEngine {
-    fn new(model_path: &Path, sample_rate_hz: u32) -> Result<Self, String> {
+    fn new(
+        model_path: &Path,
+        sample_rate_hz: u32,
+        policy: TtsProviderPolicy,
+    ) -> Result<(Self, TtsActualProvider), String> {
         let config = load_piper_voice_config(model_path)?;
         if config.audio.sample_rate != sample_rate_hz {
             return Err(format!(
@@ -269,37 +343,53 @@ impl PiperOnnxEngine {
 
         ensure_windows_espeak_data_directory_env()?;
 
-        ensure_windows_tts_cuda_runtime_dlls_beside_current_exe()?;
-
-        let mut builder = ort::session::Session::builder()
-            .map_err(|error| format!("failed to create local tts ONNX session builder: {error}"))?
-            .with_execution_providers([ort::ep::CUDA::default().build().error_on_failure()])
-            .map_err(|error| {
-                format!("failed to initialize CUDA execution provider for local tts: {error}")
-            })?
-            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
-            .map_err(|error| {
-                format!("failed to configure local tts ONNX optimization level: {error}")
-            })?
-            .with_intra_threads(1)
-            .map_err(|error| {
-                format!("failed to configure local tts ONNX worker threads: {error}")
-            })?;
-        let session = builder.commit_from_file(model_path).map_err(|error| {
-            format!(
-                "failed to load local tts ONNX model from {}: {error}",
-                model_path.display()
-            )
-        })?;
-
+        let try_provider = |cuda: bool| -> Result<ort::session::Session, String> {
+            if cuda {
+                ensure_windows_tts_cuda_runtime_dlls_beside_current_exe()?;
+            }
+            let mut providers = if cuda {
+                ort::session::Session::builder()
+                    .map_err(|e| format!("failed to create local tts ONNX session builder: {e}"))?
+                    .with_execution_providers([ort::ep::CUDA::default().build().error_on_failure()])
+            } else {
+                ort::session::Session::builder()
+                    .map_err(|e| format!("failed to create local tts ONNX session builder: {e}"))?
+                    .with_execution_providers([ort::ep::CPU::default().build()])
+            }
+            .map_err(|e| format!("failed to initialize local tts execution provider: {e}"))?;
+            providers.commit_from_file(model_path).map_err(|e| {
+                format!(
+                    "failed to load local tts ONNX model from {}: {e}",
+                    model_path.display()
+                )
+            })
+        };
+        let (session, actual_provider) = select_tts_provider(policy, try_provider)?;
         let contract = resolve_piper_model_contract(&session, &config)?;
 
-        Ok(Self {
-            session,
-            config,
-            contract,
-            sample_rate_hz,
-        })
+        Ok((
+            Self {
+                session,
+                config,
+                contract,
+                sample_rate_hz,
+            },
+            actual_provider,
+        ))
+    }
+}
+
+fn select_tts_provider<T>(
+    policy: TtsProviderPolicy,
+    mut initialize: impl FnMut(bool) -> Result<T, String>,
+) -> Result<(T, TtsActualProvider), String> {
+    match policy {
+        TtsProviderPolicy::Cpu => Ok((initialize(false)?, TtsActualProvider::Cpu)),
+        TtsProviderPolicy::Cuda => Ok((initialize(true)?, TtsActualProvider::Cuda)),
+        TtsProviderPolicy::Auto => match initialize(true) {
+            Ok(runtime) => Ok((runtime, TtsActualProvider::Cuda)),
+            Err(_) => Ok((initialize(false)?, TtsActualProvider::Cpu)),
+        },
     }
 }
 
@@ -555,13 +645,14 @@ fn decode_audio_from_outputs(
     let audio_tensor = output
         .try_extract_tensor::<f32>()
         .map_err(|error| format!("failed to extract local tts audio tensor: {error}"))?;
-    let pcm_f32 = audio_tensor.1.to_vec();
+    let mut pcm_f32 = audio_tensor.1.to_vec();
 
     if pcm_f32.is_empty() {
         return Err(String::from(
             "local tts model produced an empty audio buffer",
         ));
     }
+    normalize_pcm_samples(&mut pcm_f32)?;
 
     let duration_ms =
         ((pcm_f32.len() as u64).saturating_mul(1_000) / u64::from(sample_rate_hz)).max(1);
@@ -571,6 +662,18 @@ fn decode_audio_from_outputs(
         sample_rate_hz,
         duration_ms,
     })
+}
+
+fn normalize_pcm_samples(samples: &mut [f32]) -> Result<(), String> {
+    if samples.iter().any(|sample| !sample.is_finite()) {
+        return Err(String::from(
+            "local tts model produced non-finite audio samples",
+        ));
+    }
+    for sample in samples {
+        *sample = sample.clamp(-1.0, 1.0);
+    }
+    Ok(())
 }
 
 fn resolve_piper_model_contract(
@@ -612,28 +715,50 @@ fn resolve_piper_model_contract(
         ));
     }
 
-    let output = session
+    let output_shapes = session
         .outputs()
         .iter()
-        .find(|output| {
-            let shape = match output.dtype().tensor_shape() {
-                Some(shape) => shape,
-                None => return false,
-            };
-
-            matches!(output.name(), "audio" | "waveform" | "wav" | "output")
-                || !shape.is_empty()
-        })
-        .ok_or_else(|| {
-            String::from(
-                "local tts model contract is unsupported: expected a non-scalar audio output tensor",
+        .map(|output| {
+            (
+                output.name(),
+                output
+                    .dtype()
+                    .tensor_shape()
+                    .is_some_and(|shape| !shape.is_empty()),
             )
-        })?;
+        })
+        .collect::<Vec<_>>();
+    let output_name = select_piper_audio_output(&output_shapes)?;
 
     Ok(PiperModelContract {
         has_speaker_input,
-        output_name: output.name().to_string(),
+        output_name: output_name.to_string(),
     })
+}
+
+fn select_piper_audio_output<'a>(outputs: &[(&'a str, bool)]) -> Result<&'a str, String> {
+    const RECOGNIZED_AUDIO_NAMES: &[&str] = &["audio", "waveform", "wav", "output"];
+
+    if let Some((name, _)) = outputs
+        .iter()
+        .find(|(name, non_scalar)| *non_scalar && RECOGNIZED_AUDIO_NAMES.contains(name))
+    {
+        return Ok(name);
+    }
+
+    let mut non_scalar_outputs = outputs.iter().filter(|(_, non_scalar)| *non_scalar);
+    let Some((name, _)) = non_scalar_outputs.next() else {
+        return Err(String::from(
+            "local tts model contract is unsupported: expected a non-scalar audio output tensor",
+        ));
+    };
+    if non_scalar_outputs.next().is_some() {
+        return Err(String::from(
+            "local tts model contract is unsupported: ambiguous unnamed non-scalar audio outputs",
+        ));
+    }
+
+    Ok(name)
 }
 
 fn text_to_phoneme_ids(text: &str, config: &PiperVoiceConfig) -> Result<Vec<i64>, String> {
@@ -705,9 +830,10 @@ fn text_to_phoneme_ids(text: &str, config: &PiperVoiceConfig) -> Result<Vec<i64>
 fn default_engine_factory(
     model_path: PathBuf,
     sample_rate_hz: u32,
-) -> Result<Box<dyn SynthesisEngine>, String> {
-    let engine = PiperOnnxEngine::new(&model_path, sample_rate_hz)?;
-    Ok(Box::new(engine))
+    policy: TtsProviderPolicy,
+) -> Result<(Box<dyn SynthesisEngine>, TtsActualProvider), String> {
+    let (engine, provider) = PiperOnnxEngine::new(&model_path, sample_rate_hz, policy)?;
+    Ok((Box::new(engine), provider))
 }
 
 fn synthesize_fake_audio(text: &str, sample_rate_hz: u32) -> Result<LocalTtsAudio, String> {
@@ -744,14 +870,39 @@ mod tests {
     use super::{LocalTtsRuntime, LocalTtsRuntimeSpec};
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{mpsc, Arc, Condvar, Mutex};
+    use std::thread;
 
     struct FakeSynthesisEngine {
         sample_rate_hz: u32,
     }
 
+    struct BlockingSynthesisEngine {
+        sample_rate_hz: u32,
+        started: mpsc::Sender<()>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
     impl super::SynthesisEngine for FakeSynthesisEngine {
         fn synthesize(&mut self, text: &str) -> Result<super::LocalTtsAudio, String> {
+            super::synthesize_fake_audio(text, self.sample_rate_hz)
+        }
+    }
+
+    impl super::SynthesisEngine for BlockingSynthesisEngine {
+        fn synthesize(&mut self, text: &str) -> Result<super::LocalTtsAudio, String> {
+            self.started
+                .send(())
+                .map_err(|_| String::from("failed to signal synthesis start"))?;
+            let (lock, ready) = &*self.release;
+            let mut released = lock
+                .lock()
+                .map_err(|_| String::from("release lock is poisoned"))?;
+            while !*released {
+                released = ready
+                    .wait(released)
+                    .map_err(|_| String::from("release lock is poisoned"))?;
+            }
             super::synthesize_fake_audio(text, self.sample_rate_hz)
         }
     }
@@ -764,6 +915,58 @@ mod tests {
             config_path.to_string_lossy().replace('\\', "/"),
             "models/tts/jarvis-high.onnx.json"
         );
+    }
+
+    #[test]
+    fn piper_audio_output_selection_prefers_recognized_non_scalar_name() {
+        let outputs = [("metadata", true), ("waveform", true), ("other", true)];
+
+        assert_eq!(super::select_piper_audio_output(&outputs), Ok("waveform"));
+    }
+
+    #[test]
+    fn piper_audio_output_selection_accepts_only_unnamed_single_non_scalar_output() {
+        let outputs = [("result", true)];
+
+        assert_eq!(super::select_piper_audio_output(&outputs), Ok("result"));
+    }
+
+    #[test]
+    fn auto_provider_falls_back_to_cpu() {
+        let mut attempts = Vec::new();
+        let (runtime, provider) =
+            super::select_tts_provider(super::TtsProviderPolicy::Auto, |cuda| {
+                attempts.push(cuda);
+                if cuda {
+                    Err(String::from("CUDA unavailable"))
+                } else {
+                    Ok("cpu-runtime")
+                }
+            })
+            .expect("auto policy should fall back to CPU");
+
+        assert_eq!(attempts, [true, false]);
+        assert_eq!(runtime, "cpu-runtime");
+        assert_eq!(provider, super::TtsActualProvider::Cpu);
+    }
+
+    #[test]
+    fn pcm_normalization_rejects_non_finite_and_clamps_amplitude() {
+        let mut invalid = [0.0, f32::NAN];
+        assert!(super::normalize_pcm_samples(&mut invalid).is_err());
+
+        let mut samples = [-2.0, -0.5, 0.5, 2.0];
+        super::normalize_pcm_samples(&mut samples).expect("finite samples should normalize");
+        assert_eq!(samples, [-1.0, -0.5, 0.5, 1.0]);
+    }
+
+    #[test]
+    fn piper_audio_output_selection_rejects_ambiguous_unnamed_outputs() {
+        let outputs = [("result_a", true), ("result_b", true)];
+
+        let error = super::select_piper_audio_output(&outputs)
+            .expect_err("multiple unnamed non-scalar outputs must be rejected");
+        assert!(error.contains("ambiguous"));
     }
 
     #[test]
@@ -850,8 +1053,12 @@ mod tests {
     fn fake_engine_factory(
         _model_path: PathBuf,
         sample_rate_hz: u32,
-    ) -> Result<Box<dyn super::SynthesisEngine>, String> {
-        Ok(Box::new(FakeSynthesisEngine { sample_rate_hz }))
+        _policy: super::TtsProviderPolicy,
+    ) -> Result<(Box<dyn super::SynthesisEngine>, super::TtsActualProvider), String> {
+        Ok((
+            Box::new(FakeSynthesisEngine { sample_rate_hz }),
+            super::TtsActualProvider::Cpu,
+        ))
     }
 
     #[test]
@@ -863,6 +1070,7 @@ mod tests {
             max_queue: 4,
             sample_rate_hz: 22_050,
             max_duration_s: 300,
+            provider_policy: super::TtsProviderPolicy::Auto,
         })
         .expect("runtime should initialize");
 
@@ -886,6 +1094,7 @@ mod tests {
                 max_queue: 8,
                 sample_rate_hz: 22_050,
                 max_duration_s: 300,
+                provider_policy: super::TtsProviderPolicy::Auto,
             },
             Arc::new(fake_engine_factory),
         )
@@ -897,6 +1106,82 @@ mod tests {
 
         assert_eq!(audio.sample_rate_hz, 22_050);
         assert!(!audio.pcm_f32.is_empty());
+    }
+
+    #[test]
+    fn enabled_runtime_rejects_oversized_text_before_synthesis() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let model_path = temp_dir.path().join("jarvis.onnx");
+        fs::write(&model_path, b"fixture").expect("model fixture should be written");
+        let runtime = LocalTtsRuntime::new_with_engine_factory(
+            LocalTtsRuntimeSpec {
+                enabled: true,
+                model_path: Some(model_path),
+                worker_count: 1,
+                max_queue: 1,
+                sample_rate_hz: 22_050,
+                max_duration_s: 300,
+                provider_policy: super::TtsProviderPolicy::Auto,
+            },
+            Arc::new(fake_engine_factory),
+        )
+        .expect("runtime should initialize with fake engine");
+
+        let error = runtime
+            .synthesize(&"x".repeat(super::MAX_TTS_INPUT_BYTES + 1))
+            .expect_err("oversized input must be rejected");
+
+        assert!(error.contains("tts text exceeds maximum"));
+    }
+
+    #[test]
+    fn synthesis_result_is_rejected_when_runtime_is_disabled_in_flight() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let model_path = temp_dir.path().join("jarvis.onnx");
+        fs::write(&model_path, b"fixture").expect("model fixture should be written");
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let engine_release = Arc::clone(&release);
+        let runtime = Arc::new(
+            LocalTtsRuntime::new_with_engine_factory(
+                LocalTtsRuntimeSpec {
+                    enabled: true,
+                    model_path: Some(model_path),
+                    worker_count: 1,
+                    max_queue: 1,
+                    sample_rate_hz: 22_050,
+                    max_duration_s: 300,
+                    provider_policy: super::TtsProviderPolicy::Auto,
+                },
+                Arc::new(move |_, sample_rate_hz, _| {
+                    Ok((
+                        Box::new(BlockingSynthesisEngine {
+                            sample_rate_hz,
+                            started: started_tx.clone(),
+                            release: Arc::clone(&engine_release),
+                        }),
+                        super::TtsActualProvider::Cpu,
+                    ))
+                }),
+            )
+            .expect("runtime should initialize with blocking engine"),
+        );
+        let synthesizing_runtime = Arc::clone(&runtime);
+        let synthesis = thread::spawn(move || synthesizing_runtime.synthesize("hello"));
+        started_rx
+            .recv()
+            .expect("synthesis should reach the blocking engine");
+
+        runtime.set_enabled(false);
+        let (lock, ready) = &*release;
+        *lock.lock().expect("release lock") = true;
+        ready.notify_all();
+
+        let error = synthesis
+            .join()
+            .expect("synthesis thread should join")
+            .expect_err("disabled in-flight synthesis must not return audio");
+        assert_eq!(error, "tts was disabled during synthesis");
     }
 
     #[test]
@@ -913,8 +1198,9 @@ mod tests {
                 max_queue: 4,
                 sample_rate_hz: 22_050,
                 max_duration_s: 300,
+                provider_policy: super::TtsProviderPolicy::Auto,
             },
-            Arc::new(|_, _| {
+            Arc::new(|_, _, _| {
                 Err(String::from(
                     "failed to initialize CUDA execution provider for local tts: unavailable",
                 ))
@@ -939,6 +1225,7 @@ mod tests {
                 max_queue: 4,
                 sample_rate_hz: 22_050,
                 max_duration_s: 1,
+                provider_policy: super::TtsProviderPolicy::Auto,
             },
             Arc::new(fake_engine_factory),
         )
