@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 const WINDOWS_CONFIG_DIR: &str = "VoxGolem";
 const WINDOWS_CONFIG_FILE: &str = "config.toml";
 const WINDOWS_SOUL_FILE: &str = "SOUL.md";
+const APP_DIR: &str = "voxgolem";
 const DEFAULT_SILERO_VAD_MODEL: &str = "models/silero-vad.onnx";
 const DEFAULT_SILENCE_TIMEOUT_MS: u64 = 1_500;
 const DEFAULT_WAKE_WORD_DETECTION_THRESHOLD: f32 = 0.68;
@@ -15,6 +16,10 @@ const DEFAULT_TTS_MAX_QUEUE: usize = 8;
 const DEFAULT_TTS_SAMPLE_RATE_HZ: u32 = 22_050;
 const DEFAULT_TTS_MAX_DURATION_S: u64 = 300;
 const DEFAULT_TTS_OUTPUT_GAIN_DB: f32 = 3.0;
+const DEFAULT_TELEMETRY_MAX_BYTES: usize = 10 * 1024 * 1024;
+const DEFAULT_TELEMETRY_BACKUP_COUNT: u8 = 3;
+const MIN_TELEMETRY_MAX_BYTES: usize = 1024;
+const MAX_TELEMETRY_BACKUP_COUNT: u8 = 10;
 const MIN_TTS_OUTPUT_GAIN_DB: f32 = -24.0;
 const MAX_TTS_OUTPUT_GAIN_DB: f32 = 24.0;
 const MAX_JS_SAFE_INTEGER_U64: u64 = 9_007_199_254_740_991;
@@ -22,22 +27,31 @@ const MAX_JS_SAFE_INTEGER_U64: u64 = 9_007_199_254_740_991;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
-    wake_word_model_path: PathBuf,
-    parakeet_model_dir: PathBuf,
+    #[serde(default)]
+    wake_word_model_path: Option<PathBuf>,
+    #[serde(default)]
+    parakeet_model_dir: Option<PathBuf>,
     silero_vad_model: Option<PathBuf>,
     #[serde(default = "default_silence_timeout_ms")]
     silence_timeout_ms: u64,
     #[serde(default = "default_wake_word_detection_threshold")]
     wake_word_detection_threshold: f32,
-    response_backend: RawResponseBackend,
+    #[serde(default)]
+    response_backend: Option<RawResponseBackend>,
     #[serde(default)]
     opencode: Option<RawOpencodeConfig>,
     #[serde(default)]
     llama_cpp: Option<RawLlamaCppConfig>,
     #[serde(default)]
+    custom_openai: Option<RawCustomOpenAiConfig>,
+    #[serde(default)]
+    completion: Option<RawCompletionConfig>,
+    #[serde(default)]
     tts: Option<RawTtsConfig>,
     #[serde(default)]
     logging: Option<RawLoggingConfig>,
+    #[serde(default)]
+    telemetry: Option<RawTelemetryConfig>,
     #[serde(default, rename = "start_listening_cue")]
     _start_listening_cue: Option<PathBuf>,
     #[serde(default, rename = "stop_listening_cue")]
@@ -66,6 +80,26 @@ struct RawLlamaCppConfig {
     fast_model_path: PathBuf,
     #[serde(default)]
     quality_model_path: Option<PathBuf>,
+    #[serde(default)]
+    inference_provider: InferencePolicy,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCustomOpenAiConfig {
+    #[serde(default = "default_private_endpoint")]
+    endpoint: String,
+    #[serde(default = "default_auth_path")]
+    auth_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCompletionConfig {
+    server_path: PathBuf,
+    model_path: PathBuf,
+    #[serde(default)]
+    inference_provider: InferencePolicy,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -93,6 +127,17 @@ struct RawLoggingConfig {
     enabled: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTelemetryConfig {
+    #[serde(default = "default_telemetry_enabled")]
+    enabled: bool,
+    #[serde(default = "default_telemetry_max_bytes")]
+    max_bytes: usize,
+    #[serde(default = "default_telemetry_backup_count")]
+    backup_count: u8,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfig {
     pub wake_word_model_path: PathBuf,
@@ -102,12 +147,68 @@ pub struct RuntimeConfig {
     pub wake_word_detection_threshold: f32,
     pub local_tts: LocalTtsConfig,
     pub logging: LoggingConfig,
+    pub telemetry: TelemetryConfig,
     pub response_backend: ResponseBackendConfig,
+    pub opencode: Option<OpencodeConfig>,
+    pub llama_cpp: Option<LlamaCppConfig>,
+    pub custom_openai: Option<CustomOpenAiConfig>,
+    pub completion: Option<CompletionConfig>,
+    pub capability_issues: Vec<CapabilityConfigIssue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpencodeConfig {
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlamaCppConfig {
+    pub server_path: PathBuf,
+    pub host: String,
+    pub port: u16,
+    pub fast_model_path: PathBuf,
+    pub quality_model_path: Option<PathBuf>,
+    pub inference_provider: InferencePolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomOpenAiConfig {
+    pub endpoint: String,
+    pub auth_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionConfig {
+    pub server_path: PathBuf,
+    pub model_path: PathBuf,
+    pub inference_provider: InferencePolicy,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum InferencePolicy {
+    #[default]
+    Auto,
+    Cuda,
+    Cpu,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityConfigIssue {
+    pub capability: &'static str,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoggingConfig {
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TelemetryConfig {
+    pub enabled: bool,
+    pub max_bytes: usize,
+    pub backup_count: u8,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -123,6 +224,7 @@ pub struct LocalTtsConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponseBackendConfig {
+    Unconfigured,
     Opencode {
         path: PathBuf,
     },
@@ -138,26 +240,15 @@ pub enum ResponseBackendConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
     MissingAppData,
-    MissingConfigFile { path: PathBuf },
     ReadConfigFailed { path: PathBuf, details: String },
     ParseConfigFailed { path: PathBuf, details: String },
-    MissingFile { field: &'static str, path: PathBuf },
-    MissingDirectory { field: &'static str, path: PathBuf },
-    MissingExecutable { field: &'static str, path: PathBuf },
-    MissingBackendConfig { backend: &'static str },
 }
 
 impl Display for ConfigError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissingAppData => {
-                write!(
-                    formatter,
-                    "APPDATA is missing; cannot resolve %APPDATA%\\VoxGolem\\config.toml"
-                )
-            }
-            Self::MissingConfigFile { path } => {
-                write!(formatter, "config file not found: {}", path.display())
+                write!(formatter, "home directory is unavailable")
             }
             Self::ReadConfigFailed { path, details } => {
                 write!(
@@ -173,33 +264,6 @@ impl Display for ConfigError {
                     path.display()
                 )
             }
-            Self::MissingFile { field, path } => {
-                write!(
-                    formatter,
-                    "invalid `{field}` path; expected an existing file: {}",
-                    path.display()
-                )
-            }
-            Self::MissingDirectory { field, path } => {
-                write!(
-                    formatter,
-                    "invalid `{field}` path; expected an existing directory: {}",
-                    path.display()
-                )
-            }
-            Self::MissingExecutable { field, path } => {
-                write!(
-                    formatter,
-                    "invalid `{field}` path; expected an existing executable file: {}",
-                    path.display()
-                )
-            }
-            Self::MissingBackendConfig { backend } => {
-                write!(
-                    formatter,
-                    "missing configuration table for selected backend `{backend}`"
-                )
-            }
         }
     }
 }
@@ -207,17 +271,120 @@ impl Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 pub fn default_config_path() -> Result<PathBuf, ConfigError> {
-    Ok(default_app_data_dir()?.join(WINDOWS_CONFIG_FILE))
+    if let Some(path) = std::env::var_os("VOXGOLEM_CONFIG_PATH") {
+        return Ok(PathBuf::from(path));
+    }
+    Ok(default_config_dir()?.join(WINDOWS_CONFIG_FILE))
 }
 
 pub fn default_soul_path() -> Result<PathBuf, ConfigError> {
-    Ok(default_app_data_dir()?.join(WINDOWS_SOUL_FILE))
+    Ok(soul_path_for_config(default_config_path()?))
 }
 
-fn default_app_data_dir() -> Result<PathBuf, ConfigError> {
-    let app_data = std::env::var_os("APPDATA").ok_or(ConfigError::MissingAppData)?;
+fn soul_path_for_config(config_path: PathBuf) -> PathBuf {
+    config_path.with_file_name(WINDOWS_SOUL_FILE)
+}
 
-    Ok(PathBuf::from(app_data).join(WINDOWS_CONFIG_DIR))
+pub fn default_data_dir() -> Result<PathBuf, ConfigError> {
+    if cfg!(windows) {
+        return Ok(platform_dirs_from_env(|name| std::env::var_os(name), true)?.data);
+    }
+    linux_app_dir_from_env(
+        &mut |name| std::env::var_os(name),
+        "XDG_DATA_HOME",
+        ".local/share",
+    )
+}
+
+pub fn default_state_dir() -> Result<PathBuf, ConfigError> {
+    if cfg!(windows) {
+        return Ok(platform_dirs_from_env(|name| std::env::var_os(name), true)?.state);
+    }
+    linux_app_dir_from_env(
+        &mut |name| std::env::var_os(name),
+        "XDG_STATE_HOME",
+        ".local/state",
+    )
+}
+
+pub fn default_cache_dir() -> Result<PathBuf, ConfigError> {
+    if cfg!(windows) {
+        return Ok(platform_dirs_from_env(|name| std::env::var_os(name), true)?.cache);
+    }
+    linux_app_dir_from_env(
+        &mut |name| std::env::var_os(name),
+        "XDG_CACHE_HOME",
+        ".cache",
+    )
+}
+
+fn default_config_dir() -> Result<PathBuf, ConfigError> {
+    if cfg!(windows) {
+        return Ok(platform_dirs_from_env(|name| std::env::var_os(name), true)?.config);
+    }
+    linux_app_dir_from_env(
+        &mut |name| std::env::var_os(name),
+        "XDG_CONFIG_HOME",
+        ".config",
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PlatformDirs {
+    config: PathBuf,
+    data: PathBuf,
+    state: PathBuf,
+    cache: PathBuf,
+}
+
+fn platform_dirs_from_env<F>(mut get: F, windows: bool) -> Result<PlatformDirs, ConfigError>
+where
+    F: FnMut(&str) -> Option<std::ffi::OsString>,
+{
+    if windows {
+        let profile = get("USERPROFILE");
+        let base = get("APPDATA")
+            .or_else(|| {
+                profile
+                    .clone()
+                    .map(|p| PathBuf::from(p).join("AppData/Roaming").into_os_string())
+            })
+            .ok_or(ConfigError::MissingAppData)?;
+        let local = get("LOCALAPPDATA")
+            .or_else(|| profile.map(|p| PathBuf::from(p).join("AppData/Local").into_os_string()))
+            .unwrap_or_else(|| base.clone());
+        let config = PathBuf::from(base).join(WINDOWS_CONFIG_DIR);
+        let local = PathBuf::from(local).join(WINDOWS_CONFIG_DIR);
+        return Ok(PlatformDirs {
+            config,
+            data: local.clone(),
+            state: local.clone(),
+            cache: local,
+        });
+    }
+
+    Ok(PlatformDirs {
+        config: linux_app_dir_from_env(&mut get, "XDG_CONFIG_HOME", ".config")?,
+        data: linux_app_dir_from_env(&mut get, "XDG_DATA_HOME", ".local/share")?,
+        state: linux_app_dir_from_env(&mut get, "XDG_STATE_HOME", ".local/state")?,
+        cache: linux_app_dir_from_env(&mut get, "XDG_CACHE_HOME", ".cache")?,
+    })
+}
+
+fn linux_app_dir_from_env<F>(
+    get: &mut F,
+    xdg_name: &str,
+    home_fallback: &str,
+) -> Result<PathBuf, ConfigError>
+where
+    F: FnMut(&str) -> Option<std::ffi::OsString>,
+{
+    get(xdg_name)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| get("HOME").map(|home| PathBuf::from(home).join(home_fallback)))
+        .map(|base| base.join(APP_DIR))
+        .ok_or(ConfigError::MissingAppData)
 }
 
 pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig, ConfigError> {
@@ -233,7 +400,10 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
     let config_contents = match fs::read_to_string(&config_path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == ErrorKind::NotFound => {
-            return Err(ConfigError::MissingConfigFile { path: config_path });
+            return Ok(default_runtime_config(
+                &config_dir,
+                Some(format!("config file not found: {}", config_path.display())),
+            ));
         }
         Err(error) => {
             return Err(ConfigError::ReadConfigFailed {
@@ -250,8 +420,21 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
         }
     })?;
 
-    let wake_word_model_path = resolve_config_path(&config_dir, raw_config.wake_word_model_path);
-    let parakeet_model_dir = resolve_config_path(&config_dir, raw_config.parakeet_model_dir);
+    let wake_word_configured = raw_config.wake_word_model_path.is_some();
+    let parakeet_configured = raw_config.parakeet_model_dir.is_some();
+    let vad_configured = raw_config.silero_vad_model.is_some();
+    let wake_word_model_path = resolve_config_path(
+        &config_dir,
+        raw_config
+            .wake_word_model_path
+            .unwrap_or_else(|| PathBuf::from("models/hey_livekit.onnx")),
+    );
+    let parakeet_model_dir = resolve_config_path(
+        &config_dir,
+        raw_config
+            .parakeet_model_dir
+            .unwrap_or_else(|| PathBuf::from("models/parakeet-v2")),
+    );
     let silero_vad_model = resolve_config_path(
         &config_dir,
         raw_config
@@ -293,14 +476,39 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
         });
     }
 
-    validate_existing_file(&wake_word_model_path, "wake_word_model_path")?;
-    validate_existing_directory(&parakeet_model_dir, "parakeet_model_dir")?;
-    validate_existing_file(&silero_vad_model, "silero_vad_model")?;
+    let mut capability_issues = Vec::new();
+    record_path_issue(
+        &mut capability_issues,
+        "wake_word",
+        wake_word_configured,
+        wake_word_model_path.is_file(),
+        &wake_word_model_path,
+    );
+    record_path_issue(
+        &mut capability_issues,
+        "parakeet",
+        parakeet_configured,
+        parakeet_model_dir.is_dir(),
+        &parakeet_model_dir,
+    );
+    record_path_issue(
+        &mut capability_issues,
+        "vad",
+        vad_configured,
+        silero_vad_model.is_file(),
+        &silero_vad_model,
+    );
 
     let local_tts = match raw_config.tts {
         Some(raw_tts) => {
             let model_path = resolve_config_path(&config_dir, raw_tts.model_path);
-            validate_existing_file(&model_path, "tts.model_path")?;
+            record_path_issue(
+                &mut capability_issues,
+                "tts",
+                true,
+                model_path.is_file(),
+                &model_path,
+            );
 
             if raw_tts.worker_count == 0 {
                 return Err(ConfigError::ParseConfigFailed {
@@ -380,49 +588,234 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
             .unwrap_or(false),
     };
 
-    let response_backend = match raw_config.response_backend {
-        RawResponseBackend::Opencode => {
-            let raw_opencode = raw_config
-                .opencode
-                .ok_or(ConfigError::MissingBackendConfig {
-                    backend: "opencode",
-                })?;
-            let path = resolve_config_path(&config_dir, raw_opencode.path);
-            validate_existing_executable(&path, "opencode.path")?;
+    let telemetry = raw_config
+        .telemetry
+        .map(|raw| {
+            if raw.max_bytes < MIN_TELEMETRY_MAX_BYTES {
+                return Err("telemetry.max_bytes must be at least 1024");
+            }
+            if raw.backup_count > MAX_TELEMETRY_BACKUP_COUNT {
+                return Err("telemetry.backup_count must be between 0 and 10 inclusive");
+            }
+            Ok(TelemetryConfig {
+                enabled: raw.enabled,
+                max_bytes: raw.max_bytes,
+                backup_count: raw.backup_count,
+            })
+        })
+        .transpose()
+        .map_err(|details| ConfigError::ParseConfigFailed {
+            path: config_path.clone(),
+            details: String::from(details),
+        })?
+        .unwrap_or(TelemetryConfig {
+            enabled: true,
+            max_bytes: DEFAULT_TELEMETRY_MAX_BYTES,
+            backup_count: DEFAULT_TELEMETRY_BACKUP_COUNT,
+        });
 
-            ResponseBackendConfig::Opencode { path }
+    if let Some(raw_llama_cpp) = raw_config.llama_cpp.as_ref() {
+        let host = raw_llama_cpp.host.trim();
+        if !matches!(host, "localhost" | "127.0.0.1" | "::1") {
+            return Err(ConfigError::ParseConfigFailed {
+                path: config_path.clone(),
+                details: String::from(
+                    "llama_cpp.host must be a supported loopback host (localhost, 127.0.0.1, or ::1)",
+                ),
+            });
         }
-        RawResponseBackend::LlamaCpp => {
-            let raw_llama_cpp = raw_config
-                .llama_cpp
-                .ok_or(ConfigError::MissingBackendConfig {
-                    backend: "llama_cpp",
-                })?;
-            let server_path = resolve_config_path(&config_dir, raw_llama_cpp.server_path);
-            let host = raw_llama_cpp.host.trim().to_string();
-            let port = raw_llama_cpp.port;
-            let fast_model_path = resolve_config_path(&config_dir, raw_llama_cpp.fast_model_path);
-            let quality_model_path = raw_llama_cpp
-                .quality_model_path
-                .map(|path| resolve_config_path(&config_dir, path));
+        if raw_llama_cpp.port == 0 {
+            return Err(ConfigError::ParseConfigFailed {
+                path: config_path.clone(),
+                details: String::from("llama_cpp.port must be greater than zero"),
+            });
+        }
+    }
 
-            if host.is_empty() {
-                return Err(ConfigError::ParseConfigFailed {
-                    path: config_path.clone(),
-                    details: String::from("llama_cpp.host must not be empty"),
+    let opencode = raw_config.opencode.as_ref().map(|raw| {
+        let path = resolve_config_path(&config_dir, raw.path.clone());
+        record_path_issue(
+            &mut capability_issues,
+            "opencode",
+            true,
+            path.is_file(),
+            &path,
+        );
+        OpencodeConfig { path }
+    });
+    let llama_cpp = raw_config.llama_cpp.as_ref().map(|raw| {
+        let server_path = resolve_config_path(&config_dir, raw.server_path.clone());
+        let fast_model_path = resolve_config_path(&config_dir, raw.fast_model_path.clone());
+        let quality_model_path = raw
+            .quality_model_path
+            .clone()
+            .map(|p| resolve_config_path(&config_dir, p));
+        let host = raw.host.trim().to_string();
+        record_path_issue(
+            &mut capability_issues,
+            "local_fast",
+            true,
+            server_path.is_file() && fast_model_path.is_file(),
+            if !server_path.is_file() {
+                &server_path
+            } else {
+                &fast_model_path
+            },
+        );
+        if let Some(path) = quality_model_path.as_ref() {
+            let unavailable_path = if !server_path.is_file() {
+                &server_path
+            } else {
+                path
+            };
+            record_path_issue(
+                &mut capability_issues,
+                "local_quality",
+                true,
+                server_path.is_file() && path.is_file(),
+                unavailable_path,
+            );
+        }
+        LlamaCppConfig {
+            server_path,
+            host,
+            port: raw.port,
+            fast_model_path,
+            quality_model_path,
+            inference_provider: raw.inference_provider,
+        }
+    });
+    let custom_openai = raw_config.custom_openai.as_ref().map(|raw| {
+        let auth_path = if raw.auth_path.as_os_str().is_empty() {
+            PathBuf::new()
+        } else {
+            resolve_config_path(&config_dir, raw.auth_path.clone())
+        };
+        let endpoint = raw.endpoint.trim().to_string();
+        if !valid_custom_endpoint(&endpoint) {
+            capability_issues.push(CapabilityConfigIssue {
+                capability: "custom_provider",
+                reason: String::from("custom_openai.endpoint is invalid"),
+            });
+        }
+        if auth_path.as_os_str().is_empty() {
+            capability_issues.push(CapabilityConfigIssue {
+                capability: "custom_provider",
+                reason: String::from(
+                    "auth path unavailable: HOME or absolute XDG_DATA_HOME is required",
+                ),
+            });
+        } else {
+            record_path_issue(
+                &mut capability_issues,
+                "custom_provider",
+                true,
+                auth_path.is_file(),
+                &auth_path,
+            );
+        }
+        CustomOpenAiConfig {
+            endpoint,
+            auth_path,
+        }
+    });
+    let completion = raw_config.completion.as_ref().map(|raw| {
+        let server_path = resolve_config_path(&config_dir, raw.server_path.clone());
+        let model_path = resolve_config_path(&config_dir, raw.model_path.clone());
+        record_path_issue(
+            &mut capability_issues,
+            "qwen_prediction",
+            true,
+            server_path.is_file() && model_path.is_file(),
+            if !server_path.is_file() {
+                &server_path
+            } else {
+                &model_path
+            },
+        );
+        CompletionConfig {
+            server_path,
+            model_path,
+            inference_provider: raw.inference_provider,
+        }
+    });
+
+    let response_backend = match raw_config.response_backend {
+        Some(RawResponseBackend::Opencode) => {
+            let Some(_raw_opencode) = raw_config.opencode else {
+                capability_issues.push(CapabilityConfigIssue {
+                    capability: "opencode",
+                    reason: String::from("[opencode] table is not configured"),
                 });
+                return Ok(RuntimeConfig {
+                    wake_word_model_path,
+                    parakeet_model_dir,
+                    silero_vad_model,
+                    silence_timeout_ms,
+                    wake_word_detection_threshold,
+                    local_tts,
+                    logging,
+                    telemetry,
+                    response_backend: ResponseBackendConfig::Unconfigured,
+                    opencode: opencode.clone(),
+                    llama_cpp: llama_cpp.clone(),
+                    custom_openai: custom_openai.clone(),
+                    completion: completion.clone(),
+                    capability_issues,
+                });
+            };
+            if let Some(config) = opencode.as_ref().filter(|config| config.path.is_file()) {
+                ResponseBackendConfig::Opencode {
+                    path: config.path.clone(),
+                }
+            } else {
+                ResponseBackendConfig::Unconfigured
             }
-
-            validate_existing_executable(&server_path, "llama_cpp.server_path")?;
-            validate_existing_file(&fast_model_path, "llama_cpp.fast_model_path")?;
-
-            ResponseBackendConfig::LlamaCpp {
-                server_path,
-                host,
-                port,
-                fast_model_path,
-                quality_model_path,
+        }
+        Some(RawResponseBackend::LlamaCpp) => {
+            let Some(_raw_llama_cpp) = raw_config.llama_cpp else {
+                capability_issues.push(CapabilityConfigIssue {
+                    capability: "local_fast",
+                    reason: String::from("[llama_cpp] table is not configured"),
+                });
+                return Ok(RuntimeConfig {
+                    wake_word_model_path,
+                    parakeet_model_dir,
+                    silero_vad_model,
+                    silence_timeout_ms,
+                    wake_word_detection_threshold,
+                    local_tts,
+                    logging,
+                    telemetry,
+                    response_backend: ResponseBackendConfig::Unconfigured,
+                    opencode: opencode.clone(),
+                    llama_cpp: llama_cpp.clone(),
+                    custom_openai: custom_openai.clone(),
+                    completion: completion.clone(),
+                    capability_issues,
+                });
+            };
+            if let Some(config) = llama_cpp
+                .as_ref()
+                .filter(|config| config.server_path.is_file() && config.fast_model_path.is_file())
+            {
+                ResponseBackendConfig::LlamaCpp {
+                    server_path: config.server_path.clone(),
+                    host: config.host.clone(),
+                    port: config.port,
+                    fast_model_path: config.fast_model_path.clone(),
+                    quality_model_path: config.quality_model_path.clone(),
+                }
+            } else {
+                ResponseBackendConfig::Unconfigured
             }
+        }
+        None => {
+            capability_issues.push(CapabilityConfigIssue {
+                capability: "response_provider",
+                reason: String::from("response_backend is not configured"),
+            });
+            ResponseBackendConfig::Unconfigured
         }
     };
 
@@ -434,8 +827,90 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
         wake_word_detection_threshold,
         local_tts,
         logging,
+        telemetry,
         response_backend,
+        opencode,
+        llama_cpp,
+        custom_openai,
+        completion,
+        capability_issues,
     })
+}
+
+fn default_runtime_config(config_dir: &Path, config_reason: Option<String>) -> RuntimeConfig {
+    let mut capability_issues = Vec::new();
+    if let Some(reason) = config_reason {
+        capability_issues.push(CapabilityConfigIssue {
+            capability: "config",
+            reason,
+        });
+    }
+    for capability in [
+        "response_provider",
+        "wake_word",
+        "vad",
+        "parakeet",
+        "tts",
+        "qwen_prediction",
+        "deep",
+        "review",
+    ] {
+        capability_issues.push(CapabilityConfigIssue {
+            capability,
+            reason: String::from("not configured"),
+        });
+    }
+    RuntimeConfig {
+        wake_word_model_path: resolve_config_path(
+            config_dir,
+            PathBuf::from("models/hey_livekit.onnx"),
+        ),
+        parakeet_model_dir: resolve_config_path(config_dir, PathBuf::from("models/parakeet-v2")),
+        silero_vad_model: resolve_config_path(config_dir, PathBuf::from(DEFAULT_SILERO_VAD_MODEL)),
+        silence_timeout_ms: DEFAULT_SILENCE_TIMEOUT_MS,
+        wake_word_detection_threshold: DEFAULT_WAKE_WORD_DETECTION_THRESHOLD,
+        local_tts: LocalTtsConfig {
+            enabled: false,
+            model_path: resolve_config_path(config_dir, PathBuf::from("models/tts/jarvis.onnx")),
+            worker_count: DEFAULT_TTS_WORKER_COUNT,
+            max_queue: DEFAULT_TTS_MAX_QUEUE,
+            sample_rate_hz: DEFAULT_TTS_SAMPLE_RATE_HZ,
+            max_duration_s: DEFAULT_TTS_MAX_DURATION_S,
+            output_gain_db: DEFAULT_TTS_OUTPUT_GAIN_DB,
+        },
+        logging: LoggingConfig { enabled: false },
+        telemetry: TelemetryConfig {
+            enabled: true,
+            max_bytes: DEFAULT_TELEMETRY_MAX_BYTES,
+            backup_count: DEFAULT_TELEMETRY_BACKUP_COUNT,
+        },
+        response_backend: ResponseBackendConfig::Unconfigured,
+        opencode: None,
+        llama_cpp: None,
+        custom_openai: None,
+        completion: None,
+        capability_issues,
+    }
+}
+
+fn record_path_issue(
+    issues: &mut Vec<CapabilityConfigIssue>,
+    capability: &'static str,
+    configured: bool,
+    available: bool,
+    path: &Path,
+) {
+    if available {
+        return;
+    }
+    issues.push(CapabilityConfigIssue {
+        capability,
+        reason: if configured {
+            format!("configured asset is unavailable: {}", path.display())
+        } else {
+            String::from("not configured")
+        },
+    });
 }
 
 fn default_silence_timeout_ms() -> u64 {
@@ -466,6 +941,92 @@ fn default_tts_output_gain_db() -> f32 {
     DEFAULT_TTS_OUTPUT_GAIN_DB
 }
 
+fn default_telemetry_enabled() -> bool {
+    true
+}
+
+fn default_telemetry_max_bytes() -> usize {
+    DEFAULT_TELEMETRY_MAX_BYTES
+}
+
+fn default_telemetry_backup_count() -> u8 {
+    DEFAULT_TELEMETRY_BACKUP_COUNT
+}
+
+fn default_private_endpoint() -> String {
+    String::from("https://chatgpt.com/backend-api/codex/responses")
+}
+
+fn valid_custom_endpoint(endpoint: &str) -> bool {
+    if endpoint.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        return false;
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let suffix = &rest[authority_end..];
+    if authority.contains('@') {
+        return false;
+    }
+    if scheme.eq_ignore_ascii_case("https") {
+        return matches!(
+            authority.to_ascii_lowercase().as_str(),
+            "chatgpt.com" | "chatgpt.com:443"
+        ) && suffix == "/backend-api/codex/responses";
+    }
+    if !scheme.eq_ignore_ascii_case("http") {
+        return false;
+    }
+    let host = authority
+        .strip_prefix('[')
+        .and_then(|v| v.split_once(']').map(|x| x.0))
+        .unwrap_or_else(|| authority.split(':').next().unwrap_or(""));
+    let port_ok = if let Some(ipv6) = authority.strip_prefix('[') {
+        ipv6.split_once(']').is_some_and(|(_, rest)| {
+            rest.is_empty()
+                || rest
+                    .strip_prefix(':')
+                    .is_some_and(|port| port.parse::<u16>().is_ok_and(|port| port != 0))
+        })
+    } else {
+        authority
+            .split_once(':')
+            .is_none_or(|(_, port)| port.parse::<u16>().is_ok_and(|port| port != 0))
+    };
+    port_ok
+        && host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+fn default_auth_path() -> PathBuf {
+    default_auth_path_from_env(|name| std::env::var_os(name), cfg!(windows))
+}
+
+fn default_auth_path_from_env<F>(mut get: F, windows: bool) -> PathBuf
+where
+    F: FnMut(&str) -> Option<std::ffi::OsString>,
+{
+    if windows {
+        get("APPDATA")
+            .or_else(|| {
+                get("USERPROFILE")
+                    .map(|p| PathBuf::from(p).join("AppData/Roaming").into_os_string())
+            })
+            .map(|base| PathBuf::from(base).join("opencode/auth.json"))
+            .unwrap_or_default()
+    } else {
+        get("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| get("HOME").map(|p| PathBuf::from(p).join(".local/share")))
+            .map(|p| p.join("opencode/auth.json"))
+            .unwrap_or_default()
+    }
+}
+
 fn resolve_config_path(config_dir: &Path, path: PathBuf) -> PathBuf {
     if path.is_absolute() {
         path
@@ -474,45 +1035,264 @@ fn resolve_config_path(config_dir: &Path, path: PathBuf) -> PathBuf {
     }
 }
 
-fn validate_existing_file(path: &Path, field: &'static str) -> Result<(), ConfigError> {
-    if path.is_file() {
-        return Ok(());
-    }
-
-    Err(ConfigError::MissingFile {
-        field,
-        path: path.to_path_buf(),
-    })
-}
-
-fn validate_existing_directory(path: &Path, field: &'static str) -> Result<(), ConfigError> {
-    if path.is_dir() {
-        return Ok(());
-    }
-
-    Err(ConfigError::MissingDirectory {
-        field,
-        path: path.to_path_buf(),
-    })
-}
-
-fn validate_existing_executable(path: &Path, field: &'static str) -> Result<(), ConfigError> {
-    if path.is_file() {
-        return Ok(());
-    }
-
-    Err(ConfigError::MissingExecutable {
-        field,
-        path: path.to_path_buf(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{load_runtime_config, ConfigError, ResponseBackendConfig};
+    use super::{
+        default_auth_path_from_env, default_private_endpoint, linux_app_dir_from_env,
+        load_runtime_config, platform_dirs_from_env, soul_path_for_config, valid_custom_endpoint,
+        ConfigError, InferencePolicy, RawCompletionConfig, RawLlamaCppConfig,
+        ResponseBackendConfig,
+    };
+    use std::collections::HashMap;
     use std::fs;
+
+    #[test]
+    fn private_endpoint_defaults_to_chatgpt_codex_responses() {
+        assert_eq!(
+            default_private_endpoint(),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+    }
+
+    #[test]
+    fn custom_endpoint_policy_matches_provider_transport_policy() {
+        for endpoint in [
+            "https://chatgpt.com/backend-api/codex/responses",
+            "HTTPS://CHATGPT.COM:443/backend-api/codex/responses",
+            "http://127.0.0.1:8080/responses",
+            "http://127.0.0.1:8080/responses?tag=a@b",
+            "http://[::1]:8080/responses",
+        ] {
+            assert!(
+                valid_custom_endpoint(endpoint),
+                "expected valid: {endpoint}"
+            );
+        }
+        for endpoint in [
+            "https://chatgpt.com/other",
+            "https://chatgpt.com/backend-api/codex/responses?redirect=1",
+            "http://example.com/responses",
+            "http://localhost:8080/responses",
+            "http://user@127.0.0.1/responses",
+            "file:///tmp/responses",
+        ] {
+            assert!(
+                !valid_custom_endpoint(endpoint),
+                "expected invalid: {endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_endpoint_is_normalized_and_invalid_policy_is_reported() {
+        let temp = TempDir::new();
+        let config_path = temp.path().join("config.toml");
+        let auth_path = temp.path().join("auth.json");
+        create_file(&auth_path);
+        fs::write(
+            &config_path,
+            format!(
+                "[custom_openai]\nendpoint = \"  https://example.test/responses  \"\nauth_path = \"{}\"\n",
+                escape_path(&auth_path),
+            ),
+        )
+        .expect("config fixture should be written");
+
+        let config = load_runtime_config(Some(&config_path))
+            .expect("invalid optional endpoint should not block other capabilities");
+
+        assert_eq!(
+            config
+                .custom_openai
+                .as_ref()
+                .expect("custom config")
+                .endpoint,
+            "https://example.test/responses",
+        );
+        assert!(config.capability_issues.iter().any(|issue| {
+            issue.capability == "custom_provider"
+                && issue.reason == "custom_openai.endpoint is invalid"
+        }));
+    }
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn resolves_linux_xdg_directories_without_process_environment() {
+        let vars = HashMap::from([
+            ("HOME", "/home/test"),
+            ("XDG_CONFIG_HOME", "/config"),
+            ("XDG_DATA_HOME", "/data"),
+            ("XDG_STATE_HOME", "/state"),
+            ("XDG_CACHE_HOME", "/cache"),
+        ]);
+        let dirs =
+            platform_dirs_from_env(|name| vars.get(name).map(std::ffi::OsString::from), false)
+                .expect("complete Linux environment should resolve");
+        assert_eq!(dirs.config, PathBuf::from("/config/voxgolem"));
+        assert_eq!(dirs.data, PathBuf::from("/data/voxgolem"));
+        assert_eq!(dirs.state, PathBuf::from("/state/voxgolem"));
+        assert_eq!(dirs.cache, PathBuf::from("/cache/voxgolem"));
+    }
+
+    #[test]
+    fn resolves_linux_defaults_from_home() {
+        let vars = HashMap::from([("HOME", "/home/test")]);
+        let dirs =
+            platform_dirs_from_env(|name| vars.get(name).map(std::ffi::OsString::from), false)
+                .expect("HOME should provide Linux defaults");
+        assert_eq!(dirs.config, PathBuf::from("/home/test/.config/voxgolem"));
+        assert_eq!(dirs.data, PathBuf::from("/home/test/.local/share/voxgolem"));
+        assert_eq!(
+            dirs.state,
+            PathBuf::from("/home/test/.local/state/voxgolem")
+        );
+        assert_eq!(dirs.cache, PathBuf::from("/home/test/.cache/voxgolem"));
+    }
+
+    #[test]
+    fn resolves_complete_linux_xdg_directories_without_home() {
+        let vars = HashMap::from([
+            ("XDG_CONFIG_HOME", "/config"),
+            ("XDG_DATA_HOME", "/data"),
+            ("XDG_STATE_HOME", "/state"),
+            ("XDG_CACHE_HOME", "/cache"),
+        ]);
+        let dirs =
+            platform_dirs_from_env(|name| vars.get(name).map(std::ffi::OsString::from), false)
+                .expect("absolute XDG directories should not require HOME");
+
+        assert_eq!(dirs.config, PathBuf::from("/config/voxgolem"));
+        assert_eq!(dirs.data, PathBuf::from("/data/voxgolem"));
+        assert_eq!(dirs.state, PathBuf::from("/state/voxgolem"));
+        assert_eq!(dirs.cache, PathBuf::from("/cache/voxgolem"));
+    }
+
+    #[test]
+    fn resolves_one_linux_xdg_directory_without_unrelated_environment() {
+        let vars = HashMap::from([("XDG_CONFIG_HOME", "/config")]);
+        assert_eq!(
+            linux_app_dir_from_env(
+                &mut |name| vars.get(name).map(std::ffi::OsString::from),
+                "XDG_CONFIG_HOME",
+                ".config",
+            )
+            .unwrap(),
+            PathBuf::from("/config/voxgolem")
+        );
+    }
+
+    #[test]
+    fn ignores_relative_linux_xdg_directories() {
+        let vars = HashMap::from([
+            ("HOME", "/home/test"),
+            ("XDG_CONFIG_HOME", "relative-config"),
+            ("XDG_DATA_HOME", "relative-data"),
+            ("XDG_STATE_HOME", "relative-state"),
+            ("XDG_CACHE_HOME", "relative-cache"),
+        ]);
+        let dirs =
+            platform_dirs_from_env(|name| vars.get(name).map(std::ffi::OsString::from), false)
+                .expect("HOME should provide fallbacks for relative XDG values");
+
+        assert_eq!(dirs.config, PathBuf::from("/home/test/.config/voxgolem"));
+        assert_eq!(dirs.data, PathBuf::from("/home/test/.local/share/voxgolem"));
+        assert_eq!(
+            dirs.state,
+            PathBuf::from("/home/test/.local/state/voxgolem")
+        );
+        assert_eq!(dirs.cache, PathBuf::from("/home/test/.cache/voxgolem"));
+    }
+
+    #[test]
+    fn resolves_soul_beside_overridden_config() {
+        assert_eq!(
+            soul_path_for_config(PathBuf::from("/opt/vox/config.toml")),
+            PathBuf::from("/opt/vox/SOUL.md")
+        );
+    }
+
+    #[test]
+    fn resolves_windows_appdata_and_localappdata() {
+        let vars = HashMap::from([
+            ("APPDATA", r"C:\Users\test\AppData\Roaming"),
+            ("LOCALAPPDATA", r"C:\Users\test\AppData\Local"),
+        ]);
+        let dirs =
+            platform_dirs_from_env(|name| vars.get(name).map(std::ffi::OsString::from), true)
+                .expect("Windows environment should resolve");
+        assert_eq!(
+            dirs.config,
+            PathBuf::from(r"C:\Users\test\AppData\Roaming").join("VoxGolem")
+        );
+        assert_eq!(
+            dirs.data,
+            PathBuf::from(r"C:\Users\test\AppData\Local").join("VoxGolem")
+        );
+        assert_eq!(dirs.state, dirs.data);
+        assert_eq!(dirs.cache, dirs.data);
+    }
+
+    #[test]
+    fn resolves_windows_directories_from_userprofile() {
+        let vars = HashMap::from([("USERPROFILE", r"C:\Users\test")]);
+        let dirs =
+            platform_dirs_from_env(|name| vars.get(name).map(std::ffi::OsString::from), true)
+                .expect("USERPROFILE should provide Windows directory fallbacks");
+
+        assert_eq!(
+            dirs.config,
+            PathBuf::from(r"C:\Users\test")
+                .join("AppData/Roaming")
+                .join("VoxGolem")
+        );
+        assert_eq!(
+            dirs.data,
+            PathBuf::from(r"C:\Users\test")
+                .join("AppData/Local")
+                .join("VoxGolem")
+        );
+    }
+
+    #[test]
+    fn resolves_default_auth_paths_from_platform_data_directories() {
+        let linux = HashMap::from([("XDG_DATA_HOME", "/data")]);
+        assert_eq!(
+            default_auth_path_from_env(|name| linux.get(name).map(std::ffi::OsString::from), false),
+            PathBuf::from("/data/opencode/auth.json")
+        );
+        let windows = HashMap::from([("USERPROFILE", r"C:\Users\test")]);
+        assert_eq!(
+            default_auth_path_from_env(
+                |name| windows.get(name).map(std::ffi::OsString::from),
+                true
+            ),
+            PathBuf::from(r"C:\Users\test")
+                .join("AppData/Roaming")
+                .join("opencode/auth.json")
+        );
+        assert_eq!(default_auth_path_from_env(|_| None, false), PathBuf::new());
+        assert_eq!(default_auth_path_from_env(|_| None, true), PathBuf::new());
+    }
+
+    #[test]
+    fn loads_repository_config_example_through_runtime_parser() {
+        let config_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("config.example.toml");
+
+        let config = load_runtime_config(Some(&config_path))
+            .expect("repository config.example.toml should deserialize");
+
+        assert_eq!(config.silence_timeout_ms, 1_500);
+        assert_eq!(config.wake_word_detection_threshold, 0.68);
+        assert!(config.telemetry.enabled);
+        let llama = config
+            .llama_cpp
+            .expect("example config should include llama_cpp settings");
+        assert_eq!(llama.host, "127.0.0.1");
+        assert_eq!(llama.port, 11_435);
+    }
 
     struct TempDir {
         path: PathBuf,
@@ -547,16 +1327,113 @@ mod tests {
     }
 
     #[test]
-    fn reports_missing_config_file() {
+    fn reports_missing_config_as_a_capability_issue() {
         let temp = TempDir::new();
         let missing_path = temp.path().join("missing.toml");
 
         let result = load_runtime_config(Some(&missing_path));
 
+        let config = result.expect("missing config must produce a zero-asset runtime config");
+        assert_eq!(config.response_backend, ResponseBackendConfig::Unconfigured);
+        assert!(config.capability_issues.iter().any(|issue| {
+            issue.capability == "config"
+                && issue.reason.contains(&missing_path.display().to_string())
+        }));
+    }
+
+    #[test]
+    fn defaults_telemetry_when_config_is_absent() {
+        let temp = TempDir::new();
+        let config = load_runtime_config(Some(&temp.path().join("missing.toml")))
+            .expect("missing config should use defaults");
+
         assert_eq!(
-            result,
-            Err(ConfigError::MissingConfigFile { path: missing_path })
+            config.telemetry,
+            super::TelemetryConfig {
+                enabled: true,
+                max_bytes: 10 * 1024 * 1024,
+                backup_count: 3,
+            }
         );
+        assert!(!config.logging.enabled);
+    }
+
+    #[test]
+    fn validates_standalone_llama_loopback_host_without_selected_backend() {
+        let temp = TempDir::new();
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
+            "response_backend = \"opencode\"\n[llama_cpp]\nserver_path = \"missing\"\nhost = \"0.0.0.0\"\nport = 11435\nfast_model_path = \"fast\"\n",
+        )
+        .expect("config should be written");
+
+        assert!(matches!(
+            load_runtime_config(Some(&path)),
+            Err(ConfigError::ParseConfigFailed { details, .. })
+                if details.contains("llama_cpp.host must be a supported loopback host")
+        ));
+    }
+
+    #[test]
+    fn validates_standalone_llama_port_without_selected_backend() {
+        let temp = TempDir::new();
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
+            "[llama_cpp]\nserver_path = \"missing\"\nhost = \"127.0.0.1\"\nport = 0\nfast_model_path = \"fast\"\n",
+        )
+        .expect("config should be written");
+
+        assert!(matches!(
+            load_runtime_config(Some(&path)),
+            Err(ConfigError::ParseConfigFailed { details, .. })
+                if details.contains("llama_cpp.port must be greater than zero")
+        ));
+    }
+
+    #[test]
+    fn loads_explicit_telemetry_values() {
+        let temp = TempDir::new();
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
+            "[telemetry]\nenabled = false\nmax_bytes = 2048\nbackup_count = 0\n",
+        )
+        .expect("telemetry config should be written");
+
+        let config = load_runtime_config(Some(&path)).expect("valid telemetry config should load");
+        assert!(!config.telemetry.enabled);
+        assert_eq!(config.telemetry.max_bytes, 2048);
+        assert_eq!(config.telemetry.backup_count, 0);
+    }
+
+    #[test]
+    fn rejects_unknown_telemetry_fields() {
+        let temp = TempDir::new();
+        let path = temp.path().join("config.toml");
+        fs::write(&path, "[telemetry]\nunknown = true\n").expect("config should be written");
+
+        assert!(matches!(
+            load_runtime_config(Some(&path)),
+            Err(ConfigError::ParseConfigFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_telemetry_bounds() {
+        for (field, value) in [("max_bytes", "1023"), ("backup_count", "11")] {
+            let temp = TempDir::new();
+            let path = temp.path().join("config.toml");
+            fs::write(&path, format!("[telemetry]\n{field} = {value}\n"))
+                .expect("config should be written");
+
+            assert!(matches!(
+                load_runtime_config(Some(&path)),
+                Err(ConfigError::ParseConfigFailed { details, .. })
+                    if details.starts_with("telemetry.")
+            ));
+        }
     }
 
     #[test]
@@ -576,7 +1453,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_missing_required_wake_word_model_file() {
+    fn reports_unavailable_configured_wake_word_model_file() {
         let temp = TempDir::new();
         let model_dir = temp.path().join("models");
         let silero_vad_model = model_dir.join("silero-vad.onnx");
@@ -601,13 +1478,13 @@ mod tests {
 
         let result = load_runtime_config(Some(&config_path));
 
-        assert_eq!(
-            result,
-            Err(ConfigError::MissingFile {
-                field: "wake_word_model_path",
-                path: missing_wake_word_model_path,
-            })
-        );
+        let config = result.expect("missing wake word asset must not block other capabilities");
+        assert!(config.capability_issues.iter().any(|issue| {
+            issue.capability == "wake_word"
+                && issue
+                    .reason
+                    .contains(&missing_wake_word_model_path.display().to_string())
+        }));
     }
 
     #[test]
@@ -808,7 +1685,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_missing_required_silero_vad_model_file() {
+    fn reports_unavailable_configured_silero_vad_model_file() {
         let temp = TempDir::new();
         let model_dir = temp.path().join("models");
         let wake_word_model_path = model_dir.join("hey_livekit.onnx");
@@ -833,13 +1710,13 @@ mod tests {
 
         let result = load_runtime_config(Some(&config_path));
 
-        assert_eq!(
-            result,
-            Err(ConfigError::MissingFile {
-                field: "silero_vad_model",
-                path: missing_silero_vad_model,
-            })
-        );
+        let config = result.expect("missing VAD asset must not block other capabilities");
+        assert!(config.capability_issues.iter().any(|issue| {
+            issue.capability == "vad"
+                && issue
+                    .reason
+                    .contains(&missing_silero_vad_model.display().to_string())
+        }));
     }
 
     #[test]
@@ -867,11 +1744,34 @@ mod tests {
 
         let result = load_runtime_config(Some(&config_path));
 
+        let config = result.expect("missing optional llama table must remain nonfatal");
+        assert_eq!(config.response_backend, ResponseBackendConfig::Unconfigured);
+        assert!(config
+            .capability_issues
+            .iter()
+            .any(|issue| issue.capability == "local_fast"));
+    }
+
+    #[test]
+    fn selected_llama_backend_with_missing_assets_is_unconfigured_once() {
+        let temp = TempDir::new();
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            "response_backend = \"llama_cpp\"\n[llama_cpp]\nserver_path = \"missing-server\"\nhost = \"127.0.0.1\"\nport = 11435\nfast_model_path = \"missing-model\"\n",
+        )
+        .expect("config fixture should be written");
+
+        let config = load_runtime_config(Some(&config_path)).expect("config should load");
+
+        assert_eq!(config.response_backend, ResponseBackendConfig::Unconfigured);
         assert_eq!(
-            result,
-            Err(ConfigError::MissingBackendConfig {
-                backend: "llama_cpp",
-            })
+            config
+                .capability_issues
+                .iter()
+                .filter(|issue| issue.capability == "local_fast")
+                .count(),
+            1
         );
     }
 
@@ -900,12 +1800,12 @@ mod tests {
 
         let result = load_runtime_config(Some(&config_path));
 
-        assert_eq!(
-            result,
-            Err(ConfigError::MissingBackendConfig {
-                backend: "opencode",
-            })
-        );
+        let config = result.expect("missing optional OpenCode table must remain nonfatal");
+        assert_eq!(config.response_backend, ResponseBackendConfig::Unconfigured);
+        assert!(config
+            .capability_issues
+            .iter()
+            .any(|issue| issue.capability == "opencode"));
     }
 
     #[test]
@@ -944,7 +1844,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_missing_required_tts_model_file() {
+    fn reports_unavailable_configured_tts_model_file() {
         let temp = TempDir::new();
         let model_dir = temp.path().join("models");
         let wake_word_model_path = model_dir.join("hey_livekit.onnx");
@@ -973,13 +1873,13 @@ mod tests {
 
         let result = load_runtime_config(Some(&config_path));
 
-        assert_eq!(
-            result,
-            Err(ConfigError::MissingFile {
-                field: "tts.model_path",
-                path: missing_tts_model_path,
-            })
-        );
+        let config = result.expect("missing TTS asset must not block response capabilities");
+        assert!(config.capability_issues.iter().any(|issue| {
+            issue.capability == "tts"
+                && issue
+                    .reason
+                    .contains(&missing_tts_model_path.display().to_string())
+        }));
     }
 
     #[test]
@@ -1145,6 +2045,71 @@ mod tests {
                 quality_model_path: None,
             }
         );
+    }
+
+    #[test]
+    fn reports_quality_unavailable_when_shared_llama_server_is_missing() {
+        let temp = TempDir::new();
+        let missing_server = temp.path().join("missing-llama-server");
+        let fast_model = temp.path().join("fast.gguf");
+        let quality_model = temp.path().join("quality.gguf");
+        let config_path = temp.path().join("config.toml");
+        create_file(&fast_model);
+        create_file(&quality_model);
+        fs::write(
+            &config_path,
+            format!(
+                "[llama_cpp]\nserver_path = \"{}\"\nhost = \"127.0.0.1\"\nport = 11435\nfast_model_path = \"{}\"\nquality_model_path = \"{}\"\n",
+                escape_path(&missing_server),
+                escape_path(&fast_model),
+                escape_path(&quality_model),
+            ),
+        )
+        .expect("config fixture should be written");
+
+        let config = load_runtime_config(Some(&config_path)).expect("config should load");
+
+        assert!(config.capability_issues.iter().any(|issue| {
+            issue.capability == "local_quality"
+                && issue.reason.contains(&missing_server.display().to_string())
+        }));
+    }
+
+    #[test]
+    fn inference_provider_defaults_to_auto_independently() {
+        let llama: RawLlamaCppConfig = toml::from_str(
+            "server_path = 'server'\nhost = 'localhost'\nport = 1\nfast_model_path = 'fast'",
+        )
+        .expect("llama_cpp config should parse");
+        let completion: RawCompletionConfig =
+            toml::from_str("server_path = 'server'\nmodel_path = 'model'")
+                .expect("completion config should parse");
+
+        assert_eq!(llama.inference_provider, InferencePolicy::Auto);
+        assert_eq!(completion.inference_provider, InferencePolicy::Auto);
+    }
+
+    #[test]
+    fn inference_provider_accepts_explicit_values() {
+        for (value, expected) in [
+            ("auto", InferencePolicy::Auto),
+            ("cuda", InferencePolicy::Cuda),
+            ("cpu", InferencePolicy::Cpu),
+        ] {
+            let config: RawCompletionConfig = toml::from_str(&format!(
+                "server_path = 'server'\nmodel_path = 'model'\ninference_provider = '{value}'"
+            ))
+            .expect("inference provider should parse");
+            assert_eq!(config.inference_provider, expected);
+        }
+    }
+
+    #[test]
+    fn inference_provider_rejects_invalid_values() {
+        let result: Result<RawCompletionConfig, _> = toml::from_str(
+            "server_path = 'server'\nmodel_path = 'model'\ninference_provider = 'metal'",
+        );
+        assert!(result.is_err());
     }
 
     fn create_file(path: &Path) {

@@ -1,30 +1,45 @@
-# Local voice assets
+# Linux example. All tables are optional; paths are relative to this file.
+# Model files are intentionally external: Vox Golem does not download them.
 wake_word_model_path = "models/hey_livekit.onnx"
 parakeet_model_dir = "models/parakeet-v2"
 silero_vad_model = "models/silero-vad.onnx"
 silence_timeout_ms = 1500
 wake_word_detection_threshold = 0.68
-
-response_backend = "opencode"
-
-[logging]
-enabled = false
+response_backend = "llama_cpp"
 
 [opencode]
-path = "opencode/opencode.exe"
+path = "opencode/opencode"
 
 [llama_cpp]
-server_path = "llama/bin/llama-server.exe"
+server_path = "llama/bin/llama-server"
 host = "127.0.0.1"
 port = 11435
-fast_model_path = "models/llama/gemma-3-1b-it-Q4_K_M.gguf"
-quality_model_path = "models/llama/google_gemma-3-4b-it-Q6_K_L.gguf"
+fast_model_path = "models/llama/fast.gguf"
+quality_model_path = "models/llama/quality.gguf"
+inference_provider = "auto" # auto, cuda, or cpu
+
+[custom_openai]
+endpoint = "https://chatgpt.com/backend-api/codex/responses"
+auth_path = "/home/user/.local/share/opencode/auth.json"
+
+[completion]
+server_path = "llama/bin/llama-server"
+model_path = "models/llama/completion.gguf"
+inference_provider = "auto" # auto, cuda, or cpu
 
 [tts]
-enabled = true
+enabled = false
 model_path = "models/tts/jarvis.onnx"
 worker_count = 1
 max_queue = 8
 sample_rate_hz = 22050
 max_duration_s = 300
 output_gain_db = 3
+
+[telemetry]
+enabled = true
+max_bytes = 10485760
+backup_count = 3
+
+[logging]
+enabled = false
