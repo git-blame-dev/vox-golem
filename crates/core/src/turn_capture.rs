@@ -58,6 +58,10 @@ impl TurnCaptureState {
         self.utterance.len()
     }
 
+    pub fn utterance_samples(&self) -> &[f32] {
+        self.utterance.as_slice()
+    }
+
     pub fn record_sleeping_frame(&mut self, frame: &[f32]) {
         self.preroll.append_frame(frame);
     }
@@ -215,5 +219,18 @@ mod tests {
         assert_eq!(state.preroll_len(), 4);
         assert_eq!(state.utterance_len(), 2);
         assert_eq!(state.finish_utterance(), vec![0.5, 0.6]);
+    }
+
+    #[test]
+    fn exposes_current_utterance_samples_without_finishing_capture() {
+        let config = TurnCaptureConfig::new(4, 8).expect("valid capture config");
+        let mut state = TurnCaptureState::new(config).expect("capture state should initialize");
+        state.begin_utterance_without_preroll();
+        state
+            .record_listening_frame(&[0.1, 0.2])
+            .expect("listening frame should fit");
+
+        assert_eq!(state.utterance_samples(), &[0.1, 0.2]);
+        assert!(state.capturing_utterance());
     }
 }

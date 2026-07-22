@@ -76,6 +76,26 @@ pub async fn terminate_tokio(
         .map(|_| ())
 }
 
+pub fn terminate_tokio_on_drop(mut child: tokio::process::Child, ownership: ProcessOwnership) {
+    if ownership == ProcessOwnership::Owned {
+        if let Some(pid) = child.id() {
+            let _ = platform::terminate_group(pid, true);
+        }
+    }
+    let _ = child.start_kill();
+    let _ = std::thread::Builder::new()
+        .name(String::from("managed-process-reaper"))
+        .spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            let _ = runtime.block_on(child.wait());
+        });
+}
+
 impl ManagedProcess {
     /// Spawn a child in a new process group on Unix.
     pub fn spawn_owned(command: &mut Command) -> io::Result<Self> {
