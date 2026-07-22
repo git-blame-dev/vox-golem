@@ -26,12 +26,14 @@
           "$RESOURCE/**"
         ]
       },
-      "csp": null
+      "csp": "default-src 'self' tauri: asset:; connect-src 'self' ipc:; img-src 'self' asset: data:; media-src 'self' asset: data:; style-src 'self' 'unsafe-inline'; script-src 'self'",
+      "devCsp": "default-src 'self' tauri: asset:; connect-src 'self' ipc: http://localhost:5173 ws://localhost:5173; img-src 'self' asset: data:; media-src 'self' asset: data:; style-src 'self' 'unsafe-inline'; script-src 'self'"
     }
   },
   "bundle": {
     "active": true,
     "icon": [
+      "icons/icon.png",
       "icons/icon.ico"
     ],
     "targets": "all"
