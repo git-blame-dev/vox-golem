@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-  "apps/windows-tauri/src-tauri",
+  "apps/desktop-tauri/src-tauri",
   "crates/audio",
   "crates/core",
   "crates/model",
