@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 #![deny(unused_must_use)]
 
+pub mod agent_pipeline;
+pub mod assistant;
 pub mod config;
 pub mod runtime;
 pub mod session;
