@@ -3,7 +3,7 @@ name: Release
 on:
   workflow_run:
     workflows:
-      - CI
+      - Linux CI
     types:
       - completed
     branches:
@@ -96,7 +96,7 @@ jobs:
               release_assets="$(gh release view "$existing_tag" --repo "$REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null || true)"
               missing_assets=false
 
-              for required_asset in "vox-golem-${existing_tag}.zip" 'SHA256SUMS'; do
+              for required_asset in "vox-golem-linux-${existing_tag}.zip" 'SHA256SUMS'; do
                 if ! printf '%s\n' "$release_assets" | grep -Fxq "$required_asset"; then
                   printf 'Existing release %s is missing required asset %s.\n' "$existing_tag" "$required_asset" >&2
                   missing_assets=true
@@ -136,7 +136,7 @@ jobs:
             [ -n "$path" ] || continue
 
             case "$path" in
-              Makefile|apps/*|crates/*|frontend/*|Cargo.toml|Cargo.lock|bun.lock|package.json|tsconfig.base.json|config.example.toml)
+              Makefile|.github/workflows/ci.yml|.github/workflows/release.yml|apps/*|crates/*|frontend/*|Cargo.toml|Cargo.lock|bun.lock|package.json|tsconfig.base.json)
                 has_release_artifact_input_change=true
                 ;;
             esac
@@ -171,14 +171,26 @@ jobs:
             exit 1
           fi
 
-      - name: Download Windows app artifact from CI
+      - name: Download Linux app artifact from CI
         if: steps.release_scope.outputs.should_publish == 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: vox-golem-windows-app
-          path: package/VoxGolem
+          name: vox-golem-linux
+          path: package
           github-token: ${{ github.token }}
           run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Extract Linux app artifact
+        if: steps.release_scope.outputs.should_publish == 'true'
+        run: |
+           tar -C package -xzf package/vox-golem-linux.tar.gz
+           rm package/vox-golem-linux.tar.gz
+           test -x package/VoxGolem/vox-golem
+           test "$(stat -c '%a' package/VoxGolem/vox-golem)" = 755
+           for provider in libonnxruntime_providers_shared.so libonnxruntime_providers_cuda.so; do
+             test -f "package/VoxGolem/$provider"
+             test "$(stat -c '%a' "package/VoxGolem/$provider")" = 755
+           done
 
       - name: Create release zip
         if: steps.release_scope.outputs.should_publish == 'true'
@@ -186,7 +198,8 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           mkdir -p dist
-          (cd package && zip -r -D "../dist/vox-golem-${VERSION}.zip" VoxGolem)
+          test -x package/VoxGolem/vox-golem
+          (cd package && zip -r -D "../dist/vox-golem-linux-${VERSION}.zip" VoxGolem)
 
       - name: Verify release zip contents
         if: steps.release_scope.outputs.should_publish == 'true'
@@ -194,30 +207,17 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          zip_path="dist/vox-golem-${VERSION}.zip"
+          zip_path="dist/vox-golem-linux-${VERSION}.zip"
           mapfile -t actual_files < <(zipinfo -1 "$zip_path" | sort)
 
           printf 'Packaged files in %s:\n' "$zip_path"
           printf '%s\n' "${actual_files[@]}"
 
-          required_files=(
-            "VoxGolem/config.toml"
-            "VoxGolem/vox-golem.exe"
-            "VoxGolem/onnxruntime_providers_cuda.dll"
-            "VoxGolem/onnxruntime_providers_shared.dll"
-            "VoxGolem/cublas64_12.dll"
-            "VoxGolem/cublasLt64_12.dll"
-            "VoxGolem/cudart64_12.dll"
-            "VoxGolem/cudnn64_9.dll"
-            "VoxGolem/cudnn_adv64_9.dll"
-            "VoxGolem/cudnn_cnn64_9.dll"
-            "VoxGolem/cudnn_engines_precompiled64_9.dll"
-            "VoxGolem/cudnn_engines_runtime_compiled64_9.dll"
-            "VoxGolem/cudnn_graph64_9.dll"
-            "VoxGolem/cudnn_heuristic64_9.dll"
-            "VoxGolem/cudnn_ops64_9.dll"
-            "VoxGolem/cufft64_11.dll"
-          )
+           required_files=(
+             "VoxGolem/vox-golem"
+             "VoxGolem/libonnxruntime_providers_shared.so"
+             "VoxGolem/libonnxruntime_providers_cuda.so"
+           )
 
           missing_files=()
           for required_file in "${required_files[@]}"; do
@@ -240,13 +240,7 @@ jobs:
             exit 1
           fi
 
-          allowed_files=(
-            "${required_files[@]}"
-            "VoxGolem/DirectML.dll"
-            "VoxGolem/onnxruntime.dll"
-            "VoxGolem/onnxruntime_providers_nv_tensorrt_rtx.dll"
-            "VoxGolem/onnxruntime_providers_tensorrt.dll"
-          )
+          allowed_files=("${required_files[@]}")
 
           unexpected_files=()
           for actual_file in "${actual_files[@]}"; do
@@ -275,7 +269,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           cd dist
-          sha256sum "vox-golem-${VERSION}.zip" > SHA256SUMS
+          sha256sum "vox-golem-linux-${VERSION}.zip" > SHA256SUMS
 
       - name: Generate release notes
         if: steps.release_scope.outputs.should_publish == 'true'
@@ -305,15 +299,13 @@ jobs:
             fi
 
             printf '\n## Artifacts\n\n'
-            printf -- "- Windows app: \`VoxGolem/vox-golem.exe\`\n"
-            printf -- "- Config template: \`VoxGolem/config.toml\`\n"
-            printf -- "- CUDA/cuDNN runtime DLLs staged beside the app executable\n"
+            printf -- "- Linux app: \`VoxGolem/vox-golem\`\n"
+            printf -- "- Runtime models and system libraries are external dependencies\n"
             printf -- "- Checksums: \`SHA256SUMS\`\n"
 
             printf '\n## Verification\n\n'
-            printf -- "- CI \`workflow-lint\`\n"
-            printf -- "- CI \`linux-checks\`\n"
-            printf -- "- CI \`windows-artifact\`\n"
+            printf -- "- Linux CI \`test\`\n"
+            printf -- "- Linux CI \`native-artifact\`\n"
 
             printf '\n## Full changelog\n\n'
 

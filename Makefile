@@ -2,10 +2,14 @@
 
 SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
+export CARGO_INCREMENTAL ?= 0
 
 WINDOWS_TARGET := x86_64-pc-windows-msvc
-TARGET_RELEASE_DIR := $(CURDIR)/target/$(WINDOWS_TARGET)/release
-STAGED_RELEASE_DIR := $(CURDIR)/dist/VoxGolem
+LINUX_RELEASE_DIR := $(CURDIR)/target/release
+LINUX_STAGED_RELEASE_DIR := $(CURDIR)/dist/VoxGolem
+LINUX_ORT_LIB_DIR ?= $(if $(ORT_LIB_PATH),$(ORT_LIB_PATH),$(LINUX_RELEASE_DIR))
+WINDOWS_RELEASE_DIR := $(CURDIR)/target/$(WINDOWS_TARGET)/release
+WINDOWS_STAGED_RELEASE_DIR := $(CURDIR)/dist/VoxGolem-windows
 IMPORT_LIB_DIR := $(CURDIR)/target/import-libs
 CROSS_SHIM_DIR := $(CURDIR)/target/cross-shims
 ESPEAK_COMPAT_HEADER := $(CROSS_SHIM_DIR)/espeak_windows_compat.h
@@ -37,7 +41,6 @@ CUDA_RUNTIME_DLLS := \
 	cufft64_11.dll
 
 REQUIRED_DIST_FILES := \
-	config.toml \
 	vox-golem.exe \
 	onnxruntime_providers_cuda.dll \
 	onnxruntime_providers_shared.dll \
@@ -54,17 +57,25 @@ REQUIRED_DIST_FILES := \
 	cudnn_ops64_9.dll \
 	cufft64_11.dll
 
+LINUX_ORT_PROVIDER_LIBS := \
+	libonnxruntime_providers_shared.so \
+	libonnxruntime_providers_cuda.so
+
 .DEFAULT_GOAL := help
 
-.PHONY: help test check-pc-tools pc pc-dist dist verify-pc-dist app-dev clean
+.PHONY: help test check-linux-tools app app-smoke packaged-smoke app-dev linux dist verify-dist check-pc-tools pc pc-dist verify-pc-dist clean
 
 help:
 	@printf '%s\n' 'Targets:'
+	@printf '%s\n' '  make app      Run the native Linux Tauri app'
+	@printf '%s\n' '  make app-smoke Build and require the native Linux shell-ready marker'
+	@printf '%s\n' '  make packaged-smoke Run the staged Linux package from a separate directory'
+	@printf '%s\n' '  make app-dev  Run only the frontend development server'
 	@printf '%s\n' '  make test     Run deterministic Linux frontend and Rust checks'
-	@printf '%s\n' '  make pc       Cross-build the Windows Tauri app from Linux'
-	@printf '%s\n' '  make pc-dist  Build and stage Windows files under dist/VoxGolem'
-	@printf '%s\n' '  make dist     Build and stage all release files under dist/'
-	@printf '%s\n' '  make app-dev  Run the frontend development server'
+	@printf '%s\n' '  make linux    Build the native Linux Tauri binary'
+	@printf '%s\n' '  make dist     Stage the Linux binary under dist/VoxGolem'
+	@printf '%s\n' '  make pc       Cross-build the optional Windows app from Linux'
+	@printf '%s\n' '  make pc-dist  Stage optional Windows files under dist/VoxGolem-windows'
 	@printf '%s\n' '  make clean    Remove generated build and staging output'
 
 test:
@@ -73,9 +84,113 @@ test:
 	bun run lint
 	bun run test
 	bun run build
-	cargo fmt --check
-	cargo clippy -p voxgolem-audio -p voxgolem-core -p voxgolem-model -p voxgolem-platform --all-targets --all-features -- -D warnings
-	cargo test -p voxgolem-audio -p voxgolem-core -p voxgolem-model -p voxgolem-platform
+	cargo fmt --all -- --check
+	cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+	cargo test --locked --workspace
+
+check-linux-tools:
+	@command -v cargo-tauri >/dev/null || { printf '%s\n' 'Missing Tauri CLI. Install with: cargo install tauri-cli --version 2.11.1 --locked' >&2; exit 1; }
+	@pkg-config --exists webkit2gtk-4.1 gtk+-3.0 || { printf '%s\n' 'Missing Linux Tauri development libraries (WebKitGTK 4.1 and GTK 3).' >&2; exit 1; }
+
+app: check-linux-tools
+	bun install --frozen-lockfile
+	cargo tauri dev -- --locked
+
+app-smoke: linux
+	@set -eu; \
+		app_pid=; \
+		smoke_log='/tmp/vox-golem-app-smoke.'$$$$'.log'; \
+		smoke_config='/tmp/vox-golem-app-smoke-config.'$$$$; \
+		cleanup() { \
+			status="$$1"; \
+			if [ -n "$$app_pid" ] && kill -0 "$$app_pid" 2>/dev/null; then \
+				kill -TERM -- "-$$app_pid" 2>/dev/null || true; \
+				for _ in 1 2 3 4 5; do \
+					kill -0 "$$app_pid" 2>/dev/null || break; \
+					sleep 1; \
+				 done; \
+				kill -KILL -- "-$$app_pid" 2>/dev/null || true; \
+				wait "$$app_pid" 2>/dev/null || true; \
+			fi; \
+			if [ "$$status" -ne 0 ] && [ -f "$$smoke_log" ]; then \
+				printf '%s\n' 'Linux app smoke diagnostics:' >&2; \
+				cat "$$smoke_log" >&2 || true; \
+			fi; \
+			rm -f "$$smoke_config" "$$smoke_log" || true; \
+		}; \
+		trap 'exit 130' INT; trap 'exit 143' TERM; \
+		trap 'status=$$?; cleanup "$$status"; exit "$$status"' EXIT; \
+		setsid env VOXGOLEM_CONFIG_PATH="$$smoke_config" '$(LINUX_RELEASE_DIR)/vox-golem' >"$$smoke_log" 2>&1 & app_pid=$$!; \
+		for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do \
+			sleep 1; \
+			state="$$(ps -o stat= -p "$$app_pid" 2>/dev/null || true)"; \
+			if ! kill -0 "$$app_pid" 2>/dev/null || case "$$state" in Z*) true;; *) false;; esac; then \
+				wait "$$app_pid" || status=$$?; \
+				printf 'Linux app smoke failed: process exited before the 30-second deadline (status %s). Output: %s\n' "$${status:-unknown}" "$$smoke_log" >&2; \
+				exit 1; \
+			fi; \
+			if grep -q 'VOXGOLEM_STARTUP_READY' "$$smoke_log"; then \
+				printf '%s\n' 'Linux app smoke passed: startup-ready marker observed.'; \
+				exit 0; \
+			fi; \
+		done; \
+		printf 'Linux app smoke timed out after 30 seconds: startup-ready marker was not observed. Output: %s\n' "$$smoke_log" >&2; \
+		exit 1
+
+app-dev:
+	bun run dev
+
+linux: check-linux-tools
+	bun install --frozen-lockfile
+	cargo tauri build --no-bundle -- --locked
+	@printf 'Linux app: %s\n' '$(LINUX_RELEASE_DIR)/vox-golem'
+
+dist: linux
+	@rm -rf '$(LINUX_STAGED_RELEASE_DIR)'
+	@mkdir -p '$(LINUX_STAGED_RELEASE_DIR)'
+	cp '$(LINUX_RELEASE_DIR)/vox-golem' '$(LINUX_STAGED_RELEASE_DIR)/vox-golem'
+	@for file in $(LINUX_ORT_PROVIDER_LIBS); do \
+		source='$(LINUX_ORT_LIB_DIR)/'$$file; \
+		if [ ! -f "$$source" ]; then \
+			printf 'Missing TTS-capable ONNX Runtime provider asset: %s (expected in exact LINUX_ORT_LIB_DIR=%s; set ORT_LIB_PATH to override)\n' "$$file" '$(LINUX_ORT_LIB_DIR)' >&2; \
+			exit 1; \
+		fi; \
+		install -m 0755 "$$source" '$(LINUX_STAGED_RELEASE_DIR)/'$$file; \
+	done
+	@$(MAKE) --no-print-directory verify-dist
+
+verify-dist:
+	@test -x '$(LINUX_STAGED_RELEASE_DIR)/vox-golem' || { printf 'Missing staged Linux binary: %s\n' '$(LINUX_STAGED_RELEASE_DIR)/vox-golem' >&2; exit 1; }
+	@for file in $(LINUX_ORT_PROVIDER_LIBS); do \
+		test -f '$(LINUX_STAGED_RELEASE_DIR)'/$$file || { printf 'Missing staged ONNX Runtime provider: %s\n' "$$file" >&2; exit 1; }; \
+		test "$$(stat -c '%a' '$(LINUX_STAGED_RELEASE_DIR)'/$$file)" = 755 || { printf 'Provider has incorrect mode: %s\n' "$$file" >&2; exit 1; }; \
+	done
+	@test "$$(find '$(LINUX_STAGED_RELEASE_DIR)' -maxdepth 1 -type f | wc -l)" -eq 3 || { printf '%s\n' 'Unexpected files in Linux package.' >&2; exit 1; }
+	@printf 'vox-golem\t%s bytes\n' "$$(stat -c '%s' '$(LINUX_STAGED_RELEASE_DIR)/vox-golem')"
+
+packaged-smoke: verify-dist
+	@set -eu; \
+		smoke_pid=; smoke_log="/tmp/vox-golem-packaged-smoke.$$$$.log"; smoke_config="$$(mktemp /tmp/vox-golem-packaged-config.XXXXXX)"; \
+		cleanup() { \
+			status="$$1"; \
+			if [ -n "$$smoke_pid" ] && kill -0 "$$smoke_pid" 2>/dev/null; then \
+				kill -TERM -- "-$$smoke_pid" 2>/dev/null || true; sleep 1; kill -KILL -- "-$$smoke_pid" 2>/dev/null || true; wait "$$smoke_pid" 2>/dev/null || true; \
+			fi; \
+			if [ "$$status" -ne 0 ] && [ -f "$$smoke_log" ]; then \
+				printf '%s\n' 'Packaged Linux smoke diagnostics:' >&2; \
+				cat "$$smoke_log" >&2 || true; \
+			fi; \
+			rm -f "$$smoke_config" "$$smoke_log" || true; \
+		}; \
+		trap 'exit 130' INT; trap 'exit 143' TERM; \
+		trap 'status=$$?; cleanup "$$status"; exit "$$status"' EXIT; \
+		(cd /tmp && setsid env VOXGOLEM_CONFIG_PATH="$$smoke_config" '$(LINUX_STAGED_RELEASE_DIR)/vox-golem') >"$$smoke_log" 2>&1 & smoke_pid=$$!; \
+		for _ in $$(seq 1 30); do \
+			sleep 1; \
+			if grep -q 'VOXGOLEM_STARTUP_READY' "$$smoke_log"; then printf '%s\n' 'Packaged Linux smoke passed: startup-ready marker observed.'; exit 0; fi; \
+			if ! kill -0 "$$smoke_pid" 2>/dev/null; then printf 'Packaged Linux smoke failed; output: %s\n' "$$smoke_log" >&2; exit 1; fi; \
+		done; \
+		printf 'Packaged Linux smoke timed out; output: %s\n' "$$smoke_log" >&2; exit 1
 
 check-pc-tools:
 	@command -v cargo-xwin >/dev/null || { printf '%s\n' 'Missing cargo-xwin. Install with: cargo install cargo-xwin --locked' >&2; exit 1; }
@@ -103,41 +218,35 @@ pc: check-pc-tools $(ESPEAK_COMPAT_HEADER) $(STDCXX_IMPORT_LIB) $(DIRECTML_IMPOR
 	TARGET_CFLAGS="$${TARGET_CFLAGS:+$${TARGET_CFLAGS} }/FI$(ESPEAK_COMPAT_HEADER)" \
 	TARGET_CXXFLAGS="$${TARGET_CXXFLAGS:+$${TARGET_CXXFLAGS} }/FI$(ESPEAK_COMPAT_HEADER)" \
 	RUSTFLAGS="$${RUSTFLAGS:+$${RUSTFLAGS} }-L native=$(IMPORT_LIB_DIR)" \
-	cargo tauri build --runner cargo-xwin --target $(WINDOWS_TARGET) --no-bundle
-	@printf 'Windows app: %s\n' '$(TARGET_RELEASE_DIR)/vox-golem.exe'
+	cargo tauri build --runner cargo-xwin --target $(WINDOWS_TARGET) --no-bundle -- --locked
+	@printf 'Windows app: %s\n' '$(WINDOWS_RELEASE_DIR)/vox-golem.exe'
 
 pc-dist: pc
-	@rm -rf '$(STAGED_RELEASE_DIR)'
-	@mkdir -p '$(STAGED_RELEASE_DIR)'
-	cp '$(CURDIR)/config.example.toml' '$(STAGED_RELEASE_DIR)/config.toml'
-	cp '$(TARGET_RELEASE_DIR)/vox-golem.exe' '$(STAGED_RELEASE_DIR)/vox-golem.exe'
+	@rm -rf '$(WINDOWS_STAGED_RELEASE_DIR)'
+	@mkdir -p '$(WINDOWS_STAGED_RELEASE_DIR)'
+	cp '$(WINDOWS_RELEASE_DIR)/vox-golem.exe' '$(WINDOWS_STAGED_RELEASE_DIR)/vox-golem.exe'
 	@for file in $(ORT_RUNTIME_DLLS); do \
-		if [ -f '$(TARGET_RELEASE_DIR)'/$$file ]; then \
-			cp '$(TARGET_RELEASE_DIR)'/$$file '$(STAGED_RELEASE_DIR)'/$$file; \
+		if [ -f '$(WINDOWS_RELEASE_DIR)'/$$file ]; then \
+			cp '$(WINDOWS_RELEASE_DIR)'/$$file '$(WINDOWS_STAGED_RELEASE_DIR)'/$$file; \
 		fi; \
 	done
 	@$(MAKE) --no-print-directory $(CUDA_RUNTIME_DIR)/.complete
 	@for file in $(CUDA_RUNTIME_DLLS); do \
-		cp '$(CUDA_RUNTIME_DIR)'/$$file '$(STAGED_RELEASE_DIR)'/$$file; \
+		cp '$(CUDA_RUNTIME_DIR)'/$$file '$(WINDOWS_STAGED_RELEASE_DIR)'/$$file; \
 	done
 	@$(MAKE) --no-print-directory verify-pc-dist
-	@printf 'Staged Windows release files: %s\n' '$(STAGED_RELEASE_DIR)'
-
-dist: pc-dist
+	@printf 'Staged Windows release files: %s\n' '$(WINDOWS_STAGED_RELEASE_DIR)'
 
 verify-pc-dist:
 	@missing=0; \
 	for file in $(REQUIRED_DIST_FILES); do \
-		if [ ! -f '$(STAGED_RELEASE_DIR)'/$$file ]; then \
+		if [ ! -f '$(WINDOWS_STAGED_RELEASE_DIR)'/$$file ]; then \
 			printf 'Missing staged release file: %s\n' "$$file" >&2; \
 			missing=1; \
 		fi; \
 	done; \
 	if [ "$$missing" -ne 0 ]; then exit 1; fi
-	@find '$(STAGED_RELEASE_DIR)' -maxdepth 1 -type f -printf '%f\t%s bytes\n' | sort
-
-app-dev:
-	bun run dev
+	@find '$(WINDOWS_STAGED_RELEASE_DIR)' -maxdepth 1 -type f -printf '%f\t%s bytes\n' | sort
 
 clean:
 	rm -rf '$(CURDIR)/dist' '$(CURDIR)/package' '$(CURDIR)/target' '$(CURDIR)/frontend/app/dist'
