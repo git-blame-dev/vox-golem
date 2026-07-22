@@ -2116,6 +2116,7 @@ fn initialize_local_tts_runtime(
         max_queue: config.max_queue,
         sample_rate_hz: config.sample_rate_hz,
         max_duration_s: config.max_duration_s,
+        provider_policy: tts::TtsProviderPolicy::Auto,
     };
 
     match tts::LocalTtsRuntime::new(spec) {
