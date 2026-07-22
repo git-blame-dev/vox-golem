@@ -6,7 +6,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::managed_process::{
-    configure_owned_tokio, terminate_group, terminate_tokio, ProcessOwnership,
+    configure_owned_tokio, terminate_tokio, terminate_tokio_on_drop, ProcessOwnership,
 };
 use futures_util::StreamExt;
 use reqwest::StatusCode;
@@ -895,23 +895,8 @@ impl Drop for OpencodeServer {
     }
 }
 
-fn terminate_child_on_drop(mut child: Child) {
-    #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        let _ = terminate_group(pid, true);
-    }
-    let _ = child.start_kill();
-    let _ = std::thread::Builder::new()
-        .name(String::from("opencode-process-reaper"))
-        .spawn(move || {
-            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                return;
-            };
-            let _ = runtime.block_on(child.wait());
-        });
+fn terminate_child_on_drop(child: Child) {
+    terminate_tokio_on_drop(child, ProcessOwnership::Owned);
 }
 
 async fn send_with_timeout(
