@@ -79,6 +79,32 @@ describe('prompt payload parsing', () => {
     })
   })
 
+  it('parses strict correction events and rejects malformed corrections', () => {
+    expect(parsePromptExecutionEvent({
+      request_id: 'request-1',
+      kind: 'correction',
+      text: 'Corrected answer',
+      correction: 'Correction: Use the verified value.',
+    })).toEqual({
+      requestId: 'request-1',
+      kind: 'correction',
+      text: 'Corrected answer',
+      correction: 'Correction: Use the verified value.',
+    })
+    expect(() => parsePromptExecutionEvent({
+      request_id: 'request-1',
+      kind: 'correction',
+      text: '',
+      correction: 'not a correction',
+    })).toThrow('Correction event must include text and correction')
+    expect(() => parsePromptExecutionEvent({
+      request_id: 'request-1',
+      kind: 'correction',
+      text: 'Corrected answer',
+      correction: 'Correction: ',
+    })).toThrow('Correction event must include text and correction')
+  })
+
   it('rejects invalid result and event payloads', () => {
     expect(() => parsePromptExecutionResult({ outcome: 'completed' })).toThrow()
     expect(() =>
@@ -140,7 +166,7 @@ describe('executePrompt', () => {
       invoke: async (command, args) => {
         order.push('invoke')
         expect(command).toBe('submit_prompt')
-        expect(args).toEqual({ requestId: 'request-1', prompt: 'Draft release notes' })
+        expect(args).toEqual({ requestId: 'request-1', prompt: 'Draft release notes', source: 'typed' })
         eventHandler?.({
           payload: { request_id: 'stale', kind: 'text', text: 'Ignore me' },
         })

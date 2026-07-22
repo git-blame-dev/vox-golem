@@ -5,6 +5,8 @@ import type {
   ResponseProfile,
   ResponseProfileState,
   StartupState,
+  StartupCapability,
+  CapabilityId,
 } from '../types/chat'
 
 export const DEFAULT_SILENCE_TIMEOUT_MS = 1_500
@@ -17,6 +19,10 @@ export const DEFAULT_CUE_ASSET_PATHS: CueAssetPaths = {
 
 export const DEFAULT_SUPPORTED_RESPONSE_PROFILES: readonly ResponseProfile[] = ['fast']
 export const DEFAULT_SELECTED_RESPONSE_PROFILE: ResponseProfile = 'fast'
+export const CAPABILITY_IDS: readonly CapabilityId[] = [
+  'custom_provider', 'opencode', 'local_fast', 'local_quality', 'qwen_prediction',
+  'wake_word', 'vad', 'parakeet', 'tts', 'deep', 'review',
+]
 
 export function parseStartupState(payload: unknown): StartupState {
   if (!isRecord(payload)) {
@@ -58,6 +64,7 @@ export function parseStartupState(payload: unknown): StartupState {
       promptCancellationAvailable: payload['prompt_cancellation_available'] === true,
       ttsEnabled,
       ttsOutputGainDb,
+       capabilities: parseCapabilities(payload['capabilities']),
     }
   }
 
@@ -90,6 +97,7 @@ export function parseStartupState(payload: unknown): StartupState {
       promptCancellationAvailable: payload['prompt_cancellation_available'] === true,
       ttsEnabled,
       ttsOutputGainDb,
+       capabilities: parseCapabilities(payload['capabilities']),
     }
   }
 
@@ -148,6 +156,7 @@ function buildDefaultStartupState(): StartupState {
     promptCancellationAvailable: false,
     ttsEnabled: false,
     ttsOutputGainDb: DEFAULT_TTS_OUTPUT_GAIN_DB,
+    capabilities: legacyCapabilities(true, DEFAULT_SUPPORTED_RESPONSE_PROFILES, 'browser_preview'),
   }
 }
 
@@ -167,7 +176,7 @@ export function parseResponseProfileState(payload: unknown): ResponseProfileStat
   const selectedResponseProfile = parseResponseProfile(payload['selected_response_profile'])
   const supportedResponseProfiles = parseSupportedResponseProfiles(payload['supported_response_profiles'])
 
-  if (!supportedResponseProfiles.includes(selectedResponseProfile)) {
+  if (supportedResponseProfiles.length > 0 && !supportedResponseProfiles.includes(selectedResponseProfile)) {
     throw new Error('Selected response profile must be present in supported_response_profiles')
   }
 
@@ -241,11 +250,58 @@ function parseSupportedResponseProfiles(payload: unknown): readonly ResponseProf
 
   const profiles = payload.map(parseResponseProfile)
 
-  if (profiles.length === 0) {
-    throw new Error('Startup payload must include at least one supported_response_profile')
-  }
-
   return Array.from(new Set(profiles))
+}
+
+function parseCapabilities(payload: unknown): readonly StartupCapability[] {
+  if (payload === undefined) {
+    throw new Error('Startup payload must include capabilities')
+  }
+  if (!Array.isArray(payload)) {
+    throw new Error('Startup payload field `capabilities` must be an array')
+  }
+  const parsed = payload.map((item): StartupCapability => {
+    if (!isRecord(item) || !CAPABILITY_IDS.includes(item['id'] as CapabilityId)) {
+      throw new Error('Startup capability must include a supported id')
+    }
+    const state = item['state']
+    if (state !== 'available' && state !== 'warming' && state !== 'not_configured' && state !== 'unavailable' && state !== 'failed') {
+      throw new Error(`Startup capability ${String(item['id'])} has an invalid state`)
+    }
+    const reason = item['reason']
+    const actualProvider = item['actual_provider']
+    if (typeof reason !== 'string' || reason.trim().length === 0) {
+      throw new Error(`Startup capability ${String(item['id'])} must include a reason`)
+    }
+    if (actualProvider !== null && actualProvider !== undefined && typeof actualProvider !== 'string') {
+      throw new Error(`Startup capability ${String(item['id'])} has an invalid actual_provider`)
+    }
+    return { id: item['id'] as CapabilityId, state, reason, actualProvider: actualProvider ?? null }
+  })
+  if (new Set(parsed.map(({ id }) => id)).size !== parsed.length) {
+    throw new Error('Startup payload contains duplicate capabilities')
+  }
+  const missing = CAPABILITY_IDS.filter((id) => !parsed.some((item) => item.id === id))
+  if (missing.length > 0) {
+    throw new Error(`Startup payload is missing capabilities: ${missing.join(', ')}`)
+  }
+  return parsed
+}
+
+function legacyCapabilities(
+  _voiceInputAvailable: boolean,
+  _profiles: readonly ResponseProfile[],
+  customProvider: string | null,
+): readonly StartupCapability[] {
+  return CAPABILITY_IDS.map((id) => {
+    const available = true
+    return {
+      id,
+      state: available ? 'available' : 'not_configured',
+      reason: available ? 'ready' : 'not configured',
+      actualProvider: id === 'custom_provider' ? customProvider : null,
+    }
+  })
 }
 
 function parseTtsEnabled(payload: unknown): boolean {

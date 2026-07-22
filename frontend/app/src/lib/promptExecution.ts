@@ -24,6 +24,21 @@ export function parsePromptExecutionEvent(payload: unknown): PromptExecutionEven
     return { requestId, kind, text }
   }
 
+  if (kind === 'correction') {
+    const text = payload['text']
+    const correction = payload['correction']
+    if (
+      typeof text !== 'string' ||
+      text.trim().length === 0 ||
+      typeof correction !== 'string' ||
+      !correction.startsWith('Correction: ') ||
+      correction.slice('Correction: '.length).trim().length === 0
+    ) {
+      throw new Error('Correction event must include text and correction')
+    }
+    return { requestId, kind, text, correction }
+  }
+
   if (kind === 'status') {
     const message = payload['message']
     if (typeof message !== 'string') {
@@ -87,6 +102,7 @@ export async function executePrompt(
   requestId: string,
   prompt: string,
   onEvent: (event: PromptExecutionEvent) => void,
+  source: 'typed' | 'voice' = 'typed',
 ): Promise<PromptExecutionResult> {
   const tauri = typeof window === 'undefined' ? null : getTauriInternals()
   if (tauri === null) {
@@ -119,7 +135,7 @@ export async function executePrompt(
   })
 
   try {
-    const payload = await tauri.invoke('submit_prompt', { requestId, prompt })
+    const payload = await tauri.invoke('submit_prompt', { requestId, prompt, source })
     const result = parsePromptExecutionResult(payload)
     if (result.requestId !== requestId) {
       throw new Error('Prompt response request ID did not match the active request')

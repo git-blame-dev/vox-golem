@@ -6,12 +6,19 @@ export interface ChatMessage {
   readonly id: string
   readonly role: MessageRole
   readonly content: string
+  readonly answerStage?: AnswerStageMetadata
+}
+
+export interface AnswerStageMetadata {
+  readonly stages: readonly import('../components/AnswerStage').AnswerStageStatusEntry[]
+  readonly priorVersions: readonly import('../components/AnswerStage').AnswerPriorVersion[]
 }
 
 export interface TranscriptMessage {
   readonly id: string
   readonly role: TranscriptRole
   readonly content: string
+  readonly answerStage?: AnswerStageMetadata
 }
 
 export interface UserNotice {
@@ -41,6 +48,28 @@ export interface ResponseProfileState {
   readonly supportedResponseProfiles: readonly ResponseProfile[]
 }
 
+export type CapabilityId =
+  | 'custom_provider'
+  | 'opencode'
+  | 'local_fast'
+  | 'local_quality'
+  | 'qwen_prediction'
+  | 'wake_word'
+  | 'vad'
+  | 'parakeet'
+  | 'tts'
+  | 'deep'
+  | 'review'
+
+export type CapabilityStatus = 'available' | 'warming' | 'not_configured' | 'unavailable' | 'failed'
+
+export interface StartupCapability {
+  readonly id: CapabilityId
+  readonly state: CapabilityStatus
+  readonly reason: string
+  readonly actualProvider: string | null
+}
+
 export type BackendRuntimePhase =
   | 'initializing'
   | 'sleeping'
@@ -51,6 +80,7 @@ export type BackendRuntimePhase =
 
 export type PromptExecutionEvent =
   | { readonly requestId: string; readonly kind: 'text' | 'reasoning'; readonly text: string }
+  | { readonly requestId: string; readonly kind: 'correction'; readonly text: string; readonly correction: string }
   | { readonly requestId: string; readonly kind: 'status'; readonly message: string }
   | {
       readonly requestId: string
@@ -87,7 +117,8 @@ export type StartupState =
     readonly supportedResponseProfiles: readonly ResponseProfile[]
     readonly promptCancellationAvailable: boolean
     readonly ttsEnabled: boolean
-    readonly ttsOutputGainDb: number
+      readonly ttsOutputGainDb: number
+      readonly capabilities: readonly StartupCapability[]
   }
 | {
   readonly kind: 'ready'
@@ -101,6 +132,7 @@ export type StartupState =
     readonly promptCancellationAvailable: boolean
     readonly ttsEnabled: boolean
     readonly ttsOutputGainDb: number
+    readonly capabilities: readonly StartupCapability[]
   }
 | { readonly kind: 'error'; readonly message: string }
 
