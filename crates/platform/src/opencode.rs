@@ -1,14 +1,28 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
+#[cfg(unix)]
+use std::thread;
 use std::time::Duration;
 
+use crate::managed_process::{
+    configure_owned_tokio, terminate_group, terminate_tokio, ProcessOwnership,
+};
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde::Deserialize;
 use tokio::process::{Child, Command as TokioCommand};
 
 const MAX_JSON_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_SSE_FRAME_BYTES: usize = 256 * 1024;
+const MAX_SSE_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TRACKED_PART_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TRACKED_PARTS: usize = 1024;
+const STARTUP_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(unix)]
+const ETXTBSY_RETRY_COUNT: usize = 20;
+#[cfg(unix)]
+const ETXTBSY_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpencodePrompt {
@@ -47,6 +61,71 @@ impl OpencodePrompt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpencodePromptError {
     EmptyPrompt,
+}
+
+/// The model configurations approved for prompts sent by the platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpencodeModel {
+    Gpt56SolHigh,
+    Gpt56LunaLow,
+}
+
+impl OpencodeModel {
+    fn request_fields(self) -> serde_json::Value {
+        let model = match self {
+            Self::Gpt56SolHigh => "gpt-5.6-sol",
+            Self::Gpt56LunaLow => "gpt-5.6-luna",
+        };
+        serde_json::json!({
+            "providerID": "openai",
+            "modelID": model,
+        })
+    }
+
+    fn variant(self) -> &'static str {
+        match self {
+            Self::Gpt56SolHigh => "high",
+            Self::Gpt56LunaLow => "low",
+        }
+    }
+}
+
+/// Tool permissions are deny-by-default. The wildcard is intentional: tools
+/// added by a future OpenCode version remain unavailable until explicitly
+/// allowed here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpencodeToolPolicy {
+    AnswerOnly,
+    Research,
+}
+
+impl OpencodeToolPolicy {
+    fn request_tools(self) -> serde_json::Value {
+        match self {
+            Self::AnswerOnly => serde_json::json!({"*": false}),
+            Self::Research => serde_json::json!({
+                "*": false,
+                "websearch": true,
+                "webfetch": true,
+                "shell": false,
+                "file": false,
+                "edit": false,
+                "mutation": false,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpencodePromptOptions {
+    pub model: OpencodeModel,
+    pub tool_policy: OpencodeToolPolicy,
+}
+
+impl OpencodePromptOptions {
+    pub const fn new(model: OpencodeModel, tool_policy: OpencodeToolPolicy) -> Self {
+        Self { model, tool_policy }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,7 +250,7 @@ impl OpencodeCommandSpec {
 }
 
 pub fn run_opencode(spec: &OpencodeCommandSpec) -> std::io::Result<OpencodeRunResult> {
-    let output = spec.to_command().output()?;
+    let output = run_command(spec)?;
 
     Ok(OpencodeRunResult {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -183,10 +262,7 @@ pub fn run_opencode(spec: &OpencodeCommandSpec) -> std::io::Result<OpencodeRunRe
 pub fn run_opencode_json(
     spec: &OpencodeCommandSpec,
 ) -> Result<OpencodeJsonRunResult, OpencodeJsonRunError> {
-    let output = spec
-        .to_command()
-        .output()
-        .map_err(OpencodeJsonRunError::Io)?;
+    let output = run_command(spec).map_err(OpencodeJsonRunError::Io)?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
 
     Ok(OpencodeJsonRunResult {
@@ -194,6 +270,29 @@ pub fn run_opencode_json(
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         exit_code: output.status.code(),
     })
+}
+
+fn run_command(spec: &OpencodeCommandSpec) -> std::io::Result<Output> {
+    #[cfg(unix)]
+    for attempt in 0..ETXTBSY_RETRY_COUNT {
+        match spec.to_command().output() {
+            Err(error) if is_executable_busy(&error) && attempt + 1 < ETXTBSY_RETRY_COUNT => {
+                thread::sleep(ETXTBSY_RETRY_DELAY);
+            }
+            result => return result,
+        }
+    }
+
+    #[cfg(not(unix))]
+    return spec.to_command().output();
+
+    #[cfg(unix)]
+    unreachable!("the bounded command retry loop always returns")
+}
+
+#[cfg(unix)]
+fn is_executable_busy(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(26)
 }
 
 fn parse_json_events(stdout: &str) -> Result<Vec<OpencodeJsonEvent>, OpencodeJsonRunError> {
@@ -377,7 +476,7 @@ impl OpencodeServerConfig {
     pub fn new(executable: impl Into<PathBuf>) -> Self {
         Self {
             executable: executable.into(),
-            startup_timeout: Duration::from_secs(10),
+            startup_timeout: Duration::from_secs(30),
             request_timeout: Duration::from_secs(30),
         }
     }
@@ -409,22 +508,7 @@ impl OpencodeServer {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
         let port = listener.local_addr()?.port();
         drop(listener);
-        let mut command = TokioCommand::new(&config.executable);
-        command.args([
-            "serve",
-            "--pure",
-            "--hostname",
-            "127.0.0.1",
-            "--port",
-            &port.to_string(),
-        ]);
-        command
-            .env("OPENCODE_SERVER_PASSWORD", &password)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        command.kill_on_drop(true);
-        let mut child = command.spawn()?;
+        let mut child = spawn_server_process(&config.executable, port, &password).await?;
         #[cfg(windows)]
         let process_job = match create_process_job(&child) {
             Ok(job) => job,
@@ -464,7 +548,7 @@ impl OpencodeServer {
                 )));
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let health_timeout = config.request_timeout.min(remaining);
+            let health_timeout = startup_health_probe_timeout(config.request_timeout, remaining);
             let health_request = client
                 .get(format!("{base_url}/global/health"))
                 .basic_auth("opencode", Some(&password))
@@ -545,8 +629,16 @@ impl OpencodeServer {
             self.request_timeout,
         )
         .await?;
+        if let Err(error) = old_client.delete().await {
+            let transient = OpencodeClient {
+                session_id: new_session_id,
+                ..old_client.clone()
+            };
+            let _ = transient.delete().await;
+            return Err(error);
+        }
         self.session_id = new_session_id;
-        old_client.delete().await
+        Ok(())
     }
     pub async fn shutdown(mut self) -> Result<(), OpencodeServerError> {
         let client = self.client();
@@ -566,15 +658,100 @@ impl OpencodeServer {
     }
 }
 
+fn startup_health_probe_timeout(request_timeout: Duration, remaining: Duration) -> Duration {
+    request_timeout
+        .min(remaining)
+        .min(STARTUP_HEALTH_PROBE_TIMEOUT)
+}
+
+fn server_command(executable: &Path, port: u16, password: &str) -> TokioCommand {
+    let mut command = TokioCommand::new(executable);
+    command.args([
+        "serve",
+        "--pure",
+        "--hostname",
+        "127.0.0.1",
+        "--port",
+        &port.to_string(),
+    ]);
+    command
+        .env("OPENCODE_SERVER_PASSWORD", password)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    command.kill_on_drop(true);
+    configure_owned_tokio(&mut command);
+    command
+}
+
+async fn spawn_server_process(
+    executable: &Path,
+    port: u16,
+    password: &str,
+) -> std::io::Result<Child> {
+    #[cfg(unix)]
+    for attempt in 0..ETXTBSY_RETRY_COUNT {
+        match server_command(executable, port, password).spawn() {
+            Err(error) if is_executable_busy(&error) && attempt + 1 < ETXTBSY_RETRY_COUNT => {
+                tokio::time::sleep(ETXTBSY_RETRY_DELAY).await;
+            }
+            result => return result,
+        }
+    }
+
+    #[cfg(not(unix))]
+    return server_command(executable, port, password).spawn();
+
+    #[cfg(unix)]
+    unreachable!("the bounded server spawn retry loop always returns")
+}
+
 impl OpencodeClient {
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
+
+    pub async fn create_transient(&self) -> Result<Self, OpencodeServerError> {
+        let session_id = create_session(
+            &self.client,
+            &self.base_url,
+            &self.password,
+            self.request_timeout,
+        )
+        .await?;
+        Ok(Self {
+            session_id,
+            ..self.clone()
+        })
+    }
     pub async fn prompt(&self, prompt: &OpencodePrompt) -> Result<(), OpencodeServerError> {
-        let mut body = serde_json::json!({"parts":[{"type":"text","text":prompt.text()}]});
+        let mut body = prompt_body(prompt, None);
         if let Some(message_id) = prompt.message_id() {
             body["messageID"] = serde_json::Value::String(message_id.to_string());
         }
+        self.send_prompt_body(body).await
+    }
+
+    pub async fn prompt_with_options(
+        &self,
+        prompt: &OpencodePrompt,
+        options: OpencodePromptOptions,
+    ) -> Result<(), OpencodeServerError> {
+        let mut body = prompt_body(
+            prompt,
+            Some(serde_json::json!({
+                "model": options.model.request_fields(),
+                "variant": options.model.variant(),
+                "tools": options.tool_policy.request_tools(),
+            })),
+        );
+        if let Some(message_id) = prompt.message_id() {
+            body["messageID"] = serde_json::Value::String(message_id.to_string());
+        }
+        self.send_prompt_body(body).await
+    }
+
+    async fn send_prompt_body(&self, body: serde_json::Value) -> Result<(), OpencodeServerError> {
         let response = send_with_timeout(
             self.client
                 .post(format!(
@@ -691,16 +868,50 @@ impl OpencodeClient {
     }
 }
 
+fn prompt_body(prompt: &OpencodePrompt, options: Option<serde_json::Value>) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "parts": [{"type": "text", "text": prompt.text()}],
+        "tools": {"*": false},
+    });
+    if let Some(options) = options {
+        if let Some(object) = options.as_object() {
+            for (key, value) in object {
+                body[key] = value.clone();
+            }
+        }
+    }
+    body
+}
+
 impl Drop for OpencodeServer {
     fn drop(&mut self) {
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.start_kill();
+        if let Some(child) = self.child.take() {
+            terminate_child_on_drop(child);
         }
         #[cfg(windows)]
         {
             self.process_job = None;
         }
     }
+}
+
+fn terminate_child_on_drop(mut child: Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        let _ = terminate_group(pid, true);
+    }
+    let _ = child.start_kill();
+    let _ = std::thread::Builder::new()
+        .name(String::from("opencode-process-reaper"))
+        .spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            let _ = runtime.block_on(child.wait());
+        });
 }
 
 async fn send_with_timeout(
@@ -825,8 +1036,7 @@ async fn read_json_response(
 }
 
 async fn terminate_child(child: &mut Child) {
-    let _ = child.start_kill();
-    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    let _ = terminate_tokio(child, ProcessOwnership::Owned, Duration::from_secs(2)).await;
 }
 
 #[cfg(windows)]
@@ -950,6 +1160,13 @@ fn parse_sse_event(
             let Some(delta) = props.get("delta").and_then(serde_json::Value::as_str) else {
                 return Ok(None);
             };
+            let current = stream_parts.get(part_id).map_or(0, |part| part.text.len());
+            if current.saturating_add(delta.len()) > MAX_TRACKED_PART_BYTES
+                || tracked_part_bytes(stream_parts).saturating_add(delta.len())
+                    > MAX_TRACKED_PART_BYTES
+            {
+                return Err(OpencodeServerError::FrameTooLarge);
+            }
             let Some(stream_part) = stream_parts.get_mut(part_id) else {
                 return Ok(None);
             };
@@ -1065,6 +1282,14 @@ fn map_stream_part_update(
 ) -> Result<Option<OpencodeEvent>, OpencodeServerError> {
     if let Some(delta) = properties.get("delta").and_then(serde_json::Value::as_str) {
         if let Some(part_id) = part.get("id").and_then(serde_json::Value::as_str) {
+            let current = stream_parts.get(part_id).map_or(0, |part| part.text.len());
+            if stream_parts.get(part_id).is_none() && stream_parts.len() >= MAX_TRACKED_PARTS
+                || current.saturating_add(delta.len()) > MAX_TRACKED_PART_BYTES
+                || tracked_part_bytes(stream_parts).saturating_add(delta.len())
+                    > MAX_TRACKED_PART_BYTES
+            {
+                return Err(OpencodeServerError::FrameTooLarge);
+            }
             stream_parts
                 .entry(part_id.to_string())
                 .or_insert_with(|| StreamPart {
@@ -1093,6 +1318,15 @@ fn map_stream_part_update(
         .and_then(|tracked| full_text.strip_prefix(&tracked.text))
         .unwrap_or(full_text)
         .to_string();
+    let previous_len = stream_parts.get(part_id).map_or(0, |part| part.text.len());
+    if stream_parts.get(part_id).is_none() && stream_parts.len() >= MAX_TRACKED_PARTS
+        || tracked_part_bytes(stream_parts)
+            .saturating_sub(previous_len)
+            .saturating_add(full_text.len())
+            > MAX_TRACKED_PART_BYTES
+    {
+        return Err(OpencodeServerError::FrameTooLarge);
+    }
     stream_parts.insert(
         part_id.to_string(),
         StreamPart {
@@ -1107,6 +1341,12 @@ fn map_stream_part_update(
         StreamPartKind::Text => OpencodeEvent::Text(delta),
         StreamPartKind::Reasoning => OpencodeEvent::Reasoning(delta),
     }))
+}
+
+fn tracked_part_bytes(stream_parts: &HashMap<String, StreamPart>) -> usize {
+    stream_parts
+        .values()
+        .fold(0, |total, part| total.saturating_add(part.text.len()))
 }
 
 fn map_tool_event(part: &serde_json::Value) -> Result<OpencodeEvent, OpencodeServerError> {
@@ -1166,6 +1406,8 @@ pub struct OpencodeSseDecoder {
     assistant_message: Option<String>,
     request_started: bool,
     stream_parts: HashMap<String, StreamPart>,
+    output_bytes: usize,
+    poisoned: bool,
 }
 impl OpencodeSseDecoder {
     pub fn new(active_session: String) -> Self {
@@ -1184,14 +1426,19 @@ impl OpencodeSseDecoder {
             assistant_message: None,
             request_started: false,
             stream_parts: HashMap::new(),
+            output_bytes: 0,
+            poisoned: false,
         }
     }
     pub fn push(&mut self, chunk: &[u8]) -> Vec<Result<OpencodeEvent, OpencodeServerError>> {
+        if self.poisoned {
+            return Vec::new();
+        }
         self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
         while let Some((end, delimiter_len)) = sse_frame_end(&self.buffer) {
             let frame = self.buffer.drain(..end + delimiter_len).collect::<Vec<_>>();
-            if frame.len() > 256 * 1024 {
+            if frame.len() > MAX_SSE_FRAME_BYTES {
                 events.push(Err(OpencodeServerError::FrameTooLarge));
                 continue;
             }
@@ -1206,9 +1453,38 @@ impl OpencodeSseDecoder {
                             &mut self.request_started,
                             &mut self.stream_parts,
                         ) {
-                            Ok(Some(event)) => events.push(Ok(event)),
+                            Ok(Some(event)) => {
+                                let event_bytes = match &event {
+                                    OpencodeEvent::Text(text)
+                                    | OpencodeEvent::Reasoning(text)
+                                    | OpencodeEvent::Status(text)
+                                    | OpencodeEvent::Error(text) => text.len(),
+                                    OpencodeEvent::Tool { name, detail, .. } => {
+                                        name.len().saturating_add(detail.len())
+                                    }
+                                    OpencodeEvent::Completed => 0,
+                                };
+                                if self.output_bytes.saturating_add(event_bytes)
+                                    > MAX_SSE_OUTPUT_BYTES
+                                {
+                                    events.push(Err(OpencodeServerError::FrameTooLarge));
+                                } else {
+                                    self.output_bytes += event_bytes;
+                                    events.push(Ok(event));
+                                }
+                            }
                             Ok(None) => {}
-                            Err(error) => events.push(Err(error)),
+                            Err(error) => {
+                                if matches!(error, OpencodeServerError::FrameTooLarge) {
+                                    self.poisoned = true;
+                                    self.buffer.clear();
+                                    self.stream_parts.clear();
+                                }
+                                events.push(Err(error));
+                                if self.poisoned {
+                                    break;
+                                }
+                            }
                         }
                     }
                     Err(_) => events.push(Err(OpencodeServerError::InvalidUtf8)),
@@ -1216,7 +1492,7 @@ impl OpencodeSseDecoder {
                 }
             }
         }
-        if self.buffer.len() > 256 * 1024 {
+        if self.buffer.len() > MAX_SSE_FRAME_BYTES {
             self.buffer.clear();
             events.push(Err(OpencodeServerError::FrameTooLarge));
         }
@@ -1329,18 +1605,56 @@ enum RawToolState {
 #[cfg(test)]
 mod tests {
     use super::{
-        run_opencode, run_opencode_json, OpencodeCommandSpec, OpencodeEvent, OpencodeJsonEvent,
-        OpencodeJsonRunError, OpencodeOutputFormat, OpencodePrompt, OpencodePromptError,
-        OpencodeServerError, OpencodeSseDecoder, OpencodeToolStatus, OpencodeToolUseStatus,
+        prompt_body, run_opencode, run_opencode_json, startup_health_probe_timeout,
+        terminate_child_on_drop, OpencodeCommandSpec, OpencodeEvent, OpencodeJsonEvent,
+        OpencodeJsonRunError, OpencodeModel, OpencodeOutputFormat, OpencodePrompt,
+        OpencodePromptError, OpencodeServerConfig, OpencodeServerError, OpencodeSseDecoder,
+        OpencodeToolPolicy, OpencodeToolStatus, OpencodeToolUseStatus, MAX_TRACKED_PART_BYTES,
     };
     use std::ffi::OsStr;
     use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     static TEMP_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn drop_fallback_reaps_the_owned_child() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "exec sleep 30"]).kill_on_drop(true);
+        crate::managed_process::configure_owned_tokio(&mut command);
+        let child = command.spawn().expect("test child should start");
+        let pid = child.id().expect("test child should expose its pid");
+
+        terminate_child_on_drop(child);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while Path::new(&format!("/proc/{pid}")).exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("drop fallback should reap the child");
+    }
+
+    #[test]
+    fn startup_health_probes_are_shorter_than_the_overall_deadline() {
+        assert_eq!(
+            startup_health_probe_timeout(Duration::from_secs(30), Duration::from_secs(20)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            startup_health_probe_timeout(Duration::from_secs(30), Duration::from_millis(250)),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            OpencodeServerConfig::new("opencode").startup_timeout,
+            Duration::from_secs(30)
+        );
+    }
 
     struct TempDir {
         path: PathBuf,
@@ -1388,6 +1702,86 @@ mod tests {
             .expect("non-empty prompt should be accepted");
 
         assert_eq!(prompt.text(), "summarize the latest transcript");
+    }
+
+    #[test]
+    fn default_prompt_body_denies_all_tools() {
+        let prompt = OpencodePrompt::new("answer briefly").expect("prompt should be valid");
+        assert_eq!(
+            prompt_body(&prompt, None)["tools"],
+            serde_json::json!({"*": false})
+        );
+    }
+
+    #[test]
+    fn preserves_approved_model_identity_and_variant() {
+        assert_eq!(
+            OpencodeModel::Gpt56SolHigh.request_fields(),
+            serde_json::json!({
+                "providerID": "openai",
+                "modelID": "gpt-5.6-sol",
+            })
+        );
+        assert_eq!(OpencodeModel::Gpt56SolHigh.variant(), "high");
+        assert_eq!(
+            OpencodeModel::Gpt56LunaLow.request_fields(),
+            serde_json::json!({
+                "providerID": "openai",
+                "modelID": "gpt-5.6-luna",
+            })
+        );
+        assert_eq!(OpencodeModel::Gpt56LunaLow.variant(), "low");
+    }
+
+    #[test]
+    fn builds_opencode_1184_prompt_body_with_top_level_variant_and_tools() {
+        let prompt = OpencodePrompt::new("answer briefly").expect("prompt should be valid");
+        let body = prompt_body(
+            &prompt,
+            Some(serde_json::json!({
+                "model": OpencodeModel::Gpt56LunaLow.request_fields(),
+                "variant": "low",
+                "tools": OpencodeToolPolicy::Research.request_tools(),
+            })),
+        );
+
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "parts": [{"type": "text", "text": "answer briefly"}],
+                "model": {"providerID": "openai", "modelID": "gpt-5.6-luna"},
+                "variant": "low",
+                "tools": {
+                    "*": false,
+                    "websearch": true,
+                    "webfetch": true,
+                    "shell": false,
+                    "file": false,
+                    "edit": false,
+                    "mutation": false,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn tool_policies_are_deny_by_default() {
+        assert_eq!(
+            OpencodeToolPolicy::AnswerOnly.request_tools(),
+            serde_json::json!({"*": false})
+        );
+        assert_eq!(
+            OpencodeToolPolicy::Research.request_tools(),
+            serde_json::json!({
+                "*": false,
+                "websearch": true,
+                "webfetch": true,
+                "shell": false,
+                "file": false,
+                "edit": false,
+                "mutation": false,
+            })
+        );
     }
 
     #[test]
@@ -1786,27 +2180,100 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn bounds_aggregate_sse_output() {
+        let mut decoder = OpencodeSseDecoder::new("ses_1".into());
+        let delta = "x".repeat(64 * 1024);
+        for _ in 0..64 {
+            let frame = format!(
+                "data: {{\"type\":\"message.part.updated\",\"properties\":{{\"part\":{{\"type\":\"text\",\"sessionID\":\"ses_1\"}},\"delta\":\"{delta}\"}}}}\n\n"
+            );
+            assert!(decoder.push(frame.as_bytes()).iter().all(Result::is_ok));
+        }
+        let frame = format!(
+            "data: {{\"type\":\"message.part.updated\",\"properties\":{{\"part\":{{\"type\":\"text\",\"sessionID\":\"ses_1\"}},\"delta\":\"{delta}\"}}}}\n\n"
+        );
+        assert!(matches!(
+            decoder.push(frame.as_bytes()).as_slice(),
+            [Err(OpencodeServerError::FrameTooLarge)]
+        ));
+    }
+
+    #[test]
+    fn bounds_tracked_part_state() {
+        let mut decoder = OpencodeSseDecoder::new("ses_1".into());
+        let delta = "x".repeat(64 * 1024);
+        for _ in 0..64 {
+            let frame = format!(
+                "data: {{\"type\":\"message.part.updated\",\"properties\":{{\"part\":{{\"id\":\"part_1\",\"type\":\"text\",\"sessionID\":\"ses_1\"}},\"delta\":\"{delta}\"}}}}\n\n"
+            );
+            assert!(decoder.push(frame.as_bytes()).iter().all(Result::is_ok));
+        }
+        let frame = format!(
+            "data: {{\"type\":\"message.part.updated\",\"properties\":{{\"part\":{{\"id\":\"part_1\",\"type\":\"text\",\"sessionID\":\"ses_1\"}},\"delta\":\"{delta}\"}}}}\n\n"
+        );
+        assert!(matches!(
+            decoder.push(frame.as_bytes()).as_slice(),
+            [Err(OpencodeServerError::FrameTooLarge)]
+        ));
+    }
+
+    #[test]
+    fn rejects_repeated_deltas_before_mutating_tracked_state() {
+        let mut decoder = OpencodeSseDecoder::new("ses_1".into());
+        let delta = "x".repeat(4096);
+        let frame = |delta: &str| {
+            format!(
+                "data: {{\"type\":\"message.part.updated\",\"properties\":{{\"part\":{{\"id\":\"part_1\",\"type\":\"text\",\"sessionID\":\"ses_1\"}},\"delta\":\"{delta}\"}}}}\n\n"
+            )
+        };
+        for _ in 0..(MAX_TRACKED_PART_BYTES / delta.len()) {
+            assert!(decoder
+                .push(frame(&delta).as_bytes())
+                .iter()
+                .all(Result::is_ok));
+        }
+        assert!(matches!(
+            decoder.push(frame(&delta).as_bytes()).as_slice(),
+            [Err(OpencodeServerError::FrameTooLarge)]
+        ));
+        assert!(decoder.push(frame("safe").as_bytes()).is_empty());
+    }
+
     fn create_fake_opencode(directory: &Path, body: &str) -> PathBuf {
         #[cfg(windows)]
         let executable = directory.join("fake-opencode.cmd");
         #[cfg(not(windows))]
         let executable = directory.join("fake-opencode.sh");
+        let staged_executable = executable.with_extension("staged");
 
         #[cfg(windows)]
         let script = format!("@echo off\r\n{body}\r\n");
         #[cfg(not(windows))]
         let script = format!("#!/bin/sh\n{body}\n");
 
-        fs::write(&executable, script).expect("fake executable should be written");
+        {
+            use std::io::Write;
+
+            let mut file =
+                fs::File::create(&staged_executable).expect("fake executable should be created");
+            file.write_all(script.as_bytes())
+                .expect("fake executable should be written");
+            file.sync_all()
+                .expect("fake executable should be flushed before execution");
+        }
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
 
             let permissions = fs::Permissions::from_mode(0o755);
-            fs::set_permissions(&executable, permissions)
+            fs::set_permissions(&staged_executable, permissions)
                 .expect("fake executable should be marked executable");
         }
+
+        fs::rename(&staged_executable, &executable)
+            .expect("closed fake executable should be installed atomically");
 
         executable
     }
