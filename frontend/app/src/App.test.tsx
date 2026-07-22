@@ -107,6 +107,53 @@ describe('App', () => {
     expect(conversation.textContent).toBe('')
   })
 
+  it('keeps the typed shell nonfatal and lists every zero-asset capability in one red notice', async () => {
+    const capabilityIds = [
+      'custom_provider', 'opencode', 'local_fast', 'local_quality', 'qwen_prediction',
+      'wake_word', 'vad', 'parakeet', 'tts', 'deep', 'review',
+    ]
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        if (command === 'get_ui_text_size') return 'medium'
+        if (command === 'get_ui_theme') return 'dark'
+        if (command === 'get_startup_state') return {
+          kind: 'ready',
+          cue_asset_paths: { start_listening: 'start.wav', stop_listening: 'stop.wav' },
+          runtime_phase: 'sleeping',
+          voice_input_available: false,
+          voice_input_error: 'voice assets are not configured',
+          silence_timeout_ms: 1500,
+          selected_response_profile: 'fast',
+          supported_response_profiles: [],
+          capabilities: capabilityIds.map((id) => ({
+            id,
+            state: id === 'review' ? 'failed' : 'not_configured',
+            reason: `${id} unavailable`,
+            actual_provider: null,
+          })),
+        }
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    const composer = getComposer(container)
+    await act(async () => setTextAreaValue(composer, 'typed input remains editable'))
+
+    expect(composer.disabled).toBe(false)
+    expect(getSendButton(container).disabled).toBe(true)
+    expect(container.textContent).toContain('Sending disabled:')
+    expect(container.querySelector('.notice-toast--error')).not.toBeNull()
+    for (const id of capabilityIds) {
+      expect(container.textContent).toContain(`${id} unavailable`)
+    }
+    const settingsButton = getButtonByLabel(container, 'Settings')
+    await act(async () => { settingsButton.click(); await Promise.resolve() })
+    const instantSelect = container.querySelector<HTMLSelectElement>('#assistantInstantSelect')
+    expect(instantSelect).not.toBeNull()
+    expect(Array.from(instantSelect?.options ?? []).every((option) => option.disabled || option.value === 'local-fast')).toBe(true)
+  })
+
   it('opens settings and live-updates persisted app text size', async () => {
     const invoked: Array<{ command: string; args: unknown }> = []
     let textSize = 'medium'
@@ -141,6 +188,7 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'fast',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
             tts_enabled: false,
           }
         }
@@ -216,6 +264,7 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'fast',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
             tts_enabled: false,
           }
         }
@@ -282,6 +331,7 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'fast',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
             tts_enabled: false,
           }
         }
@@ -341,6 +391,7 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'fast',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
             tts_enabled: false,
           }
         }
@@ -388,6 +439,7 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'fast',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
             tts_enabled: false,
           }
         }
@@ -426,6 +478,7 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'fast',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
             tts_enabled: false,
           }
         }
@@ -471,6 +524,7 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'fast',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
             tts_enabled: false,
           }
         }
@@ -518,6 +572,7 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'fast',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
             tts_enabled: false,
           }
         }
@@ -577,6 +632,7 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'fast',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
             tts_enabled: false,
           }
         }
@@ -609,6 +665,8 @@ describe('App', () => {
   it('submits from Enter and ignores Shift+Enter', async () => {
     const { container } = await renderApp()
     const composer = getComposer(container)
+    expect(container.querySelector('.prompt-composer')).not.toBeNull()
+    expect(container.querySelector('.prompt-composer__ghost')).toBeNull()
 
     await act(async () => {
       setTextAreaValue(composer, 'Line one')
@@ -662,9 +720,12 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'fast',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
             tts_enabled: false,
           }
         }
+
+        if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
 
         if (command === 'set_tts_enabled') {
           expect(args).toEqual({ enabled: true })
@@ -758,9 +819,12 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'fast',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
             tts_enabled: false,
           }
         }
+
+        if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
 
         if (command === 'set_tts_enabled') {
           return { enabled: true, sample_rate_hz: 22050 }
@@ -840,15 +904,16 @@ describe('App', () => {
           silence_timeout_ms: 1500,
           selected_response_profile: 'fast',
           supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
         }
       },
     }
 
     const { container } = await renderApp()
-    const select = getResponseProfileSelect(container)
+    const select = await getResponseProfileSelect(container)
 
-    expect(select.value).toBe('fast')
-    expect(Array.from(select.options).map((option) => option.text)).toEqual(['Fast', 'Quality'])
+    expect(select.value).toBe('local-fast')
+    expect(Array.from(select.options).map((option) => option.text)).toEqual(['Local: Fast', 'Local: Quality', 'Custom: GPT-5.6 Sol High', 'Custom: GPT-5.6 Luna Low', 'OpenCode: GPT-5.6 Sol High', 'OpenCode: GPT-5.6 Luna Low'])
   })
 
   it('invokes switch_response_profile when selecting Quality profile', async () => {
@@ -872,6 +937,7 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: selectedProfile,
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
 
@@ -881,7 +947,12 @@ describe('App', () => {
           return {
             selected_response_profile: 'quality',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
+        }
+
+        if (command === 'set_assistant_settings') {
+          return (args as { settings: unknown }).settings
         }
 
         throw new Error(`unexpected command: ${command}`)
@@ -889,7 +960,7 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    const select = getResponseProfileSelect(container)
+    const select = await getResponseProfileSelect(container)
 
     await act(async () => {
       setSelectValue(select, 'quality')
@@ -897,7 +968,7 @@ describe('App', () => {
     })
 
     expect(invokedCommands).toContain('switch_response_profile')
-    expect(select.value).toBe('quality')
+    expect(select.value).toBe('local-quality')
   })
 
   it('shows model loading indicator while profile switching is in progress', async () => {
@@ -922,6 +993,7 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: selectedProfile,
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
 
@@ -936,9 +1008,14 @@ describe('App', () => {
               resolve({
                 selected_response_profile: 'quality',
                 supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
               })
             }
           })
+        }
+
+        if (command === 'set_assistant_settings') {
+          return (args as { settings: unknown }).settings
         }
 
         throw new Error(`unexpected command: ${command}`)
@@ -946,7 +1023,7 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    const select = getResponseProfileSelect(container)
+    const select = await getResponseProfileSelect(container)
 
     await act(async () => {
       setSelectValue(select, 'quality')
@@ -961,7 +1038,7 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(select.value).toBe('quality')
+    expect(select.value).toBe('local-quality')
   })
 
   it('restores previous profile and hides profile switch errors from chat', async () => {
@@ -988,6 +1065,7 @@ describe('App', () => {
               silence_timeout_ms: 1500,
               selected_response_profile: 'fast',
               supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
             }
           }
 
@@ -1005,6 +1083,7 @@ describe('App', () => {
               message: 'Loading local Gemma model...',
               selected_response_profile: 'fast',
               supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
             }
           }
 
@@ -1020,6 +1099,7 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'fast',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
 
@@ -1032,7 +1112,7 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    const select = getResponseProfileSelect(container)
+    const select = await getResponseProfileSelect(container)
 
     await act(async () => {
       setSelectValue(select, 'quality')
@@ -1047,7 +1127,7 @@ describe('App', () => {
       'get_startup_state',
       'get_startup_state',
     ])
-    expect(select.value).toBe('fast')
+    expect(select.value).toBe('local-fast')
     expect(container.textContent).toContain('Profile switch failed')
     expect(container.textContent).not.toContain(
       'Response profile switch error: response backend is busy; wait for the active operation to finish',
@@ -1075,6 +1155,7 @@ describe('App', () => {
               silence_timeout_ms: 1500,
               selected_response_profile: 'fast',
               supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
             }
           }
 
@@ -1089,7 +1170,12 @@ describe('App', () => {
           return {
             selected_response_profile: 'quality',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
+        }
+
+        if (command === 'set_assistant_settings') {
+          return (args as { settings: unknown }).settings
         }
 
         throw new Error(`unexpected command: ${command}`)
@@ -1097,7 +1183,7 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    const select = getResponseProfileSelect(container)
+    const select = await getResponseProfileSelect(container)
 
     await act(async () => {
       setSelectValue(select, 'quality')
@@ -1130,8 +1216,11 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'quality',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
+
+        if (command === 'get_assistant_settings') return defaultAssistantSettings('local-quality')
 
         expect(command).toBe('submit_prompt')
           expect(args).toMatchObject({ requestId: expect.any(String), prompt: 'Draft release notes' })
@@ -1182,8 +1271,11 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'quality',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
+
+        if (command === 'get_assistant_settings') return defaultAssistantSettings('local-quality')
 
         return {
           request_id: (args as { requestId: string }).requestId,
@@ -1236,9 +1328,11 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'fast',
             supported_response_profiles: ['fast'],
+            capabilities: completeCapabilities(),
             prompt_cancellation_available: true,
           }
         }
+        if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
         if (command === 'submit_prompt') {
           if (
             typeof args === 'object' &&
@@ -1319,9 +1413,11 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'fast',
             supported_response_profiles: ['fast'],
+            capabilities: completeCapabilities(),
             prompt_cancellation_available: true,
           }
         }
+        if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
         if (command === 'submit_prompt') {
           throw 'OpenCode server is not available'
         }
@@ -1338,6 +1434,43 @@ describe('App', () => {
 
     expect(container.textContent).toContain('Response failed')
     expect(container.textContent).toContain('OpenCode server is not available')
+  })
+
+  it('marks retained partial output as failed when the prompt transport rejects', async () => {
+    let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
+    let rejectPrompt: ((error: Error) => void) | undefined
+    let requestId = ''
+    window.__TAURI_INTERNALS__ = {
+      listen: async (event, handler) => {
+        if (event === 'prompt-execution-event') promptEventHandler = handler
+        return () => undefined
+      },
+      invoke: async (command, args) => {
+        if (command === 'get_startup_state') return readyStartupState()
+        if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
+        if (command === 'submit_prompt') {
+          requestId = (args as { requestId: string }).requestId
+          return new Promise((_, reject) => { rejectPrompt = reject })
+        }
+        return null
+      },
+    }
+
+    const { container } = await renderApp()
+    await act(async () => {
+      setTextAreaValue(getComposer(container), 'Retain partial output')
+      getSendButton(container).click()
+      await Promise.resolve()
+      promptEventHandler?.({ payload: { request_id: requestId, kind: 'text', text: 'Partial answer' } })
+    })
+    await act(async () => {
+      rejectPrompt?.(new Error('stream disconnected'))
+      await Promise.resolve()
+    })
+
+    expect(container.textContent).toContain('Partial answer')
+    expect(container.querySelector('[aria-label="Instant status: failed"]')).not.toBeNull()
+    expect(container.textContent).toContain('stream disconnected')
   })
 
   it('shows authoritative OpenCode errors from the final prompt result', async () => {
@@ -1357,9 +1490,11 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'fast',
             supported_response_profiles: ['fast'],
+            capabilities: completeCapabilities(),
             prompt_cancellation_available: true,
           }
         }
+        if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
         if (
           command === 'submit_prompt' &&
           typeof args === 'object' &&
@@ -1413,9 +1548,11 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'fast',
             supported_response_profiles: ['fast'],
+            capabilities: completeCapabilities(),
             prompt_cancellation_available: true,
           }
         }
+        if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
         if (command === 'submit_prompt') {
           if (
             typeof args === 'object' &&
@@ -1501,8 +1638,11 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'quality',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
+
+        if (command === 'get_assistant_settings') return defaultAssistantSettings('local-quality')
 
         expect(command).toBe('submit_prompt')
         const requestId = (args as { requestId: string }).requestId
@@ -1564,6 +1704,7 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'quality',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
 
@@ -1579,6 +1720,7 @@ describe('App', () => {
            silence_timeout_ms: 1500,
            selected_response_profile: 'quality',
            supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
          }
       },
     }
@@ -1618,6 +1760,7 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'quality',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
 
@@ -1685,8 +1828,11 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'quality',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
+
+        if (command === 'get_assistant_settings') return defaultAssistantSettings('local-quality')
 
         if (command === 'ingest_audio_frame') {
           return {
@@ -1782,8 +1928,11 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'quality',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
+
+        if (command === 'get_assistant_settings') return defaultAssistantSettings('local-quality')
 
         if (command === 'ingest_audio_frame') {
           return {
@@ -1839,6 +1988,7 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'quality',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
 
@@ -1906,6 +2056,7 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: selectedProfile,
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
 
@@ -1915,6 +2066,7 @@ describe('App', () => {
           return {
             selected_response_profile: 'quality',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
 
@@ -1935,7 +2087,7 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    const select = getResponseProfileSelect(container)
+    const select = await getResponseProfileSelect(container)
 
     await act(async () => {
       setSelectValue(select, 'quality')
@@ -1951,6 +2103,210 @@ describe('App', () => {
 
     expect(invokedCommands).toContain('switch_response_profile')
     expect(invokedCommands.filter((command) => command === 'ingest_audio_frame')).toHaveLength(0)
+  })
+
+  it('stops live audio and rejects stale frames before resetting the session', async () => {
+    const stop = vi.fn()
+    let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
+    const invokedCommands: string[] = []
+    let resolveIngestFrame: () => void = () => undefined
+
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      onFrame = options.onFrame
+      return { stop }
+    })
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        invokedCommands.push(command)
+        if (command === 'get_startup_state') {
+          return readyStartupState({ voice_input_available: true })
+        }
+        if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
+        if (command === 'reset_session') return null
+        if (command === 'ingest_audio_frame') {
+          await new Promise<void>((resolve) => { resolveIngestFrame = resolve })
+          return {
+            runtime_phase: 'sleeping', transcription_ready_samples: null, transcript_text: null,
+            last_activity_ms: null, capturing_utterance: false, preroll_samples: 0, utterance_samples: 0,
+          }
+        }
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    expect(onFrame).not.toBeNull()
+    const frameHandler = onFrame as unknown as (frame: readonly number[]) => Promise<void> | void
+
+    await act(async () => {
+      getButtonByLabel(container, 'Settings').click()
+      await Promise.resolve()
+    })
+
+    const framePromise = frameHandler([0.2, -0.2, 0.2, -0.2])
+    await Promise.resolve()
+    expect(invokedCommands).toContain('ingest_audio_frame')
+
+    await act(async () => {
+      getButtonByLabel(container, 'Reset Session').click()
+      await Promise.resolve()
+    })
+
+    expect(invokedCommands).not.toContain('reset_session')
+    await act(async () => {
+      resolveIngestFrame()
+      await framePromise
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    })
+
+    expect(stop).toHaveBeenCalledTimes(1)
+    expect(invokedCommands.indexOf('ingest_audio_frame')).toBeLessThan(invokedCommands.indexOf('reset_session'))
+    expect(invokedCommands.filter((command) => command === 'ingest_audio_frame')).toHaveLength(1)
+  })
+
+  it('correlates partial transcription to the active listening session', async () => {
+    let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
+    let partialEventHandler: ((event: { payload: unknown }) => void) | undefined
+    let ingestCount = 0
+    class FakeAudio {
+      play(): Promise<void> { return Promise.resolve() }
+    }
+    Object.defineProperty(globalThis, 'Audio', { configurable: true, value: FakeAudio })
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      onFrame = options.onFrame
+      return { stop: vi.fn() }
+    })
+    window.__TAURI_INTERNALS__ = {
+      listen: async (event, handler) => {
+        if (event === 'partial-transcription-event') partialEventHandler = handler
+        return () => undefined
+      },
+      invoke: async (command) => {
+        if (command === 'get_startup_state') return readyStartupState({ voice_input_available: true })
+        if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
+        if (command === 'ingest_audio_frame') {
+          ingestCount += 1
+          return {
+            runtime_phase: ingestCount === 2 ? 'sleeping' : 'listening',
+            transcription_ready_samples: null,
+            transcript_text: null,
+            last_activity_ms: null,
+            capturing_utterance: ingestCount !== 2,
+            preroll_samples: 0,
+            utterance_samples: 0,
+          }
+        }
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    const emitPartial = async (sessionId: number, revision: number, text: string) => {
+      await act(async () => {
+        partialEventHandler?.({ payload: { session_id: sessionId, revision, text } })
+        await Promise.resolve()
+      })
+    }
+    await emitPartial(1, 1, 'before listening')
+    expect(container.textContent).not.toContain('before listening')
+
+    const frame = onFrame as unknown as (samples: readonly number[]) => Promise<void> | void
+    await act(async () => { await frame([0.2, -0.2]); await Promise.resolve() })
+    await emitPartial(1, 1, 'current partial')
+    expect(container.textContent).toContain('current partial')
+    await emitPartial(2, 2, 'wrong session')
+    await emitPartial(1, 1, 'stale revision')
+    expect(container.textContent).not.toContain('wrong session')
+    expect(container.textContent).not.toContain('stale revision')
+
+    await act(async () => { await frame([0.2, -0.2]); await Promise.resolve() })
+    await emitPartial(1, 2, 'after listening')
+    expect(container.textContent).not.toContain('after listening')
+
+    await act(async () => { await frame([0.2, -0.2]); await Promise.resolve() })
+    await emitPartial(1, 3, 'previous session')
+    await emitPartial(2, 3, 'next session')
+    expect(container.textContent).not.toContain('previous session')
+    expect(container.textContent).toContain('next session')
+  })
+
+  it('invalidates a pending prompt before reset and ignores late output', async () => {
+    let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
+    let partialEventHandler: ((event: { payload: unknown }) => void) | undefined
+    let activeRequestId = ''
+    let resolveReset: () => void = () => undefined
+    const invokedCommands: string[] = []
+
+    window.__TAURI_INTERNALS__ = {
+      listen: async (event, handler) => {
+        if (event === 'prompt-execution-event') promptEventHandler = handler
+        if (event === 'partial-transcription-event') partialEventHandler = handler
+        return () => undefined
+      },
+      invoke: async (command, args) => {
+        invokedCommands.push(command)
+        if (command === 'get_startup_state') return readyStartupState({ prompt_cancellation_available: true })
+        if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
+        if (command === 'submit_prompt') {
+          activeRequestId = (args as { requestId: string }).requestId
+          return new Promise(() => undefined)
+        }
+        if (command === 'cancel_prompt') return null
+        if (command === 'reset_session') {
+          await new Promise<void>((resolve) => { resolveReset = resolve })
+          return null
+        }
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    await act(async () => {
+      setTextAreaValue(getComposer(container), 'Reset this prompt')
+      getSendButton(container).click()
+      await Promise.resolve()
+    })
+    expect(activeRequestId).not.toBe('')
+
+    await act(async () => {
+      getButtonByLabel(container, 'Settings').click()
+      await Promise.resolve()
+    })
+    await act(async () => {
+      getButtonByLabel(container, 'Reset Session').click()
+      await Promise.resolve()
+    })
+    getButtonByLabel(container, 'Reset Session').click()
+    await act(async () => {
+      setTextAreaValue(getComposer(container), 'Blocked during reset')
+      getComposer(container).dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+      await Promise.resolve()
+    })
+
+    expect(invokedCommands).toContain('cancel_prompt')
+    expect(invokedCommands).toContain('reset_session')
+    expect(invokedCommands.filter((command) => command === 'reset_session')).toHaveLength(1)
+    expect(invokedCommands.filter((command) => command === 'submit_prompt')).toHaveLength(1)
+    expect(invokedCommands.indexOf('cancel_prompt')).toBeLessThan(invokedCommands.indexOf('reset_session'))
+    promptEventHandler?.({ payload: { request_id: activeRequestId, kind: 'text', text: 'late output' } })
+    promptEventHandler?.({ payload: { request_id: activeRequestId, kind: 'error', message: 'late failure' } })
+    partialEventHandler?.({ payload: { session_id: 999, revision: 1, text: 'late partial' } })
+    expect(container.textContent).not.toContain('late output')
+    expect(container.textContent).not.toContain('late failure')
+    expect(container.textContent).not.toContain('late partial')
+
+    await act(async () => {
+      resolveReset()
+      await Promise.resolve()
+    })
+    expect(container.textContent).not.toContain('Reset this prompt')
+    expect(container.textContent).not.toContain('late output')
+    expect(container.textContent).not.toContain('late failure')
+    await act(async () => {
+      setTextAreaValue(getComposer(container), 'Prompt after reset')
+    })
+    expect(getSendButton(container).disabled).toBe(false)
   })
 
   it('ignores in-flight frame results that resolve after profile switch', async () => {
@@ -1985,6 +2341,7 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: selectedProfile,
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
 
@@ -2014,7 +2371,16 @@ describe('App', () => {
           return {
             selected_response_profile: 'quality',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
+        }
+
+        if (command === 'set_assistant_settings') {
+          return (args as { settings: unknown }).settings
+        }
+
+        if (command === 'set_assistant_settings') {
+          return (args as { settings: unknown }).settings
         }
 
         throw new Error(`unexpected command: ${command}`)
@@ -2022,7 +2388,7 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    const select = getResponseProfileSelect(container)
+    const select = await getResponseProfileSelect(container)
 
     expect(onFrame).not.toBeNull()
     const frameHandler = onFrame as unknown as (frame: readonly number[]) => Promise<void> | void
@@ -2086,6 +2452,7 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: selectedProfile,
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
 
@@ -2115,6 +2482,7 @@ describe('App', () => {
           return {
             selected_response_profile: 'quality',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
 
@@ -2123,7 +2491,7 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    const select = getResponseProfileSelect(container)
+    const select = await getResponseProfileSelect(container)
 
     expect(onFrame).not.toBeNull()
     const frameHandler = onFrame as unknown as (frame: readonly number[]) => Promise<void> | void
@@ -2186,6 +2554,7 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: selectedProfile,
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
 
@@ -2211,7 +2580,12 @@ describe('App', () => {
           return {
             selected_response_profile: 'quality',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
+        }
+
+        if (command === 'set_assistant_settings') {
+          return (args as { settings: unknown }).settings
         }
 
         throw new Error(`unexpected command: ${command}`)
@@ -2219,7 +2593,7 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    const select = getResponseProfileSelect(container)
+    const select = await getResponseProfileSelect(container)
 
     expect(onFrame).not.toBeNull()
     const frameHandler = onFrame as unknown as (frame: readonly number[]) => Promise<void> | void
@@ -2282,6 +2656,7 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: selectedProfile,
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
 
@@ -2291,6 +2666,7 @@ describe('App', () => {
           return {
             selected_response_profile: 'quality',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
 
@@ -2299,7 +2675,7 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    const select = getResponseProfileSelect(container)
+    const select = await getResponseProfileSelect(container)
 
     await act(async () => {
       setSelectValue(select, 'quality')
@@ -2353,6 +2729,7 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: selectedProfile,
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
 
@@ -2362,6 +2739,7 @@ describe('App', () => {
           return {
             selected_response_profile: 'quality',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
 
@@ -2370,7 +2748,7 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    const select = getResponseProfileSelect(container)
+    const select = await getResponseProfileSelect(container)
 
     await act(async () => {
       setSelectValue(select, 'quality')
@@ -2430,6 +2808,7 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'quality',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
 
@@ -2527,8 +2906,11 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'quality',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
+
+        if (command === 'get_assistant_settings') return defaultAssistantSettings('local-quality')
 
         if (command === 'ingest_audio_frame') {
           return {
@@ -2599,6 +2981,302 @@ describe('App', () => {
     expect(container.textContent).toContain('Stop mic')
   })
 
+  it('does not submit a voice transcript through an unavailable Instant provider', async () => {
+    let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
+    const invokedCommands: string[] = []
+    let nowMs = 1_000
+
+    class FakeAudio {
+      play(): Promise<void> {
+        return Promise.resolve()
+      }
+    }
+
+    Date.now = () => nowMs
+    Object.defineProperty(globalThis, 'Audio', { configurable: true, value: FakeAudio })
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      onFrame = options.onFrame
+      return { stop: vi.fn() }
+    })
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        invokedCommands.push(command)
+        if (command === 'get_startup_state') {
+          return readyStartupState({
+            capabilities: completeCapabilities({ opencode: 'unavailable' }),
+          })
+        }
+        if (command === 'get_assistant_settings') {
+          return {
+            instant: 'opencode-sol-high', deep: 'opencode-sol-high', review: 'opencode-sol-high',
+            deep_enabled: false, review_enabled: false, prefetch: false, completion: false,
+          }
+        }
+        if (command === 'ingest_audio_frame') {
+          return {
+            runtime_phase: 'listening', transcription_ready_samples: null, transcript_text: null,
+            last_activity_ms: 1_000, capturing_utterance: true, preroll_samples: 4, utterance_samples: 4,
+          }
+        }
+        if (command === 'mark_silence') {
+          return {
+            runtime_phase: 'processing', transcription_ready_samples: 3200,
+            transcript_text: 'Do not send this transcript', last_activity_ms: null,
+            capturing_utterance: false, preroll_samples: 4, utterance_samples: 0,
+          }
+        }
+        if (command === 'submit_prompt') throw new Error('voice prompt bypassed provider gate')
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    await renderApp()
+    await act(async () => {
+      await onFrame?.([0.04, -0.04, 0.04, -0.04])
+    })
+    nowMs = 3_600
+    await act(async () => {
+      await onFrame?.([0.001, -0.001, 0.001, -0.001])
+    })
+
+    expect(invokedCommands).toContain('mark_silence')
+    expect(invokedCommands).not.toContain('submit_prompt')
+  })
+
+  it('keeps typed and voice submission fail-closed when native settings fail to load', async () => {
+    let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
+    const invokedCommands: string[] = []
+    let nowMs = 1_000
+
+    class FakeAudio {
+      play(): Promise<void> {
+        return Promise.resolve()
+      }
+    }
+
+    Date.now = () => nowMs
+    Object.defineProperty(globalThis, 'Audio', { configurable: true, value: FakeAudio })
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      onFrame = options.onFrame
+      return { stop: vi.fn() }
+    })
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        invokedCommands.push(command)
+        if (command === 'get_startup_state') return readyStartupState()
+        if (command === 'get_assistant_settings') throw new Error('settings are unreadable')
+        if (command === 'ingest_audio_frame') {
+          return {
+            runtime_phase: 'listening', transcription_ready_samples: null, transcript_text: null,
+            last_activity_ms: 1_000, capturing_utterance: true, preroll_samples: 4, utterance_samples: 4,
+          }
+        }
+        if (command === 'mark_silence') {
+          return {
+            runtime_phase: 'processing', transcription_ready_samples: 3200,
+            transcript_text: 'Blocked voice prompt', last_activity_ms: null,
+            capturing_utterance: false, preroll_samples: 4, utterance_samples: 0,
+          }
+        }
+        if (command === 'submit_prompt') throw new Error('settings failure gate was bypassed')
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    await act(async () => {
+      setTextAreaValue(getComposer(container), 'Blocked typed prompt')
+    })
+    expect(getSendButton(container).disabled).toBe(true)
+    await act(async () => {
+      await onFrame?.([0.04, -0.04, 0.04, -0.04])
+    })
+    nowMs = 3_600
+    await act(async () => {
+      await onFrame?.([0.001, -0.001, 0.001, -0.001])
+    })
+    await act(async () => {
+      getButtonByLabel(container, 'Settings').click()
+      await Promise.resolve()
+    })
+
+    expect(invokedCommands).not.toContain('submit_prompt')
+    expect(invokedCommands).not.toContain('request_completion')
+    expect(container.textContent).toContain('Assistant settings unavailable: settings are unreadable')
+    expect(Array.from(container.querySelectorAll<HTMLSelectElement>('.settings-panel__assistant select')).every((control) => control.disabled)).toBe(true)
+    expect(Array.from(container.querySelectorAll<HTMLInputElement>('.settings-panel__assistant input')).every((control) => control.disabled)).toBe(true)
+  })
+
+  it('blocks typed and voice prompts when the selected local profile is not loaded', async () => {
+    let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
+    const invokedCommands: string[] = []
+    let nowMs = 1_000
+
+    class FakeAudio {
+      play(): Promise<void> {
+        return Promise.resolve()
+      }
+    }
+
+    Date.now = () => nowMs
+    Object.defineProperty(globalThis, 'Audio', { configurable: true, value: FakeAudio })
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      onFrame = options.onFrame
+      return { stop: vi.fn() }
+    })
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        invokedCommands.push(command)
+        if (command === 'get_startup_state') return readyStartupState({ selected_response_profile: 'fast' })
+        if (command === 'get_assistant_settings') return defaultAssistantSettings('local-quality')
+        if (command === 'ingest_audio_frame') {
+          return {
+            runtime_phase: 'listening', transcription_ready_samples: null, transcript_text: null,
+            last_activity_ms: 1_000, capturing_utterance: true, preroll_samples: 4, utterance_samples: 4,
+          }
+        }
+        if (command === 'mark_silence') {
+          return {
+            runtime_phase: 'processing', transcription_ready_samples: 3200,
+            transcript_text: 'Mismatched voice prompt', last_activity_ms: null,
+            capturing_utterance: false, preroll_samples: 4, utterance_samples: 0,
+          }
+        }
+        if (command === 'submit_prompt') throw new Error('profile gate was bypassed')
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    await act(async () => {
+      setTextAreaValue(getComposer(container), 'Mismatched typed prompt')
+    })
+    expect(getSendButton(container).disabled).toBe(true)
+    expect(container.textContent).toContain('selected local model profile is not loaded')
+    await act(async () => {
+      await onFrame?.([0.04, -0.04, 0.04, -0.04])
+    })
+    nowMs = 3_600
+    await act(async () => {
+      await onFrame?.([0.001, -0.001, 0.001, -0.001])
+    })
+
+    expect(invokedCommands).not.toContain('submit_prompt')
+  })
+
+  it('uses TTS and assistant settings updated after the microphone starts', async () => {
+    let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
+    let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
+    let resolveSettings: (settings: unknown) => void = () => undefined
+    const pendingSettings = new Promise<unknown>((resolve) => { resolveSettings = resolve })
+    const invokedCommands: string[] = []
+    let nowMs = 1_000
+
+    class FakeAudio {
+      play(): Promise<void> {
+        return Promise.resolve()
+      }
+    }
+
+    class FakeAudioContext {
+      destination = {} as AudioDestinationNode
+      state: AudioContextState = 'running'
+
+      createBuffer(): AudioBuffer {
+        return { copyToChannel: () => {} } as unknown as AudioBuffer
+      }
+
+      createBufferSource(): AudioBufferSourceNode {
+        return {
+          buffer: null,
+          connect: () => {},
+          onended: null,
+          start: function start(this: AudioBufferSourceNode) {
+            this.onended?.(new Event('ended'))
+          },
+        } as unknown as AudioBufferSourceNode
+      }
+
+      createGain(): GainNode {
+        return {
+          gain: { value: 1 } as AudioParam,
+          connect: () => {},
+        } as unknown as GainNode
+      }
+
+      async resume(): Promise<void> {}
+      async close(): Promise<void> {}
+    }
+
+    Date.now = () => nowMs
+    Object.defineProperty(globalThis, 'Audio', { configurable: true, value: FakeAudio })
+    Object.defineProperty(globalThis, 'AudioContext', { configurable: true, value: FakeAudioContext })
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      onFrame = options.onFrame
+      return { stop: vi.fn() }
+    })
+    window.__TAURI_INTERNALS__ = {
+      listen: async (event, handler) => {
+        if (event === 'prompt-execution-event') promptEventHandler = handler
+        return () => undefined
+      },
+      invoke: async (command, args) => {
+        invokedCommands.push(command)
+        if (command === 'get_startup_state') return readyStartupState({ tts_enabled: false })
+        if (command === 'get_assistant_settings') return pendingSettings
+        if (command === 'set_tts_enabled') return { enabled: true, sample_rate_hz: 22050 }
+        if (command === 'ingest_audio_frame') {
+          return {
+            runtime_phase: 'listening', transcription_ready_samples: null, transcript_text: null,
+            last_activity_ms: 1_000, capturing_utterance: true, preroll_samples: 4, utterance_samples: 4,
+          }
+        }
+        if (command === 'mark_silence') {
+          return {
+            runtime_phase: 'processing', transcription_ready_samples: 3200,
+            transcript_text: 'Use current voice settings', last_activity_ms: null,
+            capturing_utterance: false, preroll_samples: 4, utterance_samples: 0,
+          }
+        }
+        if (command === 'submit_prompt') {
+          const requestId = (args as { requestId: string }).requestId
+          promptEventHandler?.({
+            payload: { request_id: requestId, kind: 'text', text: 'Current settings response' },
+          })
+          return {
+            request_id: requestId, outcome: 'completed', error_message: null, runtime_phase: 'sleeping',
+          }
+        }
+        if (command === 'synthesize_local_tts') {
+          return { pcm_f32: [0, 0.1], sample_rate_hz: 22050, duration_ms: 1 }
+        }
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    expect(startLiveAudioSourceMock).toHaveBeenCalledTimes(1)
+    await act(async () => {
+      getTtsToggle(container).click()
+      resolveSettings({
+        instant: 'local-fast', deep: 'opencode-sol-high', review: 'opencode-sol-high',
+        deep_enabled: true, review_enabled: false, prefetch: false, completion: false,
+      })
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await onFrame?.([0.04, -0.04, 0.04, -0.04])
+    })
+    nowMs = 3_600
+    await act(async () => {
+      await onFrame?.([0.001, -0.001, 0.001, -0.001])
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+
+    expect(invokedCommands).toContain('synthesize_local_tts')
+    expect(container.querySelector('[aria-label="Deep status: stale"]')).not.toBeNull()
+  })
+
   it('uses configured startup silence timeout for auto-stop timing', async () => {
     const stop = vi.fn()
     let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
@@ -2639,6 +3317,7 @@ describe('App', () => {
             silence_timeout_ms: 3000,
             selected_response_profile: 'quality',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
 
@@ -2746,6 +3425,7 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'quality',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
 
@@ -2853,6 +3533,7 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'quality',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
 
@@ -2939,6 +3620,7 @@ describe('App', () => {
           silence_timeout_ms: 1500,
           selected_response_profile: 'quality',
           supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
         }
       },
     }
@@ -2971,6 +3653,7 @@ describe('App', () => {
           silence_timeout_ms: 1500,
           selected_response_profile: 'quality',
           supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
         }
       },
     }
@@ -2981,6 +3664,177 @@ describe('App', () => {
     expect(container.textContent).not.toContain('live_audio:\ndefault microphone started')
     expect(container.querySelector('details.shell__manual-controls')).toBeNull()
     expect(container.textContent).not.toContain('Stop listening and process')
+  })
+
+  it('does not auto-start microphone capture when wake-word capability is unavailable', async () => {
+    const wakeReason = 'wake word model is unavailable for this test'
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        expect(command).toBe('get_startup_state')
+        return readyStartupState({
+          voice_input_available: true,
+          capabilities: completeCapabilities({ wake_word: 'unavailable' }).map((capability) =>
+            capability['id'] === 'wake_word' ? { ...capability, reason: wakeReason } : capability,
+          ),
+        })
+      },
+    }
+
+    const { container } = await renderApp()
+    const startMic = getControlButton(container, 'Start mic')
+    const autoStop = getAutoStopToggle(container)
+    const describedBy = startMic.getAttribute('aria-describedby')
+    const description = describedBy === null ? null : container.querySelector(`#${describedBy}`)
+
+    expect(startLiveAudioSourceMock).not.toHaveBeenCalled()
+    expect(startMic.disabled).toBe(true)
+    expect(autoStop.disabled).toBe(true)
+    expect(container.textContent).toContain(wakeReason)
+    expect(describedBy).not.toBeNull()
+    expect(description?.textContent).toContain(wakeReason)
+    expect(autoStop.getAttribute('aria-describedby')).toBe(describedBy)
+  })
+
+  it('ignores typed completion events from before prompt submission', async () => {
+    let completionEventHandler: ((event: { payload: unknown }) => void) | undefined
+    window.__TAURI_INTERNALS__ = {
+      listen: async (event, handler) => {
+        if (event === 'completion-event') completionEventHandler = handler
+        return () => undefined
+      },
+      invoke: async (command, args) => {
+        if (command === 'get_startup_state') return readyStartupState()
+        if (command === 'get_assistant_settings') {
+          return {
+            instant: 'local-fast', deep: 'opencode-sol-high', review: 'opencode-sol-high',
+            deep_enabled: false, review_enabled: false, prefetch: false, completion: true,
+          }
+        }
+        if (command === 'request_completion' || command === 'clear_completion') return null
+        if (command === 'submit_prompt') {
+          return {
+            request_id: (args as { requestId: string }).requestId,
+            outcome: 'completed', error_message: null, runtime_phase: 'sleeping',
+          }
+        }
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    await act(async () => {
+      completionEventHandler?.({
+        payload: {
+          source: 'typed', revision: 0, voice_session_id: null, suffix: ' UNSOLICITED_COMPLETION',
+        },
+      })
+      await Promise.resolve()
+    })
+    expect(container.textContent).not.toContain('UNSOLICITED_COMPLETION')
+    await act(async () => {
+      setTextAreaValue(getComposer(container), 'submit before completion')
+    })
+    await act(async () => {
+      getSendButton(container).click()
+      await Promise.resolve()
+    })
+    await act(async () => {
+      completionEventHandler?.({
+        payload: {
+          source: 'typed', revision: 1, voice_session_id: null, suffix: ' STALE_COMPLETION',
+        },
+      })
+      await Promise.resolve()
+    })
+
+    expect(container.textContent).not.toContain('STALE_COMPLETION')
+    expect(getComposer(container).value).toBe('')
+  })
+
+  it('does not synthesize a pending response after TTS is disabled', async () => {
+    let finishPrompt: ((value: unknown) => void) | undefined
+    let promptRequestId = ''
+    const invoked: string[] = []
+
+    window.__TAURI_INTERNALS__ = {
+      listen: async () => () => undefined,
+      invoke: async (command, args) => {
+        invoked.push(command)
+        if (command === 'get_startup_state') return readyStartupState({ tts_enabled: false })
+        if (command === 'set_tts_enabled') return { enabled: args && (args as { enabled: boolean }).enabled }
+        if (command === 'submit_prompt') {
+          promptRequestId = (args as { requestId: string }).requestId
+          return new Promise((resolve) => { finishPrompt = resolve })
+        }
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    await act(async () => { getTtsToggle(container).click(); await Promise.resolve() })
+    await act(async () => {
+      setTextAreaValue(getComposer(container), 'pending response')
+      getSendButton(container).click()
+      await Promise.resolve()
+    })
+    await act(async () => { getTtsToggle(container).click(); await Promise.resolve() })
+    await act(async () => {
+      finishPrompt?.({ request_id: promptRequestId, outcome: 'completed', runtime_phase: 'sleeping' })
+      await Promise.resolve()
+    })
+
+    expect(invoked).not.toContain('synthesize_local_tts')
+  })
+
+  it('marks a Deep-only correction as Deep corrected without requiring Review', async () => {
+    let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
+    let finishPrompt: ((value: unknown) => void) | undefined
+    let requestId = ''
+    let synthesizedText = ''
+    window.__TAURI_INTERNALS__ = {
+      listen: async (event, handler) => {
+        if (event !== 'prompt-execution-event') return () => undefined
+        promptEventHandler = handler
+        return () => undefined
+      },
+      invoke: async (command, args) => {
+        if (command === 'get_startup_state') return readyStartupState({ tts_enabled: true })
+        if (command === 'get_assistant_settings') return {
+          instant: 'local-fast', deep: 'opencode-sol-high', review: 'opencode-sol-high',
+          deep_enabled: true, review_enabled: false, prefetch: false, completion: false,
+        }
+        if (command === 'submit_prompt') {
+          requestId = (args as { requestId: string }).requestId
+          return new Promise((resolve) => { finishPrompt = resolve })
+        }
+        if (command === 'synthesize_local_tts') {
+          synthesizedText = (args as { text: string }).text
+          return { pcm_f32: [0], sample_rate_hz: 22050, duration_ms: 1 }
+        }
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    await act(async () => {
+      setTextAreaValue(getComposer(container), 'correct this')
+      getSendButton(container).click()
+      await Promise.resolve()
+      await Promise.resolve()
+      promptEventHandler?.({ payload: { request_id: requestId, kind: 'status', message: 'Deep running' } })
+      promptEventHandler?.({ payload: { request_id: requestId, kind: 'correction', text: 'Corrected answer', correction: 'Correction: Deep correction' } })
+      await Promise.resolve()
+    })
+
+    expect(container.textContent).toContain('Deep')
+    expect(container.textContent).toContain('Corrected answer')
+    expect(synthesizedText).toBe('Corrected answer')
+    expect(container.querySelector('[aria-label="Deep status: corrected"]')).not.toBeNull()
+    expect(container.querySelector('[aria-label="Review status: corrected"]')).toBeNull()
+    await act(async () => {
+      finishPrompt?.({ request_id: requestId, outcome: 'cancelled', runtime_phase: 'sleeping' })
+      await Promise.resolve()
+    })
   })
 
   it('does not auto-stop on silence when the toggle is disabled', async () => {
@@ -3023,6 +3877,7 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'quality',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
 
@@ -3107,6 +3962,7 @@ describe('App', () => {
             silence_timeout_ms: 1500,
             selected_response_profile: 'quality',
             supported_response_profiles: ['fast', 'quality'],
+            capabilities: completeCapabilities(),
           }
         }
 
@@ -3168,6 +4024,41 @@ async function renderApp(): Promise<{ container: HTMLElement }> {
   }
 
   return { container }
+}
+
+function completeCapabilities(overrides: Record<string, string> = {}): Array<Record<string, unknown>> {
+  return ['custom_provider', 'opencode', 'local_fast', 'local_quality', 'qwen_prediction', 'wake_word', 'vad', 'parakeet', 'tts', 'deep', 'review']
+    .map((id) => ({ id, state: overrides[id] ?? 'available', reason: 'test fixture', actual_provider: null }))
+}
+
+function readyStartupState(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    kind: 'ready',
+    cue_asset_paths: { start_listening: 'start.wav', stop_listening: 'stop.wav' },
+    runtime_phase: 'sleeping',
+    voice_input_available: true,
+    voice_input_error: null,
+    silence_timeout_ms: 1500,
+    selected_response_profile: 'fast',
+    supported_response_profiles: ['fast', 'quality'],
+    tts_enabled: false,
+    capabilities: completeCapabilities(),
+    ...overrides,
+  }
+}
+
+function defaultAssistantSettings(
+  instant: 'local-fast' | 'local-quality' = 'local-fast',
+): Record<string, unknown> {
+  return {
+    instant,
+    deep: 'opencode-sol-high',
+    review: 'opencode-sol-high',
+    deep_enabled: false,
+    review_enabled: false,
+    prefetch: false,
+    completion: false,
+  }
 }
 
 function getComposer(container: HTMLElement): HTMLTextAreaElement {
@@ -3256,8 +4147,12 @@ function getTtsToggle(container: HTMLElement): HTMLInputElement {
   return toggle
 }
 
-function getResponseProfileSelect(container: HTMLElement): HTMLSelectElement {
-  const select = container.querySelector<HTMLSelectElement>('#responseProfileSelect')
+async function getResponseProfileSelect(container: HTMLElement): Promise<HTMLSelectElement> {
+  await act(async () => {
+    getButtonByLabel(container, 'Settings').click()
+    await Promise.resolve()
+  })
+  const select = container.querySelector<HTMLSelectElement>('#assistantInstantSelect')
 
   if (select === null) {
     throw new Error('Missing response profile select')
@@ -3267,6 +4162,7 @@ function getResponseProfileSelect(container: HTMLElement): HTMLSelectElement {
 }
 
 function setSelectValue(select: HTMLSelectElement, value: string): void {
+  if (select.id === 'assistantInstantSelect') value = value === 'quality' ? 'local-quality' : value === 'fast' ? 'local-fast' : value
   select.value = value
   select.dispatchEvent(new Event('change', { bubbles: true }))
 }
@@ -3279,7 +4175,9 @@ function nonDiagnosticCommands(commands: readonly string[]): readonly string[] {
       command !== 'get_ui_text_size' &&
       command !== 'set_ui_text_size' &&
       command !== 'get_ui_theme' &&
-      command !== 'set_ui_theme',
+      command !== 'set_ui_theme' &&
+      command !== 'get_assistant_settings' &&
+      command !== 'set_assistant_settings',
   )
 }
 

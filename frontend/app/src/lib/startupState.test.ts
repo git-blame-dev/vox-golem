@@ -1,14 +1,70 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { DEFAULT_CUE_ASSET_PATHS, isStartupStateSettled, loadStartupState, parseStartupState } from './startupState'
 
+const COMPLETE_CAPABILITIES = [
+  'custom_provider', 'opencode', 'local_fast', 'local_quality', 'qwen_prediction',
+  'wake_word', 'vad', 'parakeet', 'tts', 'deep', 'review',
+].map((id) => ({ id, state: 'not_configured', reason: `${id} is not configured`, actual_provider: null }))
+
 afterEach(() => {
   Reflect.deleteProperty(window, '__TAURI_INTERNALS__')
 })
 
 describe('parseStartupState', () => {
+  it('strictly parses every zero-asset capability without making startup fatal', () => {
+    const capabilities = [
+      'custom_provider', 'opencode', 'local_fast', 'local_quality', 'qwen_prediction',
+      'wake_word', 'vad', 'parakeet', 'tts', 'deep', 'review',
+    ].map((id) => ({ id, state: 'not_configured', reason: `${id} is not configured`, actual_provider: null }))
+
+    const state = parseStartupState({
+      kind: 'ready',
+      cue_asset_paths: { start_listening: 'start.wav', stop_listening: 'stop.wav' },
+      runtime_phase: 'sleeping',
+      voice_input_available: false,
+      voice_input_error: 'voice assets are not configured',
+      silence_timeout_ms: 1500,
+      selected_response_profile: 'fast',
+      supported_response_profiles: [],
+      capabilities,
+    })
+
+    expect(state.kind).toBe('ready')
+    if (state.kind === 'ready') {
+      expect(state.capabilities.map(({ id }) => id)).toEqual(capabilities.map(({ id }) => id))
+      expect(state.supportedResponseProfiles).toEqual([])
+    }
+  })
+
+  it('rejects an incomplete native capability contract', () => {
+    expect(() => parseStartupState({
+      kind: 'ready',
+      cue_asset_paths: { start_listening: 'start.wav', stop_listening: 'stop.wav' },
+      runtime_phase: 'sleeping',
+      voice_input_available: false,
+      voice_input_error: null,
+      silence_timeout_ms: 1500,
+      selected_response_profile: 'fast',
+      supported_response_profiles: [],
+      capabilities: [{ id: 'opencode', state: 'failed', reason: 'failed', actual_provider: null }],
+    })).toThrow('Startup payload is missing capabilities')
+  })
+
+  it('rejects a native payload that omits capabilities', () => {
+    expect(() => parseStartupState({
+      kind: 'ready',
+      cue_asset_paths: { start_listening: 'start.wav', stop_listening: 'stop.wav' },
+      runtime_phase: 'sleeping',
+      voice_input_available: false,
+      voice_input_error: null,
+      silence_timeout_ms: 1500,
+      selected_response_profile: 'fast',
+      supported_response_profiles: [],
+    })).toThrow('Startup payload must include capabilities')
+  })
+
   it('returns ready state with configured cue paths for ready payload', () => {
-    expect(
-      parseStartupState({
+    expect(parseStartupState({
         kind: 'ready',
         cue_asset_paths: {
           start_listening: 'resources/start-listening.wav',
@@ -19,9 +75,10 @@ describe('parseStartupState', () => {
         voice_input_error: null,
         silence_timeout_ms: 1500,
         selected_response_profile: 'fast',
-        supported_response_profiles: ['fast', 'quality'],
+         supported_response_profiles: ['fast', 'quality'],
+         capabilities: COMPLETE_CAPABILITIES,
       }),
-    ).toEqual({
+    ).toEqual(expect.objectContaining({
       kind: 'ready',
       cueAssetPaths: {
         startListening: 'resources/start-listening.wav',
@@ -36,7 +93,7 @@ describe('parseStartupState', () => {
       promptCancellationAvailable: false,
       ttsEnabled: false,
       ttsOutputGainDb: 3,
-    })
+    }))
   })
 
   it('returns error state for valid error payload', () => {
@@ -45,10 +102,10 @@ describe('parseStartupState', () => {
         kind: 'error',
         message: 'config file not found',
       }),
-    ).toEqual({
+    ).toEqual(expect.objectContaining({
       kind: 'error',
       message: 'config file not found',
-    })
+    }))
   })
 
   it('parses explicit tts_output_gain_db from ready payload', () => {
@@ -64,10 +121,11 @@ describe('parseStartupState', () => {
         voice_input_error: null,
         silence_timeout_ms: 1500,
         selected_response_profile: 'fast',
-        supported_response_profiles: ['fast', 'quality'],
+         supported_response_profiles: ['fast', 'quality'],
+         capabilities: COMPLETE_CAPABILITIES,
         tts_output_gain_db: 6,
       }),
-    ).toEqual({
+    ).toEqual(expect.objectContaining({
       kind: 'ready',
       cueAssetPaths: {
         startListening: 'resources/start-listening.wav',
@@ -82,7 +140,7 @@ describe('parseStartupState', () => {
       promptCancellationAvailable: false,
       ttsEnabled: false,
       ttsOutputGainDb: 6,
-    })
+    }))
   })
 
   it('returns warming state for valid warming payload', () => {
@@ -99,9 +157,10 @@ describe('parseStartupState', () => {
         silence_timeout_ms: 1500,
         message: 'Loading local Gemma model...',
         selected_response_profile: 'quality',
-        supported_response_profiles: ['fast', 'quality'],
+         supported_response_profiles: ['fast', 'quality'],
+         capabilities: COMPLETE_CAPABILITIES,
       }),
-    ).toEqual({
+    ).toEqual(expect.objectContaining({
       kind: 'warming_model',
       cueAssetPaths: {
         startListening: 'resources/start-listening.wav',
@@ -117,7 +176,7 @@ describe('parseStartupState', () => {
       promptCancellationAvailable: false,
       ttsEnabled: false,
       ttsOutputGainDb: 3,
-    })
+    }))
   })
 
   it('throws when startup payload omits selected response profile', () => {
@@ -172,8 +231,8 @@ describe('parseStartupState', () => {
     ).toThrow('Selected response profile must be present in supported_response_profiles')
   })
 
-  it('throws when supported response profiles is empty', () => {
-    expect(() =>
+  it('allows empty response profiles when no provider is available', () => {
+    expect(
       parseStartupState({
         kind: 'ready',
         cue_asset_paths: {
@@ -184,10 +243,10 @@ describe('parseStartupState', () => {
         voice_input_available: true,
         voice_input_error: null,
         silence_timeout_ms: 1500,
-        selected_response_profile: 'fast',
-        supported_response_profiles: [],
-      }),
-    ).toThrow('Startup payload must include at least one supported_response_profile')
+         selected_response_profile: 'fast',
+         supported_response_profiles: [],
+         capabilities: COMPLETE_CAPABILITIES,
+       })).toEqual(expect.objectContaining({ supportedResponseProfiles: [] }))
   })
 
   it('throws when startup payload includes unsupported response profile tokens', () => {
@@ -266,6 +325,7 @@ describe('isStartupStateSettled', () => {
         promptCancellationAvailable: false,
         ttsEnabled: false,
         ttsOutputGainDb: 3,
+        capabilities: [],
       }),
     ).toBe(false)
   })
@@ -284,6 +344,7 @@ describe('isStartupStateSettled', () => {
         promptCancellationAvailable: false,
         ttsEnabled: false,
         ttsOutputGainDb: 3,
+        capabilities: [],
       }),
     ).toBe(true)
     expect(
@@ -297,7 +358,7 @@ describe('isStartupStateSettled', () => {
 
 describe('loadStartupState', () => {
   it('falls back to default cue assets when tauri internals are unavailable', async () => {
-    await expect(loadStartupState()).resolves.toEqual({
+    await expect(loadStartupState()).resolves.toEqual(expect.objectContaining({
       kind: 'ready',
       cueAssetPaths: DEFAULT_CUE_ASSET_PATHS,
       runtimePhase: 'sleeping',
@@ -309,7 +370,7 @@ describe('loadStartupState', () => {
       promptCancellationAvailable: false,
       ttsEnabled: false,
       ttsOutputGainDb: 3,
-    })
+    }))
   })
 
   it('loads configured cue paths from tauri startup payload', async () => {
@@ -324,12 +385,13 @@ describe('loadStartupState', () => {
         voice_input_available: false,
         voice_input_error: 'Parakeet failed to initialize',
         silence_timeout_ms: 2300,
-        selected_response_profile: 'fast',
-        supported_response_profiles: ['fast', 'quality'],
-      }),
+         selected_response_profile: 'fast',
+         supported_response_profiles: ['fast', 'quality'],
+         capabilities: COMPLETE_CAPABILITIES,
+       }),
     }
 
-    await expect(loadStartupState()).resolves.toEqual({
+    await expect(loadStartupState()).resolves.toEqual(expect.objectContaining({
       kind: 'ready',
       cueAssetPaths: {
         startListening: 'configured/start.mp3',
@@ -344,7 +406,7 @@ describe('loadStartupState', () => {
       promptCancellationAvailable: false,
       ttsEnabled: false,
       ttsOutputGainDb: 3,
-    })
+    }))
   })
 
   it('surfaces invoke failures as startup errors', async () => {

@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent, KeyboardEvent } from 'react'
+import { flushSync } from 'react-dom'
 import { ChatBubble } from './components/ChatBubble'
+import { AnswerStage } from './components/AnswerStage'
+import type { AnswerStageStatusEntry, AnswerPriorVersion } from './components/AnswerStage'
+import { PromptComposer } from './components/PromptComposer'
 import { UserNoticeToast } from './components/UserNoticeToast'
 import { playCue } from './lib/audioCues'
 import { shouldSubmitComposer } from './lib/composer'
@@ -19,7 +23,11 @@ import {
   isStartupStateSettled,
   loadStartupState,
 } from './lib/startupState'
-import { invokeTauriCommand } from './lib/tauri'
+import { getTauriInternals, invokeTauriCommand } from './lib/tauri'
+import { DEFAULT_ASSISTANT_SETTINGS, deepOptions, instantOptions, parseAssistantSettings, reviewOptions, serializeAssistantSettings } from './lib/assistantSettings'
+import type { AssistantSettings } from './lib/assistantSettings'
+import { acceptsPartialTranscriptionEvent, parsePartialTranscriptionEvent } from './lib/partialTranscription'
+import { parseCompletionEvent } from './lib/completionEvents'
 import { createVoiceTelemetryRecorder } from './lib/voiceTelemetry'
 import {
   createVoiceActivityState,
@@ -48,6 +56,22 @@ const UI_TEXT_SIZE_STEPS: readonly UiTextSize[] = ['small', 'medium', 'large', '
 const DEFAULT_UI_TEXT_SIZE: UiTextSize = 'medium'
 const DEFAULT_UI_THEME: UiTheme = 'dark'
 
+const voiceInputReady = (state: StartupState): boolean =>
+  state.kind === 'ready' &&
+  state.voiceInputAvailable &&
+  hasAvailableCapabilities(state, ['wake_word', 'vad', 'parakeet'])
+
+const instantMatchesResponseProfile = (
+  state: StartupState,
+  instant: AssistantSettings['instant'],
+): boolean =>
+  state.kind === 'ready' &&
+  (instant === 'local-fast'
+    ? state.selectedResponseProfile === 'fast'
+    : instant === 'local-quality'
+      ? state.selectedResponseProfile === 'quality'
+      : true)
+
 const UI_TEXT_SIZE_LABELS: Record<UiTextSize, string> = {
   small: 'Small',
   medium: 'Medium',
@@ -75,6 +99,9 @@ function App() {
   const [startupState, setStartupState] = useState<StartupState>({ kind: 'loading' })
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus>('initializing')
   const [composerValue, setComposerValue] = useState('')
+  const [partialTranscript, setPartialTranscript] = useState('')
+  const [typedCompletionSuffix, setTypedCompletionSuffix] = useState('')
+  const [voiceCompletionSuffix, setVoiceCompletionSuffix] = useState('')
   const [autoStopOnSilence, setAutoStopOnSilence] = useState(true)
   const [ttsEnabled, setTtsEnabled] = useState(false)
   const [wakeConfidence, setWakeConfidence] = useState<number | null>(null)
@@ -82,6 +109,17 @@ function App() {
   const [micStarting, setMicStarting] = useState(false)
   const [micActive, setMicActive] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [assistantSettingsPending, setAssistantSettingsPending] = useState(
+    () => getTauriInternals() !== null,
+  )
+  const [assistantSettingsLoadError, setAssistantSettingsLoadError] = useState<string | null>(null)
+  const [assistantSettings, setAssistantSettings] = useState<AssistantSettings>(DEFAULT_ASSISTANT_SETTINGS)
+  const assistantSettingsRef = useRef<AssistantSettings>(DEFAULT_ASSISTANT_SETTINGS)
+  const assistantSettingsPendingRef = useRef(getTauriInternals() !== null)
+  const persistedAssistantSettingsRef = useRef<AssistantSettings>(DEFAULT_ASSISTANT_SETTINGS)
+  const assistantSettingsWriteRevisionRef = useRef(0)
+  const assistantSettingsWriteChainRef = useRef<Promise<void>>(Promise.resolve())
+  const instantSelectionRevisionRef = useRef(0)
   const [uiTextSize, setUiTextSize] = useState<UiTextSize>(DEFAULT_UI_TEXT_SIZE)
   const [uiTheme, setUiTheme] = useState<UiTheme>(DEFAULT_UI_THEME)
   const [notices, setNotices] = useState<readonly UserNotice[]>([])
@@ -90,6 +128,7 @@ function App() {
   )
   const [promptActivity, setPromptActivity] = useState<string | null>(null)
   const [promptState, setPromptState] = useState<'idle' | 'executing' | 'stopping'>('idle')
+  const [resetPending, setResetPending] = useState(false)
   const promptRef = useRef<{
     id: string
     assistantId: string
@@ -97,6 +136,9 @@ function App() {
     error: string | null
     terminal: boolean
     tts: boolean
+    corrected: boolean
+    stages: AnswerStageStatusEntry[]
+    priorVersions: AnswerPriorVersion[]
   } | null>(null)
   const visibleMessages = useMemo(
     () => messages.filter(isTranscriptMessage),
@@ -119,6 +161,103 @@ function App() {
   const startupStateRef = useRef<StartupState>({ kind: 'loading' })
   const voiceActivityStateRef = useRef(createVoiceActivityState())
   const voiceTelemetryRef = useRef<ReturnType<typeof createVoiceTelemetryRecorder> | null>(null)
+  const partialTranscriptionRef = useRef<{
+    sessionId: number
+    revision: number
+    active: boolean
+  } | null>(null)
+  const partialTranscriptionAllowedRef = useRef(false)
+  const expectedPartialSessionIdRef = useRef(0)
+  const completionRevisionRef = useRef(0)
+  const latestTypedCompletionRef = useRef<{ revision: number; lifecycle: number } | null>(null)
+  const completionLifecycleRef = useRef(0)
+  const resetPendingRef = useRef(false)
+  const ttsGenerationRef = useRef(0)
+  const ttsEnabledRef = useRef(false)
+  const ttsSourceRef = useRef<AudioBufferSourceNode | null>(null)
+  const uiTextSizeWriteRevisionRef = useRef(0)
+  const uiThemeWriteRevisionRef = useRef(0)
+  const ttsWriteRevisionRef = useRef(0)
+  const uiTextSizeWriteChainRef = useRef<Promise<void>>(Promise.resolve())
+  const uiThemeWriteChainRef = useRef<Promise<void>>(Promise.resolve())
+  const ttsWriteChainRef = useRef<Promise<void>>(Promise.resolve())
+
+  const cancelTts = (): void => {
+    ttsGenerationRef.current += 1
+    try {
+      ttsSourceRef.current?.stop()
+    } catch {
+      // An already-ended source is stale by definition.
+    }
+    ttsSourceRef.current = null
+  }
+
+  useEffect(() => {
+    const tauri = getTauriInternals()
+    if (tauri?.listen === undefined) return undefined
+    let active = true
+    let unlisten: (() => void) | undefined
+    void tauri.listen('partial-transcription-event', (event) => {
+      try {
+        const parsed = parsePartialTranscriptionEvent(event.payload)
+        if (!partialTranscriptionAllowedRef.current) return
+        if (!acceptsPartialTranscriptionEvent(partialTranscriptionRef.current, parsed)) return
+        partialTranscriptionRef.current = {
+          sessionId: parsed.sessionId,
+          revision: parsed.revision,
+          active: true,
+        }
+        if (active) {
+          setVoiceCompletionSuffix('')
+          setPartialTranscript(parsed.text)
+        }
+      } catch {
+        return
+      }
+    }).then((cleanup) => active ? (unlisten = cleanup) : cleanup()).catch(() => undefined)
+    return () => { active = false; unlisten?.() }
+  }, [])
+
+  useEffect(() => {
+    const tauri = getTauriInternals()
+    if (tauri?.listen === undefined) return undefined
+    let active = true
+    let unlisten: (() => void) | undefined
+    void tauri.listen('completion-event', (event) => {
+      try {
+        const parsed = parseCompletionEvent(event.payload)
+        if (parsed.source === 'typed') {
+          const latest = latestTypedCompletionRef.current
+          if (latest === null || parsed.revision !== latest.revision || latest.lifecycle !== completionLifecycleRef.current) return
+          latestTypedCompletionRef.current = null
+          if (active) setTypedCompletionSuffix(parsed.suffix ?? '')
+        } else {
+          const transcript = partialTranscriptionRef.current
+          if (transcript === null || !transcript.active || parsed.revision !== transcript.revision || parsed.voiceSessionId !== transcript.sessionId) return
+          if (active) setVoiceCompletionSuffix(parsed.suffix ?? '')
+        }
+      } catch { return }
+    }).then((cleanup) => active ? (unlisten = cleanup) : cleanup()).catch(() => undefined)
+    return () => { active = false; unlisten?.() }
+  }, [])
+
+  const clearPartialTranscript = (): void => {
+    partialTranscriptionAllowedRef.current = false
+    if (partialTranscriptionRef.current !== null) {
+      partialTranscriptionRef.current = { ...partialTranscriptionRef.current, active: false }
+    }
+    setPartialTranscript('')
+    setVoiceCompletionSuffix('')
+  }
+
+  const clearCompletion = (): void => {
+    completionLifecycleRef.current += 1
+    completionRevisionRef.current += 1
+    latestTypedCompletionRef.current = null
+    setTypedCompletionSuffix('')
+    setVoiceCompletionSuffix('')
+    void invokeTauriCommand('clear_completion').catch(() => undefined)
+  }
 
   if (voiceTelemetryRef.current === null) {
     voiceTelemetryRef.current = createVoiceTelemetryRecorder()
@@ -147,20 +286,7 @@ function App() {
         id: `notice-${Date.now()}-${currentNotices.length}`,
       }
 
-      if (currentNotices.length < MAX_NOTICE_QUEUE_LENGTH) {
-        return [...currentNotices, nextNotice]
-      }
-
-      const activeNotice = currentNotices[0]
-      if (activeNotice === undefined) {
-        return [nextNotice]
-      }
-
-      return [
-        activeNotice,
-        ...currentNotices.slice(-(MAX_NOTICE_QUEUE_LENGTH - 2)),
-        nextNotice,
-      ]
+      return [nextNotice, ...currentNotices].slice(0, MAX_NOTICE_QUEUE_LENGTH)
     })
     recordRuntimeDiagnostic('frontend_notice', `${notice.title}: ${notice.message}`)
   }, [recordRuntimeDiagnostic])
@@ -202,6 +328,34 @@ function App() {
       active = false
     }
   }, [])
+
+  useEffect(() => {
+    if (getTauriInternals() === null) {
+      return undefined
+    }
+    let active = true
+    void invokeTauriCommand('get_assistant_settings').then((payload) => {
+      if (active && assistantSettingsWriteRevisionRef.current === 0) {
+        const parsed = parseAssistantSettings(payload)
+        assistantSettingsRef.current = parsed
+        persistedAssistantSettingsRef.current = parsed
+        setAssistantSettings(parsed)
+        assistantSettingsPendingRef.current = false
+        setAssistantSettingsPending(false)
+      }
+    }).catch((error) => {
+      if (active) {
+        const message = toDisplayErrorMessage(error)
+        setAssistantSettingsLoadError(message)
+        addNotice({
+          tone: 'error',
+          title: 'Assistant settings unavailable',
+          message,
+        })
+      }
+    })
+    return () => { active = false }
+  }, [addNotice])
 
   useEffect(() => {
     const onEscape = (event: globalThis.KeyboardEvent) => {
@@ -253,13 +407,21 @@ function App() {
   }, [])
 
   const persistUiTextSize = async (nextTextSize: UiTextSize, previousTextSize: UiTextSize): Promise<void> => {
+    const revision = ++uiTextSizeWriteRevisionRef.current
     uiTextSizeHydrationOverriddenRef.current = true
     setUiTextSize(nextTextSize)
 
     try {
-      const payload = await invokeTauriCommand('set_ui_text_size', { textSize: nextTextSize })
-      setUiTextSize(parseUiTextSize(payload))
+      const write = uiTextSizeWriteChainRef.current.then(() =>
+        invokeTauriCommand('set_ui_text_size', { textSize: nextTextSize }),
+      )
+      uiTextSizeWriteChainRef.current = write.then(() => undefined, () => undefined)
+      const payload = await write
+      if (revision === uiTextSizeWriteRevisionRef.current) {
+        setUiTextSize(parseUiTextSize(payload))
+      }
     } catch (error) {
+      if (revision !== uiTextSizeWriteRevisionRef.current) return
       setUiTextSize(previousTextSize)
       addNotice({
         tone: 'error',
@@ -282,13 +444,21 @@ function App() {
   }
 
   const persistUiTheme = async (nextTheme: UiTheme, previousTheme: UiTheme): Promise<void> => {
+    const revision = ++uiThemeWriteRevisionRef.current
     uiThemeHydrationOverriddenRef.current = true
     setUiTheme(nextTheme)
 
     try {
-      const payload = await invokeTauriCommand('set_ui_theme', { theme: nextTheme })
-      setUiTheme(parseUiTheme(payload))
+      const write = uiThemeWriteChainRef.current.then(() =>
+        invokeTauriCommand('set_ui_theme', { theme: nextTheme }),
+      )
+      uiThemeWriteChainRef.current = write.then(() => undefined, () => undefined)
+      const payload = await write
+      if (revision === uiThemeWriteRevisionRef.current) {
+        setUiTheme(parseUiTheme(payload))
+      }
     } catch (error) {
+      if (revision !== uiThemeWriteRevisionRef.current) return
       setUiTheme(previousTheme)
       addNotice({
         tone: 'error',
@@ -335,8 +505,10 @@ function App() {
     startupStateRef.current = nextState
     setStartupState(nextState)
     if (nextState.kind === 'ready' || nextState.kind === 'warming_model') {
+      ttsEnabledRef.current = nextState.ttsEnabled
       setTtsEnabled(nextState.ttsEnabled)
     } else {
+      ttsEnabledRef.current = false
       setTtsEnabled(false)
     }
 
@@ -371,6 +543,18 @@ function App() {
                 `stopCue=${nextState.cueAssetPaths.stopListening}`,
             },
           ])
+          const unavailableCapabilities = nextState.capabilities.filter(
+            ({ state }) => state === 'not_configured' || state === 'unavailable' || state === 'failed',
+          )
+          if (unavailableCapabilities.length > 0) {
+            addNotice({
+              tone: 'error',
+              title: 'Startup capabilities unavailable',
+              message: unavailableCapabilities
+                .map(({ id, reason }) => `${capabilityLabel(id)}: ${reason}`)
+                .join('; '),
+            })
+          }
         }
 
         if (nextState.kind === 'error' && previousKind !== 'error') {
@@ -397,6 +581,7 @@ function App() {
   useEffect(() => {
     return () => {
       appActiveRef.current = false
+      cancelTts()
       liveAudioSessionIdRef.current += 1
       liveAudioSourceRef.current?.stop()
       liveAudioSourceRef.current = null
@@ -418,33 +603,99 @@ function App() {
     conversation.scrollTop = conversation.scrollHeight
   }, [visibleMessages])
 
+  const assistantCapabilities = useMemo(() => capabilityMap(startupState), [startupState])
+  const selectedInstantOption = instantOptions(assistantCapabilities)
+    .find((option) => option.value === assistantSettings.instant)
+  const selectedInstantProfileReady = instantMatchesResponseProfile(startupState, assistantSettings.instant)
   const canSend = useMemo(
     () =>
       startupState.kind === 'ready' &&
+      selectedInstantOption?.available === true &&
+      selectedInstantProfileReady &&
+      !assistantSettingsPending &&
+      !resetPending &&
       runtimeStatus === 'sleeping' &&
       composerValue.trim().length > 0,
-    [composerValue, runtimeStatus, startupState.kind],
+    [assistantSettingsPending, composerValue, resetPending, runtimeStatus, selectedInstantOption?.available, selectedInstantProfileReady, startupState.kind],
   )
 
-  const canToggleMic =
-    startupState.kind === 'ready' && startupState.voiceInputAvailable && !micStarting
+  const canToggleMic = voiceInputReady(startupState) && !micStarting
+  const voiceInputUnavailableReason = startupState.kind === 'ready'
+    ? (startupState.voiceInputError ?? (startupState.capabilities
+      .filter((capability) => ['wake_word', 'vad', 'parakeet'].includes(capability.id) && capability.state !== 'available')
+      .map((capability) => capability.reason ?? `${capabilityLabel(capability.id)} unavailable`)
+      .join('; ') || 'required voice capabilities are unavailable'))
+    : 'voice input is still starting'
   const cueAssetPaths =
     startupState.kind === 'ready'
       ? startupState.cueAssetPaths
       : DEFAULT_CUE_ASSET_PATHS
-  const responseProfileState =
-    startupState.kind === 'ready' || startupState.kind === 'warming_model'
-      ? {
-          selected: startupState.selectedResponseProfile,
-          supported: startupState.supportedResponseProfiles,
-        }
-      : null
-  const canSwitchResponseProfile =
-    startupState.kind === 'ready' &&
-    runtimeStatus === 'sleeping' &&
-    !micStarting &&
-    !isSwitchingResponseProfile
-  const canToggleTts = startupState.kind === 'ready' && !isSwitchingResponseProfile
+  const canToggleTts = startupState.kind === 'ready' &&
+    capabilityIsAvailable(startupState, 'tts') && !isSwitchingResponseProfile
+  const assistantControlsDisabled = startupState.kind !== 'ready' || assistantSettingsPending || isSwitchingResponseProfile
+  const persistAssistantSettings = async (next: AssistantSettings): Promise<boolean> => {
+    const revision = ++assistantSettingsWriteRevisionRef.current
+    assistantSettingsPendingRef.current = true
+    setAssistantSettingsPending(true)
+    assistantSettingsRef.current = next
+    setAssistantSettings(next)
+    let resolveWrite: (settings: AssistantSettings) => void = () => undefined
+    let rejectWrite: (error: unknown) => void = () => undefined
+    const write = new Promise<AssistantSettings>((resolve, reject) => {
+      resolveWrite = resolve
+      rejectWrite = reject
+    })
+    assistantSettingsWriteChainRef.current = assistantSettingsWriteChainRef.current
+      .then(async () => {
+        const persisted = await invokeTauriCommand('set_assistant_settings', { settings: serializeAssistantSettings(next) })
+        resolveWrite(parseAssistantSettings(persisted))
+      })
+      .catch(rejectWrite)
+    try {
+      const persisted = await write
+      persistedAssistantSettingsRef.current = persisted
+      if (revision === assistantSettingsWriteRevisionRef.current) {
+        assistantSettingsRef.current = persisted
+        setAssistantSettings(persisted)
+      }
+      return true
+    } catch (error) {
+      if (revision === assistantSettingsWriteRevisionRef.current) {
+        assistantSettingsRef.current = persistedAssistantSettingsRef.current
+        setAssistantSettings(persistedAssistantSettingsRef.current)
+      }
+      addNotice({ tone: 'error', title: 'Assistant settings failed', message: toDisplayErrorMessage(error) })
+      return false
+    } finally {
+       if (revision === assistantSettingsWriteRevisionRef.current) {
+         assistantSettingsPendingRef.current = false
+         setAssistantSettingsPending(false)
+       }
+    }
+  }
+  const changeInstant = async (instant: AssistantSettings['instant']): Promise<void> => {
+    const revision = ++instantSelectionRevisionRef.current
+    const option = instantOptions(assistantCapabilities).find((item) => item.value === instant)
+    if (!option?.available) return
+    let previousProfile: ResponseProfile | null = null
+    let switchedProfile = false
+    if (instant === 'local-fast' || instant === 'local-quality') {
+      const profile = instant === 'local-fast' ? 'fast' : 'quality'
+      if (startupState.kind !== 'ready') return
+      previousProfile = startupState.selectedResponseProfile
+      if (previousProfile !== profile) {
+        if (!await switchResponseProfile(profile)) return
+        switchedProfile = true
+      }
+      if (revision !== instantSelectionRevisionRef.current) return
+      if (startupStateRef.current.kind !== 'ready' || startupStateRef.current.selectedResponseProfile !== profile) return
+    }
+    if (revision !== instantSelectionRevisionRef.current) return
+    const persisted = await persistAssistantSettings({ ...assistantSettingsRef.current, instant })
+    if (!persisted && revision === instantSelectionRevisionRef.current && switchedProfile && previousProfile !== null) {
+      await switchResponseProfile(previousProfile)
+    }
+  }
 
   useEffect(() => {
     autoStopOnSilenceRef.current = autoStopOnSilence
@@ -488,9 +739,19 @@ function App() {
     runtimeStatusRef.current = nextStatus
     setRuntimeStatus(nextStatus)
 
-    if (nextStatus !== 'listening') {
+    if (nextStatus === 'listening' && previousStatus !== 'listening') {
+      expectedPartialSessionIdRef.current += 1
+      partialTranscriptionRef.current = {
+        sessionId: expectedPartialSessionIdRef.current,
+        revision: 0,
+        active: true,
+      }
+      partialTranscriptionAllowedRef.current = true
+    } else if (nextStatus !== 'listening') {
+      partialTranscriptionAllowedRef.current = false
       voiceActivityStateRef.current = createVoiceActivityState()
       setWakeConfidence(null)
+      clearPartialTranscript()
     }
 
     const cueType = cueForTransition(previousStatus, nextStatus)
@@ -539,9 +800,19 @@ function App() {
     runtimeStatusRef.current = nextStatus
     setRuntimeStatus(nextStatus)
 
-    if (nextStatus !== 'listening') {
+    if (nextStatus === 'listening' && previousStatus !== 'listening') {
+      expectedPartialSessionIdRef.current += 1
+      partialTranscriptionRef.current = {
+        sessionId: expectedPartialSessionIdRef.current,
+        revision: 0,
+        active: true,
+      }
+      partialTranscriptionAllowedRef.current = true
+    } else if (nextStatus !== 'listening') {
+      partialTranscriptionAllowedRef.current = false
       voiceActivityStateRef.current = createVoiceActivityState()
       setWakeConfidence(null)
+      clearPartialTranscript()
     }
 
     const cueType = cueForTransition(previousStatus, nextStatus)
@@ -694,16 +965,18 @@ function App() {
       readonly args?: RuntimeControlArgs
       readonly fallbackEvent?: Parameters<typeof transitionRuntimeStatus>[1]
       readonly quiet?: boolean
+      readonly isCurrent?: () => boolean
     } = {},
   ): Promise<RuntimeControlResult | null> => {
     if (startupStateRef.current.kind !== 'ready') {
       return null
     }
 
-    const { args, fallbackEvent, quiet } = options
+    const { args, fallbackEvent, quiet, isCurrent } = options
 
     try {
       const runtimePhase = await invokeRuntimeControl(command, args)
+      if (isCurrent !== undefined && !isCurrent()) return null
 
       if (runtimePhase === null) {
         if (fallbackEvent !== undefined) {
@@ -716,6 +989,7 @@ function App() {
       applyRuntimeControlResult(runtimePhase, quiet === undefined ? {} : { quiet })
       return runtimePhase
     } catch (error) {
+      if (isCurrent !== undefined && !isCurrent()) return null
       const message = toDisplayErrorMessage(error)
 
       recoverFromRuntimeControlError()
@@ -737,7 +1011,19 @@ function App() {
     prompt: string,
     source: 'typed' | 'voice',
   ): Promise<void> => {
-    if (startupStateRef.current.kind !== 'ready') {
+    const currentStartupState = startupStateRef.current
+    const currentSettings = assistantSettingsRef.current
+    const selectedInstant = currentStartupState.kind === 'ready'
+      ? instantOptions(capabilityMap(currentStartupState)).find((option) => option.value === currentSettings.instant)
+      : undefined
+    if (
+      currentStartupState.kind !== 'ready' ||
+      selectedInstant?.available !== true ||
+      !instantMatchesResponseProfile(currentStartupState, currentSettings.instant) ||
+      assistantSettingsPendingRef.current ||
+      isSwitchingResponseProfileRef.current ||
+      resetPendingRef.current
+    ) {
       return
     }
 
@@ -753,6 +1039,8 @@ function App() {
     if (executingStatus === currentStatus) {
       return
     }
+    clearPartialTranscript()
+    cancelTts()
 
     // eslint-disable-next-line react-hooks/purity
     const requestId = `request-${Date.now()}-${Math.random().toString(36).slice(2)}`
@@ -763,7 +1051,14 @@ function App() {
       text: '',
       error: null,
       terminal: false,
-      tts: ttsEnabled,
+      tts: ttsEnabledRef.current,
+      corrected: false,
+      stages: [
+        { stage: 'instant', status: 'running' },
+        ...(currentSettings.deepEnabled ? [{ stage: 'deep', status: 'queued' } as const] : []),
+        ...(currentSettings.reviewEnabled ? [{ stage: 'review', status: 'queued' } as const] : []),
+      ],
+      priorVersions: [],
     }
     setPromptState('executing')
     setPromptActivity('Executing prompt…')
@@ -778,6 +1073,7 @@ function App() {
 
     if (source === 'typed') {
       setComposerValue('')
+      clearCompletion()
     }
 
     const handleEvent = (event: import('./types/chat').PromptExecutionEvent): void => {
@@ -790,20 +1086,59 @@ function App() {
         setMessages((current) => {
           const index = current.findIndex((message) => message.id === active.assistantId)
           if (index < 0) {
-            return [...current, { id: active.assistantId, role: 'assistant', content: event.text }]
+            return [...current, { id: active.assistantId, role: 'assistant', content: event.text, answerStage: { stages: active.stages, priorVersions: active.priorVersions } }]
           }
           return current.map((message, messageIndex) =>
             messageIndex === index
-              ? { ...message, content: message.content + event.text }
+              ? { ...message, content: message.content + event.text, answerStage: { stages: active.stages, priorVersions: active.priorVersions } }
               : message,
           )
         })
+      }
+      if (event.kind === 'correction') {
+        active.corrected = true
+        if (active.text.trim().length > 0) {
+          active.priorVersions.push({ id: `instant-${active.priorVersions.length + 1}`, text: active.text, label: 'Before correction' })
+        }
+        active.text = event.text
+        const correctionStage = active.stages.some((stage) => stage.stage === 'review' && stage.status === 'running')
+          ? 'review'
+          : 'deep'
+        active.stages = active.stages.map((stage) => stage.stage === correctionStage ? { ...stage, status: 'corrected', detail: event.correction } : stage)
+        setMessages((current) => {
+          const corrected = {
+            id: active.assistantId,
+            role: 'assistant' as const,
+            content: event.text,
+            answerStage: { stages: active.stages, priorVersions: active.priorVersions },
+          }
+          return current.some((message) => message.id === active.assistantId)
+            ? current.map((message) => message.id === active.assistantId ? { ...message, ...corrected } : message)
+            : [...current, corrected]
+        })
+        setPromptActivity(event.correction)
+        if (active.tts && ttsEnabledRef.current) void synthesizeAndPlayAssistantReply(event.text)
       }
       if (event.kind === 'reasoning') {
         setPromptActivity(`Reasoning: ${event.text}`)
       }
       if (event.kind === 'status') {
         setPromptActivity(event.message)
+        const statusMap: Record<string, AnswerStageStatusEntry> = {
+          'Deep running': { stage: 'deep', status: 'running' },
+          'Deep completed': { stage: 'deep', status: 'completed' },
+          'Deep failed; Review will use Instant': { stage: 'deep', status: 'failed' },
+          'Deep failed; Instant retained': { stage: 'deep', status: 'failed' },
+          'Review running': { stage: 'review', status: 'running' },
+          'Review kept Instant answer': { stage: 'review', status: 'kept' },
+          'Review failed; Instant retained': { stage: 'review', status: 'failed' },
+        }
+        const mapped = statusMap[event.message]
+        if (mapped) {
+          active.stages = active.stages.map((stage) => stage.stage === mapped.stage ? mapped : stage)
+          setMessages((current) => current.map((message) => message.id === active.assistantId
+            ? { ...message, answerStage: { stages: active.stages, priorVersions: active.priorVersions } } : message))
+        }
       }
       if (event.kind === 'tool') {
         setPromptActivity(
@@ -816,7 +1151,7 @@ function App() {
       }
     }
     try {
-      const result = await executePrompt(requestId, trimmedPrompt, handleEvent)
+      const result = await executePrompt(requestId, trimmedPrompt, handleEvent, source)
       const active = promptRef.current
       if (
         active === null ||
@@ -827,6 +1162,20 @@ function App() {
         return
       }
       active.terminal = true
+      active.stages = active.stages.map((stage) => {
+        if (result.outcome !== 'completed' && (stage.status === 'running' || stage.status === 'queued')) {
+          return {
+            ...stage,
+            status: result.outcome === 'cancelled' ? 'cancelled' : 'failed',
+          }
+        }
+        if (stage.stage === 'instant' && stage.status === 'running') return { ...stage, status: 'completed' }
+        if (stage.status === 'queued') return { ...stage, status: 'stale', detail: 'Not required for this answer' }
+        return stage
+      })
+      setMessages((current) => current.map((message) => message.id === active.assistantId
+        ? { ...message, answerStage: { stages: active.stages, priorVersions: active.priorVersions } }
+        : message))
       promptRef.current = null
       setPromptState('idle')
       setPromptActivity(null)
@@ -851,7 +1200,7 @@ function App() {
           title: 'No response',
           message: 'No response was returned. Try again.',
         })
-      } else if (active.tts) {
+      } else if (active.tts && ttsEnabledRef.current && !active.corrected) {
         void synthesizeAndPlayAssistantReply(active.text)
       }
     } catch (error) {
@@ -867,13 +1216,19 @@ function App() {
         return
       }
       active.terminal = true
-      promptRef.current = null
-      setMessages((current) =>
-        current.filter(
-          (chatMessage) =>
-            chatMessage.id !== active.assistantId || chatMessage.content.trim().length > 0,
-        ),
+      active.stages = active.stages.map((stage) =>
+        stage.status === 'running' || stage.status === 'queued'
+          ? { ...stage, status: 'failed', detail: message }
+          : stage,
       )
+      promptRef.current = null
+      setMessages((current) => current
+        .map((chatMessage) => chatMessage.id === active.assistantId
+          ? { ...chatMessage, answerStage: { stages: active.stages, priorVersions: active.priorVersions } }
+          : chatMessage)
+        .filter((chatMessage) =>
+          chatMessage.id !== active.assistantId || chatMessage.content.trim().length > 0,
+        ))
       applyTransition(executingStatus, 'fail')
       addNotice({
         tone: 'error',
@@ -889,6 +1244,8 @@ function App() {
   const cancelPrompt = (): void => {
     const active = promptRef.current
     if (active === null || active.terminal || promptState === 'stopping') return
+    clearPartialTranscript()
+    cancelTts()
     setPromptState('stopping')
     void invokeTauriCommand('cancel_prompt', { requestId: active.id }).catch(() => {
       if (promptRef.current === active && !active.terminal) {
@@ -899,9 +1256,14 @@ function App() {
 
   const synthesizeAndPlayAssistantReply = async (text: string): Promise<void> => {
     let audioContext: AudioContext | null = null
+    cancelTts()
+    const generation = ttsGenerationRef.current
 
     try {
-      const payload = await invokeTauriCommand('synthesize_local_tts', { text })
+      const speechText = text.split(/\r?\n/, 1)[0]?.trim() ?? ''
+      if (speechText.length === 0) return
+      const payload = await invokeTauriCommand('synthesize_local_tts', { text: speechText })
+       if (generation !== ttsGenerationRef.current || !ttsEnabledRef.current) return
 
       if (
         !isRecord(payload) ||
@@ -932,6 +1294,8 @@ function App() {
       const buffer = audioContext.createBuffer(1, pcm.length, sampleRate)
       buffer.copyToChannel(pcm, 0)
       const source = audioContext.createBufferSource()
+       if (generation !== ttsGenerationRef.current || !ttsEnabledRef.current) return
+      ttsSourceRef.current = source
       source.buffer = buffer
       const gainNode = audioContext.createGain()
       gainNode.gain.value = Math.pow(10, currentTtsOutputGainDb() / 20)
@@ -943,6 +1307,7 @@ function App() {
         source.start()
       })
     } catch (error) {
+      if (generation !== ttsGenerationRef.current) return
       const message = toDisplayErrorMessage(error)
 
       addNotice({
@@ -955,6 +1320,7 @@ function App() {
       if (audioContext !== null) {
         await audioContext.close().catch(() => undefined)
       }
+      if (ttsSourceRef.current !== null && generation === ttsGenerationRef.current) ttsSourceRef.current = null
     }
   }
 
@@ -968,7 +1334,10 @@ function App() {
     void runPrompt(runtimePhase.transcriptText, 'voice')
   }
 
-  const handleMarkSilence = async (telemetryFrameId: string | null = null): Promise<void> => {
+  const handleMarkSilence = async (
+    liveAudioSessionId: number,
+    telemetryFrameId: string | null = null,
+  ): Promise<void> => {
     voiceTelemetry.record('cue_play_requested', {
       details: {
         cueType: 'stop_listening',
@@ -988,16 +1357,24 @@ function App() {
       reportCuePlaybackError('stop_listening', error)
     }
 
+    if (liveAudioSessionId !== liveAudioSessionIdRef.current) return
+
     const runtimePhase = await syncRuntimeControl(
       'mark_silence',
       telemetryFrameId === null
-        ? { fallbackEvent: 'end_listening' }
+        ? {
+            fallbackEvent: 'end_listening',
+            isCurrent: () => liveAudioSessionId === liveAudioSessionIdRef.current,
+          }
         : {
             args: { telemetryFrameId },
             fallbackEvent: 'end_listening',
+            isCurrent: () => liveAudioSessionId === liveAudioSessionIdRef.current,
           },
     )
 
+    if (liveAudioSessionId !== liveAudioSessionIdRef.current) return
+    clearPartialTranscript()
     maybeRunVoiceTranscript(runtimePhase)
   }
 
@@ -1008,6 +1385,7 @@ function App() {
     voiceActivityStateRef.current = createVoiceActivityState()
     setMicStarting(false)
     setMicActive(false)
+    clearPartialTranscript()
 
     if (content !== null) {
       setMessages((currentMessages) => [
@@ -1034,7 +1412,7 @@ function App() {
   }
 
   const startMic = async (): Promise<void> => {
-    if (startupStateRef.current.kind !== 'ready' || liveAudioSourceRef.current !== null || micStarting) {
+    if (!voiceInputReady(startupStateRef.current) || liveAudioSourceRef.current !== null || micStarting) {
       return
     }
 
@@ -1096,7 +1474,7 @@ function App() {
                 voiceActivityStateRef.current = voiceActivityUpdate.state
 
                 if (voiceActivityUpdate.shouldMarkSilence) {
-                  await handleMarkSilence(frameId)
+                  await handleMarkSilence(liveAudioSessionId, frameId)
                 }
               }
             }
@@ -1149,22 +1527,24 @@ function App() {
     void startMic()
   }
 
-  const switchResponseProfile = async (profile: ResponseProfile): Promise<void> => {
+  const switchResponseProfile = async (profile: ResponseProfile): Promise<boolean> => {
     if (startupStateRef.current.kind !== 'ready') {
-      return
+      return false
     }
 
     if (isSwitchingResponseProfileRef.current) {
-      return
+      return false
     }
 
     const currentState = startupStateRef.current
 
     if (currentState.selectedResponseProfile === profile) {
-      return
+      return true
     }
 
     isSwitchingResponseProfileRef.current = true
+    cancelTts()
+    clearPartialTranscript()
     setIsSwitchingResponseProfile(true)
 
     const shouldReportMicStopForSwitch =
@@ -1177,22 +1557,22 @@ function App() {
 
     await waitForInFlightLiveAudioFrames()
 
-    const settleStartupState = async (): Promise<void> => {
+    const settleStartupState = async (): Promise<StartupState> => {
       while (true) {
         if (!appActiveRef.current) {
-          return
+          return { kind: 'loading' }
         }
 
         const nextState = await loadStartupState()
 
         if (!appActiveRef.current) {
-          return
+          return { kind: 'loading' }
         }
 
         applyStartupState(nextState)
 
         if (isStartupStateSettled(nextState)) {
-          break
+          return nextState
         }
 
         await new Promise((resolve) => window.setTimeout(resolve, 500))
@@ -1212,6 +1592,7 @@ function App() {
       promptCancellationAvailable: currentState.promptCancellationAvailable,
       ttsEnabled: currentState.ttsEnabled,
       ttsOutputGainDb: currentState.ttsOutputGainDb,
+      capabilities: currentState.capabilities,
     }
 
     startupStateRef.current = warmingState
@@ -1222,7 +1603,8 @@ function App() {
     try {
       await invokeTauriCommand('switch_response_profile', { profile })
 
-      await settleStartupState()
+      const settled = await settleStartupState()
+      return settled.kind === 'ready' && settled.selectedResponseProfile === profile
     } catch (error) {
       try {
         await settleStartupState()
@@ -1242,6 +1624,7 @@ function App() {
         })
         recordRuntimeDiagnostic('profile', `Response profile switch error: ${message}`)
       }
+      return false
     } finally {
       isSwitchingResponseProfileRef.current = false
       if (appActiveRef.current) {
@@ -1251,25 +1634,37 @@ function App() {
   }
 
   const toggleTts = async (enabled: boolean): Promise<void> => {
+    const revision = ++ttsWriteRevisionRef.current
     const previousEnabled = ttsEnabled
+    ttsEnabledRef.current = enabled
+    if (!enabled) cancelTts()
     setTtsEnabled(enabled)
 
     try {
-      const payload = await invokeTauriCommand('set_tts_enabled', { enabled })
+      const write = ttsWriteChainRef.current.then(() =>
+        invokeTauriCommand('set_tts_enabled', { enabled }),
+      )
+      ttsWriteChainRef.current = write.then(() => undefined, () => undefined)
+      const payload = await write
 
+      if (revision !== ttsWriteRevisionRef.current) return
       if (
         typeof payload === 'object' &&
         payload !== null &&
         'enabled' in payload &&
         typeof payload.enabled === 'boolean'
       ) {
+        ttsEnabledRef.current = payload.enabled
         setTtsEnabled(payload.enabled)
       } else {
+        ttsEnabledRef.current = enabled
         setTtsEnabled(enabled)
       }
     } catch (error) {
+      if (revision !== ttsWriteRevisionRef.current) return
       const message = toDisplayErrorMessage(error)
 
+      ttsEnabledRef.current = previousEnabled
       setTtsEnabled(previousEnabled)
       addNotice({
         tone: 'error',
@@ -1283,7 +1678,7 @@ function App() {
   useEffect(() => {
     if (
       startupState.kind !== 'ready' ||
-      !startupState.voiceInputAvailable ||
+      !voiceInputReady(startupState) ||
       micActive ||
       micStarting ||
       micAutoStartedRef.current
@@ -1297,7 +1692,7 @@ function App() {
   }, [micActive, micStarting, startupState])
 
   const sendPrompt = async (): Promise<void> => {
-    if (startupState.kind !== 'ready') {
+    if (startupState.kind !== 'ready' || selectedInstantOption?.available !== true || assistantSettingsPending || isSwitchingResponseProfileRef.current || resetPendingRef.current) {
       return
     }
 
@@ -1312,6 +1707,7 @@ function App() {
 
   const onSubmit = (event: FormEvent<HTMLFormElement>): void => {
     event.preventDefault()
+    clearCompletion()
     void sendPrompt()
   }
 
@@ -1325,6 +1721,35 @@ function App() {
     event.preventDefault()
     void sendPrompt()
   }
+
+  const acceptTypedCompletion = (suffix: string): void => {
+    if (suffix.length === 0) return
+    const nextValue = `${composerValue}${suffix}`
+    setComposerValue(nextValue)
+    setTypedCompletionSuffix('')
+    setVoiceCompletionSuffix('')
+    completionRevisionRef.current += 1
+    const revision = completionRevisionRef.current
+    if (
+      assistantSettings.completion &&
+      !assistantSettingsPendingRef.current &&
+      startupStateRef.current.kind === 'ready' &&
+      capabilityIsAvailable(startupStateRef.current, 'qwen_prediction')
+    ) {
+      const pending = { revision, lifecycle: completionLifecycleRef.current }
+      latestTypedCompletionRef.current = pending
+      void invokeTauriCommand('request_completion', { revision, prompt: nextValue }).catch(() => {
+        if (latestTypedCompletionRef.current === pending) latestTypedCompletionRef.current = null
+      })
+    } else {
+      latestTypedCompletionRef.current = null
+    }
+  }
+
+  const selectedDeepOption = deepOptions(assistantCapabilities).find((option) => option.value === assistantSettings.deep)
+  const selectedReviewOption = reviewOptions(assistantCapabilities).find((option) => option.value === assistantSettings.review)
+  const canEnableDeep = selectedDeepOption?.available === true
+  const canEnableReview = selectedReviewOption?.available === true
 
   const onSettingsKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
     if (event.key === 'Escape') {
@@ -1362,6 +1787,42 @@ function App() {
     }
   }
 
+  const resetSession = async (): Promise<void> => {
+    if (resetPendingRef.current) return
+    resetPendingRef.current = true
+    setResetPending(true)
+    stopLiveAudio()
+    const activePrompt = promptRef.current
+    if (activePrompt !== null && !activePrompt.terminal) {
+      activePrompt.terminal = true
+      setPromptState('stopping')
+      try {
+        await invokeTauriCommand('cancel_prompt', { requestId: activePrompt.id })
+      } catch {
+        // reset_session remains authoritative for backend prompt settlement.
+      }
+    }
+    promptRef.current = null
+    cancelTts()
+    clearPartialTranscript()
+    clearCompletion()
+    try {
+      await waitForInFlightLiveAudioFrames()
+      await invokeTauriCommand('reset_session')
+      setMessages(getInitialMessages())
+      setPromptActivity(null)
+      setPromptState('idle')
+      applyRuntimeStatus('sleeping')
+    } catch (error) {
+      setPromptActivity(null)
+      setPromptState('idle')
+      addNotice({ tone: 'error', title: 'Reset failed', message: toDisplayErrorMessage(error) })
+    } finally {
+      resetPendingRef.current = false
+      setResetPending(false)
+    }
+  }
+
   const uiTextSizeIndex = Math.max(0, UI_TEXT_SIZE_STEPS.indexOf(uiTextSize))
   const canDecreaseTextSize = uiTextSizeIndex > 0
   const canIncreaseTextSize = uiTextSizeIndex < UI_TEXT_SIZE_STEPS.length - 1
@@ -1373,7 +1834,9 @@ function App() {
 
       <main ref={conversationRef} className="conversation" aria-live="polite">
         {visibleMessages.map((message) => (
-          <ChatBubble key={message.id} message={message} />
+          message.answerStage && message.role === 'assistant' ? (
+            <AnswerStage key={message.id} answer={message.content} className="message message--assistant" {...message.answerStage} />
+          ) : <ChatBubble key={message.id} message={message} />
         ))}
       </main>
 
@@ -1408,6 +1871,7 @@ function App() {
                 ×
               </button>
             </div>
+            <button type="button" className="shell__control" onClick={() => void resetSession()} aria-label="Reset Session" disabled={resetPending}>{resetPending ? 'Resetting...' : 'Reset Session'}</button>
             <div className="settings-panel__row">
               <div>
                 <strong>Text size</strong>
@@ -1437,68 +1901,105 @@ function App() {
                 </button>
               </div>
             </div>
+            <div className="settings-panel__assistant">
+              <label><strong>Instant</strong><select id="assistantInstantSelect" aria-label="Instant" value={assistantSettings.instant} disabled={assistantControlsDisabled} onChange={(event) => void changeInstant(event.target.value as AssistantSettings['instant'])}>
+                {instantOptions(assistantCapabilities).map((option) => <option key={option.value} value={option.value} disabled={!option.available} title={option.reason}>{option.label}{option.available ? '' : ` — ${option.reason}`}</option>)}
+              </select></label>
+              <label><strong>Deep model</strong><select aria-label="Deep model" value={assistantSettings.deep} disabled={assistantControlsDisabled} onChange={(event) => {
+                const value = event.target.value as AssistantSettings['deep']
+                if (deepOptions(assistantCapabilities).find((option) => option.value === value)?.available) {
+                  void persistAssistantSettings({ ...assistantSettingsRef.current, deep: value })
+                }
+              }}>
+                {deepOptions(assistantCapabilities).map((option) => <option key={option.value} value={option.value} disabled={!option.available} title={option.reason}>{option.label}</option>)}
+              </select></label>
+              <label><strong>Review model</strong><select aria-label="Review model" value={assistantSettings.review} disabled={assistantControlsDisabled} onChange={(event) => {
+                const value = event.target.value as AssistantSettings['review']
+                if (reviewOptions(assistantCapabilities).find((option) => option.value === value)?.available) {
+                  void persistAssistantSettings({ ...assistantSettingsRef.current, review: value })
+                }
+              }}>
+                {reviewOptions(assistantCapabilities).map((option) => <option key={option.value} value={option.value} disabled={!option.available} title={option.reason}>{option.label}</option>)}
+              </select></label>
+              <label><input type="checkbox" checked={assistantSettings.deepEnabled} disabled={assistantControlsDisabled || (!assistantSettings.deepEnabled && !canEnableDeep)} onChange={(event) => void persistAssistantSettings({ ...assistantSettingsRef.current, deepEnabled: event.target.checked })} /> Deep</label>
+              <label><input type="checkbox" checked={assistantSettings.reviewEnabled} disabled={assistantControlsDisabled || (!assistantSettings.reviewEnabled && !canEnableReview)} onChange={(event) => void persistAssistantSettings({ ...assistantSettingsRef.current, reviewEnabled: event.target.checked })} /> Review</label>
+              <label><input type="checkbox" checked={assistantSettings.completion} disabled={assistantControlsDisabled} onChange={(event) => {
+                if (!event.target.checked) clearCompletion()
+                void persistAssistantSettings({ ...assistantSettingsRef.current, completion: event.target.checked })
+              }} /> Completion</label>
+              <label><input type="checkbox" checked={assistantSettings.prefetch} disabled={assistantControlsDisabled} onChange={(event) => void persistAssistantSettings({ ...assistantSettingsRef.current, prefetch: event.target.checked })} /> Prefetch</label>
+              <p className="settings-panel__hint">Prefetch may transmit unaccepted predicted text when enabled.</p>
+            </div>
           </section>
         </div>
       ) : null}
 
       <form className="composer" onSubmit={onSubmit}>
-        <textarea
+        <PromptComposer
           id="promptComposer"
           className="composer__input"
           aria-label="Prompt"
           value={composerValue}
-          onChange={(event) => setComposerValue(event.target.value)}
+          partialTranscript={partialTranscript}
+          ghostSuffix={typedCompletionSuffix}
+           onChange={(event) => {
+             const nextValue = event.target.value
+             setComposerValue(nextValue)
+             setTypedCompletionSuffix('')
+             setVoiceCompletionSuffix('')
+              completionRevisionRef.current += 1
+              const revision = completionRevisionRef.current
+              if (nextValue.length === 0) {
+                latestTypedCompletionRef.current = null
+                void invokeTauriCommand('clear_completion').catch(() => undefined)
+              } else if (assistantSettings.completion && !assistantSettingsPendingRef.current && startupStateRef.current.kind === 'ready' && capabilityIsAvailable(startupStateRef.current, 'qwen_prediction')) {
+                const pending = { revision, lifecycle: completionLifecycleRef.current }
+                latestTypedCompletionRef.current = pending
+                void invokeTauriCommand('request_completion', { revision, prompt: nextValue }).catch(() => {
+                  if (latestTypedCompletionRef.current === pending) latestTypedCompletionRef.current = null
+                })
+              } else {
+                latestTypedCompletionRef.current = null
+              }
+           }}
           onKeyDown={onComposerKeyDown}
+          onAcceptCompletion={acceptTypedCompletion}
+            onDismissCompletion={() => { clearCompletion() }}
+           partialCompletionSuffix={voiceCompletionSuffix}
           placeholder="Type a prompt..."
           rows={3}
         />
         {startupState.kind === 'error' ? (
           <p className="shell__error">Startup error: {startupState.message}</p>
         ) : null}
-        {startupState.kind === 'ready' && !startupState.voiceInputAvailable ? (
+        {assistantSettingsLoadError !== null ? (
+          <p className="shell__error">Assistant settings unavailable: {assistantSettingsLoadError}</p>
+        ) : null}
+        {startupState.kind === 'ready' && !voiceInputReady(startupState) ? (
           <p className="shell__error">
-            Voice input unavailable: {startupState.voiceInputError ?? 'Parakeet failed to initialize'}
+            Voice input unavailable: {voiceInputUnavailableReason}
+          </p>
+        ) : null}
+        {startupState.kind === 'ready' && (selectedInstantOption?.available !== true || !selectedInstantProfileReady) ? (
+          <p className="shell__error" role="status">
+            Sending disabled: {selectedInstantOption?.available !== true
+              ? selectedInstantOption?.reason ?? 'selected provider is unavailable'
+              : 'selected local model profile is not loaded'}
           </p>
         ) : null}
         {startupState.kind === 'warming_model' ? (
           <p className="shell__loading">Model loading: {startupState.message}</p>
         ) : null}
         <div className="composer__actions">
-          {responseProfileState !== null ? (
-            <select
-              id="responseProfileSelect"
-              className="shell__select"
-              aria-label="Response profile"
-              value={responseProfileState.selected}
-              disabled={!canSwitchResponseProfile || responseProfileState.supported.length < 2}
-              onChange={(event) => {
-                const nextProfile = parseResponseProfileValue(event.target.value)
-                if (nextProfile === null || !responseProfileState.supported.includes(nextProfile)) {
-                  return
-                }
-
-                void switchResponseProfile(nextProfile)
-              }}
-            >
-              {RESPONSE_PROFILE_ORDER.map((profile) => (
-                <option
-                  key={profile}
-                  value={profile}
-                  disabled={!responseProfileState.supported.includes(profile)}
-                >
-                  {getResponseProfileLabel(profile)}
-                </option>
-              ))}
-            </select>
-          ) : null}
           <label className="shell__toggle">
             <input
               type="checkbox"
               checked={autoStopOnSilence}
               onChange={(event) => setAutoStopOnSilence(event.target.checked)}
-              disabled={startupState.kind !== 'ready' || !startupState.voiceInputAvailable}
+              disabled={!voiceInputReady(startupState)}
+              aria-describedby={!voiceInputReady(startupState) ? 'voice-input-help' : undefined}
             />
-            <span>Auto Stop</span>
+             <span>Auto Stop</span>
           </label>
           <label className="shell__toggle" htmlFor="tts-toggle">
             <input
@@ -1517,9 +2018,13 @@ function App() {
             className="shell__control"
             onClick={toggleMic}
             disabled={!canToggleMic}
+            aria-describedby={!voiceInputReady(startupState) ? 'voice-input-help' : undefined}
           >
             {micStarting ? 'Starting mic...' : micActive ? 'Stop mic' : 'Start mic'}
           </button>
+          {!voiceInputReady(startupState) ? (
+            <span id="voice-input-help" className="sr-only">{voiceInputUnavailableReason}</span>
+          ) : null}
           <div className="composer__send-side">
             {promptState !== 'idle' &&
             startupState.kind === 'ready' &&
@@ -1556,7 +2061,7 @@ function App() {
               ref={settingsButtonRef}
               type="button"
               className="shell__control shell__settings-button"
-              onClick={() => setSettingsOpen(true)}
+               onClick={() => flushSync(() => setSettingsOpen(true))}
               aria-label="Settings"
               aria-haspopup="dialog"
               aria-expanded={settingsOpen}
@@ -1579,18 +2084,8 @@ function toRuntimeStatus(runtimePhase: BackendRuntimePhase): RuntimeStatus {
   return runtimePhase
 }
 
-const RESPONSE_PROFILE_ORDER: readonly ResponseProfile[] = ['fast', 'quality']
-
 function getResponseProfileLabel(profile: ResponseProfile): 'Fast' | 'Quality' {
   return profile === 'fast' ? 'Fast' : 'Quality'
-}
-
-function parseResponseProfileValue(value: string): ResponseProfile | null {
-  if (value === 'fast' || value === 'quality') {
-    return value
-  }
-
-  return null
 }
 
 function parseUiTextSize(value: unknown): UiTextSize {
@@ -1628,6 +2123,30 @@ function toDisplayErrorMessage(error: unknown): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
+}
+
+function capabilityIsAvailable(
+  state: StartupState,
+  id: import('./types/chat').CapabilityId,
+): boolean {
+  return (state.kind === 'ready' || state.kind === 'warming_model') &&
+    state.capabilities.some((capability) => capability.id === id && capability.state === 'available')
+}
+
+function hasAvailableCapabilities(
+  state: StartupState,
+  ids: readonly import('./types/chat').CapabilityId[],
+): boolean {
+  return ids.every((id) => capabilityIsAvailable(state, id))
+}
+
+function capabilityMap(state: StartupState): import('./lib/assistantSettings').AssistantCapabilities {
+  const available = (id: import('./types/chat').CapabilityId): boolean => capabilityIsAvailable(state, id)
+  return { localFast: available('local_fast'), localQuality: available('local_quality'), custom: available('custom_provider'), openCode: available('opencode'), qwenPrediction: available('qwen_prediction'), deep: available('deep'), review: available('review') }
+}
+
+function capabilityLabel(id: import('./types/chat').CapabilityId): string {
+  return id.split('_').map((part) => part[0]?.toUpperCase() + part.slice(1)).join(' ')
 }
 
 function startupStateToRuntimeStatus(startupState: StartupState): RuntimeStatus {
