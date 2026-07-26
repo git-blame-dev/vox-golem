@@ -9,7 +9,7 @@ use crate::managed_process::{
     configure_owned_tokio, terminate_tokio, terminate_tokio_on_drop, ProcessOwnership,
 };
 use futures_util::StreamExt;
-use reqwest::StatusCode;
+use reqwest::{StatusCode, Url};
 use serde::Deserialize;
 use tokio::process::{Child, Command as TokioCommand};
 
@@ -18,6 +18,7 @@ const MAX_SSE_FRAME_BYTES: usize = 256 * 1024;
 const MAX_SSE_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TRACKED_PART_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TRACKED_PARTS: usize = 1024;
+const MAX_TOOL_EVIDENCE_BYTES: usize = 64 * 1024;
 const STARTUP_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(unix)]
 const ETXTBSY_RETRY_COUNT: usize = 20;
@@ -147,6 +148,15 @@ pub struct OpencodeJsonRunResult {
     pub events: Vec<OpencodeJsonEvent>,
     pub stderr: String,
     pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpencodeToolEvidence {
+    pub session_id: String,
+    pub message_id: Option<String>,
+    pub tool: String,
+    pub status: OpencodeToolUseStatus,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -406,6 +416,7 @@ pub enum OpencodeEvent {
         status: OpencodeToolStatus,
         detail: String,
     },
+    ToolEvidence(OpencodeToolEvidence),
     Error(String),
     Completed,
 }
@@ -620,25 +631,39 @@ impl OpencodeServer {
         &self.session_id
     }
     pub async fn reset(&mut self) -> Result<(), OpencodeServerError> {
+        self.reset_with_deadlines(
+            tokio::time::Instant::now() + self.request_timeout,
+            self.request_timeout,
+        )
+        .await
+    }
+
+    pub async fn reset_with_deadlines(
+        &mut self,
+        deadline: tokio::time::Instant,
+        cleanup_timeout: Duration,
+    ) -> Result<(), OpencodeServerError> {
         let old_client = self.client();
-        old_client.abort().await?;
-        let new_session_id = create_session(
+        let new_session_id = create_session_before_deadline(
             &self.client,
             &self.base_url,
             &self.password,
             self.request_timeout,
+            deadline,
         )
         .await?;
-        if let Err(error) = old_client.delete().await {
-            let transient = OpencodeClient {
-                session_id: new_session_id,
-                ..old_client.clone()
-            };
-            let _ = transient.delete().await;
-            return Err(error);
-        }
         self.session_id = new_session_id;
-        Ok(())
+
+        let abort_result = tokio::time::timeout(cleanup_timeout, old_client.abort()).await;
+        let delete_result = tokio::time::timeout(cleanup_timeout, old_client.delete()).await;
+
+        match abort_result {
+            Ok(Ok(())) => delete_result
+                .unwrap_or(Err(OpencodeServerError::RequestTimeout))
+                .map(|_| ()),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(OpencodeServerError::RequestTimeout),
+        }
     }
     pub async fn shutdown(mut self) -> Result<(), OpencodeServerError> {
         let client = self.client();
@@ -1439,6 +1464,13 @@ impl OpencodeSseDecoder {
                             &mut self.stream_parts,
                         ) {
                             Ok(Some(event)) => {
+                                let mut evidence = Vec::new();
+                                collect_tool_evidence(
+                                    text,
+                                    self.active_session.as_deref(),
+                                    self.assistant_message.as_deref(),
+                                    &mut evidence,
+                                );
                                 let event_bytes = match &event {
                                     OpencodeEvent::Text(text)
                                     | OpencodeEvent::Reasoning(text)
@@ -1446,6 +1478,9 @@ impl OpencodeSseDecoder {
                                     | OpencodeEvent::Error(text) => text.len(),
                                     OpencodeEvent::Tool { name, detail, .. } => {
                                         name.len().saturating_add(detail.len())
+                                    }
+                                    OpencodeEvent::ToolEvidence(evidence) => {
+                                        evidence.tool.len().saturating_add(evidence.detail.len())
                                     }
                                     OpencodeEvent::Completed => 0,
                                 };
@@ -1456,6 +1491,27 @@ impl OpencodeSseDecoder {
                                 } else {
                                     self.output_bytes += event_bytes;
                                     events.push(Ok(event));
+                                    if !evidence.is_empty() {
+                                        let evidence_bytes =
+                                            evidence.iter().fold(0_usize, |total, item| {
+                                                total
+                                                    .saturating_add(item.tool.len())
+                                                    .saturating_add(item.detail.len())
+                                            });
+                                        if self.output_bytes.saturating_add(evidence_bytes)
+                                            > MAX_SSE_OUTPUT_BYTES
+                                        {
+                                            events.push(Err(OpencodeServerError::FrameTooLarge));
+                                        } else {
+                                            self.output_bytes += evidence_bytes;
+                                            events.extend(
+                                                evidence
+                                                    .into_iter()
+                                                    .map(OpencodeEvent::ToolEvidence)
+                                                    .map(Ok),
+                                            );
+                                        }
+                                    }
                                 }
                             }
                             Ok(None) => {}
@@ -1483,6 +1539,77 @@ impl OpencodeSseDecoder {
         }
         events
     }
+}
+
+fn collect_tool_evidence(
+    frame: &str,
+    active_session: Option<&str>,
+    expected_message: Option<&str>,
+    evidence: &mut Vec<OpencodeToolEvidence>,
+) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(
+        &frame
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:").map(|v| v.trim_start()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    ) else {
+        return;
+    };
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("message.part.updated") {
+        return;
+    }
+    let props = value.get("properties").unwrap_or(&value);
+    let part = props.get("part").unwrap_or(props);
+    if part.get("type").and_then(serde_json::Value::as_str) != Some("tool")
+        || part.get("tool").and_then(serde_json::Value::as_str) != Some("webfetch")
+    {
+        return;
+    }
+    let session = part
+        .get("sessionID")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| props.get("sessionID").and_then(serde_json::Value::as_str));
+    let Some(session) = session else { return };
+    if active_session.is_some_and(|expected| expected != session) {
+        return;
+    }
+    let message = part
+        .get("messageID")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| props.get("messageID").and_then(serde_json::Value::as_str));
+    if expected_message.is_some_and(|expected| message != Some(expected)) {
+        return;
+    }
+    let Some(state) = part.get("state") else {
+        return;
+    };
+    if state.get("status").and_then(serde_json::Value::as_str) != Some("completed") {
+        return;
+    }
+    let Some(input_url) = state
+        .get("input")
+        .and_then(|input| input.get("url"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return;
+    };
+    let Ok(url) = Url::parse(input_url) else {
+        return;
+    };
+    if !matches!(url.scheme(), "http" | "https")
+        || input_url.len() > MAX_TOOL_EVIDENCE_BYTES
+        || input_url.chars().any(|c| c.is_control())
+    {
+        return;
+    }
+    evidence.push(OpencodeToolEvidence {
+        session_id: session.into(),
+        message_id: message.map(str::to_owned),
+        tool: "webfetch".into(),
+        status: OpencodeToolUseStatus::Completed,
+        detail: input_url.into(),
+    });
 }
 
 fn sse_frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
@@ -1593,8 +1720,9 @@ mod tests {
         prompt_body, run_opencode, run_opencode_json, startup_health_probe_timeout,
         terminate_child_on_drop, OpencodeCommandSpec, OpencodeEvent, OpencodeJsonEvent,
         OpencodeJsonRunError, OpencodeModel, OpencodeOutputFormat, OpencodePrompt,
-        OpencodePromptError, OpencodeServerConfig, OpencodeServerError, OpencodeSseDecoder,
-        OpencodeToolPolicy, OpencodeToolStatus, OpencodeToolUseStatus, MAX_TRACKED_PART_BYTES,
+        OpencodePromptError, OpencodeServer, OpencodeServerConfig, OpencodeServerError,
+        OpencodeSseDecoder, OpencodeToolPolicy, OpencodeToolStatus, OpencodeToolUseStatus,
+        MAX_TRACKED_PART_BYTES,
     };
     use std::ffi::OsStr;
     use std::fs;
@@ -1602,6 +1730,8 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     static TEMP_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1986,6 +2116,124 @@ mod tests {
             b"data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"type\":\"text\",\"sessionID\":\"ses_other\"},\"delta\":\"wrong\"}}\n\n",
         );
         assert!(events.is_empty());
+    }
+
+    async fn fake_reset_server(abort_delay: Duration, delete_delay: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fake server should bind");
+        let address = listener
+            .local_addr()
+            .expect("fake server should expose its address");
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.expect("request should connect");
+                let mut request = Vec::new();
+                let mut chunk = [0; 1024];
+                loop {
+                    let count = stream
+                        .read(&mut chunk)
+                        .await
+                        .expect("request should be readable");
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..count]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let (delay, body) = if request.contains("POST /session/") {
+                    (abort_delay, "true")
+                } else if request.contains("DELETE /session/") {
+                    (delete_delay, "true")
+                } else {
+                    (Duration::ZERO, "{\"id\":\"ses_new\"}")
+                };
+                tokio::time::sleep(delay).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("response should be writable");
+            }
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn reset_installs_replacement_before_independently_bounded_cleanup() {
+        let base_url =
+            fake_reset_server(Duration::from_millis(100), Duration::from_millis(100)).await;
+        let mut client = OpencodeServer {
+            client: reqwest::Client::new(),
+            base_url,
+            session_id: "ses_old".into(),
+            password: "password".into(),
+            request_timeout: Duration::from_secs(1),
+            child: None,
+            #[cfg(windows)]
+            process_job: None,
+        };
+
+        let result = client
+            .reset_with_deadlines(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                Duration::from_millis(10),
+            )
+            .await;
+
+        assert_eq!(client.session_id(), "ses_new");
+        assert!(matches!(result, Err(OpencodeServerError::RequestTimeout)));
+    }
+
+    #[tokio::test]
+    async fn reset_cancellation_after_installation_retains_replacement() {
+        let base_url = fake_reset_server(Duration::from_millis(100), Duration::ZERO).await;
+        let mut client = OpencodeServer {
+            client: reqwest::Client::new(),
+            base_url,
+            session_id: "ses_old".into(),
+            password: "password".into(),
+            request_timeout: Duration::from_secs(1),
+            child: None,
+            #[cfg(windows)]
+            process_job: None,
+        };
+
+        {
+            let reset = client.reset_with_deadlines(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                Duration::from_secs(1),
+            );
+            tokio::pin!(reset);
+            tokio::select! {
+                _ = &mut reset => panic!("cleanup should still be stalled"),
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        }
+
+        assert_eq!(client.session_id(), "ses_new");
+    }
+
+    #[test]
+    fn exposes_only_scoped_successful_webfetch_output_as_evidence() {
+        let mut decoder = OpencodeSseDecoder::for_message("ses_active".into(), "msg_user".into());
+        let frames = decoder.push(b"data: {\"type\":\"message.updated\",\"properties\":{\"info\":{\"id\":\"msg_user\",\"role\":\"user\",\"sessionID\":\"ses_active\"}}}\n\ndata: {\"type\":\"message.updated\",\"properties\":{\"info\":{\"id\":\"msg_assistant\",\"role\":\"assistant\",\"parentID\":\"msg_user\",\"sessionID\":\"ses_active\"}}}\n\ndata: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"type\":\"tool\",\"tool\":\"webfetch\",\"sessionID\":\"ses_active\",\"messageID\":\"msg_assistant\",\"state\":{\"status\":\"completed\",\"title\":\"Fetched\",\"input\":{\"url\":\"https://example.test/page\"},\"output\":\"The page says the service is healthy.\"}}}}\n\n");
+        assert!(frames.iter().all(Result::is_ok));
+        assert!(frames.iter().any(
+            |event| matches!(event, Ok(OpencodeEvent::Tool { name, .. }) if name == "webfetch")
+        ));
+        assert!(frames.iter().any(|event| matches!(event, Ok(OpencodeEvent::ToolEvidence(evidence)) if evidence.detail == "https://example.test/page")));
+
+        let mut decoder = OpencodeSseDecoder::new("ses_active".into());
+        let rejected = decoder.push(b"data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"type\":\"tool\",\"tool\":\"websearch\",\"sessionID\":\"ses_active\",\"state\":{\"status\":\"completed\",\"output\":\"https://example.test/search\"}}}}\n\ndata: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"type\":\"tool\",\"tool\":\"webfetch\",\"sessionID\":\"ses_other\",\"state\":{\"status\":\"completed\",\"input\":{\"url\":\"https://example.test/other\"},\"output\":\"other session\"}}}}\n\ndata: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"type\":\"tool\",\"tool\":\"webfetch\",\"sessionID\":\"ses_active\",\"state\":{\"status\":\"error\",\"input\":{\"url\":\"https://example.test/error\"},\"output\":\"error\"}}}}\n\ndata: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"type\":\"tool\",\"tool\":\"webfetch\",\"sessionID\":\"ses_active\",\"state\":{\"status\":\"completed\",\"input\":{\"url\":\"not a URL\"},\"output\":\"https://user@example.test/private\"}}}}\n\ndata: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"type\":\"tool\",\"tool\":\"webfetch\",\"sessionID\":\"ses_active\",\"state\":{\"status\":\"completed\",\"output\":\"https://output-only.example/page\"}}}}\n\n");
+        assert!(rejected.iter().all(Result::is_ok));
     }
 
     #[test]

@@ -6,9 +6,35 @@ export interface LiveAudioSource {
   stop(): void
 }
 
+export interface AudioInputDevice {
+  readonly deviceId: string
+  readonly label: string
+}
+
 export interface StartLiveAudioSourceOptions {
+  readonly deviceId?: string
   readonly onFrame: (frame: readonly number[]) => void | Promise<void>
   readonly onError: (error: unknown) => void
+  readonly onSelectedDeviceFallback?: (attemptedDeviceId: string) => void
+}
+
+export async function listAudioInputDevices(): Promise<readonly AudioInputDevice[]> {
+  const mediaDevices = navigator.mediaDevices
+  if (mediaDevices === undefined || typeof mediaDevices.enumerateDevices !== 'function') {
+    return []
+  }
+
+  const devices = await mediaDevices.enumerateDevices()
+  let unnamedIndex = 0
+  return devices
+    .filter((device) => device.kind === 'audioinput' && device.deviceId.length > 0)
+    .map((device) => {
+      unnamedIndex += 1
+      return {
+        deviceId: device.deviceId,
+        label: device.label.trim() || `Microphone ${unnamedIndex}`,
+      }
+    })
 }
 
 export async function startLiveAudioSource(
@@ -26,7 +52,7 @@ export async function startLiveAudioSource(
     throw new Error('Web Audio is unavailable in this runtime')
   }
 
-  const stream = await mediaDevices.getUserMedia({ audio: true })
+  const { stream, fellBackFromDeviceId } = await openAudioInputStream(mediaDevices, options)
   let audioContext: AudioContext | null = null
 
   try {
@@ -41,14 +67,25 @@ export async function startLiveAudioSource(
     let pendingSamples: number[] = []
     let pendingFrameDelivery = Promise.resolve()
     let stopped = false
+    let trackEnded = false
 
     const reportError = (error: unknown): void => {
-      if (stopped) {
+      if (stopped || trackEnded) {
         return
       }
 
       options.onError(error)
     }
+
+    stream.getTracks().forEach((track) => {
+      track.onended = () => {
+        if (stopped || trackEnded) {
+          return
+        }
+        trackEnded = true
+        options.onError(new Error('Microphone input ended unexpectedly'))
+      }
+    })
 
     processorNode.onaudioprocess = (event) => {
       if (stopped) {
@@ -57,7 +94,7 @@ export async function startLiveAudioSource(
 
       try {
         const monoFrame = downmixInputBuffer(event.inputBuffer)
-        const resampledFrame = resampler.process(monoFrame)
+        const resampledFrame = resampler.process(monoFrame).map(normalizeCaptureSample)
 
         if (resampledFrame.length === 0) {
           return
@@ -88,7 +125,7 @@ export async function startLiveAudioSource(
     await audioContext.resume()
     const liveAudioContext = audioContext
 
-    return {
+    const liveAudioSource: LiveAudioSource = {
       stop() {
         if (stopped) {
           return
@@ -102,6 +139,12 @@ export async function startLiveAudioSource(
         void liveAudioContext.close()
       },
     }
+
+    if (fellBackFromDeviceId !== null) {
+      options.onSelectedDeviceFallback?.(fellBackFromDeviceId)
+    }
+
+    return liveAudioSource
   } catch (error) {
     stopStream(stream)
     if (audioContext !== null) {
@@ -109,6 +152,43 @@ export async function startLiveAudioSource(
     }
     throw error
   }
+}
+
+async function openAudioInputStream(
+  mediaDevices: MediaDevices,
+  options: StartLiveAudioSourceOptions,
+): Promise<{ readonly stream: MediaStream; readonly fellBackFromDeviceId: string | null }> {
+  if (options.deviceId !== undefined) {
+    try {
+      return {
+        stream: await mediaDevices.getUserMedia({
+        audio: { deviceId: { exact: options.deviceId } },
+        }),
+        fellBackFromDeviceId: null,
+      }
+    } catch (error) {
+      if (!isStaleDeviceError(error)) {
+        throw error
+      }
+    }
+  }
+
+  return {
+    stream: await mediaDevices.getUserMedia({ audio: true }),
+    fellBackFromDeviceId: options.deviceId ?? null,
+  }
+}
+
+function isStaleDeviceError(error: unknown): boolean {
+  return error instanceof DOMException && (error.name === 'NotFoundError' || error.name === 'OverconstrainedError')
+}
+
+function normalizeCaptureSample(sample: number): number {
+  if (!Number.isFinite(sample)) {
+    return 0
+  }
+
+  return Math.max(-1, Math.min(1, sample))
 }
 
 function stopStream(stream: MediaStream): void {

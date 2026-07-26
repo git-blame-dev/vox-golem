@@ -12,6 +12,7 @@ export interface ChatMessage {
 export interface AnswerStageMetadata {
   readonly stages: readonly import('../components/AnswerStage').AnswerStageStatusEntry[]
   readonly priorVersions: readonly import('../components/AnswerStage').AnswerPriorVersion[]
+  readonly sources?: readonly import('../components/AnswerStage').AnswerSource[]
 }
 
 export interface TranscriptMessage {
@@ -80,7 +81,9 @@ export type BackendRuntimePhase =
 
 export type PromptExecutionEvent =
   | { readonly requestId: string; readonly kind: 'text' | 'reasoning'; readonly text: string }
-  | { readonly requestId: string; readonly kind: 'correction'; readonly text: string; readonly correction: string }
+  | { readonly requestId: string; readonly kind: 'correction'; readonly stage: 'instant' | 'deep' | 'review'; readonly text: string; readonly correction: string }
+  | { readonly requestId: string; readonly kind: 'stage'; readonly stage: 'instant' | 'deep' | 'review'; readonly status: import('../components/AnswerStage').AnswerStageStatus; readonly detail?: string }
+  | { readonly requestId: string; readonly kind: 'sources'; readonly sources: readonly import('../components/AnswerStage').AnswerSource[] }
   | { readonly requestId: string; readonly kind: 'status'; readonly message: string }
   | {
       readonly requestId: string

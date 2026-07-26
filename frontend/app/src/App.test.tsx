@@ -3,9 +3,12 @@ import { createRoot } from 'react-dom/client'
 import type { Root } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import * as liveAudioSourceModule from './lib/liveAudioSource'
+import type { StartLiveAudioSourceOptions } from './lib/liveAudioSource'
 import App from './App'
 
 const startLiveAudioSourceMock = vi.spyOn(liveAudioSourceModule, 'startLiveAudioSource')
+const listAudioInputDevicesMock = vi.spyOn(liveAudioSourceModule, 'listAudioInputDevices')
+  .mockResolvedValue([])
 
 const mountedContainers: HTMLElement[] = []
 const mountedRoots: Root[] = []
@@ -50,6 +53,9 @@ afterEach(() => {
   Date.now = originalDateNow
   vi.useRealTimers()
   startLiveAudioSourceMock.mockReset()
+  listAudioInputDevicesMock.mockReset()
+  listAudioInputDevicesMock.mockResolvedValue([])
+  window.localStorage.removeItem('voxgolem.audioInputDeviceId')
 })
 
 describe('App', () => {
@@ -885,6 +891,90 @@ describe('App', () => {
     expect(resumeCallCount).toBe(1)
   })
 
+  it('stops active TTS playback when Escape cancels a prompt', async () => {
+    let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
+    let finishPrompt: ((value: unknown) => void) | undefined
+    let requestId = ''
+    const stop = vi.fn()
+    const started = vi.fn()
+    class FakeAudioContext {
+      destination = {} as AudioDestinationNode
+      state: AudioContextState = 'running'
+      createBuffer(): AudioBuffer { return { copyToChannel: () => {} } as unknown as AudioBuffer }
+      createBufferSource(): AudioBufferSourceNode {
+        return { buffer: null, connect: () => {}, onended: null, start: started, stop } as unknown as AudioBufferSourceNode
+      }
+      createGain(): GainNode { return { gain: { value: 1 } as AudioParam, connect: () => {} } as unknown as GainNode }
+      async close(): Promise<void> {}
+    }
+    Object.defineProperty(globalThis, 'AudioContext', { configurable: true, value: FakeAudioContext })
+    window.__TAURI_INTERNALS__ = {
+      listen: async (_event, handler) => { promptEventHandler = handler; return () => undefined },
+      invoke: async (command, args) => {
+        if (command === 'get_startup_state') return readyStartupState({ prompt_cancellation_available: true, tts_enabled: false })
+        if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
+        if (command === 'set_tts_enabled') return { enabled: true }
+        if (command === 'submit_prompt') { requestId = (args as { requestId: string }).requestId; return new Promise((resolve) => { finishPrompt = resolve }) }
+        if (command === 'synthesize_local_tts') return { pcm_f32: [0], sample_rate_hz: 22050, duration_ms: 1 }
+        if (command === 'cancel_prompt') return null
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+    const { container } = await renderApp()
+    await act(async () => { getTtsToggle(container).click(); await new Promise((resolve) => setTimeout(resolve, 0)); setTextAreaValue(getComposer(container), 'Say this'); getSendButton(container).click(); await Promise.resolve() })
+    await act(async () => { promptEventHandler?.({ payload: { request_id: requestId, kind: 'text', text: 'Valid first line\nmore' } }); await new Promise((resolve) => setTimeout(resolve, 0)) })
+    await act(async () => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })); await Promise.resolve() })
+    expect(stop).toHaveBeenCalledOnce()
+    expect(started).toHaveBeenCalledOnce()
+    await act(async () => {
+      finishPrompt?.({ request_id: requestId, runtime_phase: 'sleeping', outcome: 'cancelled' })
+      await Promise.resolve()
+    })
+  })
+
+  it('does not start TTS playback when synthesis resolves after Escape', async () => {
+    let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
+    let resolveSynthesis: ((value: unknown) => void) | undefined
+    let requestId = ''
+    const started = vi.fn()
+    let synthesisInvoked = false
+    class FakeAudioContext {
+      destination = {} as AudioDestinationNode
+      state: AudioContextState = 'running'
+      createBuffer(): AudioBuffer { return { copyToChannel: () => {} } as unknown as AudioBuffer }
+      createBufferSource(): AudioBufferSourceNode { return { buffer: null, connect: () => {}, onended: null, start: started, stop: vi.fn() } as unknown as AudioBufferSourceNode }
+      createGain(): GainNode { return { gain: { value: 1 } as AudioParam, connect: () => {} } as unknown as GainNode }
+      async close(): Promise<void> {}
+    }
+    Object.defineProperty(globalThis, 'AudioContext', { configurable: true, value: FakeAudioContext })
+    window.__TAURI_INTERNALS__ = {
+      listen: async (_event, handler) => { promptEventHandler = handler; return () => undefined },
+      invoke: async (command, args) => {
+        if (command === 'get_startup_state') return readyStartupState({ prompt_cancellation_available: true })
+        if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
+        if (command === 'set_tts_enabled') return { enabled: true }
+        if (command === 'submit_prompt') { requestId = (args as { requestId: string }).requestId; return new Promise(() => {}) }
+        if (command === 'synthesize_local_tts') {
+          synthesisInvoked = true
+          return new Promise((resolve) => { resolveSynthesis = resolve })
+        }
+        if (command === 'cancel_prompt') return null
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+    const { container } = await renderApp()
+    await act(async () => { getTtsToggle(container).click(); await new Promise((resolve) => setTimeout(resolve, 0)); setTextAreaValue(getComposer(container), 'Say this'); getSendButton(container).click(); await Promise.resolve() })
+    await act(async () => {
+      promptEventHandler?.({ payload: { request_id: requestId, kind: 'text', text: 'Valid first line\nmore' } })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(synthesisInvoked).toBe(true)
+    expect(resolveSynthesis).toBeDefined()
+    await act(async () => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })); await Promise.resolve() })
+    await act(async () => { resolveSynthesis?.({ pcm_f32: [0], sample_rate_hz: 22050, duration_ms: 1 }); await Promise.resolve() })
+    expect(started).not.toHaveBeenCalled()
+  })
+
   it('renders response profile dropdown from startup state', async () => {
     window.__TAURI_INTERNALS__ = {
       invoke: async (command) => {
@@ -1195,6 +1285,171 @@ describe('App', () => {
     expect(container.textContent).not.toContain('Response profile switch error:')
   })
 
+  it('surfaces requested profile failure when the previous runtime is restored', async () => {
+    let startupStateCallCount = 0
+    const sources: Array<{ stop: ReturnType<typeof vi.fn> }> = []
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      const source = { stop: vi.fn(), onFrame: options.onFrame }
+      sources.push(source)
+      return source
+    })
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        if (command === 'get_startup_state') {
+          startupStateCallCount += 1
+          if (startupStateCallCount === 1) return readyStartupState()
+          return readyStartupState({
+            selected_response_profile: 'fast',
+            capabilities: completeCapabilities({
+              local_quality: 'failed',
+              qwen_prediction: 'warming',
+            }).map((capability) => capability['id'] === 'local_quality'
+              ? { ...capability, reason: 'failed to initialize requested quality profile: boom' }
+              : capability),
+          })
+        }
+
+        if (command === 'switch_response_profile') return {
+          selected_response_profile: 'quality',
+          supported_response_profiles: ['fast', 'quality'],
+        }
+
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    const select = await getResponseProfileSelect(container)
+
+    await act(async () => {
+      setSelectValue(select, 'quality')
+      await Promise.resolve()
+    })
+
+    expect(select.value).toBe('local-fast')
+    expect(container.textContent).toContain('Profile switch failed')
+    expect(container.textContent).toContain('failed to initialize requested quality profile: boom')
+    expect(startupStateCallCount).toBe(2)
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(sources).toHaveLength(2)
+    expect(sources[0]?.stop).toHaveBeenCalledOnce()
+    expect(sources[1]?.stop).not.toHaveBeenCalled()
+  })
+
+  it('restarts auto-started microphone once after a failed profile rollback', async () => {
+    const sources: Array<{ stop: ReturnType<typeof vi.fn>; onFrame: (frame: readonly number[]) => Promise<void> | void }> = []
+    const invokedCommands: string[] = []
+    let startupCalls = 0
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      const source = { stop: vi.fn(), onFrame: options.onFrame }
+      sources.push(source)
+      return source
+    })
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command, args) => {
+        invokedCommands.push(command)
+        if (command === 'get_startup_state') {
+          startupCalls += 1
+          return readyStartupState({
+            selected_response_profile: startupCalls === 1 ? 'fast' : 'fast',
+            capabilities: completeCapabilities(startupCalls === 1 ? {} : { local_quality: 'failed' }),
+          })
+        }
+        if (command === 'switch_response_profile') {
+          expect(args).toEqual({ profile: 'quality' })
+          return null
+        }
+        if (command === 'ingest_audio_frame') return { runtime_phase: 'sleeping', last_activity_ms: null, transcription_ready_samples: null, transcript_text: null, capturing_utterance: false, preroll_samples: 0, utterance_samples: 0 }
+        if (command === 'get_assistant_settings') return defaultAssistantSettings()
+        return null
+      },
+    }
+    const { container } = await renderApp()
+    const select = await getResponseProfileSelect(container)
+    await act(async () => { setSelectValue(select, 'quality'); await Promise.resolve() })
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); await Promise.resolve() })
+    expect(sources).toHaveLength(2)
+    expect(sources[0]?.stop).toHaveBeenCalledOnce()
+    expect(sources[1]?.stop).not.toHaveBeenCalled()
+    await act(async () => { await sources[0]?.onFrame([0.1]); await sources[1]?.onFrame([0.1]); await Promise.resolve() })
+    expect(invokedCommands.filter((command) => command === 'ingest_audio_frame')).toHaveLength(1)
+  })
+
+  it('keeps a failed active local profile unsendable and retries it explicitly', async () => {
+    const invokedCommands: string[] = []
+    let recovered = false
+    const startupState = (): Record<string, unknown> => readyStartupState({
+      capabilities: completeCapabilities(recovered ? {} : { local_fast: 'failed' }).map((capability) =>
+        capability['id'] === 'local_fast' && !recovered
+          ? { ...capability, reason: 'failed to initialize requested fast profile: boom' }
+          : capability),
+    })
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        invokedCommands.push(command)
+        if (command === 'get_startup_state') return startupState()
+        if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
+        if (command === 'switch_response_profile') {
+          recovered = true
+          return { selected_response_profile: 'fast', supported_response_profiles: ['fast', 'quality'] }
+        }
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    await act(async () => {
+      setTextAreaValue(getComposer(container), 'hello')
+      await Promise.resolve()
+    })
+    expect(getSendButton(container).disabled).toBe(true)
+
+    const select = await getResponseProfileSelect(container)
+    expect(select.querySelector<HTMLOptionElement>('option[value="local-fast"]')?.disabled).toBe(false)
+    await act(async () => {
+      getButtonByLabel(container, 'Retry local profile').click()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+
+    expect(nonDiagnosticCommands(invokedCommands)).toContain('switch_response_profile')
+    await act(async () => { setTextAreaValue(getComposer(container), 'another prompt'); await Promise.resolve(); await Promise.resolve(); })
+    expect(getSendButton(container).disabled).toBe(false)
+  })
+
+  it('keeps unrelated providers and retry available after a persistent local retry failure', async () => {
+    const failedState = readyStartupState({
+      capabilities: completeCapabilities({ local_fast: 'failed' }).map((capability) =>
+        capability['id'] === 'local_fast'
+          ? { ...capability, reason: 'failed to initialize requested fast profile: still broken' }
+          : capability),
+    })
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        if (command === 'get_startup_state') return failedState
+        if (command === 'switch_response_profile') {
+          return { selected_response_profile: 'fast', supported_response_profiles: ['fast'] }
+        }
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    const select = await getResponseProfileSelect(container)
+    await act(async () => {
+      getButtonByLabel(container, 'Retry local profile').click()
+      await Promise.resolve()
+    })
+
+    expect(container.textContent).toContain('Profile switch failed')
+    expect(getButtonByLabel(container, 'Retry local profile')).not.toBeNull()
+    expect(select.querySelector<HTMLOptionElement>('option[value="opencode-sol-high"]')?.disabled).toBe(false)
+    expect(getSendButton(container).disabled).toBe(true)
+  })
+
   it('renders only user and assistant prompt execution output when submit command succeeds', async () => {
     let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
     window.__TAURI_INTERNALS__ = {
@@ -1252,6 +1507,36 @@ describe('App', () => {
 
     expect(container.textContent).toContain('Draft release notes')
     expect(container.textContent).toContain('OpenCode response')
+  })
+
+  it('preserves typed prompt bytes in the user display and command payload', async () => {
+    let submittedPrompt: string | undefined
+    window.__TAURI_INTERNALS__ = {
+      listen: async () => () => undefined,
+      invoke: async (command, args) => {
+        if (command === 'get_startup_state') return readyStartupState({ selected_response_profile: 'fast' })
+        if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
+        expect(command).toBe('submit_prompt')
+        submittedPrompt = (args as { prompt: string }).prompt
+        return {
+          request_id: (args as { requestId: string }).requestId,
+          outcome: 'completed',
+          error_message: null,
+          runtime_phase: 'sleeping',
+        }
+      },
+    }
+
+    const { container } = await renderApp()
+    const prompt = '  keep me  \nwith spaces  '
+    await act(async () => setTextAreaValue(getComposer(container), prompt))
+    await act(async () => {
+      getSendButton(container).click()
+      await Promise.resolve()
+    })
+
+    expect(submittedPrompt).toBe(prompt)
+    expect(container.querySelector('.message--user .message__content')?.textContent).toBe(prompt)
   })
 
   it('does not render no-output execution fallback as an assistant message', async () => {
@@ -1617,6 +1902,63 @@ describe('App', () => {
     expect(container.textContent).not.toContain('Stopping')
   })
 
+  it('stops from the Stop button and returns to sleeping after cancellation settlement', async () => {
+    let finishPrompt: ((value: unknown) => void) | undefined
+    let requestId = ''
+    window.__TAURI_INTERNALS__ = {
+      listen: async () => () => undefined,
+      invoke: async (command, args) => {
+        if (command === 'get_startup_state') return readyStartupState({ prompt_cancellation_available: true })
+        if (command === 'get_assistant_settings') return defaultAssistantSettings()
+        if (command === 'submit_prompt') {
+          requestId = (args as { requestId: string }).requestId
+          return new Promise((resolve) => { finishPrompt = resolve })
+        }
+        if (command === 'cancel_prompt') return null
+        return null
+      },
+    }
+    const { container } = await renderApp()
+    await act(async () => { setTextAreaValue(getComposer(container), 'stop me'); getSendButton(container).click(); await Promise.resolve() })
+    const stopButton = Array.from(container.querySelectorAll('button')).find((button) => button.textContent === 'Stop')
+    expect(stopButton).toBeDefined()
+    await act(async () => { stopButton?.click(); await Promise.resolve() })
+    expect(container.textContent).toContain('Stopping')
+    await act(async () => { finishPrompt?.({ request_id: requestId, runtime_phase: 'sleeping', outcome: 'cancelled' }); await Promise.resolve() })
+    expect(container.textContent).not.toContain('Stopping')
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); })
+    await act(async () => { setTextAreaValue(getComposer(container), 'another prompt'); await Promise.resolve(); await Promise.resolve(); })
+    expect(getSendButton(container).disabled).toBe(false)
+  })
+
+  it('recovers a rejected Stop request and permits its later completion', async () => {
+    let finishPrompt: ((value: unknown) => void) | undefined
+    let requestId = ''
+    window.__TAURI_INTERNALS__ = {
+      listen: async () => () => undefined,
+      invoke: async (command, args) => {
+        if (command === 'get_startup_state') return readyStartupState({ prompt_cancellation_available: true })
+        if (command === 'get_assistant_settings') return defaultAssistantSettings()
+        if (command === 'submit_prompt') {
+          requestId = (args as { requestId: string }).requestId
+          return new Promise((resolve) => { finishPrompt = resolve })
+        }
+        if (command === 'cancel_prompt') throw new Error('cancel rejected')
+        return null
+      },
+    }
+    const { container } = await renderApp()
+    await act(async () => { setTextAreaValue(getComposer(container), 'finish me'); getSendButton(container).click(); await Promise.resolve() })
+    const stopButton = Array.from(container.querySelectorAll('button')).find((button) => button.textContent === 'Stop')
+    await act(async () => { stopButton?.click(); await Promise.resolve() })
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    expect(container.textContent).toContain('Executing prompt')
+    await act(async () => { finishPrompt?.({ request_id: requestId, runtime_phase: 'sleeping', outcome: 'completed' }); await Promise.resolve() })
+    expect(container.textContent).not.toContain('Executing prompt')
+    await act(async () => { setTextAreaValue(getComposer(container), 'another prompt'); await Promise.resolve(); await Promise.resolve() })
+    expect(getSendButton(container).disabled).toBe(false)
+  })
+
   it('uses a correlated stream error when the final result has no message', async () => {
     let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
     window.__TAURI_INTERNALS__ = {
@@ -1780,6 +2122,233 @@ describe('App', () => {
     expect(container.textContent).toContain('Startup error: failed to initialize local llama.cpp runtime: boom')
   })
 
+  it('keeps polling ready state until a warming capability becomes available', async () => {
+    let startupCalls = 0
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        if (command !== 'get_startup_state') throw new Error(`unexpected command: ${command}`)
+        startupCalls += 1
+        return readyStartupState({
+          capabilities: completeCapabilities({
+            qwen_prediction: startupCalls === 1 ? 'warming' : 'available',
+          }),
+        })
+      },
+    }
+
+    await renderApp()
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 600))
+    })
+
+    expect(startupCalls).toBe(2)
+  })
+
+  it('surfaces a capability that fails after ready state was first published', async () => {
+    let startupCalls = 0
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        if (command !== 'get_startup_state') throw new Error(`unexpected command: ${command}`)
+        startupCalls += 1
+        return readyStartupState({
+          capabilities: completeCapabilities({
+            qwen_prediction: startupCalls === 1 ? 'warming' : 'failed',
+          }).map((capability) => capability['id'] === 'qwen_prediction' && startupCalls > 1
+            ? { ...capability, reason: 'completion startup failed' }
+            : capability),
+        })
+      },
+    }
+
+    const { container } = await renderApp()
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 600))
+    })
+
+    expect(container.textContent).toContain('completion startup failed')
+  })
+
+  it('continues monitoring a capability after it becomes available', async () => {
+    let startupCalls = 0
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        if (command !== 'get_startup_state') throw new Error(`unexpected command: ${command}`)
+        startupCalls += 1
+        const state = startupCalls === 1 ? 'warming' : startupCalls === 2 ? 'available' : 'failed'
+        return readyStartupState({
+          capabilities: completeCapabilities({ qwen_prediction: state }).map((capability) =>
+            capability['id'] === 'qwen_prediction' && state === 'failed'
+              ? { ...capability, reason: 'completion worker stopped' }
+              : capability),
+        })
+      },
+    }
+
+    const { container } = await renderApp()
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 1_700))
+    })
+
+    expect(startupCalls).toBe(3)
+    expect(container.textContent).toContain('completion worker stopped')
+  })
+
+  it('keeps an active prompt tracked across settled capability polling', async () => {
+    let startupCalls = 0
+    let submitCalls = 0
+    let requestId = ''
+    let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
+    let finishPrompt: ((value: unknown) => void) | undefined
+    window.__TAURI_INTERNALS__ = {
+      listen: async (_event, handler) => {
+        promptEventHandler = handler
+        return () => undefined
+      },
+      invoke: async (command, args) => {
+        if (command === 'get_startup_state') {
+          startupCalls += 1
+          return readyStartupState({ voice_input_available: false })
+        }
+        if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
+        if (command === 'submit_prompt') {
+          submitCalls += 1
+          requestId = (args as { requestId: string }).requestId
+          return new Promise((resolve) => {
+            finishPrompt = resolve
+          })
+        }
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    await act(async () => {
+      setTextAreaValue(getComposer(container), 'Long-running prompt')
+      getSendButton(container).click()
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 1_100))
+      setTextAreaValue(getComposer(container), 'Overlapping prompt')
+    })
+
+    expect(startupCalls).toBeGreaterThanOrEqual(2)
+    expect(getSendButton(container).disabled).toBe(true)
+    await act(async () => {
+      getComposer(container).dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }),
+      )
+      await Promise.resolve()
+    })
+    expect(submitCalls).toBe(1)
+
+    await act(async () => {
+      promptEventHandler?.({
+        payload: { request_id: requestId, kind: 'text', text: 'Original response' },
+      })
+      finishPrompt?.({
+        request_id: requestId,
+        runtime_phase: 'sleeping',
+        outcome: 'completed',
+      })
+      await Promise.resolve()
+    })
+
+    expect(container.textContent).toContain('Original response')
+  })
+
+  it.each(['listening', 'processing'] as const)(
+    'does not regress live %s state during capability polling',
+    async (runtimePhase) => {
+      let startupCalls = 0
+      let submitCalls = 0
+      window.__TAURI_INTERNALS__ = {
+        invoke: async (command) => {
+          if (command === 'get_startup_state') {
+            startupCalls += 1
+            return readyStartupState({
+              runtime_phase: startupCalls === 1 ? runtimePhase : 'sleeping',
+              voice_input_available: false,
+              capabilities: completeCapabilities({
+                qwen_prediction: startupCalls === 1 ? 'warming' : 'available',
+              }),
+            })
+          }
+          if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
+          if (command === 'submit_prompt') {
+            submitCalls += 1
+            return null
+          }
+          throw new Error(`unexpected command: ${command}`)
+        },
+      }
+
+      const { container } = await renderApp()
+      await act(async () => {
+        setTextAreaValue(getComposer(container), 'Typed while voice is active')
+        await new Promise((resolve) => window.setTimeout(resolve, 600))
+      })
+
+      expect(startupCalls).toBe(2)
+      expect(getSendButton(container).disabled).toBe(true)
+      await act(async () => {
+        getComposer(container).dispatchEvent(
+          new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }),
+        )
+        await Promise.resolve()
+      })
+      expect(submitCalls).toBe(0)
+    },
+  )
+
+  it.each(['listening', 'processing'] as const)(
+    'preserves live %s state through a transient startup poll error',
+    async (runtimePhase) => {
+      let startupCalls = 0
+      let submitCalls = 0
+      window.__TAURI_INTERNALS__ = {
+        invoke: async (command) => {
+          if (command === 'get_startup_state') {
+            startupCalls += 1
+            if (startupCalls === 2) {
+              return { kind: 'error', message: 'transient startup poll failure' }
+            }
+            return readyStartupState({
+              runtime_phase: startupCalls === 1 ? runtimePhase : 'sleeping',
+              voice_input_available: false,
+              capabilities: completeCapabilities({
+                qwen_prediction: startupCalls === 1 ? 'warming' : 'available',
+              }),
+            })
+          }
+          if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
+          if (command === 'submit_prompt') {
+            submitCalls += 1
+            return null
+          }
+          throw new Error(`unexpected command: ${command}`)
+        },
+      }
+
+      const { container } = await renderApp()
+      await act(async () => {
+        setTextAreaValue(getComposer(container), 'Typed during startup recovery')
+        await new Promise((resolve) => window.setTimeout(resolve, 1_600))
+      })
+
+      expect(startupCalls).toBe(3)
+      expect(getSendButton(container).disabled).toBe(true)
+      await act(async () => {
+        getComposer(container).dispatchEvent(
+          new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }),
+        )
+        await Promise.resolve()
+      })
+      expect(submitCalls).toBe(0)
+    },
+  )
+
   it('plays the configured start-listening cue path from startup state', async () => {
     const stop = vi.fn()
     let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
@@ -1893,9 +2462,12 @@ describe('App', () => {
     expect(container.textContent).not.toContain('transcription_ready:\n3200 samples captured')
   })
 
-  it('shows wake confidence badge while listening when telemetry includes wake confidence', async () => {
+  it('holds a wake confidence peak for one second before showing the latest lower score', async () => {
+    vi.useFakeTimers()
     const stop = vi.fn()
     let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
+    let confidence: number | null = 0.00114
+    let runtimePhase: 'sleeping' | 'listening' = 'sleeping'
 
     class FakeAudio {
       play(): Promise<void> {
@@ -1936,7 +2508,7 @@ describe('App', () => {
 
         if (command === 'ingest_audio_frame') {
           return {
-            runtime_phase: 'listening',
+            runtime_phase: runtimePhase,
             transcription_ready_samples: null,
             transcript_text: null,
             last_activity_ms: Date.now(),
@@ -1944,10 +2516,14 @@ describe('App', () => {
             preroll_samples: 0,
             utterance_samples: 3,
             telemetry: {
-              wake_detected_ms: 100,
-              wake_confidence: 0.67,
+              wake_detected_ms: null,
+               wake_confidence: confidence,
             },
           }
+        }
+
+        if (command === 'ingest_audio_frame') {
+          return { runtime_phase: 'sleeping', last_activity_ms: null, transcription_ready_samples: null, transcript_text: null, capturing_utterance: false, preroll_samples: 0, utterance_samples: 0 }
         }
 
         throw new Error(`unexpected command: ${command}`)
@@ -1955,13 +2531,86 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
+    expect(container.textContent).not.toContain('wake: 0.00%')
 
     await act(async () => {
       await onFrame?.([0.04, -0.04, 0.04, -0.04])
       await Promise.resolve()
     })
 
-    expect(container.textContent).toContain('wake: 67%')
+    expect(container.textContent).toContain('wake: 0.11%')
+
+    confidence = 0.8
+    await act(async () => {
+      await onFrame?.([0.04, -0.04, 0.04, -0.04])
+      await Promise.resolve()
+    })
+    expect(container.textContent).toContain('wake: 80.00%')
+
+    confidence = null
+    await act(async () => {
+      await onFrame?.([0.04, -0.04, 0.04, -0.04])
+      await Promise.resolve()
+    })
+    expect(container.textContent).not.toContain('wake:')
+
+    confidence = 0.2
+    await act(async () => {
+      await onFrame?.([0.04, -0.04, 0.04, -0.04])
+      await Promise.resolve()
+    })
+    expect(container.textContent).toContain('wake: 20.00%')
+
+    confidence = 0.3
+    await act(async () => {
+      await onFrame?.([0.04, -0.04, 0.04, -0.04])
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(999)
+    })
+    expect(container.textContent).toContain('wake: 30.00%')
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1)
+    })
+    expect(container.textContent).toContain('wake: 30.00%')
+
+    confidence = 0.9
+    await act(async () => {
+      await onFrame?.([0.04, -0.04, 0.04, -0.04])
+      await Promise.resolve()
+    })
+    expect(container.textContent).toContain('wake: 90.00%')
+
+    confidence = 0.1
+    await act(async () => {
+      await onFrame?.([0.04, -0.04, 0.04, -0.04])
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(1_000)
+    })
+    expect(container.textContent).toContain('wake: 10.00%')
+
+    runtimePhase = 'listening'
+    confidence = 0.99
+    await act(async () => {
+      await onFrame?.([0.04, -0.04, 0.04, -0.04])
+      await Promise.resolve()
+    })
+    expect(container.textContent).not.toContain('wake:')
+
+    confidence = 0.88
+    await act(async () => {
+      await onFrame?.([0.04, -0.04, 0.04, -0.04])
+      await Promise.resolve()
+    })
+    expect(container.textContent).not.toContain('wake:')
+
+    runtimePhase = 'sleeping'
+    confidence = 0
+    await act(async () => {
+      await onFrame?.([0.04, -0.04, 0.04, -0.04])
+      await Promise.resolve()
+    })
+    expect(container.textContent).toContain('wake: 0.00%')
   })
 
   it('starts and stops default microphone capture and forwards live frames', async () => {
@@ -2029,14 +2678,22 @@ describe('App', () => {
   })
 
   it('ignores stale live frames after profile switch stops capture', async () => {
-    const stop = vi.fn()
-    let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
+    const originalStop = vi.fn()
+    const replacementStop = vi.fn()
+    let originalFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
+    let replacementFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
+    let sourceCount = 0
     const invokedCommands: string[] = []
     let selectedProfile: 'fast' | 'quality' = 'fast'
 
     startLiveAudioSourceMock.mockImplementation(async (options) => {
-      onFrame = options.onFrame
-      return { stop }
+      sourceCount += 1
+      if (sourceCount === 1) {
+        originalFrame = options.onFrame
+        return { stop: originalStop }
+      }
+      replacementFrame = options.onFrame
+      return { stop: replacementStop }
     })
 
     window.__TAURI_INTERNALS__ = {
@@ -2082,6 +2739,10 @@ describe('App', () => {
           }
         }
 
+        if (command === 'ingest_audio_frame') {
+          return { runtime_phase: 'sleeping', last_activity_ms: null, transcription_ready_samples: null, transcript_text: null, capturing_utterance: false, preroll_samples: 0, utterance_samples: 0 }
+        }
+
         throw new Error(`unexpected command: ${command}`)
       },
     }
@@ -2094,15 +2755,17 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(stop).toHaveBeenCalledTimes(1)
+    expect(originalStop).toHaveBeenCalledTimes(1)
+    expect(startLiveAudioSourceMock.mock.calls.length).toBeGreaterThan(0)
 
     await act(async () => {
-      await onFrame?.([0.2, -0.2, 0.2, -0.2])
+      await originalFrame?.([0.2, -0.2, 0.2, -0.2])
+      await replacementFrame?.([0.2, -0.2, 0.2, -0.2])
       await Promise.resolve()
     })
 
     expect(invokedCommands).toContain('switch_response_profile')
-    expect(invokedCommands.filter((command) => command === 'ingest_audio_frame')).toHaveLength(0)
+    expect(invokedCommands.filter((command) => command === 'ingest_audio_frame')).toHaveLength(1)
   })
 
   it('stops live audio and rejects stale frames before resetting the session', async () => {
@@ -2623,21 +3286,25 @@ describe('App', () => {
   })
 
   it('ignores stale delayed microphone start after profile switch invalidates session', async () => {
-    const stop = vi.fn()
-    let delayedStartPending = false
-    let resolveLiveAudioSource: (source: { stop: () => void }) => void = () => {
-      throw new Error('Expected delayed microphone start resolver')
-    }
+    const staleStop = vi.fn()
+    const replacementStop = vi.fn()
+    let delayedStartCount = 0
+    let resolveStaleStart: (source: { stop: () => void }) => void = () => { throw new Error('Expected stale resolver') }
+    let resolveReplacementStart: (source: { stop: () => void }) => void = () => { throw new Error('Expected replacement resolver') }
+    let staleFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
+    let replacementFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
     const invokedCommands: string[] = []
     let selectedProfile: 'fast' | 'quality' = 'fast'
 
-    startLiveAudioSourceMock.mockImplementation(
-      async () =>
-        await new Promise((resolve) => {
-          delayedStartPending = true
-          resolveLiveAudioSource = resolve
-        }),
-    )
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      delayedStartCount += 1
+      if (delayedStartCount === 1) {
+        staleFrame = options.onFrame
+        return await new Promise((resolve) => { resolveStaleStart = resolve })
+      }
+      replacementFrame = options.onFrame
+      return await new Promise((resolve) => { resolveReplacementStart = resolve })
+    })
 
     window.__TAURI_INTERNALS__ = {
       invoke: async (command, args) => {
@@ -2670,6 +3337,9 @@ describe('App', () => {
           }
         }
 
+        if (command === 'ingest_audio_frame') {
+          return { runtime_phase: 'sleeping', last_activity_ms: null, transcription_ready_samples: null, transcript_text: null, capturing_utterance: false, preroll_samples: 0, utterance_samples: 0 }
+        }
         throw new Error(`unexpected command: ${command}`)
       },
     }
@@ -2682,35 +3352,54 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(delayedStartPending).toBe(true)
+    expect(delayedStartCount).toBe(1)
 
     await act(async () => {
-      delayedStartPending = false
-      resolveLiveAudioSource({ stop })
+      resolveStaleStart({ stop: staleStop })
       await Promise.resolve()
     })
 
     expect(invokedCommands).toContain('switch_response_profile')
     expect(invokedCommands.filter((command) => command === 'ingest_audio_frame')).toHaveLength(0)
-    expect(stop).toHaveBeenCalledTimes(1)
+    expect(staleStop).toHaveBeenCalledTimes(1)
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); await Promise.resolve() })
+    expect(delayedStartCount).toBe(2)
     expect(container.textContent).not.toContain('live_audio:\ndefault microphone started')
+    await act(async () => {
+      await staleFrame?.([0.2, -0.2])
+      await Promise.resolve()
+    })
+    expect(invokedCommands.filter((command) => command === 'ingest_audio_frame')).toHaveLength(0)
+    await act(async () => {
+      resolveReplacementStart({ stop: replacementStop })
+      await Promise.resolve()
+      await replacementFrame?.([0.2, -0.2])
+      await Promise.resolve()
+    })
+    expect(invokedCommands.filter((command) => command === 'ingest_audio_frame')).toHaveLength(1)
   })
 
   it('ignores stale delayed microphone start rejection after profile switch', async () => {
     let delayedStartPending = false
+    let startCount = 0
     let rejectLiveAudioSource: (error: unknown) => void = () => {
       throw new Error('Expected delayed microphone start rejector')
     }
+    let replacementFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
     const invokedCommands: string[] = []
     let selectedProfile: 'fast' | 'quality' = 'fast'
 
-    startLiveAudioSourceMock.mockImplementation(
-      async () =>
-        await new Promise((_resolve, reject) => {
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      startCount += 1
+      if (startCount === 1) {
+        return await new Promise((_resolve, reject) => {
           delayedStartPending = true
           rejectLiveAudioSource = reject
-        }),
-    )
+        })
+      }
+      replacementFrame = options.onFrame
+      return { stop: vi.fn() }
+    })
 
     window.__TAURI_INTERNALS__ = {
       invoke: async (command, args) => {
@@ -2741,6 +3430,10 @@ describe('App', () => {
             supported_response_profiles: ['fast', 'quality'],
             capabilities: completeCapabilities(),
           }
+        }
+
+        if (command === 'ingest_audio_frame') {
+          return { runtime_phase: 'sleeping', last_activity_ms: null, transcription_ready_samples: null, transcript_text: null, capturing_utterance: false, preroll_samples: 0, utterance_samples: 0 }
         }
 
         throw new Error(`unexpected command: ${command}`)
@@ -2766,6 +3459,16 @@ describe('App', () => {
     expect(invokedCommands).toContain('switch_response_profile')
     expect(container.textContent).not.toContain('live_audio_error:\nPermission denied')
     expect(container.textContent).not.toContain('live_audio:\ndefault microphone started')
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      await Promise.resolve()
+    })
+    expect(startCount).toBe(2)
+    await act(async () => {
+      await replacementFrame?.([0.2, -0.2])
+      await Promise.resolve()
+    })
+    expect(invokedCommands.filter((command) => command === 'ingest_audio_frame')).toHaveLength(1)
   })
 
   it('automatically marks silence from backend speech activity updates', async () => {
@@ -3666,6 +4369,125 @@ describe('App', () => {
     expect(container.textContent).not.toContain('Stop listening and process')
   })
 
+  it('persists and restarts capture with a selected microphone', async () => {
+    const stop = vi.fn()
+    startLiveAudioSourceMock.mockResolvedValue({ stop })
+    listAudioInputDevicesMock.mockResolvedValue([
+      { deviceId: 'studio-device', label: 'Studio Microphone' },
+    ])
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        if (command === 'get_startup_state') return readyStartupState()
+        if (command === 'get_assistant_settings') return defaultAssistantSettings()
+        if (command === 'get_ui_text_size') return 'medium'
+        if (command === 'get_ui_theme') return 'dark'
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    await act(async () => {
+      getButtonByLabel(container, 'Settings').click()
+      await Promise.resolve()
+    })
+    const select = container.querySelector<HTMLSelectElement>('#audioInputDevice')
+    expect(select).not.toBeNull()
+    expect(select?.textContent).toContain('Studio Microphone')
+
+    await act(async () => {
+      setSelectValue(select as HTMLSelectElement, 'studio-device')
+      await Promise.resolve()
+    })
+
+    expect(window.localStorage.getItem('voxgolem.audioInputDeviceId')).toBe('studio-device')
+    expect(stop).toHaveBeenCalledTimes(1)
+    expect(startLiveAudioSourceMock).toHaveBeenLastCalledWith(expect.objectContaining({
+      deviceId: 'studio-device',
+    }))
+
+    await act(async () => {
+      setSelectValue(select as HTMLSelectElement, '')
+      await Promise.resolve()
+    })
+    expect(window.localStorage.getItem('voxgolem.audioInputDeviceId')).toBeNull()
+    expect(startLiveAudioSourceMock).toHaveBeenLastCalledWith(expect.not.objectContaining({
+      deviceId: expect.anything(),
+    }))
+
+    const firstRoot = mountedRoots.pop()
+    await act(async () => {
+      firstRoot?.unmount()
+    })
+    const remounted = await renderApp()
+    await act(async () => {
+      getButtonByLabel(remounted.container, 'Settings').click()
+      await Promise.resolve()
+    })
+    expect(remounted.container.querySelector<HTMLSelectElement>('#audioInputDevice')?.value).toBe('')
+    expect(startLiveAudioSourceMock).toHaveBeenLastCalledWith(expect.not.objectContaining({
+      deviceId: expect.anything(),
+    }))
+  })
+
+  it('retains an explicit microphone when fallback capture fails', async () => {
+    window.localStorage.setItem('voxgolem.audioInputDeviceId', 'stale-device')
+    startLiveAudioSourceMock.mockRejectedValue(new DOMException('permission denied', 'NotAllowedError'))
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        if (command === 'get_startup_state') return readyStartupState()
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    await renderApp()
+
+    expect(window.localStorage.getItem('voxgolem.audioInputDeviceId')).toBe('stale-device')
+  })
+
+  it('ignores delayed fallback metadata from a microphone session that was replaced', async () => {
+    const firstStop = vi.fn()
+    let firstOptions: StartLiveAudioSourceOptions | undefined
+    let callCount = 0
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      callCount += 1
+      if (callCount === 1) {
+        firstOptions = options
+        return { stop: firstStop }
+      }
+      return new Promise(() => undefined)
+    })
+    window.localStorage.setItem('voxgolem.audioInputDeviceId', 'first-device')
+    listAudioInputDevicesMock.mockResolvedValue([
+      { deviceId: 'first-device', label: 'First Microphone' },
+      { deviceId: 'second-device', label: 'Second Microphone' },
+    ])
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        if (command === 'get_startup_state') return readyStartupState()
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    await act(async () => {
+      getButtonByLabel(container, 'Settings').click()
+      await Promise.resolve()
+    })
+    const select = container.querySelector<HTMLSelectElement>('#audioInputDevice')
+    await act(async () => {
+      setSelectValue(select as HTMLSelectElement, 'second-device')
+      await Promise.resolve()
+    })
+
+    const delayedFirstOptions = firstOptions
+    if (delayedFirstOptions !== undefined) {
+      delayedFirstOptions.onSelectedDeviceFallback?.('first-device')
+    }
+
+    expect(select?.value).toBe('second-device')
+    expect(window.localStorage.getItem('voxgolem.audioInputDeviceId')).toBe('first-device')
+  })
+
   it('does not auto-start microphone capture when wake-word capability is unavailable', async () => {
     const wakeReason = 'wake word model is unavailable for this test'
     window.__TAURI_INTERNALS__ = {
@@ -3693,6 +4515,68 @@ describe('App', () => {
     expect(describedBy).not.toBeNull()
     expect(description?.textContent).toContain(wakeReason)
     expect(autoStop.getAttribute('aria-describedby')).toBe(describedBy)
+  })
+
+  it('preserves an accepted completion prefetch through typed submission', async () => {
+    let completionEventHandler: ((event: { payload: unknown }) => void) | undefined
+    const invocations: Array<{ command: string, args?: unknown }> = []
+    window.__TAURI_INTERNALS__ = {
+      listen: async (event, handler) => {
+        if (event === 'completion-event') completionEventHandler = handler
+        return () => undefined
+      },
+      invoke: async (command, args) => {
+        invocations.push({ command, args })
+        if (command === 'get_startup_state') return readyStartupState()
+        if (command === 'get_assistant_settings') {
+          return {
+            instant: 'local-fast', deep: 'opencode-sol-high', review: 'opencode-sol-high',
+            deep_enabled: false, review_enabled: false, prefetch: true, completion: true,
+          }
+        }
+        if (command === 'request_completion' || command === 'clear_completion') return null
+        if (command === 'submit_prompt') {
+          return {
+            request_id: (args as { requestId: string }).requestId,
+            outcome: 'completed', error_message: null, runtime_phase: 'sleeping',
+          }
+        }
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    const composer = getComposer(container)
+    await act(async () => {
+      setTextAreaValue(composer, 'draft')
+      await Promise.resolve()
+    })
+    await act(async () => {
+      completionEventHandler?.({
+        payload: {
+          source: 'typed', revision: 1, voice_session_id: null, suffix: ' completion',
+        },
+      })
+      await Promise.resolve()
+    })
+    await act(async () => {
+      composer.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true }))
+      await Promise.resolve()
+    })
+
+    expect(composer.value).toBe('draft completion')
+    expect(invocations.filter(({ command }) => command === 'request_completion')).toHaveLength(1)
+
+    await act(async () => {
+      getSendButton(container).click()
+      await Promise.resolve()
+    })
+
+    expect(invocations.filter(({ command }) => command === 'clear_completion')).toHaveLength(0)
+    expect(invocations.find(({ command }) => command === 'submit_prompt')?.args).toMatchObject({
+      prompt: 'draft completion',
+      source: 'typed',
+    })
   })
 
   it('ignores typed completion events from before prompt submission', async () => {
@@ -3821,16 +4705,18 @@ describe('App', () => {
       getSendButton(container).click()
       await Promise.resolve()
       await Promise.resolve()
-      promptEventHandler?.({ payload: { request_id: requestId, kind: 'status', message: 'Deep running' } })
-      promptEventHandler?.({ payload: { request_id: requestId, kind: 'correction', text: 'Corrected answer', correction: 'Correction: Deep correction' } })
+      promptEventHandler?.({ payload: { request_id: requestId, kind: 'stage', stage: 'deep', status: 'running' } })
+      promptEventHandler?.({ payload: { request_id: requestId, kind: 'sources', sources: [{ url: 'https://example.com/deep', title: 'Deep source' }] } })
+      promptEventHandler?.({ payload: { request_id: requestId, kind: 'correction', stage: 'deep', text: 'Corrected answer', correction: 'Correction: Deep correction' } })
       await Promise.resolve()
     })
 
     expect(container.textContent).toContain('Deep')
     expect(container.textContent).toContain('Corrected answer')
-    expect(synthesizedText).toBe('Corrected answer')
+    expect(synthesizedText).toBe('Deep correction')
     expect(container.querySelector('[aria-label="Deep status: corrected"]')).not.toBeNull()
     expect(container.querySelector('[aria-label="Review status: corrected"]')).toBeNull()
+    expect(container.querySelector('a[href="https://example.com/deep"]')).not.toBeNull()
     await act(async () => {
       finishPrompt?.({ request_id: requestId, outcome: 'cancelled', runtime_phase: 'sleeping' })
       await Promise.resolve()

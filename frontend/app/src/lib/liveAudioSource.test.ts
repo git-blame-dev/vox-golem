@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { startLiveAudioSource } from './liveAudioSource'
+import { listAudioInputDevices, startLiveAudioSource } from './liveAudioSource'
 
 type FakeAudioSetup = {
   readonly processorNode: FakeScriptProcessorNode
   readonly audioContext: FakeAudioContext
   readonly trackStop: ReturnType<typeof vi.fn>
+  readonly getUserMedia: ReturnType<typeof vi.fn>
+  readonly track: FakeMediaStreamTrack
 }
 
 const originalAudioContext = window.AudioContext
@@ -28,6 +30,95 @@ afterEach(() => {
 })
 
 describe('startLiveAudioSource', () => {
+  it('lists audio inputs without exposing non-audio devices', async () => {
+    const enumerateDevices = vi.fn(async () => [
+      { kind: 'audioinput', deviceId: 'studio-device', label: 'Studio Microphone' },
+      { kind: 'videoinput', deviceId: 'camera-device', label: 'Camera' },
+    ] as MediaDeviceInfo[])
+    Object.defineProperty(navigator, 'mediaDevices', {
+      configurable: true,
+      value: { getUserMedia: vi.fn(), enumerateDevices },
+    })
+
+    await expect(listAudioInputDevices()).resolves.toEqual([
+      { deviceId: 'studio-device', label: 'Studio Microphone' },
+    ])
+  })
+
+  it('requests the selected microphone instead of the portal remembered source', async () => {
+    const setup = installFakeAudioRuntime()
+
+    const source = await startLiveAudioSource({
+      deviceId: 'default',
+      onFrame: async () => undefined,
+      onError: () => undefined,
+    })
+
+    expect(setup.getUserMedia).toHaveBeenCalledWith({
+      audio: { deviceId: { exact: 'default' } },
+    })
+    source.stop()
+  })
+
+  it('falls back to the system input when the selected device is stale', async () => {
+    const setup = installFakeAudioRuntime()
+    const onSelectedDeviceFallback = vi.fn()
+    setup.getUserMedia
+      .mockRejectedValueOnce(new DOMException('stale device', 'NotFoundError'))
+      .mockResolvedValueOnce(createMediaStream(setup.trackStop, setup.track))
+
+    const source = await startLiveAudioSource({ deviceId: 'stale-device', onFrame: async () => undefined, onError: () => undefined, onSelectedDeviceFallback })
+
+    expect(setup.getUserMedia).toHaveBeenNthCalledWith(2, { audio: true })
+    expect(onSelectedDeviceFallback).toHaveBeenCalledWith('stale-device')
+    source.stop()
+  })
+
+  it('does not report fallback when the fallback capture fails', async () => {
+    const setup = installFakeAudioRuntime()
+    const onSelectedDeviceFallback = vi.fn()
+    setup.getUserMedia
+      .mockRejectedValueOnce(new DOMException('stale device', 'NotFoundError'))
+      .mockRejectedValueOnce(new DOMException('permission denied', 'NotAllowedError'))
+
+    await expect(startLiveAudioSource({ deviceId: 'stale-device', onFrame: async () => undefined, onError: () => undefined, onSelectedDeviceFallback })).rejects.toThrow('permission denied')
+    expect(onSelectedDeviceFallback).not.toHaveBeenCalled()
+  })
+
+  it('does not report fallback when audio setup fails after fallback capture', async () => {
+    const setup = installFakeAudioRuntime()
+    const onSelectedDeviceFallback = vi.fn()
+    setup.getUserMedia
+      .mockRejectedValueOnce(new DOMException('stale device', 'NotFoundError'))
+      .mockResolvedValueOnce(createMediaStream(setup.trackStop, setup.track))
+    setup.audioContext.resume.mockRejectedValueOnce(new Error('resume failed'))
+
+    await expect(startLiveAudioSource({ deviceId: 'stale-device', onFrame: async () => undefined, onError: () => undefined, onSelectedDeviceFallback })).rejects.toThrow('resume failed')
+    expect(onSelectedDeviceFallback).not.toHaveBeenCalled()
+    expect(setup.trackStop).toHaveBeenCalledTimes(1)
+  })
+
+  it('preserves permission errors for a selected device', async () => {
+    const setup = installFakeAudioRuntime()
+    const permissionError = new DOMException('permission denied', 'NotAllowedError')
+    setup.getUserMedia.mockRejectedValueOnce(permissionError)
+
+    await expect(startLiveAudioSource({ deviceId: 'selected-device', onFrame: async () => undefined, onError: () => undefined })).rejects.toBe(permissionError)
+    expect(setup.getUserMedia).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports unexpected track termination once but not intentional stop', async () => {
+    const setup = installFakeAudioRuntime()
+    const onError = vi.fn()
+    const source = await startLiveAudioSource({ onFrame: async () => undefined, onError })
+
+    setup.track.onended?.(new Event('ended'))
+    setup.track.onended?.(new Event('ended'))
+    expect(onError).toHaveBeenCalledTimes(1)
+    source.stop()
+    expect(onError).toHaveBeenCalledTimes(1)
+  })
+
   it('emits 30ms frames after low-latency processor callbacks', async () => {
     const setup = installFakeAudioRuntime()
     const onFrame = vi.fn<(frame: readonly number[]) => Promise<void>>(async () => undefined)
@@ -52,6 +143,21 @@ describe('startLiveAudioSource', () => {
 
     source.stop()
     expect(setup.trackStop).toHaveBeenCalledTimes(1)
+  })
+
+  it('clamps captured samples to the backend transcription range', async () => {
+    const setup = installFakeAudioRuntime()
+    const onFrame = vi.fn<(frame: readonly number[]) => Promise<void>>(async () => undefined)
+    const source = await startLiveAudioSource({ onFrame, onError: () => undefined })
+    const overdriven = new Float32Array(2048).fill(1.25)
+
+    setup.processorNode.emit([overdriven])
+    await vi.waitFor(() => expect(onFrame).toHaveBeenCalled())
+
+    expect(onFrame.mock.calls[0]?.[0]).toSatisfy(
+      (frame: readonly number[]) => frame.every((sample) => Number.isFinite(sample) && sample >= -1 && sample <= 1),
+    )
+    source.stop()
   })
 
   it('delivers frames sequentially in emitted order', async () => {
@@ -109,9 +215,9 @@ function createStereoRampFrame(startValue: number, sampleCount: number): Float32
   const right = new Float32Array(sampleCount)
 
   for (let index = 0; index < sampleCount; index += 1) {
-    const value = startValue + index
+    const value = (startValue + index) / 4096
     left[index] = value
-    right[index] = value + 0.5
+    right[index] = value + 0.0001
   }
 
   return [left, right]
@@ -129,9 +235,8 @@ function createInputBuffer(channels: readonly Float32Array[]): AudioBuffer {
 
 function installFakeAudioRuntime(): FakeAudioSetup {
   const trackStop = vi.fn()
-  const stream = {
-    getTracks: () => [{ stop: trackStop } as unknown as MediaStreamTrack],
-  } as MediaStream
+  const stream = createMediaStream(trackStop)
+  const track = stream.getTracks()[0] as FakeMediaStreamTrack
   const getUserMedia = vi.fn(async () => stream)
   const processorNode = new FakeScriptProcessorNode()
   const audioContext = new FakeAudioContext(48_000, processorNode)
@@ -156,7 +261,20 @@ function installFakeAudioRuntime(): FakeAudioSetup {
     processorNode,
     audioContext,
     trackStop,
+    getUserMedia,
+    track,
   }
+}
+
+type FakeMediaStreamTrack = MediaStreamTrack & { onended: ((event: Event) => void) | null }
+
+function createMediaStream(
+  trackStop: ReturnType<typeof vi.fn>,
+  track: FakeMediaStreamTrack = { stop: trackStop, onended: null } as unknown as FakeMediaStreamTrack,
+): MediaStream {
+  return {
+    getTracks: () => [track],
+  } as MediaStream
 }
 
 class FakeScriptProcessorNode {

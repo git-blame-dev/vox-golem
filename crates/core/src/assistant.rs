@@ -72,6 +72,7 @@ impl Default for AssistantPreferences {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Content {
     Text(String),
+    Refusal(String),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
@@ -107,7 +108,11 @@ pub enum InstantOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeepReport {
     pub answer: Content,
-    pub findings: Vec<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeepOutcome {
+    Success(DeepReport),
+    Failure(String),
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewDecision {
@@ -115,9 +120,9 @@ pub enum ReviewDecision {
     Rewrite(Content),
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AnswerVersion {
-    pub stage: Stage,
-    pub content: Content,
+pub enum ReviewOutcome {
+    Success(ReviewDecision),
+    Failure(String),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Generation {
@@ -141,16 +146,16 @@ impl Generation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StageResult {
     Instant(InstantOutcome),
-    Deep(DeepReport),
-    Review(ReviewDecision),
+    Deep(DeepOutcome),
+    Review(ReviewOutcome),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssistantState {
     pub generation: Generation,
     pub instant: Option<InstantOutcome>,
-    pub deep: Option<DeepReport>,
-    pub review: Option<ReviewDecision>,
+    pub deep: Option<DeepOutcome>,
+    pub review: Option<ReviewOutcome>,
     pub final_answer: Option<Content>,
 }
 impl AssistantState {
@@ -210,9 +215,6 @@ impl AssistantCoordinator {
     }
     pub fn provisional_instant(&self) -> Option<&InstantOutcome> {
         self.active.as_ref().and_then(|s| s.instant.as_ref())
-    }
-    pub fn active_prompt(&self) -> Option<&Content> {
-        self.active_prompt.as_ref()
     }
     pub fn set_preferences(&mut self, preferences: AssistantPreferences) -> Result<(), StartError> {
         if self.active.is_some() {
@@ -331,23 +333,33 @@ fn instant_answer(i: &InstantOutcome) -> Option<Content> {
     }
 }
 fn resolve(s: &AssistantState, p: &AssistantPreferences) -> Option<Content> {
-    let instant = s.instant.as_ref()?;
+    let instant = s.instant.as_ref();
+    if instant.is_none()
+        || (p.deep_enabled && s.deep.is_none())
+        || (p.review_enabled && s.review.is_none())
+    {
+        return None;
+    }
+    let instant_answer = instant.and_then(instant_answer);
+    let deep_answer = s.deep.as_ref().and_then(|d| match d {
+        DeepOutcome::Success(report) => Some(report.answer.clone()),
+        DeepOutcome::Failure(_) => None,
+    });
     if p.review_enabled {
         let review = s.review.as_ref()?;
         if p.deep_enabled && s.deep.is_none() {
             return None;
         }
-        return Some(match review {
-            ReviewDecision::Rewrite(a) => a.clone(),
-            ReviewDecision::Keep => instant_answer(instant)
-                .or_else(|| s.deep.as_ref().map(|report| report.answer.clone()))?,
-        });
+        return match review {
+            ReviewOutcome::Success(ReviewDecision::Rewrite(a)) => Some(a.clone()),
+            ReviewOutcome::Success(ReviewDecision::Keep) => deep_answer.or(instant_answer),
+            ReviewOutcome::Failure(_) => deep_answer.or(instant_answer),
+        };
     }
     if p.deep_enabled {
-        let deep = s.deep.as_ref()?;
-        return Some(deep.answer.clone());
+        return deep_answer.or(instant_answer);
     }
-    instant_answer(instant)
+    instant_answer
 }
 
 #[cfg(test)]
@@ -436,10 +448,9 @@ mod tests {
                     let deep_result = c.accept(
                         g,
                         Stage::Deep,
-                        StageResult::Deep(DeepReport {
+                        StageResult::Deep(DeepOutcome::Success(DeepReport {
                             answer: text("deep"),
-                            findings: vec![],
-                        }),
+                        })),
                     );
                     assert_eq!(
                         deep_result,
@@ -455,8 +466,12 @@ mod tests {
                         assert!(c.active().is_some());
                     }
                     assert_eq!(
-                        c.accept(g, Stage::Review, StageResult::Review(ReviewDecision::Keep)),
-                        AcceptResult::Resolved(text("instant"))
+                        c.accept(
+                            g,
+                            Stage::Review,
+                            StageResult::Review(ReviewOutcome::Success(ReviewDecision::Keep))
+                        ),
+                        AcceptResult::Resolved(if deep { text("deep") } else { text("instant") })
                     );
                 }
                 assert!(c.active().is_some());
@@ -484,10 +499,9 @@ mod tests {
             c.accept(
                 generation,
                 Stage::Deep,
-                StageResult::Deep(DeepReport {
+                StageResult::Deep(DeepOutcome::Success(DeepReport {
                     answer: text("deep"),
-                    findings: vec![],
-                })
+                }))
             ),
             AcceptResult::Resolved(text("deep"))
         );
@@ -505,7 +519,7 @@ mod tests {
             c.accept(
                 g,
                 Stage::Review,
-                StageResult::Review(ReviewDecision::Rewrite(text("r")))
+                StageResult::Review(ReviewOutcome::Success(ReviewDecision::Rewrite(text("r"))))
             ),
             AcceptResult::Pending
         );
@@ -538,10 +552,9 @@ mod tests {
             coordinator.accept(
                 generation,
                 Stage::Deep,
-                StageResult::Deep(DeepReport {
+                StageResult::Deep(DeepOutcome::Success(DeepReport {
                     answer: text("deep"),
-                    findings: vec![],
-                }),
+                })),
             ),
             AcceptResult::WrongStage
         );
@@ -549,7 +562,9 @@ mod tests {
             coordinator.accept(
                 generation,
                 Stage::Review,
-                StageResult::Review(ReviewDecision::Rewrite(text("review"))),
+                StageResult::Review(ReviewOutcome::Success(ReviewDecision::Rewrite(text(
+                    "review"
+                )))),
             ),
             AcceptResult::WrongStage
         );
@@ -567,6 +582,124 @@ mod tests {
         assert_eq!(c.start("y"), Err(StartError::Busy));
         c.cancel(g);
         assert!(c.history().is_empty());
-        assert!(c.active_prompt().is_none());
+    }
+
+    #[test]
+    fn refusal_is_typed_and_survives_commit() {
+        let mut c = AssistantCoordinator::new(Default::default());
+        let g = c.start("question").unwrap();
+        let refusal = Content::Refusal("cannot help".into());
+        assert_eq!(
+            instant(&mut c, g, InstantOutcome::Complete(refusal.clone())),
+            AcceptResult::Resolved(refusal.clone())
+        );
+        assert_eq!(c.commit(g), Some(refusal.clone()));
+        assert_eq!(c.history()[1].content, refusal);
+    }
+
+    #[test]
+    fn failures_follow_the_approved_matrix() {
+        for (deep, review) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut c = AssistantCoordinator::new(AssistantPreferences {
+                deep_enabled: deep,
+                review_enabled: review,
+                ..Default::default()
+            });
+            let g = c.start("x").unwrap();
+            assert_eq!(
+                instant(&mut c, g, InstantOutcome::Failure("instant failed".into())),
+                AcceptResult::Pending
+            );
+            if deep {
+                assert_eq!(
+                    c.accept(
+                        g,
+                        Stage::Deep,
+                        StageResult::Deep(DeepOutcome::Failure("deep failed".into()))
+                    ),
+                    AcceptResult::Pending
+                );
+            }
+            if review {
+                assert_eq!(
+                    c.accept(
+                        g,
+                        Stage::Review,
+                        StageResult::Review(ReviewOutcome::Failure("review failed".into()))
+                    ),
+                    AcceptResult::Pending
+                );
+            }
+            assert!(c.commit(g).is_none());
+        }
+    }
+
+    #[test]
+    fn review_failure_falls_back_to_deep_then_instant() {
+        let mut c = AssistantCoordinator::new(AssistantPreferences {
+            deep_enabled: true,
+            review_enabled: true,
+            ..Default::default()
+        });
+        let g = c.start("x").unwrap();
+        assert_eq!(
+            instant(&mut c, g, InstantOutcome::Complete(text("instant"))),
+            AcceptResult::Provisional(text("instant"))
+        );
+        assert_eq!(
+            c.accept(
+                g,
+                Stage::Deep,
+                StageResult::Deep(DeepOutcome::Success(DeepReport {
+                    answer: text("deep"),
+                }))
+            ),
+            AcceptResult::Pending
+        );
+        assert_eq!(
+            c.accept(
+                g,
+                Stage::Review,
+                StageResult::Review(ReviewOutcome::Failure("failed".into()))
+            ),
+            AcceptResult::Resolved(text("deep"))
+        );
+
+        let mut c = AssistantCoordinator::new(AssistantPreferences {
+            review_enabled: true,
+            ..Default::default()
+        });
+        let g = c.start("x").unwrap();
+        instant(&mut c, g, InstantOutcome::Complete(text("instant")));
+        assert_eq!(
+            c.accept(
+                g,
+                Stage::Review,
+                StageResult::Review(ReviewOutcome::Failure("failed".into()))
+            ),
+            AcceptResult::Resolved(text("instant"))
+        );
+    }
+
+    #[test]
+    fn review_rewrite_preserves_refusal_content() {
+        let mut c = AssistantCoordinator::new(AssistantPreferences {
+            review_enabled: true,
+            ..Default::default()
+        });
+        let g = c.start("x").unwrap();
+        instant(&mut c, g, InstantOutcome::Complete(text("instant")));
+        let refusal = Content::Refusal("cannot help".into());
+        assert_eq!(
+            c.accept(
+                g,
+                Stage::Review,
+                StageResult::Review(ReviewOutcome::Success(ReviewDecision::Rewrite(
+                    refusal.clone()
+                )))
+            ),
+            AcceptResult::Resolved(refusal.clone())
+        );
+        assert_eq!(c.commit(g), Some(refusal));
     }
 }
