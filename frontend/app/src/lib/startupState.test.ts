@@ -354,6 +354,30 @@ describe('isStartupStateSettled', () => {
       }),
     ).toBe(true)
   })
+
+  it('keeps polling a ready state while any capability is warming', () => {
+    expect(
+      isStartupStateSettled({
+        kind: 'ready',
+        cueAssetPaths: DEFAULT_CUE_ASSET_PATHS,
+        runtimePhase: 'sleeping',
+        voiceInputAvailable: true,
+        voiceInputError: null,
+        silenceTimeoutMs: 1500,
+        selectedResponseProfile: 'fast',
+        supportedResponseProfiles: ['fast'],
+        promptCancellationAvailable: true,
+        ttsEnabled: false,
+        ttsOutputGainDb: 3,
+        capabilities: [{
+          id: 'qwen_prediction',
+          state: 'warming',
+          reason: 'starting completion runtime',
+          actualProvider: null,
+        }],
+      }),
+    ).toBe(false)
+  })
 })
 
 describe('loadStartupState', () => {

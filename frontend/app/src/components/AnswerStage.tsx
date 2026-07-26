@@ -22,11 +22,13 @@ export interface AnswerPriorVersion {
   readonly text: string
   readonly label?: string
 }
+export interface AnswerSource { readonly url: string; readonly title: string }
 
 export interface AnswerStageProps {
   readonly answer: string
   readonly stages: readonly AnswerStageStatusEntry[]
   readonly priorVersions?: readonly AnswerPriorVersion[]
+  readonly sources?: readonly AnswerSource[]
   readonly className?: string
 }
 
@@ -51,13 +53,16 @@ function PlainText({ children }: { readonly children: string }): ReactNode {
   return children
 }
 
-export function AnswerStage({ answer, stages, priorVersions = [], className }: AnswerStageProps) {
+export function AnswerStage({ answer, stages, priorVersions = [], sources = [], className }: AnswerStageProps) {
   const rootClassName = className === undefined ? 'answer-stage' : `answer-stage ${className}`
 
   return (
     <section className={rootClassName} aria-label="Current answer">
       <h2>Current answer</h2>
       <p className="answer-stage__answer"><PlainText>{answer}</PlainText></p>
+      {sources.length === 0 ? null : <ul className="answer-stage__sources" aria-label="Sources">
+        {sources.map((source) => <li key={source.url}><a href={source.url} target="_blank" rel="noreferrer">{source.title}</a></li>)}
+      </ul>}
 
       <ul className="answer-stage__statuses" aria-label="Answer stage status">
         {stages.map(({ stage, status, detail }) => (

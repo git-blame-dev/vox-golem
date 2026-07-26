@@ -1,8 +1,8 @@
 use std::env;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -12,7 +12,6 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct LocalTtsRuntimeSpec {
-    pub enabled: bool,
     pub model_path: Option<PathBuf>,
     pub worker_count: usize,
     pub max_queue: usize,
@@ -43,12 +42,13 @@ pub struct LocalTtsAudio {
 
 #[derive(Debug)]
 pub struct LocalTtsRuntime {
-    enabled: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
     sample_rate_hz: u32,
     max_duration_ms: u64,
     sender: Option<mpsc::SyncSender<SynthesisJob>>,
     _workers: Vec<thread::JoinHandle<()>>,
     actual_provider: Option<TtsActualProvider>,
+    shutdown: Arc<AtomicBool>,
 }
 
 const MAX_TTS_INPUT_BYTES: usize = 4096;
@@ -63,6 +63,82 @@ type SynthesisEngineFactory = Arc<
         + Send
         + Sync,
 >;
+
+type AbandonedSynthesis = (
+    thread::JoinHandle<()>,
+    mpsc::Receiver<Result<(Box<dyn SynthesisEngine>, LocalTtsAudio), String>>,
+);
+
+static PENDING_INITIALIZATIONS: OnceLock<Mutex<Vec<thread::JoinHandle<()>>>> = OnceLock::new();
+static ABANDONED_SYNTHESIS: OnceLock<Mutex<Vec<thread::JoinHandle<()>>>> = OnceLock::new();
+static SYNTHESIS_PERMIT_OCCUPIED: AtomicBool = AtomicBool::new(false);
+
+struct SynthesisPermit;
+
+impl SynthesisPermit {
+    fn acquire() -> Option<Self> {
+        SYNTHESIS_PERMIT_OCCUPIED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for SynthesisPermit {
+    fn drop(&mut self) {
+        SYNTHESIS_PERMIT_OCCUPIED.store(false, Ordering::Release);
+    }
+}
+
+fn reap_abandoned_synthesis() -> bool {
+    let pending = ABANDONED_SYNTHESIS.get_or_init(|| Mutex::new(Vec::new()));
+    let Ok(mut pending) = pending.lock() else {
+        return true;
+    };
+    let mut active = Vec::with_capacity(pending.len());
+    for runner in pending.drain(..) {
+        if runner.is_finished() {
+            let _ = runner.join();
+        } else {
+            active.push(runner);
+        }
+    }
+    let occupied = !active.is_empty();
+    *pending = active;
+    occupied
+}
+
+fn retain_abandoned_synthesis(runner: thread::JoinHandle<()>) {
+    let pending = ABANDONED_SYNTHESIS.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(mut pending) = pending.lock() {
+        pending.push(runner);
+    }
+}
+
+fn reap_pending_initializations() -> bool {
+    let pending = PENDING_INITIALIZATIONS.get_or_init(|| Mutex::new(Vec::new()));
+    let Ok(mut pending) = pending.lock() else {
+        return false;
+    };
+    let mut active = Vec::with_capacity(pending.len());
+    for worker in pending.drain(..) {
+        if worker.is_finished() {
+            let _ = worker.join();
+        } else {
+            active.push(worker);
+        }
+    }
+    let has_active = !active.is_empty();
+    *pending = active;
+    has_active
+}
+
+fn retain_pending_initializations(workers: Vec<thread::JoinHandle<()>>) {
+    let pending = PENDING_INITIALIZATIONS.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(mut pending) = pending.lock() {
+        pending.extend(workers);
+    }
+}
 
 trait SynthesisEngine: Send {
     fn synthesize(&mut self, text: &str) -> Result<LocalTtsAudio, String>;
@@ -115,7 +191,10 @@ struct SynthesisJob {
     text: String,
     response: mpsc::Sender<Result<LocalTtsAudio, String>>,
     cancelled: Arc<AtomicBool>,
+    generation: u64,
 }
+
+const SYNTHESIS_CANCELLED: &str = "local tts synthesis request was cancelled or superseded";
 
 impl LocalTtsRuntime {
     pub fn new(spec: LocalTtsRuntimeSpec) -> Result<Self, String> {
@@ -127,6 +206,16 @@ impl LocalTtsRuntime {
         spec: LocalTtsRuntimeSpec,
         engine_factory: SynthesisEngineFactory,
     ) -> Result<Self, String> {
+        if reap_pending_initializations() {
+            return Err(String::from(
+                "local tts initialization is still pending from a previous attempt",
+            ));
+        }
+        if reap_abandoned_synthesis() {
+            return Err(String::from(
+                "local tts abandoned synthesis budget is still occupied",
+            ));
+        }
         if spec.worker_count == 0 {
             return Err(String::from("tts worker_count must be greater than zero"));
         }
@@ -145,78 +234,184 @@ impl LocalTtsRuntime {
 
         let max_duration_ms = spec.max_duration_s.saturating_mul(1_000);
 
-        let model_path = if spec.enabled {
-            let Some(model_path) = spec.model_path.as_ref() else {
-                return Err(String::from("tts model_path is required when enabled"));
-            };
-
-            if !model_path.is_file() {
-                return Err(format!(
-                    "tts model_path must reference an existing file: {}",
-                    model_path.display()
-                ));
-            }
-            Some(model_path.to_path_buf())
-        } else {
-            None
-        };
-
-        if !spec.enabled {
-            return Ok(Self {
-                enabled: Arc::new(AtomicBool::new(false)),
-                sample_rate_hz: spec.sample_rate_hz,
-                max_duration_ms,
-                sender: None,
-                _workers: Vec::new(),
-                actual_provider: None,
-            });
+        let model_path = spec
+            .model_path
+            .as_ref()
+            .ok_or_else(|| String::from("tts model_path is required"))?;
+        if !model_path.is_file() {
+            return Err(format!(
+                "tts model_path must reference an existing file: {}",
+                model_path.display()
+            ));
         }
+        ensure_espeak_data_directory_env(model_path)?;
 
         let (sender, receiver) = mpsc::sync_channel::<SynthesisJob>(spec.max_queue);
+        let generation = Arc::new(AtomicU64::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
         let shared_receiver = Arc::new(Mutex::new(receiver));
         let mut workers = Vec::with_capacity(spec.worker_count);
         let (init_tx, init_rx) = mpsc::channel::<Result<TtsActualProvider, String>>();
         let provider_policy = spec.provider_policy;
-        let model_path = model_path.expect("model path must exist for enabled runtime");
-
         for _ in 0..spec.worker_count {
             let worker_receiver = Arc::clone(&shared_receiver);
             let sample_rate_hz = spec.sample_rate_hz;
             let worker_model_path = model_path.clone();
             let worker_engine_factory = Arc::clone(&engine_factory);
+            let worker_generation = Arc::clone(&generation);
             let worker_init_tx = init_tx.clone();
+            let worker_shutdown = Arc::clone(&shutdown);
             workers.push(thread::spawn(move || {
-                let mut engine =
-                    match worker_engine_factory(worker_model_path, sample_rate_hz, provider_policy)
-                    {
-                        Ok((engine, provider)) => {
-                            let _ = worker_init_tx.send(Ok(provider));
-                            engine
-                        }
-                        Err(error) => {
-                            let _ = worker_init_tx.send(Err(error));
-                            return;
-                        }
-                    };
+                match worker_engine_factory(
+                    worker_model_path.clone(),
+                    sample_rate_hz,
+                    provider_policy,
+                ) {
+                    Ok((engine, provider)) => {
+                        let _ = worker_init_tx.send(Ok(provider));
 
-                loop {
-                    let next_job = {
-                        let guard = match worker_receiver.lock() {
-                            Ok(guard) => guard,
-                            Err(_) => return,
-                        };
-                        guard.recv()
-                    };
+                        // The engine is retained for ordinary sequential requests. A cancelled
+                        // native call may take ownership of it until the runner finishes.
+                        let mut available_engine = Some(engine);
 
-                    let Ok(job) = next_job else {
-                        return;
-                    };
-                    if job.cancelled.load(Ordering::Relaxed) {
-                        continue;
+                        // A native inference call cannot be forcibly stopped portably. Keep at
+                        // most one abandoned invocation per worker while its replacement runs.
+                        let mut abandoned: Option<AbandonedSynthesis> = None;
+
+                        loop {
+                            if worker_shutdown.load(Ordering::Acquire) {
+                                if let Some((runner, _)) = abandoned.take() {
+                                    retain_abandoned_synthesis(runner);
+                                }
+                                return;
+                            }
+                            let next_job = {
+                                let guard = match worker_receiver.lock() {
+                                    Ok(guard) => guard,
+                                    Err(_) => return,
+                                };
+                                guard.recv()
+                            };
+
+                            let Ok(job) = next_job else {
+                                if let Some((runner, _)) = abandoned.take() {
+                                    retain_abandoned_synthesis(runner);
+                                }
+                                return;
+                            };
+
+                            // Completed abandoned work no longer consumes the budget. Reclaim
+                            // its engine before deciding whether another runner may start.
+                            if let Some((runner, result_rx)) = abandoned.take() {
+                                match result_rx.try_recv() {
+                                    Ok(Ok((engine, _))) => {
+                                        available_engine = Some(engine);
+                                        let _ = runner.join();
+                                    }
+                                    Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
+                                        let _ = runner.join();
+                                    }
+                                    Err(mpsc::TryRecvError::Empty) => {
+                                        abandoned = Some((runner, result_rx));
+                                    }
+                                }
+                            }
+                            if abandoned.is_some() {
+                                let _ = job.response.send(Err(String::from(
+                                    "local tts abandoned synthesis budget exhausted",
+                                )));
+                                continue;
+                            }
+                            if job.cancelled.load(Ordering::Relaxed)
+                                || job.generation != worker_generation.load(Ordering::Acquire)
+                            {
+                                let _ = job.response.send(Err(String::from(SYNTHESIS_CANCELLED)));
+                                continue;
+                            }
+
+                            let engine = if let Some(engine) = available_engine.take() {
+                                engine
+                            } else {
+                                match worker_engine_factory(
+                                    worker_model_path.clone(),
+                                    sample_rate_hz,
+                                    provider_policy,
+                                ) {
+                                    Ok((engine, _)) => engine,
+                                    Err(error) => {
+                                        let _ = job.response.send(Err(error));
+                                        continue;
+                                    }
+                                }
+                            };
+                            let Some(permit) = SynthesisPermit::acquire() else {
+                                available_engine = Some(engine);
+                                let _ = job.response.send(Err(String::from(
+                                    "local tts abandoned synthesis budget exhausted",
+                                )));
+                                continue;
+                            };
+                            let (result_tx, result_rx) = mpsc::channel();
+                            let child_text = job.text.clone();
+                            let child = thread::spawn(move || {
+                                let _permit = permit;
+                                let mut engine = engine;
+                                let result =
+                                    engine.synthesize(&child_text).map(|audio| (engine, audio));
+                                let _ = result_tx.send(result);
+                            });
+
+                            let mut cancelled = false;
+                            let result = loop {
+                                match result_rx.recv_timeout(Duration::from_millis(10)) {
+                                    Ok(result) => break result,
+                                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                                        if job.cancelled.load(Ordering::Relaxed)
+                                            || job.generation
+                                                != worker_generation.load(Ordering::Acquire)
+                                        {
+                                            cancelled = true;
+                                            break Err(String::from(SYNTHESIS_CANCELLED));
+                                        }
+                                    }
+                                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                        break Err(String::from(
+                                            "local tts synthesis worker exited unexpectedly",
+                                        ))
+                                    }
+                                }
+                            };
+
+                            if cancelled {
+                                let _ = job.response.send(Err(result
+                                    .err()
+                                    .unwrap_or_else(|| String::from(SYNTHESIS_CANCELLED))));
+                                abandoned = Some((child, result_rx));
+                            } else {
+                                let _ = child.join();
+                                match result {
+                                    Ok((engine, audio)) => {
+                                        available_engine = Some(engine);
+                                        let result = if job.cancelled.load(Ordering::Relaxed)
+                                            || job.generation
+                                                != worker_generation.load(Ordering::Acquire)
+                                        {
+                                            Err(String::from(SYNTHESIS_CANCELLED))
+                                        } else {
+                                            Ok(audio)
+                                        };
+                                        let _ = job.response.send(result);
+                                    }
+                                    Err(error) => {
+                                        let _ = job.response.send(Err(error));
+                                    }
+                                }
+                            }
+                        }
                     }
-
-                    let result = engine.synthesize(&job.text);
-                    let _ = job.response.send(result);
+                    Err(error) => {
+                        let _ = worker_init_tx.send(Err(error));
+                    }
                 }
             }));
         }
@@ -225,10 +420,36 @@ impl LocalTtsRuntime {
         let mut actual_provider = None;
         for _ in 0..spec.worker_count {
             let init_result = init_rx
-                .recv()
-                .map_err(|_| String::from("failed to initialize local tts worker runtime"))?;
-            let provider = init_result?;
+                .recv_timeout(Duration::from_secs(2))
+                .map_err(|error| match error {
+                    mpsc::RecvTimeoutError::Timeout => {
+                        String::from("timed out initializing local tts worker runtime")
+                    }
+                    mpsc::RecvTimeoutError::Disconnected => {
+                        String::from("failed to initialize local tts worker runtime")
+                    }
+                });
+            let provider = match init_result {
+                Ok(result) => match result {
+                    Ok(provider) => provider,
+                    Err(error) => {
+                        shutdown.store(true, Ordering::Release);
+                        drop(sender);
+                        retain_pending_initializations(workers);
+                        return Err(error);
+                    }
+                },
+                Err(error) => {
+                    shutdown.store(true, Ordering::Release);
+                    drop(sender);
+                    retain_pending_initializations(workers);
+                    return Err(error);
+                }
+            };
             if actual_provider.is_some_and(|selected| selected != provider) {
+                shutdown.store(true, Ordering::Release);
+                drop(sender);
+                retain_pending_initializations(workers);
                 return Err(String::from(
                     "local tts workers selected inconsistent execution providers",
                 ));
@@ -237,40 +458,67 @@ impl LocalTtsRuntime {
         }
 
         Ok(Self {
-            enabled: Arc::new(AtomicBool::new(true)),
+            generation,
             sample_rate_hz: spec.sample_rate_hz,
             max_duration_ms,
             sender: Some(sender),
             _workers: workers,
             actual_provider,
+            shutdown,
         })
-    }
-
-    pub fn is_enabled(&self) -> bool {
-        self.enabled.load(Ordering::Relaxed)
     }
 
     pub fn sample_rate_hz(&self) -> u32 {
         self.sample_rate_hz
     }
 
-    pub fn is_available(&self) -> bool {
-        self.sender.is_some()
-    }
-
     pub fn actual_provider(&self) -> Option<TtsActualProvider> {
         self.actual_provider
     }
 
-    pub fn set_enabled(&self, enabled: bool) {
-        self.enabled.store(enabled, Ordering::Relaxed);
+    pub fn start_generation(&self) -> u64 {
+        self.generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1)
+    }
+
+    pub fn cancel_generation(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn shutdown_bounded(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.sender.take();
+        let mut running_workers = Vec::new();
+        for worker in self._workers.drain(..) {
+            if worker.is_finished() {
+                // Joining only completed workers keeps shutdown bounded even when native
+                // inference cannot be interrupted.
+                let _ = worker.join();
+            } else {
+                running_workers.push(worker);
+            }
+        }
+        self._workers = running_workers;
+    }
+
+    pub fn shutdown_owned(&mut self) {
+        self.shutdown_bounded();
+    }
+
+    pub fn synthesize_for_generation(
+        &self,
+        text: &str,
+        generation: u64,
+    ) -> Result<LocalTtsAudio, String> {
+        self.synthesize_inner(text, generation)
     }
 
     pub fn synthesize(&self, text: &str) -> Result<LocalTtsAudio, String> {
-        if !self.is_enabled() {
-            return Err(String::from("tts is disabled"));
-        }
+        self.synthesize_inner(text, self.generation.load(Ordering::Acquire))
+    }
 
+    fn synthesize_inner(&self, text: &str, generation: u64) -> Result<LocalTtsAudio, String> {
         let text = text.trim();
         if text.is_empty() {
             return Err(String::from("tts text must not be empty"));
@@ -292,6 +540,7 @@ impl LocalTtsRuntime {
                 text: text.to_string(),
                 response: response_tx,
                 cancelled: Arc::clone(&cancelled),
+                generation,
             })
             .map_err(|error| match error {
                 mpsc::TrySendError::Full(_) => String::from("local tts synthesis queue is full"),
@@ -319,11 +568,17 @@ impl LocalTtsRuntime {
             ));
         }
 
-        if !self.is_enabled() {
-            return Err(String::from("tts was disabled during synthesis"));
+        if generation != self.generation.load(Ordering::Acquire) {
+            return Err(String::from(SYNTHESIS_CANCELLED));
         }
 
         Ok(audio)
+    }
+}
+
+impl Drop for LocalTtsRuntime {
+    fn drop(&mut self) {
+        self.shutdown_bounded();
     }
 }
 
@@ -340,8 +595,6 @@ impl PiperOnnxEngine {
                 sample_rate_hz, config.audio.sample_rate
             ));
         }
-
-        ensure_windows_espeak_data_directory_env()?;
 
         let try_provider = |cuda: bool| -> Result<ort::session::Session, String> {
             if cuda {
@@ -500,12 +753,30 @@ pub(crate) fn resolve_strict_windows_espeak_data_directory() -> Result<Option<Pa
     }
 }
 
-fn ensure_windows_espeak_data_directory_env() -> Result<(), String> {
-    let Some(strict_root) = resolve_strict_windows_espeak_data_directory()? else {
-        return Ok(());
-    };
-    env::set_var("PIPER_ESPEAKNG_DATA_DIRECTORY", &strict_root);
-    Ok(())
+fn adjacent_espeak_data_root(model_path: &Path) -> Option<PathBuf> {
+    let root = model_path.parent()?.to_path_buf();
+    root.join("espeak-ng-data").is_dir().then_some(root)
+}
+
+fn ensure_espeak_data_directory_env(model_path: &Path) -> Result<(), String> {
+    #[cfg(not(windows))]
+    {
+        if env::var_os("PIPER_ESPEAKNG_DATA_DIRECTORY").is_none() {
+            if let Some(root) = adjacent_espeak_data_root(model_path) {
+                env::set_var("PIPER_ESPEAKNG_DATA_DIRECTORY", root);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+        let Some(strict_root) = resolve_strict_windows_espeak_data_directory()? else {
+            return Ok(());
+        };
+        env::set_var("PIPER_ESPEAKNG_DATA_DIRECTORY", &strict_root);
+        Ok(())
+    }
 }
 
 const TTS_CUDA_RUNTIME_DLLS: &[&str] = &[
@@ -870,8 +1141,29 @@ mod tests {
     use super::{LocalTtsRuntime, LocalTtsRuntimeSpec};
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::{mpsc, Arc, Condvar, Mutex};
+    use std::sync::{atomic::AtomicUsize, mpsc, Arc, Condvar, Mutex};
     use std::thread;
+
+    static TTS_RUNTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct TestRuntimeGuard(std::sync::MutexGuard<'static, ()>);
+
+    impl Drop for TestRuntimeGuard {
+        fn drop(&mut self) {
+            while super::SYNTHESIS_PERMIT_OCCUPIED.load(std::sync::atomic::Ordering::Acquire) {
+                thread::yield_now();
+            }
+            let _ = super::reap_abandoned_synthesis();
+        }
+    }
+
+    fn test_runtime_guard() -> TestRuntimeGuard {
+        TestRuntimeGuard(
+            TTS_RUNTIME_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
 
     struct FakeSynthesisEngine {
         sample_rate_hz: u32,
@@ -1050,6 +1342,19 @@ mod tests {
         assert_eq!(resolved, tts_root);
     }
 
+    #[test]
+    fn piper_espeak_path_accepts_data_adjacent_to_model() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let model_path = temp_dir.path().join("jarvis.onnx");
+        fs::create_dir_all(temp_dir.path().join("espeak-ng-data"))
+            .expect("espeak-ng-data directory should be created");
+
+        assert_eq!(
+            super::adjacent_espeak_data_root(&model_path),
+            Some(temp_dir.path().to_path_buf())
+        );
+    }
+
     fn fake_engine_factory(
         _model_path: PathBuf,
         sample_rate_hz: u32,
@@ -1062,33 +1367,14 @@ mod tests {
     }
 
     #[test]
-    fn disabled_runtime_rejects_synthesis_requests() {
-        let runtime = LocalTtsRuntime::new(LocalTtsRuntimeSpec {
-            enabled: false,
-            model_path: None,
-            worker_count: 1,
-            max_queue: 4,
-            sample_rate_hz: 22_050,
-            max_duration_s: 300,
-            provider_policy: super::TtsProviderPolicy::Auto,
-        })
-        .expect("runtime should initialize");
-
-        let error = runtime
-            .synthesize("hello")
-            .expect_err("disabled runtime should reject synthesis");
-        assert_eq!(error, "tts is disabled");
-    }
-
-    #[test]
     fn enabled_runtime_generates_audio() {
+        let _test_runtime_guard = test_runtime_guard();
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let model_path = temp_dir.path().join("jarvis.onnx");
         fs::write(&model_path, b"fixture").expect("model fixture should be written");
 
         let runtime = LocalTtsRuntime::new_with_engine_factory(
             LocalTtsRuntimeSpec {
-                enabled: true,
                 model_path: Some(model_path),
                 worker_count: 2,
                 max_queue: 8,
@@ -1109,13 +1395,49 @@ mod tests {
     }
 
     #[test]
+    fn sequential_synthesis_reuses_one_initialized_engine() {
+        let _test_runtime_guard = test_runtime_guard();
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let model_path = temp_dir.path().join("jarvis.onnx");
+        fs::write(&model_path, b"fixture").expect("model fixture should be written");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory_calls = Arc::clone(&calls);
+        let factory: super::SynthesisEngineFactory = Arc::new(move |_, sample_rate_hz, _| {
+            factory_calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Ok((
+                Box::new(FakeSynthesisEngine { sample_rate_hz }),
+                super::TtsActualProvider::Cpu,
+            ))
+        });
+        let runtime = LocalTtsRuntime::new_with_engine_factory(
+            LocalTtsRuntimeSpec {
+                model_path: Some(model_path),
+                worker_count: 1,
+                max_queue: 2,
+                sample_rate_hz: 22_050,
+                max_duration_s: 300,
+                provider_policy: super::TtsProviderPolicy::Cpu,
+            },
+            factory,
+        )
+        .expect("runtime should initialize");
+        runtime
+            .synthesize("first")
+            .expect("first synthesis should succeed");
+        runtime
+            .synthesize("second")
+            .expect("second synthesis should succeed");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Acquire), 1);
+    }
+
+    #[test]
     fn enabled_runtime_rejects_oversized_text_before_synthesis() {
+        let _test_runtime_guard = test_runtime_guard();
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let model_path = temp_dir.path().join("jarvis.onnx");
         fs::write(&model_path, b"fixture").expect("model fixture should be written");
         let runtime = LocalTtsRuntime::new_with_engine_factory(
             LocalTtsRuntimeSpec {
-                enabled: true,
                 model_path: Some(model_path),
                 worker_count: 1,
                 max_queue: 1,
@@ -1135,7 +1457,8 @@ mod tests {
     }
 
     #[test]
-    fn synthesis_result_is_rejected_when_runtime_is_disabled_in_flight() {
+    fn synthesis_result_is_rejected_when_generation_is_cancelled_in_flight() {
+        let _test_runtime_guard = test_runtime_guard();
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let model_path = temp_dir.path().join("jarvis.onnx");
         fs::write(&model_path, b"fixture").expect("model fixture should be written");
@@ -1145,7 +1468,6 @@ mod tests {
         let runtime = Arc::new(
             LocalTtsRuntime::new_with_engine_factory(
                 LocalTtsRuntimeSpec {
-                    enabled: true,
                     model_path: Some(model_path),
                     worker_count: 1,
                     max_queue: 1,
@@ -1166,13 +1488,16 @@ mod tests {
             )
             .expect("runtime should initialize with blocking engine"),
         );
+        let generation = runtime.start_generation();
         let synthesizing_runtime = Arc::clone(&runtime);
-        let synthesis = thread::spawn(move || synthesizing_runtime.synthesize("hello"));
+        let synthesis = thread::spawn(move || {
+            synthesizing_runtime.synthesize_for_generation("hello", generation)
+        });
         started_rx
             .recv()
             .expect("synthesis should reach the blocking engine");
 
-        runtime.set_enabled(false);
+        runtime.cancel_generation();
         let (lock, ready) = &*release;
         *lock.lock().expect("release lock") = true;
         ready.notify_all();
@@ -1180,19 +1505,197 @@ mod tests {
         let error = synthesis
             .join()
             .expect("synthesis thread should join")
-            .expect_err("disabled in-flight synthesis must not return audio");
-        assert_eq!(error, "tts was disabled during synthesis");
+            .expect_err("superseded in-flight synthesis must not return audio");
+        assert_eq!(error, super::SYNTHESIS_CANCELLED);
+
+        let next_generation = runtime.start_generation();
+        runtime
+            .synthesize_for_generation("after release", next_generation)
+            .expect("completed abandoned work should release the budget");
+    }
+
+    #[test]
+    fn second_cancellation_exhausts_abandoned_work_budget() {
+        let _test_runtime_guard = test_runtime_guard();
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let model_path = temp_dir.path().join("jarvis.onnx");
+        fs::write(&model_path, b"fixture").expect("model fixture should be written");
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let engine_release = Arc::clone(&release);
+        let factory_call_count = Arc::clone(&factory_calls);
+        let runtime = Arc::new(
+            LocalTtsRuntime::new_with_engine_factory(
+                LocalTtsRuntimeSpec {
+                    model_path: Some(model_path),
+                    worker_count: 1,
+                    max_queue: 1,
+                    sample_rate_hz: 22_050,
+                    max_duration_s: 300,
+                    provider_policy: super::TtsProviderPolicy::Auto,
+                },
+                Arc::new(move |_, sample_rate_hz, _| {
+                    if factory_call_count.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 0 {
+                        Ok((
+                            Box::new(BlockingSynthesisEngine {
+                                sample_rate_hz,
+                                started: started_tx.clone(),
+                                release: Arc::clone(&engine_release),
+                            }),
+                            super::TtsActualProvider::Cpu,
+                        ))
+                    } else {
+                        Ok((
+                            Box::new(FakeSynthesisEngine { sample_rate_hz }),
+                            super::TtsActualProvider::Cpu,
+                        ))
+                    }
+                }),
+            )
+            .expect("runtime should initialize with blocking engine"),
+        );
+
+        let generation = runtime.start_generation();
+        let first_runtime = Arc::clone(&runtime);
+        let (first_result_tx, first_result_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ =
+                first_result_tx.send(first_runtime.synthesize_for_generation("first", generation));
+        });
+        started_rx
+            .recv()
+            .expect("first synthesis should reach the blocking engine");
+
+        runtime.cancel_generation();
+        let first_error = first_result_rx
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .expect("cancelled caller should settle promptly")
+            .expect_err("cancelled synthesis must fail");
+        assert_eq!(first_error, super::SYNTHESIS_CANCELLED);
+
+        let replacement_generation = runtime.start_generation();
+        let error = runtime
+            .synthesize_for_generation("replacement", replacement_generation)
+            .expect_err("a second blocked cancellation must exhaust the worker budget");
+        assert!(error.contains("abandoned synthesis budget exhausted"));
+
+        // Do not leave the deliberately blocked native runner contaminating later tests.
+        *release.0.lock().expect("release lock") = true;
+        release.1.notify_all();
+    }
+
+    #[test]
+    fn queued_generation_is_skipped_and_new_generation_runs() {
+        let _test_runtime_guard = test_runtime_guard();
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let model_path = temp_dir.path().join("jarvis.onnx");
+        fs::write(&model_path, b"fixture").expect("model fixture should be written");
+        let runtime = Arc::new(
+            LocalTtsRuntime::new_with_engine_factory(
+                LocalTtsRuntimeSpec {
+                    model_path: Some(model_path),
+                    worker_count: 1,
+                    max_queue: 2,
+                    sample_rate_hz: 22_050,
+                    max_duration_s: 300,
+                    provider_policy: super::TtsProviderPolicy::Auto,
+                },
+                Arc::new(fake_engine_factory),
+            )
+            .expect("runtime should initialize"),
+        );
+        let old_generation = runtime.start_generation();
+        runtime.cancel_generation();
+        let stale = Arc::clone(&runtime);
+        let stale_result =
+            thread::spawn(move || stale.synthesize_for_generation("stale", old_generation))
+                .join()
+                .expect("stale request should join")
+                .expect_err("cancelled generation must be rejected");
+        assert_eq!(stale_result, super::SYNTHESIS_CANCELLED);
+
+        let new_generation = runtime.start_generation();
+        runtime
+            .synthesize_for_generation("current", new_generation)
+            .expect("new generation should not be blocked by stale work");
+    }
+
+    #[test]
+    fn queued_request_is_rejected_when_generation_is_cancelled() {
+        let _test_runtime_guard = test_runtime_guard();
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let model_path = temp_dir.path().join("jarvis.onnx");
+        fs::write(&model_path, b"fixture").expect("model fixture should be written");
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let engine_release = Arc::clone(&release);
+        let runtime = Arc::new(
+            LocalTtsRuntime::new_with_engine_factory(
+                LocalTtsRuntimeSpec {
+                    model_path: Some(model_path),
+                    worker_count: 1,
+                    max_queue: 2,
+                    sample_rate_hz: 22_050,
+                    max_duration_s: 300,
+                    provider_policy: super::TtsProviderPolicy::Auto,
+                },
+                Arc::new(move |_, sample_rate_hz, _| {
+                    Ok((
+                        Box::new(BlockingSynthesisEngine {
+                            sample_rate_hz,
+                            started: started_tx.clone(),
+                            release: Arc::clone(&engine_release),
+                        }),
+                        super::TtsActualProvider::Cpu,
+                    ))
+                }),
+            )
+            .expect("runtime should initialize with blocking engine"),
+        );
+
+        let generation = runtime.start_generation();
+        let first_runtime = Arc::clone(&runtime);
+        let first =
+            thread::spawn(move || first_runtime.synthesize_for_generation("first", generation));
+        started_rx
+            .recv()
+            .expect("first synthesis should reach the blocking engine");
+
+        let queued_runtime = Arc::clone(&runtime);
+        let queued =
+            thread::spawn(move || queued_runtime.synthesize_for_generation("queued", generation));
+        runtime.cancel_generation();
+
+        let (lock, ready) = &*release;
+        *lock.lock().expect("release lock") = true;
+        ready.notify_all();
+
+        assert_eq!(
+            first
+                .join()
+                .expect("first synthesis should join")
+                .unwrap_err(),
+            super::SYNTHESIS_CANCELLED
+        );
+        assert_eq!(
+            queued
+                .join()
+                .expect("queued synthesis should join")
+                .unwrap_err(),
+            super::SYNTHESIS_CANCELLED
+        );
     }
 
     #[test]
     fn enabled_runtime_surfaces_cuda_provider_init_failure() {
+        let _test_runtime_guard = test_runtime_guard();
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let model_path = temp_dir.path().join("jarvis.onnx");
         fs::write(&model_path, b"fixture").expect("model fixture should be written");
 
         let runtime_result = LocalTtsRuntime::new_with_engine_factory(
             LocalTtsRuntimeSpec {
-                enabled: true,
                 model_path: Some(model_path),
                 worker_count: 1,
                 max_queue: 4,
@@ -1213,13 +1716,13 @@ mod tests {
 
     #[test]
     fn enabled_runtime_rejects_audio_exceeding_max_duration() {
+        let _test_runtime_guard = test_runtime_guard();
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let model_path = temp_dir.path().join("jarvis.onnx");
         fs::write(&model_path, b"fixture").expect("model fixture should be written");
 
         let runtime = LocalTtsRuntime::new_with_engine_factory(
             LocalTtsRuntimeSpec {
-                enabled: true,
                 model_path: Some(model_path),
                 worker_count: 1,
                 max_queue: 4,
@@ -1237,5 +1740,63 @@ mod tests {
             .expect_err("over-limit synthesis should hard-fail");
 
         assert!(error.contains("exceeds configured max"));
+    }
+
+    #[test]
+    fn timed_out_initialization_is_owned_and_reaped_before_retry() {
+        let _test_runtime_guard = test_runtime_guard();
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let model_path = temp_dir.path().join("jarvis.onnx");
+        fs::write(&model_path, b"fixture").expect("model fixture should be written");
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory_release = Arc::clone(&release);
+        let factory_calls = Arc::clone(&calls);
+        let factory: super::SynthesisEngineFactory = Arc::new(move |_, sample_rate_hz, _| {
+            factory_calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let (lock, ready) = &*factory_release;
+            let mut released = lock.lock().expect("release lock");
+            while !*released {
+                released = ready.wait(released).expect("release lock");
+            }
+            Ok((
+                Box::new(FakeSynthesisEngine { sample_rate_hz }) as Box<dyn super::SynthesisEngine>,
+                super::TtsActualProvider::Cpu,
+            ))
+        });
+        let spec = || LocalTtsRuntimeSpec {
+            model_path: Some(model_path.clone()),
+            worker_count: 1,
+            max_queue: 1,
+            sample_rate_hz: 22_050,
+            max_duration_s: 300,
+            provider_policy: super::TtsProviderPolicy::Cpu,
+        };
+
+        let first = LocalTtsRuntime::new_with_engine_factory(spec(), Arc::clone(&factory));
+        assert!(first
+            .expect_err("blocked initialization should time out")
+            .contains("timed out initializing"));
+        let second = LocalTtsRuntime::new_with_engine_factory(spec(), Arc::clone(&factory))
+            .expect_err("active initialization must block a replacement factory");
+        assert!(second.contains("still pending"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Acquire), 1);
+
+        let (lock, ready) = &*release;
+        *lock.lock().expect("release lock") = true;
+        ready.notify_all();
+        let third = loop {
+            match LocalTtsRuntime::new_with_engine_factory(spec(), Arc::clone(&factory)) {
+                Ok(runtime) => break runtime,
+                Err(error) if error.contains("still pending") => {
+                    thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("reaped initialization should retry: {error}"),
+            }
+        };
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Acquire), 2);
+        third
+            .synthesize("after retry")
+            .expect("restarted runtime should synthesize");
     }
 }

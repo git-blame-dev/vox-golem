@@ -8,8 +8,8 @@ import { PromptComposer } from './components/PromptComposer'
 import { UserNoticeToast } from './components/UserNoticeToast'
 import { playCue } from './lib/audioCues'
 import { shouldSubmitComposer } from './lib/composer'
-import { startLiveAudioSource } from './lib/liveAudioSource'
-import type { LiveAudioSource } from './lib/liveAudioSource'
+import { listAudioInputDevices, startLiveAudioSource } from './lib/liveAudioSource'
+import type { AudioInputDevice, LiveAudioSource } from './lib/liveAudioSource'
 import { executePrompt } from './lib/promptExecution'
 import {
   ingestAudioFrame,
@@ -37,6 +37,7 @@ import {
 import { getInitialMessages } from './state/appShell'
 import { cueForTransition, transitionRuntimeStatus } from './state/runtimeMachine'
 import { isTranscriptMessage } from './types/chat'
+import { firstNonEmptyCompletedLine, firstNonEmptyStreamingLine, isValidTtsFirstLine } from './lib/ttsValidation'
 import type {
   BackendRuntimePhase,
   ChatMessage,
@@ -51,10 +52,32 @@ import type {
 import './App.css'
 
 const NOTICE_AUTO_DISMISS_MS = 4_000
+const WAKE_CONFIDENCE_PEAK_HOLD_MS = 1_000
 const MAX_NOTICE_QUEUE_LENGTH = 3
 const UI_TEXT_SIZE_STEPS: readonly UiTextSize[] = ['small', 'medium', 'large', 'extra_large']
 const DEFAULT_UI_TEXT_SIZE: UiTextSize = 'medium'
 const DEFAULT_UI_THEME: UiTheme = 'dark'
+const AUDIO_INPUT_DEVICE_STORAGE_KEY = 'voxgolem.audioInputDeviceId'
+
+function loadAudioInputDeviceId(): string | null {
+  try {
+    return window.localStorage.getItem(AUDIO_INPUT_DEVICE_STORAGE_KEY)
+  } catch {
+    return null
+  }
+}
+
+function persistAudioInputDeviceId(deviceId: string | null): void {
+  try {
+    if (deviceId === null) {
+      window.localStorage.removeItem(AUDIO_INPUT_DEVICE_STORAGE_KEY)
+    } else {
+      window.localStorage.setItem(AUDIO_INPUT_DEVICE_STORAGE_KEY, deviceId)
+    }
+  } catch {
+    // Browser storage is optional; the selected device still applies to this session.
+  }
+}
 
 const voiceInputReady = (state: StartupState): boolean =>
   state.kind === 'ready' &&
@@ -108,6 +131,8 @@ function App() {
   const [isSwitchingResponseProfile, setIsSwitchingResponseProfile] = useState(false)
   const [micStarting, setMicStarting] = useState(false)
   const [micActive, setMicActive] = useState(false)
+  const [audioInputDevices, setAudioInputDevices] = useState<readonly AudioInputDevice[]>([])
+  const [audioInputDeviceId, setAudioInputDeviceId] = useState<string | null>(loadAudioInputDeviceId)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [assistantSettingsPending, setAssistantSettingsPending] = useState(
     () => getTauriInternals() !== null,
@@ -139,6 +164,8 @@ function App() {
     corrected: boolean
     stages: AnswerStageStatusEntry[]
     priorVersions: AnswerPriorVersion[]
+     sources: import('./components/AnswerStage').AnswerSource[]
+     ttsFirstLineSpoken: boolean
   } | null>(null)
   const visibleMessages = useMemo(
     () => messages.filter(isTranscriptMessage),
@@ -149,6 +176,7 @@ function App() {
   const settingsPanelRef = useRef<HTMLElement | null>(null)
   const settingsCloseButtonRef = useRef<HTMLButtonElement | null>(null)
   const liveAudioSourceRef = useRef<LiveAudioSource | null>(null)
+  const audioInputDeviceIdRef = useRef(audioInputDeviceId)
   const liveAudioSessionIdRef = useRef(0)
   const liveAudioInFlightFramesRef = useRef(0)
   const uiTextSizeHydrationOverriddenRef = useRef(false)
@@ -157,6 +185,7 @@ function App() {
   const appActiveRef = useRef(true)
   const autoStopOnSilenceRef = useRef(true)
   const micAutoStartedRef = useRef(false)
+  const micStartInFlightRef = useRef(false)
   const runtimeStatusRef = useRef<RuntimeStatus>('initializing')
   const startupStateRef = useRef<StartupState>({ kind: 'loading' })
   const voiceActivityStateRef = useRef(createVoiceActivityState())
@@ -181,6 +210,9 @@ function App() {
   const uiTextSizeWriteChainRef = useRef<Promise<void>>(Promise.resolve())
   const uiThemeWriteChainRef = useRef<Promise<void>>(Promise.resolve())
   const ttsWriteChainRef = useRef<Promise<void>>(Promise.resolve())
+  const wakeConfidenceRef = useRef<number | null>(null)
+  const pendingWakeConfidenceRef = useRef<number | null>(null)
+  const wakeConfidenceHoldRef = useRef<number | null>(null)
 
   const cancelTts = (): void => {
     ttsGenerationRef.current += 1
@@ -190,6 +222,43 @@ function App() {
       // An already-ended source is stale by definition.
     }
     ttsSourceRef.current = null
+  }
+
+  const resetWakeConfidence = (): void => {
+    if (wakeConfidenceHoldRef.current !== null) {
+      window.clearTimeout(wakeConfidenceHoldRef.current)
+      wakeConfidenceHoldRef.current = null
+    }
+    wakeConfidenceRef.current = null
+    pendingWakeConfidenceRef.current = null
+    setWakeConfidence(null)
+  }
+
+  const updateWakeConfidence = (nextConfidence: number): void => {
+    if (!Number.isFinite(nextConfidence) || nextConfidence < 0 || nextConfidence > 1) return
+    if (wakeConfidenceRef.current === null || nextConfidence > wakeConfidenceRef.current) {
+      if (wakeConfidenceHoldRef.current !== null) {
+        window.clearTimeout(wakeConfidenceHoldRef.current)
+      }
+      wakeConfidenceRef.current = nextConfidence
+      pendingWakeConfidenceRef.current = nextConfidence
+      setWakeConfidence(nextConfidence)
+      wakeConfidenceHoldRef.current = window.setTimeout(() => {
+        wakeConfidenceHoldRef.current = null
+        wakeConfidenceRef.current = pendingWakeConfidenceRef.current
+        setWakeConfidence(pendingWakeConfidenceRef.current)
+      }, WAKE_CONFIDENCE_PEAK_HOLD_MS)
+      return
+    }
+
+    pendingWakeConfidenceRef.current = nextConfidence
+    if (wakeConfidenceHoldRef.current === null) {
+      wakeConfidenceHoldRef.current = window.setTimeout(() => {
+        wakeConfidenceHoldRef.current = null
+        wakeConfidenceRef.current = pendingWakeConfidenceRef.current
+        setWakeConfidence(pendingWakeConfidenceRef.current)
+      }, WAKE_CONFIDENCE_PEAK_HOLD_MS)
+    }
   }
 
   useEffect(() => {
@@ -250,12 +319,16 @@ function App() {
     setVoiceCompletionSuffix('')
   }
 
-  const clearCompletion = (): void => {
+  const clearCompletionDisplay = (): void => {
     completionLifecycleRef.current += 1
     completionRevisionRef.current += 1
     latestTypedCompletionRef.current = null
     setTypedCompletionSuffix('')
     setVoiceCompletionSuffix('')
+  }
+
+  const clearCompletion = (): void => {
+    clearCompletionDisplay()
     void invokeTauriCommand('clear_completion').catch(() => undefined)
   }
 
@@ -367,6 +440,7 @@ function App() {
       ) {
         const active = promptRef.current
         if (active !== null && !active.terminal && promptState !== 'stopping') {
+          cancelTts()
           setPromptState('stopping')
           void invokeTauriCommand('cancel_prompt', { requestId: active.id }).catch(() => {
             if (promptRef.current === active && !active.terminal) {
@@ -501,7 +575,7 @@ function App() {
     }
   }
 
-  const applyStartupState = (nextState: StartupState): void => {
+  const applyStartupState = (nextState: StartupState, syncRuntimeStatus = true): void => {
     startupStateRef.current = nextState
     setStartupState(nextState)
     if (nextState.kind === 'ready' || nextState.kind === 'warming_model') {
@@ -512,9 +586,11 @@ function App() {
       setTtsEnabled(false)
     }
 
-    const nextRuntimeStatus = startupStateToRuntimeStatus(nextState)
-    runtimeStatusRef.current = nextRuntimeStatus
-    setRuntimeStatus(nextRuntimeStatus)
+    if (syncRuntimeStatus) {
+      const nextRuntimeStatus = startupStateToRuntimeStatus(nextState)
+      runtimeStatusRef.current = nextRuntimeStatus
+      setRuntimeStatus(nextRuntimeStatus)
+    }
   }
 
   useEffect(() => {
@@ -528,8 +604,37 @@ function App() {
           return
         }
 
-        const previousKind = startupStateRef.current.kind
-        applyStartupState(nextState)
+        const previousState = startupStateRef.current
+        const previousKind = previousState.kind
+        const hydrated = previousKind !== 'loading'
+        if (nextState.kind === 'error' && hydrated && previousKind === 'ready') {
+          await new Promise((resolve) => window.setTimeout(resolve, 1_000))
+          continue
+        }
+        if (isSwitchingResponseProfileRef.current) {
+          await new Promise((resolve) => window.setTimeout(resolve, 500))
+          continue
+        }
+        const syncRuntimeStatus = !hydrated
+        applyStartupState(nextState, syncRuntimeStatus)
+
+        if (nextState.kind === 'ready') {
+          const newlyUnavailableCapabilities = nextState.capabilities.filter(({ id, state }) => {
+            if (state !== 'not_configured' && state !== 'unavailable' && state !== 'failed') return false
+            if (previousKind !== 'ready') return true
+            const previousCapability = previousState.capabilities.find((capability) => capability.id === id)
+            return previousCapability !== undefined && previousCapability.state !== state
+          })
+          if (newlyUnavailableCapabilities.length > 0) {
+            addNotice({
+              tone: 'error',
+              title: 'Startup capabilities unavailable',
+              message: newlyUnavailableCapabilities
+                .map(({ id, reason }) => `${capabilityLabel(id)}: ${reason}`)
+                .join('; '),
+            })
+          }
+        }
 
         if (nextState.kind === 'ready' && previousKind !== 'ready') {
           setMessages((currentMessages) => [
@@ -543,18 +648,6 @@ function App() {
                 `stopCue=${nextState.cueAssetPaths.stopListening}`,
             },
           ])
-          const unavailableCapabilities = nextState.capabilities.filter(
-            ({ state }) => state === 'not_configured' || state === 'unavailable' || state === 'failed',
-          )
-          if (unavailableCapabilities.length > 0) {
-            addNotice({
-              tone: 'error',
-              title: 'Startup capabilities unavailable',
-              message: unavailableCapabilities
-                .map(({ id, reason }) => `${capabilityLabel(id)}: ${reason}`)
-                .join('; '),
-            })
-          }
         }
 
         if (nextState.kind === 'error' && previousKind !== 'error') {
@@ -565,11 +658,10 @@ function App() {
           })
         }
 
-        if (isStartupStateSettled(nextState)) {
-          return
-        }
-
-        await new Promise((resolve) => window.setTimeout(resolve, 500))
+        await new Promise((resolve) => window.setTimeout(
+          resolve,
+          isStartupStateSettled(nextState) ? 1_000 : 500,
+        ))
       }
     })()
 
@@ -582,11 +674,33 @@ function App() {
     return () => {
       appActiveRef.current = false
       cancelTts()
+      if (wakeConfidenceHoldRef.current !== null) {
+        window.clearTimeout(wakeConfidenceHoldRef.current)
+      }
       liveAudioSessionIdRef.current += 1
       liveAudioSourceRef.current?.stop()
       liveAudioSourceRef.current = null
     }
   }, [])
+
+  useEffect(() => {
+    if (!settingsOpen) {
+      return
+    }
+
+    let active = true
+    void listAudioInputDevices()
+      .then((devices) => {
+        if (active) setAudioInputDevices(devices)
+      })
+      .catch(() => {
+        if (active) setAudioInputDevices([])
+      })
+
+    return () => {
+      active = false
+    }
+  }, [settingsOpen])
 
   useEffect(() => {
     const conversation = conversationRef.current
@@ -606,6 +720,7 @@ function App() {
   const assistantCapabilities = useMemo(() => capabilityMap(startupState), [startupState])
   const selectedInstantOption = instantOptions(assistantCapabilities)
     .find((option) => option.value === assistantSettings.instant)
+  const selectedInstantRetryable = localInstantCanRetry(startupState, assistantSettings.instant)
   const selectedInstantProfileReady = instantMatchesResponseProfile(startupState, assistantSettings.instant)
   const canSend = useMemo(
     () =>
@@ -614,9 +729,10 @@ function App() {
       selectedInstantProfileReady &&
       !assistantSettingsPending &&
       !resetPending &&
+      promptState === 'idle' &&
       runtimeStatus === 'sleeping' &&
       composerValue.trim().length > 0,
-    [assistantSettingsPending, composerValue, resetPending, runtimeStatus, selectedInstantOption?.available, selectedInstantProfileReady, startupState.kind],
+    [assistantSettingsPending, composerValue, promptState, resetPending, runtimeStatus, selectedInstantOption?.available, selectedInstantProfileReady, startupState.kind],
   )
 
   const canToggleMic = voiceInputReady(startupState) && !micStarting
@@ -676,14 +792,14 @@ function App() {
   const changeInstant = async (instant: AssistantSettings['instant']): Promise<void> => {
     const revision = ++instantSelectionRevisionRef.current
     const option = instantOptions(assistantCapabilities).find((item) => item.value === instant)
-    if (!option?.available) return
+    if (!option?.available && !localInstantCanRetry(startupStateRef.current, instant)) return
     let previousProfile: ResponseProfile | null = null
     let switchedProfile = false
     if (instant === 'local-fast' || instant === 'local-quality') {
       const profile = instant === 'local-fast' ? 'fast' : 'quality'
       if (startupState.kind !== 'ready') return
       previousProfile = startupState.selectedResponseProfile
-      if (previousProfile !== profile) {
+      if (previousProfile !== profile || localInstantCanRetry(startupStateRef.current, instant)) {
         if (!await switchResponseProfile(profile)) return
         switchedProfile = true
       }
@@ -740,6 +856,7 @@ function App() {
     setRuntimeStatus(nextStatus)
 
     if (nextStatus === 'listening' && previousStatus !== 'listening') {
+      resetWakeConfidence()
       expectedPartialSessionIdRef.current += 1
       partialTranscriptionRef.current = {
         sessionId: expectedPartialSessionIdRef.current,
@@ -750,7 +867,7 @@ function App() {
     } else if (nextStatus !== 'listening') {
       partialTranscriptionAllowedRef.current = false
       voiceActivityStateRef.current = createVoiceActivityState()
-      setWakeConfidence(null)
+      resetWakeConfidence()
       clearPartialTranscript()
     }
 
@@ -801,6 +918,7 @@ function App() {
     setRuntimeStatus(nextStatus)
 
     if (nextStatus === 'listening' && previousStatus !== 'listening') {
+      resetWakeConfidence()
       expectedPartialSessionIdRef.current += 1
       partialTranscriptionRef.current = {
         sessionId: expectedPartialSessionIdRef.current,
@@ -811,7 +929,7 @@ function App() {
     } else if (nextStatus !== 'listening') {
       partialTranscriptionAllowedRef.current = false
       voiceActivityStateRef.current = createVoiceActivityState()
-      setWakeConfidence(null)
+      resetWakeConfidence()
       clearPartialTranscript()
     }
 
@@ -897,7 +1015,7 @@ function App() {
   const enterRuntimeError = (): void => {
     runtimeStatusRef.current = 'error'
     voiceActivityStateRef.current = createVoiceActivityState()
-    setWakeConfidence(null)
+    resetWakeConfidence()
     setRuntimeStatus('error')
   }
 
@@ -922,10 +1040,21 @@ function App() {
     const nextStatus = toRuntimeStatus(runtimePhase.runtimePhase)
 
     applyRuntimeStatus(nextStatus)
-    recordRuntimeControlTelemetry(runtimePhase)
+    if (previousStatus === 'sleeping') {
+      recordRuntimeControlTelemetry(runtimePhase)
+    }
 
-    if (runtimePhase.telemetry?.wakeConfidence !== null && runtimePhase.telemetry?.wakeConfidence !== undefined) {
-      setWakeConfidence(runtimePhase.telemetry.wakeConfidence)
+    if (
+      nextStatus === 'sleeping' &&
+      runtimePhase.telemetry?.wakeConfidence === null
+    ) {
+      resetWakeConfidence()
+    } else if (
+      nextStatus === 'sleeping' &&
+      runtimePhase.telemetry?.wakeConfidence !== null &&
+      runtimePhase.telemetry?.wakeConfidence !== undefined
+    ) {
+      updateWakeConfidence(runtimePhase.telemetry.wakeConfidence)
     }
 
     if (previousStatus !== 'listening' && nextStatus === 'listening') {
@@ -1022,14 +1151,13 @@ function App() {
       !instantMatchesResponseProfile(currentStartupState, currentSettings.instant) ||
       assistantSettingsPendingRef.current ||
       isSwitchingResponseProfileRef.current ||
-      resetPendingRef.current
+      resetPendingRef.current ||
+      promptRef.current !== null
     ) {
       return
     }
 
-    const trimmedPrompt = prompt.trim()
-
-    if (trimmedPrompt.length === 0) {
+    if (prompt.trim().length === 0) {
       return
     }
 
@@ -1059,6 +1187,8 @@ function App() {
         ...(currentSettings.reviewEnabled ? [{ stage: 'review', status: 'queued' } as const] : []),
       ],
       priorVersions: [],
+      sources: [],
+      ttsFirstLineSpoken: false,
     }
     setPromptState('executing')
     setPromptActivity('Executing prompt…')
@@ -1067,13 +1197,13 @@ function App() {
       {
         id: `user-${Date.now()}`,
         role: 'user',
-        content: trimmedPrompt,
+        content: prompt,
       },
     ])
 
     if (source === 'typed') {
       setComposerValue('')
-      clearCompletion()
+      clearCompletionDisplay()
     }
 
     const handleEvent = (event: import('./types/chat').PromptExecutionEvent): void => {
@@ -1083,14 +1213,21 @@ function App() {
       }
       if (event.kind === 'text') {
         active.text += event.text
+        if (active.tts && ttsEnabledRef.current && !active.ttsFirstLineSpoken && active.text.includes('\n')) {
+          const firstLine = firstNonEmptyStreamingLine(active.text)
+          if (firstLine !== null && isValidTtsFirstLine(firstLine)) {
+            active.ttsFirstLineSpoken = true
+            void synthesizeAndPlayAssistantReply(firstLine)
+          }
+        }
         setMessages((current) => {
           const index = current.findIndex((message) => message.id === active.assistantId)
           if (index < 0) {
-            return [...current, { id: active.assistantId, role: 'assistant', content: event.text, answerStage: { stages: active.stages, priorVersions: active.priorVersions } }]
+            return [...current, { id: active.assistantId, role: 'assistant', content: event.text, answerStage: { stages: active.stages, priorVersions: active.priorVersions, sources: active.sources } }]
           }
           return current.map((message, messageIndex) =>
             messageIndex === index
-              ? { ...message, content: message.content + event.text, answerStage: { stages: active.stages, priorVersions: active.priorVersions } }
+              ? { ...message, content: message.content + event.text, answerStage: { stages: active.stages, priorVersions: active.priorVersions, sources: active.sources } }
               : message,
           )
         })
@@ -1101,44 +1238,40 @@ function App() {
           active.priorVersions.push({ id: `instant-${active.priorVersions.length + 1}`, text: active.text, label: 'Before correction' })
         }
         active.text = event.text
-        const correctionStage = active.stages.some((stage) => stage.stage === 'review' && stage.status === 'running')
-          ? 'review'
-          : 'deep'
-        active.stages = active.stages.map((stage) => stage.stage === correctionStage ? { ...stage, status: 'corrected', detail: event.correction } : stage)
+        active.stages = active.stages.map((stage) => stage.stage === event.stage ? { ...stage, status: 'corrected', detail: event.correction } : stage)
         setMessages((current) => {
           const corrected = {
             id: active.assistantId,
             role: 'assistant' as const,
             content: event.text,
-            answerStage: { stages: active.stages, priorVersions: active.priorVersions },
+             answerStage: { stages: active.stages, priorVersions: active.priorVersions, sources: active.sources },
           }
           return current.some((message) => message.id === active.assistantId)
             ? current.map((message) => message.id === active.assistantId ? { ...message, ...corrected } : message)
             : [...current, corrected]
         })
         setPromptActivity(event.correction)
-        if (active.tts && ttsEnabledRef.current) void synthesizeAndPlayAssistantReply(event.text)
+        if (active.tts && ttsEnabledRef.current) {
+          void synthesizeAndPlayAssistantReply(event.correction.replace(/^Correction:\s*/u, ''))
+        }
+      }
+      if (event.kind === 'stage') {
+        active.stages = active.stages.map((stage) => stage.stage === event.stage
+          ? { stage: event.stage, status: event.status, ...(event.detail === undefined ? {} : { detail: event.detail }) }
+          : stage)
+        setMessages((current) => current.map((message) => message.id === active.assistantId
+          ? { ...message, answerStage: { stages: active.stages, priorVersions: active.priorVersions, sources: active.sources } } : message))
+      }
+      if (event.kind === 'sources') {
+        active.sources = [...event.sources]
+        setMessages((current) => current.map((message) => message.id === active.assistantId
+          ? { ...message, answerStage: { stages: active.stages, priorVersions: active.priorVersions, sources: active.sources } } : message))
       }
       if (event.kind === 'reasoning') {
         setPromptActivity(`Reasoning: ${event.text}`)
       }
       if (event.kind === 'status') {
         setPromptActivity(event.message)
-        const statusMap: Record<string, AnswerStageStatusEntry> = {
-          'Deep running': { stage: 'deep', status: 'running' },
-          'Deep completed': { stage: 'deep', status: 'completed' },
-          'Deep failed; Review will use Instant': { stage: 'deep', status: 'failed' },
-          'Deep failed; Instant retained': { stage: 'deep', status: 'failed' },
-          'Review running': { stage: 'review', status: 'running' },
-          'Review kept Instant answer': { stage: 'review', status: 'kept' },
-          'Review failed; Instant retained': { stage: 'review', status: 'failed' },
-        }
-        const mapped = statusMap[event.message]
-        if (mapped) {
-          active.stages = active.stages.map((stage) => stage.stage === mapped.stage ? mapped : stage)
-          setMessages((current) => current.map((message) => message.id === active.assistantId
-            ? { ...message, answerStage: { stages: active.stages, priorVersions: active.priorVersions } } : message))
-        }
       }
       if (event.kind === 'tool') {
         setPromptActivity(
@@ -1151,7 +1284,7 @@ function App() {
       }
     }
     try {
-      const result = await executePrompt(requestId, trimmedPrompt, handleEvent, source)
+      const result = await executePrompt(requestId, prompt, handleEvent, source)
       const active = promptRef.current
       if (
         active === null ||
@@ -1174,7 +1307,7 @@ function App() {
         return stage
       })
       setMessages((current) => current.map((message) => message.id === active.assistantId
-        ? { ...message, answerStage: { stages: active.stages, priorVersions: active.priorVersions } }
+        ? { ...message, answerStage: { stages: active.stages, priorVersions: active.priorVersions, sources: active.sources } }
         : message))
       promptRef.current = null
       setPromptState('idle')
@@ -1200,7 +1333,7 @@ function App() {
           title: 'No response',
           message: 'No response was returned. Try again.',
         })
-      } else if (active.tts && ttsEnabledRef.current && !active.corrected) {
+      } else if (active.tts && ttsEnabledRef.current && !active.corrected && !active.ttsFirstLineSpoken) {
         void synthesizeAndPlayAssistantReply(active.text)
       }
     } catch (error) {
@@ -1224,7 +1357,7 @@ function App() {
       promptRef.current = null
       setMessages((current) => current
         .map((chatMessage) => chatMessage.id === active.assistantId
-          ? { ...chatMessage, answerStage: { stages: active.stages, priorVersions: active.priorVersions } }
+          ? { ...chatMessage, answerStage: { stages: active.stages, priorVersions: active.priorVersions, sources: active.sources } }
           : chatMessage)
         .filter((chatMessage) =>
           chatMessage.id !== active.assistantId || chatMessage.content.trim().length > 0,
@@ -1248,9 +1381,7 @@ function App() {
     cancelTts()
     setPromptState('stopping')
     void invokeTauriCommand('cancel_prompt', { requestId: active.id }).catch(() => {
-      if (promptRef.current === active && !active.terminal) {
-        setPromptState('executing')
-      }
+      if (promptRef.current === active && !active.terminal) setPromptState('executing')
     })
   }
 
@@ -1260,8 +1391,8 @@ function App() {
     const generation = ttsGenerationRef.current
 
     try {
-      const speechText = text.split(/\r?\n/, 1)[0]?.trim() ?? ''
-      if (speechText.length === 0) return
+      const speechText = firstNonEmptyCompletedLine(text) ?? ''
+      if (!isValidTtsFirstLine(speechText)) return
       const payload = await invokeTauriCommand('synthesize_local_tts', { text: speechText })
        if (generation !== ttsGenerationRef.current || !ttsEnabledRef.current) return
 
@@ -1383,6 +1514,7 @@ function App() {
     liveAudioSourceRef.current?.stop()
     liveAudioSourceRef.current = null
     voiceActivityStateRef.current = createVoiceActivityState()
+    resetWakeConfidence()
     setMicStarting(false)
     setMicActive(false)
     clearPartialTranscript()
@@ -1412,9 +1544,10 @@ function App() {
   }
 
   const startMic = async (): Promise<void> => {
-    if (!voiceInputReady(startupStateRef.current) || liveAudioSourceRef.current !== null || micStarting) {
+    if (!voiceInputReady(startupStateRef.current) || liveAudioSourceRef.current !== null || micStarting || micStartInFlightRef.current) {
       return
     }
+    micStartInFlightRef.current = true
 
     const liveAudioSessionId = liveAudioSessionIdRef.current + 1
     liveAudioSessionIdRef.current = liveAudioSessionId
@@ -1423,6 +1556,9 @@ function App() {
 
     try {
       const liveAudioSource = await startLiveAudioSource({
+        ...(audioInputDeviceIdRef.current === null
+          ? {}
+          : { deviceId: audioInputDeviceIdRef.current }),
         onFrame: async (frame) => {
           if (liveAudioSessionId !== liveAudioSessionIdRef.current) {
             return
@@ -1490,16 +1626,32 @@ function App() {
           }
         },
         onError: reportLiveAudioError,
+        onSelectedDeviceFallback: (attemptedDeviceId) => {
+          if (
+            liveAudioSessionId !== liveAudioSessionIdRef.current ||
+            audioInputDeviceIdRef.current !== attemptedDeviceId
+          ) {
+            return
+          }
+          audioInputDeviceIdRef.current = null
+          setAudioInputDeviceId(null)
+          persistAudioInputDeviceId(null)
+        },
       })
 
       if (!appActiveRef.current || liveAudioSessionId !== liveAudioSessionIdRef.current) {
         liveAudioSource.stop()
+        if (appActiveRef.current && voiceInputReady(startupStateRef.current)) {
+          micAutoStartedRef.current = false
+          queueMicrotask(() => void startMic())
+        }
         return
       }
 
       liveAudioSourceRef.current = liveAudioSource
-      setMicStarting(false)
-      setMicActive(true)
+       setMicStarting(false)
+       setMicActive(true)
+       persistAudioInputDeviceId(audioInputDeviceIdRef.current)
       setMessages((currentMessages) => [
         ...currentMessages,
         {
@@ -1510,11 +1662,18 @@ function App() {
       ])
     } catch (error) {
       if (!appActiveRef.current || liveAudioSessionId !== liveAudioSessionIdRef.current) {
+        if (appActiveRef.current && voiceInputReady(startupStateRef.current)) {
+          micAutoStartedRef.current = false
+          queueMicrotask(() => void startMic())
+        }
         return
       }
 
       setMicStarting(false)
+      micStartInFlightRef.current = false
       reportLiveAudioError(error)
+    } finally {
+      micStartInFlightRef.current = false
     }
   }
 
@@ -1525,6 +1684,18 @@ function App() {
     }
 
     void startMic()
+  }
+
+  const changeAudioInputDevice = (deviceId: string): void => {
+    const selectedDeviceId = deviceId.length === 0 ? null : deviceId
+    audioInputDeviceIdRef.current = selectedDeviceId
+    setAudioInputDeviceId(selectedDeviceId)
+
+    const shouldRestart = liveAudioSourceRef.current !== null
+    stopLiveAudio()
+    if (shouldRestart) {
+      queueMicrotask(() => void startMic())
+    }
   }
 
   const switchResponseProfile = async (profile: ResponseProfile): Promise<boolean> => {
@@ -1538,7 +1709,8 @@ function App() {
 
     const currentState = startupStateRef.current
 
-    if (currentState.selectedResponseProfile === profile) {
+    const profileInstant = profile === 'fast' ? 'local-fast' : 'local-quality'
+    if (currentState.selectedResponseProfile === profile && !localInstantCanRetry(currentState, profileInstant)) {
       return true
     }
 
@@ -1546,9 +1718,11 @@ function App() {
     cancelTts()
     clearPartialTranscript()
     setIsSwitchingResponseProfile(true)
+    const requestedCapabilityId = profile === 'quality' ? 'local_quality' : 'local_fast'
 
     const shouldReportMicStopForSwitch =
       micActive || micStarting || liveAudioSourceRef.current !== null
+    if (shouldReportMicStopForSwitch) micAutoStartedRef.current = false
     stopLiveAudio(
       shouldReportMicStopForSwitch
         ? 'live_audio:\ndefault microphone stopped for profile switch'
@@ -1569,8 +1743,17 @@ function App() {
           return { kind: 'loading' }
         }
 
-        applyStartupState(nextState)
-
+        if (nextState.kind === 'ready') {
+          const requestedCapability = nextState.capabilities.find(({ id }) => id === requestedCapabilityId)
+          if (requestedCapability !== undefined && requestedCapability.state !== 'warming') {
+            applyStartupState(nextState, true)
+            return nextState
+          }
+        }
+        if (nextState.kind === 'error') {
+          applyStartupState(nextState, false)
+          return nextState
+        }
         if (isStartupStateSettled(nextState)) {
           return nextState
         }
@@ -1601,17 +1784,42 @@ function App() {
     setRuntimeStatus('initializing')
 
     try {
-      await invokeTauriCommand('switch_response_profile', { profile })
+       await invokeTauriCommand('switch_response_profile', { profile })
 
-      const settled = await settleStartupState()
+       const settled = await settleStartupState()
+      const requestedCapability = settled.kind === 'ready'
+        ? settled.capabilities.find(({ id }) => id === requestedCapabilityId)
+        : undefined
+      if (settled.kind === 'ready' &&
+        (settled.selectedResponseProfile !== profile || requestedCapability?.state !== 'available')) {
+        const message = requestedCapability?.reason ?? `The ${getResponseProfileLabel(profile)} profile could not be started.`
+        addNotice({ tone: 'error', title: 'Profile switch failed', message })
+        recordRuntimeDiagnostic('profile', `Response profile switch error: ${message}`)
+        applyStartupState(currentState)
+        return false
+      }
+      if (settled.kind === 'error') {
+        return false
+      }
+      if (settled.kind !== 'ready' || settled.selectedResponseProfile !== profile) {
+        applyStartupState(currentState)
+        return false
+      }
       return settled.kind === 'ready' && settled.selectedResponseProfile === profile
     } catch (error) {
       try {
-        await settleStartupState()
+        const settled = await settleStartupState()
+        if (settled.kind === 'ready' || settled.kind === 'warming_model') {
+          applyStartupState(currentState)
+        }
       } catch {
         if (appActiveRef.current) {
           applyStartupState(currentState)
         }
+      }
+
+      if (appActiveRef.current && startupStateRef.current.kind === 'warming_model') {
+        applyStartupState(currentState)
       }
 
       if (appActiveRef.current) {
@@ -1636,9 +1844,7 @@ function App() {
   const toggleTts = async (enabled: boolean): Promise<void> => {
     const revision = ++ttsWriteRevisionRef.current
     const previousEnabled = ttsEnabled
-    ttsEnabledRef.current = enabled
     if (!enabled) cancelTts()
-    setTtsEnabled(enabled)
 
     try {
       const write = ttsWriteChainRef.current.then(() =>
@@ -1692,22 +1898,19 @@ function App() {
   }, [micActive, micStarting, startupState])
 
   const sendPrompt = async (): Promise<void> => {
-    if (startupState.kind !== 'ready' || selectedInstantOption?.available !== true || assistantSettingsPending || isSwitchingResponseProfileRef.current || resetPendingRef.current) {
+    if (startupState.kind !== 'ready' || selectedInstantOption?.available !== true || assistantSettingsPending || isSwitchingResponseProfileRef.current || resetPendingRef.current || promptState !== 'idle' || runtimeStatusRef.current !== 'sleeping') {
       return
     }
 
-    const prompt = composerValue.trim()
-
-    if (prompt.length === 0) {
+    if (composerValue.trim().length === 0) {
       return
     }
 
-    await runPrompt(prompt, 'typed')
+    await runPrompt(composerValue, 'typed')
   }
 
   const onSubmit = (event: FormEvent<HTMLFormElement>): void => {
     event.preventDefault()
-    clearCompletion()
     void sendPrompt()
   }
 
@@ -1726,24 +1929,7 @@ function App() {
     if (suffix.length === 0) return
     const nextValue = `${composerValue}${suffix}`
     setComposerValue(nextValue)
-    setTypedCompletionSuffix('')
-    setVoiceCompletionSuffix('')
-    completionRevisionRef.current += 1
-    const revision = completionRevisionRef.current
-    if (
-      assistantSettings.completion &&
-      !assistantSettingsPendingRef.current &&
-      startupStateRef.current.kind === 'ready' &&
-      capabilityIsAvailable(startupStateRef.current, 'qwen_prediction')
-    ) {
-      const pending = { revision, lifecycle: completionLifecycleRef.current }
-      latestTypedCompletionRef.current = pending
-      void invokeTauriCommand('request_completion', { revision, prompt: nextValue }).catch(() => {
-        if (latestTypedCompletionRef.current === pending) latestTypedCompletionRef.current = null
-      })
-    } else {
-      latestTypedCompletionRef.current = null
-    }
+    clearCompletionDisplay()
   }
 
   const selectedDeepOption = deepOptions(assistantCapabilities).find((option) => option.value === assistantSettings.deep)
@@ -1901,10 +2087,29 @@ function App() {
                 </button>
               </div>
             </div>
+            <div className="settings-panel__row">
+              <div>
+                <label htmlFor="audioInputDevice"><strong>Microphone</strong></label>
+                <p className="settings-panel__hint">Choose the input used for wake-word listening.</p>
+              </div>
+              <select
+                id="audioInputDevice"
+                aria-label="Microphone"
+                value={audioInputDeviceId ?? ''}
+                disabled={micStarting}
+                onChange={(event) => changeAudioInputDevice(event.target.value)}
+              >
+                <option value="">System selected microphone</option>
+                {audioInputDevices.map((device) => (
+                  <option key={device.deviceId} value={device.deviceId}>{device.label}</option>
+                ))}
+              </select>
+            </div>
             <div className="settings-panel__assistant">
               <label><strong>Instant</strong><select id="assistantInstantSelect" aria-label="Instant" value={assistantSettings.instant} disabled={assistantControlsDisabled} onChange={(event) => void changeInstant(event.target.value as AssistantSettings['instant'])}>
-                {instantOptions(assistantCapabilities).map((option) => <option key={option.value} value={option.value} disabled={!option.available} title={option.reason}>{option.label}{option.available ? '' : ` — ${option.reason}`}</option>)}
+                {instantOptions(assistantCapabilities).map((option) => <option key={option.value} value={option.value} disabled={!option.available && !localInstantCanRetry(startupState, option.value)} title={option.reason}>{option.label}{option.available ? '' : ` — ${option.reason}`}</option>)}
               </select></label>
+              {selectedInstantRetryable ? <button type="button" aria-label="Retry local profile" onClick={() => void changeInstant(assistantSettings.instant)}>Retry local profile</button> : null}
               <label><strong>Deep model</strong><select aria-label="Deep model" value={assistantSettings.deep} disabled={assistantControlsDisabled} onChange={(event) => {
                 const value = event.target.value as AssistantSettings['deep']
                 if (deepOptions(assistantCapabilities).find((option) => option.value === value)?.available) {
@@ -2038,14 +2243,9 @@ function App() {
                 {promptState === 'stopping' ? 'Stopping…' : 'Stop'}
               </button>
             ) : null}
-            {wakeConfidence !== null ? (
-              <div
-                className={wakeConfidence >= 0.7 ? 'composer__wake composer__wake--high' : wakeConfidence >= 0.4 ? 'composer__wake composer__wake--medium' : 'composer__wake composer__wake--low'}
-                aria-live="polite"
-              >
-                <span className="composer__wake-primary">
-                  wake: {(wakeConfidence * 100).toFixed(0)}%
-                </span>
+            {runtimeStatus === 'sleeping' && wakeConfidence !== null ? (
+              <div className={wakeConfidence >= 0.7 ? 'composer__wake composer__wake--high' : wakeConfidence >= 0.4 ? 'composer__wake composer__wake--medium' : 'composer__wake composer__wake--low'}>
+                <span className="composer__wake-primary">wake: {(wakeConfidence * 100).toFixed(2)}%</span>
               </div>
             ) : null}
             <button
@@ -2131,6 +2331,19 @@ function capabilityIsAvailable(
 ): boolean {
   return (state.kind === 'ready' || state.kind === 'warming_model') &&
     state.capabilities.some((capability) => capability.id === id && capability.state === 'available')
+}
+
+function localInstantCanRetry(
+  state: StartupState,
+  instant: AssistantSettings['instant'],
+): boolean {
+  const capabilityId = instant === 'local-fast'
+    ? 'local_fast'
+    : instant === 'local-quality'
+      ? 'local_quality'
+      : null
+  return capabilityId !== null && state.kind === 'ready' &&
+    state.capabilities.some((capability) => capability.id === capabilityId && capability.state === 'failed')
 }
 
 function hasAvailableCapabilities(

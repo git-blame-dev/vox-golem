@@ -83,26 +83,35 @@ describe('prompt payload parsing', () => {
     expect(parsePromptExecutionEvent({
       request_id: 'request-1',
       kind: 'correction',
+      stage: 'deep',
       text: 'Corrected answer',
       correction: 'Correction: Use the verified value.',
     })).toEqual({
       requestId: 'request-1',
       kind: 'correction',
+      stage: 'deep',
       text: 'Corrected answer',
       correction: 'Correction: Use the verified value.',
     })
     expect(() => parsePromptExecutionEvent({
       request_id: 'request-1',
       kind: 'correction',
+      stage: 'other',
       text: '',
       correction: 'not a correction',
-    })).toThrow('Correction event must include text and correction')
+    })).toThrow('Correction event must include stage')
+    expect(() => parsePromptExecutionEvent({
+      request_id: 'request-1',
+      kind: 'correction',
+      text: 'Corrected answer',
+      correction: 'Correction: Use the verified value.',
+    })).toThrow('Correction event must include stage')
     expect(() => parsePromptExecutionEvent({
       request_id: 'request-1',
       kind: 'correction',
       text: 'Corrected answer',
       correction: 'Correction: ',
-    })).toThrow('Correction event must include text and correction')
+    })).toThrow('Correction event must include stage')
   })
 
   it('rejects invalid result and event payloads', () => {
@@ -116,6 +125,23 @@ describe('prompt payload parsing', () => {
         detail: '',
       }),
     ).toThrow()
+  })
+
+  it('validates source title byte boundaries and complete source batches', () => {
+    const title = (value: string) => ({ url: `https://example.com/${value.length}`, title: value })
+    const ascii = (length: number) => 'a'.repeat(length)
+    const unicode = '界'.repeat(170)
+    const unicode512 = '😀'.repeat(128)
+
+    for (const length of [256, 257]) {
+      expect(parsePromptExecutionEvent({ request_id: 'request-1', kind: 'sources', sources: [title(ascii(length))] })).toMatchObject({ kind: 'sources' })
+    }
+    expect(parsePromptExecutionEvent({ request_id: 'request-1', kind: 'sources', sources: [title(ascii(512))] })).toMatchObject({ kind: 'sources' })
+    expect(parsePromptExecutionEvent({ request_id: 'request-1', kind: 'sources', sources: [title(unicode)] })).toMatchObject({ kind: 'sources' })
+    expect(parsePromptExecutionEvent({ request_id: 'request-1', kind: 'sources', sources: [title(unicode512)] })).toMatchObject({ kind: 'sources' })
+    expect(() => parsePromptExecutionEvent({ request_id: 'request-1', kind: 'sources', sources: [title('界'.repeat(171))] })).toThrow('Sources event')
+    expect(parsePromptExecutionEvent({ request_id: 'request-1', kind: 'sources', sources: [title(ascii(256)), title(ascii(512))] })).toMatchObject({ kind: 'sources' })
+    expect(() => parsePromptExecutionEvent({ request_id: 'request-1', kind: 'sources', sources: [title(ascii(256)), title('界'.repeat(171))] })).toThrow('Sources event')
   })
 })
 

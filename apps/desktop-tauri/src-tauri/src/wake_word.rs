@@ -51,6 +51,10 @@ impl WakeWordRuntime {
         self.inner.reset();
     }
 
+    pub fn latest_confidence(&self) -> Option<f32> {
+        self.inner.detector.latest_confidence()
+    }
+
     #[cfg(test)]
     pub(crate) fn new_failing_for_test() -> Self {
         Self {
@@ -172,8 +176,15 @@ impl WakeWordScorer for LiveKitScorer {
 
         let mut top_scores = predictions
             .into_iter()
-            .map(|(label, confidence)| WakeWordScore { label, confidence })
-            .collect::<Vec<_>>();
+            .map(|(label, confidence)| {
+                if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
+                    return Err(String::from(
+                        "wake word classifier returned invalid confidence",
+                    ));
+                }
+                Ok(WakeWordScore { label, confidence })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         top_scores.sort_by(|left, right| {
             right
                 .confidence
@@ -202,6 +213,7 @@ struct LiveKitDetector<S> {
     required_consecutive_hits: usize,
     consecutive_hits: usize,
     consecutive_floor_score: Option<f32>,
+    latest_confidence: Option<f32>,
 }
 
 impl<S: WakeWordScorer> LiveKitDetector<S> {
@@ -231,7 +243,12 @@ impl<S: WakeWordScorer> LiveKitDetector<S> {
             required_consecutive_hits,
             consecutive_hits: 0,
             consecutive_floor_score: None,
+            latest_confidence: None,
         }
+    }
+
+    fn latest_confidence(&self) -> Option<f32> {
+        self.latest_confidence
     }
 }
 
@@ -254,11 +271,21 @@ impl<S: WakeWordScorer> WakeWordDetector for LiveKitDetector<S> {
         }
 
         let score_snapshot = self.scorer.score(&self.rolling_samples)?;
-        let score = score_snapshot
+        let Some(score) = score_snapshot
             .top_scores
             .first()
             .map(|entry| entry.confidence)
-            .unwrap_or(0.0);
+        else {
+            self.reset();
+            return Err(String::from("wake word classifier returned no confidence"));
+        };
+        if !score.is_finite() || !(0.0..=1.0).contains(&score) {
+            self.reset();
+            return Err(String::from(
+                "wake word classifier returned invalid confidence",
+            ));
+        }
+        self.latest_confidence = Some(score);
         if score >= self.detection_threshold {
             self.consecutive_floor_score = Some(
                 self.consecutive_floor_score
@@ -281,6 +308,7 @@ impl<S: WakeWordScorer> WakeWordDetector for LiveKitDetector<S> {
         self.rolling_samples.clear();
         self.consecutive_hits = 0;
         self.consecutive_floor_score = None;
+        self.latest_confidence = None;
     }
 }
 
@@ -466,6 +494,20 @@ mod tests {
     }
 
     #[test]
+    fn livekit_detector_exposes_latest_score_below_threshold() {
+        let scorer = FakeScorer {
+            scores: vec![0.00114],
+            seen_chunks: Vec::new(),
+        };
+        let mut detector = LiveKitDetector::with_settings(scorer, 4, 8, 0.2, 1);
+
+        assert_eq!(detector.process_samples(&[0.1, 0.2, 0.3, 0.4]), Ok(None));
+        assert_eq!(detector.latest_confidence(), None);
+        assert_eq!(detector.process_samples(&[0.5, 0.6, 0.7, 0.8]), Ok(None));
+        assert_eq!(detector.latest_confidence(), Some(0.00114));
+    }
+
+    #[test]
     fn livekit_detector_keeps_only_most_recent_window() {
         let scorer = FakeScorer {
             scores: vec![0.2, 0.2],
@@ -498,6 +540,42 @@ mod tests {
         assert_eq!(normalize_sample_to_i16(1.0), i16::MAX);
         assert_eq!(normalize_sample_to_i16(-1.0), i16::MIN);
         assert_eq!(normalize_sample_to_i16(0.0), 0);
+    }
+
+    #[test]
+    fn livekit_detector_rejects_invalid_scores_and_resets_state() {
+        let scorer = FakeScorer {
+            scores: vec![f32::NAN],
+            seen_chunks: Vec::new(),
+        };
+        let mut detector = LiveKitDetector::with_settings(scorer, 4, 8, 0.5, 1);
+
+        assert_eq!(
+            detector.process_samples(&[0.0; 8]),
+            Err(String::from(
+                "wake word classifier returned invalid confidence"
+            ))
+        );
+        assert_eq!(detector.latest_confidence(), None);
+        assert_eq!(detector.consecutive_hits, 0);
+        assert!(detector.rolling_samples.is_empty());
+    }
+
+    #[test]
+    fn livekit_detector_rejects_scores_above_one_without_triggering() {
+        let scorer = FakeScorer {
+            scores: vec![1.1],
+            seen_chunks: Vec::new(),
+        };
+        let mut detector = LiveKitDetector::with_settings(scorer, 4, 8, 0.5, 1);
+
+        assert_eq!(
+            detector.process_samples(&[0.0; 8]),
+            Err(String::from(
+                "wake word classifier returned invalid confidence"
+            ))
+        );
+        assert_eq!(detector.latest_confidence(), None);
     }
 
     #[test]

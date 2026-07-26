@@ -187,7 +187,8 @@ export function parseResponseProfileState(payload: unknown): ResponseProfileStat
 }
 
 export function isStartupStateSettled(state: StartupState): boolean {
-  return state.kind === 'ready' || state.kind === 'error'
+  return state.kind === 'error' ||
+    (state.kind === 'ready' && !state.capabilities.some((capability) => capability.state === 'warming'))
 }
 
 function parseRuntimePhase(payload: unknown): BackendRuntimePhase {

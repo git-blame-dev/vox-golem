@@ -4,6 +4,7 @@ import type {
   PromptExecutionEvent,
   PromptExecutionResult,
 } from '../types/chat'
+import type { AnswerSource } from '../components/AnswerStage'
 
 export function parsePromptExecutionEvent(payload: unknown): PromptExecutionEvent {
   if (!isRecord(payload)) {
@@ -27,16 +28,31 @@ export function parsePromptExecutionEvent(payload: unknown): PromptExecutionEven
   if (kind === 'correction') {
     const text = payload['text']
     const correction = payload['correction']
+    const stage = payload['stage']
     if (
+      !isStage(stage) ||
       typeof text !== 'string' ||
       text.trim().length === 0 ||
       typeof correction !== 'string' ||
       !correction.startsWith('Correction: ') ||
       correction.slice('Correction: '.length).trim().length === 0
     ) {
-      throw new Error('Correction event must include text and correction')
+      throw new Error('Correction event must include stage, text, and correction')
     }
-    return { requestId, kind, text, correction }
+    return { requestId, kind, stage, text, correction }
+  }
+
+  if (kind === 'stage') {
+    const stage = payload['stage']
+    const status = payload['status']
+    const detail = payload['detail']
+    if (!isStage(stage) || !isStageStatus(status) || (detail !== undefined && typeof detail !== 'string')) throw new Error('Stage event must include typed stage and status')
+    return { requestId, kind, stage, status, ...(detail === undefined ? {} : { detail }) }
+  }
+  if (kind === 'sources') {
+    const sources = payload['sources']
+    if (!Array.isArray(sources) || sources.length > 32 || !sources.every(isSource)) throw new Error('Sources event must include bounded URL/title pairs')
+    return { requestId, kind, sources: sources as AnswerSource[] }
   }
 
   if (kind === 'status') {
@@ -148,6 +164,12 @@ export async function executePrompt(
 
 function isToolStatus(value: unknown): value is 'pending' | 'running' | 'completed' | 'error' {
   return value === 'pending' || value === 'running' || value === 'completed' || value === 'error'
+}
+function isStage(value: unknown): value is 'instant' | 'deep' | 'review' { return value === 'instant' || value === 'deep' || value === 'review' }
+function isStageStatus(value: unknown): value is import('../components/AnswerStage').AnswerStageStatus { return ['queued', 'running', 'completed', 'kept', 'corrected', 'cancelled', 'failed', 'stale'].includes(value as string) }
+function isSource(value: unknown): value is AnswerSource {
+  if (!isRecord(value) || typeof value['url'] !== 'string' || typeof value['title'] !== 'string' || value['title'].trim() === '' || new TextEncoder().encode(value['title']).length > 512) return false
+  try { const url = new URL(value['url']); return (url.protocol === 'http:' || url.protocol === 'https:') && value['url'].length <= 2048 } catch { return false }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

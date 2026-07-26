@@ -208,6 +208,18 @@ impl CustomOpenAiClient {
     pub async fn respond<F>(
         &self,
         prompt: &CustomOpenAiPrompt,
+        on_delta: F,
+    ) -> Result<CustomOpenAiResponse, CustomOpenAiError>
+    where
+        F: FnMut(&str),
+    {
+        self.respond_with_instructions(prompt, None, on_delta).await
+    }
+
+    pub async fn respond_with_instructions<F>(
+        &self,
+        prompt: &CustomOpenAiPrompt,
+        instructions: Option<&str>,
         mut on_delta: F,
     ) -> Result<CustomOpenAiResponse, CustomOpenAiError>
     where
@@ -224,7 +236,7 @@ impl CustomOpenAiClient {
         let mut account_id = HeaderValue::from_str(&credential.account_id)
             .map_err(|_| CustomOpenAiError::AuthUnavailable)?;
         account_id.set_sensitive(true);
-        let request = build_request(&self.config, prompt);
+        let request = build_request(&self.config, prompt, instructions);
         let response = self
             .client
             .post(&self.config.endpoint)
@@ -363,7 +375,11 @@ fn valid_endpoint(endpoint: &str) -> bool {
     }
 }
 
-fn build_request(config: &CustomOpenAiConfig, prompt: &CustomOpenAiPrompt) -> Value {
+fn build_request(
+    config: &CustomOpenAiConfig,
+    prompt: &CustomOpenAiPrompt,
+    instructions: Option<&str>,
+) -> Value {
     let input = prompt
         .history
         .iter()
@@ -388,7 +404,7 @@ fn build_request(config: &CustomOpenAiConfig, prompt: &CustomOpenAiPrompt) -> Va
         .collect::<Vec<_>>();
     json!({
         "model": config.model.model_id(),
-        "instructions": DEFAULT_INSTRUCTIONS,
+        "instructions": instructions.unwrap_or(DEFAULT_INSTRUCTIONS),
         "input": input,
         "reasoning": { "effort": config.model.reasoning_effort() },
         "stream": true,
@@ -862,15 +878,34 @@ mod tests {
             model: CustomOpenAiModel::LunaLow,
             ..CustomOpenAiConfig::default()
         };
-        let request = build_request(&config, &prompt());
+        let request = build_request(&config, &prompt(), None);
 
         assert_eq!(request["model"], "gpt-5.6-luna");
         assert_eq!(request["reasoning"]["effort"], "low");
         assert_eq!(request["stream"], true);
         assert_eq!(request["store"], false);
         assert!(request.get("tools").is_none());
+        assert_eq!(request["instructions"], DEFAULT_INSTRUCTIONS);
         assert_eq!(request["input"][0]["content"][0]["type"], "refusal");
         assert_eq!(request["input"][1]["content"][0]["text"], "Say hello");
+    }
+
+    #[test]
+    fn stage_instructions_replace_instant_defaults_without_inheriting_prose() {
+        let config = CustomOpenAiConfig::default();
+        let request = build_request(
+            &config,
+            &prompt(),
+            Some("Return strict JSON only: {\"answer\": string}"),
+        );
+        assert_eq!(
+            request["instructions"],
+            "Return strict JSON only: {\"answer\": string}"
+        );
+        assert!(!request["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("First line"));
     }
 
     #[test]
@@ -882,7 +917,7 @@ mod tests {
             content_type: CustomOpenAiContentType::Refusal,
             text: "Earlier question".to_string(),
         }];
-        let request = build_request(&config, &prompt);
+        let request = build_request(&config, &prompt, None);
         assert_eq!(request["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(
             request["input"][0]["content"][0]["text"],
