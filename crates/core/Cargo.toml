@@ -2,11 +2,15 @@
 name = "voxgolem-core"
 edition.workspace = true
 
+[features]
+default = ["voice-pipeline"]
+voice-pipeline = ["dep:voxgolem-audio", "dep:voxgolem-model"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-voxgolem-audio = { path = "../audio" }
-voxgolem-model = { path = "../model" }
+voxgolem-audio = { path = "../audio", optional = true }
+voxgolem-model = { path = "../model", optional = true }
 
 [lints]
 workspace = true

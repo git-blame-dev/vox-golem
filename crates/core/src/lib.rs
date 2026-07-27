@@ -6,7 +6,9 @@ pub mod assistant;
 pub mod config;
 pub mod runtime;
 pub mod session;
+#[cfg(feature = "voice-pipeline")]
 pub mod turn_capture;
+#[cfg(feature = "voice-pipeline")]
 pub mod voice_pipeline;
 pub mod voice_turn;
 
