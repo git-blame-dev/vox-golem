@@ -11,6 +11,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tauri::ipc::Channel;
 use tauri::{Emitter, Manager};
 
 #[cfg(windows)]
@@ -156,6 +157,7 @@ struct ActivePrompt {
     terminal_published: Arc<AtomicBool>,
     publication_epoch: u64,
     terminal_kind: Arc<Mutex<Option<TerminalKind>>>,
+    updates: Arc<Mutex<Option<Channel<PromptExecutionEventPayload>>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -640,13 +642,6 @@ enum StageStatusPayload {
 struct SourcePayload {
     url: String,
     title: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct PromptEventEnvelope {
-    request_id: String,
-    #[serde(flatten)]
-    event: PromptExecutionEventPayload,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2628,6 +2623,7 @@ async fn submit_prompt(
     request_id: String,
     prompt: String,
     source: Option<CompletionSource>,
+    updates: Channel<PromptExecutionEventPayload>,
     app: tauri::AppHandle,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<PromptFinalPayload, String> {
@@ -2649,6 +2645,11 @@ async fn submit_prompt(
         control: active_prompt_control,
         guard: active_prompt_guard,
     } = registered;
+    active_prompt_control
+        .updates
+        .lock()
+        .map_err(|_| String::from("prompt update channel lock is poisoned"))?
+        .replace(updates);
     let is_opencode = opencode_client.is_some();
     cancel_active_tts_generation(&app_state);
     if assistant_request.preferences.deep_enabled {
@@ -4838,7 +4839,7 @@ fn emit_prompt_event_controlled(
     let _publication_guard = state.prompt_publication_gate.lock().map_err(|_| {
         PromptControlError::Error(String::from("prompt publication gate is poisoned"))
     })?;
-    {
+    let (updates, execution_id) = {
         let active = state.active_prompt.lock().map_err(|_| {
             PromptControlError::Error(String::from("active prompt lock is poisoned"))
         })?;
@@ -4855,15 +4856,29 @@ fn emit_prompt_event_controlled(
         } else if active.cancelled.load(Ordering::Acquire) {
             return Err(PromptControlError::Cancelled);
         }
+        let updates = active
+            .updates
+            .lock()
+            .map_err(|_| {
+                PromptControlError::Error(String::from("prompt update channel lock is poisoned"))
+            })?
+            .clone();
+        (updates, active.assistant_generation)
+    };
+    if terminal {
+        return Ok(());
     }
-    app.emit(
-        "prompt-execution-event",
-        PromptEventEnvelope {
-            request_id: request_id.to_string(),
-            event,
-        },
-    )
-    .map_err(|error| PromptControlError::Error(format!("failed to emit prompt event: {error}")))
+    let Some(updates) = updates else {
+        return Err(PromptControlError::Error(String::from(
+            "prompt update channel is unavailable",
+        )));
+    };
+    if updates.send(event).is_err() {
+        drop(_publication_guard);
+        let _ = cancel_assistant_request(&state, execution_id);
+        return Err(PromptControlError::Cancelled);
+    }
+    Ok(())
 }
 
 fn prompt_event_identity_matches(active: &ActivePrompt, request_id: &str, generation: u64) -> bool {
@@ -4873,7 +4888,7 @@ fn prompt_event_identity_matches(active: &ActivePrompt, request_id: &str, genera
 fn emit_terminal_prompt_event_controlled(
     app: &tauri::AppHandle,
     active: &ActivePrompt,
-    event: PromptExecutionEventPayload,
+    _event: PromptExecutionEventPayload,
 ) -> Result<(), PromptControlError> {
     let state = app.state::<AppState>();
     let _publication_guard = state.prompt_publication_gate.lock().map_err(|_| {
@@ -4897,14 +4912,7 @@ fn emit_terminal_prompt_event_controlled(
     ) {
         return Err(PromptControlError::Cancelled);
     }
-    app.emit(
-        "prompt-execution-event",
-        PromptEventEnvelope {
-            request_id: active.request_id.clone(),
-            event,
-        },
-    )
-    .map_err(|error| PromptControlError::Error(format!("failed to emit prompt event: {error}")))
+    Ok(())
 }
 
 fn claim_cancelled_prompt_publication(active: &ActivePrompt) -> bool {
@@ -5014,6 +5022,7 @@ fn register_active_prompt(
         terminal_published,
         publication_epoch,
         terminal_kind,
+        updates: Arc::new(Mutex::new(None)),
     });
     Ok((generation, cancelled, cancellation_signal, settled))
 }
@@ -5263,23 +5272,29 @@ async fn stream_opencode_prompt(
 async fn cancel_prompt(
     request_id: String,
     app_state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    cancel_active_tts_generation(&app_state);
-    let active = app_state
+) -> Result<bool, String> {
+    cancel_prompt_if_active(&app_state, &request_id)
+}
+
+fn cancel_prompt_if_active(app_state: &AppState, request_id: &str) -> Result<bool, String> {
+    cancel_active_tts_generation(app_state);
+    let Some(active) = app_state
         .active_prompt
         .lock()
         .map_err(|_| String::from("active prompt lock is poisoned"))?
         .as_ref()
         .filter(|active| active.request_id == request_id)
         .cloned()
-        .ok_or_else(|| String::from("prompt request is no longer active"))?;
+    else {
+        return Ok(false);
+    };
     if !matches!(
-        cancel_assistant_request(&app_state, active.assistant_generation),
+        cancel_assistant_request(app_state, active.assistant_generation),
         voxgolem_core::conversation::SettlementResult::Applied(
             voxgolem_core::conversation::AppliedOutcome::Cancelled
         )
     ) {
-        return Err(String::from("prompt request is no longer active"));
+        return Ok(false);
     }
     {
         let _publication_guard = app_state
@@ -5287,7 +5302,7 @@ async fn cancel_prompt(
             .lock()
             .map_err(|_| String::from("prompt publication gate is poisoned"))?;
     }
-    Ok(())
+    Ok(true)
 }
 
 #[tauri::command]
@@ -9367,11 +9382,10 @@ mod tests {
         wake_word_event_timestamp, ActivePromptGuard, AgentChoicePayload, AssistantSettingsPayload,
         CapabilityPayload, CapabilityStatePayload, CommitAssistantResult, CueAssetPathsPayload,
         DeepStageResult, DeepTask, InstantChoicePayload, PrefetchEntry, PrefetchKey,
-        PromptEventEnvelope, PromptExecutionEventPayload, ResponseProfilePayload,
-        RuntimePhasePayload, RuntimePhaseResponsePayload, RuntimeTelemetryPayload, StagePayload,
-        StageStatusPayload, StartupStatePayload, SupervisedCreation, TerminalKind,
-        UiTextSizePayload, UiThemePayload, DEFAULT_SILENCE_TIMEOUT_MS, PROMPT_MAX_BYTES,
-        PROVIDER_HISTORY_MAX_BYTES,
+        PromptExecutionEventPayload, ResponseProfilePayload, RuntimePhasePayload,
+        RuntimePhaseResponsePayload, RuntimeTelemetryPayload, StagePayload, StageStatusPayload,
+        StartupStatePayload, SupervisedCreation, TerminalKind, UiTextSizePayload, UiThemePayload,
+        DEFAULT_SILENCE_TIMEOUT_MS, PROMPT_MAX_BYTES, PROVIDER_HISTORY_MAX_BYTES,
     };
 
     #[test]
@@ -9859,18 +9873,15 @@ mod tests {
     }
 
     #[test]
-    fn prompt_event_envelope_serializes_flattened_stream_contract() {
-        let payload = serde_json::to_value(PromptEventEnvelope {
-            request_id: String::from("request-7"),
-            event: PromptExecutionEventPayload::Tool {
-                tool: String::from("bash"),
-                status: String::from("running"),
-                detail: String::from("Checking status"),
-            },
+    fn prompt_update_serializes_without_request_correlation() {
+        let payload = serde_json::to_value(PromptExecutionEventPayload::Tool {
+            tool: String::from("bash"),
+            status: String::from("running"),
+            detail: String::from("Checking status"),
         })
-        .expect("prompt event should serialize");
+        .expect("prompt update should serialize");
 
-        assert_eq!(payload["request_id"], "request-7");
+        assert!(payload.get("request_id").is_none());
         assert_eq!(payload["kind"], "tool");
         assert_eq!(payload["tool"], "bash");
         assert_eq!(payload["status"], "running");
@@ -9878,14 +9889,43 @@ mod tests {
     }
 
     #[test]
+    fn prompt_update_channel_delivers_the_typed_payload() {
+        let delivered = Arc::new(Mutex::new(None));
+        let delivered_for_channel = Arc::clone(&delivered);
+        let channel = tauri::ipc::Channel::new(move |body| {
+            let tauri::ipc::InvokeResponseBody::Json(json) = body else {
+                panic!("prompt update should use JSON IPC");
+            };
+            delivered_for_channel.lock().unwrap().replace(json);
+            Ok(())
+        });
+
+        channel
+            .send(PromptExecutionEventPayload::Text {
+                text: String::from("hello"),
+            })
+            .unwrap();
+
+        let payload: serde_json::Value = serde_json::from_str(
+            delivered
+                .lock()
+                .unwrap()
+                .as_deref()
+                .expect("channel should receive an update"),
+        )
+        .unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({ "kind": "text", "text": "hello" })
+        );
+    }
+
+    #[test]
     fn stage_event_serialization_uses_typed_lifecycle_values() {
-        let payload = serde_json::to_value(PromptEventEnvelope {
-            request_id: String::from("request-8"),
-            event: PromptExecutionEventPayload::Stage {
-                stage: StagePayload::Review,
-                status: StageStatusPayload::Corrected,
-                detail: Some(String::from("material defect corrected")),
-            },
+        let payload = serde_json::to_value(PromptExecutionEventPayload::Stage {
+            stage: StagePayload::Review,
+            status: StageStatusPayload::Corrected,
+            detail: Some(String::from("material defect corrected")),
         })
         .expect("stage event should serialize");
         assert_eq!(payload["kind"], "stage");
@@ -10631,6 +10671,43 @@ mod tests {
             RuntimePhasePayload::Executing
         );
         drop(next);
+    }
+
+    #[test]
+    fn cancel_prompt_reports_only_a_matching_active_execution() {
+        let app_state = super::build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            CueAssetPathsPayload {
+                start_listening: String::from("start"),
+                stop_listening: String::from("stop"),
+            },
+            String::from("test"),
+        );
+        assert_eq!(
+            super::cancel_prompt_if_active(&app_state, "missing"),
+            Ok(false)
+        );
+
+        let request = super::begin_registered_assistant_request(
+            &app_state,
+            "request",
+            "prompt",
+            super::CompletionSource::Typed,
+        )
+        .unwrap();
+        assert_eq!(
+            super::cancel_prompt_if_active(&app_state, "other"),
+            Ok(false)
+        );
+        assert_eq!(
+            super::cancel_prompt_if_active(&app_state, "request"),
+            Ok(true)
+        );
+        assert_eq!(
+            super::cancel_prompt_if_active(&app_state, "request"),
+            Ok(false)
+        );
+        drop(request);
     }
 
     #[test]

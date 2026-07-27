@@ -135,9 +135,26 @@ export async function executePrompt(
     }
   }
 
-  if (tauri.listen === undefined) {
-    throw new Error('Prompt execution requires streaming listener support')
+  if (tauri.createChannel !== undefined) {
+    const updates = tauri.createChannel<unknown>((payload) => {
+      try {
+        if (!isRecord(payload) || 'request_id' in payload) return
+        const parsed = parsePromptExecutionEvent({ ...payload, request_id: requestId })
+        if (parsed.kind !== 'completed' && parsed.kind !== 'cancelled') onEvent(parsed)
+      } catch {
+        // Ignore malformed channel updates; the correlated command result remains authoritative.
+      }
+    })
+
+    const payload = await tauri.invoke('submit_prompt', { requestId, prompt, source, updates })
+    const result = parsePromptExecutionResult(payload)
+    if (result.requestId !== requestId) {
+      throw new Error('Prompt response request ID did not match the active request')
+    }
+    return result
   }
+
+  if (tauri.listen === undefined) throw new Error('Prompt execution requires streaming listener support')
 
   const unlisten = await tauri.listen('prompt-execution-event', (event) => {
     try {

@@ -1,4 +1,5 @@
 import {
+  Channel as tauriChannel,
   convertFileSrc as tauriConvertFileSrc,
   invoke as tauriInvoke,
   isTauri,
@@ -16,6 +17,7 @@ export interface TauriInternals {
     event: string,
     handler: (event: TauriEvent) => void,
   ) => Promise<() => void>
+  readonly createChannel?: <T>(handler: (message: T) => void) => unknown
 }
 
 declare global {
@@ -57,6 +59,7 @@ function createTauriApi(): TauriInternals {
     invoke: (command, args) => tauriInvoke(command, args as Parameters<typeof tauriInvoke>[1]),
     convertFileSrc: tauriConvertFileSrc,
     listen: (event, handler) => tauriListen(event, handler),
+    createChannel: <T>(handler: (message: T) => void) => new tauriChannel(handler),
   }
 }
 
