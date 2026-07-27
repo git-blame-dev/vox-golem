@@ -1,5 +1,5 @@
 use crate::assistant::{
-    resolve_with_stage, AssistantPolicy, AssistantState, Content, InstantOutcome, Role, Stage,
+    resolve_with_stage, AssistantPolicy, Content, DeepOutcome, InstantOutcome, Role, Stage,
     StageResult,
 };
 use serde::{Deserialize, Serialize};
@@ -115,7 +115,9 @@ pub struct ConversationSnapshot {
 #[derive(Debug, Clone)]
 struct Active {
     snapshot: AdmissionSnapshot,
-    state: AssistantState,
+    instant: Option<InstantOutcome>,
+    deep: Option<DeepOutcome>,
+    review: Option<crate::assistant::ReviewOutcome>,
     resolved: Option<(Content, Stage)>,
 }
 #[derive(Debug, Clone)]
@@ -152,11 +154,48 @@ impl ConversationSession {
     pub fn turns(&self) -> &[Turn] {
         &self.turns
     }
+    pub fn has_active_execution(&self) -> bool {
+        self.active.is_some()
+    }
+    pub fn provider_history(&self) -> Vec<crate::assistant::ConversationTurn> {
+        self.turns
+            .iter()
+            .flat_map(|turn| {
+                [
+                    crate::assistant::ConversationTurn {
+                        role: Role::User,
+                        content: turn.user.content.clone(),
+                    },
+                    crate::assistant::ConversationTurn {
+                        role: Role::Assistant,
+                        content: turn.answer.content.clone(),
+                    },
+                ]
+            })
+            .collect()
+    }
     pub fn active_execution(&self) -> Option<ExecutionId> {
         self.active.as_ref().map(|a| a.snapshot.execution_id)
     }
-    pub fn replace_policy(&mut self, policy: AssistantPolicy) {
+    pub fn provisional_instant(&self) -> Option<&InstantOutcome> {
+        self.active
+            .as_ref()
+            .and_then(|active| active.instant.as_ref())
+    }
+    pub fn resolved(&self) -> Option<(&Content, Stage)> {
+        self.active.as_ref().and_then(|active| {
+            active
+                .resolved
+                .as_ref()
+                .map(|(content, stage)| (content, *stage))
+        })
+    }
+    pub fn replace_policy(&mut self, policy: AssistantPolicy) -> Result<(), AdmissionError> {
+        if self.active.is_some() {
+            return Err(AdmissionError::Busy);
+        }
         self.policy = policy;
+        Ok(())
     }
     pub fn snapshot(&self) -> ConversationSnapshot {
         ConversationSnapshot {
@@ -207,9 +246,9 @@ impl ConversationSession {
             policy: self.policy.clone(),
         };
         self.active = Some(Active {
-            state: AssistantState::new(crate::assistant::Generation::new(
-                execution_id.generation.0,
-            )),
+            instant: None,
+            deep: None,
+            review: None,
             snapshot: snapshot.clone(),
             resolved: None,
         });
@@ -228,9 +267,9 @@ impl ConversationSession {
             return UpdateResult::IgnoredStale;
         }
         let seen = match (&stage, &result) {
-            (Stage::Instant, StageResult::Instant(_)) => active.state.instant.is_some(),
-            (Stage::Deep, StageResult::Deep(_)) => active.state.deep.is_some(),
-            (Stage::Review, StageResult::Review(_)) => active.state.review.is_some(),
+            (Stage::Instant, StageResult::Instant(_)) => active.instant.is_some(),
+            (Stage::Deep, StageResult::Deep(_)) => active.deep.is_some(),
+            (Stage::Review, StageResult::Review(_)) => active.review.is_some(),
             _ => return UpdateResult::WrongStage,
         };
         if seen {
@@ -245,14 +284,17 @@ impl ConversationSession {
             return UpdateResult::RejectedOversized;
         }
         match (&stage, &result) {
-            (Stage::Instant, StageResult::Instant(v)) => active.state.instant = Some(v.clone()),
-            (Stage::Deep, StageResult::Deep(v)) => active.state.deep = Some(v.clone()),
-            (Stage::Review, StageResult::Review(v)) => active.state.review = Some(v.clone()),
+            (Stage::Instant, StageResult::Instant(v)) => active.instant = Some(v.clone()),
+            (Stage::Deep, StageResult::Deep(v)) => active.deep = Some(v.clone()),
+            (Stage::Review, StageResult::Review(v)) => active.review = Some(v.clone()),
             _ => unreachable!("stage/result pairing validated above"),
         }
-        if let Some((content, final_stage)) =
-            resolve_with_stage(&active.state, &active.snapshot.policy)
-        {
+        if let Some((content, final_stage)) = resolve_with_stage(
+            active.instant.as_ref(),
+            active.deep.as_ref(),
+            active.review.as_ref(),
+            &active.snapshot.policy,
+        ) {
             active.resolved = Some((content.clone(), final_stage));
             return UpdateResult::Resolved {
                 content,
@@ -402,10 +444,13 @@ mod tests {
         assert_eq!(snapshot.request_id, RequestId("frontend/id/1".into()));
         assert_eq!(snapshot.execution_id.session_id, s.session_id());
         assert!(snapshot.history.is_empty());
-        s.replace_policy(AssistantPolicy {
-            deep_enabled: true,
-            ..policy()
-        });
+        assert_eq!(
+            s.replace_policy(AssistantPolicy {
+                deep_enabled: true,
+                ..policy()
+            }),
+            Err(AdmissionError::Busy)
+        );
         complete(
             &mut s,
             snapshot.execution_id,
@@ -415,6 +460,11 @@ mod tests {
             s.settle(snapshot.execution_id, SettlementIntent::Success),
             SettlementResult::Applied(AppliedOutcome::Completed(_))
         ));
+        s.replace_policy(AssistantPolicy {
+            deep_enabled: true,
+            ..policy()
+        })
+        .unwrap();
         let next = s.admit("next", "question").unwrap();
         assert_eq!(next.history.len(), 2);
         assert!(next.policy.deep_enabled);
@@ -485,6 +535,189 @@ mod tests {
             s.settle(e.execution_id, SettlementIntent::Success),
             SettlementResult::Applied(AppliedOutcome::Refused(_))
         ));
+    }
+
+    #[test]
+    fn deep_and_review_matrix_is_preserved() {
+        use crate::assistant::{DeepReport, ReviewDecision, ReviewOutcome};
+
+        for deep_enabled in [false, true] {
+            for review_enabled in [false, true] {
+                let mut session = ConversationSession::new(AssistantPolicy {
+                    deep_enabled,
+                    review_enabled,
+                    ..policy()
+                });
+                let execution = session.admit("request", "prompt").unwrap().execution_id;
+                let instant = session.update(
+                    execution,
+                    Stage::Instant,
+                    StageResult::Instant(InstantOutcome::NeedsDeep(Content::Text(
+                        "instant".into(),
+                    ))),
+                );
+                assert_eq!(
+                    instant,
+                    if deep_enabled || review_enabled {
+                        UpdateResult::Provisional(Content::Text("instant".into()))
+                    } else {
+                        UpdateResult::Resolved {
+                            content: Content::Text("instant".into()),
+                            final_stage: Stage::Instant,
+                        }
+                    }
+                );
+
+                if deep_enabled {
+                    assert_eq!(
+                        session.update(
+                            execution,
+                            Stage::Deep,
+                            StageResult::Deep(DeepOutcome::Success(DeepReport {
+                                answer: Content::Text("deep".into()),
+                            })),
+                        ),
+                        if review_enabled {
+                            UpdateResult::Pending
+                        } else {
+                            UpdateResult::Resolved {
+                                content: Content::Text("deep".into()),
+                                final_stage: Stage::Deep,
+                            }
+                        }
+                    );
+                } else {
+                    assert_eq!(
+                        session.update(
+                            execution,
+                            Stage::Deep,
+                            StageResult::Deep(DeepOutcome::Failure("disabled".into())),
+                        ),
+                        UpdateResult::WrongStage
+                    );
+                }
+
+                if review_enabled {
+                    assert_eq!(
+                        session.update(
+                            execution,
+                            Stage::Review,
+                            StageResult::Review(ReviewOutcome::Success(ReviewDecision::Keep)),
+                        ),
+                        UpdateResult::Resolved {
+                            content: Content::Text(if deep_enabled {
+                                "deep".into()
+                            } else {
+                                "instant".into()
+                            }),
+                            final_stage: Stage::Review,
+                        }
+                    );
+                } else {
+                    assert_eq!(
+                        session.update(
+                            execution,
+                            Stage::Review,
+                            StageResult::Review(ReviewOutcome::Failure("disabled".into())),
+                        ),
+                        UpdateResult::WrongStage
+                    );
+                }
+
+                assert!(matches!(
+                    session.settle(execution, SettlementIntent::Success),
+                    SettlementResult::Applied(AppliedOutcome::Completed(_))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn failures_and_review_fallbacks_are_preserved() {
+        use crate::assistant::{DeepReport, ReviewOutcome};
+
+        for (deep_enabled, review_enabled) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let mut session = ConversationSession::new(AssistantPolicy {
+                deep_enabled,
+                review_enabled,
+                ..policy()
+            });
+            let execution = session.admit("request", "prompt").unwrap().execution_id;
+            assert_eq!(
+                session.update(
+                    execution,
+                    Stage::Instant,
+                    StageResult::Instant(InstantOutcome::Failure("instant failed".into())),
+                ),
+                UpdateResult::Pending
+            );
+            if deep_enabled {
+                assert_eq!(
+                    session.update(
+                        execution,
+                        Stage::Deep,
+                        StageResult::Deep(DeepOutcome::Failure("deep failed".into())),
+                    ),
+                    UpdateResult::Pending
+                );
+            }
+            if review_enabled {
+                assert_eq!(
+                    session.update(
+                        execution,
+                        Stage::Review,
+                        StageResult::Review(ReviewOutcome::Failure("review failed".into())),
+                    ),
+                    UpdateResult::Pending
+                );
+            }
+            assert_eq!(
+                session.settle(execution, SettlementIntent::Success),
+                SettlementResult::Rejected(SettlementError::NotResolved)
+            );
+            assert_eq!(
+                session.settle(execution, SettlementIntent::Failed),
+                SettlementResult::Applied(AppliedOutcome::Failed)
+            );
+        }
+
+        let mut session = ConversationSession::new(AssistantPolicy {
+            deep_enabled: true,
+            review_enabled: true,
+            ..policy()
+        });
+        let execution = session.admit("fallback", "prompt").unwrap().execution_id;
+        assert!(matches!(
+            session.update(
+                execution,
+                Stage::Instant,
+                StageResult::Instant(InstantOutcome::Complete(Content::Text("instant".into())))
+            ),
+            UpdateResult::Provisional(_)
+        ));
+        assert_eq!(
+            session.update(
+                execution,
+                Stage::Deep,
+                StageResult::Deep(DeepOutcome::Success(DeepReport {
+                    answer: Content::Text("deep".into()),
+                }))
+            ),
+            UpdateResult::Pending
+        );
+        assert_eq!(
+            session.update(
+                execution,
+                Stage::Review,
+                StageResult::Review(ReviewOutcome::Failure("review failed".into()))
+            ),
+            UpdateResult::Resolved {
+                content: Content::Text("deep".into()),
+                final_stage: Stage::Review,
+            }
+        );
     }
 
     #[test]
