@@ -46,7 +46,7 @@ impl AgentModel {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AssistantPreferences {
+pub struct AssistantPolicy {
     pub instant_model: InstantModel,
     pub deep_model: AgentModel,
     pub review_model: AgentModel,
@@ -55,7 +55,7 @@ pub struct AssistantPreferences {
     pub prefetch_enabled: bool,
     pub completion_enabled: bool,
 }
-impl Default for AssistantPreferences {
+impl Default for AssistantPolicy {
     fn default() -> Self {
         Self {
             instant_model: InstantModel::LocalFast,
@@ -68,6 +68,9 @@ impl Default for AssistantPreferences {
         }
     }
 }
+
+/// Temporary compatibility name while callers migrate to `AssistantPolicy`.
+pub type AssistantPreferences = AssistantPolicy;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Content {
@@ -93,7 +96,7 @@ pub fn request(prompt: impl Into<String>, history: &[ConversationTurn]) -> Vec<C
     turns
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Stage {
     Instant,
     Deep,
@@ -188,7 +191,7 @@ pub enum AcceptResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssistantCoordinator {
-    preferences: AssistantPreferences,
+    preferences: AssistantPolicy,
     history: Vec<ConversationTurn>,
     active: Option<AssistantState>,
     active_prompt: Option<Content>,
@@ -332,7 +335,14 @@ fn instant_answer(i: &InstantOutcome) -> Option<Content> {
         InstantOutcome::Failure(_) => None,
     }
 }
-fn resolve(s: &AssistantState, p: &AssistantPreferences) -> Option<Content> {
+pub(crate) fn resolve(s: &AssistantState, p: &AssistantPolicy) -> Option<Content> {
+    resolve_with_stage(s, p).map(|(content, _)| content)
+}
+
+pub(crate) fn resolve_with_stage(
+    s: &AssistantState,
+    p: &AssistantPolicy,
+) -> Option<(Content, Stage)> {
     let instant = s.instant.as_ref();
     if instant.is_none()
         || (p.deep_enabled && s.deep.is_none())
@@ -351,15 +361,17 @@ fn resolve(s: &AssistantState, p: &AssistantPreferences) -> Option<Content> {
             return None;
         }
         return match review {
-            ReviewOutcome::Success(ReviewDecision::Rewrite(a)) => Some(a.clone()),
-            ReviewOutcome::Success(ReviewDecision::Keep) => deep_answer.or(instant_answer),
-            ReviewOutcome::Failure(_) => deep_answer.or(instant_answer),
+            ReviewOutcome::Success(ReviewDecision::Rewrite(a)) => Some((a.clone(), Stage::Review)),
+            ReviewOutcome::Success(ReviewDecision::Keep) => {
+                deep_answer.or(instant_answer).map(|a| (a, Stage::Review))
+            }
+            ReviewOutcome::Failure(_) => deep_answer.or(instant_answer).map(|a| (a, Stage::Review)),
         };
     }
     if p.deep_enabled {
-        return deep_answer.or(instant_answer);
+        return deep_answer.or(instant_answer).map(|a| (a, Stage::Deep));
     }
-    instant_answer
+    instant_answer.map(|a| (a, Stage::Instant))
 }
 
 #[cfg(test)]
