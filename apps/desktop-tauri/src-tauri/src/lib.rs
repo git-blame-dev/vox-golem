@@ -113,7 +113,7 @@ struct AppState {
     completion_generation: AtomicU64,
     completion_lifecycle_lock: Mutex<()>,
     telemetry_sink: Option<Arc<Mutex<telemetry::TelemetrySink>>>,
-    assistant_coordinator: Arc<Mutex<voxgolem_core::assistant::AssistantCoordinator>>,
+    conversation_session: Arc<Mutex<voxgolem_core::conversation::ConversationSession>>,
     assistant_settings_generation: Arc<AtomicU64>,
     tts_operation_lock: tokio::sync::Mutex<()>,
     tts_startup_generation: Arc<AtomicU64>,
@@ -135,7 +135,7 @@ struct AppState {
 struct ActivePrompt {
     request_id: String,
     generation: u64,
-    assistant_generation: voxgolem_core::assistant::Generation,
+    assistant_generation: voxgolem_core::conversation::ExecutionId,
     cancelled: Arc<AtomicBool>,
     cancellation_signal: Arc<tokio::sync::watch::Sender<bool>>,
     completion_signal: Arc<tokio::sync::Notify>,
@@ -191,14 +191,17 @@ type ActivePromptRegistration = (
 );
 
 struct AssistantRequestGuard {
-    coordinator: Arc<Mutex<voxgolem_core::assistant::AssistantCoordinator>>,
-    generation: voxgolem_core::assistant::Generation,
+    session: Arc<Mutex<voxgolem_core::conversation::ConversationSession>>,
+    generation: voxgolem_core::conversation::ExecutionId,
 }
 
 impl Drop for AssistantRequestGuard {
     fn drop(&mut self) {
-        if let Ok(mut coordinator) = self.coordinator.lock() {
-            coordinator.cancel(self.generation);
+        if let Ok(mut session) = self.session.lock() {
+            let _ = session.settle(
+                self.generation,
+                voxgolem_core::conversation::SettlementIntent::Cancelled,
+            );
         }
     }
 }
@@ -555,7 +558,7 @@ impl Default for AssistantSettingsPayload {
     }
 }
 
-impl From<AssistantSettingsPayload> for voxgolem_core::assistant::AssistantPreferences {
+impl From<AssistantSettingsPayload> for voxgolem_core::assistant::AssistantPolicy {
     fn from(settings: AssistantSettingsPayload) -> Self {
         use voxgolem_core::assistant::InstantModel;
         Self {
@@ -587,8 +590,8 @@ fn agent_model(choice: AgentChoicePayload) -> voxgolem_core::assistant::AgentMod
     }
 }
 
-impl From<&voxgolem_core::assistant::AssistantPreferences> for AssistantSettingsPayload {
-    fn from(preferences: &voxgolem_core::assistant::AssistantPreferences) -> Self {
+impl From<&voxgolem_core::assistant::AssistantPolicy> for AssistantSettingsPayload {
+    fn from(preferences: &voxgolem_core::assistant::AssistantPolicy) -> Self {
         use voxgolem_core::assistant::{AgentModel, InstantModel};
         Self {
             instant: match preferences.instant_model {
@@ -906,10 +909,10 @@ fn get_assistant_settings(
     app_state: tauri::State<'_, AppState>,
 ) -> Result<AssistantSettingsPayload, String> {
     let coordinator = app_state
-        .assistant_coordinator
+        .conversation_session
         .lock()
         .map_err(|_| String::from("assistant coordinator lock is poisoned"))?;
-    Ok(AssistantSettingsPayload::from(coordinator.preferences()))
+    Ok(AssistantSettingsPayload::from(coordinator.policy()))
 }
 
 #[tauri::command]
@@ -918,20 +921,20 @@ fn set_assistant_settings(
     app_state: tauri::State<'_, AppState>,
 ) -> Result<AssistantSettingsPayload, String> {
     let mut coordinator = app_state
-        .assistant_coordinator
+        .conversation_session
         .lock()
         .map_err(|_| String::from("assistant coordinator lock is poisoned"))?;
-    let previous = coordinator.preferences().clone();
+    let previous = coordinator.policy().clone();
     ensure_assistant_settings_available(
         &settings,
         &AssistantSettingsPayload::from(&previous),
         &app_state.startup_state,
     )?;
     coordinator
-        .set_preferences(settings.into())
+        .replace_policy(settings.into())
         .map_err(|_| String::from("assistant settings cannot change while a prompt is active"))?;
     if let Err(error) = persist_assistant_settings(settings) {
-        let _ = coordinator.set_preferences(previous);
+        let _ = coordinator.replace_policy(previous);
         return Err(error);
     }
     app_state
@@ -1027,10 +1030,10 @@ fn switch_response_profile(
         lock_response_backend_operation(&app_state.response_backend_operation_lock)?;
     {
         let coordinator = app_state
-            .assistant_coordinator
+            .conversation_session
             .lock()
             .map_err(|_| String::from("assistant coordinator lock is poisoned"))?;
-        if coordinator.active().is_some() {
+        if coordinator.has_active_execution() {
             return Err(String::from(
                 "response profile cannot change while a prompt is active",
             ));
@@ -1087,7 +1090,7 @@ fn switch_response_profile(
     let startup_state = Arc::clone(&app_state.startup_state);
     let llama_cpp_runtime = Arc::clone(&app_state.llama_cpp_runtime);
     let selected_response_profile = Arc::clone(&app_state.selected_response_profile);
-    let assistant_coordinator = Arc::clone(&app_state.assistant_coordinator);
+    let conversation_session = Arc::clone(&app_state.conversation_session);
     let assistant_settings_generation = Arc::clone(&app_state.assistant_settings_generation);
     let response_profile_switch_generation =
         Arc::clone(&app_state.response_profile_switch_generation);
@@ -1129,10 +1132,10 @@ fn switch_response_profile(
     }
     let expected_assistant_settings_generation =
         assistant_settings_generation.load(Ordering::SeqCst);
-    let previous_assistant_preferences = assistant_coordinator
+    let previous_assistant_preferences = conversation_session
         .lock()
         .map_err(|_| String::from("assistant coordinator lock is poisoned"))?
-        .preferences()
+        .policy()
         .clone();
 
     let llama_startups = Arc::clone(&app_state.llama_startups);
@@ -1161,7 +1164,7 @@ fn switch_response_profile(
                 }
 
                 match synchronize_local_instant_model(
-                    &assistant_coordinator,
+                    &conversation_session,
                     &assistant_settings_generation,
                     expected_assistant_settings_generation,
                     profile,
@@ -1181,7 +1184,7 @@ fn switch_response_profile(
                             shutdown_llama_start_result(Ok(runtime));
                             eprintln!("failed to persist response profile state: {error}");
                             let _ = rollback_profile_commit_state(
-                                &assistant_coordinator,
+                                &conversation_session,
                                 (
                                     &assistant_settings_generation,
                                     &response_profile_switch_generation,
@@ -1233,7 +1236,7 @@ fn switch_response_profile(
                                     switch_generation,
                                 ) {
                                     let _ = rollback_profile_commit_state(
-                                        &assistant_coordinator,
+                                        &conversation_session,
                                         (
                                             &assistant_settings_generation,
                                             &response_profile_switch_generation,
@@ -1340,7 +1343,7 @@ fn switch_response_profile(
                             *selected = current_profile;
                         }
                         match synchronize_local_instant_model(
-                            &assistant_coordinator,
+                            &conversation_session,
                             &assistant_settings_generation,
                             expected_assistant_settings_generation,
                             current_profile,
@@ -1590,9 +1593,9 @@ fn ensure_agent_prerequisites(
 }
 
 struct AssistantRequestContext {
-    generation: voxgolem_core::assistant::Generation,
+    generation: voxgolem_core::conversation::ExecutionId,
     instant_model: voxgolem_core::assistant::InstantModel,
-    preferences: voxgolem_core::assistant::AssistantPreferences,
+    preferences: voxgolem_core::assistant::AssistantPolicy,
     history: Vec<voxgolem_core::assistant::ConversationTurn>,
     started_ms: u64,
     source: CompletionSource,
@@ -1608,20 +1611,29 @@ struct PromptCancellation<'a> {
 
 fn begin_assistant_request(
     app_state: &AppState,
+    request_id: &str,
     prompt: &str,
     source: CompletionSource,
 ) -> Result<AssistantRequestContext, String> {
     let started_ms = current_time_ms()?;
     let mut coordinator = app_state
-        .assistant_coordinator
+        .conversation_session
         .lock()
         .map_err(|_| String::from("assistant coordinator lock is poisoned"))?;
-    let history = coordinator.history().to_vec();
-    let preferences = coordinator.preferences().clone();
-    let instant_model = preferences.instant_model;
-    let generation = coordinator
-        .start(prompt.to_string())
+    let snapshot = coordinator
+        .admit(request_id, prompt)
         .map_err(|error| format!("assistant request could not start: {error:?}"))?;
+    let history = snapshot
+        .history
+        .iter()
+        .map(|message| voxgolem_core::assistant::ConversationTurn {
+            role: message.role,
+            content: message.content.clone(),
+        })
+        .collect();
+    let preferences = snapshot.policy.clone();
+    let instant_model = preferences.instant_model;
+    let generation = snapshot.execution_id;
     Ok(AssistantRequestContext {
         generation,
         instant_model,
@@ -1637,9 +1649,9 @@ fn finish_assistant_request(
     app_state: &AppState,
     request_id: &str,
     active_generation: u64,
-    generation: voxgolem_core::assistant::Generation,
+    generation: voxgolem_core::conversation::ExecutionId,
     result: voxgolem_core::assistant::InstantOutcome,
-) -> Result<voxgolem_core::assistant::AcceptResult, String> {
+) -> Result<voxgolem_core::conversation::UpdateResult, String> {
     accept_assistant_stage_if_active(
         app_state,
         request_id,
@@ -1654,10 +1666,10 @@ fn accept_assistant_stage_if_active(
     app_state: &AppState,
     request_id: &str,
     active_generation: u64,
-    generation: voxgolem_core::assistant::Generation,
+    generation: voxgolem_core::conversation::ExecutionId,
     stage: voxgolem_core::assistant::Stage,
     result: voxgolem_core::assistant::StageResult,
-) -> Result<voxgolem_core::assistant::AcceptResult, String> {
+) -> Result<voxgolem_core::conversation::UpdateResult, String> {
     let active = app_state
         .active_prompt
         .lock()
@@ -1667,20 +1679,20 @@ fn accept_assistant_stage_if_active(
             && active.generation == active_generation
             && !active.cancelled.load(Ordering::SeqCst)
     }) {
-        return Ok(voxgolem_core::assistant::AcceptResult::Cancelled);
+        return Ok(voxgolem_core::conversation::UpdateResult::IgnoredStale);
     }
     Ok(app_state
-        .assistant_coordinator
+        .conversation_session
         .lock()
         .map_err(|_| String::from("assistant coordinator lock is poisoned"))?
-        .accept(generation, stage, result))
+        .update(generation, stage, result))
 }
 
 fn commit_assistant_request_if_active(
     app_state: &AppState,
     request_id: &str,
     active_generation: u64,
-    generation: voxgolem_core::assistant::Generation,
+    generation: voxgolem_core::conversation::ExecutionId,
 ) -> Result<(), String> {
     let active = app_state
         .active_prompt
@@ -1693,21 +1705,44 @@ fn commit_assistant_request_if_active(
     }) {
         return Err(String::from("assistant request is no longer active"));
     }
-    app_state
-        .assistant_coordinator
+    let result = app_state
+        .conversation_session
         .lock()
         .map_err(|_| String::from("assistant coordinator lock is poisoned"))?
-        .commit(generation)
-        .ok_or_else(|| String::from("assistant request did not resolve"))?;
-    Ok(())
+        .settle(
+            generation,
+            voxgolem_core::conversation::SettlementIntent::Success,
+        );
+    match result {
+        voxgolem_core::conversation::SettlementResult::Applied(
+            voxgolem_core::conversation::AppliedOutcome::Completed(_)
+            | voxgolem_core::conversation::AppliedOutcome::Refused(_),
+        ) => Ok(()),
+        _ => Err(String::from("assistant request did not resolve")),
+    }
 }
 
 fn cancel_assistant_request(
     app_state: &AppState,
-    generation: voxgolem_core::assistant::Generation,
+    generation: voxgolem_core::conversation::ExecutionId,
 ) {
-    if let Ok(mut coordinator) = app_state.assistant_coordinator.lock() {
-        coordinator.cancel(generation);
+    if let Ok(mut session) = app_state.conversation_session.lock() {
+        let _ = session.settle(
+            generation,
+            voxgolem_core::conversation::SettlementIntent::Cancelled,
+        );
+    }
+}
+
+fn fail_assistant_request(
+    app_state: &AppState,
+    generation: voxgolem_core::conversation::ExecutionId,
+) {
+    if let Ok(mut session) = app_state.conversation_session.lock() {
+        let _ = session.settle(
+            generation,
+            voxgolem_core::conversation::SettlementIntent::Failed,
+        );
     }
 }
 
@@ -1888,11 +1923,12 @@ async fn submit_prompt(
     let prompt = validate_prompt_text(prompt)?;
     let assistant_request = begin_assistant_request(
         &app_state,
+        &request_id,
         &prompt,
         source.unwrap_or(CompletionSource::Typed),
     )?;
     let _assistant_request_guard = AssistantRequestGuard {
-        coordinator: Arc::clone(&app_state.assistant_coordinator),
+        session: Arc::clone(&app_state.conversation_session),
         generation: assistant_request.generation,
     };
     let is_opencode = matches!(
@@ -1910,7 +1946,7 @@ async fn submit_prompt(
             .map(voxgolem_platform::opencode::OpencodeServer::client)
     };
     if is_opencode && opencode_client.is_none() {
-        cancel_assistant_request(&app_state, assistant_request.generation);
+        fail_assistant_request(&app_state, assistant_request.generation);
         return Err(String::from("OpenCode server is not available"));
     }
     let (generation, cancelled, cancellation_signal, settled) = register_active_prompt(
@@ -1943,7 +1979,7 @@ async fn submit_prompt(
         if let Err(error) =
             ensure_agent_prerequisites(&app_state, assistant_request.preferences.deep_model)
         {
-            cancel_assistant_request(&app_state, assistant_request.generation);
+            fail_assistant_request(&app_state, assistant_request.generation);
             return Err(error);
         }
     }
@@ -1951,7 +1987,7 @@ async fn submit_prompt(
         if let Err(error) =
             ensure_agent_prerequisites(&app_state, assistant_request.preferences.review_model)
         {
-            cancel_assistant_request(&app_state, assistant_request.generation);
+            fail_assistant_request(&app_state, assistant_request.generation);
             return Err(error);
         }
     }
@@ -1961,7 +1997,7 @@ async fn submit_prompt(
             .lock()
             .map_err(|_| String::from("selected response profile lock is poisoned"))?;
         if selected_profile != expected_profile {
-            cancel_assistant_request(&app_state, assistant_request.generation);
+            fail_assistant_request(&app_state, assistant_request.generation);
             return Err(String::from("selected local model is not loaded"));
         }
     }
@@ -2173,7 +2209,7 @@ async fn submit_prompt(
             .map_err(|_| String::from("selected response profile lock is poisoned"))?
             != expected_profile
         {
-            cancel_assistant_request(&app_state, assistant_request.generation);
+            fail_assistant_request(&app_state, assistant_request.generation);
             return Err(String::from("selected local model is not loaded"));
         }
         sync_llama_history(&app_state, &assistant_request.history)?;
@@ -2357,7 +2393,7 @@ async fn submit_prompt(
         voxgolem_core::voice_pipeline::VoicePipelineEvent::SubmitPrompt,
     ) {
         abort_direct_opencode_client(&client).await;
-        cancel_assistant_request(&app_state, assistant_request.generation);
+        fail_assistant_request(&app_state, assistant_request.generation);
         return Err(error);
     }
 
@@ -2543,7 +2579,7 @@ async fn submit_prompt(
             )
         }
         OpencodePromptResult::Failed(message) => {
-            cancel_assistant_request(&app_state, assistant_request.generation);
+            fail_assistant_request(&app_state, assistant_request.generation);
             apply_voice_pipeline_transition(
                 &app_state.voice_pipeline_state,
                 app_state.voice_pipeline_config,
@@ -2589,7 +2625,7 @@ async fn submit_custom_prompt(
         app_state.voice_pipeline_config,
         voxgolem_core::voice_pipeline::VoicePipelineEvent::SubmitPrompt,
     ) {
-        cancel_assistant_request(app_state, assistant_request.generation);
+        fail_assistant_request(app_state, assistant_request.generation);
         return Err(error);
     }
     let config = app_state
@@ -2793,10 +2829,10 @@ fn fail_started_prompt(
     app: &tauri::AppHandle,
     app_state: &AppState,
     request_id: &str,
-    generation: voxgolem_core::assistant::Generation,
+    generation: voxgolem_core::conversation::ExecutionId,
     message: String,
 ) -> Result<PromptFinalPayload, String> {
-    cancel_assistant_request(app_state, generation);
+    fail_assistant_request(app_state, generation);
     apply_voice_pipeline_transition(
         &app_state.voice_pipeline_state,
         app_state.voice_pipeline_config,
@@ -2826,7 +2862,7 @@ fn finish_cancelled_prompt(
     app: &tauri::AppHandle,
     app_state: &AppState,
     request_id: &str,
-    generation: voxgolem_core::assistant::Generation,
+    generation: voxgolem_core::conversation::ExecutionId,
 ) -> Result<PromptFinalPayload, String> {
     cancel_assistant_request(app_state, generation);
     ensure_cancelled_prompt_is_sleeping(app_state)?;
@@ -2914,11 +2950,11 @@ async fn settle_instant_failure(
         )?));
     }
     let answer = app_state
-        .assistant_coordinator
+        .conversation_session
         .lock()
         .map_err(|_| String::from("assistant coordinator lock is poisoned"))?
-        .active()
-        .and_then(|state| state.final_answer.clone());
+        .resolved()
+        .map(|(content, _)| content.clone());
     if answer.is_none() {
         match fail_started_prompt(
             app,
@@ -3216,7 +3252,7 @@ async fn stream_local_prompt(
 async fn resolve_enabled_agents(
     context: StageContext<'_>,
     instant_answer: &str,
-    instant_result: voxgolem_core::assistant::AcceptResult,
+    instant_result: voxgolem_core::conversation::UpdateResult,
 ) -> Result<(), PromptControlError> {
     let StageContext {
         app,
@@ -3232,7 +3268,7 @@ async fn resolve_enabled_agents(
     }
     let instant_succeeded = !matches!(
         instant_result,
-        voxgolem_core::assistant::AcceptResult::Pending
+        voxgolem_core::conversation::UpdateResult::Pending
     ) && !instant_answer.is_empty();
     emit_stage_event_controlled(
         app,
@@ -3258,7 +3294,7 @@ async fn resolve_enabled_agents(
     );
     if matches!(
         instant_result,
-        voxgolem_core::assistant::AcceptResult::Resolved(_)
+        voxgolem_core::conversation::UpdateResult::Resolved { .. }
     ) {
         return Ok(());
     }
@@ -3341,7 +3377,7 @@ async fn resolve_enabled_agents(
         if !request.preferences.review_enabled {
             if !matches!(
                 accepted,
-                voxgolem_core::assistant::AcceptResult::Resolved(_)
+                voxgolem_core::conversation::UpdateResult::Resolved { .. }
             ) {
                 return Err(PromptControlError::Error(String::from(
                     "Deep did not resolve the assistant request",
@@ -3394,7 +3430,7 @@ async fn resolve_enabled_agents(
         None,
     )?;
     let instant_content = app_state
-        .assistant_coordinator
+        .conversation_session
         .lock()
         .ok()
         .and_then(|coordinator| coordinator.provisional_instant().cloned())
@@ -3404,7 +3440,7 @@ async fn resolve_enabled_agents(
             voxgolem_core::assistant::InstantOutcome::Failure(_) => None,
         });
     let instant_status = match (&instant_result, instant_content) {
-        (voxgolem_core::assistant::AcceptResult::Pending, _) | (_, None) => {
+        (voxgolem_core::conversation::UpdateResult::Pending, _) | (_, None) => {
             voxgolem_core::agent_pipeline::StageStatus::Failure(String::from(
                 "Instant provider failed",
             ))
@@ -3508,7 +3544,7 @@ async fn resolve_enabled_agents(
             )?;
             if matches!(
                 accepted,
-                voxgolem_core::assistant::AcceptResult::Resolved(_)
+                voxgolem_core::conversation::UpdateResult::Resolved { .. }
             ) {
                 return Ok(());
             }
@@ -3544,7 +3580,7 @@ async fn resolve_enabled_agents(
     }
     if !matches!(
         accepted,
-        voxgolem_core::assistant::AcceptResult::Resolved(_)
+        voxgolem_core::conversation::UpdateResult::Resolved { .. }
     ) {
         return Err(PromptControlError::Error(String::from(
             "Review did not resolve the assistant request",
@@ -3693,7 +3729,7 @@ fn record_assistant_stage_telemetry(
             schema_version: telemetry::SCHEMA_VERSION,
             timestamp_ms: current_time_ms().unwrap_or_default(),
             request_id: request_id.to_string(),
-            generation: request.generation.id,
+            generation: request.generation.generation.0,
             input_source: match request.source {
                 CompletionSource::Typed => telemetry::InputSource::Text,
                 CompletionSource::Voice => telemetry::InputSource::Voice,
@@ -4090,7 +4126,7 @@ fn register_active_prompt(
     active_prompt: &Mutex<Option<ActivePrompt>>,
     generation_counter: &AtomicU64,
     request_id: &str,
-    assistant_generation: voxgolem_core::assistant::Generation,
+    assistant_generation: voxgolem_core::conversation::ExecutionId,
     client: Option<voxgolem_platform::opencode::OpencodeClient>,
 ) -> Result<ActivePromptRegistration, String> {
     let mut active = active_prompt
@@ -4343,11 +4379,19 @@ async fn cancel_prompt(
             .as_ref()
             .filter(|active| active.request_id == request_id)
             .ok_or_else(|| String::from("prompt request is no longer active"))?;
-        let coordinator_cancelled = app_state
-            .assistant_coordinator
-            .lock()
-            .map_err(|_| String::from("assistant coordinator lock is poisoned"))?
-            .cancel(active.assistant_generation);
+        let coordinator_cancelled = matches!(
+            app_state
+                .conversation_session
+                .lock()
+                .map_err(|_| String::from("assistant coordinator lock is poisoned"))?
+                .settle(
+                    active.assistant_generation,
+                    voxgolem_core::conversation::SettlementIntent::Cancelled
+                ),
+            voxgolem_core::conversation::SettlementResult::Applied(
+                voxgolem_core::conversation::AppliedOutcome::Cancelled
+            )
+        );
         if !coordinator_cancelled {
             return Err(String::from("prompt request is no longer active"));
         }
@@ -4467,14 +4511,22 @@ async fn reset_session(
 ) -> Result<RuntimePhaseResponsePayload, String> {
     cancel_active_tts_generation(&app_state);
     ensure_startup_ready_for_prompt(&app_state.startup_state)?;
+    app_state
+        .conversation_session
+        .lock()
+        .map_err(|_| String::from("conversation session lock is poisoned"))?
+        .reset();
     let active = app_state
         .active_prompt
         .lock()
         .map_err(|_| String::from("active prompt lock is poisoned"))?
         .clone();
     if let Some(active) = active {
-        if let Ok(mut coordinator) = app_state.assistant_coordinator.lock() {
-            coordinator.cancel(active.assistant_generation);
+        if let Ok(mut coordinator) = app_state.conversation_session.lock() {
+            let _ = coordinator.settle(
+                active.assistant_generation,
+                voxgolem_core::conversation::SettlementIntent::Cancelled,
+            );
         }
         active.cancelled.store(true, Ordering::SeqCst);
         active.cancellation_signal.send_replace(true);
@@ -4498,12 +4550,6 @@ async fn reset_session(
         reset_opencode_session(&app_state).await?;
     }
     reset_llama_session(&app_state)?;
-    app_state
-        .assistant_coordinator
-        .lock()
-        .map_err(|_| String::from("assistant coordinator lock is poisoned"))?
-        .reset();
-
     reset_runtime_session(&app_state)?;
 
     Ok(RuntimePhaseResponsePayload {
@@ -4891,7 +4937,7 @@ fn queue_completion_request(
         .lock()
         .map_err(|_| String::from("completion lifecycle lock is poisoned"))?;
     invalidate_prefetch(app_state)?;
-    if !assistant_completion_enabled(&app_state.assistant_coordinator)? {
+    if !assistant_completion_enabled(&app_state.conversation_session)? {
         clear_completion_state_locked(app_state, false)?;
         return Ok(());
     }
@@ -4932,11 +4978,11 @@ fn queue_completion_request(
 }
 
 fn assistant_completion_enabled(
-    coordinator: &Mutex<voxgolem_core::assistant::AssistantCoordinator>,
+    coordinator: &Mutex<voxgolem_core::conversation::ConversationSession>,
 ) -> Result<bool, String> {
     coordinator
         .lock()
-        .map(|coordinator| coordinator.preferences().completion_enabled)
+        .map(|coordinator| coordinator.policy().completion_enabled)
         .map_err(|_| String::from("assistant coordinator lock is poisoned"))
 }
 
@@ -4950,7 +4996,7 @@ async fn emit_completion_predictions(
         let Ok(_lifecycle) = app_state.completion_lifecycle_lock.lock() else {
             break;
         };
-        if !assistant_completion_enabled(&app_state.assistant_coordinator).unwrap_or(false) {
+        if !assistant_completion_enabled(&app_state.conversation_session).unwrap_or(false) {
             continue;
         }
         let matching = context.lock().ok().and_then(|mut current| {
@@ -5126,16 +5172,16 @@ fn queue_assistant_prefetch(
     invalidate_prefetch(&app_state)?;
     let key = {
         let coordinator = app_state
-            .assistant_coordinator
+            .conversation_session
             .lock()
             .map_err(|_| String::from("assistant coordinator lock is poisoned"))?;
-        if coordinator.active().is_some() || !coordinator.preferences().prefetch_enabled {
+        if coordinator.has_active_execution() || !coordinator.policy().prefetch_enabled {
             return Ok(());
         }
         PrefetchKey {
             prompt,
-            history: coordinator.history().to_vec(),
-            model: coordinator.preferences().instant_model,
+            history: coordinator.provider_history(),
+            model: coordinator.policy().instant_model,
         }
     };
     if let Some(expected_profile) = local_profile_for_model(key.model) {
@@ -5272,7 +5318,7 @@ fn local_profile_for_model(
 }
 
 fn synchronize_local_instant_model(
-    coordinator: &Mutex<voxgolem_core::assistant::AssistantCoordinator>,
+    coordinator: &Mutex<voxgolem_core::conversation::ConversationSession>,
     settings_generation: &AtomicU64,
     expected_generation: u64,
     profile: ResponseProfilePayload,
@@ -5287,7 +5333,7 @@ fn synchronize_local_instant_model(
 }
 
 fn synchronize_local_instant_model_with<F>(
-    coordinator: &Mutex<voxgolem_core::assistant::AssistantCoordinator>,
+    coordinator: &Mutex<voxgolem_core::conversation::ConversationSession>,
     settings_generation: &AtomicU64,
     expected_generation: u64,
     profile: ResponseProfilePayload,
@@ -5302,7 +5348,7 @@ where
     if settings_generation.load(Ordering::SeqCst) != expected_generation {
         return Ok(None);
     }
-    let mut preferences = coordinator.preferences().clone();
+    let mut preferences = coordinator.policy().clone();
     preferences.instant_model = local_instant_model(profile);
     let settings = AssistantSettingsPayload::from(&preferences);
     if settings_generation.load(Ordering::SeqCst) != expected_generation {
@@ -5313,7 +5359,7 @@ where
         return Ok(None);
     }
     coordinator
-        .set_preferences(preferences)
+        .replace_policy(preferences)
         .map_err(|_| String::from("assistant settings cannot change while a prompt is active"))?;
     settings_generation.fetch_add(1, Ordering::SeqCst);
     Ok(Some(()))
@@ -6518,11 +6564,11 @@ fn startup_state_after_profile_restore_failure(
 }
 
 fn rollback_profile_commit_state(
-    coordinator: &Mutex<voxgolem_core::assistant::AssistantCoordinator>,
+    coordinator: &Mutex<voxgolem_core::conversation::ConversationSession>,
     generations: (&AtomicU64, &AtomicU64, u64),
     selected_profile: &Mutex<ResponseProfilePayload>,
     previous_profile: ResponseProfilePayload,
-    previous_preferences: voxgolem_core::assistant::AssistantPreferences,
+    previous_preferences: voxgolem_core::assistant::AssistantPolicy,
     previous_generation: u64,
 ) -> Result<(), String> {
     let (settings_generation, switch_generation, expected_switch_generation) = generations;
@@ -6535,7 +6581,7 @@ fn rollback_profile_commit_state(
         return Ok(());
     }
     coordinator
-        .set_preferences(previous_preferences.clone())
+        .replace_policy(previous_preferences.clone())
         .map_err(|_| {
             String::from("assistant settings cannot be rolled back while a prompt is active")
         })?;
@@ -7017,8 +7063,10 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
                 completion_generation: AtomicU64::new(0),
                 completion_lifecycle_lock: Mutex::new(()),
                 telemetry_sink,
-                assistant_coordinator: Arc::new(Mutex::new(
-                    voxgolem_core::assistant::AssistantCoordinator::new(assistant_settings.into()),
+                conversation_session: Arc::new(Mutex::new(
+                    voxgolem_core::conversation::ConversationSession::new(
+                        assistant_settings.into(),
+                    ),
                 )),
                 assistant_settings_generation: Arc::new(AtomicU64::new(0)),
                 tts_operation_lock: tokio::sync::Mutex::new(()),
@@ -7143,8 +7191,8 @@ fn build_startup_error_app_state(
         completion_generation: AtomicU64::new(0),
         completion_lifecycle_lock: Mutex::new(()),
         telemetry_sink: default_telemetry_sink(),
-        assistant_coordinator: Arc::new(Mutex::new(
-            voxgolem_core::assistant::AssistantCoordinator::new(
+        conversation_session: Arc::new(Mutex::new(
+            voxgolem_core::conversation::ConversationSession::new(
                 AssistantSettingsPayload::default().into(),
             ),
         )),
@@ -7210,8 +7258,8 @@ fn build_nonfatal_config_error_app_state(
         completion_generation: AtomicU64::new(0),
         completion_lifecycle_lock: Mutex::new(()),
         telemetry_sink: default_telemetry_sink(),
-        assistant_coordinator: Arc::new(Mutex::new(
-            voxgolem_core::assistant::AssistantCoordinator::new(
+        conversation_session: Arc::new(Mutex::new(
+            voxgolem_core::conversation::ConversationSession::new(
                 AssistantSettingsPayload::default().into(),
             ),
         )),
@@ -8335,7 +8383,7 @@ mod tests {
             ..AssistantSettingsPayload::default()
         };
         let coordinator = std::sync::Mutex::new(
-            voxgolem_core::assistant::AssistantCoordinator::new(disabled.into()),
+            voxgolem_core::conversation::ConversationSession::new(disabled.into()),
         );
         let settings_generation = std::sync::atomic::AtomicU64::new(0);
         assert!(!assistant_completion_enabled(&coordinator).unwrap());
@@ -8371,7 +8419,7 @@ mod tests {
     #[test]
     fn profile_persistence_failure_does_not_commit_preferences_or_generation() {
         let coordinator =
-            std::sync::Mutex::new(voxgolem_core::assistant::AssistantCoordinator::new(
+            std::sync::Mutex::new(voxgolem_core::conversation::ConversationSession::new(
                 AssistantSettingsPayload::default().into(),
             ));
         let generation = std::sync::atomic::AtomicU64::new(4);
@@ -8387,7 +8435,7 @@ mod tests {
         assert_eq!(error, "injected persistence failure");
         assert_eq!(generation.load(Ordering::SeqCst), 4);
         assert_eq!(
-            coordinator.lock().unwrap().preferences().instant_model,
+            coordinator.lock().unwrap().policy().instant_model,
             voxgolem_core::assistant::InstantModel::LocalFast
         );
     }
@@ -8821,7 +8869,10 @@ mod tests {
             &active,
             &generations,
             "request",
-            voxgolem_core::assistant::Generation::new(1),
+            voxgolem_core::conversation::ExecutionId {
+                session_id: voxgolem_core::conversation::SessionId(1),
+                generation: voxgolem_core::conversation::GenerationId(1),
+            },
             None,
         )
         .expect("registration should succeed");
@@ -8849,7 +8900,10 @@ mod tests {
             active.as_ref(),
             &generations,
             "request",
-            voxgolem_core::assistant::Generation::new(1),
+            voxgolem_core::conversation::ExecutionId {
+                session_id: voxgolem_core::conversation::SessionId(1),
+                generation: voxgolem_core::conversation::GenerationId(1),
+            },
             None,
         )
         .expect("registration should succeed");
@@ -8878,7 +8932,10 @@ mod tests {
             &active,
             &generations,
             "request",
-            voxgolem_core::assistant::Generation::new(1),
+            voxgolem_core::conversation::ExecutionId {
+                session_id: voxgolem_core::conversation::SessionId(1),
+                generation: voxgolem_core::conversation::GenerationId(1),
+            },
             None,
         )
         .expect("registration should succeed");
@@ -10395,72 +10452,74 @@ mod tests {
     #[test]
     fn instant_failure_deep_success_resolves_deep() {
         use voxgolem_core::assistant::*;
-        let preferences = AssistantPreferences {
+        use voxgolem_core::conversation::*;
+        let preferences = AssistantPolicy {
             deep_enabled: true,
             ..Default::default()
         };
-        let mut coordinator = AssistantCoordinator::new(preferences);
-        let generation = coordinator.start("prompt").unwrap();
+        let mut session = ConversationSession::new(preferences);
+        let generation = session.admit("request", "prompt").unwrap().execution_id;
         assert_eq!(
-            coordinator.accept(
+            session.update(
                 generation,
                 Stage::Instant,
                 StageResult::Instant(InstantOutcome::Failure("instant failed".into()))
             ),
-            AcceptResult::Pending
+            UpdateResult::Pending
         );
         assert!(matches!(
-            coordinator.accept(
+            session.update(
                 generation,
                 Stage::Deep,
                 StageResult::Deep(DeepOutcome::Success(DeepReport {
                     answer: Content::Text("deep".into())
                 }))
             ),
-            AcceptResult::Resolved(Content::Text(answer)) if answer == "deep"
+            UpdateResult::Resolved { content: Content::Text(answer), .. } if answer == "deep"
         ));
     }
 
     #[test]
     fn deep_failure_keeps_successful_instant_and_both_fail() {
         use voxgolem_core::assistant::*;
-        let preferences = AssistantPreferences {
+        use voxgolem_core::conversation::*;
+        let preferences = AssistantPolicy {
             deep_enabled: true,
             ..Default::default()
         };
-        let mut coordinator = AssistantCoordinator::new(preferences.clone());
-        let generation = coordinator.start("prompt").unwrap();
+        let mut session = ConversationSession::new(preferences.clone());
+        let generation = session.admit("request", "prompt").unwrap().execution_id;
         assert!(matches!(
-            coordinator.accept(
+            session.update(
                 generation,
                 Stage::Instant,
                 StageResult::Instant(InstantOutcome::Complete(Content::Text("instant".into())))
             ),
-            AcceptResult::Provisional(Content::Text(answer)) if answer == "instant"
+            UpdateResult::Provisional(Content::Text(answer)) if answer == "instant"
         ));
         assert!(matches!(
-            coordinator.accept(
+            session.update(
                 generation,
                 Stage::Deep,
                 StageResult::Deep(DeepOutcome::Failure("deep failed".into()))
             ),
-            AcceptResult::Resolved(Content::Text(answer)) if answer == "instant"
+            UpdateResult::Resolved { content: Content::Text(answer), .. } if answer == "instant"
         ));
 
-        let mut coordinator = AssistantCoordinator::new(preferences);
-        let generation = coordinator.start("prompt").unwrap();
-        coordinator.accept(
+        let mut session = ConversationSession::new(preferences);
+        let generation = session.admit("request", "prompt").unwrap().execution_id;
+        session.update(
             generation,
             Stage::Instant,
             StageResult::Instant(InstantOutcome::Failure("instant failed".into())),
         );
         assert_eq!(
-            coordinator.accept(
+            session.update(
                 generation,
                 Stage::Deep,
                 StageResult::Deep(DeepOutcome::Failure("deep failed".into()))
             ),
-            AcceptResult::Pending
+            UpdateResult::Pending
         );
     }
 }
