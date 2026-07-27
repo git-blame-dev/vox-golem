@@ -153,6 +153,7 @@ describe('executePrompt', () => {
     )
 
     expect(getTauriInternals()?.listen).toBeTypeOf('function')
+    expect(getTauriInternals()?.createChannel).toBeTypeOf('function')
   })
 
   it('emits browser fallback text when Tauri is unavailable', async () => {
@@ -220,6 +221,32 @@ describe('executePrompt', () => {
       { requestId: 'request-1', kind: 'text', text: 'OpenCode response' },
     ])
     expect(unlistened).toBe(true)
+  })
+
+  it('creates a Channel before invoking and adapts updates without request IDs', async () => {
+    const order: string[] = []
+    const events: PromptExecutionEvent[] = []
+    let update: ((payload: unknown) => void) | undefined
+    window.__TAURI_INTERNALS__ = {
+      createChannel: <T>(handler: (message: T) => void) => {
+        order.push('channel')
+        update = handler as (payload: unknown) => void
+        return 'channel'
+      },
+      listen: async () => { throw new Error('global listener must not be used') },
+      invoke: async (command, args) => {
+        order.push('invoke')
+        expect(command).toBe('submit_prompt')
+        expect(args).toMatchObject({ requestId: 'request-1', prompt: 'Draft release notes', source: 'typed', updates: 'channel' })
+        update?.({ kind: 'text', text: 'OpenCode response' })
+        update?.({ kind: 'text' })
+        return { request_id: 'request-1', runtime_phase: 'sleeping', outcome: 'completed' }
+      },
+    }
+
+    await expect(executePrompt('request-1', 'Draft release notes', (event) => events.push(event))).resolves.toMatchObject({ requestId: 'request-1' })
+    expect(order).toEqual(['channel', 'invoke'])
+    expect(events).toEqual([{ requestId: 'request-1', kind: 'text', text: 'OpenCode response' }])
   })
 
   it('requires streaming listener support', async () => {
