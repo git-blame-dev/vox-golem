@@ -1,5 +1,9 @@
 # Vox Golem
 
+[![Linux CI](https://github.com/git-blame-dev/vox-golem/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/git-blame-dev/vox-golem/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/git-blame-dev/vox-golem?label=release&logo=github&logoColor=white)](https://github.com/git-blame-dev/vox-golem/releases/latest)
+[![Ubuntu 24.04 x86_64](https://img.shields.io/badge/Ubuntu%2024.04-x86__64-E95420?logo=ubuntu&logoColor=white)](#supported-linux-baseline)
+
 Vox Golem is a Linux-first WSL2/WSLg Tauri desktop voice assistant for typed or spoken developer prompts. It captures wake-word turns, transcribes locally when configured, and displays the answer and runtime state in one UI.
 
 ## Capabilities
