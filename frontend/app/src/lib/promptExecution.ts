@@ -1,6 +1,6 @@
 import { getTauriInternals } from './tauri'
+import { isRecord, parseRuntimePhase, utf8ByteLength } from './wire'
 import type {
-  BackendRuntimePhase,
   PromptExecutionEvent,
   PromptExecutionResult,
 } from '../types/chat'
@@ -85,7 +85,7 @@ export function parsePromptExecutionEvent(payload: unknown): PromptExecutionEven
     return {
       requestId,
       kind,
-      runtimePhase: parseRuntimePhase(payload['runtime_phase']),
+      runtimePhase: parseRuntimePhase(payload['runtime_phase'], 'Prompt runtime_phase'),
     }
   }
 
@@ -108,7 +108,7 @@ export function parsePromptExecutionResult(payload: unknown): PromptExecutionRes
   }
   return {
     requestId,
-    runtimePhase: parseRuntimePhase(payload['runtime_phase']),
+    runtimePhase: parseRuntimePhase(payload['runtime_phase'], 'Prompt runtime_phase'),
     outcome,
     errorMessage: typeof errorMessage === 'string' ? errorMessage : null,
   }
@@ -185,24 +185,6 @@ function isToolStatus(value: unknown): value is 'pending' | 'running' | 'complet
 function isStage(value: unknown): value is 'instant' | 'deep' | 'review' { return value === 'instant' || value === 'deep' || value === 'review' }
 function isStageStatus(value: unknown): value is import('../components/AnswerStage').AnswerStageStatus { return ['queued', 'running', 'completed', 'kept', 'corrected', 'cancelled', 'failed', 'stale'].includes(value as string) }
 function isSource(value: unknown): value is AnswerSource {
-  if (!isRecord(value) || typeof value['url'] !== 'string' || typeof value['title'] !== 'string' || value['title'].trim() === '' || new TextEncoder().encode(value['title']).length > 512) return false
+  if (!isRecord(value) || typeof value['url'] !== 'string' || typeof value['title'] !== 'string' || value['title'].trim() === '' || utf8ByteLength(value['title']) > 512) return false
   try { const url = new URL(value['url']); return (url.protocol === 'http:' || url.protocol === 'https:') && value['url'].length <= 2048 } catch { return false }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null
-}
-
-function parseRuntimePhase(payload: unknown): BackendRuntimePhase {
-  if (
-    payload === 'initializing' ||
-    payload === 'sleeping' ||
-    payload === 'listening' ||
-    payload === 'processing' ||
-    payload === 'executing' ||
-    payload === 'error'
-  ) {
-    return payload
-  }
-  throw new Error('Prompt payload must include a supported runtime phase')
 }
