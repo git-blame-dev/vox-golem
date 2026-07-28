@@ -1,0 +1,12 @@
+[package]
+name = "voxgolem-update-verifier"
+version = "0.0.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+base64 = "0.22"
+minisign-verify = "0.2.5"
+
+[lints]
+workspace = true
