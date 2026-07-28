@@ -153,26 +153,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
         run: |
-          release_response="$(mktemp)"
           latest_manifest="$(mktemp)"
-          trap 'rm -f "$release_response" "$latest_manifest"' EXIT
+          trap 'rm -f "$latest_manifest"' EXIT
 
-          release_status="$(curl --silent --show-error \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header 'Accept: application/vnd.github+json' \
-            --output "$release_response" \
-            --write-out '%{http_code}' \
-            "https://api.github.com/repos/${REPOSITORY}/releases/latest")"
-          if [ "$release_status" = 404 ]; then
-            printf '%s\n' 'No published updater version exists; allowing initial release.'
+          manifest_url="$(scripts/select-updater-manifest-url.sh "$REPOSITORY")"
+          if [ -z "$manifest_url" ]; then
+            printf '%s\n' 'No published updater manifest exists; allowing initial updater release.'
             exit 0
           fi
-          if [ "$release_status" != 200 ]; then
-            printf 'Failed to read latest release metadata (HTTP %s).\n' "$release_status" >&2
-            exit 1
-          fi
-
-          manifest_url="$(jq -er '.assets[] | select(.name == "latest.json") | .url' "$release_response")"
           manifest_status="$(curl --silent --show-error --location \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header 'Accept: application/octet-stream' \
