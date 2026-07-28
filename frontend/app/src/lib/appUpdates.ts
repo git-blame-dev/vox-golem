@@ -78,5 +78,5 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isBoundedString(value: unknown): value is string {
-  return typeof value === 'string' && value.length > 0 && value.length <= MAX_UPDATE_TEXT_LENGTH
+  return typeof value === 'string' && value.length > 0 && Array.from(value).length <= MAX_UPDATE_TEXT_LENGTH
 }
