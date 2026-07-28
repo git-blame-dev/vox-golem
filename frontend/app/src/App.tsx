@@ -6,6 +6,7 @@ import { AnswerStage } from './components/AnswerStage'
 import type { AnswerStageStatusEntry, AnswerPriorVersion } from './components/AnswerStage'
 import { PromptComposer } from './components/PromptComposer'
 import { UserNoticeToast } from './components/UserNoticeToast'
+import { UpdateSettings } from './components/UpdateSettings'
 import { playCue } from './lib/audioCues'
 import { shouldSubmitComposer } from './lib/composer'
 import { listAudioInputDevices, startLiveAudioSource } from './lib/liveAudioSource'
@@ -24,6 +25,7 @@ import {
   loadStartupState,
 } from './lib/startupState'
 import { getTauriInternals, invokeTauriCommand } from './lib/tauri'
+import { useAppUpdates } from './lib/useAppUpdates'
 import { DEFAULT_ASSISTANT_SETTINGS, deepOptions, instantOptions, parseAssistantSettings, reviewOptions, serializeAssistantSettings } from './lib/assistantSettings'
 import type { AssistantSettings } from './lib/assistantSettings'
 import { acceptsPartialTranscriptionEvent, parsePartialTranscriptionEvent } from './lib/partialTranscription'
@@ -119,6 +121,7 @@ type RuntimeDiagnosticKind =
   | 'profile'
 
 function App() {
+  const appUpdates = useAppUpdates()
   const [startupState, setStartupState] = useState<StartupState>({ kind: 'loading' })
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus>('initializing')
   const [composerValue, setComposerValue] = useState('')
@@ -2135,6 +2138,7 @@ function App() {
               <label><input type="checkbox" checked={assistantSettings.prefetch} disabled={assistantControlsDisabled} onChange={(event) => void persistAssistantSettings({ ...assistantSettingsRef.current, prefetch: event.target.checked })} /> Prefetch</label>
               <p className="settings-panel__hint">Prefetch may transmit unaccepted predicted text when enabled.</p>
             </div>
+            <UpdateSettings updates={appUpdates} />
           </section>
         </div>
       ) : null}
