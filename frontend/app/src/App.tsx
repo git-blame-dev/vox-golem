@@ -182,6 +182,7 @@ function App() {
     getInitialMessages(),
   )
   const [responseAnnouncement, setResponseAnnouncement] = useState('')
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false)
   const [promptActivity, setPromptActivity] = useState<string | null>(null)
   const [promptState, setPromptState] = useState<'idle' | 'executing' | 'stopping' | 'reconciling'>('idle')
   const [resetPending, setResetPending] = useState(false)
@@ -192,6 +193,8 @@ function App() {
     [messages],
   )
   const conversationRef = useRef<HTMLElement | null>(null)
+  const followLatestRef = useRef(true)
+  const jumpToLatestInProgressRef = useRef(false)
   const settingsButtonRef = useRef<HTMLButtonElement | null>(null)
   const settingsPanelRef = useRef<HTMLElement | null>(null)
   const settingsCloseButtonRef = useRef<HTMLButtonElement | null>(null)
@@ -1007,6 +1010,11 @@ function App() {
       return
     }
 
+    if (!followLatestRef.current) {
+      setShowJumpToLatest(true)
+      return
+    }
+
     if (typeof conversation.scrollTo === 'function') {
       conversation.scrollTo({ top: conversation.scrollHeight })
       return
@@ -1014,6 +1022,35 @@ function App() {
 
     conversation.scrollTop = conversation.scrollHeight
   }, [visibleMessages])
+
+  const onConversationScroll = (): void => {
+    const conversation = conversationRef.current
+    if (conversation === null) return
+    const nearLatest = conversation.scrollHeight - conversation.scrollTop - conversation.clientHeight <= 96
+    if (jumpToLatestInProgressRef.current) {
+      if (nearLatest) jumpToLatestInProgressRef.current = false
+      return
+    }
+    followLatestRef.current = nearLatest
+    setShowJumpToLatest(!nearLatest)
+  }
+
+  const interruptJumpToLatest = (): void => {
+    jumpToLatestInProgressRef.current = false
+  }
+
+  const jumpToLatest = (): void => {
+    const conversation = conversationRef.current
+    if (conversation === null) return
+    followLatestRef.current = true
+    jumpToLatestInProgressRef.current = true
+    setShowJumpToLatest(false)
+    if (typeof conversation.scrollTo === 'function') {
+      conversation.scrollTo({ top: conversation.scrollHeight, behavior: 'smooth' })
+    } else {
+      conversation.scrollTop = conversation.scrollHeight
+    }
+  }
 
   const assistantCapabilities = useMemo(() => capabilityMap(startupState), [startupState])
   const instantAssistantOptions = useMemo(
@@ -2398,6 +2435,9 @@ function App() {
   const onComposerKeyDown = (
     event: KeyboardEvent<HTMLTextAreaElement>,
   ): void => {
+    if (event.nativeEvent.isComposing) {
+      return
+    }
     if (!shouldSubmitComposer(event.key, event.shiftKey)) {
       return
     }
@@ -2637,13 +2677,28 @@ function App() {
   return (
     <div className="shell" data-ui-text-size={uiTextSize} data-ui-theme={uiTheme} data-runtime-status={runtimeStatus}>
 
-      <main ref={conversationRef} className="conversation">
-        {visibleMessages.map((message) => (
-          message.answerStage && message.role === 'assistant' ? (
-            <AnswerStage key={message.id} answer={message.content} className="message message--assistant" {...(message.contentKind === undefined ? {} : { contentKind: message.contentKind })} {...message.answerStage} />
-          ) : <ChatBubble key={message.id} message={message} />
-        ))}
-      </main>
+      <div className="conversation-region">
+        <main
+          ref={conversationRef}
+          className="conversation"
+          onScroll={onConversationScroll}
+          onWheel={interruptJumpToLatest}
+          onTouchStart={interruptJumpToLatest}
+          onPointerDown={interruptJumpToLatest}
+        >
+          {visibleMessages.map((message) => (
+            message.answerStage && message.role === 'assistant' ? (
+              <AnswerStage key={message.id} answer={message.content} className="message message--assistant" {...(message.contentKind === undefined ? {} : { contentKind: message.contentKind })} {...message.answerStage} />
+            ) : <ChatBubble key={message.id} message={message} />
+          ))}
+        </main>
+
+        {showJumpToLatest ? (
+          <button type="button" className="conversation__jump" aria-label="Jump to latest" onClick={jumpToLatest}>
+            Jump to latest
+          </button>
+        ) : null}
+      </div>
 
       <UserNoticeToast notice={notices[0] ?? null} />
       <div className="sr-only" role="status" aria-live="polite" aria-atomic="true" aria-label="Response announcements">
