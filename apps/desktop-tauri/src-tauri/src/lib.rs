@@ -1315,47 +1315,37 @@ async fn set_tts_enabled(
         .tts_startup_generation
         .fetch_add(1, Ordering::SeqCst)
         .saturating_add(1);
-    let needs_runtime = enabled
-        && app_state
-            .local_tts_runtime
-            .lock()
-            .map_err(|_| String::from("local tts runtime lock is poisoned"))?
-            .is_none();
-    let proposed_runtime = if needs_runtime {
-        tauri::async_runtime::spawn_blocking(move || {
-            initialize_local_tts_runtime(&tts_config, true, runtime_file_logging_enabled)
-        })
-        .await
-        .map_err(|error| format!("local tts initialization task failed: {error}"))??
-    } else {
-        None
-    };
-    if app_state.tts_startup_generation.load(Ordering::SeqCst) != operation_generation {
-        if let Some(mut runtime) = proposed_runtime {
-            runtime.shutdown_owned();
-        }
-        return Err(String::from("local tts operation was superseded"));
-    }
+    let current_runtime_present = app_state
+        .local_tts_runtime
+        .lock()
+        .map_err(|_| String::from("local tts runtime lock is poisoned"))?
+        .is_some();
+    let proposed_runtime = prepare_tts_runtime(
+        enabled,
+        current_runtime_present,
+        &tts_config,
+        runtime_file_logging_enabled,
+        operation_generation,
+        &app_state.tts_startup_generation,
+    )
+    .await?;
+    let proposed_runtime = persist_tts_preference(enabled, proposed_runtime)?;
     let mut runtime_guard = app_state
         .local_tts_runtime
         .lock()
         .map_err(|_| String::from("local tts runtime lock is poisoned"))?;
-    if let Err(error) = persist_tts_enabled(enabled) {
-        if let Some(mut runtime) = proposed_runtime {
-            runtime.shutdown_owned();
-        }
-        return Err(error);
-    }
+    let mut unused_proposed_runtime = proposed_runtime;
+    let mut old_runtime = None;
     if enabled {
         if runtime_guard.is_none() {
-            *runtime_guard = proposed_runtime.map(Arc::new);
+            *runtime_guard = unused_proposed_runtime.take().map(Arc::new);
             log_tts_runtime_event(config.logging.enabled, "runtime enabled");
         }
     } else {
         if let Some(runtime) = runtime_guard.as_ref() {
             runtime.cancel_generation();
         }
-        *runtime_guard = None;
+        old_runtime = runtime_guard.take();
         log_tts_runtime_event(config.logging.enabled, "runtime disabled and unloaded");
     }
     let sample_rate_hz = runtime_guard
@@ -1371,6 +1361,8 @@ async fn set_tts_enabled(
             tts::TtsActualProvider::Cpu => "cpu",
         });
     drop(runtime_guard);
+    drop(unused_proposed_runtime);
+    drop(old_runtime);
     let _lifecycle = app_state
         .lifecycle_gate
         .lock()
@@ -1401,6 +1393,50 @@ async fn set_tts_enabled(
         enabled,
         sample_rate_hz,
     })
+}
+
+fn tts_runtime_needs_initialization(enabled: bool, current_runtime_present: bool) -> bool {
+    enabled && !current_runtime_present
+}
+
+async fn prepare_tts_runtime(
+    enabled: bool,
+    current_runtime_present: bool,
+    config: &voxgolem_core::config::LocalTtsConfig,
+    runtime_file_logging_enabled: bool,
+    operation_generation: u64,
+    generation: &AtomicU64,
+) -> Result<Option<tts::LocalTtsRuntime>, String> {
+    let proposed_runtime = if tts_runtime_needs_initialization(enabled, current_runtime_present) {
+        let config = config.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            initialize_local_tts_runtime(&config, true, runtime_file_logging_enabled)
+        })
+        .await
+        .map_err(|error| format!("local tts initialization task failed: {error}"))??
+    } else {
+        None
+    };
+    if generation.load(Ordering::SeqCst) != operation_generation {
+        if let Some(mut runtime) = proposed_runtime {
+            runtime.shutdown_owned();
+        }
+        return Err(String::from("local tts operation was superseded"));
+    }
+    Ok(proposed_runtime)
+}
+
+fn persist_tts_preference(
+    enabled: bool,
+    proposed_runtime: Option<tts::LocalTtsRuntime>,
+) -> Result<Option<tts::LocalTtsRuntime>, String> {
+    if let Err(error) = persist_tts_enabled(enabled) {
+        if let Some(mut runtime) = proposed_runtime {
+            runtime.shutdown_owned();
+        }
+        return Err(error);
+    }
+    Ok(proposed_runtime)
 }
 
 #[tauri::command]
@@ -9892,17 +9928,25 @@ mod tests {
         shutdown_llama_cpp_runtime_for_exit, shutdown_tts_runtime_for_exit,
         startup_warming_state_from_snapshot, supported_response_profiles,
         take_and_invalidate_prefetch, to_runtime_phase_payload, transcribe_finished_utterance,
-        transcription_ready_samples, update_restored_profile_capabilities,
-        validate_prompt_request_id, validate_prompt_text, wake_word_event_timestamp,
-        ActivePromptGuard, AgentChoicePayload, AssistantSettingsPayload, CapabilityPayload,
-        CapabilityStatePayload, CommitAssistantResult, CueAssetPathsPayload, DeepStageResult,
-        DeepTask, InstantChoicePayload, PrefetchEntry, PrefetchKey, ProfilePersistenceRollback,
-        PromptExecutionEventPayload, ResponseProfilePayload, RuntimePhasePayload,
-        RuntimePhaseResponsePayload, RuntimeTelemetryPayload, StagePayload, StageStatusPayload,
-        StartupSnapshot, StartupStatePayload, SupervisedCreation, TerminalKind, UiPreferencesState,
-        UiTextSizePayload, UiThemePayload, DEFAULT_SILENCE_TIMEOUT_MS, PROMPT_MAX_BYTES,
-        PROVIDER_HISTORY_MAX_BYTES,
+        transcription_ready_samples, tts_runtime_needs_initialization,
+        update_restored_profile_capabilities, validate_prompt_request_id, validate_prompt_text,
+        wake_word_event_timestamp, ActivePromptGuard, AgentChoicePayload, AssistantSettingsPayload,
+        CapabilityPayload, CapabilityStatePayload, CommitAssistantResult, CueAssetPathsPayload,
+        DeepStageResult, DeepTask, InstantChoicePayload, PrefetchEntry, PrefetchKey,
+        ProfilePersistenceRollback, PromptExecutionEventPayload, ResponseProfilePayload,
+        RuntimePhasePayload, RuntimePhaseResponsePayload, RuntimeTelemetryPayload, StagePayload,
+        StageStatusPayload, StartupSnapshot, StartupStatePayload, SupervisedCreation, TerminalKind,
+        UiPreferencesState, UiTextSizePayload, UiThemePayload, DEFAULT_SILENCE_TIMEOUT_MS,
+        PROMPT_MAX_BYTES, PROVIDER_HISTORY_MAX_BYTES,
     };
+
+    #[test]
+    fn tts_preparation_only_initializes_when_enabling_without_runtime() {
+        assert!(tts_runtime_needs_initialization(true, false));
+        assert!(!tts_runtime_needs_initialization(true, true));
+        assert!(!tts_runtime_needs_initialization(false, false));
+        assert!(!tts_runtime_needs_initialization(false, true));
+    }
 
     #[test]
     fn ipc_app_snapshot_maps_one_reachable_desktop_state() {
