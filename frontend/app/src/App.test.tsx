@@ -16,6 +16,8 @@ const originalAudio = globalThis.Audio
 const originalAudioContext = globalThis.AudioContext
 const originalDateNow = Date.now
 const originalMathRandom = Math.random
+const originalRequestAnimationFrame = window.requestAnimationFrame
+const originalCancelAnimationFrame = window.cancelAnimationFrame
 
 afterEach(() => {
   for (const root of mountedRoots) {
@@ -53,6 +55,8 @@ afterEach(() => {
   delete document.documentElement.dataset['uiTheme']
   Date.now = originalDateNow
   Math.random = originalMathRandom
+  window.requestAnimationFrame = originalRequestAnimationFrame
+  window.cancelAnimationFrame = originalCancelAnimationFrame
   vi.useRealTimers()
   startLiveAudioSourceMock.mockReset()
   listAudioInputDevicesMock.mockReset()
@@ -1958,10 +1962,22 @@ describe('App', () => {
 
   it('does not reconcile a prompt result after unmount', async () => {
     let finishPrompt: ((value: unknown) => void) | undefined
+    let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
     let requestId = ''
     let snapshotCalls = 0
+    let scheduledFrame: FrameRequestCallback | undefined
+    const requestFrame = vi.fn((callback: FrameRequestCallback) => {
+      scheduledFrame = callback
+      return 73
+    })
+    const cancelFrame = vi.fn()
+    window.requestAnimationFrame = requestFrame
+    window.cancelAnimationFrame = cancelFrame
     window.__TAURI_INTERNALS__ = {
-      listen: async () => () => undefined,
+      listen: async (_event, handler) => {
+        promptEventHandler = handler
+        return () => undefined
+      },
       invoke: async (command, args) => {
         if (command === 'get_app_snapshot') {
           snapshotCalls += 1
@@ -1981,11 +1997,15 @@ describe('App', () => {
       setTextAreaValue(getComposer(container), 'Unmount prompt')
       getSendButton(container).click()
       await Promise.resolve()
+      promptEventHandler?.({ payload: { request_id: requestId, kind: 'text', text: 'Queued output' } })
     })
+    expect(requestFrame).toHaveBeenCalledTimes(1)
     const root = mountedRoots.pop()
     expect(root).toBeDefined()
     act(() => root?.unmount())
+    expect(cancelFrame).toHaveBeenCalledWith(73)
     await act(async () => {
+      scheduledFrame?.(16)
       finishPrompt?.({ request_id: requestId, runtime_phase: 'sleeping', outcome: 'completed' })
       await Promise.resolve()
     })
@@ -4089,6 +4109,70 @@ describe('App', () => {
     })
     expect(container.textContent).not.toContain('Executing prompt')
     expect(getResponseAnnouncer(container).textContent).toBe('Assistant response: Hello world')
+  })
+
+  it('batches streamed deltas by frame and flushes queued text before completion', async () => {
+    let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
+    let finishPrompt: ((value: unknown) => void) | undefined
+    let requestId = ''
+    const scheduledFrames: FrameRequestCallback[] = []
+    const requestFrame = vi.fn((callback: FrameRequestCallback) => {
+      scheduledFrames.push(callback)
+      return 41
+    })
+    const cancelFrame = vi.fn()
+    window.requestAnimationFrame = requestFrame
+    window.cancelAnimationFrame = cancelFrame
+    window.__TAURI_INTERNALS__ = {
+      listen: async (_event, handler) => {
+        promptEventHandler = handler
+        return () => undefined
+      },
+      invoke: async (command, args) => {
+        if (command === 'get_startup_state') return readyStartupState()
+        if (command === 'get_assistant_settings') return defaultAssistantSettings()
+        if (command === 'submit_prompt') {
+          requestId = (args as { requestId: string }).requestId
+          return new Promise((resolve) => { finishPrompt = resolve })
+        }
+        return null
+      },
+    }
+
+    const { container } = await renderApp()
+    await act(async () => {
+      setTextAreaValue(getComposer(container), 'Batch this stream')
+      getSendButton(container).click()
+      await Promise.resolve()
+      promptEventHandler?.({ payload: { request_id: requestId, kind: 'text', text: 'Frame ' } })
+      promptEventHandler?.({ payload: { request_id: requestId, kind: 'text', text: 'one' } })
+    })
+
+    expect(requestFrame).toHaveBeenCalledTimes(1)
+    expect(container.querySelectorAll('.message--assistant')).toHaveLength(0)
+    await act(async () => { scheduledFrames[0]?.(16); await Promise.resolve() })
+    expect(getConversation(container).textContent).toContain('Frame one')
+
+    await act(async () => {
+      promptEventHandler?.({ payload: { request_id: requestId, kind: 'text', text: ' stale' } })
+      promptEventHandler?.({ payload: { request_id: requestId, kind: 'correction', stage: 'deep', text: 'Corrected', correction: 'Correction: corrected' } })
+      promptEventHandler?.({ payload: { request_id: requestId, kind: 'text', text: ' complete' } })
+    })
+    expect(requestFrame).toHaveBeenCalledTimes(3)
+    await act(async () => { scheduledFrames[1]?.(32); await Promise.resolve() })
+    expect(getConversation(container).textContent).not.toContain('Corrected complete')
+    await act(async () => { scheduledFrames[2]?.(48); await Promise.resolve() })
+    expect(getConversation(container).textContent).toContain('Corrected complete')
+
+    await act(async () => {
+      promptEventHandler?.({ payload: { request_id: requestId, kind: 'text', text: ' terminal' } })
+      finishPrompt?.({ request_id: requestId, runtime_phase: 'sleeping', outcome: 'completed' })
+      await Promise.resolve()
+    })
+
+    expect(requestFrame).toHaveBeenCalledTimes(4)
+    expect(cancelFrame).toHaveBeenCalledWith(41)
+    expect(getConversation(container).textContent).toContain('Corrected complete terminal')
   })
 
   it('shows string errors rejected by the Tauri prompt command', async () => {
