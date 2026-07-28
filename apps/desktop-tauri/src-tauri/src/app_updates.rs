@@ -915,6 +915,37 @@ mod tests {
             .contains("failed to fetch update metadata"));
     }
 
+    #[tokio::test]
+    async fn oversized_declared_metadata_response_is_rejected() {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            super::MAX_UPDATE_METADATA_BYTES + 1
+        );
+        assert_eq!(
+            fetch_raw_response(response.into_bytes())
+                .await
+                .expect_err("oversized declared metadata must fail"),
+            "update metadata exceeds the supported size"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_chunked_metadata_response_is_rejected() {
+        let bounded_chunk = vec![b'x'; super::MAX_UPDATE_METADATA_BYTES as usize];
+        let mut response =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+        write!(response, "{:X}\r\n", bounded_chunk.len()).expect("write chunk size");
+        response.extend_from_slice(&bounded_chunk);
+        response.extend_from_slice(b"\r\n1\r\nx\r\n0\r\n\r\n");
+
+        assert_eq!(
+            fetch_raw_response(response)
+                .await
+                .expect_err("oversized streamed metadata must fail"),
+            "update metadata exceeds the supported size"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn appimage_replacement_preserves_mode_and_rejects_symlinks() {
@@ -1161,20 +1192,26 @@ mod tests {
         status: &str,
         body: &str,
     ) -> Result<super::UpdateChannelResult, String> {
+        fetch_raw_response(
+            format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes(),
+        )
+        .await
+    }
+
+    async fn fetch_raw_response(response: Vec<u8>) -> Result<super::UpdateChannelResult, String> {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind metadata server");
         let address = listener.local_addr().expect("metadata server address");
-        let status = String::from(status);
-        let body = String::from(body);
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept metadata request");
             let mut request = [0_u8; 2_048];
             let _ = stream.read(&mut request).expect("read metadata request");
-            write!(
-                stream,
-                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .expect("write metadata response");
+            stream
+                .write_all(&response)
+                .expect("write metadata response");
             listener
                 .set_nonblocking(true)
                 .expect("set metadata listener nonblocking");
