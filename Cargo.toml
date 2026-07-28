@@ -5,7 +5,8 @@ members = [
   "crates/audio",
   "crates/core",
   "crates/model",
-  "crates/platform"
+  "crates/platform",
+  "tools/update-verifier"
 ]
 
 [workspace.package]
