@@ -7761,7 +7761,8 @@ function nonDiagnosticCommands(commands: readonly string[]): readonly string[] {
       command !== 'set_ui_theme' &&
       command !== 'get_app_snapshot' &&
       command !== 'get_assistant_settings' &&
-      command !== 'set_assistant_settings',
+      command !== 'set_assistant_settings' &&
+      command !== 'check_for_update',
   )
 }
 
