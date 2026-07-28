@@ -59,6 +59,7 @@ mkdir -p "$temp_dir/bin" "$temp_dir/plugin-cache"
 printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -eu' \
+  'if [ -n "${FAKE_CURL_ARGS:-}" ]; then printf "%s\n" "$@" > "$FAKE_CURL_ARGS"; fi' \
   'while [ "$#" -gt 0 ]; do' \
   '  if [ "$1" = "--output" ]; then output="$2"; shift 2; else shift; fi' \
   'done' \
@@ -82,10 +83,34 @@ test ! -e "$marker"
 printf '%s\n' 'verified plugin' > "$temp_dir/verified-plugin"
 verified_sha256="$(sha256sum "$temp_dir/verified-plugin" | cut -d ' ' -f 1)"
 PATH="$temp_dir/bin:$PATH" FAKE_CURL_SOURCE="$temp_dir/verified-plugin" \
-  "$root/scripts/prepare-tauri-bundler-tool.sh" "$plugin" 'https://example.invalid/plugin' \
+  FAKE_CURL_ARGS="$temp_dir/curl-args" GITHUB_TOKEN='test-ci-token' \
+  "$root/scripts/prepare-tauri-bundler-tool.sh" "$plugin" \
+  'https://api.github.com/repos/example/tools/releases/assets/1' \
   "$verified_sha256"
 test -x "$plugin"
 printf '%s  %s\n' "$verified_sha256" "$plugin" | sha256sum -c - >/dev/null
+grep -Fx 'Authorization: Bearer test-ci-token' "$temp_dir/curl-args" >/dev/null
+
+rm -f "$plugin"
+PATH="$temp_dir/bin:$PATH" FAKE_CURL_SOURCE="$temp_dir/verified-plugin" \
+  FAKE_CURL_ARGS="$temp_dir/non-api-curl-args" GITHUB_TOKEN='test-ci-token' \
+  "$root/scripts/prepare-tauri-bundler-tool.sh" "$plugin" 'https://example.invalid/plugin' \
+  "$verified_sha256"
+if grep -F 'test-ci-token' "$temp_dir/non-api-curl-args"; then
+  printf '%s\n' 'GitHub token was forwarded to a non-API URL.' >&2
+  exit 1
+fi
+
+rm -f "$plugin"
+PATH="$temp_dir/bin:$PATH" FAKE_CURL_SOURCE="$temp_dir/verified-plugin" \
+  FAKE_CURL_ARGS="$temp_dir/unauthenticated-curl-args" GITHUB_TOKEN='' \
+  "$root/scripts/prepare-tauri-bundler-tool.sh" "$plugin" \
+  'https://api.github.com/repos/example/tools/releases/assets/1' \
+  "$verified_sha256"
+if grep -F 'Authorization:' "$temp_dir/unauthenticated-curl-args"; then
+  printf '%s\n' 'Authorization header was added without a GitHub token.' >&2
+  exit 1
+fi
 
 rm -f "$plugin"
 mkdir "$plugin"

@@ -46,6 +46,8 @@ jobs:
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
       - run: make dist
       - name: Build updater AppImage
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: make update-bundle
       - name: Smoke test staged package
         run: xvfb-run -a make packaged-smoke

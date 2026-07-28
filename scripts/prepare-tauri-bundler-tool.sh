@@ -23,8 +23,17 @@ fi
 
 download="$(mktemp "$target_dir/.tauri-bundler-tool.XXXXXX")"
 trap 'rm -f "$download"' EXIT
-curl --fail --location --proto '=https' --tlsv1.2 \
-  --header 'Accept: application/octet-stream' --output "$download" "$url"
+curl_args=(
+  --fail
+  --location
+  --proto '=https'
+  --tlsv1.2
+  --header 'Accept: application/octet-stream'
+)
+if [[ "$url" == https://api.github.com/* ]] && [ -n "${GITHUB_TOKEN:-}" ]; then
+  curl_args+=(--header "Authorization: Bearer $GITHUB_TOKEN")
+fi
+curl "${curl_args[@]}" --output "$download" "$url"
 printf '%s  %s\n' "$expected_sha256" "$download" | sha256sum -c -
 chmod 0755 "$download"
 mv "$download" "$target"
