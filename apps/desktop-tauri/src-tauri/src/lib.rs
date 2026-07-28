@@ -33,6 +33,7 @@ const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
 #[cfg(windows)]
 const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
 
+mod app_updates;
 mod livekit_wakeword;
 mod partial_transcription;
 mod telemetry;
@@ -7944,6 +7945,7 @@ fn store_llama_runtime_if_current(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
+        .manage(app_updates::PendingUpdate::default())
         .setup(|app| {
             let app_state = build_app_state(app.handle());
             let completion_config = app_state
@@ -8104,6 +8106,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            app_updates::check_for_update,
+            app_updates::install_update,
+            app_updates::restart_for_update,
             get_startup_state,
             set_tts_enabled,
             synthesize_local_tts,
@@ -8137,6 +8142,15 @@ pub fn run() {
     install_unix_signal_exit_handlers(app.handle());
 
     app.run(|app_handle, event| {
+        if let tauri::RunEvent::ExitRequested { ref api, .. } = event {
+            if app_handle
+                .state::<app_updates::PendingUpdate>()
+                .handle_exit_request()
+            {
+                api.prevent_exit();
+                return;
+            }
+        }
         if matches!(event, tauri::RunEvent::Exit) {
             let app_state = app_handle.state::<AppState>();
             if !app_state.exit_cleanup_started.swap(true, Ordering::SeqCst) {

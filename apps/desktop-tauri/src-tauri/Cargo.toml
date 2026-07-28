@@ -16,7 +16,11 @@ ort = { version = "=2.0.0-rc.12", features = ["ndarray", "cuda"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures-util = "0.3"
-tokio = { version = "1", features = ["macros", "signal", "sync", "time"] }
+minisign-verify = "0.2.5"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+semver = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "signal", "sync", "test-util", "time"] }
 tauri = { version = "2", features = ["protocol-asset"] }
 thiserror = "2"
 transcribe-rs = { version = "=0.3.11", features = ["onnx"] }
@@ -33,7 +37,6 @@ tauri-build = { version = "2", features = [] }
 
 [dev-dependencies]
 hound = "3"
-tempfile = "3"
 
 [lints]
 workspace = true
