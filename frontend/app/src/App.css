@@ -380,7 +380,7 @@
 .settings-panel__updates { margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--border-soft); }
 .settings-panel__update-row { display: flex; align-items: center; justify-content: space-between; gap: .75rem; }
 .settings-panel__update-copy { display: flex; align-items: baseline; gap: .6rem; min-width: 0; }
-.settings-panel__update-copy p { margin: 0; color: var(--text-muted); line-height: 1.35; }
+.settings-panel__update-copy p { min-width: 0; margin: 0; overflow-wrap: anywhere; color: var(--text-muted); line-height: 1.35; }
 .settings-panel__update-row .shell__control { flex: 0 0 auto; padding: .42rem .7rem; white-space: nowrap; }
 .settings-panel__update-error { color: var(--danger) !important; }
 

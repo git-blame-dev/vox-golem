@@ -62,4 +62,17 @@ describe('parseUpdateCheckResult', () => {
       reason: 'x'.repeat(2_049),
     })).toThrow('Invalid update check payload')
   })
+
+  it('counts Unicode scalar values at the updater text boundary', () => {
+    const note = '\u{1F916}'.repeat(2_048)
+    const result = parseUpdateCheckResult({
+      status: 'available', current_version: '0.1.0', version: '2.0.0', notes: note,
+    })
+    expect(result).toEqual({
+      status: 'available', currentVersion: '0.1.0', version: '2.0.0', notes: note,
+    })
+    expect(() => parseUpdateCheckResult({
+      status: 'available', current_version: '0.1.0', version: '2.0.0', notes: `${note}\u{1F916}`,
+    })).toThrow('Invalid update check payload')
+  })
 })

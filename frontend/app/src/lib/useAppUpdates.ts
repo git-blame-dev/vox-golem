@@ -8,7 +8,12 @@ export type UpdateState =
   | { readonly kind: 'result'; readonly result: UpdateCheckResult }
   | { readonly kind: 'installing'; readonly version: string }
   | { readonly kind: 'installed'; readonly version: string }
-  | { readonly kind: 'error'; readonly message: string }
+  | {
+      readonly kind: 'error'
+      readonly operation: 'check' | 'install' | 'restart'
+      readonly message: string
+      readonly version?: string
+    }
   | { readonly kind: 'browser' }
 
 export interface AppUpdateController {
@@ -30,7 +35,7 @@ export function useAppUpdates(): AppUpdateController {
       if (revision === requestRevision.current) setState({ kind: 'result', result })
     } catch (error) {
       if (revision === requestRevision.current) {
-        setState({ kind: 'error', message: displayError(error) })
+        setState({ kind: 'error', operation: 'check', message: displayError(error) })
       }
     }
   }, [])
@@ -56,16 +61,19 @@ export function useAppUpdates(): AppUpdateController {
       if (revision === requestRevision.current) setState({ kind: 'installed', version: installedVersion })
     } catch (error) {
       if (revision === requestRevision.current) {
-        setState({ kind: 'error', message: displayError(error) })
+        setState({ kind: 'error', operation: 'install', version, message: displayError(error) })
       }
     }
   }, [])
 
   const restart = useCallback(async (): Promise<void> => {
+    const revision = ++requestRevision.current
     try {
       await restartForUpdate()
     } catch (error) {
-      setState({ kind: 'error', message: displayError(error) })
+      if (revision === requestRevision.current) {
+        setState({ kind: 'error', operation: 'restart', message: displayError(error) })
+      }
     }
   }, [])
 
@@ -73,7 +81,6 @@ export function useAppUpdates(): AppUpdateController {
 }
 
 function displayError(error: unknown): string {
-  if (error instanceof Error) return error.message
-  if (typeof error === 'string') return error
-  return String(error)
+  const message = error instanceof Error ? error.message : typeof error === 'string' ? error : String(error)
+  return Array.from(message).slice(0, 2_048).join('')
 }

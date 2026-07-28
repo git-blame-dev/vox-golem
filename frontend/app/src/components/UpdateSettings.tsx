@@ -15,7 +15,7 @@ export function UpdateSettings({ updates }: UpdateSettingsProps): JSX.Element {
           <strong id="updates-title">Updates</strong>
           <p
             className={presentation.error ? 'settings-panel__update-error' : undefined}
-            role={presentation.error ? 'alert' : presentation.pending ? 'status' : undefined}
+            role={presentation.error ? 'alert' : 'status'}
           >
             {presentation.status}
           </p>
@@ -40,7 +40,12 @@ function updatePresentation(updates: AppUpdateController): {
   if (state.kind === 'checking') return { status: 'Checking...', action: null, pending: true }
   if (state.kind === 'browser') return { status: 'Available in the packaged app', action: null }
   if (state.kind === 'error') {
-    return { status: `Check failed: ${state.message}`, action: action('Retry', updates.check), error: true }
+    const retry = state.operation === 'check'
+      ? updates.check
+      : state.operation === 'install'
+        ? () => updates.install(state.version ?? '')
+        : updates.restart
+    return { status: `${capitalize(state.operation)} failed: ${state.message}`, action: action('Retry', retry), error: true }
   }
   if (state.kind === 'installing') {
     return { status: 'Downloading and verifying...', action: null, pending: true }
@@ -50,6 +55,10 @@ function updatePresentation(updates: AppUpdateController): {
   }
 
   return resultPresentation(state, updates, action)
+}
+
+function capitalize(value: string): string {
+  return value.charAt(0).toUpperCase() + value.slice(1)
 }
 
 function resultPresentation(

@@ -33,6 +33,8 @@ describe('UpdateSettings', () => {
 
     const container = await renderUpdates()
     expect(container.textContent).toContain('Update available')
+    expect(container.querySelector('[role="status"]')?.textContent).toBe('Update available')
+    expect(container.querySelector('[role="alert"]')).toBeNull()
     expect(container.textContent).not.toContain('You have')
     expect(container.textContent).not.toContain('Signed Linux AppImage updates')
     expect(container.querySelectorAll('.settings-panel__update-row')).toHaveLength(1)
@@ -44,6 +46,8 @@ describe('UpdateSettings', () => {
       await Promise.resolve()
     })
     expect(container.textContent).toContain('Update installed')
+    expect(container.querySelector('[role="status"]')?.textContent).toBe('Update installed')
+    expect(container.querySelectorAll('[role="status"]')).toHaveLength(1)
     expect(invoke).toHaveBeenCalledWith('install_update', undefined)
 
     await act(async () => {
@@ -130,6 +134,84 @@ describe('UpdateSettings', () => {
     })
     expect(container.textContent).toContain('Update installed')
     expect(container.textContent).not.toContain('2026.7.27-12')
+  })
+
+  it('reports install failures and retries the original version', async () => {
+    let installs = 0
+    const invoke = vi.fn(async (command: string) => {
+      if (command === 'check_for_update') {
+        return { status: 'available', current_version: '0.1.0', version: '2026.7.27-12', notes: null }
+      }
+      if (command === 'install_update') {
+        installs += 1
+        if (installs === 1) throw new Error('signature rejected')
+        return { version: '2026.7.27-12' }
+      }
+      throw new Error(`unexpected command: ${command}`)
+    })
+    window.__TAURI_INTERNALS__ = { invoke }
+
+    const container = await renderUpdates()
+    await act(async () => {
+      getButton(container, 'Install update').click()
+      await Promise.resolve()
+    })
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe('Install failed: signature rejected')
+
+    await act(async () => {
+      getButton(container, 'Retry').click()
+      await Promise.resolve()
+    })
+    expect(invoke.mock.calls.filter(([command]) => command === 'install_update')).toHaveLength(2)
+  })
+
+  it('keeps a maximum-length unbroken error and Retry action in the update row', async () => {
+    const message = 'x'.repeat(2_048)
+    window.__TAURI_INTERNALS__ = {
+      invoke: vi.fn(async (command: string) => {
+        if (command === 'check_for_update') throw new Error(message)
+        throw new Error(`unexpected command: ${command}`)
+      }),
+    }
+
+    const container = await renderUpdates()
+    const row = container.querySelector('.settings-panel__update-row')
+    expect(row?.querySelector('[role="alert"]')?.textContent).toBe(`Check failed: ${message}`)
+    expect(getButton(container, 'Retry')).toBeInstanceOf(HTMLButtonElement)
+  })
+
+  it('reports restart failures and retries restart', async () => {
+    let restarts = 0
+    const invoke = vi.fn(async (command: string) => {
+      if (command === 'check_for_update') {
+        return { status: 'available', current_version: '0.1.0', version: '2026.7.27-12', notes: null }
+      }
+      if (command === 'install_update') return { version: '2026.7.27-12' }
+      if (command === 'restart_for_update') {
+        restarts += 1
+        if (restarts === 1) throw new Error('restart denied')
+        return null
+      }
+      throw new Error(`unexpected command: ${command}`)
+    })
+    window.__TAURI_INTERNALS__ = { invoke }
+
+    const container = await renderUpdates()
+    await act(async () => {
+      getButton(container, 'Install update').click()
+      await Promise.resolve()
+    })
+    await act(async () => {
+      getButton(container, 'Restart').click()
+      await Promise.resolve()
+    })
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe('Restart failed: restart denied')
+
+    await act(async () => {
+      getButton(container, 'Retry').click()
+      await Promise.resolve()
+    })
+    expect(invoke.mock.calls.filter(([command]) => command === 'restart_for_update')).toHaveLength(2)
   })
 })
 
