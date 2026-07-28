@@ -7,6 +7,30 @@ export CARGO_INCREMENTAL ?= 0
 WINDOWS_TARGET := x86_64-pc-windows-msvc
 LINUX_RELEASE_DIR := $(CURDIR)/target/release
 LINUX_STAGED_RELEASE_DIR := $(CURDIR)/dist/VoxGolem
+LINUX_APPIMAGE_DIR := $(CURDIR)/target/release/bundle/appimage
+override TAURI_CACHE_ROOT := $(if $(XDG_CACHE_HOME),$(XDG_CACHE_HOME),$(HOME)/.cache)
+override TAURI_BUNDLER_CACHE_DIR := $(TAURI_CACHE_ROOT)/tauri
+override TAURI_APPRUN := $(TAURI_BUNDLER_CACHE_DIR)/AppRun-x86_64
+override TAURI_APPRUN_URL := https://api.github.com/repos/tauri-apps/binary-releases/releases/assets/274691722
+override TAURI_APPRUN_SHA256 := f30140a43a0a59e46db21bdefdf749b9e9f2c6946e92afabbacf98b8ae73fb4f
+override TAURI_LINUXDEPLOY := $(TAURI_BUNDLER_CACHE_DIR)/linuxdeploy-x86_64.AppImage
+override TAURI_LINUXDEPLOY_URL := https://api.github.com/repos/tauri-apps/binary-releases/releases/assets/182515537
+override TAURI_LINUXDEPLOY_SHA256 := e762bea85c8eb0d4b3508d46e5c1f037f717d0f9303ae3b4aafc8b04991fa1ef
+override TAURI_GTK_PLUGIN := $(TAURI_BUNDLER_CACHE_DIR)/linuxdeploy-plugin-gtk.sh
+override TAURI_GTK_PLUGIN_URL := https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gtk/b5eb8d05b4c0ed40107fe2158c5d8527f94568ef/linuxdeploy-plugin-gtk.sh
+override TAURI_GTK_PLUGIN_SHA256 := cb379f9b0733e9ad9f8bd78f8c2fa038aef2478523bb7d4c8e64ff6a1ea3501a
+override TAURI_GSTREAMER_PLUGIN := $(TAURI_BUNDLER_CACHE_DIR)/linuxdeploy-plugin-gstreamer.sh
+override TAURI_GSTREAMER_PLUGIN_URL := https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gstreamer/2a2e67491c32995a3f279ad0ecbe77abd512b42a/linuxdeploy-plugin-gstreamer.sh
+override TAURI_GSTREAMER_PLUGIN_SHA256 := c107b49d84edbffc6ab226ed1007e0626a4f7aa2c3a36b7782bef62351d49e94
+override LINUXDEPLOY_APPIMAGE_PLUGIN := $(TAURI_BUNDLER_CACHE_DIR)/linuxdeploy-plugin-appimage.AppImage
+override LINUXDEPLOY_APPIMAGE_PLUGIN_URL := https://api.github.com/repos/linuxdeploy/linuxdeploy-plugin-appimage/releases/assets/462804774
+override LINUXDEPLOY_APPIMAGE_PLUGIN_SHA256 := 1da16a46fa5e058ae740e7c35ed0d36d86cb869ac9cc8a5fd9a1847d7978d99a
+override APPIMAGE_RUNTIME := $(TAURI_BUNDLER_CACHE_DIR)/runtime-x86_64
+override APPIMAGE_RUNTIME_URL := https://api.github.com/repos/AppImage/type2-runtime/releases/assets/456065460
+override APPIMAGE_RUNTIME_SHA256 := 1cc49bcf1e2ccd593c379adb17c9f85a36d619088296504de95b1d06215aebbf
+override MAX_LINUX_APPIMAGE_BYTES := 300000000
+BUILD_SEQUENCE := $(if $(GITHUB_RUN_NUMBER),$(GITHUB_RUN_NUMBER),0)
+override APP_VERSION := $(shell scripts/release-version.sh "$$(git show -s --format=%ct HEAD)" '$(BUILD_SEQUENCE)')
 LINUX_ORT_LIB_DIR ?= $(if $(ORT_LIB_PATH),$(ORT_LIB_PATH),$(LINUX_RELEASE_DIR))
 WINDOWS_RELEASE_DIR := $(CURDIR)/target/$(WINDOWS_TARGET)/release
 WINDOWS_STAGED_RELEASE_DIR := $(CURDIR)/dist/VoxGolem-windows
@@ -63,7 +87,7 @@ LINUX_ORT_PROVIDER_LIBS := \
 
 .DEFAULT_GOAL := help
 
-.PHONY: help test check-linux-tools app app-smoke packaged-smoke app-dev linux dist verify-dist check-pc-tools pc pc-dist verify-pc-dist clean
+.PHONY: help app-version test test-release-tools check-linux-tools app app-smoke packaged-smoke app-dev linux dist verify-dist update-bundle verify-update-bundle update-bundle-smoke check-pc-tools pc pc-dist verify-pc-dist clean
 
 help:
 	@printf '%s\n' 'Targets:'
@@ -72,11 +96,17 @@ help:
 	@printf '%s\n' '  make packaged-smoke Run the staged Linux package from a separate directory'
 	@printf '%s\n' '  make app-dev  Run only the frontend development server'
 	@printf '%s\n' '  make test     Run deterministic Linux frontend and Rust checks'
+	@printf '%s\n' '  make app-version Print the generated application build identity'
 	@printf '%s\n' '  make linux    Build the native Linux Tauri binary'
 	@printf '%s\n' '  make dist     Stage the Linux binary under dist/VoxGolem'
+	@printf '%s\n' '  make update-bundle Build the generated-version Linux AppImage update bundle'
 	@printf '%s\n' '  make pc       Cross-build the optional Windows app from Linux'
 	@printf '%s\n' '  make pc-dist  Stage optional Windows files under dist/VoxGolem-windows'
 	@printf '%s\n' '  make clean    Remove generated build and staging output'
+
+app-version:
+	@test -n '$(APP_VERSION)' || { printf '%s\n' 'Failed to generate application version.' >&2; exit 1; }
+	@printf '%s\n' '$(APP_VERSION)'
 
 test:
 	bun install --frozen-lockfile
@@ -84,9 +114,14 @@ test:
 	bun run lint
 	bun run test
 	bun run build
+	$(MAKE) --no-print-directory test-release-tools
 	cargo fmt --all -- --check
 	cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 	cargo test --locked --workspace
+
+test-release-tools:
+	@command -v jq >/dev/null || { printf '%s\n' 'Missing jq.' >&2; exit 1; }
+	bash scripts/test-release-tools.sh
 
 check-linux-tools:
 	@command -v cargo-tauri >/dev/null || { printf '%s\n' 'Missing Tauri CLI. Install with: cargo install tauri-cli --version 2.11.1 --locked' >&2; exit 1; }
@@ -167,6 +202,61 @@ verify-dist:
 	done
 	@test "$$(find '$(LINUX_STAGED_RELEASE_DIR)' -maxdepth 1 -type f | wc -l)" -eq 3 || { printf '%s\n' 'Unexpected files in Linux package.' >&2; exit 1; }
 	@printf 'vox-golem\t%s bytes\n' "$$(stat -c '%s' '$(LINUX_STAGED_RELEASE_DIR)/vox-golem')"
+
+update-bundle: check-linux-tools
+	@test -n '$(APP_VERSION)' || { printf '%s\n' 'Failed to generate application version.' >&2; exit 1; }
+	@case '$(APP_VERSION)' in *[!0-9A-Za-z.-]*|'') printf 'Invalid APP_VERSION: %s\n' '$(APP_VERSION)' >&2; exit 1;; esac
+	@test -n '$(XDG_CACHE_HOME)$(HOME)' || { printf '%s\n' 'An absolute XDG_CACHE_HOME or HOME is required for Tauri tool pinning.' >&2; exit 1; }
+	@case '$(TAURI_CACHE_ROOT)' in /*) ;; *) printf 'Tauri cache root must be absolute: %s\n' '$(TAURI_CACHE_ROOT)' >&2; exit 1;; esac
+	bash scripts/prepare-tauri-bundler-tool.sh '$(TAURI_APPRUN)' '$(TAURI_APPRUN_URL)' '$(TAURI_APPRUN_SHA256)'
+	bash scripts/prepare-tauri-bundler-tool.sh '$(TAURI_LINUXDEPLOY)' '$(TAURI_LINUXDEPLOY_URL)' '$(TAURI_LINUXDEPLOY_SHA256)'
+	bash scripts/prepare-tauri-bundler-tool.sh '$(TAURI_GTK_PLUGIN)' '$(TAURI_GTK_PLUGIN_URL)' '$(TAURI_GTK_PLUGIN_SHA256)'
+	bash scripts/prepare-tauri-bundler-tool.sh '$(TAURI_GSTREAMER_PLUGIN)' '$(TAURI_GSTREAMER_PLUGIN_URL)' '$(TAURI_GSTREAMER_PLUGIN_SHA256)'
+	bash scripts/prepare-tauri-bundler-tool.sh '$(LINUXDEPLOY_APPIMAGE_PLUGIN)' '$(LINUXDEPLOY_APPIMAGE_PLUGIN_URL)' '$(LINUXDEPLOY_APPIMAGE_PLUGIN_SHA256)'
+	bash scripts/prepare-tauri-bundler-tool.sh '$(APPIMAGE_RUNTIME)' '$(APPIMAGE_RUNTIME_URL)' '$(APPIMAGE_RUNTIME_SHA256)'
+	@rm -rf '$(LINUX_APPIMAGE_DIR)'
+	bun install --frozen-lockfile
+	LDAI_RUNTIME_FILE='$(APPIMAGE_RUNTIME)' cargo tauri build --bundles appimage --config '{"version":"$(APP_VERSION)","bundle":{"createUpdaterArtifacts":false}}' -- --locked
+	@test -x '$(LINUXDEPLOY_APPIMAGE_PLUGIN)' || { printf 'Missing Tauri AppImage plugin: %s\n' '$(LINUXDEPLOY_APPIMAGE_PLUGIN)' >&2; exit 1; }
+	@printf '%s  %s\n' '$(LINUXDEPLOY_APPIMAGE_PLUGIN_SHA256)' '$(LINUXDEPLOY_APPIMAGE_PLUGIN)' | sha256sum -c -
+	@set -eu; \
+		mapfile -t appimages < <(find '$(LINUX_APPIMAGE_DIR)' -maxdepth 1 -type f -name '*.AppImage'); \
+		test "$${#appimages[@]}" -eq 1; \
+		appimage="$${appimages[0]}"; appdir='$(LINUX_APPIMAGE_DIR)/VoxGolem.AppDir'; \
+		bash scripts/prepare-update-appdir.sh "$$appdir" '$(LINUX_RELEASE_DIR)'; \
+		rm "$$appimage"; \
+		(cd '$(LINUX_APPIMAGE_DIR)' && ARCH=x86_64 LDAI_RUNTIME_FILE='$(APPIMAGE_RUNTIME)' '$(LINUXDEPLOY_APPIMAGE_PLUGIN)' --appimage-extract-and-run --appdir="$$appdir"); \
+		mapfile -t rebuilt < <(find '$(LINUX_APPIMAGE_DIR)' -maxdepth 1 -type f -name '*.AppImage'); \
+		test "$${#rebuilt[@]}" -eq 1 || { printf 'Expected one rebuilt AppImage, found %s.\n' "$${#rebuilt[@]}" >&2; exit 1; }; \
+		mv "$${rebuilt[0]}" "$$appimage"
+	@$(MAKE) --no-print-directory verify-update-bundle
+
+verify-update-bundle:
+	@set -eu; \
+		mapfile -t appimages < <(find '$(LINUX_APPIMAGE_DIR)' -maxdepth 1 -type f -name '*.AppImage' | sort); \
+		test "$${#appimages[@]}" -eq 1 || { printf 'Expected one AppImage, found %s.\n' "$${#appimages[@]}" >&2; exit 1; }; \
+		test -x "$${appimages[0]}" || { printf 'AppImage is not executable: %s\n' "$${appimages[0]}" >&2; exit 1; }; \
+		temp_dir="$$(mktemp -d)"; trap 'rm -rf "$$temp_dir"' EXIT; \
+		(cd "$$temp_dir" && "$${appimages[0]}" --appimage-extract >/dev/null); \
+		for provider in $(LINUX_ORT_PROVIDER_LIBS); do \
+			test -x "$$temp_dir/squashfs-root/usr/lib/$$provider" || { printf 'AppImage is missing executable provider: %s\n' "$$provider" >&2; exit 1; }; \
+		done; \
+		mapfile -t appsink_plugins < <(find "$$temp_dir/squashfs-root/usr/lib" -type f -name 'libgstapp.so*'); \
+		test "$${#appsink_plugins[@]}" -gt 0 || { printf '%s\n' 'AppImage is missing the GStreamer appsink plugin.' >&2; exit 1; }; \
+		if grep -R -Fq 'GDK_BACKEND=x11' "$$temp_dir/squashfs-root/apprun-hooks"; then printf '%s\n' 'AppImage launcher forces unsupported X11.' >&2; exit 1; fi; \
+		mapfile -t bundled_cuda < <(find "$$temp_dir/squashfs-root/usr/lib" -maxdepth 1 \( -name 'libcublas*.so*' -o -name 'libcudart*.so*' -o -name 'libcudnn*.so*' -o -name 'libcufft*.so*' -o -name 'libcurand*.so*' -o -name 'libnvrtc*.so*' -o -name 'libcuda*.so*' \)); \
+		test "$${#bundled_cuda[@]}" -eq 0 || { printf 'AppImage unexpectedly bundles CUDA system libraries:\n%s\n' "$${bundled_cuda[*]}" >&2; exit 1; }; \
+		size="$$(stat -c '%s' "$${appimages[0]}")"; test "$$size" -le '$(MAX_LINUX_APPIMAGE_BYTES)' || { printf 'AppImage exceeds size limit: %s > %s bytes.\n' "$$size" '$(MAX_LINUX_APPIMAGE_BYTES)' >&2; exit 1; }; \
+		printf 'Linux updater AppImage: %s (%s bytes)\n' "$${appimages[0]}" "$$(stat -c '%s' "$${appimages[0]}")"
+
+update-bundle-smoke: verify-update-bundle
+	@set -eu; \
+		appimage="$$(find '$(LINUX_APPIMAGE_DIR)' -maxdepth 1 -type f -name '*.AppImage')"; \
+		smoke_pid=; smoke_log="/tmp/vox-golem-appimage-smoke.$$$$.log"; smoke_config="$$(mktemp /tmp/vox-golem-appimage-config.XXXXXX)"; \
+		cleanup() { status="$$1"; if [ -n "$$smoke_pid" ] && kill -0 "$$smoke_pid" 2>/dev/null; then kill -TERM -- "-$$smoke_pid" 2>/dev/null || true; sleep 1; kill -KILL -- "-$$smoke_pid" 2>/dev/null || true; wait "$$smoke_pid" 2>/dev/null || true; fi; if [ "$$status" -ne 0 ] && [ -f "$$smoke_log" ]; then cat "$$smoke_log" >&2 || true; fi; rm -f "$$smoke_config" "$$smoke_log" || true; }; \
+		trap 'status=$$?; cleanup "$$status"; exit "$$status"' EXIT; \
+		setsid env VOXGOLEM_CONFIG_PATH="$$smoke_config" "$$appimage" >"$$smoke_log" 2>&1 & smoke_pid=$$!; \
+		bash scripts/wait-for-appimage-startup.sh "$$smoke_pid" "$$smoke_log" 30 5
 
 packaged-smoke: verify-dist
 	@set -eu; \

@@ -21,7 +21,7 @@ jobs:
   publish-release:
     name: Publish GitHub release
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 30
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.head_branch == 'main' &&
@@ -35,33 +35,16 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.workflow_run.head_sha }}
 
-      - name: Generate calendar version
+      - name: Generate application and release versions
         id: version
         shell: bash
+        env:
+          CI_RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
         run: |
-          git fetch --tags --force
-
-          date_part="$(date -u +'%Y.%m.%d')"
-          next_daily_number=1
-
-          while IFS= read -r tag; do
-            suffix="${tag##*.}"
-            case "$suffix" in
-              ''|*[!0-9]*)
-                continue
-                ;;
-            esac
-
-            suffix_number=$((10#$suffix))
-            if [ "$suffix_number" -ge "$next_daily_number" ]; then
-              next_daily_number=$((suffix_number + 1))
-            fi
-          done <<EOF
-          $(git tag --list "v${date_part}.*")
-          EOF
-
-          version="v${date_part}.${next_daily_number}"
-          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          commit_timestamp="$(git show -s --format=%ct HEAD)"
+          app_version="$(scripts/release-version.sh "$commit_timestamp" "$CI_RUN_NUMBER")"
+          printf 'app_version=%s\n' "$app_version" >> "$GITHUB_OUTPUT"
+          printf 'version=v%s\n' "$app_version" >> "$GITHUB_OUTPUT"
 
       - name: Determine release scope
         id: release_scope
@@ -96,7 +79,12 @@ jobs:
               release_assets="$(gh release view "$existing_tag" --repo "$REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null || true)"
               missing_assets=false
 
-              for required_asset in "vox-golem-linux-${existing_tag}.zip" 'SHA256SUMS'; do
+              for required_asset in \
+                "vox-golem-linux-${existing_tag}.zip" \
+                "vox-golem-linux-x86_64-${existing_tag}.AppImage" \
+                "vox-golem-linux-x86_64-${existing_tag}.AppImage.sig" \
+                'latest.json' \
+                'SHA256SUMS'; do
                 if ! printf '%s\n' "$release_assets" | grep -Fxq "$required_asset"; then
                   printf 'Existing release %s is missing required asset %s.\n' "$existing_tag" "$required_asset" >&2
                   missing_assets=true
@@ -136,7 +124,7 @@ jobs:
             [ -n "$path" ] || continue
 
             case "$path" in
-              Makefile|.github/workflows/ci.yml|.github/workflows/release.yml|apps/*|crates/*|frontend/*|Cargo.toml|Cargo.lock|bun.lock|package.json|tsconfig.base.json)
+              Makefile|.github/workflows/ci.yml|.github/workflows/release.yml|apps/*|crates/*|frontend/*|scripts/*|Cargo.toml|Cargo.lock|bun.lock|package.json|tsconfig.base.json)
                 has_release_artifact_input_change=true
                 ;;
             esac
@@ -157,6 +145,47 @@ jobs:
         if: steps.release_scope.outputs.should_publish != 'true'
         run: |
           printf 'Skipping release: %s.\n' "${{ steps.release_scope.outputs.skip_reason }}"
+
+      - name: Require increasing application version
+        if: steps.release_scope.outputs.should_publish == 'true'
+        env:
+          APP_VERSION: ${{ steps.version.outputs.app_version }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          release_response="$(mktemp)"
+          latest_manifest="$(mktemp)"
+          trap 'rm -f "$release_response" "$latest_manifest"' EXIT
+
+          release_status="$(curl --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --output "$release_response" \
+            --write-out '%{http_code}' \
+            "https://api.github.com/repos/${REPOSITORY}/releases/latest")"
+          if [ "$release_status" = 404 ]; then
+            printf '%s\n' 'No published updater version exists; allowing initial release.'
+            exit 0
+          fi
+          if [ "$release_status" != 200 ]; then
+            printf 'Failed to read latest release metadata (HTTP %s).\n' "$release_status" >&2
+            exit 1
+          fi
+
+          manifest_url="$(jq -er '.assets[] | select(.name == "latest.json") | .url' "$release_response")"
+          manifest_status="$(curl --silent --show-error --location \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/octet-stream' \
+            --output "$latest_manifest" \
+            --write-out '%{http_code}' \
+            "$manifest_url")"
+          if [ "$manifest_status" != 200 ]; then
+            printf 'Failed to read latest updater manifest (HTTP %s).\n' "$manifest_status" >&2
+            exit 1
+          fi
+
+          previous_version="$(jq -er '.version | strings' "$latest_manifest")"
+          scripts/assert-release-version-newer.sh "$APP_VERSION" "$previous_version"
 
       - name: Confirm main still targets released commit
         if: steps.release_scope.outputs.should_publish == 'true'
@@ -191,6 +220,8 @@ jobs:
              test -f "package/VoxGolem/$provider"
              test "$(stat -c '%a' "package/VoxGolem/$provider")" = 755
            done
+           test -x package/VoxGolem.AppImage
+           test "$(cat package/APP_VERSION)" = '${{ steps.version.outputs.app_version }}'
 
       - name: Create release zip
         if: steps.release_scope.outputs.should_publish == 'true'
@@ -263,13 +294,67 @@ jobs:
             exit 1
           fi
 
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        if: steps.release_scope.outputs.should_publish == 'true'
+        with:
+          toolchain: stable
+
+      - name: Install Tauri signer
+        if: steps.release_scope.outputs.should_publish == 'true'
+        run: cargo install tauri-cli --version 2.11.1 --locked
+
+      - name: Prepare updater artifact
+        if: steps.release_scope.outputs.should_publish == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          asset="vox-golem-linux-x86_64-${VERSION}.AppImage"
+          cp package/VoxGolem.AppImage "dist/$asset"
+
+      - name: Sign updater artifact
+        if: steps.release_scope.outputs.should_publish == 'true'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          test -n "$TAURI_SIGNING_PRIVATE_KEY" || { printf '%s\n' 'TAURI_SIGNING_PRIVATE_KEY is required.' >&2; exit 1; }
+          asset="vox-golem-linux-x86_64-${VERSION}.AppImage"
+          cargo tauri signer sign --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "dist/$asset"
+
+      - name: Generate updater manifest
+        if: steps.release_scope.outputs.should_publish == 'true'
+        env:
+          APP_VERSION: ${{ steps.version.outputs.app_version }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          asset="vox-golem-linux-x86_64-${VERSION}.AppImage"
+          scripts/generate-update-manifest.sh \
+            "$APP_VERSION" "$VERSION" "$asset" "dist/$asset.sig" "dist/latest.json"
+          test -s "dist/$asset.sig"
+          test -s dist/latest.json
+
+      - name: Verify updater signature against embedded key
+        if: steps.release_scope.outputs.should_publish == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          asset="vox-golem-linux-x86_64-${VERSION}.AppImage"
+          public_key="$(jq -er '.plugins.updater.pubkey' apps/desktop-tauri/src-tauri/tauri.conf.json)"
+          cargo run --locked -p voxgolem-update-verifier -- \
+            "$public_key" "dist/$asset.sig" "dist/$asset"
+
       - name: Generate release checksums
         if: steps.release_scope.outputs.should_publish == 'true'
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           cd dist
-          sha256sum "vox-golem-linux-${VERSION}.zip" > SHA256SUMS
+          sha256sum \
+            "vox-golem-linux-${VERSION}.zip" \
+            "vox-golem-linux-x86_64-${VERSION}.AppImage" \
+            "vox-golem-linux-x86_64-${VERSION}.AppImage.sig" \
+            latest.json > SHA256SUMS
 
       - name: Generate release notes
         if: steps.release_scope.outputs.should_publish == 'true'
@@ -300,6 +385,8 @@ jobs:
 
             printf '\n## Artifacts\n\n'
             printf -- "- Linux app: \`VoxGolem/vox-golem\`\n"
+            printf -- "- Signed Linux updater: \`vox-golem-linux-x86_64-${VERSION}.AppImage\`\n"
+            printf -- "- Updater metadata: \`latest.json\`\n"
             printf -- "- Runtime models and system libraries are external dependencies\n"
             printf -- "- Checksums: \`SHA256SUMS\`\n"
 
