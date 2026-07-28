@@ -26,6 +26,7 @@ export interface AnswerSource { readonly url: string; readonly title: string }
 
 export interface AnswerStageProps {
   readonly answer: string
+  readonly contentKind?: import('../types/chat').MessageContentKind
   readonly stages: readonly AnswerStageStatusEntry[]
   readonly priorVersions?: readonly AnswerPriorVersion[]
   readonly sources?: readonly AnswerSource[]
@@ -53,12 +54,12 @@ function PlainText({ children }: { readonly children: string }): ReactNode {
   return children
 }
 
-export function AnswerStage({ answer, stages, priorVersions = [], sources = [], className }: AnswerStageProps) {
+export function AnswerStage({ answer, contentKind = 'text', stages, priorVersions = [], sources = [], className }: AnswerStageProps) {
   const rootClassName = className === undefined ? 'answer-stage' : `answer-stage ${className}`
 
   return (
-    <section className={rootClassName} aria-label="Current answer">
-      <h2>Current answer</h2>
+    <section className={rootClassName} aria-label={contentKind === 'refusal' ? 'Assistant refusal' : 'Current answer'} data-content-kind={contentKind}>
+      <h2>{contentKind === 'refusal' ? 'Assistant refusal' : 'Current answer'}</h2>
       <p className="answer-stage__answer"><PlainText>{answer}</PlainText></p>
       {sources.length === 0 ? null : <ul className="answer-stage__sources" aria-label="Sources">
         {sources.map((source) => <li key={source.url}><a href={source.url} target="_blank" rel="noreferrer">{source.title}</a></li>)}
