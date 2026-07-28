@@ -93,6 +93,54 @@ describe('App', () => {
     expect(scrollToSpy.mock.calls.length).toBeGreaterThan(baselineCalls)
   })
 
+  it('preserves an older reading position until Jump to latest is requested', async () => {
+    const { container } = await renderApp()
+    const conversation = getConversation(container)
+    const scrollToSpy = vi.fn()
+    Object.defineProperties(conversation, {
+      clientHeight: { configurable: true, value: 400 },
+      scrollHeight: { configurable: true, value: 1_000 },
+      scrollTop: { configurable: true, value: 100, writable: true },
+      scrollTo: { configurable: true, value: scrollToSpy },
+    })
+    await act(async () => {
+      conversation.dispatchEvent(new Event('scroll', { bubbles: true }))
+    })
+    expect(getButtonByLabel(container, 'Jump to latest')).not.toBeNull()
+    await act(async () => {
+      setTextAreaValue(getComposer(container), 'Keep my reading position')
+      getSendButton(container).click()
+      await Promise.resolve()
+    })
+
+    expect(scrollToSpy).not.toHaveBeenCalled()
+    expect(getButtonByLabel(container, 'Jump to latest')).not.toBeNull()
+    await act(async () => { getButtonByLabel(container, 'Jump to latest').click() })
+    expect(scrollToSpy).toHaveBeenCalledWith({ top: 1_000, behavior: 'smooth' })
+    expect(container.querySelector('button[aria-label="Jump to latest"]')).toBeNull()
+
+    const callsAfterJump = scrollToSpy.mock.calls.length
+    conversation.scrollTop = 250
+    await act(async () => {
+      conversation.dispatchEvent(new Event('scroll', { bubbles: true }))
+      setTextAreaValue(getComposer(container), 'Follow during smooth scroll')
+      getSendButton(container).click()
+      await Promise.resolve()
+    })
+    expect(scrollToSpy.mock.calls.length).toBeGreaterThan(callsAfterJump)
+    expect(container.querySelector('button[aria-label="Jump to latest"]')).toBeNull()
+
+    conversation.scrollTop = 100
+    await act(async () => {
+      conversation.dispatchEvent(new WheelEvent('wheel', { bubbles: true }))
+      conversation.dispatchEvent(new Event('scroll', { bubbles: true }))
+    })
+    expect(getButtonByLabel(container, 'Jump to latest')).not.toBeNull()
+    conversation.scrollTop = 600
+    await act(async () => { conversation.dispatchEvent(new Event('scroll', { bubbles: true })) })
+    expect(container.querySelector('button[aria-label="Jump to latest"]')).toBeNull()
+  })
+
   it('submits from send button and renders prompt/response history', async () => {
     const { container } = await renderApp()
     const composer = getComposer(container)
@@ -2937,6 +2985,20 @@ describe('App', () => {
         new KeyboardEvent('keydown', {
           key: 'Enter',
           shiftKey: true,
+          bubbles: true,
+        }),
+      )
+    })
+
+    expect(container.textContent).not.toContain(
+      'Browser preview only — no backend response was generated. Prompt: Line one',
+    )
+
+    await act(async () => {
+      composer.dispatchEvent(
+        new KeyboardEvent('keydown', {
+          key: 'Enter',
+          isComposing: true,
           bubbles: true,
         }),
       )
