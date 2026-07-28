@@ -40,6 +40,39 @@ jq -e '
   .platforms["linux-x86_64"].url == "https://github.com/git-blame-dev/vox-golem/releases/download/v2026.7.27-42/vox-golem-linux-x86_64-v2026.7.27-42.AppImage"
 ' "$temp_dir/latest.json" >/dev/null
 
+mkdir -p "$temp_dir/release-api-bin"
+# The generated stub must retain these variables for its own runtime.
+# shellcheck disable=SC2016
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -eu' \
+  'if [ "${FAKE_GH_FAIL:-}" = 1 ]; then exit 1; fi' \
+  'printf "%s\n" "$FAKE_GH_RELEASES"' > "$temp_dir/release-api-bin/gh"
+chmod 0755 "$temp_dir/release-api-bin/gh"
+
+release_history="$(printf '%s\n' \
+  '{"draft":true,"prerelease":false,"assets":[{"name":"latest.json","url":"https://example.invalid/draft"}]}' \
+  '{"draft":false,"prerelease":true,"assets":[{"name":"latest.json","url":"https://example.invalid/prerelease"}]}' \
+  '{"draft":false,"prerelease":false,"assets":[]}' \
+  '{"draft":false,"prerelease":false,"assets":[{"name":"latest.json","url":"https://example.invalid/older-updater"}]}')"
+manifest_url="$(
+  PATH="$temp_dir/release-api-bin:$PATH" FAKE_GH_RELEASES="$release_history" \
+    "$root/scripts/select-updater-manifest-url.sh" 'example/repository'
+)"
+test "$manifest_url" = 'https://example.invalid/older-updater'
+
+manifest_url="$(
+  PATH="$temp_dir/release-api-bin:$PATH" \
+    FAKE_GH_RELEASES='{"draft":false,"prerelease":false,"assets":[]}' \
+    "$root/scripts/select-updater-manifest-url.sh" 'example/repository'
+)"
+test -z "$manifest_url"
+if PATH="$temp_dir/release-api-bin:$PATH" FAKE_GH_FAIL=1 FAKE_GH_RELEASES='' \
+  "$root/scripts/select-updater-manifest-url.sh" 'example/repository'; then
+  printf '%s\n' 'Failed release-history lookup unexpectedly allowed publication.' >&2
+  exit 1
+fi
+
 mkdir -p "$temp_dir/AppDir/apprun-hooks" "$temp_dir/AppDir/usr/lib" "$temp_dir/providers"
 printf '%s\n' '#!/bin/sh' 'export GTK_THEME=Adwaita' 'export GDK_BACKEND=x11 # forced fallback' > \
   "$temp_dir/AppDir/apprun-hooks/linuxdeploy-plugin-gtk.sh"
