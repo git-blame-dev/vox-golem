@@ -630,3 +630,23 @@
     right: 1rem;
   }
 }
+
+@media (max-width: 599px) {
+  .settings-overlay {
+    align-items: stretch;
+    padding: 0;
+    min-height: 100dvh;
+  }
+
+  .settings-panel {
+    width: 100%;
+    max-height: 100dvh;
+    min-height: 100dvh;
+    box-sizing: border-box;
+    border-radius: 0;
+    padding: calc(1rem + env(safe-area-inset-top))
+      calc(1rem + env(safe-area-inset-right))
+      calc(1rem + env(safe-area-inset-bottom))
+      calc(1rem + env(safe-area-inset-left));
+  }
+}

@@ -1,7 +1,7 @@
 import { StrictMode, act } from 'react'
 import { createRoot } from 'react-dom/client'
 import type { Root } from 'react-dom/client'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as liveAudioSourceModule from './lib/liveAudioSource'
 import type { StartLiveAudioSourceOptions } from './lib/liveAudioSource'
 import App from './App'
@@ -18,6 +18,102 @@ const originalDateNow = Date.now
 const originalMathRandom = Math.random
 const originalRequestAnimationFrame = window.requestAnimationFrame
 const originalCancelAnimationFrame = window.cancelAnimationFrame
+const originalHistoryPushState = window.history.pushState
+const originalHistoryReplaceState = window.history.replaceState
+const originalHistoryBack = window.history.back
+const originalHistoryForward = window.history.forward
+const originalBodyOverflow = document.body.style.getPropertyValue('overflow')
+const originalBodyOverflowPriority = document.body.style.getPropertyPriority('overflow')
+const originalBodyOverflowX = document.body.style.getPropertyValue('overflow-x')
+const originalBodyOverflowXPriority = document.body.style.getPropertyPriority('overflow-x')
+const originalBodyOverflowY = document.body.style.getPropertyValue('overflow-y')
+const originalBodyOverflowYPriority = document.body.style.getPropertyPriority('overflow-y')
+
+interface TestHistoryHarness {
+  entries: unknown[]
+  index: number
+  backCalls: number
+  forwardCalls: number
+  deferBack: boolean
+  settleBack: () => void
+  pushState: typeof window.history.pushState
+  replaceState: typeof window.history.replaceState
+  back: typeof window.history.back
+  forward: typeof window.history.forward
+  setCurrentState: (state: unknown) => void
+}
+
+let historyHarness: TestHistoryHarness | null = null
+
+function installHistoryHarness(): void {
+  const initialState = window.history.state
+  const entries: unknown[] = [initialState]
+  let index = 0
+  let pendingBack = false
+  const expose = (url = window.location.href): void => originalHistoryReplaceState.call(
+    window.history,
+    entries[index] ?? null,
+    '',
+    url,
+  )
+  const traverse = (nextIndex: number): void => {
+    if (nextIndex < 0 || nextIndex >= entries.length) return
+    index = nextIndex
+    harness.index = index
+    expose()
+    const traversedState = entries[index]
+    queueMicrotask(() => window.dispatchEvent(new PopStateEvent('popstate', { state: traversedState })))
+  }
+  const harness: TestHistoryHarness = {
+    entries,
+    index,
+    backCalls: 0,
+    forwardCalls: 0,
+    deferBack: false,
+    settleBack: () => {
+      if (!pendingBack) return
+      pendingBack = false
+      traverse(index - 1)
+    },
+    pushState: ((state: unknown) => {
+      entries.splice(index + 1)
+      entries.push(state)
+      index += 1
+      harness.index = index
+      expose()
+    }) as typeof window.history.pushState,
+    replaceState: ((state: unknown, _unused: string, url?: string | URL | null) => {
+      entries[index] = state
+      expose(url === undefined || url === null ? window.location.href : String(url))
+    }) as typeof window.history.replaceState,
+    back: (() => {
+      harness.backCalls += 1
+      if (harness.deferBack) {
+        pendingBack = true
+      } else {
+        traverse(index - 1)
+      }
+    }) as typeof window.history.back,
+    forward: (() => {
+      harness.forwardCalls += 1
+      traverse(index + 1)
+    }) as typeof window.history.forward,
+    setCurrentState: (state: unknown) => {
+      entries[index] = state
+      expose()
+    },
+  }
+  historyHarness = harness
+  Object.defineProperty(window.history, 'pushState', { configurable: true, value: harness.pushState })
+  Object.defineProperty(window.history, 'replaceState', { configurable: true, value: harness.replaceState })
+  Object.defineProperty(window.history, 'back', { configurable: true, value: harness.back })
+  Object.defineProperty(window.history, 'forward', { configurable: true, value: harness.forward })
+  expose()
+}
+
+beforeEach(() => {
+  installHistoryHarness()
+})
 
 afterEach(() => {
   for (const root of mountedRoots) {
@@ -57,11 +153,20 @@ afterEach(() => {
   Math.random = originalMathRandom
   window.requestAnimationFrame = originalRequestAnimationFrame
   window.cancelAnimationFrame = originalCancelAnimationFrame
+  Object.defineProperty(window.history, 'pushState', { configurable: true, value: originalHistoryPushState })
+  Object.defineProperty(window.history, 'replaceState', { configurable: true, value: originalHistoryReplaceState })
+  Object.defineProperty(window.history, 'back', { configurable: true, value: originalHistoryBack })
+  Object.defineProperty(window.history, 'forward', { configurable: true, value: originalHistoryForward })
+  document.body.style.setProperty('overflow', originalBodyOverflow, originalBodyOverflowPriority)
+  document.body.style.setProperty('overflow-x', originalBodyOverflowX, originalBodyOverflowXPriority)
+  document.body.style.setProperty('overflow-y', originalBodyOverflowY, originalBodyOverflowYPriority)
   vi.useRealTimers()
   startLiveAudioSourceMock.mockReset()
   listAudioInputDevicesMock.mockReset()
   listAudioInputDevicesMock.mockResolvedValue([])
   window.localStorage.removeItem('voxgolem.audioInputDeviceId')
+  originalHistoryReplaceState.call(window.history, null, '', window.location.href)
+  historyHarness = null
 })
 
 describe('App', () => {
@@ -2903,10 +3008,164 @@ describe('App', () => {
     await act(async () => {
       closeButton.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
       await new Promise((resolve) => window.setTimeout(resolve, 0))
+      await new Promise((resolve) => window.setTimeout(resolve, 0))
     })
 
     expect(container.textContent).not.toContain('Adjust the app text size live.')
     expect(document.activeElement).toBe(settingsButton)
+  })
+
+  it('marks settings history once, exposes dialog ownership, and restores body scrolling', async () => {
+    const originalOverflow = document.body.style.overflow
+    document.body.style.setProperty('overflow', 'scroll', 'important')
+    document.body.style.setProperty('overflow-x', 'clip', 'important')
+    document.body.style.setProperty('overflow-y', 'auto', 'important')
+    const { container } = await renderApp()
+    const opener = getButtonByLabel(container, 'Settings')
+
+    await act(async () => { opener.click(); await Promise.resolve() })
+    expect(opener.getAttribute('aria-controls')).toBe('settings-dialog')
+    expect(container.querySelector('[role="dialog"]')?.id).toBe('settings-dialog')
+    expect(document.body.style.overflowX).toBe('hidden')
+    expect(document.body.style.overflowY).toBe('hidden')
+    expect(historyHarness?.entries).toHaveLength(2)
+    expect(historyHarness?.entries[1]).toMatchObject({ __voxgolemSettingsOpen: expect.any(String) })
+
+    await act(async () => { getButtonByLabel(container, 'Close settings').click() })
+    expect(historyHarness?.backCalls).toBe(1)
+    expect(document.body.style.overflow).toBe('scroll')
+    expect(document.body.style.overflowX).toBe('clip')
+    expect(document.body.style.overflowY).toBe('auto')
+    expect(document.body.style.getPropertyPriority('overflow')).toBe('important')
+    document.body.style.overflow = originalOverflow
+  })
+
+  it('closes settings on its marker popstate without changing root navigation', async () => {
+    const { container } = await renderApp()
+    await act(async () => { getButtonByLabel(container, 'Settings').click() })
+    expect(historyHarness?.entries).toHaveLength(2)
+
+    await act(async () => { historyHarness?.back() })
+    expect(container.querySelector('[role="dialog"]')).toBeNull()
+    expect(historyHarness?.backCalls).toBe(1)
+    expect(historyHarness?.entries[1]).toMatchObject({ __voxgolemSettingsOpen: expect.any(String) })
+    await act(async () => { await Promise.resolve() })
+    await act(async () => {
+      historyHarness?.forward()
+      await new Promise((resolve) => window.setTimeout(resolve, 0))
+    })
+    expect(container.querySelector('[role="dialog"]')).not.toBeNull()
+  })
+
+  it('opens from an authoritative marked entry without pushing another marker', async () => {
+    historyHarness?.setCurrentState({ existing: 'field', __voxgolemSettingsOpen: true })
+    const { container } = await renderApp(true)
+
+    expect(container.querySelector('[role="dialog"]')).not.toBeNull()
+    expect(historyHarness?.entries).toHaveLength(1)
+    expect(window.history.state).toEqual({ existing: 'field', __voxgolemSettingsOpen: true })
+  })
+
+  it('closes an inherited marker without traversing and can reopen with one owned marker', async () => {
+    historyHarness?.setCurrentState({ root: 'state', __voxgolemSettingsOpen: 'other-mount' })
+    const { container } = await renderApp()
+    const opener = getButtonByLabel(container, 'Settings')
+
+    await act(async () => { getButtonByLabel(container, 'Close settings').click() })
+    expect(historyHarness?.backCalls).toBe(0)
+    expect(window.history.state).toEqual({ root: 'state' })
+    expect(container.querySelector('[role="dialog"]')).toBeNull()
+
+    await act(async () => { opener.click() })
+    expect(historyHarness?.entries).toHaveLength(2)
+    expect(window.history.state?.['__voxgolemSettingsOpen']).toEqual(expect.any(String))
+    expect(window.history.state?.['__voxgolemSettingsOpen']).not.toBe('other-mount')
+
+    await act(async () => { getButtonByLabel(container, 'Close settings').click() })
+    expect(container.querySelector('[role="dialog"]')).toBeNull()
+    expect(window.history.state).toEqual({ root: 'state' })
+    await act(async () => { historyHarness?.forward() })
+    expect(container.querySelector('[role="dialog"]')).not.toBeNull()
+  })
+
+  it('ignores Back at a closed root entry', async () => {
+    const { container } = await renderApp()
+    await act(async () => { historyHarness?.back() })
+    expect(historyHarness?.index).toBe(0)
+    expect(container.querySelector('[role="dialog"]')).toBeNull()
+  })
+
+  it('does not overwrite a competing body overflow mutation', async () => {
+    document.body.style.setProperty('overflow', 'scroll', 'important')
+    const { container } = await renderApp()
+
+    await act(async () => { getButtonByLabel(container, 'Settings').click() })
+    document.body.style.setProperty('overflow', 'auto')
+    await act(async () => { getButtonByLabel(container, 'Close settings').click() })
+
+    expect(document.body.style.overflow).toBe('auto')
+    expect(document.body.style.getPropertyPriority('overflow')).toBe('')
+  })
+
+  it('restores only the unmodified overflow axis', async () => {
+    document.body.style.setProperty('overflow-x', 'scroll', 'important')
+    document.body.style.setProperty('overflow-y', 'auto', 'important')
+    const { container } = await renderApp()
+
+    await act(async () => { getButtonByLabel(container, 'Settings').click() })
+    document.body.style.setProperty('overflow-x', 'visible')
+    await act(async () => { getButtonByLabel(container, 'Close settings').click() })
+
+    expect(document.body.style.overflowX).toBe('visible')
+    expect(document.body.style.overflowY).toBe('auto')
+    expect(document.body.style.getPropertyPriority('overflow-y')).toBe('important')
+  })
+
+  it('restores y when only x is owned and preserves absent declarations', async () => {
+    document.body.style.setProperty('overflow-y', 'scroll')
+    const { container } = await renderApp()
+
+    await act(async () => { getButtonByLabel(container, 'Settings').click() })
+    document.body.style.setProperty('overflow-y', 'clip')
+    await act(async () => { getButtonByLabel(container, 'Close settings').click() })
+
+    expect(document.body.style.overflowY).toBe('clip')
+    expect(document.body.style.getPropertyValue('overflow-x')).toBe('')
+  })
+
+  it('queues a rapid reopen until the pending Back traversal settles', async () => {
+    if (historyHarness !== null) historyHarness.deferBack = true
+    const { container } = await renderApp()
+    const opener = getButtonByLabel(container, 'Settings')
+
+    await act(async () => { opener.click() })
+    await act(async () => { getButtonByLabel(container, 'Close settings').click() })
+    await act(async () => { opener.click() })
+    expect(historyHarness?.entries).toHaveLength(2)
+    expect(historyHarness?.backCalls).toBe(1)
+    expect(container.querySelector('[role="dialog"]')).toBeNull()
+
+    await act(async () => { historyHarness?.settleBack() })
+    expect(historyHarness?.entries).toHaveLength(2)
+    expect(container.querySelector('[role="dialog"]')).not.toBeNull()
+    expect(window.history.state?.['__voxgolemSettingsOpen']).toEqual(expect.any(String))
+  })
+
+  it('restores its body scroll lock when unmounted while settings is open', async () => {
+    document.body.style.setProperty('overflow', 'scroll', 'important')
+    document.body.style.setProperty('overflow-x', 'clip', 'important')
+    document.body.style.setProperty('overflow-y', 'auto', 'important')
+    const { container } = await renderApp()
+    await act(async () => { getButtonByLabel(container, 'Settings').click() })
+    expect(document.body.style.overflowX).toBe('hidden')
+    expect(document.body.style.overflowY).toBe('hidden')
+
+    const root = mountedRoots.pop()
+    act(() => root?.unmount())
+    expect(document.body.style.overflow).toBe('scroll')
+    expect(document.body.style.overflowX).toBe('clip')
+    expect(document.body.style.overflowY).toBe('auto')
+    expect(document.body.style.getPropertyPriority('overflow')).toBe('important')
   })
 
   it('falls back to medium when persisted text size is unsupported', async () => {

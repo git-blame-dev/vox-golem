@@ -62,6 +62,8 @@ const UI_TEXT_SIZE_STEPS: readonly UiTextSize[] = ['small', 'medium', 'large', '
 const DEFAULT_UI_TEXT_SIZE: UiTextSize = 'medium'
 const DEFAULT_UI_THEME: UiTheme = 'dark'
 const AUDIO_INPUT_DEVICE_STORAGE_KEY = 'voxgolem.audioInputDeviceId'
+const SETTINGS_DIALOG_ID = 'settings-dialog'
+const SETTINGS_HISTORY_KEY = '__voxgolemSettingsOpen'
 
 function loadAudioInputDeviceId(): string | null {
   try {
@@ -155,7 +157,7 @@ function App() {
   const [micActive, setMicActive] = useState(false)
   const [audioInputDevices, setAudioInputDevices] = useState<readonly AudioInputDevice[]>([])
   const [audioInputDeviceId, setAudioInputDeviceId] = useState<string | null>(loadAudioInputDeviceId)
-  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(() => Boolean(window.history.state?.[SETTINGS_HISTORY_KEY]))
   const [assistantSettingsPending, setAssistantSettingsPending] = useState(
     () => getTauriInternals() !== null,
   )
@@ -201,6 +203,17 @@ function App() {
   const settingsButtonRef = useRef<HTMLButtonElement | null>(null)
   const settingsPanelRef = useRef<HTMLElement | null>(null)
   const settingsCloseButtonRef = useRef<HTMLButtonElement | null>(null)
+  const settingsHistoryActiveRef = useRef(settingsOpen)
+  const [settingsHistoryToken] = useState(() => `settings-${crypto.randomUUID()}`)
+  const settingsHistoryTokenRef = useRef(settingsHistoryToken)
+  const settingsHistoryOwnedRef = useRef(false)
+  const settingsHistoryTraversalPendingRef = useRef(false)
+  const settingsReopenQueuedRef = useRef(false)
+  const settingsFocusRestoreTimeoutRef = useRef<number | null>(null)
+  const settingsBodyOverflowRef = useRef<{
+    original: Record<'overflow-x' | 'overflow-y', { value: string; priority: string }>
+    written: Record<'overflow-x' | 'overflow-y', { value: string; priority: string }>
+  } | null>(null)
   const liveAudioSourceRef = useRef<LiveAudioSource | null>(null)
   const audioInputDeviceIdRef = useRef(audioInputDeviceId)
   const liveAudioSessionIdRef = useRef(0)
@@ -447,9 +460,43 @@ function App() {
 
   const voiceTelemetry = voiceTelemetryRef.current
 
-  const closeSettings = useCallback((): void => {
+  const closeSettings = useCallback((fromHistory = false): void => {
+    const currentState = window.history.state
+    const markerIsCurrent = Boolean(currentState?.[SETTINGS_HISTORY_KEY])
+    const markerIsOwned = settingsHistoryOwnedRef.current && currentState?.[SETTINGS_HISTORY_KEY] === settingsHistoryTokenRef.current
+    const shouldTraverse = !fromHistory && settingsHistoryActiveRef.current && markerIsOwned && !settingsHistoryTraversalPendingRef.current
+    if (shouldTraverse) settingsHistoryTraversalPendingRef.current = true
+    settingsHistoryActiveRef.current = fromHistory && markerIsCurrent
+    settingsHistoryOwnedRef.current = fromHistory && markerIsOwned
     setSettingsOpen(false)
-    window.setTimeout(() => settingsButtonRef.current?.focus(), 0)
+    if (settingsFocusRestoreTimeoutRef.current !== null) window.clearTimeout(settingsFocusRestoreTimeoutRef.current)
+    if (!settingsReopenQueuedRef.current) {
+      const restoreFocus = (): void => {
+        settingsFocusRestoreTimeoutRef.current = null
+        if (!settingsHistoryActiveRef.current && !settingsHistoryTraversalPendingRef.current) settingsButtonRef.current?.focus()
+      }
+      settingsFocusRestoreTimeoutRef.current = window.setTimeout(restoreFocus, 0)
+    }
+    if (shouldTraverse) {
+      window.history.back()
+    } else if (!fromHistory && markerIsCurrent && !markerIsOwned) {
+      const nextState = { ...(currentState ?? {}) }
+      delete nextState[SETTINGS_HISTORY_KEY]
+      window.history.replaceState(nextState, '')
+      settingsHistoryActiveRef.current = false
+    }
+  }, [])
+
+  const openSettings = useCallback((): void => {
+    if (settingsHistoryTraversalPendingRef.current) {
+      settingsReopenQueuedRef.current = true
+      return
+    }
+    if (settingsHistoryActiveRef.current) return
+    window.history.pushState({ ...(window.history.state ?? {}), [SETTINGS_HISTORY_KEY]: settingsHistoryTokenRef.current }, '')
+    settingsHistoryActiveRef.current = true
+    settingsHistoryOwnedRef.current = true
+    flushSync(() => setSettingsOpen(true))
   }, [])
 
   const recordRuntimeDiagnostic = useCallback((kind: RuntimeDiagnosticKind, detail: string): void => {
@@ -530,6 +577,63 @@ function App() {
     }
 
     settingsCloseButtonRef.current?.focus()
+  }, [settingsOpen])
+
+  useEffect(() => {
+    const onPopState = (): void => {
+      const markerIsCurrent = Boolean(window.history.state?.[SETTINGS_HISTORY_KEY])
+      if (markerIsCurrent) {
+        settingsHistoryTraversalPendingRef.current = false
+        settingsHistoryActiveRef.current = true
+        settingsHistoryOwnedRef.current = window.history.state?.[SETTINGS_HISTORY_KEY] === settingsHistoryTokenRef.current
+        settingsReopenQueuedRef.current = false
+        flushSync(() => setSettingsOpen(true))
+        return
+      }
+      if (!settingsHistoryActiveRef.current && !settingsHistoryTraversalPendingRef.current && !settingsOpen) return
+      settingsHistoryActiveRef.current = false
+      settingsHistoryTraversalPendingRef.current = false
+      const reopen = settingsReopenQueuedRef.current
+      settingsReopenQueuedRef.current = false
+      closeSettings(true)
+      if (reopen) openSettings()
+    }
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
+  }, [closeSettings, openSettings, settingsOpen])
+
+  useEffect(() => {
+    const declarations = ['overflow-x', 'overflow-y'] as const
+    const readDeclarations = (): Record<typeof declarations[number], { value: string; priority: string }> => Object.fromEntries(
+      declarations.map((property) => [property, {
+        value: document.body.style.getPropertyValue(property),
+        priority: document.body.style.getPropertyPriority(property),
+      }]),
+    ) as Record<typeof declarations[number], { value: string; priority: string }>
+    const restoreOverflow = (): void => {
+      const lock = settingsBodyOverflowRef.current
+      if (lock === null) return
+      const current = readDeclarations()
+      declarations.forEach((property) => {
+        if (current[property].value !== lock.written[property].value || current[property].priority !== lock.written[property].priority) return
+        document.body.style.removeProperty(property)
+        const original = lock.original[property]
+        if (original.value !== '') document.body.style.setProperty(property, original.value, original.priority)
+      })
+      settingsBodyOverflowRef.current = null
+    }
+
+    if (!settingsOpen) {
+      restoreOverflow()
+      return
+    }
+    if (settingsBodyOverflowRef.current === null) {
+      const original = readDeclarations()
+      document.body.style.setProperty('overflow-x', 'hidden', original['overflow-x'].priority)
+      document.body.style.setProperty('overflow-y', 'hidden', original['overflow-y'].priority)
+      settingsBodyOverflowRef.current = { original, written: readDeclarations() }
+    }
+    return restoreOverflow
   }, [settingsOpen])
 
   useEffect(() => {
@@ -2711,13 +2815,14 @@ function App() {
       {settingsOpen ? (
         <div
           className="settings-overlay"
-          onMouseDown={closeSettings}
+          onMouseDown={() => closeSettings()}
           onKeyDown={onSettingsKeyDown}
         >
           <section
             ref={settingsPanelRef}
             className="settings-panel"
             role="dialog"
+            id={SETTINGS_DIALOG_ID}
             aria-modal="true"
             aria-labelledby="settings-title"
             onMouseDown={(event) => event.stopPropagation()}
@@ -2731,7 +2836,7 @@ function App() {
                 ref={settingsCloseButtonRef}
                 type="button"
                 className="settings-panel__close"
-                onClick={closeSettings}
+                onClick={() => closeSettings()}
                 aria-label="Close settings"
               >
                 ×
@@ -2828,7 +2933,7 @@ function App() {
           value={composerValue}
           partialTranscript={partialTranscript}
           ghostSuffix={typedCompletionSuffix}
-           onChange={(event) => {
+          onChange={(event) => {
              const nextValue = event.target.value
              setComposerValue(nextValue)
              setTypedCompletionSuffix('')
@@ -2847,11 +2952,11 @@ function App() {
               } else {
                 latestTypedCompletionRef.current = null
               }
-           }}
+          }}
           onKeyDown={onComposerKeyDown}
           onAcceptCompletion={acceptTypedCompletion}
-            onDismissCompletion={() => { clearCompletion() }}
-           partialCompletionSuffix={voiceCompletionSuffix}
+          onDismissCompletion={() => { clearCompletion() }}
+          partialCompletionSuffix={voiceCompletionSuffix}
           placeholder="Type a prompt..."
           rows={3}
         />
@@ -2942,9 +3047,10 @@ function App() {
               ref={settingsButtonRef}
               type="button"
               className="shell__control shell__settings-button"
-               onClick={() => flushSync(() => setSettingsOpen(true))}
+              onClick={openSettings}
               aria-label="Settings"
               aria-haspopup="dialog"
+              aria-controls={SETTINGS_DIALOG_ID}
               aria-expanded={settingsOpen}
               title="Settings"
             >
