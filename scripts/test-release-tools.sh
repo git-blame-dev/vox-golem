@@ -8,6 +8,12 @@ trap 'rm -rf "$temp_dir"' EXIT
 jq -e '.bundle.linux.appimage.bundleMediaFramework == true' \
   "$root/apps/desktop-tauri/src-tauri/tauri.conf.json" >/dev/null
 
+if grep -Eq -- '--password[ =].*(TAURI_SIGNING|secrets\.)' \
+  "$root/.github/workflows/release.yml"; then
+  printf '%s\n' 'Release signing must not expose credentials in process arguments.' >&2
+  exit 1
+fi
+
 version="$("$root/scripts/release-version.sh" 0 42)"
 test "$version" = '1970.1.1-42'
 
