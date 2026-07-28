@@ -36,12 +36,30 @@ make app          # run the native Linux app
 make test         # deterministic frontend and Rust checks
 make app-smoke    # bounded Linux startup-ready smoke check
 make dist         # build and stage native binary
+make update-bundle                    # build and verify an unsigned, generated-version AppImage
+make update-bundle-smoke              # run the built AppImage startup check
 ```
 
 `make app-smoke` proves only that the zero-asset Tauri shell reaches its startup marker (shell setup); it does not prove providers, models, voice, completion, or TTS, which require their own runtime checks.
 
 The staged native binary is `dist/VoxGolem/vox-golem`. `make pc-dist` is an optional, non-gating Linux-hosted Windows cross-build and may require extra LLVM/cargo-xwin inputs; it is not part of Linux CI. No Windows runner or Windows release is promised here.
 
-CI runs `make test` and a separate Ubuntu 24.04 native artifact job (`make dist`). The Linux package contains only the executable and the ONNX Runtime shared/CUDA provider libraries produced by the locked build; user models and CUDA system libraries remain external. `make verify-dist` checks package contents, executable/library modes, and fails clearly when TTS-capable ONNX assets are absent. CI cannot prove microphone, WebView/WSLg, GPU, model, TTS, or endpoint behavior; perform those hardware/runtime checks manually. Inference policy `auto` prefers CUDA when usable and otherwise falls back to CPU; `cuda` requires CUDA and `cpu` forces CPU.
+CI runs `make test` and a separate Ubuntu 24.04 native artifact job (`make dist` and `make update-bundle`). The Linux package contains only the executable and the ONNX Runtime shared/CUDA provider libraries produced by the locked build; the AppImage carries the same provider libraries under `/usr/lib`. User models and CUDA system libraries remain external. `make verify-dist` and `make verify-update-bundle` check package contents and modes and fail clearly when TTS-capable ONNX assets are absent. CI cannot prove microphone, WebView/WSLg, GPU, model, TTS, or endpoint behavior; perform those hardware/runtime checks manually. Inference policy `auto` prefers CUDA when usable and otherwise falls back to CPU; `cuda` requires CUDA and `cpu` forces CPU.
+
+## Signed application updates
+
+GitHub Releases publish the existing ZIP plus a signed x86_64 AppImage, its detached signature, `latest.json`, and `SHA256SUMS`. AppImage builds check the latest release automatically and show the result under **Settings → Application updates**. Download and installation require an explicit button press, and restart is a separate action. Raw ZIP/development builds remain usable but report that automatic updates require the AppImage.
+
+The updater verifies every downloaded AppImage with the public key embedded in `tauri.conf.json`; signature verification cannot be disabled. A failed check, interrupted download, invalid manifest, incompatible artifact, or bad signature leaves the running installation unchanged. Updates cover the application and bundled ONNX provider libraries only, never user models, configuration, credentials, or CUDA system libraries.
+
+Release versions use valid semantic versions derived from the source commit date and Linux CI run number: `YYYY.M.D-N`. The CI-built AppImage and release tag use the same version.
+
+Maintainers must store the matching private key outside the repository and configure it as the GitHub Actions secret `TAURI_SIGNING_PRIVATE_KEY`. If the key is password-protected, also configure `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. For example, an authorized maintainer can provision the key without printing it:
+
+```bash
+gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.tauri/vox-golem-updater.key
+```
+
+Back up the private key securely. Losing it prevents installed copies from accepting future updates. Do not rotate the embedded public key without a staged migration signed by the old key, and never commit or log the private key.
 
 Telemetry is enabled by default, configurable off, local, rotating, and metadata-only; it excludes prompt/audio contents, predictions, answers, URLs, credentials, and raw errors. Voice input and provider traffic remain user data; review the provider and prefetch settings before enabling transmission.
