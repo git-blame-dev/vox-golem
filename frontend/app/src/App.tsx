@@ -133,6 +133,8 @@ type PromptProjection = {
   priorVersions: AnswerPriorVersion[]
   sources: AnswerSource[]
   ttsFirstLineSpoken: boolean
+  renderFrameId: number | null
+  renderFrameRevision: number
 }
 
 function App() {
@@ -962,7 +964,12 @@ function App() {
     return () => {
       appActiveRef.current = false
       const activePrompt = promptRef.current
-      if (activePrompt !== null) activePrompt.terminal = true
+      if (activePrompt !== null) {
+        if (activePrompt.renderFrameId !== null) window.cancelAnimationFrame(activePrompt.renderFrameId)
+        activePrompt.renderFrameId = null
+        activePrompt.renderFrameRevision += 1
+        activePrompt.terminal = true
+      }
       promptRef.current = null
       cancelTts()
       if (wakeConfidenceHoldRef.current !== null) {
@@ -1381,6 +1388,55 @@ function App() {
     applyRuntimeStatus('sleeping')
   }
 
+  const renderPromptProjection = (projection: PromptProjection): void => {
+    if (projection.text.length === 0) return
+    const text = projection.text
+    const stages = [...projection.stages]
+    const priorVersions = [...projection.priorVersions]
+    const sources = [...projection.sources]
+    setMessages((current) => {
+      const projectedMessage = {
+        id: projection.assistantId,
+        role: 'assistant' as const,
+        content: text,
+        answerStage: {
+          stages,
+          priorVersions,
+          sources,
+        },
+      }
+      return current.some((message) => message.id === projection.assistantId)
+        ? current.map((message) => message.id === projection.assistantId
+          ? { ...message, ...projectedMessage }
+          : message)
+        : [...current, projectedMessage]
+    })
+  }
+
+  const cancelPromptProjectionFrame = (projection: PromptProjection): void => {
+    if (projection.renderFrameId === null) return
+    window.cancelAnimationFrame(projection.renderFrameId)
+    projection.renderFrameId = null
+    projection.renderFrameRevision += 1
+  }
+
+  const flushPromptProjection = (projection: PromptProjection): void => {
+    cancelPromptProjectionFrame(projection)
+    renderPromptProjection(projection)
+  }
+
+  const schedulePromptProjection = (projection: PromptProjection): void => {
+    if (projection.renderFrameId !== null) return
+    const frameRevision = ++projection.renderFrameRevision
+    const frameId = window.requestAnimationFrame(() => {
+      if (projection.renderFrameRevision !== frameRevision || projection.renderFrameId !== frameId) return
+      projection.renderFrameId = null
+      if (!appActiveRef.current || promptRef.current !== projection || projection.terminal) return
+      renderPromptProjection(projection)
+    })
+    projection.renderFrameId = frameId
+  }
+
   const runPrompt = async (
     prompt: string,
     source: 'typed' | 'voice',
@@ -1447,6 +1503,8 @@ function App() {
       priorVersions: [],
       sources: [],
       ttsFirstLineSpoken: false,
+      renderFrameId: null,
+      renderFrameRevision: 0,
     }
     promptRef.current = promptProjection
     setPromptState('executing')
@@ -1486,36 +1544,17 @@ function App() {
             void synthesizeAndPlayAssistantReply(firstLine)
           }
         }
-        setMessages((current) => {
-          const index = current.findIndex((message) => message.id === active.assistantId)
-          if (index < 0) {
-            return [...current, { id: active.assistantId, role: 'assistant', content: event.text, answerStage: { stages: active.stages, priorVersions: active.priorVersions, sources: active.sources } }]
-          }
-          return current.map((message, messageIndex) =>
-            messageIndex === index
-              ? { ...message, content: message.content + event.text, answerStage: { stages: active.stages, priorVersions: active.priorVersions, sources: active.sources } }
-              : message,
-          )
-        })
+        schedulePromptProjection(active)
       }
       if (event.kind === 'correction') {
+        cancelPromptProjectionFrame(active)
         active.corrected = true
         if (active.text.trim().length > 0) {
           active.priorVersions.push({ id: `instant-${active.priorVersions.length + 1}`, text: active.text, label: 'Before correction' })
         }
         active.text = event.text
         active.stages = active.stages.map((stage) => stage.stage === event.stage ? { ...stage, status: 'corrected', detail: event.correction } : stage)
-        setMessages((current) => {
-          const corrected = {
-            id: active.assistantId,
-            role: 'assistant' as const,
-            content: event.text,
-             answerStage: { stages: active.stages, priorVersions: active.priorVersions, sources: active.sources },
-          }
-          return current.some((message) => message.id === active.assistantId)
-            ? current.map((message) => message.id === active.assistantId ? { ...message, ...corrected } : message)
-            : [...current, corrected]
-        })
+        renderPromptProjection(active)
         setPromptActivity(event.correction)
         if (
           snapshotHydrationStateRef.current !== 'succeeded' &&
@@ -1592,6 +1631,11 @@ function App() {
         return
       }
       if (result.outcome !== 'completed') cancelTts()
+      if (result.outcome === 'completed') {
+        flushPromptProjection(active)
+      } else {
+        cancelPromptProjectionFrame(active)
+      }
       active.terminal = true
       active.stages = active.stages.map((stage) => {
         if (result.outcome !== 'completed' && (stage.status === 'running' || stage.status === 'queued')) {
@@ -2427,7 +2471,10 @@ function App() {
     setResponseAnnouncement('')
 
     if (getTauriInternals() === null) {
-      if (activePrompt !== null) activePrompt.terminal = true
+      if (activePrompt !== null) {
+        cancelPromptProjectionFrame(activePrompt)
+        activePrompt.terminal = true
+      }
       promptRef.current = null
       canonicalTranscriptRef.current = []
       setMessages((current) => replaceCommittedTranscript(current, []))
@@ -2447,6 +2494,7 @@ function App() {
     setSnapshotControlsInvalidated(true)
 
     if (activePrompt !== null && !activePrompt.terminal) {
+      cancelPromptProjectionFrame(activePrompt)
       activePrompt.terminal = true
       setPromptState('stopping')
       try {
