@@ -32,10 +32,26 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/icon.png",
       "icons/icon.ico"
     ],
-    "targets": "all"
+    "targets": [
+      "appimage"
+    ],
+    "linux": {
+      "appimage": {
+        "bundleMediaFramework": true
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDVBRTA3MjZFQzkxMUVFNzEKUldSeDdoSEpibkxnV2tnRExUQ3crUWE1L1BOMXBtYXh4RW41OEZ5eWcxVnlhakl5Y2FOYUI1SUQK",
+      "endpoints": [
+        "https://github.com/git-blame-dev/vox-golem/releases/latest/download/latest.json"
+      ]
+    }
   }
 }
