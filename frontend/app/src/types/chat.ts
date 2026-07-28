@@ -1,11 +1,13 @@
 export type MessageRole = 'system' | 'user' | 'assistant'
 
 export type TranscriptRole = Exclude<MessageRole, 'system'>
+export type MessageContentKind = 'text' | 'refusal'
 
 export interface ChatMessage {
   readonly id: string
   readonly role: MessageRole
   readonly content: string
+  readonly contentKind?: MessageContentKind
   readonly answerStage?: AnswerStageMetadata
 }
 
@@ -19,6 +21,7 @@ export interface TranscriptMessage {
   readonly id: string
   readonly role: TranscriptRole
   readonly content: string
+  readonly contentKind?: MessageContentKind
   readonly answerStage?: AnswerStageMetadata
 }
 
