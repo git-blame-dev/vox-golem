@@ -1864,11 +1864,17 @@ fn switch_response_profile(
                     &assistant_settings_generation,
                     expected_assistant_settings_generation,
                     profile,
-                ) {
-                    Ok(policy) => {
+                )
+                .and_then(|prepared| {
+                    persist_prepared_local_instant_model_with(
+                        prepared,
+                        persist_profile_and_assistant_settings,
+                    )
+                }) {
+                    Ok(prepared) => {
                         persistence_rollback.arm();
                         runtime_to_publish = Some(runtime);
-                        policy_to_publish = Some(policy);
+                        policy_to_publish = Some(prepared.policy);
                         let mut ready_snapshot = startup_snapshot.clone();
                         if let Some(capability) =
                             ready_snapshot.capabilities.iter_mut().find(|capability| {
@@ -6639,35 +6645,37 @@ fn local_profile_for_model(
     }
 }
 
+#[derive(Debug)]
+struct PreparedLocalInstantModel {
+    profile: ResponseProfilePayload,
+    policy: voxgolem_core::assistant::AssistantPolicy,
+    settings: AssistantSettingsPayload,
+}
+
 fn prepare_local_instant_model(
     coordinator: &Mutex<voxgolem_core::conversation::ConversationSession>,
     lifecycle_gate: &Mutex<()>,
     settings_generation: &AtomicU64,
     expected_generation: u64,
     profile: ResponseProfilePayload,
-) -> Result<voxgolem_core::assistant::AssistantPolicy, String> {
+) -> Result<PreparedLocalInstantModel, String> {
     prepare_local_instant_model_with(
         coordinator,
         lifecycle_gate,
         settings_generation,
         expected_generation,
         profile,
-        persist_profile_and_assistant_settings,
     )?
     .ok_or_else(|| String::from("assistant settings changed during profile switch"))
 }
 
-fn prepare_local_instant_model_with<F>(
+fn prepare_local_instant_model_with(
     coordinator: &Mutex<voxgolem_core::conversation::ConversationSession>,
     lifecycle_gate: &Mutex<()>,
     settings_generation: &AtomicU64,
     expected_generation: u64,
     profile: ResponseProfilePayload,
-    persist: F,
-) -> Result<Option<voxgolem_core::assistant::AssistantPolicy>, String>
-where
-    F: FnOnce(ResponseProfilePayload, AssistantSettingsPayload) -> Result<(), String>,
-{
+) -> Result<Option<PreparedLocalInstantModel>, String> {
     let mut preferences = {
         let _lifecycle = lifecycle_gate
             .lock()
@@ -6687,8 +6695,22 @@ where
     };
     preferences.instant_model = local_instant_model(profile);
     let settings = AssistantSettingsPayload::from(&preferences);
-    persist(profile, settings)?;
-    Ok(Some(preferences))
+    Ok(Some(PreparedLocalInstantModel {
+        profile,
+        policy: preferences,
+        settings,
+    }))
+}
+
+fn persist_prepared_local_instant_model_with<F>(
+    prepared: PreparedLocalInstantModel,
+    persist: F,
+) -> Result<PreparedLocalInstantModel, String>
+where
+    F: FnOnce(ResponseProfilePayload, AssistantSettingsPayload) -> Result<(), String>,
+{
+    persist(prepared.profile, prepared.settings)?;
+    Ok(prepared)
 }
 
 fn local_instant_model(profile: ResponseProfilePayload) -> voxgolem_core::assistant::InstantModel {
@@ -9859,7 +9881,8 @@ mod tests {
         load_persisted_tts_enabled, load_persisted_ui_text_size, load_persisted_ui_theme,
         lock_ready_response_backend_operation, merge_profile_startup_publication,
         model_path_for_profile, parse_deep_agent_json, parse_persisted_state,
-        parse_review_agent_json, persist_assistant_settings, persist_selected_response_profile,
+        parse_review_agent_json, persist_assistant_settings,
+        persist_prepared_local_instant_model_with, persist_selected_response_profile,
         persist_tts_enabled, persist_ui_text_size, persist_ui_theme,
         prepare_local_instant_model_with, process_wake_word_frame, race_durable_cancellation,
         record_terminal_kind, register_active_prompt, register_owned_work,
@@ -10375,17 +10398,12 @@ mod tests {
         let lifecycle = std::sync::Mutex::new(());
         assert!(!assistant_completion_enabled(&coordinator).unwrap());
 
-        let mut persisted = None;
         let policy = prepare_local_instant_model_with(
             &coordinator,
             &lifecycle,
             &settings_generation,
             0,
             ResponseProfilePayload::Quality,
-            |profile, settings| {
-                persisted = Some((profile, settings));
-                Ok(())
-            },
         )
         .unwrap()
         .unwrap();
@@ -10394,19 +10412,21 @@ mod tests {
             voxgolem_core::assistant::InstantModel::LocalFast
         );
         assert_eq!(settings_generation.load(Ordering::SeqCst), 0);
-        coordinator.lock().unwrap().replace_policy(policy).unwrap();
+        assert_eq!(policy.profile, ResponseProfilePayload::Quality);
+        assert_eq!(policy.settings.instant, InstantChoicePayload::LocalQuality);
+        coordinator
+            .lock()
+            .unwrap()
+            .replace_policy(policy.policy)
+            .unwrap();
         settings_generation.fetch_add(1, Ordering::SeqCst);
-        let (profile, settings) = persisted.unwrap();
-        assert_eq!(profile, ResponseProfilePayload::Quality);
-        assert_eq!(settings.instant, InstantChoicePayload::LocalQuality);
-        assert!(!settings.completion);
+        assert!(!policy.settings.completion);
         assert!(prepare_local_instant_model_with(
             &coordinator,
             &lifecycle,
             &settings_generation,
             0,
             ResponseProfilePayload::Fast,
-            |_, _| panic!("stale profile must not persist"),
         )
         .unwrap()
         .is_none());
@@ -10420,14 +10440,19 @@ mod tests {
             ));
         let generation = std::sync::atomic::AtomicU64::new(4);
         let lifecycle = std::sync::Mutex::new(());
-        let error = prepare_local_instant_model_with(
+        let prepared = prepare_local_instant_model_with(
             &coordinator,
             &lifecycle,
             &generation,
             4,
             ResponseProfilePayload::Quality,
-            |_, _| Err(String::from("injected persistence failure")),
         )
+        .expect("candidate derivation must succeed")
+        .expect("candidate should remain current");
+
+        let error = persist_prepared_local_instant_model_with(prepared, |_, _| {
+            Err(String::from("injected persistence failure"))
+        })
         .expect_err("persistence failure must be returned");
 
         assert_eq!(error, "injected persistence failure");
@@ -10447,19 +10472,46 @@ mod tests {
         let generation = std::sync::atomic::AtomicU64::new(0);
         let lifecycle = std::sync::Mutex::new(());
 
-        prepare_local_instant_model_with(
+        let prepared = prepare_local_instant_model_with(
             &coordinator,
             &lifecycle,
             &generation,
             0,
             ResponseProfilePayload::Quality,
-            |_, _| {
-                assert!(coordinator.try_lock().is_ok());
-                Ok(())
-            },
         )
         .expect("profile synchronization should succeed")
         .expect("profile synchronization should remain current");
+        persist_prepared_local_instant_model_with(prepared, |_, _| {
+            assert!(coordinator.try_lock().is_ok());
+            Ok(())
+        })
+        .expect("profile persistence should succeed");
+    }
+
+    #[test]
+    fn profile_candidate_derivation_rejects_an_active_prompt() {
+        let mut session = voxgolem_core::conversation::ConversationSession::new(
+            AssistantSettingsPayload::default().into(),
+        );
+        session
+            .admit("request", "prompt")
+            .expect("prompt should start");
+        let coordinator = std::sync::Mutex::new(session);
+        let generation = std::sync::atomic::AtomicU64::new(0);
+        let lifecycle = std::sync::Mutex::new(());
+
+        let error = prepare_local_instant_model_with(
+            &coordinator,
+            &lifecycle,
+            &generation,
+            0,
+            ResponseProfilePayload::Quality,
+        )
+        .expect_err("active prompt must reject profile preparation");
+        assert_eq!(
+            error,
+            "assistant settings cannot change while a prompt is active"
+        );
     }
 
     #[test]
