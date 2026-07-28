@@ -122,6 +122,7 @@ describe('App', () => {
       invoke: async (command) => {
         if (command === 'get_ui_text_size') return 'medium'
         if (command === 'get_ui_theme') return 'dark'
+        if (command === 'get_assistant_settings') return defaultAssistantSettings()
         if (command === 'get_startup_state') return {
           kind: 'ready',
           cue_asset_paths: { start_listening: 'start.wav', stop_listening: 'stop.wav' },
@@ -5063,7 +5064,8 @@ function nonDiagnosticCommands(commands: readonly string[]): readonly string[] {
       command !== 'get_ui_theme' &&
       command !== 'set_ui_theme' &&
       command !== 'get_assistant_settings' &&
-      command !== 'set_assistant_settings',
+      command !== 'set_assistant_settings' &&
+      command !== 'check_for_update',
   )
 }
 
