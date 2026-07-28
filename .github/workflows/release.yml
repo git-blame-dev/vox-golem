@@ -35,6 +35,9 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.workflow_run.head_sha }}
 
+      - name: Install release tool dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq
+
       - name: Generate application and release versions
         id: version
         shell: bash
@@ -308,7 +311,7 @@ jobs:
         run: |
           test -n "$TAURI_SIGNING_PRIVATE_KEY" || { printf '%s\n' 'TAURI_SIGNING_PRIVATE_KEY is required.' >&2; exit 1; }
           asset="vox-golem-linux-x86_64-${VERSION}.AppImage"
-          cargo tauri signer sign --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "dist/$asset"
+          cargo tauri signer sign "dist/$asset"
 
       - name: Generate updater manifest
         if: steps.release_scope.outputs.should_publish == 'true'
