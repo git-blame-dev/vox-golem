@@ -1691,6 +1691,108 @@ fn ensure_assistant_settings_available(
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum RuntimeReplacement<R, V> {
+    Applied {
+        runtime: R,
+        value: V,
+    },
+    Restored {
+        runtime: R,
+        error: String,
+    },
+    RestoreFailed {
+        error: String,
+        restore_error: String,
+    },
+    Superseded,
+    RejectedExistingExternal {
+        runtime: R,
+    },
+    RejectedStartedExternal,
+}
+
+fn replace_owned_runtime_transaction<R, S, V, E>(
+    current_runtime: Option<R>,
+    specs: (S, S),
+    is_owned: impl Fn(&R) -> bool,
+    is_current: impl Fn() -> bool,
+    mut shutdown: impl FnMut(&mut R),
+    mut start: impl FnMut(S) -> Result<R, E>,
+    prepare: impl FnOnce(&R) -> Result<V, String>,
+) -> RuntimeReplacement<R, V>
+where
+    E: ToString,
+{
+    let (requested_spec, previous_spec) = specs;
+    if let Some(mut runtime) = current_runtime {
+        if !is_owned(&runtime) {
+            return RuntimeReplacement::RejectedExistingExternal { runtime };
+        }
+        shutdown(&mut runtime);
+    }
+
+    let mut requested_runtime = match start(requested_spec) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            if !is_current() {
+                return RuntimeReplacement::Superseded;
+            }
+            let error = error.to_string();
+            return match start(previous_spec) {
+                Ok(mut runtime) if !is_current() => {
+                    shutdown(&mut runtime);
+                    RuntimeReplacement::Superseded
+                }
+                Ok(runtime) if !is_owned(&runtime) => RuntimeReplacement::RejectedStartedExternal,
+                Ok(runtime) => RuntimeReplacement::Restored { runtime, error },
+                Err(_) if !is_current() => RuntimeReplacement::Superseded,
+                Err(restore_error) => RuntimeReplacement::RestoreFailed {
+                    error,
+                    restore_error: restore_error.to_string(),
+                },
+            };
+        }
+    };
+    if !is_current() {
+        shutdown(&mut requested_runtime);
+        return RuntimeReplacement::Superseded;
+    }
+    if !is_owned(&requested_runtime) {
+        return RuntimeReplacement::RejectedStartedExternal;
+    }
+
+    match prepare(&requested_runtime) {
+        Ok(_) if !is_current() => {
+            shutdown(&mut requested_runtime);
+            RuntimeReplacement::Superseded
+        }
+        Ok(value) => RuntimeReplacement::Applied {
+            runtime: requested_runtime,
+            value,
+        },
+        Err(error) => {
+            shutdown(&mut requested_runtime);
+            if !is_current() {
+                return RuntimeReplacement::Superseded;
+            }
+            match start(previous_spec) {
+                Ok(mut runtime) if !is_current() => {
+                    shutdown(&mut runtime);
+                    RuntimeReplacement::Superseded
+                }
+                Ok(runtime) if !is_owned(&runtime) => RuntimeReplacement::RejectedStartedExternal,
+                Ok(runtime) => RuntimeReplacement::Restored { runtime, error },
+                Err(_) if !is_current() => RuntimeReplacement::Superseded,
+                Err(restore_error) => RuntimeReplacement::RestoreFailed {
+                    error,
+                    restore_error: restore_error.to_string(),
+                },
+            }
+        }
+    }
+}
+
 fn begin_response_profile_switch_transition(
     lifecycle_gate: &Mutex<()>,
     exit_cleanup_started: &AtomicBool,
@@ -1752,13 +1854,25 @@ fn switch_response_profile(
         .selected_response_profile
         .lock()
         .map_err(|_| String::from("selected response profile lock is poisoned"))?;
-    let runtime_loaded = app_state
-        .llama_cpp_runtime
-        .lock()
-        .map_err(|_| String::from("local llama.cpp runtime lock is poisoned"))?
-        .is_some();
+    let (runtime_loaded, runtime_owned) = {
+        let runtime = app_state
+            .llama_cpp_runtime
+            .lock()
+            .map_err(|_| String::from("local llama.cpp runtime lock is poisoned"))?;
+        (
+            runtime.is_some(),
+            runtime
+                .as_ref()
+                .is_none_or(voxgolem_platform::llama_cpp::LlamaCppRuntime::is_owned),
+        )
+    };
     if current_profile == profile && runtime_loaded {
         return Ok(response);
+    }
+    if current_profile != profile && !runtime_owned {
+        return Err(String::from(
+            "response profile cannot change while using an externally managed llama.cpp runtime",
+        ));
     }
 
     let Some(config) = app_state.runtime_config.as_ref() else {
@@ -1843,9 +1957,6 @@ fn switch_response_profile(
         .lock()
         .map_err(|_| String::from("local llama.cpp runtime lock is poisoned"))?
         .take();
-    if let Some(mut runtime) = previous_runtime {
-        runtime.shutdown_owned();
-    }
     let previous_assistant_settings = AssistantSettingsPayload::from(
         app_state
             .conversation_session
@@ -1857,12 +1968,8 @@ fn switch_response_profile(
         assistant_settings_generation.load(Ordering::SeqCst);
     let llama_startups = Arc::clone(&app_state.llama_startups);
     ensure_app_running(&app_state.exit_cleanup_started)?;
-    let (startup_cancellation, startup_worker) =
-        voxgolem_platform::llama_cpp::LlamaCppRuntime::start_with_policy_cancellable(
-            server_spec,
-            inference_policy,
-        );
-    let fallback_cancellation = startup_cancellation.clone();
+    let startup_cancellation = voxgolem_platform::llama_cpp::LlamaCppStartupCancellation::default();
+    let worker_cancellation = startup_cancellation.clone();
     let startup_coordinator = std::thread::spawn(move || {
         let mut persistence_rollback = ProfilePersistenceRollback {
             previous_profile: current_profile,
@@ -1872,29 +1979,33 @@ fn switch_response_profile(
             expected_generation: switch_generation,
             armed: false,
         };
-        let start_result = startup_worker.join().unwrap_or_else(|_| {
-            Err(voxgolem_platform::llama_cpp::LlamaCppRuntimeError::StartupCancelled)
-        });
-        if !runtime_startup_is_current(
-            &exit_cleanup_started,
-            &response_profile_switch_generation,
-            switch_generation,
-        ) {
-            shutdown_llama_start_result(start_result);
-            return;
-        }
-
         let mut runtime_to_publish = None;
         let mut policy_to_publish = None;
-        let published_state = match start_result {
-            Ok(runtime) => {
-                let actual_provider = actual_inference_provider_name(runtime.actual_provider());
-                if response_profile_switch_generation.load(Ordering::SeqCst) != switch_generation {
-                    shutdown_llama_start_result(Ok(runtime));
-                    return;
-                }
-
-                match prepare_local_instant_model(
+        let replacement = replace_owned_runtime_transaction(
+            previous_runtime,
+            (server_spec, fallback_server_spec),
+            voxgolem_platform::llama_cpp::LlamaCppRuntime::is_owned,
+            || {
+                runtime_startup_is_current(
+                    &exit_cleanup_started,
+                    &response_profile_switch_generation,
+                    switch_generation,
+                )
+            },
+            voxgolem_platform::llama_cpp::LlamaCppRuntime::shutdown_owned,
+            |spec| {
+                voxgolem_platform::llama_cpp::LlamaCppRuntime::start_with_policy_cancellation(
+                    spec,
+                    inference_policy,
+                    worker_cancellation.clone(),
+                )
+                .join()
+                .unwrap_or_else(|_| {
+                    Err(voxgolem_platform::llama_cpp::LlamaCppRuntimeError::StartupCancelled)
+                })
+            },
+            |_| {
+                let prepared = prepare_local_instant_model(
                     &conversation_session,
                     &lifecycle_gate,
                     &assistant_settings_generation,
@@ -1906,105 +2017,78 @@ fn switch_response_profile(
                         prepared,
                         persist_profile_and_assistant_settings,
                     )
-                }) {
-                    Ok(prepared) => {
-                        persistence_rollback.arm();
-                        runtime_to_publish = Some(runtime);
-                        policy_to_publish = Some(prepared.policy);
-                        let mut ready_snapshot = startup_snapshot.clone();
-                        if let Some(capability) =
-                            ready_snapshot.capabilities.iter_mut().find(|capability| {
-                                capability.id
-                                    == if profile == ResponseProfilePayload::Quality {
-                                        "local_quality"
-                                    } else {
-                                        "local_fast"
-                                    }
-                            })
-                        {
-                            capability.state = CapabilityStatePayload::Available;
-                            capability.reason = String::from("ready");
-                            capability.actual_provider = Some(actual_provider);
-                        }
-                        startup_ready_state_from_snapshot(&ready_snapshot, profile)
-                    }
-                    Err(error) => {
-                        shutdown_llama_start_result(Ok(runtime));
-                        let restore_worker = voxgolem_platform::llama_cpp::LlamaCppRuntime::start_with_policy_cancellation(
-                            fallback_server_spec.clone(),
-                            inference_policy,
-                            fallback_cancellation.clone(),
-                        );
-                        let restore_result = restore_worker.join().unwrap_or_else(|_| {
-                            Err(voxgolem_platform::llama_cpp::LlamaCppRuntimeError::StartupCancelled)
-                        });
-                        if response_profile_switch_generation.load(Ordering::SeqCst)
-                            != switch_generation
-                        {
-                            shutdown_llama_start_result(restore_result);
-                            return;
-                        }
-                        match restore_result {
-                            Ok(runtime) => {
-                                let actual_provider =
-                                    actual_inference_provider_name(runtime.actual_provider());
-                                runtime_to_publish = Some(runtime);
-                                let mut snapshot = startup_snapshot.clone();
-                                update_restored_profile_capabilities(
-                                    &mut snapshot.capabilities,
-                                    profile,
-                                    current_profile,
-                                    &error.to_string(),
-                                    actual_provider,
-                                );
-                                startup_ready_state_from_snapshot(&snapshot, current_profile)
+                })?;
+                persistence_rollback.arm();
+                Ok(prepared)
+            },
+        );
+        let published_state = match replacement {
+            RuntimeReplacement::Applied { runtime, value } => {
+                let actual_provider = actual_inference_provider_name(runtime.actual_provider());
+                runtime_to_publish = Some(runtime);
+                policy_to_publish = Some(value.policy);
+                let mut ready_snapshot = startup_snapshot.clone();
+                if let Some(capability) =
+                    ready_snapshot.capabilities.iter_mut().find(|capability| {
+                        capability.id
+                            == if profile == ResponseProfilePayload::Quality {
+                                "local_quality"
+                            } else {
+                                "local_fast"
                             }
-                            Err(restore_error) => startup_state_after_profile_restore_failure(
-                                &startup_snapshot,
-                                profile,
-                                current_profile,
-                                &error.to_string(),
-                                &restore_error.to_string(),
-                            ),
-                        }
-                    }
-                }
-            }
-            Err(error) => {
-                let restore_result = {
-                    let worker = voxgolem_platform::llama_cpp::LlamaCppRuntime::start_with_policy_cancellation(fallback_server_spec, inference_policy, fallback_cancellation);
-                    worker.join().unwrap_or_else(|_| {
-                        Err(voxgolem_platform::llama_cpp::LlamaCppRuntimeError::StartupCancelled)
                     })
-                };
-                if response_profile_switch_generation.load(Ordering::SeqCst) != switch_generation {
-                    shutdown_llama_start_result(restore_result);
-                    return;
+                {
+                    capability.state = CapabilityStatePayload::Available;
+                    capability.reason = String::from("ready");
+                    capability.actual_provider = Some(actual_provider);
                 }
-
-                match restore_result {
-                    Ok(runtime) => {
-                        let actual_provider =
-                            actual_inference_provider_name(runtime.actual_provider());
-                        runtime_to_publish = Some(runtime);
-                        let mut ready_snapshot = startup_snapshot.clone();
-                        update_restored_profile_capabilities(
-                            &mut ready_snapshot.capabilities,
-                            profile,
-                            current_profile,
-                            &error.to_string(),
-                            actual_provider,
-                        );
-                        startup_ready_state_from_snapshot(&ready_snapshot, current_profile)
-                    }
-                    Err(restore_error) => startup_state_after_profile_restore_failure(
-                        &startup_snapshot,
-                        profile,
-                        current_profile,
-                        &error.to_string(),
-                        &restore_error.to_string(),
-                    ),
-                }
+                startup_ready_state_from_snapshot(&ready_snapshot, profile)
+            }
+            RuntimeReplacement::Restored { runtime, error } => {
+                let actual_provider = actual_inference_provider_name(runtime.actual_provider());
+                runtime_to_publish = Some(runtime);
+                let mut ready_snapshot = startup_snapshot.clone();
+                update_restored_profile_capabilities(
+                    &mut ready_snapshot.capabilities,
+                    profile,
+                    current_profile,
+                    &error,
+                    actual_provider,
+                );
+                startup_ready_state_from_snapshot(&ready_snapshot, current_profile)
+            }
+            RuntimeReplacement::RestoreFailed {
+                error,
+                restore_error,
+            } => startup_state_after_profile_restore_failure(
+                &startup_snapshot,
+                profile,
+                current_profile,
+                &error,
+                &restore_error,
+            ),
+            RuntimeReplacement::Superseded => return,
+            RuntimeReplacement::RejectedExistingExternal { runtime } => {
+                let actual_provider = actual_inference_provider_name(runtime.actual_provider());
+                runtime_to_publish = Some(runtime);
+                let mut ready_snapshot = startup_snapshot.clone();
+                update_restored_profile_capabilities(
+                    &mut ready_snapshot.capabilities,
+                    profile,
+                    current_profile,
+                    "response profile cannot change while using an externally managed llama.cpp runtime",
+                    actual_provider,
+                );
+                startup_ready_state_from_snapshot(&ready_snapshot, current_profile)
+            }
+            RuntimeReplacement::RejectedStartedExternal => {
+                startup_state_after_profile_restore_failure(
+                    &startup_snapshot,
+                    profile,
+                    current_profile,
+                    "an externally managed llama.cpp runtime cannot satisfy the requested profile",
+                    "an externally managed llama.cpp runtime cannot restore the previous profile",
+                )
             }
         };
 
@@ -9899,6 +9983,7 @@ fn configure_linux_microphone_permission(app: &mut tauri::App) -> tauri::Result<
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
 
@@ -9922,23 +10007,237 @@ mod tests {
         persist_tts_enabled, persist_ui_text_size, persist_ui_theme,
         prepare_local_instant_model_with, process_wake_word_frame, race_durable_cancellation,
         record_terminal_kind, register_active_prompt, register_owned_work,
-        reset_conversation_execution, reset_voice_pipeline_to_waiting, reset_wake_word_runtime,
-        resolve_effective_tts_enabled, response_profile_state_path, runtime_log_path,
-        runtime_phase_response_from_state, runtime_startup_is_current,
-        shutdown_llama_cpp_runtime_for_exit, shutdown_tts_runtime_for_exit,
-        startup_warming_state_from_snapshot, supported_response_profiles,
-        take_and_invalidate_prefetch, to_runtime_phase_payload, transcribe_finished_utterance,
-        transcription_ready_samples, tts_runtime_needs_initialization,
-        update_restored_profile_capabilities, validate_prompt_request_id, validate_prompt_text,
-        wake_word_event_timestamp, ActivePromptGuard, AgentChoicePayload, AssistantSettingsPayload,
-        CapabilityPayload, CapabilityStatePayload, CommitAssistantResult, CueAssetPathsPayload,
-        DeepStageResult, DeepTask, InstantChoicePayload, PrefetchEntry, PrefetchKey,
-        ProfilePersistenceRollback, PromptExecutionEventPayload, ResponseProfilePayload,
-        RuntimePhasePayload, RuntimePhaseResponsePayload, RuntimeTelemetryPayload, StagePayload,
+        replace_owned_runtime_transaction, reset_conversation_execution,
+        reset_voice_pipeline_to_waiting, reset_wake_word_runtime, resolve_effective_tts_enabled,
+        response_profile_state_path, runtime_log_path, runtime_phase_response_from_state,
+        runtime_startup_is_current, shutdown_llama_cpp_runtime_for_exit,
+        shutdown_tts_runtime_for_exit, startup_warming_state_from_snapshot,
+        supported_response_profiles, take_and_invalidate_prefetch, to_runtime_phase_payload,
+        transcribe_finished_utterance, transcription_ready_samples,
+        tts_runtime_needs_initialization, update_restored_profile_capabilities,
+        validate_prompt_request_id, validate_prompt_text, wake_word_event_timestamp,
+        ActivePromptGuard, AgentChoicePayload, AssistantSettingsPayload, CapabilityPayload,
+        CapabilityStatePayload, CommitAssistantResult, CueAssetPathsPayload, DeepStageResult,
+        DeepTask, InstantChoicePayload, PrefetchEntry, PrefetchKey, ProfilePersistenceRollback,
+        PromptExecutionEventPayload, ResponseProfilePayload, RuntimePhasePayload,
+        RuntimePhaseResponsePayload, RuntimeReplacement, RuntimeTelemetryPayload, StagePayload,
         StageStatusPayload, StartupSnapshot, StartupStatePayload, SupervisedCreation, TerminalKind,
         UiPreferencesState, UiTextSizePayload, UiThemePayload, DEFAULT_SILENCE_TIMEOUT_MS,
         PROMPT_MAX_BYTES, PROVIDER_HISTORY_MAX_BYTES,
     };
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct FakeRuntime {
+        name: &'static str,
+        owned: bool,
+    }
+
+    fn fake_runtime(name: &'static str, owned: bool) -> FakeRuntime {
+        FakeRuntime { name, owned }
+    }
+
+    fn run_fake_runtime_transaction<V>(
+        current: Option<FakeRuntime>,
+        starts: Vec<Result<FakeRuntime, &'static str>>,
+        is_current: impl Fn() -> bool,
+        prepare: impl FnOnce(&FakeRuntime) -> Result<V, String>,
+    ) -> (RuntimeReplacement<FakeRuntime, V>, Vec<String>) {
+        let events = RefCell::new(Vec::new());
+        let mut starts = starts.into_iter();
+        let result = replace_owned_runtime_transaction(
+            current,
+            ("requested", "old"),
+            |runtime| runtime.owned,
+            is_current,
+            |runtime| events.borrow_mut().push(format!("stop:{}", runtime.name)),
+            |spec| {
+                events.borrow_mut().push(format!("start:{spec}"));
+                starts.next().expect("fake startup result")
+            },
+            prepare,
+        );
+        assert!(
+            starts.next().is_none(),
+            "all fake startup results should be used"
+        );
+        (result, events.into_inner())
+    }
+
+    #[test]
+    fn owned_runtime_transaction_stops_old_runtime_and_commits_requested_runtime() {
+        let (result, events) = run_fake_runtime_transaction(
+            Some(fake_runtime("old", true)),
+            vec![Ok(fake_runtime("requested", true))],
+            || true,
+            |_| Ok("prepared"),
+        );
+
+        assert_eq!(
+            result,
+            RuntimeReplacement::Applied {
+                runtime: fake_runtime("requested", true),
+                value: "prepared",
+            }
+        );
+        assert_eq!(events, ["stop:old", "start:requested"]);
+    }
+
+    #[test]
+    fn owned_runtime_transaction_restores_old_runtime_after_requested_start_failure() {
+        let (result, events) = run_fake_runtime_transaction(
+            Some(fake_runtime("old", true)),
+            vec![Err("requested failed"), Ok(fake_runtime("old", true))],
+            || true,
+            |_| Ok(()),
+        );
+
+        assert_eq!(
+            result,
+            RuntimeReplacement::Restored {
+                runtime: fake_runtime("old", true),
+                error: String::from("requested failed"),
+            }
+        );
+        assert_eq!(events, ["stop:old", "start:requested", "start:old"]);
+    }
+
+    #[test]
+    fn owned_runtime_transaction_restores_old_runtime_after_preparation_failure() {
+        let (result, events) = run_fake_runtime_transaction(
+            Some(fake_runtime("old", true)),
+            vec![
+                Ok(fake_runtime("requested", true)),
+                Ok(fake_runtime("old", true)),
+            ],
+            || true,
+            |_| Err::<(), _>(String::from("preparation failed")),
+        );
+
+        assert_eq!(
+            result,
+            RuntimeReplacement::Restored {
+                runtime: fake_runtime("old", true),
+                error: String::from("preparation failed"),
+            }
+        );
+        assert_eq!(
+            events,
+            ["stop:old", "start:requested", "stop:requested", "start:old"]
+        );
+    }
+
+    #[test]
+    fn owned_runtime_transaction_reports_restore_failure() {
+        let (result, events) = run_fake_runtime_transaction(
+            Some(fake_runtime("old", true)),
+            vec![Err("requested failed"), Err("old failed")],
+            || true,
+            |_| Ok(()),
+        );
+
+        assert_eq!(
+            result,
+            RuntimeReplacement::RestoreFailed {
+                error: String::from("requested failed"),
+                restore_error: String::from("old failed"),
+            }
+        );
+        assert_eq!(events, ["stop:old", "start:requested", "start:old"]);
+    }
+
+    #[test]
+    fn owned_runtime_transaction_rejects_external_runtime_without_mutation() {
+        let (result, events) = run_fake_runtime_transaction(
+            Some(fake_runtime("external", false)),
+            vec![],
+            || true,
+            |_| Ok(()),
+        );
+
+        assert_eq!(
+            result,
+            RuntimeReplacement::RejectedExistingExternal {
+                runtime: fake_runtime("external", false),
+            }
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn owned_runtime_transaction_rejects_external_requested_runtime_from_empty_slot() {
+        let prepared = Cell::new(false);
+
+        let (result, events) = run_fake_runtime_transaction(
+            None,
+            vec![Ok(fake_runtime("requested", false))],
+            || true,
+            |_| {
+                prepared.set(true);
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, RuntimeReplacement::RejectedStartedExternal);
+        assert_eq!(events, ["start:requested"]);
+        assert!(!prepared.get());
+    }
+
+    #[test]
+    fn owned_runtime_transaction_rejects_external_requested_runtime_after_stopping_owned_runtime() {
+        let prepared = Cell::new(false);
+
+        let (result, events) = run_fake_runtime_transaction(
+            Some(fake_runtime("old", true)),
+            vec![Ok(fake_runtime("requested", false))],
+            || true,
+            |_| {
+                prepared.set(true);
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, RuntimeReplacement::RejectedStartedExternal);
+        assert_eq!(events, ["stop:old", "start:requested"]);
+        assert!(!prepared.get());
+    }
+
+    #[test]
+    fn owned_runtime_transaction_rejects_external_fallback_runtime() {
+        let prepared = Cell::new(false);
+
+        let (result, events) = run_fake_runtime_transaction(
+            Some(fake_runtime("old", true)),
+            vec![Err("requested failed"), Ok(fake_runtime("old", false))],
+            || true,
+            |_| {
+                prepared.set(true);
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, RuntimeReplacement::RejectedStartedExternal);
+        assert_eq!(events, ["stop:old", "start:requested", "start:old"]);
+        assert!(!prepared.get());
+    }
+
+    #[test]
+    fn owned_runtime_transaction_stops_requested_runtime_when_superseded_after_preparation() {
+        let current_checks = Cell::new(0);
+
+        let (result, events) = run_fake_runtime_transaction(
+            Some(fake_runtime("old", true)),
+            vec![Ok(fake_runtime("requested", true))],
+            || {
+                let check = current_checks.get();
+                current_checks.set(check + 1);
+                check == 0
+            },
+            |_| Ok(()),
+        );
+
+        assert_eq!(result, RuntimeReplacement::Superseded);
+        assert_eq!(events, ["stop:old", "start:requested", "stop:requested"]);
+    }
 
     #[test]
     fn tts_preparation_only_initializes_when_enabling_without_runtime() {
