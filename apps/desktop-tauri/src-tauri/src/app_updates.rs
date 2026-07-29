@@ -7,17 +7,32 @@ use std::future::Future;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::time::Instant;
 
 const UPDATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_UPDATE_METADATA_BYTES: u64 = 64 * 1024;
-const MAX_UPDATE_BYTES: u64 = 300_000_000;
+const MAX_LINUX_UPDATE_BYTES: u64 = 300_000_000;
+const MAX_WINDOWS_UPDATE_BYTES: u64 = 250_000_000;
 const MAX_UPDATE_NOTES_CHARS: usize = 2_048;
 const UPDATE_CHANNEL_UNAVAILABLE_REASON: &str = "No published updates yet.";
 const UPDATE_RELEASE_HOST: &str = "github.com";
 const UPDATE_RELEASE_PATH_PREFIX: &str = "/git-blame-dev/vox-golem/releases/download";
+const UPDATE_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+const UPDATE_PROGRESS_BYTES: u64 = 1024 * 1024;
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_STAGING_PREFIX: &str = "vox-golem-update-";
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_STAGING_MARKER: &str = ".vox-golem-update";
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_STAGING_MARKER_CONTENT: &str = "vox-golem-update-v1\n";
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_STAGING_MAX_SCAN: usize = 128;
+#[cfg(target_os = "windows")]
+const WINDOWS_STAGING_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+#[cfg(target_os = "windows")]
+const WINDOWS_UPDATE_LOG_MAX_BYTES: u64 = 64 * 1024;
 
 #[derive(Default)]
 enum UpdateOperationState {
@@ -50,6 +65,56 @@ struct AvailableUpdate {
     body: Option<String>,
     download_url: reqwest::Url,
     signature: String,
+    max_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpdatePlatform {
+    Linux,
+    Windows,
+}
+
+fn current_update_platform() -> UpdatePlatform {
+    #[cfg(target_os = "windows")]
+    {
+        UpdatePlatform::Windows
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        UpdatePlatform::Linux
+    }
+}
+
+fn update_platform(os: &str) -> Option<UpdatePlatform> {
+    match os {
+        "linux" => Some(UpdatePlatform::Linux),
+        "windows" => Some(UpdatePlatform::Windows),
+        _ => None,
+    }
+}
+
+fn install_behavior(platform: UpdatePlatform) -> InstallBehavior {
+    match platform {
+        UpdatePlatform::Linux => InstallBehavior::InstallThenRestart,
+        UpdatePlatform::Windows => InstallBehavior::InstallAndRestart,
+    }
+}
+
+fn platform_manifest(
+    platforms: &UpdatePlatforms,
+    platform: UpdatePlatform,
+) -> &UpdateManifestPlatform {
+    match platform {
+        UpdatePlatform::Linux => &platforms.linux_x86_64,
+        UpdatePlatform::Windows => &platforms.windows_x86_64,
+    }
+}
+
+fn platform_max_bytes(platform: UpdatePlatform) -> u64 {
+    match platform {
+        UpdatePlatform::Linux => MAX_LINUX_UPDATE_BYTES,
+        UpdatePlatform::Windows => MAX_WINDOWS_UPDATE_BYTES,
+    }
 }
 
 #[derive(Deserialize)]
@@ -63,6 +128,8 @@ struct UpdateManifest {
 struct UpdatePlatforms {
     #[serde(rename = "linux-x86_64")]
     linux_x86_64: UpdateManifestPlatform,
+    #[serde(rename = "windows-x86_64")]
+    windows_x86_64: UpdateManifestPlatform,
 }
 
 #[derive(Deserialize)]
@@ -90,6 +157,7 @@ pub(crate) enum UpdateCheckResult {
         current_version: String,
         version: String,
         notes: Option<String>,
+        install_behavior: InstallBehavior,
     },
     UpToDate {
         current_version: String,
@@ -105,11 +173,37 @@ pub(crate) enum UpdateCheckResult {
     Installing {
         current_version: String,
         version: String,
+        install_behavior: InstallBehavior,
     },
     Installed {
         current_version: String,
         version: String,
+        install_behavior: InstallBehavior,
     },
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InstallBehavior {
+    InstallThenRestart,
+    InstallAndRestart,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum UpdateProgressPhase {
+    Started,
+    Progress,
+    Verifying,
+    Installing,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct UpdateProgress {
+    version: String,
+    phase: UpdateProgressPhase,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -130,11 +224,16 @@ pub(crate) async fn check_for_update(
     #[cfg(not(target_os = "linux"))]
     let appimage = None;
     let current_executable = std::env::current_exe().ok();
+    #[cfg(target_os = "windows")]
+    let local_data_directory = app.path().local_data_dir().ok();
+    #[cfg(not(target_os = "windows"))]
+    let local_data_directory: Option<std::path::PathBuf> = None;
     if let Err(reason) = update_installation_support(
         std::env::consts::OS,
         appimage,
         current_executable.as_deref(),
         &std::env::temp_dir(),
+        local_data_directory.as_deref(),
     ) {
         return Ok(UpdateCheckResult::Unsupported {
             current_version,
@@ -184,7 +283,16 @@ pub(crate) async fn check_for_update(
 pub(crate) async fn install_update(
     app: AppHandle,
     pending_update: State<'_, PendingUpdate>,
+    app_state: State<'_, crate::AppState>,
 ) -> Result<InstallUpdateResult, String> {
+    crate::ensure_update_installation_is_idle(&app_state)?;
+    #[cfg(target_os = "windows")]
+    let update_logging_enabled = app_state
+        .runtime_config
+        .as_ref()
+        .is_some_and(|config| config.logging.enabled);
+    #[cfg(target_os = "windows")]
+    log_windows_update_event(&app, update_logging_enabled, "download started");
     let public_key = updater_public_key(&app)?;
     let update = take_ready_update(&pending_update)?;
     let version = update.version.clone();
@@ -198,7 +306,7 @@ pub(crate) async fn install_update(
     #[cfg(not(target_os = "linux"))]
     let appimage_path = std::path::PathBuf::new();
 
-    let bytes = match download_and_verify_update(&update, public_key).await {
+    let bytes = match download_and_verify_update(&app, &update, public_key).await {
         Ok(bytes) => bytes,
         Err(error) => {
             set_update_state(
@@ -208,20 +316,63 @@ pub(crate) async fn install_update(
             return Err(format!("failed to download or verify update: {error}"));
         }
     };
+    #[cfg(target_os = "windows")]
+    log_windows_update_event(&app, update_logging_enabled, "download verified");
 
+    let _installation_guard = match crate::begin_update_installation(&app_state) {
+        Ok(guard) => guard,
+        Err(error) => {
+            return Err(restore_ready_after_prelaunch_rejection(
+                &pending_update,
+                update,
+                error,
+            ));
+        }
+    };
+    if let Err(error) = crate::ensure_update_installation_is_idle(&app_state) {
+        return Err(restore_ready_after_prelaunch_rejection(
+            &pending_update,
+            update,
+            error,
+        ));
+    }
     if !begin_replacement(&pending_update, &version)? {
         return Err(String::from(
             "application exit won before update replacement",
         ));
     }
+    emit_progress(
+        &app,
+        &version,
+        UpdateProgressPhase::Installing,
+        bytes.len() as u64,
+        Some(bytes.len() as u64),
+    );
     let install_result = match tauri::async_runtime::spawn_blocking(move || {
-        replace_appimage(&appimage_path, &bytes)
+        #[cfg(target_os = "windows")]
+        {
+            stage_and_launch_windows_installer(&bytes)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            replace_appimage(&appimage_path, &bytes)
+        }
     })
     .await
     {
         Ok(result) => result.map_err(|error| format!("failed to install update: {error}")),
         Err(error) => Err(format!("update installer task failed: {error}")),
     };
+    #[cfg(target_os = "windows")]
+    log_windows_update_event(
+        &app,
+        update_logging_enabled,
+        if install_result.is_ok() {
+            "installer launched"
+        } else {
+            "installer launch failed"
+        },
+    );
 
     let next = if install_result.is_ok() {
         UpdateOperationState::Installed {
@@ -231,7 +382,7 @@ pub(crate) async fn install_update(
         UpdateOperationState::Ready(Box::new(update))
     };
     let should_exit = finish_replacement(&pending_update, next)?;
-    if should_exit {
+    if should_exit || (cfg!(target_os = "windows") && install_result.is_ok()) {
         app.exit(0);
     }
     install_result?;
@@ -285,9 +436,25 @@ pub(crate) fn update_installation_support(
     appimage_path: Option<&Path>,
     current_executable: Option<&Path>,
     temporary_directory: &Path,
+    local_data_directory: Option<&Path>,
 ) -> Result<(), &'static str> {
+    if update_platform(operating_system) == Some(UpdatePlatform::Windows) {
+        let canonical_executable = local_data_directory.map(|directory| {
+            directory
+                .join("Programs")
+                .join("VoxGolem")
+                .join("vox-golem.exe")
+        });
+        if !current_executable
+            .zip(canonical_executable.as_deref())
+            .is_some_and(|(current, canonical)| windows_paths_match(current, canonical))
+        {
+            return Err("Automatic updates require the installed Windows application.");
+        }
+        return Ok(());
+    }
     if operating_system != "linux" {
-        return Err("Automatic updates are currently supported only on Linux.");
+        return Err("Automatic updates are currently supported only on Linux and Windows.");
     }
     if appimage_path.is_none_or(|path| path.as_os_str().is_empty())
         || !current_executable.is_some_and(|executable| {
@@ -306,6 +473,17 @@ pub(crate) fn update_installation_support(
         return Err("Automatic updates require the Linux AppImage.");
     }
     Ok(())
+}
+
+fn windows_paths_match(left: &Path, right: &Path) -> bool {
+    fn normalize(path: &Path) -> Option<String> {
+        let path = path.to_str()?.replace('/', "\\");
+        Some(path.trim_end_matches('\\').to_ascii_lowercase())
+    }
+
+    normalize(left)
+        .zip(normalize(right))
+        .is_some_and(|(left, right)| left == right)
 }
 
 fn updater_public_key(app: &AppHandle) -> Result<String, String> {
@@ -406,24 +584,39 @@ fn parse_update_manifest(
     }
 
     let version = manifest_version.to_string();
-    expected_update_artifact(&version, &manifest.platforms.linux_x86_64.url)?;
+    let platform = current_update_platform();
+    let selected = platform_manifest(&manifest.platforms, platform);
+    expected_update_artifact(&version, &selected.url, platform)?;
     Ok(UpdateChannelResult::Available(AvailableUpdate {
         current_version: current_version.to_string(),
         version,
         body: manifest.notes,
-        download_url: manifest.platforms.linux_x86_64.url,
-        signature: manifest.platforms.linux_x86_64.signature,
+        download_url: selected.url.clone(),
+        signature: selected.signature.clone(),
+        max_bytes: platform_max_bytes(platform),
     }))
 }
 
 async fn download_and_verify_update(
+    app: &AppHandle,
     update: &AvailableUpdate,
     public_key: String,
 ) -> Result<Vec<u8>, String> {
     let deadline = Instant::now() + UPDATE_DOWNLOAD_TIMEOUT;
-    let expected_artifact = expected_update_artifact(&update.version, &update.download_url)?;
-    let bytes = run_before_update_deadline(deadline, "download", download_update(update)).await?;
+    let platform = current_update_platform();
+    let expected_artifact =
+        expected_update_artifact(&update.version, &update.download_url, platform)?;
+    emit_progress(app, &update.version, UpdateProgressPhase::Started, 0, None);
+    let bytes =
+        run_before_update_deadline(deadline, "download", download_update(app, update)).await?;
     let signature = update.signature.clone();
+    emit_progress(
+        app,
+        &update.version,
+        UpdateProgressPhase::Verifying,
+        bytes.len() as u64,
+        Some(bytes.len() as u64),
+    );
 
     run_before_update_deadline(
         deadline,
@@ -440,9 +633,16 @@ async fn download_and_verify_update(
     Ok(bytes)
 }
 
-fn expected_update_artifact(version: &str, download_url: &reqwest::Url) -> Result<String, String> {
+fn expected_update_artifact(
+    version: &str,
+    download_url: &reqwest::Url,
+    platform: UpdatePlatform,
+) -> Result<String, String> {
     let tag = format!("v{version}");
-    let artifact = format!("vox-golem-linux-x86_64-{tag}.AppImage");
+    let artifact = match platform {
+        UpdatePlatform::Linux => format!("vox-golem-linux-x86_64-{tag}.AppImage"),
+        UpdatePlatform::Windows => format!("vox-golem-windows-x86_64-{tag}-setup.exe"),
+    };
     let expected_path = format!("{UPDATE_RELEASE_PATH_PREFIX}/{tag}/{artifact}");
     if download_url.scheme() != "https"
         || download_url.host_str() != Some(UPDATE_RELEASE_HOST)
@@ -460,7 +660,7 @@ fn expected_update_artifact(version: &str, download_url: &reqwest::Url) -> Resul
     Ok(artifact)
 }
 
-async fn download_update(update: &AvailableUpdate) -> Result<Vec<u8>, String> {
+async fn download_update(app: &AppHandle, update: &AvailableUpdate) -> Result<Vec<u8>, String> {
     let response = reqwest::Client::builder()
         .user_agent(concat!(
             env!("CARGO_PKG_NAME"),
@@ -482,36 +682,81 @@ async fn download_update(update: &AvailableUpdate) -> Result<Vec<u8>, String> {
     }
 
     let content_length = response.content_length();
-    ensure_declared_update_size(content_length)?;
+    ensure_declared_update_size(content_length, update.max_bytes)?;
     let mut bytes = Vec::new();
     if let Some(content_length) = content_length {
         reserve_update_bytes(&mut bytes, content_length as usize)?;
     }
     let mut downloaded = 0_u64;
+    let mut last_progress = Instant::now();
+    let mut last_progress_bytes = 0_u64;
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| format!("update download failed: {error}"))?;
-        downloaded = checked_update_download_size(downloaded, chunk.len())?;
+        downloaded = checked_update_download_size(downloaded, chunk.len(), update.max_bytes)?;
         reserve_update_bytes(&mut bytes, chunk.len())?;
         bytes.extend_from_slice(&chunk);
+        if downloaded == bytes.len() as u64
+            && (downloaded.saturating_sub(last_progress_bytes) >= UPDATE_PROGRESS_BYTES
+                || last_progress.elapsed() >= UPDATE_PROGRESS_INTERVAL)
+        {
+            emit_progress(
+                app,
+                &update.version,
+                UpdateProgressPhase::Progress,
+                downloaded,
+                content_length,
+            );
+            last_progress = Instant::now();
+            last_progress_bytes = downloaded;
+        }
     }
+    emit_progress(
+        app,
+        &update.version,
+        UpdateProgressPhase::Progress,
+        downloaded,
+        content_length,
+    );
     Ok(bytes)
 }
 
-fn ensure_declared_update_size(content_length: Option<u64>) -> Result<(), String> {
-    if content_length.is_some_and(|length| length > MAX_UPDATE_BYTES) {
+fn emit_progress(
+    app: &AppHandle,
+    version: &str,
+    phase: UpdateProgressPhase,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+) {
+    let _ = app.emit(
+        "app-update-progress",
+        UpdateProgress {
+            version: String::from(version),
+            phase,
+            downloaded_bytes,
+            total_bytes,
+        },
+    );
+}
+
+fn ensure_declared_update_size(content_length: Option<u64>, max_bytes: u64) -> Result<(), String> {
+    if content_length.is_some_and(|length| length > max_bytes) {
         return Err(format!(
-            "update artifact exceeds the {MAX_UPDATE_BYTES}-byte limit"
+            "update artifact exceeds the {max_bytes}-byte limit"
         ));
     }
     Ok(())
 }
 
-fn checked_update_download_size(downloaded: u64, chunk_size: usize) -> Result<u64, String> {
+fn checked_update_download_size(
+    downloaded: u64,
+    chunk_size: usize,
+    max_bytes: u64,
+) -> Result<u64, String> {
     let total = downloaded
         .checked_add(chunk_size as u64)
-        .filter(|total| *total <= MAX_UPDATE_BYTES)
-        .ok_or_else(|| format!("update artifact exceeds the {MAX_UPDATE_BYTES}-byte limit"))?;
+        .filter(|total| *total <= max_bytes)
+        .ok_or_else(|| format!("update artifact exceeds the {max_bytes}-byte limit"))?;
     Ok(total)
 }
 
@@ -567,6 +812,186 @@ fn replace_appimage(_path: &Path, _bytes: &[u8]) -> Result<(), String> {
     Err(String::from(
         "automatic update replacement is supported only on Linux",
     ))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_launch_args() -> [&'static str; 3] {
+    ["/P", "/R", "/UPDATE"]
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn validate_staging_directory(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("failed to inspect update staging directory: {error}"))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(String::from(
+            "update staging path is not a regular directory",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn write_staging_marker(directory: &Path) -> Result<(), String> {
+    use std::io::Write;
+
+    let marker = directory.join(WINDOWS_STAGING_MARKER);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+        .map_err(|error| format!("failed to create update staging marker: {error}"))?;
+    file.write_all(WINDOWS_STAGING_MARKER_CONTENT.as_bytes())
+        .map_err(|error| format!("failed to write update staging marker: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("failed to sync update staging marker: {error}"))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn cleanup_stale_windows_installers_in(root: &Path, minimum_age: Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(WINDOWS_STAGING_PREFIX))
+        })
+        .take(WINDOWS_STAGING_MAX_SCAN)
+    {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        debug_assert!(name.starts_with(WINDOWS_STAGING_PREFIX));
+        let path = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let marker = path.join(WINDOWS_STAGING_MARKER);
+        let Ok(marker_metadata) = std::fs::symlink_metadata(&marker) else {
+            continue;
+        };
+        if !marker_metadata.file_type().is_file() || marker_metadata.file_type().is_symlink() {
+            continue;
+        }
+        if !matches!(
+            std::fs::read_to_string(&marker),
+            Ok(content) if content == WINDOWS_STAGING_MARKER_CONTENT
+        ) {
+            continue;
+        }
+        let Ok(age) = metadata.modified().and_then(|modified| {
+            std::time::SystemTime::now()
+                .duration_since(modified)
+                .map_err(std::io::Error::other)
+        }) else {
+            continue;
+        };
+        if age < minimum_age {
+            continue;
+        }
+        if std::fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn cleanup_stale_windows_installers(app: &AppHandle, logging_enabled: bool) {
+    let removed =
+        cleanup_stale_windows_installers_in(&std::env::temp_dir(), WINDOWS_STAGING_MAX_AGE);
+    if removed > 0 {
+        log_windows_update_event(
+            app,
+            logging_enabled,
+            &format!("removed {removed} stale staging directories"),
+        );
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn log_windows_update_event(app: &AppHandle, enabled: bool, event: &str) {
+    use std::io::Write;
+
+    if !enabled {
+        return;
+    }
+    let Ok(directory) = app.path().app_log_dir() else {
+        return;
+    };
+    if std::fs::create_dir_all(&directory).is_err() {
+        return;
+    }
+    let path = directory.join("updates.log");
+    let truncate = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            metadata.len() >= WINDOWS_UPDATE_LOG_MAX_BYTES
+        }
+        Ok(_) => return,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => return,
+    };
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(!truncate)
+        .truncate(truncate)
+        .write(true)
+        .open(path)
+    else {
+        return;
+    };
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let safe_event: String = event
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, ' ' | '-'))
+        .take(128)
+        .collect();
+    let _ = writeln!(file, "{timestamp} {safe_event}");
+}
+
+#[cfg(target_os = "windows")]
+fn stage_and_launch_windows_installer(bytes: &[u8]) -> Result<(), String> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::process::Command;
+
+    if bytes.is_empty() {
+        return Err(String::from("update installer is empty"));
+    }
+    let root = std::env::temp_dir();
+    let directory = tempfile::Builder::new()
+        .prefix(WINDOWS_STAGING_PREFIX)
+        .tempdir_in(&root)
+        .map_err(|error| format!("failed to create update staging directory: {error}"))?;
+    validate_staging_directory(directory.path())?;
+    write_staging_marker(directory.path())?;
+    let installer = directory.path().join("vox-golem-update.exe");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&installer)
+        .map_err(|error| format!("failed to create staged installer: {error}"))?;
+    file.write_all(bytes)
+        .map_err(|error| format!("failed to stage installer: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("failed to sync staged installer: {error}"))?;
+    Command::new(&installer)
+        .args(windows_launch_args())
+        .spawn()
+        .map_err(|error| format!("failed to launch staged installer: {error}"))?;
+    std::mem::forget(directory);
+    Ok(())
 }
 
 async fn run_before_update_deadline<T, F>(
@@ -663,10 +1088,12 @@ fn begin_check_or_snapshot(
         | UpdateOperationState::Replacing { version } => Some(UpdateCheckResult::Installing {
             current_version: String::from(current_version),
             version: version.clone(),
+            install_behavior: install_behavior(current_update_platform()),
         }),
         UpdateOperationState::Installed { version } => Some(UpdateCheckResult::Installed {
             current_version: String::from(current_version),
             version: version.clone(),
+            install_behavior: install_behavior(current_update_platform()),
         }),
     };
     Ok(result)
@@ -711,6 +1138,20 @@ fn take_ready_update(pending_update: &PendingUpdate) -> Result<AvailableUpdate, 
     }
 }
 
+fn restore_ready_after_prelaunch_rejection(
+    pending_update: &PendingUpdate,
+    update: AvailableUpdate,
+    error: String,
+) -> String {
+    match set_update_state(
+        pending_update,
+        UpdateOperationState::Ready(Box::new(update)),
+    ) {
+        Ok(()) => error,
+        Err(state_error) => format!("{error}; failed to restore update state: {state_error}"),
+    }
+}
+
 fn begin_replacement(pending_update: &PendingUpdate, version: &str) -> Result<bool, String> {
     let mut lifecycle = pending_update
         .lifecycle
@@ -736,6 +1177,7 @@ fn available_result(update: &AvailableUpdate) -> UpdateCheckResult {
         current_version: update.current_version.clone(),
         version: update.version.clone(),
         notes: update.body.clone(),
+        install_behavior: install_behavior(current_update_platform()),
     }
 }
 
@@ -782,7 +1224,7 @@ mod tests {
     use super::{
         begin_check_or_snapshot, begin_replacement, finish_replacement, take_ready_update,
         update_installation_support, PendingUpdate, UpdateCheckResult, UpdateOperationState,
-        UpdaterLifecycle, MAX_UPDATE_BYTES, UPDATE_CHANNEL_UNAVAILABLE_REASON,
+        UpdaterLifecycle, MAX_LINUX_UPDATE_BYTES, UPDATE_CHANNEL_UNAVAILABLE_REASON,
         UPDATE_DOWNLOAD_TIMEOUT,
     };
     use std::io::{Read, Write};
@@ -797,13 +1239,14 @@ mod tests {
     const FIXTURE_MESSAGE: &[u8] = b"VoxGolem updater verifier fixture\n";
 
     #[test]
-    fn automatic_updates_require_a_linux_appimage() {
+    fn automatic_updates_require_the_platform_installation_identity() {
         assert_eq!(
             update_installation_support(
                 "linux",
                 Some(Path::new("/opt/VoxGolem.AppImage")),
                 Some(Path::new("/tmp/.mount_vox/usr/bin/vox-golem")),
                 Path::new("/tmp"),
+                None,
             ),
             Ok(())
         );
@@ -813,6 +1256,7 @@ mod tests {
                 None,
                 Some(Path::new("/tmp/.mount_vox/usr/bin/vox-golem")),
                 Path::new("/tmp"),
+                None,
             ),
             Err("Automatic updates require the Linux AppImage.")
         );
@@ -822,6 +1266,7 @@ mod tests {
                 Some(Path::new("/tmp/forged.AppImage")),
                 Some(Path::new("/usr/bin/vox-golem")),
                 Path::new("/tmp"),
+                None,
             ),
             Err("Automatic updates require the Linux AppImage.")
         );
@@ -829,10 +1274,39 @@ mod tests {
             update_installation_support(
                 "windows",
                 Some(Path::new("ignored")),
-                Some(Path::new("ignored")),
+                Some(Path::new(
+                    "C:/Users/Test/AppData/Local/Programs/VoxGolem/vox-golem.exe"
+                )),
                 Path::new("ignored"),
+                Some(Path::new("c:\\users\\test\\appdata\\local")),
             ),
-            Err("Automatic updates are currently supported only on Linux.")
+            Ok(())
+        );
+        assert_eq!(
+            update_installation_support(
+                "windows",
+                None,
+                Some(Path::new(
+                    "C:/Users/Test/AppData/Local/VoxGolem/vox-golem.exe",
+                )),
+                Path::new("ignored"),
+                Some(Path::new("C:/Users/Test/AppData/Local")),
+            ),
+            Err("Automatic updates require the installed Windows application.")
+        );
+        assert_eq!(
+            update_installation_support(
+                "windows",
+                None,
+                Some(Path::new("C:/portable/vox-golem.exe")),
+                Path::new("ignored"),
+                Some(Path::new("C:/Users/Test/AppData/Local")),
+            ),
+            Err("Automatic updates require the installed Windows application.")
+        );
+        assert_eq!(
+            update_installation_support("macos", None, None, Path::new("ignored"), None),
+            Err("Automatic updates are currently supported only on Linux and Windows.")
         );
     }
 
@@ -842,6 +1316,7 @@ mod tests {
             current_version: String::from("0.1.0"),
             version: String::from("2026.7.27-12"),
             notes: Some(String::from("Safer updates")),
+            install_behavior: super::InstallBehavior::InstallThenRestart,
         };
         assert_eq!(
             serde_json::to_value(available).expect("serialize update result"),
@@ -849,7 +1324,8 @@ mod tests {
                 "status": "available",
                 "current_version": "0.1.0",
                 "version": "2026.7.27-12",
-                "notes": "Safer updates"
+                "notes": "Safer updates",
+                "install_behavior": "install_then_restart"
             })
         );
 
@@ -1018,6 +1494,35 @@ mod tests {
     }
 
     #[test]
+    fn busy_prelaunch_rejection_restores_the_available_update() {
+        let pending = pending_in(UpdateOperationState::Downloading {
+            version: String::from("2026.7.27-12"),
+        });
+        let update = super::AvailableUpdate {
+            current_version: String::from("0.1.0"),
+            version: String::from("2026.7.27-12"),
+            body: None,
+            download_url: "https://github.com/git-blame-dev/vox-golem/releases/download/v2026.7.27-12/vox-golem-windows-x86_64-v2026.7.27-12-setup.exe"
+                .parse()
+                .expect("update URL"),
+            signature: String::from("signature"),
+            max_bytes: super::MAX_WINDOWS_UPDATE_BYTES,
+        };
+        assert_eq!(
+            super::restore_ready_after_prelaunch_rejection(
+                &pending,
+                update,
+                String::from("Update installation requires VoxGolem to be idle."),
+            ),
+            "Update installation requires VoxGolem to be idle."
+        );
+        assert!(matches!(
+            begin_check_or_snapshot(&pending, "0.1.0").expect("available snapshot"),
+            Some(UpdateCheckResult::Available { version, .. }) if version == "2026.7.27-12"
+        ));
+    }
+
+    #[test]
     fn exit_committed_during_download_prevents_replacement() {
         let pending = pending_in(UpdateOperationState::Downloading {
             version: String::from("2026.7.27-12"),
@@ -1075,13 +1580,30 @@ mod tests {
 
     #[test]
     fn oversized_declared_and_streamed_updates_are_rejected() {
-        assert!(super::ensure_declared_update_size(Some(MAX_UPDATE_BYTES)).is_ok());
-        assert!(super::ensure_declared_update_size(Some(MAX_UPDATE_BYTES + 1)).is_err());
+        assert!(super::ensure_declared_update_size(
+            Some(MAX_LINUX_UPDATE_BYTES),
+            MAX_LINUX_UPDATE_BYTES
+        )
+        .is_ok());
+        assert!(super::ensure_declared_update_size(
+            Some(MAX_LINUX_UPDATE_BYTES + 1),
+            MAX_LINUX_UPDATE_BYTES
+        )
+        .is_err());
         assert_eq!(
-            super::checked_update_download_size(MAX_UPDATE_BYTES - 1, 1),
-            Ok(MAX_UPDATE_BYTES)
+            super::checked_update_download_size(
+                MAX_LINUX_UPDATE_BYTES - 1,
+                1,
+                MAX_LINUX_UPDATE_BYTES
+            ),
+            Ok(MAX_LINUX_UPDATE_BYTES)
         );
-        assert!(super::checked_update_download_size(MAX_UPDATE_BYTES - 1, 2).is_err());
+        assert!(super::checked_update_download_size(
+            MAX_LINUX_UPDATE_BYTES - 1,
+            2,
+            MAX_LINUX_UPDATE_BYTES
+        )
+        .is_err());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1153,7 +1675,7 @@ mod tests {
         .parse()
         .expect("valid update URL");
         assert_eq!(
-            super::expected_update_artifact(version, &valid_url),
+            super::expected_update_artifact(version, &valid_url, super::UpdatePlatform::Linux),
             Ok(String::from(artifact))
         );
 
@@ -1173,10 +1695,63 @@ mod tests {
         ] {
             assert!(super::expected_update_artifact(
                 version,
-                &invalid_url.parse().expect("invalid-case URL still parses")
+                &invalid_url.parse().expect("invalid-case URL still parses"),
+                super::UpdatePlatform::Linux,
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn platform_descriptors_have_distinct_exact_artifacts_and_bounds() {
+        let version = "2026.7.27-43";
+        let linux = format!("https://github.com/git-blame-dev/vox-golem/releases/download/v{version}/vox-golem-linux-x86_64-v{version}.AppImage").parse().expect("linux URL");
+        let windows = format!("https://github.com/git-blame-dev/vox-golem/releases/download/v{version}/vox-golem-windows-x86_64-v{version}-setup.exe").parse().expect("windows URL");
+        assert_eq!(
+            super::expected_update_artifact(version, &linux, super::UpdatePlatform::Linux).unwrap(),
+            format!("vox-golem-linux-x86_64-v{version}.AppImage")
+        );
+        assert_eq!(
+            super::expected_update_artifact(version, &windows, super::UpdatePlatform::Windows)
+                .unwrap(),
+            format!("vox-golem-windows-x86_64-v{version}-setup.exe")
+        );
+        assert_eq!(
+            super::platform_max_bytes(super::UpdatePlatform::Linux),
+            300_000_000
+        );
+        assert_eq!(
+            super::platform_max_bytes(super::UpdatePlatform::Windows),
+            250_000_000
+        );
+    }
+
+    #[test]
+    fn windows_launch_and_staging_seams_are_host_testable() {
+        assert_eq!(super::windows_launch_args(), ["/P", "/R", "/UPDATE"]);
+        let directory = tempfile::tempdir().expect("staging directory");
+        super::validate_staging_directory(directory.path()).expect("regular directory");
+        let link = directory.path().join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(directory.path(), &link).expect("symlink");
+        #[cfg(unix)]
+        assert!(super::validate_staging_directory(&link).is_err());
+
+        let marked = directory.path().join("vox-golem-update-marked");
+        let unmarked = directory.path().join("vox-golem-update-unmarked");
+        for index in 0..=super::WINDOWS_STAGING_MAX_SCAN {
+            std::fs::create_dir(directory.path().join(format!("unrelated-{index}")))
+                .expect("unrelated directory");
+        }
+        std::fs::create_dir(&marked).expect("marked directory");
+        std::fs::create_dir(&unmarked).expect("unmarked directory");
+        super::write_staging_marker(&marked).expect("staging marker");
+        assert_eq!(
+            super::cleanup_stale_windows_installers_in(directory.path(), Duration::ZERO),
+            1
+        );
+        assert!(!marked.exists());
+        assert!(unmarked.exists());
     }
 
     fn pending_in(state: UpdateOperationState) -> PendingUpdate {
@@ -1245,6 +1820,12 @@ mod tests {
                     "signature": "signed artifact",
                     "url": format!(
                         "https://github.com/git-blame-dev/vox-golem/releases/download/v{version}/{artifact}"
+                    )
+                },
+                "windows-x86_64": {
+                    "signature": "signed artifact",
+                    "url": format!(
+                        "https://github.com/git-blame-dev/vox-golem/releases/download/v{version}/vox-golem-windows-x86_64-v{version}-setup.exe"
                     )
                 }
             }

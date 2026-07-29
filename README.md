@@ -4,7 +4,7 @@
 [![Latest release](https://img.shields.io/github/v/release/git-blame-dev/vox-golem?label=release&logo=github&logoColor=white)](https://github.com/git-blame-dev/vox-golem/releases/latest)
 [![Ubuntu 24.04 x86_64](https://img.shields.io/badge/Ubuntu%2024.04-x86__64-E95420?logo=ubuntu&logoColor=white)](#supported-linux-baseline)
 
-Vox Golem is a Linux-first WSL2/WSLg Tauri desktop voice assistant for typed or spoken developer prompts. It captures wake-word turns, transcribes locally when configured, and displays the answer and runtime state in one UI.
+Vox Golem is a Linux-first, Linux/Windows Tauri desktop voice assistant for typed or spoken developer prompts. It captures wake-word turns, transcribes locally when configured, and displays the answer and runtime state in one UI.
 
 ## Capabilities
 
@@ -15,6 +15,12 @@ Deep and Review default to disabled. They are reasoning/review-only paths with n
 ## Supported Linux baseline
 
 The supported release baseline is Ubuntu 24.04 LTS on x86_64, including Ubuntu 24.04 under WSL2/WSLg. CI builds on that baseline; older Ubuntu releases and other distributions are not promised because native library compatibility is not verified. CUDA and its system libraries are intentionally external and are never bundled.
+
+## Windows target
+
+Windows 11 x64 uses a per-user NSIS installer under `%LOCALAPPDATA%\Programs\VoxGolem`. The installer is built on Ubuntu, creates a Start Menu shortcut, and packages only the application, DirectML, ONNX Runtime provider bridges, and required app-local Microsoft VC runtime DLLs. NVIDIA drivers, CUDA, cuDNN, TensorRT, models, `llama-server`, `SOUL.md`, configuration, credentials, and user data remain external. Windows artifacts are not Authenticode-signed and may trigger SmartScreen; real Windows 11 hardware validation is required before release-readiness claims.
+
+Windows configuration defaults to `%APPDATA%\VoxGolem\config.toml`. Relative paths resolve beside that file, and missing assets disable only the affected optional capability.
 
 ## WSL2/WSLg setup
 
@@ -38,21 +44,23 @@ make app-smoke    # bounded Linux startup-ready smoke check
 make dist         # build and stage native binary
 make update-bundle                    # build and verify an unsigned, generated-version AppImage
 make update-bundle-smoke              # run the built AppImage startup check
+make pc-dist      # cross-build and stage the lightweight Windows payload on Linux
+make pc-installer # build and verify the Windows NSIS installer on Linux
 ```
 
 `make app-smoke` proves only that the zero-asset Tauri shell reaches its startup marker (shell setup); it does not prove providers, models, voice, completion, or TTS, which require their own runtime checks.
 
-The staged native binary is `dist/VoxGolem/vox-golem`. `make pc-dist` is an optional, non-gating Linux-hosted Windows cross-build and may require extra LLVM/cargo-xwin inputs; it is not part of Linux CI. No Windows runner or Windows release is promised here.
+The staged native binary is `dist/VoxGolem/vox-golem`. Windows cross-builds require cargo-xwin 0.23.0, LLVM/Clang 19 or newer, NSIS, cabextract, and 7-Zip. They do not require a Windows runner.
 
-CI runs `make test` and a separate Ubuntu 24.04 native artifact job (`make dist` and `make update-bundle`). The Linux package contains only the executable and the ONNX Runtime shared/CUDA provider libraries produced by the locked build; the AppImage carries the same provider libraries under `/usr/lib`. User models and CUDA system libraries remain external. `make verify-dist` and `make verify-update-bundle` check package contents and modes and fail clearly when TTS-capable ONNX assets are absent. CI cannot prove microphone, WebView/WSLg, GPU, model, TTS, or endpoint behavior; perform those hardware/runtime checks manually. Inference policy `auto` prefers CUDA when usable and otherwise falls back to CPU; `cuda` requires CUDA and `cpu` forces CPU.
+CI runs `make test` plus separate Ubuntu 24.04 Linux and Windows artifact jobs. The Linux job runs `make dist` and `make update-bundle`; the Windows job runs `make pc-installer`. Exact package allowlists reject system NVIDIA runtimes, models, and user data. CI cannot prove microphone, WebView/WSLg, GPU, model, TTS, speaker, or real Windows behavior; perform those hardware/runtime checks manually. Inference policy `auto` prefers CUDA when usable and otherwise falls back to CPU; `cuda` requires CUDA and `cpu` forces CPU.
 
 ## Signed application updates
 
-GitHub Releases publish the existing ZIP plus a signed x86_64 AppImage, its detached signature, `latest.json`, and `SHA256SUMS`. AppImage builds check the latest release automatically and show the result under **Settings → Application updates**. Download and installation require an explicit button press, and restart is a separate action. Raw ZIP/development builds remain usable but report that automatic updates require the AppImage.
+Eligible `main` pushes publish one atomic GitHub release containing the Linux ZIP, signed x86_64 AppImage, signed Windows 11 x64 NSIS installer, both detached updater signatures, a two-platform `latest.json`, and `SHA256SUMS`. Publication fails if either platform artifact is missing. Packaged builds check the latest release automatically and show the result under **Settings → Application updates**. Download and installation require an explicit button press. Linux keeps separate install and restart actions; Windows uses `Install and restart`, launches the passive installer, exits, replaces locked files, and relaunches.
 
-The updater verifies every downloaded AppImage with the public key embedded in `tauri.conf.json`; signature verification cannot be disabled. A failed check, interrupted download, invalid manifest, incompatible artifact, or bad signature leaves the running installation unchanged. Updates cover the application and bundled ONNX provider libraries only, never user models, configuration, credentials, or CUDA system libraries.
+The updater verifies every downloaded AppImage or NSIS installer with the public key embedded in `tauri.conf.json`; signature verification cannot be disabled. Downloads are size-bounded and bound to the exact repository, tag, version, platform, and filename. A failed check, interrupted download, invalid manifest, incompatible artifact, or bad signature leaves the running installation unchanged. Updates cover only application package files, never user models, configuration, credentials, or system GPU libraries.
 
-Release versions use valid semantic versions derived from the source commit date and Linux CI run number: `YYYY.M.D-N`. The CI-built AppImage and release tag use the same version.
+Release versions use valid semantic versions derived from the source commit date and CI run number: `YYYY.M.D-N`. Linux and Windows artifacts and the release tag use the same version and source SHA.
 
 Maintainers must store the matching private key outside the repository and configure it as the GitHub Actions secret `TAURI_SIGNING_PRIVATE_KEY`. If the key is password-protected, also configure `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. For example, an authorized maintainer can provision the key without printing it:
 

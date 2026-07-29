@@ -3,10 +3,11 @@ import type { AppUpdateController, UpdateState } from '../lib/useAppUpdates'
 
 interface UpdateSettingsProps {
   readonly updates: AppUpdateController
+  readonly installationDisabled?: boolean
 }
 
-export function UpdateSettings({ updates }: UpdateSettingsProps): JSX.Element {
-  const presentation = updatePresentation(updates)
+export function UpdateSettings({ updates, installationDisabled = false }: UpdateSettingsProps): JSX.Element {
+  const presentation = updatePresentation(updates, installationDisabled)
 
   return (
     <section className="settings-panel__updates" aria-labelledby="updates-title">
@@ -26,15 +27,15 @@ export function UpdateSettings({ updates }: UpdateSettingsProps): JSX.Element {
   )
 }
 
-function updatePresentation(updates: AppUpdateController): {
+function updatePresentation(updates: AppUpdateController, installationDisabled: boolean): {
   readonly status: string
   readonly action: JSX.Element | null
   readonly error?: boolean
   readonly pending?: boolean
 } {
   const { state } = updates
-  const action = (label: string, run: () => Promise<void>): JSX.Element => (
-    <button type="button" className="shell__control" onClick={() => void run()}>{label}</button>
+  const action = (label: string, run: () => Promise<void>, disabled = false): JSX.Element => (
+    <button type="button" className="shell__control" onClick={() => void run()} disabled={disabled}>{label}</button>
   )
 
   if (state.kind === 'checking') return { status: 'Checking...', action: null, pending: true }
@@ -43,29 +44,34 @@ function updatePresentation(updates: AppUpdateController): {
     return { status: `Check failed: ${state.message}`, action: action('Retry', updates.check), error: true }
   }
   if (state.kind === 'installing') {
-    return { status: 'Downloading and verifying...', action: null, pending: true }
+    return { status: progressStatus(state.progress), action: null, pending: true }
   }
   if (state.kind === 'installed') {
-    return { status: 'Update installed', action: action('Restart', updates.restart) }
+    return { status: 'Update installed', action: state.installBehavior === 'install_and_restart' ? null : action('Restart', updates.restart) }
   }
 
-  return resultPresentation(state, updates, action)
+  return resultPresentation(state, updates, action, installationDisabled)
 }
 
 function resultPresentation(
   state: Extract<UpdateState, { readonly kind: 'result' }>,
   updates: AppUpdateController,
-  action: (label: string, run: () => Promise<void>) => JSX.Element,
+  action: (label: string, run: () => Promise<void>, disabled?: boolean) => JSX.Element,
+  installationDisabled: boolean,
 ): { readonly status: string; readonly action: JSX.Element | null; readonly pending?: boolean } {
   const { result } = state
   if (result.status === 'available') {
-    return { status: 'Update available', action: action('Install update', () => updates.install(result.version)) }
+    const label = result.installBehavior === 'install_and_restart' ? 'Install and restart' : 'Install update'
+    return {
+      status: installationDisabled ? 'Update available. Finish active work before installing.' : 'Update available',
+      action: action(label, () => updates.install(result.version, result.installBehavior), installationDisabled),
+    }
   }
   if (result.status === 'installing') {
-    return { status: 'Downloading and verifying...', action: null, pending: true }
+    return { status: progressStatus(updates.progress), action: null, pending: true }
   }
   if (result.status === 'installed') {
-    return { status: 'Update installed', action: action('Restart', updates.restart) }
+    return { status: 'Update installed', action: result.installBehavior === 'install_and_restart' ? null : action('Restart', updates.restart) }
   }
   if (result.status === 'up_to_date') {
     return { status: 'Up to date', action: action('Check', updates.check) }
@@ -75,3 +81,15 @@ function resultPresentation(
   }
   return { status: result.reason, action: null }
 }
+
+function progressStatus(progress: AppUpdateController['progress']): string {
+  if (!progress) return 'Downloading and verifying...'
+  const downloaded = formatMb(progress.downloadedBytes)
+  if (progress.phase === 'verifying') return `Verifying ${downloaded} MB...`
+  if (progress.phase === 'installing') return 'Starting installer...'
+  if (progress.totalBytes === undefined || progress.totalBytes === 0) return `Downloading: ${downloaded} MB`
+  const percent = Math.min(100, Math.floor(progress.downloadedBytes / progress.totalBytes * 100))
+  return `Downloading: ${percent}% (${downloaded} / ${formatMb(progress.totalBytes)} MB)`
+}
+
+function formatMb(bytes: number): string { return (bytes / 1_000_000).toFixed(1) }

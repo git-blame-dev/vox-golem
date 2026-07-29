@@ -34,52 +34,46 @@ override APP_VERSION := $(shell scripts/release-version.sh "$$(git show -s --for
 LINUX_ORT_LIB_DIR ?= $(if $(ORT_LIB_PATH),$(ORT_LIB_PATH),$(LINUX_RELEASE_DIR))
 WINDOWS_RELEASE_DIR := $(CURDIR)/target/$(WINDOWS_TARGET)/release
 WINDOWS_STAGED_RELEASE_DIR := $(CURDIR)/dist/VoxGolem-windows
+WINDOWS_NSIS_DIR := $(WINDOWS_RELEASE_DIR)/bundle/nsis
+WINDOWS_NSIS_INSTALLER := $(WINDOWS_NSIS_DIR)/VoxGolem_$(APP_VERSION)_x64-setup.exe
 IMPORT_LIB_DIR := $(CURDIR)/target/import-libs
 CROSS_SHIM_DIR := $(CURDIR)/target/cross-shims
 ESPEAK_COMPAT_HEADER := $(CROSS_SHIM_DIR)/espeak_windows_compat.h
+WINDOWS_NSIS_TEMPLATE := $(CROSS_SHIM_DIR)/windows-installer.nsi
+TAURI_NSIS_TEMPLATE_SOURCE := $(CURDIR)/.deps/tauri-bundler/2.9.1/installer.nsi
+TAURI_NSIS_TEMPLATE_URL := https://raw.githubusercontent.com/tauri-apps/tauri/e5ae5b93cdd310045191cc0526f253140ad64b87/crates/tauri-bundler/src/bundle/windows/nsis/installer.nsi
+TAURI_NSIS_TEMPLATE_SHA256 := ee84148e405adc4d736a46456dd8345a644751bd1f28a335dd7fd833a32d7c3e
+MAX_WINDOWS_INSTALLER_BYTES := 250000000
+WINDOWS_CROSS_BIN := $(CURDIR)/scripts/windows-cross
+WINDOWS_CLANG_CL := $(WINDOWS_CROSS_BIN)/clang-cl
+REAL_CLANG_CL := $(shell command -v clang-cl 2>/dev/null || command -v clang-19 2>/dev/null)
 STDCXX_IMPORT_LIB := $(IMPORT_LIB_DIR)/stdc++.lib
 DIRECTML_IMPORT_LIB := $(IMPORT_LIB_DIR)/DirectML.lib
 PATHCCH_IMPORT_LIB := $(IMPORT_LIB_DIR)/PathCch.lib
-CUDA_RUNTIME_FLAVOR ?= onnxruntime-1.24.2-cu12-cudnn9
-CUDA_RUNTIME_DIR := $(CURDIR)/.deps/cuda-runtime/$(CUDA_RUNTIME_FLAVOR)/bin
+VC_REDIST_VERSION := 14.51.36247.0
+VC_REDIST_URL := https://download.visualstudio.microsoft.com/download/pr/ebdab8e5-1d7b-4d9f-a11b-cbb1720c3b12/843068991DAAA1F73AD9F6239BCE4D0F6A07A51F18C37EA2A867E9BECA71295C/VC_redist.x64.exe
+VC_REDIST_SHA256 := 843068991daaa1f73ad9f6239bce4d0f6a07a51f18c37ea2a867e9beca71295c
+VC_REDIST_ARCHIVE := $(CURDIR)/.deps/downloads/VC_redist.x64-$(VC_REDIST_VERSION).exe
+VC_RUNTIME_ROOT := $(CURDIR)/.deps/vc-runtime/$(VC_REDIST_VERSION)
+VC_RUNTIME_DIR := $(VC_RUNTIME_ROOT)/bin
 
 ORT_RUNTIME_DLLS := \
 	DirectML.dll \
 	onnxruntime_providers_cuda.dll \
-	onnxruntime_providers_nv_tensorrt_rtx.dll \
-	onnxruntime_providers_shared.dll \
-	onnxruntime_providers_tensorrt.dll
+	onnxruntime_providers_shared.dll
 
-CUDA_RUNTIME_DLLS := \
-	cublas64_12.dll \
-	cublasLt64_12.dll \
-	cudart64_12.dll \
-	cudnn64_9.dll \
-	cudnn_adv64_9.dll \
-	cudnn_cnn64_9.dll \
-	cudnn_engines_precompiled64_9.dll \
-	cudnn_engines_runtime_compiled64_9.dll \
-	cudnn_graph64_9.dll \
-	cudnn_heuristic64_9.dll \
-	cudnn_ops64_9.dll \
-	cufft64_11.dll
+VC_RUNTIME_DLLS := \
+	MSVCP140.dll \
+	MSVCP140_1.dll \
+	VCRUNTIME140.dll \
+	VCRUNTIME140_1.dll
 
 REQUIRED_DIST_FILES := \
 	vox-golem.exe \
+	DirectML.dll \
 	onnxruntime_providers_cuda.dll \
 	onnxruntime_providers_shared.dll \
-	cublas64_12.dll \
-	cublasLt64_12.dll \
-	cudart64_12.dll \
-	cudnn64_9.dll \
-	cudnn_adv64_9.dll \
-	cudnn_cnn64_9.dll \
-	cudnn_engines_precompiled64_9.dll \
-	cudnn_engines_runtime_compiled64_9.dll \
-	cudnn_graph64_9.dll \
-	cudnn_heuristic64_9.dll \
-	cudnn_ops64_9.dll \
-	cufft64_11.dll
+	$(VC_RUNTIME_DLLS)
 
 LINUX_ORT_PROVIDER_LIBS := \
 	libonnxruntime_providers_shared.so \
@@ -87,7 +81,7 @@ LINUX_ORT_PROVIDER_LIBS := \
 
 .DEFAULT_GOAL := help
 
-.PHONY: help app-version test test-release-tools check-linux-tools app app-smoke packaged-smoke app-dev linux dist verify-dist update-bundle verify-update-bundle update-bundle-smoke check-pc-tools pc pc-dist verify-pc-dist clean
+.PHONY: help app-version test test-release-tools check-linux-tools app app-smoke packaged-smoke app-dev linux dist verify-dist update-bundle verify-update-bundle update-bundle-smoke check-pc-tools pc pc-dist verify-pc-dist pc-installer verify-pc-installer clean
 
 help:
 	@printf '%s\n' 'Targets:'
@@ -102,6 +96,7 @@ help:
 	@printf '%s\n' '  make update-bundle Build the generated-version Linux AppImage update bundle'
 	@printf '%s\n' '  make pc       Cross-build the optional Windows app from Linux'
 	@printf '%s\n' '  make pc-dist  Stage optional Windows files under dist/VoxGolem-windows'
+	@printf '%s\n' '  make pc-installer Build the lightweight Windows NSIS installer from Linux'
 	@printf '%s\n' '  make clean    Remove generated build and staging output'
 
 app-version:
@@ -285,15 +280,16 @@ packaged-smoke: verify-dist
 check-pc-tools:
 	@command -v cargo-xwin >/dev/null || { printf '%s\n' 'Missing cargo-xwin. Install with: cargo install cargo-xwin --locked' >&2; exit 1; }
 	@command -v cargo-tauri >/dev/null || { printf '%s\n' 'Missing Tauri CLI. Install with: cargo install tauri-cli --version 2.11.1 --locked' >&2; exit 1; }
+	@bash scripts/verify-nsis-version.sh
 	@command -v cmake >/dev/null || { printf '%s\n' 'Missing cmake. Install CMake before running make pc.' >&2; exit 1; }
 	@command -v ninja >/dev/null || { printf '%s\n' 'Missing ninja. cargo-xwin requires Ninja for CMake crates.' >&2; exit 1; }
-	@command -v clang-cl >/dev/null || { printf '%s\n' 'Missing clang-cl. Install LLVM/Clang 19 or newer before running make pc.' >&2; exit 1; }
-	@clang_version="$$(clang-cl --version | { read -r first_line; printf '%s\n' "$$first_line"; })"; \
+	@test -n '$(REAL_CLANG_CL)' || { printf '%s\n' 'Missing clang-cl or clang-19. Install LLVM/Clang 19 or newer before running make pc.' >&2; exit 1; }
+	@clang_version="$$('$(REAL_CLANG_CL)' --driver-mode=cl --version | { read -r first_line; printf '%s\n' "$$first_line"; })"; \
 		clang_major="$${clang_version#* version }"; \
 		clang_major="$${clang_major%%.*}"; \
 		case "$$clang_major" in ''|*[!0-9]*) clang_major=0 ;; esac; \
 		if [ "$$clang_major" -lt 19 ]; then \
-			printf 'clang-cl 19 or newer is required for the Windows STL used by cargo-xwin; found: %s\n' "$$clang_version" >&2; \
+			printf 'Clang 19 or newer is required for the Windows STL used by cargo-xwin; found: %s\n' "$$clang_version" >&2; \
 			exit 1; \
 		fi
 	@command -v llvm-rc >/dev/null || { printf '%s\n' 'Missing llvm-rc. Install LLVM tools before running make pc.' >&2; exit 1; }
@@ -304,9 +300,10 @@ check-pc-tools:
 
 pc: check-pc-tools $(ESPEAK_COMPAT_HEADER) $(STDCXX_IMPORT_LIB) $(DIRECTML_IMPORT_LIB) $(PATHCCH_IMPORT_LIB)
 	bun install --frozen-lockfile
+	PATH='$(WINDOWS_CROSS_BIN)':"$$PATH" \
+	VOXGOLEM_REAL_CLANG_CL='$(REAL_CLANG_CL)' \
+	VOXGOLEM_ESPEAK_COMPAT_HEADER='$(ESPEAK_COMPAT_HEADER)' \
 	CMAKE_GENERATOR=Ninja \
-	TARGET_CFLAGS="$${TARGET_CFLAGS:+$${TARGET_CFLAGS} }/FI$(ESPEAK_COMPAT_HEADER)" \
-	TARGET_CXXFLAGS="$${TARGET_CXXFLAGS:+$${TARGET_CXXFLAGS} }/FI$(ESPEAK_COMPAT_HEADER)" \
 	RUSTFLAGS="$${RUSTFLAGS:+$${RUSTFLAGS} }-L native=$(IMPORT_LIB_DIR)" \
 	cargo tauri build --runner cargo-xwin --target $(WINDOWS_TARGET) --no-bundle -- --locked
 	@printf 'Windows app: %s\n' '$(WINDOWS_RELEASE_DIR)/vox-golem.exe'
@@ -320,23 +317,37 @@ pc-dist: pc
 			cp '$(WINDOWS_RELEASE_DIR)'/$$file '$(WINDOWS_STAGED_RELEASE_DIR)'/$$file; \
 		fi; \
 	done
-	@$(MAKE) --no-print-directory $(CUDA_RUNTIME_DIR)/.complete
-	@for file in $(CUDA_RUNTIME_DLLS); do \
-		cp '$(CUDA_RUNTIME_DIR)'/$$file '$(WINDOWS_STAGED_RELEASE_DIR)'/$$file; \
+	@$(MAKE) --no-print-directory $(VC_RUNTIME_DIR)/.complete
+	@for file in $(VC_RUNTIME_DLLS); do \
+		cp '$(VC_RUNTIME_DIR)'/$$file '$(WINDOWS_STAGED_RELEASE_DIR)'/$$file; \
 	done
 	@$(MAKE) --no-print-directory verify-pc-dist
 	@printf 'Staged Windows release files: %s\n' '$(WINDOWS_STAGED_RELEASE_DIR)'
 
+pc-installer: pc-dist $(WINDOWS_NSIS_TEMPLATE)
+	@test -n '$(APP_VERSION)' || { printf '%s\n' 'Failed to generate application version.' >&2; exit 1; }
+	@case '$(APP_VERSION)' in *[!0-9A-Za-z.-]*|'') printf 'Invalid APP_VERSION: %s\n' '$(APP_VERSION)' >&2; exit 1;; esac
+	PATH='$(WINDOWS_CROSS_BIN)':"$$PATH" \
+	VOXGOLEM_REAL_CLANG_CL='$(REAL_CLANG_CL)' \
+	VOXGOLEM_ESPEAK_COMPAT_HEADER='$(ESPEAK_COMPAT_HEADER)' \
+	CMAKE_GENERATOR=Ninja \
+	RUSTFLAGS="$${RUSTFLAGS:+$${RUSTFLAGS} }-L native=$(IMPORT_LIB_DIR)" \
+	cargo tauri build --runner cargo-xwin --target $(WINDOWS_TARGET) --bundles nsis --config '{"version":"$(APP_VERSION)","bundle":{"createUpdaterArtifacts":false}}' -- --locked
+	@$(MAKE) --no-print-directory verify-pc-installer
+
+verify-pc-installer:
+	@test -f '$(WINDOWS_NSIS_INSTALLER)' || { printf 'Missing Windows NSIS installer: %s\n' '$(WINDOWS_NSIS_INSTALLER)' >&2; exit 1; }
+	@test "$$(find '$(WINDOWS_NSIS_DIR)' -maxdepth 1 -type f -name '*.exe' | wc -l)" -eq 1 || { printf '%s\n' 'Expected exactly one Windows NSIS installer.' >&2; exit 1; }
+	@bash scripts/verify-windows-installer.sh '$(WINDOWS_NSIS_INSTALLER)' '$(MAX_WINDOWS_INSTALLER_BYTES)'
+	@grep -Fq 'Call CreateOrUpdateStartMenuShortcut' '$(WINDOWS_RELEASE_DIR)/nsis/x64/installer.nsi'
+	@! grep -Fq 'Call CreateOrUpdateDesktopShortcut' '$(WINDOWS_RELEASE_DIR)/nsis/x64/installer.nsi'
+	@! grep -Fq 'MUI_FINISHPAGE_SHOWREADME' '$(WINDOWS_RELEASE_DIR)/nsis/x64/installer.nsi'
+	@grep -Fq 'StrCpy $$INSTDIR "$$LOCALAPPDATA\Programs\VoxGolem"' '$(WINDOWS_RELEASE_DIR)/nsis/x64/installer.nsi'
+	@! grep -Fq 'MUI_PAGE_DIRECTORY' '$(WINDOWS_RELEASE_DIR)/nsis/x64/installer.nsi'
+	@! grep -Fq 'Call RestorePreviousInstallLocation' '$(WINDOWS_RELEASE_DIR)/nsis/x64/installer.nsi'
+
 verify-pc-dist:
-	@missing=0; \
-	for file in $(REQUIRED_DIST_FILES); do \
-		if [ ! -f '$(WINDOWS_STAGED_RELEASE_DIR)'/$$file ]; then \
-			printf 'Missing staged release file: %s\n' "$$file" >&2; \
-			missing=1; \
-		fi; \
-	done; \
-	if [ "$$missing" -ne 0 ]; then exit 1; fi
-	@find '$(WINDOWS_STAGED_RELEASE_DIR)' -maxdepth 1 -type f -printf '%f\t%s bytes\n' | sort
+	@bash scripts/verify-windows-package.sh '$(WINDOWS_STAGED_RELEASE_DIR)'
 
 clean:
 	rm -rf '$(CURDIR)/dist' '$(CURDIR)/package' '$(CURDIR)/target' '$(CURDIR)/frontend/app/dist'
@@ -349,6 +360,16 @@ $(ESPEAK_COMPAT_HEADER):
 		'#ifdef _WIN32' \
 		'#pragma comment(lib, "advapi32")' \
 		'#endif' > '$@'
+
+$(TAURI_NSIS_TEMPLATE_SOURCE):
+	@command -v curl >/dev/null || { printf '%s\n' 'Missing curl. Install curl before preparing the NSIS template.' >&2; exit 1; }
+	@mkdir -p '$(@D)'
+	@curl --retry 5 --retry-delay 2 --retry-all-errors -fsSL '$(TAURI_NSIS_TEMPLATE_URL)' -o '$@'
+	@printf '%s  %s\n' '$(TAURI_NSIS_TEMPLATE_SHA256)' '$@' | sha256sum -c -
+
+$(WINDOWS_NSIS_TEMPLATE): $(TAURI_NSIS_TEMPLATE_SOURCE) scripts/customize-windows-nsis-template.py
+	@printf '%s  %s\n' '$(TAURI_NSIS_TEMPLATE_SHA256)' '$(TAURI_NSIS_TEMPLATE_SOURCE)' | sha256sum -c -
+	@python3 scripts/customize-windows-nsis-template.py '$(TAURI_NSIS_TEMPLATE_SOURCE)' '$@'
 
 $(STDCXX_IMPORT_LIB):
 	@mkdir -p '$(IMPORT_LIB_DIR)'
@@ -392,48 +413,24 @@ $(PATHCCH_IMPORT_LIB):
 		'PathIsUNCEx' > '$(IMPORT_LIB_DIR)/PathCch.def'
 	llvm-dlltool -m i386:x86-64 -d '$(IMPORT_LIB_DIR)/PathCch.def' -l '$@'
 
-$(CUDA_RUNTIME_DIR)/.complete:
-	@command -v curl >/dev/null || { printf '%s\n' 'Missing curl. Install curl before staging runtime DLLs.' >&2; exit 1; }
-	@command -v unzip >/dev/null || { printf '%s\n' 'Missing unzip. Install unzip before staging runtime DLLs.' >&2; exit 1; }
-	@mkdir -p '$(CUDA_RUNTIME_DIR)' '$(CURDIR)/.deps/downloads' '$(CURDIR)/.deps/extract'
-	@complete=1; \
-	for file in $(CUDA_RUNTIME_DLLS); do \
-		if [ ! -f '$(CUDA_RUNTIME_DIR)'/$$file ]; then complete=0; fi; \
-	done; \
-	if [ "$$complete" -eq 1 ]; then touch '$@'; exit 0; fi; \
-	rm -rf '$(CURDIR)/.deps/extract'/* '$(CUDA_RUNTIME_DIR)'/*; \
-	download_and_extract() { \
-		local url="$$1"; \
-		local sha256="$$2"; \
-		shift 2; \
-		local archive='$(CURDIR)/.deps/downloads/'"$${url##*/}"; \
-		local extract_dir='$(CURDIR)/.deps/extract/'"$${url##*/}"; \
-		curl --retry 5 --retry-delay 2 --retry-all-errors -fsSL "$$url" -o "$$archive"; \
-		printf '%s  %s\n' "$$sha256" "$$archive" | sha256sum -c -; \
-		rm -rf "$$extract_dir"; \
-		mkdir -p "$$extract_dir"; \
-		unzip -q "$$archive" -d "$$extract_dir"; \
-		for pattern in "$$@"; do \
-			mapfile -t matches < <(find "$$extract_dir" -type f -name "$$pattern" | sort); \
-			if [ "$${#matches[@]}" -eq 0 ]; then \
-				printf 'No DLLs matched %s in %s\n' "$$pattern" "$$archive" >&2; \
-				exit 1; \
-			fi; \
-			for match in "$${matches[@]}"; do \
-				cp "$$match" '$(CUDA_RUNTIME_DIR)'/; \
-			done; \
-		done; \
-	}; \
-	download_and_extract 'https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.9.79-archive.zip' '179e9c43b0735ffe67207b3da556eb5a0c50f3047961882b7657d3b822d34ef8' 'cudart64_12.dll'; \
-	download_and_extract 'https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-12.9.1.4-archive.zip' 'd534d98b0b453a98914dbf3adf47d7e84b55037abf02f87466439e1dcef581ed' 'cublas64_12.dll' 'cublasLt64_12.dll'; \
-	download_and_extract 'https://developer.download.nvidia.com/compute/cuda/redist/libcufft/windows-x86_64/libcufft-windows-x86_64-11.4.1.4-archive.zip' 'f26f80bb9abff3269c548e1559e8c2b4ba58ccb8acc6095bbc6404fc962d4b80' 'cufft64_11.dll'; \
-	download_and_extract 'https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.10.0.56_cuda12-archive.zip' '214f21e4a6fdc7121b2463f55937ebf097ab7c96232c3d575b39b9b030503fca' 'cudnn*.dll'; \
-	missing=0; \
-	for file in $(CUDA_RUNTIME_DLLS); do \
-		if [ ! -f '$(CUDA_RUNTIME_DIR)'/$$file ]; then \
-			printf 'Missing CUDA runtime DLL after extraction: %s\n' "$$file" >&2; \
-			missing=1; \
-		fi; \
-	done; \
-	if [ "$$missing" -ne 0 ]; then exit 1; fi; \
-	touch '$@'
+$(VC_RUNTIME_DIR)/.complete:
+	@command -v curl >/dev/null || { printf '%s\n' 'Missing curl. Install curl before staging the VC runtime.' >&2; exit 1; }
+	@command -v cabextract >/dev/null || { printf '%s\n' 'Missing cabextract. Install cabextract before staging the VC runtime.' >&2; exit 1; }
+	@mkdir -p '$(CURDIR)/.deps/downloads' '$(VC_RUNTIME_ROOT)'
+	@if [ ! -f '$(VC_REDIST_ARCHIVE)' ]; then \
+		curl --retry 5 --retry-delay 2 --retry-all-errors -fsSL '$(VC_REDIST_URL)' -o '$(VC_REDIST_ARCHIVE)'; \
+	fi
+	@printf '%s  %s\n' '$(VC_REDIST_SHA256)' '$(VC_REDIST_ARCHIVE)' | sha256sum -c -
+	@rm -rf '$(VC_RUNTIME_ROOT)/cabs' '$(VC_RUNTIME_ROOT)/extract' '$(VC_RUNTIME_DIR)'
+	@mkdir -p '$(VC_RUNTIME_ROOT)/cabs' '$(VC_RUNTIME_ROOT)/extract' '$(VC_RUNTIME_DIR)'
+	@cabextract -q -d '$(VC_RUNTIME_ROOT)/cabs' -F a4 '$(VC_REDIST_ARCHIVE)'
+	@cabextract -q -d '$(VC_RUNTIME_ROOT)/extract' '$(VC_RUNTIME_ROOT)/cabs/a4'
+	@install -m 0644 '$(VC_RUNTIME_ROOT)/extract/msvcp140.dll_amd64' '$(VC_RUNTIME_DIR)/MSVCP140.dll'
+	@install -m 0644 '$(VC_RUNTIME_ROOT)/extract/msvcp140_1.dll_amd64' '$(VC_RUNTIME_DIR)/MSVCP140_1.dll'
+	@install -m 0644 '$(VC_RUNTIME_ROOT)/extract/vcruntime140.dll_amd64' '$(VC_RUNTIME_DIR)/VCRUNTIME140.dll'
+	@install -m 0644 '$(VC_RUNTIME_ROOT)/extract/vcruntime140_1.dll_amd64' '$(VC_RUNTIME_DIR)/VCRUNTIME140_1.dll'
+	@printf '%s  %s\n' '7c26614e1d733892c2deac7e245ce115504b1d80592dd0a01b08e3e5a55f89ca' '$(VC_RUNTIME_DIR)/MSVCP140.dll' | sha256sum -c -
+	@printf '%s  %s\n' '206c931bf90fdad8816de3b5e2ef80b2bcaa9406c89ecc05fe6fddffe251e982' '$(VC_RUNTIME_DIR)/MSVCP140_1.dll' | sha256sum -c -
+	@printf '%s  %s\n' 'd1f4225df2cd877dbf130d5668a021dce3f94118455ff5ec952061c30afc9ce7' '$(VC_RUNTIME_DIR)/VCRUNTIME140.dll' | sha256sum -c -
+	@printf '%s  %s\n' 'a7146c08f89fe5b04541ab507cdb59ff7b44534d4ba3c668a426c6450a03434e' '$(VC_RUNTIME_DIR)/VCRUNTIME140_1.dll' | sha256sum -c -
+	@touch '$@'

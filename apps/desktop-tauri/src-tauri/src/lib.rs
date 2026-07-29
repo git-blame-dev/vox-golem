@@ -4,7 +4,7 @@
 use base64::Engine;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -13,25 +13,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
 
-#[cfg(windows)]
-use std::os::windows::ffi::OsStrExt;
 #[cfg(target_os = "linux")]
 use webkit2gtk::glib::prelude::Cast;
 #[cfg(target_os = "linux")]
 use webkit2gtk::UserMediaPermissionRequest;
 #[cfg(target_os = "linux")]
 use webkit2gtk::{PermissionRequestExt, UserMediaPermissionRequestExt, WebViewExt};
-
-#[cfg(windows)]
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
-}
-
-#[cfg(windows)]
-const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
-#[cfg(windows)]
-const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
 
 mod app_updates;
 mod livekit_wakeword;
@@ -111,12 +98,15 @@ struct AppState {
     completion_runtime: Mutex<Option<voxgolem_platform::completion::CompletionRuntime>>,
     completion_request: Arc<Mutex<Option<voxgolem_platform::completion::CompletionRequestHandle>>>,
     completion_context: Arc<Mutex<Option<CompletionRequestContext>>>,
+    completion_update_guard: Mutex<Option<tokio::sync::OwnedRwLockReadGuard<()>>>,
     completion_generation: AtomicU64,
     completion_lifecycle_lock: Mutex<()>,
     telemetry_sink: Option<Arc<Mutex<telemetry::TelemetrySink>>>,
     assistant_coordinator: Arc<Mutex<voxgolem_core::assistant::AssistantCoordinator>>,
     assistant_settings_generation: Arc<AtomicU64>,
+    update_installation_gate: Arc<tokio::sync::RwLock<()>>,
     tts_operation_lock: tokio::sync::Mutex<()>,
+    tts_playback: Mutex<TtsPlaybackState>,
     tts_startup_generation: Arc<AtomicU64>,
     local_tts_runtime: Mutex<Option<Arc<tts::LocalTtsRuntime>>>,
     llama_cpp_runtime: Arc<Mutex<Option<voxgolem_platform::llama_cpp::LlamaCppRuntime>>>,
@@ -130,6 +120,12 @@ struct AppState {
     prefetch_task: Mutex<Option<ActivePrefetch>>,
     llama_startups: LlamaStartupRegistry,
     exit_cleanup_started: AtomicBool,
+}
+
+#[derive(Default)]
+struct TtsPlaybackState {
+    latest_id: u64,
+    current_id: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -742,6 +738,7 @@ async fn set_tts_enabled(
     enabled: bool,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<SetTtsEnabledPayload, String> {
+    let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
     let config = app_state
         .runtime_config
         .as_ref()
@@ -821,8 +818,10 @@ async fn set_tts_enabled(
 #[tauri::command]
 async fn synthesize_local_tts(
     text: String,
+    playback_id: u64,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<SynthesizeLocalTtsPayload, String> {
+    let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
     let runtime_file_logging_enabled = app_state
         .runtime_config
         .as_ref()
@@ -841,16 +840,31 @@ async fn synthesize_local_tts(
             String::from("local tts runtime is not available")
         })?)
     };
+    register_tts_playback(&app_state.tts_playback, playback_id)?;
     let generation = runtime.start_generation();
-    let audio = tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         runtime.synthesize_for_generation(&text, generation)
     })
-    .await
-    .map_err(|error| format!("local tts synthesis task failed: {error}"))?
-    .map_err(|error| {
+    .await;
+    let audio = match result {
+        Ok(Ok(audio)) => audio,
+        Ok(Err(error)) => {
+            finish_tts_playback_state(&app_state.tts_playback, playback_id)?;
+            log_tts_runtime_event(
+                runtime_file_logging_enabled,
+                &format!("synthesis failed: {error}"),
+            );
+            return Err(error);
+        }
+        Err(error) => {
+            finish_tts_playback_state(&app_state.tts_playback, playback_id)?;
+            return Err(format!("local tts synthesis task failed: {error}"));
+        }
+    };
+    ensure_tts_playback_current(&app_state.tts_playback, playback_id).map_err(|error| {
         log_tts_runtime_event(
             runtime_file_logging_enabled,
-            &format!("synthesis failed: {error}"),
+            &format!("synthesis superseded: {error}"),
         );
         error
     })?;
@@ -860,6 +874,60 @@ async fn synthesize_local_tts(
         sample_rate_hz: audio.sample_rate_hz,
         duration_ms: audio.duration_ms,
     })
+}
+
+#[tauri::command]
+fn finish_tts_playback(
+    playback_id: u64,
+    app_state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    finish_tts_playback_state(&app_state.tts_playback, playback_id)
+}
+
+fn register_tts_playback(state: &Mutex<TtsPlaybackState>, playback_id: u64) -> Result<(), String> {
+    if playback_id == 0 || playback_id > 9_007_199_254_740_991 {
+        return Err(String::from("TTS playback id is invalid"));
+    }
+    let mut state = state
+        .lock()
+        .map_err(|_| String::from("TTS playback state lock is poisoned"))?;
+    if playback_id < state.latest_id {
+        return Err(String::from("TTS playback was superseded"));
+    }
+    state.latest_id = playback_id;
+    state.current_id = Some(playback_id);
+    Ok(())
+}
+
+fn ensure_tts_playback_current(
+    state: &Mutex<TtsPlaybackState>,
+    playback_id: u64,
+) -> Result<(), String> {
+    let state = state
+        .lock()
+        .map_err(|_| String::from("TTS playback state lock is poisoned"))?;
+    if state.latest_id == playback_id && state.current_id == Some(playback_id) {
+        Ok(())
+    } else {
+        Err(String::from("TTS playback was superseded"))
+    }
+}
+
+fn finish_tts_playback_state(
+    state: &Mutex<TtsPlaybackState>,
+    playback_id: u64,
+) -> Result<(), String> {
+    if playback_id == 0 || playback_id > 9_007_199_254_740_991 {
+        return Err(String::from("TTS playback id is invalid"));
+    }
+    let mut state = state
+        .lock()
+        .map_err(|_| String::from("TTS playback state lock is poisoned"))?;
+    state.latest_id = state.latest_id.max(playback_id.saturating_add(1));
+    if state.current_id == Some(playback_id) {
+        state.current_id = None;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -918,6 +986,7 @@ fn set_assistant_settings(
     settings: AssistantSettingsPayload,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<AssistantSettingsPayload, String> {
+    let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
     let mut coordinator = app_state
         .assistant_coordinator
         .lock()
@@ -994,6 +1063,7 @@ fn switch_response_profile(
     profile: ResponseProfilePayload,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<SwitchResponseProfilePayload, String> {
+    let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
     let supported_response_profiles = app_state.supported_response_profiles.clone();
     if !supported_response_profiles.contains(&profile) {
         return Err(format!(
@@ -1884,6 +1954,7 @@ async fn submit_prompt(
     app: tauri::AppHandle,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<PromptFinalPayload, String> {
+    let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
     ensure_startup_ready_for_prompt(&app_state.startup_state)?;
     validate_prompt_request_id(&request_id)?;
     let prompt = validate_prompt_text(prompt)?;
@@ -4373,6 +4444,7 @@ fn record_speech_activity(
     now_ms: u64,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<RuntimePhaseResponsePayload, String> {
+    let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
     let _operation_guard =
         lock_response_backend_operation(&app_state.response_backend_operation_lock)?;
     ensure_startup_ready_for_prompt(&app_state.startup_state)?;
@@ -4392,6 +4464,7 @@ fn mark_silence(
     telemetry_frame_id: Option<String>,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<RuntimePhaseResponsePayload, String> {
+    let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
     let _operation_guard =
         lock_response_backend_operation(&app_state.response_backend_operation_lock)?;
     ensure_startup_ready_for_prompt(&app_state.startup_state)?;
@@ -4466,6 +4539,7 @@ fn mark_silence(
 async fn reset_session(
     app_state: tauri::State<'_, AppState>,
 ) -> Result<RuntimePhaseResponsePayload, String> {
+    let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
     cancel_active_tts_generation(&app_state);
     ensure_startup_ready_for_prompt(&app_state.startup_state)?;
     let active = app_state
@@ -4612,6 +4686,7 @@ fn ingest_audio_frame(
     app: tauri::AppHandle,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<RuntimePhaseResponsePayload, String> {
+    let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
     ensure_startup_ready_for_prompt(&app_state.startup_state)?;
     let backend_ingest_started_ms = current_time_ms()?;
     let mut guard = app_state
@@ -4877,6 +4952,11 @@ fn clear_completion_request_state_locked(
         .lock()
         .map_err(|_| String::from("completion context lock is poisoned"))?
         .take();
+    app_state
+        .completion_update_guard
+        .lock()
+        .map_err(|_| String::from("completion update guard lock is poisoned"))?
+        .take();
     Ok(())
 }
 
@@ -4903,12 +4983,7 @@ fn queue_completion_request(
         .clone()
         .ok_or_else(|| String::from("completion runtime is not available"))?;
     if prompt.trim().is_empty() || prompt.len() > COMPLETION_PROMPT_MAX_BYTES {
-        request.clear();
-        app_state
-            .completion_context
-            .lock()
-            .map_err(|_| String::from("completion context lock is poisoned"))?
-            .take();
+        clear_completion_request_state_locked(app_state, false)?;
         return Ok(());
     }
     let backend_revision = app_state
@@ -4916,6 +4991,12 @@ fn queue_completion_request(
         .fetch_add(1, Ordering::SeqCst)
         .saturating_add(1);
     let started_ms = current_time_ms()?;
+    let update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
+    *app_state
+        .completion_update_guard
+        .lock()
+        .map_err(|_| String::from("completion update guard lock is poisoned"))? =
+        Some(update_guard);
     *app_state
         .completion_context
         .lock()
@@ -5024,6 +5105,9 @@ async fn emit_completion_predictions(
                 suffix: prediction.suffix,
             },
         );
+        if let Ok(mut guard) = app_state.completion_update_guard.lock() {
+            guard.take();
+        };
     }
 
     let app_state = app.state::<AppState>();
@@ -5038,6 +5122,9 @@ async fn emit_completion_predictions(
         }
         if let Ok(mut context) = app_state.completion_context.lock() {
             context.take();
+        }
+        if let Ok(mut guard) = app_state.completion_update_guard.lock() {
+            guard.take();
         }
         if !app_state.exit_cleanup_started.load(Ordering::SeqCst) {
             fail_startup_capability(
@@ -5124,6 +5211,7 @@ fn queue_assistant_prefetch(
     source: CompletionSource,
 ) -> Result<(), String> {
     let app_state = app.state::<AppState>();
+    let update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
     invalidate_prefetch(&app_state)?;
     let key = {
         let coordinator = app_state
@@ -5174,6 +5262,7 @@ fn queue_assistant_prefetch(
     let task_cancelled = Arc::clone(&cancelled);
     let task_cancellation_signal = Arc::clone(&cancellation_signal);
     let task = tauri::async_runtime::spawn(async move {
+        let _update_guard = update_guard;
         let started = Instant::now();
         let result = run_assistant_prefetch(
             &app,
@@ -6029,45 +6118,19 @@ fn persist_state(state: PersistedState) -> Result<(), String> {
 }
 
 fn atomic_replace_state_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    let temporary_path = path.with_extension(format!("tmp-{}", std::process::id()));
-    let result = File::create(&temporary_path)
-        .and_then(|mut file| {
-            file.write_all(contents)?;
-            file.sync_all()
-        })
-        .and_then(|_| {
-            #[cfg(not(windows))]
-            {
-                fs::rename(&temporary_path, path)
-            }
-            #[cfg(windows)]
-            {
-                let source = std::ffi::OsStr::new(&temporary_path)
-                    .encode_wide()
-                    .chain(std::iter::once(0))
-                    .collect::<Vec<_>>();
-                let destination = std::ffi::OsStr::new(path)
-                    .encode_wide()
-                    .chain(std::iter::once(0))
-                    .collect::<Vec<_>>();
-                let result = unsafe {
-                    MoveFileExW(
-                        source.as_ptr(),
-                        destination.as_ptr(),
-                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-                    )
-                };
-                if result == 0 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(())
-                }
-            }
-        });
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary_path);
-    }
-    result
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "state path has no parent directory",
+        )
+    })?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(contents)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| error.error)
 }
 
 fn load_selected_response_profile() -> Result<Option<ResponseProfilePayload>, String> {
@@ -7015,6 +7078,7 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
                 completion_runtime: Mutex::new(None),
                 completion_request: Arc::new(Mutex::new(None)),
                 completion_context: Arc::new(Mutex::new(None)),
+                completion_update_guard: Mutex::new(None),
                 completion_generation: AtomicU64::new(0),
                 completion_lifecycle_lock: Mutex::new(()),
                 telemetry_sink,
@@ -7022,7 +7086,9 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
                     voxgolem_core::assistant::AssistantCoordinator::new(assistant_settings.into()),
                 )),
                 assistant_settings_generation: Arc::new(AtomicU64::new(0)),
+                update_installation_gate: Arc::new(tokio::sync::RwLock::new(())),
                 tts_operation_lock: tokio::sync::Mutex::new(()),
+                tts_playback: Mutex::new(TtsPlaybackState::default()),
                 tts_startup_generation: Arc::new(AtomicU64::new(0)),
                 local_tts_runtime: Mutex::new(local_tts_runtime.map(Arc::new)),
                 llama_cpp_runtime,
@@ -7141,6 +7207,7 @@ fn build_startup_error_app_state(
         completion_runtime: Mutex::new(None),
         completion_request: Arc::new(Mutex::new(None)),
         completion_context: Arc::new(Mutex::new(None)),
+        completion_update_guard: Mutex::new(None),
         completion_generation: AtomicU64::new(0),
         completion_lifecycle_lock: Mutex::new(()),
         telemetry_sink: default_telemetry_sink(),
@@ -7150,7 +7217,9 @@ fn build_startup_error_app_state(
             ),
         )),
         assistant_settings_generation: Arc::new(AtomicU64::new(0)),
+        update_installation_gate: Arc::new(tokio::sync::RwLock::new(())),
         tts_operation_lock: tokio::sync::Mutex::new(()),
+        tts_playback: Mutex::new(TtsPlaybackState::default()),
         tts_startup_generation: Arc::new(AtomicU64::new(0)),
         local_tts_runtime: Mutex::new(None),
         llama_cpp_runtime: Arc::new(Mutex::new(None)),
@@ -7208,6 +7277,7 @@ fn build_nonfatal_config_error_app_state(
         completion_runtime: Mutex::new(None),
         completion_request: Arc::new(Mutex::new(None)),
         completion_context: Arc::new(Mutex::new(None)),
+        completion_update_guard: Mutex::new(None),
         completion_generation: AtomicU64::new(0),
         completion_lifecycle_lock: Mutex::new(()),
         telemetry_sink: default_telemetry_sink(),
@@ -7217,7 +7287,9 @@ fn build_nonfatal_config_error_app_state(
             ),
         )),
         assistant_settings_generation: Arc::new(AtomicU64::new(0)),
+        update_installation_gate: Arc::new(tokio::sync::RwLock::new(())),
         tts_operation_lock: tokio::sync::Mutex::new(()),
+        tts_playback: Mutex::new(TtsPlaybackState::default()),
         tts_startup_generation: Arc::new(AtomicU64::new(0)),
         local_tts_runtime: Mutex::new(None),
         llama_cpp_runtime: Arc::new(Mutex::new(None)),
@@ -7270,6 +7342,75 @@ fn ensure_response_profile_switch_runtime_is_idle(
     }
 
     Ok(())
+}
+
+fn update_installation_busy_reason(
+    startup_ready: bool,
+    runtime_phase: RuntimePhasePayload,
+    active_prompt: bool,
+    response_operation_busy: bool,
+    tts_operation_busy: bool,
+) -> Option<&'static str> {
+    if !startup_ready
+        || runtime_phase != RuntimePhasePayload::Sleeping
+        || active_prompt
+        || response_operation_busy
+        || tts_operation_busy
+    {
+        Some("Update installation requires VoxGolem to be idle.")
+    } else {
+        None
+    }
+}
+
+fn begin_update_sensitive_operation(
+    gate: &Arc<tokio::sync::RwLock<()>>,
+) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, String> {
+    Arc::clone(gate)
+        .try_read_owned()
+        .map_err(|_| String::from("an update installation is starting"))
+}
+
+pub(crate) fn begin_update_installation(
+    app_state: &AppState,
+) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>, String> {
+    Arc::clone(&app_state.update_installation_gate)
+        .try_write_owned()
+        .map_err(|_| String::from("Update installation requires VoxGolem to be idle."))
+}
+
+pub(crate) fn ensure_update_installation_is_idle(app_state: &AppState) -> Result<(), String> {
+    let startup_ready = app_state
+        .startup_state
+        .lock()
+        .map_err(|_| String::from("startup state lock is poisoned"))
+        .map(|state| matches!(*state, StartupStatePayload::Ready { .. }))?;
+    let runtime_phase = current_runtime_phase(&app_state.voice_pipeline_state)?;
+    let active_prompt = app_state
+        .active_prompt
+        .lock()
+        .map_err(|_| String::from("active prompt lock is poisoned"))?
+        .is_some();
+    let response_operation_busy = app_state
+        .response_backend_operation_lock
+        .try_lock()
+        .is_err();
+    let tts_playback_busy = app_state
+        .tts_playback
+        .lock()
+        .map_err(|_| String::from("TTS playback state lock is poisoned"))?
+        .current_id
+        .is_some();
+    let tts_operation_busy = app_state.tts_operation_lock.try_lock().is_err() || tts_playback_busy;
+
+    update_installation_busy_reason(
+        startup_ready,
+        runtime_phase,
+        active_prompt,
+        response_operation_busy,
+        tts_operation_busy,
+    )
+    .map_or(Ok(()), |reason| Err(String::from(reason)))
 }
 
 fn ensure_startup_ready_for_prompt(
@@ -7944,10 +8085,28 @@ fn store_llama_runtime_if_current(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(target_os = "windows")]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _, _| {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.unminimize();
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }));
+
+    let builder = builder
         .manage(app_updates::PendingUpdate::default())
         .setup(|app| {
             let app_state = build_app_state(app.handle());
+            #[cfg(target_os = "windows")]
+            app_updates::cleanup_stale_windows_installers(
+                app.handle(),
+                app_state
+                    .runtime_config
+                    .as_ref()
+                    .is_some_and(|config| config.logging.enabled),
+            );
             let completion_config = app_state
                 .runtime_config
                 .as_ref()
@@ -7991,7 +8150,12 @@ pub fn run() {
                     let startup_generation_state =
                         Arc::clone(&app.state::<AppState>().tts_startup_generation);
                     let app_handle = app.handle().clone();
+                    let startup_update_guard = begin_update_sensitive_operation(
+                        &app.state::<AppState>().update_installation_gate,
+                    )
+                    .map_err(std::io::Error::other)?;
                     tauri::async_runtime::spawn_blocking(move || {
+                        let _startup_update_guard = startup_update_guard;
                         let state = app_handle.state::<AppState>();
                         let _operation_guard =
                             tauri::async_runtime::block_on(state.tts_operation_lock.lock());
@@ -8059,6 +8223,10 @@ pub fn run() {
             configure_linux_microphone_permission(app)?;
             if let Some(config) = completion_config {
                 let app_handle = app.handle().clone();
+                let startup_update_guard = begin_update_sensitive_operation(
+                    &app.state::<AppState>().update_installation_gate,
+                )
+                .map_err(std::io::Error::other)?;
                 tauri::async_runtime::spawn(async move {
                     match voxgolem_platform::completion::CompletionRuntime::start_with_policy(
                         &config.server_path,
@@ -8092,6 +8260,7 @@ pub fn run() {
                                 "qwen_prediction",
                                 actual_provider,
                             );
+                            drop(startup_update_guard);
                             emit_completion_predictions(app_handle, predictor, context).await;
                         }
                         Err(error) => fail_startup_capability(
@@ -8112,6 +8281,7 @@ pub fn run() {
             get_startup_state,
             set_tts_enabled,
             synthesize_local_tts,
+            finish_tts_playback,
             get_ui_text_size,
             set_ui_text_size,
             get_ui_theme,
@@ -8290,27 +8460,29 @@ mod tests {
 
     use super::{
         agent_history, allows_user_media_from_uri, apply_optional_speech_activity,
-        assistant_completion_enabled, atomic_replace_state_file, bounded_provider_history,
-        build_mark_silence_response, build_startup_error_app_state,
+        assistant_completion_enabled, atomic_replace_state_file, begin_update_installation,
+        begin_update_sensitive_operation, bounded_provider_history, build_mark_silence_response,
+        build_nonfatal_config_error_app_state, build_startup_error_app_state,
         claim_cancelled_prompt_publication, cleanup_sequential,
         clear_completion_request_state_locked, current_runtime_phase_response,
         current_silence_deadline, default_response_profile, default_voice_pipeline_config,
-        ensure_assistant_settings_available, fit_review_history_to_prompt_budget,
+        ensure_assistant_settings_available, ensure_update_installation_is_idle,
+        finish_tts_playback_state, fit_review_history_to_prompt_budget,
         ingest_audio_frame_with_optional_wake_word_detection, initial_stage_sequence,
         load_llama_cpp_system_prompt, load_persisted_state, load_persisted_tts_enabled,
         load_persisted_ui_text_size, load_persisted_ui_theme, model_path_for_profile,
         parse_deep_agent_json, parse_persisted_state, parse_review_agent_json,
         persist_assistant_settings, persist_selected_response_profile, persist_tts_enabled,
         persist_ui_text_size, persist_ui_theme, process_wake_word_frame, race_durable_cancellation,
-        register_active_prompt, reset_voice_pipeline_to_waiting, reset_wake_word_runtime,
-        resolve_effective_tts_enabled, response_profile_state_path, runtime_log_path,
-        runtime_phase_response_from_state, shutdown_llama_cpp_runtime_for_exit,
+        register_active_prompt, register_tts_playback, reset_voice_pipeline_to_waiting,
+        reset_wake_word_runtime, resolve_effective_tts_enabled, response_profile_state_path,
+        runtime_log_path, runtime_phase_response_from_state, shutdown_llama_cpp_runtime_for_exit,
         supported_response_profiles, synchronize_local_instant_model_with,
         take_and_invalidate_prefetch, to_runtime_phase_payload, transcribe_finished_utterance,
-        transcription_ready_samples, update_restored_profile_capabilities,
-        validate_prompt_request_id, validate_prompt_text, wake_word_event_timestamp,
-        ActivePromptGuard, AgentChoicePayload, AssistantSettingsPayload, CapabilityPayload,
-        CapabilityStatePayload, CueAssetPathsPayload, DeepStageResult, DeepTask,
+        transcription_ready_samples, update_installation_busy_reason,
+        update_restored_profile_capabilities, validate_prompt_request_id, validate_prompt_text,
+        wake_word_event_timestamp, ActivePromptGuard, AgentChoicePayload, AssistantSettingsPayload,
+        CapabilityPayload, CapabilityStatePayload, CueAssetPathsPayload, DeepStageResult, DeepTask,
         InstantChoicePayload, PrefetchEntry, PrefetchKey, PromptEventEnvelope,
         PromptExecutionEventPayload, ResponseProfilePayload, RuntimePhasePayload,
         RuntimePhaseResponsePayload, RuntimeTelemetryPayload, StagePayload, StageStatusPayload,
@@ -8340,6 +8512,155 @@ mod tests {
             true,
             true
         ));
+    }
+
+    #[test]
+    fn update_installation_requires_every_backend_activity_to_be_idle() {
+        assert_eq!(
+            update_installation_busy_reason(
+                true,
+                RuntimePhasePayload::Sleeping,
+                false,
+                false,
+                false,
+            ),
+            None
+        );
+        for state in [
+            (false, RuntimePhasePayload::Sleeping, false, false, false),
+            (true, RuntimePhasePayload::Listening, false, false, false),
+            (true, RuntimePhasePayload::Sleeping, true, false, false),
+            (true, RuntimePhasePayload::Sleeping, false, true, false),
+            (true, RuntimePhasePayload::Sleeping, false, false, true),
+        ] {
+            assert_eq!(
+                update_installation_busy_reason(state.0, state.1, state.2, state.3, state.4),
+                Some("Update installation requires VoxGolem to be idle.")
+            );
+        }
+    }
+
+    #[test]
+    fn update_installation_gate_excludes_new_and_active_operations() {
+        let gate = std::sync::Arc::new(tokio::sync::RwLock::new(()));
+        let operation = begin_update_sensitive_operation(&gate).expect("begin operation");
+        assert!(std::sync::Arc::clone(&gate).try_write_owned().is_err());
+        drop(operation);
+
+        let installation = std::sync::Arc::clone(&gate)
+            .try_write_owned()
+            .expect("begin installation");
+        assert!(begin_update_sensitive_operation(&gate).is_err());
+        drop(installation);
+
+        let app_state = build_startup_error_app_state(
+            default_voice_pipeline_config(),
+            String::from("test startup"),
+        );
+        let operation = begin_update_sensitive_operation(&app_state.update_installation_gate)
+            .expect("begin app operation");
+        assert!(begin_update_installation(&app_state).is_err());
+        drop(operation);
+        assert!(begin_update_installation(&app_state).is_ok());
+    }
+
+    #[test]
+    fn completion_and_prefetch_guards_block_installation_for_their_full_lifetime() {
+        let app_state = build_startup_error_app_state(
+            default_voice_pipeline_config(),
+            String::from("test startup"),
+        );
+        let completion = begin_update_sensitive_operation(&app_state.update_installation_gate)
+            .expect("begin completion");
+        *app_state.completion_update_guard.lock().unwrap() = Some(completion);
+        assert!(begin_update_installation(&app_state).is_err());
+        app_state.completion_update_guard.lock().unwrap().take();
+
+        for provider in ["local", "custom", "opencode"] {
+            let prefetch = begin_update_sensitive_operation(&app_state.update_installation_gate)
+                .unwrap_or_else(|_| panic!("begin {provider} prefetch"));
+            assert!(begin_update_installation(&app_state).is_err());
+            drop(prefetch);
+        }
+        assert!(begin_update_installation(&app_state).is_ok());
+    }
+
+    #[test]
+    fn optional_runtime_startup_guards_close_both_spawn_races() {
+        let app_state = build_startup_error_app_state(
+            default_voice_pipeline_config(),
+            String::from("test startup"),
+        );
+        for runtime in ["completion", "tts"] {
+            let startup = begin_update_sensitive_operation(&app_state.update_installation_gate)
+                .unwrap_or_else(|_| panic!("begin {runtime} startup"));
+            assert!(begin_update_installation(&app_state).is_err());
+            drop(startup);
+        }
+
+        let installation = begin_update_installation(&app_state).expect("begin installation");
+        for runtime in ["completion", "tts"] {
+            assert!(
+                begin_update_sensitive_operation(&app_state.update_installation_gate).is_err(),
+                "{runtime} startup must not begin during installation"
+            );
+        }
+        drop(installation);
+    }
+
+    #[test]
+    fn tts_synthesis_and_playback_remain_authoritatively_busy() {
+        let app_state = build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            CueAssetPathsPayload {
+                start_listening: String::from("start"),
+                stop_listening: String::from("stop"),
+            },
+            String::from("test startup"),
+        );
+        assert!(ensure_update_installation_is_idle(&app_state).is_ok());
+
+        let synthesis = begin_update_sensitive_operation(&app_state.update_installation_gate)
+            .expect("begin synthesis");
+        register_tts_playback(&app_state.tts_playback, 1).expect("register playback");
+        assert!(begin_update_installation(&app_state).is_err());
+        drop(synthesis);
+
+        let installation = begin_update_installation(&app_state).expect("begin installation");
+        assert!(ensure_update_installation_is_idle(&app_state).is_err());
+        finish_tts_playback_state(&app_state.tts_playback, 1).expect("finish playback");
+        assert!(ensure_update_installation_is_idle(&app_state).is_ok());
+        drop(installation);
+
+        register_tts_playback(&app_state.tts_playback, 2).expect("register old playback");
+        register_tts_playback(&app_state.tts_playback, 3).expect("register current playback");
+        finish_tts_playback_state(&app_state.tts_playback, 2).expect("finish stale playback");
+        assert!(ensure_update_installation_is_idle(&app_state).is_err());
+        finish_tts_playback_state(&app_state.tts_playback, 3).expect("finish current playback");
+        assert!(ensure_update_installation_is_idle(&app_state).is_ok());
+    }
+
+    #[test]
+    fn invalid_completion_input_releases_existing_update_guard() {
+        for prompt in [
+            String::from("   "),
+            "x".repeat(super::COMPLETION_PROMPT_MAX_BYTES + 1),
+        ] {
+            let app_state = build_startup_error_app_state(
+                default_voice_pipeline_config(),
+                String::from("test startup"),
+            );
+            let guard = begin_update_sensitive_operation(&app_state.update_installation_gate)
+                .expect("begin completion");
+            *app_state.completion_update_guard.lock().unwrap() = Some(guard);
+
+            if prompt.trim().is_empty() || prompt.len() > super::COMPLETION_PROMPT_MAX_BYTES {
+                clear_completion_request_state_locked(&app_state, false)
+                    .expect("invalid completion should clear state");
+            }
+
+            assert!(begin_update_installation(&app_state).is_ok());
+        }
     }
 
     #[test]
@@ -9666,14 +9987,20 @@ mod tests {
         assert_eq!(std::fs::read_to_string(path).unwrap(), "previous");
     }
 
-    #[cfg(windows)]
     #[test]
-    fn windows_atomic_state_replacement_replaces_existing_file() {
+    fn atomic_state_replacement_replaces_existing_file_repeatedly() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("state.toml");
         std::fs::write(&path, b"previous").expect("previous state");
         atomic_replace_state_file(&path, b"next").expect("replacement should succeed");
         assert_eq!(std::fs::read_to_string(path).unwrap(), "next");
+
+        atomic_replace_state_file(&directory.path().join("state.toml"), b"latest")
+            .expect("second replacement should succeed");
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("state.toml")).unwrap(),
+            "latest"
+        );
     }
 
     #[test]

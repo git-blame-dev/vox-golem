@@ -130,6 +130,7 @@ function App() {
   const [voiceCompletionSuffix, setVoiceCompletionSuffix] = useState('')
   const [autoStopOnSilence, setAutoStopOnSilence] = useState(true)
   const [ttsEnabled, setTtsEnabled] = useState(false)
+  const [ttsPlaying, setTtsPlaying] = useState(false)
   const [wakeConfidence, setWakeConfidence] = useState<number | null>(null)
   const [isSwitchingResponseProfile, setIsSwitchingResponseProfile] = useState(false)
   const [micStarting, setMicStarting] = useState(false)
@@ -207,6 +208,7 @@ function App() {
   const ttsGenerationRef = useRef(0)
   const ttsEnabledRef = useRef(false)
   const ttsSourceRef = useRef<AudioBufferSourceNode | null>(null)
+  const ttsPlaybackIdRef = useRef<number | null>(null)
   const uiTextSizeWriteRevisionRef = useRef(0)
   const uiThemeWriteRevisionRef = useRef(0)
   const ttsWriteRevisionRef = useRef(0)
@@ -219,12 +221,25 @@ function App() {
 
   const cancelTts = (): void => {
     ttsGenerationRef.current += 1
+    const playbackId = ttsPlaybackIdRef.current
     try {
       ttsSourceRef.current?.stop()
     } catch {
       // An already-ended source is stale by definition.
     }
     ttsSourceRef.current = null
+    if (playbackId === null) {
+      setTtsPlaying(false)
+      return
+    }
+    void invokeTauriCommand('finish_tts_playback', { playbackId })
+      .catch(() => undefined)
+      .finally(() => {
+        if (ttsPlaybackIdRef.current === playbackId) {
+          ttsPlaybackIdRef.current = null
+          setTtsPlaying(false)
+        }
+      })
   }
 
   const resetWakeConfidence = (): void => {
@@ -737,6 +752,15 @@ function App() {
       composerValue.trim().length > 0,
     [assistantSettingsPending, composerValue, promptState, resetPending, runtimeStatus, selectedInstantOption?.available, selectedInstantProfileReady, startupState.kind],
   )
+  const updateInstallationDisabled =
+    startupState.kind !== 'ready' ||
+    runtimeStatus !== 'sleeping' ||
+    promptState !== 'idle' ||
+    resetPending ||
+    isSwitchingResponseProfile ||
+    assistantSettingsPending ||
+    micStarting ||
+    ttsPlaying
 
   const canToggleMic = voiceInputReady(startupState) && !micStarting
   const voiceInputUnavailableReason = startupState.kind === 'ready'
@@ -1396,8 +1420,13 @@ function App() {
     try {
       const speechText = firstNonEmptyCompletedLine(text) ?? ''
       if (!isValidTtsFirstLine(speechText)) return
-      const payload = await invokeTauriCommand('synthesize_local_tts', { text: speechText })
-       if (generation !== ttsGenerationRef.current || !ttsEnabledRef.current) return
+      ttsPlaybackIdRef.current = generation
+      setTtsPlaying(true)
+      const payload = await invokeTauriCommand('synthesize_local_tts', {
+        text: speechText,
+        playbackId: generation,
+      })
+      if (generation !== ttsGenerationRef.current || !ttsEnabledRef.current) return
 
       if (
         !isRecord(payload) ||
@@ -1428,7 +1457,7 @@ function App() {
       const buffer = audioContext.createBuffer(1, pcm.length, sampleRate)
       buffer.copyToChannel(pcm, 0)
       const source = audioContext.createBufferSource()
-       if (generation !== ttsGenerationRef.current || !ttsEnabledRef.current) return
+      if (generation !== ttsGenerationRef.current || !ttsEnabledRef.current) return
       ttsSourceRef.current = source
       source.buffer = buffer
       const gainNode = audioContext.createGain()
@@ -1454,7 +1483,12 @@ function App() {
       if (audioContext !== null) {
         await audioContext.close().catch(() => undefined)
       }
-      if (ttsSourceRef.current !== null && generation === ttsGenerationRef.current) ttsSourceRef.current = null
+      await invokeTauriCommand('finish_tts_playback', { playbackId: generation }).catch(() => undefined)
+      if (ttsPlaybackIdRef.current === generation) {
+        ttsPlaybackIdRef.current = null
+        ttsSourceRef.current = null
+        setTtsPlaying(false)
+      }
     }
   }
 
@@ -2138,7 +2172,7 @@ function App() {
               <label><input type="checkbox" checked={assistantSettings.prefetch} disabled={assistantControlsDisabled} onChange={(event) => void persistAssistantSettings({ ...assistantSettingsRef.current, prefetch: event.target.checked })} /> Prefetch</label>
               <p className="settings-panel__hint">Prefetch may transmit unaccepted predicted text when enabled.</p>
             </div>
-            <UpdateSettings updates={appUpdates} />
+            <UpdateSettings updates={appUpdates} installationDisabled={updateInstallationDisabled} />
           </section>
         </div>
       ) : null}
