@@ -23,7 +23,8 @@ describe('UpdateSettings', () => {
         status: 'available',
         current_version: '0.1.0',
         version: '2026.7.27-12',
-        notes: 'Safer updates',
+         notes: 'Safer updates',
+         install_behavior: 'install_then_restart',
       }
       if (command === 'install_update') return { version: '2026.7.27-12' }
       if (command === 'restart_for_update') return null
@@ -96,12 +97,31 @@ describe('UpdateSettings', () => {
     expect(container.querySelector('[role="alert"]')).toBeNull()
   })
 
+  it('disables an available update while application work is active', async () => {
+    window.__TAURI_INTERNALS__ = {
+      invoke: vi.fn(async (command: string) => {
+        if (command !== 'check_for_update') throw new Error(`unexpected command: ${command}`)
+        return {
+          status: 'available',
+          current_version: '0.1.0',
+          version: '2026.7.27-12',
+          notes: null,
+          install_behavior: 'install_and_restart',
+        }
+      }),
+    }
+
+    const container = await renderUpdates(true)
+    expect(getButton(container, 'Install and restart').disabled).toBe(true)
+    expect(container.textContent).toContain('Finish active work before installing')
+  })
+
   it('preserves an in-flight install when settings closes and does not check twice', async () => {
     let finishInstall: (result: { version: string }) => void = () => undefined
     const pendingInstall = new Promise<{ version: string }>((resolve) => { finishInstall = resolve })
     const invoke = vi.fn(async (command: string) => {
       if (command === 'check_for_update') return {
-        status: 'available', current_version: '0.1.0', version: '2026.7.27-12', notes: null,
+         status: 'available', current_version: '0.1.0', version: '2026.7.27-12', notes: null, install_behavior: 'install_then_restart',
       }
       if (command === 'install_update') return pendingInstall
       throw new Error(`unexpected command: ${command}`)
@@ -133,27 +153,27 @@ describe('UpdateSettings', () => {
   })
 })
 
-async function renderUpdates(): Promise<HTMLElement> {
+async function renderUpdates(installationDisabled = false): Promise<HTMLElement> {
   const container = document.createElement('div')
   document.body.append(container)
   containers.push(container)
   const root = createRoot(container)
   roots.push(root)
   await act(async () => {
-    root.render(<UpdateTestHost />)
+    root.render(<UpdateTestHost installationDisabled={installationDisabled} />)
     await Promise.resolve()
   })
   return container
 }
 
-function UpdateTestHost(): JSX.Element {
+function UpdateTestHost({ installationDisabled }: { readonly installationDisabled: boolean }): JSX.Element {
   const updates = useAppUpdates()
   const [visible, setVisible] = useState(true)
   return (
     <div>
       <button type="button" onClick={() => setVisible(false)}>Hide updates</button>
       <button type="button" onClick={() => setVisible(true)}>Show updates</button>
-      {visible ? <UpdateSettings updates={updates} /> : null}
+      {visible ? <UpdateSettings updates={updates} installationDisabled={installationDisabled} /> : null}
     </div>
   )
 }

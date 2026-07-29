@@ -851,6 +851,7 @@ describe('App', () => {
         if (command === 'synthesize_local_tts') {
           expect(args).toEqual({
             text: 'Voice response',
+            playbackId: 2,
           })
           return {
             pcm_f32: [0.0, 0.1, -0.1],
@@ -974,6 +975,74 @@ describe('App', () => {
     await act(async () => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })); await Promise.resolve() })
     await act(async () => { resolveSynthesis?.({ pcm_f32: [0], sample_rate_hz: 22050, duration_ms: 1 }); await Promise.resolve() })
     expect(started).not.toHaveBeenCalled()
+  })
+
+  it('disables update installation from TTS synthesis through playback completion', async () => {
+    let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
+    let resolveSynthesis: ((value: unknown) => void) | undefined
+    let source: AudioBufferSourceNode | undefined
+    class FakeAudioContext {
+      destination = {} as AudioDestinationNode
+      state: AudioContextState = 'running'
+      createBuffer(): AudioBuffer { return { copyToChannel: () => {} } as unknown as AudioBuffer }
+      createBufferSource(): AudioBufferSourceNode {
+        source = { buffer: null, connect: () => {}, onended: null, start: vi.fn(), stop: vi.fn() } as unknown as AudioBufferSourceNode
+        return source
+      }
+      createGain(): GainNode { return { gain: { value: 1 } as AudioParam, connect: () => {} } as unknown as GainNode }
+      async close(): Promise<void> {}
+    }
+    Object.defineProperty(globalThis, 'AudioContext', { configurable: true, value: FakeAudioContext })
+    window.__TAURI_INTERNALS__ = {
+      listen: async (event, handler) => {
+        if (event === 'prompt-execution-event') promptEventHandler = handler
+        return () => undefined
+      },
+      invoke: async (command, args) => {
+        if (command === 'get_startup_state') return readyStartupState({ tts_enabled: true })
+        if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
+        if (command === 'check_for_update') {
+          return {
+            status: 'available',
+            current_version: '2026.7.27-1',
+            version: '2026.7.28-1',
+            notes: null,
+            install_behavior: 'install_and_restart',
+          }
+        }
+        if (command === 'submit_prompt') {
+          const requestId = (args as { requestId: string }).requestId
+          promptEventHandler?.({ payload: { request_id: requestId, kind: 'text', text: 'Spoken response' } })
+          return { request_id: requestId, outcome: 'completed', error_message: null, runtime_phase: 'sleeping' }
+        }
+        if (command === 'synthesize_local_tts') {
+          return new Promise((resolve) => { resolveSynthesis = resolve })
+        }
+        if (command === 'finish_tts_playback') return null
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    await act(async () => { setTextAreaValue(getComposer(container), 'Speak'); getSendButton(container).click(); await Promise.resolve() })
+    await act(async () => { getButtonByLabel(container, 'Settings').click(); await Promise.resolve() })
+    const install = getButtonByText(container, 'Install and restart')
+    expect(resolveSynthesis).toBeDefined()
+    expect(install.disabled).toBe(true)
+
+    await act(async () => {
+      resolveSynthesis?.({ pcm_f32: [0], sample_rate_hz: 22050, duration_ms: 1 })
+      await Promise.resolve()
+    })
+    expect(source).toBeDefined()
+    expect(install.disabled).toBe(true)
+
+    await act(async () => {
+      source?.onended?.(new Event('ended'))
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(install.disabled).toBe(false)
   })
 
   it('renders response profile dropdown from startup state', async () => {
@@ -4995,6 +5064,15 @@ function getButtonByLabel(container: HTMLElement, label: string): HTMLButtonElem
     throw new Error(`Missing ${label} button`)
   }
 
+  return button
+}
+
+function getButtonByText(container: HTMLElement, text: string): HTMLButtonElement {
+  const button = Array.from(container.querySelectorAll<HTMLButtonElement>('button'))
+    .find((candidate) => candidate.textContent?.trim() === text)
+  if (button === undefined) {
+    throw new Error(`Missing ${text} button`)
+  }
   return button
 }
 

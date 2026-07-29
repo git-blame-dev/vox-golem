@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -eu -o pipefail
+
+: "${VOXGOLEM_REAL_CLANG_CL:?The real clang-cl path is required.}"
+
+for argument do
+  case "$argument" in
+    */espeak-ng/src/espeak-ng.c|*\\espeak-ng\\src\\espeak-ng.c)
+      test -f "${VOXGOLEM_ESPEAK_COMPAT_HEADER:?The eSpeak compatibility header is required.}"
+      set -- "/FI$VOXGOLEM_ESPEAK_COMPAT_HEADER" "$@"
+      break
+      ;;
+  esac
+done
+
+exec "$VOXGOLEM_REAL_CLANG_CL" --driver-mode=cl "$@"

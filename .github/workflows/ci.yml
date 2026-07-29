@@ -66,3 +66,51 @@ jobs:
         with:
           name: vox-golem-linux
           path: vox-golem-linux.tar.gz
+
+  windows-artifact:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.3.9
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: stable
+      - name: Install Windows cross-build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cabextract clang-19 cmake file lld-19 llvm-19 llvm-19-tools ninja-build p7zip-full
+          curl --retry 5 --retry-delay 2 --retry-all-errors -fsSLO https://archive.ubuntu.com/ubuntu/pool/universe/n/nsis/nsis-common_3.09-4ubuntu1_all.deb
+          curl --retry 5 --retry-delay 2 --retry-all-errors -fsSLO https://archive.ubuntu.com/ubuntu/pool/universe/n/nsis/nsis_3.09-4ubuntu1_amd64.deb
+          printf '%s  %s\n' \
+            '49471b9debdee4751ebb4caf6b705cc4c678eebfaecefbe56362258893f85859' 'nsis-common_3.09-4ubuntu1_all.deb' \
+            '9e061bef1a8b611aeb2ea76d9a3bd7722b960ca1a9dff8e38d2ab51e5a8f5e5b' 'nsis_3.09-4ubuntu1_amd64.deb' | sha256sum -c -
+          sudo apt-get install -y ./nsis-common_3.09-4ubuntu1_all.deb ./nsis_3.09-4ubuntu1_amd64.deb
+          cargo install cargo-xwin --version 0.23.0 --locked
+          cargo install tauri-cli --version 2.11.1 --locked
+      - name: Determine application version
+        id: app_version
+        run: |
+          commit_timestamp="$(git show -s --format=%ct HEAD)"
+          version="$(scripts/release-version.sh "$commit_timestamp" "$GITHUB_RUN_NUMBER")"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+      - name: Build and verify Windows installer
+        env:
+          APP_VERSION: ${{ steps.app_version.outputs.version }}
+        run: PATH="/usr/lib/llvm-19/bin:$PATH" make pc-installer
+      - name: Stage Windows CI artifact
+        env:
+          APP_VERSION: ${{ steps.app_version.outputs.version }}
+        run: |
+          source="target/x86_64-pc-windows-msvc/release/bundle/nsis/VoxGolem_${APP_VERSION}_x64-setup.exe"
+          asset="vox-golem-windows-x86_64-v${APP_VERSION}-setup.exe"
+          test -f "$source"
+          mkdir windows-package
+          cp "$source" "windows-package/$asset"
+          printf '%s\n' "$APP_VERSION" > windows-package/APP_VERSION
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: vox-golem-windows
+          path: windows-package
