@@ -78,6 +78,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: stable
+          targets: x86_64-pc-windows-msvc
       - name: Install Windows cross-build dependencies
         run: |
           sudo apt-get update
