@@ -4059,6 +4059,52 @@ describe('App', () => {
     expect(sources[1]?.stop).not.toHaveBeenCalled()
   })
 
+  it('keeps local prompts disabled when profile startup and restoration both fail', async () => {
+    let startupStateCallCount = 0
+    let submitCalls = 0
+
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        if (command === 'get_app_snapshot') return appSnapshot()
+        if (command === 'get_startup_state') {
+          startupStateCallCount += 1
+          if (startupStateCallCount === 1) return readyStartupState()
+          return readyStartupState({
+            selected_response_profile: 'fast',
+            capabilities: completeCapabilities({
+              local_fast: 'failed',
+              local_quality: 'failed',
+            }).map((capability) => ['local_fast', 'local_quality'].includes(String(capability['id']))
+              ? { ...capability, reason: 'an externally managed runtime cannot restore the previous profile' }
+              : capability),
+          })
+        }
+        if (command === 'switch_response_profile') return null
+        if (command === 'get_assistant_settings') return defaultAssistantSettings()
+        if (command === 'submit_prompt') {
+          submitCalls += 1
+          return null
+        }
+        return null
+      },
+    }
+
+    const { container } = await renderApp()
+    await act(async () => {
+      setSelectValue(await getResponseProfileSelect(container), 'quality')
+      await Promise.resolve()
+    })
+    await closeSettings(container)
+    await act(async () => {
+      setTextAreaValue(getComposer(container), 'Must remain blocked without a local runtime')
+      await Promise.resolve()
+    })
+
+    expect(container.textContent).toContain('an externally managed runtime cannot restore the previous profile')
+    expect(getSendButton(container).disabled).toBe(true)
+    expect(submitCalls).toBe(0)
+  })
+
   it('restarts auto-started microphone once after a failed profile rollback', async () => {
     const sources: Array<{ stop: ReturnType<typeof vi.fn>; onFrame: (frame: readonly number[]) => Promise<void> | void }> = []
     const invokedCommands: string[] = []

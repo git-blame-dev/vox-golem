@@ -2428,7 +2428,6 @@ function App() {
         const message = requestedCapability?.reason ?? `The ${getResponseProfileLabel(profile)} profile could not be started.`
         addNotice({ tone: 'error', title: 'Profile switch failed', message })
         recordRuntimeDiagnostic('profile', `Response profile switch error: ${message}`)
-        applyStartupState(currentState)
         return false
       }
       if (settled.kind === 'error') {
