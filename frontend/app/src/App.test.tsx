@@ -175,7 +175,7 @@ describe('App', () => {
     const composer = getComposer(container)
     const sendButton = getSendButton(container)
     const conversation = getConversation(container)
-    expect(container.querySelector('.shell__header')).toBeNull()
+    expect(container.querySelector('.shell__header')).not.toBeNull()
     expect(conversation).toBeTruthy()
     const scrollToSpy = vi.fn()
 
@@ -196,6 +196,23 @@ describe('App', () => {
     })
 
     expect(scrollToSpy.mock.calls.length).toBeGreaterThan(baselineCalls)
+  })
+
+  it('renders one response-first semantic shell with a single reset affordance', async () => {
+    const { container } = await renderApp()
+    const header = container.querySelector('header.shell__header')
+    const shell = getShell(container)
+
+    expect(header).not.toBeNull()
+    expect(header?.querySelector('[data-shell-identity]')?.textContent).toContain('VoxGolem')
+    expect(header?.querySelector('[data-runtime-phase]')?.textContent).toContain(getShell(container).dataset['runtimeStatus'])
+    expect(header?.querySelector('[aria-label="Switch to light mode"]')).not.toBeNull()
+    expect(header?.querySelector('[aria-label="Settings"]')).not.toBeNull()
+    expect(header?.querySelector('button[aria-label="New Chat"]')?.textContent).toContain('New Chat')
+    expect(container.querySelectorAll('button[aria-label="New Chat"]')).toHaveLength(1)
+    expect(getConversation(container).hasAttribute('aria-live')).toBe(false)
+    expect(shell.querySelector('main.conversation')).not.toBeNull()
+    expect(container.querySelector('form.composer .prompt-composer')).not.toBeNull()
   })
 
   it('preserves an older reading position until Jump to latest is requested', async () => {
@@ -340,15 +357,16 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
+    await act(async () => setTextAreaValue(getComposer(container), 'Must remain blocked'))
     await act(async () => {
       getButtonByLabel(container, 'Settings').click()
-      setTextAreaValue(getComposer(container), 'Must remain blocked')
       await Promise.resolve()
     })
     const selected = container.querySelector<HTMLOptionElement>('#assistantInstantSelect option[value="custom-sol-high"]')
     expect(selected?.textContent).toContain('Snapshot Custom Sol')
     expect(selected?.disabled).toBe(true)
     expect(selected?.title).toBe('Snapshot provider unavailable')
+    await closeSettings(container)
     expect(getSendButton(container).disabled).toBe(true)
   })
 
@@ -413,14 +431,15 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
+    await act(async () => setTextAreaValue(getComposer(container), 'Unavailable omitted model'))
     await act(async () => {
       getButtonByLabel(container, 'Settings').click()
-      setTextAreaValue(getComposer(container), 'Unavailable omitted model')
       await Promise.resolve()
     })
     const localFast = container.querySelector<HTMLOptionElement>('#assistantInstantSelect option[value="local-fast"]')
     expect(localFast?.disabled).toBe(true)
     expect(localFast?.title).toBe('Unavailable in the current app snapshot')
+    await closeSettings(container)
     expect(getSendButton(container).disabled).toBe(true)
   })
 
@@ -486,6 +505,7 @@ describe('App', () => {
     })
     expect(snapshotCalls).toBe(2)
     expect(container.querySelector('[aria-label="Retry local profile"]')).toBeNull()
+    await closeSettings(container)
     await act(async () => setTextAreaValue(getComposer(container), 'Available after retry'))
     expect(getSendButton(container).disabled).toBe(false)
   })
@@ -526,7 +546,7 @@ describe('App', () => {
     })
 
     expect(stop).toHaveBeenCalledTimes(1)
-    expect(getControlButton(container, 'Start mic').disabled).toBe(true)
+    expect(Array.from(container.querySelectorAll<HTMLButtonElement>('button')).filter((button) => button.textContent?.trim() === 'Start mic')).toHaveLength(0)
     await act(async () => { await frame([0.2, -0.2]); await Promise.resolve() })
     expect(ingestCalls).toBe(0)
   })
@@ -559,7 +579,7 @@ describe('App', () => {
     })
 
     expect(stop).toHaveBeenCalledTimes(1)
-    expect(getControlButton(container, 'Start mic').disabled).toBe(true)
+    expect(Array.from(container.querySelectorAll<HTMLButtonElement>('button')).filter((button) => button.textContent?.trim() === 'Start mic')).toHaveLength(0)
   })
 
   it.each(['resolve', 'reject'] as const)('ignores an in-flight microphone result after capability loss: %s', async (settlement) => {
@@ -749,7 +769,8 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    await act(async () => { getAutoStopToggle(container).click() })
+    await openSettings(container); await act(async () => { getAutoStopToggle(container).click() })
+    await closeSettings(container)
     const frame = onFrame as unknown as (samples: readonly number[]) => Promise<void> | void
     await act(async () => { await frame([0.04, -0.04]); await Promise.resolve() })
     expect(getShell(container).dataset['runtimeStatus']).toBe('listening')
@@ -799,7 +820,8 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    await act(async () => { getAutoStopToggle(container).click() })
+    await openSettings(container); await act(async () => { getAutoStopToggle(container).click() })
+    await closeSettings(container)
     await act(async () => {
       setTextAreaValue(getComposer(container), 'Reconcile runtime prompt')
       getSendButton(container).click()
@@ -887,7 +909,8 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    await act(async () => { getAutoStopToggle(container).click() })
+    await openSettings(container); await act(async () => { getAutoStopToggle(container).click() })
+    await closeSettings(container)
     await act(async () => {
       setTextAreaValue(getComposer(container), 'Fallback runtime prompt')
       getSendButton(container).click()
@@ -941,7 +964,8 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    await act(async () => { getAutoStopToggle(container).click() })
+    await openSettings(container); await act(async () => { getAutoStopToggle(container).click() })
+    await closeSettings(container)
     await act(async () => {
       setTextAreaValue(getComposer(container), 'Cancel this projection')
       getSendButton(container).click()
@@ -1165,7 +1189,8 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    await act(async () => { getAutoStopToggle(container).click() })
+    await openSettings(container); await act(async () => { getAutoStopToggle(container).click() })
+    await closeSettings(container)
     await act(async () => {
       setTextAreaValue(getComposer(container), 'Rejected pending question')
       getSendButton(container).click()
@@ -1446,7 +1471,7 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    await act(async () => { getAutoStopToggle(container).click() })
+    await openSettings(container); await act(async () => { getAutoStopToggle(container).click() })
     const frame = onFrame as unknown as (samples: readonly number[]) => Promise<void> | void
     await act(async () => { await frame([0.04, -0.04]); await Promise.resolve() })
     expect(getShell(container).dataset['runtimeStatus']).toBe('listening')
@@ -1533,7 +1558,10 @@ describe('App', () => {
     await act(async () => {
       getButtonByLabel(container, 'Settings').click()
       await Promise.resolve()
-      getButtonByLabel(container, 'Reset Session').click()
+    })
+    await closeSettings(container)
+    await act(async () => {
+      getNewChatButton(container).click()
       await Promise.resolve()
       await Promise.resolve()
     })
@@ -1578,7 +1606,11 @@ describe('App', () => {
     const { container } = await renderApp()
     await act(async () => {
       getButtonByLabel(container, 'Settings').click()
-      getButtonByLabel(container, 'Reset Session').click()
+      for (let index = 0; index < 6; index += 1) await Promise.resolve()
+    })
+    await closeSettings(container)
+    await act(async () => {
+      getNewChatButton(container).click()
       for (let index = 0; index < 6; index += 1) await Promise.resolve()
     })
     await act(async () => {
@@ -1587,10 +1619,13 @@ describe('App', () => {
       ]))
       for (let index = 0; index < 6; index += 1) await Promise.resolve()
     })
+    await closeSettings(container)
+    await openSettings(container)
     await act(async () => {
       getTtsToggle(container).click()
       await Promise.resolve()
     })
+    await closeSettings(container)
     await act(async () => {
       setTextAreaValue(getComposer(container), 'Session two prompt')
       getSendButton(container).click()
@@ -1632,9 +1667,14 @@ describe('App', () => {
     const { container } = await renderApp()
     await act(async () => {
       getButtonByLabel(container, 'Settings').click()
-      getButtonByLabel(container, 'Reset Session').click()
       await Promise.resolve()
     })
+    await closeSettings(container)
+    await act(async () => {
+      getNewChatButton(container).click()
+      await Promise.resolve()
+    })
+    await closeSettings(container)
     expect(getSendButton(container).disabled).toBe(true)
     await act(async () => {
       await vi.advanceTimersByTimeAsync(250)
@@ -1673,11 +1713,16 @@ describe('App', () => {
     expect(container.textContent).toContain('Assistant settings unavailable: legacy settings failed')
     await act(async () => {
       getButtonByLabel(container, 'Settings').click()
-      getButtonByLabel(container, 'Reset Session').click()
+      for (let index = 0; index < 8; index += 1) await Promise.resolve()
+    })
+    await closeSettings(container)
+    await act(async () => {
+      getNewChatButton(container).click()
       for (let index = 0; index < 8; index += 1) await Promise.resolve()
     })
 
     expect(container.textContent).not.toContain('Assistant settings unavailable: legacy settings failed')
+    await openSettings(container)
     expect(container.querySelector<HTMLSelectElement>('#assistantInstantSelect')?.disabled).toBe(false)
   })
 
@@ -1762,15 +1807,19 @@ describe('App', () => {
       await Promise.resolve()
       getButtonByLabel(container, 'Settings').click()
       await Promise.resolve()
-      getButtonByLabel(container, 'Reset Session').click()
+    })
+    await closeSettings(container)
+    await act(async () => {
+      getNewChatButton(container).click()
       await Promise.resolve()
       await Promise.resolve()
     })
 
     expect(requestId).not.toBe('')
     expect(snapshotCalls).toBe(2)
-    expect(container.textContent).toContain('Reset failed')
+    expect(container.textContent).toContain('New chat failed')
     expect(getConversation(container).textContent).not.toContain('Reset failure prompt')
+    await closeSettings(container)
     await act(async () => setTextAreaValue(getComposer(container), 'Recovered prompt'))
     expect(getSendButton(container).disabled).toBe(false)
   })
@@ -1959,6 +2008,7 @@ describe('App', () => {
 
     const { container } = await renderApp()
     await act(async () => {
+      await openSettings(container)
       getTtsToggle(container).click()
       await Promise.resolve()
       await Promise.resolve()
@@ -1986,6 +2036,7 @@ describe('App', () => {
 
     const { container } = await renderApp()
     await act(async () => {
+      await openSettings(container)
       getTtsToggle(container).click()
       await Promise.resolve()
       await Promise.resolve()
@@ -2012,12 +2063,15 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
+    await openSettings(container)
     expect(getTtsToggle(container).checked).toBe(true)
     await act(async () => {
       resolveStartup(readyStartupState({ tts_enabled: false }))
       await Promise.resolve()
       await Promise.resolve()
     })
+    await closeSettings(container)
+    await openSettings(container)
     expect(getTtsToggle(container).checked).toBe(true)
     await act(async () => {
       getTtsToggle(container).click()
@@ -2044,6 +2098,7 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
+    await openSettings(container)
     expect(getTtsToggle(container).checked).toBe(false)
     await act(async () => {
       await vi.advanceTimersByTimeAsync(500)
@@ -2073,11 +2128,14 @@ describe('App', () => {
 
     const { container } = await renderApp()
     await act(async () => {
+      await openSettings(container)
       getTtsToggle(container).click()
       await Promise.resolve()
     })
     expect(getTtsToggle(container).checked).toBe(true)
+    await closeSettings(container)
     await act(async () => {
+      await openSettings(container)
       getTtsToggle(container).click()
       await Promise.resolve()
     })
@@ -2105,12 +2163,15 @@ describe('App', () => {
       await Promise.resolve()
       getButtonByLabel(container, 'Settings').click()
       await Promise.resolve()
-      getButtonByLabel(container, 'Reset Session').click()
+    })
+    await closeSettings(container)
+    await act(async () => {
+      getNewChatButton(container).click()
       await Promise.resolve()
     })
 
     expect(getConversation(container).textContent).toBe('')
-    expect(container.textContent).not.toContain('Reset failed')
+    expect(container.textContent).not.toContain('New chat failed')
   })
 
   it('does not reconcile a prompt result after unmount', async () => {
@@ -2307,7 +2368,10 @@ describe('App', () => {
     expect(textSizeWrites).toBe(2)
     expect(getShell(container).dataset['uiTextSize']).toBe('medium')
 
-    await act(async () => { getTtsToggle(container).click() })
+    await closeSettings(container)
+    await openSettings(container); await act(async () => { getTtsToggle(container).click() })
+    await closeSettings(container)
+    await openSettings(container)
     await act(async () => { getTtsToggle(container).click() })
     await act(async () => {
       rejectFirstTts(new Error('first TTS write failed'))
@@ -2348,7 +2412,10 @@ describe('App', () => {
     await act(async () => {
       getButtonByLabel(container, 'Settings').click()
       await Promise.resolve()
-      getButtonByLabel(container, 'Reset Session').click()
+    })
+    await closeSettings(container)
+    await act(async () => {
+      getNewChatButton(container).click()
       await Promise.resolve()
     })
     await act(async () => {
@@ -2358,7 +2425,8 @@ describe('App', () => {
 
     expect(snapshotCalls).toBe(4)
     expect(container.textContent).toContain('Session recovery required')
-    expect(getButtonByLabel(container, 'Reset Session').disabled).toBe(false)
+    expect(getNewChatButton(container).disabled).toBe(false)
+    await closeSettings(container)
     await act(async () => setTextAreaValue(getComposer(container), 'Blocked until retry'))
     expect(getSendButton(container).disabled).toBe(true)
     const frame = onFrame as unknown as (samples: readonly number[]) => Promise<void> | void
@@ -2499,7 +2567,10 @@ describe('App', () => {
     await act(async () => {
       getButtonByLabel(container, 'Settings').click()
       await Promise.resolve()
-      getButtonByLabel(container, 'Reset Session').click()
+    })
+    await closeSettings(container)
+    await act(async () => {
+      getNewChatButton(container).click()
       await Promise.resolve()
     })
     const root = mountedRoots.pop()
@@ -2556,7 +2627,11 @@ describe('App', () => {
     expect(composer.disabled).toBe(false)
     expect(getSendButton(container).disabled).toBe(true)
     expect(container.textContent).toContain('Sending disabled:')
-    expect(container.querySelector('.notice-toast--error')).not.toBeNull()
+    const notice = container.querySelector('.notice-toast--error')
+    expect(notice).not.toBeNull()
+    expect(notice?.parentElement?.classList.contains('conversation-notice')).toBe(true)
+    expect(notice?.parentElement?.parentElement?.classList.contains('conversation-region')).toBe(true)
+    expect(container.querySelector('[aria-label="Response announcements"]')?.closest('.conversation-region')).toBeNull()
     for (const id of capabilityIds) {
       expect(container.textContent).toContain(`${id} unavailable`)
     }
@@ -3318,6 +3393,7 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
+    await openSettings(container)
     const ttsToggle = getTtsToggle(container)
 
     expect(container.textContent).not.toContain('Enter to send, Shift+Enter for newline')
@@ -3327,6 +3403,7 @@ describe('App', () => {
       ttsToggle.click()
       await Promise.resolve()
     })
+    await closeSettings(container)
 
     expect(invoked).toContain('set_tts_enabled')
     expect(ttsToggle.checked).toBe(true)
@@ -3438,14 +3515,17 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
+    await openSettings(container)
+    await closeSettings(container)
+    await openSettings(container)
     const ttsToggle = getTtsToggle(container)
-    const composer = getComposer(container)
-    const sendButton = getSendButton(container)
-
     await act(async () => {
       ttsToggle.click()
       await Promise.resolve()
     })
+    await closeSettings(container)
+    const composer = getComposer(container)
+    const sendButton = getSendButton(container)
 
     await act(async () => {
       setTextAreaValue(composer, 'Hello voice')
@@ -3496,7 +3576,10 @@ describe('App', () => {
       },
     }
     const { container } = await renderApp()
-    await act(async () => { getTtsToggle(container).click(); await new Promise((resolve) => setTimeout(resolve, 0)); setTextAreaValue(getComposer(container), 'Say this'); getSendButton(container).click(); await Promise.resolve() })
+    await openSettings(container)
+    await act(async () => { const toggle = getTtsToggle(container); toggle.click(); await new Promise((resolve) => setTimeout(resolve, 0)); await Promise.resolve() })
+    await closeSettings(container)
+    await act(async () => { setTextAreaValue(getComposer(container), 'Say this'); getSendButton(container).click(); await Promise.resolve() })
     await act(async () => { promptEventHandler?.({ payload: { request_id: requestId, kind: 'text', text: 'Valid first line\nmore' } }); await new Promise((resolve) => setTimeout(resolve, 0)) })
     await act(async () => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })); await Promise.resolve() })
     expect(stop).toHaveBeenCalledOnce()
@@ -3538,7 +3621,10 @@ describe('App', () => {
       },
     }
     const { container } = await renderApp()
-    await act(async () => { getTtsToggle(container).click(); await new Promise((resolve) => setTimeout(resolve, 0)); setTextAreaValue(getComposer(container), 'Say this'); getSendButton(container).click(); await Promise.resolve() })
+    await openSettings(container)
+    await act(async () => { getTtsToggle(container).click(); await new Promise((resolve) => setTimeout(resolve, 0)); await Promise.resolve() })
+    await closeSettings(container)
+    await act(async () => { setTextAreaValue(getComposer(container), 'Say this'); getSendButton(container).click(); await Promise.resolve() })
     await act(async () => {
       promptEventHandler?.({ payload: { request_id: requestId, kind: 'text', text: 'Valid first line\nmore' } })
       await new Promise((resolve) => setTimeout(resolve, 0))
@@ -3581,9 +3667,13 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
+    await openSettings(container)
     await act(async () => {
       getTtsToggle(container).click()
       await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    await closeSettings(container)
+    await act(async () => {
       setTextAreaValue(getComposer(container), 'Discard this speech')
       getSendButton(container).click()
       await Promise.resolve()
@@ -4034,6 +4124,9 @@ describe('App', () => {
     await act(async () => {
       setSelectValue(await getResponseProfileSelect(container), 'quality')
       for (let index = 0; index < 8; index += 1) await Promise.resolve()
+    })
+    await closeSettings(container)
+    await act(async () => {
       setTextAreaValue(getComposer(container), 'Must remain blocked after refresh failure')
       getSendButton(container).click()
       await Promise.resolve()
@@ -4041,19 +4134,31 @@ describe('App', () => {
 
     expect(container.textContent).toContain('Profile state unavailable')
     expect(getSendButton(container).disabled).toBe(true)
-    const select = container.querySelector<HTMLSelectElement>('#assistantInstantSelect')
-    expect(select).not.toBeNull()
+    await openSettings(container)
+    const settingsSelect = container.querySelector<HTMLSelectElement>('#assistantInstantSelect')
+    expect(settingsSelect).not.toBeNull()
     await act(async () => {
-      setSelectValue(select as HTMLSelectElement, 'custom-sol-high')
+      setSelectValue(settingsSelect as HTMLSelectElement, 'custom-sol-high')
       await Promise.resolve()
+    })
+    await closeSettings(container)
+    await act(async () => {
       setTextAreaValue(getComposer(container), 'Custom remains blocked')
       getSendButton(container).click()
-      setSelectValue(select as HTMLSelectElement, 'quality')
       for (let index = 0; index < 6; index += 1) await Promise.resolve()
+    })
+    await openSettings(container)
+    await act(async () => {
+      setSelectValue(container.querySelector<HTMLSelectElement>('#assistantInstantSelect') as HTMLSelectElement, 'quality')
+      await Promise.resolve()
+    })
+    await closeSettings(container)
+    await act(async () => {
       setTextAreaValue(getComposer(container), 'Local quality remains blocked')
       getSendButton(container).click()
       await Promise.resolve()
     })
+    await closeSettings(container)
     expect(submitCalls).toBe(0)
   })
 
@@ -4159,6 +4264,7 @@ describe('App', () => {
       getButtonByLabel(container, 'Retry local profile').click()
       await new Promise((resolve) => setTimeout(resolve, 0))
     })
+    await closeSettings(container)
 
     expect(nonDiagnosticCommands(invokedCommands)).toContain('switch_response_profile')
     await act(async () => { setTextAreaValue(getComposer(container), 'another prompt'); await Promise.resolve(); await Promise.resolve(); })
@@ -4192,6 +4298,7 @@ describe('App', () => {
     expect(container.textContent).toContain('Profile switch failed')
     expect(getButtonByLabel(container, 'Retry local profile')).not.toBeNull()
     expect(select.querySelector<HTMLOptionElement>('option[value="opencode-sol-high"]')?.disabled).toBe(false)
+    await closeSettings(container)
     expect(getSendButton(container).disabled).toBe(true)
   })
 
@@ -5628,8 +5735,9 @@ describe('App', () => {
     await Promise.resolve()
     expect(invokedCommands).toContain('ingest_audio_frame')
 
+    await closeSettings(container)
     await act(async () => {
-      getButtonByLabel(container, 'Reset Session').click()
+      getNewChatButton(container).click()
       await Promise.resolve()
     })
 
@@ -5666,9 +5774,13 @@ describe('App', () => {
     await act(async () => {
       getButtonByLabel(container, 'Settings').click()
       await Promise.resolve()
-      getButtonByLabel(container, 'Reset Session').click()
+    })
+    await closeSettings(container)
+    await act(async () => {
+      getNewChatButton(container).click()
       await Promise.resolve()
     })
+    await closeSettings(container)
     expect(startLiveAudioSourceMock).toHaveBeenCalledTimes(1)
     expect(getControlButton(container, 'Start mic').disabled).toBe(true)
 
@@ -5703,7 +5815,11 @@ describe('App', () => {
     expect(startLiveAudioSourceMock).toHaveBeenCalledTimes(1)
     await act(async () => {
       getButtonByLabel(container, 'Settings').click()
-      getButtonByLabel(container, 'Reset Session').click()
+      await Promise.resolve()
+    })
+    await closeSettings(container)
+    await act(async () => {
+      getNewChatButton(container).click()
       await Promise.resolve()
     })
     expect(startLiveAudioSourceMock).toHaveBeenCalledTimes(1)
@@ -5829,11 +5945,12 @@ describe('App', () => {
       getButtonByLabel(container, 'Settings').click()
       await Promise.resolve()
     })
+    await closeSettings(container)
     await act(async () => {
-      getButtonByLabel(container, 'Reset Session').click()
+      getNewChatButton(container).click()
       await Promise.resolve()
     })
-    getButtonByLabel(container, 'Reset Session').click()
+    if (container.querySelector('[role="dialog"]') !== null) await closeSettings(container)
     await act(async () => {
       setTextAreaValue(getComposer(container), 'Blocked during reset')
       getComposer(container).dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
@@ -6853,6 +6970,7 @@ describe('App', () => {
     const { container } = await renderApp()
     expect(startLiveAudioSourceMock).toHaveBeenCalledTimes(1)
     await act(async () => {
+      await openSettings(container)
       getTtsToggle(container).click()
       resolveSettings({
         instant: 'local-fast', deep: 'opencode-sol-high', review: 'opencode-sol-high',
@@ -7397,18 +7515,13 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    const startMic = getControlButton(container, 'Start mic')
+    await openSettings(container)
     const autoStop = getAutoStopToggle(container)
-    const describedBy = startMic.getAttribute('aria-describedby')
-    const description = describedBy === null ? null : container.querySelector(`#${describedBy}`)
 
     expect(startLiveAudioSourceMock).not.toHaveBeenCalled()
-    expect(startMic.disabled).toBe(true)
+    expect(Array.from(container.querySelectorAll('button')).some((button) => button.textContent?.trim() === 'Start mic')).toBe(false)
     expect(autoStop.disabled).toBe(true)
     expect(container.textContent).toContain(wakeReason)
-    expect(describedBy).not.toBeNull()
-    expect(description?.textContent).toContain(wakeReason)
-    expect(autoStop.getAttribute('aria-describedby')).toBe(describedBy)
   })
 
   it('preserves an accepted completion prefetch through typed submission', async () => {
@@ -7549,13 +7662,16 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    await act(async () => { getTtsToggle(container).click(); await Promise.resolve() })
+    await openSettings(container); await act(async () => { getTtsToggle(container).click(); await Promise.resolve() })
+    await closeSettings(container)
     await act(async () => {
       setTextAreaValue(getComposer(container), 'pending response')
       getSendButton(container).click()
       await Promise.resolve()
     })
+    await openSettings(container)
     await act(async () => { getTtsToggle(container).click(); await Promise.resolve() })
+    await closeSettings(container)
     await act(async () => {
       finishPrompt?.({ request_id: promptRequestId, outcome: 'completed', runtime_phase: 'sleeping' })
       await Promise.resolve()
@@ -7680,6 +7796,7 @@ describe('App', () => {
     const { container } = await renderApp()
 
     await act(async () => {
+      await openSettings(container)
       getAutoStopToggle(container).click()
       await Promise.resolve()
     })
@@ -7898,6 +8015,7 @@ function canonicalTurn(
 }
 
 function getComposer(container: HTMLElement): HTMLTextAreaElement {
+  assertSettingsClosed(container)
   const composer = container.querySelector<HTMLTextAreaElement>('#promptComposer')
 
   if (composer === null) {
@@ -7934,6 +8052,7 @@ function getResponseAnnouncer(container: HTMLElement): HTMLElement {
 }
 
 function getSendButton(container: HTMLElement): HTMLButtonElement {
+  assertSettingsClosed(container)
   const button = container.querySelector<HTMLButtonElement>('button[type="submit"]')
 
   if (button === null) {
@@ -7953,10 +8072,16 @@ function getButtonByLabel(container: HTMLElement, label: string): HTMLButtonElem
   return button
 }
 
+function getNewChatButton(container: HTMLElement): HTMLButtonElement {
+  assertSettingsClosed(container)
+  return getButtonByLabel(container, 'New Chat')
+}
+
 function getControlButton(
   container: HTMLElement,
   label: 'Start mic' | 'Stop mic',
 ): HTMLButtonElement {
+  assertSettingsClosed(container)
   const buttons = Array.from(container.querySelectorAll<HTMLButtonElement>('button'))
   const button = buttons.find((candidate) => candidate.textContent?.trim() === label)
 
@@ -7967,8 +8092,14 @@ function getControlButton(
   return button
 }
 
+function assertSettingsClosed(container: HTMLElement): void {
+  if (container.querySelector('[role="dialog"]') !== null) {
+    throw new Error('Background interaction requested while Settings dialog is open')
+  }
+}
+
 function getAutoStopToggle(container: HTMLElement): HTMLInputElement {
-  const labels = Array.from(container.querySelectorAll<HTMLLabelElement>('label.shell__toggle'))
+  const labels = Array.from(container.querySelectorAll<HTMLLabelElement>('.settings-panel label.shell__toggle'))
   const autoStopLabel = labels.find((label) => label.textContent?.includes('Auto Stop'))
   const toggle = autoStopLabel?.querySelector<HTMLInputElement>('input[type="checkbox"]') ?? null
 
@@ -7980,13 +8111,30 @@ function getAutoStopToggle(container: HTMLElement): HTMLInputElement {
 }
 
 function getTtsToggle(container: HTMLElement): HTMLInputElement {
-  const toggle = container.querySelector<HTMLInputElement>('#tts-toggle')
+  const toggle = container.querySelector<HTMLInputElement>('.settings-panel #tts-toggle')
 
   if (toggle === null) {
     throw new Error('Missing TTS toggle')
   }
 
   return toggle
+}
+
+async function openSettings(container: HTMLElement): Promise<void> {
+  expect(container.querySelector('[role="dialog"]')).toBeNull()
+  await act(async () => {
+    getButtonByLabel(container, 'Settings').click()
+    await Promise.resolve()
+  })
+}
+
+async function closeSettings(container: HTMLElement): Promise<void> {
+  if (container.querySelector('[role="dialog"]') === null) return
+  await act(async () => {
+    getButtonByLabel(container, 'Close settings').click()
+    await Promise.resolve()
+  })
+  expect(container.querySelector('[role="dialog"]')).toBeNull()
 }
 
 async function getResponseProfileSelect(container: HTMLElement): Promise<HTMLSelectElement> {

@@ -183,6 +183,7 @@ function App() {
   const [uiTextSize, setUiTextSize] = useState<UiTextSize>(DEFAULT_UI_TEXT_SIZE)
   const [uiTheme, setUiTheme] = useState<UiTheme>(DEFAULT_UI_THEME)
   const [notices, setNotices] = useState<readonly UserNotice[]>([])
+  const [noticeInteraction, setNoticeInteraction] = useState({ focused: false, hovered: false })
   const [messages, setMessages] = useState<readonly ChatMessage[]>(() =>
     getInitialMessages(),
   )
@@ -304,7 +305,7 @@ function App() {
     }
     if (!appActiveRef.current || !isCurrent() || transcriptRevision !== transcriptRevisionRef.current) return
     if (latest.activeRequest !== null) {
-      setPromptActivity('Session recovery required. Use Reset Session to retry.')
+      setPromptActivity('Session recovery required. Use New Chat to retry.')
       setPromptState('reconciling')
       return
     }
@@ -564,12 +565,17 @@ function App() {
       return undefined
     }
 
+    if (noticeInteraction.focused || noticeInteraction.hovered) return undefined
+
     const timeoutId = window.setTimeout(() => {
-      setNotices((currentNotices) => currentNotices.slice(1))
+      setNotices((currentNotices) => {
+        if (currentNotices.length <= 1) setNoticeInteraction({ focused: false, hovered: false })
+        return currentNotices.slice(1)
+      })
     }, NOTICE_AUTO_DISMISS_MS)
 
     return () => window.clearTimeout(timeoutId)
-  }, [notices])
+  }, [noticeInteraction, notices])
 
   useEffect(() => {
     if (!settingsOpen) {
@@ -1110,25 +1116,37 @@ function App() {
     }
   }, [settingsOpen])
 
+  const scrollConversationToLatest = useCallback((behavior?: ScrollBehavior): void => {
+    const conversation = conversationRef.current
+    if (conversation === null || !followLatestRef.current) {
+      if (conversation !== null) setShowJumpToLatest(true)
+      return
+    }
+    if (typeof conversation.scrollTo === 'function') {
+      conversation.scrollTo({ top: conversation.scrollHeight, ...(behavior === undefined ? {} : { behavior }) })
+    } else {
+      conversation.scrollTop = conversation.scrollHeight
+    }
+  }, [])
+  const activeNoticeId = notices[0]?.id
+
+  useEffect(() => {
+    scrollConversationToLatest()
+  }, [scrollConversationToLatest, visibleMessages])
+
   useEffect(() => {
     const conversation = conversationRef.current
+    if (conversation === null) return
+    const resizeObserver = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => {
+      scrollConversationToLatest()
+    })
+    resizeObserver?.observe(conversation)
+    return () => resizeObserver?.disconnect()
+  }, [scrollConversationToLatest])
 
-    if (conversation === null) {
-      return
-    }
-
-    if (!followLatestRef.current) {
-      setShowJumpToLatest(true)
-      return
-    }
-
-    if (typeof conversation.scrollTo === 'function') {
-      conversation.scrollTo({ top: conversation.scrollHeight })
-      return
-    }
-
-    conversation.scrollTop = conversation.scrollHeight
-  }, [visibleMessages])
+  useEffect(() => {
+    scrollConversationToLatest()
+  }, [activeNoticeId, composerValue, scrollConversationToLatest, uiTextSize])
 
   const onConversationScroll = (): void => {
     const conversation = conversationRef.current
@@ -1152,11 +1170,7 @@ function App() {
     followLatestRef.current = true
     jumpToLatestInProgressRef.current = true
     setShowJumpToLatest(false)
-    if (typeof conversation.scrollTo === 'function') {
-      conversation.scrollTo({ top: conversation.scrollHeight, behavior: 'smooth' })
-    } else {
-      conversation.scrollTop = conversation.scrollHeight
-    }
+    scrollConversationToLatest('smooth')
   }
 
   const assistantCapabilities = useMemo(() => capabilityMap(startupState), [startupState])
@@ -1827,7 +1841,7 @@ function App() {
         }
         if (!appActiveRef.current || promptRef.current !== active || resetPendingRef.current || transcriptRevision !== transcriptRevisionRef.current) return
         if (snapshot === null) {
-          setPromptActivity('Session recovery required. Use Reset Session to retry.')
+          setPromptActivity('Session recovery required. Use New Chat to retry.')
           return
         }
         setMessages((current) => replaceCommittedTranscript(current, snapshot.transcript))
@@ -2671,7 +2685,7 @@ function App() {
         }
       }
       if (resetSnapshot === null) {
-        setPromptActivity('Session recovery required. Use Reset Session to retry.')
+        setPromptActivity('Session recovery required. Use New Chat to retry.')
         setPromptState('reconciling')
         return
       }
@@ -2707,7 +2721,7 @@ function App() {
         applyRuntimeStatus(toRuntimeStatus(resetSnapshot?.runtimePhase ?? 'sleeping'))
       }
     } catch (error) {
-      addNotice({ tone: 'error', title: 'Reset failed', message: toDisplayErrorMessage(error) })
+      addNotice({ tone: 'error', title: 'New chat failed', message: toDisplayErrorMessage(error) })
       setPromptActivity('Recovering session state…')
       let snapshot: AppSnapshot | null = null
       let recoveryRuntimeActivityRevision: number | null = null
@@ -2766,7 +2780,7 @@ function App() {
           await recoverOrphanedRequest(snapshot, transcriptRevision, () => resetPendingRef.current)
         }
       } else if (appActiveRef.current && transcriptRevision === transcriptRevisionRef.current) {
-        setPromptActivity('Session recovery required. Use Reset Session to retry.')
+        setPromptActivity('Session recovery required. Use New Chat to retry.')
         setPromptState('reconciling')
       }
     } finally {
@@ -2784,6 +2798,40 @@ function App() {
   return (
     <div className="shell" data-ui-text-size={uiTextSize} data-ui-theme={uiTheme} data-runtime-status={runtimeStatus}>
 
+      <header className="shell__header" aria-label="VoxGolem">
+        <div className="shell__identity" data-shell-identity>
+          <strong>VoxGolem</strong>
+          <span data-runtime-phase>Runtime: {runtimeStatus}</span>
+        </div>
+        <div className="shell__header-actions">
+          <button type="button" className="shell__control shell__new-chat" onClick={() => void resetSession()} aria-label="New Chat" disabled={resetPending}>
+            {resetPending ? 'Starting new chat...' : 'New Chat'}
+          </button>
+          <button
+            type="button"
+            className="shell__control shell__theme-button"
+            onClick={toggleUiTheme}
+            aria-label={themeToggleLabel}
+            title={themeToggleLabel}
+          >
+            {uiTheme === 'dark' ? '☀' : '☾'}
+          </button>
+          <button
+            ref={settingsButtonRef}
+            type="button"
+            className="shell__control shell__settings-button"
+            onClick={openSettings}
+            aria-label="Settings"
+            aria-haspopup="dialog"
+            aria-controls={SETTINGS_DIALOG_ID}
+            aria-expanded={settingsOpen}
+            title="Settings"
+          >
+            ⚙
+          </button>
+        </div>
+      </header>
+
       <div className="conversation-region">
         <main
           ref={conversationRef}
@@ -2800,6 +2848,19 @@ function App() {
           ))}
         </main>
 
+        <div
+          className="conversation-notice"
+          onFocus={() => setNoticeInteraction((current) => ({ ...current, focused: true }))}
+          onBlur={(event) => {
+            if (!event.currentTarget.contains(event.relatedTarget)) {
+              setNoticeInteraction((current) => ({ ...current, focused: false }))
+            }
+          }}
+          onMouseEnter={() => setNoticeInteraction((current) => ({ ...current, hovered: true }))}
+          onMouseLeave={() => setNoticeInteraction((current) => ({ ...current, hovered: false }))}
+        >
+          <UserNoticeToast notice={notices[0] ?? null} />
+        </div>
         {showJumpToLatest ? (
           <button type="button" className="conversation__jump" aria-label="Jump to latest" onClick={jumpToLatest}>
             Jump to latest
@@ -2807,9 +2868,10 @@ function App() {
         ) : null}
       </div>
 
-      <UserNoticeToast notice={notices[0] ?? null} />
-      <div className="sr-only" role="status" aria-live="polite" aria-atomic="true" aria-label="Response announcements">
-        {responseAnnouncement}
+      <div className="status-announcer">
+        <div className="sr-only" role="status" aria-live="polite" aria-atomic="true" aria-label="Response announcements">
+          {responseAnnouncement}
+        </div>
       </div>
 
       {settingsOpen ? (
@@ -2842,7 +2904,6 @@ function App() {
                 ×
               </button>
             </div>
-            <button type="button" className="shell__control" onClick={() => void resetSession()} aria-label="Reset Session" disabled={resetPending}>{resetPending ? 'Resetting...' : 'Reset Session'}</button>
             <div className="settings-panel__row">
               <div>
                 <strong>Text size</strong>
@@ -2851,7 +2912,7 @@ function App() {
               <div className="settings-panel__stepper" aria-label="Text size controls">
                 <button
                   type="button"
-                  className="settings-panel__step-button"
+                  className="settings-panel__step-button settings-panel__interactive"
                   onClick={() => adjustUiTextSize(-1)}
                   disabled={!canDecreaseTextSize}
                   aria-label="Decrease text size"
@@ -2863,7 +2924,7 @@ function App() {
                 </span>
                 <button
                   type="button"
-                  className="settings-panel__step-button"
+                  className="settings-panel__step-button settings-panel__interactive"
                   onClick={() => adjustUiTextSize(1)}
                   disabled={!canIncreaseTextSize}
                   aria-label="Increase text size"
@@ -2877,7 +2938,8 @@ function App() {
                 <label htmlFor="audioInputDevice"><strong>Microphone</strong></label>
                 <p className="settings-panel__hint">Choose the input used for wake-word listening.</p>
               </div>
-              <select
+               <select
+                 className="settings-panel__interactive"
                 id="audioInputDevice"
                 aria-label="Microphone"
                 value={audioInputDeviceId ?? ''}
@@ -2885,25 +2947,58 @@ function App() {
                 onChange={(event) => changeAudioInputDevice(event.target.value)}
               >
                 <option value="">System selected microphone</option>
-                {audioInputDevices.map((device) => (
+               {audioInputDevices.map((device) => (
                   <option key={device.deviceId} value={device.deviceId}>{device.label}</option>
-                ))}
-              </select>
+               ))}
+             </select>
+           </div>
+            <div className="settings-panel__row">
+              <div>
+                <strong>Voice input</strong>
+                <p className="settings-panel__hint">Stop listening automatically after silence.</p>
+              </div>
+               <label className="shell__toggle settings-panel__interactive">
+                <input
+                  type="checkbox"
+                  checked={autoStopOnSilence}
+                  onChange={(event) => setAutoStopOnSilence(event.target.checked)}
+                  disabled={!voiceInputReady(startupState)}
+                  aria-describedby={!voiceInputReady(startupState) ? 'voice-input-help' : undefined}
+                />
+                <span>Auto Stop</span>
+              </label>
+              {!voiceInputReady(startupState) ? <span id="voice-input-help" className="sr-only">{voiceInputUnavailableReason}</span> : null}
+            </div>
+            <div className="settings-panel__row">
+              <div>
+                <strong>Speech output</strong>
+                <p className="settings-panel__hint">Read assistant responses aloud.</p>
+              </div>
+               <label className="shell__toggle settings-panel__interactive">
+                <input
+                  id="tts-toggle"
+                  type="checkbox"
+                  checked={ttsEnabled}
+                  disabled={!canToggleTts}
+                  onChange={(event) => { void toggleTts(event.target.checked) }}
+                />
+                <span>TTS</span>
+              </label>
             </div>
             <div className="settings-panel__assistant">
-              <label><strong>Instant</strong><select id="assistantInstantSelect" aria-label="Instant" value={assistantSettings.instant} disabled={assistantControlsDisabled} onChange={(event) => void changeInstant(event.target.value as AssistantSettings['instant'])}>
+               <label className="settings-panel__interactive"><strong>Instant</strong><select id="assistantInstantSelect" aria-label="Instant" value={assistantSettings.instant} disabled={assistantControlsDisabled} onChange={(event) => void changeInstant(event.target.value as AssistantSettings['instant'])}>
                 {instantAssistantOptions.map((option) => <option key={option.value} value={option.value} disabled={!option.available && !localInstantCanRetry(startupState, option.value)} title={option.reason}>{option.label}{option.available ? '' : ` — ${option.reason}`}</option>)}
               </select></label>
-              {selectedInstantRetryable ? <button type="button" aria-label="Retry local profile" onClick={() => void changeInstant(assistantSettings.instant)}>Retry local profile</button> : null}
-              <label><strong>Deep model</strong><select aria-label="Deep model" value={assistantSettings.deep} disabled={assistantControlsDisabled} onChange={(event) => {
+               {selectedInstantRetryable ? <button className="settings-panel__interactive" type="button" aria-label="Retry local profile" onClick={() => void changeInstant(assistantSettings.instant)}>Retry local profile</button> : null}
+               <label className="settings-panel__interactive"><strong>Deep model</strong><select aria-label="Deep model" value={assistantSettings.deep} disabled={assistantControlsDisabled} onChange={(event) => {
                 const value = event.target.value as AssistantSettings['deep']
                 if (deepAssistantOptions.find((option) => option.value === value)?.available) {
                   void persistAssistantSettings({ ...assistantSettingsRef.current, deep: value })
                 }
               }}>
                 {deepAssistantOptions.map((option) => <option key={option.value} value={option.value} disabled={!option.available} title={option.reason}>{option.label}</option>)}
-              </select></label>
-              <label><strong>Review model</strong><select aria-label="Review model" value={assistantSettings.review} disabled={assistantControlsDisabled} onChange={(event) => {
+               </select></label>
+               <label className="settings-panel__interactive"><strong>Review model</strong><select aria-label="Review model" value={assistantSettings.review} disabled={assistantControlsDisabled} onChange={(event) => {
                 const value = event.target.value as AssistantSettings['review']
                 if (reviewAssistantOptions.find((option) => option.value === value)?.available) {
                   void persistAssistantSettings({ ...assistantSettingsRef.current, review: value })
@@ -2911,13 +3006,13 @@ function App() {
               }}>
                 {reviewAssistantOptions.map((option) => <option key={option.value} value={option.value} disabled={!option.available} title={option.reason}>{option.label}</option>)}
               </select></label>
-              <label><input type="checkbox" checked={assistantSettings.deepEnabled} disabled={assistantControlsDisabled || (!assistantSettings.deepEnabled && !canEnableDeep)} onChange={(event) => void persistAssistantSettings({ ...assistantSettingsRef.current, deepEnabled: event.target.checked })} /> Deep</label>
-              <label><input type="checkbox" checked={assistantSettings.reviewEnabled} disabled={assistantControlsDisabled || (!assistantSettings.reviewEnabled && !canEnableReview)} onChange={(event) => void persistAssistantSettings({ ...assistantSettingsRef.current, reviewEnabled: event.target.checked })} /> Review</label>
-              <label><input type="checkbox" checked={assistantSettings.completion} disabled={assistantControlsDisabled} onChange={(event) => {
+               <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.deepEnabled} disabled={assistantControlsDisabled || (!assistantSettings.deepEnabled && !canEnableDeep)} onChange={(event) => void persistAssistantSettings({ ...assistantSettingsRef.current, deepEnabled: event.target.checked })} /> Deep</label>
+               <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.reviewEnabled} disabled={assistantControlsDisabled || (!assistantSettings.reviewEnabled && !canEnableReview)} onChange={(event) => void persistAssistantSettings({ ...assistantSettingsRef.current, reviewEnabled: event.target.checked })} /> Review</label>
+               <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.completion} disabled={assistantControlsDisabled} onChange={(event) => {
                 if (!event.target.checked) clearCompletion()
                 void persistAssistantSettings({ ...assistantSettingsRef.current, completion: event.target.checked })
-              }} /> Completion</label>
-              <label><input type="checkbox" checked={assistantSettings.prefetch} disabled={assistantControlsDisabled} onChange={(event) => void persistAssistantSettings({ ...assistantSettingsRef.current, prefetch: event.target.checked })} /> Prefetch</label>
+               }} /> Completion</label>
+               <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.prefetch} disabled={assistantControlsDisabled} onChange={(event) => void persistAssistantSettings({ ...assistantSettingsRef.current, prefetch: event.target.checked })} /> Prefetch</label>
               <p className="settings-panel__hint">Prefetch may transmit unaccepted predicted text when enabled.</p>
             </div>
             <UpdateSettings updates={appUpdates} />
@@ -2930,7 +3025,8 @@ function App() {
           id="promptComposer"
           className="composer__input"
           aria-label="Prompt"
-          value={composerValue}
+           value={composerValue}
+           typographyRevision={uiTextSize}
           partialTranscript={partialTranscript}
           ghostSuffix={typedCompletionSuffix}
           onChange={(event) => {
@@ -2956,10 +3052,11 @@ function App() {
           onKeyDown={onComposerKeyDown}
           onAcceptCompletion={acceptTypedCompletion}
           onDismissCompletion={() => { clearCompletion() }}
-          partialCompletionSuffix={voiceCompletionSuffix}
-          placeholder="Type a prompt..."
-          rows={3}
-        />
+           partialCompletionSuffix={voiceCompletionSuffix}
+           placeholder="Type a prompt..."
+           rows={2}
+           maxRows={4}
+         />
         {startupState.kind === 'error' ? (
           <p className="shell__error">Startup error: {startupState.message}</p>
         ) : null}
@@ -2981,41 +3078,13 @@ function App() {
         {startupState.kind === 'warming_model' ? (
           <p className="shell__loading">Model loading: {startupState.message}</p>
         ) : null}
-        <div className="composer__actions">
-          <label className="shell__toggle">
-            <input
-              type="checkbox"
-              checked={autoStopOnSilence}
-              onChange={(event) => setAutoStopOnSilence(event.target.checked)}
-              disabled={!voiceInputReady(startupState)}
-              aria-describedby={!voiceInputReady(startupState) ? 'voice-input-help' : undefined}
-            />
-             <span>Auto Stop</span>
-          </label>
-          <label className="shell__toggle" htmlFor="tts-toggle">
-            <input
-              id="tts-toggle"
-              type="checkbox"
-              checked={ttsEnabled}
-              disabled={!canToggleTts}
-              onChange={(event) => {
-                void toggleTts(event.target.checked)
-              }}
-            />
-            <span>TTS</span>
-          </label>
-          <button
-            type="button"
-            className="shell__control"
-            onClick={toggleMic}
-            disabled={!canToggleMic}
-            aria-describedby={!voiceInputReady(startupState) ? 'voice-input-help' : undefined}
-          >
-            {micStarting ? 'Starting mic...' : micActive ? 'Stop mic' : 'Start mic'}
-          </button>
-          {!voiceInputReady(startupState) ? (
-            <span id="voice-input-help" className="sr-only">{voiceInputUnavailableReason}</span>
-          ) : null}
+          <div className="composer__actions">
+            <span className="composer__model"><span className="composer__model-prefix">Active model:</span> {selectedInstantOption?.label ?? assistantSettings.instant}</span>
+           {voiceInputReady(startupState) ? (
+             <button type="button" className="shell__control" onClick={toggleMic} disabled={!canToggleMic}>
+               {micStarting ? 'Starting mic...' : micActive ? 'Stop mic' : 'Start mic'}
+             </button>
+           ) : null}
           <div className="composer__send-side">
             {(promptState === 'executing' || promptState === 'stopping') &&
             startupState.kind === 'ready' &&
@@ -3034,28 +3103,6 @@ function App() {
                 <span className="composer__wake-primary">wake: {(wakeConfidence * 100).toFixed(2)}%</span>
               </div>
             ) : null}
-            <button
-              type="button"
-              className="shell__control shell__theme-button"
-              onClick={toggleUiTheme}
-              aria-label={themeToggleLabel}
-              title={themeToggleLabel}
-            >
-              {uiTheme === 'dark' ? '☀' : '☾'}
-            </button>
-            <button
-              ref={settingsButtonRef}
-              type="button"
-              className="shell__control shell__settings-button"
-              onClick={openSettings}
-              aria-label="Settings"
-              aria-haspopup="dialog"
-              aria-controls={SETTINGS_DIALOG_ID}
-              aria-expanded={settingsOpen}
-              title="Settings"
-            >
-              ⚙
-            </button>
             <button type="submit" className="composer__button" disabled={!canSend}>
               Send
             </button>

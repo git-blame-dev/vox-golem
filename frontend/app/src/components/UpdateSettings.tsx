@@ -34,7 +34,7 @@ function updatePresentation(updates: AppUpdateController): {
 } {
   const { state } = updates
   const action = (label: string, run: () => Promise<void>): JSX.Element => (
-    <button type="button" className="shell__control" onClick={() => void run()}>{label}</button>
+    <button type="button" className="shell__control settings-panel__interactive" onClick={() => void run()}>{label}</button>
   )
 
   if (state.kind === 'checking') return { status: 'Checking...', action: null, pending: true }
