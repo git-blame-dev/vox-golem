@@ -5,6 +5,27 @@ import {
   isTauri,
 } from '@tauri-apps/api/core'
 import { listen as tauriListen } from '@tauri-apps/api/event'
+import type { AppSnapshot, ValidatedPreferences } from './appSnapshot'
+import { utf8ByteLength } from './wire'
+const ANDROID_CAPABILITY_IDS = ['custom_provider', 'opencode', 'local_fast', 'local_quality', 'qwen_prediction', 'wake_word', 'vad', 'parakeet', 'tts', 'deep', 'review'] as const
+const COMMAND_ERROR_CODES = ['invalid_input', 'not_found', 'busy', 'unavailable', 'internal'] as const
+type CommandErrorCode = typeof COMMAND_ERROR_CODES[number]
+
+export class TauriCommandError extends Error {
+  readonly code: CommandErrorCode
+
+  constructor(code: CommandErrorCode, message: string) {
+    const validCode = COMMAND_ERROR_CODES.includes(code) ? code : 'internal'
+    const validMessage = message.length > 0 && utf8ByteLength(message) <= 512 ? message : 'Native command failed'
+    super(validMessage)
+    this.name = 'TauriCommandError'
+    this.code = validCode
+  }
+}
+
+function androidCommandError(code: CommandErrorCode, message: string): TauriCommandError {
+  return new TauriCommandError(code, message)
+}
 
 export interface TauriEvent {
   readonly payload: unknown
@@ -44,7 +65,7 @@ export function getTauriInternals(): TauriInternals | null {
     tauriInternals &&
     typeof tauriInternals.invoke === 'function'
   ) {
-    return tauriInternals
+    return withoutAndroidEventListener(tauriInternals, isAndroidRuntime)
   }
 
   if (!isTauri()) {
@@ -55,24 +76,147 @@ export function getTauriInternals(): TauriInternals | null {
 }
 
 function createTauriApi(): TauriInternals {
-  return {
+  return withoutAndroidEventListener({
     invoke: (command, args) => tauriInvoke(command, args as Parameters<typeof tauriInvoke>[1]),
     convertFileSrc: tauriConvertFileSrc,
     listen: (event, handler) => tauriListen(event, handler),
     createChannel: <T>(handler: (message: T) => void) => new tauriChannel(handler),
-  }
+  }, isAndroidRuntime)
+}
+
+export function withoutAndroidEventListener(internals: TauriInternals, android: boolean): TauriInternals {
+  if (!android) return internals
+  const withoutListener = { ...internals }
+  delete withoutListener.listen
+  return withoutListener
 }
 
 export function hasInjectedTauriInternals(): boolean {
   return typeof window !== 'undefined' && typeof window.__TAURI_INTERNALS__?.invoke === 'function'
 }
 
+export const isAndroidRuntime = import.meta.env['VITE_VOXGOLEM_RUNTIME'] === 'android'
+
+let androidSnapshot: AppSnapshot | null = null
+
+export function cacheAndroidSnapshot(snapshot: AppSnapshot): void {
+  androidSnapshot = snapshot
+}
+
+export function getCachedAndroidPreferences(): ValidatedPreferences | null {
+  return androidSnapshot?.preferences ?? null
+}
+
+export function setCachedAndroidPreferences(preferences: ValidatedPreferences): void {
+  if (androidSnapshot !== null) androidSnapshot = { ...androidSnapshot, preferences }
+}
+
+export function buildAndroidStartupState(snapshot: AppSnapshot): Record<string, unknown> {
+  const capabilities = new Map(snapshot.capabilities.map((capability) => [capability.id, capability]))
+  return {
+    kind: 'ready', cue_asset_paths: { start_listening: 'resources/start-listening.wav', stop_listening: 'resources/stop-listening.wav' },
+    runtime_phase: snapshot.runtimePhase, voice_input_available: false, voice_input_error: 'Voice input is unavailable on Android',
+    silence_timeout_ms: 1500, selected_response_profile: snapshot.preferences.responseProfile, supported_response_profiles: [],
+    prompt_cancellation_available: snapshot.activeRequest !== null, tts_enabled: false, tts_output_gain_db: 3,
+    capabilities: ANDROID_CAPABILITY_IDS.map((id) => {
+      const capability = capabilities.get(id)
+      return capability === undefined
+        ? { id, state: 'not_configured', reason: 'Unavailable on Android zero-asset runtime', actual_provider: null }
+        : { id, state: capability.state, reason: capability.reason, actual_provider: capability.actualProvider }
+    }),
+  }
+}
+
 export async function invokeTauriCommand(command: string, args?: unknown): Promise<unknown> {
+  if (isAndroidRuntime) return invokeAndroidCommand(command, args)
   if (hasInjectedTauriInternals()) {
     return window.__TAURI_INTERNALS__!.invoke(command, args)
   }
 
   return tauriInvoke(command, args as Parameters<typeof tauriInvoke>[1])
+}
+
+export async function invokeAndroidCommand(command: string, args?: unknown): Promise<unknown> {
+  const nativeInvoke = getTauriInternals()?.invoke ?? ((name: string, payload?: unknown) => tauriInvoke(name, payload as Parameters<typeof tauriInvoke>[1]))
+  const invoke = async (name: string, payload?: unknown): Promise<unknown> => {
+    try { return await nativeInvoke(name, payload) } catch (error) { throw normalizeTauriError(error) }
+  }
+  if (command === 'get_app_snapshot') {
+    const snapshot = await invoke(command, args)
+    const { parseAppSnapshot } = await import('./appSnapshot')
+    let parsed: AppSnapshot
+    try { parsed = parseAppSnapshot(snapshot) } catch { throw androidCommandError('internal', 'Android runtime returned an invalid snapshot') }
+    cacheAndroidSnapshot(parsed)
+    return snapshot
+  }
+  if (command === 'get_startup_state') {
+    let snapshot = androidSnapshot
+    if (snapshot === null) snapshot = await import('./appSnapshot').then(({ loadAppSnapshot }) => loadAppSnapshot())
+    if (snapshot === null) throw androidCommandError('internal', 'Android snapshot hydration failed')
+    return buildAndroidStartupState(snapshot)
+  }
+  if (command === 'set_preferences') {
+    const result = await invoke(command, args)
+    const { parseValidatedPreferences } = await import('./appSnapshot')
+    let preferences: ValidatedPreferences
+    try { preferences = parseValidatedPreferences(result) } catch { throw androidCommandError('internal', 'Android runtime returned invalid preferences') }
+    setCachedAndroidPreferences(preferences)
+    return result
+  }
+  if (command === 'get_ui_theme' || command === 'get_ui_text_size' || command === 'get_assistant_settings') {
+    const preferences = androidSnapshot?.preferences
+    if (preferences === null || preferences === undefined) throw androidCommandError('internal', 'Android preferences are not hydrated')
+    if (command === 'get_ui_theme') return preferences.uiTheme
+    if (command === 'get_ui_text_size') return preferences.uiTextSize
+    return { instant: preferences.instant, deep: preferences.deep, review: preferences.review, deep_enabled: preferences.deepEnabled, review_enabled: preferences.reviewEnabled, prefetch: preferences.prefetch, completion: preferences.completion }
+  }
+  if (command === 'clear_completion' || command === 'request_completion' || command === 'record_frontend_runtime_diagnostic') return null
+  if (command === 'check_for_update' || command === 'install_update' || command === 'restart_for_update' || command === 'synthesize_local_tts') throw androidCommandError('unavailable', 'Command is unavailable on Android')
+  if (command === 'set_ui_theme' || command === 'set_ui_text_size' || command === 'set_assistant_settings' || command === 'switch_response_profile' || command === 'set_tts_enabled') {
+    const current = androidSnapshot?.preferences
+    if (current === null || current === undefined) throw androidCommandError('internal', 'Android preferences are not hydrated')
+    const proposal = androidPreferenceProposal(command, args, current)
+    const result = await invokeAndroidCommand('set_preferences', { preferences: proposal })
+    const persisted = androidSnapshot?.preferences
+    if (persisted === null || persisted === undefined) throw androidCommandError('internal', 'Android preferences were not published')
+    if (command === 'set_ui_theme') return persisted.uiTheme
+    if (command === 'set_ui_text_size') return persisted.uiTextSize
+    if (command === 'set_assistant_settings') return { instant: persisted.instant, deep: persisted.deep, review: persisted.review, deep_enabled: persisted.deepEnabled, review_enabled: persisted.reviewEnabled, prefetch: persisted.prefetch, completion: persisted.completion }
+    if (command === 'set_tts_enabled') return { enabled: persisted.ttsEnabled }
+    return result
+  }
+  if (command === 'cancel_prompt' || command === 'reset_session' || command === 'submit_prompt') {
+    const result = await invoke(command, args)
+    if (command === 'reset_session') {
+      const { parseAppSnapshot } = await import('./appSnapshot')
+      let snapshot: AppSnapshot
+      try { snapshot = parseAppSnapshot(result) } catch { throw androidCommandError('internal', 'Android runtime returned an invalid reset snapshot') }
+      cacheAndroidSnapshot(snapshot)
+      return result
+    }
+    return result
+  }
+  throw androidCommandError('unavailable', 'Command is unavailable on Android')
+}
+
+export function androidPreferenceProposal(command: string, args: unknown, current: ValidatedPreferences): Record<string, unknown> {
+  const value = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>
+  const settings = value['settings'] as Record<string, unknown> | undefined
+  const next = { ...current, ...(command === 'set_ui_theme' ? { uiTheme: value['theme'] } : {}), ...(command === 'set_ui_text_size' ? { uiTextSize: value['textSize'] } : {}), ...(command === 'switch_response_profile' ? { responseProfile: value['profile'] } : {}), ...(command === 'set_tts_enabled' ? { ttsEnabled: value['enabled'] } : {}), ...(command === 'set_assistant_settings' && settings ? { instant: settings['instant'], deep: settings['deep'], review: settings['review'], deepEnabled: settings['deep_enabled'], reviewEnabled: settings['review_enabled'], prefetch: settings['prefetch'], completion: settings['completion'] } : {}) }
+  return { instant: next.instant, deep: next.deep, review: next.review, deep_enabled: next.deepEnabled, review_enabled: next.reviewEnabled, prefetch: next.prefetch, completion: next.completion, response_profile: next.responseProfile, tts_enabled: next.ttsEnabled, ui_theme: next.uiTheme, ui_text_size: next.uiTextSize }
+}
+
+export function normalizeTauriError(error: unknown): TauriCommandError {
+  if (error instanceof TauriCommandError) return androidCommandError(error.code, error.message)
+  if (typeof error === 'object' && error !== null) {
+    const payload = error as Record<string, unknown>
+    const code = payload['code']
+    const message = payload['message']
+    if (COMMAND_ERROR_CODES.includes(code as CommandErrorCode) && typeof message === 'string' && message.length > 0 && utf8ByteLength(message) <= 512) {
+      return androidCommandError(code as CommandErrorCode, message)
+    }
+  }
+  return androidCommandError('internal', 'Native command failed')
 }
 
 export function convertTauriFileSrc(filePath: string): string | null {

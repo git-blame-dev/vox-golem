@@ -39,6 +39,7 @@ function updatePresentation(updates: AppUpdateController): {
 
   if (state.kind === 'checking') return { status: 'Checking...', action: null, pending: true }
   if (state.kind === 'browser') return { status: 'Available in the packaged app', action: null }
+  if (state.kind === 'unsupported') return { status: state.reason, action: null }
   if (state.kind === 'error') {
     const retry = state.operation === 'check'
       ? updates.check

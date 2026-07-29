@@ -249,6 +249,15 @@ describe('executePrompt', () => {
     expect(events).toEqual([{ requestId: 'request-1', kind: 'text', text: 'OpenCode response' }])
   })
 
+  it('preserves desktop Channel rejection details', async () => {
+    window.__TAURI_INTERNALS__ = {
+      createChannel: () => 'channel',
+      invoke: async () => { throw 'provider unavailable' },
+    }
+
+    await expect(executePrompt('request-1', 'Draft release notes', () => undefined)).rejects.toBe('provider unavailable')
+  })
+
   it('requires streaming listener support', async () => {
     window.__TAURI_INTERNALS__ = { invoke: async () => null }
 

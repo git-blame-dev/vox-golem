@@ -5044,6 +5044,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vox-golem-android"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "voxgolem-core",
+]
+
+[[package]]
 name = "voxgolem-audio"
 version = "0.0.0"
 

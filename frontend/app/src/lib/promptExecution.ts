@@ -1,10 +1,56 @@
-import { getTauriInternals } from './tauri'
+import { TauriCommandError, getTauriInternals, isAndroidRuntime, normalizeTauriError } from './tauri'
+import { parseCanonicalTurn } from './appSnapshot'
 import { isRecord, parseRuntimePhase, utf8ByteLength } from './wire'
 import type {
   PromptExecutionEvent,
   PromptExecutionResult,
 } from '../types/chat'
 import type { AnswerSource } from '../components/AnswerStage'
+
+export function parseAndroidPromptUpdate(payload: unknown, requestId: string): PromptExecutionEvent {
+  if (!isRecord(payload) || typeof payload['kind'] !== 'string') throw new Error('Android prompt update must include kind')
+  const kind = payload['kind']
+  if (kind === 'delta') {
+    if (typeof payload['text'] !== 'string' || utf8ByteLength(payload['text']) > 256 * 1024) throw new Error('Android delta must include bounded text')
+    return { requestId, kind: 'text', text: payload['text'] }
+  }
+  if (kind === 'stage') {
+    if (!isStage(payload['stage']) || !isStageStatus(payload['status']) || (payload['detail'] !== undefined && payload['detail'] !== null && (typeof payload['detail'] !== 'string' || utf8ByteLength(payload['detail']) > 512))) throw new Error('Android stage update is invalid')
+    return { requestId, kind: 'stage', stage: payload['stage'], status: payload['status'], ...(typeof payload['detail'] === 'string' ? { detail: payload['detail'] } : {}) }
+  }
+  if (kind === 'correction') {
+    if (!isStage(payload['stage']) || typeof payload['text'] !== 'string' || utf8ByteLength(payload['text']) > 256 * 1024 || typeof payload['correction'] !== 'string' || payload['correction'].trim() === '' || utf8ByteLength(payload['correction']) > 512) throw new Error('Android correction update is invalid')
+    return { requestId, kind: 'correction', stage: payload['stage'], text: payload['text'], correction: payload['correction'] }
+  }
+  if (kind === 'status') {
+    if (typeof payload['message'] !== 'string' || utf8ByteLength(payload['message']) > 512) throw new Error('Android status update is invalid')
+    return { requestId, kind: 'status', message: payload['message'] }
+  }
+  throw new Error('Android prompt update kind is unsupported')
+}
+
+export function parseAndroidPromptOutcome(payload: unknown, requestId: string): PromptExecutionResult {
+  if (!isRecord(payload) || (payload['kind'] !== 'completed' && payload['kind'] !== 'refused' && payload['kind'] !== 'cancelled')) throw new Error('Android prompt outcome is invalid')
+  if (payload['kind'] === 'cancelled') {
+    if (Object.prototype.hasOwnProperty.call(payload, 'turn')) throw new Error('Cancelled Android prompt outcome must not include a turn')
+    return { requestId, runtimePhase: 'sleeping', outcome: 'cancelled', errorMessage: null, canonicalOutcome: 'cancelled' }
+  }
+  const turn = parseCanonicalTurn(payload['turn'])
+  if (turn.requestId !== requestId) throw new Error('Android prompt outcome request ID did not match the active request')
+  if (payload['kind'] === 'completed' && turn.answer.content.kind !== 'text') throw new Error('Completed Android prompt outcome must contain a text answer')
+  if (payload['kind'] === 'refused' && turn.answer.content.kind !== 'refusal') throw new Error('Refused Android prompt outcome must contain a refusal answer')
+  return { requestId, runtimePhase: 'sleeping', outcome: 'completed', errorMessage: null, canonicalOutcome: payload['kind'], canonicalTurn: turn }
+}
+
+export function parseAndroidPromptOutcomeForExecution(payload: unknown, requestId: string): PromptExecutionResult {
+  try { return parseAndroidPromptOutcome(payload, requestId) } catch (error) { throw normalizeTauriError(error) }
+}
+
+export function missingPromptStreamingSupportError(android: boolean): Error {
+  return android
+    ? new TauriCommandError('internal', 'Prompt execution requires Channel support')
+    : new Error('Prompt execution requires streaming listener support')
+}
 
 export function parsePromptExecutionEvent(payload: unknown): PromptExecutionEvent {
   if (!isRecord(payload)) {
@@ -138,6 +184,10 @@ export async function executePrompt(
   if (tauri.createChannel !== undefined) {
     const updates = tauri.createChannel<unknown>((payload) => {
       try {
+        if (isAndroidRuntime) {
+          onEvent(parseAndroidPromptUpdate(payload, requestId))
+          return
+        }
         if (!isRecord(payload) || 'request_id' in payload) return
         const parsed = parsePromptExecutionEvent({ ...payload, request_id: requestId })
         if (parsed.kind !== 'completed' && parsed.kind !== 'cancelled') onEvent(parsed)
@@ -146,15 +196,28 @@ export async function executePrompt(
       }
     })
 
-    const payload = await tauri.invoke('submit_prompt', { requestId, prompt, source, updates })
-    const result = parsePromptExecutionResult(payload)
+    let payload: unknown
+    try {
+      payload = await tauri.invoke('submit_prompt', isAndroidRuntime ? { requestId, prompt, updates } : { requestId, prompt, source, updates })
+    } catch (error) {
+      if (isAndroidRuntime) throw normalizeTauriError(error)
+      throw error
+    }
+    let result: PromptExecutionResult
+    if (isAndroidRuntime) {
+      result = parseAndroidPromptOutcomeForExecution(payload, requestId)
+    } else {
+      result = parsePromptExecutionResult(payload)
+    }
     if (result.requestId !== requestId) {
       throw new Error('Prompt response request ID did not match the active request')
     }
     return result
   }
 
-  if (tauri.listen === undefined) throw new Error('Prompt execution requires streaming listener support')
+  if (tauri.listen === undefined) {
+    throw missingPromptStreamingSupportError(isAndroidRuntime)
+  }
 
   const unlisten = await tauri.listen('prompt-execution-event', (event) => {
     try {

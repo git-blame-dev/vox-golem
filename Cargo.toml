@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "apps/android-tauri/src-tauri",
   "apps/desktop-tauri/src-tauri",
   "crates/audio",
   "crates/core",

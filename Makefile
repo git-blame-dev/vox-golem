@@ -87,7 +87,7 @@ LINUX_ORT_PROVIDER_LIBS := \
 
 .DEFAULT_GOAL := help
 
-.PHONY: help app-version test test-release-tools check-linux-tools app app-smoke packaged-smoke app-dev linux dist verify-dist update-bundle verify-update-bundle update-bundle-smoke check-pc-tools pc pc-dist verify-pc-dist clean
+.PHONY: help app-version test test-release-tools check-linux-tools app app-smoke packaged-smoke app-dev linux dist verify-dist update-bundle verify-update-bundle update-bundle-smoke check-pc-tools pc pc-dist verify-pc-dist check-android-tools android-init android-build clean
 
 help:
 	@printf '%s\n' 'Targets:'
@@ -102,6 +102,8 @@ help:
 	@printf '%s\n' '  make update-bundle Build the generated-version Linux AppImage update bundle'
 	@printf '%s\n' '  make pc       Cross-build the optional Windows app from Linux'
 	@printf '%s\n' '  make pc-dist  Stage optional Windows files under dist/VoxGolem-windows'
+	@printf '%s\n' '  make android-init  Generate the pinned Android Tauri platform shell'
+	@printf '%s\n' '  make android-build Build the arm64 Android debug APK'
 	@printf '%s\n' '  make clean    Remove generated build and staging output'
 
 app-version:
@@ -122,6 +124,18 @@ test:
 test-release-tools:
 	@command -v jq >/dev/null || { printf '%s\n' 'Missing jq.' >&2; exit 1; }
 	bash scripts/test-release-tools.sh
+
+check-android-tools:
+	@command -v cargo >/dev/null || { printf '%s\n' 'Missing Cargo.' >&2; exit 1; }
+	@cargo tauri --version 2>&1 | grep -Fxq 'tauri-cli 2.11.1' || { printf '%s\n' 'Tauri CLI 2.11.1 is required. Install with: cargo install tauri-cli --version 2.11.1 --locked' >&2; exit 1; }
+
+android-init: check-android-tools
+	@cargo tauri icon '$(CURDIR)/apps/desktop-tauri/src-tauri/icons/icon.png' --output '$(CURDIR)/apps/android-tauri/src-tauri/icons'
+	@cd apps/android-tauri/src-tauri && cargo tauri android init --ci
+	@cargo tauri icon '$(CURDIR)/apps/desktop-tauri/src-tauri/icons/icon.png' --output '$(CURDIR)/apps/android-tauri/src-tauri/icons'
+
+android-build: check-android-tools
+	@cd apps/android-tauri/src-tauri && cargo tauri android build --debug --target aarch64 --apk --ci
 
 check-linux-tools:
 	@command -v cargo-tauri >/dev/null || { printf '%s\n' 'Missing Tauri CLI. Install with: cargo install tauri-cli --version 2.11.1 --locked' >&2; exit 1; }

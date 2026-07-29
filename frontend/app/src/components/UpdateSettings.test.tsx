@@ -213,6 +213,28 @@ describe('UpdateSettings', () => {
     })
     expect(invoke.mock.calls.filter(([command]) => command === 'restart_for_update')).toHaveLength(2)
   })
+
+  it('presents intentionally unsupported Android updates without Retry', async () => {
+    const container = document.createElement('div')
+    document.body.append(container)
+    containers.push(container)
+    const root = createRoot(container)
+    roots.push(root)
+    const check = vi.fn(async () => undefined)
+    await act(async () => {
+      root.render(<UpdateSettings updates={{
+        state: { kind: 'unsupported', reason: 'Desktop updates are not available on Android' },
+        check,
+        install: vi.fn(async () => undefined),
+        restart: vi.fn(async () => undefined),
+      }} />)
+    })
+
+    expect(container.textContent).toContain('Desktop updates are not available on Android')
+    expect(container.querySelector('[role="alert"]')).toBeNull()
+    expect(Array.from(container.querySelectorAll('button')).some(({ textContent }) => textContent === 'Retry')).toBe(false)
+    expect(check).not.toHaveBeenCalled()
+  })
 })
 
 async function renderUpdates(): Promise<HTMLElement> {
