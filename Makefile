@@ -305,7 +305,7 @@ pc: check-pc-tools $(ESPEAK_COMPAT_HEADER) $(STDCXX_IMPORT_LIB) $(DIRECTML_IMPOR
 	VOXGOLEM_ESPEAK_COMPAT_HEADER='$(ESPEAK_COMPAT_HEADER)' \
 	CMAKE_GENERATOR=Ninja \
 	RUSTFLAGS="$${RUSTFLAGS:+$${RUSTFLAGS} }-L native=$(IMPORT_LIB_DIR)" \
-	cargo tauri build --runner cargo-xwin --target $(WINDOWS_TARGET) --no-bundle -- --locked
+	cargo tauri build --runner cargo-xwin --target $(WINDOWS_TARGET) --no-bundle --config '{"bundle":{"resources":[]}}' -- --locked
 	@printf 'Windows app: %s\n' '$(WINDOWS_RELEASE_DIR)/vox-golem.exe'
 
 pc-dist: pc
