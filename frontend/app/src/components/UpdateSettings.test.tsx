@@ -33,7 +33,7 @@ describe('UpdateSettings', () => {
     window.__TAURI_INTERNALS__ = { invoke }
 
     const container = await renderUpdates()
-    expect(container.textContent).toContain('Update available')
+    expect(container.textContent).toContain('Update 2026.7.27-12 available')
     expect(container.textContent).not.toContain('You have')
     expect(container.textContent).not.toContain('Signed Linux AppImage updates')
     expect(container.querySelectorAll('.settings-panel__update-row')).toHaveLength(1)
@@ -113,7 +113,7 @@ describe('UpdateSettings', () => {
 
     const container = await renderUpdates(true)
     expect(getButton(container, 'Install and restart').disabled).toBe(true)
-    expect(container.textContent).toContain('Finish active work before installing')
+    expect(container.textContent).toContain('Update 2026.7.27-12 available. Finish active work before installing.')
   })
 
   it('preserves an in-flight install when settings closes and does not check twice', async () => {

@@ -63,7 +63,9 @@ function resultPresentation(
   if (result.status === 'available') {
     const label = result.installBehavior === 'install_and_restart' ? 'Install and restart' : 'Install update'
     return {
-      status: installationDisabled ? 'Update available. Finish active work before installing.' : 'Update available',
+      status: installationDisabled
+        ? `Update ${result.version} available. Finish active work before installing.`
+        : `Update ${result.version} available`,
       action: action(label, () => updates.install(result.version, result.installBehavior), installationDisabled),
     }
   }
