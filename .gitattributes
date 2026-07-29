@@ -1,0 +1,3 @@
+apps/android-tauri/src-tauri/gen/android/build.gradle.kts -whitespace
+apps/android-tauri/src-tauri/gen/android/buildSrc/build.gradle.kts -whitespace
+apps/android-tauri/src-tauri/gen/android/buildSrc/src/main/java/dev/gitblame/voxgolem/android/kotlin/BuildTask.kt -whitespace
