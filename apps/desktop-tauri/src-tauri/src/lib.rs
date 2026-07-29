@@ -7646,6 +7646,80 @@ fn load_persisted_state() -> Result<PersistedState, String> {
     parse_persisted_state(&contents)
 }
 
+fn lock_persisted_state_file(state_path: &Path) -> std::io::Result<File> {
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(state_path.with_extension("lock"))?;
+    lock_file.lock()?;
+    Ok(lock_file)
+}
+
+fn is_persisted_state_temp(file_name: &std::ffi::OsStr, state_path: &Path) -> bool {
+    let prefix_path = state_path.with_extension("tmp-");
+    let Some(prefix) = prefix_path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(file_name) = file_name.to_str() else {
+        return false;
+    };
+    let Some(pid) = file_name.strip_prefix(prefix) else {
+        return false;
+    };
+    !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn cleanup_orphan_state_temps() -> Result<(), String> {
+    cleanup_orphan_state_temps_with(|| {})
+}
+
+fn cleanup_orphan_state_temps_with(before_lock: impl FnOnce()) -> Result<(), String> {
+    let state_path = response_profile_state_path()?;
+    let Some(parent) = state_path.parent() else {
+        return Ok(());
+    };
+    before_lock();
+    let _lock = match lock_persisted_state_file(&state_path) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "failed to lock persisted state {}: {error}",
+                state_path.display()
+            ));
+        }
+    };
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect persisted state directory {}: {error}",
+                parent.display()
+            ));
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to inspect persisted state directory {}: {error}",
+                parent.display()
+            )
+        })?;
+        if is_persisted_state_temp(&entry.file_name(), &state_path) {
+            fs::remove_file(entry.path()).map_err(|error| {
+                format!(
+                    "failed to remove orphan persisted state temporary {}: {error}",
+                    entry.path().display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn persist_state(state: PersistedState) -> Result<(), String> {
     let state_path = response_profile_state_path()?;
     if let Some(parent) = state_path.parent() {
@@ -7702,6 +7776,7 @@ fn persist_state(state: PersistedState) -> Result<(), String> {
 }
 
 fn atomic_replace_state_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let _lock = lock_persisted_state_file(path)?;
     let temporary_path = path.with_extension(format!("tmp-{}", std::process::id()));
     let result = File::create(&temporary_path)
         .and_then(|mut file| {
@@ -8349,6 +8424,9 @@ fn initialize_app_state(init: AppStateInit) -> AppState {
 fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
     let fallback_voice_pipeline_config = default_voice_pipeline_config();
     let cue_asset_paths = embedded_cue_asset_paths();
+    if let Err(error) = cleanup_orphan_state_temps() {
+        eprintln!("failed to clean persisted state temporaries: {error}");
+    }
 
     match voxgolem_core::config::load_runtime_config(None) {
         Ok(config) => {
@@ -9999,6 +10077,7 @@ fn configure_linux_microphone_permission(app: &mut tauri::App) -> tauri::Result<
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::fs;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
 
@@ -10007,17 +10086,18 @@ mod tests {
         assistant_completion_enabled, atomic_replace_state_file, bounded_capability_reason,
         bounded_provider_history, build_ipc_app_snapshot, build_mark_silence_response,
         build_nonfatal_config_error_app_state, build_startup_error_app_state,
-        claim_cancelled_prompt_publication, cleanup_sequential, clear_active_prompt,
-        clear_completion_request_state_locked, current_runtime_phase_response,
+        claim_cancelled_prompt_publication, cleanup_orphan_state_temps_with, cleanup_sequential,
+        clear_active_prompt, clear_completion_request_state_locked, current_runtime_phase_response,
         current_silence_deadline, default_response_profile, default_voice_pipeline_config,
         ensure_app_running, ensure_assistant_settings_available,
         fit_review_history_to_prompt_budget, get_app_snapshot_from_state,
         ingest_audio_frame_with_optional_wake_word_detection, initial_stage_sequence,
         invalidate_runtime_startups_for_exit, load_llama_cpp_system_prompt, load_persisted_state,
         load_persisted_tts_enabled, load_persisted_ui_text_size, load_persisted_ui_theme,
-        lock_live_settings_operation, lock_ready_response_backend_operation,
-        merge_profile_startup_publication, model_path_for_profile, parse_deep_agent_json,
-        parse_persisted_state, parse_review_agent_json, persist_assistant_settings,
+        lock_live_settings_operation, lock_persisted_state_file,
+        lock_ready_response_backend_operation, merge_profile_startup_publication,
+        model_path_for_profile, parse_deep_agent_json, parse_persisted_state,
+        parse_review_agent_json, persist_assistant_settings,
         persist_prepared_local_instant_model_with, persist_selected_response_profile,
         persist_tts_enabled, persist_ui_text_size, persist_ui_theme,
         prepare_local_instant_model_with, process_wake_word_frame, race_durable_cancellation,
@@ -13082,6 +13162,62 @@ mod tests {
             Some(ResponseProfilePayload::Quality)
         );
         assert_eq!(persisted.assistant_settings, Some(settings));
+    }
+
+    #[test]
+    fn startup_cleanup_removes_only_recognized_orphan_state_temps() {
+        let _appdata_lock = APPDATA_ENV_LOCK
+            .lock()
+            .expect("APPDATA test lock should not be poisoned");
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let previous_appdata = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", temp_dir.path());
+        let state_dir = temp_dir.path().join("VoxGolem");
+        fs::create_dir_all(&state_dir).expect("state directory");
+        let canonical = state_dir.join("state.toml");
+        let orphan = state_dir.join("state.tmp-1234");
+        let unrelated = state_dir.join("other.tmp-1234");
+        let near_misses = [
+            state_dir.join("state.tmp-"),
+            state_dir.join("state.tmp-backup"),
+            state_dir.join("state.tmp-1234.bak"),
+        ];
+        fs::write(&canonical, b"ui_theme = \"dark\"\n").expect("canonical fixture");
+        fs::write(&orphan, b"partial").expect("orphan fixture");
+        fs::write(&unrelated, b"keep").expect("unrelated fixture");
+        for path in &near_misses {
+            fs::write(path, b"keep").expect("near-miss fixture");
+        }
+
+        let state_lock = lock_persisted_state_file(&canonical).expect("state lock");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (cleanup_tx, cleanup_rx) = std::sync::mpsc::channel();
+        let cleanup = std::thread::spawn(move || {
+            cleanup_tx
+                .send(cleanup_orphan_state_temps_with(|| {
+                    started_tx.send(()).expect("cleanup started");
+                }))
+                .expect("cleanup result");
+        });
+        started_rx
+            .recv()
+            .expect("cleanup should reach lock boundary");
+        assert!(cleanup_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(state_lock);
+        cleanup_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cleanup result")
+            .expect("orphan cleanup should succeed");
+        cleanup.join().expect("cleanup worker");
+
+        match previous_appdata {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+        assert!(canonical.is_file());
+        assert!(!orphan.exists());
+        assert!(unrelated.is_file());
+        assert!(near_misses.iter().all(|path| path.is_file()));
     }
 
     #[test]
