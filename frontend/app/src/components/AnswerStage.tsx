@@ -56,30 +56,33 @@ function PlainText({ children }: { readonly children: string }): ReactNode {
 
 export function AnswerStage({ answer, contentKind = 'text', stages, priorVersions = [], sources = [], className }: AnswerStageProps) {
   const rootClassName = className === undefined ? 'answer-stage' : `answer-stage ${className}`
+  const stageDetails = stages.filter(({ detail }) => typeof detail === 'string' && detail.trim() !== '')
+  const hasDetails = sources.length > 0 || stageDetails.length > 0 || priorVersions.length > 0
 
   return (
     <section className={rootClassName} aria-label={contentKind === 'refusal' ? 'Assistant refusal' : 'Current answer'} data-content-kind={contentKind}>
       <h2>{contentKind === 'refusal' ? 'Assistant refusal' : 'Current answer'}</h2>
       <p className="answer-stage__answer"><PlainText>{answer}</PlainText></p>
-      {sources.length === 0 ? null : <ul className="answer-stage__sources" aria-label="Sources">
-        {sources.map((source) => <li key={source.url}><a href={source.url} target="_blank" rel="noreferrer">{source.title}</a></li>)}
-      </ul>}
-
       <ul className="answer-stage__statuses" aria-label="Answer stage status">
-        {stages.map(({ stage, status, detail }) => (
-          <li key={stage} data-stage={stage} data-status={status}>
+         {stages.map(({ stage, status }, index) => (
+           <li key={`${stage}-${status}-${index}`} data-stage={stage} data-status={status}>
             <span>{stageLabels[stage]}</span>
             <span aria-label={`${stageLabels[stage]} status: ${statusLabels[status]}`}>
               {statusLabels[status]}
             </span>
-            {detail === undefined ? null : <span> — <PlainText>{detail}</PlainText></span>}
           </li>
         ))}
       </ul>
 
-      {priorVersions.length === 0 ? null : (
-        <details className="answer-stage__history">
-          <summary>Prior answer versions ({priorVersions.length})</summary>
+      {hasDetails ? <details className="answer-stage__details">
+        <summary>Details</summary>
+        {sources.length === 0 ? null : <ul className="answer-stage__sources" aria-label="Sources">
+          {sources.map((source, index) => <li key={`${source.url}-${index}`}><a href={source.url} target="_blank" rel="noreferrer">{source.title}</a></li>)}
+        </ul>}
+         {stageDetails.length === 0 ? null : <section aria-label="Stage details">
+           {stageDetails.map(({ stage, status, detail }, index) => <p key={`${stage}-${status}-${index}`}><strong>{stageLabels[stage]} ({statusLabels[status]}):</strong> <PlainText>{detail ?? ''}</PlainText></p>)}
+        </section>}
+        {priorVersions.length === 0 ? null : <section aria-label="Prior answer versions">
           <ol>
             {priorVersions.map(({ id, text, label }) => (
               <li key={id}>
@@ -88,8 +91,8 @@ export function AnswerStage({ answer, contentKind = 'text', stages, priorVersion
               </li>
             ))}
           </ol>
-        </details>
-      )}
+        </section>}
+      </details> : null}
     </section>
   )
 }

@@ -12,6 +12,7 @@ afterEach(() => {
   for (const container of containers) container.remove()
   roots.length = 0
   containers.length = 0
+  vi.restoreAllMocks()
 })
 
 function render(props: Parameters<typeof PromptComposer>[0]) {
@@ -28,7 +29,73 @@ function textarea(container: HTMLElement) {
   return container.querySelector('textarea') as HTMLTextAreaElement
 }
 
+function setMetrics(input: HTMLTextAreaElement, scrollHeight: number) {
+  vi.spyOn(window, 'getComputedStyle').mockReturnValue({
+    lineHeight: '20px',
+    paddingTop: '4px',
+    paddingBottom: '4px',
+    borderTopWidth: '1px',
+    borderBottomWidth: '1px',
+  } as CSSStyleDeclaration)
+  Object.defineProperty(input, 'scrollHeight', { configurable: true, value: scrollHeight })
+}
+
 describe('PromptComposer', () => {
+  it('starts at two lines, grows to four, caps, and shrinks without moving selection', () => {
+    vi.spyOn(window, 'getComputedStyle').mockReturnValue({
+      lineHeight: '20px',
+      paddingTop: '4px',
+      paddingBottom: '4px',
+      borderTopWidth: '1px',
+      borderBottomWidth: '1px',
+    } as CSSStyleDeclaration)
+    const container = render({ value: 'draft', maxRows: 4 })
+    const input = textarea(container)
+    setMetrics(input, 42)
+    act(() => roots[0]!.render(<PromptComposer onChange={() => undefined} value="draft" maxRows={4} />))
+    expect(input.style.height).toBe('50px')
+
+    Object.defineProperty(input, 'scrollHeight', { configurable: true, value: 62 })
+    act(() => roots[0]!.render(<PromptComposer onChange={() => undefined} value="draft changed" maxRows={4} />))
+    expect(input.style.height).toBe('64px')
+    expect(input.style.overflowY).toBe('hidden')
+
+    Object.defineProperty(input, 'scrollHeight', { configurable: true, value: 88 })
+    act(() => window.dispatchEvent(new Event('resize')))
+    expect(input.style.height).toBe('90px')
+    expect(input.style.overflowY).toBe('hidden')
+
+    Object.defineProperty(input, 'scrollHeight', { configurable: true, value: 142 })
+    input.setSelectionRange(2, 4)
+    act(() => window.dispatchEvent(new Event('resize')))
+    expect(input.style.height).toBe('90px')
+    expect(input.style.overflowY).toBe('auto')
+    expect(input.selectionStart).toBe(2)
+    expect(input.selectionEnd).toBe(4)
+
+    Object.defineProperty(input, 'scrollHeight', { configurable: true, value: 22 })
+    act(() => roots[0]!.render(<PromptComposer onChange={() => undefined} value="draft" maxRows={4} />))
+    expect(input.style.height).toBe('50px')
+    expect(input.style.overflowY).toBe('hidden')
+  })
+
+  it('remeasures when typography changes without losing the draft or selection', () => {
+    const container = render({ value: 'draft text', maxRows: 4, typographyRevision: 'medium' })
+    const input = textarea(container)
+    setMetrics(input, 142)
+    input.setSelectionRange(2, 6)
+    act(() => roots[0]!.render(<PromptComposer onChange={() => undefined} value="draft text" maxRows={4} typographyRevision="large" />))
+    expect(input.value).toBe('draft text')
+    expect(input.selectionStart).toBe(2)
+    expect(input.selectionEnd).toBe(6)
+    expect(input.style.height).toBe('90px')
+  })
+
+  it('does nothing when browser metrics are unavailable', () => {
+    const container = render({ value: 'draft', maxRows: 4 })
+    expect(textarea(container).style.height).toBe('')
+  })
+
   it('keeps the ghost suffix out of the controlled textarea value', () => {
     const container = render({ value: 'draft', ghostSuffix: ' completion', 'aria-label': 'Prompt' })
     expect(textarea(container).value).toBe('draft')
@@ -88,6 +155,22 @@ describe('PromptComposer', () => {
     input.setSelectionRange(0, 5)
     act(() => input.dispatchEvent(new Event('select', { bubbles: true })))
     expect(container.querySelector('[aria-hidden="true"]')).toBeNull()
+  })
+
+  it('hides capped ghost text while scrolled and preserves scroll callbacks and draft selection', () => {
+    const dismiss = vi.fn()
+    const onScroll = vi.fn()
+    const container = render({ value: 'line one\nline two\nline three', ghostSuffix: ' completion', maxRows: 2, onDismissCompletion: dismiss, onScroll })
+    const input = textarea(container)
+    setMetrics(input, 100)
+    input.setSelectionRange(input.value.length, input.value.length)
+    input.scrollTop = 20
+    act(() => input.dispatchEvent(new Event('scroll', { bubbles: true })))
+    expect(container.querySelector('.prompt-composer__ghost')).toBeNull()
+    expect(onScroll).toHaveBeenCalledOnce()
+    expect(dismiss).toHaveBeenCalledOnce()
+    expect(input.value).toBe('line one\nline two\nline three')
+    expect(input.selectionStart).toBe(input.value.length)
   })
 
   it('announces partial transcripts and keeps the visual ghost decorative', () => {
