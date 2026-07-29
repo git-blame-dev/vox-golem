@@ -4686,7 +4686,7 @@ fn ingest_audio_frame(
     app: tauri::AppHandle,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<RuntimePhaseResponsePayload, String> {
-    let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
+    let update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
     ensure_startup_ready_for_prompt(&app_state.startup_state)?;
     let backend_ingest_started_ms = current_time_ms()?;
     let mut guard = app_state
@@ -4781,6 +4781,7 @@ fn ingest_audio_frame(
             Arc::clone(parakeet_runtime),
             Arc::clone(&app_state.partial_transcription),
             app_state.voice_pipeline_config.sample_rate_hz(),
+            update_guard,
         );
     }
 
@@ -4793,15 +4794,14 @@ fn spawn_partial_transcription(
     parakeet_runtime: Arc<Mutex<transcription::ParakeetRuntime>>,
     scheduler: Arc<Mutex<partial_transcription::PartialTranscriptionScheduler>>,
     sample_rate_hz: u32,
+    update_guard: tokio::sync::OwnedRwLockReadGuard<()>,
 ) {
-    if !matches!(
-        action,
-        partial_transcription::PartialTranscriptionAction::StartSnapshot { .. }
-    ) {
+    let Some(update_guard) = partial_transcription_worker_guard(&action, update_guard) else {
         return;
-    }
+    };
 
     tauri::async_runtime::spawn(async move {
+        let _update_guard = update_guard;
         let mut next_action = action;
         while let partial_transcription::PartialTranscriptionAction::StartSnapshot {
             session_id,
@@ -4895,6 +4895,17 @@ fn spawn_partial_transcription(
             }
         }
     });
+}
+
+fn partial_transcription_worker_guard(
+    action: &partial_transcription::PartialTranscriptionAction,
+    update_guard: tokio::sync::OwnedRwLockReadGuard<()>,
+) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+    matches!(
+        action,
+        partial_transcription::PartialTranscriptionAction::StartSnapshot { .. }
+    )
+    .then_some(update_guard)
 }
 
 #[tauri::command]
@@ -8472,17 +8483,19 @@ mod tests {
         load_llama_cpp_system_prompt, load_persisted_state, load_persisted_tts_enabled,
         load_persisted_ui_text_size, load_persisted_ui_theme, model_path_for_profile,
         parse_deep_agent_json, parse_persisted_state, parse_review_agent_json,
-        persist_assistant_settings, persist_selected_response_profile, persist_tts_enabled,
-        persist_ui_text_size, persist_ui_theme, process_wake_word_frame, race_durable_cancellation,
-        register_active_prompt, register_tts_playback, reset_voice_pipeline_to_waiting,
-        reset_wake_word_runtime, resolve_effective_tts_enabled, response_profile_state_path,
-        runtime_log_path, runtime_phase_response_from_state, shutdown_llama_cpp_runtime_for_exit,
-        supported_response_profiles, synchronize_local_instant_model_with,
-        take_and_invalidate_prefetch, to_runtime_phase_payload, transcribe_finished_utterance,
-        transcription_ready_samples, update_installation_busy_reason,
-        update_restored_profile_capabilities, validate_prompt_request_id, validate_prompt_text,
-        wake_word_event_timestamp, ActivePromptGuard, AgentChoicePayload, AssistantSettingsPayload,
-        CapabilityPayload, CapabilityStatePayload, CueAssetPathsPayload, DeepStageResult, DeepTask,
+        partial_transcription_worker_guard, persist_assistant_settings,
+        persist_selected_response_profile, persist_tts_enabled, persist_ui_text_size,
+        persist_ui_theme, process_wake_word_frame, race_durable_cancellation,
+        register_active_prompt, register_tts_playback, reset_runtime_session,
+        reset_voice_pipeline_to_waiting, reset_wake_word_runtime, resolve_effective_tts_enabled,
+        response_profile_state_path, runtime_log_path, runtime_phase_response_from_state,
+        shutdown_llama_cpp_runtime_for_exit, supported_response_profiles,
+        synchronize_local_instant_model_with, take_and_invalidate_prefetch,
+        to_runtime_phase_payload, transcribe_finished_utterance, transcription_ready_samples,
+        update_installation_busy_reason, update_restored_profile_capabilities,
+        validate_prompt_request_id, validate_prompt_text, wake_word_event_timestamp,
+        ActivePromptGuard, AgentChoicePayload, AssistantSettingsPayload, CapabilityPayload,
+        CapabilityStatePayload, CueAssetPathsPayload, DeepStageResult, DeepTask,
         InstantChoicePayload, PrefetchEntry, PrefetchKey, PromptEventEnvelope,
         PromptExecutionEventPayload, ResponseProfilePayload, RuntimePhasePayload,
         RuntimePhaseResponsePayload, RuntimeTelemetryPayload, StagePayload, StageStatusPayload,
@@ -8638,6 +8651,35 @@ mod tests {
         assert!(ensure_update_installation_is_idle(&app_state).is_err());
         finish_tts_playback_state(&app_state.tts_playback, 3).expect("finish current playback");
         assert!(ensure_update_installation_is_idle(&app_state).is_ok());
+    }
+
+    #[test]
+    fn partial_transcription_guard_survives_reset_and_excludes_installation() {
+        let app_state = build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            CueAssetPathsPayload {
+                start_listening: String::from("start"),
+                stop_listening: String::from("stop"),
+            },
+            String::from("test startup"),
+        );
+        let command_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)
+            .expect("begin ingest command");
+        let action = super::partial_transcription::PartialTranscriptionAction::StartSnapshot {
+            session_id: 1,
+            revision: 1,
+            samples: vec![0.0],
+        };
+        let worker_guard = partial_transcription_worker_guard(&action, command_guard)
+            .expect("handoff partial transcription guard");
+
+        reset_runtime_session(&app_state).expect("reset while worker remains active");
+        assert!(begin_update_installation(&app_state).is_err());
+        drop(worker_guard);
+
+        let installation = begin_update_installation(&app_state).expect("begin installation");
+        assert!(begin_update_sensitive_operation(&app_state.update_installation_gate).is_err());
+        drop(installation);
     }
 
     #[test]
