@@ -12,7 +12,7 @@ import { shouldSubmitComposer } from './lib/composer'
 import { listAudioInputDevices, startLiveAudioSource } from './lib/liveAudioSource'
 import type { AudioInputDevice, LiveAudioSource } from './lib/liveAudioSource'
 import { executePrompt } from './lib/promptExecution'
-import { loadAppSnapshot } from './lib/appSnapshot'
+import { appendCanonicalTurn, canonicalExecutionKey, isExpectedCanonicalTurn, loadAppSnapshot } from './lib/appSnapshot'
 import type { AppSnapshot, Capability, ModelOption, Turn, ValidatedPreferences } from './lib/appSnapshot'
 import {
   ingestAudioFrame,
@@ -45,6 +45,7 @@ import { firstNonEmptyCompletedLine, firstNonEmptyStreamingLine, isValidTtsFirst
 import type {
   BackendRuntimePhase,
   ChatMessage,
+  PromptExecutionResult,
   RuntimeControlResult,
   ResponseProfile,
   RuntimeStatus,
@@ -1751,12 +1752,7 @@ function App() {
         setPromptActivity(event.message)
       }
     }
-    let result: {
-      readonly requestId: string
-      readonly runtimePhase: BackendRuntimePhase | null
-      readonly outcome: 'completed' | 'cancelled' | 'error'
-      readonly errorMessage: string | null
-    }
+    let result: PromptExecutionResult
     let commandRejected = false
     try {
       result = await executePrompt(requestId, prompt, handleEvent, source)
@@ -1788,6 +1784,20 @@ function App() {
       ) {
         return
       }
+      const acceptedCanonicalTurn = result.canonicalTurn !== undefined && isExpectedCanonicalTurn(
+        result.canonicalTurn,
+        requestId,
+        expectedCanonicalSessionId,
+        priorCanonicalExecutions,
+      ) ? result.canonicalTurn : undefined
+      if (result.canonicalTurn !== undefined && acceptedCanonicalTurn === undefined) {
+        result = {
+          requestId: result.requestId,
+          runtimePhase: result.runtimePhase,
+          outcome: 'error',
+          errorMessage: 'The returned response did not match the active execution.',
+        }
+      }
       if (result.outcome !== 'completed') cancelTts()
       if (result.outcome === 'completed') {
         flushPromptProjection(active)
@@ -1815,7 +1825,7 @@ function App() {
           (message) => message.id !== active.userId && message.id !== active.assistantId,
         ))
       }
-      let reconciledTurn: Turn | undefined
+      let reconciledTurn: Turn | undefined = acceptedCanonicalTurn
       let reconciledRuntimePhase: BackendRuntimePhase | null = null
       let reconciledRuntimeActivityRevision: number | null = null
       if (snapshotHydrationStateRef.current === 'succeeded') {
@@ -1841,19 +1851,28 @@ function App() {
         }
         if (!appActiveRef.current || promptRef.current !== active || resetPendingRef.current || transcriptRevision !== transcriptRevisionRef.current) return
         if (snapshot === null) {
-          setPromptActivity('Session recovery required. Use New Chat to retry.')
-          return
+          if (acceptedCanonicalTurn === undefined) {
+            setPromptActivity('Session recovery required. Use New Chat to retry.')
+            return
+          }
+          const transcript = appendCanonicalTurn(canonicalTranscriptRef.current, acceptedCanonicalTurn)
+          setMessages((current) => replaceCommittedTranscript(current, transcript))
+          canonicalTranscriptRef.current = transcript
+          snapshotSessionIdRef.current = acceptedCanonicalTurn.executionId.sessionId
+        } else {
+          const snapshotTurn = findNewTurnForRequest(
+            snapshot.transcript,
+            requestId,
+            expectedCanonicalSessionId,
+            priorCanonicalExecutions,
+          )
+          reconciledTurn = snapshotTurn ?? acceptedCanonicalTurn
+          const transcript = appendCanonicalTurn(snapshot.transcript, snapshotTurn === undefined ? acceptedCanonicalTurn : undefined)
+          setMessages((current) => replaceCommittedTranscript(current, transcript))
+          canonicalTranscriptRef.current = transcript
+          snapshotSessionIdRef.current = snapshot.sessionId
+          reconciledRuntimePhase = snapshot.runtimePhase
         }
-        setMessages((current) => replaceCommittedTranscript(current, snapshot.transcript))
-        reconciledTurn = findNewTurnForRequest(
-          snapshot.transcript,
-          requestId,
-          expectedCanonicalSessionId,
-          priorCanonicalExecutions,
-        )
-        canonicalTranscriptRef.current = snapshot.transcript
-        snapshotSessionIdRef.current = snapshot.sessionId
-        reconciledRuntimePhase = snapshot.runtimePhase
       }
       promptRef.current = null
       setPromptState('idle')
@@ -3008,7 +3027,7 @@ function App() {
               </select></label>
                <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.deepEnabled} disabled={assistantControlsDisabled || (!assistantSettings.deepEnabled && !canEnableDeep)} onChange={(event) => void persistAssistantSettings({ ...assistantSettingsRef.current, deepEnabled: event.target.checked })} /> Deep</label>
                <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.reviewEnabled} disabled={assistantControlsDisabled || (!assistantSettings.reviewEnabled && !canEnableReview)} onChange={(event) => void persistAssistantSettings({ ...assistantSettingsRef.current, reviewEnabled: event.target.checked })} /> Review</label>
-               <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.completion} disabled={assistantControlsDisabled} onChange={(event) => {
+               <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.completion} disabled={assistantControlsDisabled || (!assistantSettings.completion && !assistantCapabilities.qwenPrediction)} onChange={(event) => {
                 if (!event.target.checked) clearCompletion()
                 void persistAssistantSettings({ ...assistantSettingsRef.current, completion: event.target.checked })
                }} /> Completion</label>
@@ -3256,9 +3275,7 @@ function findNewTurnForRequest(
   for (let index = transcript.length - 1; index >= 0; index -= 1) {
     const turn = transcript[index]
     if (
-      turn?.requestId === requestId &&
-      turn.executionId.sessionId === expectedSessionId &&
-      !priorExecutions.has(executionKey(turn))
+      turn !== undefined && isExpectedCanonicalTurn(turn, requestId, expectedSessionId, priorExecutions)
     ) {
       return turn
     }
@@ -3267,7 +3284,7 @@ function findNewTurnForRequest(
 }
 
 function executionKey(turn: Turn): string {
-  return `${turn.executionId.sessionId}:${turn.executionId.generation}`
+  return canonicalExecutionKey(turn)
 }
 
 function capabilityIsAvailable(

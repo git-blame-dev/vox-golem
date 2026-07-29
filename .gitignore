@@ -1,5 +1,8 @@
 target/
 apps/desktop-tauri/src-tauri/gen/
+apps/android-tauri/src-tauri/gen/schemas/
+apps/android-tauri/src-tauri/icons/*
+!apps/android-tauri/src-tauri/icons/icon.png
 .deps/
 package/
 

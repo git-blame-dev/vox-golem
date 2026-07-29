@@ -8,6 +8,10 @@ const CAPABILITY_ID_MAX_BYTES = 64
 const MODEL_ID_MAX_BYTES = 128
 const LABEL_MAX_BYTES = 128
 const DISPLAY_TEXT_MAX_BYTES = 512
+const REQUEST_ID_MAX_BYTES = 128
+const PROMPT_MAX_BYTES = 32 * 1024
+const COMMITTED_TURN_MAX_COUNT = 20
+const COMMITTED_TEXT_MAX_BYTES = 256 * 1024
 const stages = ['instant', 'deep', 'review'] as const
 const capabilityStates = ['available', 'warming', 'not_configured', 'unavailable', 'failed'] as const
 const instantChoices: readonly InstantChoice[] = ['local-fast', 'local-quality', 'custom-sol-high', 'custom-luna-low', 'opencode-sol-high', 'opencode-luna-low']
@@ -91,10 +95,14 @@ export function parseAppSnapshot(payload: unknown): AppSnapshot {
   rejectDuplicateIds(capabilities, 'capability')
   const modelOptions = Array.from(payload['model_options'], parseModelOption)
   rejectDuplicateIds(modelOptions, 'model option')
+  const transcript = Array.from(payload['transcript'], parseCanonicalTurn)
+  if (transcript.length > COMMITTED_TURN_MAX_COUNT || transcriptTextBytes(transcript) > COMMITTED_TEXT_MAX_BYTES) {
+    throw new Error('App snapshot transcript exceeds canonical history bounds')
+  }
   return {
     sessionId: parseWireId(payload['session_id'], 'session_id'),
     runtimePhase: parseRuntimePhase(payload['runtime_phase'], 'runtime_phase'),
-    transcript: Array.from(payload['transcript'], parseTurn),
+    transcript,
     activeRequest: payload['active_request'] === null ? null : parseActiveRequest(payload['active_request']),
     capabilities,
     modelOptions,
@@ -104,6 +112,29 @@ export function parseAppSnapshot(payload: unknown): AppSnapshot {
 
 export async function loadAppSnapshot(): Promise<AppSnapshot> {
   return parseAppSnapshot(await invokeTauriCommand('get_app_snapshot'))
+}
+
+export function appendCanonicalTurn(transcript: readonly Turn[], turn: Turn | undefined): readonly Turn[] {
+  if (turn === undefined || transcript.some(({ executionId }) =>
+    executionId.sessionId === turn.executionId.sessionId && executionId.generation === turn.executionId.generation)) {
+    return transcript
+  }
+  const next = [...transcript, turn]
+  while (next.length > COMMITTED_TURN_MAX_COUNT || transcriptTextBytes(next) > COMMITTED_TEXT_MAX_BYTES) next.shift()
+  return next
+}
+
+export function canonicalExecutionKey(turn: Turn): string {
+  return `${turn.executionId.sessionId}:${turn.executionId.generation}`
+}
+
+export function isExpectedCanonicalTurn(
+  turn: Turn,
+  requestId: string,
+  expectedSessionId: string | null,
+  priorExecutions: ReadonlySet<string>,
+): boolean {
+  return expectedSessionId !== null && turn.requestId === requestId && turn.executionId.sessionId === expectedSessionId && !priorExecutions.has(canonicalExecutionKey(turn))
 }
 
 function parseWireId(value: unknown, field: string): WireId {
@@ -132,12 +163,14 @@ function parseMessage(value: unknown): Message {
   return { id: parseWireId(value['id'], 'message.id'), role: value['role'], content: parseContent(value['content']) }
 }
 
-function parseTurn(value: unknown): Turn {
-  if (!isRecord(value) || typeof value['request_id'] !== 'string' || value['request_id'].length === 0) throw new Error('turn must include request_id')
+export function parseCanonicalTurn(value: unknown): Turn {
+  if (!isRecord(value) || typeof value['request_id'] !== 'string' || value['request_id'].length === 0 || utf8ByteLength(value['request_id']) > REQUEST_ID_MAX_BYTES) throw new Error('turn must include a bounded request_id')
   const user = parseMessage(value['user'])
   const answer = parseMessage(value['answer'])
   if (user.role !== 'user') throw new Error('turn must include the user role')
   if (answer.role !== 'assistant') throw new Error('turn must include the assistant role')
+  if (user.content.kind !== 'text' || user.content.text.trim().length === 0 || utf8ByteLength(user.content.text) > PROMPT_MAX_BYTES) throw new Error('turn user content must be a bounded prompt')
+  if (utf8ByteLength(user.content.text) + utf8ByteLength(answer.content.text) > COMMITTED_TEXT_MAX_BYTES) throw new Error('turn content exceeds canonical history bounds')
   return {
     requestId: value['request_id'],
     executionId: parseExecutionId(value['execution_id']),
@@ -147,9 +180,13 @@ function parseTurn(value: unknown): Turn {
   }
 }
 
+function transcriptTextBytes(transcript: readonly Turn[]): number {
+  return transcript.reduce((total, turn) => total + utf8ByteLength(turn.user.content.text) + utf8ByteLength(turn.answer.content.text), 0)
+}
+
 function parseActiveRequest(value: unknown): ActiveRequestSummary {
-  if (!isRecord(value) || typeof value['request_id'] !== 'string' || value['request_id'].length === 0 || typeof value['prompt'] !== 'string') {
-    throw new Error('active_request must include request_id and prompt')
+  if (!isRecord(value) || typeof value['request_id'] !== 'string' || value['request_id'].length === 0 || utf8ByteLength(value['request_id']) > REQUEST_ID_MAX_BYTES || typeof value['prompt'] !== 'string' || value['prompt'].trim().length === 0 || utf8ByteLength(value['prompt']) > PROMPT_MAX_BYTES) {
+    throw new Error('active_request must include a bounded request_id and prompt')
   }
   return { executionId: parseExecutionId(value['execution_id']), requestId: value['request_id'], prompt: value['prompt'] }
 }
@@ -176,7 +213,7 @@ function parseModelOption(value: unknown): ModelOption {
   }
 }
 
-function parsePreferences(value: unknown): ValidatedPreferences {
+export function parseValidatedPreferences(value: unknown): ValidatedPreferences {
   if (!isRecord(value)) throw new Error('preferences must be an object')
   const instant = value['instant']; const deep = value['deep']; const review = value['review']
   if (!instantChoices.includes(instant as InstantChoice)) throw new Error('preferences instant is invalid')
@@ -195,6 +232,8 @@ function parsePreferences(value: unknown): ValidatedPreferences {
     responseProfile, ttsEnabled: value['tts_enabled'] as boolean, uiTheme, uiTextSize,
   }
 }
+
+const parsePreferences = parseValidatedPreferences
 
 function parseStage(value: unknown): Stage {
   if (stages.includes(value as Stage)) return value as Stage
