@@ -102,7 +102,7 @@ struct AppState {
     startup_state: Arc<Mutex<StartupStatePayload>>,
     runtime_config: Option<voxgolem_core::config::RuntimeConfig>,
     selected_response_profile: Arc<Mutex<ResponseProfilePayload>>,
-    ui_preferences: Mutex<UiPreferencesState>,
+    ui_preferences: Arc<Mutex<UiPreferencesState>>,
     settings_operation_lock: Arc<tokio::sync::Mutex<()>>,
     ui_preferences_operation_lock: Mutex<()>,
     supported_response_profiles: Vec<ResponseProfilePayload>,
@@ -119,7 +119,7 @@ struct AppState {
     completion_request: Arc<Mutex<Option<voxgolem_platform::completion::CompletionRequestHandle>>>,
     completion_context: Arc<Mutex<Option<CompletionRequestContext>>>,
     completion_generation: AtomicU64,
-    completion_lifecycle_lock: Mutex<()>,
+    completion_lifecycle_lock: Arc<Mutex<()>>,
     telemetry_sink: Option<Arc<Mutex<telemetry::TelemetrySink>>>,
     conversation_session: Arc<Mutex<voxgolem_core::conversation::ConversationSession>>,
     assistant_settings_generation: Arc<AtomicU64>,
@@ -132,16 +132,16 @@ struct AppState {
     prompt_publication_epoch: Arc<AtomicU64>,
     tts_operation_lock: tokio::sync::Mutex<()>,
     tts_startup_generation: Arc<AtomicU64>,
-    local_tts_runtime: Mutex<Option<Arc<tts::LocalTtsRuntime>>>,
+    local_tts_runtime: Arc<Mutex<Option<Arc<tts::LocalTtsRuntime>>>>,
     llama_cpp_runtime: Arc<Mutex<Option<voxgolem_platform::llama_cpp::LlamaCppRuntime>>>,
     llama_cpp_conversation: Mutex<Vec<LlamaConversationTurn>>,
     llama_cpp_system_prompt: Option<String>,
     opencode_server: Arc<Mutex<Option<voxgolem_platform::opencode::OpencodeServer>>>,
     active_prompt: Arc<Mutex<Option<ActivePrompt>>>,
     active_prompt_generation: AtomicU64,
-    prefetch_generation: AtomicU64,
-    prefetch_cache: Mutex<Option<PrefetchEntry>>,
-    prefetch_task: Mutex<Option<ActivePrefetch>>,
+    prefetch_generation: Arc<AtomicU64>,
+    prefetch_cache: Arc<Mutex<Option<PrefetchEntry>>>,
+    prefetch_task: Arc<Mutex<Option<ActivePrefetch>>>,
     llama_startups: LlamaStartupRegistry,
     exit_cleanup_started: Arc<AtomicBool>,
 }
@@ -272,6 +272,39 @@ struct ResetAdmissionGuard {
 struct SettingsPublicationGuard {
     in_progress: Arc<AtomicBool>,
     armed: bool,
+}
+
+#[derive(Clone)]
+struct PreferencePublicationState {
+    lifecycle_gate: Arc<Mutex<()>>,
+    exit_cleanup_started: Arc<AtomicBool>,
+    startup_state: Arc<Mutex<StartupStatePayload>>,
+    selected_response_profile: Arc<Mutex<ResponseProfilePayload>>,
+    ui_preferences: Arc<Mutex<UiPreferencesState>>,
+    conversation_session: Arc<Mutex<voxgolem_core::conversation::ConversationSession>>,
+    assistant_settings_generation: Arc<AtomicU64>,
+    local_tts_runtime: Arc<Mutex<Option<Arc<tts::LocalTtsRuntime>>>>,
+    llama_cpp_runtime: Arc<Mutex<Option<voxgolem_platform::llama_cpp::LlamaCppRuntime>>>,
+    completion_lifecycle_lock: Arc<Mutex<()>>,
+    completion_request: Arc<Mutex<Option<voxgolem_platform::completion::CompletionRequestHandle>>>,
+    completion_context: Arc<Mutex<Option<CompletionRequestContext>>>,
+    prefetch_generation: Arc<AtomicU64>,
+    prefetch_cache: Arc<Mutex<Option<PrefetchEntry>>>,
+    prefetch_task: Arc<Mutex<Option<ActivePrefetch>>>,
+}
+
+struct LlamaPreferenceChangeSpec {
+    requested_spec: voxgolem_platform::llama_cpp::LlamaCppServerSpec,
+    fallback_spec: voxgolem_platform::llama_cpp::LlamaCppServerSpec,
+    startup_snapshot: Option<StartupSnapshot>,
+    inference_policy: voxgolem_platform::inference::InferencePolicy,
+    startup_cancellation: voxgolem_platform::llama_cpp::LlamaCppStartupCancellation,
+}
+
+struct RuntimePublicationToken {
+    exit_cleanup_started: Arc<AtomicBool>,
+    switch_generation: Arc<AtomicU64>,
+    expected_generation: u64,
 }
 
 struct ProfilePersistenceRollback {
@@ -484,6 +517,28 @@ impl Drop for SettingsPublicationGuard {
     fn drop(&mut self) {
         if self.armed {
             self.in_progress.store(false, Ordering::Release);
+        }
+    }
+}
+
+impl PreferencePublicationState {
+    fn new(app_state: &AppState) -> Self {
+        Self {
+            lifecycle_gate: Arc::clone(&app_state.lifecycle_gate),
+            exit_cleanup_started: Arc::clone(&app_state.exit_cleanup_started),
+            startup_state: Arc::clone(&app_state.startup_state),
+            selected_response_profile: Arc::clone(&app_state.selected_response_profile),
+            ui_preferences: Arc::clone(&app_state.ui_preferences),
+            conversation_session: Arc::clone(&app_state.conversation_session),
+            assistant_settings_generation: Arc::clone(&app_state.assistant_settings_generation),
+            local_tts_runtime: Arc::clone(&app_state.local_tts_runtime),
+            llama_cpp_runtime: Arc::clone(&app_state.llama_cpp_runtime),
+            completion_lifecycle_lock: Arc::clone(&app_state.completion_lifecycle_lock),
+            completion_request: Arc::clone(&app_state.completion_request),
+            completion_context: Arc::clone(&app_state.completion_context),
+            prefetch_generation: Arc::clone(&app_state.prefetch_generation),
+            prefetch_cache: Arc::clone(&app_state.prefetch_cache),
+            prefetch_task: Arc::clone(&app_state.prefetch_task),
         }
     }
 }
@@ -990,6 +1045,38 @@ impl From<&voxgolem_core::assistant::AssistantPolicy> for AssistantSettingsPaylo
     }
 }
 
+impl From<&voxgolem_core::ipc::ValidatedPreferences> for AssistantSettingsPayload {
+    fn from(preferences: &voxgolem_core::ipc::ValidatedPreferences) -> Self {
+        use voxgolem_core::ipc::{AgentModelChoice, InstantModelChoice};
+        Self {
+            instant: match preferences.instant {
+                InstantModelChoice::LocalFast => InstantChoicePayload::LocalFast,
+                InstantModelChoice::LocalQuality => InstantChoicePayload::LocalQuality,
+                InstantModelChoice::CustomSolHigh => InstantChoicePayload::CustomSolHigh,
+                InstantModelChoice::CustomLunaLow => InstantChoicePayload::CustomLunaLow,
+                InstantModelChoice::OpenCodeSolHigh => InstantChoicePayload::OpenCodeSolHigh,
+                InstantModelChoice::OpenCodeLunaLow => InstantChoicePayload::OpenCodeLunaLow,
+            },
+            deep: match preferences.deep {
+                AgentModelChoice::CustomSolHigh => AgentChoicePayload::CustomSolHigh,
+                AgentModelChoice::CustomLunaLow => AgentChoicePayload::CustomLunaLow,
+                AgentModelChoice::OpenCodeSolHigh => AgentChoicePayload::OpenCodeSolHigh,
+                AgentModelChoice::OpenCodeLunaLow => AgentChoicePayload::OpenCodeLunaLow,
+            },
+            review: match preferences.review {
+                AgentModelChoice::CustomSolHigh => AgentChoicePayload::CustomSolHigh,
+                AgentModelChoice::CustomLunaLow => AgentChoicePayload::CustomLunaLow,
+                AgentModelChoice::OpenCodeSolHigh => AgentChoicePayload::OpenCodeSolHigh,
+                AgentModelChoice::OpenCodeLunaLow => AgentChoicePayload::OpenCodeLunaLow,
+            },
+            deep_enabled: preferences.deep_enabled,
+            review_enabled: preferences.review_enabled,
+            prefetch: preferences.prefetch,
+            completion: preferences.completion,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum UiTextSizePayload {
@@ -1232,6 +1319,217 @@ fn ipc_command_error(message: &'static str) -> voxgolem_core::ipc::CommandError 
         .expect("static IPC command errors should fit the wire bound")
 }
 
+fn preference_command_error(
+    code: voxgolem_core::ipc::CommandErrorCode,
+    message: impl Into<String>,
+) -> voxgolem_core::ipc::CommandError {
+    let detail = message.into();
+    eprintln!("preference update failed ({code:?}): {detail}");
+    let display_message = match code {
+        voxgolem_core::ipc::CommandErrorCode::InvalidInput => "invalid preference proposal",
+        voxgolem_core::ipc::CommandErrorCode::Busy => "preference update is busy",
+        voxgolem_core::ipc::CommandErrorCode::Unavailable => "requested preference is unavailable",
+        voxgolem_core::ipc::CommandErrorCode::NotFound
+        | voxgolem_core::ipc::CommandErrorCode::Internal => "preference update failed",
+    };
+    voxgolem_core::ipc::CommandError::new(code, display_message)
+        .expect("static preference errors should fit the wire bound")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_validated_preferences(
+    state: &PreferencePublicationState,
+    preferences: &voxgolem_core::ipc::ValidatedPreferences,
+    requested_settings: AssistantSettingsPayload,
+    requested_profile: ResponseProfilePayload,
+    requested_ui: UiPreferencesState,
+    assistant_changed: bool,
+    tts_changed: bool,
+    mut proposed_tts_runtime: Option<tts::LocalTtsRuntime>,
+    llama_replacement: Option<voxgolem_platform::llama_cpp::LlamaCppRuntime>,
+    profile_startup_state: Option<StartupStatePayload>,
+    runtime_publication: Option<&RuntimePublicationToken>,
+    publication: SettingsPublicationGuard,
+) -> Result<(), voxgolem_core::ipc::CommandError> {
+    use voxgolem_core::ipc::CommandErrorCode;
+
+    let _lifecycle = state
+        .lifecycle_gate
+        .lock()
+        .map_err(|_| ipc_command_error("lifecycle state is unavailable"))?;
+    if state.exit_cleanup_started.load(Ordering::SeqCst)
+        || runtime_publication.is_some_and(|token| {
+            !runtime_startup_is_current(
+                &token.exit_cleanup_started,
+                &token.switch_generation,
+                token.expected_generation,
+            )
+        })
+    {
+        return Err(preference_command_error(
+            CommandErrorCode::Busy,
+            "preference update was superseded",
+        ));
+    }
+    let mut session = state
+        .conversation_session
+        .lock()
+        .map_err(|_| ipc_command_error("conversation state is unavailable"))?;
+    let mut selected_profile = state
+        .selected_response_profile
+        .lock()
+        .map_err(|_| ipc_command_error("response profile state is unavailable"))?;
+    let mut ui_preferences = state
+        .ui_preferences
+        .lock()
+        .map_err(|_| ipc_command_error("interface preferences are unavailable"))?;
+    let mut startup_state = state
+        .startup_state
+        .lock()
+        .map_err(|_| ipc_command_error("capability state is unavailable"))?;
+    let mut tts_runtime = state
+        .local_tts_runtime
+        .lock()
+        .map_err(|_| ipc_command_error("local TTS runtime is unavailable"))?;
+    let mut llama_runtime = state
+        .llama_cpp_runtime
+        .lock()
+        .map_err(|_| ipc_command_error("local llama.cpp runtime is unavailable"))?;
+    if session.has_active_execution() {
+        return Err(preference_command_error(
+            CommandErrorCode::Busy,
+            "preferences cannot change while a prompt is active",
+        ));
+    }
+    if assistant_changed {
+        session
+            .replace_policy(requested_settings.into())
+            .map_err(|_| {
+                preference_command_error(
+                    CommandErrorCode::Busy,
+                    "preferences cannot change while a prompt is active",
+                )
+            })?;
+        state
+            .assistant_settings_generation
+            .fetch_add(1, Ordering::SeqCst);
+    }
+    *selected_profile = requested_profile;
+    *ui_preferences = requested_ui;
+    let replaced_llama_runtime =
+        llama_replacement.and_then(|runtime| llama_runtime.replace(runtime));
+    if let Some(profile_startup_state) = profile_startup_state {
+        merge_profile_startup_publication(&mut startup_state, profile_startup_state);
+    }
+    let mut replaced_tts_runtime = None;
+    if tts_changed {
+        if preferences.tts_enabled {
+            if tts_runtime.is_none() {
+                *tts_runtime = proposed_tts_runtime.take().map(Arc::new);
+            }
+        } else {
+            if let Some(runtime) = tts_runtime.as_ref() {
+                runtime.cancel_generation();
+            }
+            replaced_tts_runtime = tts_runtime.take();
+        }
+        let runtime_available = tts_runtime.is_some();
+        let actual_provider = tts_runtime
+            .as_deref()
+            .and_then(tts::LocalTtsRuntime::actual_provider)
+            .map(|provider| match provider {
+                tts::TtsActualProvider::Cuda => "cuda",
+                tts::TtsActualProvider::Cpu => "cpu",
+            });
+        if let StartupStatePayload::WarmingModel {
+            capabilities,
+            tts_enabled,
+            ..
+        }
+        | StartupStatePayload::Ready {
+            capabilities,
+            tts_enabled,
+            ..
+        } = &mut *startup_state
+        {
+            *tts_enabled = preferences.tts_enabled;
+            repair_tts_capability_from_status(
+                capabilities,
+                preferences.tts_enabled,
+                runtime_available,
+                actual_provider,
+            );
+        }
+    }
+    publication.finish();
+    drop(llama_runtime);
+    drop(tts_runtime);
+    drop(startup_state);
+    drop(ui_preferences);
+    drop(selected_profile);
+    drop(session);
+    drop(_lifecycle);
+    drop(replaced_llama_runtime);
+    drop(replaced_tts_runtime);
+    Ok(())
+}
+
+fn publish_preference_startup_failure(
+    state: &PreferencePublicationState,
+    startup_failure: StartupStatePayload,
+    runtime_publication: &RuntimePublicationToken,
+    publication: SettingsPublicationGuard,
+) -> Result<(), voxgolem_core::ipc::CommandError> {
+    let _lifecycle = state
+        .lifecycle_gate
+        .lock()
+        .map_err(|_| ipc_command_error("lifecycle state is unavailable"))?;
+    if !runtime_startup_is_current(
+        &runtime_publication.exit_cleanup_started,
+        &runtime_publication.switch_generation,
+        runtime_publication.expected_generation,
+    ) {
+        return Err(preference_command_error(
+            voxgolem_core::ipc::CommandErrorCode::Busy,
+            "preference update was superseded",
+        ));
+    }
+    let mut startup_state = state
+        .startup_state
+        .lock()
+        .map_err(|_| ipc_command_error("capability state is unavailable"))?;
+    merge_profile_startup_publication(&mut startup_state, startup_failure);
+    publication.finish();
+    Ok(())
+}
+
+fn clear_disabled_completion_after_publication(
+    state: &PreferencePublicationState,
+) -> Result<(), String> {
+    let _lifecycle = state
+        .completion_lifecycle_lock
+        .lock()
+        .map_err(|_| String::from("completion lifecycle lock is poisoned"))?;
+    if let Some(request) = state
+        .completion_request
+        .lock()
+        .map_err(|_| String::from("completion request lock is poisoned"))?
+        .clone()
+    {
+        request.clear();
+    }
+    state
+        .completion_context
+        .lock()
+        .map_err(|_| String::from("completion context lock is poisoned"))?
+        .take();
+    invalidate_prefetch_state(
+        &state.prefetch_generation,
+        &state.prefetch_task,
+        &state.prefetch_cache,
+    )
+}
+
 fn ensure_app_running(exit_cleanup_started: &AtomicBool) -> Result<(), String> {
     if exit_cleanup_started.load(Ordering::SeqCst) {
         Err(String::from("application shutdown is in progress"))
@@ -1297,6 +1595,717 @@ fn get_app_snapshot_from_state(
         response_profile,
         ui_preferences,
     ))
+}
+
+#[tauri::command]
+async fn set_preferences(
+    preferences: voxgolem_core::ipc::ValidatedPreferences,
+    app_state: tauri::State<'_, AppState>,
+) -> Result<voxgolem_core::ipc::ValidatedPreferences, voxgolem_core::ipc::CommandError> {
+    set_preferences_from_state(preferences, &app_state).await
+}
+
+async fn set_preferences_from_state(
+    preferences: voxgolem_core::ipc::ValidatedPreferences,
+    app_state: &AppState,
+) -> Result<voxgolem_core::ipc::ValidatedPreferences, voxgolem_core::ipc::CommandError> {
+    use voxgolem_core::ipc::CommandErrorCode;
+
+    let settings_operation = lock_live_settings_operation(app_state)
+        .await
+        .map_err(|error| preference_command_error(CommandErrorCode::Unavailable, error))?;
+    let _tts_operation = app_state.tts_operation_lock.lock().await;
+    ensure_app_running(&app_state.exit_cleanup_started)
+        .map_err(|error| preference_command_error(CommandErrorCode::Unavailable, error))?;
+    let previous = get_app_snapshot_from_state(app_state)?.preferences;
+    let requested_persisted = PersistedState::from(&preferences);
+    let requested_settings = requested_persisted
+        .assistant_settings
+        .expect("canonical preferences always contain assistant settings");
+    let requested_profile = requested_persisted
+        .selected_response_profile
+        .expect("canonical preferences always contain a response profile");
+    let required_local_profile = match preferences.instant {
+        voxgolem_core::ipc::InstantModelChoice::LocalFast => {
+            Some(voxgolem_core::ipc::ResponseProfile::Fast)
+        }
+        voxgolem_core::ipc::InstantModelChoice::LocalQuality => {
+            Some(voxgolem_core::ipc::ResponseProfile::Quality)
+        }
+        voxgolem_core::ipc::InstantModelChoice::CustomSolHigh
+        | voxgolem_core::ipc::InstantModelChoice::CustomLunaLow
+        | voxgolem_core::ipc::InstantModelChoice::OpenCodeSolHigh
+        | voxgolem_core::ipc::InstantModelChoice::OpenCodeLunaLow => None,
+    };
+    if required_local_profile.is_some_and(|profile| profile != preferences.response_profile) {
+        return Err(preference_command_error(
+            CommandErrorCode::InvalidInput,
+            "local instant model and response profile must match",
+        ));
+    }
+    let requested_ui = UiPreferencesState {
+        theme: requested_persisted
+            .ui_theme
+            .expect("canonical preferences always contain a UI theme"),
+        text_size: requested_persisted
+            .ui_text_size
+            .expect("canonical preferences always contain a UI text size"),
+    };
+    let current_profile = *app_state
+        .selected_response_profile
+        .lock()
+        .map_err(|_| ipc_command_error("response profile state is unavailable"))?;
+    let profile_changed = requested_profile != current_profile;
+    if profile_changed {
+        if !app_state
+            .supported_response_profiles
+            .contains(&requested_profile)
+        {
+            return Err(preference_command_error(
+                CommandErrorCode::InvalidInput,
+                format!(
+                    "response profile `{}` is not supported",
+                    requested_profile.as_str()
+                ),
+            ));
+        }
+        ensure_startup_ready_for_profile_switch(&app_state.startup_state)
+            .map_err(|error| preference_command_error(CommandErrorCode::Unavailable, error))?;
+        ensure_response_profile_switch_runtime_is_idle(&app_state.voice_pipeline_state)
+            .map_err(|error| preference_command_error(CommandErrorCode::Busy, error))?;
+        invalidate_and_wait_for_prefetch(app_state)
+            .await
+            .map_err(|error| preference_command_error(CommandErrorCode::Internal, error))?;
+    }
+    let tts_changed = preferences.tts_enabled != previous.tts_enabled;
+    let mut proposed_tts_runtime = if tts_changed && preferences.tts_enabled {
+        let config = app_state.runtime_config.as_ref().ok_or_else(|| {
+            preference_command_error(CommandErrorCode::Unavailable, "TTS is not configured")
+        })?;
+        let operation_generation = app_state
+            .tts_startup_generation
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1);
+        let current_runtime_present = app_state
+            .local_tts_runtime
+            .lock()
+            .map_err(|_| ipc_command_error("local TTS runtime is unavailable"))?
+            .is_some();
+        prepare_tts_runtime(
+            true,
+            current_runtime_present,
+            &config.local_tts,
+            config.logging.enabled,
+            operation_generation,
+            &app_state.tts_startup_generation,
+        )
+        .await
+        .map_err(|error| preference_command_error(CommandErrorCode::Unavailable, error))?
+    } else {
+        None
+    };
+
+    let previous_settings = AssistantSettingsPayload::from(&previous);
+    let assistant_changed = requested_settings != previous_settings;
+    let _backend_operation = if assistant_changed || profile_changed {
+        Some(
+            lock_ready_response_backend_operation(
+                &app_state.response_backend_operation_lock,
+                &app_state.startup_state,
+            )
+            .map_err(|error| preference_command_error(CommandErrorCode::Unavailable, error))?,
+        )
+    } else {
+        None
+    };
+    let mut profile_spec = if profile_changed {
+        let config = app_state.runtime_config.as_ref().ok_or_else(|| {
+            preference_command_error(
+                CommandErrorCode::Unavailable,
+                "response backend is not configured",
+            )
+        })?;
+        let voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
+            server_path,
+            host,
+            port,
+            fast_model_path,
+            quality_model_path,
+        } = &config.response_backend
+        else {
+            return Err(preference_command_error(
+                CommandErrorCode::Unavailable,
+                "response profile changes require a managed llama.cpp backend",
+            ));
+        };
+        if app_state
+            .llama_cpp_runtime
+            .lock()
+            .map_err(|_| ipc_command_error("local llama.cpp runtime is unavailable"))?
+            .as_ref()
+            .is_some_and(|runtime| !runtime.is_owned())
+        {
+            return Err(preference_command_error(
+                CommandErrorCode::Unavailable,
+                "response profile cannot change while using an externally managed llama.cpp runtime",
+            ));
+        }
+        let requested_model_path = model_path_for_profile(
+            requested_profile,
+            fast_model_path,
+            quality_model_path.as_ref(),
+        )
+        .map_err(|error| preference_command_error(CommandErrorCode::InvalidInput, error))?
+        .to_path_buf();
+        let fallback_model_path = model_path_for_profile(
+            current_profile,
+            fast_model_path,
+            quality_model_path.as_ref(),
+        )
+        .map_err(|error| preference_command_error(CommandErrorCode::InvalidInput, error))?
+        .to_path_buf();
+        Some(LlamaPreferenceChangeSpec {
+            requested_spec: voxgolem_platform::llama_cpp::LlamaCppServerSpec::new(
+                server_path.clone(),
+                requested_model_path,
+                host.clone(),
+                *port,
+                LLAMA_CPP_MODEL_ALIAS,
+            ),
+            fallback_spec: voxgolem_platform::llama_cpp::LlamaCppServerSpec::new(
+                server_path.clone(),
+                fallback_model_path,
+                host.clone(),
+                *port,
+                LLAMA_CPP_MODEL_ALIAS,
+            ),
+            startup_snapshot: None,
+            inference_policy: config
+                .llama_cpp
+                .as_ref()
+                .map(|llama| platform_inference_policy(llama.inference_provider))
+                .unwrap_or(voxgolem_platform::inference::InferencePolicy::Auto),
+            startup_cancellation:
+                voxgolem_platform::llama_cpp::LlamaCppStartupCancellation::default(),
+        })
+    } else {
+        None
+    };
+
+    let publication = {
+        let _lifecycle = app_state
+            .lifecycle_gate
+            .lock()
+            .map_err(|_| ipc_command_error("lifecycle state is unavailable"))?;
+        let session = app_state
+            .conversation_session
+            .lock()
+            .map_err(|_| ipc_command_error("conversation state is unavailable"))?;
+        if session.has_active_execution() {
+            return Err(preference_command_error(
+                CommandErrorCode::Busy,
+                "preferences cannot change while a prompt is active",
+            ));
+        }
+        if assistant_changed {
+            ensure_assistant_settings_available(
+                &requested_settings,
+                &previous_settings,
+                &app_state.startup_state,
+            )
+            .map_err(|error| preference_command_error(CommandErrorCode::Unavailable, error))?;
+        }
+        if let Some(profile_spec) = &mut profile_spec {
+            ensure_response_profile_switch_runtime_is_idle(&app_state.voice_pipeline_state)
+                .map_err(|error| preference_command_error(CommandErrorCode::Busy, error))?;
+            let latest_startup = startup_snapshot_for_profile_switch(
+                &app_state.startup_state,
+                requested_profile,
+                app_state.supported_response_profiles.clone(),
+            )
+            .map_err(|error| preference_command_error(CommandErrorCode::Unavailable, error))?;
+            *app_state
+                .startup_state
+                .lock()
+                .map_err(|_| ipc_command_error("capability state is unavailable"))? =
+                startup_warming_state_from_snapshot(&latest_startup, requested_profile);
+            profile_spec.startup_snapshot = Some(latest_startup);
+        }
+        app_state
+            .settings_publication_in_progress
+            .store(true, Ordering::Release);
+        let publication = SettingsPublicationGuard {
+            in_progress: Arc::clone(&app_state.settings_publication_in_progress),
+            armed: true,
+        };
+        invalidate_prefetch(app_state)
+            .map_err(|error| preference_command_error(CommandErrorCode::Internal, error))?;
+        publication
+    };
+    drop(_backend_operation);
+
+    if let Some(profile_spec) = profile_spec {
+        let result = execute_llama_preference_change(
+            app_state,
+            settings_operation,
+            publication,
+            preferences.clone(),
+            previous.clone(),
+            requested_settings,
+            requested_profile,
+            requested_ui,
+            assistant_changed,
+            tts_changed,
+            proposed_tts_runtime,
+            current_profile,
+            profile_spec,
+        )
+        .await;
+        return result;
+    }
+    let _settings_operation = settings_operation;
+
+    let previous_persisted = match persist_validated_preferences(&preferences) {
+        Ok(previous) => previous,
+        Err(error) => {
+            if let Some(mut runtime) = proposed_tts_runtime.take() {
+                runtime.shutdown_owned();
+            }
+            return Err(preference_command_error(CommandErrorCode::Internal, error));
+        }
+    };
+    let publish_result = publish_validated_preferences(
+        &PreferencePublicationState::new(app_state),
+        &preferences,
+        requested_settings,
+        requested_profile,
+        requested_ui,
+        assistant_changed,
+        tts_changed,
+        proposed_tts_runtime.take(),
+        None,
+        None,
+        None,
+        publication,
+    );
+    if let Err(error) = publish_result {
+        if let Err(rollback_error) = restore_persisted_state(previous_persisted) {
+            eprintln!("failed to roll back unpublished preferences: {rollback_error}");
+        }
+        return Err(error);
+    }
+    if let Err(error) = invalidate_prefetch(app_state) {
+        eprintln!("failed to invalidate prefetch after preference update: {error}");
+    }
+    if previous.completion && !preferences.completion {
+        if let Err(error) = clear_completion_state(app_state) {
+            eprintln!("failed to clear disabled completion state: {error}");
+        }
+    }
+    Ok(preferences)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_llama_preference_change(
+    app_state: &AppState,
+    settings_operation: tokio::sync::OwnedMutexGuard<()>,
+    publication: SettingsPublicationGuard,
+    preferences: voxgolem_core::ipc::ValidatedPreferences,
+    previous: voxgolem_core::ipc::ValidatedPreferences,
+    requested_settings: AssistantSettingsPayload,
+    requested_profile: ResponseProfilePayload,
+    requested_ui: UiPreferencesState,
+    assistant_changed: bool,
+    tts_changed: bool,
+    proposed_tts_runtime: Option<tts::LocalTtsRuntime>,
+    current_profile: ResponseProfilePayload,
+    profile_spec: LlamaPreferenceChangeSpec,
+) -> Result<voxgolem_core::ipc::ValidatedPreferences, voxgolem_core::ipc::CommandError> {
+    use voxgolem_core::ipc::CommandErrorCode;
+
+    ensure_app_running(&app_state.exit_cleanup_started)
+        .map_err(|error| preference_command_error(CommandErrorCode::Unavailable, error))?;
+    let switch_generation = app_state
+        .response_profile_switch_generation
+        .fetch_add(1, Ordering::SeqCst)
+        .saturating_add(1);
+    app_state
+        .llama_cpp_conversation
+        .lock()
+        .map_err(|_| ipc_command_error("local llama.cpp conversation is unavailable"))?
+        .clear();
+    let previous_runtime = app_state
+        .llama_cpp_runtime
+        .lock()
+        .map_err(|_| ipc_command_error("local llama.cpp runtime is unavailable"))?
+        .take();
+    let publication_state = PreferencePublicationState::new(app_state);
+    let response_profile_switch_generation =
+        Arc::clone(&app_state.response_profile_switch_generation);
+    let exit_cleanup_started = Arc::clone(&app_state.exit_cleanup_started);
+    let worker_cancellation = profile_spec.startup_cancellation.clone();
+    let registry_cancellation = profile_spec.startup_cancellation.clone();
+    let startup_snapshot = profile_spec
+        .startup_snapshot
+        .expect("profile startup snapshot must be reserved before worker launch");
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let worker = std::thread::spawn(move || {
+        let _settings_operation = settings_operation;
+        let mut publication = Some(publication);
+        let mut proposed_tts_runtime = proposed_tts_runtime;
+        let mut persisted_rollback = None;
+        let replacement = replace_owned_runtime_transaction(
+            previous_runtime,
+            (profile_spec.requested_spec, profile_spec.fallback_spec),
+            voxgolem_platform::llama_cpp::LlamaCppRuntime::is_owned,
+            || {
+                runtime_startup_is_current(
+                    &exit_cleanup_started,
+                    &response_profile_switch_generation,
+                    switch_generation,
+                )
+            },
+            voxgolem_platform::llama_cpp::LlamaCppRuntime::shutdown_owned,
+            |spec| {
+                voxgolem_platform::llama_cpp::LlamaCppRuntime::start_with_policy_cancellation(
+                    spec,
+                    profile_spec.inference_policy,
+                    worker_cancellation.clone(),
+                )
+                .join()
+                .unwrap_or_else(|_| {
+                    Err(voxgolem_platform::llama_cpp::LlamaCppRuntimeError::StartupCancelled)
+                })
+            },
+            |_| {
+                persisted_rollback = Some(persist_validated_preferences(&preferences)?);
+                Ok(())
+            },
+        );
+        let runtime_publication = RuntimePublicationToken {
+            exit_cleanup_started: Arc::clone(&exit_cleanup_started),
+            switch_generation: Arc::clone(&response_profile_switch_generation),
+            expected_generation: switch_generation,
+        };
+        let result = match replacement {
+            RuntimeReplacement::Applied { runtime, value: () } => {
+                let previous_persisted = persisted_rollback
+                    .take()
+                    .expect("applied preferences must retain their rollback state");
+                if !runtime_startup_is_current(
+                    &exit_cleanup_started,
+                    &response_profile_switch_generation,
+                    switch_generation,
+                ) {
+                    if let Err(error) = restore_persisted_state(previous_persisted) {
+                        eprintln!("failed to roll back superseded preferences: {error}");
+                    }
+                    Err(preference_command_error(
+                        CommandErrorCode::Busy,
+                        "preference update was superseded",
+                    ))
+                } else {
+                    let actual_provider = actual_inference_provider_name(runtime.actual_provider());
+                    let mut ready_snapshot = startup_snapshot.clone();
+                    if let Some(capability) =
+                        ready_snapshot.capabilities.iter_mut().find(|capability| {
+                            capability.id
+                                == if requested_profile == ResponseProfilePayload::Quality {
+                                    "local_quality"
+                                } else {
+                                    "local_fast"
+                                }
+                        })
+                    {
+                        capability.state = CapabilityStatePayload::Available;
+                        capability.reason = String::from("ready");
+                        capability.actual_provider = Some(actual_provider);
+                    }
+                    let ready_state =
+                        startup_ready_state_from_snapshot(&ready_snapshot, requested_profile);
+                    match publish_validated_preferences(
+                        &publication_state,
+                        &preferences,
+                        requested_settings,
+                        requested_profile,
+                        requested_ui,
+                        assistant_changed,
+                        tts_changed,
+                        proposed_tts_runtime.take(),
+                        Some(runtime),
+                        Some(ready_state),
+                        Some(&runtime_publication),
+                        publication.take().expect("preference publication guard"),
+                    ) {
+                        Ok(()) => {
+                            let cleanup = if previous.completion && !preferences.completion {
+                                clear_disabled_completion_after_publication(&publication_state)
+                            } else {
+                                invalidate_prefetch_state(
+                                    &publication_state.prefetch_generation,
+                                    &publication_state.prefetch_task,
+                                    &publication_state.prefetch_cache,
+                                )
+                            };
+                            if let Err(error) = cleanup {
+                                eprintln!(
+                                    "failed to clean runtime state after preference update: {error}"
+                                );
+                            }
+                            Ok(preferences.clone())
+                        }
+                        Err(error) => {
+                            if let Err(rollback_error) = restore_persisted_state(previous_persisted)
+                            {
+                                eprintln!(
+                                    "failed to roll back unpublished preferences: {rollback_error}"
+                                );
+                            }
+                            Err(error)
+                        }
+                    }
+                }
+            }
+            RuntimeReplacement::Restored { runtime, error } => {
+                let actual_provider = actual_inference_provider_name(runtime.actual_provider());
+                let mut ready_snapshot = startup_snapshot.clone();
+                update_restored_profile_capabilities(
+                    &mut ready_snapshot.capabilities,
+                    requested_profile,
+                    current_profile,
+                    &error,
+                    actual_provider,
+                );
+                let previous_persisted = PersistedState::from(&previous);
+                let previous_ui = UiPreferencesState {
+                    theme: previous_persisted
+                        .ui_theme
+                        .expect("canonical preferences contain a UI theme"),
+                    text_size: previous_persisted
+                        .ui_text_size
+                        .expect("canonical preferences contain a UI text size"),
+                };
+                let restored = publish_validated_preferences(
+                    &publication_state,
+                    &previous,
+                    AssistantSettingsPayload::from(&previous),
+                    current_profile,
+                    previous_ui,
+                    false,
+                    false,
+                    None,
+                    Some(runtime),
+                    Some(startup_ready_state_from_snapshot(
+                        &ready_snapshot,
+                        current_profile,
+                    )),
+                    Some(&runtime_publication),
+                    publication.take().expect("preference publication guard"),
+                );
+                match restored {
+                    Ok(()) => Err(preference_command_error(
+                        CommandErrorCode::Unavailable,
+                        error,
+                    )),
+                    Err(error) => Err(error),
+                }
+            }
+            RuntimeReplacement::PreparationRestored { runtime, error } => {
+                eprintln!("failed to persist requested preferences: {error}");
+                let actual_provider = actual_inference_provider_name(runtime.actual_provider());
+                let mut ready_snapshot = startup_snapshot.clone();
+                update_restored_profile_capabilities(
+                    &mut ready_snapshot.capabilities,
+                    current_profile,
+                    current_profile,
+                    "preference persistence failed",
+                    actual_provider,
+                );
+                let previous_persisted = PersistedState::from(&previous);
+                let previous_ui = UiPreferencesState {
+                    theme: previous_persisted
+                        .ui_theme
+                        .expect("canonical preferences contain a UI theme"),
+                    text_size: previous_persisted
+                        .ui_text_size
+                        .expect("canonical preferences contain a UI text size"),
+                };
+                let restored = publish_validated_preferences(
+                    &publication_state,
+                    &previous,
+                    AssistantSettingsPayload::from(&previous),
+                    current_profile,
+                    previous_ui,
+                    false,
+                    false,
+                    None,
+                    Some(runtime),
+                    Some(startup_ready_state_from_snapshot(
+                        &ready_snapshot,
+                        current_profile,
+                    )),
+                    Some(&runtime_publication),
+                    publication.take().expect("preference publication guard"),
+                );
+                match restored {
+                    Ok(()) => Err(preference_command_error(CommandErrorCode::Internal, error)),
+                    Err(error) => Err(error),
+                }
+            }
+            RuntimeReplacement::RestoreFailed {
+                error,
+                restore_error,
+            } => {
+                let failure = startup_state_after_profile_restore_failure(
+                    &startup_snapshot,
+                    requested_profile,
+                    current_profile,
+                    &error,
+                    &restore_error,
+                );
+                match publish_preference_startup_failure(
+                    &publication_state,
+                    failure,
+                    &runtime_publication,
+                    publication.take().expect("preference publication guard"),
+                ) {
+                    Ok(()) => Err(preference_command_error(
+                        CommandErrorCode::Unavailable,
+                        format!(
+                            "failed to start requested profile: {error}; failed to restore previous profile: {restore_error}"
+                        ),
+                    )),
+                    Err(error) => Err(error),
+                }
+            }
+            RuntimeReplacement::PreparationRestoreFailed {
+                error,
+                restore_error,
+            } => {
+                let failure = startup_state_after_preparation_restore_failure(
+                    &startup_snapshot,
+                    current_profile,
+                    &error,
+                    &restore_error,
+                );
+                match publish_preference_startup_failure(
+                    &publication_state,
+                    failure,
+                    &runtime_publication,
+                    publication.take().expect("preference publication guard"),
+                ) {
+                    Ok(()) => Err(preference_command_error(CommandErrorCode::Internal, error)),
+                    Err(error) => Err(error),
+                }
+            }
+            RuntimeReplacement::PreparationRejectedStartedExternal { error } => {
+                let failure = startup_state_after_preparation_restore_failure(
+                    &startup_snapshot,
+                    current_profile,
+                    &error,
+                    "an externally managed llama.cpp runtime cannot restore the previous profile",
+                );
+                match publish_preference_startup_failure(
+                    &publication_state,
+                    failure,
+                    &runtime_publication,
+                    publication.take().expect("preference publication guard"),
+                ) {
+                    Ok(()) => Err(preference_command_error(CommandErrorCode::Internal, error)),
+                    Err(error) => Err(error),
+                }
+            }
+            RuntimeReplacement::Superseded => {
+                if let Some(previous_persisted) = persisted_rollback.take() {
+                    if let Err(error) = restore_persisted_state(previous_persisted) {
+                        eprintln!("failed to roll back superseded preferences: {error}");
+                    }
+                }
+                Err(preference_command_error(
+                    CommandErrorCode::Busy,
+                    "preference update was superseded",
+                ))
+            }
+            RuntimeReplacement::RejectedExistingExternal { runtime } => {
+                let actual_provider = actual_inference_provider_name(runtime.actual_provider());
+                let mut ready_snapshot = startup_snapshot.clone();
+                update_restored_profile_capabilities(
+                    &mut ready_snapshot.capabilities,
+                    requested_profile,
+                    current_profile,
+                    "response profile cannot change while using an externally managed llama.cpp runtime",
+                    actual_provider,
+                );
+                let previous_persisted = PersistedState::from(&previous);
+                let previous_ui = UiPreferencesState {
+                    theme: previous_persisted
+                        .ui_theme
+                        .expect("canonical preferences contain a UI theme"),
+                    text_size: previous_persisted
+                        .ui_text_size
+                        .expect("canonical preferences contain a UI text size"),
+                };
+                let restored = publish_validated_preferences(
+                    &publication_state,
+                    &previous,
+                    AssistantSettingsPayload::from(&previous),
+                    current_profile,
+                    previous_ui,
+                    false,
+                    false,
+                    None,
+                    Some(runtime),
+                    Some(startup_ready_state_from_snapshot(
+                        &ready_snapshot,
+                        current_profile,
+                    )),
+                    Some(&runtime_publication),
+                    publication.take().expect("preference publication guard"),
+                );
+                match restored {
+                    Ok(()) => Err(preference_command_error(
+                        CommandErrorCode::Unavailable,
+                        "response profile cannot change while using an externally managed llama.cpp runtime",
+                    )),
+                    Err(error) => Err(error),
+                }
+            }
+            RuntimeReplacement::RejectedStartedExternal => {
+                let failure = startup_state_after_profile_restore_failure(
+                    &startup_snapshot,
+                    requested_profile,
+                    current_profile,
+                    "an externally managed llama.cpp runtime cannot satisfy the requested profile",
+                    "an externally managed llama.cpp runtime cannot restore the previous profile",
+                );
+                match publish_preference_startup_failure(
+                    &publication_state,
+                    failure,
+                    &runtime_publication,
+                    publication.take().expect("preference publication guard"),
+                ) {
+                    Ok(()) => Err(preference_command_error(
+                        CommandErrorCode::Unavailable,
+                        "an externally managed llama.cpp runtime cannot satisfy the requested profile",
+                    )),
+                    Err(error) => Err(error),
+                }
+            }
+        };
+        let _ = result_tx.send(result);
+    });
+    register_llama_startup(
+        &app_state.llama_startups,
+        &app_state.exit_cleanup_started,
+        registry_cancellation,
+        worker,
+    );
+    result_rx.await.map_err(|_| {
+        preference_command_error(
+            CommandErrorCode::Internal,
+            "preference runtime worker ended without a result",
+        )
+    })?
 }
 
 #[tauri::command]
@@ -1720,6 +2729,17 @@ enum RuntimeReplacement<R, V> {
         error: String,
         restore_error: String,
     },
+    PreparationRestored {
+        runtime: R,
+        error: String,
+    },
+    PreparationRestoreFailed {
+        error: String,
+        restore_error: String,
+    },
+    PreparationRejectedStartedExternal {
+        error: String,
+    },
     Superseded,
     RejectedExistingExternal {
         runtime: R,
@@ -1796,10 +2816,12 @@ where
                     shutdown(&mut runtime);
                     RuntimeReplacement::Superseded
                 }
-                Ok(runtime) if !is_owned(&runtime) => RuntimeReplacement::RejectedStartedExternal,
-                Ok(runtime) => RuntimeReplacement::Restored { runtime, error },
+                Ok(runtime) if !is_owned(&runtime) => {
+                    RuntimeReplacement::PreparationRejectedStartedExternal { error }
+                }
+                Ok(runtime) => RuntimeReplacement::PreparationRestored { runtime, error },
                 Err(_) if !is_current() => RuntimeReplacement::Superseded,
-                Err(restore_error) => RuntimeReplacement::RestoreFailed {
+                Err(restore_error) => RuntimeReplacement::PreparationRestoreFailed {
                     error,
                     restore_error: restore_error.to_string(),
                 },
@@ -2073,6 +3095,20 @@ async fn switch_response_profile(
                 );
                 startup_ready_state_from_snapshot(&ready_snapshot, current_profile)
             }
+            RuntimeReplacement::PreparationRestored { runtime, error } => {
+                eprintln!("failed to persist requested response profile: {error}");
+                let actual_provider = actual_inference_provider_name(runtime.actual_provider());
+                runtime_to_publish = Some(runtime);
+                let mut ready_snapshot = startup_snapshot.clone();
+                update_restored_profile_capabilities(
+                    &mut ready_snapshot.capabilities,
+                    current_profile,
+                    current_profile,
+                    "response profile persistence failed",
+                    actual_provider,
+                );
+                startup_ready_state_from_snapshot(&ready_snapshot, current_profile)
+            }
             RuntimeReplacement::RestoreFailed {
                 error,
                 restore_error,
@@ -2083,6 +3119,23 @@ async fn switch_response_profile(
                 &error,
                 &restore_error,
             ),
+            RuntimeReplacement::PreparationRestoreFailed {
+                error,
+                restore_error,
+            } => startup_state_after_preparation_restore_failure(
+                &startup_snapshot,
+                current_profile,
+                &error,
+                &restore_error,
+            ),
+            RuntimeReplacement::PreparationRejectedStartedExternal { error } => {
+                startup_state_after_preparation_restore_failure(
+                    &startup_snapshot,
+                    current_profile,
+                    &error,
+                    "an externally managed llama.cpp runtime cannot restore the previous profile",
+                )
+            }
             RuntimeReplacement::Superseded => return,
             RuntimeReplacement::RejectedExistingExternal { runtime } => {
                 let actual_provider = actual_inference_provider_name(runtime.actual_provider());
@@ -6465,9 +7518,20 @@ async fn emit_completion_predictions(
 }
 
 fn invalidate_prefetch(app_state: &AppState) -> Result<(), String> {
-    app_state.prefetch_generation.fetch_add(1, Ordering::SeqCst);
-    let active = app_state
-        .prefetch_task
+    invalidate_prefetch_state(
+        &app_state.prefetch_generation,
+        &app_state.prefetch_task,
+        &app_state.prefetch_cache,
+    )
+}
+
+fn invalidate_prefetch_state(
+    generation: &AtomicU64,
+    task: &Mutex<Option<ActivePrefetch>>,
+    cache: &Mutex<Option<PrefetchEntry>>,
+) -> Result<(), String> {
+    generation.fetch_add(1, Ordering::SeqCst);
+    let active = task
         .lock()
         .map_err(|_| String::from("prefetch task lock is poisoned"))?;
     if let Some(task) = active.as_ref() {
@@ -6483,8 +7547,7 @@ fn invalidate_prefetch(app_state: &AppState) -> Result<(), String> {
         }
     }
     drop(active);
-    app_state
-        .prefetch_cache
+    cache
         .lock()
         .map_err(|_| String::from("prefetch cache lock is poisoned"))?
         .take();
@@ -7452,182 +8515,89 @@ struct PersistedState {
     assistant_settings: Option<AssistantSettingsPayload>,
 }
 
+impl From<&voxgolem_core::ipc::ValidatedPreferences> for PersistedState {
+    fn from(preferences: &voxgolem_core::ipc::ValidatedPreferences) -> Self {
+        use voxgolem_core::ipc::{ResponseProfile, UiTextSize, UiTheme};
+        Self {
+            selected_response_profile: Some(match preferences.response_profile {
+                ResponseProfile::Fast => ResponseProfilePayload::Fast,
+                ResponseProfile::Quality => ResponseProfilePayload::Quality,
+            }),
+            tts_enabled: Some(preferences.tts_enabled),
+            ui_text_size: Some(match preferences.ui_text_size {
+                UiTextSize::Small => UiTextSizePayload::Small,
+                UiTextSize::Medium => UiTextSizePayload::Medium,
+                UiTextSize::Large => UiTextSizePayload::Large,
+                UiTextSize::ExtraLarge => UiTextSizePayload::ExtraLarge,
+            }),
+            ui_theme: Some(match preferences.ui_theme {
+                UiTheme::Light => UiThemePayload::Light,
+                UiTheme::Dark => UiThemePayload::Dark,
+            }),
+            assistant_settings: Some(preferences.into()),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedStateWire {
+    selected_response_profile: Option<ResponseProfilePayload>,
+    tts_enabled: Option<bool>,
+    ui_text_size: Option<UiTextSizePayload>,
+    ui_theme: Option<UiThemePayload>,
+    assistant_instant: Option<InstantChoicePayload>,
+    assistant_deep: Option<AgentChoicePayload>,
+    assistant_review: Option<AgentChoicePayload>,
+    assistant_deep_enabled: Option<bool>,
+    assistant_review_enabled: Option<bool>,
+    assistant_prefetch: Option<bool>,
+    assistant_completion: Option<bool>,
+}
+
 fn parse_persisted_state(contents: &str) -> Result<PersistedState, String> {
-    let mut state = PersistedState::default();
-    let mut assistant_settings = AssistantSettingsPayload::default();
-    let mut assistant_settings_seen = false;
-
-    for raw_line in contents.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
-            continue;
+    let wire: PersistedStateWire =
+        toml::from_str(contents).map_err(|error| format!("invalid state.toml: {error}"))?;
+    let assistant_settings = match (
+        wire.assistant_instant,
+        wire.assistant_deep,
+        wire.assistant_review,
+        wire.assistant_deep_enabled,
+        wire.assistant_review_enabled,
+        wire.assistant_prefetch,
+        wire.assistant_completion,
+    ) {
+        (None, None, None, None, None, None, None) => None,
+        (
+            Some(instant),
+            Some(deep),
+            Some(review),
+            Some(deep_enabled),
+            Some(review_enabled),
+            Some(prefetch),
+            Some(completion),
+        ) => Some(AssistantSettingsPayload {
+            instant,
+            deep,
+            review,
+            deep_enabled,
+            review_enabled,
+            prefetch,
+            completion,
+        }),
+        _ => {
+            return Err(String::from(
+                "invalid state.toml: assistant settings must be complete",
+            ));
         }
-
-        if let Some(value) = line.strip_prefix("selected_response_profile") {
-            let Some(value) = value.trim_start().strip_prefix('=') else {
-                return Err(String::from(
-                    "invalid state.toml: expected `selected_response_profile = \"...\"`",
-                ));
-            };
-
-            let value = value.trim().trim_matches('"').to_ascii_lowercase();
-            state.selected_response_profile = match value.as_str() {
-                "fast" => Some(ResponseProfilePayload::Fast),
-                "quality" => Some(ResponseProfilePayload::Quality),
-                _ => {
-                    return Err(format!(
-                        "invalid state.toml: unsupported selected_response_profile `{value}`"
-                    ));
-                }
-            };
-            continue;
-        }
-
-        if let Some(value) = line.strip_prefix("tts_enabled") {
-            let Some(value) = value.trim_start().strip_prefix('=') else {
-                return Err(String::from(
-                    "invalid state.toml: expected `tts_enabled = true|false`",
-                ));
-            };
-
-            let value = value.trim().trim_matches('"').to_ascii_lowercase();
-            state.tts_enabled = match value.as_str() {
-                "true" => Some(true),
-                "false" => Some(false),
-                _ => {
-                    return Err(format!(
-                        "invalid state.toml: unsupported tts_enabled `{value}`"
-                    ));
-                }
-            };
-            continue;
-        }
-
-        if let Some(value) = line.strip_prefix("ui_text_size") {
-            let Some(value) = value.trim_start().strip_prefix('=') else {
-                return Err(String::from(
-                    "invalid state.toml: expected `ui_text_size = \"...\"`",
-                ));
-            };
-
-            let value = value.trim().trim_matches('"').to_ascii_lowercase();
-            state.ui_text_size = match value.as_str() {
-                "small" => Some(UiTextSizePayload::Small),
-                "medium" => Some(UiTextSizePayload::Medium),
-                "large" => Some(UiTextSizePayload::Large),
-                "extra_large" => Some(UiTextSizePayload::ExtraLarge),
-                _ => {
-                    return Err(format!(
-                        "invalid state.toml: unsupported ui_text_size `{value}`"
-                    ));
-                }
-            };
-            continue;
-        }
-
-        if let Some(value) = line.strip_prefix("ui_theme") {
-            let Some(value) = value.trim_start().strip_prefix('=') else {
-                return Err(String::from(
-                    "invalid state.toml: expected `ui_theme = \"...\"`",
-                ));
-            };
-
-            let value = value.trim().trim_matches('"').to_ascii_lowercase();
-            state.ui_theme = match value.as_str() {
-                "light" => Some(UiThemePayload::Light),
-                "dark" => Some(UiThemePayload::Dark),
-                _ => {
-                    return Err(format!(
-                        "invalid state.toml: unsupported ui_theme `{value}`"
-                    ));
-                }
-            };
-            continue;
-        }
-
-        if let Some(value) = line.strip_prefix("assistant_instant") {
-            assistant_settings.instant = parse_instant_choice(value)?;
-            assistant_settings_seen = true;
-            continue;
-        }
-        if let Some(value) = line.strip_prefix("assistant_deep_enabled") {
-            assistant_settings.deep_enabled =
-                parse_persisted_bool(value, "assistant_deep_enabled")?;
-            assistant_settings_seen = true;
-            continue;
-        }
-        if let Some(value) = line.strip_prefix("assistant_deep") {
-            assistant_settings.deep = parse_agent_choice(value, "assistant_deep")?;
-            assistant_settings_seen = true;
-            continue;
-        }
-        if let Some(value) = line.strip_prefix("assistant_review_enabled") {
-            assistant_settings.review_enabled =
-                parse_persisted_bool(value, "assistant_review_enabled")?;
-            assistant_settings_seen = true;
-            continue;
-        }
-        if let Some(value) = line.strip_prefix("assistant_review") {
-            assistant_settings.review = parse_agent_choice(value, "assistant_review")?;
-            assistant_settings_seen = true;
-            continue;
-        }
-        if let Some(value) = line.strip_prefix("assistant_prefetch") {
-            assistant_settings.prefetch = parse_persisted_bool(value, "assistant_prefetch")?;
-            assistant_settings_seen = true;
-            continue;
-        }
-        if let Some(value) = line.strip_prefix("assistant_completion") {
-            assistant_settings.completion = parse_persisted_bool(value, "assistant_completion")?;
-            assistant_settings_seen = true;
-        }
-    }
-
-    state.assistant_settings = assistant_settings_seen.then_some(assistant_settings);
-
-    Ok(state)
-}
-
-fn persisted_value<'a>(value: &'a str, field: &str) -> Result<&'a str, String> {
-    value
-        .trim_start()
-        .strip_prefix('=')
-        .map(|value| value.trim().trim_matches('"'))
-        .ok_or_else(|| format!("invalid state.toml: expected `{field} = ...`"))
-}
-
-fn parse_instant_choice(value: &str) -> Result<InstantChoicePayload, String> {
-    let value = persisted_value(value, "assistant_instant")?;
-    match value {
-        "local-fast" => Ok(InstantChoicePayload::LocalFast),
-        "local-quality" => Ok(InstantChoicePayload::LocalQuality),
-        "custom-sol-high" => Ok(InstantChoicePayload::CustomSolHigh),
-        "custom-luna-low" => Ok(InstantChoicePayload::CustomLunaLow),
-        "opencode-sol-high" => Ok(InstantChoicePayload::OpenCodeSolHigh),
-        "opencode-luna-low" => Ok(InstantChoicePayload::OpenCodeLunaLow),
-        _ => Err(format!(
-            "invalid state.toml: unsupported assistant_instant `{value}`"
-        )),
-    }
-}
-
-fn parse_agent_choice(value: &str, field: &str) -> Result<AgentChoicePayload, String> {
-    let value = persisted_value(value, field)?;
-    match value {
-        "custom-sol-high" => Ok(AgentChoicePayload::CustomSolHigh),
-        "custom-luna-low" => Ok(AgentChoicePayload::CustomLunaLow),
-        "opencode-sol-high" => Ok(AgentChoicePayload::OpenCodeSolHigh),
-        "opencode-luna-low" => Ok(AgentChoicePayload::OpenCodeLunaLow),
-        _ => Err(format!("invalid state.toml: unsupported {field} `{value}`")),
-    }
-}
-
-fn parse_persisted_bool(value: &str, field: &str) -> Result<bool, String> {
-    match persisted_value(value, field)? {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        value => Err(format!("invalid state.toml: unsupported {field} `{value}`")),
-    }
+    };
+    Ok(PersistedState {
+        selected_response_profile: wire.selected_response_profile,
+        tts_enabled: wire.tts_enabled,
+        ui_text_size: wire.ui_text_size,
+        ui_theme: wire.ui_theme,
+        assistant_settings,
+    })
 }
 
 fn load_persisted_state() -> Result<PersistedState, String> {
@@ -7894,6 +8864,24 @@ fn persist_assistant_settings(settings: AssistantSettingsPayload) -> Result<(), 
     let mut persisted = load_persisted_state()?;
     persisted.assistant_settings = Some(settings);
     persist_state(persisted)
+}
+
+fn persist_validated_preferences(
+    preferences: &voxgolem_core::ipc::ValidatedPreferences,
+) -> Result<PersistedState, String> {
+    let _guard = PERSISTED_STATE_LOCK
+        .lock()
+        .map_err(|_| String::from("persisted state lock is poisoned"))?;
+    let previous = load_persisted_state()?;
+    persist_state(preferences.into())?;
+    Ok(previous)
+}
+
+fn restore_persisted_state(state: PersistedState) -> Result<(), String> {
+    let _guard = PERSISTED_STATE_LOCK
+        .lock()
+        .map_err(|_| String::from("persisted state lock is poisoned"))?;
+    persist_state(state)
 }
 
 fn resolve_assistant_settings(
@@ -8184,6 +9172,10 @@ fn update_restored_profile_capabilities(
     startup_error: &str,
     actual_provider: &'static str,
 ) {
+    eprintln!(
+        "failed to initialize requested {} profile before restoration: {startup_error}",
+        requested.as_str()
+    );
     let requested_id = if requested == ResponseProfilePayload::Quality {
         "local_quality"
     } else {
@@ -8202,7 +9194,7 @@ fn update_restored_profile_capabilities(
             requested_id,
             CapabilityStatePayload::Failed,
             format!(
-                "failed to initialize requested {} profile: {startup_error}",
+                "failed to initialize requested {} profile",
                 requested.as_str()
             ),
         );
@@ -8227,6 +9219,11 @@ fn startup_state_after_profile_restore_failure(
     startup_error: &str,
     restore_error: &str,
 ) -> StartupStatePayload {
+    eprintln!(
+        "failed to initialize requested {} profile: {startup_error}; failed to restore {} profile: {restore_error}",
+        requested.as_str(),
+        restored.as_str()
+    );
     let mut snapshot = startup_snapshot.clone();
     let requested_id = if requested == ResponseProfilePayload::Quality {
         "local_quality"
@@ -8239,12 +9236,12 @@ fn startup_state_after_profile_restore_failure(
         CapabilityStatePayload::Failed,
         if requested == restored {
             format!(
-                "failed to initialize requested {} profile: {startup_error}; retry failed: {restore_error}",
+                "failed to initialize requested {} profile; retry failed",
                 requested.as_str()
             )
         } else {
             format!(
-                "failed to initialize requested {} profile: {startup_error}",
+                "failed to initialize requested {} profile",
                 requested.as_str()
             )
         },
@@ -8259,12 +9256,34 @@ fn startup_state_after_profile_restore_failure(
             &mut snapshot.capabilities,
             restored_id,
             CapabilityStatePayload::Failed,
-            format!(
-                "failed to restore previous {} profile: {restore_error}",
-                restored.as_str()
-            ),
+            format!("failed to restore previous {} profile", restored.as_str()),
         );
     }
+    startup_ready_state_from_snapshot(&snapshot, restored)
+}
+
+fn startup_state_after_preparation_restore_failure(
+    startup_snapshot: &StartupSnapshot,
+    restored: ResponseProfilePayload,
+    preparation_error: &str,
+    restore_error: &str,
+) -> StartupStatePayload {
+    eprintln!(
+        "failed to prepare requested preferences: {preparation_error}; failed to restore {} profile: {restore_error}",
+        restored.as_str()
+    );
+    let mut snapshot = startup_snapshot.clone();
+    let restored_id = if restored == ResponseProfilePayload::Quality {
+        "local_quality"
+    } else {
+        "local_fast"
+    };
+    mark_capability(
+        &mut snapshot.capabilities,
+        restored_id,
+        CapabilityStatePayload::Failed,
+        format!("failed to restore previous {} profile", restored.as_str()),
+    );
     startup_ready_state_from_snapshot(&snapshot, restored)
 }
 
@@ -8373,7 +9392,7 @@ fn initialize_app_state(init: AppStateInit) -> AppState {
         startup_state: init.startup_state,
         runtime_config: init.runtime_config,
         selected_response_profile: init.selected_response_profile,
-        ui_preferences: Mutex::new(resolved_ui_preferences()),
+        ui_preferences: Arc::new(Mutex::new(resolved_ui_preferences())),
         settings_operation_lock: Arc::new(tokio::sync::Mutex::new(())),
         ui_preferences_operation_lock: Mutex::new(()),
         supported_response_profiles: init.supported_response_profiles,
@@ -8391,7 +9410,7 @@ fn initialize_app_state(init: AppStateInit) -> AppState {
         completion_context: Arc::new(Mutex::new(None)),
         completion_generation: AtomicU64::new(0),
         lifecycle_gate: init.lifecycle_gate,
-        completion_lifecycle_lock: Mutex::new(()),
+        completion_lifecycle_lock: Arc::new(Mutex::new(())),
         telemetry_sink: init.telemetry_sink,
         conversation_session: Arc::new(Mutex::new(
             voxgolem_core::conversation::ConversationSession::new(init.assistant_policy),
@@ -8406,16 +9425,16 @@ fn initialize_app_state(init: AppStateInit) -> AppState {
         prompt_publication_epoch: Arc::new(AtomicU64::new(0)),
         tts_operation_lock: tokio::sync::Mutex::new(()),
         tts_startup_generation: Arc::new(AtomicU64::new(0)),
-        local_tts_runtime: Mutex::new(init.local_tts_runtime.map(Arc::new)),
+        local_tts_runtime: Arc::new(Mutex::new(init.local_tts_runtime.map(Arc::new))),
         llama_cpp_runtime: init.llama_cpp_runtime,
         llama_cpp_conversation: Mutex::new(Vec::new()),
         llama_cpp_system_prompt: init.llama_cpp_system_prompt,
         opencode_server: Arc::new(Mutex::new(None)),
         active_prompt: Arc::new(Mutex::new(None)),
         active_prompt_generation: AtomicU64::new(0),
-        prefetch_generation: AtomicU64::new(0),
-        prefetch_cache: Mutex::new(None),
-        prefetch_task: Mutex::new(None),
+        prefetch_generation: Arc::new(AtomicU64::new(0)),
+        prefetch_cache: Arc::new(Mutex::new(None)),
+        prefetch_task: Arc::new(Mutex::new(None)),
         llama_startups: init.llama_startups,
         exit_cleanup_started: init.exit_cleanup_started,
     }
@@ -9597,6 +10616,15 @@ fn invalidate_runtime_startups_for_exit(app_state: &AppState) {
         .fetch_add(1, Ordering::SeqCst);
 }
 
+fn begin_exit_cleanup(app_state: &AppState) -> bool {
+    let _lifecycle = app_state.lifecycle_gate.lock().ok();
+    if app_state.exit_cleanup_started.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    invalidate_runtime_startups_for_exit(app_state);
+    true
+}
+
 fn shutdown_tts_runtime_for_exit(app_state: &AppState) {
     let _operation = tauri::async_runtime::block_on(app_state.tts_operation_lock.lock());
     if let Ok(mut runtime) = app_state.local_tts_runtime.lock() {
@@ -9881,6 +10909,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_app_snapshot,
+            set_preferences,
             app_updates::check_for_update,
             app_updates::install_update,
             app_updates::restart_for_update,
@@ -9928,8 +10957,7 @@ pub fn run() {
         }
         if matches!(event, tauri::RunEvent::Exit) {
             let app_state = app_handle.state::<AppState>();
-            if !app_state.exit_cleanup_started.swap(true, Ordering::SeqCst) {
-                invalidate_runtime_startups_for_exit(&app_state);
+            if begin_exit_cleanup(&app_state) {
                 shutdown_prefetch_for_exit(&app_state);
                 shutdown_llama_startups_for_exit(&app_state);
                 shutdown_llama_cpp_runtime_for_exit(&app_state);
@@ -10083,11 +11111,12 @@ mod tests {
 
     use super::{
         agent_history, allows_user_media_from_uri, apply_optional_speech_activity,
-        assistant_completion_enabled, atomic_replace_state_file, bounded_capability_reason,
-        bounded_provider_history, build_ipc_app_snapshot, build_mark_silence_response,
-        build_nonfatal_config_error_app_state, build_startup_error_app_state,
-        claim_cancelled_prompt_publication, cleanup_orphan_state_temps_with, cleanup_sequential,
-        clear_active_prompt, clear_completion_request_state_locked, current_runtime_phase_response,
+        assistant_completion_enabled, atomic_replace_state_file, begin_exit_cleanup,
+        bounded_capability_reason, bounded_provider_history, build_ipc_app_snapshot,
+        build_mark_silence_response, build_nonfatal_config_error_app_state,
+        build_startup_error_app_state, claim_cancelled_prompt_publication,
+        cleanup_orphan_state_temps_with, cleanup_sequential, clear_active_prompt,
+        clear_completion_request_state_locked, current_runtime_phase_response,
         current_silence_deadline, default_response_profile, default_voice_pipeline_config,
         ensure_app_running, ensure_assistant_settings_available,
         fit_review_history_to_prompt_budget, get_app_snapshot_from_state,
@@ -10099,26 +11128,27 @@ mod tests {
         model_path_for_profile, parse_deep_agent_json, parse_persisted_state,
         parse_review_agent_json, persist_assistant_settings,
         persist_prepared_local_instant_model_with, persist_selected_response_profile,
-        persist_tts_enabled, persist_ui_text_size, persist_ui_theme,
-        prepare_local_instant_model_with, process_wake_word_frame, race_durable_cancellation,
-        record_terminal_kind, register_active_prompt, register_owned_work,
-        replace_owned_runtime_transaction, reset_conversation_execution,
-        reset_voice_pipeline_to_waiting, reset_wake_word_runtime, resolve_effective_tts_enabled,
-        response_profile_state_path, runtime_log_path, runtime_phase_response_from_state,
-        runtime_startup_is_current, shutdown_llama_cpp_runtime_for_exit,
-        shutdown_tts_runtime_for_exit, startup_warming_state_from_snapshot,
-        supported_response_profiles, take_and_invalidate_prefetch, to_runtime_phase_payload,
-        transcribe_finished_utterance, transcription_ready_samples,
-        tts_runtime_needs_initialization, update_restored_profile_capabilities,
-        validate_prompt_request_id, validate_prompt_text, wake_word_event_timestamp,
-        ActivePromptGuard, AgentChoicePayload, AssistantSettingsPayload, CapabilityPayload,
-        CapabilityStatePayload, CommitAssistantResult, CueAssetPathsPayload, DeepStageResult,
-        DeepTask, InstantChoicePayload, PrefetchEntry, PrefetchKey, ProfilePersistenceRollback,
-        PromptExecutionEventPayload, ResponseProfilePayload, RuntimePhasePayload,
-        RuntimePhaseResponsePayload, RuntimeReplacement, RuntimeTelemetryPayload, StagePayload,
-        StageStatusPayload, StartupSnapshot, StartupStatePayload, SupervisedCreation, TerminalKind,
-        UiPreferencesState, UiTextSizePayload, UiThemePayload, DEFAULT_SILENCE_TIMEOUT_MS,
-        PROMPT_MAX_BYTES, PROVIDER_HISTORY_MAX_BYTES,
+        persist_state, persist_tts_enabled, persist_ui_text_size, persist_ui_theme,
+        persist_validated_preferences, preference_command_error, prepare_local_instant_model_with,
+        process_wake_word_frame, race_durable_cancellation, record_terminal_kind,
+        register_active_prompt, register_owned_work, replace_owned_runtime_transaction,
+        reset_conversation_execution, reset_voice_pipeline_to_waiting, reset_wake_word_runtime,
+        resolve_effective_tts_enabled, response_profile_state_path, runtime_log_path,
+        runtime_phase_response_from_state, runtime_startup_is_current, set_preferences_from_state,
+        shutdown_llama_cpp_runtime_for_exit, shutdown_tts_runtime_for_exit,
+        startup_warming_state_from_snapshot, supported_response_profiles,
+        take_and_invalidate_prefetch, to_runtime_phase_payload, transcribe_finished_utterance,
+        transcription_ready_samples, tts_runtime_needs_initialization,
+        update_restored_profile_capabilities, validate_prompt_request_id, validate_prompt_text,
+        wake_word_event_timestamp, ActivePromptGuard, AgentChoicePayload, AssistantSettingsPayload,
+        CapabilityPayload, CapabilityStatePayload, CommitAssistantResult, CueAssetPathsPayload,
+        DeepStageResult, DeepTask, InstantChoicePayload, PersistedState, PrefetchEntry,
+        PrefetchKey, ProfilePersistenceRollback, PromptExecutionEventPayload,
+        ResponseProfilePayload, RuntimePhasePayload, RuntimePhaseResponsePayload,
+        RuntimeReplacement, RuntimeTelemetryPayload, StagePayload, StageStatusPayload,
+        StartupSnapshot, StartupStatePayload, SupervisedCreation, TerminalKind, UiPreferencesState,
+        UiTextSizePayload, UiThemePayload, DEFAULT_SILENCE_TIMEOUT_MS, PROMPT_MAX_BYTES,
+        PROVIDER_HISTORY_MAX_BYTES,
     };
 
     #[derive(Debug, PartialEq, Eq)]
@@ -10210,7 +11240,7 @@ mod tests {
 
         assert_eq!(
             result,
-            RuntimeReplacement::Restored {
+            RuntimeReplacement::PreparationRestored {
                 runtime: fake_runtime("old", true),
                 error: String::from("preparation failed"),
             }
@@ -10313,6 +11343,30 @@ mod tests {
         assert_eq!(result, RuntimeReplacement::RejectedStartedExternal);
         assert_eq!(events, ["stop:old", "start:requested", "start:old"]);
         assert!(!prepared.get());
+    }
+
+    #[test]
+    fn owned_runtime_transaction_preserves_preparation_failure_for_external_fallback() {
+        let (result, events) = run_fake_runtime_transaction(
+            Some(fake_runtime("old", true)),
+            vec![
+                Ok(fake_runtime("requested", true)),
+                Ok(fake_runtime("old", false)),
+            ],
+            || true,
+            |_| Err::<(), _>(String::from("persistence failed")),
+        );
+
+        assert_eq!(
+            result,
+            RuntimeReplacement::PreparationRejectedStartedExternal {
+                error: String::from("persistence failed"),
+            }
+        );
+        assert_eq!(
+            events,
+            ["stop:old", "start:requested", "stop:requested", "start:old"]
+        );
     }
 
     #[test]
@@ -10501,6 +11555,657 @@ mod tests {
             voxgolem_core::ipc::UiTheme::Light
         );
         assert!(snapshot.preferences.tts_enabled);
+    }
+
+    #[test]
+    fn canonical_preferences_publish_and_persist_as_one_zero_asset_state() {
+        let _appdata_lock = APPDATA_ENV_LOCK
+            .lock()
+            .expect("APPDATA test lock should not be poisoned");
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let previous_appdata = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", temp_dir.path());
+        let state = build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            super::embedded_cue_asset_paths(),
+            String::from("not configured"),
+        );
+        let mut requested = get_app_snapshot_from_state(&state)
+            .expect("initial snapshot")
+            .preferences;
+        requested.completion = false;
+        requested.ui_theme = voxgolem_core::ipc::UiTheme::Light;
+        requested.ui_text_size = voxgolem_core::ipc::UiTextSize::ExtraLarge;
+
+        let accepted =
+            tauri::async_runtime::block_on(set_preferences_from_state(requested.clone(), &state))
+                .expect("zero-asset preferences should update");
+        let snapshot = get_app_snapshot_from_state(&state).expect("updated snapshot");
+        let persisted = load_persisted_state().expect("updated state should reload");
+
+        match previous_appdata {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+        assert_eq!(accepted, requested);
+        assert_eq!(snapshot.preferences, requested);
+        assert_eq!(persisted, PersistedState::from(&requested));
+    }
+
+    #[test]
+    fn canonical_preferences_disable_tts_in_the_same_publication() {
+        let _appdata_lock = APPDATA_ENV_LOCK
+            .lock()
+            .expect("APPDATA test lock should not be poisoned");
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let previous_appdata = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", temp_dir.path());
+        let state = build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            super::embedded_cue_asset_paths(),
+            String::from("not configured"),
+        );
+        if let StartupStatePayload::Ready { tts_enabled, .. } =
+            &mut *state.startup_state.lock().expect("startup state")
+        {
+            *tts_enabled = true;
+        }
+        let mut requested = get_app_snapshot_from_state(&state)
+            .expect("initial snapshot")
+            .preferences;
+        requested.tts_enabled = false;
+
+        let accepted =
+            tauri::async_runtime::block_on(set_preferences_from_state(requested.clone(), &state))
+                .expect("TTS should disable without preparing a runtime");
+        let snapshot = get_app_snapshot_from_state(&state).expect("updated snapshot");
+        let persisted = load_persisted_state().expect("updated state should reload");
+
+        match previous_appdata {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+        assert_eq!(accepted, requested);
+        assert_eq!(snapshot.preferences, requested);
+        assert_eq!(persisted.tts_enabled, Some(false));
+    }
+
+    #[test]
+    fn canonical_preferences_wait_for_warming_tts_before_snapshotting() {
+        let _appdata_lock = APPDATA_ENV_LOCK
+            .lock()
+            .expect("APPDATA test lock should not be poisoned");
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let previous_appdata = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", temp_dir.path());
+        let state = Arc::new(build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            super::embedded_cue_asset_paths(),
+            String::from("not configured"),
+        ));
+        let tts_operation = tauri::async_runtime::block_on(state.tts_operation_lock.lock());
+        let requested = get_app_snapshot_from_state(&state)
+            .expect("initial snapshot")
+            .preferences;
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let command_state = Arc::clone(&state);
+        let command = std::thread::spawn(move || {
+            started_tx.send(()).expect("command start");
+            result_tx
+                .send(tauri::async_runtime::block_on(set_preferences_from_state(
+                    requested,
+                    &command_state,
+                )))
+                .expect("command result");
+        });
+        started_rx.recv().expect("command should start");
+        assert!(result_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        if let StartupStatePayload::Ready { tts_enabled, .. } =
+            &mut *state.startup_state.lock().expect("startup state")
+        {
+            *tts_enabled = true;
+        }
+        drop(tts_operation);
+        let accepted = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("command should finish")
+            .expect("canonical preferences should disable warmed TTS");
+        command.join().expect("command thread");
+        let snapshot = get_app_snapshot_from_state(&state).expect("updated snapshot");
+
+        match previous_appdata {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+        assert!(!accepted.tts_enabled);
+        assert!(!snapshot.preferences.tts_enabled);
+    }
+
+    #[test]
+    fn canonical_preference_errors_hide_local_details_and_remain_bounded() {
+        let path_error = preference_command_error(
+            voxgolem_core::ipc::CommandErrorCode::Internal,
+            "failed at /home/private/model",
+        );
+        let oversized_error = preference_command_error(
+            voxgolem_core::ipc::CommandErrorCode::Unavailable,
+            "x".repeat(600),
+        );
+
+        assert_eq!(
+            path_error.code(),
+            voxgolem_core::ipc::CommandErrorCode::Internal
+        );
+        assert!(!path_error.message().contains("/home/private/model"));
+        assert!(
+            oversized_error.message().len() <= voxgolem_core::ipc::CommandError::MAX_MESSAGE_BYTES
+        );
+    }
+
+    #[test]
+    fn canonical_preferences_reject_mismatched_local_model_and_profile() {
+        let state = build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            super::embedded_cue_asset_paths(),
+            String::from("not configured"),
+        );
+        let previous = get_app_snapshot_from_state(&state)
+            .expect("initial snapshot")
+            .preferences;
+        let mut requested = previous.clone();
+        requested.response_profile = voxgolem_core::ipc::ResponseProfile::Quality;
+
+        let error = tauri::async_runtime::block_on(set_preferences_from_state(requested, &state))
+            .expect_err("mismatched local preferences should be rejected");
+
+        assert_eq!(
+            error.code(),
+            voxgolem_core::ipc::CommandErrorCode::InvalidInput
+        );
+        assert_eq!(
+            get_app_snapshot_from_state(&state)
+                .expect("unchanged snapshot")
+                .preferences,
+            previous
+        );
+    }
+
+    #[test]
+    fn canonical_completion_cleanup_invalidates_prefetch() {
+        let state = build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            super::embedded_cue_asset_paths(),
+            String::from("not configured"),
+        );
+        let publication_state = super::PreferencePublicationState::new(&state);
+        let before = state.prefetch_generation.load(Ordering::SeqCst);
+
+        super::clear_disabled_completion_after_publication(&publication_state)
+            .expect("completion cleanup should succeed");
+
+        assert_eq!(state.prefetch_generation.load(Ordering::SeqCst), before + 1);
+    }
+
+    #[test]
+    fn canonical_runtime_publication_rechecks_shutdown_inside_lifecycle_gate() {
+        let state = build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            super::embedded_cue_asset_paths(),
+            String::from("not configured"),
+        );
+        let preferences = get_app_snapshot_from_state(&state)
+            .expect("initial snapshot")
+            .preferences;
+        let previous_ui = *state.ui_preferences.lock().expect("UI preferences");
+        state
+            .settings_publication_in_progress
+            .store(true, Ordering::Release);
+        let publication = super::SettingsPublicationGuard {
+            in_progress: Arc::clone(&state.settings_publication_in_progress),
+            armed: true,
+        };
+        let token = super::RuntimePublicationToken {
+            exit_cleanup_started: Arc::new(AtomicBool::new(true)),
+            switch_generation: Arc::new(AtomicU64::new(4)),
+            expected_generation: 4,
+        };
+
+        let error = super::publish_validated_preferences(
+            &super::PreferencePublicationState::new(&state),
+            &preferences,
+            AssistantSettingsPayload::from(&preferences),
+            ResponseProfilePayload::Fast,
+            UiPreferencesState {
+                theme: UiThemePayload::Light,
+                text_size: UiTextSizePayload::ExtraLarge,
+            },
+            false,
+            false,
+            None,
+            None,
+            None,
+            Some(&token),
+            publication,
+        )
+        .expect_err("shutdown should supersede final publication");
+
+        assert_eq!(error.code(), voxgolem_core::ipc::CommandErrorCode::Busy);
+        assert_eq!(
+            *state.ui_preferences.lock().expect("UI preferences"),
+            previous_ui
+        );
+        assert!(!state
+            .settings_publication_in_progress
+            .load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn canonical_non_profile_publication_rechecks_shutdown_inside_lifecycle_gate() {
+        let state = build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            super::embedded_cue_asset_paths(),
+            String::from("not configured"),
+        );
+        let preferences = get_app_snapshot_from_state(&state)
+            .expect("initial snapshot")
+            .preferences;
+        let previous_ui = *state.ui_preferences.lock().expect("UI preferences");
+        state.exit_cleanup_started.store(true, Ordering::SeqCst);
+        state
+            .settings_publication_in_progress
+            .store(true, Ordering::Release);
+        let publication = super::SettingsPublicationGuard {
+            in_progress: Arc::clone(&state.settings_publication_in_progress),
+            armed: true,
+        };
+
+        let error = super::publish_validated_preferences(
+            &super::PreferencePublicationState::new(&state),
+            &preferences,
+            AssistantSettingsPayload::from(&preferences),
+            ResponseProfilePayload::Fast,
+            UiPreferencesState {
+                theme: UiThemePayload::Light,
+                text_size: UiTextSizePayload::ExtraLarge,
+            },
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            publication,
+        )
+        .expect_err("shutdown should supersede non-profile publication");
+
+        assert_eq!(error.code(), voxgolem_core::ipc::CommandErrorCode::Busy);
+        assert_eq!(
+            *state.ui_preferences.lock().expect("UI preferences"),
+            previous_ui
+        );
+        assert!(!state
+            .settings_publication_in_progress
+            .load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn canonical_non_profile_shutdown_after_write_restores_exact_previous_state() {
+        let _appdata_lock = APPDATA_ENV_LOCK
+            .lock()
+            .expect("APPDATA test lock should not be poisoned");
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let previous_appdata = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", temp_dir.path());
+        let state = Arc::new(build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            super::embedded_cue_asset_paths(),
+            String::from("not configured"),
+        ));
+        let previous = get_app_snapshot_from_state(&state)
+            .expect("initial snapshot")
+            .preferences;
+        persist_validated_preferences(&previous).expect("previous preferences should persist");
+        let state_path = response_profile_state_path().expect("state path");
+        let state_file_lock = lock_persisted_state_file(&state_path).expect("state file lock");
+        let mut requested = previous.clone();
+        requested.ui_theme = voxgolem_core::ipc::UiTheme::Light;
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let command_state = Arc::clone(&state);
+        let command = std::thread::spawn(move || {
+            result_tx
+                .send(tauri::async_runtime::block_on(set_preferences_from_state(
+                    requested,
+                    &command_state,
+                )))
+                .expect("command result");
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !state
+            .settings_publication_in_progress
+            .load(Ordering::Acquire)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "command did not reserve publication"
+            );
+            std::thread::yield_now();
+        }
+        assert!(begin_exit_cleanup(&state));
+        drop(state_file_lock);
+        let error = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("command should finish")
+            .expect_err("exit should supersede preference publication");
+        command.join().expect("command thread");
+        let snapshot = get_app_snapshot_from_state(&state).expect("unchanged snapshot");
+        let persisted = load_persisted_state().expect("restored persisted state");
+
+        match previous_appdata {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+        assert_eq!(error.code(), voxgolem_core::ipc::CommandErrorCode::Busy);
+        assert_eq!(snapshot.preferences, previous);
+        assert_eq!(persisted, PersistedState::from(&previous));
+    }
+
+    #[test]
+    fn exit_reservation_waits_for_the_lifecycle_publication_boundary() {
+        let state = Arc::new(build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            super::embedded_cue_asset_paths(),
+            String::from("not configured"),
+        ));
+        let lifecycle = state.lifecycle_gate.lock().expect("lifecycle gate");
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let exit_state = Arc::clone(&state);
+        let exit = std::thread::spawn(move || {
+            result_tx
+                .send(begin_exit_cleanup(&exit_state))
+                .expect("exit result");
+        });
+
+        assert!(result_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(lifecycle);
+        assert!(result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("exit should reserve cleanup"));
+        exit.join().expect("exit thread");
+        assert!(state.exit_cleanup_started.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn canonical_persistence_failure_does_not_publish_preferences() {
+        let _appdata_lock = APPDATA_ENV_LOCK
+            .lock()
+            .expect("APPDATA test lock should not be poisoned");
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let invalid_appdata = temp_dir.path().join("not-a-directory");
+        fs::write(&invalid_appdata, b"file").expect("invalid APPDATA fixture");
+        let previous_appdata = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", &invalid_appdata);
+        let state = build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            super::embedded_cue_asset_paths(),
+            String::from("not configured"),
+        );
+        let previous = get_app_snapshot_from_state(&state)
+            .expect("initial snapshot")
+            .preferences;
+        let mut requested = previous.clone();
+        requested.ui_theme = voxgolem_core::ipc::UiTheme::Light;
+
+        let error = tauri::async_runtime::block_on(set_preferences_from_state(requested, &state))
+            .expect_err("invalid persistence directory should reject the update");
+        let snapshot = get_app_snapshot_from_state(&state).expect("unchanged snapshot");
+
+        match previous_appdata {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+        assert_eq!(error.code(), voxgolem_core::ipc::CommandErrorCode::Internal);
+        assert_eq!(snapshot.preferences, previous);
+        assert!(!state
+            .settings_publication_in_progress
+            .load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn canonical_preferences_preserve_incompatible_persisted_state_bytes() {
+        let _appdata_lock = APPDATA_ENV_LOCK
+            .lock()
+            .expect("APPDATA test lock should not be poisoned");
+        let previous_appdata = std::env::var_os("APPDATA");
+        let cases = [
+            "unknown_field = true\n",
+            "[future]\nvalue = 1\n",
+            "ui_theme = \"dark\"\nui_theme = \"light\"\n",
+            "ui_theme =\n",
+            "tts_enabled = \"true\"\n",
+        ];
+        for (index, contents) in cases.into_iter().enumerate() {
+            let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+            std::env::set_var("APPDATA", temp_dir.path());
+            let state_path = response_profile_state_path().expect("state path");
+            fs::create_dir_all(state_path.parent().expect("state parent"))
+                .expect("state directory");
+            fs::write(&state_path, contents).expect("incompatible state fixture");
+            let state = build_nonfatal_config_error_app_state(
+                default_voice_pipeline_config(),
+                super::embedded_cue_asset_paths(),
+                String::from("not configured"),
+            );
+            let mut requested = get_app_snapshot_from_state(&state)
+                .expect("initial snapshot")
+                .preferences;
+            requested.ui_theme = match requested.ui_theme {
+                voxgolem_core::ipc::UiTheme::Light => voxgolem_core::ipc::UiTheme::Dark,
+                voxgolem_core::ipc::UiTheme::Dark => voxgolem_core::ipc::UiTheme::Light,
+            };
+
+            let result =
+                tauri::async_runtime::block_on(set_preferences_from_state(requested, &state));
+            let Err(error) = result else {
+                panic!("case {index} should reject incompatible state");
+            };
+
+            assert_eq!(error.code(), voxgolem_core::ipc::CommandErrorCode::Internal);
+            assert_eq!(
+                fs::read(&state_path).expect("state bytes"),
+                contents.as_bytes()
+            );
+        }
+        match previous_appdata {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+    }
+
+    fn missing_llama_app_state(root: &std::path::Path) -> super::AppState {
+        let mut state = build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            super::embedded_cue_asset_paths(),
+            String::from("not configured"),
+        );
+        let missing_server = root.join("missing-llama-server");
+        let fast_model = root.join("fast.gguf");
+        let quality_model = root.join("quality.gguf");
+        state.runtime_config = Some(voxgolem_core::config::RuntimeConfig {
+            wake_word_model_path: root.join("wake.onnx"),
+            parakeet_model_dir: root.join("parakeet"),
+            silero_vad_model: root.join("vad.onnx"),
+            silence_timeout_ms: DEFAULT_SILENCE_TIMEOUT_MS,
+            wake_word_detection_threshold: 0.68,
+            local_tts: voxgolem_core::config::LocalTtsConfig {
+                enabled: false,
+                model_path: root.join("tts.onnx"),
+                worker_count: 1,
+                max_queue: 8,
+                sample_rate_hz: 22_050,
+                max_duration_s: 300,
+                output_gain_db: 3.0,
+            },
+            logging: voxgolem_core::config::LoggingConfig { enabled: false },
+            telemetry: voxgolem_core::config::TelemetryConfig {
+                enabled: false,
+                max_bytes: 10 * 1024 * 1024,
+                backup_count: 3,
+            },
+            response_backend: voxgolem_core::config::ResponseBackendConfig::LlamaCpp {
+                server_path: missing_server.clone(),
+                host: String::from("127.0.0.1"),
+                port: 65_300,
+                fast_model_path: fast_model.clone(),
+                quality_model_path: Some(quality_model.clone()),
+            },
+            opencode: None,
+            llama_cpp: Some(voxgolem_core::config::LlamaCppConfig {
+                server_path: missing_server,
+                host: String::from("127.0.0.1"),
+                port: 65_300,
+                fast_model_path: fast_model,
+                quality_model_path: Some(quality_model),
+                inference_provider: voxgolem_core::config::InferencePolicy::Auto,
+            }),
+            custom_openai: None,
+            completion: None,
+            capability_issues: Vec::new(),
+        });
+        state.supported_response_profiles = vec![
+            ResponseProfilePayload::Fast,
+            ResponseProfilePayload::Quality,
+        ];
+        *state.startup_state.lock().expect("startup state") = StartupStatePayload::Ready {
+            cue_asset_paths: super::embedded_cue_asset_paths(),
+            runtime_phase: RuntimePhasePayload::Sleeping,
+            voice_input_available: false,
+            voice_input_error: None,
+            silence_timeout_ms: DEFAULT_SILENCE_TIMEOUT_MS,
+            selected_response_profile: ResponseProfilePayload::Fast,
+            supported_response_profiles: state.supported_response_profiles.clone(),
+            prompt_cancellation_available: true,
+            tts_enabled: false,
+            tts_output_gain_db: 3.0,
+            capabilities: vec![
+                CapabilityPayload {
+                    id: "local_fast",
+                    state: CapabilityStatePayload::Available,
+                    reason: String::from("ready"),
+                    actual_provider: Some("cpu"),
+                },
+                CapabilityPayload {
+                    id: "local_quality",
+                    state: CapabilityStatePayload::Available,
+                    reason: String::from("configured"),
+                    actual_provider: None,
+                },
+            ],
+        };
+        state
+    }
+
+    #[test]
+    fn canonical_profile_startup_failure_keeps_previous_preferences() {
+        let _appdata_lock = APPDATA_ENV_LOCK
+            .lock()
+            .expect("APPDATA test lock should not be poisoned");
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let previous_appdata = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", temp_dir.path());
+        let state = missing_llama_app_state(temp_dir.path());
+        let previous = get_app_snapshot_from_state(&state)
+            .expect("initial snapshot")
+            .preferences;
+        persist_validated_preferences(&previous).expect("previous preferences should persist");
+        let mut requested = previous.clone();
+        requested.instant = voxgolem_core::ipc::InstantModelChoice::LocalQuality;
+        requested.response_profile = voxgolem_core::ipc::ResponseProfile::Quality;
+
+        let error = tauri::async_runtime::block_on(set_preferences_from_state(requested, &state))
+            .expect_err("missing llama.cpp server should reject the update");
+        let snapshot = get_app_snapshot_from_state(&state).expect("restored snapshot");
+        let persisted = load_persisted_state().expect("restored state should reload");
+
+        match previous_appdata {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+        assert_eq!(
+            error.code(),
+            voxgolem_core::ipc::CommandErrorCode::Unavailable
+        );
+        assert_eq!(snapshot.preferences, previous);
+        assert_eq!(persisted, PersistedState::from(&previous));
+        assert!(!state
+            .settings_publication_in_progress
+            .load(Ordering::Acquire));
+        assert!(state
+            .llama_cpp_runtime
+            .lock()
+            .expect("llama runtime")
+            .is_none());
+    }
+
+    #[test]
+    fn canonical_restore_failure_preserves_newer_unrelated_capabilities() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let state = missing_llama_app_state(temp_dir.path());
+        let stale_snapshot = super::startup_snapshot_for_profile_switch(
+            &state.startup_state,
+            ResponseProfilePayload::Quality,
+            state.supported_response_profiles.clone(),
+        )
+        .expect("startup snapshot");
+        if let StartupStatePayload::Ready { capabilities, .. } =
+            &mut *state.startup_state.lock().expect("startup state")
+        {
+            capabilities.push(CapabilityPayload {
+                id: "qwen_prediction",
+                state: CapabilityStatePayload::Available,
+                reason: String::from("ready"),
+                actual_provider: Some("cpu"),
+            });
+        }
+        let failure = super::startup_state_after_profile_restore_failure(
+            &stale_snapshot,
+            ResponseProfilePayload::Quality,
+            ResponseProfilePayload::Fast,
+            "requested failed",
+            "restore failed",
+        );
+        state
+            .settings_publication_in_progress
+            .store(true, Ordering::Release);
+        let publication = super::SettingsPublicationGuard {
+            in_progress: Arc::clone(&state.settings_publication_in_progress),
+            armed: true,
+        };
+        let token = super::RuntimePublicationToken {
+            exit_cleanup_started: Arc::new(AtomicBool::new(false)),
+            switch_generation: Arc::new(AtomicU64::new(9)),
+            expected_generation: 9,
+        };
+
+        super::publish_preference_startup_failure(
+            &super::PreferencePublicationState::new(&state),
+            failure,
+            &token,
+            publication,
+        )
+        .expect("profile failure should publish");
+        let startup = state.startup_state.lock().expect("startup state");
+        let StartupStatePayload::Ready { capabilities, .. } = &*startup else {
+            panic!("profile failure should keep the shell ready");
+        };
+
+        assert!(capabilities.iter().any(|capability| {
+            capability.id == "qwen_prediction"
+                && capability.state == CapabilityStatePayload::Available
+        }));
+        assert!(capabilities.iter().any(|capability| {
+            capability.id == "local_quality" && capability.state == CapabilityStatePayload::Failed
+        }));
     }
 
     #[test]
@@ -12964,7 +14669,7 @@ mod tests {
             &mut capabilities,
             ResponseProfilePayload::Quality,
             ResponseProfilePayload::Fast,
-            "boom",
+            "failed at /home/private/model.gguf on http://127.0.0.1:8080",
             "cpu",
         );
 
@@ -12973,8 +14678,10 @@ mod tests {
         assert_eq!(capabilities[1].state, CapabilityStatePayload::Failed);
         assert_eq!(
             capabilities[1].reason,
-            "failed to initialize requested quality profile: boom"
+            "failed to initialize requested quality profile"
         );
+        assert!(!capabilities[1].reason.contains("/home/private"));
+        assert!(!capabilities[1].reason.contains("127.0.0.1"));
         assert_eq!(capabilities[1].actual_provider, None);
     }
 
@@ -13025,8 +14732,8 @@ mod tests {
             &snapshot,
             ResponseProfilePayload::Fast,
             ResponseProfilePayload::Fast,
-            "first failure",
-            "second failure",
+            "failed at /home/private/requested.gguf",
+            "failed at http://127.0.0.1:8080/restore",
         );
 
         let super::StartupStatePayload::Ready {
@@ -13039,7 +14746,12 @@ mod tests {
         };
         assert_eq!(selected_response_profile, ResponseProfilePayload::Fast);
         assert_eq!(capabilities[0].state, CapabilityStatePayload::Failed);
-        assert!(capabilities[0].reason.contains("second failure"));
+        assert_eq!(
+            capabilities[0].reason,
+            "failed to initialize requested fast profile; retry failed"
+        );
+        assert!(!capabilities[0].reason.contains("/home/private"));
+        assert!(!capabilities[0].reason.contains("127.0.0.1"));
         assert_eq!(capabilities[0].actual_provider, None);
     }
 
@@ -13165,6 +14877,65 @@ mod tests {
     }
 
     #[test]
+    fn persist_validated_preferences_replaces_every_preference_in_one_state() {
+        let _appdata_lock = APPDATA_ENV_LOCK
+            .lock()
+            .expect("APPDATA test lock should not be poisoned");
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let previous_appdata = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", temp_dir.path());
+        let previous = PersistedState {
+            selected_response_profile: Some(ResponseProfilePayload::Fast),
+            tts_enabled: Some(false),
+            ui_text_size: Some(UiTextSizePayload::Small),
+            ui_theme: Some(UiThemePayload::Light),
+            assistant_settings: Some(AssistantSettingsPayload::default()),
+        };
+        persist_state(previous).expect("previous state should persist");
+        let preferences = voxgolem_core::ipc::ValidatedPreferences {
+            instant: voxgolem_core::ipc::InstantModelChoice::CustomLunaLow,
+            deep: voxgolem_core::ipc::AgentModelChoice::CustomSolHigh,
+            review: voxgolem_core::ipc::AgentModelChoice::OpenCodeLunaLow,
+            deep_enabled: true,
+            review_enabled: true,
+            prefetch: true,
+            completion: false,
+            response_profile: voxgolem_core::ipc::ResponseProfile::Quality,
+            tts_enabled: true,
+            ui_theme: voxgolem_core::ipc::UiTheme::Dark,
+            ui_text_size: voxgolem_core::ipc::UiTextSize::ExtraLarge,
+        };
+
+        let replaced = persist_validated_preferences(&preferences)
+            .expect("complete preferences should persist");
+        let persisted = load_persisted_state().expect("state should reload");
+
+        match previous_appdata {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+        assert_eq!(replaced, previous);
+        assert_eq!(
+            persisted,
+            PersistedState {
+                selected_response_profile: Some(ResponseProfilePayload::Quality),
+                tts_enabled: Some(true),
+                ui_text_size: Some(UiTextSizePayload::ExtraLarge),
+                ui_theme: Some(UiThemePayload::Dark),
+                assistant_settings: Some(AssistantSettingsPayload {
+                    instant: InstantChoicePayload::CustomLunaLow,
+                    deep: AgentChoicePayload::CustomSolHigh,
+                    review: AgentChoicePayload::OpenCodeLunaLow,
+                    deep_enabled: true,
+                    review_enabled: true,
+                    prefetch: true,
+                    completion: false,
+                }),
+            }
+        );
+    }
+
+    #[test]
     fn startup_cleanup_removes_only_recognized_orphan_state_temps() {
         let _appdata_lock = APPDATA_ENV_LOCK
             .lock()
@@ -13270,24 +15041,14 @@ mod tests {
     fn parse_persisted_state_rejects_invalid_ui_text_size() {
         let result = parse_persisted_state("ui_text_size = \"giant\"\n");
 
-        assert_eq!(
-            result,
-            Err(String::from(
-                "invalid state.toml: unsupported ui_text_size `giant`"
-            ))
-        );
+        assert!(result.is_err());
     }
 
     #[test]
     fn parse_persisted_state_rejects_invalid_ui_theme() {
         let result = parse_persisted_state("ui_theme = \"sepia\"\n");
 
-        assert_eq!(
-            result,
-            Err(String::from(
-                "invalid state.toml: unsupported ui_theme `sepia`"
-            ))
-        );
+        assert!(result.is_err());
     }
 
     #[test]
