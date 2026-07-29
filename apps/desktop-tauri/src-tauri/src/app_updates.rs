@@ -986,6 +986,7 @@ fn stage_and_launch_windows_installer(bytes: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("failed to stage installer: {error}"))?;
     file.sync_all()
         .map_err(|error| format!("failed to sync staged installer: {error}"))?;
+    drop(file);
     Command::new(&installer)
         .args(windows_launch_args())
         .spawn()
