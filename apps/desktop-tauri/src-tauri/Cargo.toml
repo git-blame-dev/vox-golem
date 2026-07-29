@@ -23,6 +23,7 @@ tempfile = "3"
 tokio = { version = "1", features = ["macros", "signal", "sync", "test-util", "time"] }
 tauri = { version = "2", features = ["protocol-asset"] }
 thiserror = "2"
+toml = "0.8"
 transcribe-rs = { version = "=0.3.11", features = ["onnx"] }
 voxgolem-audio = { path = "../../../crates/audio" }
 voxgolem-core = { path = "../../../crates/core" }
