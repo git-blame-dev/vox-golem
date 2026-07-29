@@ -236,11 +236,16 @@ jobs:
           github-token: ${{ github.token }}
           run-id: ${{ github.event.workflow_run.id }}
 
+      - name: Install Windows verifier dependencies
+        if: steps.release_scope.outputs.should_publish == 'true'
+        run: sudo apt-get update && sudo apt-get install -y file llvm-19
+
       - name: Verify Windows installer artifact
         if: steps.release_scope.outputs.should_publish == 'true'
         env:
           APP_VERSION: ${{ steps.version.outputs.app_version }}
           VERSION: ${{ steps.version.outputs.version }}
+          VOXGOLEM_OBJDUMP: /usr/lib/llvm-19/bin/llvm-objdump
         run: |
           asset="vox-golem-windows-x86_64-${VERSION}-setup.exe"
           mapfile -t files < <(find windows-package -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
