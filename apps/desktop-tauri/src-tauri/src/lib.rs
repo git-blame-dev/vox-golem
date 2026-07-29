@@ -103,6 +103,7 @@ struct AppState {
     runtime_config: Option<voxgolem_core::config::RuntimeConfig>,
     selected_response_profile: Arc<Mutex<ResponseProfilePayload>>,
     ui_preferences: Mutex<UiPreferencesState>,
+    settings_operation_lock: Arc<tokio::sync::Mutex<()>>,
     ui_preferences_operation_lock: Mutex<()>,
     supported_response_profiles: Vec<ResponseProfilePayload>,
     response_profile_switch_generation: Arc<AtomicU64>,
@@ -1239,6 +1240,17 @@ fn ensure_app_running(exit_cleanup_started: &AtomicBool) -> Result<(), String> {
     }
 }
 
+async fn lock_live_settings_operation(
+    app_state: &AppState,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+    ensure_app_running(&app_state.exit_cleanup_started)?;
+    let guard = Arc::clone(&app_state.settings_operation_lock)
+        .lock_owned()
+        .await;
+    ensure_app_running(&app_state.exit_cleanup_started)?;
+    Ok(guard)
+}
+
 #[tauri::command]
 fn get_app_snapshot(
     app_state: tauri::State<'_, AppState>,
@@ -1301,7 +1313,7 @@ async fn set_tts_enabled(
     enabled: bool,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<SetTtsEnabledPayload, String> {
-    ensure_app_running(&app_state.exit_cleanup_started)?;
+    let _settings_operation = lock_live_settings_operation(&app_state).await?;
     let config = app_state
         .runtime_config
         .as_ref()
@@ -1515,10 +1527,11 @@ fn get_ui_text_size(app_state: tauri::State<'_, AppState>) -> Result<UiTextSizeP
 }
 
 #[tauri::command]
-fn set_ui_text_size(
+async fn set_ui_text_size(
     text_size: UiTextSizePayload,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<UiTextSizePayload, String> {
+    let _settings_operation = lock_live_settings_operation(&app_state).await?;
     let _operation = app_state
         .ui_preferences_operation_lock
         .lock()
@@ -1546,10 +1559,11 @@ fn get_ui_theme(app_state: tauri::State<'_, AppState>) -> Result<UiThemePayload,
 }
 
 #[tauri::command]
-fn set_ui_theme(
+async fn set_ui_theme(
     theme: UiThemePayload,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<UiThemePayload, String> {
+    let _settings_operation = lock_live_settings_operation(&app_state).await?;
     let _operation = app_state
         .ui_preferences_operation_lock
         .lock()
@@ -1579,10 +1593,11 @@ fn get_assistant_settings(
 }
 
 #[tauri::command]
-fn set_assistant_settings(
+async fn set_assistant_settings(
     settings: AssistantSettingsPayload,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<AssistantSettingsPayload, String> {
+    let _settings_operation = lock_live_settings_operation(&app_state).await?;
     let _operation_guard = lock_ready_response_backend_operation(
         &app_state.response_backend_operation_lock,
         &app_state.startup_state,
@@ -1822,11 +1837,11 @@ fn begin_response_profile_switch_transition(
 }
 
 #[tauri::command]
-fn switch_response_profile(
+async fn switch_response_profile(
     profile: ResponseProfilePayload,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<SwitchResponseProfilePayload, String> {
-    ensure_app_running(&app_state.exit_cleanup_started)?;
+    let settings_operation = lock_live_settings_operation(&app_state).await?;
     let supported_response_profiles = app_state.supported_response_profiles.clone();
     if !supported_response_profiles.contains(&profile) {
         return Err(format!(
@@ -1843,7 +1858,7 @@ fn switch_response_profile(
     };
 
     ensure_response_profile_switch_runtime_is_idle(&app_state.voice_pipeline_state)?;
-    invalidate_and_wait_for_prefetch(&app_state)?;
+    invalidate_and_wait_for_prefetch(&app_state).await?;
     let _operation_guard = lock_ready_response_backend_operation(
         &app_state.response_backend_operation_lock,
         &app_state.startup_state,
@@ -1971,6 +1986,7 @@ fn switch_response_profile(
     let startup_cancellation = voxgolem_platform::llama_cpp::LlamaCppStartupCancellation::default();
     let worker_cancellation = startup_cancellation.clone();
     let startup_coordinator = std::thread::spawn(move || {
+        let _settings_operation = settings_operation;
         let mut persistence_rollback = ProfilePersistenceRollback {
             previous_profile: current_profile,
             previous_settings: previous_assistant_settings,
@@ -6489,7 +6505,7 @@ fn abort_prefetch(app_state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
-fn invalidate_and_wait_for_prefetch(app_state: &AppState) -> Result<(), String> {
+async fn invalidate_and_wait_for_prefetch(app_state: &AppState) -> Result<(), String> {
     invalidate_prefetch(app_state)?;
     let active = app_state
         .prefetch_task
@@ -6502,17 +6518,15 @@ fn invalidate_and_wait_for_prefetch(app_state: &AppState) -> Result<(), String> 
     let Some(mut task) = active.task.take() else {
         return Ok(());
     };
-    tauri::async_runtime::block_on(async {
-        match tokio::time::timeout(Duration::from_secs(3), &mut task).await {
-            Ok(result) => result.map_err(|_| String::from("active prefetch task failed")),
-            Err(_) => {
-                task.abort();
-                Err(String::from(
-                    "timed out waiting for the active prefetch to stop",
-                ))
-            }
+    match tokio::time::timeout(Duration::from_secs(3), &mut task).await {
+        Ok(result) => result.map_err(|_| String::from("active prefetch task failed")),
+        Err(_) => {
+            task.abort();
+            Err(String::from(
+                "timed out waiting for the active prefetch to stop",
+            ))
         }
-    })
+    }
 }
 
 fn take_and_invalidate_prefetch(
@@ -8285,6 +8299,7 @@ fn initialize_app_state(init: AppStateInit) -> AppState {
         runtime_config: init.runtime_config,
         selected_response_profile: init.selected_response_profile,
         ui_preferences: Mutex::new(resolved_ui_preferences()),
+        settings_operation_lock: Arc::new(tokio::sync::Mutex::new(())),
         ui_preferences_operation_lock: Mutex::new(()),
         supported_response_profiles: init.supported_response_profiles,
         response_profile_switch_generation: init.response_profile_switch_generation,
@@ -10000,9 +10015,9 @@ mod tests {
         ingest_audio_frame_with_optional_wake_word_detection, initial_stage_sequence,
         invalidate_runtime_startups_for_exit, load_llama_cpp_system_prompt, load_persisted_state,
         load_persisted_tts_enabled, load_persisted_ui_text_size, load_persisted_ui_theme,
-        lock_ready_response_backend_operation, merge_profile_startup_publication,
-        model_path_for_profile, parse_deep_agent_json, parse_persisted_state,
-        parse_review_agent_json, persist_assistant_settings,
+        lock_live_settings_operation, lock_ready_response_backend_operation,
+        merge_profile_startup_publication, model_path_for_profile, parse_deep_agent_json,
+        parse_persisted_state, parse_review_agent_json, persist_assistant_settings,
         persist_prepared_local_instant_model_with, persist_selected_response_profile,
         persist_tts_enabled, persist_ui_text_size, persist_ui_theme,
         prepare_local_instant_model_with, process_wake_word_frame, race_durable_cancellation,
@@ -10461,6 +10476,37 @@ mod tests {
 
     #[test]
     fn queued_runtime_operations_recheck_exit_after_locking() {
+        let settings_state = Arc::new(build_startup_error_app_state(
+            default_voice_pipeline_config(),
+            String::from("test"),
+        ));
+        let settings_operation = tauri::async_runtime::block_on(
+            Arc::clone(&settings_state.settings_operation_lock).lock_owned(),
+        );
+        let (settings_started_tx, settings_started_rx) = std::sync::mpsc::channel();
+        let (settings_tx, settings_rx) = std::sync::mpsc::channel();
+        let queued_settings_state = Arc::clone(&settings_state);
+        let settings_worker = std::thread::spawn(move || {
+            settings_started_tx.send(()).expect("settings started");
+            let result = tauri::async_runtime::block_on(lock_live_settings_operation(
+                &queued_settings_state,
+            ));
+            settings_tx.send(result.map(drop)).expect("settings result");
+        });
+        settings_started_rx.recv().expect("settings should start");
+        assert!(settings_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        settings_state
+            .exit_cleanup_started
+            .store(true, Ordering::SeqCst);
+        drop(settings_operation);
+        assert_eq!(
+            settings_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("settings result"),
+            Err(String::from("application shutdown is in progress"))
+        );
+        settings_worker.join().expect("settings worker");
+
         let profile_state = Arc::new(build_nonfatal_config_error_app_state(
             default_voice_pipeline_config(),
             super::embedded_cue_asset_paths(),
@@ -13510,7 +13556,7 @@ mod tests {
             task: Some(task),
         });
 
-        super::invalidate_and_wait_for_prefetch(&app_state)
+        tauri::async_runtime::block_on(super::invalidate_and_wait_for_prefetch(&app_state))
             .expect("prefetch cancellation should settle");
         assert!(cancelled.load(Ordering::SeqCst));
         assert!(app_state.prefetch_task.lock().unwrap().is_none());
