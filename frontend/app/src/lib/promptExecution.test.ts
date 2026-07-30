@@ -6,9 +6,11 @@ import {
 } from './promptExecution'
 import type { PromptExecutionEvent } from '../types/chat'
 import { getTauriInternals } from './tauri'
+import { resetBrowserPreviewRuntime } from './browserRuntime'
 
 afterEach(() => {
   Reflect.deleteProperty(window, '__TAURI_INTERNALS__')
+  resetBrowserPreviewRuntime()
 })
 
 describe('prompt payload parsing', () => {
@@ -156,22 +158,28 @@ describe('executePrompt', () => {
     expect(getTauriInternals()?.createChannel).toBeTypeOf('function')
   })
 
-  it('emits browser fallback text when Tauri is unavailable', async () => {
+  it('streams a deterministic response through the browser preview adapter', async () => {
     const events: PromptExecutionEvent[] = []
 
     await expect(
       executePrompt('request-1', 'Draft release notes', (event) => events.push(event)),
-    ).resolves.toEqual({
+    ).resolves.toMatchObject({
       requestId: 'request-1',
       runtimePhase: 'sleeping',
       outcome: 'completed',
       errorMessage: null,
+      canonicalOutcome: 'completed',
+      canonicalTurn: {
+        requestId: 'request-1',
+        executionId: { sessionId: '1', generation: '1' },
+        answer: { content: { kind: 'text' } },
+      },
     })
     expect(events).toEqual([
       {
         requestId: 'request-1',
         kind: 'text',
-        text: 'Browser preview only — no backend response was generated. Prompt: Draft release notes',
+        text: 'Browser preview only: no backend response was generated. Prompt: Draft release notes',
       },
     ])
   })

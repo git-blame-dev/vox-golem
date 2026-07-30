@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { checkForUpdate, installUpdate, restartForUpdate } from './appUpdates'
 import type { UpdateCheckResult } from './appUpdates'
-import { getTauriInternals, isAndroidRuntime } from './tauri'
+import { getTauriInternals, isAndroidRuntime, isBrowserPreviewRuntime } from './tauri'
 
 export type UpdateState =
   | { readonly kind: 'checking' }
@@ -25,7 +25,7 @@ export interface AppUpdateController {
 }
 
 export function useAppUpdates(): AppUpdateController {
-  const [state, setState] = useState<UpdateState>(() => initialUpdateState(getTauriInternals() !== null, isAndroidRuntime))
+  const [state, setState] = useState<UpdateState>(() => initialUpdateState(getTauriInternals() !== null && !isBrowserPreviewRuntime(), isAndroidRuntime))
   const requestRevision = useRef(0)
 
   const loadUpdate = useCallback(async (revision: number): Promise<void> => {
@@ -47,7 +47,7 @@ export function useAppUpdates(): AppUpdateController {
   }, [loadUpdate])
 
   useEffect(() => {
-    if (getTauriInternals() === null || isAndroidRuntime) return
+    if (getTauriInternals() === null || isAndroidRuntime || isBrowserPreviewRuntime()) return
     const revision = ++requestRevision.current
     void loadUpdate(revision)
     return () => { requestRevision.current += 1 }

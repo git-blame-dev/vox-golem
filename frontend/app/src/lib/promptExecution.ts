@@ -1,4 +1,4 @@
-import { TauriCommandError, getTauriInternals, isAndroidRuntime, normalizeTauriError } from './tauri'
+import { TauriCommandError, getTauriInternals, isAndroidRuntime, isBrowserPreviewRuntime, normalizeTauriError } from './tauri'
 import { parseCanonicalTurn } from './appSnapshot'
 import { isRecord, parseRuntimePhase, utf8ByteLength } from './wire'
 import type {
@@ -167,24 +167,13 @@ export async function executePrompt(
   source: 'typed' | 'voice' = 'typed',
 ): Promise<PromptExecutionResult> {
   const tauri = typeof window === 'undefined' ? null : getTauriInternals()
-  if (tauri === null) {
-    onEvent({
-      requestId,
-      kind: 'text',
-      text: `Browser preview only — no backend response was generated. Prompt: ${prompt}`,
-    })
-    return {
-      requestId,
-      runtimePhase: 'sleeping',
-      outcome: 'completed',
-      errorMessage: null,
-    }
-  }
+  if (tauri === null) throw new Error('Prompt execution requires a runtime adapter')
+  const canonicalRuntime = isAndroidRuntime || isBrowserPreviewRuntime()
 
   if (tauri.createChannel !== undefined) {
     const updates = tauri.createChannel<unknown>((payload) => {
       try {
-        if (isAndroidRuntime) {
+        if (canonicalRuntime) {
           onEvent(parseAndroidPromptUpdate(payload, requestId))
           return
         }
@@ -204,7 +193,7 @@ export async function executePrompt(
       throw error
     }
     let result: PromptExecutionResult
-    if (isAndroidRuntime) {
+    if (canonicalRuntime) {
       result = parseAndroidPromptOutcomeForExecution(payload, requestId)
     } else {
       result = parsePromptExecutionResult(payload)

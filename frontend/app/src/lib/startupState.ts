@@ -131,10 +131,6 @@ export async function loadStartupState(): Promise<StartupState> {
       hasInjectedTauriInternals: hasInjectedTauriInternals(),
     })
 
-    if (!hasInjectedTauriInternals()) {
-      return buildDefaultStartupState()
-    }
-
     const message = error instanceof Error ? error.message : 'Failed to load startup state'
     return {
       kind: 'error',
