@@ -70,7 +70,8 @@ describe('UpdateSettings', () => {
     }
 
     const container = await renderUpdates()
-    expect(container.textContent).toContain('release endpoint unavailable')
+    expect(container.textContent).toContain('Update failed: release endpoint unavailable')
+    expect(container.textContent).not.toContain('Check failed:')
 
     await act(async () => {
       getButton(container, 'Retry').click()
