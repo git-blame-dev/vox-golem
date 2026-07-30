@@ -26,7 +26,8 @@ import {
   isStartupStateSettled,
   loadStartupState,
 } from './lib/startupState'
-import { getTauriInternals, invokeTauriCommand } from './lib/tauri'
+import { getTauriInternals, invokeTauriCommand, isBrowserPreviewRuntime } from './lib/tauri'
+import { teardownBrowserPreviewRuntime } from './lib/browserRuntime'
 import { useAppUpdates } from './lib/useAppUpdates'
 import { DEFAULT_ASSISTANT_SETTINGS, deepOptions, instantOptions, parseAssistantSettings, reviewOptions, serializeAssistantSettings } from './lib/assistantSettings'
 import type { AssistantSettings } from './lib/assistantSettings'
@@ -1024,7 +1025,7 @@ function App() {
         const syncRuntimeStatus = !hydrated && !snapshotRuntimeHydratedRef.current
         const publishedState = applyStartupState(nextState, syncRuntimeStatus, startupSnapshotRevision)
 
-        if (publishedState.kind === 'ready') {
+        if (publishedState.kind === 'ready' && !isBrowserPreviewRuntime()) {
           const newlyUnavailableCapabilities = publishedState.capabilities.filter(({ id, state }) => {
             if (state !== 'not_configured' && state !== 'unavailable' && state !== 'failed') return false
             if (previousKind !== 'ready') return true
@@ -1095,6 +1096,7 @@ function App() {
       liveAudioSessionIdRef.current += 1
       liveAudioSourceRef.current?.stop()
       liveAudioSourceRef.current = null
+      if (isBrowserPreviewRuntime()) teardownBrowserPreviewRuntime()
     }
   }, [])
 
@@ -2819,6 +2821,7 @@ function App() {
       <header className="shell__header" aria-label="VoxGolem">
         <div className="shell__identity" data-shell-identity>
           <strong>VoxGolem</strong>
+          {isBrowserPreviewRuntime() ? <span data-browser-preview>Browser preview</span> : null}
           <span data-runtime-phase>Runtime: {runtimeStatus}</span>
         </div>
         <div className="shell__header-actions">

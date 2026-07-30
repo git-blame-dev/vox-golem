@@ -4,6 +4,7 @@ import type { Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as liveAudioSourceModule from './lib/liveAudioSource'
 import type { StartLiveAudioSourceOptions } from './lib/liveAudioSource'
+import { configureBrowserPreviewFixture } from './lib/browserRuntime'
 import App from './App'
 
 const startLiveAudioSourceMock = vi.spyOn(liveAudioSourceModule, 'startLiveAudioSource')
@@ -205,6 +206,7 @@ describe('App', () => {
 
     expect(header).not.toBeNull()
     expect(header?.querySelector('[data-shell-identity]')?.textContent).toContain('VoxGolem')
+    expect(header?.querySelector('[data-browser-preview]')?.textContent).toBe('Browser preview')
     expect(header?.querySelector('[data-runtime-phase]')?.textContent).toContain(getShell(container).dataset['runtimeStatus'])
     expect(header?.querySelector('[aria-label="Switch to light mode"]')).not.toBeNull()
     expect(header?.querySelector('[aria-label="Settings"]')).not.toBeNull()
@@ -278,7 +280,7 @@ describe('App', () => {
 
     expect(container.textContent).toContain('Draft release notes')
     expect(container.textContent).toContain(
-      'Browser preview only — no backend response was generated. Prompt: Draft release notes',
+      'Browser preview only: no backend response was generated. Prompt: Draft release notes',
     )
   })
 
@@ -297,6 +299,31 @@ describe('App', () => {
     expect(container.querySelectorAll('.message--assistant')).toHaveLength(2)
     expect(getConversation(container).textContent).toContain('First repeated request')
     expect(getConversation(container).textContent).toContain('Second repeated request')
+  })
+
+  it('cancels a delayed browser preview through the shared Stop control', async () => {
+    vi.useFakeTimers()
+    configureBrowserPreviewFixture({ delayMs: 50, chunks: ['Delayed browser response'] })
+    const { container } = await renderApp()
+
+    await act(async () => {
+      setTextAreaValue(getComposer(container), 'Cancel browser preview')
+      getSendButton(container).click()
+      await Promise.resolve()
+    })
+    const stopButton = Array.from(container.querySelectorAll('button')).find((button) => button.textContent === 'Stop')
+    expect(stopButton).not.toBeUndefined()
+
+    await act(async () => {
+      stopButton?.click()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(getConversation(container).textContent).toBe('')
+    expect(container.textContent).toContain('Response cancelled')
+    await act(async () => { await vi.advanceTimersByTimeAsync(200) })
+    expect(getConversation(container).textContent).toBe('')
   })
 
   it('starts with an empty chat transcript', async () => {
@@ -2155,7 +2182,7 @@ describe('App', () => {
     expect(getTtsToggle(container).checked).toBe(true)
   })
 
-  it('resets browser preview history without invoking a native command', async () => {
+  it('resets browser preview history through the simulated adapter', async () => {
     const { container } = await renderApp()
     await act(async () => {
       setTextAreaValue(getComposer(container), 'Browser reset prompt')
@@ -3325,7 +3352,7 @@ describe('App', () => {
     })
 
     expect(container.textContent).not.toContain(
-      'Browser preview only — no backend response was generated. Prompt: Line one',
+      'Browser preview only: no backend response was generated. Prompt: Line one',
     )
 
     await act(async () => {
@@ -3339,7 +3366,7 @@ describe('App', () => {
     })
 
     expect(container.textContent).not.toContain(
-      'Browser preview only — no backend response was generated. Prompt: Line one',
+      'Browser preview only: no backend response was generated. Prompt: Line one',
     )
 
     await act(async () => {
@@ -3352,7 +3379,7 @@ describe('App', () => {
     })
 
     expect(container.textContent).toContain(
-      'Browser preview only — no backend response was generated. Prompt: Line one',
+      'Browser preview only: no backend response was generated. Prompt: Line one',
     )
   })
 

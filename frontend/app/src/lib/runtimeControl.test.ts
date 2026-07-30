@@ -6,8 +6,17 @@ afterEach(() => {
 })
 
 describe('invokeRuntimeControl', () => {
-  it('returns null when tauri internals are unavailable', async () => {
-    await expect(invokeRuntimeControl('reset_session')).resolves.toBeNull()
+  it('resets the browser preview runtime through the shared adapter', async () => {
+    await expect(invokeRuntimeControl('reset_session')).resolves.toEqual({
+      runtimePhase: 'sleeping',
+      transcriptionReadySamples: null,
+      transcriptText: null,
+      lastActivityMs: null,
+      capturingUtterance: false,
+      prerollSamples: 0,
+      utteranceSamples: 0,
+      telemetry: null,
+    })
   })
 
   it('parses runtime phase payloads from tauri commands', async () => {

@@ -6,6 +6,7 @@ import {
 } from '@tauri-apps/api/core'
 import { listen as tauriListen } from '@tauri-apps/api/event'
 import type { AppSnapshot, ValidatedPreferences } from './appSnapshot'
+import { getBrowserPreviewInternals } from './browserRuntime'
 import { utf8ByteLength } from './wire'
 const ANDROID_CAPABILITY_IDS = ['custom_provider', 'opencode', 'local_fast', 'local_quality', 'qwen_prediction', 'wake_word', 'vad', 'parakeet', 'tts', 'deep', 'review'] as const
 const COMMAND_ERROR_CODES = ['invalid_input', 'not_found', 'busy', 'unavailable', 'internal'] as const
@@ -68,9 +69,7 @@ export function getTauriInternals(): TauriInternals | null {
     return withoutAndroidEventListener(tauriInternals, isAndroidRuntime)
   }
 
-  if (!isTauri()) {
-    return null
-  }
+  if (!isTauri()) return getBrowserPreviewInternals()
 
   return createTauriApi()
 }
@@ -93,6 +92,10 @@ export function withoutAndroidEventListener(internals: TauriInternals, android: 
 
 export function hasInjectedTauriInternals(): boolean {
   return typeof window !== 'undefined' && typeof window.__TAURI_INTERNALS__?.invoke === 'function'
+}
+
+export function isBrowserPreviewRuntime(): boolean {
+  return typeof window !== 'undefined' && !isAndroidRuntime && !hasInjectedTauriInternals() && !isTauri()
 }
 
 export const isAndroidRuntime = import.meta.env['VITE_VOXGOLEM_RUNTIME'] === 'android'
@@ -129,10 +132,8 @@ export function buildAndroidStartupState(snapshot: AppSnapshot): Record<string, 
 
 export async function invokeTauriCommand(command: string, args?: unknown): Promise<unknown> {
   if (isAndroidRuntime) return invokeAndroidCommand(command, args)
-  if (hasInjectedTauriInternals()) {
-    return window.__TAURI_INTERNALS__!.invoke(command, args)
-  }
-
+  const internals = getTauriInternals()
+  if (internals !== null) return internals.invoke(command, args)
   return tauriInvoke(command, args as Parameters<typeof tauriInvoke>[1])
 }
 
