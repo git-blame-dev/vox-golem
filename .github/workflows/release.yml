@@ -355,8 +355,8 @@ jobs:
           test -n "$TAURI_SIGNING_PRIVATE_KEY" || { printf '%s\n' 'TAURI_SIGNING_PRIVATE_KEY is required.' >&2; exit 1; }
           linux_asset="vox-golem-linux-x86_64-${VERSION}.AppImage"
           windows_asset="vox-golem-windows-x86_64-${VERSION}-setup.exe"
-          cargo tauri signer sign --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "dist/$linux_asset"
-          cargo tauri signer sign --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "dist/$windows_asset"
+          cargo-tauri signer sign --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "dist/$linux_asset"
+          cargo-tauri signer sign --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "dist/$windows_asset"
 
       - name: Generate updater manifest
         if: steps.release_scope.outputs.should_publish == 'true'

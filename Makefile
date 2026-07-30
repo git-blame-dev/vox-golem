@@ -327,6 +327,7 @@ pc-dist: pc
 pc-installer: pc-dist $(WINDOWS_NSIS_TEMPLATE)
 	@test -n '$(APP_VERSION)' || { printf '%s\n' 'Failed to generate application version.' >&2; exit 1; }
 	@case '$(APP_VERSION)' in *[!0-9A-Za-z.-]*|'') printf 'Invalid APP_VERSION: %s\n' '$(APP_VERSION)' >&2; exit 1;; esac
+	@rm -rf '$(WINDOWS_NSIS_DIR)'
 	PATH='$(WINDOWS_CROSS_BIN)':"$$PATH" \
 	VOXGOLEM_REAL_CLANG_CL='$(REAL_CLANG_CL)' \
 	VOXGOLEM_ESPEAK_COMPAT_HEADER='$(ESPEAK_COMPAT_HEADER)' \
