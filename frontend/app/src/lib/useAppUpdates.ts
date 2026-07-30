@@ -17,6 +17,7 @@ export interface AppUpdateController {
   readonly install: (version: string, installBehavior?: InstallBehavior) => Promise<void>
   readonly restart: () => Promise<void>
   readonly progress: UpdateProgress | undefined
+  readonly restartPending: boolean
 }
 
 export function useAppUpdates(): AppUpdateController {
@@ -25,7 +26,9 @@ export function useAppUpdates(): AppUpdateController {
   )
   const requestRevision = useRef(0)
   const activeVersion = useRef<string | undefined>(undefined)
+  const operationInFlight = useRef<'install' | 'restart' | undefined>(undefined)
   const [progress, setProgress] = useState<UpdateProgress | undefined>()
+  const [restartPending, setRestartPending] = useState(false)
 
   const loadUpdate = useCallback(async (revision: number): Promise<void> => {
     try {
@@ -56,6 +59,8 @@ export function useAppUpdates(): AppUpdateController {
   }, [loadUpdate])
 
   const install = useCallback(async (version: string, installBehavior: InstallBehavior = 'install_then_restart'): Promise<void> => {
+    if (operationInFlight.current !== undefined) return
+    operationInFlight.current = 'install'
     const revision = ++requestRevision.current
     setState({ kind: 'installing', version })
     activeVersion.current = version
@@ -71,14 +76,22 @@ export function useAppUpdates(): AppUpdateController {
         setState({ kind: 'error', message: displayError(error) })
         setProgress(undefined)
       }
+    } finally {
+      if (operationInFlight.current === 'install') operationInFlight.current = undefined
     }
   }, [])
 
   const restart = useCallback(async (): Promise<void> => {
+    if (operationInFlight.current !== undefined) return
+    operationInFlight.current = 'restart'
+    setRestartPending(true)
     try {
       await restartForUpdate()
     } catch (error) {
       setState({ kind: 'error', message: displayError(error) })
+    } finally {
+      if (operationInFlight.current === 'restart') operationInFlight.current = undefined
+      setRestartPending(false)
     }
   }, [])
 
@@ -93,14 +106,14 @@ export function useAppUpdates(): AppUpdateController {
         const next = parseUpdateProgress(event.payload)
         setProgress((current) => activeVersion.current === next.version ? next : current)
       } catch { /* Ignore malformed native events. */ }
-    }).then((dispose) => { if (active) unlisten = dispose; else dispose() })
+    }).then((dispose) => { if (active) unlisten = dispose; else dispose() }).catch(() => undefined)
     return () => { active = false; unlisten?.() }
   }, [])
 
   const displayedState: UpdateState = state.kind === 'installing' && progress
     ? { ...state, progress }
     : state
-  return { state: displayedState, check, install, restart, progress }
+  return { state: displayedState, check, install, restart, progress, restartPending }
 }
 
 function stateVersion(state: UpdateState): string | undefined {
