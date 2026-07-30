@@ -101,9 +101,25 @@ export function isBrowserPreviewRuntime(): boolean {
 export const isAndroidRuntime = import.meta.env['VITE_VOXGOLEM_RUNTIME'] === 'android'
 
 let androidSnapshot: AppSnapshot | null = null
+let androidPreferenceWriteChain: Promise<void> = Promise.resolve()
+let androidPreferencePublicationRevision = 0
 
-export function cacheAndroidSnapshot(snapshot: AppSnapshot): void {
-  androidSnapshot = snapshot
+function enqueueAndroidPreferenceWrite<T>(operation: () => Promise<T>): Promise<T> {
+  const result = androidPreferenceWriteChain.then(operation)
+  androidPreferenceWriteChain = result.then(() => undefined, () => undefined)
+  return result
+}
+
+export function cacheAndroidSnapshot(snapshot: AppSnapshot, expectedPreferenceRevision = androidPreferencePublicationRevision): AppSnapshot {
+  const published = expectedPreferenceRevision === androidPreferencePublicationRevision || androidSnapshot === null
+    ? snapshot
+    : { ...snapshot, preferences: androidSnapshot.preferences }
+  androidSnapshot = published
+  return published
+}
+
+export function getAndroidPreferencePublicationRevision(): number {
+  return androidPreferencePublicationRevision
 }
 
 export function getCachedAndroidPreferences(): ValidatedPreferences | null {
@@ -111,6 +127,7 @@ export function getCachedAndroidPreferences(): ValidatedPreferences | null {
 }
 
 export function setCachedAndroidPreferences(preferences: ValidatedPreferences): void {
+  androidPreferencePublicationRevision += 1
   if (androidSnapshot !== null) androidSnapshot = { ...androidSnapshot, preferences }
 }
 
@@ -120,7 +137,7 @@ export function buildAndroidStartupState(snapshot: AppSnapshot): Record<string, 
     kind: 'ready', cue_asset_paths: { start_listening: 'resources/start-listening.wav', stop_listening: 'resources/stop-listening.wav' },
     runtime_phase: snapshot.runtimePhase, voice_input_available: false, voice_input_error: 'Voice input is unavailable on Android',
     silence_timeout_ms: 1500, selected_response_profile: snapshot.preferences.responseProfile, supported_response_profiles: [],
-    prompt_cancellation_available: snapshot.activeRequest !== null, tts_enabled: false, tts_output_gain_db: 3,
+    prompt_cancellation_available: true, tts_enabled: false, tts_output_gain_db: 3,
     capabilities: ANDROID_CAPABILITY_IDS.map((id) => {
       const capability = capabilities.get(id)
       return capability === undefined
@@ -143,26 +160,22 @@ export async function invokeAndroidCommand(command: string, args?: unknown): Pro
     try { return await nativeInvoke(name, payload) } catch (error) { throw normalizeTauriError(error) }
   }
   if (command === 'get_app_snapshot') {
-    const snapshot = await invoke(command, args)
-    const { parseAppSnapshot } = await import('./appSnapshot')
-    let parsed: AppSnapshot
-    try { parsed = parseAppSnapshot(snapshot) } catch { throw androidCommandError('internal', 'Android runtime returned an invalid snapshot') }
-    cacheAndroidSnapshot(parsed)
-    return snapshot
+    return invoke(command, args)
   }
   if (command === 'get_startup_state') {
-    let snapshot = androidSnapshot
-    if (snapshot === null) snapshot = await import('./appSnapshot').then(({ loadAppSnapshot }) => loadAppSnapshot())
+    const snapshot = androidSnapshot
     if (snapshot === null) throw androidCommandError('internal', 'Android snapshot hydration failed')
     return buildAndroidStartupState(snapshot)
   }
   if (command === 'set_preferences') {
-    const result = await invoke(command, args)
-    const { parseValidatedPreferences } = await import('./appSnapshot')
-    let preferences: ValidatedPreferences
-    try { preferences = parseValidatedPreferences(result) } catch { throw androidCommandError('internal', 'Android runtime returned invalid preferences') }
-    setCachedAndroidPreferences(preferences)
-    return result
+    return enqueueAndroidPreferenceWrite(async () => {
+      const result = await invoke(command, args)
+      const { parseValidatedPreferences } = await import('./appSnapshot')
+      let preferences: ValidatedPreferences
+      try { preferences = parseValidatedPreferences(result) } catch { throw androidCommandError('internal', 'Android runtime returned invalid preferences') }
+      setCachedAndroidPreferences(preferences)
+      return result
+    })
   }
   if (command === 'get_ui_theme' || command === 'get_ui_text_size' || command === 'get_assistant_settings') {
     const preferences = androidSnapshot?.preferences
@@ -174,25 +187,27 @@ export async function invokeAndroidCommand(command: string, args?: unknown): Pro
   if (command === 'clear_completion' || command === 'request_completion' || command === 'record_frontend_runtime_diagnostic') return null
   if (command === 'check_for_update' || command === 'install_update' || command === 'restart_for_update' || command === 'synthesize_local_tts') throw androidCommandError('unavailable', 'Command is unavailable on Android')
   if (command === 'set_ui_theme' || command === 'set_ui_text_size' || command === 'set_assistant_settings' || command === 'switch_response_profile' || command === 'set_tts_enabled') {
-    const current = androidSnapshot?.preferences
-    if (current === null || current === undefined) throw androidCommandError('internal', 'Android preferences are not hydrated')
-    const proposal = androidPreferenceProposal(command, args, current)
-    const result = await invokeAndroidCommand('set_preferences', { preferences: proposal })
-    const persisted = androidSnapshot?.preferences
-    if (persisted === null || persisted === undefined) throw androidCommandError('internal', 'Android preferences were not published')
-    if (command === 'set_ui_theme') return persisted.uiTheme
-    if (command === 'set_ui_text_size') return persisted.uiTextSize
-    if (command === 'set_assistant_settings') return { instant: persisted.instant, deep: persisted.deep, review: persisted.review, deep_enabled: persisted.deepEnabled, review_enabled: persisted.reviewEnabled, prefetch: persisted.prefetch, completion: persisted.completion }
-    if (command === 'set_tts_enabled') return { enabled: persisted.ttsEnabled }
-    return result
+    return enqueueAndroidPreferenceWrite(async () => {
+      const current = androidSnapshot?.preferences
+      if (current === null || current === undefined) throw androidCommandError('internal', 'Android preferences are not hydrated')
+      const proposal = androidPreferenceProposal(command, args, current)
+      const result = await invoke('set_preferences', { preferences: proposal })
+      const { parseValidatedPreferences } = await import('./appSnapshot')
+      let persisted: ValidatedPreferences
+      try { persisted = parseValidatedPreferences(result) } catch { throw androidCommandError('internal', 'Android runtime returned invalid preferences') }
+      setCachedAndroidPreferences(persisted)
+      if (command === 'set_ui_theme') return persisted.uiTheme
+      if (command === 'set_ui_text_size') return persisted.uiTextSize
+      if (command === 'set_assistant_settings') return { instant: persisted.instant, deep: persisted.deep, review: persisted.review, deep_enabled: persisted.deepEnabled, review_enabled: persisted.reviewEnabled, prefetch: persisted.prefetch, completion: persisted.completion }
+      if (command === 'set_tts_enabled') return { enabled: persisted.ttsEnabled }
+      return result
+    })
   }
   if (command === 'cancel_prompt' || command === 'reset_session' || command === 'submit_prompt') {
     const result = await invoke(command, args)
     if (command === 'reset_session') {
       const { parseAppSnapshot } = await import('./appSnapshot')
-      let snapshot: AppSnapshot
-      try { snapshot = parseAppSnapshot(result) } catch { throw androidCommandError('internal', 'Android runtime returned an invalid reset snapshot') }
-      cacheAndroidSnapshot(snapshot)
+      try { parseAppSnapshot(result) } catch { throw androidCommandError('internal', 'Android runtime returned an invalid reset snapshot') }
       return result
     }
     return result

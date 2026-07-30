@@ -2290,6 +2290,50 @@ describe('App', () => {
     expect(container.textContent).not.toContain('Synchronizing response')
   })
 
+  it('refreshes provider controls from the post-terminal snapshot', async () => {
+    let snapshotCalls = 0
+    const expiredCapabilities = completeCapabilities().map((capability) => capability['id'] === 'custom_provider'
+      ? { ...capability, state: 'unavailable', reason: 'OpenCode authentication has expired' }
+      : capability)
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        if (command === 'get_app_snapshot') {
+          snapshotCalls += 1
+          return snapshotCalls === 1
+            ? appSnapshot([], { instant: 'custom-sol-high' })
+            : appSnapshot([], { instant: 'custom-sol-high' }, {
+                capabilities: expiredCapabilities,
+                model_options: [
+                  { id: 'custom-sol-high', label: 'Sol High', available: false, unavailable_reason: 'OpenCode authentication has expired' },
+                  { id: 'custom-luna-low', label: 'Luna Low', available: false, unavailable_reason: 'OpenCode authentication has expired' },
+                ],
+              })
+        }
+        if (command === 'get_startup_state') return readyStartupState()
+        if (command === 'submit_prompt') throw { code: 'unavailable', message: 'OpenCode authentication has expired' }
+        return null
+      },
+    }
+
+    const { container } = await renderApp()
+    await act(async () => {
+      setTextAreaValue(getComposer(container), 'Expired auth prompt')
+    })
+    expect(getSendButton(container).disabled).toBe(false)
+    await act(async () => {
+      getSendButton(container).click()
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    await act(async () => {
+      setTextAreaValue(getComposer(container), 'Retry after expiry')
+    })
+
+    expect(snapshotCalls).toBe(2)
+    expect(getSendButton(container).disabled).toBe(true)
+  })
+
   it('rolls back failed second preference writes to the first persisted values', async () => {
     let themeWrites = 0
     let textSizeWrites = 0

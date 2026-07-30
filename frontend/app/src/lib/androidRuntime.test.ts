@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { TauriCommandError, androidPreferenceProposal, buildAndroidStartupState, cacheAndroidSnapshot, invokeAndroidCommand, normalizeTauriError, withoutAndroidEventListener } from './tauri'
+import { TauriCommandError, androidPreferenceProposal, buildAndroidStartupState, cacheAndroidSnapshot, getAndroidPreferencePublicationRevision, invokeAndroidCommand, normalizeTauriError, setCachedAndroidPreferences, withoutAndroidEventListener } from './tauri'
 import { missingPromptStreamingSupportError, parseAndroidPromptOutcome, parseAndroidPromptOutcomeForExecution, parseAndroidPromptUpdate } from './promptExecution'
 import type { AppSnapshot, ValidatedPreferences } from './appSnapshot'
 import { appendCanonicalTurn, canonicalExecutionKey, isExpectedCanonicalTurn, parseAppSnapshot, parseCanonicalTurn } from './appSnapshot'
@@ -11,13 +11,17 @@ const preferences: ValidatedPreferences = {
 }
 const snapshot = { runtimePhase: 'sleeping', preferences, capabilities: [], activeRequest: null } as unknown as AppSnapshot
 
-afterEach(() => { delete window.__TAURI_INTERNALS__ })
+afterEach(() => {
+  delete window.__TAURI_INTERNALS__
+  vi.unstubAllEnvs()
+})
 
 describe('Android runtime contract helpers', () => {
   it('projects zero-asset startup truthfully across every legacy capability', () => {
     const startup = buildAndroidStartupState(snapshot)
     expect(startup['supported_response_profiles']).toEqual([])
     expect(startup['voice_input_available']).toBe(false)
+    expect(startup['prompt_cancellation_available']).toBe(true)
     expect(startup['capabilities']).toHaveLength(11)
     expect((startup['capabilities'] as Record<string, unknown>[]).every((item) => item['state'] === 'not_configured' && item['actual_provider'] === null)).toBe(true)
   })
@@ -70,6 +74,81 @@ describe('Android runtime contract helpers', () => {
 
     await expect(invokeAndroidCommand('unknown_desktop_command')).rejects.toMatchObject({ code: 'unavailable', message: 'Command is unavailable on Android' })
     expect(invoke).toHaveBeenCalledTimes(1)
+  })
+
+  it('serializes disjoint legacy preference changes against the latest cache', async () => {
+    cacheAndroidSnapshot(snapshot)
+    let resolveFirst: (value: unknown) => void = () => undefined
+    const proposals: Record<string, unknown>[] = []
+    window.__TAURI_INTERNALS__ = {
+      invoke: vi.fn(async (_command, args) => {
+        const proposal = (args as { preferences: Record<string, unknown> }).preferences
+        proposals.push(proposal)
+        if (proposals.length === 1) {
+          return new Promise((resolve) => { resolveFirst = resolve })
+        }
+        return proposal
+      }),
+    }
+
+    const theme = invokeAndroidCommand('set_ui_theme', { theme: 'light' })
+    const textSize = invokeAndroidCommand('set_ui_text_size', { textSize: 'small' })
+    await Promise.resolve()
+    expect(proposals).toHaveLength(1)
+    resolveFirst({ ...proposals[0], ui_theme: 'light' })
+    await expect(theme).resolves.toBe('light')
+    await expect(textSize).resolves.toBe('small')
+    expect(proposals).toHaveLength(2)
+    expect(proposals[1]).toMatchObject({ ui_theme: 'light', ui_text_size: 'small' })
+  })
+
+  it('publishes only snapshots accepted by the App ordering gate', async () => {
+    const capability = (state: 'available' | 'unavailable') => ({
+      id: 'custom_provider',
+      state,
+      reason: state === 'available' ? 'Ready' : 'Rejected',
+      actual_provider: null,
+    })
+    const accepted = parseAppSnapshot({ ...wireSnapshot(), capabilities: [capability('available')] })
+    const stale = { ...wireSnapshot(), capabilities: [capability('unavailable')] }
+    cacheAndroidSnapshot(accepted)
+    window.__TAURI_INTERNALS__ = { invoke: async () => stale }
+
+    await invokeAndroidCommand('get_app_snapshot')
+    const startup = await invokeAndroidCommand('get_startup_state') as { capabilities: Array<Record<string, unknown>> }
+    expect(startup.capabilities.find((item) => item['id'] === 'custom_provider')?.['state']).toBe('available')
+
+    cacheAndroidSnapshot(parseAppSnapshot(stale))
+    const updated = await invokeAndroidCommand('get_startup_state') as { capabilities: Array<Record<string, unknown>> }
+    expect(updated.capabilities.find((item) => item['id'] === 'custom_provider')?.['state']).toBe('unavailable')
+  })
+
+  it('preserves preferences changed after a snapshot request started', () => {
+    cacheAndroidSnapshot(snapshot)
+    const snapshotPreferenceRevision = getAndroidPreferencePublicationRevision()
+    const updatedPreferences = { ...preferences, uiTheme: 'light' as const }
+    setCachedAndroidPreferences(updatedPreferences)
+
+    const published = cacheAndroidSnapshot(
+      { ...snapshot, preferences: { ...preferences, uiTheme: 'dark' } },
+      snapshotPreferenceRevision,
+    )
+    expect(published.preferences).toEqual(updatedPreferences)
+    expect(androidPreferenceProposal('set_ui_text_size', { textSize: 'small' }, published.preferences))
+      .toMatchObject({ ui_theme: 'light', ui_text_size: 'small' })
+  })
+
+  it('parses a native snapshot exactly once through the actual Android branch', async () => {
+    vi.stubEnv('VITE_VOXGOLEM_RUNTIME', 'android')
+    vi.resetModules()
+    window.__TAURI_INTERNALS__ = { invoke: async () => wireSnapshot() }
+    const [{ loadAppSnapshot }, { isAndroidRuntime }] = await Promise.all([
+      import('./appSnapshot'),
+      import('./tauri'),
+    ])
+    expect(isAndroidRuntime).toBe(true)
+    await expect(loadAppSnapshot()).resolves.toMatchObject({ sessionId: '1', modelOptions: [] })
+    vi.unstubAllEnvs()
   })
 
   it('removes event listening and preserves every typed command error code', () => {
