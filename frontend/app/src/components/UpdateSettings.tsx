@@ -41,7 +41,7 @@ function updatePresentation(updates: AppUpdateController, installationDisabled: 
   if (state.kind === 'checking') return { status: 'Checking...', action: null, pending: true }
   if (state.kind === 'browser') return { status: 'Available in the packaged app', action: null }
   if (state.kind === 'error') {
-    return { status: `Check failed: ${state.message}`, action: action('Retry', updates.check), error: true }
+    return { status: `Update failed: ${state.message}`, action: action('Retry', updates.check), error: true }
   }
   if (state.kind === 'installing') {
     return { status: progressStatus(state.progress), action: null, pending: true }
