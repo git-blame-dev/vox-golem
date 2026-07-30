@@ -18,7 +18,7 @@ The supported release baseline is Ubuntu 24.04 LTS on x86_64, including Ubuntu 2
 
 ## Windows target
 
-Windows 11 x64 uses a per-user NSIS installer under `%LOCALAPPDATA%\Programs\VoxGolem`. The installer is built on Ubuntu, creates a Start Menu shortcut, and packages only the application, DirectML, ONNX Runtime provider bridges, and required app-local Microsoft VC runtime DLLs. NVIDIA drivers, CUDA, cuDNN, TensorRT, models, `llama-server`, `SOUL.md`, configuration, credentials, and user data remain external. Windows artifacts are not Authenticode-signed and may trigger SmartScreen; real Windows 11 hardware validation is required before release-readiness claims.
+Windows 11 x64 uses a per-user NSIS installer under `%LOCALAPPDATA%\Programs\VoxGolem`. The installer is built on Ubuntu, creates a Start Menu shortcut, and packages only the application, DirectML, ONNX Runtime provider bridges, and required app-local Microsoft VC runtime DLLs. NVIDIA drivers, CUDA, cuDNN, TensorRT, models, `llama-server`, `SOUL.md`, configuration, credentials, and user data remain external. Windows artifacts are not Authenticode-signed and may trigger SmartScreen. Installation, single-instance behavior, configured NVIDIA and forced-CPU modes, audio, data preservation, uninstall/reinstall, and a signed in-app update have been validated on Windows 11 x64 NVIDIA hardware; non-NVIDIA Windows hardware remains unvalidated.
 
 Windows configuration defaults to `%APPDATA%\VoxGolem\config.toml`. Relative paths resolve beside that file, and missing assets disable only the affected optional capability.
 
