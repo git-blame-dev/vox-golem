@@ -47,7 +47,7 @@ function updatePresentation(updates: AppUpdateController, installationDisabled: 
     return { status: progressStatus(state.progress), action: null, pending: true }
   }
   if (state.kind === 'installed') {
-    return { status: 'Update installed', action: state.installBehavior === 'install_and_restart' ? null : action('Restart', updates.restart) }
+    return { status: 'Update installed', action: state.installBehavior === 'install_and_restart' ? null : action('Restart', updates.restart, updates.restartPending) }
   }
 
   return resultPresentation(state, updates, action, installationDisabled)
@@ -73,7 +73,7 @@ function resultPresentation(
     return { status: progressStatus(updates.progress), action: null, pending: true }
   }
   if (result.status === 'installed') {
-    return { status: 'Update installed', action: result.installBehavior === 'install_and_restart' ? null : action('Restart', updates.restart) }
+    return { status: 'Update installed', action: result.installBehavior === 'install_and_restart' ? null : action('Restart', updates.restart, updates.restartPending) }
   }
   if (result.status === 'up_to_date') {
     return { status: 'Up to date', action: action('Check', updates.check) }
