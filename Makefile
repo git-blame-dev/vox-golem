@@ -87,7 +87,7 @@ LINUX_ORT_PROVIDER_LIBS := \
 
 .DEFAULT_GOAL := help
 
-.PHONY: help app-version test test-release-tools check-linux-tools app app-smoke packaged-smoke app-dev linux dist verify-dist update-bundle verify-update-bundle update-bundle-smoke check-pc-tools pc pc-dist verify-pc-dist check-android-tools android-init android-build clean
+.PHONY: help app-version test test-release-tools test-android-tools check-linux-tools app app-smoke packaged-smoke app-dev linux dist verify-dist update-bundle verify-update-bundle update-bundle-smoke check-pc-tools pc pc-dist verify-pc-dist check-android-tools check-android-provision-tools android-init android-build android-provision-auth clean
 
 help:
 	@printf '%s\n' 'Targets:'
@@ -104,6 +104,7 @@ help:
 	@printf '%s\n' '  make pc-dist  Stage optional Windows files under dist/VoxGolem-windows'
 	@printf '%s\n' '  make android-init  Generate the pinned Android Tauri platform shell'
 	@printf '%s\n' '  make android-build Build the arm64 Android debug APK'
+	@printf '%s\n' '  make android-provision-auth DEVICE=<adb-serial> AUTH_PATH=<file> Provision app-private auth'
 	@printf '%s\n' '  make clean    Remove generated build and staging output'
 
 app-version:
@@ -117,6 +118,7 @@ test:
 	bun run test
 	bun run build
 	$(MAKE) --no-print-directory test-release-tools
+	$(MAKE) --no-print-directory test-android-tools
 	cargo fmt --all -- --check
 	cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 	cargo test --locked --workspace
@@ -125,9 +127,17 @@ test-release-tools:
 	@command -v jq >/dev/null || { printf '%s\n' 'Missing jq.' >&2; exit 1; }
 	bash scripts/test-release-tools.sh
 
+test-android-tools:
+	@command -v jq >/dev/null || { printf '%s\n' 'Missing jq.' >&2; exit 1; }
+	bash scripts/test-android-provision-auth.sh
+
 check-android-tools:
 	@command -v cargo >/dev/null || { printf '%s\n' 'Missing Cargo.' >&2; exit 1; }
 	@cargo tauri --version 2>&1 | grep -Fxq 'tauri-cli 2.11.1' || { printf '%s\n' 'Tauri CLI 2.11.1 is required. Install with: cargo install tauri-cli --version 2.11.1 --locked' >&2; exit 1; }
+
+check-android-provision-tools:
+	@command -v adb >/dev/null || { printf '%s\n' 'Missing adb. Install Android SDK Platform Tools.' >&2; exit 1; }
+	@command -v jq >/dev/null || { printf '%s\n' 'Missing jq.' >&2; exit 1; }
 
 android-init: check-android-tools
 	@cargo tauri icon '$(CURDIR)/apps/desktop-tauri/src-tauri/icons/icon.png' --output '$(CURDIR)/apps/android-tauri/src-tauri/icons'
@@ -136,6 +146,13 @@ android-init: check-android-tools
 
 android-build: check-android-tools
 	@cd apps/android-tauri/src-tauri && cargo tauri android build --debug --target aarch64 --apk --ci
+
+android-provision-auth: export DEVICE := $(DEVICE)
+android-provision-auth: export AUTH_PATH := $(AUTH_PATH)
+android-provision-auth: check-android-provision-tools
+	@test -n "$${DEVICE:-}" || { printf '%s\n' 'Set DEVICE to one exact serial from adb devices.' >&2; exit 1; }
+	@test -n "$${AUTH_PATH:-}" || { printf '%s\n' 'Set AUTH_PATH to the compatible host auth JSON.' >&2; exit 1; }
+	@'$(CURDIR)/scripts/android-provision-auth.sh' --device "$$DEVICE" --auth "$$AUTH_PATH"
 
 check-linux-tools:
 	@command -v cargo-tauri >/dev/null || { printf '%s\n' 'Missing Tauri CLI. Install with: cargo install tauri-cli --version 2.11.1 --locked' >&2; exit 1; }

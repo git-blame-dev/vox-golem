@@ -3,7 +3,7 @@
 
 #[cfg(feature = "desktop")]
 pub mod completion;
-#[cfg(feature = "custom-openai")]
+#[cfg(any(feature = "custom-openai", feature = "custom-openai-webpki"))]
 pub mod custom_openai;
 pub mod inference;
 #[cfg(feature = "desktop")]

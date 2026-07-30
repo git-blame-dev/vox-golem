@@ -26,7 +26,7 @@ import {
   isStartupStateSettled,
   loadStartupState,
 } from './lib/startupState'
-import { getTauriInternals, invokeTauriCommand, isBrowserPreviewRuntime } from './lib/tauri'
+import { cacheAndroidSnapshot, getAndroidPreferencePublicationRevision, getTauriInternals, invokeTauriCommand, isAndroidRuntime, isBrowserPreviewRuntime } from './lib/tauri'
 import { teardownBrowserPreviewRuntime } from './lib/browserRuntime'
 import { useAppUpdates } from './lib/useAppUpdates'
 import { DEFAULT_ASSISTANT_SETTINGS, deepOptions, instantOptions, parseAssistantSettings, reviewOptions, serializeAssistantSettings } from './lib/assistantSettings'
@@ -172,6 +172,8 @@ function App() {
   const snapshotControlsFreshRef = useRef(getTauriInternals() === null)
   const snapshotControlsInvalidatedRef = useRef(false)
   const snapshotHydrationRevisionRef = useRef(0)
+  const snapshotControlRequestRevisionRef = useRef(0)
+  const refreshAndroidSnapshotControlsRef = useRef<() => void>(() => undefined)
   const [assistantSettingsLoadError, setAssistantSettingsLoadError] = useState<string | null>(null)
   const [assistantSettings, setAssistantSettings] = useState<AssistantSettings>(DEFAULT_ASSISTANT_SETTINGS)
   const [snapshotModelOptions, setSnapshotModelOptions] = useState<readonly ModelOption[] | null>(null)
@@ -562,6 +564,32 @@ function App() {
     }
   }, [])
 
+  const adoptSnapshotControls = useCallback((snapshot: AppSnapshot, revision: number, preferenceRevision: number): boolean => {
+    if (revision !== snapshotControlRequestRevisionRef.current) return false
+    const acceptedSnapshot = isAndroidRuntime
+      ? cacheAndroidSnapshot(snapshot, preferenceRevision)
+      : snapshot
+    snapshotHydrationRevisionRef.current += 1
+    adoptSnapshotPreferences(acceptedSnapshot.preferences)
+    const capabilities = toStartupCapabilities(acceptedSnapshot.capabilities)
+    snapshotCapabilitiesRef.current = capabilities
+    snapshotResponseProfileRef.current = acceptedSnapshot.preferences.responseProfile
+    snapshotModelOptionsRef.current = acceptedSnapshot.modelOptions
+    setSnapshotModelOptions(acceptedSnapshot.modelOptions)
+    const controlledState = applySnapshotControlState(
+      startupStateRef.current,
+      capabilities,
+      acceptedSnapshot.preferences.responseProfile,
+    )
+    startupStateRef.current = controlledState
+    setStartupState(controlledState)
+    snapshotControlsFreshRef.current = true
+    setSnapshotControlsFresh(true)
+    snapshotControlsInvalidatedRef.current = false
+    setSnapshotControlsInvalidated(false)
+    return true
+  }, [adoptSnapshotPreferences])
+
   useEffect(() => {
     if (notices.length === 0) {
       return undefined
@@ -647,79 +675,139 @@ function App() {
   useEffect(() => {
     if (snapshotHydrationStateRef.current !== 'pending') return undefined
     let active = true
-    const transcriptRevision = transcriptRevisionRef.current
+    let retryTimer: number | null = null
     const runtimeActivityRevision = runtimeActivityRevisionRef.current
-
-    void loadAppSnapshot().then(async (snapshot) => {
-      if (!active || transcriptRevision !== transcriptRevisionRef.current) return
-      snapshotHydrationRevisionRef.current += 1
-
-      canonicalTranscriptRef.current = snapshot.transcript
-      const activeRequestMessage: ChatMessage[] = snapshot.activeRequest === null ? [] : [{
-        id: `recovered-user-${snapshot.activeRequest.executionId.sessionId}-${snapshot.activeRequest.executionId.generation}`,
-        role: 'user',
-        content: snapshot.activeRequest.prompt,
-      }]
-      setMessages((current) => [
-        ...replaceCommittedTranscript(current, snapshot.transcript),
-        ...activeRequestMessage,
-      ])
-      snapshotRuntimeHydratedRef.current = true
-      if (runtimeActivityRevision === runtimeActivityRevisionRef.current) {
-        synchronizeHydratedRuntimeStatus(toRuntimeStatus(snapshot.runtimePhase))
+    const scheduleHydrationRetry = (): void => {
+      if (!active || snapshotHydrationStateRef.current !== 'pending') return
+      if (retryTimer !== null) window.clearTimeout(retryTimer)
+      retryTimer = window.setTimeout(hydrateSnapshot, 250)
+    }
+    function hydrateSnapshot(): void {
+      if (!active || snapshotHydrationStateRef.current !== 'pending') return
+      if (resetPendingRef.current) {
+        scheduleHydrationRetry()
+        return
       }
-      adoptSnapshotPreferences(snapshot.preferences)
-      const snapshotCapabilities = toStartupCapabilities(snapshot.capabilities)
-      snapshotCapabilitiesRef.current = snapshotCapabilities
-      snapshotResponseProfileRef.current = snapshot.preferences.responseProfile
-      snapshotSessionIdRef.current = snapshot.sessionId
-      snapshotModelOptionsRef.current = snapshot.modelOptions
-      setSnapshotModelOptions(snapshot.modelOptions)
-      const controlledStartupState = applySnapshotControlState(
-        startupStateRef.current,
-        snapshotCapabilities,
-        snapshot.preferences.responseProfile,
-      )
-      startupStateRef.current = controlledStartupState
-      setStartupState(controlledStartupState)
-      snapshotHydrationStateRef.current = 'succeeded'
-      setSnapshotHydrationState('succeeded')
-      snapshotControlsFreshRef.current = true
-      setSnapshotControlsFresh(true)
-      snapshotControlsInvalidatedRef.current = false
-      setSnapshotControlsInvalidated(false)
-      if (snapshot.activeRequest === null || transcriptRevision !== transcriptRevisionRef.current) return
-
-      setPromptState('stopping')
-      setPromptActivity('Recovering interrupted response…')
-      await recoverOrphanedRequest(
-        snapshot,
-        transcriptRevision,
-        () => active && !resetPendingRef.current,
-      )
-    }).catch(() => {
-      if (active) {
-        snapshotHydrationStateRef.current = 'failed'
-        setSnapshotHydrationState('failed')
-        snapshotControlsFreshRef.current = true
-        setSnapshotControlsFresh(true)
-        snapshotControlsInvalidatedRef.current = false
-        setSnapshotControlsInvalidated(false)
-        const currentStartupState = startupStateRef.current
-        if (
-          ttsWriteRevisionRef.current === 0 &&
-          (currentStartupState.kind === 'ready' || currentStartupState.kind === 'warming_model')
-        ) {
-          ttsEnabledRef.current = currentStartupState.ttsEnabled
-          ttsPersistedValueRef.current = currentStartupState.ttsEnabled
-          ttsPersistedInitializedRef.current = true
-          setTtsEnabled(currentStartupState.ttsEnabled)
+      const transcriptRevision = transcriptRevisionRef.current
+      const snapshotControlRevision = ++snapshotControlRequestRevisionRef.current
+      const snapshotPreferenceRevision = getAndroidPreferencePublicationRevision()
+      void loadAppSnapshot().then(async (snapshot) => {
+        if (!active || snapshotHydrationStateRef.current !== 'pending') return
+        if (transcriptRevision !== transcriptRevisionRef.current) {
+          scheduleHydrationRetry()
+          return
         }
-      }
-    })
+        if (!adoptSnapshotControls(snapshot, snapshotControlRevision, snapshotPreferenceRevision)) {
+          scheduleHydrationRetry()
+          return
+        }
 
-    return () => { active = false }
-  }, [adoptSnapshotPreferences, recoverOrphanedRequest, synchronizeHydratedRuntimeStatus])
+        canonicalTranscriptRef.current = snapshot.transcript
+        const activeRequestMessage: ChatMessage[] = snapshot.activeRequest === null ? [] : [{
+          id: `recovered-user-${snapshot.activeRequest.executionId.sessionId}-${snapshot.activeRequest.executionId.generation}`,
+          role: 'user',
+          content: snapshot.activeRequest.prompt,
+        }]
+        setMessages((current) => [
+          ...replaceCommittedTranscript(current, snapshot.transcript),
+          ...activeRequestMessage,
+        ])
+        snapshotRuntimeHydratedRef.current = true
+        if (runtimeActivityRevision === runtimeActivityRevisionRef.current) {
+          synchronizeHydratedRuntimeStatus(toRuntimeStatus(snapshot.runtimePhase))
+        }
+        snapshotSessionIdRef.current = snapshot.sessionId
+        snapshotHydrationStateRef.current = 'succeeded'
+        setSnapshotHydrationState('succeeded')
+        if (snapshot.activeRequest === null && !resetPendingRef.current && promptRef.current === null) {
+          setPromptActivity(null)
+          setPromptState('idle')
+        }
+        if (snapshot.activeRequest === null || transcriptRevision !== transcriptRevisionRef.current) return
+
+        setPromptState('stopping')
+        setPromptActivity('Recovering interrupted response…')
+        await recoverOrphanedRequest(
+          snapshot,
+          transcriptRevision,
+          () => active && !resetPendingRef.current,
+        )
+      }).catch(() => {
+        if (active && isAndroidRuntime) {
+          scheduleHydrationRetry()
+          return
+        }
+        if (active) {
+          snapshotHydrationStateRef.current = 'failed'
+          setSnapshotHydrationState('failed')
+          snapshotControlsFreshRef.current = true
+          setSnapshotControlsFresh(true)
+          snapshotControlsInvalidatedRef.current = false
+          setSnapshotControlsInvalidated(false)
+          const currentStartupState = startupStateRef.current
+          if (
+            ttsWriteRevisionRef.current === 0 &&
+            (currentStartupState.kind === 'ready' || currentStartupState.kind === 'warming_model')
+          ) {
+            ttsEnabledRef.current = currentStartupState.ttsEnabled
+            ttsPersistedValueRef.current = currentStartupState.ttsEnabled
+            ttsPersistedInitializedRef.current = true
+            setTtsEnabled(currentStartupState.ttsEnabled)
+          }
+        }
+      })
+    }
+    hydrateSnapshot()
+
+    return () => {
+      active = false
+      if (retryTimer !== null) window.clearTimeout(retryTimer)
+    }
+  }, [adoptSnapshotControls, recoverOrphanedRequest, synchronizeHydratedRuntimeStatus])
+
+  useEffect(() => {
+    if (!isAndroidRuntime) return undefined
+    let active = true
+    let refreshInFlight = false
+    let refreshQueued = false
+    const runRefresh = (allowRetry: boolean): void => {
+      if (document.visibilityState !== 'visible' || snapshotHydrationStateRef.current !== 'succeeded') return
+      if (refreshInFlight) {
+        refreshQueued = true
+        return
+      }
+      refreshInFlight = true
+      let succeeded = false
+      let failed = false
+      const snapshotControlRevision = ++snapshotControlRequestRevisionRef.current
+      const snapshotPreferenceRevision = getAndroidPreferencePublicationRevision()
+      snapshotControlsFreshRef.current = false
+      setSnapshotControlsFresh(false)
+      void loadAppSnapshot().then((snapshot) => {
+        if (!active || document.visibilityState !== 'visible') return
+        succeeded = adoptSnapshotControls(snapshot, snapshotControlRevision, snapshotPreferenceRevision)
+      }).catch(() => { failed = true }).finally(() => {
+        const latestFailed = failed && snapshotControlRevision === snapshotControlRequestRevisionRef.current && (allowRetry || refreshQueued)
+        const staleRecoveryQueued = refreshQueued && !snapshotControlsFreshRef.current
+        const retry = active && !succeeded && (latestFailed || staleRecoveryQueued) && document.visibilityState === 'visible'
+        refreshQueued = false
+        refreshInFlight = false
+        if (retry) runRefresh(false)
+      })
+    }
+    refreshAndroidSnapshotControlsRef.current = () => runRefresh(true)
+    const refreshControls = (): void => runRefresh(true)
+    document.addEventListener('visibilitychange', refreshControls)
+    window.addEventListener('focus', refreshControls)
+    window.addEventListener('pageshow', refreshControls)
+    return () => {
+      active = false
+      refreshAndroidSnapshotControlsRef.current = () => undefined
+      document.removeEventListener('visibilitychange', refreshControls)
+      window.removeEventListener('focus', refreshControls)
+      window.removeEventListener('pageshow', refreshControls)
+    }
+  }, [adoptSnapshotControls])
 
   useEffect(() => {
     if (snapshotHydrationState !== 'failed') return undefined
@@ -999,7 +1087,9 @@ function App() {
     return publishedState
   }, [publishRuntimeStatus, synchronizeHydratedRuntimeStatus])
 
+  const startupLoadAllowed = !isAndroidRuntime || snapshotHydrationState !== 'pending'
   useEffect(() => {
+    if (!startupLoadAllowed) return undefined
     let active = true
 
     void (async () => {
@@ -1075,7 +1165,7 @@ function App() {
     return () => {
       active = false
     }
-  }, [addNotice, applyStartupState])
+  }, [addNotice, applyStartupState, startupLoadAllowed])
 
   useEffect(() => {
     appActiveRef.current = true
@@ -1834,6 +1924,8 @@ function App() {
         setPromptState('reconciling')
         setPromptActivity('Synchronizing response…')
         const transcriptRevision = transcriptRevisionRef.current
+        const snapshotControlRevision = ++snapshotControlRequestRevisionRef.current
+        const snapshotPreferenceRevision = getAndroidPreferencePublicationRevision()
         let snapshot: Awaited<ReturnType<typeof loadAppSnapshot>> | null = null
         for (let attempt = 0; attempt < 3 && snapshot === null; attempt += 1) {
           if (!appActiveRef.current || promptRef.current !== active || resetPendingRef.current || transcriptRevision !== transcriptRevisionRef.current) return
@@ -1861,7 +1953,11 @@ function App() {
           setMessages((current) => replaceCommittedTranscript(current, transcript))
           canonicalTranscriptRef.current = transcript
           snapshotSessionIdRef.current = acceptedCanonicalTurn.executionId.sessionId
+          if (isAndroidRuntime && !snapshotControlsFreshRef.current) {
+            refreshAndroidSnapshotControlsRef.current()
+          }
         } else {
+          adoptSnapshotControls(snapshot, snapshotControlRevision, snapshotPreferenceRevision)
           const snapshotTurn = findNewTurnForRequest(
             snapshot.transcript,
             requestId,
@@ -2286,7 +2382,8 @@ function App() {
 
   const refreshSnapshotControlsAfterProfileTransition = async (profile: ResponseProfile): Promise<boolean> => {
     if (snapshotHydrationStateRef.current !== 'succeeded') return true
-    const hydrationRevision = snapshotHydrationRevisionRef.current
+    const hydrationRevision = ++snapshotControlRequestRevisionRef.current
+    const snapshotPreferenceRevision = getAndroidPreferencePublicationRevision()
     snapshotControlsFreshRef.current = false
     setSnapshotControlsFresh(false)
     snapshotControlsInvalidatedRef.current = true
@@ -2297,29 +2394,12 @@ function App() {
         !appActiveRef.current ||
         !isSwitchingResponseProfileRef.current ||
         resetPendingRef.current ||
-        hydrationRevision !== snapshotHydrationRevisionRef.current ||
+        hydrationRevision !== snapshotControlRequestRevisionRef.current ||
         snapshot.preferences.responseProfile !== profile
       ) {
         return false
       }
-      snapshotHydrationRevisionRef.current += 1
-      const capabilities = toStartupCapabilities(snapshot.capabilities)
-      snapshotCapabilitiesRef.current = capabilities
-      snapshotResponseProfileRef.current = snapshot.preferences.responseProfile
-      snapshotModelOptionsRef.current = snapshot.modelOptions
-      setSnapshotModelOptions(snapshot.modelOptions)
-      snapshotControlsFreshRef.current = true
-      setSnapshotControlsFresh(true)
-      snapshotControlsInvalidatedRef.current = false
-      setSnapshotControlsInvalidated(false)
-      const controlledState = applySnapshotControlState(
-        startupStateRef.current,
-        capabilities,
-        snapshot.preferences.responseProfile,
-      )
-      startupStateRef.current = controlledState
-      setStartupState(controlledState)
-      return true
+      return adoptSnapshotControls(snapshot, hydrationRevision, snapshotPreferenceRevision)
     } catch (error) {
       addNotice({
         tone: 'error',
@@ -2696,6 +2776,8 @@ function App() {
       setPromptActivity('Recovering session state…')
       setPromptState('reconciling')
       let resetSnapshot: AppSnapshot | null = null
+      const snapshotControlRevision = ++snapshotControlRequestRevisionRef.current
+      const snapshotPreferenceRevision = getAndroidPreferencePublicationRevision()
       for (let attempt = 0; attempt < 3 && resetSnapshot === null; attempt += 1) {
         if (!appActiveRef.current || transcriptRevision !== transcriptRevisionRef.current) return
         try {
@@ -2710,28 +2792,11 @@ function App() {
         return
       }
       if (appActiveRef.current && transcriptRevision === transcriptRevisionRef.current) {
-        snapshotHydrationRevisionRef.current += 1
         snapshotHydrationStateRef.current = 'succeeded'
         setSnapshotHydrationState('succeeded')
-        snapshotControlsFreshRef.current = true
-        setSnapshotControlsFresh(true)
-        snapshotControlsInvalidatedRef.current = false
-        setSnapshotControlsInvalidated(false)
         canonicalTranscriptRef.current = resetSnapshot.transcript
         snapshotSessionIdRef.current = resetSnapshot.sessionId
-        snapshotModelOptionsRef.current = resetSnapshot.modelOptions
-        setSnapshotModelOptions(resetSnapshot.modelOptions)
-        const capabilities = toStartupCapabilities(resetSnapshot.capabilities)
-        snapshotCapabilitiesRef.current = capabilities
-        snapshotResponseProfileRef.current = resetSnapshot.preferences.responseProfile
-        adoptSnapshotPreferences(resetSnapshot.preferences)
-        const controlledState = applySnapshotControlState(
-          startupStateRef.current,
-          capabilities,
-          resetSnapshot.preferences.responseProfile,
-        )
-        startupStateRef.current = controlledState
-        setStartupState(controlledState)
+        adoptSnapshotControls(resetSnapshot, snapshotControlRevision, snapshotPreferenceRevision)
         setMessages((current) => replaceCommittedTranscript(current, resetSnapshot.transcript))
       }
       if (!appActiveRef.current) return
@@ -2745,6 +2810,8 @@ function App() {
       setPromptActivity('Recovering session state…')
       let snapshot: AppSnapshot | null = null
       let recoveryRuntimeActivityRevision: number | null = null
+      const snapshotControlRevision = ++snapshotControlRequestRevisionRef.current
+      const snapshotPreferenceRevision = getAndroidPreferencePublicationRevision()
       for (let attempt = 0; attempt < 3 && snapshot === null; attempt += 1) {
         if (!appActiveRef.current || !resetPendingRef.current || transcriptRevision !== transcriptRevisionRef.current) break
         try {
@@ -2757,28 +2824,11 @@ function App() {
       }
       if (snapshot !== null && appActiveRef.current && transcriptRevision === transcriptRevisionRef.current) {
         promptRef.current = null
-        snapshotHydrationRevisionRef.current += 1
         snapshotHydrationStateRef.current = 'succeeded'
         setSnapshotHydrationState('succeeded')
-        snapshotControlsFreshRef.current = true
-        setSnapshotControlsFresh(true)
-        snapshotControlsInvalidatedRef.current = false
-        setSnapshotControlsInvalidated(false)
         canonicalTranscriptRef.current = snapshot.transcript
         snapshotSessionIdRef.current = snapshot.sessionId
-        snapshotModelOptionsRef.current = snapshot.modelOptions
-        setSnapshotModelOptions(snapshot.modelOptions)
-        const capabilities = toStartupCapabilities(snapshot.capabilities)
-        snapshotCapabilitiesRef.current = capabilities
-        snapshotResponseProfileRef.current = snapshot.preferences.responseProfile
-        adoptSnapshotPreferences(snapshot.preferences)
-        const controlledState = applySnapshotControlState(
-          startupStateRef.current,
-          capabilities,
-          snapshot.preferences.responseProfile,
-        )
-        startupStateRef.current = controlledState
-        setStartupState(controlledState)
+        adoptSnapshotControls(snapshot, snapshotControlRevision, snapshotPreferenceRevision)
         const activeRequestMessage: ChatMessage[] = snapshot.activeRequest === null ? [] : [{
           id: `recovered-user-${snapshot.activeRequest.executionId.sessionId}-${snapshot.activeRequest.executionId.generation}`,
           role: 'user',
