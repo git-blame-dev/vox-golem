@@ -6337,6 +6337,85 @@ fn fail_startup_capability(
     }
 }
 
+fn apply_opencode_startup_failure(
+    capabilities: &mut [CapabilityPayload],
+    mut settings: AssistantSettingsPayload,
+    reason: String,
+) -> AssistantSettingsPayload {
+    mark_capability(
+        capabilities,
+        "opencode",
+        CapabilityStatePayload::Failed,
+        reason.clone(),
+    );
+    if capability_available(capabilities, "custom_provider") {
+        settings.instant = match settings.instant {
+            InstantChoicePayload::OpenCodeSolHigh => InstantChoicePayload::CustomSolHigh,
+            InstantChoicePayload::OpenCodeLunaLow => InstantChoicePayload::CustomLunaLow,
+            choice => choice,
+        };
+        settings.deep = match settings.deep {
+            AgentChoicePayload::OpenCodeSolHigh => AgentChoicePayload::CustomSolHigh,
+            AgentChoicePayload::OpenCodeLunaLow => AgentChoicePayload::CustomLunaLow,
+            choice => choice,
+        };
+        settings.review = match settings.review {
+            AgentChoicePayload::OpenCodeSolHigh => AgentChoicePayload::CustomSolHigh,
+            AgentChoicePayload::OpenCodeLunaLow => AgentChoicePayload::CustomLunaLow,
+            choice => choice,
+        };
+    } else {
+        settings.deep_enabled = false;
+        settings.review_enabled = false;
+        for capability_id in ["deep", "review"] {
+            mark_capability(
+                capabilities,
+                capability_id,
+                CapabilityStatePayload::Failed,
+                reason.clone(),
+            );
+        }
+    }
+    settings
+}
+
+fn fail_opencode_startup(app_state: &AppState, reason: String) {
+    let settings = match app_state.assistant_coordinator.lock() {
+        Ok(coordinator) => AssistantSettingsPayload::from(coordinator.preferences()),
+        Err(_) => {
+            fail_startup_capability(&app_state.startup_state, "opencode", reason);
+            return;
+        }
+    };
+    let reconciled = match app_state.startup_state.lock() {
+        Ok(mut startup) => {
+            let capabilities = match &mut *startup {
+                StartupStatePayload::WarmingModel { capabilities, .. }
+                | StartupStatePayload::Ready { capabilities, .. } => capabilities,
+                StartupStatePayload::Error { .. } => return,
+            };
+            apply_opencode_startup_failure(capabilities, settings, reason)
+        }
+        Err(_) => return,
+    };
+    if reconciled == settings {
+        return;
+    }
+    match app_state.assistant_coordinator.lock() {
+        Ok(mut coordinator) => {
+            if coordinator.set_preferences(reconciled.into()).is_ok() {
+                app_state
+                    .assistant_settings_generation
+                    .fetch_add(1, Ordering::SeqCst);
+                if let Err(error) = persist_assistant_settings(reconciled) {
+                    eprintln!("failed to persist reconciled assistant settings: {error}");
+                }
+            }
+        }
+        Err(_) => eprintln!("failed to reconcile assistant settings after OpenCode startup"),
+    }
+}
+
 fn set_startup_capability_provider(
     startup_state: &Arc<Mutex<StartupStatePayload>>,
     capability_id: &str,
@@ -6410,10 +6489,14 @@ fn configured_capabilities(
                             "custom_provider" | "opencode" | "local_fast" | "local_quality"
                         ))
             });
-            let opencode_configured = config
-                .opencode
-                .as_ref()
-                .is_some_and(|opencode| opencode.path.is_file());
+            let opencode_configured =
+                config
+                    .opencode
+                    .as_ref()
+                    .is_some_and(|opencode| match opencode.runtime {
+                        voxgolem_core::config::OpencodeRuntime::Native => opencode.path.is_file(),
+                        voxgolem_core::config::OpencodeRuntime::Wsl => cfg!(windows),
+                    });
             let custom_configured = config
                 .custom_openai
                 .as_ref()
@@ -6474,6 +6557,89 @@ fn configured_capabilities(
             }
         })
         .collect()
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn apply_wsl_custom_auth_resolution(
+    config: &mut voxgolem_core::config::RuntimeConfig,
+    resolved: Result<PathBuf, String>,
+) {
+    let is_wsl = config.custom_openai.as_ref().is_some_and(|custom| {
+        custom.auth_source == voxgolem_core::config::CustomOpenAiAuthSource::Wsl
+    });
+    if !is_wsl {
+        return;
+    }
+    config.capability_issues.retain(|issue| {
+        issue.capability != "custom_provider" || !issue.reason.starts_with("WSL auth")
+    });
+    match resolved {
+        Ok(path) if path.is_file() => {
+            if let Some(custom) = config.custom_openai.as_mut() {
+                custom.auth_path = path;
+            }
+        }
+        Ok(_) => config
+            .capability_issues
+            .push(voxgolem_core::config::CapabilityConfigIssue {
+                capability: "custom_provider",
+                reason: String::from("WSL OpenCode auth file is unavailable"),
+            }),
+        Err(error) => config
+            .capability_issues
+            .push(voxgolem_core::config::CapabilityConfigIssue {
+                capability: "custom_provider",
+                reason: format!("failed to resolve WSL OpenCode auth: {error}"),
+            }),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_platform_provider_paths(config: &mut voxgolem_core::config::RuntimeConfig) {
+    let Some(custom) = config
+        .custom_openai
+        .as_ref()
+        .filter(|custom| custom.auth_source == voxgolem_core::config::CustomOpenAiAuthSource::Wsl)
+    else {
+        return;
+    };
+    let explicit = (!custom.auth_path.as_os_str().is_empty()).then_some(custom.auth_path.as_path());
+    let resolved = voxgolem_platform::wsl::WslRunner::default()
+        .resolve_auth_path(explicit)
+        .map_err(|error| error.to_string());
+    apply_wsl_custom_auth_resolution(config, resolved);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn resolve_platform_provider_paths(_config: &mut voxgolem_core::config::RuntimeConfig) {}
+
+fn opencode_server_config(
+    config: &voxgolem_core::config::OpencodeConfig,
+) -> Result<voxgolem_platform::opencode::OpencodeServerConfig, String> {
+    match config.runtime {
+        voxgolem_core::config::OpencodeRuntime::Native => Ok(
+            voxgolem_platform::opencode::OpencodeServerConfig::new(&config.path),
+        ),
+        voxgolem_core::config::OpencodeRuntime::Wsl => {
+            #[cfg(target_os = "windows")]
+            {
+                let explicit =
+                    (!config.path.as_os_str().is_empty()).then_some(config.path.as_path());
+                let executable = voxgolem_platform::wsl::WslRunner::default()
+                    .discover_opencode(explicit)
+                    .map_err(|error| error.to_string())?;
+                Ok(voxgolem_platform::opencode::OpencodeServerConfig::new_wsl(
+                    executable,
+                ))
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                Err(String::from(
+                    "WSL OpenCode runtime is only supported by the Windows application",
+                ))
+            }
+        }
+    }
 }
 
 fn failed_capabilities(reason: String) -> Vec<CapabilityPayload> {
@@ -6735,7 +6901,8 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
     let cue_asset_paths = embedded_cue_asset_paths();
 
     match voxgolem_core::config::load_runtime_config(None) {
-        Ok(config) => {
+        Ok(mut config) => {
+            resolve_platform_provider_paths(&mut config);
             let telemetry_sink = new_telemetry_sink(config.telemetry);
             let mut capabilities = configured_capabilities(&config);
             let voice_pipeline_config =
@@ -8124,11 +8291,13 @@ pub fn run() {
                 .and_then(|config| config.completion.clone());
             if let Some(config) = app_state.runtime_config.as_ref() {
                 if let Some(opencode) = config.opencode.as_ref() {
-                    match tauri::async_runtime::block_on(
-                        voxgolem_platform::opencode::OpencodeServer::start(
-                            voxgolem_platform::opencode::OpencodeServerConfig::new(&opencode.path),
-                        ),
-                    ) {
+                    let server = opencode_server_config(opencode).and_then(|server_config| {
+                        tauri::async_runtime::block_on(
+                            voxgolem_platform::opencode::OpencodeServer::start(server_config),
+                        )
+                        .map_err(|error| error.to_string())
+                    });
+                    match server {
                         Ok(server) => {
                             *app_state
                                 .opencode_server
@@ -8136,9 +8305,8 @@ pub fn run() {
                                 .expect("opencode server lock") = Some(server)
                         }
                         Err(error) => {
-                            fail_startup_capability(
-                                &app_state.startup_state,
-                                "opencode",
+                            fail_opencode_startup(
+                                &app_state,
                                 format!("failed to start OpenCode server: {error}"),
                             );
                         }
@@ -8470,20 +8638,21 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_history, allows_user_media_from_uri, apply_optional_speech_activity,
+        agent_history, allows_user_media_from_uri, apply_opencode_startup_failure,
+        apply_optional_speech_activity, apply_wsl_custom_auth_resolution,
         assistant_completion_enabled, atomic_replace_state_file, begin_update_installation,
         begin_update_sensitive_operation, bounded_provider_history, build_mark_silence_response,
         build_nonfatal_config_error_app_state, build_startup_error_app_state,
         claim_cancelled_prompt_publication, cleanup_sequential,
-        clear_completion_request_state_locked, current_runtime_phase_response,
-        current_silence_deadline, default_response_profile, default_voice_pipeline_config,
-        ensure_assistant_settings_available, ensure_update_installation_is_idle,
-        finish_tts_playback_state, fit_review_history_to_prompt_budget,
-        ingest_audio_frame_with_optional_wake_word_detection, initial_stage_sequence,
-        load_llama_cpp_system_prompt, load_persisted_state, load_persisted_tts_enabled,
-        load_persisted_ui_text_size, load_persisted_ui_theme, model_path_for_profile,
-        parse_deep_agent_json, parse_persisted_state, parse_review_agent_json,
-        partial_transcription_worker_guard, persist_assistant_settings,
+        clear_completion_request_state_locked, configured_capabilities,
+        current_runtime_phase_response, current_silence_deadline, default_response_profile,
+        default_voice_pipeline_config, ensure_assistant_settings_available,
+        ensure_update_installation_is_idle, finish_tts_playback_state,
+        fit_review_history_to_prompt_budget, ingest_audio_frame_with_optional_wake_word_detection,
+        initial_stage_sequence, load_llama_cpp_system_prompt, load_persisted_state,
+        load_persisted_tts_enabled, load_persisted_ui_text_size, load_persisted_ui_theme,
+        model_path_for_profile, parse_deep_agent_json, parse_persisted_state,
+        parse_review_agent_json, partial_transcription_worker_guard, persist_assistant_settings,
         persist_selected_response_profile, persist_tts_enabled, persist_ui_text_size,
         persist_ui_theme, process_wake_word_frame, race_durable_cancellation,
         register_active_prompt, register_tts_playback, reset_runtime_session,
@@ -9550,6 +9719,144 @@ mod tests {
                 ResponseProfilePayload::Quality
             ]
         );
+    }
+
+    #[test]
+    fn resolved_wsl_auth_enables_only_the_custom_provider() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let auth_path = temp.path().join("auth.json");
+        std::fs::write(&auth_path, "{}").expect("auth fixture");
+        std::fs::write(
+            &config_path,
+            "response_backend = \"opencode\"\n[opencode]\nruntime = \"wsl\"\n[custom_openai]\nauth_source = \"wsl\"\n",
+        )
+        .expect("config fixture");
+        let mut config =
+            voxgolem_core::config::load_runtime_config(Some(&config_path)).expect("WSL config");
+
+        apply_wsl_custom_auth_resolution(&mut config, Ok(auth_path.clone()));
+
+        assert_eq!(
+            config
+                .custom_openai
+                .as_ref()
+                .expect("custom config")
+                .auth_path,
+            auth_path
+        );
+        let capabilities = configured_capabilities(&config);
+        let custom = capabilities
+            .iter()
+            .find(|capability| capability.id == "custom_provider")
+            .expect("custom capability");
+        assert_eq!(custom.state, CapabilityStatePayload::Available);
+    }
+
+    #[test]
+    fn failed_wsl_auth_resolution_isolated_to_custom_capability() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "response_backend = \"opencode\"\n[opencode]\nruntime = \"wsl\"\n[custom_openai]\nauth_source = \"wsl\"\n",
+        )
+        .expect("config fixture");
+        let mut config =
+            voxgolem_core::config::load_runtime_config(Some(&config_path)).expect("WSL config");
+
+        apply_wsl_custom_auth_resolution(&mut config, Err(String::from("WSL is unavailable")));
+
+        let capabilities = configured_capabilities(&config);
+        let custom = capabilities
+            .iter()
+            .find(|capability| capability.id == "custom_provider")
+            .expect("custom capability");
+        assert_eq!(custom.state, CapabilityStatePayload::Unavailable);
+        assert!(custom.reason.contains("WSL is unavailable"));
+        assert!(capabilities.iter().any(|capability| {
+            capability.id == "wake_word"
+                && capability.reason != "failed to resolve WSL OpenCode auth: WSL is unavailable"
+        }));
+    }
+
+    #[test]
+    fn opencode_startup_failure_reconciles_dependent_capabilities_and_settings() {
+        let capability = |id, state| CapabilityPayload {
+            id,
+            state,
+            reason: String::from("ready"),
+            actual_provider: None,
+        };
+        let settings = AssistantSettingsPayload {
+            instant: InstantChoicePayload::OpenCodeSolHigh,
+            deep: AgentChoicePayload::OpenCodeSolHigh,
+            review: AgentChoicePayload::OpenCodeLunaLow,
+            deep_enabled: true,
+            review_enabled: true,
+            ..AssistantSettingsPayload::default()
+        };
+
+        let mut without_fallback = vec![
+            capability("custom_provider", CapabilityStatePayload::NotConfigured),
+            capability("opencode", CapabilityStatePayload::Available),
+            capability("deep", CapabilityStatePayload::Available),
+            capability("review", CapabilityStatePayload::Available),
+        ];
+        let reconciled = apply_opencode_startup_failure(
+            &mut without_fallback,
+            settings,
+            String::from("OpenCode failed"),
+        );
+        assert!(!reconciled.deep_enabled);
+        assert!(!reconciled.review_enabled);
+        for id in ["opencode", "deep", "review"] {
+            assert_eq!(
+                without_fallback
+                    .iter()
+                    .find(|capability| capability.id == id)
+                    .expect("capability")
+                    .state,
+                CapabilityStatePayload::Failed
+            );
+        }
+
+        let mut with_custom = vec![
+            capability("custom_provider", CapabilityStatePayload::Available),
+            capability("opencode", CapabilityStatePayload::Available),
+            capability("deep", CapabilityStatePayload::Available),
+            capability("review", CapabilityStatePayload::Available),
+        ];
+        let reconciled = apply_opencode_startup_failure(
+            &mut with_custom,
+            settings,
+            String::from("OpenCode failed"),
+        );
+        assert_eq!(reconciled.instant, InstantChoicePayload::CustomSolHigh);
+        assert_eq!(reconciled.deep, AgentChoicePayload::CustomSolHigh);
+        assert_eq!(reconciled.review, AgentChoicePayload::CustomLunaLow);
+        assert!(reconciled.deep_enabled);
+        assert!(reconciled.review_enabled);
+        assert!(with_custom.iter().any(|capability| {
+            capability.id == "deep" && capability.state == CapabilityStatePayload::Available
+        }));
+        assert!(with_custom.iter().any(|capability| {
+            capability.id == "review" && capability.state == CapabilityStatePayload::Available
+        }));
+
+        let mut with_custom = vec![
+            capability("custom_provider", CapabilityStatePayload::Available),
+            capability("opencode", CapabilityStatePayload::Available),
+        ];
+        let reconciled = apply_opencode_startup_failure(
+            &mut with_custom,
+            AssistantSettingsPayload {
+                instant: InstantChoicePayload::OpenCodeLunaLow,
+                ..settings
+            },
+            String::from("OpenCode failed"),
+        );
+        assert_eq!(reconciled.instant, InstantChoicePayload::CustomLunaLow);
     }
 
     #[test]

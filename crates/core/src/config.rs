@@ -68,7 +68,10 @@ enum RawResponseBackend {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawOpencodeConfig {
-    path: PathBuf,
+    #[serde(default)]
+    path: Option<PathBuf>,
+    #[serde(default)]
+    runtime: OpencodeRuntime,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -89,8 +92,10 @@ struct RawLlamaCppConfig {
 struct RawCustomOpenAiConfig {
     #[serde(default = "default_private_endpoint")]
     endpoint: String,
-    #[serde(default = "default_auth_path")]
-    auth_path: PathBuf,
+    #[serde(default)]
+    auth_path: Option<PathBuf>,
+    #[serde(default)]
+    auth_source: CustomOpenAiAuthSource,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -159,6 +164,7 @@ pub struct RuntimeConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpencodeConfig {
     pub path: PathBuf,
+    pub runtime: OpencodeRuntime,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,6 +181,23 @@ pub struct LlamaCppConfig {
 pub struct CustomOpenAiConfig {
     pub endpoint: String,
     pub auth_path: PathBuf,
+    pub auth_source: CustomOpenAiAuthSource,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CustomOpenAiAuthSource {
+    #[default]
+    Native,
+    Wsl,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OpencodeRuntime {
+    #[default]
+    Native,
+    Wsl,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -420,6 +443,47 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
         }
     })?;
 
+    if raw_config
+        .opencode
+        .as_ref()
+        .is_some_and(|raw| raw.runtime == OpencodeRuntime::Native && raw.path.is_none())
+    {
+        return Err(ConfigError::ParseConfigFailed {
+            path: config_path.clone(),
+            details: String::from("opencode.path is required for native runtime"),
+        });
+    }
+    if let Some(path) = raw_config
+        .opencode
+        .as_ref()
+        .filter(|raw| raw.runtime == OpencodeRuntime::Wsl)
+        .and_then(|raw| raw.path.as_ref())
+        .filter(|path| !is_absolute_linux_path(path))
+    {
+        return Err(ConfigError::ParseConfigFailed {
+            path: config_path.clone(),
+            details: format!(
+                "opencode.path must be an absolute Linux path for WSL runtime: {}",
+                path.display()
+            ),
+        });
+    }
+    if let Some(path) = raw_config
+        .custom_openai
+        .as_ref()
+        .filter(|raw| raw.auth_source == CustomOpenAiAuthSource::Wsl)
+        .and_then(|raw| raw.auth_path.as_ref())
+        .filter(|path| !is_absolute_linux_path(path))
+    {
+        return Err(ConfigError::ParseConfigFailed {
+            path: config_path.clone(),
+            details: format!(
+                "custom_openai.auth_path must be an absolute Linux path for WSL auth: {}",
+                path.display()
+            ),
+        });
+    }
+
     let wake_word_configured = raw_config.wake_word_model_path.is_some();
     let parakeet_configured = raw_config.parakeet_model_dir.is_some();
     let vad_configured = raw_config.silero_vad_model.is_some();
@@ -633,15 +697,35 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
     }
 
     let opencode = raw_config.opencode.as_ref().map(|raw| {
-        let path = resolve_config_path(&config_dir, raw.path.clone());
-        record_path_issue(
-            &mut capability_issues,
-            "opencode",
-            true,
-            path.is_file(),
-            &path,
-        );
-        OpencodeConfig { path }
+        let path = match raw.runtime {
+            OpencodeRuntime::Wsl => raw.path.clone().unwrap_or_default(),
+            OpencodeRuntime::Native => raw
+                .path
+                .clone()
+                .map_or_else(PathBuf::new, |path| resolve_config_path(&config_dir, path)),
+        };
+        match raw.runtime {
+            OpencodeRuntime::Wsl if !cfg!(windows) => {
+                capability_issues.push(CapabilityConfigIssue {
+                    capability: "opencode",
+                    reason: String::from(
+                        "WSL runtime is only supported by the Windows application",
+                    ),
+                });
+            }
+            OpencodeRuntime::Wsl => {}
+            OpencodeRuntime::Native => record_path_issue(
+                &mut capability_issues,
+                "opencode",
+                true,
+                path.is_file(),
+                &path,
+            ),
+        }
+        OpencodeConfig {
+            path,
+            runtime: raw.runtime,
+        }
     });
     let llama_cpp = raw_config.llama_cpp.as_ref().map(|raw| {
         let server_path = resolve_config_path(&config_dir, raw.server_path.clone());
@@ -686,10 +770,16 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
         }
     });
     let custom_openai = raw_config.custom_openai.as_ref().map(|raw| {
-        let auth_path = if raw.auth_path.as_os_str().is_empty() {
-            PathBuf::new()
-        } else {
-            resolve_config_path(&config_dir, raw.auth_path.clone())
+        let auth_path = match raw.auth_source {
+            CustomOpenAiAuthSource::Wsl => raw.auth_path.clone().unwrap_or_default(),
+            CustomOpenAiAuthSource::Native => {
+                let path = raw.auth_path.clone().unwrap_or_else(default_auth_path);
+                if path.as_os_str().is_empty() {
+                    path
+                } else {
+                    resolve_config_path(&config_dir, path)
+                }
+            }
         };
         let endpoint = raw.endpoint.trim().to_string();
         if !valid_custom_endpoint(&endpoint) {
@@ -698,25 +788,16 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
                 reason: String::from("custom_openai.endpoint is invalid"),
             });
         }
-        if auth_path.as_os_str().is_empty() {
-            capability_issues.push(CapabilityConfigIssue {
-                capability: "custom_provider",
-                reason: String::from(
-                    "auth path unavailable: HOME or absolute XDG_DATA_HOME is required",
-                ),
-            });
-        } else {
-            record_path_issue(
-                &mut capability_issues,
-                "custom_provider",
-                true,
-                auth_path.is_file(),
-                &auth_path,
-            );
-        }
+        record_custom_auth_issue(
+            &mut capability_issues,
+            raw.auth_source,
+            &auth_path,
+            cfg!(windows),
+        );
         CustomOpenAiConfig {
             endpoint,
             auth_path,
+            auth_source: raw.auth_source,
         }
     });
     let completion = raw_config.completion.as_ref().map(|raw| {
@@ -740,84 +821,86 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
         }
     });
 
-    let response_backend = match raw_config.response_backend {
-        Some(RawResponseBackend::Opencode) => {
-            let Some(_raw_opencode) = raw_config.opencode else {
-                capability_issues.push(CapabilityConfigIssue {
-                    capability: "opencode",
-                    reason: String::from("[opencode] table is not configured"),
-                });
-                return Ok(RuntimeConfig {
-                    wake_word_model_path,
-                    parakeet_model_dir,
-                    silero_vad_model,
-                    silence_timeout_ms,
-                    wake_word_detection_threshold,
-                    local_tts,
-                    logging,
-                    telemetry,
-                    response_backend: ResponseBackendConfig::Unconfigured,
-                    opencode: opencode.clone(),
-                    llama_cpp: llama_cpp.clone(),
-                    custom_openai: custom_openai.clone(),
-                    completion: completion.clone(),
-                    capability_issues,
-                });
-            };
-            if let Some(config) = opencode.as_ref().filter(|config| config.path.is_file()) {
-                ResponseBackendConfig::Opencode {
-                    path: config.path.clone(),
+    let response_backend =
+        match raw_config.response_backend {
+            Some(RawResponseBackend::Opencode) => {
+                let Some(_raw_opencode) = raw_config.opencode else {
+                    capability_issues.push(CapabilityConfigIssue {
+                        capability: "opencode",
+                        reason: String::from("[opencode] table is not configured"),
+                    });
+                    return Ok(RuntimeConfig {
+                        wake_word_model_path,
+                        parakeet_model_dir,
+                        silero_vad_model,
+                        silence_timeout_ms,
+                        wake_word_detection_threshold,
+                        local_tts,
+                        logging,
+                        telemetry,
+                        response_backend: ResponseBackendConfig::Unconfigured,
+                        opencode: opencode.clone(),
+                        llama_cpp: llama_cpp.clone(),
+                        custom_openai: custom_openai.clone(),
+                        completion: completion.clone(),
+                        capability_issues,
+                    });
+                };
+                if let Some(config) = opencode.as_ref().filter(|config| {
+                    config.runtime == OpencodeRuntime::Wsl || config.path.is_file()
+                }) {
+                    ResponseBackendConfig::Opencode {
+                        path: config.path.clone(),
+                    }
+                } else {
+                    ResponseBackendConfig::Unconfigured
                 }
-            } else {
+            }
+            Some(RawResponseBackend::LlamaCpp) => {
+                let Some(_raw_llama_cpp) = raw_config.llama_cpp else {
+                    capability_issues.push(CapabilityConfigIssue {
+                        capability: "local_fast",
+                        reason: String::from("[llama_cpp] table is not configured"),
+                    });
+                    return Ok(RuntimeConfig {
+                        wake_word_model_path,
+                        parakeet_model_dir,
+                        silero_vad_model,
+                        silence_timeout_ms,
+                        wake_word_detection_threshold,
+                        local_tts,
+                        logging,
+                        telemetry,
+                        response_backend: ResponseBackendConfig::Unconfigured,
+                        opencode: opencode.clone(),
+                        llama_cpp: llama_cpp.clone(),
+                        custom_openai: custom_openai.clone(),
+                        completion: completion.clone(),
+                        capability_issues,
+                    });
+                };
+                if let Some(config) = llama_cpp.as_ref().filter(|config| {
+                    config.server_path.is_file() && config.fast_model_path.is_file()
+                }) {
+                    ResponseBackendConfig::LlamaCpp {
+                        server_path: config.server_path.clone(),
+                        host: config.host.clone(),
+                        port: config.port,
+                        fast_model_path: config.fast_model_path.clone(),
+                        quality_model_path: config.quality_model_path.clone(),
+                    }
+                } else {
+                    ResponseBackendConfig::Unconfigured
+                }
+            }
+            None => {
+                capability_issues.push(CapabilityConfigIssue {
+                    capability: "response_provider",
+                    reason: String::from("response_backend is not configured"),
+                });
                 ResponseBackendConfig::Unconfigured
             }
-        }
-        Some(RawResponseBackend::LlamaCpp) => {
-            let Some(_raw_llama_cpp) = raw_config.llama_cpp else {
-                capability_issues.push(CapabilityConfigIssue {
-                    capability: "local_fast",
-                    reason: String::from("[llama_cpp] table is not configured"),
-                });
-                return Ok(RuntimeConfig {
-                    wake_word_model_path,
-                    parakeet_model_dir,
-                    silero_vad_model,
-                    silence_timeout_ms,
-                    wake_word_detection_threshold,
-                    local_tts,
-                    logging,
-                    telemetry,
-                    response_backend: ResponseBackendConfig::Unconfigured,
-                    opencode: opencode.clone(),
-                    llama_cpp: llama_cpp.clone(),
-                    custom_openai: custom_openai.clone(),
-                    completion: completion.clone(),
-                    capability_issues,
-                });
-            };
-            if let Some(config) = llama_cpp
-                .as_ref()
-                .filter(|config| config.server_path.is_file() && config.fast_model_path.is_file())
-            {
-                ResponseBackendConfig::LlamaCpp {
-                    server_path: config.server_path.clone(),
-                    host: config.host.clone(),
-                    port: config.port,
-                    fast_model_path: config.fast_model_path.clone(),
-                    quality_model_path: config.quality_model_path.clone(),
-                }
-            } else {
-                ResponseBackendConfig::Unconfigured
-            }
-        }
-        None => {
-            capability_issues.push(CapabilityConfigIssue {
-                capability: "response_provider",
-                reason: String::from("response_backend is not configured"),
-            });
-            ResponseBackendConfig::Unconfigured
-        }
-    };
+        };
 
     Ok(RuntimeConfig {
         wake_word_model_path,
@@ -911,6 +994,36 @@ fn record_path_issue(
             String::from("not configured")
         },
     });
+}
+
+fn record_custom_auth_issue(
+    issues: &mut Vec<CapabilityConfigIssue>,
+    source: CustomOpenAiAuthSource,
+    auth_path: &Path,
+    windows: bool,
+) {
+    match source {
+        CustomOpenAiAuthSource::Wsl if !windows => issues.push(CapabilityConfigIssue {
+            capability: "custom_provider",
+            reason: String::from("WSL auth is only supported by the Windows application"),
+        }),
+        CustomOpenAiAuthSource::Wsl => {}
+        CustomOpenAiAuthSource::Native if auth_path.as_os_str().is_empty() => {
+            issues.push(CapabilityConfigIssue {
+                capability: "custom_provider",
+                reason: String::from(
+                    "auth path unavailable: HOME or absolute XDG_DATA_HOME is required",
+                ),
+            });
+        }
+        CustomOpenAiAuthSource::Native => record_path_issue(
+            issues,
+            "custom_provider",
+            true,
+            auth_path.is_file(),
+            auth_path,
+        ),
+    }
 }
 
 fn default_silence_timeout_ms() -> u64 {
@@ -1035,12 +1148,17 @@ fn resolve_config_path(config_dir: &Path, path: PathBuf) -> PathBuf {
     }
 }
 
+fn is_absolute_linux_path(path: &Path) -> bool {
+    path.to_str().is_some_and(|path| path.starts_with('/'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         default_auth_path_from_env, default_private_endpoint, linux_app_dir_from_env,
-        load_runtime_config, platform_dirs_from_env, soul_path_for_config, valid_custom_endpoint,
-        ConfigError, InferencePolicy, RawCompletionConfig, RawLlamaCppConfig,
+        load_runtime_config, platform_dirs_from_env, record_custom_auth_issue,
+        soul_path_for_config, valid_custom_endpoint, ConfigError, CustomOpenAiAuthSource,
+        InferencePolicy, OpencodeRuntime, RawCompletionConfig, RawLlamaCppConfig,
         ResponseBackendConfig,
     };
     use std::collections::HashMap;
@@ -1113,6 +1231,120 @@ mod tests {
             issue.capability == "custom_provider"
                 && issue.reason == "custom_openai.endpoint is invalid"
         }));
+    }
+
+    #[test]
+    fn provider_modes_default_to_native_and_preserve_native_paths() {
+        let temp = TempDir::new();
+        let auth = temp.path().join("auth.json");
+        let opencode = temp.path().join("opencode");
+        create_file(&auth);
+        create_file(&opencode);
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "response_backend = \"opencode\"\n[opencode]\npath = \"{}\"\n[custom_openai]\nauth_path = \"{}\"\n",
+                escape_path(&opencode),
+                escape_path(&auth)
+            ),
+        )
+        .expect("config should be written");
+
+        let config = load_runtime_config(Some(&path)).expect("native config should load");
+        assert_eq!(config.opencode.unwrap().runtime, OpencodeRuntime::Native);
+        assert_eq!(
+            config.custom_openai.unwrap().auth_source,
+            CustomOpenAiAuthSource::Native
+        );
+    }
+
+    #[test]
+    fn wsl_modes_keep_omitted_paths_unresolved() {
+        let temp = TempDir::new();
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
+            "response_backend = \"opencode\"\n[opencode]\nruntime = \"wsl\"\n[custom_openai]\nauth_source = \"wsl\"\n",
+        )
+        .expect("config should be written");
+
+        let config = load_runtime_config(Some(&path)).expect("WSL config should parse");
+        assert_eq!(config.opencode.unwrap().path, PathBuf::new());
+        assert_eq!(config.custom_openai.unwrap().auth_path, PathBuf::new());
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(config.capability_issues.iter().any(|issue| {
+                issue.capability == "opencode" && issue.reason.contains("only supported")
+            }));
+            assert!(config.capability_issues.iter().any(|issue| {
+                issue.capability == "custom_provider" && issue.reason.contains("only supported")
+            }));
+        }
+        assert!(matches!(
+            config.response_backend,
+            ResponseBackendConfig::Opencode { path } if path.as_os_str().is_empty()
+        ));
+    }
+
+    #[test]
+    fn rejects_relative_wsl_provider_paths() {
+        for config in [
+            "[opencode]\nruntime = \"wsl\"\npath = \"relative/opencode\"\n",
+            "[custom_openai]\nauth_source = \"wsl\"\nauth_path = \"relative/auth.json\"\n",
+        ] {
+            let temp = TempDir::new();
+            let path = temp.path().join("config.toml");
+            fs::write(&path, config).expect("config should be written");
+            assert!(matches!(
+                load_runtime_config(Some(&path)),
+                Err(ConfigError::ParseConfigFailed { details, .. })
+                    if details.contains("absolute Linux path")
+            ));
+        }
+    }
+
+    #[test]
+    fn preserves_explicit_wsl_provider_paths_verbatim() {
+        let temp = TempDir::new();
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
+            "[opencode]\nruntime = \"wsl\"\npath = \"/home/user/bin/opencode\"\n[custom_openai]\nauth_source = \"wsl\"\nauth_path = \"/home/user/auth.json\"\n",
+        )
+        .expect("config should be written");
+
+        let config = load_runtime_config(Some(&path)).expect("WSL config should parse");
+        assert_eq!(
+            config.opencode.expect("OpenCode config").path,
+            PathBuf::from("/home/user/bin/opencode")
+        );
+        assert_eq!(
+            config.custom_openai.expect("Custom config").auth_path,
+            PathBuf::from("/home/user/auth.json")
+        );
+    }
+
+    #[test]
+    fn windows_defers_wsl_auth_file_validation_to_the_platform_resolver() {
+        for path in [Path::new(""), Path::new("/home/user/missing-auth.json")] {
+            let mut issues = Vec::new();
+            record_custom_auth_issue(&mut issues, CustomOpenAiAuthSource::Wsl, path, true);
+            assert!(issues.is_empty());
+        }
+    }
+
+    #[test]
+    fn rejects_native_opencode_without_a_path() {
+        let temp = TempDir::new();
+        let path = temp.path().join("config.toml");
+        fs::write(&path, "[opencode]\n").expect("config should be written");
+
+        assert!(matches!(
+            load_runtime_config(Some(&path)),
+            Err(ConfigError::ParseConfigFailed { details, .. })
+                if details.contains("opencode.path is required")
+        ));
     }
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
