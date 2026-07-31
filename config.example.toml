@@ -9,6 +9,7 @@ response_backend = "llama_cpp"
 
 [opencode]
 path = "opencode/opencode"
+runtime = "native" # Windows may use "wsl" and omit path for discovery.
 
 [llama_cpp]
 server_path = "llama/bin/llama-server"
@@ -21,6 +22,7 @@ inference_provider = "auto" # auto, cuda, or cpu
 [custom_openai]
 endpoint = "https://chatgpt.com/backend-api/codex/responses"
 auth_path = "/home/user/.local/share/opencode/auth.json"
+auth_source = "native" # Windows may use "wsl" and omit auth_path.
 
 [completion]
 server_path = "llama/bin/llama-server"

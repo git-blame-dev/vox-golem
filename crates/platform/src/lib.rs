@@ -7,3 +7,4 @@ pub mod inference;
 pub mod llama_cpp;
 pub mod managed_process;
 pub mod opencode;
+pub mod wsl;

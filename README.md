@@ -22,6 +22,21 @@ Windows 11 x64 uses a per-user NSIS installer under `%LOCALAPPDATA%\Programs\Vox
 
 Windows configuration defaults to `%APPDATA%\VoxGolem\config.toml`. Relative paths resolve beside that file, and missing assets disable only the affected optional capability.
 
+### Native Windows with WSL providers
+
+The native Windows app can use the default WSL distribution for OpenCode without adding OpenCode or WSL files to the installer. Install and log in to OpenCode inside that distribution first; the distribution must also provide `sh` and `setsid`, as Ubuntu does by default. The Custom provider reads the live WSL auth file but sends its HTTPS request directly from the Windows app; the OpenCode provider starts one authenticated WSL server at app startup and keeps it warm until app exit.
+
+```toml
+[custom_openai]
+auth_source = "wsl"
+endpoint = "https://chatgpt.com/backend-api/codex/responses"
+
+[opencode]
+runtime = "wsl"
+```
+
+The default locations are `$HOME/.local/share/opencode/auth.json` and `$HOME/.opencode/bin/opencode`, followed by WSL command lookup for the executable. Optional overrides must be absolute Linux paths. WSL selection is explicit per provider; omitted selectors retain native behavior, and Vox Golem never silently falls back to a different credential or executable source. Missing WSL, a default distribution, auth, or OpenCode disables only the affected capability.
+
 ## WSL2/WSLg setup
 
 Install Bun 1.3.9, Rust stable, Tauri CLI 2.11.1, and the Ubuntu WebKitGTK/GTK, audio, CMake, Ninja, Clang/LLVM, and eSpeak development packages. WSLg supplies the Linux GUI and microphone integration; verify those manually on your machine.
