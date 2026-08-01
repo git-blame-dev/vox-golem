@@ -8863,13 +8863,12 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_history, allows_user_media_from_uri, apply_opencode_startup_failure,
-        apply_optional_speech_activity, apply_wsl_custom_auth_resolution,
-        assistant_completion_enabled, atomic_replace_state_file, begin_update_installation,
-        begin_update_sensitive_operation, bounded_provider_history, build_mark_silence_response,
-        build_nonfatal_config_error_app_state, build_startup_error_app_state,
-        cancel_current_tts_playback_state, cancel_prompt_request_state,
-        cancel_tts_generation_for_prompt, cancel_tts_playback_state,
+        agent_history, apply_opencode_startup_failure, apply_optional_speech_activity,
+        apply_wsl_custom_auth_resolution, assistant_completion_enabled, atomic_replace_state_file,
+        begin_update_installation, begin_update_sensitive_operation, bounded_provider_history,
+        build_mark_silence_response, build_nonfatal_config_error_app_state,
+        build_startup_error_app_state, cancel_current_tts_playback_state,
+        cancel_prompt_request_state, cancel_tts_generation_for_prompt, cancel_tts_playback_state,
         claim_cancelled_prompt_publication, cleanup_sequential,
         clear_completion_request_state_locked, configured_capabilities,
         current_runtime_phase_response, current_silence_deadline, default_response_profile,
