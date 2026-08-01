@@ -795,10 +795,12 @@ describe('App', () => {
           }
         }
 
+        if (command === 'reserve_local_tts_playback_id') return 72
+
         if (command === 'speak_local_tts') {
           expect(args).toEqual({
             text: 'Voice response',
-            playbackId: 2,
+            playbackId: 72,
           })
           return {
             duration_ms: 1,
@@ -855,6 +857,7 @@ describe('App', () => {
         }
         if (command === 'set_tts_enabled') return { enabled: true }
         if (command === 'submit_prompt') { requestId = (args as { requestId: string }).requestId; return new Promise((resolve) => { finishPrompt = resolve }) }
+        if (command === 'reserve_local_tts_playback_id') return 73
         if (command === 'speak_local_tts') return new Promise((resolve) => { finishSpeech = resolve })
         if (command === 'finish_tts_playback') { finishTts(); return null }
         if (command === 'cancel_prompt') return null
@@ -890,6 +893,7 @@ describe('App', () => {
         if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
         if (command === 'set_tts_enabled') return { enabled: true }
         if (command === 'submit_prompt') { requestId = (args as { requestId: string }).requestId; return new Promise(() => {}) }
+        if (command === 'reserve_local_tts_playback_id') return 74
         if (command === 'speak_local_tts') {
           synthesisInvoked = true
           return new Promise((resolve) => { resolveSynthesis = resolve })
@@ -937,6 +941,7 @@ describe('App', () => {
           promptEventHandler?.({ payload: { request_id: requestId, kind: 'text', text: 'Spoken response' } })
           return { request_id: requestId, outcome: 'completed', error_message: null, runtime_phase: 'sleeping' }
         }
+        if (command === 'reserve_local_tts_playback_id') return 75
         if (command === 'speak_local_tts') {
           return new Promise((resolve) => { resolveSynthesis = resolve })
         }
@@ -3906,6 +3911,7 @@ describe('App', () => {
             request_id: requestId, outcome: 'completed', error_message: null, runtime_phase: 'sleeping',
           }
         }
+        if (command === 'reserve_local_tts_playback_id') return 76
         if (command === 'speak_local_tts') {
           return { duration_ms: 1 }
         }
@@ -4647,6 +4653,7 @@ describe('App', () => {
           requestId = (args as { requestId: string }).requestId
           return new Promise((resolve) => { finishPrompt = resolve })
         }
+        if (command === 'reserve_local_tts_playback_id') return 77
         if (command === 'speak_local_tts') {
           synthesizedText = (args as { text: string }).text
           return { duration_ms: 1 }

@@ -1401,19 +1401,25 @@ function App() {
 
   const synthesizeAndPlayAssistantReply = async (text: string): Promise<void> => {
     let commandPending = false
+    let playbackId: number | null = null
     cancelTts()
     const generation = ttsGenerationRef.current
 
     try {
       const speechText = firstNonEmptyCompletedLine(text) ?? ''
       if (!isValidTtsFirstLine(speechText)) return
-      ttsPlaybackIdRef.current = generation
+      playbackId = parseNativeAudioRequestId(
+        await invokeTauriCommand('reserve_local_tts_playback_id'),
+        'TTS playback',
+      )
+      if (generation !== ttsGenerationRef.current || !ttsEnabledRef.current) return
+      ttsPlaybackIdRef.current = playbackId
       setTtsPlaying(true)
       commandPending = true
       setPendingTtsCommands((count) => count + 1)
       const payload = await invokeTauriCommand('speak_local_tts', {
         text: speechText,
-        playbackId: generation,
+        playbackId,
       })
       if (generation !== ttsGenerationRef.current || !ttsEnabledRef.current) return
 
@@ -1439,7 +1445,7 @@ function App() {
       if (commandPending) {
         setPendingTtsCommands((count) => Math.max(0, count - 1))
       }
-      if (ttsPlaybackIdRef.current === generation) {
+      if (playbackId !== null && ttsPlaybackIdRef.current === playbackId) {
         ttsPlaybackIdRef.current = null
         setTtsPlaying(false)
       }
@@ -2326,6 +2332,13 @@ function toDisplayErrorMessage(error: unknown): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
+}
+
+function parseNativeAudioRequestId(payload: unknown, label: string): number {
+  if (typeof payload !== 'number' || !Number.isSafeInteger(payload) || payload <= 0) {
+    throw new Error(`${label} ID is invalid`)
+  }
+  return payload
 }
 
 function capabilityIsAvailable(

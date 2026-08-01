@@ -151,7 +151,9 @@ impl AudioPlaybackService {
                 if self.suspended.load(Ordering::Acquire) {
                     return Err(PlaybackError::Suspended);
                 }
-                if request.playback_id < state.latest_id {
+                if request.playback_id < state.latest_id
+                    || (request.playback_id == state.latest_id && state.current.is_some())
+                {
                     return Err(PlaybackError::Superseded);
                 }
                 state.latest_id = request.playback_id;
@@ -750,6 +752,21 @@ mod tests {
             Err(PlaybackError::Superseded)
         );
         assert!(second.join().expect("second playback").is_ok());
+    }
+
+    #[test]
+    fn duplicate_active_playback_id_is_rejected() {
+        let backend = Arc::new(FakeBackend::default());
+        let service = Arc::new(AudioPlaybackService::with_backend(backend.clone()));
+        let worker_service = Arc::clone(&service);
+        let worker = thread::spawn(move || worker_service.play(request(1)));
+        let player = wait_for_player(&backend, 0);
+
+        assert_eq!(service.play(request(1)), Err(PlaybackError::Superseded));
+        assert_eq!(backend.starts.load(Ordering::Acquire), 1);
+
+        player.complete();
+        assert!(worker.join().expect("playback thread").is_ok());
     }
 
     #[test]
