@@ -1,8 +1,6 @@
 import { getTauriInternals } from './tauri'
 
-const MAX_CAPTURE_ID = Number.MAX_SAFE_INTEGER
 const MAX_PENDING_FRAMES = 8
-let captureSequence = 0
 
 export interface LiveAudioSource {
   stop(): void
@@ -38,7 +36,9 @@ export async function startLiveAudioSource(
     throw new Error('Native microphone capture is unavailable in this runtime')
   }
 
-  const captureId = nextCaptureId()
+  const captureId = parseNativeCaptureId(
+    await tauri.invoke('reserve_native_microphone_capture_id'),
+  )
   let stopped = false
   let firstFrameReported = false
   let deliveringFrames = false
@@ -150,11 +150,6 @@ export async function startLiveAudioSource(
   }
 }
 
-function nextCaptureId(): number {
-  captureSequence = captureSequence >= MAX_CAPTURE_ID ? 1 : captureSequence + 1
-  return captureSequence
-}
-
 function parseAudioInputDevice(payload: unknown): AudioInputDevice {
   if (typeof payload !== 'object' || payload === null) {
     throw new Error('Audio input device must be an object')
@@ -164,6 +159,13 @@ function parseAudioInputDevice(payload: unknown): AudioInputDevice {
     throw new Error('Audio input device fields are invalid')
   }
   return { deviceId: record['device_id'], label: record['label'] }
+}
+
+function parseNativeCaptureId(payload: unknown): number {
+  if (typeof payload !== 'number' || !Number.isSafeInteger(payload) || payload <= 0) {
+    throw new Error('Native microphone capture ID is invalid')
+  }
+  return payload
 }
 
 function parseCaptureStart(payload: unknown): boolean {

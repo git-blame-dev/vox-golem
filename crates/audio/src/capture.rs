@@ -36,6 +36,7 @@ pub struct CaptureTerminal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureError {
     InvalidCaptureId,
+    CaptureIdExhausted,
     InvalidSampleRate,
     InvalidFrameSize,
     InvalidSample,
@@ -52,6 +53,7 @@ impl fmt::Display for CaptureError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidCaptureId => write!(formatter, "audio capture id is invalid"),
+            Self::CaptureIdExhausted => write!(formatter, "audio capture ids are exhausted"),
             Self::InvalidSampleRate => {
                 write!(
                     formatter,
@@ -92,6 +94,7 @@ struct Shared {
 
 #[derive(Default)]
 struct State {
+    next_id: u64,
     latest_id: u64,
     cancelled_through: u64,
     current_id: Option<u64>,
@@ -124,6 +127,29 @@ impl AudioCaptureService {
 
     pub fn list_input_devices(&self) -> Result<Vec<InputDevice>, CaptureError> {
         enumerate_input_devices()
+    }
+
+    pub fn reserve_id(&self) -> Result<u64, CaptureError> {
+        if self.shared.shutting_down.load(Ordering::Acquire) {
+            return Err(CaptureError::ShuttingDown);
+        }
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| CaptureError::StatePoisoned)?;
+        if self.shared.shutting_down.load(Ordering::Acquire) {
+            return Err(CaptureError::ShuttingDown);
+        }
+        let next_id = state
+            .next_id
+            .max(state.latest_id)
+            .max(state.cancelled_through)
+            .checked_add(1)
+            .filter(|next_id| *next_id <= MAX_CAPTURE_ID)
+            .ok_or(CaptureError::CaptureIdExhausted)?;
+        state.next_id = next_id;
+        Ok(next_id)
     }
 
     pub fn start(
@@ -809,6 +835,39 @@ mod tests {
         let state = service.shared.state.lock().unwrap();
         assert_eq!(state.latest_id, 1);
         assert_eq!(state.cancelled_through, 1);
+    }
+
+    #[test]
+    fn native_id_reservations_advance_past_stopped_renderer_sessions() {
+        let service = AudioCaptureService::new();
+        let first = service.reserve_id().expect("reserve first capture");
+        assert!(!service.stop(first).expect("stop first capture"));
+
+        let second = service.reserve_id().expect("reserve replacement capture");
+
+        assert!(second > first);
+        service.shared.state.lock().unwrap().current_id = Some(second);
+        assert!(!service.stop(first).expect("repeat stale stop"));
+        let state = service.shared.state.lock().unwrap();
+        assert_eq!(state.cancelled_through, first);
+        assert_eq!(state.current_id, Some(second));
+    }
+
+    #[test]
+    fn concurrent_native_id_reservations_are_unique_and_bounded() {
+        let service = Arc::new(AudioCaptureService::new());
+        let mut reservations = (0..32)
+            .map(|_| {
+                let service = Arc::clone(&service);
+                thread::spawn(move || service.reserve_id().expect("reserve capture"))
+            })
+            .map(|worker| worker.join().expect("reservation worker"))
+            .collect::<Vec<_>>();
+        reservations.sort_unstable();
+        assert_eq!(reservations, (1..=32).collect::<Vec<_>>());
+
+        service.shared.state.lock().unwrap().next_id = MAX_CAPTURE_ID;
+        assert_eq!(service.reserve_id(), Err(CaptureError::CaptureIdExhausted));
     }
 
     #[test]

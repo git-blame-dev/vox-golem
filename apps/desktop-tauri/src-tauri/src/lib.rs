@@ -120,6 +120,7 @@ struct AppState {
 
 #[derive(Default)]
 struct TtsPlaybackState {
+    next_id: u64,
     latest_id: u64,
     current_id: Option<u64>,
 }
@@ -848,6 +849,11 @@ async fn set_tts_enabled(
 }
 
 #[tauri::command]
+fn reserve_local_tts_playback_id(app_state: tauri::State<'_, AppState>) -> Result<u64, String> {
+    reserve_tts_playback_id(&app_state.tts_playback)
+}
+
+#[tauri::command]
 async fn speak_local_tts(
     text: String,
     playback_id: u64,
@@ -957,6 +963,16 @@ async fn finish_tts_playback(
         .cancel(playback_id)
         .map_err(|error| format!("failed to cancel local tts playback: {error}"))?;
     Ok(())
+}
+
+#[tauri::command]
+fn reserve_native_microphone_capture_id(
+    app_state: tauri::State<'_, AppState>,
+) -> Result<u64, String> {
+    app_state
+        .microphone_capture
+        .reserve_id()
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1084,12 +1100,26 @@ fn register_tts_playback(state: &Mutex<TtsPlaybackState>, playback_id: u64) -> R
     let mut state = state
         .lock()
         .map_err(|_| String::from("TTS playback state lock is poisoned"))?;
-    if playback_id < state.latest_id {
+    if playback_id < state.latest_id || state.current_id == Some(playback_id) {
         return Err(String::from("TTS playback was superseded"));
     }
     state.latest_id = playback_id;
     state.current_id = Some(playback_id);
     Ok(())
+}
+
+fn reserve_tts_playback_id(state: &Mutex<TtsPlaybackState>) -> Result<u64, String> {
+    let mut state = state
+        .lock()
+        .map_err(|_| String::from("TTS playback state lock is poisoned"))?;
+    let next_id = state
+        .next_id
+        .max(state.latest_id)
+        .checked_add(1)
+        .filter(|next_id| *next_id <= 9_007_199_254_740_991)
+        .ok_or_else(|| String::from("TTS playback ids are exhausted"))?;
+    state.next_id = next_id;
+    Ok(next_id)
 }
 
 fn ensure_tts_playback_current(
@@ -8727,8 +8757,10 @@ pub fn run() {
             app_updates::restart_for_update,
             get_startup_state,
             set_tts_enabled,
+            reserve_local_tts_playback_id,
             speak_local_tts,
             finish_tts_playback,
+            reserve_native_microphone_capture_id,
             list_audio_input_devices,
             start_native_microphone,
             stop_native_microphone,
@@ -9035,6 +9067,43 @@ mod tests {
 
         assert!(cancel_tts_playback_state(&state, 2).expect("cancel current playback"));
         assert!(super::ensure_tts_playback_current(&state, 2).is_err());
+    }
+
+    #[test]
+    fn native_tts_reservations_survive_renderer_replacement() {
+        let state = std::sync::Mutex::new(super::TtsPlaybackState::default());
+        let first = super::reserve_tts_playback_id(&state).expect("reserve first playback");
+        register_tts_playback(&state, first).expect("register first playback");
+        finish_tts_playback_state(&state, first).expect("finish first playback");
+
+        let replacement = super::reserve_tts_playback_id(&state).expect("reserve replacement");
+        assert!(replacement > first);
+        register_tts_playback(&state, replacement).expect("register replacement playback");
+        assert!(register_tts_playback(&state, replacement).is_err());
+
+        finish_tts_playback_state(&state, first).expect("finish stale playback");
+        assert!(super::ensure_tts_playback_current(&state, replacement).is_ok());
+        assert!(!cancel_tts_playback_state(&state, first).expect("cancel stale playback"));
+        assert!(super::ensure_tts_playback_current(&state, replacement).is_ok());
+    }
+
+    #[test]
+    fn concurrent_tts_reservations_are_unique_and_bounded() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(super::TtsPlaybackState::default()));
+        let mut reservations = (0..32)
+            .map(|_| {
+                let state = std::sync::Arc::clone(&state);
+                std::thread::spawn(move || {
+                    super::reserve_tts_playback_id(&state).expect("reserve playback")
+                })
+            })
+            .map(|worker| worker.join().expect("reservation worker"))
+            .collect::<Vec<_>>();
+        reservations.sort_unstable();
+        assert_eq!(reservations, (1..=32).collect::<Vec<_>>());
+
+        state.lock().unwrap().next_id = 9_007_199_254_740_991;
+        assert!(super::reserve_tts_playback_id(&state).is_err());
     }
 
     #[test]
