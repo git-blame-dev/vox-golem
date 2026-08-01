@@ -20,7 +20,6 @@ import type { RuntimeControlArgs } from './lib/runtimeControl'
 import {
   DEFAULT_CUE_ASSET_PATHS,
   DEFAULT_SILENCE_TIMEOUT_MS,
-  DEFAULT_TTS_OUTPUT_GAIN_DB,
   isStartupStateSettled,
   loadStartupState,
 } from './lib/startupState'
@@ -131,6 +130,7 @@ function App() {
   const [autoStopOnSilence, setAutoStopOnSilence] = useState(true)
   const [ttsEnabled, setTtsEnabled] = useState(false)
   const [ttsPlaying, setTtsPlaying] = useState(false)
+  const [pendingTtsCommands, setPendingTtsCommands] = useState(0)
   const [wakeConfidence, setWakeConfidence] = useState<number | null>(null)
   const [isSwitchingResponseProfile, setIsSwitchingResponseProfile] = useState(false)
   const [micStarting, setMicStarting] = useState(false)
@@ -180,6 +180,7 @@ function App() {
   const settingsPanelRef = useRef<HTMLElement | null>(null)
   const settingsCloseButtonRef = useRef<HTMLButtonElement | null>(null)
   const liveAudioSourceRef = useRef<LiveAudioSource | null>(null)
+  const liveAudioStartAbortRef = useRef<AbortController | null>(null)
   const audioInputDeviceIdRef = useRef(audioInputDeviceId)
   const liveAudioSessionIdRef = useRef(0)
   const liveAudioInFlightFramesRef = useRef(0)
@@ -207,7 +208,6 @@ function App() {
   const resetPendingRef = useRef(false)
   const ttsGenerationRef = useRef(0)
   const ttsEnabledRef = useRef(false)
-  const ttsSourceRef = useRef<AudioBufferSourceNode | null>(null)
   const ttsPlaybackIdRef = useRef<number | null>(null)
   const uiTextSizeWriteRevisionRef = useRef(0)
   const uiThemeWriteRevisionRef = useRef(0)
@@ -222,12 +222,6 @@ function App() {
   const cancelTts = (): void => {
     ttsGenerationRef.current += 1
     const playbackId = ttsPlaybackIdRef.current
-    try {
-      ttsSourceRef.current?.stop()
-    } catch {
-      // An already-ended source is stale by definition.
-    }
-    ttsSourceRef.current = null
     if (playbackId === null) {
       setTtsPlaying(false)
       return
@@ -576,17 +570,6 @@ function App() {
     return DEFAULT_SILENCE_TIMEOUT_MS
   }
 
-  const currentTtsOutputGainDb = (): number => {
-    if (
-      startupStateRef.current.kind === 'ready' ||
-      startupStateRef.current.kind === 'warming_model'
-    ) {
-      return startupStateRef.current.ttsOutputGainDb
-    }
-
-    return DEFAULT_TTS_OUTPUT_GAIN_DB
-  }
-
   const waitForInFlightLiveAudioFrames = async (): Promise<void> => {
     while (appActiveRef.current && liveAudioInFlightFramesRef.current > 0) {
       await new Promise((resolve) => setTimeout(resolve, 10))
@@ -689,6 +672,7 @@ function App() {
   }, [addNotice])
 
   useEffect(() => {
+    appActiveRef.current = true
     return () => {
       appActiveRef.current = false
       cancelTts()
@@ -696,6 +680,8 @@ function App() {
         window.clearTimeout(wakeConfidenceHoldRef.current)
       }
       liveAudioSessionIdRef.current += 1
+      liveAudioStartAbortRef.current?.abort()
+      liveAudioStartAbortRef.current = null
       liveAudioSourceRef.current?.stop()
       liveAudioSourceRef.current = null
     }
@@ -760,7 +746,8 @@ function App() {
     isSwitchingResponseProfile ||
     assistantSettingsPending ||
     micStarting ||
-    ttsPlaying
+    ttsPlaying ||
+    pendingTtsCommands > 0
 
   const canToggleMic = voiceInputReady(startupState) && !micStarting
   const voiceInputUnavailableReason = startupState.kind === 'ready'
@@ -1413,7 +1400,7 @@ function App() {
   }
 
   const synthesizeAndPlayAssistantReply = async (text: string): Promise<void> => {
-    let audioContext: AudioContext | null = null
+    let commandPending = false
     cancelTts()
     const generation = ttsGenerationRef.current
 
@@ -1422,7 +1409,9 @@ function App() {
       if (!isValidTtsFirstLine(speechText)) return
       ttsPlaybackIdRef.current = generation
       setTtsPlaying(true)
-      const payload = await invokeTauriCommand('synthesize_local_tts', {
+      commandPending = true
+      setPendingTtsCommands((count) => count + 1)
+      const payload = await invokeTauriCommand('speak_local_tts', {
         text: speechText,
         playbackId: generation,
       })
@@ -1430,45 +1419,12 @@ function App() {
 
       if (
         !isRecord(payload) ||
-        !Array.isArray(payload['pcm_f32']) ||
-        typeof payload['sample_rate_hz'] !== 'number' ||
-        payload['sample_rate_hz'] <= 0 ||
-        !Number.isFinite(payload['sample_rate_hz'])
+        typeof payload['duration_ms'] !== 'number' ||
+        payload['duration_ms'] < 0 ||
+        !Number.isFinite(payload['duration_ms'])
       ) {
         throw new Error('TTS synthesis payload is invalid')
       }
-
-      audioContext = new AudioContext()
-      if (audioContext.state === 'suspended') {
-        await audioContext.resume()
-      }
-      const sampleRate = Math.trunc(payload['sample_rate_hz'])
-      const pcm = Float32Array.from(
-        payload['pcm_f32'].map((sample) => {
-          const finiteSample = typeof sample === 'number' && Number.isFinite(sample) ? sample : 0
-          return Math.max(-1, Math.min(1, finiteSample))
-        }),
-      )
-
-      if (pcm.length === 0) {
-        return
-      }
-
-      const buffer = audioContext.createBuffer(1, pcm.length, sampleRate)
-      buffer.copyToChannel(pcm, 0)
-      const source = audioContext.createBufferSource()
-      if (generation !== ttsGenerationRef.current || !ttsEnabledRef.current) return
-      ttsSourceRef.current = source
-      source.buffer = buffer
-      const gainNode = audioContext.createGain()
-      gainNode.gain.value = Math.pow(10, currentTtsOutputGainDb() / 20)
-      source.connect(gainNode)
-      gainNode.connect(audioContext.destination)
-
-      await new Promise<void>((resolve) => {
-        source.onended = () => resolve()
-        source.start()
-      })
     } catch (error) {
       if (generation !== ttsGenerationRef.current) return
       const message = toDisplayErrorMessage(error)
@@ -1478,15 +1434,13 @@ function App() {
         title: 'TTS playback failed',
         message,
       })
-      recordRuntimeDiagnostic('tts', `TTS synthesis error: ${message}`)
+      recordRuntimeDiagnostic('tts', `TTS error: ${message}`)
     } finally {
-      if (audioContext !== null) {
-        await audioContext.close().catch(() => undefined)
+      if (commandPending) {
+        setPendingTtsCommands((count) => Math.max(0, count - 1))
       }
-      await invokeTauriCommand('finish_tts_playback', { playbackId: generation }).catch(() => undefined)
       if (ttsPlaybackIdRef.current === generation) {
         ttsPlaybackIdRef.current = null
-        ttsSourceRef.current = null
         setTtsPlaying(false)
       }
     }
@@ -1548,6 +1502,8 @@ function App() {
 
   const stopLiveAudio = (content: string | null = null): void => {
     liveAudioSessionIdRef.current += 1
+    liveAudioStartAbortRef.current?.abort()
+    liveAudioStartAbortRef.current = null
     liveAudioSourceRef.current?.stop()
     liveAudioSourceRef.current = null
     voiceActivityStateRef.current = createVoiceActivityState()
@@ -1585,6 +1541,8 @@ function App() {
       return
     }
     micStartInFlightRef.current = true
+    const startAbort = new AbortController()
+    liveAudioStartAbortRef.current = startAbort
 
     const liveAudioSessionId = liveAudioSessionIdRef.current + 1
     liveAudioSessionIdRef.current = liveAudioSessionId
@@ -1593,6 +1551,7 @@ function App() {
 
     try {
       const liveAudioSource = await startLiveAudioSource({
+        signal: startAbort.signal,
         ...(audioInputDeviceIdRef.current === null
           ? {}
           : { deviceId: audioInputDeviceIdRef.current }),
@@ -1663,6 +1622,9 @@ function App() {
           }
         },
         onError: reportLiveAudioError,
+        onStatus: (status) => {
+          recordRuntimeDiagnostic('audio', `Microphone startup: ${status}`)
+        },
         onSelectedDeviceFallback: (attemptedDeviceId) => {
           if (
             liveAudioSessionId !== liveAudioSessionIdRef.current ||
@@ -1710,6 +1672,9 @@ function App() {
       micStartInFlightRef.current = false
       reportLiveAudioError(error)
     } finally {
+      if (liveAudioStartAbortRef.current === startAbort) {
+        liveAudioStartAbortRef.current = null
+      }
       micStartInFlightRef.current = false
     }
   }

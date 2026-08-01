@@ -1,6 +1,8 @@
-const PROCESSOR_BUFFER_SIZE = 1024
-const TARGET_SAMPLE_RATE = 16_000
-const OUTPUT_CHUNK_SIZE = 480
+import { getTauriInternals } from './tauri'
+
+const MAX_CAPTURE_ID = Number.MAX_SAFE_INTEGER
+const MAX_PENDING_FRAMES = 8
+let captureSequence = 0
 
 export interface LiveAudioSource {
   stop(): void
@@ -13,249 +15,206 @@ export interface AudioInputDevice {
 
 export interface StartLiveAudioSourceOptions {
   readonly deviceId?: string
+  readonly signal?: AbortSignal
   readonly onFrame: (frame: readonly number[]) => void | Promise<void>
   readonly onError: (error: unknown) => void
+  readonly onStatus?: (status: string) => void
   readonly onSelectedDeviceFallback?: (attemptedDeviceId: string) => void
 }
 
 export async function listAudioInputDevices(): Promise<readonly AudioInputDevice[]> {
-  const mediaDevices = navigator.mediaDevices
-  if (mediaDevices === undefined || typeof mediaDevices.enumerateDevices !== 'function') {
-    return []
-  }
-
-  const devices = await mediaDevices.enumerateDevices()
-  let unnamedIndex = 0
-  return devices
-    .filter((device) => device.kind === 'audioinput' && device.deviceId.length > 0)
-    .map((device) => {
-      unnamedIndex += 1
-      return {
-        deviceId: device.deviceId,
-        label: device.label.trim() || `Microphone ${unnamedIndex}`,
-      }
-    })
+  const tauri = getTauriInternals()
+  if (tauri === null) return []
+  const payload = await tauri.invoke('list_audio_input_devices')
+  if (!Array.isArray(payload)) throw new Error('Audio input device list must be an array')
+  return payload.map(parseAudioInputDevice)
 }
 
 export async function startLiveAudioSource(
   options: StartLiveAudioSourceOptions,
 ): Promise<LiveAudioSource> {
-  const mediaDevices = navigator.mediaDevices
-
-  if (mediaDevices === undefined || typeof mediaDevices.getUserMedia !== 'function') {
-    throw new Error('Microphone capture is unavailable in this runtime')
+  const tauri = getTauriInternals()
+  if (tauri?.listen === undefined) {
+    throw new Error('Native microphone capture is unavailable in this runtime')
   }
 
-  const AudioContextConstructor = window.AudioContext
+  const captureId = nextCaptureId()
+  let stopped = false
+  let firstFrameReported = false
+  let deliveringFrames = false
+  let pendingFrames: number[][] = []
+  let abortListener: (() => void) | undefined
+  const listeners: { frame?: () => void; terminal?: () => void } = {}
 
-  if (AudioContextConstructor === undefined) {
-    throw new Error('Web Audio is unavailable in this runtime')
+  const stopCapture = (notifyNative: boolean): void => {
+    if (stopped) return
+    stopped = true
+    pendingFrames = []
+    if (abortListener !== undefined) {
+      options.signal?.removeEventListener('abort', abortListener)
+      abortListener = undefined
+    }
+    listeners.frame?.()
+    listeners.terminal?.()
+    if (notifyNative) {
+      void tauri.invoke('stop_native_microphone', { captureId }).catch(() => undefined)
+    }
   }
-
-  const { stream, fellBackFromDeviceId } = await openAudioInputStream(mediaDevices, options)
-  let audioContext: AudioContext | null = null
-
-  try {
-    audioContext = new AudioContextConstructor()
-    const sourceNode = audioContext.createMediaStreamSource(stream)
-    const processorNode = audioContext.createScriptProcessor(
-      PROCESSOR_BUFFER_SIZE,
-      Math.max(sourceNode.channelCount, 1),
-      1,
-    )
-    const resampler = createLinearResampler(audioContext.sampleRate, TARGET_SAMPLE_RATE)
-    let pendingSamples: number[] = []
-    let pendingFrameDelivery = Promise.resolve()
-    let stopped = false
-    let trackEnded = false
-
-    const reportError = (error: unknown): void => {
-      if (stopped || trackEnded) {
-        return
-      }
-
-      options.onError(error)
-    }
-
-    stream.getTracks().forEach((track) => {
-      track.onended = () => {
-        if (stopped || trackEnded) {
-          return
-        }
-        trackEnded = true
-        options.onError(new Error('Microphone input ended unexpectedly'))
-      }
-    })
-
-    processorNode.onaudioprocess = (event) => {
-      if (stopped) {
-        return
-      }
-
-      try {
-        const monoFrame = downmixInputBuffer(event.inputBuffer)
-        const resampledFrame = resampler.process(monoFrame).map(normalizeCaptureSample)
-
-        if (resampledFrame.length === 0) {
-          return
-        }
-
-        pendingSamples = pendingSamples.concat(resampledFrame)
-
-        while (pendingSamples.length >= OUTPUT_CHUNK_SIZE) {
-          const nextFrame = pendingSamples.slice(0, OUTPUT_CHUNK_SIZE)
-          pendingSamples = pendingSamples.slice(OUTPUT_CHUNK_SIZE)
-          pendingFrameDelivery = pendingFrameDelivery
-            .then(async () => {
-              if (stopped) {
-                return
-              }
-
-              await options.onFrame(nextFrame)
-            })
-            .catch(reportError)
-        }
-      } catch (error) {
-        reportError(error)
-      }
-    }
-
-    sourceNode.connect(processorNode)
-    processorNode.connect(audioContext.destination)
-    await audioContext.resume()
-    const liveAudioContext = audioContext
-
-    const liveAudioSource: LiveAudioSource = {
-      stop() {
-        if (stopped) {
-          return
-        }
-
-        stopped = true
-        processorNode.onaudioprocess = null
-        processorNode.disconnect()
-        sourceNode.disconnect()
-        stopStream(stream)
-        void liveAudioContext.close()
-      },
-    }
-
-    if (fellBackFromDeviceId !== null) {
-      options.onSelectedDeviceFallback?.(fellBackFromDeviceId)
-    }
-
-    return liveAudioSource
-  } catch (error) {
-    stopStream(stream)
-    if (audioContext !== null) {
-      void audioContext.close()
-    }
-    throw error
+  const reportError = (error: unknown, notifyNative = true): void => {
+    if (stopped) return
+    stopCapture(notifyNative)
+    options.onError(error)
   }
-}
-
-async function openAudioInputStream(
-  mediaDevices: MediaDevices,
-  options: StartLiveAudioSourceOptions,
-): Promise<{ readonly stream: MediaStream; readonly fellBackFromDeviceId: string | null }> {
-  if (options.deviceId !== undefined) {
+  const drainFrames = async (): Promise<void> => {
+    if (deliveringFrames) return
+    deliveringFrames = true
     try {
-      return {
-        stream: await mediaDevices.getUserMedia({
-        audio: { deviceId: { exact: options.deviceId } },
-        }),
-        fellBackFromDeviceId: null,
+      while (!stopped) {
+        const frame = pendingFrames.shift()
+        if (frame === undefined) return
+        await options.onFrame(frame)
       }
     } catch (error) {
-      if (!isStaleDeviceError(error)) {
-        throw error
-      }
+      reportError(error)
+    } finally {
+      deliveringFrames = false
     }
   }
 
-  return {
-    stream: await mediaDevices.getUserMedia({ audio: true }),
-    fellBackFromDeviceId: options.deviceId ?? null,
-  }
-}
-
-function isStaleDeviceError(error: unknown): boolean {
-  return error instanceof DOMException && (error.name === 'NotFoundError' || error.name === 'OverconstrainedError')
-}
-
-function normalizeCaptureSample(sample: number): number {
-  if (!Number.isFinite(sample)) {
-    return 0
-  }
-
-  return Math.max(-1, Math.min(1, sample))
-}
-
-function stopStream(stream: MediaStream): void {
-  stream.getTracks().forEach((track) => {
-    track.stop()
+  listeners.frame = await tauri.listen('native-microphone-frame', (event) => {
+    if (stopped) return
+    let parsed: NativeMicrophoneFrame
+    try {
+      parsed = parseNativeMicrophoneFrame(event.payload)
+    } catch (error) {
+      reportError(error)
+      return
+    }
+    if (parsed.captureId !== captureId) return
+    if (!firstFrameReported) {
+      firstFrameReported = true
+      options.onStatus?.('first_frame')
+    }
+    if (pendingFrames.length >= MAX_PENDING_FRAMES) {
+      reportError(new Error('Native microphone processing fell behind'))
+      return
+    }
+    pendingFrames.push([...parsed.frame])
+    void drainFrames()
   })
-}
-
-function downmixInputBuffer(inputBuffer: AudioBuffer): Float32Array {
-  if (inputBuffer.numberOfChannels === 1) {
-    return new Float32Array(inputBuffer.getChannelData(0))
+  try {
+    listeners.terminal = await tauri.listen('native-microphone-terminal', (event) => {
+      if (stopped) return
+      let parsed: NativeMicrophoneTerminal
+      try {
+        parsed = parseNativeMicrophoneTerminal(event.payload)
+      } catch (error) {
+        reportError(error)
+        return
+      }
+      if (parsed.captureId !== captureId) return
+      reportError(new Error(parsed.message), false)
+    })
+  } catch (error) {
+    stopCapture(false)
+    throw error
   }
 
-  const monoFrame = new Float32Array(inputBuffer.length)
+  abortListener = () => stopCapture(true)
+  options.signal?.addEventListener('abort', abortListener, { once: true })
+  if (options.signal?.aborted === true) {
+    abortListener()
+    throw new DOMException('Native microphone startup was cancelled', 'AbortError')
+  }
 
-  for (let channelIndex = 0; channelIndex < inputBuffer.numberOfChannels; channelIndex += 1) {
-    const channelData = inputBuffer.getChannelData(channelIndex)
-
-    for (let sampleIndex = 0; sampleIndex < channelData.length; sampleIndex += 1) {
-      const currentSample = monoFrame[sampleIndex] ?? 0
-
-      monoFrame[sampleIndex] =
-        currentSample + (channelData[sampleIndex] ?? 0) / inputBuffer.numberOfChannels
+  options.onStatus?.('starting_native_input')
+  try {
+    const payload = await tauri.invoke('start_native_microphone', {
+      captureId,
+      deviceId: options.deviceId ?? null,
+    })
+    const fellBackToDefault = parseCaptureStart(payload)
+    if (fellBackToDefault && options.deviceId !== undefined) {
+      options.onSelectedDeviceFallback?.(options.deviceId)
     }
+    if (!stopped) options.onStatus?.('native_input_started')
+  } catch (error) {
+    stopCapture(false)
+    throw error
   }
-
-  return monoFrame
-}
-
-function createLinearResampler(inputSampleRate: number, outputSampleRate: number) {
-  if (inputSampleRate <= 0 || outputSampleRate <= 0) {
-    throw new Error('Audio sample rates must be positive')
-  }
-
-  const sampleStep = inputSampleRate / outputSampleRate
-  let pendingInput: number[] = []
-  let inputPosition = 0
 
   return {
-    process(frame: Float32Array): number[] {
-      pendingInput = pendingInput.concat(Array.from(frame))
-
-      if (pendingInput.length < 2) {
-        return []
-      }
-
-      const output: number[] = []
-
-      while (inputPosition + 1 < pendingInput.length) {
-        const lowerIndex = Math.floor(inputPosition)
-        const upperIndex = lowerIndex + 1
-        const fraction = inputPosition - lowerIndex
-        const lowerSample = pendingInput[lowerIndex] ?? 0
-        const upperSample = pendingInput[upperIndex] ?? lowerSample
-
-        output.push(lowerSample + (upperSample - lowerSample) * fraction)
-        inputPosition += sampleStep
-      }
-
-      const consumedSamples = Math.floor(inputPosition)
-
-      if (consumedSamples > 0) {
-        pendingInput = pendingInput.slice(consumedSamples)
-        inputPosition -= consumedSamples
-      }
-
-      return output
+    stop(): void {
+      stopCapture(true)
     },
   }
+}
+
+function nextCaptureId(): number {
+  captureSequence = captureSequence >= MAX_CAPTURE_ID ? 1 : captureSequence + 1
+  return captureSequence
+}
+
+function parseAudioInputDevice(payload: unknown): AudioInputDevice {
+  if (typeof payload !== 'object' || payload === null) {
+    throw new Error('Audio input device must be an object')
+  }
+  const record = payload as Record<string, unknown>
+  if (typeof record['device_id'] !== 'string' || typeof record['label'] !== 'string') {
+    throw new Error('Audio input device fields are invalid')
+  }
+  return { deviceId: record['device_id'], label: record['label'] }
+}
+
+function parseCaptureStart(payload: unknown): boolean {
+  if (typeof payload !== 'object' || payload === null) {
+    throw new Error('Native microphone start response must be an object')
+  }
+  const fallback = (payload as Record<string, unknown>)['fell_back_to_default']
+  if (typeof fallback !== 'boolean') {
+    throw new Error('Native microphone start response is invalid')
+  }
+  return fallback
+}
+
+interface NativeMicrophoneFrame {
+  readonly captureId: number
+  readonly frame: readonly number[]
+}
+
+interface NativeMicrophoneTerminal {
+  readonly captureId: number
+  readonly message: string
+}
+
+function parseNativeMicrophoneFrame(payload: unknown): NativeMicrophoneFrame {
+  if (typeof payload !== 'object' || payload === null) {
+    throw new Error('Native microphone frame must be an object')
+  }
+  const record = payload as Record<string, unknown>
+  const captureId = record['capture_id']
+  const frame = record['frame']
+  if (!Number.isSafeInteger(captureId) || typeof captureId !== 'number' || captureId <= 0) {
+    throw new Error('Native microphone frame capture ID is invalid')
+  }
+  if (!Array.isArray(frame) || frame.length === 0 || frame.some((sample) => typeof sample !== 'number' || !Number.isFinite(sample))) {
+    throw new Error('Native microphone frame samples are invalid')
+  }
+  return { captureId, frame: frame as number[] }
+}
+
+function parseNativeMicrophoneTerminal(payload: unknown): NativeMicrophoneTerminal {
+  if (typeof payload !== 'object' || payload === null) {
+    throw new Error('Native microphone terminal event must be an object')
+  }
+  const record = payload as Record<string, unknown>
+  const captureId = record['capture_id']
+  const message = record['message']
+  if (!Number.isSafeInteger(captureId) || typeof captureId !== 'number' || captureId <= 0) {
+    throw new Error('Native microphone terminal capture ID is invalid')
+  }
+  if (typeof message !== 'string' || message.trim().length === 0) {
+    throw new Error('Native microphone terminal message is invalid')
+  }
+  return { captureId, message }
 }
