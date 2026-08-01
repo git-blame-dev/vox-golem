@@ -13,13 +13,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
 
-#[cfg(target_os = "linux")]
-use webkit2gtk::glib::prelude::Cast;
-#[cfg(target_os = "linux")]
-use webkit2gtk::UserMediaPermissionRequest;
-#[cfg(target_os = "linux")]
-use webkit2gtk::{PermissionRequestExt, UserMediaPermissionRequestExt, WebViewExt};
-
 mod app_updates;
 mod livekit_wakeword;
 mod partial_transcription;
@@ -36,6 +29,7 @@ const DEFAULT_UTTERANCE_MAX_SAMPLES: usize = 4_800_000;
 const PARTIAL_TRANSCRIPTION_MINIMUM_SAMPLES: usize = 8_000;
 const PARTIAL_TRANSCRIPTION_MAXIMUM_SAMPLES: usize = 480_000;
 const PARTIAL_TRANSCRIPTION_THROTTLE: Duration = Duration::from_millis(350);
+const NATIVE_MICROPHONE_FRAME_SAMPLES: usize = 480;
 const COMPLETION_PROMPT_MAX_BYTES: usize = 32 * 1024;
 const DEFAULT_TELEMETRY_MAX_BYTES: usize = 10 * 1024 * 1024;
 const DEFAULT_TELEMETRY_BACKUP_COUNT: u8 = 3;
@@ -92,6 +86,7 @@ struct AppState {
     voice_pipeline_state: Mutex<voxgolem_core::voice_pipeline::VoicePipelineState>,
     wake_word_runtime: Option<Mutex<wake_word::WakeWordRuntime>>,
     voice_activity_runtime: Option<Mutex<voice_activity::VoiceActivityRuntime>>,
+    microphone_capture: Arc<voxgolem_audio::capture::AudioCaptureService>,
     parakeet_runtime: Option<Arc<Mutex<transcription::ParakeetRuntime>>>,
     partial_transcription: Arc<Mutex<partial_transcription::PartialTranscriptionScheduler>>,
     partial_voice_session: AtomicU64,
@@ -109,6 +104,7 @@ struct AppState {
     tts_playback: Mutex<TtsPlaybackState>,
     tts_startup_generation: Arc<AtomicU64>,
     local_tts_runtime: Mutex<Option<Arc<tts::LocalTtsRuntime>>>,
+    tts_audio_playback: Arc<voxgolem_audio::playback::AudioPlaybackService>,
     llama_cpp_runtime: Arc<Mutex<Option<voxgolem_platform::llama_cpp::LlamaCppRuntime>>>,
     llama_cpp_conversation: Mutex<Vec<LlamaConversationTurn>>,
     llama_cpp_system_prompt: Option<String>,
@@ -666,9 +662,30 @@ struct SetTtsEnabledPayload {
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 struct SynthesizeLocalTtsPayload {
-    pcm_f32: Vec<f32>,
-    sample_rate_hz: u32,
     duration_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct AudioInputDevicePayload {
+    device_id: String,
+    label: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct StartNativeMicrophonePayload {
+    fell_back_to_default: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct NativeMicrophoneFramePayload {
+    capture_id: u64,
+    frame: Vec<f32>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct NativeMicrophoneTerminalPayload {
+    capture_id: u64,
+    message: String,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -787,9 +804,24 @@ async fn set_tts_enabled(
             *runtime_guard = proposed_runtime.map(Arc::new);
             log_tts_runtime_event(config.logging.enabled, "runtime enabled");
         }
+        app_state
+            .tts_audio_playback
+            .resume()
+            .map_err(|error| format!("failed to resume local tts audio output: {error}"))?;
     } else {
+        app_state
+            .tts_audio_playback
+            .suspend()
+            .map_err(|error| format!("failed to suspend local tts audio output: {error}"))?;
+        let current_playback_id = cancel_current_tts_playback_state(&app_state.tts_playback)?;
         if let Some(runtime) = runtime_guard.as_ref() {
             runtime.cancel_generation();
+        }
+        if let Some(playback_id) = current_playback_id {
+            app_state
+                .tts_audio_playback
+                .cancel(playback_id)
+                .map_err(|error| format!("failed to cancel local tts playback: {error}"))?;
         }
         *runtime_guard = None;
         log_tts_runtime_event(config.logging.enabled, "runtime disabled and unloaded");
@@ -816,7 +848,7 @@ async fn set_tts_enabled(
 }
 
 #[tauri::command]
-async fn synthesize_local_tts(
+async fn speak_local_tts(
     text: String,
     playback_id: u64,
     app_state: tauri::State<'_, AppState>,
@@ -827,21 +859,23 @@ async fn synthesize_local_tts(
         .as_ref()
         .map(|config| config.logging.enabled)
         .unwrap_or(false);
-    let runtime = {
+    let (runtime, generation) = {
+        let _operation_guard = app_state.tts_operation_lock.lock().await;
         let runtime_guard = app_state
             .local_tts_runtime
             .lock()
             .map_err(|_| String::from("local tts runtime lock is poisoned"))?;
-        Arc::clone(runtime_guard.as_ref().ok_or_else(|| {
+        let runtime = Arc::clone(runtime_guard.as_ref().ok_or_else(|| {
             log_tts_runtime_event(
                 runtime_file_logging_enabled,
                 "synthesis rejected: runtime unavailable",
             );
             String::from("local tts runtime is not available")
-        })?)
+        })?);
+        register_tts_playback(&app_state.tts_playback, playback_id)?;
+        let generation = runtime.start_generation();
+        (runtime, generation)
     };
-    register_tts_playback(&app_state.tts_playback, playback_id)?;
-    let generation = runtime.start_generation();
     let result = tauri::async_runtime::spawn_blocking(move || {
         runtime.synthesize_for_generation(&text, generation)
     })
@@ -868,20 +902,179 @@ async fn synthesize_local_tts(
         );
         error
     })?;
+    let duration_ms = audio.duration_ms;
+    let output_gain_db = app_state
+        .runtime_config
+        .as_ref()
+        .map(|config| config.local_tts.output_gain_db)
+        .unwrap_or(0.0);
+    let playback = Arc::clone(&app_state.tts_audio_playback);
+    let playback_result = tauri::async_runtime::spawn_blocking(move || {
+        playback.play(voxgolem_audio::playback::PlaybackRequest {
+            playback_id,
+            pcm_f32: audio.pcm_f32,
+            sample_rate_hz: audio.sample_rate_hz,
+            gain_db: output_gain_db,
+        })
+    })
+    .await;
+    match playback_result {
+        Ok(Ok(_)) => {
+            finish_tts_playback_state(&app_state.tts_playback, playback_id)?;
+        }
+        Ok(Err(error)) => {
+            finish_tts_playback_state(&app_state.tts_playback, playback_id)?;
+            log_tts_runtime_event(
+                runtime_file_logging_enabled,
+                &format!("playback failed: {error}"),
+            );
+            return Err(format!("local tts playback failed: {error}"));
+        }
+        Err(error) => {
+            finish_tts_playback_state(&app_state.tts_playback, playback_id)?;
+            return Err(format!("local tts playback task failed: {error}"));
+        }
+    }
 
-    Ok(SynthesizeLocalTtsPayload {
-        pcm_f32: audio.pcm_f32,
-        sample_rate_hz: audio.sample_rate_hz,
-        duration_ms: audio.duration_ms,
+    Ok(SynthesizeLocalTtsPayload { duration_ms })
+}
+
+#[tauri::command]
+async fn finish_tts_playback(
+    playback_id: u64,
+    app_state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let _operation_guard = app_state.tts_operation_lock.lock().await;
+    if cancel_tts_playback_state(&app_state.tts_playback, playback_id)? {
+        if let Ok(runtime) = app_state.local_tts_runtime.lock() {
+            if let Some(runtime) = runtime.as_ref() {
+                runtime.cancel_generation();
+            }
+        }
+    }
+    app_state
+        .tts_audio_playback
+        .cancel(playback_id)
+        .map_err(|error| format!("failed to cancel local tts playback: {error}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn list_audio_input_devices(
+    app_state: tauri::State<'_, AppState>,
+) -> Result<Vec<AudioInputDevicePayload>, String> {
+    let devices = app_state
+        .microphone_capture
+        .list_input_devices()
+        .map_err(|error| error.to_string())?;
+    Ok(devices
+        .into_iter()
+        .map(|device| AudioInputDevicePayload {
+            device_id: device.id,
+            label: device.label,
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn start_native_microphone(
+    capture_id: u64,
+    device_id: Option<String>,
+    app: tauri::AppHandle,
+    app_state: tauri::State<'_, AppState>,
+) -> Result<StartNativeMicrophonePayload, String> {
+    ensure_startup_ready_for_prompt(&app_state.startup_state)?;
+    let event_app = app.clone();
+    let terminal_app = app;
+    let first_frame = Arc::new(AtomicBool::new(false));
+    let callback_first_frame = Arc::clone(&first_frame);
+    let logging_enabled = app_state
+        .runtime_config
+        .as_ref()
+        .is_some_and(|config| config.logging.enabled);
+    let microphone_capture = Arc::clone(&app_state.microphone_capture);
+    let sample_rate_hz = app_state.voice_pipeline_config.sample_rate_hz();
+    let start = tauri::async_runtime::spawn_blocking(move || {
+        microphone_capture.start(
+            capture_id,
+            device_id,
+            sample_rate_hz,
+            NATIVE_MICROPHONE_FRAME_SAMPLES,
+            Box::new(move |frame| {
+                if !callback_first_frame.swap(true, Ordering::AcqRel) {
+                    let _ = append_runtime_log_line(
+                        logging_enabled,
+                        "audio",
+                        "native microphone produced first frame",
+                    );
+                }
+                if event_app
+                    .emit(
+                        "native-microphone-frame",
+                        NativeMicrophoneFramePayload { capture_id, frame },
+                    )
+                    .is_err()
+                {
+                    let _ = append_runtime_log_line(
+                        logging_enabled,
+                        "audio",
+                        "native microphone frame event failed",
+                    );
+                }
+            }),
+            Box::new(move |terminal| {
+                let message = terminal.error.to_string();
+                let _ = append_runtime_log_line(
+                    logging_enabled,
+                    "audio",
+                    &format!("native microphone stopped unexpectedly: {message}"),
+                );
+                if terminal_app
+                    .emit(
+                        "native-microphone-terminal",
+                        NativeMicrophoneTerminalPayload {
+                            capture_id: terminal.capture_id,
+                            message,
+                        },
+                    )
+                    .is_err()
+                {
+                    let _ = append_runtime_log_line(
+                        logging_enabled,
+                        "audio",
+                        "native microphone terminal event failed",
+                    );
+                }
+            }),
+        )
+    })
+    .await
+    .map_err(|error| format!("native microphone startup task failed: {error}"))?
+    .map_err(|error| error.to_string())?;
+    let _ = append_runtime_log_line(logging_enabled, "audio", "native microphone started");
+    Ok(StartNativeMicrophonePayload {
+        fell_back_to_default: start.fell_back_to_default,
     })
 }
 
 #[tauri::command]
-fn finish_tts_playback(
-    playback_id: u64,
+fn stop_native_microphone(
+    capture_id: u64,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    finish_tts_playback_state(&app_state.tts_playback, playback_id)
+    app_state
+        .microphone_capture
+        .stop(capture_id)
+        .map_err(|error| error.to_string())?;
+    let _ = append_runtime_log_line(
+        app_state
+            .runtime_config
+            .as_ref()
+            .is_some_and(|config| config.logging.enabled),
+        "audio",
+        "native microphone stopped",
+    );
+    Ok(())
 }
 
 fn register_tts_playback(state: &Mutex<TtsPlaybackState>, playback_id: u64) -> Result<(), String> {
@@ -911,6 +1104,37 @@ fn ensure_tts_playback_current(
     } else {
         Err(String::from("TTS playback was superseded"))
     }
+}
+
+fn cancel_tts_playback_state(
+    state: &Mutex<TtsPlaybackState>,
+    playback_id: u64,
+) -> Result<bool, String> {
+    if playback_id == 0 || playback_id > 9_007_199_254_740_991 {
+        return Err(String::from("TTS playback id is invalid"));
+    }
+    let mut state = state
+        .lock()
+        .map_err(|_| String::from("TTS playback state lock is poisoned"))?;
+    state.latest_id = state.latest_id.max(playback_id.saturating_add(1));
+    if state.current_id != Some(playback_id) {
+        return Ok(false);
+    }
+    state.current_id = None;
+    Ok(true)
+}
+
+fn cancel_current_tts_playback_state(
+    state: &Mutex<TtsPlaybackState>,
+) -> Result<Option<u64>, String> {
+    let mut state = state
+        .lock()
+        .map_err(|_| String::from("TTS playback state lock is poisoned"))?;
+    let Some(playback_id) = state.current_id.take() else {
+        return Ok(None);
+    };
+    state.latest_id = state.latest_id.max(playback_id.saturating_add(1));
+    Ok(Some(playback_id))
 }
 
 fn finish_tts_playback_state(
@@ -4400,42 +4624,82 @@ fn ensure_cancelled_prompt_is_sleeping(app_state: &AppState) -> Result<(), Strin
     Ok(())
 }
 
+async fn cancel_tts_generation_for_prompt(
+    tts_operation_lock: &tokio::sync::Mutex<()>,
+    active_prompt: &Mutex<Option<ActivePrompt>>,
+    request_id: &str,
+    cancel_tts_generation: impl FnOnce(),
+) -> Result<bool, String> {
+    let _operation_guard = tts_operation_lock.lock().await;
+    {
+        let active = active_prompt
+            .lock()
+            .map_err(|_| String::from("active prompt lock is poisoned"))?;
+        if !active
+            .as_ref()
+            .is_some_and(|active| active.request_id == request_id)
+        {
+            return Ok(false);
+        }
+    }
+    cancel_tts_generation();
+    Ok(true)
+}
+
+fn cancel_prompt_request_state(
+    active_prompt: &Mutex<Option<ActivePrompt>>,
+    request_id: &str,
+    cancel_assistant_generation: impl FnOnce(
+        voxgolem_core::assistant::Generation,
+    ) -> Result<bool, String>,
+) -> Result<Option<voxgolem_platform::opencode::OpencodeClient>, String> {
+    let active_guard = active_prompt
+        .lock()
+        .map_err(|_| String::from("active prompt lock is poisoned"))?;
+    let active = active_guard
+        .as_ref()
+        .filter(|active| active.request_id == request_id)
+        .ok_or_else(|| String::from("prompt request is no longer active"))?;
+    if !cancel_assistant_generation(active.assistant_generation)? {
+        return Err(String::from("prompt request is no longer active"));
+    }
+    active.cancelled.store(true, Ordering::SeqCst);
+    active.cancellation_signal.send_replace(true);
+    let client = active.client.clone();
+    let publication_gate = Arc::clone(&active.publication_gate);
+    drop(active_guard);
+    let _publication_guard = publication_gate
+        .lock()
+        .map_err(|_| String::from("prompt publication gate is poisoned"))?;
+    Ok(client)
+}
+
 #[tauri::command]
 async fn cancel_prompt(
     request_id: String,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    cancel_active_tts_generation(&app_state);
-    let client = {
-        let active_guard = app_state
-            .active_prompt
-            .lock()
-            .map_err(|_| String::from("active prompt lock is poisoned"))?;
-        let active = active_guard
-            .as_ref()
-            .filter(|active| active.request_id == request_id)
-            .ok_or_else(|| String::from("prompt request is no longer active"))?;
-        let coordinator_cancelled = app_state
-            .assistant_coordinator
-            .lock()
-            .map_err(|_| String::from("assistant coordinator lock is poisoned"))?
-            .cancel(active.assistant_generation);
-        if !coordinator_cancelled {
-            return Err(String::from("prompt request is no longer active"));
-        }
-        active.cancelled.store(true, Ordering::SeqCst);
-        active.cancellation_signal.send_replace(true);
-        let client = active.client.clone();
-        let publication_gate = Arc::clone(&active.publication_gate);
-        drop(active_guard);
-        let _publication_guard = publication_gate
-            .lock()
-            .map_err(|_| String::from("prompt publication gate is poisoned"))?;
-        client
-    };
+    let client = cancel_prompt_request_state(
+        &app_state.active_prompt,
+        &request_id,
+        |assistant_generation| {
+            app_state
+                .assistant_coordinator
+                .lock()
+                .map_err(|_| String::from("assistant coordinator lock is poisoned"))
+                .map(|mut coordinator| coordinator.cancel(assistant_generation))
+        },
+    )?;
     if let Some(client) = client {
         abort_direct_opencode_client(&client).await;
     }
+    cancel_tts_generation_for_prompt(
+        &app_state.tts_operation_lock,
+        &app_state.active_prompt,
+        &request_id,
+        || cancel_active_tts_generation(&app_state),
+    )
+    .await?;
     Ok(())
 }
 
@@ -7250,6 +7514,7 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
                 voice_pipeline_state: Mutex::new(voice_pipeline_state),
                 wake_word_runtime,
                 voice_activity_runtime,
+                microphone_capture: Arc::new(voxgolem_audio::capture::AudioCaptureService::new()),
                 parakeet_runtime,
                 partial_transcription: new_partial_transcription_scheduler(),
                 partial_voice_session: AtomicU64::new(0),
@@ -7269,6 +7534,7 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
                 tts_playback: Mutex::new(TtsPlaybackState::default()),
                 tts_startup_generation: Arc::new(AtomicU64::new(0)),
                 local_tts_runtime: Mutex::new(local_tts_runtime.map(Arc::new)),
+                tts_audio_playback: Arc::new(voxgolem_audio::playback::AudioPlaybackService::new()),
                 llama_cpp_runtime,
                 llama_cpp_conversation: Mutex::new(Vec::new()),
                 llama_cpp_system_prompt,
@@ -7379,6 +7645,7 @@ fn build_startup_error_app_state(
         voice_pipeline_state: Mutex::new(voice_pipeline_state),
         wake_word_runtime: None,
         voice_activity_runtime: None,
+        microphone_capture: Arc::new(voxgolem_audio::capture::AudioCaptureService::new()),
         parakeet_runtime: None,
         partial_transcription: new_partial_transcription_scheduler(),
         partial_voice_session: AtomicU64::new(0),
@@ -7400,6 +7667,7 @@ fn build_startup_error_app_state(
         tts_playback: Mutex::new(TtsPlaybackState::default()),
         tts_startup_generation: Arc::new(AtomicU64::new(0)),
         local_tts_runtime: Mutex::new(None),
+        tts_audio_playback: Arc::new(voxgolem_audio::playback::AudioPlaybackService::new()),
         llama_cpp_runtime: Arc::new(Mutex::new(None)),
         llama_cpp_conversation: Mutex::new(Vec::new()),
         llama_cpp_system_prompt: None,
@@ -7449,6 +7717,7 @@ fn build_nonfatal_config_error_app_state(
         voice_pipeline_state: Mutex::new(voice_pipeline_state),
         wake_word_runtime: None,
         voice_activity_runtime: None,
+        microphone_capture: Arc::new(voxgolem_audio::capture::AudioCaptureService::new()),
         parakeet_runtime: None,
         partial_transcription: new_partial_transcription_scheduler(),
         partial_voice_session: AtomicU64::new(0),
@@ -7470,6 +7739,7 @@ fn build_nonfatal_config_error_app_state(
         tts_playback: Mutex::new(TtsPlaybackState::default()),
         tts_startup_generation: Arc::new(AtomicU64::new(0)),
         local_tts_runtime: Mutex::new(None),
+        tts_audio_playback: Arc::new(voxgolem_audio::playback::AudioPlaybackService::new()),
         llama_cpp_runtime: Arc::new(Mutex::new(None)),
         llama_cpp_conversation: Mutex::new(Vec::new()),
         llama_cpp_system_prompt: None,
@@ -8398,8 +8668,6 @@ pub fn run() {
                     });
                 }
             }
-            #[cfg(target_os = "linux")]
-            configure_linux_microphone_permission(app)?;
             if let Some(config) = completion_config {
                 let app_handle = app.handle().clone();
                 let startup_update_guard = begin_update_sensitive_operation(
@@ -8459,8 +8727,11 @@ pub fn run() {
             app_updates::restart_for_update,
             get_startup_state,
             set_tts_enabled,
-            synthesize_local_tts,
+            speak_local_tts,
             finish_tts_playback,
+            list_audio_input_devices,
+            start_native_microphone,
+            stop_native_microphone,
             get_ui_text_size,
             set_ui_text_size,
             get_ui_theme,
@@ -8507,6 +8778,8 @@ pub fn run() {
                 shutdown_llama_startups_for_exit(&app_state);
                 shutdown_llama_cpp_runtime_for_exit(&app_state);
                 shutdown_completion_runtime_for_exit(&app_state);
+                app_state.microphone_capture.shutdown();
+                app_state.tts_audio_playback.shutdown();
                 if let Ok(mut runtime) = app_state.local_tts_runtime.lock() {
                     if let Some(runtime) = runtime.take() {
                         if let Ok(mut runtime) = Arc::try_unwrap(runtime) {
@@ -8525,28 +8798,6 @@ pub fn run() {
             }
         }
     });
-}
-
-fn allows_user_media(audio: bool, video: bool) -> bool {
-    audio && !video
-}
-
-fn allows_user_media_from_uri(uri: Option<&str>, audio: bool, video: bool) -> bool {
-    let trusted = uri.is_some_and(is_trusted_user_media_origin);
-    trusted && allows_user_media(audio, video)
-}
-
-fn is_trusted_user_media_origin(uri: &str) -> bool {
-    let (scheme, rest) = uri.split_once("://").unwrap_or(("", ""));
-    let (authority, _) = rest.split_once(['/', '?', '#']).unwrap_or((rest, ""));
-    if authority.contains('@') {
-        return false;
-    }
-    match scheme {
-        "tauri" => authority == "localhost",
-        "http" => cfg!(debug_assertions) && authority == "localhost:5173",
-        _ => false,
-    }
 }
 
 fn shutdown_llama_startups_for_exit(app_state: &AppState) {
@@ -8606,35 +8857,9 @@ fn register_llama_startup(
     guard.push((cancellation, worker));
 }
 
-#[cfg(target_os = "linux")]
-fn configure_linux_microphone_permission(app: &mut tauri::App) -> tauri::Result<()> {
-    if let Some(webview_window) = app.get_webview_window("main") {
-        webview_window.with_webview(|webview| {
-            webview
-                .inner()
-                .connect_permission_request(|webview, request| {
-                    let Some(user_media_request) =
-                        request.downcast_ref::<UserMediaPermissionRequest>()
-                    else {
-                        return false;
-                    };
-                    let audio = user_media_request.is_for_audio_device();
-                    let video = user_media_request.is_for_video_device();
-                    if allows_user_media_from_uri(webview.uri().as_deref(), audio, video) {
-                        request.allow();
-                    } else {
-                        request.deny();
-                    }
-                    true
-                });
-        })?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use super::{
@@ -8643,6 +8868,8 @@ mod tests {
         assistant_completion_enabled, atomic_replace_state_file, begin_update_installation,
         begin_update_sensitive_operation, bounded_provider_history, build_mark_silence_response,
         build_nonfatal_config_error_app_state, build_startup_error_app_state,
+        cancel_current_tts_playback_state, cancel_prompt_request_state,
+        cancel_tts_generation_for_prompt, cancel_tts_playback_state,
         claim_cancelled_prompt_publication, cleanup_sequential,
         clear_completion_request_state_locked, configured_capabilities,
         current_runtime_phase_response, current_silence_deadline, default_response_profile,
@@ -8671,30 +8898,6 @@ mod tests {
         StartupStatePayload, SupervisedCreation, UiTextSizePayload, UiThemePayload,
         DEFAULT_SILENCE_TIMEOUT_MS, PROMPT_MAX_BYTES, PROVIDER_HISTORY_MAX_BYTES,
     };
-
-    #[test]
-    fn user_media_policy_allows_audio_only() {
-        assert!(super::allows_user_media(true, false));
-        assert!(!super::allows_user_media(true, true));
-        assert!(!super::allows_user_media(false, true));
-        assert!(!super::allows_user_media(false, false));
-        assert!(super::allows_user_media_from_uri(
-            Some("tauri://localhost"),
-            true,
-            false
-        ));
-        assert!(!super::allows_user_media_from_uri(
-            Some("https://evil.example"),
-            true,
-            false
-        ));
-        assert!(!super::allows_user_media_from_uri(None, true, false));
-        assert!(!super::allows_user_media_from_uri(
-            Some("tauri://localhost"),
-            true,
-            true
-        ));
-    }
 
     #[test]
     fn update_installation_requires_every_backend_activity_to_be_idle() {
@@ -8823,6 +9026,33 @@ mod tests {
     }
 
     #[test]
+    fn stale_tts_cancellation_does_not_cancel_the_current_synthesis() {
+        let state = std::sync::Mutex::new(super::TtsPlaybackState::default());
+        register_tts_playback(&state, 1).expect("register old playback");
+        register_tts_playback(&state, 2).expect("register current playback");
+
+        assert!(!cancel_tts_playback_state(&state, 1).expect("cancel stale playback"));
+        assert!(super::ensure_tts_playback_current(&state, 2).is_ok());
+
+        assert!(cancel_tts_playback_state(&state, 2).expect("cancel current playback"));
+        assert!(super::ensure_tts_playback_current(&state, 2).is_err());
+    }
+
+    #[test]
+    fn disabling_tts_invalidates_the_authorized_playback_id() {
+        let state = std::sync::Mutex::new(super::TtsPlaybackState::default());
+        register_tts_playback(&state, 8).expect("register authorized playback");
+
+        assert_eq!(
+            cancel_current_tts_playback_state(&state).expect("invalidate current playback"),
+            Some(8)
+        );
+        assert!(super::ensure_tts_playback_current(&state, 8).is_err());
+        assert!(register_tts_playback(&state, 8).is_err());
+        register_tts_playback(&state, 9).expect("register post-enable playback");
+    }
+
+    #[test]
     fn partial_transcription_guard_survives_reset_and_excludes_installation() {
         let app_state = build_nonfatal_config_error_app_state(
             default_voice_pipeline_config(),
@@ -8938,27 +9168,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn user_media_policy_matches_only_trusted_origins() {
-        assert!(allows_user_media_from_uri(
-            Some("tauri://localhost/route?q=1#f"),
-            true,
-            false
-        ));
-        assert!(
-            cfg!(debug_assertions)
-                == allows_user_media_from_uri(Some("http://localhost:5173/nested"), true, false)
-        );
-        for uri in [
-            "tauri://localhost.evil/",
-            "tauri://user@localhost/",
-            "tauri://localhost:443/",
-            "https://localhost/",
-            "http://localhost:5174/",
-        ] {
-            assert!(!allows_user_media_from_uri(Some(uri), true, false), "{uri}");
-        }
-    }
     use crate::wake_word::{WakeWordDetection, WakeWordRuntime};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
@@ -9414,6 +9623,86 @@ mod tests {
         assert!(!cancelled.load(Ordering::Acquire));
         assert!(!*cancellation_signal.subscribe().borrow());
         assert!(active.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_prompt_cancellation_does_not_cancel_newer_tts() {
+        let active = Arc::new(Mutex::new(None));
+        let generations = AtomicU64::new(0);
+        register_active_prompt(
+            active.as_ref(),
+            &generations,
+            "old-request",
+            voxgolem_core::assistant::Generation::new(1),
+            None,
+        )
+        .expect("register old prompt");
+        let tts_operation_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let operation_guard = tts_operation_lock.lock().await;
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let stale_cancellations = Arc::clone(&cancellations);
+        let stale_lock = Arc::clone(&tts_operation_lock);
+        let stale_active = Arc::clone(&active);
+        let stale = tokio::spawn(async move {
+            cancel_tts_generation_for_prompt(
+                stale_lock.as_ref(),
+                stale_active.as_ref(),
+                "old-request",
+                || {
+                    stale_cancellations.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        *active.lock().expect("active prompt lock") = None;
+        register_active_prompt(
+            active.as_ref(),
+            &generations,
+            "new-request",
+            voxgolem_core::assistant::Generation::new(2),
+            None,
+        )
+        .expect("register new prompt");
+
+        drop(operation_guard);
+
+        assert!(!stale
+            .await
+            .expect("stale cancellation task")
+            .expect("stale cancellation check"));
+        assert_eq!(cancellations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn prompt_cancel_signal_does_not_wait_for_tts_operation_lock() {
+        let active = Mutex::new(None);
+        let generations = AtomicU64::new(0);
+        register_active_prompt(
+            &active,
+            &generations,
+            "active-request",
+            voxgolem_core::assistant::Generation::new(1),
+            None,
+        )
+        .expect("register active prompt");
+        let (cancelled, cancellation_signal) = {
+            let active = active.lock().expect("active prompt lock");
+            let active = active.as_ref().expect("active prompt");
+            (
+                Arc::clone(&active.cancelled),
+                Arc::clone(&active.cancellation_signal),
+            )
+        };
+        let tts_operation_lock = tokio::sync::Mutex::new(());
+        let _operation_guard = tts_operation_lock.lock().await;
+
+        let client = cancel_prompt_request_state(&active, "active-request", |_| Ok(true))
+            .expect("cancel prompt state");
+
+        assert!(client.is_none());
+        assert!(cancelled.load(Ordering::SeqCst));
+        assert!(*cancellation_signal.borrow());
     }
 
     #[test]

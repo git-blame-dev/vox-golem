@@ -13,7 +13,6 @@ const listAudioInputDevicesMock = vi.spyOn(liveAudioSourceModule, 'listAudioInpu
 const mountedContainers: HTMLElement[] = []
 const mountedRoots: Root[] = []
 const originalAudio = globalThis.Audio
-const originalAudioContext = globalThis.AudioContext
 const originalDateNow = Date.now
 
 afterEach(() => {
@@ -36,15 +35,6 @@ afterEach(() => {
     Object.defineProperty(globalThis, 'Audio', {
       configurable: true,
       value: originalAudio,
-    })
-  }
-
-  if (originalAudioContext === undefined) {
-    Reflect.deleteProperty(globalThis, 'AudioContext')
-  } else {
-    Object.defineProperty(globalThis, 'AudioContext', {
-      configurable: true,
-      value: originalAudioContext,
     })
   }
 
@@ -762,49 +752,6 @@ describe('App', () => {
     let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
     const invoked: string[] = []
 
-    let resumeCallCount = 0
-
-    class FakeAudioContext {
-      destination = {} as AudioDestinationNode
-      state: AudioContextState = 'suspended'
-
-    createBuffer(): AudioBuffer {
-        return {
-          copyToChannel: () => {},
-        } as unknown as AudioBuffer
-      }
-
-      createBufferSource(): AudioBufferSourceNode {
-        return {
-          buffer: null,
-          connect: () => {},
-          onended: null,
-          start: function start(this: AudioBufferSourceNode) {
-            this.onended?.(new Event('ended'))
-          },
-        } as unknown as AudioBufferSourceNode
-      }
-
-      createGain(): GainNode {
-        return {
-          gain: { value: 1 } as AudioParam,
-          connect: () => {},
-        } as unknown as GainNode
-      }
-
-      async resume(): Promise<void> {
-        resumeCallCount += 1
-        this.state = 'running'
-      }
-
-      async close(): Promise<void> {}
-    }
-
-    Object.defineProperty(globalThis, 'AudioContext', {
-      configurable: true,
-      value: FakeAudioContext,
-    })
-
     window.__TAURI_INTERNALS__ = {
       listen: async (_event, handler) => {
         promptEventHandler = handler
@@ -848,14 +795,12 @@ describe('App', () => {
           }
         }
 
-        if (command === 'synthesize_local_tts') {
+        if (command === 'speak_local_tts') {
           expect(args).toEqual({
             text: 'Voice response',
             playbackId: 2,
           })
           return {
-            pcm_f32: [0.0, 0.1, -0.1],
-            sample_rate_hz: 22050,
             duration_ms: 1,
           }
         }
@@ -889,35 +834,29 @@ describe('App', () => {
       await new Promise((resolve) => setTimeout(resolve, 10))
     })
 
-    expect(invoked).toContain('synthesize_local_tts')
-    expect(resumeCallCount).toBe(1)
+    expect(invoked).toContain('speak_local_tts')
   })
 
   it('stops active TTS playback when Escape cancels a prompt', async () => {
     let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
     let finishPrompt: ((value: unknown) => void) | undefined
+    let finishSpeech: ((value: unknown) => void) | undefined
     let requestId = ''
-    const stop = vi.fn()
-    const started = vi.fn()
-    class FakeAudioContext {
-      destination = {} as AudioDestinationNode
-      state: AudioContextState = 'running'
-      createBuffer(): AudioBuffer { return { copyToChannel: () => {} } as unknown as AudioBuffer }
-      createBufferSource(): AudioBufferSourceNode {
-        return { buffer: null, connect: () => {}, onended: null, start: started, stop } as unknown as AudioBufferSourceNode
-      }
-      createGain(): GainNode { return { gain: { value: 1 } as AudioParam, connect: () => {} } as unknown as GainNode }
-      async close(): Promise<void> {}
-    }
-    Object.defineProperty(globalThis, 'AudioContext', { configurable: true, value: FakeAudioContext })
+    const finishTts = vi.fn()
     window.__TAURI_INTERNALS__ = {
       listen: async (_event, handler) => { promptEventHandler = handler; return () => undefined },
       invoke: async (command, args) => {
         if (command === 'get_startup_state') return readyStartupState({ prompt_cancellation_available: true, tts_enabled: false })
         if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
+        if (command === 'check_for_update') {
+          return {
+            status: 'available', current_version: '2026.7.27-1', version: '2026.7.28-1', notes: null, install_behavior: 'install_and_restart',
+          }
+        }
         if (command === 'set_tts_enabled') return { enabled: true }
         if (command === 'submit_prompt') { requestId = (args as { requestId: string }).requestId; return new Promise((resolve) => { finishPrompt = resolve }) }
-        if (command === 'synthesize_local_tts') return { pcm_f32: [0], sample_rate_hz: 22050, duration_ms: 1 }
+        if (command === 'speak_local_tts') return new Promise((resolve) => { finishSpeech = resolve })
+        if (command === 'finish_tts_playback') { finishTts(); return null }
         if (command === 'cancel_prompt') return null
         throw new Error(`unexpected command: ${command}`)
       },
@@ -926,29 +865,24 @@ describe('App', () => {
     await act(async () => { getTtsToggle(container).click(); await new Promise((resolve) => setTimeout(resolve, 0)); setTextAreaValue(getComposer(container), 'Say this'); getSendButton(container).click(); await Promise.resolve() })
     await act(async () => { promptEventHandler?.({ payload: { request_id: requestId, kind: 'text', text: 'Valid first line\nmore' } }); await new Promise((resolve) => setTimeout(resolve, 0)) })
     await act(async () => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })); await Promise.resolve() })
-    expect(stop).toHaveBeenCalledOnce()
-    expect(started).toHaveBeenCalledOnce()
+    expect(finishTts).toHaveBeenCalledOnce()
     await act(async () => {
       finishPrompt?.({ request_id: requestId, runtime_phase: 'sleeping', outcome: 'cancelled' })
       await Promise.resolve()
     })
+    await act(async () => { getButtonByLabel(container, 'Settings').click(); await Promise.resolve() })
+    const install = getButtonByText(container, 'Install and restart')
+    expect(install.disabled).toBe(true)
+    await act(async () => { finishSpeech?.({ duration_ms: 1 }); await Promise.resolve() })
+    expect(install.disabled).toBe(false)
   })
 
-  it('does not start TTS playback when synthesis resolves after Escape', async () => {
+  it('finishes native TTS playback when synthesis resolves after Escape', async () => {
     let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
     let resolveSynthesis: ((value: unknown) => void) | undefined
     let requestId = ''
-    const started = vi.fn()
     let synthesisInvoked = false
-    class FakeAudioContext {
-      destination = {} as AudioDestinationNode
-      state: AudioContextState = 'running'
-      createBuffer(): AudioBuffer { return { copyToChannel: () => {} } as unknown as AudioBuffer }
-      createBufferSource(): AudioBufferSourceNode { return { buffer: null, connect: () => {}, onended: null, start: started, stop: vi.fn() } as unknown as AudioBufferSourceNode }
-      createGain(): GainNode { return { gain: { value: 1 } as AudioParam, connect: () => {} } as unknown as GainNode }
-      async close(): Promise<void> {}
-    }
-    Object.defineProperty(globalThis, 'AudioContext', { configurable: true, value: FakeAudioContext })
+    const finishTts = vi.fn()
     window.__TAURI_INTERNALS__ = {
       listen: async (_event, handler) => { promptEventHandler = handler; return () => undefined },
       invoke: async (command, args) => {
@@ -956,11 +890,12 @@ describe('App', () => {
         if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
         if (command === 'set_tts_enabled') return { enabled: true }
         if (command === 'submit_prompt') { requestId = (args as { requestId: string }).requestId; return new Promise(() => {}) }
-        if (command === 'synthesize_local_tts') {
+        if (command === 'speak_local_tts') {
           synthesisInvoked = true
           return new Promise((resolve) => { resolveSynthesis = resolve })
         }
         if (command === 'cancel_prompt') return null
+        if (command === 'finish_tts_playback') { finishTts(); return null }
         throw new Error(`unexpected command: ${command}`)
       },
     }
@@ -973,26 +908,13 @@ describe('App', () => {
     expect(synthesisInvoked).toBe(true)
     expect(resolveSynthesis).toBeDefined()
     await act(async () => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })); await Promise.resolve() })
-    await act(async () => { resolveSynthesis?.({ pcm_f32: [0], sample_rate_hz: 22050, duration_ms: 1 }); await Promise.resolve() })
-    expect(started).not.toHaveBeenCalled()
+    await act(async () => { resolveSynthesis?.({ duration_ms: 1 }); await Promise.resolve() })
+    expect(finishTts).toHaveBeenCalledOnce()
   })
 
   it('disables update installation from TTS synthesis through playback completion', async () => {
     let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
     let resolveSynthesis: ((value: unknown) => void) | undefined
-    let source: AudioBufferSourceNode | undefined
-    class FakeAudioContext {
-      destination = {} as AudioDestinationNode
-      state: AudioContextState = 'running'
-      createBuffer(): AudioBuffer { return { copyToChannel: () => {} } as unknown as AudioBuffer }
-      createBufferSource(): AudioBufferSourceNode {
-        source = { buffer: null, connect: () => {}, onended: null, start: vi.fn(), stop: vi.fn() } as unknown as AudioBufferSourceNode
-        return source
-      }
-      createGain(): GainNode { return { gain: { value: 1 } as AudioParam, connect: () => {} } as unknown as GainNode }
-      async close(): Promise<void> {}
-    }
-    Object.defineProperty(globalThis, 'AudioContext', { configurable: true, value: FakeAudioContext })
     window.__TAURI_INTERNALS__ = {
       listen: async (event, handler) => {
         if (event === 'prompt-execution-event') promptEventHandler = handler
@@ -1015,7 +937,7 @@ describe('App', () => {
           promptEventHandler?.({ payload: { request_id: requestId, kind: 'text', text: 'Spoken response' } })
           return { request_id: requestId, outcome: 'completed', error_message: null, runtime_phase: 'sleeping' }
         }
-        if (command === 'synthesize_local_tts') {
+        if (command === 'speak_local_tts') {
           return new Promise((resolve) => { resolveSynthesis = resolve })
         }
         if (command === 'finish_tts_playback') return null
@@ -1031,15 +953,7 @@ describe('App', () => {
     expect(install.disabled).toBe(true)
 
     await act(async () => {
-      resolveSynthesis?.({ pcm_f32: [0], sample_rate_hz: 22050, duration_ms: 1 })
-      await Promise.resolve()
-    })
-    expect(source).toBeDefined()
-    expect(install.disabled).toBe(true)
-
-    await act(async () => {
-      source?.onended?.(new Event('ended'))
-      await Promise.resolve()
+      resolveSynthesis?.({ duration_ms: 1 })
       await Promise.resolve()
     })
     expect(install.disabled).toBe(false)
@@ -3363,6 +3277,7 @@ describe('App', () => {
     let resolveReplacementStart: (source: { stop: () => void }) => void = () => { throw new Error('Expected replacement resolver') }
     let staleFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
     let replacementFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
+    let staleSignal: AbortSignal | undefined
     const invokedCommands: string[] = []
     let selectedProfile: 'fast' | 'quality' = 'fast'
 
@@ -3370,6 +3285,7 @@ describe('App', () => {
       delayedStartCount += 1
       if (delayedStartCount === 1) {
         staleFrame = options.onFrame
+        staleSignal = options.signal
         return await new Promise((resolve) => { resolveStaleStart = resolve })
       }
       replacementFrame = options.onFrame
@@ -3423,6 +3339,7 @@ describe('App', () => {
     })
 
     expect(delayedStartCount).toBe(1)
+    expect(staleSignal?.aborted).toBe(true)
 
     await act(async () => {
       resolveStaleStart({ stop: staleStop })
@@ -3951,39 +3868,8 @@ describe('App', () => {
       }
     }
 
-    class FakeAudioContext {
-      destination = {} as AudioDestinationNode
-      state: AudioContextState = 'running'
-
-      createBuffer(): AudioBuffer {
-        return { copyToChannel: () => {} } as unknown as AudioBuffer
-      }
-
-      createBufferSource(): AudioBufferSourceNode {
-        return {
-          buffer: null,
-          connect: () => {},
-          onended: null,
-          start: function start(this: AudioBufferSourceNode) {
-            this.onended?.(new Event('ended'))
-          },
-        } as unknown as AudioBufferSourceNode
-      }
-
-      createGain(): GainNode {
-        return {
-          gain: { value: 1 } as AudioParam,
-          connect: () => {},
-        } as unknown as GainNode
-      }
-
-      async resume(): Promise<void> {}
-      async close(): Promise<void> {}
-    }
-
     Date.now = () => nowMs
     Object.defineProperty(globalThis, 'Audio', { configurable: true, value: FakeAudio })
-    Object.defineProperty(globalThis, 'AudioContext', { configurable: true, value: FakeAudioContext })
     startLiveAudioSourceMock.mockImplementation(async (options) => {
       onFrame = options.onFrame
       return { stop: vi.fn() }
@@ -4020,8 +3906,8 @@ describe('App', () => {
             request_id: requestId, outcome: 'completed', error_message: null, runtime_phase: 'sleeping',
           }
         }
-        if (command === 'synthesize_local_tts') {
-          return { pcm_f32: [0, 0.1], sample_rate_hz: 22050, duration_ms: 1 }
+        if (command === 'speak_local_tts') {
+          return { duration_ms: 1 }
         }
         throw new Error(`unexpected command: ${command}`)
       },
@@ -4046,7 +3932,7 @@ describe('App', () => {
       await new Promise((resolve) => setTimeout(resolve, 0))
     })
 
-    expect(invokedCommands).toContain('synthesize_local_tts')
+    expect(invokedCommands).toContain('speak_local_tts')
     expect(container.querySelector('[aria-label="Deep status: stale"]')).not.toBeNull()
   })
 
@@ -4737,7 +4623,7 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(invoked).not.toContain('synthesize_local_tts')
+    expect(invoked).not.toContain('speak_local_tts')
   })
 
   it('marks a Deep-only correction as Deep corrected without requiring Review', async () => {
@@ -4761,9 +4647,9 @@ describe('App', () => {
           requestId = (args as { requestId: string }).requestId
           return new Promise((resolve) => { finishPrompt = resolve })
         }
-        if (command === 'synthesize_local_tts') {
+        if (command === 'speak_local_tts') {
           synthesizedText = (args as { text: string }).text
-          return { pcm_f32: [0], sample_rate_hz: 22050, duration_ms: 1 }
+          return { duration_ms: 1 }
         }
         throw new Error(`unexpected command: ${command}`)
       },
