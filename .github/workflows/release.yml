@@ -1,477 +1,151 @@
 name: Release
 
 on:
-  workflow_run:
-    workflows:
-      - Linux CI
-    types:
-      - completed
-    branches:
-      - main
+  push:
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
-  actions: read
-  contents: write
+  contents: read
 
 concurrency:
   group: release-main
   cancel-in-progress: false
 
 jobs:
-  publish-release:
-    name: Publish GitHub release
+  test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_branch == 'main' &&
-      github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_repository.full_name == github.repository
-
     steps:
-      - name: Check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.3.9
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq p7zip-full libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev libssl-dev libxdo-dev libespeak-dev cmake ninja-build clang lld llvm pkg-config
+      - run: make test
+
+  release:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           fetch-depth: 0
-          ref: ${{ github.event.workflow_run.head_sha }}
-
-      - name: Generate application and release versions
-        id: version
-        shell: bash
-        env:
-          CI_RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
-        run: |
-          commit_timestamp="$(git show -s --format=%ct HEAD)"
-          app_version="$(scripts/release-version.sh "$commit_timestamp" "$CI_RUN_NUMBER")"
-          printf 'app_version=%s\n' "$app_version" >> "$GITHUB_OUTPUT"
-          printf 'version=v%s\n' "$app_version" >> "$GITHUB_OUTPUT"
-
-      - name: Determine release scope
-        id: release_scope
-        shell: bash
-        env:
-          TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          git fetch --tags --force
-
-          previous_tag="$(git describe --tags --match 'v[0-9]*' --abbrev=0 "${TARGET_SHA}^" 2>/dev/null || true)"
-
-          if git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null; then
-            tag_target="$(git rev-list -n 1 "$VERSION")"
-            if [ "$tag_target" != "$TARGET_SHA" ]; then
-              printf 'Refusing to publish %s because tag %s already points at %s.\n' "$TARGET_SHA" "$VERSION" "$tag_target" >&2
-              exit 1
-            fi
-          fi
-
-          existing_release_tags="$(git tag --points-at "$TARGET_SHA" --list 'v[0-9]*' || true)"
-          if [ -z "$existing_release_tags" ]; then
-            existing_release_tags="$(gh api "repos/${REPOSITORY}/releases" --paginate --jq ".[] | select(.target_commitish == \"${TARGET_SHA}\") | .tag_name" | head -n 1)"
-          fi
-
-          if [ -n "$existing_release_tags" ]; then
-            while IFS= read -r existing_tag; do
-              [ -n "$existing_tag" ] || continue
-
-              release_json="$(gh release view "$existing_tag" --repo "$REPOSITORY" --json assets,isDraft,targetCommitish)"
-              if [ "$(jq -er '.isDraft' <<< "$release_json")" = true ]; then
-                if [ "$existing_tag" != "$VERSION" ] || \
-                   [ "$(jq -er '.targetCommitish | strings' <<< "$release_json")" != "$TARGET_SHA" ]; then
-                  printf 'Refusing to resume unexpected draft release %s for %s.\n' "$existing_tag" "$TARGET_SHA" >&2
-                  exit 1
-                fi
-                printf 'Resuming draft release %s for %s.\n' "$existing_tag" "$TARGET_SHA"
-                {
-                  printf 'previous_tag=%s\n' "$previous_tag"
-                  printf 'should_publish=true\n'
-                } >> "$GITHUB_OUTPUT"
-                exit 0
-              fi
-              release_assets="$(jq -er '.assets[].name' <<< "$release_json")"
-              missing_assets=false
-
-              for required_asset in \
-                "vox-golem-linux-${existing_tag}.zip" \
-                "vox-golem-linux-x86_64-${existing_tag}.AppImage" \
-                "vox-golem-linux-x86_64-${existing_tag}.AppImage.sig" \
-                "vox-golem-windows-x86_64-${existing_tag}-setup.exe" \
-                "vox-golem-windows-x86_64-${existing_tag}-setup.exe.sig" \
-                'latest.json' \
-                'SHA256SUMS'; do
-                if ! printf '%s\n' "$release_assets" | grep -Fxq "$required_asset"; then
-                  printf 'Existing release %s is missing required asset %s.\n' "$existing_tag" "$required_asset" >&2
-                  missing_assets=true
-                fi
-              done
-
-              if [ "$missing_assets" = true ]; then
-                printf 'Refusing to create a second release for %s while %s is incomplete.\n' "$TARGET_SHA" "$existing_tag" >&2
-                exit 1
-              fi
-
-              printf 'Release %s already targets %s; skipping duplicate release.\n' "$existing_tag" "$TARGET_SHA"
-              {
-                printf 'previous_tag=%s\n' "$previous_tag"
-                printf 'should_publish=false\n'
-                printf 'skip_reason=%s\n' "release ${existing_tag} already targets this commit"
-              } >> "$GITHUB_OUTPUT"
-              exit 0
-            done <<EOF
-          $existing_release_tags
-          EOF
-          fi
-
-          if [ -z "$previous_tag" ]; then
-            printf 'No previous tag found; publishing initial release.\n'
-            {
-              printf 'previous_tag=\n'
-              printf 'should_publish=true\n'
-            } >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          changed_files="$(git diff --name-only "${previous_tag}..${TARGET_SHA}")"
-          has_release_artifact_input_change=false
-
-          while IFS= read -r path; do
-            [ -n "$path" ] || continue
-
-            case "$path" in
-              Makefile|.github/workflows/ci.yml|.github/workflows/release.yml|apps/*|crates/*|frontend/*|scripts/*|Cargo.toml|Cargo.lock|bun.lock|package.json|tsconfig.base.json)
-                has_release_artifact_input_change=true
-                ;;
-            esac
-          done <<EOF
-          $changed_files
-          EOF
-
-          printf 'Changed files since %s:\n%s\n' "$previous_tag" "$changed_files"
-          {
-            printf 'previous_tag=%s\n' "$previous_tag"
-            printf 'should_publish=%s\n' "$has_release_artifact_input_change"
-            if [ "$has_release_artifact_input_change" != true ]; then
-              printf 'skip_reason=%s\n' 'no release artifact inputs changed'
-            fi
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Skip release
-        if: steps.release_scope.outputs.should_publish != 'true'
-        run: |
-          printf 'Skipping release: %s.\n' "${{ steps.release_scope.outputs.skip_reason }}"
-
-      - name: Require increasing application version
-        if: steps.release_scope.outputs.should_publish == 'true'
-        env:
-          APP_VERSION: ${{ steps.version.outputs.app_version }}
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-        run: |
-          latest_manifest="$(mktemp)"
-          trap 'rm -f "$latest_manifest"' EXIT
-
-          manifest_url="$(scripts/select-updater-manifest-url.sh "$REPOSITORY")"
-          if [ -z "$manifest_url" ]; then
-            printf '%s\n' 'No published updater manifest exists; allowing initial updater release.'
-            exit 0
-          fi
-          manifest_status="$(curl --silent --show-error --location \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header 'Accept: application/octet-stream' \
-            --output "$latest_manifest" \
-            --write-out '%{http_code}' \
-            "$manifest_url")"
-          if [ "$manifest_status" != 200 ]; then
-            printf 'Failed to read latest updater manifest (HTTP %s).\n' "$manifest_status" >&2
-            exit 1
-          fi
-
-          previous_version="$(jq -er '.version | strings' "$latest_manifest")"
-          scripts/assert-release-version-newer.sh "$APP_VERSION" "$previous_version"
-
-      - name: Confirm main still targets released commit
-        if: steps.release_scope.outputs.should_publish == 'true'
-        env:
-          TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
-        run: |
-          git fetch origin main
-          current_main="$(git rev-parse FETCH_HEAD)"
-
-          if [ "$current_main" != "$TARGET_SHA" ]; then
-            printf 'Refusing to publish %s because origin/main is now %s.\n' "$TARGET_SHA" "$current_main" >&2
-            exit 1
-          fi
-
-      - name: Download Linux app artifact from CI
-        if: steps.release_scope.outputs.should_publish == 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
-          name: vox-golem-linux
-          path: package
-          github-token: ${{ github.token }}
-          run-id: ${{ github.event.workflow_run.id }}
-
-      - name: Extract Linux app artifact
-        if: steps.release_scope.outputs.should_publish == 'true'
-        run: |
-           tar -C package -xzf package/vox-golem-linux.tar.gz
-           rm package/vox-golem-linux.tar.gz
-           test -x package/VoxGolem/vox-golem
-           test "$(stat -c '%a' package/VoxGolem/vox-golem)" = 755
-           for provider in libonnxruntime_providers_shared.so libonnxruntime_providers_cuda.so; do
-             test -f "package/VoxGolem/$provider"
-             test "$(stat -c '%a' "package/VoxGolem/$provider")" = 755
-           done
-           test -x package/VoxGolem.AppImage
-           test "$(cat package/APP_VERSION)" = '${{ steps.version.outputs.app_version }}'
-
-      - name: Download Windows installer artifact from CI
-        if: steps.release_scope.outputs.should_publish == 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          name: vox-golem-windows
-          path: windows-package
-          github-token: ${{ github.token }}
-          run-id: ${{ github.event.workflow_run.id }}
-
-      - name: Install Windows verifier dependencies
-        if: steps.release_scope.outputs.should_publish == 'true'
-        run: sudo apt-get update && sudo apt-get install -y file llvm-19
-
-      - name: Verify Windows installer artifact
-        if: steps.release_scope.outputs.should_publish == 'true'
-        env:
-          APP_VERSION: ${{ steps.version.outputs.app_version }}
-          VERSION: ${{ steps.version.outputs.version }}
-          VOXGOLEM_OBJDUMP: /usr/lib/llvm-19/bin/llvm-objdump
-        run: |
-          asset="vox-golem-windows-x86_64-${VERSION}-setup.exe"
-          mapfile -t files < <(find windows-package -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
-          test "${#files[@]}" -eq 2
-          test "${files[0]}" = APP_VERSION
-          test "${files[1]}" = "$asset"
-          test "$(cat windows-package/APP_VERSION)" = "$APP_VERSION"
-          scripts/verify-windows-installer.sh "windows-package/$asset" 250000000
-
-      - name: Create release zip
-        if: steps.release_scope.outputs.should_publish == 'true'
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          mkdir -p dist
-          test -x package/VoxGolem/vox-golem
-          (cd package && zip -r -D "../dist/vox-golem-linux-${VERSION}.zip" VoxGolem)
-
-      - name: Verify release zip contents
-        if: steps.release_scope.outputs.should_publish == 'true'
-        shell: bash
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          zip_path="dist/vox-golem-linux-${VERSION}.zip"
-          mapfile -t actual_files < <(zipinfo -1 "$zip_path" | sort)
-
-          printf 'Packaged files in %s:\n' "$zip_path"
-          printf '%s\n' "${actual_files[@]}"
-
-           required_files=(
-             "VoxGolem/vox-golem"
-             "VoxGolem/libonnxruntime_providers_shared.so"
-             "VoxGolem/libonnxruntime_providers_cuda.so"
-           )
-
-          missing_files=()
-          for required_file in "${required_files[@]}"; do
-            found=false
-            for actual_file in "${actual_files[@]}"; do
-              if [ "$actual_file" = "$required_file" ]; then
-                found=true
-                break
-              fi
-            done
-
-            if [ "$found" != true ]; then
-              missing_files+=("$required_file")
-            fi
-          done
-
-          if [ "${#missing_files[@]}" -gt 0 ]; then
-            printf 'Missing required release files:\n' >&2
-            printf '%s\n' "${missing_files[@]}" >&2
-            exit 1
-          fi
-
-          allowed_files=("${required_files[@]}")
-
-          unexpected_files=()
-          for actual_file in "${actual_files[@]}"; do
-            allowed=false
-            for allowed_file in "${allowed_files[@]}"; do
-              if [ "$actual_file" = "$allowed_file" ]; then
-                allowed=true
-                break
-              fi
-            done
-
-            if [ "$allowed" != true ]; then
-              unexpected_files+=("$actual_file")
-            fi
-          done
-
-          if [ "${#unexpected_files[@]}" -gt 0 ]; then
-            printf 'Unexpected release files:\n' >&2
-            printf '%s\n' "${unexpected_files[@]}" >&2
-            exit 1
-          fi
-
+          bun-version: 1.3.9
+      - name: Install release dependencies
+        run: bun install --frozen-lockfile
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
-        if: steps.release_scope.outputs.should_publish == 'true'
         with:
-          toolchain: stable
-
-      - name: Install Tauri signer
-        if: steps.release_scope.outputs.should_publish == 'true'
-        run: cargo install tauri-cli --version 2.11.1 --locked
-
-      - name: Prepare updater artifact
-        if: steps.release_scope.outputs.should_publish == 'true'
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
+          toolchain: 1.95.0
+          targets: x86_64-pc-windows-msvc
+      - name: Install packaging tools
         run: |
-          asset="vox-golem-linux-x86_64-${VERSION}.AppImage"
-          cp package/VoxGolem.AppImage "dist/$asset"
-          windows_asset="vox-golem-windows-x86_64-${VERSION}-setup.exe"
-          cp "windows-package/$windows_asset" "dist/$windows_asset"
-
-      - name: Sign updater artifacts
-        if: steps.release_scope.outputs.should_publish == 'true'
+          sudo apt-get update
+          sudo apt-get install -y cabextract clang-19 cmake file jq lld-19 llvm-19 llvm-19-tools minisign ninja-build p7zip-full patchelf zip libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev libssl-dev libxdo-dev libespeak-dev
+          curl --retry 5 --retry-delay 2 --retry-all-errors -fsSLO https://archive.ubuntu.com/ubuntu/pool/universe/n/nsis/nsis-common_3.09-4ubuntu1_all.deb
+          curl --retry 5 --retry-delay 2 --retry-all-errors -fsSLO https://archive.ubuntu.com/ubuntu/pool/universe/n/nsis/nsis_3.09-4ubuntu1_amd64.deb
+          printf '%s  %s\n' \
+            '49471b9debdee4751ebb4caf6b705cc4c678eebfaecefbe56362258893f85859' 'nsis-common_3.09-4ubuntu1_all.deb' \
+            '9e061bef1a8b611aeb2ea76d9a3bd7722b960ca1a9dff8e38d2ab51e5a8f5e5b' 'nsis_3.09-4ubuntu1_amd64.deb' | sha256sum -c -
+          sudo apt-get install -y ./nsis-common_3.09-4ubuntu1_all.deb ./nsis_3.09-4ubuntu1_amd64.deb
+          cargo install cargo-xwin --version 0.23.0 --locked
+          cargo install tauri-cli --version 2.11.1 --locked
+          printf '%s\n' '/usr/lib/llvm-19/bin' '${{ github.workspace }}/scripts/windows-cross' >> "$GITHUB_PATH"
+      - name: Compute candidate identity
+        id: version
         env:
+          CI_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          app_version="$(scripts/release-version.sh "$(git show -s --format=%ct HEAD)" "$CI_RUN_NUMBER")"
+          printf 'app_version=%s\ntag=v%s\n' "$app_version" "$app_version" >> "$GITHUB_OUTPUT"
+      - name: Verify release eligibility
+        id: eligibility
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          APP_VERSION: ${{ steps.version.outputs.app_version }}
+          TARGET_SHA: ${{ github.sha }}
+        run: scripts/preflight-release.sh "$GITHUB_REPOSITORY" "$TAG" "$APP_VERSION" "$TARGET_SHA" >> "$GITHUB_OUTPUT"
+      - name: Prepare pinned AppImage tools
+        if: steps.eligibility.outputs.build == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: make prepare-appimage-tools
+      - name: Build Linux AppImage with pinned Tauri action
+        id: linux
+        if: steps.eligibility.outputs.build == 'true'
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          tauriScript: cargo-tauri
+          args: --bundles appimage --no-sign --config '{"version":"${{ steps.version.outputs.app_version }}","bundle":{"createUpdaterArtifacts":false}}'
+          tagName: ${{ steps.version.outputs.tag }}
+          releaseName: VoxGolem ${{ steps.version.outputs.tag }}
+          releaseCommitish: ${{ github.sha }}
+          releaseDraft: true
+          prerelease: false
+          uploadUpdaterJson: false
+          uploadUpdaterSignatures: false
+          uploadPlainBinary: false
+          releaseAssetNamePattern: vox-golem-linux-x86_64-v[version][ext]
+      - name: Finalize AppImage and stage Linux ZIP from the same binary
+        if: steps.eligibility.outputs.build == 'true'
+        run: |
+          make prepare-appimage-tools postprocess-update-bundle stage-linux-existing
+          make verify-update-bundle
+      - name: Prepare Windows native bundle inputs
+        if: steps.eligibility.outputs.build == 'true'
+        run: make prepare-pc-bundle
+      - name: Build Windows NSIS with pinned Tauri action
+        if: steps.eligibility.outputs.build == 'true'
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          VOXGOLEM_REAL_CLANG_CL: /usr/bin/clang-19
+          VOXGOLEM_ESPEAK_COMPAT_HEADER: ${{ github.workspace }}/target/cross-shims/espeak_windows_compat.h
+          CMAKE_GENERATOR: Ninja
+          RUSTFLAGS: -L native=${{ github.workspace }}/target/import-libs
+        with:
+          tauriScript: cargo-tauri
+          args: --runner cargo-xwin --target x86_64-pc-windows-msvc --bundles nsis --no-sign --config '{"version":"${{ steps.version.outputs.app_version }}","bundle":{"createUpdaterArtifacts":false}}'
+          releaseId: ${{ steps.linux.outputs.releaseId }}
+          tagName: ${{ steps.version.outputs.tag }}
+          releaseDraft: true
+          prerelease: false
+          uploadUpdaterJson: false
+          uploadUpdaterSignatures: false
+          uploadPlainBinary: false
+          releaseAssetNamePattern: vox-golem-windows-x86_64-v[version][setup][ext]
+      - name: Sign and validate final canonical bytes
+        if: steps.eligibility.outputs.build == 'true'
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          APP_VERSION: ${{ steps.version.outputs.app_version }}
+          TAG: ${{ steps.version.outputs.tag }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          test -n "$TAURI_SIGNING_PRIVATE_KEY" || { printf '%s\n' 'TAURI_SIGNING_PRIVATE_KEY is required.' >&2; exit 1; }
-          linux_asset="vox-golem-linux-x86_64-${VERSION}.AppImage"
-          windows_asset="vox-golem-windows-x86_64-${VERSION}-setup.exe"
-          cargo-tauri signer sign --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "dist/$linux_asset"
-          cargo-tauri signer sign --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "dist/$windows_asset"
-
-      - name: Generate updater manifest
-        if: steps.release_scope.outputs.should_publish == 'true'
-        env:
-          APP_VERSION: ${{ steps.version.outputs.app_version }}
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          linux_asset="vox-golem-linux-x86_64-${VERSION}.AppImage"
-          windows_asset="vox-golem-windows-x86_64-${VERSION}-setup.exe"
-          scripts/generate-update-manifest.sh \
-            "$APP_VERSION" "$VERSION" \
-            "$linux_asset" "dist/$linux_asset.sig" \
-            "$windows_asset" "dist/$windows_asset.sig" \
-            "dist/latest.json"
-          test -s "dist/$linux_asset.sig"
-          test -s "dist/$windows_asset.sig"
-          test -s dist/latest.json
-
-      - name: Verify updater signatures against embedded key
-        if: steps.release_scope.outputs.should_publish == 'true'
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          linux_asset="vox-golem-linux-x86_64-${VERSION}.AppImage"
-          windows_asset="vox-golem-windows-x86_64-${VERSION}-setup.exe"
-          public_key="$(jq -er '.plugins.updater.pubkey' apps/desktop-tauri/src-tauri/tauri.conf.json)"
-          cargo run --locked -p voxgolem-update-verifier -- \
-            "$public_key" "dist/$linux_asset.sig" "dist/$linux_asset"
-          cargo run --locked -p voxgolem-update-verifier -- \
-            "$public_key" "dist/$windows_asset.sig" "dist/$windows_asset"
-
-      - name: Generate release checksums
-        if: steps.release_scope.outputs.should_publish == 'true'
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          cd dist
-          sha256sum \
-            "vox-golem-linux-${VERSION}.zip" \
-            "vox-golem-linux-x86_64-${VERSION}.AppImage" \
-            "vox-golem-linux-x86_64-${VERSION}.AppImage.sig" \
-            "vox-golem-windows-x86_64-${VERSION}-setup.exe" \
-            "vox-golem-windows-x86_64-${VERSION}-setup.exe.sig" \
-            latest.json > SHA256SUMS
-
-      - name: Verify exact combined release assets
-        if: steps.release_scope.outputs.should_publish == 'true'
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: scripts/verify-release-assets.sh dist "$VERSION"
-
-      - name: Generate release notes
-        if: steps.release_scope.outputs.should_publish == 'true'
-        shell: bash
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-          TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
-          PREVIOUS_TAG: ${{ steps.release_scope.outputs.previous_tag }}
-        run: |
-          if [ -n "$PREVIOUS_TAG" ]; then
-            commit_range="${PREVIOUS_TAG}..${TARGET_SHA}"
-            compare_url="https://github.com/${GITHUB_REPOSITORY}/compare/${PREVIOUS_TAG}...${VERSION}"
-          else
-            commit_range="$TARGET_SHA"
-            compare_url=""
-          fi
-
-          commit_lines="$(git log --reverse --pretty=format:'- %s (%h)' "$commit_range")"
-
-          {
-            printf '## Changes\n\n'
-
-            if [ -n "$commit_lines" ]; then
-              printf '%s\n' "$commit_lines"
-            else
-              printf -- '- No commit changes detected.\n'
-            fi
-
-            printf '\n## Artifacts\n\n'
-            printf -- "- Linux app: \`VoxGolem/vox-golem\`\n"
-            printf -- '- Signed Linux updater: %c%s%c\n' 96 "vox-golem-linux-x86_64-${VERSION}.AppImage" 96
-            printf -- '- Windows 11 x64 installer: %c%s%c\n' 96 "vox-golem-windows-x86_64-${VERSION}-setup.exe" 96
-            printf -- "- Updater metadata: \`latest.json\`\n"
-            printf -- "- NVIDIA drivers, CUDA, cuDNN, TensorRT, and models are external dependencies\n"
-            printf -- "- Windows artifacts are not Authenticode-signed and may trigger SmartScreen\n"
-            printf -- "- Checksums: \`SHA256SUMS\`\n"
-
-            printf '\n## Verification\n\n'
-            printf -- "- Linux CI \`test\`\n"
-            printf -- "- Linux CI \`native-artifact\`\n"
-            printf -- "- Linux CI \`windows-artifact\`\n"
-
-            printf '\n## Full changelog\n\n'
-
-            if [ -n "$compare_url" ]; then
-              printf '%s\n' "$compare_url"
-            else
-              printf 'Initial release from %s.\n' "$TARGET_SHA"
-            fi
-          } > release-notes.md
-
-      - name: Stage, verify, and publish release
-        if: steps.release_scope.outputs.should_publish == 'true'
+          mapfile -t appimages < <(find target/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage')
+          test "${#appimages[@]}" -eq 1
+          installer="target/x86_64-pc-windows-msvc/release/bundle/nsis/VoxGolem_${APP_VERSION}_x64-setup.exe"
+          scripts/finalize-release-assets.sh "${appimages[0]}" dist/VoxGolem "$installer" "$APP_VERSION" "$TAG"
+          scripts/verify-windows-installer.sh "$installer" 250000000
+          printf 'Automated release from %s.\n' "$GITHUB_SHA" > release-notes.md
+      - name: Complete and publish draft
+        if: steps.eligibility.outputs.build == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.version }}
-          TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
-        run: |
-          git fetch origin main
-          current_main="$(git rev-parse FETCH_HEAD)"
-
-          if [ "$current_main" != "$TARGET_SHA" ]; then
-            printf 'Refusing to publish %s because origin/main is now %s.\n' "$TARGET_SHA" "$current_main" >&2
-            exit 1
-          fi
-
-          scripts/publish-draft-release.sh \
-            "$GITHUB_REPOSITORY" "$VERSION" "$TARGET_SHA" dist release-notes.md
+        run: scripts/publish-draft-release.sh "$GITHUB_REPOSITORY" "${{ steps.version.outputs.tag }}" "$GITHUB_SHA" "$GITHUB_WORKSPACE/dist-final" release-notes.md

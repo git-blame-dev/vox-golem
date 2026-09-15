@@ -181,7 +181,7 @@ if [ "$uninstaller_bytes" -gt 500000 ]; then
   printf 'Extracted uninstaller exceeds its size limit: %s bytes.\n' "$uninstaller_bytes" >&2
   exit 1
 fi
-"$file_command" "$uninstaller" | grep -Eq 'PE32 executable.*Intel 80386' || {
+"$file_command" "$uninstaller" | grep -Eq 'PE32 executable.*Intel (80386|i386)' || {
   printf '%s\n' 'Extracted uninstaller is not a 32-bit PE executable.' >&2
   exit 1
 }
@@ -200,7 +200,7 @@ for internal in "${expected_internals[@]}"; do
   fi
   case "$internal" in
     *.dll)
-      "$file_command" "$internal_path" | grep -Eq 'PE32 executable.*Intel 80386' || {
+      "$file_command" "$internal_path" | grep -Eq 'PE32 executable.*Intel (80386|i386)' || {
         printf 'NSIS internal file is not a 32-bit PE DLL: %s\n' "$internal" >&2
         exit 1
       }

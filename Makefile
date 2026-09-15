@@ -81,7 +81,7 @@ LINUX_ORT_PROVIDER_LIBS := \
 
 .DEFAULT_GOAL := help
 
-.PHONY: help app-version test test-release-tools check-linux-tools app app-smoke packaged-smoke app-dev linux dist verify-dist update-bundle verify-update-bundle update-bundle-smoke check-pc-tools pc pc-dist verify-pc-dist pc-installer verify-pc-installer clean
+.PHONY: help app-version test test-release-tools check-linux-tools app app-smoke packaged-smoke app-dev linux dist stage-linux-existing verify-dist prepare-appimage-tools update-bundle postprocess-update-bundle verify-update-bundle update-bundle-smoke check-pc-tools prepare-pc-bundle pc pc-dist verify-pc-dist pc-installer verify-pc-installer clean
 
 help:
 	@printf '%s\n' 'Targets:'
@@ -176,6 +176,9 @@ linux: check-linux-tools
 	@printf 'Linux app: %s\n' '$(LINUX_RELEASE_DIR)/vox-golem'
 
 dist: linux
+	@$(MAKE) --no-print-directory stage-linux-existing
+
+stage-linux-existing:
 	@rm -rf '$(LINUX_STAGED_RELEASE_DIR)'
 	@mkdir -p '$(LINUX_STAGED_RELEASE_DIR)'
 	cp '$(LINUX_RELEASE_DIR)/vox-golem' '$(LINUX_STAGED_RELEASE_DIR)/vox-golem'
@@ -198,20 +201,26 @@ verify-dist:
 	@test "$$(find '$(LINUX_STAGED_RELEASE_DIR)' -maxdepth 1 -type f | wc -l)" -eq 3 || { printf '%s\n' 'Unexpected files in Linux package.' >&2; exit 1; }
 	@printf 'vox-golem\t%s bytes\n' "$$(stat -c '%s' '$(LINUX_STAGED_RELEASE_DIR)/vox-golem')"
 
-update-bundle: check-linux-tools
-	@test -n '$(APP_VERSION)' || { printf '%s\n' 'Failed to generate application version.' >&2; exit 1; }
-	@case '$(APP_VERSION)' in *[!0-9A-Za-z.-]*|'') printf 'Invalid APP_VERSION: %s\n' '$(APP_VERSION)' >&2; exit 1;; esac
-	@test -n '$(XDG_CACHE_HOME)$(HOME)' || { printf '%s\n' 'An absolute XDG_CACHE_HOME or HOME is required for Tauri tool pinning.' >&2; exit 1; }
-	@case '$(TAURI_CACHE_ROOT)' in /*) ;; *) printf 'Tauri cache root must be absolute: %s\n' '$(TAURI_CACHE_ROOT)' >&2; exit 1;; esac
+prepare-appimage-tools:
 	bash scripts/prepare-tauri-bundler-tool.sh '$(TAURI_APPRUN)' '$(TAURI_APPRUN_URL)' '$(TAURI_APPRUN_SHA256)'
 	bash scripts/prepare-tauri-bundler-tool.sh '$(TAURI_LINUXDEPLOY)' '$(TAURI_LINUXDEPLOY_URL)' '$(TAURI_LINUXDEPLOY_SHA256)'
 	bash scripts/prepare-tauri-bundler-tool.sh '$(TAURI_GTK_PLUGIN)' '$(TAURI_GTK_PLUGIN_URL)' '$(TAURI_GTK_PLUGIN_SHA256)'
 	bash scripts/prepare-tauri-bundler-tool.sh '$(TAURI_GSTREAMER_PLUGIN)' '$(TAURI_GSTREAMER_PLUGIN_URL)' '$(TAURI_GSTREAMER_PLUGIN_SHA256)'
 	bash scripts/prepare-tauri-bundler-tool.sh '$(LINUXDEPLOY_APPIMAGE_PLUGIN)' '$(LINUXDEPLOY_APPIMAGE_PLUGIN_URL)' '$(LINUXDEPLOY_APPIMAGE_PLUGIN_SHA256)'
 	bash scripts/prepare-tauri-bundler-tool.sh '$(APPIMAGE_RUNTIME)' '$(APPIMAGE_RUNTIME_URL)' '$(APPIMAGE_RUNTIME_SHA256)'
+
+update-bundle: check-linux-tools prepare-appimage-tools
+	@command -v patchelf >/dev/null || { printf '%s\n' 'Missing patchelf, required for AppImage media-framework bundling.' >&2; exit 1; }
+	@test -n '$(APP_VERSION)' || { printf '%s\n' 'Failed to generate application version.' >&2; exit 1; }
+	@case '$(APP_VERSION)' in *[!0-9A-Za-z.-]*|'') printf 'Invalid APP_VERSION: %s\n' '$(APP_VERSION)' >&2; exit 1;; esac
+	@test -n '$(XDG_CACHE_HOME)$(HOME)' || { printf '%s\n' 'An absolute XDG_CACHE_HOME or HOME is required for Tauri tool pinning.' >&2; exit 1; }
+	@case '$(TAURI_CACHE_ROOT)' in /*) ;; *) printf 'Tauri cache root must be absolute: %s\n' '$(TAURI_CACHE_ROOT)' >&2; exit 1;; esac
 	@rm -rf '$(LINUX_APPIMAGE_DIR)'
 	bun install --frozen-lockfile
 	LDAI_RUNTIME_FILE='$(APPIMAGE_RUNTIME)' cargo tauri build --bundles appimage --config '{"version":"$(APP_VERSION)","bundle":{"createUpdaterArtifacts":false}}' -- --locked
+	@$(MAKE) --no-print-directory postprocess-update-bundle
+
+postprocess-update-bundle:
 	@test -x '$(LINUXDEPLOY_APPIMAGE_PLUGIN)' || { printf 'Missing Tauri AppImage plugin: %s\n' '$(LINUXDEPLOY_APPIMAGE_PLUGIN)' >&2; exit 1; }
 	@printf '%s  %s\n' '$(LINUXDEPLOY_APPIMAGE_PLUGIN_SHA256)' '$(LINUXDEPLOY_APPIMAGE_PLUGIN)' | sha256sum -c -
 	@set -eu; \
@@ -298,6 +307,10 @@ check-pc-tools:
 	@command -v llvm-dlltool >/dev/null || { printf '%s\n' 'Missing llvm-dlltool. Install LLVM tools before running make pc.' >&2; exit 1; }
 	@command -v lld-link >/dev/null || { printf '%s\n' 'Missing lld-link. Install lld before running make pc.' >&2; exit 1; }
 
+prepare-pc-bundle: check-pc-tools $(ESPEAK_COMPAT_HEADER) $(STDCXX_IMPORT_LIB) $(DIRECTML_IMPORT_LIB) $(PATHCCH_IMPORT_LIB) $(VC_RUNTIME_DIR)/.complete $(WINDOWS_NSIS_TEMPLATE)
+	@rm -rf '$(CURDIR)/target/tauri-windows-resources'
+	VOXGOLEM_VC_RUNTIME_DIR='$(VC_RUNTIME_DIR)' bash scripts/prepare-tauri-windows-resources.sh --prepare
+
 pc: check-pc-tools $(ESPEAK_COMPAT_HEADER) $(STDCXX_IMPORT_LIB) $(DIRECTML_IMPORT_LIB) $(PATHCCH_IMPORT_LIB)
 	bun install --frozen-lockfile
 	PATH='$(WINDOWS_CROSS_BIN)':"$$PATH" \
@@ -324,10 +337,12 @@ pc-dist: pc
 	@$(MAKE) --no-print-directory verify-pc-dist
 	@printf 'Staged Windows release files: %s\n' '$(WINDOWS_STAGED_RELEASE_DIR)'
 
-pc-installer: pc-dist $(WINDOWS_NSIS_TEMPLATE)
+pc-installer: check-pc-tools $(ESPEAK_COMPAT_HEADER) $(STDCXX_IMPORT_LIB) $(DIRECTML_IMPORT_LIB) $(PATHCCH_IMPORT_LIB) $(VC_RUNTIME_DIR)/.complete $(WINDOWS_NSIS_TEMPLATE)
 	@test -n '$(APP_VERSION)' || { printf '%s\n' 'Failed to generate application version.' >&2; exit 1; }
 	@case '$(APP_VERSION)' in *[!0-9A-Za-z.-]*|'') printf 'Invalid APP_VERSION: %s\n' '$(APP_VERSION)' >&2; exit 1;; esac
 	@rm -rf '$(WINDOWS_NSIS_DIR)'
+	@rm -rf '$(CURDIR)/target/tauri-windows-resources'
+	VOXGOLEM_VC_RUNTIME_DIR='$(VC_RUNTIME_DIR)' bash scripts/prepare-tauri-windows-resources.sh --prepare
 	PATH='$(WINDOWS_CROSS_BIN)':"$$PATH" \
 	VOXGOLEM_REAL_CLANG_CL='$(REAL_CLANG_CL)' \
 	VOXGOLEM_ESPEAK_COMPAT_HEADER='$(ESPEAK_COMPAT_HEADER)' \

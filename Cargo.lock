@@ -5686,14 +5686,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "voxgolem-update-verifier"
-version = "0.0.0"
-dependencies = [
- "base64 0.22.1",
- "minisign-verify",
-]
-
-[[package]]
 name = "vswhom"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

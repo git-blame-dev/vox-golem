@@ -10,6 +10,8 @@ fi
 release_dir="$1"
 tag="$2"
 version="${tag#v}"
+root="$(cd "$(dirname "$0")/.." && pwd)"
+minisign="${MINISIGN:-minisign}"
 
 if [ ! -d "$release_dir" ] || [ -L "$release_dir" ]; then
   printf 'Release directory is missing or unsafe: %s\n' "$release_dir" >&2
@@ -64,6 +66,15 @@ if [ "$(printf '%s\n' "${checksum_files[@]}")" != "$(printf '%s\n' "${sorted_exp
   exit 1
 fi
 (cd "$release_dir" && sha256sum --strict -c SHA256SUMS)
+
+verification_dir="$(mktemp -d)"
+trap 'rm -rf "$verification_dir"' EXIT
+public_key="$(jq -er '.plugins.updater.pubkey | strings | select(length > 0)' "$root/apps/desktop-tauri/src-tauri/tauri.conf.json")"
+printf '%s' "$public_key" | base64 --decode > "$verification_dir/updater.pub"
+for asset in "$linux_asset" "$windows_asset"; do
+  base64 --decode < "$release_dir/$asset.sig" > "$verification_dir/$asset.sig"
+  "$minisign" -Vm "$release_dir/$asset" -p "$verification_dir/updater.pub" -x "$verification_dir/$asset.sig"
+done
 
 linux_signature="$(<"$release_dir/$linux_asset.sig")"
 windows_signature="$(<"$release_dir/$windows_asset.sig")"
