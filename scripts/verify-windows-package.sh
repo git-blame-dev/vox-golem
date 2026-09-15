@@ -86,7 +86,7 @@ for file in "${expected[@]}"; do
       cublaslt64_12.dll|cublas64_12.dll|cufft64_11.dll|cudart64_12.dll|cudnn64_9.dll)
         # These approved GPU prerequisites remain external system capabilities.
         ;;
-      api-ms-win-*.dll|advapi32.dll|bcryptprimitives.dll|comctl32.dll|crypt32.dll|d3d12.dll|dbghelp.dll|dwmapi.dll|dxgi.dll|gdi32.dll|kernel32.dll|ntdll.dll|ole32.dll|oleaut32.dll|setupapi.dll|shell32.dll|shlwapi.dll|ucrtbase.dll|user32.dll|ws2_32.dll)
+      api-ms-win-*.dll|advapi32.dll|bcrypt.dll|bcryptprimitives.dll|comctl32.dll|crypt32.dll|d3d12.dll|dbghelp.dll|dwmapi.dll|dxgi.dll|gdi32.dll|kernel32.dll|ntdll.dll|ole32.dll|oleaut32.dll|setupapi.dll|shell32.dll|shlwapi.dll|ucrtbase.dll|user32.dll|ws2_32.dll)
         ;;
       *)
         printf 'Unplanned Windows runtime dependency in %s: %s\n' "$file" "$dependency" >&2
