@@ -115,6 +115,8 @@ struct AppState {
     prefetch_cache: Mutex<Option<PrefetchEntry>>,
     prefetch_task: Mutex<Option<ActivePrefetch>>,
     llama_startups: LlamaStartupRegistry,
+    shutdown_lock: tokio::sync::Mutex<()>,
+    shutdown_complete: AtomicBool,
     exit_cleanup_started: AtomicBool,
 }
 
@@ -850,6 +852,7 @@ async fn set_tts_enabled(
 
 #[tauri::command]
 fn reserve_local_tts_playback_id(app_state: tauri::State<'_, AppState>) -> Result<u64, String> {
+    let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
     reserve_tts_playback_id(&app_state.tts_playback)
 }
 
@@ -969,6 +972,7 @@ async fn finish_tts_playback(
 fn reserve_native_microphone_capture_id(
     app_state: tauri::State<'_, AppState>,
 ) -> Result<u64, String> {
+    let _update_guard = begin_native_microphone_operation(&app_state.update_installation_gate)?;
     app_state
         .microphone_capture
         .reserve_id()
@@ -999,6 +1003,7 @@ async fn start_native_microphone(
     app: tauri::AppHandle,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<StartNativeMicrophonePayload, String> {
+    let _update_guard = begin_native_microphone_operation(&app_state.update_installation_gate)?;
     ensure_startup_ready_for_prompt(&app_state.startup_state)?;
     let event_app = app.clone();
     let terminal_app = app;
@@ -4665,9 +4670,9 @@ async fn cancel_tts_generation_for_prompt(
         let active = active_prompt
             .lock()
             .map_err(|_| String::from("active prompt lock is poisoned"))?;
-        if !active
+        if active
             .as_ref()
-            .is_some_and(|active| active.request_id == request_id)
+            .is_none_or(|active| active.request_id != request_id)
         {
             return Ok(false);
         }
@@ -6171,6 +6176,7 @@ struct PersistedState {
     ui_text_size: Option<UiTextSizePayload>,
     ui_theme: Option<UiThemePayload>,
     assistant_settings: Option<AssistantSettingsPayload>,
+    auto_update_download: Option<bool>,
 }
 
 fn parse_persisted_state(contents: &str) -> Result<PersistedState, String> {
@@ -6221,6 +6227,11 @@ fn parse_persisted_state(contents: &str) -> Result<PersistedState, String> {
                     ));
                 }
             };
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("auto_update_download") {
+            state.auto_update_download = Some(parse_persisted_bool(value, "auto_update_download")?);
             continue;
         }
 
@@ -6388,6 +6399,9 @@ fn persist_state(state: PersistedState) -> Result<(), String> {
     if let Some(tts_enabled) = state.tts_enabled {
         lines.push(format!("tts_enabled = {tts_enabled}"));
     }
+    if let Some(enabled) = state.auto_update_download {
+        lines.push(format!("auto_update_download = {enabled}"));
+    }
     if let Some(ui_text_size) = state.ui_text_size {
         lines.push(format!("ui_text_size = \"{}\"", ui_text_size.as_str()));
     }
@@ -6474,6 +6488,19 @@ fn persist_tts_enabled(enabled: bool) -> Result<(), String> {
         .map_err(|_| String::from("persisted state lock is poisoned"))?;
     let mut persisted = load_persisted_state()?;
     persisted.tts_enabled = Some(enabled);
+    persist_state(persisted)
+}
+
+fn load_auto_update_download() -> Result<bool, String> {
+    Ok(load_persisted_state()?.auto_update_download.unwrap_or(true))
+}
+
+pub(crate) fn persist_auto_update_download(enabled: bool) -> Result<(), String> {
+    let _guard = PERSISTED_STATE_LOCK
+        .lock()
+        .map_err(|_| String::from("persisted state lock is poisoned"))?;
+    let mut persisted = load_persisted_state()?;
+    persisted.auto_update_download = Some(enabled);
     persist_state(persisted)
 }
 
@@ -7575,6 +7602,8 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
                 prefetch_cache: Mutex::new(None),
                 prefetch_task: Mutex::new(None),
                 llama_startups,
+                shutdown_lock: tokio::sync::Mutex::new(()),
+                shutdown_complete: AtomicBool::new(false),
                 exit_cleanup_started: AtomicBool::new(false),
             }
         }
@@ -7708,6 +7737,8 @@ fn build_startup_error_app_state(
         prefetch_cache: Mutex::new(None),
         prefetch_task: Mutex::new(None),
         llama_startups: Arc::new(Mutex::new(Vec::new())),
+        shutdown_lock: tokio::sync::Mutex::new(()),
+        shutdown_complete: AtomicBool::new(false),
         exit_cleanup_started: AtomicBool::new(false),
     }
 }
@@ -7780,6 +7811,8 @@ fn build_nonfatal_config_error_app_state(
         prefetch_cache: Mutex::new(None),
         prefetch_task: Mutex::new(None),
         llama_startups: Arc::new(Mutex::new(Vec::new())),
+        shutdown_lock: tokio::sync::Mutex::new(()),
+        shutdown_complete: AtomicBool::new(false),
         exit_cleanup_started: AtomicBool::new(false),
     }
 }
@@ -7847,6 +7880,12 @@ fn begin_update_sensitive_operation(
     Arc::clone(gate)
         .try_read_owned()
         .map_err(|_| String::from("an update installation is starting"))
+}
+
+fn begin_native_microphone_operation(
+    gate: &Arc<tokio::sync::RwLock<()>>,
+) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, String> {
+    begin_update_sensitive_operation(gate)
 }
 
 pub(crate) fn begin_update_installation(
@@ -8445,7 +8484,7 @@ fn shutdown_llama_cpp_runtime_for_exit(app_state: &AppState) {
     }
 }
 
-fn shutdown_completion_runtime_for_exit(app_state: &AppState) {
+async fn shutdown_completion_runtime(app_state: &AppState) {
     let runtime = {
         let Ok(_lifecycle) = app_state.completion_lifecycle_lock.lock() else {
             return;
@@ -8465,11 +8504,11 @@ fn shutdown_completion_runtime_for_exit(app_state: &AppState) {
             .unwrap_or(None)
     };
     if let Some(mut runtime) = runtime {
-        let _ = tauri::async_runtime::block_on(runtime.shutdown());
+        let _ = runtime.shutdown().await;
     }
 }
 
-fn shutdown_prefetch_for_exit(app_state: &AppState) {
+async fn shutdown_prefetch(app_state: &AppState) {
     app_state.prefetch_generation.fetch_add(1, Ordering::SeqCst);
     let active = app_state
         .prefetch_task
@@ -8480,16 +8519,73 @@ fn shutdown_prefetch_for_exit(app_state: &AppState) {
         active.cancelled.store(true, Ordering::SeqCst);
         active.cancellation_signal.send_replace(true);
         if let Some(mut task) = active.task.take() {
-            if tauri::async_runtime::block_on(tokio::time::timeout(
-                Duration::from_secs(3),
-                &mut task,
-            ))
-            .is_err()
+            if tokio::time::timeout(Duration::from_secs(3), &mut task)
+                .await
+                .is_err()
             {
                 task.abort();
             }
         }
     }
+}
+
+pub(crate) fn shutdown_runtime_for_exit(app_state: &AppState) {
+    tauri::async_runtime::block_on(shutdown_runtime(app_state));
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) async fn shutdown_runtime_for_update(app_state: &AppState) {
+    shutdown_runtime(app_state).await;
+}
+
+async fn shutdown_runtime(app_state: &AppState) {
+    run_serialized_shutdown(
+        &app_state.shutdown_lock,
+        &app_state.exit_cleanup_started,
+        &app_state.shutdown_complete,
+        || async {
+            shutdown_prefetch(app_state).await;
+            shutdown_llama_startups_for_exit(app_state);
+            shutdown_llama_cpp_runtime_for_exit(app_state);
+            shutdown_completion_runtime(app_state).await;
+            app_state.microphone_capture.shutdown();
+            app_state.tts_audio_playback.shutdown();
+            if let Ok(mut runtime) = app_state.local_tts_runtime.lock() {
+                if let Some(runtime) = runtime.take() {
+                    if let Ok(mut runtime) = Arc::try_unwrap(runtime) {
+                        runtime.shutdown_bounded();
+                    }
+                }
+            }
+            let opencode_server = app_state
+                .opencode_server
+                .lock()
+                .map(|mut server| server.take())
+                .unwrap_or(None);
+            if let Some(server) = opencode_server {
+                let _ = server.shutdown().await;
+            }
+        },
+    )
+    .await;
+}
+
+async fn run_serialized_shutdown<F, Fut>(
+    lock: &tokio::sync::Mutex<()>,
+    started: &AtomicBool,
+    complete: &AtomicBool,
+    cleanup: F,
+) where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let _guard = lock.lock().await;
+    if complete.load(Ordering::Acquire) {
+        return;
+    }
+    started.store(true, Ordering::Release);
+    cleanup().await;
+    complete.store(true, Ordering::Release);
 }
 
 fn store_completion_runtime(
@@ -8572,18 +8668,16 @@ pub fn run() {
             let _ = window.set_focus();
         }
     }));
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
 
     let builder = builder
         .manage(app_updates::PendingUpdate::default())
         .setup(|app| {
             let app_state = build_app_state(app.handle());
-            #[cfg(target_os = "windows")]
-            app_updates::cleanup_stale_windows_installers(
-                app.handle(),
-                app_state
-                    .runtime_config
-                    .as_ref()
-                    .is_some_and(|config| config.logging.enabled),
+            let auto_update_download = load_auto_update_download().unwrap_or(false);
+            app_updates::configure_auto_download(
+                &app.state::<app_updates::PendingUpdate>(),
+                auto_update_download,
             );
             let completion_config = app_state
                 .runtime_config
@@ -8749,11 +8843,16 @@ pub fn run() {
                 });
             }
             eprintln!("{STARTUP_READY_MARKER}");
+            app_updates::start_background_update(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             app_updates::check_for_update,
+            app_updates::download_update,
             app_updates::install_update,
+            app_updates::discard_update,
+            app_updates::set_auto_update_download,
+            app_updates::get_update_snapshot,
             app_updates::restart_for_update,
             get_startup_state,
             set_tts_enabled,
@@ -8805,40 +8904,16 @@ pub fn run() {
         }
         if matches!(event, tauri::RunEvent::Exit) {
             let app_state = app_handle.state::<AppState>();
-            if !app_state.exit_cleanup_started.swap(true, Ordering::SeqCst) {
-                shutdown_prefetch_for_exit(&app_state);
-                shutdown_llama_startups_for_exit(&app_state);
-                shutdown_llama_cpp_runtime_for_exit(&app_state);
-                shutdown_completion_runtime_for_exit(&app_state);
-                app_state.microphone_capture.shutdown();
-                app_state.tts_audio_playback.shutdown();
-                if let Ok(mut runtime) = app_state.local_tts_runtime.lock() {
-                    if let Some(runtime) = runtime.take() {
-                        if let Ok(mut runtime) = Arc::try_unwrap(runtime) {
-                            runtime.shutdown_bounded();
-                        }
-                    }
-                }
-            }
-            let opencode_server = app_state
-                .opencode_server
-                .lock()
-                .expect("opencode server lock")
-                .take();
-            if let Some(server) = opencode_server {
-                let _ = tauri::async_runtime::block_on(server.shutdown());
-            }
+            shutdown_runtime_for_exit(&app_state);
         }
     });
 }
 
 fn shutdown_llama_startups_for_exit(app_state: &AppState) {
-    let startups = app_state
-        .llama_startups
-        .lock()
-        .expect("llama startup lock")
-        .drain(..)
-        .collect::<Vec<_>>();
+    let startups = app_state.llama_startups.lock().map_or_else(
+        |poisoned| poisoned.into_inner().drain(..).collect::<Vec<_>>(),
+        |mut startups| startups.drain(..).collect::<Vec<_>>(),
+    );
     for (cancellation, worker) in startups {
         cancellation.cancel();
         let _ = worker.join();
@@ -8897,10 +8972,11 @@ mod tests {
     use super::{
         agent_history, apply_opencode_startup_failure, apply_optional_speech_activity,
         apply_wsl_custom_auth_resolution, assistant_completion_enabled, atomic_replace_state_file,
-        begin_update_installation, begin_update_sensitive_operation, bounded_provider_history,
-        build_mark_silence_response, build_nonfatal_config_error_app_state,
-        build_startup_error_app_state, cancel_current_tts_playback_state,
-        cancel_prompt_request_state, cancel_tts_generation_for_prompt, cancel_tts_playback_state,
+        begin_native_microphone_operation, begin_update_installation,
+        begin_update_sensitive_operation, bounded_provider_history, build_mark_silence_response,
+        build_nonfatal_config_error_app_state, build_startup_error_app_state,
+        cancel_current_tts_playback_state, cancel_prompt_request_state,
+        cancel_tts_generation_for_prompt, cancel_tts_playback_state,
         claim_cancelled_prompt_publication, cleanup_sequential,
         clear_completion_request_state_locked, configured_capabilities,
         current_runtime_phase_response, current_silence_deadline, default_response_profile,
@@ -8915,14 +8991,14 @@ mod tests {
         persist_ui_theme, process_wake_word_frame, race_durable_cancellation,
         register_active_prompt, register_tts_playback, reset_runtime_session,
         reset_voice_pipeline_to_waiting, reset_wake_word_runtime, resolve_effective_tts_enabled,
-        response_profile_state_path, runtime_log_path, runtime_phase_response_from_state,
-        shutdown_llama_cpp_runtime_for_exit, supported_response_profiles,
-        synchronize_local_instant_model_with, take_and_invalidate_prefetch,
-        to_runtime_phase_payload, transcribe_finished_utterance, transcription_ready_samples,
-        update_installation_busy_reason, update_restored_profile_capabilities,
-        validate_prompt_request_id, validate_prompt_text, wake_word_event_timestamp,
-        ActivePromptGuard, AgentChoicePayload, AssistantSettingsPayload, CapabilityPayload,
-        CapabilityStatePayload, CueAssetPathsPayload, DeepStageResult, DeepTask,
+        response_profile_state_path, run_serialized_shutdown, runtime_log_path,
+        runtime_phase_response_from_state, shutdown_llama_cpp_runtime_for_exit,
+        supported_response_profiles, synchronize_local_instant_model_with,
+        take_and_invalidate_prefetch, to_runtime_phase_payload, transcribe_finished_utterance,
+        transcription_ready_samples, update_installation_busy_reason,
+        update_restored_profile_capabilities, validate_prompt_request_id, validate_prompt_text,
+        wake_word_event_timestamp, ActivePromptGuard, AgentChoicePayload, AssistantSettingsPayload,
+        CapabilityPayload, CapabilityStatePayload, CueAssetPathsPayload, DeepStageResult, DeepTask,
         InstantChoicePayload, PrefetchEntry, PrefetchKey, PromptEventEnvelope,
         PromptExecutionEventPayload, ResponseProfilePayload, RuntimePhasePayload,
         RuntimePhaseResponsePayload, RuntimeTelemetryPayload, StagePayload, StageStatusPayload,
@@ -8954,6 +9030,53 @@ mod tests {
                 Some("Update installation requires VoxGolem to be idle.")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn incomplete_shutdown_is_retried_without_racing_another_attempt() {
+        let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let complete = std::sync::Arc::new(AtomicBool::new(false));
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+
+        let failed = {
+            let lock = std::sync::Arc::clone(&lock);
+            let started = std::sync::Arc::clone(&started);
+            let complete = std::sync::Arc::clone(&complete);
+            let attempts = std::sync::Arc::clone(&attempts);
+            tokio::spawn(async move {
+                run_serialized_shutdown(&lock, &started, &complete, || async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    panic!("synthetic incomplete shutdown");
+                })
+                .await;
+            })
+        };
+        assert!(failed.await.is_err());
+        assert!(started.load(Ordering::SeqCst));
+        assert!(!complete.load(Ordering::SeqCst));
+
+        let retries = (0..2)
+            .map(|_| {
+                let lock = std::sync::Arc::clone(&lock);
+                let started = std::sync::Arc::clone(&started);
+                let complete = std::sync::Arc::clone(&complete);
+                let attempts = std::sync::Arc::clone(&attempts);
+                tokio::spawn(async move {
+                    run_serialized_shutdown(&lock, &started, &complete, || async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        tokio::task::yield_now().await;
+                    })
+                    .await;
+                })
+            })
+            .collect::<Vec<_>>();
+        for retry in retries {
+            retry.await.expect("retry shutdown task");
+        }
+
+        assert!(complete.load(Ordering::SeqCst));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -9007,7 +9130,7 @@ mod tests {
             default_voice_pipeline_config(),
             String::from("test startup"),
         );
-        for runtime in ["completion", "tts"] {
+        for runtime in ["completion", "tts", "microphone"] {
             let startup = begin_update_sensitive_operation(&app_state.update_installation_gate)
                 .unwrap_or_else(|_| panic!("begin {runtime} startup"));
             assert!(begin_update_installation(&app_state).is_err());
@@ -9015,12 +9138,26 @@ mod tests {
         }
 
         let installation = begin_update_installation(&app_state).expect("begin installation");
-        for runtime in ["completion", "tts"] {
+        for runtime in ["completion", "tts", "microphone"] {
             assert!(
                 begin_update_sensitive_operation(&app_state.update_installation_gate).is_err(),
                 "{runtime} startup must not begin during installation"
             );
         }
+        drop(installation);
+    }
+
+    #[test]
+    fn native_microphone_reservation_and_start_share_the_installation_gate() {
+        let gate = std::sync::Arc::new(tokio::sync::RwLock::new(()));
+        let reservation = begin_native_microphone_operation(&gate).expect("reserve microphone");
+        assert!(std::sync::Arc::clone(&gate).try_write_owned().is_err());
+        drop(reservation);
+
+        let installation = std::sync::Arc::clone(&gate)
+            .try_write_owned()
+            .expect("begin installation");
+        assert!(begin_native_microphone_operation(&gate).is_err());
         drop(installation);
     }
 
@@ -10398,6 +10535,15 @@ mod tests {
                 completion: false,
             })
         );
+    }
+
+    #[test]
+    fn parse_persisted_state_reads_and_validates_auto_update_download() {
+        let enabled = parse_persisted_state("auto_update_download = true\n")
+            .expect("automatic update preference should parse");
+
+        assert_eq!(enabled.auto_update_download, Some(true));
+        assert!(parse_persisted_state("auto_update_download = sometimes\n").is_err());
     }
 
     #[test]

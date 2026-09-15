@@ -1,13 +1,12 @@
-import { act, useState } from 'react'
-import type { JSX } from 'react'
+import { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { UpdateSettings } from './UpdateSettings'
 import { useAppUpdates } from '../lib/useAppUpdates'
 import type { TauriEvent } from '../lib/tauri'
 
-const containers: HTMLElement[] = []
 const roots: ReturnType<typeof createRoot>[] = []
+const containers: HTMLElement[] = []
 
 afterEach(() => {
   for (const root of roots) act(() => root.unmount())
@@ -17,296 +16,204 @@ afterEach(() => {
   Reflect.deleteProperty(window, '__TAURI_INTERNALS__')
 })
 
-describe('UpdateSettings', () => {
-  it('checks automatically but installs and restarts only after separate user actions', async () => {
-    const invoke = vi.fn(async (command: string) => {
-      if (command === 'check_for_update') return {
-        status: 'available',
-        current_version: '0.1.0',
-        version: '2026.7.27-12',
-         notes: 'Safer updates',
-         install_behavior: 'install_then_restart',
-      }
-      if (command === 'install_update') return { version: '2026.7.27-12' }
-      if (command === 'restart_for_update') return null
-      throw new Error(`unexpected command: ${command}`)
-    })
-    window.__TAURI_INTERNALS__ = { invoke }
-
-    const container = await renderUpdates()
-    expect(container.textContent).toContain('Update 2026.7.27-12 available')
-    expect(container.textContent).not.toContain('You have')
-    expect(container.textContent).not.toContain('Signed Linux AppImage updates')
-    expect(container.querySelectorAll('.settings-panel__update-row')).toHaveLength(1)
-    expect(invoke).toHaveBeenCalledWith('check_for_update', undefined)
-    expect(invoke).not.toHaveBeenCalledWith('install_update', undefined)
-
-    await act(async () => {
-      getButton(container, 'Install update').click()
-      await Promise.resolve()
-    })
-    expect(container.textContent).toContain('Update installed')
-    expect(invoke).toHaveBeenCalledWith('install_update', undefined)
-
-    await act(async () => {
-      getButton(container, 'Restart').click()
-      await Promise.resolve()
-    })
-    expect(invoke).toHaveBeenCalledWith('restart_for_update', undefined)
-  })
-
-  it('submits one install when the action is activated twice before rendering', async () => {
-    let finishInstall: (result: { version: string }) => void = () => undefined
-    const pendingInstall = new Promise<{ version: string }>((resolve) => { finishInstall = resolve })
-    const invoke = vi.fn(async (command: string) => {
-      if (command === 'check_for_update') return {
-        status: 'available', current_version: '0.1.0', version: '2026.7.27-12', notes: null, install_behavior: 'install_and_restart',
-      }
-      if (command === 'install_update') return pendingInstall
-      throw new Error(`unexpected command: ${command}`)
-    })
-    window.__TAURI_INTERNALS__ = { invoke }
-
-    const container = await renderUpdates()
-    await act(async () => {
-      const install = getButton(container, 'Install and restart')
-      install.click()
-      install.click()
-      await Promise.resolve()
-    })
-
-    expect(invoke.mock.calls.filter(([command]) => command === 'install_update')).toHaveLength(1)
-    await act(async () => {
-      finishInstall({ version: '2026.7.27-12' })
-      await pendingInstall
-    })
-  })
-
-  it('submits one restart and disables the action while it is pending', async () => {
-    let finishRestart: () => void = () => undefined
-    const pendingRestart = new Promise<void>((resolve) => { finishRestart = resolve })
-    const invoke = vi.fn(async (command: string) => {
-      if (command === 'check_for_update') return {
-        status: 'available', current_version: '0.1.0', version: '2026.7.27-12', notes: null, install_behavior: 'install_then_restart',
-      }
-      if (command === 'install_update') return { version: '2026.7.27-12' }
-      if (command === 'restart_for_update') return pendingRestart
-      throw new Error(`unexpected command: ${command}`)
-    })
-    window.__TAURI_INTERNALS__ = { invoke }
-
-    const container = await renderUpdates()
-    await act(async () => {
-      getButton(container, 'Install update').click()
-      await Promise.resolve()
-    })
-    await act(async () => {
-      const restart = getButton(container, 'Restart')
-      restart.click()
-      restart.click()
-      await Promise.resolve()
-    })
-
-    expect(invoke.mock.calls.filter(([command]) => command === 'restart_for_update')).toHaveLength(1)
-    expect(getButton(container, 'Restart').disabled).toBe(true)
-    await act(async () => {
-      finishRestart()
-      await pendingRestart
-    })
-  })
-
-  it('renders filtered native download and verification progress', async () => {
-    let progressHandler: (event: TauriEvent) => void = () => undefined
-    let finishInstall: (result: { version: string }) => void = () => undefined
-    const pendingInstall = new Promise<{ version: string }>((resolve) => { finishInstall = resolve })
-    window.__TAURI_INTERNALS__ = {
-      invoke: vi.fn(async (command: string) => {
-        if (command === 'check_for_update') return {
-          status: 'available', current_version: '0.1.0', version: '2026.7.27-12', notes: null, install_behavior: 'install_and_restart',
-        }
-        if (command === 'install_update') return pendingInstall
+describe('UpdateSettings revisioned native state', () => {
+  it('registers its listener before hydration and never performs a startup check', async () => {
+    const calls: string[] = []
+    installTauri({
+      listen: async () => { calls.push('listen'); return () => undefined },
+      invoke: async (command) => {
+        calls.push(command)
+        if (command === 'get_update_snapshot') return snapshot({ phase: 'up_to_date', version: null })
         throw new Error(`unexpected command: ${command}`)
-      }),
-      listen: async (event, handler) => {
-        if (event === 'app-update-progress') progressHandler = handler
-        return () => undefined
       },
-    }
-
+    })
     const container = await renderUpdates()
-    await act(async () => {
-      getButton(container, 'Install and restart').click()
-      await Promise.resolve()
-    })
-    expect(container.textContent).toContain('Downloading and verifying...')
-
-    await act(async () => {
-      progressHandler({ payload: { version: 'other-version', phase: 'progress', downloaded_bytes: 9_000_000, total_bytes: 10_000_000 } })
-      progressHandler({ payload: { version: '2026.7.27-12', phase: 'progress', downloaded_bytes: -1 } })
-    })
-    expect(container.textContent).toContain('Downloading and verifying...')
-
-    await act(async () => {
-      progressHandler({ payload: { version: '2026.7.27-12', phase: 'started', downloaded_bytes: 0, total_bytes: 10_000_000 } })
-    })
-    expect(container.textContent).toContain('Downloading: 0% (0.0 / 10.0 MB)')
-    await act(async () => {
-      progressHandler({ payload: { version: '2026.7.27-12', phase: 'progress', downloaded_bytes: 5_000_000, total_bytes: 10_000_000 } })
-    })
-    expect(container.textContent).toContain('Downloading: 50% (5.0 / 10.0 MB)')
-    await act(async () => {
-      progressHandler({ payload: { version: '2026.7.27-12', phase: 'verifying', downloaded_bytes: 10_000_000, total_bytes: 10_000_000 } })
-    })
-    expect(container.textContent).toContain('Verifying 10.0 MB...')
-    await act(async () => {
-      progressHandler({ payload: { version: '2026.7.27-12', phase: 'installing', downloaded_bytes: 10_000_000, total_bytes: 10_000_000 } })
-    })
-    expect(container.textContent).toContain('Starting installer...')
-
-    await act(async () => {
-      finishInstall({ version: '2026.7.27-12' })
-      await pendingInstall
-    })
-  })
-
-  it('ignores native progress-listener setup failures', async () => {
-    window.__TAURI_INTERNALS__ = {
-      invoke: vi.fn(async () => ({ status: 'up_to_date', current_version: '0.1.0' })),
-      listen: async () => { throw new Error('listener unavailable') },
-    }
-
-    const container = await renderUpdates()
-    await act(async () => { await Promise.resolve() })
+    expect(calls).toEqual(['listen', 'get_update_snapshot'])
+    expect(calls).not.toContain('check_for_update')
     expect(container.textContent).toContain('Up to date')
   })
 
-  it('keeps unsupported packages and update failures localized and retryable', async () => {
-    let checks = 0
-    window.__TAURI_INTERNALS__ = {
-      invoke: vi.fn(async (command: string) => {
-        if (command !== 'check_for_update') throw new Error(`unexpected command: ${command}`)
-        checks += 1
-        if (checks === 1) throw new Error('release endpoint unavailable')
-        return {
-          status: 'unsupported',
-          current_version: '0.1.0',
-          reason: 'Automatic updates require the Linux AppImage.',
-        }
-      }),
-    }
-
-    const container = await renderUpdates()
-    expect(container.textContent).toContain('Update failed: release endpoint unavailable')
-    expect(container.textContent).not.toContain('Check failed:')
-
-    await act(async () => {
-      getButton(container, 'Retry').click()
-      await Promise.resolve()
+  it('keeps a newer Ready event when delayed hydration returns Downloading', async () => {
+    const hydration = deferred<unknown>()
+    let handler: (event: TauriEvent) => void = () => undefined
+    installTauri({
+      listen: async (_event, next) => { handler = next; return () => undefined },
+      invoke: async (command) => {
+        if (command === 'get_update_snapshot') return hydration.promise
+        throw new Error(`unexpected command: ${command}`)
+      },
     })
-    expect(container.textContent).toContain('Automatic updates require the Linux AppImage.')
+    const container = await renderUpdates(false)
+    await act(async () => { handler({ payload: snapshot({ revision: 8, phase: 'ready' }) }) })
+    hydration.resolve(snapshot({ revision: 7, phase: 'downloading', operation: 'download', progress_phase: 'downloading' }))
+    await act(async () => { await hydration.promise })
+    expect(container.textContent).toContain('Update 2.0.0 is ready')
+    expect(getButton(container, 'Restart and update')).toBeInstanceOf(HTMLButtonElement)
   })
 
-  it('presents a missing updater-enabled release as informational', async () => {
-    window.__TAURI_INTERNALS__ = {
-      invoke: vi.fn(async (command: string) => {
-        if (command !== 'check_for_update') throw new Error(`unexpected command: ${command}`)
-        return {
-          status: 'unavailable',
-          current_version: '0.1.0',
-          reason: 'No published updates yet.',
-        }
-      }),
-    }
-
-    const container = await renderUpdates()
-    expect(container.textContent).toContain('No published updates yet.')
-    expect(container.textContent).not.toContain('Update failed')
-    expect(container.querySelector('[role="alert"]')).toBeNull()
-  })
-
-  it('disables an available update while application work is active', async () => {
-    window.__TAURI_INTERNALS__ = {
-      invoke: vi.fn(async (command: string) => {
-        if (command !== 'check_for_update') throw new Error(`unexpected command: ${command}`)
-        return {
-          status: 'available',
-          current_version: '0.1.0',
-          version: '2026.7.27-12',
-          notes: null,
-          install_behavior: 'install_and_restart',
-        }
-      }),
-    }
-
-    const container = await renderUpdates(true)
-    expect(getButton(container, 'Install and restart').disabled).toBe(true)
-    expect(container.textContent).toContain('Update 2026.7.27-12 available. Finish active work before installing.')
-  })
-
-  it('preserves an in-flight install when settings closes and does not check twice', async () => {
-    let finishInstall: (result: { version: string }) => void = () => undefined
-    const pendingInstall = new Promise<{ version: string }>((resolve) => { finishInstall = resolve })
+  it('manual Check exposes Available and does not automatically download', async () => {
     const invoke = vi.fn(async (command: string) => {
-      if (command === 'check_for_update') return {
-         status: 'available', current_version: '0.1.0', version: '2026.7.27-12', notes: null, install_behavior: 'install_then_restart',
-      }
-      if (command === 'install_update') return pendingInstall
+      if (command === 'get_update_snapshot') return snapshot({ phase: 'up_to_date', version: null })
+      if (command === 'check_for_update') return snapshot({ revision: 3, phase: 'available', notes: 'Details' })
       throw new Error(`unexpected command: ${command}`)
     })
-    window.__TAURI_INTERNALS__ = { invoke }
+    installTauri({ invoke })
+    const container = await renderUpdates()
+    await act(async () => { getButton(container, 'Check').click(); await Promise.resolve() })
+    expect(container.textContent).toContain('Update 2.0.0 available')
+    expect(container.querySelector('.settings-panel__update-notes')?.textContent).toBe('Details')
+    expect(invoke.mock.calls.some(([command]) => command === 'download_update')).toBe(false)
+  })
 
+  it('uses unified snapshot progress and ignores stale progress revisions', async () => {
+    let handler: (event: TauriEvent) => void = () => undefined
+    installTauri({
+      listen: async (_event, next) => { handler = next; return () => undefined },
+      invoke: async () => snapshot({ revision: 2, phase: 'downloading', operation: 'download', progress_phase: 'downloading' }),
+    })
     const container = await renderUpdates()
     await act(async () => {
-      getButton(container, 'Install update').click()
-      await Promise.resolve()
+      handler({ payload: snapshot({ revision: 4, phase: 'downloading', operation: 'download', progress_phase: 'downloading', downloaded_bytes: 5_000_000, total_bytes: 10_000_000 }) })
+      handler({ payload: snapshot({ revision: 3, phase: 'downloading', operation: 'download', progress_phase: 'downloading', downloaded_bytes: 1, total_bytes: 10_000_000 }) })
     })
-    await act(async () => {
-      getButton(container, 'Hide updates').click()
-    })
-    await act(async () => {
-      getButton(container, 'Show updates').click()
-    })
+    expect(container.textContent).toContain('Downloading: 50% (5.0 / 10.0 MB)')
+  })
 
-    expect(container.textContent).toContain('Downloading and verifying...')
-    expect(container.textContent).not.toContain('2026.7.27-12')
-    expect(invoke.mock.calls.filter(([command]) => command === 'check_for_update')).toHaveLength(1)
-
-    await act(async () => {
-      finishInstall({ version: '2026.7.27-12' })
-      await pendingInstall
+  it('keeps restart-required state through stale responses and restart failure', async () => {
+    const install = deferred<unknown>()
+    let handler: (event: TauriEvent) => void = () => undefined
+    installTauri({
+      listen: async (_event, next) => { handler = next; return () => undefined },
+      invoke: async (command) => {
+        if (command === 'get_update_snapshot') return snapshot({ revision: 2, phase: 'ready' })
+        if (command === 'install_update') return install.promise
+        if (command === 'restart_for_update') throw new Error('synthetic restart failure')
+        throw new Error(`unexpected command: ${command}`)
+      },
     })
-    expect(container.textContent).toContain('Update installed')
-    expect(container.textContent).not.toContain('2026.7.27-12')
+    const container = await renderUpdates()
+    await act(async () => { getButton(container, 'Restart and update').click(); await Promise.resolve() })
+    await act(async () => {
+      handler({ payload: snapshot({ revision: 5, phase: 'restart_required', operation: null, error: null, reason: 'Restart required.' }) })
+      install.resolve(snapshot({ revision: 4, phase: 'ready' }))
+      await install.promise
+    })
+    await act(async () => { getButton(container, 'Restart VoxGolem').click(); await Promise.resolve() })
+    expect(container.textContent).toContain('Restart failed: synthetic restart failure')
+    expect(getButton(container, 'Restart VoxGolem')).toBeInstanceOf(HTMLButtonElement)
+  })
+
+  it('offers phase-aware retry while retaining the available update', async () => {
+    const invoke = vi.fn(async (command: string) => {
+      if (command === 'get_update_snapshot') return snapshot({ phase: 'available', error: 'offline' })
+      if (command === 'download_update') return snapshot({ revision: 3, phase: 'ready', error: null })
+      throw new Error(`unexpected command: ${command}`)
+    })
+    installTauri({ invoke })
+    const container = await renderUpdates()
+    expect(container.textContent).toContain('Update failed: offline')
+    await act(async () => { getButton(container, 'Retry').click(); await Promise.resolve() })
+    expect(invoke).toHaveBeenCalledWith('download_update', undefined)
+    expect(container.textContent).toContain('Update 2.0.0 is ready')
+  })
+
+  it('Later discards ready state and the preference commits only on successful persistence', async () => {
+    let saveAttempts = 0
+    const invoke = vi.fn(async (command: string, args?: unknown) => {
+      if (command === 'get_update_snapshot') return snapshot({ phase: 'ready' })
+      if (command === 'discard_update') return snapshot({ revision: 3, phase: 'idle', version: null, notes: null })
+      if (command === 'set_auto_update_download') {
+        saveAttempts += 1
+        if (saveAttempts === 1) throw new Error('disk unavailable')
+        expect(args).toEqual({ enabled: false })
+        return snapshot({ revision: 4, phase: 'idle', version: null, auto_download_enabled: false })
+      }
+      throw new Error(`unexpected command: ${command}`)
+    })
+    installTauri({ invoke })
+    const container = await renderUpdates()
+    await act(async () => { getButton(container, 'Later').click(); await Promise.resolve() })
+    expect(getButton(container, 'Check')).toBeInstanceOf(HTMLButtonElement)
+    const checkbox = getCheckbox(container)
+    await act(async () => { checkbox.click(); await Promise.resolve() })
+    expect(checkbox.checked).toBe(true)
+    expect(container.textContent).toContain('disk unavailable')
+    await act(async () => { getButton(container, 'Retry saving').click(); await Promise.resolve() })
+    expect(checkbox.checked).toBe(false)
+  })
+
+  it('renders update notes as plain text, including empty and long strings', async () => {
+    const notes = `${'x'.repeat(5_000)}<b>literal</b>`
+    installTauri({ invoke: async () => snapshot({ phase: 'ready', notes }) })
+    const container = await renderUpdates()
+    expect(container.querySelector('.settings-panel__update-notes')?.textContent).toBe(notes)
+    expect(container.querySelector('.settings-panel__update-notes b')).toBeNull()
   })
 })
 
-async function renderUpdates(installationDisabled = false): Promise<HTMLElement> {
+function installTauri(overrides: Partial<NonNullable<typeof window.__TAURI_INTERNALS__>>): void {
+  window.__TAURI_INTERNALS__ = {
+    invoke: async (command) => {
+      if (command === 'get_update_snapshot') return snapshot()
+      throw new Error(`unexpected command: ${command}`)
+    },
+    listen: async () => () => undefined,
+    ...overrides,
+  }
+}
+
+function snapshot(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    revision: 2,
+    phase: 'available',
+    operation: null,
+    current_version: '1.0.0',
+    version: '2.0.0',
+    notes: null,
+    progress_phase: null,
+    downloaded_bytes: 0,
+    total_bytes: null,
+    error: null,
+    reason: null,
+    auto_download_enabled: true,
+    ...overrides,
+  }
+}
+
+async function renderUpdates(waitForHydration = true): Promise<HTMLElement> {
   const container = document.createElement('div')
   document.body.append(container)
   containers.push(container)
   const root = createRoot(container)
   roots.push(root)
   await act(async () => {
-    root.render(<UpdateTestHost installationDisabled={installationDisabled} />)
-    await Promise.resolve()
+    root.render(<UpdateHost />)
+    if (waitForHydration) {
+      await Promise.resolve()
+      await Promise.resolve()
+    }
   })
   return container
 }
 
-function UpdateTestHost({ installationDisabled }: { readonly installationDisabled: boolean }): JSX.Element {
-  const updates = useAppUpdates()
-  const [visible, setVisible] = useState(true)
-  return (
-    <div>
-      <button type="button" onClick={() => setVisible(false)}>Hide updates</button>
-      <button type="button" onClick={() => setVisible(true)}>Show updates</button>
-      {visible ? <UpdateSettings updates={updates} installationDisabled={installationDisabled} /> : null}
-    </div>
-  )
+function UpdateHost() {
+  return <UpdateSettings updates={useAppUpdates()} />
 }
 
 function getButton(container: HTMLElement, name: string): HTMLButtonElement {
   const button = Array.from(container.querySelectorAll('button')).find((candidate) => candidate.textContent === name)
-  if (!(button instanceof HTMLButtonElement)) throw new Error(`button not found: ${name}`)
+  if (!(button instanceof HTMLButtonElement)) throw new Error(`button not found: ${name}; ${container.textContent}`)
   return button
+}
+
+function getCheckbox(container: HTMLElement): HTMLInputElement {
+  const checkbox = container.querySelector<HTMLInputElement>('input[type="checkbox"]')
+  if (checkbox === null) throw new Error('checkbox not found')
+  return checkbox
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise })
+  return { promise, resolve }
 }

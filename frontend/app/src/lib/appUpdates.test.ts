@@ -1,75 +1,53 @@
 import { describe, expect, it } from 'vitest'
-import { parseUpdateCheckResult, parseUpdateProgress } from './appUpdates'
+import { parseUpdateSnapshot, retryOperation, selectFreshSnapshot } from './appUpdates'
+import type { UpdateSnapshot } from './appUpdates'
 
-describe('parseUpdateCheckResult', () => {
-  it('accepts an available signed update', () => {
-    expect(parseUpdateCheckResult({
-      status: 'available',
-      current_version: '0.1.0',
-      version: '2026.7.27-12',
-       notes: 'Safer updates',
-       install_behavior: 'install_then_restart',
-    })).toEqual({
-      status: 'available',
-      currentVersion: '0.1.0',
-      version: '2026.7.27-12',
-       notes: 'Safer updates',
-       installBehavior: 'install_then_restart',
-    })
+describe('app update snapshots', () => {
+  it('parses a complete native snapshot including empty and long plain-text notes', () => {
+    const notes = `\n${'x'.repeat(10_000)}<b>literal</b>`
+    expect(parseUpdateSnapshot(nativeSnapshot({ notes }))).toMatchObject({ revision: 4, phase: 'available', notes })
+    expect(parseUpdateSnapshot(nativeSnapshot({ notes: '' })).notes).toBe('')
   })
 
-  it('accepts up-to-date, unavailable, and unsupported results', () => {
-    expect(parseUpdateCheckResult({
-      status: 'up_to_date',
-      current_version: '2026.7.27-12',
-    })).toEqual({ status: 'up_to_date', currentVersion: '2026.7.27-12' })
-
-    expect(parseUpdateCheckResult({
-      status: 'unavailable',
-      current_version: '0.1.0',
-      reason: 'No updater-enabled release is published yet.',
-    })).toEqual({
-      status: 'unavailable',
-      currentVersion: '0.1.0',
-      reason: 'No updater-enabled release is published yet.',
-    })
-
-    expect(parseUpdateCheckResult({
-      status: 'unsupported',
-      current_version: '0.1.0',
-      reason: 'Install the AppImage to enable updates.',
-    })).toEqual({
-      status: 'unsupported',
-      currentVersion: '0.1.0',
-      reason: 'Install the AppImage to enable updates.',
-    })
+  it('rejects malformed revisions and inconsistent progress', () => {
+    expect(() => parseUpdateSnapshot(nativeSnapshot({ revision: -1 }))).toThrow('Invalid update snapshot payload')
+    expect(() => parseUpdateSnapshot(nativeSnapshot({ downloaded_bytes: 11, total_bytes: 10 }))).toThrow()
   })
 
-  it('accepts process-wide installing and installed snapshots', () => {
-    expect(parseUpdateCheckResult({
-       status: 'installing', current_version: '0.1.0', version: '2026.7.27-12', install_behavior: 'install_then_restart',
-    })).toEqual({ status: 'installing', currentVersion: '0.1.0', version: '2026.7.27-12', installBehavior: 'install_then_restart' })
-    expect(parseUpdateCheckResult({
-       status: 'installed', current_version: '0.1.0', version: '2026.7.27-12', install_behavior: 'install_then_restart',
-    })).toEqual({ status: 'installed', currentVersion: '0.1.0', version: '2026.7.27-12', installBehavior: 'install_then_restart' })
+  it('orders event and IPC snapshots by native revision', () => {
+    const ready = parsed({ revision: 8, phase: 'ready' })
+    const stale = parsed({ revision: 7, phase: 'downloading', operation: 'download' })
+    expect(selectFreshSnapshot(ready, stale)).toBe(ready)
+    expect(selectFreshSnapshot(stale, ready)).toBe(ready)
+    expect(selectFreshSnapshot(ready, parsed({ revision: 8, phase: 'downloading' }))).toBe(ready)
   })
 
-  it('rejects malformed or oversized updater payloads', () => {
-    expect(() => parseUpdateCheckResult({ status: 'available', version: '2.0.0' })).toThrow(
-      'Invalid update check payload',
-    )
-    expect(() => parseUpdateCheckResult({
-      status: 'unsupported',
-      current_version: '0.1.0',
-      reason: 'x'.repeat(2_049),
-    })).toThrow('Invalid update check payload')
-  })
-
-  it('parses bounded progress and rejects unsafe or inconsistent values', () => {
-    expect(parseUpdateProgress({ version: '2.0.0', phase: 'progress', downloaded_bytes: 10, total_bytes: 20 })).toEqual({ version: '2.0.0', phase: 'progress', downloadedBytes: 10, totalBytes: 20 })
-    expect(parseUpdateProgress({ version: '2.0.0', phase: 'started', downloaded_bytes: 10 })).toEqual({ version: '2.0.0', phase: 'started', downloadedBytes: 10 })
-    expect(parseUpdateProgress({ version: '2.0.0', phase: 'progress', downloaded_bytes: 10, total_bytes: null })).toEqual({ version: '2.0.0', phase: 'progress', downloadedBytes: 10 })
-    expect(() => parseUpdateProgress({ version: '2.0.0', phase: 'progress', downloaded_bytes: 21, total_bytes: 20 })).toThrow()
-    expect(() => parseUpdateProgress({ version: '2.0.0', phase: 'progress', downloaded_bytes: Number.MAX_SAFE_INTEGER + 1 })).toThrow()
+  it('retries according to the retained native phase', () => {
+    expect(retryOperation(parsed({ phase: 'available' }))).toBe('download')
+    expect(retryOperation(parsed({ phase: 'ready' }))).toBe('install')
+    expect(retryOperation(parsed({ phase: 'idle' }))).toBe('check')
+    expect(retryOperation(parsed({ phase: 'unavailable', reason: 'No release yet', version: null }))).toBe('check')
   })
 })
+
+function parsed(overrides: Record<string, unknown>): UpdateSnapshot {
+  return parseUpdateSnapshot(nativeSnapshot(overrides))
+}
+
+function nativeSnapshot(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    revision: 4,
+    phase: 'available',
+    operation: null,
+    current_version: '1.0.0',
+    version: '2.0.0',
+    notes: null,
+    progress_phase: null,
+    downloaded_bytes: 0,
+    total_bytes: null,
+    error: null,
+    reason: null,
+    auto_download_enabled: true,
+    ...overrides,
+  }
+}
