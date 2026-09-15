@@ -850,11 +850,7 @@ describe('App', () => {
       invoke: async (command, args) => {
         if (command === 'get_startup_state') return readyStartupState({ prompt_cancellation_available: true, tts_enabled: false })
         if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
-        if (command === 'check_for_update') {
-          return {
-            status: 'available', current_version: '2026.7.27-1', version: '2026.7.28-1', notes: null, install_behavior: 'install_and_restart',
-          }
-        }
+        if (command === 'get_update_snapshot') return updateSnapshot({ phase: 'ready' })
         if (command === 'set_tts_enabled') return { enabled: true }
         if (command === 'submit_prompt') { requestId = (args as { requestId: string }).requestId; return new Promise((resolve) => { finishPrompt = resolve }) }
         if (command === 'reserve_local_tts_playback_id') return 73
@@ -874,7 +870,7 @@ describe('App', () => {
       await Promise.resolve()
     })
     await act(async () => { getButtonByLabel(container, 'Settings').click(); await Promise.resolve() })
-    const install = getButtonByText(container, 'Install and restart')
+    const install = getButtonByText(container, 'Restart and update')
     expect(install.disabled).toBe(true)
     await act(async () => { finishSpeech?.({ duration_ms: 1 }); await Promise.resolve() })
     expect(install.disabled).toBe(false)
@@ -927,15 +923,7 @@ describe('App', () => {
       invoke: async (command, args) => {
         if (command === 'get_startup_state') return readyStartupState({ tts_enabled: true })
         if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
-        if (command === 'check_for_update') {
-          return {
-            status: 'available',
-            current_version: '2026.7.27-1',
-            version: '2026.7.28-1',
-            notes: null,
-            install_behavior: 'install_and_restart',
-          }
-        }
+        if (command === 'get_update_snapshot') return updateSnapshot({ phase: 'ready' })
         if (command === 'submit_prompt') {
           const requestId = (args as { requestId: string }).requestId
           promptEventHandler?.({ payload: { request_id: requestId, kind: 'text', text: 'Spoken response' } })
@@ -953,7 +941,7 @@ describe('App', () => {
     const { container } = await renderApp()
     await act(async () => { setTextAreaValue(getComposer(container), 'Speak'); getSendButton(container).click(); await Promise.resolve() })
     await act(async () => { getButtonByLabel(container, 'Settings').click(); await Promise.resolve() })
-    const install = getButtonByText(container, 'Install and restart')
+    const install = getButtonByText(container, 'Restart and update')
     expect(resolveSynthesis).toBeDefined()
     expect(install.disabled).toBe(true)
 
@@ -962,6 +950,48 @@ describe('App', () => {
       await Promise.resolve()
     })
     expect(install.disabled).toBe(false)
+  })
+
+  it('disables normal runtime controls while update installation owns the lifecycle', async () => {
+    let updateStateHandler: ((event: { payload: unknown }) => void) | undefined
+    window.__TAURI_INTERNALS__ = {
+      listen: async (event, handler) => {
+        if (event === 'app-update-state') updateStateHandler = handler
+        return () => undefined
+      },
+      invoke: async (command) => {
+        if (command === 'get_startup_state') return readyStartupState({ tts_enabled: false })
+        if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
+        if (command === 'get_update_snapshot') return updateSnapshot({ phase: 'up_to_date', version: null })
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const { container } = await renderApp()
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      setTextAreaValue(getComposer(container), 'Do not submit during installation')
+    })
+    expect(getSendButton(container).disabled).toBe(false)
+
+    await act(async () => {
+      updateStateHandler?.({
+        payload: {
+          ...updateSnapshot({
+            revision: 3,
+            phase: 'restart_required',
+            reason: 'Restart to finish the update.',
+          }),
+        },
+      })
+      await Promise.resolve()
+    })
+
+    expect(getSendButton(container).disabled).toBe(true)
+    const microphoneControl = Array.from(container.querySelectorAll<HTMLButtonElement>('button'))
+      .find((button) => button.textContent === 'Start mic' || button.textContent === 'Stop mic')
+    expect(microphoneControl?.disabled).toBe(true)
+    expect(getTtsToggle(container).disabled).toBe(true)
   })
 
   it('renders response profile dropdown from startup state', async () => {
@@ -5036,8 +5066,28 @@ function nonDiagnosticCommands(commands: readonly string[]): readonly string[] {
       command !== 'set_ui_theme' &&
       command !== 'get_assistant_settings' &&
       command !== 'set_assistant_settings' &&
+      command !== 'set_auto_update_download' &&
+      command !== 'get_update_snapshot' &&
       command !== 'check_for_update',
   )
+}
+
+function updateSnapshot(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    revision: 2,
+    phase: 'up_to_date',
+    operation: null,
+    current_version: '2026.7.27-1',
+    version: '2026.7.28-1',
+    notes: null,
+    progress_phase: null,
+    downloaded_bytes: 0,
+    total_bytes: null,
+    error: null,
+    reason: null,
+    auto_download_enabled: true,
+    ...overrides,
+  }
 }
 
 function setTextAreaValue(textArea: HTMLTextAreaElement, value: string): void {

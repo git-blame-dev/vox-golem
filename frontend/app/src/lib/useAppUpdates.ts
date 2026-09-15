@@ -1,125 +1,176 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { checkForUpdate, installUpdate, parseUpdateProgress, restartForUpdate } from './appUpdates'
-import type { InstallBehavior, UpdateCheckResult, UpdateProgress } from './appUpdates'
+import {
+  checkForUpdate,
+  discardUpdate,
+  downloadUpdate,
+  getUpdateSnapshot,
+  installUpdate,
+  parseUpdateSnapshot,
+  restartForUpdate,
+  retryOperation,
+  selectFreshSnapshot,
+  setAutoUpdateDownload,
+} from './appUpdates'
+import type { UpdateSnapshot } from './appUpdates'
 import { getTauriInternals } from './tauri'
 
 export type UpdateState =
-  | { readonly kind: 'checking' }
-  | { readonly kind: 'result'; readonly result: UpdateCheckResult }
-  | { readonly kind: 'installing'; readonly version: string; readonly progress?: UpdateProgress }
-  | { readonly kind: 'installed'; readonly version: string; readonly installBehavior: 'install_then_restart' | 'install_and_restart' }
-  | { readonly kind: 'error'; readonly message: string }
+  | { readonly kind: 'loading' }
+  | { readonly kind: 'snapshot'; readonly snapshot: UpdateSnapshot }
   | { readonly kind: 'browser' }
 
 export interface AppUpdateController {
   readonly state: UpdateState
   readonly check: () => Promise<void>
-  readonly install: (version: string, installBehavior?: InstallBehavior) => Promise<void>
+  readonly download: () => Promise<void>
+  readonly install: () => Promise<void>
+  readonly later: () => Promise<void>
   readonly restart: () => Promise<void>
-  readonly progress: UpdateProgress | undefined
-  readonly restartPending: boolean
+  readonly actionPending: boolean
+  readonly actionError: string | null
+  readonly autoDownloadSaving: boolean
+  readonly autoDownloadError: string | null
+  readonly setAutoDownloadEnabled: (enabled: boolean) => Promise<void>
+  readonly retryAutoDownloadSave: () => Promise<void>
 }
 
 export function useAppUpdates(): AppUpdateController {
   const [state, setState] = useState<UpdateState>(() =>
-    getTauriInternals() === null ? { kind: 'browser' } : { kind: 'checking' },
+    getTauriInternals() === null ? { kind: 'browser' } : { kind: 'loading' },
   )
-  const requestRevision = useRef(0)
-  const activeVersion = useRef<string | undefined>(undefined)
-  const operationInFlight = useRef<'install' | 'restart' | undefined>(undefined)
-  const [progress, setProgress] = useState<UpdateProgress | undefined>()
-  const [restartPending, setRestartPending] = useState(false)
+  const snapshotRef = useRef<UpdateSnapshot | null>(null)
+  const operationInFlight = useRef(false)
+  const [actionPending, setActionPending] = useState(false)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const [autoDownloadSaving, setAutoDownloadSaving] = useState(false)
+  const [autoDownloadError, setAutoDownloadError] = useState<string | null>(null)
+  const desiredAutoDownload = useRef(true)
+  const preferenceWriteInFlight = useRef(false)
 
-  const loadUpdate = useCallback(async (revision: number): Promise<void> => {
-    try {
-      const result = await checkForUpdate()
-       if (revision === requestRevision.current) {
-         activeVersion.current = stateVersion({ kind: 'result', result })
-         setState({ kind: 'result', result })
-       }
-    } catch (error) {
-      if (revision === requestRevision.current) {
-        setState({ kind: 'error', message: displayError(error) })
-      }
-    }
-  }, [])
-
-  const check = useCallback(async (): Promise<void> => {
-    const revision = ++requestRevision.current
-    setState({ kind: 'checking' })
-    setProgress(undefined)
-    await loadUpdate(revision)
-  }, [loadUpdate])
-
-  useEffect(() => {
-    if (getTauriInternals() === null) return
-    const revision = ++requestRevision.current
-    void loadUpdate(revision)
-    return () => { requestRevision.current += 1 }
-  }, [loadUpdate])
-
-  const install = useCallback(async (version: string, installBehavior: InstallBehavior = 'install_then_restart'): Promise<void> => {
-    if (operationInFlight.current !== undefined) return
-    operationInFlight.current = 'install'
-    const revision = ++requestRevision.current
-    setState({ kind: 'installing', version })
-    activeVersion.current = version
-    setProgress(undefined)
-    try {
-      const installedVersion = await installUpdate()
-      if (revision === requestRevision.current) {
-        setProgress(undefined)
-        setState({ kind: 'installed', version: installedVersion, installBehavior })
-      }
-    } catch (error) {
-      if (revision === requestRevision.current) {
-        setState({ kind: 'error', message: displayError(error) })
-        setProgress(undefined)
-      }
-    } finally {
-      if (operationInFlight.current === 'install') operationInFlight.current = undefined
-    }
-  }, [])
-
-  const restart = useCallback(async (): Promise<void> => {
-    if (operationInFlight.current !== undefined) return
-    operationInFlight.current = 'restart'
-    setRestartPending(true)
-    try {
-      await restartForUpdate()
-    } catch (error) {
-      setState({ kind: 'error', message: displayError(error) })
-    } finally {
-      if (operationInFlight.current === 'restart') operationInFlight.current = undefined
-      setRestartPending(false)
+  const acceptSnapshot = useCallback((incoming: UpdateSnapshot): void => {
+    const selected = selectFreshSnapshot(snapshotRef.current, incoming)
+    if (selected !== snapshotRef.current) {
+      if (snapshotRef.current === null) desiredAutoDownload.current = selected.autoDownloadEnabled
+      snapshotRef.current = selected
+      setState({ kind: 'snapshot', snapshot: selected })
+      setActionError(null)
     }
   }, [])
 
   useEffect(() => {
     const tauri = getTauriInternals()
-    if (!tauri?.listen) return
+    if (tauri === null) return
     let active = true
     let unlisten: (() => void) | undefined
-    void tauri.listen('app-update-progress', (event) => {
-      if (!active) return
+    const hydrate = async (): Promise<void> => {
+      if (tauri.listen) {
+        try {
+          const dispose = await tauri.listen('app-update-state', (event) => {
+            if (!active) return
+            try { acceptSnapshot(parseUpdateSnapshot(event.payload)) } catch { /* Ignore malformed native events. */ }
+          })
+          if (!active) {
+            dispose()
+            return
+          }
+          unlisten = dispose
+        } catch {
+          // Hydration still provides a useful read-only state if events are unavailable.
+        }
+      }
       try {
-        const next = parseUpdateProgress(event.payload)
-        setProgress((current) => activeVersion.current === next.version ? next : current)
-      } catch { /* Ignore malformed native events. */ }
-    }).then((dispose) => { if (active) unlisten = dispose; else dispose() }).catch(() => undefined)
-    return () => { active = false; unlisten?.() }
+        const initial = await getUpdateSnapshot()
+        if (active) acceptSnapshot(initial)
+      } catch (error) {
+        if (active) setActionError(displayError(error))
+      }
+    }
+    void hydrate()
+    return () => {
+      active = false
+      unlisten?.()
+    }
+  }, [acceptSnapshot])
+
+  const runSnapshotCommand = useCallback(async (command: () => Promise<UpdateSnapshot>): Promise<void> => {
+    if (operationInFlight.current) return
+    operationInFlight.current = true
+    setActionPending(true)
+    setActionError(null)
+    try {
+      acceptSnapshot(await command())
+    } catch (error) {
+      setActionError(displayError(error))
+    } finally {
+      operationInFlight.current = false
+      setActionPending(false)
+    }
+  }, [acceptSnapshot])
+
+  const check = useCallback(() => runSnapshotCommand(checkForUpdate), [runSnapshotCommand])
+  const download = useCallback(() => runSnapshotCommand(downloadUpdate), [runSnapshotCommand])
+  const install = useCallback(() => runSnapshotCommand(installUpdate), [runSnapshotCommand])
+  const later = useCallback(() => runSnapshotCommand(discardUpdate), [runSnapshotCommand])
+
+  const restart = useCallback(async (): Promise<void> => {
+    if (operationInFlight.current) return
+    operationInFlight.current = true
+    setActionPending(true)
+    setActionError(null)
+    try {
+      await restartForUpdate()
+    } catch (error) {
+      setActionError(`Restart failed: ${displayError(error)}`)
+    } finally {
+      operationInFlight.current = false
+      setActionPending(false)
+    }
   }, [])
 
-  const displayedState: UpdateState = state.kind === 'installing' && progress
-    ? { ...state, progress }
-    : state
-  return { state: displayedState, check, install, restart, progress, restartPending }
+  const setAutoDownloadEnabled = useCallback(async (enabled: boolean): Promise<void> => {
+    if (preferenceWriteInFlight.current) return
+    preferenceWriteInFlight.current = true
+    desiredAutoDownload.current = enabled
+    setAutoDownloadSaving(true)
+    setAutoDownloadError(null)
+    try {
+      acceptSnapshot(await setAutoUpdateDownload(enabled))
+    } catch (error) {
+      setAutoDownloadError(`Automatic update preference was not saved: ${displayError(error)}`)
+    } finally {
+      preferenceWriteInFlight.current = false
+      setAutoDownloadSaving(false)
+    }
+  }, [acceptSnapshot])
+
+  const retryAutoDownloadSave = useCallback(
+    () => setAutoDownloadEnabled(desiredAutoDownload.current),
+    [setAutoDownloadEnabled],
+  )
+
+  return {
+    state,
+    check,
+    download,
+    install,
+    later,
+    restart,
+    actionPending,
+    actionError,
+    autoDownloadSaving,
+    autoDownloadError,
+    setAutoDownloadEnabled,
+    retryAutoDownloadSave,
+  }
 }
 
-function stateVersion(state: UpdateState): string | undefined {
-  if (state.kind === 'installing' || state.kind === 'installed') return state.version
-  if (state.kind === 'result' && (state.result.status === 'available' || state.result.status === 'installing' || state.result.status === 'installed')) return state.result.version
-  return undefined
+export function retryCurrentOperation(updates: AppUpdateController): Promise<void> {
+  if (updates.state.kind !== 'snapshot') return updates.check()
+  switch (retryOperation(updates.state.snapshot)) {
+    case 'download': return updates.download()
+    case 'install': return updates.install()
+    case 'check': return updates.check()
+  }
 }
 
 function displayError(error: unknown): string {

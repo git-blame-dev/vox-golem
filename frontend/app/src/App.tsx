@@ -25,6 +25,7 @@ import {
 } from './lib/startupState'
 import { getTauriInternals, invokeTauriCommand } from './lib/tauri'
 import { useAppUpdates } from './lib/useAppUpdates'
+import type { UpdateState } from './lib/useAppUpdates'
 import { DEFAULT_ASSISTANT_SETTINGS, deepOptions, instantOptions, parseAssistantSettings, reviewOptions, serializeAssistantSettings } from './lib/assistantSettings'
 import type { AssistantSettings } from './lib/assistantSettings'
 import { acceptsPartialTranscriptionEvent, parsePartialTranscriptionEvent } from './lib/partialTranscription'
@@ -119,8 +120,16 @@ type RuntimeDiagnosticKind =
   | 'audio'
   | 'profile'
 
+function appUpdateBlocksRuntime(state: UpdateState): boolean {
+  return state.kind === 'snapshot' && (
+    state.snapshot.phase === 'installing' ||
+    state.snapshot.phase === 'restart_required'
+  )
+}
+
 function App() {
   const appUpdates = useAppUpdates()
+  const updateRuntimeBlocked = appUpdateBlocksRuntime(appUpdates.state)
   const [startupState, setStartupState] = useState<StartupState>({ kind: 'loading' })
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus>('initializing')
   const [composerValue, setComposerValue] = useState('')
@@ -735,8 +744,9 @@ function App() {
       !resetPending &&
       promptState === 'idle' &&
       runtimeStatus === 'sleeping' &&
+      !updateRuntimeBlocked &&
       composerValue.trim().length > 0,
-    [assistantSettingsPending, composerValue, promptState, resetPending, runtimeStatus, selectedInstantOption?.available, selectedInstantProfileReady, startupState.kind],
+    [assistantSettingsPending, composerValue, promptState, resetPending, runtimeStatus, selectedInstantOption?.available, selectedInstantProfileReady, startupState.kind, updateRuntimeBlocked],
   )
   const updateInstallationDisabled =
     startupState.kind !== 'ready' ||
@@ -749,7 +759,7 @@ function App() {
     ttsPlaying ||
     pendingTtsCommands > 0
 
-  const canToggleMic = voiceInputReady(startupState) && !micStarting
+  const canToggleMic = voiceInputReady(startupState) && !micStarting && !updateRuntimeBlocked
   const voiceInputUnavailableReason = startupState.kind === 'ready'
     ? (startupState.voiceInputError ?? (startupState.capabilities
       .filter((capability) => ['wake_word', 'vad', 'parakeet'].includes(capability.id) && capability.state !== 'available')
@@ -761,8 +771,8 @@ function App() {
       ? startupState.cueAssetPaths
       : DEFAULT_CUE_ASSET_PATHS
   const canToggleTts = startupState.kind === 'ready' &&
-    capabilityIsAvailable(startupState, 'tts') && !isSwitchingResponseProfile
-  const assistantControlsDisabled = startupState.kind !== 'ready' || assistantSettingsPending || isSwitchingResponseProfile
+    capabilityIsAvailable(startupState, 'tts') && !isSwitchingResponseProfile && !updateRuntimeBlocked
+  const assistantControlsDisabled = startupState.kind !== 'ready' || assistantSettingsPending || isSwitchingResponseProfile || updateRuntimeBlocked
   const persistAssistantSettings = async (next: AssistantSettings): Promise<boolean> => {
     const revision = ++assistantSettingsWriteRevisionRef.current
     assistantSettingsPendingRef.current = true
@@ -1543,7 +1553,7 @@ function App() {
   }
 
   const startMic = async (): Promise<void> => {
-    if (!voiceInputReady(startupStateRef.current) || liveAudioSourceRef.current !== null || micStarting || micStartInFlightRef.current) {
+    if (updateRuntimeBlocked || !voiceInputReady(startupStateRef.current) || liveAudioSourceRef.current !== null || micStarting || micStartInFlightRef.current) {
       return
     }
     micStartInFlightRef.current = true
@@ -1903,10 +1913,10 @@ function App() {
     micAutoStartedRef.current = true
     void startMic()
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [micActive, micStarting, startupState])
+  }, [micActive, micStarting, startupState, updateRuntimeBlocked])
 
   const sendPrompt = async (): Promise<void> => {
-    if (startupState.kind !== 'ready' || selectedInstantOption?.available !== true || assistantSettingsPending || isSwitchingResponseProfileRef.current || resetPendingRef.current || promptState !== 'idle' || runtimeStatusRef.current !== 'sleeping') {
+    if (updateRuntimeBlocked || startupState.kind !== 'ready' || selectedInstantOption?.available !== true || assistantSettingsPending || isSwitchingResponseProfileRef.current || resetPendingRef.current || promptState !== 'idle' || runtimeStatusRef.current !== 'sleeping') {
       return
     }
 
@@ -2065,7 +2075,7 @@ function App() {
                 ×
               </button>
             </div>
-            <button type="button" className="shell__control" onClick={() => void resetSession()} aria-label="Reset Session" disabled={resetPending}>{resetPending ? 'Resetting...' : 'Reset Session'}</button>
+            <button type="button" className="shell__control" onClick={() => void resetSession()} aria-label="Reset Session" disabled={resetPending || updateRuntimeBlocked}>{resetPending ? 'Resetting...' : 'Reset Session'}</button>
             <div className="settings-panel__row">
               <div>
                 <strong>Text size</strong>
@@ -2104,7 +2114,7 @@ function App() {
                 id="audioInputDevice"
                 aria-label="Microphone"
                 value={audioInputDeviceId ?? ''}
-                disabled={micStarting}
+                disabled={micStarting || updateRuntimeBlocked}
                 onChange={(event) => changeAudioInputDevice(event.target.value)}
               >
                 <option value="">System selected microphone</option>
@@ -2210,7 +2220,7 @@ function App() {
               type="checkbox"
               checked={autoStopOnSilence}
               onChange={(event) => setAutoStopOnSilence(event.target.checked)}
-              disabled={!voiceInputReady(startupState)}
+              disabled={!voiceInputReady(startupState) || updateRuntimeBlocked}
               aria-describedby={!voiceInputReady(startupState) ? 'voice-input-help' : undefined}
             />
              <span>Auto Stop</span>
@@ -2247,7 +2257,7 @@ function App() {
                 type="button"
                 className="shell__control"
                 onClick={cancelPrompt}
-                disabled={promptState === 'stopping'}
+                disabled={promptState === 'stopping' || updateRuntimeBlocked}
               >
                 {promptState === 'stopping' ? 'Stopping…' : 'Stop'}
               </button>
