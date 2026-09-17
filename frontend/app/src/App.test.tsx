@@ -5086,6 +5086,7 @@ function updateSnapshot(overrides: Record<string, unknown> = {}): Record<string,
     error: null,
     reason: null,
     auto_download_enabled: true,
+    auto_install_enabled: true,
     ...overrides,
   }
 }

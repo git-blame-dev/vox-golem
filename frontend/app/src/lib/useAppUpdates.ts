@@ -10,6 +10,7 @@ import {
   retryOperation,
   selectFreshSnapshot,
   setAutoUpdateDownload,
+  setAutoUpdateInstall,
 } from './appUpdates'
 import type { UpdateSnapshot } from './appUpdates'
 import { getTauriInternals } from './tauri'
@@ -32,6 +33,10 @@ export interface AppUpdateController {
   readonly autoDownloadError: string | null
   readonly setAutoDownloadEnabled: (enabled: boolean) => Promise<void>
   readonly retryAutoDownloadSave: () => Promise<void>
+  readonly autoInstallSaving: boolean
+  readonly autoInstallError: string | null
+  readonly setAutoInstallEnabled: (enabled: boolean) => Promise<void>
+  readonly retryAutoInstallSave: () => Promise<void>
 }
 
 export function useAppUpdates(): AppUpdateController {
@@ -46,11 +51,18 @@ export function useAppUpdates(): AppUpdateController {
   const [autoDownloadError, setAutoDownloadError] = useState<string | null>(null)
   const desiredAutoDownload = useRef(true)
   const preferenceWriteInFlight = useRef(false)
+  const [autoInstallSaving, setAutoInstallSaving] = useState(false)
+  const [autoInstallError, setAutoInstallError] = useState<string | null>(null)
+  const desiredAutoInstall = useRef(true)
+  const installPreferenceWriteInFlight = useRef(false)
 
   const acceptSnapshot = useCallback((incoming: UpdateSnapshot): void => {
     const selected = selectFreshSnapshot(snapshotRef.current, incoming)
     if (selected !== snapshotRef.current) {
-      if (snapshotRef.current === null) desiredAutoDownload.current = selected.autoDownloadEnabled
+      if (snapshotRef.current === null) {
+        desiredAutoDownload.current = selected.autoDownloadEnabled
+        desiredAutoInstall.current = selected.autoInstallEnabled
+      }
       snapshotRef.current = selected
       setState({ kind: 'snapshot', snapshot: selected })
       setActionError(null)
@@ -148,6 +160,27 @@ export function useAppUpdates(): AppUpdateController {
     [setAutoDownloadEnabled],
   )
 
+  const setAutoInstallEnabled = useCallback(async (enabled: boolean): Promise<void> => {
+    if (installPreferenceWriteInFlight.current) return
+    installPreferenceWriteInFlight.current = true
+    desiredAutoInstall.current = enabled
+    setAutoInstallSaving(true)
+    setAutoInstallError(null)
+    try {
+      acceptSnapshot(await setAutoUpdateInstall(enabled))
+    } catch (error) {
+      setAutoInstallError(`Automatic install preference was not saved: ${displayError(error)}`)
+    } finally {
+      installPreferenceWriteInFlight.current = false
+      setAutoInstallSaving(false)
+    }
+  }, [acceptSnapshot])
+
+  const retryAutoInstallSave = useCallback(
+    () => setAutoInstallEnabled(desiredAutoInstall.current),
+    [setAutoInstallEnabled],
+  )
+
   return {
     state,
     check,
@@ -161,6 +194,10 @@ export function useAppUpdates(): AppUpdateController {
     autoDownloadError,
     setAutoDownloadEnabled,
     retryAutoDownloadSave,
+    autoInstallSaving,
+    autoInstallError,
+    setAutoInstallEnabled,
+    retryAutoInstallSave,
   }
 }
 

@@ -23,11 +23,29 @@ export function UpdateSettings({ updates, installationDisabled = false }: Update
         />
         Download updates automatically
       </label>
+      <label className="settings-panel__update-toggle">
+        <input
+          type="checkbox"
+          checked={snapshot?.autoInstallEnabled ?? true}
+          disabled={updates.autoInstallSaving || snapshot === null}
+          onChange={(event) => void updates.setAutoInstallEnabled(event.currentTarget.checked)}
+        />
+        Install downloaded updates automatically
+      </label>
       {updates.autoDownloadSaving ? <p role="status">Saving automatic update preference...</p> : null}
       {updates.autoDownloadError !== null ? (
         <div className="settings-panel__update-preference-error" role="alert">
           <p>{updates.autoDownloadError}</p>
           <button type="button" className="shell__control" disabled={updates.autoDownloadSaving} onClick={() => void updates.retryAutoDownloadSave()}>
+            Retry saving
+          </button>
+        </div>
+      ) : null}
+      {updates.autoInstallSaving ? <p role="status">Saving automatic install preference...</p> : null}
+      {updates.autoInstallError !== null ? (
+        <div className="settings-panel__update-preference-error" role="alert">
+          <p>{updates.autoInstallError}</p>
+          <button type="button" className="shell__control" disabled={updates.autoInstallSaving} onClick={() => void updates.retryAutoInstallSave()}>
             Retry saving
           </button>
         </div>

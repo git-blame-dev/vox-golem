@@ -134,12 +134,34 @@ describe('UpdateSettings revisioned native state', () => {
     const container = await renderUpdates()
     await act(async () => { getButton(container, 'Later').click(); await Promise.resolve() })
     expect(getButton(container, 'Check')).toBeInstanceOf(HTMLButtonElement)
-    const checkbox = getCheckbox(container)
+    const checkbox = getCheckbox(container, 'Download updates automatically')
     await act(async () => { checkbox.click(); await Promise.resolve() })
     expect(checkbox.checked).toBe(true)
     expect(container.textContent).toContain('disk unavailable')
     await act(async () => { getButton(container, 'Retry saving').click(); await Promise.resolve() })
     expect(checkbox.checked).toBe(false)
+  })
+
+  it('persists the independent default-on automatic install preference', async () => {
+    const invoke = vi.fn(async (command: string, args?: unknown) => {
+      if (command === 'get_update_snapshot') return snapshot()
+      if (command === 'set_auto_update_install') {
+        expect(args).toEqual({ enabled: false })
+        return snapshot({ revision: 3, auto_install_enabled: false })
+      }
+      throw new Error(`unexpected command: ${command}`)
+    })
+    installTauri({ invoke })
+    const container = await renderUpdates()
+    const download = getCheckbox(container, 'Download updates automatically')
+    const install = getCheckbox(container, 'Install downloaded updates automatically')
+    expect(download.checked).toBe(true)
+    expect(install.checked).toBe(true)
+
+    await act(async () => { install.click(); await Promise.resolve() })
+
+    expect(download.checked).toBe(true)
+    expect(install.checked).toBe(false)
   })
 
   it('renders update notes as plain text, including empty and long strings', async () => {
@@ -176,6 +198,7 @@ function snapshot(overrides: Record<string, unknown> = {}): Record<string, unkno
     error: null,
     reason: null,
     auto_download_enabled: true,
+    auto_install_enabled: true,
     ...overrides,
   }
 }
@@ -206,9 +229,10 @@ function getButton(container: HTMLElement, name: string): HTMLButtonElement {
   return button
 }
 
-function getCheckbox(container: HTMLElement): HTMLInputElement {
-  const checkbox = container.querySelector<HTMLInputElement>('input[type="checkbox"]')
-  if (checkbox === null) throw new Error('checkbox not found')
+function getCheckbox(container: HTMLElement, name: string): HTMLInputElement {
+  const label = Array.from(container.querySelectorAll('label')).find((candidate) => candidate.textContent?.includes(name))
+  const checkbox = label?.querySelector<HTMLInputElement>('input[type="checkbox"]')
+  if (checkbox === null || checkbox === undefined) throw new Error(`checkbox not found: ${name}`)
   return checkbox
 }
 

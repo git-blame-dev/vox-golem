@@ -5,7 +5,13 @@ import type { UpdateSnapshot } from './appUpdates'
 describe('app update snapshots', () => {
   it('parses a complete native snapshot including empty and long plain-text notes', () => {
     const notes = `\n${'x'.repeat(10_000)}<b>literal</b>`
-    expect(parseUpdateSnapshot(nativeSnapshot({ notes }))).toMatchObject({ revision: 4, phase: 'available', notes })
+    expect(parseUpdateSnapshot(nativeSnapshot({ notes }))).toMatchObject({
+      revision: 4,
+      phase: 'available',
+      notes,
+      autoDownloadEnabled: true,
+      autoInstallEnabled: true,
+    })
     expect(parseUpdateSnapshot(nativeSnapshot({ notes: '' })).notes).toBe('')
   })
 
@@ -48,6 +54,7 @@ function nativeSnapshot(overrides: Record<string, unknown> = {}): Record<string,
     error: null,
     reason: null,
     auto_download_enabled: true,
+    auto_install_enabled: true,
     ...overrides,
   }
 }
