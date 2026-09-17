@@ -751,9 +751,74 @@ mkdir -p "$temp_dir/release-api-bin"
 printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -eu' \
+  'test "$#" -eq 5' \
+  'test "$1" = api' \
+  'test "$2" = --paginate' \
+  'test "$3" = "repos/example/repository/releases?per_page=100"' \
+  'test "$4" = --jq' \
+  'test "$5" = ".[]"' \
   'if [ "${FAKE_GH_FAIL:-}" = 1 ]; then exit 1; fi' \
   'printf "%s\n" "$FAKE_GH_RELEASES"' > "$temp_dir/release-api-bin/gh"
 chmod 0755 "$temp_dir/release-api-bin/gh"
+
+selector_history="$(printf '%s\n' \
+  '{"draft":false,"prerelease":false,"tag_name":"v2026.9.17-1","target_commitish":"older-source"}' \
+  '{"draft":false,"prerelease":false,"tag_name":"v2026.9.17-3","target_commitish":"other-source"}' \
+  '{"draft":true,"prerelease":false,"tag_name":"v2026.9.17-4","target_commitish":"draft-source"}')"
+selected_version="$(
+  PATH="$temp_dir/release-api-bin:$PATH" FAKE_GH_RELEASES='' \
+    "$root/scripts/select-release-version.sh" example/repository new-source 2026.9.17
+)"
+test "$selected_version" = '2026.9.17-1'
+selected_version="$(
+  PATH="$temp_dir/release-api-bin:$PATH" FAKE_GH_RELEASES="$selector_history" \
+    "$root/scripts/select-release-version.sh" example/repository new-source 2026.9.17
+)"
+test "$selected_version" = '2026.9.17-5'
+selected_version="$(
+  PATH="$temp_dir/release-api-bin:$PATH" \
+    FAKE_GH_RELEASES="$selector_history"$'\n''{"draft":true,"prerelease":false,"tag_name":"v2026.9.16-2","target_commitish":"retry-source"}' \
+    "$root/scripts/select-release-version.sh" example/repository retry-source 2026.9.18
+)"
+test "$selected_version" = '2026.9.16-2'
+if PATH="$temp_dir/release-api-bin:$PATH" FAKE_GH_FAIL=1 FAKE_GH_RELEASES='' \
+  "$root/scripts/select-release-version.sh" example/repository new-source 2026.9.17; then
+  printf '%s\n' 'Failed release-history lookup unexpectedly allocated a release version.' >&2
+  exit 1
+fi
+if PATH="$temp_dir/release-api-bin:$PATH" \
+  FAKE_GH_RELEASES='{"draft":1,"prerelease":false,"tag_name":"v2026.9.17-1","target_commitish":"older-source"}' \
+  "$root/scripts/select-release-version.sh" example/repository new-source 2026.9.17; then
+  printf '%s\n' 'Malformed release state unexpectedly allocated a release version.' >&2
+  exit 1
+fi
+if PATH="$temp_dir/release-api-bin:$PATH" \
+  FAKE_GH_RELEASES='{"draft":false,"prerelease":true,"tag_name":"v2026.9.17-1","target_commitish":"same-source"}' \
+  "$root/scripts/select-release-version.sh" example/repository same-source 2026.9.17; then
+  printf '%s\n' 'Same-source canonical prerelease unexpectedly allocated a release version.' >&2
+  exit 1
+fi
+if PATH="$temp_dir/release-api-bin:$PATH" \
+  FAKE_GH_RELEASES='{"draft":false,"prerelease":true,"tag_name":"v2026.9.17-1","target_commitish":"same-source"}
+{"draft":true,"prerelease":false,"tag_name":"v2026.9.17-2","target_commitish":"same-source"}' \
+  "$root/scripts/select-release-version.sh" example/repository same-source 2026.9.17; then
+  printf '%s\n' 'Prerelease collision unexpectedly selected a release version.' >&2
+  exit 1
+fi
+if PATH="$temp_dir/release-api-bin:$PATH" \
+  FAKE_GH_RELEASES='{"draft":false,"prerelease":false,"tag_name":"v2026.9.17-1","target_commitish":"older-source"}
+{"draft":true,"prerelease":false,"tag_name":"v2026.9.17-1","target_commitish":"other-source"}' \
+  "$root/scripts/select-release-version.sh" example/repository new-source 2026.9.17; then
+  printf '%s\n' 'Duplicate release tag unexpectedly allocated a release version.' >&2
+  exit 1
+fi
+if PATH="$temp_dir/release-api-bin:$PATH" \
+  FAKE_GH_RELEASES='{"draft":false,"prerelease":false,"tag_name":"v2026.9.16-1","target_commitish":"same-source"}
+{"draft":true,"prerelease":false,"tag_name":"v2026.9.17-2","target_commitish":"same-source"}' \
+  "$root/scripts/select-release-version.sh" example/repository same-source 2026.9.17; then
+  printf '%s\n' 'Ambiguous same-source releases unexpectedly selected a release version.' >&2
+  exit 1
+fi
 
 release_history="$(printf '%s\n' \
   '{"draft":true,"prerelease":false,"tag_name":"v2026.7.27-99","assets":[{"name":"latest.json","url":"https://example.invalid/draft"}]}' \

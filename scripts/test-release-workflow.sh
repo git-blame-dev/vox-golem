@@ -28,6 +28,7 @@ bun -e '
   const steps = workflow.jobs.release.steps;
   const index = (name) => steps.findIndex((step) => step.name === name);
   const install = index("Install release dependencies");
+  const identityIndex = index("Compute candidate identity");
   const linuxIndex = index("Build Linux AppImage with pinned Tauri action");
   const prepareWindowsIndex = index("Prepare Windows native bundle inputs");
   const windowsIndex = index("Build Windows NSIS with pinned Tauri action");
@@ -35,6 +36,11 @@ bun -e '
   const publisher = index("Complete and publish draft");
   assert.ok(install >= 0 && install < linuxIndex);
   assert.equal(steps[install].run, "bun install --frozen-lockfile");
+  const identity = steps[identityIndex];
+  assert.equal(identity.env.GH_TOKEN, "${{ github.token }}");
+  assert.match(identity.run, /scripts\/select-release-version\.sh "\$GITHUB_REPOSITORY" "\$TARGET_SHA"/);
+  assert.doesNotMatch(identity.run, /CI_RUN_NUMBER/);
+  assert.ok(!identity.run.includes("scripts/release-version.sh"));
   const linux = steps[linuxIndex];
   const windows = steps[windowsIndex];
   const action = "tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f";

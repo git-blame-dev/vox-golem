@@ -66,9 +66,10 @@ jobs:
       - name: Compute candidate identity
         id: version
         env:
-          CI_RUN_NUMBER: ${{ github.run_number }}
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ github.sha }}
         run: |
-          app_version="$(scripts/release-version.sh "$(git show -s --format=%ct HEAD)" "$CI_RUN_NUMBER")"
+          app_version="$(scripts/select-release-version.sh "$GITHUB_REPOSITORY" "$TARGET_SHA")"
           printf 'app_version=%s\ntag=v%s\n' "$app_version" "$app_version" >> "$GITHUB_OUTPUT"
       - name: Verify release eligibility
         id: eligibility
