@@ -17,6 +17,7 @@ export interface UpdateSnapshot {
   readonly error: string | null
   readonly reason: string | null
   readonly autoDownloadEnabled: boolean
+  readonly autoInstallEnabled: boolean
 }
 
 export async function getUpdateSnapshot(): Promise<UpdateSnapshot> {
@@ -47,6 +48,10 @@ export async function setAutoUpdateDownload(enabled: boolean): Promise<UpdateSna
   return parseUpdateSnapshot(await invokeTauriCommand('set_auto_update_download', { enabled }))
 }
 
+export async function setAutoUpdateInstall(enabled: boolean): Promise<UpdateSnapshot> {
+  return parseUpdateSnapshot(await invokeTauriCommand('set_auto_update_install', { enabled }))
+}
+
 export function selectFreshSnapshot(current: UpdateSnapshot | null, incoming: UpdateSnapshot): UpdateSnapshot {
   return current !== null && current.revision >= incoming.revision ? current : incoming
 }
@@ -68,7 +73,8 @@ export function parseUpdateSnapshot(payload: unknown): UpdateSnapshot {
     !(payload['total_bytes'] === null || isSafeCount(payload['total_bytes'])) ||
     !(payload['error'] === null || typeof payload['error'] === 'string') ||
     !(payload['reason'] === null || typeof payload['reason'] === 'string') ||
-    typeof payload['auto_download_enabled'] !== 'boolean') {
+    typeof payload['auto_download_enabled'] !== 'boolean' ||
+    typeof payload['auto_install_enabled'] !== 'boolean') {
     throw new Error('Invalid update snapshot payload')
   }
   if (payload['total_bytes'] !== null && payload['downloaded_bytes'] > payload['total_bytes']) {
@@ -87,6 +93,7 @@ export function parseUpdateSnapshot(payload: unknown): UpdateSnapshot {
     error: payload['error'],
     reason: payload['reason'],
     autoDownloadEnabled: payload['auto_download_enabled'],
+    autoInstallEnabled: payload['auto_install_enabled'],
   }
 }
 

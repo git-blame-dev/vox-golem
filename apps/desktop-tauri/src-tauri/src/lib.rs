@@ -6177,6 +6177,7 @@ struct PersistedState {
     ui_theme: Option<UiThemePayload>,
     assistant_settings: Option<AssistantSettingsPayload>,
     auto_update_download: Option<bool>,
+    auto_update_install: Option<bool>,
 }
 
 fn parse_persisted_state(contents: &str) -> Result<PersistedState, String> {
@@ -6232,6 +6233,11 @@ fn parse_persisted_state(contents: &str) -> Result<PersistedState, String> {
 
         if let Some(value) = line.strip_prefix("auto_update_download") {
             state.auto_update_download = Some(parse_persisted_bool(value, "auto_update_download")?);
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("auto_update_install") {
+            state.auto_update_install = Some(parse_persisted_bool(value, "auto_update_install")?);
             continue;
         }
 
@@ -6402,6 +6408,9 @@ fn persist_state(state: PersistedState) -> Result<(), String> {
     if let Some(enabled) = state.auto_update_download {
         lines.push(format!("auto_update_download = {enabled}"));
     }
+    if let Some(enabled) = state.auto_update_install {
+        lines.push(format!("auto_update_install = {enabled}"));
+    }
     if let Some(ui_text_size) = state.ui_text_size {
         lines.push(format!("ui_text_size = \"{}\"", ui_text_size.as_str()));
     }
@@ -6495,12 +6504,25 @@ fn load_auto_update_download() -> Result<bool, String> {
     Ok(load_persisted_state()?.auto_update_download.unwrap_or(true))
 }
 
+fn load_auto_update_install() -> Result<bool, String> {
+    Ok(load_persisted_state()?.auto_update_install.unwrap_or(true))
+}
+
 pub(crate) fn persist_auto_update_download(enabled: bool) -> Result<(), String> {
     let _guard = PERSISTED_STATE_LOCK
         .lock()
         .map_err(|_| String::from("persisted state lock is poisoned"))?;
     let mut persisted = load_persisted_state()?;
     persisted.auto_update_download = Some(enabled);
+    persist_state(persisted)
+}
+
+pub(crate) fn persist_auto_update_install(enabled: bool) -> Result<(), String> {
+    let _guard = PERSISTED_STATE_LOCK
+        .lock()
+        .map_err(|_| String::from("persisted state lock is poisoned"))?;
+    let mut persisted = load_persisted_state()?;
+    persisted.auto_update_install = Some(enabled);
     persist_state(persisted)
 }
 
@@ -8675,9 +8697,14 @@ pub fn run() {
         .setup(|app| {
             let app_state = build_app_state(app.handle());
             let auto_update_download = load_auto_update_download().unwrap_or(false);
+            let auto_update_install = load_auto_update_install().unwrap_or(false);
             app_updates::configure_auto_download(
                 &app.state::<app_updates::PendingUpdate>(),
                 auto_update_download,
+            );
+            app_updates::configure_auto_install(
+                &app.state::<app_updates::PendingUpdate>(),
+                auto_update_install,
             );
             let completion_config = app_state
                 .runtime_config
@@ -8852,6 +8879,7 @@ pub fn run() {
             app_updates::install_update,
             app_updates::discard_update,
             app_updates::set_auto_update_download,
+            app_updates::set_auto_update_install,
             app_updates::get_update_snapshot,
             app_updates::restart_for_update,
             get_startup_state,
@@ -8983,10 +9011,12 @@ mod tests {
         default_voice_pipeline_config, ensure_assistant_settings_available,
         ensure_update_installation_is_idle, finish_tts_playback_state,
         fit_review_history_to_prompt_budget, ingest_audio_frame_with_optional_wake_word_detection,
-        initial_stage_sequence, load_llama_cpp_system_prompt, load_persisted_state,
-        load_persisted_tts_enabled, load_persisted_ui_text_size, load_persisted_ui_theme,
-        model_path_for_profile, parse_deep_agent_json, parse_persisted_state,
-        parse_review_agent_json, partial_transcription_worker_guard, persist_assistant_settings,
+        initial_stage_sequence, load_auto_update_download, load_auto_update_install,
+        load_llama_cpp_system_prompt, load_persisted_state, load_persisted_tts_enabled,
+        load_persisted_ui_text_size, load_persisted_ui_theme, model_path_for_profile,
+        parse_deep_agent_json, parse_persisted_state, parse_review_agent_json,
+        partial_transcription_worker_guard, persist_assistant_settings,
+        persist_auto_update_download, persist_auto_update_install,
         persist_selected_response_profile, persist_tts_enabled, persist_ui_text_size,
         persist_ui_theme, process_wake_word_frame, race_durable_cancellation,
         register_active_prompt, register_tts_playback, reset_runtime_session,
@@ -10547,6 +10577,42 @@ mod tests {
     }
 
     #[test]
+    fn parse_persisted_state_reads_and_validates_auto_update_install() {
+        let enabled = parse_persisted_state("auto_update_install = true\n")
+            .expect("automatic install preference should parse");
+        let disabled = parse_persisted_state("auto_update_install = false\n")
+            .expect("automatic install preference should parse");
+
+        assert_eq!(enabled.auto_update_install, Some(true));
+        assert_eq!(disabled.auto_update_install, Some(false));
+        assert!(parse_persisted_state("auto_update_install = sometimes\n").is_err());
+    }
+
+    #[test]
+    fn automatic_update_preferences_default_on_and_persist_independently() {
+        let _appdata_lock = APPDATA_ENV_LOCK
+            .lock()
+            .expect("APPDATA test lock should not be poisoned");
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let previous_appdata = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", temp_dir.path());
+
+        assert!(load_auto_update_download().expect("missing download preference should default"));
+        assert!(load_auto_update_install().expect("missing install preference should default"));
+        persist_auto_update_download(false).expect("download preference should persist");
+        persist_auto_update_install(false).expect("install preference should persist");
+        let persisted = load_persisted_state().expect("preferences should reload");
+
+        match previous_appdata {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+
+        assert_eq!(persisted.auto_update_download, Some(false));
+        assert_eq!(persisted.auto_update_install, Some(false));
+    }
+
+    #[test]
     fn agent_json_parsers_reject_unknown_fields_and_accept_escaped_text() {
         assert!(parse_deep_agent_json(
             r#"{"complete_answer":"answer","voice_summary":"Done.","sources":[],"extra":true}"#,
@@ -11046,6 +11112,47 @@ mod tests {
             .starts_with(super::CUE_AUDIO_DATA_URL_PREFIX));
         assert!(!cue_asset_paths.start_listening.contains("resources/"));
         assert!(!cue_asset_paths.stop_listening.contains("resources/"));
+    }
+
+    #[test]
+    fn start_listening_cue_is_a_short_lower_pitched_mono_chime() {
+        let wav = super::START_LISTENING_CUE_WAV;
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(u16::from_le_bytes([wav[20], wav[21]]), 1);
+        assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 1);
+        let sample_rate = u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]);
+        assert_eq!(sample_rate, 48_000);
+        assert_eq!(u16::from_le_bytes([wav[34], wav[35]]), 16);
+
+        let data = wav
+            .windows(4)
+            .position(|chunk| chunk == b"data")
+            .expect("cue should contain PCM data");
+        let data_len =
+            u32::from_le_bytes([wav[data + 4], wav[data + 5], wav[data + 6], wav[data + 7]])
+                as usize;
+        let samples = wav[data + 8..data + 8 + data_len]
+            .chunks_exact(2)
+            .map(|sample| i16::from_le_bytes([sample[0], sample[1]]))
+            .collect::<Vec<_>>();
+        let duration_ms = samples.len() as u64 * 1_000 / u64::from(sample_rate);
+        assert!((180..=400).contains(&duration_ms));
+
+        let positive_crossings = samples
+            .windows(2)
+            .filter(|pair| pair[0] <= 0 && pair[1] > 0)
+            .count();
+        let average_frequency = positive_crossings as u64 * 1_000 / duration_ms;
+        assert!((300..=650).contains(&average_frequency));
+        assert!(
+            samples
+                .iter()
+                .map(|sample| sample.unsigned_abs())
+                .max()
+                .unwrap_or(0)
+                <= 20_000
+        );
     }
 
     #[test]

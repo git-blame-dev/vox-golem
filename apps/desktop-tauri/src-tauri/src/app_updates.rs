@@ -84,6 +84,7 @@ pub(crate) struct UpdateSnapshot {
     error: Option<String>,
     reason: Option<&'static str>,
     auto_download_enabled: bool,
+    auto_install_enabled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -171,7 +172,11 @@ struct UpdaterSession<U> {
 }
 
 impl<U> UpdaterSession<U> {
-    fn new(current_version: String, auto_download_enabled: bool) -> Self {
+    fn new(
+        current_version: String,
+        auto_download_enabled: bool,
+        auto_install_enabled: bool,
+    ) -> Self {
         Self {
             snapshot: UpdateSnapshot {
                 revision: 0,
@@ -186,6 +191,7 @@ impl<U> UpdaterSession<U> {
                 error: None,
                 reason: None,
                 auto_download_enabled,
+                auto_install_enabled,
             },
             resource: None,
             suppressed_for_session: false,
@@ -363,6 +369,11 @@ impl<U> UpdaterSession<U> {
         self.bump();
     }
 
+    fn set_auto_install(&mut self, enabled: bool) {
+        self.snapshot.auto_install_enabled = enabled;
+        self.bump();
+    }
+
     fn take_ready(&mut self, id: u64) -> Option<(U, Vec<u8>, UpdateMetadata)> {
         if self.active_operation_id != Some(id) {
             return None;
@@ -473,13 +484,15 @@ fn retain_recovery_state<U, G>(
 pub(crate) struct PendingUpdate {
     session: Mutex<UpdaterSession<Update>>,
     auto_download_enabled: AtomicBool,
+    auto_install_enabled: AtomicBool,
 }
 
 impl Default for PendingUpdate {
     fn default() -> Self {
         Self {
-            session: Mutex::new(UpdaterSession::new(String::new(), true)),
+            session: Mutex::new(UpdaterSession::new(String::new(), true, true)),
             auto_download_enabled: AtomicBool::new(true),
+            auto_install_enabled: AtomicBool::new(true),
         }
     }
 }
@@ -556,14 +569,44 @@ pub(crate) fn set_auto_update_download(
 }
 
 #[tauri::command]
+pub(crate) fn set_auto_update_install(
+    app: AppHandle,
+    pending: State<'_, PendingUpdate>,
+    enabled: bool,
+) -> Result<UpdateSnapshot, String> {
+    crate::persist_auto_update_install(enabled)?;
+    pending
+        .auto_install_enabled
+        .store(enabled, Ordering::Release);
+    let snapshot = {
+        let mut session = lock_session(&pending)?;
+        session.set_auto_install(enabled);
+        session.snapshot.clone()
+    };
+    emit_snapshot(&app, &snapshot);
+    if enabled {
+        start_automatic_install(app);
+    }
+    Ok(snapshot)
+}
+
+#[tauri::command]
 pub(crate) async fn install_update(
     app: AppHandle,
     pending: State<'_, PendingUpdate>,
     app_state: State<'_, crate::AppState>,
 ) -> Result<UpdateSnapshot, String> {
-    crate::ensure_update_installation_is_idle(&app_state)?;
+    perform_install(&app, &pending, &app_state).await
+}
+
+async fn perform_install(
+    app: &AppHandle,
+    pending: &PendingUpdate,
+    app_state: &crate::AppState,
+) -> Result<UpdateSnapshot, String> {
+    crate::ensure_update_installation_is_idle(app_state)?;
     let (id, update, bytes, metadata, installing) = {
-        let mut session = lock_session(&pending)?;
+        let mut session = lock_session(pending)?;
         session
             .install_exit
             .reserve_installation()
@@ -582,20 +625,20 @@ pub(crate) async fn install_update(
         let snapshot = session.snapshot.clone();
         (id, update, bytes, metadata, snapshot)
     };
-    emit_snapshot(&app, &installing);
+    emit_snapshot(app, &installing);
 
-    let installation_guard = match crate::begin_update_installation(&app_state) {
+    let installation_guard = match crate::begin_update_installation(app_state) {
         Ok(guard) => guard,
         Err(error) => {
-            restore_install(&pending, id, update, bytes, metadata, error.clone())?;
-            emit_current_snapshot(&app, &pending)?;
+            restore_install(pending, id, update, bytes, metadata, error.clone())?;
+            emit_current_snapshot(app, pending)?;
             return Err(error);
         }
     };
-    if let Err(error) = crate::ensure_update_installation_is_idle(&app_state) {
+    if let Err(error) = crate::ensure_update_installation_is_idle(app_state) {
         drop(installation_guard);
-        restore_install(&pending, id, update, bytes, metadata, error.clone())?;
-        emit_current_snapshot(&app, &pending)?;
+        restore_install(pending, id, update, bytes, metadata, error.clone())?;
+        emit_current_snapshot(app, pending)?;
         return Err(error);
     }
 
@@ -624,7 +667,7 @@ pub(crate) async fn install_update(
         Err(error) => {
             let message = format!("update installer task failed: {error}");
             let snapshot = {
-                let mut session = lock_session(&pending)?;
+                let mut session = lock_session(pending)?;
                 #[cfg(target_os = "windows")]
                 {
                     session.install_exit.release_installation();
@@ -637,7 +680,7 @@ pub(crate) async fn install_update(
                 }
                 session.snapshot.clone()
             };
-            emit_snapshot(&app, &snapshot);
+            emit_snapshot(app, &snapshot);
             return Ok(snapshot);
         }
     };
@@ -646,7 +689,7 @@ pub(crate) async fn install_update(
         (Ok(()), _, _) => {
             drop(installation_guard);
             let _snapshot = {
-                let mut session = lock_session(&pending)?;
+                let mut session = lock_session(pending)?;
                 session.install_exit.release_installation();
                 session.finish(id);
                 session.snapshot.clone()
@@ -659,7 +702,7 @@ pub(crate) async fn install_update(
         (Err(error), update, bytes) => {
             let message = format!("failed to install update: {error}");
             let snapshot = {
-                let mut session = lock_session(&pending)?;
+                let mut session = lock_session(pending)?;
                 session.install_exit.release_installation();
                 #[cfg(target_os = "windows")]
                 {
@@ -673,7 +716,7 @@ pub(crate) async fn install_update(
                 }
                 session.snapshot.clone()
             };
-            emit_snapshot(&app, &snapshot);
+            emit_snapshot(app, &snapshot);
             Ok(snapshot)
         }
     }
@@ -757,12 +800,28 @@ pub(crate) fn start_background_update(app: AppHandle) {
     });
 }
 
+fn start_automatic_install(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let pending = app.state::<PendingUpdate>();
+        attempt_automatic_install(&app, &pending).await;
+    });
+}
+
 pub(crate) fn configure_auto_download(pending: &PendingUpdate, enabled: bool) {
     pending
         .auto_download_enabled
         .store(enabled, Ordering::Release);
     if let Ok(mut session) = pending.session.lock() {
         session.snapshot.auto_download_enabled = enabled;
+    }
+}
+
+pub(crate) fn configure_auto_install(pending: &PendingUpdate, enabled: bool) {
+    pending
+        .auto_install_enabled
+        .store(enabled, Ordering::Release);
+    if let Ok(mut session) = pending.session.lock() {
+        session.snapshot.auto_install_enabled = enabled;
     }
 }
 
@@ -829,6 +888,28 @@ async fn perform_check(
     Ok(snapshot)
 }
 
+async fn attempt_automatic_install(app: &AppHandle, pending: &PendingUpdate) {
+    let app_state = app.state::<crate::AppState>();
+    let idle = crate::ensure_update_installation_is_idle(&app_state).is_ok();
+    let enabled = pending.auto_install_enabled.load(Ordering::Acquire);
+    let should_install = lock_session(pending)
+        .map(|session| should_automatically_install(&session, enabled, idle))
+        .unwrap_or(false);
+    if should_install {
+        let _ = perform_install(app, pending, &app_state).await;
+    }
+}
+
+fn should_automatically_install<U>(session: &UpdaterSession<U>, enabled: bool, idle: bool) -> bool {
+    enabled
+        && idle
+        && !session.suppressed_for_session
+        && session.active_operation_id.is_none()
+        && session.snapshot.phase == UpdatePhase::Ready
+        && matches!(session.resource, Some(UpdateResource::Ready { .. }))
+        && matches!(session.install_exit.phase, InstallExitPhase::Open)
+}
+
 async fn perform_download(
     app: &AppHandle,
     pending: &PendingUpdate,
@@ -882,7 +963,8 @@ async fn perform_download(
         session.snapshot.clone()
     };
     emit_snapshot(app, &snapshot);
-    Ok(snapshot)
+    attempt_automatic_install(app, pending).await;
+    Ok(lock_session(pending)?.snapshot.clone())
 }
 
 fn current_bundle_type() -> Option<BundleType> {
@@ -935,7 +1017,7 @@ mod tests {
     use super::*;
 
     fn session() -> UpdaterSession<()> {
-        UpdaterSession::new(String::from("1.0.0"), true)
+        UpdaterSession::new(String::from("1.0.0"), true, true)
     }
 
     fn metadata() -> UpdateMetadata {
@@ -964,6 +1046,34 @@ mod tests {
         assert!(progressed > reserved);
         assert!(session.snapshot.revision > progressed);
         assert_eq!(session.snapshot.phase, UpdatePhase::Ready);
+    }
+
+    #[test]
+    fn automatic_install_requires_enabled_ready_and_idle_state() {
+        let mut ready = session();
+        ready.resource = Some(UpdateResource::Ready {
+            update: (),
+            bytes: vec![1, 2, 3],
+            metadata: metadata(),
+        });
+        ready.snapshot.phase = UpdatePhase::Ready;
+
+        assert!(should_automatically_install(&ready, true, true));
+        assert!(!should_automatically_install(&ready, false, true));
+        assert!(!should_automatically_install(&ready, true, false));
+        assert!(matches!(ready.resource, Some(UpdateResource::Ready { .. })));
+
+        let id = ready.reserve(UpdateOperation::Install, true).unwrap();
+        assert!(!should_automatically_install(&ready, true, true));
+        ready.finish_failure(id, String::from("synthetic failure"));
+
+        let mut available = session();
+        available.resource = Some(UpdateResource::Available {
+            update: (),
+            metadata: metadata(),
+        });
+        available.snapshot.phase = UpdatePhase::Available;
+        assert!(!should_automatically_install(&available, true, true));
     }
 
     #[test]
