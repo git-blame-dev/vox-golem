@@ -108,7 +108,7 @@ jobs:
           make verify-update-bundle
       - name: Prepare Windows native bundle inputs
         if: steps.eligibility.outputs.build == 'true'
-        run: make prepare-pc-bundle
+        run: make prepare-pc-bundle REAL_CLANG_CL=/usr/bin/clang-19
       - name: Build Windows NSIS with pinned Tauri action
         if: steps.eligibility.outputs.build == 'true'
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f

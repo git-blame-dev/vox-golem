@@ -29,6 +29,7 @@ bun -e '
   const index = (name) => steps.findIndex((step) => step.name === name);
   const install = index("Install release dependencies");
   const linuxIndex = index("Build Linux AppImage with pinned Tauri action");
+  const prepareWindowsIndex = index("Prepare Windows native bundle inputs");
   const windowsIndex = index("Build Windows NSIS with pinned Tauri action");
   const finalizer = index("Sign and validate final canonical bytes");
   const publisher = index("Complete and publish draft");
@@ -42,6 +43,7 @@ bun -e '
   assert.equal(linux.with.releaseDraft, true);
   assert.equal(linux.with.releaseCommitish, "${{ github.sha }}");
   assert.equal(windows.with.releaseId, "${{ steps.linux.outputs.releaseId }}");
+  assert.equal(steps[prepareWindowsIndex].run, "make prepare-pc-bundle REAL_CLANG_CL=/usr/bin/clang-19");
   assert.ok(linuxIndex < windowsIndex && windowsIndex < finalizer && finalizer < publisher);
 ' "$root/.github/workflows/release.yml"
 
