@@ -3,7 +3,8 @@
 wake_word_model_path = "models/hey_livekit.onnx"
 parakeet_model_dir = "models/parakeet-v2"
 silero_vad_model = "models/silero-vad.onnx"
-silence_timeout_ms = 1500
+initial_silence_timeout_ms = 2500
+silence_timeout_ms = 750
 wake_word_detection_threshold = 0.68
 response_backend = "llama_cpp"
 

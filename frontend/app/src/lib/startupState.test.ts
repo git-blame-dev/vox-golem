@@ -33,6 +33,7 @@ describe('parseStartupState', () => {
     if (state.kind === 'ready') {
       expect(state.capabilities.map(({ id }) => id)).toEqual(capabilities.map(({ id }) => id))
       expect(state.supportedResponseProfiles).toEqual([])
+      expect(state.initialSilenceTimeoutMs).toBe(2_500)
     }
   })
 
@@ -87,6 +88,7 @@ describe('parseStartupState', () => {
       runtimePhase: 'sleeping',
       voiceInputAvailable: true,
       voiceInputError: null,
+      initialSilenceTimeoutMs: 2500,
       silenceTimeoutMs: 1500,
       selectedResponseProfile: 'fast',
       supportedResponseProfiles: ['fast', 'quality'],
@@ -94,6 +96,26 @@ describe('parseStartupState', () => {
       ttsEnabled: false,
       ttsOutputGainDb: 3,
     }))
+  })
+
+  it('parses and validates the configurable wait before the first detected speech', () => {
+    const ready = {
+      kind: 'ready',
+      cue_asset_paths: { start_listening: 'start.wav', stop_listening: 'stop.wav' },
+      runtime_phase: 'sleeping',
+      voice_input_available: true,
+      voice_input_error: null,
+      initial_silence_timeout_ms: 2_700,
+      silence_timeout_ms: 750,
+      selected_response_profile: 'fast',
+      supported_response_profiles: ['fast'],
+      capabilities: COMPLETE_CAPABILITIES,
+    }
+    const parsed = parseStartupState(ready)
+    expect(parsed.kind === 'ready' && parsed.initialSilenceTimeoutMs).toBe(2_700)
+    expect(parsed.kind === 'ready' && parsed.silenceTimeoutMs).toBe(750)
+    expect(() => parseStartupState({ ...ready, initial_silence_timeout_ms: 0 }))
+      .toThrow('initial_silence_timeout_ms')
   })
 
   it('returns error state for valid error payload', () => {
@@ -318,6 +340,7 @@ describe('isStartupStateSettled', () => {
         runtimePhase: 'initializing',
         voiceInputAvailable: true,
         voiceInputError: null,
+        initialSilenceTimeoutMs: 2500,
         silenceTimeoutMs: 1500,
         message: 'Loading local Gemma model...',
         selectedResponseProfile: 'quality',
@@ -338,6 +361,7 @@ describe('isStartupStateSettled', () => {
         runtimePhase: 'sleeping',
         voiceInputAvailable: true,
         voiceInputError: null,
+        initialSilenceTimeoutMs: 2500,
         silenceTimeoutMs: 1500,
         selectedResponseProfile: 'quality',
         supportedResponseProfiles: ['fast', 'quality'],
@@ -363,6 +387,7 @@ describe('isStartupStateSettled', () => {
         runtimePhase: 'sleeping',
         voiceInputAvailable: true,
         voiceInputError: null,
+        initialSilenceTimeoutMs: 2500,
         silenceTimeoutMs: 1500,
         selectedResponseProfile: 'fast',
         supportedResponseProfiles: ['fast'],
@@ -388,7 +413,8 @@ describe('loadStartupState', () => {
       runtimePhase: 'sleeping',
       voiceInputAvailable: true,
       voiceInputError: null,
-      silenceTimeoutMs: 1500,
+      initialSilenceTimeoutMs: 2500,
+      silenceTimeoutMs: 750,
       selectedResponseProfile: 'fast',
       supportedResponseProfiles: ['fast'],
       promptCancellationAvailable: false,

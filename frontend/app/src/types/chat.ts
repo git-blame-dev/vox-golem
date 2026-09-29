@@ -123,30 +123,32 @@ export type StartupState =
       readonly runtimePhase: BackendRuntimePhase
       readonly voiceInputAvailable: boolean
       readonly voiceInputError: string | null
-  readonly silenceTimeoutMs: number
-  readonly message: string
-    readonly selectedResponseProfile: ResponseProfile
-    readonly supportedResponseProfiles: readonly ResponseProfile[]
-    readonly promptCancellationAvailable: boolean
-    readonly ttsEnabled: boolean
+      readonly initialSilenceTimeoutMs: number
+      readonly silenceTimeoutMs: number
+      readonly message: string
+      readonly selectedResponseProfile: ResponseProfile
+      readonly supportedResponseProfiles: readonly ResponseProfile[]
+      readonly promptCancellationAvailable: boolean
+      readonly ttsEnabled: boolean
       readonly ttsOutputGainDb: number
       readonly capabilities: readonly StartupCapability[]
-  }
-| {
-  readonly kind: 'ready'
-  readonly cueAssetPaths: CueAssetPaths
+    }
+  | {
+      readonly kind: 'ready'
+      readonly cueAssetPaths: CueAssetPaths
       readonly runtimePhase: BackendRuntimePhase
       readonly voiceInputAvailable: boolean
-  readonly voiceInputError: string | null
-  readonly silenceTimeoutMs: number
-    readonly selectedResponseProfile: ResponseProfile
-    readonly supportedResponseProfiles: readonly ResponseProfile[]
-    readonly promptCancellationAvailable: boolean
-    readonly ttsEnabled: boolean
-    readonly ttsOutputGainDb: number
-    readonly capabilities: readonly StartupCapability[]
-  }
-| { readonly kind: 'error'; readonly message: string }
+      readonly voiceInputError: string | null
+      readonly initialSilenceTimeoutMs: number
+      readonly silenceTimeoutMs: number
+      readonly selectedResponseProfile: ResponseProfile
+      readonly supportedResponseProfiles: readonly ResponseProfile[]
+      readonly promptCancellationAvailable: boolean
+      readonly ttsEnabled: boolean
+      readonly ttsOutputGainDb: number
+      readonly capabilities: readonly StartupCapability[]
+    }
+  | { readonly kind: 'error'; readonly message: string }
 
 export type RuntimeStatus =
   | 'initializing'
@@ -161,6 +163,7 @@ export interface RuntimeControlResult {
   readonly transcriptionReadySamples: number | null
   readonly transcriptText: string | null
   readonly lastActivityMs: number | null
+  readonly heardSpeech: boolean
   readonly capturingUtterance: boolean
   readonly prerollSamples: number
   readonly utteranceSamples: number

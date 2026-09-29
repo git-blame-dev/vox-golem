@@ -79,6 +79,7 @@ pub enum VoicePipelineAction {
     FinishedUtterance {
         transcription_input: ParakeetTranscriptionInput,
     },
+    ExpiredWithoutSpeech,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -193,6 +194,11 @@ pub fn apply_voice_pipeline_event(
                 VoicePipelineAction::FinishedUtterance {
                     transcription_input,
                 }
+            } else if previous_phase == RuntimePhase::Listening
+                && session.runtime().phase() == RuntimePhase::Sleeping
+            {
+                capture.reset();
+                VoicePipelineAction::ExpiredWithoutSpeech
             } else {
                 VoicePipelineAction::None
             };
@@ -290,7 +296,9 @@ mod tests {
 
     fn pipeline_config() -> VoicePipelineConfig {
         VoicePipelineConfig::new(
-            SessionConfig::new(VoiceTurnConfig::new(1_200).expect("valid silence timeout")),
+            SessionConfig::new(
+                VoiceTurnConfig::with_timeouts(1_200, 1_200).expect("valid silence timeouts"),
+            ),
             TurnCaptureConfig::new(4, 16).expect("valid turn capture config"),
             PARAKEET_SAMPLE_RATE_HZ,
         )
@@ -353,8 +361,14 @@ mod tests {
             VoicePipelineEvent::WakeWordDetected { now_ms: 100 },
         )
         .expect("wake word should start listening");
-        let (recording_state, _) = apply_voice_pipeline_event(
+        let (speaking_state, _) = apply_voice_pipeline_event(
             &listening_state,
+            config,
+            VoicePipelineEvent::SpeechDetected { now_ms: 200 },
+        )
+        .expect("speech should be detected");
+        let (recording_state, _) = apply_voice_pipeline_event(
+            &speaking_state,
             config,
             VoicePipelineEvent::RecordListeningFrame {
                 frame: vec![0.1, 0.2],
@@ -365,7 +379,7 @@ mod tests {
         let (_, action) = apply_voice_pipeline_event(
             &recording_state,
             config,
-            VoicePipelineEvent::SilenceCheck { now_ms: 1_300 },
+            VoicePipelineEvent::SilenceCheck { now_ms: 1_400 },
         )
         .expect("silence timeout should finish the utterance");
 
@@ -404,8 +418,14 @@ mod tests {
             VoicePipelineEvent::WakeWordDetected { now_ms: 100 },
         )
         .expect("wake word should start listening");
-        let (recording_state, _) = apply_voice_pipeline_event(
+        let (speaking_state, _) = apply_voice_pipeline_event(
             &listening_state,
+            config,
+            VoicePipelineEvent::SpeechDetected { now_ms: 200 },
+        )
+        .expect("speech should be detected");
+        let (recording_state, _) = apply_voice_pipeline_event(
+            &speaking_state,
             config,
             VoicePipelineEvent::RecordListeningFrame {
                 frame: vec![0.5, 0.6],
@@ -416,7 +436,7 @@ mod tests {
         let (processing_state, action) = apply_voice_pipeline_event(
             &recording_state,
             config,
-            VoicePipelineEvent::SilenceCheck { now_ms: 1_300 },
+            VoicePipelineEvent::SilenceCheck { now_ms: 1_400 },
         )
         .expect("silence timeout should finish the utterance");
 
@@ -436,6 +456,49 @@ mod tests {
                 .expect("captured utterance should become valid transcription input"),
             }
         );
+    }
+
+    #[test]
+    fn initial_silence_expiry_resets_capture_without_transcription_input() {
+        let config = VoicePipelineConfig::new(
+            SessionConfig::new(
+                VoiceTurnConfig::with_timeouts(2_500, 750).expect("valid silence timeouts"),
+            ),
+            TurnCaptureConfig::new(4, 16).expect("valid turn capture config"),
+            PARAKEET_SAMPLE_RATE_HZ,
+        );
+        let (ready, _) = apply_voice_pipeline_event(
+            &VoicePipelineState::new(config).expect("pipeline should initialize"),
+            config,
+            VoicePipelineEvent::StartupValidated,
+        )
+        .expect("startup validation should succeed");
+        let (listening, _) = apply_voice_pipeline_event(
+            &ready,
+            config,
+            VoicePipelineEvent::WakeWordDetected { now_ms: 0 },
+        )
+        .expect("wake word should start listening");
+        let (recording, _) = apply_voice_pipeline_event(
+            &listening,
+            config,
+            VoicePipelineEvent::RecordListeningFrame {
+                frame: vec![0.25, 0.5],
+            },
+        )
+        .expect("listening frame should be captured");
+
+        let (expired, action) = apply_voice_pipeline_event(
+            &recording,
+            config,
+            VoicePipelineEvent::SilenceCheck { now_ms: 2_500 },
+        )
+        .expect("no-speech expiry should not transcribe");
+
+        assert_eq!(action, VoicePipelineAction::ExpiredWithoutSpeech);
+        assert_eq!(expired.session().runtime().phase(), RuntimePhase::Sleeping);
+        assert!(!expired.capture().capturing_utterance());
+        assert_eq!(expired.capture().utterance_len(), 0);
     }
 
     #[test]
@@ -470,7 +533,7 @@ mod tests {
         let (still_listening_state, action) = apply_voice_pipeline_event(
             &refreshed_state,
             config,
-            VoicePipelineEvent::SilenceCheck { now_ms: 1_300 },
+            VoicePipelineEvent::SilenceCheck { now_ms: 1_400 },
         )
         .expect("refreshed activity should delay silence timeout");
 
@@ -491,7 +554,9 @@ mod tests {
     #[test]
     fn silence_returns_transcription_input_error_for_wrong_sample_rate() {
         let config = VoicePipelineConfig::new(
-            SessionConfig::new(VoiceTurnConfig::new(1_200).expect("valid silence timeout")),
+            SessionConfig::new(
+                VoiceTurnConfig::with_timeouts(1_200, 1_200).expect("valid silence timeouts"),
+            ),
             TurnCaptureConfig::new(4, 16).expect("valid turn capture config"),
             44_100,
         );
@@ -515,11 +580,17 @@ mod tests {
             VoicePipelineEvent::WakeWordDetected { now_ms: 100 },
         )
         .expect("wake word should start listening");
-
-        let error = apply_voice_pipeline_event(
+        let (speaking_state, _) = apply_voice_pipeline_event(
             &listening_state,
             config,
-            VoicePipelineEvent::SilenceCheck { now_ms: 1_300 },
+            VoicePipelineEvent::SpeechDetected { now_ms: 200 },
+        )
+        .expect("speech should be detected");
+
+        let error = apply_voice_pipeline_event(
+            &speaking_state,
+            config,
+            VoicePipelineEvent::SilenceCheck { now_ms: 1_400 },
         )
         .expect_err("wrong sample rate should fail transcription input validation");
 

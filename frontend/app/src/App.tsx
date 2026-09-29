@@ -19,6 +19,7 @@ import {
 import type { RuntimeControlArgs } from './lib/runtimeControl'
 import {
   DEFAULT_CUE_ASSET_PATHS,
+  DEFAULT_INITIAL_SILENCE_TIMEOUT_MS,
   DEFAULT_SILENCE_TIMEOUT_MS,
   isStartupStateSettled,
   loadStartupState,
@@ -604,6 +605,13 @@ function App() {
     }
 
     return DEFAULT_SILENCE_TIMEOUT_MS
+  }
+
+  const currentInitialSilenceTimeoutMs = (): number => {
+    if (startupStateRef.current.kind === 'ready' || startupStateRef.current.kind === 'warming_model') {
+      return startupStateRef.current.initialSilenceTimeoutMs
+    }
+    return DEFAULT_INITIAL_SILENCE_TIMEOUT_MS
   }
 
   const waitForInFlightLiveAudioFrames = async (): Promise<void> => {
@@ -1527,23 +1535,25 @@ function App() {
   const handleMarkSilence = async (
     liveAudioSessionId: number,
     telemetryFrameId: string | null = null,
+    heardSpeech = true,
   ): Promise<void> => {
     voiceTelemetry.record('silence_detected')
-    voiceTelemetry.record('cue_play_requested', {
-      details: {
-        cueType: 'stop_listening',
-        source: 'mark_silence',
-      },
-    })
-
-    void playCueWithFallback('stop_listening', cueAssetPathsRef.current, fallbackCueAssetPathsRef.current)
-      .then(() => voiceTelemetry.record('cue_play_started', {
+    if (heardSpeech) {
+      voiceTelemetry.record('cue_play_requested', {
         details: {
           cueType: 'stop_listening',
           source: 'mark_silence',
         },
-      }))
-      .catch((error: unknown) => reportCuePlaybackError('stop_listening', error))
+      })
+      void playCueWithFallback('stop_listening', cueAssetPathsRef.current, fallbackCueAssetPathsRef.current)
+        .then(() => voiceTelemetry.record('cue_play_started', {
+          details: {
+            cueType: 'stop_listening',
+            source: 'mark_silence',
+          },
+        }))
+        .catch((error: unknown) => reportCuePlaybackError('stop_listening', error))
+    }
 
     if (liveAudioSessionId !== liveAudioSessionIdRef.current) return
 
@@ -1680,14 +1690,16 @@ function App() {
               applyRuntimeControlResult(status, { quiet: true })
               voiceActivityStateRef.current = syncVoiceActivityState(
                 voiceActivityStateRef.current,
-                nextStatus,
-                status.lastActivityMs,
+                  nextStatus,
+                  status.lastActivityMs,
+                  status.heardSpeech,
               )
 
               if (nextStatus === 'listening' && autoStopOnSilenceRef.current) {
                 const voiceActivityUpdate = updateVoiceActivityState(
                   voiceActivityStateRef.current,
                   nowMs,
+                  currentInitialSilenceTimeoutMs(),
                   currentSilenceTimeoutMs(),
                 )
 
@@ -1695,7 +1707,7 @@ function App() {
 
                 if (voiceActivityUpdate.shouldMarkSilence && markSilenceInFlightRef.current === null) {
                   markSilenceInFlightRef.current = liveAudioSessionId
-                  void handleMarkSilence(liveAudioSessionId, frameId)
+                  void handleMarkSilence(liveAudioSessionId, frameId, voiceActivityUpdate.state.heardSpeech)
                     .catch((error: unknown) => {
                       if (liveAudioSessionId !== liveAudioSessionIdRef.current) return
                       enterRuntimeError()
@@ -1869,6 +1881,7 @@ function App() {
       runtimePhase: 'initializing',
       voiceInputAvailable: currentState.voiceInputAvailable,
       voiceInputError: currentState.voiceInputError,
+      initialSilenceTimeoutMs: currentState.initialSilenceTimeoutMs,
       silenceTimeoutMs: currentState.silenceTimeoutMs,
       message: `Switching response profile to ${getResponseProfileLabel(profile)}...`,
       selectedResponseProfile: profile,

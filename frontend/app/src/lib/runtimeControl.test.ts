@@ -32,6 +32,7 @@ describe('invokeRuntimeControl', () => {
       transcriptionReadySamples: null,
       transcriptText: null,
       lastActivityMs: 100,
+      heardSpeech: false,
       capturingUtterance: true,
       prerollSamples: 3,
       utteranceSamples: 5,
@@ -50,6 +51,7 @@ describe('invokeRuntimeControl', () => {
           transcription_ready_samples: null,
           transcript_text: null,
           last_activity_ms: 101,
+          heard_speech: true,
           capturing_utterance: true,
           preroll_samples: 4,
           utterance_samples: 4,
@@ -62,6 +64,7 @@ describe('invokeRuntimeControl', () => {
       transcriptionReadySamples: null,
       transcriptText: null,
       lastActivityMs: 101,
+      heardSpeech: true,
       capturingUtterance: true,
       prerollSamples: 4,
       utteranceSamples: 4,
@@ -92,6 +95,7 @@ describe('invokeRuntimeControl', () => {
       transcriptionReadySamples: null,
       transcriptText: null,
       lastActivityMs: null,
+      heardSpeech: false,
       capturingUtterance: false,
       prerollSamples: 3,
       utteranceSamples: 0,
@@ -134,6 +138,7 @@ describe('invokeRuntimeControl', () => {
       transcriptionReadySamples: null,
       transcriptText: null,
       lastActivityMs: null,
+      heardSpeech: false,
       capturingUtterance: false,
       prerollSamples: 3,
       utteranceSamples: 0,
@@ -181,6 +186,21 @@ describe('invokeRuntimeControl', () => {
     )
   })
 
+  it('rejects malformed speech-heard state instead of guessing a timeout phase', async () => {
+    window.__TAURI_INTERNALS__ = { invoke: async () => ({
+      runtime_phase: 'listening',
+      transcription_ready_samples: null,
+      transcript_text: null,
+      last_activity_ms: 100,
+      heard_speech: 'true',
+      capturing_utterance: true,
+      preroll_samples: 0,
+      utterance_samples: 0,
+    }) }
+
+    await expect(ingestAudioFrame([0.1])).rejects.toThrow('heard_speech')
+  })
+
   it('rejects runtime control payloads missing transcript text', async () => {
     window.__TAURI_INTERNALS__ = {
       invoke: async () => ({
@@ -216,6 +236,7 @@ describe('invokeRuntimeControl', () => {
       transcriptionReadySamples: 3200,
       transcriptText: 'Draft release notes',
       lastActivityMs: null,
+      heardSpeech: false,
       capturingUtterance: false,
       prerollSamples: 3,
       utteranceSamples: 0,
@@ -253,6 +274,7 @@ describe('invokeRuntimeControl', () => {
       transcriptionReadySamples: 3200,
       transcriptText: 'Draft release notes',
       lastActivityMs: null,
+      heardSpeech: false,
       capturingUtterance: false,
       prerollSamples: 3,
       utteranceSamples: 0,
