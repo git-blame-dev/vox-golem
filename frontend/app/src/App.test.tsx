@@ -4671,6 +4671,57 @@ describe('App', () => {
     expect(stopCueCalls).toBe(1)
   })
 
+  it('stops the processing cue before speaking the assistant answer', async () => {
+    let onFrame: StartLiveAudioSourceOptions['onFrame'] | null = null
+    let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
+    const order: string[] = []
+    let nowMs = 100
+    Date.now = () => nowMs
+    Object.defineProperty(globalThis, 'Audio', {
+      configurable: true,
+      value: class {
+        private readonly source: string
+        constructor(source: string) { this.source = source }
+        play(): Promise<void> {
+          if (this.source === 'stop.wav') order.push('processing cue started')
+          return Promise.resolve()
+        }
+        pause(): void {
+          if (this.source === 'stop.wav') order.push('processing cue stopped')
+        }
+      },
+    })
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      onFrame = options.onFrame
+      return { stop: vi.fn() }
+    })
+    window.__TAURI_INTERNALS__ = {
+      listen: async (_event, handler) => { promptEventHandler = handler; return () => undefined },
+      invoke: async (command, args) => {
+        if (command === 'get_startup_state') return readyStartupState({ tts_enabled: true, initial_silence_timeout_ms: 2500, silence_timeout_ms: 750 })
+        if (command === 'get_assistant_settings') return defaultAssistantSettings()
+        if (command === 'ingest_audio_frame') return { runtime_phase: 'listening', transcription_ready_samples: null, transcript_text: null, last_activity_ms: 100, heard_speech: true, capturing_utterance: true, preroll_samples: 4, utterance_samples: 4 }
+        if (command === 'mark_silence') return { runtime_phase: 'processing', transcription_ready_samples: 3200, transcript_text: 'Synthetic question', last_activity_ms: null, heard_speech: false, capturing_utterance: false, preroll_samples: 4, utterance_samples: 0 }
+        if (command === 'submit_prompt') {
+          const requestId = (args as { requestId: string }).requestId
+          promptEventHandler?.({ payload: { request_id: requestId, kind: 'text', text: 'Synthetic answer' } })
+          return { request_id: requestId, outcome: 'completed', error_message: null, runtime_phase: 'sleeping' }
+        }
+        if (command === 'reserve_local_tts_playback_id') return 72
+        if (command === 'speak_local_tts') { order.push('assistant speech requested'); return { duration_ms: 1 } }
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    await renderApp()
+    await act(async () => { await onFrame?.([0.1, -0.1]); await Promise.resolve() })
+    nowMs = 850
+    await act(async () => { await onFrame?.([0.001, -0.001]); await Promise.resolve() })
+    await vi.waitFor(() => expect(order).toContain('assistant speech requested'))
+
+    expect(order).toEqual(['processing cue started', 'processing cue stopped', 'assistant speech requested'])
+  })
+
   it('hides microphone capture errors from chat without changing the backend contract', async () => {
     startLiveAudioSourceMock.mockRejectedValue(new Error('Permission denied'))
 
