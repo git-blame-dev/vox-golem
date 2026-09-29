@@ -79,6 +79,17 @@ describe('prompt payload parsing', () => {
     })
   })
 
+  it('accepts measured Custom direct timings and rejects fabricated or reversed values', () => {
+    expect(parsePromptExecutionEvent({
+      request_id: 'request-1', kind: 'custom_direct_timings', first_text_ms: 405, completed_ms: 1875,
+    })).toEqual({
+      requestId: 'request-1', kind: 'custom_direct_timings', timings: { firstTextMs: 405, completedMs: 1875 },
+    })
+    for (const [first_text_ms, completed_ms] of [[-1, 20], [30, 20], [1.5, 20], [0, Number.MAX_SAFE_INTEGER + 1], [undefined, 20]]) {
+      expect(() => parsePromptExecutionEvent({ request_id: 'request-1', kind: 'custom_direct_timings', first_text_ms, completed_ms })).toThrow('Custom direct timings')
+    }
+  })
+
   it('parses strict correction events and rejects malformed corrections', () => {
     expect(parsePromptExecutionEvent({
       request_id: 'request-1',

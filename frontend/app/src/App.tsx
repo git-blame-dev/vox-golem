@@ -7,7 +7,7 @@ import type { AnswerStageStatusEntry, AnswerPriorVersion } from './components/An
 import { PromptComposer } from './components/PromptComposer'
 import { UserNoticeToast } from './components/UserNoticeToast'
 import { UpdateSettings } from './components/UpdateSettings'
-import { playCue } from './lib/audioCues'
+import { playCueWithFallback, prepareVoiceCues } from './lib/audioCues'
 import { shouldSubmitComposer } from './lib/composer'
 import { listAudioInputDevices, startLiveAudioSource } from './lib/liveAudioSource'
 import type { AudioInputDevice, LiveAudioSource } from './lib/liveAudioSource'
@@ -23,7 +23,7 @@ import {
   isStartupStateSettled,
   loadStartupState,
 } from './lib/startupState'
-import { getTauriInternals, invokeTauriCommand } from './lib/tauri'
+import { getTauriInternals, invokeTauriCommand, isNativeTauriRuntime } from './lib/tauri'
 import { useAppUpdates } from './lib/useAppUpdates'
 import type { UpdateState } from './lib/useAppUpdates'
 import { DEFAULT_ASSISTANT_SETTINGS, deepOptions, instantOptions, parseAssistantSettings, reviewOptions, serializeAssistantSettings } from './lib/assistantSettings'
@@ -31,6 +31,9 @@ import type { AssistantSettings } from './lib/assistantSettings'
 import { acceptsPartialTranscriptionEvent, parsePartialTranscriptionEvent } from './lib/partialTranscription'
 import { parseCompletionEvent } from './lib/completionEvents'
 import { createVoiceTelemetryRecorder } from './lib/voiceTelemetry'
+import { WakeDiagnostics } from './components/WakeDiagnostics'
+import { WakeClipSettings } from './components/WakeClipSettings'
+import { createWakeClipBuffer } from './lib/wakeClipBuffer'
 import {
   createVoiceActivityState,
   syncVoiceActivityState,
@@ -43,6 +46,7 @@ import { firstNonEmptyCompletedLine, firstNonEmptyStreamingLine, isValidTtsFirst
 import type {
   BackendRuntimePhase,
   ChatMessage,
+  CueAssetPaths,
   RuntimeControlResult,
   ResponseProfile,
   RuntimeStatus,
@@ -138,6 +142,7 @@ function App() {
   const [voiceCompletionSuffix, setVoiceCompletionSuffix] = useState('')
   const [autoStopOnSilence, setAutoStopOnSilence] = useState(true)
   const [ttsEnabled, setTtsEnabled] = useState(false)
+  const [preparedCueAssetPaths, setPreparedCueAssetPaths] = useState<CueAssetPaths | null>(null)
   const [ttsPlaying, setTtsPlaying] = useState(false)
   const [pendingTtsCommands, setPendingTtsCommands] = useState(0)
   const [wakeConfidence, setWakeConfidence] = useState<number | null>(null)
@@ -151,6 +156,7 @@ function App() {
     () => getTauriInternals() !== null,
   )
   const [assistantSettingsLoadError, setAssistantSettingsLoadError] = useState<string | null>(null)
+  const [customRetryPending, setCustomRetryPending] = useState(false)
   const [assistantSettings, setAssistantSettings] = useState<AssistantSettings>(DEFAULT_ASSISTANT_SETTINGS)
   const assistantSettingsRef = useRef<AssistantSettings>(DEFAULT_ASSISTANT_SETTINGS)
   const assistantSettingsPendingRef = useRef(getTauriInternals() !== null)
@@ -193,6 +199,7 @@ function App() {
   const audioInputDeviceIdRef = useRef(audioInputDeviceId)
   const liveAudioSessionIdRef = useRef(0)
   const liveAudioInFlightFramesRef = useRef(0)
+  const markSilenceInFlightRef = useRef<number | null>(null)
   const uiTextSizeHydrationOverriddenRef = useRef(false)
   const uiThemeHydrationOverriddenRef = useRef(false)
   const isSwitchingResponseProfileRef = useRef(false)
@@ -218,6 +225,8 @@ function App() {
   const ttsGenerationRef = useRef(0)
   const ttsEnabledRef = useRef(false)
   const ttsPlaybackIdRef = useRef<number | null>(null)
+  const cueAssetPathsRef = useRef<CueAssetPaths>(DEFAULT_CUE_ASSET_PATHS)
+  const fallbackCueAssetPathsRef = useRef<CueAssetPaths>(DEFAULT_CUE_ASSET_PATHS)
   const uiTextSizeWriteRevisionRef = useRef(0)
   const uiThemeWriteRevisionRef = useRef(0)
   const ttsWriteRevisionRef = useRef(0)
@@ -450,6 +459,24 @@ function App() {
     })
     return () => { active = false }
   }, [addNotice])
+
+  const voiceCuesCanPrepare = startupState.kind === 'ready' && capabilityIsAvailable(startupState, 'tts')
+  useEffect(() => {
+    if (!voiceCuesCanPrepare || !isNativeTauriRuntime() || preparedCueAssetPaths !== null) return
+    let active = true
+    let attempts = 0
+    let retry: ReturnType<typeof setTimeout> | null = null
+    const prepare = (): void => {
+      attempts += 1
+      void prepareVoiceCues()
+        .then((paths) => { if (active) setPreparedCueAssetPaths(paths) })
+        .catch(() => {
+          if (active && attempts < 3) retry = setTimeout(prepare, 2_000)
+        })
+    }
+    prepare()
+    return () => { active = false; if (retry !== null) clearTimeout(retry) }
+  }, [voiceCuesCanPrepare, preparedCueAssetPaths])
 
   useEffect(() => {
     const onEscape = (event: globalThis.KeyboardEvent) => {
@@ -760,16 +787,21 @@ function App() {
     pendingTtsCommands > 0
 
   const canToggleMic = voiceInputReady(startupState) && !micStarting && !updateRuntimeBlocked
+  const selectedAudioInputDevice = audioInputDevices.find((device) => device.deviceId === audioInputDeviceId)
   const voiceInputUnavailableReason = startupState.kind === 'ready'
     ? (startupState.voiceInputError ?? (startupState.capabilities
       .filter((capability) => ['wake_word', 'vad', 'parakeet'].includes(capability.id) && capability.state !== 'available')
       .map((capability) => capability.reason ?? `${capabilityLabel(capability.id)} unavailable`)
       .join('; ') || 'required voice capabilities are unavailable'))
     : 'voice input is still starting'
-  const cueAssetPaths =
-    startupState.kind === 'ready'
-      ? startupState.cueAssetPaths
-      : DEFAULT_CUE_ASSET_PATHS
+  const fallbackCueAssetPaths = startupState.kind === 'ready'
+    ? startupState.cueAssetPaths
+    : DEFAULT_CUE_ASSET_PATHS
+  const cueAssetPaths = preparedCueAssetPaths ?? fallbackCueAssetPaths
+  useEffect(() => {
+    cueAssetPathsRef.current = cueAssetPaths
+    fallbackCueAssetPathsRef.current = fallbackCueAssetPaths
+  }, [cueAssetPaths, fallbackCueAssetPaths])
   const canToggleTts = startupState.kind === 'ready' &&
     capabilityIsAvailable(startupState, 'tts') && !isSwitchingResponseProfile && !updateRuntimeBlocked
   const assistantControlsDisabled = startupState.kind !== 'ready' || assistantSettingsPending || isSwitchingResponseProfile || updateRuntimeBlocked
@@ -905,7 +937,7 @@ function App() {
         },
       })
 
-      void playCue(cueType, cueAssetPaths)
+       void playCueWithFallback(cueType, cueAssetPathsRef.current, fallbackCueAssetPathsRef.current)
         .then(() => {
           voiceTelemetry.record('cue_play_started', {
             details: {
@@ -967,7 +999,7 @@ function App() {
         },
       })
 
-      void playCue(cueType, cueAssetPaths)
+       void playCueWithFallback(cueType, cueAssetPathsRef.current, fallbackCueAssetPathsRef.current)
         .then(() => {
           voiceTelemetry.record('cue_play_started', {
             details: {
@@ -1064,7 +1096,11 @@ function App() {
     const nextStatus = toRuntimeStatus(runtimePhase.runtimePhase)
 
     applyRuntimeStatus(nextStatus)
-    if (previousStatus === 'sleeping') {
+    if (
+      previousStatus === 'sleeping' ||
+      typeof runtimePhase.telemetry?.transcriptionStartedMs === 'number' ||
+      typeof runtimePhase.telemetry?.transcriptionCompletedMs === 'number'
+    ) {
       recordRuntimeControlTelemetry(runtimePhase)
     }
 
@@ -1236,7 +1272,14 @@ function App() {
         return
       }
       if (event.kind === 'text') {
+        if (source === 'voice' && active.text.length === 0 && event.text.length > 0) {
+          voiceTelemetry.record('provider_first_text')
+        }
+        const hadCompleteLine = active.text.includes('\n')
         active.text += event.text
+        if (source === 'voice' && !hadCompleteLine && active.text.includes('\n')) {
+          voiceTelemetry.record('provider_first_line')
+        }
         if (active.tts && ttsEnabledRef.current && !active.ttsFirstLineSpoken && active.text.includes('\n')) {
           const firstLine = firstNonEmptyStreamingLine(active.text)
           if (firstLine !== null && isValidTtsFirstLine(firstLine)) {
@@ -1291,6 +1334,11 @@ function App() {
         setMessages((current) => current.map((message) => message.id === active.assistantId
           ? { ...message, answerStage: { stages: active.stages, priorVersions: active.priorVersions, sources: active.sources } } : message))
       }
+      if (event.kind === 'custom_direct_timings') {
+        setMessages((current) => current.map((message) => message.id === active.assistantId
+          ? { ...message, customDirectTimings: event.timings }
+          : message))
+      }
       if (event.kind === 'reasoning') {
         setPromptActivity(`Reasoning: ${event.text}`)
       }
@@ -1307,6 +1355,7 @@ function App() {
         setPromptActivity(event.message)
       }
     }
+    if (source === 'voice') voiceTelemetry.record('provider_request_started', { details: { provider: currentSettings.instant } })
     try {
       const result = await executePrompt(requestId, prompt, handleEvent, source)
       const active = promptRef.current
@@ -1318,6 +1367,7 @@ function App() {
       ) {
         return
       }
+      if (source === 'voice') voiceTelemetry.record('provider_completed', { details: { outcome: result.outcome } })
       active.terminal = true
       active.stages = active.stages.map((stage) => {
         if (result.outcome !== 'completed' && (stage.status === 'running' || stage.status === 'queued')) {
@@ -1418,6 +1468,7 @@ function App() {
     try {
       const speechText = firstNonEmptyCompletedLine(text) ?? ''
       if (!isValidTtsFirstLine(speechText)) return
+      voiceTelemetry.record('tts_synthesis_requested')
       playbackId = parseNativeAudioRequestId(
         await invokeTauriCommand('reserve_local_tts_playback_id'),
         'TTS playback',
@@ -1431,6 +1482,7 @@ function App() {
         text: speechText,
         playbackId,
       })
+      voiceTelemetry.record('tts_playback_completed')
       if (generation !== ttsGenerationRef.current || !ttsEnabledRef.current) return
 
       if (
@@ -1476,6 +1528,7 @@ function App() {
     liveAudioSessionId: number,
     telemetryFrameId: string | null = null,
   ): Promise<void> => {
+    voiceTelemetry.record('silence_detected')
     voiceTelemetry.record('cue_play_requested', {
       details: {
         cueType: 'stop_listening',
@@ -1483,20 +1536,18 @@ function App() {
       },
     })
 
-    try {
-      await playCue('stop_listening', cueAssetPaths)
-      voiceTelemetry.record('cue_play_started', {
+    void playCueWithFallback('stop_listening', cueAssetPathsRef.current, fallbackCueAssetPathsRef.current)
+      .then(() => voiceTelemetry.record('cue_play_started', {
         details: {
           cueType: 'stop_listening',
           source: 'mark_silence',
         },
-      })
-    } catch (error) {
-      reportCuePlaybackError('stop_listening', error)
-    }
+      }))
+      .catch((error: unknown) => reportCuePlaybackError('stop_listening', error))
 
     if (liveAudioSessionId !== liveAudioSessionIdRef.current) return
 
+    voiceTelemetry.record('mark_silence_submitted')
     const runtimePhase = await syncRuntimeControl(
       'mark_silence',
       telemetryFrameId === null
@@ -1512,12 +1563,14 @@ function App() {
     )
 
     if (liveAudioSessionId !== liveAudioSessionIdRef.current) return
+    voiceTelemetry.record('mark_silence_resolved')
     clearPartialTranscript()
     maybeRunVoiceTranscript(runtimePhase)
   }
 
   const stopLiveAudio = (content: string | null = null): void => {
     liveAudioSessionIdRef.current += 1
+    markSilenceInFlightRef.current = null
     liveAudioStartAbortRef.current?.abort()
     liveAudioStartAbortRef.current = null
     liveAudioSourceRef.current?.stop()
@@ -1542,12 +1595,15 @@ function App() {
 
   const reportLiveAudioError = (error: unknown): void => {
     const message = error instanceof Error ? error.message : 'Live audio capture failed'
+    const recovery = message === 'Native microphone processing fell behind'
+      ? ' Capture stopped; select Start mic to resume.'
+      : ''
 
     recordRuntimeDiagnostic('audio', `Live audio error: ${message}`)
     addNotice({
       tone: 'error',
       title: 'Microphone unavailable',
-      message,
+      message: `${message}${recovery}`,
     })
     stopLiveAudio()
   }
@@ -1562,6 +1618,8 @@ function App() {
 
     const liveAudioSessionId = liveAudioSessionIdRef.current + 1
     liveAudioSessionIdRef.current = liveAudioSessionId
+    const wakeClipBuffer = createWakeClipBuffer()
+    let wakeClipSleeping = true
 
     setMicStarting(true)
 
@@ -1579,6 +1637,7 @@ function App() {
           liveAudioInFlightFramesRef.current += 1
 
           try {
+            if (wakeClipSleeping) wakeClipBuffer.push(frame)
             const nowMs = Date.now()
             const frameId = voiceTelemetry.nextFrameId(nowMs)
 
@@ -1598,12 +1657,25 @@ function App() {
               frameId === null ? {} : { telemetryFrameId: frameId },
             )
 
+            const detected = typeof status?.telemetry?.wakeDetectedMs === 'number'
+            if (detected) {
+              const samples = wakeClipBuffer.take()
+              const confidence = status?.telemetry?.wakeConfidence
+              if (typeof confidence === 'number' && Number.isFinite(confidence)) {
+                void invokeTauriCommand('save_wake_clip', { samples, confidence }).catch((reason: unknown) => {
+                  addNotice({ tone: 'error', title: 'Wake clip not saved', message: reason instanceof Error ? reason.message : String(reason) })
+                })
+              }
+            }
             if (liveAudioSessionId !== liveAudioSessionIdRef.current) {
+              wakeClipBuffer.clear()
               return
             }
 
             if (status !== null) {
               const nextStatus = toRuntimeStatus(status.runtimePhase)
+              if (!detected && nextStatus !== 'sleeping') wakeClipBuffer.clear()
+              wakeClipSleeping = nextStatus === 'sleeping'
 
               applyRuntimeControlResult(status, { quiet: true })
               voiceActivityStateRef.current = syncVoiceActivityState(
@@ -1621,8 +1693,19 @@ function App() {
 
                 voiceActivityStateRef.current = voiceActivityUpdate.state
 
-                if (voiceActivityUpdate.shouldMarkSilence) {
-                  await handleMarkSilence(liveAudioSessionId, frameId)
+                if (voiceActivityUpdate.shouldMarkSilence && markSilenceInFlightRef.current === null) {
+                  markSilenceInFlightRef.current = liveAudioSessionId
+                  void handleMarkSilence(liveAudioSessionId, frameId)
+                    .catch((error: unknown) => {
+                      if (liveAudioSessionId !== liveAudioSessionIdRef.current) return
+                      enterRuntimeError()
+                      reportLiveAudioError(error)
+                    })
+                    .finally(() => {
+                      if (markSilenceInFlightRef.current === liveAudioSessionId) {
+                        markSilenceInFlightRef.current = null
+                      }
+                    })
                 }
               }
             }
@@ -2032,14 +2115,47 @@ function App() {
   const canIncreaseTextSize = uiTextSizeIndex < UI_TEXT_SIZE_STEPS.length - 1
   const nextUiThemeLabel = uiTheme === 'dark' ? 'light' : 'dark'
   const themeToggleLabel = `Switch to ${nextUiThemeLabel} mode`
+  const customFailure = (startupState.kind === 'ready' || startupState.kind === 'warming_model')
+    ? startupState.capabilities.find((capability) => capability.id === 'custom_provider' &&
+      (capability.state === 'failed' || capability.state === 'unavailable'))
+    : undefined
+
+  const retryCustom = async (): Promise<void> => {
+    if (customRetryPending) return
+    setCustomRetryPending(true)
+    try {
+      await invokeTauriCommand('retry_custom_provider')
+      applyStartupState(await loadStartupState(), false)
+    } catch (error) {
+      addNotice({ tone: 'error', title: 'Custom retry failed', message: toDisplayErrorMessage(error) })
+      try {
+        const latest = await loadStartupState()
+        if (latest.kind === 'ready') applyStartupState(latest, false)
+      } catch { /* Retain the persistent capability reason until the next startup poll. */ }
+    } finally {
+      setCustomRetryPending(false)
+    }
+  }
 
   return (
-    <div className="shell" data-ui-text-size={uiTextSize} data-ui-theme={uiTheme}>
+    <div className="shell" data-ui-text-size={uiTextSize} data-ui-theme={uiTheme} style={customFailure ? { gridTemplateRows: 'auto 1fr auto' } : undefined}>
+
+      {customFailure ? <div role="alert" style={{ padding: '.65rem 1rem', background: 'var(--danger-bg)', color: '#fff' }}>
+        Custom connection: {customFailure.reason}{' '}
+        <button type="button" aria-label="Retry Custom" disabled={customRetryPending} onClick={() => void retryCustom()}>Retry Custom</button>
+      </div> : null}
 
       <main ref={conversationRef} className="conversation" aria-live="polite">
         {visibleMessages.map((message) => (
           message.answerStage && message.role === 'assistant' ? (
-            <AnswerStage key={message.id} answer={message.content} className="message message--assistant" {...message.answerStage} />
+            message.customDirectTimings ? (
+              <div key={message.id} style={{ maxWidth: 'min(42rem, 100%)' }}>
+                <AnswerStage answer={message.content} className="message message--assistant" {...message.answerStage} />
+                <small style={{ display: 'block', marginTop: '.35rem', color: 'var(--text-muted)' }}>
+                  First text: {formatDirectDuration(message.customDirectTimings.firstTextMs)} · Completed: {formatDirectDuration(message.customDirectTimings.completedMs)}
+                </small>
+              </div>
+            ) : <AnswerStage key={message.id} answer={message.content} className="message message--assistant" {...message.answerStage} />
           ) : <ChatBubble key={message.id} message={message} />
         ))}
       </main>
@@ -2105,7 +2221,7 @@ function App() {
                 </button>
               </div>
             </div>
-            <div className="settings-panel__row">
+            <div className="settings-panel__row settings-panel__mic-row">
               <div>
                 <label htmlFor="audioInputDevice"><strong>Microphone</strong></label>
                 <p className="settings-panel__hint">Choose the input used for wake-word listening.</p>
@@ -2113,6 +2229,7 @@ function App() {
               <select
                 id="audioInputDevice"
                 aria-label="Microphone"
+                title={selectedAudioInputDevice?.label ?? ''}
                 value={audioInputDeviceId ?? ''}
                 disabled={micStarting || updateRuntimeBlocked}
                 onChange={(event) => changeAudioInputDevice(event.target.value)}
@@ -2122,11 +2239,17 @@ function App() {
                   <option key={device.deviceId} value={device.deviceId}>{device.label}</option>
                 ))}
               </select>
+              {selectedAudioInputDevice && (
+                <p className="settings-panel__hint settings-panel__mic-name">{selectedAudioInputDevice.label}</p>
+              )}
             </div>
             <div className="settings-panel__assistant">
               <label><strong>Instant</strong><select id="assistantInstantSelect" aria-label="Instant" value={assistantSettings.instant} disabled={assistantControlsDisabled} onChange={(event) => void changeInstant(event.target.value as AssistantSettings['instant'])}>
                 {instantOptions(assistantCapabilities).map((option) => <option key={option.value} value={option.value} disabled={!option.available && !localInstantCanRetry(startupState, option.value)} title={option.reason}>{option.label}{option.available ? '' : ` — ${option.reason}`}</option>)}
               </select></label>
+              {startupState.kind === 'ready' && !assistantCapabilities.custom ? (
+                <p className="settings-panel__hint">Custom connection: {startupState.capabilities.find((capability) => capability.id === 'custom_provider')?.reason ?? 'unavailable'}</p>
+              ) : null}
               {selectedInstantRetryable ? <button type="button" aria-label="Retry local profile" onClick={() => void changeInstant(assistantSettings.instant)}>Retry local profile</button> : null}
               <label><strong>Deep model</strong><select aria-label="Deep model" value={assistantSettings.deep} disabled={assistantControlsDisabled} onChange={(event) => {
                 const value = event.target.value as AssistantSettings['deep']
@@ -2154,6 +2277,8 @@ function App() {
               <p className="settings-panel__hint">Prefetch may transmit unaccepted predicted text when enabled.</p>
             </div>
             <UpdateSettings updates={appUpdates} installationDisabled={updateInstallationDisabled} />
+            <WakeDiagnostics disabled={!voiceInputReady(startupState) || updateRuntimeBlocked} />
+            <WakeClipSettings />
           </section>
         </div>
       ) : null}
@@ -2246,6 +2371,9 @@ function App() {
           >
             {micStarting ? 'Starting mic...' : micActive ? 'Stop mic' : 'Start mic'}
           </button>
+          <span className="composer__instant-model" aria-label={`Selected Instant model: ${selectedInstantOption?.label ?? 'Loading'}`}>
+            <strong>Instant:</strong> {selectedInstantOption?.label ?? 'Loading'}
+          </span>
           {!voiceInputReady(startupState) ? (
             <span id="voice-input-help" className="sr-only">{voiceInputUnavailableReason}</span>
           ) : null}
@@ -2301,6 +2429,10 @@ function App() {
 
 function toRuntimeStatus(runtimePhase: BackendRuntimePhase): RuntimeStatus {
   return runtimePhase
+}
+
+function formatDirectDuration(milliseconds: number): string {
+  return milliseconds < 1000 ? `${milliseconds} ms` : `${(milliseconds / 1000).toFixed(2)} s`
 }
 
 function getResponseProfileLabel(profile: ResponseProfile): 'Fast' | 'Quality' {

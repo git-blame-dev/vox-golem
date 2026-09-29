@@ -1,11 +1,64 @@
-import { describe, expect, it, vi } from 'vitest'
-import { playCue } from './audioCues'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { playCue, playCueWithFallback, prepareVoiceCues } from './audioCues'
 import { DEFAULT_CUE_ASSET_PATHS } from './startupState'
 
 const WINDOWS_CUE_PATH = 'C:\\bundle\\start-listening.wav'
 const WINDOWS_CUE_FILE_URL = 'file:///C:/bundle/start-listening.wav'
 
+afterEach(() => {
+  Reflect.deleteProperty(window, '__TAURI_INTERNALS__')
+})
+
+describe('prepareVoiceCues', () => {
+  it('loads the two prepared local WAV URLs without changing the embedded fallback', async () => {
+    const start = 'data:audio/wav;base64,AAEC'
+    const stop = 'data:audio/wav;base64,AQID'
+    const shortStop = 'data:audio/wav;base64,BAUG'
+    window.__TAURI_INTERNALS__ = {
+      invoke: vi.fn(async () => ({ start_listening: start, stop_listening: stop, stop_listening_short: shortStop })),
+    }
+
+    const prepared = await prepareVoiceCues()
+
+    expect(prepared).toEqual({ startListening: start, stopListening: stop, stopListeningShort: shortStop })
+    expect(window.__TAURI_INTERNALS__.invoke).toHaveBeenCalledWith('prepare_voice_cues')
+    expect(DEFAULT_CUE_ASSET_PATHS).toEqual({
+      startListening: 'resources/start-listening.wav',
+      stopListening: 'resources/stop-listening.wav',
+    })
+  })
+
+  it('rejects incomplete or nonlocal cue responses', async () => {
+    window.__TAURI_INTERNALS__ = {
+      invoke: vi.fn(async () => ({
+        start_listening: 'data:audio/wav;base64,AAEC',
+        stop_listening: 'https://example.test/audio.wav',
+      })),
+    }
+
+    await expect(prepareVoiceCues()).rejects.toThrow('Local voice cue URL is invalid')
+  })
+})
+
 describe('playCue', () => {
+  it('falls back to the embedded chime when prepared voice playback fails', async () => {
+    const voice = 'data:audio/wav;base64,AAEC'
+    const play = vi.fn(async (source: string) => {
+      if (source === voice) throw new Error('voice playback failed')
+    })
+
+    await playCueWithFallback(
+      'stop_listening',
+      { ...DEFAULT_CUE_ASSET_PATHS, stopListening: voice },
+      DEFAULT_CUE_ASSET_PATHS,
+      { play },
+    )
+
+    expect(play.mock.calls.map(([source]) => source)).toEqual([
+      voice,
+      DEFAULT_CUE_ASSET_PATHS.stopListening,
+    ])
+  })
   it('plays the configured start-listening cue', async () => {
     const play = vi.fn(async () => undefined)
 

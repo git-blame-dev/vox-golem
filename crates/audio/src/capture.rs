@@ -129,6 +129,14 @@ impl AudioCaptureService {
         enumerate_input_devices()
     }
 
+    pub fn is_capturing(&self) -> Result<bool, CaptureError> {
+        self.shared
+            .state
+            .lock()
+            .map(|state| state.current_id.is_some())
+            .map_err(|_| CaptureError::StatePoisoned)
+    }
+
     pub fn reserve_id(&self) -> Result<u64, CaptureError> {
         if self.shared.shutting_down.load(Ordering::Acquire) {
             return Err(CaptureError::ShuttingDown);
@@ -299,13 +307,27 @@ fn enumerate_input_devices() -> Result<Vec<InputDevice>, CaptureError> {
             let description = device.description().ok()?;
             let id = device.id().ok()?;
             (description.driver() != Some("null"))
-                .then(|| input_device_descriptor(&id, description.name()))
+                .then(|| input_device_descriptor(&id, &description, cfg!(windows)))
         })
         .collect();
     Ok(devices)
 }
 
-fn input_device_descriptor(id: &cpal::DeviceId, label: &str) -> InputDevice {
+fn input_device_descriptor(
+    id: &cpal::DeviceId,
+    description: &cpal::DeviceDescription,
+    prefer_friendly_name: bool,
+) -> InputDevice {
+    let label = prefer_friendly_name
+        .then(|| {
+            description
+                .extended()
+                .iter()
+                .find(|name| !name.trim().is_empty())
+                .map(String::as_str)
+        })
+        .flatten()
+        .unwrap_or_else(|| description.name());
     InputDevice {
         id: id.to_string(),
         label: label.to_string(),
@@ -693,22 +715,58 @@ mod tests {
     use std::sync::Barrier;
 
     #[test]
+    fn capture_status_tracks_the_authoritative_capture_not_reserved_ids() {
+        let service = AudioCaptureService::new();
+        let id = service.reserve_id().unwrap();
+        assert_eq!(service.is_capturing(), Ok(false));
+        service.shared.state.lock().unwrap().current_id = Some(id);
+        assert_eq!(service.is_capturing(), Ok(true));
+        service.stop(id).unwrap();
+        assert_eq!(service.is_capturing(), Ok(false));
+    }
+
+    #[test]
     fn reordered_duplicate_labels_preserve_stable_device_ids() {
         let host_id = cpal::default_host().id();
         let first_id = cpal::DeviceId(host_id, "stable-first".to_string());
         let second_id = cpal::DeviceId(host_id, "stable-second".to_string());
+        let generic = cpal::DeviceDescriptionBuilder::new("Microphone").build();
         let listed = [
-            input_device_descriptor(&first_id, "Microphone"),
-            input_device_descriptor(&second_id, "Microphone"),
+            input_device_descriptor(&first_id, &generic, false),
+            input_device_descriptor(&second_id, &generic, false),
         ];
         let reordered = [
-            input_device_descriptor(&second_id, "Microphone"),
-            input_device_descriptor(&first_id, "Microphone"),
+            input_device_descriptor(&second_id, &generic, false),
+            input_device_descriptor(&first_id, &generic, false),
         ];
 
         assert_eq!(listed[0].id, reordered[1].id);
         assert_eq!(listed[1].id, reordered[0].id);
         assert_ne!(listed[0].id, listed[1].id);
+    }
+
+    #[test]
+    fn full_windows_friendly_names_distinguish_generic_microphones() {
+        let host_id = cpal::default_host().id();
+        let first_id = cpal::DeviceId(host_id, "synthetic-usb".to_string());
+        let second_id = cpal::DeviceId(host_id, "synthetic-virtual".to_string());
+        let usb = cpal::DeviceDescriptionBuilder::new("Microphone")
+            .add_extended_line("Microphone (Example USB)")
+            .build();
+        let virtual_mic = cpal::DeviceDescriptionBuilder::new("Microphone")
+            .add_extended_line("Microphone (Example Virtual)")
+            .build();
+
+        let first = input_device_descriptor(&first_id, &usb, true);
+        let second = input_device_descriptor(&second_id, &virtual_mic, true);
+
+        assert_eq!(first.label, "Microphone (Example USB)");
+        assert_eq!(second.label, "Microphone (Example Virtual)");
+        assert_ne!(first.id, second.id);
+        assert_eq!(
+            input_device_descriptor(&first_id, &usb, false).label,
+            "Microphone"
+        );
     }
 
     #[test]

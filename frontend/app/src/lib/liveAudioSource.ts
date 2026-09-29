@@ -1,6 +1,6 @@
 import { getTauriInternals } from './tauri'
 
-const MAX_PENDING_FRAMES = 8
+const MAX_PENDING_FRAMES = 32
 
 export interface LiveAudioSource {
   stop(): void

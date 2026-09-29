@@ -35,10 +35,10 @@ describe('AnswerStage', () => {
       ],
     })
 
-    expect(container.querySelector('h2')?.textContent).toBe('Current answer')
+    expect(container.querySelector('h2')).toBeNull()
     expect(container.querySelector('.answer-stage__answer')?.textContent).toContain('<em>safe</em> **plain text**')
     expect(container.querySelector('.answer-stage__answer em')).toBeNull()
-    expect(container.querySelector('[aria-label="Instant status: completed"]')).toBeTruthy()
+    expect(container.querySelector('[aria-label="Instant status: completed"]')).toBeNull()
     expect(container.querySelector('[aria-label="Deep status: running"]')).toBeTruthy()
     expect(container.querySelector('[aria-label="Review status: queued"]')).toBeTruthy()
   })
@@ -66,5 +66,11 @@ describe('AnswerStage', () => {
   it('omits history when no prior versions were recorded', () => {
     const container = render({ answer: 'answer', stages: [], priorVersions: [] })
     expect(container.querySelector('details')).toBeNull()
+  })
+
+  it('does not render an empty status list after an Instant-only answer completes', () => {
+    const container = render({ answer: 'Done', stages: [{ stage: 'instant', status: 'completed' }] })
+    expect(container.querySelector('[aria-label="Answer stage status"]')).toBeNull()
+    expect(container.querySelector('.answer-stage__answer')?.textContent).toBe('Done')
   })
 })

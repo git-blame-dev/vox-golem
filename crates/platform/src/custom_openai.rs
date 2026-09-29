@@ -17,13 +17,16 @@ const AUTH_EXPIRY_MARGIN_MS: u64 = 60_000;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CustomOpenAiModel {
     SolHigh,
+    SolNone,
+    LunaNone,
     LunaLow,
 }
 
 impl CustomOpenAiModel {
     pub fn model_id(self) -> &'static str {
         match self {
-            Self::SolHigh => "gpt-5.6-sol",
+            Self::SolHigh | Self::SolNone => "gpt-6-sol",
+            Self::LunaNone => "gpt-6-luna",
             Self::LunaLow => "gpt-5.6-luna",
         }
     }
@@ -31,6 +34,7 @@ impl CustomOpenAiModel {
     pub fn reasoning_effort(self) -> &'static str {
         match self {
             Self::SolHigh => "high",
+            Self::SolNone | Self::LunaNone => "none",
             Self::LunaLow => "low",
         }
     }
@@ -228,7 +232,6 @@ impl CustomOpenAiClient {
         if prompt.session_id.trim().is_empty() || prompt.prompt.trim().is_empty() {
             return Err(CustomOpenAiError::InvalidPrompt);
         }
-        let started = Instant::now();
         let credential = load_credential(&self.config.auth_path)?;
         let mut authorization = HeaderValue::from_str(&format!("Bearer {}", credential.access))
             .map_err(|_| CustomOpenAiError::AuthUnavailable)?;
@@ -237,7 +240,7 @@ impl CustomOpenAiClient {
             .map_err(|_| CustomOpenAiError::AuthUnavailable)?;
         account_id.set_sensitive(true);
         let request = build_request(&self.config, prompt, instructions);
-        let response = self
+        let request = self
             .client
             .post(&self.config.endpoint)
             .header(ACCEPT, "text/event-stream")
@@ -247,10 +250,9 @@ impl CustomOpenAiClient {
             .header("Originator", "opencode")
             .header("session-id", &prompt.session_id)
             .timeout(self.config.total_timeout)
-            .json(&request)
-            .send()
-            .await
-            .map_err(map_transport_error)?;
+            .json(&request);
+        let started = Instant::now();
+        let response = request.send().await.map_err(map_transport_error)?;
         let headers_at = started.elapsed();
         if !response.status().is_success() {
             return Err(map_http_status(response.status()));
@@ -295,7 +297,7 @@ impl CustomOpenAiClient {
                             event.delta.as_deref().filter(|delta| !delta.is_empty())
                         {
                             accumulator.push(delta, CustomOpenAiContentType::OutputText)?;
-                            first_text_at.get_or_insert_with(|| started.elapsed());
+                            record_first_visible_text(&mut first_text_at, started, delta);
                             on_delta(delta);
                         }
                     }
@@ -304,7 +306,7 @@ impl CustomOpenAiClient {
                             event.delta.as_deref().filter(|delta| !delta.is_empty())
                         {
                             accumulator.push(delta, CustomOpenAiContentType::Refusal)?;
-                            first_text_at.get_or_insert_with(|| started.elapsed());
+                            record_first_visible_text(&mut first_text_at, started, delta);
                             on_delta(delta);
                         }
                     }
@@ -340,6 +342,12 @@ impl CustomOpenAiClient {
                 completed_at,
             },
         })
+    }
+}
+
+fn record_first_visible_text(first_text_at: &mut Option<Duration>, started: Instant, delta: &str) {
+    if first_text_at.is_none() && delta.chars().any(|character| !character.is_whitespace()) {
+        *first_text_at = Some(started.elapsed());
     }
 }
 
@@ -747,12 +755,26 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn first_visible_text_clock_ignores_leading_whitespace_deltas() {
+        let started = Instant::now();
+        let mut first = None;
+        super::record_first_visible_text(&mut first, started, " \n");
+        assert_eq!(first, None);
+        std::thread::sleep(Duration::from_millis(8));
+        super::record_first_visible_text(&mut first, started, "Ready");
+        let visible_at = first.expect("visible text should start the clock");
+        assert!(visible_at >= Duration::from_millis(8));
+        super::record_first_visible_text(&mut first, started, " again");
+        assert_eq!(first, Some(visible_at));
+    }
+
     #[tokio::test]
     async fn respond_streams_text_and_sends_sensitive_compatible_request() {
         let events = sse(&[
             r#"{"type":"response.output_text.delta","delta":"hel"}"#,
             r#"{"type":"response.output_text.delta","delta":"lo"}"#,
-            r#"{"type":"response.completed","response":{"model":"gpt-5.6-sol","service_tier":"default","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,"input_tokens_details":{"cached_tokens":3}}}}"#,
+            r#"{"type":"response.completed","response":{"model":"gpt-6-sol","service_tier":"default","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,"input_tokens_details":{"cached_tokens":3}}}}"#,
         ]);
         let (request, deltas, result) = fixture(
             200,
@@ -768,7 +790,7 @@ mod tests {
         assert!(request_text.contains("originator: opencode"));
         let body = request_text.split("\r\n\r\n").nth(1).unwrap();
         let body: Value = serde_json::from_str(body).unwrap();
-        assert_eq!(body["model"], "gpt-5.6-sol");
+        assert_eq!(body["model"], "gpt-6-sol");
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["store"], false);
         assert!(body.get("tools").is_none());
@@ -776,6 +798,9 @@ mod tests {
         assert_eq!(response.text, "hello");
         assert_eq!(deltas, "hello");
         assert_eq!(response.usage.unwrap().cached_input_tokens, Some(3));
+        assert!(response.timings.first_text_at.is_some());
+        assert!(response.timings.headers_at <= response.timings.first_text_at.unwrap());
+        assert!(response.timings.first_text_at.unwrap() <= response.timings.completed_at);
     }
 
     #[tokio::test]
@@ -866,10 +891,38 @@ mod tests {
 
     #[test]
     fn maps_sol_and_luna_without_substitution() {
-        assert_eq!(CustomOpenAiModel::SolHigh.model_id(), "gpt-5.6-sol");
+        assert_eq!(CustomOpenAiModel::SolHigh.model_id(), "gpt-6-sol");
         assert_eq!(CustomOpenAiModel::SolHigh.reasoning_effort(), "high");
+        assert_eq!(CustomOpenAiModel::SolNone.model_id(), "gpt-6-sol");
+        assert_eq!(CustomOpenAiModel::SolNone.reasoning_effort(), "none");
         assert_eq!(CustomOpenAiModel::LunaLow.model_id(), "gpt-5.6-luna");
         assert_eq!(CustomOpenAiModel::LunaLow.reasoning_effort(), "low");
+    }
+
+    #[test]
+    fn direct_sol_without_reasoning_preserves_the_custom_request_contract() {
+        let config = CustomOpenAiConfig {
+            model: CustomOpenAiModel::SolNone,
+            ..CustomOpenAiConfig::default()
+        };
+        let request = build_request(&config, &prompt(), None);
+        assert_eq!(request["model"], "gpt-6-sol");
+        assert_eq!(request["reasoning"]["effort"], "none");
+        assert_eq!(request["store"], false);
+        assert!(request.get("tools").is_none());
+    }
+
+    #[test]
+    fn direct_gpt6_luna_without_reasoning_sends_exact_model_and_effort() {
+        let config = CustomOpenAiConfig {
+            model: CustomOpenAiModel::LunaNone,
+            ..CustomOpenAiConfig::default()
+        };
+        let request = build_request(&config, &prompt(), None);
+        assert_eq!(request["model"], "gpt-6-luna");
+        assert_eq!(request["reasoning"]["effort"], "none");
+        assert_eq!(request["store"], false);
+        assert!(request.get("tools").is_none());
     }
 
     #[test]

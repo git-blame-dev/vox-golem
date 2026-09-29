@@ -25,6 +25,16 @@ export function parsePromptExecutionEvent(payload: unknown): PromptExecutionEven
     return { requestId, kind, text }
   }
 
+  if (kind === 'custom_direct_timings') {
+    const firstTextMs = payload['first_text_ms']
+    const completedMs = payload['completed_ms']
+    if (!Number.isSafeInteger(firstTextMs) || !Number.isSafeInteger(completedMs) ||
+        (firstTextMs as number) < 0 || (completedMs as number) < (firstTextMs as number)) {
+      throw new Error('Custom direct timings must include ordered nonnegative milliseconds')
+    }
+    return { requestId, kind, timings: { firstTextMs: firstTextMs as number, completedMs: completedMs as number } }
+  }
+
   if (kind === 'correction') {
     const text = payload['text']
     const correction = payload['correction']

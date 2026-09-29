@@ -319,6 +319,20 @@
   gap: 1rem;
 }
 
+.settings-panel__mic-row {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.settings-panel__mic-row select {
+  width: 100%;
+  min-width: 0;
+}
+
+.settings-panel__mic-name {
+  overflow-wrap: anywhere;
+}
+
 .settings-panel__stepper {
   display: inline-flex;
   align-items: center;
@@ -392,7 +406,6 @@
 }
 
 .answer-stage { max-width: min(42rem, 100%); padding: .85rem 1rem; border: 1px solid var(--message-assistant-border); border-radius: .9rem; background: var(--message-assistant-bg); }
-.answer-stage h2 { margin: 0 0 .5rem; font-size: 1em; }
 .answer-stage__answer { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; }
 .answer-stage__statuses { display: flex; flex-wrap: wrap; gap: .5rem 1rem; padding: 0; margin: .75rem 0 0; list-style: none; color: var(--text-muted); font-size: .82em; }
 .answer-stage__history { margin-top: .75rem; color: var(--text-muted); }
@@ -463,6 +476,17 @@
 .composer__hint {
   color: var(--text-muted);
   font-size: 0.8em;
+}
+
+.composer__instant-model {
+  color: var(--text-muted);
+  font-size: 0.8em;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.composer__instant-model strong {
+  color: var(--text-primary);
 }
 
 .composer__send-side {

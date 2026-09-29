@@ -21,6 +21,9 @@ mod transcription;
 #[allow(dead_code)]
 mod tts;
 mod voice_activity;
+mod voice_cues;
+mod wake_clips;
+mod wake_diagnostics;
 mod wake_word;
 
 const DEFAULT_SILENCE_TIMEOUT_MS: u64 = 1_500;
@@ -78,6 +81,9 @@ type LlamaStartupRegistry = Arc<
 struct AppState {
     startup_state: Arc<Mutex<StartupStatePayload>>,
     runtime_config: Option<voxgolem_core::config::RuntimeConfig>,
+    custom_auth_source_path: Option<PathBuf>,
+    custom_auth_path: Mutex<Option<PathBuf>>,
+    custom_retry_lock: tokio::sync::Mutex<()>,
     selected_response_profile: Arc<Mutex<ResponseProfilePayload>>,
     supported_response_profiles: Vec<ResponseProfilePayload>,
     response_profile_switch_generation: Arc<AtomicU64>,
@@ -104,6 +110,8 @@ struct AppState {
     tts_playback: Mutex<TtsPlaybackState>,
     tts_startup_generation: Arc<AtomicU64>,
     local_tts_runtime: Mutex<Option<Arc<tts::LocalTtsRuntime>>>,
+    voice_cue_cache: tokio::sync::OnceCell<PreparedCueAssetPathsPayload>,
+    wake_clip_writers: Arc<tokio::sync::Semaphore>,
     tts_audio_playback: Arc<voxgolem_audio::playback::AudioPlaybackService>,
     llama_cpp_runtime: Arc<Mutex<Option<voxgolem_platform::llama_cpp::LlamaCppRuntime>>>,
     llama_cpp_conversation: Mutex<Vec<LlamaConversationTurn>>,
@@ -306,6 +314,10 @@ enum PromptExecutionEventPayload {
     Sources {
         sources: Vec<SourcePayload>,
     },
+    CustomDirectTimings {
+        first_text_ms: u64,
+        completed_ms: u64,
+    },
     Error {
         message: String,
     },
@@ -446,6 +458,13 @@ struct CueAssetPathsPayload {
     stop_listening: String,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct PreparedCueAssetPathsPayload {
+    start_listening: String,
+    stop_listening: String,
+    stop_listening_short: String,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum ResponseProfilePayload {
@@ -468,6 +487,8 @@ enum InstantChoicePayload {
     LocalFast,
     LocalQuality,
     CustomSolHigh,
+    CustomSolNone,
+    CustomLunaNone,
     CustomLunaLow,
     #[serde(rename = "opencode-sol-high")]
     OpenCodeSolHigh,
@@ -481,6 +502,8 @@ impl InstantChoicePayload {
             Self::LocalFast => "local-fast",
             Self::LocalQuality => "local-quality",
             Self::CustomSolHigh => "custom-sol-high",
+            Self::CustomSolNone => "custom-sol-none",
+            Self::CustomLunaNone => "custom-luna-none",
             Self::CustomLunaLow => "custom-luna-low",
             Self::OpenCodeSolHigh => "opencode-sol-high",
             Self::OpenCodeLunaLow => "opencode-luna-low",
@@ -491,7 +514,10 @@ impl InstantChoicePayload {
         match self {
             Self::LocalFast => "local_fast",
             Self::LocalQuality => "local_quality",
-            Self::CustomSolHigh | Self::CustomLunaLow => "custom_provider",
+            Self::CustomSolHigh
+            | Self::CustomSolNone
+            | Self::CustomLunaNone
+            | Self::CustomLunaLow => "custom_provider",
             Self::OpenCodeSolHigh | Self::OpenCodeLunaLow => "opencode",
         }
     }
@@ -559,6 +585,8 @@ impl From<AssistantSettingsPayload> for voxgolem_core::assistant::AssistantPrefe
                 InstantChoicePayload::LocalFast => InstantModel::LocalFast,
                 InstantChoicePayload::LocalQuality => InstantModel::LocalQuality,
                 InstantChoicePayload::CustomSolHigh => InstantModel::CustomSolHigh,
+                InstantChoicePayload::CustomSolNone => InstantModel::CustomSolNone,
+                InstantChoicePayload::CustomLunaNone => InstantModel::CustomLunaNone,
                 InstantChoicePayload::CustomLunaLow => InstantModel::CustomLunaLow,
                 InstantChoicePayload::OpenCodeSolHigh => InstantModel::OpenCodeSolHigh,
                 InstantChoicePayload::OpenCodeLunaLow => InstantModel::OpenCodeLunaLow,
@@ -591,6 +619,8 @@ impl From<&voxgolem_core::assistant::AssistantPreferences> for AssistantSettings
                 InstantModel::LocalFast => InstantChoicePayload::LocalFast,
                 InstantModel::LocalQuality => InstantChoicePayload::LocalQuality,
                 InstantModel::CustomSolHigh => InstantChoicePayload::CustomSolHigh,
+                InstantModel::CustomSolNone => InstantChoicePayload::CustomSolNone,
+                InstantModel::CustomLunaNone => InstantChoicePayload::CustomLunaNone,
                 InstantModel::CustomLunaLow => InstantChoicePayload::CustomLunaLow,
                 InstantModel::OpenCodeSolHigh => InstantChoicePayload::OpenCodeSolHigh,
                 InstantModel::OpenCodeLunaLow => InstantChoicePayload::OpenCodeLunaLow,
@@ -754,6 +784,112 @@ fn get_startup_state(app_state: tauri::State<'_, AppState>) -> StartupStatePaylo
 }
 
 #[tauri::command]
+async fn retry_custom_provider(
+    app_state: tauri::State<'_, AppState>,
+) -> Result<StartupStatePayload, String> {
+    let _retry_guard = app_state.custom_retry_lock.lock().await;
+    let config = app_state
+        .runtime_config
+        .as_ref()
+        .ok_or("startup config is not ready")?;
+    if !config.custom_openai.as_ref().is_some_and(|custom| {
+        custom.auth_source == voxgolem_core::config::CustomOpenAiAuthSource::Wsl
+    }) {
+        return Err(String::from("Custom WSL auth is not configured"));
+    }
+    let source = app_state.custom_auth_source_path.clone();
+    let resolved = tauri::async_runtime::spawn_blocking(move || {
+        voxgolem_platform::wsl::WslRunner::default()
+            .with_limits(Duration::from_secs(15), 4096)
+            .resolve_auth_path(source.as_deref())
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| String::from("Custom auth lookup worker failed"))?;
+    refresh_custom_auth_state(
+        config,
+        &app_state.custom_auth_path,
+        &app_state.startup_state,
+        resolved,
+    )?;
+    Ok(app_state
+        .startup_state
+        .lock()
+        .map_err(|_| String::from("startup state lock is poisoned"))?
+        .clone())
+}
+
+fn refresh_custom_auth_state(
+    config: &voxgolem_core::config::RuntimeConfig,
+    path_state: &Mutex<Option<PathBuf>>,
+    startup_state: &Arc<Mutex<StartupStatePayload>>,
+    resolved: Result<PathBuf, String>,
+) -> Result<(), String> {
+    let mut refreshed = config.clone();
+    apply_wsl_custom_auth_resolution(&mut refreshed, resolved);
+    let refreshed_capabilities = configured_capabilities(&refreshed);
+    let capability = refreshed_capabilities
+        .iter()
+        .find(|capability| capability.id == "custom_provider")
+        .cloned()
+        .ok_or("Custom capability is missing")?;
+    let path = (capability.state == CapabilityStatePayload::Available)
+        .then(|| {
+            refreshed
+                .custom_openai
+                .as_ref()
+                .map(|custom| custom.auth_path.clone())
+        })
+        .flatten();
+    let mut current_path = path_state
+        .lock()
+        .map_err(|_| "Custom auth state lock is poisoned")?;
+    let mut startup = startup_state
+        .lock()
+        .map_err(|_| "startup state lock is poisoned")?;
+    let capabilities = match &mut *startup {
+        StartupStatePayload::Ready { capabilities, .. }
+        | StartupStatePayload::WarmingModel { capabilities, .. } => capabilities,
+        StartupStatePayload::Error { .. } => return Err(String::from("startup is not ready")),
+    };
+    let existing = capabilities
+        .iter_mut()
+        .find(|item| item.id == "custom_provider")
+        .ok_or("Custom capability is missing")?;
+    *existing = capability;
+    for id in ["deep", "review"] {
+        if let (Some(current), Some(refreshed)) = (
+            capabilities.iter_mut().find(|item| item.id == id),
+            refreshed_capabilities.iter().find(|item| item.id == id),
+        ) {
+            if matches!(
+                current.state,
+                CapabilityStatePayload::Unavailable | CapabilityStatePayload::NotConfigured
+            ) {
+                *current = refreshed.clone();
+            }
+        }
+    }
+    *current_path = path;
+    Ok(())
+}
+
+fn custom_auth_path(
+    app_state: &AppState,
+    config: &voxgolem_core::config::CustomOpenAiConfig,
+) -> Result<PathBuf, String> {
+    if config.auth_source != voxgolem_core::config::CustomOpenAiAuthSource::Wsl {
+        return Ok(config.auth_path.clone());
+    }
+    app_state
+        .custom_auth_path
+        .lock()
+        .map_err(|_| String::from("Custom auth state lock is poisoned"))?
+        .clone()
+        .ok_or_else(|| String::from("Custom WSL auth is unavailable; retry Custom"))
+}
+
+#[tauri::command]
 async fn set_tts_enabled(
     enabled: bool,
     app_state: tauri::State<'_, AppState>,
@@ -854,6 +990,56 @@ async fn set_tts_enabled(
 fn reserve_local_tts_playback_id(app_state: tauri::State<'_, AppState>) -> Result<u64, String> {
     let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
     reserve_tts_playback_id(&app_state.tts_playback)
+}
+
+#[tauri::command]
+async fn prepare_voice_cues(
+    app_state: tauri::State<'_, AppState>,
+) -> Result<PreparedCueAssetPathsPayload, String> {
+    let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
+    app_state
+        .voice_cue_cache
+        .get_or_try_init(|| async {
+            let config = app_state
+                .runtime_config
+                .as_ref()
+                .ok_or_else(|| String::from("local voice configuration is unavailable"))?;
+            if !config.local_tts.model_path.is_file() {
+                return Err(String::from("local voice model is unavailable"));
+            }
+            let spec = config.local_tts.clone();
+            let logging_enabled = config.logging.enabled;
+            let existing = app_state
+                .local_tts_runtime
+                .lock()
+                .map_err(|_| String::from("local voice runtime lock is poisoned"))?
+                .clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let owned = if existing.is_none() {
+                    initialize_local_tts_runtime(&spec, true, logging_enabled)?.map(Arc::new)
+                } else {
+                    None
+                };
+                let runtime = existing
+                    .as_deref()
+                    .or(owned.as_deref())
+                    .ok_or_else(|| String::from("local voice runtime is unavailable"))?;
+                let (start_listening, stop_listening, stop_listening_short) =
+                    voice_cues::prepare_cue_urls(
+                        |text| runtime.synthesize(text),
+                        spec.output_gain_db,
+                    )?;
+                Ok::<_, String>(PreparedCueAssetPathsPayload {
+                    start_listening,
+                    stop_listening,
+                    stop_listening_short,
+                })
+            })
+            .await
+            .map_err(|_| String::from("local voice cue worker failed"))?
+        })
+        .await
+        .cloned()
 }
 
 #[tauri::command]
@@ -1187,6 +1373,200 @@ fn finish_tts_playback_state(
         state.current_id = None;
     }
     Ok(())
+}
+
+#[tauri::command]
+fn set_wake_diagnostics(
+    enabled: bool,
+    app_state: tauri::State<'_, AppState>,
+) -> Result<wake_diagnostics::WakeDiagnosticsSnapshot, String> {
+    update_wake_diagnostics(&app_state, Some(enabled), None)
+}
+
+#[tauri::command]
+fn get_wake_diagnostics(
+    app_state: tauri::State<'_, AppState>,
+) -> Result<wake_diagnostics::WakeDiagnosticsSnapshot, String> {
+    update_wake_diagnostics(&app_state, None, None)
+}
+
+#[tauri::command]
+fn mark_wake_diagnostics(
+    marker: wake_diagnostics::WakeDiagnosticMarker,
+    app_state: tauri::State<'_, AppState>,
+) -> Result<wake_diagnostics::WakeDiagnosticsSnapshot, String> {
+    update_wake_diagnostics(&app_state, None, Some(marker))
+}
+
+fn update_wake_diagnostics(
+    app_state: &AppState,
+    enabled: Option<bool>,
+    marker: Option<wake_diagnostics::WakeDiagnosticMarker>,
+) -> Result<wake_diagnostics::WakeDiagnosticsSnapshot, String> {
+    let capturing = app_state
+        .microphone_capture
+        .is_capturing()
+        .map_err(|error| error.to_string())?;
+    let phase = wake_diagnostic_phase(
+        current_runtime_phase(&app_state.voice_pipeline_state)?,
+        capturing,
+    );
+    let runtime = app_state
+        .wake_word_runtime
+        .as_ref()
+        .ok_or_else(|| String::from("Wake-word detection is unavailable"))?;
+    let mut runtime = runtime
+        .lock()
+        .map_err(|_| String::from("wake word runtime lock is poisoned"))?;
+    if let Some(enabled) = enabled {
+        runtime.set_diagnostics_enabled(enabled);
+    }
+    runtime.record_diagnostics_phase(phase);
+    Ok(match marker {
+        Some(marker) => runtime.mark_diagnostics(marker),
+        None => runtime.diagnostics_snapshot(),
+    })
+}
+
+#[tauri::command]
+fn get_wake_clip_settings() -> Result<wake_clips::ClipSettings, String> {
+    wake_clips::load_settings()
+}
+
+const WAKE_CLIP_WRITER_PERMITS: u32 = 2;
+
+async fn update_wake_clip_settings_with_writers<F>(
+    writers: Arc<tokio::sync::Semaphore>,
+    update: F,
+) -> Result<wake_clips::ClipSettings, String>
+where
+    F: FnOnce() -> Result<wake_clips::ClipSettings, String>,
+{
+    let _permits = tokio::time::timeout(
+        Duration::from_secs(5),
+        writers.acquire_many_owned(WAKE_CLIP_WRITER_PERMITS),
+    )
+    .await
+    .map_err(|_| String::from("wake clip writer is busy; could not update settings"))?
+    .map_err(|_| String::from("wake clip writer is unavailable"))?;
+    update()
+}
+
+#[tauri::command]
+async fn set_wake_clip_settings(
+    enabled: bool,
+    directory: String,
+    app_state: tauri::State<'_, AppState>,
+) -> Result<wake_clips::ClipSettings, String> {
+    update_wake_clip_settings_with_writers(Arc::clone(&app_state.wake_clip_writers), || {
+        wake_clips::set_settings(enabled, &directory)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn save_wake_clip(
+    samples: Vec<f32>,
+    confidence: f32,
+    app_state: tauri::State<'_, AppState>,
+) -> Result<Option<wake_clips::ClipMetadata>, String> {
+    let permit = Arc::clone(&app_state.wake_clip_writers)
+        .try_acquire_owned()
+        .map_err(|_| String::from("wake clip writer is busy; this clip was not saved"))?;
+    let settings = wake_clips::load_settings()?;
+    if !settings.enabled {
+        return Ok(None);
+    }
+    let model_file = app_state
+        .runtime_config
+        .as_ref()
+        .and_then(|config| config.wake_word_model_path.file_name())
+        .ok_or_else(|| String::from("active wake-word model is unavailable"))?
+        .to_string_lossy()
+        .into_owned();
+    let model_revision = app_state
+        .wake_word_runtime
+        .as_ref()
+        .ok_or_else(|| String::from("active wake-word runtime is unavailable"))?
+        .lock()
+        .map_err(|_| String::from("wake-word runtime lock is poisoned"))?
+        .model_revision()
+        .to_owned();
+    let saved = tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        wake_clips::save_clip(
+            Path::new(&settings.directory),
+            &model_file,
+            &model_revision,
+            &samples,
+            confidence,
+        )
+    })
+    .await
+    .map_err(|error| format!("wake clip worker stopped: {error}"))??;
+    Ok(Some(saved))
+}
+
+#[tauri::command]
+async fn list_wake_clips(offset: usize) -> Result<Vec<wake_clips::ClipMetadata>, String> {
+    let settings = wake_clips::load_settings()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        wake_clips::list_clips(Path::new(&settings.directory), offset)
+    })
+    .await
+    .map_err(|error| format!("wake clip listing failed: {error}"))?
+}
+
+#[tauri::command]
+fn play_wake_clip(profile: String, id: String) -> Result<String, String> {
+    let settings = wake_clips::load_settings()?;
+    wake_clips::clip_data_url(Path::new(&settings.directory), &profile, &id)
+}
+
+#[tauri::command]
+fn label_wake_clip(
+    profile: String,
+    id: String,
+    label: wake_clips::ClipLabel,
+) -> Result<wake_clips::ClipMetadata, String> {
+    let settings = wake_clips::load_settings()?;
+    wake_clips::set_label(Path::new(&settings.directory), &profile, &id, label)
+}
+
+#[tauri::command]
+async fn delete_wake_clip(profile: String, id: String) -> Result<(), String> {
+    let settings = wake_clips::load_settings()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        wake_clips::delete_clip(Path::new(&settings.directory), &profile, &id)
+    })
+    .await
+    .map_err(|error| format!("wake clip deletion worker stopped: {error}"))?
+}
+
+fn wake_diagnostic_phase(
+    phase: RuntimePhasePayload,
+    capturing: bool,
+) -> wake_diagnostics::WakeDiagnosticPhase {
+    use wake_diagnostics::WakeDiagnosticPhase;
+    if !capturing {
+        return WakeDiagnosticPhase::Stopped;
+    }
+    match phase {
+        RuntimePhasePayload::Initializing => WakeDiagnosticPhase::Initializing,
+        RuntimePhasePayload::Sleeping => WakeDiagnosticPhase::Sleeping,
+        RuntimePhasePayload::Listening => WakeDiagnosticPhase::Listening,
+        RuntimePhasePayload::Processing => WakeDiagnosticPhase::Processing,
+        RuntimePhasePayload::Executing => WakeDiagnosticPhase::Executing,
+        RuntimePhasePayload::Error => WakeDiagnosticPhase::Error,
+    }
+}
+
+fn record_wake_diagnostics_phase(app_state: &AppState, phase: RuntimePhasePayload) {
+    if let Some(runtime) = &app_state.wake_word_runtime {
+        if let Ok(mut runtime) = runtime.lock() {
+            runtime.record_diagnostics_phase(wake_diagnostic_phase(phase, true));
+        }
+    }
 }
 
 #[tauri::command]
@@ -2475,6 +2855,8 @@ async fn submit_prompt(
     if matches!(
         assistant_request.instant_model,
         voxgolem_core::assistant::InstantModel::CustomSolHigh
+            | voxgolem_core::assistant::InstantModel::CustomSolNone
+            | voxgolem_core::assistant::InstantModel::CustomLunaNone
             | voxgolem_core::assistant::InstantModel::CustomLunaLow
     ) {
         return submit_custom_prompt(
@@ -2940,15 +3322,33 @@ async fn submit_custom_prompt(
         voxgolem_core::assistant::InstantModel::CustomSolHigh => {
             voxgolem_platform::custom_openai::CustomOpenAiModel::SolHigh
         }
+        voxgolem_core::assistant::InstantModel::CustomSolNone => {
+            voxgolem_platform::custom_openai::CustomOpenAiModel::SolNone
+        }
+        voxgolem_core::assistant::InstantModel::CustomLunaNone => {
+            voxgolem_platform::custom_openai::CustomOpenAiModel::LunaNone
+        }
         voxgolem_core::assistant::InstantModel::CustomLunaLow => {
             voxgolem_platform::custom_openai::CustomOpenAiModel::LunaLow
         }
         _ => unreachable!("custom dispatch requires a Custom model"),
     };
+    let auth_path = match custom_auth_path(app_state, config) {
+        Ok(path) => path,
+        Err(error) => {
+            return fail_started_prompt(
+                app,
+                app_state,
+                request_id,
+                assistant_request.generation,
+                error,
+            );
+        }
+    };
     let client = voxgolem_platform::custom_openai::CustomOpenAiClient::new(
         voxgolem_platform::custom_openai::CustomOpenAiConfig {
             endpoint: config.endpoint.clone(),
-            auth_path: config.auth_path.clone(),
+            auth_path,
             model,
             ..Default::default()
         },
@@ -3042,6 +3442,17 @@ async fn submit_custom_prompt(
             }
         }
     };
+    if let Some(first_text_at) = response.timings.first_text_at {
+        let _ = emit_prompt_event_controlled(
+            app,
+            request_id,
+            PromptExecutionEventPayload::CustomDirectTimings {
+                first_text_ms: u64::try_from(first_text_at.as_millis()).unwrap_or(u64::MAX),
+                completed_ms: u64::try_from(response.timings.completed_at.as_millis())
+                    .unwrap_or(u64::MAX),
+            },
+        );
+    }
     let answer = response.text;
     let answer_content = match response.content_type {
         voxgolem_platform::custom_openai::CustomOpenAiContentType::OutputText => {
@@ -3938,7 +4349,17 @@ fn instant_telemetry_identity(
         ),
         InstantModel::CustomSolHigh => (
             telemetry::Provider::Custom,
-            "gpt-5.6-sol",
+            "gpt-6-sol",
+            telemetry::InferenceProvider::Remote,
+        ),
+        InstantModel::CustomSolNone => (
+            telemetry::Provider::Custom,
+            "gpt-6-sol",
+            telemetry::InferenceProvider::Remote,
+        ),
+        InstantModel::CustomLunaNone => (
+            telemetry::Provider::Custom,
+            "gpt-6-luna",
             telemetry::InferenceProvider::Remote,
         ),
         InstantModel::CustomLunaLow => (
@@ -3948,7 +4369,7 @@ fn instant_telemetry_identity(
         ),
         InstantModel::OpenCodeSolHigh => (
             telemetry::Provider::OpenCode,
-            "gpt-5.6-sol",
+            "gpt-6-sol",
             telemetry::InferenceProvider::Remote,
         ),
         InstantModel::OpenCodeLunaLow => (
@@ -3970,7 +4391,7 @@ fn agent_telemetry_identity(
     match model {
         AgentModel::CustomSolHigh => (
             telemetry::Provider::Custom,
-            "gpt-5.6-sol",
+            "gpt-6-sol",
             telemetry::InferenceProvider::Remote,
         ),
         AgentModel::CustomLunaLow => (
@@ -3980,7 +4401,7 @@ fn agent_telemetry_identity(
         ),
         AgentModel::OpenCodeSolHigh => (
             telemetry::Provider::OpenCode,
-            "gpt-5.6-sol",
+            "gpt-6-sol",
             telemetry::InferenceProvider::Remote,
         ),
         AgentModel::OpenCodeLunaLow => (
@@ -4166,7 +4587,7 @@ async fn run_agent_text(
             let client = voxgolem_platform::custom_openai::CustomOpenAiClient::new(
                 voxgolem_platform::custom_openai::CustomOpenAiConfig {
                     endpoint: config.endpoint.clone(),
-                    auth_path: config.auth_path.clone(),
+                    auth_path: custom_auth_path(app_state, config)?,
                     model,
                     ..Default::default()
                 },
@@ -4221,7 +4642,7 @@ async fn run_agent_text(
                 prompt,
                 match model {
                     voxgolem_core::assistant::AgentModel::OpenCodeSolHigh => {
-                        voxgolem_platform::opencode::OpencodeModel::Gpt56SolHigh
+                        voxgolem_platform::opencode::OpencodeModel::Gpt6SolHigh
                     }
                     voxgolem_core::assistant::AgentModel::OpenCodeLunaLow => {
                         voxgolem_platform::opencode::OpencodeModel::Gpt56LunaLow
@@ -4538,7 +4959,7 @@ async fn stream_opencode_prompt(
     futures_util::pin_mut!(events);
     let model = match model {
         voxgolem_core::assistant::InstantModel::OpenCodeSolHigh => {
-            voxgolem_platform::opencode::OpencodeModel::Gpt56SolHigh
+            voxgolem_platform::opencode::OpencodeModel::Gpt6SolHigh
         }
         voxgolem_core::assistant::InstantModel::OpenCodeLunaLow => {
             voxgolem_platform::opencode::OpencodeModel::Gpt56LunaLow
@@ -4998,6 +5419,11 @@ fn ingest_audio_frame(
         voxgolem_core::runtime::RuntimePhase::Listening
     );
 
+    record_wake_diagnostics_phase(
+        &app_state,
+        to_runtime_phase_payload(guard.session().runtime().phase()),
+    );
+
     let (wake_word_detection, wake_word_confidence) = if matches!(
         guard.session().runtime().phase(),
         voxgolem_core::runtime::RuntimePhase::Sleeping
@@ -5032,6 +5458,11 @@ fn ingest_audio_frame(
     )?;
 
     *guard = next_state;
+
+    record_wake_diagnostics_phase(
+        &app_state,
+        to_runtime_phase_payload(guard.session().runtime().phase()),
+    );
 
     let partial_action = if app_state.parakeet_runtime.is_none() {
         partial_transcription::PartialTranscriptionAction::Ignore
@@ -5665,6 +6096,8 @@ fn local_profile_for_model(
         InstantModel::LocalFast => Some(ResponseProfilePayload::Fast),
         InstantModel::LocalQuality => Some(ResponseProfilePayload::Quality),
         InstantModel::CustomSolHigh
+        | InstantModel::CustomSolNone
+        | InstantModel::CustomLunaNone
         | InstantModel::CustomLunaLow
         | InstantModel::OpenCodeSolHigh
         | InstantModel::OpenCodeLunaLow => None,
@@ -5804,22 +6237,35 @@ async fn run_assistant_prefetch(
                     .map_err(|error| format!("local prefetch task failed: {error}"))?,
             }
         }
-        InstantModel::CustomSolHigh | InstantModel::CustomLunaLow => {
+        InstantModel::CustomSolHigh
+        | InstantModel::CustomSolNone
+        | InstantModel::CustomLunaNone
+        | InstantModel::CustomLunaLow => {
             let app_state = app.state::<AppState>();
             let config = app_state
                 .runtime_config
                 .as_ref()
                 .and_then(|config| config.custom_openai.as_ref())
                 .ok_or_else(|| String::from("Custom provider is not configured"))?;
-            let model = if key.model == InstantModel::CustomSolHigh {
-                voxgolem_platform::custom_openai::CustomOpenAiModel::SolHigh
-            } else {
-                voxgolem_platform::custom_openai::CustomOpenAiModel::LunaLow
+            let model = match key.model {
+                InstantModel::CustomSolHigh => {
+                    voxgolem_platform::custom_openai::CustomOpenAiModel::SolHigh
+                }
+                InstantModel::CustomSolNone => {
+                    voxgolem_platform::custom_openai::CustomOpenAiModel::SolNone
+                }
+                InstantModel::CustomLunaNone => {
+                    voxgolem_platform::custom_openai::CustomOpenAiModel::LunaNone
+                }
+                InstantModel::CustomLunaLow => {
+                    voxgolem_platform::custom_openai::CustomOpenAiModel::LunaLow
+                }
+                _ => unreachable!("custom prefetch requires a Custom model"),
             };
             let client = voxgolem_platform::custom_openai::CustomOpenAiClient::new(
                 voxgolem_platform::custom_openai::CustomOpenAiConfig {
                     endpoint: config.endpoint.clone(),
-                    auth_path: config.auth_path.clone(),
+                    auth_path: custom_auth_path(&app_state, config)?,
                     model,
                     ..Default::default()
                 },
@@ -5867,7 +6313,7 @@ async fn run_assistant_prefetch(
                 &format!("prefetch-{generation}"),
                 &render_provider_prompt(&key.history, &key.prompt),
                 if key.model == InstantModel::OpenCodeSolHigh {
-                    voxgolem_platform::opencode::OpencodeModel::Gpt56SolHigh
+                    voxgolem_platform::opencode::OpencodeModel::Gpt6SolHigh
                 } else {
                     voxgolem_platform::opencode::OpencodeModel::Gpt56LunaLow
                 },
@@ -6340,6 +6786,8 @@ fn parse_instant_choice(value: &str) -> Result<InstantChoicePayload, String> {
         "local-fast" => Ok(InstantChoicePayload::LocalFast),
         "local-quality" => Ok(InstantChoicePayload::LocalQuality),
         "custom-sol-high" => Ok(InstantChoicePayload::CustomSolHigh),
+        "custom-sol-none" => Ok(InstantChoicePayload::CustomSolNone),
+        "custom-luna-none" => Ok(InstantChoicePayload::CustomLunaNone),
         "custom-luna-low" => Ok(InstantChoicePayload::CustomLunaLow),
         "opencode-sol-high" => Ok(InstantChoicePayload::OpenCodeSolHigh),
         "opencode-luna-low" => Ok(InstantChoicePayload::OpenCodeLunaLow),
@@ -6902,7 +7350,6 @@ fn configured_capabilities(
         .collect()
 }
 
-#[cfg(any(test, target_os = "windows"))]
 fn apply_wsl_custom_auth_resolution(
     config: &mut voxgolem_core::config::RuntimeConfig,
     resolved: Result<PathBuf, String>,
@@ -6914,8 +7361,15 @@ fn apply_wsl_custom_auth_resolution(
         return;
     }
     config.capability_issues.retain(|issue| {
-        issue.capability != "custom_provider" || !issue.reason.starts_with("WSL auth")
+        issue.capability != "custom_provider"
+            || !(issue.reason.starts_with("WSL auth")
+                || issue
+                    .reason
+                    .starts_with("failed to resolve WSL OpenCode auth"))
     });
+    if let Some(custom) = config.custom_openai.as_mut() {
+        custom.auth_path = PathBuf::new();
+    }
     match resolved {
         Ok(path) if path.is_file() => {
             if let Some(custom) = config.custom_openai.as_mut() {
@@ -6937,6 +7391,14 @@ fn apply_wsl_custom_auth_resolution(
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn resolve_custom_wsl_auth_with_retry<F>(mut lookup: F) -> Result<PathBuf, String>
+where
+    F: FnMut(Duration) -> Result<PathBuf, String>,
+{
+    lookup(Duration::from_secs(5)).or_else(|_| lookup(Duration::from_secs(15)))
+}
+
 #[cfg(target_os = "windows")]
 fn resolve_platform_provider_paths(config: &mut voxgolem_core::config::RuntimeConfig) {
     let Some(custom) = config
@@ -6947,9 +7409,20 @@ fn resolve_platform_provider_paths(config: &mut voxgolem_core::config::RuntimeCo
         return;
     };
     let explicit = (!custom.auth_path.as_os_str().is_empty()).then_some(custom.auth_path.as_path());
-    let resolved = voxgolem_platform::wsl::WslRunner::default()
-        .resolve_auth_path(explicit)
-        .map_err(|error| error.to_string());
+    let mut attempt = 0;
+    let resolved = resolve_custom_wsl_auth_with_retry(|timeout| {
+        attempt += 1;
+        let result = voxgolem_platform::wsl::WslRunner::default()
+            .with_limits(timeout, 4096)
+            .resolve_auth_path(explicit);
+        if let Err(error) = &result {
+            eprintln!("Custom WSL auth lookup attempt {attempt} failed: {error}");
+        }
+        result.map_err(|error| error.to_string())
+    });
+    if attempt == 2 && resolved.is_ok() {
+        eprintln!("Custom WSL auth lookup recovered on automatic retry");
+    }
     apply_wsl_custom_auth_resolution(config, resolved);
 }
 
@@ -7245,7 +7718,26 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
 
     match voxgolem_core::config::load_runtime_config(None) {
         Ok(mut config) => {
+            let custom_auth_source_path = config
+                .custom_openai
+                .as_ref()
+                .filter(|custom| {
+                    custom.auth_source == voxgolem_core::config::CustomOpenAiAuthSource::Wsl
+                })
+                .and_then(|custom| {
+                    (!custom.auth_path.as_os_str().is_empty()).then(|| custom.auth_path.clone())
+                });
             resolve_platform_provider_paths(&mut config);
+            let custom_auth_path = Mutex::new(
+                config
+                    .custom_openai
+                    .as_ref()
+                    .filter(|custom| {
+                        custom.auth_source == voxgolem_core::config::CustomOpenAiAuthSource::Wsl
+                            && custom.auth_path.is_file()
+                    })
+                    .map(|custom| custom.auth_path.clone()),
+            );
             let telemetry_sink = new_telemetry_sink(config.telemetry);
             let mut capabilities = configured_capabilities(&config);
             let voice_pipeline_config =
@@ -7585,6 +8077,9 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
             AppState {
                 startup_state,
                 runtime_config: Some(config),
+                custom_auth_source_path,
+                custom_auth_path,
+                custom_retry_lock: tokio::sync::Mutex::new(()),
                 selected_response_profile,
                 supported_response_profiles,
                 response_profile_switch_generation,
@@ -7613,6 +8108,10 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
                 tts_playback: Mutex::new(TtsPlaybackState::default()),
                 tts_startup_generation: Arc::new(AtomicU64::new(0)),
                 local_tts_runtime: Mutex::new(local_tts_runtime.map(Arc::new)),
+                voice_cue_cache: tokio::sync::OnceCell::new(),
+                wake_clip_writers: Arc::new(tokio::sync::Semaphore::new(
+                    WAKE_CLIP_WRITER_PERMITS as usize,
+                )),
                 tts_audio_playback: Arc::new(voxgolem_audio::playback::AudioPlaybackService::new()),
                 llama_cpp_runtime,
                 llama_cpp_conversation: Mutex::new(Vec::new()),
@@ -7718,6 +8217,9 @@ fn build_startup_error_app_state(
     AppState {
         startup_state: Arc::new(Mutex::new(StartupStatePayload::Error { message })),
         runtime_config: None,
+        custom_auth_source_path: None,
+        custom_auth_path: Mutex::new(None),
+        custom_retry_lock: tokio::sync::Mutex::new(()),
         selected_response_profile: Arc::new(Mutex::new(default_response_profile())),
         supported_response_profiles: vec![default_response_profile()],
         response_profile_switch_generation: Arc::new(AtomicU64::new(0)),
@@ -7748,6 +8250,10 @@ fn build_startup_error_app_state(
         tts_playback: Mutex::new(TtsPlaybackState::default()),
         tts_startup_generation: Arc::new(AtomicU64::new(0)),
         local_tts_runtime: Mutex::new(None),
+        voice_cue_cache: tokio::sync::OnceCell::new(),
+        wake_clip_writers: Arc::new(tokio::sync::Semaphore::new(
+            WAKE_CLIP_WRITER_PERMITS as usize,
+        )),
         tts_audio_playback: Arc::new(voxgolem_audio::playback::AudioPlaybackService::new()),
         llama_cpp_runtime: Arc::new(Mutex::new(None)),
         llama_cpp_conversation: Mutex::new(Vec::new()),
@@ -7792,6 +8298,9 @@ fn build_nonfatal_config_error_app_state(
             capabilities: failed_capabilities(message),
         })),
         runtime_config: None,
+        custom_auth_source_path: None,
+        custom_auth_path: Mutex::new(None),
+        custom_retry_lock: tokio::sync::Mutex::new(()),
         selected_response_profile: Arc::new(Mutex::new(default_response_profile())),
         supported_response_profiles: Vec::new(),
         response_profile_switch_generation: Arc::new(AtomicU64::new(0)),
@@ -7822,6 +8331,10 @@ fn build_nonfatal_config_error_app_state(
         tts_playback: Mutex::new(TtsPlaybackState::default()),
         tts_startup_generation: Arc::new(AtomicU64::new(0)),
         local_tts_runtime: Mutex::new(None),
+        voice_cue_cache: tokio::sync::OnceCell::new(),
+        wake_clip_writers: Arc::new(tokio::sync::Semaphore::new(
+            WAKE_CLIP_WRITER_PERMITS as usize,
+        )),
         tts_audio_playback: Arc::new(voxgolem_audio::playback::AudioPlaybackService::new()),
         llama_cpp_runtime: Arc::new(Mutex::new(None)),
         llama_cpp_conversation: Mutex::new(Vec::new()),
@@ -8883,8 +9396,10 @@ pub fn run() {
             app_updates::get_update_snapshot,
             app_updates::restart_for_update,
             get_startup_state,
+            retry_custom_provider,
             set_tts_enabled,
             reserve_local_tts_playback_id,
+            prepare_voice_cues,
             speak_local_tts,
             finish_tts_playback,
             reserve_native_microphone_capture_id,
@@ -8899,6 +9414,16 @@ pub fn run() {
             set_assistant_settings,
             switch_response_profile,
             record_frontend_runtime_diagnostic,
+            set_wake_diagnostics,
+            get_wake_diagnostics,
+            mark_wake_diagnostics,
+            get_wake_clip_settings,
+            set_wake_clip_settings,
+            save_wake_clip,
+            list_wake_clips,
+            play_wake_clip,
+            label_wake_clip,
+            delete_wake_clip,
             submit_prompt,
             cancel_prompt,
             record_speech_activity,
@@ -9060,6 +9585,47 @@ mod tests {
                 Some("Update installation requires VoxGolem to be idle.")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn pausing_wake_clip_saving_waits_for_a_writer_before_reporting_success() {
+        let writers = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let active_write = std::sync::Arc::clone(&writers)
+            .try_acquire_owned()
+            .expect("first synthetic clip write");
+        let enabled = std::sync::Arc::new(AtomicBool::new(true));
+        let (started, started_receiver) = tokio::sync::oneshot::channel();
+        let pause = {
+            let writers = std::sync::Arc::clone(&writers);
+            let enabled = std::sync::Arc::clone(&enabled);
+            tokio::spawn(async move {
+                started.send(()).expect("pause starts");
+                super::update_wake_clip_settings_with_writers(writers, || {
+                    enabled.store(false, Ordering::SeqCst);
+                    Ok(super::wake_clips::ClipSettings {
+                        enabled: false,
+                        directory: String::from("/synthetic/clips"),
+                    })
+                })
+                .await
+            })
+        };
+        started_receiver.await.expect("pause task started");
+        tokio::task::yield_now().await;
+        assert!(
+            !pause.is_finished(),
+            "Pause must wait for an active clip writer"
+        );
+        assert!(enabled.load(Ordering::SeqCst));
+
+        drop(active_write);
+        let settings = tokio::time::timeout(Duration::from_secs(1), pause)
+            .await
+            .expect("Pause settles after writer finishes")
+            .expect("Pause task")
+            .expect("Pause succeeds");
+        assert!(!settings.enabled);
+        assert!(!enabled.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -9433,6 +9999,74 @@ mod tests {
     }
 
     #[test]
+    fn direct_sol_no_reasoning_choice_round_trips_as_custom_instant() {
+        let settings = AssistantSettingsPayload {
+            instant: InstantChoicePayload::CustomSolNone,
+            ..AssistantSettingsPayload::default()
+        };
+        let wire = serde_json::to_value(settings).unwrap();
+        assert_eq!(wire["instant"], "custom-sol-none");
+        assert_eq!(settings.instant.capability_id(), "custom_provider");
+        assert_eq!(
+            AssistantSettingsPayload::from(&voxgolem_core::assistant::AssistantPreferences::from(
+                settings
+            )),
+            settings
+        );
+        assert_eq!(
+            super::parse_instant_choice("= \"custom-sol-none\"").unwrap(),
+            InstantChoicePayload::CustomSolNone
+        );
+        assert_eq!(
+            super::instant_telemetry_identity(
+                voxgolem_core::assistant::InstantModel::CustomSolNone
+            )
+            .0,
+            crate::telemetry::Provider::Custom
+        );
+    }
+
+    #[test]
+    fn direct_luna_no_reasoning_choice_round_trips_as_custom_instant() {
+        let settings = AssistantSettingsPayload {
+            instant: InstantChoicePayload::CustomLunaNone,
+            ..AssistantSettingsPayload::default()
+        };
+        let wire = serde_json::to_value(settings).unwrap();
+        assert_eq!(wire["instant"], "custom-luna-none");
+        assert_eq!(settings.instant.capability_id(), "custom_provider");
+        assert_eq!(
+            AssistantSettingsPayload::from(&voxgolem_core::assistant::AssistantPreferences::from(
+                settings
+            )),
+            settings
+        );
+        assert_eq!(
+            super::parse_instant_choice("= \"custom-luna-none\"").unwrap(),
+            settings.instant
+        );
+        assert_eq!(
+            super::instant_telemetry_identity(
+                voxgolem_core::assistant::InstantModel::CustomLunaNone
+            )
+            .1,
+            "gpt-6-luna"
+        );
+    }
+
+    #[test]
+    fn sol_high_telemetry_matches_the_selected_remote_model() {
+        use voxgolem_core::assistant::{AgentModel, InstantModel};
+
+        for model in [InstantModel::CustomSolHigh, InstantModel::OpenCodeSolHigh] {
+            assert_eq!(super::instant_telemetry_identity(model).1, "gpt-6-sol");
+        }
+        for model in [AgentModel::CustomSolHigh, AgentModel::OpenCodeSolHigh] {
+            assert_eq!(super::agent_telemetry_identity(model).1, "gpt-6-sol");
+        }
+    }
+
+    #[test]
     fn prompt_text_is_bounded_before_provider_dispatch() {
         assert!(validate_prompt_text("x".repeat(PROMPT_MAX_BYTES)).is_ok());
         assert!(validate_prompt_text("x".repeat(PROMPT_MAX_BYTES + 1)).is_err());
@@ -9696,6 +10330,22 @@ mod tests {
         assert_eq!(payload["tool"], "bash");
         assert_eq!(payload["status"], "running");
         assert_eq!(payload["detail"], "Checking status");
+    }
+
+    #[test]
+    fn custom_direct_timing_event_serializes_measured_milliseconds() {
+        let payload = serde_json::to_value(PromptEventEnvelope {
+            request_id: String::from("request-9"),
+            event: PromptExecutionEventPayload::CustomDirectTimings {
+                first_text_ms: 450,
+                completed_ms: 1250,
+            },
+        })
+        .expect("timing event should serialize");
+        assert_eq!(payload["request_id"], "request-9");
+        assert_eq!(payload["kind"], "custom_direct_timings");
+        assert_eq!(payload["first_text_ms"], 450);
+        assert_eq!(payload["completed_ms"], 1250);
     }
 
     #[test]
@@ -10302,6 +10952,108 @@ mod tests {
             capability.id == "wake_word"
                 && capability.reason != "failed to resolve WSL OpenCode auth: WSL is unavailable"
         }));
+    }
+
+    #[test]
+    fn custom_wsl_startup_recovers_after_one_failed_lookup_before_capability_selection() {
+        let auth_path = PathBuf::from("/synthetic/wsl-auth.json");
+        let mut attempts = Vec::new();
+        let resolved = super::resolve_custom_wsl_auth_with_retry(|timeout| {
+            attempts.push(timeout);
+            if attempts.len() == 1 {
+                Err(String::from("WSL command timed out"))
+            } else {
+                Ok(auth_path.clone())
+            }
+        });
+
+        assert_eq!(resolved, Ok(auth_path));
+        assert_eq!(attempts, [Duration::from_secs(5), Duration::from_secs(15)]);
+    }
+
+    #[test]
+    fn custom_wsl_startup_does_not_retry_a_successful_lookup() {
+        let mut attempts = Vec::new();
+        let resolved = super::resolve_custom_wsl_auth_with_retry(|timeout| {
+            attempts.push(timeout);
+            Ok(PathBuf::from("/synthetic/wsl-auth.json"))
+        });
+
+        assert!(resolved.is_ok());
+        assert_eq!(attempts, [Duration::from_secs(5)]);
+    }
+
+    #[test]
+    fn custom_wsl_startup_keeps_the_final_failure_reason_after_one_retry() {
+        let mut attempts = Vec::new();
+        let resolved = super::resolve_custom_wsl_auth_with_retry(|timeout| {
+            attempts.push(timeout);
+            Err(if attempts.len() == 1 {
+                String::from("WSL command timed out")
+            } else {
+                String::from("WSL default distribution is unavailable")
+            })
+        });
+
+        assert_eq!(
+            resolved,
+            Err(String::from("WSL default distribution is unavailable"))
+        );
+        assert_eq!(attempts, [Duration::from_secs(5), Duration::from_secs(15)]);
+    }
+
+    #[test]
+    fn retry_custom_auth_replaces_failed_capability_and_direct_transport_path() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let auth_path = temp.path().join("auth.json");
+        std::fs::write(&config_path, "[custom_openai]\nauth_source = \"wsl\"\n")
+            .expect("synthetic config");
+        let mut config =
+            voxgolem_core::config::load_runtime_config(Some(&config_path)).expect("config");
+        apply_wsl_custom_auth_resolution(&mut config, Err(String::from("WSL command timed out")));
+        let state = Arc::new(Mutex::new(StartupStatePayload::Ready {
+            cue_asset_paths: super::embedded_cue_asset_paths(),
+            runtime_phase: RuntimePhasePayload::Sleeping,
+            voice_input_available: false,
+            voice_input_error: None,
+            silence_timeout_ms: DEFAULT_SILENCE_TIMEOUT_MS,
+            selected_response_profile: ResponseProfilePayload::Fast,
+            supported_response_profiles: Vec::new(),
+            prompt_cancellation_available: true,
+            tts_enabled: false,
+            tts_output_gain_db: 0.0,
+            capabilities: configured_capabilities(&config),
+        }));
+        let path_state = Mutex::new(None);
+        assert_eq!(
+            configured_capabilities(&config)[0].state,
+            CapabilityStatePayload::Unavailable
+        );
+        std::fs::write(&auth_path, "{}").expect("synthetic auth file");
+        super::refresh_custom_auth_state(&config, &path_state, &state, Ok(auth_path.clone()))
+            .expect("retry");
+        assert_eq!(
+            path_state.lock().expect("path lock").as_ref(),
+            Some(&auth_path)
+        );
+        {
+            let guard = state.lock().expect("state lock");
+            let StartupStatePayload::Ready { capabilities, .. } = &*guard else {
+                panic!("ready");
+            };
+            assert_eq!(capabilities[0].state, CapabilityStatePayload::Available);
+        }
+        let custom = config.custom_openai.as_ref().expect("custom config");
+        assert_eq!(
+            path_state.lock().expect("path lock").clone(),
+            Some(auth_path.clone())
+        );
+        assert_ne!(custom.auth_path, auth_path);
+        drop(std::fs::remove_file(&auth_path));
+        super::refresh_custom_auth_state(&config, &path_state, &state, Ok(auth_path))
+            .expect("failed retry");
+        assert!(path_state.lock().expect("path lock").is_none());
     }
 
     #[test]
@@ -11156,6 +11908,40 @@ mod tests {
     }
 
     #[test]
+    fn stop_listening_cue_matches_the_soft_short_start_chime() {
+        let wav = super::STOP_LISTENING_CUE_WAV;
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(u16::from_le_bytes([wav[20], wav[21]]), 1);
+        assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 1);
+        let sample_rate = u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]);
+        assert_eq!(sample_rate, 48_000);
+        assert_eq!(u16::from_le_bytes([wav[34], wav[35]]), 16);
+
+        let data = wav
+            .windows(4)
+            .position(|chunk| chunk == b"data")
+            .expect("cue should contain PCM data");
+        let data_len =
+            u32::from_le_bytes([wav[data + 4], wav[data + 5], wav[data + 6], wav[data + 7]])
+                as usize;
+        let samples = wav[data + 8..data + 8 + data_len]
+            .chunks_exact(2)
+            .map(|sample| i16::from_le_bytes([sample[0], sample[1]]))
+            .collect::<Vec<_>>();
+        let duration_ms = samples.len() as u64 * 1_000 / u64::from(sample_rate);
+        assert!((180..=400).contains(&duration_ms));
+
+        let positive_crossings = samples
+            .windows(2)
+            .filter(|pair| pair[0] <= 0 && pair[1] > 0)
+            .count();
+        let average_frequency = positive_crossings as u64 * 1_000 / duration_ms;
+        assert!((300..=650).contains(&average_frequency));
+        assert!(samples.iter().all(|sample| sample.unsigned_abs() <= 12_000));
+    }
+
+    #[test]
     fn contract_response_profile_switch_requires_ready_startup_state() {
         let warming_state = Arc::new(Mutex::new(super::StartupStatePayload::WarmingModel {
             cue_asset_paths: super::CueAssetPathsPayload {
@@ -11631,6 +12417,69 @@ mod tests {
             .expect("missing model file should fail");
 
         assert!(error.contains("failed to load wake word model"));
+    }
+
+    #[test]
+    fn wake_diagnostics_bridge_marks_and_stops_without_requiring_a_microphone() {
+        let mut state = build_startup_error_app_state(
+            default_voice_pipeline_config(),
+            String::from("synthetic startup"),
+        );
+        assert!(super::update_wake_diagnostics(&state, Some(true), None).is_err());
+        state.wake_word_runtime = Some(Mutex::new(WakeWordRuntime::new_failing_for_test()));
+        let enabled = super::update_wake_diagnostics(&state, Some(true), None).unwrap();
+        assert!(enabled.enabled);
+        assert_eq!(
+            enabled.phase,
+            crate::wake_diagnostics::WakeDiagnosticPhase::Stopped
+        );
+        let marked = super::update_wake_diagnostics(
+            &state,
+            None,
+            Some(crate::wake_diagnostics::WakeDiagnosticMarker::WakeAttempt),
+        )
+        .unwrap();
+        assert!(matches!(
+            marked.events.last(),
+            Some(crate::wake_diagnostics::WakeDiagnosticEvent::Marker { .. })
+        ));
+        let stopped = super::update_wake_diagnostics(&state, Some(false), None).unwrap();
+        assert!(!stopped.enabled);
+        assert_eq!(stopped.events, marked.events);
+    }
+
+    #[test]
+    fn wake_diagnostic_phase_distinguishes_mic_off_from_armed_and_busy() {
+        use crate::wake_diagnostics::WakeDiagnosticPhase;
+        for (runtime, diagnostic) in [
+            (
+                RuntimePhasePayload::Initializing,
+                WakeDiagnosticPhase::Initializing,
+            ),
+            (RuntimePhasePayload::Sleeping, WakeDiagnosticPhase::Sleeping),
+            (
+                RuntimePhasePayload::Listening,
+                WakeDiagnosticPhase::Listening,
+            ),
+            (
+                RuntimePhasePayload::Processing,
+                WakeDiagnosticPhase::Processing,
+            ),
+            (
+                RuntimePhasePayload::Executing,
+                WakeDiagnosticPhase::Executing,
+            ),
+            (RuntimePhasePayload::Error, WakeDiagnosticPhase::Error),
+        ] {
+            assert_eq!(
+                super::wake_diagnostic_phase(runtime.clone(), true),
+                diagnostic
+            );
+            assert_eq!(
+                super::wake_diagnostic_phase(runtime, false),
+                WakeDiagnosticPhase::Stopped
+            );
+        }
     }
 
     #[test]

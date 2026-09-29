@@ -64,6 +64,12 @@ export function hasInjectedTauriInternals(): boolean {
   return typeof window !== 'undefined' && typeof window.__TAURI_INTERNALS__?.invoke === 'function'
 }
 
+export function isNativeTauriRuntime(): boolean {
+  if (typeof window === 'undefined') return false
+  const internals = window.__TAURI_INTERNALS__ as (TauriInternals & { transformCallback?: unknown }) | undefined
+  return typeof internals?.transformCallback === 'function'
+}
+
 export async function invokeTauriCommand(command: string, args?: unknown): Promise<unknown> {
   if (hasInjectedTauriInternals()) {
     return window.__TAURI_INTERNALS__!.invoke(command, args)

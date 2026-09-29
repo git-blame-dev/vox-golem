@@ -187,17 +187,33 @@ impl WslRunner {
     }
 
     pub fn resolve_auth_path(&self, linux_path: Option<&Path>) -> Result<PathBuf, WslError> {
+        let deadline = Instant::now() + self.timeout;
         let path = match linux_path {
             Some(path) => {
-                self.check_default_distribution()?;
+                self.with_remaining_time(deadline)?
+                    .check_default_distribution()?;
                 path.to_string_lossy().into_owned()
             }
             None => {
-                let home = self.default_home().map_err(default_distribution_error)?;
+                let home = self
+                    .with_remaining_time(deadline)?
+                    .default_home()
+                    .map_err(default_distribution_error)?;
                 join_linux_home(&home, ".local/share/opencode/auth.json")
             }
         };
-        self.linux_path_string_to_windows(&path)
+        self.with_remaining_time(deadline)?
+            .linux_path_string_to_windows(&path)
+    }
+
+    fn with_remaining_time(&self, deadline: Instant) -> Result<Self, WslError> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(WslError::Timeout);
+        }
+        let mut runner = self.clone();
+        runner.timeout = remaining;
+        Ok(runner)
     }
 
     pub fn discover_opencode(&self, explicit: Option<&Path>) -> Result<PathBuf, WslError> {
@@ -692,6 +708,38 @@ mod tests {
 
         assert_eq!(auth.unwrap(), PathBuf::from(r"C:\auth.json"));
         assert_eq!(opencode.unwrap(), PathBuf::from("/custom/opencode"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_path_resolution_shares_one_timeout_across_home_and_path_lookups() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let suffix = format!("{}-{:?}", std::process::id(), Instant::now());
+        let script = std::env::temp_dir().join(format!("voxgolem-fake-wsl-auth-budget-{suffix}"));
+        let home_done = std::env::temp_dir().join(format!("voxgolem-fake-wsl-home-done-{suffix}"));
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nif [ \"$6\" = sh ]; then sleep 0.12; touch '{}'; printf /home/test; exit 0; fi\nif [ \"$6\" = wslpath ]; then sleep 0.12; printf 'C:\\\\auth.json'; exit 0; fi\nexit 1\n",
+                home_done.display()
+            ),
+        )
+        .expect("fake WSL script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            .expect("fake WSL permissions");
+        let result = WslRunner::new(&script)
+            .with_limits(Duration::from_millis(190), MAX_OUTPUT)
+            .resolve_auth_path(None);
+        let first_lookup_completed = home_done.exists();
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_file(&home_done);
+
+        assert!(
+            first_lookup_completed,
+            "the home lookup should complete before the path lookup times out"
+        );
+        assert_eq!(result.unwrap_err(), WslError::Timeout);
     }
 
     #[cfg(unix)]

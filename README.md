@@ -8,7 +8,7 @@ Vox Golem is a Linux-first, Linux/Windows Tauri desktop voice assistant for type
 
 ## Capabilities
 
-Each capability is optional and uses user-supplied local assets: local `llama.cpp`, the experimental Custom private Codex endpoint, OpenCode, wake-word/VAD/transcription, and local TTS. Six Instant choices are **Local Fast**, **Local Quality**, **Custom Sol High**, **Custom Luna Low**, **OpenCode Sol High**, and **OpenCode Luna Low**. Four Deep/Review choices are **Custom Sol High**, **Custom Luna Low**, **OpenCode Sol High**, and **OpenCode Luna Low**.
+Each capability is optional and uses user-supplied local assets: local `llama.cpp`, the experimental Custom private Codex endpoint, OpenCode, wake-word/VAD/transcription, and local TTS. Eight Instant choices are **Local Fast**, **Local Quality**, **Custom Sol High**, **Custom Sol No Reasoning**, **Custom GPT-6 Luna No Reasoning**, **Custom GPT-5.6 Luna Low**, **OpenCode Sol High**, and **OpenCode Luna Low**. Both Custom Sol choices and Custom GPT-6 Luna No Reasoning use VoxGolem's direct Rust connection to the configured Custom endpoint; OpenCode choices use the separate OpenCode client. Four Deep/Review choices are **Custom Sol High**, **Custom Luna Low**, **OpenCode Sol High**, and **OpenCode Luna Low**.
 
 Deep and Review default to disabled. They are reasoning/review-only paths with no workspace or shell authority; OpenCode research is restricted to `websearch` and `webfetch`. Prefetch is disabled by default; enabling it can transmit predicted prompt text to the configured provider before submission.
 
@@ -35,7 +35,7 @@ endpoint = "https://chatgpt.com/backend-api/codex/responses"
 runtime = "wsl"
 ```
 
-The default locations are `$HOME/.local/share/opencode/auth.json` and `$HOME/.opencode/bin/opencode`, followed by WSL command lookup for the executable. Optional overrides must be absolute Linux paths. WSL selection is explicit per provider; omitted selectors retain native behavior, and Vox Golem never silently falls back to a different credential or executable source. Missing WSL, a default distribution, auth, or OpenCode disables only the affected capability.
+The default locations are `$HOME/.local/share/opencode/auth.json` and `$HOME/.opencode/bin/opencode`, followed by WSL command lookup for the executable. On Windows, `wsl.exe` uses the default WSL distribution, and `$HOME` is that distribution's user home. Optional overrides must be absolute Linux paths. WSL selection is explicit per provider; omitted selectors retain native behavior, and Vox Golem never silently falls back to a different credential or executable source. Missing WSL, a default distribution, auth, or OpenCode disables only the affected capability. A failed Custom WSL auth lookup gets one bounded automatic startup retry; if it still fails, the app keeps the reason visible and offers **Retry Custom** without a restart.
 
 ## WSL2/WSLg setup
 
@@ -64,6 +64,10 @@ make pc-installer # build and verify the Windows NSIS installer on Linux
 ```
 
 `make app-smoke` proves only that the zero-asset Tauri shell reaches its startup marker (shell setup); it does not prove providers, models, voice, completion, or TTS, which require their own runtime checks.
+
+For repeatable synthetic wake-word accuracy checks, run `make wakeword-bench WAKE_WORD_MODEL=/path/to/hey_livekit.onnx`. The [benchmark guide](tools/wakeword-bench/README.md) describes corpus generation, calibration/holdout evaluation, artifact verification, and the limits of artificial speech tests.
+
+When the microphone is active, VoxGolem saves up to 1.5 seconds of pre-trigger wake audio for each new detection as a local PCM16 WAV; older 0.5-, 0.75- and three-second clips remain playable. This window can still truncate unusually slow speech, so review recordings before using them for training. Clips are grouped by the detecting model filename and a local content-derived revision ID. The revision ID distinguishes replaced model bytes with the same filename; it is not a cryptographic checksum and may change with Rust toolchain versions. In Settings → Wake clips, you can pause saving, choose an absolute local save directory, browse clips in pages, play them, label them true/false wakes, or delete them. Clips start unreviewed: the detector's model name is a prediction, not proof of what was said. The default folder is `wake-clips` beside your local VoxGolem configuration (`%APPDATA%\VoxGolem\wake-clips` on Windows); the selected directory is stored locally in `wake-clips.json`. No storage quota or automatic deletion is applied. Save failures appear as a notice without stopping the microphone. Recordings, models, and runtime settings are local user data and stay out of Git.
 
 The staged native binary is `dist/VoxGolem/vox-golem`. Windows cross-builds require cargo-xwin 0.23.0, LLVM/Clang 19 or newer, NSIS, cabextract, and 7-Zip. They do not require a Windows runner.
 

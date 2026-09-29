@@ -159,6 +159,46 @@ describe('native live audio source', () => {
     expect(onFrame).toHaveBeenCalledOnce()
   })
 
+  it('drains a transient native frame burst after ingestion resumes', async () => {
+    const handlers = new Map<string, (event: { payload: unknown }) => void>()
+    let releaseFirstFrame: () => void = () => undefined
+    const firstFrameBlocked = new Promise<void>((resolve) => {
+      releaseFirstFrame = resolve
+    })
+    const received: number[] = []
+    const onError = vi.fn()
+    const invoke = vi.fn<(command: string, args?: unknown) => Promise<unknown>>(async (command) => {
+      if (command === 'reserve_native_microphone_capture_id') return 47
+      if (command === 'start_native_microphone') return { fell_back_to_default: false }
+      return null
+    })
+    window.__TAURI_INTERNALS__ = {
+      invoke,
+      listen: vi.fn(async (event, handler) => {
+        handlers.set(event, handler)
+        return vi.fn()
+      }),
+    }
+
+    const source = await startLiveAudioSource({
+      onFrame: async (frame) => {
+        received.push(frame[0]!)
+        if (received.length === 1) await firstFrameBlocked
+      },
+      onError,
+    })
+    const frameHandler = handlers.get('native-microphone-frame')
+    for (let index = 0; index < 16; index += 1) {
+      frameHandler?.({ payload: { capture_id: 47, frame: [index] } })
+    }
+
+    expect(onError).not.toHaveBeenCalled()
+    releaseFirstFrame()
+    await vi.waitFor(() => expect(received).toEqual(Array.from({ length: 16 }, (_, index) => index)))
+    expect(invoke).not.toHaveBeenCalledWith('stop_native_microphone', { captureId: 47 })
+    source.stop()
+  })
+
   it('cancels native startup before the start command settles', async () => {
     let resolveStart: (payload: unknown) => void = () => undefined
     const startPending = new Promise<unknown>((resolve) => {
