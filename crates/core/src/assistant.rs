@@ -7,6 +7,8 @@ pub enum InstantModel {
     LocalFast,
     LocalQuality,
     CustomSolHigh,
+    CustomSolNone,
+    CustomLunaNone,
     CustomLunaLow,
     OpenCodeSolHigh,
     OpenCodeLunaLow,
@@ -31,7 +33,10 @@ impl InstantModel {
     pub fn provider(self) -> Provider {
         match self {
             Self::LocalFast | Self::LocalQuality => Provider::Local,
-            Self::CustomSolHigh | Self::CustomLunaLow => Provider::Custom,
+            Self::CustomSolHigh
+            | Self::CustomSolNone
+            | Self::CustomLunaNone
+            | Self::CustomLunaLow => Provider::Custom,
             Self::OpenCodeSolHigh | Self::OpenCodeLunaLow => Provider::OpenCode,
         }
     }
@@ -381,6 +386,7 @@ mod tests {
         assert!(!p.deep_enabled && !p.review_enabled);
         assert_eq!(p.review_model, AgentModel::OpenCodeSolHigh);
         assert_eq!(InstantModel::CustomLunaLow.provider(), Provider::Custom);
+        assert_eq!(InstantModel::CustomLunaNone.provider(), Provider::Custom);
         assert_eq!(AgentModel::CustomLunaLow.provider(), Provider::Custom);
     }
     #[test]

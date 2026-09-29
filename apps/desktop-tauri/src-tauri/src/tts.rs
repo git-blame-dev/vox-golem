@@ -53,6 +53,7 @@ pub struct LocalTtsRuntime {
 
 const MAX_TTS_INPUT_BYTES: usize = 4096;
 const MAX_SYNTHESIS_WAIT_MS: u64 = 10 * 60 * 1_000;
+const WORKER_INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(8);
 
 type SynthesisEngineFactory = Arc<
     dyn Fn(
@@ -419,16 +420,17 @@ impl LocalTtsRuntime {
         drop(init_tx);
         let mut actual_provider = None;
         for _ in 0..spec.worker_count {
-            let init_result = init_rx
-                .recv_timeout(Duration::from_secs(2))
-                .map_err(|error| match error {
-                    mpsc::RecvTimeoutError::Timeout => {
-                        String::from("timed out initializing local tts worker runtime")
-                    }
-                    mpsc::RecvTimeoutError::Disconnected => {
-                        String::from("failed to initialize local tts worker runtime")
-                    }
-                });
+            let init_result =
+                init_rx
+                    .recv_timeout(WORKER_INITIALIZATION_TIMEOUT)
+                    .map_err(|error| match error {
+                        mpsc::RecvTimeoutError::Timeout => {
+                            String::from("timed out initializing local tts worker runtime")
+                        }
+                        mpsc::RecvTimeoutError::Disconnected => {
+                            String::from("failed to initialize local tts worker runtime")
+                        }
+                    });
             let provider = match init_result {
                 Ok(result) => match result {
                     Ok(provider) => provider,
@@ -1798,5 +1800,33 @@ mod tests {
         third
             .synthesize("after retry")
             .expect("restarted runtime should synthesize");
+    }
+
+    #[test]
+    fn tolerates_a_slow_but_successful_local_voice_initialization() {
+        let _test_runtime_guard = test_runtime_guard();
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let model_path = temp_dir.path().join("example-voice.onnx");
+        fs::write(&model_path, b"fixture").expect("model fixture should be written");
+        let runtime = LocalTtsRuntime::new_with_engine_factory(
+            LocalTtsRuntimeSpec {
+                model_path: Some(model_path),
+                worker_count: 1,
+                max_queue: 1,
+                sample_rate_hz: 22_050,
+                max_duration_s: 300,
+                provider_policy: super::TtsProviderPolicy::Cpu,
+            },
+            Arc::new(|_, sample_rate_hz, _| {
+                thread::sleep(std::time::Duration::from_millis(2_400));
+                Ok((
+                    Box::new(FakeSynthesisEngine { sample_rate_hz })
+                        as Box<dyn super::SynthesisEngine>,
+                    super::TtsActualProvider::Cpu,
+                ))
+            }),
+        )
+        .expect("local voice initialization should tolerate a short slow start");
+        runtime.synthesize("Yes?").expect("voice should synthesize");
     }
 }

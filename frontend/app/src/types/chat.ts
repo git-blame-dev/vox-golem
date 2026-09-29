@@ -7,6 +7,12 @@ export interface ChatMessage {
   readonly role: MessageRole
   readonly content: string
   readonly answerStage?: AnswerStageMetadata
+  readonly customDirectTimings?: CustomDirectTimings
+}
+
+export interface CustomDirectTimings {
+  readonly firstTextMs: number
+  readonly completedMs: number
 }
 
 export interface AnswerStageMetadata {
@@ -20,6 +26,7 @@ export interface TranscriptMessage {
   readonly role: TranscriptRole
   readonly content: string
   readonly answerStage?: AnswerStageMetadata
+  readonly customDirectTimings?: CustomDirectTimings
 }
 
 export interface UserNotice {
@@ -36,6 +43,7 @@ export function isTranscriptMessage(message: ChatMessage): message is Transcript
 export interface CueAssetPaths {
   readonly startListening: string
   readonly stopListening: string
+  readonly stopListeningShort?: string
 }
 
 export type ResponseProfile = 'fast' | 'quality'
@@ -80,6 +88,7 @@ export type BackendRuntimePhase =
   | 'error'
 
 export type PromptExecutionEvent =
+  | { readonly requestId: string; readonly kind: 'custom_direct_timings'; readonly timings: CustomDirectTimings }
   | { readonly requestId: string; readonly kind: 'text' | 'reasoning'; readonly text: string }
   | { readonly requestId: string; readonly kind: 'correction'; readonly stage: 'instant' | 'deep' | 'review'; readonly text: string; readonly correction: string }
   | { readonly requestId: string; readonly kind: 'stage'; readonly stage: 'instant' | 'deep' | 'review'; readonly status: import('../components/AnswerStage').AnswerStageStatus; readonly detail?: string }

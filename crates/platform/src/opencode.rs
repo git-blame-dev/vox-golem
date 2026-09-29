@@ -67,14 +67,14 @@ pub enum OpencodePromptError {
 /// The model configurations approved for prompts sent by the platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpencodeModel {
-    Gpt56SolHigh,
+    Gpt6SolHigh,
     Gpt56LunaLow,
 }
 
 impl OpencodeModel {
     fn request_fields(self) -> serde_json::Value {
         let model = match self {
-            Self::Gpt56SolHigh => "gpt-5.6-sol",
+            Self::Gpt6SolHigh => "gpt-6-sol",
             Self::Gpt56LunaLow => "gpt-5.6-luna",
         };
         serde_json::json!({
@@ -85,7 +85,7 @@ impl OpencodeModel {
 
     fn variant(self) -> &'static str {
         match self {
-            Self::Gpt56SolHigh => "high",
+            Self::Gpt6SolHigh => "high",
             Self::Gpt56LunaLow => "low",
         }
     }
@@ -2037,13 +2037,13 @@ mod tests {
     #[test]
     fn preserves_approved_model_identity_and_variant() {
         assert_eq!(
-            OpencodeModel::Gpt56SolHigh.request_fields(),
+            OpencodeModel::Gpt6SolHigh.request_fields(),
             serde_json::json!({
                 "providerID": "openai",
-                "modelID": "gpt-5.6-sol",
+                "modelID": "gpt-6-sol",
             })
         );
-        assert_eq!(OpencodeModel::Gpt56SolHigh.variant(), "high");
+        assert_eq!(OpencodeModel::Gpt6SolHigh.variant(), "high");
         assert_eq!(
             OpencodeModel::Gpt56LunaLow.request_fields(),
             serde_json::json!({

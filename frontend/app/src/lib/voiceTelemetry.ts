@@ -1,5 +1,12 @@
 const TELEMETRY_STORAGE_KEY = 'voxgolem.voiceTelemetry'
 const MAX_EVENTS = 400
+const MAX_MILESTONES = 64
+const PER_FRAME_EVENTS = new Set([
+  'frontend_frame_captured',
+  'frontend_frame_sent',
+  'backend_ingest_started',
+  'backend_ingest_completed',
+])
 
 type VoiceTelemetryValue = string | number | boolean | null
 
@@ -14,6 +21,7 @@ export interface VoiceTelemetrySnapshot {
   readonly enabled: boolean
   readonly droppedCount: number
   readonly events: readonly VoiceTelemetryEvent[]
+  readonly milestones: readonly VoiceTelemetryEvent[]
 }
 
 export interface VoiceTelemetryRecorder {
@@ -39,12 +47,13 @@ export function createVoiceTelemetryRecorder(): VoiceTelemetryRecorder {
       enabled,
       nextFrameId: () => null,
       record: () => undefined,
-      snapshot: () => ({ enabled, droppedCount: 0, events: [] }),
+      snapshot: () => ({ enabled, droppedCount: 0, events: [], milestones: [] }),
       clear: () => undefined,
     }
   }
 
   const events: VoiceTelemetryEvent[] = []
+  const milestones: VoiceTelemetryEvent[] = []
   let droppedCount = 0
   let frameSequence = 0
 
@@ -68,16 +77,22 @@ export function createVoiceTelemetryRecorder(): VoiceTelemetryRecorder {
       }
 
       events.push(nextEvent)
+      if (!PER_FRAME_EVENTS.has(event)) {
+        if (milestones.length >= MAX_MILESTONES) milestones.shift()
+        milestones.push(nextEvent)
+      }
     },
     snapshot(): VoiceTelemetrySnapshot {
       return {
         enabled,
         droppedCount,
         events: [...events],
+        milestones: [...milestones],
       }
     },
     clear(): void {
       events.length = 0
+      milestones.length = 0
       droppedCount = 0
     },
   }

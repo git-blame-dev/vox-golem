@@ -21,6 +21,7 @@ describe('createVoiceTelemetryRecorder', () => {
       enabled: false,
       droppedCount: 0,
       events: [],
+      milestones: [],
     })
   })
 
@@ -91,5 +92,20 @@ describe('createVoiceTelemetryRecorder', () => {
     expect(snapshot.droppedCount).toBe(5)
     expect(snapshot.events[0]?.details['index']).toBe(5)
     expect(snapshot.events[399]?.details['index']).toBe(404)
+  })
+
+  it('retains voice-turn milestones when frame events roll over', () => {
+    window.localStorage.setItem(TELEMETRY_STORAGE_KEY, '1')
+    const recorder = createVoiceTelemetryRecorder()
+    recorder.record('wake_detected', { atMs: 1_000 })
+    for (let index = 0; index < 405; index += 1) {
+      recorder.record('frontend_frame_captured', { atMs: 1_001 + index })
+    }
+
+    const snapshot = recorder.snapshot()
+    expect(snapshot.events.some((event) => event.event === 'wake_detected')).toBe(false)
+    expect(snapshot).toMatchObject({
+      milestones: [{ event: 'wake_detected', atMs: 1_000 }],
+    })
   })
 })

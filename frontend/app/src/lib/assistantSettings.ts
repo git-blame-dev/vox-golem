@@ -1,5 +1,5 @@
 /** The deliberately small, stable vocabulary shared by the settings UI and Tauri. */
-export type InstantChoice = 'local-fast' | 'local-quality' | 'custom-sol-high' | 'custom-luna-low' | 'opencode-sol-high' | 'opencode-luna-low'
+export type InstantChoice = 'local-fast' | 'local-quality' | 'custom-sol-high' | 'custom-sol-none' | 'custom-luna-none' | 'custom-luna-low' | 'opencode-sol-high' | 'opencode-luna-low'
 export type DeepChoice = 'custom-sol-high' | 'custom-luna-low' | 'opencode-sol-high' | 'opencode-luna-low'
 export type ReviewChoice = DeepChoice
 
@@ -38,16 +38,16 @@ export const DEFAULT_ASSISTANT_SETTINGS: Readonly<AssistantSettings> = {
 
 const instantLabels: Record<InstantChoice, string> = {
   'local-fast': 'Local: Fast', 'local-quality': 'Local: Quality',
-  'custom-sol-high': 'Custom: GPT-5.6 Sol High', 'custom-luna-low': 'Custom: GPT-5.6 Luna Low',
-  'opencode-sol-high': 'OpenCode: GPT-5.6 Sol High', 'opencode-luna-low': 'OpenCode: GPT-5.6 Luna Low',
+  'custom-sol-high': 'Custom: GPT-6 Sol High', 'custom-sol-none': 'Custom: GPT-6 Sol No Reasoning', 'custom-luna-none': 'Custom: GPT-6 Luna No Reasoning', 'custom-luna-low': 'Custom: GPT-5.6 Luna Low',
+  'opencode-sol-high': 'OpenCode: GPT-6 Sol High', 'opencode-luna-low': 'OpenCode: GPT-5.6 Luna Low',
 }
 const deepLabels: Record<DeepChoice, string> = {
-  'custom-sol-high': 'Deep: Custom: GPT-5.6 Sol High', 'custom-luna-low': 'Deep: Custom: GPT-5.6 Luna Low',
-  'opencode-sol-high': 'Deep: OpenCode: GPT-5.6 Sol High', 'opencode-luna-low': 'Deep: OpenCode: GPT-5.6 Luna Low',
+  'custom-sol-high': 'Deep: Custom: GPT-6 Sol High', 'custom-luna-low': 'Deep: Custom: GPT-5.6 Luna Low',
+  'opencode-sol-high': 'Deep: OpenCode: GPT-6 Sol High', 'opencode-luna-low': 'Deep: OpenCode: GPT-5.6 Luna Low',
 }
 const reviewLabels: Record<ReviewChoice, string> = {
-  'custom-sol-high': 'Review: Custom: GPT-5.6 Sol High', 'custom-luna-low': 'Review: Custom: GPT-5.6 Luna Low',
-  'opencode-sol-high': 'Review: OpenCode: GPT-5.6 Sol High', 'opencode-luna-low': 'Review: OpenCode: GPT-5.6 Luna Low',
+  'custom-sol-high': 'Review: Custom: GPT-6 Sol High', 'custom-luna-low': 'Review: Custom: GPT-5.6 Luna Low',
+  'opencode-sol-high': 'Review: OpenCode: GPT-6 Sol High', 'opencode-luna-low': 'Review: OpenCode: GPT-5.6 Luna Low',
 }
 
 function options<T extends string>(labels: Record<T, string>, capabilities: AssistantCapabilities): AssistantOption<T>[] {
@@ -55,7 +55,7 @@ function options<T extends string>(labels: Record<T, string>, capabilities: Assi
     const provider = value.startsWith('local') || value === 'none' ? 'local' : value.startsWith('custom') ? 'custom' : 'openCode'
     const available = value === 'local-fast' ? capabilities.localFast : value === 'local-quality' ? capabilities.localQuality : provider === 'custom' ? capabilities.custom : capabilities.openCode
     const providerName = provider === 'openCode' ? 'OpenCode' : provider === 'custom' ? 'Custom' : 'Local'
-    const description = value.startsWith('opencode') ? 'OpenCode search' : value.startsWith('custom') ? 'Custom reasoning-only' : undefined
+    const description = value === 'custom-sol-none' || value === 'custom-luna-none' ? 'Direct Custom connection; reasoning disabled' : value.startsWith('opencode') ? 'OpenCode search' : value.startsWith('custom') ? 'Custom reasoning-only' : undefined
     const featureUnavailable = labels === deepLabels ? !capabilities.deep : labels === reviewLabels ? !capabilities.review : false
     return { value, label: labels[value], available: available && !featureUnavailable, ...(description ? { description } : {}), ...(available && !featureUnavailable ? {} : { reason: featureUnavailable ? `${providerName} does not support this option` : `${providerName} is unavailable` }) }
   })

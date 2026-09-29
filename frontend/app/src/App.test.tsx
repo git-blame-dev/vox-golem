@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client'
 import type { Root } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import * as liveAudioSourceModule from './lib/liveAudioSource'
+import * as tauriModule from './lib/tauri'
 import type { StartLiveAudioSourceOptions } from './lib/liveAudioSource'
 import App from './App'
 
@@ -46,6 +47,8 @@ afterEach(() => {
   listAudioInputDevicesMock.mockReset()
   listAudioInputDevicesMock.mockResolvedValue([])
   window.localStorage.removeItem('voxgolem.audioInputDeviceId')
+  window.localStorage.removeItem('voxgolem.voiceTelemetry')
+  Reflect.deleteProperty(window, '__VOXGOLEM_VOICE_TELEMETRY__')
 })
 
 describe('App', () => {
@@ -1022,7 +1025,7 @@ describe('App', () => {
     const select = await getResponseProfileSelect(container)
 
     expect(select.value).toBe('local-fast')
-    expect(Array.from(select.options).map((option) => option.text)).toEqual(['Local: Fast', 'Local: Quality', 'Custom: GPT-5.6 Sol High', 'Custom: GPT-5.6 Luna Low', 'OpenCode: GPT-5.6 Sol High', 'OpenCode: GPT-5.6 Luna Low'])
+    expect(Array.from(select.options).map((option) => option.text)).toEqual(['Local: Fast', 'Local: Quality', 'Custom: GPT-6 Sol High', 'Custom: GPT-6 Sol No Reasoning', 'Custom: GPT-6 Luna No Reasoning', 'Custom: GPT-5.6 Luna Low', 'OpenCode: GPT-6 Sol High', 'OpenCode: GPT-5.6 Luna Low'])
   })
 
   it('invokes switch_response_profile when selecting Quality profile', async () => {
@@ -1469,6 +1472,73 @@ describe('App', () => {
     expect(getSendButton(container).disabled).toBe(true)
   })
 
+  it('shows the actual Custom capability reason beside disabled direct models', async () => {
+    const startup = readyStartupState({ capabilities: completeCapabilities({ custom_provider: 'unavailable' })
+      .map((capability) => capability['id'] === 'custom_provider'
+        ? { ...capability, reason: 'WSL OpenCode auth file is unavailable' }
+        : capability) })
+    window.__TAURI_INTERNALS__ = { invoke: async (command) => {
+      if (command === 'get_startup_state') return startup
+      if (command === 'get_assistant_settings') return defaultAssistantSettings()
+      throw new Error(`unexpected command: ${command}`)
+    } }
+    const { container } = await renderApp()
+    await act(async () => { getButtonByLabel(container, 'Settings').click(); await Promise.resolve() })
+    expect(container.textContent).toContain('Custom connection: WSL OpenCode auth file is unavailable')
+    const select = container.querySelector<HTMLSelectElement>('select[aria-label="Instant"]')!
+    expect(select.querySelector<HTMLOptionElement>('option[value="custom-sol-none"]')?.disabled).toBe(true)
+    expect(select.querySelector<HTMLOptionElement>('option[value="custom-luna-none"]')?.disabled).toBe(true)
+  })
+
+  it('keeps Custom startup failure visible and enables direct choices after an explicit retry', async () => {
+    let recovered = false
+    const calls: string[] = []
+    const state = () => readyStartupState({ capabilities: completeCapabilities(recovered ? {} : { custom_provider: 'unavailable' })
+      .map((capability) => capability['id'] === 'custom_provider' && !recovered
+        ? { ...capability, reason: 'failed to resolve WSL OpenCode auth: WSL command timed out' }
+        : capability) })
+    window.__TAURI_INTERNALS__ = { invoke: async (command) => {
+      calls.push(command)
+      if (command === 'get_startup_state') return state()
+      if (command === 'get_assistant_settings') return defaultAssistantSettings()
+      if (command === 'retry_custom_provider') { recovered = true; return state() }
+      throw new Error(`unexpected command: ${command}`)
+    } }
+    const { container } = await renderApp()
+    expect(container.textContent).toContain('Custom connection: failed to resolve WSL OpenCode auth: WSL command timed out')
+    await act(async () => { getButtonByLabel(container, 'Settings').click(); await Promise.resolve() })
+    const select = container.querySelector<HTMLSelectElement>('select[aria-label="Instant"]')!
+    expect(select.querySelector<HTMLOptionElement>('option[value="custom-luna-none"]')?.disabled).toBe(true)
+    await act(async () => { getButtonByLabel(container, 'Retry Custom').click(); await Promise.resolve() })
+    expect(calls).toContain('retry_custom_provider')
+    expect(select.querySelector<HTMLOptionElement>('option[value="custom-luna-none"]')?.disabled).toBe(false)
+    expect(container.textContent).not.toContain('failed to resolve WSL OpenCode auth')
+  })
+
+  it('shows preloaded and updated Instant choice to the right of the mic without claiming Deep or Review', async () => {
+    let selected = 'custom-luna-none'
+    window.__TAURI_INTERNALS__ = { invoke: async (command, args) => {
+      if (command === 'get_startup_state') return readyStartupState()
+      if (command === 'get_assistant_settings') return { ...defaultAssistantSettings(), instant: selected }
+      if (command === 'set_assistant_settings') {
+        selected = (args as { settings: { instant: string } }).settings.instant
+        return { ...defaultAssistantSettings(), instant: selected }
+      }
+      throw new Error(`unexpected command: ${command}`)
+    } }
+    const { container } = await renderApp()
+    const indicator = container.querySelector<HTMLElement>('.composer__instant-model')
+    const mic = getControlButton(container, 'Start mic')
+    expect(indicator?.textContent).toBe('Instant: Custom: GPT-6 Luna No Reasoning')
+    expect(mic.compareDocumentPosition(indicator!)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+    const select = await getResponseProfileSelect(container)
+    expect(select.value).toBe('custom-luna-none')
+    expect(select.querySelector('option[value="custom-luna-none"]')).not.toBeNull()
+    await act(async () => { setSelectValue(select, 'custom-sol-none'); await Promise.resolve() })
+    expect(selected).toBe('custom-sol-none')
+    expect(indicator?.textContent).toBe('Instant: Custom: GPT-6 Sol No Reasoning')
+  })
+
   it('renders only user and assistant prompt execution output when submit command succeeds', async () => {
     let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
     window.__TAURI_INTERNALS__ = {
@@ -1698,6 +1768,37 @@ describe('App', () => {
       await Promise.resolve()
     })
     expect(container.textContent).not.toContain('Executing prompt')
+  })
+
+  it('shows measured Custom direct request timing with its response, never from another request', async () => {
+    let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
+    let submissions = 0
+    window.__TAURI_INTERNALS__ = {
+      listen: async (_event, handler) => { promptEventHandler = handler; return () => undefined },
+      invoke: async (command, args) => {
+        if (command === 'get_startup_state') return readyStartupState()
+        if (command === 'get_assistant_settings') return { ...defaultAssistantSettings(), instant: 'custom-sol-none' }
+        expect(command).toBe('submit_prompt')
+        const requestId = (args as { requestId: string }).requestId
+        submissions += 1
+        promptEventHandler?.({ payload: { request_id: 'unrelated', kind: 'custom_direct_timings', first_text_ms: 1, completed_ms: 2 } })
+        promptEventHandler?.({ payload: { request_id: requestId, kind: 'text', text: `Response ${submissions}` } })
+        if (submissions === 1) promptEventHandler?.({ payload: { request_id: requestId, kind: 'custom_direct_timings', first_text_ms: 450, completed_ms: 1250 } })
+        return { request_id: requestId, outcome: 'completed', runtime_phase: 'sleeping' }
+      },
+    }
+    const { container } = await renderApp()
+    for (const prompt of ['First', 'Second']) {
+      await act(async () => setTextAreaValue(getComposer(container), prompt))
+      await act(async () => { getSendButton(container).click(); await Promise.resolve() })
+    }
+    expect(container.textContent).toContain('First text: 450 ms · Completed: 1.25 s')
+    expect(container.textContent).not.toContain('Custom direct request ·')
+    expect(container.textContent).not.toContain('First text: 1 ms')
+    const answers = container.querySelectorAll('.message--assistant')
+    expect(answers).toHaveLength(2)
+    expect(answers[1]?.textContent).toContain('Response 2')
+    expect(answers[1]?.nextElementSibling).toBeNull()
   })
 
   it('shows string errors rejected by the Tauri prompt command', async () => {
@@ -2367,6 +2468,190 @@ describe('App', () => {
       expect(submitCalls).toBe(0)
     },
   )
+
+  it('uses prepared local voice cues for later wake and silence frames without restarting the microphone', async () => {
+    const playedSources: string[] = []
+    const fallback = { start_listening: 'start.wav', stop_listening: 'stop.wav' }
+    const voice = {
+      start_listening: 'data:audio/wav;base64,AAEC',
+      stop_listening: 'data:audio/wav;base64,AQID',
+      stop_listening_short: 'data:audio/wav;base64,BAUG',
+    }
+    let resolveCues: (paths: typeof voice) => void = () => undefined
+    const pendingCues = new Promise<typeof voice>((resolve) => { resolveCues = resolve })
+    let onFrame: StartLiveAudioSourceOptions['onFrame'] | null = null
+    let phase: 'sleeping' | 'listening' | 'processing' = 'sleeping'
+    let wakeReported = false
+    const savedWakeClips: number[][] = []
+    let nowMs = 100
+
+    Date.now = () => nowMs
+    Object.defineProperty(globalThis, 'Audio', {
+      configurable: true,
+      value: class {
+        constructor(source: string) { playedSources.push(source) }
+        play(): Promise<void> { return Promise.resolve() }
+      },
+    })
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      onFrame = options.onFrame
+      return { stop: vi.fn() }
+    })
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command, args) => {
+        if (command === 'get_startup_state') return readyStartupState({ cue_asset_paths: fallback })
+        if (command === 'get_assistant_settings') return defaultAssistantSettings()
+        if (command === 'prepare_voice_cues') return pendingCues
+        if (command === 'save_wake_clip') {
+          savedWakeClips.push((args as { samples: number[] }).samples)
+          return null
+        }
+        if (command === 'ingest_audio_frame') {
+          const detected = phase === 'listening' && !wakeReported
+          if (detected) wakeReported = true
+          return {
+            runtime_phase: phase,
+            transcription_ready_samples: null,
+            transcript_text: null,
+            last_activity_ms: phase === 'listening' ? 100 : null,
+            capturing_utterance: phase === 'listening',
+            preroll_samples: 4,
+            utterance_samples: 4,
+            telemetry: detected ? { wake_detected_ms: 100, wake_confidence: 0.8 } : null,
+          }
+        }
+        if (command === 'mark_silence') {
+          phase = 'processing'
+          return {
+            runtime_phase: phase,
+            transcription_ready_samples: null,
+            transcript_text: null,
+            last_activity_ms: null,
+            capturing_utterance: false,
+            preroll_samples: 4,
+            utterance_samples: 0,
+          }
+        }
+        throw new Error(`unexpected command: ${command}`)
+      },
+    }
+
+    const nativeRuntime = vi.spyOn(tauriModule, 'isNativeTauriRuntime').mockReturnValue(true)
+    await renderApp()
+    nativeRuntime.mockRestore()
+    expect(startLiveAudioSourceMock).toHaveBeenCalledTimes(1)
+
+    await act(async () => { resolveCues(voice); await pendingCues })
+    phase = 'listening'
+    await act(async () => { await onFrame?.([0.04, -0.04]); await Promise.resolve() })
+    nowMs = 2_000
+    await act(async () => {
+      await onFrame?.([0.001, -0.001])
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+
+    expect(playedSources).toEqual([voice.start_listening, voice.stop_listening])
+    expect(savedWakeClips).toHaveLength(1)
+    expect(savedWakeClips[0]).toHaveLength(2)
+    expect(savedWakeClips[0]?.[0]).toBeCloseTo(0.04)
+    expect(savedWakeClips[0]?.[1]).toBeCloseTo(-0.04)
+    expect(startLiveAudioSourceMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('retries a transient voice-cue preparation failure and uses the recovered voice', async () => {
+    const played: string[] = []
+    let onFrame: StartLiveAudioSourceOptions['onFrame'] | null = null
+    let preparations = 0
+    const voice = {
+      start_listening: 'data:audio/wav;base64,AAEC',
+      stop_listening: 'data:audio/wav;base64,AQID',
+      stop_listening_short: 'data:audio/wav;base64,BAUG',
+    }
+    Object.defineProperty(globalThis, 'Audio', { configurable: true, value: class {
+      constructor(source: string) { played.push(source) }
+      play(): Promise<void> { return Promise.resolve() }
+    } })
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      onFrame = options.onFrame
+      return { stop: vi.fn() }
+    })
+    window.__TAURI_INTERNALS__ = { invoke: async (command) => {
+      if (command === 'get_startup_state') return readyStartupState()
+      if (command === 'get_assistant_settings') return defaultAssistantSettings()
+      if (command === 'prepare_voice_cues') {
+        preparations += 1
+        if (preparations === 1) throw new Error('temporary local voice startup failure')
+        return voice
+      }
+      if (command === 'ingest_audio_frame') return { runtime_phase: 'listening', last_activity_ms: 100, transcription_ready_samples: null, transcript_text: null, capturing_utterance: true, preroll_samples: 4, utterance_samples: 4 }
+      throw new Error(`unexpected command: ${command}`)
+    } }
+    const nativeRuntime = vi.spyOn(tauriModule, 'isNativeTauriRuntime').mockReturnValue(true)
+    await renderApp()
+    nativeRuntime.mockRestore()
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 2_050)) })
+    expect(preparations).toBe(2)
+    await act(async () => { await onFrame?.([0.04, -0.04]); await Promise.resolve() })
+    expect(played).toContain(voice.start_listening)
+    expect(startLiveAudioSourceMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not cancel a detected wake clip when the microphone stops before the save settles', async () => {
+    let onFrame: StartLiveAudioSourceOptions['onFrame'] | null = null
+    const stop = vi.fn()
+    let releaseSave: () => void = () => undefined
+    const pendingSave = new Promise<void>((resolve) => { releaseSave = resolve })
+    let saveCount = 0
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      onFrame = options.onFrame
+      return { stop }
+    })
+    window.__TAURI_INTERNALS__ = { invoke: async (command) => {
+      if (command === 'get_startup_state') return readyStartupState()
+      if (command === 'get_assistant_settings') return defaultAssistantSettings()
+      if (command === 'save_wake_clip') { saveCount += 1; return pendingSave }
+      if (command === 'ingest_audio_frame') return { runtime_phase: 'listening', last_activity_ms: 100, transcription_ready_samples: null, transcript_text: null, capturing_utterance: true, preroll_samples: 4, utterance_samples: 4, telemetry: { wake_detected_ms: 42, wake_confidence: 0.82 } }
+      throw new Error(`unexpected command: ${command}`)
+    } }
+    const { container } = await renderApp()
+    await act(async () => { await onFrame?.([0.1, -0.1]) })
+    expect(saveCount).toBe(1)
+    await act(async () => { getControlButton(container, 'Stop mic').click() })
+    expect(stop).toHaveBeenCalledOnce()
+    releaseSave()
+    await act(async () => { await pendingSave })
+    expect(container.textContent).not.toContain('Wake clip not saved')
+  })
+
+  it('saves an already-submitted wake frame even if Stop mic precedes its ingest reply', async () => {
+    let onFrame: StartLiveAudioSourceOptions['onFrame'] | null = null
+    let finishIngest: (value: unknown) => void = () => undefined
+    const pendingIngest = new Promise<unknown>((resolve) => { finishIngest = resolve })
+    const saved: number[][] = []
+    const stop = vi.fn()
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      onFrame = options.onFrame
+      return { stop }
+    })
+    window.__TAURI_INTERNALS__ = { invoke: async (command, args) => {
+      if (command === 'get_startup_state') return readyStartupState()
+      if (command === 'get_assistant_settings') return defaultAssistantSettings()
+      if (command === 'ingest_audio_frame') return pendingIngest
+      if (command === 'save_wake_clip') { saved.push((args as { samples: number[] }).samples); return null }
+      throw new Error(`unexpected command: ${command}`)
+    } }
+    const { container } = await renderApp()
+    let pendingFrame: Promise<void> | void
+    await act(async () => { pendingFrame = onFrame?.([0.2, -0.2]); await Promise.resolve() })
+    await act(async () => { getControlButton(container, 'Stop mic').click() })
+    finishIngest({ runtime_phase: 'listening', last_activity_ms: 100, transcription_ready_samples: null, transcript_text: null, capturing_utterance: true, preroll_samples: 4, utterance_samples: 4, telemetry: { wake_detected_ms: 42, wake_confidence: 0.82 } })
+    await act(async () => { await pendingFrame; await Promise.resolve() })
+    expect(stop).toHaveBeenCalledOnce()
+    expect(saved).toHaveLength(1)
+    expect(saved[0]).toHaveLength(2)
+    expect(saved[0]?.[0]).toBeCloseTo(0.2)
+    expect(container.textContent).not.toContain('Reset to idle')
+  })
 
   it('plays the configured start-listening cue path from startup state', async () => {
     const stop = vi.fn()
@@ -3498,6 +3783,10 @@ describe('App', () => {
     let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
     const invokedCommands: string[] = []
     let nowMs = 1_000
+    let releaseFinalTranscription: () => void = () => undefined
+    const finalTranscriptionBlocked = new Promise<void>((resolve) => {
+      releaseFinalTranscription = resolve
+    })
 
     class FakeAudio {
       play(): Promise<void> {
@@ -3550,6 +3839,7 @@ describe('App', () => {
         }
 
         expect(command).toBe('mark_silence')
+        await finalTranscriptionBlocked
 
         return {
           runtime_phase: 'processing',
@@ -3572,21 +3862,37 @@ describe('App', () => {
 
     nowMs = 3_600
 
+    let drainingFrames: Promise<void> | undefined
     await act(async () => {
-      await onFrame?.([0.001, -0.001, 0.001, -0.001])
+      const silenceFrame = Promise.resolve(onFrame?.([0.001, -0.001, 0.001, -0.001]))
+      await vi.waitFor(() => expect(nonDiagnosticCommands(invokedCommands)).toContain('mark_silence'))
+      const nextFrame = Promise.resolve(onFrame?.([0.001, -0.001, 0.001, -0.001]))
+      drainingFrames = Promise.all([silenceFrame, nextFrame]).then(() => undefined)
+    })
+
+    const drainedBeforeTranscription = await Promise.race([
+      drainingFrames!.then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 0)),
+    ])
+    releaseFinalTranscription()
+    await act(async () => {
+      await drainingFrames
       await Promise.resolve()
     })
 
+    expect(drainedBeforeTranscription).toBe(true)
     expect(nonDiagnosticCommands(invokedCommands)).toEqual([
       'get_startup_state',
       'ingest_audio_frame',
       'ingest_audio_frame',
       'mark_silence',
+      'ingest_audio_frame',
     ])
     expect(container.textContent).not.toContain('transcription_ready:\n3200 samples captured')
   })
 
   it('submits the transcribed voice prompt after silence and returns to wake-word waiting', async () => {
+    window.localStorage.setItem('voxgolem.voiceTelemetry', '1')
     const stop = vi.fn()
     let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
     let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
@@ -3658,6 +3964,10 @@ describe('App', () => {
             capturing_utterance: false,
             preroll_samples: 4,
             utterance_samples: 0,
+            telemetry: {
+              transcription_started_ms: 2_000,
+              transcription_completed_ms: 2_400,
+            },
           }
         }
 
@@ -3704,6 +4014,12 @@ describe('App', () => {
     expect(container.textContent).toContain('Open the pull request')
     expect(container.textContent).toContain('Voice execution response')
     expect(container.textContent).toContain('Stop mic')
+    const events = window.__VOXGOLEM_VOICE_TELEMETRY__?.snapshot().events.map((event) => event.event) ?? []
+    expect(events).toContain('transcription_started')
+    expect(events).toContain('transcription_completed')
+    expect(events).toContain('provider_request_started')
+    expect(events).toContain('provider_first_text')
+    expect(events).toContain('provider_completed')
   })
 
   it('does not submit a voice transcript through an unavailable Instant provider', async () => {
@@ -4171,12 +4487,13 @@ describe('App', () => {
     expect(container.textContent).toContain('Stop mic')
   })
 
-  it('waits for the stop cue before starting silence processing', async () => {
+  it('starts silence processing while the stop cue is still starting', async () => {
     const stop = vi.fn()
     let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
     const invokedCommands: string[] = []
     let nowMs = 1_000
     let hasPendingStopCue = false
+    let stopCueCalls = 0
     let resolveStopCue: () => void = () => {
       throw new Error('stop cue was not pending')
     }
@@ -4190,6 +4507,7 @@ describe('App', () => {
 
       play(): Promise<void> {
         if (this.source === 'resources/stop-listening.wav') {
+          stopCueCalls += 1
           return new Promise<void>((resolve) => {
             hasPendingStopCue = true
             resolveStopCue = resolve
@@ -4277,6 +4595,7 @@ describe('App', () => {
       'get_startup_state',
       'ingest_audio_frame',
       'ingest_audio_frame',
+      'mark_silence',
     ])
 
     if (hasPendingStopCue) {
@@ -4294,6 +4613,7 @@ describe('App', () => {
       'ingest_audio_frame',
       'mark_silence',
     ])
+    expect(stopCueCalls).toBe(1)
   })
 
   it('hides microphone capture errors from chat without changing the backend contract', async () => {
@@ -4393,6 +4713,7 @@ describe('App', () => {
 
     expect(window.localStorage.getItem('voxgolem.audioInputDeviceId')).toBe('studio-device')
     expect(stop).toHaveBeenCalledTimes(1)
+    expect(container.querySelector('.settings-panel__mic-name')?.textContent).toBe('Studio Microphone')
     expect(startLiveAudioSourceMock).toHaveBeenLastCalledWith(expect.objectContaining({
       deviceId: 'studio-device',
     }))
@@ -5066,6 +5387,8 @@ function nonDiagnosticCommands(commands: readonly string[]): readonly string[] {
       command !== 'set_ui_theme' &&
       command !== 'get_assistant_settings' &&
       command !== 'set_assistant_settings' &&
+      command !== 'get_wake_clip_settings' &&
+      command !== 'list_wake_clips' &&
       command !== 'set_auto_update_download' &&
       command !== 'get_update_snapshot' &&
       command !== 'check_for_update',

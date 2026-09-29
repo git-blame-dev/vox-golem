@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "name": "hey-livekit-synthetic-v1",
+  "sample_rate_hz": 16000,
+  "seed": 73129,
+  "baseline": {"threshold": 0.68, "hits": 1},
+  "thresholds": [0.5, 0.68, 0.8, 0.9, 0.95, 0.97, 0.98],
+  "consecutive_hits": [1, 2, 3],
+  "cooldown_ms": 2000,
+  "stream_seconds": 120,
+  "scenarios": [
+    {"id": "clean", "gain": 1.0, "lead_ms": 2000},
+    {"id": "quiet", "gain": 0.25, "lead_ms": 2000},
+    {"id": "noise_10db", "gain": 1.0, "lead_ms": 2000, "snr_db": 10.0},
+    {"id": "echo_60ms", "gain": 1.0, "lead_ms": 2000, "echo_ms": 60, "echo_gain": 0.35},
+    {"id": "clipped", "gain": 4.0, "lead_ms": 2000},
+    {"id": "cold_start", "gain": 1.0, "lead_ms": 0},
+    {"id": "half_hop_offset", "gain": 1.0, "lead_ms": 2040}
+  ],
+  "splits": {
+    "calibration": {
+      "voices": [{"name": "en-gb", "speed": 160}, {"name": "en-us", "speed": 180}],
+      "positive": [
+        {"id": "isolated", "text": "hey livekit"},
+        {"id": "spaced", "text": "hey live kit"},
+        {"id": "command", "text": "hey livekit tell me the weather"},
+        {"id": "pause", "text": "hey livekit. Tell me the weather."}
+      ],
+      "negative": [
+        {"id": "like_that", "text": "hey like that"},
+        {"id": "like_it", "text": "hey like it"},
+        {"id": "live_cat", "text": "hey live cat"},
+        {"id": "little_kid", "text": "hey little kid"},
+        {"id": "weather", "text": "The weather is nice today. Please close the window."},
+        {"id": "developer", "text": "Check the latest build and run the unit tests before restarting."}
+      ]
+    },
+    "holdout": {
+      "voices": [{"name": "en-us+f3", "speed": 150}, {"name": "en-gb+f2", "speed": 190}],
+      "positive": [
+        {"id": "isolated", "text": "hey livekit"},
+        {"id": "spaced", "text": "hey live kit"},
+        {"id": "settings", "text": "hey livekit open the settings"},
+        {"id": "pause", "text": "hey livekit. Show the latest result."}
+      ],
+      "negative": [
+        {"id": "light_kit", "text": "hey light kit"},
+        {"id": "life_kid", "text": "hey life kid"},
+        {"id": "look_it_up", "text": "hey look it up"},
+        {"id": "they_like_it", "text": "they like it"},
+        {"id": "lunch", "text": "We can discuss the schedule after lunch and choose a time tomorrow."},
+        {"id": "code", "text": "Save the changes and check whether the application opens correctly."}
+      ]
+    }
+  }
+}

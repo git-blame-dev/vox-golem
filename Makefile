@@ -4,6 +4,9 @@ SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
 export CARGO_INCREMENTAL ?= 0
 
+WAKE_WORD_MODEL ?=
+WAKE_BENCH_DIR ?= target/wakeword-bench/validated-v1
+
 WINDOWS_TARGET := x86_64-pc-windows-msvc
 LINUX_RELEASE_DIR := $(CURDIR)/target/release
 LINUX_STAGED_RELEASE_DIR := $(CURDIR)/dist/VoxGolem
@@ -81,6 +84,16 @@ LINUX_ORT_PROVIDER_LIBS := \
 
 .DEFAULT_GOAL := help
 
+.PHONY: wakeword-bench test-wakeword-bench
+
+wakeword-bench:
+	@test -n '$(WAKE_WORD_MODEL)' || { printf '%s\n' 'Set WAKE_WORD_MODEL to a local classifier ONNX file.' >&2; exit 1; }
+	python3 tools/wakeword-bench/bench.py run --model '$(WAKE_WORD_MODEL)' --output '$(WAKE_BENCH_DIR)'
+
+test-wakeword-bench:
+	python3 -m unittest discover -s tools/wakeword-bench -p 'test_*.py'
+	cargo test --locked -p vox-golem --example wakeword_bench
+
 .PHONY: help app-version test test-release-tools check-linux-tools app app-smoke packaged-smoke app-dev linux dist stage-linux-existing verify-dist prepare-appimage-tools update-bundle postprocess-update-bundle verify-update-bundle update-bundle-smoke check-pc-tools prepare-pc-bundle pc pc-dist verify-pc-dist pc-installer verify-pc-installer clean
 
 help:
@@ -90,6 +103,7 @@ help:
 	@printf '%s\n' '  make packaged-smoke Run the staged Linux package from a separate directory'
 	@printf '%s\n' '  make app-dev  Run only the frontend development server'
 	@printf '%s\n' '  make test     Run deterministic Linux frontend and Rust checks'
+	@printf '%s\n' '  make wakeword-bench WAKE_WORD_MODEL=/path/model.onnx  Run the synthetic wake-word benchmark'
 	@printf '%s\n' '  make app-version Print the generated application build identity'
 	@printf '%s\n' '  make linux    Build the native Linux Tauri binary'
 	@printf '%s\n' '  make dist     Stage the Linux binary under dist/VoxGolem'

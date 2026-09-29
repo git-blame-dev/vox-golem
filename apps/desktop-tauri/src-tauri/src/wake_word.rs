@@ -1,5 +1,12 @@
 use crate::livekit_wakeword::WakeWordModel;
+use crate::wake_diagnostics::{
+    InferenceDiagnostics, WakeDiagnosticMarker, WakeDiagnosticPhase, WakeDiagnostics,
+    WakeDiagnosticsSnapshot,
+};
+use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::path::Path;
+use std::time::Instant;
 
 const DETECTOR_SAMPLE_RATE_HZ: u64 = 16_000;
 const DETECTOR_INPUT_SAMPLE_RATE_HZ: u32 = 16_000;
@@ -22,6 +29,7 @@ pub struct WakeWordScoreSnapshot {
 
 pub struct WakeWordRuntime {
     inner: BufferedWakeWordRuntime<LiveKitDetector<Box<dyn WakeWordScorer + Send>>>,
+    model_revision: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -32,12 +40,33 @@ pub struct WakeWordDetection {
 
 impl WakeWordRuntime {
     pub fn new(wake_word_model_path: &Path, detection_threshold: f32) -> Result<Self, String> {
+        let model_bytes = std::fs::read(wake_word_model_path)
+            .map_err(|error| format!("failed to load wake word model: {error}"))?;
+        let model_revision = model_revision(&model_bytes);
+        let mut snapshot = tempfile::NamedTempFile::new()
+            .map_err(|error| format!("failed to snapshot wake word model: {error}"))?;
+        snapshot
+            .write_all(&model_bytes)
+            .and_then(|()| snapshot.flush())
+            .map_err(|error| format!("failed to snapshot wake word model: {error}"))?;
         Ok(Self {
             inner: BufferedWakeWordRuntime::new(LiveKitDetector::new(
-                Box::new(LiveKitScorer::new(wake_word_model_path)?),
+                Box::new(LiveKitScorer::new(snapshot.path())?) as Box<dyn WakeWordScorer + Send>,
                 detection_threshold,
+            ))
+            .with_diagnostics(WakeDiagnostics::new(
+                &wake_word_model_path.to_string_lossy(),
+                detection_threshold,
+                DETECTOR_INPUT_SAMPLE_RATE_HZ,
+                DETECTOR_WINDOW_SAMPLES,
+                DETECTOR_CHUNK_SAMPLES,
             )),
+            model_revision,
         })
+    }
+
+    pub fn model_revision(&self) -> &str {
+        &self.model_revision
     }
 
     pub fn process_sleeping_frame(
@@ -55,6 +84,32 @@ impl WakeWordRuntime {
         self.inner.detector.latest_confidence()
     }
 
+    pub fn set_diagnostics_enabled(&mut self, enabled: bool) {
+        let at_ms = self.inner.diagnostics.now_ms();
+        self.inner.diagnostics.set_enabled(enabled, at_ms);
+        self.inner.detector.set_diagnostics_enabled(enabled);
+    }
+
+    pub fn diagnostics_snapshot(&self) -> WakeDiagnosticsSnapshot {
+        let at_ms = self.inner.diagnostics.now_ms();
+        self.inner
+            .diagnostics
+            .snapshot(self.inner.warmup_remaining_samples(), at_ms)
+    }
+
+    pub fn mark_diagnostics(&mut self, marker: WakeDiagnosticMarker) -> WakeDiagnosticsSnapshot {
+        let warmup = self.inner.warmup_remaining_samples();
+        let at_ms = self.inner.diagnostics.now_ms();
+        let mut snapshot = self.inner.diagnostics.mark(marker, at_ms);
+        snapshot.warmup_remaining_samples = warmup;
+        snapshot
+    }
+
+    pub fn record_diagnostics_phase(&mut self, phase: WakeDiagnosticPhase) {
+        let at_ms = self.inner.diagnostics.now_ms();
+        self.inner.diagnostics.record_phase(phase, at_ms);
+    }
+
     #[cfg(test)]
     pub(crate) fn new_failing_for_test() -> Self {
         Self {
@@ -65,20 +120,41 @@ impl WakeWordRuntime {
                 DETECTION_THRESHOLD,
                 1,
             )),
+            model_revision: model_revision(b"synthetic failing model"),
         }
     }
+}
+
+fn model_revision(bytes: &[u8]) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 trait WakeWordDetector {
     fn samples_per_frame(&self) -> usize;
     fn process_samples(&mut self, samples: &[f32]) -> Result<Option<f32>, String>;
     fn reset(&mut self);
+    fn set_diagnostics_enabled(&mut self, _enabled: bool) {}
+    fn take_inference_diagnostics(
+        &mut self,
+        _sample_position: u64,
+    ) -> Option<InferenceDiagnostics> {
+        None
+    }
+    fn warmup_remaining_samples(&self) -> usize {
+        0
+    }
+    fn latest_score(&self) -> Option<f32> {
+        None
+    }
 }
 
 struct BufferedWakeWordRuntime<D> {
     detector: D,
     pending_samples: Vec<f32>,
     processed_samples: u64,
+    diagnostics: WakeDiagnostics,
 }
 
 impl<D: WakeWordDetector> BufferedWakeWordRuntime<D> {
@@ -87,7 +163,19 @@ impl<D: WakeWordDetector> BufferedWakeWordRuntime<D> {
             detector,
             pending_samples: Vec::new(),
             processed_samples: 0,
+            diagnostics: WakeDiagnostics::new("unknown", 0.0, 16_000, 0, 0),
         }
+    }
+
+    fn with_diagnostics(mut self, diagnostics: WakeDiagnostics) -> Self {
+        self.diagnostics = diagnostics;
+        self
+    }
+
+    fn warmup_remaining_samples(&self) -> usize {
+        self.detector
+            .warmup_remaining_samples()
+            .saturating_sub(self.pending_samples.len())
     }
 
     fn process_sleeping_frame(
@@ -108,6 +196,8 @@ impl<D: WakeWordDetector> BufferedWakeWordRuntime<D> {
                 Ok(detection_score) => detection_score,
                 Err(error) => {
                     self.pending_samples.drain(..frame_end);
+                    self.diagnostics
+                        .record_reset(self.diagnostics.now_ms(), "inference_error");
                     self.detector.reset();
                     return Err(error);
                 }
@@ -116,10 +206,21 @@ impl<D: WakeWordDetector> BufferedWakeWordRuntime<D> {
             self.processed_samples = self
                 .processed_samples
                 .saturating_add(samples_per_frame as u64);
+            if let Some(metrics) = self
+                .detector
+                .take_inference_diagnostics(self.processed_samples)
+            {
+                if let Some(score) = self.detector.latest_score() {
+                    let at_ms = self.diagnostics.now_ms();
+                    self.diagnostics.record_score(at_ms, score, metrics);
+                }
+            }
             consumed_samples = frame_end;
 
             if let Some(confidence) = detection_score {
                 self.pending_samples.clear();
+                self.diagnostics
+                    .record_reset(self.diagnostics.now_ms(), "detection");
                 self.detector.reset();
                 return Ok(Some(WakeWordDetection {
                     detected_at_ms: samples_to_ms(self.processed_samples),
@@ -137,6 +238,8 @@ impl<D: WakeWordDetector> BufferedWakeWordRuntime<D> {
 
     fn reset(&mut self) {
         self.pending_samples.clear();
+        self.diagnostics
+            .record_reset(self.diagnostics.now_ms(), "manual");
         self.detector.reset();
     }
 }
@@ -214,6 +317,9 @@ struct LiveKitDetector<S> {
     consecutive_hits: usize,
     consecutive_floor_score: Option<f32>,
     latest_confidence: Option<f32>,
+    diagnostics_enabled: bool,
+    last_inference_ms: Option<f64>,
+    last_signal_metrics: Option<(Option<f32>, f32, f32)>,
 }
 
 impl<S: WakeWordScorer> LiveKitDetector<S> {
@@ -244,6 +350,9 @@ impl<S: WakeWordScorer> LiveKitDetector<S> {
             consecutive_hits: 0,
             consecutive_floor_score: None,
             latest_confidence: None,
+            diagnostics_enabled: false,
+            last_inference_ms: None,
+            last_signal_metrics: None,
         }
     }
 
@@ -258,6 +367,8 @@ impl<S: WakeWordScorer> WakeWordDetector for LiveKitDetector<S> {
     }
 
     fn process_samples(&mut self, samples: &[f32]) -> Result<Option<f32>, String> {
+        self.last_inference_ms = None;
+        self.last_signal_metrics = None;
         self.rolling_samples
             .extend(samples.iter().copied().map(normalize_sample_to_i16));
 
@@ -270,7 +381,15 @@ impl<S: WakeWordScorer> WakeWordDetector for LiveKitDetector<S> {
             return Ok(None);
         }
 
+        let signal_metrics = self
+            .diagnostics_enabled
+            .then(|| super::wake_diagnostics::signal_metrics(samples));
+        let diagnostics_started = self.diagnostics_enabled.then(Instant::now);
         let score_snapshot = self.scorer.score(&self.rolling_samples)?;
+        if let Some(started) = diagnostics_started {
+            self.last_inference_ms = Some(started.elapsed().as_secs_f64() * 1_000.0);
+            self.last_signal_metrics = signal_metrics;
+        }
         let Some(score) = score_snapshot
             .top_scores
             .first()
@@ -309,6 +428,37 @@ impl<S: WakeWordScorer> WakeWordDetector for LiveKitDetector<S> {
         self.consecutive_hits = 0;
         self.consecutive_floor_score = None;
         self.latest_confidence = None;
+        self.last_inference_ms = None;
+        self.last_signal_metrics = None;
+    }
+
+    fn set_diagnostics_enabled(&mut self, enabled: bool) {
+        self.diagnostics_enabled = enabled;
+        if !enabled {
+            self.last_inference_ms = None;
+            self.last_signal_metrics = None;
+        }
+    }
+
+    fn take_inference_diagnostics(&mut self, sample_position: u64) -> Option<InferenceDiagnostics> {
+        let inference_ms = self.last_inference_ms.take()?;
+        let (rms_dbfs, peak, clipped_fraction) = self.last_signal_metrics.take()?;
+        Some(InferenceDiagnostics {
+            sample_position,
+            rms_dbfs,
+            peak,
+            clipped_fraction,
+            inference_ms,
+        })
+    }
+
+    fn warmup_remaining_samples(&self) -> usize {
+        self.window_samples
+            .saturating_sub(self.rolling_samples.len())
+    }
+
+    fn latest_score(&self) -> Option<f32> {
+        self.latest_confidence
     }
 }
 
@@ -330,8 +480,8 @@ fn samples_to_ms(samples: u64) -> u64 {
 mod tests {
     use super::{
         normalize_sample_to_i16, samples_to_ms, BufferedWakeWordRuntime, LiveKitDetector,
-        WakeWordDetection, WakeWordDetector, WakeWordRuntime, WakeWordScore, WakeWordScoreSnapshot,
-        WakeWordScorer, DETECTION_THRESHOLD,
+        WakeDiagnostics, WakeWordDetection, WakeWordDetector, WakeWordRuntime, WakeWordScore,
+        WakeWordScoreSnapshot, WakeWordScorer, DETECTION_THRESHOLD,
     };
     use hound::WavReader;
     use std::path::{Path, PathBuf};
@@ -589,6 +739,22 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_snapshot_is_safe_without_a_score_and_records_error_reset() {
+        let mut runtime = WakeWordRuntime::new_failing_for_test();
+        runtime.set_diagnostics_enabled(true);
+        assert!(runtime.diagnostics_snapshot().events.is_empty());
+
+        assert!(runtime.process_sleeping_frame(&[0.0; 8]).is_err());
+        let snapshot = runtime.diagnostics_snapshot();
+        assert_eq!(snapshot.events.len(), 1);
+        assert!(matches!(
+            snapshot.events[0],
+            crate::wake_diagnostics::WakeDiagnosticEvent::Reset { ref reason, .. }
+                if reason == "inference_error"
+        ));
+    }
+
+    #[test]
     fn process_sleeping_frame_does_not_replay_consumed_chunks_after_error() {
         let detector = OneShotErrorDetector {
             samples_per_frame: 480,
@@ -692,6 +858,80 @@ mod tests {
             detector.process_samples(&[0.5, 0.6, 0.7, 0.8]),
             Ok(Some(0.7))
         );
+    }
+
+    #[test]
+    fn diagnostics_records_only_real_inferences_and_keeps_trigger_score_before_reset() {
+        let scorer = FakeScorer {
+            scores: vec![0.9, 0.2],
+            seen_chunks: Vec::new(),
+        };
+        let mut detector = LiveKitDetector::with_settings(scorer, 3, 6, 0.5, 1);
+        detector.set_diagnostics_enabled(true);
+        let mut runtime = BufferedWakeWordRuntime::new(detector).with_diagnostics(
+            WakeDiagnostics::new("/tmp/synthetic/model.onnx", 0.5, 16_000, 6, 3),
+        );
+        runtime.diagnostics.set_enabled(true, 0);
+
+        assert_eq!(runtime.process_sleeping_frame(&[0.0; 3]), Ok(None));
+        assert_eq!(
+            runtime.process_sleeping_frame(&[0.0; 3]),
+            Ok(Some(WakeWordDetection {
+                detected_at_ms: 0,
+                confidence: 0.9,
+            }))
+        );
+        let snapshot = runtime.diagnostics.snapshot(
+            runtime.warmup_remaining_samples(),
+            runtime.diagnostics.now_ms(),
+        );
+        assert_eq!(snapshot.events.len(), 2);
+        assert!(matches!(
+            snapshot.events[0],
+            crate::wake_diagnostics::WakeDiagnosticEvent::Score {
+                score: 0.9,
+                sample_position: 6,
+                ..
+            }
+        ));
+        assert!(
+            matches!(snapshot.events[1], crate::wake_diagnostics::WakeDiagnosticEvent::Reset { ref reason, .. } if reason == "detection")
+        );
+        assert_eq!(snapshot.warmup_remaining_samples, 6);
+    }
+
+    #[test]
+    fn diagnostics_score_cadence_tracks_inferences_not_input_frames() {
+        let scorer = FakeScorer {
+            scores: vec![0.2; 5],
+            seen_chunks: Vec::new(),
+        };
+        let mut detector = LiveKitDetector::with_settings(scorer, 4, 8, 0.5, 1);
+        detector.set_diagnostics_enabled(true);
+        let mut runtime = BufferedWakeWordRuntime::new(detector)
+            .with_diagnostics(WakeDiagnostics::new("test.onnx", 0.5, 16_000, 8, 4));
+        runtime.diagnostics.set_enabled(true, 0);
+
+        for _ in 0..8 {
+            assert_eq!(runtime.process_sleeping_frame(&[0.0; 3]), Ok(None));
+        }
+        let scores = runtime
+            .diagnostics
+            .snapshot(
+                runtime.warmup_remaining_samples(),
+                runtime.diagnostics.now_ms(),
+            )
+            .events
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    crate::wake_diagnostics::WakeDiagnosticEvent::Score { .. }
+                )
+            })
+            .count();
+        assert_eq!(scores, 5);
+        assert_eq!(runtime.detector.scorer.seen_chunks.len(), 5);
     }
 
     fn fixtures_dir() -> PathBuf {

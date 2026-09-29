@@ -1,0 +1,46 @@
+.wake-diagnostics {
+  margin-block: 1rem;
+  border: 1px solid var(--border-color, #555);
+  border-radius: 0.5rem;
+  padding: 0.75rem;
+}
+
+.wake-diagnostics > summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.wake-diagnostics__body > p {
+  margin-block: 0.75rem;
+}
+
+.wake-diagnostics__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.wake-diagnostics__measurements {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+  gap: 0.5rem 1rem;
+  margin-block: 1rem 0;
+}
+
+.wake-diagnostics__measurements > div {
+  min-width: 0;
+}
+
+.wake-diagnostics__measurements dt {
+  font-size: 0.85em;
+  opacity: 0.75;
+}
+
+.wake-diagnostics__measurements dd {
+  margin-inline-start: 0;
+  overflow-wrap: anywhere;
+}
+
+.wake-diagnostics__error {
+  color: var(--error-color, #b42318);
+}

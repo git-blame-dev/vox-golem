@@ -1,7 +1,37 @@
 import type { CueAssetPaths } from '../types/chat'
-import { convertTauriFileSrc } from './tauri'
+import { convertTauriFileSrc, getTauriInternals } from './tauri'
 
 export type CueType = 'start_listening' | 'stop_listening'
+
+const WAV_DATA_URL_PREFIX = 'data:audio/wav;base64,'
+const MAX_VOICE_CUE_URL_LENGTH = 2_100_000
+
+export async function prepareVoiceCues(): Promise<CueAssetPaths> {
+  const tauri = getTauriInternals()
+  if (tauri === null) throw new Error('Local voice cues require the desktop runtime')
+  const payload = await tauri.invoke('prepare_voice_cues')
+  if (typeof payload !== 'object' || payload === null) {
+    throw new Error('Local voice cue response is invalid')
+  }
+  const record = payload as Record<string, unknown>
+  const startListening = parseVoiceCueUrl(record['start_listening'])
+  const stopListening = parseVoiceCueUrl(record['stop_listening'])
+  const stopListeningShort = parseVoiceCueUrl(record['stop_listening_short'])
+  return { startListening, stopListening, stopListeningShort }
+}
+
+function parseVoiceCueUrl(value: unknown): string {
+  if (
+    typeof value !== 'string' ||
+    !value.startsWith(WAV_DATA_URL_PREFIX) ||
+    value.length <= WAV_DATA_URL_PREFIX.length ||
+    value.length > MAX_VOICE_CUE_URL_LENGTH ||
+    !/^[A-Za-z\d+/]+={0,2}$/.test(value.slice(WAV_DATA_URL_PREFIX.length))
+  ) {
+    throw new Error('Local voice cue URL is invalid')
+  }
+  return value
+}
 
 export interface CuePlayer {
   play(source: string): Promise<void>
@@ -16,6 +46,20 @@ export async function playCue(
   const source = resolveCuePlaybackSource(configuredSource)
 
   await cuePlayer.play(source)
+}
+
+export async function playCueWithFallback(
+  cueType: CueType,
+  preferred: CueAssetPaths,
+  fallback: CueAssetPaths,
+  cuePlayer: CuePlayer = createBrowserCuePlayer(),
+): Promise<void> {
+  try {
+    await playCue(cueType, preferred, cuePlayer)
+  } catch (error) {
+    if (resolveCueSource(cueType, preferred) === resolveCueSource(cueType, fallback)) throw error
+    await playCue(cueType, fallback, cuePlayer)
+  }
 }
 
 export function createBrowserCuePlayer(): CuePlayer {
