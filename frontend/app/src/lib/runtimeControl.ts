@@ -112,12 +112,16 @@ function parseRuntimePhaseResponse(payload: unknown): RuntimeControlResult {
     }
 
     const capturingUtterance = record['capturing_utterance']
+    const heardSpeech = record['heard_speech']
     const prerollSamples = record['preroll_samples']
     const utteranceSamples = record['utterance_samples']
     const telemetry = parseRuntimeControlTelemetry(record['telemetry'])
 
     if (typeof capturingUtterance !== 'boolean') {
       throw new Error('Runtime control payload must include capturing_utterance')
+    }
+    if (heardSpeech !== undefined && typeof heardSpeech !== 'boolean') {
+      throw new Error('Runtime control payload heard_speech must be boolean when present')
     }
 
     if (typeof prerollSamples !== 'number' || typeof utteranceSamples !== 'number') {
@@ -130,6 +134,7 @@ function parseRuntimePhaseResponse(payload: unknown): RuntimeControlResult {
         typeof transcriptionReadySamples === 'number' ? transcriptionReadySamples : null,
       transcriptText: typeof transcriptText === 'string' ? transcriptText : null,
       lastActivityMs: typeof lastActivityMs === 'number' ? lastActivityMs : null,
+      heardSpeech: heardSpeech === true,
       capturingUtterance,
       prerollSamples,
       utteranceSamples,

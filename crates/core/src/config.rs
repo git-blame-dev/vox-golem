@@ -9,7 +9,8 @@ const WINDOWS_CONFIG_FILE: &str = "config.toml";
 const WINDOWS_SOUL_FILE: &str = "SOUL.md";
 const APP_DIR: &str = "voxgolem";
 const DEFAULT_SILERO_VAD_MODEL: &str = "models/silero-vad.onnx";
-const DEFAULT_SILENCE_TIMEOUT_MS: u64 = 1_500;
+const DEFAULT_INITIAL_SILENCE_TIMEOUT_MS: u64 = 2_500;
+const DEFAULT_SILENCE_TIMEOUT_MS: u64 = 750;
 const DEFAULT_WAKE_WORD_DETECTION_THRESHOLD: f32 = 0.68;
 const DEFAULT_TTS_WORKER_COUNT: usize = 1;
 const DEFAULT_TTS_MAX_QUEUE: usize = 8;
@@ -34,6 +35,8 @@ struct RawConfig {
     silero_vad_model: Option<PathBuf>,
     #[serde(default = "default_silence_timeout_ms")]
     silence_timeout_ms: u64,
+    #[serde(default = "default_initial_silence_timeout_ms")]
+    initial_silence_timeout_ms: u64,
     #[serde(default = "default_wake_word_detection_threshold")]
     wake_word_detection_threshold: f32,
     #[serde(default)]
@@ -148,6 +151,7 @@ pub struct RuntimeConfig {
     pub wake_word_model_path: PathBuf,
     pub parakeet_model_dir: PathBuf,
     pub silero_vad_model: PathBuf,
+    pub initial_silence_timeout_ms: u64,
     pub silence_timeout_ms: u64,
     pub wake_word_detection_threshold: f32,
     pub local_tts: LocalTtsConfig,
@@ -505,23 +509,27 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
             .silero_vad_model
             .unwrap_or_else(|| PathBuf::from(DEFAULT_SILERO_VAD_MODEL)),
     );
+    let initial_silence_timeout_ms = raw_config.initial_silence_timeout_ms;
     let silence_timeout_ms = raw_config.silence_timeout_ms;
     let wake_word_detection_threshold = raw_config.wake_word_detection_threshold;
 
-    if silence_timeout_ms == 0 {
-        return Err(ConfigError::ParseConfigFailed {
-            path: config_path.clone(),
-            details: String::from("silence_timeout_ms must be greater than zero"),
-        });
-    }
+    for (name, timeout_ms) in [
+        ("initial_silence_timeout_ms", initial_silence_timeout_ms),
+        ("silence_timeout_ms", silence_timeout_ms),
+    ] {
+        if timeout_ms == 0 {
+            return Err(ConfigError::ParseConfigFailed {
+                path: config_path.clone(),
+                details: format!("{name} must be greater than zero"),
+            });
+        }
 
-    if silence_timeout_ms > MAX_JS_SAFE_INTEGER_U64 {
-        return Err(ConfigError::ParseConfigFailed {
-            path: config_path.clone(),
-            details: String::from(
-                "silence_timeout_ms must be less than or equal to 9_007_199_254_740_991",
-            ),
-        });
+        if timeout_ms > MAX_JS_SAFE_INTEGER_U64 {
+            return Err(ConfigError::ParseConfigFailed {
+                path: config_path.clone(),
+                details: format!("{name} must be less than or equal to 9_007_199_254_740_991"),
+            });
+        }
     }
 
     if !wake_word_detection_threshold.is_finite() {
@@ -833,6 +841,7 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
                         wake_word_model_path,
                         parakeet_model_dir,
                         silero_vad_model,
+                        initial_silence_timeout_ms,
                         silence_timeout_ms,
                         wake_word_detection_threshold,
                         local_tts,
@@ -866,6 +875,7 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
                         wake_word_model_path,
                         parakeet_model_dir,
                         silero_vad_model,
+                        initial_silence_timeout_ms,
                         silence_timeout_ms,
                         wake_word_detection_threshold,
                         local_tts,
@@ -906,6 +916,7 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
         wake_word_model_path,
         parakeet_model_dir,
         silero_vad_model,
+        initial_silence_timeout_ms,
         silence_timeout_ms,
         wake_word_detection_threshold,
         local_tts,
@@ -950,6 +961,7 @@ fn default_runtime_config(config_dir: &Path, config_reason: Option<String>) -> R
         ),
         parakeet_model_dir: resolve_config_path(config_dir, PathBuf::from("models/parakeet-v2")),
         silero_vad_model: resolve_config_path(config_dir, PathBuf::from(DEFAULT_SILERO_VAD_MODEL)),
+        initial_silence_timeout_ms: DEFAULT_INITIAL_SILENCE_TIMEOUT_MS,
         silence_timeout_ms: DEFAULT_SILENCE_TIMEOUT_MS,
         wake_word_detection_threshold: DEFAULT_WAKE_WORD_DETECTION_THRESHOLD,
         local_tts: LocalTtsConfig {
@@ -1028,6 +1040,10 @@ fn record_custom_auth_issue(
 
 fn default_silence_timeout_ms() -> u64 {
     DEFAULT_SILENCE_TIMEOUT_MS
+}
+
+fn default_initial_silence_timeout_ms() -> u64 {
+    DEFAULT_INITIAL_SILENCE_TIMEOUT_MS
 }
 
 fn default_wake_word_detection_threshold() -> f32 {
@@ -1516,7 +1532,8 @@ mod tests {
         let config = load_runtime_config(Some(&config_path))
             .expect("repository config.example.toml should deserialize");
 
-        assert_eq!(config.silence_timeout_ms, 1_500);
+        assert_eq!(config.initial_silence_timeout_ms, 2_500);
+        assert_eq!(config.silence_timeout_ms, 750);
         assert_eq!(config.wake_word_detection_threshold, 0.68);
         assert!(config.telemetry.enabled);
         let llama = config
@@ -1570,6 +1587,8 @@ mod tests {
 
         let config = result.expect("missing config must produce a zero-asset runtime config");
         assert_eq!(config.response_backend, ResponseBackendConfig::Unconfigured);
+        assert_eq!(config.initial_silence_timeout_ms, 2_500);
+        assert_eq!(config.silence_timeout_ms, 750);
         assert!(config.capability_issues.iter().any(|issue| {
             issue.capability == "config"
                 && issue.reason.contains(&missing_path.display().to_string())
@@ -1751,7 +1770,8 @@ mod tests {
             .expect("config without silero_vad_model should use default path");
 
         assert_eq!(result.silero_vad_model, default_silero_vad_model);
-        assert_eq!(result.silence_timeout_ms, 1_500);
+        assert_eq!(result.initial_silence_timeout_ms, 2_500);
+        assert_eq!(result.silence_timeout_ms, 750);
         assert!(!result.logging.enabled);
     }
 
@@ -1854,7 +1874,7 @@ mod tests {
     }
 
     #[test]
-    fn loads_custom_silence_timeout() {
+    fn loads_custom_voice_timeouts() {
         let temp = TempDir::new();
         let model_dir = temp.path().join("models");
         let wake_word_model_path = model_dir.join("hey_livekit.onnx");
@@ -1870,7 +1890,7 @@ mod tests {
         fs::write(
             &config_path,
             format!(
-                "wake_word_model_path = \"{}\"\nparakeet_model_dir = \"{}\"\nsilero_vad_model = \"{}\"\nsilence_timeout_ms = 1750\nresponse_backend = \"opencode\"\n\n[opencode]\npath = \"{}\"\n",
+                "wake_word_model_path = \"{}\"\nparakeet_model_dir = \"{}\"\nsilero_vad_model = \"{}\"\ninitial_silence_timeout_ms = 3500\nsilence_timeout_ms = 750\nresponse_backend = \"opencode\"\n\n[opencode]\npath = \"{}\"\n",
                 escape_path(&wake_word_model_path),
                 escape_path(&model_dir),
                 escape_path(&silero_vad_model),
@@ -1881,7 +1901,45 @@ mod tests {
 
         let result = load_runtime_config(Some(&config_path)).expect("valid config should load");
 
-        assert_eq!(result.silence_timeout_ms, 1_750);
+        assert_eq!(result.initial_silence_timeout_ms, 3_500);
+        assert_eq!(result.silence_timeout_ms, 750);
+    }
+
+    #[test]
+    fn validates_both_voice_timeouts_as_positive_js_safe_integers() {
+        for (field, value, expected_error) in [
+            (
+                "initial_silence_timeout_ms",
+                "0",
+                "initial_silence_timeout_ms must be greater than zero",
+            ),
+            (
+                "silence_timeout_ms",
+                "0",
+                "silence_timeout_ms must be greater than zero",
+            ),
+            (
+                "initial_silence_timeout_ms",
+                "9007199254740992",
+                "initial_silence_timeout_ms must be less than or equal to 9_007_199_254_740_991",
+            ),
+            (
+                "silence_timeout_ms",
+                "9007199254740992",
+                "silence_timeout_ms must be less than or equal to 9_007_199_254_740_991",
+            ),
+        ] {
+            let temp = TempDir::new();
+            let config_path = temp.path().join("config.toml");
+            fs::write(&config_path, format!("{field} = {value}\n"))
+                .expect("config fixture should be written");
+
+            assert!(matches!(
+                load_runtime_config(Some(&config_path)),
+                Err(ConfigError::ParseConfigFailed { details, .. })
+                    if details.contains(expected_error)
+            ));
+        }
     }
 
     #[test]

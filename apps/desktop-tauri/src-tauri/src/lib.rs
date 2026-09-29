@@ -26,7 +26,8 @@ mod wake_clips;
 mod wake_diagnostics;
 mod wake_word;
 
-const DEFAULT_SILENCE_TIMEOUT_MS: u64 = 1_500;
+const DEFAULT_INITIAL_SILENCE_TIMEOUT_MS: u64 = 2_500;
+const DEFAULT_SILENCE_TIMEOUT_MS: u64 = 750;
 const DEFAULT_PREROLL_MAX_SAMPLES: usize = 4_000;
 const DEFAULT_UTTERANCE_MAX_SAMPLES: usize = 4_800_000;
 const PARTIAL_TRANSCRIPTION_MINIMUM_SAMPLES: usize = 8_000;
@@ -435,6 +436,7 @@ struct RuntimePhaseResponsePayload {
     transcription_ready_samples: Option<usize>,
     transcript_text: Option<String>,
     last_activity_ms: Option<u64>,
+    heard_speech: bool,
     capturing_utterance: bool,
     preroll_samples: usize,
     utterance_samples: usize,
@@ -747,6 +749,7 @@ enum StartupStatePayload {
         runtime_phase: RuntimePhasePayload,
         voice_input_available: bool,
         voice_input_error: Option<String>,
+        initial_silence_timeout_ms: u64,
         silence_timeout_ms: u64,
         message: String,
         selected_response_profile: ResponseProfilePayload,
@@ -761,6 +764,7 @@ enum StartupStatePayload {
         runtime_phase: RuntimePhasePayload,
         voice_input_available: bool,
         voice_input_error: Option<String>,
+        initial_silence_timeout_ms: u64,
         silence_timeout_ms: u64,
         selected_response_profile: ResponseProfilePayload,
         supported_response_profiles: Vec<ResponseProfilePayload>,
@@ -1827,6 +1831,7 @@ fn switch_response_profile(
             runtime_phase: RuntimePhasePayload::Initializing,
             voice_input_available: startup_snapshot.voice_input_available,
             voice_input_error: startup_snapshot.voice_input_error.clone(),
+            initial_silence_timeout_ms: startup_snapshot.initial_silence_timeout_ms,
             silence_timeout_ms: startup_snapshot.silence_timeout_ms,
             message: String::from("Loading local Gemma model..."),
             selected_response_profile: profile,
@@ -5190,11 +5195,7 @@ fn mark_silence(
     ensure_startup_ready_for_prompt(&app_state.startup_state)?;
     let now_ms = current_time_ms()?;
 
-    let action = apply_voice_pipeline_transition(
-        &app_state.voice_pipeline_state,
-        app_state.voice_pipeline_config,
-        voxgolem_core::voice_pipeline::VoicePipelineEvent::SilenceCheck { now_ms },
-    )?;
+    let action = apply_silence_check_with_input_reset(&app_state, now_ms)?;
 
     let should_measure_transcription = matches!(
         action,
@@ -5478,11 +5479,11 @@ fn ingest_audio_frame(
             .start_session(session_id);
         partial_transcription::PartialTranscriptionAction::Ignore
     } else if started_listening {
-        app_state
+        let mut scheduler = app_state
             .partial_transcription
             .lock()
-            .map_err(|_| String::from("partial transcription lock is poisoned"))?
-            .request_snapshot(now_ms, guard.capture().utterance_samples())
+            .map_err(|_| String::from("partial transcription lock is poisoned"))?;
+        request_partial_snapshot_after_detected_speech(&guard, &mut scheduler, now_ms)
     } else {
         partial_transcription::PartialTranscriptionAction::Ignore
     };
@@ -5625,6 +5626,17 @@ fn spawn_partial_transcription(
             }
         }
     });
+}
+
+fn request_partial_snapshot_after_detected_speech(
+    state: &voxgolem_core::voice_pipeline::VoicePipelineState,
+    scheduler: &mut partial_transcription::PartialTranscriptionScheduler,
+    now_ms: u64,
+) -> partial_transcription::PartialTranscriptionAction {
+    if !state.session().voice_turn().heard_speech() {
+        return partial_transcription::PartialTranscriptionAction::Ignore;
+    }
+    scheduler.request_snapshot(now_ms, state.capture().utterance_samples())
 }
 
 fn partial_transcription_worker_guard(
@@ -6354,6 +6366,7 @@ struct StartupSnapshot {
     cue_asset_paths: CueAssetPathsPayload,
     voice_input_available: bool,
     voice_input_error: Option<String>,
+    initial_silence_timeout_ms: u64,
     silence_timeout_ms: u64,
     tts_enabled: bool,
     tts_output_gain_db: f32,
@@ -6370,6 +6383,7 @@ fn startup_ready_state_from_snapshot(
         runtime_phase: RuntimePhasePayload::Sleeping,
         voice_input_available: startup_snapshot.voice_input_available,
         voice_input_error: startup_snapshot.voice_input_error.clone(),
+        initial_silence_timeout_ms: startup_snapshot.initial_silence_timeout_ms,
         silence_timeout_ms: startup_snapshot.silence_timeout_ms,
         selected_response_profile,
         supported_response_profiles: startup_snapshot.supported_response_profiles.clone(),
@@ -6394,6 +6408,7 @@ fn startup_snapshot_for_profile_switch(
             cue_asset_paths,
             voice_input_available,
             voice_input_error,
+            initial_silence_timeout_ms,
             silence_timeout_ms,
             tts_enabled,
             tts_output_gain_db,
@@ -6404,6 +6419,7 @@ fn startup_snapshot_for_profile_switch(
             cue_asset_paths,
             voice_input_available,
             voice_input_error,
+            initial_silence_timeout_ms,
             silence_timeout_ms,
             tts_enabled,
             tts_output_gain_db,
@@ -6413,6 +6429,7 @@ fn startup_snapshot_for_profile_switch(
             cue_asset_paths: cue_asset_paths.clone(),
             voice_input_available: *voice_input_available,
             voice_input_error: voice_input_error.clone(),
+            initial_silence_timeout_ms: *initial_silence_timeout_ms,
             silence_timeout_ms: *silence_timeout_ms,
             tts_enabled: *tts_enabled,
             tts_output_gain_db: *tts_output_gain_db,
@@ -7740,8 +7757,10 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
             );
             let telemetry_sink = new_telemetry_sink(config.telemetry);
             let mut capabilities = configured_capabilities(&config);
-            let voice_pipeline_config =
-                voice_pipeline_config_with_silence_timeout(config.silence_timeout_ms);
+            let voice_pipeline_config = voice_pipeline_config_with_silence_timeouts(
+                config.initial_silence_timeout_ms,
+                config.silence_timeout_ms,
+            );
             let supported_response_profiles = supported_response_profiles(&config.response_backend);
             let selected_response_profile = Arc::new(Mutex::new(
                 resolve_selected_response_profile(&supported_response_profiles),
@@ -7880,6 +7899,7 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
                         runtime_phase: RuntimePhasePayload::Initializing,
                         voice_input_available,
                         voice_input_error: voice_input_error.clone(),
+                        initial_silence_timeout_ms: config.initial_silence_timeout_ms,
                         silence_timeout_ms: config.silence_timeout_ms,
                         message: String::from("Loading local Gemma model..."),
                         selected_response_profile: selected_profile_at_startup,
@@ -7896,6 +7916,7 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
                         runtime_phase: RuntimePhasePayload::Sleeping,
                         voice_input_available,
                         voice_input_error: voice_input_error.clone(),
+                        initial_silence_timeout_ms: config.initial_silence_timeout_ms,
                         silence_timeout_ms: config.silence_timeout_ms,
                         selected_response_profile: selected_profile_at_startup,
                         supported_response_profiles: supported_response_profiles.clone(),
@@ -7911,6 +7932,7 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
                         runtime_phase: RuntimePhasePayload::Sleeping,
                         voice_input_available,
                         voice_input_error: voice_input_error.clone(),
+                        initial_silence_timeout_ms: config.initial_silence_timeout_ms,
                         silence_timeout_ms: config.silence_timeout_ms,
                         selected_response_profile: selected_profile_at_startup,
                         supported_response_profiles: Vec::new(),
@@ -7943,6 +7965,7 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
                     let cue_asset_paths = cue_asset_paths.clone();
                     let voice_input_error = voice_input_error.clone();
                     let silence_timeout_ms = config.silence_timeout_ms;
+                    let initial_silence_timeout_ms = config.initial_silence_timeout_ms;
                     let selected_response_profile = selected_profile_at_startup;
                     let supported_response_profiles = supported_response_profiles.clone();
                     let inference_policy = config
@@ -8045,6 +8068,7 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
                                 runtime_phase: RuntimePhasePayload::Sleeping,
                                 voice_input_available,
                                 voice_input_error,
+                                initial_silence_timeout_ms,
                                 silence_timeout_ms,
                                 selected_response_profile,
                                 supported_response_profiles: if local_ready {
@@ -8289,6 +8313,7 @@ fn build_nonfatal_config_error_app_state(
             runtime_phase: RuntimePhasePayload::Sleeping,
             voice_input_available: false,
             voice_input_error: Some(message.clone()),
+            initial_silence_timeout_ms: DEFAULT_INITIAL_SILENCE_TIMEOUT_MS,
             silence_timeout_ms: DEFAULT_SILENCE_TIMEOUT_MS,
             selected_response_profile: default_response_profile(),
             supported_response_profiles: Vec::new(),
@@ -8515,12 +8540,18 @@ fn current_silence_deadline(
         .map_err(|_| String::from("voice pipeline lock is poisoned"))?;
 
     let last_activity_ms = guard.session().voice_turn().last_activity_ms().unwrap_or(0);
-    Ok(last_activity_ms.saturating_add(
+    let timeout_ms = if guard.session().voice_turn().heard_speech() {
         voice_pipeline_config
             .session()
             .voice_turn()
-            .silence_timeout_ms(),
-    ))
+            .silence_timeout_ms()
+    } else {
+        voice_pipeline_config
+            .session()
+            .voice_turn()
+            .initial_silence_timeout_ms()
+    };
+    Ok(last_activity_ms.saturating_add(timeout_ms))
 }
 
 fn current_runtime_phase_response(
@@ -8554,6 +8585,7 @@ fn runtime_phase_response_from_state(
             .session()
             .voice_turn()
             .last_activity_ms(),
+        heard_speech: voice_pipeline_state.session().voice_turn().heard_speech(),
         capturing_utterance: voice_pipeline_state.capture().capturing_utterance(),
         preroll_samples: voice_pipeline_state.capture().preroll_len(),
         utterance_samples: voice_pipeline_state.capture().utterance_len(),
@@ -8713,14 +8745,21 @@ fn to_runtime_phase_payload(
 }
 
 fn default_voice_pipeline_config() -> voxgolem_core::voice_pipeline::VoicePipelineConfig {
-    voice_pipeline_config_with_silence_timeout(DEFAULT_SILENCE_TIMEOUT_MS)
+    voice_pipeline_config_with_silence_timeouts(
+        DEFAULT_INITIAL_SILENCE_TIMEOUT_MS,
+        DEFAULT_SILENCE_TIMEOUT_MS,
+    )
 }
 
-fn voice_pipeline_config_with_silence_timeout(
+fn voice_pipeline_config_with_silence_timeouts(
+    initial_silence_timeout_ms: u64,
     silence_timeout_ms: u64,
 ) -> voxgolem_core::voice_pipeline::VoicePipelineConfig {
-    let voice_turn = voxgolem_core::voice_turn::VoiceTurnConfig::new(silence_timeout_ms)
-        .expect("silence timeout constant should be valid");
+    let voice_turn = voxgolem_core::voice_turn::VoiceTurnConfig::with_timeouts(
+        initial_silence_timeout_ms,
+        silence_timeout_ms,
+    )
+    .expect("silence timeout constant should be valid");
     let capture = voxgolem_core::turn_capture::TurnCaptureConfig::new(
         DEFAULT_PREROLL_MAX_SAMPLES,
         DEFAULT_UTTERANCE_MAX_SAMPLES,
@@ -8750,6 +8789,36 @@ fn apply_voice_pipeline_transition(
     )
     .map_err(|error| format!("voice pipeline transition failed: {error:?}"))?;
 
+    *guard = next_state;
+    Ok(action)
+}
+
+fn apply_silence_check_with_input_reset(
+    app_state: &AppState,
+    now_ms: u64,
+) -> Result<voxgolem_core::voice_pipeline::VoicePipelineAction, String> {
+    let mut guard = app_state
+        .voice_pipeline_state
+        .lock()
+        .map_err(|_| String::from("voice pipeline lock is poisoned"))?;
+    let (next_state, action) = voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
+        &guard,
+        app_state.voice_pipeline_config,
+        voxgolem_core::voice_pipeline::VoicePipelineEvent::SilenceCheck { now_ms },
+    )
+    .map_err(|error| format!("voice pipeline transition failed: {error:?}"))?;
+    if matches!(
+        action,
+        voxgolem_core::voice_pipeline::VoicePipelineAction::ExpiredWithoutSpeech
+    ) {
+        reset_wake_word_runtime(&app_state.wake_word_runtime)?;
+        reset_voice_activity_runtime(&app_state.voice_activity_runtime)?;
+        app_state
+            .partial_transcription
+            .lock()
+            .map_err(|_| String::from("partial transcription lock is poisoned"))?
+            .reset();
+    }
     *guard = next_state;
     Ok(action)
 }
@@ -9558,7 +9627,8 @@ mod tests {
         PromptExecutionEventPayload, ResponseProfilePayload, RuntimePhasePayload,
         RuntimePhaseResponsePayload, RuntimeTelemetryPayload, StagePayload, StageStatusPayload,
         StartupStatePayload, SupervisedCreation, UiTextSizePayload, UiThemePayload,
-        DEFAULT_SILENCE_TIMEOUT_MS, PROMPT_MAX_BYTES, PROVIDER_HISTORY_MAX_BYTES,
+        DEFAULT_INITIAL_SILENCE_TIMEOUT_MS, DEFAULT_SILENCE_TIMEOUT_MS, PROMPT_MAX_BYTES,
+        PROVIDER_HISTORY_MAX_BYTES,
     };
 
     #[test]
@@ -11017,6 +11087,7 @@ mod tests {
             runtime_phase: RuntimePhasePayload::Sleeping,
             voice_input_available: false,
             voice_input_error: None,
+            initial_silence_timeout_ms: DEFAULT_INITIAL_SILENCE_TIMEOUT_MS,
             silence_timeout_ms: DEFAULT_SILENCE_TIMEOUT_MS,
             selected_response_profile: ResponseProfilePayload::Fast,
             supported_response_profiles: Vec::new(),
@@ -11215,6 +11286,7 @@ mod tests {
             },
             voice_input_available: true,
             voice_input_error: None,
+            initial_silence_timeout_ms: DEFAULT_INITIAL_SILENCE_TIMEOUT_MS,
             silence_timeout_ms: 1_500,
             tts_enabled: true,
             tts_output_gain_db: 0.0,
@@ -11951,6 +12023,7 @@ mod tests {
             runtime_phase: RuntimePhasePayload::Initializing,
             voice_input_available: true,
             voice_input_error: None,
+            initial_silence_timeout_ms: DEFAULT_INITIAL_SILENCE_TIMEOUT_MS,
             silence_timeout_ms: DEFAULT_SILENCE_TIMEOUT_MS,
             message: String::from("Loading local Gemma model..."),
             selected_response_profile: ResponseProfilePayload::Quality,
@@ -11979,6 +12052,7 @@ mod tests {
             runtime_phase: RuntimePhasePayload::Sleeping,
             voice_input_available: true,
             voice_input_error: None,
+            initial_silence_timeout_ms: DEFAULT_INITIAL_SILENCE_TIMEOUT_MS,
             silence_timeout_ms: DEFAULT_SILENCE_TIMEOUT_MS,
             selected_response_profile: ResponseProfilePayload::Fast,
             supported_response_profiles: vec![
@@ -12013,6 +12087,13 @@ mod tests {
             voxgolem_core::voice_pipeline::VoicePipelineEvent::WakeWordDetected { now_ms: 100 },
         )
         .expect("wake word should start listening");
+        assert_eq!(
+            current_silence_deadline(
+                &Mutex::new(listening_state.0.clone()),
+                voice_pipeline_config
+            ),
+            Ok(DEFAULT_INITIAL_SILENCE_TIMEOUT_MS + 100)
+        );
         let refreshed_state = voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
             &listening_state.0,
             voice_pipeline_config,
@@ -12078,6 +12159,7 @@ mod tests {
                 transcription_ready_samples: None,
                 transcript_text: None,
                 last_activity_ms: Some(100),
+                heard_speech: false,
                 capturing_utterance: true,
                 preroll_samples: 3,
                 utterance_samples: 2,
@@ -12167,6 +12249,7 @@ mod tests {
                 transcription_ready_samples: Some(2),
                 transcript_text: Some("draft release notes".to_string()),
                 last_activity_ms: None,
+                heard_speech: false,
                 capturing_utterance: false,
                 preroll_samples: 2,
                 utterance_samples: 0,
@@ -12213,6 +12296,213 @@ mod tests {
             refreshed_state.session().voice_turn().last_activity_ms(),
             Some(450)
         );
+        assert!(
+            super::runtime_phase_response_from_state(&refreshed_state, None, None, None)
+                .heard_speech
+        );
+    }
+
+    #[test]
+    fn waiting_for_first_speech_expires_without_transcription_or_processing_cue() {
+        use voxgolem_core::voice_pipeline::{
+            apply_voice_pipeline_event, VoicePipelineAction, VoicePipelineEvent, VoicePipelineState,
+        };
+
+        let config = default_voice_pipeline_config();
+        let ready = apply_voice_pipeline_event(
+            &VoicePipelineState::new(config).expect("synthetic pipeline"),
+            config,
+            VoicePipelineEvent::StartupValidated,
+        )
+        .expect("ready")
+        .0;
+        let listening = apply_voice_pipeline_event(
+            &ready,
+            config,
+            VoicePipelineEvent::WakeWordDetected { now_ms: 100 },
+        )
+        .expect("listening")
+        .0;
+        let listening =
+            voxgolem_core::voice_pipeline::ingest_audio_frame(&listening, config, vec![0.1, -0.1])
+                .expect("synthetic silence frame");
+        let (sleeping, action) = apply_voice_pipeline_event(
+            &listening,
+            config,
+            VoicePipelineEvent::SilenceCheck { now_ms: 2_600 },
+        )
+        .expect("initial wait expires");
+        assert_eq!(action, VoicePipelineAction::ExpiredWithoutSpeech);
+        assert_eq!(
+            sleeping.session().runtime().phase(),
+            voxgolem_core::runtime::RuntimePhase::Sleeping
+        );
+        assert!(!sleeping.capture().capturing_utterance());
+        assert_eq!(sleeping.capture().utterance_len(), 0);
+        assert_eq!(transcribe_finished_utterance(&action, &None), Ok(None));
+        let response = build_mark_silence_response(&Mutex::new(sleeping), &action, None, None)
+            .expect("silent expiry response");
+        assert_eq!(response.runtime_phase, RuntimePhasePayload::Sleeping);
+        assert_eq!(response.transcript_text, None);
+        assert!(!response.heard_speech);
+    }
+
+    #[test]
+    fn listening_noise_cannot_start_partial_transcription_before_vad_speech() {
+        use voxgolem_core::voice_pipeline::{
+            apply_voice_pipeline_event, ingest_audio_frame, VoicePipelineEvent, VoicePipelineState,
+        };
+
+        let config = default_voice_pipeline_config();
+        let ready = apply_voice_pipeline_event(
+            &VoicePipelineState::new(config).expect("synthetic pipeline"),
+            config,
+            VoicePipelineEvent::StartupValidated,
+        )
+        .expect("ready")
+        .0;
+        let listening = apply_voice_pipeline_event(
+            &ready,
+            config,
+            VoicePipelineEvent::WakeWordDetected { now_ms: 100 },
+        )
+        .expect("listening")
+        .0;
+        let noisy = ingest_audio_frame(&listening, config, vec![0.0; 8_001])
+            .expect("buffered synthetic noise");
+        let scheduler = super::new_partial_transcription_scheduler();
+        let mut scheduler = scheduler.lock().expect("partial scheduler");
+        scheduler.start_session(1);
+        assert!(matches!(
+            super::request_partial_snapshot_after_detected_speech(&noisy, &mut scheduler, 500),
+            super::partial_transcription::PartialTranscriptionAction::Ignore,
+        ));
+
+        let speech = apply_voice_pipeline_event(
+            &noisy,
+            config,
+            VoicePipelineEvent::SpeechDetected { now_ms: 550 },
+        )
+        .expect("VAD detects speech")
+        .0;
+        assert!(matches!(
+            super::request_partial_snapshot_after_detected_speech(&speech, &mut scheduler, 550),
+            super::partial_transcription::PartialTranscriptionAction::StartSnapshot {
+                session_id: 1,
+                ..
+            },
+        ));
+    }
+
+    #[test]
+    fn silent_expiry_clears_old_partial_session_before_a_new_wake_starts() {
+        use voxgolem_core::voice_pipeline::{VoicePipelineAction, VoicePipelineEvent};
+
+        let state = build_startup_error_app_state(
+            default_voice_pipeline_config(),
+            String::from("synthetic startup"),
+        );
+        reset_voice_pipeline_to_waiting(
+            &state.voice_pipeline_state,
+            &state.wake_word_runtime,
+            &state.voice_activity_runtime,
+            state.voice_pipeline_config,
+        )
+        .expect("ready");
+        super::apply_voice_pipeline_transition(
+            &state.voice_pipeline_state,
+            state.voice_pipeline_config,
+            VoicePipelineEvent::WakeWordDetected { now_ms: 100 },
+        )
+        .expect("first wake");
+        state
+            .partial_transcription
+            .lock()
+            .expect("partial scheduler")
+            .start_session(1);
+        assert_eq!(
+            super::apply_silence_check_with_input_reset(&state, 2_600),
+            Ok(VoicePipelineAction::ExpiredWithoutSpeech)
+        );
+        assert!(matches!(
+            state
+                .partial_transcription
+                .lock()
+                .expect("partial scheduler")
+                .request_snapshot(2_600, &vec![0.0; 8_001]),
+            super::partial_transcription::PartialTranscriptionAction::Ignore,
+        ));
+
+        super::apply_voice_pipeline_transition(
+            &state.voice_pipeline_state,
+            state.voice_pipeline_config,
+            VoicePipelineEvent::WakeWordDetected { now_ms: 2_700 },
+        )
+        .expect("next wake can start");
+        state
+            .partial_transcription
+            .lock()
+            .expect("partial scheduler")
+            .start_session(2);
+        assert!(matches!(
+            state
+                .partial_transcription
+                .lock()
+                .expect("partial scheduler")
+                .request_snapshot(2_700, &vec![0.0; 8_001]),
+            super::partial_transcription::PartialTranscriptionAction::StartSnapshot {
+                session_id: 2,
+                ..
+            },
+        ));
+    }
+
+    #[test]
+    fn silent_voice_expiry_preserves_an_unrelated_typed_completion() {
+        use voxgolem_core::voice_pipeline::{VoicePipelineAction, VoicePipelineEvent};
+
+        let state = build_startup_error_app_state(
+            default_voice_pipeline_config(),
+            String::from("synthetic startup"),
+        );
+        reset_voice_pipeline_to_waiting(
+            &state.voice_pipeline_state,
+            &state.wake_word_runtime,
+            &state.voice_activity_runtime,
+            state.voice_pipeline_config,
+        )
+        .expect("ready");
+        super::apply_voice_pipeline_transition(
+            &state.voice_pipeline_state,
+            state.voice_pipeline_config,
+            VoicePipelineEvent::WakeWordDetected { now_ms: 100 },
+        )
+        .expect("wake");
+        *state.completion_context.lock().expect("completion context") =
+            Some(super::CompletionRequestContext {
+                backend_revision: 7,
+                client_revision: 7,
+                source: super::CompletionSource::Typed,
+                voice_session_id: None,
+                prompt: String::from("synthetic draft"),
+                started_ms: 100,
+            });
+        let prefetch_generation = state.prefetch_generation.load(Ordering::SeqCst);
+
+        assert_eq!(
+            super::apply_silence_check_with_input_reset(&state, 2_600),
+            Ok(VoicePipelineAction::ExpiredWithoutSpeech)
+        );
+        assert!(state
+            .completion_context
+            .lock()
+            .expect("completion context")
+            .as_ref()
+            .is_some_and(|context| context.source == super::CompletionSource::Typed));
+        assert_eq!(
+            state.prefetch_generation.load(Ordering::SeqCst),
+            prefetch_generation
+        );
     }
 
     #[test]
@@ -12239,6 +12529,13 @@ mod tests {
             vec![0.1, 0.2, 0.3],
         )
         .expect("listening frame should be recorded before silence");
+        let processing_state = voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
+            &processing_state,
+            voice_pipeline_config,
+            voxgolem_core::voice_pipeline::VoicePipelineEvent::SpeechDetected { now_ms: 101 },
+        )
+        .expect("VAD detects user speech")
+        .0;
         let processing_state = voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
             &processing_state,
             voice_pipeline_config,
@@ -12277,6 +12574,7 @@ mod tests {
                 transcription_ready_samples: Some(3),
                 transcript_text: Some("draft release notes".to_string()),
                 last_activity_ms: None,
+                heard_speech: false,
                 capturing_utterance: false,
                 preroll_samples: 0,
                 utterance_samples: 0,
@@ -12516,6 +12814,7 @@ mod tests {
             runtime_phase: RuntimePhasePayload::Sleeping,
             voice_input_available: true,
             voice_input_error: None,
+            initial_silence_timeout_ms: DEFAULT_INITIAL_SILENCE_TIMEOUT_MS,
             silence_timeout_ms: 1_500,
             selected_response_profile: ResponseProfilePayload::Fast,
             supported_response_profiles: vec![ResponseProfilePayload::Fast],

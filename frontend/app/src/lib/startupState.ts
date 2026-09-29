@@ -9,7 +9,8 @@ import type {
   CapabilityId,
 } from '../types/chat'
 
-export const DEFAULT_SILENCE_TIMEOUT_MS = 1_500
+export const DEFAULT_INITIAL_SILENCE_TIMEOUT_MS = 2_500
+export const DEFAULT_SILENCE_TIMEOUT_MS = 750
 export const DEFAULT_TTS_OUTPUT_GAIN_DB = 3
 
 export const DEFAULT_CUE_ASSET_PATHS: CueAssetPaths = {
@@ -32,6 +33,7 @@ export function parseStartupState(payload: unknown): StartupState {
   if (payload['kind'] === 'warming_model') {
     const voiceInputAvailable = payload['voice_input_available']
     const voiceInputError = payload['voice_input_error']
+    const initialSilenceTimeoutMs = parseInitialSilenceTimeoutMs(payload['initial_silence_timeout_ms'])
     const silenceTimeoutMs = parseSilenceTimeoutMs(payload['silence_timeout_ms'])
     const message = payload['message']
     const ttsEnabled = parseTtsEnabled(payload['tts_enabled'])
@@ -57,6 +59,7 @@ export function parseStartupState(payload: unknown): StartupState {
       runtimePhase: parseRuntimePhase(payload['runtime_phase']),
       voiceInputAvailable,
       voiceInputError,
+      initialSilenceTimeoutMs,
       silenceTimeoutMs,
       message,
       selectedResponseProfile: responseProfileState.selectedResponseProfile,
@@ -71,6 +74,7 @@ export function parseStartupState(payload: unknown): StartupState {
   if (payload['kind'] === 'ready') {
     const voiceInputAvailable = payload['voice_input_available']
     const voiceInputError = payload['voice_input_error']
+    const initialSilenceTimeoutMs = parseInitialSilenceTimeoutMs(payload['initial_silence_timeout_ms'])
     const silenceTimeoutMs = parseSilenceTimeoutMs(payload['silence_timeout_ms'])
     const ttsEnabled = parseTtsEnabled(payload['tts_enabled'])
     const ttsOutputGainDb = parseTtsOutputGainDb(payload['tts_output_gain_db'])
@@ -91,6 +95,7 @@ export function parseStartupState(payload: unknown): StartupState {
       runtimePhase: parseRuntimePhase(payload['runtime_phase']),
       voiceInputAvailable,
       voiceInputError,
+      initialSilenceTimeoutMs,
       silenceTimeoutMs,
       selectedResponseProfile: responseProfileState.selectedResponseProfile,
       supportedResponseProfiles: responseProfileState.supportedResponseProfiles,
@@ -150,6 +155,7 @@ function buildDefaultStartupState(): StartupState {
     runtimePhase: 'sleeping',
     voiceInputAvailable: true,
     voiceInputError: null,
+    initialSilenceTimeoutMs: DEFAULT_INITIAL_SILENCE_TIMEOUT_MS,
     silenceTimeoutMs: DEFAULT_SILENCE_TIMEOUT_MS,
     selectedResponseProfile: DEFAULT_SELECTED_RESPONSE_PROFILE,
     supportedResponseProfiles: DEFAULT_SUPPORTED_RESPONSE_PROFILES,
@@ -233,6 +239,14 @@ function parseSilenceTimeoutMs(payload: unknown): number {
     throw new Error('Startup payload must include a positive integer `silence_timeout_ms`')
   }
 
+  return payload
+}
+
+function parseInitialSilenceTimeoutMs(payload: unknown): number {
+  if (payload === undefined) return DEFAULT_INITIAL_SILENCE_TIMEOUT_MS
+  if (typeof payload !== 'number' || !Number.isSafeInteger(payload) || payload <= 0) {
+    throw new Error('Startup payload must include a positive integer `initial_silence_timeout_ms`')
+  }
   return payload
 }
 

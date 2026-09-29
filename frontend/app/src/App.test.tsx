@@ -2514,6 +2514,7 @@ describe('App', () => {
             transcription_ready_samples: null,
             transcript_text: null,
             last_activity_ms: phase === 'listening' ? 100 : null,
+            heard_speech: phase === 'listening',
             capturing_utterance: phase === 'listening',
             preroll_samples: 4,
             utterance_samples: 4,
@@ -2713,6 +2714,7 @@ describe('App', () => {
             transcription_ready_samples: null,
             transcript_text: null,
             last_activity_ms: 100,
+            heard_speech: true,
             capturing_utterance: true,
             preroll_samples: 4,
             utterance_samples: 4,
@@ -4338,6 +4340,7 @@ describe('App', () => {
             transcription_ready_samples: null,
             transcript_text: null,
             last_activity_ms: 1_000,
+            heard_speech: true,
             capturing_utterance: true,
             preroll_samples: 4,
             utterance_samples: 4,
@@ -4487,6 +4490,50 @@ describe('App', () => {
     expect(container.textContent).toContain('Stop mic')
   })
 
+  it('returns to wake waiting without the stop cue when no speech is detected in 2.5 seconds', async () => {
+    let nowMs = 100
+    let phase: 'listening' | 'sleeping' = 'listening'
+    const invokedCommands: string[] = []
+    const playedSources: string[] = []
+    let onFrame: StartLiveAudioSourceOptions['onFrame'] | null = null
+    Date.now = () => nowMs
+    Object.defineProperty(globalThis, 'Audio', {
+      configurable: true,
+      value: class {
+        constructor(source: string) { playedSources.push(source) }
+        play(): Promise<void> { return Promise.resolve() }
+      },
+    })
+    startLiveAudioSourceMock.mockImplementation(async (options) => {
+      onFrame = options.onFrame
+      return { stop: vi.fn() }
+    })
+    window.__TAURI_INTERNALS__ = { invoke: async (command) => {
+      invokedCommands.push(command)
+      if (command === 'get_startup_state') return readyStartupState({ initial_silence_timeout_ms: 2500, silence_timeout_ms: 750 })
+      if (command === 'get_assistant_settings') return defaultAssistantSettings()
+      if (command === 'ingest_audio_frame') return { runtime_phase: phase, last_activity_ms: phase === 'listening' ? 100 : null, heard_speech: false, transcription_ready_samples: null, transcript_text: null, capturing_utterance: phase === 'listening', preroll_samples: 0, utterance_samples: phase === 'listening' ? 4 : 0 }
+      if (command === 'mark_silence') {
+        phase = 'sleeping'
+        return { runtime_phase: phase, last_activity_ms: null, heard_speech: false, transcription_ready_samples: null, transcript_text: null, capturing_utterance: false, preroll_samples: 0, utterance_samples: 0 }
+      }
+      throw new Error(`unexpected command: ${command}`)
+    } }
+
+    const { container } = await renderApp()
+    nowMs = 2_599
+    await act(async () => { await onFrame?.([0.001, -0.001]); await Promise.resolve() })
+    expect(invokedCommands).not.toContain('mark_silence')
+    nowMs = 2_600
+    await act(async () => { await onFrame?.([0.001, -0.001]); await Promise.resolve() })
+    await vi.waitFor(() => expect(invokedCommands).toContain('mark_silence'))
+    expect(playedSources).not.toContain('resources/stop-listening.wav')
+    expect(invokedCommands).not.toContain('submit_prompt')
+    expect(container.textContent).toContain('Stop mic')
+    await act(async () => { await onFrame?.([0.001, -0.001]); await Promise.resolve() })
+    expect(phase).toBe('sleeping')
+  })
+
   it('starts silence processing while the stop cue is still starting', async () => {
     const stop = vi.fn()
     let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
@@ -4543,7 +4590,8 @@ describe('App', () => {
             runtime_phase: 'sleeping',
             voice_input_available: true,
             voice_input_error: null,
-            silence_timeout_ms: 1500,
+            initial_silence_timeout_ms: 2500,
+            silence_timeout_ms: 750,
             selected_response_profile: 'quality',
             supported_response_profiles: ['fast', 'quality'],
             capabilities: completeCapabilities(),
@@ -4556,6 +4604,7 @@ describe('App', () => {
             transcription_ready_samples: null,
             transcript_text: null,
             last_activity_ms: 1_000,
+            heard_speech: true,
             capturing_utterance: true,
             preroll_samples: 4,
             utterance_samples: 4,
@@ -4583,7 +4632,11 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    nowMs = 3_600
+    nowMs = 1_749
+    await act(async () => { await onFrame?.([0.001, -0.001]); await Promise.resolve() })
+    expect(nonDiagnosticCommands(invokedCommands)).not.toContain('mark_silence')
+
+    nowMs = 1_750
 
     let pendingFrame: Promise<void> | void
     await act(async () => {
@@ -4593,6 +4646,7 @@ describe('App', () => {
 
     expect(nonDiagnosticCommands(invokedCommands)).toEqual([
       'get_startup_state',
+      'ingest_audio_frame',
       'ingest_audio_frame',
       'ingest_audio_frame',
       'mark_silence',
@@ -4609,6 +4663,7 @@ describe('App', () => {
 
     expect(nonDiagnosticCommands(invokedCommands)).toEqual([
       'get_startup_state',
+      'ingest_audio_frame',
       'ingest_audio_frame',
       'ingest_audio_frame',
       'mark_silence',

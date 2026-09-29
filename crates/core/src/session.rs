@@ -127,6 +127,8 @@ pub fn apply_session_event(
                     apply_runtime_event(state.runtime(), RuntimeEvent::EndListening)
                         .map_err(SessionTransitionError::Runtime)?
                 }
+                VoiceTurnAction::StopWithoutSpeech => reset_runtime_to_idle(state.runtime())
+                    .map_err(SessionTransitionError::Runtime)?,
                 _ => state.runtime.clone(),
             };
 
@@ -168,7 +170,9 @@ mod tests {
     };
 
     fn session_config() -> SessionConfig {
-        SessionConfig::new(VoiceTurnConfig::new(1_200).expect("valid silence timeout"))
+        SessionConfig::new(
+            VoiceTurnConfig::with_timeouts(1_200, 1_200).expect("valid silence timeouts"),
+        )
     }
 
     #[test]
@@ -218,16 +222,47 @@ mod tests {
         )
         .expect("wake word should start listening");
 
-        let next = apply_session_event(
+        let speaking = apply_session_event(
             &listening,
             session_config(),
-            SessionEvent::SilenceCheck { now_ms: 1_300 },
+            SessionEvent::SpeechDetected { now_ms: 200 },
+        )
+        .expect("speech should be detected");
+        let next = apply_session_event(
+            &speaking,
+            session_config(),
+            SessionEvent::SilenceCheck { now_ms: 1_400 },
         )
         .expect("silence timeout should stop listening");
 
         assert_eq!(next.runtime().phase(), RuntimePhase::Processing);
         assert!(!next.voice_turn().listening());
         assert_eq!(next.voice_turn().last_activity_ms(), None);
+    }
+
+    #[test]
+    fn initial_silence_expiry_returns_to_sleeping_without_error() {
+        let config = SessionConfig::new(
+            VoiceTurnConfig::with_timeouts(2_500, 750).expect("valid silence timeouts"),
+        );
+        let ready =
+            apply_session_event(&SessionState::new(), config, SessionEvent::StartupValidated)
+                .expect("startup validation should succeed");
+        let listening =
+            apply_session_event(&ready, config, SessionEvent::WakeWordDetected { now_ms: 0 })
+                .expect("wake word should start listening");
+
+        let next = apply_session_event(
+            &listening,
+            config,
+            SessionEvent::SilenceCheck { now_ms: 2_500 },
+        )
+        .expect("no-speech expiry should reset cleanly");
+
+        assert_eq!(next.runtime().phase(), RuntimePhase::Sleeping);
+        assert_eq!(next.runtime().last_error(), None);
+        assert!(!next.voice_turn().listening());
+        assert!(!next.voice_turn().heard_speech());
     }
 
     #[test]
@@ -275,6 +310,7 @@ mod tests {
         assert_eq!(next.runtime().phase(), RuntimePhase::Listening);
         assert!(next.voice_turn().listening());
         assert_eq!(next.voice_turn().last_activity_ms(), Some(450));
+        assert!(next.voice_turn().heard_speech());
     }
 
     #[test]
@@ -307,10 +343,16 @@ mod tests {
             SessionEvent::WakeWordDetected { now_ms: 100 },
         )
         .expect("wake word should start listening");
-        let processing = apply_session_event(
+        let speaking = apply_session_event(
             &listening,
             session_config(),
-            SessionEvent::SilenceCheck { now_ms: 1_300 },
+            SessionEvent::SpeechDetected { now_ms: 200 },
+        )
+        .expect("speech should be detected");
+        let processing = apply_session_event(
+            &speaking,
+            session_config(),
+            SessionEvent::SilenceCheck { now_ms: 1_400 },
         )
         .expect("silence timeout should stop listening");
 
@@ -336,10 +378,16 @@ mod tests {
             SessionEvent::WakeWordDetected { now_ms: 100 },
         )
         .expect("wake word should start listening");
-        let processing = apply_session_event(
+        let speaking = apply_session_event(
             &listening,
             session_config(),
-            SessionEvent::SilenceCheck { now_ms: 1_300 },
+            SessionEvent::SpeechDetected { now_ms: 200 },
+        )
+        .expect("speech should be detected");
+        let processing = apply_session_event(
+            &speaking,
+            session_config(),
+            SessionEvent::SilenceCheck { now_ms: 1_400 },
         )
         .expect("silence timeout should stop listening");
 
