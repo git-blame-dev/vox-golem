@@ -7,7 +7,7 @@ import type { AnswerStageStatusEntry, AnswerPriorVersion } from './components/An
 import { PromptComposer } from './components/PromptComposer'
 import { UserNoticeToast } from './components/UserNoticeToast'
 import { UpdateSettings } from './components/UpdateSettings'
-import { playCueWithFallback, prepareVoiceCues } from './lib/audioCues'
+import { createBrowserCuePlayer, playCueWithFallback, prepareVoiceCues } from './lib/audioCues'
 import { shouldSubmitComposer } from './lib/composer'
 import { listAudioInputDevices, startLiveAudioSource } from './lib/liveAudioSource'
 import type { AudioInputDevice, LiveAudioSource } from './lib/liveAudioSource'
@@ -226,6 +226,7 @@ function App() {
   const ttsGenerationRef = useRef(0)
   const ttsEnabledRef = useRef(false)
   const ttsPlaybackIdRef = useRef<number | null>(null)
+  const cuePlayerRef = useRef(createBrowserCuePlayer())
   const cueAssetPathsRef = useRef<CueAssetPaths>(DEFAULT_CUE_ASSET_PATHS)
   const fallbackCueAssetPathsRef = useRef<CueAssetPaths>(DEFAULT_CUE_ASSET_PATHS)
   const uiTextSizeWriteRevisionRef = useRef(0)
@@ -717,8 +718,10 @@ function App() {
 
   useEffect(() => {
     appActiveRef.current = true
+    const cuePlayer = cuePlayerRef.current
     return () => {
       appActiveRef.current = false
+      cuePlayer.stop()
       cancelTts()
       if (wakeConfidenceHoldRef.current !== null) {
         window.clearTimeout(wakeConfidenceHoldRef.current)
@@ -945,9 +948,9 @@ function App() {
         },
       })
 
-       void playCueWithFallback(cueType, cueAssetPathsRef.current, fallbackCueAssetPathsRef.current)
-        .then(() => {
-          voiceTelemetry.record('cue_play_started', {
+       void playCueWithFallback(cueType, cueAssetPathsRef.current, fallbackCueAssetPathsRef.current, cuePlayerRef.current)
+        .then((started) => {
+          if (started) voiceTelemetry.record('cue_play_started', {
             details: {
               cueType,
               source: 'apply_transition',
@@ -1007,9 +1010,9 @@ function App() {
         },
       })
 
-       void playCueWithFallback(cueType, cueAssetPathsRef.current, fallbackCueAssetPathsRef.current)
-        .then(() => {
-          voiceTelemetry.record('cue_play_started', {
+       void playCueWithFallback(cueType, cueAssetPathsRef.current, fallbackCueAssetPathsRef.current, cuePlayerRef.current)
+        .then((started) => {
+          if (started) voiceTelemetry.record('cue_play_started', {
             details: {
               cueType,
               source: 'apply_runtime_status',
@@ -1486,6 +1489,7 @@ function App() {
       setTtsPlaying(true)
       commandPending = true
       setPendingTtsCommands((count) => count + 1)
+      cuePlayerRef.current.stop()
       const payload = await invokeTauriCommand('speak_local_tts', {
         text: speechText,
         playbackId,
@@ -1545,13 +1549,13 @@ function App() {
           source: 'mark_silence',
         },
       })
-      void playCueWithFallback('stop_listening', cueAssetPathsRef.current, fallbackCueAssetPathsRef.current)
-        .then(() => voiceTelemetry.record('cue_play_started', {
+      void playCueWithFallback('stop_listening', cueAssetPathsRef.current, fallbackCueAssetPathsRef.current, cuePlayerRef.current)
+        .then((started) => { if (started) voiceTelemetry.record('cue_play_started', {
           details: {
             cueType: 'stop_listening',
             source: 'mark_silence',
           },
-        }))
+        }) })
         .catch((error: unknown) => reportCuePlaybackError('stop_listening', error))
     }
 

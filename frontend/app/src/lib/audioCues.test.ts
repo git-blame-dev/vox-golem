@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { playCue, playCueWithFallback, prepareVoiceCues } from './audioCues'
+import { createBrowserCuePlayer, playCue, playCueWithFallback, prepareVoiceCues } from './audioCues'
 import { DEFAULT_CUE_ASSET_PATHS } from './startupState'
 
 const WINDOWS_CUE_PATH = 'C:\\bundle\\start-listening.wav'
@@ -7,6 +7,7 @@ const WINDOWS_CUE_FILE_URL = 'file:///C:/bundle/start-listening.wav'
 
 afterEach(() => {
   Reflect.deleteProperty(window, '__TAURI_INTERNALS__')
+  vi.unstubAllGlobals()
 })
 
 describe('prepareVoiceCues', () => {
@@ -41,6 +42,39 @@ describe('prepareVoiceCues', () => {
 })
 
 describe('playCue', () => {
+  it('pauses an active browser cue on demand', async () => {
+    const paused = vi.fn()
+    vi.stubGlobal('Audio', class {
+      play(): Promise<void> { return Promise.resolve() }
+      pause(): void { paused() }
+    })
+
+    const player = createBrowserCuePlayer()
+    await player.play('data:audio/wav;base64,AAEC')
+    player.stop()
+
+    expect(paused).toHaveBeenCalledOnce()
+  })
+
+  it('does not play a fallback cue after an in-flight cue is stopped', async () => {
+    const played: string[] = []
+    vi.stubGlobal('Audio', class {
+      constructor(source: string) { played.push(source) }
+      play(): Promise<void> {
+        return new Promise<void>((_resolve, reject) => { this.rejectPlayback = reject })
+      }
+      rejectPlayback: ((error: Error) => void) | null = null
+      pause(): void { this.rejectPlayback?.(new Error('playback was interrupted')) }
+    })
+    const player = createBrowserCuePlayer()
+    const preferred = { ...DEFAULT_CUE_ASSET_PATHS, stopListening: 'data:audio/wav;base64,AAEC' }
+
+    const pending = playCueWithFallback('stop_listening', preferred, DEFAULT_CUE_ASSET_PATHS, player)
+    player.stop()
+    await expect(pending).resolves.toBe(false)
+    expect(played).toEqual([preferred.stopListening])
+  })
+
   it('falls back to the embedded chime when prepared voice playback fails', async () => {
     const voice = 'data:audio/wav;base64,AAEC'
     const play = vi.fn(async (source: string) => {

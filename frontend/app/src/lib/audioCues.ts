@@ -34,18 +34,22 @@ function parseVoiceCueUrl(value: unknown): string {
 }
 
 export interface CuePlayer {
-  play(source: string): Promise<void>
+  play(source: string): Promise<void | boolean>
+}
+
+export interface BrowserCuePlayer extends CuePlayer {
+  stop(): void
 }
 
 export async function playCue(
   cueType: CueType,
   cueAssetPaths: CueAssetPaths,
   cuePlayer: CuePlayer = createBrowserCuePlayer(),
-): Promise<void> {
+): Promise<boolean> {
   const configuredSource = resolveCueSource(cueType, cueAssetPaths)
   const source = resolveCuePlaybackSource(configuredSource)
 
-  await cuePlayer.play(source)
+  return (await cuePlayer.play(source)) !== false
 }
 
 export async function playCueWithFallback(
@@ -53,23 +57,37 @@ export async function playCueWithFallback(
   preferred: CueAssetPaths,
   fallback: CueAssetPaths,
   cuePlayer: CuePlayer = createBrowserCuePlayer(),
-): Promise<void> {
+): Promise<boolean> {
   try {
-    await playCue(cueType, preferred, cuePlayer)
+    return await playCue(cueType, preferred, cuePlayer)
   } catch (error) {
     if (resolveCueSource(cueType, preferred) === resolveCueSource(cueType, fallback)) throw error
-    await playCue(cueType, fallback, cuePlayer)
+    return playCue(cueType, fallback, cuePlayer)
   }
 }
 
-export function createBrowserCuePlayer(): CuePlayer {
+export function createBrowserCuePlayer(): BrowserCuePlayer {
+  let activeAudio: HTMLAudioElement | null = null
+  const stop = (): void => {
+    const previous = activeAudio
+    activeAudio = null
+    if (previous !== null) {
+      previous.onerror = null
+      previous.onended = null
+      if (typeof previous.pause === 'function') previous.pause()
+    }
+  }
   return {
-    async play(source: string): Promise<void> {
+    stop,
+    async play(source: string): Promise<boolean> {
       if (typeof Audio !== 'function') {
         throw new Error('Audio playback is unavailable in this runtime')
       }
 
+      stop()
       const element = new Audio(source)
+      activeAudio = element
+      element.onended = () => { if (activeAudio === element) activeAudio = null }
 
       element.onerror = () => {
         console.error('[cue] audio element reported an error', {
@@ -92,6 +110,7 @@ export function createBrowserCuePlayer(): CuePlayer {
         try {
           await playback
         } catch (error) {
+          if (activeAudio !== element) return false
           const message = error instanceof Error ? error.message : String(error)
 
           console.error('[cue] audio playback failed', {
@@ -105,6 +124,7 @@ export function createBrowserCuePlayer(): CuePlayer {
           throw new Error(`Audio playback failed for source ${source}: ${message}`)
         }
       }
+      return true
     },
   }
 }
