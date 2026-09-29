@@ -1530,6 +1530,8 @@ mod tests {
         path: PathBuf,
     }
 
+    static TEMP_DIR_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     impl TempDir {
         fn new() -> Self {
             let stamp = SystemTime::now()
@@ -1538,8 +1540,9 @@ mod tests {
                 .as_nanos();
 
             let path = std::env::temp_dir().join(format!(
-                "voxgolem-config-tests-{}-{stamp}",
-                std::process::id()
+                "voxgolem-config-tests-{}-{stamp}-{}",
+                std::process::id(),
+                TEMP_DIR_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
 
             fs::create_dir_all(&path).expect("temporary test directory should be creatable");
