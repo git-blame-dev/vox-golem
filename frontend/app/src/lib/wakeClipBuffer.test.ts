@@ -2,16 +2,16 @@ import { describe, expect, it } from 'vitest'
 import { createWakeClipBuffer } from './wakeClipBuffer'
 
 describe('wake clip pre-roll', () => {
-  it('retains the latest 1.5 seconds including the beginning of a slower wake phrase', () => {
+  it('retains the latest 800 milliseconds when the window begins mid-frame', () => {
     const buffer = createWakeClipBuffer()
     for (let index = 0; index < 101; index += 1) {
       buffer.push(Array(480).fill(index))
     }
     const samples = buffer.take()
-    expect(samples).toHaveLength(24_000)
-    expect(samples[0]).toBe(51)
-    expect(samples[479]).toBe(51)
-    expect(samples[480]).toBe(52)
+    expect(samples).toHaveLength(12_800)
+    expect(samples[0]).toBe(74)
+    expect(samples[319]).toBe(74)
+    expect(samples[320]).toBe(75)
     expect(samples.at(-1)).toBe(100)
     expect(buffer.take()).toEqual([])
   })

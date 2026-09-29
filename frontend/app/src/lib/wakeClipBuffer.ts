@@ -1,4 +1,4 @@
-const WAKE_CLIP_SAMPLES = 1.5 * 16_000
+const WAKE_CLIP_SAMPLES = 0.8 * 16_000
 
 export interface WakeClipBuffer {
   push(frame: readonly number[]): void
