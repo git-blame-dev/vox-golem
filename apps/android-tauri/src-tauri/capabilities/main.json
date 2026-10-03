@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/android-schema.json",
+  "identifier": "main",
+  "description": "Canonical app commands for the main VoxGolem window",
+  "windows": ["main"],
+  "permissions": [
+    "allow-get-app-snapshot",
+    "allow-submit-prompt",
+    "allow-cancel-prompt",
+    "allow-reset-session",
+    "allow-set-preferences"
+  ]
+}

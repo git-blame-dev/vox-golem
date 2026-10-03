@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { DEFAULT_CUE_ASSET_PATHS, isStartupStateSettled, loadStartupState, parseStartupState } from './startupState'
+import { getBrowserPreviewInternals } from './browserRuntime'
 
 const COMPLETE_CAPABILITIES = [
   'custom_provider', 'opencode', 'local_fast', 'local_quality', 'qwen_prediction',
@@ -8,6 +9,7 @@ const COMPLETE_CAPABILITIES = [
 
 afterEach(() => {
   Reflect.deleteProperty(window, '__TAURI_INTERNALS__')
+  vi.restoreAllMocks()
 })
 
 describe('parseStartupState', () => {
@@ -406,21 +408,28 @@ describe('isStartupStateSettled', () => {
 })
 
 describe('loadStartupState', () => {
-  it('falls back to default cue assets when tauri internals are unavailable', async () => {
+  it('loads truthful browser preview capabilities through the shared adapter', async () => {
     await expect(loadStartupState()).resolves.toEqual(expect.objectContaining({
       kind: 'ready',
       cueAssetPaths: DEFAULT_CUE_ASSET_PATHS,
       runtimePhase: 'sleeping',
-      voiceInputAvailable: true,
-      voiceInputError: null,
-      initialSilenceTimeoutMs: 2500,
-      silenceTimeoutMs: 750,
+      voiceInputAvailable: false,
+      voiceInputError: 'Voice input is unavailable in browser preview',
+      silenceTimeoutMs: 1500,
       selectedResponseProfile: 'fast',
       supportedResponseProfiles: ['fast'],
-      promptCancellationAvailable: false,
+      promptCancellationAvailable: true,
       ttsEnabled: false,
       ttsOutputGainDb: 3,
     }))
+    await expect(loadStartupState()).resolves.toMatchObject({
+      capabilities: expect.arrayContaining([{
+        id: 'local_fast',
+        state: 'available',
+        reason: 'Deterministic browser preview',
+        actualProvider: 'browser_preview',
+      }]),
+    })
   })
 
   it('loads configured cue paths from tauri startup payload', async () => {
@@ -457,6 +466,15 @@ describe('loadStartupState', () => {
       ttsEnabled: false,
       ttsOutputGainDb: 3,
     }))
+  })
+
+  it('fails closed when the browser preview adapter cannot load startup state', async () => {
+    vi.spyOn(getBrowserPreviewInternals(), 'invoke').mockRejectedValue(new Error('preview startup failed'))
+
+    await expect(loadStartupState()).resolves.toEqual({
+      kind: 'error',
+      message: 'preview startup failed',
+    })
   })
 
   it('surfaces invoke failures as startup errors', async () => {

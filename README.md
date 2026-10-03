@@ -6,6 +6,28 @@
 
 Vox Golem is a Linux-first, Linux/Windows Tauri desktop voice assistant for typed or spoken developer prompts. It captures wake-word turns, transcribes locally when configured, and displays the answer and runtime state in one UI.
 
+The Android debug app shares the responsive React UI and canonical conversation lifecycle with desktop. Separate desktop and Android Tauri shells own native packaging, permissions, lifecycle, and storage. Android initially supports foreground typed Custom-provider chat; desktop retains voice, local models, OpenCode, completion, Deep/Review, and signed updates. Browser preview exercises the same UI with a labelled deterministic simulated runtime.
+
+## Android debug build
+
+Use JDK 21, Android SDK platform/build tools 36, NDK 28.2.13676358, Tauri CLI 2.11.1, and the `aarch64-linux-android` Rust target. Set `JAVA_HOME`, `ANDROID_HOME`, and `NDK_HOME`, and put the JDK's `bin` directory on the build shell's `PATH`.
+
+```bash
+make android-build
+```
+
+The ARM64 debug APK is under `apps/android-tauri/src-tauri/gen/android/app/build/outputs/apk/universal/debug/`. The authored Android package requests Internet only, disables cleartext and backup, and stores bounded conversations and preferences in memory. Stop, New Chat, app suspension, and lost Channels invalidate active requests; interrupted output is not committed to later prompt history.
+
+Android does not perform login or refresh OAuth credentials. Provision an existing compatible OpenCode login into the installed debug app's private storage:
+
+```bash
+make android-provision-auth DEVICE=<exact-authorized-transport> AUTH_PATH=<host-auth.json>
+```
+
+For pairing held by another Linux host, set `ADB_SSH_HOST` and optionally `REMOTE_ADB`; credentials are streamed through SSH/ADB without printing their contents. Provisioning validates and snapshots bounded input, atomically installs a restricted app-private file, and verifies transfer length and permissions. Reprovision when the credential expires. A debug build and app-private storage do not establish a supported in-app login flow.
+
+`make android-init` is the sole scaffold-regeneration command. The pinned generator owns Gradle scaffolding and launcher resources; the authored manifest and backup-rule exceptions remain versioned. Android does not enable microphone capture, local inference, OpenCode subprocesses, Deep/Review, prefetch, persistent chats, or background requests in this milestone.
+
 ## Capabilities
 
 Each capability is optional and uses user-supplied local assets: local `llama.cpp`, the experimental Custom private Codex endpoint, OpenCode, wake-word/VAD/transcription, and local TTS. Eight Instant choices are **Local Fast**, **Local Quality**, **Custom Sol High**, **Custom Sol No Reasoning**, **Custom GPT-6 Luna No Reasoning**, **Custom GPT-5.6 Luna Low**, **OpenCode Sol High**, and **OpenCode Luna Low**. Both Custom Sol choices and Custom GPT-6 Luna No Reasoning use VoxGolem's direct Rust connection to the configured Custom endpoint; OpenCode choices use the separate OpenCode client. Four Deep/Review choices are **Custom Sol High**, **Custom Luna Low**, **OpenCode Sol High**, and **OpenCode Luna Low**.

@@ -1,11 +1,13 @@
 export type MessageRole = 'system' | 'user' | 'assistant'
 
 export type TranscriptRole = Exclude<MessageRole, 'system'>
+export type MessageContentKind = 'text' | 'refusal'
 
 export interface ChatMessage {
   readonly id: string
   readonly role: MessageRole
   readonly content: string
+  readonly contentKind?: MessageContentKind
   readonly answerStage?: AnswerStageMetadata
   readonly customDirectTimings?: CustomDirectTimings
 }
@@ -25,6 +27,7 @@ export interface TranscriptMessage {
   readonly id: string
   readonly role: TranscriptRole
   readonly content: string
+  readonly contentKind?: MessageContentKind
   readonly answerStage?: AnswerStageMetadata
   readonly customDirectTimings?: CustomDirectTimings
 }
@@ -110,9 +113,11 @@ export type PromptExecutionEvent =
 
 export interface PromptExecutionResult {
   readonly requestId: string
-  readonly runtimePhase: BackendRuntimePhase
+  readonly runtimePhase: BackendRuntimePhase | null
   readonly outcome: 'completed' | 'cancelled' | 'error'
   readonly errorMessage: string | null
+  readonly canonicalOutcome?: 'completed' | 'refused' | 'cancelled'
+  readonly canonicalTurn?: import('../lib/appSnapshot').Turn
 }
 
 export type StartupState =

@@ -94,7 +94,7 @@ test-wakeword-bench:
 	python3 -m unittest discover -s tools/wakeword-bench -p 'test_*.py'
 	cargo test --locked -p vox-golem --example wakeword_bench
 
-.PHONY: help app-version test test-release-tools check-linux-tools app app-smoke packaged-smoke app-dev linux dist stage-linux-existing verify-dist prepare-appimage-tools update-bundle postprocess-update-bundle verify-update-bundle update-bundle-smoke check-pc-tools prepare-pc-bundle pc pc-dist verify-pc-dist pc-installer verify-pc-installer clean
+.PHONY: help app-version test test-release-tools test-android-tools check-android-tools android-init android-build android-provision-auth check-linux-tools app app-smoke packaged-smoke app-dev linux dist stage-linux-existing verify-dist prepare-appimage-tools update-bundle postprocess-update-bundle verify-update-bundle update-bundle-smoke check-pc-tools prepare-pc-bundle pc pc-dist verify-pc-dist pc-installer verify-pc-installer clean
 
 help:
 	@printf '%s\n' 'Targets:'
@@ -111,6 +111,9 @@ help:
 	@printf '%s\n' '  make pc       Cross-build the optional Windows app from Linux'
 	@printf '%s\n' '  make pc-dist  Stage optional Windows files under dist/VoxGolem-windows'
 	@printf '%s\n' '  make pc-installer Build the lightweight Windows NSIS installer from Linux'
+	@printf '%s\n' '  make android-init Regenerate the pinned Android platform scaffold'
+	@printf '%s\n' '  make android-build Build the ARM64 Android debug APK'
+	@printf '%s\n' '  make android-provision-auth DEVICE=<serial> AUTH_PATH=<file> Provision app-private auth'
 	@printf '%s\n' '  make clean    Remove generated build and staging output'
 
 app-version:
@@ -124,6 +127,7 @@ test:
 	bun run test
 	bun run build
 	$(MAKE) --no-print-directory test-release-tools
+	$(MAKE) --no-print-directory test-android-tools
 	cargo fmt --all -- --check
 	cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 	cargo test --locked --workspace
@@ -131,6 +135,30 @@ test:
 test-release-tools:
 	@command -v jq >/dev/null || { printf '%s\n' 'Missing jq.' >&2; exit 1; }
 	bash scripts/test-release-tools.sh
+
+test-android-tools:
+	@command -v jq >/dev/null || { printf '%s\n' 'Missing jq.' >&2; exit 1; }
+	bash scripts/test-android-provision-auth.sh
+
+check-android-tools:
+	@cargo tauri --version 2>&1 | grep -Fxq 'tauri-cli 2.11.1' || { printf '%s\n' 'Android builds require Tauri CLI 2.11.1.' >&2; exit 1; }
+	@test -x "$${JAVA_HOME:-}/bin/java" || { printf '%s\n' 'Set JAVA_HOME to a JDK 21 installation.' >&2; exit 1; }
+	@test -d "$${ANDROID_HOME:-}/platforms/android-36" || { printf '%s\n' 'Set ANDROID_HOME to an SDK with platform 36.' >&2; exit 1; }
+	@test -x "$${NDK_HOME:-}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" || { printf '%s\n' 'Set NDK_HOME to the Android NDK installation.' >&2; exit 1; }
+	@rustup target list --installed | grep -Fxq 'aarch64-linux-android' || { printf '%s\n' 'Install the aarch64-linux-android Rust target.' >&2; exit 1; }
+
+android-init: check-android-tools
+	cargo tauri icon apps/desktop-tauri/src-tauri/icons/icon.png --output apps/android-tauri/src-tauri/icons
+	cd apps/android-tauri/src-tauri && cargo tauri android init --ci
+	cargo tauri icon apps/desktop-tauri/src-tauri/icons/icon.png --output apps/android-tauri/src-tauri/icons
+
+android-build: check-android-tools
+	cd apps/android-tauri/src-tauri && cargo tauri android build --debug --target aarch64 --apk --ci -- --locked
+
+android-provision-auth: export DEVICE := $(DEVICE)
+android-provision-auth: export AUTH_PATH := $(AUTH_PATH)
+android-provision-auth:
+	@'$(CURDIR)/scripts/android-provision-auth.sh' --device "$${DEVICE:-}" --auth "$${AUTH_PATH:-}"
 
 check-linux-tools:
 	@command -v cargo-tauri >/dev/null || { printf '%s\n' 'Missing Tauri CLI. Install with: cargo install tauri-cli --version 2.11.1 --locked' >&2; exit 1; }
