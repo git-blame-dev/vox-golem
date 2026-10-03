@@ -737,21 +737,21 @@ content = "I cannot provide that."
             Content::Refusal("I cannot provide that.".into())
         );
 
-        let mut coordinator =
-            crate::assistant::AssistantCoordinator::new(crate::assistant::AssistantPreferences {
+        let mut session =
+            crate::conversation::ConversationSession::new(crate::assistant::AssistantPolicy {
                 review_enabled: true,
                 ..Default::default()
             });
-        let generation = coordinator.start("question").expect("generation");
-        coordinator.accept(
-            generation,
+        let execution = session.admit("request", "question").expect("admission");
+        session.update(
+            execution.execution_id,
             crate::assistant::Stage::Instant,
             crate::assistant::StageResult::Instant(crate::assistant::InstantOutcome::Complete(
                 Content::Text("answer".into()),
             )),
         );
-        let result = coordinator.accept(
-            generation,
+        let result = session.update(
+            execution.execution_id,
             crate::assistant::Stage::Review,
             crate::assistant::StageResult::Review(crate::assistant::ReviewOutcome::Success(
                 crate::assistant::ReviewDecision::Rewrite(replacement.clone()),
@@ -759,8 +759,19 @@ content = "I cannot provide that."
         );
         assert_eq!(
             result,
-            crate::assistant::AcceptResult::Resolved(replacement.clone())
+            crate::conversation::UpdateResult::Resolved {
+                content: replacement.clone(),
+                final_stage: crate::assistant::Stage::Review
+            }
         );
-        assert_eq!(coordinator.commit(generation), Some(replacement));
+        assert!(matches!(
+            session.settle(
+                execution.execution_id,
+                crate::conversation::SettlementIntent::Success
+            ),
+            crate::conversation::SettlementResult::Applied(
+                crate::conversation::AppliedOutcome::Refused(_)
+            )
+        ));
     }
 }

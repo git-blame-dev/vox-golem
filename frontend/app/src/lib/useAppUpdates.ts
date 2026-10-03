@@ -13,12 +13,18 @@ import {
   setAutoUpdateInstall,
 } from './appUpdates'
 import type { UpdateSnapshot } from './appUpdates'
-import { getTauriInternals } from './tauri'
+import { getTauriInternals, isAndroidRuntime, isBrowserPreviewRuntime } from './tauri'
 
 export type UpdateState =
   | { readonly kind: 'loading' }
   | { readonly kind: 'snapshot'; readonly snapshot: UpdateSnapshot }
   | { readonly kind: 'browser' }
+  | { readonly kind: 'unsupported'; readonly reason: string }
+
+export function initialUpdateState(native: boolean, android: boolean): UpdateState {
+  if (android) return { kind: 'unsupported', reason: 'Desktop updates are not available on Android' }
+  return native ? { kind: 'loading' } : { kind: 'browser' }
+}
 
 export interface AppUpdateController {
   readonly state: UpdateState
@@ -41,7 +47,7 @@ export interface AppUpdateController {
 
 export function useAppUpdates(): AppUpdateController {
   const [state, setState] = useState<UpdateState>(() =>
-    getTauriInternals() === null ? { kind: 'browser' } : { kind: 'loading' },
+    initialUpdateState(getTauriInternals() !== null && !isBrowserPreviewRuntime(), isAndroidRuntime),
   )
   const snapshotRef = useRef<UpdateSnapshot | null>(null)
   const operationInFlight = useRef(false)
@@ -71,7 +77,7 @@ export function useAppUpdates(): AppUpdateController {
 
   useEffect(() => {
     const tauri = getTauriInternals()
-    if (tauri === null) return
+    if (tauri === null || isAndroidRuntime || isBrowserPreviewRuntime()) return
     let active = true
     let unlisten: (() => void) | undefined
     const hydrate = async (): Promise<void> => {

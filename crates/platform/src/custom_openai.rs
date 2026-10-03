@@ -1,9 +1,10 @@
 use futures_util::StreamExt;
 use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{redirect, Client, StatusCode, Url};
-use serde::Deserialize;
+use serde::{de, Deserialize, Deserializer};
 use serde_json::{json, Value};
 use std::fmt::{Display, Formatter};
+use std::io::Read;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -13,6 +14,8 @@ const MAX_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const AUTH_EXPIRY_MARGIN_MS: u64 = 60_000;
+pub const MAX_CUSTOM_OPENAI_AUTH_BYTES: u64 = 65_536;
+const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CustomOpenAiModel {
@@ -132,6 +135,22 @@ pub struct CustomOpenAiResponse {
     pub timings: CustomOpenAiTimings,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CustomOpenAiAuthRevision {
+    len: u64,
+    modified_ns: u128,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CustomOpenAiAuthObservation {
+    pub revision: Option<CustomOpenAiAuthRevision>,
+    pub status: Result<(), CustomOpenAiError>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CustomOpenAiError {
     InvalidConfig,
@@ -197,8 +216,27 @@ impl CustomOpenAiClient {
         {
             return Err(CustomOpenAiError::InvalidConfig);
         }
-        let client = Client::builder()
-            .use_rustls_tls()
+        #[allow(unused_mut)]
+        let mut client_builder = Client::builder();
+        #[cfg(all(feature = "custom-openai-webpki", not(feature = "custom-openai")))]
+        {
+            let root_store = rustls::RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            };
+            let tls_config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .map_err(|_| CustomOpenAiError::Transport)?
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+            client_builder = client_builder.use_preconfigured_tls(tls_config);
+        }
+        #[cfg(not(all(feature = "custom-openai-webpki", not(feature = "custom-openai"))))]
+        {
+            client_builder = client_builder.use_rustls_tls();
+        }
+        let client = client_builder
             .redirect(redirect::Policy::none())
             .connect_timeout(config.connect_timeout)
             .build()
@@ -220,39 +258,75 @@ impl CustomOpenAiClient {
         self.respond_with_instructions(prompt, None, on_delta).await
     }
 
+    pub fn check_auth(&self) -> Result<(), CustomOpenAiError> {
+        self.observe_auth().status
+    }
+
+    pub fn auth_revision(&self) -> Option<CustomOpenAiAuthRevision> {
+        path_auth_revision(&self.config.auth_path)
+    }
+
+    pub fn observe_auth(&self) -> CustomOpenAiAuthObservation {
+        match read_credential_file(&self.config.auth_path) {
+            Ok((contents, revision)) => CustomOpenAiAuthObservation {
+                revision: Some(revision),
+                status: parse_request_credential(&contents, revision).map(|_| ()),
+            },
+            Err(error) => CustomOpenAiAuthObservation {
+                revision: None,
+                status: Err(error),
+            },
+        }
+    }
+
     pub async fn respond_with_instructions<F>(
         &self,
         prompt: &CustomOpenAiPrompt,
         instructions: Option<&str>,
-        mut on_delta: F,
+        on_delta: F,
     ) -> Result<CustomOpenAiResponse, CustomOpenAiError>
     where
         F: FnMut(&str),
     {
+        self.respond_with_auth_revision(prompt, instructions, on_delta, |_| {})
+            .await
+    }
+
+    pub async fn respond_with_auth_revision<F, R>(
+        &self,
+        prompt: &CustomOpenAiPrompt,
+        instructions: Option<&str>,
+        mut on_delta: F,
+        on_auth_revision: R,
+    ) -> Result<CustomOpenAiResponse, CustomOpenAiError>
+    where
+        F: FnMut(&str),
+        R: FnOnce(CustomOpenAiAuthRevision),
+    {
         if prompt.session_id.trim().is_empty() || prompt.prompt.trim().is_empty() {
             return Err(CustomOpenAiError::InvalidPrompt);
         }
-        let credential = load_credential(&self.config.auth_path)?;
-        let mut authorization = HeaderValue::from_str(&format!("Bearer {}", credential.access))
-            .map_err(|_| CustomOpenAiError::AuthUnavailable)?;
-        authorization.set_sensitive(true);
-        let mut account_id = HeaderValue::from_str(&credential.account_id)
-            .map_err(|_| CustomOpenAiError::AuthUnavailable)?;
-        account_id.set_sensitive(true);
+        let started = Instant::now();
+        let credential = load_request_credential(&self.config.auth_path)?;
+        on_auth_revision(credential.revision);
         let request = build_request(&self.config, prompt, instructions);
-        let request = self
+        let mut request_builder = self
             .client
             .post(&self.config.endpoint)
             .header(ACCEPT, "text/event-stream")
-            .header(AUTHORIZATION, authorization)
-            .header("ChatGPT-Account-Id", account_id)
+            .header(AUTHORIZATION, credential.authorization)
             .header(CONTENT_TYPE, "application/json")
             .header("Originator", "opencode")
             .header("session-id", &prompt.session_id)
-            .timeout(self.config.total_timeout)
-            .json(&request);
-        let started = Instant::now();
-        let response = request.send().await.map_err(map_transport_error)?;
+            .timeout(self.config.total_timeout);
+        if let Some(account_id) = credential.account_id {
+            request_builder = request_builder.header("ChatGPT-Account-Id", account_id);
+        }
+        let response = request_builder
+            .json(&request)
+            .send()
+            .await
+            .map_err(map_transport_error)?;
         let headers_at = started.elapsed();
         if !response.status().is_success() {
             return Err(map_http_status(response.status()));
@@ -431,23 +505,155 @@ struct AuthFile {
 #[serde(rename_all = "camelCase")]
 struct OAuthCredential {
     access: String,
-    account_id: String,
+    account_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_expiry")]
     expires: u64,
 }
 
-fn load_credential(path: &PathBuf) -> Result<OAuthCredential, CustomOpenAiError> {
-    let contents = std::fs::read(path).map_err(|_| CustomOpenAiError::AuthUnavailable)?;
+fn deserialize_expiry<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ExpiryVisitor;
+    impl de::Visitor<'_> for ExpiryVisitor {
+        type Value = u64;
+
+        fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a non-negative safe integer")
+        }
+        fn visit_u64<E: de::Error>(self, value: u64) -> Result<u64, E> {
+            if value <= MAX_SAFE_JSON_INTEGER {
+                Ok(value)
+            } else {
+                Err(E::custom("expiry exceeds the safe integer range"))
+            }
+        }
+        fn visit_i64<E: de::Error>(self, value: i64) -> Result<u64, E> {
+            let value = u64::try_from(value).map_err(|_| E::custom("expiry is negative"))?;
+            self.visit_u64(value)
+        }
+        fn visit_f64<E: de::Error>(self, value: f64) -> Result<u64, E> {
+            if value.is_finite()
+                && value >= 0.0
+                && value.fract() == 0.0
+                && value <= MAX_SAFE_JSON_INTEGER as f64
+            {
+                Ok(value as u64)
+            } else {
+                Err(E::custom("expiry is not a safe integer"))
+            }
+        }
+    }
+    deserializer.deserialize_any(ExpiryVisitor)
+}
+
+struct RequestCredential {
+    authorization: HeaderValue,
+    account_id: Option<HeaderValue>,
+    revision: CustomOpenAiAuthRevision,
+}
+
+fn metadata_auth_revision(metadata: &std::fs::Metadata) -> Option<CustomOpenAiAuthRevision> {
+    if !metadata.is_file() {
+        return None;
+    }
+    let modified_ns = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(CustomOpenAiAuthRevision {
+            len: metadata.len(),
+            modified_ns,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Some(CustomOpenAiAuthRevision {
+            len: metadata.len(),
+            modified_ns,
+        })
+    }
+}
+
+fn path_auth_revision(path: &PathBuf) -> Option<CustomOpenAiAuthRevision> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink() {
+        return None;
+    }
+    metadata_auth_revision(&metadata)
+}
+
+fn read_credential_file(
+    path: &PathBuf,
+) -> Result<(Vec<u8>, CustomOpenAiAuthRevision), CustomOpenAiError> {
+    let file = std::fs::File::open(path).map_err(|_| CustomOpenAiError::AuthUnavailable)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| CustomOpenAiError::AuthUnavailable)?;
+    let revision = metadata_auth_revision(&metadata).ok_or(CustomOpenAiError::AuthUnavailable)?;
+    if revision.len > MAX_CUSTOM_OPENAI_AUTH_BYTES {
+        return Err(CustomOpenAiError::AuthUnavailable);
+    }
+    let mut contents = Vec::new();
+    file.take(MAX_CUSTOM_OPENAI_AUTH_BYTES + 1)
+        .read_to_end(&mut contents)
+        .map_err(|_| CustomOpenAiError::AuthUnavailable)?;
+    if contents.len() as u64 > MAX_CUSTOM_OPENAI_AUTH_BYTES {
+        return Err(CustomOpenAiError::AuthUnavailable);
+    }
+    Ok((contents, revision))
+}
+
+fn parse_request_credential(
+    contents: &[u8],
+    revision: CustomOpenAiAuthRevision,
+) -> Result<RequestCredential, CustomOpenAiError> {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| CustomOpenAiError::AuthUnavailable)?
         .as_millis() as u64;
-    parse_credential(&contents, now_ms)
+    let credential = parse_credential(contents, now_ms)?;
+    let mut authorization = HeaderValue::from_str(&format!("Bearer {}", credential.access))
+        .map_err(|_| CustomOpenAiError::AuthUnavailable)?;
+    authorization.set_sensitive(true);
+    let account_id = credential
+        .account_id
+        .map(|value| {
+            let mut header =
+                HeaderValue::from_str(&value).map_err(|_| CustomOpenAiError::AuthUnavailable)?;
+            header.set_sensitive(true);
+            Ok(header)
+        })
+        .transpose()?;
+    Ok(RequestCredential {
+        authorization,
+        account_id,
+        revision,
+    })
+}
+
+fn load_request_credential(path: &PathBuf) -> Result<RequestCredential, CustomOpenAiError> {
+    let (contents, revision) = read_credential_file(path)?;
+    parse_request_credential(&contents, revision)
 }
 
 fn parse_credential(contents: &[u8], now_ms: u64) -> Result<OAuthCredential, CustomOpenAiError> {
     let auth: AuthFile =
         serde_json::from_slice(contents).map_err(|_| CustomOpenAiError::AuthUnavailable)?;
-    if auth.openai.access.is_empty() || auth.openai.account_id.is_empty() {
+    if auth.openai.access.is_empty()
+        || auth
+            .openai
+            .account_id
+            .as_ref()
+            .is_some_and(String::is_empty)
+    {
         return Err(CustomOpenAiError::AuthUnavailable);
     }
     let expires_ms = if auth.openai.expires < 10_000_000_000 {
@@ -664,6 +870,20 @@ mod tests {
         String,
         Result<CustomOpenAiResponse, CustomOpenAiError>,
     ) {
+        fixture_with_account(status, content_type, chunks, idle, Some("test-account")).await
+    }
+
+    async fn fixture_with_account(
+        status: u16,
+        content_type: &str,
+        chunks: Vec<Vec<u8>>,
+        idle: Duration,
+        account_id: Option<&str>,
+    ) -> (
+        Vec<u8>,
+        String,
+        Result<CustomOpenAiResponse, CustomOpenAiError>,
+    ) {
         let content_type = content_type.to_string();
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("listener");
         let address = listener.local_addr().expect("address");
@@ -725,7 +945,14 @@ mod tests {
             .unwrap()
             .as_secs()
             + 3600;
-        std::fs::write(&path, format!(r#"{{"openai":{{"access":"test-access","accountId":"test-account","expires":{expiry}}}}}"#)).unwrap();
+        let account_id = account_id
+            .map(|value| format!(r#","accountId":"{value}""#))
+            .unwrap_or_default();
+        std::fs::write(
+            &path,
+            format!(r#"{{"openai":{{"access":"test-access"{account_id},"expires":{expiry}}}}}"#),
+        )
+        .unwrap();
         let config = CustomOpenAiConfig {
             endpoint: format!("http://{address}"),
             auth_path: path.clone(),
@@ -801,6 +1028,25 @@ mod tests {
         assert!(response.timings.first_text_at.is_some());
         assert!(response.timings.headers_at <= response.timings.first_text_at.unwrap());
         assert!(response.timings.first_text_at.unwrap() <= response.timings.completed_at);
+    }
+
+    #[tokio::test]
+    async fn respond_omits_account_header_when_oauth_record_has_no_account() {
+        let (request, _, result) = fixture_with_account(
+            200,
+            "text/event-stream",
+            sse(&[
+                r#"{"type":"response.output_text.delta","delta":"ok"}"#,
+                r#"{"type":"response.completed","response":{"model":"gpt-5.6-sol"}}"#,
+            ]),
+            Duration::from_secs(1),
+            None,
+        )
+        .await;
+        let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+        assert!(request.contains("authorization: bearer test-access"));
+        assert!(!request.contains("chatgpt-account-id:"));
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
@@ -1041,11 +1287,77 @@ mod tests {
         let valid =
             br#"{"openai":{"access":"secret","accountId":"account-id","expires":1000000000000}}"#;
         let credential = parse_credential(valid, 1).expect("credential should be valid");
-        assert_eq!(credential.account_id, "account-id");
+        assert_eq!(credential.account_id.as_deref(), Some("account-id"));
         assert!(matches!(
             parse_credential(valid, 999_999_940_000),
             Err(CustomOpenAiError::AuthExpired)
         ));
+        for expiry in ["4102444800.0", "4.1024448e9"] {
+            let value = format!(
+                r#"{{"openai":{{"access":"secret","accountId":"account-id","expires":{expiry}}}}}"#
+            );
+            assert!(parse_credential(value.as_bytes(), 1).is_ok());
+        }
+        assert!(parse_credential(
+            br#"{"other":{"type":"api"},"openai":{"type":"oauth","refresh":"refresh-secret","access":"secret","expires":4102444800,"accountId":"account-id"}}"#,
+            1,
+        )
+        .is_ok());
+        assert!(parse_credential(
+            br#"{"openai":{"type":"oauth","refresh":"refresh-secret","access":"secret","expires":4102444800}}"#,
+            1,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn check_auth_reports_valid_missing_and_expired_records() {
+        let id = AUTH_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("vox-golem-check-auth-{id}.json"));
+        let config = CustomOpenAiConfig {
+            auth_path: path.clone(),
+            ..Default::default()
+        };
+        let client = CustomOpenAiClient::new(config).expect("client");
+
+        assert_eq!(client.check_auth(), Err(CustomOpenAiError::AuthUnavailable));
+        let expiry = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"openai":{{"access":"secret","accountId":"account","expires":{expiry}}}}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(client.check_auth(), Ok(()));
+        for invalid in [
+            format!(
+                r#"{{"openai":{{"access":"bad\nvalue","accountId":"account","expires":{expiry}}}}}"#
+            ),
+            format!(
+                r#"{{"openai":{{"access":"secret","accountId":"bad\rvalue","expires":{expiry}}}}}"#
+            ),
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            assert_eq!(client.check_auth(), Err(CustomOpenAiError::AuthUnavailable));
+        }
+        std::fs::write(
+            &path,
+            r#"{"openai":{"access":"secret","accountId":"account","expires":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(client.check_auth(), Err(CustomOpenAiError::AuthExpired));
+        std::fs::write(
+            &path,
+            vec![b'x'; (MAX_CUSTOM_OPENAI_AUTH_BYTES + 1) as usize],
+        )
+        .unwrap();
+        assert_eq!(client.check_auth(), Err(CustomOpenAiError::AuthUnavailable));
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

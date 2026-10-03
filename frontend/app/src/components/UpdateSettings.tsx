@@ -75,6 +75,7 @@ function updatePresentation(
     <button type="button" className="shell__control" onClick={() => void run()} disabled={disabled}>{label}</button>
   )
   if (updates.state.kind === 'browser') return { status: 'Available in the packaged app', action: null }
+  if (updates.state.kind === 'unsupported') return { status: updates.state.reason, action: null }
   if (snapshot === null) {
     return updates.actionError === null
       ? { status: 'Loading update status...', action: null, pending: true }

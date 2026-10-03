@@ -74,8 +74,8 @@ function stringField(payload: Record<string, unknown>, key: string): string {
 }
 
 export function parseAssistantSettings(payload: unknown): AssistantSettings {
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('Invalid assistant settings payload')
-  const p = payload as Record<string, unknown>
+  if (!isRecord(payload)) throw new Error('Invalid assistant settings payload')
+  const p = payload
   const instant = stringField(p, 'instant'); const deep = stringField(p, 'deep'); const review = stringField(p, 'review')
   if (!instantValues.has(instant) || !deepValues.has(deep) || !reviewValues.has(review) || typeof p['deep_enabled'] !== 'boolean' || typeof p['review_enabled'] !== 'boolean' || typeof p['prefetch'] !== 'boolean' || typeof p['completion'] !== 'boolean') throw new Error('Invalid assistant settings payload')
   return { instant: instant as InstantChoice, deep: deep as DeepChoice, review: review as ReviewChoice, deepEnabled: p['deep_enabled'] as boolean, reviewEnabled: p['review_enabled'] as boolean, prefetch: p['prefetch'] as boolean, completion: p['completion'] as boolean }
@@ -84,3 +84,4 @@ export function parseAssistantSettings(payload: unknown): AssistantSettings {
 export function serializeAssistantSettings(settings: AssistantSettings): Record<string, unknown> {
   return { instant: settings.instant, deep: settings.deep, review: settings.review, deep_enabled: settings.deepEnabled, review_enabled: settings.reviewEnabled, prefetch: settings.prefetch, completion: settings.completion }
 }
+import { isRecord } from './wire'

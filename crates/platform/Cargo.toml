@@ -2,16 +2,59 @@
 name = "voxgolem-platform"
 edition.workspace = true
 
+[features]
+default = ["desktop", "custom-openai"]
+custom-openai = [
+  "dep:futures-util",
+  "dep:reqwest",
+  "reqwest/json",
+  "reqwest/rustls",
+  "reqwest/stream",
+  "dep:tokio",
+  "tokio/time",
+]
+custom-openai-webpki = [
+  "dep:futures-util",
+  "dep:reqwest",
+  "reqwest/json",
+  "reqwest/rustls-no-provider",
+  "reqwest/stream",
+  "dep:rustls",
+  "dep:tokio",
+  "tokio/time",
+  "dep:webpki-roots",
+]
+desktop = [
+  "dep:futures-util",
+  "dep:rand",
+  "dep:reqwest",
+  "reqwest/json",
+  "reqwest/rustls",
+  "reqwest/stream",
+  "dep:tokio",
+  "tokio/macros",
+  "tokio/net",
+  "tokio/process",
+  "tokio/sync",
+  "tokio/time",
+  "dep:win32job",
+]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-futures-util = "0.3"
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
-tokio = { version = "1", features = ["macros", "process", "time", "net", "sync"] }
-rand = "0.9"
+futures-util = { version = "0.3", optional = true }
+reqwest = { version = "0.13", default-features = false, optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+tokio = { version = "1", default-features = false, optional = true }
+rand = { version = "0.9", optional = true }
+webpki-roots = { version = "1", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-win32job = "2.0.3"
+win32job = { version = "2.0.3", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 
 [lints]
 workspace = true

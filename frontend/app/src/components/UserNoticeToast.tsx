@@ -10,14 +10,20 @@ export function UserNoticeToast({ notice }: UserNoticeToastProps): JSX.Element |
     return null
   }
 
+  const titleId = `conversation-notice-${notice.id}-title`
+  const messageId = `conversation-notice-${notice.id}-message`
+
   return (
     <aside
       className={`notice-toast notice-toast--${notice.tone}`}
       role="status"
       aria-live="polite"
+      aria-labelledby={titleId}
+      aria-describedby={messageId}
+      tabIndex={0}
     >
-      <strong className="notice-toast__title">{notice.title}</strong>
-      <span className="notice-toast__message">{notice.message}</span>
+      <strong id={titleId} className="notice-toast__title">{notice.title}</strong>
+      <span id={messageId} className="notice-toast__message">{notice.message}</span>
     </aside>
   )
 }

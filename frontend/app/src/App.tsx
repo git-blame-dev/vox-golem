@@ -3,7 +3,7 @@ import type { FormEvent, KeyboardEvent } from 'react'
 import { flushSync } from 'react-dom'
 import { ChatBubble } from './components/ChatBubble'
 import { AnswerStage } from './components/AnswerStage'
-import type { AnswerStageStatusEntry, AnswerPriorVersion } from './components/AnswerStage'
+import type { AnswerSource, AnswerStageStatusEntry, AnswerPriorVersion } from './components/AnswerStage'
 import { PromptComposer } from './components/PromptComposer'
 import { UserNoticeToast } from './components/UserNoticeToast'
 import { UpdateSettings } from './components/UpdateSettings'
@@ -12,6 +12,8 @@ import { shouldSubmitComposer } from './lib/composer'
 import { listAudioInputDevices, startLiveAudioSource } from './lib/liveAudioSource'
 import type { AudioInputDevice, LiveAudioSource } from './lib/liveAudioSource'
 import { executePrompt } from './lib/promptExecution'
+import { appendCanonicalTurn, canonicalExecutionKey, isExpectedCanonicalTurn, loadAppSnapshot } from './lib/appSnapshot'
+import type { AppSnapshot, Capability, ModelOption, Turn, ValidatedPreferences } from './lib/appSnapshot'
 import {
   ingestAudioFrame,
   invokeRuntimeControl,
@@ -24,7 +26,8 @@ import {
   isStartupStateSettled,
   loadStartupState,
 } from './lib/startupState'
-import { getTauriInternals, invokeTauriCommand, isNativeTauriRuntime } from './lib/tauri'
+import { cacheAndroidSnapshot, getAndroidPreferencePublicationRevision, getTauriInternals, invokeTauriCommand, isAndroidRuntime, isBrowserPreviewRuntime, isNativeTauriRuntime } from './lib/tauri'
+import { teardownBrowserPreviewRuntime } from './lib/browserRuntime'
 import { useAppUpdates } from './lib/useAppUpdates'
 import type { UpdateState } from './lib/useAppUpdates'
 import { DEFAULT_ASSISTANT_SETTINGS, deepOptions, instantOptions, parseAssistantSettings, reviewOptions, serializeAssistantSettings } from './lib/assistantSettings'
@@ -48,6 +51,7 @@ import type {
   BackendRuntimePhase,
   ChatMessage,
   CueAssetPaths,
+  PromptExecutionResult,
   RuntimeControlResult,
   ResponseProfile,
   RuntimeStatus,
@@ -65,6 +69,8 @@ const UI_TEXT_SIZE_STEPS: readonly UiTextSize[] = ['small', 'medium', 'large', '
 const DEFAULT_UI_TEXT_SIZE: UiTextSize = 'medium'
 const DEFAULT_UI_THEME: UiTheme = 'dark'
 const AUDIO_INPUT_DEVICE_STORAGE_KEY = 'voxgolem.audioInputDeviceId'
+const SETTINGS_DIALOG_ID = 'settings-dialog'
+const SETTINGS_HISTORY_KEY = '__voxgolemSettingsOpen'
 
 function loadAudioInputDeviceId(): string | null {
   try {
@@ -132,7 +138,26 @@ function appUpdateBlocksRuntime(state: UpdateState): boolean {
   )
 }
 
+type PromptProjection = {
+  id: string
+  userId: string
+  assistantId: string
+  text: string
+  error: string | null
+  terminal: boolean
+  tts: boolean
+  corrected: boolean
+  stages: AnswerStageStatusEntry[]
+  priorVersions: AnswerPriorVersion[]
+  sources: AnswerSource[]
+  ttsFirstLineSpoken: boolean
+  renderFrameId: number | null
+  renderFrameRevision: number
+  customDirectTimings?: import('./types/chat').CustomDirectTimings
+}
+
 function App() {
+  const supportsDesktopRuntime = !isAndroidRuntime && !isBrowserPreviewRuntime()
   const appUpdates = useAppUpdates()
   const updateRuntimeBlocked = appUpdateBlocksRuntime(appUpdates.state)
   const [startupState, setStartupState] = useState<StartupState>({ kind: 'loading' })
@@ -152,13 +177,26 @@ function App() {
   const [micActive, setMicActive] = useState(false)
   const [audioInputDevices, setAudioInputDevices] = useState<readonly AudioInputDevice[]>([])
   const [audioInputDeviceId, setAudioInputDeviceId] = useState<string | null>(loadAudioInputDeviceId)
-  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(() => Boolean(window.history.state?.[SETTINGS_HISTORY_KEY]))
   const [assistantSettingsPending, setAssistantSettingsPending] = useState(
     () => getTauriInternals() !== null,
   )
+  const [snapshotHydrationState, setSnapshotHydrationState] = useState<'unavailable' | 'pending' | 'failed' | 'succeeded'>(
+    () => getTauriInternals() === null ? 'unavailable' : 'pending',
+  )
+  const [snapshotControlsFresh, setSnapshotControlsFresh] = useState(() => getTauriInternals() === null)
+  const [snapshotControlsInvalidated, setSnapshotControlsInvalidated] = useState(false)
+  const snapshotHydrationStateRef = useRef(snapshotHydrationState)
+  const snapshotControlsFreshRef = useRef(getTauriInternals() === null)
+  const snapshotControlsInvalidatedRef = useRef(false)
+  const snapshotHydrationRevisionRef = useRef(0)
+  const snapshotControlRequestRevisionRef = useRef(0)
+  const refreshAndroidSnapshotControlsRef = useRef<() => void>(() => undefined)
   const [assistantSettingsLoadError, setAssistantSettingsLoadError] = useState<string | null>(null)
   const [customRetryPending, setCustomRetryPending] = useState(false)
   const [assistantSettings, setAssistantSettings] = useState<AssistantSettings>(DEFAULT_ASSISTANT_SETTINGS)
+  const [snapshotModelOptions, setSnapshotModelOptions] = useState<readonly ModelOption[] | null>(null)
+  const snapshotModelOptionsRef = useRef<readonly ModelOption[] | null>(null)
   const assistantSettingsRef = useRef<AssistantSettings>(DEFAULT_ASSISTANT_SETTINGS)
   const assistantSettingsPendingRef = useRef(getTauriInternals() !== null)
   const persistedAssistantSettingsRef = useRef<AssistantSettings>(DEFAULT_ASSISTANT_SETTINGS)
@@ -168,47 +206,64 @@ function App() {
   const [uiTextSize, setUiTextSize] = useState<UiTextSize>(DEFAULT_UI_TEXT_SIZE)
   const [uiTheme, setUiTheme] = useState<UiTheme>(DEFAULT_UI_THEME)
   const [notices, setNotices] = useState<readonly UserNotice[]>([])
+  const [noticeInteraction, setNoticeInteraction] = useState({ focused: false, hovered: false })
   const [messages, setMessages] = useState<readonly ChatMessage[]>(() =>
     getInitialMessages(),
   )
+  const [responseAnnouncement, setResponseAnnouncement] = useState('')
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false)
   const [promptActivity, setPromptActivity] = useState<string | null>(null)
-  const [promptState, setPromptState] = useState<'idle' | 'executing' | 'stopping'>('idle')
+  const [promptState, setPromptState] = useState<'idle' | 'executing' | 'stopping' | 'reconciling'>('idle')
   const [resetPending, setResetPending] = useState(false)
-  const promptRef = useRef<{
-    id: string
-    assistantId: string
-    text: string
-    error: string | null
-    terminal: boolean
-    tts: boolean
-    corrected: boolean
-    stages: AnswerStageStatusEntry[]
-    priorVersions: AnswerPriorVersion[]
-     sources: import('./components/AnswerStage').AnswerSource[]
-     ttsFirstLineSpoken: boolean
-  } | null>(null)
+  const promptRef = useRef<PromptProjection | null>(null)
+  const promptProjectionRevisionRef = useRef(0)
   const visibleMessages = useMemo(
     () => messages.filter(isTranscriptMessage),
     [messages],
   )
   const conversationRef = useRef<HTMLElement | null>(null)
+  const followLatestRef = useRef(true)
+  const jumpToLatestInProgressRef = useRef(false)
   const settingsButtonRef = useRef<HTMLButtonElement | null>(null)
   const settingsPanelRef = useRef<HTMLElement | null>(null)
   const settingsCloseButtonRef = useRef<HTMLButtonElement | null>(null)
+  const settingsHistoryActiveRef = useRef(settingsOpen)
+  const [settingsHistoryToken] = useState(() => `settings-${crypto.randomUUID()}`)
+  const settingsHistoryTokenRef = useRef(settingsHistoryToken)
+  const settingsHistoryOwnedRef = useRef(false)
+  const settingsHistoryTraversalPendingRef = useRef(false)
+  const settingsReopenQueuedRef = useRef(false)
+  const settingsFocusRestoreTimeoutRef = useRef<number | null>(null)
+  const settingsBodyOverflowRef = useRef<{
+    original: Record<'overflow-x' | 'overflow-y', { value: string; priority: string }>
+    written: Record<'overflow-x' | 'overflow-y', { value: string; priority: string }>
+  } | null>(null)
   const liveAudioSourceRef = useRef<LiveAudioSource | null>(null)
   const liveAudioStartAbortRef = useRef<AbortController | null>(null)
   const audioInputDeviceIdRef = useRef(audioInputDeviceId)
   const liveAudioSessionIdRef = useRef(0)
   const liveAudioInFlightFramesRef = useRef(0)
   const markSilenceInFlightRef = useRef<number | null>(null)
-  const uiTextSizeHydrationOverriddenRef = useRef(false)
-  const uiThemeHydrationOverriddenRef = useRef(false)
+  const initialSnapshotPreferencesRef = useRef<ValidatedPreferences | null>(null)
+  const snapshotCapabilitiesRef = useRef<readonly import('./types/chat').StartupCapability[] | null>(null)
+  const snapshotResponseProfileRef = useRef<ResponseProfile | null>(null)
+  const snapshotSessionIdRef = useRef<string | null>(null)
+  const uiTextSizePersistedRevisionRef = useRef(0)
+  const uiThemePersistedRevisionRef = useRef(0)
+  const uiTextSizePersistedValueRef = useRef<UiTextSize>(DEFAULT_UI_TEXT_SIZE)
+  const uiThemePersistedValueRef = useRef<UiTheme>(DEFAULT_UI_THEME)
+  const uiTextSizePersistedInitializedRef = useRef(false)
+  const uiThemePersistedInitializedRef = useRef(false)
+  const uiTextSizePendingRevisionRef = useRef<number | null>(null)
+  const uiThemePendingRevisionRef = useRef<number | null>(null)
   const isSwitchingResponseProfileRef = useRef(false)
   const appActiveRef = useRef(true)
   const autoStopOnSilenceRef = useRef(true)
   const micAutoStartedRef = useRef(false)
   const micStartInFlightRef = useRef(false)
   const runtimeStatusRef = useRef<RuntimeStatus>('initializing')
+  const runtimeActivityRevisionRef = useRef(0)
+  const snapshotRuntimeHydratedRef = useRef(false)
   const startupStateRef = useRef<StartupState>({ kind: 'loading' })
   const voiceActivityStateRef = useRef(createVoiceActivityState())
   const voiceTelemetryRef = useRef<ReturnType<typeof createVoiceTelemetryRecorder> | null>(null)
@@ -223,12 +278,18 @@ function App() {
   const latestTypedCompletionRef = useRef<{ revision: number; lifecycle: number } | null>(null)
   const completionLifecycleRef = useRef(0)
   const resetPendingRef = useRef(false)
+  const transcriptRevisionRef = useRef(0)
+  const canonicalTranscriptRef = useRef<readonly Turn[]>([])
   const ttsGenerationRef = useRef(0)
   const ttsEnabledRef = useRef(false)
   const ttsPlaybackIdRef = useRef<number | null>(null)
   const cuePlayerRef = useRef(createBrowserCuePlayer())
   const cueAssetPathsRef = useRef<CueAssetPaths>(DEFAULT_CUE_ASSET_PATHS)
   const fallbackCueAssetPathsRef = useRef<CueAssetPaths>(DEFAULT_CUE_ASSET_PATHS)
+  const ttsPersistedRevisionRef = useRef(0)
+  const ttsPersistedValueRef = useRef(false)
+  const ttsPersistedInitializedRef = useRef(false)
+  const ttsPendingRevisionRef = useRef<number | null>(null)
   const uiTextSizeWriteRevisionRef = useRef(0)
   const uiThemeWriteRevisionRef = useRef(0)
   const ttsWriteRevisionRef = useRef(0)
@@ -238,6 +299,54 @@ function App() {
   const wakeConfidenceRef = useRef<number | null>(null)
   const pendingWakeConfidenceRef = useRef<number | null>(null)
   const wakeConfidenceHoldRef = useRef<number | null>(null)
+
+  const publishRuntimeStatus = useCallback((nextStatus: RuntimeStatus, claimActivity: boolean): RuntimeStatus => {
+    if (claimActivity) runtimeActivityRevisionRef.current += 1
+    const previousStatus = runtimeStatusRef.current
+    runtimeStatusRef.current = nextStatus
+    setRuntimeStatus(nextStatus)
+    return previousStatus
+  }, [])
+
+  const recoverOrphanedRequest = useCallback(async (
+    initialSnapshot: AppSnapshot,
+    transcriptRevision: number,
+    isCurrent: () => boolean,
+  ): Promise<void> => {
+    let latest = initialSnapshot
+    let latestRuntimeActivityRevision: number | null = null
+    for (let attempt = 0; attempt < 3 && latest.activeRequest !== null; attempt += 1) {
+      if (!appActiveRef.current || !isCurrent() || transcriptRevision !== transcriptRevisionRef.current) return
+      await invokeTauriCommand('cancel_prompt', { requestId: latest.activeRequest.requestId }).catch(() => undefined)
+      if (!appActiveRef.current || !isCurrent() || transcriptRevision !== transcriptRevisionRef.current) return
+      try {
+        const runtimeActivityRevision = runtimeActivityRevisionRef.current
+        latest = await loadAppSnapshot()
+        latestRuntimeActivityRevision = runtimeActivityRevision
+      } catch {
+        if (attempt < 2) await new Promise((resolve) => window.setTimeout(resolve, 250 * (attempt + 1)))
+      }
+      if (!appActiveRef.current || !isCurrent() || transcriptRevision !== transcriptRevisionRef.current) return
+      if (latest.activeRequest !== null && attempt < 2) {
+        await new Promise((resolve) => window.setTimeout(resolve, 250 * (attempt + 1)))
+      }
+    }
+    if (!appActiveRef.current || !isCurrent() || transcriptRevision !== transcriptRevisionRef.current) return
+    if (latest.activeRequest !== null) {
+      setPromptActivity('Session recovery required. Use New Chat to retry.')
+      setPromptState('reconciling')
+      return
+    }
+    canonicalTranscriptRef.current = latest.transcript
+    snapshotSessionIdRef.current = latest.sessionId
+    setMessages((current) => replaceCommittedTranscript(current, latest.transcript))
+    snapshotRuntimeHydratedRef.current = true
+    if (latestRuntimeActivityRevision === runtimeActivityRevisionRef.current) {
+      publishRuntimeStatus(toRuntimeStatus(latest.runtimePhase), false)
+    }
+    setPromptActivity(null)
+    setPromptState('idle')
+  }, [publishRuntimeStatus])
 
   const cancelTts = (): void => {
     ttsGenerationRef.current += 1
@@ -303,6 +412,7 @@ function App() {
         const parsed = parsePartialTranscriptionEvent(event.payload)
         if (!partialTranscriptionAllowedRef.current) return
         if (!acceptsPartialTranscriptionEvent(partialTranscriptionRef.current, parsed)) return
+        expectedPartialSessionIdRef.current = parsed.sessionId
         partialTranscriptionRef.current = {
           sessionId: parsed.sessionId,
           revision: parsed.revision,
@@ -364,15 +474,65 @@ function App() {
     void invokeTauriCommand('clear_completion').catch(() => undefined)
   }
 
+  const synchronizeHydratedRuntimeStatus = useCallback((nextStatus: RuntimeStatus): void => {
+    publishRuntimeStatus(nextStatus, false)
+    if (nextStatus === 'listening') {
+      partialTranscriptionRef.current = null
+      partialTranscriptionAllowedRef.current = true
+      return
+    }
+
+    partialTranscriptionAllowedRef.current = false
+    if (partialTranscriptionRef.current !== null) {
+      partialTranscriptionRef.current = { ...partialTranscriptionRef.current, active: false }
+    }
+    setPartialTranscript('')
+    setVoiceCompletionSuffix('')
+  }, [publishRuntimeStatus])
+
   if (voiceTelemetryRef.current === null) {
     voiceTelemetryRef.current = createVoiceTelemetryRecorder()
   }
 
   const voiceTelemetry = voiceTelemetryRef.current
 
-  const closeSettings = useCallback((): void => {
+  const closeSettings = useCallback((fromHistory = false): void => {
+    const currentState = window.history.state
+    const markerIsCurrent = Boolean(currentState?.[SETTINGS_HISTORY_KEY])
+    const markerIsOwned = settingsHistoryOwnedRef.current && currentState?.[SETTINGS_HISTORY_KEY] === settingsHistoryTokenRef.current
+    const shouldTraverse = !fromHistory && settingsHistoryActiveRef.current && markerIsOwned && !settingsHistoryTraversalPendingRef.current
+    if (shouldTraverse) settingsHistoryTraversalPendingRef.current = true
+    settingsHistoryActiveRef.current = fromHistory && markerIsCurrent
+    settingsHistoryOwnedRef.current = fromHistory && markerIsOwned
     setSettingsOpen(false)
-    window.setTimeout(() => settingsButtonRef.current?.focus(), 0)
+    if (settingsFocusRestoreTimeoutRef.current !== null) window.clearTimeout(settingsFocusRestoreTimeoutRef.current)
+    if (!settingsReopenQueuedRef.current) {
+      const restoreFocus = (): void => {
+        settingsFocusRestoreTimeoutRef.current = null
+        if (!settingsHistoryActiveRef.current && !settingsHistoryTraversalPendingRef.current) settingsButtonRef.current?.focus()
+      }
+      settingsFocusRestoreTimeoutRef.current = window.setTimeout(restoreFocus, 0)
+    }
+    if (shouldTraverse) {
+      window.history.back()
+    } else if (!fromHistory && markerIsCurrent && !markerIsOwned) {
+      const nextState = { ...(currentState ?? {}) }
+      delete nextState[SETTINGS_HISTORY_KEY]
+      window.history.replaceState(nextState, '')
+      settingsHistoryActiveRef.current = false
+    }
+  }, [])
+
+  const openSettings = useCallback((): void => {
+    if (settingsHistoryTraversalPendingRef.current) {
+      settingsReopenQueuedRef.current = true
+      return
+    }
+    if (settingsHistoryActiveRef.current) return
+    window.history.pushState({ ...(window.history.state ?? {}), [SETTINGS_HISTORY_KEY]: settingsHistoryTokenRef.current }, '')
+    settingsHistoryActiveRef.current = true
+    settingsHistoryOwnedRef.current = true
+    flushSync(() => setSettingsOpen(true))
   }, [])
 
   const recordRuntimeDiagnostic = useCallback((kind: RuntimeDiagnosticKind, detail: string): void => {
@@ -396,17 +556,87 @@ function App() {
     recordRuntimeDiagnostic('frontend_notice', `${notice.title}: ${notice.message}`)
   }, [recordRuntimeDiagnostic])
 
+  const adoptSnapshotPreferences = useCallback((preferences: ValidatedPreferences): void => {
+    setAssistantSettingsLoadError(null)
+    initialSnapshotPreferencesRef.current = preferences
+    if (uiTextSizePersistedRevisionRef.current === 0) {
+      uiTextSizePersistedValueRef.current = preferences.uiTextSize
+      uiTextSizePersistedInitializedRef.current = true
+      if (uiTextSizePendingRevisionRef.current === null) setUiTextSize(preferences.uiTextSize)
+    }
+    if (uiThemePersistedRevisionRef.current === 0) {
+      uiThemePersistedValueRef.current = preferences.uiTheme
+      uiThemePersistedInitializedRef.current = true
+      if (uiThemePendingRevisionRef.current === null) setUiTheme(preferences.uiTheme)
+    }
+    if (ttsPersistedRevisionRef.current === 0) {
+      ttsPersistedValueRef.current = preferences.ttsEnabled
+      ttsPersistedInitializedRef.current = true
+      if (ttsPendingRevisionRef.current === null) {
+        ttsEnabledRef.current = preferences.ttsEnabled
+        setTtsEnabled(preferences.ttsEnabled)
+      }
+    }
+    if (assistantSettingsWriteRevisionRef.current === 0) {
+      const settings: AssistantSettings = {
+        instant: preferences.instant,
+        deep: preferences.deep,
+        review: preferences.review,
+        deepEnabled: preferences.deepEnabled,
+        reviewEnabled: preferences.reviewEnabled,
+        prefetch: preferences.prefetch,
+        completion: preferences.completion,
+      }
+      assistantSettingsRef.current = settings
+      persistedAssistantSettingsRef.current = settings
+      setAssistantSettings(settings)
+      assistantSettingsPendingRef.current = false
+      setAssistantSettingsPending(false)
+    }
+  }, [])
+
+  const adoptSnapshotControls = useCallback((snapshot: AppSnapshot, revision: number, preferenceRevision: number): boolean => {
+    if (revision !== snapshotControlRequestRevisionRef.current) return false
+    const acceptedSnapshot = isAndroidRuntime
+      ? cacheAndroidSnapshot(snapshot, preferenceRevision)
+      : snapshot
+    snapshotHydrationRevisionRef.current += 1
+    adoptSnapshotPreferences(acceptedSnapshot.preferences)
+    const capabilities = toStartupCapabilities(acceptedSnapshot.capabilities)
+    snapshotCapabilitiesRef.current = capabilities
+    snapshotResponseProfileRef.current = acceptedSnapshot.preferences.responseProfile
+    snapshotModelOptionsRef.current = acceptedSnapshot.modelOptions
+    setSnapshotModelOptions(acceptedSnapshot.modelOptions)
+    const controlledState = applySnapshotControlState(
+      startupStateRef.current,
+      capabilities,
+      acceptedSnapshot.preferences.responseProfile,
+    )
+    startupStateRef.current = controlledState
+    setStartupState(controlledState)
+    snapshotControlsFreshRef.current = true
+    setSnapshotControlsFresh(true)
+    snapshotControlsInvalidatedRef.current = false
+    setSnapshotControlsInvalidated(false)
+    return true
+  }, [adoptSnapshotPreferences])
+
   useEffect(() => {
     if (notices.length === 0) {
       return undefined
     }
 
+    if (noticeInteraction.focused || noticeInteraction.hovered) return undefined
+
     const timeoutId = window.setTimeout(() => {
-      setNotices((currentNotices) => currentNotices.slice(1))
+      setNotices((currentNotices) => {
+        if (currentNotices.length <= 1) setNoticeInteraction({ focused: false, hovered: false })
+        return currentNotices.slice(1)
+      })
     }, NOTICE_AUTO_DISMISS_MS)
 
     return () => window.clearTimeout(timeoutId)
-  }, [notices])
+  }, [noticeInteraction, notices])
 
   useEffect(() => {
     if (!settingsOpen) {
@@ -417,27 +647,223 @@ function App() {
   }, [settingsOpen])
 
   useEffect(() => {
+    const onPopState = (): void => {
+      const markerIsCurrent = Boolean(window.history.state?.[SETTINGS_HISTORY_KEY])
+      if (markerIsCurrent) {
+        settingsHistoryTraversalPendingRef.current = false
+        settingsHistoryActiveRef.current = true
+        settingsHistoryOwnedRef.current = window.history.state?.[SETTINGS_HISTORY_KEY] === settingsHistoryTokenRef.current
+        settingsReopenQueuedRef.current = false
+        flushSync(() => setSettingsOpen(true))
+        return
+      }
+      if (!settingsHistoryActiveRef.current && !settingsHistoryTraversalPendingRef.current && !settingsOpen) return
+      settingsHistoryActiveRef.current = false
+      settingsHistoryTraversalPendingRef.current = false
+      const reopen = settingsReopenQueuedRef.current
+      settingsReopenQueuedRef.current = false
+      closeSettings(true)
+      if (reopen) openSettings()
+    }
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
+  }, [closeSettings, openSettings, settingsOpen])
+
+  useEffect(() => {
+    const declarations = ['overflow-x', 'overflow-y'] as const
+    const readDeclarations = (): Record<typeof declarations[number], { value: string; priority: string }> => Object.fromEntries(
+      declarations.map((property) => [property, {
+        value: document.body.style.getPropertyValue(property),
+        priority: document.body.style.getPropertyPriority(property),
+      }]),
+    ) as Record<typeof declarations[number], { value: string; priority: string }>
+    const restoreOverflow = (): void => {
+      const lock = settingsBodyOverflowRef.current
+      if (lock === null) return
+      const current = readDeclarations()
+      declarations.forEach((property) => {
+        if (current[property].value !== lock.written[property].value || current[property].priority !== lock.written[property].priority) return
+        document.body.style.removeProperty(property)
+        const original = lock.original[property]
+        if (original.value !== '') document.body.style.setProperty(property, original.value, original.priority)
+      })
+      settingsBodyOverflowRef.current = null
+    }
+
+    if (!settingsOpen) {
+      restoreOverflow()
+      return
+    }
+    if (settingsBodyOverflowRef.current === null) {
+      const original = readDeclarations()
+      document.body.style.setProperty('overflow-x', 'hidden', original['overflow-x'].priority)
+      document.body.style.setProperty('overflow-y', 'hidden', original['overflow-y'].priority)
+      settingsBodyOverflowRef.current = { original, written: readDeclarations() }
+    }
+    return restoreOverflow
+  }, [settingsOpen])
+
+  useEffect(() => {
+    if (snapshotHydrationStateRef.current !== 'pending') return undefined
+    let active = true
+    let retryTimer: number | null = null
+    const runtimeActivityRevision = runtimeActivityRevisionRef.current
+    const scheduleHydrationRetry = (): void => {
+      if (!active || snapshotHydrationStateRef.current !== 'pending') return
+      if (retryTimer !== null) window.clearTimeout(retryTimer)
+      retryTimer = window.setTimeout(hydrateSnapshot, 250)
+    }
+    function hydrateSnapshot(): void {
+      if (!active || snapshotHydrationStateRef.current !== 'pending') return
+      if (resetPendingRef.current) {
+        scheduleHydrationRetry()
+        return
+      }
+      const transcriptRevision = transcriptRevisionRef.current
+      const snapshotControlRevision = ++snapshotControlRequestRevisionRef.current
+      const snapshotPreferenceRevision = getAndroidPreferencePublicationRevision()
+      void loadAppSnapshot().then(async (snapshot) => {
+        if (!active || snapshotHydrationStateRef.current !== 'pending') return
+        if (transcriptRevision !== transcriptRevisionRef.current) {
+          scheduleHydrationRetry()
+          return
+        }
+        if (!adoptSnapshotControls(snapshot, snapshotControlRevision, snapshotPreferenceRevision)) {
+          scheduleHydrationRetry()
+          return
+        }
+
+        canonicalTranscriptRef.current = snapshot.transcript
+        const activeRequestMessage: ChatMessage[] = snapshot.activeRequest === null ? [] : [{
+          id: `recovered-user-${snapshot.activeRequest.executionId.sessionId}-${snapshot.activeRequest.executionId.generation}`,
+          role: 'user',
+          content: snapshot.activeRequest.prompt,
+        }]
+        setMessages((current) => [
+          ...replaceCommittedTranscript(current, snapshot.transcript),
+          ...activeRequestMessage,
+        ])
+        snapshotRuntimeHydratedRef.current = true
+        if (runtimeActivityRevision === runtimeActivityRevisionRef.current) {
+          synchronizeHydratedRuntimeStatus(toRuntimeStatus(snapshot.runtimePhase))
+        }
+        snapshotSessionIdRef.current = snapshot.sessionId
+        snapshotHydrationStateRef.current = 'succeeded'
+        setSnapshotHydrationState('succeeded')
+        if (snapshot.activeRequest === null && !resetPendingRef.current && promptRef.current === null) {
+          setPromptActivity(null)
+          setPromptState('idle')
+        }
+        if (snapshot.activeRequest === null || transcriptRevision !== transcriptRevisionRef.current) return
+
+        setPromptState('stopping')
+        setPromptActivity('Recovering interrupted response…')
+        await recoverOrphanedRequest(
+          snapshot,
+          transcriptRevision,
+          () => active && !resetPendingRef.current,
+        )
+      }).catch(() => {
+        if (active && isAndroidRuntime) {
+          scheduleHydrationRetry()
+          return
+        }
+        if (active) {
+          snapshotHydrationStateRef.current = 'failed'
+          setSnapshotHydrationState('failed')
+          snapshotControlsFreshRef.current = true
+          setSnapshotControlsFresh(true)
+          snapshotControlsInvalidatedRef.current = false
+          setSnapshotControlsInvalidated(false)
+          const currentStartupState = startupStateRef.current
+          if (
+            ttsWriteRevisionRef.current === 0 &&
+            (currentStartupState.kind === 'ready' || currentStartupState.kind === 'warming_model')
+          ) {
+            ttsEnabledRef.current = currentStartupState.ttsEnabled
+            ttsPersistedValueRef.current = currentStartupState.ttsEnabled
+            ttsPersistedInitializedRef.current = true
+            setTtsEnabled(currentStartupState.ttsEnabled)
+          }
+        }
+      })
+    }
+    hydrateSnapshot()
+
+    return () => {
+      active = false
+      if (retryTimer !== null) window.clearTimeout(retryTimer)
+    }
+  }, [adoptSnapshotControls, recoverOrphanedRequest, synchronizeHydratedRuntimeStatus])
+
+  useEffect(() => {
+    if (!isAndroidRuntime) return undefined
+    let active = true
+    let refreshInFlight = false
+    let refreshQueued = false
+    const runRefresh = (allowRetry: boolean): void => {
+      if (document.visibilityState !== 'visible' || snapshotHydrationStateRef.current !== 'succeeded') return
+      if (refreshInFlight) {
+        refreshQueued = true
+        return
+      }
+      refreshInFlight = true
+      let succeeded = false
+      let failed = false
+      const snapshotControlRevision = ++snapshotControlRequestRevisionRef.current
+      const snapshotPreferenceRevision = getAndroidPreferencePublicationRevision()
+      snapshotControlsFreshRef.current = false
+      setSnapshotControlsFresh(false)
+      void loadAppSnapshot().then((snapshot) => {
+        if (!active || document.visibilityState !== 'visible') return
+        succeeded = adoptSnapshotControls(snapshot, snapshotControlRevision, snapshotPreferenceRevision)
+      }).catch(() => { failed = true }).finally(() => {
+        const latestFailed = failed && snapshotControlRevision === snapshotControlRequestRevisionRef.current && (allowRetry || refreshQueued)
+        const staleRecoveryQueued = refreshQueued && !snapshotControlsFreshRef.current
+        const retry = active && !succeeded && (latestFailed || staleRecoveryQueued) && document.visibilityState === 'visible'
+        refreshQueued = false
+        refreshInFlight = false
+        if (retry) runRefresh(false)
+      })
+    }
+    refreshAndroidSnapshotControlsRef.current = () => runRefresh(true)
+    const refreshControls = (): void => runRefresh(true)
+    document.addEventListener('visibilitychange', refreshControls)
+    window.addEventListener('focus', refreshControls)
+    window.addEventListener('pageshow', refreshControls)
+    return () => {
+      active = false
+      refreshAndroidSnapshotControlsRef.current = () => undefined
+      document.removeEventListener('visibilitychange', refreshControls)
+      window.removeEventListener('focus', refreshControls)
+      window.removeEventListener('pageshow', refreshControls)
+    }
+  }, [adoptSnapshotControls])
+
+  useEffect(() => {
+    if (snapshotHydrationState !== 'failed') return undefined
     let active = true
 
     void invokeTauriCommand('get_ui_text_size')
       .then((payload) => {
-        if (!active || uiTextSizeHydrationOverriddenRef.current) {
+        if (!active || uiTextSizePersistedRevisionRef.current !== 0) {
           return
         }
 
-        setUiTextSize(parseUiTextSize(payload))
+        const textSize = parseUiTextSize(payload)
+        uiTextSizePersistedValueRef.current = textSize
+        uiTextSizePersistedInitializedRef.current = true
+        if (uiTextSizePendingRevisionRef.current === null) setUiTextSize(textSize)
       })
       .catch(() => undefined)
 
     return () => {
       active = false
     }
-  }, [])
+  }, [snapshotHydrationState])
 
   useEffect(() => {
-    if (getTauriInternals() === null) {
-      return undefined
-    }
+    if (snapshotHydrationState !== 'failed') return undefined
     let active = true
     void invokeTauriCommand('get_assistant_settings').then((payload) => {
       if (active && assistantSettingsWriteRevisionRef.current === 0) {
@@ -460,7 +886,7 @@ function App() {
       }
     })
     return () => { active = false }
-  }, [addNotice])
+  }, [addNotice, snapshotHydrationState])
 
   const voiceCuesCanPrepare = startupState.kind === 'ready' && capabilityIsAvailable(startupState, 'tts')
   useEffect(() => {
@@ -513,26 +939,30 @@ function App() {
   }, [uiTheme])
 
   useEffect(() => {
+    if (snapshotHydrationState !== 'failed') return undefined
     let active = true
 
     void invokeTauriCommand('get_ui_theme')
       .then((payload) => {
-        if (!active || uiThemeHydrationOverriddenRef.current) {
+        if (!active || uiThemePersistedRevisionRef.current !== 0) {
           return
         }
 
-        setUiTheme(parseUiTheme(payload))
+        const theme = parseUiTheme(payload)
+        uiThemePersistedValueRef.current = theme
+        uiThemePersistedInitializedRef.current = true
+        if (uiThemePendingRevisionRef.current === null) setUiTheme(theme)
       })
       .catch(() => undefined)
 
     return () => {
       active = false
     }
-  }, [])
+  }, [snapshotHydrationState])
 
   const persistUiTextSize = async (nextTextSize: UiTextSize, previousTextSize: UiTextSize): Promise<void> => {
     const revision = ++uiTextSizeWriteRevisionRef.current
-    uiTextSizeHydrationOverriddenRef.current = true
+    uiTextSizePendingRevisionRef.current = revision
     setUiTextSize(nextTextSize)
 
     try {
@@ -541,12 +971,20 @@ function App() {
       )
       uiTextSizeWriteChainRef.current = write.then(() => undefined, () => undefined)
       const payload = await write
+      const persistedTextSize = parseUiTextSize(payload)
+      uiTextSizePersistedRevisionRef.current = revision
+      uiTextSizePersistedValueRef.current = persistedTextSize
+      uiTextSizePersistedInitializedRef.current = true
       if (revision === uiTextSizeWriteRevisionRef.current) {
-        setUiTextSize(parseUiTextSize(payload))
+        uiTextSizePendingRevisionRef.current = null
+        setUiTextSize(persistedTextSize)
       }
     } catch (error) {
       if (revision !== uiTextSizeWriteRevisionRef.current) return
-      setUiTextSize(previousTextSize)
+      uiTextSizePendingRevisionRef.current = null
+      setUiTextSize(uiTextSizePersistedInitializedRef.current
+        ? uiTextSizePersistedValueRef.current
+        : initialSnapshotPreferencesRef.current?.uiTextSize ?? previousTextSize)
       addNotice({
         tone: 'error',
         title: 'Setting not saved',
@@ -569,7 +1007,7 @@ function App() {
 
   const persistUiTheme = async (nextTheme: UiTheme, previousTheme: UiTheme): Promise<void> => {
     const revision = ++uiThemeWriteRevisionRef.current
-    uiThemeHydrationOverriddenRef.current = true
+    uiThemePendingRevisionRef.current = revision
     setUiTheme(nextTheme)
 
     try {
@@ -578,12 +1016,20 @@ function App() {
       )
       uiThemeWriteChainRef.current = write.then(() => undefined, () => undefined)
       const payload = await write
+      const persistedTheme = parseUiTheme(payload)
+      uiThemePersistedRevisionRef.current = revision
+      uiThemePersistedValueRef.current = persistedTheme
+      uiThemePersistedInitializedRef.current = true
       if (revision === uiThemeWriteRevisionRef.current) {
-        setUiTheme(parseUiTheme(payload))
+        uiThemePendingRevisionRef.current = null
+        setUiTheme(persistedTheme)
       }
     } catch (error) {
       if (revision !== uiThemeWriteRevisionRef.current) return
-      setUiTheme(previousTheme)
+      uiThemePendingRevisionRef.current = null
+      setUiTheme(uiThemePersistedInitializedRef.current
+        ? uiThemePersistedValueRef.current
+        : initialSnapshotPreferencesRef.current?.uiTheme ?? previousTheme)
       addNotice({
         tone: 'error',
         title: 'Theme not saved',
@@ -621,29 +1067,79 @@ function App() {
     }
   }
 
-  const applyStartupState = (nextState: StartupState, syncRuntimeStatus = true): void => {
-    startupStateRef.current = nextState
-    setStartupState(nextState)
-    if (nextState.kind === 'ready' || nextState.kind === 'warming_model') {
-      ttsEnabledRef.current = nextState.ttsEnabled
-      setTtsEnabled(nextState.ttsEnabled)
-    } else {
-      ttsEnabledRef.current = false
-      setTtsEnabled(false)
+  const applyStartupState = useCallback((
+    nextState: StartupState,
+    syncRuntimeStatus = true,
+    startupSnapshotRevision = snapshotHydrationRevisionRef.current,
+  ): StartupState => {
+    const isInitialStartupHydration = startupStateRef.current.kind === 'loading'
+    const preserveSnapshotControls =
+      snapshotHydrationStateRef.current === 'succeeded' &&
+      startupSnapshotRevision < snapshotHydrationRevisionRef.current &&
+      snapshotCapabilitiesRef.current !== null &&
+      snapshotResponseProfileRef.current !== null
+    const publishedState = preserveSnapshotControls
+      ? applySnapshotControlState(
+        nextState,
+        snapshotCapabilitiesRef.current ?? [],
+        snapshotResponseProfileRef.current ?? 'fast',
+      )
+      : nextState
+    if (
+      snapshotHydrationStateRef.current === 'succeeded' &&
+      !preserveSnapshotControls &&
+      (publishedState.kind === 'ready' || publishedState.kind === 'warming_model')
+    ) {
+      snapshotCapabilitiesRef.current = publishedState.capabilities
+      snapshotResponseProfileRef.current = publishedState.selectedResponseProfile
+    }
+    startupStateRef.current = publishedState
+    setStartupState(publishedState)
+    const startupTtsStateIsFresh =
+      snapshotHydrationStateRef.current !== 'succeeded' ||
+      startupSnapshotRevision === snapshotHydrationRevisionRef.current
+    if (
+      ttsWriteRevisionRef.current === 0 &&
+      startupTtsStateIsFresh &&
+      (nextState.kind === 'ready' || nextState.kind === 'warming_model')
+    ) {
+      ttsPersistedValueRef.current = nextState.ttsEnabled
+      ttsPersistedInitializedRef.current = true
+    }
+    if (
+      snapshotHydrationStateRef.current !== 'pending' &&
+      (
+        snapshotHydrationStateRef.current !== 'succeeded' ||
+        startupSnapshotRevision === snapshotHydrationRevisionRef.current
+      ) &&
+      ttsWriteRevisionRef.current === 0
+    ) {
+      const nextTtsEnabled = nextState.kind === 'ready' || nextState.kind === 'warming_model'
+        ? nextState.ttsEnabled
+        : false
+      ttsEnabledRef.current = nextTtsEnabled
+      setTtsEnabled(nextTtsEnabled)
     }
 
     if (syncRuntimeStatus) {
       const nextRuntimeStatus = startupStateToRuntimeStatus(nextState)
-      runtimeStatusRef.current = nextRuntimeStatus
-      setRuntimeStatus(nextRuntimeStatus)
+      if (isInitialStartupHydration) {
+        synchronizeHydratedRuntimeStatus(nextRuntimeStatus)
+      } else {
+        publishRuntimeStatus(nextRuntimeStatus, true)
+      }
     }
-  }
+    return publishedState
+  }, [publishRuntimeStatus, synchronizeHydratedRuntimeStatus])
 
+  const startupLoadAllowed = !isAndroidRuntime || snapshotHydrationState !== 'pending'
   useEffect(() => {
+    if (!startupLoadAllowed) return undefined
     let active = true
 
     void (async () => {
       while (active) {
+        const startupSnapshotRevision = snapshotHydrationRevisionRef.current
         const nextState = await loadStartupState()
 
         if (!active) {
@@ -661,11 +1157,11 @@ function App() {
           await new Promise((resolve) => window.setTimeout(resolve, 500))
           continue
         }
-        const syncRuntimeStatus = !hydrated
-        applyStartupState(nextState, syncRuntimeStatus)
+        const syncRuntimeStatus = !hydrated && !snapshotRuntimeHydratedRef.current
+        const publishedState = applyStartupState(nextState, syncRuntimeStatus, startupSnapshotRevision)
 
-        if (nextState.kind === 'ready') {
-          const newlyUnavailableCapabilities = nextState.capabilities.filter(({ id, state }) => {
+        if (publishedState.kind === 'ready' && !isBrowserPreviewRuntime()) {
+          const newlyUnavailableCapabilities = publishedState.capabilities.filter(({ id, state }) => {
             if (state !== 'not_configured' && state !== 'unavailable' && state !== 'failed') return false
             if (previousKind !== 'ready') return true
             const previousCapability = previousState.capabilities.find((capability) => capability.id === id)
@@ -714,7 +1210,7 @@ function App() {
     return () => {
       active = false
     }
-  }, [addNotice])
+  }, [addNotice, applyStartupState, startupLoadAllowed])
 
   useEffect(() => {
     appActiveRef.current = true
@@ -722,6 +1218,14 @@ function App() {
     return () => {
       appActiveRef.current = false
       cuePlayer.stop()
+      const activePrompt = promptRef.current
+      if (activePrompt !== null) {
+        if (activePrompt.renderFrameId !== null) window.cancelAnimationFrame(activePrompt.renderFrameId)
+        activePrompt.renderFrameId = null
+        activePrompt.renderFrameRevision += 1
+        activePrompt.terminal = true
+      }
+      promptRef.current = null
       cancelTts()
       if (wakeConfidenceHoldRef.current !== null) {
         window.clearTimeout(wakeConfidenceHoldRef.current)
@@ -731,11 +1235,12 @@ function App() {
       liveAudioStartAbortRef.current = null
       liveAudioSourceRef.current?.stop()
       liveAudioSourceRef.current = null
+      if (isBrowserPreviewRuntime()) teardownBrowserPreviewRuntime()
     }
   }, [])
 
   useEffect(() => {
-    if (!settingsOpen) {
+    if (!settingsOpen || !supportsDesktopRuntime) {
       return
     }
 
@@ -751,25 +1256,79 @@ function App() {
     return () => {
       active = false
     }
-  }, [settingsOpen])
+  }, [settingsOpen, supportsDesktopRuntime])
+
+  const scrollConversationToLatest = useCallback((behavior?: ScrollBehavior): void => {
+    const conversation = conversationRef.current
+    if (conversation === null || !followLatestRef.current) {
+      if (conversation !== null) setShowJumpToLatest(true)
+      return
+    }
+    if (typeof conversation.scrollTo === 'function') {
+      conversation.scrollTo({ top: conversation.scrollHeight, ...(behavior === undefined ? {} : { behavior }) })
+    } else {
+      conversation.scrollTop = conversation.scrollHeight
+    }
+  }, [])
+  const activeNoticeId = notices[0]?.id
+
+  useEffect(() => {
+    scrollConversationToLatest()
+  }, [scrollConversationToLatest, visibleMessages])
 
   useEffect(() => {
     const conversation = conversationRef.current
+    if (conversation === null) return
+    const resizeObserver = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => {
+      scrollConversationToLatest()
+    })
+    resizeObserver?.observe(conversation)
+    return () => resizeObserver?.disconnect()
+  }, [scrollConversationToLatest])
 
-    if (conversation === null) {
+  useEffect(() => {
+    scrollConversationToLatest()
+  }, [activeNoticeId, composerValue, scrollConversationToLatest, uiTextSize])
+
+  const onConversationScroll = (): void => {
+    const conversation = conversationRef.current
+    if (conversation === null) return
+    const nearLatest = conversation.scrollHeight - conversation.scrollTop - conversation.clientHeight <= 96
+    if (jumpToLatestInProgressRef.current) {
+      if (nearLatest) jumpToLatestInProgressRef.current = false
       return
     }
+    followLatestRef.current = nearLatest
+    setShowJumpToLatest(!nearLatest)
+  }
 
-    if (typeof conversation.scrollTo === 'function') {
-      conversation.scrollTo({ top: conversation.scrollHeight })
-      return
-    }
+  const interruptJumpToLatest = (): void => {
+    jumpToLatestInProgressRef.current = false
+  }
 
-    conversation.scrollTop = conversation.scrollHeight
-  }, [visibleMessages])
+  const jumpToLatest = (): void => {
+    const conversation = conversationRef.current
+    if (conversation === null) return
+    followLatestRef.current = true
+    jumpToLatestInProgressRef.current = true
+    setShowJumpToLatest(false)
+    scrollConversationToLatest('smooth')
+  }
 
   const assistantCapabilities = useMemo(() => capabilityMap(startupState), [startupState])
-  const selectedInstantOption = instantOptions(assistantCapabilities)
+  const instantAssistantOptions = useMemo(
+    () => applySnapshotModelOptions(instantOptions(assistantCapabilities), snapshotModelOptions),
+    [assistantCapabilities, snapshotModelOptions],
+  )
+  const deepAssistantOptions = useMemo(
+    () => applySnapshotModelOptions(deepOptions(assistantCapabilities), snapshotModelOptions),
+    [assistantCapabilities, snapshotModelOptions],
+  )
+  const reviewAssistantOptions = useMemo(
+    () => applySnapshotModelOptions(reviewOptions(assistantCapabilities), snapshotModelOptions),
+    [assistantCapabilities, snapshotModelOptions],
+  )
+  const selectedInstantOption = instantAssistantOptions
     .find((option) => option.value === assistantSettings.instant)
   const selectedInstantRetryable = localInstantCanRetry(startupState, assistantSettings.instant)
   const selectedInstantProfileReady = instantMatchesResponseProfile(startupState, assistantSettings.instant)
@@ -779,12 +1338,13 @@ function App() {
       selectedInstantOption?.available === true &&
       selectedInstantProfileReady &&
       !assistantSettingsPending &&
+      snapshotControlsFresh &&
       !resetPending &&
       promptState === 'idle' &&
       runtimeStatus === 'sleeping' &&
       !updateRuntimeBlocked &&
       composerValue.trim().length > 0,
-    [assistantSettingsPending, composerValue, promptState, resetPending, runtimeStatus, selectedInstantOption?.available, selectedInstantProfileReady, startupState.kind, updateRuntimeBlocked],
+    [assistantSettingsPending, composerValue, promptState, resetPending, runtimeStatus, selectedInstantOption?.available, selectedInstantProfileReady, snapshotControlsFresh, startupState.kind, updateRuntimeBlocked],
   )
   const updateInstallationDisabled =
     startupState.kind !== 'ready' ||
@@ -797,8 +1357,14 @@ function App() {
     ttsPlaying ||
     pendingTtsCommands > 0
 
-  const canToggleMic = voiceInputReady(startupState) && !micStarting && !updateRuntimeBlocked
   const selectedAudioInputDevice = audioInputDevices.find((device) => device.deviceId === audioInputDeviceId)
+  const voiceSnapshotControlsUsable = snapshotControlsFresh || (
+    !snapshotControlsInvalidated && snapshotHydrationState === 'pending'
+  )
+  const voiceSnapshotControlsUsableNow = (): boolean => snapshotControlsFreshRef.current || (
+    !snapshotControlsInvalidatedRef.current && snapshotHydrationStateRef.current === 'pending'
+  )
+  const canToggleMic = !updateRuntimeBlocked && (micActive || (voiceSnapshotControlsUsable && voiceInputReady(startupState) && !micStarting && !resetPending))
   const voiceInputUnavailableReason = startupState.kind === 'ready'
     ? (startupState.voiceInputError ?? (startupState.capabilities
       .filter((capability) => ['wake_word', 'vad', 'parakeet'].includes(capability.id) && capability.state !== 'available')
@@ -815,7 +1381,7 @@ function App() {
   }, [cueAssetPaths, fallbackCueAssetPaths])
   const canToggleTts = startupState.kind === 'ready' &&
     capabilityIsAvailable(startupState, 'tts') && !isSwitchingResponseProfile && !updateRuntimeBlocked
-  const assistantControlsDisabled = startupState.kind !== 'ready' || assistantSettingsPending || isSwitchingResponseProfile || updateRuntimeBlocked
+  const assistantControlsDisabled = startupState.kind !== 'ready' || assistantSettingsPending || isSwitchingResponseProfile || !snapshotControlsFresh || updateRuntimeBlocked
   const persistAssistantSettings = async (next: AssistantSettings): Promise<boolean> => {
     const revision = ++assistantSettingsWriteRevisionRef.current
     assistantSettingsPendingRef.current = true
@@ -858,7 +1424,7 @@ function App() {
   }
   const changeInstant = async (instant: AssistantSettings['instant']): Promise<void> => {
     const revision = ++instantSelectionRevisionRef.current
-    const option = instantOptions(assistantCapabilities).find((item) => item.value === instant)
+    const option = instantAssistantOptions.find((item) => item.value === instant)
     if (!option?.available && !localInstantCanRetry(startupStateRef.current, instant)) return
     let previousProfile: ResponseProfile | null = null
     let switchedProfile = false
@@ -909,80 +1475,12 @@ function App() {
     })
   }
 
-  const applyTransition = (
-    previousStatus: RuntimeStatus,
-    event: Parameters<typeof transitionRuntimeStatus>[1],
-  ): RuntimeStatus => {
-    const nextStatus = transitionRuntimeStatus(previousStatus, event)
-
-    if (nextStatus === previousStatus) {
-      return previousStatus
-    }
-
-    runtimeStatusRef.current = nextStatus
-    setRuntimeStatus(nextStatus)
-
-    if (nextStatus === 'listening' && previousStatus !== 'listening') {
-      resetWakeConfidence()
-      expectedPartialSessionIdRef.current += 1
-      partialTranscriptionRef.current = {
-        sessionId: expectedPartialSessionIdRef.current,
-        revision: 0,
-        active: true,
-      }
-      partialTranscriptionAllowedRef.current = true
-    } else if (nextStatus !== 'listening') {
-      partialTranscriptionAllowedRef.current = false
-      voiceActivityStateRef.current = createVoiceActivityState()
-      resetWakeConfidence()
-      clearPartialTranscript()
-    }
-
-    const cueType = cueForTransition(previousStatus, nextStatus)
-
-    if (cueType !== null) {
-      voiceTelemetry.record('cue_play_requested', {
-        details: {
-          cueType,
-          source: 'apply_transition',
-        },
-      })
-
-       void playCueWithFallback(cueType, cueAssetPathsRef.current, fallbackCueAssetPathsRef.current, cuePlayerRef.current)
-        .then((started) => {
-          if (started) voiceTelemetry.record('cue_play_started', {
-            details: {
-              cueType,
-              source: 'apply_transition',
-            },
-          })
-        })
-        .catch((error: unknown) => {
-          console.error('[cue] playback failure during transition', {
-            cueType,
-            cueAssetPaths,
-            runtimeStatusBefore: previousStatus,
-            runtimeStatusAfter: nextStatus,
-            error,
-          })
-
-          applyTransition(nextStatus, 'fail')
-          reportCuePlaybackError(cueType, error)
-        })
-    }
-
-    return nextStatus
-  }
-
   const applyRuntimeStatus = (nextStatus: RuntimeStatus): RuntimeStatus => {
-    const previousStatus = runtimeStatusRef.current
+    const previousStatus = publishRuntimeStatus(nextStatus, true)
 
     if (nextStatus === previousStatus) {
       return previousStatus
     }
-
-    runtimeStatusRef.current = nextStatus
-    setRuntimeStatus(nextStatus)
 
     if (nextStatus === 'listening' && previousStatus !== 'listening') {
       resetWakeConfidence()
@@ -1036,6 +1534,11 @@ function App() {
     return nextStatus
   }
 
+  const applyTransition = (
+    previousStatus: RuntimeStatus,
+    event: Parameters<typeof transitionRuntimeStatus>[1],
+  ): RuntimeStatus => applyRuntimeStatus(transitionRuntimeStatus(previousStatus, event))
+
   const recordRuntimeControlTelemetry = (runtimePhase: RuntimeControlResult): void => {
     const telemetry = runtimePhase.telemetry
 
@@ -1080,10 +1583,7 @@ function App() {
   }
 
   const enterRuntimeError = (): void => {
-    runtimeStatusRef.current = 'error'
-    voiceActivityStateRef.current = createVoiceActivityState()
-    resetWakeConfidence()
-    setRuntimeStatus('error')
+    applyRuntimeStatus('error')
   }
 
   const transitionFromCurrentStatus = (
@@ -1173,6 +1673,7 @@ function App() {
     }
 
     const { args, fallbackEvent, quiet, isCurrent } = options
+    runtimeActivityRevisionRef.current += 1
 
     try {
       const runtimePhase = await invokeRuntimeControl(command, args)
@@ -1207,6 +1708,56 @@ function App() {
     applyRuntimeStatus('sleeping')
   }
 
+  const renderPromptProjection = (projection: PromptProjection): void => {
+    if (projection.text.length === 0) return
+    const text = projection.text
+    const stages = [...projection.stages]
+    const priorVersions = [...projection.priorVersions]
+    const sources = [...projection.sources]
+    setMessages((current) => {
+      const projectedMessage = {
+        id: projection.assistantId,
+        role: 'assistant' as const,
+        content: text,
+        ...(projection.customDirectTimings === undefined ? {} : { customDirectTimings: projection.customDirectTimings }),
+        answerStage: {
+          stages,
+          priorVersions,
+          sources,
+        },
+      }
+      return current.some((message) => message.id === projection.assistantId)
+        ? current.map((message) => message.id === projection.assistantId
+          ? { ...message, ...projectedMessage }
+          : message)
+        : [...current, projectedMessage]
+    })
+  }
+
+  const cancelPromptProjectionFrame = (projection: PromptProjection): void => {
+    if (projection.renderFrameId === null) return
+    window.cancelAnimationFrame(projection.renderFrameId)
+    projection.renderFrameId = null
+    projection.renderFrameRevision += 1
+  }
+
+  const flushPromptProjection = (projection: PromptProjection): void => {
+    cancelPromptProjectionFrame(projection)
+    renderPromptProjection(projection)
+  }
+
+  const schedulePromptProjection = (projection: PromptProjection): void => {
+    if (projection.renderFrameId !== null) return
+    const frameRevision = ++projection.renderFrameRevision
+    const frameId = window.requestAnimationFrame(() => {
+      if (projection.renderFrameRevision !== frameRevision || projection.renderFrameId !== frameId) return
+      projection.renderFrameId = null
+      if (!appActiveRef.current || promptRef.current !== projection || projection.terminal) return
+      renderPromptProjection(projection)
+    })
+    projection.renderFrameId = frameId
+  }
+
   const runPrompt = async (
     prompt: string,
     source: 'typed' | 'voice',
@@ -1214,13 +1765,18 @@ function App() {
     const currentStartupState = startupStateRef.current
     const currentSettings = assistantSettingsRef.current
     const selectedInstant = currentStartupState.kind === 'ready'
-      ? instantOptions(capabilityMap(currentStartupState)).find((option) => option.value === currentSettings.instant)
+      ? applySnapshotModelOptions(
+        instantOptions(capabilityMap(currentStartupState)),
+        snapshotModelOptionsRef.current,
+      ).find((option) => option.value === currentSettings.instant)
       : undefined
     if (
       currentStartupState.kind !== 'ready' ||
+      updateRuntimeBlocked ||
       selectedInstant?.available !== true ||
       !instantMatchesResponseProfile(currentStartupState, currentSettings.instant) ||
       assistantSettingsPendingRef.current ||
+      !snapshotControlsFreshRef.current ||
       isSwitchingResponseProfileRef.current ||
       resetPendingRef.current ||
       promptRef.current !== null
@@ -1238,14 +1794,23 @@ function App() {
     if (executingStatus === currentStatus) {
       return
     }
+    const promptRuntimeActivityRevision = runtimeActivityRevisionRef.current
+    const expectedCanonicalSessionId = snapshotSessionIdRef.current
+    const priorCanonicalExecutions = new Set(
+      canonicalTranscriptRef.current.map((turn) => executionKey(turn)),
+    )
     clearPartialTranscript()
     cancelTts()
+    setResponseAnnouncement('')
 
     // eslint-disable-next-line react-hooks/purity
     const requestId = `request-${Date.now()}-${Math.random().toString(36).slice(2)}`
-    const assistantId = `assistant-${requestId}`
-    promptRef.current = {
+    const projectionRevision = ++promptProjectionRevisionRef.current
+    const userId = `user-${projectionRevision}-${requestId}`
+    const assistantId = `assistant-${projectionRevision}-${requestId}`
+    const promptProjection: PromptProjection = {
       id: requestId,
+      userId,
       assistantId,
       text: '',
       error: null,
@@ -1260,13 +1825,16 @@ function App() {
       priorVersions: [],
       sources: [],
       ttsFirstLineSpoken: false,
+      renderFrameId: null,
+      renderFrameRevision: 0,
     }
+    promptRef.current = promptProjection
     setPromptState('executing')
     setPromptActivity('Executing prompt…')
     setMessages((currentMessages) => [
       ...currentMessages,
       {
-        id: `user-${Date.now()}`,
+        id: userId,
         role: 'user',
         content: prompt,
       },
@@ -1278,8 +1846,9 @@ function App() {
     }
 
     const handleEvent = (event: import('./types/chat').PromptExecutionEvent): void => {
+      if (!appActiveRef.current) return
       const active = promptRef.current
-      if (active === null || active.id !== event.requestId || active.terminal) {
+      if (active !== promptProjection || active.id !== event.requestId || active.terminal) {
         return
       }
       if (event.kind === 'text') {
@@ -1291,45 +1860,36 @@ function App() {
         if (source === 'voice' && !hadCompleteLine && active.text.includes('\n')) {
           voiceTelemetry.record('provider_first_line')
         }
-        if (active.tts && ttsEnabledRef.current && !active.ttsFirstLineSpoken && active.text.includes('\n')) {
+        if (
+          snapshotHydrationStateRef.current !== 'succeeded' &&
+          active.tts &&
+          ttsEnabledRef.current &&
+          !active.ttsFirstLineSpoken &&
+          active.text.includes('\n')
+        ) {
           const firstLine = firstNonEmptyStreamingLine(active.text)
           if (firstLine !== null && isValidTtsFirstLine(firstLine)) {
             active.ttsFirstLineSpoken = true
             void synthesizeAndPlayAssistantReply(firstLine)
           }
         }
-        setMessages((current) => {
-          const index = current.findIndex((message) => message.id === active.assistantId)
-          if (index < 0) {
-            return [...current, { id: active.assistantId, role: 'assistant', content: event.text, answerStage: { stages: active.stages, priorVersions: active.priorVersions, sources: active.sources } }]
-          }
-          return current.map((message, messageIndex) =>
-            messageIndex === index
-              ? { ...message, content: message.content + event.text, answerStage: { stages: active.stages, priorVersions: active.priorVersions, sources: active.sources } }
-              : message,
-          )
-        })
+        schedulePromptProjection(active)
       }
       if (event.kind === 'correction') {
+        cancelPromptProjectionFrame(active)
         active.corrected = true
         if (active.text.trim().length > 0) {
           active.priorVersions.push({ id: `instant-${active.priorVersions.length + 1}`, text: active.text, label: 'Before correction' })
         }
         active.text = event.text
         active.stages = active.stages.map((stage) => stage.stage === event.stage ? { ...stage, status: 'corrected', detail: event.correction } : stage)
-        setMessages((current) => {
-          const corrected = {
-            id: active.assistantId,
-            role: 'assistant' as const,
-            content: event.text,
-             answerStage: { stages: active.stages, priorVersions: active.priorVersions, sources: active.sources },
-          }
-          return current.some((message) => message.id === active.assistantId)
-            ? current.map((message) => message.id === active.assistantId ? { ...message, ...corrected } : message)
-            : [...current, corrected]
-        })
+        renderPromptProjection(active)
         setPromptActivity(event.correction)
-        if (active.tts && ttsEnabledRef.current) {
+        if (
+          snapshotHydrationStateRef.current !== 'succeeded' &&
+          active.tts &&
+          ttsEnabledRef.current
+        ) {
           void synthesizeAndPlayAssistantReply(event.correction.replace(/^Correction:\s*/u, ''))
         }
       }
@@ -1339,6 +1899,7 @@ function App() {
           : stage)
         setMessages((current) => current.map((message) => message.id === active.assistantId
           ? { ...message, answerStage: { stages: active.stages, priorVersions: active.priorVersions, sources: active.sources } } : message))
+        setPromptActivity(`${event.stage[0]?.toUpperCase()}${event.stage.slice(1)} stage ${event.status}`)
       }
       if (event.kind === 'sources') {
         active.sources = [...event.sources]
@@ -1346,6 +1907,7 @@ function App() {
           ? { ...message, answerStage: { stages: active.stages, priorVersions: active.priorVersions, sources: active.sources } } : message))
       }
       if (event.kind === 'custom_direct_timings') {
+        active.customDirectTimings = event.timings
         setMessages((current) => current.map((message) => message.id === active.assistantId
           ? { ...message, customDirectTimings: event.timings }
           : message))
@@ -1367,11 +1929,32 @@ function App() {
       }
     }
     if (source === 'voice') voiceTelemetry.record('provider_request_started', { details: { provider: currentSettings.instant } })
+    let result: PromptExecutionResult
+    let commandRejected = false
     try {
-      const result = await executePrompt(requestId, prompt, handleEvent, source)
+      result = await executePrompt(requestId, prompt, handleEvent, source)
+    } catch (error) {
+      const message = error instanceof Error
+        ? error.message
+        : typeof error === 'string' && error.trim().length > 0
+          ? error
+          : 'Prompt execution failed'
+      commandRejected = true
+      result = {
+        requestId,
+        runtimePhase: null,
+        outcome: 'error',
+        errorMessage: message,
+      }
+      recordRuntimeDiagnostic('execution', `Execution error: ${message}`)
+    }
+
+    {
+      if (!appActiveRef.current) return
       const active = promptRef.current
       if (
         active === null ||
+        active !== promptProjection ||
         active.id !== requestId ||
         result.requestId !== requestId ||
         active.terminal
@@ -1379,6 +1962,26 @@ function App() {
         return
       }
       if (source === 'voice') voiceTelemetry.record('provider_completed', { details: { outcome: result.outcome } })
+      const acceptedCanonicalTurn = result.canonicalTurn !== undefined && isExpectedCanonicalTurn(
+        result.canonicalTurn,
+        requestId,
+        expectedCanonicalSessionId,
+        priorCanonicalExecutions,
+      ) ? result.canonicalTurn : undefined
+      if (result.canonicalTurn !== undefined && acceptedCanonicalTurn === undefined) {
+        result = {
+          requestId: result.requestId,
+          runtimePhase: result.runtimePhase,
+          outcome: 'error',
+          errorMessage: 'The returned response did not match the active execution.',
+        }
+      }
+      if (result.outcome !== 'completed') cancelTts()
+      if (result.outcome === 'completed') {
+        flushPromptProjection(active)
+      } else {
+        cancelPromptProjectionFrame(active)
+      }
       active.terminal = true
       active.stages = active.stages.map((stage) => {
         if (result.outcome !== 'completed' && (stage.status === 'running' || stage.status === 'queued')) {
@@ -1394,68 +1997,142 @@ function App() {
       setMessages((current) => current.map((message) => message.id === active.assistantId
         ? { ...message, answerStage: { stages: active.stages, priorVersions: active.priorVersions, sources: active.sources } }
         : message))
+      if (result.outcome !== 'completed') {
+        setResponseAnnouncement('')
+        setMessages((current) => current.filter(
+          (message) => message.id !== active.userId && message.id !== active.assistantId,
+        ))
+      }
+      let reconciledTurn: Turn | undefined = acceptedCanonicalTurn
+      let reconciledRuntimePhase: BackendRuntimePhase | null = null
+      let reconciledRuntimeActivityRevision: number | null = null
+      if (snapshotHydrationStateRef.current === 'succeeded') {
+        setPromptState('reconciling')
+        setPromptActivity('Synchronizing response…')
+        const transcriptRevision = transcriptRevisionRef.current
+        const snapshotControlRevision = ++snapshotControlRequestRevisionRef.current
+        const snapshotPreferenceRevision = getAndroidPreferencePublicationRevision()
+        let snapshot: Awaited<ReturnType<typeof loadAppSnapshot>> | null = null
+        for (let attempt = 0; attempt < 3 && snapshot === null; attempt += 1) {
+          if (!appActiveRef.current || promptRef.current !== active || resetPendingRef.current || transcriptRevision !== transcriptRevisionRef.current) return
+          try {
+            const runtimeActivityRevision = runtimeActivityRevisionRef.current
+            const candidate = await loadAppSnapshot()
+            if (candidate.activeRequest === null) {
+              snapshot = candidate
+              reconciledRuntimeActivityRevision = runtimeActivityRevision
+            }
+          } catch {
+            // A bounded retry keeps terminal settlement tied to canonical state.
+          }
+          if (snapshot === null && attempt < 2) {
+            await new Promise((resolve) => window.setTimeout(resolve, 250 * (attempt + 1)))
+          }
+        }
+        if (!appActiveRef.current || promptRef.current !== active || resetPendingRef.current || transcriptRevision !== transcriptRevisionRef.current) return
+        if (snapshot === null) {
+          if (acceptedCanonicalTurn === undefined) {
+            setPromptActivity('Session recovery required. Use New Chat to retry.')
+            return
+          }
+          const transcript = appendCanonicalTurn(canonicalTranscriptRef.current, acceptedCanonicalTurn)
+          setMessages((current) => replaceCommittedTranscript(current, transcript))
+          canonicalTranscriptRef.current = transcript
+          snapshotSessionIdRef.current = acceptedCanonicalTurn.executionId.sessionId
+          if (isAndroidRuntime && !snapshotControlsFreshRef.current) {
+            refreshAndroidSnapshotControlsRef.current()
+          }
+        } else {
+          adoptSnapshotControls(snapshot, snapshotControlRevision, snapshotPreferenceRevision)
+          const snapshotTurn = findNewTurnForRequest(
+            snapshot.transcript,
+            requestId,
+            expectedCanonicalSessionId,
+            priorCanonicalExecutions,
+          )
+          reconciledTurn = snapshotTurn ?? acceptedCanonicalTurn
+          const transcript = appendCanonicalTurn(snapshot.transcript, snapshotTurn === undefined ? acceptedCanonicalTurn : undefined)
+          setMessages((current) => replaceCommittedTranscript(current, transcript))
+          canonicalTranscriptRef.current = transcript
+          snapshotSessionIdRef.current = snapshot.sessionId
+          reconciledRuntimePhase = snapshot.runtimePhase
+        }
+      }
       promptRef.current = null
       setPromptState('idle')
       setPromptActivity(null)
-      applyRuntimeStatus(toRuntimeStatus(result.runtimePhase))
-      if (result.outcome !== 'completed') {
-        setMessages((current) =>
-          current.filter(
-            (message) => message.id !== assistantId || message.content.trim().length > 0,
-          ),
-        )
+      if (
+        reconciledRuntimePhase === null &&
+        result.runtimePhase !== null &&
+        promptRuntimeActivityRevision === runtimeActivityRevisionRef.current
+      ) {
+        applyRuntimeStatus(toRuntimeStatus(result.runtimePhase))
+      } else if (
+        reconciledRuntimePhase !== null &&
+        reconciledRuntimeActivityRevision === runtimeActivityRevisionRef.current
+      ) {
+        applyRuntimeStatus(toRuntimeStatus(reconciledRuntimePhase))
+      }
+      const canonicalSettlementRequired = snapshotHydrationStateRef.current === 'succeeded'
+      const canonicalCanConfirmCompletion = result.outcome === 'completed' || commandRejected
+      const effectiveOutcome = reconciledTurn !== undefined && canonicalCanConfirmCompletion
+        ? 'completed'
+        : canonicalSettlementRequired && result.outcome === 'completed'
+          ? 'error'
+          : result.outcome
+      const terminalText = reconciledTurn?.answer.content.text ?? active.text
+      if (effectiveOutcome === 'completed' && reconciledTurn !== undefined) {
+        const answerId = reconciledTurn.answer.id
+        setMessages((current) => current.map((message) => message.id === answerId ? {
+          ...message,
+          ...(active.customDirectTimings === undefined ? {} : { customDirectTimings: active.customDirectTimings }),
+          answerStage: {
+            ...message.answerStage,
+            stages: message.answerStage?.stages ?? [],
+            priorVersions: [...active.priorVersions],
+            sources: [...active.sources],
+          },
+        } : message))
+      }
+      if (effectiveOutcome === 'completed' && terminalText.trim().length > 0) {
+        setResponseAnnouncement(formatResponseAnnouncement(
+          reconciledTurn?.answer.content.kind ?? 'text',
+          terminalText,
+        ))
+      }
+      if (effectiveOutcome !== 'completed') {
         addNotice({
-          tone: result.outcome === 'error' ? 'error' : 'info',
-          title: result.outcome === 'error' ? 'Response failed' : 'Response cancelled',
+          tone: effectiveOutcome === 'error' ? 'error' : 'info',
+          title: effectiveOutcome === 'error' ? 'Response failed' : 'Response cancelled',
           message:
-            result.outcome === 'error'
-              ? result.errorMessage ?? active.error ?? 'The response could not be completed. Try again.'
+            effectiveOutcome === 'error'
+              ? result.outcome === 'completed'
+                ? 'The completed response could not be synchronized. Try again.'
+                : result.errorMessage ?? active.error ?? 'The response could not be completed. Try again.'
               : 'The response was cancelled.',
         })
-      } else if (active.text.trim().length === 0) {
+      } else if (terminalText.trim().length === 0) {
         addNotice({
           tone: 'info',
           title: 'No response',
           message: 'No response was returned. Try again.',
         })
-      } else if (active.tts && ttsEnabledRef.current && !active.corrected && !active.ttsFirstLineSpoken) {
-        void synthesizeAndPlayAssistantReply(active.text)
+      } else if (
+        appActiveRef.current &&
+        active.tts &&
+        ttsEnabledRef.current &&
+        !(active.corrected && snapshotHydrationStateRef.current !== 'succeeded') &&
+        !active.ttsFirstLineSpoken
+      ) {
+        void synthesizeAndPlayAssistantReply(terminalText)
       }
-    } catch (error) {
-      const message =
-        error instanceof Error
-          ? error.message
-          : typeof error === 'string' && error.trim().length > 0
-            ? error
-            : 'Prompt execution failed'
-
-      const active = promptRef.current
-      if (active === null || active.id !== requestId) {
-        return
+      if (
+        commandRejected &&
+        snapshotHydrationStateRef.current !== 'succeeded' &&
+        promptRuntimeActivityRevision === runtimeActivityRevisionRef.current
+      ) {
+        applyTransition(executingStatus, 'fail')
       }
-      active.terminal = true
-      active.stages = active.stages.map((stage) =>
-        stage.status === 'running' || stage.status === 'queued'
-          ? { ...stage, status: 'failed', detail: message }
-          : stage,
-      )
-      promptRef.current = null
-      setMessages((current) => current
-        .map((chatMessage) => chatMessage.id === active.assistantId
-          ? { ...chatMessage, answerStage: { stages: active.stages, priorVersions: active.priorVersions, sources: active.sources } }
-          : chatMessage)
-        .filter((chatMessage) =>
-          chatMessage.id !== active.assistantId || chatMessage.content.trim().length > 0,
-        ))
-      applyTransition(executingStatus, 'fail')
-      addNotice({
-        tone: 'error',
-        title: 'Response failed',
-        message,
-      })
-      recordRuntimeDiagnostic('execution', `Execution error: ${message}`)
-      setPromptState('idle')
-      setPromptActivity(null)
     }
   }
 
@@ -1541,6 +2218,7 @@ function App() {
     telemetryFrameId: string | null = null,
     heardSpeech = true,
   ): Promise<void> => {
+    if (!voiceSnapshotControlsUsableNow()) return
     voiceTelemetry.record('silence_detected')
     if (heardSpeech) {
       voiceTelemetry.record('cue_play_requested', {
@@ -1559,7 +2237,7 @@ function App() {
         .catch((error: unknown) => reportCuePlaybackError('stop_listening', error))
     }
 
-    if (liveAudioSessionId !== liveAudioSessionIdRef.current) return
+    if (liveAudioSessionId !== liveAudioSessionIdRef.current || !voiceSnapshotControlsUsableNow()) return
 
     voiceTelemetry.record('mark_silence_submitted')
     const runtimePhase = await syncRuntimeControl(
@@ -1576,7 +2254,7 @@ function App() {
           },
     )
 
-    if (liveAudioSessionId !== liveAudioSessionIdRef.current) return
+    if (liveAudioSessionId !== liveAudioSessionIdRef.current || !voiceSnapshotControlsUsableNow()) return
     voiceTelemetry.record('mark_silence_resolved')
     clearPartialTranscript()
     maybeRunVoiceTranscript(runtimePhase)
@@ -1623,7 +2301,7 @@ function App() {
   }
 
   const startMic = async (): Promise<void> => {
-    if (updateRuntimeBlocked || !voiceInputReady(startupStateRef.current) || liveAudioSourceRef.current !== null || micStarting || micStartInFlightRef.current) {
+    if (updateRuntimeBlocked || resetPendingRef.current || !voiceSnapshotControlsUsableNow() || !voiceInputReady(startupStateRef.current) || liveAudioSourceRef.current !== null || micStarting || micStartInFlightRef.current) {
       return
     }
     micStartInFlightRef.current = true
@@ -1644,10 +2322,15 @@ function App() {
           ? {}
           : { deviceId: audioInputDeviceIdRef.current }),
         onFrame: async (frame) => {
-          if (liveAudioSessionId !== liveAudioSessionIdRef.current) {
+          if (
+            liveAudioSessionId !== liveAudioSessionIdRef.current ||
+            !voiceSnapshotControlsUsableNow() ||
+            !voiceInputReady(startupStateRef.current)
+          ) {
             return
           }
 
+          runtimeActivityRevisionRef.current += 1
           liveAudioInFlightFramesRef.current += 1
 
           try {
@@ -1681,7 +2364,7 @@ function App() {
                 })
               }
             }
-            if (liveAudioSessionId !== liveAudioSessionIdRef.current) {
+            if (liveAudioSessionId !== liveAudioSessionIdRef.current || !voiceSnapshotControlsUsableNow() || !voiceInputReady(startupStateRef.current)) {
               wakeClipBuffer.clear()
               return
             }
@@ -1726,7 +2409,11 @@ function App() {
               }
             }
           } catch (error) {
-            if (liveAudioSessionId !== liveAudioSessionIdRef.current) {
+            if (
+              liveAudioSessionId !== liveAudioSessionIdRef.current ||
+              !voiceSnapshotControlsUsableNow() ||
+              !voiceInputReady(startupStateRef.current)
+            ) {
               return
             }
 
@@ -1753,9 +2440,14 @@ function App() {
         },
       })
 
-      if (!appActiveRef.current || liveAudioSessionId !== liveAudioSessionIdRef.current) {
+      if (
+        !appActiveRef.current ||
+        liveAudioSessionId !== liveAudioSessionIdRef.current ||
+        !voiceSnapshotControlsUsableNow() ||
+        (startupStateRef.current.kind === 'ready' && !voiceInputReady(startupStateRef.current))
+      ) {
         liveAudioSource.stop()
-        if (appActiveRef.current && voiceInputReady(startupStateRef.current)) {
+        if (appActiveRef.current && voiceSnapshotControlsUsableNow() && voiceInputReady(startupStateRef.current)) {
           micAutoStartedRef.current = false
           queueMicrotask(() => void startMic())
         }
@@ -1776,7 +2468,7 @@ function App() {
       ])
     } catch (error) {
       if (!appActiveRef.current || liveAudioSessionId !== liveAudioSessionIdRef.current) {
-        if (appActiveRef.current && voiceInputReady(startupStateRef.current)) {
+        if (appActiveRef.current && voiceSnapshotControlsUsableNow() && voiceInputReady(startupStateRef.current)) {
           micAutoStartedRef.current = false
           queueMicrotask(() => void startMic())
         }
@@ -1815,6 +2507,36 @@ function App() {
     }
   }
 
+  const refreshSnapshotControlsAfterProfileTransition = async (profile: ResponseProfile): Promise<boolean> => {
+    if (snapshotHydrationStateRef.current !== 'succeeded') return true
+    const hydrationRevision = ++snapshotControlRequestRevisionRef.current
+    const snapshotPreferenceRevision = getAndroidPreferencePublicationRevision()
+    snapshotControlsFreshRef.current = false
+    setSnapshotControlsFresh(false)
+    snapshotControlsInvalidatedRef.current = true
+    setSnapshotControlsInvalidated(true)
+    try {
+      const snapshot = await loadAppSnapshot()
+      if (
+        !appActiveRef.current ||
+        !isSwitchingResponseProfileRef.current ||
+        resetPendingRef.current ||
+        hydrationRevision !== snapshotControlRequestRevisionRef.current ||
+        snapshot.preferences.responseProfile !== profile
+      ) {
+        return false
+      }
+      return adoptSnapshotControls(snapshot, hydrationRevision, snapshotPreferenceRevision)
+    } catch (error) {
+      addNotice({
+        tone: 'error',
+        title: 'Profile state unavailable',
+        message: toDisplayErrorMessage(error),
+      })
+      return false
+    }
+  }
+
   const switchResponseProfile = async (profile: ResponseProfile): Promise<boolean> => {
     if (startupStateRef.current.kind !== 'ready') {
       return false
@@ -1827,7 +2549,11 @@ function App() {
     const currentState = startupStateRef.current
 
     const profileInstant = profile === 'fast' ? 'local-fast' : 'local-quality'
-    if (currentState.selectedResponseProfile === profile && !localInstantCanRetry(currentState, profileInstant)) {
+    if (
+      snapshotControlsFreshRef.current &&
+      currentState.selectedResponseProfile === profile &&
+      !localInstantCanRetry(currentState, profileInstant)
+    ) {
       return true
     }
 
@@ -1898,8 +2624,7 @@ function App() {
 
     startupStateRef.current = warmingState
     setStartupState(warmingState)
-    runtimeStatusRef.current = 'initializing'
-    setRuntimeStatus('initializing')
+    applyRuntimeStatus('initializing')
 
     try {
        await invokeTauriCommand('switch_response_profile', { profile })
@@ -1913,7 +2638,6 @@ function App() {
         const message = requestedCapability?.reason ?? `The ${getResponseProfileLabel(profile)} profile could not be started.`
         addNotice({ tone: 'error', title: 'Profile switch failed', message })
         recordRuntimeDiagnostic('profile', `Response profile switch error: ${message}`)
-        applyStartupState(currentState)
         return false
       }
       if (settled.kind === 'error') {
@@ -1921,6 +2645,11 @@ function App() {
       }
       if (settled.kind !== 'ready' || settled.selectedResponseProfile !== profile) {
         applyStartupState(currentState)
+        return false
+      }
+      if (!await refreshSnapshotControlsAfterProfileTransition(profile)) {
+        micAutoStartedRef.current = false
+        stopLiveAudio()
         return false
       }
       return settled.kind === 'ready' && settled.selectedResponseProfile === profile
@@ -1961,7 +2690,10 @@ function App() {
 
   const toggleTts = async (enabled: boolean): Promise<void> => {
     const revision = ++ttsWriteRevisionRef.current
-    const previousEnabled = ttsEnabled
+    ttsPendingRevisionRef.current = revision
+    const previousEnabled = ttsEnabledRef.current
+    ttsEnabledRef.current = enabled
+    setTtsEnabled(enabled)
     if (!enabled) cancelTts()
 
     try {
@@ -1970,26 +2702,32 @@ function App() {
       )
       ttsWriteChainRef.current = write.then(() => undefined, () => undefined)
       const payload = await write
-
-      if (revision !== ttsWriteRevisionRef.current) return
-      if (
+      const persistedEnabled =
         typeof payload === 'object' &&
         payload !== null &&
         'enabled' in payload &&
         typeof payload.enabled === 'boolean'
-      ) {
-        ttsEnabledRef.current = payload.enabled
-        setTtsEnabled(payload.enabled)
-      } else {
-        ttsEnabledRef.current = enabled
-        setTtsEnabled(enabled)
+          ? payload.enabled
+          : enabled
+      ttsPersistedRevisionRef.current = revision
+      ttsPersistedValueRef.current = persistedEnabled
+      ttsPersistedInitializedRef.current = true
+      if (revision !== ttsWriteRevisionRef.current) return
+      if (revision === ttsWriteRevisionRef.current) {
+        ttsPendingRevisionRef.current = null
+        ttsEnabledRef.current = ttsPersistedValueRef.current
+        setTtsEnabled(ttsPersistedValueRef.current)
       }
     } catch (error) {
       if (revision !== ttsWriteRevisionRef.current) return
       const message = toDisplayErrorMessage(error)
 
-      ttsEnabledRef.current = previousEnabled
-      setTtsEnabled(previousEnabled)
+      ttsPendingRevisionRef.current = null
+      const rollbackEnabled = ttsPersistedInitializedRef.current
+        ? ttsPersistedValueRef.current
+        : initialSnapshotPreferencesRef.current?.ttsEnabled ?? previousEnabled
+      ttsEnabledRef.current = rollbackEnabled
+      setTtsEnabled(rollbackEnabled)
       addNotice({
         tone: 'error',
         title: 'TTS setting failed',
@@ -2000,9 +2738,20 @@ function App() {
   }
 
   useEffect(() => {
+    if (!voiceSnapshotControlsUsable) {
+      micAutoStartedRef.current = false
+      if (micActive || micStarting || micStartInFlightRef.current) stopLiveAudio()
+      return
+    }
+    if (startupState.kind === 'ready' && !voiceInputReady(startupState)) {
+      micAutoStartedRef.current = false
+      if (micActive || micStarting || micStartInFlightRef.current) stopLiveAudio()
+      return
+    }
+    if (!voiceInputReady(startupState)) return
     if (
-      startupState.kind !== 'ready' ||
-      !voiceInputReady(startupState) ||
+      resetPending ||
+      resetPendingRef.current ||
       micActive ||
       micStarting ||
       micAutoStartedRef.current
@@ -2013,7 +2762,7 @@ function App() {
     micAutoStartedRef.current = true
     void startMic()
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [micActive, micStarting, startupState, updateRuntimeBlocked])
+  }, [micActive, micStarting, resetPending, startupState, voiceSnapshotControlsUsable, updateRuntimeBlocked])
 
   const sendPrompt = async (): Promise<void> => {
     if (updateRuntimeBlocked || startupState.kind !== 'ready' || selectedInstantOption?.available !== true || assistantSettingsPending || isSwitchingResponseProfileRef.current || resetPendingRef.current || promptState !== 'idle' || runtimeStatusRef.current !== 'sleeping') {
@@ -2035,6 +2784,9 @@ function App() {
   const onComposerKeyDown = (
     event: KeyboardEvent<HTMLTextAreaElement>,
   ): void => {
+    if (event.nativeEvent.isComposing) {
+      return
+    }
     if (!shouldSubmitComposer(event.key, event.shiftKey)) {
       return
     }
@@ -2050,8 +2802,8 @@ function App() {
     clearCompletionDisplay()
   }
 
-  const selectedDeepOption = deepOptions(assistantCapabilities).find((option) => option.value === assistantSettings.deep)
-  const selectedReviewOption = reviewOptions(assistantCapabilities).find((option) => option.value === assistantSettings.review)
+  const selectedDeepOption = deepAssistantOptions.find((option) => option.value === assistantSettings.deep)
+  const selectedReviewOption = reviewAssistantOptions.find((option) => option.value === assistantSettings.review)
   const canEnableDeep = selectedDeepOption?.available === true
   const canEnableReview = selectedReviewOption?.available === true
 
@@ -2094,10 +2846,44 @@ function App() {
   const resetSession = async (): Promise<void> => {
     if (resetPendingRef.current) return
     resetPendingRef.current = true
+    const transcriptRevision = ++transcriptRevisionRef.current
     setResetPending(true)
+    if (liveAudioSourceRef.current !== null || micStarting || micStartInFlightRef.current) {
+      micAutoStartedRef.current = false
+    }
     stopLiveAudio()
+    const resetRuntimeActivityRevision = runtimeActivityRevisionRef.current
     const activePrompt = promptRef.current
+    cancelTts()
+    clearPartialTranscript()
+    clearCompletion()
+    setResponseAnnouncement('')
+
+    if (getTauriInternals() === null) {
+      if (activePrompt !== null) {
+        cancelPromptProjectionFrame(activePrompt)
+        activePrompt.terminal = true
+      }
+      promptRef.current = null
+      canonicalTranscriptRef.current = []
+      setMessages((current) => replaceCommittedTranscript(current, []))
+      setPromptActivity(null)
+      setPromptState('idle')
+      if (resetRuntimeActivityRevision === runtimeActivityRevisionRef.current) {
+        applyRuntimeStatus('sleeping')
+      }
+      resetPendingRef.current = false
+      setResetPending(false)
+      return
+    }
+
+    snapshotControlsFreshRef.current = false
+    setSnapshotControlsFresh(false)
+    snapshotControlsInvalidatedRef.current = true
+    setSnapshotControlsInvalidated(true)
+
     if (activePrompt !== null && !activePrompt.terminal) {
+      cancelPromptProjectionFrame(activePrompt)
       activePrompt.terminal = true
       setPromptState('stopping')
       try {
@@ -2105,22 +2891,96 @@ function App() {
       } catch {
         // reset_session remains authoritative for backend prompt settlement.
       }
+      if (!appActiveRef.current) return
     }
-    promptRef.current = null
-    cancelTts()
-    clearPartialTranscript()
-    clearCompletion()
     try {
       await waitForInFlightLiveAudioFrames()
+      if (!appActiveRef.current) return
       await invokeTauriCommand('reset_session')
-      setMessages(getInitialMessages())
+      if (!appActiveRef.current) return
+      promptRef.current = null
+      canonicalTranscriptRef.current = []
+      setMessages((current) => replaceCommittedTranscript(current, []))
+      setPromptActivity('Recovering session state…')
+      setPromptState('reconciling')
+      let resetSnapshot: AppSnapshot | null = null
+      const snapshotControlRevision = ++snapshotControlRequestRevisionRef.current
+      const snapshotPreferenceRevision = getAndroidPreferencePublicationRevision()
+      for (let attempt = 0; attempt < 3 && resetSnapshot === null; attempt += 1) {
+        if (!appActiveRef.current || transcriptRevision !== transcriptRevisionRef.current) return
+        try {
+          resetSnapshot = await loadAppSnapshot()
+        } catch {
+          if (attempt < 2) await new Promise((resolve) => window.setTimeout(resolve, 250 * (attempt + 1)))
+        }
+      }
+      if (resetSnapshot === null) {
+        setPromptActivity('Session recovery required. Use New Chat to retry.')
+        setPromptState('reconciling')
+        return
+      }
+      if (appActiveRef.current && transcriptRevision === transcriptRevisionRef.current) {
+        snapshotHydrationStateRef.current = 'succeeded'
+        setSnapshotHydrationState('succeeded')
+        canonicalTranscriptRef.current = resetSnapshot.transcript
+        snapshotSessionIdRef.current = resetSnapshot.sessionId
+        adoptSnapshotControls(resetSnapshot, snapshotControlRevision, snapshotPreferenceRevision)
+        setMessages((current) => replaceCommittedTranscript(current, resetSnapshot.transcript))
+      }
+      if (!appActiveRef.current) return
       setPromptActivity(null)
       setPromptState('idle')
-      applyRuntimeStatus('sleeping')
+      if (resetRuntimeActivityRevision === runtimeActivityRevisionRef.current) {
+        applyRuntimeStatus(toRuntimeStatus(resetSnapshot?.runtimePhase ?? 'sleeping'))
+      }
     } catch (error) {
-      setPromptActivity(null)
-      setPromptState('idle')
-      addNotice({ tone: 'error', title: 'Reset failed', message: toDisplayErrorMessage(error) })
+      addNotice({ tone: 'error', title: 'New chat failed', message: toDisplayErrorMessage(error) })
+      setPromptActivity('Recovering session state…')
+      let snapshot: AppSnapshot | null = null
+      let recoveryRuntimeActivityRevision: number | null = null
+      const snapshotControlRevision = ++snapshotControlRequestRevisionRef.current
+      const snapshotPreferenceRevision = getAndroidPreferencePublicationRevision()
+      for (let attempt = 0; attempt < 3 && snapshot === null; attempt += 1) {
+        if (!appActiveRef.current || !resetPendingRef.current || transcriptRevision !== transcriptRevisionRef.current) break
+        try {
+          const runtimeActivityRevision = runtimeActivityRevisionRef.current
+          snapshot = await loadAppSnapshot()
+          recoveryRuntimeActivityRevision = runtimeActivityRevision
+        } catch {
+          if (attempt < 2) await new Promise((resolve) => window.setTimeout(resolve, 250 * (attempt + 1)))
+        }
+      }
+      if (snapshot !== null && appActiveRef.current && transcriptRevision === transcriptRevisionRef.current) {
+        promptRef.current = null
+        snapshotHydrationStateRef.current = 'succeeded'
+        setSnapshotHydrationState('succeeded')
+        canonicalTranscriptRef.current = snapshot.transcript
+        snapshotSessionIdRef.current = snapshot.sessionId
+        adoptSnapshotControls(snapshot, snapshotControlRevision, snapshotPreferenceRevision)
+        const activeRequestMessage: ChatMessage[] = snapshot.activeRequest === null ? [] : [{
+          id: `recovered-user-${snapshot.activeRequest.executionId.sessionId}-${snapshot.activeRequest.executionId.generation}`,
+          role: 'user',
+          content: snapshot.activeRequest.prompt,
+        }]
+        setMessages((current) => [
+          ...replaceCommittedTranscript(current, snapshot.transcript),
+          ...activeRequestMessage,
+        ])
+        if (snapshot.activeRequest === null) {
+          if (recoveryRuntimeActivityRevision === runtimeActivityRevisionRef.current) {
+            applyRuntimeStatus(toRuntimeStatus(snapshot.runtimePhase))
+          }
+          setPromptActivity(null)
+          setPromptState('idle')
+        } else {
+          setPromptState('stopping')
+          setPromptActivity('Recovering interrupted response…')
+          await recoverOrphanedRequest(snapshot, transcriptRevision, () => resetPendingRef.current)
+        }
+      } else if (appActiveRef.current && transcriptRevision === transcriptRevisionRef.current) {
+        setPromptActivity('Session recovery required. Use New Chat to retry.')
+        setPromptState('reconciling')
+      }
     } finally {
       resetPendingRef.current = false
       setResetPending(false)
@@ -2155,40 +3015,103 @@ function App() {
   }
 
   return (
-    <div className="shell" data-ui-text-size={uiTextSize} data-ui-theme={uiTheme} style={customFailure ? { gridTemplateRows: 'auto 1fr auto' } : undefined}>
+    <div className="shell" data-ui-text-size={uiTextSize} data-ui-theme={uiTheme} data-runtime-status={runtimeStatus}>
 
-      {customFailure ? <div role="alert" style={{ padding: '.65rem 1rem', background: 'var(--danger-bg)', color: '#fff' }}>
-        Custom connection: {customFailure.reason}{' '}
-        <button type="button" aria-label="Retry Custom" disabled={customRetryPending} onClick={() => void retryCustom()}>Retry Custom</button>
-      </div> : null}
+      <header className="shell__header" aria-label="VoxGolem">
+        <div className="shell__identity" data-shell-identity>
+          <strong>VoxGolem</strong>
+          {isBrowserPreviewRuntime() ? <span data-browser-preview>Browser preview</span> : null}
+          <span data-runtime-phase>Runtime: {runtimeStatus}</span>
+        </div>
+        <div className="shell__header-actions">
+            <button type="button" className="shell__control shell__new-chat" onClick={() => void resetSession()} aria-label="New Chat" disabled={resetPending || updateRuntimeBlocked}>
+            {resetPending ? 'Starting new chat...' : 'New Chat'}
+          </button>
+          <button
+            type="button"
+            className="shell__control shell__theme-button"
+            onClick={toggleUiTheme}
+            aria-label={themeToggleLabel}
+            title={themeToggleLabel}
+          >
+            {uiTheme === 'dark' ? '☀' : '☾'}
+          </button>
+          <button
+            ref={settingsButtonRef}
+            type="button"
+            className="shell__control shell__settings-button"
+            onClick={openSettings}
+            aria-label="Settings"
+            aria-haspopup="dialog"
+            aria-controls={SETTINGS_DIALOG_ID}
+            aria-expanded={settingsOpen}
+            title="Settings"
+          >
+            ⚙
+          </button>
+        </div>
+      </header>
 
-      <main ref={conversationRef} className="conversation" aria-live="polite">
-        {visibleMessages.map((message) => (
-          message.answerStage && message.role === 'assistant' ? (
-            message.customDirectTimings ? (
-              <div key={message.id} style={{ maxWidth: 'min(42rem, 100%)' }}>
-                <AnswerStage answer={message.content} className="message message--assistant" {...message.answerStage} />
-                <small style={{ display: 'block', marginTop: '.35rem', color: 'var(--text-muted)' }}>
-                  First text: {formatDirectDuration(message.customDirectTimings.firstTextMs)} · Completed: {formatDirectDuration(message.customDirectTimings.completedMs)}
-                </small>
+      <div className="conversation-region">
+        {customFailure ? <div role="alert" className="shell__error">
+          Custom connection: {customFailure.reason}{' '}
+          {supportsDesktopRuntime ? <button type="button" aria-label="Retry Custom" disabled={customRetryPending || updateRuntimeBlocked} onClick={() => void retryCustom()}>Retry Custom</button> : null}
+        </div> : null}
+        <main
+          ref={conversationRef}
+          className="conversation"
+          onScroll={onConversationScroll}
+          onWheel={interruptJumpToLatest}
+          onTouchStart={interruptJumpToLatest}
+          onPointerDown={interruptJumpToLatest}
+        >
+          {visibleMessages.map((message) => (
+            message.answerStage && message.role === 'assistant' ? (
+              <div key={message.id} className="conversation__answer">
+                <AnswerStage answer={message.content} className="message message--assistant" {...(message.contentKind === undefined ? {} : { contentKind: message.contentKind })} {...message.answerStage} />
+                {message.customDirectTimings ? <small className="conversation__timings">First text: {formatDirectDuration(message.customDirectTimings.firstTextMs)} · Completed: {formatDirectDuration(message.customDirectTimings.completedMs)}</small> : null}
               </div>
-            ) : <AnswerStage key={message.id} answer={message.content} className="message message--assistant" {...message.answerStage} />
-          ) : <ChatBubble key={message.id} message={message} />
-        ))}
-      </main>
+            ) : <ChatBubble key={message.id} message={message} />
+          ))}
+        </main>
 
-      <UserNoticeToast notice={notices[0] ?? null} />
+        <div
+          className="conversation-notice"
+          onFocus={() => setNoticeInteraction((current) => ({ ...current, focused: true }))}
+          onBlur={(event) => {
+            if (!event.currentTarget.contains(event.relatedTarget)) {
+              setNoticeInteraction((current) => ({ ...current, focused: false }))
+            }
+          }}
+          onMouseEnter={() => setNoticeInteraction((current) => ({ ...current, hovered: true }))}
+          onMouseLeave={() => setNoticeInteraction((current) => ({ ...current, hovered: false }))}
+        >
+          <UserNoticeToast notice={notices[0] ?? null} />
+        </div>
+        {showJumpToLatest ? (
+          <button type="button" className="conversation__jump" aria-label="Jump to latest" onClick={jumpToLatest}>
+            Jump to latest
+          </button>
+        ) : null}
+      </div>
+
+      <div className="status-announcer">
+        <div className="sr-only" role="status" aria-live="polite" aria-atomic="true" aria-label="Response announcements">
+          {responseAnnouncement}
+        </div>
+      </div>
 
       {settingsOpen ? (
         <div
           className="settings-overlay"
-          onMouseDown={closeSettings}
+          onMouseDown={() => closeSettings()}
           onKeyDown={onSettingsKeyDown}
         >
           <section
             ref={settingsPanelRef}
             className="settings-panel"
             role="dialog"
+            id={SETTINGS_DIALOG_ID}
             aria-modal="true"
             aria-labelledby="settings-title"
             onMouseDown={(event) => event.stopPropagation()}
@@ -2202,13 +3125,12 @@ function App() {
                 ref={settingsCloseButtonRef}
                 type="button"
                 className="settings-panel__close"
-                onClick={closeSettings}
+                onClick={() => closeSettings()}
                 aria-label="Close settings"
               >
                 ×
               </button>
             </div>
-            <button type="button" className="shell__control" onClick={() => void resetSession()} aria-label="Reset Session" disabled={resetPending || updateRuntimeBlocked}>{resetPending ? 'Resetting...' : 'Reset Session'}</button>
             <div className="settings-panel__row">
               <div>
                 <strong>Text size</strong>
@@ -2217,7 +3139,7 @@ function App() {
               <div className="settings-panel__stepper" aria-label="Text size controls">
                 <button
                   type="button"
-                  className="settings-panel__step-button"
+                  className="settings-panel__step-button settings-panel__interactive"
                   onClick={() => adjustUiTextSize(-1)}
                   disabled={!canDecreaseTextSize}
                   aria-label="Decrease text size"
@@ -2229,7 +3151,7 @@ function App() {
                 </span>
                 <button
                   type="button"
-                  className="settings-panel__step-button"
+                  className="settings-panel__step-button settings-panel__interactive"
                   onClick={() => adjustUiTextSize(1)}
                   disabled={!canIncreaseTextSize}
                   aria-label="Increase text size"
@@ -2238,12 +3160,13 @@ function App() {
                 </button>
               </div>
             </div>
-            <div className="settings-panel__row settings-panel__mic-row">
+            {supportsDesktopRuntime ? <div className="settings-panel__row settings-panel__mic-row">
               <div>
                 <label htmlFor="audioInputDevice"><strong>Microphone</strong></label>
                 <p className="settings-panel__hint">Choose the input used for wake-word listening.</p>
               </div>
-              <select
+               <select
+                 className="settings-panel__interactive"
                 id="audioInputDevice"
                 aria-label="Microphone"
                 title={selectedAudioInputDevice?.label ?? ''}
@@ -2252,50 +3175,85 @@ function App() {
                 onChange={(event) => changeAudioInputDevice(event.target.value)}
               >
                 <option value="">System selected microphone</option>
-                {audioInputDevices.map((device) => (
+               {audioInputDevices.map((device) => (
                   <option key={device.deviceId} value={device.deviceId}>{device.label}</option>
                 ))}
               </select>
               {selectedAudioInputDevice && (
                 <p className="settings-panel__hint settings-panel__mic-name">{selectedAudioInputDevice.label}</p>
               )}
+           </div> : null}
+            <div className="settings-panel__row">
+              <div>
+                <strong>Voice input</strong>
+                <p className="settings-panel__hint">Stop listening automatically after silence.</p>
+              </div>
+               <label className="shell__toggle settings-panel__interactive">
+                <input
+                  type="checkbox"
+                  checked={autoStopOnSilence}
+                  onChange={(event) => setAutoStopOnSilence(event.target.checked)}
+                  disabled={!voiceInputReady(startupState) || updateRuntimeBlocked}
+                  aria-describedby={!voiceInputReady(startupState) ? 'voice-input-help' : undefined}
+                />
+                <span>Auto Stop</span>
+              </label>
+              {!voiceInputReady(startupState) ? <span id="voice-input-help" className="sr-only">{voiceInputUnavailableReason}</span> : null}
+            </div>
+            <div className="settings-panel__row">
+              <div>
+                <strong>Speech output</strong>
+                <p className="settings-panel__hint">Read assistant responses aloud.</p>
+              </div>
+               <label className="shell__toggle settings-panel__interactive">
+                <input
+                  id="tts-toggle"
+                  type="checkbox"
+                  checked={ttsEnabled}
+                  disabled={!canToggleTts}
+                  onChange={(event) => { void toggleTts(event.target.checked) }}
+                />
+                <span>TTS</span>
+              </label>
             </div>
             <div className="settings-panel__assistant">
-              <label><strong>Instant</strong><select id="assistantInstantSelect" aria-label="Instant" value={assistantSettings.instant} disabled={assistantControlsDisabled} onChange={(event) => void changeInstant(event.target.value as AssistantSettings['instant'])}>
-                {instantOptions(assistantCapabilities).map((option) => <option key={option.value} value={option.value} disabled={!option.available && !localInstantCanRetry(startupState, option.value)} title={option.reason}>{option.label}{option.available ? '' : ` — ${option.reason}`}</option>)}
+               <label className="settings-panel__interactive"><strong>Instant</strong><select id="assistantInstantSelect" aria-label="Instant" value={assistantSettings.instant} disabled={assistantControlsDisabled} onChange={(event) => void changeInstant(event.target.value as AssistantSettings['instant'])}>
+                {instantAssistantOptions.map((option) => <option key={option.value} value={option.value} disabled={!option.available && !localInstantCanRetry(startupState, option.value)} title={option.reason}>{option.label}{option.available ? '' : ` — ${option.reason}`}</option>)}
               </select></label>
               {startupState.kind === 'ready' && !assistantCapabilities.custom ? (
                 <p className="settings-panel__hint">Custom connection: {startupState.capabilities.find((capability) => capability.id === 'custom_provider')?.reason ?? 'unavailable'}</p>
               ) : null}
-              {selectedInstantRetryable ? <button type="button" aria-label="Retry local profile" onClick={() => void changeInstant(assistantSettings.instant)}>Retry local profile</button> : null}
-              <label><strong>Deep model</strong><select aria-label="Deep model" value={assistantSettings.deep} disabled={assistantControlsDisabled} onChange={(event) => {
+               {selectedInstantRetryable ? <button className="settings-panel__interactive" type="button" aria-label="Retry local profile" onClick={() => void changeInstant(assistantSettings.instant)}>Retry local profile</button> : null}
+               <label className="settings-panel__interactive"><strong>Deep model</strong><select aria-label="Deep model" value={assistantSettings.deep} disabled={assistantControlsDisabled} onChange={(event) => {
                 const value = event.target.value as AssistantSettings['deep']
-                if (deepOptions(assistantCapabilities).find((option) => option.value === value)?.available) {
+                if (deepAssistantOptions.find((option) => option.value === value)?.available) {
                   void persistAssistantSettings({ ...assistantSettingsRef.current, deep: value })
                 }
               }}>
-                {deepOptions(assistantCapabilities).map((option) => <option key={option.value} value={option.value} disabled={!option.available} title={option.reason}>{option.label}</option>)}
-              </select></label>
-              <label><strong>Review model</strong><select aria-label="Review model" value={assistantSettings.review} disabled={assistantControlsDisabled} onChange={(event) => {
+                {deepAssistantOptions.map((option) => <option key={option.value} value={option.value} disabled={!option.available} title={option.reason}>{option.label}</option>)}
+               </select></label>
+               <label className="settings-panel__interactive"><strong>Review model</strong><select aria-label="Review model" value={assistantSettings.review} disabled={assistantControlsDisabled} onChange={(event) => {
                 const value = event.target.value as AssistantSettings['review']
-                if (reviewOptions(assistantCapabilities).find((option) => option.value === value)?.available) {
+                if (reviewAssistantOptions.find((option) => option.value === value)?.available) {
                   void persistAssistantSettings({ ...assistantSettingsRef.current, review: value })
                 }
               }}>
-                {reviewOptions(assistantCapabilities).map((option) => <option key={option.value} value={option.value} disabled={!option.available} title={option.reason}>{option.label}</option>)}
+                {reviewAssistantOptions.map((option) => <option key={option.value} value={option.value} disabled={!option.available} title={option.reason}>{option.label}</option>)}
               </select></label>
-              <label><input type="checkbox" checked={assistantSettings.deepEnabled} disabled={assistantControlsDisabled || (!assistantSettings.deepEnabled && !canEnableDeep)} onChange={(event) => void persistAssistantSettings({ ...assistantSettingsRef.current, deepEnabled: event.target.checked })} /> Deep</label>
-              <label><input type="checkbox" checked={assistantSettings.reviewEnabled} disabled={assistantControlsDisabled || (!assistantSettings.reviewEnabled && !canEnableReview)} onChange={(event) => void persistAssistantSettings({ ...assistantSettingsRef.current, reviewEnabled: event.target.checked })} /> Review</label>
-              <label><input type="checkbox" checked={assistantSettings.completion} disabled={assistantControlsDisabled} onChange={(event) => {
+               <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.deepEnabled} disabled={assistantControlsDisabled || (!assistantSettings.deepEnabled && !canEnableDeep)} onChange={(event) => void persistAssistantSettings({ ...assistantSettingsRef.current, deepEnabled: event.target.checked })} /> Deep</label>
+               <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.reviewEnabled} disabled={assistantControlsDisabled || (!assistantSettings.reviewEnabled && !canEnableReview)} onChange={(event) => void persistAssistantSettings({ ...assistantSettingsRef.current, reviewEnabled: event.target.checked })} /> Review</label>
+               <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.completion} disabled={assistantControlsDisabled || (!assistantSettings.completion && !assistantCapabilities.qwenPrediction)} onChange={(event) => {
                 if (!event.target.checked) clearCompletion()
                 void persistAssistantSettings({ ...assistantSettingsRef.current, completion: event.target.checked })
-              }} /> Completion</label>
-              <label><input type="checkbox" checked={assistantSettings.prefetch} disabled={assistantControlsDisabled} onChange={(event) => void persistAssistantSettings({ ...assistantSettingsRef.current, prefetch: event.target.checked })} /> Prefetch</label>
+               }} /> Completion</label>
+               <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.prefetch} disabled={assistantControlsDisabled} onChange={(event) => void persistAssistantSettings({ ...assistantSettingsRef.current, prefetch: event.target.checked })} /> Prefetch</label>
               <p className="settings-panel__hint">Prefetch may transmit unaccepted predicted text when enabled.</p>
             </div>
             <UpdateSettings updates={appUpdates} installationDisabled={updateInstallationDisabled} />
-            <WakeDiagnostics disabled={!voiceInputReady(startupState) || updateRuntimeBlocked} />
-            <WakeClipSettings />
+            {!isAndroidRuntime && !isBrowserPreviewRuntime() ? <>
+              <WakeDiagnostics disabled={!voiceInputReady(startupState) || updateRuntimeBlocked} />
+              <WakeClipSettings />
+            </> : null}
           </section>
         </div>
       ) : null}
@@ -2305,10 +3263,11 @@ function App() {
           id="promptComposer"
           className="composer__input"
           aria-label="Prompt"
-          value={composerValue}
+           value={composerValue}
+           typographyRevision={uiTextSize}
           partialTranscript={partialTranscript}
           ghostSuffix={typedCompletionSuffix}
-           onChange={(event) => {
+          onChange={(event) => {
              const nextValue = event.target.value
              setComposerValue(nextValue)
              setTypedCompletionSuffix('')
@@ -2327,14 +3286,15 @@ function App() {
               } else {
                 latestTypedCompletionRef.current = null
               }
-           }}
+          }}
           onKeyDown={onComposerKeyDown}
           onAcceptCompletion={acceptTypedCompletion}
-            onDismissCompletion={() => { clearCompletion() }}
+          onDismissCompletion={() => { clearCompletion() }}
            partialCompletionSuffix={voiceCompletionSuffix}
-          placeholder="Type a prompt..."
-          rows={3}
-        />
+           placeholder="Type a prompt..."
+           rows={2}
+           maxRows={4}
+         />
         {startupState.kind === 'error' ? (
           <p className="shell__error">Startup error: {startupState.message}</p>
         ) : null}
@@ -2356,46 +3316,15 @@ function App() {
         {startupState.kind === 'warming_model' ? (
           <p className="shell__loading">Model loading: {startupState.message}</p>
         ) : null}
-        <div className="composer__actions">
-          <label className="shell__toggle">
-            <input
-              type="checkbox"
-              checked={autoStopOnSilence}
-              onChange={(event) => setAutoStopOnSilence(event.target.checked)}
-              disabled={!voiceInputReady(startupState) || updateRuntimeBlocked}
-              aria-describedby={!voiceInputReady(startupState) ? 'voice-input-help' : undefined}
-            />
-             <span>Auto Stop</span>
-          </label>
-          <label className="shell__toggle" htmlFor="tts-toggle">
-            <input
-              id="tts-toggle"
-              type="checkbox"
-              checked={ttsEnabled}
-              disabled={!canToggleTts}
-              onChange={(event) => {
-                void toggleTts(event.target.checked)
-              }}
-            />
-            <span>TTS</span>
-          </label>
-          <button
-            type="button"
-            className="shell__control"
-            onClick={toggleMic}
-            disabled={!canToggleMic}
-            aria-describedby={!voiceInputReady(startupState) ? 'voice-input-help' : undefined}
-          >
-            {micStarting ? 'Starting mic...' : micActive ? 'Stop mic' : 'Start mic'}
-          </button>
-          <span className="composer__instant-model" aria-label={`Selected Instant model: ${selectedInstantOption?.label ?? 'Loading'}`}>
-            <strong>Instant:</strong> {selectedInstantOption?.label ?? 'Loading'}
-          </span>
-          {!voiceInputReady(startupState) ? (
-            <span id="voice-input-help" className="sr-only">{voiceInputUnavailableReason}</span>
-          ) : null}
+          <div className="composer__actions">
+           {voiceInputReady(startupState) ? (
+             <button type="button" className="shell__control" onClick={toggleMic} disabled={!canToggleMic}>
+               {micStarting ? 'Starting mic...' : micActive ? 'Stop mic' : 'Start mic'}
+             </button>
+           ) : null}
+            <span className="composer__model composer__instant-model" aria-label={`Selected Instant model: ${selectedInstantOption?.label ?? 'Loading'}`}><strong>Instant:</strong> {selectedInstantOption?.label ?? assistantSettings.instant}</span>
           <div className="composer__send-side">
-            {promptState !== 'idle' &&
+            {(promptState === 'executing' || promptState === 'stopping') &&
             startupState.kind === 'ready' &&
             startupState.promptCancellationAvailable ? (
               <button
@@ -2412,27 +3341,6 @@ function App() {
                 <span className="composer__wake-primary">wake: {(wakeConfidence * 100).toFixed(2)}%</span>
               </div>
             ) : null}
-            <button
-              type="button"
-              className="shell__control shell__theme-button"
-              onClick={toggleUiTheme}
-              aria-label={themeToggleLabel}
-              title={themeToggleLabel}
-            >
-              {uiTheme === 'dark' ? '☀' : '☾'}
-            </button>
-            <button
-              ref={settingsButtonRef}
-              type="button"
-              className="shell__control shell__settings-button"
-               onClick={() => flushSync(() => setSettingsOpen(true))}
-              aria-label="Settings"
-              aria-haspopup="dialog"
-              aria-expanded={settingsOpen}
-              title="Settings"
-            >
-              ⚙
-            </button>
             <button type="submit" className="composer__button" disabled={!canSend}>
               Send
             </button>
@@ -2450,6 +3358,50 @@ function toRuntimeStatus(runtimePhase: BackendRuntimePhase): RuntimeStatus {
 
 function formatDirectDuration(milliseconds: number): string {
   return milliseconds < 1000 ? `${milliseconds} ms` : `${(milliseconds / 1000).toFixed(2)} s`
+}
+
+function formatResponseAnnouncement(kind: 'text' | 'refusal', text: string): string {
+  const boundedText = text.trim().slice(0, 240)
+  if (boundedText.length === 0) return ''
+  return `${kind === 'refusal' ? 'Assistant refusal' : 'Assistant response'}: ${boundedText}`
+}
+
+function projectCommittedTranscript(transcript: readonly Turn[]): readonly ChatMessage[] {
+  return transcript.flatMap((turn) => [
+    { id: turn.user.id, role: 'user' as const, content: turn.user.content.text },
+    {
+      id: turn.answer.id,
+      role: 'assistant' as const,
+      content: turn.answer.content.text,
+      contentKind: turn.answer.content.kind,
+      answerStage: {
+        stages: [{ stage: turn.finalStage, status: 'completed' as const }],
+        priorVersions: [],
+      },
+    },
+  ])
+}
+
+function replaceCommittedTranscript(
+  current: readonly ChatMessage[],
+  transcript: readonly Turn[],
+): readonly ChatMessage[] {
+  return [
+    ...current.filter((message) => message.role === 'system'),
+    ...projectCommittedTranscript(transcript).map((message) => {
+      const previous = current.find((candidate) => candidate.id === message.id)
+      if (previous === undefined || message.answerStage === undefined) return message
+      return {
+        ...message,
+        ...(previous.customDirectTimings === undefined ? {} : { customDirectTimings: previous.customDirectTimings }),
+        answerStage: {
+          ...message.answerStage,
+          priorVersions: previous.answerStage?.priorVersions ?? [],
+          sources: previous.answerStage?.sources ?? [],
+        },
+      }
+    }),
+  ]
 }
 
 function getResponseProfileLabel(profile: ResponseProfile): 'Fast' | 'Quality' {
@@ -2498,6 +3450,83 @@ function parseNativeAudioRequestId(payload: unknown, label: string): number {
     throw new Error(`${label} ID is invalid`)
   }
   return payload
+}
+
+const CAPABILITY_IDS = new Set<import('./types/chat').CapabilityId>([
+  'custom_provider', 'opencode', 'local_fast', 'local_quality', 'qwen_prediction',
+  'wake_word', 'vad', 'parakeet', 'tts', 'deep', 'review',
+])
+
+function toStartupCapabilities(capabilities: readonly Capability[]): readonly import('./types/chat').StartupCapability[] {
+  return capabilities
+    .filter((capability): capability is Capability & { readonly id: import('./types/chat').CapabilityId } =>
+      CAPABILITY_IDS.has(capability.id as import('./types/chat').CapabilityId))
+    .map((capability) => ({
+      id: capability.id,
+      state: capability.state,
+      reason: capability.reason,
+      actualProvider: capability.actualProvider,
+    }))
+}
+
+function applySnapshotControlState(
+  state: StartupState,
+  capabilities: readonly import('./types/chat').StartupCapability[],
+  responseProfile: ResponseProfile,
+): StartupState {
+  if (state.kind !== 'ready' && state.kind !== 'warming_model') return state
+  return {
+    ...state,
+    capabilities,
+    selectedResponseProfile: responseProfile,
+  }
+}
+
+function applySnapshotModelOptions<T extends string>(
+  fallback: readonly import('./lib/assistantSettings').AssistantOption<T>[],
+  snapshotOptions: readonly ModelOption[] | null,
+): import('./lib/assistantSettings').AssistantOption<T>[] {
+  if (snapshotOptions === null) return [...fallback]
+  return fallback.map((option) => {
+    const snapshotOption = snapshotOptions.find((candidate) => candidate.id === option.value)
+    if (snapshotOption === undefined) {
+      return { ...option, available: false, reason: 'Unavailable in the current app snapshot' }
+    }
+    const available = option.available && snapshotOption.available
+    if (available) {
+      const availableOption = { ...option }
+      delete availableOption.reason
+      return { ...availableOption, label: snapshotOption.label, available: true }
+    }
+    return {
+      ...option,
+      label: snapshotOption.label,
+      available: false,
+      reason: snapshotOption.unavailableReason ?? option.reason ?? 'Unavailable',
+    }
+  })
+}
+
+function findNewTurnForRequest(
+  transcript: readonly Turn[],
+  requestId: string,
+  expectedSessionId: string | null,
+  priorExecutions: ReadonlySet<string>,
+): Turn | undefined {
+  if (expectedSessionId === null) return undefined
+  for (let index = transcript.length - 1; index >= 0; index -= 1) {
+    const turn = transcript[index]
+    if (
+      turn !== undefined && isExpectedCanonicalTurn(turn, requestId, expectedSessionId, priorExecutions)
+    ) {
+      return turn
+    }
+  }
+  return undefined
+}
+
+function executionKey(turn: Turn): string {
+  return canonicalExecutionKey(turn)
 }
 
 function capabilityIsAvailable(

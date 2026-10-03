@@ -1,6 +1,6 @@
 import { hasInjectedTauriInternals, invokeTauriCommand } from './tauri'
+import { isRecord, parseRuntimePhase } from './wire'
 import type {
-  BackendRuntimePhase,
   CueAssetPaths,
   ResponseProfile,
   ResponseProfileState,
@@ -56,7 +56,7 @@ export function parseStartupState(payload: unknown): StartupState {
     return {
       kind: 'warming_model',
       cueAssetPaths: parseCueAssetPaths(payload['cue_asset_paths']),
-      runtimePhase: parseRuntimePhase(payload['runtime_phase']),
+      runtimePhase: parseRuntimePhase(payload['runtime_phase'], 'Startup runtime_phase'),
       voiceInputAvailable,
       voiceInputError,
       initialSilenceTimeoutMs,
@@ -92,7 +92,7 @@ export function parseStartupState(payload: unknown): StartupState {
     return {
       kind: 'ready',
       cueAssetPaths: parseCueAssetPaths(payload['cue_asset_paths']),
-      runtimePhase: parseRuntimePhase(payload['runtime_phase']),
+      runtimePhase: parseRuntimePhase(payload['runtime_phase'], 'Startup runtime_phase'),
       voiceInputAvailable,
       voiceInputError,
       initialSilenceTimeoutMs,
@@ -135,10 +135,6 @@ export async function loadStartupState(): Promise<StartupState> {
       error,
       hasInjectedTauriInternals: hasInjectedTauriInternals(),
     })
-
-    if (!hasInjectedTauriInternals()) {
-      return buildDefaultStartupState()
-    }
 
     const message = error instanceof Error ? error.message : 'Failed to load startup state'
     return {
@@ -195,21 +191,6 @@ export function parseResponseProfileState(payload: unknown): ResponseProfileStat
 export function isStartupStateSettled(state: StartupState): boolean {
   return state.kind === 'error' ||
     (state.kind === 'ready' && !state.capabilities.some((capability) => capability.state === 'warming'))
-}
-
-function parseRuntimePhase(payload: unknown): BackendRuntimePhase {
-  if (
-    payload === 'initializing' ||
-    payload === 'sleeping' ||
-    payload === 'listening' ||
-    payload === 'processing' ||
-    payload === 'executing' ||
-    payload === 'error'
-  ) {
-    return payload
-  }
-
-  throw new Error('Startup ready payload must include a supported runtime phase')
 }
 
 function parseCueAssetPaths(payload: unknown): CueAssetPaths {
@@ -341,8 +322,4 @@ function parseTtsOutputGainDb(payload: unknown): number {
   }
 
   return payload
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null
 }
