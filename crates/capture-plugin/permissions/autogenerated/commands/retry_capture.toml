@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-retry-capture"
+description = "Enables the retry_capture command without any pre-configured scope."
+commands.allow = ["retry_capture"]
+
+[[permission]]
+identifier = "deny-retry-capture"
+description = "Denies the retry_capture command without any pre-configured scope."
+commands.deny = ["retry_capture"]

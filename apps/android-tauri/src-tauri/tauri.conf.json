@@ -5,7 +5,7 @@
   "identifier": "dev.gitblame.voxgolem.android",
   "build": {
     "beforeDevCommand": "VITE_VOXGOLEM_RUNTIME=android bun run --cwd ../../frontend/app dev",
-    "beforeBuildCommand": "VITE_VOXGOLEM_RUNTIME=android bun run --cwd ../../frontend/app build",
+    "beforeBuildCommand": "python3 ../../scripts/prepare-android-capture.py && VITE_VOXGOLEM_RUNTIME=android bun run --cwd ../../frontend/app build",
     "devUrl": "http://localhost:5173",
     "frontendDist": "../../../frontend/app/dist"
   },

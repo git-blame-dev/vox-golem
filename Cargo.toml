@@ -4,6 +4,7 @@ members = [
   "apps/android-tauri/src-tauri",
   "apps/desktop-tauri/src-tauri",
   "crates/audio",
+  "crates/capture-plugin",
   "crates/core",
   "crates/model",
   "crates/platform"

@@ -1,0 +1,13 @@
+[default]
+description = "Allows access to all capture plugin operations."
+permissions = [
+  "allow-snapshot",
+  "allow-enable-capture",
+  "allow-list-captures",
+  "allow-select-notes-folder",
+  "allow-play-capture",
+  "allow-stop-playback",
+  "allow-retry-capture",
+  "allow-finalize-capture",
+  "allow-update-transcript"
+]

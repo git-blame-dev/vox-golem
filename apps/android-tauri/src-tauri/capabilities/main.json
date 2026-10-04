@@ -8,6 +8,7 @@
     "allow-submit-prompt",
     "allow-cancel-prompt",
     "allow-reset-session",
-    "allow-set-preferences"
+    "allow-set-preferences",
+    "capture:default"
   ]
 }
