@@ -16,7 +16,7 @@ Use JDK 21, Android SDK platform/build tools 36, NDK 28.2.13676358, Tauri CLI 2.
 make android-build
 ```
 
-The ARM64 debug APK is under `apps/android-tauri/src-tauri/gen/android/app/build/outputs/apk/universal/debug/`. The authored Android package requests Internet only, disables cleartext and backup, and stores bounded conversations and preferences in memory. Stop, New Chat, app suspension, and lost Channels invalidate active requests; interrupted output is not committed to later prompt history.
+The ARM64 debug APK is under `apps/android-tauri/src-tauri/gen/android/app/build/outputs/apk/universal/debug/`. The Android package disables cleartext and backup and stores bounded chat conversations and preferences in memory. Stop, New Chat, app suspension, and lost Channels invalidate active chat requests; interrupted output is not committed to later prompt history. Watch dictation uses a separate native capture plugin with persisted recording/history state and explicit permission setup.
 
 Android does not perform login or refresh OAuth credentials. Provision an existing compatible OpenCode login into the installed debug app's private storage:
 
@@ -26,7 +26,24 @@ make android-provision-auth DEVICE=<exact-authorized-transport> AUTH_PATH=<host-
 
 For pairing held by another Linux host, set `ADB_SSH_HOST` and optionally `REMOTE_ADB`; credentials are streamed through SSH/ADB without printing their contents. Provisioning validates and snapshots bounded input, atomically installs a restricted app-private file, and verifies transfer length and permissions. Reprovision when the credential expires. A debug build and app-private storage do not establish a supported in-app login flow.
 
-`make android-init` is the sole scaffold-regeneration command. The pinned generator owns Gradle scaffolding and launcher resources; the authored manifest and backup-rule exceptions remain versioned. Android does not enable microphone capture, local inference, OpenCode subprocesses, Deep/Review, prefetch, persistent chats, or background requests in this milestone.
+`make android-init` is the sole scaffold-regeneration command. The pinned generator owns Gradle scaffolding and launcher resources; the authored manifest and backup-rule exceptions remain versioned. Chat does not enable desktop wake-word capture, local model inference, OpenCode subprocesses, Deep/Review, prefetch, persistent chats, or background chat requests. Watch dictation does not enter the assistant pipeline.
+
+## Watch dictation companion
+
+The native Wear OS app is maintained under `apps/wear/`; phone capture integration and shared domain/storage code live under `crates/capture-plugin/`. The phone and watch use the same application ID and compatible signing certificates for Wear Data Layer. Both APKs must be installed on their corresponding devices.
+
+```bash
+make wear-test
+make wear-build
+```
+
+These commands need JDK 21 and Android SDK platform 36. The Wear debug APK is `apps/wear/app/build/outputs/apk/debug/app-debug.apk`. The existing `make android-build` builds the phone APK, including the native capture plugin. CI builds both artifacts on Linux.
+
+On the phone, open **Voice notes**, enable watch dictation through the visible permission setup, and choose the notes folder through Android's folder picker. Audio remains staged locally until a verified copy is saved under `recordings/<capture-id>.wav` in that folder. The app creates `inbox.org` if absent and prepends one final transcript as a `* TODO` with a capture-day, date-only `SCHEDULED` line. No assistant completion, summary, or property drawer is added. Playback, processing retries and transcript corrections are available in history; correcting an already exported transcript does not create another task.
+
+On the watch, select **VoxGolem Capture** as Samsung knock-knock's launcher target. A deliberate launch starts one recording after microphone permission; normal resume does not start another. Local recording persists independently of phone connectivity. Manual Stop is available, and arm-down stopping uses a user-calibrated motion policy whose accuracy must be checked on the worn device. Keep the ordinary watch face between captures. A saved-on-watch acknowledgement is distinct from phone archival or Org export.
+
+Recognition uses the phone's native on-device speech provider with supplied watch PCM; provider external-audio and segmented-session support must be validated on the actual phone. An unavailable provider or dropped connection retains audio for later processing, with accurate pending/error state. Fully offline watch-local live ASR is not bundled. Native storage and export recovery distinguish verified success from ambiguous SAF writes; ambiguous conflicts retain recovery data and need review. Normal permanent recordings are not automatically pruned.
 
 ## Capabilities
 
