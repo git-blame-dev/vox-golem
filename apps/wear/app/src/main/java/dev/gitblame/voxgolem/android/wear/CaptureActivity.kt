@@ -166,6 +166,8 @@ class CaptureActivity : ComponentActivity(), SensorEventListener {
 
     private fun refresh() {
         snapshot = CaptureSnapshot(repository.active(), repository.records().take(12))
+        if (snapshot.active != null) window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         updateMotionDiagnostics()
     }
 
@@ -205,6 +207,14 @@ class CaptureActivity : ComponentActivity(), SensorEventListener {
     override fun onDestroy() {
         unregisterReceiver(signals)
         super.onDestroy()
+    }
+
+    override fun onStop() {
+        if (!isChangingConfigurations && repository.active() != null) {
+            startService(Intent(this, CaptureService::class.java).setAction(CaptureService.ACTION_STOP)
+                .putExtra(CaptureService.EXTRA_STOP_REASON, "ui-interruption"))
+        }
+        super.onStop()
     }
 
     override fun onSensorChanged(event: SensorEvent) {
