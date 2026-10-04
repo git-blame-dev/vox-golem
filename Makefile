@@ -94,7 +94,7 @@ test-wakeword-bench:
 	python3 -m unittest discover -s tools/wakeword-bench -p 'test_*.py'
 	cargo test --locked -p vox-golem --example wakeword_bench
 
-.PHONY: help app-version test test-release-tools test-android-tools check-android-tools android-init android-build android-provision-auth check-linux-tools app app-smoke packaged-smoke app-dev linux dist stage-linux-existing verify-dist prepare-appimage-tools update-bundle postprocess-update-bundle verify-update-bundle update-bundle-smoke check-pc-tools prepare-pc-bundle pc pc-dist verify-pc-dist pc-installer verify-pc-installer clean
+.PHONY: help app-version test test-release-tools test-android-tools check-android-tools android-init android-build android-capture-test android-provision-auth check-wear-tools wear-test wear-build check-linux-tools app app-smoke packaged-smoke app-dev linux dist stage-linux-existing verify-dist prepare-appimage-tools update-bundle postprocess-update-bundle verify-update-bundle update-bundle-smoke check-pc-tools prepare-pc-bundle pc pc-dist verify-pc-dist pc-installer verify-pc-installer clean
 
 help:
 	@printf '%s\n' 'Targets:'
@@ -113,6 +113,9 @@ help:
 	@printf '%s\n' '  make pc-installer Build the lightweight Windows NSIS installer from Linux'
 	@printf '%s\n' '  make android-init Regenerate the pinned Android platform scaffold'
 	@printf '%s\n' '  make android-build Build the ARM64 Android debug APK'
+	@printf '%s\n' '  make android-capture-test Run native capture unit tests and lint after android-build'
+	@printf '%s\n' '  make wear-test Run Wear capture unit tests and lint'
+	@printf '%s\n' '  make wear-build Build the Wear OS debug APK'
 	@printf '%s\n' '  make android-provision-auth DEVICE=<serial> AUTH_PATH=<file> Provision app-private auth'
 	@printf '%s\n' '  make clean    Remove generated build and staging output'
 
@@ -151,9 +154,23 @@ android-init: check-android-tools
 	cargo tauri icon apps/desktop-tauri/src-tauri/icons/icon.png --output apps/android-tauri/src-tauri/icons
 	cd apps/android-tauri/src-tauri && cargo tauri android init --ci
 	cargo tauri icon apps/desktop-tauri/src-tauri/icons/icon.png --output apps/android-tauri/src-tauri/icons
+	python3 scripts/prepare-android-capture.py
 
 android-build: check-android-tools
 	cd apps/android-tauri/src-tauri && cargo tauri android build --debug --target aarch64 --apk --ci -- --locked
+
+android-capture-test: check-android-tools
+	apps/android-tauri/src-tauri/gen/android/gradlew -p apps/android-tauri/src-tauri/gen/android --no-daemon :tauri-plugin-capture:testDebugUnitTest :tauri-plugin-capture:lintDebug
+
+check-wear-tools:
+	@test -x "$${JAVA_HOME:-}/bin/java" || { printf '%s\n' 'Set JAVA_HOME to a JDK 21 installation.' >&2; exit 1; }
+	@test -d "$${ANDROID_HOME:-}/platforms/android-36" || { printf '%s\n' 'Set ANDROID_HOME to an SDK with platform 36.' >&2; exit 1; }
+
+wear-test: check-wear-tools
+	apps/wear/gradlew -p apps/wear --no-daemon :app:testDebugUnitTest :app:lintDebug
+
+wear-build: check-wear-tools
+	apps/wear/gradlew -p apps/wear --no-daemon :app:assembleDebug
 
 android-provision-auth: export DEVICE := $(DEVICE)
 android-provision-auth: export AUTH_PATH := $(AUTH_PATH)

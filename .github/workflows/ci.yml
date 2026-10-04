@@ -47,14 +47,24 @@ jobs:
           bun install --frozen-lockfile
       - name: Build the ARM64 debug app
         run: make android-build
+      - name: Check native capture
+        run: make android-capture-test
+      - name: Check and build the Wear companion
+        run: make wear-test wear-build
       - name: Verify the APK signature
         run: |
           "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose \
             apps/android-tauri/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose \
+            apps/wear/app/build/outputs/apk/debug/app-debug.apk
       - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
         with:
           name: vox-golem-android-debug-arm64
           path: apps/android-tauri/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: vox-golem-wear-debug
+          path: apps/wear/app/build/outputs/apk/debug/app-debug.apk
 
   native-artifact:
     if: github.event_name == 'pull_request' || github.ref != 'refs/heads/main'
