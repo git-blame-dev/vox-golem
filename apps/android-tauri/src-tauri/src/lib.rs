@@ -959,6 +959,7 @@ fn set_preferences_inner(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_capture::init())
         .setup(|app| {
             let path = prepare_auth_path(app.path().app_data_dir()?)?;
             let provider = Arc::new(CustomProvider { auth_path: path });
@@ -1341,7 +1342,8 @@ mod tests {
                 "allow-submit-prompt",
                 "allow-cancel-prompt",
                 "allow-reset-session",
-                "allow-set-preferences"
+                "allow-set-preferences",
+                "capture:default"
             ])
         );
         assert!(!value.to_string().contains("event"));

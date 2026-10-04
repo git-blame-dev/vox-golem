@@ -68,4 +68,5 @@ dependencies {
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.0")
 }
 
+apply(from = "../../../../capture.gradle.kts")
 apply(from = "tauri.build.gradle.kts")
