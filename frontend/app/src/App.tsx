@@ -37,6 +37,7 @@ import { parseCompletionEvent } from './lib/completionEvents'
 import { createVoiceTelemetryRecorder } from './lib/voiceTelemetry'
 import { WakeDiagnostics } from './components/WakeDiagnostics'
 import { WakeClipSettings } from './components/WakeClipSettings'
+import { CaptureHistory } from './components/CaptureHistory'
 import { createWakeClipBuffer } from './lib/wakeClipBuffer'
 import {
   createVoiceActivityState,
@@ -178,6 +179,7 @@ function App() {
   const [audioInputDevices, setAudioInputDevices] = useState<readonly AudioInputDevice[]>([])
   const [audioInputDeviceId, setAudioInputDeviceId] = useState<string | null>(loadAudioInputDeviceId)
   const [settingsOpen, setSettingsOpen] = useState(() => Boolean(window.history.state?.[SETTINGS_HISTORY_KEY]))
+  const [voiceNotesOpen, setVoiceNotesOpen] = useState(false)
   const [assistantSettingsPending, setAssistantSettingsPending] = useState(
     () => getTauriInternals() !== null,
   )
@@ -3024,6 +3026,7 @@ function App() {
           <span data-runtime-phase>Runtime: {runtimeStatus}</span>
         </div>
         <div className="shell__header-actions">
+          {isAndroidRuntime ? <button type="button" className="shell__control" onClick={() => setVoiceNotesOpen((open) => !open)}>{voiceNotesOpen ? 'Chat' : 'Voice notes'}</button> : null}
             <button type="button" className="shell__control shell__new-chat" onClick={() => void resetSession()} aria-label="New Chat" disabled={resetPending || updateRuntimeBlocked}>
             {resetPending ? 'Starting new chat...' : 'New Chat'}
           </button>
@@ -3052,6 +3055,7 @@ function App() {
         </div>
       </header>
 
+      {voiceNotesOpen ? <CaptureHistory onBack={() => setVoiceNotesOpen(false)} /> : <>
       <div className="conversation-region">
         {customFailure ? <div role="alert" className="shell__error">
           Custom connection: {customFailure.reason}{' '}
@@ -3348,6 +3352,7 @@ function App() {
           {promptActivity !== null ? <div className="composer__status" role="status" aria-live="polite">{promptActivity}</div> : null}
         </div>
       </form>
+      </>}
     </div>
   )
 }
