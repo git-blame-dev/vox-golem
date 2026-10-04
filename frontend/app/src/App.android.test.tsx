@@ -23,6 +23,25 @@ afterEach(() => {
 })
 
 describe('Android App lifecycle', () => {
+  it('adds a separate voice-notes entry without enabling unsupported voice controls', async () => {
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        if (command === 'get_app_snapshot') return appSnapshot()
+        if (command === 'get_startup_state') return readyStartupState()
+        return null
+      },
+    }
+    container = document.createElement('div')
+    document.body.append(container)
+    root = createRoot(container)
+    await act(async () => { root?.render(<App />) })
+    for (let index = 0; index < 5; index += 1) await act(async () => { await Promise.resolve() })
+
+    expect(container.textContent).not.toContain('Start mic')
+    expect(Array.from(container.querySelectorAll('button')).some((button) => button.textContent === 'Voice notes')).toBe(true)
+    expect(container.querySelector('#promptComposer')).not.toBeNull()
+  })
+
   it('keeps an unavailable provider reason without offering desktop-only retry', async () => {
     const unavailable = capabilities().map((capability) => capability['id'] === 'custom_provider'
       ? { ...capability, state: 'unavailable', reason: 'Authentication requires provisioning' }
