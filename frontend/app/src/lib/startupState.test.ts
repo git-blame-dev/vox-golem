@@ -13,6 +13,54 @@ afterEach(() => {
 })
 
 describe('parseStartupState', () => {
+  const speechStartupPayload = {
+    kind: 'ready',
+    cue_asset_paths: { start_listening: 'start.wav', stop_listening: 'stop.wav' },
+    runtime_phase: 'sleeping',
+    voice_input_available: false,
+    voice_input_error: null,
+    silence_timeout_ms: 1500,
+    selected_response_profile: 'fast',
+    supported_response_profiles: [],
+    capabilities: COMPLETE_CAPABILITIES,
+  }
+
+  it.each(['ready', 'warming_model'])('parses speech identity separately from execution providers in %s', (kind) => {
+    const state = parseStartupState({
+      ...speechStartupPayload,
+      kind,
+      message: 'Synthetic model warming',
+      speech_services: {
+        stt: { configured_engine: 'Parakeet', runtime_engine: 'Parakeet', configured_model: null, configured_voice: null, configured_locale: null },
+        tts: { configured_engine: 'Piper ONNX', runtime_engine: null, configured_model: 'Synthetic voice model', configured_voice: 'Synthetic voice', configured_locale: 'en-US' },
+      },
+    })
+    expect(state).toMatchObject({
+      speechServices: {
+        stt: { configuredEngine: 'Parakeet', runtimeEngine: 'Parakeet', configuredModel: null, configuredVoice: null, configuredLocale: null },
+        tts: { configuredEngine: 'Piper ONNX', runtimeEngine: null, configuredModel: 'Synthetic voice model', configuredVoice: 'Synthetic voice', configuredLocale: 'en-US' },
+      },
+    })
+  })
+
+  it.each(['ready', 'warming_model'])('accepts older and Android %s payloads without speech identity', (kind) => {
+    expect(parseStartupState({ ...speechStartupPayload, kind, message: 'Synthetic model warming' })).not.toHaveProperty('speechServices')
+  })
+
+  it.each([false, {}, { stt: {}, tts: {} }])('rejects malformed speech identity instead of inventing an engine', (speech_services) => {
+    expect(() => parseStartupState({ ...speechStartupPayload, speech_services })).toThrow('speech_services')
+  })
+
+  it.each(['configured_engine', 'runtime_engine', 'configured_model', 'configured_voice', 'configured_locale'])('validates nullable bounded %s speech metadata', (field) => {
+    const service = { configured_engine: null, runtime_engine: null, configured_model: null, configured_voice: null, configured_locale: null }
+    const payload = (value: unknown) => ({ ...speechStartupPayload, speech_services: { stt: service, tts: { ...service, [field]: value } } })
+    expect(() => parseStartupState(payload(null))).not.toThrow()
+    expect(() => parseStartupState(payload('x'.repeat(256)))).not.toThrow()
+    for (const invalid of [undefined, 42, '', '   ', 'x'.repeat(257), 'Synthetic\nidentity', 'Synthetic\u0000identity', 'Synthetic\u007fidentity']) {
+      expect(() => parseStartupState(payload(invalid))).toThrow(`invalid ${field}`)
+    }
+  })
+
   it('strictly parses every zero-asset capability without making startup fatal', () => {
     const capabilities = [
       'custom_provider', 'opencode', 'local_fast', 'local_quality', 'qwen_prediction',

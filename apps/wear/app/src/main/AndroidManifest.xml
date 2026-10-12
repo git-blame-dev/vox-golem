@@ -2,6 +2,7 @@
     <uses-feature android:name="android.hardware.type.watch" />
     <uses-feature android:name="android.hardware.microphone" android:required="true" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -9,11 +10,50 @@
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
+    <queries>
+        <intent><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.HOME" /></intent>
+        <intent>
+            <action android:name="android.support.wearable.input.action.REMOTE_INPUT" />
+        </intent>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
+
     <application
         android:allowBackup="false"
-        android:label="VoxGolem Capture"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:label="Vox Note"
         android:theme="@android:style/Theme.Material.NoActionBar">
         <meta-data android:name="com.google.android.wearable.standalone" android:value="true" />
+        <activity android:name=".assistant.AssistantActivity" android:exported="true"
+            android:label="Vox Chat" android:launchMode="singleTop" android:taskAffinity="dev.gitblame.voxgolem.android.assistant">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity-alias android:name=".assistant.AssistantVoiceEntry"
+            android:targetActivity=".assistant.AssistantActivity"
+            android:exported="true" android:label="Vox Ask">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias android:name=".assistant.AssistantConversationEntry"
+            android:targetActivity=".assistant.AssistantActivity"
+            android:exported="true" android:label="Vox Talk">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity android:name=".assistant.AssistantTextEntryActivity" android:exported="false" android:label="Assistant draft" />
         <activity
             android:name=".CaptureActivity"
             android:exported="true"
@@ -37,6 +77,10 @@
             <intent-filter>
                 <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
                 <data android:scheme="wear" android:host="*" android:pathPrefix="/voxgolem/capture/v1/" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="com.google.android.gms.wearable.CHANNEL_EVENT" />
+                <data android:scheme="wear" android:host="*" android:pathPrefix="/voxgolem/capture/v1/receipt/" />
             </intent-filter>
         </service>
     </application>

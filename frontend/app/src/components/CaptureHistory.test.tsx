@@ -29,6 +29,102 @@ beforeEach(() => {
 })
 
 describe('CaptureHistory', () => {
+  it.each(['ASK', 'TALK', 'DRAFT'] as const)('does not offer Note finalization for interrupted %s audio', async (purpose) => {
+    captureMocks.loadCaptureSnapshot.mockResolvedValue({ available: true, notesFolderUri: null,
+      captures: [{ ...capture(), purpose, captureState: 'INTERRUPTED' }], error: null })
+    await mount()
+    await act(async () => { container?.querySelector<HTMLButtonElement>('.capture-history__record')?.click() })
+    expect(Array.from(container?.querySelectorAll('button') ?? []).some((button) => button.textContent === 'Finalize interrupted capture')).toBe(false)
+    expect(captureMocks.finalizeCapture).not.toHaveBeenCalled()
+  })
+  it('shows retained audio and unavailable live recognition as separate outcomes with captured policy', async () => {
+    const record = { ...capture(), requestedLanguage: 'en-AU', speechNetworkFallback: false,
+      liveTranscriptionState: 'UNAVAILABLE' as const, liveStatusRevision: 3,
+      canTranscribeLive: false, liveErrorCode: 'external-audio-provider-unavailable' }
+    captureMocks.loadCaptureSnapshot.mockResolvedValue({ available: true, notesFolderUri: null, captures: [record], error: null })
+    await mount()
+    await act(async () => { container?.querySelector<HTMLButtonElement>('.capture-history__record')?.click() })
+    expect(container?.textContent).toContain('Live: unavailable')
+    expect(container?.textContent).toContain('Audio retained; live transcription unavailable')
+    expect(container?.textContent).toContain('Input language: en-AU')
+    expect(container?.textContent).toContain('Speech policy: dedicated on-device only')
+    expect(container?.textContent).not.toContain('Transcribing audio now')
+  })
+  it('keeps retained Ask audio separate from Notes processing and transcript correction', async () => {
+    const record = { ...capture(), purpose: 'ASK' as const, recognitionState: 'FAILED' as const }
+    captureMocks.loadCaptureSnapshot.mockResolvedValue({ available: true, notesFolderUri: null, captures: [record], error: null })
+    await mount()
+    await act(async () => { container?.querySelector<HTMLButtonElement>('.capture-history__record')?.click() })
+    expect(container?.textContent).toContain('Purpose: ask')
+    expect(container?.textContent).not.toContain('Archive:')
+    expect(container?.textContent).not.toContain('Org:')
+    const buttons = Array.from(container?.querySelectorAll('button') ?? [])
+    expect(buttons.find((button) => button.textContent === 'Retry processing')?.disabled).toBe(true)
+    expect(buttons.find((button) => button.textContent === 'Save correction')?.disabled).toBe(true)
+    const play = buttons.find((button) => button.textContent === 'Play recording')!
+    await act(async () => { play.click() })
+    expect(captureMocks.playCapture).toHaveBeenCalledWith(record.captureId)
+    expect(captureMocks.retryCapture).not.toHaveBeenCalled()
+    expect(captureMocks.updateCaptureTranscript).not.toHaveBeenCalled()
+  })
+  it.each(['speech-recognizer-7', 'no-speech-detected'])('quietly presents exact capture no-match %s without promoting the draft or changing retained audio', async (error) => {
+    const record = { ...capture(), recognitionState: 'FAILED' as const, previewText: 'Synthetic unconfirmed preview', finalText: null, archivedAudioUri: 'content://synthetic/retained-audio', error }
+    captureMocks.loadCaptureSnapshot.mockResolvedValue({ available: true, notesFolderUri: null, captures: [record], error })
+    await mount()
+    await act(async () => { container?.querySelector<HTMLButtonElement>('.capture-history__record')?.click() })
+    expect(container?.querySelector('[role="alert"]')).toBeNull()
+    expect(container?.textContent).not.toContain(error)
+    expect(container?.textContent).toContain('Last preview (not final)')
+    expect(container?.textContent).toContain('Synthetic unconfirmed preview')
+    expect(container?.textContent).toContain('Recognition: failed')
+    expect(record.error).toBe(error)
+    expect(record.finalText).toBeNull()
+    expect(record.archivedAudioUri).toBe('content://synthetic/retained-audio')
+    const play = Array.from(container?.querySelectorAll('button') ?? []).find((button) => button.textContent === 'Play recording')!
+    await act(async () => { play.click() })
+    expect(captureMocks.playCapture).toHaveBeenCalledWith(record.captureId)
+    expect(captureMocks.updateCaptureTranscript).not.toHaveBeenCalled()
+    expect(captureMocks.finalizeCapture).not.toHaveBeenCalled()
+    expect(captureMocks.retryCapture).not.toHaveBeenCalled()
+  })
+  it.each([false, true])('keeps actionable capture errors visible alongside a no-match code (no-match primary: %s)', async (noMatchPrimary) => {
+    captureMocks.loadCaptureSnapshot.mockResolvedValue({ available: true, notesFolderUri: null, captures: [{ ...capture(), error: 'Synthetic audio retirement failed' }], error: noMatchPrimary ? 'no-speech-detected' : 'Synthetic archive write failed', onboardingError: noMatchPrimary ? 'Synthetic archive write failed' : 'no-speech-detected' })
+    await mount()
+    await act(async () => { container?.querySelector<HTMLButtonElement>('.capture-history__record')?.click() })
+    expect(container?.querySelector('[role="alert"]')?.textContent).toBe('Synthetic archive write failed')
+    expect(container?.textContent).toContain('Synthetic audio retirement failed')
+  })
+  it('does not suppress composite recognition and retirement failures merely containing a no-match code', async () => {
+    const error = 'speech-recognizer-7:retirement-failed'
+    captureMocks.loadCaptureSnapshot.mockResolvedValue({ available: true, notesFolderUri: null, captures: [{ ...capture(), error }], error })
+    await mount()
+    await act(async () => { container?.querySelector<HTMLButtonElement>('.capture-history__record')?.click() })
+    expect(container?.querySelector('[role="alert"]')?.textContent).toBe(error)
+    expect(container?.querySelector('.capture-history__detail .capture-history__error')?.textContent).toBe(error)
+  })
+  it('shows starting until a refreshed snapshot confirms foreground readiness', async () => {
+    const pending = snapshotWithSetupRequired()
+    captureMocks.loadCaptureSnapshot.mockResolvedValue(pending)
+    captureMocks.enableCapture.mockResolvedValue({ ...pending, onboardingState: 'starting', onboardingError: null })
+    await mount()
+    await act(async () => { container?.querySelector<HTMLButtonElement>('button[aria-label="Enable watch dictation"]')?.click() })
+    expect(container?.textContent).toContain('Watch dictation is starting…')
+    expect(container?.querySelector('[role="alert"]')).toBeNull()
+    expect(container?.querySelector<HTMLButtonElement>('button[aria-label="Enable watch dictation"]')?.disabled).toBe(true)
+    captureMocks.loadCaptureSnapshot.mockResolvedValue({ ...pending, setupRequired: false, onboardingState: 'enabled', onboardingError: null })
+    await act(async () => {
+      Array.from(container?.querySelectorAll('button') ?? []).find((button) => button.textContent === 'Refresh')?.click()
+    })
+    expect(container?.textContent).toContain('Watch dictation is enabled.')
+    expect(container?.textContent).not.toContain('Watch dictation is starting…')
+  })
+
+  it('shows an asynchronous runtime failure after startup and permits explicit retry', async () => {
+    captureMocks.loadCaptureSnapshot.mockResolvedValue({ ...snapshotWithSetupRequired(), onboardingState: 'failed', onboardingError: 'synthetic-service-denied' })
+    await mount()
+    expect(container?.querySelector('[role="alert"]')?.textContent).toBe('synthetic-service-denied')
+    expect(container?.querySelector<HTMLButtonElement>('button[aria-label="Enable watch dictation"]')?.disabled).toBe(false)
+  })
   it('requires an explicit action to finalize an interrupted recording', async () => {
     const interrupted = { ...capture(), captureState: 'INTERRUPTED', recognitionState: 'QUEUED' }
     captureMocks.loadCaptureSnapshot.mockResolvedValue({ available: true, notesFolderUri: null, captures: [interrupted], error: null })
@@ -101,7 +197,9 @@ describe('CaptureHistory', () => {
     captureMocks.listCaptures.mockResolvedValue([])
     await mount()
 
-    expect(container?.textContent).toContain('This flow uses watch-provided audio only. It never records through the phone microphone.')
+    expect(container?.textContent).toContain('For Watch Notes, the app supplies Watch audio to the recognizer.')
+    expect(container?.textContent).toContain('Provider input-source isolation is not yet verified.')
+    expect(container?.textContent).not.toContain('never records through the phone microphone')
     expect(container?.textContent).toContain('RECORD_AUDIO')
     const enable = container?.querySelector<HTMLButtonElement>('button[aria-label="Enable watch dictation"]')
     expect(enable).not.toBeNull()
@@ -150,7 +248,9 @@ async function mount(): Promise<void> {
 
 function capture(): CaptureRecord {
   return {
-    captureId: 'synthetic-capture-1', createdAtUtc: '2026-01-02T03:04:05Z', finishedAtUtc: null, durationMs: 30_000,
+    captureId: 'synthetic-capture-1', purpose: 'NOTE', requestedLanguage: null, speechNetworkFallback: false,
+    liveTranscriptionState: 'NOT_REQUESTED', liveStatusRevision: 0, canTranscribeLive: false, liveErrorCode: null,
+    createdAtUtc: '2026-01-02T03:04:05Z', finishedAtUtc: null, durationMs: 30_000,
     captureState: 'SAVED', recognitionState: 'RUNNING', transferState: 'PENDING', archiveState: 'WAITING_FOR_FOLDER', orgState: 'WAITING_FOR_TRANSCRIPT',
     previewText: 'Last recognized phrase', finalText: null, archivedAudioUri: null, error: null, transcriptVersion: 1,
   }

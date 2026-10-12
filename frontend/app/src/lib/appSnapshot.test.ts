@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { loadAppSnapshot, parseAppSnapshot } from './appSnapshot'
+import { isExpectedCanonicalTurn, loadAppSnapshot, parseAppSnapshot } from './appSnapshot'
 
 function validSnapshot(): Record<string, unknown> {
   return {
@@ -40,6 +40,49 @@ afterEach(() => {
 })
 
 describe('app snapshot contract', () => {
+  it.each(['speech_language', 'speech_tts_provider', 'speech_tts_voice'])('accepts legacy omission and enforces the 512 UTF-8 byte string boundary for %s', (field) => {
+    const wire = validSnapshot()
+    expect(parseAppSnapshot(wire).preferences).toMatchObject({ speechLanguage: '', speechTtsProvider: '', speechTtsVoice: '' })
+    const original = wire['preferences'] as Record<string, unknown>
+    wire['preferences'] = { ...original, [field]: 'é'.repeat(256) }
+    expect(Object.values(parseAppSnapshot(wire).preferences)).toContain('é'.repeat(256))
+    for (const value of [null, undefined, 0, true, 'é'.repeat(257), 'x'.repeat(513)]) {
+      wire['preferences'] = { ...original, [field]: value }
+      expect(() => parseAppSnapshot(wire)).toThrow(/512 UTF-8 bytes/)
+    }
+  })
+  it('defaults only missing new policy fields and preserves explicit web and speech policy', () => {
+    const wire = validSnapshot()
+    expect(parseAppSnapshot(wire).preferences).toMatchObject({ webEnabled: true, speechNetworkFallback: true })
+    wire['preferences'] = { ...(wire['preferences'] as Record<string, unknown>), web_enabled: false, speech_network_fallback: false }
+    expect(parseAppSnapshot(wire).preferences).toMatchObject({ webEnabled: false, speechNetworkFallback: false })
+  })
+  it.each(['web_enabled', 'speech_network_fallback'])('rejects malformed %s without weakening old required fields', (field) => {
+    for (const value of [null, 'false', 0]) {
+      const wire = validSnapshot()
+      wire['preferences'] = { ...(wire['preferences'] as Record<string, unknown>), [field]: value }
+      expect(() => parseAppSnapshot(wire)).toThrow(/boolean/)
+    }
+    const wire = validSnapshot()
+    delete (wire['preferences'] as Record<string, unknown>)['completion']
+    expect(() => parseAppSnapshot(wire)).toThrow(/completion/)
+  })
+  it('accepts distributed Android identities without relaxing desktop decimal IDs', () => {
+    const id = '11111111-1111-4111-8111-111111111111:18446744073709551615'
+    const wire = validSnapshot()
+    wire['session_id'] = id
+    wire['active_request'] = null
+    const turn = (wire['transcript'] as Record<string, unknown>[])[0]!
+    turn['execution_id'] = { session_id: id, generation: id }
+    ;(turn['user'] as Record<string, unknown>)['id'] = id
+    ;(turn['answer'] as Record<string, unknown>)['id'] = id
+    expect(() => parseAppSnapshot(wire)).toThrow(/canonical unsigned decimal/)
+    expect(parseAppSnapshot(wire, true).transcript[0]?.executionId.generation).toBe(id)
+    const canonical = parseAppSnapshot(wire, true).transcript[0]!
+    expect(isExpectedCanonicalTurn(canonical, canonical.requestId, '0', new Set())).toBe(false)
+    expect(isExpectedCanonicalTurn(canonical, canonical.requestId, '0', new Set(), true)).toBe(true)
+    expect(() => parseAppSnapshot({ ...wire, session_id: id.replace(':184', ':0184') }, true)).toThrow(/session_id/)
+  })
   it.each(['custom-sol-high', 'custom-sol-none', 'custom-luna-none', 'custom-luna-low'] as const)(
     'accepts the current Custom Instant selection %s in canonical preferences',
     (instant) => {
@@ -64,6 +107,8 @@ describe('app snapshot contract', () => {
       instant: 'custom-sol-high', deep: 'opencode-sol-high', review: 'custom-luna-low',
       deepEnabled: true, reviewEnabled: false, prefetch: true, completion: false,
       responseProfile: 'quality', ttsEnabled: true, uiTheme: 'light', uiTextSize: 'extra_large',
+      webEnabled: true, speechNetworkFallback: true,
+      speechLanguage: '', speechTtsProvider: '', speechTtsVoice: '',
     })
   })
 

@@ -1,0 +1,19 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <activity
+            android:name=".CompactEdgeButtonFixtureActivity"
+            android:exported="false"
+            android:label="Synthetic compact edge fixture" />
+        <activity
+            android:name=".assistant.AssistantUxFixtureActivity"
+            android:exported="false"
+            android:label="Synthetic assistant UX fixture"
+            android:taskAffinity="dev.gitblame.voxgolem.android.assistant.uxfixture" />
+        <receiver
+            android:name=".CaptureStatusReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP" />
+        <activity android:name=".speechtest.NativeTtsHostActivity" android:exported="false" />
+        <activity android:name=".speechtest.SuppliedAudioProofActivity" android:exported="false" />
+    </application>
+</manifest>

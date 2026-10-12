@@ -1,0 +1,10 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <queries><intent><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.HOME" /></intent></queries>
+    <application>
+        <activity android:name="dev.gitblame.voxgolem.assistant.phone.NewVoiceShortcutActivity"
+            android:label="Ask"
+            android:exported="true" android:noHistory="true" android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.NoDisplay" />
+        <receiver android:name="dev.gitblame.voxgolem.assistant.phone.NewVoiceShortcutPinnedReceiver" android:exported="false" />
+    </application>
+</manifest>

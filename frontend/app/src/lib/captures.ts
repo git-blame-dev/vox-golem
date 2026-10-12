@@ -1,15 +1,33 @@
 import { getTauriInternals, isAndroidRuntime } from './tauri'
 
+// Public enum names from crates/capture-android/.../CaptureContract.kt, not persistence JSON.
+const captureStates = ['PREPARING', 'RECORDING', 'STOPPING', 'SAVED', 'INTERRUPTED', 'FAILED'] as const
+const capturePurposes = ['NOTE', 'ASK', 'TALK', 'DRAFT'] as const
+const recognitionStates = ['UNAVAILABLE', 'QUEUED', 'RUNNING', 'FINAL', 'FAILED', 'NO_SPEECH'] as const
+const transferStates = ['LOCAL_ONLY', 'PENDING', 'SENDING', 'PHONE_STAGED', 'PHONE_ARCHIVED'] as const
+const archiveStates = ['NOT_STAGED', 'STAGED', 'WAITING_FOR_FOLDER', 'COPYING', 'VERIFIED', 'RETRYABLE_ERROR', 'CONFLICT'] as const
+const orgStates = ['WAITING_FOR_TRANSCRIPT', 'WAITING_FOR_FOLDER', 'READY', 'WRITING', 'EXPORTED', 'RETRYABLE_ERROR', 'NEEDS_REVIEW', 'NONE'] as const
+const liveTranscriptionStates = ['NOT_REQUESTED', 'CONNECTING', 'PENDING', 'ATTEMPTING', 'PROVIDER_READY', 'TRANSCRIBING', 'UNAVAILABLE', 'COMPLETED'] as const
+const onboardingStates = ['setup-required', 'permission-required', 'starting', 'enabled', 'failed', 'unsupported'] as const
+export type CaptureOnboardingState = typeof onboardingStates[number]
+
 export interface CaptureRecord {
   captureId: string
+  purpose: typeof capturePurposes[number]
+  requestedLanguage: string | null
+  speechNetworkFallback: boolean
+  liveTranscriptionState: typeof liveTranscriptionStates[number]
+  liveStatusRevision: number
+  canTranscribeLive: boolean
+  liveErrorCode: string | null
   createdAtUtc: string
   finishedAtUtc: string | null
   durationMs: number
-  captureState: string
-  recognitionState: string
-  transferState: string
-  archiveState: string
-  orgState: string
+  captureState: typeof captureStates[number]
+  recognitionState: typeof recognitionStates[number]
+  transferState: typeof transferStates[number]
+  archiveState: typeof archiveStates[number]
+  orgState: typeof orgStates[number]
   previewText: string | null
   finalText: string | null
   archivedAudioUri: string | null
@@ -20,6 +38,8 @@ export interface CaptureRecord {
 export interface CaptureSnapshot {
   available: boolean
   setupRequired: boolean
+  onboardingState: CaptureOnboardingState
+  onboardingError: string | null
   notesFolderUri: string | null
   captures: CaptureRecord[]
   error: string | null
@@ -36,6 +56,17 @@ function nullableString(value: unknown, field: string): string | null {
   throw new Error(`Capture ${field} is invalid`)
 }
 
+function state<T extends string>(value: unknown, states: readonly T[], field: string): T {
+  if (typeof value !== 'string' || !states.includes(value as T)) throw new Error(`Capture ${field} is invalid`)
+  return value as T
+}
+
+function legacyBoolean(value: unknown, field: string): boolean {
+  if (value === undefined) return false
+  if (typeof value !== 'boolean') throw new Error(`Capture ${field} is invalid`)
+  return value
+}
+
 export function parseCaptureRecord(value: unknown): CaptureRecord {
   const item = object(value)
   if (item === null || typeof item['captureId'] !== 'string' || item['captureId'].length === 0 ||
@@ -45,13 +76,26 @@ export function parseCaptureRecord(value: unknown): CaptureRecord {
     typeof item['transcriptVersion'] !== 'number' || !Number.isSafeInteger(item['transcriptVersion']) || item['transcriptVersion'] < 0) {
     throw new Error('Capture record is invalid')
   }
-  for (const field of ['captureState', 'recognitionState', 'transferState', 'archiveState', 'orgState'] as const) {
-    if (typeof item[field] !== 'string') throw new Error(`Capture ${field} is invalid`)
+  const liveStatusRevision = item['liveStatusRevision'] === undefined ? 0 : item['liveStatusRevision']
+  if (typeof liveStatusRevision !== 'number' || !Number.isSafeInteger(liveStatusRevision) || liveStatusRevision < 0) {
+    throw new Error('Capture liveStatusRevision is invalid')
   }
   return {
     captureId: item['captureId'] as string, createdAtUtc: item['createdAtUtc'] as string, finishedAtUtc: item['finishedAtUtc'] as string | null,
-    durationMs: item['durationMs'] as number, captureState: item['captureState'] as string, recognitionState: item['recognitionState'] as string,
-    transferState: item['transferState'] as string, archiveState: item['archiveState'] as string, orgState: item['orgState'] as string,
+    purpose: item['purpose'] === undefined ? 'NOTE' : state(item['purpose'], capturePurposes, 'purpose'),
+    requestedLanguage: item['requestedLanguage'] === undefined ? null : nullableString(item['requestedLanguage'], 'requestedLanguage'),
+    speechNetworkFallback: legacyBoolean(item['speechNetworkFallback'], 'speechNetworkFallback'),
+    liveTranscriptionState: item['liveTranscriptionState'] === undefined ? 'NOT_REQUESTED'
+      : state(item['liveTranscriptionState'], liveTranscriptionStates, 'liveTranscriptionState'),
+    liveStatusRevision,
+    canTranscribeLive: legacyBoolean(item['canTranscribeLive'], 'canTranscribeLive'),
+    liveErrorCode: item['liveErrorCode'] === undefined ? null : nullableString(item['liveErrorCode'], 'liveErrorCode'),
+    durationMs: item['durationMs'] as number,
+    captureState: state(item['captureState'], captureStates, 'captureState'),
+    recognitionState: state(item['recognitionState'], recognitionStates, 'recognitionState'),
+    transferState: state(item['transferState'], transferStates, 'transferState'),
+    archiveState: state(item['archiveState'], archiveStates, 'archiveState'),
+    orgState: state(item['orgState'], orgStates, 'orgState'),
     previewText: nullableString(item['previewText'], 'previewText'), finalText: nullableString(item['finalText'], 'finalText'),
     archivedAudioUri: nullableString(item['archivedAudioUri'], 'archivedAudioUri'), error: nullableString(item['error'], 'error'),
     transcriptVersion: item['transcriptVersion'],
@@ -67,9 +111,16 @@ export function parseCaptureSnapshot(value: unknown): CaptureSnapshot {
   }
   const captures = snapshot['captures'].map(parseCaptureRecord)
   if (typeof snapshot['error'] !== 'string' && snapshot['error'] !== null) throw new Error('Capture snapshot error is invalid')
+  const setupRequired = snapshot['setupRequired'] === true
+  const onboardingState = snapshot['onboardingState'] === undefined
+    ? setupRequired ? 'setup-required' : 'enabled'
+    : state(snapshot['onboardingState'], onboardingStates, 'onboarding state')
   return {
     available: snapshot['available'],
-    setupRequired: snapshot['setupRequired'] === true,
+    setupRequired: onboardingState !== 'enabled',
+    onboardingState,
+    onboardingError: snapshot['onboardingError'] === undefined
+      ? snapshot['error'] : nullableString(snapshot['onboardingError'], 'onboarding error'),
     notesFolderUri: nullableString(snapshot['notesFolderUri'], 'notesFolderUri'),
     captures,
     error: snapshot['error'],

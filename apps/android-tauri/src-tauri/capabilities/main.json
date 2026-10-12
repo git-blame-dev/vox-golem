@@ -9,6 +9,23 @@
     "allow-cancel-prompt",
     "allow-reset-session",
     "allow-set-preferences",
+    "allow-set-search-mode",
+    "allow-select-conversation",
+    "allow-select-conversation-head",
+    "allow-save-assistant-draft",
+    "allow-list-assistant-conversations",
+    "allow-list-assistant-heads",
+    "allow-assistant-voice-status",
+    "allow-start-assistant-voice",
+    "allow-finish-assistant-dictation",
+    "allow-stop-assistant-voice",
+    "allow-assistant-pairing-status",
+    "allow-new-voice-shortcut-status",
+    "allow-pin-new-voice-shortcut",
+    "allow-consume-new-voice-shortcut",
+    "allow-stop-send-new-voice-shortcut",
+    "allow-release-new-voice-shortcut",
+    "allow-prepare-new-voice-shortcut",
     "capture:default"
   ]
 }

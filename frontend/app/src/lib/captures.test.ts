@@ -8,12 +8,47 @@ afterEach(() => {
 })
 
 describe('capture IPC adapter', () => {
+  it('preserves voice-entry purpose and treats only legacy records as Notes', () => {
+    expect(parseCaptureRecord(record())).toMatchObject({ purpose: 'NOTE' })
+    for (const purpose of ['NOTE', 'ASK', 'TALK', 'DRAFT']) {
+      expect(parseCaptureRecord({ ...record(), purpose })).toMatchObject({ purpose })
+    }
+    expect(() => parseCaptureRecord({ ...record(), purpose: 'invented' })).toThrow('Capture purpose is invalid')
+    expect(() => parseCaptureRecord({ ...record(), purpose: null })).toThrow('Capture purpose is invalid')
+  })
+  it('preserves captured speech policy and live readiness without treating availability as accepted input', () => {
+    expect(parseCaptureRecord({ ...record(), purpose: 'ASK', orgState: 'NONE', requestedLanguage: 'en-AU',
+      speechNetworkFallback: false, liveTranscriptionState: 'UNAVAILABLE', liveStatusRevision: 3,
+      canTranscribeLive: false, liveErrorCode: 'external-audio-provider-unavailable' })).toMatchObject({
+      purpose: 'ASK', orgState: 'NONE', requestedLanguage: 'en-AU', speechNetworkFallback: false,
+      liveTranscriptionState: 'UNAVAILABLE', liveStatusRevision: 3, canTranscribeLive: false,
+      liveErrorCode: 'external-audio-provider-unavailable',
+    })
+    expect(parseCaptureRecord(record())).toMatchObject({ requestedLanguage: null, speechNetworkFallback: false,
+      liveTranscriptionState: 'NOT_REQUESTED', liveStatusRevision: 0, canTranscribeLive: false, liveErrorCode: null })
+    expect(() => parseCaptureRecord({ ...record(), liveStatusRevision: -1 })).toThrow('Capture liveStatusRevision is invalid')
+    expect(() => parseCaptureRecord({ ...record(), liveTranscriptionState: 'invented' })).toThrow('Capture liveTranscriptionState is invalid')
+    expect(() => parseCaptureRecord({ ...record(), speechNetworkFallback: 'true' })).toThrow('Capture speechNetworkFallback is invalid')
+  })
+  it('preserves explicit onboarding progress and errors without treating startup as failure', () => {
+    const base = { available: true, setupRequired: true, notesFolderUri: null, captures: [], error: null }
+    expect(parseCaptureSnapshot({ ...base, onboardingState: 'starting', onboardingError: null })).toMatchObject({
+      onboardingState: 'starting', onboardingError: null,
+    })
+    expect(parseCaptureSnapshot({ ...base, onboardingState: 'permission-required', onboardingError: 'synthetic-denial' })).toMatchObject({
+      onboardingState: 'permission-required', onboardingError: 'synthetic-denial',
+    })
+    expect(() => parseCaptureSnapshot({ ...base, onboardingState: 'invented', onboardingError: null })).toThrow('Capture onboarding state is invalid')
+    expect(parseCaptureSnapshot({ ...base, setupRequired: true, onboardingState: 'enabled', onboardingError: null }).setupRequired).toBe(false)
+    expect(parseCaptureSnapshot({ ...base, error: 'synthetic-legacy-error' }).onboardingError).toBe('synthetic-legacy-error')
+  })
   it('validates the camelCase capture schema and rejects malformed native payloads', () => {
     expect(parseCaptureSnapshot({ available: true, notesFolderUri: null, captures: [record()], error: null })).toMatchObject({ setupRequired: false })
     expect(parseCaptureSnapshot({ available: true, notesFolderUri: null, captures: [record()], error: null }).captures[0]).toMatchObject({
       captureId: 'synthetic-capture-1', previewText: 'Last preview', finalText: 'Final words', transcriptVersion: 2,
     })
     expect(() => parseCaptureRecord({ ...record(), durationMs: -1 })).toThrow('Capture record is invalid')
+    expect(() => parseCaptureRecord({ ...record(), recognitionState: 'invented' })).toThrow('Capture recognitionState is invalid')
     expect(() => parseCaptureSnapshot({ available: true, notesFolderUri: null, captures: [record(), {}], error: null })).toThrow('Capture record is invalid')
     expect(() => parseCaptureSnapshot({ available: true, notesFolderUri: null, captures: Array.from({ length: 101 }, record), error: null })).toThrow('Capture snapshot is invalid')
     expect(() => parseCaptureSnapshot({ available: true, setupRequired: 'yes', notesFolderUri: null, captures: [], error: null })).toThrow('Capture snapshot is invalid')

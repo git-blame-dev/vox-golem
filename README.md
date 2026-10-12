@@ -4,52 +4,101 @@
 [![Latest release](https://img.shields.io/github/v/release/git-blame-dev/vox-golem?label=release&logo=github&logoColor=white)](https://github.com/git-blame-dev/vox-golem/releases/latest)
 [![Ubuntu 24.04 x86_64](https://img.shields.io/badge/Ubuntu%2024.04-x86__64-E95420?logo=ubuntu&logoColor=white)](#supported-linux-baseline)
 
-Vox Golem is a Linux-first, Linux/Windows Tauri desktop voice assistant for typed or spoken developer prompts. It captures wake-word turns, transcribes locally when configured, and displays the answer and runtime state in one UI.
+Vox Golem is a Linux-first assistant with Linux/Windows Tauri desktop, Android phone, and native Wear OS shells. Desktop supports typed or spoken developer prompts, including configured wake-word capture and local transcription. Phone and watch can each run foreground Custom-provider chat; neither requires the other to execute its provider request once credentials and network access are available.
 
-The Android debug app shares the responsive React UI and canonical conversation lifecycle with desktop. Separate desktop and Android Tauri shells own native packaging, permissions, lifecycle, and storage. Android initially supports foreground typed Custom-provider chat; desktop retains voice, local models, OpenCode, completion, Deep/Review, and signed updates. Browser preview exercises the same UI with a labelled deterministic simulated runtime.
+Desktop and phone share the responsive React UI. Wear uses native Kotlin/Compose and an ARM32 Rust JNI library, not a WebView. Browser preview uses the same React tree with a labelled deterministic simulated runtime.
 
-## Android debug build
+## Platform boundaries
 
-Use JDK 21, Android SDK platform/build tools 36, NDK 28.2.13676358, Tauri CLI 2.11.1, and the `aarch64-linux-android` Rust target. Set `JAVA_HOME`, `ANDROID_HOME`, and `NDK_HOME`, and put the JDK's `bin` directory on the build shell's `PATH`.
+| Capability | Linux/Windows desktop | Android phone | Wear OS |
+| --- | --- | --- | --- |
+| Chat providers | Local, Custom, OpenCode | Custom; foreground only | Custom; foreground only |
+| Conversation storage | Desktop lifecycle; no phone/Wear replication wiring | App-private SQLite, local drafts, conversation/head selection | Same native store/domain; local drafts and conversation/head selection |
+| Phone/Wear conversation sync | Not wired | Automatic native-paired sharing | Automatic native-paired sharing |
+| Assistant speech | Configured desktop wake/VAD/transcription/TTS | Native admission enabled; on-device dictation requires installed language support; optional local TTS | On-device SDK dictation when installed language support is proven; optional local TTS |
+| Voice notes | No native watch capture runtime | Watch-audio recognition, history and SAF/Org export | Durable local recording with phone preview/archive transfer |
+| Desktop-only features | Completion, Deep/Review, prefetch, signed updates | Capability-gated off | Not included |
 
-```bash
-make android-build
-```
+Linux builds and tests do not establish Windows, Android or Wear runtime readiness. Real microphone, speech provider, gestures, lifecycle, GMS transport and optimized JNI paths require device acceptance.
 
-The ARM64 debug APK is under `apps/android-tauri/src-tauri/gen/android/app/build/outputs/apk/universal/debug/`. The Android package disables cleartext and backup and stores bounded chat conversations and preferences in memory. Stop, New Chat, app suspension, and lost Channels invalidate active chat requests; interrupted output is not committed to later prompt history. Watch dictation uses a separate native capture plugin with persisted recording/history state and explicit permission setup.
+## Android and Wear builds
 
-Android does not perform login or refresh OAuth credentials. Provision an existing compatible OpenCode login into the installed debug app's private storage:
-
-```bash
-make android-provision-auth DEVICE=<exact-authorized-transport> AUTH_PATH=<host-auth.json>
-```
-
-For pairing held by another Linux host, set `ADB_SSH_HOST` and optionally `REMOTE_ADB`; credentials are streamed through SSH/ADB without printing their contents. Provisioning validates and snapshots bounded input, atomically installs a restricted app-private file, and verifies transfer length and permissions. Reprovision when the credential expires. A debug build and app-private storage do not establish a supported in-app login flow.
-
-`make android-init` is the sole scaffold-regeneration command. The pinned generator owns Gradle scaffolding and launcher resources; the authored manifest and backup-rule exceptions remain versioned. Chat does not enable desktop wake-word capture, local model inference, OpenCode subprocesses, Deep/Review, prefetch, persistent chats, or background chat requests. Watch dictation does not enter the assistant pipeline.
-
-## Watch dictation companion
-
-The native Wear OS app is maintained under `apps/wear/`; phone capture integration and shared domain/storage code live under `crates/capture-plugin/`. The phone and watch use the same application ID and compatible signing certificates for Wear Data Layer. Both APKs must be installed on their corresponding devices.
+Run from this source checkout on Linux. Use JDK 21, Android SDK platform/build tools 36, NDK 28.2.13676358 and Tauri CLI 2.11.1. Set `JAVA_HOME`, `ANDROID_HOME`, and `NDK_HOME`; put the JDK's `bin` on `PATH`. Rust targets are `aarch64-linux-android` for the phone and `armv7-linux-androideabi` for the current Wear APK. JNI builds use cached Cargo dependencies (`--offline --locked`).
 
 ```bash
-make wear-test
-make wear-build
+make android-build           # ARM64 phone debug APK, including both native plugins
+make android-assistant-test  # shared Assistant + phone bridge unit tests and lint
+make android-capture-test    # shared capture + phone plugin unit tests and lint
+make wear-test               # shared libraries + Wear unit tests and lint
+make wear-build              # ARM32 Wear debug APK
+make wear-performance        # optimized, non-debuggable, debug-signed local trial
 ```
 
-These commands need JDK 21 and Android SDK platform 36. The Wear debug APK is `apps/wear/app/build/outputs/apk/debug/app-debug.apk`. The existing `make android-build` builds the phone APK, including the native capture plugin. CI builds both artifacts on Linux.
+Phone output: `apps/android-tauri/src-tauri/gen/android/app/build/outputs/apk/universal/debug/`. Wear outputs: `apps/wear/app/build/outputs/apk/{debug,performance}/`. An optimized local trial is not a production-signed release. These commands build/check source; they do not install anything.
 
-On the phone, open **Voice notes**, enable watch dictation through the visible permission setup, and choose the notes folder through Android's folder picker. Audio remains staged locally until a verified copy is saved under `recordings/<capture-id>.wav` in that folder. The app creates `inbox.org` if absent and prepends one final transcript as a `* TODO` with a capture-day, date-only `SCHEDULED` line. No assistant completion, summary, or property drawer is added. Playback, processing retries and transcript corrections are available in history; correcting an already exported transcript does not create another task.
+`make android-init` is the only phone scaffold-regeneration command. Keep authored configuration, native libraries and UI sources outside generated output; launcher assets derive from the canonical [SVG](apps/desktop-tauri/src-tauri/icons/icon.svg). The [phone shell guide](apps/android-tauri/README.md) covers native setup, and the [Wear guide](apps/wear/README.md) covers launchers and device gates.
 
-On the watch, select **VoxGolem Capture** as Samsung knock-knock's launcher target. A deliberate launch starts one recording after microphone permission; normal resume does not start another. Local recording persists independently of phone connectivity. Manual Stop is available, and arm-down stopping uses a user-calibrated motion policy whose accuracy must be checked on the worn device. Keep the ordinary watch face between captures. A saved-on-watch acknowledgement is distinct from phone archival or Org export.
+## Shared phone/Wear Assistant
 
-Recognition uses the phone's native on-device speech provider with supplied watch PCM; provider external-audio and segmented-session support must be validated on the actual phone. An unavailable provider or dropped connection retains audio for later processing, with accurate pending/error state. Fully offline watch-local live ASR is not bundled. Native storage and export recovery distinguish verified success from ambiguous SAF writes; ambiguous conflicts retain recovery data and need review. Normal permanent recordings are not automatically pruned.
+Phone and watch retain the **same conversation identities and completed turns** after native enrollment and reconciliation, while drafts, selected heads, running requests and provisional text remain local. Concurrent continuations remain branches: choose a head before sending rather than silently merging sibling answers. New Chat retains existing conversations.
+
+Rust core owns immutable operations, snapshot validation, merge/deletion rules and bounded context selection. The shared headless JNI bridge applies those rules; [AssistantRuntime](crates/assistant-android/src/main/java/dev/gitblame/voxgolem/assistant/runtime/AssistantRuntime.kt) owns one engine per process. [AssistantStore](crates/assistant-android/src/main/java/dev/gitblame/voxgolem/assistant/AssistantStore.kt) owns app-private SQLite transactions, including revision checks, outboxes and exact per-peer receipts. Installation replica IDs and credentials are excluded from backup. Provisional output is not history: successful delivery gating and a local commit are required before a completed turn is published.
+
+Conversation replication uses bounded, finite GMS DataItem/Asset exchanges of immutable records, never an imported database snapshot or a remote-generation command. Receiver commit precedes exact-body ACK; SDK submission alone is not proof of synchronization. Wear Data Layer may route through encrypted Google servers when direct connectivity is unavailable, so this is **not a cloud-free transport**. Custom prompts and answers also go to the configured remote provider. See the [shared native Assistant guide](crates/assistant-android/README.md) for ownership and canonical source links.
+
+### Provider access: external development setup only
+
+Phone and Watch consume existing access from their own app-private provider files, read-only. There is no credential settings panel, document-picker import, phone-to-Watch credential copy, login, renewal or refresh workflow. Normal chat still reports unavailable, expired or rejected provider access and retains drafts for deliberate retry.
+
+For authorized development, manually inject an existing compatible access-only file into each selected app's private provider location using external developer tooling. Keep that tooling and all source/staging files outside this repository, publish a complete owner-only file (0600), verify the target and publication without printing contents, then restart the app. Preserve upstream auth, histories and other app data. Do not put runtime keys in prompts, logs, examples or project artifacts. There is no maintained provisioning/export helper in this repository; non-debuggable installations cannot be assumed to permit `run-as`.
+
+Conversation sharing remains automatic over native-paired, matching-package/signature Wear Data Layer apps. Version-3 peer identity is independent of provider access; sync neither transfers credentials nor requires usable access. Each device needs its own valid access and internet route to generate an answer. A proper device-auth flow is deferred, not available in the current app.
+
+### Phone voice chat shortcut
+
+Android Settings exposes **Add Ask to Home screen**. On API26+ with a supporting launcher, pinning requires launcher confirmation; installation alone never pins it. Ask preserves the current conversation and existing draft, submits one authoritative finalized utterance once, optionally speaks the reply, then idles. Talk uses the same current-context pipeline and reopens recognition after the reply/playback completes. **Stop cancels without sending**; ordinary draft dictation still requires a separate Send. Unverified phone shortcut origins require a visible in-app Ask tap rather than automatic microphone consent. Missing provider/language support leaves typing available. Stable legacy shortcut/command IDs remain compatibility interfaces, not the current new-chat workflow. See the [phone bridge guide](crates/assistant-plugin/README.md#new-voice-chat-shortcut-implemented-source).
+
+The phone plugin now enables shared speech-resource admission on load. This removes the previous source-wiring blocker, not the need for microphone permission, installed provider/language checks or physical acceptance. The separate watch-to-phone supplied-audio Assistant lane has production runtime constructors, but its provider/device gate remains default-false without physical calibration evidence; it is not advertised as an activated UI feature.
+
+Automated builds and checks establish software compatibility, not launcher, speech-provider or physical runtime acceptance. During a refactor, previously built or installed APKs are not evidence for the changing source. Deployment must verify the matching build, application ID, ABI, signing certificate and APK SHA-256, and preserve user data.
+
+## Voice notes: separate from Assistant
+
+On the phone, open **Voice notes**, enable watch dictation through visible permission setup, and select the destination with Android's folder picker. On the watch, use **Vox Note**, including as Samsung knock-knock's target. A deliberate launch starts one recording after setup; ordinary resume does not start another. Recording remains local when the phone is absent. Arm-down stopping needs calibration and worn-device verification; manual Stop remains available.
+
+Vox Note records on the Watch and attempts live phone transcription from supplied PCM (API33+); text previews return while recording, with saved-WAV replay as recovery after Stop. New Notes capture the shared installation speech language/fallback preference at Start; an Automatic language resolves to the Watch locale. With fallback disabled, admission requires the dedicated on-device route. With fallback allowed, an ordinary provider may use network processing; offline preference is not an offline guarantee. Legacy records without captured policy require dedicated on-device recognition. Supplied-input/segmented support and microphone-source isolation require actual provider acceptance, not API availability or a READY callback. No recognition model is bundled or downloaded. Recording readiness, transcription readiness, retained audio, archival and export are distinct statuses. Note capture never submits an Assistant prompt.
+
+Verified WAV copies go to `recordings/<capture-id>.wav` in the selected folder. The app creates `ai-inbox.org` if absent and prepends a final transcript as a `* TODO` with a capture-day, date-only `SCHEDULED` line, without a summary or property drawer. Only the matching `ai-inbox.org.txt` candidate may be normalized. Existing `inbox.org` files and old exports stay untouched; old-target pending journals require review. Corrections to an already exported transcript do not create another task. Ambiguous SAF writes retain recovery data rather than claiming success; permanent recordings are not automatically pruned.
+
+Shared records, SQLite and WAV code live in [capture-android](crates/capture-android/README.md); the [capture API guide](crates/capture-plugin/API.md) links canonical types, phone adapters and the frontend parser without duplicating schemas. Watch **SAVED**, phone archival and Org export are distinct acknowledgements.
 
 ## Capabilities
 
 Each capability is optional and uses user-supplied local assets: local `llama.cpp`, the experimental Custom private Codex endpoint, OpenCode, wake-word/VAD/transcription, and local TTS. Eight Instant choices are **Local Fast**, **Local Quality**, **Custom Sol High**, **Custom Sol No Reasoning**, **Custom GPT-6 Luna No Reasoning**, **Custom GPT-5.6 Luna Low**, **OpenCode Sol High**, and **OpenCode Luna Low**. Both Custom Sol choices and Custom GPT-6 Luna No Reasoning use VoxGolem's direct Rust connection to the configured Custom endpoint; OpenCode choices use the separate OpenCode client. Four Deep/Review choices are **Custom Sol High**, **Custom Luna Low**, **OpenCode Sol High**, and **OpenCode Luna Low**.
 
 Deep and Review default to disabled. They are reasoning/review-only paths with no workspace or shell authority; OpenCode research is restricted to `websearch` and `webfetch`. Prefetch is disabled by default; enabling it can transmit predicted prompt text to the configured provider before submission.
+
+The stable Custom/OpenCode Sol aliases now request `gpt-6.1-sol`; alias mapping is not
+evidence that a live provider accepts that model. Chat remains on the requested backend,
+independent of local-first speech processing.
+
+### Web permission and response presentation
+
+Web access defaults on and is persisted per installation through Settings, separately
+from Quick/Verify/Research effort. Verify and Research are explicit lookup actions, not
+prompt-keyword heuristics. Disabling web access keeps ordinary chat available, advertises
+no web tools and prevents native lookup/provider-fallback calls; it does not make remote
+chat or provider-controlled speech offline. Native lookup sends model-generated queries,
+focus text and URLs to Parallel, with Exa as the disclosed fallback. OpenCode research is
+delegated to its configured runtime, whose external provider identity may be unknown.
+External correlation is process-scoped rather than the canonical local conversation ID.
+
+One portable app-owned policy requests plain text and the shortest complete answer,
+without a duplicate lead summary. Tool calls, required structured stage JSON, refusals,
+literal code/symbols and essential sources retain their contracts. Existing conversation
+records and external `SOUL.md` content are not rewritten. Mobile speech consumes the
+answer-only projection, not the canonical source footer. Model compliance and physical
+speech behavior remain separate acceptance checks.
 
 ## Supported Linux baseline
 
@@ -87,7 +136,7 @@ cargo install tauri-cli --version 2.11.1 --locked
 
 Copy [`config.example.toml`](config.example.toml) to `${XDG_CONFIG_HOME:-$HOME/.config}/voxgolem/config.toml` (or set `VOXGOLEM_CONFIG_PATH`). When using Local Fast or Local Quality on any platform, also create a non-empty `SOUL.md` beside that config; copying the example is therefore a config-only setup step, and the required soul text must be supplied separately. Missing local assets or `SOUL.md` disable only the local response capability. XDG defaults are `~/.config/voxgolem`, `~/.local/share/voxgolem`, `~/.local/state/voxgolem`, and `~/.cache/voxgolem`. Relative paths resolve beside the config. Keep model files external; there is no model downloader.
 
-OpenCode uses its existing CLI login/auth state; this app does not provision credentials. Custom endpoints are experimental, especially private endpoints; inspect the endpoint and auth configuration before use. Never put secrets in this example or in source control.
+Desktop OpenCode uses its existing CLI login/auth state; the desktop app does not perform login or renewal. Mobile external development access setup is described above. Custom endpoints are experimental, especially private endpoints; inspect the endpoint and auth configuration before use. Never put secrets in examples or source control.
 
 ## Commands
 

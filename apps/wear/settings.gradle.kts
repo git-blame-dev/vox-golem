@@ -17,5 +17,12 @@ dependencyResolutionManagement {
 rootProject.name = "VoxGolemWear"
 include(":app")
 
-// The app's prepareCaptureDomainSources task shares only the maintained capture
-// domain and storage sources. Phone Tauri services and capabilities stay on phone.
+include(":voice-android")
+project(":voice-android").projectDir = file("../../crates/voice-android")
+
+include(":capture-android")
+project(":capture-android").projectDir = file("../../crates/capture-android")
+
+gradle.extensions.extraProperties["assistantNativeAbis"] = listOf("armeabi-v7a")
+include(":assistant-android")
+project(":assistant-android").projectDir = file("../../crates/assistant-android")

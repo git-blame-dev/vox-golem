@@ -82,6 +82,20 @@ describe('browser preview runtime', () => {
     })
   })
 
+  it('publishes all stable Instant choices through the production snapshot parser without enabling native-only models', async () => {
+    const snapshot = parseAppSnapshot(await getBrowserPreviewInternals().invoke('get_app_snapshot'))
+    expect(snapshot.modelOptions.map((model) => model.id)).toEqual([
+      'local-fast', 'local-quality', 'custom-sol-high', 'custom-sol-none',
+      'custom-luna-none', 'custom-luna-low', 'opencode-sol-high', 'opencode-luna-low',
+    ])
+    expect(snapshot.modelOptions.filter((model) => model.available).map((model) => model.id)).toEqual(['local-fast'])
+    expect(snapshot.modelOptions.find((model) => model.id === 'custom-sol-none')).toEqual({
+      id: 'custom-sol-none', label: 'Custom: GPT-6.1 Sol No Reasoning', available: false,
+      unavailableReason: 'Unavailable in browser preview',
+    })
+    expect(snapshot.modelOptions.find((model) => model.id === 'opencode-sol-high')?.label).toBe('OpenCode: GPT-6.1 Sol High')
+  })
+
   it('rejects deterministic failures without committing partial output', async () => {
     vi.useFakeTimers()
     configureBrowserPreviewFixture({
@@ -244,6 +258,9 @@ describe('browser preview runtime', () => {
       ttsEnabled: false,
       uiTheme: 'light',
       uiTextSize: 'large',
+      webEnabled: true,
+      speechNetworkFallback: true,
+      speechLanguage: '', speechTtsProvider: '', speechTtsVoice: '',
     })
     proposal.ui_theme = 'dark'
     returned['ui_theme'] = 'dark'
@@ -252,6 +269,34 @@ describe('browser preview runtime', () => {
       uiTheme: 'light',
       uiTextSize: 'large',
     })
+  })
+
+  it('round-trips speech strings through preview snapshots and legacy settings without adding speech capability', async () => {
+    const runtime = getBrowserPreviewInternals()
+    const wire = await runtime.invoke('get_app_snapshot') as { preferences: Record<string, unknown> }
+    const proposed = { ...wire.preferences, speech_language: 'en-AU', speech_tts_provider: 'synthetic.tts.engine', speech_tts_voice: 'é'.repeat(256) }
+    expect(await runtime.invoke('set_preferences', { preferences: proposed })).toEqual(proposed)
+    const settings = await runtime.invoke('get_assistant_settings') as Record<string, unknown>
+    expect(settings).toMatchObject({ speech_language: 'en-AU', speech_tts_provider: 'synthetic.tts.engine', speech_tts_voice: 'é'.repeat(256) })
+    const oldSettings = { ...settings }; delete oldSettings['speech_language']; delete oldSettings['speech_tts_provider']; delete oldSettings['speech_tts_voice']
+    expect(await runtime.invoke('set_assistant_settings', { settings: oldSettings })).toMatchObject({ speech_language: 'en-AU', speech_tts_provider: 'synthetic.tts.engine', speech_tts_voice: 'é'.repeat(256) })
+    for (const field of ['speech_language', 'speech_tts_provider', 'speech_tts_voice']) {
+      for (const value of [null, true, 'é'.repeat(257)]) await expect(runtime.invoke('set_preferences', { preferences: { ...proposed, [field]: value } })).rejects.toMatchObject({ code: 'invalid_input' })
+    }
+    const snapshot = parseAppSnapshot(await runtime.invoke('get_app_snapshot'))
+    expect(snapshot.preferences).toMatchObject({ speechLanguage: 'en-AU', speechTtsProvider: 'synthetic.tts.engine', speechTtsVoice: 'é'.repeat(256) })
+    expect(snapshot.capabilities.find(({ id }) => id === 'tts')?.state).toBe('unavailable')
+  })
+
+  it('accepts old full preferences, persists new policies and still rejects unknown or malformed fields atomically', async () => {
+    const runtime = getBrowserPreviewInternals()
+    const wire = await runtime.invoke('get_app_snapshot') as { preferences: Record<string, unknown> }
+    const proposal = { ...wire.preferences, web_enabled: false, speech_network_fallback: false }
+    expect(parseValidatedPreferences(await runtime.invoke('set_preferences', { preferences: proposal }))).toMatchObject({ webEnabled: false, speechNetworkFallback: false })
+    for (const bad of [{ ...proposal, web_enabled: 'false' }, { ...proposal, speech_network_fallback: null }, { ...proposal, unsupported: true }]) {
+      await expect(runtime.invoke('set_preferences', { preferences: bad })).rejects.toMatchObject({ code: 'invalid_input' })
+    }
+    expect(parseAppSnapshot(await runtime.invoke('get_app_snapshot')).preferences).toMatchObject({ webEnabled: false, speechNetworkFallback: false })
   })
 
   it('rejects sparse fixture chunks before admitting work', async () => {

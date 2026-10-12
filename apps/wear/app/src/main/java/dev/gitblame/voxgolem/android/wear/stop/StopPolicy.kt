@@ -48,7 +48,12 @@ class ProvisionalMotionStopPolicy(
     private val loweringAngleDegrees: Float? = null,
     private val referenceDurationMs: Long = 500,
     private val loweringHoldMs: Long = 750,
+    private val maxSampleGapMs: Long = 250,
 ) {
+    private var readyCaptureId: String? = null
+    private var readyAtMs = 0L
+    private var stopRequested = false
+    private var lastValidSampleAt: Long? = null
     private var referenceStartedAt: Long? = null
     private var referenceX = 0.0
     private var referenceY = 0.0
@@ -59,13 +64,34 @@ class ProvisionalMotionStopPolicy(
 
     init {
         require(loweringAngleDegrees == null || loweringAngleDegrees in 1f..179f)
-        require(referenceDurationMs > 0 && loweringHoldMs > 0)
+        require(referenceDurationMs > 0 && loweringHoldMs > 0 && maxSampleGapMs > 0)
+    }
+
+    fun onMicrophoneReady(captureId: String, elapsedMs: Long = 0) {
+        require(elapsedMs >= 0)
+        if (readyCaptureId == captureId) return
+        reset()
+        readyCaptureId = captureId
+        readyAtMs = elapsedMs
     }
 
     fun onGravitySample(captureId: String, x: Float, y: Float, z: Float, elapsedMs: Long): StopRequest? {
+        if (captureId != readyCaptureId || stopRequested || loweringAngleDegrees == null) return null
+        if (elapsedMs < readyAtMs) { interruptSamples(); return null }
         val magnitude = kotlin.math.sqrt(x * x + y * y + z * z)
-        if (magnitude !in 6f..13f) return null
-        if (loweringAngleDegrees == null) return null
+        if (magnitude !in 6f..13f) {
+            interruptSamples()
+            return null
+        }
+        val previousSampleAt = lastValidSampleAt
+        if (previousSampleAt != null) {
+            if (elapsedMs <= previousSampleAt) {
+                interruptSamples()
+                return null
+            }
+            if (elapsedMs - previousSampleAt > maxSampleGapMs) interruptSamples()
+        }
+        lastValidSampleAt = elapsedMs
 
         if (!referenceReady) {
             if (referenceCount == 0) referenceStartedAt = elapsedMs
@@ -85,6 +111,7 @@ class ProvisionalMotionStopPolicy(
         if (angle >= loweringAngleDegrees) {
             if (loweringStartedAt == null) loweringStartedAt = elapsedMs
             if (elapsedMs - (loweringStartedAt ?: elapsedMs) >= loweringHoldMs) {
+                stopRequested = true
                 return StopRequest(captureId, "provisional_motion_lowering")
             }
         } else {
@@ -94,12 +121,26 @@ class ProvisionalMotionStopPolicy(
     }
 
     fun reset() {
+        readyCaptureId = null
+        readyAtMs = 0
+        stopRequested = false
+        lastValidSampleAt = null
+        loweringStartedAt = null
+        clearReference()
+    }
+
+    private fun interruptSamples() {
+        lastValidSampleAt = null
+        loweringStartedAt = null
+        if (!referenceReady) clearReference()
+    }
+
+    private fun clearReference() {
         referenceStartedAt = null
         referenceX = 0.0
         referenceY = 0.0
         referenceZ = 0.0
         referenceCount = 0
         referenceReady = false
-        loweringStartedAt = null
     }
 }

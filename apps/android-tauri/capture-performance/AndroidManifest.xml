@@ -1,0 +1,7 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <profileable android:shell="true" />
+        <meta-data android:name="dev.gitblame.voxgolem.capture.TIMING_ENABLED" android:value="true" />
+        <meta-data android:name="dev.gitblame.voxgolem.assistant.TIMING_ENABLED" android:value="true" />
+    </application>
+</manifest>

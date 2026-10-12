@@ -74,7 +74,7 @@ class CaptureTransferJobTest {
         assertTrue(job.isPersisted)
         assertTrue(job.minLatencyMillis in 25_000L..30_000L)
 
-        repository.update(id) { it.copy(transferState = TransferState.PHONE_ARCHIVED) }
+        repository.update(id) { it.copy(transferState = TransferState.PHONE_ARCHIVED, completionNotified = true) }
         CaptureTransferJob.schedule(context)
         assertEquals(0, scheduler.allPendingJobs.size)
     }
@@ -160,5 +160,67 @@ class CaptureTransferJobTest {
         val beforeCappedAttempt = Instant.parse(shared.get(id)!!.nextRetryAtUtc)
         watch.beginTransferAttempt(id, beforeCappedAttempt)
         assertEquals(beforeCappedAttempt.plusSeconds(300).toString(), shared.get(id)!!.nextRetryAtUtc)
+    }
+
+    @Test fun offlineFailureOfOneCaptureDoesNotPreventAnotherDueCaptureFromPersistingItsOwnRetry() {
+        val context = RuntimeEnvironment.getApplication()
+        val shared = CaptureRepository(context)
+        val at = Instant.parse("2026-10-05T12:30:00Z")
+        fun pending(offset: Long, retryAt: String?, state: TransferState = TransferState.PENDING): CaptureRecord = shared.save(CaptureRecord(
+            captureId = UUID.randomUUID().toString(), createdAtUtc = at.plusSeconds(offset).toString(),
+            captureState = CaptureState.INTERRUPTED, transferState = state,
+            localAudioPath = "/synthetic/offline-$offset/audio.wav", finalizedByteLength = 48,
+            durableFrames = 2, sha256 = "a".repeat(64), nextRetryAtUtc = retryAt,
+        ))
+        val first = pending(0, null)
+        val malformedDeadline = pending(1, "synthetic invalid timestamp")
+        val future = pending(2, at.plusSeconds(90).toString())
+        val staged = pending(3, at.toString(), TransferState.PHONE_STAGED)
+        WearCaptureTransport(context).transferPending(at)
+        for (record in listOf(first, malformedDeadline)) {
+            val attempted = shared.get(record.captureId)!!
+            assertEquals(TransferState.SENDING, attempted.transferState)
+            assertEquals(1, attempted.retryCount)
+            assertEquals(at.plusSeconds(30).toString(), attempted.nextRetryAtUtc)
+        }
+        assertEquals(future, shared.get(future.captureId))
+        assertEquals(TransferState.PHONE_STAGED, shared.get(staged.captureId)!!.transferState)
+        assertEquals(at.plusSeconds(60).toString(), shared.get(staged.captureId)!!.nextRetryAtUtc)
+        assertEquals(4, dev.gitblame.voxgolem.android.wear.capture.CaptureRepository(context).pendingTransfers().size)
+    }
+
+    @Test fun archivedAndNoSpeechCompletionCancelOnlyTheirOwnOutboxEntries() {
+        val context = RuntimeEnvironment.getApplication()
+        val shared = CaptureRepository(context)
+        val at = Instant.parse("2026-10-05T12:30:00Z")
+        fun saved(offset: Long) = shared.save(CaptureRecord(
+            captureId = UUID.randomUUID().toString(), createdAtUtc = at.plusSeconds(offset).toString(),
+            captureState = CaptureState.SAVED, transferState = TransferState.PHONE_ARCHIVED,
+            localAudioPath = "/synthetic/$offset/audio.wav",
+        ))
+        val completed = saved(0)
+        val noSpeech = saved(1)
+        val stillWaiting = saved(2)
+        shared.update(completed.captureId) { it.copy(completionNotified = true) }
+        shared.update(noSpeech.captureId) { it.copy(recognitionState = dev.gitblame.voxgolem.capture.RecognitionState.NO_SPEECH) }
+        val watch = dev.gitblame.voxgolem.android.wear.capture.CaptureRepository(context)
+        assertEquals(listOf(stillWaiting.captureId), watch.pendingTransfers().map { it.captureId })
+        CaptureTransferJob.schedule(context, immediate = true)
+        assertEquals(0L, context.getSystemService(JobScheduler::class.java).allPendingJobs.single().minLatencyMillis)
+        assertTrue(shared.get(completed.captureId)!!.completionNotified)
+    }
+
+    @Test fun stagedOrArchivedCapturesCannotBeginAnArchiveResendOrLoseReceiptState() {
+        val context = RuntimeEnvironment.getApplication()
+        val shared = CaptureRepository(context)
+        val watch = dev.gitblame.voxgolem.android.wear.capture.CaptureRepository(context)
+        val at = Instant.parse("2026-10-05T12:30:00Z")
+        for (status in listOf(TransferState.PHONE_STAGED, TransferState.PHONE_ARCHIVED)) {
+            val record = shared.save(CaptureRecord(UUID.randomUUID().toString(), createdAtUtc = at.toString(), transferState = status))
+            assertEquals(null, watch.beginTransferAttempt(record.captureId, at))
+            assertEquals(record, shared.get(record.captureId))
+            watch.updateTransfer(record.captureId, TransferState.PENDING, at)
+            assertEquals(status, shared.get(record.captureId)!!.transferState)
+        }
     }
 }

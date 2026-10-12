@@ -31,6 +31,7 @@ export interface AnswerStageProps {
   readonly priorVersions?: readonly AnswerPriorVersion[]
   readonly sources?: readonly AnswerSource[]
   readonly className?: string
+  readonly compact?: boolean
 }
 
 const stageLabels: Record<AnswerStageName, string> = {
@@ -54,17 +55,18 @@ function PlainText({ children }: { readonly children: string }): ReactNode {
   return children
 }
 
-export function AnswerStage({ answer, contentKind = 'text', stages, priorVersions = [], sources = [], className }: AnswerStageProps) {
+export function AnswerStage({ answer, contentKind = 'text', stages, priorVersions = [], sources = [], className, compact = false }: AnswerStageProps) {
   const rootClassName = className === undefined ? 'answer-stage' : `answer-stage ${className}`
   const stageDetails = stages.filter(({ detail }) => typeof detail === 'string' && detail.trim() !== '')
   const hasDetails = sources.length > 0 || stageDetails.length > 0 || priorVersions.length > 0
+  const visibleStages = compact ? stages.filter(({ stage, status }) => stage !== 'instant' || status !== 'completed') : stages
 
   return (
-    <section className={rootClassName} aria-label={contentKind === 'refusal' ? 'Assistant refusal' : 'Current answer'} data-content-kind={contentKind}>
-      <h2>{contentKind === 'refusal' ? 'Assistant refusal' : 'Current answer'}</h2>
+    <section className={rootClassName} aria-label={contentKind === 'refusal' ? 'Assistant refusal' : compact ? 'Assistant answer' : 'Current answer'} data-content-kind={contentKind}>
+      {!compact || contentKind === 'refusal' ? <h2>{contentKind === 'refusal' ? 'Assistant refusal' : 'Current answer'}</h2> : null}
       <p className="answer-stage__answer"><PlainText>{answer}</PlainText></p>
-      <ul className="answer-stage__statuses" aria-label="Answer stage status">
-         {stages.map(({ stage, status }, index) => (
+      {!compact || visibleStages.length > 0 ? <ul className="answer-stage__statuses" aria-label="Answer stage status">
+         {visibleStages.map(({ stage, status }, index) => (
           <li key={`${stage}-${status}-${index}`} data-stage={stage} data-status={status}>
             <span>{stageLabels[stage]}</span>
             <span aria-label={`${stageLabels[stage]} status: ${statusLabels[status]}`}>
@@ -72,7 +74,7 @@ export function AnswerStage({ answer, contentKind = 'text', stages, priorVersion
             </span>
           </li>
         ))}
-      </ul>
+      </ul> : null}
 
       {hasDetails ? <details className="answer-stage__details">
         <summary>Details</summary>

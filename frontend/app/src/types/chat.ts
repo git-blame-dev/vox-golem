@@ -82,6 +82,19 @@ export interface StartupCapability {
   readonly actualProvider: string | null
 }
 
+export interface SpeechServiceMetadata {
+  readonly configuredEngine: string | null
+  readonly runtimeEngine: string | null
+  readonly configuredModel: string | null
+  readonly configuredVoice: string | null
+  readonly configuredLocale: string | null
+}
+
+export interface SpeechServicesMetadata {
+  readonly stt: SpeechServiceMetadata
+  readonly tts: SpeechServiceMetadata
+}
+
 export type BackendRuntimePhase =
   | 'initializing'
   | 'sleeping'
@@ -137,6 +150,7 @@ export type StartupState =
       readonly ttsEnabled: boolean
       readonly ttsOutputGainDb: number
       readonly capabilities: readonly StartupCapability[]
+      readonly speechServices?: SpeechServicesMetadata
     }
   | {
       readonly kind: 'ready'
@@ -152,6 +166,7 @@ export type StartupState =
       readonly ttsEnabled: boolean
       readonly ttsOutputGainDb: number
       readonly capabilities: readonly StartupCapability[]
+      readonly speechServices?: SpeechServicesMetadata
     }
   | { readonly kind: 'error'; readonly message: string }
 

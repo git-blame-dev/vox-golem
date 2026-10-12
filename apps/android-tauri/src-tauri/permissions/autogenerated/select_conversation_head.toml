@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-select-conversation-head"
+description = "Enables the select_conversation_head command without any pre-configured scope."
+commands.allow = ["select_conversation_head"]
+
+[[permission]]
+identifier = "deny-select-conversation-head"
+description = "Denies the select_conversation_head command without any pre-configured scope."
+commands.deny = ["select_conversation_head"]

@@ -1,3 +1,4 @@
 include ':app'
 
+apply from: '../../../capture.settings.gradle'
 apply from: 'tauri.settings.gradle'

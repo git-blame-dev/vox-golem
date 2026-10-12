@@ -3,10 +3,19 @@ import { DEFAULT_ASSISTANT_SETTINGS, deepOptions, instantOptions, parseAssistant
 
 const all = { localFast: true, localQuality: true, custom: true, openCode: true, qwenPrediction: true, deep: true, review: true }
 describe('assistant settings contract', () => {
-  it('has safe defaults', () => expect(DEFAULT_ASSISTANT_SETTINGS).toEqual({ instant: 'local-fast', deep: 'opencode-sol-high', review: 'opencode-sol-high', deepEnabled: false, reviewEnabled: false, prefetch: false, completion: true }))
+  it('normalizes legacy speech selections to Automatic and round-trips exact bounded UTF-8 identifiers', () => {
+    const legacy = { instant: 'local-fast', deep: 'opencode-sol-high', review: 'opencode-sol-high', deep_enabled: false, review_enabled: false, prefetch: false, completion: true }
+    expect(parseAssistantSettings(legacy)).toMatchObject({ speechLanguage: '', speechTtsProvider: '', speechTtsVoice: '' })
+    const wire = { ...legacy, speech_language: 'en-AU', speech_tts_provider: 'synthetic.tts.engine', speech_tts_voice: 'é'.repeat(256) }
+    expect(serializeAssistantSettings(parseAssistantSettings(wire))).toMatchObject(wire)
+    for (const key of ['speech_language', 'speech_tts_provider', 'speech_tts_voice']) {
+      for (const value of [null, undefined, true, 1, 'é'.repeat(257), 'x'.repeat(513)]) expect(() => parseAssistantSettings({ ...wire, [key]: value })).toThrow()
+    }
+  })
+  it('has safe defaults', () => expect(DEFAULT_ASSISTANT_SETTINGS).toEqual({ instant: 'local-fast', deep: 'opencode-sol-high', review: 'opencode-sol-high', deepEnabled: false, reviewEnabled: false, prefetch: false, completion: true, webEnabled: true, speechNetworkFallback: true, speechLanguage: '', speechTtsProvider: '', speechTtsVoice: '' }))
   it('labels every choice with its provider', () => {
     expect(instantOptions(all)).toHaveLength(8); expect(deepOptions(all)).toHaveLength(4); expect(reviewOptions(all)).toHaveLength(4)
-    expect(instantOptions(all).map((x) => x.label)).toEqual(['Local: Fast', 'Local: Quality', 'Custom: GPT-6 Sol High', 'Custom: GPT-6 Sol No Reasoning', 'Custom: GPT-6 Luna No Reasoning', 'Custom: GPT-5.6 Luna Low', 'OpenCode: GPT-6 Sol High', 'OpenCode: GPT-5.6 Luna Low'])
+    expect(instantOptions(all).map((x) => x.label)).toEqual(['Local: Fast', 'Local: Quality', 'Custom: GPT-6.1 Sol High', 'Custom: GPT-6.1 Sol No Reasoning', 'Custom: GPT-6 Luna No Reasoning', 'Custom: GPT-5.6 Luna Low', 'OpenCode: GPT-6.1 Sol High', 'OpenCode: GPT-5.6 Luna Low'])
     expect(deepOptions(all).map((x) => x.value)).toEqual(['custom-sol-high', 'custom-luna-low', 'opencode-sol-high', 'opencode-luna-low'])
     expect(reviewOptions(all).map((x) => x.value)).toEqual(['custom-sol-high', 'custom-luna-low', 'opencode-sol-high', 'opencode-luna-low'])
     expect(deepOptions(all).map((x) => x.description)).toEqual(['Custom reasoning-only', 'Custom reasoning-only', 'OpenCode search', 'OpenCode search'])
@@ -26,7 +35,7 @@ describe('assistant settings contract', () => {
       instant: 'custom-sol-none', deep: 'custom-sol-high', review: 'opencode-sol-high',
       deep_enabled: false, review_enabled: false, prefetch: false, completion: true,
     }
-    expect(serializeAssistantSettings(parseAssistantSettings(payload))).toEqual(payload)
+    expect(serializeAssistantSettings(parseAssistantSettings(payload))).toEqual({ ...payload, web_enabled: true, speech_network_fallback: true, speech_language: '', speech_tts_provider: '', speech_tts_voice: '' })
     expect(instantOptions(all).find((option) => option.value === 'custom-sol-none')).toMatchObject({
       available: true, description: 'Direct Custom connection; reasoning disabled',
     })
@@ -34,10 +43,17 @@ describe('assistant settings contract', () => {
   })
   it('round-trips direct GPT-6 Luna None and keeps it Instant-only', () => {
     const payload = { instant: 'custom-luna-none', deep: 'custom-sol-high', review: 'custom-luna-low', deep_enabled: false, review_enabled: false, prefetch: true, completion: true }
-    expect(serializeAssistantSettings(parseAssistantSettings(payload))).toEqual(payload)
+    expect(serializeAssistantSettings(parseAssistantSettings(payload))).toEqual({ ...payload, web_enabled: true, speech_network_fallback: true, speech_language: '', speech_tts_provider: '', speech_tts_voice: '' })
     expect(instantOptions(all).find((option) => option.value === payload.instant)).toMatchObject({ available: true, description: 'Direct Custom connection; reasoning disabled' })
     expect(instantOptions({ ...all, custom: false }).find((option) => option.value === payload.instant)?.available).toBe(false)
     expect(deepOptions(all).map((option) => option.value)).not.toContain(payload.instant)
     expect(reviewOptions(all).map((option) => option.value)).not.toContain(payload.instant)
+  })
+  it('round-trips both explicit policies and rejects supplied non-booleans', () => {
+    const wire = serializeAssistantSettings({ ...DEFAULT_ASSISTANT_SETTINGS, webEnabled: false, speechNetworkFallback: false })
+    expect(serializeAssistantSettings(parseAssistantSettings(wire))).toEqual(wire)
+    for (const key of ['web_enabled', 'speech_network_fallback']) {
+      for (const value of [undefined, null, 0, 'false']) expect(() => parseAssistantSettings({ ...wire, [key]: value })).toThrow(/boolean/)
+    }
   })
 })

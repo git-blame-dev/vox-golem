@@ -1,0 +1,69 @@
+.search-mode {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.6rem;
+  font-size: 0.875rem;
+}
+
+.search-mode__label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.search-mode select {
+  min-height: 2.75rem;
+  padding: 0.25rem 0.4rem;
+  color: var(--text-primary, CanvasText);
+  background: var(--surface-input, Canvas);
+  font: inherit;
+  border: 1px solid currentColor;
+  border-radius: 0.35rem;
+}
+
+.search-mode__reason {
+  max-width: 28rem;
+}
+
+.search-mode__icon-control {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 48px;
+  height: 48px;
+  min-width: 48px;
+  min-height: 48px;
+  border-radius: 0.65rem;
+  color: var(--text-primary, CanvasText);
+}
+
+.search-mode__icon-control svg {
+  width: 22px;
+  height: 22px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.search-mode__icon-control select {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  min-width: 48px;
+  min-height: 48px;
+  box-sizing: border-box;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.search-mode__icon-control:has(select:disabled) { opacity: 0.48; }
+.search-mode__icon-control:focus-within { outline: 2px solid var(--focus-ring, Highlight); outline-offset: 2px; }
+.search-mode__icon-control select:disabled { cursor: not-allowed; }

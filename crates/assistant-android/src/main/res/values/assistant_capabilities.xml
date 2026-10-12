@@ -1,0 +1,6 @@
+<resources>
+    <string-array name="android_wear_capabilities" translatable="false">
+        <item>voxgolem_assistant_v1</item>
+        <item>voxgolem_assistant_input_v1</item>
+    </string-array>
+</resources>

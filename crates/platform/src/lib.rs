@@ -12,5 +12,17 @@ pub mod llama_cpp;
 pub mod managed_process;
 #[cfg(feature = "desktop")]
 pub mod opencode;
+#[cfg(any(
+    feature = "desktop",
+    feature = "custom-openai",
+    feature = "custom-openai-webpki"
+))]
+mod owned_loopback;
+#[cfg(feature = "web-search")]
+pub mod search;
+#[cfg(feature = "web-search")]
+pub mod search_control;
+#[cfg(feature = "web-search")]
+pub mod web;
 #[cfg(feature = "desktop")]
 pub mod wsl;

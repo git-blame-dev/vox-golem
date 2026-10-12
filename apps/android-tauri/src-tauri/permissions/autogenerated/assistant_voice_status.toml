@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-assistant-voice-status"
+description = "Enables the assistant_voice_status command without any pre-configured scope."
+commands.allow = ["assistant_voice_status"]
+
+[[permission]]
+identifier = "deny-assistant-voice-status"
+description = "Denies the assistant_voice_status command without any pre-configured scope."
+commands.deny = ["assistant_voice_status"]

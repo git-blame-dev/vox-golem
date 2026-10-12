@@ -1,203 +1,190 @@
-# Capture domain and storage API (v1)
+# Capture integration contract (v1)
 
-Package: `dev.gitblame.voxgolem.capture`. Tauri includes the phone Android library as
-`:tauri-plugin-capture`; Wear packages the same maintained domain/storage sources
-without the phone-only Tauri classes and services.
-These signatures are the integration contract for the phone and Wear owners; keep
-the contracts free of Activity/UI/ASR dependencies. All timestamps are UTC ISO-8601
-strings unless named `finishedLocalDate` (ISO `yyyy-MM-dd`) or `timezoneId`.
+Source package: `dev.gitblame.voxgolem.capture`. Phone uses `:tauri-plugin-capture`;
+phone and Wear depend on the ordinary `:capture-android` library. SDK speech is shared
+through `:voice-android`; the capture plugin does not depend on Assistant/JNI. Desktop has no
+native watch-capture runtime. Wear keeps its native shell, not the phone Tauri plugin.
 
-## Phone transport integration
+## Authoritative sources
 
-Phone-only native classes (no generated Rust/Tauri edits required):
+- [Shared enums, records, manifests, protocol and transcript reducer](../capture-android/src/main/java/dev/gitblame/voxgolem/capture/CaptureContract.kt)
+- [Canonical SQLite repository and persistence JSON](../capture-android/src/main/java/dev/gitblame/voxgolem/capture/CaptureRepository.kt)
+- [PCM recording writer](../capture-android/src/main/java/dev/gitblame/voxgolem/capture/PcmRecordingWriter.kt), [WAV reader](../capture-android/src/main/java/dev/gitblame/voxgolem/capture/WavPcmReader.kt)
+- [Phone commands and Activity callbacks](android/src/main/java/dev/gitblame/voxgolem/capture/CapturePlugin.kt)
+- [Public projection allowlist](android/src/main/java/dev/gitblame/voxgolem/capture/CaptureProjection.kt)
+- [Frontend bridge parser](../../frontend/app/src/lib/captures.ts)
 
-```kotlin
-class PhoneCaptureCoordinator(context: Context) {
-    fun start(): EnableResult
-    fun enableFromVisibleActivity(): EnableResult
-    fun retryCapture(captureId: String)
-    fun finalizeCapture(captureId: String)
-}
-class CaptureListenerService : WearableListenerService()
-class PhoneCaptureRuntimeService : Service()
-```
+These source declarations, not copied signatures or enum catalogues in this document,
+define the API. UTC timestamps use ISO-8601; `finishedLocalDate` is `yyyy-MM-dd`.
+Public capture-history responses are not canonical persistence JSON: they include
+display duration, nullable transcript/audio/error fields and enum names, but omit
+private spool paths, audio hashes, recognition session IDs and export recovery data.
+No schema, database version, preference key or data migration changes accompany the
+phone ownership extraction.
 
-`CaptureListenerService` uses the current Wearable event-specific manifest filters
-for `CHANNEL_EVENT`, `MESSAGE_RECEIVED`, and `DATA_CHANGED`, scoped to the capture
-path prefix. This follows the [WearableListenerService manifest contract](https://developers.google.com/android/reference/com/google/android/gms/wearable/WearableListenerService);
-an additional legacy `BIND_LISTENER` action is not required. `PhoneCaptureRuntimeService` handles supplied
-watch audio as a connected-device foreground service; it never records from the
-phone microphone. The host manifest needs `FOREGROUND_SERVICE`,
-`FOREGROUND_SERVICE_CONNECTED_DEVICE`, and `BLUETOOTH_CONNECT` (runtime grant on
-Android 12+), and the service declaration must use
-`android:foregroundServiceType="connectedDevice"`. Android SpeechRecognizer
-also requires the user-granted `RECORD_AUDIO` permission even though the adapter
-only supplies the watch's PCM source. On Android 13+ supply a visible notification
-channel. A background-start denial is not bypassed; onboarding must provide the
-platform-supported companion association / foreground-start route or require the
-user to open the app before live transcription.
+## Phone ownership
 
-`SuppliedAudioSpeechRecognizer` requires API 33 external PCM input and an
-on-device SpeechRecognizer. It uses a pipe-backed
-`RecognizerIntent.EXTRA_AUDIO_SOURCE`, PCM16 format extras, partial results, and
-explicit source EOF. Android exposes no provider-independent capability bit for
-accepting this external source; readiness distinguishes a pending attempt from
-provider-ready and actual hypothesis delivery. No network/cloud
-fallback or phone-microphone fallback is selected. The on-device provider's
-actual external-audio support, language availability, and accuracy remain a
-device acceptance gate.
+- [PhoneCaptureCoordinator](android/src/main/java/dev/gitblame/voxgolem/capture/PhoneCaptureCoordinator.kt)
+  remains the single live/replay/probe admission, session, timeout and SDK-retirement
+  owner. Recognition leases and failed-teardown retries are retained; no replacement
+  SDK session is admitted while failed retirement still owns the resource. SDK
+  teardown does not run under session/lease admission monitors.
+- [PhoneCaptureDelivery](android/src/main/java/dev/gitblame/voxgolem/capture/PhoneCaptureDelivery.kt)
+  owns wire encoding, transcript revision coalescing, separate live-message and
+   receipt executors, and oversized exact-node receipt channels. Publishing follows coordinator
+  persistence. Empty or unsendable hypotheses do not suppress a deliverable preview;
+  final messages are not dropped by partial coalescing.
+- [PhoneCaptureArchive](android/src/main/java/dev/gitblame/voxgolem/capture/PhoneCaptureArchive.kt)
+  owns archive deduplication and the serial archive/export lane, using canonical
+  repository rows rather than another record cache. Verified read-back is required
+  before `PHONE_ARCHIVED`; export requires `SAVED`, nonempty `FINAL`, verified audio.
+- [CaptureChannelReceiver](android/src/main/java/dev/gitblame/voxgolem/capture/CaptureChannelReceiver.kt)
+  remains application-owned. Transient GMS listener destruction does not end its
+  readers; real runtime shutdown does. Live EOF/archive reconciliation stays with
+  the coordinator because it is coupled to recognition-session ownership.
 
-Phone wire handling matches `WearCaptureTransport.kt`: `protocol` is
-`voxgolem/capture/v1`; start/ready/partial/final/stop/receipt/status are JSON
-messages under `/voxgolem/capture/v1/*`; live channels use an int32-length JSON
-start header, then repeated int64 sequence + int32 PCM-byte-length + PCM frames,
-and int64 `-1` EOF. Archive channels use int32-length JSON header, int64 WAV
-length, then exact WAV bytes. Archive receipts echo `archiveHash` and use
-`PHONE_STAGED` then, only after verified SAF read-back, `PHONE_ARCHIVED` with
-optional `destinationId`. Phone transcript notifications currently fit the
-Wear sender's 32 KiB message cap; a channel-backed large-transcript response is
-not implemented by that Wear sender and must not be claimed as delivered.
+## Requirements and onboarding
 
-```kotlin
-enum class CaptureState { PREPARING, RECORDING, STOPPING, SAVED, INTERRUPTED, FAILED }
-enum class RecognitionState { UNAVAILABLE, QUEUED, RUNNING, FINAL, FAILED, NO_SPEECH }
-enum class TransferState { LOCAL_ONLY, PENDING, SENDING, PHONE_STAGED, PHONE_ARCHIVED }
-enum class ArchiveState { NOT_STAGED, STAGED, WAITING_FOR_FOLDER, COPYING, VERIFIED, RETRYABLE_ERROR, CONFLICT }
-enum class OrgState { WAITING_FOR_TRANSCRIPT, WAITING_FOR_FOLDER, READY, WRITING, EXPORTED, RETRYABLE_ERROR, NEEDS_REVIEW }
+[NativePhoneRequirements](android/src/main/java/dev/gitblame/voxgolem/capture/PhoneCaptureRequirements.kt)
+is the phone-only permission/alias/error catalogue. The plugin's annotations and
+visible permission request, coordinator admission and foreground service checks
+share it. `RECORD_AUDIO` is required for supplied watch audio, `BLUETOOTH_CONNECT`
+from API31 and `POST_NOTIFICATIONS` from API33. Requests require an explicit action
+in a resumed Activity; prior consent permits a visible-resume service restart.
+Service admission still rechecks consent and permissions and fails closed.
 
-data class CaptureFormat(
-    val sampleRate: Int = 16_000,
-    val channels: Int = 1,
-    val bitsPerSample: Int = 16,
-)
+The service is a visible `connectedDevice` foreground service, not a microphone
+service. Host manifest permissions and service type remain required. The supplied
+audio adapter needs API33 and a provider accepting external PCM. New Notes capture
+the shared installation language/network-fallback policy at Start and carry it to
+live and replay recognition; missing legacy policy defaults to dedicated local-only
+admission. Disabled fallback requires the dedicated on-device route. Permitted
+fallback can select an ordinary provider with provider-controlled networking;
+offline preference is not an execution guarantee. Android permits unsupported
+external-input providers to open their own microphone, so the app supplying Watch
+PCM does not establish provider microphone isolation. Permission denial or a
+background FGS start denial is not bypassed. Real input support, isolation and
+accuracy require device acceptance, not a READY callback, service-start request or
+host test.
 
-data class CaptureRecord(
-    val captureId: String,
-    val schemaVersion: Int = 1,
-    val sourceKind: String = "watch",
-    val createdAtUtc: String,
-    val startedAtUtc: String? = null,
-    val finishedAtUtc: String? = null,
-    val finishedLocalDate: String? = null,
-    val timezoneId: String? = null,
-    val captureState: CaptureState = CaptureState.PREPARING,
-    val stopReason: String? = null,
-    val observedFrames: Long = 0,
-    val durableFrames: Long = 0,
-    val format: CaptureFormat = CaptureFormat(),
-    val localAudioPath: String? = null,
-    val archivedAudioUri: String? = null,
-    val finalizedByteLength: Long? = null,
-    val sha256: String? = null,
-    val recognitionState: RecognitionState = RecognitionState.QUEUED,
-    val recognitionSessionId: String? = null,
-    val lastRevision: Long = 0,
-    val previewText: String? = null,
-    val finalText: String? = null,
-    val engineId: String? = null,
-    val language: String? = null,
-    val transcriptVersion: Long = 0,
-    val exportTranscriptVersion: Long? = null,
-    val transferState: TransferState = TransferState.LOCAL_ONLY,
-    val archiveState: ArchiveState = ArchiveState.NOT_STAGED,
-    val orgState: OrgState = OrgState.WAITING_FOR_TRANSCRIPT,
-    val exportDestinationId: String? = null,
-    val lastErrorStage: String? = null,
-    val lastErrorCode: String? = null,
-    val retryCount: Int = 0,
-    val nextRetryAtUtc: String? = null,
-)
+`NativeProjectionStatus` tracks consent, foreground readiness, runtime failure and
+missing permission separately. Public `onboardingState` is `setup-required`,
+`permission-required`, `starting`, `enabled`, `failed` or `unsupported`;
+`onboardingError` is nullable. `starting` means consent/permissions permit startup
+but foreground readiness is not confirmed; it is neither success nor failure.
+`enabled` requires readiness with no current failure or missing permission.
+`setupRequired` remains true until enabled. Folder readiness is independent.
+Frontend retains legacy snapshots without onboarding fields using `setupRequired`
+and the existing `error` fallback. The Rust bridge still forwards snapshots and
+unwraps native `{captures: [...]}` list responses into the frontend array.
 
-data class CaptureManifest(
-    val captureId: String,
-    val format: CaptureFormat,
-    val frameCount: Long,
-    val pcmByteLength: Long,
-    val wavByteLength: Long,
-    val sha256: String,
-)
+## Wire and durable export guarantees
 
-object CaptureProtocol {
-    const val VERSION: Int = 1
-    const val MAX_MESSAGE_BYTES: Int = 32 * 1024
-    const val MAX_CHANNEL_RESULT_BYTES: Int = 256 * 1024
-    const val MAX_FRAME_MILLIS: Int = 100
-    const val START: String = "/voxgolem/capture/v1/start"
-    const val READY: String = "/voxgolem/capture/v1/ready"
-    const val PARTIAL: String = "/voxgolem/capture/v1/partial"
-    const val FINAL: String = "/voxgolem/capture/v1/final"
-    const val STOP: String = "/voxgolem/capture/v1/stop"
-    const val RECEIPT: String = "/voxgolem/capture/v1/receipt"
-    const val STATUS: String = "/voxgolem/capture/v1/status"
-    fun isValidUuid(value: String): Boolean
-    fun validateFormat(format: CaptureFormat): Boolean
-    fun validateFrame(format: CaptureFormat, sequence: Long, byteLength: Int, previousSequence: Long?): Boolean
-    fun validatePayloadSize(byteLength: Int, channelResult: Boolean = false): Boolean
-    fun validateManifest(manifest: CaptureManifest): Boolean
-}
+Protocol stays `voxgolem/capture/v1`: start/ready/partial/final/stop/receipt/status
+messages, ordered bounded PCM frames with explicit EOF, and exact archive length
+and hash validation. Receipts echo the archive hash. Transcript messages fit the
+32KiB message cap; larger final receipts use a ChannelClient channel opened to the
+exact originating/selected watch node at `/voxgolem/capture/v1/receipt/<captureId>`.
+The channel carries a big-endian 32-bit byte length followed by the unchanged v1
+UTF-8 JSON receipt and EOF. Length is limited to 256KiB. Once a lifetime reservation
+is obtained, logical work is revoked after 15 seconds, including queued/acquiring IO;
+a timed-out receive cannot commit a receipt. Native retirement is separately confirmed.
+Wear rechecks the selected phone node before acquisition and before committing.
+After consuming a valid receipt, Wear writes a one-byte `1` acknowledgement on
+the reverse stream and closes that stream. The phone reads that byte before
+closing the native channel. Failed synchronous/asynchronous closes retain their
+precise handles and admission charge until a successful close or matching callback,
+including late SDK stream acquisitions. Each recovery round makes at most three
+native/stream close attempts, off the deadline scheduler. Phone admits at most ten
+outstanding receipt resources. Wear admits at most ten receipt readers and manages
+up to 64 reserved cleanup lifetimes including rejected incoming channels. This quota
+does not bound every SDK-delivered callback handle: a handle waiting for a reservation
+is outside that managed pool, and its 15-second lifetime has not begun. Saturation can
+therefore leave dispatch waiting indefinitely for confirmed retirement; there is no
+new application queue for these handles and no claim of a total SDK-handle bound.
+Exhausted cleanup capacity backpressures dispatch rather than dropping a failed handle; explicit
+capture transport retry requests another bounded recovery round. Native failure can
+therefore deny/delay subsequent receipt work until retirement succeeds.
+Wear also installs a process-owned SDK close observer, independent of the listener
+dispatch queue, so callback confirmation can release cleanup quota during dispatch
+backpressure. A GMS-delivered handle awaiting quota remains held by its callback;
+no stream or transcript processing is admitted for it.
+Phone tracks early close confirmations only during pending open attempts, filtering
+by expected node/path and retaining at most 16 exact SDK channel identities per open.
+Adoption reconciles the exact handle, never a capture path alone. Unrelated callbacks
+are ignored, excess same-route candidates are not cached, and completed attempts
+discard their candidates so a later replacement cannot inherit an old confirmation.
+An archive hash and capture ID correlate content; neither is peer authentication.
+Transport confidentiality relies on Google's paired-node ChannelClient routing,
+not a recipient UUID in a globally replicated payload. No credentials are sent.
+The phone atomically creates a new capture and an immutable phone-local origin
+association from the actual GMS source node. The additive `phone_capture_origins`
+table lives in the private capture database; it is never encoded in canonical
+records or the protocol. STATUS/retry, live input, duplicate archive/header replay,
+and all transcript-bearing deliveries check that association. Hash equality cannot
+authorize another watch or rebind ownership. Capture IDs/hashes remain non-secret.
+Live PCM also requires the capture/session/source-node tuple and the exact registered
+input owner. SDK mutations retain the recognizer's exact events owner, so reused
+session IDs cannot redirect stale input, finish or cancellation to a replacement.
+Rejected readers are stopped with a fixed `live-input-ownership-rejected` READY status.
+An authorized peer with no admitted SDK preview can still retain its local recording
+and transfer the finalized archive. The reviewed collision path requires knowledge
+or collision of a live session UUID (or an admission race); no discovery route was
+established, and UUID secrecy is not used as the authorization control.
+Denied requests receive only an additive v1 `AUTHORIZATION_FAILED` receipt with the
+echoed capture ID and fixed `capture-origin-not-authorized` code: no hash, transcript,
+session, destination or claimed archive acknowledgement. Older receivers ignore the
+unknown stage. Updated Wear shows an actionable origin-confirmation error without
+promoting transfer/recognition state or deleting retained text/audio.
 
-data class TranscriptUpdate(
-    val captureId: String, val sessionId: String, val revision: Long,
-    val fullText: String, val isFinal: Boolean,
-)
-data class TranscriptSnapshot(val sessionId: String?, val revision: Long, val preview: String?, val finalText: String?)
-class TranscriptReducer(private val captureId: String) {
-    fun apply(update: TranscriptUpdate): TranscriptSnapshot
-    fun snapshot(): TranscriptSnapshot
-}
+Existing captures without an association remain local-only: no STATUS/header replay
+can claim them, and remote transcript delivery is withheld. Their local history,
+audio, explicit finalization, recognition and Org export remain available. No rows
+or audio are deleted or rewritten to backfill origin guesses. Legacy captures and
+changed SDK node identities after reinstall require a future explicit local origin
+confirmation/rebind feature; no such UI or automatic rebind is introduced here.
+An unbound orphaned audio file also cannot be claimed by START followed by a matching
+header replay. New archive admission requires the verified full incoming body, not
+just a header/hash match against a pre-existing file.
 
-class CaptureRepository(context: android.content.Context) {
-    fun list(offset: Int = 0, limit: Int = 50): List<CaptureRecord>
-    fun get(id: String): CaptureRecord?
-    /** Insert-only; an identical duplicate is idempotent, a differing duplicate throws. Use update for changes. */
-    fun save(record: CaptureRecord): CaptureRecord
-    /** Atomic read-transform-write; returns null when id is absent. */
-    fun update(id: String, transform: (CaptureRecord) -> CaptureRecord): CaptureRecord?
-    /** Marks process-owned PREPARING/RECORDING/STOPPING records INTERRUPTED. */
-    fun recoverInterrupted(): List<CaptureRecord>
-    fun createPcmSpool(captureId: String): java.io.File
-}
+Small v1 message receipts and stored record schemas remain compatible. The former
+persistent oversized DataItem route is intentionally no longer emitted or consumed:
+updated phone and Wear builds are required together for oversized completions.
+Existing global DataItems created by older installations are not retroactively
+made private or deleted by this change. Ordinary status retry can request a fresh
+exact-node receipt only for an authorized bound origin. Canonical records and the
+database version remain unchanged; the private origin table is added lazily without
+backfilling older rows. No audio capability or credential transfer is introduced.
 
-data class PcmCheckpoint(val pcmByteLength: Long, val frameCount: Long)
-class PcmRecordingWriter(file: java.io.File, format: CaptureFormat) : java.io.Closeable {
-    fun append(bytes: ByteArray, count: Int = bytes.size)
-    fun checkpoint(): PcmCheckpoint
-    /** Finalizes to WAV using streaming copy; file's parent directory must be captureId. */
-    fun finish(wavFile: java.io.File): CaptureManifest
-    override fun close()
-}
+Projected and peer-visible diagnostic codes use the shared fixed allowlist, not
+exception messages, URI/path values, or exception class names. Unknown historical
+codes become a fixed failure code at public boundaries; private recording and SAF
+URI fields retain their existing explicit local-use contracts. Detailed exception
+logging is not added. Matching duplicate interrupted archives retain the phone's
+explicit `SAVED`/`user-finalized` decision; conflicting content remains rejected.
 
-object OrgExport {
-    /** UTF-8 headline with headline-breaking whitespace collapsed and ends trimmed. */
-    fun formatEntry(finalText: String, finishedLocalDate: String): ByteArray
-    /** Prepends entry and preserves all existing bytes, including an initial UTF-8 BOM. */
-    fun prepend(entry: ByteArray, existing: ByteArray): ByteArray
-}
+[SafNotesStore](android/src/main/java/dev/gitblame/voxgolem/capture/SafNotesStore.kt)
+owns destination preference, one persistable read/write grant acquisition and
+verified WAV archival. Plugin result handling validates offered read/write flags
+before selection. SAF uses document URIs, never guessed external filesystem paths.
 
-data class NotesDestination(val id: String, val treeUri: android.net.Uri)
-interface NotesDestinationStore {
-    fun selected(): NotesDestination?
-    fun select(treeUri: android.net.Uri): NotesDestination
-}
-class SafNotesStore(context: android.content.Context) : NotesDestinationStore {
-    override fun selected(): NotesDestination?
-    override fun select(treeUri: android.net.Uri): NotesDestination
-    fun archiveAudio(destination: NotesDestination, captureId: String, sourceWav: java.io.File,
-                     expectedSha256: String, expectedByteLength: Long): android.net.Uri
-}
+[OrgExportCoordinator and its private journal database](android/src/main/java/dev/gitblame/voxgolem/capture/OrgExportCoordinator.kt)
+move together unchanged. `capture_org_journal.db` version1, row keys, image paths,
+pre/post hashes, exact `ai-inbox.org` name handling, process serialization and
+read-back safeguards are preserved. Ambiguity remains `NEEDS_REVIEW`, not a claim
+of atomic provider replacement or cross-process editor locking. Legacy completed
+writes are acknowledged only after matching capture/destination/version/phase,
+provider tree membership, owned recovery images, lengths, entry and current
+postimage hash; acknowledgment is metadata-only. Unwritten preimages and unsafe
+or unknown outcomes remain held. Already-exported corrections do not rewrite or
+duplicate the exported entry; interrupted audio requires explicit finalization.
 
-data class OrgExportResult(val state: OrgState, val destinationId: String?, val reason: String? = null)
-class OrgExportCoordinator(context: android.content.Context) {
-    /** Export is permitted only for an intentional SAVED capture with nonempty FINAL text. */
-    fun process(captureId: String): OrgExportResult
-}
-```
+## Verification boundary
 
-Protocol validation is strict (UUIDs, supported PCM dimensions, positive bounded
-frame lengths and contiguous sequence starting at zero, payload caps, and manifest
-frame/length/hash consistency). A rejected update is a no-op in the transcript
-reducer. SAF operations use document URIs, never guessed filesystem paths. The Org
-coordinator serializes and journals writes and reports ambiguous provider outcomes as
-`NEEDS_REVIEW`; it does not claim atomic replacement or cross-process editor locking.
-Capture metadata and Org export journals use platform SQLite; SAF destination selection
-and the lightweight audio-copy recovery locator use app-private preferences.
+The phone library retains core-library desugaring for Java time at minSdk24.
+This extraction adds no dependency or toolchain change. Existing phone coordinator,
+channel, adapter and SAF provider tests remain the regression owners; shared-domain
+tests run in `:capture-android`, not a copied phone implementation. Final integrated
+phone/shared tests, Android lint and app builds are primary-coordinated gates after
+all source lanes finish. API36 provider/FGS behavior and physical watch/phone
+acceptance remain separate device gates; no new installation is authorized here.

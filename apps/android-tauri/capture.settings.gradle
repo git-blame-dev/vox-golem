@@ -1,0 +1,9 @@
+include ':voice-android'
+project(':voice-android').projectDir = new File(rootDir, '../../../../../crates/voice-android')
+include ':capture-android'
+project(':capture-android').projectDir = new File(rootDir, '../../../../../crates/capture-android')
+include ':assistant-android'
+project(':assistant-android').projectDir = new File(rootDir, '../../../../../crates/assistant-android')
+gradle.ext.assistantNativeAbis = ['arm64-v8a']
+include ':tauri-plugin-assistant'
+project(':tauri-plugin-assistant').projectDir = new File(rootDir, '../../../../../crates/assistant-plugin/android')

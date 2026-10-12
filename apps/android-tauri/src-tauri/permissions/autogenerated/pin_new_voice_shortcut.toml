@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pin-new-voice-shortcut"
+description = "Enables the pin_new_voice_shortcut command without any pre-configured scope."
+commands.allow = ["pin_new_voice_shortcut"]
+
+[[permission]]
+identifier = "deny-pin-new-voice-shortcut"
+description = "Denies the pin_new_voice_shortcut command without any pre-configured scope."
+commands.deny = ["pin_new_voice_shortcut"]

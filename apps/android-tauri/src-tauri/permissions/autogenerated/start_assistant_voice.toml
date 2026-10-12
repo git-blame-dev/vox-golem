@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-start-assistant-voice"
+description = "Enables the start_assistant_voice command without any pre-configured scope."
+commands.allow = ["start_assistant_voice"]
+
+[[permission]]
+identifier = "deny-start-assistant-voice"
+description = "Denies the start_assistant_voice command without any pre-configured scope."
+commands.deny = ["start_assistant_voice"]

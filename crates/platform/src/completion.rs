@@ -35,7 +35,7 @@ use crate::managed_process::{
     configure_owned_tokio, terminate_tokio, terminate_tokio_on_drop, ProcessOwnership,
 };
 use futures_util::StreamExt;
-use reqwest::{redirect, Client};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
 use tokio::sync::watch;
@@ -148,9 +148,7 @@ impl CompletionRuntime {
 
         let port = reserve_loopback_port()?;
         let api_key = transient_api_key()?;
-        let client = Client::builder()
-            .no_proxy()
-            .redirect(redirect::Policy::none())
+        let client = crate::owned_loopback::client_builder()
             .connect_timeout(Duration::from_millis(500))
             .pool_idle_timeout(Duration::from_secs(30))
             .build()

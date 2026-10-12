@@ -174,14 +174,16 @@ pub struct LlamaCppPrompt {
 impl LlamaCppPrompt {
     pub fn new(user_prompt: impl Into<String>) -> Self {
         Self {
-            system_prompt: None,
+            system_prompt: Some(voxgolem_core::response_style::compose_instructions("")),
             user_prompt: user_prompt.into(),
             max_tokens: 256,
         }
     }
 
     pub fn with_system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
-        self.system_prompt = Some(system_prompt.into());
+        self.system_prompt = Some(voxgolem_core::response_style::compose_instructions(
+            &system_prompt.into(),
+        ));
         self
     }
 
@@ -1446,7 +1448,10 @@ mod tests {
         assert_eq!(request.max_tokens, 42);
         assert_eq!(request.messages.len(), 2);
         assert_eq!(request.messages[0].role, "system");
-        assert_eq!(request.messages[0].content, "be concise");
+        assert_eq!(
+            request.messages[0].content,
+            voxgolem_core::response_style::compose_instructions("be concise")
+        );
         assert_eq!(request.messages[1].role, "user");
         assert_eq!(request.messages[1].content, "hello");
     }
@@ -1475,6 +1480,11 @@ mod tests {
             let body = request_text.split("\r\n\r\n").nth(1).expect("body");
             assert!(body.contains("\"stream\":true"));
             assert!(body.contains("prompt with \\n spaces"));
+            let value: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(
+                value["messages"][0]["content"],
+                voxgolem_core::response_style::PLAIN_TEXT_POLICY
+            );
             let response = concat!(
                 "HTTP/1.1 200 OK\r\n",
                 "Content-Type: text/event-stream\r\n",
