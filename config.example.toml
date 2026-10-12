@@ -1,5 +1,7 @@
 # Linux example. All tables are optional; paths are relative to this file.
 # Model files are intentionally external: Vox Golem does not download them.
+# Web lookup permission is independent of Quick/Verify/Research effort.
+web_enabled = true
 wake_word_model_path = "models/hey_livekit.onnx"
 parakeet_model_dir = "models/parakeet-v2"
 silero_vad_model = "models/silero-vad.onnx"
@@ -22,7 +24,8 @@ inference_provider = "auto" # auto, cuda, or cpu
 
 [custom_openai]
 endpoint = "https://chatgpt.com/backend-api/codex/responses"
-auth_path = "/home/user/.local/share/opencode/auth.json"
+# Omit auth_path to use the platform's existing OpenCode data-directory default.
+# Set an explicit absolute override only when that default is unsuitable.
 auth_source = "native" # Windows may use "wsl" and omit auth_path.
 
 [completion]

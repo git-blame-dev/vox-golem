@@ -1,7 +1,10 @@
 package dev.gitblame.voxgolem.capture
 
 import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.nio.charset.StandardCharsets.UTF_8
 
@@ -32,5 +35,17 @@ class OrgExportTest {
     fun rejectsEmptyTranscriptAndInvalidFinishDateInsteadOfCreatingAnEmptyTask() {
         assertThrows(IllegalArgumentException::class.java) { OrgExport.formatEntry(" \r\n\t", "2026-10-03") }
         assertThrows(IllegalArgumentException::class.java) { OrgExport.formatEntry("synthetic task", "2026-02-30") }
+    }
+
+    @Test
+    fun acceptsOnlyTheExactCanonicalInboxName() {
+        assertEquals("text/org", ORG_DOCUMENT_MIME_TYPE)
+        assertTrue(isInboxDocumentName("ai-inbox.org"))
+        assertFalse(isInboxDocumentName("ai-inbox.org.txt"))
+        assertFalse(isInboxDocumentName("ai-inbox.org (1).txt"))
+        assertFalse(isInboxDocumentName("inbox.org"))
+        assertFalse(isInboxDocumentName("inbox.org.txt"))
+        assertFalse(isInboxDocumentName("inbox.txt"))
+        assertFalse(isInboxDocumentName("inbox.org (1).txt"))
     }
 }

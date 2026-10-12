@@ -13,7 +13,7 @@ struct CaptureError {
 #[cfg(target_os = "android")]
 struct CaptureHandle<R: Runtime>(tauri::plugin::PluginHandle<R>);
 
-fn run_command<R: Runtime>(
+async fn run_command<R: Runtime>(
     app: tauri::AppHandle<R>,
     command: &str,
     arguments: serde_json::Value,
@@ -22,7 +22,8 @@ fn run_command<R: Runtime>(
     {
         app.state::<CaptureHandle<R>>()
             .0
-            .run_mobile_plugin(command, arguments)
+            .run_mobile_plugin_async(command, arguments)
+            .await
             .map_err(|error| CaptureError {
                 message: error.to_string(),
             })
@@ -37,17 +38,19 @@ fn run_command<R: Runtime>(
 }
 
 #[tauri::command]
-fn snapshot<R: Runtime>(app: tauri::AppHandle<R>) -> Result<serde_json::Value, CaptureError> {
-    run_command(app, "snapshot", serde_json::json!({}))
+async fn snapshot<R: Runtime>(app: tauri::AppHandle<R>) -> Result<serde_json::Value, CaptureError> {
+    run_command(app, "snapshot", serde_json::json!({})).await
 }
 
 #[tauri::command]
-fn enable_capture<R: Runtime>(app: tauri::AppHandle<R>) -> Result<serde_json::Value, CaptureError> {
-    run_command(app, "enable_capture", serde_json::json!({}))
+async fn enable_capture<R: Runtime>(
+    app: tauri::AppHandle<R>,
+) -> Result<serde_json::Value, CaptureError> {
+    run_command(app, "enable_capture", serde_json::json!({})).await
 }
 
 #[tauri::command]
-fn list_captures<R: Runtime>(
+async fn list_captures<R: Runtime>(
     app: tauri::AppHandle<R>,
     offset: u32,
     limit: u32,
@@ -56,7 +59,8 @@ fn list_captures<R: Runtime>(
         app,
         "list_captures",
         serde_json::json!({ "offset": offset, "limit": limit }),
-    )?;
+    )
+    .await?;
     serde_json::from_value(
         payload
             .get("captures")
@@ -69,14 +73,14 @@ fn list_captures<R: Runtime>(
 }
 
 #[tauri::command]
-fn select_notes_folder<R: Runtime>(
+async fn select_notes_folder<R: Runtime>(
     app: tauri::AppHandle<R>,
 ) -> Result<serde_json::Value, CaptureError> {
-    run_command(app, "select_notes_folder", serde_json::json!({}))
+    run_command(app, "select_notes_folder", serde_json::json!({})).await
 }
 
 #[tauri::command]
-fn play_capture<R: Runtime>(
+async fn play_capture<R: Runtime>(
     app: tauri::AppHandle<R>,
     capture_id: String,
 ) -> Result<(), CaptureError> {
@@ -85,16 +89,19 @@ fn play_capture<R: Runtime>(
         "play_capture",
         serde_json::json!({ "captureId": capture_id }),
     )
+    .await
     .map(|_| ())
 }
 
 #[tauri::command]
-fn stop_playback<R: Runtime>(app: tauri::AppHandle<R>) -> Result<(), CaptureError> {
-    run_command(app, "stop_playback", serde_json::json!({})).map(|_| ())
+async fn stop_playback<R: Runtime>(app: tauri::AppHandle<R>) -> Result<(), CaptureError> {
+    run_command(app, "stop_playback", serde_json::json!({}))
+        .await
+        .map(|_| ())
 }
 
 #[tauri::command]
-fn retry_capture<R: Runtime>(
+async fn retry_capture<R: Runtime>(
     app: tauri::AppHandle<R>,
     capture_id: String,
 ) -> Result<(), CaptureError> {
@@ -103,11 +110,12 @@ fn retry_capture<R: Runtime>(
         "retry_capture",
         serde_json::json!({ "captureId": capture_id }),
     )
+    .await
     .map(|_| ())
 }
 
 #[tauri::command]
-fn finalize_capture<R: Runtime>(
+async fn finalize_capture<R: Runtime>(
     app: tauri::AppHandle<R>,
     capture_id: String,
 ) -> Result<(), CaptureError> {
@@ -116,11 +124,12 @@ fn finalize_capture<R: Runtime>(
         "finalize_capture",
         serde_json::json!({ "captureId": capture_id }),
     )
+    .await
     .map(|_| ())
 }
 
 #[tauri::command]
-fn update_transcript<R: Runtime>(
+async fn update_transcript<R: Runtime>(
     app: tauri::AppHandle<R>,
     capture_id: String,
     text: String,
@@ -130,6 +139,7 @@ fn update_transcript<R: Runtime>(
         "update_transcript",
         serde_json::json!({ "captureId": capture_id, "text": text }),
     )
+    .await
     .map(|_| ())
 }
 

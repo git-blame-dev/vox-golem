@@ -1,0 +1,15 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <queries><package android:name="dev.gitblame.voxgolem.android" /></queries>
+    <application>
+        <service android:name="dev.gitblame.voxgolem.android.wear.speechtest.SyntheticTtsService"
+            android:exported="true" android:enabled="false" android:label="Synthetic TTS fixture (tests only)">
+            <intent-filter>
+                <action android:name="android.intent.action.TTS_SERVICE" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <meta-data android:name="android.speech.tts" android:resource="@xml/synthetic_tts_engine" />
+        </service>
+        <provider android:name="dev.gitblame.voxgolem.android.wear.speechtest.SpeechFixtureControl"
+            android:authorities="${applicationId}.speechfixture" android:exported="true" />
+    </application>
+</manifest>

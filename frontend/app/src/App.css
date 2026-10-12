@@ -161,6 +161,56 @@
   cursor: not-allowed;
 }
 
+.shell__icon-control {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  flex: 0 0 auto;
+}
+
+.shell__icon-control svg {
+  width: 22px;
+  height: 22px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.shell__conversation-picker {
+  position: relative;
+  box-sizing: border-box;
+}
+
+.shell__conversation-picker:has(select:disabled) { opacity: 0.48; }
+.shell__conversation-picker:focus-within { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+
+.shell__conversation-select {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+  font: inherit;
+}
+
+.shell__conversation-select:disabled { cursor: not-allowed; }
+
+.settings-panel__speech { margin-top: 1rem; border-top: 1px solid var(--border-soft); overflow-wrap: anywhere; }
+.settings-panel__speech h3 { margin: 1rem 0 .6rem; }
+.settings-panel__speech h4 { margin: .8rem 0 .3rem; }
+.settings-panel__speech p { margin: .3rem 0; color: var(--text-muted); font-size: .9em; }
+.settings-panel__write-error { position: sticky; top: 0; z-index: 1; padding: .6rem; margin-bottom: .75rem; border: 1px solid var(--danger); border-radius: .5rem; background: var(--surface-panel-strong); overflow-wrap: anywhere; }
+.speech-selection__field { display: grid; gap: .35rem; margin: .7rem 0; }
+.speech-selection__field select { width: 100%; min-width: 0; min-height: 48px; box-sizing: border-box; padding: .45rem; border: 1px solid var(--border-strong); border-radius: .5rem; background: var(--surface-input); color: var(--text-primary); font: inherit; }
+.speech-selection__field select:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+.speech-selection__field select:disabled { opacity: .6; }
+
 .shell__select {
   border: 1px solid var(--border-strong);
   background: var(--surface-glass-solid);
@@ -472,6 +522,7 @@
 .answer-stage__details h3 { margin: .35rem 0 .1rem; font-size: 1em; }
 
 .composer {
+  min-width: 0;
   border-top: 1px solid var(--border-soft);
   padding: 1rem max(1.5rem, env(safe-area-inset-right)) calc(1.2rem + env(safe-area-inset-bottom)) max(1.5rem, env(safe-area-inset-left));
   background: var(--surface-panel);
@@ -492,7 +543,14 @@
   background: var(--surface-panel);
 }
 
-.shell__identity { display: grid; flex: 1 1 auto; gap: 0.12rem; min-width: 0; overflow: hidden; }
+.shell__identity { display: flex; flex: 1 1 auto; align-items: center; gap: 0.6rem; min-width: 0; overflow: hidden; }
+.shell__runtime { display: grid; gap: 0.12rem; min-width: 0; }
+.shell__logo { display: block; flex: 0 0 auto; width: 2.5rem; height: 2.5rem; }
+.shell__logo[data-busy="true"] { animation: voxgolem-header-spin 8.533s linear infinite; }
+@keyframes voxgolem-header-spin { to { transform: rotate(-360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .shell__logo[data-busy="true"] { animation: none; }
+}
 .shell__identity strong, .shell__identity span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .shell__identity strong { color: var(--text-strong); letter-spacing: 0.02em; }
 .shell__identity span { color: var(--text-muted); font-size: 0.76em; text-transform: capitalize; }
@@ -569,12 +627,35 @@
   font-size: 0.8em;
 }
 
+.composer__actions > label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-width: 0;
+  max-width: 100%;
+}
+
 .composer__instant-model {
   color: var(--text-muted);
   font-size: 0.8em;
-  min-width: 0;
   overflow-wrap: anywhere;
 }
+
+.composer__actions select {
+  min-width: 0;
+  max-width: 100%;
+  min-height: 2.75rem;
+  padding: 0.35rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 0.5rem;
+  font: inherit;
+  color: var(--text-primary);
+  background: var(--surface-input);
+}
+
+.composer__instant-model select { max-width: min(18rem, 65vw); }
+
+.composer__actions select:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 
 .composer__instant-model strong {
   color: var(--text-primary);
@@ -797,6 +878,58 @@
 .capture-history__edit textarea { box-sizing: border-box; width: 100%; resize: vertical; min-height: 7rem; padding: .65rem; border: 1px solid var(--border-strong); border-radius: .55rem; color: var(--text-primary); background: var(--surface-input); font: inherit; }
 .capture-history__error { color: var(--danger); }
 .capture-history__note { border-left: 3px solid var(--accent-primary); padding-left: .6rem; }
+
+.composer__prompt-row { display: contents; }
+.native-icon-select { position: relative; color: var(--text-primary); }
+.native-icon-select select { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
+.native-icon-select:has(select:disabled) { opacity: .48; }
+.native-icon-select:focus-within { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+.native-icon-select select:disabled { cursor: not-allowed; }
+
+.shell[data-platform='android'] .shell__header {
+  min-height: calc(3rem + env(safe-area-inset-top));
+  padding: env(safe-area-inset-top) max(.5rem, env(safe-area-inset-right)) 0 max(.5rem, env(safe-area-inset-left));
+  gap: .25rem;
+  border: 0;
+  background: transparent;
+}
+.shell[data-platform='android'] .shell__logo { width: 32px; height: 32px; }
+.shell[data-platform='android'] .shell__identity { flex: 0 0 32px; }
+.shell[data-platform='android'] .shell__header-actions { position: relative; flex: 1 1 0; flex-wrap: nowrap; justify-content: flex-end; gap: 0; }
+.shell[data-platform='android'] .shell__header-actions .shell__icon-control { flex: 0 0 48px; width: 48px; min-width: 48px; height: 48px; min-height: 48px; }
+.shell[data-platform='android'] .shell__header-actions .shell__icon-control svg { width: 20px; height: 20px; }
+.shell[data-platform='android'] .shell__header-actions .android-voice-controls { flex: 0 0 auto; min-width: 0; margin: 0; gap: 0; }
+.shell[data-platform='android'] .shell__header-actions .search-mode { flex: 1 1 0; min-width: 0; }
+.shell[data-platform='android'] .shell__header-actions select { min-width: 0; min-height: 48px; }
+.shell[data-platform='android'] .shell__control { border: 0; background: transparent; box-shadow: none; min-width: 48px; min-height: 48px; }
+.shell[data-platform='android'] .shell__control:hover:not(:disabled),
+.shell[data-platform='android'] .shell__control[aria-pressed='true'] { background: var(--surface-glass-hover); }
+.shell[data-platform='android'] .shell__icon-control { width: 48px; height: 48px; }
+.shell[data-platform='android'] .shell__overflow { flex: 0 0 48px; }
+.shell[data-platform='android'] .shell__overflow > summary { display: flex; list-style: none; cursor: pointer; align-items: center; justify-content: center; box-sizing: border-box; }
+.shell[data-platform='android'] .shell__overflow > summary::-webkit-details-marker { display: none; }
+.shell[data-platform='android'] .shell__overflow > summary:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
+.shell[data-platform='android'] .shell__overflow-actions { position: absolute; z-index: 10; top: 100%; right: 0; display: flex; flex-wrap: wrap; width: min(240px, calc(100vw - 32px)); max-height: calc(100dvh - 100px); overflow-y: auto; padding: 8px; box-sizing: border-box; border: 1px solid var(--border-soft); border-radius: .75rem; background: var(--surface-panel); box-shadow: 0 .5rem 1.5rem #0004; }
+.shell[data-platform='android'] .composer { padding-top: .35rem; padding-bottom: calc(.5rem + env(safe-area-inset-bottom)); }
+.shell[data-platform='android'] .android-voice-controls { margin-top: 0; gap: .25rem; }
+.shell[data-platform='android'] .composer__actions:empty { display: none; }
+.shell[data-platform='android'] .composer__actions--secondary { margin-top: 0; }
+.shell[data-platform='android'] .composer__prompt-row { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) 44px; align-items: end; column-gap: .5rem; margin-top: 0; }
+/* Flatten only the Android wrapper so Send shares the textarea's autosized row,
+   independently of partial-transcript/help content and inline baseline space. */
+.shell[data-platform='android'] .prompt-composer { display: contents; }
+.shell[data-platform='android'] .composer__input { display: block; grid-column: 1; grid-row: 1; min-height: 44px; line-height: 1.5; padding-block: max(2px, calc((44px - 1.5em - 2px) / 2)); }
+.shell[data-platform='android'] .prompt-composer__ghost { top: max(3px, calc((44px - 1.5em) / 2)); right: calc(44px + .5rem + .75rem); max-width: none; }
+.shell[data-platform='android'] .prompt-composer__partial { grid-column: 1; grid-row: 2; }
+.shell[data-platform='android'] .composer__button { width: 44px; height: auto; min-width: 44px; min-height: 44px; padding: 0; }
+.shell[data-platform='android'] .composer__button svg { width: 20px; height: 20px; }
+.shell[data-platform='android'] .composer__prompt-row > .composer__button { grid-column: 2; grid-row: 1; align-self: stretch; }
+.shell[data-platform='android'] .composer__status--compact { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; color: var(--text-muted); }
+.shell[data-platform='android'] .composer__status--compact svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.shell[data-platform='android'] .composer__send-side { width: auto; margin-left: auto; }
+.shell[data-platform='android'] .message--assistant,
+.shell[data-platform='android'] .answer-stage { border: 0; border-radius: .9rem; padding: .75rem .95rem; background: var(--message-assistant-bg); box-shadow: inset 0 1px 0 var(--message-assistant-border); }
+.shell[data-platform='android'] .answer-stage__answer { margin: 0; }
 
 @media (max-width: 760px) {
   .capture-history__layout { grid-template-columns: minmax(0, 1fr); }

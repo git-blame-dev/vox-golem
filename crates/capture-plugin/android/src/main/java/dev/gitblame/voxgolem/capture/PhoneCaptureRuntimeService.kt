@@ -1,16 +1,13 @@
 package dev.gitblame.voxgolem.capture
 
-import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
-import com.google.android.gms.wearable.Wearable
 
 /** User-visible, non-microphone execution lifetime for processing supplied Wear audio. */
 class PhoneCaptureRuntimeService : Service() {
@@ -24,12 +21,18 @@ class PhoneCaptureRuntimeService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         foregroundReady = false
-        if (packageManager.hasSystemFeature("android.hardware.type.watch")) {
+        if (NativePhoneRequirements.isWatch(this)) {
             stopSelfResult(startId)
             return START_NOT_STICKY
         }
-        if (!hasConnectedDevicePermission()) {
-            setRuntimeError("bluetooth-connect-permission-required")
+        val preferences = getSharedPreferences(PhoneCaptureCoordinator.PREFERENCES, MODE_PRIVATE)
+        if (!preferences.getBoolean(PhoneCaptureCoordinator.KEY_OPTED_IN, false)) {
+            stopSelfResult(startId)
+            return START_NOT_STICKY
+        }
+        val permissionError = missingPermissionError()
+        if (permissionError != null) {
+            setRuntimeError(permissionError)
             stopSelfResult(startId)
             return START_NOT_STICKY
         }
@@ -38,7 +41,7 @@ class PhoneCaptureRuntimeService : Service() {
             val notification = builder
                 .setSmallIcon(android.R.drawable.ic_btn_speak_now)
                 .setContentTitle("Processing watch dictation")
-                .setContentText("Supplied watch audio is being transcribed; phone microphone is not used")
+                .setContentText("Supplied watch audio requested for transcription")
                 .setOngoing(true)
                 .setCategory(Notification.CATEGORY_SERVICE)
                 .build()
@@ -48,6 +51,7 @@ class PhoneCaptureRuntimeService : Service() {
                 startForeground(NOTIFICATION_ID, notification)
             }
             foregroundReady = true
+            PhoneCaptureCoordinator.shared(this).onRuntimeStarted()
             PhoneCaptureCoordinator.shared(this).retryPendingCaptures()
             getSharedPreferences(PhoneCaptureCoordinator.PREFERENCES, MODE_PRIVATE).edit()
                 .remove(PhoneCaptureCoordinator.KEY_RUNTIME_ERROR).apply()
@@ -61,13 +65,15 @@ class PhoneCaptureRuntimeService : Service() {
             stopSelfResult(startId)
             return START_NOT_STICKY
         }
-        return START_NOT_STICKY
+        return START_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
         foregroundReady = false
+        CaptureChannelReceiver.stopShared()
+        PhoneCaptureCoordinator.shared(this).onRuntimeStopped()
         super.onDestroy()
     }
 
@@ -75,11 +81,9 @@ class PhoneCaptureRuntimeService : Service() {
         getSharedPreferences(PhoneCaptureCoordinator.PREFERENCES, MODE_PRIVATE).edit()
             .putString(PhoneCaptureCoordinator.KEY_RUNTIME_ERROR, code)
             .apply()
-        runCatching { Wearable.getCapabilityClient(this).removeLocalCapability(CaptureWire.PHONE_CAPABILITY) }
     }
 
-    private fun hasConnectedDevicePermission(): Boolean = Build.VERSION.SDK_INT < 31 ||
-        checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+    private fun missingPermissionError(): String? = NativePhoneRequirements.missing(this).firstOrNull()?.error
 
     companion object {
         const val ACTION_START = "dev.gitblame.voxgolem.capture.START_PROCESSING"

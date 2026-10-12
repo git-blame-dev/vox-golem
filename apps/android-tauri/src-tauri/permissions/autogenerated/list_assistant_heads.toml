@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-assistant-heads"
+description = "Enables the list_assistant_heads command without any pre-configured scope."
+commands.allow = ["list_assistant_heads"]
+
+[[permission]]
+identifier = "deny-list-assistant-heads"
+description = "Denies the list_assistant_heads command without any pre-configured scope."
+commands.deny = ["list_assistant_heads"]

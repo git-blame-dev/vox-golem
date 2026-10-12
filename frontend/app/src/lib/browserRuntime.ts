@@ -1,4 +1,6 @@
 import { utf8ByteLength } from './wire'
+import { parseSpeechSelectionString } from './assistantSettings'
+import { INSTANT_CHOICES, AGENT_CHOICES, DEFAULT_MODEL_CHOICES, browserModelOptions } from './modelCatalog'
 
 type BrowserCommandErrorCode = 'invalid_input' | 'not_found' | 'busy' | 'unavailable' | 'internal'
 type BrowserPreviewOutcome = 'completed' | 'refused' | 'error'
@@ -28,6 +30,11 @@ interface BrowserPreviewPreferences {
   readonly review_enabled: boolean
   readonly prefetch: boolean
   readonly completion: boolean
+  readonly web_enabled: boolean
+  readonly speech_network_fallback: boolean
+  readonly speech_language: string
+  readonly speech_tts_provider: string
+  readonly speech_tts_voice: string
   readonly response_profile: string
   readonly tts_enabled: boolean
   readonly ui_theme: string
@@ -72,8 +79,8 @@ const CAPABILITY_IDS = [
   'custom_provider', 'opencode', 'local_fast', 'local_quality', 'qwen_prediction',
   'wake_word', 'vad', 'parakeet', 'tts', 'deep', 'review',
 ] as const
-const INSTANT_CHOICES = new Set(['local-fast', 'local-quality', 'custom-sol-high', 'custom-luna-low', 'opencode-sol-high', 'opencode-luna-low'])
-const AGENT_CHOICES = new Set(['custom-sol-high', 'custom-luna-low', 'opencode-sol-high', 'opencode-luna-low'])
+const instantChoices = new Set<string>(INSTANT_CHOICES)
+const agentChoices = new Set<string>(AGENT_CHOICES)
 const MAX_TIMER_DELAY_MS = 2_147_483_647
 const DEFAULT_FIXTURE: BrowserPreviewFixture = {
   delayMs: 0,
@@ -329,6 +336,11 @@ function setLegacyAssistantSettings(value: unknown): Record<string, unknown> {
     review_enabled: settings['review_enabled'],
     prefetch: settings['prefetch'],
     completion: settings['completion'],
+    web_enabled: Object.prototype.hasOwnProperty.call(settings, 'web_enabled') ? settings['web_enabled'] : state.preferences.web_enabled,
+    speech_network_fallback: Object.prototype.hasOwnProperty.call(settings, 'speech_network_fallback') ? settings['speech_network_fallback'] : state.preferences.speech_network_fallback,
+    speech_language: Object.prototype.hasOwnProperty.call(settings, 'speech_language') ? settings['speech_language'] : state.preferences.speech_language,
+    speech_tts_provider: Object.prototype.hasOwnProperty.call(settings, 'speech_tts_provider') ? settings['speech_tts_provider'] : state.preferences.speech_tts_provider,
+    speech_tts_voice: Object.prototype.hasOwnProperty.call(settings, 'speech_tts_voice') ? settings['speech_tts_voice'] : state.preferences.speech_tts_voice,
   })
   return assistantSettingsPayload()
 }
@@ -339,14 +351,23 @@ function parsePreferences(value: unknown): BrowserPreviewPreferences {
     'instant', 'deep', 'review', 'deep_enabled', 'review_enabled', 'prefetch', 'completion',
     'response_profile', 'tts_enabled', 'ui_theme', 'ui_text_size',
   ]
-  if (Object.keys(payload).length !== exactFields.length || exactFields.some((field) => !Object.prototype.hasOwnProperty.call(payload, field))) {
+  const policyFields = ['web_enabled', 'speech_network_fallback']
+  const optionalFields = [...policyFields, 'speech_language', 'speech_tts_provider', 'speech_tts_voice']
+  if (Object.keys(payload).some((field) => !exactFields.includes(field) && !optionalFields.includes(field)) || exactFields.some((field) => !Object.prototype.hasOwnProperty.call(payload, field))) {
     throw new BrowserPreviewCommandError('invalid_input', 'Preferences must include every supported field')
   }
-  if (!INSTANT_CHOICES.has(payload['instant'] as string) || !AGENT_CHOICES.has(payload['deep'] as string) || !AGENT_CHOICES.has(payload['review'] as string)) {
+  if (!instantChoices.has(payload['instant'] as string) || !agentChoices.has(payload['deep'] as string) || !agentChoices.has(payload['review'] as string)) {
     throw new BrowserPreviewCommandError('invalid_input', 'Preferences include an unsupported model')
   }
   for (const field of ['deep_enabled', 'review_enabled', 'prefetch', 'completion', 'tts_enabled']) {
     if (typeof payload[field] !== 'boolean') throw new BrowserPreviewCommandError('invalid_input', `Preference ${field} must be boolean`)
+  }
+  for (const field of policyFields) {
+    if (Object.prototype.hasOwnProperty.call(payload, field) && typeof payload[field] !== 'boolean') throw new BrowserPreviewCommandError('invalid_input', `Preference ${field} must be boolean`)
+  }
+  const speechString = (key: string): string => {
+    try { return parseSpeechSelectionString(payload, key) }
+    catch { throw new BrowserPreviewCommandError('invalid_input', `Preference ${key} must be a string within 512 UTF-8 bytes`) }
   }
   if (payload['response_profile'] !== 'fast' && payload['response_profile'] !== 'quality') throw new BrowserPreviewCommandError('invalid_input', 'Response profile is unsupported')
   if (payload['ui_theme'] !== 'light' && payload['ui_theme'] !== 'dark') throw new BrowserPreviewCommandError('invalid_input', 'UI theme is unsupported')
@@ -359,6 +380,9 @@ function parsePreferences(value: unknown): BrowserPreviewPreferences {
     review_enabled: payload['review_enabled'] as boolean,
     prefetch: payload['prefetch'] as boolean,
     completion: payload['completion'] as boolean,
+    web_enabled: payload['web_enabled'] === undefined ? true : payload['web_enabled'] as boolean,
+    speech_network_fallback: payload['speech_network_fallback'] === undefined ? true : payload['speech_network_fallback'] as boolean,
+    speech_language: speechString('speech_language'), speech_tts_provider: speechString('speech_tts_provider'), speech_tts_voice: speechString('speech_tts_voice'),
     response_profile: payload['response_profile'] as string,
     tts_enabled: payload['tts_enabled'] as boolean,
     ui_theme: payload['ui_theme'] as string,
@@ -386,14 +410,7 @@ function snapshotPayload(): Record<string, unknown> {
     capabilities: CAPABILITY_IDS.map((id) => id === 'local_fast'
       ? { id, state: 'available', reason: 'Deterministic browser preview', actual_provider: 'browser_preview' }
       : { id, state: 'unavailable', reason: 'Unavailable in browser preview', actual_provider: null }),
-    model_options: [
-      { id: 'local-fast', label: 'Local: Fast (browser preview)', available: true, unavailable_reason: null },
-      { id: 'local-quality', label: 'Local: Quality', available: false, unavailable_reason: 'Unavailable in browser preview' },
-      { id: 'custom-sol-high', label: 'Custom: GPT-5.6 Sol High', available: false, unavailable_reason: 'Unavailable in browser preview' },
-      { id: 'custom-luna-low', label: 'Custom: GPT-5.6 Luna Low', available: false, unavailable_reason: 'Unavailable in browser preview' },
-      { id: 'opencode-sol-high', label: 'OpenCode: GPT-5.6 Sol High', available: false, unavailable_reason: 'Unavailable in browser preview' },
-      { id: 'opencode-luna-low', label: 'OpenCode: GPT-5.6 Luna Low', available: false, unavailable_reason: 'Unavailable in browser preview' },
-    ],
+    model_options: browserModelOptions(),
     preferences: state.preferences,
   })
 }
@@ -426,6 +443,9 @@ function assistantSettingsPayload(): Record<string, unknown> {
     review_enabled: preferences.review_enabled,
     prefetch: preferences.prefetch,
     completion: preferences.completion,
+    web_enabled: preferences.web_enabled,
+    speech_network_fallback: preferences.speech_network_fallback,
+    speech_language: preferences.speech_language, speech_tts_provider: preferences.speech_tts_provider, speech_tts_voice: preferences.speech_tts_voice,
   }
 }
 
@@ -469,13 +489,14 @@ function createState(): BrowserPreviewState {
     transcript: [],
     active: null,
     preferences: {
-      instant: 'local-fast',
-      deep: 'opencode-sol-high',
-      review: 'opencode-sol-high',
+      ...DEFAULT_MODEL_CHOICES,
       deep_enabled: false,
       review_enabled: false,
       prefetch: false,
       completion: false,
+      web_enabled: true,
+      speech_network_fallback: true,
+      speech_language: '', speech_tts_provider: '', speech_tts_voice: '',
       response_profile: 'fast',
       tts_enabled: false,
       ui_theme: 'dark',

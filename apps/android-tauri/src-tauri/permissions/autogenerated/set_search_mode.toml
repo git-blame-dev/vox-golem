@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-search-mode"
+description = "Enables the set_search_mode command without any pre-configured scope."
+commands.allow = ["set_search_mode"]
+
+[[permission]]
+identifier = "deny-set-search-mode"
+description = "Denies the set_search_mode command without any pre-configured scope."
+commands.deny = ["set_search_mode"]

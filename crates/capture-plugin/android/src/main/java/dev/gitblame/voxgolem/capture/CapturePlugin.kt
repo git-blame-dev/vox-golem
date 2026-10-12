@@ -1,12 +1,14 @@
 package dev.gitblame.voxgolem.capture
 
 import android.app.Activity
-import android.Manifest
 import android.content.Intent
 import android.media.MediaPlayer
 import android.net.Uri
 import android.provider.DocumentsContract
 import androidx.activity.result.ActivityResult
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.DefaultLifecycleObserver
 import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
@@ -18,15 +20,12 @@ import app.tauri.plugin.JSObject
 import app.tauri.plugin.JSArray
 import app.tauri.plugin.Plugin
 import java.io.File
-import java.time.Instant
-import java.time.Duration
-import org.json.JSONObject
 
 @TauriPlugin(
     permissions = [
-        Permission(alias = "phoneAudio", strings = [Manifest.permission.RECORD_AUDIO]),
-        Permission(alias = "phoneConnectedDevice", strings = [Manifest.permission.BLUETOOTH_CONNECT]),
-        Permission(alias = "phoneNotifications", strings = [Manifest.permission.POST_NOTIFICATIONS]),
+        Permission(alias = NativePhoneRequirements.AUDIO_ALIAS, strings = [NativePhoneRequirements.AUDIO_PERMISSION]),
+        Permission(alias = NativePhoneRequirements.CONNECTED_DEVICE_ALIAS, strings = [NativePhoneRequirements.CONNECTED_DEVICE_PERMISSION]),
+        Permission(alias = NativePhoneRequirements.NOTIFICATIONS_ALIAS, strings = [NativePhoneRequirements.NOTIFICATIONS_PERMISSION]),
     ],
 )
 class CapturePlugin(private val activity: Activity) : Plugin(activity) {
@@ -34,18 +33,15 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
     private val destinationStore by lazy { SafNotesStore(activity) }
     private val phoneCoordinator by lazy { PhoneCaptureCoordinator.shared(activity.applicationContext) }
     private var player: MediaPlayer? = null
-    @Volatile private var activityVisible = false
-
-    override fun onResume() {
-        activityVisible = true
-    }
-
-    override fun onPause() {
-        activityVisible = false
-    }
 
     override fun load(webView: android.webkit.WebView) {
-        // Enabling is always explicit; loading the plugin never starts a foreground service.
+        (activity as? LifecycleOwner)?.lifecycle?.addObserver(object : DefaultLifecycleObserver {
+            override fun onResume(owner: LifecycleOwner) {
+                if (!isWatch() && phoneCoordinator.isEnabled() && !PhoneCaptureRuntimeService.isForegroundReady()) {
+                    phoneCoordinator.start()
+                }
+            }
+        })
     }
 
     @Command
@@ -53,7 +49,7 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
         try {
             invoke.resolve(snapshotValue())
         } catch (error: Exception) {
-            invoke.reject(error.message ?: "Cannot load voice note history")
+            invoke.reject("capture-history-unavailable")
         }
     }
 
@@ -64,15 +60,11 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
             invoke.reject("Phone capture setup is unavailable on Wear OS")
             return
         }
-        if (!activityVisible) {
+        if ((activity as? LifecycleOwner)?.lifecycle?.currentState?.isAtLeast(Lifecycle.State.RESUMED) != true) {
             invoke.reject("Phone capture can only be enabled from the visible app")
             return
         }
-        val aliases = buildList {
-            if (activity.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) add("phoneAudio")
-            if (android.os.Build.VERSION.SDK_INT >= 31 && activity.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != android.content.pm.PackageManager.PERMISSION_GRANTED) add("phoneConnectedDevice")
-            if (android.os.Build.VERSION.SDK_INT >= 33 && activity.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) add("phoneNotifications")
-        }
+        val aliases = NativePhoneRequirements.missing(activity).map { it.alias }
         if (aliases.isNotEmpty()) {
             requestPermissionForAliases(aliases.toTypedArray(), invoke, "capturePermissionsGranted")
             return
@@ -90,7 +82,7 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
             require(args.offset >= 0 && args.limit in 1..100) { "Invalid capture page" }
             invoke.resolve(JSObject().put("captures", JSArray(repository.list(args.offset, args.limit).map(::recordValue))))
         } catch (error: Exception) {
-            invoke.reject(error.message ?: "Cannot load voice note history")
+            invoke.reject("capture-history-unavailable")
         }
     }
 
@@ -118,15 +110,11 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
             val flags = result.data?.flags ?: 0
             val requiredFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
             require(flags and requiredFlags == requiredFlags) { "Notes folder requires read and write access" }
-            activity.contentResolver.takePersistableUriPermission(
-                uri,
-                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
-            )
             destinationStore.select(uri)
             phoneCoordinator.retryPendingCaptures()
             invoke.resolve(snapshotValue())
         } catch (error: Exception) {
-            invoke.reject(error.message ?: "Cannot save notes folder permission")
+            invoke.reject("notes-folder-permission-unavailable")
         }
     }
 
@@ -151,7 +139,7 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
             invoke.resolve()
         } catch (error: Exception) {
             stopPlayer()
-            invoke.reject(error.message ?: "Cannot play recording")
+            invoke.reject("recording-playback-unavailable")
         }
     }
 
@@ -171,7 +159,7 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
             phoneCoordinator.retryCapture(args.captureId)
             invoke.resolve()
         } catch (error: Exception) {
-            invoke.reject(error.cause?.message ?: "Capture retry is unavailable")
+            invoke.reject("capture-retry-unavailable")
         }
     }
 
@@ -182,7 +170,7 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
             phoneCoordinator.finalizeCapture(args.captureId)
             invoke.resolve()
         } catch (error: Exception) {
-            invoke.reject(error.message ?: "Cannot finalize interrupted capture")
+            invoke.reject("capture-finalization-unavailable")
         }
     }
 
@@ -193,6 +181,7 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
             require(CaptureProtocol.isValidUuid(args.captureId)) { "Invalid capture ID" }
             require(args.text.length <= 1_000_000) { "Transcript is too long" }
             val updated = repository.update(args.captureId) { record ->
+                require(record.purpose == CapturePurpose.NOTE) { "Only Note transcripts can be edited" }
                 require(record.captureState == CaptureState.SAVED) { "Only finalized captures can be edited" }
                 record.copy(
                     finalText = args.text,
@@ -210,59 +199,26 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
             if (args.text.isNotBlank()) phoneCoordinator.retryCapture(args.captureId)
             invoke.resolve()
         } catch (error: Exception) {
-            invoke.reject(error.message ?: "Cannot update transcript")
+            invoke.reject("transcript-update-unavailable")
         }
     }
 
-    private fun snapshotValue(): JSObject = JSObject().apply {
-        val destination = destinationStore.selected()
-        val runtimeError = activity.getSharedPreferences(PhoneCaptureCoordinator.PREFERENCES, Activity.MODE_PRIVATE)
-            .getString(PhoneCaptureCoordinator.KEY_RUNTIME_ERROR, null)
-        val enabled = phoneCoordinator.isEnabled() && PhoneCaptureRuntimeService.isForegroundReady()
-        put("available", true)
-        put("notesFolderUri", destination?.treeUri?.toString() ?: JSONObject.NULL)
-        put("captures", JSArray(repository.list(0, 100).map(::recordValue)))
-        put("error", JSONObject.NULL)
-        put("setupRequired", !enabled || runtimeError != null)
-        put("onboardingState", when {
-            runtimeError != null -> "failed"
-            !enabled -> "setup-required"
-            PhoneCaptureRuntimeService.isForegroundReady() -> "enabled"
-            else -> "starting"
-        })
-        put("onboardingError", runtimeError ?: JSONObject.NULL)
-    }
+    private fun projectionStatus() = NativeProjectionStatus(
+        consentEnabled = phoneCoordinator.hasConsent(),
+        foregroundReady = PhoneCaptureRuntimeService.isForegroundReady(),
+        runtimeError = activity.getSharedPreferences(PhoneCaptureCoordinator.PREFERENCES, Activity.MODE_PRIVATE)
+            .getString(PhoneCaptureCoordinator.KEY_RUNTIME_ERROR, null),
+        permissionError = NativePhoneRequirements.missing(activity).firstOrNull()?.error,
+    )
+
+    private fun snapshotValue(): JSObject = NativeCaptureProjection.snapshot(destinationStore.selected(), repository.list(0, 100), projectionStatus())
 
     private fun resolveEnable(invoke: Invoke) {
         val result = phoneCoordinator.enableFromVisibleActivity()
-        val response = snapshotValue().apply {
-            put("setupRequired", result.state != "enabled")
-            put("onboardingState", result.state)
-            put("onboardingError", result.error ?: JSONObject.NULL)
-        }
-        invoke.resolve(response)
+        invoke.resolve(NativeCaptureProjection.snapshot(destinationStore.selected(), repository.list(0, 100), projectionStatus(), result))
     }
 
-    private fun recordValue(record: CaptureRecord): JSObject = JSObject().apply {
-        val started = record.startedAtUtc?.let { runCatching { Instant.parse(it) }.getOrNull() }
-        val finished = record.finishedAtUtc?.let { runCatching { Instant.parse(it) }.getOrNull() }
-        val duration = if (started != null && finished != null) Duration.between(started, finished).toMillis().coerceAtLeast(0)
-            else record.durableFrames * 1000 / record.format.sampleRate
-        put("captureId", record.captureId)
-        put("createdAtUtc", record.createdAtUtc)
-        put("finishedAtUtc", record.finishedAtUtc ?: JSONObject.NULL)
-        put("durationMs", duration)
-        put("captureState", record.captureState.name)
-        put("recognitionState", record.recognitionState.name)
-        put("transferState", record.transferState.name)
-        put("archiveState", record.archiveState.name)
-        put("orgState", record.orgState.name)
-        put("previewText", record.previewText ?: JSONObject.NULL)
-        put("finalText", record.finalText ?: JSONObject.NULL)
-        put("archivedAudioUri", record.archivedAudioUri ?: JSONObject.NULL)
-        put("error", record.lastErrorCode ?: record.lastErrorStage ?: JSONObject.NULL)
-        put("transcriptVersion", record.transcriptVersion)
-    }
+    private fun recordValue(record: CaptureRecord): JSObject = NativeCaptureProjection.record(record)
 
     private fun stopPlayer() {
         player?.runCatching { stop() }
@@ -270,7 +226,7 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
         player = null
     }
 
-    private fun isWatch(): Boolean = activity.packageManager.hasSystemFeature("android.hardware.type.watch")
+    private fun isWatch(): Boolean = NativePhoneRequirements.isWatch(activity)
 
     override fun onDestroy() {
         stopPlayer()

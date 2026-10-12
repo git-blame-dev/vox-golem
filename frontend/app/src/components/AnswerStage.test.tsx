@@ -25,6 +25,19 @@ function render(props: Parameters<typeof AnswerStage>[0]) {
 }
 
 describe('AnswerStage', () => {
+  it('compacts phone answers without losing refusal, busy/terminal status or evidence', () => {
+    const container = render({ compact: true, answer: 'Synthetic answer', stages: [{ stage: 'instant', status: 'completed' }], sources: [{ url: 'https://example.test/source', title: 'Synthetic source' }], priorVersions: [{ id: 'synthetic-old', text: 'Synthetic prior answer' }] })
+    expect(container.querySelector('h2')).toBeNull()
+    expect(container.textContent).not.toContain('Current answer')
+    expect(container.querySelector('[data-status="completed"]')).toBeNull()
+    expect(container.querySelector('details')?.textContent).toContain('Synthetic source')
+    expect(container.querySelector('details')?.textContent).toContain('Synthetic prior answer')
+    const refusal = render({ compact: true, contentKind: 'refusal', answer: 'Synthetic refusal', stages: [{ stage: 'instant', status: 'failed' }] })
+    expect(refusal.querySelector('h2')?.textContent).toBe('Assistant refusal')
+    expect(refusal.querySelector('[data-status="failed"]')).toBeTruthy()
+    const busy = render({ compact: true, answer: 'Synthetic stream', stages: [{ stage: 'instant', status: 'running' }] })
+    expect(busy.querySelector('[data-status="running"]')).toBeTruthy()
+  })
   it('exposes the authoritative answer and accessible status names', () => {
     const container = render({
       answer: '<em>safe</em> **plain text**',

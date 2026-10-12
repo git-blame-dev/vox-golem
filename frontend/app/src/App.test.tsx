@@ -1,12 +1,17 @@
 import { StrictMode, act } from 'react'
+import { readFileSync } from 'node:fs'
 import { createRoot } from 'react-dom/client'
 import type { Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as liveAudioSourceModule from './lib/liveAudioSource'
 import * as tauriModule from './lib/tauri'
+import * as instantModelSelectModule from './components/InstantModelSelect'
 import type { StartLiveAudioSourceOptions } from './lib/liveAudioSource'
 import { configureBrowserPreviewFixture } from './lib/browserRuntime'
 import App from './App'
+import { FrontendSession } from './FrontendSession'
+import { sessionAuthority } from './SessionAuthority'
+import headerIcon from '../../../apps/desktop-tauri/src-tauri/icons/icon.svg?url'
 
 const startLiveAudioSourceMock = vi.spyOn(liveAudioSourceModule, 'startLiveAudioSource')
 const listAudioInputDevicesMock = vi.spyOn(liveAudioSourceModule, 'listAudioInputDevices')
@@ -164,7 +169,158 @@ afterEach(() => {
 })
 
 describe('App', () => {
-  it('settles desktop Channel updates against canonical snapshots without losing timing or source details', async () => {
+  it('preserves failed Review and corrected fallback stage details through canonical completion and a later snapshot', async () => {
+    const committed: Record<string, unknown>[] = []
+    let send: (payload: unknown) => void = () => undefined
+    window.__TAURI_INTERNALS__ = {
+      createChannel: <T,>(handler: (payload: T) => void) => { send = handler as (payload: unknown) => void; return 'synthetic-stage-channel' },
+      invoke: async (command, args) => {
+        if (command === 'get_startup_state') return readyStartupState({ voice_input_available: false })
+        if (command === 'get_app_snapshot') return appSnapshot(committed, { instant: 'custom-sol-high', deep_enabled: true, review_enabled: true })
+        if (command === 'submit_prompt') {
+          const request = args as { requestId: string; prompt: string }
+          if (committed.length === 0) {
+            send({ kind: 'text', text: 'Synthetic provisional answer' })
+            send({ kind: 'stage', stage: 'instant', status: 'completed' })
+            send({ kind: 'correction', stage: 'deep', text: 'Synthetic corrected fallback answer', correction: 'Correction: synthetic evidence changed the answer' })
+            send({ kind: 'stage', stage: 'review', status: 'failed', detail: 'Synthetic Review provider failed' })
+            committed.push(canonicalTurn('401', '402', request.prompt, 'Synthetic corrected fallback answer', request.requestId, 'text', 'deep'))
+          } else committed.push(canonicalTurn('403', '404', request.prompt, 'Synthetic next answer', request.requestId))
+          return { request_id: request.requestId, runtime_phase: 'sleeping', outcome: 'completed' }
+        }
+        return null
+      },
+    }
+    const { container } = await renderApp()
+    await act(async () => { setTextAreaValue(getComposer(container), 'Synthetic fallback question') })
+    await act(async () => { getSendButton(container).click() })
+    const assertSettled = (): void => {
+      const answer = container.querySelectorAll('.answer-stage')[0]!
+      expect(answer.querySelector('.answer-stage__answer')?.textContent).toBe('Synthetic corrected fallback answer')
+      expect(answer.querySelector('[data-stage="review"][data-status="failed"]')).not.toBeNull()
+      expect(answer.querySelector('[data-stage="deep"][data-status="corrected"]')).not.toBeNull()
+      expect(answer.querySelector('details')?.textContent).toContain('Synthetic Review provider failed')
+      expect(answer.querySelector('details')?.textContent).toContain('Correction: synthetic evidence changed the answer')
+      expect(answer.querySelector('details')?.textContent).toContain('Synthetic provisional answer')
+    }
+    assertSettled()
+    await act(async () => { setTextAreaValue(getComposer(container), 'Synthetic later snapshot question') })
+    await act(async () => { getSendButton(container).click() })
+    assertSettled()
+    expect(container.querySelectorAll('.message--assistant')).toHaveLength(2)
+  })
+  it.each([
+    ['sleeping', false], ['listening', true], ['processing', true],
+    ['executing', true], ['error', false],
+  ])('animates the canonical accessible header icon only for active work: %s', async (phase, busy) => {
+    window.__TAURI_INTERNALS__ = { invoke: async (command) => {
+      if (command === 'get_startup_state') return readyStartupState({ runtime_phase: phase, voice_input_available: false })
+      if (command === 'get_assistant_settings') return defaultAssistantSettings()
+      return null
+    } }
+    const { container } = await renderApp()
+    const logo = container.querySelector<HTMLImageElement>('header img[alt="VoxGolem"]')
+    expect(logo).not.toBeNull()
+    expect(logo?.getAttribute('src')).toBe(headerIcon)
+    expect(logo?.dataset['busy']).toBe(String(busy))
+  })
+
+  it('uses native reduced-motion CSS to suppress even the busy header animation', () => {
+    const appStyles = readFileSync('src/App.css', 'utf8')
+    const sheet = new CSSStyleSheet()
+    sheet.replaceSync(appStyles)
+    const motionRule = Array.from(sheet.cssRules).find((rule) =>
+      rule instanceof CSSMediaRule && rule.cssText.includes('(prefers-reduced-motion: reduce)')) as CSSMediaRule | undefined
+    expect(motionRule).toBeDefined()
+    const logoRule = Array.from(motionRule!.cssRules).find((rule) =>
+      rule instanceof CSSStyleRule && rule.selectorText === '.shell__logo[data-busy="true"]') as CSSStyleRule | undefined
+    expect(logoRule?.style.animation).toBe('none')
+    const activeRule = Array.from(sheet.cssRules).find((rule) =>
+      rule instanceof CSSStyleRule && rule.selectorText === '.shell__logo[data-busy="true"]') as CSSStyleRule | undefined
+    expect(activeRule?.style.animation).toBe('voxgolem-header-spin 8.533s linear infinite')
+    expect(appStyles).toContain('rotate(-360deg)')
+  })
+
+  it('shares inline Instant persistence and rollback with Settings, locking both during a write', async () => {
+    const calls: string[] = []
+    let rejectWrite: (reason: unknown) => void = () => undefined
+    window.__TAURI_INTERNALS__ = { invoke: async (command, args) => {
+      calls.push(command)
+      if (command === 'get_startup_state') return readyStartupState({ voice_input_available: false })
+      if (command === 'get_assistant_settings') return { ...defaultAssistantSettings(), instant: 'custom-sol-high' }
+      if (command === 'set_assistant_settings') {
+        expect(args).toMatchObject({ settings: { instant: 'custom-sol-none' } })
+        return new Promise((_resolve, reject) => { rejectWrite = reject })
+      }
+      return null
+    } }
+    const { container } = await renderApp()
+    const inline = container.querySelector<HTMLSelectElement>('#composerInstantSelect')!
+    expect(inline?.value).toBe('custom-sol-high')
+    await act(async () => {
+      setTextAreaValue(getComposer(container), 'Synthetic preserved draft')
+      setSelectValue(inline, 'custom-sol-none')
+      await Promise.resolve()
+    })
+    expect(inline.disabled).toBe(true)
+    expect(getSendButton(container).disabled).toBe(true)
+    await act(async () => { getButtonByLabel(container, 'Settings').click(); await Promise.resolve() })
+    const settings = container.querySelector<HTMLSelectElement>('#assistantInstantSelect')!
+    expect(settings.value).toBe('custom-sol-none')
+    expect(settings.disabled).toBe(true)
+    await act(async () => { setSelectValue(settings, 'custom-luna-low'); await Promise.resolve() })
+    expect(calls.filter((command) => command === 'set_assistant_settings')).toHaveLength(1)
+    await act(async () => { rejectWrite(new Error('Synthetic settings failure')); await Promise.resolve() })
+    expect(inline.value).toBe('custom-sol-high')
+    expect(settings.value).toBe('custom-sol-high')
+    expect(inline.disabled).toBe(false)
+    await closeSettings(container)
+    expect(getComposer(container).value).toBe('Synthetic preserved draft')
+    expect(calls).not.toContain('cancel_prompt')
+    expect(calls).not.toContain('submit_prompt')
+  })
+
+  it('locks inline model actions throughout request execution and explicit Stop without implicit cancellation or resubmission', async () => {
+    const calls: string[] = []
+    let finishPrompt: (value: unknown) => void = () => undefined
+    let finishStop: (value: unknown) => void = () => undefined
+    window.__TAURI_INTERNALS__ = { invoke: async (command) => {
+      calls.push(command)
+      if (command === 'get_app_snapshot') return appSnapshot()
+      if (command === 'get_startup_state') return readyStartupState({ voice_input_available: false, prompt_cancellation_available: true })
+      if (command === 'submit_prompt') return new Promise((resolve) => { finishPrompt = resolve })
+      if (command === 'cancel_prompt') return new Promise((resolve) => { finishStop = resolve })
+      return null
+    } }
+    const { container } = await renderApp()
+    const inline = container.querySelector<HTMLSelectElement>('#composerInstantSelect')!
+    await act(async () => {
+      setTextAreaValue(getComposer(container), 'Synthetic pending prompt')
+      getSendButton(container).click()
+      await Promise.resolve()
+    })
+    expect(inline.disabled).toBe(true)
+    expect(container.querySelector<HTMLImageElement>('.shell__logo')?.dataset['busy']).toBe('true')
+    await act(async () => { setSelectValue(inline, 'local-quality'); await Promise.resolve() })
+    expect(calls).not.toContain('cancel_prompt')
+    expect(calls).not.toContain('switch_response_profile')
+    expect(calls).not.toContain('set_assistant_settings')
+    await act(async () => { getButtonByText(container, 'Stop').click(); await Promise.resolve() })
+    expect(inline.disabled).toBe(true)
+    await act(async () => { setSelectValue(inline, 'custom-sol-none'); await Promise.resolve() })
+    expect(calls.filter((command) => command === 'cancel_prompt')).toHaveLength(1)
+    expect(calls.filter((command) => command === 'submit_prompt')).toHaveLength(1)
+    await act(async () => {
+      finishStop({ cancelled: true })
+      finishPrompt({ outcome: 'cancelled', runtime_phase: 'sleeping', request_id: 'synthetic-request' })
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(inline.disabled).toBe(false)
+    expect(inline.value).toBe('local-fast')
+    expect(container.querySelector<HTMLImageElement>('.shell__logo')?.dataset['busy']).toBe('false')
+  })
+  it.each([[450, 1250, '450 ms', '1.25 s'], [999, 1000, '999 ms', '1 s'], [1100, 1234, '1.1 s', '1.23 s']])('settles desktop Channel updates against canonical snapshots without losing timing or source details (%s/%s)', async (firstText, completed, firstLabel, completedLabel) => {
     const committed: Record<string, unknown>[] = []
     let send: ((payload: unknown) => void) | undefined
     window.__TAURI_INTERNALS__ = {
@@ -188,7 +344,7 @@ describe('App', () => {
           }
           send?.({ kind: 'stage', stage: 'instant', status: 'running', detail: null })
           send?.({ kind: 'text', text: 'Provisional answer' })
-          send?.({ kind: 'custom_direct_timings', first_text_ms: 450, completed_ms: 1250 })
+          send?.({ kind: 'custom_direct_timings', first_text_ms: firstText, completed_ms: completed })
           send?.({ kind: 'sources', sources: [{ url: 'https://example.com/evidence', title: 'Synthetic evidence' }] })
           committed.push(canonicalTurn('301', '302', 'Synthetic question', 'Canonical answer', request.requestId))
           return { request_id: request.requestId, runtime_phase: 'sleeping', outcome: 'completed', error_message: null }
@@ -206,7 +362,7 @@ describe('App', () => {
     expect(container.querySelectorAll('.message--assistant')).toHaveLength(1)
     expect(getConversation(container).textContent).toContain('Canonical answer')
     expect(getConversation(container).textContent).not.toContain('Provisional answer')
-    expect(container.textContent).toContain('First text: 450 ms · Completed: 1.25 s')
+    expect(container.textContent).toContain(`First text: ${firstLabel} · Completed: ${completedLabel}`)
     const details = container.querySelector<HTMLDetailsElement>('.answer-stage__details')
     expect(details).not.toBeNull()
     expect(container.querySelector('a[href="https://example.com/evidence"]')).not.toBeNull()
@@ -216,7 +372,7 @@ describe('App', () => {
     await act(async () => { getSendButton(container).click(); for (let index = 0; index < 8; index += 1) await Promise.resolve() })
     expect(container.querySelectorAll('.message--assistant')).toHaveLength(2)
     expect(container.textContent).toContain('Second canonical answer')
-    expect(container.textContent).toContain('First text: 450 ms · Completed: 1.25 s')
+    expect(container.textContent).toContain(`First text: ${firstLabel} · Completed: ${completedLabel}`)
     expect(container.querySelector('a[href="https://example.com/evidence"]')).not.toBeNull()
   })
 
@@ -254,7 +410,7 @@ describe('App', () => {
     const shell = getShell(container)
 
     expect(header).not.toBeNull()
-    expect(header?.querySelector('[data-shell-identity]')?.textContent).toContain('VoxGolem')
+    expect(header?.querySelector('[data-shell-identity] img')?.getAttribute('alt')).toBe('VoxGolem')
     expect(header?.querySelector('[data-browser-preview]')?.textContent).toBe('Browser preview')
     expect(header?.querySelector('[data-runtime-phase]')?.textContent).toContain(getShell(container).dataset['runtimeStatus'])
     expect(header?.querySelector('[aria-label="Switch to light mode"]')).not.toBeNull()
@@ -495,7 +651,7 @@ describe('App', () => {
     expect(selected?.title).toBe('Detailed provider authentication failure')
   })
 
-  it('disables a model omitted from the authoritative snapshot', async () => {
+  it('hides a model omitted from the authoritative snapshot without silently selecting another', async () => {
     window.__TAURI_INTERNALS__ = {
       invoke: async (command) => {
         if (command === 'get_app_snapshot') return appSnapshot([], { instant: 'local-fast' }, {
@@ -513,8 +669,8 @@ describe('App', () => {
       await Promise.resolve()
     })
     const localFast = container.querySelector<HTMLOptionElement>('#assistantInstantSelect option[value="local-fast"]')
-    expect(localFast?.disabled).toBe(true)
-    expect(localFast?.title).toBe('Unavailable in the current app snapshot')
+    expect(localFast).toBeNull()
+    expect(container.querySelector<HTMLSelectElement>('#assistantInstantSelect')?.value).toBe('')
     await closeSettings(container)
     expect(getSendButton(container).disabled).toBe(true)
   })
@@ -1183,7 +1339,8 @@ describe('App', () => {
     expect(getShell(container).dataset['runtimeStatus']).toBe('error')
   })
 
-  it('does not let reconciliation overwrite a newer profile transition', async () => {
+  it('locks both model selectors until canonical reconciliation settles, without cancelling or switching', async () => {
+    const calls: string[] = []
     let finishPrompt: ((value: unknown) => void) | undefined
     let resolveReconciliation: (value: unknown) => void = () => undefined
     let requestId = ''
@@ -1191,6 +1348,7 @@ describe('App', () => {
     window.__TAURI_INTERNALS__ = {
       listen: async () => () => undefined,
       invoke: async (command, args) => {
+        calls.push(command)
         if (command === 'get_app_snapshot') {
           snapshotCalls += 1
           if (snapshotCalls === 1) return appSnapshot()
@@ -1219,7 +1377,11 @@ describe('App', () => {
       setSelectValue(await getResponseProfileSelect(container), 'quality')
       await Promise.resolve()
     })
-    expect(getShell(container).dataset['runtimeStatus']).toBe('initializing')
+    expect(container.querySelector<HTMLSelectElement>('#assistantInstantSelect')?.disabled).toBe(true)
+    expect(container.querySelector<HTMLSelectElement>('#composerInstantSelect')?.disabled).toBe(true)
+    expect(calls).not.toContain('switch_response_profile')
+    expect(calls).not.toContain('cancel_prompt')
+    expect(calls.filter((command) => command === 'submit_prompt')).toHaveLength(1)
 
     await act(async () => {
       resolveReconciliation(appSnapshot(
@@ -1230,7 +1392,9 @@ describe('App', () => {
       await Promise.resolve()
       await Promise.resolve()
     })
-    expect(getShell(container).dataset['runtimeStatus']).toBe('initializing')
+    expect(getShell(container).dataset['runtimeStatus']).toBe('sleeping')
+    expect(container.querySelector<HTMLSelectElement>('#assistantInstantSelect')?.disabled).toBe(false)
+    expect(container.querySelector<HTMLSelectElement>('#composerInstantSelect')?.disabled).toBe(false)
   })
 
   it('reconciles a rejected prompt without overwriting newer live runtime or canonical history', async () => {
@@ -2710,7 +2874,7 @@ describe('App', () => {
     expect(snapshotCalls).toBe(1)
   })
 
-  it('keeps the typed shell nonfatal and lists every zero-asset capability in one red notice', async () => {
+  it('keeps the typed shell nonfatal with speech diagnostics in Settings and other unavailable capabilities in one notice', async () => {
     const capabilityIds = [
       'custom_provider', 'opencode', 'local_fast', 'local_quality', 'qwen_prediction',
       'wake_word', 'vad', 'parakeet', 'tts', 'deep', 'review',
@@ -2762,10 +2926,12 @@ describe('App', () => {
     expect(notice?.parentElement?.parentElement?.classList.contains('conversation-region')).toBe(true)
     expect(container.querySelector('[aria-label="Response announcements"]')?.closest('.conversation-region')).toBeNull()
     for (const id of capabilityIds) {
-      expect(container.textContent).toContain(`${id} unavailable`)
+      if (['wake_word', 'vad', 'parakeet', 'tts'].includes(id)) expect(container.textContent).not.toContain(`${id} unavailable`)
+      else expect(container.textContent).toContain(`${id} unavailable`)
     }
     const settingsButton = getButtonByLabel(container, 'Settings')
     await act(async () => { settingsButton.click(); await Promise.resolve() })
+    for (const id of ['wake_word', 'vad', 'parakeet', 'tts']) expect(container.querySelector('[role="dialog"]')?.textContent).toContain(`${id} unavailable`)
     const instantSelect = container.querySelector<HTMLSelectElement>('#assistantInstantSelect')
     expect(instantSelect).not.toBeNull()
     expect(Array.from(instantSelect?.options ?? []).every((option) => option.disabled || option.value === 'local-fast')).toBe(true)
@@ -3876,7 +4042,7 @@ describe('App', () => {
     const select = await getResponseProfileSelect(container)
 
     expect(select.value).toBe('local-fast')
-    expect(Array.from(select.options).map((option) => option.text)).toEqual(['Local: Fast', 'Local: Quality', 'Custom: GPT-6 Sol High', 'Custom: GPT-6 Sol No Reasoning', 'Custom: GPT-6 Luna No Reasoning', 'Custom: GPT-5.6 Luna Low', 'OpenCode: GPT-6 Sol High', 'OpenCode: GPT-5.6 Luna Low'])
+    expect(Array.from(select.options).map((option) => option.text)).toEqual(['Local: Fast', 'Local: Quality', 'Custom: GPT-6.1 Sol High', 'Custom: GPT-6.1 Sol No Reasoning', 'Custom: GPT-6 Luna No Reasoning', 'Custom: GPT-5.6 Luna Low', 'OpenCode: GPT-6.1 Sol High', 'OpenCode: GPT-5.6 Luna Low'])
   })
 
   it('invokes switch_response_profile when selecting Quality profile', async () => {
@@ -3886,6 +4052,8 @@ describe('App', () => {
     window.__TAURI_INTERNALS__ = {
       invoke: async (command, args) => {
         invokedCommands.push(command)
+
+        if (command === 'get_assistant_settings') return defaultAssistantSettings()
 
         if (command === 'get_startup_state') {
           return {
@@ -3943,6 +4111,7 @@ describe('App', () => {
 
     window.__TAURI_INTERNALS__ = {
       invoke: async (command, args) => {
+        if (command === 'get_assistant_settings') return defaultAssistantSettings()
         if (command === 'get_startup_state') {
           return {
             kind: 'ready',
@@ -4011,6 +4180,8 @@ describe('App', () => {
     window.__TAURI_INTERNALS__ = {
       invoke: async (command) => {
         invokedCommands.push(command)
+
+        if (command === 'get_assistant_settings') return defaultAssistantSettings()
 
         if (command === 'get_startup_state') {
           startupStateCallCount += 1
@@ -4102,6 +4273,7 @@ describe('App', () => {
 
     window.__TAURI_INTERNALS__ = {
       invoke: async (command, args) => {
+        if (command === 'get_assistant_settings') return defaultAssistantSettings()
         if (command === 'get_startup_state') {
           startupStateCallCount += 1
 
@@ -4169,6 +4341,7 @@ describe('App', () => {
 
     window.__TAURI_INTERNALS__ = {
       invoke: async (command) => {
+        if (command === 'get_assistant_settings') return defaultAssistantSettings()
         if (command === 'get_startup_state') {
           startupStateCallCount += 1
           if (startupStateCallCount === 1) return readyStartupState()
@@ -4479,6 +4652,7 @@ describe('App', () => {
     })
     window.__TAURI_INTERNALS__ = {
       invoke: async (command) => {
+        if (command === 'get_assistant_settings') return defaultAssistantSettings()
         if (command === 'get_startup_state') return failedState
         if (command === 'switch_response_profile') {
           return { selected_response_profile: 'fast', supported_response_profiles: ['fast'] }
@@ -4558,14 +4732,14 @@ describe('App', () => {
     const { container } = await renderApp()
     const indicator = container.querySelector<HTMLElement>('.composer__instant-model')
     const mic = getControlButton(container, 'Start mic')
-    expect(indicator?.textContent).toBe('Instant: Custom: GPT-6 Luna No Reasoning')
+    expect(indicator?.querySelector<HTMLSelectElement>('select')?.selectedOptions[0]?.textContent).toBe('Custom: GPT-6 Luna No Reasoning')
     expect(mic.compareDocumentPosition(indicator!)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
     const select = await getResponseProfileSelect(container)
     expect(select.value).toBe('custom-luna-none')
     expect(select.querySelector('option[value="custom-luna-none"]')).not.toBeNull()
     await act(async () => { setSelectValue(select, 'custom-sol-none'); await Promise.resolve() })
     expect(selected).toBe('custom-sol-none')
-    expect(indicator?.textContent).toBe('Instant: Custom: GPT-6 Sol No Reasoning')
+    expect(indicator?.querySelector<HTMLSelectElement>('select')?.selectedOptions[0]?.textContent).toBe('Custom: GPT-6.1 Sol No Reasoning')
   })
 
   it('renders only user and assistant prompt execution output when submit command succeeds', async () => {
@@ -4803,6 +4977,133 @@ describe('App', () => {
     })
     expect(container.textContent).not.toContain('Executing prompt')
     expect(getResponseAnnouncer(container).textContent).toBe('Assistant response: Hello world')
+  })
+
+  it('fences queued and late stream presentation immediately on Stop while native retirement is pending', async () => {
+    let send: ((event: { payload: unknown }) => void) | undefined
+    let requestId = ''
+    let finish: ((value: unknown) => void) | undefined
+    let stop: ((value: unknown) => void) | undefined
+    const frames: FrameRequestCallback[] = []
+    window.requestAnimationFrame = vi.fn((callback) => { frames.push(callback); return frames.length })
+    window.cancelAnimationFrame = vi.fn()
+    const invoke = vi.fn(async (command: string, args?: unknown) => {
+      if (command === 'get_startup_state') return readyStartupState({ prompt_cancellation_available: true, voice_input_available: false })
+      if (command === 'get_app_snapshot') return appSnapshot()
+      if (command === 'submit_prompt') {
+        requestId = (args as { requestId: string }).requestId
+        return new Promise((resolve) => { finish = resolve })
+      }
+      if (command === 'cancel_prompt') return new Promise((resolve) => { stop = resolve })
+      return null
+    })
+    window.__TAURI_INTERNALS__ = { invoke, listen: async (_event, handler) => { send = handler; return () => undefined } }
+    const { container } = await renderApp()
+    await act(async () => {
+      setTextAreaValue(getComposer(container), 'Synthetic cancellable question')
+      getSendButton(container).click()
+      await Promise.resolve()
+      send?.({ payload: { request_id: requestId, kind: 'text', text: 'Synthetic queued answer' } })
+    })
+    expect(frames).toHaveLength(1)
+    await act(async () => {
+      Array.from(container.querySelectorAll('button')).find((button) => button.textContent === 'Stop')!.click()
+      frames[0]?.(16)
+      send?.({ payload: { request_id: requestId, kind: 'text', text: 'Synthetic late answer' } })
+    })
+    expect(getConversation(container).textContent).not.toContain('Synthetic queued answer')
+    expect(getConversation(container).textContent).not.toContain('Synthetic late answer')
+    expect(frames).toHaveLength(1)
+    expect(Array.from(container.querySelectorAll('button')).find((button) => button.textContent === 'Stopping…')!.disabled).toBe(true)
+    await act(async () => {
+      setTextAreaValue(getComposer(container), 'Synthetic second question')
+      getSendButton(container).click()
+    })
+    expect(invoke.mock.calls.filter(([command]) => command === 'submit_prompt')).toHaveLength(1)
+    await act(async () => {
+      stop?.(true)
+      finish?.({ request_id: requestId, runtime_phase: 'sleeping', outcome: 'cancelled' })
+    })
+    expect(getConversation(container).textContent).not.toContain('Synthetic queued answer')
+  })
+
+  it('admits same-tick Send only once and presents frames without republishing unrelated session slices or resizing the composer', async () => {
+    const session = new FrontendSession()
+    const preserved = canonicalTurn('31', '32', 'Synthetic preserved question', 'Synthetic preserved answer', 'synthetic-preserved')
+    let committed: Record<string, unknown> | null = null
+    let requestId = ''
+    let send: (value: unknown) => void = () => undefined
+    let finish: (value: unknown) => void = () => undefined
+    const frames: FrameRequestCallback[] = []
+    window.requestAnimationFrame = vi.fn((callback) => { frames.push(callback); return frames.length })
+    window.cancelAnimationFrame = vi.fn()
+    const native = vi.fn(async (command: string, args?: unknown) => {
+      if (command === 'get_app_snapshot') return appSnapshot(committed === null ? [preserved] : [preserved, committed])
+      if (command === 'get_startup_state') return readyStartupState({ voice_input_available: false, prompt_cancellation_available: true })
+      if (command === 'submit_prompt') {
+        requestId = (args as { requestId: string }).requestId
+        return new Promise((resolve) => { finish = resolve })
+      }
+      return null
+    })
+    window.__TAURI_INTERNALS__ = { invoke: native, createChannel: <T,>(callback: (value: T) => void) => {
+      send = callback as (value: unknown) => void
+      return {}
+    } }
+    const { container } = await renderApp(false, session)
+    await act(async () => {
+      setTextAreaValue(getComposer(container), 'Synthetic current question')
+      const form = container.querySelector('form')!
+      form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+      form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    })
+    expect(native.mock.calls.filter(([command]) => command === 'submit_prompt')).toHaveLength(1)
+    await act(async () => { getButtonByLabel(container, 'Settings').click() })
+    const snapshots = [session.getToolbarSnapshot(), session.getComposerSnapshot(), session.getSettingsSnapshot()]
+    const priorAnswer = session.getMessagesSnapshot().find((message) => message.content === 'Synthetic preserved answer')
+    expect(priorAnswer).toBeDefined()
+    const layout = vi.spyOn(window, 'getComputedStyle')
+    const runtimeBindings = vi.spyOn(sessionAuthority(session), 'fieldState')
+    const modelRenders = vi.spyOn(instantModelSelectModule, 'InstantModelSelect')
+    const oldIntents = session.intents
+    let stageMetadata: ReturnType<typeof session.getMessagesSnapshot>[number]['answerStage']
+    for (const [index, chunks] of [['Synthetic ', 'frame one'], [' and ', 'frame two']].entries()) {
+      await act(async () => {
+        for (const text of chunks) send({ kind: 'text', text })
+      })
+      expect(frames).toHaveLength(index + 1)
+      await act(async () => { frames[index]!(16 * (index + 1)) })
+      expect(session.getToolbarSnapshot()).toBe(snapshots[0])
+      expect(session.getComposerSnapshot()).toBe(snapshots[1])
+      expect(session.getSettingsSnapshot()).toBe(snapshots[2])
+      expect(session.getMessagesSnapshot().find((message) => message.content === 'Synthetic preserved answer')).toBe(priorAnswer)
+      const nextMetadata = session.getMessagesSnapshot().find((message) => message.content.startsWith('Synthetic frame one'))?.answerStage
+      if (stageMetadata !== undefined) {
+        expect(nextMetadata?.stages).toBe(stageMetadata.stages)
+        expect(nextMetadata?.priorVersions).toBe(stageMetadata.priorVersions)
+        expect(nextMetadata?.sources).toBe(stageMetadata.sources)
+      }
+      stageMetadata = nextMetadata
+    }
+    expect(getConversation(container).textContent).toContain('Synthetic frame one and frame two')
+    expect(layout).not.toHaveBeenCalled()
+    expect(runtimeBindings).not.toHaveBeenCalled()
+    expect(modelRenders).not.toHaveBeenCalled()
+    expect(session.intents).toBe(oldIntents)
+    await act(async () => { send({ kind: 'reasoning', text: 'Synthetic bounded reasoning progress' }) })
+    expect(container.textContent).toContain('Synthetic bounded reasoning progress')
+    expect(modelRenders.mock.calls.filter(([props]) => props.id === 'assistantInstantSelect')).toHaveLength(0)
+    expect(session.getSettingsSnapshot()).toBe(snapshots[2])
+    modelRenders.mockRestore()
+    layout.mockRestore()
+    await act(async () => {
+      committed = canonicalTurn('33', '34', 'Synthetic current question', 'Synthetic canonical answer', requestId)
+      finish({ request_id: requestId, runtime_phase: 'sleeping', outcome: 'completed' })
+    })
+    expect(getConversation(container).textContent).toContain('Synthetic canonical answer')
+    expect(native.mock.calls.filter(([command]) => command === 'get_app_snapshot')).toHaveLength(2)
+    expect(runtimeBindings).toHaveBeenCalled()
+    runtimeBindings.mockRestore()
   })
 
   it('batches streamed deltas by frame and flushes queued text before completion', async () => {
@@ -5177,6 +5478,48 @@ describe('App', () => {
     await act(async () => { finishPrompt?.({ request_id: requestId, runtime_phase: 'sleeping', outcome: 'completed' }); await Promise.resolve() })
     expect(container.textContent).not.toContain('Executing prompt')
     await act(async () => { setTextAreaValue(getComposer(container), 'another prompt'); await Promise.resolve(); await Promise.resolve() })
+    expect(getSendButton(container).disabled).toBe(false)
+  })
+
+  it('keeps stopped presentation fenced after rejected cancellation but adopts trusted canonical completion', async () => {
+    let requestId = ''
+    let channel: (value: unknown) => void = () => undefined
+    let finish: (value: unknown) => void = () => undefined
+    let committed: Record<string, unknown> | null = null
+    const frames: FrameRequestCallback[] = []
+    window.requestAnimationFrame = vi.fn((callback) => { frames.push(callback); return frames.length })
+    window.cancelAnimationFrame = vi.fn()
+    window.__TAURI_INTERNALS__ = {
+      createChannel: <T,>(handler: (value: T) => void) => { channel = handler as (value: unknown) => void; return {} },
+      invoke: async (command, args) => {
+        if (command === 'get_app_snapshot') return appSnapshot(committed === null ? [] : [committed])
+        if (command === 'get_startup_state') return readyStartupState({ voice_input_available: false, prompt_cancellation_available: true })
+        if (command === 'submit_prompt') {
+          requestId = (args as { requestId: string }).requestId
+          return new Promise((resolve) => { finish = resolve })
+        }
+        if (command === 'cancel_prompt') throw new Error('Synthetic rejected cancellation')
+        return null
+      },
+    }
+    const { container } = await renderApp()
+    await act(async () => { setTextAreaValue(getComposer(container), 'Synthetic cancelled presentation'); getSendButton(container).click() })
+    await act(async () => { channel({ kind: 'text', text: 'Synthetic obsolete queued text' }) })
+    expect(frames).toHaveLength(1)
+    await act(async () => { Array.from(container.querySelectorAll('button')).find((button) => button.textContent === 'Stop')!.click() })
+    await act(async () => {
+      frames[0]!(16)
+      channel({ kind: 'text', text: 'Synthetic obsolete Channel text' })
+    })
+    expect(frames).toHaveLength(1)
+    expect(getConversation(container).textContent).not.toContain('Synthetic obsolete')
+    expect(getSendButton(container).disabled).toBe(true)
+    await act(async () => {
+      committed = canonicalTurn('41', '42', 'Synthetic cancelled presentation', 'Synthetic trusted canonical completion', requestId)
+      finish({ request_id: requestId, runtime_phase: 'sleeping', outcome: 'completed' })
+    })
+    expect(getConversation(container).textContent).toContain('Synthetic trusted canonical completion')
+    await act(async () => { setTextAreaValue(getComposer(container), 'Synthetic next prompt') })
     expect(getSendButton(container).disabled).toBe(false)
   })
 
@@ -6107,6 +6450,8 @@ describe('App', () => {
       invoke: async (command, args) => {
         invokedCommands.push(command)
 
+        if (command === 'get_assistant_settings') return defaultAssistantSettings()
+
         if (command === 'get_startup_state') {
           return {
             kind: 'ready',
@@ -6236,12 +6581,14 @@ describe('App', () => {
     expect(invokedCommands.filter((command) => command === 'ingest_audio_frame')).toHaveLength(1)
   })
 
-  it('blocks microphone restart and preserves newer runtime activity while reset settles', async () => {
+  it('blocks microphone restart and model changes while reset settles', async () => {
+    const calls: string[] = []
     let resolveReset: () => void = () => undefined
     let snapshotCalls = 0
     startLiveAudioSourceMock.mockResolvedValue({ stop: vi.fn() })
     window.__TAURI_INTERNALS__ = {
       invoke: async (command) => {
+        calls.push(command)
         if (command === 'get_app_snapshot') {
           snapshotCalls += 1
           return appSnapshot([], {}, { runtime_phase: 'sleeping' })
@@ -6271,7 +6618,9 @@ describe('App', () => {
       setSelectValue(await getResponseProfileSelect(container), 'quality')
       await Promise.resolve()
     })
-    expect(getShell(container).dataset['runtimeStatus']).toBe('initializing')
+    expect(container.querySelector<HTMLSelectElement>('#assistantInstantSelect')?.disabled).toBe(true)
+    expect(container.querySelector<HTMLSelectElement>('#composerInstantSelect')?.disabled).toBe(true)
+    expect(calls).not.toContain('switch_response_profile')
     await act(async () => {
       resolveReset()
       await Promise.resolve()
@@ -6279,7 +6628,8 @@ describe('App', () => {
     })
 
     expect(snapshotCalls).toBeGreaterThanOrEqual(2)
-    expect(getShell(container).dataset['runtimeStatus']).toBe('initializing')
+    expect(getShell(container).dataset['runtimeStatus']).toBe('sleeping')
+    expect(container.querySelector<HTMLSelectElement>('#assistantInstantSelect')?.disabled).toBe(false)
   })
 
   it('restarts auto-started microphone capture once after reset settles', async () => {
@@ -6484,6 +6834,8 @@ describe('App', () => {
       invoke: async (command, args) => {
         invokedCommands.push(command)
 
+        if (command === 'get_assistant_settings') return defaultAssistantSettings()
+
         if (command === 'get_startup_state') {
           return {
             kind: 'ready',
@@ -6595,6 +6947,8 @@ describe('App', () => {
       invoke: async (command, args) => {
         invokedCommands.push(command)
 
+        if (command === 'get_assistant_settings') return defaultAssistantSettings()
+
         if (command === 'get_startup_state') {
           return {
             kind: 'ready',
@@ -6696,6 +7050,8 @@ describe('App', () => {
     window.__TAURI_INTERNALS__ = {
       invoke: async (command, args) => {
         invokedCommands.push(command)
+
+        if (command === 'get_assistant_settings') return defaultAssistantSettings()
 
         if (command === 'get_startup_state') {
           return {
@@ -6805,6 +7161,8 @@ describe('App', () => {
       invoke: async (command, args) => {
         invokedCommands.push(command)
 
+        if (command === 'get_assistant_settings') return defaultAssistantSettings()
+
         if (command === 'get_startup_state') {
           return {
             kind: 'ready',
@@ -6900,6 +7258,8 @@ describe('App', () => {
     window.__TAURI_INTERNALS__ = {
       invoke: async (command, args) => {
         invokedCommands.push(command)
+
+        if (command === 'get_assistant_settings') return defaultAssistantSettings()
 
         if (command === 'get_startup_state') {
           return {
@@ -8500,7 +8860,37 @@ describe('App', () => {
   })
 })
 
-async function renderApp(strict = false): Promise<{ container: HTMLElement }> {
+describe('Settings-only desktop speech diagnostics', () => {
+  it('shows reported providers and static speech failures in Settings, not chat', async () => {
+    const capabilities = completeCapabilities().map((item) => item['id'] === 'parakeet'
+      ? { ...item, state: 'unavailable', reason: 'Synthetic STT model missing', actual_provider: null }
+      : item['id'] === 'tts' ? { ...item, actual_provider: 'cuda' } : item)
+    window.__TAURI_INTERNALS__ = { invoke: async (command) => {
+      if (command === 'get_app_snapshot') return appSnapshot([], {}, { capabilities })
+      if (command === 'get_startup_state') return readyStartupState({ capabilities, voice_input_available: false, voice_input_error: 'Synthetic STT model missing',
+        speech_services: {
+          stt: { configured_engine: 'Parakeet', runtime_engine: null, configured_model: null, configured_voice: null, configured_locale: null },
+          tts: { configured_engine: 'Piper ONNX', runtime_engine: 'Piper ONNX', configured_model: null, configured_voice: null, configured_locale: null },
+        },
+      })
+      return null
+    } }
+    const { container } = await renderApp()
+    expect(container.textContent).not.toContain('Synthetic STT model missing')
+    expect(container.textContent).not.toContain('CUDA')
+    await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
+    const dialog = container.querySelector('[role="dialog"]')!
+    expect(dialog.textContent).toContain('Synthetic STT model missing')
+    expect(dialog.textContent).toContain('Parakeet')
+    expect(dialog.textContent).toContain('Local processing')
+    expect(dialog.textContent).toContain('CUDA')
+    expect(dialog.textContent).toContain('Piper ONNX')
+    expect(dialog.textContent).toContain('Model identity not reported')
+    expect(dialog.textContent).toContain('Voice identity not reported')
+  })
+})
+
+async function renderApp(strict = false, session?: FrontendSession): Promise<{ container: HTMLElement }> {
   installPromptChannelFixture()
   const container = document.createElement('div')
   document.body.append(container)
@@ -8509,7 +8899,7 @@ async function renderApp(strict = false): Promise<{ container: HTMLElement }> {
   mountedRoots.push(root)
 
   await act(async () => {
-    root.render(strict ? <StrictMode><App /></StrictMode> : <App />)
+    root.render(strict ? <StrictMode><App session={session} /></StrictMode> : <App session={session} />)
   })
 
   for (let index = 0; index < 5; index += 1) {

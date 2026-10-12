@@ -12,7 +12,7 @@ pub enum TextValidationError {
     TooLong,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct BoundedText<const MAX_BYTES: usize>(String);
 
@@ -247,8 +247,25 @@ pub struct ValidatedPreferences {
     pub completion: bool,
     pub response_profile: ResponseProfile,
     pub tts_enabled: bool,
+    #[serde(default = "default_enabled")]
+    pub web_enabled: bool,
+    #[serde(default = "default_enabled")]
+    pub speech_network_fallback: bool,
     pub ui_theme: UiTheme,
     pub ui_text_size: UiTextSize,
+    /// Empty selects the system/automatic language rather than a fixed locale.
+    #[serde(default)]
+    pub speech_language: BoundedText<DISPLAY_TEXT_MAX_BYTES>,
+    /// Empty selects the system/automatic TTS provider.
+    #[serde(default)]
+    pub speech_tts_provider: BoundedText<DISPLAY_TEXT_MAX_BYTES>,
+    /// Empty selects the system/automatic voice rather than a fixed voice ID.
+    #[serde(default)]
+    pub speech_tts_voice: BoundedText<DISPLAY_TEXT_MAX_BYTES>,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -576,8 +593,145 @@ mod tests {
             completion: false,
             response_profile: ResponseProfile::Fast,
             tts_enabled: false,
+            web_enabled: true,
+            speech_network_fallback: true,
             ui_theme: UiTheme::Dark,
             ui_text_size: UiTextSize::Large,
+            speech_language: BoundedText::default(),
+            speech_tts_provider: BoundedText::default(),
+            speech_tts_voice: BoundedText::default(),
+        }
+    }
+
+    #[test]
+    fn legacy_preferences_default_web_and_speech_fallback_to_enabled() {
+        let mut old = serde_json::to_value(preferences()).unwrap();
+        old.as_object_mut().unwrap().remove("web_enabled");
+        old.as_object_mut()
+            .unwrap()
+            .remove("speech_network_fallback");
+        let preferences: ValidatedPreferences = serde_json::from_value(old).unwrap();
+        let wire = serde_json::to_value(preferences).unwrap();
+        assert_eq!(wire["web_enabled"], true);
+        assert_eq!(wire["speech_network_fallback"], true);
+    }
+
+    #[test]
+    fn preferences_preserve_explicit_web_and_speech_fallback_denial() {
+        let mut wire = serde_json::to_value(preferences()).unwrap();
+        wire["web_enabled"] = false.into();
+        wire["speech_network_fallback"] = false.into();
+        let preferences: ValidatedPreferences = serde_json::from_value(wire).unwrap();
+        let wire = serde_json::to_value(preferences).unwrap();
+        assert_eq!(wire["web_enabled"], false);
+        assert_eq!(wire["speech_network_fallback"], false);
+    }
+
+    #[test]
+    fn web_and_speech_fallback_preferences_are_independent_and_require_booleans() {
+        for web_enabled in [true, false] {
+            for fallback in [true, false] {
+                let mut wire = serde_json::to_value(preferences()).unwrap();
+                wire["web_enabled"] = web_enabled.into();
+                wire["speech_network_fallback"] = fallback.into();
+                let parsed: ValidatedPreferences = serde_json::from_value(wire.clone()).unwrap();
+                assert_eq!(parsed.web_enabled, web_enabled);
+                assert_eq!(parsed.speech_network_fallback, fallback);
+                for field in ["web_enabled", "speech_network_fallback"] {
+                    let mut old = wire.clone();
+                    old.as_object_mut().unwrap().remove(field);
+                    let parsed: ValidatedPreferences = serde_json::from_value(old).unwrap();
+                    assert_eq!(parsed.web_enabled, field == "web_enabled" || web_enabled);
+                    assert_eq!(
+                        parsed.speech_network_fallback,
+                        field == "speech_network_fallback" || fallback
+                    );
+                }
+            }
+        }
+        for field in ["web_enabled", "speech_network_fallback"] {
+            for invalid in [
+                serde_json::Value::Null,
+                serde_json::json!("false"),
+                serde_json::json!(0),
+            ] {
+                let mut wire = serde_json::to_value(preferences()).unwrap();
+                wire[field] = invalid;
+                assert!(serde_json::from_value::<ValidatedPreferences>(wire).is_err());
+            }
+        }
+    }
+
+    const SPEECH_SELECTION_FIELDS: [&str; 3] =
+        ["speech_language", "speech_tts_provider", "speech_tts_voice"];
+
+    #[test]
+    fn speech_selection_preferences_default_to_automatic_for_legacy_payloads() {
+        let mut legacy = serde_json::to_value(preferences()).unwrap();
+        for field in SPEECH_SELECTION_FIELDS {
+            legacy.as_object_mut().unwrap().remove(field);
+        }
+        let parsed: ValidatedPreferences = serde_json::from_value(legacy.clone()).unwrap();
+        let mut restored = serde_json::to_value(parsed).unwrap();
+        for field in SPEECH_SELECTION_FIELDS {
+            assert_eq!(
+                restored.as_object_mut().unwrap().remove(field),
+                Some(serde_json::json!(""))
+            );
+        }
+        assert_eq!(restored, legacy);
+    }
+
+    #[test]
+    fn speech_selection_preferences_roundtrip_verbatim_and_default_independently() {
+        let mut wire = serde_json::to_value(preferences()).unwrap();
+        for (field, choice) in SPEECH_SELECTION_FIELDS.into_iter().zip([
+            "en-AU",
+            "dev.synthetic.tts",
+            "Synthetic 🧪 voice",
+        ]) {
+            wire[field] = choice.into();
+        }
+        let parsed: ValidatedPreferences = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), wire);
+        for field in SPEECH_SELECTION_FIELDS {
+            let mut older = wire.clone();
+            older.as_object_mut().unwrap().remove(field);
+            let parsed: ValidatedPreferences = serde_json::from_value(older).unwrap();
+            let mut expected = wire.clone();
+            expected[field] = "".into();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn speech_selection_preferences_enforce_utf8_byte_bounds_per_field() {
+        for choice in ["".to_owned(), "x".repeat(512), "🧪".repeat(128)] {
+            let mut wire = serde_json::to_value(preferences()).unwrap();
+            for field in SPEECH_SELECTION_FIELDS {
+                wire[field] = choice.clone().into();
+            }
+            let parsed: ValidatedPreferences = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), wire);
+        }
+        for field in SPEECH_SELECTION_FIELDS {
+            for invalid in [
+                serde_json::Value::Null,
+                serde_json::json!(false),
+                serde_json::json!(42),
+                serde_json::json!([]),
+                serde_json::json!({}),
+                serde_json::json!("x".repeat(513)),
+                serde_json::json!(format!("{}x", "🧪".repeat(128))),
+                serde_json::json!("🧪".repeat(129)),
+            ] {
+                let mut wire = serde_json::to_value(preferences()).unwrap();
+                wire[field] = invalid;
+                assert!(
+                    serde_json::from_value::<ValidatedPreferences>(wire).is_err(),
+                    "{field} must reject malformed or oversized choices"
+                );
+            }
         }
     }
 

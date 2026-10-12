@@ -15,8 +15,11 @@ use tauri::ipc::Channel;
 use tauri::{Emitter, Manager};
 
 mod app_updates;
+#[cfg(test)]
+mod conversation_runtime_tests;
 mod livekit_wakeword;
 mod partial_transcription;
+mod search_runtime;
 mod telemetry;
 mod transcription;
 #[allow(dead_code)]
@@ -80,10 +83,8 @@ type LlamaStartupRegistry = Arc<
 >;
 
 struct AppState {
-    // Synchronous admission order: prompt_publication_gate -> lifecycle_gate -> active_prompt
-    // -> conversation_session. The lifecycle gate also bounds every AppSnapshot publication.
-    // Never await or perform provider/process I/O while holding these locks.
-    lifecycle_gate: Arc<Mutex<()>>,
+    network_preferences: Arc<Mutex<NetworkPreferences>>,
+    conversation: DesktopConversationRuntime,
     startup_state: Arc<Mutex<StartupStatePayload>>,
     runtime_config: Option<voxgolem_core::config::RuntimeConfig>,
     custom_auth_source_path: Option<PathBuf>,
@@ -111,16 +112,8 @@ struct AppState {
     completion_generation: AtomicU64,
     completion_lifecycle_lock: Arc<Mutex<()>>,
     telemetry_sink: Option<Arc<Mutex<telemetry::TelemetrySink>>>,
-    conversation_session: Arc<Mutex<voxgolem_core::conversation::ConversationSession>>,
-    assistant_settings_generation: Arc<AtomicU64>,
     update_installation_gate: Arc<tokio::sync::RwLock<()>>,
-    settings_publication_in_progress: Arc<AtomicBool>,
-    reset_in_progress: Arc<AtomicBool>,
-    reset_operation_lock: tokio::sync::Mutex<()>,
-    prompt_cleanup: Arc<PromptCleanupTracker>,
     prefetch_cleanup: Arc<PromptCleanupTracker>,
-    prompt_publication_gate: Arc<Mutex<()>>,
-    prompt_publication_epoch: Arc<AtomicU64>,
     tts_operation_lock: tokio::sync::Mutex<()>,
     tts_playback: Arc<Mutex<TtsPlaybackState>>,
     tts_startup_generation: Arc<AtomicU64>,
@@ -132,8 +125,6 @@ struct AppState {
     llama_cpp_conversation: Mutex<Vec<LlamaConversationTurn>>,
     llama_cpp_system_prompt: Option<String>,
     opencode_server: Arc<Mutex<Option<voxgolem_platform::opencode::OpencodeServer>>>,
-    active_prompt: Arc<Mutex<Option<ActivePrompt>>>,
-    active_prompt_generation: AtomicU64,
     prefetch_generation: Arc<AtomicU64>,
     prefetch_cache: Arc<Mutex<Option<PrefetchEntry>>>,
     prefetch_task: Arc<Mutex<Option<ActivePrefetch>>>,
@@ -141,6 +132,78 @@ struct AppState {
     shutdown_lock: tokio::sync::Mutex<()>,
     shutdown_complete: AtomicBool,
     exit_cleanup_started: Arc<AtomicBool>,
+}
+
+/// Canonical/physical execution authority. No outer lock: the established gates
+/// retain their ordering and publication semantics. Native resource adapters are
+/// borrowed only at the operations that need them.
+struct DesktopConversationRuntime {
+    // prompt_publication_gate -> lifecycle_gate -> active_prompt -> conversation_session.
+    // Never await or perform provider/process I/O while these gates are held.
+    lifecycle_gate: Arc<Mutex<()>>,
+    conversation_session: Arc<Mutex<voxgolem_core::conversation::ConversationSession>>,
+    assistant_settings_generation: Arc<AtomicU64>,
+    settings_publication_in_progress: Arc<AtomicBool>,
+    reset_in_progress: Arc<AtomicBool>,
+    reset_operation_lock: tokio::sync::Mutex<()>,
+    prompt_cleanup: Arc<PromptCleanupTracker>,
+    prompt_publication_gate: Arc<Mutex<()>>,
+    prompt_publication_epoch: Arc<AtomicU64>,
+    active_prompt: Arc<Mutex<Option<ActivePrompt>>>,
+    active_prompt_generation: AtomicU64,
+    search: search_runtime::DesktopSearchState,
+}
+
+// Native snapshot/settings/audio integration uses the same gates, never mirrors.
+impl std::ops::Deref for AppState {
+    type Target = DesktopConversationRuntime;
+    fn deref(&self) -> &Self::Target {
+        &self.conversation
+    }
+}
+
+struct PromptAdmissionResources<'a> {
+    startup_state: &'a Arc<Mutex<StartupStatePayload>>,
+    opencode_server: &'a Mutex<Option<voxgolem_platform::opencode::OpencodeServer>>,
+    network_preferences: &'a Mutex<NetworkPreferences>,
+    voice_pipeline_state: &'a Arc<Mutex<voxgolem_core::voice_pipeline::VoicePipelineState>>,
+    voice_pipeline_config: voxgolem_core::voice_pipeline::VoicePipelineConfig,
+}
+
+impl AppState {
+    fn prompt_admission_resources(&self) -> PromptAdmissionResources<'_> {
+        PromptAdmissionResources {
+            startup_state: &self.startup_state,
+            opencode_server: &self.opencode_server,
+            network_preferences: &self.network_preferences,
+            voice_pipeline_state: &self.voice_pipeline_state,
+            voice_pipeline_config: self.voice_pipeline_config,
+        }
+    }
+}
+
+impl DesktopConversationRuntime {
+    fn new(
+        lifecycle_gate: Arc<Mutex<()>>,
+        policy: voxgolem_core::assistant::AssistantPolicy,
+    ) -> Self {
+        Self {
+            lifecycle_gate,
+            conversation_session: Arc::new(Mutex::new(
+                voxgolem_core::conversation::ConversationSession::new(policy),
+            )),
+            assistant_settings_generation: Arc::new(AtomicU64::new(0)),
+            settings_publication_in_progress: Arc::new(AtomicBool::new(false)),
+            reset_in_progress: Arc::new(AtomicBool::new(false)),
+            reset_operation_lock: tokio::sync::Mutex::new(()),
+            prompt_cleanup: Arc::new(PromptCleanupTracker::default()),
+            prompt_publication_gate: Arc::new(Mutex::new(())),
+            prompt_publication_epoch: Arc::new(AtomicU64::new(0)),
+            active_prompt: Arc::new(Mutex::new(None)),
+            active_prompt_generation: AtomicU64::new(0),
+            search: search_runtime::DesktopSearchState::default(),
+        }
+    }
 }
 
 struct AppStateInit {
@@ -284,6 +347,7 @@ struct SettingsPublicationGuard {
 
 #[derive(Clone)]
 struct PreferencePublicationState {
+    network_preferences: Arc<Mutex<NetworkPreferences>>,
     lifecycle_gate: Arc<Mutex<()>>,
     exit_cleanup_started: Arc<AtomicBool>,
     startup_state: Arc<Mutex<StartupStatePayload>>,
@@ -532,6 +596,7 @@ impl Drop for SettingsPublicationGuard {
 impl PreferencePublicationState {
     fn new(app_state: &AppState) -> Self {
         Self {
+            network_preferences: Arc::clone(&app_state.network_preferences),
             lifecycle_gate: Arc::clone(&app_state.lifecycle_gate),
             exit_cleanup_started: Arc::clone(&app_state.exit_cleanup_started),
             startup_state: Arc::clone(&app_state.startup_state),
@@ -794,7 +859,7 @@ struct CompletionRequestContext {
     source: CompletionSource,
     voice_session_id: Option<partial_transcription::VoiceSessionId>,
     prompt: String,
-    started_ms: u64,
+    started: Instant,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -950,11 +1015,11 @@ impl InstantChoicePayload {
         match self {
             Self::LocalFast => "Local: Fast",
             Self::LocalQuality => "Local: Quality",
-            Self::CustomSolHigh => "Custom: GPT-6 Sol High",
-            Self::CustomSolNone => "Custom: GPT-6 Sol None",
+            Self::CustomSolHigh => "Custom: GPT-6.1 Sol High",
+            Self::CustomSolNone => "Custom: GPT-6.1 Sol None",
             Self::CustomLunaNone => "Custom: GPT-6 Luna None",
             Self::CustomLunaLow => "Custom: GPT-5.6 Luna Low",
-            Self::OpenCodeSolHigh => "OpenCode: GPT-6 Sol High",
+            Self::OpenCodeSolHigh => "OpenCode: GPT-6.1 Sol High",
             Self::OpenCodeLunaLow => "OpenCode: GPT-5.6 Luna Low",
         }
     }
@@ -972,15 +1037,6 @@ enum AgentChoicePayload {
 }
 
 impl AgentChoicePayload {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::CustomSolHigh => "custom-sol-high",
-            Self::CustomLunaLow => "custom-luna-low",
-            Self::OpenCodeSolHigh => "opencode-sol-high",
-            Self::OpenCodeLunaLow => "opencode-luna-low",
-        }
-    }
-
     fn capability_id(self) -> &'static str {
         match self {
             Self::CustomSolHigh | Self::CustomLunaLow => "custom_provider",
@@ -1125,17 +1181,6 @@ enum UiTextSizePayload {
     ExtraLarge,
 }
 
-impl UiTextSizePayload {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Small => "small",
-            Self::Medium => "medium",
-            Self::Large => "large",
-            Self::ExtraLarge => "extra_large",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum UiThemePayload {
@@ -1149,12 +1194,41 @@ struct UiPreferencesState {
     text_size: UiTextSizePayload,
 }
 
-impl UiThemePayload {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Light => "light",
-            Self::Dark => "dark",
+type SpeechChoice = voxgolem_core::ipc::BoundedText<{ voxgolem_core::ipc::DISPLAY_TEXT_MAX_BYTES }>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NetworkPreferences {
+    web_enabled: bool,
+    // Pass-through only: desktop speech has no network fallback capability.
+    speech_network_fallback: bool,
+    // Requested choices only; they do not establish desktop SDK/provider support.
+    speech_language: SpeechChoice,
+    speech_tts_provider: SpeechChoice,
+    speech_tts_voice: SpeechChoice,
+}
+
+impl Default for NetworkPreferences {
+    fn default() -> Self {
+        Self {
+            web_enabled: true,
+            speech_network_fallback: true,
+            speech_language: SpeechChoice::default(),
+            speech_tts_provider: SpeechChoice::default(),
+            speech_tts_voice: SpeechChoice::default(),
         }
+    }
+}
+
+fn resolve_network_preferences(
+    config_web_enabled: bool,
+    persisted: &PersistedState,
+) -> NetworkPreferences {
+    NetworkPreferences {
+        web_enabled: persisted.web_enabled.unwrap_or(config_web_enabled),
+        speech_network_fallback: persisted.speech_network_fallback.unwrap_or(true),
+        speech_language: persisted.speech_language.clone(),
+        speech_tts_provider: persisted.speech_tts_provider.clone(),
+        speech_tts_voice: persisted.speech_tts_voice.clone(),
     }
 }
 
@@ -1253,6 +1327,29 @@ enum StartupStatePayload {
     },
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct SpeechServiceMetadataPayload {
+    configured_engine: Option<&'static str>,
+    runtime_engine: Option<&'static str>,
+    configured_model: Option<&'static str>,
+    configured_voice: Option<&'static str>,
+    configured_locale: Option<&'static str>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct SpeechServicesMetadataPayload {
+    stt: SpeechServiceMetadataPayload,
+    tts: SpeechServiceMetadataPayload,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct StartupSettingsPayload {
+    #[serde(flatten)]
+    state: StartupStatePayload,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speech_services: Option<SpeechServicesMetadataPayload>,
+}
+
 fn validated_ipc_text<const MAX_BYTES: usize>(
     value: &str,
 ) -> voxgolem_core::ipc::BoundedText<MAX_BYTES> {
@@ -1328,6 +1425,7 @@ fn build_ipc_app_snapshot(
     startup_state: &StartupStatePayload,
     response_profile: ResponseProfilePayload,
     ui_preferences: UiPreferencesState,
+    network_preferences: NetworkPreferences,
 ) -> voxgolem_core::ipc::AppSnapshot {
     use voxgolem_core::assistant::InstantModel;
     use voxgolem_core::ipc;
@@ -1346,6 +1444,11 @@ fn build_ipc_app_snapshot(
         model_options: ipc_model_options(&capabilities),
         capabilities,
         preferences: ipc::ValidatedPreferences {
+            web_enabled: network_preferences.web_enabled,
+            speech_network_fallback: network_preferences.speech_network_fallback,
+            speech_language: network_preferences.speech_language,
+            speech_tts_provider: network_preferences.speech_tts_provider,
+            speech_tts_voice: network_preferences.speech_tts_voice,
             instant: policy.instant_model.into(),
             deep: policy.deep_model.into(),
             review: policy.review_model.into(),
@@ -1445,6 +1548,10 @@ fn publish_validated_preferences(
         .ui_preferences
         .lock()
         .map_err(|_| ipc_command_error("interface preferences are unavailable"))?;
+    let mut network_preferences = state
+        .network_preferences
+        .lock()
+        .map_err(|_| ipc_command_error("network preferences are unavailable"))?;
     let mut startup_state = state
         .startup_state
         .lock()
@@ -1500,6 +1607,13 @@ fn publish_validated_preferences(
     }
     *selected_profile = requested_profile;
     *ui_preferences = requested_ui;
+    *network_preferences = NetworkPreferences {
+        web_enabled: preferences.web_enabled,
+        speech_network_fallback: preferences.speech_network_fallback,
+        speech_language: preferences.speech_language.clone(),
+        speech_tts_provider: preferences.speech_tts_provider.clone(),
+        speech_tts_voice: preferences.speech_tts_voice.clone(),
+    };
     let replaced_llama_runtime =
         llama_replacement.and_then(|runtime| llama_runtime.replace(runtime));
     if let Some(profile_startup_state) = profile_startup_state {
@@ -1550,6 +1664,7 @@ fn publish_validated_preferences(
     drop(tts_runtime);
     drop(startup_state);
     drop(ui_preferences);
+    drop(network_preferences);
     drop(selected_profile);
     drop(session);
     drop(_lifecycle);
@@ -1678,6 +1793,11 @@ fn get_app_snapshot_from_state(
         &startup_state,
         response_profile,
         ui_preferences,
+        app_state
+            .network_preferences
+            .lock()
+            .map_err(|_| ipc_command_error("network preferences are unavailable"))?
+            .clone(),
     ))
 }
 
@@ -2397,12 +2517,45 @@ async fn execute_llama_preference_change(
 }
 
 #[tauri::command]
-fn get_startup_state(app_state: tauri::State<'_, AppState>) -> StartupStatePayload {
-    app_state
+fn get_startup_state(app_state: tauri::State<'_, AppState>) -> StartupSettingsPayload {
+    get_startup_state_from_state(&app_state)
+}
+
+fn get_startup_state_from_state(app_state: &AppState) -> StartupSettingsPayload {
+    let state = app_state
         .startup_state
         .lock()
         .expect("startup state lock should not be poisoned")
-        .clone()
+        .clone();
+    let speech_services = app_state.runtime_config.as_ref().map(|config| {
+        let metadata =
+            |id: &str, engine: &'static str, runtime_loaded: bool| SpeechServiceMetadataPayload {
+                configured_engine: (!config
+                    .capability_issues
+                    .iter()
+                    .any(|issue| issue.capability == id && issue.reason == "not configured"))
+                .then_some(engine),
+                runtime_engine: runtime_loaded.then_some(engine),
+                configured_model: None,
+                configured_voice: None,
+                configured_locale: None,
+            };
+        SpeechServicesMetadataPayload {
+            stt: metadata("parakeet", "Parakeet", app_state.parakeet_runtime.is_some()),
+            tts: metadata(
+                "tts",
+                "Piper ONNX",
+                app_state
+                    .local_tts_runtime
+                    .lock()
+                    .is_ok_and(|runtime| runtime.is_some()),
+            ),
+        }
+    });
+    StartupSettingsPayload {
+        state,
+        speech_services,
+    }
 }
 
 #[tauri::command]
@@ -4083,6 +4236,7 @@ struct StageContext<'a> {
     active_generation: u64,
     deep_task: Option<DeepTask>,
     cancellation: PromptCancellation<'a>,
+    search_result: Option<&'a voxgolem_platform::search::RunResult>,
 }
 
 fn stage_context<'a>(
@@ -4102,6 +4256,7 @@ fn stage_context<'a>(
         active_generation,
         deep_task,
         cancellation,
+        search_result: None,
     }
 }
 
@@ -4111,6 +4266,7 @@ fn start_deep_task(
     prompt: &str,
     history: &[voxgolem_core::assistant::ConversationTurn],
     model: voxgolem_core::assistant::AgentModel,
+    web_enabled: bool,
     control: &ActivePrompt,
 ) -> Option<DeepTask> {
     let cancelled = Arc::clone(&control.cancelled);
@@ -4137,7 +4293,8 @@ fn start_deep_task(
             voxgolem_core::assistant::AgentModel::OpenCodeSolHigh
                 | voxgolem_core::assistant::AgentModel::OpenCodeLunaLow
         );
-        let prompt = if is_opencode {
+        let sources_allowed = is_opencode && web_enabled;
+        let prompt = if sources_allowed {
             voxgolem_core::agent_pipeline::opencode_deep_prompt(&request)
         } else {
             voxgolem_core::agent_pipeline::custom_deep_prompt(&request)
@@ -4153,7 +4310,7 @@ fn start_deep_task(
         let result = run_agent_text(
             &task_app.state::<AppState>(),
             model,
-            if is_opencode {
+            if sources_allowed {
                 voxgolem_platform::opencode::OpencodeToolPolicy::Research
             } else {
                 voxgolem_platform::opencode::OpencodeToolPolicy::AnswerOnly
@@ -4171,7 +4328,7 @@ fn start_deep_task(
             parse_deep_agent_json_with_evidence(
                 &result.text,
                 started.elapsed().as_millis() as u64,
-                is_opencode,
+                sources_allowed,
                 &result.evidence,
             )
         });
@@ -4245,13 +4402,15 @@ fn ensure_agent_prerequisites(
 }
 
 struct AssistantRequestContext {
+    web_enabled: bool,
     generation: voxgolem_core::conversation::ExecutionId,
     instant_model: voxgolem_core::assistant::InstantModel,
     preferences: voxgolem_core::assistant::AssistantPolicy,
     history: Vec<voxgolem_core::assistant::ConversationTurn>,
-    started_ms: u64,
+    started: Instant,
     source: CompletionSource,
     prompt: String,
+    search_mode: voxgolem_core::search::Mode,
 }
 
 struct RegisteredAssistantRequest {
@@ -4272,155 +4431,183 @@ struct PromptCancellation<'a> {
     control: &'a ActivePrompt,
 }
 
+#[cfg(test)]
 fn begin_registered_assistant_request(
     app_state: &AppState,
     request_id: &str,
     prompt: &str,
     source: CompletionSource,
 ) -> Result<RegisteredAssistantRequest, String> {
-    let started_ms = current_time_ms()?;
-    let _publication_admission = app_state
-        .prompt_publication_gate
-        .lock()
-        .map_err(|_| String::from("prompt publication gate is poisoned"))?;
-    let _lifecycle = app_state
-        .lifecycle_gate
-        .lock()
-        .map_err(|_| String::from("lifecycle gate is poisoned"))?;
-    if app_state.reset_in_progress.load(Ordering::Acquire) {
-        return Err(String::from("session reset is in progress"));
-    }
-    if app_state
-        .settings_publication_in_progress
-        .load(Ordering::Acquire)
-    {
-        return Err(String::from("assistant settings update is in progress"));
-    }
-    ensure_startup_ready_for_prompt(&app_state.startup_state)?;
-    if current_runtime_phase(&app_state.voice_pipeline_state)? == RuntimePhasePayload::Error {
-        apply_voice_pipeline_transition(
-            &app_state.voice_pipeline_state,
-            app_state.voice_pipeline_config,
-            voxgolem_core::voice_pipeline::VoicePipelineEvent::ResetToIdle,
-        )?;
-    }
-    let opencode_client = app_state
-        .opencode_server
-        .lock()
-        .map_err(|_| String::from("opencode server lock is poisoned"))?
-        .as_ref()
-        .map(voxgolem_platform::opencode::OpencodeServer::client);
-    let mut coordinator = app_state
-        .conversation_session
-        .lock()
-        .map_err(|_| String::from("assistant coordinator lock is poisoned"))?;
-    let is_opencode = matches!(
-        coordinator.policy().instant_model,
-        voxgolem_core::assistant::InstantModel::OpenCodeSolHigh
-            | voxgolem_core::assistant::InstantModel::OpenCodeLunaLow
-    );
-    if is_opencode && opencode_client.is_none() {
-        return Err(String::from("OpenCode server is not available"));
-    }
-    let snapshot = coordinator
-        .admit(request_id, prompt)
-        .map_err(|error| format!("assistant request could not start: {error:?}"))?;
-    let history = snapshot
-        .history
-        .iter()
-        .map(|message| voxgolem_core::assistant::ConversationTurn {
-            role: message.role,
-            content: message.content.clone(),
-        })
-        .collect();
-    let preferences = snapshot.policy.clone();
-    let instant_model = preferences.instant_model;
-    let execution_id = snapshot.execution_id;
-    drop(coordinator);
+    app_state.conversation.admit(
+        app_state.prompt_admission_resources(),
+        request_id,
+        prompt,
+        source,
+        voxgolem_core::search::Mode::Quick,
+    )
+}
 
-    let selected_client = is_opencode.then(|| {
-        opencode_client
-            .clone()
-            .expect("OpenCode availability was checked before admission")
-    });
-    let (physical_generation, cancelled, cancellation_signal, settled) =
-        match register_active_prompt(
-            &app_state.active_prompt,
-            &app_state.active_prompt_generation,
-            request_id,
-            execution_id,
-            None,
-            app_state.prompt_publication_epoch.load(Ordering::SeqCst),
-        ) {
-            Ok(registration) => registration,
-            Err(error) => {
-                if let Ok(mut session) = app_state.conversation_session.lock() {
-                    let _ = session.settle(
-                        execution_id,
-                        voxgolem_core::conversation::SettlementIntent::Cancelled,
-                    );
-                }
-                return Err(error);
-            }
-        };
-    let control = app_state
-        .active_prompt
-        .lock()
-        .map_err(|_| String::from("active prompt lock is poisoned"))?
-        .as_ref()
-        .filter(|active| {
-            active.request_id == request_id && active.generation == physical_generation
-        })
-        .cloned()
-        .ok_or_else(|| String::from("active prompt registration disappeared"))?;
-    if let Err(error) = apply_voice_pipeline_transition(
-        &app_state.voice_pipeline_state,
-        app_state.voice_pipeline_config,
-        voxgolem_core::voice_pipeline::VoicePipelineEvent::SubmitPrompt,
-    ) {
-        if let Ok(mut session) = app_state.conversation_session.lock() {
-            let _ = session.settle(
-                execution_id,
-                voxgolem_core::conversation::SettlementIntent::Failed,
-            );
+impl DesktopConversationRuntime {
+    fn admit(
+        &self,
+        resources: PromptAdmissionResources<'_>,
+        request_id: &str,
+        prompt: &str,
+        source: CompletionSource,
+        search_mode: voxgolem_core::search::Mode,
+    ) -> Result<RegisteredAssistantRequest, String> {
+        let app_state = self;
+        let started = Instant::now();
+        let _publication_admission = app_state
+            .prompt_publication_gate
+            .lock()
+            .map_err(|_| String::from("prompt publication gate is poisoned"))?;
+        let _lifecycle = app_state
+            .lifecycle_gate
+            .lock()
+            .map_err(|_| String::from("lifecycle gate is poisoned"))?;
+        if app_state.reset_in_progress.load(Ordering::Acquire) {
+            return Err(String::from("session reset is in progress"));
         }
-        let _ = clear_active_prompt(&app_state.active_prompt, request_id, physical_generation);
-        return Err(error);
-    }
-    let guard = ActivePromptGuard {
-        active_prompt: Arc::clone(&app_state.active_prompt),
-        conversation_session: Arc::clone(&app_state.conversation_session),
-        request_id: request_id.to_string(),
-        generation: physical_generation,
-        execution_id,
-        cancelled: Arc::clone(&cancelled),
-        armed: Arc::new(AtomicBool::new(true)),
-        abort_client: Arc::clone(&control.abort_client),
-        prompt_cleanup: Arc::clone(&app_state.prompt_cleanup),
-        settled,
-        lifecycle_gate: Arc::clone(&app_state.lifecycle_gate),
-        terminal_kind: Arc::clone(&control.terminal_kind),
-        voice_pipeline_state: Arc::clone(&app_state.voice_pipeline_state),
-        voice_pipeline_config: app_state.voice_pipeline_config,
-    };
+        if app_state
+            .settings_publication_in_progress
+            .load(Ordering::Acquire)
+        {
+            return Err(String::from("assistant settings update is in progress"));
+        }
+        ensure_startup_ready_for_prompt(resources.startup_state)?;
+        if current_runtime_phase(resources.voice_pipeline_state)? == RuntimePhasePayload::Error {
+            apply_voice_pipeline_transition(
+                resources.voice_pipeline_state,
+                resources.voice_pipeline_config,
+                voxgolem_core::voice_pipeline::VoicePipelineEvent::ResetToIdle,
+            )?;
+        }
+        let opencode_client = resources
+            .opencode_server
+            .lock()
+            .map_err(|_| String::from("opencode server lock is poisoned"))?
+            .as_ref()
+            .map(voxgolem_platform::opencode::OpencodeServer::client);
+        let mut coordinator = app_state
+            .conversation_session
+            .lock()
+            .map_err(|_| String::from("assistant coordinator lock is poisoned"))?;
+        let is_opencode = matches!(
+            coordinator.policy().instant_model,
+            voxgolem_core::assistant::InstantModel::OpenCodeSolHigh
+                | voxgolem_core::assistant::InstantModel::OpenCodeLunaLow
+        );
+        if is_opencode && opencode_client.is_none() {
+            return Err(String::from("OpenCode server is not available"));
+        }
+        let web_enabled = resources
+            .network_preferences
+            .lock()
+            .map_err(|_| String::from("network preferences lock is poisoned"))?
+            .web_enabled;
+        let snapshot = coordinator
+            .admit(request_id, prompt)
+            .map_err(|error| format!("assistant request could not start: {error:?}"))?;
+        let history = snapshot
+            .history
+            .into_iter()
+            .map(|message| voxgolem_core::assistant::ConversationTurn {
+                role: message.role,
+                content: message.content,
+            })
+            .collect();
+        let preferences = snapshot.policy;
+        let instant_model = preferences.instant_model;
+        let execution_id = snapshot.execution_id;
+        drop(coordinator);
 
-    Ok(RegisteredAssistantRequest {
-        request: AssistantRequestContext {
-            generation: execution_id,
-            instant_model,
-            preferences,
-            history,
-            started_ms,
-            source,
-            prompt: prompt.to_string(),
-        },
-        physical_generation,
-        cancelled,
-        cancellation_signal,
-        opencode_client: selected_client,
-        control,
-        guard,
-    })
+        let selected_client = is_opencode.then(|| {
+            opencode_client
+                .clone()
+                .expect("OpenCode availability was checked before admission")
+        });
+        let (physical_generation, cancelled, cancellation_signal, settled) =
+            match register_active_prompt(
+                &app_state.active_prompt,
+                &app_state.active_prompt_generation,
+                request_id,
+                execution_id,
+                None,
+                app_state.prompt_publication_epoch.load(Ordering::SeqCst),
+            ) {
+                Ok(registration) => registration,
+                Err(error) => {
+                    if let Ok(mut session) = app_state.conversation_session.lock() {
+                        let _ = session.settle(
+                            execution_id,
+                            voxgolem_core::conversation::SettlementIntent::Cancelled,
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+        let control = app_state
+            .active_prompt
+            .lock()
+            .map_err(|_| String::from("active prompt lock is poisoned"))?
+            .as_ref()
+            .filter(|active| {
+                active.request_id == request_id && active.generation == physical_generation
+            })
+            .cloned()
+            .ok_or_else(|| String::from("active prompt registration disappeared"))?;
+        if let Err(error) = apply_voice_pipeline_transition(
+            resources.voice_pipeline_state,
+            resources.voice_pipeline_config,
+            voxgolem_core::voice_pipeline::VoicePipelineEvent::SubmitPrompt,
+        ) {
+            if let Ok(mut session) = app_state.conversation_session.lock() {
+                let _ = session.settle(
+                    execution_id,
+                    voxgolem_core::conversation::SettlementIntent::Failed,
+                );
+            }
+            let _ = clear_active_prompt(&app_state.active_prompt, request_id, physical_generation);
+            return Err(error);
+        }
+        let guard = ActivePromptGuard {
+            active_prompt: Arc::clone(&app_state.active_prompt),
+            conversation_session: Arc::clone(&app_state.conversation_session),
+            request_id: request_id.to_string(),
+            generation: physical_generation,
+            execution_id,
+            cancelled: Arc::clone(&cancelled),
+            armed: Arc::new(AtomicBool::new(true)),
+            abort_client: Arc::clone(&control.abort_client),
+            prompt_cleanup: Arc::clone(&app_state.prompt_cleanup),
+            settled,
+            lifecycle_gate: Arc::clone(&app_state.lifecycle_gate),
+            terminal_kind: Arc::clone(&control.terminal_kind),
+            voice_pipeline_state: Arc::clone(resources.voice_pipeline_state),
+            voice_pipeline_config: resources.voice_pipeline_config,
+        };
+
+        Ok(RegisteredAssistantRequest {
+            request: AssistantRequestContext {
+                generation: execution_id,
+                instant_model,
+                preferences,
+                history,
+                started,
+                source,
+                prompt: snapshot.prompt,
+                search_mode,
+                web_enabled,
+            },
+            physical_generation,
+            cancelled,
+            cancellation_signal,
+            opencode_client: selected_client,
+            control,
+            guard,
+        })
+    }
 }
 
 fn finish_assistant_request(
@@ -4448,26 +4635,42 @@ fn accept_assistant_stage_if_active(
     stage: voxgolem_core::assistant::Stage,
     result: voxgolem_core::assistant::StageResult,
 ) -> Result<voxgolem_core::conversation::UpdateResult, String> {
-    let _lifecycle = app_state
-        .lifecycle_gate
-        .lock()
-        .map_err(|_| String::from("lifecycle gate is poisoned"))?;
-    let active = app_state
-        .active_prompt
-        .lock()
-        .map_err(|_| String::from("active prompt lock is poisoned"))?;
-    if !active.as_ref().is_some_and(|active| {
-        active.request_id == request_id
-            && active.generation == active_generation
-            && !active.cancelled.load(Ordering::SeqCst)
-    }) {
-        return Ok(voxgolem_core::conversation::UpdateResult::IgnoredStale);
+    app_state
+        .conversation
+        .accept_stage(request_id, active_generation, generation, stage, result)
+}
+
+impl DesktopConversationRuntime {
+    fn accept_stage(
+        &self,
+        request_id: &str,
+        active_generation: u64,
+        generation: voxgolem_core::conversation::ExecutionId,
+        stage: voxgolem_core::assistant::Stage,
+        result: voxgolem_core::assistant::StageResult,
+    ) -> Result<voxgolem_core::conversation::UpdateResult, String> {
+        let app_state = self;
+        let _lifecycle = app_state
+            .lifecycle_gate
+            .lock()
+            .map_err(|_| String::from("lifecycle gate is poisoned"))?;
+        let active = app_state
+            .active_prompt
+            .lock()
+            .map_err(|_| String::from("active prompt lock is poisoned"))?;
+        if !active.as_ref().is_some_and(|active| {
+            active.request_id == request_id
+                && active.generation == active_generation
+                && !active.cancelled.load(Ordering::SeqCst)
+        }) {
+            return Ok(voxgolem_core::conversation::UpdateResult::IgnoredStale);
+        }
+        Ok(app_state
+            .conversation_session
+            .lock()
+            .map_err(|_| String::from("assistant coordinator lock is poisoned"))?
+            .update(generation, stage, result))
     }
-    Ok(app_state
-        .conversation_session
-        .lock()
-        .map_err(|_| String::from("assistant coordinator lock is poisoned"))?
-        .update(generation, stage, result))
 }
 
 fn commit_assistant_request_if_active(
@@ -4477,157 +4680,188 @@ fn commit_assistant_request_if_active(
     generation: voxgolem_core::conversation::ExecutionId,
     control: &ActivePrompt,
 ) -> Result<CommitAssistantResult, String> {
-    let _lifecycle = app_state
-        .lifecycle_gate
-        .lock()
-        .map_err(|_| String::from("lifecycle gate is poisoned"))?;
-    let removed = {
-        let mut active = app_state
-            .active_prompt
+    app_state
+        .conversation
+        .commit(request_id, active_generation, generation, control, || {
+            let _ = apply_voice_pipeline_transition(
+                &app_state.voice_pipeline_state,
+                app_state.voice_pipeline_config,
+                voxgolem_core::voice_pipeline::VoicePipelineEvent::PromptCompleted,
+            );
+        })
+}
+
+impl DesktopConversationRuntime {
+    fn commit(
+        &self,
+        request_id: &str,
+        active_generation: u64,
+        generation: voxgolem_core::conversation::ExecutionId,
+        control: &ActivePrompt,
+        on_completed: impl FnOnce(),
+    ) -> Result<CommitAssistantResult, String> {
+        let app_state = self;
+        let _lifecycle = app_state
+            .lifecycle_gate
             .lock()
-            .map_err(|_| String::from("active prompt lock is poisoned"))?;
-        let Some(current) = active.as_ref().filter(|active| {
-            active.request_id == request_id && active.generation == active_generation
-        }) else {
-            return if control
+            .map_err(|_| String::from("lifecycle gate is poisoned"))?;
+        let removed = {
+            let mut active = app_state
+                .active_prompt
+                .lock()
+                .map_err(|_| String::from("active prompt lock is poisoned"))?;
+            let Some(current) = active.as_ref().filter(|active| {
+                active.request_id == request_id && active.generation == active_generation
+            }) else {
+                return if control
+                    .terminal_kind
+                    .lock()
+                    .ok()
+                    .and_then(|terminal| *terminal)
+                    == Some(TerminalKind::Cancelled)
+                {
+                    Ok(CommitAssistantResult::Cancelled)
+                } else {
+                    Err(String::from("assistant request is no longer active"))
+                };
+            };
+            if current
                 .terminal_kind
                 .lock()
                 .ok()
                 .and_then(|terminal| *terminal)
                 == Some(TerminalKind::Cancelled)
             {
-                Ok(CommitAssistantResult::Cancelled)
-            } else {
-                Err(String::from("assistant request is no longer active"))
-            };
-        };
-        if current
-            .terminal_kind
-            .lock()
-            .ok()
-            .and_then(|terminal| *terminal)
-            == Some(TerminalKind::Cancelled)
-        {
-            return Ok(CommitAssistantResult::Cancelled);
-        }
-        let result = app_state
-            .conversation_session
-            .lock()
-            .map_err(|_| String::from("assistant coordinator lock is poisoned"))?
-            .settle(
-                generation,
-                voxgolem_core::conversation::SettlementIntent::Success,
-            );
-        match result {
-            voxgolem_core::conversation::SettlementResult::Applied(
-                outcome @ (voxgolem_core::conversation::AppliedOutcome::Completed(_)
-                | voxgolem_core::conversation::AppliedOutcome::Refused(_)),
-            ) => {
-                record_terminal_kind(
-                    &current.terminal_kind,
-                    if matches!(
-                        outcome,
-                        voxgolem_core::conversation::AppliedOutcome::Refused(_)
-                    ) {
-                        TerminalKind::Refused
-                    } else {
-                        TerminalKind::Completed
-                    },
-                );
-                current.settled.store(true, Ordering::Release);
-                let _ = apply_voice_pipeline_transition(
-                    &app_state.voice_pipeline_state,
-                    app_state.voice_pipeline_config,
-                    voxgolem_core::voice_pipeline::VoicePipelineEvent::PromptCompleted,
-                );
-                active.take()
-            }
-            voxgolem_core::conversation::SettlementResult::Applied(
-                voxgolem_core::conversation::AppliedOutcome::Cancelled,
-            ) => return Ok(CommitAssistantResult::Cancelled),
-            voxgolem_core::conversation::SettlementResult::Applied(
-                voxgolem_core::conversation::AppliedOutcome::Failed,
-            ) => return Err(String::from("assistant request failed")),
-            voxgolem_core::conversation::SettlementResult::IgnoredStale
-                if control
-                    .terminal_kind
-                    .lock()
-                    .ok()
-                    .and_then(|terminal| *terminal)
-                    == Some(TerminalKind::Cancelled) =>
-            {
                 return Ok(CommitAssistantResult::Cancelled);
             }
-            voxgolem_core::conversation::SettlementResult::IgnoredStale => {
-                return Err(String::from("assistant request is stale"));
+            let result = app_state
+                .conversation_session
+                .lock()
+                .map_err(|_| String::from("assistant coordinator lock is poisoned"))?
+                .settle(
+                    generation,
+                    voxgolem_core::conversation::SettlementIntent::Success,
+                );
+            match result {
+                voxgolem_core::conversation::SettlementResult::Applied(
+                    outcome @ (voxgolem_core::conversation::AppliedOutcome::Completed(_)
+                    | voxgolem_core::conversation::AppliedOutcome::Refused(_)),
+                ) => {
+                    record_terminal_kind(
+                        &current.terminal_kind,
+                        if matches!(
+                            outcome,
+                            voxgolem_core::conversation::AppliedOutcome::Refused(_)
+                        ) {
+                            TerminalKind::Refused
+                        } else {
+                            TerminalKind::Completed
+                        },
+                    );
+                    current.settled.store(true, Ordering::Release);
+                    on_completed();
+                    active.take()
+                }
+                voxgolem_core::conversation::SettlementResult::Applied(
+                    voxgolem_core::conversation::AppliedOutcome::Cancelled,
+                ) => return Ok(CommitAssistantResult::Cancelled),
+                voxgolem_core::conversation::SettlementResult::Applied(
+                    voxgolem_core::conversation::AppliedOutcome::Failed,
+                ) => return Err(String::from("assistant request failed")),
+                voxgolem_core::conversation::SettlementResult::IgnoredStale
+                    if control
+                        .terminal_kind
+                        .lock()
+                        .ok()
+                        .and_then(|terminal| *terminal)
+                        == Some(TerminalKind::Cancelled) =>
+                {
+                    return Ok(CommitAssistantResult::Cancelled);
+                }
+                voxgolem_core::conversation::SettlementResult::IgnoredStale => {
+                    return Err(String::from("assistant request is stale"));
+                }
+                voxgolem_core::conversation::SettlementResult::Rejected(_) => {
+                    return Err(String::from("assistant request did not resolve"));
+                }
             }
-            voxgolem_core::conversation::SettlementResult::Rejected(_) => {
-                return Err(String::from("assistant request did not resolve"));
-            }
+        };
+        drop(_lifecycle);
+        if let Some(removed) = removed {
+            removed.completion_signal.notify_one();
         }
-    };
-    drop(_lifecycle);
-    if let Some(removed) = removed {
-        removed.completion_signal.notify_one();
+        Ok(CommitAssistantResult::Committed)
     }
-    Ok(CommitAssistantResult::Committed)
 }
 
 fn cancel_assistant_request(
     app_state: &AppState,
     generation: voxgolem_core::conversation::ExecutionId,
 ) -> voxgolem_core::conversation::SettlementResult {
-    let Ok(_lifecycle) = app_state.lifecycle_gate.lock() else {
-        return voxgolem_core::conversation::SettlementResult::IgnoredStale;
-    };
-    let Ok(mut active) = app_state.active_prompt.lock() else {
-        return voxgolem_core::conversation::SettlementResult::IgnoredStale;
-    };
-    let Ok(mut session) = app_state.conversation_session.lock() else {
-        return voxgolem_core::conversation::SettlementResult::IgnoredStale;
-    };
-    let matching = active
-        .as_ref()
-        .is_some_and(|active| active.assistant_generation == generation);
-    let result = session.settle(
-        generation,
-        voxgolem_core::conversation::SettlementIntent::Cancelled,
-    );
-    let cleanup = if matches!(
-        result,
-        voxgolem_core::conversation::SettlementResult::Applied(
-            voxgolem_core::conversation::AppliedOutcome::Cancelled
-        )
-    ) && matching
-    {
-        let current = active.as_ref().expect("matching prompt should exist");
-        record_terminal_kind(&current.terminal_kind, TerminalKind::Cancelled);
-        current.cancelled.store(true, Ordering::Release);
-        current.settled.store(true, Ordering::Release);
+    app_state.conversation.cancel(generation, |current| {
         cancel_matching_prompt_tts(Some(current), &current.request_id, || {
-            cancel_active_tts_generation(app_state);
+            cancel_active_tts_generation(app_state)
         });
         repair_cancelled_prompt_runtime(app_state);
-        let abort_claim = claim_prompt_abort(&current.abort_client, &app_state.prompt_cleanup);
-        let deep_handle = claim_prompt_deep_handle(current);
-        let deep_abort = claim_prompt_deep_abort(current);
-        Some(PromptPhysicalCleanup {
-            active: active.take().expect("matching prompt should exist"),
-            abort_claim,
-            deep_handle,
-            deep_abort,
-            cancel: true,
-        })
-    } else {
-        None
-    };
-    drop(session);
-    drop(active);
-    drop(_lifecycle);
-    if let Some(cleanup) = cleanup {
-        cleanup.cancel_detached();
+    })
+}
+
+impl DesktopConversationRuntime {
+    fn cancel(
+        &self,
+        generation: voxgolem_core::conversation::ExecutionId,
+        repair: impl FnOnce(&ActivePrompt),
+    ) -> voxgolem_core::conversation::SettlementResult {
+        let app_state = self;
+        let Ok(_lifecycle) = app_state.lifecycle_gate.lock() else {
+            return voxgolem_core::conversation::SettlementResult::IgnoredStale;
+        };
+        let Ok(mut active) = app_state.active_prompt.lock() else {
+            return voxgolem_core::conversation::SettlementResult::IgnoredStale;
+        };
+        let Ok(mut session) = app_state.conversation_session.lock() else {
+            return voxgolem_core::conversation::SettlementResult::IgnoredStale;
+        };
+        let matching = active
+            .as_ref()
+            .is_some_and(|active| active.assistant_generation == generation);
+        let result = session.settle(
+            generation,
+            voxgolem_core::conversation::SettlementIntent::Cancelled,
+        );
+        let cleanup = if matches!(
+            result,
+            voxgolem_core::conversation::SettlementResult::Applied(
+                voxgolem_core::conversation::AppliedOutcome::Cancelled
+            )
+        ) && matching
+        {
+            let current = active.as_ref().expect("matching prompt should exist");
+            record_terminal_kind(&current.terminal_kind, TerminalKind::Cancelled);
+            current.cancelled.store(true, Ordering::Release);
+            current.settled.store(true, Ordering::Release);
+            repair(current);
+            let abort_claim = claim_prompt_abort(&current.abort_client, &app_state.prompt_cleanup);
+            let deep_handle = claim_prompt_deep_handle(current);
+            let deep_abort = claim_prompt_deep_abort(current);
+            Some(PromptPhysicalCleanup {
+                active: active.take().expect("matching prompt should exist"),
+                abort_claim,
+                deep_handle,
+                deep_abort,
+                cancel: true,
+            })
+        } else {
+            None
+        };
+        drop(session);
+        drop(active);
+        drop(_lifecycle);
+        if let Some(cleanup) = cleanup {
+            cleanup.cancel_detached();
+        }
+        result
     }
-    result
 }
 
 fn fail_assistant_request(
@@ -4635,54 +4869,67 @@ fn fail_assistant_request(
     generation: voxgolem_core::conversation::ExecutionId,
     message: &str,
 ) -> voxgolem_core::conversation::SettlementResult {
-    let Ok(_lifecycle) = app_state.lifecycle_gate.lock() else {
-        return voxgolem_core::conversation::SettlementResult::IgnoredStale;
-    };
-    let Ok(mut active) = app_state.active_prompt.lock() else {
-        return voxgolem_core::conversation::SettlementResult::IgnoredStale;
-    };
-    let Ok(mut session) = app_state.conversation_session.lock() else {
-        return voxgolem_core::conversation::SettlementResult::IgnoredStale;
-    };
-    let matching = active
-        .as_ref()
-        .is_some_and(|active| active.assistant_generation == generation);
-    let result = session.settle(
-        generation,
-        voxgolem_core::conversation::SettlementIntent::Failed,
-    );
-    let cleanup = if matches!(
-        result,
-        voxgolem_core::conversation::SettlementResult::Applied(
-            voxgolem_core::conversation::AppliedOutcome::Failed
-        )
-    ) && matching
-    {
-        let current = active.as_ref().expect("matching prompt should exist");
-        record_terminal_kind(&current.terminal_kind, TerminalKind::Failed);
-        current.cancelled.store(true, Ordering::Release);
-        current.settled.store(true, Ordering::Release);
-        repair_failed_prompt_runtime(app_state, message);
-        let abort_claim = claim_prompt_abort(&current.abort_client, &app_state.prompt_cleanup);
-        let deep_handle = claim_prompt_deep_handle(current);
-        let deep_abort = claim_prompt_deep_abort(current);
-        Some(PromptPhysicalCleanup {
-            active: active.take().expect("matching prompt should exist"),
-            abort_claim,
-            deep_handle,
-            deep_abort,
-            cancel: true,
-        })
-    } else {
-        None
-    };
-    drop(session);
-    drop(active);
-    drop(_lifecycle);
-    if let Some(cleanup) = cleanup {
-        cleanup.cancel_detached();
+    app_state.conversation.fail(generation, || {
+        repair_failed_prompt_runtime(app_state, message)
+    })
+}
+
+impl DesktopConversationRuntime {
+    fn fail(
+        &self,
+        generation: voxgolem_core::conversation::ExecutionId,
+        repair: impl FnOnce(),
+    ) -> voxgolem_core::conversation::SettlementResult {
+        let app_state = self;
+        let Ok(_lifecycle) = app_state.lifecycle_gate.lock() else {
+            return voxgolem_core::conversation::SettlementResult::IgnoredStale;
+        };
+        let Ok(mut active) = app_state.active_prompt.lock() else {
+            return voxgolem_core::conversation::SettlementResult::IgnoredStale;
+        };
+        let Ok(mut session) = app_state.conversation_session.lock() else {
+            return voxgolem_core::conversation::SettlementResult::IgnoredStale;
+        };
+        let matching = active
+            .as_ref()
+            .is_some_and(|active| active.assistant_generation == generation);
+        let result = session.settle(
+            generation,
+            voxgolem_core::conversation::SettlementIntent::Failed,
+        );
+        let cleanup = if matches!(
+            result,
+            voxgolem_core::conversation::SettlementResult::Applied(
+                voxgolem_core::conversation::AppliedOutcome::Failed
+            )
+        ) && matching
+        {
+            let current = active.as_ref().expect("matching prompt should exist");
+            record_terminal_kind(&current.terminal_kind, TerminalKind::Failed);
+            current.cancelled.store(true, Ordering::Release);
+            current.settled.store(true, Ordering::Release);
+            repair();
+            let abort_claim = claim_prompt_abort(&current.abort_client, &app_state.prompt_cleanup);
+            let deep_handle = claim_prompt_deep_handle(current);
+            let deep_abort = claim_prompt_deep_abort(current);
+            Some(PromptPhysicalCleanup {
+                active: active.take().expect("matching prompt should exist"),
+                abort_claim,
+                deep_handle,
+                deep_abort,
+                cancel: true,
+            })
+        } else {
+            None
+        };
+        drop(session);
+        drop(active);
+        drop(_lifecycle);
+        if let Some(cleanup) = cleanup {
+            cleanup.cancel_detached();
+        }
+        result
     }
-    result
 }
 
 struct OpencodeStreamContext<'a> {
@@ -4890,329 +5137,157 @@ where
 }
 
 #[tauri::command]
+fn set_search_mode(
+    mode: voxgolem_core::search::Mode,
+    app_state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let coordinator = app_state
+        .conversation_session
+        .lock()
+        .map_err(|_| String::from("assistant coordinator lock is poisoned"))?;
+    let web_enabled = app_state
+        .network_preferences
+        .lock()
+        .map_err(|_| String::from("network preferences lock is poisoned"))?
+        .web_enabled;
+    search_runtime::route(coordinator.policy(), mode, web_enabled)?;
+    app_state.conversation.search.set_mode(mode)
+}
+
+#[tauri::command]
 async fn submit_prompt(
     request_id: String,
     prompt: String,
     source: Option<CompletionSource>,
+    search_mode: Option<voxgolem_core::search::Mode>,
     updates: Channel<PromptExecutionEventPayload>,
     app: tauri::AppHandle,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<PromptFinalPayload, String> {
-    let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
-    ensure_startup_ready_for_prompt(&app_state.startup_state)?;
-    validate_prompt_request_id(&request_id)?;
-    let prompt = validate_prompt_text(prompt)?;
-    let registered = begin_registered_assistant_request(
-        &app_state,
-        &request_id,
-        &prompt,
-        source.unwrap_or(CompletionSource::Typed),
-    )?;
-    let RegisteredAssistantRequest {
-        request: assistant_request,
-        physical_generation: generation,
-        cancelled,
-        cancellation_signal,
-        opencode_client,
-        control: active_prompt_control,
-        guard: active_prompt_guard,
-    } = registered;
-    active_prompt_control
-        .updates
-        .lock()
-        .map_err(|_| String::from("prompt update channel lock is poisoned"))?
-        .replace(updates);
-    let is_opencode = opencode_client.is_some();
-    cancel_active_tts_generation(&app_state);
-    if assistant_request.preferences.deep_enabled {
-        if let Err(error) =
-            ensure_agent_prerequisites(&app_state, assistant_request.preferences.deep_model)
-        {
-            fail_assistant_request(&app_state, assistant_request.generation, &error);
-            return Err(error);
-        }
-    }
-    if assistant_request.preferences.review_enabled {
-        if let Err(error) =
-            ensure_agent_prerequisites(&app_state, assistant_request.preferences.review_model)
-        {
-            fail_assistant_request(&app_state, assistant_request.generation, &error);
-            return Err(error);
-        }
-    }
-    if let Some(expected_profile) = local_profile_for_model(assistant_request.instant_model) {
-        let selected_profile = *app_state
-            .selected_response_profile
-            .lock()
-            .map_err(|_| String::from("selected response profile lock is poisoned"))?;
-        if selected_profile != expected_profile {
-            fail_assistant_request(
-                &app_state,
-                assistant_request.generation,
-                "selected local model is not loaded",
-            );
-            return Err(String::from("selected local model is not loaded"));
-        }
-    }
-    let mut deep_task = None;
-    for stage in initial_stage_sequence(assistant_request.preferences.deep_enabled) {
-        if stage == StagePayload::Deep {
-            let stage_result = emit_stage_event_controlled(
-                &app,
-                &request_id,
-                generation,
-                StagePayload::Deep,
-                StageStatusPayload::Queued,
-                None,
-            );
-            if let Err(error) = stage_result {
-                match error {
-                    PromptControlError::Cancelled => {
-                        return finish_cancelled_prompt(
-                            &app,
-                            &app_state,
-                            &request_id,
-                            assistant_request.generation,
-                            &active_prompt_control,
-                        );
-                    }
-                    PromptControlError::Error(error) => return Err(error),
-                }
-            }
-            deep_task = start_deep_task(
-                &app,
-                &request_id,
-                &assistant_request.prompt,
-                &assistant_request.history,
-                assistant_request.preferences.deep_model,
-                &active_prompt_control,
-            );
-        } else {
-            let stage_result = emit_stage_event_controlled(
-                &app,
-                &request_id,
-                generation,
-                StagePayload::Instant,
-                StageStatusPayload::Running,
-                None,
-            );
-            if let Err(error) = stage_result {
-                match error {
-                    PromptControlError::Cancelled => {
-                        return finish_cancelled_prompt(
-                            &app,
-                            &app_state,
-                            &request_id,
-                            assistant_request.generation,
-                            &active_prompt_control,
-                        );
-                    }
-                    PromptControlError::Error(error) => return Err(error),
-                }
-            }
-        }
-    }
-    let prefetch_key = PrefetchKey {
-        prompt: prompt.clone(),
-        history: assistant_request.history.clone(),
-        model: assistant_request.instant_model,
-    };
-    let prefetched_answer = {
-        let _lifecycle = app_state
-            .completion_lifecycle_lock
-            .lock()
-            .map_err(|_| String::from("completion lifecycle lock is poisoned"))?;
-        let prefetched_answer = take_and_invalidate_prefetch(
-            &app_state.prefetch_cache,
-            &app_state.prefetch_generation,
-            &app_state.assistant_settings_generation,
-            &prefetch_key,
-        )?;
-        clear_completion_request_state_locked(&app_state, false)?;
-        invalidate_prefetch(&app_state)?;
-        prefetched_answer
-    };
-    if let Some(answer) = prefetched_answer {
-        let answer_text = assistant_content_text(&answer).to_string();
-        match emit_prompt_event_controlled(
-            &app,
+    DesktopStageDispatcher { app_state, app }
+        .submit(request_id, prompt, source, search_mode, updates)
+        .await
+}
+
+/// Concrete provider/stage adapter. It borrows shell resources, never clones
+/// AppState or owns canonical state; all execution transitions go to its owner.
+struct DesktopStageDispatcher<'a> {
+    app_state: tauri::State<'a, AppState>,
+    app: tauri::AppHandle,
+}
+
+impl DesktopStageDispatcher<'_> {
+    async fn submit(
+        self,
+        request_id: String,
+        prompt: String,
+        source: Option<CompletionSource>,
+        search_mode: Option<voxgolem_core::search::Mode>,
+        updates: Channel<PromptExecutionEventPayload>,
+    ) -> Result<PromptFinalPayload, String> {
+        let app_state = self.app_state;
+        let app = self.app;
+        let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
+        ensure_startup_ready_for_prompt(&app_state.startup_state)?;
+        validate_prompt_request_id(&request_id)?;
+        let prompt = validate_prompt_text(prompt)?;
+        let search_mode = search_runtime::request_mode(search_mode);
+        let registered = app_state.conversation.admit(
+            app_state.prompt_admission_resources(),
             &request_id,
-            generation,
-            PromptExecutionEventPayload::Text {
-                text: answer_text.clone(),
-            },
-        ) {
-            Ok(()) => {}
-            Err(PromptControlError::Cancelled) => {
-                return finish_cancelled_prompt(
-                    &app,
-                    &app_state,
-                    &request_id,
-                    assistant_request.generation,
-                    &active_prompt_control,
-                );
-            }
-            Err(PromptControlError::Error(error)) => return Err(error),
-        }
-        let instant_result = finish_assistant_request(
-            &app_state,
-            &request_id,
-            generation,
-            assistant_request.generation,
-            voxgolem_core::assistant::InstantOutcome::Complete(answer),
+            &prompt,
+            source.unwrap_or(CompletionSource::Typed),
+            search_mode,
         )?;
-        if let Err(error) = resolve_enabled_agents(
-            stage_context(
+        let RegisteredAssistantRequest {
+            request: assistant_request,
+            physical_generation: generation,
+            cancelled,
+            cancellation_signal,
+            opencode_client,
+            control: active_prompt_control,
+            guard: active_prompt_guard,
+        } = registered;
+        active_prompt_control
+            .updates
+            .lock()
+            .map_err(|_| String::from("prompt update channel lock is poisoned"))?
+            .replace(updates);
+        if !assistant_request.web_enabled {
+            emit_prompt_event_controlled(
                 &app,
-                &app_state,
                 &request_id,
-                &assistant_request,
                 generation,
-                deep_task,
-                PromptCancellation {
-                    active_generation: generation,
-                    cancelled: &cancelled,
-                    signal: &cancellation_signal,
-                    control: &active_prompt_control,
+                PromptExecutionEventPayload::Status {
+                    message: String::from(
+                        "Web lookup disabled; current sources will not be retrieved or verified",
+                    ),
                 },
-            ),
-            &answer_text,
-            instant_result,
-        )
-        .await
-        {
-            if matches!(error, PromptControlError::Cancelled) {
-                return finish_cancelled_prompt(
+            )
+            .map_err(String::from)?;
+        }
+        let native_search = match search_runtime::route(
+            &assistant_request.preferences,
+            search_mode,
+            assistant_request.web_enabled,
+        ) {
+            Ok(native) => native,
+            Err(error) => {
+                return fail_started_prompt(
                     &app,
                     &app_state,
                     &request_id,
                     assistant_request.generation,
                     &active_prompt_control,
+                    error,
                 );
             }
-            return fail_started_prompt(
-                &app,
-                &app_state,
-                &request_id,
-                assistant_request.generation,
-                &active_prompt_control,
-                error.into_message(),
-            );
-        }
-        if cancelled.load(Ordering::SeqCst) {
-            return finish_cancelled_prompt(
-                &app,
-                &app_state,
-                &request_id,
-                assistant_request.generation,
-                &active_prompt_control,
-            );
-        }
-        if commit_assistant_request_if_active(
-            &app_state,
-            &request_id,
-            generation,
-            assistant_request.generation,
-            &active_prompt_control,
-        )? == CommitAssistantResult::Cancelled
-        {
-            return finish_cancelled_prompt(
-                &app,
-                &app_state,
-                &request_id,
-                assistant_request.generation,
-                &active_prompt_control,
-            );
-        }
-        let runtime_phase = current_runtime_phase(&app_state.voice_pipeline_state)?;
-        let _ = emit_terminal_prompt_event_controlled(
-            &app,
-            &active_prompt_control,
-            PromptExecutionEventPayload::Completed {
-                runtime_phase: runtime_phase.clone(),
-            },
-        );
-        active_prompt_guard.finish();
-        return Ok(PromptFinalPayload {
-            request_id,
-            runtime_phase,
-            outcome: String::from("completed"),
-            error_message: None,
-        });
-    }
-    if matches!(
-        assistant_request.instant_model,
-        voxgolem_core::assistant::InstantModel::CustomSolHigh
-            | voxgolem_core::assistant::InstantModel::CustomSolNone
-            | voxgolem_core::assistant::InstantModel::CustomLunaNone
-            | voxgolem_core::assistant::InstantModel::CustomLunaLow
-    ) {
-        return submit_custom_prompt(
-            &request_id,
-            &prompt,
-            assistant_request,
-            &app,
-            &app_state,
-            PromptCancellation {
-                active_generation: generation,
-                cancelled: &cancelled,
-                signal: &cancellation_signal,
-                control: &active_prompt_control,
-            },
-            deep_task,
-        )
-        .await;
-    }
-    if !is_opencode {
-        let expected_profile = match assistant_request.instant_model {
-            voxgolem_core::assistant::InstantModel::LocalFast => ResponseProfilePayload::Fast,
-            voxgolem_core::assistant::InstantModel::LocalQuality => ResponseProfilePayload::Quality,
-            _ => unreachable!("non-local providers return before local dispatch"),
         };
-        if *app_state
-            .selected_response_profile
-            .lock()
-            .map_err(|_| String::from("selected response profile lock is poisoned"))?
-            != expected_profile
-        {
-            fail_assistant_request(
-                &app_state,
-                assistant_request.generation,
-                "selected local model is not loaded",
-            );
-            return Err(String::from("selected local model is not loaded"));
-        }
-        sync_llama_history(&app_state, &assistant_request.history)?;
-        let result = match stream_local_prompt(
-            &app,
-            &app_state,
-            &request_id,
-            generation,
-            &prompt,
-            &cancelled,
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(PromptControlError::Cancelled) => {
-                return finish_cancelled_prompt(
-                    &app,
-                    &app_state,
-                    &request_id,
-                    assistant_request.generation,
-                    &active_prompt_control,
-                )
+        let is_opencode = opencode_client.is_some();
+        cancel_active_tts_generation(&app_state);
+        if assistant_request.preferences.deep_enabled {
+            if let Err(error) =
+                ensure_agent_prerequisites(&app_state, assistant_request.preferences.deep_model)
+            {
+                fail_assistant_request(&app_state, assistant_request.generation, &error);
+                return Err(error);
             }
-            Err(PromptControlError::Error(error)) => {
-                if let Err(publication) = emit_prompt_event_controlled(
+        }
+        if assistant_request.preferences.review_enabled {
+            if let Err(error) =
+                ensure_agent_prerequisites(&app_state, assistant_request.preferences.review_model)
+            {
+                fail_assistant_request(&app_state, assistant_request.generation, &error);
+                return Err(error);
+            }
+        }
+        if let Some(expected_profile) = local_profile_for_model(assistant_request.instant_model) {
+            let selected_profile = *app_state
+                .selected_response_profile
+                .lock()
+                .map_err(|_| String::from("selected response profile lock is poisoned"))?;
+            if selected_profile != expected_profile {
+                fail_assistant_request(
+                    &app_state,
+                    assistant_request.generation,
+                    "selected local model is not loaded",
+                );
+                return Err(String::from("selected local model is not loaded"));
+            }
+        }
+        let mut deep_task = None;
+        for stage in initial_stage_sequence(assistant_request.preferences.deep_enabled) {
+            if stage == StagePayload::Deep {
+                let stage_result = emit_stage_event_controlled(
                     &app,
                     &request_id,
                     generation,
-                    PromptExecutionEventPayload::Error {
-                        message: error.clone(),
-                    },
-                ) {
-                    match publication {
+                    StagePayload::Deep,
+                    StageStatusPayload::Queued,
+                    None,
+                );
+                if let Err(error) = stage_result {
+                    match error {
                         PromptControlError::Cancelled => {
                             return finish_cancelled_prompt(
                                 &app,
@@ -5220,49 +5295,102 @@ async fn submit_prompt(
                                 &request_id,
                                 assistant_request.generation,
                                 &active_prompt_control,
-                            )
+                            );
                         }
                         PromptControlError::Error(error) => return Err(error),
                     }
                 }
-                match settle_instant_failure(
-                    stage_context(
+                if !native_search {
+                    deep_task = start_deep_task(
+                        &app,
+                        &request_id,
+                        &assistant_request.prompt,
+                        &assistant_request.history,
+                        assistant_request.preferences.deep_model,
+                        assistant_request.web_enabled,
+                        &active_prompt_control,
+                    );
+                }
+            } else {
+                let stage_result = emit_stage_event_controlled(
+                    &app,
+                    &request_id,
+                    generation,
+                    StagePayload::Instant,
+                    StageStatusPayload::Running,
+                    None,
+                );
+                if let Err(error) = stage_result {
+                    match error {
+                        PromptControlError::Cancelled => {
+                            return finish_cancelled_prompt(
+                                &app,
+                                &app_state,
+                                &request_id,
+                                assistant_request.generation,
+                                &active_prompt_control,
+                            );
+                        }
+                        PromptControlError::Error(error) => return Err(error),
+                    }
+                }
+            }
+        }
+        let prefetched_answer = {
+            let _lifecycle = app_state
+                .completion_lifecycle_lock
+                .lock()
+                .map_err(|_| String::from("completion lifecycle lock is poisoned"))?;
+            let prefetched_answer =
+                if search_runtime::consume_prefetch(&assistant_request.preferences) {
+                    let prefetch_key = PrefetchKey {
+                        prompt: prompt.clone(),
+                        history: assistant_request.history.clone(),
+                        model: assistant_request.instant_model,
+                    };
+                    take_and_invalidate_prefetch(
+                        &app_state.prefetch_cache,
+                        &app_state.prefetch_generation,
+                        &app_state.assistant_settings_generation,
+                        &prefetch_key,
+                    )?
+                } else {
+                    None
+                };
+            clear_completion_request_state_locked(&app_state, false)?;
+            invalidate_prefetch(&app_state)?;
+            prefetched_answer
+        };
+        if let Some(answer) = prefetched_answer {
+            let answer_text = assistant_content_text(&answer).to_string();
+            match emit_prompt_event_controlled(
+                &app,
+                &request_id,
+                generation,
+                PromptExecutionEventPayload::Text {
+                    text: answer_text.clone(),
+                },
+            ) {
+                Ok(()) => {}
+                Err(PromptControlError::Cancelled) => {
+                    return finish_cancelled_prompt(
                         &app,
                         &app_state,
                         &request_id,
-                        &assistant_request,
-                        generation,
-                        deep_task,
-                        PromptCancellation {
-                            active_generation: generation,
-                            cancelled: &cancelled,
-                            signal: &cancellation_signal,
-                            control: &active_prompt_control,
-                        },
-                    ),
-                    error,
-                )
-                .await
-                {
-                    Ok(Some(result)) => return Ok(result),
-                    Ok(None) => return Err(String::from("local response failed")),
-                    Err(error) => return Err(error),
+                        assistant_request.generation,
+                        &active_prompt_control,
+                    );
                 }
+                Err(PromptControlError::Error(error)) => return Err(error),
             }
-        };
-        let answer = prompt_execution_text(&result.events);
-        if cancelled.load(Ordering::SeqCst) {
-            return finish_cancelled_prompt(
-                &app,
+            let instant_result = finish_assistant_request(
                 &app_state,
                 &request_id,
+                generation,
                 assistant_request.generation,
-                &active_prompt_control,
-            );
-        }
-        if answer.trim().is_empty() {
-            let message = String::from("response provider completed without visible text");
-            match settle_instant_failure(
+                voxgolem_core::assistant::InstantOutcome::Complete(answer),
+            )?;
+            if let Err(error) = resolve_enabled_agents(
                 stage_context(
                     &app,
                     &app_state,
@@ -5277,45 +5405,30 @@ async fn submit_prompt(
                         control: &active_prompt_control,
                     },
                 ),
-                message.clone(),
+                &answer_text,
+                instant_result,
             )
             .await
             {
-                Ok(Some(result)) => return Ok(result),
-                Ok(None) => return Err(message),
-                Err(error) => return Err(error),
+                if matches!(error, PromptControlError::Cancelled) {
+                    return finish_cancelled_prompt(
+                        &app,
+                        &app_state,
+                        &request_id,
+                        assistant_request.generation,
+                        &active_prompt_control,
+                    );
+                }
+                return fail_started_prompt(
+                    &app,
+                    &app_state,
+                    &request_id,
+                    assistant_request.generation,
+                    &active_prompt_control,
+                    error.into_message(),
+                );
             }
-        }
-        let instant_result = finish_assistant_request(
-            &app_state,
-            &request_id,
-            generation,
-            assistant_request.generation,
-            voxgolem_core::assistant::InstantOutcome::Complete(
-                voxgolem_core::assistant::Content::Text(answer.clone()),
-            ),
-        )?;
-        if let Err(error) = resolve_enabled_agents(
-            stage_context(
-                &app,
-                &app_state,
-                &request_id,
-                &assistant_request,
-                generation,
-                deep_task,
-                PromptCancellation {
-                    active_generation: generation,
-                    cancelled: &cancelled,
-                    signal: &cancellation_signal,
-                    control: &active_prompt_control,
-                },
-            ),
-            &answer,
-            instant_result,
-        )
-        .await
-        {
-            if matches!(error, PromptControlError::Cancelled) {
+            if cancelled.load(Ordering::SeqCst) {
                 return finish_cancelled_prompt(
                     &app,
                     &app_state,
@@ -5324,120 +5437,95 @@ async fn submit_prompt(
                     &active_prompt_control,
                 );
             }
-            return fail_started_prompt(
-                &app,
+            if commit_assistant_request_if_active(
                 &app_state,
                 &request_id,
+                generation,
                 assistant_request.generation,
                 &active_prompt_control,
-                error.into_message(),
-            );
-        }
-        if cancelled.load(Ordering::SeqCst) {
-            return finish_cancelled_prompt(
+            )? == CommitAssistantResult::Cancelled
+            {
+                return finish_cancelled_prompt(
+                    &app,
+                    &app_state,
+                    &request_id,
+                    assistant_request.generation,
+                    &active_prompt_control,
+                );
+            }
+            let runtime_phase = current_runtime_phase(&app_state.voice_pipeline_state)?;
+            let _ = emit_terminal_prompt_event_controlled(
                 &app,
-                &app_state,
-                &request_id,
-                assistant_request.generation,
                 &active_prompt_control,
+                PromptExecutionEventPayload::Completed {
+                    runtime_phase: runtime_phase.clone(),
+                },
             );
+            active_prompt_guard.finish();
+            return Ok(PromptFinalPayload {
+                request_id,
+                runtime_phase,
+                outcome: String::from("completed"),
+                error_message: None,
+            });
         }
-        if commit_assistant_request_if_active(
-            &app_state,
-            &request_id,
-            generation,
-            assistant_request.generation,
-            &active_prompt_control,
-        )? == CommitAssistantResult::Cancelled
-        {
-            return finish_cancelled_prompt(
-                &app,
-                &app_state,
-                &request_id,
-                assistant_request.generation,
-                &active_prompt_control,
-            );
-        }
-        let phase = current_runtime_phase(&app_state.voice_pipeline_state)?;
-        let _ = emit_terminal_prompt_event_controlled(
-            &app,
-            &active_prompt_control,
-            PromptExecutionEventPayload::Completed {
-                runtime_phase: phase.clone(),
-            },
-        );
-        active_prompt_guard.finish();
-        return Ok(PromptFinalPayload {
-            request_id,
-            runtime_phase: phase,
-            outcome: "completed".into(),
-            error_message: None,
-        });
-    }
-    let base_client = opencode_client.expect("OpenCode availability was checked before dispatch");
-    let transient_client = match create_transient_opencode_client(
-        &base_client,
-        &cancellation_signal,
-        &app_state.prompt_cleanup,
-    )
-    .await
-    {
-        Ok(client) => client,
-        Err(_) if cancelled.load(Ordering::Acquire) => {
-            return finish_cancelled_prompt(
-                &app,
-                &app_state,
-                &request_id,
-                assistant_request.generation,
-                &active_prompt_control,
-            );
-        }
-        Err(error) => {
-            return fail_started_prompt(
-                &app,
-                &app_state,
-                &request_id,
-                assistant_request.generation,
-                &active_prompt_control,
-                error,
-            );
-        }
-    };
-    let result = stream_opencode_prompt(
-        OpencodeStreamContext {
-            app: &app,
-            active_prompt: &app_state.active_prompt,
-            request_id: &request_id,
-            generation,
-            client: &transient_client.client,
-            cancelled: &cancelled,
-            cancellation_signal: &cancellation_signal,
-        },
-        &render_provider_prompt(&assistant_request.history, &prompt),
-        assistant_request.instant_model,
-    )
-    .await;
-    transient_client.finish().await;
-    if cancelled.load(Ordering::SeqCst) {
-        return finish_cancelled_prompt(
-            &app,
-            &app_state,
-            &request_id,
-            assistant_request.generation,
-            &active_prompt_control,
-        );
-    }
-    if let OpencodePromptResult::Failed(message) = &result {
-        if let Err(publication) = emit_prompt_event_controlled(
-            &app,
-            &request_id,
-            generation,
-            PromptExecutionEventPayload::Error {
-                message: message.clone(),
-            },
+        if matches!(
+            assistant_request.instant_model,
+            voxgolem_core::assistant::InstantModel::CustomSolHigh
+                | voxgolem_core::assistant::InstantModel::CustomSolNone
+                | voxgolem_core::assistant::InstantModel::CustomLunaNone
+                | voxgolem_core::assistant::InstantModel::CustomLunaLow
         ) {
-            match publication {
-                PromptControlError::Cancelled => {
+            return submit_custom_prompt(
+                &request_id,
+                &prompt,
+                assistant_request,
+                &app,
+                &app_state,
+                PromptCancellation {
+                    active_generation: generation,
+                    cancelled: &cancelled,
+                    signal: &cancellation_signal,
+                    control: &active_prompt_control,
+                },
+                deep_task,
+            )
+            .await;
+        }
+        if !is_opencode {
+            let expected_profile = match assistant_request.instant_model {
+                voxgolem_core::assistant::InstantModel::LocalFast => ResponseProfilePayload::Fast,
+                voxgolem_core::assistant::InstantModel::LocalQuality => {
+                    ResponseProfilePayload::Quality
+                }
+                _ => unreachable!("non-local providers return before local dispatch"),
+            };
+            if *app_state
+                .selected_response_profile
+                .lock()
+                .map_err(|_| String::from("selected response profile lock is poisoned"))?
+                != expected_profile
+            {
+                fail_assistant_request(
+                    &app_state,
+                    assistant_request.generation,
+                    "selected local model is not loaded",
+                );
+                return Err(String::from("selected local model is not loaded"));
+            }
+            sync_llama_history(&app_state, &assistant_request.history)?;
+            let result = match stream_local_prompt(
+                &app,
+                &app_state,
+                &request_id,
+                generation,
+                &prompt,
+                &cancelled,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(PromptControlError::Cancelled) => {
                     return finish_cancelled_prompt(
                         &app,
                         &app_state,
@@ -5446,38 +5534,65 @@ async fn submit_prompt(
                         &active_prompt_control,
                     )
                 }
-                PromptControlError::Error(error) => return Err(error),
+                Err(PromptControlError::Error(error)) => {
+                    if let Err(publication) = emit_prompt_event_controlled(
+                        &app,
+                        &request_id,
+                        generation,
+                        PromptExecutionEventPayload::Error {
+                            message: error.clone(),
+                        },
+                    ) {
+                        match publication {
+                            PromptControlError::Cancelled => {
+                                return finish_cancelled_prompt(
+                                    &app,
+                                    &app_state,
+                                    &request_id,
+                                    assistant_request.generation,
+                                    &active_prompt_control,
+                                )
+                            }
+                            PromptControlError::Error(error) => return Err(error),
+                        }
+                    }
+                    match settle_instant_failure(
+                        stage_context(
+                            &app,
+                            &app_state,
+                            &request_id,
+                            &assistant_request,
+                            generation,
+                            deep_task,
+                            PromptCancellation {
+                                active_generation: generation,
+                                cancelled: &cancelled,
+                                signal: &cancellation_signal,
+                                control: &active_prompt_control,
+                            },
+                        ),
+                        error,
+                    )
+                    .await
+                    {
+                        Ok(Some(result)) => return Ok(result),
+                        Ok(None) => return Err(String::from("local response failed")),
+                        Err(error) => return Err(error),
+                    }
+                }
+            };
+            let answer = prompt_execution_text(&result.events);
+            if cancelled.load(Ordering::SeqCst) {
+                return finish_cancelled_prompt(
+                    &app,
+                    &app_state,
+                    &request_id,
+                    assistant_request.generation,
+                    &active_prompt_control,
+                );
             }
-        }
-        match settle_instant_failure(
-            stage_context(
-                &app,
-                &app_state,
-                &request_id,
-                &assistant_request,
-                generation,
-                deep_task,
-                PromptCancellation {
-                    active_generation: generation,
-                    cancelled: &cancelled,
-                    signal: &cancellation_signal,
-                    control: &active_prompt_control,
-                },
-            ),
-            message.clone(),
-        )
-        .await
-        {
-            Ok(Some(result)) => return Ok(result),
-            Ok(None) => return Err(message.clone()),
-            Err(error) => return Err(error),
-        }
-    }
-
-    let (outcome, event, error_message) = match result {
-        OpencodePromptResult::Completed(answer) => {
             if answer.trim().is_empty() {
-                let message = String::from("OpenCode completed without visible text");
+                let message = String::from("response provider completed without visible text");
                 match settle_instant_failure(
                     stage_context(
                         &app,
@@ -5575,49 +5690,267 @@ async fn submit_prompt(
                 );
             }
             let phase = current_runtime_phase(&app_state.voice_pipeline_state)?;
-            (
-                "completed",
+            let _ = emit_terminal_prompt_event_controlled(
+                &app,
+                &active_prompt_control,
                 PromptExecutionEventPayload::Completed {
-                    runtime_phase: phase,
+                    runtime_phase: phase.clone(),
                 },
-                None,
-            )
+            );
+            active_prompt_guard.finish();
+            return Ok(PromptFinalPayload {
+                request_id,
+                runtime_phase: phase,
+                outcome: "completed".into(),
+                error_message: None,
+            });
         }
-        OpencodePromptResult::Cancelled => {
-            cancel_assistant_request(&app_state, assistant_request.generation);
-            let phase = current_runtime_phase(&app_state.voice_pipeline_state)?;
-            (
-                "cancelled",
-                PromptExecutionEventPayload::Cancelled {
-                    runtime_phase: phase,
-                },
-                None,
-            )
+        let base_client =
+            opencode_client.expect("OpenCode availability was checked before dispatch");
+        let transient_client = match create_transient_opencode_client(
+            &base_client,
+            &cancellation_signal,
+            &app_state.prompt_cleanup,
+        )
+        .await
+        {
+            Ok(client) => client,
+            Err(_) if cancelled.load(Ordering::Acquire) => {
+                return finish_cancelled_prompt(
+                    &app,
+                    &app_state,
+                    &request_id,
+                    assistant_request.generation,
+                    &active_prompt_control,
+                );
+            }
+            Err(error) => {
+                return fail_started_prompt(
+                    &app,
+                    &app_state,
+                    &request_id,
+                    assistant_request.generation,
+                    &active_prompt_control,
+                    error,
+                );
+            }
+        };
+        let result = stream_opencode_prompt(
+            OpencodeStreamContext {
+                app: &app,
+                active_prompt: &app_state.active_prompt,
+                request_id: &request_id,
+                generation,
+                client: &transient_client.client,
+                cancelled: &cancelled,
+                cancellation_signal: &cancellation_signal,
+            },
+            &render_provider_prompt(&assistant_request.history, &prompt),
+            assistant_request.instant_model,
+        )
+        .await;
+        transient_client.finish().await;
+        if cancelled.load(Ordering::SeqCst) {
+            return finish_cancelled_prompt(
+                &app,
+                &app_state,
+                &request_id,
+                assistant_request.generation,
+                &active_prompt_control,
+            );
         }
-        OpencodePromptResult::Failed(message) => {
-            fail_assistant_request(&app_state, assistant_request.generation, &message);
-            (
-                "error",
+        if let OpencodePromptResult::Failed(message) = &result {
+            if let Err(publication) = emit_prompt_event_controlled(
+                &app,
+                &request_id,
+                generation,
                 PromptExecutionEventPayload::Error {
                     message: message.clone(),
                 },
-                Some(message),
+            ) {
+                match publication {
+                    PromptControlError::Cancelled => {
+                        return finish_cancelled_prompt(
+                            &app,
+                            &app_state,
+                            &request_id,
+                            assistant_request.generation,
+                            &active_prompt_control,
+                        )
+                    }
+                    PromptControlError::Error(error) => return Err(error),
+                }
+            }
+            match settle_instant_failure(
+                stage_context(
+                    &app,
+                    &app_state,
+                    &request_id,
+                    &assistant_request,
+                    generation,
+                    deep_task,
+                    PromptCancellation {
+                        active_generation: generation,
+                        cancelled: &cancelled,
+                        signal: &cancellation_signal,
+                        control: &active_prompt_control,
+                    },
+                ),
+                message.clone(),
             )
+            .await
+            {
+                Ok(Some(result)) => return Ok(result),
+                Ok(None) => return Err(message.clone()),
+                Err(error) => return Err(error),
+            }
         }
-    };
-    let phase = current_runtime_phase(&app_state.voice_pipeline_state)?;
-    if outcome == "completed" {
-        let _ = emit_terminal_prompt_event_controlled(&app, &active_prompt_control, event);
-    } else {
-        emit_terminal_prompt_event_controlled(&app, &active_prompt_control, event)?;
+
+        let (outcome, event, error_message) = match result {
+            OpencodePromptResult::Completed(answer) => {
+                if answer.trim().is_empty() {
+                    let message = String::from("OpenCode completed without visible text");
+                    match settle_instant_failure(
+                        stage_context(
+                            &app,
+                            &app_state,
+                            &request_id,
+                            &assistant_request,
+                            generation,
+                            deep_task,
+                            PromptCancellation {
+                                active_generation: generation,
+                                cancelled: &cancelled,
+                                signal: &cancellation_signal,
+                                control: &active_prompt_control,
+                            },
+                        ),
+                        message.clone(),
+                    )
+                    .await
+                    {
+                        Ok(Some(result)) => return Ok(result),
+                        Ok(None) => return Err(message),
+                        Err(error) => return Err(error),
+                    }
+                }
+                let instant_result = finish_assistant_request(
+                    &app_state,
+                    &request_id,
+                    generation,
+                    assistant_request.generation,
+                    voxgolem_core::assistant::InstantOutcome::Complete(
+                        voxgolem_core::assistant::Content::Text(answer.clone()),
+                    ),
+                )?;
+                if let Err(error) = resolve_enabled_agents(
+                    stage_context(
+                        &app,
+                        &app_state,
+                        &request_id,
+                        &assistant_request,
+                        generation,
+                        deep_task,
+                        PromptCancellation {
+                            active_generation: generation,
+                            cancelled: &cancelled,
+                            signal: &cancellation_signal,
+                            control: &active_prompt_control,
+                        },
+                    ),
+                    &answer,
+                    instant_result,
+                )
+                .await
+                {
+                    if matches!(error, PromptControlError::Cancelled) {
+                        return finish_cancelled_prompt(
+                            &app,
+                            &app_state,
+                            &request_id,
+                            assistant_request.generation,
+                            &active_prompt_control,
+                        );
+                    }
+                    return fail_started_prompt(
+                        &app,
+                        &app_state,
+                        &request_id,
+                        assistant_request.generation,
+                        &active_prompt_control,
+                        error.into_message(),
+                    );
+                }
+                if cancelled.load(Ordering::SeqCst) {
+                    return finish_cancelled_prompt(
+                        &app,
+                        &app_state,
+                        &request_id,
+                        assistant_request.generation,
+                        &active_prompt_control,
+                    );
+                }
+                if commit_assistant_request_if_active(
+                    &app_state,
+                    &request_id,
+                    generation,
+                    assistant_request.generation,
+                    &active_prompt_control,
+                )? == CommitAssistantResult::Cancelled
+                {
+                    return finish_cancelled_prompt(
+                        &app,
+                        &app_state,
+                        &request_id,
+                        assistant_request.generation,
+                        &active_prompt_control,
+                    );
+                }
+                let phase = current_runtime_phase(&app_state.voice_pipeline_state)?;
+                (
+                    "completed",
+                    PromptExecutionEventPayload::Completed {
+                        runtime_phase: phase,
+                    },
+                    None,
+                )
+            }
+            OpencodePromptResult::Cancelled => {
+                cancel_assistant_request(&app_state, assistant_request.generation);
+                let phase = current_runtime_phase(&app_state.voice_pipeline_state)?;
+                (
+                    "cancelled",
+                    PromptExecutionEventPayload::Cancelled {
+                        runtime_phase: phase,
+                    },
+                    None,
+                )
+            }
+            OpencodePromptResult::Failed(message) => {
+                fail_assistant_request(&app_state, assistant_request.generation, &message);
+                (
+                    "error",
+                    PromptExecutionEventPayload::Error {
+                        message: message.clone(),
+                    },
+                    Some(message),
+                )
+            }
+        };
+        let phase = current_runtime_phase(&app_state.voice_pipeline_state)?;
+        if outcome == "completed" {
+            let _ = emit_terminal_prompt_event_controlled(&app, &active_prompt_control, event);
+        } else {
+            emit_terminal_prompt_event_controlled(&app, &active_prompt_control, event)?;
+        }
+        active_prompt_guard.finish();
+        Ok(PromptFinalPayload {
+            request_id,
+            runtime_phase: phase,
+            outcome: outcome.to_string(),
+            error_message,
+        })
     }
-    active_prompt_guard.finish();
-    Ok(PromptFinalPayload {
-        request_id,
-        runtime_phase: phase,
-        outcome: outcome.to_string(),
-        error_message,
-    })
 }
 
 async fn submit_custom_prompt(
@@ -5627,8 +5960,25 @@ async fn submit_custom_prompt(
     app: &tauri::AppHandle,
     app_state: &AppState,
     cancellation: PromptCancellation<'_>,
-    deep_task: Option<DeepTask>,
+    mut deep_task: Option<DeepTask>,
 ) -> Result<PromptFinalPayload, String> {
+    let mut cancellation_receiver = cancellation.signal.subscribe();
+    if *cancellation_receiver.borrow()
+        || cancellation.cancelled.load(Ordering::Acquire)
+        || !is_active_prompt(
+            &app_state.active_prompt,
+            request_id,
+            cancellation.active_generation,
+        )?
+    {
+        return finish_cancelled_prompt(
+            app,
+            app_state,
+            request_id,
+            assistant_request.generation,
+            cancellation.control,
+        );
+    }
     let config = app_state
         .runtime_config
         .as_ref()
@@ -5671,14 +6021,13 @@ async fn submit_custom_prompt(
             );
         }
     };
-    let client = voxgolem_platform::custom_openai::CustomOpenAiClient::new(
-        voxgolem_platform::custom_openai::CustomOpenAiConfig {
-            endpoint: config.endpoint.clone(),
-            auth_path,
-            model,
-            ..Default::default()
-        },
-    );
+    let provider_config = voxgolem_platform::custom_openai::CustomOpenAiConfig {
+        endpoint: config.endpoint.clone(),
+        auth_path,
+        model,
+        ..Default::default()
+    };
+    let client = voxgolem_platform::custom_openai::CustomOpenAiClient::new(provider_config.clone());
     let client = match client {
         Ok(client) => client,
         Err(error) => {
@@ -5697,7 +6046,6 @@ async fn submit_custom_prompt(
         prompt: prompt.to_string(),
         history: custom_history(&assistant_request.history),
     };
-    let mut cancellation_receiver = cancellation.signal.subscribe();
     if *cancellation_receiver.borrow() {
         return finish_cancelled_prompt(
             app,
@@ -5707,6 +6055,9 @@ async fn submit_custom_prompt(
             cancellation.control,
         );
     }
+    let native_search = search_runtime::native_search_eligible(&assistant_request.preferences);
+    let search_state = &app_state.conversation.search;
+    let mut expected_auth_revision = None;
     let response = tokio::select! {
         biased;
         _ = cancellation_receiver.changed() => {
@@ -5718,18 +6069,38 @@ async fn submit_custom_prompt(
                 cancellation.control,
             );
         }
-        response = client.respond(&provider_prompt, |text| {
-            if !cancellation.cancelled.load(Ordering::SeqCst) {
-                let _ = emit_prompt_event_controlled(
-                    app,
-                    request_id,
-                    cancellation.active_generation,
-                    PromptExecutionEventPayload::Text {
-                        text: text.to_string(),
-                    },
-                );
+        response = async {
+            if native_search {
+                search_runtime::run_custom(
+                    search_state,
+                    &client,
+                    provider_config,
+                    &provider_prompt,
+                    assistant_request.search_mode,
+                    assistant_request.web_enabled,
+                    assistant_request.generation.session_id,
+                    cancellation,
+                    |event| emit_prompt_event_controlled(
+                        app, request_id, cancellation.active_generation, event,
+                    ).map_err(|_| ()),
+                ).await.map(|(result, revision)| {
+                    expected_auth_revision = revision;
+                    (result.response.clone(), Some(result))
+                }).map_err(search_runtime::run_error)
+            } else {
+                client.respond(&provider_prompt, |text| {
+                    if !cancellation.cancelled.load(Ordering::SeqCst)
+                        && emit_prompt_event_controlled(
+                            app, request_id, cancellation.active_generation,
+                            PromptExecutionEventPayload::Text { text: text.to_string() },
+                        ).is_err()
+                    {
+                        cancellation.cancelled.store(true, Ordering::SeqCst);
+                        cancellation.signal.send_replace(true);
+                    }
+                }).await.map(|response| (response, None)).map_err(|error| error.to_string())
             }
-        }) => response,
+        } => response,
     };
     if cancellation.cancelled.load(Ordering::SeqCst) {
         return finish_cancelled_prompt(
@@ -5740,7 +6111,7 @@ async fn submit_custom_prompt(
             cancellation.control,
         );
     }
-    let response = match response {
+    let (response, search_result) = match response {
         Ok(response) => response,
         Err(error) => {
             let message = error.to_string();
@@ -5765,6 +6136,18 @@ async fn submit_custom_prompt(
                     PromptControlError::Error(error) => return Err(error),
                 }
             }
+            if native_search && assistant_request.preferences.deep_enabled {
+                let unavailable = format!("{}\n\nNative web retrieval failed: {}. Do not claim source verification or browse independently.", prompt, message);
+                deep_task = start_deep_task(
+                    app,
+                    request_id,
+                    &unavailable,
+                    &assistant_request.history,
+                    assistant_request.preferences.deep_model,
+                    assistant_request.web_enabled,
+                    cancellation.control,
+                );
+            }
             match settle_instant_failure(
                 stage_context(
                     app,
@@ -5785,8 +6168,18 @@ async fn submit_custom_prompt(
             }
         }
     };
+    if native_search && expected_auth_revision != client.auth_revision() {
+        return fail_started_prompt(
+            app,
+            app_state,
+            request_id,
+            assistant_request.generation,
+            cancellation.control,
+            String::from("Custom provider authentication changed during native search"),
+        );
+    }
     if let Some(first_text_at) = response.timings.first_text_at {
-        let _ = emit_prompt_event_controlled(
+        if emit_prompt_event_controlled(
             app,
             request_id,
             cancellation.active_generation,
@@ -5795,12 +6188,28 @@ async fn submit_custom_prompt(
                 completed_ms: u64::try_from(response.timings.completed_at.as_millis())
                     .unwrap_or(u64::MAX),
             },
-        );
+        )
+        .is_err()
+        {
+            cancellation.cancelled.store(true, Ordering::SeqCst);
+            cancellation.signal.send_replace(true);
+            return finish_cancelled_prompt(
+                app,
+                app_state,
+                request_id,
+                assistant_request.generation,
+                cancellation.control,
+            );
+        }
     }
+    let persisted_answer = search_result.as_ref().map_or_else(
+        || response.text.clone(),
+        voxgolem_platform::search::RunResult::persisted_text,
+    );
     let answer = response.text;
     let answer_content = match response.content_type {
         voxgolem_platform::custom_openai::CustomOpenAiContentType::OutputText => {
-            voxgolem_core::assistant::Content::Text(answer.clone())
+            voxgolem_core::assistant::Content::Text(persisted_answer)
         }
         voxgolem_platform::custom_openai::CustomOpenAiContentType::Refusal => {
             voxgolem_core::assistant::Content::Refusal(answer.clone())
@@ -5813,21 +6222,31 @@ async fn submit_custom_prompt(
         assistant_request.generation,
         voxgolem_core::assistant::InstantOutcome::Complete(answer_content),
     )?;
-    if let Err(error) = resolve_enabled_agents(
-        stage_context(
-            app,
-            app_state,
-            request_id,
-            &assistant_request,
-            cancellation.active_generation,
-            deep_task,
-            cancellation,
-        ),
-        &answer,
-        instant_result,
-    )
-    .await
-    {
+    if let Some(result) = search_result.as_ref() {
+        if assistant_request.preferences.deep_enabled {
+            let enriched_prompt = search_runtime::deep_request(prompt, result);
+            deep_task = start_deep_task(
+                app,
+                request_id,
+                &enriched_prompt,
+                &assistant_request.history,
+                assistant_request.preferences.deep_model,
+                assistant_request.web_enabled,
+                cancellation.control,
+            );
+        }
+    }
+    let mut stages = stage_context(
+        app,
+        app_state,
+        request_id,
+        &assistant_request,
+        cancellation.active_generation,
+        deep_task,
+        cancellation,
+    );
+    stages.search_result = search_result.as_ref();
+    if let Err(error) = resolve_enabled_agents(stages, &answer, instant_result).await {
         if matches!(error, PromptControlError::Cancelled) {
             return finish_cancelled_prompt(
                 app,
@@ -5853,6 +6272,16 @@ async fn submit_custom_prompt(
             request_id,
             assistant_request.generation,
             cancellation.control,
+        );
+    }
+    if native_search && expected_auth_revision != client.auth_revision() {
+        return fail_started_prompt(
+            app,
+            app_state,
+            request_id,
+            assistant_request.generation,
+            cancellation.control,
+            String::from("Custom provider authentication changed before search settlement"),
         );
     }
     if commit_assistant_request_if_active(
@@ -5985,6 +6414,7 @@ async fn settle_instant_failure(
         active_generation,
         deep_task,
         cancellation,
+        search_result: _,
     } = context;
     let instant_result = finish_assistant_request(
         app_state,
@@ -6092,7 +6522,7 @@ async fn settle_instant_failure(
 fn custom_history(
     history: &[voxgolem_core::assistant::ConversationTurn],
 ) -> Vec<voxgolem_platform::custom_openai::CustomOpenAiMessage> {
-    bounded_provider_history(history)
+    history
         .iter()
         .map(
             |turn| voxgolem_platform::custom_openai::CustomOpenAiMessage {
@@ -6359,6 +6789,7 @@ async fn resolve_enabled_agents(
         active_generation: _,
         deep_task,
         cancellation,
+        search_result,
     } = context;
     if cancellation.cancelled.load(Ordering::SeqCst) {
         return Err(PromptControlError::Cancelled);
@@ -6385,9 +6816,7 @@ async fn resolve_enabled_agents(
         request,
         telemetry::Stage::Generation,
         instant_telemetry_identity(request.instant_model),
-        current_time_ms()
-            .unwrap_or(request.started_ms)
-            .saturating_sub(request.started_ms),
+        u64::try_from(request.started.elapsed().as_millis()).unwrap_or(u64::MAX),
         instant_succeeded,
     );
     if matches!(
@@ -6416,7 +6845,10 @@ async fn resolve_enabled_agents(
             result.report.is_some(),
         );
         let report = match result.report {
-            Some(report) => {
+            Some(mut report) => {
+                if let Some(result) = search_result {
+                    report.sources = search_runtime::source_links(&result.sources);
+                }
                 emit_stage_event_controlled(
                     app,
                     request_id,
@@ -6458,7 +6890,17 @@ async fn resolve_enabled_agents(
         let deep_outcome = match report.as_ref() {
             Some(report) => voxgolem_core::assistant::DeepOutcome::Success(
                 voxgolem_core::assistant::DeepReport {
-                    answer: voxgolem_core::assistant::Content::Text(report.complete_answer.clone()),
+                    answer: search_result.map_or_else(
+                        || voxgolem_core::assistant::Content::Text(report.complete_answer.clone()),
+                        |result| {
+                            search_runtime::persisted_content(
+                                voxgolem_core::assistant::Content::Text(
+                                    report.complete_answer.clone(),
+                                ),
+                                &result.sources,
+                            )
+                        },
+                    ),
                 },
             ),
             None => voxgolem_core::assistant::DeepOutcome::Failure(String::from(
@@ -6573,26 +7015,33 @@ async fn resolve_enabled_agents(
     };
     let review_input =
         fit_review_history_to_prompt_budget(voxgolem_core::agent_pipeline::ReviewInput {
-            original_request: request.prompt.clone(),
+            original_request: search_result.map_or_else(
+                || request.prompt.clone(),
+                |result| search_runtime::deep_request(&request.prompt, result),
+            ),
             canonical_history: agent_history(&request.history),
             instant: instant_status,
             deep: deep_status,
             materiality_policy: String::from(
                 "Only material factual defects justify rewrite; style-only differences are KEEP.",
             ),
-            sources: deep_report
-                .as_ref()
-                .map(|report| {
-                    report
-                        .sources
-                        .iter()
-                        .map(|source| voxgolem_core::agent_pipeline::SourceEvidence {
-                            url: source.url.clone(),
-                            title: source.title.clone(),
+            sources: search_result
+                .map(|result| search_runtime::source_links(&result.sources))
+                .unwrap_or_else(|| {
+                    deep_report
+                        .as_ref()
+                        .map(|report| {
+                            report
+                                .sources
+                                .iter()
+                                .map(|source| voxgolem_core::agent_pipeline::SourceEvidence {
+                                    url: source.url.clone(),
+                                    title: source.title.clone(),
+                                })
+                                .collect()
                         })
-                        .collect()
-                })
-                .unwrap_or_default(),
+                        .unwrap_or_default()
+                }),
         })?;
     let review_prompt = voxgolem_core::agent_pipeline::typed_review_prompt(&review_input);
     let review_started = Instant::now();
@@ -6674,7 +7123,10 @@ async fn resolve_enabled_agents(
             replacement,
             correction,
         } => (
-            voxgolem_core::assistant::ReviewDecision::Rewrite(replacement.clone()),
+            voxgolem_core::assistant::ReviewDecision::Rewrite(search_result.map_or_else(
+                || replacement.clone(),
+                |result| search_runtime::persisted_content(replacement.clone(), &result.sources),
+            )),
             Some((replacement, correction)),
         ),
     };
@@ -6760,12 +7212,12 @@ fn instant_telemetry_identity(
         ),
         InstantModel::CustomSolHigh => (
             telemetry::Provider::Custom,
-            "gpt-6-sol",
+            "gpt-6.1-sol",
             telemetry::InferenceProvider::Remote,
         ),
         InstantModel::CustomSolNone => (
             telemetry::Provider::Custom,
-            "gpt-6-sol",
+            "gpt-6.1-sol",
             telemetry::InferenceProvider::Remote,
         ),
         InstantModel::CustomLunaNone => (
@@ -6780,7 +7232,7 @@ fn instant_telemetry_identity(
         ),
         InstantModel::OpenCodeSolHigh => (
             telemetry::Provider::OpenCode,
-            "gpt-6-sol",
+            "gpt-6.1-sol",
             telemetry::InferenceProvider::Remote,
         ),
         InstantModel::OpenCodeLunaLow => (
@@ -6802,7 +7254,7 @@ fn agent_telemetry_identity(
     match model {
         AgentModel::CustomSolHigh => (
             telemetry::Provider::Custom,
-            "gpt-6-sol",
+            "gpt-6.1-sol",
             telemetry::InferenceProvider::Remote,
         ),
         AgentModel::CustomLunaLow => (
@@ -6812,7 +7264,7 @@ fn agent_telemetry_identity(
         ),
         AgentModel::OpenCodeSolHigh => (
             telemetry::Provider::OpenCode,
-            "gpt-6-sol",
+            "gpt-6.1-sol",
             telemetry::InferenceProvider::Remote,
         ),
         AgentModel::OpenCodeLunaLow => (
@@ -7161,51 +7613,73 @@ fn emit_prompt_event_controlled(
     generation: u64,
     event: PromptExecutionEventPayload,
 ) -> Result<(), PromptControlError> {
-    let terminal = matches!(&event, PromptExecutionEventPayload::Cancelled { .. });
     let state = app.state::<AppState>();
-    let _publication_guard = state.prompt_publication_gate.lock().map_err(|_| {
-        PromptControlError::Error(String::from("prompt publication gate is poisoned"))
-    })?;
-    let (updates, execution_id) = {
-        let active = state.active_prompt.lock().map_err(|_| {
-            PromptControlError::Error(String::from("active prompt lock is poisoned"))
+    state
+        .conversation
+        .publish(request_id, generation, event, |current| {
+            cancel_matching_prompt_tts(Some(current), &current.request_id, || {
+                cancel_active_tts_generation(&state)
+            });
+            repair_cancelled_prompt_runtime(&state);
+        })
+}
+
+impl DesktopConversationRuntime {
+    fn publish(
+        &self,
+        request_id: &str,
+        generation: u64,
+        event: PromptExecutionEventPayload,
+        repair: impl FnOnce(&ActivePrompt),
+    ) -> Result<(), PromptControlError> {
+        let terminal = matches!(&event, PromptExecutionEventPayload::Cancelled { .. });
+        let state = self;
+        let _publication_guard = state.prompt_publication_gate.lock().map_err(|_| {
+            PromptControlError::Error(String::from("prompt publication gate is poisoned"))
         })?;
-        let Some(active) = active
-            .as_ref()
-            .filter(|active| prompt_event_identity_matches(active, request_id, generation))
-        else {
-            return Err(PromptControlError::Cancelled);
-        };
-        if terminal {
-            if !claim_cancelled_prompt_publication(active) {
+        let (updates, execution_id) = {
+            let active = state.active_prompt.lock().map_err(|_| {
+                PromptControlError::Error(String::from("active prompt lock is poisoned"))
+            })?;
+            let Some(active) = active
+                .as_ref()
+                .filter(|active| prompt_event_identity_matches(active, request_id, generation))
+            else {
+                return Err(PromptControlError::Cancelled);
+            };
+            if terminal {
+                if !claim_cancelled_prompt_publication(active) {
+                    return Err(PromptControlError::Cancelled);
+                }
+            } else if active.cancelled.load(Ordering::Acquire) {
                 return Err(PromptControlError::Cancelled);
             }
-        } else if active.cancelled.load(Ordering::Acquire) {
+            let updates = active
+                .updates
+                .lock()
+                .map_err(|_| {
+                    PromptControlError::Error(String::from(
+                        "prompt update channel lock is poisoned",
+                    ))
+                })?
+                .clone();
+            (updates, active.assistant_generation)
+        };
+        if terminal {
+            return Ok(());
+        }
+        let Some(updates) = updates else {
+            return Err(PromptControlError::Error(String::from(
+                "prompt update channel is unavailable",
+            )));
+        };
+        if updates.send(event).is_err() {
+            drop(_publication_guard);
+            let _ = self.cancel(execution_id, repair);
             return Err(PromptControlError::Cancelled);
         }
-        let updates = active
-            .updates
-            .lock()
-            .map_err(|_| {
-                PromptControlError::Error(String::from("prompt update channel lock is poisoned"))
-            })?
-            .clone();
-        (updates, active.assistant_generation)
-    };
-    if terminal {
-        return Ok(());
+        Ok(())
     }
-    let Some(updates) = updates else {
-        return Err(PromptControlError::Error(String::from(
-            "prompt update channel is unavailable",
-        )));
-    };
-    if updates.send(event).is_err() {
-        drop(_publication_guard);
-        let _ = cancel_assistant_request(&state, execution_id);
-        return Err(PromptControlError::Cancelled);
-    }
-    Ok(())
 }
 
 fn prompt_event_identity_matches(active: &ActivePrompt, request_id: &str, generation: u64) -> bool {
@@ -7217,29 +7691,37 @@ fn emit_terminal_prompt_event_controlled(
     active: &ActivePrompt,
     _event: PromptExecutionEventPayload,
 ) -> Result<(), PromptControlError> {
-    let state = app.state::<AppState>();
-    let _publication_guard = state.prompt_publication_gate.lock().map_err(|_| {
-        PromptControlError::Error(String::from("prompt publication gate is poisoned"))
-    })?;
-    let superseded = state
-        .active_prompt
-        .lock()
-        .map_err(|_| PromptControlError::Error(String::from("active prompt lock is poisoned")))?
-        .as_ref()
-        .is_some_and(|current| {
-            current.request_id == active.request_id && current.generation != active.generation
-        });
-    if superseded {
-        return Err(PromptControlError::Cancelled);
+    app.state::<AppState>()
+        .conversation
+        .publish_terminal(active)
+}
+
+impl DesktopConversationRuntime {
+    fn publish_terminal(&self, active: &ActivePrompt) -> Result<(), PromptControlError> {
+        let state = self;
+        let _publication_guard = state.prompt_publication_gate.lock().map_err(|_| {
+            PromptControlError::Error(String::from("prompt publication gate is poisoned"))
+        })?;
+        let superseded = state
+            .active_prompt
+            .lock()
+            .map_err(|_| PromptControlError::Error(String::from("active prompt lock is poisoned")))?
+            .as_ref()
+            .is_some_and(|current| {
+                current.request_id == active.request_id && current.generation != active.generation
+            });
+        if superseded {
+            return Err(PromptControlError::Cancelled);
+        }
+        if !claim_terminal_prompt_publication(
+            active,
+            state.prompt_publication_epoch.load(Ordering::Acquire),
+            state.active_prompt_generation.load(Ordering::Acquire),
+        ) {
+            return Err(PromptControlError::Cancelled);
+        }
+        Ok(())
     }
-    if !claim_terminal_prompt_publication(
-        active,
-        state.prompt_publication_epoch.load(Ordering::Acquire),
-        state.active_prompt_generation.load(Ordering::Acquire),
-    ) {
-        return Err(PromptControlError::Cancelled);
-    }
-    Ok(())
 }
 
 fn claim_cancelled_prompt_publication(active: &ActivePrompt) -> bool {
@@ -7609,31 +8091,49 @@ async fn cancel_prompt(
 }
 
 fn cancel_prompt_if_active(app_state: &AppState, request_id: &str) -> Result<bool, String> {
-    let Some(active) = app_state
-        .active_prompt
-        .lock()
-        .map_err(|_| String::from("active prompt lock is poisoned"))?
-        .as_ref()
-        .filter(|active| active.request_id == request_id)
-        .cloned()
-    else {
-        return Ok(false);
-    };
-    if !matches!(
-        cancel_assistant_request(app_state, active.assistant_generation),
-        voxgolem_core::conversation::SettlementResult::Applied(
-            voxgolem_core::conversation::AppliedOutcome::Cancelled
-        )
-    ) {
-        return Ok(false);
-    }
-    {
-        let _publication_guard = app_state
-            .prompt_publication_gate
+    app_state
+        .conversation
+        .cancel_if_active(request_id, |current| {
+            cancel_matching_prompt_tts(Some(current), &current.request_id, || {
+                cancel_active_tts_generation(app_state)
+            });
+            repair_cancelled_prompt_runtime(app_state);
+        })
+}
+
+impl DesktopConversationRuntime {
+    fn cancel_if_active(
+        &self,
+        request_id: &str,
+        repair: impl FnOnce(&ActivePrompt),
+    ) -> Result<bool, String> {
+        let app_state = self;
+        let Some(active) = app_state
+            .active_prompt
             .lock()
-            .map_err(|_| String::from("prompt publication gate is poisoned"))?;
+            .map_err(|_| String::from("active prompt lock is poisoned"))?
+            .as_ref()
+            .filter(|active| active.request_id == request_id)
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        if !matches!(
+            self.cancel(active.assistant_generation, repair),
+            voxgolem_core::conversation::SettlementResult::Applied(
+                voxgolem_core::conversation::AppliedOutcome::Cancelled
+            )
+        ) {
+            return Ok(false);
+        }
+        {
+            let _publication_guard = app_state
+                .prompt_publication_gate
+                .lock()
+                .map_err(|_| String::from("prompt publication gate is poisoned"))?;
+        }
+        Ok(true)
     }
-    Ok(true)
 }
 
 #[tauri::command]
@@ -7739,43 +8239,70 @@ fn mark_silence(
 #[tauri::command]
 async fn reset_session(
     app_state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<RuntimePhaseResponsePayload, String> {
-    let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
-    let _reset_guard = app_state.reset_operation_lock.lock().await;
-    cancel_active_tts_generation(&app_state);
-    ensure_startup_ready_for_prompt(&app_state.startup_state)?;
-    let reset_execution = reset_conversation_execution(
-        &app_state.prompt_publication_gate,
-        &app_state.prompt_publication_epoch,
-        &app_state.lifecycle_gate,
-        (&app_state.reset_in_progress, &app_state.prompt_cleanup),
-        &app_state.active_prompt,
-        &app_state.conversation_session,
-        || reset_voice_runtime_session(&app_state),
-    )?;
-    let _admission_guard = ResetAdmissionGuard {
-        lifecycle_gate: Arc::clone(&app_state.lifecycle_gate),
-        reset_in_progress: Arc::clone(&app_state.reset_in_progress),
-    };
-    let cleanup = reset_execution.cleanup;
-    reset_llama_session(&app_state)?;
-    reset_runtime_session(&app_state)?;
-    abort_prefetch(&app_state)?;
-    if let Some(cleanup) = cleanup {
-        cleanup.cancel_and_wait().await;
-    }
-    let has_opencode = app_state
-        .opencode_server
-        .lock()
-        .map_err(|_| String::from("opencode server lock is poisoned"))?
-        .is_some();
-    if has_opencode {
-        reset_opencode_session(&app_state).await?;
+    DesktopStageDispatcher { app_state, app }.reset().await
+}
+
+impl DesktopConversationRuntime {
+    fn begin_reset(
+        &self,
+        reset_voice: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(ResetConversationExecution, ResetAdmissionGuard), String> {
+        let execution = reset_conversation_execution(
+            &self.prompt_publication_gate,
+            &self.prompt_publication_epoch,
+            &self.lifecycle_gate,
+            (&self.reset_in_progress, &self.prompt_cleanup),
+            &self.active_prompt,
+            &self.conversation_session,
+            reset_voice,
+        )?;
+        Ok((
+            execution,
+            ResetAdmissionGuard {
+                lifecycle_gate: Arc::clone(&self.lifecycle_gate),
+                reset_in_progress: Arc::clone(&self.reset_in_progress),
+            },
+        ))
     }
 
-    Ok(RuntimePhaseResponsePayload {
-        ..current_runtime_phase_response(&app_state.voice_pipeline_state, None, None)?
-    })
+    async fn retire_search(&self) {
+        self.prompt_cleanup.wait().await;
+        self.search.shutdown().await;
+    }
+}
+
+impl DesktopStageDispatcher<'_> {
+    async fn reset(self) -> Result<RuntimePhaseResponsePayload, String> {
+        let app_state = self.app_state;
+        let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
+        let _reset_guard = app_state.reset_operation_lock.lock().await;
+        cancel_active_tts_generation(&app_state);
+        ensure_startup_ready_for_prompt(&app_state.startup_state)?;
+        let (reset_execution, _admission_guard) = app_state
+            .conversation
+            .begin_reset(|| reset_voice_runtime_session(&app_state))?;
+        let cleanup = reset_execution.cleanup;
+        reset_llama_session(&app_state)?;
+        reset_runtime_session(&app_state)?;
+        abort_prefetch(&app_state)?;
+        if let Some(cleanup) = cleanup {
+            cleanup.cancel_and_wait().await;
+        }
+        let has_opencode = app_state
+            .opencode_server
+            .lock()
+            .map_err(|_| String::from("opencode server lock is poisoned"))?
+            .is_some();
+        if has_opencode {
+            reset_opencode_session(&app_state).await?;
+        }
+
+        Ok(RuntimePhaseResponsePayload {
+            ..current_runtime_phase_response(&app_state.voice_pipeline_state, None, None)?
+        })
+    }
 }
 
 fn reset_runtime_session(app_state: &AppState) -> Result<(), String> {
@@ -8202,7 +8729,7 @@ fn queue_completion_request(
         .completion_generation
         .fetch_add(1, Ordering::SeqCst)
         .saturating_add(1);
-    let started_ms = current_time_ms()?;
+    let started = Instant::now();
     let update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
     *app_state
         .completion_update_guard
@@ -8219,7 +8746,7 @@ fn queue_completion_request(
             source,
             voice_session_id,
             prompt: prompt.clone(),
-            started_ms,
+            started,
         });
     request.request(backend_revision, prompt);
     Ok(())
@@ -8289,9 +8816,7 @@ async fn emit_completion_predictions(
                 input_tokens: None,
                 output_tokens: None,
                 duration_ms: Some(
-                    current_time_ms()
-                        .unwrap_or(request.started_ms)
-                        .saturating_sub(request.started_ms),
+                    u64::try_from(request.started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 ),
                 status: telemetry::Status::Ok,
                 error_category: telemetry::ErrorCategory::None,
@@ -8513,7 +9038,10 @@ fn queue_assistant_prefetch(
             .conversation_session
             .lock()
             .map_err(|_| String::from("assistant coordinator lock is poisoned"))?;
-        if coordinator.has_active_execution() || !coordinator.policy().prefetch_enabled {
+        if !search_runtime::queue_prefetch_eligible(
+            coordinator.policy(),
+            coordinator.has_active_execution(),
+        ) {
             return Ok(());
         }
         (
@@ -9378,8 +9906,13 @@ fn log_tts_runtime_event(enabled: bool, message: &str) {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct PersistedState {
+    web_enabled: Option<bool>,
+    speech_network_fallback: Option<bool>,
+    speech_language: SpeechChoice,
+    speech_tts_provider: SpeechChoice,
+    speech_tts_voice: SpeechChoice,
     selected_response_profile: Option<ResponseProfilePayload>,
     tts_enabled: Option<bool>,
     ui_text_size: Option<UiTextSizePayload>,
@@ -9393,6 +9926,11 @@ impl From<&voxgolem_core::ipc::ValidatedPreferences> for PersistedState {
     fn from(preferences: &voxgolem_core::ipc::ValidatedPreferences) -> Self {
         use voxgolem_core::ipc::{ResponseProfile, UiTextSize, UiTheme};
         Self {
+            web_enabled: Some(preferences.web_enabled),
+            speech_network_fallback: Some(preferences.speech_network_fallback),
+            speech_language: preferences.speech_language.clone(),
+            speech_tts_provider: preferences.speech_tts_provider.clone(),
+            speech_tts_voice: preferences.speech_tts_voice.clone(),
             selected_response_profile: Some(match preferences.response_profile {
                 ResponseProfile::Fast => ResponseProfilePayload::Fast,
                 ResponseProfile::Quality => ResponseProfilePayload::Quality,
@@ -9415,9 +9953,17 @@ impl From<&voxgolem_core::ipc::ValidatedPreferences> for PersistedState {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedStateWire {
+    web_enabled: Option<bool>,
+    speech_network_fallback: Option<bool>,
+    #[serde(default, skip_serializing_if = "speech_choice_is_empty")]
+    speech_language: SpeechChoice,
+    #[serde(default, skip_serializing_if = "speech_choice_is_empty")]
+    speech_tts_provider: SpeechChoice,
+    #[serde(default, skip_serializing_if = "speech_choice_is_empty")]
+    speech_tts_voice: SpeechChoice,
     auto_update_download: Option<bool>,
     auto_update_install: Option<bool>,
     selected_response_profile: Option<ResponseProfilePayload>,
@@ -9431,6 +9977,41 @@ struct PersistedStateWire {
     assistant_review_enabled: Option<bool>,
     assistant_prefetch: Option<bool>,
     assistant_completion: Option<bool>,
+}
+
+impl From<&PersistedState> for PersistedStateWire {
+    fn from(state: &PersistedState) -> Self {
+        let settings = state.assistant_settings;
+        Self {
+            web_enabled: state.web_enabled,
+            speech_network_fallback: state.speech_network_fallback,
+            speech_language: state.speech_language.clone(),
+            speech_tts_provider: state.speech_tts_provider.clone(),
+            speech_tts_voice: state.speech_tts_voice.clone(),
+            auto_update_download: state.auto_update_download,
+            auto_update_install: state.auto_update_install,
+            selected_response_profile: state.selected_response_profile,
+            tts_enabled: state.tts_enabled,
+            ui_text_size: state.ui_text_size,
+            ui_theme: state.ui_theme,
+            assistant_instant: settings.map(|settings| settings.instant),
+            assistant_deep: settings.map(|settings| settings.deep),
+            assistant_review: settings.map(|settings| settings.review),
+            assistant_deep_enabled: settings.map(|settings| settings.deep_enabled),
+            assistant_review_enabled: settings.map(|settings| settings.review_enabled),
+            assistant_prefetch: settings.map(|settings| settings.prefetch),
+            assistant_completion: settings.map(|settings| settings.completion),
+        }
+    }
+}
+
+fn speech_choice_is_empty(choice: &SpeechChoice) -> bool {
+    choice.as_str().is_empty()
+}
+
+fn serialize_persisted_state(state: &PersistedState) -> Result<String, String> {
+    toml::to_string(&PersistedStateWire::from(state))
+        .map_err(|error| format!("failed to serialize state.toml: {error}"))
 }
 
 fn parse_persisted_state(contents: &str) -> Result<PersistedState, String> {
@@ -9470,6 +10051,11 @@ fn parse_persisted_state(contents: &str) -> Result<PersistedState, String> {
         }
     };
     Ok(PersistedState {
+        web_enabled: wire.web_enabled,
+        speech_network_fallback: wire.speech_network_fallback,
+        speech_language: wire.speech_language,
+        speech_tts_provider: wire.speech_tts_provider,
+        speech_tts_voice: wire.speech_tts_voice,
         selected_response_profile: wire.selected_response_profile,
         tts_enabled: wire.tts_enabled,
         ui_text_size: wire.ui_text_size,
@@ -9581,45 +10167,7 @@ fn persist_state(state: PersistedState) -> Result<(), String> {
         })?;
     }
 
-    let mut lines = Vec::<String>::new();
-    if let Some(profile) = state.selected_response_profile {
-        lines.push(format!(
-            "selected_response_profile = \"{}\"",
-            profile.as_str()
-        ));
-    }
-    if let Some(tts_enabled) = state.tts_enabled {
-        lines.push(format!("tts_enabled = {tts_enabled}"));
-    }
-    if let Some(enabled) = state.auto_update_download {
-        lines.push(format!("auto_update_download = {enabled}"));
-    }
-    if let Some(enabled) = state.auto_update_install {
-        lines.push(format!("auto_update_install = {enabled}"));
-    }
-    if let Some(ui_text_size) = state.ui_text_size {
-        lines.push(format!("ui_text_size = \"{}\"", ui_text_size.as_str()));
-    }
-    if let Some(ui_theme) = state.ui_theme {
-        lines.push(format!("ui_theme = \"{}\"", ui_theme.as_str()));
-    }
-    if let Some(settings) = state.assistant_settings {
-        lines.extend([
-            format!("assistant_instant = \"{}\"", settings.instant.as_str()),
-            format!("assistant_deep = \"{}\"", settings.deep.as_str()),
-            format!("assistant_review = \"{}\"", settings.review.as_str()),
-            format!("assistant_deep_enabled = {}", settings.deep_enabled),
-            format!("assistant_review_enabled = {}", settings.review_enabled),
-            format!("assistant_prefetch = {}", settings.prefetch),
-            format!("assistant_completion = {}", settings.completion),
-        ]);
-    }
-
-    let contents = if lines.is_empty() {
-        String::new()
-    } else {
-        format!("{}\n", lines.join("\n"))
-    };
+    let contents = serialize_persisted_state(&state)?;
 
     let result = atomic_replace_state_file(&state_path, contents.as_bytes());
     if let Err(error) = result {
@@ -10482,7 +11030,19 @@ fn append_telemetry(
 }
 
 fn initialize_app_state(init: AppStateInit) -> AppState {
+    let persisted = load_persisted_state().unwrap_or_else(|error| {
+        eprintln!("failed to read network preferences: {error}");
+        PersistedState::default()
+    });
+    let network_preferences = resolve_network_preferences(
+        init.runtime_config
+            .as_ref()
+            .is_none_or(|config| config.web_enabled),
+        &persisted,
+    );
     AppState {
+        conversation: DesktopConversationRuntime::new(init.lifecycle_gate, init.assistant_policy),
+        network_preferences: Arc::new(Mutex::new(network_preferences)),
         startup_state: init.startup_state,
         runtime_config: init.runtime_config,
         custom_auth_source_path: init.custom_auth_source_path,
@@ -10517,20 +11077,9 @@ fn initialize_app_state(init: AppStateInit) -> AppState {
         completion_request: Arc::new(Mutex::new(None)),
         completion_context: Arc::new(Mutex::new(None)),
         completion_generation: AtomicU64::new(0),
-        lifecycle_gate: init.lifecycle_gate,
         completion_lifecycle_lock: Arc::new(Mutex::new(())),
         telemetry_sink: init.telemetry_sink,
-        conversation_session: Arc::new(Mutex::new(
-            voxgolem_core::conversation::ConversationSession::new(init.assistant_policy),
-        )),
-        assistant_settings_generation: Arc::new(AtomicU64::new(0)),
-        settings_publication_in_progress: Arc::new(AtomicBool::new(false)),
-        reset_in_progress: Arc::new(AtomicBool::new(false)),
-        reset_operation_lock: tokio::sync::Mutex::new(()),
-        prompt_cleanup: Arc::new(PromptCleanupTracker::default()),
         prefetch_cleanup: Arc::new(PromptCleanupTracker::default()),
-        prompt_publication_gate: Arc::new(Mutex::new(())),
-        prompt_publication_epoch: Arc::new(AtomicU64::new(0)),
         tts_operation_lock: tokio::sync::Mutex::new(()),
         tts_startup_generation: Arc::new(AtomicU64::new(0)),
         local_tts_runtime: Arc::new(Mutex::new(init.local_tts_runtime.map(Arc::new))),
@@ -10538,8 +11087,6 @@ fn initialize_app_state(init: AppStateInit) -> AppState {
         llama_cpp_conversation: Mutex::new(Vec::new()),
         llama_cpp_system_prompt: init.llama_cpp_system_prompt,
         opencode_server: Arc::new(Mutex::new(None)),
-        active_prompt: Arc::new(Mutex::new(None)),
-        active_prompt_generation: AtomicU64::new(0),
         prefetch_generation: Arc::new(AtomicU64::new(0)),
         prefetch_cache: Arc::new(Mutex::new(None)),
         prefetch_task: Arc::new(Mutex::new(None)),
@@ -11743,7 +12290,8 @@ fn llama_cpp_input_token_limit() -> usize {
 }
 
 fn estimate_llama_input_tokens(system_prompt: &str, user_prompt: &str) -> usize {
-    estimate_text_tokens(system_prompt)
+    let system_prompt = voxgolem_core::response_style::compose_instructions(system_prompt);
+    estimate_text_tokens(&system_prompt)
         .saturating_add(estimate_text_tokens(user_prompt))
         .saturating_add(LLAMA_CPP_CHAT_WRAPPER_TOKENS)
 }
@@ -11922,7 +12470,7 @@ async fn shutdown_runtime(app_state: &AppState) {
                 let _ = cancel_prompt_if_active(app_state, &request_id);
             }
             shutdown_prefetch(app_state).await;
-            app_state.prompt_cleanup.wait().await;
+            app_state.conversation.retire_search().await;
             app_state.prefetch_cleanup.wait().await;
             shutdown_llama_startups_for_exit(app_state);
             shutdown_llama_cpp_runtime_for_exit(app_state);
@@ -12340,6 +12888,7 @@ pub fn run() {
             label_wake_clip,
             delete_wake_clip,
             submit_prompt,
+            set_search_mode,
             cancel_prompt,
             record_speech_activity,
             ingest_audio_frame,
@@ -12770,6 +13319,99 @@ mod tests {
     }
 
     #[test]
+    fn speech_startup_metadata_reports_engines_without_model_paths_or_provider_inference() {
+        let _appdata_lock = APPDATA_ENV_LOCK.lock().expect("APPDATA test lock");
+        let temp_dir = tempfile::tempdir().expect("synthetic app data directory");
+        let previous_appdata = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", temp_dir.path());
+        let mut state = missing_llama_app_state(std::path::Path::new("/synthetic/private-models"));
+        match previous_appdata {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+        if let StartupStatePayload::Ready { capabilities, .. } =
+            &mut *state.startup_state.lock().expect("startup state")
+        {
+            capabilities.push(CapabilityPayload {
+                id: "tts",
+                state: CapabilityStatePayload::Available,
+                reason: String::from("ready"),
+                actual_provider: Some("cuda"),
+            });
+        }
+        let payload = serde_json::to_value(super::get_startup_state_from_state(&state))
+            .expect("startup metadata should serialize");
+        assert_eq!(payload["kind"], "ready");
+        assert_eq!(
+            payload["speech_services"]["stt"]["configured_engine"],
+            "Parakeet"
+        );
+        assert_eq!(
+            payload["speech_services"]["tts"]["configured_engine"],
+            "Piper ONNX"
+        );
+        for service in ["stt", "tts"] {
+            for field in [
+                "runtime_engine",
+                "configured_model",
+                "configured_voice",
+                "configured_locale",
+            ] {
+                assert!(payload["speech_services"][service][field].is_null());
+            }
+        }
+        assert!(!payload["speech_services"]
+            .to_string()
+            .contains("private-models"));
+
+        state
+            .runtime_config
+            .as_mut()
+            .expect("synthetic config")
+            .capability_issues
+            .push(voxgolem_core::config::CapabilityConfigIssue {
+                capability: "tts",
+                reason: String::from("synthetic configured asset is missing"),
+            });
+        let payload = serde_json::to_value(super::get_startup_state_from_state(&state))
+            .expect("unavailable configured metadata should serialize");
+        assert_eq!(
+            payload["speech_services"]["tts"]["configured_engine"],
+            "Piper ONNX"
+        );
+        assert!(payload["speech_services"]["tts"]["runtime_engine"].is_null());
+
+        state
+            .runtime_config
+            .as_mut()
+            .expect("synthetic config")
+            .capability_issues
+            .push(voxgolem_core::config::CapabilityConfigIssue {
+                capability: "tts",
+                reason: String::from("not configured"),
+            });
+        let payload = serde_json::to_value(super::get_startup_state_from_state(&state))
+            .expect("unconfigured metadata should serialize");
+        assert!(payload["speech_services"]["tts"]["configured_engine"].is_null());
+        state
+            .runtime_config
+            .as_mut()
+            .expect("synthetic config")
+            .capability_issues
+            .push(voxgolem_core::config::CapabilityConfigIssue {
+                capability: "parakeet",
+                reason: String::from("not configured"),
+            });
+        let payload = serde_json::to_value(super::get_startup_state_from_state(&state))
+            .expect("unconfigured recognition metadata should serialize");
+        assert!(payload["speech_services"]["stt"]["configured_engine"].is_null());
+        state.runtime_config = None;
+        let payload = serde_json::to_value(super::get_startup_state_from_state(&state))
+            .expect("missing metadata should serialize");
+        assert!(payload.get("speech_services").is_none());
+    }
+
+    #[test]
     fn ipc_app_snapshot_maps_one_reachable_desktop_state() {
         let mut session = voxgolem_core::conversation::ConversationSession::new(
             AssistantSettingsPayload {
@@ -12827,6 +13469,13 @@ mod tests {
                 theme: UiThemePayload::Light,
                 text_size: UiTextSizePayload::Large,
             },
+            super::NetworkPreferences {
+                web_enabled: false,
+                speech_network_fallback: false,
+                speech_language: super::validated_ipc_text("synthetic-language"),
+                speech_tts_provider: super::validated_ipc_text("synthetic-tts"),
+                speech_tts_voice: super::validated_ipc_text("synthetic-voice"),
+            },
         );
 
         assert_eq!(snapshot.session_id.as_str(), "1");
@@ -12849,6 +13498,20 @@ mod tests {
             voxgolem_core::ipc::ResponseProfile::Quality
         );
         assert!(snapshot.preferences.tts_enabled);
+        assert!(!snapshot.preferences.web_enabled);
+        assert!(!snapshot.preferences.speech_network_fallback);
+        assert_eq!(
+            snapshot.preferences.speech_language.as_str(),
+            "synthetic-language"
+        );
+        assert_eq!(
+            snapshot.preferences.speech_tts_provider.as_str(),
+            "synthetic-tts"
+        );
+        assert_eq!(
+            snapshot.preferences.speech_tts_voice.as_str(),
+            "synthetic-voice"
+        );
         assert_eq!(
             snapshot.preferences.ui_theme,
             voxgolem_core::ipc::UiTheme::Light
@@ -12952,6 +13615,11 @@ mod tests {
             .expect("initial snapshot")
             .preferences;
         requested.completion = false;
+        requested.web_enabled = false;
+        requested.speech_network_fallback = false;
+        requested.speech_language = super::validated_ipc_text("synthetic-language");
+        requested.speech_tts_provider = super::validated_ipc_text("synthetic-tts");
+        requested.speech_tts_voice = super::validated_ipc_text("synthetic-voice");
         requested.ui_theme = voxgolem_core::ipc::UiTheme::Light;
         requested.ui_text_size = voxgolem_core::ipc::UiTextSize::ExtraLarge;
 
@@ -13011,6 +13679,136 @@ mod tests {
         assert_eq!(persisted.tts_enabled, Some(false));
         assert!(state.tts_playback.lock().unwrap().current_id.is_none());
         assert!(super::ensure_tts_playback_current(&state.tts_playback, playback_id).is_err());
+    }
+
+    #[test]
+    fn network_preferences_default_from_config_and_saved_settings_override_without_resetting_old_payloads(
+    ) {
+        let old = super::parse_persisted_state("").unwrap();
+        assert_eq!(
+            super::resolve_network_preferences(true, &old),
+            super::NetworkPreferences::default()
+        );
+        assert!(!super::resolve_network_preferences(false, &old).web_enabled);
+        for web in [false, true] {
+            for speech in [false, true] {
+                let persisted = super::parse_persisted_state(&format!(
+                    "web_enabled = {web}\nspeech_network_fallback = {speech}\n"
+                ))
+                .unwrap();
+                let resolved = super::resolve_network_preferences(!web, &persisted);
+                assert_eq!(resolved.web_enabled, web);
+                assert_eq!(resolved.speech_network_fallback, speech);
+            }
+        }
+    }
+
+    #[test]
+    fn persisted_speech_choices_round_trip_through_the_real_toml_path_with_escaping_and_byte_bounds(
+    ) {
+        for value in [
+            "synthetic \"quoted\" \\ voice\n界🧪".to_owned(),
+            "🧪".repeat(128),
+        ] {
+            let choice = super::SpeechChoice::new(value).unwrap();
+            let state = PersistedState {
+                web_enabled: Some(false),
+                speech_network_fallback: Some(false),
+                speech_language: choice.clone(),
+                speech_tts_provider: choice.clone(),
+                speech_tts_voice: choice,
+                ..PersistedState::default()
+            };
+            let wire = super::serialize_persisted_state(&state).unwrap();
+            let parsed = super::parse_persisted_state(&wire).unwrap();
+            assert_eq!(parsed, state);
+            let resolved = super::resolve_network_preferences(true, &parsed);
+            assert_eq!(resolved.speech_language, state.speech_language);
+            assert_eq!(resolved.speech_tts_provider, state.speech_tts_provider);
+            assert_eq!(resolved.speech_tts_voice, state.speech_tts_voice);
+            assert!(!resolved.web_enabled);
+            assert!(!resolved.speech_network_fallback);
+        }
+        for field in ["speech_language", "speech_tts_provider", "speech_tts_voice"] {
+            for invalid in [
+                "true".to_owned(),
+                "1".to_owned(),
+                "[]".to_owned(),
+                "null".to_owned(),
+                format!("\"{}\"", "🧪".repeat(129)),
+            ] {
+                assert!(
+                    super::parse_persisted_state(&format!("{field} = {invalid}\n")).is_err(),
+                    "{field} must retain its bounded string contract"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_speech_choices_default_independently_without_erasing_a_saved_sibling() {
+        assert_eq!(
+            super::serialize_persisted_state(&PersistedState::default()).unwrap(),
+            ""
+        );
+        let empty =
+            super::resolve_network_preferences(true, &super::parse_persisted_state("").unwrap());
+        assert!(empty.speech_language.as_str().is_empty());
+        assert!(empty.speech_tts_provider.as_str().is_empty());
+        assert!(empty.speech_tts_voice.as_str().is_empty());
+        for field in ["speech_language", "speech_tts_provider", "speech_tts_voice"] {
+            let state = super::parse_persisted_state(&format!("web_enabled = false\nspeech_network_fallback = false\n{field} = \"synthetic-saved-choice\"\n")).unwrap();
+            let resolved = super::resolve_network_preferences(true, &state);
+            for (name, choice) in [
+                ("speech_language", resolved.speech_language),
+                ("speech_tts_provider", resolved.speech_tts_provider),
+                ("speech_tts_voice", resolved.speech_tts_voice),
+            ] {
+                assert_eq!(
+                    choice.as_str(),
+                    if name == field {
+                        "synthetic-saved-choice"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            assert!(!resolved.web_enabled);
+            assert!(!resolved.speech_network_fallback);
+        }
+    }
+
+    #[test]
+    fn unrelated_saved_preferences_preserve_bounded_speech_choices_and_network_flags() {
+        let _appdata_lock = APPDATA_ENV_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let previous_appdata = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", root.path());
+        let saved = PersistedState {
+            web_enabled: Some(false),
+            speech_network_fallback: Some(false),
+            speech_language: super::validated_ipc_text("synthetic-language"),
+            speech_tts_provider: super::validated_ipc_text("synthetic-tts"),
+            speech_tts_voice: super::validated_ipc_text("synthetic \"voice\" \\ 界"),
+            ..PersistedState::default()
+        };
+        persist_state(saved.clone()).unwrap();
+        super::persist_tts_enabled(false).unwrap();
+        super::persist_ui_theme(UiThemePayload::Light).unwrap();
+        super::persist_selected_response_profile(ResponseProfilePayload::Quality).unwrap();
+        let reloaded = load_persisted_state().unwrap();
+        match previous_appdata {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+        assert_eq!(reloaded.speech_language, saved.speech_language);
+        assert_eq!(reloaded.speech_tts_provider, saved.speech_tts_provider);
+        assert_eq!(reloaded.speech_tts_voice, saved.speech_tts_voice);
+        assert_eq!(reloaded.web_enabled, saved.web_enabled);
+        assert_eq!(
+            reloaded.speech_network_fallback,
+            saved.speech_network_fallback
+        );
     }
 
     #[test]
@@ -13463,6 +14261,7 @@ mod tests {
         let fast_model = root.join("fast.gguf");
         let quality_model = root.join("quality.gguf");
         state.runtime_config = Some(voxgolem_core::config::RuntimeConfig {
+            web_enabled: true,
             wake_word_model_path: root.join("wake.onnx"),
             parakeet_model_dir: root.join("parakeet"),
             silero_vad_model: root.join("vad.onnx"),
@@ -13834,6 +14633,7 @@ mod tests {
                 theme: UiThemePayload::Dark,
                 text_size: UiTextSizePayload::Medium,
             },
+            super::NetworkPreferences::default(),
         );
         let quality = snapshot
             .model_options
@@ -14556,6 +15356,35 @@ mod tests {
     }
 
     #[test]
+    fn request_admission_captures_network_permission_instead_of_reading_mutable_settings_later() {
+        let _appdata_lock = APPDATA_ENV_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let previous_appdata = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", root.path());
+        let state = super::build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            super::embedded_cue_asset_paths(),
+            "Synthetic configuration".into(),
+        );
+        state.network_preferences.lock().unwrap().web_enabled = false;
+        let registered = super::begin_registered_assistant_request(
+            &state,
+            "synthetic-request",
+            "Synthetic question",
+            super::CompletionSource::Typed,
+        )
+        .unwrap();
+        state.network_preferences.lock().unwrap().web_enabled = true;
+        assert!(!registered.request.web_enabled);
+        assert!(state.network_preferences.lock().unwrap().web_enabled);
+        drop(registered);
+        match previous_appdata {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+    }
+
+    #[test]
     fn user_media_policy_matches_only_trusted_origins() {
         assert!(allows_user_media_from_uri(
             Some("tauri://localhost/route?q=1#f"),
@@ -14666,10 +15495,10 @@ mod tests {
         use voxgolem_core::assistant::{AgentModel, InstantModel};
 
         for model in [InstantModel::CustomSolHigh, InstantModel::OpenCodeSolHigh] {
-            assert_eq!(super::instant_telemetry_identity(model).1, "gpt-6-sol");
+            assert_eq!(super::instant_telemetry_identity(model).1, "gpt-6.1-sol");
         }
         for model in [AgentModel::CustomSolHigh, AgentModel::OpenCodeSolHigh] {
-            assert_eq!(super::agent_telemetry_identity(model).1, "gpt-6-sol");
+            assert_eq!(super::agent_telemetry_identity(model).1, "gpt-6.1-sol");
         }
     }
 
@@ -17172,6 +18001,11 @@ mod tests {
         let previous_appdata = std::env::var_os("APPDATA");
         std::env::set_var("APPDATA", temp_dir.path());
         let previous = PersistedState {
+            web_enabled: Some(true),
+            speech_network_fallback: Some(true),
+            speech_language: super::validated_ipc_text("synthetic-old-language"),
+            speech_tts_provider: super::validated_ipc_text("synthetic-old-tts"),
+            speech_tts_voice: super::validated_ipc_text("synthetic-old-voice"),
             auto_update_download: Some(false),
             auto_update_install: Some(true),
             selected_response_profile: Some(ResponseProfilePayload::Fast),
@@ -17180,8 +18014,13 @@ mod tests {
             ui_theme: Some(UiThemePayload::Light),
             assistant_settings: Some(AssistantSettingsPayload::default()),
         };
-        persist_state(previous).expect("previous state should persist");
+        persist_state(previous.clone()).expect("previous state should persist");
         let preferences = voxgolem_core::ipc::ValidatedPreferences {
+            web_enabled: false,
+            speech_network_fallback: false,
+            speech_language: super::validated_ipc_text("synthetic-language"),
+            speech_tts_provider: super::validated_ipc_text("synthetic-tts"),
+            speech_tts_voice: super::validated_ipc_text("synthetic-voice"),
             instant: voxgolem_core::ipc::InstantModelChoice::CustomLunaLow,
             deep: voxgolem_core::ipc::AgentModelChoice::CustomSolHigh,
             review: voxgolem_core::ipc::AgentModelChoice::OpenCodeLunaLow,
@@ -17207,6 +18046,11 @@ mod tests {
         assert_eq!(
             persisted,
             PersistedState {
+                web_enabled: Some(false),
+                speech_network_fallback: Some(false),
+                speech_language: preferences.speech_language.clone(),
+                speech_tts_provider: preferences.speech_tts_provider.clone(),
+                speech_tts_voice: preferences.speech_tts_voice.clone(),
                 selected_response_profile: Some(ResponseProfilePayload::Quality),
                 auto_update_download: Some(false),
                 auto_update_install: Some(true),
@@ -18341,7 +19185,7 @@ mod tests {
                 source: super::CompletionSource::Typed,
                 voice_session_id: None,
                 prompt: String::from("synthetic draft"),
-                started_ms: 100,
+                started: std::time::Instant::now(),
             });
         let prefetch_generation = state.prefetch_generation.load(Ordering::SeqCst);
 

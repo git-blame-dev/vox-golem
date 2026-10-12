@@ -32,6 +32,9 @@ internal object CaptureWire {
         val sessionId: String,
         val format: CaptureFormat,
         val startedAt: String,
+        val purpose: CapturePurpose = CapturePurpose.NOTE,
+        val requestedLanguage: String? = null,
+        val speechNetworkFallback: Boolean = false,
     )
 
     data class ArchiveHeader(
@@ -49,6 +52,9 @@ internal object CaptureWire {
         val createdAtUtc: String? = null,
         val startedAtUtc: String? = null,
         val finishedAtUtc: String? = null,
+        val purpose: CapturePurpose = CapturePurpose.NOTE,
+        val requestedLanguage: String? = null,
+        val speechNetworkFallback: Boolean = false,
     )
 
     fun readJsonHeader(input: DataInputStream, maximum: Int): JSONObject {
@@ -68,10 +74,13 @@ internal object CaptureWire {
         sessionId = json.optString("sessionId"),
         format = formatFrom(json),
         startedAt = json.optString("startedAt"),
+        purpose = purposeFrom(json), requestedLanguage = languageFrom(json), speechNetworkFallback = fallbackFrom(json),
     )
 
     fun validLiveStart(header: LiveHeader, captureId: String, sessionId: String): Boolean =
         header.protocol == PROTOCOL && header.captureId == captureId && header.sessionId == sessionId &&
+            header.purpose == CapturePurpose.NOTE &&
+            CaptureProtocol.validateRequestedLanguage(header.requestedLanguage) &&
             CaptureProtocol.validateFormat(header.format) && runCatching { Instant.parse(header.startedAt) }.isSuccess
 
     fun formatFrom(json: JSONObject): CaptureFormat = CaptureFormat(
@@ -95,10 +104,13 @@ internal object CaptureWire {
         createdAtUtc = json.optString("createdAtUtc").takeIf(String::isNotBlank),
         startedAtUtc = json.optString("startedAtUtc").takeIf(String::isNotBlank),
         finishedAtUtc = json.optString("finishedAtUtc").takeIf(String::isNotBlank),
+        purpose = purposeFrom(json), requestedLanguage = languageFrom(json), speechNetworkFallback = fallbackFrom(json),
     )
 
     fun validArchiveHeader(header: ArchiveHeader, captureId: String, attemptId: String): Boolean {
         if (header.protocol != PROTOCOL || header.captureId != captureId || header.attemptId != attemptId ||
+            header.purpose != CapturePurpose.NOTE ||
+            !CaptureProtocol.validateRequestedLanguage(header.requestedLanguage) ||
             !CaptureProtocol.validateFormat(header.format) ||
             header.captureState !in setOf(CaptureState.SAVED, CaptureState.INTERRUPTED) ||
             (header.stopReason?.length ?: 0) > 160 ||
@@ -110,5 +122,22 @@ internal object CaptureWire {
             header.wavBytes == 44L + header.frameCount * alignment &&
             header.sha256.matches(Regex("(?i)^[0-9a-f]{64}$")) &&
             runCatching { LocalDate.parse(header.finishDate); ZoneId.of(header.timezone) }.isSuccess
+    }
+
+    private fun purposeFrom(json: JSONObject): CapturePurpose =
+        if (!json.has("purpose")) CapturePurpose.NOTE else CapturePurpose.valueOf(json.getString("purpose"))
+
+    private fun languageFrom(json: JSONObject): String? {
+        if (!json.has("requestedLanguage") || json.isNull("requestedLanguage")) return null
+        val value = json.getString("requestedLanguage")
+        require(CaptureProtocol.validateRequestedLanguage(value)) { "invalid-capture-language" }
+        return value
+    }
+
+    private fun fallbackFrom(json: JSONObject): Boolean {
+        if (!json.has("speechNetworkFallback")) return false
+        val value = json.get("speechNetworkFallback")
+        require(value is Boolean) { "invalid-capture-speech-policy" }
+        return value == true
     }
 }

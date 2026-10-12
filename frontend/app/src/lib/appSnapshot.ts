@@ -1,7 +1,9 @@
-import type { DeepChoice, InstantChoice, ReviewChoice } from './assistantSettings'
-import { invokeTauriCommand } from './tauri'
+import type { DeepChoice, InstantChoice, ReviewChoice, SpeechSelection } from './assistantSettings'
+import { parsePolicyBoolean, parseSpeechSelectionString } from './assistantSettings'
+import { invokeTauriCommand, isAndroidRuntime } from './tauri'
 import { isRecord, parseRuntimePhase, utf8ByteLength } from './wire'
 import type { BackendRuntimePhase, ResponseProfile, UiTextSize, UiTheme } from '../types/chat'
+import { INSTANT_CHOICES as instantChoices, AGENT_CHOICES as agentChoices } from './modelCatalog'
 
 const U64_MAX = 18_446_744_073_709_551_615n
 const CAPABILITY_ID_MAX_BYTES = 64
@@ -14,8 +16,6 @@ const COMMITTED_TURN_MAX_COUNT = 20
 const COMMITTED_TEXT_MAX_BYTES = 256 * 1024
 const stages = ['instant', 'deep', 'review'] as const
 const capabilityStates = ['available', 'warming', 'not_configured', 'unavailable', 'failed'] as const
-const instantChoices: readonly InstantChoice[] = ['local-fast', 'local-quality', 'custom-sol-high', 'custom-sol-none', 'custom-luna-none', 'custom-luna-low', 'opencode-sol-high', 'opencode-luna-low']
-const agentChoices: readonly DeepChoice[] = ['custom-sol-high', 'custom-luna-low', 'opencode-sol-high', 'opencode-luna-low']
 
 export type WireId = string
 export type Stage = typeof stages[number]
@@ -61,7 +61,7 @@ export interface ModelOption {
   readonly unavailableReason: string | null
 }
 
-export interface ValidatedPreferences {
+export interface ValidatedPreferences extends SpeechSelection {
   readonly instant: InstantChoice
   readonly deep: DeepChoice
   readonly review: ReviewChoice
@@ -69,6 +69,8 @@ export interface ValidatedPreferences {
   readonly reviewEnabled: boolean
   readonly prefetch: boolean
   readonly completion: boolean
+  readonly webEnabled: boolean
+  readonly speechNetworkFallback: boolean
   readonly responseProfile: ResponseProfile
   readonly ttsEnabled: boolean
   readonly uiTheme: UiTheme
@@ -83,9 +85,24 @@ export interface AppSnapshot {
   readonly capabilities: readonly Capability[]
   readonly modelOptions: readonly ModelOption[]
   readonly preferences: ValidatedPreferences
+  readonly assistant?: AndroidAssistantProjection
 }
 
-export function parseAppSnapshot(payload: unknown): AppSnapshot {
+export interface AndroidAssistantProjection {
+  readonly revision: string
+  readonly conversations: readonly { readonly id: string; readonly title: string }[]
+  readonly conversationCount: number
+  readonly conversationOffset: number
+  readonly selectedHead: string | null
+  readonly branchChoices: readonly string[]
+  readonly branchCount: number
+  readonly branchOffset: number
+  readonly draft: string
+  readonly interrupted: boolean
+  readonly error: string | null
+}
+
+export function parseAppSnapshot(payload: unknown, android = isAndroidRuntime): AppSnapshot {
   if (!isRecord(payload)) throw new Error('App snapshot must be an object')
   if (!Array.isArray(payload['transcript'])) throw new Error('App snapshot transcript must be an array')
   if (!Array.isArray(payload['capabilities'])) throw new Error('App snapshot capabilities must be an array')
@@ -95,18 +112,19 @@ export function parseAppSnapshot(payload: unknown): AppSnapshot {
   rejectDuplicateIds(capabilities, 'capability')
   const modelOptions = Array.from(payload['model_options'], parseModelOption)
   rejectDuplicateIds(modelOptions, 'model option')
-  const transcript = Array.from(payload['transcript'], parseCanonicalTurn)
+  const transcript = Array.from(payload['transcript'], (turn) => parseCanonicalTurn(turn, android))
   if (transcript.length > COMMITTED_TURN_MAX_COUNT || transcriptTextBytes(transcript) > COMMITTED_TEXT_MAX_BYTES) {
     throw new Error('App snapshot transcript exceeds canonical history bounds')
   }
   return {
-    sessionId: parseWireId(payload['session_id'], 'session_id'),
+    sessionId: parseWireId(payload['session_id'], 'session_id', android),
     runtimePhase: parseRuntimePhase(payload['runtime_phase'], 'runtime_phase'),
     transcript,
-    activeRequest: payload['active_request'] === null ? null : parseActiveRequest(payload['active_request']),
+    activeRequest: payload['active_request'] === null ? null : parseActiveRequest(payload['active_request'], android),
     capabilities,
     modelOptions,
     preferences: parsePreferences(payload['preferences']),
+    ...(android && payload['assistant'] !== undefined ? { assistant: parseAndroidAssistant(payload['assistant']) } : {}),
   }
 }
 
@@ -133,21 +151,26 @@ export function isExpectedCanonicalTurn(
   requestId: string,
   expectedSessionId: string | null,
   priorExecutions: ReadonlySet<string>,
+  allowNewConversation = false,
 ): boolean {
-  return expectedSessionId !== null && turn.requestId === requestId && turn.executionId.sessionId === expectedSessionId && !priorExecutions.has(canonicalExecutionKey(turn))
+  return expectedSessionId !== null && turn.requestId === requestId && (turn.executionId.sessionId === expectedSessionId || (allowNewConversation && expectedSessionId === '0')) && !priorExecutions.has(canonicalExecutionKey(turn))
 }
 
-function parseWireId(value: unknown, field: string): WireId {
+function parseWireId(value: unknown, field: string, android = false): WireId {
+  if (android && typeof value === 'string') {
+    const match = /^([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}):([1-9]\d*)$/.exec(value)
+    if (match !== null && BigInt(match[2]!) <= U64_MAX) return value
+  }
   if (typeof value !== 'string' || !/^(0|[1-9]\d*)$/.test(value)) throw new Error(`${field} must be a canonical unsigned decimal string`)
   if (BigInt(value) > U64_MAX) throw new Error(`${field} exceeds the u64 range`)
   return value
 }
 
-function parseExecutionId(value: unknown): ExecutionId {
+function parseExecutionId(value: unknown, android = false): ExecutionId {
   if (!isRecord(value)) throw new Error('execution_id must be an object')
   return {
-    sessionId: parseWireId(value['session_id'], 'execution_id.session_id'),
-    generation: parseWireId(value['generation'], 'execution_id.generation'),
+    sessionId: parseWireId(value['session_id'], 'execution_id.session_id', android),
+    generation: parseWireId(value['generation'], 'execution_id.generation', android),
   }
 }
 
@@ -158,22 +181,22 @@ function parseContent(value: unknown): MessageContent {
   return { kind: value['kind'], text: value['text'] }
 }
 
-function parseMessage(value: unknown): Message {
+function parseMessage(value: unknown, android = false): Message {
   if (!isRecord(value) || (value['role'] !== 'user' && value['role'] !== 'assistant')) throw new Error('message must include a supported role')
-  return { id: parseWireId(value['id'], 'message.id'), role: value['role'], content: parseContent(value['content']) }
+  return { id: parseWireId(value['id'], 'message.id', android), role: value['role'], content: parseContent(value['content']) }
 }
 
-export function parseCanonicalTurn(value: unknown): Turn {
+export function parseCanonicalTurn(value: unknown, android = false): Turn {
   if (!isRecord(value) || typeof value['request_id'] !== 'string' || value['request_id'].length === 0 || utf8ByteLength(value['request_id']) > REQUEST_ID_MAX_BYTES) throw new Error('turn must include a bounded request_id')
-  const user = parseMessage(value['user'])
-  const answer = parseMessage(value['answer'])
+  const user = parseMessage(value['user'], android)
+  const answer = parseMessage(value['answer'], android)
   if (user.role !== 'user') throw new Error('turn must include the user role')
   if (answer.role !== 'assistant') throw new Error('turn must include the assistant role')
   if (user.content.kind !== 'text' || user.content.text.trim().length === 0 || utf8ByteLength(user.content.text) > PROMPT_MAX_BYTES) throw new Error('turn user content must be a bounded prompt')
   if (utf8ByteLength(user.content.text) + utf8ByteLength(answer.content.text) > COMMITTED_TEXT_MAX_BYTES) throw new Error('turn content exceeds canonical history bounds')
   return {
     requestId: value['request_id'],
-    executionId: parseExecutionId(value['execution_id']),
+    executionId: parseExecutionId(value['execution_id'], android),
     user: user as Turn['user'],
     answer: answer as Turn['answer'],
     finalStage: parseStage(value['final_stage']),
@@ -184,11 +207,53 @@ function transcriptTextBytes(transcript: readonly Turn[]): number {
   return transcript.reduce((total, turn) => total + utf8ByteLength(turn.user.content.text) + utf8ByteLength(turn.answer.content.text), 0)
 }
 
-function parseActiveRequest(value: unknown): ActiveRequestSummary {
+function parseActiveRequest(value: unknown, android = false): ActiveRequestSummary {
   if (!isRecord(value) || typeof value['request_id'] !== 'string' || value['request_id'].length === 0 || utf8ByteLength(value['request_id']) > REQUEST_ID_MAX_BYTES || typeof value['prompt'] !== 'string' || value['prompt'].trim().length === 0 || utf8ByteLength(value['prompt']) > PROMPT_MAX_BYTES) {
     throw new Error('active_request must include a bounded request_id and prompt')
   }
-  return { executionId: parseExecutionId(value['execution_id']), requestId: value['request_id'], prompt: value['prompt'] }
+  return { executionId: parseExecutionId(value['execution_id'], android), requestId: value['request_id'], prompt: value['prompt'] }
+}
+
+function parseAndroidAssistant(value: unknown): AndroidAssistantProjection {
+  if (!isRecord(value) || !Array.isArray(value['conversations']) || value['conversations'].length > 128 || !Array.isArray(value['branch_choices']) || value['branch_choices'].length > 128 || typeof value['interrupted'] !== 'boolean') throw new Error('Android assistant projection is invalid')
+  const conversations = Array.from(value['conversations'], (item: unknown) => {
+    if (!isRecord(item)) throw new Error('Android conversation is invalid')
+    return { id: parseWireId(item['id'], 'conversation.id', true), title: parseBoundedString(item['title'], 256, 'conversation.title') }
+  })
+  rejectDuplicateIds(conversations, 'conversation')
+  const branches = Array.from(value['branch_choices'], (id: unknown) => parseWireId(id, 'branch choice', true))
+  if (new Set(branches).size !== branches.length) throw new Error('Android branch choices contain duplicate IDs')
+  const count = value['conversation_count'] ?? conversations.length
+  if (!Number.isSafeInteger(count) || (count as number) < conversations.length || (count as number) > 16_384) throw new Error('Android conversation count is invalid')
+  const offset = value['conversation_offset'] ?? conversations.length
+  if (!Number.isSafeInteger(offset) || (offset as number) < 0 || (offset as number) > (count as number)) throw new Error('Android conversation offset is invalid')
+  const branchCount = value['branch_count'] ?? branches.length
+  const branchOffset = value['branch_offset'] ?? branches.length
+  if (!Number.isSafeInteger(branchCount) || (branchCount as number) < branches.length || (branchCount as number) > 16_384 || !Number.isSafeInteger(branchOffset) || (branchOffset as number) < 0 || (branchOffset as number) > (branchCount as number)) throw new Error('Android continuation count is invalid')
+  return {
+    revision: parseWireId(value['revision'], 'assistant.revision'), conversations, conversationCount: count as number, conversationOffset: offset as number,
+    selectedHead: value['selected_head'] === null ? null : parseWireId(value['selected_head'], 'selected_head', true),
+    branchChoices: branches, branchCount: branchCount as number, branchOffset: branchOffset as number,
+    draft: parseBoundedString(value['draft'], PROMPT_MAX_BYTES, 'draft'), interrupted: value['interrupted'],
+    error: value['error'] === undefined || value['error'] === null ? null : parseBoundedString(value['error'], DISPLAY_TEXT_MAX_BYTES, 'assistant error'),
+  }
+}
+
+export function parseAndroidConversationPage(value: unknown): { readonly revision: string; readonly conversations: AndroidAssistantProjection['conversations']; readonly nextOffset: number } {
+  if (!isRecord(value) || !Array.isArray(value['conversations']) || value['conversations'].length > 128 || !Number.isSafeInteger(value['next_offset']) || (value['next_offset'] as number) < 0 || (value['next_offset'] as number) > 16_384) throw new Error('Android conversation page is invalid')
+  const conversations = Array.from(value['conversations'], (item: unknown) => {
+    if (!isRecord(item)) throw new Error('Android conversation is invalid')
+    return { id: parseWireId(item['id'], 'conversation.id', true), title: parseBoundedString(item['title'], 256, 'conversation.title') }
+  })
+  rejectDuplicateIds(conversations, 'conversation')
+  return { revision: parseWireId(value['revision'], 'revision'), conversations, nextOffset: value['next_offset'] as number }
+}
+
+export function parseAndroidHeadPage(value: unknown): { readonly revision: string; readonly heads: readonly string[]; readonly nextOffset: number } {
+  if (!isRecord(value) || !Array.isArray(value['heads']) || value['heads'].length > 128 || !Number.isSafeInteger(value['next_offset']) || (value['next_offset'] as number) < 0 || (value['next_offset'] as number) > 16_384) throw new Error('Android continuation page is invalid')
+  const heads = Array.from(value['heads'], (id: unknown) => parseWireId(id, 'head', true))
+  if (new Set(heads).size !== heads.length) throw new Error('Android continuation page contains duplicate IDs')
+  return { revision: parseWireId(value['revision'], 'revision'), heads, nextOffset: value['next_offset'] as number }
 }
 
 function parseCapability(value: unknown): Capability {
@@ -229,6 +294,8 @@ export function parseValidatedPreferences(value: unknown): ValidatedPreferences 
     instant: instant as InstantChoice, deep: deep as DeepChoice, review: review as ReviewChoice,
     deepEnabled: value['deep_enabled'] as boolean, reviewEnabled: value['review_enabled'] as boolean,
     prefetch: value['prefetch'] as boolean, completion: value['completion'] as boolean,
+    webEnabled: parsePolicyBoolean(value, 'web_enabled'), speechNetworkFallback: parsePolicyBoolean(value, 'speech_network_fallback'),
+    speechLanguage: parseSpeechSelectionString(value, 'speech_language'), speechTtsProvider: parseSpeechSelectionString(value, 'speech_tts_provider'), speechTtsVoice: parseSpeechSelectionString(value, 'speech_tts_voice'),
     responseProfile, ttsEnabled: value['tts_enabled'] as boolean, uiTheme, uiTextSize,
   }
 }

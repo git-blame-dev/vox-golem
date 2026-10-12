@@ -26,7 +26,7 @@ transcribe-rs = { version = "=0.3.11", features = ["onnx"] }
 voxgolem-audio = { path = "../../../crates/audio" }
 voxgolem-core = { path = "../../../crates/core" }
 voxgolem-model = { path = "../../../crates/model" }
-voxgolem-platform = { path = "../../../crates/platform" }
+voxgolem-platform = { path = "../../../crates/platform", features = ["web-search"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 tauri-plugin-single-instance = "=2.4.3"

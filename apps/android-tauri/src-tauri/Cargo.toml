@@ -10,17 +10,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tauri = { version = "=2.11.1", features = ["protocol-asset"] }
 tauri-plugin-capture = { path = "../../../crates/capture-plugin" }
-voxgolem-core = { path = "../../../crates/core", default-features = false }
-voxgolem-platform = { path = "../../../crates/platform", default-features = false, features = ["custom-openai-webpki"] }
-tokio = { version = "1", features = ["sync", "macros", "rt", "time"] }
+tauri-plugin-assistant = { path = "../../../crates/assistant-plugin" }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [lints]
 workspace = true
-
-[dev-dependencies]
-serde_json = "1"

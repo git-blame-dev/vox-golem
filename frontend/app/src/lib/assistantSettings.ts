@@ -1,9 +1,18 @@
-/** The deliberately small, stable vocabulary shared by the settings UI and Tauri. */
-export type InstantChoice = 'local-fast' | 'local-quality' | 'custom-sol-high' | 'custom-sol-none' | 'custom-luna-none' | 'custom-luna-low' | 'opencode-sol-high' | 'opencode-luna-low'
-export type DeepChoice = 'custom-sol-high' | 'custom-luna-low' | 'opencode-sol-high' | 'opencode-luna-low'
+import { DEFAULT_MODEL_CHOICES, modelLabels } from './modelCatalog'
+import type { AgentChoice, InstantChoice } from './modelCatalog'
+export type { InstantChoice } from './modelCatalog'
+export type DeepChoice = AgentChoice
 export type ReviewChoice = DeepChoice
 
-export interface AssistantSettings {
+export interface SpeechSelection {
+  readonly speechLanguage: string
+  readonly speechTtsProvider: string
+  readonly speechTtsVoice: string
+}
+
+export const DEFAULT_SPEECH_SELECTION: SpeechSelection = { speechLanguage: '', speechTtsProvider: '', speechTtsVoice: '' }
+
+export interface AssistantSettings extends SpeechSelection {
   instant: InstantChoice
   deep: DeepChoice
   review: ReviewChoice
@@ -11,6 +20,8 @@ export interface AssistantSettings {
   reviewEnabled: boolean
   prefetch: boolean
   completion: boolean
+  webEnabled: boolean
+  speechNetworkFallback: boolean
 }
 
 export interface AssistantCapabilities {
@@ -32,23 +43,14 @@ export interface AssistantOption<T extends string> {
 }
 
 export const DEFAULT_ASSISTANT_SETTINGS: Readonly<AssistantSettings> = {
-  instant: 'local-fast', deep: 'opencode-sol-high', review: 'opencode-sol-high',
-  deepEnabled: false, reviewEnabled: false, prefetch: false, completion: true,
+  ...DEFAULT_SPEECH_SELECTION,
+  ...DEFAULT_MODEL_CHOICES,
+  deepEnabled: false, reviewEnabled: false, prefetch: false, completion: true, webEnabled: true, speechNetworkFallback: true,
 }
 
-const instantLabels: Record<InstantChoice, string> = {
-  'local-fast': 'Local: Fast', 'local-quality': 'Local: Quality',
-  'custom-sol-high': 'Custom: GPT-6 Sol High', 'custom-sol-none': 'Custom: GPT-6 Sol No Reasoning', 'custom-luna-none': 'Custom: GPT-6 Luna No Reasoning', 'custom-luna-low': 'Custom: GPT-5.6 Luna Low',
-  'opencode-sol-high': 'OpenCode: GPT-6 Sol High', 'opencode-luna-low': 'OpenCode: GPT-5.6 Luna Low',
-}
-const deepLabels: Record<DeepChoice, string> = {
-  'custom-sol-high': 'Deep: Custom: GPT-6 Sol High', 'custom-luna-low': 'Deep: Custom: GPT-5.6 Luna Low',
-  'opencode-sol-high': 'Deep: OpenCode: GPT-6 Sol High', 'opencode-luna-low': 'Deep: OpenCode: GPT-5.6 Luna Low',
-}
-const reviewLabels: Record<ReviewChoice, string> = {
-  'custom-sol-high': 'Review: Custom: GPT-6 Sol High', 'custom-luna-low': 'Review: Custom: GPT-5.6 Luna Low',
-  'opencode-sol-high': 'Review: OpenCode: GPT-6 Sol High', 'opencode-luna-low': 'Review: OpenCode: GPT-5.6 Luna Low',
-}
+const instantLabels = modelLabels('instant')
+const deepLabels = modelLabels('deep')
+const reviewLabels = modelLabels('review')
 
 function options<T extends string>(labels: Record<T, string>, capabilities: AssistantCapabilities): AssistantOption<T>[] {
   return (Object.keys(labels) as T[]).map((value) => {
@@ -78,10 +80,21 @@ export function parseAssistantSettings(payload: unknown): AssistantSettings {
   const p = payload
   const instant = stringField(p, 'instant'); const deep = stringField(p, 'deep'); const review = stringField(p, 'review')
   if (!instantValues.has(instant) || !deepValues.has(deep) || !reviewValues.has(review) || typeof p['deep_enabled'] !== 'boolean' || typeof p['review_enabled'] !== 'boolean' || typeof p['prefetch'] !== 'boolean' || typeof p['completion'] !== 'boolean') throw new Error('Invalid assistant settings payload')
-  return { instant: instant as InstantChoice, deep: deep as DeepChoice, review: review as ReviewChoice, deepEnabled: p['deep_enabled'] as boolean, reviewEnabled: p['review_enabled'] as boolean, prefetch: p['prefetch'] as boolean, completion: p['completion'] as boolean }
+  return { instant: instant as InstantChoice, deep: deep as DeepChoice, review: review as ReviewChoice, deepEnabled: p['deep_enabled'] as boolean, reviewEnabled: p['review_enabled'] as boolean, prefetch: p['prefetch'] as boolean, completion: p['completion'] as boolean, webEnabled: parsePolicyBoolean(p, 'web_enabled'), speechNetworkFallback: parsePolicyBoolean(p, 'speech_network_fallback'), speechLanguage: parseSpeechSelectionString(p, 'speech_language'), speechTtsProvider: parseSpeechSelectionString(p, 'speech_tts_provider'), speechTtsVoice: parseSpeechSelectionString(p, 'speech_tts_voice') }
 }
 
 export function serializeAssistantSettings(settings: AssistantSettings): Record<string, unknown> {
-  return { instant: settings.instant, deep: settings.deep, review: settings.review, deep_enabled: settings.deepEnabled, review_enabled: settings.reviewEnabled, prefetch: settings.prefetch, completion: settings.completion }
+  return { instant: settings.instant, deep: settings.deep, review: settings.review, deep_enabled: settings.deepEnabled, review_enabled: settings.reviewEnabled, prefetch: settings.prefetch, completion: settings.completion, web_enabled: settings.webEnabled, speech_network_fallback: settings.speechNetworkFallback, speech_language: settings.speechLanguage, speech_tts_provider: settings.speechTtsProvider, speech_tts_voice: settings.speechTtsVoice }
 }
-import { isRecord } from './wire'
+export function parsePolicyBoolean(payload: Record<string, unknown>, key: 'web_enabled' | 'speech_network_fallback'): boolean {
+  if (!Object.prototype.hasOwnProperty.call(payload, key)) return true
+  if (typeof payload[key] !== 'boolean') throw new Error(`Preference ${key} must be boolean`)
+  return payload[key]
+}
+export function parseSpeechSelectionString(payload: Record<string, unknown>, key: string): string {
+  if (!Object.prototype.hasOwnProperty.call(payload, key)) return ''
+  const value = payload[key]
+  if (typeof value !== 'string' || utf8ByteLength(value) > 512) throw new Error(`Speech preference ${key} must be a string within 512 UTF-8 bytes`)
+  return value
+}
+import { isRecord, utf8ByteLength } from './wire'

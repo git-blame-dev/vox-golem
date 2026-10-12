@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-consume-new-voice-shortcut"
+description = "Enables the consume_new_voice_shortcut command without any pre-configured scope."
+commands.allow = ["consume_new_voice_shortcut"]
+
+[[permission]]
+identifier = "deny-consume-new-voice-shortcut"
+description = "Denies the consume_new_voice_shortcut command without any pre-configured scope."
+commands.deny = ["consume_new_voice_shortcut"]

@@ -28,6 +28,8 @@ const MAX_JS_SAFE_INTEGER_U64: u64 = 9_007_199_254_740_991;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
+    #[serde(default = "default_web_enabled")]
+    web_enabled: bool,
     #[serde(default)]
     wake_word_model_path: Option<PathBuf>,
     #[serde(default)]
@@ -148,6 +150,7 @@ struct RawTelemetryConfig {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfig {
+    pub web_enabled: bool,
     pub wake_word_model_path: PathBuf,
     pub parakeet_model_dir: PathBuf,
     pub silero_vad_model: PathBuf,
@@ -838,6 +841,7 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
                         reason: String::from("[opencode] table is not configured"),
                     });
                     return Ok(RuntimeConfig {
+                        web_enabled: raw_config.web_enabled,
                         wake_word_model_path,
                         parakeet_model_dir,
                         silero_vad_model,
@@ -872,6 +876,7 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
                         reason: String::from("[llama_cpp] table is not configured"),
                     });
                     return Ok(RuntimeConfig {
+                        web_enabled: raw_config.web_enabled,
                         wake_word_model_path,
                         parakeet_model_dir,
                         silero_vad_model,
@@ -913,6 +918,7 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
         };
 
     Ok(RuntimeConfig {
+        web_enabled: raw_config.web_enabled,
         wake_word_model_path,
         parakeet_model_dir,
         silero_vad_model,
@@ -955,6 +961,7 @@ fn default_runtime_config(config_dir: &Path, config_reason: Option<String>) -> R
         });
     }
     RuntimeConfig {
+        web_enabled: default_web_enabled(),
         wake_word_model_path: resolve_config_path(
             config_dir,
             PathBuf::from("models/hey_livekit.onnx"),
@@ -1036,6 +1043,10 @@ fn record_custom_auth_issue(
             auth_path,
         ),
     }
+}
+
+fn default_web_enabled() -> bool {
+    true
 }
 
 fn default_silence_timeout_ms() -> u64 {
@@ -1536,11 +1547,58 @@ mod tests {
         assert_eq!(config.silence_timeout_ms, 750);
         assert_eq!(config.wake_word_detection_threshold, 0.68);
         assert!(config.telemetry.enabled);
+        assert!(config.web_enabled);
+        assert_eq!(
+            config
+                .custom_openai
+                .as_ref()
+                .expect("example Custom settings")
+                .auth_path,
+            super::default_auth_path(),
+            "the copied example should use the production platform auth default"
+        );
         let llama = config
             .llama_cpp
             .expect("example config should include llama_cpp settings");
         assert_eq!(llama.host, "127.0.0.1");
         assert_eq!(llama.port, 11_435);
+    }
+
+    #[test]
+    fn web_permission_accepts_only_top_level_boolean_through_runtime_parser() {
+        let temp = TempDir::new();
+        let path = temp.path().join("config.toml");
+        for value in ["true", "false"] {
+            fs::write(&path, format!("web_enabled = {value}\n")).unwrap();
+            assert_eq!(
+                load_runtime_config(Some(&path)).unwrap().web_enabled,
+                value == "true"
+            );
+        }
+        for value in ["\"false\"", "0", "[]", "{}"] {
+            fs::write(&path, format!("web_enabled = {value}\n")).unwrap();
+            assert!(matches!(
+                load_runtime_config(Some(&path)),
+                Err(ConfigError::ParseConfigFailed { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn web_permission_defaults_on_for_missing_or_legacy_config_and_survives_backend_fallback() {
+        let temp = TempDir::new();
+        let path = temp.path().join("config.toml");
+        assert!(load_runtime_config(Some(&path)).unwrap().web_enabled);
+        for contents in [
+            "",
+            "response_backend = \"opencode\"\n",
+            "response_backend = \"llama_cpp\"\n",
+        ] {
+            fs::write(&path, contents).unwrap();
+            assert!(load_runtime_config(Some(&path)).unwrap().web_enabled);
+            fs::write(&path, format!("web_enabled = false\n{contents}")).unwrap();
+            assert!(!load_runtime_config(Some(&path)).unwrap().web_enabled);
+        }
     }
 
     struct TempDir {

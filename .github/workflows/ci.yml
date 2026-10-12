@@ -35,20 +35,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: 1.95.0
-          targets: aarch64-linux-android
+          targets: aarch64-linux-android,armv7-linux-androideabi
       - name: Configure the pinned Android build tools
         run: |
           test -x "$JAVA_HOME_21_X64/bin/java"
           printf 'JAVA_HOME=%s\n' "$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
           printf '%s/bin\n' "$JAVA_HOME_21_X64" >> "$GITHUB_PATH"
-          sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;28.2.13676358'
+          sdkmanager 'platforms;android-36' 'platforms;android-37.0' 'build-tools;36.0.0' 'ndk;28.2.13676358'
           printf 'NDK_HOME=%s/ndk/28.2.13676358\n' "$ANDROID_HOME" >> "$GITHUB_ENV"
           cargo install tauri-cli --version 2.11.1 --locked
           bun install --frozen-lockfile
+      - name: Check SDK-only voice without JNI tasks
+        run: make android-voice-test
       - name: Build the ARM64 debug app
         run: make android-build
-      - name: Check native capture
+      - name: Check SDK-only voice and native capture
         run: make android-capture-test
+      - name: Check shared and phone Assistant
+        run: make android-assistant-test
       - name: Check and build the Wear companion
         run: make wear-test wear-build
       - name: Verify the APK signature

@@ -159,6 +159,17 @@ describe('prompt payload parsing', () => {
 })
 
 describe('executePrompt', () => {
+  it.each(['quick', 'verify', 'research'] as const)('passes the admitted %s mode for voice submissions', async (searchMode) => {
+    window.__TAURI_INTERNALS__ = {
+      createChannel: () => 'synthetic-channel',
+      invoke: async (command, args) => {
+        expect(command).toBe('submit_prompt')
+        expect(args).toEqual({ requestId: 'synthetic-request', prompt: 'Synthetic question', source: 'voice', searchMode, updates: 'synthetic-channel' })
+        return { request_id: 'synthetic-request', runtime_phase: 'sleeping', outcome: 'completed' }
+      },
+    }
+    await executePrompt('synthetic-request', 'Synthetic question', () => undefined, 'voice', searchMode)
+  })
   it('uses API wrappers for native-shaped Tauri internals', () => {
     window.__TAURI_INTERNALS__ = Object.assign(
       { invoke: async () => null },
@@ -209,7 +220,7 @@ describe('executePrompt', () => {
       invoke: async (command, args) => {
         order.push('invoke')
         expect(command).toBe('submit_prompt')
-        expect(args).toEqual({ requestId: 'request-1', prompt: 'Draft release notes', source: 'typed', updates: 'channel' })
+        expect(args).toEqual({ requestId: 'request-1', prompt: 'Draft release notes', source: 'typed', searchMode: 'quick', updates: 'channel' })
         send?.({ request_id: 'stale', kind: 'text', text: 'Ignore me' })
         send?.({ kind: 'text', text: 'OpenCode response' })
         return {

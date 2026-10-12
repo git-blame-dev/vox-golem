@@ -1,0 +1,20 @@
+.android-voice-controls--compact {
+  flex-wrap: nowrap;
+}
+
+.android-voice-controls--compact .shell__icon-control {
+  min-width: 48px;
+  min-height: 48px;
+  width: 48px;
+  height: 48px;
+}
+
+.android-voice-controls--compact .shell__icon-control svg[data-icon-state] {
+  width: 32px;
+  height: 32px;
+}
+
+.android-voice-controls--compact .android-voice-controls__mark-background {
+  fill: var(--surface-panel-strong, Canvas);
+  stroke: none;
+}

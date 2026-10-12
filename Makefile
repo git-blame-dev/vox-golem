@@ -94,7 +94,7 @@ test-wakeword-bench:
 	python3 -m unittest discover -s tools/wakeword-bench -p 'test_*.py'
 	cargo test --locked -p vox-golem --example wakeword_bench
 
-.PHONY: help app-version test test-release-tools test-android-tools check-android-tools android-init android-build android-capture-test android-provision-auth check-wear-tools wear-test wear-build check-linux-tools app app-smoke packaged-smoke app-dev linux dist stage-linux-existing verify-dist prepare-appimage-tools update-bundle postprocess-update-bundle verify-update-bundle update-bundle-smoke check-pc-tools prepare-pc-bundle pc pc-dist verify-pc-dist pc-installer verify-pc-installer clean
+.PHONY: help app-version icons test test-release-tools test-android-tools check-android-tools android-init android-build android-capture-test check-wear-tools wear-test wear-build wear-performance check-linux-tools app app-smoke packaged-smoke app-dev linux dist stage-linux-existing verify-dist prepare-appimage-tools update-bundle postprocess-update-bundle verify-update-bundle update-bundle-smoke check-pc-tools prepare-pc-bundle pc pc-dist verify-pc-dist pc-installer verify-pc-installer clean
 
 help:
 	@printf '%s\n' 'Targets:'
@@ -105,6 +105,7 @@ help:
 	@printf '%s\n' '  make test     Run deterministic Linux frontend and Rust checks'
 	@printf '%s\n' '  make wakeword-bench WAKE_WORD_MODEL=/path/model.onnx  Run the synthetic wake-word benchmark'
 	@printf '%s\n' '  make app-version Print the generated application build identity'
+	@printf '%s\n' '  make icons    Regenerate native icons from the canonical SVG'
 	@printf '%s\n' '  make linux    Build the native Linux Tauri binary'
 	@printf '%s\n' '  make dist     Stage the Linux binary under dist/VoxGolem'
 	@printf '%s\n' '  make update-bundle Build the generated-version Linux AppImage update bundle'
@@ -114,9 +115,10 @@ help:
 	@printf '%s\n' '  make android-init Regenerate the pinned Android platform scaffold'
 	@printf '%s\n' '  make android-build Build the ARM64 Android debug APK'
 	@printf '%s\n' '  make android-capture-test Run native capture unit tests and lint after android-build'
+	@printf '%s\n' '  make android-voice-test Run SDK-only voice unit tests and lint without building JNI'
 	@printf '%s\n' '  make wear-test Run Wear capture unit tests and lint'
 	@printf '%s\n' '  make wear-build Build the Wear OS debug APK'
-	@printf '%s\n' '  make android-provision-auth DEVICE=<serial> AUTH_PATH=<file> Provision app-private auth'
+	@printf '%s\n' '  make wear-performance Build the optimized local Wear OS APK with debug signing'
 	@printf '%s\n' '  make clean    Remove generated build and staging output'
 
 app-version:
@@ -140,8 +142,12 @@ test-release-tools:
 	bash scripts/test-release-tools.sh
 
 test-android-tools:
-	@command -v jq >/dev/null || { printf '%s\n' 'Missing jq.' >&2; exit 1; }
-	bash scripts/test-android-provision-auth.sh
+	python3 scripts/test-prepare-android-capture.py
+	python3 -B -m unittest discover -s scripts -p test_generate_icons.py
+	python3 -B -m unittest discover -s scripts -p test_generate_mobile_cues.py
+
+icons:
+	python3 scripts/generate-icons.py
 
 check-android-tools:
 	@cargo tauri --version 2>&1 | grep -Fxq 'tauri-cli 2.11.1' || { printf '%s\n' 'Android builds require Tauri CLI 2.11.1.' >&2; exit 1; }
@@ -151,31 +157,43 @@ check-android-tools:
 	@rustup target list --installed | grep -Fxq 'aarch64-linux-android' || { printf '%s\n' 'Install the aarch64-linux-android Rust target.' >&2; exit 1; }
 
 android-init: check-android-tools
-	cargo tauri icon apps/desktop-tauri/src-tauri/icons/icon.png --output apps/android-tauri/src-tauri/icons
-	cd apps/android-tauri/src-tauri && cargo tauri android init --ci
-	cargo tauri icon apps/desktop-tauri/src-tauri/icons/icon.png --output apps/android-tauri/src-tauri/icons
+	$(MAKE) --no-print-directory icons
+	cd apps/android-tauri/src-tauri && cargo tauri android init --ci --skip-targets-install
+	$(MAKE) --no-print-directory icons
 	python3 scripts/prepare-android-capture.py
 
 android-build: check-android-tools
+	python3 scripts/prepare-android-capture.py
 	cd apps/android-tauri/src-tauri && cargo tauri android build --debug --target aarch64 --apk --ci -- --locked
 
 android-capture-test: check-android-tools
-	apps/android-tauri/src-tauri/gen/android/gradlew -p apps/android-tauri/src-tauri/gen/android --no-daemon :tauri-plugin-capture:testDebugUnitTest :tauri-plugin-capture:lintDebug
+	python3 scripts/prepare-android-capture.py
+	apps/android-tauri/src-tauri/gen/android/gradlew -p apps/android-tauri/src-tauri/gen/android --no-daemon :voice-android:testDebugUnitTest :voice-android:lintDebug :capture-android:testDebugUnitTest :capture-android:lintDebug :tauri-plugin-capture:testDebugUnitTest :tauri-plugin-capture:lintDebug
+
+.PHONY: android-voice-test android-assistant-test
+android-voice-test:
+	@test -x "$${JAVA_HOME:-}/bin/java" || { printf '%s\n' 'Set JAVA_HOME to a JDK 21 installation.' >&2; exit 1; }
+	@test -d "$${ANDROID_HOME:-}/platforms/android-36" || { printf '%s\n' 'Set ANDROID_HOME to an SDK with platform 36.' >&2; exit 1; }
+	python3 scripts/prepare-android-capture.py
+	apps/android-tauri/src-tauri/gen/android/gradlew -p apps/android-tauri/src-tauri/gen/android --no-daemon :voice-android:testDebugUnitTest :voice-android:lintDebug
+
+android-assistant-test: check-android-tools
+	python3 scripts/prepare-android-capture.py
+	apps/android-tauri/src-tauri/gen/android/gradlew -p apps/android-tauri/src-tauri/gen/android --no-daemon :voice-android:testDebugUnitTest :voice-android:lintDebug :assistant-android:testDebugUnitTest :assistant-android:lintDebug :tauri-plugin-assistant:testDebugUnitTest :tauri-plugin-assistant:lintDebug
 
 check-wear-tools:
 	@test -x "$${JAVA_HOME:-}/bin/java" || { printf '%s\n' 'Set JAVA_HOME to a JDK 21 installation.' >&2; exit 1; }
 	@test -d "$${ANDROID_HOME:-}/platforms/android-36" || { printf '%s\n' 'Set ANDROID_HOME to an SDK with platform 36.' >&2; exit 1; }
+	@test -d "$${ANDROID_HOME:-}/platforms/android-37.0" || { printf '%s\n' 'Wear Material 3 requires the stable platforms;android-37.0 SDK package.' >&2; exit 1; }
 
 wear-test: check-wear-tools
-	apps/wear/gradlew -p apps/wear --no-daemon :app:testDebugUnitTest :app:lintDebug
+	apps/wear/gradlew -p apps/wear --no-daemon :voice-android:testDebugUnitTest :voice-android:lintDebug :assistant-android:testDebugUnitTest :assistant-android:lintDebug :capture-android:testDebugUnitTest :capture-android:lintDebug :app:testDebugUnitTest :app:lintDebug
 
 wear-build: check-wear-tools
 	apps/wear/gradlew -p apps/wear --no-daemon :app:assembleDebug
 
-android-provision-auth: export DEVICE := $(DEVICE)
-android-provision-auth: export AUTH_PATH := $(AUTH_PATH)
-android-provision-auth:
-	@'$(CURDIR)/scripts/android-provision-auth.sh' --device "$${DEVICE:-}" --auth "$${AUTH_PATH:-}"
+wear-performance: check-wear-tools
+	apps/wear/gradlew -p apps/wear --no-daemon :app:assemblePerformance
 
 check-linux-tools:
 	@command -v cargo-tauri >/dev/null || { printf '%s\n' 'Missing Tauri CLI. Install with: cargo install tauri-cli --version 2.11.1 --locked' >&2; exit 1; }

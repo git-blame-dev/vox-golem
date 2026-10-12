@@ -4,10 +4,12 @@ members = [
   "apps/android-tauri/src-tauri",
   "apps/desktop-tauri/src-tauri",
   "crates/audio",
+  "crates/assistant-plugin",
   "crates/capture-plugin",
   "crates/core",
   "crates/model",
-  "crates/platform"
+  "crates/platform",
+  "crates/wear-assistant-native"
 ]
 
 [workspace.package]

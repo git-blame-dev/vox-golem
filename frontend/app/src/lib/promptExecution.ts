@@ -6,6 +6,7 @@ import type {
   PromptExecutionResult,
 } from '../types/chat'
 import type { AnswerSource } from '../components/AnswerStage'
+import type { SearchMode } from './searchMode'
 
 export function parseAndroidPromptUpdate(payload: unknown, requestId: string): PromptExecutionEvent {
   if (!isRecord(payload) || typeof payload['kind'] !== 'string') throw new Error('Android prompt update must include kind')
@@ -35,7 +36,7 @@ export function parseAndroidPromptOutcome(payload: unknown, requestId: string): 
     if (Object.prototype.hasOwnProperty.call(payload, 'turn')) throw new Error('Cancelled Android prompt outcome must not include a turn')
     return { requestId, runtimePhase: 'sleeping', outcome: 'cancelled', errorMessage: null, canonicalOutcome: 'cancelled' }
   }
-  const turn = parseCanonicalTurn(payload['turn'])
+  const turn = parseCanonicalTurn(payload['turn'], true)
   if (turn.requestId !== requestId) throw new Error('Android prompt outcome request ID did not match the active request')
   if (payload['kind'] === 'completed' && turn.answer.content.kind !== 'text') throw new Error('Completed Android prompt outcome must contain a text answer')
   if (payload['kind'] === 'refused' && turn.answer.content.kind !== 'refusal') throw new Error('Refused Android prompt outcome must contain a refusal answer')
@@ -175,6 +176,7 @@ export async function executePrompt(
   prompt: string,
   onEvent: (event: PromptExecutionEvent) => void,
   source: 'typed' | 'voice' = 'typed',
+  searchMode: SearchMode = 'quick',
 ): Promise<PromptExecutionResult> {
   const tauri = typeof window === 'undefined' ? null : getTauriInternals()
   if (tauri === null) throw new Error('Prompt execution requires a runtime adapter')
@@ -197,7 +199,7 @@ export async function executePrompt(
 
     let payload: unknown
     try {
-      payload = await tauri.invoke('submit_prompt', isAndroidRuntime ? { requestId, prompt, updates } : { requestId, prompt, source, updates })
+      payload = await tauri.invoke('submit_prompt', isAndroidRuntime ? { requestId, prompt, searchMode, updates } : { requestId, prompt, source, searchMode, updates })
     } catch (error) {
       if (isAndroidRuntime) throw normalizeTauriError(error)
       throw error

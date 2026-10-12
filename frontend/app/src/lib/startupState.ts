@@ -7,6 +7,8 @@ import type {
   StartupState,
   StartupCapability,
   CapabilityId,
+  SpeechServiceMetadata,
+  SpeechServicesMetadata,
 } from '../types/chat'
 
 export const DEFAULT_INITIAL_SILENCE_TIMEOUT_MS = 2_500
@@ -67,7 +69,8 @@ export function parseStartupState(payload: unknown): StartupState {
       promptCancellationAvailable: payload['prompt_cancellation_available'] === true,
       ttsEnabled,
       ttsOutputGainDb,
-       capabilities: parseCapabilities(payload['capabilities']),
+      capabilities: parseCapabilities(payload['capabilities']),
+      ...parseSpeechServices(payload['speech_services']),
     }
   }
 
@@ -102,7 +105,8 @@ export function parseStartupState(payload: unknown): StartupState {
       promptCancellationAvailable: payload['prompt_cancellation_available'] === true,
       ttsEnabled,
       ttsOutputGainDb,
-       capabilities: parseCapabilities(payload['capabilities']),
+      capabilities: parseCapabilities(payload['capabilities']),
+      ...parseSpeechServices(payload['speech_services']),
     }
   }
 
@@ -247,6 +251,30 @@ function parseSupportedResponseProfiles(payload: unknown): readonly ResponseProf
   const profiles = payload.map(parseResponseProfile)
 
   return Array.from(new Set(profiles))
+}
+
+function parseSpeechServices(payload: unknown): { readonly speechServices?: SpeechServicesMetadata } {
+  if (payload === undefined) return {}
+  if (!isRecord(payload)) throw new Error('Startup speech_services must be an object')
+  const parseService = (service: unknown): SpeechServiceMetadata => {
+    if (!isRecord(service)) throw new Error('Startup speech_services must include STT and TTS metadata')
+    const parseText = (key: string): string | null => {
+      const value = service[key]
+      if (value === null) return null
+      if (typeof value !== 'string' || value.trim().length === 0 || value.length > 256 || [...value].some((character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)) {
+        throw new Error(`Startup speech_services has invalid ${key}`)
+      }
+      return value
+    }
+    return {
+      configuredEngine: parseText('configured_engine'),
+      runtimeEngine: parseText('runtime_engine'),
+      configuredModel: parseText('configured_model'),
+      configuredVoice: parseText('configured_voice'),
+      configuredLocale: parseText('configured_locale'),
+    }
+  }
+  return { speechServices: { stt: parseService(payload['stt']), tts: parseService(payload['tts']) } }
 }
 
 function parseCapabilities(payload: unknown): readonly StartupCapability[] {

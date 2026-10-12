@@ -2,12 +2,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { TauriCommandError, androidPreferenceProposal, buildAndroidStartupState, cacheAndroidSnapshot, getAndroidPreferencePublicationRevision, invokeAndroidCommand, normalizeTauriError, setCachedAndroidPreferences, withoutAndroidEventListener } from './tauri'
 import { missingPromptStreamingSupportError, parseAndroidPromptOutcome, parseAndroidPromptOutcomeForExecution, parseAndroidPromptUpdate } from './promptExecution'
 import type { AppSnapshot, ValidatedPreferences } from './appSnapshot'
-import { appendCanonicalTurn, canonicalExecutionKey, isExpectedCanonicalTurn, parseAppSnapshot, parseCanonicalTurn } from './appSnapshot'
+import { appendCanonicalTurn, canonicalExecutionKey, isExpectedCanonicalTurn, parseAppSnapshot, parseCanonicalTurn, parseValidatedPreferences } from './appSnapshot'
 import { initialUpdateState } from './useAppUpdates'
 
 const preferences: ValidatedPreferences = {
   instant: 'local-fast', deep: 'opencode-sol-high', review: 'opencode-luna-low', deepEnabled: false, reviewEnabled: true,
   prefetch: true, completion: false, responseProfile: 'quality', ttsEnabled: true, uiTheme: 'dark', uiTextSize: 'large',
+  webEnabled: false, speechNetworkFallback: false,
+  speechLanguage: 'en-AU', speechTtsProvider: 'synthetic.tts.engine', speechTtsVoice: 'synthetic-local-voice',
 }
 const snapshot = { runtimePhase: 'sleeping', preferences, capabilities: [], activeRequest: null } as unknown as AppSnapshot
 
@@ -30,7 +32,21 @@ describe('Android runtime contract helpers', () => {
     expect(androidPreferenceProposal('set_assistant_settings', { settings: { instant: 'local-quality', deep_enabled: true, review_enabled: false, prefetch: false, completion: true, deep: 'custom-sol-high', review: 'custom-luna-low' } }, preferences)).toEqual({
       instant: 'local-quality', deep: 'custom-sol-high', review: 'custom-luna-low', deep_enabled: true, review_enabled: false, prefetch: false, completion: true,
       response_profile: 'quality', tts_enabled: true, ui_theme: 'dark', ui_text_size: 'large',
+      web_enabled: false, speech_network_fallback: false,
+      speech_language: 'en-AU', speech_tts_provider: 'synthetic.tts.engine', speech_tts_voice: 'synthetic-local-voice',
     })
+  })
+
+  it('preserves speech selections through old proposals and unrelated writes while accepting explicit Automatic clearing', () => {
+    expect(androidPreferenceProposal('set_ui_theme', { theme: 'light' }, preferences)).toMatchObject({ speech_language: 'en-AU', speech_tts_provider: 'synthetic.tts.engine', speech_tts_voice: 'synthetic-local-voice' })
+    const cleared = androidPreferenceProposal('set_assistant_settings', { settings: { instant: preferences.instant, deep: preferences.deep, review: preferences.review, deep_enabled: preferences.deepEnabled, review_enabled: preferences.reviewEnabled, prefetch: preferences.prefetch, completion: preferences.completion, speech_language: '', speech_tts_provider: '', speech_tts_voice: '' } }, preferences)
+    expect(parseValidatedPreferences(cleared)).toEqual({ ...preferences, speechLanguage: '', speechTtsProvider: '', speechTtsVoice: '' })
+  })
+
+  it('changes policy fields explicitly without losing unrelated or older-payload preferences', () => {
+    const settings = { instant: 'local-fast', deep: 'opencode-sol-high', review: 'opencode-luna-low', deep_enabled: false, review_enabled: true, prefetch: true, completion: false }
+    expect(androidPreferenceProposal('set_assistant_settings', { settings: { ...settings, web_enabled: true, speech_network_fallback: true } }, preferences)).toMatchObject({ web_enabled: true, speech_network_fallback: true, tts_enabled: true, ui_theme: 'dark' })
+    expect(androidPreferenceProposal('set_ui_theme', { theme: 'light' }, preferences)).toMatchObject({ web_enabled: false, speech_network_fallback: false, ui_theme: 'light' })
   })
 
   it('strictly maps canonical prompt updates and outcomes', () => {

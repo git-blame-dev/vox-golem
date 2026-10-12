@@ -74,7 +74,7 @@ pub enum OpencodeModel {
 impl OpencodeModel {
     fn request_fields(self) -> serde_json::Value {
         let model = match self {
-            Self::Gpt6SolHigh => "gpt-6-sol",
+            Self::Gpt6SolHigh => "gpt-6.1-sol",
             Self::Gpt56LunaLow => "gpt-5.6-luna",
         };
         serde_json::json!({
@@ -563,7 +563,7 @@ impl OpencodeServer {
             child: Some(child),
             wsl_owned,
         };
-        let client = match reqwest::Client::builder()
+        let client = match crate::owned_loopback::client_builder()
             .connect_timeout(config.request_timeout)
             .build()
         {
@@ -950,6 +950,7 @@ fn prompt_body(prompt: &OpencodePrompt, options: Option<serde_json::Value>) -> s
     let mut body = serde_json::json!({
         "parts": [{"type": "text", "text": prompt.text()}],
         "tools": {"*": false},
+        "system": voxgolem_core::response_style::PLAIN_TEXT_POLICY,
     });
     if let Some(options) = options {
         if let Some(object) = options.as_object() {
@@ -2040,7 +2041,7 @@ mod tests {
             OpencodeModel::Gpt6SolHigh.request_fields(),
             serde_json::json!({
                 "providerID": "openai",
-                "modelID": "gpt-6-sol",
+                "modelID": "gpt-6.1-sol",
             })
         );
         assert_eq!(OpencodeModel::Gpt6SolHigh.variant(), "high");
@@ -2070,6 +2071,7 @@ mod tests {
             body,
             serde_json::json!({
                 "parts": [{"type": "text", "text": "answer briefly"}],
+                "system": voxgolem_core::response_style::PLAIN_TEXT_POLICY,
                 "model": {"providerID": "openai", "modelID": "gpt-5.6-luna"},
                 "variant": "low",
                 "tools": {

@@ -20,3 +20,9 @@ models/
 config.toml
 .DS_Store
 Thumbs.db
+
+crates/assistant-plugin/android/build/
+crates/assistant-plugin/android/.tauri/
+
+__pycache__/
+*.pyc

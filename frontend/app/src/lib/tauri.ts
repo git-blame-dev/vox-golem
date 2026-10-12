@@ -8,6 +8,8 @@ import { listen as tauriListen } from '@tauri-apps/api/event'
 import type { AppSnapshot, ValidatedPreferences } from './appSnapshot'
 import { getBrowserPreviewInternals } from './browserRuntime'
 import { utf8ByteLength } from './wire'
+import { NEW_VOICE_SHORTCUT_COMMANDS } from './newVoiceShortcut'
+import { serializeAssistantSettings } from './assistantSettings'
 const ANDROID_CAPABILITY_IDS = ['custom_provider', 'opencode', 'local_fast', 'local_quality', 'qwen_prediction', 'wake_word', 'vad', 'parakeet', 'tts', 'deep', 'review'] as const
 const COMMAND_ERROR_CODES = ['invalid_input', 'not_found', 'busy', 'unavailable', 'internal'] as const
 type CommandErrorCode = typeof COMMAND_ERROR_CODES[number]
@@ -141,9 +143,9 @@ export function buildAndroidStartupState(snapshot: AppSnapshot): Record<string, 
   const capabilities = new Map(snapshot.capabilities.map((capability) => [capability.id, capability]))
   return {
     kind: 'ready', cue_asset_paths: { start_listening: 'resources/start-listening.wav', stop_listening: 'resources/stop-listening.wav' },
-    runtime_phase: snapshot.runtimePhase, voice_input_available: false, voice_input_error: 'Voice input is unavailable on Android',
+    runtime_phase: snapshot.runtimePhase, voice_input_available: false, voice_input_error: 'Desktop audio input is unavailable on Android; native dictation has separate availability',
     silence_timeout_ms: 1500, selected_response_profile: snapshot.preferences.responseProfile, supported_response_profiles: [],
-    prompt_cancellation_available: true, tts_enabled: false, tts_output_gain_db: 3,
+    prompt_cancellation_available: true, tts_enabled: snapshot.preferences.ttsEnabled, tts_output_gain_db: 3,
     capabilities: ANDROID_CAPABILITY_IDS.map((id) => {
       const capability = capabilities.get(id)
       return capability === undefined
@@ -191,7 +193,7 @@ export async function invokeAndroidCommand(command: string, args?: unknown): Pro
     if (preferences === null || preferences === undefined) throw androidCommandError('internal', 'Android preferences are not hydrated')
     if (command === 'get_ui_theme') return preferences.uiTheme
     if (command === 'get_ui_text_size') return preferences.uiTextSize
-    return { instant: preferences.instant, deep: preferences.deep, review: preferences.review, deep_enabled: preferences.deepEnabled, review_enabled: preferences.reviewEnabled, prefetch: preferences.prefetch, completion: preferences.completion }
+    return serializeAssistantSettings(preferences)
   }
   if (command === 'clear_completion' || command === 'request_completion' || command === 'record_frontend_runtime_diagnostic') return null
   if (command === 'check_for_update' || command === 'install_update' || command === 'restart_for_update' || command === 'synthesize_local_tts') throw androidCommandError('unavailable', 'Command is unavailable on Android')
@@ -207,11 +209,14 @@ export async function invokeAndroidCommand(command: string, args?: unknown): Pro
       setCachedAndroidPreferences(persisted)
       if (command === 'set_ui_theme') return persisted.uiTheme
       if (command === 'set_ui_text_size') return persisted.uiTextSize
-      if (command === 'set_assistant_settings') return { instant: persisted.instant, deep: persisted.deep, review: persisted.review, deep_enabled: persisted.deepEnabled, review_enabled: persisted.reviewEnabled, prefetch: persisted.prefetch, completion: persisted.completion }
+      if (command === 'set_assistant_settings') return serializeAssistantSettings(persisted)
       if (command === 'set_tts_enabled') return { enabled: persisted.ttsEnabled }
       return result
     })
   }
+  if (command === 'save_assistant_draft' || command === 'select_conversation' || command === 'select_conversation_head' || command === 'list_assistant_conversations' || command === 'list_assistant_heads') return invoke(command, args)
+  if (['assistant_voice_status', 'start_assistant_voice', 'finish_assistant_dictation', 'stop_assistant_voice'].includes(command)) return invoke(command, args)
+  if ((NEW_VOICE_SHORTCUT_COMMANDS as readonly string[]).includes(command)) return invoke(command, args)
   if (command === 'cancel_prompt' || command === 'reset_session' || command === 'submit_prompt') {
     const result = await invoke(command, args)
     if (command === 'reset_session') {
@@ -228,7 +233,12 @@ export function androidPreferenceProposal(command: string, args: unknown, curren
   const value = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>
   const settings = value['settings'] as Record<string, unknown> | undefined
   const next = { ...current, ...(command === 'set_ui_theme' ? { uiTheme: value['theme'] } : {}), ...(command === 'set_ui_text_size' ? { uiTextSize: value['textSize'] } : {}), ...(command === 'switch_response_profile' ? { responseProfile: value['profile'] } : {}), ...(command === 'set_tts_enabled' ? { ttsEnabled: value['enabled'] } : {}), ...(command === 'set_assistant_settings' && settings ? { instant: settings['instant'], deep: settings['deep'], review: settings['review'], deepEnabled: settings['deep_enabled'], reviewEnabled: settings['review_enabled'], prefetch: settings['prefetch'], completion: settings['completion'] } : {}) }
-  return { instant: next.instant, deep: next.deep, review: next.review, deep_enabled: next.deepEnabled, review_enabled: next.reviewEnabled, prefetch: next.prefetch, completion: next.completion, response_profile: next.responseProfile, tts_enabled: next.ttsEnabled, ui_theme: next.uiTheme, ui_text_size: next.uiTextSize }
+  return { instant: next.instant, deep: next.deep, review: next.review, deep_enabled: next.deepEnabled, review_enabled: next.reviewEnabled, prefetch: next.prefetch, completion: next.completion, response_profile: next.responseProfile, tts_enabled: next.ttsEnabled, ui_theme: next.uiTheme, ui_text_size: next.uiTextSize,
+    web_enabled: command === 'set_assistant_settings' && settings && Object.prototype.hasOwnProperty.call(settings, 'web_enabled') ? settings['web_enabled'] : current.webEnabled,
+    speech_network_fallback: command === 'set_assistant_settings' && settings && Object.prototype.hasOwnProperty.call(settings, 'speech_network_fallback') ? settings['speech_network_fallback'] : current.speechNetworkFallback,
+    speech_language: command === 'set_assistant_settings' && settings && Object.prototype.hasOwnProperty.call(settings, 'speech_language') ? settings['speech_language'] : current.speechLanguage,
+    speech_tts_provider: command === 'set_assistant_settings' && settings && Object.prototype.hasOwnProperty.call(settings, 'speech_tts_provider') ? settings['speech_tts_provider'] : current.speechTtsProvider,
+    speech_tts_voice: command === 'set_assistant_settings' && settings && Object.prototype.hasOwnProperty.call(settings, 'speech_tts_voice') ? settings['speech_tts_voice'] : current.speechTtsVoice }
 }
 
 export function normalizeTauriError(error: unknown): TauriCommandError {

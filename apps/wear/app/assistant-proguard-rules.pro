@@ -1,0 +1,1 @@
+-keep class dev.gitblame.voxgolem.android.wear.assistant.WearAssistantNative { *; }

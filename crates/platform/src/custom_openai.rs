@@ -2,18 +2,28 @@ use futures_util::StreamExt;
 use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{redirect, Client, StatusCode, Url};
 use serde::{de, Deserialize, Deserializer};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::fmt::{Display, Formatter};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+pub(crate) mod envelope;
+#[cfg(feature = "web-search")]
+pub mod tools;
+pub use envelope::{checked_request, MAX_REQUEST_BYTES};
+#[cfg(test)]
+mod envelope_tests;
+#[cfg(test)]
+mod loopback_tests;
+
 const DEFAULT_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
-const DEFAULT_INSTRUCTIONS: &str = "Answer directly. First line: give the answer naturally using the fewest words possible, never more than 12 words, with no Markdown or label. Then a blank line. Then give the complete answer with any needed detail. Do not repeat the first line verbatim. You have no tools and must not claim to have used tools.";
+const DEFAULT_INSTRUCTIONS: &str = "You have no tools and must not claim to have used tools.";
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const AUTH_EXPIRY_MARGIN_MS: u64 = 60_000;
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_CUSTOM_OPENAI_AUTH_BYTES: u64 = 65_536;
 const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -28,7 +38,7 @@ pub enum CustomOpenAiModel {
 impl CustomOpenAiModel {
     pub fn model_id(self) -> &'static str {
         match self {
-            Self::SolHigh | Self::SolNone => "gpt-6-sol",
+            Self::SolHigh | Self::SolNone => "gpt-6.1-sol",
             Self::LunaNone => "gpt-6-luna",
             Self::LunaLow => "gpt-5.6-luna",
         }
@@ -96,7 +106,7 @@ impl Default for CustomOpenAiConfig {
             endpoint: DEFAULT_ENDPOINT.to_string(),
             auth_path: default_auth_path(),
             model: CustomOpenAiModel::SolHigh,
-            connect_timeout: Duration::from_secs(10),
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             idle_timeout: Duration::from_secs(30),
             total_timeout: Duration::from_secs(180),
         }
@@ -151,6 +161,26 @@ pub struct CustomOpenAiAuthObservation {
     pub status: Result<(), CustomOpenAiError>,
 }
 
+/// Inspect access using the same bounded read, parser and expiry policy as a request.
+/// No HTTP client is constructed and no credentials or observations are retained.
+pub fn observe_custom_openai_auth(path: &Path) -> CustomOpenAiAuthObservation {
+    match read_credential_file(path) {
+        Ok((contents, revision)) => CustomOpenAiAuthObservation {
+            revision: Some(revision),
+            status: parse_request_credential(&contents, revision).map(|_| ()),
+        },
+        Err(error) => CustomOpenAiAuthObservation {
+            revision: None,
+            status: Err(error),
+        },
+    }
+}
+
+/// A fresh path revision for fencing observations against external replacement.
+pub fn custom_openai_auth_revision(path: &Path) -> Option<CustomOpenAiAuthRevision> {
+    path_auth_revision(path)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CustomOpenAiError {
     InvalidConfig,
@@ -193,7 +223,7 @@ impl Display for CustomOpenAiError {
             Self::EmptyResponse => "custom provider completed without visible text",
             Self::Incomplete => "custom provider response was incomplete",
             Self::Failed => "custom provider response failed",
-            Self::TooLarge => "custom provider response exceeded safety limits",
+            Self::TooLarge => "custom provider request or response exceeded safety limits",
         };
         formatter.write_str(message)
     }
@@ -208,6 +238,37 @@ pub struct CustomOpenAiClient {
 
 impl CustomOpenAiClient {
     pub fn new(config: CustomOpenAiConfig) -> Result<Self, CustomOpenAiError> {
+        let config = Self::validated_config(config)?;
+        let client = Self::transport(&config)?;
+        Ok(Self { config, client })
+    }
+
+    /// Reuse this owner's pool with fresh request configuration and credentials.
+    /// The owner must keep the pool on the same continuously driven Tokio runtime.
+    pub fn with_reused_transport(
+        &self,
+        config: CustomOpenAiConfig,
+    ) -> Result<Self, CustomOpenAiError> {
+        let config = Self::validated_config(config)?;
+        if config.endpoint != self.config.endpoint
+            || config.connect_timeout != self.config.connect_timeout
+        {
+            return Err(CustomOpenAiError::InvalidConfig);
+        }
+        Ok(Self {
+            config,
+            client: self.client.clone(),
+        })
+    }
+
+    #[cfg(feature = "web-search")]
+    pub(crate) fn config(&self) -> &CustomOpenAiConfig {
+        &self.config
+    }
+
+    fn validated_config(
+        config: CustomOpenAiConfig,
+    ) -> Result<CustomOpenAiConfig, CustomOpenAiError> {
         let endpoint = config.endpoint.trim().to_string();
         if !valid_endpoint(&endpoint)
             || config.connect_timeout.is_zero()
@@ -216,8 +277,19 @@ impl CustomOpenAiClient {
         {
             return Err(CustomOpenAiError::InvalidConfig);
         }
+        Ok(CustomOpenAiConfig { endpoint, ..config })
+    }
+
+    fn transport(config: &CustomOpenAiConfig) -> Result<Client, CustomOpenAiError> {
+        let endpoint =
+            Url::parse(&config.endpoint).map_err(|_| CustomOpenAiError::InvalidConfig)?;
         #[allow(unused_mut)]
-        let mut client_builder = Client::builder();
+        let mut client_builder = if endpoint.scheme() == "http" {
+            // validated_config admits HTTP only for numeric loopback endpoints.
+            crate::owned_loopback::client_builder()
+        } else {
+            Client::builder()
+        };
         #[cfg(all(feature = "custom-openai-webpki", not(feature = "custom-openai")))]
         {
             let root_store = rustls::RootCertStore {
@@ -236,15 +308,12 @@ impl CustomOpenAiClient {
         {
             client_builder = client_builder.use_rustls_tls();
         }
-        let client = client_builder
+        client_builder
             .redirect(redirect::Policy::none())
             .connect_timeout(config.connect_timeout)
+            .tcp_keepalive(None)
             .build()
-            .map_err(|_| CustomOpenAiError::Transport)?;
-        Ok(Self {
-            config: CustomOpenAiConfig { endpoint, ..config },
-            client,
-        })
+            .map_err(|_| CustomOpenAiError::Transport)
     }
 
     pub async fn respond<F>(
@@ -263,20 +332,11 @@ impl CustomOpenAiClient {
     }
 
     pub fn auth_revision(&self) -> Option<CustomOpenAiAuthRevision> {
-        path_auth_revision(&self.config.auth_path)
+        custom_openai_auth_revision(&self.config.auth_path)
     }
 
     pub fn observe_auth(&self) -> CustomOpenAiAuthObservation {
-        match read_credential_file(&self.config.auth_path) {
-            Ok((contents, revision)) => CustomOpenAiAuthObservation {
-                revision: Some(revision),
-                status: parse_request_credential(&contents, revision).map(|_| ()),
-            },
-            Err(error) => CustomOpenAiAuthObservation {
-                revision: None,
-                status: Err(error),
-            },
-        }
+        observe_custom_openai_auth(&self.config.auth_path)
     }
 
     pub async fn respond_with_instructions<F>(
@@ -296,20 +356,55 @@ impl CustomOpenAiClient {
         &self,
         prompt: &CustomOpenAiPrompt,
         instructions: Option<&str>,
-        mut on_delta: F,
+        on_delta: F,
         on_auth_revision: R,
     ) -> Result<CustomOpenAiResponse, CustomOpenAiError>
     where
         F: FnMut(&str),
         R: FnOnce(CustomOpenAiAuthRevision),
     {
+        self.respond_with_auth_revision_and_dispatch(
+            prompt,
+            instructions,
+            on_delta,
+            on_auth_revision,
+            |_| {},
+        )
+        .await
+    }
+
+    /// Observe dispatch after body preparation, without changing legacy timing origins.
+    pub async fn respond_with_auth_revision_and_dispatch<F, R, D>(
+        &self,
+        prompt: &CustomOpenAiPrompt,
+        instructions: Option<&str>,
+        mut on_delta: F,
+        on_auth_revision: R,
+        on_dispatch: D,
+    ) -> Result<CustomOpenAiResponse, CustomOpenAiError>
+    where
+        F: FnMut(&str),
+        R: FnOnce(CustomOpenAiAuthRevision),
+        D: FnOnce(Instant),
+    {
+        if prompt.session_id.len() > MAX_REQUEST_BYTES || prompt.prompt.len() > MAX_REQUEST_BYTES {
+            return Err(CustomOpenAiError::TooLarge);
+        }
         if prompt.session_id.trim().is_empty() || prompt.prompt.trim().is_empty() {
             return Err(CustomOpenAiError::InvalidPrompt);
         }
         let started = Instant::now();
+        let deadline = tokio::time::Instant::now() + self.config.total_timeout;
+        let request = checked_request(&self.config, prompt, instructions)?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(CustomOpenAiError::Timeout);
+        }
         let credential = load_request_credential(&self.config.auth_path)?;
         on_auth_revision(credential.revision);
-        let request = build_request(&self.config, prompt, instructions);
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(CustomOpenAiError::Timeout);
+        }
         let mut request_builder = self
             .client
             .post(&self.config.endpoint)
@@ -318,12 +413,18 @@ impl CustomOpenAiClient {
             .header(CONTENT_TYPE, "application/json")
             .header("Originator", "opencode")
             .header("session-id", &prompt.session_id)
-            .timeout(self.config.total_timeout);
+            .timeout(remaining);
         if let Some(account_id) = credential.account_id {
             request_builder = request_builder.header("ChatGPT-Account-Id", account_id);
         }
+        let request_builder = request_builder.body(request);
+        on_dispatch(Instant::now());
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(CustomOpenAiError::Timeout);
+        }
         let response = request_builder
-            .json(&request)
+            .timeout(remaining)
             .send()
             .await
             .map_err(map_transport_error)?;
@@ -457,43 +558,13 @@ fn valid_endpoint(endpoint: &str) -> bool {
     }
 }
 
+#[cfg(any(test, feature = "web-search"))]
 fn build_request(
     config: &CustomOpenAiConfig,
     prompt: &CustomOpenAiPrompt,
     instructions: Option<&str>,
 ) -> Value {
-    let input = prompt
-        .history
-        .iter()
-        .map(|message| {
-            let content = match (message.role, message.content_type) {
-                (CustomOpenAiRole::User, _) => {
-                    json!({ "type": "input_text", "text": message.text })
-                }
-                (CustomOpenAiRole::Assistant, CustomOpenAiContentType::OutputText) => {
-                    json!({ "type": "output_text", "text": message.text })
-                }
-                (CustomOpenAiRole::Assistant, CustomOpenAiContentType::Refusal) => {
-                    json!({ "type": "refusal", "refusal": message.text })
-                }
-            };
-            json!({ "role": message.role.as_str(), "content": [content] })
-        })
-        .chain(std::iter::once(json!({
-            "role": "user",
-            "content": [{ "type": "input_text", "text": prompt.prompt }]
-        })))
-        .collect::<Vec<_>>();
-    json!({
-        "model": config.model.model_id(),
-        "instructions": instructions.unwrap_or(DEFAULT_INSTRUCTIONS),
-        "input": input,
-        "reasoning": { "effort": config.model.reasoning_effort() },
-        "stream": true,
-        "store": false,
-        "prompt_cache_key": prompt.session_id,
-        "parallel_tool_calls": false
-    })
+    envelope::initial_value(config, prompt, instructions)
 }
 
 #[derive(Deserialize)]
@@ -582,7 +653,7 @@ fn metadata_auth_revision(metadata: &std::fs::Metadata) -> Option<CustomOpenAiAu
     }
 }
 
-fn path_auth_revision(path: &PathBuf) -> Option<CustomOpenAiAuthRevision> {
+fn path_auth_revision(path: &Path) -> Option<CustomOpenAiAuthRevision> {
     let metadata = std::fs::symlink_metadata(path).ok()?;
     if metadata.file_type().is_symlink() {
         return None;
@@ -591,7 +662,7 @@ fn path_auth_revision(path: &PathBuf) -> Option<CustomOpenAiAuthRevision> {
 }
 
 fn read_credential_file(
-    path: &PathBuf,
+    path: &Path,
 ) -> Result<(Vec<u8>, CustomOpenAiAuthRevision), CustomOpenAiError> {
     let file = std::fs::File::open(path).map_err(|_| CustomOpenAiError::AuthUnavailable)?;
     let metadata = file
@@ -639,7 +710,7 @@ fn parse_request_credential(
     })
 }
 
-fn load_request_credential(path: &PathBuf) -> Result<RequestCredential, CustomOpenAiError> {
+fn load_request_credential(path: &Path) -> Result<RequestCredential, CustomOpenAiError> {
     let (contents, revision) = read_credential_file(path)?;
     parse_request_credential(&contents, revision)
 }
@@ -765,16 +836,16 @@ impl OutputAccumulator {
 }
 
 #[derive(Default)]
-struct SseDecoder {
+pub(crate) struct SseDecoder {
     buffer: Vec<u8>,
 }
 
 impl SseDecoder {
-    fn push(&mut self, chunk: &[u8]) {
+    pub(crate) fn push(&mut self, chunk: &[u8]) {
         self.buffer.extend_from_slice(chunk);
     }
 
-    fn next_data(&mut self) -> Result<Option<String>, CustomOpenAiError> {
+    pub(crate) fn next_data(&mut self) -> Result<Option<String>, CustomOpenAiError> {
         let Some((position, separator_len)) = find_sse_separator(&self.buffer) else {
             if self.buffer.len() > MAX_EVENT_BYTES {
                 return Err(CustomOpenAiError::TooLarge);
@@ -996,12 +1067,361 @@ mod tests {
         assert_eq!(first, Some(visible_at));
     }
 
+    async fn pool_server(
+        listener: TcpListener,
+        accepted: std::sync::Arc<AtomicU64>,
+        observed: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let mut workers = tokio::task::JoinSet::new();
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            accepted.fetch_add(1, Ordering::Relaxed);
+            let observed = observed.clone();
+            workers.spawn(async move {
+                loop {
+                    let mut request = Vec::new();
+                    let mut buffer = [0_u8; 4096];
+                    loop {
+                        let count = socket.read(&mut buffer).await.unwrap();
+                        if count == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buffer[..count]);
+                        if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                            let length = headers.lines().find_map(|line| {
+                                line.strip_prefix("content-length:")?.trim().parse::<usize>().ok()
+                            }).unwrap();
+                            if request.len() >= end + 4 + length {
+                                observed.lock().unwrap().push(headers.lines().find(|line| {
+                                    line.starts_with("authorization:")
+                                }).unwrap().to_string());
+                                break;
+                            }
+                        }
+                    }
+                    let body = concat!(
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Synthetic answer\"}\n\n",
+                        "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+                    );
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(), body
+                    );
+                    if socket.write_all(response.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn independent_clients_do_not_share_idle_connections_across_suspended_runtimes() {
+        let connections = std::sync::Arc::new(AtomicU64::new(0));
+        let accepted = connections.clone();
+        let (address_tx, address_rx) = std::sync::mpsc::sync_channel(1);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        // The server keeps running independently while client runtime A is suspended.
+        let server = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+                address_tx.send(listener.local_addr().unwrap()).unwrap();
+                let task = tokio::spawn(pool_server(listener, accepted, Default::default()));
+                let _ = stop_rx.await;
+                task.abort();
+                let _ = task.await;
+            });
+        });
+        let endpoint = format!("http://{}", address_rx.recv().unwrap());
+        let id = AUTH_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "vox-synthetic-runtime-auth-{}-{id}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"openai":{"access":"synthetic-runtime","expires":4102444800}}"#,
+        )
+        .unwrap();
+        let config = CustomOpenAiConfig {
+            endpoint,
+            auth_path: path.clone(),
+            total_timeout: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let runtime_a = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client_a = CustomOpenAiClient::new(config.clone()).unwrap();
+        let first = runtime_a.block_on(async {
+            let response = client_a.respond(&prompt(), |_| {}).await;
+            tokio::task::yield_now().await;
+            response
+        });
+        assert!(
+            first.is_ok(),
+            "runtime A must establish an idle connection: {first:?}"
+        );
+        let runtime_b = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client_b = CustomOpenAiClient::new(config).unwrap();
+        let second = runtime_b.block_on(client_b.respond(&prompt(), |_| {}));
+        stop_tx.send(()).unwrap();
+        server.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            second.is_ok(),
+            "runtime B must not depend on suspended runtime A: {second:?}"
+        );
+        assert_eq!(
+            connections.load(Ordering::Relaxed),
+            2,
+            "independent clients must own separate pools"
+        );
+        drop(client_a);
+        drop(runtime_a);
+    }
+
+    #[tokio::test]
+    async fn explicitly_owned_clients_reuse_connection_without_reusing_request_credentials() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let connections = std::sync::Arc::new(AtomicU64::new(0));
+        let authorizations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = tokio::spawn(pool_server(
+            listener,
+            connections.clone(),
+            authorizations.clone(),
+        ));
+        let id = AUTH_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "vox-synthetic-pool-auth-{}-{id}.json",
+            std::process::id()
+        ));
+        let config = CustomOpenAiConfig {
+            endpoint,
+            auth_path: path.clone(),
+            total_timeout: Duration::from_secs(3),
+            ..Default::default()
+        };
+        let owner = CustomOpenAiClient::new(config.clone()).unwrap();
+        let mut revisions = Vec::new();
+        for access in ["synthetic-first", "synthetic-second"] {
+            std::fs::write(
+                &path,
+                format!(r#"{{"openai":{{"access":"{access}","expires":4102444800}}}}"#),
+            )
+            .unwrap();
+            let client = owner.with_reused_transport(config.clone()).unwrap();
+            assert_eq!(
+                client
+                    .respond_with_auth_revision(
+                        &prompt(),
+                        None,
+                        |_| {},
+                        |revision| revisions.push(revision)
+                    )
+                    .await
+                    .unwrap()
+                    .text,
+                "Synthetic answer"
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+        server.abort();
+        let _ = server.await;
+        assert_eq!(
+            *authorizations.lock().unwrap(),
+            vec![
+                "authorization: bearer synthetic-first",
+                "authorization: bearer synthetic-second"
+            ]
+        );
+        assert_eq!(
+            connections.load(Ordering::Relaxed),
+            1,
+            "sequential requests should retain the existing HTTP connection pool"
+        );
+        assert_ne!(revisions[0], revisions[1]);
+    }
+
+    #[test]
+    fn explicit_reuse_validates_policy_but_accepts_new_request_configuration() {
+        let config = CustomOpenAiConfig {
+            connect_timeout: Duration::from_secs(2),
+            ..Default::default()
+        };
+        let owner = CustomOpenAiClient::new(config.clone()).unwrap();
+        let mut request_config = config.clone();
+        request_config.endpoint = format!(" {} ", request_config.endpoint);
+        request_config.auth_path = PathBuf::from("/synthetic/new-auth.json");
+        request_config.model = CustomOpenAiModel::LunaNone;
+        request_config.idle_timeout = Duration::from_secs(4);
+        request_config.total_timeout = Duration::from_secs(6);
+        let request_client = owner.with_reused_transport(request_config).unwrap();
+        assert_eq!(
+            request_client.config.auth_path,
+            PathBuf::from("/synthetic/new-auth.json")
+        );
+        assert_eq!(request_client.config.model, CustomOpenAiModel::LunaNone);
+        assert_eq!(request_client.config.idle_timeout, Duration::from_secs(4));
+        assert_eq!(request_client.config.total_timeout, Duration::from_secs(6));
+        for invalid in [
+            CustomOpenAiConfig {
+                endpoint: "http://127.0.0.1:8080".into(),
+                ..config.clone()
+            },
+            CustomOpenAiConfig {
+                endpoint: "https://example.test/responses".into(),
+                ..config.clone()
+            },
+            CustomOpenAiConfig {
+                connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+                ..config.clone()
+            },
+            CustomOpenAiConfig {
+                connect_timeout: Duration::ZERO,
+                ..config.clone()
+            },
+            CustomOpenAiConfig {
+                idle_timeout: Duration::ZERO,
+                ..config.clone()
+            },
+            CustomOpenAiConfig {
+                total_timeout: Duration::ZERO,
+                ..config.clone()
+            },
+        ] {
+            assert!(matches!(
+                owner.with_reused_transport(invalid),
+                Err(CustomOpenAiError::InvalidConfig)
+            ));
+        }
+        assert!(
+            owner.with_reused_transport(config).is_ok(),
+            "a rejected configuration must not poison the owner"
+        );
+    }
+
+    #[cfg(feature = "web-search")]
+    #[tokio::test]
+    async fn dispatch_observers_exclude_preparation_but_preserve_legacy_timing_origins() {
+        use std::cell::Cell;
+        use tools::{ModelEvent, RoundOptions, RoundRequest};
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(pool_server(listener, Default::default(), observed.clone()));
+        let id = AUTH_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "vox-synthetic-dispatch-{}-{id}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"openai":{"access":"synthetic-dispatch","expires":4102444800}}"#,
+        )
+        .unwrap();
+        let config = CustomOpenAiConfig {
+            endpoint,
+            auth_path: path.clone(),
+            total_timeout: Duration::from_secs(3),
+            ..Default::default()
+        };
+        let client = CustomOpenAiClient::new(config.clone()).unwrap();
+        let mut prompt = prompt();
+        prompt.prompt = "Synthetic preparation ".repeat(8000);
+        for tool_route in [false, true] {
+            let dispatch = Cell::new(None);
+            let visible = Cell::new(None);
+            let prepared = Cell::new(None);
+            let before = observed.lock().unwrap().len();
+            let prepare = || {
+                std::thread::sleep(Duration::from_millis(80));
+                prepared.set(Some(Instant::now()));
+            };
+            let on_dispatch = |instant: Instant| {
+                assert!(dispatch.replace(Some(instant)).is_none());
+                assert!(instant >= prepared.get().unwrap());
+                assert_eq!(
+                    observed.lock().unwrap().len(),
+                    before,
+                    "send must not be polled before dispatch"
+                );
+            };
+            let on_text = |text: &str| {
+                if !text.trim().is_empty() && visible.get().is_none() {
+                    visible.set(Some(
+                        dispatch.get().expect("dispatch before text").elapsed(),
+                    ));
+                }
+            };
+            let response = if tool_route {
+                let input = tools::initial_input(&config, &prompt);
+                client
+                    .tool_round_with_events(
+                        RoundRequest {
+                            session_id: &prompt.session_id,
+                            input: &input,
+                            instructions: "Synthetic policy",
+                            tools: &[],
+                        },
+                        RoundOptions {
+                            deadline: tokio::time::Instant::now() + Duration::from_secs(3),
+                            expected_auth_revision: None,
+                            require_tool: false,
+                        },
+                        |event| {
+                            match event {
+                                ModelEvent::AuthRevision(_) => prepare(),
+                                ModelEvent::RequestDispatched(instant) => on_dispatch(instant),
+                                ModelEvent::TextDelta { text, .. } => on_text(text),
+                            }
+                            Ok(())
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .response
+            } else {
+                client
+                    .respond_with_auth_revision_and_dispatch(
+                        &prompt,
+                        None,
+                        on_text,
+                        |_| prepare(),
+                        on_dispatch,
+                    )
+                    .await
+                    .unwrap()
+            };
+            assert!(
+                response.timings.first_text_at.unwrap()
+                    >= visible.get().unwrap() + Duration::from_millis(80),
+                "legacy clock must still include preparation"
+            );
+            assert!(response.timings.headers_at >= Duration::from_millis(80));
+            assert!(response.timings.completed_at >= response.timings.first_text_at.unwrap());
+        }
+        std::fs::remove_file(path).unwrap();
+        server.abort();
+        let _ = server.await;
+    }
+
     #[tokio::test]
     async fn respond_streams_text_and_sends_sensitive_compatible_request() {
         let events = sse(&[
             r#"{"type":"response.output_text.delta","delta":"hel"}"#,
             r#"{"type":"response.output_text.delta","delta":"lo"}"#,
-            r#"{"type":"response.completed","response":{"model":"gpt-6-sol","service_tier":"default","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,"input_tokens_details":{"cached_tokens":3}}}}"#,
+            r#"{"type":"response.completed","response":{"model":"gpt-6.1-sol","service_tier":"default","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,"input_tokens_details":{"cached_tokens":3}}}}"#,
         ]);
         let (request, deltas, result) = fixture(
             200,
@@ -1017,7 +1437,7 @@ mod tests {
         assert!(request_text.contains("originator: opencode"));
         let body = request_text.split("\r\n\r\n").nth(1).unwrap();
         let body: Value = serde_json::from_str(body).unwrap();
-        assert_eq!(body["model"], "gpt-6-sol");
+        assert_eq!(body["model"], "gpt-6.1-sol");
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["store"], false);
         assert!(body.get("tools").is_none());
@@ -1137,9 +1557,9 @@ mod tests {
 
     #[test]
     fn maps_sol_and_luna_without_substitution() {
-        assert_eq!(CustomOpenAiModel::SolHigh.model_id(), "gpt-6-sol");
+        assert_eq!(CustomOpenAiModel::SolHigh.model_id(), "gpt-6.1-sol");
         assert_eq!(CustomOpenAiModel::SolHigh.reasoning_effort(), "high");
-        assert_eq!(CustomOpenAiModel::SolNone.model_id(), "gpt-6-sol");
+        assert_eq!(CustomOpenAiModel::SolNone.model_id(), "gpt-6.1-sol");
         assert_eq!(CustomOpenAiModel::SolNone.reasoning_effort(), "none");
         assert_eq!(CustomOpenAiModel::LunaLow.model_id(), "gpt-5.6-luna");
         assert_eq!(CustomOpenAiModel::LunaLow.reasoning_effort(), "low");
@@ -1152,7 +1572,7 @@ mod tests {
             ..CustomOpenAiConfig::default()
         };
         let request = build_request(&config, &prompt(), None);
-        assert_eq!(request["model"], "gpt-6-sol");
+        assert_eq!(request["model"], "gpt-6.1-sol");
         assert_eq!(request["reasoning"]["effort"], "none");
         assert_eq!(request["store"], false);
         assert!(request.get("tools").is_none());
@@ -1184,7 +1604,10 @@ mod tests {
         assert_eq!(request["stream"], true);
         assert_eq!(request["store"], false);
         assert!(request.get("tools").is_none());
-        assert_eq!(request["instructions"], DEFAULT_INSTRUCTIONS);
+        assert_eq!(
+            request["instructions"],
+            voxgolem_core::response_style::compose_instructions(DEFAULT_INSTRUCTIONS)
+        );
         assert_eq!(request["input"][0]["content"][0]["type"], "refusal");
         assert_eq!(request["input"][1]["content"][0]["text"], "Say hello");
     }
@@ -1199,7 +1622,9 @@ mod tests {
         );
         assert_eq!(
             request["instructions"],
-            "Return strict JSON only: {\"answer\": string}"
+            voxgolem_core::response_style::compose_instructions(
+                "Return strict JSON only: {\"answer\": string}"
+            )
         );
         assert!(!request["instructions"]
             .as_str()
@@ -1308,6 +1733,54 @@ mod tests {
             1,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn transport_independent_auth_observation_reads_replacements_and_bounds() {
+        let id = AUTH_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("vox-synthetic-auth-observation-{id}.json"));
+        let absent = observe_custom_openai_auth(&path);
+        assert_eq!(absent.status, Err(CustomOpenAiError::AuthUnavailable));
+        assert_eq!(absent.revision, None);
+        std::fs::write(
+            &path,
+            r#"{"openai":{"access":"synthetic-access","expires":4102444800000}}"#,
+        )
+        .unwrap();
+        let ready = observe_custom_openai_auth(&path);
+        assert_eq!(ready.status, Ok(()));
+        assert_eq!(ready.revision, custom_openai_auth_revision(&path));
+        assert_eq!(
+            load_request_credential(&path).unwrap().revision,
+            ready.revision.unwrap()
+        );
+        let replacement = path.with_extension("replacement");
+        std::fs::write(
+            &replacement,
+            r#"{"openai":{"access":"synthetic-expired-access","expires":1}}"#,
+        )
+        .unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let expired = observe_custom_openai_auth(&path);
+        assert_eq!(expired.status, Err(CustomOpenAiError::AuthExpired));
+        assert_ne!(expired.revision, ready.revision);
+        assert!(matches!(
+            load_request_credential(&path),
+            Err(CustomOpenAiError::AuthExpired)
+        ));
+        for invalid in [
+            br#"{"openai":{"access":"synthetic\ninvalid-header","expires":4102444800000}}"#
+                .to_vec(),
+            br#"{"_assistant":{"generation":"0"}}"#.to_vec(),
+            vec![b'x'; MAX_CUSTOM_OPENAI_AUTH_BYTES as usize + 1],
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            assert_eq!(
+                observe_custom_openai_auth(&path).status,
+                Err(CustomOpenAiError::AuthUnavailable)
+            );
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

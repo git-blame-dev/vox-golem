@@ -1,0 +1,25 @@
+[package]
+name = "voxgolem-wear-assistant-native"
+edition.workspace = true
+publish = false
+
+[lib]
+name = "wear_assistant_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+jni = "=0.21.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sha2 = "=0.10.9"
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
+voxgolem-platform = { path = "../platform", default-features = false, features = ["custom-openai-webpki", "web-search"] }
+voxgolem-core = { path = "../core", default-features = false }
+
+# Exported JNI names require no_mangle; unsafe blocks remain denied.
+[lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+all = "deny"

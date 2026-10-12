@@ -4,7 +4,16 @@ edition.workspace = true
 
 [features]
 default = ["desktop", "custom-openai"]
+web-search = [
+  "custom-openai-webpki",
+  "dep:rmcp",
+  "dep:voxgolem-core",
+  "tokio/macros",
+  "tokio/rt",
+  "tokio/sync",
+]
 custom-openai = [
+  "dep:voxgolem-core",
   "dep:futures-util",
   "dep:reqwest",
   "reqwest/json",
@@ -14,6 +23,7 @@ custom-openai = [
   "tokio/time",
 ]
 custom-openai-webpki = [
+  "dep:voxgolem-core",
   "dep:futures-util",
   "dep:reqwest",
   "reqwest/json",
@@ -25,6 +35,7 @@ custom-openai-webpki = [
   "dep:webpki-roots",
 ]
 desktop = [
+  "dep:voxgolem-core",
   "dep:futures-util",
   "dep:rand",
   "dep:reqwest",
@@ -43,6 +54,8 @@ desktop = [
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rmcp = { version = "=3.5.1", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"], optional = true }
+voxgolem-core = { path = "../core", default-features = false, optional = true }
 futures-util = { version = "0.3", optional = true }
 reqwest = { version = "0.13", default-features = false, optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
