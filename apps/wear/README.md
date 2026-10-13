@@ -10,6 +10,13 @@ An independent native Wear OS Gradle root with four launcher entries:
 - **Vox Talk** uses that same pipeline and reopens recognition after reply/playback;
   it does not create a new chat. Stop cancels without sending.
 
+All four entries retain the canonical VoxGolem logo with a bottom-right purpose
+badge: chat bubble for Chat, microphone for Ask, conversation bubbles for Talk,
+and note page for Note. Phone Chat/Ask/Talk use the same generated artwork. These
+are launcher-only variants; in-app emblems and the Note background are unchanged.
+Ask/Talk retain their existing exported, one-tap microphone behavior, permission
+and foreground/cancellation checks. Another app can also invoke these entries.
+
 The shell uses Kotlin/Compose, not Tauri or a WebView. It directly depends on the
 ordinary [capture-android](../../crates/capture-android/README.md) and
 [assistant-android](../../crates/assistant-android/README.md) and
@@ -145,7 +152,9 @@ new chat, retries a blocked launch later, nor replays on recreation or ordinary 
 Watch launcher caller verification was explicitly removed to permit direct automatic
 start: another app can invoke these exported entries when microphone permission is
 already granted. This is not silent background capture; the visible foreground and
-ownership checks remain. Phone unverified shortcuts still require an in-app tap.
+ownership checks remain. Phone Ask/Talk now use the same externally invocable,
+one-tap entry policy; pinning a phone home-screen shortcut still requires launcher
+confirmation.
 
 While the Assistant is resumed, its native window requests **keep screen on for up to
 two minutes of inactivity**. Real touch or rotary input resets the window; changed

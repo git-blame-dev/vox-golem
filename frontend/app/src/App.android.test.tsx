@@ -641,7 +641,9 @@ describe('Android App lifecycle', () => {
     expect(invoke.mock.calls.some(([command]) => command === 'submit_prompt' || command === 'prepare_new_voice_shortcut')).toBe(false)
     expect(invoke).toHaveBeenCalledWith('stop_assistant_voice', undefined)
   })
-  it.each([true, false])('Ask preserves current context and refuses microphone entry without provider admission: %s', async (accessReady) => {
+  it.each([
+    ['ask', true], ['ask', false], ['talk', true], ['talk', false],
+  ] as const)('%s launcher preserves current context and refuses microphone entry without provider admission: %s', async (entryMode, accessReady) => {
     vi.useFakeTimers()
     const id = (sequence: number): string => `11111111-1111-4111-8111-111111111111:${sequence}`
     const token = '22222222-2222-4222-8222-222222222222'
@@ -659,8 +661,8 @@ describe('Android App lifecycle', () => {
       if (command === 'get_app_snapshot') return snapshot()
       if (command === 'get_startup_state') return readyStartupState()
       if (command === 'assistant_voice_status') return voice
-      if (command === 'consume_new_voice_shortcut') { if (!launch) return { token: null, error: null }; launch = false; return { token, error: null } }
-      if (command === 'start_assistant_voice') { sessionId = (args as { sessionId: string }).sessionId; return { ...voice, mode: 'ask', dictation: 'listening', loop: 'listening' } }
+      if (command === 'consume_new_voice_shortcut') { if (!launch) return { token: null, error: null }; launch = false; return { token, error: null, mode: entryMode } }
+      if (command === 'start_assistant_voice') { sessionId = (args as { sessionId: string }).sessionId; return { ...voice, mode: entryMode === 'talk' ? 'loop' : 'ask', dictation: 'listening', loop: 'listening' } }
       if (command === 'reset_session') { drafts.set(selected, (args as { draft: string }).draft); selected = id(2); return snapshot() }
       if (command === 'save_assistant_draft') { drafts.set(selected, (args as { text: string }).text); return null }
       if (command === 'submit_prompt') { expect(selected).toBe(id(1)); expect(snapshot().transcript).toHaveLength(1); return { kind: 'cancelled' } }
@@ -684,7 +686,7 @@ describe('Android App lifecycle', () => {
       expect(invoke.mock.calls.some(([command]) => command === 'submit_prompt')).toBe(false)
       return
     }
-    expect(invoke).toHaveBeenCalledWith('start_assistant_voice', expect.objectContaining({ draft: 'Synthetic old unsent draft', completionPolicy: 'single_turn', launchToken: token }))
+    expect(invoke).toHaveBeenCalledWith('start_assistant_voice', expect.objectContaining({ draft: 'Synthetic old unsent draft', loopMode: entryMode === 'talk', completionPolicy: entryMode === 'talk' ? 'repeat_after_reply' : 'single_turn', launchToken: token }))
     await act(async () => { input({ sessionId, kind: 'dictation', phase: 'final', draft: 'Synthetic new voice words', utterance: '1', error: null }) })
     expect(invoke.mock.calls.some(([command]) => command === 'reset_session')).toBe(false)
     expect(container.querySelector<HTMLTextAreaElement>('#promptComposer')?.value).toBe('Synthetic new voice words')

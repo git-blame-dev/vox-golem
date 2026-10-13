@@ -17,6 +17,26 @@ class NewVoiceShortcutPolicyTest {
         val gate = ShortcutActionGate(); gate.offer(token); gate.background(); assertNull(gate.consume())
         assertFalse(gate.offer("synthetic-untrusted-prompt"))
     }
+    @Test fun entryPolicyRemainsBoundToItsTokenUntilRetirement() {
+        val gate = ShortcutActionGate()
+        assertTrue(gate.offer(token, VoiceEntryMode.TALK))
+        assertEquals(VoiceEntryMode.TALK, gate.mode(token))
+        assertFalse(gate.permits(token, true, "repeat_after_reply"))
+        assertEquals(token, gate.consume())
+        assertTrue(gate.permits(token, true, "repeat_after_reply"))
+        assertFalse(gate.permits(token, false, "single_turn"))
+        assertFalse(gate.permits(token, false, "stop_send_new"))
+        assertFalse(gate.offer("22222222-2222-4222-8222-222222222222", VoiceEntryMode.ASK))
+        gate.release(token)
+        assertNull(gate.mode(token)); assertFalse(gate.permits(token, true, "repeat_after_reply"))
+        val ask = "22222222-2222-4222-8222-222222222222"
+        assertTrue(gate.offer(ask)); assertEquals(ask, gate.consume())
+        assertEquals(VoiceEntryMode.ASK, gate.mode(ask))
+        assertTrue(gate.permits(ask, false, "single_turn"))
+        assertTrue(gate.permits(ask, false, "stop_send_new"))
+        assertFalse(gate.permits(ask, true, "repeat_after_reply"))
+        gate.background(); assertNull(gate.mode(ask))
+    }
     @Test fun notificationRequiresTheExactPendingTokenAndDoesNotReplayAfterConsumption() {
         val gate = ShortcutActionGate()
         gate.offer(token)
