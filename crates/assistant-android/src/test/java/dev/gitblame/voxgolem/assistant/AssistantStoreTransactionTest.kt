@@ -42,6 +42,23 @@ class AssistantStoreTransactionTest {
 
     @After fun closeStores() { stores.forEach(AssistantStore::close) }
 
+    @Test fun committedSnapshotRejectsAmbiguousOrMalformedRevisionDocuments() {
+        val store = open()
+        store.snapshot() // Create the database before injecting synthetic corrupt committed state.
+        val invalid = listOf(
+            "{\"revision\":\"0\",\"revision\":\"0\"}",
+            "{\"revision\":0}", "{}", "{\"revision\":\"0\"} {}",
+            "{\"revision\":\"0\",\"records\":[}",
+            "{revision:'0'}",
+        )
+        for (raw in invalid) {
+            SQLiteDatabase.openDatabase(File(context.noBackupFilesDir, "assistant.db").path, null, 0).use {
+                it.execSQL("UPDATE state SET snapshot = ?", arrayOf(raw))
+            }
+            assertThrows("Accepted synthetic corrupt snapshot: $raw", Exception::class.java) { store.snapshot() }
+        }
+    }
+
     @Test fun injectedPreCommitFailureRollsBackEveryPublicationAndReceiptWithoutNativeLibrary() {
         val store = open()
         store.beforeCommit = { error("Synthetic transaction failure") }

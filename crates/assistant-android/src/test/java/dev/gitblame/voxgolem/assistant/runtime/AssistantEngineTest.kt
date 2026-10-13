@@ -711,6 +711,98 @@ class AssistantEngineTest {
         assertTrue(snapshots.single().viewJson.contains("Synthetic final answer"))
     }
 
+    @Test fun phoneStartupContextIsConsumedOnceAndRevisionChangeDiscardsIt() {
+        val calls = mutableListOf<JSONObject>()
+        val queue = Queue()
+        val instance = AssistantEngine(store, queue, AssistantRequestWorker(providerQueue, provider),
+            { "/synthetic/private/auth.json" }, models,
+            projectionGateway = dev.gitblame.voxgolem.assistant.DomainGateway { raw ->
+                calls += JSONObject(raw)
+                dev.gitblame.voxgolem.assistant.AssistantDomainNative.apply(raw)
+            }, preparePhoneContext = true)
+        queue.drain()
+        assertEquals(1, calls.size)
+        assertEquals("context", calls.single().getJSONObject("request").getJSONObject("read").getString("kind"))
+        instance.resume(); queue.drain()
+        assertEquals(1, calls.size)
+        instance.selectedContext { _, _ -> }; queue.drain()
+        assertEquals(1, calls.size)
+        instance.selectedContext { _, _ -> }; queue.drain()
+        assertEquals(2, calls.size)
+        instance.stop(); queue.drain()
+
+        calls.clear()
+        val stale = AssistantEngine(store, queue, AssistantRequestWorker(providerQueue, provider),
+            { "/synthetic/private/auth.json" }, models,
+            projectionGateway = dev.gitblame.voxgolem.assistant.DomainGateway { raw ->
+                calls += JSONObject(raw)
+                dev.gitblame.voxgolem.assistant.AssistantDomainNative.apply(raw)
+            }, preparePhoneContext = true)
+        queue.drain()
+        store.createConversation("Synthetic intervening import equivalent")
+        stale.selectedContext { _, _ -> }; queue.drain()
+        assertEquals(2, calls.size)
+        stale.stop(); queue.drain()
+    }
+
+    @Test fun existingConversationAdmissionCombinesProjectionWithUtf8BudgetedContext() {
+        val conversation = store.createConversation("Synthetic existing conversation").getJSONObject("operation").getJSONObject("id")
+        store.selectConversation(conversation, null)
+        val calls = mutableListOf<JSONObject>()
+        val queue = Queue()
+        val worker = AssistantRequestWorker(providerQueue, provider)
+        val instance = AssistantEngine(store, queue, worker, { "/synthetic/private/auth.json" }, models,
+            projectionGateway = dev.gitblame.voxgolem.assistant.DomainGateway { raw ->
+                calls += JSONObject(raw)
+                dev.gitblame.voxgolem.assistant.AssistantDomainNative.apply(raw)
+            })
+        instance.resume(); queue.drain(); calls.clear()
+        val prompt = "Synthetic 🧪 admission"
+        instance.submit("synthetic-budget", prompt, resultListener = AssistantResultListener { _, _ -> })
+        queue.drain()
+        assertEquals(listOf("projection", "projection"), calls.map { it.getString("kind") })
+        val read = calls.first().getJSONObject("request").getJSONObject("read")
+        assertEquals(20, read.getInt("max_turns"))
+        assertEquals(256 * 1024 - prompt.toByteArray(Charsets.UTF_8).size, read.getInt("max_text_bytes"))
+        instance.stop(); providerQueue.drain(); queue.drain(); worker.close()
+        assertTrue(AssistantEngine::class.java.declaredConstructors.any { it.parameterTypes.size == 8 && it.parameterTypes.first() == AssistantStore::class.java })
+    }
+
+    @Test fun startupHandoffPreservesInterveningActorDraftAndRejectsLocalSelectionOnlyChange() {
+        val first = store.createConversation("Synthetic first").getJSONObject("operation").getJSONObject("id")
+        val second = store.createConversation("Synthetic second").getJSONObject("operation").getJSONObject("id")
+        store.selectConversation(first, null)
+        val calls = mutableListOf<JSONObject>()
+        val queue = Queue()
+        fun instance() = AssistantEngine(store, queue, AssistantRequestWorker(providerQueue, provider),
+            { "/synthetic/private/auth.json" }, models,
+            projectionGateway = dev.gitblame.voxgolem.assistant.DomainGateway { raw ->
+                calls += JSONObject(raw)
+                dev.gitblame.voxgolem.assistant.AssistantDomainNative.apply(raw)
+            }, preparePhoneContext = true)
+        val draftOwner = instance()
+        queue.drain()
+        draftOwner.setDraft("Synthetic intervening draft"); queue.drain()
+        draftOwner.selectedContext { _, captured -> assertEquals("Synthetic intervening draft", captured.draft) }
+        queue.drain()
+        assertEquals(1, calls.size)
+        draftOwner.stop(); queue.drain()
+
+        calls.clear()
+        val selectedOwner = instance()
+        queue.drain()
+        val before = store.snapshot().getString("revision")
+        store.selectConversation(second, null)
+        assertEquals(before, store.snapshot().getString("revision"))
+        selectedOwner.selectedContext { raw, captured ->
+            assertEquals(second.toString(), captured.conversation)
+            assertEquals(second.toString(), JSONObject(raw!!).getJSONObject("conversation").toString())
+        }
+        queue.drain()
+        assertEquals(2, calls.size)
+        selectedOwner.stop(); queue.drain()
+    }
+
     @Test fun deliveryWithoutAckCannotCommitAndResultIsDeliveryFailed() {
         val results = mutableListOf<AssistantRequestResult>()
         val delivery = AcknowledgedAssistantDelivery("synthetic-client-1", {}, timeoutMillis = 10)

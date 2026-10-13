@@ -77,6 +77,7 @@ class AssistantEngine @JvmOverloads internal constructor(
     projectionGateway: DomainGateway = DomainGateway(AssistantDomainNative::apply),
     private val beginTiming: (Operation) -> AssistantTiming = { AssistantTiming.begin(null, it) },
     private val startupTiming: AssistantTiming? = null,
+    private val preparePhoneContext: Boolean = false,
 ) : AssistantClient {
     private class Ticket(
         val token: String, val epoch: Long,
@@ -111,6 +112,8 @@ class AssistantEngine @JvmOverloads internal constructor(
     private val externalSessions = LinkedHashMap<String, String>(256, 0.75f, true)
     private var afterRetirement: (() -> Unit)? = null
     private var active: Active? = null
+    private data class StartupContext(val json: String?, val revision: String, val conversation: String?, val head: String?)
+    private var startupContext: StartupContext? = null
     private var state = policies.read().let { AssistantState(webEnabled = it.webEnabled, speechNetworkFallback = it.speechNetworkFallback,
         speechLanguage = it.speechLanguage, speechTtsProvider = it.speechTtsProvider, speechTtsVoice = it.speechTtsVoice) }
     @Volatile private var published = state
@@ -128,7 +131,9 @@ class AssistantEngine @JvmOverloads internal constructor(
                 speechLanguage = policy.speechLanguage, speechTtsProvider = policy.speechTtsProvider, speechTtsVoice = policy.speechTtsVoice)
             loadDraft()
             startupTiming?.mark(Stage.DRAFT_LOADED)
-            refreshProjection()
+            val prepared = refreshProjection(if (preparePhoneContext) AssistantProjectionRead.Context() else null)
+            if (preparePhoneContext) startupContext = StartupContext(prepared?.toString(),
+                JSONObject(state.viewJson).getString("revision"), state.conversation, state.selectedHead)
             if (state.model !in AssistantModels.aliases) state = state.copy(error = "unsupported_model")
             startupTiming?.mark(Stage.HYDRATION_COMPLETED)
         }
@@ -147,7 +152,15 @@ class AssistantEngine @JvmOverloads internal constructor(
         return AutoCloseable { observers -= observer }
     }
 
-    override fun resume() = dispatch { state = state.copy(foreground = true); refreshProjection() }
+    override fun resume() = dispatch {
+        state = state.copy(foreground = true)
+        val prepared = startupContext
+        if (prepared != null && active == null && !state.busy &&
+            state.conversation == prepared.conversation && state.selectedHead == prepared.head &&
+            store.projectionStillCurrent(prepared.revision, prepared.conversation, prepared.head)) {
+            state = state.copy(credential = credentials?.status())
+        } else refreshProjection()
+    }
     override fun refresh() = dispatch { refreshProjection() }
     fun refresh(onSettled: (AssistantState) -> Unit) = dispatch(onSettled) { refreshProjection() }
 
@@ -157,7 +170,13 @@ class AssistantEngine @JvmOverloads internal constructor(
     fun selectedContext(onSettled: (String?, AssistantState) -> Unit) {
         var context: String? = null
         dispatch({ onSettled(context, it) }) {
-            context = refreshProjection(AssistantProjectionRead.Context)?.toString()
+            val prepared = startupContext.also { startupContext = null }
+            context = if (prepared != null && active == null && !state.busy &&
+                state.conversation == prepared.conversation && state.selectedHead == prepared.head &&
+                store.projectionStillCurrent(prepared.revision, prepared.conversation, prepared.head)) {
+                state = state.copy(credential = credentials?.status())
+                prepared.json
+            } else refreshProjection(AssistantProjectionRead.Context())?.toString()
         }
     }
 
@@ -457,26 +476,29 @@ class AssistantEngine @JvmOverloads internal constructor(
             ticket.timing.mark(Stage.CREDENTIAL_CHECKED)
             if (state.model !in AssistantModels.aliases) { fail("unsupported_model"); return }
             if ((if (voiceOwner != null) promptOverride ?: state.draft else state.draft).isBlank()) { fail("empty_prompt"); return }
-            refreshProjection()
+            val prompt = if (voiceOwner != null) promptOverride ?: state.draft else state.draft
+            val contextRead = AssistantProjectionRead.Context(256 * 1024 - prompt.toByteArray(Charsets.UTF_8).size)
+            val projectedContext = refreshProjection(contextRead)
             ticket.timing.mark(Stage.PROJECTION_REFRESHED)
             if (voiceOwner != null && (state.conversation != voiceOwner.conversation || state.selectedHead != voiceOwner.selectedHead)) {
                 loadDraft(); fail("conversation_changed"); return
             }
             if (state.branchChoices.isNotEmpty()) { fail("choose_continuation"); return }
-            val prompt = if (voiceOwner != null) promptOverride ?: state.draft else state.draft
             val fresh = state.conversation == null
             if (fresh) {
                 val creation = store.createConversation("Conversation")
                 val id = creation.getJSONObject("operation").getJSONObject("id")
                 state = state.copy(conversation = id.toString(), selectedHead = null)
             }
-            val raw = store.snapshot().toString()
             val pinnedConversation = voiceOwner?.conversation?.let(::JSONObject) ?: conversation()
             val pinnedHead = if (voiceOwner == null) head() else voiceOwner.selectedHead?.let(::JSONObject)
-            val context = domain.evaluate("context", raw, JSONObject().put("request", JSONObject()
-                .put("expected_revision", JSONObject(raw).getString("revision"))
-                .put("conversation", pinnedConversation).put("selected_head", pinnedHead ?: JSONObject.NULL)
-                .put("max_turns", 20).put("max_text_bytes", 256 * 1024 - prompt.toByteArray(Charsets.UTF_8).size))) as JSONObject
+            // A fresh conversation needs the snapshot after its actual create commit.
+            val context = if (fresh) {
+                val projection = domain.project(store.committedSnapshot().rawJson,
+                    pinnedConversation, pinnedHead, false, contextRead)
+                state = state.copy(viewJson = projection.view.toString())
+                requireNotNull(projection.read())
+            } else requireNotNull(projectedContext)
             ticket.timing.mark(Stage.CONTEXT_PREPARED)
             if (voiceOwner != null) {
                 // A replica may commit between reconciliation and snapshot capture. Never let context's automatic head selection reparent this voice turn.
@@ -687,13 +709,14 @@ class AssistantEngine @JvmOverloads internal constructor(
     }
 
     private fun refreshProjection(read: AssistantProjectionRead? = null): JSONObject? {
+        startupContext = null
         state = state.copy(credential = credentials?.status())
         startupTiming?.mark(Stage.CREDENTIAL_STATUS_READ)
         if (active == null) {
             val local = store.localState()
             state = state.copy(conversation = local.objectOrNull("conversation")?.toString(), selectedHead = local.objectOrNull("selected_head")?.toString())
         }
-        val raw = store.snapshot().toString()
+        val raw = store.committedSnapshot().rawJson
         startupTiming?.mark(Stage.CANONICAL_SNAPSHOT_LOADED)
         val projection = domain.project(raw, conversation(), head(), active != null, read)
         startupTiming?.mark(Stage.DOMAIN_PROJECTION_COMPLETED)
