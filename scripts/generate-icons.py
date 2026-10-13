@@ -51,7 +51,7 @@ def monochrome_layer(source):
     return layer
 
 
-def phone_shortcut_layer(source):
+def entry_layer(source, purpose):
     color = source.get("color", "")
     if re.fullmatch(r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})", color) is None:
         raise ValueError("The shortcut icon requires an opaque hex root color (#RGB or #RRGGBB)")
@@ -59,23 +59,62 @@ def phone_shortcut_layer(source):
     mark = layer.find(f"{SVG}g[@id='mark']")
     if mark is None:
         raise ValueError("The icon must contain its artwork in the mark group")
+    fraction = artwork_geometry(source)
+    x, y, width, height = map(float, source.attrib["viewBox"].split())
+    cx, cy = x + width / 2, y + height / 2
+    radius = width * fraction / 2
     mark_index = list(layer).index(mark)
     layer.remove(mark)
     scaled = ET.Element(SVG + "g", {
         "id": "shortcut-mark",
-        "transform": "translate(54 54) scale(0.82) translate(-54 -54)",
+        "transform": f"translate({cx:g} {cy:g}) scale(0.82) translate({-cx:g} {-cy:g})",
     })
     scaled.append(mark)
     layer.insert(mark_index, scaled)
-    badge = ET.SubElement(layer, SVG + "g", {"id": "new-voice-badge"})
-    ET.SubElement(badge, SVG + "circle", {
-        "cx": "72", "cy": "72", "r": "8", "fill": "#000000", "stroke": "none",
+    badge = ET.SubElement(layer, SVG + "g", {
+        "id": "entry-badge",
+        "transform": f"translate({cx + radius * .5:g} {cy + radius * .5:g}) scale({radius / 28:g})",
     })
+    ET.SubElement(badge, SVG + "circle", {
+        "cx": "0", "cy": "0", "r": "7", "fill": "#000000", "stroke": "none",
+    })
+    glyphs = {
+        "ask": "M-2-1V-3A2 2 0 0 1 2-3V-1A2 2 0 0 1-2-1Z M-4-1V0A4 4 0 0 0 4 0V-1 M0 4V6 M-2 6H2",
+        "chat": "M-4-3H4V2H0L-3 5V2H-4Z",
+        "talk": "M-5-4H2V0H-1L-3 2V0H-5Z M4-1H5V4H3L1 6V4H-1V3",
+        "note": "M-3-5H1L4-2V5H-3Z M1-5V-2H4 M-1 0H2 M-1 2H2",
+    }
+    if purpose not in glyphs:
+        raise ValueError(f"Unknown entry purpose: {purpose}")
     ET.SubElement(badge, SVG + "path", {
-        "d": "M68 72H76M72 68V76", "fill": "none", "stroke": color,
-        "stroke-width": "3", "stroke-linecap": "round",
+        "d": glyphs[purpose], "fill": "none", "stroke": color,
+        "stroke-width": "1.4", "stroke-linecap": "round", "stroke-linejoin": "round",
     })
     return layer
+
+
+def phone_shortcut_layer(source):
+    return entry_layer(source, "ask")
+
+
+def render_entries(source, work, destination, purposes):
+    # Render each purpose once; the legacy pinned shortcut aliases Ask's bytes.
+    layers = {purpose: entry_layer(source, purpose) for purpose in purposes}
+    outputs = {}
+    for purpose, layer in layers.items():
+        derived = work / f"entry-{purpose}.svg"
+        ET.ElementTree(layer).write(derived, encoding="unicode")
+        generated = work / f"entry-{purpose}"
+        subprocess.run(
+            ["cargo", "tauri", "icon", str(derived), "--output", str(generated)],
+            cwd=ROOT, check=True,
+        )
+        outputs[purpose] = generated / "icon.png"
+    directory = destination / "drawable-nodpi"
+    directory.mkdir(parents=True, exist_ok=True)
+    for purpose, png in outputs.items():
+        shutil.copyfile(png, directory / f"voxgolem_entry_{purpose}.png")
+    return outputs
 
 
 def artwork_geometry(source):
@@ -122,13 +161,13 @@ def main():
         "--wear-res-output",
         type=Path,
         metavar="PATH",
-        help="Generate only Wear launcher and capture background resources into PATH",
+        help="Generate Wear launcher, entry icons and capture background resources into PATH",
     )
     output_modes.add_argument(
         "--phone-shortcut-res-output",
         type=Path,
         metavar="PATH",
-        help="Generate only drawable-nodpi/voxgolem_new_voice_shortcut.png into PATH",
+        help="Generate phone Chat/Ask/Talk entry icons and legacy Ask shortcut into PATH",
     )
     arguments = parser.parse_args()
     version = subprocess.check_output(
@@ -153,20 +192,11 @@ def main():
         work = Path(temporary)
         if arguments.phone_shortcut_res_output is not None:
             try:
-                shortcut = phone_shortcut_layer(source)
+                outputs = render_entries(source, work, arguments.phone_shortcut_res_output, ("chat", "ask", "talk"))
             except ValueError as error:
                 parser.error(str(error))
-            derived = work / "phone-shortcut.svg"
-            ET.ElementTree(shortcut).write(derived, encoding="unicode")
-            generated = work / "generated"
-            subprocess.run(
-                ["cargo", "tauri", "icon", str(derived), "--output", str(generated)],
-                cwd=ROOT,
-                check=True,
-            )
             output = arguments.phone_shortcut_res_output / "drawable-nodpi/voxgolem_new_voice_shortcut.png"
-            output.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(generated / "icon.png", output)
+            shutil.copyfile(outputs["ask"], output)
             print(f"Generated phone shortcut resource {output} from icons/icon.svg")
             return
         foreground = work / "foreground.svg"
@@ -207,6 +237,10 @@ def main():
                 shutil.copyfile(legacy / f"{size}x{size}.png", directory / filename)
         if arguments.wear_res_output is not None:
             destination = arguments.wear_res_output
+            try:
+                render_entries(source, work, destination, ("chat", "ask", "talk", "note"))
+            except ValueError as error:
+                parser.error(str(error))
             android = generated / "android"
             launcher_files = list(android.glob("mipmap-*/ic_launcher*.png")) + [
                 android / "mipmap-anydpi-v26/ic_launcher.xml",
