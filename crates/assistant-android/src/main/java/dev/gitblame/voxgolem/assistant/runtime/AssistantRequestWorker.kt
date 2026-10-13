@@ -23,6 +23,7 @@ class AssistantRequestWorker(
         var deliveredBytes = 0L
         var deliveredStatuses = 0
         var firstTextMeasured = false
+        var dispatchMeasured = false
     }
 
     private val lock = Any()
@@ -48,6 +49,12 @@ class AssistantRequestWorker(
                     if (!admitted) return@execute
                     timing?.mark(Stage.WORKER_STARTED)
                     val callback = object : ProviderDeltaCallback {
+                        override fun onRequestDispatched() = synchronized(lock) {
+                            if (active !== request || request.cancelled || request.dispatchMeasured) return@synchronized
+                            request.dispatchMeasured = true
+                            // Android elapsed-realtime receipt, not the Rust dispatch instant or network headers.
+                            timing?.mark(Stage.REQUEST_DISPATCHED)
+                        }
                         override fun onFirstText(milliseconds: Long) = synchronized(lock) {
                             if (active !== request || request.cancelled || request.firstTextMeasured) return@synchronized
                             check(milliseconds in 0..86_400_000) { "Invalid provider first-text duration" }

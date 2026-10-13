@@ -5,6 +5,7 @@
   "windows": ["main"],
   "permissions": [
     "allow-get-app-snapshot",
+    "allow-report-startup-stage",
     "allow-submit-prompt",
     "allow-cancel-prompt",
     "allow-reset-session",

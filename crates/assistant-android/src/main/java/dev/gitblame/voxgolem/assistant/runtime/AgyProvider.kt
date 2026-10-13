@@ -1,6 +1,7 @@
 package dev.gitblame.voxgolem.assistant.runtime
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Log
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -136,7 +137,8 @@ class AgyProviderNative(private val context: Context) : ProviderNativeCalls {
                 Thread({
                     try {
                         p.errorStream.bufferedReader().useLines { lines ->
-                            lines.forEach { Log.d(TAG, "agy stderr: $it") }
+                            // Drain without exposing engine payloads or credentials in diagnostics.
+                            lines.forEach { _ -> }
                         }
                     } catch (_: Exception) {}
                 }, "agy-stderr").start()
@@ -155,8 +157,9 @@ class AgyProviderNative(private val context: Context) : ProviderNativeCalls {
                 ensureCredentials()
                 val targetAgyModel = resolveTargetModel(requestedModel)
                 val effort = if (targetAgyModel.endsWith("-low")) "low" else "high"
-                startProcess(executable, targetAgyModel, effort, null)
-                Log.i(TAG, "Prewarmed local engine for $targetAgyModel")
+                if (startProcess(executable, targetAgyModel, effort, null)) {
+                    Log.i(TAG, "Prewarm acquired local engine process; readiness not verified")
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to prewarm local engine: ${e.message}")
             }
@@ -223,9 +226,6 @@ class AgyProviderNative(private val context: Context) : ProviderNativeCalls {
 
         callback.onReady()
 
-        val startTime = System.currentTimeMillis()
-        var firstTextDelivered = false
-        var firstTextMs: Long? = null
         val accumulated = StringBuilder()
 
         try {
@@ -234,9 +234,14 @@ class AgyProviderNative(private val context: Context) : ProviderNativeCalls {
             val inner = JSONObject()
             inner.put("content", finalPrompt)
             msg.put("message", inner)
+            val serializedRequest = msg.toString() + "\n"
 
+            // Dispatch initiation includes lock acquisition/write/flush, not engine or HTTP readiness.
+            val timing = AgyRequestTiming(SystemClock::elapsedRealtime)
+            // Do not call the worker while holding the process lock: cancellation takes them in the reverse order.
+            callback.onRequestDispatched()
             synchronized(lock) {
-                writer.write(msg.toString() + "\n")
+                writer.write(serializedRequest)
                 writer.flush()
             }
 
@@ -264,10 +269,7 @@ class AgyProviderNative(private val context: Context) : ProviderNativeCalls {
                     } else if (stepType == "thought" || stepType == "reasoning") {
                         // Internal model reasoning/thought tokens; do not treat as user response text
                     } else if (delta.isNotEmpty() && (stepType.isEmpty() || stepType == "agent_response")) {
-                        if (!firstTextDelivered) {
-                            firstTextDelivered = true
-                            val elapsed = (System.currentTimeMillis() - startTime).coerceAtLeast(0L)
-                            firstTextMs = elapsed
+                        timing.onForwardedText(delta)?.let { elapsed ->
                             callback.onFirstText(elapsed)
                         }
                         accumulated.append(delta)
@@ -278,13 +280,13 @@ class AgyProviderNative(private val context: Context) : ProviderNativeCalls {
                     val status = res?.optString("status")
                     if (status == "SUCCESS") {
                         val text = accumulated.toString()
-                        val completedMs = (System.currentTimeMillis() - startTime).coerceAtLeast(0L)
+                        val completedMs = timing.completedMs()
                         return JSONObject()
                             .put("status", "complete")
                             .put("contentType", "output_text")
                             .put("text", text)
                             .put("returnedModel", targetAgyModel)
-                            .put("firstTextMs", firstTextMs ?: completedMs)
+                            .put("firstTextMs", timing.firstTextMs)
                             .put("completedMs", completedMs)
                             .toString()
                     } else {
@@ -300,13 +302,13 @@ class AgyProviderNative(private val context: Context) : ProviderNativeCalls {
 
             val text = accumulated.toString()
             if (text.isNotEmpty()) {
-                val completedMs = (System.currentTimeMillis() - startTime).coerceAtLeast(0L)
+                val completedMs = timing.completedMs()
                 return JSONObject()
                     .put("status", "complete")
                     .put("contentType", "output_text")
                     .put("text", text)
                     .put("returnedModel", targetAgyModel)
-                    .put("firstTextMs", firstTextMs ?: completedMs)
+                    .put("firstTextMs", timing.firstTextMs)
                     .put("completedMs", completedMs)
                     .toString()
             }

@@ -14,7 +14,7 @@ use jni::sys::jstring;
 use jni::JNIEnv;
 use outcome::Outcome;
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::io::Read;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -293,6 +293,7 @@ async fn direct_response(
 ) -> Outcome {
     let (failure_tx, failure_rx) = watch::channel(None);
     let delta_cancelled = cancelled.clone();
+    let callback = RefCell::new(callback);
     let mut delivered_bytes = 0_usize;
     let auth_revision = Cell::new(None);
     let first_text = FirstTextTiming::default();
@@ -313,14 +314,25 @@ async fn direct_response(
                 &first_text,
                 delta,
                 || *delta_cancelled.borrow(),
-                callback,
+                &mut **callback.borrow_mut(),
             );
             if let Err(error) = result {
                 let _ = failure_tx.send(Some(error));
             }
         },
         |revision| auth_revision.set(Some(revision)),
-        |dispatched| first_text.dispatched(dispatched),
+        |dispatched| {
+            if failure_tx.borrow().is_some() {
+                return;
+            }
+            if let Err(error) = first_text.dispatched(
+                dispatched,
+                || *delta_cancelled.borrow(),
+                &mut **callback.borrow_mut(),
+            ) {
+                let _ = failure_tx.send(Some(error));
+            }
+        },
     );
     await_authenticated_response(response, &auth_revision, cancelled, failure_rx).await
 }
@@ -340,6 +352,7 @@ fn deliver_bounded_delta(
 
 enum CallbackEvent<'a> {
     Ready,
+    RequestDispatched,
     FirstText(u64),
     Delta(&'a str),
     Status(&'static str),
@@ -352,10 +365,17 @@ struct FirstTextTiming {
 }
 
 impl FirstTextTiming {
-    fn dispatched(&self, instant: std::time::Instant) {
-        if self.dispatched.get().is_none() {
-            self.dispatched.set(Some(instant));
+    fn dispatched(
+        &self,
+        instant: std::time::Instant,
+        cancelled: impl FnOnce() -> bool,
+        callback: &mut impl FnMut(CallbackEvent<'_>) -> Result<(), ErrorCode>,
+    ) -> Result<(), ErrorCode> {
+        if cancelled() || self.dispatched.get().is_some() {
+            return Ok(());
         }
+        self.dispatched.set(Some(instant));
+        callback(CallbackEvent::RequestDispatched)
     }
 
     fn deliver(
@@ -512,6 +532,9 @@ fn respond_jni(
                 match event {
                     CallbackEvent::Ready => {
                         env.call_method(&callback, "onReady", "()V", &[])?;
+                    }
+                    CallbackEvent::RequestDispatched => {
+                        env.call_method(&callback, "onRequestDispatched", "()V", &[])?;
                     }
                     CallbackEvent::FirstText(milliseconds) => {
                         env.call_method(
@@ -910,7 +933,8 @@ mod tests {
                         ready_count += 1;
                         cancellation::registry().cancel(request_id);
                     }
-                    CallbackEvent::FirstText(_)
+                    CallbackEvent::RequestDispatched
+                    | CallbackEvent::FirstText(_)
                     | CallbackEvent::Delta(_)
                     | CallbackEvent::Status(_) => {
                         panic!("cancelled request must not deliver timing, text or status")
@@ -1077,6 +1101,7 @@ mod tests {
             rx,
             &mut |event| {
                 events.push(match event {
+                    CallbackEvent::RequestDispatched => "dispatch",
                     CallbackEvent::FirstText(_) => "first",
                     CallbackEvent::Delta(_) => "delta",
                     _ => "other",
@@ -1086,7 +1111,7 @@ mod tests {
         ));
         assert_eq!(
             events,
-            ["first", "delta"],
+            ["dispatch", "first", "delta"],
             "timing must precede the visible refusal delta"
         );
         let value: serde_json::Value = serde_json::from_str(&outcome.json()).unwrap();
@@ -1174,6 +1199,7 @@ mod tests {
             let mut first = None;
             let mut callback = |event: CallbackEvent<'_>| {
                 match event {
+                    CallbackEvent::RequestDispatched => events.push("dispatch"),
                     CallbackEvent::FirstText(ms) => {
                         assert!(first.replace(ms).is_none());
                         events.push("first");
@@ -1203,12 +1229,83 @@ mod tests {
             };
             server.join().unwrap();
             assert!(matches!(outcome, Outcome::Complete { .. }));
-            assert_eq!(events, ["space", "first", "text"]);
+            assert_eq!(events, ["dispatch", "space", "first", "text"]);
             assert!(
                 first.unwrap() >= 75,
                 "all three server delays belong to dispatch latency"
             );
         }
+    }
+
+    #[test]
+    fn dispatch_callback_failure_or_cancellation_prevents_later_callbacks_on_both_routes() {
+        for search_route in [false, true] {
+            for fail_callback in [false, true] {
+                let fixture = AuthFixture::new();
+                fixture.replace("synthetic-dispatch-auth");
+                let request = request::parse(r#"{"requestId":"synthetic-dispatch-stop","conversationId":"synthetic-conversation:1","searchMode":"quick","instructions":"Synthetic policy","messages":[{"role":"user","content":"Synthetic question"}]}"#).unwrap();
+                // No provider response: callback failure/cancellation must retire without headers or text.
+                let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                let config = CustomOpenAiConfig {
+                    auth_path: fixture.path(),
+                    endpoint: format!("http://{}/synthetic", listener.local_addr().unwrap()),
+                    total_timeout: std::time::Duration::from_secs(3),
+                    ..Default::default()
+                };
+                let process = search::ProcessProvider::new(config.clone()).unwrap();
+                let (cancel, rx) = watch::channel(false);
+                let mut dispatches = 0;
+                let mut callback = |event: CallbackEvent<'_>| {
+                    assert!(matches!(event, CallbackEvent::RequestDispatched));
+                    dispatches += 1;
+                    if fail_callback {
+                        Err(ErrorCode::CallbackFailed)
+                    } else {
+                        cancel.send(true).unwrap();
+                        Ok(())
+                    }
+                };
+                let outcome = if search_route {
+                    process.runtime.block_on(search::respond(
+                        &process,
+                        config,
+                        &request,
+                        rx,
+                        &mut callback,
+                    ))
+                } else {
+                    let client = process.client(config).unwrap();
+                    process
+                        .runtime
+                        .block_on(direct_response(&client, &request, rx, &mut callback))
+                };
+                assert_eq!(dispatches, 1);
+                let value: serde_json::Value = serde_json::from_str(&outcome.json()).unwrap();
+                if fail_callback {
+                    assert_eq!(value["code"], "callback_failed");
+                    assert!(value["authRevision"].is_string());
+                } else {
+                    assert_eq!(value["status"], "cancelled");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_dispatch_does_not_emit_or_establish_first_text_origin() {
+        let timing = FirstTextTiming::default();
+        timing
+            .dispatched(std::time::Instant::now(), || true, &mut |_| {
+                panic!("cancelled dispatch must not be observed")
+            })
+            .unwrap();
+        assert!(timing.dispatched.get().is_none());
+        timing
+            .deliver("Synthetic text", &mut |_| {
+                panic!("no first-text measurement without dispatch")
+            })
+            .unwrap();
+        assert!(!timing.delivered.get());
     }
 
     #[test]
@@ -1225,6 +1322,9 @@ mod tests {
             let (_cancel, rx) = watch::channel(false);
             let mut calls = 0;
             let mut callback = |event: CallbackEvent<'_>| {
+                if matches!(event, CallbackEvent::RequestDispatched) {
+                    return Ok(());
+                }
                 assert!(matches!(event, CallbackEvent::FirstText(_)));
                 calls += 1;
                 Err(ErrorCode::CallbackFailed)
@@ -1267,6 +1367,9 @@ mod tests {
             let (cancel, rx) = watch::channel(false);
             let mut calls = 0;
             let mut callback = |event: CallbackEvent<'_>| {
+                if matches!(event, CallbackEvent::RequestDispatched) {
+                    return Ok(());
+                }
                 let CallbackEvent::Delta(text) = event else {
                     panic!("cancelled request cannot emit timing")
                 };
@@ -1316,6 +1419,7 @@ mod tests {
             rx,
             &mut |event| {
                 events.push(match event {
+                    CallbackEvent::RequestDispatched => "dispatch",
                     CallbackEvent::FirstText(ms) => {
                         assert!(ms >= 50);
                         "first"
@@ -1331,14 +1435,29 @@ mod tests {
         ));
         server.join().unwrap();
         assert!(matches!(outcome, Outcome::Complete { .. }));
-        assert_eq!(events, ["first", "terminal-delivery"]);
+        assert_eq!(events, ["dispatch", "first", "terminal-delivery"]);
     }
 
     #[test]
     fn timing_keeps_first_dispatch_and_obeys_cancellation_and_byte_budget() {
         let timing = FirstTextTiming::default();
-        timing.dispatched(std::time::Instant::now() - std::time::Duration::from_millis(80));
-        timing.dispatched(std::time::Instant::now());
+        let mut dispatches = 0;
+        let mut dispatch_callback = |event: CallbackEvent<'_>| {
+            assert!(matches!(event, CallbackEvent::RequestDispatched));
+            dispatches += 1;
+            Ok(())
+        };
+        timing
+            .dispatched(
+                std::time::Instant::now() - std::time::Duration::from_millis(80),
+                || false,
+                &mut dispatch_callback,
+            )
+            .unwrap();
+        timing
+            .dispatched(std::time::Instant::now(), || false, &mut dispatch_callback)
+            .unwrap();
+        assert_eq!(dispatches, 1);
         let mut bytes = 0;
         deliver_timed_delta(&mut bytes, &timing, "Synthetic", || true, &mut |_| {
             panic!("stale cancelled text")
@@ -1474,6 +1593,7 @@ mod tests {
             rx,
             &mut |event| {
                 events.push(match event {
+                    CallbackEvent::RequestDispatched => "dispatch",
                     CallbackEvent::Status(_) => "status",
                     CallbackEvent::FirstText(ms) => {
                         assert!(ms >= 80, "clock must retain the first round's dispatch");
@@ -1485,7 +1605,7 @@ mod tests {
                 Ok(())
             },
         ));
-        assert_eq!(events, ["status", "first", "text"]);
+        assert_eq!(events, ["dispatch", "status", "first", "text"]);
         let result: serde_json::Value = serde_json::from_str(&outcome.json()).unwrap();
         assert_eq!(result["status"], "complete");
         assert_eq!(result["text"], "Synthetic pooled answer");
@@ -1526,6 +1646,7 @@ mod tests {
             &request,
             rx,
             &mut |event| match event {
+                CallbackEvent::RequestDispatched => Ok(()),
                 CallbackEvent::Status(status) => {
                     statuses.push(status);
                     Err(ErrorCode::CallbackFailed)

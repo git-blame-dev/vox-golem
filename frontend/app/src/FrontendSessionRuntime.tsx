@@ -1,4 +1,5 @@
-import { memo, useCallback, useEffect } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect } from 'react'
+import { FrontendTiming } from './lib/frontendTiming'
 import { useSessionView } from './FrontendSession'
 import type { FrontendSession } from './FrontendSession'
 import { SessionAuthority, cancelPromptProjectionFrame, sessionAuthority, useSessionControls, useSessionIntents } from './SessionAuthority'
@@ -125,6 +126,8 @@ function appUpdateBlocksRuntime(state: UpdateState): boolean {
 
 function useFrontendSessionRuntime(session: SessionAuthority) {
   useSessionControls(session)
+  const timingRef = session.operationRef('frontendTiming', () => new FrontendTiming())
+  useLayoutEffect(() => { timingRef.current.startup('SHELL_DOM_COMMITTED') }, [timingRef])
   const supportsDesktopRuntime = !isAndroidRuntime && !isBrowserPreviewRuntime()
   const appUpdates = useAppUpdates()
   const updateRuntimeBlocked = appUpdateBlocksRuntime(appUpdates.state)
@@ -277,11 +280,14 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       setComposerValue(snapshot.assistant.draft)
     }
     if (replaceHistory) {
+      if (snapshot.sessionId !== snapshotSessionIdRef.current || prior?.selectedHead !== assistant.selectedHead) {
+        timingRef.current.retireRequest()
+      }
       canonicalTranscriptRef.current = snapshot.transcript
       snapshotSessionIdRef.current = snapshot.sessionId
       setMessages((current) => replaceCommittedTranscript(current, snapshot.transcript))
     }
-  }, [androidAssistantRef, canonicalTranscriptRef, composerEditRevisionRef, setAndroidAssistant, setAndroidConversationId, setComposerValue, setMessages, shortcutDraftRef, snapshotSessionIdRef])
+  }, [androidAssistantRef, canonicalTranscriptRef, composerEditRevisionRef, setAndroidAssistant, setAndroidConversationId, setComposerValue, setMessages, shortcutDraftRef, snapshotSessionIdRef, timingRef])
   const ttsGenerationRef = session.operationRef('ttsRevision', () => 0)
   const ttsEnabledRef = session.fieldRef('ttsEnabled')
   const ttsPlaybackIdRef = session.operationRef<number | null>('ttsPlayback', () => null)
@@ -668,8 +674,10 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       const composerRevision = composerEditRevisionRef.current
       const snapshotControlRevision = ++snapshotControlRequestRevisionRef.current
       const snapshotPreferenceRevision = getAndroidPreferencePublicationRevision()
+      timingRef.current.startup('INITIAL_SNAPSHOT_REQUESTED')
       void loadAppSnapshot().then(async (snapshot) => {
         if (!active || snapshotHydrationStateRef.current !== 'pending') return
+        timingRef.current.startup('INITIAL_SNAPSHOT_RECEIVED')
         if (transcriptRevision !== transcriptRevisionRef.current) {
           scheduleHydrationRetry()
           return
@@ -698,6 +706,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         snapshotSessionIdRef.current = snapshot.sessionId
         snapshotHydrationStateRef.current = 'succeeded'
         setSnapshotHydrationState('succeeded')
+        timingRef.current.startup('INITIAL_SNAPSHOT_APPLIED')
         if (snapshot.activeRequest === null && androidDraftPendingRef.current !== null) persistAndroidDraftRef.current(composerValueRef.current)
         if (snapshot.activeRequest === null && !resetPendingRef.current && promptRef.current === null) {
           setPromptActivity(null)
@@ -743,7 +752,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       active = false
       if (retryTimer !== null) window.clearTimeout(retryTimer)
     }
-  }, [adoptAndroidConversation, adoptSnapshotControls, androidAssistantRef, androidDraftPendingRef, canonicalTranscriptRef, composerEditRevisionRef, composerValueRef, persistAndroidDraftRef, promptRef, recoverOrphanedRequest, resetPendingRef, runtimeActivityRevisionRef, setMessages, setPromptActivity, setPromptState, setSnapshotControlsFresh, setSnapshotControlsInvalidated, setSnapshotHydrationState, setTtsEnabled, snapshotControlRequestRevisionRef, snapshotControlsFreshRef, snapshotControlsInvalidatedRef, snapshotHydrationStateRef, snapshotRuntimeHydratedRef, snapshotSessionIdRef, startupStateRef, synchronizeHydratedRuntimeStatus, transcriptRevisionRef, ttsEnabledRef, ttsPersistedInitializedRef, ttsPersistedValueRef, ttsWriteRevisionRef])
+  }, [adoptAndroidConversation, adoptSnapshotControls, androidAssistantRef, androidDraftPendingRef, canonicalTranscriptRef, composerEditRevisionRef, composerValueRef, persistAndroidDraftRef, promptRef, recoverOrphanedRequest, resetPendingRef, runtimeActivityRevisionRef, setMessages, setPromptActivity, setPromptState, setSnapshotControlsFresh, setSnapshotControlsInvalidated, setSnapshotHydrationState, setTtsEnabled, snapshotControlRequestRevisionRef, snapshotControlsFreshRef, snapshotControlsInvalidatedRef, snapshotHydrationStateRef, snapshotRuntimeHydratedRef, snapshotSessionIdRef, startupStateRef, synchronizeHydratedRuntimeStatus, timingRef, transcriptRevisionRef, ttsEnabledRef, ttsPersistedInitializedRef, ttsPersistedValueRef, ttsWriteRevisionRef])
 
   useEffect(() => {
     if (!isAndroidRuntime) return undefined
@@ -1174,6 +1183,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   useEffect(() => {
     const cuePlayer = cuePlayerRef.current
     session.activate(() => {
+      timingRef.current.retireRequest()
       cuePlayer.stop()
       const activePrompt = promptRef.current
       if (activePrompt !== null) {
@@ -1203,7 +1213,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       if (isBrowserPreviewRuntime()) teardownBrowserPreviewRuntime()
     })
     return () => session.dispose()
-  }, [cancelTts, completionLifecycleRef, cuePlayerRef, latestTypedCompletionRef, liveAudioSessionIdRef, liveAudioSourceRef, liveAudioStartAbortRef, micAutoStartedRef, micStartInFlightRef, partialTranscriptionAllowedRef, partialTranscriptionRef, pendingWakeConfidenceRef, promptRef, session, wakeConfidenceHoldRef])
+  }, [cancelTts, completionLifecycleRef, cuePlayerRef, latestTypedCompletionRef, liveAudioSessionIdRef, liveAudioSourceRef, liveAudioStartAbortRef, micAutoStartedRef, micStartInFlightRef, partialTranscriptionAllowedRef, partialTranscriptionRef, pendingWakeConfidenceRef, promptRef, session, timingRef, wakeConfidenceHoldRef])
 
   useEffect(() => {
     if (!settingsOpen || !supportsDesktopRuntime) {
@@ -1250,15 +1260,18 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     if (searchModeInitializedRef.current || startupState.kind !== 'ready' || runtimeStatus !== 'sleeping' ||
       promptState !== 'idle' || !snapshotControlsFresh || assistantSettingsPending || resetPending) return
     searchModeInitializedRef.current = true
+    timingRef.current.startup('INITIAL_SEARCH_MODE_REQUESTED')
     const write = selectNativeSearchMode('quick')
     searchModeWriteRef.current = write.catch(() => undefined)
-    void write.catch((error) => {
+    void write.then(() => {
+      if (appActiveRef.current) timingRef.current.startup('INITIAL_SEARCH_MODE_ACK')
+    }).catch((error) => {
       if (appActiveRef.current) addNotice({ tone: 'error', title: 'Search mode not initialized', message: toDisplayErrorMessage(error) })
     }).finally(() => {
       searchModePendingRef.current = false
       if (appActiveRef.current) setSearchModePending(false)
     })
-  }, [addNotice, appActiveRef, assistantSettingsPending, promptState, resetPending, runtimeStatus, searchModeInitializedRef, searchModePendingRef, searchModeWriteRef, setSearchModePending, snapshotControlsFresh, startupState.kind])
+  }, [addNotice, appActiveRef, assistantSettingsPending, promptState, resetPending, runtimeStatus, searchModeInitializedRef, searchModePendingRef, searchModeWriteRef, setSearchModePending, snapshotControlsFresh, startupState.kind, timingRef])
   const changeSearchMode = async (mode: SearchMode): Promise<void> => {
     if (instantControlsDisabled || runtimeStatusRef.current !== 'sleeping' || micStarting || micActive ||
       searchModePendingRef.current || resetPendingRef.current || promptRef.current !== null ||
@@ -1619,6 +1632,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   ): Promise<void> => {
     const admission = session.admitPrompt(prompt, source, nativeRequestId, updateRuntimeBlocked)
     if (admission === null) return
+    const admittedAt = performance.now()
     const appActiveRef = { get current() { return admission.isCurrent() } }
     const currentSettings = admission.settings
     const executingStatus = applyTransition(runtimeStatusRef.current, 'submit_prompt')
@@ -1637,6 +1651,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     const projectionRevision = ++promptProjectionRevisionRef.current
     const userId = `user-${projectionRevision}-${requestId}`
     const assistantId = `assistant-${projectionRevision}-${requestId}`
+    const requestTiming = timingRef.current.admit(assistantId, admittedAt)
     const promptProjection: PromptProjection = {
       id: requestId,
       userId,
@@ -1658,7 +1673,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       ttsFirstLineSpoken: false,
       renderFrameId: null,
       renderFrameRevision: 0,
-      admittedAt: performance.now(),
+      admittedAt,
     }
     promptRef.current = promptProjection
     setPromptState('executing')
@@ -1689,14 +1704,8 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         if (source === 'voice' && active.text.length === 0 && event.text.length > 0) {
           voiceTelemetry.record('provider_first_text')
         }
-        if (isAndroidRuntime && active.customDirectTimings === undefined && event.text.length > 0) {
-          const elapsed = active.admittedAt !== undefined ? Math.max(0, Math.round(performance.now() - active.admittedAt)) : 0
-          const timings = { firstTextMs: elapsed, completedMs: elapsed }
-          active.customDirectTimings = timings
-          setMessages((current) => current.map((message) => message.id === active.assistantId
-            ? { ...message, customDirectTimings: timings }
-            : message))
-        }
+        const timings = requestTiming.received(event.text)
+        if (isAndroidRuntime && timings !== undefined) active.customDirectTimings = timings
         const hadCompleteLine = active.text.includes('\n')
         active.text += event.text
         if (source === 'voice' && !hadCompleteLine && active.text.includes('\n')) {
@@ -1724,6 +1733,8 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
           active.priorVersions = [...active.priorVersions, { id: `instant-${active.priorVersions.length + 1}`, text: active.text, label: 'Before correction' }]
         }
         active.text = event.text
+        const timings = requestTiming.received(event.text)
+        if (isAndroidRuntime && timings !== undefined) active.customDirectTimings = timings
         active.stages = active.stages.map((stage) => stage.stage === event.stage ? { ...stage, status: 'corrected', detail: event.correction } : stage)
         session.renderPromptProjection(active)
         setPromptActivity({ text: event.correction, compact: false })
@@ -1749,10 +1760,13 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
           ? { ...message, answerStage: { stages: active.stages, priorVersions: active.priorVersions, sources: active.sources } } : message))
       }
       if (event.kind === 'custom_direct_timings') {
-        active.customDirectTimings = event.timings
-        setMessages((current) => current.map((message) => message.id === active.assistantId
-          ? { ...message, customDirectTimings: event.timings }
-          : message))
+        if (!isAndroidRuntime) {
+          requestTiming.provider(event.timings)
+          active.customDirectTimings = event.timings
+          setMessages((current) => current.map((message) => message.id === active.assistantId
+            ? { ...message, customDirectTimings: event.timings }
+            : message))
+        }
       }
       if (event.kind === 'reasoning') {
         setPromptActivity({ text: `Reasoning: ${event.text}`, compact: true })
@@ -1772,6 +1786,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     let result: PromptExecutionResult
     let commandRejected = false
     try {
+      requestTiming.dispatch()
       result = await executePrompt(requestId, prompt, handleEvent, source, admittedMode)
     } catch (error) {
       const message = error instanceof Error
@@ -1803,10 +1818,13 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       }
       if (source === 'voice') voiceTelemetry.record('provider_completed', { details: { outcome: result.outcome } })
       if (result.customDirectTimings) {
-        const stableFirstTextMs = active.customDirectTimings?.firstTextMs ?? result.customDirectTimings.firstTextMs
-        active.customDirectTimings = {
-          firstTextMs: stableFirstTextMs,
-          completedMs: result.customDirectTimings.completedMs,
+        if (!isAndroidRuntime) {
+          requestTiming.provider(result.customDirectTimings)
+          const stableFirstTextMs = active.customDirectTimings?.firstTextMs ?? result.customDirectTimings.firstTextMs
+          active.customDirectTimings = {
+            firstTextMs: stableFirstTextMs,
+            completedMs: result.customDirectTimings.completedMs,
+          }
         }
       }
       const acceptedCanonicalTurn = result.canonicalTurn !== undefined && isExpectedCanonicalTurn(
@@ -1816,6 +1834,11 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         priorCanonicalExecutions,
         isAndroidRuntime,
       ) ? result.canonicalTurn : undefined
+      if (acceptedCanonicalTurn !== undefined) {
+        requestTiming.canonicalAnswer(canonicalMessageId(acceptedCanonicalTurn.answer))
+        const timings = requestTiming.received(acceptedCanonicalTurn.answer.content.text)
+        if (isAndroidRuntime && timings !== undefined) active.customDirectTimings = timings
+      }
       if (result.canonicalTurn !== undefined && acceptedCanonicalTurn === undefined) {
         result = {
           requestId: result.requestId,
@@ -1904,6 +1927,11 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
             priorCanonicalExecutions,
           )
           reconciledTurn = snapshotTurn ?? acceptedCanonicalTurn
+          if (reconciledTurn !== undefined) {
+            requestTiming.canonicalAnswer(canonicalMessageId(reconciledTurn.answer))
+            const timings = requestTiming.received(reconciledTurn.answer.content.text)
+            if (isAndroidRuntime && timings !== undefined) active.customDirectTimings = timings
+          }
           const transcript = appendCanonicalTurn(snapshot.transcript, snapshotTurn === undefined ? acceptedCanonicalTurn : undefined)
           setMessages((current) => replaceCommittedTranscript(current, transcript))
           canonicalTranscriptRef.current = transcript
@@ -1945,6 +1973,12 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
           ? 'error'
           : result.outcome
       const terminalText = reconciledTurn?.answer.content.text ?? active.text
+      const frontendTimings = requestTiming.settle()
+      if (isAndroidRuntime && frontendTimings !== undefined) {
+        active.customDirectTimings = frontendTimings
+        if (reconciledTurn === undefined) setMessages((current) => current.map((message) =>
+          message.id === active.assistantId ? { ...message, customDirectTimings: frontendTimings } : message))
+      }
       if (isAndroidRuntime && effectiveOutcome === 'completed' && composerEditRevisionRef.current === promptComposerRevision) {
         androidDraftPendingRef.current = null
         androidDraftWriteFailureRef.current = null
@@ -2708,6 +2742,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     setResponseAnnouncement('')
 
     if (getTauriInternals() === null) {
+      timingRef.current.retireRequest()
       searchModeRef.current = 'quick'
       setSearchMode('quick')
       if (activePrompt !== null) {
@@ -2754,6 +2789,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       resetDraftRevision = composerEditRevisionRef.current
       if (androidSelectionRecoveryRef.current !== null) androidSelectionRecoveryRef.current = { transcriptRevision, composerRevision: resetDraftRevision }
       await invokeTauriCommand('reset_session', isAndroidRuntime ? { draft: composerValueRef.current } : undefined)
+      if (appActiveRef.current) timingRef.current.retireRequest()
       searchModeInitializedRef.current = true
       searchModeRef.current = 'quick'
       setSearchMode('quick')
@@ -2824,6 +2860,10 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         }
       }
       if (snapshot !== null && appActiveRef.current && transcriptRevision === transcriptRevisionRef.current) {
+        if (snapshot.sessionId !== snapshotSessionIdRef.current ||
+          (isAndroidRuntime && snapshot.assistant !== undefined && snapshot.assistant.selectedHead !== androidAssistantRef.current?.selectedHead)) {
+          timingRef.current.retireRequest()
+        }
         promptRef.current = null
         session.retirePromptAdmission()
         snapshotHydrationStateRef.current = 'succeeded'
@@ -3081,6 +3121,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     drainAndroidVoiceRequestRef.current()
   }
   const actions = useSessionIntents(session, {
+    onAnswerDomCommitted: (id: string) => timingRef.current.domCommitted(id),
     onSubmit, onComposerKeyDown, acceptTypedCompletion, clearCompletion, changeComposer,
     patchAssistantSettings, voiceDraftChanged, voiceSubmitted,
     voiceSettled: () => refreshAndroidSnapshotControlsRef.current(),
@@ -3121,17 +3162,25 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       !assistantSettingsPending &&
       !searchModePending &&
       !resetPending &&
+      !isSwitchingResponseProfile &&
+      !updateRuntimeBlocked &&
+      !androidVoiceActive &&
+      !nativeConversationNeedsRecovery &&
+      (androidAssistant?.branchChoices.length ?? 0) === 0 &&
+      shortcutDraftRef.current?.needsNew !== true &&
+      androidSelectionRecoveryRef.current === null &&
       promptState === 'idle' &&
       runtimeStatus === 'sleeping' &&
-      selectedInstantOption?.available === true
+      selectedInstantOption?.available === true &&
+      instantMatchesResponseProfile(startupState, assistantSettings.instant)
     if (readyToSend) {
       startupTelemetrySentRef.current = true
       const elapsed = Math.round(performance.now())
-      console.info('[telemetry] app_ready_to_send_ms:', elapsed)
+      timingRef.current.startup('STATE_READY')
       document.documentElement.dataset['appReadyToSendMs'] = String(elapsed)
       ;(window as unknown as { __appReadyToSendMs?: number }).__appReadyToSendMs = elapsed
     }
-  }, [assistantSettingsPending, promptState, resetPending, runtimeStatus, searchModePending, selectedInstantOption?.available, snapshotControlsFresh, startupState.kind, startupTelemetrySentRef])
+  }, [androidAssistant?.branchChoices.length, androidSelectionRecoveryRef, androidVoiceActive, assistantSettings.instant, assistantSettingsPending, isSwitchingResponseProfile, nativeConversationNeedsRecovery, promptState, resetPending, runtimeStatus, searchModePending, selectedInstantOption?.available, shortcutDraftRef, snapshotControlsFresh, startupState, startupTelemetrySentRef, timingRef, updateRuntimeBlocked])
 
   return {
     actions,

@@ -104,6 +104,37 @@ class AssistantTimingTest {
         assertTrue(timing.isFinished); assertEquals(1, ends)
     }
 
+    @Test fun startupAcknowledgementsAreFixedBoundedAndUseTheNativeObserver() {
+        var now = 1_000_000_000L
+        val events = mutableListOf<AssistantTiming.Event>()
+        val timing = AssistantTiming.begin(context, Operation.ACTIVITY, { now }, AssistantTiming.Sink(events::add))
+        timing.mark(Stage.ACTIVITY_CREATED)
+        assertFalse(timing.reportFrontendStage("synthetic-untrusted-payload"))
+        now += 80_000_000
+        assertTrue(timing.reportFrontendStage("frontend_ready"))
+        timing.reportFrontendStage("frontend_ready")
+        now += 40_000_000
+        assertTrue(timing.reportFrontendStage("first_response_dom"))
+        timing.reportFrontendStage("first_response_dom")
+        timing.finish(Stage.CANCELLED)
+        val marks = events.filter { it.kind == Kind.MARK }
+        assertEquals(listOf(Stage.ACTIVITY_CREATED, Stage.FRONTEND_READY_ACK, Stage.FIRST_RESPONSE_DOM_ACK), marks.map { it.stage })
+        assertEquals(listOf(0L, 80_000_000L, 120_000_000L), marks.map { it.elapsedNanos })
+        assertEquals(1, events.count { it.kind == Kind.END })
+        val generation = AssistantTiming.begin(context, Operation.GENERATION)
+        assertFalse(generation.reportFrontendStage("frontend_ready"))
+        generation.finish(Stage.CANCELLED)
+    }
+
+    @Test fun explicitPlatformOriginIncludesWorkBeforeActivityEntryInTheSameClock() {
+        val events = mutableListOf<AssistantTiming.Event>()
+        val timing = AssistantTiming.begin(context, Operation.ACTIVITY, { 5_125_000_000L },
+            AssistantTiming.Sink(events::add), originNanos = 5_000_000_000L)
+        timing.mark(Stage.ACTIVITY_CREATED)
+        assertEquals(125_000_000L, events.last().elapsedNanos)
+        timing.finish(Stage.CANCELLED)
+    }
+
     @Test fun concurrentCallbacksCannotEmitAfterTheSingleEnd() {
         val events = mutableListOf<AssistantTiming.Event>()
         val timing = AssistantTiming.begin(context, Operation.TTS_UTTERANCE, { 0L }, AssistantTiming.Sink { events += it })

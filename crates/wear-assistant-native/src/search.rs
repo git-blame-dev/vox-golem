@@ -133,8 +133,7 @@ pub(crate) async fn respond(
                     Ok(())
                 }
                 RunEvent::Model(ModelEvent::RequestDispatched(instant)) => {
-                    first_text.dispatched(instant);
-                    Ok(())
+                    first_text.dispatched(instant, || cancellation.is_cancelled(), callback)
                 }
                 RunEvent::Model(ModelEvent::TextDelta { text, .. }) => deliver_timed_delta(
                     &mut bytes,

@@ -21,8 +21,9 @@ object AssistantRuntime {
 
     fun refreshIfStarted() { engine?.refresh() }
 
-    @Synchronized fun get(context: Context): AssistantEngine {
-        engine?.let { return it }
+    @Synchronized fun get(context: Context, startupTiming: AssistantTiming? = null): AssistantEngine {
+        engine?.let { startupTiming?.mark(AssistantTiming.Stage.RUNTIME_REUSED); return it }
+        startupTiming?.mark(AssistantTiming.Stage.RUNTIME_CREATE_STARTED)
         val application = context.applicationContext
         val credentials = ProviderAuthSource(application)
         val io = Executors.newSingleThreadExecutor { command -> Thread(command, "assistant-store") }
@@ -43,6 +44,9 @@ object AssistantRuntime {
 
         return AssistantEngine(AssistantStore(application), io, AssistantRequestWorker(provider, router),
             credentials::pathForProvider, modelStorage, credentials, NativeAssistantPolicyStorage(application),
-            beginTiming = { AssistantTiming.begin(application, it) }).also { engine = it }
+            beginTiming = { AssistantTiming.begin(application, it) }, startupTiming = startupTiming).also {
+                engine = it
+                startupTiming?.mark(AssistantTiming.Stage.RUNTIME_CREATED)
+            }
     }
 }

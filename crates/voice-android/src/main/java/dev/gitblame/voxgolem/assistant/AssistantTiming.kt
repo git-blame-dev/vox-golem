@@ -30,8 +30,16 @@ class AssistantTiming private constructor(
         SDK_CREATED, SUPPORT_REQUESTED, SUPPORT_CALLBACK, SUPPORTED, UNSUPPORTED,
         LISTENING_REQUESTED, READY_CALLBACK, READY_MAIN_DELIVERED, FIRST_PARTIAL, END_OF_SPEECH,
         FINISH_REQUESTED, FINAL_CALLBACK, FINAL_MAIN_DELIVERED, TIMED_OUT,
-        WORKER_STARTED, NATIVE_READY, FIRST_TEXT, PROVISIONAL_STATE_APPLIED, OUTCOME_RECEIVED, DELIVERY_WAIT, DELIVERY_READY, DURABLE_COMMITTED,
+        WORKER_STARTED, NATIVE_READY, REQUEST_DISPATCHED, FIRST_TEXT, PROVISIONAL_STATE_APPLIED, OUTCOME_RECEIVED, DELIVERY_WAIT, DELIVERY_READY, DURABLE_COMMITTED,
         ACTIVITY_CREATED, RESUMED, FIRST_PROJECTION,
+        WEBVIEW_CREATED, PLUGIN_LOAD_STARTED, PLUGIN_LOAD_COMPLETED,
+        RUNTIME_CREATE_STARTED, RUNTIME_CREATED, RUNTIME_REUSED,
+        HYDRATION_QUEUED, HYDRATION_STARTED, LOCAL_STATE_LOADED, DRAFT_LOADED,
+        CREDENTIAL_STATUS_READ, CANONICAL_SNAPSHOT_LOADED, DOMAIN_PROJECTION_COMPLETED, HYDRATION_COMPLETED,
+        INITIAL_SNAPSHOT_REQUESTED, INITIAL_SNAPSHOT_REPLIED, FRONTEND_READY_ACK, FIRST_RESPONSE_DOM_ACK,
+        ADMISSION_STARTED, DRAFT_PERSISTED, CREDENTIAL_CHECKED, PROJECTION_REFRESHED,
+        CONTEXT_PREPARED, ADMISSION_PERSISTED, REQUEST_SERIALIZED,
+        SETTLEMENT_STARTED, SELECTION_PERSISTED, SETTLEMENT_PROJECTED,
     }
     enum class Kind { BEGIN, MARK, END }
     data class Event(val operation: Operation, val run: Int, val parentRun: Int?, val kind: Kind,
@@ -62,6 +70,17 @@ class AssistantTiming private constructor(
         }
     }
 
+    /** Receipt of a frontend observation, including IPC delay; never a native pixel timestamp. */
+    fun reportFrontendStage(stage: String): Boolean {
+        if (operation != Operation.ACTIVITY) return false
+        when (stage) {
+            "frontend_ready" -> mark(Stage.FRONTEND_READY_ACK)
+            "first_response_dom" -> finish(Stage.FIRST_RESPONSE_DOM_ACK)
+            else -> return false
+        }
+        return true
+    }
+
     /** Children share the root's monotonic origin and observer, but retire independently (including warm SDKs). */
     fun child(operation: Operation): AssistantTiming = AssistantTiming(operation,
         if (enabled) sequence.incrementAndGet() else 0, if (enabled) run else null, enabled, clock, sink, startedAt)
@@ -81,14 +100,15 @@ class AssistantTiming private constructor(
         private val sequence = AtomicInteger()
 
         fun begin(context: Context?, operation: Operation,
-            clock: () -> Long = SystemClock::elapsedRealtimeNanos, sink: Sink = AndroidSink): AssistantTiming {
+            clock: () -> Long = SystemClock::elapsedRealtimeNanos, sink: Sink = AndroidSink,
+            originNanos: Long? = null): AssistantTiming {
             val enabled = context != null && (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0 ||
                 context.applicationInfo.metaData?.getBoolean(ENABLED_METADATA, false) == true ||
                 runCatching {
                     context.packageManager.getApplicationInfo(context.packageName, PackageManager.GET_META_DATA)
                         .metaData?.getBoolean(ENABLED_METADATA, false) == true
                 }.getOrDefault(false))
-            return AssistantTiming(operation, if (enabled) sequence.incrementAndGet() else 0, null, enabled, clock, sink)
+            return AssistantTiming(operation, if (enabled) sequence.incrementAndGet() else 0, null, enabled, clock, sink, originNanos)
         }
     }
 
