@@ -131,6 +131,7 @@ export interface PromptExecutionResult {
   readonly errorMessage: string | null
   readonly canonicalOutcome?: 'completed' | 'refused' | 'cancelled'
   readonly canonicalTurn?: import('../lib/appSnapshot').Turn
+  readonly terminalSnapshot?: import('../lib/appSnapshot').AppSnapshot
   readonly customDirectTimings?: CustomDirectTimings
 }
 

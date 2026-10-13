@@ -85,6 +85,37 @@ class EnginePhoneSnapshotTest {
             io.drain()
             return outcome ?: error("Snapshot did not settle")
         }
+        fun terminalAfterMutation(localSelectionOnly: Boolean): JSONObject {
+            // Simulate the already-committed result boundary; the real engine/store fence
+            // and phone encoder run here without requiring a provider or host JNI.
+            val captured = engine.snapshot()
+            val raw = JSONObject().put("revision", JSONObject(captured.viewJson).getString("revision"))
+                .put("conversation", conversation).put("parent", head).put("turns", JSONArray()).toString()
+            val result = AssistantRequestResult("synthetic-client", status = "complete", revision = "0",
+                recordJson = "{\"syntheticDurableRecord\":true}", terminalContextJson = raw)
+            val durableTurn = JSONObject().put("id", "synthetic-durable-turn")
+            val voiceContext = JSONObject().put("conversation", "synthetic-committed-conversation").put("selectedHead", "synthetic-committed-head")
+            val outcome = JSONObject().put("kind", "completed").put("turn", durableTurn).put("voiceContext", voiceContext)
+            backend.attachTerminalSnapshot(outcome, result, captured)
+            check(outcome.has("app_snapshot"))
+            outcome.remove("app_snapshot")
+            if (localSelectionOnly) store.selectConversation(conversation, null)
+            else android.database.sqlite.SQLiteDatabase.openDatabase(
+                java.io.File(context.noBackupFilesDir, "assistant.db").path, null, 0,
+            ).use { db ->
+                // Another store/process transaction commits a synthetic canonical revision.
+                db.beginTransaction()
+                try {
+                    db.execSQL("UPDATE state SET revision = '1', snapshot = ?", arrayOf(
+                        "{\"version\":1,\"revision\":\"1\",\"records\":[],\"retired\":[]}"))
+                    db.setTransactionSuccessful()
+                } finally { db.endTransaction() }
+            }
+            backend.attachTerminalSnapshot(outcome, result, captured)
+            assertEquals(durableTurn.toString(), outcome.getJSONObject("turn").toString())
+            assertEquals(voiceContext.toString(), outcome.getJSONObject("voiceContext").toString())
+            return outcome
+        }
         override fun close() { engine.stop(); io.drain(); worker.close(); store.close() }
         companion object {
             fun id(sequence: String) = JSONObject().put("replica", "00000000-0000-4000-8000-000000000701").put("sequence", sequence)
@@ -116,5 +147,13 @@ class EnginePhoneSnapshotTest {
             assertEquals("internal", failure.code)
             assertEquals(listOf("projection"), f.calls)
         }
+    }
+
+    @Test fun externallyCommittedCanonicalMutationOmitsInlineSnapshotButPreservesDurableOutcome() {
+        Fixture().use { assertFalse(it.terminalAfterMutation(localSelectionOnly = false).has("app_snapshot")) }
+    }
+
+    @Test fun localSelectionOnlyMutationOmitsInlineSnapshotButPreservesDurableOutcome() {
+        Fixture().use { assertFalse(it.terminalAfterMutation(localSelectionOnly = true).has("app_snapshot")) }
     }
 }

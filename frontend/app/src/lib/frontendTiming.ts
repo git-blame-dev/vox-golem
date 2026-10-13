@@ -2,7 +2,7 @@ import type { CustomDirectTimings } from '../types/chat'
 import { invokeTauriCommand, isAndroidRuntime } from './tauri'
 
 type StartupStage = 'SHELL_DOM_COMMITTED' | 'INITIAL_SNAPSHOT_REQUESTED' | 'INITIAL_SNAPSHOT_RECEIVED' | 'INITIAL_SNAPSHOT_APPLIED' | 'INITIAL_SEARCH_MODE_REQUESTED' | 'INITIAL_SEARCH_MODE_ACK' | 'STATE_READY'
-type RequestStage = 'ADMITTED' | 'IPC_DISPATCH' | 'FIRST_NONBLANK_RECEIVED' | 'FIRST_TEXT_DOM_COMMITTED' | 'SETTLED'
+type RequestStage = 'ADMITTED' | 'IPC_DISPATCH' | 'FIRST_NONBLANK_RECEIVED' | 'FIRST_TEXT_DOM_COMMITTED' | 'INLINE_SNAPSHOT_ACCEPTED' | 'TERMINAL_SNAPSHOT_RPC_REQUESTED' | 'SETTLED'
 
 export function frontendTimingEnabled(): boolean {
   return import.meta.env['VITE_VOXGOLEM_TIMING'] === '1'
@@ -82,6 +82,10 @@ export class FrontendRequestTiming {
   }
 
   dispatch(): void { this.record('IPC_DISPATCH') }
+
+  reconciliation(source: 'inline' | 'rpc'): void {
+    this.record(source === 'inline' ? 'INLINE_SNAPSHOT_ACCEPTED' : 'TERMINAL_SNAPSHOT_RPC_REQUESTED')
+  }
 
   received(text: string): CustomDirectTimings | undefined {
     if (this.firstNonblankAt === null && text.trim().length > 0) {

@@ -61,6 +61,7 @@ describe('frontend timing boundaries', () => {
     timing.domCommitted('synthetic-restored-answer')
     const first = timing.admit('synthetic-projection-a', now)
     first.dispatch(); first.dispatch()
+    first.reconciliation('inline'); first.reconciliation('inline')
     now = 150
     expect(first.received(' \n\t')).toBeUndefined()
     timing.domCommitted('synthetic-projection-a')
@@ -84,6 +85,7 @@ describe('frontend timing boundaries', () => {
       { scope: 'frontend_request', request: 2, stage: 'FIRST_TEXT_DOM_COMMITTED', atMs: 275, elapsedMs: 0 },
     ])
     expect(metadata.filter((entry) => entry['stage'] === 'IPC_DISPATCH')).toHaveLength(1)
+    expect(metadata.filter((entry) => entry['stage'] === 'INLINE_SNAPSHOT_ACCEPTED')).toHaveLength(1)
     expect(metadata.filter((entry) => entry['scope'] === 'provider_request')).toEqual([
       { scope: 'provider_request', request: 1, stage: 'PROVIDER_DURATIONS', firstTextMs: 7, completedMs: 9 },
     ])
