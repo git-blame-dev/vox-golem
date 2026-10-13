@@ -21,7 +21,7 @@ object AssistantRuntime {
 
     fun refreshIfStarted() { engine?.refresh() }
 
-    @Synchronized fun get(context: Context, startupTiming: AssistantTiming? = null): AssistantEngine {
+    @Synchronized fun get(context: Context, startupTiming: AssistantTiming? = null, preparePhoneContext: Boolean = false): AssistantEngine {
         engine?.let { startupTiming?.mark(AssistantTiming.Stage.RUNTIME_REUSED); return it }
         startupTiming?.mark(AssistantTiming.Stage.RUNTIME_CREATE_STARTED)
         val application = context.applicationContext
@@ -39,7 +39,8 @@ object AssistantRuntime {
 
         return AssistantEngine(AssistantStore(application), io, AssistantRequestWorker(provider, router),
             credentials::pathForProvider, modelStorage, credentials, NativeAssistantPolicyStorage(application),
-            beginTiming = { AssistantTiming.begin(application, it) }, startupTiming = startupTiming).also {
+            beginTiming = { AssistantTiming.begin(application, it) }, startupTiming = startupTiming,
+            preparePhoneContext = preparePhoneContext).also {
                 engine = it
                 startupTiming?.mark(AssistantTiming.Stage.RUNTIME_CREATED)
             }

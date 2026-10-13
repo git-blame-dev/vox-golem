@@ -15,11 +15,13 @@ class AssistantDomainException(val error: JSONObject) :
     IllegalArgumentException("Assistant domain: ${error.optString("kind", "invalid")}")
 
 internal sealed class AssistantProjectionRead {
-    object Context : AssistantProjectionRead()
+    data class Context(val maxTextBytes: Int = 256 * 1024) : AssistantProjectionRead() {
+        init { require(maxTextBytes in 0..256 * 1024) }
+    }
     data class History(val before: String?) : AssistantProjectionRead()
 
     fun request(): JSONObject = when (this) {
-        Context -> JSONObject().put("kind", "context").put("max_turns", 20).put("max_text_bytes", 256 * 1024)
+        is Context -> JSONObject().put("kind", "context").put("max_turns", 20).put("max_text_bytes", maxTextBytes)
         is History -> JSONObject().put("kind", "history").put("before", before ?: JSONObject.NULL)
             .put("max_turns", 32).put("max_text_bytes", 2 * 1024 * 1024)
     }

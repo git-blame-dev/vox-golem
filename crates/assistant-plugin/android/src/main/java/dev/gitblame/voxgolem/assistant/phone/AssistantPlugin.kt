@@ -89,7 +89,7 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
         val startupTiming = (activity as? PhoneStartupTimingOwner)?.startupTiming?.trace
         startupTiming?.mark(Stage.PLUGIN_LOAD_STARTED)
         AssistantRuntime.configureCaptureResourceAdmission(true)
-        AssistantRuntime.get(activity, startupTiming)
+        AssistantRuntime.get(activity, startupTiming, preparePhoneContext = true)
         webViewReference = WeakReference(webView)
         (activity as? LifecycleOwner)?.lifecycle?.addObserver(object : DefaultLifecycleObserver {
             override fun onResume(owner: LifecycleOwner) = setForeground(true)

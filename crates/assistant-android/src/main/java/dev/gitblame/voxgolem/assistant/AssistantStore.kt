@@ -4,15 +4,21 @@ import android.content.ContentValues
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import android.util.JsonReader
+import android.util.JsonToken
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.Closeable
 import java.io.File
+import java.io.IOException
+import java.io.StringReader
 import java.math.BigInteger
 import java.util.UUID
 
 class AssistantRevisionBusyException : IllegalStateException("Assistant store revision changed repeatedly")
 class AssistantCompletionSuppressedException : IllegalStateException("Completion deleted or quarantined; not saved")
+
+internal data class CommittedSnapshot(val rawJson: String, val revision: String)
 
 /** Blocking IO. The caller must use an existing worker/dispatcher, never the UI thread. */
 class AssistantStore(
@@ -49,9 +55,9 @@ class AssistantStore(
     @Synchronized fun importRecords(records: JSONArray): JSONObject = commitRecords(records, true)
 
     @Synchronized fun context(conversation: JSONObject, selectedHead: JSONObject?): JSONObject {
-        val raw = readSnapshot()
-        return domain.evaluate("context", raw, JSONObject().put("request", JSONObject()
-            .put("expected_revision", JSONObject(raw).getString("revision"))
+        val captured = committedSnapshot()
+        return domain.evaluate("context", captured.rawJson, JSONObject().put("request", JSONObject()
+            .put("expected_revision", captured.revision)
             .put("conversation", conversation).put("selected_head", selectedHead ?: JSONObject.NULL)
             .put("max_turns", 20).put("max_text_bytes", 256 * 1024))) as JSONObject
     }
@@ -97,6 +103,16 @@ class AssistantStore(
         check(it.moveToFirst())
         JSONObject().put("conversation", if (it.isNull(0)) JSONObject.NULL else JSONObject(it.getString(0)))
             .put("selected_head", if (it.isNull(1)) JSONObject.NULL else JSONObject(it.getString(1)))
+    }
+
+    @Synchronized internal fun projectionStillCurrent(revision: String, conversation: String?, head: String?): Boolean = transaction { db ->
+        readRevision(db) == revision && db.rawQuery(
+            "SELECT conversation, selected_head FROM local_state WHERE singleton = 1", null,
+        ).use {
+            check(it.moveToFirst())
+            (if (it.isNull(0)) null else it.getString(0)) == conversation &&
+                (if (it.isNull(1)) null else it.getString(1)) == head
+        }
     }
 
     /** Null conversation is a fresh, not-yet-created draft. Interrupted never implies replay. */
@@ -150,8 +166,9 @@ class AssistantStore(
         val ids = JSONArray()
         for (i in 0 until receipts.length()) ids.put(receipts.getJSONObject(i).getJSONObject("operation"))
         repeat(MAX_RETRIES) {
-            val raw = readSnapshot()
-            val revision = JSONObject(raw).getString("revision")
+            val committed = committedSnapshot()
+            val raw = committed.rawJson
+            val revision = committed.revision
             val expected = domain.evaluate("receipts", raw, JSONObject().put("recipient", peerReplica).put("operation_ids", ids)) as JSONArray
             for (i in 0 until receipts.length()) {
                 val receipt = receipts.getJSONObject(i)
@@ -186,9 +203,10 @@ class AssistantStore(
         require(input.length() <= 128)
         val records = JSONArray(input.toString())
         repeat(MAX_RETRIES) {
-            val raw = readSnapshot()
+            val captured = committedSnapshot()
+            val raw = captured.rawJson
             val plan = domain.evaluate("plan", raw, JSONObject().put("command", JSONObject()
-                .put("kind", "import").put("expected_revision", JSONObject(raw).getString("revision"))
+                .put("kind", "import").put("expected_revision", captured.revision)
                 .put("records", records))) as JSONObject
             val snapshot = plan.getJSONObject("snapshot")
             val quarantined = quarantinedIds(plan)
@@ -300,7 +318,9 @@ class AssistantStore(
         check(it.moveToFirst()); it.getString(0)
     }
 
-    private fun readSnapshot(): String {
+    private fun readSnapshot(): String = committedSnapshot().rawJson
+
+    @Synchronized internal fun committedSnapshot(): CommittedSnapshot {
         val db = helper.readableDatabase
         return transaction(db) {
             db.rawQuery("SELECT length(CAST(snapshot AS BLOB)) FROM state WHERE singleton = 1", null).use {
@@ -309,8 +329,24 @@ class AssistantStore(
             // A snapshot can exceed Android's usual 2 MiB CursorWindow. Scalar statement IO
             // avoids placing the bounded 4 MiB value into a cursor row.
             val raw = db.compileStatement("SELECT snapshot FROM state WHERE singleton = 1").use { it.simpleQueryForString() }
-            check(JSONObject(raw).getString("revision") == readRevision(db)) { "Assistant DB revision mismatch" }
-            raw
+            val revision = readRevision(db)
+            try { JsonReader(StringReader(raw)).use { reader ->
+                reader.isLenient = false
+                reader.beginObject()
+                var embedded: String? = null
+                while (reader.hasNext()) {
+                    if (reader.nextName() == "revision") {
+                        check(embedded == null && reader.peek() == JsonToken.STRING) { "Invalid Assistant revision" }
+                        embedded = reader.nextString()
+                    } else reader.skipValue()
+                }
+                reader.endObject()
+                check(reader.peek() == JsonToken.END_DOCUMENT) { "Trailing Assistant snapshot data" }
+                check(embedded == revision) { "Assistant DB revision mismatch" }
+            } } catch (error: IOException) {
+                throw IllegalStateException("Invalid Assistant committed snapshot", error)
+            }
+            CommittedSnapshot(raw, revision)
         }
     }
 
