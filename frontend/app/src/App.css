@@ -508,6 +508,14 @@
   color: var(--message-text);
 }
 
+.message__thinking {
+  color: var(--text-muted);
+  font-style: italic;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
 .answer-stage { max-width: min(100%, 42rem); padding: .35rem 0 .5rem 1.15rem; border: 0; border-left: 2px solid var(--accent-primary-strong); border-radius: 0; background: transparent; box-shadow: none; }
 .answer-stage h2 { margin: 0 0 .5rem; font-size: 1em; }
 .answer-stage__answer { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; }

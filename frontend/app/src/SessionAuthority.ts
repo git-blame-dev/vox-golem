@@ -31,6 +31,7 @@ export type PromptProjection = {
   renderFrameId: number | null
   renderFrameRevision: number
   customDirectTimings?: import('./types/chat').CustomDirectTimings
+  admittedAt?: number
 }
 
 export interface RuntimeProjection {
@@ -257,7 +258,7 @@ export class SessionAuthority {
   }
 
   renderPromptProjection(projection: PromptProjection): void {
-    if (!this.active || projection.text.length === 0 || projection.presentationCancelled) return
+    if (!this.active || projection.presentationCancelled) return
     const projectedMessage: ChatMessage = {
       id: projection.assistantId, role: 'assistant', content: projection.text,
       ...(projection.customDirectTimings === undefined ? {} : { customDirectTimings: projection.customDirectTimings }),

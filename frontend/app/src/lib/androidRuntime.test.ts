@@ -54,10 +54,12 @@ describe('Android runtime contract helpers', () => {
     expect(parseAndroidPromptUpdate({ kind: 'stage', stage: 'deep', status: 'running', detail: null }, 'r')).toEqual({ requestId: 'r', kind: 'stage', stage: 'deep', status: 'running' })
     expect(parseAndroidPromptUpdate({ kind: 'correction', stage: 'review', text: 'new', correction: 'old was corrected' }, 'r')).toMatchObject({ kind: 'correction', correction: 'old was corrected' })
     expect(parseAndroidPromptUpdate({ kind: 'status', message: 'waiting' }, 'r')).toMatchObject({ kind: 'status', message: 'waiting' })
+    expect(parseAndroidPromptUpdate({ kind: 'custom_direct_timings', first_text_ms: 450, completed_ms: 1250 }, 'r')).toEqual({ requestId: 'r', kind: 'custom_direct_timings', timings: { firstTextMs: 450, completedMs: 1250 } })
     const turn = { request_id: 'r', execution_id: { session_id: '1', generation: '1' }, user: { id: '1', role: 'user', content: { kind: 'text', text: 'question' } }, answer: { id: '2', role: 'assistant', content: { kind: 'refusal', text: 'cannot help' } }, final_stage: 'instant' }
     expect(parseAndroidPromptOutcome({ kind: 'refused', turn }, 'r')).toMatchObject({ outcome: 'completed', runtimePhase: 'sleeping', canonicalOutcome: 'refused' })
     const textTurn = { ...turn, answer: { ...turn.answer, content: { kind: 'text', text: 'answer' } } }
     expect(parseAndroidPromptOutcome({ kind: 'completed', turn: textTurn }, 'r')).toMatchObject({ outcome: 'completed', canonicalOutcome: 'completed' })
+    expect(parseAndroidPromptOutcome({ kind: 'completed', turn: textTurn, first_text_ms: 450, completed_ms: 1250 }, 'r')).toMatchObject({ outcome: 'completed', canonicalOutcome: 'completed', customDirectTimings: { firstTextMs: 450, completedMs: 1250 } })
     expect(parseAndroidPromptOutcome({ kind: 'cancelled' }, 'r')).toMatchObject({ outcome: 'cancelled' })
     expect(() => parseAndroidPromptUpdate({ kind: 'delta', delta: 'wrong' }, 'r')).toThrow()
     expect(() => parseAndroidPromptOutcome({ kind: 'completed', turn: {} }, 'r')).toThrow()

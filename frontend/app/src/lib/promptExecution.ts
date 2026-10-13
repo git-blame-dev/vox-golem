@@ -15,6 +15,15 @@ export function parseAndroidPromptUpdate(payload: unknown, requestId: string): P
     if (typeof payload['text'] !== 'string' || utf8ByteLength(payload['text']) > 256 * 1024) throw new Error('Android delta must include bounded text')
     return { requestId, kind: 'text', text: payload['text'] }
   }
+  if (kind === 'custom_direct_timings') {
+    const firstTextMs = payload['first_text_ms']
+    const completedMs = payload['completed_ms']
+    if (!Number.isSafeInteger(firstTextMs) || !Number.isSafeInteger(completedMs) ||
+        (firstTextMs as number) < 0 || (completedMs as number) < (firstTextMs as number)) {
+      throw new Error('Custom direct timings must include ordered nonnegative milliseconds')
+    }
+    return { requestId, kind: 'custom_direct_timings', timings: { firstTextMs: firstTextMs as number, completedMs: completedMs as number } }
+  }
   if (kind === 'stage') {
     if (!isStage(payload['stage']) || !isStageStatus(payload['status']) || (payload['detail'] !== undefined && payload['detail'] !== null && (typeof payload['detail'] !== 'string' || utf8ByteLength(payload['detail']) > 512))) throw new Error('Android stage update is invalid')
     return { requestId, kind: 'stage', stage: payload['stage'], status: payload['status'], ...(typeof payload['detail'] === 'string' ? { detail: payload['detail'] } : {}) }
@@ -40,7 +49,18 @@ export function parseAndroidPromptOutcome(payload: unknown, requestId: string): 
   if (turn.requestId !== requestId) throw new Error('Android prompt outcome request ID did not match the active request')
   if (payload['kind'] === 'completed' && turn.answer.content.kind !== 'text') throw new Error('Completed Android prompt outcome must contain a text answer')
   if (payload['kind'] === 'refused' && turn.answer.content.kind !== 'refusal') throw new Error('Refused Android prompt outcome must contain a refusal answer')
-  return { requestId, runtimePhase: 'sleeping', outcome: 'completed', errorMessage: null, canonicalOutcome: payload['kind'], canonicalTurn: turn }
+  const firstTextMs = payload['first_text_ms']
+  const completedMs = payload['completed_ms']
+  let customDirectTimings: import('../types/chat').CustomDirectTimings | undefined
+  if (
+    Number.isSafeInteger(firstTextMs) &&
+    Number.isSafeInteger(completedMs) &&
+    (firstTextMs as number) >= 0 &&
+    (completedMs as number) >= (firstTextMs as number)
+  ) {
+    customDirectTimings = { firstTextMs: firstTextMs as number, completedMs: completedMs as number }
+  }
+  return { requestId, runtimePhase: 'sleeping', outcome: 'completed', errorMessage: null, canonicalOutcome: payload['kind'], canonicalTurn: turn, ...(customDirectTimings === undefined ? {} : { customDirectTimings }) }
 }
 
 export function parseAndroidPromptOutcomeForExecution(payload: unknown, requestId: string): PromptExecutionResult {

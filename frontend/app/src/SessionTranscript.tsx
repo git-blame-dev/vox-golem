@@ -5,6 +5,7 @@ import { isTranscriptMessage } from './types/chat'
 import { ChatBubble } from './components/ChatBubble'
 import { AnswerStage } from './components/AnswerStage'
 import { isAndroidRuntime } from './lib/tauri'
+import { duration } from './lib/duration'
 
 export function SessionTranscript({ session, staging, composerValue, textSize, noticeId }: {
   readonly session: FrontendSession
@@ -63,15 +64,11 @@ const TranscriptRow = memo(function TranscriptRow({ message }: { readonly messag
   if (!message.answerStage || message.role !== 'assistant') return <ChatBubble message={message} />
   return <div className="conversation__answer">
     <AnswerStage compact={isAndroidRuntime} answer={message.content} className="message message--assistant" {...(message.contentKind === undefined ? {} : { contentKind: message.contentKind })} {...message.answerStage} />
-    {message.customDirectTimings ? <small className="conversation__timings">First text: {duration(message.customDirectTimings.firstTextMs)} · Completed: {duration(message.customDirectTimings.completedMs)}</small> : null}
+    {message.customDirectTimings ? <small className="conversation__timings">{duration(message.customDirectTimings.firstTextMs)}</small> : null}
   </div>
 })
 
 export function ResponseAnnouncements({ session }: { readonly session: FrontendSession }) {
   const announcement = useSyncExternalStore(session.subscribe, session.getAnnouncementSnapshot, session.getAnnouncementSnapshot)
   return <div className="status-announcer"><div className="sr-only" role="status" aria-live="polite" aria-atomic="true" aria-label="Response announcements">{announcement}</div></div>
-}
-
-function duration(milliseconds: number): string {
-  return milliseconds < 1000 ? `${milliseconds} ms` : `${Number((milliseconds / 1000).toFixed(2))} s`
 }

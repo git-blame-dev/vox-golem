@@ -10,8 +10,8 @@ export function searchModeAvailability(settings: AssistantSettings, modelAvailab
   if (settings.deepEnabled && settings.deep.startsWith('opencode-')) {
     return { available: false, reason: 'OpenCode Deep owns research for this turn.' }
   }
-  if (!['custom-sol-high', 'custom-sol-none', 'custom-luna-none', 'custom-luna-low'].includes(settings.instant)) {
-    return { available: false, reason: 'Native search requires a supported Custom model.' }
+  if (!['custom-sol-high', 'custom-sol-none', 'custom-luna-none', 'custom-luna-low', 'agy-flash-low', 'agy-flash-high', 'agy-opus-high', 'agy-sonnet-high'].includes(settings.instant)) {
+    return { available: false, reason: 'Native search requires a supported model.' }
   }
   if (!modelAvailable) return { available: false, reason: 'The selected Custom model is unavailable.' }
   return { available: true }
