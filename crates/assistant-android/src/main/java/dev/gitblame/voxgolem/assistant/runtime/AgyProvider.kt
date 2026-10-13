@@ -18,9 +18,9 @@ class AgyProviderRouter(
     private val agyNative: ProviderNativeCalls = AgyProviderNative(context)
 ) : ProviderNativeCalls {
     fun prewarm(model: String) {
-        if (model.startsWith("agy-") || model.startsWith("claude-") || model.startsWith("gemini-") || model.startsWith("opus") || model.startsWith("sonnet") || model.startsWith("3.8-")) {
-            (agyNative as? AgyProviderNative)?.prewarm(model)
-        }
+        val eligible = model.startsWith("agy-") || model.startsWith("claude-") || model.startsWith("gemini-") || model.startsWith("opus") || model.startsWith("sonnet") || model.startsWith("3.8-")
+        // Every accepted selection invalidates older work, including selections routed elsewhere.
+        (agyNative as? AgyProviderNative)?.prewarm(model, eligible)
     }
 
     override fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String {
@@ -53,6 +53,9 @@ class AgyProviderNative(private val context: Context) : ProviderNativeCalls {
     private var activeSessionId: String? = null
     private var activeRequestId: String? = null
     private val cancelled = AtomicBoolean(false)
+    private var prewarmGeneration = 0L
+
+    private fun advancePrewarmSelection(): Long = synchronized(lock) { ++prewarmGeneration }
 
     private fun ensureCredentials() {
         val homeDir = File(context.filesDir, "home")
@@ -150,14 +153,26 @@ class AgyProviderNative(private val context: Context) : ProviderNativeCalls {
         }
     }
 
-    fun prewarm(requestedModel: String) {
+    private fun acquirePrewarmProcess(executable: File, targetModel: String, effort: String, generation: Long): Boolean =
+        synchronized(lock) {
+            if (generation != prewarmGeneration) return@synchronized false
+            // Respond owns model/session acquisition until its complete unwind, including cancellation.
+            if (activeRequestId != null) return@synchronized false
+            // Prewarm has no conversation identity and must not reset one on a reusable process.
+            if (activeModel == targetModel && isAlive(process)) return@synchronized true
+            startProcess(executable, targetModel, effort, null)
+        }
+
+    fun prewarm(requestedModel: String, eligible: Boolean) {
+        val generation = advancePrewarmSelection()
+        if (!eligible) return
         Thread({
             try {
                 val executable = getExecutable() ?: return@Thread
                 ensureCredentials()
                 val targetAgyModel = resolveTargetModel(requestedModel)
                 val effort = if (targetAgyModel.endsWith("-low")) "low" else "high"
-                if (startProcess(executable, targetAgyModel, effort, null)) {
+                if (acquirePrewarmProcess(executable, targetAgyModel, effort, generation)) {
                     Log.i(TAG, "Prewarm acquired local engine process; readiness not verified")
                 }
             } catch (e: Exception) {
@@ -168,10 +183,24 @@ class AgyProviderNative(private val context: Context) : ProviderNativeCalls {
 
     override fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String {
         synchronized(lock) {
+            if (activeRequestId != null) {
+                return JSONObject().put("status", "error").put("code", "busy")
+                    .put("message", "An Agy request is already active").toString()
+            }
             activeRequestId = requestId
             cancelled.set(false)
         }
 
+        return try {
+            respondOwned(requestJson, callback)
+        } finally {
+            synchronized(lock) {
+                if (activeRequestId == requestId) activeRequestId = null
+            }
+        }
+    }
+
+    private fun respondOwned(requestJson: String, callback: ProviderDeltaCallback): String {
         val executable = getExecutable()
         if (executable == null) {
             return JSONObject().put("status", "error").put("code", "unsupported_model")
@@ -212,6 +241,7 @@ class AgyProviderNative(private val context: Context) : ProviderNativeCalls {
         var reader: BufferedReader
 
         synchronized(lock) {
+            if (cancelled.get()) return JSONObject().put("status", "cancelled").toString()
             if (process == null || activeModel != targetAgyModel || (activeSessionId != null && activeSessionId != sessionId) || !isAlive(process)) {
                 if (!startProcess(executable, targetAgyModel, effort, sessionId)) {
                     return JSONObject().put("status", "error").put("code", "internal_error")
@@ -241,6 +271,7 @@ class AgyProviderNative(private val context: Context) : ProviderNativeCalls {
             // Do not call the worker while holding the process lock: cancellation takes them in the reverse order.
             callback.onRequestDispatched()
             synchronized(lock) {
+                if (cancelled.get()) return JSONObject().put("status", "cancelled").toString()
                 writer.write(serializedRequest)
                 writer.flush()
             }

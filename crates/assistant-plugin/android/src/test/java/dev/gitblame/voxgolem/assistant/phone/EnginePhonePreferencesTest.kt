@@ -33,10 +33,15 @@ class EnginePhonePreferencesTest {
             """{"ok":true,"value":{"view":{"revision":"0","records":[],"conversations":[],"pending":[]},"continuation":null,"read":null}}"""
         }
         private val store = AssistantStore(context, gateway)
+        var rejectModelWrite = false
+        val prewarmed = mutableListOf<String>()
         private val models = object : AssistantModelStorage {
             private var value = "custom-sol-high"
             override fun read() = value
-            override fun write(value: String) { this.value = value }
+            override fun write(value: String) {
+                if (rejectModelWrite) { rejectModelWrite = false; error("Synthetic model storage failure") }
+                this.value = value
+            }
         }
         private val policies = NativeAssistantPolicyStorage(context).apply {
             write(AssistantPolicy(speechLanguage = selection.language, speechTtsProvider = selection.ttsProvider, speechTtsVoice = selection.ttsVoice))
@@ -56,7 +61,16 @@ class EnginePhonePreferencesTest {
             io.drain()
             PhonePreferences(context).write(PhonePreferences.defaults().put("tts_enabled", enabled)
                 .put("speech_language", selection.language).put("speech_tts_provider", selection.ttsProvider).put("speech_tts_voice", selection.ttsVoice))
-            backend = EnginePhoneBackend(context, engine)
+            backend = EnginePhoneBackend(context, engine) { model ->
+                assertEquals(model, engine.snapshot().model)
+                assertEquals(model, models.read())
+                assertEquals(model, persisted().getString("instant"))
+                assertEquals(model, context.getSharedPreferences("assistant-phone-preferences", android.content.Context.MODE_PRIVATE)
+                    .getString("instant", null))
+                assertEquals(engine.snapshot().webEnabled, persistedPolicy().webEnabled)
+                assertFalse(engine.snapshot().busy)
+                prewarmed += model
+            }
             backend.speechStatus = JSONObject().put("ttsAvailable", false)
         }
         fun update(input: JSONObject): Result<Any?> {
@@ -70,10 +84,69 @@ class EnginePhonePreferencesTest {
         fun duplicatePolicyKeys() = context.getSharedPreferences("assistant-phone-preferences", android.content.Context.MODE_PRIVATE)
             .all.keys.filter(dev.gitblame.voxgolem.voice.InstallationPreferences::ownsKey)
         fun publishOptions(options: SpeechOptions) { backend.publishSpeechOptions(options); io.drain() }
+        fun queueUpdate(input: JSONObject, reply: (Result<Any?>) -> Unit) {
+            backend.command("set_preferences", JSONObject().put("preferences", input), reply)
+        }
+        fun drain() = io.drain()
         override fun close() { engine.stop(); io.drain(); worker.close(); store.close() }
     }
 
     @After fun resetAdmission() { AssistantRuntime.configureCaptureResourceAdmission(false) }
+
+    @Test fun acceptedModelChangesPrewarmOnlyAfterPersistenceAndInvalidateForNonAgySelection() {
+        AssistantRuntime.configureCaptureResourceAdmission(true)
+        Fixture(false).use { f ->
+            f.backend.speechStatus = JSONObject().put("ttsAvailable", true)
+            f.update(f.backend.nativePreferences().put("instant", "agy-flash-high").put("web_enabled", false)).getOrThrow()
+            assertEquals(listOf("agy-flash-high"), f.prewarmed)
+            for (input in listOf(
+                f.backend.nativePreferences().put("ui_theme", "light"),
+                f.backend.nativePreferences().put("tts_enabled", true),
+                f.backend.nativePreferences().put("web_enabled", true),
+            )) {
+                f.update(input).getOrThrow()
+                assertEquals(listOf("agy-flash-high"), f.prewarmed)
+            }
+            f.update(f.backend.nativePreferences().put("instant", "custom-sol-none")).getOrThrow()
+            assertEquals(listOf("agy-flash-high", "custom-sol-none"), f.prewarmed)
+        }
+    }
+
+    @Test fun rejectedUnsupportedUnavailableAndRolledBackSelectionsNeverPrewarm() {
+        Fixture(false).use { f ->
+            val initial = f.backend.nativePreferences()
+            for (input in listOf(
+                JSONObject(initial.toString()).put("instant", "synthetic-unsupported"),
+                JSONObject(initial.toString()).put("instant", "agy-flash-high").put("tts_enabled", true),
+                JSONObject(initial.toString()).put("instant", "agy-flash-high").put("speech_tts_provider", "synthetic.missing.tts"),
+            )) {
+                assertTrue(f.update(input).isFailure)
+                assertTrue(f.prewarmed.isEmpty())
+                assertEquals("custom-sol-high", f.engine.snapshot().model)
+                assertEquals("custom-sol-high", f.persisted().getString("instant"))
+            }
+            f.rejectModelWrite = true
+            assertTrue(f.update(JSONObject(initial.toString()).put("instant", "agy-flash-high")).isFailure)
+            assertTrue(f.prewarmed.isEmpty())
+            assertEquals("custom-sol-high", f.engine.snapshot().model)
+            assertEquals("custom-sol-high", f.persisted().getString("instant"))
+        }
+    }
+
+    @Test fun pendingPreferenceChoiceRejectsBusySelectionWithoutPrewarmingIt() {
+        Fixture(false).use { f ->
+            var first: Result<Any?>? = null
+            var busy: Result<Any?>? = null
+            f.queueUpdate(f.backend.nativePreferences().put("web_enabled", false)) { first = it }
+            f.queueUpdate(f.backend.nativePreferences().put("instant", "agy-flash-high")) { busy = it }
+            assertEquals("busy", (busy?.exceptionOrNull() as AssistantPhoneFailure).code)
+            assertTrue(f.prewarmed.isEmpty())
+            f.drain()
+            first!!.getOrThrow()
+            assertTrue(f.prewarmed.isEmpty())
+            assertEquals("custom-sol-high", f.persisted().getString("instant"))
+        }
+    }
 
     @Test fun legacyPhonePolicyKeysRemainUntouchedAndNeverOverrideTheActorPolicy() {
         Fixture(false, SpeechSelection(language = "en-AU")).use { f ->
