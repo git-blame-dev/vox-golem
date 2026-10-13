@@ -374,6 +374,13 @@ fn forward_update(
                 .get("message")
                 .and_then(Value::as_str)
                 .is_some_and(|text| text.len() <= 512),
+            Some("custom_direct_timings") => {
+                update
+                    .get("first_text_ms")
+                    .and_then(Value::as_u64)
+                    .is_some()
+                    && update.get("completed_ms").and_then(Value::as_u64).is_some()
+            }
             _ => false,
         });
     let accepted = !*failed

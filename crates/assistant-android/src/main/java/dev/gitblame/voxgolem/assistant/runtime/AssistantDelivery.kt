@@ -25,6 +25,8 @@ data class AssistantRequestResult(
     val revision: String? = null,
     val recordJson: String? = null,
     val speechText: String? = null,
+    val firstTextMs: Long? = null,
+    val completedMs: Long? = null,
 )
 
 fun interface AssistantResultListener {

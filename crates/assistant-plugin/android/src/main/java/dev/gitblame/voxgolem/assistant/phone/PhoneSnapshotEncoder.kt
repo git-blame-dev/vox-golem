@@ -50,11 +50,21 @@ object PhoneSnapshotEncoder {
             "vad" to "Voice activity detection is unavailable on Android", "parakeet" to "Desktop transcription is unavailable on Android",
             "tts" to "Text to speech is unavailable on Android", "deep" to "Deep execution is disabled on Android", "review" to "Review execution is disabled on Android",
         )) {
-            val available = id == "custom_provider" && providerAvailable
+            val available = (id == "custom_provider" && providerAvailable) || (id == "local_fast")
             capabilities.put(JSONObject().put("id", id).put("state", if (available) "available" else "unavailable")
-                .put("reason", reason).put("actual_provider", if (available) "custom_openai" else JSONObject.NULL))
+                .put("reason", if (available) "ready" else reason).put("actual_provider", if (id == "custom_provider" && available) "custom_openai" else if (id == "local_fast") "llama.cpp" else JSONObject.NULL))
         }
         val options = JSONArray()
+        options.put(JSONObject().put("id", "local-fast").put("label", "Local: Llama 3.2 3B").put("available", true)
+            .put("unavailable_reason", JSONObject.NULL))
+        options.put(JSONObject().put("id", "agy-flash-low").put("label", "Agy: Gemini 3.8 Flash Low").put("available", true)
+            .put("unavailable_reason", JSONObject.NULL))
+        options.put(JSONObject().put("id", "agy-flash-high").put("label", "Agy: Gemini 3.8 Flash High").put("available", true)
+            .put("unavailable_reason", JSONObject.NULL))
+        options.put(JSONObject().put("id", "agy-opus-high").put("label", "Agy: Claude Opus 5.5 High").put("available", true)
+            .put("unavailable_reason", JSONObject.NULL))
+        options.put(JSONObject().put("id", "agy-sonnet-high").put("label", "Agy: Claude Sonnet 5.5 High").put("available", true)
+            .put("unavailable_reason", JSONObject.NULL))
         for ((id, label) in mapOf("custom-sol-high" to "Sol High", "custom-sol-none" to "Sol None", "custom-luna-none" to "Luna None", "custom-luna-low" to "Luna Low")) {
             options.put(JSONObject().put("id", id).put("label", label).put("available", providerAvailable)
                 .put("unavailable_reason", if (providerAvailable) JSONObject.NULL else providerReason))

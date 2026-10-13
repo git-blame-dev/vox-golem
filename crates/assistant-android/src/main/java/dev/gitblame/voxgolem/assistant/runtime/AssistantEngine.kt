@@ -52,7 +52,7 @@ interface AssistantModelStorage {
 }
 
 object AssistantModels {
-    val aliases = listOf("custom-sol-high", "custom-sol-none", "custom-luna-none", "custom-luna-low")
+    val aliases = listOf("custom-sol-high", "custom-sol-none", "custom-luna-none", "custom-luna-low", "local-fast", "agy-flash-low", "agy-flash-high", "agy-opus-high", "agy-sonnet-high")
 }
 
 object AssistantSearchModes {
@@ -95,6 +95,8 @@ class AssistantEngine @JvmOverloads internal constructor(
         val searchMode: String,
         val webEnabled: Boolean,
         val externalSessionId: String,
+        val admittedAt: Long = android.os.SystemClock.elapsedRealtime(),
+        var firstTextMs: Long? = null,
     )
     private val domain = AssistantDomain(projectionGateway)
     private val observers = CopyOnWriteArrayList<(AssistantState) -> Unit>()
@@ -429,13 +431,17 @@ class AssistantEngine @JvmOverloads internal constructor(
             if (ticket.cancelled.get() || ticket.epoch != epoch.get()) { fail("interrupted", true); return }
             if (!state.foreground) { fail("background", true); return }
             val auth = credentials?.selection()
-            val credential = auth?.status
-            state = state.copy(credential = credential)
-            when (credential?.reason) {
-                ProviderAuthReason.EXPIRED -> { fail("auth_expired"); return }
-                ProviderAuthReason.MISSING, ProviderAuthReason.INVALID -> { fail("auth_unavailable"); return }
-                ProviderAuthReason.UNAUTHORIZED -> { fail("unauthorized"); return }
-                else -> Unit
+            if (state.model != "local-fast" && !state.model.startsWith("agy-")) {
+                val credential = auth?.status
+                state = state.copy(credential = credential)
+                when (credential?.reason) {
+                    ProviderAuthReason.EXPIRED -> { fail("auth_expired"); return }
+                    ProviderAuthReason.MISSING, ProviderAuthReason.INVALID -> { fail("auth_unavailable"); return }
+                    ProviderAuthReason.UNAUTHORIZED -> { fail("unauthorized"); return }
+                    else -> Unit
+                }
+            } else {
+                state = state.copy(credential = null)
             }
             if (state.model !in AssistantModels.aliases) { fail("unsupported_model"); return }
             if ((if (voiceOwner != null) promptOverride ?: state.draft else state.draft).isBlank()) { fail("empty_prompt"); return }
@@ -492,6 +498,7 @@ class AssistantEngine @JvmOverloads internal constructor(
                 val admitted = worker.submit(id, selectedAuthPath, serializedRequest, object : AssistantRequestListener {
                     override fun onFirstText(requestId: String, milliseconds: Long) = dispatch {
                         if (requestId == turn.id && active === turn && turn.epoch == epoch.get() && !ticket.cancelled.get()) {
+                            turn.firstTextMs = milliseconds
                             state = state.copy(firstTextMs = milliseconds)
                         }
                     }
@@ -562,9 +569,14 @@ class AssistantEngine @JvmOverloads internal constructor(
         var saved = false
         var savedRecord: String? = null
         var speechText: String? = null
+        var outcomeFirstText: Long? = null
+        var outcomeCompleted: Long? = null
         try {
             require(raw.toByteArray(Charsets.UTF_8).size <= 2 * 1024 * 1024)
             val outcome = JSONObject(raw)
+            val elapsedMs = (android.os.SystemClock.elapsedRealtime() - turn.admittedAt).coerceAtLeast(0L)
+            outcomeFirstText = if (outcome.has("firstTextMs")) outcome.getLong("firstTextMs") else turn.firstTextMs
+            outcomeCompleted = if (outcome.has("completedMs")) outcome.getLong("completedMs") else elapsedMs
             val providerStatus = when {
                 outcome.optString("status") == "complete" -> 200
                 outcome.optString("code") == "unauthorized" -> 401
@@ -614,7 +626,7 @@ class AssistantEngine @JvmOverloads internal constructor(
              try { refreshProjection() } catch (_: RuntimeException) {
                  state = state.copy(error = if (saved) "saved_local_state_failed" else state.error ?: "not_saved")
              } finally {
-                finish(turn.ticket, if (saved) "complete" else if (state.error == "interrupted") "cancelled" else "error", state.error, turn.id, savedRecord, if (saved) speechText else null)
+                finish(turn.ticket, if (saved) "complete" else if (state.error == "interrupted") "cancelled" else "error", state.error, turn.id, savedRecord, if (saved) speechText else null, if (saved) (outcomeFirstText ?: outcomeCompleted) else null, if (saved) outcomeCompleted else null)
                 afterRetirement?.also { afterRetirement = null; it() }
             }
         }
@@ -622,7 +634,7 @@ class AssistantEngine @JvmOverloads internal constructor(
 
     private fun ticketFailure(ticket: Ticket) = ticket.failure.get()
 
-    private fun finish(ticket: Ticket, status: String, code: String?, providerId: String? = null, record: String? = null, speechText: String? = null) {
+    private fun finish(ticket: Ticket, status: String, code: String?, providerId: String? = null, record: String? = null, speechText: String? = null, firstTextMs: Long? = null, completedMs: Long? = null) {
         if (ticket.finished) return
         ticket.finished = true
         ticket.timing.finish(when (status) { "complete" -> Stage.SETTLED; "cancelled" -> Stage.CANCELLED; else -> Stage.FAILED })
@@ -631,7 +643,7 @@ class AssistantEngine @JvmOverloads internal constructor(
         ticket.listener = null
         ticket.delivery = null
         val result = AssistantRequestResult(ticket.token, providerId, status, code,
-            JSONObject(state.viewJson).optString("revision"), record, speechText)
+            JSONObject(state.viewJson).optString("revision"), record, speechText, firstTextMs, completedMs)
         try { listener?.onResult(result, state) } catch (_: RuntimeException) { /* Durable settlement cannot depend on a result consumer. */ }
     }
 
