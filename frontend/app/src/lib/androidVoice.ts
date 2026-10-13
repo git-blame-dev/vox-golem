@@ -17,6 +17,8 @@ export interface AndroidVoiceStatus extends SpeechSelection {
   readonly recognitionRoute?: string | null
   readonly ttsRoute?: string | null
   readonly localOnlyRecognitionAvailable?: boolean
+  readonly missingSpeechServices?: boolean
+  readonly speechRequirementMessage?: string | null
   readonly recognitionMetadata?: AndroidSpeechMetadata | null
   readonly ttsMetadata?: AndroidSpeechMetadata | null
   readonly diagnosticError?: string | null
@@ -75,6 +77,8 @@ export function parseAndroidVoiceStatus(value: unknown): AndroidVoiceStatus {
     speechLanguage: parseSpeechSelectionString(value, 'speechLanguage'), speechTtsProvider: parseSpeechSelectionString(value, 'speechTtsProvider'), speechTtsVoice: parseSpeechSelectionString(value, 'speechTtsVoice'),
     speechOptions: parseSpeechOptions(value['speechOptions']),
     localOnlyRecognitionAvailable: value['localOnlyRecognitionAvailable'] === true,
+    missingSpeechServices: value['missingSpeechServices'] === true,
+    speechRequirementMessage: value['speechRequirementMessage'] === undefined || value['speechRequirementMessage'] === null ? null : text(value['speechRequirementMessage'], 512),
     recognitionMetadata: parseSpeechMetadata(value['recognitionMetadata']), ttsMetadata: parseSpeechMetadata(value['ttsMetadata']),
     diagnosticError: value['diagnosticError'] === undefined || value['diagnosticError'] === null ? null : text(value['diagnosticError'], 512),
     dictation: text(value['dictation'], 32), ...(value['readyForSpeech'] === undefined ? {} : { readyForSpeech: value['readyForSpeech'] }), loop: text(value['loop'], 32), ttsEnabled: value['ttsEnabled'], ttsAvailable: value['ttsAvailable'], ttsPhase: text(value['ttsPhase'], 32),
@@ -145,3 +149,17 @@ export function parseAndroidVoiceEvent(value: unknown): AndroidVoiceEvent {
   if (value['kind'] === 'shortcut_review') return { sessionId, kind: 'shortcut_review', draft: text(value['draft'], 32 * 1024), reason: text(value['reason'], 512) }
   throw new Error('Native voice event kind is unsupported')
 }
+
+export async function openSpeechServicesStore(): Promise<void> {
+  try {
+    const { invokeTauriCommand } = await import('./tauri')
+    await invokeTauriCommand('open_speech_services_store')
+  } catch (error) {
+    if (typeof window !== 'undefined' && typeof window.open === 'function') {
+      window.open('https://play.google.com/store/apps/details?id=com.google.android.tts', '_blank')
+    } else {
+      throw error
+    }
+  }
+}
+

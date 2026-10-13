@@ -81,6 +81,7 @@ internal fun assistantSpeechFallbackDescription(state: AssistantState, voice: As
 
 internal fun assistantDictationAvailabilityDescription(state: AssistantState, voice: AssistantVoiceState): String = when {
     !state.foreground -> "Keep Chat foreground to check dictation readiness. Keyboard remains available."
+    voice.missingSpeechServices -> "Speech Recognition & Synthesis by Google is required for local dictation. Install from Play Store to enable."
     !voice.admissionReady -> "Speech resources are not ready. This does not establish whether offline recognition is available. Keyboard remains available."
     !voice.recognitionServiceAvailable -> "Native dictation is unavailable under the current speech policy. Keyboard remains available."
     else -> "Dictation requests the configured language. An offline preference alone is not a local-processing guarantee."

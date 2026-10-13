@@ -13,6 +13,7 @@ fn main() {
             "list_assistant_conversations",
             "list_assistant_heads",
             "assistant_voice_status",
+            "open_speech_services_store",
             "start_assistant_voice",
             "finish_assistant_dictation",
             "stop_assistant_voice",

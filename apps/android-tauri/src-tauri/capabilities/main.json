@@ -16,6 +16,7 @@
     "allow-list-assistant-conversations",
     "allow-list-assistant-heads",
     "allow-assistant-voice-status",
+    "allow-open-speech-services-store",
     "allow-start-assistant-voice",
     "allow-finish-assistant-dictation",
     "allow-stop-assistant-voice",

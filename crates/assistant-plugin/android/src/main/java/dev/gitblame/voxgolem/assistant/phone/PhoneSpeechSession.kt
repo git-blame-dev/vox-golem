@@ -22,6 +22,7 @@ import dev.gitblame.voxgolem.assistant.speech.description
 import dev.gitblame.voxgolem.assistant.speech.metadata
 import dev.gitblame.voxgolem.assistant.speech.SpeechAdmission
 import dev.gitblame.voxgolem.assistant.speech.SpeechSelection
+import dev.gitblame.voxgolem.assistant.speech.SpeechServiceRequirement
 import dev.gitblame.voxgolem.assistant.speech.SpeechOptions
 import dev.gitblame.voxgolem.assistant.speech.LoopPhase
 import dev.gitblame.voxgolem.assistant.speech.VoiceSessionPolicy
@@ -86,7 +87,7 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
     private val preferenceObserver: (Boolean) -> Unit = { enabled ->
         if (!closed) {
             output.setEnabled(enabled)
-            if (visible) output.prepare(language)
+            if (visible && enabled) output.prepare(language)
         }
     }
     private data class ReplyOwner(val requestId: String, val ticket: Long, val loopReply: Boolean)
@@ -179,6 +180,8 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
     fun status(): JSONObject {
         val admissionReady = AssistantRuntime.captureResourceAdmissionReady()
         val available = admissionReady && runCatching { dictation.serviceAvailable() }.getOrDefault(false)
+        val missingSpeech = SpeechServiceRequirement.isMissing(context)
+        val missingMessage = SpeechServiceRequirement.missingRequirementDescription(context)
         val spoken = output.snapshot()
         val recognized = dictation.snapshot()
         val fallback = backend.nativePreferences().optBoolean("speech_network_fallback", true)
@@ -186,10 +189,13 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
         val recordingAvailable = visible && runCatching { dictation.recordingAvailable() }.getOrDefault(false)
         return JSONObject().put("kind", "voice_status").put("available", available)
             .put("reason", if (!admissionReady) "Native recognition resource sharing is not ready; typing remains available"
+                else if (missingSpeech && missingMessage != null) "$missingMessage Install from Play Store to enable."
                 else if (recordingEnabled && !recordingAvailable) "Recorded input requires a validated supplied-audio provider and local archive adapter; typing remains available"
                 else if (available && fallback) "Native dictation prefers the configured installed language; provider-controlled fallback is allowed"
                 else if (available) "Dedicated on-device dictation; network fallback is disabled"
                 else "Native speech service is unavailable under the configured policy; typing remains available")
+            .put("missingSpeechServices", missingSpeech)
+            .put("speechRequirementMessage", missingMessage ?: JSONObject.NULL)
             .put("mode", mode).put("dictation", recognized.phase.name.lowercase()).put("readyForSpeech", recognized.readyForSpeech).put("loop", loop.snapshot().phase.name.lowercase())
             .put("recordingEnabled", recordingEnabled).put("recordingAvailable", recordingAvailable)
             .put("recordingStatus", if (!recordingEnabled) "provider-proof-required" else if (!recordingAvailable)
@@ -250,7 +256,7 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
         microphoneCues.foreground(visible)
         if (!visible) { cancelShortcut(); sessionId = null; sink = null; waiting = null }
         loop.setForeground(visible)
-        if (visible) output.prepare(language)
+        if (visible && output.snapshot().enabled) output.prepare(language)
     }
 
     fun start(id: String, loopMode: Boolean, draft: String, events: (JSONObject) -> Unit, shortcutLaunch: String? = null,
@@ -258,7 +264,10 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
         check(Looper.myLooper() == Looper.getMainLooper())
         if (closed || !visible) throw AssistantPhoneFailure("unavailable", "Voice input requires the visible app")
         if (backend.busy()) throw EnginePhoneBackend.providerFailure("busy")
-        if (!status().getBoolean("available") || !dictation.serviceAvailable()) throw AssistantPhoneFailure("unavailable", "Dictation is unavailable under the configured speech policy")
+        if (!status().getBoolean("available") || !dictation.serviceAvailable()) {
+            val missing = SpeechServiceRequirement.missingRequirementDescription(context)
+            throw AssistantPhoneFailure("unavailable", missing ?: "Dictation is unavailable under the configured speech policy")
+        }
         if (active()) throw EnginePhoneBackend.providerFailure("busy")
         val legacyShortcut = completionPolicy == "stop_send_new"
         val singleTurn = completionPolicy == "single_turn"

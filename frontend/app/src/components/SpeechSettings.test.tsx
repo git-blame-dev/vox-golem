@@ -261,4 +261,16 @@ describe('SpeechSettings', () => {
       expect(container.textContent).not.toMatch(/Piper|Parakeet|Configured engine/)
     } finally { dispose() }
   })
+
+  it('renders missing speech services notice with Play Store action when speech services are missing', () => {
+    const androidStatus = voiceStatus({ available: false, missingSpeechServices: true, speechRequirementMessage: 'Google speech services required for testing' })
+    const { container, dispose } = renderSpeech({ android: true, androidStatus, statusError: null, startupState: startup(identity) })
+    try {
+      const notice = container.querySelector('.settings-panel__missing-speech')
+      expect(notice).not.toBeNull()
+      expect(notice?.textContent).toContain('Google speech services required for testing')
+      const button = notice?.querySelector('button')
+      expect(button?.textContent).toBe('Open Play Store')
+    } finally { dispose() }
+  })
 })

@@ -30,6 +30,8 @@ data class AssistantVoiceState(
     val recordingEnabled: Boolean = false,
     val recordingAvailable: Boolean = false,
     val recordingStatus: String = "provider-proof-required",
+    val missingSpeechServices: Boolean = false,
+    val speechRequirementMessage: String? = null,
 ) {
     val listening: Boolean get() = dictation.phase in setOf(DictationPhase.CHECKING, DictationPhase.LISTENING, DictationPhase.FINISHING)
     val active: Boolean get() = admissionPending || listening || speech.phase in setOf(SpeechPhase.CHECKING, SpeechPhase.SPEAKING) ||
@@ -69,6 +71,7 @@ internal class WearAssistantVoice(
     private val language: String = Locale.getDefault().toLanguageTag(),
     private val main: Handler = Handler(Looper.getMainLooper()),
     private val listeningCue: ListeningCue? = null,
+    private val context: Context? = null,
 ) : AssistantVoiceController {
     constructor(context: Context, engine: AssistantEngine,
         providerGate: dev.gitblame.voxgolem.assistant.inputtransport.SuppliedAudioProviderGate =
@@ -77,7 +80,8 @@ internal class WearAssistantVoice(
         this(engine, SharedDictationOwner.configuredWithAudio(context, { engine.snapshot().speechAdmission() },
                 audio = recordedVoiceCapture(context), providerGate = providerGate, recordingEnabled = recordingEnabled),
             LocalSpeechOutput.configured(context) { engine.snapshot().speechAdmission() }, AssistantEnginePort(engine),
-            listeningCue = AndroidListeningCue(context.applicationContext))
+            listeningCue = AndroidListeningCue(context.applicationContext),
+            context = context.applicationContext)
     private val observers = mutableListOf<(AssistantVoiceState) -> Unit>()
     private var mode = false
     private var entryMode: AssistantVoiceEntryMode? = null
@@ -98,6 +102,8 @@ internal class WearAssistantVoice(
     private val microphoneCues = listeningCue?.let(::MicrophoneCueController)
     private var recognitionServiceAvailable = false
     private var localOnlyRecognitionAvailable = false
+    private var missingSpeechServices = false
+    private var speechRequirementMessage: String? = null
     private var lastAdmission = engine.snapshot().speechAdmission()
     private var publishedOptions: SpeechOptions? = null
     private val replyEpoch = AtomicLong()
@@ -147,7 +153,9 @@ internal class WearAssistantVoice(
             speechSelection = engine.snapshot().speechAdmission().selection, entryMode = entryMode,
             recordingEnabled = recordingEnabled, recordingAvailable = recordingAvailable,
             recordingStatus = if (!recordingEnabled) "provider-proof-required" else if (!recordingAvailable)
-                "recorded-input-unavailable" else "recorded-input-selected")
+                "recorded-input-unavailable" else "recorded-input-selected",
+            missingSpeechServices = missingSpeechServices,
+            speechRequirementMessage = speechRequirementMessage)
     }
     private fun options() = output.options().copy(recognitionInstalledLanguages = dictation.snapshot().route?.installedLanguages,
         recognitionSupportedLanguages = dictation.snapshot().route?.supportedLanguages, localOnlyRecognitionAvailable = localOnlyRecognitionAvailable).bounded()
@@ -210,6 +218,8 @@ internal class WearAssistantVoice(
         if (!visible) retireManualReply()
         recognitionServiceAvailable = visible && runCatching { dictation.serviceAvailable() }.getOrDefault(false)
         localOnlyRecognitionAvailable = visible && runCatching { dictation.localOnlyServiceAvailable() }.getOrDefault(false)
+        missingSpeechServices = context?.let { ctx -> runCatching { SpeechServiceRequirement.isMissing(ctx) }.getOrDefault(false) } ?: false
+        speechRequirementMessage = if (missingSpeechServices) context?.let { ctx -> runCatching { SpeechServiceRequirement.missingRequirementDescription(ctx) }.getOrNull() } else null
         updateOptions()
         if (!visible) preservePartial()
         loop.setForeground(visible)

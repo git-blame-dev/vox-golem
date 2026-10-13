@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-open-speech-services-store"
+description = "Enables the open_speech_services_store command without any pre-configured scope."
+commands.allow = ["open_speech_services_store"]
+
+[[permission]]
+identifier = "deny-open-speech-services-store"
+description = "Denies the open_speech_services_store command without any pre-configured scope."
+commands.deny = ["open_speech_services_store"]

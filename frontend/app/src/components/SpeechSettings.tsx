@@ -1,6 +1,6 @@
 import { useId } from 'react'
 import type { AndroidSpeechMetadata, AndroidSpeechVoiceOption, AndroidVoiceStatus } from '../lib/androidVoice'
-import { visibleSpeechError } from '../lib/androidVoice'
+import { visibleSpeechError, openSpeechServicesStore } from '../lib/androidVoice'
 import { DEFAULT_SPEECH_SELECTION } from '../lib/assistantSettings'
 import type { SpeechSelection } from '../lib/assistantSettings'
 import type { SpeechServiceMetadata, StartupState } from '../types/chat'
@@ -27,6 +27,10 @@ export function SpeechSettings({ android, androidStatus, statusError, startupSta
   return <section className="settings-panel__speech" aria-labelledby="speech-settings-title">
     <h3 id="speech-settings-title">Speech services</h3>
     {android ? <>
+      {androidStatus?.missingSpeechServices ? <div className="settings-panel__missing-speech" role="alert">
+        <p><strong>Speech services required:</strong> {androidStatus.speechRequirementMessage || 'Speech Recognition & Synthesis by Google is required for local voice dictation and speech output on this device.'}</p>
+        <button type="button" className="shell__control settings-panel__interactive" onClick={() => void openSpeechServicesStore()}>Open Play Store</button>
+      </div> : null}
       {(localOnlyAvailable || !speechNetworkFallback) && onSpeechNetworkFallbackChange ? <>
         <label className="shell__toggle settings-panel__interactive"><input type="checkbox" aria-label="Allow speech network fallback" checked={speechNetworkFallback} disabled={disabled} onChange={(event) => { if (!disabled && (event.target.checked || localOnlyAvailable)) onSpeechNetworkFallbackChange(event.target.checked) }} /> Allow speech network fallback</label>
         <p>Local-first speech requested{speechNetworkFallback ? '; network fallback permitted when supported.' : '; network fallback disabled where supported.'} This preference is not proof of offline processing; the provider may not report the actual route.</p>

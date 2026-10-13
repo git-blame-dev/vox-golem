@@ -687,4 +687,18 @@ describe('Android native voice controls', () => {
     expect(state.onInputCancelled).toHaveBeenCalledTimes(1)
     expect(state.onSubmit).toHaveBeenCalledTimes(1)
   })
+  it('shows missing speech prompt when voice is tapped without speech services, and opens Play Store', async () => {
+    const missingWire = { ...wire, available: false, missingSpeechServices: true, speechRequirementMessage: 'Speech services required for tests' }
+    const state = await setup(true, missingWire)
+    const askButton = compactButton('Ask')
+    expect(askButton.disabled).toBe(false)
+    await act(async () => { askButton.click() })
+    expect(container!.querySelector('.speech-prompt-dialog')).not.toBeNull()
+    expect(container!.querySelector('.speech-prompt-dialog__content')?.textContent).toContain('Speech services required for tests')
+    const openStoreButton = Array.from(container!.querySelectorAll('button')).find((b) => b.textContent === 'Open Play Store')
+    expect(openStoreButton).toBeDefined()
+    await act(async () => { openStoreButton!.click() })
+    expect(state.native).toHaveBeenCalledWith('open_speech_services_store', undefined)
+    expect(container!.querySelector('.speech-prompt-dialog')).toBeNull()
+  })
 })

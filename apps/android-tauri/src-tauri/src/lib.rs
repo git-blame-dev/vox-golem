@@ -128,6 +128,7 @@ async fn list_assistant_heads<R: Runtime>(
     tauri_plugin_assistant::forward(app, "list_assistant_heads", json!({"offset":offset,"expectedRevision":expected_revision,"conversationId":conversation_id})).await
 }
 native_command!(assistant_voice_status);
+native_command!(open_speech_services_store);
 native_command!(finish_assistant_dictation);
 native_command!(stop_assistant_voice);
 native_command!(assistant_pairing_status);
@@ -196,6 +197,7 @@ pub fn run() {
             list_assistant_conversations,
             list_assistant_heads,
             assistant_voice_status,
+            open_speech_services_store,
             start_assistant_voice,
             finish_assistant_dictation,
             stop_assistant_voice,
