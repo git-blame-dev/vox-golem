@@ -8,6 +8,16 @@ The generated baseline is intentionally kept separate from authored behavior. Au
 
 Prerequisites are Bun, Rust/Cargo, Android SDK/NDK tooling supported by Tauri, and the pinned `tauri-cli 2.11.1`. Run `make android-init` from the repository root after those prerequisites are installed.
 
+## Launcher entries
+
+- **Vox Chat** (chat-bubble badge) opens the normal chat UI without starting a new microphone session.
+- **Vox Ask** (bottom-right microphone badge) starts native recognition as soon as permission, foreground and provider admission permit. The recognizer's authoritative final utterance is sent once in the current conversation, then the voice session idles.
+- **Vox Talk** (conversation-bubbles badge) follows the same pipeline, but listens again after the reply/playback until Stop or backgrounding. It does not change the persistent voice-mode preference.
+
+The existing pinned **Ask** shortcut keeps its component, action and ID and uses the same microphone artwork and single-turn policy. Its stored icon is refreshed when shortcut Settings checks its status. Phone/Wear purpose icons derive from the canonical SVG during Gradle builds; desktop and in-app emblems remain unbadged.
+
+Ask/Talk are explicit exported launcher entry points, matching Wear's one-tap behavior. Another app can invoke them too: caller disclosure is deliberately not required. Microphone permission, visible-app admission, busy/context checks and Stop still apply. Incoming intent text or mode extras are not prompts; aliases select the policy. Saved-state/Recents replay does not mint a launch token, and repeated taps do not replace active work. Real mic startup time depends on Android/speech-provider readiness; no fixed latency is guaranteed.
+
 ## Provider access and conversation sharing
 
 The app reads externally injected access from its app-private provider file. It

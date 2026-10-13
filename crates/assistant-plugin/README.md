@@ -157,11 +157,13 @@ with **Add Ask to Home screen**. On API26+ and a supporting launcher,
 requests a pin with generated artwork. The launcher asks for confirmation; accepted
 request is not confirmed pinning, and installing the APK does not automatically pin it.
 
-A fresh dispatcher launch selects Ask without resetting the conversation or draft.
-Verified caller provenance may issue a one-time native launch action; an unverified
-origin requires a visible in-app Ask tap. Canonical hydration, foreground readiness,
-pending draft writes and current conversation/head ownership still gate admission.
-Saved-state/Recents restoration does not replay microphone consent.
+A fresh legacy shortcut dispatch selects Ask; the phone launcher also exposes
+Chat/Ask/Talk. Voice alias identity selects Ask or Talk without resetting the
+conversation or draft, accepting no incoming prompt or mode extras. These exported
+entries issue a one-time process-local launch token without caller confirmation:
+another app can invoke them too. Microphone permission, canonical hydration,
+foreground readiness, pending draft writes and current conversation/head ownership
+still gate admission. Saved-state/Recents restoration does not replay mic entry.
 
 Ask sends one authoritative finalized utterance once through the existing
 Channel-ACK/SQLite path, optionally speaks the reply, then idles. Talk is the separate
