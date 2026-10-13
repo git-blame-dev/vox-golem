@@ -75,7 +75,7 @@ class EnginePhoneBackend internal constructor(
                     } else replySnapshot(reply, state, raw)
                 }
                 "new_conversation" -> {
-                    val draft = arguments.optString("draft", "")
+                    val draft = newConversationDraft(arguments)
                     if (draft.isNotEmpty()) engine.resetWithDraft(draft, ::settled)
                     else engine.reset(::settled)
                 }
@@ -308,6 +308,9 @@ class EnginePhoneBackend internal constructor(
     }
 
     companion object {
+        internal fun newConversationDraft(arguments: JSONObject): String =
+            if (arguments.isNull("draft")) "" else arguments.optString("draft", "")
+
         fun providerFailure(code: String?): AssistantPhoneFailure = when (code) {
             "busy" -> AssistantPhoneFailure("busy", "A request is already active")
             "invalid_request", "empty_prompt", "prompt_too_large", "unsupported_search_mode" -> AssistantPhoneFailure("invalid_input", "Prompt, request ID or search mode is invalid")
