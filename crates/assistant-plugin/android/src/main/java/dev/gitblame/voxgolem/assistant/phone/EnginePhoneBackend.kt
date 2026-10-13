@@ -13,7 +13,11 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 /** Owns only the active transport sink. SQLite/session/provider ownership stays in AssistantRuntime. */
-class EnginePhoneBackend internal constructor(private val context: Context, private val engine: AssistantEngine) : AssistantPhoneBackend {
+class EnginePhoneBackend internal constructor(
+    private val context: Context,
+    private val engine: AssistantEngine,
+    private val prewarm: (String) -> Unit = AssistantRuntime::prewarm,
+) : AssistantPhoneBackend {
     constructor(context: Context) : this(context, AssistantRuntime.get(context))
     private val delivery = AtomicReference<PhoneRequestDelivery?>(null)
     private val preferences = PhonePreferences(context)
@@ -197,13 +201,19 @@ class EnginePhoneBackend internal constructor(private val context: Context, priv
             if (!preferencesPending.compareAndSet(false, true)) { reply(Result.failure(providerFailure("busy"))); return }
         }
         val selectedModel = value.getString("instant")
-        AssistantRuntime.prewarm(selectedModel)
+        var previousModel: String? = null
         engine.updatePreferences(selectedModel, dev.gitblame.voxgolem.assistant.runtime.AssistantPolicy(
             value.getBoolean("web_enabled"), value.getBoolean("speech_network_fallback"), value.getString("speech_language"),
-            value.getString("speech_tts_provider"), value.getString("speech_tts_voice")), { preferences.write(value) }) { selected ->
+            value.getString("speech_tts_provider"), value.getString("speech_tts_voice")), {
+            previousModel = engine.snapshot().model
+            preferences.write(value)
+        }) { selected ->
             preferencesPending.set(false)
             if (selected.error != null) reply(Result.failure(providerFailure(selected.error)))
             else {
+                if (previousModel != null && selected.model == selectedModel && selected.model != previousModel) {
+                    prewarm(selected.model)
+                }
                 // A view listener failure must not misclassify already persisted settings.
                 runCatching { onPreferencesChanged?.invoke(value.getBoolean("tts_enabled")) }
                 reply(Result.success(preferencesFor(selected)))

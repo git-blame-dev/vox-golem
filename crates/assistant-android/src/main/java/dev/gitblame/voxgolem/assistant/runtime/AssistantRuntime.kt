@@ -35,12 +35,7 @@ object AssistantRuntime {
         }
         val router = AgyProviderRouter(application).also { agyRouter = it }
         val initialModel = modelStorage.read()
-        val prewarmModel = if (initialModel.startsWith("agy-") || initialModel.startsWith("gemini-") || initialModel.startsWith("claude-") || initialModel.startsWith("opus") || initialModel.startsWith("sonnet") || initialModel.startsWith("3.8-")) {
-            initialModel
-        } else {
-            "gemini-3.8-flash-high"
-        }
-        router.prewarm(prewarmModel)
+        router.prewarm(initialModel)
 
         return AssistantEngine(AssistantStore(application), io, AssistantRequestWorker(provider, router),
             credentials::pathForProvider, modelStorage, credentials, NativeAssistantPolicyStorage(application),
