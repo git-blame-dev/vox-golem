@@ -138,6 +138,21 @@ Copy [`config.example.toml`](config.example.toml) to `${XDG_CONFIG_HOME:-$HOME/.
 
 Desktop OpenCode uses its existing CLI login/auth state; the desktop app does not perform login or renewal. Mobile external development access setup is described above. Custom endpoints are experimental, especially private endpoints; inspect the endpoint and auth configuration before use. Never put secrets in examples or source control.
 
+### Standalone local llama.cpp runtime
+
+Local chat and completion use an external `llama-server` bundle, not another application project. `scripts/build-local-llama.sh` builds pinned llama.cpp `b10054` (`ac2557cb24def295888ef47f1a35b401d978c510`) with CUDA and stages the executable, colocated libraries, licence and checksum manifest under `${XDG_DATA_HOME:-$HOME/.local/share}/voxgolem/runtimes/llama.cpp/b10054/`.
+
+```bash
+LLAMA_SOURCE=/absolute/path/to/pinned/llama.cpp \
+CUDAToolkit_ROOT=/absolute/path/to/cuda \
+LLAMA_CUDA_ARCHITECTURES=86 \
+scripts/build-local-llama.sh
+```
+
+The source must be clean and pinned; the script does not download source or models, install drivers, or overwrite an existing runtime. It requires Git, CMake, Ninja and patchelf; `PATCHELF` can select an explicit executable. Staged ELF library paths are normalized to exactly `$ORIGIN`, without build-cache or current-directory entries. Architecture 86 targets RTX 30-series GPUs; select the actual hardware architecture for another machine. `LLAMA_BUILD_JOBS`, `LLAMA_BUILD_DIR` and `LLAMA_RUNTIME_DIR` override bounded build concurrency and external output paths. Keep all runtime library files and symlinks together. Point both `[llama_cpp].server_path` and `[completion].server_path` at the staged `bin/llama-server`, and configure models separately. Existing `auto`, `cuda` and `cpu` inference policies remain unchanged.
+
+Run `python3 scripts/test_build_local_llama.py` for synthetic build-boundary, no-clobber publication and bundle-preservation checks; these do not compile CUDA or run models.
+
 ## Commands
 
 ```bash
