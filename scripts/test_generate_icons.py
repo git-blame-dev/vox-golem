@@ -40,6 +40,17 @@ def file_bytes(directory):
 
 
 class IconGenerationTests(unittest.TestCase):
+    def test_entry_variants_follow_canvas_geometry_and_do_not_mutate_source(self):
+        source = icons.ET.fromstring(SYNTHETIC_SVG)
+        before = icons.ET.tostring(source)
+        variants = [icons.entry_layer(source, purpose) for purpose in ("chat", "ask", "talk", "note")]
+        self.assertEqual(icons.ET.tostring(source), before)
+        self.assertEqual(len({icons.ET.tostring(layer) for layer in variants}), 4)
+        for layer in variants:
+            badge = layer.find(f"{icons.SVG}g[@id='entry-badge']")
+            self.assertEqual(badge.get("transform"), "translate(55 65) scale(1.07143)")
+            self.assertLess(math.hypot(15, 15) + 7.5, 30)
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="test-icons-")
         self.addCleanup(self.temporary.cleanup)
@@ -57,6 +68,8 @@ class IconGenerationTests(unittest.TestCase):
         if "--png" in command:
             for size in icons.ANDROID_ICON_SIZES.values():
                 (output / f"{size}x{size}.png").write_bytes(f"legacy-{size}".encode())
+        elif Path(command[3]).suffix == ".svg":
+            (output / "icon.png").write_bytes(Path(command[3]).stem.encode())
         else:
             manifest = json.loads(Path(command[3]).read_text())
             self.assertEqual(manifest["default"], str(self.desktop / "icon.svg"))
@@ -111,7 +124,8 @@ class IconGenerationTests(unittest.TestCase):
         before = file_bytes(self.desktop)
         self.invoke(["--wear-res-output", str(destination)], self.fake_render)
         self.assertEqual(set(file_bytes(destination)),
-                          set(LAUNCHER_FILES) | {"drawable-nodpi/capture_background.png", "values/artwork_geometry.xml"})
+                          set(LAUNCHER_FILES) | {"drawable-nodpi/capture_background.png", "values/artwork_geometry.xml"}
+                          | {f"drawable-nodpi/voxgolem_entry_{purpose}.png" for purpose in ("chat", "ask", "talk", "note")})
         self.assertEqual((destination / "values/artwork_geometry.xml").read_text(),
                          icons.artwork_geometry_resource(icons.ET.fromstring(SYNTHETIC_SVG)))
         self.assert_legacy_launchers(destination)
@@ -120,7 +134,7 @@ class IconGenerationTests(unittest.TestCase):
         self.assertEqual(file_bytes(self.desktop), before)
         self.assertFalse(self.phone.exists())
         self.assertFalse((self.root / "target").exists())
-        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(len(self.calls), 6)
 
     def test_canonical_ink_fraction_uses_outer_stroke_and_keeps_inner_black(self):
         source = icons.ET.parse(CANONICAL_SVG).getroot()
@@ -176,26 +190,24 @@ class IconGenerationTests(unittest.TestCase):
     def test_shortcut_derives_mark_and_badge_without_mutating_source(self):
         source = icons.ET.fromstring(SYNTHETIC_SVG)
         mark = source.find(f"{icons.SVG}g[@id='mark']")
-        mark.set("transform", "rotate(10 54 54)")
         before = icons.ET.tostring(source)
         derived = icons.phone_shortcut_layer(source)
         self.assertEqual(icons.ET.tostring(source), before)
         self.assertEqual(derived.get("viewBox"), source.get("viewBox"))
         scaled = derived.find(f"{icons.SVG}g[@id='shortcut-mark']")
-        self.assertEqual(scaled.get("transform"), "translate(54 54) scale(0.82) translate(-54 -54)")
+        self.assertEqual(scaled.get("transform"), "translate(40 50) scale(0.82) translate(-40 -50)")
         self.assertEqual(icons.ET.tostring(scaled.find(f"{icons.SVG}g[@id='mark']")),
                          icons.ET.tostring(mark))
-        badge = derived.find(f"{icons.SVG}g[@id='new-voice-badge']")
+        badge = derived.find(f"{icons.SVG}g[@id='entry-badge']")
         circle = badge.find(f"{icons.SVG}circle")
-        self.assertEqual(circle.attrib, {"cx": "72", "cy": "72", "r": "8",
+        self.assertEqual(circle.attrib, {"cx": "0", "cy": "0", "r": "7",
                                          "fill": "#000000", "stroke": "none"})
         plus = badge.find(f"{icons.SVG}path")
-        self.assertEqual(plus.get("d"), "M68 72H76M72 68V76")
+        self.assertIn("A2 2", plus.get("d"))
         self.assertEqual(plus.get("stroke"), "#12ABCD")
-        self.assertEqual(plus.get("stroke-width"), "3")
+        self.assertEqual(plus.get("stroke-width"), "1.4")
         self.assertEqual(plus.get("stroke-linecap"), "round")
-        self.assertLess(math.hypot(72 - 54, 72 - 54) + 8, 34.4444445)
-        self.assertLess(0.82 * (28 + 6 / 2), 34.4444445)
+        self.assertLess(math.hypot(15, 15) + 7.5, 30)
 
     def test_shortcut_requires_concrete_source_color_and_mark(self):
         for color in (None, "", "currentColor", "url(https://invalid.example/color)", "#NOTHEX"):
@@ -222,7 +234,7 @@ class IconGenerationTests(unittest.TestCase):
             self.assertNotEqual(derived_path, self.desktop / "icon.svg")
             derived = icons.ET.parse(derived_path).getroot()
             self.assertEqual(derived.get("color"), "#12ABCD")
-            self.assertIsNotNone(derived.find(f"{icons.SVG}g[@id='new-voice-badge']"))
+            self.assertIsNotNone(derived.find(f"{icons.SVG}g[@id='entry-badge']"))
             output = Path(command[command.index("--output") + 1])
             output.mkdir()
             (output / "icon.png").write_bytes(b"synthetic-shortcut-png")
@@ -231,11 +243,13 @@ class IconGenerationTests(unittest.TestCase):
         self.invoke(["--phone-shortcut-res-output", str(destination)], render_shortcut)
         self.assertEqual(file_bytes(destination), {
             "drawable-nodpi/voxgolem_new_voice_shortcut.png": b"synthetic-shortcut-png",
+            **{f"drawable-nodpi/voxgolem_entry_{purpose}.png": b"synthetic-shortcut-png"
+               for purpose in ("chat", "ask", "talk")},
         })
         self.assertEqual({name: data for name, data in file_bytes(self.root).items()
                           if not name.startswith("phone build/")}, before)
         self.assertFalse((self.root / "target").exists())
-        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(self.calls), 3)
         self.assertFalse(Path(self.calls[0][3]).exists())
 
     def test_shortcut_cli_invalid_color_fails_clearly_without_publishing(self):
@@ -274,6 +288,18 @@ class IconGenerationTests(unittest.TestCase):
             self.assertEqual(file_bytes(self.root), before)
             self.assertFalse(destination.exists())
 
+    def test_late_entry_render_failure_does_not_publish_partial_resources(self):
+        destination = self.root / "generated-res"
+        before = file_bytes(self.root)
+        def fail_third(command, **kwargs):
+            if len(self.calls) == 2:
+                raise subprocess.CalledProcessError(1, command)
+            return self.fake_render(command, **kwargs)
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.invoke(["--phone-shortcut-res-output", str(destination)], fail_third)
+        self.assertEqual(file_bytes(self.root), before)
+        self.assertFalse(destination.exists())
+
     @unittest.skipUnless(shutil.which("cargo"), "requires existing pinned cargo tauri renderer")
     def test_real_renderer_outputs_are_byte_identical_between_default_and_wear(self):
         shutil.copyfile(CANONICAL_SVG, self.desktop / "icon.svg")
@@ -288,7 +314,24 @@ class IconGenerationTests(unittest.TestCase):
         before = file_bytes(self.root)
         destination = self.root / "wear build/generated/launcher-res"
         self.invoke(["--wear-res-output", str(destination)])
-        self.assertEqual(set(file_bytes(destination)), set(expected))
+        entries = {f"drawable-nodpi/voxgolem_entry_{purpose}.png" for purpose in ("chat", "ask", "talk", "note")}
+        self.assertEqual(set(file_bytes(destination)), set(expected) | entries)
+        self.assertEqual(len({(destination / name).read_bytes() for name in entries}), 4)
+        if shutil.which("ffmpeg"):
+            note = destination / "drawable-nodpi/voxgolem_entry_note.png"
+            pixels = subprocess.check_output([
+                "ffmpeg", "-v", "error", "-i", str(note), "-vf", "scale=48:48",
+                "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1",
+            ])
+            source = icons.ET.parse(CANONICAL_SVG).getroot()
+            x, y, width, _ = map(float, source.get("viewBox").split())
+            radius = icons.artwork_geometry(source) * width / 2
+            def note_pixel(dx, dy):
+                px = int((width / 2 + radius / 2 + dx * radius / 28) * 48 / width)
+                py = int((width / 2 + radius / 2 + dy * radius / 28) * 48 / width)
+                return pixels[(py * 48 + px) * 4:(py * 48 + px) * 4 + 4]
+            self.assertGreater(note_pixel(-3, 1)[0], note_pixel(0, -3)[0] + 60)
+            self.assertGreater(note_pixel(0, 2)[0], note_pixel(0, -3)[0] + 60)
         for filename, data in expected.items():
             with self.subTest(filename=filename):
                 self.assertEqual((destination / filename).read_bytes(), data)
@@ -304,7 +347,7 @@ class IconGenerationTests(unittest.TestCase):
             cwd=self.root, check=True, capture_output=True, text=True,
         )
         self.assertIn("Generated Wear resources", result.stdout)
-        self.assertEqual(file_bytes(destination), expected)
+        self.assertEqual({name: data for name, data in file_bytes(destination).items() if name not in entries}, expected)
         self.assertEqual([file_bytes(directory) for directory in authored_directories], authored_before)
 
     @unittest.skipUnless(shutil.which("cargo") and shutil.which("ffmpeg"),
@@ -316,7 +359,11 @@ class IconGenerationTests(unittest.TestCase):
         destination = self.root / "shortcut build/generated/res"
         self.invoke(["--phone-shortcut-res-output", str(destination)])
         files = file_bytes(destination)
-        self.assertEqual(set(files), {"drawable-nodpi/voxgolem_new_voice_shortcut.png"})
+        self.assertEqual(set(files), {"drawable-nodpi/voxgolem_new_voice_shortcut.png"}
+                         | {f"drawable-nodpi/voxgolem_entry_{purpose}.png" for purpose in ("chat", "ask", "talk")})
+        self.assertEqual(files["drawable-nodpi/voxgolem_new_voice_shortcut.png"],
+                         files["drawable-nodpi/voxgolem_entry_ask.png"])
+        self.assertEqual(len({files[f"drawable-nodpi/voxgolem_entry_{purpose}.png"] for purpose in ("chat", "ask", "talk")}), 3)
         self.assertEqual({name: data for name, data in file_bytes(self.root).items()
                           if not name.startswith("shortcut build/")}, before)
         authored_directories = (
@@ -349,9 +396,45 @@ class IconGenerationTests(unittest.TestCase):
             offset = (py * width + px) * 4
             return pixels[offset:offset + 4]
 
-        for point in ((72, 72), (69, 72), (75, 72), (72, 69), (72, 75)):
+        radius = icons.artwork_geometry(source) * view_width / 2
+        bx, by, scale = x + view_width / 2 + radius / 2, y + view_height / 2 + radius / 2, radius / 28
+        # The microphone has two capsule sides, a lower stand and a black interior.
+        for dx, dy in ((-2, -2), (2, -2), (0, 5), (-1, 6), (1, 6)):
+            point = (bx + dx * scale, by + dy * scale)
             self.assertEqual(pixel_at(*point), yellow)
-        self.assertEqual(pixel_at(75, 75), b"\x00\x00\x00\xff")
+        self.assertEqual(pixel_at(bx, by - 2 * scale), b"\x00\x00\x00\xff")
+        # Decode the actual renderer output at launcher size. Each badge must keep
+        # visible ink, a black counter and a distinct silhouette after downsampling.
+        badge_pixels = {}
+        for purpose, ink, counter in (
+            ("chat", (0, -3), (0, 0)),
+            ("ask", (0, 5), (0, -2)),
+            ("talk", (-5, -2), (-2, -2)),
+        ):
+            entry_png = destination / f"drawable-nodpi/voxgolem_entry_{purpose}.png"
+            rgba = subprocess.check_output([
+                "ffmpeg", "-v", "error", "-i", str(entry_png),
+                "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1",
+            ])
+            self.assertTrue(all(
+                (index % width + .5 - width / 2) ** 2
+                + (index // width + .5 - height / 2) ** 2 <= (radius * width / view_width + 1) ** 2
+                for index in range(width * height) if rgba[index * 4 + 3]
+            ), purpose)
+            small = subprocess.check_output([
+                "ffmpeg", "-v", "error", "-i", str(entry_png),
+                "-vf", "scale=48:48", "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1",
+            ])
+            def small_pixel(point):
+                px = int((bx + point[0] * scale - x) * 48 / view_width)
+                py = int((by + point[1] * scale - y) * 48 / view_height)
+                return small[(py * 48 + px) * 4:(py * 48 + px) * 4 + 4]
+            lit, dark = small_pixel(ink), small_pixel(counter)
+            self.assertGreater(lit[0], dark[0] + 60, purpose)
+            self.assertGreater(lit[1], dark[1] + 40, purpose)
+            self.assertEqual(lit[3], 255)
+            badge_pixels[purpose] = small
+        self.assertEqual(len(set(badge_pixels.values())), 3)
         max_radius_squared = max(
             (index % width + 0.5 - width / 2) ** 2 + (index // width + 0.5 - height / 2) ** 2
             for index in range(width * height) if pixels[index * 4 + 3]

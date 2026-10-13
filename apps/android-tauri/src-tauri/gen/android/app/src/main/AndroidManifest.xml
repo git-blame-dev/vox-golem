@@ -18,7 +18,8 @@
         <activity
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode"
             android:launchMode="singleTask"
-            android:label="@string/main_activity_title"
+            android:label="Vox Chat"
+            android:icon="@drawable/voxgolem_entry_chat"
             android:name=".MainActivity"
             android:exported="true"
             android:showWhenLocked="true"
@@ -30,6 +31,28 @@
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <activity android:name="dev.gitblame.voxgolem.assistant.phone.NewVoiceShortcutActivity" />
+        <activity-alias
+            android:name=".AssistantVoiceEntry"
+            android:targetActivity="dev.gitblame.voxgolem.assistant.phone.NewVoiceShortcutActivity"
+            android:exported="true" android:label="Vox Ask"
+            android:icon="@drawable/voxgolem_entry_ask">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".AssistantConversationEntry"
+            android:targetActivity="dev.gitblame.voxgolem.assistant.phone.NewVoiceShortcutActivity"
+            android:exported="true" android:label="Vox Talk"
+            android:icon="@drawable/voxgolem_entry_talk">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
 
         <provider
           android:name="androidx.core.content.FileProvider"

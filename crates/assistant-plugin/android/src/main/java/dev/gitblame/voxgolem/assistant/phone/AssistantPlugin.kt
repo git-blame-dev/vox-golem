@@ -113,11 +113,11 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
         val token = intent.getStringExtra(NewVoiceShortcutLauncher.TOKEN_EXTRA)
         if (intent.action == NewVoiceShortcutLauncher.MAIN_ACTION && intent.data == null &&
             intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY == 0 &&
-            (token != null && ShortcutActionGate.valid(token) || NewVoiceShortcutLauncher.hasConfirmation())) notifyShortcut(token)
+            token != null && ShortcutActionGate.valid(token)) notifyShortcut(token)
     }
     private fun notifyShortcut(token: String? = null) { main.post {
         val webView = webViewReference?.get() ?: return@post
-        if (visible.get() && (NewVoiceShortcutLauncher.actions.notifyPending(token) || NewVoiceShortcutLauncher.notifyConfirmation())) {
+        if (visible.get() && NewVoiceShortcutLauncher.actions.notifyPending(token)) {
             webView.evaluateJavascript("window.dispatchEvent(new Event('${NewVoiceShortcutLauncher.NOTIFICATION_EVENT}'))", null)
         }
     } }
@@ -129,7 +129,7 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
         if (!visible && wasVisible) NewVoiceShortcutLauncher.cancelEntries()
         try { backend.foreground(visible) } catch (_: AssistantPhoneFailure) { /* Commands report the unavailable binding. */ }
         speech.foreground(visible)
-        if (visible && (NewVoiceShortcutLauncher.actions.hasPending() || NewVoiceShortcutLauncher.hasConfirmation())) notifyShortcut()
+        if (visible && NewVoiceShortcutLauncher.actions.hasPending()) notifyShortcut()
     }
 
     private fun execute(invoke: Invoke, name: String = invoke.command) {
@@ -182,13 +182,11 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
     }
     @Command fun consume_new_voice_shortcut(invoke: Invoke) {
         if (!visible.get()) { invoke.resolve(JSObject().put("token", JSONObject.NULL).put("error", JSONObject.NULL)); return }
-        if (NewVoiceShortcutLauncher.takeConfirmation()) {
-            invoke.resolve(JSObject().put("token", JSONObject.NULL).put("error", JSONObject.NULL).put("confirmationRequired", true)); return
-        }
         val token = NewVoiceShortcutLauncher.actions.consume()
+        val mode = token?.let(NewVoiceShortcutLauncher.actions::mode) ?: VoiceEntryMode.ASK
         val busy = token != null && (backend.busy() || speech.active() || pendingVoice != null)
         if (busy) NewVoiceShortcutLauncher.actions.release(token!!)
-        invoke.resolve(JSObject().put("token", if (busy) JSONObject.NULL else token ?: JSONObject.NULL).put("error", if (busy) "Voice chat is busy; existing work was not cancelled" else JSONObject.NULL))
+        invoke.resolve(JSObject().put("token", if (busy) JSONObject.NULL else token ?: JSONObject.NULL).put("mode", mode.wireValue).put("error", if (busy) "Voice chat is busy; existing work was not cancelled" else JSONObject.NULL))
     }
     @Command fun release_new_voice_shortcut(invoke: Invoke) {
         val token = invoke.getArgs().optString("token")
@@ -209,7 +207,7 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
             if (args.completionPolicy == "stop_send_new" && (args.loopMode || args.launchToken == null || !NewVoiceShortcutLauncher.actions.active(args.launchToken!!))) {
                 reject(invoke, "invalid_input", "A deliberate voice shortcut launch is required"); return
             }
-            if (args.launchToken != null && !NewVoiceShortcutLauncher.actions.active(args.launchToken!!)) {
+            if (args.launchToken != null && !NewVoiceShortcutLauncher.actions.permits(args.launchToken!!, args.loopMode, args.completionPolicy)) {
                 reject(invoke, "invalid_input", "A deliberate voice shortcut launch is required"); return
             }
             if (!visible.get()) { reject(invoke, "unavailable", "Voice input requires the visible app"); return }
