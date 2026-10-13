@@ -13,7 +13,6 @@ import android.os.Bundle
 import androidx.annotation.RequiresApi
 import org.json.JSONObject
 import java.util.UUID
-import dev.gitblame.voxgolem.assistant.speech.VoiceLaunchProvenance
 
 object NewVoiceShortcutLauncher {
     const val DISPATCH_ACTION = "dev.gitblame.voxgolem.NEW_VOICE_SHORTCUT"
@@ -25,19 +24,26 @@ object NewVoiceShortcutLauncher {
     private const val LONG_LABEL = "Ask in current chat"
     val actions = ShortcutActionGate()
     @Volatile private var requested = false
-    private var confirmationPending = false
-    private var confirmationNotified = false
-    @Synchronized fun requireConfirmation() { confirmationPending = true; confirmationNotified = false }
-    @Synchronized fun hasConfirmation() = confirmationPending
-    @Synchronized fun notifyConfirmation(): Boolean {
-        if (!confirmationPending || confirmationNotified) return false
-        confirmationNotified = true; return true
+    fun cancelEntries() { actions.background() }
+
+    fun entryMode(context: Context, intent: Intent): VoiceEntryMode? {
+        if (intent.data != null || intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0) return null
+        val component = intent.component ?: return null
+        if (component.packageName != context.packageName) return null
+        if (intent.action == DISPATCH_ACTION && component.className == NewVoiceShortcutActivity::class.java.name) return VoiceEntryMode.ASK
+        if (intent.action != Intent.ACTION_MAIN || !intent.hasCategory(Intent.CATEGORY_LAUNCHER)) return null
+        return when (component.className) {
+            "${context.packageName}.AssistantVoiceEntry" -> VoiceEntryMode.ASK
+            "${context.packageName}.AssistantConversationEntry" -> VoiceEntryMode.TALK
+            else -> null
+        }
     }
-    @Synchronized fun takeConfirmation(): Boolean {
-        val pending = confirmationPending
-        confirmationPending = false; confirmationNotified = false; return pending
-    }
-    @Synchronized fun cancelEntries() { confirmationPending = false; confirmationNotified = false; actions.background() }
+
+    // With multiple launcher aliases, getLaunchIntentForPackage may resolve back to a voice dispatcher.
+    fun mainIntent(context: Context): Intent = Intent(Intent.ACTION_MAIN)
+        .setClassName(context.packageName, "${context.packageName}.MainActivity")
+        .addCategory(Intent.CATEGORY_LAUNCHER)
+        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
 
     fun status(context: Context): JSONObject {
         if (Build.VERSION.SDK_INT < 26) return JSONObject().put("supported", false).put("pinned", false).put("requested", false)
@@ -45,7 +51,7 @@ object NewVoiceShortcutLauncher {
         val supported = manager?.isRequestPinShortcutSupported == true
         val existing = if (supported) manager!!.pinnedShortcuts.firstOrNull { it.id == SHORTCUT_ID } else null
         val pinned = existing != null
-        if (existing != null && (existing.shortLabel.toString() != SHORT_LABEL || existing.longLabel?.toString() != LONG_LABEL)) {
+        if (existing != null) {
             runCatching { manager!!.updateShortcuts(listOf(shortcut(context))) }
         }
         return JSONObject().put("supported", supported).put("pinned", pinned).put("requested", requested && !pinned)
@@ -74,31 +80,21 @@ object NewVoiceShortcutLauncher {
     }
 }
 
-/** No microphone, provider, history mutation or replay from saved state/Recents. */
+/** Explicit exported voice entries may be invoked by other apps; microphone permission still applies. */
 open class NewVoiceShortcutActivity : Activity() {
-    protected open fun launchOrigin() = VoiceLaunchProvenance.initial(this)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (savedInstanceState == null && intent.action == NewVoiceShortcutLauncher.DISPATCH_ACTION && intent.data == null &&
-            intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY == 0) {
-            if (launchOrigin() == VoiceLaunchProvenance.Origin.UNVERIFIED) {
-                NewVoiceShortcutLauncher.requireConfirmation()
-                packageManager.getLaunchIntentForPackage(packageName)?.let { main ->
-                    main.action = NewVoiceShortcutLauncher.MAIN_ACTION
-                    main.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-                    startActivity(main)
-                }
-                finish(); return
-            }
+        val mode = if (savedInstanceState == null) NewVoiceShortcutLauncher.entryMode(this, intent) else null
+        if (mode != null) {
             val token = UUID.randomUUID().toString()
-            if (NewVoiceShortcutLauncher.actions.offer(token)) {
-                packageManager.getLaunchIntentForPackage(packageName)?.let { main ->
+            if (NewVoiceShortcutLauncher.actions.offer(token, mode)) {
+                try {
+                    val main = NewVoiceShortcutLauncher.mainIntent(this)
                     main.action = NewVoiceShortcutLauncher.MAIN_ACTION
                     main.putExtra(NewVoiceShortcutLauncher.TOKEN_EXTRA, token)
-                    main.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
                     startActivity(main)
-                } ?: NewVoiceShortcutLauncher.actions.background()
-            } else packageManager.getLaunchIntentForPackage(packageName)?.let { startActivity(it) }
+                } catch (error: RuntimeException) { NewVoiceShortcutLauncher.cancelEntries(); throw error }
+            } else startActivity(NewVoiceShortcutLauncher.mainIntent(this))
         }
         finish()
     }

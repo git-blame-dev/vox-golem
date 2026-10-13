@@ -196,11 +196,13 @@ resource availability are still checked, and physical speech behavior is unverif
 
 The phone's single-turn voice shortcut is implemented in source; see the
 [bridge guide](../assistant-plugin/README.md#new-voice-chat-shortcut-implemented-source).
-Pinning requests launcher confirmation. A verified fresh launch or explicit in-app
-Ask tap uses the current conversation/draft, sends one authoritative final once,
-optionally speaks, then idles. Unverified phone launch provenance requires the visible
-tap. Talk alone repeats after reply/playback. Stop cancels without sending; legacy
-Stop & send remains a compatibility command, not the normal entry policy.
+Pinning requests launcher confirmation. Fresh phone Ask/Talk entries do not require
+an additional caller-confirmation tap; another app can invoke those exported entries
+too. Microphone permission and foreground/readiness/context ownership checks remain.
+Ask uses the current conversation/draft, sends one authoritative final once,
+optionally speaks, then idles. Talk alone repeats after reply/playback. Stop cancels
+without sending; legacy Stop & send remains a compatibility command, not the normal
+entry policy.
 
 The distinct [AssistantInputRuntime](src/main/java/dev/gitblame/voxgolem/assistant/inputtransport/AssistantInputRuntime.kt)
 now has production phone/watch constructors and creates `PhoneInputController` in

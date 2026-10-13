@@ -271,7 +271,7 @@ export function useAndroidVoiceAdapter({ enabled = true, statusEnabled = enabled
           await invokeTauriCommand('release_new_voice_shortcut', { token: action.token }); token = null; if (mounted.current) setError('New voice chat is busy or native dictation is unavailable; existing work was preserved'); return
         }
         token = null
-        await start(false, action.token, 'single_turn')
+        await start(action.mode === 'talk', action.token, action.mode === 'talk' ? 'repeat_after_reply' : 'single_turn')
       } catch { if (token !== null) { void invokeTauriCommand('release_new_voice_shortcut', { token }).catch(() => undefined); if (mounted.current) setError('Native shortcut launch is invalid; existing work was preserved') } }
        finally { if (scanPendingRef.current === scan) scanPendingRef.current = null }
     }

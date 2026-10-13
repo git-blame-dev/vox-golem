@@ -14,7 +14,9 @@ export function parseNewVoicePinStatus(value: unknown): NewVoicePinStatus {
   if (!isRecord(value) || typeof value['supported'] !== 'boolean' || typeof value['pinned'] !== 'boolean' || typeof value['requested'] !== 'boolean') throw new Error('Native shortcut status is invalid')
   return { supported: value['supported'], pinned: value['pinned'], requested: value['requested'] }
 }
-export function parsePendingNewVoiceAction(value: unknown): { readonly token: string | null; readonly error: string | null } {
+export function parsePendingNewVoiceAction(value: unknown): { readonly token: string | null; readonly error: string | null; readonly mode: 'ask' | 'talk' } {
   if (!isRecord(value) || (value['token'] !== null && pendingNewVoiceToken(value) === null) || (value['error'] !== null && (typeof value['error'] !== 'string' || utf8ByteLength(value['error']) > 512))) throw new Error('Native shortcut launch is invalid')
-  return { token: value['token'] as string | null, error: value['error'] as string | null }
+  const mode = value['mode'] === undefined ? 'ask' : value['mode']
+  if (mode !== 'ask' && mode !== 'talk') throw new Error('Native voice entry mode is invalid')
+  return { token: value['token'] as string | null, error: value['error'] as string | null, mode }
 }
