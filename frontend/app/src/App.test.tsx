@@ -320,7 +320,7 @@ describe('App', () => {
     expect(inline.value).toBe('local-fast')
     expect(container.querySelector<HTMLImageElement>('.shell__logo')?.dataset['busy']).toBe('false')
   })
-  it.each([[450, 1250, '450 ms', '1.25 s'], [999, 1000, '999 ms', '1 s'], [1100, 1234, '1.1 s', '1.23 s']])('settles desktop Channel updates against canonical snapshots without losing timing or source details (%s/%s)', async (firstText, completed, firstLabel, completedLabel) => {
+  it.each([[450, 1250, '450 ms'], [999, 1000, '999 ms'], [1100, 1234, '1.1 s']])('settles desktop Channel updates against canonical snapshots without losing timing or source details (%s/%s)', async (firstText, completed, firstLabel) => {
     const committed: Record<string, unknown>[] = []
     let send: ((payload: unknown) => void) | undefined
     window.__TAURI_INTERNALS__ = {
@@ -362,7 +362,8 @@ describe('App', () => {
     expect(container.querySelectorAll('.message--assistant')).toHaveLength(1)
     expect(getConversation(container).textContent).toContain('Canonical answer')
     expect(getConversation(container).textContent).not.toContain('Provisional answer')
-    expect(container.textContent).toContain(`First text: ${firstLabel} · Completed: ${completedLabel}`)
+    expect(container.textContent).toContain(firstLabel)
+    expect(container.textContent).not.toContain('Completed:')
     const details = container.querySelector<HTMLDetailsElement>('.answer-stage__details')
     expect(details).not.toBeNull()
     expect(container.querySelector('a[href="https://example.com/evidence"]')).not.toBeNull()
@@ -372,7 +373,8 @@ describe('App', () => {
     await act(async () => { getSendButton(container).click(); for (let index = 0; index < 8; index += 1) await Promise.resolve() })
     expect(container.querySelectorAll('.message--assistant')).toHaveLength(2)
     expect(container.textContent).toContain('Second canonical answer')
-    expect(container.textContent).toContain(`First text: ${firstLabel} · Completed: ${completedLabel}`)
+    expect(container.textContent).toContain(firstLabel)
+    expect(container.textContent).not.toContain('Completed:')
     expect(container.querySelector('a[href="https://example.com/evidence"]')).not.toBeNull()
   })
 
@@ -4042,7 +4044,7 @@ describe('App', () => {
     const select = await getResponseProfileSelect(container)
 
     expect(select.value).toBe('local-fast')
-    expect(Array.from(select.options).map((option) => option.text)).toEqual(['Local: Fast', 'Local: Quality', 'Custom: GPT-6.1 Sol High', 'Custom: GPT-6.1 Sol No Reasoning', 'Custom: GPT-6 Luna No Reasoning', 'Custom: GPT-5.6 Luna Low', 'OpenCode: GPT-6.1 Sol High', 'OpenCode: GPT-5.6 Luna Low'])
+    expect(Array.from(select.options).map((option) => option.text)).toEqual(['Local: Llama 3.2 3B', 'Local: Quality', 'Custom: GPT-6.1 Sol High', 'Custom: GPT-6.1 Sol No Reasoning', 'Custom: GPT-6 Luna No Reasoning', 'Custom: GPT-5.6 Luna Low', 'OpenCode: GPT-6.1 Sol High', 'OpenCode: GPT-5.6 Luna Low', 'Agy: Gemini 3.8 Flash Low', 'Agy: Gemini 3.8 Flash High', 'Agy: Claude Opus 5.5 High', 'Agy: Claude Sonnet 5.5 High'])
   })
 
   it('invokes switch_response_profile when selecting Quality profile', async () => {
@@ -4944,7 +4946,9 @@ describe('App', () => {
       })
       const submitCall = promptEventHandler
       expect(submitCall).toBeDefined()
-      expect(container.querySelectorAll('.message--assistant')).toHaveLength(0)
+      expect(container.querySelectorAll('.message--assistant')).toHaveLength(1)
+      expect(getConversation(container).textContent).not.toContain('Wrong')
+      expect(container.querySelector('.message__thinking')).not.toBeNull()
     })
 
     expect(activeRequestId).not.toBe('')
@@ -5144,9 +5148,12 @@ describe('App', () => {
     })
 
     expect(requestFrame).toHaveBeenCalledTimes(1)
-    expect(container.querySelectorAll('.message--assistant')).toHaveLength(0)
+    expect(container.querySelectorAll('.message--assistant')).toHaveLength(1)
+    expect(getConversation(container).textContent).not.toContain('Frame one')
+    expect(container.querySelector('.message__thinking')).not.toBeNull()
     await act(async () => { scheduledFrames[0]?.(16); await Promise.resolve() })
     expect(getConversation(container).textContent).toContain('Frame one')
+    expect(container.querySelector('.message__thinking')).toBeNull()
 
     await act(async () => {
       promptEventHandler?.({ payload: { request_id: requestId, kind: 'text', text: ' stale' } })
@@ -5192,9 +5199,10 @@ describe('App', () => {
       await act(async () => setTextAreaValue(getComposer(container), prompt))
       await act(async () => { getSendButton(container).click(); await Promise.resolve() })
     }
-    expect(container.textContent).toContain('First text: 450 ms · Completed: 1.25 s')
+    expect(container.textContent).toContain('450 ms')
+    expect(container.textContent).not.toContain('Completed: 1.25 s')
     expect(container.textContent).not.toContain('Custom direct request ·')
-    expect(container.textContent).not.toContain('First text: 1 ms')
+    expect(container.textContent).not.toContain('First text:')
     const answers = container.querySelectorAll('.message--assistant')
     expect(answers).toHaveLength(2)
     expect(answers[1]?.textContent).toContain('Response 2')

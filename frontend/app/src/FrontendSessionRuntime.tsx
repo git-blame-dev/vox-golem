@@ -43,8 +43,9 @@ import {
   DEFAULT_SILENCE_TIMEOUT_MS,
   isStartupStateSettled,
   loadStartupState,
+  parseStartupState,
 } from './lib/startupState'
-import { cacheAndroidSnapshot, getAndroidPreferencePublicationRevision, getTauriInternals, invokeTauriCommand, isAndroidRuntime, isBrowserPreviewRuntime, isNativeTauriRuntime } from './lib/tauri'
+import { buildAndroidStartupState, cacheAndroidSnapshot, getAndroidPreferencePublicationRevision, getTauriInternals, invokeTauriCommand, isAndroidRuntime, isBrowserPreviewRuntime, isNativeTauriRuntime } from './lib/tauri'
 import { teardownBrowserPreviewRuntime } from './lib/browserRuntime'
 import { useAppUpdates } from './lib/useAppUpdates'
 import type { UpdateState } from './lib/useAppUpdates'
@@ -596,11 +597,13 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     snapshotResponseProfileRef.current = acceptedSnapshot.preferences.responseProfile
     snapshotModelOptionsRef.current = acceptedSnapshot.modelOptions
     setSnapshotModelOptions(acceptedSnapshot.modelOptions)
-    const controlledState = applySnapshotControlState(
-      startupStateRef.current,
-      capabilities,
-      acceptedSnapshot.preferences.responseProfile,
-    )
+    const controlledState = isAndroidRuntime && startupStateRef.current.kind === 'loading'
+      ? parseStartupState(buildAndroidStartupState(acceptedSnapshot))
+      : applySnapshotControlState(
+          startupStateRef.current,
+          capabilities,
+          acceptedSnapshot.preferences.responseProfile,
+        )
     startupStateRef.current = controlledState
     setStartupState(controlledState)
     snapshotControlsFreshRef.current = true
@@ -766,7 +769,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       snapshotControlsFreshRef.current = false
       setSnapshotControlsFresh(false)
       void loadAppSnapshot().then((snapshot) => {
-        if (!active || document.visibilityState !== 'visible') return
+        if (!active) return
         if (androidSelectionRecoveryRef.current !== null) {
           if (resetPendingRef.current || selectionRecovery !== androidSelectionRecoveryRef.current || selectionRecovery === null) return
           succeeded = adoptRecoveredAndroidSelection(snapshot, selectionRecovery, snapshotControlRevision, snapshotPreferenceRevision)
@@ -774,7 +777,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
           return
         }
         succeeded = adoptSnapshotControls(snapshot, snapshotControlRevision, snapshotPreferenceRevision)
-        if (succeeded && transcriptRevision === transcriptRevisionRef.current && promptRef.current === null && !resetPendingRef.current) {
+        if (succeeded && document.visibilityState === 'visible' && transcriptRevision === transcriptRevisionRef.current && promptRef.current === null && !resetPendingRef.current) {
           adoptAndroidConversation(snapshot, composerRevision, true)
         }
       }).catch(() => { failed = true }).finally(() => {
@@ -1116,6 +1119,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
 
         if (publishedState.kind === 'ready' && !isBrowserPreviewRuntime()) {
           const newlyUnavailableCapabilities = publishedState.capabilities.filter(({ id, state }) => {
+            if (isAndroidRuntime && ['opencode', 'local_quality', 'qwen_prediction', 'deep', 'review', 'wake_word', 'vad', 'parakeet', 'tts'].includes(id)) return false
             if (['wake_word', 'vad', 'parakeet', 'tts'].includes(id)) return false
             if (state !== 'not_configured' && state !== 'unavailable' && state !== 'failed') return false
             if (previousKind !== 'ready') return true
@@ -1654,6 +1658,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       ttsFirstLineSpoken: false,
       renderFrameId: null,
       renderFrameRevision: 0,
+      admittedAt: performance.now(),
     }
     promptRef.current = promptProjection
     setPromptState('executing')
@@ -1666,6 +1671,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         content: prompt,
       },
     ])
+    session.renderPromptProjection(promptProjection)
 
     if (source === 'typed') {
       composerValueRef.current = ''
@@ -1682,6 +1688,14 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       if (event.kind === 'text') {
         if (source === 'voice' && active.text.length === 0 && event.text.length > 0) {
           voiceTelemetry.record('provider_first_text')
+        }
+        if (isAndroidRuntime && active.customDirectTimings === undefined && event.text.length > 0) {
+          const elapsed = active.admittedAt !== undefined ? Math.max(0, Math.round(performance.now() - active.admittedAt)) : 0
+          const timings = { firstTextMs: elapsed, completedMs: elapsed }
+          active.customDirectTimings = timings
+          setMessages((current) => current.map((message) => message.id === active.assistantId
+            ? { ...message, customDirectTimings: timings }
+            : message))
         }
         const hadCompleteLine = active.text.includes('\n')
         active.text += event.text
@@ -1788,6 +1802,13 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         return
       }
       if (source === 'voice') voiceTelemetry.record('provider_completed', { details: { outcome: result.outcome } })
+      if (result.customDirectTimings) {
+        const stableFirstTextMs = active.customDirectTimings?.firstTextMs ?? result.customDirectTimings.firstTextMs
+        active.customDirectTimings = {
+          firstTextMs: stableFirstTextMs,
+          completedMs: result.customDirectTimings.completedMs,
+        }
+      }
       const acceptedCanonicalTurn = result.canonicalTurn !== undefined && isExpectedCanonicalTurn(
         result.canonicalTurn,
         requestId,
@@ -1808,6 +1829,9 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         session.flushPromptProjection(active)
       } else {
         cancelPromptProjectionFrame(active)
+        if (active.text.trim().length === 0) {
+          setMessages((current) => current.filter((message) => message.id !== active.assistantId))
+        }
       }
       active.terminal = true
       const observedStages = active.stages
@@ -1908,6 +1932,10 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         reconciledRuntimeActivityRevision === runtimeActivityRevisionRef.current
       ) {
         applyRuntimeStatus(toRuntimeStatus(reconciledRuntimePhase))
+      } else if (
+        promptRuntimeActivityRevision === runtimeActivityRevisionRef.current
+      ) {
+        publishRuntimeStatus('sleeping', false)
       }
       const canonicalSettlementRequired = snapshotHydrationStateRef.current === 'succeeded'
       const canonicalCanConfirmCompletion = result.outcome === 'completed' || commandRejected
@@ -3083,6 +3111,28 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     start: voice.start, stop: voice.stop, finishDictation: voice.finishDictation,
     finishShortcut: voice.finishShortcut, toggleSpeech: voice.toggleSpeech,
   }, 'voiceIntents')
+
+  const startupTelemetrySentRef = session.operationRef('startupTelemetrySent', () => false)
+  useEffect(() => {
+    if (startupTelemetrySentRef.current) return
+    const readyToSend =
+      startupState.kind === 'ready' &&
+      snapshotControlsFresh &&
+      !assistantSettingsPending &&
+      !searchModePending &&
+      !resetPending &&
+      promptState === 'idle' &&
+      runtimeStatus === 'sleeping' &&
+      selectedInstantOption?.available === true
+    if (readyToSend) {
+      startupTelemetrySentRef.current = true
+      const elapsed = Math.round(performance.now())
+      console.info('[telemetry] app_ready_to_send_ms:', elapsed)
+      document.documentElement.dataset['appReadyToSendMs'] = String(elapsed)
+      ;(window as unknown as { __appReadyToSendMs?: number }).__appReadyToSendMs = elapsed
+    }
+  }, [assistantSettingsPending, promptState, resetPending, runtimeStatus, searchModePending, selectedInstantOption?.available, snapshotControlsFresh, startupState.kind, startupTelemetrySentRef])
+
   return {
     actions,
     voice: { ...voice, ...voiceIntents },
