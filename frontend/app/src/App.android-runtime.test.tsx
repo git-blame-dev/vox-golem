@@ -19,6 +19,217 @@ afterEach(() => {
 })
 
 describe('production Android App runtime', () => {
+  it.each([
+    { streamed: true, enabled: false }, { streamed: false, enabled: false },
+    { streamed: true, enabled: true }, { streamed: false, enabled: true },
+  ])('keeps Android timing on the frontend admission clock (streamed=$streamed, telemetry=$enabled)', async ({ streamed, enabled }) => {
+    vi.stubEnv('VITE_VOXGOLEM_RUNTIME', 'android'); vi.resetModules(); window.history.replaceState(null, '')
+    vi.stubEnv('VITE_VOXGOLEM_TIMING', enabled ? '1' : '0')
+    delete document.documentElement.dataset['appReadyToSendMs']
+    delete (window as unknown as { __appReadyToSendMs?: number }).__appReadyToSendMs
+    let now = 100
+    vi.spyOn(performance, 'now').mockImplementation(() => now)
+    let frame: FrameRequestCallback | undefined
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => { frame = callback; return 1 })
+    const log = vi.spyOn(console, 'info').mockImplementation((_label, value) => {
+      const metadata = typeof value === 'string' ? JSON.parse(value) as Record<string, unknown> : undefined
+      if (metadata?.['stage'] === 'FIRST_TEXT_DOM_COMMITTED') {
+        expect(Array.from(container!.querySelectorAll('.answer-stage__answer')).some((answer) => answer.textContent?.trim() === 'Synthetic answer')).toBe(true)
+      }
+    })
+    let updates: (value: unknown) => void = () => undefined
+    let finish: (value: unknown) => void = () => undefined
+    let requestId = ''
+    let transcript: unknown[] = [{ request_id: 'synthetic-restored-request', execution_id: { session_id: '1', generation: '1' }, user: { id: '1', role: 'user', content: { kind: 'text', text: 'Synthetic restored question' } }, answer: { id: '2', role: 'assistant', content: { kind: 'text', text: 'Synthetic restored answer' } }, final_stage: 'instant' }]
+    const invoke = vi.fn(async (command: string, args?: unknown) => {
+      if (command === 'get_app_snapshot') return { ...wireSnapshot(), transcript }
+      if (command === 'submit_prompt') {
+        requestId = (args as { requestId: string }).requestId
+        updates = (args as { updates: { send: (value: unknown) => void } }).updates.send
+        return new Promise((resolve) => { finish = resolve })
+      }
+      return null
+    })
+    window.__TAURI_INTERNALS__ = { invoke, createChannel: <T,>(send: (value: T) => void) => ({ send }) }
+    const { default: App } = await import('./App')
+    const { FrontendSession } = await import('./FrontendSession')
+    const session = new FrontendSession({ android: true, nativeSearch: true })
+    container = document.createElement('div'); document.body.append(container); root = createRoot(container)
+    await act(async () => { root?.render(<App session={session} />) })
+    expect(invoke.mock.calls.filter(([command, args]) => command === 'report_startup_stage' && (args as { stage: string }).stage === 'first_response_dom')).toHaveLength(0)
+    expect(document.documentElement.dataset['appReadyToSendMs']).toBe('100')
+    const input = container.querySelector<HTMLTextAreaElement>('#promptComposer')!
+    await act(async () => { Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set?.call(input, 'Synthetic timing question'); input.dispatchEvent(new Event('input', { bubbles: true })) })
+    await act(async () => { container!.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })
+    now = 125
+    await act(async () => { updates({ kind: 'status', message: 'Thinking' }) })
+    expect(container.querySelector('.message__thinking')).not.toBeNull()
+    expect(log.mock.calls.some(([, metadata]) => typeof metadata === 'string' && JSON.parse(metadata)['stage'] === 'FIRST_NONBLANK_RECEIVED')).toBe(false)
+    now = 150
+    await act(async () => { updates({ kind: 'delta', text: ' \n' }) })
+    expect(container.querySelector('.conversation__timings')).toBeNull()
+    await act(async () => { frame?.(now) })
+    expect(invoke.mock.calls.filter(([command, args]) => command === 'report_startup_stage' && (args as { stage: string }).stage === 'first_response_dom')).toHaveLength(0)
+    if (streamed) {
+      now = 200
+      await act(async () => { updates({ kind: 'delta', text: 'Synthetic answer' }) })
+      expect(invoke.mock.calls.filter(([command, args]) => command === 'report_startup_stage' && (args as { stage: string }).stage === 'first_response_dom')).toHaveLength(0)
+      now = 225
+      await act(async () => { frame?.(now) })
+      now = 250
+      await act(async () => { updates({ kind: 'custom_direct_timings', first_text_ms: 7, completed_ms: 900_009 }) })
+      expect(container.querySelector('.conversation__timings')?.textContent).toBe('100 ms')
+    }
+    now = 400
+    const turn = { request_id: requestId, execution_id: { session_id: '1', generation: '2' }, user: { id: '3', role: 'user', content: { kind: 'text', text: 'Synthetic timing question' } }, answer: { id: '4', role: 'assistant', content: { kind: 'text', text: 'Synthetic answer' } }, final_stage: 'instant' }
+    transcript = [...transcript, turn]
+    await act(async () => { finish({ kind: 'completed', turn, first_text_ms: 7, completed_ms: 900_009 }) })
+    const answer = session.getMessagesSnapshot().find((message) => message.id === '4')
+    expect(answer?.customDirectTimings).toEqual({ firstTextMs: streamed ? 100 : 300, completedMs: 300 })
+    const stages = invoke.mock.calls.filter(([command]) => command === 'report_startup_stage').map(([, args]) => (args as { stage: string }).stage)
+    expect(stages).toEqual(enabled ? ['frontend_ready', 'first_response_dom'] : [])
+    const metadata = log.mock.calls.filter(([label]) => label === '[frontend-timing]').map(([, value]) => JSON.parse(value as string) as Record<string, unknown>)
+    if (enabled) {
+      expect(metadata.filter((entry) => entry['stage'] === 'FIRST_NONBLANK_RECEIVED')).toEqual([{ scope: 'frontend_request', request: 1, stage: 'FIRST_NONBLANK_RECEIVED', atMs: streamed ? 200 : 400, elapsedMs: streamed ? 100 : 300 }])
+      expect(metadata.filter((entry) => entry['stage'] === 'FIRST_TEXT_DOM_COMMITTED')).toEqual([{ scope: 'frontend_request', request: 1, stage: 'FIRST_TEXT_DOM_COMMITTED', atMs: streamed ? 225 : 400, elapsedMs: streamed ? 125 : 300 }])
+      expect(metadata.filter((entry) => entry['stage'] === 'SETTLED')).toEqual([{ scope: 'frontend_request', request: 1, stage: 'SETTLED', atMs: 400, elapsedMs: 300 }])
+      expect(metadata.filter((entry) => entry['scope'] === 'provider_request')).toHaveLength(0)
+      expect(metadata.filter((entry) => entry['scope'] === 'webview_navigation').map((entry) => entry['stage'])).toEqual(['SHELL_DOM_COMMITTED', 'INITIAL_SNAPSHOT_REQUESTED', 'INITIAL_SNAPSHOT_RECEIVED', 'INITIAL_SNAPSHOT_APPLIED', 'INITIAL_SEARCH_MODE_REQUESTED', 'INITIAL_SEARCH_MODE_ACK', 'STATE_READY'])
+      expect(JSON.stringify(metadata)).not.toContain('Synthetic')
+      expect(JSON.stringify(metadata)).not.toContain(requestId)
+    } else expect(log).not.toHaveBeenCalled()
+  })
+
+  it.each(['branch', 'storage'] as const)('does not label blocked %s admission as startup ready', async (blocked) => {
+    vi.stubEnv('VITE_VOXGOLEM_RUNTIME', 'android'); vi.stubEnv('VITE_VOXGOLEM_TIMING', '1')
+    vi.resetModules(); window.history.replaceState(null, '')
+    delete document.documentElement.dataset['appReadyToSendMs']
+    delete (window as unknown as { __appReadyToSendMs?: number }).__appReadyToSendMs
+    const log = vi.spyOn(console, 'info').mockImplementation(() => undefined)
+    window.__TAURI_INTERNALS__ = { invoke: async (command) => {
+      if (command === 'get_app_snapshot') return { ...wireSnapshot(), assistant: {
+        revision: '1', conversations: [], selected_head: null, branch_choices: blocked === 'branch' ? ['2'] : [],
+        draft: '', interrupted: false, error: blocked === 'storage' ? 'storage_error' : null,
+      } }
+      return null
+    } }
+    const { default: App } = await import('./App')
+    container = document.createElement('div'); document.body.append(container); root = createRoot(container)
+    await act(async () => { root?.render(<App />) })
+    expect(log.mock.calls.some(([label, metadata]) => label === '[frontend-timing]' && JSON.parse(metadata as string)['stage'] === 'STATE_READY')).toBe(false)
+    expect(document.documentElement.dataset['appReadyToSendMs']).toBeUndefined()
+  })
+
+  it('preserves opted-in desktop provider diagnostics and provider-scoped badges', async () => {
+    vi.stubEnv('VITE_VOXGOLEM_RUNTIME', 'desktop'); vi.stubEnv('VITE_VOXGOLEM_TIMING', '1')
+    vi.resetModules(); window.history.replaceState(null, '')
+    const log = vi.spyOn(console, 'info').mockImplementation(() => undefined)
+    let transcript: unknown[] = []
+    window.__TAURI_INTERNALS__ = {
+      createChannel: <T,>(send: (value: T) => void) => ({ send }),
+      invoke: async (command, args) => {
+        if (command === 'get_app_snapshot') return { ...wireSnapshot(), transcript }
+        if (command === 'get_startup_state') return desktopStartupState()
+        if (command === 'submit_prompt') {
+          const { requestId, updates } = args as { requestId: string; updates: { send: (value: unknown) => void } }
+          updates.send({ kind: 'text', text: 'Synthetic desktop answer' })
+          updates.send({ kind: 'custom_direct_timings', first_text_ms: 450, completed_ms: 1250 })
+          transcript = [{ request_id: requestId, execution_id: { session_id: '1', generation: '1' }, user: { id: '1', role: 'user', content: { kind: 'text', text: 'Synthetic desktop question' } }, answer: { id: '2', role: 'assistant', content: { kind: 'text', text: 'Synthetic desktop answer' } }, final_stage: 'instant' }]
+          return { request_id: requestId, outcome: 'completed', runtime_phase: 'sleeping' }
+        }
+        return null
+      },
+    }
+    const { default: App } = await import('./App')
+    container = document.createElement('div'); document.body.append(container); root = createRoot(container)
+    await act(async () => { root?.render(<App />) })
+    const input = container.querySelector<HTMLTextAreaElement>('#promptComposer')!
+    await act(async () => { Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set?.call(input, 'Synthetic desktop question'); input.dispatchEvent(new Event('input', { bubbles: true })) })
+    await act(async () => { container!.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })
+    expect(container.querySelector('.conversation__timings')?.textContent).toBe('450 ms')
+    const provider = log.mock.calls.filter(([label]) => label === '[frontend-timing]').map(([, value]) => JSON.parse(value as string) as Record<string, unknown>).filter((metadata) => metadata['scope'] === 'provider_request')
+    expect(provider).toEqual([{ scope: 'provider_request', request: 1, stage: 'PROVIDER_DURATIONS', firstTextMs: 450, completedMs: 1250 }])
+  })
+
+  it.each([false, true])('fences retired history but preserves unchanged context after New Chat (rejected=%s)', async (rejected) => {
+    vi.stubEnv('VITE_VOXGOLEM_RUNTIME', 'android'); vi.stubEnv('VITE_VOXGOLEM_TIMING', '1')
+    vi.resetModules(); window.history.replaceState(null, '')
+    let now = 100
+    vi.spyOn(performance, 'now').mockImplementation(() => now)
+    const log = vi.spyOn(console, 'info').mockImplementation(() => undefined)
+    let sessionId = '1'
+    let firstTurn: Record<string, unknown> | undefined
+    let freshTurn: Record<string, unknown> | undefined
+    let finishFirst: (value: unknown) => void = () => undefined
+    let releaseReconciliation: (value: unknown) => void = () => undefined
+    let holdReconciliation = false
+    const snapshot = () => ({ ...wireSnapshot(), session_id: sessionId,
+      transcript: sessionId === '1' ? [firstTurn, freshTurn].filter((turn) => turn !== undefined) : [],
+      assistant: { revision: '1', conversations: [{ id: '1', title: 'Synthetic original' }, { id: '2', title: 'Synthetic new' }], selected_head: null, branch_choices: [], draft: '', interrupted: false, error: null },
+    })
+    const turn = (requestId: string, fresh: boolean) => ({ request_id: requestId, execution_id: { session_id: '1', generation: fresh ? '2' : '1' },
+      user: { id: fresh ? '13' : '11', role: 'user', content: { kind: 'text', text: 'Synthetic question' } },
+      answer: { id: fresh ? '14' : '12', role: 'assistant', content: { kind: 'text', text: fresh ? 'Synthetic fresh answer' : 'Synthetic old answer' } }, final_stage: 'instant' })
+    const invoke = vi.fn(async (command: string, args?: unknown) => {
+      if (command === 'get_app_snapshot') {
+        if (holdReconciliation) { holdReconciliation = false; return new Promise((resolve) => { releaseReconciliation = resolve }) }
+        return snapshot()
+      }
+      if (command === 'submit_prompt') {
+        const requestId = (args as { requestId: string }).requestId
+        if (firstTurn === undefined) {
+          firstTurn = turn(requestId, false)
+          holdReconciliation = true
+          return new Promise((resolve) => { finishFirst = resolve })
+        }
+        now = 900
+        freshTurn = turn(requestId, true)
+        return { kind: 'completed', turn: freshTurn }
+      }
+      if (command === 'reset_session') {
+        if (rejected) throw { code: 'internal', message: 'Synthetic reset rejected without changing context' }
+        sessionId = '2'; return snapshot()
+      }
+      if (command === 'select_conversation') { sessionId = (args as { conversationId: string }).conversationId; return snapshot() }
+      return null
+    })
+    window.__TAURI_INTERNALS__ = { invoke, createChannel: <T,>(send: (value: T) => void) => ({ send }) }
+    const { default: App } = await import('./App')
+    const { FrontendSession } = await import('./FrontendSession')
+    const session = new FrontendSession({ android: true, nativeSearch: true })
+    container = document.createElement('div'); document.body.append(container); root = createRoot(container)
+    await act(async () => { root?.render(<App session={session} />) })
+    const submit = async () => {
+      const input = container!.querySelector<HTMLTextAreaElement>('#promptComposer')!
+      await act(async () => { Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set?.call(input, 'Synthetic question'); input.dispatchEvent(new Event('input', { bubbles: true })) })
+      await act(async () => { container!.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })
+    }
+    await submit()
+    now = 200
+    await act(async () => { finishFirst({ kind: 'completed', turn: firstTurn }) })
+    expect(session.getControlsSnapshot().promptState).toBe('reconciling')
+    expect(container.querySelector('.answer-stage__answer')?.textContent).not.toBe('Synthetic old answer')
+    now = 300
+    await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="New Chat"]')!.click() })
+    expect(session.getControlsSnapshot().promptState).toBe('idle')
+    now = 400
+    await act(async () => { await session.intents.selectAndroidConversation('select_conversation', '1') })
+    expect(container.querySelector('.answer-stage__answer')?.textContent).toBe('Synthetic old answer')
+    const commits = () => log.mock.calls.filter(([label]) => label === '[frontend-timing]').map(([, value]) => JSON.parse(value as string) as Record<string, unknown>).filter((metadata) => metadata['stage'] === 'FIRST_TEXT_DOM_COMMITTED')
+    const nativeCommits = () => invoke.mock.calls.filter(([command, args]) => command === 'report_startup_stage' && (args as { stage: string }).stage === 'first_response_dom')
+    const preservedCommit = { scope: 'frontend_request', request: 1, stage: 'FIRST_TEXT_DOM_COMMITTED', atMs: 300, elapsedMs: 200 }
+    expect(commits()).toEqual(rejected ? [preservedCommit] : [])
+    expect(nativeCommits()).toHaveLength(rejected ? 1 : 0)
+    await act(async () => { releaseReconciliation(snapshot()) })
+    expect(commits()).toEqual(rejected ? [preservedCommit] : [])
+    now = 700
+    await submit()
+    const freshCommit = { scope: 'frontend_request', request: 2, stage: 'FIRST_TEXT_DOM_COMMITTED', atMs: 900, elapsedMs: 200 }
+    expect(commits()).toEqual(rejected ? [preservedCommit, freshCommit] : [freshCommit])
+    expect(nativeCommits()).toHaveLength(1)
+    expect(container.textContent).toContain('Synthetic fresh answer')
+  })
+
   it.each(['android', 'desktop'] as const)('keeps one native Search selector with unchanged gating and accepted selection on %s', async (platform) => {
     vi.stubEnv('VITE_VOXGOLEM_RUNTIME', platform); vi.resetModules(); window.history.replaceState(null, '')
     let webEnabled = true

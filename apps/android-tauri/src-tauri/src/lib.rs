@@ -10,6 +10,14 @@ async fn get_app_snapshot<R: Runtime>(
 }
 
 #[tauri::command]
+async fn report_startup_stage<R: Runtime>(
+    app: AppHandle<R>,
+    stage: String,
+) -> Result<Value, StructuredPluginInvokeError> {
+    tauri_plugin_assistant::forward(app, "report_startup_stage", json!({ "stage": stage })).await
+}
+
+#[tauri::command]
 async fn submit_prompt<R: Runtime>(
     app: AppHandle<R>,
     request_id: String,
@@ -186,6 +194,7 @@ pub fn run() {
         .plugin(tauri_plugin_assistant::init())
         .invoke_handler(tauri::generate_handler![
             get_app_snapshot,
+            report_startup_stage,
             submit_prompt,
             cancel_prompt,
             reset_session,

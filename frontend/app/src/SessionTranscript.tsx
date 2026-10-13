@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import type { FrontendSession } from './FrontendSession'
 import type { TranscriptMessage, UiTextSize } from './types/chat'
 import { isTranscriptMessage } from './types/chat'
@@ -6,6 +6,7 @@ import { ChatBubble } from './components/ChatBubble'
 import { AnswerStage } from './components/AnswerStage'
 import { isAndroidRuntime } from './lib/tauri'
 import { duration } from './lib/duration'
+import { frontendTimingEnabled } from './lib/frontendTiming'
 
 export function SessionTranscript({ session, staging, composerValue, textSize, noticeId }: {
   readonly session: FrontendSession
@@ -20,6 +21,7 @@ export function SessionTranscript({ session, staging, composerValue, textSize, n
   const followLatest = useRef(true)
   const jumping = useRef(false)
   const [showJump, setShowJump] = useState(false)
+  const onAnswerDomCommitted = useCallback((id: string) => session.intents.onAnswerDomCommitted(id), [session])
   const scrollToLatest = useCallback((behavior?: ScrollBehavior): void => {
     const conversation = conversationRef.current
     if (conversation === null || !followLatest.current) {
@@ -49,7 +51,7 @@ export function SessionTranscript({ session, staging, composerValue, textSize, n
       followLatest.current = nearLatest
       setShowJump(!nearLatest)
     }} onWheel={interrupt} onTouchStart={interrupt} onPointerDown={interrupt}>
-      {visibleMessages.map((message) => <TranscriptRow key={message.id} message={message} />)}
+      {visibleMessages.map((message) => <TranscriptRow key={message.id} message={message} onAnswerDomCommitted={onAnswerDomCommitted} />)}
     </main>
     {showJump ? <button type="button" className="conversation__jump" aria-label="Jump to latest" onClick={() => {
       followLatest.current = true
@@ -60,7 +62,10 @@ export function SessionTranscript({ session, staging, composerValue, textSize, n
   </>
 }
 
-const TranscriptRow = memo(function TranscriptRow({ message }: { readonly message: TranscriptMessage }) {
+const TranscriptRow = memo(function TranscriptRow({ message, onAnswerDomCommitted }: { readonly message: TranscriptMessage; readonly onAnswerDomCommitted: (id: string) => void }) {
+  useLayoutEffect(() => {
+    if (frontendTimingEnabled() && message.role === 'assistant' && message.content.trim().length > 0) onAnswerDomCommitted(message.id)
+  }, [message.content, message.id, message.role, onAnswerDomCommitted])
   if (!message.answerStage || message.role !== 'assistant') return <ChatBubble message={message} />
   return <div className="conversation__answer">
     <AnswerStage compact={isAndroidRuntime} answer={message.content} className="message message--assistant" {...(message.contentKind === undefined ? {} : { contentKind: message.contentKind })} {...message.answerStage} />

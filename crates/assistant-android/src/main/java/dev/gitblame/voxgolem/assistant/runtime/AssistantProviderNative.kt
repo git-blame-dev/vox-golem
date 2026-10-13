@@ -2,6 +2,8 @@ package dev.gitblame.voxgolem.assistant.runtime
 
 interface ProviderDeltaCallback {
     fun onReady()
+    /** Receipt near HTTP dispatch, before response headers; JNI crossing is included in observation time. */
+    fun onRequestDispatched() {}
     fun onDelta(text: String)
     fun onStatus(status: String) {}
     fun onFirstText(milliseconds: Long) {}

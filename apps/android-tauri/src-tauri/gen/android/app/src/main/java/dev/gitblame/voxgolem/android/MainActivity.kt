@@ -8,16 +8,21 @@ import android.os.PowerManager
 import android.view.WindowManager
 import android.webkit.WebView
 import androidx.activity.enableEdgeToEdge
+import dev.gitblame.voxgolem.assistant.phone.PhoneStartupTiming
+import dev.gitblame.voxgolem.assistant.phone.PhoneStartupTimingOwner
 
-class MainActivity : TauriActivity() {
+class MainActivity : TauriActivity(), PhoneStartupTimingOwner {
   private var activeWebView: WebView? = null
+  override val startupTiming by lazy { PhoneStartupTiming(this) }
 
   override fun onWebViewCreate(webView: WebView) {
     super.onWebViewCreate(webView)
     activeWebView = webView
+    startupTiming.webViewCreated()
   }
 
   override fun onCreate(savedInstanceState: Bundle?) {
+    startupTiming.activityCreated()
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
@@ -30,6 +35,11 @@ class MainActivity : TauriActivity() {
         WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
       )
     }
+  }
+
+  override fun onDestroy() {
+    startupTiming.close()
+    super.onDestroy()
   }
 
   override fun onPause() {

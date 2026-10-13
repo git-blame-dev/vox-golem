@@ -77,16 +77,41 @@ class AssistantEngineTest {
     @Test fun generationTimingSeparatesQueuedWorkerTextOutcomeAndDurableSettlement() {
         context.applicationInfo.flags = context.applicationInfo.flags or ApplicationInfo.FLAG_DEBUGGABLE
         prepare()
-        assertEquals(listOf(Stage.REQUESTED, Stage.ADMITTED), timings.mapNotNull { it.stage })
+        val admissionStages = listOf(Stage.REQUESTED, Stage.ADMISSION_STARTED, Stage.DRAFT_PERSISTED,
+            Stage.CREDENTIAL_CHECKED, Stage.PROJECTION_REFRESHED, Stage.CONTEXT_PREPARED,
+            Stage.ADMISSION_PERSISTED, Stage.REQUEST_SERIALIZED, Stage.ADMITTED)
+        assertEquals(admissionStages, timings.mapNotNull { it.stage })
         providerQueue.drain()
-        assertEquals(listOf(Stage.REQUESTED, Stage.ADMITTED, Stage.WORKER_STARTED, Stage.NATIVE_READY,
+        assertEquals(admissionStages + listOf(Stage.WORKER_STARTED, Stage.NATIVE_READY,
             Stage.FIRST_TEXT, Stage.OUTCOME_RECEIVED, Stage.DELIVERY_READY), timings.mapNotNull { it.stage })
         io.drain()
-        assertEquals(listOf(Stage.DURABLE_COMMITTED, Stage.SETTLED),
-            timings.filter { it.kind == AssistantTiming.Kind.MARK }.takeLast(2).map { it.stage })
+        assertEquals(listOf(Stage.SETTLEMENT_STARTED, Stage.DURABLE_COMMITTED, Stage.SELECTION_PERSISTED,
+            Stage.SETTLEMENT_PROJECTED, Stage.SETTLED),
+            timings.filter { it.kind == AssistantTiming.Kind.MARK }.takeLast(5).map { it.stage })
         assertEquals(1, timings.count { it.kind == AssistantTiming.Kind.END })
         assertEquals(1, timings.map { it.run }.distinct().size)
         assertFalse(state.busy)
+    }
+
+    @Test fun startupHydrationSeparatesQueueStorageAndDomainProjectionWithoutRetainingActivity() {
+        context.applicationInfo.flags = context.applicationInfo.flags or ApplicationInfo.FLAG_DEBUGGABLE
+        val startupEvents = mutableListOf<AssistantTiming.Event>()
+        val startup = AssistantTiming.begin(context, AssistantTiming.Operation.ACTIVITY,
+            sink = AssistantTiming.Sink(startupEvents::add))
+        val startupQueue = Queue()
+        val instance = AssistantEngine(store, startupQueue, AssistantRequestWorker(providerQueue, provider),
+            { "/synthetic/private/auth.json" }, models, startupTiming = startup)
+        assertEquals(listOf(Stage.HYDRATION_QUEUED), startupEvents.mapNotNull { it.stage })
+        startupQueue.drain()
+        assertEquals(listOf(Stage.HYDRATION_QUEUED, Stage.HYDRATION_STARTED, Stage.LOCAL_STATE_LOADED,
+            Stage.DRAFT_LOADED, Stage.CREDENTIAL_STATUS_READ, Stage.CANONICAL_SNAPSHOT_LOADED, Stage.DOMAIN_PROJECTION_COMPLETED,
+            Stage.HYDRATION_COMPLETED), startupEvents.mapNotNull { it.stage })
+        assertEquals(1, startupEvents.map { it.run }.distinct().size)
+        startup.finish(Stage.CANCELLED)
+        val count = startupEvents.size
+        instance.refresh(); startupQueue.drain()
+        assertEquals(count, startupEvents.size)
+        instance.stop(); startupQueue.drain()
     }
 
     @Test fun cancelledQueuedGenerationClosesTimingWithoutWorkerOrProviderAdmission() {

@@ -27,6 +27,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.lang.ref.WeakReference
 import dev.gitblame.voxgolem.assistant.runtime.AssistantRuntime
+import dev.gitblame.voxgolem.assistant.AssistantTiming.Stage
 
 @InvokeArg
 class SubmitArgs {
@@ -85,8 +86,10 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     override fun load(webView: WebView) {
+        val startupTiming = (activity as? PhoneStartupTimingOwner)?.startupTiming?.trace
+        startupTiming?.mark(Stage.PLUGIN_LOAD_STARTED)
         AssistantRuntime.configureCaptureResourceAdmission(true)
-        AssistantRuntime.get(activity)
+        AssistantRuntime.get(activity, startupTiming)
         webViewReference = WeakReference(webView)
         (activity as? LifecycleOwner)?.lifecycle?.addObserver(object : DefaultLifecycleObserver {
             override fun onResume(owner: LifecycleOwner) = setForeground(true)
@@ -103,6 +106,7 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
             }
         })
         setForeground((activity as? LifecycleOwner)?.lifecycle?.currentState?.isAtLeast(Lifecycle.State.RESUMED) == true)
+        startupTiming?.mark(Stage.PLUGIN_LOAD_COMPLETED)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -133,7 +137,22 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
         catch (error: RuntimeException) { reply(invoke, Result.failure(error)) }
     }
 
-    @Command fun get_app_snapshot(invoke: Invoke) = execute(invoke)
+    @Command fun get_app_snapshot(invoke: Invoke) {
+        val timing = (activity as? PhoneStartupTimingOwner)?.startupTiming?.trace
+        timing?.mark(Stage.INITIAL_SNAPSHOT_REQUESTED)
+        try { backend.command(invoke.command, JSONObject(invoke.getRawArgs())) { result ->
+            if (result.isSuccess) timing?.mark(Stage.INITIAL_SNAPSHOT_REPLIED)
+            reply(invoke, result)
+        } } catch (error: RuntimeException) { reply(invoke, Result.failure(error)) }
+    }
+    @Command fun report_startup_stage(invoke: Invoke) {
+        val stage = invoke.getArgs().optString("stage")
+        if (stage !in setOf("frontend_ready", "first_response_dom")) {
+            reject(invoke, "invalid_input", "Unknown startup timing stage"); return
+        }
+        (activity as? PhoneStartupTimingOwner)?.startupTiming?.trace?.reportFrontendStage(stage)
+        invoke.resolve()
+    }
     @Command fun new_conversation(invoke: Invoke) {
         if (pendingVoice != null || speech.active() && speech.status().optString("mode") != "shortcut") reject(invoke, "busy", "Stop voice before changing conversations") else execute(invoke)
     }

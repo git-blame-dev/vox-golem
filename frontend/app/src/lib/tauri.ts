@@ -217,7 +217,7 @@ export async function invokeAndroidCommand(command: string, args?: unknown): Pro
       return result
     })
   }
-  if (command === 'save_assistant_draft' || command === 'select_conversation' || command === 'select_conversation_head' || command === 'list_assistant_conversations' || command === 'list_assistant_heads') return invoke(command, args)
+  if (command === 'report_startup_stage' || command === 'save_assistant_draft' || command === 'select_conversation' || command === 'select_conversation_head' || command === 'list_assistant_conversations' || command === 'list_assistant_heads') return invoke(command, args)
   if (['assistant_voice_status', 'start_assistant_voice', 'finish_assistant_dictation', 'stop_assistant_voice', 'open_speech_services_store'].includes(command)) return invoke(command, args)
   if ((NEW_VOICE_SHORTCUT_COMMANDS as readonly string[]).includes(command)) return invoke(command, args)
   if (command === 'cancel_prompt' || command === 'reset_session' || command === 'submit_prompt') {
