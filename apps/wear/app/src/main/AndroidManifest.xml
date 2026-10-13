@@ -31,7 +31,8 @@
         android:theme="@android:style/Theme.Material.NoActionBar">
         <meta-data android:name="com.google.android.wearable.standalone" android:value="true" />
         <activity android:name=".assistant.AssistantActivity" android:exported="true"
-            android:label="Vox Chat" android:launchMode="singleTop" android:taskAffinity="dev.gitblame.voxgolem.android.assistant">
+            android:label="Vox Chat" android:icon="@drawable/voxgolem_entry_chat"
+            android:launchMode="singleTop" android:taskAffinity="dev.gitblame.voxgolem.android.assistant">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -39,7 +40,7 @@
         </activity>
         <activity-alias android:name=".assistant.AssistantVoiceEntry"
             android:targetActivity=".assistant.AssistantActivity"
-            android:exported="true" android:label="Vox Ask">
+            android:exported="true" android:label="Vox Ask" android:icon="@drawable/voxgolem_entry_ask">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -47,7 +48,7 @@
         </activity-alias>
         <activity-alias android:name=".assistant.AssistantConversationEntry"
             android:targetActivity=".assistant.AssistantActivity"
-            android:exported="true" android:label="Vox Talk">
+            android:exported="true" android:label="Vox Talk" android:icon="@drawable/voxgolem_entry_talk">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -56,6 +57,7 @@
         <activity android:name=".assistant.AssistantTextEntryActivity" android:exported="false" android:label="Assistant draft" />
         <activity
             android:name=".CaptureActivity"
+            android:icon="@drawable/voxgolem_entry_note"
             android:exported="true"
             android:launchMode="singleTop">
             <intent-filter>
