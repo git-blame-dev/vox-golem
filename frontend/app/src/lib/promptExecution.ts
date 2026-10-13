@@ -1,5 +1,5 @@
 import { TauriCommandError, getTauriInternals, isAndroidRuntime, isBrowserPreviewRuntime, normalizeTauriError } from './tauri'
-import { parseCanonicalTurn } from './appSnapshot'
+import { parseAppSnapshot, parseCanonicalTurn } from './appSnapshot'
 import { isRecord, parseRuntimePhase, utf8ByteLength } from './wire'
 import type {
   PromptExecutionEvent,
@@ -60,7 +60,13 @@ export function parseAndroidPromptOutcome(payload: unknown, requestId: string): 
   ) {
     customDirectTimings = { firstTextMs: firstTextMs as number, completedMs: completedMs as number }
   }
-  return { requestId, runtimePhase: 'sleeping', outcome: 'completed', errorMessage: null, canonicalOutcome: payload['kind'], canonicalTurn: turn, ...(customDirectTimings === undefined ? {} : { customDirectTimings }) }
+  let terminalSnapshot: import('./appSnapshot').AppSnapshot | undefined
+  if (payload['app_snapshot'] !== undefined && payload['app_snapshot'] !== null) {
+    try { terminalSnapshot = parseAppSnapshot(payload['app_snapshot'], true) } catch {
+      // Optional projection evidence cannot invalidate an otherwise committed turn.
+    }
+  }
+  return { requestId, runtimePhase: 'sleeping', outcome: 'completed', errorMessage: null, canonicalOutcome: payload['kind'], canonicalTurn: turn, ...(terminalSnapshot === undefined ? {} : { terminalSnapshot }), ...(customDirectTimings === undefined ? {} : { customDirectTimings }) }
 }
 
 export function parseAndroidPromptOutcomeForExecution(payload: unknown, requestId: string): PromptExecutionResult {

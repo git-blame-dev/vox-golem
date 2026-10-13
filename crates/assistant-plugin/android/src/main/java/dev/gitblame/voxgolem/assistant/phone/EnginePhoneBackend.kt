@@ -239,7 +239,7 @@ class EnginePhoneBackend internal constructor(
         if (!admitted) {
             terminal(Result.failure(AssistantPhoneFailure("busy", "A request is already active"))); return
         }
-        val listener = dev.gitblame.voxgolem.assistant.runtime.AssistantResultListener { result, _ ->
+        val listener = dev.gitblame.voxgolem.assistant.runtime.AssistantResultListener { result, resultState ->
             delivery.compareAndSet(current, null)
             try {
                 when (result.status) {
@@ -265,6 +265,8 @@ class EnginePhoneBackend internal constructor(
                         val reconciliationFailed = runCatching { AssistantReplication.reconcileNow(context) }.isFailure
                         if (result.code == "saved_local_state_failed" || reconciliationFailed) {
                             outcome.put("warning", providerFailure("saved_local_state_failed").boundedMessage)
+                        } else {
+                            attachTerminalSnapshot(outcome, result, resultState)
                         }
                         terminal(Result.success(outcome))
                     }
@@ -275,13 +277,23 @@ class EnginePhoneBackend internal constructor(
                 }
             } catch (error: RuntimeException) { terminal(Result.failure(error)) }
         }
-        if (owner == null) engine.submit(clientRequestId, prompt, current.gate, listener, searchMode)
+        if (owner == null) engine.submit(clientRequestId, prompt, current.gate, listener, searchMode, terminalContext = true)
         else engine.submitSpeech(clientRequestId, prompt, owner.conversation, listener,
-            expectedHead = owner.selectedHead, delivery = current.gate, searchMode = searchMode)
+            expectedHead = owner.selectedHead, delivery = current.gate, searchMode = searchMode, terminalContext = true)
     }
 
     override fun acknowledge(clientRequestId: String, providerRequestId: String, revision: String, accepted: Boolean): Boolean =
         delivery.get()?.takeIf { it.clientRequestId == clientRequestId }?.acknowledge(providerRequestId, revision, accepted) ?: false
+
+    internal fun attachTerminalSnapshot(outcome: JSONObject,
+        result: dev.gitblame.voxgolem.assistant.runtime.AssistantRequestResult, resultState: AssistantState) {
+        val raw = result.terminalContextJson ?: return
+        // Encode first; the transactional fence then observes any already-committed mutation,
+        // including imports committed while encoding or while reconcileNow was being queued.
+        runCatching { encode(resultState, JSONObject(raw)) }.onSuccess { encoded ->
+            if (engine.terminalContextStillCurrent(result, resultState)) outcome.put("app_snapshot", encoded)
+        }
+    }
 
     override fun cancelDelivery(clientRequestId: String) {
         delivery.get()?.takeIf { it.clientRequestId == clientRequestId }?.cancel()

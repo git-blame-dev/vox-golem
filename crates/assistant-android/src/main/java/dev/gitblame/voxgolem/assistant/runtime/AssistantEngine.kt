@@ -84,6 +84,7 @@ class AssistantEngine @JvmOverloads internal constructor(
         @Volatile var delivery: AssistantDeliveryGate?, var listener: AssistantResultListener?,
         val timing: AssistantTiming,
         val spokenResponse: Boolean,
+        val terminalContext: Boolean,
     ) {
         var finished = false
         val failure = AtomicReference<String?>(null)
@@ -99,6 +100,7 @@ class AssistantEngine @JvmOverloads internal constructor(
         val externalSessionId: String,
         val admittedAt: Long = android.os.SystemClock.elapsedRealtime(),
         var firstTextMs: Long? = null,
+        var outcomeJson: String? = null,
     )
     private val domain = AssistantDomain(projectionGateway)
     private val observers = CopyOnWriteArrayList<(AssistantState) -> Unit>()
@@ -140,6 +142,23 @@ class AssistantEngine @JvmOverloads internal constructor(
     }
 
     override fun snapshot(): AssistantState = published
+
+    /** Blocking store IO on the result actor. Evidence is current at this transaction,
+     * not a promise that replication cannot commit again before the UI receives it. */
+    fun terminalContextStillCurrent(result: AssistantRequestResult, resultState: AssistantState): Boolean = try {
+        val revision = result.revision
+        val context = result.terminalContextJson?.let(::JSONObject)
+        val conversation = resultState.conversation?.let(::JSONObject)
+        val head = resultState.selectedHead?.let(::JSONObject)
+        result.status == "complete" && result.code == null && !resultState.busy && resultState.error == null &&
+            revision != null && context != null && conversation != null &&
+            JSONObject(resultState.viewJson).getString("revision") == revision &&
+            context.getString("revision") == revision &&
+            sameId(conversation, context.getJSONObject("conversation")) &&
+            (if (head == null) context.isNull("parent") else
+                !context.isNull("parent") && sameId(head, context.getJSONObject("parent"))) &&
+            store.projectionStillCurrent(revision, resultState.conversation, resultState.selectedHead)
+    } catch (_: RuntimeException) { false }
 
     /** Outer UI state acknowledgement, not proof that a lazy reply item or pixels are presented. */
     fun markProvisionalStateApplied(clientRequestToken: String?) {
@@ -386,20 +405,22 @@ class AssistantEngine @JvmOverloads internal constructor(
         enqueueSubmission(clientRequestToken, prompt, delivery, resultListener)
     }
     fun submitSpeech(clientRequestToken: String, prompt: String, expectedConversation: String?, resultListener: AssistantResultListener,
-        expectedHead: String? = snapshot().selectedHead, delivery: AssistantDeliveryGate? = null, searchMode: String? = null) {
+        expectedHead: String? = snapshot().selectedHead, delivery: AssistantDeliveryGate? = null, searchMode: String? = null,
+        terminalContext: Boolean = false) {
         enqueueSubmission(clientRequestToken, prompt, delivery, resultListener, searchMode, expectedConversation = expectedConversation,
-            expectedHead = expectedHead, requireConversationOwner = true)
+            expectedHead = expectedHead, requireConversationOwner = true, terminalContext = terminalContext)
     }
 
-    fun submit(clientRequestToken: String, prompt: String, delivery: AssistantDeliveryGate? = null, resultListener: AssistantResultListener, searchMode: String?) {
-        enqueueSubmission(clientRequestToken, prompt, delivery, resultListener, searchMode)
+    fun submit(clientRequestToken: String, prompt: String, delivery: AssistantDeliveryGate? = null, resultListener: AssistantResultListener, searchMode: String?, terminalContext: Boolean = false) {
+        enqueueSubmission(clientRequestToken, prompt, delivery, resultListener, searchMode, terminalContext = terminalContext)
     }
 
     private fun enqueueSubmission(token: String, promptOverride: String?, delivery: AssistantDeliveryGate?, listener: AssistantResultListener?, searchMode: String? = null,
-        expectedConversation: String? = null, requireConversationOwner: Boolean = false, expectedHead: String? = null) {
+        expectedConversation: String? = null, requireConversationOwner: Boolean = false, expectedHead: String? = null,
+        terminalContext: Boolean = false) {
         val requestedEpoch = epoch.get()
         val ticket = Ticket(token, requestedEpoch, delivery, listener, beginTiming(Operation.GENERATION),
-            spokenResponse = requireConversationOwner || token.startsWith("voice-"))
+            spokenResponse = requireConversationOwner || token.startsWith("voice-"), terminalContext = terminalContext)
         ticket.timing.mark(Stage.REQUESTED)
         val duplicate = submitted.putIfAbsent(token, ticket) != null
         dispatch {
@@ -575,9 +596,14 @@ class AssistantEngine @JvmOverloads internal constructor(
                             if (ready) ticket.timing.mark(Stage.DELIVERY_READY)
                             if (!ready) ticket.failure.set("delivery_failed")
                         }
-                        dispatch { settle(turn, outcomeJson) }
+                        dispatch { if (active === turn) turn.outcomeJson = outcomeJson }
                     }
                     override fun onRetired(requestId: String) = dispatch {
+                        val outcome = turn.outcomeJson
+                        if (active === turn && turn.epoch == epoch.get() && !ticket.cancelled.get() && outcome != null) {
+                            settle(turn, outcome)
+                            return@dispatch
+                        }
                         if (active === turn) {
                             active = null
                             cancellationOwner.compareAndSet(ticket, null)
@@ -610,6 +636,7 @@ class AssistantEngine @JvmOverloads internal constructor(
         var speechText: String? = null
         var outcomeFirstText: Long? = null
         var outcomeCompleted: Long? = null
+        var terminalContextJson: String? = null
         try {
             require(raw.toByteArray(Charsets.UTF_8).size <= 2 * 1024 * 1024)
             val outcome = JSONObject(raw)
@@ -664,12 +691,14 @@ class AssistantEngine @JvmOverloads internal constructor(
             cancellationOwner.compareAndSet(turn.ticket, null)
             state = state.copy(busy = false, toolStatus = null)
              try {
-                 refreshProjection()
+                  terminalContextJson = refreshProjection(if (saved && turn.ticket.terminalContext)
+                      AssistantProjectionRead.Context() else null)?.toString()
                  turn.ticket.timing.mark(Stage.SETTLEMENT_PROJECTED)
              } catch (_: RuntimeException) {
                  state = state.copy(error = if (saved) "saved_local_state_failed" else state.error ?: "not_saved")
              } finally {
-                finish(turn.ticket, if (saved) "complete" else if (state.error == "interrupted") "cancelled" else "error", state.error, turn.id, savedRecord, if (saved) speechText else null, if (saved) (outcomeFirstText ?: outcomeCompleted) else null, if (saved) outcomeCompleted else null)
+                 finish(turn.ticket, if (saved) "complete" else if (state.error == "interrupted") "cancelled" else "error", state.error, turn.id, savedRecord, if (saved) speechText else null, if (saved) (outcomeFirstText ?: outcomeCompleted) else null, if (saved) outcomeCompleted else null,
+                     if (saved && state.error == null) terminalContextJson else null)
                 afterRetirement?.also { afterRetirement = null; it() }
             }
         }
@@ -677,7 +706,7 @@ class AssistantEngine @JvmOverloads internal constructor(
 
     private fun ticketFailure(ticket: Ticket) = ticket.failure.get()
 
-    private fun finish(ticket: Ticket, status: String, code: String?, providerId: String? = null, record: String? = null, speechText: String? = null, firstTextMs: Long? = null, completedMs: Long? = null) {
+    private fun finish(ticket: Ticket, status: String, code: String?, providerId: String? = null, record: String? = null, speechText: String? = null, firstTextMs: Long? = null, completedMs: Long? = null, terminalContextJson: String? = null) {
         if (ticket.finished) return
         ticket.finished = true
         ticket.timing.finish(when (status) { "complete" -> Stage.SETTLED; "cancelled" -> Stage.CANCELLED; else -> Stage.FAILED })
@@ -686,7 +715,7 @@ class AssistantEngine @JvmOverloads internal constructor(
         ticket.listener = null
         ticket.delivery = null
         val result = AssistantRequestResult(ticket.token, providerId, status, code,
-            JSONObject(state.viewJson).optString("revision"), record, speechText, firstTextMs, completedMs)
+            JSONObject(state.viewJson).optString("revision"), record, speechText, firstTextMs, completedMs, terminalContextJson)
         try { listener?.onResult(result, state) } catch (_: RuntimeException) { /* Durable settlement cannot depend on a result consumer. */ }
     }
 

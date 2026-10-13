@@ -27,6 +27,7 @@ data class AssistantRequestResult(
     val speechText: String? = null,
     val firstTextMs: Long? = null,
     val completedMs: Long? = null,
+    val terminalContextJson: String? = null,
 )
 
 fun interface AssistantResultListener {

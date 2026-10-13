@@ -9,9 +9,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 vi.hoisted(() => { vi.stubEnv('VITE_VOXGOLEM_RUNTIME', 'android') })
 
 import App from './App'
+import { SessionAuthority } from './SessionAuthority'
+import { getCachedAndroidPreferences, setCachedAndroidPreferences } from './lib/tauri'
 
 let root: Root | null = null
 let container: HTMLElement | null = null
+const initialTimingEnv = import.meta.env['VITE_VOXGOLEM_TIMING'] ?? ''
 
 afterEach(() => {
   vi.useRealTimers()
@@ -20,6 +23,7 @@ afterEach(() => {
   root = null
   container = null
   delete window.__TAURI_INTERNALS__
+  vi.stubEnv('VITE_VOXGOLEM_TIMING', initialTimingEnv)
   vi.restoreAllMocks()
 })
 
@@ -292,6 +296,130 @@ describe('Android App lifecycle', () => {
     })
     expect(logo.getAttribute('data-busy')).toBe('false')
   })
+  it.each(['completed', 'refused', 'poisoned', 'missing', 'composer', 'executing'] as const)('settles %s terminal evidence without trusting malformed optional metadata', async (mode) => {
+    let snapshots = 0
+    let turn: Record<string, unknown> | undefined = undefined
+    const snapshot = () => ({ ...appSnapshot(turn === undefined ? [] : [turn]), assistant: {
+      revision: turn === undefined ? '1' : '2', conversations: [{ id: '1', title: 'Synthetic chat' }],
+      selected_head: turn === undefined ? null : '3', branch_choices: [], draft: '', interrupted: false, error: null,
+    } })
+    window.__TAURI_INTERNALS__ = {
+      createChannel: <T,>(handler: (value: T) => void) => ({ send: handler }),
+      invoke: async (command, args) => {
+        if (command === 'get_app_snapshot') { snapshots += 1; return snapshot() }
+        if (command === 'get_startup_state') return readyStartupState()
+        if (command === 'submit_prompt') {
+          turn = canonicalTurn('2', '3', 'Synthetic inline question', 'Synthetic inline answer', (args as { requestId: string }).requestId)
+          if (mode === 'refused') turn['answer'] = { id: '3', role: 'assistant', content: { kind: 'refusal', text: 'Synthetic inline answer' } }
+          if (mode === 'composer') {
+            const composer = container!.querySelector('textarea')!
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set?.call(composer, 'Synthetic newer draft')
+            composer.dispatchEvent(new Event('input', { bubbles: true }))
+          }
+          return { kind: mode === 'refused' ? 'refused' : 'completed', turn,
+            ...(mode === 'missing' ? {} : { app_snapshot: mode === 'poisoned' ? { transcript: 'invalid' } : mode === 'executing' ? { ...snapshot(), runtime_phase: 'executing' } : snapshot() }) }
+        }
+        return null
+      },
+    }
+    container = document.createElement('div'); document.body.append(container); root = createRoot(container)
+    await act(async () => { root?.render(<App />) })
+    const before = snapshots
+    await act(async () => {
+      const composer = container!.querySelector('textarea')!
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set?.call(composer, 'Synthetic inline question')
+      composer.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await act(async () => { container!.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })
+    expect(container.textContent).toContain('Synthetic inline answer')
+    expect(container.querySelector('.shell__logo')?.getAttribute('data-busy')).toBe('false')
+    expect(snapshots - before).toBe(mode === 'completed' || mode === 'refused' ? 0 : 1)
+  })
+
+  it.each(['preferences', 'controlsRevision', 'contextRevision', 'runtimeRevision', 'lost-result', 'cancelled', 'bounded-retry', 'reset-invalidated'] as const)('recovers deferred inline evidence after %s through fresh canonical snapshots', async (race) => {
+    vi.stubEnv('VITE_VOXGOLEM_TIMING', '1')
+    const timingLog = vi.spyOn(console, 'info').mockImplementation(() => undefined)
+    const operations = vi.spyOn(SessionAuthority.prototype, 'operationRef')
+    let snapshots = 0
+    let postResultSnapshots = 0
+    let cancellationRequests = 0
+    let resultReleased = false
+    let requestId = ''
+    let finish: (value: unknown) => void = () => undefined
+    let fail: (value: unknown) => void = () => undefined
+    const committed: { turn?: Record<string, unknown> } = {}
+    const snapshot = () => ({ ...appSnapshot(committed.turn === undefined ? [] : [committed.turn]), assistant: {
+      revision: committed.turn === undefined ? '1' : '2', conversations: [{ id: '1', title: 'Synthetic recovery chat' }],
+      selected_head: committed.turn === undefined ? null : '3', branch_choices: [], draft: '', interrupted: false, error: null,
+    } })
+    window.__TAURI_INTERNALS__ = {
+      createChannel: <T,>(handler: (value: T) => void) => ({ send: handler }),
+      invoke: async (command, args) => {
+        if (command === 'get_app_snapshot') {
+          snapshots += 1
+          if (resultReleased) postResultSnapshots += 1
+          if (race === 'bounded-retry' && resultReleased && postResultSnapshots < 3) {
+            throw new Error('Synthetic projection not yet available')
+          }
+          return snapshot()
+        }
+        if (command === 'get_startup_state') return readyStartupState()
+        if (command === 'cancel_prompt') { cancellationRequests += 1; return null }
+        if (command === 'submit_prompt') {
+          requestId = (args as { requestId: string }).requestId
+          return new Promise((resolve, reject) => { finish = resolve; fail = reject })
+        }
+        return null
+      },
+    }
+    container = document.createElement('div'); document.body.append(container); root = createRoot(container)
+    await act(async () => { root?.render(<App />) })
+    await act(async () => {
+      const composer = container!.querySelector('textarea')!
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set?.call(composer, 'Synthetic recovery question')
+      composer.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await act(async () => { container!.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })
+    expect(requestId).not.toBe('')
+    const before = snapshots
+    if (race === 'cancelled') {
+      await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Stop"]')!.click() })
+      expect(cancellationRequests).toBe(1)
+    }
+    const turn = canonicalTurn('2', '3', 'Synthetic recovery question', 'Synthetic durable answer', requestId)
+    committed.turn = turn
+    const captured = snapshot()
+    // Simulate concurrent owners publishing invalidation while submit_prompt is pending.
+    // The production authority, adapter, parser and reconciliation loop remain real.
+    if (race === 'preferences') {
+      setCachedAndroidPreferences({ ...getCachedAndroidPreferences()!, uiTheme: 'light' })
+    } else if (race === 'controlsRevision' || race === 'contextRevision' || race === 'runtimeRevision') {
+      const authority = operations.mock.contexts[0] as unknown as SessionAuthority
+      authority.operationRef(race, () => 0).current += 1
+    } else if (race === 'reset-invalidated') {
+      const authority = operations.mock.contexts[0] as unknown as SessionAuthority
+      authority.fieldRef('resetPending').current = true
+    }
+    if (race === 'bounded-retry') vi.useFakeTimers()
+    await act(async () => {
+      resultReleased = true
+      if (race === 'lost-result') fail(new Error('Synthetic result transport lost after commit'))
+      else if (race === 'cancelled') finish({ kind: 'cancelled', app_snapshot: captured })
+      else finish({ kind: 'completed', turn, ...(race === 'bounded-retry' ? {} : { app_snapshot: captured }) })
+      if (race === 'bounded-retry') await vi.advanceTimersByTimeAsync(1000)
+    })
+    const rpcMarkers = timingLog.mock.calls.filter(([label, value]) => label === '[frontend-timing]' && typeof value === 'string' && JSON.parse(value)['stage'] === 'TERMINAL_SNAPSHOT_RPC_REQUESTED')
+    if (race === 'reset-invalidated') {
+      expect(snapshots - before).toBe(0)
+      expect(rpcMarkers).toHaveLength(0)
+      return
+    }
+    expect(snapshots - before).toBe(race === 'bounded-retry' ? 3 : 1)
+    expect(rpcMarkers).toHaveLength(1)
+    expect(container.textContent).toContain('Synthetic durable answer')
+    expect(container.querySelector('.shell__logo')?.getAttribute('data-busy')).toBe('false')
+  })
+
   it('keeps full synced conversation titles in an accessible header icon native chooser', async () => {
     const id = '11111111-1111-4111-8111-111111111111:1'
     const title = `Synthetic offline conversation ${'long native dropdown title '.repeat(8)}`

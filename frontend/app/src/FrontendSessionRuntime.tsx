@@ -1785,6 +1785,11 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     if (source === 'voice') voiceTelemetry.record('provider_request_started', { details: { provider: currentSettings.instant } })
     let result: PromptExecutionResult
     let commandRejected = false
+    const inlineControlRevision = snapshotControlRequestRevisionRef.current
+    const inlinePreferenceRevision = getAndroidPreferencePublicationRevision()
+    const inlineRuntimeRevision = runtimeActivityRevisionRef.current
+    const inlineTranscriptRevision = transcriptRevisionRef.current
+    const inlineAssistant = androidAssistantRef.current
     try {
       requestTiming.dispatch()
       result = await executePrompt(requestId, prompt, handleEvent, source, admittedMode)
@@ -1885,13 +1890,33 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         setPromptState('reconciling')
         setPromptActivity({ text: 'Synchronizing response…', compact: true })
         const transcriptRevision = transcriptRevisionRef.current
-        const snapshotControlRevision = ++snapshotControlRequestRevisionRef.current
-        const snapshotPreferenceRevision = getAndroidPreferencePublicationRevision()
-        let snapshot: Awaited<ReturnType<typeof loadAppSnapshot>> | null = null
+        const inline = result.terminalSnapshot
+        const inlineTurn = inline === undefined ? undefined : findNewTurnForRequest(
+          inline.transcript, requestId, expectedCanonicalSessionId, priorCanonicalExecutions,
+        )
+        const acceptInline = result.outcome === 'completed' && acceptedCanonicalTurn !== undefined &&
+          inline !== undefined && inline.activeRequest === null && inline.assistant !== undefined &&
+          (!isAndroidRuntime || inline.runtimePhase === 'sleeping') &&
+          inline.assistant.error === null && inline.assistant.interrupted === false &&
+          inline.assistant.selectedHead !== null && inline.assistant.revision !== inlineAssistant?.revision &&
+          inline.sessionId === expectedCanonicalSessionId && inlineTurn !== undefined &&
+          JSON.stringify(inlineTurn) === JSON.stringify(acceptedCanonicalTurn) &&
+          inlineControlRevision === snapshotControlRequestRevisionRef.current &&
+          inlinePreferenceRevision === getAndroidPreferencePublicationRevision() &&
+          inlineRuntimeRevision === runtimeActivityRevisionRef.current &&
+          inlineTranscriptRevision === transcriptRevisionRef.current &&
+          promptComposerRevision === composerEditRevisionRef.current &&
+          inlineAssistant === androidAssistantRef.current && !resetPendingRef.current
+        const snapshotControlRevision = acceptInline ? inlineControlRevision : ++snapshotControlRequestRevisionRef.current
+        if (acceptInline) requestTiming.reconciliation('inline')
+        const snapshotPreferenceRevision = acceptInline ? inlinePreferenceRevision : getAndroidPreferencePublicationRevision()
+        let snapshot: Awaited<ReturnType<typeof loadAppSnapshot>> | null = acceptInline ? inline! : null
+        if (acceptInline) reconciledRuntimeActivityRevision = inlineRuntimeRevision
         for (let attempt = 0; attempt < 3 && snapshot === null; attempt += 1) {
           if (!appActiveRef.current || promptRef.current !== active || resetPendingRef.current || transcriptRevision !== transcriptRevisionRef.current) return
           try {
             const runtimeActivityRevision = runtimeActivityRevisionRef.current
+            requestTiming.reconciliation('rpc')
             const candidate = await loadAppSnapshot()
             if (candidate.activeRequest === null) {
               snapshot = candidate

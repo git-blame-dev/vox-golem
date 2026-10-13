@@ -709,6 +709,68 @@ class AssistantEngineTest {
         assertNotNull(results.single().recordJson)
         assertEquals(results.single().revision, JSONObject(snapshots.single().viewJson).getString("revision"))
         assertTrue(snapshots.single().viewJson.contains("Synthetic final answer"))
+        assertNull(results.single().terminalContextJson)
+    }
+
+    @Test fun optedInTerminalContextMatchesExactCommittedResultState() {
+        var result: AssistantRequestResult? = null
+        var terminalState: AssistantState? = null
+        engine.submit("synthetic-terminal-context", "Synthetic 🧪 question", resultListener = AssistantResultListener { value, projection ->
+            result = value; terminalState = projection
+        }, searchMode = null, terminalContext = true)
+        io.drain(); settle()
+        val context = JSONObject(result!!.terminalContextJson!!)
+        assertEquals(result!!.revision, context.getString("revision"))
+        assertEquals(context.getString("revision"), JSONObject(terminalState!!.viewJson).getString("revision"))
+        assertFalse(terminalState!!.busy)
+        assertEquals(JSONObject(result!!.recordJson!!).toString(), context.getJSONArray("turns").getJSONObject(0).toString())
+    }
+
+    @Test fun terminalContextFenceRejectsExternalCanonicalAndLocalSelectionChanges() {
+        var result: AssistantRequestResult? = null
+        var captured: AssistantState? = null
+        engine.submit("synthetic-fenced-terminal", "Synthetic question", resultListener = AssistantResultListener { value, projection ->
+            result = value; captured = projection
+        }, searchMode = null, terminalContext = true)
+        io.drain(); settle()
+        val terminal = result!!
+        val projection = captured!!
+        assertTrue(engine.terminalContextStillCurrent(terminal, projection))
+        store.selectConversation(JSONObject(projection.conversation!!), null)
+        assertFalse(engine.terminalContextStillCurrent(terminal, projection))
+        store.selectConversation(JSONObject(projection.conversation), JSONObject(projection.selectedHead!!))
+        assertTrue(engine.terminalContextStillCurrent(terminal, projection))
+        assertFalse(engine.terminalContextStillCurrent(terminal.copy(revision = "synthetic-mismatch"), projection))
+        val wrongContext = JSONObject(terminal.terminalContextJson!!).put("revision", "synthetic-mismatch").toString()
+        assertFalse(engine.terminalContextStillCurrent(terminal.copy(terminalContextJson = wrongContext), projection))
+        store.createConversation("Synthetic external canonical mutation")
+        assertFalse(engine.terminalContextStillCurrent(terminal, projection))
+        assertNotNull(terminal.recordJson)
+        assertEquals("complete", terminal.status)
+    }
+
+    @Test fun terminalResultCannotPrecedeWorkerRetirementEvenWithImmediateActorDispatch() {
+        val workerQueue = Queue()
+        val worker = AssistantRequestWorker(workerQueue, provider)
+        val instance = AssistantEngine(store, Executor { it.run() }, worker,
+            { "/synthetic/private/auth.json" }, models)
+        instance.resume()
+        var results = 0
+        var replacementAdmitted = false
+        instance.submit("synthetic-retirement", "Synthetic question", resultListener = AssistantResultListener { _, projection ->
+            results++
+            assertFalse(projection.busy)
+            replacementAdmitted = worker.submit("synthetic-retirement-probe", "/synthetic/private/auth.json", "{}",
+                object : AssistantRequestListener {
+                    override fun onDelta(requestId: String, text: String) {}
+                    override fun onOutcome(requestId: String, outcomeJson: String) {}
+                })
+            worker.cancel()
+        })
+        workerQueue.drain()
+        assertEquals(1, results)
+        assertTrue(replacementAdmitted)
+        instance.stop(); worker.close()
     }
 
     @Test fun phoneStartupContextIsConsumedOnceAndRevisionChangeDiscardsIt() {
