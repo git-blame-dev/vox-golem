@@ -39,9 +39,13 @@ impl ProcessProvider {
         &self,
         config: CustomOpenAiConfig,
     ) -> Result<CustomOpenAiClient, ErrorCode> {
-        self.transport
-            .with_reused_transport(config)
-            .map_err(ErrorCode::from)
+        if config.endpoint != self.transport.config().endpoint {
+            CustomOpenAiClient::new(config).map_err(ErrorCode::from)
+        } else {
+            self.transport
+                .with_reused_transport(config)
+                .map_err(ErrorCode::from)
+        }
     }
 }
 

@@ -14,11 +14,11 @@ describe('assistant settings contract', () => {
   })
   it('has safe defaults', () => expect(DEFAULT_ASSISTANT_SETTINGS).toEqual({ instant: 'local-fast', deep: 'opencode-sol-high', review: 'opencode-sol-high', deepEnabled: false, reviewEnabled: false, prefetch: false, completion: true, webEnabled: true, speechNetworkFallback: true, speechLanguage: '', speechTtsProvider: '', speechTtsVoice: '' }))
   it('labels every choice with its provider', () => {
-    expect(instantOptions(all)).toHaveLength(8); expect(deepOptions(all)).toHaveLength(4); expect(reviewOptions(all)).toHaveLength(4)
-    expect(instantOptions(all).map((x) => x.label)).toEqual(['Local: Fast', 'Local: Quality', 'Custom: GPT-6.1 Sol High', 'Custom: GPT-6.1 Sol No Reasoning', 'Custom: GPT-6 Luna No Reasoning', 'Custom: GPT-5.6 Luna Low', 'OpenCode: GPT-6.1 Sol High', 'OpenCode: GPT-5.6 Luna Low'])
-    expect(deepOptions(all).map((x) => x.value)).toEqual(['custom-sol-high', 'custom-luna-low', 'opencode-sol-high', 'opencode-luna-low'])
-    expect(reviewOptions(all).map((x) => x.value)).toEqual(['custom-sol-high', 'custom-luna-low', 'opencode-sol-high', 'opencode-luna-low'])
-    expect(deepOptions(all).map((x) => x.description)).toEqual(['Custom reasoning-only', 'Custom reasoning-only', 'OpenCode search', 'OpenCode search'])
+    expect(instantOptions(all)).toHaveLength(12); expect(deepOptions(all)).toHaveLength(8); expect(reviewOptions(all)).toHaveLength(8)
+    expect(instantOptions(all).map((x) => x.label)).toEqual(['Local: Llama 3.2 3B', 'Local: Quality', 'Custom: GPT-6.1 Sol High', 'Custom: GPT-6.1 Sol No Reasoning', 'Custom: GPT-6 Luna No Reasoning', 'Custom: GPT-5.6 Luna Low', 'OpenCode: GPT-6.1 Sol High', 'OpenCode: GPT-5.6 Luna Low', 'Agy: Gemini 3.8 Flash Low', 'Agy: Gemini 3.8 Flash High', 'Agy: Claude Opus 5.5 High', 'Agy: Claude Sonnet 5.5 High'])
+    expect(deepOptions(all).map((x) => x.value)).toEqual(['custom-sol-high', 'custom-luna-low', 'opencode-sol-high', 'opencode-luna-low', 'agy-flash-low', 'agy-flash-high', 'agy-opus-high', 'agy-sonnet-high'])
+    expect(reviewOptions(all).map((x) => x.value)).toEqual(['custom-sol-high', 'custom-luna-low', 'opencode-sol-high', 'opencode-luna-low', 'agy-flash-low', 'agy-flash-high', 'agy-opus-high', 'agy-sonnet-high'])
+    expect(deepOptions(all).map((x) => x.description)).toEqual(['Custom reasoning-only', 'Custom reasoning-only', 'OpenCode search', 'OpenCode search', 'Google Antigravity search', 'Google Antigravity search', 'Google Antigravity search', 'Google Antigravity search'])
   })
   it('reports unavailable providers', () => expect(deepOptions({ ...all, custom: false, openCode: false }).filter((x) => !x.available).every((x) => x.reason)).toBe(true))
   it('strictly parses and serializes backend payloads', () => {

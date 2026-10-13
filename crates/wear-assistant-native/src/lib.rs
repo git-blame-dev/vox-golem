@@ -23,7 +23,7 @@ use tokio::sync::watch;
 use voxgolem_platform::custom_openai::{
     custom_openai_auth_revision, observe_custom_openai_auth, CustomOpenAiAuthObservation,
     CustomOpenAiAuthRevision, CustomOpenAiClient, CustomOpenAiConfig, CustomOpenAiError,
-    CustomOpenAiResponse, MAX_CUSTOM_OPENAI_AUTH_BYTES,
+    CustomOpenAiModel, CustomOpenAiResponse, MAX_CUSTOM_OPENAI_AUTH_BYTES,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
@@ -72,7 +72,13 @@ impl From<CustomOpenAiError> for ErrorCode {
 }
 
 fn provider_config(auth_path: &str, request: &request::Request) -> CustomOpenAiConfig {
+    let endpoint = if request.model == CustomOpenAiModel::LocalFast {
+        "http://127.0.0.1:11435/v1/responses".to_string()
+    } else {
+        "https://chatgpt.com/backend-api/codex/responses".to_string()
+    };
     CustomOpenAiConfig {
+        endpoint,
         auth_path: auth_path.into(),
         model: request.model,
         ..Default::default()
@@ -255,7 +261,7 @@ fn respond(
         if *registration.cancelled.borrow() {
             return Outcome::Cancelled;
         }
-        if request.search_mode.is_some() {
+        if request.model != CustomOpenAiModel::LocalFast && request.search_mode.is_some() {
             return search::respond(
                 process,
                 provider_config(auth_path, &request),

@@ -1,6 +1,6 @@
 /** Stable routing IDs; these defaults never override native labels or availability. */
 export const MODEL_CATALOG = [
-  { id: 'local-fast', label: 'Local: Fast', agent: false, preview: true },
+  { id: 'local-fast', label: 'Local: Llama 3.2 3B', agent: false, preview: true },
   { id: 'local-quality', label: 'Local: Quality', agent: false, preview: false },
   { id: 'custom-sol-high', label: 'Custom: GPT-6.1 Sol High', agent: true, preview: false },
   { id: 'custom-sol-none', label: 'Custom: GPT-6.1 Sol No Reasoning', agent: false, preview: false },
@@ -8,6 +8,10 @@ export const MODEL_CATALOG = [
   { id: 'custom-luna-low', label: 'Custom: GPT-5.6 Luna Low', agent: true, preview: false },
   { id: 'opencode-sol-high', label: 'OpenCode: GPT-6.1 Sol High', agent: true, preview: false },
   { id: 'opencode-luna-low', label: 'OpenCode: GPT-5.6 Luna Low', agent: true, preview: false },
+  { id: 'agy-flash-low', label: 'Agy: Gemini 3.8 Flash Low', agent: true, preview: false },
+  { id: 'agy-flash-high', label: 'Agy: Gemini 3.8 Flash High', agent: true, preview: false },
+  { id: 'agy-opus-high', label: 'Agy: Claude Opus 5.5 High', agent: true, preview: false },
+  { id: 'agy-sonnet-high', label: 'Agy: Claude Sonnet 5.5 High', agent: true, preview: false },
 ] as const
 
 export type InstantChoice = typeof MODEL_CATALOG[number]['id']

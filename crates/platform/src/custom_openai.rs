@@ -33,6 +33,7 @@ pub enum CustomOpenAiModel {
     SolNone,
     LunaNone,
     LunaLow,
+    LocalFast,
 }
 
 impl CustomOpenAiModel {
@@ -41,13 +42,14 @@ impl CustomOpenAiModel {
             Self::SolHigh | Self::SolNone => "gpt-6.1-sol",
             Self::LunaNone => "gpt-6-luna",
             Self::LunaLow => "gpt-5.6-luna",
+            Self::LocalFast => "local-fast",
         }
     }
 
     pub fn reasoning_effort(self) -> &'static str {
         match self {
             Self::SolHigh => "high",
-            Self::SolNone | Self::LunaNone => "none",
+            Self::SolNone | Self::LunaNone | Self::LocalFast => "none",
             Self::LunaLow => "low",
         }
     }
@@ -145,7 +147,7 @@ pub struct CustomOpenAiResponse {
     pub timings: CustomOpenAiTimings,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CustomOpenAiAuthRevision {
     len: u64,
     modified_ns: u128,
@@ -261,8 +263,7 @@ impl CustomOpenAiClient {
         })
     }
 
-    #[cfg(feature = "web-search")]
-    pub(crate) fn config(&self) -> &CustomOpenAiConfig {
+    pub fn config(&self) -> &CustomOpenAiConfig {
         &self.config
     }
 
@@ -328,14 +329,26 @@ impl CustomOpenAiClient {
     }
 
     pub fn check_auth(&self) -> Result<(), CustomOpenAiError> {
+        if self.config.model == CustomOpenAiModel::LocalFast {
+            return Ok(());
+        }
         self.observe_auth().status
     }
 
     pub fn auth_revision(&self) -> Option<CustomOpenAiAuthRevision> {
+        if self.config.model == CustomOpenAiModel::LocalFast {
+            return Some(CustomOpenAiAuthRevision::default());
+        }
         custom_openai_auth_revision(&self.config.auth_path)
     }
 
     pub fn observe_auth(&self) -> CustomOpenAiAuthObservation {
+        if self.config.model == CustomOpenAiModel::LocalFast {
+            return CustomOpenAiAuthObservation {
+                revision: Some(CustomOpenAiAuthRevision::default()),
+                status: Ok(()),
+            };
+        }
         observe_custom_openai_auth(&self.config.auth_path)
     }
 
@@ -399,7 +412,15 @@ impl CustomOpenAiClient {
         if tokio::time::Instant::now() >= deadline {
             return Err(CustomOpenAiError::Timeout);
         }
-        let credential = load_request_credential(&self.config.auth_path)?;
+        let credential = if self.config.model == CustomOpenAiModel::LocalFast {
+            load_request_credential(&self.config.auth_path).unwrap_or_else(|_| RequestCredential {
+                authorization: HeaderValue::from_static("Bearer local"),
+                account_id: None,
+                revision: CustomOpenAiAuthRevision::default(),
+            })
+        } else {
+            load_request_credential(&self.config.auth_path)?
+        };
         on_auth_revision(credential.revision);
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {

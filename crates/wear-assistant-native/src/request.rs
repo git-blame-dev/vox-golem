@@ -111,6 +111,7 @@ pub(crate) fn parse(input: &str) -> Result<Request, ErrorCode> {
         "custom-sol-none" => CustomOpenAiModel::SolNone,
         "custom-luna-none" => CustomOpenAiModel::LunaNone,
         "custom-luna-low" => CustomOpenAiModel::LunaLow,
+        "local-fast" => CustomOpenAiModel::LocalFast,
         _ => return Err(ErrorCode::InvalidRequest),
     };
     let text_bytes: usize = wire

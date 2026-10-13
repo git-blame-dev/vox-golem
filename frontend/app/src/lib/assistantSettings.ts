@@ -54,10 +54,10 @@ const reviewLabels = modelLabels('review')
 
 function options<T extends string>(labels: Record<T, string>, capabilities: AssistantCapabilities): AssistantOption<T>[] {
   return (Object.keys(labels) as T[]).map((value) => {
-    const provider = value.startsWith('local') || value === 'none' ? 'local' : value.startsWith('custom') ? 'custom' : 'openCode'
-    const available = value === 'local-fast' ? capabilities.localFast : value === 'local-quality' ? capabilities.localQuality : provider === 'custom' ? capabilities.custom : capabilities.openCode
-    const providerName = provider === 'openCode' ? 'OpenCode' : provider === 'custom' ? 'Custom' : 'Local'
-    const description = value === 'custom-sol-none' || value === 'custom-luna-none' ? 'Direct Custom connection; reasoning disabled' : value.startsWith('opencode') ? 'OpenCode search' : value.startsWith('custom') ? 'Custom reasoning-only' : undefined
+    const provider = value.startsWith('local') || value === 'none' ? 'local' : value.startsWith('custom') ? 'custom' : value.startsWith('agy') ? 'agy' : 'openCode'
+    const available = value === 'local-fast' ? capabilities.localFast : value === 'local-quality' ? capabilities.localQuality : provider === 'custom' ? capabilities.custom : provider === 'agy' ? true : capabilities.openCode
+    const providerName = provider === 'agy' ? 'Agy' : provider === 'openCode' ? 'OpenCode' : provider === 'custom' ? 'Custom' : 'Local'
+    const description = value === 'custom-sol-none' || value === 'custom-luna-none' ? 'Direct Custom connection; reasoning disabled' : value.startsWith('agy') ? 'Google Antigravity search' : value.startsWith('opencode') ? 'OpenCode search' : value.startsWith('custom') ? 'Custom reasoning-only' : undefined
     const featureUnavailable = labels === deepLabels ? !capabilities.deep : labels === reviewLabels ? !capabilities.review : false
     return { value, label: labels[value], available: available && !featureUnavailable, ...(description ? { description } : {}), ...(available && !featureUnavailable ? {} : { reason: featureUnavailable ? `${providerName} does not support this option` : `${providerName} is unavailable` }) }
   })

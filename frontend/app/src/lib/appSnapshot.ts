@@ -263,7 +263,7 @@ function parseCapability(value: unknown): Capability {
   return {
     id: parseBoundedString(value['id'], CAPABILITY_ID_MAX_BYTES, 'capability id'),
     state: state as CapabilityState,
-    reason: parseBoundedString(value['reason'], DISPLAY_TEXT_MAX_BYTES, 'capability reason'),
+    reason: (parseNullableBoundedString(value, 'reason', DISPLAY_TEXT_MAX_BYTES)?.trim() || 'ready'),
     actualProvider: parseNullableBoundedString(value, 'actual_provider', CAPABILITY_ID_MAX_BYTES),
   }
 }

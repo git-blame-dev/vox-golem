@@ -9,6 +9,11 @@ import java.util.concurrent.Executors
 object AssistantRuntime {
     @Volatile private var engine: AssistantEngine? = null
     @Volatile private var captureAdmissionReady = false
+    @Volatile private var agyRouter: AgyProviderRouter? = null
+
+    fun prewarm(model: String) {
+        agyRouter?.prewarm(model)
+    }
 
     /** Enable only after Note/live/replay/probe owners all use RecognitionResourceLease.process. */
     fun configureCaptureResourceAdmission(ready: Boolean) { captureAdmissionReady = ready }
@@ -27,7 +32,16 @@ object AssistantRuntime {
             override fun read() = preferences.getString("model", "custom-sol-high") ?: "custom-sol-high"
             override fun write(value: String) { check(preferences.edit().putString("model", value).commit()) }
         }
-        return AssistantEngine(AssistantStore(application), io, AssistantRequestWorker(provider),
+        val router = AgyProviderRouter(application).also { agyRouter = it }
+        val initialModel = modelStorage.read()
+        val prewarmModel = if (initialModel.startsWith("agy-") || initialModel.startsWith("gemini-") || initialModel.startsWith("claude-") || initialModel.startsWith("opus") || initialModel.startsWith("sonnet") || initialModel.startsWith("3.8-")) {
+            initialModel
+        } else {
+            "gemini-3.8-flash-high"
+        }
+        router.prewarm(prewarmModel)
+
+        return AssistantEngine(AssistantStore(application), io, AssistantRequestWorker(provider, router),
             credentials::pathForProvider, modelStorage, credentials, NativeAssistantPolicyStorage(application),
             beginTiming = { AssistantTiming.begin(application, it) }).also { engine = it }
     }

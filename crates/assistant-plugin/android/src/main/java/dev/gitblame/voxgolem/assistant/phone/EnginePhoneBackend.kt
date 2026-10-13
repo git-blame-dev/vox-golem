@@ -196,7 +196,9 @@ class EnginePhoneBackend internal constructor(private val context: Context, priv
         synchronized(admission) {
             if (!preferencesPending.compareAndSet(false, true)) { reply(Result.failure(providerFailure("busy"))); return }
         }
-        engine.updatePreferences(value.getString("instant"), dev.gitblame.voxgolem.assistant.runtime.AssistantPolicy(
+        val selectedModel = value.getString("instant")
+        AssistantRuntime.prewarm(selectedModel)
+        engine.updatePreferences(selectedModel, dev.gitblame.voxgolem.assistant.runtime.AssistantPolicy(
             value.getBoolean("web_enabled"), value.getBoolean("speech_network_fallback"), value.getString("speech_language"),
             value.getString("speech_tts_provider"), value.getString("speech_tts_voice")), { preferences.write(value) }) { selected ->
             preferencesPending.set(false)
@@ -241,6 +243,10 @@ class EnginePhoneBackend internal constructor(private val context: Context, priv
                         val turn = PhoneSnapshotEncoder.turn(record, mapOf(requestId to result.clientRequestToken))
                         val refused = turn.getJSONObject("answer").getJSONObject("content").getString("kind") == "refusal"
                         val outcome = JSONObject().put("kind", if (refused) "refused" else "completed").put("turn", turn)
+                        if (result.firstTextMs != null && result.completedMs != null) {
+                            outcome.put("first_text_ms", result.firstTextMs)
+                            outcome.put("completed_ms", result.completedMs)
+                        }
                         result.speechText?.let { outcome.put("speechText", it) }
                         if (owner != null) committedVoiceInputContext(record).let { committed ->
                             outcome.put("voiceContext", JSONObject().put("conversation", committed.conversation)
