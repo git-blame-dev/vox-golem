@@ -23,6 +23,7 @@ Thumbs.db
 
 crates/assistant-plugin/android/build/
 crates/assistant-plugin/android/.tauri/
+apps/android-tauri/src-tauri/gen/android/app/src/main/assets/
 
 __pycache__/
 *.pyc

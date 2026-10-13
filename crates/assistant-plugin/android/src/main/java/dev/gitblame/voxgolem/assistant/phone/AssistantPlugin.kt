@@ -1,11 +1,14 @@
 package dev.gitblame.voxgolem.assistant.phone
 
 import android.app.Activity
+import android.app.KeyguardManager
+import android.content.Context
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.webkit.WebView
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.Lifecycle
@@ -55,14 +58,49 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
     private var webViewReference: WeakReference<WebView>? = null
     private data class PendingVoice(val epoch: Long, val args: VoiceArgs, val invoke: Invoke, val owner: SpeechAdmissionSnapshot)
     private var pendingVoice: PendingVoice? = null
+    private var promptWakeLock: PowerManager.WakeLock? = null
+
+    private fun isScreenOffOrLocked(): Boolean {
+        val pm = activity.getSystemService(Context.POWER_SERVICE) as? PowerManager
+        val km = activity.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+        val screenOff = pm?.isInteractive == false
+        val locked = km?.isKeyguardLocked == true
+        return screenOff || locked
+    }
+
+    private fun acquirePromptWakeLock() {
+        try {
+            if (promptWakeLock == null) {
+                val pm = activity.getSystemService(Context.POWER_SERVICE) as? PowerManager
+                promptWakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "VoxGolem:PromptExecution")
+            }
+            promptWakeLock?.takeIf { !it.isHeld }?.acquire(60_000)
+        } catch (_: RuntimeException) {}
+    }
+
+    private fun releasePromptWakeLock() {
+        try {
+            promptWakeLock?.takeIf { it.isHeld }?.release()
+        } catch (_: RuntimeException) {}
+    }
 
     override fun load(webView: WebView) {
         AssistantRuntime.configureCaptureResourceAdmission(true)
+        AssistantRuntime.get(activity)
         webViewReference = WeakReference(webView)
         (activity as? LifecycleOwner)?.lifecycle?.addObserver(object : DefaultLifecycleObserver {
             override fun onResume(owner: LifecycleOwner) = setForeground(true)
-            override fun onPause(owner: LifecycleOwner) = setForeground(false)
-            override fun onDestroy(owner: LifecycleOwner) { setForeground(false); speech.close() }
+            override fun onPause(owner: LifecycleOwner) {
+                if (!isScreenOffOrLocked()) setForeground(false)
+            }
+            override fun onStop(owner: LifecycleOwner) {
+                if (!isScreenOffOrLocked()) setForeground(false)
+            }
+            override fun onDestroy(owner: LifecycleOwner) {
+                setForeground(false)
+                speech.close()
+                releasePromptWakeLock()
+            }
         })
         setForeground((activity as? LifecycleOwner)?.lifecycle?.currentState?.isAtLeast(Lifecycle.State.RESUMED) == true)
     }
@@ -113,6 +151,11 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
     @Command fun assistant_pairing_status(invoke: Invoke) = execute(invoke)
 
     @Command fun assistant_voice_status(invoke: Invoke) { invoke.resolve(JSObject(speech.status().toString())) }
+    @Command fun open_speech_services_store(invoke: Invoke) {
+        val opened = dev.gitblame.voxgolem.assistant.speech.SpeechServiceRequirement.openPlayStore(activity)
+        if (opened) invoke.resolve()
+        else reject(invoke, "unavailable", "Unable to open Play Store or browser")
+    }
     @Command fun new_voice_shortcut_status(invoke: Invoke) { invoke.resolve(JSObject(NewVoiceShortcutLauncher.status(activity).toString())) }
     @Command fun pin_new_voice_shortcut(invoke: Invoke) {
         if (!visible.get()) { reject(invoke, "unavailable", "Pinning a shortcut requires the visible app"); return }
@@ -207,7 +250,9 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
         if (args.requestId.isEmpty() || args.requestId.toByteArray(Charsets.UTF_8).size > 128 || args.prompt.isBlank() || args.prompt.toByteArray(Charsets.UTF_8).size > 32 * 1024) {
             reject(invoke, "invalid_input", "Prompt or request ID is empty or too long"); return
         }
-        if ((activity as? LifecycleOwner)?.lifecycle?.currentState?.isAtLeast(Lifecycle.State.RESUMED) != true) {
+        val isAlive = !activity.isFinishing && !activity.isDestroyed
+        val isForeground = (activity as? LifecycleOwner)?.lifecycle?.currentState?.isAtLeast(Lifecycle.State.RESUMED) == true
+        if (!isAlive || (!isForeground && !isScreenOffOrLocked())) {
             reject(invoke, "unavailable", "The app must be in the foreground to send a request"); return
         }
         val nativeVoice = args.requestId.startsWith("voice-") || args.requestId.startsWith("shortcut-")
@@ -221,11 +266,16 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
         }
         val ended = AtomicBoolean(false)
         val replyTicket = speech.onRequestSubmitted(args.requestId)
+        acquirePromptWakeLock()
         val terminal: (Result<Any?>) -> Unit = { result ->
-            if (ended.compareAndSet(false, true)) {
-                synchronized(lock) { if (request == args.requestId) request = null }
-                speech.onRequestResult(args.requestId, result, replyTicket)
-                reply(invoke, result)
+            try {
+                if (ended.compareAndSet(false, true)) {
+                    synchronized(lock) { if (request == args.requestId) request = null }
+                    speech.onRequestResult(args.requestId, result, replyTicket)
+                    reply(invoke, result)
+                }
+            } finally {
+                releasePromptWakeLock()
             }
         }
         try {
