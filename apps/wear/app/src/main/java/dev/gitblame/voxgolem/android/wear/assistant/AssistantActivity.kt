@@ -158,7 +158,7 @@ open class AssistantActivity : ComponentActivity() {
                         { requestVoice(false) }, { requestVoice(true) }, voice::endUtterance, ::setReadRepliesAloud, voice::speak,
                          ::recheck, history::older, history::retry, ::setConversationMode, client::selectSearchMode,
                            ::setWebEnabled, ::setSpeechNetworkFallback, ::setSpeechLanguage, ::setSpeechTtsProvider,
-                             ::setSpeechTtsVoice, ::resetSpeechSelection, prepareSpeechOptions = ::prepareSpeechOptions), pendingPrompts, speechSelectionError, speechSelectionPending,
+                             ::setSpeechTtsVoice, ::resetSpeechSelection, prepareSpeechOptions = ::prepareSpeechOptions, openSpeechStore = ::openSpeechStore), pendingPrompts, speechSelectionError, speechSelectionPending,
                     replyMetrics = replyMetrics::get)
             }
         }
@@ -320,6 +320,7 @@ open class AssistantActivity : ComponentActivity() {
     }
 
     internal fun stopAll() { pendingVoiceLaunch = null; permissionAction = null; voice.stop(); client.stop() }
+    internal fun openSpeechStore() { dev.gitblame.voxgolem.assistant.speech.SpeechServiceRequirement.openPlayStore(this) }
     private fun canChangeVoiceContext() = visible && resumed && !voiceAdmissionPending && !voice.snapshot().active && !client.snapshot().busy
     internal fun newConversation() { if (canChangeVoiceContext()) client.newConversation() }
     internal fun selectConversation(id: String) { if (canChangeVoiceContext()) client.selectConversation(id) }

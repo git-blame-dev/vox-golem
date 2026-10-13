@@ -18,3 +18,49 @@
   fill: var(--surface-panel-strong, Canvas);
   stroke: none;
 }
+
+.speech-prompt-dialog {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+
+.speech-prompt-dialog__backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+}
+
+.speech-prompt-dialog__content {
+  position: relative;
+  max-width: 360px;
+  width: 100%;
+  background: var(--surface-panel, #222);
+  color: var(--text-color, #eee);
+  border: 1px solid var(--border-color, #444);
+  border-radius: 12px;
+  padding: 20px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+
+.speech-prompt-dialog__content h4 {
+  margin: 0 0 8px 0;
+  font-size: 1.1rem;
+}
+
+.speech-prompt-dialog__content p {
+  margin: 0 0 16px 0;
+  font-size: 0.95rem;
+  line-height: 1.4;
+}
+
+.speech-prompt-dialog__actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+

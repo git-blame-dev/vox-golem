@@ -87,9 +87,10 @@ internal data class AssistantActions(
     val selectSpeechVoice: (String) -> Unit,
     val resetSpeechSelection: () -> Unit,
     val prepareSpeechOptions: () -> Unit = {},
+    val openSpeechStore: () -> Unit = {},
 )
 
-private enum class AssistantPage { CHAT, CHATS, SETTINGS, SPEECH_LANGUAGE, SPEECH_ENGINE, SPEECH_VOICE }
+private enum class AssistantPage { CHAT, CHATS, SETTINGS, SPEECH_LANGUAGE, SPEECH_ENGINE, SPEECH_VOICE, MISSING_SPEECH }
 
 private fun AssistantPage.backPage() = when (this) {
     AssistantPage.SPEECH_LANGUAGE, AssistantPage.SPEECH_ENGINE, AssistantPage.SPEECH_VOICE -> AssistantPage.SETTINGS
@@ -121,7 +122,7 @@ internal fun AssistantScreen(
     speechSelectionPending: Boolean = false,
     replyMetrics: (String?) -> Long? = { null },
 ) {
-    var page by rememberSaveable { mutableStateOf(AssistantPage.CHAT) }
+    var page by rememberSaveable { mutableStateOf(if (voice.missingSpeechServices && voice.entryMode != null) AssistantPage.MISSING_SPEECH else AssistantPage.CHAT) }
     val chats = remember(state.viewJson) { assistantChats(state.viewJson) }
     val title = chats.firstOrNull { it.id.let(::assistantIdKey) == state.conversation?.let(::assistantIdKey) }?.title ?: "Assistant"
     val promptPresentation = remember { AssistantPromptPresentation() }
@@ -137,7 +138,7 @@ internal fun AssistantScreen(
             CompositionLocalProvider(LocalScreenIsActive provides (page == AssistantPage.CHAT && LocalScreenIsActive.current)) {
                 val repeatAfterReply = assistantRepeatsAfterReply(voice, preferences)
                 ChatScreen(state, voice, history, pendingPrompts, actions, repeatAfterReply, page == AssistantPage.CHAT,
-                    { page = AssistantPage.SETTINGS }, replyMetrics)
+                    { page = AssistantPage.SETTINGS }, replyMetrics, onMissingSpeech = { page = AssistantPage.MISSING_SPEECH })
             }
         }
         if (page != AssistantPage.CHAT) {
@@ -166,6 +167,7 @@ internal fun AssistantScreen(
                                  }
                                  SpeechSelectionScreen(state, voice, actions, field, speechSelectionError, speechSelectionPending) { page = AssistantPage.SETTINGS }
                              }
+                            AssistantPage.MISSING_SPEECH -> MissingSpeechScreen(voice, actions) { page = AssistantPage.CHAT }
                             AssistantPage.CHAT -> Unit
                         }
                     }
@@ -181,6 +183,7 @@ private fun ChatScreen(
     pendingPrompts: List<AssistantPendingPrompt>,
     actions: AssistantActions, conversationMode: Boolean, active: Boolean, settings: () -> Unit,
     replyMetrics: (String?) -> Long?,
+    onMissingSpeech: () -> Unit = {},
 ) {
     val list = rememberLazyListState()
     val reading = rememberSaveable(saver = AssistantReadingPosition.Saver) { AssistantReadingPosition() }
@@ -255,8 +258,13 @@ private fun ChatScreen(
                         actions.older()
                     }
                 }
-                if (state.conversation == null) item(key = "choose-chat") {
-                    Text("Type or dictate a question. Send starts a new chat.")
+                if (state.conversation == null) {
+                    item(key = "choose-chat") {
+                        Text("Type or dictate a question. Send starts a new chat.")
+                    }
+                    if (voice.missingSpeechServices) item(key = "missing-speech-chat") {
+                        ActionButton("Speech services required · Open Play Store", true, onMissingSpeech)
+                    }
                 }
                 if (state.branchChoices.isNotEmpty()) {
                     item(key = "branches") { Text("Choose a continuation", color = MaterialTheme.colorScheme.primary) }
@@ -318,7 +326,7 @@ private fun ChatScreen(
             if (!showLatest) {
                 Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(maxOf(48.dp, CompactEdgeButtonDefaults.Height)),
                     contentAlignment = Alignment.BottomCenter) {
-                    PrimaryEdgeButton(state, voice, actions.copy(stop = { continuity.stopReply(); actions.stop() }), conversationMode)
+                    PrimaryEdgeButton(state, voice, actions.copy(stop = { continuity.stopReply(); actions.stop() }), conversationMode, onMissingSpeech)
                 }
             }
             if (showLatest) {
@@ -419,6 +427,14 @@ private fun SettingsScreen(state: AssistantState, voice: AssistantVoiceState, pa
         item { Text("Speech model selection unavailable · model identifiers not reported") }
         item { ActionButton("Reset all speech to Automatic", assistantCanSelectSpeech(state, voice, speechSelectionPending), actions.resetSpeechSelection) }
         item { Text("Speech routes", style = wearTextStyle(MaterialTheme.typography.titleMedium)) }
+        if (voice.missingSpeechServices) {
+            item {
+                Text(voice.speechRequirementMessage ?: "Speech Recognition & Synthesis by Google is required for local STT or TTS.", color = MaterialTheme.colorScheme.error)
+            }
+            item {
+                ActionButton("Open Play Store", true, actions.openSpeechStore)
+            }
+        }
         item { Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(speechSettings.dictationStatus, style = wearTextStyle(MaterialTheme.typography.labelMedium))
             speechSettings.dictationDetails?.let { Text(it) }
@@ -498,13 +514,27 @@ private fun Modifier.listRotary(state: LazyListState, active: Boolean, scrolled:
 }
 
 @Composable
-private fun PrimaryEdgeButton(state: AssistantState, voice: AssistantVoiceState, actions: AssistantActions, conversationMode: Boolean) {
+private fun MissingSpeechScreen(voice: AssistantVoiceState, actions: AssistantActions, back: () -> Unit) {
+    val message = voice.speechRequirementMessage
+        ?: "Speech Recognition & Synthesis by Google is required for local voice dictation and speech output on your watch."
+    ScreenList("Speech Required", back, "Back to chat") {
+        item {
+            Text(message, style = wearTextStyle(MaterialTheme.typography.bodyMedium))
+        }
+        item {
+            ActionButton("Open Play Store", true, actions.openSpeechStore)
+        }
+    }
+}
+
+@Composable
+private fun PrimaryEdgeButton(state: AssistantState, voice: AssistantVoiceState, actions: AssistantActions, conversationMode: Boolean, onMissingSpeech: () -> Unit = {}) {
     val control = assistantPrimaryControl(state, voice, conversationMode)
     val action = when (control.action) {
         AssistantPrimaryAction.STOP -> actions.stop
         AssistantPrimaryAction.SEND -> actions.send
-        AssistantPrimaryAction.TALK -> actions.conversationMode
-        AssistantPrimaryAction.ASK -> actions.dictate
+        AssistantPrimaryAction.TALK -> if (voice.missingSpeechServices) onMissingSpeech else actions.conversationMode
+        AssistantPrimaryAction.ASK -> if (voice.missingSpeechServices) onMissingSpeech else actions.dictate
     }
     CompactEdgeButton(onClick = action, enabled = control.enabled, contentDescription = control.action.description) {
         when (control.action) {
@@ -614,10 +644,10 @@ internal fun assistantPrimaryControl(state: AssistantState, voice: AssistantVoic
     voice.active -> AssistantPrimaryControl(AssistantPrimaryAction.STOP, true)
     voice.launchConfirmationRequired -> AssistantPrimaryControl(
         if (voice.entryMode == AssistantVoiceEntryMode.TALK) AssistantPrimaryAction.TALK else AssistantPrimaryAction.ASK,
-        state.foreground && state.branchChoices.isEmpty() && voice.admissionReady && voice.recognitionServiceAvailable)
+        state.foreground && state.branchChoices.isEmpty() && (voice.missingSpeechServices || (voice.admissionReady && voice.recognitionServiceAvailable)))
     state.draft.isNotBlank() -> AssistantPrimaryControl(AssistantPrimaryAction.SEND, assistantCanSend(state, voice))
     else -> AssistantPrimaryControl(if (conversationMode) AssistantPrimaryAction.TALK else AssistantPrimaryAction.ASK,
-        state.foreground && state.branchChoices.isEmpty() && voice.admissionReady && voice.recognitionServiceAvailable)
+        state.foreground && state.branchChoices.isEmpty() && (voice.missingSpeechServices || (voice.admissionReady && voice.recognitionServiceAvailable)))
 }
 
 internal fun assistantShowsLatest(state: AssistantState, voice: AssistantVoiceState, readingOlder: Boolean): Boolean =
