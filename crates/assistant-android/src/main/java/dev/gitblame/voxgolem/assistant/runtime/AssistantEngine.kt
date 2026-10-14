@@ -52,7 +52,7 @@ interface AssistantModelStorage {
 }
 
 object AssistantModels {
-    val aliases = listOf("custom-sol-high", "custom-sol-none", "custom-luna-none", "custom-luna-low", "local-fast", "agy-flash-low", "agy-flash-high", "agy-opus-high", "agy-sonnet-high")
+    val aliases = listOf("custom-sol-high", "custom-sol-none", "custom-luna-none", "custom-luna-low", "local-fast", "agy-flash-low", "agy-flash-high", "agy-opus-high", "agy-sonnet-high", "gemini-nano")
 }
 
 object AssistantSearchModes {

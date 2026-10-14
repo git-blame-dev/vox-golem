@@ -57,6 +57,8 @@ object PhoneSnapshotEncoder {
         val options = JSONArray()
         options.put(JSONObject().put("id", "local-fast").put("label", "Local: Llama 3.2 3B").put("available", true)
             .put("unavailable_reason", JSONObject.NULL))
+        options.put(JSONObject().put("id", "gemini-nano").put("label", "Local: Gemini Nano").put("available", true)
+            .put("unavailable_reason", JSONObject.NULL))
         options.put(JSONObject().put("id", "agy-flash-low").put("label", "Agy: Gemini 3.8 Flash Low").put("available", true)
             .put("unavailable_reason", JSONObject.NULL))
         options.put(JSONObject().put("id", "agy-flash-high").put("label", "Agy: Gemini 3.8 Flash High").put("available", true)

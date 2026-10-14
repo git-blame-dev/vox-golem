@@ -31,6 +31,8 @@ android {
 
 dependencies {
     api(project(":voice-android"))
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+    implementation("com.google.ai.edge.aicore:aicore:0.0.1-exp02")
     implementation("com.google.android.gms:play-services-wearable:19.0.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.robolectric:robolectric:4.14.1")
