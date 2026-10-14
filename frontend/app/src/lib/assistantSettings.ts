@@ -58,7 +58,7 @@ function options<T extends string>(labels: Record<T, string>, capabilities: Assi
     .filter((value) => isAndroid || value !== 'gemini-nano')
     .map((value) => {
     const provider = value.startsWith('local') || value === 'none' || value === 'gemini-nano' ? 'local' : value.startsWith('custom') ? 'custom' : value.startsWith('agy') ? 'agy' : 'openCode'
-    const available = value === 'local-fast' ? capabilities.localFast : value === 'local-quality' ? capabilities.localQuality : value === 'gemini-nano' ? false : provider === 'custom' ? capabilities.custom : provider === 'agy' ? true : capabilities.openCode
+    const available = value === 'local-fast' ? capabilities.localFast : value === 'local-quality' ? capabilities.localQuality : value === 'gemini-nano' ? isAndroid : provider === 'custom' ? capabilities.custom : provider === 'agy' ? true : capabilities.openCode
     const providerName = provider === 'agy' ? 'Agy' : provider === 'openCode' ? 'OpenCode' : provider === 'custom' ? 'Custom' : 'Local'
     const description = value === 'custom-sol-none' || value === 'custom-luna-none' ? 'Direct Custom connection; reasoning disabled' : value === 'gemini-nano' ? 'Pixel 8 on-device model' : value.startsWith('agy') ? 'Google Antigravity search' : value.startsWith('opencode') ? 'OpenCode search' : value.startsWith('custom') ? 'Custom reasoning-only' : undefined
     const featureUnavailable = labels === deepLabels ? !capabilities.deep : labels === reviewLabels ? !capabilities.review : false
