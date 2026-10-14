@@ -123,7 +123,9 @@ internal fun AssistantScreen(
     replyMetrics: (String?) -> Long? = { null },
 ) {
     var page by rememberSaveable { mutableStateOf(if (voice.missingSpeechServices && voice.entryMode != null) AssistantPage.MISSING_SPEECH else AssistantPage.CHAT) }
-    val chats = remember(state.viewJson) { assistantChats(state.viewJson) }
+    val view = remember(state.viewJson) { JSONObject(state.viewJson) }
+    val chats = remember(view) { assistantChats(view) }
+    val branchLabels = remember(view, state.branchChoices) { state.branchChoices.associateWith { assistantBranchLabel(view, it) } }
     val title = chats.firstOrNull { it.id.let(::assistantIdKey) == state.conversation?.let(::assistantIdKey) }?.title ?: "Assistant"
     val promptPresentation = remember { AssistantPromptPresentation() }
     val pendingPrompts = observedPrompts ?: promptPresentation.project(state, voice, history)
@@ -138,7 +140,7 @@ internal fun AssistantScreen(
             CompositionLocalProvider(LocalScreenIsActive provides (page == AssistantPage.CHAT && LocalScreenIsActive.current)) {
                 val repeatAfterReply = assistantRepeatsAfterReply(voice, preferences)
                 ChatScreen(state, voice, history, pendingPrompts, actions, repeatAfterReply, page == AssistantPage.CHAT,
-                    { page = AssistantPage.SETTINGS }, replyMetrics, onMissingSpeech = { page = AssistantPage.MISSING_SPEECH })
+                    { page = AssistantPage.SETTINGS }, replyMetrics, branchLabels, onMissingSpeech = { page = AssistantPage.MISSING_SPEECH })
             }
         }
         if (page != AssistantPage.CHAT) {
@@ -183,6 +185,7 @@ private fun ChatScreen(
     pendingPrompts: List<AssistantPendingPrompt>,
     actions: AssistantActions, conversationMode: Boolean, active: Boolean, settings: () -> Unit,
     replyMetrics: (String?) -> Long?,
+    branchLabels: Map<String, String>,
     onMissingSpeech: () -> Unit = {},
 ) {
     val list = rememberLazyListState()
@@ -269,7 +272,7 @@ private fun ChatScreen(
                 if (state.branchChoices.isNotEmpty()) {
                     item(key = "branches") { Text("Choose a continuation", color = MaterialTheme.colorScheme.primary) }
                     items(state.branchChoices, key = { "branch:${assistantIdKey(it)}" }) { id ->
-                        ActionButton(assistantBranchLabel(state.viewJson, id), !state.busy && !voice.active) { actions.selectHead(id) }
+                        ActionButton(branchLabels.getValue(id), !state.busy && !voice.active) { actions.selectHead(id) }
                     }
                 } else if (state.conversation != null && turns.isEmpty() && reply == null && visiblePrompts.isEmpty()) item(key = "empty") {
                     Text(if (history.error != null) "Conversation unavailable" else if (history.loading || !readyHistory) "Loading conversation…" else "No messages yet. Ask a question.")
@@ -910,15 +913,17 @@ internal class AssistantHistoryPresentation {
 }
 
 internal data class AssistantChat(val id: String, val title: String)
-internal fun assistantChats(view: String): List<AssistantChat> {
-    val conversations = JSONObject(view).getJSONArray("conversations")
+internal fun assistantChats(view: String): List<AssistantChat> = assistantChats(JSONObject(view))
+private fun assistantChats(view: JSONObject): List<AssistantChat> {
+    val conversations = view.getJSONArray("conversations")
     return (0 until conversations.length()).map { conversations.getJSONObject(it) }
         .filter { !it.optBoolean("deleted") && !it.isNull("title") }
         .map { AssistantChat(it.getJSONObject("id").toString(), it.getString("title")) }
 }
 
-internal fun assistantBranchLabel(view: String, id: String): String {
-    val records = JSONObject(view).getJSONArray("records")
+internal fun assistantBranchLabel(view: String, id: String): String = assistantBranchLabel(JSONObject(view), id)
+private fun assistantBranchLabel(view: JSONObject, id: String): String {
+    val records = view.getJSONArray("records")
     val operation = (0 until records.length()).map { records.getJSONObject(it).getJSONObject("operation") }
         .firstOrNull { assistantIdKey(it.getJSONObject("id").toString()) == assistantIdKey(id) }
     val prompt = operation?.optJSONObject("body")?.optString("prompt").orEmpty().replace('\n', ' ').trim()

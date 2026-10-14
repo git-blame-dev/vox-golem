@@ -30,7 +30,8 @@ interface AssistantInputPeers : SourcePeerBinding, AutoCloseable {
     fun refresh()
 }
 
-internal data class InputPeerSelection(val local: String, val peer: String, val replica: String, val association: String, val peerRole: AssistantPeerRole)
+internal data class InputPeerSelection(val local: String, val peer: String, val replica: String, val association: String,
+    val peerRole: AssistantPeerRole, val approvalVersion: Long = 0)
 internal interface InputPeerNativeState {
     fun selected(): InputPeerSelection?
     fun stillApproved(selection: InputPeerSelection): Boolean
@@ -43,6 +44,8 @@ internal interface InputPeerSdk {
 internal class ApplicationInputPeerState(context: Context) : InputPeerNativeState {
     private val application = context.applicationContext
     override fun selected(): InputPeerSelection? {
+        if (!EnrolledPeerRegistry.approvalStable()) return null
+        val version = EnrolledPeerRegistry.approvalVersion()
         val setup = (application as? AssistantPeerSetupOwner)?.assistantPeerSetup ?: return null
         val selected = setup.state()
         if (selected.reason != PeerPairingReason.ENROLLED) return null
@@ -54,12 +57,13 @@ internal class ApplicationInputPeerState(context: Context) : InputPeerNativeStat
         if (local == peer) return null
         return EnrolledPeerRegistry(application).use { registry ->
             val binding = registry.bindingFor(peer, replica) ?: return@use null
-            if (replica !in registry.replicas() || binding.association != association) null
+            if (replica !in registry.replicas() || binding.association != association || version != EnrolledPeerRegistry.approvalVersion() || !EnrolledPeerRegistry.approvalStable()) null
             else InputPeerSelection(local, peer, replica, association,
-                if (setup.role == AssistantPeerRole.PHONE) AssistantPeerRole.WATCH else AssistantPeerRole.PHONE)
+                if (setup.role == AssistantPeerRole.PHONE) AssistantPeerRole.WATCH else AssistantPeerRole.PHONE, version)
         }
     }
-    override fun stillApproved(selection: InputPeerSelection) = selected() == selection
+    override fun stillApproved(selection: InputPeerSelection) = EnrolledPeerRegistry.approvalStable() &&
+        selection.approvalVersion == EnrolledPeerRegistry.approvalVersion()
 }
 
 private class AndroidInputPeerSdk(context: Context) : InputPeerSdk {
@@ -90,6 +94,8 @@ class ApplicationAssistantInputPeers internal constructor(
     private var pending: Future<*>? = null
     private var snapshot: Snapshot? = null
     init { requireInputMain() }
+    internal fun resolutionPending(): Boolean { requireInputMain(); return inFlight }
+    internal fun resolutionBarrier(): Future<*> = worker.submit { }
 
     override fun selected(): AssistantInputPeerRoute? {
         requireInputMain()

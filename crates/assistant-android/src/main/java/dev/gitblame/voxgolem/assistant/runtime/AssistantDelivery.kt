@@ -40,6 +40,7 @@ class AcknowledgedAssistantDelivery(
     private val enqueue: (AssistantDeliveryPacket) -> Unit,
     private val maxInFlight: Int = 64,
     private val timeoutMillis: Long = 5000,
+    private val onBlocked: () -> Unit = {},
 ) : AssistantDeliveryGate {
     private val lock = Object()
     private var providerId: String? = null
@@ -104,6 +105,7 @@ class AcknowledgedAssistantDelivery(
         while (!failed && !condition()) {
             val remaining = deadline - System.nanoTime()
             if (remaining <= 0) { failed = true; break }
+            onBlocked()
             try { lock.wait((remaining / 1_000_000).coerceAtLeast(1)) } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt(); failed = true
             }

@@ -171,6 +171,12 @@ class GmsAssistantInputTransport internal constructor(
         }, "assistant-input-send").apply { isDaemon = true; start() }
     }
     override fun audio(pcm: ByteArray): Boolean = queue?.offer(pcm) ?: false
+    internal fun awaitAudioIoRetired(timeoutMs: Long): Boolean {
+        require(timeoutMs in 1..5000)
+        val worker = io ?: return true
+        worker.join(timeoutMs)
+        return !worker.isAlive
+    }
     override fun finishAudio() { requireInputMain(); queue?.finish() }
     override fun cancelAudio() {
         requireInputMain(); generation.incrementAndGet(); queue?.cancel(); queue = null

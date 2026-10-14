@@ -38,9 +38,15 @@ class PhoneCaptureRuntimeServiceTest {
 
     @After
     fun tearDown() {
-        controller?.destroy()
-        controller = null
-        preferences.edit().clear().commit()
+        try { controller?.destroy() }
+        finally {
+            controller = null
+            try { PhoneCaptureCoordinator.shared(context).shutdownForTests() }
+            finally {
+                PhoneCaptureCoordinator.resetSharedForTests()
+                preferences.edit().clear().commit()
+            }
+        }
         assertFalse(PhoneCaptureRuntimeService.isForegroundReady())
     }
 

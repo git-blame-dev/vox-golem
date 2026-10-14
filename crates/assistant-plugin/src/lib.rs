@@ -92,6 +92,51 @@ impl<T> InputRoutes<T> {
         self.pending = None;
         self.current = None;
     }
+
+    fn stop(&mut self, session_id: Option<&str>) {
+        let Some(session_id) = session_id else {
+            self.clear();
+            return;
+        };
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|(id, _)| id == session_id)
+        {
+            self.current = None;
+        }
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|(_, id, _)| id == session_id)
+        {
+            self.pending = None;
+        }
+    }
+}
+
+fn voice_stop_session(arguments: &Value) -> Result<Option<&str>, StructuredPluginInvokeError> {
+    if arguments.is_object() {
+        match arguments.get("sessionId") {
+            None => return Ok(None),
+            Some(Value::String(id)) if !id.trim().is_empty() && id.len() <= 128 => {
+                return Ok(Some(id))
+            }
+            _ => {}
+        }
+    }
+    Err(StructuredPluginInvokeError::bounded(
+        Some("invalid_input"),
+        Some("Voice session ID is invalid"),
+    ))
+}
+
+/// Preserve omission vs explicit null at the command boundary; Option<String> would conflate them.
+pub fn voice_stop_arguments(arguments: &Value) -> Result<Value, StructuredPluginInvokeError> {
+    Ok(match voice_stop_session(arguments)? {
+        None => serde_json::json!({}),
+        Some(id) => serde_json::json!({"sessionId": id}),
+    })
 }
 
 #[cfg(target_os = "android")]
@@ -190,24 +235,30 @@ mod android {
                 InvokeResponseBody::Json(raw) => serde_json::from_str(&raw).unwrap_or(Value::Null),
                 InvokeResponseBody::Raw(_) => Value::Null,
             };
-            let failed = input_forwarding.lock().ok().is_some_and(|mut sink| {
+            let failed = input_forwarding.lock().ok().and_then(|mut sink| {
                 let Some(session_id) = payload.get("sessionId").and_then(Value::as_str) else {
-                    return false;
+                    return None;
                 };
                 let Some(updates) = sink.get(session_id) else {
-                    return false;
+                    return None;
                 };
+                let session_id = session_id.to_owned();
                 if updates.send(payload).is_ok() {
-                    false
+                    None
                 } else {
-                    sink.clear();
-                    true
+                    sink.stop(Some(&session_id));
+                    Some(session_id)
                 }
             });
-            if failed {
+            if let Some(session_id) = failed {
                 let app = input_app.clone();
                 let _ = tauri::async_runtime::spawn(async move {
-                    let _ = forward(app, "stop_assistant_voice", serde_json::json!({})).await;
+                    let _ = forward(
+                        app,
+                        "stop_assistant_voice",
+                        serde_json::json!({"sessionId": session_id}),
+                    )
+                    .await;
                 });
             }
             Ok(())
@@ -227,8 +278,9 @@ mod android {
         arguments: Value,
     ) -> Result<Value, StructuredPluginInvokeError> {
         if command == "stop_assistant_voice" {
+            let session_id = voice_stop_session(&arguments)?;
             if let Ok(mut sink) = app.state::<Bridge<R>>().input_sink.lock() {
-                sink.clear();
+                sink.stop(session_id);
             }
         }
         app.state::<Bridge<R>>()
@@ -503,6 +555,63 @@ pub fn init<R: Runtime>() -> tauri::plugin::TauriPlugin<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_voice_stop_preserves_identity_and_rejects_supplied_null_or_malformed_ids() {
+        assert_eq!(
+            voice_stop_arguments(&serde_json::json!({})).unwrap(),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            voice_stop_arguments(&serde_json::json!({"sessionId":"synthetic-session"})).unwrap(),
+            serde_json::json!({"sessionId":"synthetic-session"})
+        );
+        let boundary = serde_json::json!({"sessionId": "é".repeat(64)});
+        assert_eq!(voice_stop_arguments(&boundary).unwrap(), boundary);
+        for id in [
+            Value::Null,
+            serde_json::json!(7),
+            serde_json::json!(""),
+            serde_json::json!(" "),
+            serde_json::json!("é".repeat(65)),
+        ] {
+            let error = voice_stop_arguments(&serde_json::json!({"sessionId":id})).unwrap_err();
+            assert_eq!(error.code, "invalid_input");
+            assert_eq!(error.message, "Voice session ID is invalid");
+        }
+    }
+
+    #[test]
+    fn stale_scoped_stop_and_failed_old_sink_cannot_clear_a_new_voice_route() {
+        let mut routes = InputRoutes::<String>::default();
+        let old = routes
+            .begin("synthetic-old".into(), "old-sink".into())
+            .unwrap();
+        routes.complete(old, true);
+        let newer = routes
+            .begin("synthetic-new".into(), "new-sink".into())
+            .unwrap();
+        routes.stop(Some("synthetic-old"));
+        assert!(routes.get("synthetic-old").is_none());
+        assert_eq!(
+            routes.get("synthetic-new").map(String::as_str),
+            Some("new-sink")
+        );
+        routes.complete(newer, true);
+        routes.stop(Some("synthetic-old"));
+        assert_eq!(
+            routes.get("synthetic-new").map(String::as_str),
+            Some("new-sink")
+        );
+        routes.stop(Some("synthetic-new"));
+        assert!(routes.get("synthetic-new").is_none());
+        let pending = routes
+            .begin("synthetic-pending".into(), "pending-sink".into())
+            .unwrap();
+        routes.stop(Some("synthetic-pending"));
+        routes.complete(pending, true);
+        assert!(routes.get("synthetic-pending").is_none());
+    }
 
     #[test]
     fn native_codes_survive_without_display_formatting() {

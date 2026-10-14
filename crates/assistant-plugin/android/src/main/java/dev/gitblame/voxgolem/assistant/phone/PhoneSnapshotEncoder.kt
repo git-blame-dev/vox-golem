@@ -9,6 +9,7 @@ object PhoneSnapshotEncoder {
     fun encode(state: AssistantState, selectedContext: JSONObject?, preferences: JSONObject,
         clientRequestIds: Map<String, String>, activeRequest: JSONObject? = null,
         providerAvailable: Boolean = false, providerReason: String = "Access credential status is unavailable",
+        optionalProviders: Map<String, dev.gitblame.voxgolem.assistant.runtime.OptionalProviderReadiness> = emptyMap(),
     ): JSONObject {
         val view = JSONObject(state.viewJson)
         val turns = selectedContext?.getJSONArray("turns") ?: JSONArray()
@@ -50,22 +51,20 @@ object PhoneSnapshotEncoder {
             "vad" to "Voice activity detection is unavailable on Android", "parakeet" to "Desktop transcription is unavailable on Android",
             "tts" to "Text to speech is unavailable on Android", "deep" to "Deep execution is disabled on Android", "review" to "Review execution is disabled on Android",
         )) {
-            val available = (id == "custom_provider" && providerAvailable) || (id == "local_fast")
+            val localReady = optionalProviders["local-fast"]?.available == true
+            val available = (id == "custom_provider" && providerAvailable) || (id == "local_fast" && localReady)
             capabilities.put(JSONObject().put("id", id).put("state", if (available) "available" else "unavailable")
-                .put("reason", if (available) "ready" else reason).put("actual_provider", if (id == "custom_provider" && available) "custom_openai" else if (id == "local_fast") "llama.cpp" else JSONObject.NULL))
+                .put("reason", if (available) "ready" else reason).put("actual_provider", if (id == "custom_provider" && available) "custom_openai" else if (id == "local_fast" && localReady) "llama.cpp" else JSONObject.NULL))
         }
         val options = JSONArray()
-        options.put(JSONObject().put("id", "local-fast").put("label", "Local: Llama 3.2 3B").put("available", true)
-            .put("unavailable_reason", JSONObject.NULL))
-        options.put(JSONObject().put("id", "agy-flash-low").put("label", "Agy: Gemini 3.8 Flash Low").put("available", true)
-            .put("unavailable_reason", JSONObject.NULL))
-        options.put(JSONObject().put("id", "agy-flash-high").put("label", "Agy: Gemini 3.8 Flash High").put("available", true)
-            .put("unavailable_reason", JSONObject.NULL))
-        options.put(JSONObject().put("id", "agy-opus-high").put("label", "Agy: Claude Opus 5.5 High").put("available", true)
-            .put("unavailable_reason", JSONObject.NULL))
-        options.put(JSONObject().put("id", "agy-sonnet-high").put("label", "Agy: Claude Sonnet 5.5 High").put("available", true)
-            .put("unavailable_reason", JSONObject.NULL))
-        for ((id, label) in mapOf("custom-sol-high" to "Sol High", "custom-sol-none" to "Sol None", "custom-luna-none" to "Luna None", "custom-luna-low" to "Luna Low")) {
+        for ((id, label) in dev.gitblame.voxgolem.assistant.runtime.AssistantModels.optionalLabels) {
+            val readiness = optionalProviders[id]
+            val policyAllowed = id == "local-fast" || state.webEnabled
+            val available = readiness?.available == true && policyAllowed
+            options.put(JSONObject().put("id", id).put("label", label).put("available", available)
+                .put("unavailable_reason", if (available) JSONObject.NULL else if (!policyAllowed) "Agy cannot enforce disabled web tools" else readiness?.reason ?: "Provider readiness is not published"))
+        }
+        for ((id, label) in dev.gitblame.voxgolem.assistant.runtime.AssistantModels.customLabels) {
             options.put(JSONObject().put("id", id).put("label", label).put("available", providerAvailable)
                 .put("unavailable_reason", if (providerAvailable) JSONObject.NULL else providerReason))
         }

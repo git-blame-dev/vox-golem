@@ -46,7 +46,7 @@ class EnginePhoneBackend internal constructor(
     fun saveOwnedSpeechDraft(text: String, conversation: String?, head: String?) {
         engine.setSpeechDraft(text, conversation, expectedHead = head, requireHeadOwner = true)
     }
-    fun stopAll() { delivery.get()?.cancel(); engine.stop() }
+    fun stopSpeechRequest(requestId: String) { cancelDelivery(requestId) }
 
     override fun command(name: String, arguments: JSONObject, reply: (Result<Any?>) -> Unit) {
         if (name == "cancel_prompt") {
@@ -172,7 +172,7 @@ class EnginePhoneBackend internal constructor(
             }
         }
         val encoded = PhoneSnapshotEncoder.encode(state, selectedContext, preferencesFor(state), routing,
-            providerAvailable = ready, providerReason = reason)
+            providerAvailable = ready, providerReason = reason, optionalProviders = AssistantRuntime.optionalProviderReadiness())
         val speech = speechStatus
         if (speech?.optBoolean("ttsAvailable") == true) {
             val capabilities = encoded.getJSONArray("capabilities")
@@ -212,7 +212,7 @@ class EnginePhoneBackend internal constructor(
             if (selected.error != null) reply(Result.failure(providerFailure(selected.error)))
             else {
                 if (previousModel != null && selected.model == selectedModel && selected.model != previousModel) {
-                    prewarm(selected.model)
+                    runCatching { prewarm(selected.model) }
                 }
                 // A view listener failure must not misclassify already persisted settings.
                 runCatching { onPreferencesChanged?.invoke(value.getBoolean("tts_enabled")) }
@@ -313,7 +313,9 @@ class EnginePhoneBackend internal constructor(
 
         fun providerFailure(code: String?): AssistantPhoneFailure = when (code) {
             "busy" -> AssistantPhoneFailure("busy", "A request is already active")
-            "invalid_request", "empty_prompt", "prompt_too_large", "unsupported_search_mode" -> AssistantPhoneFailure("invalid_input", "Prompt, request ID or search mode is invalid")
+            "invalid_request", "empty_prompt", "prompt_too_large" -> AssistantPhoneFailure("invalid_input", "Prompt, request ID or search mode is invalid")
+            "unsupported_search_mode" -> AssistantPhoneFailure("unavailable", "Selected model cannot enforce this search or web policy. Choose another model or change the policy explicitly.")
+            "retirement_failed" -> AssistantPhoneFailure("unavailable", "Engine retirement exceeded its deadline. The draft is retained; retry explicitly.")
             "duplicate_request" -> AssistantPhoneFailure("invalid_input", "This request identity has already been used")
             "auth_expired" -> AssistantPhoneFailure("unavailable", "Provider access has expired. Update the app-private provider file externally, then retry explicitly.")
             "auth_unavailable" -> AssistantPhoneFailure("unavailable", "Provider access is missing or invalid. Supply the app-private provider file externally, then retry explicitly.")

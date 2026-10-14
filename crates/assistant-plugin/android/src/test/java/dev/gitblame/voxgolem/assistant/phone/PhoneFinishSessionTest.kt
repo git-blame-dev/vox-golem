@@ -1,6 +1,8 @@
 package dev.gitblame.voxgolem.assistant.phone
 
 import android.os.Looper
+import android.app.Activity
+import app.tauri.plugin.Invoke
 import android.os.Bundle
 import android.media.AudioManager
 import android.speech.tts.TextToSpeech
@@ -15,6 +17,7 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Robolectric
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
@@ -46,7 +49,8 @@ class PhoneFinishSessionTest {
         }
         fun publishHead(value: String?) { head = value; contextObservers.toList().forEach { it() } }
         override fun saveOwnedSpeechDraft(text: String, conversation: String?) { if (this.conversation == conversation) saveSpeechDraft(text) }
-        override fun stopAll() {}
+        val cancelledRequests = mutableListOf<String>()
+        override fun stopSpeechRequest(requestId: String) { cancelledRequests += requestId }
         override fun nativePreferences() = JSONObject().put("tts_enabled", ttsEnabled)
         override var speechStatus: JSONObject? = null
         override var onPreferencesChanged: ((Boolean) -> Unit)? = null
@@ -95,6 +99,15 @@ class PhoneFinishSessionTest {
         phone.start("synthetic-session", loop, "Synthetic retained draft", { events += JSONObject(it.toString()) }); drain()
     }
     private fun submits() = events.filter { it.getString("kind") == "submit" }
+    private fun stopCommand(plugin: AssistantPlugin, arguments: JSONObject): List<String> {
+        val replies = mutableListOf<String>()
+        val response: (Long, String) -> Unit = { _, data -> replies += data }
+        val mapper = Class.forName("com.fasterxml.jackson.databind.ObjectMapper").getDeclaredConstructor().newInstance()
+        val invoke = Invoke::class.java.declaredConstructors.single()
+            .newInstance(1L, "stop_assistant_voice", 1L, 2L, response, arguments.toString(), mapper) as Invoke
+        plugin.stop_assistant_voice(invoke)
+        return replies
+    }
 
     private fun enableTts(): PhoneCueTtsShadow {
         val context = RuntimeEnvironment.getApplication()
@@ -121,6 +134,78 @@ class PhoneFinishSessionTest {
         phone.foreground(true); drain()
     }
     @After fun close() { phone.close(); drain(); AssistantRuntime.configureCaptureResourceAdmission(false) }
+
+    @Test fun nativeScopedStopCannotCancelANewerSessionSdkOrItsMintedGeneration() {
+        val activity = Robolectric.buildActivity(Activity::class.java).create().get()
+        val plugin = AssistantPlugin(activity, phone)
+        phone.start("synthetic-old-session", false, "", { events += JSONObject(it.toString()) }, completionPolicy = "single_turn"); drain()
+        phone.stop(); drain()
+        phone.start("synthetic-new-session", false, "", { events += JSONObject(it.toString()) }, completionPolicy = "single_turn"); drain()
+        val newerSdk = factory.sessions.last()
+        assertEquals(1, newerSdk.starts); assertFalse(newerSdk.destroyed)
+        val worker = java.util.concurrent.Executors.newSingleThreadExecutor()
+        try {
+            val queued = worker.submit<List<String>> { stopCommand(plugin, JSONObject().put("sessionId", "synthetic-old-session")) }
+                .get(2, java.util.concurrent.TimeUnit.SECONDS)
+            assertTrue("Native ownership must be checked on main, not the bridge worker", queued.isEmpty())
+            drain(); assertEquals(1, queued.size)
+        } finally {
+            worker.shutdownNow(); assertTrue(worker.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS))
+        }
+        assertEquals(1, stopCommand(plugin, JSONObject().put("sessionId", "synthetic-old-session")).size)
+        drain()
+        assertTrue(phone.ownsSession("synthetic-new-session"))
+        assertFalse(newerSdk.destroyed); assertFalse(newerSdk.cancelled)
+        newerSdk.events.final("Synthetic newer question"); drain()
+        val requestId = submits().single().getString("requestId")
+        phone.onRequestSubmitted(requestId)
+        stopCommand(plugin, JSONObject().put("sessionId", "synthetic-old-session")); drain()
+        assertTrue(backend.cancelledRequests.isEmpty())
+        assertFalse(stopCommand(plugin, JSONObject().put("sessionId", "é".repeat(64))).single().contains("invalid_input"))
+        for (identity in listOf(JSONObject.NULL, 7, "", " ", "é".repeat(65))) {
+            val rejected = stopCommand(plugin, JSONObject().put("sessionId", identity))
+            assertTrue(rejected.single().contains("invalid_input"))
+            assertTrue(rejected.single().contains("Voice session ID is invalid"))
+            assertTrue(phone.ownsSession("synthetic-new-session"))
+            assertTrue(backend.cancelledRequests.isEmpty())
+        }
+        stopCommand(plugin, JSONObject().put("sessionId", "synthetic-new-session")); drain()
+        assertEquals(listOf(requestId), backend.cancelledRequests)
+        assertFalse(phone.ownsSession("synthetic-new-session"))
+        phone.onRequestSubmitted("synthetic-unrelated-typed-request")
+        stopCommand(plugin, JSONObject()); drain()
+        assertEquals(listOf(requestId), backend.cancelledRequests)
+        activity.finish()
+    }
+
+    @Test fun idleObserverStopNeverCancelsAnUnrelatedTypedReplyButOwnedVoiceStopDoes() {
+        phone.onRequestSubmitted("synthetic-typed-request")
+        phone.stop(); drain()
+        assertTrue(backend.cancelledRequests.isEmpty())
+        phone.start("synthetic-owned-ask", false, "", { events += JSONObject(it.toString()) }, completionPolicy = "single_turn"); drain()
+        factory.sessions.single().events.final("Synthetic voice question"); drain()
+        val requestId = submits().single().getString("requestId")
+        phone.onRequestSubmitted(requestId)
+        phone.stop(); drain()
+        assertEquals(listOf(requestId), backend.cancelledRequests)
+        phone.stop(); drain()
+        assertEquals(listOf(requestId), backend.cancelledRequests)
+    }
+
+    @Test fun lockedWindowRetainsGenerationButDisallowsNewSpeechAndLateReplyCannotRestart() {
+        start(true)
+        factory.sessions.single().events.final("Synthetic voice question"); drain()
+        val requestId = submits().single().getString("requestId")
+        val ticket = phone.onRequestSubmitted(requestId)
+        phone.foreground(false, retainGeneration = true); drain()
+        assertTrue(backend.cancelledRequests.isEmpty())
+        assertThrows(AssistantPhoneFailure::class.java) { phone.start("synthetic-hidden", false, "", {}) }
+        phone.onRequestResult(requestId, answer(), ticket); drain()
+        phone.foreground(true); drain()
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
+        assertEquals(1, factory.sessions.size)
+        assertTrue(backend.cancelledRequests.isEmpty())
+    }
 
     @Test fun recordedAskPublishesOnlyTheFinalArtifactReferenceAndKeepsDraftOwnership() {
         factory.archiveExpected = true

@@ -20,7 +20,7 @@ class StopSendNewPolicy(private val maximumSegments: Int = 32) {
         if (terminal) return Action.None
         if (phase == "final" && this.phase == "final") return Action.None
         this.phase = phase
-        if (draft.toByteArray(Charsets.UTF_8).size > 32 * 1024) return review("Dictation exceeded the draft limit; review before sending")
+        if (!dev.gitblame.voxgolem.assistant.AssistantDraftBudget.accepts(draft)) return review("Dictation exceeded the draft limit; review before sending")
         latest = draft
         if (phase == "error") {
             return review(error ?: "Recognition failed; review before sending")

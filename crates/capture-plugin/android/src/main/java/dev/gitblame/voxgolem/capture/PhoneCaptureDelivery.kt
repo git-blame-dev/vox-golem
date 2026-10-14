@@ -65,7 +65,7 @@ internal class PhoneCaptureDelivery(
     }
 
     fun sendTranscript(captureId: String, sessionId: String, nodeId: String, transcript: Transcript,
-                       timing: CaptureTiming, text: String, final: Boolean, revision: Long) {
+                       timing: CaptureTiming, text: String, final: Boolean, revision: Long, transcriptVersion: Long) {
         if (!repository.isPhoneOrigin(captureId, nodeId) || repository.get(captureId)?.purpose != CapturePurpose.NOTE) return
         val path = if (final) CaptureWire.FINAL else CaptureWire.PARTIAL
         val body = JSONObject()
@@ -73,14 +73,16 @@ internal class PhoneCaptureDelivery(
             .put("captureId", captureId)
             .put("sessionId", sessionId)
             .put("revision", revision)
-            .put("transcriptVersion", repository.get(captureId)?.transcriptVersion ?: 0)
+            .put("transcriptVersion", transcriptVersion)
             .put("fullText", text)
             .toString()
         val bytes = body.toByteArray(StandardCharsets.UTF_8)
         if (CaptureProtocol.validatePayloadSize(bytes.size)) {
             if (text.isNotBlank()) transcript.deliverableRevision = revision
             enqueueMessage(nodeId, path, bytes, timing.takeIf { text.isNotBlank() }) {
-                repository.isPhoneOrigin(captureId, nodeId) && (final || revision >= transcript.deliverableRevision)
+                repository.isPhoneOrigin(captureId, nodeId) && repository.get(captureId)?.let {
+                    it.recognitionSessionId == sessionId && it.transcriptVersion == transcriptVersion
+                } == true && (final || revision >= transcript.deliverableRevision)
             }
         } else {
             repository.update(captureId) { current ->
@@ -106,19 +108,24 @@ internal class PhoneCaptureDelivery(
             .apply { if (destinationId != null) put("destinationId", destinationId) }
             .toString().toByteArray(StandardCharsets.UTF_8)
         if (CaptureProtocol.validatePayloadSize(bytes.size)) enqueueMessage(nodeId, CaptureWire.RECEIPT, bytes) {
-            repository.isPhoneOrigin(record.captureId, nodeId)
+            receiptIsCurrent(nodeId, record)
         }
         else if (CaptureProtocol.validatePayloadSize(bytes.size, channelResult = true)) {
             runCatching { delivery.execute {
-                if (repository.isPhoneOrigin(record.captureId, nodeId)) runCatching { sendOversizedReceipt(nodeId, record.captureId, bytes) }
+                if (receiptIsCurrent(nodeId, record)) runCatching { sendOversizedReceipt(nodeId, record.captureId, bytes) }
             } }
         } else {
             val error = JSONObject().put("protocol", CaptureWire.PROTOCOL).put("captureId", record.captureId)
                 .put("archiveHash", record.sha256).put("stage", stage).put("recognitionState", "FAILED")
                 .put("errorCode", "final-transcript-exceeds-result-limit").toString().toByteArray(StandardCharsets.UTF_8)
-            enqueueMessage(nodeId, CaptureWire.RECEIPT, error)
+            enqueueMessage(nodeId, CaptureWire.RECEIPT, error) { receiptIsCurrent(nodeId, record) }
         }
     }
+
+    private fun receiptIsCurrent(nodeId: String, record: CaptureRecord): Boolean =
+        repository.isPhoneOrigin(record.captureId, nodeId) && repository.get(record.captureId)?.let {
+            it.transcriptVersion == record.transcriptVersion && it.recognitionState == record.recognitionState && it.finalText == record.finalText
+        } == true
 
     private fun enqueueMessage(nodeId: String, path: String, bytes: ByteArray, timing: CaptureTiming? = null,
                                isCurrent: () -> Boolean = { true }) {

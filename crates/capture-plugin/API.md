@@ -179,6 +179,25 @@ postimage hash; acknowledgment is metadata-only. Unwritten preimages and unsafe
 or unknown outcomes remain held. Already-exported corrections do not rewrite or
 duplicate the exported entry; interrupted audio requires explicit finalization.
 
+### Manual transcript correction
+
+`plugin:capture|update_transcript` accepts `captureId`, `text`, and optional
+`expectedVersion`. The current editor must supply the `transcriptVersion` of the
+record selected as its edit baseline. Supplied versions must be nonnegative JSON
+integers in the native signed 64-bit range; strings, fractions, booleans, explicit
+null, and out-of-range numbers are rejected, not coerced.
+
+The repository compares `expectedVersion` inside the same transaction that commits
+the correction. A mismatch rejects with the fixed `transcript-conflict` error:
+text, version, export state, and active recognition ownership remain unchanged.
+A successful correction increments the version and fences older ASR callbacks
+before retiring the exact recognition owner. Exported entries are not rewritten.
+
+Legacy callers may omit `expectedVersion`; those edits remain authoritative over
+older ASR, but do **not** protect against another manual edit made after the caller
+read its baseline. New editor callers must not omit the version or automatically
+retry a conflict with a freshly read version.
+
 ## Verification boundary
 
 The phone library retains core-library desugaring for Java time at minSdk24.

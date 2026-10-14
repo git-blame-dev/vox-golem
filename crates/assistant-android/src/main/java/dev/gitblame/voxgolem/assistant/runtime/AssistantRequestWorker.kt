@@ -19,11 +19,13 @@ class AssistantRequestWorker(
 ) : AutoCloseable {
     private class Request(val id: String) {
         var cancelled = false
-        var nativeReady = false
+        var cancellationRegistered = false
         var deliveredBytes = 0L
         var deliveredStatuses = 0
         var firstTextMeasured = false
         var dispatchMeasured = false
+        var returned = false
+        var retired = false
     }
 
     private val lock = Any()
@@ -50,33 +52,33 @@ class AssistantRequestWorker(
                     timing?.mark(Stage.WORKER_STARTED)
                     val callback = object : ProviderDeltaCallback {
                         override fun onRequestDispatched() = synchronized(lock) {
-                            if (active !== request || request.cancelled || request.dispatchMeasured) return@synchronized
+                            if (active !== request || request.returned || request.cancelled || request.dispatchMeasured) return@synchronized
                             request.dispatchMeasured = true
                             // Android elapsed-realtime receipt, not the Rust dispatch instant or network headers.
                             timing?.mark(Stage.REQUEST_DISPATCHED)
                         }
                         override fun onFirstText(milliseconds: Long) = synchronized(lock) {
-                            if (active !== request || request.cancelled || request.firstTextMeasured) return@synchronized
+                            if (active !== request || request.returned || request.cancelled || request.firstTextMeasured) return@synchronized
                             check(milliseconds in 0..86_400_000) { "Invalid provider first-text duration" }
                             request.firstTextMeasured = true
                             listener.onFirstText(request.id, milliseconds)
                         }
                         override fun onReady() = synchronized(lock) {
-                            if (active !== request) return@synchronized
-                            request.nativeReady = true
+                            if (active !== request || request.returned) return@synchronized
+                            request.cancellationRegistered = true
                             timing?.mark(Stage.NATIVE_READY)
                             if (request.cancelled) native.cancel(request.id)
                         }
 
                         override fun onDelta(text: String) = synchronized(lock) {
-                            if (active !== request || request.cancelled) return@synchronized
+                            if (active !== request || request.returned || request.cancelled) return@synchronized
                             request.deliveredBytes += text.toByteArray(Charsets.UTF_8).size
                             check(request.deliveredBytes <= 256 * 1024) { "Native output exceeds callback budget" }
                             listener.onDelta(request.id, text)
                         }
 
                         override fun onStatus(status: String) = synchronized(lock) {
-                            if (active !== request || request.cancelled) return@synchronized
+                            if (active !== request || request.returned || request.cancelled) return@synchronized
                             check(status in AssistantSearchModes.statuses) { "Invalid native tool status" }
                             check(++request.deliveredStatuses <= AssistantSearchModes.MAX_STATUS_EVENTS) { "Native status exceeds callback budget" }
                             listener.onStatus(request.id, status)
@@ -87,11 +89,20 @@ class AssistantRequestWorker(
                     } catch (_: RuntimeException) {
                         """{"status":"error","code":"internal_error"}"""
                     }
-                    val deliverOutcome = synchronized(lock) { active === request && !request.cancelled }
+                    val deliverOutcome = synchronized(lock) { request.returned = true; active === request && !request.cancelled }
                     if (deliverOutcome) listener.onOutcome(request.id, outcome)
                 } finally {
-                    synchronized(lock) { if (active === request) active = null }
-                    listener.onRetired(request.id)
+                    synchronized(lock) { request.returned = true }
+                    native.whenRetired(request.id) {
+                        val first = synchronized(lock) {
+                            if (request.retired) false else {
+                                request.retired = true
+                                if (active === request) active = null
+                                true
+                            }
+                        }
+                        if (first) listener.onRetired(request.id)
+                    }
                 }
             }
         } catch (error: RuntimeException) {
@@ -105,7 +116,7 @@ class AssistantRequestWorker(
         active?.let { request ->
             if (!request.cancelled) {
                 request.cancelled = true
-                if (request.nativeReady) native.cancel(request.id)
+                if (request.cancellationRegistered) native.cancel(request.id)
             }
         }
     }

@@ -349,10 +349,12 @@ class AndroidLocalRecognizerFactoryTest {
     @Test fun suppliedConstructionRejectsWorkerCallsBeforeSdkAllocation() {
         registerGoogle(); ShadowSpeechRecognizer.setIsOnDeviceRecognitionAvailable(false)
         val factory = AndroidLocalRecognizerFactory(RuntimeEnvironment.getApplication())
-        var failure: Throwable? = null
-        Thread { try { factory.createSuppliedRecognizer(true) } catch (error: Throwable) { failure = error } }
-            .apply { start(); join() }
-        assertTrue(failure is IllegalStateException)
+        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        try {
+            val failure = executor.submit<Throwable?> { runCatching { factory.createSuppliedRecognizer(true) }.exceptionOrNull() }
+                .get(2, java.util.concurrent.TimeUnit.SECONDS)
+            assertTrue(failure is IllegalStateException)
+        } finally { executor.shutdownNow(); assertTrue(executor.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS)) }
         assertNull(ShadowSpeechRecognizer.getLatestSpeechRecognizer())
     }
     @Test fun disablingFallbackRejectsOrdinaryProviderEvenWithInstalledLanguageMetadata() {

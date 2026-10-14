@@ -16,8 +16,10 @@ class CaptureListenerService : WearableListenerService() {
     override fun onChannelOpened(channel: ChannelClient.Channel) =
         CaptureChannelReceiver.shared(applicationContext).onChannelOpened(channel)
 
-    override fun onChannelClosed(channel: ChannelClient.Channel, closeReason: Int, appSpecificErrorCode: Int) =
+    override fun onChannelClosed(channel: ChannelClient.Channel, closeReason: Int, appSpecificErrorCode: Int) {
         PhoneReceiptChannelSender.confirmNativeRetired(channel)
+        CaptureChannelReceiver.confirmNativeRetired(channel)
+    }
 
     companion object {
         const val ACTION_STATE = "dev.gitblame.voxgolem.capture.STATE"
