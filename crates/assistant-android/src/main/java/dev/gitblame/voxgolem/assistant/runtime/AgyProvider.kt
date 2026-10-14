@@ -15,9 +15,15 @@ import java.util.concurrent.atomic.AtomicBoolean
 class AgyProviderRouter(
     private val context: Context,
     private val defaultNative: ProviderNativeCalls = AssistantProviderNative,
-    private val agyNative: ProviderNativeCalls = AgyProviderNative(context)
+    private val agyNative: ProviderNativeCalls = AgyProviderNative(context),
+    private val geminiNanoNative: ProviderNativeCalls = GeminiNanoProvider(context)
 ) : ProviderNativeCalls {
     fun prewarm(model: String) {
+        if (model == GeminiNanoProvider.MODEL_NAME) {
+            (geminiNanoNative as? GeminiNanoProvider)?.prewarm()
+            (agyNative as? AgyProviderNative)?.prewarm(model, false)
+            return
+        }
         val eligible = model.startsWith("agy-") || model.startsWith("claude-") || model.startsWith("gemini-") || model.startsWith("opus") || model.startsWith("sonnet") || model.startsWith("3.8-")
         // Every accepted selection invalidates older work, including selections routed elsewhere.
         (agyNative as? AgyProviderNative)?.prewarm(model, eligible)
@@ -27,7 +33,9 @@ class AgyProviderRouter(
         val model = try {
             JSONObject(requestJson).optString("model")
         } catch (_: Exception) { "" }
-        return if (model.startsWith("agy-") || model.startsWith("claude-") || model.startsWith("gemini-") || model.startsWith("opus") || model.startsWith("sonnet") || model.startsWith("3.8-")) {
+        return if (model == GeminiNanoProvider.MODEL_NAME) {
+            geminiNanoNative.respond(requestId, authPath, requestJson, callback)
+        } else if (model.startsWith("agy-") || model.startsWith("claude-") || model.startsWith("gemini-") || model.startsWith("opus") || model.startsWith("sonnet") || model.startsWith("3.8-")) {
             agyNative.respond(requestId, authPath, requestJson, callback)
         } else {
             defaultNative.respond(requestId, authPath, requestJson, callback)
@@ -35,6 +43,7 @@ class AgyProviderRouter(
     }
 
     override fun cancel(requestId: String) {
+        geminiNanoNative.cancel(requestId)
         agyNative.cancel(requestId)
         defaultNative.cancel(requestId)
     }

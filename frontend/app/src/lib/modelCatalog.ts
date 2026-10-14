@@ -2,6 +2,7 @@
 export const MODEL_CATALOG = [
   { id: 'local-fast', label: 'Local: Llama 3.2 3B', agent: false, preview: true },
   { id: 'local-quality', label: 'Local: Quality', agent: false, preview: false },
+  { id: 'gemini-nano', label: 'Local: Gemini Nano', agent: false, preview: false },
   { id: 'custom-sol-high', label: 'Custom: GPT-6.1 Sol High', agent: true, preview: false },
   { id: 'custom-sol-none', label: 'Custom: GPT-6.1 Sol No Reasoning', agent: false, preview: false },
   { id: 'custom-luna-none', label: 'Custom: GPT-6 Luna No Reasoning', agent: false, preview: false },
@@ -31,7 +32,8 @@ export function modelLabels(stage: 'instant' | 'deep' | 'review'): Record<string
 }
 
 export function browserModelOptions() {
-  return MODEL_CATALOG.map((model) => ({
+  const isAndroid = import.meta.env['VITE_VOXGOLEM_RUNTIME'] === 'android'
+  return MODEL_CATALOG.filter((model) => isAndroid || model.id !== 'gemini-nano').map((model) => ({
     id: model.id,
     label: model.preview ? `${model.label} (browser preview)` : model.label,
     available: model.preview,

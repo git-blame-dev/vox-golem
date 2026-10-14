@@ -67,7 +67,7 @@ class PhonePreferences(context: Context) {
             val defaults = defaults()
             if (value.keys().asSequence().toSet() != defaults.keys().asSequence().toSet()) invalid()
             val enums = mapOf(
-                "instant" to setOf("custom-sol-high", "custom-sol-none", "custom-luna-none", "custom-luna-low", "local-fast", "agy-flash-low", "agy-flash-high", "agy-opus-high", "agy-sonnet-high"),
+                "instant" to setOf("custom-sol-high", "custom-sol-none", "custom-luna-none", "custom-luna-low", "local-fast", "agy-flash-low", "agy-flash-high", "agy-opus-high", "agy-sonnet-high", "gemini-nano"),
                 "deep" to setOf("custom-sol-high", "custom-luna-low", "agy-flash-low", "agy-flash-high", "agy-opus-high", "agy-sonnet-high"),
                 "review" to setOf("custom-sol-high", "custom-luna-low", "agy-flash-low", "agy-flash-high", "agy-opus-high", "agy-sonnet-high"),
                 "response_profile" to setOf("fast", "quality"), "ui_theme" to setOf("light", "dark"),
