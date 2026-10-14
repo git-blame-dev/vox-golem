@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { JSX } from 'react'
 import { invokeTauriCommand } from '../lib/tauri'
+import { OwnedClipPlayback } from '../lib/ownedClipPlayback'
 
 interface Settings { enabled: boolean; directory: string }
 interface Clip { id: string; profile: string; model_file: string; model_revision: string; created_ms: number; confidence: number; label: 'unreviewed' | 'true_wake' | 'false_wake' }
@@ -32,6 +33,8 @@ export function WakeClipSettings(): JSX.Element {
   const [busy, setBusy] = useState(false)
   const mounted = useRef(true)
   const listRevision = useRef(0)
+  const lifetime = useRef(0)
+  const [playback] = useState(() => new OwnedClipPlayback())
 
   const refresh = useCallback(async (page: number): Promise<Clip[] | null> => {
     const revision = ++listRevision.current
@@ -51,15 +54,17 @@ export function WakeClipSettings(): JSX.Element {
   }, [])
   useEffect(() => {
     mounted.current = true
+    const epoch = ++lifetime.current
+    playback.activate()
     void invokeTauriCommand('get_wake_clip_settings').then((value) => {
-      if (!mounted.current) return
+      if (!mounted.current || epoch !== lifetime.current) return
       const next = parseSettings(value)
       setSettings(next)
       setDirectory(next.directory)
       void refresh(0)
-    }).catch((reason: unknown) => { if (mounted.current) setError(String(reason)) })
-    return () => { mounted.current = false }
-  }, [refresh])
+    }).catch((reason: unknown) => { if (mounted.current && epoch === lifetime.current) setError(String(reason)) })
+    return () => { mounted.current = false; lifetime.current += 1; listRevision.current += 1; playback.retire() }
+  }, [playback, refresh])
 
   const save = async (enabled: boolean, path: string): Promise<void> => {
     setBusy(true)
@@ -79,11 +84,7 @@ export function WakeClipSettings(): JSX.Element {
   }
 
   const play = async (clip: Clip): Promise<void> => {
-    try {
-      const url = await invokeTauriCommand('play_wake_clip', { profile: clip.profile, id: clip.id })
-      if (typeof url !== 'string' || !url.startsWith('data:audio/wav;base64,') || url.length > 200_000) throw new Error('Wake clip audio is invalid')
-      await new Audio(url).play()
-    } catch (reason) { if (mounted.current) setError(String(reason)) }
+    await playback.play(() => invokeTauriCommand('play_wake_clip', { profile: clip.profile, id: clip.id }), (reason) => setError(String(reason)))
   }
 
   const remove = async (clip: Clip): Promise<void> => {

@@ -1,6 +1,7 @@
 import type { JSX } from 'react'
 import type { TranscriptMessage } from '../types/chat'
 import { duration } from '../lib/duration'
+import { turnObservationAttributes } from '../turnObservation'
 
 interface ChatBubbleProps {
   readonly message: TranscriptMessage
@@ -9,7 +10,7 @@ interface ChatBubbleProps {
 export function ChatBubble({ message }: ChatBubbleProps): JSX.Element {
   const isAssistantWaiting = message.role === 'assistant' && message.content.length === 0
   return (
-    <article className={`message message--${message.role}`}>
+    <article className={`message message--${message.role}`} {...turnObservationAttributes(message)}>
       <p className="message__content">
         {isAssistantWaiting ? <span className="message__thinking">Thinking…</span> : message.content}
       </p>

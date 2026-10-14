@@ -38,7 +38,7 @@ async function setup(compact = false, initialStatus: Record<string, unknown> = {
   }
   container = document.createElement('div'); document.body.append(container); root = createRoot(container)
   await act(async () => { root?.render(<AndroidVoiceControls draft="" disabled={disabled} generationAvailable={generationAvailable} stopRef={stopRef} onDraft={onDraft} onSubmit={onSubmit} onActivity={vi.fn()} onInputCancelled={onInputCancelled} onSettled={vi.fn()} compact={compact} modelControl={compact ? <button aria-label="Model"><ControlIcon kind="model" /></button> : undefined} />) })
-  return { native, onDraft, onSubmit, onInputCancelled, stopRef, event: (value: Record<string, unknown>) => channel({ sessionId, ...value }) }
+  return { native, onDraft, onSubmit, onInputCancelled, stopRef, ownedSession: () => sessionId, event: (value: Record<string, unknown>) => channel({ sessionId, ...value }) }
 }
 
 function compactButton(label: string): HTMLButtonElement {
@@ -54,6 +54,38 @@ function expectIconOnlyRow() {
 }
 
 describe('compact Android voice icons', () => {
+  it.each([
+    { dictation: 'listening' }, { mode: 'loop', loop: 'generating' }, { ttsPhase: 'speaking' },
+  ])('explicitly stops observed native activity after WebView recreation: %j', async (status) => {
+    const state = await setup(true, status)
+    expect(state.ownedSession()).toBe('')
+    expect(compactButton('Stop voice').disabled).toBe(false)
+    await act(async () => { compactButton('Stop voice').click() })
+    expect(state.native).toHaveBeenCalledWith('stop_assistant_voice', undefined)
+    expect(state.native.mock.calls.filter(([name]) => name === 'stop_assistant_voice')).toHaveLength(1)
+    expect(state.native.mock.calls.some(([name]) => name === 'start_assistant_voice')).toBe(false)
+    expect(state.onInputCancelled).toHaveBeenCalledOnce()
+  })
+  it('does not cancel native work when an unowned observer is hidden or unmounted', async () => {
+    const state = await setup(true, { loop: 'generating' })
+    vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden')
+    await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
+    await act(async () => { root!.unmount(); root = null })
+    expect(state.native.mock.calls.filter(([name]) => name === 'stop_assistant_voice')).toHaveLength(0)
+    expect(state.onInputCancelled).not.toHaveBeenCalled()
+  })
+  it('retires only the admitted session on hide, once, and rejects its late final after unmount', async () => {
+    const state = await setup(true)
+    await act(async () => { compactButton('Ask').click() })
+    expect(state.ownedSession()).not.toBe('')
+    vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden')
+    await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
+    expect(state.native).toHaveBeenCalledWith('stop_assistant_voice', { sessionId: state.ownedSession() })
+    await act(async () => { root!.unmount(); root = null; state.event({ kind: 'submit', requestId: 'synthetic-retired-final', text: 'Synthetic late final' }) })
+    expect(state.native.mock.calls.filter(([name]) => name === 'stop_assistant_voice')).toHaveLength(1)
+    expect(state.onInputCancelled).toHaveBeenCalledOnce()
+    expect(state.onSubmit).not.toHaveBeenCalled()
+  })
   it('starts Ask in the owned current draft and uses square Stop cancellation, never Finish', async () => {
     const state = await setup(true)
     await act(async () => { compactButton('Ask').click() })
@@ -61,7 +93,7 @@ describe('compact Android voice icons', () => {
     expect(compactButton('Stop voice').querySelector('svg')?.getAttribute('data-icon-kind')).toBe('stop')
     expect(compactButton('Finish dictation')).toBeNull()
     await act(async () => { compactButton('Stop voice').click(); state.event({ kind: 'submit', requestId: 'synthetic-cancelled-final', text: 'Synthetic stale final' }) })
-    expect(state.native).toHaveBeenCalledWith('stop_assistant_voice', undefined)
+    expect(state.native).toHaveBeenCalledWith('stop_assistant_voice', expect.objectContaining({ sessionId: expect.any(String) }))
     expect(state.native.mock.calls.some(([name]) => name === 'finish_assistant_dictation')).toBe(false)
     expect(state.onSubmit).not.toHaveBeenCalled()
   })
@@ -100,7 +132,7 @@ describe('compact Android voice icons', () => {
     expect(state.onSubmit).not.toHaveBeenCalled()
     expectIconOnlyRow()
     await act(async () => { compactButton('Stop voice').click(); state.event({ kind: 'dictation', phase: 'final', draft: 'Synthetic stale draft' }) })
-    expect(state.native).toHaveBeenCalledWith('stop_assistant_voice', undefined)
+    expect(state.native).toHaveBeenCalledWith('stop_assistant_voice', expect.objectContaining({ sessionId: expect.any(String) }))
     expect(state.onInputCancelled).toHaveBeenCalledTimes(1)
     expect(state.onDraft).toHaveBeenCalledTimes(1)
   })
@@ -121,6 +153,7 @@ describe('compact Android voice icons', () => {
     expect(compactButton('Stop & send')).toBeNull()
     expect(compactButton('Stop voice').disabled).toBe(false)
     await act(async () => { compactButton('Stop voice').click() })
+    expect(state.native).toHaveBeenCalledWith('stop_assistant_voice', undefined)
     expect(state.native.mock.calls.some(([name]) => name === 'stop_send_new_voice_shortcut')).toBe(false)
     expect(state.onSubmit).not.toHaveBeenCalled()
   })
@@ -200,7 +233,7 @@ describe('compact Android voice icons', () => {
     expect(state.native).toHaveBeenCalledWith('start_assistant_voice', expect.objectContaining({ loopMode: true }))
     expect(compactButton('Stop voice').getAttribute('aria-pressed')).toBe('true')
     await act(async () => { compactButton('Stop voice').click() })
-    expect(state.native).toHaveBeenCalledWith('stop_assistant_voice', undefined)
+    expect(state.native).toHaveBeenCalledWith('stop_assistant_voice', expect.objectContaining({ sessionId: expect.any(String) }))
     expect(compactButton('Talk').getAttribute('aria-pressed')).toBe('false')
     expectIconOnlyRow()
   })
@@ -238,6 +271,36 @@ describe('compact Android voice icons', () => {
 })
 
 describe('Android native voice controls', () => {
+  it.each([
+    ['Ask', 'cancel-event'], ['Speak replies', 'cancel-event'],
+    ['Ask', 'cancel-button'], ['Speak replies', 'cancel-button'],
+  ])('opens a native modal from %s and restores its invoker on %s', async (label, dismissal) => {
+    // The DOM runner does not implement top-layer inertness or browser Tab navigation.
+    const showModal = vi.spyOn(HTMLDialogElement.prototype, 'showModal').mockImplementation(function (this: HTMLDialogElement) {
+      this.open = true
+      this.querySelector<HTMLElement>('[autofocus]')?.focus()
+    })
+    const close = vi.spyOn(HTMLDialogElement.prototype, 'close').mockImplementation(function (this: HTMLDialogElement) { this.open = false })
+    const state = await setup(true, { available: false, missingSpeechServices: true })
+    if (label === 'Speak replies') container!.querySelector('details')!.open = true
+    const invoker = compactButton(label)
+    invoker.focus()
+    await act(async () => { invoker.click() })
+    const dialog = container!.querySelector('dialog')!
+    expect(dialog).not.toBeNull()
+    expect(showModal).toHaveBeenCalledTimes(1)
+    expect(dialog.open).toBe(true)
+    expect(document.activeElement?.textContent).toBe('Cancel')
+    expect(document.getElementById(dialog.getAttribute('aria-labelledby')!)?.textContent).toBe('Speech Services Required')
+    await act(async () => {
+      if (dismissal === 'cancel-event') dialog.dispatchEvent(new Event('cancel', { cancelable: true }))
+      else Array.from(dialog.querySelectorAll('button')).find((button) => button.textContent === 'Cancel')!.click()
+    })
+    expect(container!.querySelector('dialog')).toBeNull()
+    expect(close).toHaveBeenCalledTimes(1)
+    expect(document.activeElement).toBe(invoker)
+    expect(state.native.mock.calls.some(([name]) => name === 'start_assistant_voice' || name === 'set_tts_enabled')).toBe(false)
+  })
   it('opens unverified shortcut navigation visibly but requires an app Ask tap before microphone admission', async () => {
     vi.useFakeTimers()
     let confirmation = true

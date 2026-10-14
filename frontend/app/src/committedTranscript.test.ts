@@ -10,6 +10,17 @@ function encoderTurn(sequence: number) {
 }
 
 describe('actual Android encoder-shaped transcript projection', () => {
+  it.each(['', ' \n'])('does not expose an empty canonical answer as successful text to runtime observers', (text) => {
+    const turn = encoderTurn(3)
+    const [user, answer] = projectCommittedTranscript([{ ...turn, answer: { ...turn.answer, content: { kind: 'text', text } } }])
+    expect(user?.observation?.requestId).toBe(turn.requestId)
+    expect(answer?.observation).toEqual({ requestId: turn.requestId, outcome: 'completed', stageStatus: 'completed', contentKind: 'error' })
+  })
+  it('retires hidden runtime transcript messages when canonical conversation context is replaced', () => {
+    const current = [{ id: 'system-transcript', role: 'system' as const, content: 'transcript:\nSynthetic private utterance' }]
+    expect(replaceCommittedTranscript(current, [encoderTurn(3)]).some(({ role }) => role === 'system')).toBe(false)
+    expect(replaceCommittedTranscript(current, [])).toEqual([])
+  })
   it('settles transient stages against the canonical final stage without replacing recorded terminal details', () => {
     expect(settleCanonicalAnswerStages([{ stage: 'instant', status: 'running' }, { stage: 'deep', status: 'queued' }, { stage: 'review', status: 'queued' }], 'deep')).toEqual([
       { stage: 'instant', status: 'completed' }, { stage: 'deep', status: 'completed' }, { stage: 'review', status: 'stale', detail: 'Not required for this answer' },

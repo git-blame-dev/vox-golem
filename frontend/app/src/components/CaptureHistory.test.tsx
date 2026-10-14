@@ -21,6 +21,7 @@ afterEach(() => {
   container?.remove()
   container = null
   vi.clearAllMocks()
+  vi.useRealTimers()
 })
 
 beforeEach(() => {
@@ -29,6 +30,99 @@ beforeEach(() => {
 })
 
 describe('CaptureHistory', () => {
+  it('preserves a correction rejected by the atomic native version fence and requires review', async () => {
+    const initial = { ...capture(), finalText: 'Synthetic initial', transcriptVersion: 2 }
+    captureMocks.loadCaptureSnapshot.mockResolvedValue({ available: true, notesFolderUri: null, captures: [initial], error: null })
+    await mount()
+    await act(async () => { container!.querySelector<HTMLButtonElement>('.capture-history__record')!.click() })
+    const editor = container!.querySelector<HTMLTextAreaElement>('textarea')!
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(editor, 'Synthetic preserved edit')
+      editor.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    captureMocks.updateCaptureTranscript.mockRejectedValueOnce(new Error('transcript-conflict'))
+    captureMocks.loadCaptureSnapshot.mockResolvedValue({ available: true, notesFolderUri: null, captures: [{ ...initial, transcriptVersion: 3, finalText: 'Synthetic concurrent final' }], error: null })
+    await act(async () => { Array.from(container!.querySelectorAll('button')).find((button) => button.textContent === 'Save correction')!.click() })
+    expect(captureMocks.updateCaptureTranscript).toHaveBeenCalledWith(initial.captureId, 'Synthetic preserved edit', 2)
+    expect(editor.value).toBe('Synthetic preserved edit')
+    expect(container!.textContent).toContain('Transcript changed while you were editing')
+    expect(container!.textContent).toContain('Synthetic concurrent final')
+    expect(Array.from(container!.querySelectorAll('button')).find((button) => button.textContent === 'Save correction')!.disabled).toBe(true)
+  })
+  it('refreshes an untouched correction but preserves a dirty draft and exposes a version conflict', async () => {
+    const initial = { ...capture(), finalText: 'Synthetic initial', transcriptVersion: 1 }
+    captureMocks.loadCaptureSnapshot.mockResolvedValue({ available: true, notesFolderUri: null, captures: [initial], error: null })
+    await mount()
+    await act(async () => { container!.querySelector<HTMLButtonElement>('.capture-history__record')!.click() })
+    const editor = container!.querySelector<HTMLTextAreaElement>('textarea')!
+    const refresh = () => Array.from(container!.querySelectorAll('button')).find((button) => button.textContent === 'Refresh')!.click()
+    captureMocks.loadCaptureSnapshot.mockResolvedValue({ available: true, notesFolderUri: null, captures: [{ ...initial, finalText: 'Synthetic native final', transcriptVersion: 2 }], error: null })
+    await act(async () => { refresh() })
+    expect(editor.value).toBe('Synthetic native final')
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(editor, 'Synthetic local correction')
+      editor.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    captureMocks.loadCaptureSnapshot.mockResolvedValue({ available: true, notesFolderUri: null, captures: [{ ...initial, finalText: 'Synthetic later final', transcriptVersion: 3 }], error: null })
+    await act(async () => { refresh() })
+    expect(editor.value).toBe('Synthetic local correction')
+    expect(container!.textContent).toContain('Transcript changed while you were editing')
+    expect(Array.from(container!.querySelectorAll('button')).find((button) => button.textContent === 'Save correction')!.disabled).toBe(true)
+    expect(captureMocks.updateCaptureTranscript).not.toHaveBeenCalled()
+  })
+
+  it('retains an edited capture displaced from the current history page without allowing a stale save', async () => {
+    const initial = { ...capture(), finalText: 'Synthetic initial', transcriptVersion: 1 }
+    captureMocks.loadCaptureSnapshot.mockResolvedValue({ available: true, notesFolderUri: null, captures: [initial], error: null })
+    await mount()
+    await act(async () => { container!.querySelector<HTMLButtonElement>('.capture-history__record')!.click() })
+    await act(async () => {
+      const editor = container!.querySelector<HTMLTextAreaElement>('textarea')!
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(editor, 'Synthetic displaced correction')
+      editor.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    captureMocks.loadCaptureSnapshot.mockResolvedValue({ available: true, notesFolderUri: null, captures: [], error: null })
+    await act(async () => { Array.from(container!.querySelectorAll('button')).find((button) => button.textContent === 'Refresh')!.click() })
+    expect(container!.querySelector<HTMLTextAreaElement>('textarea')?.value).toBe('Synthetic displaced correction')
+    expect(container!.textContent).toContain('no longer in this history page')
+    expect(Array.from(container!.querySelectorAll('button')).find((button) => button.textContent === 'Save correction')!.disabled).toBe(true)
+    expect(captureMocks.updateCaptureTranscript).not.toHaveBeenCalled()
+  })
+
+  it('does not overlap slow polls or discard their result when focus requests another refresh', async () => {
+    vi.useFakeTimers()
+    let finish!: (value: unknown) => void
+    captureMocks.loadCaptureSnapshot.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+      .mockResolvedValue({ available: true, notesFolderUri: null, captures: [capture()], error: null })
+    await mount()
+    await act(async () => { await vi.advanceTimersByTimeAsync(15_000); window.dispatchEvent(new Event('focus')) })
+    expect(captureMocks.loadCaptureSnapshot).toHaveBeenCalledTimes(1)
+    await act(async () => { finish({ available: true, notesFolderUri: null, captures: [capture()], error: null }) })
+    expect(container!.querySelectorAll('.capture-history__record')).toHaveLength(1)
+    expect(captureMocks.loadCaptureSnapshot.mock.calls.length).toBeLessThanOrEqual(2)
+  })
+
+  it('coalesces page changes behind the active request and publishes only the latest requested page', async () => {
+    const newest = Array.from({ length: 100 }, (_, index) => ({ ...capture(), captureId: `synthetic-newest-${index}` }))
+    captureMocks.loadCaptureSnapshot.mockResolvedValue({ available: true, notesFolderUri: null, captures: newest, error: null })
+    let resolveOlder!: (records: CaptureRecord[]) => void
+    captureMocks.listCaptures.mockImplementation((offset: number, limit: number) => {
+      if (offset === 100 && limit === 1) return Promise.resolve([capture()])
+      if (offset === 100 && limit === 100) return new Promise((resolve) => { resolveOlder = resolve })
+      throw new Error(`Unexpected synthetic page: ${offset}/${limit}`)
+    })
+    await mount()
+    await act(async () => { Array.from(container!.querySelectorAll('button')).find((button) => button.textContent === 'Older')!.click() })
+    expect(captureMocks.loadCaptureSnapshot).toHaveBeenCalledTimes(2)
+    captureMocks.loadCaptureSnapshot.mockResolvedValue({ available: true, notesFolderUri: null, captures: [{ ...capture(), finalText: 'Synthetic newest refresh' }], error: null })
+    await act(async () => { Array.from(container!.querySelectorAll('button')).find((button) => button.textContent === 'Refresh')!.click() })
+    expect(captureMocks.loadCaptureSnapshot).toHaveBeenCalledTimes(2)
+    await act(async () => { resolveOlder([{ ...capture(), finalText: 'Synthetic obsolete older page' }]) })
+    expect(container!.textContent).toContain('Synthetic newest refresh')
+    expect(container!.textContent).not.toContain('Synthetic obsolete older page')
+    expect(container!.querySelectorAll('.capture-history__record')).toHaveLength(1)
+  })
+
   it.each(['ASK', 'TALK', 'DRAFT'] as const)('does not offer Note finalization for interrupted %s audio', async (purpose) => {
     captureMocks.loadCaptureSnapshot.mockResolvedValue({ available: true, notesFolderUri: null,
       captures: [{ ...capture(), purpose, captureState: 'INTERRUPTED' }], error: null })
@@ -167,7 +261,7 @@ describe('CaptureHistory', () => {
       save?.click()
       await Promise.resolve()
     })
-    expect(captureMocks.updateCaptureTranscript).toHaveBeenCalledWith('synthetic-capture-1', 'Corrected task')
+    expect(captureMocks.updateCaptureTranscript).toHaveBeenCalledWith('synthetic-capture-1', 'Corrected task', archived.transcriptVersion)
     expect(container?.textContent).toContain('History edited; inbox entry unchanged.')
   })
 
@@ -242,7 +336,6 @@ async function mount(): Promise<void> {
   root = createRoot(container)
   await act(async () => {
     root?.render(<CaptureHistory onBack={() => undefined} />)
-    for (let index = 0; index < 6; index += 1) await Promise.resolve()
   })
 }
 

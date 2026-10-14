@@ -3,6 +3,14 @@ export type MessageRole = 'system' | 'user' | 'assistant'
 export type TranscriptRole = Exclude<MessageRole, 'system'>
 export type MessageContentKind = 'text' | 'refusal'
 
+/** Private DOM correlation for the admitted request; never a canonical conversation ID. */
+export interface TurnObservation {
+  readonly requestId: string
+  readonly outcome: 'pending' | 'completed' | 'error' | 'cancelled'
+  readonly stageStatus: import('../components/AnswerStage').AnswerStageStatus
+  readonly contentKind: MessageContentKind | 'error'
+}
+
 export interface ChatMessage {
   readonly id: string
   readonly role: MessageRole
@@ -10,6 +18,7 @@ export interface ChatMessage {
   readonly contentKind?: MessageContentKind
   readonly answerStage?: AnswerStageMetadata
   readonly customDirectTimings?: CustomDirectTimings
+  readonly observation?: TurnObservation
 }
 
 export interface CustomDirectTimings {
@@ -30,6 +39,7 @@ export interface TranscriptMessage {
   readonly contentKind?: MessageContentKind
   readonly answerStage?: AnswerStageMetadata
   readonly customDirectTimings?: CustomDirectTimings
+  readonly observation?: TurnObservation
 }
 
 export interface UserNotice {

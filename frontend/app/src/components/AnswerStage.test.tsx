@@ -25,6 +25,13 @@ function render(props: Parameters<typeof AnswerStage>[0]) {
 }
 
 describe('AnswerStage', () => {
+  it('settles a blank completed answer instead of leaving Thinking visible', () => {
+    const completed = render({ answer: '', stages: [{ stage: 'instant', status: 'completed' }] })
+    expect(completed.querySelector('.message__thinking')).toBeNull()
+    expect(completed.textContent).toContain('No response was returned.')
+    const pending = render({ answer: '', stages: [{ stage: 'instant', status: 'running' }] })
+    expect(pending.querySelector('.message__thinking')).not.toBeNull()
+  })
   it('compacts phone answers without losing refusal, busy/terminal status or evidence', () => {
     const container = render({ compact: true, answer: 'Synthetic answer', stages: [{ stage: 'instant', status: 'completed' }], sources: [{ url: 'https://example.test/source', title: 'Synthetic source' }], priorVersions: [{ id: 'synthetic-old', text: 'Synthetic prior answer' }] })
     expect(container.querySelector('h2')).toBeNull()

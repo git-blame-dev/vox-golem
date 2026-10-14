@@ -1,74 +1,22 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { JSX } from 'react'
 import {
-  enableCapture, finalizeCapture, listCaptures, loadCaptureSnapshot, playCapture, retryCapture, selectNotesFolder, stopCapturePlayback,
+  enableCapture, finalizeCapture, playCapture, retryCapture, selectNotesFolder, stopCapturePlayback,
   updateCaptureTranscript,
 } from '../lib/captures'
-import type { CaptureRecord, CaptureSnapshot } from '../lib/captures'
+import type { CaptureRecord } from '../lib/captures'
 import { visibleSpeechError } from '../lib/androidVoice'
+import { captureErrorMessage as errorMessage, useCaptureHistory } from '../lib/useCaptureHistory'
 
 const PAGE_SIZE = 100
 
 export function CaptureHistory({ onBack }: { onBack: () => void }): JSX.Element {
-  const [snapshot, setSnapshot] = useState<CaptureSnapshot | null>(null)
-  const [records, setRecords] = useState<CaptureRecord[]>([])
-  const [offset, setOffset] = useState(0)
-  const [hasOlder, setHasOlder] = useState(false)
-  const [selectedId, setSelectedId] = useState<string | null>(null)
-  const [draft, setDraft] = useState('')
-  const [error, setError] = useState<string | null>(null)
-  const [setupMessage, setSetupMessage] = useState<string | null>(null)
+  const { snapshot, setSnapshot, records, setRecords, offset, hasOlder, selectedId, selected, draft, draftVersion, conflict, offPage,
+    error, setError, setupMessage, setSetupMessage, mounted, refresh, selectRecord, setDraft, acceptSavedCorrection, markCorrectionConflict } = useCaptureHistory()
   const [busy, setBusy] = useState(false)
   const [playingId, setPlayingId] = useState<string | null>(null)
   const [editedExportedIds, setEditedExportedIds] = useState<ReadonlySet<string>>(() => new Set())
-  const mounted = useRef(true)
-  const refreshRevision = useRef(0)
-  const selected = records.find((record) => record.captureId === selectedId) ?? null
-
-  const refresh = useCallback(async (page: number): Promise<void> => {
-    const revision = ++refreshRevision.current
-    try {
-      const nextSnapshot = await loadCaptureSnapshot()
-      let nextRecords = nextSnapshot.captures
-      let more = false
-      if (page > 0) {
-        nextRecords = await listCaptures(page, PAGE_SIZE)
-        if (nextRecords.length === PAGE_SIZE) more = (await listCaptures(page + PAGE_SIZE, 1)).length > 0
-      } else if (nextRecords.length === PAGE_SIZE) {
-        more = (await listCaptures(PAGE_SIZE, 1)).length > 0
-      }
-      if (!mounted.current || revision !== refreshRevision.current) return
-      nextRecords = [...nextRecords].sort((left, right) => Date.parse(right.createdAtUtc) - Date.parse(left.createdAtUtc))
-      setSnapshot(nextSnapshot)
-      setRecords(nextRecords)
-      setOffset(page)
-      setHasOlder(more)
-      setError(nextSnapshot.error ?? nextSnapshot.onboardingError ?? null)
-      setSetupMessage(nextSnapshot.onboardingState === 'starting' ? 'Watch dictation is starting…'
-        : nextSnapshot.onboardingState === 'enabled' ? 'Watch dictation is enabled.' : null)
-      setSelectedId((current) => current !== null && nextRecords.some(({ captureId }) => captureId === current) ? current : null)
-    } catch (reason) {
-      if (mounted.current && revision === refreshRevision.current) setError(errorMessage(reason))
-    }
-  }, [])
-
-  useEffect(() => {
-    mounted.current = true
-    void Promise.resolve().then(() => refresh(offset))
-    const poll = (): void => {
-      if (document.visibilityState === 'visible') void refresh(offset)
-    }
-    const timer = window.setInterval(poll, 5_000)
-    document.addEventListener('visibilitychange', poll)
-    window.addEventListener('focus', poll)
-    return () => {
-      mounted.current = false
-      window.clearInterval(timer)
-      document.removeEventListener('visibilitychange', poll)
-      window.removeEventListener('focus', poll)
-      void stopCapturePlayback().catch(() => undefined)
-    }
-  }, [offset, refresh])
+  useEffect(() => () => { void stopCapturePlayback().catch(() => undefined) }, [])
 
   const chooseFolder = async (): Promise<void> => {
     setBusy(true)
@@ -109,11 +57,6 @@ export function CaptureHistory({ onBack }: { onBack: () => void }): JSX.Element 
     }
   }
 
-  const selectRecord = (record: CaptureRecord): void => {
-    setSelectedId(record.captureId)
-    setDraft(record.finalText ?? record.previewText ?? '')
-  }
-
   const play = async (record: CaptureRecord): Promise<void> => {
     setBusy(true)
     setError(null)
@@ -148,15 +91,22 @@ export function CaptureHistory({ onBack }: { onBack: () => void }): JSX.Element 
   }
 
   const saveTranscript = async (): Promise<void> => {
-    if (selected === null || selected.purpose !== 'NOTE') return
+    if (selected === null || selected.purpose !== 'NOTE' || conflict || offPage || draftVersion === undefined) return
     setBusy(true)
     setError(null)
     try {
-      await updateCaptureTranscript(selected.captureId, draft)
+      await updateCaptureTranscript(selected.captureId, draft, draftVersion)
+      acceptSavedCorrection(selected.captureId, draft)
       if (isExported(selected.orgState)) setEditedExportedIds((current) => new Set(current).add(selected.captureId))
       await refresh(offset)
     }
-    catch (reason) { if (mounted.current) setError(errorMessage(reason)) }
+    catch (reason) {
+      if (!mounted.current) return
+      if (errorMessage(reason) === 'transcript-conflict') {
+        markCorrectionConflict(selected.captureId)
+        await refresh(offset)
+      } else setError(errorMessage(reason))
+    }
     finally { if (mounted.current) setBusy(false) }
   }
 
@@ -228,7 +178,9 @@ export function CaptureHistory({ onBack }: { onBack: () => void }): JSX.Element 
           <label className="capture-history__edit">Correct transcript
             <textarea value={draft} onChange={(event) => setDraft(event.target.value)} rows={6} disabled={selected.captureState !== 'SAVED' || selected.purpose !== 'NOTE'} />
           </label>
-          <button type="button" className="shell__control" disabled={busy || selected.captureState !== 'SAVED' || selected.purpose !== 'NOTE' || draft === (selected.finalText ?? selected.previewText ?? '')} onClick={() => void saveTranscript()}>Save correction</button>
+          {conflict ? <p role="alert">Transcript changed while you were editing. Your correction was preserved. Select the capture again to reload the latest transcript before correcting it.</p> : null}
+          {offPage ? <p role="alert">This capture is no longer in this history page. Your correction was preserved. Return to its history page to review the latest transcript before saving.</p> : null}
+          <button type="button" className="shell__control" disabled={busy || conflict || offPage || selected.captureState !== 'SAVED' || selected.purpose !== 'NOTE' || draft === (selected.finalText ?? selected.previewText ?? '')} onClick={() => void saveTranscript()}>Save correction</button>
           {selected.purpose !== 'NOTE' ? <p className="capture-history__note">Audio retained for this voice session. Notes export and note corrections do not modify its conversation.</p>
             : isExported(selected.orgState) && editedExportedIds.has(selected.captureId)
             ? <p className="capture-history__note">History edited; inbox entry unchanged.</p>
@@ -270,9 +222,3 @@ function formatDuration(milliseconds: number): string {
   return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`
 }
 function formatDate(value: string): string { return new Date(value).toLocaleString() }
-function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message
-  if (typeof error === 'string') return error
-  if (typeof error === 'object' && error !== null && 'message' in error && typeof error.message === 'string') return error.message
-  return 'Capture service request failed'
-}
