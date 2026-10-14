@@ -14,7 +14,7 @@ SETTINGS_HOOK = "apply from: '../../../capture.settings.gradle'"
 
 class PrepareAndroidCaptureTest(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
+        self.temporary = tempfile.TemporaryDirectory(prefix='synthetic-android-capture-', dir='/tmp/opencode')
         self.addCleanup(self.temporary.cleanup)
         self.root = pathlib.Path(self.temporary.name)
         self.script = self.root / 'scripts/prepare-android-capture.py'
@@ -28,7 +28,7 @@ class PrepareAndroidCaptureTest(unittest.TestCase):
 
     def run_hook(self):
         return subprocess.run([sys.executable, str(self.script)], cwd=self.root,
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, timeout=15)
 
     def assert_rejected_without_writes(self):
         before = (self.build.read_bytes(), self.settings.read_bytes())
