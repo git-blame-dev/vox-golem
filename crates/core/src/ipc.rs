@@ -202,6 +202,57 @@ pub enum InstantModelChoice {
     OpenCodeLunaLow,
 }
 
+impl InstantModelChoice {
+    pub const ALL: [Self; 8] = [
+        Self::LocalFast,
+        Self::LocalQuality,
+        Self::CustomSolHigh,
+        Self::CustomSolNone,
+        Self::CustomLunaNone,
+        Self::CustomLunaLow,
+        Self::OpenCodeSolHigh,
+        Self::OpenCodeLunaLow,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalFast => "local-fast",
+            Self::LocalQuality => "local-quality",
+            Self::CustomSolHigh => "custom-sol-high",
+            Self::CustomSolNone => "custom-sol-none",
+            Self::CustomLunaNone => "custom-luna-none",
+            Self::CustomLunaLow => "custom-luna-low",
+            Self::OpenCodeSolHigh => "opencode-sol-high",
+            Self::OpenCodeLunaLow => "opencode-luna-low",
+        }
+    }
+
+    pub fn capability_id(self) -> &'static str {
+        match self {
+            Self::LocalFast => "local_fast",
+            Self::LocalQuality => "local_quality",
+            Self::CustomSolHigh
+            | Self::CustomSolNone
+            | Self::CustomLunaNone
+            | Self::CustomLunaLow => "custom_provider",
+            Self::OpenCodeSolHigh | Self::OpenCodeLunaLow => "opencode",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LocalFast => "Local: Fast",
+            Self::LocalQuality => "Local: Quality",
+            Self::CustomSolHigh => "Custom: GPT-6.1 Sol High",
+            Self::CustomSolNone => "Custom: GPT-6.1 Sol None",
+            Self::CustomLunaNone => "Custom: GPT-6 Luna None",
+            Self::CustomLunaLow => "Custom: GPT-5.6 Luna Low",
+            Self::OpenCodeSolHigh => "OpenCode: GPT-6.1 Sol High",
+            Self::OpenCodeLunaLow => "OpenCode: GPT-5.6 Luna Low",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AgentModelChoice {
@@ -213,11 +264,29 @@ pub enum AgentModelChoice {
     OpenCodeLunaLow,
 }
 
+impl AgentModelChoice {
+    pub fn capability_id(self) -> &'static str {
+        match self {
+            Self::CustomSolHigh | Self::CustomLunaLow => "custom_provider",
+            Self::OpenCodeSolHigh | Self::OpenCodeLunaLow => "opencode",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponseProfile {
     Fast,
     Quality,
+}
+
+impl ResponseProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Quality => "quality",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -490,6 +559,21 @@ impl From<assistant::InstantModel> for InstantModelChoice {
         }
     }
 }
+
+impl From<InstantModelChoice> for assistant::InstantModel {
+    fn from(choice: InstantModelChoice) -> Self {
+        match choice {
+            InstantModelChoice::LocalFast => Self::LocalFast,
+            InstantModelChoice::LocalQuality => Self::LocalQuality,
+            InstantModelChoice::CustomSolHigh => Self::CustomSolHigh,
+            InstantModelChoice::CustomSolNone => Self::CustomSolNone,
+            InstantModelChoice::CustomLunaNone => Self::CustomLunaNone,
+            InstantModelChoice::CustomLunaLow => Self::CustomLunaLow,
+            InstantModelChoice::OpenCodeSolHigh => Self::OpenCodeSolHigh,
+            InstantModelChoice::OpenCodeLunaLow => Self::OpenCodeLunaLow,
+        }
+    }
+}
 impl From<assistant::AgentModel> for AgentModelChoice {
     fn from(v: assistant::AgentModel) -> Self {
         match v {
@@ -497,6 +581,17 @@ impl From<assistant::AgentModel> for AgentModelChoice {
             assistant::AgentModel::CustomLunaLow => Self::CustomLunaLow,
             assistant::AgentModel::OpenCodeSolHigh => Self::OpenCodeSolHigh,
             assistant::AgentModel::OpenCodeLunaLow => Self::OpenCodeLunaLow,
+        }
+    }
+}
+
+impl From<AgentModelChoice> for assistant::AgentModel {
+    fn from(choice: AgentModelChoice) -> Self {
+        match choice {
+            AgentModelChoice::CustomSolHigh => Self::CustomSolHigh,
+            AgentModelChoice::CustomLunaLow => Self::CustomLunaLow,
+            AgentModelChoice::OpenCodeSolHigh => Self::OpenCodeSolHigh,
+            AgentModelChoice::OpenCodeLunaLow => Self::OpenCodeLunaLow,
         }
     }
 }
@@ -549,6 +644,77 @@ impl TryFrom<conversation::AppliedOutcome> for PromptOutcome {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn portable_model_catalog_matches_wire_and_domain_contracts() {
+        use super::InstantModelChoice as Wire;
+        use crate::assistant::InstantModel as Domain;
+        let cases = [
+            (
+                Wire::LocalFast,
+                Domain::LocalFast,
+                "local-fast",
+                "local_fast",
+            ),
+            (
+                Wire::LocalQuality,
+                Domain::LocalQuality,
+                "local-quality",
+                "local_quality",
+            ),
+            (
+                Wire::CustomSolHigh,
+                Domain::CustomSolHigh,
+                "custom-sol-high",
+                "custom_provider",
+            ),
+            (
+                Wire::CustomSolNone,
+                Domain::CustomSolNone,
+                "custom-sol-none",
+                "custom_provider",
+            ),
+            (
+                Wire::CustomLunaNone,
+                Domain::CustomLunaNone,
+                "custom-luna-none",
+                "custom_provider",
+            ),
+            (
+                Wire::CustomLunaLow,
+                Domain::CustomLunaLow,
+                "custom-luna-low",
+                "custom_provider",
+            ),
+            (
+                Wire::OpenCodeSolHigh,
+                Domain::OpenCodeSolHigh,
+                "opencode-sol-high",
+                "opencode",
+            ),
+            (
+                Wire::OpenCodeLunaLow,
+                Domain::OpenCodeLunaLow,
+                "opencode-luna-low",
+                "opencode",
+            ),
+        ];
+        assert_eq!(
+            Wire::ALL.to_vec(),
+            cases.iter().map(|case| case.0).collect::<Vec<_>>()
+        );
+        for (wire, domain, id, capability) in cases {
+            assert_eq!(serde_json::to_value(wire).unwrap(), id);
+            assert_eq!(
+                serde_json::from_value::<Wire>(serde_json::json!(id)).unwrap(),
+                wire
+            );
+            assert_eq!(Domain::from(wire), domain);
+            assert_eq!(Wire::from(domain), wire);
+            assert_eq!(wire.as_str(), id);
+            assert_eq!(wire.capability_id(), capability);
+            assert!(!wire.label().trim().is_empty());
+        }
+    }
     use super::*;
     use crate::assistant::{Content, Role, Stage as AssistantStage};
     use crate::conversation::{

@@ -320,11 +320,17 @@ fn history_page(store: &Store, request: HistoryRequest) -> Result<HistoryPage, D
         max_turns: 0,
         max_text_bytes: 0,
     })?;
-    let history = match &selection.parent {
-        Some(head) => store.history(&selection.conversation, head)?,
-        None => vec![],
-    };
-    let end = if let Some(cursor) = cursor {
+    // Core validates the entire ancestry before exposing any records. Keep that
+    // authority, but do not clone text outside the visible page.
+    let mut history = selection
+        .parent
+        .as_ref()
+        .map(|head| store.history_borrowed(&selection.conversation, head))
+        .transpose()?
+        .into_iter()
+        .flatten()
+        .rev();
+    if let Some(cursor) = &cursor {
         if cursor.conversation != selection.conversation
             || Some(&cursor.head) != selection.parent.as_ref()
         {
@@ -333,27 +339,31 @@ fn history_page(store: &Store, request: HistoryRequest) -> Result<HistoryPage, D
         if cursor.revision != selection.revision {
             return Err(invalid("history_cursor_stale"));
         }
-        history
-            .iter()
-            .position(|record| record.operation.id == cursor.before)
-            .ok_or_else(|| invalid("history_cursor_before"))?
-    } else {
-        history.len()
-    };
-    let mut start = end;
+        if !history.any(|record| record.operation.id == cursor.before) {
+            return Err(invalid("history_cursor_before"));
+        }
+    }
+    let mut turns = Vec::new();
     let mut bytes = 0;
-    for record in history[..end].iter().rev().take(request.max_turns) {
+    let mut has_older = false;
+    for record in history {
+        if turns.len() == request.max_turns {
+            has_older = true;
+            break;
+        }
         let size = record.operation.text_bytes();
         if size > request.max_text_bytes - bytes {
-            if start == end {
+            if turns.is_empty() {
                 return Err(limit("history_turn_text_bytes"));
             }
+            has_older = true;
             break;
         }
         bytes += size;
-        start -= 1;
+        turns.push(record.clone());
     }
-    let older_before = if start > 0 {
+    turns.reverse();
+    let older_before = if has_older {
         Some(encode(
             &HistoryCursor {
                 version: 1,
@@ -363,7 +373,7 @@ fn history_page(store: &Store, request: HistoryRequest) -> Result<HistoryPage, D
                     .parent
                     .clone()
                     .ok_or_else(|| invalid("native_internal"))?,
-                before: history[start].operation.id.clone(),
+                before: turns[0].operation.id.clone(),
             },
             MAX_HISTORY_CURSOR_BYTES,
             "history_cursor_bytes",
@@ -375,7 +385,7 @@ fn history_page(store: &Store, request: HistoryRequest) -> Result<HistoryPage, D
         revision: selection.revision,
         conversation: selection.conversation,
         head: selection.parent,
-        turns: history[start..end].to_vec(),
+        turns,
         older_before,
     })
 }

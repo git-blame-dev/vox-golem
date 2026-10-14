@@ -441,6 +441,20 @@ impl Store {
         &self.revision
     }
 
+    /// Retained records in lexical operation-ID order, including quarantine witnesses.
+    pub fn retained_records(&self) -> impl DoubleEndedIterator<Item = &Record> {
+        self.records.values()
+    }
+
+    /// Compact retired identities in lexical operation-ID order.
+    pub fn retired_records(&self) -> impl DoubleEndedIterator<Item = &RetiredRecord> {
+        self.retired.values()
+    }
+
+    pub fn is_quarantined(&self, id: &OperationId) -> bool {
+        self.quarantine.contains_key(id)
+    }
+
     pub fn export(&self) -> StoreSnapshot {
         StoreSnapshot {
             version: SCHEMA_VERSION,
@@ -452,6 +466,18 @@ impl Store {
     }
 
     pub fn snapshot(&self) -> StoreView {
+        let (conversations, pending) = self.conversation_views();
+        StoreView {
+            revision: self.revision.clone(),
+            records: self.records.values().cloned().collect(),
+            retired: self.retired.values().cloned().collect(),
+            conversations,
+            pending,
+            quarantine: self.quarantine_entries(),
+        }
+    }
+
+    fn conversation_views(&self) -> (Vec<ConversationView>, Vec<OperationId>) {
         let deleted = self.deleted();
         let mut conversations = BTreeMap::new();
         for record in self.records.values() {
@@ -509,14 +535,7 @@ impl Store {
                 view.title = Some(title_preview(prompt));
             }
         }
-        StoreView {
-            revision: self.revision.clone(),
-            records: self.records.values().cloned().collect(),
-            retired: self.retired.values().cloned().collect(),
-            conversations: conversations.into_values().collect(),
-            pending,
-            quarantine: self.quarantine_entries(),
-        }
+        (conversations.into_values().collect(), pending)
     }
 
     pub fn plan(&self, command: Command) -> Result<MutationPlan, DomainError> {
@@ -940,6 +959,18 @@ impl Store {
         conversation: &OperationId,
         head: &OperationId,
     ) -> Result<Vec<Record>, DomainError> {
+        Ok(self
+            .history_borrowed(conversation, head)?
+            .cloned()
+            .collect())
+    }
+
+    /// Validate the complete ancestry before yielding borrowed records, oldest first.
+    pub fn history_borrowed(
+        &self,
+        conversation: &OperationId,
+        head: &OperationId,
+    ) -> Result<impl DoubleEndedIterator<Item = &Record>, DomainError> {
         conversation.validate()?;
         head.validate()?;
         if self.deleted().contains(conversation) {
@@ -964,8 +995,7 @@ impl Store {
             .path(head)?
             .into_iter()
             .rev()
-            .map(|id| self.records[&id].clone())
-            .collect())
+            .map(|id| &self.records[&id]))
     }
 
     pub fn select_context(&self, request: ContextRequest) -> Result<ContextSelection, DomainError> {
@@ -980,8 +1010,8 @@ impl Store {
             });
         }
         let view = self
-            .snapshot()
-            .conversations
+            .conversation_views()
+            .0
             .into_iter()
             .find(|c| c.id == request.conversation)
             .ok_or_else(|| DomainError::Missing {
@@ -1015,18 +1045,18 @@ impl Store {
             }
         };
         let history = match &parent {
-            Some(head) => self.history(&request.conversation, head)?,
-            None => vec![],
+            Some(head) => Some(self.history_borrowed(&request.conversation, head)?),
+            None => None,
         };
         let mut turns = vec![];
         let mut bytes = 0;
-        for record in history.into_iter().rev().take(request.max_turns) {
+        for record in history.into_iter().flatten().rev().take(request.max_turns) {
             let size = record.operation.text_bytes();
             if size > request.max_text_bytes - bytes {
                 break;
             }
             bytes += size;
-            turns.push(record);
+            turns.push(record.clone());
         }
         turns.reverse();
         Ok(ContextSelection {
@@ -1050,11 +1080,11 @@ impl Store {
             });
         }
         if let Some(head) = &request.selected_head {
-            self.history(&request.conversation, head)?;
+            let _ = self.history_borrowed(&request.conversation, head)?;
         }
         let view = self
-            .snapshot()
-            .conversations
+            .conversation_views()
+            .0
             .into_iter()
             .find(|c| c.id == request.conversation)
             .ok_or_else(|| DomainError::Missing {
