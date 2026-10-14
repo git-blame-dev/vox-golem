@@ -413,15 +413,10 @@ impl CustomOpenAiClient {
             return Err(CustomOpenAiError::Timeout);
         }
         let credential = if self.config.model == CustomOpenAiModel::LocalFast {
-            load_request_credential(&self.config.auth_path).unwrap_or_else(|_| RequestCredential {
-                authorization: HeaderValue::from_static("Bearer local"),
-                account_id: None,
-                revision: CustomOpenAiAuthRevision::default(),
-            })
+            None
         } else {
-            load_request_credential(&self.config.auth_path)?
+            Some(load_request_credential(&self.config.auth_path)?)
         };
-        on_auth_revision(credential.revision);
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return Err(CustomOpenAiError::Timeout);
@@ -430,13 +425,16 @@ impl CustomOpenAiClient {
             .client
             .post(&self.config.endpoint)
             .header(ACCEPT, "text/event-stream")
-            .header(AUTHORIZATION, credential.authorization)
             .header(CONTENT_TYPE, "application/json")
             .header("Originator", "opencode")
             .header("session-id", &prompt.session_id)
             .timeout(remaining);
-        if let Some(account_id) = credential.account_id {
-            request_builder = request_builder.header("ChatGPT-Account-Id", account_id);
+        if let Some(credential) = credential {
+            on_auth_revision(credential.revision);
+            request_builder = request_builder.header(AUTHORIZATION, credential.authorization);
+            if let Some(account_id) = credential.account_id {
+                request_builder = request_builder.header("ChatGPT-Account-Id", account_id);
+            }
         }
         let request_builder = request_builder.body(request);
         on_dispatch(Instant::now());
@@ -487,30 +485,25 @@ impl CustomOpenAiClient {
                 }
                 let event: WireEvent =
                     serde_json::from_str(&data).map_err(|_| CustomOpenAiError::MalformedStream)?;
+                if let Some((delta, kind)) = text_delta(&event.kind, event.delta.as_deref())? {
+                    accumulator.push(delta, kind)?;
+                    if !delta.is_empty() {
+                        record_first_visible_text(&mut first_text_at, started, delta);
+                        on_delta(delta);
+                    }
+                }
                 match event.kind.as_str() {
-                    "response.output_text.delta" => {
-                        if let Some(delta) =
-                            event.delta.as_deref().filter(|delta| !delta.is_empty())
-                        {
-                            accumulator.push(delta, CustomOpenAiContentType::OutputText)?;
-                            record_first_visible_text(&mut first_text_at, started, delta);
-                            on_delta(delta);
-                        }
-                    }
-                    "response.refusal.delta" => {
-                        if let Some(delta) =
-                            event.delta.as_deref().filter(|delta| !delta.is_empty())
-                        {
-                            accumulator.push(delta, CustomOpenAiContentType::Refusal)?;
-                            record_first_visible_text(&mut first_text_at, started, delta);
-                            on_delta(delta);
-                        }
-                    }
                     "response.completed" | "response.done" => {
                         let metadata = event.response.ok_or(CustomOpenAiError::MalformedStream)?;
-                        if metadata.error.is_some() || metadata.incomplete_details.is_some() {
-                            return Err(CustomOpenAiError::Incomplete);
+                        metadata.validate()?;
+                        let terminal = accumulator
+                            .reconcile(metadata.output.as_deref().unwrap_or_default())?;
+                        let suffix = terminal_suffix(&accumulator.text, &terminal.text);
+                        if !suffix.is_empty() {
+                            record_first_visible_text(&mut first_text_at, started, suffix);
+                            on_delta(suffix);
                         }
+                        accumulator = terminal;
                         break 'response (
                             metadata.model,
                             metadata.service_tier,
@@ -545,6 +538,31 @@ fn record_first_visible_text(first_text_at: &mut Option<Duration>, started: Inst
     if first_text_at.is_none() && delta.chars().any(|character| !character.is_whitespace()) {
         *first_text_at = Some(started.elapsed());
     }
+}
+
+fn text_delta<'a>(
+    kind: &str,
+    delta: Option<&'a str>,
+) -> Result<Option<(&'a str, CustomOpenAiContentType)>, CustomOpenAiError> {
+    let content_type = match kind {
+        "response.output_text.delta" => CustomOpenAiContentType::OutputText,
+        "response.refusal.delta" => CustomOpenAiContentType::Refusal,
+        _ => return Ok(None),
+    };
+    Ok(Some((
+        delta.ok_or(CustomOpenAiError::MalformedStream)?,
+        content_type,
+    )))
+}
+
+fn terminal_suffix<'a>(streamed: &str, terminal: &'a str) -> &'a str {
+    terminal.strip_prefix(streamed).unwrap_or_else(|| {
+        if streamed.trim().is_empty() {
+            terminal
+        } else {
+            ""
+        }
+    })
 }
 
 fn default_auth_path() -> PathBuf {
@@ -771,6 +789,10 @@ struct WireEvent {
 
 #[derive(Deserialize)]
 struct ResponseMetadata {
+    #[serde(default, deserialize_with = "deserialize_present_status")]
+    status: Option<Value>,
+    #[serde(default)]
+    output: Option<Vec<Value>>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
@@ -781,6 +803,36 @@ struct ResponseMetadata {
     error: Option<Value>,
     #[serde(default)]
     incomplete_details: Option<Value>,
+}
+
+fn deserialize_present_status<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Value>, D::Error> {
+    // Missing status is a legacy-compatible omission; an explicit null or
+    // non-completed value must not be mistaken for a successful terminal event.
+    Value::deserialize(deserializer).map(Some)
+}
+
+impl ResponseMetadata {
+    fn validate(&self) -> Result<(), CustomOpenAiError> {
+        if self.error.is_some()
+            || self.incomplete_details.is_some()
+            || self
+                .status
+                .as_ref()
+                .is_some_and(|status| status != "completed")
+        {
+            return Err(CustomOpenAiError::Incomplete);
+        }
+        if self
+            .model
+            .as_ref()
+            .is_some_and(|model| model.len() > 256 || model.trim().is_empty())
+        {
+            return Err(CustomOpenAiError::MalformedStream);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -821,6 +873,48 @@ struct OutputAccumulator {
 }
 
 impl OutputAccumulator {
+    /// Terminal output is authoritative; streamed deltas are a fallback for
+    /// providers which omit output. Opaque reasoning/continuation items stay opaque.
+    fn reconcile(&self, output: &[Value]) -> Result<Self, CustomOpenAiError> {
+        let mut terminal = Self::default();
+        for item in output.iter().filter(|item| item["type"] == "message") {
+            if item
+                .get("status")
+                .is_some_and(|status| status != "completed")
+            {
+                return Err(CustomOpenAiError::Incomplete);
+            }
+            let content = item["content"]
+                .as_array()
+                .ok_or(CustomOpenAiError::MalformedStream)?;
+            for content in content {
+                let (field, kind) = match content["type"].as_str() {
+                    Some("output_text") => ("text", CustomOpenAiContentType::OutputText),
+                    Some("refusal") => ("refusal", CustomOpenAiContentType::Refusal),
+                    _ => continue,
+                };
+                terminal.push(
+                    content[field]
+                        .as_str()
+                        .ok_or(CustomOpenAiError::MalformedStream)?,
+                    kind,
+                )?;
+            }
+        }
+        if self
+            .content_type
+            .zip(terminal.content_type)
+            .is_some_and(|(streamed, final_kind)| streamed != final_kind)
+        {
+            return Err(CustomOpenAiError::MixedContent);
+        }
+        if terminal.text.is_empty() {
+            terminal.text.clone_from(&self.text);
+            terminal.content_type = self.content_type;
+        }
+        Ok(terminal)
+    }
+
     fn push(
         &mut self,
         delta: &str,
@@ -859,6 +953,7 @@ impl OutputAccumulator {
 #[derive(Default)]
 pub(crate) struct SseDecoder {
     buffer: Vec<u8>,
+    boundary: crate::sse::Boundary,
 }
 
 impl SseDecoder {
@@ -867,7 +962,7 @@ impl SseDecoder {
     }
 
     pub(crate) fn next_data(&mut self) -> Result<Option<String>, CustomOpenAiError> {
-        let Some((position, separator_len)) = find_sse_separator(&self.buffer) else {
+        let Some((position, separator_len)) = self.boundary.separator(&mut self.buffer) else {
             if self.buffer.len() > MAX_EVENT_BYTES {
                 return Err(CustomOpenAiError::TooLarge);
             }
@@ -879,29 +974,8 @@ impl SseDecoder {
         let record = self.buffer[..position].to_vec();
         self.buffer.drain(..position + separator_len);
         let record = String::from_utf8(record).map_err(|_| CustomOpenAiError::MalformedStream)?;
-        let record = record.strip_prefix('\u{feff}').unwrap_or(&record);
-        let normalized = record.replace("\r\n", "\n").replace('\r', "\n");
-        let data = normalized
-            .lines()
-            .filter_map(|line| line.strip_prefix("data:"))
-            .map(|line| line.strip_prefix(' ').unwrap_or(line))
-            .collect::<Vec<_>>()
-            .join("\n");
-        Ok(Some(data))
+        Ok(Some(crate::sse::data(&record)))
     }
-}
-
-fn find_sse_separator(buffer: &[u8]) -> Option<(usize, usize)> {
-    buffer
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|position| (position, 4))
-        .or_else(|| {
-            buffer
-                .windows(2)
-                .position(|window| window == b"\n\n" || window == b"\r\r")
-                .map(|position| (position, 2))
-        })
 }
 
 fn supported_stream_content_type(value: Option<&HeaderValue>) -> bool {
@@ -937,8 +1011,6 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-
-    static AUTH_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
     fn prompt() -> CustomOpenAiPrompt {
         CustomOpenAiPrompt {
@@ -976,62 +1048,89 @@ mod tests {
         String,
         Result<CustomOpenAiResponse, CustomOpenAiError>,
     ) {
+        fixture_with_model(
+            status,
+            content_type,
+            chunks,
+            idle,
+            account_id,
+            CustomOpenAiModel::SolHigh,
+        )
+        .await
+    }
+
+    async fn fixture_with_model(
+        status: u16,
+        content_type: &str,
+        chunks: Vec<Vec<u8>>,
+        idle: Duration,
+        account_id: Option<&str>,
+        model: CustomOpenAiModel,
+    ) -> (
+        Vec<u8>,
+        String,
+        Result<CustomOpenAiResponse, CustomOpenAiError>,
+    ) {
         let content_type = content_type.to_string();
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("listener");
         let address = listener.local_addr().expect("address");
         let request = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("connection");
-            let mut bytes = Vec::new();
-            let mut buffer = [0; 4096];
-            loop {
-                let count = socket.read(&mut buffer).await.expect("request");
-                bytes.extend_from_slice(&buffer[..count]);
-                if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-                    let headers_end = bytes
-                        .windows(4)
-                        .position(|window| window == b"\r\n\r\n")
-                        .unwrap()
-                        + 4;
-                    let headers = String::from_utf8_lossy(&bytes[..headers_end]);
-                    let length = headers
-                        .lines()
-                        .find_map(|line| {
-                            line.strip_prefix("Content-Length:")?
-                                .trim()
-                                .parse::<usize>()
-                                .ok()
-                        })
-                        .unwrap_or(0);
-                    if bytes.len() >= headers_end + length {
-                        break;
+            tokio::time::timeout(Duration::from_secs(8), async move {
+                let (mut socket, _) = listener.accept().await.expect("connection");
+                let mut bytes = Vec::new();
+                let mut buffer = [0; 4096];
+                loop {
+                    let count = socket.read(&mut buffer).await.expect("request");
+                    assert_ne!(count, 0, "EOF before complete request");
+                    bytes.extend_from_slice(&buffer[..count]);
+                    assert!(bytes.len() <= MAX_REQUEST_BYTES + 16 * 1024);
+                    if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let headers_end = bytes
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                            .unwrap()
+                            + 4;
+                        let headers = String::from_utf8_lossy(&bytes[..headers_end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .expect("content-length");
+                        if bytes.len() >= headers_end + length {
+                            break;
+                        }
                     }
                 }
-            }
-            let content_type = if content_type.is_empty() {
-                String::new()
-            } else {
-                format!("Content-Type: {content_type}\r\n")
-            };
-            let response =
-                format!("HTTP/1.1 {status} Test\r\n{content_type}Connection: close\r\n\r\n");
-            socket
-                .write_all(response.as_bytes())
-                .await
-                .expect("response headers");
-            for chunk in chunks {
-                if socket.write_all(&chunk).await.is_err() {
-                    break;
+                let content_type = if content_type.is_empty() {
+                    String::new()
+                } else {
+                    format!("Content-Type: {content_type}\r\n")
+                };
+                let response =
+                    format!("HTTP/1.1 {status} Test\r\n{content_type}Connection: close\r\n\r\n");
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("response headers");
+                for chunk in chunks {
+                    if socket.write_all(&chunk).await.is_err() {
+                        break;
+                    }
+                    if socket.flush().await.is_err() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
                 }
-                if socket.flush().await.is_err() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-            bytes
+                bytes
+            })
+            .await
+            .expect("fixture request/response deadline (including pre-dispatch failure)")
         });
-        let id = AUTH_FILE_ID.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("vox-golem-auth-{}-{id}.json", std::process::id()));
+        let auth_dir = crate::test_support::TestDir::new("auth");
+        let path = auth_dir.path().join("auth.json");
         let expiry = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1050,15 +1149,26 @@ mod tests {
             auth_path: path.clone(),
             idle_timeout: idle,
             total_timeout: Duration::from_secs(5),
+            model,
             ..Default::default()
         };
         let client = CustomOpenAiClient::new(config).expect("client");
         let deltas = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let seen = deltas.clone();
         let result = client
-            .respond(&prompt(), |delta| seen.lock().unwrap().push_str(delta))
+            .respond_with_auth_revision(
+                &prompt(),
+                None,
+                |delta| seen.lock().unwrap().push_str(delta),
+                |_| {
+                    assert_ne!(
+                        model,
+                        CustomOpenAiModel::LocalFast,
+                        "local response must not observe a cloud auth revision"
+                    )
+                },
+            )
             .await;
-        std::fs::remove_file(path).ok();
         let request = request.await.expect("server");
         let captured_deltas = deltas.lock().unwrap().clone();
         (request, captured_deltas, result)
@@ -1072,6 +1182,195 @@ mod tests {
                 bytes.chunks(3).map(Vec::from).collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    #[test]
+    fn local_auth_observation_does_not_touch_a_cloud_file() {
+        let client = CustomOpenAiClient::new(CustomOpenAiConfig {
+            model: CustomOpenAiModel::LocalFast,
+            auth_path: PathBuf::from("/synthetic/missing/cloud-auth.json"),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(client.check_auth().is_ok());
+    }
+
+    #[tokio::test]
+    async fn local_dispatch_never_forwards_cloud_credentials_or_revision() {
+        let (request, _, result) = fixture_with_model(
+            200,
+            "text/event-stream",
+            sse(&[
+                r#"{"type":"response.output_text.delta","delta":"Synthetic local answer"}"#,
+                r#"{"type":"response.completed","response":{}}"#,
+            ]),
+            Duration::from_secs(2),
+            Some("synthetic-cloud-account"),
+            CustomOpenAiModel::LocalFast,
+        )
+        .await;
+        assert_eq!(result.unwrap().text, "Synthetic local answer");
+        let headers = String::from_utf8(request).unwrap().to_ascii_lowercase();
+        assert!(!headers.contains("authorization:"));
+        assert!(!headers.contains("chatgpt-account-id:"));
+        assert!(!headers.contains("test-access"));
+    }
+
+    #[test]
+    fn review_sse_all_line_ending_pairs_across_every_split() {
+        for line in ["\n", "\r", "\r\n"] {
+            for blank in ["\n", "\r", "\r\n"] {
+                // CR followed immediately by LF is ONE CRLF newline, not a blank line.
+                let extra = if line == "\r" && blank == "\n" {
+                    "\n"
+                } else {
+                    ""
+                };
+                let separator = format!("{line}{blank}{extra}");
+                let wire = format!("data: Synthetic é 🧪{separator}data: terminal{separator}")
+                    .into_bytes();
+                for split in 0..=wire.len() {
+                    let mut decoder = SseDecoder::default();
+                    let mut events = Vec::new();
+                    for chunk in [&wire[..split], &wire[split..]] {
+                        decoder.push(chunk);
+                        while let Some(data) = decoder.next_data().unwrap() {
+                            events.push(data);
+                        }
+                    }
+                    assert_eq!(
+                        events,
+                        ["Synthetic é 🧪", "terminal"],
+                        "line {line:?}, blank {blank:?}, split {split}"
+                    );
+                }
+            }
+        }
+        let mut decoder = SseDecoder::default();
+        decoder.push(b"data: Synthetic\r");
+        assert!(decoder.next_data().unwrap().is_none());
+        decoder.push(b"\n");
+        assert!(
+            decoder.next_data().unwrap().is_none(),
+            "CR+LF is one line ending, not a blank line"
+        );
+        decoder.push(b"\n");
+        assert_eq!(decoder.next_data().unwrap().as_deref(), Some("Synthetic"));
+    }
+
+    #[test]
+    fn sse_separator_preserves_wire_order_across_line_endings_and_partitions() {
+        let wire = b"data: first\n\ndata: second\r\n\r\ndata: third\r\r";
+        for split in 0..=wire.len() {
+            let mut decoder = SseDecoder::default();
+            let mut events = Vec::new();
+            for chunk in [&wire[..split], &wire[split..]] {
+                decoder.push(chunk);
+                while let Some(data) = decoder.next_data().unwrap() {
+                    events.push(data);
+                }
+            }
+            assert_eq!(events, ["first", "second", "third"], "split {split}");
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_and_local_protocol_partition_matrix_keeps_terminal_suffix_exactly_once() {
+        let wire = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Synthetic é\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"reasoning\",\"encrypted_content\":\"synthetic-opaque\"},{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Synthetic é 🧪\"}]}]}}\r\n\r\n"
+        ).as_bytes();
+        for model in [CustomOpenAiModel::SolHigh, CustomOpenAiModel::LocalFast] {
+            for width in [1, 2, 3, 7, wire.len()] {
+                let (_, deltas, result) = fixture_with_model(
+                    200,
+                    "text/event-stream",
+                    wire.chunks(width).map(Vec::from).collect(),
+                    Duration::from_secs(2),
+                    Some("synthetic-account"),
+                    model,
+                )
+                .await;
+                assert_eq!(
+                    result.unwrap().text,
+                    "Synthetic é 🧪",
+                    "model {model:?}, width {width}"
+                );
+                assert_eq!(
+                    deltas, "Synthetic é 🧪",
+                    "terminal text must extend, not duplicate, streamed text"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn review_direct_and_local_transport_accept_all_sse_ending_pairs() {
+        for (_, separator) in crate::test_support::sse_ending_pairs() {
+            for model in [CustomOpenAiModel::SolHigh, CustomOpenAiModel::LocalFast] {
+                let delta =
+                    serde_json::json!({"type":"response.output_text.delta","delta":"Synthetic é"});
+                let terminal = serde_json::json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Synthetic é 🧪"}]}]}});
+                let wire = format!("data: {delta}{separator}data: {terminal}{separator}");
+                let (_, deltas, result) = fixture_with_model(
+                    200,
+                    "text/event-stream",
+                    wire.as_bytes().chunks(1).map(Vec::from).collect(),
+                    Duration::from_secs(2),
+                    None,
+                    model,
+                )
+                .await;
+                assert_eq!(result.unwrap().text, "Synthetic é 🧪");
+                assert_eq!(deltas, "Synthetic é 🧪");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_terminal_reconciles_text_refusal_and_status_without_duplicate_deltas() {
+        for (kind, field, expected_kind) in [
+            ("output_text", "text", CustomOpenAiContentType::OutputText),
+            ("refusal", "refusal", CustomOpenAiContentType::Refusal),
+        ] {
+            let terminal = serde_json::json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":kind,field:"Synthetic 🧪 answer"}]}]}}).to_string();
+            let (_, deltas, result) = fixture(
+                200,
+                "text/event-stream",
+                sse(&[&terminal]),
+                Duration::from_secs(2),
+            )
+            .await;
+            let response = result.unwrap();
+            assert_eq!(response.text, "Synthetic 🧪 answer");
+            assert_eq!(response.content_type, expected_kind);
+            assert_eq!(deltas, response.text);
+            let delta = serde_json::json!({"type":format!("response.{kind}.delta"),"delta":"Synthetic 🧪 answer"}).to_string();
+            let (_, deltas, result) = fixture(
+                200,
+                "text/event-stream",
+                sse(&[&delta, &terminal]),
+                Duration::from_secs(2),
+            )
+            .await;
+            assert_eq!(result.unwrap().text, deltas);
+        }
+        for terminal in [
+            r#"{"type":"response.completed","response":{"status":"failed"}}"#,
+            r#"{"type":"response.completed","response":{"status":null}}"#,
+        ] {
+            let (_, _, result) = fixture(
+                200,
+                "text/event-stream",
+                sse(&[
+                    r#"{"type":"response.output_text.delta","delta":"Synthetic"}"#,
+                    terminal,
+                ]),
+                Duration::from_secs(2),
+            )
+            .await;
+            assert_eq!(result, Err(CustomOpenAiError::Incomplete));
+        }
     }
 
     #[test]
@@ -1159,11 +1458,8 @@ mod tests {
             });
         });
         let endpoint = format!("http://{}", address_rx.recv().unwrap());
-        let id = AUTH_FILE_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "vox-synthetic-runtime-auth-{}-{id}.json",
-            std::process::id()
-        ));
+        let auth_dir = crate::test_support::TestDir::new("runtime-auth");
+        let path = auth_dir.path().join("auth.json");
         std::fs::write(
             &path,
             r#"{"openai":{"access":"synthetic-runtime","expires":4102444800}}"#,
@@ -1197,7 +1493,6 @@ mod tests {
         let second = runtime_b.block_on(client_b.respond(&prompt(), |_| {}));
         stop_tx.send(()).unwrap();
         server.join().unwrap();
-        std::fs::remove_file(path).unwrap();
         assert!(
             second.is_ok(),
             "runtime B must not depend on suspended runtime A: {second:?}"
@@ -1222,11 +1517,8 @@ mod tests {
             connections.clone(),
             authorizations.clone(),
         ));
-        let id = AUTH_FILE_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "vox-synthetic-pool-auth-{}-{id}.json",
-            std::process::id()
-        ));
+        let auth_dir = crate::test_support::TestDir::new("pool-auth");
+        let path = auth_dir.path().join("auth.json");
         let config = CustomOpenAiConfig {
             endpoint,
             auth_path: path.clone(),
@@ -1256,7 +1548,6 @@ mod tests {
                 "Synthetic answer"
             );
         }
-        std::fs::remove_file(path).unwrap();
         server.abort();
         let _ = server.await;
         assert_eq!(
@@ -1341,11 +1632,8 @@ mod tests {
         let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(pool_server(listener, Default::default(), observed.clone()));
-        let id = AUTH_FILE_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "vox-synthetic-dispatch-{}-{id}.json",
-            std::process::id()
-        ));
+        let auth_dir = crate::test_support::TestDir::new("dispatch-auth");
+        let path = auth_dir.path().join("auth.json");
         std::fs::write(
             &path,
             r#"{"openai":{"access":"synthetic-dispatch","expires":4102444800}}"#,
@@ -1432,7 +1720,6 @@ mod tests {
             assert!(response.timings.headers_at >= Duration::from_millis(80));
             assert!(response.timings.completed_at >= response.timings.first_text_at.unwrap());
         }
-        std::fs::remove_file(path).unwrap();
         server.abort();
         let _ = server.await;
     }
@@ -1758,8 +2045,8 @@ mod tests {
 
     #[test]
     fn transport_independent_auth_observation_reads_replacements_and_bounds() {
-        let id = AUTH_FILE_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("vox-synthetic-auth-observation-{id}.json"));
+        let auth_dir = crate::test_support::TestDir::new("auth-observation");
+        let path = auth_dir.path().join("auth.json");
         let absent = observe_custom_openai_auth(&path);
         assert_eq!(absent.status, Err(CustomOpenAiError::AuthUnavailable));
         assert_eq!(absent.revision, None);
@@ -1801,13 +2088,12 @@ mod tests {
                 Err(CustomOpenAiError::AuthUnavailable)
             );
         }
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn check_auth_reports_valid_missing_and_expired_records() {
-        let id = AUTH_FILE_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("vox-golem-check-auth-{id}.json"));
+        let auth_dir = crate::test_support::TestDir::new("check-auth");
+        let path = auth_dir.path().join("auth.json");
         let config = CustomOpenAiConfig {
             auth_path: path.clone(),
             ..Default::default()
@@ -1851,7 +2137,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(client.check_auth(), Err(CustomOpenAiError::AuthUnavailable));
-        std::fs::remove_file(path).ok();
     }
 
     #[test]
