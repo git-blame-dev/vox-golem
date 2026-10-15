@@ -62,7 +62,7 @@ describe('prompt terminal presentation and speech', () => {
         expect(ttsEnabled).toBe(false)
         await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="Close settings"]')!.click() })
       } else if (policy === 'stopped') {
-        await act(async () => { Array.from(container.querySelectorAll('button')).find((button) => button.textContent === 'Stop')!.click() })
+        await act(async () => { container.querySelector<HTMLButtonElement>('button[aria-label="Stop"]')!.click() })
         expect(invoke.mock.calls.filter(([command]) => command === 'cancel_prompt')).toHaveLength(1)
       }
       transcript = [canonicalTurn('1', '2', 'Synthetic pending question', 'Synthetic completed answer.', requestId)]

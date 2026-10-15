@@ -10,6 +10,8 @@
   display: inline-flex;
   align-items: center;
   gap: 0.35rem;
+  min-width: 0;
+  flex-wrap: wrap;
 }
 
 .search-mode select {
@@ -24,7 +26,16 @@
 
 .search-mode__reason {
   max-width: 28rem;
+  margin: .35rem 0 0;
+  overflow-wrap: anywhere;
 }
+
+.search-mode__help { min-width: 0; color: var(--text-muted); }
+.search-mode__help summary { display: flex; align-items: center; min-height: 48px; padding-inline: .5rem; cursor: pointer; list-style: none; text-decoration: underline; text-underline-offset: .2em; }
+.search-mode__help summary::-webkit-details-marker { display: none; }
+.search-mode__help summary:focus-visible { outline: 2px solid var(--focus-ring, Highlight); outline-offset: 2px; }
+.search-mode:has(.search-mode__help[open]) { align-items: flex-start; }
+.search-mode__help[open] { flex-basis: 100%; }
 
 .search-mode__icon-control {
   position: relative;

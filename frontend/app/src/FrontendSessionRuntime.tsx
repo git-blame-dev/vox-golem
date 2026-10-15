@@ -5,7 +5,7 @@ import type { FrontendSession } from './FrontendSession'
 import { SessionAuthority, cancelPromptProjectionFrame, sessionAuthority, useSessionControls, useSessionIntents } from './SessionAuthority'
 import type { PromptProjection } from './SessionAuthority'
 import { applySnapshotModelOptions, capabilityIsAvailable, capabilityMap, generationIneligibility, instantMatchesResponseProfile } from './sessionPolicy'
-import type { ChangeEvent, FormEvent, KeyboardEvent } from 'react'
+import type { ChangeEvent, FormEvent, KeyboardEvent, ReactNode } from 'react'
 import { SETTINGS_DIALOG_ID, useSettingsNavigation } from './lib/useSettingsNavigation'
 import { persistAudioInputDeviceId } from './lib/audioInputPreference'
 import { useAndroidVoiceAdapter } from './lib/useAndroidVoiceAdapter'
@@ -14,7 +14,7 @@ import { PromptComposer } from './components/PromptComposer'
 import { SearchModeSelect } from './components/SearchModeSelect'
 import { searchModeAvailability, selectNativeSearchMode } from './lib/searchMode'
 import type { SearchMode } from './lib/searchMode'
-import { AndroidVoiceControls } from './components/AndroidVoiceControls'
+import { AndroidVoiceControlsProvider, AndroidComposerVoiceControl, AndroidVoiceSecondaryControls } from './components/AndroidVoiceControls'
 import { SpeechSettings } from './components/SpeechSettings'
 import type { AndroidVoiceContext, AndroidVoiceStatus } from './lib/androidVoice'
 import { NewVoiceShortcutSettings } from './components/NewVoiceShortcutSettings'
@@ -195,6 +195,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   const observeDesktopStartupRef = session.operationRef<(state: StartupState) => void>('observeDesktopStartup', () => () => undefined)
   const [, setAssistantSettingsLoadError] = session.fieldState('assistantSettingsLoadError')
   const [, setAssistantSettingsWriteError] = session.fieldState('assistantSettingsWriteError')
+  const [, setUiThemeWriteError] = session.fieldState('uiThemeWriteError')
   const [customRetryPending, setCustomRetryPending] = session.fieldState('customRetryPending')
   const [assistantSettings, setAssistantSettings] = session.fieldState('assistantSettings')
   const [, setSearchMode] = session.fieldState('searchMode')
@@ -263,6 +264,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   const resetPendingRef = session.fieldRef('resetPending')
   const transcriptRevisionRef = session.selection.contextRevision
   const canonicalTranscriptRef = session.selection.transcript
+  const restoredDraftAnnouncementRef = session.operationRef<string | null>('restoredDraftAnnouncement', () => null)
   const adoptAndroidConversation = useCallback((snapshot: AppSnapshot, composerRevision: number, replaceHistory: boolean): void => {
     if (!isAndroidRuntime || snapshot.assistant === undefined) return
     if (shortcutDraftRef.current?.needsNew === true) return
@@ -277,6 +279,11 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     setAndroidAssistant(withHeads)
     if (composerRevision === composerEditRevisionRef.current) {
       setComposerValue(snapshot.assistant.draft)
+      const restoration = `${snapshot.sessionId}:${snapshot.assistant.selectedHead}`
+      if (snapshot.assistant.interrupted && snapshot.assistant.draft !== '' && restoredDraftAnnouncementRef.current !== restoration) {
+        restoredDraftAnnouncementRef.current = restoration
+        setResponseAnnouncement('Draft restored in Prompt')
+      } else if (!snapshot.assistant.interrupted) restoredDraftAnnouncementRef.current = null
     }
     if (replaceHistory) {
       if (snapshot.sessionId !== snapshotSessionIdRef.current || prior?.selectedHead !== assistant.selectedHead) {
@@ -286,7 +293,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       snapshotSessionIdRef.current = snapshot.sessionId
       setMessages((current) => replaceCommittedTranscript(current, snapshot.transcript))
     }
-  }, [androidAssistantRef, canonicalTranscriptRef, composerEditRevisionRef, setAndroidAssistant, setAndroidConversationId, setComposerValue, setMessages, shortcutDraftRef, snapshotSessionIdRef, timingRef])
+  }, [androidAssistantRef, canonicalTranscriptRef, composerEditRevisionRef, restoredDraftAnnouncementRef, setAndroidAssistant, setAndroidConversationId, setComposerValue, setMessages, setResponseAnnouncement, shortcutDraftRef, snapshotSessionIdRef, timingRef])
   const ttsGenerationRef = session.audio.speechRevision
   const ttsEnabledRef = session.fieldRef('ttsEnabled')
   const ttsPlaybackIdRef = session.audio.speechPlayback
@@ -1033,6 +1040,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
 
   const persistUiTheme = async (nextTheme: UiTheme, previousTheme: UiTheme): Promise<void> => {
     const revision = ++uiThemeWriteRevisionRef.current
+    setUiThemeWriteError(null)
     uiThemePendingRevisionRef.current = revision
     setUiTheme(nextTheme)
 
@@ -1052,6 +1060,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     } catch (error) {
       if (revision !== uiThemeWriteRevisionRef.current) return
       uiThemePendingRevisionRef.current = null
+      setUiThemeWriteError(toDisplayErrorMessage(error))
       setUiTheme(uiThemePersistedInitializedRef.current
         ? uiThemePersistedValueRef.current
         : initialSnapshotPreferencesRef.current?.uiTheme ?? previousTheme)
@@ -1063,9 +1072,8 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     }
   }
 
-  const toggleUiTheme = (): void => {
-    const nextTheme = uiTheme === 'dark' ? 'light' : 'dark'
-    void persistUiTheme(nextTheme, uiTheme)
+  const changeUiTheme = (nextTheme: UiTheme): void => {
+    if (nextTheme !== uiTheme) void persistUiTheme(nextTheme, uiTheme)
   }
 
   const currentSilenceTimeoutMs = (): number => {
@@ -2991,7 +2999,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
 
   useEffect(() => { persistAndroidDraftRef.current = persistAndroidDraft })
 
-  async function beginCurrentVoiceDraft(): Promise<string> {
+  async function beginCurrentVoiceDraft(completionPolicy: 'manual' | 'single_turn' | 'repeat_after_reply'): Promise<string> {
     const generationAvailable = (): boolean => {
       const startup = startupStateRef.current
       const selected = startup.kind === 'ready' ? applySnapshotModelOptions(
@@ -3002,13 +3010,16 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         (androidAssistantRef.current?.branchChoices.length ?? 0) === 0 &&
         !['saved_local_state_failed', 'draft_not_saved', 'storage_error'].includes(androidAssistantRef.current?.error ?? '')
     }
-    if (!isAndroidRuntime || !generationAvailable() || updateRuntimeBlocked || resetPendingRef.current || promptRef.current !== null || androidVoiceActiveRef.current || androidSelectionRecoveryRef.current !== null || !snapshotControlsFreshRef.current || assistantSettingsPendingRef.current || !searchModeInitializedRef.current || searchModePendingRef.current || shortcutDraftRef.current?.needsNew === true) throw new Error('Voice chat is busy; existing work was preserved')
+    const captureAvailable = (): boolean => !['saved_local_state_failed', 'draft_not_saved', 'storage_error', 'corrupt_store'].includes(androidAssistantRef.current?.error ?? '') &&
+      (androidAssistantRef.current?.branchChoices.length ?? 0) === 0 &&
+      (completionPolicy === 'manual' || generationAvailable())
+    if (!isAndroidRuntime || !captureAvailable() || updateRuntimeBlocked || resetPendingRef.current || promptRef.current !== null || androidVoiceActiveRef.current || androidSelectionRecoveryRef.current !== null || !snapshotControlsFreshRef.current || assistantSettingsPendingRef.current || !searchModeInitializedRef.current || searchModePendingRef.current || shortcutDraftRef.current?.needsNew === true) throw new Error('Voice chat is busy; existing work was preserved')
     const conversation = snapshotSessionIdRef.current
     const selectedHead = androidAssistantRef.current?.selectedHead ?? null
     const revision = composerEditRevisionRef.current
     await androidDraftWriteChainRef.current
     if (androidDraftWriteFailureRef.current !== null) throw androidDraftWriteFailureRef.current
-    if (!appActiveRef.current || !generationAvailable() || updateRuntimeBlocked || document.visibilityState !== 'visible' || resetPendingRef.current || promptRef.current !== null || androidSelectionRecoveryRef.current !== null || !snapshotControlsFreshRef.current || snapshotSessionIdRef.current !== conversation || (androidAssistantRef.current?.selectedHead ?? null) !== selectedHead || composerEditRevisionRef.current !== revision || assistantSettingsPendingRef.current || !searchModeInitializedRef.current || searchModePendingRef.current) throw new Error('Voice chat was interrupted; existing work was preserved')
+    if (!appActiveRef.current || !captureAvailable() || updateRuntimeBlocked || document.visibilityState !== 'visible' || resetPendingRef.current || promptRef.current !== null || androidSelectionRecoveryRef.current !== null || !snapshotControlsFreshRef.current || snapshotSessionIdRef.current !== conversation || (androidAssistantRef.current?.selectedHead ?? null) !== selectedHead || composerEditRevisionRef.current !== revision || assistantSettingsPendingRef.current || !searchModeInitializedRef.current || searchModePendingRef.current) throw new Error('Voice chat was interrupted; existing work was preserved')
     if (settingsOpen) closeSettings()
     return composerValueRef.current
   }
@@ -3143,7 +3154,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     voiceSettled: () => refreshAndroidSnapshotControlsRef.current(),
     beginCurrentVoiceDraft, onAndroidVoiceActivity, onAndroidSpeechStatus, onAndroidVoiceInputCancelled,
     changeInstant, changeSearchMode, resetSession, retryCustom, cancelPrompt,
-    toggleUiTheme, adjustUiTextSize, toggleTts, toggleMic, changeAudioInputDevice,
+    changeUiTheme, adjustUiTextSize, toggleTts, toggleMic, changeAudioInputDevice,
     setAutoStopOnSilence, setVoiceNotesOpen, setNoticeInteraction,
     loadMoreAndroidConversations, loadMoreAndroidHeads, selectAndroidConversation,
     canRetry: (value: AssistantSettings['instant']) => localInstantCanRetry(startupStateRef.current, value),
@@ -3230,12 +3241,24 @@ function sameExternalView(previous: SessionViewProps, next: SessionViewProps): b
 const SessionViews = memo(function SessionViews({ session, view }: SessionViewProps) {
   const { uiTextSize, uiTheme, runtimeStatus } = useSessionView(session, 'shell')
   return <div className="shell" data-platform={isAndroidRuntime ? 'android' : 'desktop'} data-ui-text-size={uiTextSize} data-ui-theme={uiTheme} data-runtime-status={runtimeStatus}>
+    <SessionVoiceControls session={session} view={view}>
     <SessionToolbar session={session} view={view} />
     <SessionConversation session={session} view={view} />
     <SessionSettings session={session} view={view} />
     <SessionComposer session={session} view={view} />
+    </SessionVoiceControls>
   </div>
 }, sameExternalView)
+
+function SessionVoiceControls({ session, view, children }: SessionViewProps & { readonly children: ReactNode }) {
+  const { searchModePending, resetPending, promptState, snapshotControlsFresh, assistantSettingsPending,
+    nativeConversationNeedsRecovery, selectedInstantOption, androidAssistant, updateRuntimeBlocked } = usePresentation(session, view, 'toolbar')
+  if (!isAndroidRuntime) return children
+  return <AndroidVoiceControlsProvider voice={view.voice}
+    disabled={updateRuntimeBlocked || nativeConversationNeedsRecovery || searchModePending || resetPending || promptState !== 'idle' || !snapshotControlsFresh || assistantSettingsPending || (androidAssistant?.branchChoices.length ?? 0) > 0}
+    generationAvailable={!nativeConversationNeedsRecovery && selectedInstantOption?.available === true && (androidAssistant?.branchChoices.length ?? 0) === 0}
+    interactionBlocked={view.navigation.settingsOpen}>{children}</AndroidVoiceControlsProvider>
+}
 
 function usePresentation(session: FrontendSession, view: SessionViewProps['view'], name: Parameters<typeof session.getViewSnapshot>[0]) {
   useSessionView(session, name)
@@ -3268,7 +3291,6 @@ function usePresentation(session: FrontendSession, view: SessionViewProps['view'
       isSwitchingResponseProfile || assistantSettingsPending || micStarting || state.ttsPlaying || state.pendingTtsCommands > 0,
     selectedAudioInputDevice: state.audioInputDevices.find((device) => device.deviceId === state.audioInputDeviceId),
     canDecreaseTextSize: sizeIndex > 0, canIncreaseTextSize: sizeIndex < UI_TEXT_SIZE_STEPS.length - 1,
-    themeToggleLabel: `Switch to ${state.uiTheme === 'dark' ? 'light' : 'dark'} mode`,
     customFailure: startupState.kind === 'ready' || startupState.kind === 'warming_model' ? startupState.capabilities.find((capability) =>
       capability.id === 'custom_provider' && (capability.state === 'failed' || capability.state === 'unavailable')) : undefined,
     canEnableDeep: options.deepAssistantOptions.some((option) => option.value === assistantSettings.deep && option.available),
@@ -3279,31 +3301,23 @@ function usePresentation(session: FrontendSession, view: SessionViewProps['view'
 
 const SessionToolbar = memo(function SessionToolbar({ session, view }: SessionViewProps) {
   const {
-    updateRuntimeBlocked, startupState, runtimeStatus, shortcutStaging, androidAssistant, androidConversationId,
-    headPagePending, androidVoiceActive, micStarting, micActive, voiceNotesOpen, assistantSettingsPending,
-    snapshotControlsFresh, assistantSettings, searchMode, searchModePending, uiTheme, promptActivity,
-    promptState, resetPending, instantAssistantOptions, selectedInstantOption, nativeConversationNeedsRecovery,
-    searchAvailability, instantControlsDisabled, themeToggleLabel, headerBusy,
+    updateRuntimeBlocked, runtimeStatus, shortcutStaging, androidAssistant, androidConversationId,
+    headPagePending, androidVoiceActive, micStarting, micActive, voiceNotesOpen,
+    snapshotControlsFresh, searchMode, searchModePending,
+    promptState, resetPending,
+    searchAvailability, instantControlsDisabled, headerBusy,
   } = usePresentation(session, view, 'toolbar')
   const { settingsOpen, settingsButtonRef, openSettings } = view.navigation
   const {
-    changeInstant, changeSearchMode, resetSession, cancelPrompt, toggleUiTheme,
-    setVoiceNotesOpen, selectAndroidConversation, canRetry,
+    changeSearchMode, resetSession,
+    setVoiceNotesOpen, selectAndroidConversation,
   } = view.actions
   const searchModeControl = <SearchModeSelect iconOnly={isAndroidRuntime} value={searchAvailability.available ? searchMode : 'quick'}
     disabled={!searchAvailability.available || instantControlsDisabled || searchModePending || runtimeStatus !== 'sleeping' || micStarting || micActive}
     reason={searchAvailability.reason} onChange={(mode) => void changeSearchMode(mode)} />
-  const stopPromptControl = (promptState === 'executing' || promptState === 'stopping') &&
-    startupState.kind === 'ready' && startupState.promptCancellationAvailable ? (
-      <button type="button" className={isAndroidRuntime ? 'shell__control shell__icon-control' : 'shell__control'}
-        aria-label={isAndroidRuntime ? promptState === 'stopping' ? 'Stopping…' : 'Stop' : undefined}
-        title={isAndroidRuntime ? promptState === 'stopping' ? 'Stopping…' : 'Stop' : undefined}
-        onClick={cancelPrompt} disabled={promptState === 'stopping' || updateRuntimeBlocked}>
-        {isAndroidRuntime ? <><ControlIcon kind="stop" /><span className="sr-only">{promptState === 'stopping' ? 'Stopping…' : 'Stop'}</span></> : promptState === 'stopping' ? 'Stopping…' : 'Stop'}
-      </button>
-    ) : null
   const notesControl = <button type="button" className="shell__control shell__icon-control" aria-label={voiceNotesOpen ? 'Chat' : 'Voice notes'} title={voiceNotesOpen ? 'Chat' : 'Voice notes'} aria-pressed={voiceNotesOpen} onClick={() => setVoiceNotesOpen((open) => !open)}>
     <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 3h10l4 4v14H5z M15 3v5h4 M8 12h8 M8 16h6" /></svg>
+    <span className="shell__overflow-label" aria-hidden="true">{voiceNotesOpen ? 'Chat' : 'Voice notes'}</span>
   </button>
   const conversationControl = androidAssistant !== null ? <label className="shell__control shell__icon-control shell__conversation-picker" title={androidAssistant.conversations.find((item) => item.id === androidConversationId)?.title ?? 'Conversation'}>
     <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 4h16v12H9l-5 4z M8 8h8 M8 12h6" /></svg>
@@ -3312,44 +3326,30 @@ const SessionToolbar = memo(function SessionToolbar({ session, view }: SessionVi
       {androidAssistant.conversations.map((conversation) => <option key={conversation.id} value={conversation.id}>{conversation.title}</option>)}
     </select>
   </label> : null
-  const newChatControl = <button type="button" className={`shell__control shell__new-chat${isAndroidRuntime ? ' shell__icon-control' : ''}`} onClick={() => void resetSession()} aria-label="New Chat" aria-busy={resetPending} title={resetPending ? 'Starting new chat…' : 'New Chat'} disabled={resetPending || updateRuntimeBlocked}>
-    {isAndroidRuntime ? <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 5v14 M5 12h14" /></svg> : resetPending ? 'Starting new chat...' : 'New Chat'}
+  const newChatControl = <button type="button" className="shell__control shell__new-chat shell__icon-control" onClick={() => void resetSession()} aria-label="New Chat" aria-busy={resetPending} title={resetPending ? 'Starting new chat…' : 'New Chat'} disabled={resetPending || updateRuntimeBlocked}>
+    <ControlIcon kind="plus" />
+    <span className="shell__overflow-label" aria-hidden="true">New Chat</span>
   </button>
   const settingsControl = <button ref={settingsButtonRef} type="button" className={`shell__control shell__settings-button${isAndroidRuntime ? ' shell__icon-control' : ''}`} onClick={openSettings} aria-label="Settings" aria-haspopup="dialog" aria-controls={SETTINGS_DIALOG_ID} aria-expanded={settingsOpen} title="Settings">
     {isAndroidRuntime ? <ControlIcon kind="settings" /> : '⚙'}
+    <span className="shell__overflow-label" aria-hidden="true">Settings</span>
   </button>
-  const androidVoiceControls = isAndroidRuntime && !voiceNotesOpen ? <AndroidVoiceControls voice={view.voice} compact secondaryControls={<>{notesControl}{conversationControl}{newChatControl}{searchModeControl}{settingsControl}</>} modelControl={<InstantModelSelect iconOnly id="composerInstantSelect" label="Instant model" value={assistantSettings.instant} options={instantAssistantOptions} disabled={instantControlsDisabled} canRetry={canRetry} onChange={changeInstant} />} disabled={searchModePending || resetPending || promptState !== 'idle' || !snapshotControlsFresh || assistantSettingsPending}
-    generationAvailable={!nativeConversationNeedsRecovery && selectedInstantOption?.available === true && (androidAssistant?.branchChoices.length ?? 0) === 0} /> : null
 
   return (
       <header className="shell__header" aria-label="VoxGolem">
         <div className="shell__identity" data-shell-identity>
-          <img className="shell__logo" src={headerIcon} alt="VoxGolem" width={isAndroidRuntime ? 32 : 40} height={isAndroidRuntime ? 32 : 40} data-busy={headerBusy} />
+          <img className="shell__logo" src={headerIcon} alt="VoxGolem" width={32} height={32} data-busy={headerBusy} />
           <div className="shell__runtime">
             {isBrowserPreviewRuntime() ? <span data-browser-preview>Browser preview</span> : null}
-            {!isAndroidRuntime ? <span data-runtime-phase>Runtime: {runtimeStatus}</span> : null}
+            {!isAndroidRuntime && runtimeStatus !== 'sleeping' ? <span data-runtime-phase role="status">Runtime: {runtimeStatus}</span> : null}
           </div>
         </div>
         <div className="shell__header-actions" role={isAndroidRuntime ? 'group' : undefined} aria-label={isAndroidRuntime ? 'Android toolbar' : undefined} aria-describedby={isAndroidRuntime && shortcutStaging ? 'new-voice-draft-status' : undefined}>
-          {isAndroidRuntime && voiceNotesOpen ? <>{notesControl}<PhoneActionOverflow>{conversationControl}{newChatControl}{settingsControl}</PhoneActionOverflow></> : null}
-          {!isAndroidRuntime ? newChatControl : null}
-          {!isAndroidRuntime ? <button
-            type="button"
-            className="shell__control shell__theme-button"
-            onClick={toggleUiTheme}
-            aria-label={themeToggleLabel}
-            title={themeToggleLabel}
-          >
-            {uiTheme === 'dark' ? '☀' : '☾'}
-          </button> : null}
-          {androidVoiceControls}
-          {isAndroidRuntime && !voiceNotesOpen ? <>
-            {stopPromptControl}
-            {promptActivity?.compact ? <span className="composer__status composer__status--compact" role="status" aria-live="polite" title={promptActivity.text}>
-              <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="8" /><path d="M12 7v5l3 2" /></svg>
-              <span className="sr-only">{promptActivity.text}</span>
-            </span> : null}
-          </> : null}
+          {isAndroidRuntime ? <>{voiceNotesOpen ? notesControl : null}{conversationControl}<PhoneActionOverflow>
+            {!voiceNotesOpen ? <AndroidVoiceSecondaryControls /> : null}
+            {!voiceNotesOpen ? notesControl : newChatControl}{searchModeControl}{settingsControl}
+          </PhoneActionOverflow></> : null}
+          {!isAndroidRuntime ? searchModeControl : null}
           {!isAndroidRuntime ? settingsControl : null}
         </div>
       </header>
@@ -3357,15 +3357,11 @@ const SessionToolbar = memo(function SessionToolbar({ session, view }: SessionVi
 }, sameExternalView)
 
 const SessionConversation = memo(function SessionConversation({ session, view }: SessionViewProps) {
-  const { voiceNotesOpen, customFailure, supportsDesktopRuntime, customRetryPending, updateRuntimeBlocked,
+  const { voiceNotesOpen,
     shortcutStaging, composerValue, uiTextSize, notices } = usePresentation(session, view, 'conversation')
-  const { setVoiceNotesOpen, retryCustom, setNoticeInteraction } = view.actions
+  const { setVoiceNotesOpen, setNoticeInteraction } = view.actions
   return voiceNotesOpen ? <CaptureHistory onBack={() => setVoiceNotesOpen(false)} /> : <>
       <div className="conversation-region">
-        {customFailure ? <div role="alert" className="shell__error">
-          Custom connection: {customFailure.reason}{' '}
-          {supportsDesktopRuntime ? <button type="button" aria-label="Retry Custom" disabled={customRetryPending || updateRuntimeBlocked} onClick={() => void retryCustom()}>Retry Custom</button> : null}
-        </div> : null}
         <SessionTranscript session={session} staging={shortcutStaging} composerValue={composerValue} textSize={uiTextSize} noticeId={notices[0]?.id} />
 
         <div
@@ -3388,15 +3384,15 @@ const SessionConversation = memo(function SessionConversation({ session, view }:
 }, sameExternalView)
 
 const SessionSettings = memo(function SessionSettings({ session, view }: SessionViewProps) {
-  const { uiTheme, themeToggleLabel, assistantSettingsWriteError, uiTextSize, canDecreaseTextSize, canIncreaseTextSize,
+  const { uiTheme, assistantSettingsWriteError, uiThemeWriteError, uiTextSize, canDecreaseTextSize, canIncreaseTextSize,
     supportsDesktopRuntime, selectedAudioInputDevice, audioInputDeviceId, micStarting, updateRuntimeBlocked, audioInputDevices,
     autoStopOnSilence, startupState, voiceInputUnavailableReason, ttsEnabled, canToggleTts, androidVoiceStatus,
     androidSpeechStatusError, assistantSettings, instantControlsDisabled, instantAssistantOptions, assistantCapabilities,
     selectedInstantRetryable, selectedInstantOption, assistantControlsDisabled, deepAssistantOptions, reviewAssistantOptions,
-    canEnableDeep, canEnableReview, appUpdates, updateInstallationDisabled } = usePresentation(session, view, 'settings')
+    canEnableDeep, canEnableReview, appUpdates, updateInstallationDisabled, customFailure, customRetryPending } = usePresentation(session, view, 'settings')
   const { settingsOpen, settingsPanelRef, settingsCloseButtonRef, closeSettings, onSettingsKeyDown } = view.navigation
-  const { toggleUiTheme, adjustUiTextSize, changeAudioInputDevice, setAutoStopOnSilence, toggleTts, patchAssistantSettings,
-    changeInstant, clearCompletion } = view.actions
+  const { changeUiTheme, adjustUiTextSize, changeAudioInputDevice, setAutoStopOnSilence, toggleTts, patchAssistantSettings,
+    changeInstant, clearCompletion, retryCustom } = view.actions
   return settingsOpen ? (
         <div
           className="settings-overlay"
@@ -3415,7 +3411,6 @@ const SessionSettings = memo(function SessionSettings({ session, view }: Session
             <div className="settings-panel__header">
               <div>
                 <h2 id="settings-title">Settings</h2>
-                <p>Adjust the app text size live.</p>
               </div>
               <button
                 ref={settingsCloseButtonRef}
@@ -3426,14 +3421,19 @@ const SessionSettings = memo(function SessionSettings({ session, view }: Session
               >
                 ×
               </button>
+              {assistantSettingsWriteError !== null || uiThemeWriteError !== null ? (
+                <div className="settings-panel__write-error" role="alert" tabIndex={0}>
+                  {assistantSettingsWriteError !== null ? <p className="shell__error">Assistant settings could not be saved: {assistantSettingsWriteError}</p> : null}
+                  {uiThemeWriteError !== null ? <p className="shell__error">Theme could not be saved: {uiThemeWriteError}</p> : null}
+                </div>
+              ) : null}
             </div>
-            {isAndroidRuntime ? <div className="settings-panel__row">
-              <strong>Theme</strong>
-              <button type="button" className="shell__control settings-panel__interactive" onClick={toggleUiTheme} aria-label={themeToggleLabel} title={themeToggleLabel}>
-                {uiTheme === 'dark' ? 'Dark' : 'Light'}
-              </button>
-            </div> : null}
-            {assistantSettingsWriteError !== null ? <p className="shell__error settings-panel__write-error" role="alert">Assistant settings could not be saved: {assistantSettingsWriteError}</p> : null}
+            <div className="settings-panel__row">
+              <label htmlFor="uiTheme"><strong>Theme</strong></label>
+              <select id="uiTheme" className="shell__control settings-panel__interactive" aria-label="Theme" value={uiTheme} onChange={(event) => changeUiTheme(parseUiTheme(event.target.value))}>
+                <option value="dark">OLED Night</option><option value="slate">Slate</option><option value="light">Light</option>
+              </select>
+            </div>
             <div className="settings-panel__row">
               <div>
                 <strong>Text size</strong>
@@ -3463,6 +3463,38 @@ const SessionSettings = memo(function SessionSettings({ session, view }: Session
                 </button>
               </div>
             </div>
+            <section className="settings-panel__assistant" aria-labelledby="model-settings-title">
+              <h3 id="model-settings-title">Model</h3>
+              <label className="settings-panel__interactive"><strong>Instant</strong><InstantModelSelect id="assistantInstantSelect" label="Instant" value={assistantSettings.instant} options={instantAssistantOptions} disabled={instantControlsDisabled} canRetry={(value) => localInstantCanRetry(startupState, value)} onChange={(value) => void changeInstant(value)} /></label>
+              {startupState.kind === 'ready' && !assistantCapabilities.custom ? <div>
+                <p className="settings-panel__hint">Custom connection: {customFailure?.reason ?? 'unavailable'}</p>
+                {customFailure && supportsDesktopRuntime ? <button type="button" className="shell__control" aria-label="Retry Custom" disabled={customRetryPending || updateRuntimeBlocked} onClick={() => void retryCustom()}>{customRetryPending ? 'Retrying…' : 'Retry Custom'}</button> : null}
+              </div> : null}
+              {selectedInstantRetryable && selectedInstantOption ? <button className="settings-panel__interactive" type="button" aria-label="Retry local profile" disabled={instantControlsDisabled} onClick={() => void changeInstant(assistantSettings.instant)}>Retry local profile</button> : null}
+              {!isAndroidRuntime ? <details className="settings-panel__advanced">
+                <summary>Advanced model settings</summary>
+                <label className="settings-panel__interactive"><strong>Deep model</strong><select aria-label="Deep model" value={assistantSettings.deep} disabled={assistantControlsDisabled} onChange={(event) => {
+                  const value = event.target.value as AssistantSettings['deep']
+                  if (deepAssistantOptions.find((option) => option.value === value)?.available) patchAssistantSettings({ deep: value })
+                }}>
+                  {deepAssistantOptions.map((option) => <option key={option.value} value={option.value} disabled={!option.available} title={option.reason}>{option.label}</option>)}
+                </select></label>
+                <label className="settings-panel__interactive"><strong>Review model</strong><select aria-label="Review model" value={assistantSettings.review} disabled={assistantControlsDisabled} onChange={(event) => {
+                  const value = event.target.value as AssistantSettings['review']
+                  if (reviewAssistantOptions.find((option) => option.value === value)?.available) patchAssistantSettings({ review: value })
+                }}>
+                  {reviewAssistantOptions.map((option) => <option key={option.value} value={option.value} disabled={!option.available} title={option.reason}>{option.label}</option>)}
+                </select></label>
+                <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.deepEnabled} disabled={assistantControlsDisabled || (!assistantSettings.deepEnabled && !canEnableDeep)} onChange={(event) => patchAssistantSettings({ deepEnabled: event.target.checked })} /> Deep</label>
+                <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.reviewEnabled} disabled={assistantControlsDisabled || (!assistantSettings.reviewEnabled && !canEnableReview)} onChange={(event) => patchAssistantSettings({ reviewEnabled: event.target.checked })} /> Review</label>
+                <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.completion} disabled={assistantControlsDisabled || (!assistantSettings.completion && !assistantCapabilities.qwenPrediction)} onChange={(event) => {
+                  if (!event.target.checked) clearCompletion()
+                  patchAssistantSettings({ completion: event.target.checked })
+                }} /> Completion</label>
+                <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.prefetch} disabled={assistantControlsDisabled || !supportsDesktopRuntime} aria-describedby="prefetch-help" onChange={(event) => patchAssistantSettings({ prefetch: event.target.checked })} /> Prefetch</label>
+                <p id="prefetch-help" className="settings-panel__hint">{supportsDesktopRuntime ? 'Prefetch may transmit unaccepted predicted text when enabled.' : 'Prefetch is unavailable on this runtime.'}</p>
+              </details> : null}
+            </section>
             {supportsDesktopRuntime ? <div className="settings-panel__row settings-panel__mic-row">
               <div>
                 <label htmlFor="audioInputDevice"><strong>Microphone</strong></label>
@@ -3530,37 +3562,6 @@ const SessionSettings = memo(function SessionSettings({ session, view }: Session
               <p className="settings-panel__hint">{assistantSettings.webEnabled ? 'Native search may send question-derived queries and public-page requests to external providers: Parallel is primary, with Exa as fallback when needed. Delegated OpenCode routes may use their own search providers.' : 'Web is off: no web lookup or search fallback. Normal chat still uses the selected chat provider; answers are not web-verified.'}</p>
               <p className="settings-panel__hint">Search effort (Quick, Verify, Research) is separate from this permission. Providers used depend on availability; search and fallback activity appear in the response status when reported.</p>
             </section>
-            <div className="settings-panel__assistant">
-               <label className="settings-panel__interactive"><strong>Instant</strong><InstantModelSelect id="assistantInstantSelect" label="Instant" value={assistantSettings.instant} options={instantAssistantOptions} disabled={instantControlsDisabled} canRetry={(value) => localInstantCanRetry(startupState, value)} onChange={(value) => void changeInstant(value)} /></label>
-              {startupState.kind === 'ready' && !assistantCapabilities.custom ? (
-                <p className="settings-panel__hint">Custom connection: {startupState.capabilities.find((capability) => capability.id === 'custom_provider')?.reason ?? 'unavailable'}</p>
-              ) : null}
-               {selectedInstantRetryable && selectedInstantOption ? <button className="settings-panel__interactive" type="button" aria-label="Retry local profile" disabled={instantControlsDisabled} onClick={() => void changeInstant(assistantSettings.instant)}>Retry local profile</button> : null}
-               <label className="settings-panel__interactive"><strong>Deep model</strong><select aria-label="Deep model" value={assistantSettings.deep} disabled={assistantControlsDisabled} onChange={(event) => {
-                const value = event.target.value as AssistantSettings['deep']
-                if (deepAssistantOptions.find((option) => option.value === value)?.available) {
-                   patchAssistantSettings({ deep: value })
-                }
-              }}>
-                {deepAssistantOptions.map((option) => <option key={option.value} value={option.value} disabled={!option.available} title={option.reason}>{option.label}</option>)}
-               </select></label>
-               <label className="settings-panel__interactive"><strong>Review model</strong><select aria-label="Review model" value={assistantSettings.review} disabled={assistantControlsDisabled} onChange={(event) => {
-                const value = event.target.value as AssistantSettings['review']
-                if (reviewAssistantOptions.find((option) => option.value === value)?.available) {
-                   patchAssistantSettings({ review: value })
-                }
-              }}>
-                {reviewAssistantOptions.map((option) => <option key={option.value} value={option.value} disabled={!option.available} title={option.reason}>{option.label}</option>)}
-              </select></label>
-               <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.deepEnabled} disabled={assistantControlsDisabled || (!assistantSettings.deepEnabled && !canEnableDeep)} onChange={(event) => patchAssistantSettings({ deepEnabled: event.target.checked })} /> Deep</label>
-               <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.reviewEnabled} disabled={assistantControlsDisabled || (!assistantSettings.reviewEnabled && !canEnableReview)} onChange={(event) => patchAssistantSettings({ reviewEnabled: event.target.checked })} /> Review</label>
-               <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.completion} disabled={assistantControlsDisabled || (!assistantSettings.completion && !assistantCapabilities.qwenPrediction)} onChange={(event) => {
-                if (!event.target.checked) clearCompletion()
-                 patchAssistantSettings({ completion: event.target.checked })
-               }} /> Completion</label>
-                <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.prefetch} disabled={assistantControlsDisabled || !supportsDesktopRuntime} aria-describedby="prefetch-help" onChange={(event) => patchAssistantSettings({ prefetch: event.target.checked })} /> Prefetch</label>
-              <p id="prefetch-help" className="settings-panel__hint">{supportsDesktopRuntime ? 'Prefetch may transmit unaccepted predicted text when enabled.' : 'Prefetch is unavailable on this runtime.'}</p>
-            </div>
             {isAndroidRuntime ? <NewVoiceShortcutSettings /> : null}
             <UpdateSettings updates={appUpdates} installationDisabled={updateInstallationDisabled} />
             {!isAndroidRuntime && !isBrowserPreviewRuntime() ? <>
@@ -3577,15 +3578,18 @@ const SessionComposer = memo(function SessionComposer({ session, view }: Session
     androidVoiceActive, headPagePending, snapshotControlsFresh, composerValue, uiTextSize, partialTranscript,
     typedCompletionSuffix, voiceCompletionSuffix, canSend, startupState, assistantSettingsLoadError, selectedInstantOption,
     selectedInstantProfileReady, canToggleMic, micStarting, micActive, assistantSettings, instantAssistantOptions,
-    instantControlsDisabled, searchAvailability, searchMode, searchModePending, runtimeStatus, updateRuntimeBlocked,
-    promptActivity, wakeConfidence } = usePresentation(session, view, 'composer')
+    instantControlsDisabled, runtimeStatus, updateRuntimeBlocked,
+    promptActivity, wakeConfidence, customFailure, supportsDesktopRuntime, customRetryPending } = usePresentation(session, view, 'composer')
   const { onSubmit, loadMoreAndroidConversations, loadMoreAndroidHeads, selectAndroidConversation, changeComposer,
-    onComposerKeyDown, acceptTypedCompletion, clearCompletion, toggleMic, changeInstant, changeSearchMode, cancelPrompt } = view.actions
-  const searchModeControl = <SearchModeSelect iconOnly={isAndroidRuntime} value={searchAvailability.available ? searchMode : 'quick'}
-    disabled={!searchAvailability.available || instantControlsDisabled || searchModePending || runtimeStatus !== 'sleeping' || micStarting || micActive}
-    reason={searchAvailability.reason} onChange={(mode) => void changeSearchMode(mode)} />
-  const stopPromptControl = (promptState === 'executing' || promptState === 'stopping') && startupState.kind === 'ready' && startupState.promptCancellationAvailable ?
-    <button type="button" className="shell__control" onClick={cancelPrompt} disabled={promptState === 'stopping' || updateRuntimeBlocked}>{promptState === 'stopping' ? 'Stopping…' : 'Stop'}</button> : null
+     onComposerKeyDown, acceptTypedCompletion, clearCompletion, toggleMic, changeInstant, cancelPrompt, resetSession, retryCustom } = view.actions
+  const canStop = (promptState === 'executing' || promptState === 'stopping') && startupState.kind === 'ready' && startupState.promptCancellationAvailable
+  const busy = promptState !== 'idle' || runtimeStatus === 'processing' || runtimeStatus === 'executing'
+  const actionLabel = canStop ? promptState === 'stopping' ? 'Stopping…' : 'Stop' : busy ? 'Working…' : 'Send'
+  const selectedUnavailable = startupState.kind === 'ready' && (selectedInstantOption?.available !== true || !selectedInstantProfileReady)
+  let unavailableReason = selectedInstantOption?.reason ?? 'selected provider is unavailable'
+  if (selectedInstantOption?.available === true && !selectedInstantProfileReady) unavailableReason = 'selected local model profile is not loaded'
+  if (unavailableReason === 'response_backend is not configured') unavailableReason = 'selected provider is not configured'
+  const showAvailability = startupState.kind === 'error' || startupState.kind === 'warming_model' || assistantSettingsLoadError !== null || selectedUnavailable
   return !voiceNotesOpen ? <form className="composer" onSubmit={onSubmit}>
         {shortcutStaging ? <p id="new-voice-draft-status" className={isAndroidRuntime ? 'sr-only' : undefined} role="status">New voice draft — Stop &amp; send starts a new conversation. Previous history and draft are preserved.</p> : null}
         {isAndroidRuntime && androidAssistant !== null ? <div className="composer__actions">
@@ -3595,9 +3599,9 @@ const SessionComposer = memo(function SessionComposer({ session, view }: Session
             {androidAssistant.branchChoices.map((head, index) => <option key={head} value={head}>Continuation {index + 1}</option>)}
           </select></label> : null}
           {androidAssistant.branchOffset < androidAssistant.branchCount ? <button type="button" disabled={headPagePending || resetPending || promptState !== 'idle' || androidVoiceActive} onClick={() => void loadMoreAndroidHeads()}>{headPagePending ? 'Loading continuations…' : 'More continuations'}</button> : null}
-          {androidAssistant.interrupted ? <span role="status">Interrupted draft restored. Review before sending.</span> : null}
-          {androidAssistant.error !== null ? <span role="status">Native conversation status: {androidAssistant.error.replaceAll('_', ' ')}</span> : null}
+          {androidAssistant.error !== null && androidAssistant.error !== 'interrupted' ? <span role="status">Native conversation status: {androidAssistant.error.replaceAll('_', ' ')}</span> : null}
         </div> : null}
+        <div className="composer__surface">
         <div className="composer__prompt-row">
         <PromptComposer
           id="promptComposer"
@@ -3612,48 +3616,47 @@ const SessionComposer = memo(function SessionComposer({ session, view }: Session
           onAcceptCompletion={acceptTypedCompletion}
            onDismissCompletion={clearCompletion}
            partialCompletionSuffix={voiceCompletionSuffix}
-           placeholder="Type a prompt..."
-           rows={isAndroidRuntime ? 1 : 2}
-           maxRows={isAndroidRuntime ? 1 : 4}
+            placeholder="Ask Assistant…"
+            rows={1}
+            maxRows={6}
           />
-        {isAndroidRuntime ? <button type="submit" className="composer__button shell__icon-control" aria-label="Send" title="Send" disabled={!canSend}><ControlIcon kind="send" /></button> : null}
+        <button type={busy ? 'button' : 'submit'} className="composer__button shell__icon-control" aria-label={actionLabel} title={actionLabel}
+          disabled={canStop ? promptState === 'stopping' || updateRuntimeBlocked : busy || !canSend} onClick={canStop ? cancelPrompt : undefined}>
+          <ControlIcon kind={canStop ? 'stop' : 'send'} />
+        </button>
         </div>
+        <div className="composer__utility-row">
+          <InstantModelSelect variant="pill" id="composerInstantSelect" label="Instant model" value={assistantSettings.instant} options={instantAssistantOptions} disabled={instantControlsDisabled} canRetry={(value) => localInstantCanRetry(startupState, value)} onChange={(value) => void changeInstant(value)} />
+          <div className="composer__utility-actions">
+            {isAndroidRuntime ? <AndroidComposerVoiceControl /> : voiceInputReady(startupState) ? <button type="button" className="shell__control shell__icon-control" onClick={toggleMic} disabled={!canToggleMic} aria-label={micStarting ? 'Starting mic…' : micActive ? 'Stop mic' : 'Start mic'} title={micActive ? 'Stop mic' : 'Start mic'}><ControlIcon kind={micActive ? 'stop' : 'mic'} /></button> : null}
+            <button type="button" className="shell__control shell__icon-control shell__new-chat" aria-label="New Chat" title={resetPending ? 'Starting new chat…' : 'New Chat'} aria-busy={resetPending} disabled={resetPending || updateRuntimeBlocked} onClick={() => void resetSession()}><ControlIcon kind="plus" /></button>
+          </div>
+        </div>
+        {showAvailability ? <div className="composer__availability">
         {startupState.kind === 'error' ? (
           <p className="shell__error">Startup error: {startupState.message}</p>
         ) : null}
         {assistantSettingsLoadError !== null ? (
           <p className="shell__error">Assistant settings unavailable: {assistantSettingsLoadError}</p>
         ) : null}
-        {startupState.kind === 'ready' && (selectedInstantOption?.available !== true || !selectedInstantProfileReady) ? (
+        {selectedUnavailable ? (
           <p className="shell__error" role="status">
-            Sending disabled: {selectedInstantOption?.available !== true
-              ? selectedInstantOption?.reason ?? 'selected provider is unavailable'
-              : 'selected local model profile is not loaded'}
+            Sending disabled: {unavailableReason}
           </p>
         ) : null}
+        {selectedUnavailable && assistantSettings.instant.startsWith('custom-') && customFailure && supportsDesktopRuntime ? <button type="button" className="shell__control" aria-label="Retry Custom" disabled={customRetryPending || updateRuntimeBlocked} onClick={() => void retryCustom()}>{customRetryPending ? 'Retrying…' : 'Retry Custom'}</button> : null}
         {startupState.kind === 'warming_model' ? (
           <p className="shell__loading">Model loading: {startupState.message}</p>
         ) : null}
-          <div className={isAndroidRuntime ? 'composer__actions composer__actions--secondary' : 'composer__actions'}>
-           {voiceInputReady(startupState) ? (
-             <button type="button" className="shell__control" onClick={toggleMic} disabled={!canToggleMic}>
-               {micStarting ? 'Starting mic...' : micActive ? 'Stop mic' : 'Start mic'}
-             </button>
-           ) : null}
-              {!isAndroidRuntime ? <label className="composer__instant-model"><strong>Instant:</strong> <InstantModelSelect id="composerInstantSelect" label="Instant model" value={assistantSettings.instant} options={instantAssistantOptions} disabled={instantControlsDisabled} canRetry={(value) => localInstantCanRetry(startupState, value)} onChange={(value) => void changeInstant(value)} /></label> : null}
-             {!isAndroidRuntime ? searchModeControl : null}
-          <div className="composer__send-side">
-            {!isAndroidRuntime ? stopPromptControl : null}
+        </div> : null}
+        </div>
+          <div className="composer__actions composer__actions--secondary">
             {runtimeStatus === 'sleeping' && wakeConfidence !== null ? (
               <div className={wakeConfidence >= 0.7 ? 'composer__wake composer__wake--high' : wakeConfidence >= 0.4 ? 'composer__wake composer__wake--medium' : 'composer__wake composer__wake--low'}>
                 <span className="composer__wake-primary">wake: {(wakeConfidence * 100).toFixed(2)}%</span>
               </div>
             ) : null}
-            {!isAndroidRuntime ? <button type="submit" className="composer__button" disabled={!canSend}>
-              Send
-            </button> : null}
-          </div>
-          {promptActivity !== null && (!isAndroidRuntime || !promptActivity.compact) ? <div className="composer__status" role="status" aria-live="polite">{promptActivity.text}</div> : null}
+          {promptActivity !== null ? <div className={promptActivity.compact ? 'sr-only' : 'composer__status'} role="status" aria-live="polite">{promptActivity.text}</div> : null}
         </div>
       </form> : null
 }, sameExternalView)

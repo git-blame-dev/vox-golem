@@ -4,7 +4,24 @@ import { flushSync } from 'react-dom'
 
 export const SETTINGS_DIALOG_ID = 'settings-dialog'
 const SETTINGS_HISTORY_KEY = '__voxgolemSettingsOpen'
-const FOCUSABLE = 'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+const FOCUSABLE = 'button, [href], input, select, textarea, summary:not([tabindex="-1"]), [tabindex]:not([tabindex="-1"])'
+
+function isSemanticallyFocusable(element: HTMLElement): boolean {
+  if (element.matches(':disabled, input[type="hidden"]') ||
+    (element.hasAttribute('tabindex') && Number(element.getAttribute('tabindex')) < 0)) return false
+  for (let ancestor: HTMLElement | null = element; ancestor !== null; ancestor = ancestor.parentElement) {
+    if (ancestor.hasAttribute('hidden') || ancestor.hasAttribute('inert')) return false
+    if (ancestor instanceof HTMLFieldSetElement && ancestor.disabled && element.matches('button, input, select, textarea')) {
+      const legend = Array.from(ancestor.children).find((child) => child.tagName === 'LEGEND')
+      if (!legend?.contains(element)) return false
+    }
+    if (ancestor instanceof HTMLDetailsElement && !ancestor.open) {
+      const summary = Array.from(ancestor.children).find((child) => child.tagName === 'SUMMARY')
+      if (!summary?.contains(element)) return false
+    }
+  }
+  return true
+}
 
 /** Owns only DOM navigation, focus and scroll locking; preferences remain session-owned. */
 export function useSettingsNavigation() {
@@ -109,7 +126,7 @@ export function useSettingsNavigation() {
   const onSettingsKeyDown = useCallback((event: KeyboardEvent<HTMLDivElement>): void => {
     if (event.key === 'Escape') { event.preventDefault(); closeSettings(); return }
     if (event.key !== 'Tab') return
-    const elements = Array.from(settingsPanelRef.current?.querySelectorAll<HTMLElement>(FOCUSABLE) ?? [])
+    const elements = Array.from(settingsPanelRef.current?.querySelectorAll<HTMLElement>(FOCUSABLE) ?? []).filter(isSemanticallyFocusable)
     const first = elements[0]
     const last = elements.at(-1)
     if (first === undefined || last === undefined) return

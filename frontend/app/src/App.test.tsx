@@ -1,6 +1,7 @@
 import { StrictMode, act } from 'react'
 import { readFileSync } from 'node:fs'
 import { createRoot } from 'react-dom/client'
+import { flushSync } from 'react-dom'
 import type { Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as liveAudioSourceModule from './lib/liveAudioSource'
@@ -8,6 +9,7 @@ import * as tauriModule from './lib/tauri'
 import * as instantModelSelectModule from './components/InstantModelSelect'
 import type { StartLiveAudioSourceOptions } from './lib/liveAudioSource'
 import { configureBrowserPreviewFixture } from './lib/browserRuntime'
+import { useSettingsNavigation } from './lib/useSettingsNavigation'
 import App from './App'
 import { FrontendSession } from './FrontendSession'
 import { sessionAuthority } from './SessionAuthority'
@@ -275,6 +277,12 @@ describe('App', () => {
     expect(inline.value).toBe('custom-sol-high')
     expect(settings.value).toBe('custom-sol-high')
     expect(inline.disabled).toBe(false)
+    const dialog = container.querySelector<HTMLElement>('[role="dialog"]')!
+    dialog.scrollTop = 400
+    const error = dialog.querySelector('[role="alert"]')!
+    expect(error.textContent).toContain('Assistant settings could not be saved: Synthetic settings failure')
+    expect(error.closest('.settings-panel__header')).not.toBeNull()
+    expect(error.closest('details')).toBeNull()
     await closeSettings(container)
     expect(getComposer(container).value).toBe('Synthetic preserved draft')
     expect(calls).not.toContain('cancel_prompt')
@@ -437,10 +445,10 @@ describe('App', () => {
     expect(header).not.toBeNull()
     expect(header?.querySelector('[data-shell-identity] img')?.getAttribute('alt')).toBe('VoxGolem')
     expect(header?.querySelector('[data-browser-preview]')?.textContent).toBe('Browser preview')
-    expect(header?.querySelector('[data-runtime-phase]')?.textContent).toContain(getShell(container).dataset['runtimeStatus'])
-    expect(header?.querySelector('[aria-label="Switch to light mode"]')).not.toBeNull()
+    expect(header?.querySelector('[data-runtime-phase]')).toBeNull()
+    expect(header?.querySelector('[aria-label="Theme"]')).toBeNull()
     expect(header?.querySelector('[aria-label="Settings"]')).not.toBeNull()
-    expect(header?.querySelector('button[aria-label="New Chat"]')?.textContent).toContain('New Chat')
+    expect(container.querySelector('.composer [aria-label="New Chat"]')).not.toBeNull()
     expect(container.querySelectorAll('button[aria-label="New Chat"]')).toHaveLength(1)
     expect(getConversation(container).hasAttribute('aria-live')).toBe(false)
     expect(shell.querySelector('main.conversation')).not.toBeNull()
@@ -541,7 +549,7 @@ describe('App', () => {
       getSendButton(container).click()
       await Promise.resolve()
     })
-    const stopButton = Array.from(container.querySelectorAll('button')).find((button) => button.textContent === 'Stop')
+    const stopButton = container.querySelector<HTMLButtonElement>('[aria-label="Stop"]')
     expect(stopButton).not.toBeUndefined()
 
     await act(async () => {
@@ -669,6 +677,14 @@ describe('App', () => {
     const { container } = await renderApp()
     await act(async () => {
       await vi.advanceTimersByTimeAsync(1_000)
+    })
+    const availability = container.querySelector('.composer__surface .composer__availability')
+    expect(availability?.textContent).toContain('Sending disabled: Detailed provider authentication failure')
+    expect(container.querySelectorAll('.composer__availability')).toHaveLength(1)
+    expect(Array.from(container.querySelectorAll('p')).filter((paragraph) => paragraph.textContent?.includes('Detailed provider authentication failure'))).toHaveLength(1)
+    expect(availability?.querySelector('[aria-label="Retry Custom"]')).not.toBeNull()
+    expect(getSendButton(container).disabled).toBe(true)
+    await act(async () => {
       getButtonByLabel(container, 'Settings').click()
       await Promise.resolve()
     })
@@ -2237,7 +2253,7 @@ describe('App', () => {
 
     const { container } = await renderApp()
     await act(async () => {
-      getButtonByLabel(container, 'Switch to light mode').click()
+      changeTheme(container, 'light')
       getButtonByLabel(container, 'Settings').click()
       await Promise.resolve()
       getButtonByLabel(container, 'Increase text size').click()
@@ -2590,8 +2606,8 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    await act(async () => { getButtonByLabel(container, 'Switch to light mode').click() })
-    await act(async () => { getButtonByLabel(container, 'Switch to dark mode').click() })
+    await act(async () => { changeTheme(container, 'light') })
+    await act(async () => { changeTheme(container, 'dark') })
     await act(async () => {
       resolveFirstTheme('light')
       await Promise.resolve()
@@ -2647,8 +2663,8 @@ describe('App', () => {
     }
 
     const { container } = await renderApp()
-    await act(async () => { getButtonByLabel(container, 'Switch to light mode').click() })
-    await act(async () => { getButtonByLabel(container, 'Switch to dark mode').click() })
+    await act(async () => { changeTheme(container, 'light') })
+    await act(async () => { changeTheme(container, 'dark') })
     await act(async () => {
       rejectFirstTheme(new Error('first theme write failed'))
       await Promise.resolve()
@@ -3093,7 +3109,7 @@ describe('App', () => {
     expect(shell.dataset['uiTextSize']).toBe('large')
   })
 
-  it('starts in persisted dark mode and toggles to light mode', async () => {
+  it('starts in persisted dark mode and roundtrips Slate and Light through Settings', async () => {
     const invoked: Array<{ command: string; args: unknown }> = []
     let theme = 'dark'
 
@@ -3140,15 +3156,22 @@ describe('App', () => {
     const shell = getShell(container)
 
     expect(shell.dataset['uiTheme']).toBe('dark')
-    expect(getButtonByLabel(container, 'Switch to light mode').textContent).toBe('☀')
+    await act(async () => { getButtonByLabel(container, 'Settings').click() })
+    expect(getThemeSelect(container).value).toBe('dark')
+
+    expect(Array.from(getThemeSelect(container).options).map((option) => option.value)).toEqual(['dark', 'slate', 'light'])
+    await act(async () => { changeTheme(container, 'slate'); await Promise.resolve() })
+    expect(shell.dataset['uiTheme']).toBe('slate')
+    expect(getThemeSelect(container).value).toBe('slate')
+    expect(invoked).toContainEqual({ command: 'set_ui_theme', args: { theme: 'slate' } })
 
     await act(async () => {
-      getButtonByLabel(container, 'Switch to light mode').click()
+      changeTheme(container, 'light')
       await Promise.resolve()
     })
 
     expect(shell.dataset['uiTheme']).toBe('light')
-    expect(getButtonByLabel(container, 'Switch to dark mode').textContent).toBe('☾')
+    expect(getThemeSelect(container).value).toBe('light')
     expect(invoked).toContainEqual({ command: 'set_ui_theme', args: { theme: 'light' } })
   })
 
@@ -3200,7 +3223,7 @@ describe('App', () => {
     const shell = getShell(container)
 
     await act(async () => {
-      getButtonByLabel(container, 'Switch to light mode').click()
+      changeTheme(container, 'light')
       await Promise.resolve()
     })
 
@@ -3247,10 +3270,11 @@ describe('App', () => {
     const { container } = await renderApp()
 
     expect(getShell(container).dataset['uiTheme']).toBe('dark')
-    expect(getButtonByLabel(container, 'Switch to light mode').textContent).toBe('☀')
+    await act(async () => { getButtonByLabel(container, 'Settings').click() })
+    expect(getThemeSelect(container).value).toBe('dark')
   })
 
-  it('reverts theme and shows a notice when theme persistence fails', async () => {
+  it.each(['light', 'slate'] as const)('reverts %s theme and shows a notice when theme persistence fails', async (theme) => {
     window.__TAURI_INTERNALS__ = {
       invoke: async (command) => {
         if (command === 'get_ui_theme') {
@@ -3286,7 +3310,7 @@ describe('App', () => {
     const { container } = await renderApp()
 
     await act(async () => {
-      getButtonByLabel(container, 'Switch to light mode').click()
+      changeTheme(container, theme)
       await Promise.resolve()
       await Promise.resolve()
     })
@@ -3294,6 +3318,43 @@ describe('App', () => {
     expect(getShell(container).dataset['uiTheme']).toBe('dark')
     expect(container.textContent).toContain('Theme not saved')
     expect(container.textContent).toContain('theme write failed')
+  })
+
+  it('keeps desktop theme failures in the open Settings header and clears them on retry without stale failures', async () => {
+    let writes = 0
+    let rejectEarlier: (error: Error) => void = () => undefined
+    let resolveLatest: (theme: string) => void = () => undefined
+    window.__TAURI_INTERNALS__ = { invoke: async (command) => {
+      if (command === 'get_startup_state') return readyStartupState({ voice_input_available: false })
+      if (command === 'get_ui_theme') return 'dark'
+      if (command === 'get_assistant_settings') return defaultAssistantSettings()
+      if (command === 'set_ui_theme') {
+        writes += 1
+        if (writes === 1) throw new Error('Synthetic theme failure')
+        if (writes === 2) return new Promise((_, reject) => { rejectEarlier = reject })
+        return new Promise((resolve) => { resolveLatest = resolve })
+      }
+      return null
+    } }
+    const { container } = await renderApp()
+    await act(async () => { getButtonByLabel(container, 'Settings').click() })
+    await act(async () => { changeTheme(container, 'light'); await Promise.resolve() })
+    const dialog = container.querySelector<HTMLElement>('[role="dialog"]')!
+    expect(dialog).not.toBeNull()
+    expect(getShell(container).dataset['uiTheme']).toBe('dark')
+    const error = dialog.querySelector('.settings-panel__write-error[role="alert"]')
+    expect(error?.textContent).toContain('Theme could not be saved: Synthetic theme failure')
+    expect(error?.closest('.settings-panel__header')).not.toBeNull()
+    await act(async () => { changeTheme(container, 'slate') })
+    expect(dialog.querySelector('.settings-panel__write-error')).toBeNull()
+    await act(async () => { changeTheme(container, 'light') })
+    await act(async () => { rejectEarlier(new Error('Synthetic stale failure')); await Promise.resolve(); await Promise.resolve() })
+    expect(writes).toBe(3)
+    expect(dialog.querySelector('.settings-panel__write-error')).toBeNull()
+    expect(getShell(container).dataset['uiTheme']).toBe('light')
+    await act(async () => { resolveLatest('light'); await Promise.resolve() })
+    expect(dialog.querySelector('.settings-panel__write-error')).toBeNull()
+    expect(getShell(container).dataset['uiTheme']).toBe('light')
   })
 
   it('reverts text size and shows a notice when settings persistence fails', async () => {
@@ -3346,6 +3407,61 @@ describe('App', () => {
     expect(shell.dataset['uiTextSize']).toBe('medium')
     expect(container.textContent).toContain('Setting not saved')
     expect(container.textContent).toContain('state write failed')
+  })
+
+  it.each([false, true])('traps Settings focus at visible disclosure boundaries (open=%s)', async (open) => {
+    function SettingsFocusHarness() {
+      const navigation = useSettingsNavigation()
+      return <>
+        <button ref={navigation.settingsButtonRef} onClick={navigation.openSettings}>Open synthetic Settings</button>
+        {navigation.settingsOpen ? <div ref={(panel) => { navigation.settingsPanelRef.current = panel }} onKeyDown={navigation.onSettingsKeyDown}>
+          <button ref={navigation.settingsCloseButtonRef}>Close synthetic Settings</button>
+          <details><summary>Advanced model settings</summary><input aria-label="Collapsed advanced input" /></details>
+          <details open={open}>
+            <summary><span data-focus-boundary="summary">Speech details and diagnostics</span></summary>
+            <button data-focus-boundary="body">Synthetic speech action</button>
+            <details><summary data-focus-boundary="nested">Nested diagnostics</summary><input aria-label="Nested collapsed input" /></details>
+          </details>
+          <div hidden><button>Hidden descendant</button><summary>Hidden summary</summary></div>
+          <div inert><a href="#synthetic">Inert descendant</a></div>
+          <input type="hidden" />
+          <button hidden>Hidden button</button>
+          <button disabled>Disabled button</button>
+          <fieldset disabled><input aria-label="Disabled fieldset input" /></fieldset>
+          <button tabIndex={-1}>Explicitly unfocusable button</button>
+          <summary tabIndex={-1}>Explicitly unfocusable summary</summary>
+        </div> : null}
+      </>
+    }
+    const container = document.createElement('div')
+    document.body.append(container)
+    const root = createRoot(container)
+    mountedContainers.push(container)
+    mountedRoots.push(root)
+    await act(async () => { root.render(<SettingsFocusHarness />) })
+    await act(async () => { container.querySelector('button')!.click() })
+    const close = Array.from(container.querySelectorAll('button')).find((button) => button.textContent === 'Close synthetic Settings')!
+    const last = open
+      ? container.querySelector<HTMLElement>('[data-focus-boundary="nested"]')!
+      : container.querySelector('[data-focus-boundary="summary"]')!.parentElement!
+    expect(document.activeElement).toBe(close)
+    await act(async () => { close.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true, cancelable: true })) })
+    expect(document.activeElement).toBe(last)
+    await act(async () => { last.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })) })
+    expect(document.activeElement).toBe(close)
+    if (open) {
+      const outer = container.querySelector<HTMLDetailsElement>('details[open]')!
+      outer.querySelector('details')!.remove()
+      await act(async () => { close.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true })) })
+      const body = outer.querySelector<HTMLButtonElement>('[data-focus-boundary="body"]')!
+      expect(document.activeElement).toBe(body)
+      await act(async () => { body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true })) })
+      expect(document.activeElement).toBe(close)
+      await act(async () => { outer.querySelector('summary')!.click() })
+      expect(outer.open).toBe(false)
+      await act(async () => { close.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true })) })
+      expect(document.activeElement).toBe(outer.querySelector('summary'))
+    }
   })
 
   it('supports keyboard focus and Escape close for the settings overlay', async () => {
@@ -3973,7 +4089,7 @@ describe('App', () => {
 
     expect(getSendButton(container).disabled).toBe(true)
     const microphoneControl = Array.from(container.querySelectorAll<HTMLButtonElement>('button'))
-      .find((button) => button.textContent === 'Start mic' || button.textContent === 'Stop mic')
+      .find((button) => ['Start mic', 'Stop mic'].includes(button.getAttribute('aria-label') ?? ''))
     expect(microphoneControl?.disabled).toBe(true)
     await openSettings(container)
     expect(getTtsToggle(container).disabled).toBe(true)
@@ -4701,6 +4817,39 @@ describe('App', () => {
     expect(getSendButton(container).disabled).toBe(true)
   })
 
+  it('keeps common Model controls before speech and advanced desktop models collapsed', async () => {
+    window.__TAURI_INTERNALS__ = { invoke: async (command) => {
+      if (command === 'get_startup_state') return readyStartupState({ voice_input_error: 'Synthetic speech initialization failure' })
+      if (command === 'get_assistant_settings') return defaultAssistantSettings()
+      return null
+    } }
+    const { container } = await renderApp()
+    await openSettings(container)
+    const instant = container.querySelector<HTMLSelectElement>('#assistantInstantSelect')!
+    const theme = getThemeSelect(container)
+    const textSize = getButtonByLabel(container, 'Increase text size')
+    const speech = container.querySelector('[aria-labelledby="speech-settings-title"]')!
+    expect(instant).not.toBeNull()
+    expect(speech).not.toBeNull()
+    expect(theme.compareDocumentPosition(instant) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(textSize.compareDocumentPosition(instant) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(instant.compareDocumentPosition(speech) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(instant.closest('details')).toBeNull()
+    const advanced = container.querySelector<HTMLDetailsElement>('details.settings-panel__advanced')!
+    expect(advanced.open).toBe(false)
+    expect(advanced.querySelector('[aria-label="Deep model"]')).not.toBeNull()
+    expect(advanced.querySelector('[aria-label="Review model"]')).not.toBeNull()
+    await act(async () => { advanced.querySelector('summary')!.click() })
+    expect(advanced.open).toBe(true)
+    const diagnostics = Array.from(speech.querySelectorAll('details')).find((details) => details.querySelector('summary')?.textContent === 'Speech details and diagnostics')!
+    expect(diagnostics.open).toBe(false)
+    const error = Array.from(speech.querySelectorAll('p')).find((paragraph) => paragraph.textContent === 'Synthetic speech initialization failure')!
+    expect(error).toBeDefined()
+    expect(error.closest('details')).toBeNull()
+    await act(async () => { diagnostics.querySelector('summary')!.click() })
+    expect(diagnostics.open).toBe(true)
+  })
+
   it('shows the actual Custom capability reason beside disabled direct models', async () => {
     const startup = readyStartupState({ capabilities: completeCapabilities({ custom_provider: 'unavailable' })
       .map((capability) => capability['id'] === 'custom_provider'
@@ -4719,7 +4868,7 @@ describe('App', () => {
     expect(select.querySelector<HTMLOptionElement>('option[value="custom-luna-none"]')?.disabled).toBe(true)
   })
 
-  it('keeps Custom startup failure visible and enables direct choices after an explicit retry', async () => {
+  it('keeps unused Custom failure in Settings, not global chat, and enables direct choices after an explicit retry', async () => {
     let recovered = false
     const calls: string[] = []
     const state = () => readyStartupState({ capabilities: completeCapabilities(recovered ? {} : { custom_provider: 'unavailable' })
@@ -4734,8 +4883,10 @@ describe('App', () => {
       throw new Error(`unexpected command: ${command}`)
     } }
     const { container } = await renderApp()
-    expect(container.textContent).toContain('Custom connection: failed to resolve WSL OpenCode auth: WSL command timed out')
+    expect(container.textContent).not.toContain('Custom connection: failed to resolve WSL OpenCode auth: WSL command timed out')
+    expect(container.querySelector('[aria-label="Retry Custom"]')).toBeNull()
     await act(async () => { getButtonByLabel(container, 'Settings').click(); await Promise.resolve() })
+    expect(container.querySelector('[role="dialog"]')?.textContent).toContain('Custom connection: failed to resolve WSL OpenCode auth: WSL command timed out')
     const select = container.querySelector<HTMLSelectElement>('select[aria-label="Instant"]')!
     expect(select.querySelector<HTMLOptionElement>('option[value="custom-luna-none"]')?.disabled).toBe(true)
     await act(async () => { getButtonByLabel(container, 'Retry Custom').click(); await Promise.resolve() })
@@ -4756,10 +4907,10 @@ describe('App', () => {
       throw new Error(`unexpected command: ${command}`)
     } }
     const { container } = await renderApp()
-    const indicator = container.querySelector<HTMLElement>('.composer__instant-model')
+    const indicator = container.querySelector<HTMLElement>('.composer__model-pill')
     const mic = getControlButton(container, 'Start mic')
     expect(indicator?.querySelector<HTMLSelectElement>('select')?.selectedOptions[0]?.textContent).toBe('Custom: GPT-6 Luna No Reasoning')
-    expect(mic.compareDocumentPosition(indicator!)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+    expect(indicator!.compareDocumentPosition(mic) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
     const select = await getResponseProfileSelect(container)
     expect(select.value).toBe('custom-luna-none')
     expect(select.querySelector('option[value="custom-luna-none"]')).not.toBeNull()
@@ -4962,7 +5113,7 @@ describe('App', () => {
       await Promise.resolve()
     })
     const stopButton = Array.from(container.querySelectorAll('button')).find(
-      (button) => button.textContent === 'Stop',
+      (button) => button.getAttribute('aria-label') === 'Stop',
     )
     expect(stopButton).toBeDefined()
 
@@ -5037,14 +5188,14 @@ describe('App', () => {
     })
     expect(frames).toHaveLength(1)
     await act(async () => {
-      Array.from(container.querySelectorAll('button')).find((button) => button.textContent === 'Stop')!.click()
+      getButtonByLabel(container, 'Stop').click()
       frames[0]?.(16)
       send?.({ payload: { request_id: requestId, kind: 'text', text: 'Synthetic late answer' } })
     })
     expect(getConversation(container).textContent).not.toContain('Synthetic queued answer')
     expect(getConversation(container).textContent).not.toContain('Synthetic late answer')
     expect(frames).toHaveLength(1)
-    expect(Array.from(container.querySelectorAll('button')).find((button) => button.textContent === 'Stopping…')!.disabled).toBe(true)
+    expect(getButtonByLabel(container, 'Stopping…').disabled).toBe(true)
     await act(async () => {
       setTextAreaValue(getComposer(container), 'Synthetic second question')
       getSendButton(container).click()
@@ -5427,14 +5578,14 @@ describe('App', () => {
       getSendButton(container).click()
       await Promise.resolve()
     })
-    expect(container.textContent).toContain('Stop')
+    expect(getButtonByLabel(container, 'Stop')).not.toBeNull()
 
     await act(async () => {
       window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
       await Promise.resolve()
     })
     expect(cancelledRequestId).toBe(activeRequestId)
-    expect(container.textContent).toContain('Stopping')
+    expect(getButtonByLabel(container, 'Stopping…').disabled).toBe(true)
 
     await act(async () => {
       promptEventHandler?.({
@@ -5476,10 +5627,10 @@ describe('App', () => {
     }
     const { container } = await renderApp()
     await act(async () => { setTextAreaValue(getComposer(container), 'stop me'); getSendButton(container).click(); await Promise.resolve() })
-    const stopButton = Array.from(container.querySelectorAll('button')).find((button) => button.textContent === 'Stop')
+    const stopButton = container.querySelector<HTMLButtonElement>('[aria-label="Stop"]')
     expect(stopButton).toBeDefined()
     await act(async () => { stopButton?.click(); await Promise.resolve() })
-    expect(container.textContent).toContain('Stopping')
+    expect(getButtonByLabel(container, 'Stopping…').disabled).toBe(true)
     await act(async () => { finishPrompt?.({ request_id: requestId, runtime_phase: 'sleeping', outcome: 'cancelled' }); await Promise.resolve() })
     expect(container.textContent).not.toContain('Stopping')
     await act(async () => { await Promise.resolve(); await Promise.resolve(); })
@@ -5505,7 +5656,7 @@ describe('App', () => {
     }
     const { container } = await renderApp()
     await act(async () => { setTextAreaValue(getComposer(container), 'finish me'); getSendButton(container).click(); await Promise.resolve() })
-    const stopButton = Array.from(container.querySelectorAll('button')).find((button) => button.textContent === 'Stop')
+    const stopButton = container.querySelector<HTMLButtonElement>('[aria-label="Stop"]')
     await act(async () => { stopButton?.click(); await Promise.resolve() })
     await act(async () => { await Promise.resolve(); await Promise.resolve() })
     expect(container.textContent).toContain('Executing prompt')
@@ -5540,14 +5691,15 @@ describe('App', () => {
     await act(async () => { setTextAreaValue(getComposer(container), 'Synthetic cancelled presentation'); getSendButton(container).click() })
     await act(async () => { channel({ kind: 'text', text: 'Synthetic obsolete queued text' }) })
     expect(frames).toHaveLength(1)
-    await act(async () => { Array.from(container.querySelectorAll('button')).find((button) => button.textContent === 'Stop')!.click() })
+    await act(async () => { getButtonByLabel(container, 'Stop').click() })
     await act(async () => {
       frames[0]!(16)
       channel({ kind: 'text', text: 'Synthetic obsolete Channel text' })
     })
     expect(frames).toHaveLength(1)
     expect(getConversation(container).textContent).not.toContain('Synthetic obsolete')
-    expect(getSendButton(container).disabled).toBe(true)
+    expect(getSendButton(container).type).toBe('button')
+    expect(getSendButton(container).getAttribute('aria-label')).toBe('Stop')
     await act(async () => {
       committed = canonicalTurn('41', '42', 'Synthetic cancelled presentation', 'Synthetic trusted canonical completion', requestId)
       finish({ request_id: requestId, runtime_phase: 'sleeping', outcome: 'completed' })
@@ -7621,7 +7773,7 @@ describe('App', () => {
     expect(container.textContent).not.toContain('transcript:\nOpen the pull request')
     expect(container.textContent).toContain('Open the pull request')
     expect(container.textContent).toContain('Voice execution response')
-    expect(container.textContent).toContain('Stop mic')
+    expect(getControlButton(container, 'Stop mic').disabled).toBe(false)
     const events = window.__VOXGOLEM_VOICE_TELEMETRY__?.snapshot().events.map((event) => event.event) ?? []
     expect(events).toContain('transcription_started')
     expect(events).toContain('transcription_completed')
@@ -8096,7 +8248,7 @@ describe('App', () => {
       'Runtime control error (mark_silence): utterance transcription failed: InvalidTranscript(EmptyText)',
     )
     expect(container.textContent).toContain('Runtime control failed')
-    expect(container.textContent).toContain('Stop mic')
+    expect(getControlButton(container, 'Stop mic').disabled).toBe(false)
     expect(getShell(container).dataset['runtimeStatus']).toBe('sleeping')
     nowMs = 4_000
     lastSpeechMs = nowMs
@@ -8144,7 +8296,7 @@ describe('App', () => {
     await vi.waitFor(() => expect(invokedCommands).toContain('mark_silence'))
     expect(playedSources).not.toContain('resources/stop-listening.wav')
     expect(invokedCommands).not.toContain('submit_prompt')
-    expect(container.textContent).toContain('Stop mic')
+    expect(getControlButton(container, 'Stop mic').disabled).toBe(false)
     await act(async () => { await onFrame?.([0.001, -0.001]); await Promise.resolve() })
     expect(phase).toBe('sleeping')
   })
@@ -8366,7 +8518,7 @@ describe('App', () => {
 
     expect(container.textContent).toContain('Microphone unavailable')
     expect(container.textContent).not.toContain('live_audio_error:\nPermission denied')
-    expect(container.textContent).toContain('Start mic')
+    expect(getControlButton(container, 'Start mic').disabled).toBe(false)
   })
 
   it('auto-starts microphone capture when voice input is ready', async () => {
@@ -8804,7 +8956,7 @@ describe('App', () => {
       'ingest_audio_frame',
       'ingest_audio_frame',
     ])
-    expect(container.textContent).toContain('Stop mic')
+    expect(getButtonByLabel(container, 'Stop mic').disabled).toBe(false)
   })
 
   it('hides raw runtime control rejection messages from chat', async () => {
@@ -9001,13 +9153,26 @@ function getResponseAnnouncer(container: HTMLElement): HTMLElement {
 
 function getSendButton(container: HTMLElement): HTMLButtonElement {
   assertSettingsClosed(container)
-  const button = container.querySelector<HTMLButtonElement>('button[type="submit"]')
+  const button = container.querySelector<HTMLButtonElement>('.composer__prompt-row > .composer__button')
 
   if (button === null) {
     throw new Error('Missing send button')
   }
 
   return button
+}
+
+function getThemeSelect(container: HTMLElement): HTMLSelectElement {
+  const select = container.querySelector<HTMLSelectElement>('select[aria-label="Theme"]')
+  if (!select) throw new Error('Missing Theme selector')
+  return select
+}
+
+function changeTheme(container: HTMLElement, theme: 'dark' | 'slate' | 'light'): void {
+  const wasClosed = container.querySelector('[role="dialog"]') === null
+  if (wasClosed) flushSync(() => { getButtonByLabel(container, 'Settings').click() })
+  setSelectValue(getThemeSelect(container), theme)
+  if (wasClosed) flushSync(() => { getButtonByLabel(container, 'Close settings').click() })
 }
 
 function getButtonByLabel(container: HTMLElement, label: string): HTMLButtonElement {
@@ -9022,7 +9187,7 @@ function getButtonByLabel(container: HTMLElement, label: string): HTMLButtonElem
 
 function getButtonByText(container: HTMLElement, text: string): HTMLButtonElement {
   const button = Array.from(container.querySelectorAll<HTMLButtonElement>('button'))
-    .find((candidate) => candidate.textContent?.trim() === text)
+    .find((candidate) => candidate.textContent?.trim() === text || candidate.getAttribute('aria-label') === text)
   if (button === undefined) {
     throw new Error(`Missing ${text} button`)
   }
@@ -9040,7 +9205,7 @@ function getControlButton(
 ): HTMLButtonElement {
   assertSettingsClosed(container)
   const buttons = Array.from(container.querySelectorAll<HTMLButtonElement>('button'))
-  const button = buttons.find((candidate) => candidate.textContent?.trim() === label)
+  const button = buttons.find((candidate) => candidate.getAttribute('aria-label') === label)
 
   if (button === undefined) {
     throw new Error(`Missing ${label} control button`)

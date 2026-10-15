@@ -18,6 +18,8 @@ interface Props {
 }
 
 export function SpeechSettings({ android, androidStatus, statusError, startupState, speechNetworkFallback = true, disabled = false, onSpeechNetworkFallbackChange, speechSelection = DEFAULT_SPEECH_SELECTION, onSpeechSelectionChange }: Props) {
+  const fallbackHelpId = useId()
+  const modelId = useId()
   const capabilities = startupState.kind === 'ready' || startupState.kind === 'warming_model'
     ? startupState.capabilities : []
   const speechServices = startupState.kind === 'ready' || startupState.kind === 'warming_model'
@@ -32,11 +34,28 @@ export function SpeechSettings({ android, androidStatus, statusError, startupSta
         <button type="button" className="shell__control settings-panel__interactive" onClick={() => void openSpeechServicesStore()}>Open Play Store</button>
       </div> : null}
       {(localOnlyAvailable || !speechNetworkFallback) && onSpeechNetworkFallbackChange ? <>
-        <label className="shell__toggle settings-panel__interactive"><input type="checkbox" aria-label="Allow speech network fallback" checked={speechNetworkFallback} disabled={disabled} onChange={(event) => { if (!disabled && (event.target.checked || localOnlyAvailable)) onSpeechNetworkFallbackChange(event.target.checked) }} /> Allow speech network fallback</label>
-        <p>Local-first speech requested{speechNetworkFallback ? '; network fallback permitted when supported.' : '; network fallback disabled where supported.'} This preference is not proof of offline processing; the provider may not report the actual route.</p>
+        <label className="shell__toggle settings-panel__interactive"><input type="checkbox" aria-label="Allow speech network fallback" aria-describedby={fallbackHelpId} checked={speechNetworkFallback} disabled={disabled} onChange={(event) => { if (!disabled && (event.target.checked || localOnlyAvailable)) onSpeechNetworkFallbackChange(event.target.checked) }} /> Allow speech network fallback</label>
+        <p id={fallbackHelpId}>Local-first speech requested{speechNetworkFallback ? '; network fallback permitted when supported.' : '; network fallback disabled where supported.'} This is not proof of offline processing.</p>
       </> : null}
-      {!localOnlyAvailable ? <p>{androidStatus === null ? statusError ? 'Dedicated on-device recognition capability is not reported.' : 'Checking dedicated on-device recognition capability.' : 'The dedicated on-device API is unavailable or not reported. Ordinary recognition providers may still work offline; this does not verify or enforce offline processing.'} {speechNetworkFallback ? 'Disabling speech network fallback is unavailable until the dedicated capability is reported.' : 'You can re-enable speech network fallback to allow provider-controlled recognition when available.'}</p> : null}
+      {!localOnlyAvailable ? <p>{androidStatus === null ? statusError ? 'Dedicated on-device recognition capability is not reported.' : 'Checking dedicated on-device recognition capability.' : 'The dedicated on-device API is unavailable or not reported.'} {speechNetworkFallback ? 'Disabling speech network fallback is unavailable until the dedicated capability is reported.' : 'You can re-enable speech network fallback.'}</p> : null}
       {onSpeechSelectionChange ? <AndroidSpeechSelectors status={androidStatus} selection={speechSelection} fallback={speechNetworkFallback} localOnlyAvailable={localOnlyAvailable} disabled={disabled} onChange={onSpeechSelectionChange} /> : null}
+      <p>Voice input (STT): {androidStatus === null ? statusError ? 'Status not reported' : 'Checking…' : androidStatus.available ? 'Available' : 'Unavailable'} · Speech output (TTS): {androidStatus === null ? 'Status not reported' : androidStatus.ttsAvailable ? 'Available' : 'Unavailable'}{androidStatus === null ? '' : androidStatus.ttsEnabled ? ' · Speak replies enabled' : ' · Speak replies disabled'}</p>
+      {visibleSpeechError(androidStatus?.error) ? <p>{visibleSpeechError(androidStatus?.error)}</p> : null}
+      {statusError ? <p>{statusError}</p> : null}
+      <details>
+      <summary>Speech details and diagnostics</summary>
+      <p>Saved requests are not proof of the provider, locale, voice or processing route used by the last session. The provider may not report the actual route.</p>
+      <p>Ordinary recognition providers may still work offline; this does not verify or enforce offline processing.</p>
+      <p>Voices for another engine appear only after its native inventory is prepared. The native runtime validates language/voice compatibility. Automatic does not confirm which voice will be selected.</p>
+      {onSpeechSelectionChange ? <>
+        <label className="speech-selection__field" htmlFor={modelId}>Speech model<select id={modelId} aria-label="Speech model" disabled><option>Unavailable — model identifiers not reported</option></select></label>
+        <section aria-label="Last native-reported requested configuration">
+          <h4>Last native-reported requested configuration</h4>
+          <p>Language: {androidStatus?.speechLanguage || 'Automatic / not reported'}</p>
+          <p>TTS engine: {androidStatus?.speechTtsProvider || 'Automatic / not reported'}</p>
+          <p>TTS voice: {androidStatus?.speechTtsVoice || 'Automatic / not reported'}</p>
+        </section>
+      </> : null}
       <h4>Voice input (STT)</h4>
       <p>{androidStatus?.reason || unreportedStatus || 'Checking native speech…'}</p>
       <p>{androidStatus?.recognitionRoute ?? 'Recognition provider, locale and processing route not reported'}</p>
@@ -44,10 +63,16 @@ export function SpeechSettings({ android, androidStatus, statusError, startupSta
       <h4>Speech output (TTS)</h4>
       <p>{androidStatus?.ttsRoute ?? 'Speech engine, voice and processing route not reported'}</p>
       <AndroidSpeechIdentity metadata={androidStatus?.ttsMetadata} />
-      <p>{androidStatus === null ? unreportedStatus || 'Checking speech output…' : androidStatus.ttsAvailable ? 'Available' : 'Unavailable'}{androidStatus === null ? '' : androidStatus.ttsEnabled ? ' · Speak replies enabled' : ' · Speak replies disabled'}</p>
-      {visibleSpeechError(androidStatus?.error) ? <p>{visibleSpeechError(androidStatus?.error)}</p> : null}
-      {statusError ? <p>{statusError}</p> : null}
+      </details>
     </> : <>
+      {(['parakeet', 'tts', 'wake_word', 'vad'] as const).map((id) => {
+        const capability = capabilities.find((item) => item.id === id)
+        const label = { parakeet: 'Voice input (STT)', tts: 'Speech output (TTS)', wake_word: 'Wake word', vad: 'Voice activity detection' }[id]
+        return <p key={id}>{label}: {capability ? capability.state.replaceAll('_', ' ') : 'Status not reported'}</p>
+      })}
+      {(startupState.kind === 'ready' || startupState.kind === 'warming_model') && startupState.voiceInputError ? <p>{startupState.voiceInputError}</p> : null}
+      <details>
+      <summary>Speech details and diagnostics</summary>
       {(['parakeet', 'tts', 'wake_word', 'vad'] as const).map((id) => {
         const capability = capabilities.find((item) => item.id === id)
         const label = { parakeet: 'Voice input (STT)', tts: 'Speech output (TTS)', wake_word: 'Wake word', vad: 'Voice activity detection' }[id]
@@ -59,7 +84,7 @@ export function SpeechSettings({ android, androidStatus, statusError, startupSta
           {id === 'parakeet' || id === 'tts' ? <SpeechIdentity metadata={id === 'parakeet' ? speechServices?.stt : speechServices?.tts} output={id === 'tts'} /> : null}
         </div>
       })}
-      {(startupState.kind === 'ready' || startupState.kind === 'warming_model') && startupState.voiceInputError ? <p>{startupState.voiceInputError}</p> : null}
+      </details>
     </>}
   </section>
 }
@@ -94,22 +119,14 @@ function AndroidSpeechSelectors({ status, selection, fallback, localOnlyAvailabl
     if (voice.provider !== selection.speechTtsProvider || voice.name === '') continue
     if (!voices.has(voice.name)) voices.set(voice.name, voice)
   }
-  const modelId = useId()
   return <section aria-label="Requested speech configuration">
     <h4>Requested speech configuration</h4>
-    <p>These are saved requests, not proof of the provider, locale, voice or processing route used by the last session.</p>
-    <SpeechChoiceSelect label="Speech language" value={selection.speechLanguage} choices={[...new Set(languages ?? [])].filter((language) => language !== '').map((language) => ({ value: language, label: language }))} disabled={disabled} onChange={(speechLanguage) => onChange({ ...selection, speechLanguage })} />
+    <p>Saved preferences, not observed selection; see speech details for reported facts.</p>
+    <SpeechChoiceSelect label="Speech language" value={selection.speechLanguage} choices={[...new Set(languages ?? [])].filter((language) => language !== '').map((language) => ({ value: language, label: language }))} disabled={disabled} onChange={(speechLanguage) => onChange({ ...selection, speechLanguage })} description="Requested speech locale; Automatic lets the native runtime choose." />
     {languages == null ? <p>Language support is not reported under this policy. Only Automatic is available until supported choices are reported.</p> : null}
-    <SpeechChoiceSelect label="TTS engine" value={selection.speechTtsProvider} choices={providers.map((provider) => ({ value: provider, label: provider }))} disabled={disabled} onChange={(speechTtsProvider) => onChange({ ...selection, speechTtsProvider, speechTtsVoice: '' })} description="Changing the TTS engine resets the requested voice to Automatic. Voices for another engine appear only after its native inventory is prepared." />
-    <SpeechChoiceSelect label="TTS voice" value={selection.speechTtsVoice} choices={[...voices.values()].map((voice) => ({ value: voice.name, label: `${voice.name} · ${voice.language}${voice.networkRequired ? fallback ? ' · network required' : ' · unavailable: network fallback is off' : ' · SDK network not required'}`, disabled: voice.networkRequired && !fallback }))} disabled={disabled} onChange={(speechTtsVoice) => onChange({ ...selection, speechTtsVoice })} description="Only reported voices for the requested engine are listed. The native runtime validates language/voice compatibility. Clear a network voice to Automatic before disabling fallback. Automatic does not confirm which voice will be selected." />
+    <SpeechChoiceSelect label="TTS engine" value={selection.speechTtsProvider} choices={providers.map((provider) => ({ value: provider, label: provider }))} disabled={disabled} onChange={(speechTtsProvider) => onChange({ ...selection, speechTtsProvider, speechTtsVoice: '' })} description="Changing the TTS engine resets the requested voice to Automatic." />
+    <SpeechChoiceSelect label="TTS voice" value={selection.speechTtsVoice} choices={[...voices.values()].map((voice) => ({ value: voice.name, label: `${voice.name} · ${voice.language}${voice.networkRequired ? fallback ? ' · network required' : ' · unavailable: network fallback is off' : ' · SDK network not required'}`, disabled: voice.networkRequired && !fallback }))} disabled={disabled} onChange={(speechTtsVoice) => onChange({ ...selection, speechTtsVoice })} description="Reported voices for the requested engine; clear a network voice to Automatic before disabling fallback." />
     {(selection.speechLanguage !== '' || selection.speechTtsProvider !== '' || selection.speechTtsVoice !== '') ? <button type="button" className="shell__control settings-panel__interactive" aria-label="Use Automatic speech settings" disabled={disabled} onClick={() => { if (!disabled) onChange(DEFAULT_SPEECH_SELECTION) }}>Use Automatic speech settings</button> : null}
-    <label className="speech-selection__field" htmlFor={modelId}>Speech model<select id={modelId} aria-label="Speech model" disabled><option>Unavailable — model identifiers not reported</option></select></label>
-    <section aria-label="Last native-reported requested configuration">
-      <h4>Last native-reported requested configuration</h4>
-      <p>Language: {status?.speechLanguage || 'Automatic / not reported'}</p>
-      <p>TTS engine: {status?.speechTtsProvider || 'Automatic / not reported'}</p>
-      <p>TTS voice: {status?.speechTtsVoice || 'Automatic / not reported'}</p>
-    </section>
   </section>
 }
 

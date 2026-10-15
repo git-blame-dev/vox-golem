@@ -181,7 +181,8 @@ describe('admitted search mode and generation-owned presentation', () => {
     expect(selector.disabled).toBe(true)
     for (const message of ['Searching', 'Reading', 'Fallback', 'Partial']) {
       await act(async () => { requests[0]!.updates.send({ kind: 'status', message }) })
-      expect(container.querySelector('.composer__status')?.textContent).toBe(message)
+      expect(container.querySelector('.composer [role="status"].sr-only')?.textContent).toBe(message)
+      expect(container.querySelector('.composer__status')).toBeNull()
     }
     await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="New Chat"]')!.click() })
     expect(selector.value).toBe('quick')
@@ -194,7 +195,8 @@ describe('admitted search mode and generation-owned presentation', () => {
       requests[0]!.updates.send({ kind: 'status', message: 'Synthetic stale fallback' })
       requests[0]!.finish()
     })
-    expect(container.querySelector('.composer__status')?.textContent).toBe('Reading')
+    expect(container.querySelector('.composer [role="status"].sr-only')?.textContent).toBe('Reading')
+    expect(container.querySelector('.composer__status')).toBeNull()
     await act(async () => { requests[1]!.finish() })
   })
 

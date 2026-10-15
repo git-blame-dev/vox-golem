@@ -1,20 +1,75 @@
-.android-voice-controls--compact {
-  flex-wrap: nowrap;
+.android-voice-controls--composer {
+  position: relative;
+  display: flex;
+  flex: 0 1 auto;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: .35rem;
+  min-width: 0;
+  max-width: 100%;
+  margin: 0;
 }
 
-.android-voice-controls--compact .shell__icon-control {
-  min-width: 48px;
-  min-height: 48px;
+.shell .android-voice-controls--composer .shell__icon-control {
   width: 48px;
   height: 48px;
+  min-width: 48px;
+  min-height: 48px;
+  border-radius: 999px;
+  background: var(--surface-pill);
 }
 
-.android-voice-controls--compact .shell__icon-control svg[data-icon-state] {
+.android-voice-controls--composer .shell__icon-control:hover:not(:disabled) {
+  background: var(--surface-pill-hover);
+}
+
+.shell .android-voice-controls--composer [data-voice-mode='ask'] {
+  background: var(--accent-primary);
+  color: var(--accent-primary-text);
+}
+
+.android-voice-controls--composer [data-voice-mode='dictate'] {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: -3px;
+}
+
+.android-voice-controls__mode {
+  flex: 1 1 100%;
+  text-align: end;
+  color: var(--text-muted);
+  font-size: .8em;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  max-width: 18em;
+}
+
+.android-voice-controls__armed {
+  position: absolute;
+  inset-inline-end: 0;
+  bottom: calc(100% + .25rem);
+  z-index: 1;
+  width: max-content;
+  max-width: min(18em, 70vw);
+  padding: .35rem .6rem;
+  border-radius: .75rem;
+  background: var(--surface-panel-strong);
+  color: var(--text-primary);
+  font-size: .85em;
+  pointer-events: none;
+}
+
+.android-voice-controls--composer .shell__icon-control:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.android-voice-controls--composer .shell__icon-control svg[data-icon-state] {
   width: 32px;
   height: 32px;
 }
 
-.android-voice-controls--compact .android-voice-controls__mark-background {
+.android-voice-controls__mark-background {
   fill: var(--surface-panel-strong, Canvas);
   stroke: none;
 }
@@ -28,12 +83,12 @@
   background: var(--surface-panel-strong);
   color: var(--text-primary);
   border: 1px solid var(--border-strong);
-  border-radius: 12px;
+  border-radius: 20px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
 }
 
 .speech-prompt-dialog::backdrop {
-  background: rgba(0, 0, 0, 0.6);
+  background: var(--overlay-bg, rgba(0, 0, 0, 0.6));
 }
 
 .speech-prompt-dialog__content {

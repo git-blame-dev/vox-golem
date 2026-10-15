@@ -9,7 +9,7 @@ export function SearchModeSelect({ value, disabled, reason, onChange, iconOnly =
 }) {
   const hintId = useId()
   const description = `Search mode: ${SEARCH_MODE_LABELS[value]}${reason ? `. ${reason}` : disabled ? '. Temporarily unavailable' : ''}`
-  const select = <select aria-label="Search mode" value={value} disabled={disabled} title={iconOnly ? description : undefined} aria-describedby={iconOnly || reason ? hintId : undefined}
+  const select = <select aria-label="Search mode" value={value} disabled={disabled} title={description} aria-describedby={iconOnly || reason ? hintId : undefined}
     onChange={(event) => {
       const mode = event.target.value as SearchMode
       if (!disabled && SEARCH_MODES.includes(mode)) onChange(mode)
@@ -18,8 +18,11 @@ export function SearchModeSelect({ value, disabled, reason, onChange, iconOnly =
   </select>
   return <div className={iconOnly ? 'search-mode search-mode--icon-only' : 'search-mode'} data-search-mode={iconOnly ? value : undefined}>
     {iconOnly ? <span className="native-icon-select shell__icon-control search-mode__icon-control" title={description}>
-      <ControlIcon kind="search" />{select}
+      <ControlIcon kind="search" /><span className="shell__overflow-label" aria-hidden="true">Search: {SEARCH_MODE_LABELS[value]}</span>{select}
     </span> : <label className="search-mode__label">Search:{select}</label>}
-    {iconOnly || reason ? <span id={hintId} className={iconOnly ? 'search-mode__reason sr-only' : 'search-mode__reason'}>{iconOnly ? description : reason}</span> : null}
+    {iconOnly ? <span id={hintId} className="search-mode__reason sr-only">{description}</span> : reason ? <details className="search-mode__help">
+      <summary>Search info</summary>
+      <p id={hintId} className="search-mode__reason">{reason}</p>
+    </details> : null}
   </div>
 }
