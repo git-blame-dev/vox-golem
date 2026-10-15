@@ -332,7 +332,13 @@ class EnginePhoneBackend internal constructor(
              "unsupported_tts_provider" -> AssistantPhoneFailure("unavailable", "Selected TTS provider is not installed or available")
              "unsupported_tts_voice" -> AssistantPhoneFailure("unavailable", "Selected TTS voice is not available for this provider, language or network policy")
              "invalid_speech_selection" -> AssistantPhoneFailure("invalid_input", "Invalid speech selection")
-            "background", "backgrounded" -> AssistantPhoneFailure("unavailable", "The app must be in the foreground to send a request")
+             "background", "backgrounded" -> AssistantPhoneFailure("unavailable", "The app must be in the foreground to send a request")
+            "aicore_not_available" -> AssistantPhoneFailure("unavailable", "Gemini Nano on-device model is not available on this device")
+            "aicore_needs_update" -> AssistantPhoneFailure("unavailable", "Gemini Nano requires an AICore system update")
+            "aicore_busy" -> AssistantPhoneFailure("busy", "Gemini Nano on-device service is busy")
+            "aicore_downloading" -> AssistantPhoneFailure("unavailable", "Gemini Nano model is downloading in the background. Please wait and try again shortly.")
+            "aicore_unavailable" -> AssistantPhoneFailure("unavailable", "Gemini Nano on-device model is currently unavailable")
+            "internal_error" -> AssistantPhoneFailure("internal", "Assistant internal error. The draft is retained; retry explicitly.")
             else -> AssistantPhoneFailure("unavailable", "Assistant request failed. The draft is retained; retry explicitly.")
         }
     }
