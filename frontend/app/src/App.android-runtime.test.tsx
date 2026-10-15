@@ -19,7 +19,7 @@ afterEach(() => {
 })
 
 describe('production Android App runtime', () => {
-  it('does not offer unsupported Android Prefetch or emit an invalid preference proposal', async () => {
+  it('keeps Instant before speech and omits unsupported Android model controls without invalid preference proposals', async () => {
     vi.stubEnv('VITE_VOXGOLEM_RUNTIME', 'android'); vi.resetModules(); window.history.replaceState(null, '')
     const invoke = vi.fn(async (command: string) => command === 'get_app_snapshot' ? wireSnapshot() : null)
     window.__TAURI_INTERNALS__ = { invoke }
@@ -27,10 +27,33 @@ describe('production Android App runtime', () => {
     container = document.createElement('div'); document.body.append(container); root = createRoot(container)
     await act(async () => { root?.render(<App />) })
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
-    const prefetch = Array.from(container.querySelectorAll('label')).find((label) => label.textContent === ' Prefetch')?.querySelector<HTMLInputElement>('input')
-    expect(prefetch).toBeDefined()
-    expect(prefetch!.disabled).toBe(true)
-    await act(async () => { prefetch!.click() })
+    const instant = container.querySelector<HTMLSelectElement>('#assistantInstantSelect')!
+    expect(instant).not.toBeNull()
+    expect(instant.closest('details')).toBeNull()
+    for (const control of ['select[aria-label="Theme"]', '[aria-label="Increase text size"]']) {
+      const appearance = container.querySelector(control)!
+      expect(appearance).not.toBeNull()
+      expect(appearance.compareDocumentPosition(instant) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    }
+    for (const label of ['Deep', 'Review', 'Completion', 'Prefetch']) {
+      expect(Array.from(container.querySelectorAll('label')).find((element) => element.textContent?.trim() === label)).toBeUndefined()
+    }
+    expect(container.querySelector('[aria-label="Deep model"]')).toBeNull()
+    expect(container.querySelector('[aria-label="Review model"]')).toBeNull()
+    expect(container.querySelector('.settings-panel__advanced')).toBeNull()
+    const speech = container.querySelector('select[aria-label="Speech language"]')!
+    expect(speech).not.toBeNull()
+    expect(instant.compareDocumentPosition(speech) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    const diagnostics = Array.from(container.querySelectorAll('details')).find((details) => details.querySelector('summary')?.textContent === 'Speech details and diagnostics')!
+    expect(diagnostics).toBeDefined()
+    expect(diagnostics.open).toBe(false)
+    for (const label of ['Speech language', 'TTS engine', 'TTS voice']) {
+      const control = container.querySelector(`select[aria-label="${label}"]`)!
+      expect(control).not.toBeNull()
+      expect(control.closest('details')).toBeNull()
+    }
+    await act(async () => { diagnostics.querySelector('summary')!.click() })
+    expect(diagnostics.open).toBe(true)
     expect(invoke.mock.calls.some(([command]) => command === 'set_preferences')).toBe(false)
     window.history.replaceState(null, '')
   })
@@ -275,7 +298,7 @@ describe('production Android App runtime', () => {
     expect(container.querySelector('.shell')?.getAttribute('data-platform')).toBe(platform)
     if (platform === 'android') {
       expect(search.closest('.shell__header-actions')).not.toBeNull()
-      expect(search.closest('.shell__header-actions')?.querySelector('[aria-label="Ask"]')).not.toBeNull()
+      expect(container.querySelector('.composer__utility-row [aria-label="Ask"]')).not.toBeNull()
       expect(container.querySelector('.composer__search')).toBeNull()
       expect(search.closest('.native-icon-select')?.querySelector('svg[data-icon-kind="search"]')).not.toBeNull()
       expect(search.closest('.search-mode')?.querySelector('.search-mode__label')).toBeNull()
@@ -285,7 +308,7 @@ describe('production Android App runtime', () => {
       expect(search.closest('.native-icon-select')).toBeNull()
       expect(search.closest('label')?.firstChild?.textContent).toBe('Search:')
       expect(promptRow.compareDocumentPosition(search) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
-      expect(search.closest('.composer__actions')?.querySelector('button[type="submit"]')?.textContent).toBe('Send')
+      expect(promptRow.querySelector('button[type="submit"]')?.getAttribute('aria-label')).toBe('Send')
     }
     expect(search.value).toBe('quick')
     expect(search.disabled).toBe(false)
@@ -308,7 +331,7 @@ describe('production Android App runtime', () => {
     if (platform === 'android') expect(search.getAttribute('title')).toContain('Web is off. Normal chat remains available')
   })
 
-  it.each(['android', 'desktop'] as const)('compacts routine composer progress only on Android and retains detailed failures on %s', async (platform) => {
+  it.each(['android', 'desktop'] as const)('keeps routine progress screen-reader accessible and retains detailed failures on %s', async (platform) => {
     vi.stubEnv('VITE_VOXGOLEM_RUNTIME', platform); vi.resetModules(); window.history.replaceState(null, '')
     let updates: (value: unknown) => void = () => undefined
     let finish: () => void = () => undefined
@@ -330,24 +353,18 @@ describe('production Android App runtime', () => {
     const input = container.querySelector<HTMLTextAreaElement>('#promptComposer')!
     await act(async () => { Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set?.call(input, 'Synthetic compact status question'); input.dispatchEvent(new Event('input', { bubbles: true })) })
     await act(async () => { container!.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })
-    const stop = container.querySelector<HTMLButtonElement>(platform === 'android' ? '.shell__header-actions button[aria-label="Stop"]' : '.composer__send-side button')!
+    const stop = container.querySelector<HTMLButtonElement>('.composer__prompt-row > button[aria-label="Stop"]')!
     expect(stop).not.toBeNull()
     expect(stop.disabled).toBe(false)
-    if (platform === 'android') expect(stop.querySelector('svg[aria-hidden="true"]')).not.toBeNull()
-    else expect(stop.textContent).toBe('Stop')
+    expect(stop.querySelector('svg[aria-hidden="true"]')).not.toBeNull()
     for (const message of ['Executing prompt…', 'Searching', 'Reading']) {
       if (message !== 'Executing prompt…') await act(async () => { updates({ kind: 'status', message }) })
-      const status = container.querySelector('.composer__status')!
+      const status = container.querySelector('.composer [role="status"].sr-only')!
       expect(status.textContent).toBe(message)
       expect(status.getAttribute('role')).toBe('status')
       expect(status.getAttribute('aria-live')).toBe('polite')
-      expect(status.classList.contains('composer__status--compact')).toBe(platform === 'android')
-      if (platform === 'android') {
-        expect(status.closest('.shell__header-actions')).not.toBeNull()
-        expect(status.querySelector('.sr-only')?.textContent).toBe(message)
-        expect(status.querySelector('svg[aria-hidden="true"]')).not.toBeNull()
-        expect(status.getAttribute('title')).toBe(message)
-      }
+      expect(status.classList.contains('sr-only')).toBe(true)
+      expect(container.querySelector('.composer__status')).toBeNull()
     }
     for (const [event, expected] of [
       [{ kind: 'stage', stage: 'instant', status: 'failed', detail: 'Synthetic stage failure' }, 'Instant stage failed'],
@@ -365,8 +382,7 @@ describe('production Android App runtime', () => {
     }
     await act(async () => { stop.click() })
     expect(stop.disabled).toBe(true)
-    if (platform === 'android') expect(stop.getAttribute('aria-label')).toBe('Stopping…')
-    else expect(stop.textContent).toBe('Stopping…')
+    expect(stop.getAttribute('aria-label')).toBe('Stopping…')
     await act(async () => { finish() })
   })
 

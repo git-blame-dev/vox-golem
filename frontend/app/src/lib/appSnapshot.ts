@@ -285,7 +285,7 @@ export function parseValidatedPreferences(value: unknown): ValidatedPreferences 
   if (!agentChoices.includes(deep as DeepChoice) || !agentChoices.includes(review as ReviewChoice)) throw new Error('preferences agent model is invalid')
   const responseProfile = value['response_profile']; const uiTheme = value['ui_theme']; const uiTextSize = value['ui_text_size']
   if (responseProfile !== 'fast' && responseProfile !== 'quality') throw new Error('preferences response_profile is invalid')
-  if (uiTheme !== 'light' && uiTheme !== 'dark') throw new Error('preferences ui_theme is invalid')
+  if (uiTheme !== 'light' && uiTheme !== 'dark' && uiTheme !== 'slate') throw new Error('preferences ui_theme is invalid')
   if (uiTextSize !== 'small' && uiTextSize !== 'medium' && uiTextSize !== 'large' && uiTextSize !== 'extra_large') throw new Error('preferences ui_text_size is invalid')
   for (const field of ['deep_enabled', 'review_enabled', 'prefetch', 'completion', 'tts_enabled'] as const) {
     if (typeof value[field] !== 'boolean') throw new Error(`preferences ${field} must be boolean`)

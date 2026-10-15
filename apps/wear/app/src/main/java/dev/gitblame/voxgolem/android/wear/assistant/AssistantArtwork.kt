@@ -36,7 +36,7 @@ internal class AssistantArtworkTransition {
     private var phase = AssistantArtworkPhase.IDLE
 
     fun update(state: AssistantState, active: Boolean, listening: Boolean = false): AssistantArtworkPhase {
-        if (!active || !state.foreground || (!listening && (state.error != null || state.interrupted))) {
+        if (!active || (!state.foreground && (!listening || state.busy)) || (!listening && (state.error != null || state.interrupted))) {
             initialized = true
             phase = AssistantArtworkPhase.IDLE
         } else if (!initialized) {

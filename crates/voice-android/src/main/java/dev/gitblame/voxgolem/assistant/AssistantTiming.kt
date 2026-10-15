@@ -20,7 +20,8 @@ class AssistantTiming private constructor(
     private val sink: Sink,
     origin: Long? = null,
 ) {
-    enum class Operation { PREPARATION, SPEECH, TTS_INITIALIZATION, TTS_UTTERANCE, RECOGNITION, SUPPORT_CHECK, GENERATION, ACTIVITY }
+    enum class Operation { PREPARATION, SPEECH, TTS_INITIALIZATION, TTS_UTTERANCE, RECOGNITION, SUPPORT_CHECK, GENERATION, ACTIVITY,
+        VOICE_FLOW, VOICE_TURN, MICROPHONE_CUE, TTS_WARMUP, VOICE_INVENTORY, PRESENTATION }
     enum class Stage {
         REQUESTED, ADMITTED, READY_REUSED, PENDING_REUSED,
         CREATE_REQUESTED, INIT_CALLBACK, INIT_MAIN_DELIVERED, INIT_READY, INIT_FAILED, VOICES_READY,
@@ -40,11 +41,21 @@ class AssistantTiming private constructor(
         ADMISSION_STARTED, DRAFT_PERSISTED, CREDENTIAL_CHECKED, PROJECTION_REFRESHED,
         CONTEXT_PREPARED, ADMISSION_PERSISTED, REQUEST_SERIALIZED,
         SETTLEMENT_STARTED, SELECTION_PERSISTED, SETTLEMENT_PROJECTED,
+        CAPTURE_OPEN_REQUESTED, CAPTURE_RECORDING, DIRECT_MIC_FALLBACK, PROVIDER_READY_CALLBACK,
+        SUPPORT_CACHE_HIT, SUPPORT_CACHE_MISS, SUPPORT_MAIN_DELIVERED, RETIREMENT_STARTED,
+        VOICE_INVENTORY_REQUESTED, VOICE_INVENTORY_READY, VOICE_SELECTED,
+        PRIME_REQUESTED, PRIME_ACCEPTED, PRIME_REJECTED, PRIME_COMPLETED, PRIME_FAILED,
+        CUE_PLAY_REQUESTED, CUE_LOAD_READY, CUE_PLAY_SUBMITTED,
+        FIRST_CLAUSE_READY, TEXT_LAYOUT_OBSERVED, TEXT_DRAW_SUBMITTED,
     }
     enum class Kind { BEGIN, MARK, END }
     data class Event(val operation: Operation, val run: Int, val parentRun: Int?, val kind: Kind,
         val stage: Stage?, val elapsedNanos: Long, val observedNanos: Long)
     fun interface Sink { fun emit(event: Event) }
+    interface MetadataSink : Sink {
+        fun emitMetadata(operation: Operation, run: Int, parentRun: Int?, observedNanos: Long,
+            metadata: AssistantDiagnosticJournal.Metadata)
+    }
 
     private val startedAt = if (enabled) origin ?: now() else 0L
     private val stages = if (enabled) EnumSet.noneOf(Stage::class.java) else null
@@ -85,6 +96,20 @@ class AssistantTiming private constructor(
     fun child(operation: Operation): AssistantTiming = AssistantTiming(operation,
         if (enabled) sequence.incrementAndGet() else 0, if (enabled) run else null, enabled, clock, sink, startedAt)
 
+    /** A correlated operation with its own origin, on the same process-local monotonic observer. */
+    fun fork(operation: Operation): AssistantTiming = AssistantTiming(operation,
+        if (enabled) sequence.incrementAndGet() else 0, if (enabled) run else null, enabled, clock, sink)
+
+    /** Typed public SDK/configuration metadata goes only to the bounded local journal, never logcat. */
+    fun metadata(metadata: AssistantDiagnosticJournal.Metadata) {
+        if (!enabled || finished) return
+        synchronized(this) {
+            if (finished) return
+            try { (sink as? MetadataSink)?.emitMetadata(operation, run, parentRun, now(), metadata) }
+            catch (_: RuntimeException) { /* Optional evidence cannot change application ownership. */ }
+        }
+    }
+
     private fun now(): Long = try { clock() } catch (_: RuntimeException) { 0L }
     private fun emit(kind: Kind, stage: Stage?) {
         try {
@@ -108,7 +133,18 @@ class AssistantTiming private constructor(
                     context.packageManager.getApplicationInfo(context.packageName, PackageManager.GET_META_DATA)
                         .metaData?.getBoolean(ENABLED_METADATA, false) == true
                 }.getOrDefault(false))
-            return AssistantTiming(operation, if (enabled) sequence.incrementAndGet() else 0, null, enabled, clock, sink, originNanos)
+            val effectiveSink = if (enabled && sink === AndroidSink) {
+                val journal = AssistantDiagnosticJournal.forContext(context)
+                object : MetadataSink {
+                    override fun emit(event: Event) {
+                        try { AndroidSink.emit(event) } finally { journal.offer(event) }
+                    }
+                    override fun emitMetadata(operation: Operation, run: Int, parentRun: Int?, observedNanos: Long,
+                        metadata: AssistantDiagnosticJournal.Metadata) =
+                        journal.offerMetadata(operation, run, parentRun, observedNanos, metadata)
+                }
+            } else sink
+            return AssistantTiming(operation, if (enabled) sequence.incrementAndGet() else 0, null, enabled, clock, effectiveSink, originNanos)
         }
     }
 

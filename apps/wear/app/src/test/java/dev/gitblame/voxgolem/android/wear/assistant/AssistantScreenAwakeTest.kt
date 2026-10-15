@@ -159,8 +159,8 @@ class AssistantScreenAwakeTest {
         try {
             looper.idle()
             looper.idleFor(Duration.ofSeconds(119))
-            activity.audio.publish(activity.audio.state.copy(dictation = DictationState(DictationPhase.LISTENING,
-                "Synthetic queued partial", utterance = 1)))
+            Thread { activity.audio.publish(activity.audio.state.copy(dictation = DictationState(DictationPhase.LISTENING,
+                "Synthetic queued partial", utterance = 1))) }.apply { start(); join() }
             // Advance the Android clock without executing queued progress until its old deadline has passed.
             ShadowSystemClock.advanceBy(Duration.ofSeconds(1))
             looper.idle()

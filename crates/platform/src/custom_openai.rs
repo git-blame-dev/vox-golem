@@ -209,9 +209,9 @@ impl Display for CustomOpenAiError {
         let message = match self {
             Self::InvalidConfig => "custom provider configuration is invalid",
             Self::InvalidPrompt => "custom provider prompt is invalid",
-            Self::AuthUnavailable => "OpenCode authentication is unavailable",
-            Self::AuthExpired => "OpenCode authentication has expired",
-            Self::Unauthorized => "OpenCode authentication was rejected",
+            Self::AuthUnavailable => "Custom provider access is unavailable",
+            Self::AuthExpired => "Custom provider access has expired",
+            Self::Unauthorized => "Custom provider access was rejected",
             Self::Forbidden => "the selected model is unavailable",
             Self::RateLimited => "the custom provider rate limit was reached",
             Self::Http(status) => {
@@ -581,10 +581,11 @@ fn valid_endpoint(endpoint: &str) -> bool {
     }
     match url.scheme() {
         "https" => {
-            url.host_str()
-                .is_some_and(|host| host.eq_ignore_ascii_case("chatgpt.com"))
-                && url.port_or_known_default() == Some(443)
-                && url.path() == "/backend-api/codex/responses"
+            matches!(
+                (url.host_str(), url.path()),
+                (Some("chatgpt.com"), "/backend-api/codex/responses")
+                    | (Some("api.openai.com"), "/v1/responses")
+            ) && url.port_or_known_default() == Some(443)
                 && url.query().is_none()
                 && url.fragment().is_none()
         }
@@ -1959,15 +1960,29 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_validation_restricts_oauth_to_chatgpt_or_loopback() {
+    fn endpoint_validation_restricts_access_to_paired_official_routes_or_loopback() {
         for endpoint in [
             "https://chatgpt.com/backend-api/codex/responses",
+            "https://chatgpt.com:443/backend-api/codex/responses",
+            "https://CHATGPT.COM/backend-api/codex/responses",
+            "https://api.openai.com/v1/responses",
+            "https://api.openai.com:443/v1/responses",
+            "https://API.OPENAI.COM/v1/responses",
             "http://127.0.0.1:8080/responses",
             "http://[::1]:8080/responses",
+            "http://127.0.0.2:8080/other?local=1#local",
         ] {
             assert!(
                 valid_endpoint(endpoint),
                 "expected valid endpoint: {endpoint}"
+            );
+            assert!(
+                CustomOpenAiClient::new(CustomOpenAiConfig {
+                    endpoint: endpoint.into(),
+                    ..CustomOpenAiConfig::default()
+                })
+                .is_ok(),
+                "expected client to accept endpoint: {endpoint}"
             );
         }
         for endpoint in [
@@ -1979,6 +1994,27 @@ mod tests {
             "http://example.test/responses",
             "https://api.example.test/responses",
             "https://chatgpt.com/other",
+            "https://chatgpt.com/v1/responses",
+            "https://api.openai.com/backend-api/codex/responses",
+            "https://api.openai.com/v1/responses/",
+            "https://api.openai.com/v1/responses/extra",
+            "https://api.openai.com/v1/%72esponses",
+            "http://api.openai.com/v1/responses",
+            "https://api.openai.com:444/v1/responses",
+            "https://chatgpt.com:444/backend-api/codex/responses",
+            "https://sub.api.openai.com/v1/responses",
+            "https://api.openai.com.example.test/v1/responses",
+            "https://api.openai.com./v1/responses",
+            "https://sub.chatgpt.com/backend-api/codex/responses",
+            "https://chatgpt.com.example.test/backend-api/codex/responses",
+            "https://user@api.openai.com/v1/responses",
+            "https://:password@api.openai.com/v1/responses",
+            "https://api.openai.com@example.test/v1/responses",
+            "https://api.openai.com/v1/responses?redirect=1",
+            "https://api.openai.com/v1/responses?",
+            "https://api.openai.com/v1/responses#fragment",
+            "https://api.openai.com/v1/responses#",
+            "https://chatgpt.com/backend-api/codex/responses#fragment",
             "https://chatgpt.com/backend-api/codex/responses?redirect=1",
             "https://example.test:bad/responses",
             "http://user:password@127.0.0.1:8080/responses",
@@ -1987,6 +2023,16 @@ mod tests {
             assert!(
                 !valid_endpoint(endpoint),
                 "expected invalid endpoint: {endpoint}"
+            );
+            assert!(
+                matches!(
+                    CustomOpenAiClient::new(CustomOpenAiConfig {
+                        endpoint: endpoint.into(),
+                        ..CustomOpenAiConfig::default()
+                    }),
+                    Err(CustomOpenAiError::InvalidConfig)
+                ),
+                "expected client to reject endpoint: {endpoint}"
             );
         }
     }
@@ -2137,6 +2183,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(client.check_auth(), Err(CustomOpenAiError::AuthUnavailable));
+    }
+
+    #[test]
+    fn access_errors_identify_the_custom_provider_not_the_credential_source() {
+        for (error, expected) in [
+            (
+                CustomOpenAiError::AuthUnavailable,
+                "Custom provider access is unavailable",
+            ),
+            (
+                CustomOpenAiError::AuthExpired,
+                "Custom provider access has expired",
+            ),
+            (
+                CustomOpenAiError::Unauthorized,
+                "Custom provider access was rejected",
+            ),
+        ] {
+            assert_eq!(error.to_string(), expected);
+        }
     }
 
     #[test]

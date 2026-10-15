@@ -46,6 +46,7 @@ export interface RuntimeProjection {
   readonly assistantSettingsPending: boolean
   readonly assistantSettingsLoadError: string | null
   readonly assistantSettingsWriteError: string | null
+  readonly uiThemeWriteError: string | null
   readonly snapshotHydrationState: 'unavailable' | 'pending' | 'failed' | 'succeeded'
   readonly snapshotControlsFresh: boolean
   readonly snapshotControlsInvalidated: boolean
@@ -105,7 +106,7 @@ export interface ModelsSnapshot {
 
 const VIEW_KEYS = {
   shell: ['uiTextSize', 'uiTheme', 'runtimeStatus'],
-  conversation: ['startupState', 'customRetryPending', 'voiceNotesOpen', 'shortcutStaging', 'composerValue', 'uiTextSize', 'notices'],
+  conversation: ['voiceNotesOpen', 'shortcutStaging', 'composerValue', 'uiTextSize', 'notices'],
   toolbar: ['startupState', 'runtimeStatus', 'assistantSettings', 'assistantSettingsPending',
     'snapshotHydrationState', 'snapshotControlsFresh', 'snapshotControlsInvalidated', 'snapshotModelOptions',
     'searchMode', 'searchModePending', 'androidAssistant', 'androidConversationId', 'androidVoiceActive',
@@ -116,12 +117,12 @@ const VIEW_KEYS = {
     'searchModePending', 'composerValue', 'partialTranscript', 'typedCompletionSuffix', 'voiceCompletionSuffix',
     'androidAssistant', 'androidVoiceActive', 'conversationPagePending', 'headPagePending', 'voiceNotesOpen',
     'promptState', 'promptActivity', 'resetPending', 'micStarting', 'micActive', 'shortcutStaging',
-    'uiTextSize', 'wakeConfidence', 'isSwitchingResponseProfile', 'snapshotControlsInvalidated'],
+    'uiTextSize', 'wakeConfidence', 'isSwitchingResponseProfile', 'snapshotControlsInvalidated', 'customRetryPending'],
   settings: ['startupState', 'runtimeStatus', 'assistantSettings', 'assistantSettingsPending',
-    'assistantSettingsLoadError', 'assistantSettingsWriteError', 'snapshotControlsFresh', 'snapshotModelOptions',
+    'assistantSettingsLoadError', 'assistantSettingsWriteError', 'uiThemeWriteError', 'snapshotControlsFresh', 'snapshotModelOptions',
     'uiTextSize', 'uiTheme', 'ttsEnabled', 'autoStopOnSilence', 'audioInputDevices', 'audioInputDeviceId',
     'androidVoiceStatus', 'androidSpeechStatusError', 'androidVoiceActive', 'promptState', 'resetPending',
-    'isSwitchingResponseProfile', 'micStarting', 'ttsPlaying', 'pendingTtsCommands', 'searchModePending', 'androidAssistant'],
+    'isSwitchingResponseProfile', 'micStarting', 'ttsPlaying', 'pendingTtsCommands', 'searchModePending', 'androidAssistant', 'customRetryPending'],
 } as const satisfies Record<string, readonly (keyof ControlsSnapshot)[]>
 type ViewName = keyof typeof VIEW_KEYS
 type ViewSnapshot<N extends ViewName> = Pick<ControlsSnapshot, (typeof VIEW_KEYS)[N][number]>
@@ -163,7 +164,7 @@ export class SessionAuthority {
       runtimeProjection: {
         startupState: { kind: 'loading' }, runtimeStatus: 'initializing',
         assistantSettings: DEFAULT_ASSISTANT_SETTINGS, assistantSettingsPending: snapshotAvailable,
-        assistantSettingsLoadError: null, assistantSettingsWriteError: null,
+        assistantSettingsLoadError: null, assistantSettingsWriteError: null, uiThemeWriteError: null,
         snapshotHydrationState: snapshotAvailable ? 'pending' : 'unavailable',
         snapshotControlsFresh: !snapshotAvailable, snapshotControlsInvalidated: false,
         snapshotModelOptions: null, searchMode: 'quick', searchModePending: nativeSearch,

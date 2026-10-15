@@ -60,7 +60,8 @@ export const PromptComposer = forwardRef<HTMLTextAreaElement, PromptComposerProp
 
       textarea.style.height = 'auto'
       const minHeight = minRows * lineHeight + padding + borders
-      const maxHeight = capRows * lineHeight + padding + borders
+      const cssMaxHeight = Number.parseFloat(styles.maxHeight)
+      const maxHeight = Math.min(capRows * lineHeight + padding + borders, Number.isFinite(cssMaxHeight) && cssMaxHeight > 0 ? cssMaxHeight : Number.MAX_SAFE_INTEGER)
       const desiredHeight = textarea.scrollHeight + borders
       const height = Math.min(Math.max(desiredHeight, minHeight), maxHeight)
       textarea.style.height = `${height}px`

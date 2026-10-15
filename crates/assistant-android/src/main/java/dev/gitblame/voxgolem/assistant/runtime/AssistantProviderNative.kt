@@ -11,6 +11,7 @@ interface ProviderDeltaCallback {
 }
 
 interface ProviderNativeCalls {
+    fun prewarm(model: String, authPath: String = "") {}
     fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String
     fun cancel(requestId: String)
     fun prepareSearch(requestJson: String, callback: ProviderDeltaCallback): String =
@@ -21,6 +22,11 @@ interface ProviderNativeCalls {
 
 object AssistantProviderNative : ProviderNativeCalls {
     init { System.loadLibrary("wear_assistant_native") }
+    override fun prewarm(model: String, authPath: String) {
+        if (authPath.isNotEmpty() && !model.startsWith("agy-") && model != "local-fast") {
+            runCatching { observeAuth(authPath) }
+        }
+    }
     external fun observeAuth(authPath: String): String
     external override fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String
     external override fun cancel(requestId: String)

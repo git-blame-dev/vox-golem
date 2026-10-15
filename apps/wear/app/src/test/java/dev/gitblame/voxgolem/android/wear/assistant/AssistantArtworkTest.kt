@@ -28,7 +28,11 @@ class AssistantArtworkTest {
             AssistantArtworkTransition().update(idle, true, assistantArtworkListening(sdkReady)))
         assertEquals("Initial in-flight generation still does not replay old feedback", AssistantArtworkPhase.IDLE,
             AssistantArtworkTransition().update(idle.copy(busy = true), true, assistantArtworkListening(sdkReady)))
-        assertEquals(AssistantArtworkPhase.IDLE, artwork.update(idle.copy(foreground = false), true, assistantArtworkListening(sdkReady)))
+        assertEquals("Early voice launch rotates into LISTENING on readyForSpeech before state.foreground arrives",
+            AssistantArtworkPhase.LISTENING, artwork.update(idle.copy(foreground = false), true, assistantArtworkListening(sdkReady)))
+        assertEquals(AssistantArtworkPhase.IDLE, artwork.update(idle.copy(foreground = false), true, assistantArtworkListening(admitted)))
+        assertEquals(AssistantArtworkPhase.IDLE, artwork.update(idle.copy(foreground = false, busy = true), true, assistantArtworkListening(sdkReady)))
+        assertEquals(AssistantArtworkPhase.IDLE, artwork.update(idle.copy(foreground = false), false, assistantArtworkListening(sdkReady)))
     }
 
     @Test fun actualListeningUsesTheNotePhaseAndBusyRetainsGenerationPriority() {

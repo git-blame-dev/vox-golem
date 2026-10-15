@@ -2,4 +2,5 @@
 /.kotlin/
 /build/
 /app/build/
+/voice-benchmark/build/
 /local.properties

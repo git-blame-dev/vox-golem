@@ -68,6 +68,38 @@ class SharedDictationOwnerTest {
     private val owner = SharedDictationOwner(factory, { permission }, leases)
     private fun drain() = shadowOf(Looper.getMainLooper()).idle()
 
+    @Test fun mainThreadStartAdmitsInlineAndStopCannotRetireTheReplacementLater() {
+        owner.setForeground(true)
+        owner.start("en-US", immediateAdmission = true)
+        assertEquals(1, factory.creates)
+        assertEquals(DictationPhase.CHECKING, owner.snapshot().phase)
+        val first = factory.sessions.single()
+        owner.stop()
+        assertTrue(first.destroyed)
+        owner.start("en-US", immediateAdmission = true)
+        assertEquals(2, factory.creates)
+        drain()
+        assertTrue(factory.sessions.last().started)
+        assertFalse(factory.sessions.last().destroyed)
+        owner.close()
+    }
+
+    @Test fun ordinaryStartReturnsUtteranceBeforeAnImmediateAdmissionFailureCallback() {
+        val capture = leases.tryAcquire(RecognitionResourceLease.Kind.CAPTURE_LIVE)!!
+        var boundUtterance = 0L
+        val failures = mutableListOf<DictationState>()
+        val subscription = owner.subscribe { value ->
+            if (value.phase == DictationPhase.ERROR && value.utterance == boundUtterance) failures += value
+        }
+        owner.setForeground(true)
+        boundUtterance = owner.start("en-US")
+        assertEquals(DictationPhase.IDLE, owner.snapshot().phase)
+        drain()
+        assertEquals("recognition_busy", failures.single().error)
+        assertSame(capture, leases.current())
+        subscription.close(); owner.close(); capture.close(); drain()
+    }
+
     private fun timedOwner(events: MutableList<AssistantTiming.Event>, clock: () -> Long = { 0L }): SharedDictationOwner {
         val context = RuntimeEnvironment.getApplication()
         context.applicationInfo.flags = context.applicationInfo.flags or ApplicationInfo.FLAG_DEBUGGABLE
@@ -102,7 +134,8 @@ class SharedDictationOwnerTest {
         val events = mutableListOf<AssistantTiming.Event>()
         val timed = timedOwner(events) { now }
         factory.route = RecognitionRoute("synthetic.private.provider", "en-AU")
-        timed.setForeground(true); timed.start("en-AU", "Synthetic private retained words")
+        timed.setForeground(true)
+        Thread { timed.start("en-AU", "Synthetic private retained words") }.apply { start(); join() }
         assertEquals(listOf(Stage.REQUESTED), events.filter { it.kind == Kind.MARK }.map { it.stage })
         now += 100; drain()
         val sdk = factory.sessions.single()
@@ -132,7 +165,9 @@ class SharedDictationOwnerTest {
     @Test fun timingCancellationBeforeAdmissionAndObsoleteCallbacksCannotAttachToReplacementRun() {
         val events = mutableListOf<AssistantTiming.Event>()
         val timed = timedOwner(events)
-        timed.setForeground(true); timed.start("en-US"); timed.stop(); drain()
+        timed.setForeground(true)
+        Thread { timed.start("en-US") }.apply { start(); join() }
+        timed.stop(); drain()
         val cancelledRun = events.first().run
         assertEquals(Stage.CANCELLED, events.single { it.run == cancelledRun && it.kind == Kind.END }.stage)
         assertFalse(events.any { it.run == cancelledRun && it.stage == Stage.WORKER_STARTED })
@@ -306,7 +341,9 @@ class SharedDictationOwnerTest {
         assertEquals(0, factory.creates); assertEquals("microphone_permission_required", owner.snapshot().error)
     }
     @Test fun cancelBeforeAdmissionCannotAllocateOrRestart() {
-        owner.setForeground(true); owner.start("en-US"); owner.stop(); drain()
+        owner.setForeground(true)
+        Thread { owner.start("en-US") }.apply { start(); join() }
+        owner.stop(); drain()
         assertEquals(0, factory.creates); assertNull(leases.current())
     }
     @Test fun providerFinalEndsOneSessionAndLateCallbacksCannotReleaseNextOwner() {

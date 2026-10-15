@@ -29,18 +29,32 @@ function textarea(container: HTMLElement) {
   return container.querySelector('textarea') as HTMLTextAreaElement
 }
 
-function setMetrics(input: HTMLTextAreaElement, scrollHeight: number) {
+function setMetrics(input: HTMLTextAreaElement, scrollHeight: number, maxHeight?: string) {
   vi.spyOn(window, 'getComputedStyle').mockReturnValue({
     lineHeight: '20px',
     paddingTop: '4px',
     paddingBottom: '4px',
     borderTopWidth: '1px',
     borderBottomWidth: '1px',
+    maxHeight,
   } as CSSStyleDeclaration)
   Object.defineProperty(input, 'scrollHeight', { configurable: true, value: scrollHeight })
 }
 
 describe('PromptComposer', () => {
+  it.each([36, 70])('respects a computed viewport height cap of %spx and keeps long content scrollable without moving selection', (maxHeight) => {
+    const draft = 'Synthetic line one\nSynthetic line two\nSynthetic line three\nSynthetic line four'
+    const container = render({ value: draft, maxRows: 4 })
+    const input = textarea(container)
+    setMetrics(input, 180, `${maxHeight}px`)
+    input.setSelectionRange(3, 12)
+    act(() => window.dispatchEvent(new Event('resize')))
+    expect(input.style.height).toBe(`${maxHeight}px`)
+    expect(input.style.overflowY).toBe('auto')
+    expect(input.value).toBe(draft)
+    expect(input.selectionStart).toBe(3)
+    expect(input.selectionEnd).toBe(12)
+  })
   it('starts at two lines, grows to four, caps, and shrinks without moving selection', () => {
     vi.spyOn(window, 'getComputedStyle').mockReturnValue({
       lineHeight: '20px',

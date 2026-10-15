@@ -50,6 +50,50 @@ function renderSpeech(props: Parameters<typeof SpeechSettings>[0]) {
 }
 
 describe('SpeechSettings', () => {
+  it('summarizes desktop availability while keeping voice failures visible and identities disclosed', () => {
+    const state = startup(identity)
+    if (state.kind !== 'ready') throw new Error('Synthetic startup must be ready')
+    const { container, dispose } = renderSpeech({ android: false, androidStatus: null, statusError: null, startupState: { ...state, voiceInputError: 'Synthetic microphone failure' } })
+    try {
+      const details = container.querySelector('details')!
+      expect(details.open).toBe(false)
+      expect(details.textContent).not.toContain('Synthetic microphone failure')
+      expect(container.textContent).toContain('Synthetic microphone failure')
+      for (const label of ['Voice input (STT)', 'Speech output (TTS)', 'Wake word', 'Voice activity detection']) {
+        const summary = Array.from(container.querySelectorAll('p')).find((node) => node.textContent === `${label}: available`)!
+        expect(summary).toBeDefined()
+        expect(summary.closest('details')).toBeNull()
+      }
+      act(() => details.querySelector('summary')!.click())
+      expect(details.open).toBe(true)
+      expect(details.textContent).toContain('Runtime engine: Piper ONNX')
+    } finally { dispose() }
+  })
+  it('keeps requested controls and actionable failures outside closed native diagnostics', () => {
+    const { container, dispose } = renderSpeech({ android: true, androidStatus: voiceStatus({ speechOptions, error: 'recognition_retirement_failed', missingSpeechServices: true, recognitionRoute: 'Synthetic route metadata' }), statusError: 'Synthetic observation failure', startupState: startup(), onSpeechSelectionChange: () => undefined, onSpeechNetworkFallbackChange: () => undefined })
+    try {
+      const details = container.querySelector('details')!
+      expect(details).not.toBeNull()
+      expect(details.open).toBe(false)
+      expect(details.querySelector('summary')?.textContent).toBe('Speech details and diagnostics')
+      for (const label of ['Speech language', 'TTS engine', 'TTS voice', 'Allow speech network fallback']) {
+        const control = container.querySelector(`[aria-label="${label}"]`)!
+        expect(control.closest('details')).toBeNull()
+        const help = container.querySelector(`[id="${control.getAttribute('aria-describedby')}"]`)!
+        expect(help).not.toBeNull()
+        expect(help.closest('details')).toBeNull()
+      }
+      for (const text of ['recognition_retirement_failed', 'Synthetic observation failure', 'Open Play Store']) {
+        expect(container.textContent).toContain(text)
+        expect(details.textContent).not.toContain(text)
+      }
+      act(() => details.querySelector('summary')!.click())
+      expect(details.open).toBe(true)
+      expect(details.textContent).toContain('Synthetic route metadata')
+      expect(details.textContent).toContain('Underlying model identity: Not reported')
+      expect(details.querySelector('[aria-label="Speech model"]')).not.toBeNull()
+    } finally { dispose() }
+  })
   it('offers only Automatic before SDK support is reported and leaves hidden-model selection explicitly unavailable', () => {
     const { container, dispose } = renderSpeech({ android: true, androidStatus: voiceStatus(), statusError: null, startupState: startup(), onSpeechSelectionChange: () => undefined })
     try {

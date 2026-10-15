@@ -38,7 +38,7 @@ class SyntheticAssistantClient : AssistantClient {
     }
     fun publish(value: AssistantState) { state = value; observers.toList().forEach { it(value) } }
     override fun history(before: String?, onSettled: (String?, AssistantState) -> Unit) { resumeHistoryOrder += "history"; historyReads += before to onSettled }
-    override fun resume() { resumeHistoryOrder += "resume"; resumes++ }
+    override fun resume() { resumeHistoryOrder += "resume"; resumes++; state = state.copy(foreground = true) }
     override fun background() { backgrounds++ }
     override fun refresh() {}
     override fun stop() {}
@@ -80,6 +80,16 @@ class FailedInitialVoicePreferencesActivity : SyntheticAssistantActivity() {
             }
         }
         return WearVoiceSettings(failed)
+    }
+}
+
+class MissingTtsInstallerActivity : SyntheticAssistantActivity() {
+    val attempted = mutableListOf<Intent>()
+    override fun startActivity(intent: Intent) {
+        attempted += intent
+        if (intent.action == android.speech.tts.TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA)
+            throw android.content.ActivityNotFoundException("Synthetic missing installer")
+        super.startActivity(intent)
     }
 }
 
@@ -138,10 +148,16 @@ class SyntheticAssistantVoice : AssistantVoiceController {
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class AssistantActivityTest {
-    @Test fun talkLaunchPrecedesHistoryAndWaitsForForegroundHydration() {
+    @Test fun missingOfflineRecognitionLanguageExposesGoogleInstallAction() {
+        for (error in listOf("local_language_unavailable", "recognition_error_12", "recognition_error_13")) {
+            assertTrue(assistantIsInstallableVoiceError(error))
+            assertTrue(assistantVoiceErrorText(error).contains("offline language"))
+        }
+    }
+    @Test fun talkLaunchRetainsAdmissionUntilContextHydrationThenPrecedesHistoryWithoutResumeProjection() {
         Shadows.shadowOf(RuntimeEnvironment.getApplication()).grantPermissions(Manifest.permission.RECORD_AUDIO)
         val client = SyntheticAssistantClient().apply {
-            state = state.copy(foreground = false, conversation = "{\"replica\":\"synthetic-launch-order\",\"sequence\":\"1\"}")
+            state = state.copy(foreground = false, contextReady = false, draft = "")
         }
         SyntheticAssistantActivity.retainedClient = client
         val controller = Robolectric.buildActivity(SyntheticAssistantActivity::class.java, conversationLaunchIntent()).create().start()
@@ -152,13 +168,33 @@ class AssistantActivityTest {
             assertTrue(activity.audio.speechChoices.isNotEmpty())
         }
         try {
+            assertEquals(0, activity.audio.conversations)
             controller.resume()
             Shadows.shadowOf(Looper.getMainLooper()).idle()
+            assertTrue(client.snapshot().foreground)
+            assertFalse(client.snapshot().contextReady)
+            assertTrue(activity.voiceAdmissionPending)
             assertTrue(client.historyReads.isEmpty())
+            assertTrue(activity.linkReads.isEmpty())
             assertEquals(0, activity.audio.conversations)
-            client.publish(client.state.copy(foreground = true))
+            // A foreground-only notification is not evidence that persisted selection/draft was loaded.
+            client.publish(client.state)
+            Shadows.shadowOf(Looper.getMainLooper()).idle()
+            assertTrue(activity.voiceAdmissionPending)
+            assertEquals(0, activity.audio.conversations)
+            val conversation = "{\"replica\":\"synthetic-launch-order\",\"sequence\":\"1\"}"
+            val head = "{\"replica\":\"synthetic-launch-order\",\"sequence\":\"2\"}"
+            client.publish(client.state.copy(contextReady = true, conversation = conversation, selectedHead = head,
+                draft = "Synthetic hydrated launch draft"))
             Shadows.shadowOf(Looper.getMainLooper()).idle()
             assertEquals(1, activity.audio.conversations)
+            assertEquals(listOf("Synthetic hydrated launch draft"), activity.audio.conversationDrafts)
+            assertFalse(activity.voiceAdmissionPending)
+            assertTrue(client.historyReads.isEmpty())
+            client.publish(client.state)
+            Shadows.shadowOf(Looper.getMainLooper()).idle()
+            assertEquals(1, activity.audio.conversations)
+            activity.audio.publish(activity.audio.state.copy(error = "synthetic-terminal"))
             assertEquals(1, client.historyReads.size)
         } finally { controller.pause().stop().destroy(); SyntheticAssistantActivity.retainedClient = null }
     }
@@ -204,6 +240,21 @@ class AssistantActivityTest {
     private fun voiceLaunchIntent() = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
         .setComponent(ComponentName(RuntimeEnvironment.getApplication(), AssistantActivity.VOICE_ENTRY))
 
+    @Test fun componentOnlyShellLaunchDoesNotAdmitVoiceButRealLauncherIntentDoes() {
+        Shadows.shadowOf(RuntimeEnvironment.getApplication()).grantPermissions(Manifest.permission.RECORD_AUDIO)
+        for (entry in listOf(voiceLaunchIntent(), conversationLaunchIntent())) {
+            val controller = Robolectric.buildActivity(SyntheticAssistantActivity::class.java,
+                Intent().setComponent(entry.component)).setup()
+            try {
+                val activity = controller.get()
+                assertEquals(0, activity.audio.dictations + activity.audio.conversations)
+                assertNull(activity.presentedVoiceState().entryMode)
+                controller.newIntent(entry)
+                assertEquals(1, activity.audio.dictations + activity.audio.conversations)
+            } finally { controller.pause().stop().destroy() }
+        }
+    }
+
     @Test fun matchingAskAndTalkLauncherEntriesAutomaticallyStartWithoutCallerVerification() {
         Shadows.shadowOf(RuntimeEnvironment.getApplication()).grantPermissions(Manifest.permission.RECORD_AUDIO)
         for ((intent, mode) in listOf(voiceLaunchIntent() to AssistantVoiceEntryMode.ASK, conversationLaunchIntent() to AssistantVoiceEntryMode.TALK)) {
@@ -225,8 +276,8 @@ class AssistantActivityTest {
 
     @Test fun stopRetiresDelayedHydrationLaunchAndPermissionAdmissionWithoutForegroundReplay() {
         Shadows.shadowOf(RuntimeEnvironment.getApplication()).grantPermissions(Manifest.permission.RECORD_AUDIO)
-        SyntheticAssistantActivity.retainedClient = SyntheticAssistantClient().apply { state = state.copy(foreground = false) }
-        val controller = Robolectric.buildActivity(SyntheticAssistantActivity::class.java, voiceLaunchIntent()).setup()
+        SyntheticAssistantActivity.retainedClient = SyntheticAssistantClient().apply { state = state.copy(foreground = false, contextReady = false) }
+        val controller = Robolectric.buildActivity(SyntheticAssistantActivity::class.java, voiceLaunchIntent()).create().start()
         val activity = controller.get()
         try {
             Shadows.shadowOf(Looper.getMainLooper()).idle()
@@ -234,9 +285,13 @@ class AssistantActivityTest {
             assertTrue(activity.presentedVoiceState().active)
             activity.newConversation(); activity.selectHead("synthetic-blocked-head")
             assertEquals(0, activity.synthetic.newConversations)
+            controller.resume()
+            Shadows.shadowOf(Looper.getMainLooper()).idle()
+            assertTrue(activity.voiceAdmissionPending)
+            assertEquals(0, activity.audio.dictations + activity.audio.conversations)
             activity.stopAll()
             assertFalse(activity.voiceAdmissionPending)
-            activity.synthetic.publish(activity.synthetic.state.copy(foreground = true))
+            activity.synthetic.publish(activity.synthetic.state.copy(foreground = true, contextReady = true))
             Shadows.shadowOf(Looper.getMainLooper()).idle()
             assertEquals(0, activity.audio.dictations + activity.audio.conversations)
             controller.pause().stop().start().resume(); Shadows.shadowOf(Looper.getMainLooper()).idle()
@@ -344,28 +399,33 @@ class AssistantActivityTest {
     @Test fun bothEntryLaunchesWaitForHydrationOnceAndNeverReplayAfterRecreationOrBackground() {
         Shadows.shadowOf(RuntimeEnvironment.getApplication()).grantPermissions(Manifest.permission.RECORD_AUDIO)
         for ((intent, conversation) in listOf(voiceLaunchIntent() to false, conversationLaunchIntent() to true)) {
-            SyntheticAssistantActivity.retainedClient = SyntheticAssistantClient().apply { state = state.copy(foreground = false) }
-            val controller = Robolectric.buildActivity(SyntheticAssistantActivity::class.java, intent).setup()
+            SyntheticAssistantActivity.retainedClient = SyntheticAssistantClient().apply {
+                state = state.copy(foreground = false, contextReady = false, draft = "Synthetic admitted draft")
+            }
+            val controller = Robolectric.buildActivity(SyntheticAssistantActivity::class.java, intent).create().start()
             val looper = Shadows.shadowOf(Looper.getMainLooper())
             try {
                 val original = controller.get()
                 looper.idle()
                 assertEquals(0, original.audio.dictations + original.audio.conversations)
-                original.synthetic.publish(original.synthetic.state.copy(foreground = true, draft = "Synthetic admitted draft"))
+                controller.resume()
                 looper.idle()
+                assertEquals(0, original.audio.dictations + original.audio.conversations)
+                assertTrue(original.voiceAdmissionPending)
+                original.synthetic.publish(original.synthetic.state.copy(contextReady = true)); looper.idle()
                 assertEquals(if (conversation) 1 else 0, original.audio.conversations)
                 assertEquals(if (conversation) 0 else 1, original.audio.dictations)
                 assertEquals(listOf("Synthetic admitted draft"), if (conversation) original.audio.conversationDrafts else original.audio.dictatedDrafts)
-                original.synthetic.publish(original.synthetic.state); looper.idle()
+                original.synthetic.publish(original.synthetic.state.copy(foreground = true)); looper.idle()
                 assertEquals(1, original.audio.dictations + original.audio.conversations)
                 controller.configurationChange(android.content.res.Configuration(original.resources.configuration).apply { fontScale += 0.1f })
                 looper.idle()
                 val replacement = controller.get()
                 assertEquals(0, replacement.audio.dictations + replacement.audio.conversations)
-                replacement.synthetic.publish(replacement.synthetic.state.copy(foreground = false)); looper.idle()
+                replacement.synthetic.publish(replacement.synthetic.state.copy(contextReady = false)); looper.idle()
                 controller.newIntent(intent)
                 controller.pause().stop()
-                replacement.synthetic.publish(replacement.synthetic.state.copy(foreground = true)); looper.idle()
+                replacement.synthetic.publish(replacement.synthetic.state.copy(foreground = true, contextReady = true)); looper.idle()
                 controller.start().resume(); looper.idle()
                 assertEquals(0, replacement.audio.dictations + replacement.audio.conversations)
             } finally { controller.pause().stop().destroy(); SyntheticAssistantActivity.retainedClient = null }
@@ -412,8 +472,8 @@ class AssistantActivityTest {
     @Test fun recreationBeforeNativeHydrationRetiresBothPendingLauncherRequests() {
         Shadows.shadowOf(RuntimeEnvironment.getApplication()).grantPermissions(Manifest.permission.RECORD_AUDIO)
         for (intent in listOf(voiceLaunchIntent(), conversationLaunchIntent())) {
-            SyntheticAssistantActivity.retainedClient = SyntheticAssistantClient().apply { state = state.copy(foreground = false) }
-            val controller = Robolectric.buildActivity(SyntheticAssistantActivity::class.java, intent).setup()
+            SyntheticAssistantActivity.retainedClient = SyntheticAssistantClient().apply { state = state.copy(foreground = false, contextReady = false) }
+            val controller = Robolectric.buildActivity(SyntheticAssistantActivity::class.java, intent).create().start()
             val looper = Shadows.shadowOf(Looper.getMainLooper())
             try {
                 val original = controller.get()
@@ -421,7 +481,7 @@ class AssistantActivityTest {
                 assertEquals(0, original.audio.dictations + original.audio.conversations)
                 controller.configurationChange(android.content.res.Configuration(original.resources.configuration).apply { fontScale += 0.1f })
                 val replacement = controller.get()
-                replacement.synthetic.publish(replacement.synthetic.state.copy(foreground = true)); looper.idle()
+                replacement.synthetic.publish(replacement.synthetic.state.copy(foreground = true, contextReady = true)); looper.idle()
                 assertEquals(0, replacement.audio.dictations + replacement.audio.conversations)
                 controller.pause().stop().start().resume(); looper.idle()
                 assertEquals(0, replacement.audio.dictations + replacement.audio.conversations)
@@ -431,13 +491,15 @@ class AssistantActivityTest {
 
     @Test fun latestExplicitAliasSelectsTheEntryActionWhileWaitingForHydration() {
         Shadows.shadowOf(RuntimeEnvironment.getApplication()).grantPermissions(Manifest.permission.RECORD_AUDIO)
-        SyntheticAssistantActivity.retainedClient = SyntheticAssistantClient().apply { state = state.copy(foreground = false) }
-        val controller = Robolectric.buildActivity(SyntheticAssistantActivity::class.java, conversationLaunchIntent()).setup()
+        SyntheticAssistantActivity.retainedClient = SyntheticAssistantClient().apply { state = state.copy(foreground = false, contextReady = false) }
+        val controller = Robolectric.buildActivity(SyntheticAssistantActivity::class.java, conversationLaunchIntent()).create().start()
         val activity = controller.get()
         val looper = Shadows.shadowOf(Looper.getMainLooper())
         try {
             controller.newIntent(voiceLaunchIntent())
-            activity.synthetic.publish(activity.synthetic.state.copy(foreground = true)); looper.idle()
+            controller.resume()
+            assertTrue(activity.voiceAdmissionPending)
+            activity.synthetic.publish(activity.synthetic.state.copy(contextReady = true)); looper.idle()
             assertEquals(1, activity.audio.dictations)
             assertEquals(0, activity.audio.conversations)
             assertEquals(0, activity.synthetic.newConversations)
@@ -497,15 +559,20 @@ class AssistantActivityTest {
         }
     }
 
-    @Test fun voiceLauncherWaitsForForegroundHydrationButDoesNotReplayAfterRecreation() {
+    @Test fun voiceLauncherWaitsForContextHydrationButDoesNotReplayAfterRecreation() {
         Shadows.shadowOf(RuntimeEnvironment.getApplication()).grantPermissions(Manifest.permission.RECORD_AUDIO)
-        SyntheticAssistantActivity.retainedClient = SyntheticAssistantClient().apply { state = state.copy(foreground = false) }
-        val controller = Robolectric.buildActivity(SyntheticAssistantActivity::class.java, voiceLaunchIntent()).setup()
+        SyntheticAssistantActivity.retainedClient = SyntheticAssistantClient().apply {
+            state = state.copy(foreground = false, contextReady = false, draft = "Synthetic hydrated draft")
+        }
+        val controller = Robolectric.buildActivity(SyntheticAssistantActivity::class.java, voiceLaunchIntent()).create().start()
         try {
             val original = controller.get()
             val looper = Shadows.shadowOf(Looper.getMainLooper())
             looper.idle(); assertEquals(0, original.audio.dictations)
-            original.synthetic.publish(original.synthetic.state.copy(foreground = true, draft = "Synthetic hydrated draft"))
+            controller.resume()
+            looper.idle(); assertEquals(0, original.audio.dictations)
+            assertTrue(original.voiceAdmissionPending)
+            original.synthetic.publish(original.synthetic.state.copy(contextReady = true))
             looper.idle(); assertEquals(1, original.audio.dictations)
             assertEquals(listOf("Synthetic hydrated draft"), original.audio.dictatedDrafts)
             controller.configurationChange(android.content.res.Configuration(original.resources.configuration).apply { fontScale += 0.1f })
@@ -1119,7 +1186,7 @@ class AssistantActivityTest {
         assertEquals(0, activity.synthetic.sends)
         activity.editDraft()
         assertEquals(1, activity.audio.stops)
-        assertTrue(assistantVoiceErrorText("on_device_recognition_unavailable").contains("no voice-model download"))
+        assertTrue(assistantVoiceErrorText("on_device_recognition_unavailable").contains("offline language"))
         controller.pause().stop().destroy()
     }
     @Test fun nativeDismissalPreservesDraftRetiresVoiceAndRejectsLatePermission() {
@@ -1135,5 +1202,209 @@ class AssistantActivityTest {
         assertEquals(0, activity.synthetic.sends)
         assertEquals(listOf(true, false), activity.audio.foregrounds)
         assertEquals(1, activity.audio.closes)
+    }
+
+    @Test fun voiceLaunchGateRequiresHydratedContextButNotARedundantNativeForegroundProjection() {
+        assertFalse(AssistantVoiceLaunchGate.shouldStart(
+            visible = true, resumed = true, state = null, pendingMode = AssistantVoiceEntryMode.ASK
+        ))
+        assertTrue(AssistantVoiceLaunchGate.shouldStart(
+            visible = true, resumed = true, state = AssistantState(foreground = false), pendingMode = AssistantVoiceEntryMode.ASK,
+            voiceActive = false, inputPending = false, permissionPending = false, finishingOrDestroyed = false
+        ))
+        assertFalse(AssistantVoiceLaunchGate.shouldStart(
+            visible = true, resumed = true, state = AssistantState(foreground = true, contextReady = false), pendingMode = AssistantVoiceEntryMode.ASK
+        ))
+        assertFalse(AssistantVoiceLaunchGate.shouldStart(
+            visible = true, resumed = false, state = null, pendingMode = AssistantVoiceEntryMode.ASK,
+            voiceActive = false, inputPending = false, permissionPending = false, finishingOrDestroyed = false
+        ))
+        assertFalse(AssistantVoiceLaunchGate.shouldStart(
+            visible = true, resumed = true, state = AssistantState(busy = true), pendingMode = AssistantVoiceEntryMode.ASK,
+            voiceActive = false, inputPending = false, permissionPending = false, finishingOrDestroyed = false
+        ))
+    }
+
+    @Test fun coldPendingLaunchSurvivesBoundedSyncFallbackButStillRequiresContextReadiness() {
+        Shadows.shadowOf(RuntimeEnvironment.getApplication()).grantPermissions(Manifest.permission.RECORD_AUDIO)
+        SyntheticAssistantActivity.retainedClient = SyntheticAssistantClient().apply {
+            state = state.copy(contextReady = false, foreground = false)
+        }
+        val controller = Robolectric.buildActivity(SyntheticAssistantActivity::class.java, voiceLaunchIntent()).create().start().resume()
+        val activity = controller.get()
+        val looper = Shadows.shadowOf(Looper.getMainLooper())
+        try {
+            looper.idle()
+            assertTrue(activity.voiceAdmissionPending)
+            activity.audio.publish(activity.audio.state.copy(error = "synthetic-prior-session-error"))
+            assertTrue("An unrelated voice terminal cannot flush a pending context admission", activity.linkReads.isEmpty())
+            looper.idleFor(Duration.ofMillis(AssistantActivity.DEFERRED_STARTUP_SYNC_DELAY_MS))
+            assertEquals(1, activity.linkReads.size)
+            assertTrue(activity.synthetic.historyReads.isEmpty())
+            assertTrue(activity.voiceAdmissionPending)
+            assertTrue(activity.audio.askedDrafts.isEmpty())
+            activity.synthetic.publish(activity.synthetic.state.copy(contextReady = true, draft = "Synthetic post-timeout hydrated draft"))
+            looper.idle()
+            assertEquals(listOf("Synthetic post-timeout hydrated draft"), activity.audio.askedDrafts)
+            assertFalse(activity.voiceAdmissionPending)
+            activity.synthetic.publish(activity.synthetic.state); looper.idle()
+            assertEquals(1, activity.audio.askedDrafts.size)
+        } finally { controller.pause().stop().destroy(); SyntheticAssistantActivity.retainedClient = null }
+    }
+
+    @Test fun voiceLaunchDefersBackgroundLinkSyncUntilReadyForSpeechOrFallbackTimeout() {
+        Shadows.shadowOf(RuntimeEnvironment.getApplication()).grantPermissions(Manifest.permission.RECORD_AUDIO)
+        val controller = Robolectric.buildActivity(SyntheticAssistantActivity::class.java, voiceLaunchIntent()).create().start()
+        val activity = controller.get()
+        try {
+            controller.resume()
+            assertEquals(1, activity.audio.dictations)
+            activity.synthetic.publish(activity.synthetic.state.copy(conversation = "{\"replica\":\"synthetic-ready-conversation\",\"sequence\":\"1\"}"))
+            Shadows.shadowOf(Looper.getMainLooper()).idle()
+            assertTrue(activity.synthetic.historyReads.isEmpty())
+            assertEquals("Background link read is deferred while waiting for readyForSpeech", 0, activity.linkReads.size)
+            activity.audio.publish(activity.audio.state.copy(
+                dictation = dev.gitblame.voxgolem.assistant.recognition.DictationState(
+                    phase = dev.gitblame.voxgolem.assistant.recognition.DictationPhase.LISTENING,
+                    readyForSpeech = true
+                )
+            ))
+            assertEquals("ReadyForSpeech flushes deferred startup sync immediately", 1, activity.linkReads.size)
+            assertEquals(1, activity.synthetic.historyReads.size)
+        } finally {
+            controller.pause().stop().destroy()
+        }
+    }
+
+    @Test fun voiceSubscriptionUpdatesMainThreadVoiceStateSynchronouslyWithoutWaitingForHandlerPost() {
+        val controller = Robolectric.buildActivity(SyntheticAssistantActivity::class.java).setup()
+        val activity = controller.get()
+        try {
+            val ready = activity.audio.state.copy(
+                dictation = dev.gitblame.voxgolem.assistant.recognition.DictationState(
+                    phase = dev.gitblame.voxgolem.assistant.recognition.DictationPhase.LISTENING,
+                    readyForSpeech = true,
+                    draft = "Synchronous partial"
+                )
+            )
+            activity.audio.publish(ready)
+            // Without idling the main looper, main-thread publish updates voiceState and artwork listening immediately
+            assertTrue(activity.presentedVoiceState().dictation.readyForSpeech)
+            assertTrue(assistantArtworkListening(activity.presentedVoiceState()))
+        } finally {
+            controller.pause().stop().destroy()
+        }
+    }
+
+    @Test fun mainThreadVoiceDeliveryDoesNotReplayStaleProjectionOnHandler() {
+        val controller = Robolectric.buildActivity(SyntheticAssistantActivity::class.java).setup()
+        val activity = controller.get()
+        val looper = Shadows.shadowOf(Looper.getMainLooper())
+        try {
+            looper.idle()
+            activity.audio.publish(activity.audio.state.copy(error = "synthetic-first"))
+            android.os.Handler(Looper.getMainLooper()).post {
+                assertEquals("synthetic-latest", activity.presentedVoiceState().error)
+            }
+            activity.audio.publish(activity.audio.state.copy(error = "synthetic-latest"))
+            looper.idle()
+        } finally { controller.pause().stop().destroy() }
+    }
+
+    @Test fun voiceStartupDefersHistoryAcrossProjectionsAndFlushesCurrentSnapshotAtTimeout() {
+        Shadows.shadowOf(RuntimeEnvironment.getApplication()).grantPermissions(Manifest.permission.RECORD_AUDIO)
+        val controller = Robolectric.buildActivity(SyntheticAssistantActivity::class.java, voiceLaunchIntent()).create().start()
+        val activity = controller.get()
+        val looper = Shadows.shadowOf(Looper.getMainLooper())
+        try {
+            activity.synthetic.state = activity.synthetic.state.copy(conversation = "{\"replica\":\"synthetic-old-conversation\",\"sequence\":\"1\"}")
+            controller.resume()
+            activity.synthetic.publish(activity.synthetic.state)
+            looper.idle()
+            assertTrue(activity.synthetic.historyReads.isEmpty())
+            val currentConversation = "{\"replica\":\"synthetic-current-conversation\",\"sequence\":\"1\"}"
+            activity.synthetic.state = activity.synthetic.state.copy(conversation = currentConversation)
+            looper.idleFor(Duration.ofMillis(AssistantActivity.DEFERRED_STARTUP_SYNC_DELAY_MS))
+            assertEquals(1, activity.synthetic.historyReads.size)
+            assertEquals(currentConversation, activity.historyState.conversation)
+            assertEquals(1, activity.linkReads.size)
+        } finally { controller.pause().stop().destroy() }
+    }
+
+    @Test fun backgroundVoiceDeliveryWaitsForMainThreadAndRetiresOnStop() {
+        val controller = Robolectric.buildActivity(SyntheticAssistantActivity::class.java).setup()
+        val activity = controller.get()
+        val looper = Shadows.shadowOf(Looper.getMainLooper())
+        try {
+            looper.idle()
+            Thread { activity.audio.publish(activity.audio.state.copy(error = "synthetic-background")) }.apply { start(); join() }
+            assertNull(activity.presentedVoiceState().error)
+            looper.idle()
+            assertEquals("synthetic-background", activity.presentedVoiceState().error)
+            Thread { activity.audio.publish(activity.audio.state.copy(error = "synthetic-retired")) }.apply { start(); join() }
+            controller.pause().stop()
+            looper.idle()
+            assertEquals("synthetic-background", activity.presentedVoiceState().error)
+        } finally { controller.destroy() }
+    }
+
+    @Test fun pausedVoiceStartupDoesNotFlushHistoryOrLinkOnTimeoutOrLateReady() {
+        Shadows.shadowOf(RuntimeEnvironment.getApplication()).grantPermissions(Manifest.permission.RECORD_AUDIO)
+        val controller = Robolectric.buildActivity(SyntheticAssistantActivity::class.java, voiceLaunchIntent()).create().start().resume()
+        val activity = controller.get()
+        try {
+            controller.pause()
+            activity.audio.publish(activity.audio.state.copy(error = "synthetic-terminal"))
+            Shadows.shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(AssistantActivity.DEFERRED_STARTUP_SYNC_DELAY_MS))
+            assertTrue(activity.synthetic.historyReads.isEmpty())
+            assertTrue(activity.linkReads.isEmpty())
+        } finally { controller.stop().destroy() }
+    }
+
+    @Test fun openSpeechStoreMissingInstallerFallsBackWithoutUnpackagedTtsInstall() {
+        val controller = Robolectric.buildActivity(MissingTtsInstallerActivity::class.java).setup()
+        val activity = controller.get()
+        try {
+            activity.audio.publish(activity.audio.state.copy(error = "local_voice_unavailable"))
+            activity.openSpeechStore()
+            val installers = activity.attempted.filter {
+                it.action == android.speech.tts.TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA
+            }
+            assertEquals(1, installers.size)
+            assertEquals("com.google.android.tts", installers.single().`package`)
+            assertEquals(Intent.ACTION_VIEW, activity.attempted.last().action)
+            assertEquals("com.android.vending", activity.attempted.last().`package`)
+        } finally { controller.pause().stop().destroy() }
+    }
+
+    @Test fun openSpeechStoreLaunchesPackagedTtsDataInstallWhenLocalVoiceDataIsMissing() {
+        val context = RuntimeEnvironment.getApplication()
+        val pm = Shadows.shadowOf(context.packageManager)
+        val googleTtsInstall = Intent(android.speech.tts.TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA)
+            .setPackage("com.google.android.tts")
+        val resolveInfo = ResolveInfo().apply {
+            activityInfo = ActivityInfo().apply {
+                packageName = "com.google.android.tts"
+                name = "com.google.android.tts.InstallActivity"
+                applicationInfo = ApplicationInfo().apply { packageName = "com.google.android.tts" }
+            }
+        }
+        pm.addResolveInfoForIntent(googleTtsInstall, resolveInfo)
+        val controller = Robolectric.buildActivity(SyntheticAssistantActivity::class.java).setup()
+        val activity = controller.get()
+        try {
+            activity.audio.publish(activity.audio.state.copy(
+                loop = dev.gitblame.voxgolem.assistant.speech.ConversationLoopState(error = "local_voice_unavailable")
+            ))
+            assertTrue(assistantIsInstallableVoiceError("local_voice_unavailable", activity.presentedVoiceState()))
+            assertTrue(assistantNeedsTtsDataInstall(activity.presentedVoiceState()))
+            activity.openSpeechStore()
+            val started = Shadows.shadowOf(activity).nextStartedActivity
+            assertNotNull(started)
+            assertEquals(android.speech.tts.TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA, started.action)
+            assertEquals("com.google.android.tts", started.`package`)
+        } finally {
+            controller.pause().stop().destroy()
+        }
     }
 }

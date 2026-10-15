@@ -42,7 +42,7 @@ describe('SearchModeSelect', () => {
     expect(onChange).not.toHaveBeenCalled()
   })
 
-  it('retains the visible Search label and reason when iconOnly is omitted', () => {
+  it('retains the visible Search label and discloses associated secondary help when iconOnly is omitted', () => {
     const onChange = vi.fn()
     const { select } = render(true, 'Synthetic disabled reason')
     act(() => root?.render(<SearchModeSelect value="quick" disabled reason="Synthetic disabled reason" onChange={onChange} />))
@@ -50,6 +50,13 @@ describe('SearchModeSelect', () => {
     expect(container!.querySelector('.native-icon-select')).toBeNull()
     expect(container!.querySelector('.search-mode__reason')?.textContent).toBe('Synthetic disabled reason')
     expect(container!.querySelector('.search-mode__reason')?.classList.contains('sr-only')).toBe(false)
+    const help = container!.querySelector('details')!
+    expect(help.open).toBe(false)
+    expect(help.querySelector('summary')?.textContent).toBe('Search info')
+    expect(help.querySelector(`#${CSS.escape(select.getAttribute('aria-describedby')!)}`)?.textContent).toBe('Synthetic disabled reason')
+    expect(select.title).toContain('Synthetic disabled reason')
+    act(() => { help.querySelector('summary')!.click() })
+    expect(help.open).toBe(true)
   })
 
   it('renders only a decorative collapsed icon and publishes the current mode through native semantics, description and title', () => {

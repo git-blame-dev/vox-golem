@@ -294,6 +294,7 @@ impl ResponseProfile {
 pub enum UiTheme {
     Light,
     Dark,
+    Slate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -766,6 +767,21 @@ mod tests {
             speech_language: BoundedText::default(),
             speech_tts_provider: BoundedText::default(),
             speech_tts_voice: BoundedText::default(),
+        }
+    }
+
+    #[test]
+    fn preferences_round_trip_all_themes_and_reject_unknown_values() {
+        for theme in ["dark", "slate", "light"] {
+            let mut wire = serde_json::to_value(preferences()).unwrap();
+            wire["ui_theme"] = theme.into();
+            let parsed: ValidatedPreferences = serde_json::from_value(wire).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap()["ui_theme"], theme);
+        }
+        for theme in ["sepia", "dim", "sleek-dark"] {
+            let mut wire = serde_json::to_value(preferences()).unwrap();
+            wire["ui_theme"] = theme.into();
+            assert!(serde_json::from_value::<ValidatedPreferences>(wire).is_err());
         }
     }
 

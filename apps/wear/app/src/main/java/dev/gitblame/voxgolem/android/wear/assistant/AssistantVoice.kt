@@ -11,8 +11,36 @@ import java.lang.ref.WeakReference
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import dev.gitblame.voxgolem.assistant.AssistantTiming
+import dev.gitblame.voxgolem.assistant.AssistantDiagnosticJournal.Metadata
 
 enum class AssistantVoiceEntryMode { ASK, TALK }
+
+private fun activeVoicePhases(dictation: DictationPhase, speech: SpeechPhase, loop: LoopPhase): Boolean =
+    dictation == DictationPhase.CHECKING || dictation == DictationPhase.LISTENING || dictation == DictationPhase.FINISHING ||
+        speech == SpeechPhase.CHECKING || speech == SpeechPhase.SPEAKING ||
+        loop == LoopPhase.LISTENING || loop == LoopPhase.GENERATING || loop == LoopPhase.SPEAKING || loop == LoopPhase.BETWEEN_TURNS
+
+internal data class AssistantVoiceOperationStatus(val active: Boolean, val failed: Boolean)
+
+internal object AssistantVoiceLaunchGate {
+    fun shouldStart(
+        visible: Boolean,
+        resumed: Boolean,
+        state: AssistantState?,
+        pendingMode: AssistantVoiceEntryMode?,
+        hasRecordAudioPermission: Boolean = true,
+        voiceActive: Boolean = false,
+        inputPending: Boolean = false,
+        permissionPending: Boolean = false,
+        finishingOrDestroyed: Boolean = false,
+    ): Boolean {
+        if (!visible || !resumed || finishingOrDestroyed || pendingMode == null || !hasRecordAudioPermission ||
+            voiceActive || inputPending || permissionPending) return false
+        if (state == null || !state.contextReady || state.busy) return false
+        return true
+    }
+}
 
 data class AssistantVoiceState(
     val dictation: DictationState = DictationState(),
@@ -34,8 +62,7 @@ data class AssistantVoiceState(
     val speechRequirementMessage: String? = null,
 ) {
     val listening: Boolean get() = dictation.phase in setOf(DictationPhase.CHECKING, DictationPhase.LISTENING, DictationPhase.FINISHING)
-    val active: Boolean get() = admissionPending || listening || speech.phase in setOf(SpeechPhase.CHECKING, SpeechPhase.SPEAKING) ||
-        loop.phase in setOf(LoopPhase.LISTENING, LoopPhase.GENERATING, LoopPhase.SPEAKING, LoopPhase.BETWEEN_TURNS)
+    val active: Boolean get() = admissionPending || activeVoicePhases(dictation.phase, speech.phase, loop.phase)
 }
 
 interface AssistantVoiceController : AutoCloseable {
@@ -45,7 +72,9 @@ interface AssistantVoiceController : AutoCloseable {
     fun dictate(draft: String)
     /** Single authoritative utterance -> one reply -> idle. Legacy draft dictation is unchanged. */
     fun ask(draft: String) { dictate(draft) }
+    fun ask(draft: String, timingParent: AssistantTiming?) { ask(draft) }
     fun conversation(draft: String)
+    fun conversation(draft: String, timingParent: AssistantTiming?) { conversation(draft) }
     fun endUtterance()
     fun stop()
     fun tts(enabled: Boolean)
@@ -105,6 +134,8 @@ internal class WearAssistantVoice(
     private var missingSpeechServices = false
     private var speechRequirementMessage: String? = null
     private var lastAdmission = engine.snapshot().speechAdmission()
+    private var optionsSource = optionsInput().frozenLanguages()
+    private var speechOptions = optionsSource.bounded()
     private var publishedOptions: SpeechOptions? = null
     private val replyEpoch = AtomicLong()
     private var manualRequest: Long? = null
@@ -157,9 +188,27 @@ internal class WearAssistantVoice(
             missingSpeechServices = missingSpeechServices,
             speechRequirementMessage = speechRequirementMessage)
     }
-    private fun options() = output.options().copy(recognitionInstalledLanguages = dictation.snapshot().route?.installedLanguages,
-        recognitionSupportedLanguages = dictation.snapshot().route?.supportedLanguages, localOnlyRecognitionAvailable = localOnlyRecognitionAvailable).bounded()
+    internal fun operationStatus(): AssistantVoiceOperationStatus {
+        val input = dictation.snapshot()
+        val speech = output.snapshot()
+        val conversation = loop.snapshot()
+        return AssistantVoiceOperationStatus(activeVoicePhases(input.phase, speech.phase, conversation.phase),
+            error != null || input.error != null || speech.error != null || conversation.error != null)
+    }
+    private fun options() = speechOptions
+    private fun optionsInput(): SpeechOptions {
+        val route = dictation.snapshot().route
+        return output.options().copy(recognitionInstalledLanguages = route?.installedLanguages,
+            recognitionSupportedLanguages = route?.supportedLanguages, localOnlyRecognitionAvailable = localOnlyRecognitionAvailable)
+    }
+    private fun SpeechOptions.frozenLanguages() = copy(recognitionInstalledLanguages = recognitionInstalledLanguages?.toList(),
+        recognitionSupportedLanguages = recognitionSupportedLanguages?.toList())
     private fun updateOptions() {
+        val source = optionsInput()
+        if (source != optionsSource) {
+            optionsSource = source.frozenLanguages()
+            speechOptions = optionsSource.bounded()
+        }
         val value = options()
         if (value != publishedOptions) { publishedOptions = value; engine.publishSpeechOptions(value) }
     }
@@ -233,6 +282,7 @@ internal class WearAssistantVoice(
     }
     private fun admit(): Boolean {
         if (closed || !foreground) return false
+        if (!engine.snapshot().contextReady) { error = "context_not_ready"; publish(); return false }
         if (!admissionReady()) { error = "capture_admission_unavailable"; publish(); return false }
         if (engine.snapshot().busy || manualRequest != null) { error = "generation_busy"; publish(); return false }
         error = null
@@ -249,16 +299,24 @@ internal class WearAssistantVoice(
     override fun conversation(draft: String) {
         startVoice(draft, AssistantVoiceEntryMode.TALK)
     }
+    override fun conversation(draft: String, timingParent: AssistantTiming?) = startVoice(draft, AssistantVoiceEntryMode.TALK, timingParent)
     override fun ask(draft: String) {
         startVoice(draft, AssistantVoiceEntryMode.ASK)
     }
-    private fun startVoice(draft: String, entry: AssistantVoiceEntryMode) {
-        if (!admit()) return
+    override fun ask(draft: String, timingParent: AssistantTiming?) = startVoice(draft, AssistantVoiceEntryMode.ASK, timingParent)
+    private fun startVoice(draft: String, entry: AssistantVoiceEntryMode, timingParent: AssistantTiming? = null) {
+        if (!admit()) { timingParent?.finish(AssistantTiming.Stage.FAILED); return }
+        val timing = timingParent ?: AssistantTiming.begin(context, AssistantTiming.Operation.VOICE_FLOW).also {
+            it.mark(AssistantTiming.Stage.REQUESTED)
+            it.metadata(Metadata(entry = if (entry == AssistantVoiceEntryMode.ASK) "ask" else "talk"))
+        }
         retireManualReply()
+        listeningCue?.timing(timing)
         entryMode = entry
         val owner = engine.snapshot()
         sessionConversation = owner.conversation; sessionHead = owner.selectedHead
-        mode = true; loop.start(language, draft, if (entry == AssistantVoiceEntryMode.ASK) VoiceSessionPolicy.SINGLE_TURN else VoiceSessionPolicy.REPEAT_AFTER_REPLY)
+        mode = true; loop.start(language, draft, if (entry == AssistantVoiceEntryMode.ASK) VoiceSessionPolicy.SINGLE_TURN else VoiceSessionPolicy.REPEAT_AFTER_REPLY,
+            timingParent = timing)
     }
     override fun send(): Boolean {
         if (closed || !foreground || mode || snapshot().listening || engine.snapshot().busy || manualRequest != null) return true
@@ -288,7 +346,10 @@ internal class WearAssistantVoice(
         microphoneCues?.finish(dictation.snapshot().utterance)
         loop.endUtterance()
     }
-    override fun stop() { microphoneCues?.cancel(); retireManualReply(); preservePartial(); mode = false; loop.stop(); publish() }
+    override fun stop() {
+        microphoneCues?.cancel(); retireManualReply(); preservePartial()
+        mode = false; loop.stop(); publish()
+    }
     override fun tts(enabled: Boolean) {
         if (closed) return
         repliesEnabled = enabled

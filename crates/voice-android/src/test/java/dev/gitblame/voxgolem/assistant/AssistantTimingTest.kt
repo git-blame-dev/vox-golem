@@ -82,6 +82,47 @@ class AssistantTimingTest {
         assertTrue(ShadowLog.getLogsForTag(AssistantTiming.TAG).isEmpty())
     }
 
+    @Test fun correlatedForkKeepsParentIdentityButStartsItsOwnDurationAfterParentSettles() {
+        var now = 1_000_000_000L
+        val events = mutableListOf<AssistantTiming.Event>()
+        val launch = AssistantTiming.begin(context, Operation.ACTIVITY, { now }, AssistantTiming.Sink(events::add))
+        now += 200_000_000L
+        launch.finish(Stage.FIRST_PROJECTION)
+        val voice = launch.fork(Operation.VOICE_FLOW)
+        now += 30_000_000L
+        val recognition = voice.fork(Operation.RECOGNITION)
+        now += 70_000_000L
+        recognition.finish(Stage.SETTLED)
+        voice.finish(Stage.SETTLED)
+        assertTrue(events.filter { it.run == voice.run }.all { it.parentRun == launch.run })
+        assertTrue(events.filter { it.run == recognition.run }.all { it.parentRun == voice.run })
+        assertEquals(0L, events.first { it.run == recognition.run }.elapsedNanos)
+        assertEquals(70_000_000L, events.last { it.run == recognition.run }.elapsedNanos)
+        assertEquals(100_000_000L, events.last { it.run == voice.run }.elapsedNanos)
+        assertEquals(1_300_000_000L, events.last().observedNanos)
+    }
+
+    @Test fun typedMetadataUsesTheSameObserverAndNeverEscapesRetirementOrSinkFailures() {
+        var now = 500L
+        val observed = mutableListOf<Long>()
+        val sink = object : AssistantTiming.MetadataSink {
+            override fun emit(event: AssistantTiming.Event) {}
+            override fun emitMetadata(operation: Operation, run: Int, parentRun: Int?, observedNanos: Long,
+                metadata: AssistantDiagnosticJournal.Metadata) {
+                observed += observedNanos
+                throw IllegalStateException("Synthetic journal unavailable")
+            }
+        }
+        val timing = AssistantTiming.begin(context, Operation.SPEECH, { now }, sink)
+        now = 700L
+        timing.metadata(AssistantDiagnosticJournal.Metadata(engine = "com.google.android.tts", networkRequired = false))
+        timing.finish(Stage.SETTLED)
+        timing.metadata(AssistantDiagnosticJournal.Metadata(count = 1))
+        assertEquals(listOf(700L), observed)
+        assertTrue(timing.isFinished)
+        assertTrue(ShadowLog.getLogsForTag(AssistantTiming.TAG).isEmpty())
+    }
+
     @Test fun explicitAssistantMetadataEnablesReleaseButCaptureMetadataDoesNot() {
         context.applicationInfo.flags = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE.inv()
         context.applicationInfo.metaData = Bundle().apply { putBoolean("dev.gitblame.voxgolem.capture.TIMING_ENABLED", true) }

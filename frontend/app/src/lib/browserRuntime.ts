@@ -370,7 +370,7 @@ function parsePreferences(value: unknown): BrowserPreviewPreferences {
     catch { throw new BrowserPreviewCommandError('invalid_input', `Preference ${key} must be a string within 512 UTF-8 bytes`) }
   }
   if (payload['response_profile'] !== 'fast' && payload['response_profile'] !== 'quality') throw new BrowserPreviewCommandError('invalid_input', 'Response profile is unsupported')
-  if (payload['ui_theme'] !== 'light' && payload['ui_theme'] !== 'dark') throw new BrowserPreviewCommandError('invalid_input', 'UI theme is unsupported')
+  if (payload['ui_theme'] !== 'light' && payload['ui_theme'] !== 'dark' && payload['ui_theme'] !== 'slate') throw new BrowserPreviewCommandError('invalid_input', 'UI theme is unsupported')
   if (!['small', 'medium', 'large', 'extra_large'].includes(payload['ui_text_size'] as string)) throw new BrowserPreviewCommandError('invalid_input', 'UI text size is unsupported')
   return {
     instant: payload['instant'] as string,

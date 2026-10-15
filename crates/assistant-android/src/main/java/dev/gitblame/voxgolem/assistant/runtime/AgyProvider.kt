@@ -33,6 +33,11 @@ class AgyProviderRouter(
         (agyNative as? AgyProviderNative)?.prewarm(model, eligible)
     }
 
+    override fun prewarm(model: String, authPath: String) {
+        prewarm(model)
+        if (!isAgyModel(model)) defaultNative.prewarm(model, authPath)
+    }
+
     override fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String {
         val model = try {
             JSONObject(requestJson).optString("model")

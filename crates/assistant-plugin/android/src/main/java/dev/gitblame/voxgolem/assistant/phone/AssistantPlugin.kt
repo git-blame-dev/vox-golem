@@ -58,6 +58,7 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
     private val speechOwner = lazy { suppliedSpeech ?: PhoneSpeechSession(activity.applicationContext, backend) }
     private val speech get() = speechOwner.value
     private val main = Handler(Looper.getMainLooper())
+    private val uiThemePublication = (activity as? PhoneUiThemeOwner)?.let(::PhoneUiThemePublication)
     private val visible = AtomicBoolean(false)
     private val inputEpoch = AtomicLong()
     private var webViewReference: WeakReference<WebView>? = null
@@ -143,11 +144,24 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
         catch (error: RuntimeException) { reply(invoke, Result.failure(error)) }
     }
 
+    private fun publishUiTheme(result: Result<Any?>, preferences: Boolean) {
+        if (uiThemePublication == null) return
+        val theme = PhoneUiThemePublication.readTheme(result, preferences) ?: return
+        activity.runOnUiThread {
+            if (!activity.isFinishing && !activity.isDestroyed) {
+                uiThemePublication.publish(theme, preferences)
+            }
+        }
+    }
+
     @Command fun get_app_snapshot(invoke: Invoke) {
         val timing = (activity as? PhoneStartupTimingOwner)?.startupTiming?.trace
         timing?.mark(Stage.INITIAL_SNAPSHOT_REQUESTED)
         try { backend.command(invoke.command, JSONObject(invoke.getRawArgs())) { result ->
-            if (result.isSuccess) timing?.mark(Stage.INITIAL_SNAPSHOT_REPLIED)
+            if (result.isSuccess) {
+                timing?.mark(Stage.INITIAL_SNAPSHOT_REPLIED)
+                publishUiTheme(result, preferences = false)
+            }
             reply(invoke, result)
         } } catch (error: RuntimeException) { reply(invoke, Result.failure(error)) }
     }
@@ -162,7 +176,12 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
     @Command fun new_conversation(invoke: Invoke) {
         if (pendingVoice != null || speech.active() && speech.status().optString("mode") != "shortcut") reject(invoke, "busy", "Stop voice before changing conversations") else execute(invoke)
     }
-    @Command fun set_preferences(invoke: Invoke) = execute(invoke)
+    @Command fun set_preferences(invoke: Invoke) {
+        try { backend.command(invoke.command, JSONObject(invoke.getRawArgs())) { result ->
+            publishUiTheme(result, preferences = true)
+            reply(invoke, result)
+        } } catch (error: RuntimeException) { reply(invoke, Result.failure(error)) }
+    }
     @Command fun set_search_mode(invoke: Invoke) = execute(invoke)
     @Command fun select_conversation(invoke: Invoke) {
         if (speech.active() || pendingVoice != null) reject(invoke, "busy", "Stop voice before changing conversations") else execute(invoke)

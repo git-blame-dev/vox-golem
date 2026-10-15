@@ -4,6 +4,18 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class PhonePreferencesTest {
+    @Test fun acceptsAllThemesAndKeepsDarkDefaultWithoutAcceptingAliases() {
+        assertEquals("dark", PhonePreferences.defaults().getString("ui_theme"))
+        for (theme in listOf("dark", "slate", "light")) {
+            PhonePreferences.validate(PhonePreferences.defaults().put("ui_theme", theme))
+        }
+        for (theme in listOf("sepia", "dim", "sleek-dark", true, 0)) {
+            val error = assertThrows(AssistantPhoneFailure::class.java) {
+                PhonePreferences.validate(PhonePreferences.defaults().put("ui_theme", theme))
+            }
+            assertEquals("invalid_input", error.code)
+        }
+    }
     @Test fun retainsAllLegacyKeysAndEnumSpellings() {
         val value = PhonePreferences.defaults().put("deep", "custom-luna-low").put("review", "custom-luna-low").put("ui_text_size", "extra_large")
         PhonePreferences.validate(value)

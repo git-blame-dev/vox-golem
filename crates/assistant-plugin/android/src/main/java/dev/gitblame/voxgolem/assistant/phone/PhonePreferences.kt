@@ -70,7 +70,7 @@ class PhonePreferences(context: Context) {
                 "instant" to dev.gitblame.voxgolem.assistant.runtime.AssistantModels.aliases.toSet(),
                 "deep" to setOf("custom-sol-high", "custom-luna-low", "agy-flash-low", "agy-flash-high", "agy-opus-high", "agy-sonnet-high"),
                 "review" to setOf("custom-sol-high", "custom-luna-low", "agy-flash-low", "agy-flash-high", "agy-opus-high", "agy-sonnet-high"),
-                "response_profile" to setOf("fast", "quality"), "ui_theme" to setOf("light", "dark"),
+                "response_profile" to setOf("fast", "quality"), "ui_theme" to setOf("light", "dark", "slate"),
                 "ui_text_size" to setOf("small", "medium", "large", "extra_large"),
             )
             for ((key, options) in enums) {

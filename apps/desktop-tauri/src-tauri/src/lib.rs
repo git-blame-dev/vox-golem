@@ -1377,6 +1377,7 @@ fn build_ipc_app_snapshot(
             ui_theme: match ui_preferences.theme {
                 UiThemePayload::Light => ipc::UiTheme::Light,
                 UiThemePayload::Dark => ipc::UiTheme::Dark,
+                UiThemePayload::Slate => ipc::UiTheme::Slate,
             },
             ui_text_size: match ui_preferences.text_size {
                 UiTextSizePayload::Small => ipc::UiTextSize::Small,
@@ -9860,6 +9861,7 @@ impl From<&voxgolem_core::ipc::ValidatedPreferences> for PersistedState {
             ui_theme: Some(match preferences.ui_theme {
                 UiTheme::Light => UiThemePayload::Light,
                 UiTheme::Dark => UiThemePayload::Dark,
+                UiTheme::Slate => UiThemePayload::Slate,
             }),
             assistant_settings: Some(preferences.into()),
             auto_update_download: None,
@@ -13522,6 +13524,52 @@ mod tests {
     }
 
     #[test]
+    fn canonical_themes_round_trip_publication_storage_and_restart() {
+        use voxgolem_core::ipc::UiTheme;
+        let directory = tempfile::tempdir().unwrap();
+        let _root = super::test_storage::ScopedRoot::new(directory.path().to_path_buf());
+        let state = build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            super::embedded_cue_asset_paths(),
+            "synthetic".into(),
+        );
+        let mut requested = get_app_snapshot_from_state(&state).unwrap().preferences;
+        assert_eq!(requested.ui_theme, UiTheme::Dark);
+        for theme in [UiTheme::Slate, UiTheme::Light, UiTheme::Dark] {
+            requested.ui_theme = theme;
+            let accepted = tauri::async_runtime::block_on(set_preferences_from_state(
+                requested.clone(),
+                &state,
+            ))
+            .unwrap();
+            assert_eq!(accepted.ui_theme, theme);
+            assert_eq!(
+                get_app_snapshot_from_state(&state)
+                    .unwrap()
+                    .preferences
+                    .ui_theme,
+                theme
+            );
+            assert_eq!(
+                load_persisted_state().unwrap(),
+                PersistedState::from(&requested)
+            );
+            let restarted = build_nonfatal_config_error_app_state(
+                default_voice_pipeline_config(),
+                super::embedded_cue_asset_paths(),
+                "synthetic".into(),
+            );
+            assert_eq!(
+                get_app_snapshot_from_state(&restarted)
+                    .unwrap()
+                    .preferences
+                    .ui_theme,
+                theme
+            );
+        }
+    }
+
+    #[test]
     fn canonical_preferences_disable_tts_in_the_same_publication() {
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
@@ -14112,6 +14160,7 @@ mod tests {
             requested.ui_theme = match requested.ui_theme {
                 voxgolem_core::ipc::UiTheme::Light => voxgolem_core::ipc::UiTheme::Dark,
                 voxgolem_core::ipc::UiTheme::Dark => voxgolem_core::ipc::UiTheme::Light,
+                voxgolem_core::ipc::UiTheme::Slate => voxgolem_core::ipc::UiTheme::Light,
             };
 
             let result =
@@ -15365,6 +15414,111 @@ mod tests {
             .0,
             crate::telemetry::Provider::Custom
         );
+    }
+
+    #[test]
+    fn custom_instant_admission_does_not_require_an_opencode_server() {
+        use voxgolem_core::assistant::InstantModel;
+
+        for model in [
+            InstantModel::CustomSolHigh,
+            InstantModel::CustomSolNone,
+            InstantModel::CustomLunaNone,
+            InstantModel::CustomLunaLow,
+        ] {
+            let state = build_nonfatal_config_error_app_state(
+                default_voice_pipeline_config(),
+                super::embedded_cue_asset_paths(),
+                String::from("synthetic unconfigured backend"),
+            );
+            let mut policy = state.conversation_session.lock().unwrap().policy().clone();
+            policy.instant_model = model;
+            policy.deep_enabled = false;
+            policy.review_enabled = false;
+            state
+                .conversation_session
+                .lock()
+                .unwrap()
+                .replace_policy(policy)
+                .unwrap();
+            assert!(state.opencode_server.lock().unwrap().is_none());
+            let registered = super::begin_registered_assistant_request(
+                &state,
+                "synthetic-request",
+                "Synthetic prompt",
+                super::CompletionSource::Typed,
+            )
+            .expect("Custom admission must not require OpenCode");
+            assert!(registered.opencode_client.is_none());
+            assert_eq!(registered.request.instant_model, model);
+            assert_eq!(registered.request.preferences.instant_model, model);
+        }
+    }
+
+    #[test]
+    fn canonical_switch_to_custom_luna_none_admits_without_opencode() {
+        let directory = tempfile::tempdir().unwrap();
+        let _storage_root = super::test_storage::ScopedRoot::new(directory.path().to_path_buf());
+        let state = build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            super::embedded_cue_asset_paths(),
+            String::from("synthetic unconfigured backend"),
+        );
+        if let StartupStatePayload::Ready { capabilities, .. } =
+            &mut *state.startup_state.lock().unwrap()
+        {
+            capabilities.push(CapabilityPayload {
+                id: "custom_provider",
+                state: CapabilityStatePayload::Available,
+                reason: String::from("synthetic ready"),
+                actual_provider: None,
+            });
+        } else {
+            panic!("synthetic shell must be ready");
+        }
+        let mut requested = get_app_snapshot_from_state(&state).unwrap().preferences;
+        assert_ne!(
+            requested.instant,
+            voxgolem_core::ipc::InstantModelChoice::CustomLunaNone
+        );
+        requested.instant = voxgolem_core::ipc::InstantModelChoice::CustomLunaNone;
+        requested.deep_enabled = false;
+        requested.review_enabled = false;
+        requested.completion = false;
+        requested.prefetch = false;
+        tauri::async_runtime::block_on(set_preferences_from_state(requested, &state))
+            .expect("canonical Custom model switch must publish");
+        let registered = super::begin_registered_assistant_request(
+            &state,
+            "synthetic-request",
+            "Synthetic prompt",
+            super::CompletionSource::Typed,
+        )
+        .expect("published Custom choice must admit without OpenCode");
+        assert!(registered.opencode_client.is_none());
+        assert_eq!(
+            registered.request.instant_model,
+            voxgolem_core::assistant::InstantModel::CustomLunaNone
+        );
+        drop(registered);
+
+        let mut policy = state.conversation_session.lock().unwrap().policy().clone();
+        policy.instant_model = voxgolem_core::assistant::InstantModel::OpenCodeSolHigh;
+        state
+            .conversation_session
+            .lock()
+            .unwrap()
+            .replace_policy(policy)
+            .unwrap();
+        let error = super::begin_registered_assistant_request(
+            &state,
+            "synthetic-opencode-request",
+            "Synthetic prompt",
+            super::CompletionSource::Typed,
+        )
+        .err()
+        .expect("OpenCode must still require its server");
+        assert_eq!(error, "OpenCode server is not available");
     }
 
     #[test]
@@ -18126,7 +18280,7 @@ mod tests {
         let initial = get_app_snapshot_from_state(&state).unwrap().preferences;
         persist_state(PersistedState::from(&initial)).unwrap();
         let mut proposed = initial.clone();
-        proposed.ui_theme = voxgolem_core::ipc::UiTheme::Light;
+        proposed.ui_theme = voxgolem_core::ipc::UiTheme::Slate;
         let previous = persist_validated_preferences(&proposed).unwrap();
         super::persist_auto_update_install(false).unwrap();
         super::restore_persisted_state(previous, &proposed).unwrap();

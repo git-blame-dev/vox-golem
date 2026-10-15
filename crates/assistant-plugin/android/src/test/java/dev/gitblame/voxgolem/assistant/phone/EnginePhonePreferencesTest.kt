@@ -95,6 +95,25 @@ class EnginePhonePreferencesTest {
 
     @After fun resetAdmission() { AssistantRuntime.configureCaptureResourceAdmission(false) }
 
+    @Test fun allThemesRoundTripThroughNativePublicationAndStorageWithoutInvalidWrites() {
+        Fixture(false).use { f ->
+            assertEquals("dark", f.backend.nativePreferences().getString("ui_theme"))
+            for (theme in listOf("slate", "light", "dark", "slate")) {
+                val result = f.update(f.backend.nativePreferences().put("ui_theme", theme)).getOrThrow() as JSONObject
+                assertEquals(theme, result.getString("ui_theme"))
+                assertEquals(theme, f.backend.nativePreferences().getString("ui_theme"))
+                assertEquals(theme, f.persisted().getString("ui_theme"))
+            }
+            assertTrue(f.update(f.backend.nativePreferences().put("ui_theme", "sepia")).isFailure)
+            assertEquals("slate", f.backend.nativePreferences().getString("ui_theme"))
+            assertEquals("slate", f.persisted().getString("ui_theme"))
+            f.rejectModelWrite = true
+            assertTrue(f.update(f.backend.nativePreferences().put("instant", "agy-flash-high").put("ui_theme", "light")).isFailure)
+            assertEquals("slate", f.backend.nativePreferences().getString("ui_theme"))
+            assertEquals("slate", f.persisted().getString("ui_theme"))
+        }
+    }
+
     @Test fun failedPrewarmCannotSuppressCommittedPreferenceReply() {
         Fixture(false).use { f ->
             f.prewarmFails = true

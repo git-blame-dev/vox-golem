@@ -4,7 +4,6 @@ import type { TranscriptMessage, UiTextSize } from './types/chat'
 import { isTranscriptMessage } from './types/chat'
 import { ChatBubble } from './components/ChatBubble'
 import { AnswerStage } from './components/AnswerStage'
-import { isAndroidRuntime } from './lib/tauri'
 import { duration } from './lib/duration'
 import { frontendTimingEnabled } from './lib/frontendTiming'
 import { turnObservationAttributes } from './turnObservation'
@@ -69,7 +68,7 @@ const TranscriptRow = memo(function TranscriptRow({ message, onAnswerDomCommitte
   }, [message.content, message.id, message.role, onAnswerDomCommitted])
   if (!message.answerStage || message.role !== 'assistant') return <ChatBubble message={message} />
   return <div className="conversation__answer" {...turnObservationAttributes(message)}>
-    <AnswerStage compact={isAndroidRuntime} answer={message.content} className="message message--assistant" {...(message.contentKind === undefined ? {} : { contentKind: message.contentKind })} {...message.answerStage} />
+    <AnswerStage compact answer={message.content} className="message message--assistant" {...(message.contentKind === undefined ? {} : { contentKind: message.contentKind })} {...message.answerStage} />
     {message.customDirectTimings ? <small className="conversation__timings">{duration(message.customDirectTimings.firstTextMs)}</small> : null}
   </div>
 })

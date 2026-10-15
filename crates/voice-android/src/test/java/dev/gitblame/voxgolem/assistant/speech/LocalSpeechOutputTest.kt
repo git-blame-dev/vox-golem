@@ -31,6 +31,9 @@ class LocalSpeechOutputTest {
             override var provider: String? = null
             var offered = listOf(LocalVoice("synthetic-local", Locale.US, false, true))
             var spoken = mutableListOf<String>()
+            var queueModes = mutableListOf<Int>()
+            var terminals = mutableListOf<(String?) -> Unit>()
+            var warmups = mutableListOf<LocalVoice>()
             lateinit var finished: (String?) -> Unit
             var stops = 0
             var shutdown = false
@@ -39,8 +42,23 @@ class LocalSpeechOutputTest {
             var shutdownCalls = 0
             var beforeShutdown: (() -> Unit)? = null
             override fun voices() = offered
-            override fun speak(text: String, voice: LocalVoice, onTerminal: (String?) -> Unit): Boolean {
-                spoken += text; finished = onTerminal; return true
+            override fun warmup(voice: LocalVoice) {
+                warmups += voice
+            }
+            override fun speak(text: String, voice: LocalVoice, onTerminal: (String?) -> Unit): Boolean =
+                speak(text, voice, android.speech.tts.TextToSpeech.QUEUE_FLUSH, null, onTerminal)
+            override fun speak(
+                text: String,
+                voice: LocalVoice,
+                queueMode: Int,
+                timing: AssistantTiming?,
+                onTerminal: (String?) -> Unit,
+            ): Boolean {
+                spoken += text
+                queueModes += queueMode
+                terminals += onTerminal
+                finished = onTerminal
+                return true
             }
             override fun stop() { stops++ }
             override fun shutdown() {
@@ -82,6 +100,86 @@ class LocalSpeechOutputTest {
         context.applicationInfo.flags = context.applicationInfo.flags or ApplicationInfo.FLAG_DEBUGGABLE
         return LocalSpeechOutput(factory, focus, leases = leases,
             beginTiming = { AssistantTiming.begin(context, it, sink = AssistantTiming.Sink { event -> events += event }) })
+    }
+
+    @Test fun catalogueProjectionIsReusedAcrossWarmSpeechPhasesAndRetirement() {
+        enable(); output.prepare("en-US"); drain(); factory.ready(true); drain()
+        val options = output.options()
+        val phases = mutableListOf<SpeechPhase>()
+        val subscription = output.subscribe { state ->
+            phases += state.phase
+            assertSame(options, state.options)
+        }
+        drain()
+        output.speak("Synthetic cached reply", "en-US") {}; drain()
+        factory.sdk.finished(null); drain()
+        output.setForeground(false); drain()
+        assertTrue(phases.containsAll(listOf(SpeechPhase.CHECKING, SpeechPhase.SPEAKING, SpeechPhase.IDLE)))
+        assertEquals("synthetic-local", options.ttsVoices.single().name)
+        subscription.close(); output.close(); drain()
+    }
+
+    @Test fun catalogueProviderReplacementAndRemovalInvalidateButUnchangedRefreshReusesProjection() {
+        var providers = listOf("synthetic-first")
+        val catalog = object : LocalTtsFactory {
+            override fun providers() = providers
+            override fun create(onReady: (Boolean) -> Unit): LocalTtsSession = error("No SDK needed")
+        }
+        val speech = LocalSpeechOutput(catalog, focus)
+        speech.refreshProviders(); drain()
+        val first = speech.options()
+        speech.refreshProviders(); drain(); assertSame(first, speech.options())
+        providers = listOf("synthetic-second")
+        speech.refreshProviders(); drain()
+        val replaced = speech.options()
+        assertNotSame(first, replaced); assertEquals(providers, replaced.ttsProviders)
+        providers = emptyList()
+        speech.refreshProviders(); drain()
+        assertNotSame(replaced, speech.options()); assertTrue(speech.options().ttsProviders.isEmpty())
+        speech.close(); drain()
+    }
+
+    @Test fun catalogueInventoryReplacementAndLruEvictionPreserveBoundsAndLiveSelection() {
+        var selected = "synthetic-provider-0"
+        var voices = listOf(LocalVoice("synthetic-original", Locale.US, false, true))
+        lateinit var ready: (Boolean) -> Unit
+        lateinit var session: Factory.Session
+        val catalog = object : LocalTtsFactory {
+            override fun providers() = listOf(selected)
+            override fun create(onReady: (Boolean) -> Unit): LocalTtsSession {
+                ready = onReady
+                session = Factory.Session().apply { provider = selected; offered = voices }
+                return session
+            }
+        }
+        val speech = LocalSpeechOutput(catalog, focus,
+            configuration = { SpeechAdmission(SpeechSelection(ttsProvider = selected), false) })
+        fun prepare() {
+            speech.setForeground(false); drain()
+            speech.setForeground(true); speech.prepare("en-US"); drain(); ready(true); drain()
+        }
+        speech.setEnabled(true); prepare()
+        val original = speech.options()
+        voices = listOf(LocalVoice("synthetic-replacement", Locale.US, false, true))
+        prepare()
+        assertNotSame(original, speech.options())
+        assertEquals("synthetic-replacement", speech.options().ttsVoices.single().name)
+        assertEquals("synthetic-replacement", session.warmups.single().name)
+        voices = emptyList(); prepare()
+        assertTrue(speech.options().ttsVoices.isEmpty())
+        for (index in 0..8) {
+            selected = "synthetic-provider-$index"
+            voices = (0..128).map { LocalVoice("synthetic-voice-${it.toString().padStart(3, '0')}", Locale.US, false, true) }
+            prepare()
+        }
+        val bounded = speech.options()
+        assertEquals(1024, bounded.ttsVoices.size)
+        assertEquals(8, bounded.ttsVoices.map { it.provider }.distinct().size)
+        assertFalse(bounded.ttsVoices.any { it.provider == "synthetic-provider-0" })
+        assertFalse(bounded.ttsVoices.any { it.name == "synthetic-voice-128" })
+        assertEquals("synthetic-voice-000", session.warmups.single().name)
+        assertEquals(0, focus.requests)
+        speech.close(); drain()
     }
 
     @Test fun ownerTimingPreservesWarmCacheIdleAdmissionAndSeparateReplySettlement() {
@@ -513,5 +611,134 @@ class LocalSpeechOutputTest {
         factory.sdk.finished(null); drain()
         assertEquals(0, oldCompletions); assertSame(admitted, leases.current())
         replacement.stop(); drain(); assertNull(leases.current())
+    }
+
+    @Test fun prepareTriggersWarmupOnReadySession() {
+        enable()
+        output.prepare("en-US"); drain()
+        factory.ready(true); drain()
+        assertEquals(listOf(factory.sdk.offered.single()), factory.sdk.warmups)
+        output.close(); drain()
+    }
+
+    @Test fun preparationPassesExplicitResolvedVoiceAndPlaybackDoesNotPrimeAgain() {
+        val australian = LocalVoice("synthetic-au-selected", Locale.forLanguageTag("en-AU"), false, true)
+        factory.sdk.offered = listOf(LocalVoice("synthetic-us-first", Locale.US, false, true),
+            australian.copy(name = "synthetic-au-other"), australian)
+        val speech = LocalSpeechOutput(factory, focus, configuration = {
+            SpeechAdmission(SpeechSelection(language = "en-AU", ttsVoice = australian.name), false)
+        })
+        speech.setForeground(true); speech.setEnabled(true); speech.prepare("en-US"); drain()
+        factory.ready(true); drain()
+        assertEquals(listOf(australian), factory.sdk.warmups)
+        assertEquals(0, focus.requests)
+        speech.speakStreamChunk("Synthetic first clause.", "en-US", flush = true); drain()
+        assertEquals(listOf(australian), factory.sdk.warmups)
+        assertEquals(listOf("Synthetic first clause."), factory.sdk.spoken)
+        speech.close(); drain()
+    }
+
+    @Test fun directPlaybackAndPlaybackTakingOverPendingPreparationDoNotInsertWarmupAheadOfSpeech() {
+        enable()
+        output.prepare("en-US"); drain()
+        output.speak("Synthetic pending answer.", "en-US") {}; drain()
+        factory.ready(true); drain()
+        assertTrue(factory.sdk.warmups.isEmpty())
+        factory.sdk.finished(null); drain()
+        output.speak("Synthetic next answer.", "en-US") {}; drain()
+        assertTrue(factory.sdk.warmups.isEmpty())
+        output.close(); drain()
+    }
+
+    @Test fun disablingBeforeFirstPostedStreamInitializationSettlesWithoutAllocatingSdk() {
+        enable()
+        val done = mutableListOf<String?>()
+        output.speakStreamChunk("Synthetic first sentence.", "en-US", flush = true, keepOpen = true, onDone = done::add)
+        output.setEnabled(false)
+        drain()
+        assertEquals(listOf("speech_cancelled"), done)
+        assertEquals(0, factory.creates)
+        output.close(); drain()
+        assertEquals(1, done.size)
+    }
+
+    @Test fun openStreamRetainsLeaseAcrossStarvationAndQueuesLaterBurstExactlyOnce() {
+        val leases = RecognitionResourceLease()
+        val speech = LocalSpeechOutput(factory, focus, leases = leases)
+        speech.setForeground(true); speech.setEnabled(true); drain()
+        val done = mutableListOf<String?>()
+        speech.speakStreamChunk("Synthetic first sentence.", "en-US", flush = true, keepOpen = true, onDone = done::add)
+        drain(); factory.ready(true); drain()
+        val firstLease = leases.current()
+        factory.sdk.terminals[0](null); drain()
+        assertSame(firstLease, leases.current())
+        assertEquals(SpeechPhase.SPEAKING, speech.snapshot().phase)
+        assertEquals(0, focus.releases)
+        speech.speakStreamChunk("Synthetic second sentence.", "en-US", flush = false, onDone = done::add)
+        speech.speakStreamChunk("Synthetic third sentence.", "en-US", flush = false, onDone = done::add)
+        speech.finishStream(); drain()
+        assertEquals(listOf("Synthetic first sentence.", "Synthetic second sentence.", "Synthetic third sentence."), factory.sdk.spoken)
+        assertEquals(1, focus.requests)
+        factory.sdk.terminals[1](null); factory.sdk.terminals[2](null); drain()
+        assertEquals(listOf<String?>(null, null, null), done)
+        assertEquals(1, focus.releases)
+        assertNull(leases.current())
+        speech.close(); drain()
+    }
+
+    @Test fun disableFocusLossAndTimeoutSettleEveryActiveStreamCallbackOnce() {
+        for (retire in listOf("disable", "focus", "timeout")) {
+            val localFactory = Factory()
+            val localFocus = Focus()
+            val leases = RecognitionResourceLease()
+            val speech = LocalSpeechOutput(localFactory, localFocus, timeoutMillis = 50, leases = leases)
+            speech.setForeground(true); speech.setEnabled(true); drain()
+            val done = mutableListOf<String?>()
+            speech.speakStreamChunk("Synthetic active first.", "en-US", flush = true, keepOpen = true, onDone = done::add)
+            drain(); localFactory.ready(true); drain()
+            speech.speakStreamChunk("Synthetic queued second.", "en-US", flush = false, onDone = done::add); drain()
+            when (retire) {
+                "disable" -> speech.setEnabled(false)
+                "focus" -> localFocus.lost()
+                else -> shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(50))
+            }
+            drain()
+            assertEquals(retire, 2, done.size)
+            assertTrue(done.all { it != null })
+            assertNull(leases.current())
+            localFactory.sdk.terminals.forEach { it(null) }; drain()
+            assertEquals(retire, 2, done.size)
+            speech.close(); drain()
+        }
+    }
+
+    @Test fun speakStreamChunkHoldsSingleLeaseAndFocusAcrossFlushAndQueuedAddChunks() {
+        val leases = RecognitionResourceLease()
+        val speech = LocalSpeechOutput(factory, focus, leases = leases)
+        speech.setForeground(true); speech.setEnabled(true); drain()
+        val done = mutableListOf<String?>()
+        speech.speakStreamChunk("First sentence.", "en-US", flush = true, onDone = done::add)
+        drain(); factory.ready(true); drain()
+        speech.speakStreamChunk("Second sentence.", "en-US", flush = false, onDone = done::add)
+        drain()
+        assertEquals(listOf("First sentence.", "Second sentence."), factory.sdk.spoken)
+        assertEquals(
+            listOf(android.speech.tts.TextToSpeech.QUEUE_FLUSH, android.speech.tts.TextToSpeech.QUEUE_ADD),
+            factory.sdk.queueModes,
+        )
+        assertEquals(1, focus.requests)
+        assertEquals(0, focus.releases)
+        assertNotNull(leases.current())
+        factory.sdk.terminals[0](null); drain()
+        assertEquals(listOf<String?>(null), done)
+        assertEquals(0, focus.releases)
+        assertNotNull(leases.current())
+        assertEquals(SpeechPhase.SPEAKING, speech.snapshot().phase)
+        factory.sdk.terminals[1](null); drain()
+        assertEquals(listOf<String?>(null, null), done)
+        assertEquals(1, focus.releases)
+        assertNull(leases.current())
+        assertEquals(SpeechPhase.IDLE, speech.snapshot().phase)
+        speech.close(); drain()
     }
 }

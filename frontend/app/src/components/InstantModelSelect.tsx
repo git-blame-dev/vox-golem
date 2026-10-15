@@ -9,11 +9,12 @@ interface InstantModelSelectProps {
   readonly disabled: boolean
   readonly canRetry: (value: InstantChoice) => boolean
   readonly onChange: (value: InstantChoice) => void
-  readonly iconOnly?: boolean
+  readonly variant?: 'default' | 'pill' | 'icon'
 }
 
-export function InstantModelSelect({ id, label, value, options, disabled, canRetry, onChange, iconOnly = false }: InstantModelSelectProps) {
+export function InstantModelSelect({ id, label, value, options, disabled, canRetry, onChange, variant = 'default' }: InstantModelSelectProps) {
   const selected = options.find((option) => option.value === value)
+  const selectedLabel = selected?.label ?? (options.length === 0 ? 'Models unavailable' : 'Selected model unavailable')
   const select = (
     <select id={id} aria-label={label} title={selected?.label ?? 'Models unavailable'} value={selected ? value : ''} disabled={disabled} onChange={(event) => {
       if (disabled) return
@@ -26,5 +27,13 @@ export function InstantModelSelect({ id, label, value, options, disabled, canRet
       </option>)}
     </select>
   )
-  return iconOnly ? <span className="native-icon-select shell__icon-control" title={selected?.label ?? 'Models unavailable'}><ControlIcon kind="model" />{select}</span> : select
+  if (variant === 'default') return select
+  return <span className={variant === 'pill' ? 'composer__model-pill native-icon-select' : 'native-icon-select shell__icon-control'} title={selectedLabel}>
+    <ControlIcon kind="model" />
+    {variant === 'pill' ? <>
+      <span className="composer__model-pill-label" aria-hidden="true">{selectedLabel}</span>
+      <svg className="composer__model-pill-chevron" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M4 6l4 4 4-4" /></svg>
+    </> : null}
+    {select}
+  </span>
 }

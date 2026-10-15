@@ -1,0 +1,7 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application android:allowBackup="false" android:testOnly="true" />
+    <instrumentation
+        android:name="dev.gitblame.voxgolem.android.wear.speechtest.SyntheticAskInstrumentation"
+        android:targetPackage="dev.gitblame.voxgolem.android"
+        android:functionalTest="true" />
+</manifest>

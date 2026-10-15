@@ -22,7 +22,7 @@ export interface AndroidVoiceAdapterInputs {
   readonly onStatus?: (status: AndroidVoiceStatus | null, statusError: string | null) => void
   readonly shortcutReady?: boolean
   /** Flush and bind the current conversation/draft before microphone permission admission. */
-  readonly onBeforeStart?: () => Promise<string>
+  readonly onBeforeStart?: (completionPolicy: 'manual' | 'single_turn' | 'repeat_after_reply') => Promise<string>
   readonly onShortcutBeforeStart?: () => Promise<string>
   readonly onShortcutStarted?: () => void
   readonly onShortcutPrepare?: (oldDraft: string, isCurrent: () => boolean) => Promise<void>
@@ -162,7 +162,7 @@ export function useAndroidVoiceAdapter({ enabled = true, statusEnabled = enabled
     const legacyShortcut = launchToken !== undefined && onBeforeStart === undefined && onShortcutBeforeStart !== undefined
     if (onBeforeStart !== undefined) {
       try {
-        ownedDraft = await onBeforeStart()
+        ownedDraft = await onBeforeStart(completionPolicy)
         if (!ownsStart() || document.visibilityState !== 'visible') { releaseLaunch(); if (lifecycleEpoch === lifecycleEpochRef.current) startingRef.current = false; if (ownsStart()) setPending(false); return }
         if (launchToken !== undefined) shortcutRef.current = { token: launchToken, oldDraft: ownedDraft, prepared: true, prepare: Promise.resolve() }
       } catch (failure) {

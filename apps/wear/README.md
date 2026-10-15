@@ -116,25 +116,101 @@ Custom chat should be described as cloud-free.
 
 ### Native speech, without a bundled model
 
-Ask, Talk and manual draft dictation prefer an installed matching language using native
-recognition services. Controlled provider fallback is permitted by default; a normal
-vendor service can use network processing, and an installed-language report or offline
-preference is not proof of the current route. Turning off **Speech network fallback**
-requires the dedicated on-device API; devices without that capability retain keyboard
-input rather than silently using an offline hint. No voice model is downloaded by the
-app. The keyboard's own microphone belongs to the installed IME and is not guaranteed
-offline.
+Ask, Talk and manual draft dictation pin Google's installed recognition service
+(`com.google.android.tts`) and validate installed on-device language support. The app
+requests offline processing and disables provider/network fallback in this strict route,
+regardless of an older saved fallback preference. The provider owns its implementation;
+an offline hint is not independent proof of network isolation or proprietary model identity.
+No voice model is downloaded by the app. The keyboard's own microphone belongs to the
+installed IME and is not covered by this app-owned recognition policy.
 
 **Speak replies** retains the Wear installation's choice and defaults on for new
-settings. Installed non-network voices are preferred; network voices are eligible
-only when the captured fallback policy permits them. Settings offers only reported
+settings. Synthesis is pinned to Google and accepts only installed voices reported as
+not requiring a network connection; network voices are excluded from the inventory and
+rejected at playback. Settings offers only reported
 language, engine and voice choices, with Automatic recovery when a saved choice is
 unavailable. Configured choices, selected/reported identities and unknown model or
 processing information are shown separately. Talk uses the shared foreground-only
-dictation → one committed generation → optional TTS → next-utterance loop; Ask stops
+dictation → one generation with optional streaming local TTS → durable settlement and
+playback completion → next-utterance loop; Ask stops
 after the reply. Manual dictation remains draft-only. Stop
 invalidates its epoch, retires recognition/generation/playback and cancels next-turn
 timers. It does not resume automatically after foreground loss or an SDK error.
+
+### Scoped assistant timing diagnostics
+
+Debug builds and builds with `dev.gitblame.voxgolem.assistant.TIMING_ENABLED=true`
+(including `performance`) emit fixed timing stages through `VoxGolemAssistantTiming`.
+The compatible logcat format contains no speech or conversation content. A bounded
+background journal additionally records process/session and run/parent correlation,
+validated public speech/model route metadata and bounded numeric counters as JSONL.
+
+The journal is under the app-scoped external files directory at
+`diagnostics/assistant-timing/`, with a private no-backup fallback if external storage
+is unavailable. Default bounds are256 queued records,256KiB per file,8MiB aggregate,
+128 files and a90-day maximum eligible age; storage/file limits can evict earlier.
+Cleanup runs off critical paths on startup/next journal drain, not through periodic
+device wakeups while the app is stopped. Immutable creation timestamps govern age;
+uncertain future-dated files are evicted on clock rollback. Overflow/write loss is
+reported in subsequent records. No log file, benchmark output or synthetic WAV belongs
+in Git.
+
+On an explicitly authorized, identity-verified device host/transport, use its configured
+ADB executable (`$ADB`) and selected Watch transport (`$WATCH`), for example:
+
+```sh
+"$ADB" -s "$WATCH" logcat -d -v raw -s VoxGolemAssistantTiming:I '*:S'
+"$ADB" -s "$WATCH" pull \
+  /sdcard/Android/data/dev.gitblame.voxgolem.android/files/diagnostics/assistant-timing \
+  "$OUT/assistant-timing"
+```
+
+Keep exports outside the checkout and verify that the current device actually uses
+that external path. Logs deliberately exclude raw audio, transcripts, prompts, replies,
+credentials, headers, device/account/conversation identifiers and endpoints. SDK playback
+callbacks and UI layout/draw-submission marks do not prove audible onset or painted pixels.
+The outer task record owns actual optimized-runtime verification and synthetic-flow results;
+broader logging/export/telemetry policy remains separate deferred planning work.
+
+### Small optimized synthetic voice benchmark
+
+`voice-benchmark` builds a test-only, SDK/Java instrumentation APK with no Kotlin or
+AndroidX runtime dependencies. Its control plane reflects only SDK-typed methods on
+the guarded target facade. This avoids borrowing debug-app dependencies that R8 may
+rename/remove in the independently optimized target; do not install a debug AndroidTest
+APK beside `performance` and repair its class-loading failures with production keep rules.
+
+```sh
+apps/wear/gradlew -p apps/wear --offline --no-daemon \
+  :app:assemblePerformance :voice-benchmark:assemblePerformance
+```
+
+On the explicitly authorized Watch7, verify model/API/ABI, both signing certificates,
+copied/installed hashes and idle capture before compatible in-place installation. The
+helper's `android:testOnly` requires `adb install -r -t`; the target must remain the
+non-debuggable optimized app. No user data clear or model download is part of this test.
+
+```sh
+RUNNER=dev.gitblame.voxgolem.android.test/dev.gitblame.voxgolem.android.wear.speechtest.SyntheticAskInstrumentation
+"$ADB" -s "$WATCH" shell am instrument -w -r -e mode startup "$RUNNER"
+# Proceed only after benchmark_result=ready and INSTRUMENTATION_CODE=-1.
+timeout 120 "$ADB" -s "$WATCH" shell am instrument -w -r \
+  -e mode whole -e liveProvider true -e syntheticAudio true "$RUNNER"
+```
+
+Whole mode runs three serial Ask paths with real Google STT, Luna None, production
+layout/draw observations and real local Google TTS. Finite fixture tokens must match
+exactly before model admission. State/preferences/storage are synthetic-only, web is
+disabled for the isolated baseline, and replication is suppressed. The input bypasses
+microphone acoustics and native AudioRecord acquisition; session setup is instrumented
+and warm/mixed rather than a cold-process launch. Fixture generation occurs before
+measurement and warms Google speech. Three samples establish only a small happy-path
+baseline—not general STT accuracy, tail percentiles, acoustic output or painted pixels.
+
+Success requires `benchmark_result=complete`, `completed_trials=3` and instrumentation
+code-1. On any failure/timeout, return HOME and force-stop only the identity-verified
+target if retirement is uncertain; reconnect and reconcile before any new attempt.
+No automatic rerun loop or broader stress/provider sweep is implied.
 
 **Vox Ask** opens the existing Assistant and requests a single finalized voice turn
 in its current conversation/draft after foreground, permission and ownership checks.

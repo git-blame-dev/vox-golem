@@ -17,9 +17,11 @@ import android.speech.SpeechRecognizer
 import dev.gitblame.voxgolem.assistant.AssistantTiming
 import dev.gitblame.voxgolem.assistant.AssistantTiming.Operation
 import dev.gitblame.voxgolem.assistant.AssistantTiming.Stage
-import java.util.concurrent.Executor
+import dev.gitblame.voxgolem.assistant.AssistantDiagnosticJournal.Metadata
 import dev.gitblame.voxgolem.assistant.inputtransport.AndroidLocalSuppliedAudioFactory
 import dev.gitblame.voxgolem.assistant.inputtransport.SuppliedAudioProviderGate
+import dev.gitblame.voxgolem.assistant.speech.SpeechServiceRequirement
+import java.util.concurrent.Executor
 
 class AndroidLocalRecognizerFactory(
     private val context: Context,
@@ -28,6 +30,9 @@ class AndroidLocalRecognizerFactory(
     private val recordedAudio: RecordedAudioFactory? = null,
     private val suppliedAudioGate: SuppliedAudioProviderGate = SuppliedAudioProviderGate.UNPROVEN,
     private val enableRecording: () -> Boolean = { false },
+    private val supportCache: GoogleSttSupportCache = GoogleSttSupportCache(context),
+    private val preRollFactory: PreRollAudioSourceFactory = AndroidPreRollAudioSource.defaultFactory(context),
+    private val strictGoogleOnly: Boolean = !AndroidPreRollAudioSource.isRobolectricRuntime(),
 ) : LocalRecognizerFactory {
     override fun recordingEnabled() = enableRecording()
     override fun recordingAvailable(language: String, networkFallback: Boolean): Boolean =
@@ -52,18 +57,24 @@ class AndroidLocalRecognizerFactory(
     private fun suppliedCandidates(networkFallback: Boolean): List<AndroidLocalSuppliedAudioFactory> {
         requireMain()
         if (Build.VERSION.SDK_INT < 33) return emptyList()
-        return selectCandidates(networkFallback).ordered.distinctBy { it.provider to it.dedicated }
+        val effectiveFallback = networkFallback && !isStrictGoogleMode()
+        return selectCandidates(effectiveFallback).ordered.distinctBy { it.provider to it.dedicated }
             .filter { it.dedicated || it.component != null }.map {
-                AndroidLocalSuppliedAudioFactory(context, it.component, it.dedicated, networkFallback, suppliedAudioGate)
+                AndroidLocalSuppliedAudioFactory(context, it.component, it.dedicated, effectiveFallback, suppliedAudioGate)
             }
     }
+    private fun isStrictGoogleMode(): Boolean =
+        strictGoogleOnly || googleService()?.className == SpeechServiceRequirement.GOOGLE_RECOGNITION_SERVICE_CLASS
+
     override fun available(): Boolean {
         requireMain()
+        if (isStrictGoogleMode()) return googleService() != null
         if (!fallbackPolicy()) return localOnlyAvailable()
         return googleService() != null || localOnlyAvailable() || SpeechRecognizer.isRecognitionAvailable(context)
     }
     override fun localOnlyAvailable(): Boolean {
         requireMain()
+        if (isStrictGoogleMode()) return googleService() != null
         return Build.VERSION.SDK_INT >= 31 && SpeechRecognizer.isOnDeviceRecognitionAvailable(context)
     }
 
@@ -73,6 +84,7 @@ class AndroidLocalRecognizerFactory(
     override fun create(timing: AssistantTiming): LocalRecognizerSession = createForPolicy(fallbackPolicy(), timing)
     override fun availableForPolicy(networkFallback: Boolean): Boolean {
         requireMain()
+        if (isStrictGoogleMode()) return googleService() != null
         return if (networkFallback) googleService() != null || localOnlyAvailable() || SpeechRecognizer.isRecognitionAvailable(context)
             else localOnlyAvailable()
     }
@@ -81,9 +93,18 @@ class AndroidLocalRecognizerFactory(
     override fun createForPolicy(networkFallback: Boolean, timing: AssistantTiming): LocalRecognizerSession {
         requireMain()
         timing.mark(Stage.CREATE_REQUESTED)
-        val selected = selectCandidates(networkFallback)
+        val effectiveFallback = networkFallback && !isStrictGoogleMode()
+        val selected = selectCandidates(effectiveFallback)
         if (selected.ordered.isEmpty()) throw UnsupportedOperationException("on-device-speech-api-unavailable")
-        return Session(selected.ordered.distinctBy { it.provider }, selected.fallback, networkFallback, timing)
+        return Session(
+            selected.ordered.distinctBy { it.provider },
+            selected.fallback,
+            effectiveFallback,
+            timing,
+            supportCache,
+            preRollFactory,
+            isStrictGoogleMode(),
+        )
     }
 
     /** Construction only. Caller owns PFD acceptance/support, listener, lease and actual retirement. */
@@ -95,12 +116,20 @@ class AndroidLocalRecognizerFactory(
 
     private fun selectCandidates(networkFallback: Boolean): CandidateSelection {
         requireMain()
+        if (isStrictGoogleMode()) {
+            val google = googleService()?.let { component ->
+                Candidate(component.flattenToShortString(), false, component) {
+                    SpeechRecognizer.createSpeechRecognizer(context, component)
+                }
+            }
+            return CandidateSelection(listOfNotNull(google), null)
+        }
         val allowFallback = networkFallback
         val google = if (allowFallback) googleService()?.let { component ->
             Candidate(component.flattenToShortString(), false, component) { SpeechRecognizer.createSpeechRecognizer(context, component) }
         } else null
         val dedicated = if (Build.VERSION.SDK_INT >= 31 && SpeechRecognizer.isOnDeviceRecognitionAvailable(context)) {
-            val component = onDeviceComponent()
+            val component = onDeviceComponent()?.takeIf { it.packageName != SAMSUNG_SPEECH_PACKAGE }
             Candidate(component?.flattenToShortString() ?: "android.on-device", true, component) {
                 SpeechRecognizer.createOnDeviceSpeechRecognizer(context)
             }
@@ -108,18 +137,35 @@ class AndroidLocalRecognizerFactory(
         val configured = if (allowFallback && SpeechRecognizer.isRecognitionAvailable(context)) {
             val component = Settings.Secure.getString(context.contentResolver, "voice_recognition_service")
                 ?.let(ComponentName::unflattenFromString)
-            Candidate(component?.flattenToShortString() ?: "android.system-default", false, component) {
-                SpeechRecognizer.createSpeechRecognizer(context, component)
+            if (component?.packageName == SAMSUNG_SPEECH_PACKAGE) {
+                null
+            } else {
+                Candidate(component?.flattenToShortString() ?: "android.system-default", false, component) {
+                    SpeechRecognizer.createSpeechRecognizer(context, component)
+                }
             }
         } else null
         return CandidateSelection(listOfNotNull(google, dedicated,
             configured?.takeUnless { google != null && it.provider == "android.system-default" }), google ?: configured)
     }
 
-    private fun googleService(): ComponentName? = context.packageManager
-        .queryIntentServices(Intent(RecognitionService.SERVICE_INTERFACE), 0)
-        .firstOrNull { it.serviceInfo?.packageName == "com.google.android.tts" }
-        ?.serviceInfo?.let { ComponentName(it.packageName, it.name) }
+    private fun googleService(): ComponentName? {
+        val pm = context.packageManager
+        val explicit = runCatching {
+            pm.queryIntentServices(
+                Intent(RecognitionService.SERVICE_INTERFACE).setPackage(SpeechServiceRequirement.GOOGLE_SPEECH_PACKAGE),
+                0,
+            )
+        }.getOrNull().orEmpty()
+        val all = if (explicit.isNotEmpty()) explicit else runCatching {
+            pm.queryIntentServices(Intent(RecognitionService.SERVICE_INTERFACE), 0)
+        }.getOrNull().orEmpty()
+        val googleInfos = all.mapNotNull { it.serviceInfo }
+            .filter { it.packageName == SpeechServiceRequirement.GOOGLE_SPEECH_PACKAGE }
+        val matched = googleInfos.firstOrNull { it.name == SpeechServiceRequirement.GOOGLE_RECOGNITION_SERVICE_CLASS }
+            ?: googleInfos.firstOrNull().takeUnless { strictGoogleOnly }
+        return matched?.let { ComponentName(it.packageName, it.name) }
+    }
 
     private fun onDeviceComponent(): ComponentName? {
         val resource = context.resources.getIdentifier("config_defaultOnDeviceSpeechRecognitionService", "string", "android")
@@ -137,6 +183,9 @@ class AndroidLocalRecognizerFactory(
         private val providerCandidate: Candidate?,
         private val allowProviderFallback: Boolean,
         private val timing: AssistantTiming,
+        private val supportCache: GoogleSttSupportCache,
+        private val preRollFactory: PreRollAudioSourceFactory,
+        private val strictOfflineOnly: Boolean,
     ) : LocalRecognizerSession {
         private var candidate = localCandidates.first()
         private var supportTiming: AssistantTiming? = timing.child(Operation.SUPPORT_CHECK).also { it.mark(Stage.CREATE_REQUESTED) }
@@ -152,6 +201,7 @@ class AndroidLocalRecognizerFactory(
         private var listeningStarted = false
         private var admissionFallbackReason: String? = null
         private var explicitLanguage = false
+        private var preRoll: PreRollAudioSource? = null
         override var route: RecognitionRoute? = null
             private set
 
@@ -163,6 +213,12 @@ class AndroidLocalRecognizerFactory(
             check(!destroyed && !listeningStarted)
             admitted = false
             explicitLanguage = explicit
+            // Preserve the first words while cold service binding and support validation complete.
+            if (preRoll == null) {
+                timing.mark(Stage.CAPTURE_OPEN_REQUESTED)
+                preRoll = runCatching { preRollFactory.open() }.getOrNull()
+                timing.mark(if (preRoll?.isRecording == true) Stage.CAPTURE_RECORDING else Stage.DIRECT_MIC_FALLBACK)
+            }
             checkCandidate(language, result, if (languageCheck == 0L) supportTiming else null)
         }
 
@@ -172,7 +228,7 @@ class AndroidLocalRecognizerFactory(
             this.supportTiming = supportTiming
             val checkingSdk = sdk
             route = RecognitionRoute(candidate.provider, language, fallbackReason = admissionFallbackReason,
-                onDeviceOnly = candidate.dedicated)
+                onDeviceOnly = candidate.dedicated || (strictOfflineOnly && !allowProviderFallback))
             val ticket = languageCheck
             var settled = false
             var cannotCheck = false
@@ -182,8 +238,24 @@ class AndroidLocalRecognizerFactory(
                 settled = true
                 clearLanguageDeadline()
                 admitted = supported
+                if (!supported) closePreRoll()
                 supportTiming.finish(if (supported) Stage.SUPPORTED else Stage.UNSUPPORTED)
                 result(supported)
+            }
+            val cached = supportCache.get(candidate.provider, language, allowProviderFallback)
+            supportTiming.mark(if (cached != null) Stage.SUPPORT_CACHE_HIT else Stage.SUPPORT_CACHE_MISS)
+            supportTiming.metadata(Metadata(engine = candidate.component?.packageName,
+                requestedLanguage = language, onDevice = route?.onDeviceOnly, cacheHit = cached != null))
+            if (cached != null) {
+                route = route?.copy(
+                    selectedLanguage = cached.selectedLanguage,
+                    installedLanguages = cached.installedLanguages,
+                    supportedLanguages = cached.supportedLanguages,
+                )
+                supportTiming.mark(Stage.SUPPORT_REQUESTED)
+                supportTiming.mark(Stage.SUPPORT_CALLBACK)
+                finish(true)
+                return
             }
             fun providerControlled(reason: String) {
                 if (ticket != languageCheck || settled) return
@@ -248,8 +320,10 @@ class AndroidLocalRecognizerFactory(
                     SpeechRecognizer.ERROR_CANNOT_CHECK_SUPPORT -> {
                         cannotCheck = true; unavailableReason = "support_metadata_unavailable"
                     }
-                    SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED, SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE ->
+                    SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED, SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE -> {
+                        supportCache.invalidate(candidate.provider, language)
                         unavailable("installed_language_unavailable")
+                    }
                     else -> { supportTiming.finish(Stage.FAILED); route = route?.copy(fallbackReason = "support_error_$error"); finish(false) }
                 }
             }
@@ -257,12 +331,17 @@ class AndroidLocalRecognizerFactory(
                 override fun onSupportResult(support: RecognitionSupport) {
                     if (ticket != languageCheck || settled) return
                     supportTiming.mark(Stage.SUPPORT_CALLBACK)
-                    route = route?.copy(installedLanguages = support.installedOnDeviceLanguages.filter { it.length <= 64 }.take(128),
-                        supportedLanguages = (support.installedOnDeviceLanguages + if (allowProviderFallback) support.onlineLanguages else emptyList())
-                            .filter { it.length <= 64 }.distinct().take(128))
+                    val installedList = support.installedOnDeviceLanguages.filter { it.length <= 64 }.take(128)
+                    val supportedList = (support.installedOnDeviceLanguages + if (allowProviderFallback) support.onlineLanguages else emptyList())
+                        .filter { it.length <= 64 }.distinct().take(128)
+                    route = route?.copy(
+                        installedLanguages = installedList,
+                        supportedLanguages = supportedList,
+                    )
                     val selected = SpeechLocales.installedMatch(language, support.installedOnDeviceLanguages)
                     if (selected != null) {
                         route = route?.copy(selectedLanguage = selected)
+                        supportCache.put(candidate.provider, language, CachedSttSupport(selected, installedList, supportedList), allowProviderFallback)
                         finish(true)
                     } else {
                         unavailableReason = "installed_language_unavailable"
@@ -322,24 +401,45 @@ class AndroidLocalRecognizerFactory(
             val ticket = ++recognitionEpoch
             var terminal = false
             var providerFinal = ""
+            var readyDelivered = false
             fun active() = ticket == recognitionEpoch && !destroyed && !terminal
             fun reported(bundle: Bundle?) {
                 val value = bundle?.getString("current_locale")?.let(SpeechLocales::parse)?.toLanguageTag()
                 if (value != null) route = route?.copy(reportedLanguage = value)
             }
             sdk.setRecognitionListener(object : RecognitionListener {
-                override fun onReadyForSpeech(params: Bundle?) { if (active()) { timing.mark(Stage.READY_CALLBACK); events.ready() } }
+                override fun onReadyForSpeech(params: Bundle?) {
+                    if (active()) timing.mark(Stage.PROVIDER_READY_CALLBACK)
+                    if (active() && !readyDelivered) {
+                        readyDelivered = true
+                        timing.mark(Stage.READY_CALLBACK)
+                        events.ready()
+                    }
+                }
                 override fun onBeginningOfSpeech() {}
                 override fun onRmsChanged(rmsdB: Float) {}
                 override fun onBufferReceived(buffer: ByteArray?) {}
-                override fun onEndOfSpeech() { if (active()) timing.mark(Stage.END_OF_SPEECH) }
+                override fun onEndOfSpeech() {
+                    if (active()) {
+                        timing.mark(Stage.END_OF_SPEECH)
+                        preRoll?.stopCapture()
+                    }
+                }
                 override fun onError(error: Int) {
                     if (!active()) return
+                    timing.metadata(Metadata(sdkError = error))
+                    if (error == SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED ||
+                        error == SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE
+                    ) {
+                        supportCache.invalidate(candidate.provider, language)
+                    }
+                    closePreRoll()
                     timing.mark(Stage.ON_ERROR)
                     terminal = true; events.error("recognition_error_$error")
                 }
                 override fun onResults(results: Bundle?) {
                     if (!active()) return
+                    closePreRoll()
                     timing.mark(Stage.FINAL_CALLBACK)
                     reported(results); terminal = true
                     events.final(text(results).ifBlank { providerFinal })
@@ -354,12 +454,59 @@ class AndroidLocalRecognizerFactory(
                 }
                 override fun onEvent(eventType: Int, params: Bundle?) {}
             })
+            val preferOffline = strictOfflineOnly || (route?.localPreferred ?: true)
+            val selectedLanguage = route?.selectedLanguage ?: language
+            timing.metadata(Metadata(engine = candidate.component?.packageName, requestedLanguage = language,
+                language = selectedLanguage, onDevice = route?.onDeviceOnly))
+            val listeningIntent = intent(selectedLanguage, preferOffline)
+            val activePreRoll = preRoll ?: runCatching { preRollFactory.open() }.getOrNull().also { preRoll = it }
+            val immediateReady = if (activePreRoll != null && activePreRoll.isRecording) {
+                activePreRoll.configureIntent(listeningIntent)
+                activePreRoll.startStreaming()
+                true
+            } else {
+                closePreRoll()
+                false
+            }
             timing.mark(Stage.LISTENING_REQUESTED)
-            sdk.startListening(intent(route?.selectedLanguage ?: language, route?.localPreferred ?: true))
+            try {
+                sdk.startListening(listeningIntent)
+            } catch (error: RuntimeException) {
+                closePreRoll()
+                throw error
+            }
+            if (immediateReady && active() && !readyDelivered) {
+                readyDelivered = true
+                timing.mark(Stage.READY_CALLBACK)
+                events.ready()
+            }
         }
-        override fun stop() { requireMain(); timing.mark(Stage.FINISH_REQUESTED); sdk.stopListening() }
-        override fun cancel() { requireMain(); recognitionEpoch++; invalidateLanguageCheck(); sdk.cancel() }
-        override fun destroy() { requireMain(); recognitionEpoch++; invalidateLanguageCheck(); sdk.destroy(); destroyed = true }
+        override fun stop() {
+            requireMain()
+            timing.mark(Stage.FINISH_REQUESTED)
+            preRoll?.stopCapture()
+            sdk.stopListening()
+        }
+        override fun cancel() {
+            requireMain()
+            recognitionEpoch++
+            invalidateLanguageCheck()
+            closePreRoll()
+            sdk.cancel()
+        }
+        override fun destroy() {
+            requireMain()
+            recognitionEpoch++
+            invalidateLanguageCheck()
+            closePreRoll()
+            sdk.destroy()
+            destroyed = true
+        }
+        private fun closePreRoll() {
+            val active = preRoll ?: return
+            active.close()
+            preRoll = null
+        }
         private fun invalidateLanguageCheck(keepTiming: AssistantTiming? = null) {
             languageCheck++
             if (supportTiming !== keepTiming) supportTiming?.finish(Stage.CANCELLED)
@@ -372,6 +519,7 @@ class AndroidLocalRecognizerFactory(
         }
     }
     companion object {
+        private const val SAMSUNG_SPEECH_PACKAGE = "com.samsung.SMT"
         private fun requireMain() { check(Looper.myLooper() == Looper.getMainLooper()) }
         private fun text(bundle: Bundle?) = bundle?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull().orEmpty()
         internal fun intent(language: String, preferOffline: Boolean = true) = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
