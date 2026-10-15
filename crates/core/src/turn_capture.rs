@@ -62,6 +62,10 @@ impl TurnCaptureState {
         self.utterance.as_slice()
     }
 
+    pub fn max_utterance_samples(&self) -> usize {
+        self.utterance.max_samples()
+    }
+
     pub fn record_sleeping_frame(&mut self, frame: &[f32]) {
         self.preroll.append_frame(frame);
     }
@@ -75,6 +79,7 @@ impl TurnCaptureState {
 
     pub fn begin_utterance_without_preroll(&mut self) {
         self.utterance.clear();
+        self.utterance.reserve_capacity();
         self.capturing_utterance = true;
     }
 

@@ -8,6 +8,8 @@ import com.google.android.gms.wearable.CapabilityInfo
 import com.google.android.gms.wearable.ChannelClient
 import com.google.android.gms.wearable.Wearable
 import dev.gitblame.voxgolem.capture.CaptureProtocol
+import dev.gitblame.voxgolem.capture.CaptureChannelLifetime
+import dev.gitblame.voxgolem.capture.CaptureChannelRetirementOwner
 import java.io.OutputStream
 import java.util.concurrent.Executor
 import java.util.concurrent.TimeUnit
@@ -21,6 +23,7 @@ internal interface CaptureWearSdk {
 }
 
 internal class GoogleCaptureWearSdk(context: Context) : CaptureWearSdk {
+    init { CaptureWearListenerService.observeCaptureClosures(context.applicationContext) }
     private val capability = Wearable.getCapabilityClient(context)
     private val channels = Wearable.getChannelClient(context)
     private val messages = Wearable.getMessageClient(context)
@@ -32,19 +35,36 @@ internal class GoogleCaptureWearSdk(context: Context) : CaptureWearSdk {
 }
 
 /** Owns the actual SDK acquisitions, including resources delivered after timeout or cancellation. */
-internal class CaptureChannelOwnership(private val sdk: CaptureWearSdk, private val timeoutMs: Long = 10_000) : AutoCloseable {
+internal class CaptureChannelOwnership(
+    private val sdk: CaptureWearSdk,
+    private val timeoutMs: Long = 10_000,
+    private val retirements: CaptureChannelRetirementOwner = processRetirements,
+) : AutoCloseable {
     private val lock = Any()
     private var retired = false
-    private var channel: ChannelClient.Channel? = null
-    private var stream: OutputStream? = null
-    val isRetired: Boolean get() = synchronized(lock) { retired }
+    private var lifetime: CaptureChannelLifetime? = null
+    val isRetired: Boolean get() = synchronized(lock) { retired || lifetime?.isRetired == true }
 
     fun open(nodeId: String, path: String): ChannelClient.Channel {
-        check(!isRetired)
-        val task = sdk.open(nodeId, path)
-        task.addOnSuccessListener(DIRECT) { acquired ->
-            val late = synchronized(lock) { if (retired) true else { channel = acquired; false } }
-            if (late) runCatching { sdk.close(acquired) }
+        retirements.retryFailedRetirements()
+        val owner = synchronized(lock) {
+            check(!retired && lifetime == null)
+            lateinit var reserved: CaptureChannelLifetime
+            reserved = retirements.reserve(15 * 60_000L) { channels.entries.removeAll { it.value === reserved } }
+                ?: error("capture-retirement-capacity-unavailable")
+            lifetime = reserved
+            reserved
+        }
+        val task = try { sdk.open(nodeId, path) } catch (failure: Exception) {
+            owner.nativeAcquisitionFailed(); close(); throw failure
+        }
+        task.addOnCompleteListener(DIRECT) { completed ->
+            if (!completed.isSuccessful) owner.nativeAcquisitionFailed()
+            else {
+                val acquired = completed.result
+                channels[acquired] = owner
+                owner.acquiredNative { confirmed -> sdk.close(acquired).addOnCompleteListener(DIRECT) { confirmed(it.isSuccessful) } }
+            }
         }
         return try {
             Tasks.await(task, timeoutMs, TimeUnit.MILLISECONDS).also { check(!isRetired) }
@@ -52,11 +72,12 @@ internal class CaptureChannelOwnership(private val sdk: CaptureWearSdk, private 
     }
     fun output(channel: ChannelClient.Channel): OutputStream {
         check(!isRetired)
-        val task = sdk.output(channel)
-        task.addOnSuccessListener(DIRECT) { acquired ->
-            val late = synchronized(lock) { if (retired) true else { stream = acquired; false } }
-            if (late) retireStream(acquired)
+        val owner = synchronized(lock) { lifetime } ?: error("capture-channel-not-open")
+        owner.beginStreamAcquisition()
+        val task = try { sdk.output(channel) } catch (failure: Exception) {
+            owner.streamAcquisitionCompleted(null); close(); throw failure
         }
+        task.addOnCompleteListener(DIRECT) { owner.streamAcquisitionCompleted(if (it.isSuccessful) it.result else null) }
         return try {
             Tasks.await(task, timeoutMs, TimeUnit.MILLISECONDS).also { check(!isRetired) }
         } catch (error: Exception) { close(); throw error }
@@ -65,19 +86,14 @@ internal class CaptureChannelOwnership(private val sdk: CaptureWearSdk, private 
         val owned = synchronized(lock) {
             if (retired) return
             retired = true
-            (channel to stream).also { channel = null; stream = null }
+            lifetime
         }
-        // Request native retirement before Java close so Data Layer can interrupt a blocked write.
-        owned.first?.let { runCatching { sdk.close(it) } }
-        owned.second?.let(::retireStream)
+        owned?.close()
     }
     companion object {
         private val DIRECT = Executor { it.run() }
-        private val cleanup = java.util.concurrent.Executors.newFixedThreadPool(2) { runnable ->
-            Thread(runnable, "capture-stream-retirement").apply { isDaemon = true }
-        }
-        private fun retireStream(stream: OutputStream) {
-            runCatching { cleanup.execute { runCatching { stream.close() } } }
-        }
+        private val processRetirements = CaptureChannelRetirementOwner(32)
+        private val channels = java.util.concurrent.ConcurrentHashMap<ChannelClient.Channel, CaptureChannelLifetime>()
+        fun confirmNativeRetired(channel: ChannelClient.Channel) { channels[channel]?.confirmNativeRetired() }
     }
 }

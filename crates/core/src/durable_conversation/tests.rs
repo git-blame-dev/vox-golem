@@ -81,6 +81,105 @@ fn empty() -> Store {
     Store::restore(StoreSnapshot::empty()).unwrap()
 }
 
+#[test]
+fn borrowed_history_and_bounded_context_preserve_whole_turns() {
+    let store = import(
+        &empty(),
+        vec![
+            create(),
+            turn(A, 2, None, vec![]),
+            turn(A, 3, Some(id(A, 2)), vec![]),
+        ],
+    );
+    let borrowed: Vec<_> = store
+        .history_borrowed(&id(A, 1), &id(A, 3))
+        .unwrap()
+        .collect();
+    assert_eq!(
+        borrowed.iter().map(|r| (*r).clone()).collect::<Vec<_>>(),
+        store.history(&id(A, 1), &id(A, 3)).unwrap()
+    );
+    for record in &borrowed {
+        assert!(std::ptr::eq(
+            *record,
+            store
+                .retained_records()
+                .find(|r| r.operation.id == record.operation.id)
+                .unwrap()
+        ));
+    }
+    let size = borrowed[1].operation.text_bytes();
+    for (max_turns, max_text_bytes, expected) in [
+        (0, size * 2, 0),
+        (2, size * 2, 2),
+        (2, size, 1),
+        (2, size - 1, 0),
+        (1, size * 2, 1),
+    ] {
+        let selection = store
+            .select_context(ContextRequest {
+                expected_revision: store.revision().into(),
+                conversation: id(A, 1),
+                selected_head: Some(id(A, 3)),
+                max_turns,
+                max_text_bytes,
+            })
+            .unwrap();
+        assert_eq!(
+            selection.turns,
+            borrowed[borrowed.len() - expected..]
+                .iter()
+                .map(|r| (*r).clone())
+                .collect::<Vec<_>>()
+        );
+    }
+    assert!(matches!(
+        store.select_context(ContextRequest {
+            expected_revision: store.revision().into(),
+            conversation: id(A, 1),
+            selected_head: Some(id(A, 999)),
+            max_turns: 0,
+            max_text_bytes: 0,
+        }),
+        Err(DomainError::Missing { .. })
+    ));
+    let pending = import(&empty(), vec![create(), turn(A, 3, Some(id(A, 2)), vec![])]);
+    assert!(matches!(
+        pending.history_borrowed(&id(A, 1), &id(A, 3)),
+        Err(DomainError::Missing { .. })
+    ));
+    let deleted = import(&store, vec![delete()]);
+    assert!(matches!(
+        deleted.history_borrowed(&id(A, 1), &id(A, 3)),
+        Err(DomainError::Deleted { .. })
+    ));
+}
+
+#[test]
+fn borrowed_context_counts_multibyte_refusal_without_splitting_turns() {
+    let mut root = turn(A, 2, None, vec![]);
+    if let OperationBody::TurnCompleted { prompt, answer, .. } = &mut root.operation.body {
+        *prompt = "界".into();
+        *answer = Answer::Refusal {
+            reason: "é".into()
+        };
+    }
+    let store = import(&empty(), vec![create(), root.clone()]);
+    for (max_text_bytes, expected) in [(4, vec![]), (5, vec![root.clone()])] {
+        let selection = store
+            .select_context(ContextRequest {
+                expected_revision: store.revision().into(),
+                conversation: id(A, 1),
+                selected_head: Some(id(A, 2)),
+                max_turns: 1,
+                max_text_bytes,
+            })
+            .unwrap();
+        assert_eq!(selection.turns, expected);
+        assert_eq!(selection.parent, Some(id(A, 2)));
+    }
+}
+
 fn titled_create(title: &str) -> Record {
     let mut record = create();
     record.operation.body = OperationBody::ConversationCreated {

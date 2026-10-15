@@ -35,6 +35,7 @@ class EnginePhonePreferencesTest {
         private val store = AssistantStore(context, gateway)
         var rejectModelWrite = false
         val prewarmed = mutableListOf<String>()
+        var prewarmFails = false
         private val models = object : AssistantModelStorage {
             private var value = "custom-sol-high"
             override fun read() = value
@@ -70,6 +71,7 @@ class EnginePhonePreferencesTest {
                 assertEquals(engine.snapshot().webEnabled, persistedPolicy().webEnabled)
                 assertFalse(engine.snapshot().busy)
                 prewarmed += model
+                if (prewarmFails) error("Synthetic prewarm failure")
             }
             backend.speechStatus = JSONObject().put("ttsAvailable", false)
         }
@@ -92,6 +94,16 @@ class EnginePhonePreferencesTest {
     }
 
     @After fun resetAdmission() { AssistantRuntime.configureCaptureResourceAdmission(false) }
+
+    @Test fun failedPrewarmCannotSuppressCommittedPreferenceReply() {
+        Fixture(false).use { f ->
+            f.prewarmFails = true
+            val result = f.update(f.backend.nativePreferences().put("instant", "agy-flash-high")).getOrThrow() as JSONObject
+            assertEquals("agy-flash-high", result.getString("instant"))
+            assertEquals("agy-flash-high", f.persisted().getString("instant"))
+            assertFalse(f.backend.busy())
+        }
+    }
 
     @Test fun acceptedModelChangesPrewarmOnlyAfterPersistenceAndInvalidateForNonAgySelection() {
         AssistantRuntime.configureCaptureResourceAdmission(true)

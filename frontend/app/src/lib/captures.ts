@@ -171,6 +171,7 @@ export async function finalizeCapture(captureId: string): Promise<void> {
   await captureInvoke('finalize_capture', { captureId })
 }
 
-export async function updateCaptureTranscript(captureId: string, text: string): Promise<void> {
-  await captureInvoke('update_transcript', { captureId, text })
+export async function updateCaptureTranscript(captureId: string, text: string, expectedVersion: number): Promise<void> {
+  if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 0) throw new Error('Capture correction version is invalid')
+  await captureInvoke('update_transcript', { captureId, text, expectedVersion })
 }

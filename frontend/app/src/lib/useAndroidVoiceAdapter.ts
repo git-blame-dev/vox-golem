@@ -69,7 +69,9 @@ export function useAndroidVoiceAdapter({ enabled = true, statusEnabled = enabled
     if (launchHintsRef.current.shortcutReady !== shortcutReady) launchEpochRef.current += 1
     launchHintsRef.current = { shortcutReady, disabled, active, available: status?.available }
   }, [shortcutReady, disabled, active, status?.available])
-  const stop = useCallback(() => {
+  const retireVoice = useCallback((explicit: boolean) => {
+    const sessionId = sessionRef.current
+    if (sessionId === null && !explicit) return
     statusRevisionRef.current += 1
     launchEpochRef.current += 1
     setConfirmationRequired(false)
@@ -83,15 +85,26 @@ export function useAndroidVoiceAdapter({ enabled = true, statusEnabled = enabled
     onActivity(false)
     setPending(false)
     setStatus((current) => current === null ? null : { ...current, mode: current.mode === 'shortcut' ? 'dictation' : current.mode, dictation: 'idle', loop: 'idle', ttsPhase: 'idle', shortcutPhase: null, readyForSpeech: false })
-    void invokeTauriCommand('stop_assistant_voice').catch(() => undefined)
+    void invokeTauriCommand('stop_assistant_voice', sessionId === null ? undefined : { sessionId }).catch(() => undefined)
   }, [onActivity])
+  // Only a deliberate user action may target observed native voice without an owned ticket.
+  const stop = useCallback(() => retireVoice(true), [retireVoice])
+  const retireOwned = useCallback(() => retireVoice(false), [retireVoice])
   useEffect(() => {
     if (!enabled) return undefined
     mounted.current = true
     lifecycleEpochRef.current += 1
-    stopRef.current = stop
-    return () => { mounted.current = false; startingRef.current = false; scanPendingRef.current = null; setPending(false); lifecycleEpochRef.current += 1; launchEpochRef.current += 1; inputCancelledCallbackRef.current?.(); const shortcut = shortcutRef.current; shortcutRef.current = null; if (shortcut !== null) void invokeTauriCommand('release_new_voice_shortcut', { token: shortcut.token }).catch(() => undefined); onActivity(false); stopRef.current = null; sessionRef.current = null; void invokeTauriCommand('stop_assistant_voice').catch(() => undefined) }
-  }, [enabled, onActivity, stop, stopRef])
+    stopRef.current = retireOwned
+    return () => {
+      retireOwned()
+      mounted.current = false
+      startingRef.current = false
+      scanPendingRef.current = null
+      lifecycleEpochRef.current += 1
+      launchEpochRef.current += 1
+      if (stopRef.current === retireOwned) stopRef.current = null
+    }
+  }, [enabled, onActivity, retireOwned, stopRef])
   useEffect(() => {
     if (!statusEnabled) return undefined
     return statusPoller.start({
@@ -101,9 +114,9 @@ export function useAndroidVoiceAdapter({ enabled = true, statusEnabled = enabled
         if (next.ttsAvailable !== ttsAvailable.current) { ttsAvailable.current = next.ttsAvailable; settledRef.current() }
       },
       fail: () => setStatusError('Native speech status is unavailable'),
-      hidden: stop,
+      hidden: retireOwned,
     })
-  }, [acceptStatus, statusEnabled, statusPoller, stop])
+  }, [acceptStatus, statusEnabled, statusPoller, retireOwned])
   useEffect(() => { onActivity(enabled && active) }, [active, enabled, onActivity])
 
   useEffect(() => {
@@ -192,7 +205,7 @@ export function useAndroidVoiceAdapter({ enabled = true, statusEnabled = enabled
                 await invokeTauriCommand('prepare_new_voice_shortcut', { sessionId })
                 shortcut.prepared = true
               })()
-              void shortcut.prepare.catch((failure: unknown) => { if (sessionRef.current === sessionId) { setError(failure instanceof Error ? failure.message : 'New conversation could not be prepared'); stop() } })
+              void shortcut.prepare.catch((failure: unknown) => { if (sessionRef.current === sessionId) { setError(failure instanceof Error ? failure.message : 'New conversation could not be prepared'); retireOwned() } })
             }
           }
           if (event.kind === 'submit' && !requests.has(event.requestId)) {
@@ -224,9 +237,9 @@ export function useAndroidVoiceAdapter({ enabled = true, statusEnabled = enabled
           if (event.kind === 'shortcut_review') {
             onDraft(event.draft); setError(event.reason)
             const shortcut = shortcutRef.current
-            if (shortcut !== null && event.draft === '' && !shortcut.prepared) stop()
+            if (shortcut !== null && event.draft === '' && !shortcut.prepared) retireOwned()
           }
-        } catch { setError('Native voice returned an invalid event'); stop() }
+        } catch { setError('Native voice returned an invalid event'); retireOwned() }
       })
       const statusRevision = statusRevisionRef.current
       const value = await invokeTauriCommand('start_assistant_voice', { sessionId, loopMode, draft: legacyShortcut ? '' : ownedDraft, updates, completionPolicy: legacyShortcut ? 'stop_send_new' : completionPolicy, ...(launchToken === undefined ? {} : { launchToken }) })
@@ -235,7 +248,7 @@ export function useAndroidVoiceAdapter({ enabled = true, statusEnabled = enabled
     } catch (failure) {
       if (sessionRef.current === sessionId) {
         inputCancelledCallbackRef.current?.()
-        if (nativeAdmitted) void invokeTauriCommand('stop_assistant_voice').catch(() => undefined)
+        if (nativeAdmitted) void invokeTauriCommand('stop_assistant_voice', { sessionId }).catch(() => undefined)
         const shortcut = shortcutRef.current; shortcutRef.current = null
         if (shortcut !== null) { onShortcutCancelled?.(shortcut.oldDraft, shortcut.prepared); void invokeTauriCommand('release_new_voice_shortcut', { token: shortcut.token }).catch(() => undefined) }
         sessionRef.current = null; setError(failure instanceof Error ? failure.message : 'Native voice failed')

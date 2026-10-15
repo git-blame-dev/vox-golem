@@ -20,6 +20,9 @@ mod conversation_runtime_tests;
 mod livekit_wakeword;
 mod partial_transcription;
 mod search_runtime;
+mod state_store;
+mod update_activity;
+use update_activity::{UpdateActivity, UpdateOperationLease};
 mod telemetry;
 mod transcription;
 #[allow(dead_code)]
@@ -58,7 +61,6 @@ const CUE_AUDIO_DATA_URL_PREFIX: &str = "data:audio/wav;base64,";
 const START_LISTENING_CUE_WAV: &[u8] = include_bytes!("../resources/start-listening.wav");
 const STOP_LISTENING_CUE_WAV: &[u8] = include_bytes!("../resources/stop-listening.wav");
 const STARTUP_READY_MARKER: &str = "VOXGOLEM_STARTUP_READY";
-static PERSISTED_STATE_LOCK: Mutex<()> = Mutex::new(());
 static TELEMETRY_ERROR_REPORTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,11 +110,11 @@ struct AppState {
     completion_runtime: Mutex<Option<voxgolem_platform::completion::CompletionRuntime>>,
     completion_request: Arc<Mutex<Option<voxgolem_platform::completion::CompletionRequestHandle>>>,
     completion_context: Arc<Mutex<Option<CompletionRequestContext>>>,
-    completion_update_guard: Mutex<Option<tokio::sync::OwnedRwLockReadGuard<()>>>,
+    completion_update_guard: Arc<Mutex<Option<UpdateOperationLease>>>,
     completion_generation: AtomicU64,
     completion_lifecycle_lock: Arc<Mutex<()>>,
     telemetry_sink: Option<Arc<Mutex<telemetry::TelemetrySink>>>,
-    update_installation_gate: Arc<tokio::sync::RwLock<()>>,
+    update_installation_gate: Arc<UpdateActivity>,
     prefetch_cleanup: Arc<PromptCleanupTracker>,
     tts_operation_lock: tokio::sync::Mutex<()>,
     tts_playback: Arc<Mutex<TtsPlaybackState>>,
@@ -163,6 +165,7 @@ impl std::ops::Deref for AppState {
 }
 
 struct PromptAdmissionResources<'a> {
+    exit_cleanup_started: &'a AtomicBool,
     startup_state: &'a Arc<Mutex<StartupStatePayload>>,
     opencode_server: &'a Mutex<Option<voxgolem_platform::opencode::OpencodeServer>>,
     network_preferences: &'a Mutex<NetworkPreferences>,
@@ -173,6 +176,7 @@ struct PromptAdmissionResources<'a> {
 impl AppState {
     fn prompt_admission_resources(&self) -> PromptAdmissionResources<'_> {
         PromptAdmissionResources {
+            exit_cleanup_started: &self.exit_cleanup_started,
             startup_state: &self.startup_state,
             opencode_server: &self.opencode_server,
             network_preferences: &self.network_preferences,
@@ -203,6 +207,26 @@ impl DesktopConversationRuntime {
             active_prompt_generation: AtomicU64::new(0),
             search: search_runtime::DesktopSearchState::default(),
         }
+    }
+
+    fn instant_stage_succeeded(
+        &self,
+        execution: voxgolem_core::conversation::ExecutionId,
+    ) -> Result<bool, PromptControlError> {
+        let session = self
+            .conversation_session
+            .lock()
+            .map_err(|_| String::from("conversation session lock is poisoned"))?;
+        if session.active_execution() != Some(execution) {
+            return Err(PromptControlError::Cancelled);
+        }
+        Ok(matches!(
+            session.provisional_instant(),
+            Some(
+                voxgolem_core::assistant::InstantOutcome::Complete(_)
+                    | voxgolem_core::assistant::InstantOutcome::NeedsDeep(_)
+            )
+        ))
     }
 }
 
@@ -362,6 +386,7 @@ struct PreferencePublicationState {
     completion_lifecycle_lock: Arc<Mutex<()>>,
     completion_request: Arc<Mutex<Option<voxgolem_platform::completion::CompletionRequestHandle>>>,
     completion_context: Arc<Mutex<Option<CompletionRequestContext>>>,
+    completion_update_guard: Arc<Mutex<Option<UpdateOperationLease>>>,
     prefetch_generation: Arc<AtomicU64>,
     prefetch_cache: Arc<Mutex<Option<PrefetchEntry>>>,
     prefetch_task: Arc<Mutex<Option<ActivePrefetch>>>,
@@ -611,6 +636,7 @@ impl PreferencePublicationState {
             completion_lifecycle_lock: Arc::clone(&app_state.completion_lifecycle_lock),
             completion_request: Arc::clone(&app_state.completion_request),
             completion_context: Arc::clone(&app_state.completion_context),
+            completion_update_guard: Arc::clone(&app_state.completion_update_guard),
             prefetch_generation: Arc::clone(&app_state.prefetch_generation),
             prefetch_cache: Arc::clone(&app_state.prefetch_cache),
             prefetch_task: Arc::clone(&app_state.prefetch_task),
@@ -943,107 +969,9 @@ struct PreparedCueAssetPathsPayload {
     stop_listening_short: String,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum ResponseProfilePayload {
-    Fast,
-    Quality,
-}
-
-impl ResponseProfilePayload {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Fast => "fast",
-            Self::Quality => "quality",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-enum InstantChoicePayload {
-    LocalFast,
-    LocalQuality,
-    CustomSolHigh,
-    CustomSolNone,
-    CustomLunaNone,
-    CustomLunaLow,
-    #[serde(rename = "opencode-sol-high")]
-    OpenCodeSolHigh,
-    #[serde(rename = "opencode-luna-low")]
-    OpenCodeLunaLow,
-}
-
-impl InstantChoicePayload {
-    const ALL: [Self; 8] = [
-        Self::LocalFast,
-        Self::LocalQuality,
-        Self::CustomSolHigh,
-        Self::CustomSolNone,
-        Self::CustomLunaNone,
-        Self::CustomLunaLow,
-        Self::OpenCodeSolHigh,
-        Self::OpenCodeLunaLow,
-    ];
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::LocalFast => "local-fast",
-            Self::LocalQuality => "local-quality",
-            Self::CustomSolHigh => "custom-sol-high",
-            Self::CustomSolNone => "custom-sol-none",
-            Self::CustomLunaNone => "custom-luna-none",
-            Self::CustomLunaLow => "custom-luna-low",
-            Self::OpenCodeSolHigh => "opencode-sol-high",
-            Self::OpenCodeLunaLow => "opencode-luna-low",
-        }
-    }
-
-    fn capability_id(self) -> &'static str {
-        match self {
-            Self::LocalFast => "local_fast",
-            Self::LocalQuality => "local_quality",
-            Self::CustomSolHigh
-            | Self::CustomSolNone
-            | Self::CustomLunaNone
-            | Self::CustomLunaLow => "custom_provider",
-            Self::OpenCodeSolHigh | Self::OpenCodeLunaLow => "opencode",
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::LocalFast => "Local: Fast",
-            Self::LocalQuality => "Local: Quality",
-            Self::CustomSolHigh => "Custom: GPT-6.1 Sol High",
-            Self::CustomSolNone => "Custom: GPT-6.1 Sol None",
-            Self::CustomLunaNone => "Custom: GPT-6 Luna None",
-            Self::CustomLunaLow => "Custom: GPT-5.6 Luna Low",
-            Self::OpenCodeSolHigh => "OpenCode: GPT-6.1 Sol High",
-            Self::OpenCodeLunaLow => "OpenCode: GPT-5.6 Luna Low",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-enum AgentChoicePayload {
-    CustomSolHigh,
-    CustomLunaLow,
-    #[serde(rename = "opencode-sol-high")]
-    OpenCodeSolHigh,
-    #[serde(rename = "opencode-luna-low")]
-    OpenCodeLunaLow,
-}
-
-impl AgentChoicePayload {
-    fn capability_id(self) -> &'static str {
-        match self {
-            Self::CustomSolHigh | Self::CustomLunaLow => "custom_provider",
-            Self::OpenCodeSolHigh | Self::OpenCodeLunaLow => "opencode",
-        }
-    }
-}
+type ResponseProfilePayload = voxgolem_core::ipc::ResponseProfile;
+type InstantChoicePayload = voxgolem_core::ipc::InstantModelChoice;
+type AgentChoicePayload = voxgolem_core::ipc::AgentModelChoice;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct AssistantSettingsPayload {
@@ -1058,34 +986,16 @@ struct AssistantSettingsPayload {
 
 impl Default for AssistantSettingsPayload {
     fn default() -> Self {
-        Self {
-            instant: InstantChoicePayload::LocalFast,
-            deep: AgentChoicePayload::OpenCodeSolHigh,
-            review: AgentChoicePayload::OpenCodeSolHigh,
-            deep_enabled: false,
-            review_enabled: false,
-            prefetch: false,
-            completion: true,
-        }
+        Self::from(&voxgolem_core::assistant::AssistantPolicy::default())
     }
 }
 
 impl From<AssistantSettingsPayload> for voxgolem_core::assistant::AssistantPolicy {
     fn from(settings: AssistantSettingsPayload) -> Self {
-        use voxgolem_core::assistant::InstantModel;
         Self {
-            instant_model: match settings.instant {
-                InstantChoicePayload::LocalFast => InstantModel::LocalFast,
-                InstantChoicePayload::LocalQuality => InstantModel::LocalQuality,
-                InstantChoicePayload::CustomSolHigh => InstantModel::CustomSolHigh,
-                InstantChoicePayload::CustomSolNone => InstantModel::CustomSolNone,
-                InstantChoicePayload::CustomLunaNone => InstantModel::CustomLunaNone,
-                InstantChoicePayload::CustomLunaLow => InstantModel::CustomLunaLow,
-                InstantChoicePayload::OpenCodeSolHigh => InstantModel::OpenCodeSolHigh,
-                InstantChoicePayload::OpenCodeLunaLow => InstantModel::OpenCodeLunaLow,
-            },
-            deep_model: agent_model(settings.deep),
-            review_model: agent_model(settings.review),
+            instant_model: settings.instant.into(),
+            deep_model: settings.deep.into(),
+            review_model: settings.review.into(),
             deep_enabled: settings.deep_enabled,
             review_enabled: settings.review_enabled,
             prefetch_enabled: settings.prefetch,
@@ -1094,42 +1004,12 @@ impl From<AssistantSettingsPayload> for voxgolem_core::assistant::AssistantPolic
     }
 }
 
-fn agent_model(choice: AgentChoicePayload) -> voxgolem_core::assistant::AgentModel {
-    use voxgolem_core::assistant::AgentModel;
-    match choice {
-        AgentChoicePayload::CustomSolHigh => AgentModel::CustomSolHigh,
-        AgentChoicePayload::CustomLunaLow => AgentModel::CustomLunaLow,
-        AgentChoicePayload::OpenCodeSolHigh => AgentModel::OpenCodeSolHigh,
-        AgentChoicePayload::OpenCodeLunaLow => AgentModel::OpenCodeLunaLow,
-    }
-}
-
 impl From<&voxgolem_core::assistant::AssistantPolicy> for AssistantSettingsPayload {
     fn from(preferences: &voxgolem_core::assistant::AssistantPolicy) -> Self {
-        use voxgolem_core::assistant::{AgentModel, InstantModel};
         Self {
-            instant: match preferences.instant_model {
-                InstantModel::LocalFast => InstantChoicePayload::LocalFast,
-                InstantModel::LocalQuality => InstantChoicePayload::LocalQuality,
-                InstantModel::CustomSolHigh => InstantChoicePayload::CustomSolHigh,
-                InstantModel::CustomSolNone => InstantChoicePayload::CustomSolNone,
-                InstantModel::CustomLunaNone => InstantChoicePayload::CustomLunaNone,
-                InstantModel::CustomLunaLow => InstantChoicePayload::CustomLunaLow,
-                InstantModel::OpenCodeSolHigh => InstantChoicePayload::OpenCodeSolHigh,
-                InstantModel::OpenCodeLunaLow => InstantChoicePayload::OpenCodeLunaLow,
-            },
-            deep: match preferences.deep_model {
-                AgentModel::CustomSolHigh => AgentChoicePayload::CustomSolHigh,
-                AgentModel::CustomLunaLow => AgentChoicePayload::CustomLunaLow,
-                AgentModel::OpenCodeSolHigh => AgentChoicePayload::OpenCodeSolHigh,
-                AgentModel::OpenCodeLunaLow => AgentChoicePayload::OpenCodeLunaLow,
-            },
-            review: match preferences.review_model {
-                AgentModel::CustomSolHigh => AgentChoicePayload::CustomSolHigh,
-                AgentModel::CustomLunaLow => AgentChoicePayload::CustomLunaLow,
-                AgentModel::OpenCodeSolHigh => AgentChoicePayload::OpenCodeSolHigh,
-                AgentModel::OpenCodeLunaLow => AgentChoicePayload::OpenCodeLunaLow,
-            },
+            instant: preferences.instant_model.into(),
+            deep: preferences.deep_model.into(),
+            review: preferences.review_model.into(),
             deep_enabled: preferences.deep_enabled,
             review_enabled: preferences.review_enabled,
             prefetch: preferences.prefetch_enabled,
@@ -1140,30 +1020,10 @@ impl From<&voxgolem_core::assistant::AssistantPolicy> for AssistantSettingsPaylo
 
 impl From<&voxgolem_core::ipc::ValidatedPreferences> for AssistantSettingsPayload {
     fn from(preferences: &voxgolem_core::ipc::ValidatedPreferences) -> Self {
-        use voxgolem_core::ipc::{AgentModelChoice, InstantModelChoice};
         Self {
-            instant: match preferences.instant {
-                InstantModelChoice::LocalFast => InstantChoicePayload::LocalFast,
-                InstantModelChoice::LocalQuality => InstantChoicePayload::LocalQuality,
-                InstantModelChoice::CustomSolHigh => InstantChoicePayload::CustomSolHigh,
-                InstantModelChoice::CustomSolNone => InstantChoicePayload::CustomSolNone,
-                InstantModelChoice::CustomLunaNone => InstantChoicePayload::CustomLunaNone,
-                InstantModelChoice::CustomLunaLow => InstantChoicePayload::CustomLunaLow,
-                InstantModelChoice::OpenCodeSolHigh => InstantChoicePayload::OpenCodeSolHigh,
-                InstantModelChoice::OpenCodeLunaLow => InstantChoicePayload::OpenCodeLunaLow,
-            },
-            deep: match preferences.deep {
-                AgentModelChoice::CustomSolHigh => AgentChoicePayload::CustomSolHigh,
-                AgentModelChoice::CustomLunaLow => AgentChoicePayload::CustomLunaLow,
-                AgentModelChoice::OpenCodeSolHigh => AgentChoicePayload::OpenCodeSolHigh,
-                AgentModelChoice::OpenCodeLunaLow => AgentChoicePayload::OpenCodeLunaLow,
-            },
-            review: match preferences.review {
-                AgentModelChoice::CustomSolHigh => AgentChoicePayload::CustomSolHigh,
-                AgentModelChoice::CustomLunaLow => AgentChoicePayload::CustomLunaLow,
-                AgentModelChoice::OpenCodeSolHigh => AgentChoicePayload::OpenCodeSolHigh,
-                AgentModelChoice::OpenCodeLunaLow => AgentChoicePayload::OpenCodeLunaLow,
-            },
+            instant: preferences.instant,
+            deep: preferences.deep,
+            review: preferences.review,
             deep_enabled: preferences.deep_enabled,
             review_enabled: preferences.review_enabled,
             prefetch: preferences.prefetch,
@@ -1172,21 +1032,8 @@ impl From<&voxgolem_core::ipc::ValidatedPreferences> for AssistantSettingsPayloa
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum UiTextSizePayload {
-    Small,
-    Medium,
-    Large,
-    ExtraLarge,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum UiThemePayload {
-    Light,
-    Dark,
-}
+type UiTextSizePayload = voxgolem_core::ipc::UiTextSize;
+type UiThemePayload = voxgolem_core::ipc::UiTheme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct UiPreferencesState {
@@ -1195,6 +1042,68 @@ struct UiPreferencesState {
 }
 
 type SpeechChoice = voxgolem_core::ipc::BoundedText<{ voxgolem_core::ipc::DISPLAY_TEXT_MAX_BYTES }>;
+
+/// Compatibility command shape; publication uses the same canonical preference transaction.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct AssistantSettingsCommandPayload {
+    #[serde(flatten)]
+    settings: AssistantSettingsPayload,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    web_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    speech_network_fallback: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    speech_language: Option<SpeechChoice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    speech_tts_provider: Option<SpeechChoice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    speech_tts_voice: Option<SpeechChoice>,
+}
+
+impl AssistantSettingsCommandPayload {
+    fn apply_to(
+        self,
+        mut preferences: voxgolem_core::ipc::ValidatedPreferences,
+    ) -> voxgolem_core::ipc::ValidatedPreferences {
+        let policy: voxgolem_core::assistant::AssistantPolicy = self.settings.into();
+        preferences.instant = policy.instant_model.into();
+        preferences.deep = policy.deep_model.into();
+        preferences.review = policy.review_model.into();
+        preferences.deep_enabled = self.settings.deep_enabled;
+        preferences.review_enabled = self.settings.review_enabled;
+        preferences.prefetch = self.settings.prefetch;
+        preferences.completion = self.settings.completion;
+        if let Some(value) = self.web_enabled {
+            preferences.web_enabled = value;
+        }
+        if let Some(value) = self.speech_network_fallback {
+            preferences.speech_network_fallback = value;
+        }
+        if let Some(value) = self.speech_language {
+            preferences.speech_language = value;
+        }
+        if let Some(value) = self.speech_tts_provider {
+            preferences.speech_tts_provider = value;
+        }
+        if let Some(value) = self.speech_tts_voice {
+            preferences.speech_tts_voice = value;
+        }
+        preferences
+    }
+}
+
+impl From<&voxgolem_core::ipc::ValidatedPreferences> for AssistantSettingsCommandPayload {
+    fn from(preferences: &voxgolem_core::ipc::ValidatedPreferences) -> Self {
+        Self {
+            settings: AssistantSettingsPayload::from(preferences),
+            web_enabled: Some(preferences.web_enabled),
+            speech_network_fallback: Some(preferences.speech_network_fallback),
+            speech_language: Some(preferences.speech_language.clone()),
+            speech_tts_provider: Some(preferences.speech_tts_provider.clone()),
+            speech_tts_voice: Some(preferences.speech_tts_voice.clone()),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct NetworkPreferences {
@@ -1709,19 +1618,12 @@ fn clear_disabled_completion_after_publication(
         .completion_lifecycle_lock
         .lock()
         .map_err(|_| String::from("completion lifecycle lock is poisoned"))?;
-    if let Some(request) = state
-        .completion_request
-        .lock()
-        .map_err(|_| String::from("completion request lock is poisoned"))?
-        .clone()
-    {
-        request.clear();
-    }
-    state
-        .completion_context
-        .lock()
-        .map_err(|_| String::from("completion context lock is poisoned"))?
-        .take();
+    clear_completion_request_resources(
+        &state.completion_request,
+        &state.completion_context,
+        &state.completion_update_guard,
+        false,
+    )?;
     invalidate_prefetch_state(
         &state.prefetch_generation,
         &state.prefetch_task,
@@ -1813,6 +1715,15 @@ async fn set_preferences_from_state(
     preferences: voxgolem_core::ipc::ValidatedPreferences,
     app_state: &AppState,
 ) -> Result<voxgolem_core::ipc::ValidatedPreferences, voxgolem_core::ipc::CommandError> {
+    update_preferences_from_state(app_state, |_| preferences).await
+}
+
+async fn update_preferences_from_state(
+    app_state: &AppState,
+    proposal: impl FnOnce(
+        voxgolem_core::ipc::ValidatedPreferences,
+    ) -> voxgolem_core::ipc::ValidatedPreferences,
+) -> Result<voxgolem_core::ipc::ValidatedPreferences, voxgolem_core::ipc::CommandError> {
     use voxgolem_core::ipc::CommandErrorCode;
 
     let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)
@@ -1824,6 +1735,7 @@ async fn set_preferences_from_state(
     ensure_app_running(&app_state.exit_cleanup_started)
         .map_err(|error| preference_command_error(CommandErrorCode::Unavailable, error))?;
     let previous = get_app_snapshot_from_state(app_state)?.preferences;
+    let preferences = proposal(previous.clone());
     let requested_persisted = PersistedState::from(&preferences);
     let requested_settings = requested_persisted
         .assistant_settings
@@ -2097,7 +2009,7 @@ async fn set_preferences_from_state(
         publication,
     );
     if let Err(error) = publish_result {
-        if let Err(rollback_error) = restore_persisted_state(previous_persisted) {
+        if let Err(rollback_error) = restore_persisted_state(previous_persisted, &preferences) {
             eprintln!("failed to roll back unpublished preferences: {rollback_error}");
         }
         return Err(error);
@@ -2157,7 +2069,7 @@ async fn execute_llama_preference_change(
         .startup_snapshot
         .expect("profile startup snapshot must be reserved before worker launch");
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    let worker = std::thread::spawn(move || {
+    let worker = spawn_runtime_worker(move || {
         let _settings_operation = settings_operation;
         let mut publication = Some(publication);
         let mut proposed_tts_runtime = proposed_tts_runtime;
@@ -2205,7 +2117,7 @@ async fn execute_llama_preference_change(
                     &response_profile_switch_generation,
                     switch_generation,
                 ) {
-                    if let Err(error) = restore_persisted_state(previous_persisted) {
+                    if let Err(error) = restore_persisted_state(previous_persisted, &preferences) {
                         eprintln!("failed to roll back superseded preferences: {error}");
                     }
                     Err(preference_command_error(
@@ -2263,7 +2175,8 @@ async fn execute_llama_preference_change(
                             Ok(preferences.clone())
                         }
                         Err(error) => {
-                            if let Err(rollback_error) = restore_persisted_state(previous_persisted)
+                            if let Err(rollback_error) =
+                                restore_persisted_state(previous_persisted, &preferences)
                             {
                                 eprintln!(
                                     "failed to roll back unpublished preferences: {rollback_error}"
@@ -2425,7 +2338,7 @@ async fn execute_llama_preference_change(
             }
             RuntimeReplacement::Superseded => {
                 if let Some(previous_persisted) = persisted_rollback.take() {
-                    if let Err(error) = restore_persisted_state(previous_persisted) {
+                    if let Err(error) = restore_persisted_state(previous_persisted, &preferences) {
                         eprintln!("failed to roll back superseded preferences: {error}");
                     }
                 }
@@ -2573,7 +2486,7 @@ async fn retry_custom_provider(
         return Err(String::from("Custom WSL auth is not configured"));
     }
     let source = app_state.custom_auth_source_path.clone();
-    let resolved = tauri::async_runtime::spawn_blocking(move || {
+    let resolved = spawn_runtime_blocking(move || {
         voxgolem_platform::wsl::WslRunner::default()
             .with_limits(Duration::from_secs(15), 4096)
             .resolve_auth_path(source.as_deref())
@@ -2793,7 +2706,7 @@ async fn prepare_tts_runtime(
 ) -> Result<Option<tts::LocalTtsRuntime>, String> {
     let proposed_runtime = if tts_runtime_needs_initialization(enabled, current_runtime_present) {
         let config = config.clone();
-        tauri::async_runtime::spawn_blocking(move || {
+        spawn_runtime_blocking(move || {
             initialize_local_tts_runtime(&config, true, runtime_file_logging_enabled)
         })
         .await
@@ -2851,7 +2764,7 @@ async fn prepare_voice_cues(
                 .lock()
                 .map_err(|_| String::from("local voice runtime lock is poisoned"))?
                 .clone();
-            tauri::async_runtime::spawn_blocking(move || {
+            spawn_runtime_blocking(move || {
                 let owned = if existing.is_none() {
                     initialize_local_tts_runtime(&spec, true, logging_enabled)?.map(Arc::new)
                 } else {
@@ -2909,10 +2822,8 @@ async fn speak_local_tts(
         let generation = runtime.start_generation();
         (runtime, generation)
     };
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        runtime.synthesize_for_generation(&text, generation)
-    })
-    .await;
+    let result =
+        spawn_runtime_blocking(move || runtime.synthesize_for_generation(&text, generation)).await;
     let audio = match result {
         Ok(Ok(audio)) => audio,
         Ok(Err(error)) => {
@@ -2942,7 +2853,7 @@ async fn speak_local_tts(
         .map(|config| config.local_tts.output_gain_db)
         .unwrap_or(0.0);
     let playback = Arc::clone(&app_state.tts_audio_playback);
-    let playback_result = tauri::async_runtime::spawn_blocking(move || {
+    let playback_result = spawn_runtime_blocking(move || {
         playback.play(voxgolem_audio::playback::PlaybackRequest {
             playback_id,
             pcm_f32: audio.pcm_f32,
@@ -3039,7 +2950,7 @@ async fn start_native_microphone(
         .is_some_and(|config| config.logging.enabled);
     let microphone_capture = Arc::clone(&app_state.microphone_capture);
     let sample_rate_hz = app_state.voice_pipeline_config.sample_rate_hz();
-    let start = tauri::async_runtime::spawn_blocking(move || {
+    let start = spawn_runtime_blocking(move || {
         microphone_capture.start(
             capture_id,
             device_id,
@@ -3330,7 +3241,7 @@ async fn save_wake_clip(
         .map_err(|_| String::from("wake-word runtime lock is poisoned"))?
         .model_revision()
         .to_owned();
-    let saved = tauri::async_runtime::spawn_blocking(move || {
+    let saved = spawn_runtime_blocking(move || {
         let _permit = permit;
         wake_clips::save_clip(
             Path::new(&settings.directory),
@@ -3492,75 +3403,27 @@ async fn set_ui_theme(
 #[tauri::command]
 fn get_assistant_settings(
     app_state: tauri::State<'_, AppState>,
-) -> Result<AssistantSettingsPayload, String> {
-    let coordinator = app_state
-        .conversation_session
-        .lock()
-        .map_err(|_| String::from("assistant coordinator lock is poisoned"))?;
-    Ok(AssistantSettingsPayload::from(coordinator.policy()))
+) -> Result<AssistantSettingsCommandPayload, voxgolem_core::ipc::CommandError> {
+    Ok(AssistantSettingsCommandPayload::from(
+        &get_app_snapshot_from_state(&app_state)?.preferences,
+    ))
 }
 
 #[tauri::command]
 async fn set_assistant_settings(
-    settings: AssistantSettingsPayload,
+    settings: AssistantSettingsCommandPayload,
     app_state: tauri::State<'_, AppState>,
-) -> Result<AssistantSettingsPayload, String> {
-    let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
-    let _settings_operation = lock_live_settings_operation(&app_state).await?;
-    let _operation_guard = lock_ready_response_backend_operation(
-        &app_state.response_backend_operation_lock,
-        &app_state.startup_state,
-    )?;
-    let publication = {
-        let _lifecycle = app_state
-            .lifecycle_gate
-            .lock()
-            .map_err(|_| String::from("lifecycle gate is poisoned"))?;
-        let coordinator = app_state
-            .conversation_session
-            .lock()
-            .map_err(|_| String::from("assistant coordinator lock is poisoned"))?;
-        let previous = AssistantSettingsPayload::from(coordinator.policy());
-        ensure_assistant_settings_available(&settings, &previous, &app_state.startup_state)?;
-        if coordinator.has_active_execution() {
-            return Err(String::from(
-                "assistant settings cannot change while a prompt is active",
-            ));
-        }
-        app_state
-            .settings_publication_in_progress
-            .store(true, Ordering::Release);
-        let publication = SettingsPublicationGuard {
-            in_progress: Arc::clone(&app_state.settings_publication_in_progress),
-            armed: true,
-        };
-        invalidate_prefetch(&app_state)?;
-        publication
-    };
-    persist_assistant_settings(settings)?;
-    {
-        let _lifecycle = app_state
-            .lifecycle_gate
-            .lock()
-            .map_err(|_| String::from("lifecycle gate is poisoned"))?;
-        app_state
-            .conversation_session
-            .lock()
-            .map_err(|_| String::from("assistant coordinator lock is poisoned"))?
-            .replace_policy(settings.into())
-            .map_err(|_| {
-                String::from("assistant settings cannot change while a prompt is active")
-            })?;
-        app_state
-            .assistant_settings_generation
-            .fetch_add(1, Ordering::SeqCst);
-        invalidate_prefetch(&app_state)?;
-        publication.finish();
-    }
-    if !settings.completion {
-        clear_completion_state(&app_state)?;
-    }
-    Ok(settings)
+) -> Result<AssistantSettingsCommandPayload, voxgolem_core::ipc::CommandError> {
+    set_assistant_settings_from_state(settings, &app_state).await
+}
+
+async fn set_assistant_settings_from_state(
+    settings: AssistantSettingsCommandPayload,
+    app_state: &AppState,
+) -> Result<AssistantSettingsCommandPayload, voxgolem_core::ipc::CommandError> {
+    let accepted =
+        update_preferences_from_state(app_state, |previous| settings.apply_to(previous)).await?;
+    Ok(AssistantSettingsCommandPayload::from(&accepted))
 }
 
 fn lock_ready_response_backend_operation<'a>(
@@ -3908,7 +3771,7 @@ async fn switch_response_profile(
     ensure_app_running(&app_state.exit_cleanup_started)?;
     let startup_cancellation = voxgolem_platform::llama_cpp::LlamaCppStartupCancellation::default();
     let worker_cancellation = startup_cancellation.clone();
-    let startup_coordinator = std::thread::spawn(move || {
+    let startup_coordinator = spawn_runtime_worker(move || {
         let _settings_operation = settings_operation;
         let mut persistence_rollback = ProfilePersistenceRollback {
             previous_profile: current_profile,
@@ -4466,6 +4329,7 @@ impl DesktopConversationRuntime {
             .lifecycle_gate
             .lock()
             .map_err(|_| String::from("lifecycle gate is poisoned"))?;
+        ensure_app_running(resources.exit_cleanup_started)?;
         if app_state.reset_in_progress.load(Ordering::Acquire) {
             return Err(String::from("session reset is in progress"));
         }
@@ -5405,7 +5269,6 @@ impl DesktopStageDispatcher<'_> {
                         control: &active_prompt_control,
                     },
                 ),
-                &answer_text,
                 instant_result,
             )
             .await
@@ -5641,7 +5504,6 @@ impl DesktopStageDispatcher<'_> {
                         control: &active_prompt_control,
                     },
                 ),
-                &answer,
                 instant_result,
             )
             .await
@@ -5858,7 +5720,6 @@ impl DesktopStageDispatcher<'_> {
                             control: &active_prompt_control,
                         },
                     ),
-                    &answer,
                     instant_result,
                 )
                 .await
@@ -6246,7 +6107,7 @@ async fn submit_custom_prompt(
         cancellation,
     );
     stages.search_result = search_result.as_ref();
-    if let Err(error) = resolve_enabled_agents(stages, &answer, instant_result).await {
+    if let Err(error) = resolve_enabled_agents(stages, instant_result).await {
         if matches!(error, PromptControlError::Cancelled) {
             return finish_cancelled_prompt(
                 app,
@@ -6433,7 +6294,6 @@ async fn settle_instant_failure(
             deep_task,
             cancellation,
         ),
-        "",
         instant_result,
     )
     .await
@@ -6778,7 +6638,6 @@ async fn stream_local_prompt(
 
 async fn resolve_enabled_agents(
     context: StageContext<'_>,
-    instant_answer: &str,
     instant_result: voxgolem_core::conversation::UpdateResult,
 ) -> Result<(), PromptControlError> {
     let StageContext {
@@ -6794,10 +6653,9 @@ async fn resolve_enabled_agents(
     if cancellation.cancelled.load(Ordering::SeqCst) {
         return Err(PromptControlError::Cancelled);
     }
-    let instant_succeeded = !matches!(
-        instant_result,
-        voxgolem_core::conversation::UpdateResult::Pending
-    ) && !instant_answer.is_empty();
+    let instant_succeeded = app_state
+        .conversation
+        .instant_stage_succeeded(request.generation)?;
     emit_stage_event_controlled(
         app,
         request_id,
@@ -6992,13 +6850,11 @@ async fn resolve_enabled_agents(
             | voxgolem_core::assistant::InstantOutcome::NeedsDeep(content) => Some(content),
             voxgolem_core::assistant::InstantOutcome::Failure(_) => None,
         });
-    let instant_status = match (&instant_result, instant_content) {
-        (voxgolem_core::conversation::UpdateResult::Pending, _) | (_, None) => {
-            voxgolem_core::agent_pipeline::StageStatus::Failure(String::from(
-                "Instant provider failed",
-            ))
-        }
-        (_, Some(content)) => voxgolem_core::agent_pipeline::StageStatus::Success(content),
+    let instant_status = match instant_content {
+        None => voxgolem_core::agent_pipeline::StageStatus::Failure(String::from(
+            "Instant provider failed",
+        )),
+        Some(content) => voxgolem_core::agent_pipeline::StageStatus::Success(content),
     };
     let deep_status = match deep_report.as_ref() {
         Some(report) => voxgolem_core::agent_pipeline::StageStatus::Success(
@@ -7013,47 +6869,48 @@ async fn resolve_enabled_agents(
             voxgolem_core::agent_pipeline::StageStatus::Failure(String::from("Deep stage disabled"))
         }
     };
-    let review_input =
-        fit_review_history_to_prompt_budget(voxgolem_core::agent_pipeline::ReviewInput {
-            original_request: search_result.map_or_else(
-                || request.prompt.clone(),
-                |result| search_runtime::deep_request(&request.prompt, result),
-            ),
-            canonical_history: agent_history(&request.history),
-            instant: instant_status,
-            deep: deep_status,
-            materiality_policy: String::from(
-                "Only material factual defects justify rewrite; style-only differences are KEEP.",
-            ),
-            sources: search_result
-                .map(|result| search_runtime::source_links(&result.sources))
-                .unwrap_or_else(|| {
-                    deep_report
-                        .as_ref()
-                        .map(|report| {
-                            report
-                                .sources
-                                .iter()
-                                .map(|source| voxgolem_core::agent_pipeline::SourceEvidence {
-                                    url: source.url.clone(),
-                                    title: source.title.clone(),
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                }),
-        })?;
-    let review_prompt = voxgolem_core::agent_pipeline::typed_review_prompt(&review_input);
     let review_started = Instant::now();
-    let review = run_agent_text(
-        app_state,
-        request.preferences.review_model,
-        voxgolem_platform::opencode::OpencodeToolPolicy::AnswerOnly,
-        &format!("{request_id}-review"),
-        &review_prompt,
-        cancellation.cancelled,
-        cancellation.signal,
-    )
+    let review_input = voxgolem_core::agent_pipeline::ReviewInput {
+        original_request: search_result.map_or_else(
+            || request.prompt.clone(),
+            |result| search_runtime::deep_request(&request.prompt, result),
+        ),
+        canonical_history: agent_history(&request.history),
+        instant: instant_status,
+        deep: deep_status,
+        materiality_policy: String::from(
+            "Only material factual defects justify rewrite; style-only differences are KEEP.",
+        ),
+        sources: search_result
+            .map(|result| search_runtime::source_links(&result.sources))
+            .unwrap_or_else(|| {
+                deep_report
+                    .as_ref()
+                    .map(|report| {
+                        report
+                            .sources
+                            .iter()
+                            .map(|source| voxgolem_core::agent_pipeline::SourceEvidence {
+                                url: source.url.clone(),
+                                title: source.title.clone(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }),
+    };
+    let review = dispatch_review(review_input, |review_prompt| async move {
+        run_agent_text(
+            app_state,
+            request.preferences.review_model,
+            voxgolem_platform::opencode::OpencodeToolPolicy::AnswerOnly,
+            &format!("{request_id}-review"),
+            &review_prompt,
+            cancellation.cancelled,
+            cancellation.signal,
+        )
+        .await
+    })
     .await;
     if cancellation.cancelled.load(Ordering::SeqCst) {
         return Err(PromptControlError::Cancelled);
@@ -7405,17 +7262,22 @@ fn agent_history(
 }
 
 fn fit_review_history_to_prompt_budget(
-    mut input: voxgolem_core::agent_pipeline::ReviewInput,
+    input: voxgolem_core::agent_pipeline::ReviewInput,
 ) -> Result<voxgolem_core::agent_pipeline::ReviewInput, String> {
-    while voxgolem_core::agent_pipeline::typed_review_prompt(&input).len()
-        > voxgolem_core::agent_pipeline::MAX_REVIEW_PROMPT_BYTES
-        && input.canonical_history.len() >= 2
-    {
-        input.canonical_history.drain(..2);
-    }
-    voxgolem_core::agent_pipeline::validate_review_input(&input)
-        .map_err(|error| error.to_string())?;
-    Ok(input)
+    voxgolem_core::agent_pipeline::fit_review_history_to_prompt_budget(input)
+        .map_err(|error| error.to_string())
+}
+
+async fn dispatch_review<F, Fut>(
+    input: voxgolem_core::agent_pipeline::ReviewInput,
+    dispatch: F,
+) -> Result<AgentTextResult, String>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<AgentTextResult, String>>,
+{
+    let input = fit_review_history_to_prompt_budget(input)?;
+    dispatch(voxgolem_core::agent_pipeline::typed_review_prompt(&input)).await
 }
 
 async fn run_agent_text(
@@ -8389,6 +8251,32 @@ fn ingest_audio_frame(
     app: tauri::AppHandle,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<RuntimePhaseResponsePayload, String> {
+    let ingested = ingest_audio_frame_from_state(frame, telemetry_frame_id, &app_state)?;
+    if let Some(parakeet_runtime) = app_state.parakeet_runtime.as_ref() {
+        spawn_partial_transcription(
+            app,
+            ingested.partial_action,
+            Arc::clone(parakeet_runtime),
+            Arc::clone(&app_state.partial_transcription),
+            app_state.voice_pipeline_config.sample_rate_hz(),
+            ingested.update_guard,
+        );
+    }
+    Ok(ingested.response)
+}
+
+struct IngestedAudioFrame<'a> {
+    response: RuntimePhaseResponsePayload,
+    partial_action: partial_transcription::PartialTranscriptionAction,
+    update_guard: UpdateOperationLease,
+    _lifecycle: MutexGuard<'a, ()>,
+}
+
+fn ingest_audio_frame_from_state(
+    frame: Vec<f32>,
+    telemetry_frame_id: Option<String>,
+    app_state: &AppState,
+) -> Result<IngestedAudioFrame<'_>, String> {
     let update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
     let _lifecycle = app_state
         .lifecycle_gate
@@ -8407,7 +8295,7 @@ fn ingest_audio_frame(
     );
 
     record_wake_diagnostics_phase(
-        &app_state,
+        app_state,
         to_runtime_phase_payload(guard.session().runtime().phase()),
     );
 
@@ -8426,28 +8314,23 @@ fn ingest_audio_frame(
         false
     };
 
-    let mut next_state = ingest_audio_frame_with_optional_wake_word_detection(
-        &guard,
+    let update = voxgolem_core::voice_pipeline::prepare_audio_frame_update(
+        &mut guard,
         app_state.voice_pipeline_config,
-        frame,
+        &frame,
         wake_word_now_ms,
-    )?;
+        speech_detected.then_some(now_ms),
+    )
+    .map_err(|error| format!("voice pipeline frame ingestion failed: {error:?}"))?;
 
     if wake_word_now_ms.is_some() {
         reset_voice_activity_runtime(&app_state.voice_activity_runtime)?;
     }
 
-    next_state = apply_optional_speech_activity(
-        next_state,
-        app_state.voice_pipeline_config,
-        speech_detected,
-        now_ms,
-    )?;
-
-    *guard = next_state;
+    update.commit();
 
     record_wake_diagnostics_phase(
-        &app_state,
+        app_state,
         to_runtime_phase_payload(guard.session().runtime().phase()),
     );
 
@@ -8491,18 +8374,12 @@ fn ingest_audio_frame(
     );
     drop(guard);
 
-    if let Some(parakeet_runtime) = app_state.parakeet_runtime.as_ref() {
-        spawn_partial_transcription(
-            app,
-            partial_action,
-            Arc::clone(parakeet_runtime),
-            Arc::clone(&app_state.partial_transcription),
-            app_state.voice_pipeline_config.sample_rate_hz(),
-            update_guard,
-        );
-    }
-
-    Ok(response)
+    Ok(IngestedAudioFrame {
+        response,
+        partial_action,
+        update_guard,
+        _lifecycle,
+    })
 }
 
 fn spawn_partial_transcription(
@@ -8511,7 +8388,7 @@ fn spawn_partial_transcription(
     parakeet_runtime: Arc<Mutex<transcription::ParakeetRuntime>>,
     scheduler: Arc<Mutex<partial_transcription::PartialTranscriptionScheduler>>,
     sample_rate_hz: u32,
-    update_guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    update_guard: UpdateOperationLease,
 ) {
     let Some(update_guard) = partial_transcription_worker_guard(&action, update_guard) else {
         return;
@@ -8528,7 +8405,7 @@ fn spawn_partial_transcription(
         {
             let started = Instant::now();
             let runtime = Arc::clone(&parakeet_runtime);
-            let result = tauri::async_runtime::spawn_blocking(move || {
+            let result = spawn_runtime_blocking(move || {
                 let input = voxgolem_model::parakeet::ParakeetTranscriptionInput::new(
                     sample_rate_hz,
                     samples,
@@ -8627,8 +8504,8 @@ fn request_partial_snapshot_after_detected_speech(
 
 fn partial_transcription_worker_guard(
     action: &partial_transcription::PartialTranscriptionAction,
-    update_guard: tokio::sync::OwnedRwLockReadGuard<()>,
-) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+    update_guard: UpdateOperationLease,
+) -> Option<UpdateOperationLease> {
     matches!(
         action,
         partial_transcription::PartialTranscriptionAction::StartSnapshot { .. }
@@ -8675,8 +8552,21 @@ fn clear_completion_request_state_locked(
     app_state: &AppState,
     require_runtime: bool,
 ) -> Result<(), String> {
-    let request = app_state
-        .completion_request
+    clear_completion_request_resources(
+        &app_state.completion_request,
+        &app_state.completion_context,
+        &app_state.completion_update_guard,
+        require_runtime,
+    )
+}
+
+fn clear_completion_request_resources(
+    request: &Mutex<Option<voxgolem_platform::completion::CompletionRequestHandle>>,
+    context: &Mutex<Option<CompletionRequestContext>>,
+    update_guard: &Mutex<Option<UpdateOperationLease>>,
+    require_runtime: bool,
+) -> Result<(), String> {
+    let request = request
         .lock()
         .map_err(|_| String::from("completion request lock is poisoned"))?
         .clone();
@@ -8686,13 +8576,11 @@ fn clear_completion_request_state_locked(
     if let Some(request) = request {
         request.clear();
     }
-    app_state
-        .completion_context
+    context
         .lock()
         .map_err(|_| String::from("completion context lock is poisoned"))?
         .take();
-    app_state
-        .completion_update_guard
+    update_guard
         .lock()
         .map_err(|_| String::from("completion update guard lock is poisoned"))?
         .take();
@@ -8715,16 +8603,16 @@ fn queue_completion_request(
         clear_completion_state_locked(app_state, false)?;
         return Ok(());
     }
+    if prompt.trim().is_empty() || prompt.len() > COMPLETION_PROMPT_MAX_BYTES {
+        clear_completion_request_state_locked(app_state, false)?;
+        return Ok(());
+    }
     let request = app_state
         .completion_request
         .lock()
         .map_err(|_| String::from("completion request lock is poisoned"))?
         .clone()
         .ok_or_else(|| String::from("completion runtime is not available"))?;
-    if prompt.trim().is_empty() || prompt.len() > COMPLETION_PROMPT_MAX_BYTES {
-        clear_completion_request_state_locked(app_state, false)?;
-        return Ok(());
-    }
     let backend_revision = app_state
         .completion_generation
         .fetch_add(1, Ordering::SeqCst)
@@ -9327,7 +9215,7 @@ async fn run_assistant_prefetch(
                 return Err(String::from("prefetch cancelled"));
             }
             let provider_cancellation = cancellation.clone();
-            let provider = tauri::async_runtime::spawn_blocking(move || {
+            let provider = spawn_runtime_blocking(move || {
                 let app_state = app.state::<AppState>();
                 if app_state.prefetch_generation.load(Ordering::SeqCst) != generation {
                     return Err(String::from("prefetch cancelled"));
@@ -9736,18 +9624,10 @@ fn default_ui_theme() -> UiThemePayload {
     UiThemePayload::Dark
 }
 
-fn resolved_ui_preferences() -> UiPreferencesState {
-    let text_size = load_persisted_ui_text_size().unwrap_or_else(|error| {
-        eprintln!("failed to read UI text size: {error}");
-        None
-    });
-    let theme = load_persisted_ui_theme().unwrap_or_else(|error| {
-        eprintln!("failed to read UI theme: {error}");
-        None
-    });
+fn resolved_ui_preferences(persisted: &PersistedState) -> UiPreferencesState {
     UiPreferencesState {
-        theme: theme.unwrap_or_else(default_ui_theme),
-        text_size: text_size.unwrap_or_else(default_ui_text_size),
+        theme: persisted.ui_theme.unwrap_or_else(default_ui_theme),
+        text_size: persisted.ui_text_size.unwrap_or_else(default_ui_text_size),
     }
 }
 
@@ -9812,13 +9692,48 @@ fn runtime_log_path() -> Result<PathBuf, String> {
         .join(RUNTIME_LOG_FILE))
 }
 
+#[cfg(test)]
+mod test_storage;
+
+fn spawn_runtime_worker<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> std::thread::JoinHandle<T> {
+    #[cfg(test)]
+    {
+        let context = test_storage::current();
+        std::thread::spawn(move || context.run(work))
+    }
+    #[cfg(not(test))]
+    std::thread::spawn(work)
+}
+
+fn spawn_runtime_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> tauri::async_runtime::JoinHandle<T> {
+    #[cfg(test)]
+    let context = test_storage::current();
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(test)]
+        {
+            context.run(work)
+        }
+        #[cfg(not(test))]
+        {
+            work()
+        }
+    })
+}
+
 fn application_config_path() -> Result<PathBuf, String> {
     #[cfg(test)]
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        return Ok(PathBuf::from(appdata).join("VoxGolem").join("config.toml"));
+    {
+        Ok(test_storage::configuration_path())
     }
-    voxgolem_core::config::default_config_path()
-        .map_err(|error| format!("failed to resolve application config path: {error}"))
+    #[cfg(not(test))]
+    {
+        voxgolem_core::config::default_config_path()
+            .map_err(|error| format!("failed to resolve application config path: {error}"))
+    }
 }
 
 fn append_runtime_log_line(enabled: bool, subsystem: &str, message: &str) -> Result<(), String> {
@@ -10067,30 +9982,21 @@ fn parse_persisted_state(contents: &str) -> Result<PersistedState, String> {
 }
 
 fn load_persisted_state() -> Result<PersistedState, String> {
-    let state_path = response_profile_state_path()?;
-    let contents = match fs::read_to_string(&state_path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(PersistedState::default()),
-        Err(error) => {
-            return Err(format!(
-                "failed to read response profile state {}: {error}",
-                state_path.display()
-            ));
-        }
-    };
+    persisted_store()?.load()
+}
 
-    parse_persisted_state(&contents)
+fn persisted_store() -> Result<state_store::StateStore, String> {
+    Ok(state_store::StateStore::new(response_profile_state_path()?))
+}
+
+fn mutate_persisted_state<T>(
+    change: impl FnOnce(&mut PersistedState) -> Result<T, String>,
+) -> Result<T, String> {
+    persisted_store()?.mutate(change)
 }
 
 fn lock_persisted_state_file(state_path: &Path) -> std::io::Result<File> {
-    let lock_file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(state_path.with_extension("lock"))?;
-    lock_file.lock()?;
-    Ok(lock_file)
+    state_store::lock_path(state_path)
 }
 
 fn is_persisted_state_temp(file_name: &std::ffi::OsStr, state_path: &Path) -> bool {
@@ -10156,44 +10062,16 @@ fn cleanup_orphan_state_temps_with(before_lock: impl FnOnce()) -> Result<(), Str
     Ok(())
 }
 
+#[cfg(test)]
 fn persist_state(state: PersistedState) -> Result<(), String> {
-    let state_path = response_profile_state_path()?;
-    if let Some(parent) = state_path.parent() {
-        fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "failed to create response profile state directory {}: {error}",
-                parent.display()
-            )
-        })?;
-    }
-
-    let contents = serialize_persisted_state(&state)?;
-
-    let result = atomic_replace_state_file(&state_path, contents.as_bytes());
-    if let Err(error) = result {
-        return Err(format!(
-            "failed to write response profile state {}: {error}",
-            state_path.display()
-        ));
-    }
-    Ok(())
+    mutate_persisted_state(|current| {
+        *current = state;
+        Ok(())
+    })
 }
 
 fn atomic_replace_state_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    let _lock = lock_persisted_state_file(path)?;
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            ErrorKind::InvalidInput,
-            "state path has no parent directory",
-        )
-    })?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary.write_all(contents)?;
-    temporary.as_file().sync_all()?;
-    temporary
-        .persist(path)
-        .map(|_| ())
-        .map_err(|error| error.error)
+    state_store::atomic_bytes_replace(path, contents)
 }
 
 fn load_selected_response_profile() -> Result<Option<ResponseProfilePayload>, String> {
@@ -10201,25 +10079,21 @@ fn load_selected_response_profile() -> Result<Option<ResponseProfilePayload>, St
 }
 
 fn persist_selected_response_profile(profile: ResponseProfilePayload) -> Result<(), String> {
-    let _guard = PERSISTED_STATE_LOCK
-        .lock()
-        .map_err(|_| String::from("persisted state lock is poisoned"))?;
-    let mut persisted = load_persisted_state()?;
-    persisted.selected_response_profile = Some(profile);
-    persist_state(persisted)
+    mutate_persisted_state(|persisted| {
+        persisted.selected_response_profile = Some(profile);
+        Ok(())
+    })
 }
 
 fn persist_profile_and_assistant_settings(
     profile: ResponseProfilePayload,
     settings: AssistantSettingsPayload,
 ) -> Result<(), String> {
-    let _guard = PERSISTED_STATE_LOCK
-        .lock()
-        .map_err(|_| String::from("persisted state lock is poisoned"))?;
-    let mut persisted = load_persisted_state()?;
-    persisted.selected_response_profile = Some(profile);
-    persisted.assistant_settings = Some(settings);
-    persist_state(persisted)
+    mutate_persisted_state(|persisted| {
+        persisted.selected_response_profile = Some(profile);
+        persisted.assistant_settings = Some(settings);
+        Ok(())
+    })
 }
 
 fn load_persisted_tts_enabled() -> Result<Option<bool>, String> {
@@ -10227,12 +10101,10 @@ fn load_persisted_tts_enabled() -> Result<Option<bool>, String> {
 }
 
 fn persist_tts_enabled(enabled: bool) -> Result<(), String> {
-    let _guard = PERSISTED_STATE_LOCK
-        .lock()
-        .map_err(|_| String::from("persisted state lock is poisoned"))?;
-    let mut persisted = load_persisted_state()?;
-    persisted.tts_enabled = Some(enabled);
-    persist_state(persisted)
+    mutate_persisted_state(|persisted| {
+        persisted.tts_enabled = Some(enabled);
+        Ok(())
+    })
 }
 
 fn load_auto_update_download() -> Result<bool, String> {
@@ -10244,47 +10116,41 @@ fn load_auto_update_install() -> Result<bool, String> {
 }
 
 pub(crate) fn persist_auto_update_download(enabled: bool) -> Result<(), String> {
-    let _guard = PERSISTED_STATE_LOCK
-        .lock()
-        .map_err(|_| String::from("persisted state lock is poisoned"))?;
-    let mut persisted = load_persisted_state()?;
-    persisted.auto_update_download = Some(enabled);
-    persist_state(persisted)
+    mutate_persisted_state(|persisted| {
+        persisted.auto_update_download = Some(enabled);
+        Ok(())
+    })
 }
 
 pub(crate) fn persist_auto_update_install(enabled: bool) -> Result<(), String> {
-    let _guard = PERSISTED_STATE_LOCK
-        .lock()
-        .map_err(|_| String::from("persisted state lock is poisoned"))?;
-    let mut persisted = load_persisted_state()?;
-    persisted.auto_update_install = Some(enabled);
-    persist_state(persisted)
+    mutate_persisted_state(|persisted| {
+        persisted.auto_update_install = Some(enabled);
+        Ok(())
+    })
 }
 
+#[cfg(test)]
 fn load_persisted_ui_text_size() -> Result<Option<UiTextSizePayload>, String> {
     Ok(load_persisted_state()?.ui_text_size)
 }
 
 fn persist_ui_text_size(text_size: UiTextSizePayload) -> Result<(), String> {
-    let _guard = PERSISTED_STATE_LOCK
-        .lock()
-        .map_err(|_| String::from("persisted state lock is poisoned"))?;
-    let mut persisted = load_persisted_state()?;
-    persisted.ui_text_size = Some(text_size);
-    persist_state(persisted)
+    mutate_persisted_state(|persisted| {
+        persisted.ui_text_size = Some(text_size);
+        Ok(())
+    })
 }
 
+#[cfg(test)]
 fn load_persisted_ui_theme() -> Result<Option<UiThemePayload>, String> {
     Ok(load_persisted_state()?.ui_theme)
 }
 
 fn persist_ui_theme(theme: UiThemePayload) -> Result<(), String> {
-    let _guard = PERSISTED_STATE_LOCK
-        .lock()
-        .map_err(|_| String::from("persisted state lock is poisoned"))?;
-    let mut persisted = load_persisted_state()?;
-    persisted.ui_theme = Some(theme);
-    persist_state(persisted)
+    mutate_persisted_state(|persisted| {
+        persisted.ui_theme = Some(theme);
+        Ok(())
+    })
 }
 
 fn load_assistant_settings() -> Result<Option<AssistantSettingsPayload>, String> {
@@ -10292,33 +10158,43 @@ fn load_assistant_settings() -> Result<Option<AssistantSettingsPayload>, String>
 }
 
 fn persist_assistant_settings(settings: AssistantSettingsPayload) -> Result<(), String> {
-    let _guard = PERSISTED_STATE_LOCK
-        .lock()
-        .map_err(|_| String::from("persisted state lock is poisoned"))?;
-    let mut persisted = load_persisted_state()?;
-    persisted.assistant_settings = Some(settings);
-    persist_state(persisted)
+    mutate_persisted_state(|persisted| {
+        persisted.assistant_settings = Some(settings);
+        Ok(())
+    })
 }
 
 fn persist_validated_preferences(
     preferences: &voxgolem_core::ipc::ValidatedPreferences,
 ) -> Result<PersistedState, String> {
-    let _guard = PERSISTED_STATE_LOCK
-        .lock()
-        .map_err(|_| String::from("persisted state lock is poisoned"))?;
-    let previous = load_persisted_state()?;
-    let mut proposed = PersistedState::from(preferences);
-    proposed.auto_update_download = previous.auto_update_download;
-    proposed.auto_update_install = previous.auto_update_install;
-    persist_state(proposed)?;
-    Ok(previous)
+    mutate_persisted_state(|current| {
+        let previous = current.clone();
+        let mut proposed = PersistedState::from(preferences);
+        proposed.auto_update_download = current.auto_update_download;
+        proposed.auto_update_install = current.auto_update_install;
+        *current = proposed;
+        Ok(previous)
+    })
 }
 
-fn restore_persisted_state(state: PersistedState) -> Result<(), String> {
-    let _guard = PERSISTED_STATE_LOCK
-        .lock()
-        .map_err(|_| String::from("persisted state lock is poisoned"))?;
-    persist_state(state)
+fn restore_persisted_state(
+    mut state: PersistedState,
+    expected: &voxgolem_core::ipc::ValidatedPreferences,
+) -> Result<(), String> {
+    mutate_persisted_state(|current| {
+        let mut compared = current.clone();
+        compared.auto_update_download = None;
+        compared.auto_update_install = None;
+        if compared != PersistedState::from(expected) {
+            return Err(String::from(
+                "persisted preferences changed before rollback",
+            ));
+        }
+        state.auto_update_download = current.auto_update_download;
+        state.auto_update_install = current.auto_update_install;
+        *current = state;
+        Ok(())
+    })
 }
 
 fn resolve_assistant_settings(
@@ -10993,7 +10869,10 @@ fn telemetry_inference_provider(
 fn new_telemetry_sink(
     config: voxgolem_core::config::TelemetryConfig,
 ) -> Option<Arc<Mutex<telemetry::TelemetrySink>>> {
+    #[cfg(not(test))]
     let state_dir = voxgolem_core::config::default_state_dir().ok()?;
+    #[cfg(test)]
+    let state_dir = test_storage::state_directory();
     Some(Arc::new(Mutex::new(telemetry::TelemetrySink::new(
         state_dir,
         telemetry::TelemetryConfig {
@@ -11049,8 +10928,8 @@ fn initialize_app_state(init: AppStateInit) -> AppState {
         custom_auth_path: init.custom_auth_path,
         custom_retry_lock: init.custom_retry_lock,
         microphone_capture: init.microphone_capture,
-        completion_update_guard: Mutex::new(None),
-        update_installation_gate: Arc::new(tokio::sync::RwLock::new(())),
+        completion_update_guard: Arc::new(Mutex::new(None)),
+        update_installation_gate: Arc::new(UpdateActivity::default()),
         tts_playback: Arc::new(Mutex::new(TtsPlaybackState::default())),
         voice_cue_cache: tokio::sync::OnceCell::new(),
         wake_clip_writers: Arc::new(tokio::sync::Semaphore::new(
@@ -11060,7 +10939,7 @@ fn initialize_app_state(init: AppStateInit) -> AppState {
         shutdown_lock: tokio::sync::Mutex::new(()),
         shutdown_complete: AtomicBool::new(false),
         selected_response_profile: init.selected_response_profile,
-        ui_preferences: Arc::new(Mutex::new(resolved_ui_preferences())),
+        ui_preferences: Arc::new(Mutex::new(resolved_ui_preferences(&persisted))),
         settings_operation_lock: Arc::new(tokio::sync::Mutex::new(())),
         ui_preferences_operation_lock: Mutex::new(()),
         supported_response_profiles: init.supported_response_profiles,
@@ -11102,7 +10981,11 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
         eprintln!("failed to clean persisted state temporaries: {error}");
     }
 
-    match voxgolem_core::config::load_runtime_config(None) {
+    #[cfg(test)]
+    let config_path = Some(test_storage::configuration_path());
+    #[cfg(not(test))]
+    let config_path: Option<PathBuf> = None;
+    match voxgolem_core::config::load_runtime_config(config_path.as_deref()) {
         Ok(mut config) => {
             let custom_auth_source_path = config
                 .custom_openai
@@ -11365,7 +11248,7 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
                     let (startup_cancellation, startup_worker) =
                         voxgolem_platform::llama_cpp::LlamaCppRuntime::start_with_policy_cancellable(
                             server_spec, inference_policy);
-                    let startup_coordinator = std::thread::spawn(move || {
+                    let startup_coordinator = spawn_runtime_worker(move || {
                         let start_result = startup_worker.join().unwrap_or_else(|_| Err(voxgolem_platform::llama_cpp::LlamaCppRuntimeError::StartupCancelled));
                         if !runtime_startup_is_current(
                             &startup_exit_cleanup,
@@ -11725,25 +11608,21 @@ fn update_installation_busy_reason(
 }
 
 fn begin_update_sensitive_operation(
-    gate: &Arc<tokio::sync::RwLock<()>>,
-) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, String> {
-    Arc::clone(gate)
-        .try_read_owned()
-        .map_err(|_| String::from("an update installation is starting"))
+    gate: &Arc<UpdateActivity>,
+) -> Result<UpdateOperationLease, String> {
+    gate.operation()
 }
 
 fn begin_native_microphone_operation(
-    gate: &Arc<tokio::sync::RwLock<()>>,
-) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, String> {
+    gate: &Arc<UpdateActivity>,
+) -> Result<UpdateOperationLease, String> {
     begin_update_sensitive_operation(gate)
 }
 
 pub(crate) fn begin_update_installation(
     app_state: &AppState,
 ) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>, String> {
-    Arc::clone(&app_state.update_installation_gate)
-        .try_write_owned()
-        .map_err(|_| String::from("Update installation requires VoxGolem to be idle."))
+    app_state.update_installation_gate.installation()
 }
 
 pub(crate) fn ensure_update_installation_is_idle(app_state: &AppState) -> Result<(), String> {
@@ -11975,6 +11854,7 @@ fn current_time_ms() -> Result<u64, String> {
         .map_err(|error| format!("system clock is before unix epoch: {error}"))
 }
 
+#[cfg(test)]
 fn ingest_audio_frame_with_optional_wake_word_detection(
     voice_pipeline_state: &voxgolem_core::voice_pipeline::VoicePipelineState,
     voice_pipeline_config: voxgolem_core::voice_pipeline::VoicePipelineConfig,
@@ -12011,6 +11891,7 @@ fn ingest_audio_frame_with_optional_wake_word_detection(
     .map_err(|error| format!("voice pipeline frame ingestion failed: {error:?}"))
 }
 
+#[cfg(test)]
 fn apply_optional_speech_activity(
     voice_pipeline_state: voxgolem_core::voice_pipeline::VoicePipelineState,
     voice_pipeline_config: voxgolem_core::voice_pipeline::VoicePipelineConfig,
@@ -12527,6 +12408,7 @@ fn begin_exit_cleanup(app_state: &AppState) -> bool {
         return false;
     }
     invalidate_runtime_startups_for_exit(app_state);
+    app_state.update_installation_gate.signal_change();
     true
 }
 
@@ -13320,15 +13202,9 @@ mod tests {
 
     #[test]
     fn speech_startup_metadata_reports_engines_without_model_paths_or_provider_inference() {
-        let _appdata_lock = APPDATA_ENV_LOCK.lock().expect("APPDATA test lock");
         let temp_dir = tempfile::tempdir().expect("synthetic app data directory");
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", temp_dir.path());
+        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
         let mut state = missing_llama_app_state(std::path::Path::new("/synthetic/private-models"));
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
         if let StartupStatePayload::Ready { capabilities, .. } =
             &mut *state.startup_state.lock().expect("startup state")
         {
@@ -13599,13 +13475,24 @@ mod tests {
     }
 
     #[test]
+    fn assistant_settings_command_payload_preserves_explicit_network_policy() {
+        let input = serde_json::json!({
+            "instant": "local-fast", "deep": "opencode-sol-high", "review": "opencode-sol-high",
+            "deep_enabled": false, "review_enabled": false, "prefetch": false, "completion": false,
+            "web_enabled": false, "speech_network_fallback": false,
+            "speech_language": "en-AU", "speech_tts_provider": "synthetic-engine", "speech_tts_voice": "synthetic-voice"
+        });
+        let parsed: super::AssistantSettingsCommandPayload = serde_json::from_value(input).unwrap();
+        let returned = serde_json::to_value(parsed).unwrap();
+        assert_eq!(returned["web_enabled"], false);
+        assert_eq!(returned["speech_network_fallback"], false);
+        assert_eq!(returned["speech_language"], "en-AU");
+    }
+
+    #[test]
     fn canonical_preferences_publish_and_persist_as_one_zero_asset_state() {
-        let _appdata_lock = APPDATA_ENV_LOCK
-            .lock()
-            .expect("APPDATA test lock should not be poisoned");
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", temp_dir.path());
+        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
         let state = build_nonfatal_config_error_app_state(
             default_voice_pipeline_config(),
             super::embedded_cue_asset_paths(),
@@ -13629,10 +13516,6 @@ mod tests {
         let snapshot = get_app_snapshot_from_state(&state).expect("updated snapshot");
         let persisted = load_persisted_state().expect("updated state should reload");
 
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
         assert_eq!(accepted, requested);
         assert_eq!(snapshot.preferences, requested);
         assert_eq!(persisted, PersistedState::from(&requested));
@@ -13640,12 +13523,8 @@ mod tests {
 
     #[test]
     fn canonical_preferences_disable_tts_in_the_same_publication() {
-        let _appdata_lock = APPDATA_ENV_LOCK
-            .lock()
-            .expect("APPDATA test lock should not be poisoned");
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", temp_dir.path());
+        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
         let state = build_nonfatal_config_error_app_state(
             default_voice_pipeline_config(),
             super::embedded_cue_asset_paths(),
@@ -13670,10 +13549,6 @@ mod tests {
         let snapshot = get_app_snapshot_from_state(&state).expect("updated snapshot");
         let persisted = load_persisted_state().expect("updated state should reload");
 
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
         assert_eq!(accepted, requested);
         assert_eq!(snapshot.preferences, requested);
         assert_eq!(persisted.tts_enabled, Some(false));
@@ -13780,10 +13655,8 @@ mod tests {
 
     #[test]
     fn unrelated_saved_preferences_preserve_bounded_speech_choices_and_network_flags() {
-        let _appdata_lock = APPDATA_ENV_LOCK.lock().unwrap();
         let root = tempfile::tempdir().unwrap();
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", root.path());
+        let _storage_root = super::test_storage::ScopedRoot::new(root.path().to_path_buf());
         let saved = PersistedState {
             web_enabled: Some(false),
             speech_network_fallback: Some(false),
@@ -13797,10 +13670,6 @@ mod tests {
         super::persist_ui_theme(UiThemePayload::Light).unwrap();
         super::persist_selected_response_profile(ResponseProfilePayload::Quality).unwrap();
         let reloaded = load_persisted_state().unwrap();
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
         assert_eq!(reloaded.speech_language, saved.speech_language);
         assert_eq!(reloaded.speech_tts_provider, saved.speech_tts_provider);
         assert_eq!(reloaded.speech_tts_voice, saved.speech_tts_voice);
@@ -13813,12 +13682,8 @@ mod tests {
 
     #[test]
     fn canonical_preferences_wait_for_warming_tts_before_snapshotting() {
-        let _appdata_lock = APPDATA_ENV_LOCK
-            .lock()
-            .expect("APPDATA test lock should not be poisoned");
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", temp_dir.path());
+        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
         let state = Arc::new(build_nonfatal_config_error_app_state(
             default_voice_pipeline_config(),
             super::embedded_cue_asset_paths(),
@@ -13831,7 +13696,7 @@ mod tests {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let command_state = Arc::clone(&state);
-        let command = std::thread::spawn(move || {
+        let command = super::spawn_runtime_worker(move || {
             started_tx.send(()).expect("command start");
             result_tx
                 .send(tauri::async_runtime::block_on(set_preferences_from_state(
@@ -13855,10 +13720,6 @@ mod tests {
         command.join().expect("command thread");
         let snapshot = get_app_snapshot_from_state(&state).expect("updated snapshot");
 
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
         assert!(!accepted.tts_enabled);
         assert!(!snapshot.preferences.tts_enabled);
     }
@@ -13921,11 +13782,51 @@ mod tests {
         );
         let publication_state = super::PreferencePublicationState::new(&state);
         let before = state.prefetch_generation.load(Ordering::SeqCst);
+        *state.completion_update_guard.lock().unwrap() = Some(
+            begin_update_sensitive_operation(&state.update_installation_gate)
+                .expect("reserve synthetic completion lease"),
+        );
 
         super::clear_disabled_completion_after_publication(&publication_state)
             .expect("completion cleanup should succeed");
 
         assert_eq!(state.prefetch_generation.load(Ordering::SeqCst), before + 1);
+        assert!(state.completion_update_guard.lock().unwrap().is_none());
+        assert!(state.update_installation_gate.try_write().is_ok());
+    }
+
+    #[test]
+    fn shutdown_closes_prompt_admission_before_any_request_mutation() {
+        let state = build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            super::embedded_cue_asset_paths(),
+            String::from("synthetic unavailable assets"),
+        );
+        let phase = super::current_runtime_phase(&state.voice_pipeline_state).unwrap();
+        assert!(super::begin_exit_cleanup(&state));
+        let result = super::begin_registered_assistant_request(
+            &state,
+            "synthetic-after-exit",
+            "Synthetic question",
+            super::CompletionSource::Typed,
+        );
+        let admitted = result.is_ok();
+        drop(result);
+        assert!(
+            !admitted,
+            "exit must close canonical and physical admission"
+        );
+        assert!(!state
+            .conversation_session
+            .lock()
+            .unwrap()
+            .has_active_execution());
+        assert!(state.active_prompt.lock().unwrap().is_none());
+        assert_eq!(
+            super::current_runtime_phase(&state.voice_pipeline_state).unwrap(),
+            phase
+        );
+        assert_eq!(state.active_prompt_generation.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -14080,12 +13981,8 @@ mod tests {
 
     #[test]
     fn canonical_non_profile_shutdown_after_write_restores_exact_previous_state() {
-        let _appdata_lock = APPDATA_ENV_LOCK
-            .lock()
-            .expect("APPDATA test lock should not be poisoned");
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", temp_dir.path());
+        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
         let state = Arc::new(build_nonfatal_config_error_app_state(
             default_voice_pipeline_config(),
             super::embedded_cue_asset_paths(),
@@ -14101,7 +13998,7 @@ mod tests {
         requested.ui_theme = voxgolem_core::ipc::UiTheme::Light;
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let command_state = Arc::clone(&state);
-        let command = std::thread::spawn(move || {
+        let command = super::spawn_runtime_worker(move || {
             result_tx
                 .send(tauri::async_runtime::block_on(set_preferences_from_state(
                     requested,
@@ -14130,10 +14027,6 @@ mod tests {
         let snapshot = get_app_snapshot_from_state(&state).expect("unchanged snapshot");
         let persisted = load_persisted_state().expect("restored persisted state");
 
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
         assert_eq!(error.code(), voxgolem_core::ipc::CommandErrorCode::Busy);
         assert_eq!(snapshot.preferences, previous);
         assert_eq!(persisted, PersistedState::from(&previous));
@@ -14166,14 +14059,10 @@ mod tests {
 
     #[test]
     fn canonical_persistence_failure_does_not_publish_preferences() {
-        let _appdata_lock = APPDATA_ENV_LOCK
-            .lock()
-            .expect("APPDATA test lock should not be poisoned");
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let invalid_appdata = temp_dir.path().join("not-a-directory");
         fs::write(&invalid_appdata, b"file").expect("invalid APPDATA fixture");
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", &invalid_appdata);
+        let _storage_root = super::test_storage::ScopedRoot::new(invalid_appdata.clone());
         let state = build_nonfatal_config_error_app_state(
             default_voice_pipeline_config(),
             super::embedded_cue_asset_paths(),
@@ -14189,10 +14078,6 @@ mod tests {
             .expect_err("invalid persistence directory should reject the update");
         let snapshot = get_app_snapshot_from_state(&state).expect("unchanged snapshot");
 
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
         assert_eq!(error.code(), voxgolem_core::ipc::CommandErrorCode::Internal);
         assert_eq!(snapshot.preferences, previous);
         assert!(!state
@@ -14202,10 +14087,6 @@ mod tests {
 
     #[test]
     fn canonical_preferences_preserve_incompatible_persisted_state_bytes() {
-        let _appdata_lock = APPDATA_ENV_LOCK
-            .lock()
-            .expect("APPDATA test lock should not be poisoned");
-        let previous_appdata = std::env::var_os("APPDATA");
         let cases = [
             "unknown_field = true\n",
             "[future]\nvalue = 1\n",
@@ -14215,7 +14096,7 @@ mod tests {
         ];
         for (index, contents) in cases.into_iter().enumerate() {
             let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-            std::env::set_var("APPDATA", temp_dir.path());
+            let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
             let state_path = response_profile_state_path().expect("state path");
             fs::create_dir_all(state_path.parent().expect("state parent"))
                 .expect("state directory");
@@ -14244,10 +14125,6 @@ mod tests {
                 fs::read(&state_path).expect("state bytes"),
                 contents.as_bytes()
             );
-        }
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
         }
     }
 
@@ -14339,12 +14216,8 @@ mod tests {
 
     #[test]
     fn canonical_profile_startup_failure_keeps_previous_preferences() {
-        let _appdata_lock = APPDATA_ENV_LOCK
-            .lock()
-            .expect("APPDATA test lock should not be poisoned");
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", temp_dir.path());
+        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
         let state = missing_llama_app_state(temp_dir.path());
         let previous = get_app_snapshot_from_state(&state)
             .expect("initial snapshot")
@@ -14359,10 +14232,6 @@ mod tests {
         let snapshot = get_app_snapshot_from_state(&state).expect("restored snapshot");
         let persisted = load_persisted_state().expect("restored state should reload");
 
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
         assert_eq!(
             error.code(),
             voxgolem_core::ipc::CommandErrorCode::Unavailable
@@ -14887,14 +14756,12 @@ mod tests {
 
     #[test]
     fn update_installation_gate_excludes_new_and_active_operations() {
-        let gate = std::sync::Arc::new(tokio::sync::RwLock::new(()));
+        let gate = std::sync::Arc::new(super::UpdateActivity::default());
         let operation = begin_update_sensitive_operation(&gate).expect("begin operation");
-        assert!(std::sync::Arc::clone(&gate).try_write_owned().is_err());
+        assert!(gate.installation().is_err());
         drop(operation);
 
-        let installation = std::sync::Arc::clone(&gate)
-            .try_write_owned()
-            .expect("begin installation");
+        let installation = gate.installation().expect("begin installation");
         assert!(begin_update_sensitive_operation(&gate).is_err());
         drop(installation);
 
@@ -14966,18 +14833,30 @@ mod tests {
         ));
         let prompt_cleanup = state.prompt_cleanup.register();
         let worker_state = Arc::clone(&state);
-        let worker = tokio::spawn(async move {
+        let mut worker = tokio::spawn(async move {
             super::shutdown_runtime(&worker_state).await;
         });
-        while !state.exit_cleanup_started.load(Ordering::Acquire) {
-            tokio::task::yield_now().await;
-        }
-        assert!(!state.shutdown_complete.load(Ordering::Acquire));
+        let started = tokio::time::timeout(Duration::from_secs(5), async {
+            while !state.exit_cleanup_started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let incomplete = !state.shutdown_complete.load(Ordering::Acquire);
         drop(prompt_cleanup);
-        tokio::time::timeout(Duration::from_secs(2), worker)
-            .await
-            .unwrap()
-            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), &mut worker).await;
+        if result.is_err() {
+            worker.abort();
+        }
+        assert!(
+            started.is_ok(),
+            "shutdown must reserve exit before draining"
+        );
+        assert!(
+            incomplete,
+            "detached cleanup must still exclude shutdown completion"
+        );
+        result.unwrap().unwrap();
         assert!(state.shutdown_complete.load(Ordering::Acquire));
         super::shutdown_runtime(&state).await;
     }
@@ -15028,14 +14907,12 @@ mod tests {
 
     #[test]
     fn native_microphone_reservation_and_start_share_the_installation_gate() {
-        let gate = std::sync::Arc::new(tokio::sync::RwLock::new(()));
+        let gate = std::sync::Arc::new(super::UpdateActivity::default());
         let reservation = begin_native_microphone_operation(&gate).expect("reserve microphone");
-        assert!(std::sync::Arc::clone(&gate).try_write_owned().is_err());
+        assert!(gate.installation().is_err());
         drop(reservation);
 
-        let installation = std::sync::Arc::clone(&gate)
-            .try_write_owned()
-            .expect("begin installation");
+        let installation = gate.installation().expect("begin installation");
         assert!(begin_native_microphone_operation(&gate).is_err());
         drop(installation);
     }
@@ -15106,15 +14983,47 @@ mod tests {
     #[test]
     fn concurrent_tts_reservations_are_unique_and_bounded() {
         let state = std::sync::Arc::new(std::sync::Mutex::new(super::TtsPlaybackState::default()));
-        let mut reservations = (0..32)
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut releases = Vec::new();
+        let workers = (0..32)
             .map(|_| {
                 let state = std::sync::Arc::clone(&state);
+                let ready = ready_tx.clone();
+                let done = done_tx.clone();
+                let (release, start) = std::sync::mpsc::channel();
+                releases.push(release);
                 std::thread::spawn(move || {
-                    super::reserve_tts_playback_id(&state).expect("reserve playback")
+                    ready.send(()).expect("worker ready");
+                    let result = start
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(|error| error.to_string())
+                        .and_then(|()| super::reserve_tts_playback_id(&state));
+                    let _ = done.send(result);
                 })
             })
-            .map(|worker| worker.join().expect("reservation worker"))
             .collect::<Vec<_>>();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let ready = (0..32).try_for_each(|_| {
+            ready_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        });
+        // Always release before assertions: a setup failure must not strand workers.
+        for release in releases {
+            let _ = release.send(());
+        }
+        ready.expect("all reservation workers reach the start boundary");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut reservations = (0..32)
+            .map(|_| {
+                done_rx
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .expect("reservation completes within the phase bound")
+                    .expect("reserve playback")
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().expect("completed reservation worker");
+        }
         reservations.sort_unstable();
         assert_eq!(reservations, (1..=32).collect::<Vec<_>>());
 
@@ -15179,10 +15088,14 @@ mod tests {
                 .expect("begin completion");
             *app_state.completion_update_guard.lock().unwrap() = Some(guard);
 
-            if prompt.trim().is_empty() || prompt.len() > super::COMPLETION_PROMPT_MAX_BYTES {
-                clear_completion_request_state_locked(&app_state, false)
-                    .expect("invalid completion should clear state");
-            }
+            super::queue_completion_request(
+                super::CompletionSource::Typed,
+                1,
+                None,
+                prompt,
+                &app_state,
+            )
+            .expect("invalid input must retire its lease even after the predictor is unavailable");
 
             assert!(begin_update_installation(&app_state).is_ok());
         }
@@ -15357,10 +15270,8 @@ mod tests {
 
     #[test]
     fn request_admission_captures_network_permission_instead_of_reading_mutable_settings_later() {
-        let _appdata_lock = APPDATA_ENV_LOCK.lock().unwrap();
         let root = tempfile::tempdir().unwrap();
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", root.path());
+        let _storage_root = super::test_storage::ScopedRoot::new(root.path().to_path_buf());
         let state = super::build_nonfatal_config_error_app_state(
             default_voice_pipeline_config(),
             super::embedded_cue_asset_paths(),
@@ -15378,10 +15289,6 @@ mod tests {
         assert!(!registered.request.web_enabled);
         assert!(state.network_preferences.lock().unwrap().web_enabled);
         drop(registered);
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
     }
 
     #[test]
@@ -15408,8 +15315,6 @@ mod tests {
     use crate::wake_word::{WakeWordDetection, WakeWordRuntime};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
-
-    static APPDATA_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn prompt_request_ids_must_be_opaque_generated_identifiers() {
@@ -15634,6 +15539,96 @@ mod tests {
         let error = fit_review_history_to_prompt_budget(input).unwrap_err();
 
         assert_eq!(error, "review input exceeds bounds");
+    }
+
+    #[tokio::test]
+    async fn optional_review_admission_failure_skips_provider_and_resolves_successful_instant() {
+        use voxgolem_core::agent_pipeline::{ReviewInput, StageStatus, MAX_TEXT_BYTES};
+        use voxgolem_core::assistant::{
+            Content, InstantOutcome, ReviewOutcome, Stage, StageResult,
+        };
+        let state = build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            super::embedded_cue_asset_paths(),
+            "synthetic".into(),
+        );
+        state
+            .conversation_session
+            .lock()
+            .unwrap()
+            .replace_policy(
+                AssistantSettingsPayload {
+                    instant: InstantChoicePayload::CustomSolHigh,
+                    review_enabled: true,
+                    ..AssistantSettingsPayload::default()
+                }
+                .into(),
+            )
+            .unwrap();
+        let registered = super::begin_registered_assistant_request(
+            &state,
+            "synthetic-review-fallback",
+            "Synthetic question",
+            super::CompletionSource::Typed,
+        )
+        .unwrap();
+        let answer = Content::Text("Synthetic successful answer".into());
+        assert_eq!(
+            super::finish_assistant_request(
+                &state,
+                "synthetic-review-fallback",
+                registered.physical_generation,
+                registered.request.generation,
+                InstantOutcome::Complete(answer.clone()),
+            )
+            .unwrap(),
+            voxgolem_core::conversation::UpdateResult::Provisional(answer.clone())
+        );
+        let called = AtomicBool::new(false);
+        let input = ReviewInput {
+            original_request: "x".repeat(MAX_TEXT_BYTES + 1),
+            canonical_history: vec![],
+            instant: StageStatus::Success(answer.clone()),
+            deep: StageStatus::Failure("Deep stage disabled".into()),
+            materiality_policy: "Only material factual defects justify rewrite.".into(),
+            sources: vec![],
+        };
+        let error = super::dispatch_review(input, |_| async {
+            called.store(true, Ordering::Release);
+            panic!("invalid optional Review input must not reach the provider");
+        })
+        .await
+        .err()
+        .expect("real Review admission must reject the oversized field");
+        assert!(!called.load(Ordering::Acquire));
+        let resolved = super::accept_assistant_stage_if_active(
+            &state,
+            "synthetic-review-fallback",
+            registered.physical_generation,
+            registered.request.generation,
+            Stage::Review,
+            StageResult::Review(ReviewOutcome::Failure(error)),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved,
+            voxgolem_core::conversation::UpdateResult::Resolved {
+                content: answer.clone(),
+                final_stage: Stage::Review,
+            }
+        );
+        {
+            let mut session = state.conversation_session.lock().unwrap();
+            assert!(matches!(
+                session.settle(
+                    registered.request.generation,
+                    voxgolem_core::conversation::SettlementIntent::Success,
+                ),
+                voxgolem_core::conversation::SettlementResult::Applied(_)
+            ));
+            assert_eq!(session.turns().last().unwrap().answer.content, answer);
+        }
+        drop(registered);
     }
 
     #[test]
@@ -16854,21 +16849,21 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
 
         std::thread::scope(|scope| {
-            scope.spawn(|| {
+            let worker = scope.spawn(|| {
                 let result =
                     super::cancel_assistant_request(&app_state, request.request.generation);
                 sender.send(result).unwrap();
             });
+            let result = receiver.recv_timeout(Duration::from_secs(1));
+            drop(publication);
+            worker.join().expect("cancellation worker");
             assert!(matches!(
-                receiver
-                    .recv_timeout(Duration::from_secs(1))
-                    .expect("logical cancellation must not wait for event publication"),
+                result.expect("logical cancellation must not wait for event publication"),
                 voxgolem_core::conversation::SettlementResult::Applied(
                     voxgolem_core::conversation::AppliedOutcome::Cancelled
                 )
             ));
         });
-        drop(publication);
         drop(request);
     }
 
@@ -17122,7 +17117,7 @@ mod tests {
 
         std::thread::scope(|scope| {
             let app_state = &app_state;
-            scope.spawn(move || {
+            let worker = scope.spawn(move || {
                 started_sender.send(()).unwrap();
                 done_sender
                     .send(reset_conversation_execution(
@@ -17136,18 +17131,21 @@ mod tests {
                     ))
                     .unwrap();
             });
-            started_receiver.recv().unwrap();
-            assert!(done_receiver
-                .recv_timeout(Duration::from_millis(20))
-                .is_err());
-            assert!(app_state
+            let started = started_receiver.recv_timeout(Duration::from_secs(5));
+            let premature = done_receiver.recv_timeout(Duration::from_millis(20));
+            let active = app_state
                 .conversation_session
                 .lock()
                 .unwrap()
-                .has_active_execution());
+                .has_active_execution();
+            let finished_early = premature.is_ok();
             drop(publication);
-            done_receiver
-                .recv_timeout(Duration::from_secs(1))
+            let result = premature.or_else(|_| done_receiver.recv_timeout(Duration::from_secs(5)));
+            worker.join().expect("reset worker");
+            assert!(started.is_ok(), "reset worker must start");
+            assert!(!finished_early, "reset must wait for terminal publication");
+            assert!(active);
+            result
                 .expect("reset should continue after terminal publication")
                 .expect("reset should succeed");
         });
@@ -17285,9 +17283,13 @@ mod tests {
                 })
                 .await
             });
-            started_receiver
-                .await
-                .expect("setup future should be polled");
+            let started = tokio::time::timeout(Duration::from_secs(5), started_receiver).await;
+            if started.is_err() {
+                task.abort();
+                let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+                panic!("setup future was not polled before its failure deadline");
+            }
+            started.unwrap().expect("setup future should be polled");
             signal.send_replace(true);
             assert!(tokio::time::timeout(Duration::from_secs(1), task)
                 .await
@@ -17324,9 +17326,13 @@ mod tests {
                 })
                 .await
             });
-            started_receiver
-                .await
-                .expect("setup future should be polled");
+            let started = tokio::time::timeout(Duration::from_secs(5), started_receiver).await;
+            if started.is_err() {
+                task.abort();
+                let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+                panic!("setup future was not polled before its failure deadline");
+            }
+            started.unwrap().expect("setup future should be polled");
             signal.send_replace(true);
             assert!(tokio::time::timeout(Duration::from_secs(1), task)
                 .await
@@ -17370,15 +17376,88 @@ mod tests {
     }
 
     #[test]
-    fn failed_instant_stage_is_not_reported_as_successful_telemetry() {
-        let event = PromptExecutionEventPayload::Stage {
-            stage: StagePayload::Instant,
-            status: StageStatusPayload::Failed,
-            detail: Some(String::from("transport failed")),
-        };
-        let value = serde_json::to_value(event).unwrap();
-        assert_eq!(value["stage"], "instant");
-        assert_eq!(value["status"], "failed");
+    fn stage_telemetry_uses_the_provider_outcome_not_pending_optional_stages_or_request_text() {
+        for succeeded in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let _storage_root =
+                super::test_storage::ScopedRoot::new(directory.path().to_path_buf());
+            let state = build_nonfatal_config_error_app_state(
+                default_voice_pipeline_config(),
+                super::embedded_cue_asset_paths(),
+                "synthetic".into(),
+            );
+            state
+                .conversation_session
+                .lock()
+                .unwrap()
+                .replace_policy(
+                    AssistantSettingsPayload {
+                        instant: InstantChoicePayload::CustomSolHigh,
+                        review_enabled: true,
+                        ..AssistantSettingsPayload::default()
+                    }
+                    .into(),
+                )
+                .unwrap();
+            let id = format!("synthetic-telemetry-{succeeded}");
+            let request = super::begin_registered_assistant_request(
+                &state,
+                &id,
+                "SYNTHETIC_PRIVATE_PROMPT_SENTINEL",
+                super::CompletionSource::Typed,
+            )
+            .unwrap();
+            let outcome = if succeeded {
+                voxgolem_core::assistant::InstantOutcome::Complete(
+                    voxgolem_core::assistant::Content::Text(
+                        "SYNTHETIC_PRIVATE_ANSWER_SENTINEL".into(),
+                    ),
+                )
+            } else {
+                voxgolem_core::assistant::InstantOutcome::Failure(
+                    "SYNTHETIC_PRIVATE_ERROR_SENTINEL".into(),
+                )
+            };
+            let update = super::finish_assistant_request(
+                &state,
+                &id,
+                request.physical_generation,
+                request.request.generation,
+                outcome,
+            )
+            .unwrap();
+            if succeeded {
+                assert_eq!(
+                    update,
+                    voxgolem_core::conversation::UpdateResult::Provisional(
+                        voxgolem_core::assistant::Content::Text(
+                            "SYNTHETIC_PRIVATE_ANSWER_SENTINEL".into()
+                        )
+                    )
+                );
+            }
+            let reported = state
+                .conversation
+                .instant_stage_succeeded(request.request.generation)
+                .unwrap();
+            assert_eq!(reported, succeeded);
+            super::record_assistant_stage_telemetry(
+                &state,
+                &id,
+                &request.request,
+                super::telemetry::Stage::Generation,
+                super::instant_telemetry_identity(request.request.instant_model),
+                7,
+                reported,
+            );
+            let bytes =
+                fs::read_to_string(directory.path().join("VoxGolem/telemetry.jsonl")).unwrap();
+            let value: serde_json::Value = serde_json::from_str(bytes.trim()).unwrap();
+            assert_eq!(value["status"], if succeeded { "ok" } else { "error" });
+            assert_eq!(value["duration_ms"], 7);
+            assert!(!bytes.contains("SYNTHETIC_PRIVATE_"));
+            drop(request);
+        }
     }
 
     #[test]
@@ -17415,9 +17494,6 @@ mod tests {
 
     #[test]
     fn load_llama_cpp_system_prompt_reads_soul_file_from_appdata() {
-        let _appdata_lock = APPDATA_ENV_LOCK
-            .lock()
-            .expect("APPDATA test lock should not be poisoned");
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let appdata_path = temp_dir.path().join("VoxGolem");
         std::fs::create_dir_all(&appdata_path).expect("appdata path should be creatable");
@@ -17427,15 +17503,9 @@ mod tests {
         )
         .expect("SOUL.md should be writable");
 
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", temp_dir.path());
+        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
 
         let result = load_llama_cpp_system_prompt();
-
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
 
         assert_eq!(
             result.expect("SOUL.md should load"),
@@ -17919,23 +17989,14 @@ mod tests {
 
     #[test]
     fn automatic_update_preferences_default_on_and_persist_independently() {
-        let _appdata_lock = APPDATA_ENV_LOCK
-            .lock()
-            .expect("APPDATA test lock should not be poisoned");
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", temp_dir.path());
+        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
 
         assert!(load_auto_update_download().expect("missing download preference should default"));
         assert!(load_auto_update_install().expect("missing install preference should default"));
         persist_auto_update_download(false).expect("download preference should persist");
         persist_auto_update_install(false).expect("install preference should persist");
         let persisted = load_persisted_state().expect("preferences should reload");
-
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
 
         assert_eq!(persisted.auto_update_download, Some(false));
         assert_eq!(persisted.auto_update_install, Some(false));
@@ -17963,12 +18024,8 @@ mod tests {
 
     #[test]
     fn persist_assistant_settings_preserves_legacy_profile() {
-        let _appdata_lock = APPDATA_ENV_LOCK
-            .lock()
-            .expect("APPDATA test lock should not be poisoned");
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", temp_dir.path());
+        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
 
         persist_selected_response_profile(ResponseProfilePayload::Quality)
             .expect("profile should persist");
@@ -17980,11 +18037,6 @@ mod tests {
         persist_assistant_settings(settings).expect("assistant settings should persist");
         let persisted = load_persisted_state().expect("state should reload");
 
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
-
         assert_eq!(
             persisted.selected_response_profile,
             Some(ResponseProfilePayload::Quality)
@@ -17994,12 +18046,8 @@ mod tests {
 
     #[test]
     fn persist_validated_preferences_replaces_every_preference_in_one_state() {
-        let _appdata_lock = APPDATA_ENV_LOCK
-            .lock()
-            .expect("APPDATA test lock should not be poisoned");
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", temp_dir.path());
+        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
         let previous = PersistedState {
             web_enabled: Some(true),
             speech_network_fallback: Some(true),
@@ -18038,10 +18086,6 @@ mod tests {
             .expect("complete preferences should persist");
         let persisted = load_persisted_state().expect("state should reload");
 
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
         assert_eq!(replaced, previous);
         assert_eq!(
             persisted,
@@ -18071,13 +18115,48 @@ mod tests {
     }
 
     #[test]
+    fn canonical_rollback_preserves_later_update_preferences() {
+        let directory = tempfile::tempdir().unwrap();
+        let _root = super::test_storage::ScopedRoot::new(directory.path().to_path_buf());
+        let state = build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            super::embedded_cue_asset_paths(),
+            "synthetic".into(),
+        );
+        let initial = get_app_snapshot_from_state(&state).unwrap().preferences;
+        persist_state(PersistedState::from(&initial)).unwrap();
+        let mut proposed = initial.clone();
+        proposed.ui_theme = voxgolem_core::ipc::UiTheme::Light;
+        let previous = persist_validated_preferences(&proposed).unwrap();
+        super::persist_auto_update_install(false).unwrap();
+        super::restore_persisted_state(previous, &proposed).unwrap();
+        let restored = load_persisted_state().unwrap();
+        assert_eq!(restored.ui_theme, PersistedState::from(&initial).ui_theme);
+        assert_eq!(restored.auto_update_install, Some(false));
+    }
+
+    #[test]
+    fn canonical_rollback_never_replaces_newer_preferences() {
+        let directory = tempfile::tempdir().unwrap();
+        let _root = super::test_storage::ScopedRoot::new(directory.path().to_path_buf());
+        let state = build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            super::embedded_cue_asset_paths(),
+            "synthetic".into(),
+        );
+        let initial = get_app_snapshot_from_state(&state).unwrap().preferences;
+        let previous = persist_validated_preferences(&initial).unwrap();
+        super::persist_ui_text_size(UiTextSizePayload::ExtraLarge).unwrap();
+        let path = response_profile_state_path().unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert!(super::restore_persisted_state(previous, &initial).is_err());
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
     fn startup_cleanup_removes_only_recognized_orphan_state_temps() {
-        let _appdata_lock = APPDATA_ENV_LOCK
-            .lock()
-            .expect("APPDATA test lock should not be poisoned");
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", temp_dir.path());
+        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
         let state_dir = temp_dir.path().join("VoxGolem");
         fs::create_dir_all(&state_dir).expect("state directory");
         let canonical = state_dir.join("state.toml");
@@ -18098,28 +18177,27 @@ mod tests {
         let state_lock = lock_persisted_state_file(&canonical).expect("state lock");
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (cleanup_tx, cleanup_rx) = std::sync::mpsc::channel();
-        let cleanup = std::thread::spawn(move || {
+        let cleanup = super::spawn_runtime_worker(move || {
             cleanup_tx
                 .send(cleanup_orphan_state_temps_with(|| {
                     started_tx.send(()).expect("cleanup started");
                 }))
                 .expect("cleanup result");
         });
-        started_rx
-            .recv()
-            .expect("cleanup should reach lock boundary");
-        assert!(cleanup_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        let started = started_rx.recv_timeout(Duration::from_secs(5));
+        let blocked = cleanup_rx.recv_timeout(Duration::from_millis(20));
         drop(state_lock);
+        started.expect("cleanup should reach lock boundary within the bound");
+        assert!(matches!(
+            blocked,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
         cleanup_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("cleanup result")
             .expect("orphan cleanup should succeed");
         cleanup.join().expect("cleanup worker");
 
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
         assert!(canonical.is_file());
         assert!(!orphan.exists());
         assert!(unrelated.is_file());
@@ -18128,12 +18206,8 @@ mod tests {
 
     #[test]
     fn exit_rolls_back_a_profile_persisted_before_publication() {
-        let _appdata_lock = APPDATA_ENV_LOCK
-            .lock()
-            .expect("APPDATA test lock should not be poisoned");
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", temp_dir.path());
+        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
         let previous_settings = AssistantSettingsPayload::default();
         super::persist_profile_and_assistant_settings(
             ResponseProfilePayload::Fast,
@@ -18161,10 +18235,6 @@ mod tests {
         });
         let persisted = load_persisted_state().expect("state should reload");
 
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
         assert_eq!(
             persisted.selected_response_profile,
             Some(ResponseProfilePayload::Fast)
@@ -18188,72 +18258,41 @@ mod tests {
 
     #[test]
     fn load_persisted_tts_enabled_reads_boolean_flag_from_state_file() {
-        let _appdata_lock = APPDATA_ENV_LOCK
-            .lock()
-            .expect("APPDATA test lock should not be poisoned");
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", temp_dir.path());
+        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
 
         persist_tts_enabled(true).expect("tts flag should be written");
         let persisted = load_persisted_tts_enabled().expect("tts flag should load");
-
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
 
         assert_eq!(persisted, Some(true));
     }
 
     #[test]
     fn load_persisted_ui_text_size_reads_text_size_flag_from_state_file() {
-        let _appdata_lock = APPDATA_ENV_LOCK
-            .lock()
-            .expect("APPDATA test lock should not be poisoned");
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", temp_dir.path());
+        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
 
         persist_ui_text_size(UiTextSizePayload::Large).expect("text size should be written");
         let persisted = load_persisted_ui_text_size().expect("text size should load");
-
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
 
         assert_eq!(persisted, Some(UiTextSizePayload::Large));
     }
 
     #[test]
     fn load_persisted_ui_theme_reads_theme_flag_from_state_file() {
-        let _appdata_lock = APPDATA_ENV_LOCK
-            .lock()
-            .expect("APPDATA test lock should not be poisoned");
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", temp_dir.path());
+        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
 
         persist_ui_theme(UiThemePayload::Light).expect("theme should be written");
         let persisted = load_persisted_ui_theme().expect("theme should load");
-
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
 
         assert_eq!(persisted, Some(UiThemePayload::Light));
     }
 
     #[test]
     fn persist_selected_response_profile_preserves_tts_enabled_flag() {
-        let _appdata_lock = APPDATA_ENV_LOCK
-            .lock()
-            .expect("APPDATA test lock should not be poisoned");
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", temp_dir.path());
+        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
 
         persist_tts_enabled(true).expect("tts flag should be written");
         persist_selected_response_profile(ResponseProfilePayload::Quality)
@@ -18261,33 +18300,19 @@ mod tests {
 
         let persisted = load_persisted_tts_enabled().expect("tts flag should load");
 
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
-
         assert_eq!(persisted, Some(true));
     }
 
     #[test]
     fn persist_ui_text_size_preserves_profile_and_tts_enabled_flags() {
-        let _appdata_lock = APPDATA_ENV_LOCK
-            .lock()
-            .expect("APPDATA test lock should not be poisoned");
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", temp_dir.path());
+        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
 
         persist_selected_response_profile(ResponseProfilePayload::Quality)
             .expect("profile state should be written");
         persist_tts_enabled(true).expect("tts flag should be written");
         persist_ui_text_size(UiTextSizePayload::Small).expect("text size should be written");
         let persisted = load_persisted_state().expect("persisted state should load");
-
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
 
         assert_eq!(
             persisted.selected_response_profile,
@@ -18299,12 +18324,8 @@ mod tests {
 
     #[test]
     fn persist_ui_theme_preserves_existing_state_flags() {
-        let _appdata_lock = APPDATA_ENV_LOCK
-            .lock()
-            .expect("APPDATA test lock should not be poisoned");
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", temp_dir.path());
+        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
 
         persist_selected_response_profile(ResponseProfilePayload::Quality)
             .expect("profile state should be written");
@@ -18312,11 +18333,6 @@ mod tests {
         persist_ui_text_size(UiTextSizePayload::ExtraLarge).expect("text size should be written");
         persist_ui_theme(UiThemePayload::Dark).expect("theme should be written");
         let persisted = load_persisted_state().expect("persisted state should load");
-
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
 
         assert_eq!(
             persisted.selected_response_profile,
@@ -18329,63 +18345,36 @@ mod tests {
 
     #[test]
     fn resolve_effective_tts_enabled_prefers_persisted_state() {
-        let _appdata_lock = APPDATA_ENV_LOCK
-            .lock()
-            .expect("APPDATA test lock should not be poisoned");
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", temp_dir.path());
+        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
 
         persist_tts_enabled(true).expect("tts flag should be written");
         let effective = resolve_effective_tts_enabled(false, true);
-
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
 
         assert!(effective);
     }
 
     #[test]
     fn resolve_effective_tts_enabled_ignores_persisted_true_without_model() {
-        let _appdata_lock = APPDATA_ENV_LOCK
-            .lock()
-            .expect("APPDATA test lock should not be poisoned");
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", temp_dir.path());
+        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
 
         persist_tts_enabled(true).expect("tts flag should be written");
         let effective = resolve_effective_tts_enabled(false, false);
-
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
 
         assert!(!effective);
     }
 
     #[test]
     fn persist_selected_response_profile_writes_state_file_in_appdata() {
-        let _appdata_lock = APPDATA_ENV_LOCK
-            .lock()
-            .expect("APPDATA test lock should not be poisoned");
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", temp_dir.path());
+        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
 
         persist_selected_response_profile(ResponseProfilePayload::Quality)
             .expect("profile state should be written");
         let state_path = response_profile_state_path().expect("state path should resolve");
         let state_contents =
             std::fs::read_to_string(&state_path).expect("state file should be readable");
-
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
 
         assert!(state_path
             .to_string_lossy()
@@ -18422,19 +18411,10 @@ mod tests {
 
     #[test]
     fn runtime_log_path_resolves_in_appdata_logs_directory() {
-        let _appdata_lock = APPDATA_ENV_LOCK
-            .lock()
-            .expect("APPDATA test lock should not be poisoned");
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", temp_dir.path());
+        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
 
         let log_path = runtime_log_path().expect("runtime log path should resolve");
-
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
 
         assert!(log_path
             .to_string_lossy()
@@ -18444,43 +18424,25 @@ mod tests {
 
     #[test]
     fn append_tts_runtime_log_line_writes_tts_tagged_entry() {
-        let _appdata_lock = APPDATA_ENV_LOCK
-            .lock()
-            .expect("APPDATA test lock should not be poisoned");
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", temp_dir.path());
+        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
 
         super::append_tts_runtime_log_line(true, "runtime initialized successfully")
             .expect("runtime log write should succeed");
         let log_path = runtime_log_path().expect("runtime log path should resolve");
         let contents = std::fs::read_to_string(&log_path).expect("runtime log should be readable");
 
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
-
         assert!(contents.contains("[tts] runtime initialized successfully"));
     }
 
     #[test]
     fn append_tts_runtime_log_line_skips_file_when_disabled() {
-        let _appdata_lock = APPDATA_ENV_LOCK
-            .lock()
-            .expect("APPDATA test lock should not be poisoned");
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let previous_appdata = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", temp_dir.path());
+        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
 
         super::append_tts_runtime_log_line(false, "runtime initialized successfully")
             .expect("disabled runtime log write should be a no-op");
         let log_path = runtime_log_path().expect("runtime log path should resolve");
-
-        match previous_appdata {
-            Some(value) => std::env::set_var("APPDATA", value),
-            None => std::env::remove_var("APPDATA"),
-        }
 
         assert!(!log_path.exists());
     }
@@ -18548,30 +18510,33 @@ mod tests {
 
     #[test]
     fn ingest_audio_processing_is_independent_of_response_backend_lock() {
-        let operation_lock = Mutex::new(());
-        let _submit_guard = super::lock_response_backend_operation(&operation_lock)
-            .expect("lock should be acquired");
-
-        let config = super::default_voice_pipeline_config();
-        let ready_state = voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
-            &voxgolem_core::voice_pipeline::VoicePipelineState::new(config)
-                .expect("voice pipeline should initialize"),
-            config,
-            voxgolem_core::voice_pipeline::VoicePipelineEvent::StartupValidated,
-        )
-        .expect("startup validation should succeed")
-        .0;
-        let listening_state = super::ingest_audio_frame_with_optional_wake_word_detection(
-            &ready_state,
-            config,
-            vec![0.1, 0.2, 0.3],
-            Some(100),
-        )
-        .expect("wake frame should still be processed while response generation is locked");
-        assert_eq!(
-            listening_state.session().runtime().phase(),
-            voxgolem_core::runtime::RuntimePhase::Listening
+        let state = build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            super::embedded_cue_asset_paths(),
+            "synthetic".into(),
         );
+        let response_operation = state.response_backend_operation_lock.lock().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let result = super::ingest_audio_frame_from_state(
+                    vec![0.1, 0.2, 0.3],
+                    Some("synthetic-frame".into()),
+                    &state,
+                )
+                .map(|ingested| ingested.response);
+                sender.send(result).unwrap();
+            });
+            let result = receiver.recv_timeout(Duration::from_secs(5));
+            drop(response_operation);
+            worker.join().expect("frame ingestion worker");
+            let response = result
+                .expect("actual frame ingestion must not wait for response ownership")
+                .unwrap();
+            assert_eq!(response.runtime_phase, RuntimePhasePayload::Sleeping);
+            assert_eq!(response.preroll_samples, 3);
+            assert_eq!(response.utterance_samples, 0);
+        });
     }
 
     #[test]

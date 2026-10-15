@@ -13,6 +13,7 @@ afterEach(() => {
   containers.length = 0
   Reflect.deleteProperty(window, '__TAURI_INTERNALS__')
   vi.restoreAllMocks()
+  vi.useRealTimers()
 })
 
 describe('WakeDiagnostics', () => {
@@ -117,17 +118,23 @@ describe('WakeDiagnostics', () => {
   })
 
   it('ignores late poll responses after unmount', async () => {
+    vi.useFakeTimers()
     const poll = deferred<unknown>()
     const invoke = vi.fn(async (command: string) => command === 'get_wake_diagnostics' ? poll.promise : diagnosticSnapshot({ enabled: true }))
     installTauri(invoke)
     const container = await render()
     await click(container, 'Wake diagnostics')
     await click(container, 'Start collection')
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000) })
+    expect(invoke).toHaveBeenCalledWith('get_wake_diagnostics', undefined)
     const root = roots[0]
     if (!root) throw new Error('missing test root')
     await act(async () => { root.unmount() })
     await act(async () => { poll.resolve(diagnosticSnapshot()); await poll.promise })
     expect(container.textContent).toBe('')
+    const polls = invoke.mock.calls.filter(([command]) => command === 'get_wake_diagnostics').length
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
+    expect(invoke.mock.calls.filter(([command]) => command === 'get_wake_diagnostics')).toHaveLength(polls)
   })
 
   it('ignores an in-flight poll after collection has stopped', async () => {
@@ -239,7 +246,6 @@ describe('WakeDiagnostics', () => {
     oldStart.resolve(diagnosticSnapshot({ enabled: true }))
     await act(async () => {
       await oldStart.promise
-      for (let index = 0; index < 12; index += 1) await Promise.resolve()
     })
     expect(operations).toEqual(['start-1', 'old-start-resolved', 'cleanup-stop', 'start-2', 'new-start-resolved'])
     expect(backendEnabled).toBe(true)
@@ -291,7 +297,6 @@ describe('WakeDiagnostics', () => {
     oldStop.resolve(diagnosticSnapshot({ enabled: false }))
     await act(async () => {
       await oldStop.promise
-      for (let index = 0; index < 12; index += 1) await Promise.resolve()
     })
     expect(operations).toEqual(['new-start', 'old-stop', 'old-stop-resolved', 'unmount-cleanup', 'new-start'])
     expect(backendEnabled).toBe(true)
@@ -339,7 +344,6 @@ describe('WakeDiagnostics', () => {
     oldMark.resolve(diagnosticSnapshot({ enabled: true, events: [markerEvent()] }))
     await act(async () => {
       await oldMark.promise
-      for (let index = 0; index < 12; index += 1) await Promise.resolve()
     })
 
     expect(operations).toEqual(['old-start', 'old-mark', 'old-mark-resolved', 'cleanup', 'new-start'])

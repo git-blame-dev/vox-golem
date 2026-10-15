@@ -167,7 +167,7 @@ class AssistantInputRuntimeTest {
             val result = f.runtime.stop(started.session!!)
             assertFalse(result.isDone); assertTrue(f.micClosed); assertTrue(f.ports.single().ended)
             f.control(f.watchReply(InputKind.FINAL, 3, "synthetic final"))
-            assertTrue(result.join().authoritative); assertEquals("synthetic final", result.join().text)
+            assertTrue(result.get(2, java.util.concurrent.TimeUnit.SECONDS).authoritative); assertEquals("synthetic final", result.get(2, java.util.concurrent.TimeUnit.SECONDS).text)
             assertTrue(f.ports.single().sent.all { it.kind in setOf(InputKind.START, InputKind.STOP) })
         } finally { f.runtime.close() }
     }

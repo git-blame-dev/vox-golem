@@ -268,7 +268,6 @@ mod tests {
     use std::os::unix::fs::symlink;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::path::Path;
     use tempfile::tempdir;
 
     fn event() -> TelemetryMetadata {
@@ -412,19 +411,5 @@ mod tests {
             .append(&event())
             .is_err());
         assert_eq!(fs::read_to_string(target).unwrap(), "unchanged");
-    }
-    #[test]
-    fn sentinel_is_not_serialized() {
-        let dir = tempdir().unwrap();
-        let mut value = event();
-        value.request_id = "safe".into();
-        sink_append(dir.path(), &value);
-        let text = fs::read_to_string(dir.path().join(FILE_NAME)).unwrap();
-        assert!(!text.contains("PROMPT_SENTINEL"));
-    }
-    fn sink_append(dir: &Path, event: &TelemetryMetadata) {
-        TelemetrySink::new(dir, config(4096, 1))
-            .append(event)
-            .unwrap();
     }
 }

@@ -65,12 +65,12 @@ class ConversationLoopController(
         observers += observer; main.post { if (observer in observers) observer(state) }
         return AutoCloseable { observers -= observer }
     }
-    fun setForeground(visible: Boolean) {
-        if (!visible) { retainInput(epoch.getAndIncrement()); engine.stop() }
+    fun setForeground(visible: Boolean, retireGeneration: Boolean = true) {
+        if (!visible) { retainInput(epoch.getAndIncrement()); if (retireGeneration) engine.stop() }
         dictation.setForeground(visible); output.setForeground(visible)
         main.post {
             foreground = visible
-            if (!visible) { cancelOwners(); publish(state.copy(phase = LoopPhase.PAUSED)) }
+            if (!visible) { cancelOwners(retireGeneration); publish(state.copy(phase = LoopPhase.PAUSED)) }
         }
     }
     /** Foregrounding alone never restarts. Call this only for deliberate visible user consent. */
@@ -177,7 +177,7 @@ class ConversationLoopController(
         dictation.stop(); output.stop(); engine.stop()
         main.post { clearPending(); publish(state.copy(phase = LoopPhase.IDLE, error = null)) }
     }
-    private fun cancelOwners() { clearPending(); dictation.stop(); output.stop(); engine.stop() }
+    private fun cancelOwners(retireGeneration: Boolean = true) { clearPending(); dictation.stop(); output.stop(); if (retireGeneration) engine.stop() }
     private fun retainInput(ticket: Long) {
         val input = dictation.snapshot()
         if (listeningEpoch == ticket && state.phase == LoopPhase.LISTENING && input.utterance == utterance && inputStillOwned() &&

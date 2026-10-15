@@ -1,6 +1,7 @@
 package dev.gitblame.voxgolem.capture
 
 import android.content.Context
+import com.google.android.gms.tasks.Task
 import com.google.android.gms.tasks.Tasks
 import com.google.android.gms.wearable.ChannelClient
 import com.google.android.gms.wearable.DataEvent
@@ -10,7 +11,6 @@ import com.google.android.gms.wearable.Wearable
 import org.json.JSONObject
 import java.io.DataInputStream
 import java.io.File
-import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
@@ -34,8 +34,8 @@ import java.util.concurrent.atomic.AtomicReference
 internal class CaptureChannelReceiver(
     context: Context,
     private val coordinator: PhoneCaptureCoordinator = PhoneCaptureCoordinator.shared(context.applicationContext),
-    private val acquireInput: (ChannelClient.Channel) -> InputStream = channelInput(context.applicationContext),
-    private val closeChannel: (ChannelClient.Channel) -> Unit = channelCloser(context.applicationContext),
+    private val acquireInput: ((ChannelClient.Channel) -> InputStream)? = null,
+    private val closeChannel: ((ChannelClient.Channel) -> Unit)? = null,
     private val now: () -> Long = { android.os.SystemClock.elapsedRealtime() },
     liveExecutor: (() -> ExecutorService) = { readerExecutor() },
     archiveExecutor: (() -> ExecutorService) = { readerExecutor() },
@@ -46,6 +46,11 @@ internal class CaptureChannelReceiver(
             allowCoreThreadTimeOut(true)
         }
     },
+    private val inputTask: (ChannelClient.Channel) -> Task<InputStream> = { Wearable.getChannelClient(context.applicationContext).getInputStream(it) },
+    private val closeTask: (ChannelClient.Channel) -> Task<Void> = { Wearable.getChannelClient(context.applicationContext).close(it) },
+    private val retirements: CaptureChannelRetirementOwner = processRetirements,
+    private val inputTimeoutMs: Long = 5_000,
+    private val observeNativeClosures: () -> Unit = { observeClosures(context.applicationContext) },
 ) {
     private val appContext = context.applicationContext
     private val repository by lazy { CaptureRepository(appContext) }
@@ -100,23 +105,50 @@ internal class CaptureChannelReceiver(
     }
 
     fun onChannelOpened(channel: ChannelClient.Channel) {
+        if (openChannels.containsKey(channel) || channelLifetimes.containsKey(channel)) return
+        val closedBeforeAdoption = AtomicBoolean(false)
+        if (pendingNativeClosures.putIfAbsent(channel, closedBeforeAdoption) != null) return
+        if (closeChannel == null) runCatching { observeNativeClosures() }
+        retirements.retryFailedRetirements()
+        lateinit var lifetime: CaptureChannelLifetime
+        try {
+            lifetime = retirements.awaitReservation(15 * 60_000L) {
+                channelLifetimes.remove(channel, lifetime)
+                pendingNativeClosures.remove(channel, closedBeforeAdoption)
+            }
+        } catch (failure: Exception) {
+            pendingNativeClosures.remove(channel, closedBeforeAdoption)
+            throw failure
+        }
+        if (channelLifetimes.putIfAbsent(channel, lifetime) != null) {
+            pendingNativeClosures.remove(channel, closedBeforeAdoption)
+            lifetime.nativeAcquisitionFailed(); return
+        }
+        lifetime.acquiredNative { completed ->
+            val synchronousClose = closeChannel
+            if (synchronousClose != null) completed(runCatching { synchronousClose(channel) }.isSuccess)
+            else closeTask(channel).addOnCompleteListener(DIRECT) { completed(it.isSuccessful) }
+        }
+        pendingNativeClosures.remove(channel, closedBeforeAdoption)
+        if (closedBeforeAdoption.get()) lifetime.confirmNativeRetired()
+        if (lifetime.isRetired || Thread.currentThread().isInterrupted) { lifetime.close(); return }
         if (isWatch()) {
-            runCatching { closeChannel(channel) }
+            lifetime.close()
             return
         }
         val liveMatch = Regex("^${Regex.escape(CaptureWire.LIVE)}/([0-9a-fA-F-]{36})/([0-9a-fA-F-]{36})$").matchEntire(channel.path)
         val archiveMatch = Regex("^${Regex.escape(CaptureWire.ARCHIVE)}/([0-9a-fA-F-]{36})/([0-9a-fA-F-]{36})$").matchEntire(channel.path)
         if (liveMatch == null && archiveMatch == null) {
-            runCatching { closeChannel(channel) }
+            lifetime.close()
             return
         }
         val match = liveMatch ?: archiveMatch!!
         if (!coordinator.canReceiveArchive(match.groupValues[1], channel.nodeId)) {
             coordinator.rejectOrigin(match.groupValues[1], channel.nodeId)
-            runCatching { closeChannel(channel) }
+            lifetime.close()
             return
         }
-        val owned = ChannelReader(channel, match.groupValues[1], match.groupValues[2], liveMatch != null)
+        val owned = ChannelReader(channel, match.groupValues[1], match.groupValues[2], liveMatch != null, lifetime)
         val admitted = synchronized(openChannels) {
             if (openChannels.containsKey(channel)) return
             if (destroyed || !owned.register()) false
@@ -124,7 +156,7 @@ internal class CaptureChannelReceiver(
         }
         if (!admitted) {
             if (liveMatch != null) coordinator.rejectLiveInput(match.groupValues[1], match.groupValues[2], channel.nodeId)
-            runCatching { closeChannel(channel) }
+            lifetime.close()
             return
         }
         val started = synchronized(openChannels) {
@@ -138,11 +170,11 @@ internal class CaptureChannelReceiver(
         private val captureId: String,
         private val sessionId: String,
         private val live: Boolean,
+        private val lifetime: CaptureChannelLifetime,
     ) {
         private val timing by lazy { CaptureTiming(appContext, if (live) "phone-live-channel" else "phone-archive-channel") }
         private val lastProgress = AtomicLong(now())
         private val retired = AtomicBoolean(false)
-        private val openedInput = AtomicReference<InputStream?>()
         private val deadline = AtomicReference<ScheduledFuture<*>?>()
         private val closeInput: () -> Unit = { retire(null) }
 
@@ -167,16 +199,29 @@ internal class CaptureChannelReceiver(
             if (retired.get()) return
             timing.mark("reader-started")
             val input = if (retired.get()) null else runCatching {
-                acquireInput(channel)
+                lifetime.beginStreamAcquisition()
+                val synchronousInput = acquireInput
+                if (synchronousInput != null) {
+                    val acquired = try { synchronousInput(channel) } catch (failure: Exception) {
+                        lifetime.streamAcquisitionCompleted(null); throw failure
+                    }
+                    lifetime.streamAcquisitionCompleted(acquired)
+                    acquired
+                } else {
+                    val acquiring = try { inputTask(channel) } catch (failure: Exception) {
+                        lifetime.streamAcquisitionCompleted(null); throw failure
+                    }
+                    acquiring.addOnCompleteListener(DIRECT) { lifetime.streamAcquisitionCompleted(if (it.isSuccessful) it.result else null) }
+                    Tasks.await(acquiring, inputTimeoutMs, TimeUnit.MILLISECONDS)
+                }
             }.getOrNull()
             if (input == null) {
                 retire(if (live) "live-input-unavailable" else "archive-input-unavailable")
                 timing.finish("input-unavailable")
                 return
             }
-            openedInput.set(input)
-            if (retired.get()) {
-                runCatching { openedInput.getAndSet(null)?.close() }
+            if (retired.get() || lifetime.isRetired) {
+                retire(null)
                 return
             }
             timing.mark("input-ready")
@@ -184,7 +229,7 @@ internal class CaptureChannelReceiver(
                 if (live) receiveLive(channel, DataInputStream(input), captureId, sessionId, closeInput, timing) {
                     lastProgress.set(now())
                 }
-                else receiveArchive(channel, DataInputStream(input), captureId, sessionId) { lastProgress.set(now()) }
+                else receiveArchive(channel, DataInputStream(input), captureId, sessionId, lifetime) { lastProgress.set(now()) }
             } catch (_: CaptureOriginAuthorizationException) {
                 coordinator.rejectOrigin(captureId, channel.nodeId)
                 retire(null)
@@ -202,8 +247,7 @@ internal class CaptureChannelReceiver(
         fun retire(code: String?) {
             if (!retired.compareAndSet(false, true)) return
             deadline.getAndSet(null)?.cancel(false)
-            runCatching { openedInput.getAndSet(null)?.close() }
-            runCatching { closeChannel(channel) }
+            lifetime.close()
             try {
                 if (live) {
                     if (code != null) coordinator.failLiveInput(captureId, sessionId, channel.nodeId, closeInput, code)
@@ -259,7 +303,7 @@ internal class CaptureChannelReceiver(
     }
 
     private fun receiveArchive(channel: ChannelClient.Channel, input: DataInputStream, captureId: String, attemptId: String,
-                               progress: () -> Unit) {
+                               lifetime: CaptureChannelLifetime, progress: () -> Unit) {
         if (channel.nodeId.isBlank() || !CaptureProtocol.isValidUuid(captureId) || !CaptureProtocol.isValidUuid(attemptId)) throw IOException("invalid-archive-identity")
         val header = CaptureWire.archiveHeader(CaptureWire.readJsonHeader(input, CaptureWire.MAX_HEADER_BYTES))
         if (!CaptureWire.validArchiveHeader(header, captureId, attemptId)) throw IOException("invalid-archive-header")
@@ -285,13 +329,23 @@ internal class CaptureChannelReceiver(
         if (!directory.exists() && !directory.mkdirs()) throw IOException("archive-directory-create-failed")
         val finalWav = File(directory, "received.wav")
         val part = File(directory, "received.wav.part")
+        if (finalWav.exists() && !coordinator.canReuseStagedArchive(captureId, channel.nodeId)) {
+            // A crash between rename and database commit leaves bytes, not authorization. Preserve
+            // them outside the staging slot and require this attempt's complete verified body.
+            val quarantine = File(appContext.filesDir, "capture-quarantine")
+            if (!quarantine.exists() && !quarantine.mkdirs()) throw IOException("archive-directory-create-failed")
+            val orphan = File(quarantine, "${captureId.lowercase()}-${java.util.UUID.randomUUID()}.wav")
+            if (!finalWav.renameTo(orphan)) throw IOException("cannot-finalize-staged-archive")
+        }
         if (finalWav.exists()) {
             if (!coordinator.canReuseStagedArchive(captureId, channel.nodeId)) throw CaptureOriginAuthorizationException()
             if (finalWav.length() != expectedLength || !sha256(finalWav).equals(header.sha256, ignoreCase = true)) {
                 throw IOException("existing-staged-audio-conflict")
             }
             verifyWav(finalWav, format, header.frameCount)
-            coordinator.onArchiveReceived(archiveRecord(header, old, finalWav), channel.nodeId)
+            if (!lifetime.ifActive { coordinator.onArchiveReceived(archiveRecord(header, old, finalWav), channel.nodeId) }) {
+                throw IOException("archive-input-unavailable")
+            }
             return
         }
         val digest = MessageDigest.getInstance("SHA-256")
@@ -314,10 +368,11 @@ internal class CaptureChannelReceiver(
             throw IOException("archive-sha256-or-length-mismatch")
         }
         verifyWav(part, format, header.frameCount)
-        if (!coordinator.canReceiveArchive(captureId, channel.nodeId)) throw CaptureOriginAuthorizationException()
-        if (!part.renameTo(finalWav)) throw IOException("cannot-finalize-staged-archive")
-
-        coordinator.onArchiveReceived(archiveRecord(header, old, finalWav), channel.nodeId)
+        if (!lifetime.ifActive {
+            if (!coordinator.canReceiveArchive(captureId, channel.nodeId)) throw CaptureOriginAuthorizationException()
+            if (!part.renameTo(finalWav)) throw IOException("cannot-finalize-staged-archive")
+            coordinator.onArchiveReceived(archiveRecord(header, old, finalWav), channel.nodeId)
+        }) throw IOException("archive-input-unavailable")
     }
 
     private fun archiveRecord(header: CaptureWire.ArchiveHeader, old: CaptureRecord?, wav: File): CaptureRecord {
@@ -349,16 +404,7 @@ internal class CaptureChannelReceiver(
         WavPcmReader(file, format).use { if (it.frameCount != frames) throw IOException("wav-header-does-not-match-manifest") }
     }
 
-    private fun sha256(file: File): String = FileInputStream(file).use { input ->
-        val digest = MessageDigest.getInstance("SHA-256")
-        val buffer = ByteArray(64 * 1024)
-        while (true) {
-            val count = input.read(buffer)
-            if (count < 0) break
-            digest.update(buffer, 0, count)
-        }
-        digest.digest().joinToString("") { "%02x".format(it) }
-    }
+    private fun sha256(file: File): String = CaptureFileIntegrity.digest(file).sha256
 
     private fun handleStatus(nodeId: String, json: JSONObject) {
         val requestId = json.optString("requestId")
@@ -385,6 +431,29 @@ internal class CaptureChannelReceiver(
         private const val MAX_CAPTURE_MILLIS = 10 * 60 * 1_000L
         private const val INPUT_IDLE_TIMEOUT_MILLIS = 15_000L
         private const val MAX_QUEUED_READERS = 16
+        private val DIRECT = java.util.concurrent.Executor { it.run() }
+        private val processRetirements = CaptureChannelRetirementOwner(64)
+        private val channelLifetimes = ConcurrentHashMap<ChannelClient.Channel, CaptureChannelLifetime>()
+        private val pendingNativeClosures = ConcurrentHashMap<ChannelClient.Channel, AtomicBoolean>()
+        fun confirmNativeRetired(channel: ChannelClient.Channel) {
+            pendingNativeClosures[channel]?.set(true)
+            channelLifetimes[channel]?.confirmNativeRetired()
+        }
+        private val observerRequested = AtomicBoolean(false)
+        @Volatile private var observerClient: ChannelClient? = null
+        private val closeObserver = object : ChannelClient.ChannelCallback() {
+            override fun onChannelClosed(channel: ChannelClient.Channel, closeReason: Int, appSpecificErrorCode: Int) = confirmNativeRetired(channel)
+        }
+        /** Close acknowledgements must remain dispatchable while listener admission is backpressured. */
+        private fun observeClosures(context: Context) {
+            val client = observerClient ?: synchronized(processRetirements) {
+                observerClient ?: Wearable.getChannelClient(context.applicationContext).also { observerClient = it }
+            }
+            if (!observerRequested.compareAndSet(false, true)) return
+            try { client.registerChannelCallback(closeObserver).addOnCompleteListener(DIRECT) {
+                if (!it.isSuccessful) observerRequested.set(false)
+            } } catch (_: Exception) { observerRequested.set(false) }
+        }
         @Volatile private var instance: CaptureChannelReceiver? = null
 
         fun shared(context: Context): CaptureChannelReceiver = instance ?: synchronized(this) {
@@ -400,14 +469,6 @@ internal class CaptureChannelReceiver(
             1, 1, 30, TimeUnit.SECONDS, ArrayBlockingQueue(MAX_QUEUED_READERS),
         ).apply { allowCoreThreadTimeOut(true) }
 
-        private fun channelInput(context: Context): (ChannelClient.Channel) -> InputStream = { channel ->
-            Tasks.await(Wearable.getChannelClient(context).getInputStream(channel), 5, TimeUnit.SECONDS)
-        }
-
-        private fun channelCloser(context: Context): (ChannelClient.Channel) -> Unit = { channel ->
-            Wearable.getChannelClient(context).close(channel)
-            Unit
-        }
     }
 }
 

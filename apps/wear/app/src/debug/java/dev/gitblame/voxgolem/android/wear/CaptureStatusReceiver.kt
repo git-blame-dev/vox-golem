@@ -6,6 +6,7 @@ import android.content.Intent
 import com.google.android.gms.tasks.Tasks
 import com.google.android.gms.wearable.Wearable
 import dev.gitblame.voxgolem.capture.CaptureRepository
+import dev.gitblame.voxgolem.capture.CaptureErrorCodes
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -31,9 +32,9 @@ class CaptureStatusReceiver : BroadcastReceiver() {
                         .put("audioExists", audio?.isFile == true)
                         .put("audioBytes", audio?.length() ?: 0)
                         .put("expectedAudioBytes", record.finalizedByteLength ?: 0)
-                        .putOpt("stopReason", diagnosticCode(record.stopReason))
-                        .putOpt("errorStage", diagnosticCode(record.lastErrorStage))
-                        .putOpt("errorCode", diagnosticCode(record.lastErrorCode))
+                        .putOpt("stopReason", record.stopReason?.takeIf { it in STOP_REASONS })
+                        .putOpt("errorStage", record.lastErrorStage?.takeIf { it in ERROR_STAGES })
+                        .putOpt("errorCode", record.lastErrorCode?.let { CaptureErrorCodes.safe(it) })
                         .put("hasError", record.lastErrorCode != null))
                 }
                 val nodes = runCatching {
@@ -47,7 +48,8 @@ class CaptureStatusReceiver : BroadcastReceiver() {
         }.start()
     }
 
-    private fun diagnosticCode(value: String?): String? = value?.takeIf {
-        it.matches(Regex("[a-z][a-z0-9_-]{0,79}"))
+    companion object {
+        private val STOP_REASONS = setOf("manual", "motion", "maximum-duration", "user-finalized", "process-recovery", "service-destroyed", "capture-error")
+        private val ERROR_STAGES = setOf("capture", "capture-recovery", "recognition", "execution", "delivery", "archive", "org-export", "transfer")
     }
 }

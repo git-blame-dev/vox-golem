@@ -22,6 +22,21 @@ mod owned_loopback;
 pub mod search;
 #[cfg(feature = "web-search")]
 pub mod search_control;
+#[cfg(any(
+    feature = "desktop",
+    feature = "custom-openai",
+    feature = "custom-openai-webpki"
+))]
+mod sse;
+#[cfg(all(
+    test,
+    any(
+        feature = "desktop",
+        feature = "custom-openai",
+        feature = "custom-openai-webpki"
+    )
+))]
+mod test_support;
 #[cfg(feature = "web-search")]
 pub mod web;
 #[cfg(feature = "desktop")]

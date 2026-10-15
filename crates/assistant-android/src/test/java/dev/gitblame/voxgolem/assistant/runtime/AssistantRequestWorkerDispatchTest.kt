@@ -16,6 +16,35 @@ import java.util.concurrent.Executor
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35], manifest = Config.NONE)
 class AssistantRequestWorkerDispatchTest {
+    @Test fun outcomeDoesNotReleasePhysicalOwnershipAndReturnedCallbacksAreFencedUntilSingleRetirement() {
+        lateinit var retire: () -> Unit
+        lateinit var callback: ProviderDeltaCallback
+        val events = mutableListOf<String>()
+        val native = object : ProviderNativeCalls {
+            override fun respond(requestId: String, authPath: String, requestJson: String, delta: ProviderDeltaCallback): String {
+                callback = delta; delta.onReady(); delta.onDelta("Synthetic draft")
+                return """{"status":"error","code":"retirement_failed"}"""
+            }
+            override fun cancel(requestId: String) { events += "cancel" }
+            override fun whenRetired(requestId: String, retired: () -> Unit) { retire = retired }
+        }
+        val worker = AssistantRequestWorker(Executor { it.run() }, native)
+        val listener = object : AssistantRequestListener {
+            override fun onDelta(requestId: String, text: String) { events += "delta" }
+            override fun onOutcome(requestId: String, outcomeJson: String) { events += "outcome" }
+            override fun onRetired(requestId: String) { events += "retired" }
+        }
+        assertTrue(worker.submit("synthetic-request", "", "{}", listener))
+        assertEquals(listOf("delta", "outcome"), events)
+        assertFalse(worker.submit("synthetic-overlap", "", "{}", listener))
+        callback.onDelta("Synthetic late draft"); callback.onStatus("Searching")
+        assertEquals(listOf("delta", "outcome"), events)
+        worker.cancel(); assertEquals("cancel", events.last())
+        retire(); retire()
+        assertEquals(1, events.count { it == "retired" })
+        assertTrue(worker.submit("synthetic-replacement", "", "{}", listener))
+        retire(); worker.close()
+    }
     private fun timing(clock: () -> Long, events: MutableList<AssistantTiming.Event>): AssistantTiming {
         val context = RuntimeEnvironment.getApplication()
         context.applicationInfo.flags = context.applicationInfo.flags or ApplicationInfo.FLAG_DEBUGGABLE

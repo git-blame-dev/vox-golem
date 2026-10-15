@@ -60,11 +60,12 @@ export function AnswerStage({ answer, contentKind = 'text', stages, priorVersion
   const stageDetails = stages.filter(({ detail }) => typeof detail === 'string' && detail.trim() !== '')
   const hasDetails = sources.length > 0 || stageDetails.length > 0 || priorVersions.length > 0
   const visibleStages = compact ? stages.filter(({ stage, status }) => stage !== 'instant' || status !== 'completed') : stages
+  const pending = stages.some(({ status }) => status === 'queued' || status === 'running')
 
   return (
     <section className={rootClassName} aria-label={contentKind === 'refusal' ? 'Assistant refusal' : compact ? 'Assistant answer' : 'Current answer'} data-content-kind={contentKind}>
       {!compact || contentKind === 'refusal' ? <h2>{contentKind === 'refusal' ? 'Assistant refusal' : 'Current answer'}</h2> : null}
-      <p className="answer-stage__answer">{answer.length === 0 ? <span className="message__thinking">Thinking…</span> : <PlainText>{answer}</PlainText>}</p>
+      <p className="answer-stage__answer">{answer.trim().length === 0 ? pending ? <span className="message__thinking">Thinking…</span> : 'No response was returned.' : <PlainText>{answer}</PlainText>}</p>
       {!compact || visibleStages.length > 0 ? <ul className="answer-stage__statuses" aria-label="Answer stage status">
          {visibleStages.map(({ stage, status }, index) => (
           <li key={`${stage}-${status}-${index}`} data-stage={stage} data-status={status}>

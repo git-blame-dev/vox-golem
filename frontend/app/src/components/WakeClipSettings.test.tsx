@@ -3,9 +3,47 @@ import { createRoot } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { WakeClipSettings } from './WakeClipSettings'
 
-afterEach(() => { Reflect.deleteProperty(window, '__TAURI_INTERNALS__') })
+afterEach(() => { Reflect.deleteProperty(window, '__TAURI_INTERNALS__'); vi.unstubAllGlobals() })
 
 describe('WakeClipSettings', () => {
+  it('owns one playback and retires replacement, late responses and unmounted audio', async () => {
+    const audios: { play: ReturnType<typeof vi.fn>; pause: ReturnType<typeof vi.fn>; src: string }[] = []
+    vi.stubGlobal('Audio', class {
+      src: string
+      play = vi.fn(async () => undefined)
+      pause = vi.fn()
+      removeAttribute = vi.fn()
+      constructor(src: string) { this.src = src; audios.push(this) }
+    })
+    const clip = (id: string) => ({ id, profile: 'synthetic-profile', model_file: id, model_revision: 'synthetic-revision', created_ms: 42, confidence: 0.8, label: 'unreviewed' })
+    const pending: ((value: unknown) => void)[] = []
+    window.__TAURI_INTERNALS__ = { invoke: async (command) => {
+      if (command === 'get_wake_clip_settings') return { enabled: true, directory: '/tmp/synthetic-clips' }
+      if (command === 'list_wake_clips') return [clip('synthetic-first'), clip('synthetic-second')]
+      if (command === 'play_wake_clip') return new Promise((resolve) => { pending.push(resolve) })
+      throw new Error(`unexpected ${command}`)
+    } }
+    const container = document.createElement('div'); document.body.append(container)
+    const root = createRoot(container)
+    let unmounted = false
+    try {
+      await act(async () => { root.render(<WakeClipSettings />) })
+      const play = Array.from(container.querySelectorAll('button')).filter((button) => button.textContent === 'Play')
+      await act(async () => { play[0]!.click(); play[1]!.click() })
+      await act(async () => { pending[1]!('data:audio/wav;base64,U1lOVEhFVElD') })
+      await act(async () => { pending[0]!('data:audio/wav;base64,U1RBTEU=') })
+      expect(audios).toHaveLength(1)
+      await act(async () => { play[0]!.click() })
+      expect(audios[0]!.pause).toHaveBeenCalledOnce()
+      await act(async () => { root.unmount() }); unmounted = true
+      await act(async () => { pending[2]!('data:audio/wav;base64,TEFURQ==') })
+      expect(audios).toHaveLength(1)
+    } finally {
+      if (!unmounted) await act(async () => { root.unmount() })
+      container.remove()
+    }
+  })
+
   it('starts enabled and updates the directory and true/false labels without touching the microphone', async () => {
     const invoke = vi.fn(async (command: string, args?: unknown): Promise<unknown> => {
       if (command === 'get_wake_clip_settings') return { enabled: true, directory: '/tmp/synthetic-clips' }

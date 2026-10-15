@@ -78,18 +78,30 @@ class AndroidSuppliedAudioInputTest {
         sdk.callback.onResults(result("Synthetic duplicate")); assertEquals(1, events.finals.size)
         session.close()
     }
-    @Test fun localUtteranceEofTimeoutAndApprovalLossCannotCreateAnAuthoritativeFinal() {
-        var approved = true
+    @Test fun localUtteranceEofTimeoutCannotCreateAnAuthoritativeFinal() {
         val sdk = FakeSdk(); val pipe = FakePipe(); val events = Events()
-        val session = AndroidSuppliedAudioSession("en-US", sdk, pipe, SuppliedAudioMode.UTTERANCE) { approved }
+        val session = AndroidSuppliedAudioSession("en-US", sdk, pipe, SuppliedAudioMode.UTTERANCE) { true }
         session.checkSupport {}; session.start(events)
         sdk.callback.onResults(result("Synthetic premature final"))
         shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(3))
         assertEquals(listOf("source_eof_timeout"), events.errors); assertTrue(events.finals.isEmpty())
-        approved = false
-        assertFalse(session.appendFromWorker(byteArrayOf(0, 0)))
         pipe.sourceClosed = true; pipe.sourceEnd!!.invoke(true)
         assertTrue(events.finals.isEmpty()); session.close()
+    }
+    @Test fun liveApprovalLossBeforeEofCannotCreateAnAuthoritativeFinal() {
+        var approved = true
+        val sdk = FakeSdk(); val pipe = FakePipe(); val events = Events()
+        val session = AndroidSuppliedAudioSession("en-US", sdk, pipe, SuppliedAudioMode.UTTERANCE) { approved }
+        try {
+            session.checkSupport {}; session.start(events)
+            sdk.callback.onResults(result("Synthetic pending final"))
+            assertTrue(events.errors.isEmpty()); assertTrue(events.finals.isEmpty())
+            approved = false
+            assertFalse(session.appendFromWorker(byteArrayOf(0, 0)))
+            pipe.sourceClosed = true; pipe.sourceEnd!!.invoke(true)
+            assertEquals(listOf("supplied_audio_approval_lost"), events.errors)
+            assertTrue(events.finals.isEmpty())
+        } finally { session.close() }
     }
     @Test fun exactDescriptorIntentIsQueriedAndStartedWithListenerFirst() {
         val sdk = FakeSdk(); val pipe = FakePipe(); val events = Events()
@@ -166,14 +178,15 @@ class AndroidSuppliedAudioInputTest {
         val sdk = FakeSdk(); val pipe = FakePipe(); val events = Events()
         val session = AndroidSuppliedAudioSession("en-US", sdk, pipe) { true }
         session.checkSupport {}; session.start(events)
-        var failure: Throwable? = null
-        Thread { try { session.finish() } catch (error: Throwable) { failure = error } }.apply { start(); join() }
-        assertTrue(failure is IllegalStateException)
-        Thread { sdk.callback.onPartialResults(result("synthetic worker draft")) }.apply { start(); join() }
-        assertTrue(events.partials.isEmpty())
-        shadowOf(Looper.getMainLooper()).idle()
-        assertEquals(listOf("synthetic worker draft"), events.partials)
-        session.close()
+        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        try {
+            val failure = executor.submit<Throwable?> { runCatching { session.finish() }.exceptionOrNull() }.get(2, TimeUnit.SECONDS)
+            assertTrue(failure is IllegalStateException)
+            executor.submit { sdk.callback.onPartialResults(result("synthetic worker draft")) }.get(2, TimeUnit.SECONDS)
+            assertTrue(events.partials.isEmpty())
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals(listOf("synthetic worker draft"), events.partials)
+        } finally { session.close(); executor.shutdownNow(); assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS)) }
     }
     @Test fun defaultDeviceGateDeniesEvenAvailableProvider() {
         ShadowSpeechRecognizer.setIsOnDeviceRecognitionAvailable(true)

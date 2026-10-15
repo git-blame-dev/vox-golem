@@ -395,7 +395,8 @@ describe('Android App lifecycle', () => {
       setCachedAndroidPreferences({ ...getCachedAndroidPreferences()!, uiTheme: 'light' })
     } else if (race === 'controlsRevision' || race === 'contextRevision' || race === 'runtimeRevision') {
       const authority = operations.mock.contexts[0] as unknown as SessionAuthority
-      authority.operationRef(race, () => 0).current += 1
+      if (race === 'contextRevision') authority.selection.contextRevision.current += 1
+      else authority.operationRef(race, () => 0).current += 1
     } else if (race === 'reset-invalidated') {
       const authority = operations.mock.contexts[0] as unknown as SessionAuthority
       authority.fieldRef('resetPending').current = true
@@ -639,7 +640,7 @@ describe('Android App lifecycle', () => {
     expect(composer.value).toBe(retained)
     if (outcome !== 'new-chat') expect(retained).toBe('Synthetic voice draft')
     expect(invoke.mock.calls.some(([command]) => command === 'submit_prompt' || command === 'prepare_new_voice_shortcut')).toBe(false)
-    expect(invoke).toHaveBeenCalledWith('stop_assistant_voice', undefined)
+    expect(invoke).toHaveBeenCalledWith('stop_assistant_voice', expect.objectContaining({ sessionId: expect.any(String) }))
   })
   it.each([
     ['ask', true], ['ask', false], ['talk', true], ['talk', false],
@@ -1021,7 +1022,6 @@ describe('Android App lifecycle', () => {
     document.body.append(container)
     root = createRoot(container)
     await act(async () => { root?.render(<App />) })
-    for (let index = 0; index < 5; index += 1) await act(async () => { await Promise.resolve() })
     await act(async () => { container?.querySelector<HTMLButtonElement>('[aria-label="Settings"]')?.click() })
     for (const id of ['composerInstantSelect', 'assistantInstantSelect']) {
       const select = container.querySelector<HTMLSelectElement>(`#${id}`)!
@@ -1050,7 +1050,6 @@ describe('Android App lifecycle', () => {
     document.body.append(container)
     root = createRoot(container)
     await act(async () => { root?.render(<App />) })
-    for (let index = 0; index < 5; index += 1) await act(async () => { await Promise.resolve() })
 
     expect(container.textContent).not.toContain('Start mic')
     expect(container.querySelector('header button[aria-label="Voice notes"]')).not.toBeNull()

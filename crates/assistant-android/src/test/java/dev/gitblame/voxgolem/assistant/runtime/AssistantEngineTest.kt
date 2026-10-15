@@ -31,6 +31,8 @@ class AssistantEngineTest {
     private class Provider : ProviderNativeCalls {
         val requests = mutableListOf<JSONObject>()
         val cancelled = mutableListOf<String>()
+        var deferRetirement = false
+        lateinit var retired: () -> Unit
         var body: (ProviderDeltaCallback) -> String = { callback ->
             callback.onReady(); callback.onDelta("Synthetic provisional")
             """{"status":"complete","text":"Synthetic final answer","contentType":"output_text"}"""
@@ -40,6 +42,9 @@ class AssistantEngineTest {
             return body(callback)
         }
         override fun cancel(requestId: String) { cancelled += requestId }
+        override fun whenRetired(requestId: String, retired: () -> Unit) {
+            if (deferRetirement) this.retired = retired else retired()
+        }
     }
     private val context = RuntimeEnvironment.getApplication()
     private val store = AssistantStore(context)
@@ -334,6 +339,32 @@ class AssistantEngineTest {
             assertEquals("", state.provisional)
             assertEquals(1, store.snapshot().getJSONArray("records").length())
         } finally { subscription.close() }
+    }
+
+    @Test fun unconfirmedProcessRetirementCannotSettleOrConsumeDraftAndExplicitRouteFailuresSurviveSettlement() {
+        provider.deferRetirement = true
+        provider.body = { callback ->
+            callback.onReady(); callback.onDelta("Synthetic partial draft")
+            """{"status":"error","code":"retirement_failed"}"""
+        }
+        prepare()
+        val before = store.snapshot().getJSONArray("records").length()
+        settle()
+        assertTrue(state.busy)
+        assertEquals("Synthetic question", state.draft)
+        assertEquals(before, store.snapshot().getJSONArray("records").length())
+        provider.retired(); io.drain()
+        assertFalse(state.busy); assertEquals("retirement_failed", state.error)
+        assertEquals("Synthetic question", state.draft)
+        assertEquals(before, store.snapshot().getJSONArray("records").length())
+        provider.deferRetirement = false
+        for (code in listOf("unsupported_search_mode", "provider_failure")) {
+            provider.body = { JSONObject().put("status", "error").put("code", code).toString() }
+            prepare(); settle()
+            assertEquals(code, state.error)
+            assertEquals("Synthetic question", state.draft)
+            assertEquals(before, store.snapshot().getJSONArray("records").length())
+        }
     }
 
     @Test fun providerFirstTextAppearsDuringStreamingSurvivesCompletionAndResetsForTheNextRequest() {

@@ -35,11 +35,11 @@ describe('FrontendSession transition authority', () => {
 
   it('keeps independent invalidation counters and retires the active lifetime once before replay activation', () => {
     const session = new SessionAuthority()
-    const context = session.operationRef('contextRevision', () => 0)
-    const composer = session.operationRef('composerRevision', () => 0)
+    const context = session.selection.contextRevision
+    const composer = session.selection.composerRevision
     composer.current += 1
     expect(context.current).toBe(0)
-    expect(session.operationRef('composerRevision', () => 99)).toBe(composer)
+    expect(session.selection.composerRevision).toBe(composer)
     const retire = vi.fn(() => expect(session.activeRef.current).toBe(false))
     session.activate(retire)
     session.dispose()

@@ -24,32 +24,60 @@ import java.util.concurrent.TimeUnit
 @Config(sdk = [24, 35], manifest = Config.NONE)
 class ReplicationStatusReadTest {
     @get:Rule val folder = TemporaryFolder()
+    private val testOwners = mutableSetOf<AssistantReplication.Owner>()
+
+    @org.junit.After fun retireTestOwners() {
+        val executors = testOwners.map { ReflectionHelpers.getField<java.util.concurrent.ThreadPoolExecutor>(it, "executor") }
+        val failures = mutableListOf<Throwable>()
+        var interruption: InterruptedException? = null
+        for (executor in executors) {
+            try { executor.shutdown() } catch (error: Exception) { failures += error }
+        }
+        for (executor in executors) {
+            try {
+                if (executor.awaitTermination(30, TimeUnit.SECONDS)) continue
+                failures += AssertionError("Replication work must finish before Robolectric tears down native SQLite")
+            } catch (error: Exception) {
+                failures += error
+                if (error is InterruptedException) interruption = error
+            }
+            try {
+                executor.shutdownNow()
+                if (!executor.awaitTermination(30, TimeUnit.SECONDS)) {
+                    failures += AssertionError("Replication executor did not terminate after forced shutdown")
+                }
+            } catch (error: Exception) {
+                failures += error
+                if (error is InterruptedException) interruption = error
+            }
+        }
+        interruption?.let { error ->
+            failures.filter { it !== error }.forEach(error::addSuppressed)
+            Thread.currentThread().interrupt()
+            throw error
+        }
+        if (failures.isNotEmpty()) {
+            val failure = AssertionError("Replication owner cleanup failed")
+            failures.forEach(failure::addSuppressed)
+            throw failure
+        }
+    }
 
     @Test fun startupSchedulingAndPersistedBackoffWaitForExistingExecutorEvenWhenQueueIsFull() {
         for (fullQueue in listOf(false, true)) {
             val fixture = Fixture("synthetic-deferred-startup-$fullQueue")
             fixture.scheduler.cancelAll()
             val owner = AssistantReplication.Owner(fixture.context, fixture.context.assistantPeerAssociationProvider,
-                fixture::transport, { false })
+                fixture::transport, { false }).also { testOwners += it }
             // Seed a persisted retry before blocking the process owner.
             owner.state.failed(System.currentTimeMillis())
-            val entered = CountDownLatch(1)
-            val release = CountDownLatch(1)
-            val blocking = owner.submit { entered.countDown(); check(release.await(30, TimeUnit.SECONDS)) }!!
-            assertTrue(entered.await(30, TimeUnit.SECONDS))
-            val queued = (0 until (if (fullQueue) 16 else 0)).map { owner.submit {}!! }
-            try {
+            withBlockedOwner(owner, if (fullQueue) 16 else 0) {
                 withOwner(owner) {
                     val jobsBefore = fixture.scheduler.allPendingJobs.toList()
                     AssistantReplication.start(fixture.context, fixture.context.assistantPeerAssociationProvider)
                     assertEquals(jobsBefore, fixture.scheduler.allPendingJobs)
                     assertTrue(fixture.localSdk.calls.isEmpty())
                 }
-            } finally {
-                release.countDown()
-                blocking.get(30, TimeUnit.SECONDS)
-                queued.lastOrNull()?.get(30, TimeUnit.SECONDS)
-                owner.submit {}!!.get(30, TimeUnit.SECONDS)
             }
             assertNotNull(fixture.scheduler.getPendingJob(AssistantReplication.PERIODIC_JOB))
             assertNotNull(fixture.scheduler.getPendingJob(AssistantReplication.RETRY_JOB))
@@ -61,7 +89,7 @@ class ReplicationStatusReadTest {
         assertNotNull(System.getProperty("assistant.native.library"))
         val fixture = Fixture("synthetic-status-startup")
         val owner = AssistantReplication.Owner(fixture.context, fixture.context.assistantPeerAssociationProvider,
-            fixture::transport, { true })
+            fixture::transport, { true }).also { testOwners += it }
         withOwner(owner) {
             val credentialFile = File(fixture.root, "assistant-auth.json").apply { writeText("Synthetic externally owned bytes") }
             val credentialBefore = credentialFile.readBytes()
@@ -121,23 +149,14 @@ class ReplicationStatusReadTest {
     @Test fun rejectedStatusReadReturnsUnavailableWithoutSchedulingRetryOrInvokingSdk() {
         val fixture = Fixture("synthetic-status-busy")
         val owner = AssistantReplication.Owner(fixture.context, fixture.context.assistantPeerAssociationProvider,
-            fixture::transport, { true })
-        val entered = CountDownLatch(1)
-        val release = CountDownLatch(1)
-        val blocking = owner.submit { entered.countDown(); assertTrue(release.await(30, TimeUnit.SECONDS)) }!!
-        assertTrue(entered.await(30, TimeUnit.SECONDS))
-        val queued = (0 until 16).map { owner.submit {}!! }
-        try {
+            fixture::transport, { true }).also { testOwners += it }
+        withBlockedOwner(owner, 16) {
             withOwner(owner) {
                 val jobsBefore = fixture.scheduler.allPendingJobs.toList()
                 assertEquals(PeerPairingReason.UNAVAILABLE, readStatus(fixture.context).reason)
                 assertTrue(fixture.localSdk.calls.isEmpty())
                 assertEquals(jobsBefore, fixture.scheduler.allPendingJobs)
             }
-        } finally {
-            release.countDown()
-            blocking.get(30, TimeUnit.SECONDS)
-            queued.last().get(30, TimeUnit.SECONDS)
         }
     }
 
@@ -147,13 +166,47 @@ class ReplicationStatusReadTest {
             it.saveSetup("status", JSONObject().put("reason", "SYNTHETIC_INVALID_REASON"))
         }
         val owner = AssistantReplication.Owner(fixture.context, fixture.context.assistantPeerAssociationProvider,
-            fixture::transport, { true })
+            fixture::transport, { true }).also { testOwners += it }
         withOwner(owner) {
             val jobsBefore = fixture.scheduler.allPendingJobs.toList()
             assertEquals(PeerPairingReason.STORAGE_FAILURE, readStatus(fixture.context).reason)
             assertTrue(fixture.localSdk.calls.isEmpty())
             assertEquals(jobsBefore, fixture.scheduler.allPendingJobs)
             EnrolledPeerRegistry(fixture.context).use { assertEquals("SYNTHETIC_INVALID_REASON", it.setupValue("status")!!.getString("reason")) }
+        }
+    }
+
+    @Test fun setupFailureBeforeOwnerSwapReleasesGatedWorkAndRetiresActualExecutor() {
+        val fixture = Fixture("synthetic-setup-failure")
+        val owner = AssistantReplication.Owner(fixture.context, fixture.context.assistantPeerAssociationProvider,
+            fixture::transport, { false }).also { testOwners += it }
+        val previous = ReflectionHelpers.getStaticField<AssistantReplication.Owner?>(AssistantReplication::class.java, "owner")
+        val injected = IllegalStateException("Synthetic failure before owner swap")
+        try {
+            withBlockedOwner(owner, 0) { throw injected }
+            fail("Expected injected setup failure")
+        } catch (error: IllegalStateException) {
+            assertSame(injected, error)
+        }
+        assertSame(previous, ReflectionHelpers.getStaticField<AssistantReplication.Owner?>(AssistantReplication::class.java, "owner"))
+        retireTestOwners()
+        val executor = ReflectionHelpers.getField<java.util.concurrent.ThreadPoolExecutor>(owner, "executor")
+        assertTrue("The actual owner executor must be retired after failed setup", executor.isTerminated)
+    }
+
+    private fun withBlockedOwner(owner: AssistantReplication.Owner, queueSize: Int, block: () -> Unit) {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val accepted = mutableListOf<java.util.concurrent.Future<*>>()
+        try {
+            accepted += requireNotNull(owner.submit { entered.countDown(); check(release.await(30, TimeUnit.SECONDS)) })
+            assertTrue(entered.await(30, TimeUnit.SECONDS))
+            repeat(queueSize) { accepted += requireNotNull(owner.submit {}) }
+            block()
+        } finally {
+            release.countDown()
+            accepted.forEach { it.get(30, TimeUnit.SECONDS) }
+            requireNotNull(owner.submit {}).get(30, TimeUnit.SECONDS)
         }
     }
 
@@ -185,7 +238,9 @@ class ReplicationStatusReadTest {
         previous?.submit {}?.get(30, TimeUnit.SECONDS)
         ReflectionHelpers.setStaticField(AssistantReplication::class.java, "owner", owner)
         try { block() } finally {
+            val installed = ReflectionHelpers.getStaticField<AssistantReplication.Owner?>(AssistantReplication::class.java, "owner")
             ReflectionHelpers.setStaticField(AssistantReplication::class.java, "owner", previous)
+            if (installed != null && installed !== previous) testOwners += installed
         }
     }
     private fun budget() = BoundedGmsWait(System.nanoTime() + TimeUnit.SECONDS.toNanos(30))

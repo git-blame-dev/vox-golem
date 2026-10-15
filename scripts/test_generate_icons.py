@@ -4,6 +4,8 @@ import importlib.util
 import io
 import json
 import math
+from functools import partial
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -52,7 +54,7 @@ class IconGenerationTests(unittest.TestCase):
             self.assertLess(math.hypot(15, 15) + 7.5, 30)
 
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix="test-icons-")
+        self.temporary = tempfile.TemporaryDirectory(prefix="test-icons-", dir="/tmp/opencode")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.desktop = self.root / "desktop/icons"
@@ -90,10 +92,15 @@ class IconGenerationTests(unittest.TestCase):
     def invoke(self, arguments=(), render=None):
         with patch.multiple(icons, ROOT=self.root, DESKTOP_ICONS=self.desktop,
                             ANDROID_SHELL=self.phone), \
+                patch.object(icons.tempfile, "tempdir", str(self.root)), \
                 patch.object(sys, "argv", [str(SCRIPT), *arguments]), \
                 contextlib.redirect_stdout(io.StringIO()):
             if render is None:
-                icons.main()
+                run = partial(subprocess.run, timeout=120)
+                check_output = partial(subprocess.check_output, timeout=30)
+                with patch.object(icons.subprocess, "run", side_effect=run), \
+                        patch.object(icons.subprocess, "check_output", side_effect=check_output):
+                    icons.main()
             else:
                 with patch.object(icons.subprocess, "run", side_effect=render), \
                         patch.object(icons.subprocess, "check_output", return_value="tauri-cli 2.11.1\n"):
@@ -322,7 +329,7 @@ class IconGenerationTests(unittest.TestCase):
             pixels = subprocess.check_output([
                 "ffmpeg", "-v", "error", "-i", str(note), "-vf", "scale=48:48",
                 "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1",
-            ])
+            ], timeout=30)
             source = icons.ET.parse(CANONICAL_SVG).getroot()
             x, y, width, _ = map(float, source.get("viewBox").split())
             radius = icons.artwork_geometry(source) * width / 2
@@ -344,7 +351,8 @@ class IconGenerationTests(unittest.TestCase):
         authored_before = [file_bytes(directory) for directory in authored_directories]
         result = subprocess.run(
             [sys.executable, str(SCRIPT), "--wear-res-output", "wear build/generated/launcher-res"],
-            cwd=self.root, check=True, capture_output=True, text=True,
+            cwd=self.root, check=True, capture_output=True, text=True, timeout=120,
+            env=dict(os.environ, TMPDIR=str(self.root)),
         )
         self.assertIn("Generated Wear resources", result.stdout)
         self.assertEqual({name: data for name, data in file_bytes(destination).items() if name not in entries}, expected)
@@ -373,7 +381,8 @@ class IconGenerationTests(unittest.TestCase):
         authored_before = [file_bytes(directory) for directory in authored_directories]
         result = subprocess.run(
             [sys.executable, str(SCRIPT), "--phone-shortcut-res-output", "shortcut build/generated/res"],
-            cwd=self.root, check=True, capture_output=True, text=True,
+            cwd=self.root, check=True, capture_output=True, text=True, timeout=120,
+            env=dict(os.environ, TMPDIR=str(self.root)),
         )
         self.assertIn("Generated phone shortcut resource", result.stdout)
         self.assertEqual(file_bytes(destination), files)
@@ -383,7 +392,7 @@ class IconGenerationTests(unittest.TestCase):
         self.assertEqual((width, height), (512, 512))
         pixels = subprocess.check_output([
             "ffmpeg", "-v", "error", "-i", str(png), "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1",
-        ])
+        ], timeout=30)
         self.assertEqual(len(pixels), width * height * 4)
         source = icons.ET.parse(self.desktop / "icon.svg").getroot()
         color = source.get("color").lstrip("#")
@@ -415,7 +424,7 @@ class IconGenerationTests(unittest.TestCase):
             rgba = subprocess.check_output([
                 "ffmpeg", "-v", "error", "-i", str(entry_png),
                 "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1",
-            ])
+            ], timeout=30)
             self.assertTrue(all(
                 (index % width + .5 - width / 2) ** 2
                 + (index // width + .5 - height / 2) ** 2 <= (radius * width / view_width + 1) ** 2
@@ -424,7 +433,7 @@ class IconGenerationTests(unittest.TestCase):
             small = subprocess.check_output([
                 "ffmpeg", "-v", "error", "-i", str(entry_png),
                 "-vf", "scale=48:48", "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1",
-            ])
+            ], timeout=30)
             def small_pixel(point):
                 px = int((bx + point[0] * scale - x) * 48 / view_width)
                 py = int((by + point[1] * scale - y) * 48 / view_height)

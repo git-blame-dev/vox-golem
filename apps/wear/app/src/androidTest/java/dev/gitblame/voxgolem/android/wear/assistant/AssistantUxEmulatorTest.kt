@@ -1188,19 +1188,34 @@ class AssistantUxEmulatorTest {
         val bitmap = requireNotNull(automation.takeScreenshot())
         try {
             val radius = 23f * geometry.density
-            assertTrue("Actual text ink remains painted behind the transparent target, not covered by a filled container",
-                behindTarget.any { character ->
+            fun hasGlyphContrast(frame: android.graphics.Bitmap): Boolean = behindTarget.any { character ->
                     val bounds = RectF(character.bounds).apply { intersect(RectF(latest)) }
-                    (bounds.top.toInt().coerceAtLeast(0) until bounds.bottom.toInt().coerceAtMost(bitmap.height)).any { y ->
-                        (bounds.left.toInt().coerceAtLeast(0) until bounds.right.toInt().coerceAtMost(bitmap.width)).any { x ->
-                            val pixel = bitmap.getPixel(x, y)
+                    var ink = 0
+                    var background = 0
+                    for (y in bounds.top.toInt().coerceAtLeast(0) until bounds.bottom.toInt().coerceAtMost(frame.height)) {
+                        for (x in bounds.left.toInt().coerceAtLeast(0) until bounds.right.toInt().coerceAtMost(frame.width)) {
                             val dx = x - latest.exactCenterX()
                             val dy = y - latest.exactCenterY()
-                            dx * dx + dy * dy < radius * radius &&
-                                Color.red(pixel) > 180 && Color.green(pixel) > 180 && Color.blue(pixel) > 180
+                            if (dx * dx + dy * dy >= radius * radius) continue
+                            val pixel = frame.getPixel(x, y)
+                            if (Color.red(pixel) > 180 && Color.green(pixel) > 180 && Color.blue(pixel) > 180) ink++
+                            if (Color.red(pixel) < 100 && Color.green(pixel) < 100 && Color.blue(pixel) < 100) background++
                         }
                     }
-                })
+                    ink >= 2 && background >= 2
+                }
+            assertTrue("Glyphs need both light ink and dark inter-glyph background, not just an opaque white target",
+                hasGlyphContrast(bitmap))
+            // Negative control from the identical frame/geometry. Neither an opaque white nor a
+            // black container may pass an oracle intended to prove underlying text remains painted.
+            for (fill in listOf(Color.WHITE, Color.BLACK)) {
+                val opaque = bitmap.copy(android.graphics.Bitmap.Config.ARGB_8888, true)
+                try {
+                    android.graphics.Canvas(opaque).drawCircle(latest.exactCenterX(), latest.exactCenterY(), radius + 1f,
+                        android.graphics.Paint().apply { color = fill })
+                    assertFalse("An opaque container must fail the text contrast oracle", hasGlyphContrast(opaque))
+                } finally { opaque.recycle() }
+            }
         } finally { bitmap.recycle() }
     }
 

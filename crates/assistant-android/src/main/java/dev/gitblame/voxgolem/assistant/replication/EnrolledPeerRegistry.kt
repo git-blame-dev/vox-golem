@@ -9,6 +9,8 @@ import java.io.Closeable
 import java.io.File
 import kotlin.math.min
 import kotlin.random.Random
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicInteger
 
 /** Native association lookup, injected by each Application. Node IDs are ephemeral routes. */
 fun interface PeerAssociationProvider {
@@ -23,6 +25,16 @@ interface AssistantPeerAssociationOwner {
 /** App-private replication bookkeeping; conversation records are stored separately. */
 class EnrolledPeerRegistry(context: Context) : Closeable {
     private val database = ReplicationDatabase(context.applicationContext)
+    companion object {
+        // All enrollment/setup mutations use this process owner. Readers publish immutable
+        // selections off-main and compare this fence without opening SQLite on PCM admission.
+        private val approvalEpoch = AtomicLong()
+        private val approvalWriters = AtomicInteger()
+        internal fun approvalVersion(): Long = approvalEpoch.get()
+        internal fun approvalStable(): Boolean = approvalWriters.get() == 0
+        private fun beginApprovalMutation() { approvalWriters.incrementAndGet(); approvalEpoch.incrementAndGet() }
+        private fun endApprovalMutation() { approvalEpoch.incrementAndGet(); approvalWriters.decrementAndGet() }
+    }
 
     fun replicas(): Set<String> = database.readableDatabase.rawQuery("SELECT replica FROM peers ORDER BY replica", null).use { cursor ->
         buildSet { while (cursor.moveToNext()) add(cursor.getString(0)) }
@@ -32,6 +44,7 @@ class EnrolledPeerRegistry(context: Context) : Closeable {
         ReplicationWire.uuid(replica)
         val db = database.writableDatabase
         db.beginTransaction()
+        beginApprovalMutation()
         try {
             val existing = replicas()
             require(replica in existing || existing.size < ReplicationWire.MAX_PEERS) { "Assistant peer limit reached" }
@@ -42,19 +55,20 @@ class EnrolledPeerRegistry(context: Context) : Closeable {
             db.insertWithOnConflict("peers", null, ContentValues().apply { put("replica", replica) }, SQLiteDatabase.CONFLICT_IGNORE)
             db.delete("cleanup_peers", "replica = ?", arrayOf(replica))
             db.setTransactionSuccessful()
-        } finally { db.endTransaction() }
+        } finally { try { db.endTransaction() } finally { endApprovalMutation() } }
     }
 
     fun revoke(replica: String) {
         ReplicationWire.uuid(replica)
         val db = database.writableDatabase
         db.beginTransaction()
+        beginApprovalMutation()
         try {
             if (db.delete("peers", "replica = ?", arrayOf(replica)) != 0) {
                 db.insertWithOnConflict("cleanup_peers", null, ContentValues().apply { put("replica", replica) }, SQLiteDatabase.CONFLICT_IGNORE)
             }
             db.setTransactionSuccessful()
-        } finally { db.endTransaction() }
+        } finally { try { db.endTransaction() } finally { endApprovalMutation() } }
     }
 
     internal fun setupValue(key: String): JSONObject? = database.readableDatabase.rawQuery("SELECT value FROM setup WHERE key = ?", arrayOf(key)).use {
@@ -65,8 +79,11 @@ class EnrolledPeerRegistry(context: Context) : Closeable {
         require(key in setOf("incoming", "outgoing", "status"))
         val raw = value?.toString()
         require(raw == null || raw.toByteArray(Charsets.UTF_8).size <= 4096)
-        if (raw == null) database.writableDatabase.delete("setup", "key = ?", arrayOf(key))
-        else check(database.writableDatabase.insertWithOnConflict("setup", null, ContentValues().apply { put("key", key); put("value", raw) }, SQLiteDatabase.CONFLICT_REPLACE) != -1L)
+        beginApprovalMutation()
+        try {
+            if (raw == null) database.writableDatabase.delete("setup", "key = ?", arrayOf(key))
+            else check(database.writableDatabase.insertWithOnConflict("setup", null, ContentValues().apply { put("key", key); put("value", raw) }, SQLiteDatabase.CONFLICT_REPLACE) != -1L)
+        } finally { endApprovalMutation() }
     }
 
     internal fun clearLegacySetup() {
@@ -81,6 +98,7 @@ class EnrolledPeerRegistry(context: Context) : Closeable {
         listOf(binding.replica, binding.association).forEach(ReplicationWire::uuid)
         val db = database.writableDatabase
         db.beginTransaction()
+        beginApprovalMutation()
         try {
             replicas().filter { it != binding.replica }.forEach { revoke(it) }
             db.delete("native_bindings", "replica != ?", arrayOf(binding.replica))
@@ -89,7 +107,7 @@ class EnrolledPeerRegistry(context: Context) : Closeable {
                 put("replica", binding.replica); put("association", binding.association)
             }, SQLiteDatabase.CONFLICT_REPLACE) != -1L)
             db.setTransactionSuccessful()
-        } finally { db.endTransaction() }
+        } finally { try { db.endTransaction() } finally { endApprovalMutation() } }
     }
 
     override fun close() = database.close()

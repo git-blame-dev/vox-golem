@@ -340,9 +340,12 @@ describe('parseStartupState', () => {
   })
 
   it('throws when ready payload omits cue paths', () => {
-    expect(() => parseStartupState({ kind: 'ready', silence_timeout_ms: 1500 })).toThrow(
-      'Startup ready payload must include voice_input_available',
-    )
+    const valid = { kind: 'ready', cue_asset_paths: { start_listening: 'resources/start-listening.wav', stop_listening: 'resources/stop-listening.wav' }, runtime_phase: 'sleeping', voice_input_available: true,
+      voice_input_error: null, silence_timeout_ms: 1500, selected_response_profile: 'fast', supported_response_profiles: ['fast'], capabilities: COMPLETE_CAPABILITIES }
+    expect(parseStartupState(valid).kind).toBe('ready')
+    const invalid = { ...valid } as Record<string, unknown>
+    delete invalid['cue_asset_paths']
+    expect(() => parseStartupState(invalid)).toThrow('Startup ready payload must include cue asset paths')
   })
 
   it('throws when startup payload omits silence timeout', () => {

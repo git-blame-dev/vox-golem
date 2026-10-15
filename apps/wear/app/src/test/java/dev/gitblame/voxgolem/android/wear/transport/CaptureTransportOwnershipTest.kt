@@ -46,15 +46,18 @@ internal class FakeCaptureWearSdk : CaptureWearSdk {
     val stops = CountDownLatch(1)
     val closeCount = AtomicInteger()
     val sent = java.util.Collections.synchronizedList(mutableListOf<String>())
+    val sentBodies = java.util.Collections.synchronizedList(mutableListOf<Pair<String, ByteArray>>())
+    var closeTask: () -> Task<Void> = { Tasks.forResult(null) }
     var onChannelClose: () -> Unit = {}
     override fun phones() = phoneTask()
     override fun open(nodeId: String, path: String): Task<ChannelClient.Channel> { opened.countDown(); return openTask }
     override fun output(channel: ChannelClient.Channel): Task<OutputStream> { outputRequested.countDown(); return outputTask }
     override fun close(channel: ChannelClient.Channel): Task<Void> {
-        closeCount.incrementAndGet(); onChannelClose(); closed.countDown(); return Tasks.forResult(null)
+        closeCount.incrementAndGet(); onChannelClose(); closed.countDown(); return closeTask()
     }
     override fun send(nodeId: String, path: String, bytes: ByteArray): Task<Int> {
         sent += path
+        sentBodies += path to bytes.copyOf()
         if (path == CaptureProtocol.STOP) stops.countDown()
         return Tasks.forResult(1)
     }
@@ -190,5 +193,64 @@ class CaptureTransportOwnershipTest {
         assertEquals(0L, failed.count)
         assertArrayEquals(bytes, wav.readBytes())
         attempt.close(); assertEquals(1, sdk.closeCount.get())
+    }
+
+    @Test fun lateActualOpenTaskAndFailedCloseTasksKeepAdmissionUntilExplicitRecovery() {
+        val sdk = FakeCaptureWearSdk()
+        val late = TaskCompletionSource<ChannelClient.Channel>()
+        val owner = dev.gitblame.voxgolem.capture.CaptureChannelRetirementOwner(1)
+        sdk.openTask = late.task
+        sdk.closeTask = { Tasks.forException(IllegalStateException("Synthetic asynchronous channel close failed")) }
+        val ownership = CaptureChannelOwnership(sdk, 20, owner)
+        val worker = Thread { runCatching { ownership.open("synthetic-phone", "/synthetic") } }
+        try {
+            worker.start(); assertTrue(sdk.opened.await(2, TimeUnit.SECONDS)); worker.join(2_000)
+            assertFalse(worker.isAlive); assertTrue(ownership.isRetired)
+            assertEquals(1, owner.size); assertNull(owner.reserve())
+            late.setResult(sdk.channel)
+            await { sdk.closeCount.get() == 3 }
+            assertEquals(1, owner.size); assertNull(owner.reserve())
+            sdk.closeTask = { Tasks.forResult(null) }
+            owner.retryFailedRetirements()
+            await { owner.size == 0 }
+            assertEquals(4, sdk.closeCount.get())
+        } finally {
+            sdk.closeTask = { Tasks.forResult(null) }
+            if (!late.task.isComplete) late.setException(IllegalStateException("Synthetic acquisition cancelled"))
+            ownership.close(); owner.retryFailedRetirements(); worker.interrupt(); worker.join(2_000)
+        }
+    }
+
+    @Test fun nativeCloseSuccessCannotForgetLateOutputOrItsFailedJavaClose() {
+        val sdk = FakeCaptureWearSdk()
+        val late = TaskCompletionSource<OutputStream>()
+        sdk.outputTask = late.task
+        val owner = dev.gitblame.voxgolem.capture.CaptureChannelRetirementOwner(1)
+        val ownership = CaptureChannelOwnership(sdk, 20, owner)
+        val attempts = AtomicInteger()
+        val recovered = java.util.concurrent.atomic.AtomicBoolean(false)
+        val worker = Thread { runCatching { ownership.output(ownership.open("synthetic-phone", "/synthetic")) } }
+        try {
+            worker.start(); assertTrue(sdk.outputRequested.await(2, TimeUnit.SECONDS)); worker.join(2_000)
+            assertFalse(worker.isAlive); assertTrue(sdk.closed.await(2, TimeUnit.SECONDS))
+            assertEquals(1, owner.size); assertNull(owner.reserve())
+            late.setResult(object : ByteArrayOutputStream() {
+                override fun close() { attempts.incrementAndGet(); if (!recovered.get()) error("Synthetic output close failed") }
+            })
+            await { attempts.get() == 3 }
+            assertEquals(1, owner.size); assertNull(owner.reserve())
+            recovered.set(true); owner.retryFailedRetirements()
+            await { owner.size == 0 }
+            assertEquals(4, attempts.get())
+        } finally {
+            recovered.set(true)
+            if (!late.task.isComplete) late.setException(IllegalStateException("Synthetic output acquisition cancelled"))
+            ownership.close(); owner.retryFailedRetirements(); worker.interrupt(); worker.join(2_000)
+        }
+    }
+
+    private fun await(condition: () -> Boolean) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+        while (!condition()) { check(System.nanoTime() < deadline) { "Synthetic SDK retirement did not complete" }; Thread.sleep(1) }
     }
 }

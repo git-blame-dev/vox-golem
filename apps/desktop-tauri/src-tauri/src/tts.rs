@@ -245,7 +245,6 @@ impl LocalTtsRuntime {
                 model_path.display()
             ));
         }
-        ensure_espeak_data_directory_env(model_path)?;
 
         let (sender, receiver) = mpsc::sync_channel::<SynthesisJob>(spec.max_queue);
         let generation = Arc::new(AtomicU64::new(0));
@@ -599,9 +598,6 @@ impl PiperOnnxEngine {
         }
 
         let try_provider = |cuda: bool| -> Result<ort::session::Session, String> {
-            if cuda {
-                ensure_windows_tts_cuda_runtime_dlls_beside_current_exe()?;
-            }
             let mut providers = if cuda {
                 ort::session::Session::builder()
                     .map_err(|e| format!("failed to create local tts ONNX session builder: {e}"))?
@@ -778,63 +774,6 @@ fn ensure_espeak_data_directory_env(model_path: &Path) -> Result<(), String> {
         };
         env::set_var("PIPER_ESPEAKNG_DATA_DIRECTORY", &strict_root);
         Ok(())
-    }
-}
-
-const TTS_CUDA_RUNTIME_DLLS: &[&str] = &[
-    "cublasLt64_12.dll",
-    "cublas64_12.dll",
-    "cufft64_11.dll",
-    "cudart64_12.dll",
-    "cudnn64_9.dll",
-    "cudnn_adv64_9.dll",
-    "cudnn_cnn64_9.dll",
-    "cudnn_engines_precompiled64_9.dll",
-    "cudnn_engines_runtime_compiled64_9.dll",
-    "cudnn_graph64_9.dll",
-    "cudnn_heuristic64_9.dll",
-    "cudnn_ops64_9.dll",
-    "onnxruntime_providers_cuda.dll",
-    "onnxruntime_providers_shared.dll",
-];
-
-fn verify_tts_cuda_runtime_dlls_in_dir(executable_dir: &Path) -> Result<(), String> {
-    let missing_dlls = TTS_CUDA_RUNTIME_DLLS
-        .iter()
-        .copied()
-        .filter(|dll_name| !executable_dir.join(dll_name).is_file())
-        .collect::<Vec<_>>();
-
-    if missing_dlls.is_empty() {
-        return Ok(());
-    }
-
-    Err(format!(
-    "local tts CUDA runtime DLLs are missing beside the current executable in {}: {}. Copy the missing DLLs into that directory before starting VoxGolem.",
-    executable_dir.display(),
-    missing_dlls.join(", ")
-))
-}
-
-fn ensure_windows_tts_cuda_runtime_dlls_beside_current_exe() -> Result<(), String> {
-    #[cfg(not(windows))]
-    {
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    {
-        let executable_path = env::current_exe().map_err(|error| {
-            format!("failed to resolve current executable for local tts CUDA DLL check: {error}")
-        })?;
-        let executable_dir = executable_path.parent().ok_or_else(|| {
-            format!(
-                "failed to resolve current executable directory for local tts CUDA DLL check: {}",
-                executable_path.display()
-            )
-        })?;
-
-        verify_tts_cuda_runtime_dlls_in_dir(executable_dir)
     }
 }
 
@@ -1105,6 +1044,7 @@ fn default_engine_factory(
     sample_rate_hz: u32,
     policy: TtsProviderPolicy,
 ) -> Result<(Box<dyn SynthesisEngine>, TtsActualProvider), String> {
+    ensure_espeak_data_directory_env(&model_path)?;
     let (engine, provider) = PiperOnnxEngine::new(&model_path, sample_rate_hz, policy)?;
     Ok((Box::new(engine), provider))
 }
@@ -1145,6 +1085,9 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{atomic::AtomicUsize, mpsc, Arc, Condvar, Mutex};
     use std::thread;
+    use std::time::{Duration, Instant};
+
+    const TEST_WAIT_BOUND: Duration = Duration::from_secs(20);
 
     static TTS_RUNTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1152,10 +1095,19 @@ mod tests {
 
     impl Drop for TestRuntimeGuard {
         fn drop(&mut self) {
-            while super::SYNTHESIS_PERMIT_OCCUPIED.load(std::sync::atomic::Ordering::Acquire) {
-                thread::yield_now();
+            let deadline = Instant::now() + TEST_WAIT_BOUND;
+            while super::SYNTHESIS_PERMIT_OCCUPIED.load(std::sync::atomic::Ordering::Acquire)
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(1));
             }
             let _ = super::reap_abandoned_synthesis();
+            if !thread::panicking() {
+                assert!(
+                    !super::SYNTHESIS_PERMIT_OCCUPIED.load(std::sync::atomic::Ordering::Acquire),
+                    "test synthesis did not retire within the cleanup bound"
+                );
+            }
         }
     }
 
@@ -1177,6 +1129,46 @@ mod tests {
         release: Arc<(Mutex<bool>, Condvar)>,
     }
 
+    struct ReleaseOnDrop(Arc<(Mutex<bool>, Condvar)>);
+
+    impl ReleaseOnDrop {
+        fn release(&self) {
+            let (lock, ready) = &*self.0;
+            *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+            ready.notify_all();
+        }
+    }
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    fn wait_for_release(release: &(Mutex<bool>, Condvar)) -> Result<(), String> {
+        let (lock, ready) = release;
+        let released = lock
+            .lock()
+            .map_err(|_| String::from("release lock is poisoned"))?;
+        let (released, _) = ready
+            .wait_timeout_while(released, TEST_WAIT_BOUND, |released| !*released)
+            .map_err(|_| String::from("release lock is poisoned"))?;
+        if !*released {
+            return Err(String::from("test worker release wait exceeded its bound"));
+        }
+        Ok(())
+    }
+
+    fn spawn_test_worker<T: Send + 'static>(
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> mpsc::Receiver<T> {
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(work());
+        });
+        receiver
+    }
+
     impl super::SynthesisEngine for FakeSynthesisEngine {
         fn synthesize(&mut self, text: &str) -> Result<super::LocalTtsAudio, String> {
             super::synthesize_fake_audio(text, self.sample_rate_hz)
@@ -1188,15 +1180,7 @@ mod tests {
             self.started
                 .send(())
                 .map_err(|_| String::from("failed to signal synthesis start"))?;
-            let (lock, ready) = &*self.release;
-            let mut released = lock
-                .lock()
-                .map_err(|_| String::from("release lock is poisoned"))?;
-            while !*released {
-                released = ready
-                    .wait(released)
-                    .map_err(|_| String::from("release lock is poisoned"))?;
-            }
+            wait_for_release(&self.release)?;
             super::synthesize_fake_audio(text, self.sample_rate_hz)
         }
     }
@@ -1245,6 +1229,50 @@ mod tests {
     }
 
     #[test]
+    fn auto_provider_keeps_successful_cuda_without_trying_cpu() {
+        let mut attempts = Vec::new();
+        let (runtime, provider) =
+            super::select_tts_provider(super::TtsProviderPolicy::Auto, |cuda| {
+                attempts.push(cuda);
+                Ok("synthetic-cuda-runtime")
+            })
+            .expect("successful CUDA initialization should be selected");
+
+        assert_eq!(attempts, [true]);
+        assert_eq!(runtime, "synthetic-cuda-runtime");
+        assert_eq!(provider, super::TtsActualProvider::Cuda);
+    }
+
+    #[test]
+    fn cpu_provider_does_not_attempt_cuda() {
+        let mut attempts = Vec::new();
+        let (_, provider) = super::select_tts_provider(super::TtsProviderPolicy::Cpu, |cuda| {
+            attempts.push(cuda);
+            Ok(())
+        })
+        .expect("CPU initialization should succeed");
+
+        assert_eq!(attempts, [false]);
+        assert_eq!(provider, super::TtsActualProvider::Cpu);
+    }
+
+    #[test]
+    fn blocking_fixture_releases_worker_on_unwind() {
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_release = Arc::clone(&release);
+        let result = spawn_test_worker(move || wait_for_release(&worker_release));
+        let unwound = std::panic::catch_unwind(move || {
+            let _release_on_drop = ReleaseOnDrop(release);
+            panic!("synthetic assertion failure before explicit release");
+        });
+        assert!(unwound.is_err());
+        result
+            .recv_timeout(TEST_WAIT_BOUND)
+            .expect("unwinding must release the blocked worker")
+            .expect("worker should observe release rather than its timeout");
+    }
+
+    #[test]
     fn pcm_normalization_rejects_non_finite_and_clamps_amplitude() {
         let mut invalid = [0.0, f32::NAN];
         assert!(super::normalize_pcm_samples(&mut invalid).is_err());
@@ -1275,38 +1303,33 @@ mod tests {
     }
 
     #[test]
-    fn contract_cuda_runtime_dll_check_lists_missing_executable_directory_dlls() {
-        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        fs::write(temp_dir.path().join("cublas64_12.dll"), b"fixture")
-            .expect("present dll fixture should be written");
+    fn cuda_provider_failure_is_preserved_without_cpu_fallback() {
+        let mut attempts = Vec::new();
+        let error = super::select_tts_provider::<()>(super::TtsProviderPolicy::Cuda, |cuda| {
+            attempts.push(cuda);
+            Err(String::from("synthetic ORT CUDA initialization failure"))
+        })
+        .expect_err("explicit CUDA must not silently fall back");
 
-        let error = super::verify_tts_cuda_runtime_dlls_in_dir(temp_dir.path())
-            .expect_err("missing CUDA runtime DLLs should fail before provider init");
-
-        assert!(
-            error.contains("local tts CUDA runtime DLLs are missing beside the current executable")
-        );
-        assert!(error.contains("cublasLt64_12.dll"));
-        assert!(error.contains("cufft64_11.dll"));
-        assert!(error.contains("cudart64_12.dll"));
-        assert!(error.contains("cudnn64_9.dll"));
-        assert!(error.contains("cudnn_ops64_9.dll"));
-        assert!(error.contains("onnxruntime_providers_cuda.dll"));
-        assert!(error.contains("onnxruntime_providers_shared.dll"));
-        assert!(!error.contains("CUDA_PATH"));
-        assert!(!error.contains("PATH"));
+        assert_eq!(attempts, [true]);
+        assert_eq!(error, "synthetic ORT CUDA initialization failure");
     }
 
     #[test]
-    fn contract_cuda_runtime_dll_check_accepts_complete_executable_directory() {
-        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        for dll_name in super::TTS_CUDA_RUNTIME_DLLS {
-            fs::write(temp_dir.path().join(dll_name), b"fixture")
-                .expect("dll fixture should be written");
-        }
+    fn auto_provider_preserves_cpu_error_when_both_initializations_fail() {
+        let mut attempts = Vec::new();
+        let error = super::select_tts_provider::<()>(super::TtsProviderPolicy::Auto, |cuda| {
+            attempts.push(cuda);
+            Err(String::from(if cuda {
+                "synthetic CUDA failure"
+            } else {
+                "synthetic CPU failure"
+            }))
+        })
+        .expect_err("failed CPU fallback must surface its error");
 
-        super::verify_tts_cuda_runtime_dlls_in_dir(temp_dir.path())
-            .expect("complete CUDA runtime DLL set should pass preflight");
+        assert_eq!(attempts, [true, false]);
+        assert_eq!(error, "synthetic CPU failure");
     }
 
     #[test]
@@ -1466,6 +1489,7 @@ mod tests {
         fs::write(&model_path, b"fixture").expect("model fixture should be written");
         let (started_tx, started_rx) = mpsc::channel();
         let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_on_drop = ReleaseOnDrop(Arc::clone(&release));
         let engine_release = Arc::clone(&release);
         let runtime = Arc::new(
             LocalTtsRuntime::new_with_engine_factory(
@@ -1492,21 +1516,19 @@ mod tests {
         );
         let generation = runtime.start_generation();
         let synthesizing_runtime = Arc::clone(&runtime);
-        let synthesis = thread::spawn(move || {
+        let synthesis = spawn_test_worker(move || {
             synthesizing_runtime.synthesize_for_generation("hello", generation)
         });
         started_rx
-            .recv()
+            .recv_timeout(TEST_WAIT_BOUND)
             .expect("synthesis should reach the blocking engine");
 
         runtime.cancel_generation();
-        let (lock, ready) = &*release;
-        *lock.lock().expect("release lock") = true;
-        ready.notify_all();
+        release_on_drop.release();
 
         let error = synthesis
-            .join()
-            .expect("synthesis thread should join")
+            .recv_timeout(TEST_WAIT_BOUND)
+            .expect("synthesis caller should finish within the bound")
             .expect_err("superseded in-flight synthesis must not return audio");
         assert_eq!(error, super::SYNTHESIS_CANCELLED);
 
@@ -1524,6 +1546,7 @@ mod tests {
         fs::write(&model_path, b"fixture").expect("model fixture should be written");
         let (started_tx, started_rx) = mpsc::channel();
         let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_on_drop = ReleaseOnDrop(Arc::clone(&release));
         let factory_calls = Arc::new(AtomicUsize::new(0));
         let engine_release = Arc::clone(&release);
         let factory_call_count = Arc::clone(&factory_calls);
@@ -1566,7 +1589,7 @@ mod tests {
                 first_result_tx.send(first_runtime.synthesize_for_generation("first", generation));
         });
         started_rx
-            .recv()
+            .recv_timeout(TEST_WAIT_BOUND)
             .expect("first synthesis should reach the blocking engine");
 
         runtime.cancel_generation();
@@ -1582,9 +1605,7 @@ mod tests {
             .expect_err("a second blocked cancellation must exhaust the worker budget");
         assert!(error.contains("abandoned synthesis budget exhausted"));
 
-        // Do not leave the deliberately blocked native runner contaminating later tests.
-        *release.0.lock().expect("release lock") = true;
-        release.1.notify_all();
+        release_on_drop.release();
     }
 
     #[test]
@@ -1611,9 +1632,9 @@ mod tests {
         runtime.cancel_generation();
         let stale = Arc::clone(&runtime);
         let stale_result =
-            thread::spawn(move || stale.synthesize_for_generation("stale", old_generation))
-                .join()
-                .expect("stale request should join")
+            spawn_test_worker(move || stale.synthesize_for_generation("stale", old_generation))
+                .recv_timeout(TEST_WAIT_BOUND)
+                .expect("stale request should finish within the bound")
                 .expect_err("cancelled generation must be rejected");
         assert_eq!(stale_result, super::SYNTHESIS_CANCELLED);
 
@@ -1631,6 +1652,7 @@ mod tests {
         fs::write(&model_path, b"fixture").expect("model fixture should be written");
         let (started_tx, started_rx) = mpsc::channel();
         let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_on_drop = ReleaseOnDrop(Arc::clone(&release));
         let engine_release = Arc::clone(&release);
         let runtime = Arc::new(
             LocalTtsRuntime::new_with_engine_factory(
@@ -1659,31 +1681,30 @@ mod tests {
         let generation = runtime.start_generation();
         let first_runtime = Arc::clone(&runtime);
         let first =
-            thread::spawn(move || first_runtime.synthesize_for_generation("first", generation));
+            spawn_test_worker(move || first_runtime.synthesize_for_generation("first", generation));
         started_rx
-            .recv()
+            .recv_timeout(TEST_WAIT_BOUND)
             .expect("first synthesis should reach the blocking engine");
 
         let queued_runtime = Arc::clone(&runtime);
-        let queued =
-            thread::spawn(move || queued_runtime.synthesize_for_generation("queued", generation));
+        let queued = spawn_test_worker(move || {
+            queued_runtime.synthesize_for_generation("queued", generation)
+        });
         runtime.cancel_generation();
 
-        let (lock, ready) = &*release;
-        *lock.lock().expect("release lock") = true;
-        ready.notify_all();
+        release_on_drop.release();
 
         assert_eq!(
             first
-                .join()
-                .expect("first synthesis should join")
+                .recv_timeout(TEST_WAIT_BOUND)
+                .expect("first synthesis should finish within the bound")
                 .unwrap_err(),
             super::SYNTHESIS_CANCELLED
         );
         assert_eq!(
             queued
-                .join()
-                .expect("queued synthesis should join")
+                .recv_timeout(TEST_WAIT_BOUND)
+                .expect("queued synthesis should finish within the bound")
                 .unwrap_err(),
             super::SYNTHESIS_CANCELLED
         );
@@ -1703,12 +1724,15 @@ mod tests {
                 max_queue: 4,
                 sample_rate_hz: 22_050,
                 max_duration_s: 300,
-                provider_policy: super::TtsProviderPolicy::Auto,
+                provider_policy: super::TtsProviderPolicy::Cuda,
             },
-            Arc::new(|_, _, _| {
-                Err(String::from(
-                    "failed to initialize CUDA execution provider for local tts: unavailable",
-                ))
+            Arc::new(|_, _, policy| {
+                super::select_tts_provider(policy, |cuda| {
+                    assert!(cuda, "explicit CUDA must not initialize CPU fallback");
+                    Err(String::from(
+                        "failed to initialize CUDA execution provider for local tts: unavailable",
+                    ))
+                })
             }),
         );
 
@@ -1751,16 +1775,13 @@ mod tests {
         let model_path = temp_dir.path().join("jarvis.onnx");
         fs::write(&model_path, b"fixture").expect("model fixture should be written");
         let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_on_drop = ReleaseOnDrop(Arc::clone(&release));
         let calls = Arc::new(AtomicUsize::new(0));
         let factory_release = Arc::clone(&release);
         let factory_calls = Arc::clone(&calls);
         let factory: super::SynthesisEngineFactory = Arc::new(move |_, sample_rate_hz, _| {
             factory_calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            let (lock, ready) = &*factory_release;
-            let mut released = lock.lock().expect("release lock");
-            while !*released {
-                released = ready.wait(released).expect("release lock");
-            }
+            wait_for_release(&factory_release)?;
             Ok((
                 Box::new(FakeSynthesisEngine { sample_rate_hz }) as Box<dyn super::SynthesisEngine>,
                 super::TtsActualProvider::Cpu,
@@ -1784,13 +1805,16 @@ mod tests {
         assert!(second.contains("still pending"));
         assert_eq!(calls.load(std::sync::atomic::Ordering::Acquire), 1);
 
-        let (lock, ready) = &*release;
-        *lock.lock().expect("release lock") = true;
-        ready.notify_all();
+        release_on_drop.release();
+        let deadline = Instant::now() + TEST_WAIT_BOUND;
         let third = loop {
             match LocalTtsRuntime::new_with_engine_factory(spec(), Arc::clone(&factory)) {
                 Ok(runtime) => break runtime,
                 Err(error) if error.contains("still pending") => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "initialization was not reaped within the bound"
+                    );
                     thread::sleep(std::time::Duration::from_millis(10));
                 }
                 Err(error) => panic!("reaped initialization should retry: {error}"),

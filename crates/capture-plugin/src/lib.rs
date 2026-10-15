@@ -131,16 +131,50 @@ async fn finalize_capture<R: Runtime>(
 #[tauri::command]
 async fn update_transcript<R: Runtime>(
     app: tauri::AppHandle<R>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<(), CaptureError> {
+    let arguments = transcript_arguments(request.body())?;
+    run_command(app, "update_transcript", arguments)
+        .await
+        .map(|_| ())
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateTranscriptArguments {
     capture_id: String,
     text: String,
-) -> Result<(), CaptureError> {
-    run_command(
-        app,
-        "update_transcript",
-        serde_json::json!({ "captureId": capture_id, "text": text }),
-    )
-    .await
-    .map(|_| ())
+    #[serde(
+        default,
+        deserialize_with = "supplied_transcript_version",
+        skip_serializing_if = "Option::is_none"
+    )]
+    expected_version: Option<u64>,
+}
+
+fn supplied_transcript_version<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    let version = <u64 as serde::Deserialize>::deserialize(deserializer)?;
+    if version > i64::MAX as u64 {
+        return Err(serde::de::Error::custom(
+            "transcript version exceeds native range",
+        ));
+    }
+    Ok(Some(version))
+}
+
+/// Parse the actual invoke body so omission remains distinct from an explicitly invalid null.
+fn transcript_arguments(body: &tauri::ipc::InvokeBody) -> Result<serde_json::Value, CaptureError> {
+    let invalid = || CaptureError {
+        message: "transcript-update-unavailable".to_owned(),
+    };
+    let tauri::ipc::InvokeBody::Json(value) = body else {
+        return Err(invalid());
+    };
+    let arguments: UpdateTranscriptArguments =
+        serde_json::from_value(value.clone()).map_err(|_| invalid())?;
+    serde_json::to_value(arguments).map_err(|_| invalid())
 }
 
 pub fn init<R: Runtime>() -> tauri::plugin::TauriPlugin<R> {
@@ -168,4 +202,52 @@ pub fn init<R: Runtime>() -> tauri::plugin::TauriPlugin<R> {
             Ok(())
         })
         .build()
+}
+
+#[cfg(test)]
+mod transcript_bridge_tests {
+    use super::*;
+    use serde_json::json;
+
+    const ID: &str = "123e4567-e89b-42d3-a456-426614174094";
+
+    #[test]
+    fn actual_invoke_body_forwards_selected_version_and_preserves_legacy_omission() {
+        for version in [0, 3, i64::MAX as u64] {
+            let input = json!({"captureId": ID, "text": "Synthetic correction", "expectedVersion": version});
+            assert_eq!(
+                transcript_arguments(&tauri::ipc::InvokeBody::Json(input.clone())).unwrap(),
+                input
+            );
+        }
+        let legacy = json!({"captureId": ID, "text": "Synthetic legacy correction"});
+        assert_eq!(
+            transcript_arguments(&tauri::ipc::InvokeBody::Json(legacy.clone())).unwrap(),
+            legacy
+        );
+    }
+
+    #[test]
+    fn actual_invoke_body_rejects_invalid_version_types_and_range_before_native_dispatch() {
+        for version in [
+            json!(-1),
+            json!(1.0),
+            json!(1.25),
+            json!("3"),
+            json!(true),
+            json!(null),
+            json!([]),
+            json!({}),
+            json!(i64::MAX as u64 + 1),
+        ] {
+            let input = json!({"captureId": ID, "text": "Synthetic rejected correction", "expectedVersion": version});
+            assert_eq!(
+                transcript_arguments(&tauri::ipc::InvokeBody::Json(input))
+                    .unwrap_err()
+                    .message,
+                "transcript-update-unavailable"
+            );
+        }
+        assert!(transcript_arguments(&tauri::ipc::InvokeBody::Raw(vec![1, 2, 3])).is_err());
+    }
 }

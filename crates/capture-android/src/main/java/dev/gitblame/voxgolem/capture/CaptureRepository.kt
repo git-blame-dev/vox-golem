@@ -65,6 +65,47 @@ class CaptureRepository(context: Context) {
         }
     }
 
+    /** Domain outboxes avoid unrelated active rows and do not truncate at a history page. */
+    fun pendingNoteTransfers(): List<CaptureRecord> = finalizedNotes(includeInterrupted = true).filter { record ->
+        record.localAudioPath?.endsWith(".wav") == true &&
+            (record.transferState != TransferState.PHONE_ARCHIVED ||
+                (record.captureState == CaptureState.SAVED && !record.completionNotified && record.recognitionState != RecognitionState.NO_SPEECH))
+    }
+
+    fun savedNotes(): List<CaptureRecord> = finalizedNotes(includeInterrupted = false)
+
+    private fun finalizedNotes(includeInterrupted: Boolean): List<CaptureRecord> = synchronized(monitor) {
+        helper.readableDatabase.rawQuery(
+            "SELECT body FROM captures WHERE capture_state " +
+                (if (includeInterrupted) "IN ('SAVED','INTERRUPTED')" else "= 'SAVED'") +
+                " ORDER BY created_at_utc DESC, capture_id DESC", null,
+        ).use { cursor -> buildList {
+            while (cursor.moveToNext()) decode(cursor.getString(0)).takeIf { it.purpose == CapturePurpose.NOTE }?.let(::add)
+        } }
+    }
+
+    /** Manual text is terminal authority. This transaction fences all older recognition attempts. */
+    fun correctTranscript(id: String, text: String, expectedVersion: Long? = null): CaptureRecord = update(id) { current ->
+        require(current.purpose == CapturePurpose.NOTE) { "Only Note transcripts can be edited" }
+        require(current.captureState == CaptureState.SAVED) { "Only finalized captures can be edited" }
+        require(text.length <= 1_000_000) { "Transcript is too long" }
+        require(expectedVersion == null || expectedVersion >= 0) { "Invalid transcript version" }
+        if (expectedVersion != null && expectedVersion != current.transcriptVersion) throw CaptureTranscriptConflictException()
+        current.copy(finalText = text, previewText = text,
+            recognitionState = if (text.isBlank()) RecognitionState.NO_SPEECH else RecognitionState.FINAL,
+            recognitionSessionId = null, transcriptVersion = current.transcriptVersion + 1, nextRetryAtUtc = null,
+            liveTranscriptionState = if (text.isBlank()) LiveTranscriptionState.UNAVAILABLE else LiveTranscriptionState.COMPLETED,
+            liveStatusRevision = current.liveStatusRevision + 1, canTranscribeLive = false,
+            liveErrorCode = if (text.isBlank()) "no-speech-detected" else null,
+            lastErrorStage = current.lastErrorStage.takeUnless { it in setOf("recognition", "execution", "delivery") },
+            lastErrorCode = current.lastErrorCode.takeUnless { current.lastErrorStage in setOf("recognition", "execution", "delivery") },
+            orgState = when {
+                current.orgState == OrgState.EXPORTED -> OrgState.EXPORTED
+                text.isBlank() -> OrgState.WAITING_FOR_TRANSCRIPT
+                else -> OrgState.READY
+            })
+    } ?: throw IllegalArgumentException("Capture was not found")
+
     fun save(record: CaptureRecord): CaptureRecord = synchronized(monitor) {
         validate(record)
         val normalized = record.copy(captureId = record.captureId.lowercase())
@@ -284,3 +325,5 @@ class CaptureRepository(context: Context) {
         private fun JSONObject.nullableLong(key: String): Long? = if (isNull(key)) null else getLong(key)
     }
 }
+
+class CaptureTranscriptConflictException : IllegalStateException("transcript-conflict")

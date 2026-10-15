@@ -62,7 +62,7 @@ class WatchInputControllerTest {
         assertFalse(result.isDone); assertTrue(f.closed); assertTrue(f.transport.ended)
         assertEquals(InputKind.STOP, f.transport.controls.last().kind)
         f.controller.receive("synthetic-phone", f.reply(InputKind.FINAL, 3, "synthetic authoritative"))
-        assertEquals("synthetic authoritative", result.join().text); assertTrue(result.join().authoritative)
+        assertEquals("synthetic authoritative", result.get(2, java.util.concurrent.TimeUnit.SECONDS).text); assertTrue(result.get(2, java.util.concurrent.TimeUnit.SECONDS).authoritative)
         assertNull(f.lease.current())
     }
     @Test fun homeInterruptCancelsAndLateChannelReadyCannotOpenMic() {
@@ -89,8 +89,8 @@ class WatchInputControllerTest {
         f.controller.receive("synthetic-phone", f.reply(InputKind.PARTIAL, 1, "synthetic saved-in-ui draft"))
         val result = f.controller.stop(session)
         f.now = 5000; f.controller.tick()
-        assertFalse(result.join().authoritative)
-        assertEquals("synthetic saved-in-ui draft", result.join().text)
-        assertEquals("final_timeout", result.join().error)
+        assertFalse(result.get(2, java.util.concurrent.TimeUnit.SECONDS).authoritative)
+        assertEquals("synthetic saved-in-ui draft", result.get(2, java.util.concurrent.TimeUnit.SECONDS).text)
+        assertEquals("final_timeout", result.get(2, java.util.concurrent.TimeUnit.SECONDS).error)
     }
 }

@@ -11,7 +11,7 @@ SCRIPT = Path(os.environ.get('LLAMA_RECIPE_UNDER_TEST', Path(__file__).with_name
 
 class LocalRuntimeRecipeTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix='synthetic-llama-recipe-')
+        self.temporary = tempfile.TemporaryDirectory(prefix='synthetic-llama-recipe-', dir='/tmp/opencode')
         self.root = Path(self.temporary.name)
         self.source = self.root / 'synthetic-source'
         self.repository = self.root / 'synthetic-vox'
@@ -70,7 +70,43 @@ fi
 
     def run_recipe(self, **changes):
         return subprocess.run(['bash', str(self.recipe)], env=dict(self.env, **changes),
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, timeout=15)
+
+    def test_wrong_pin_and_dirty_checkout_rejected_before_build(self):
+        for mode, expected in (('wrong-pin', 'must be pinned'), ('dirty', 'must be clean')):
+            with self.subTest(mode=mode):
+                self.write_tool('git', '#!/bin/sh\ncase "$*" in *rev-parse*) echo ' +
+                                ('0000000000000000000000000000000000000000' if mode == 'wrong-pin' else 'ac2557cb24def295888ef47f1a35b401d978c510') +
+                                ';; *status*) ' + ('echo " M synthetic-file"' if mode == 'dirty' else ':') + ';; esac\n')
+                result = self.run_recipe()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected, result.stderr)
+                self.assertFalse(self.marker.exists())
+                self.assertFalse(self.runtime.exists())
+
+    def test_missing_cuda_rejected_before_build(self):
+        (self.root / 'cuda/bin/nvcc').unlink()
+        result = self.run_recipe()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('CUDA compiler unavailable', result.stderr)
+        self.assertFalse(self.marker.exists())
+
+    def test_bad_rpath_cleans_stage_without_publishing(self):
+        self.write_tool('patchelf', '#!/bin/sh\ncase "$1" in --print-rpath) echo /synthetic/wrong;; esac\n')
+        result = self.run_recipe()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Runtime library path validation failed', result.stderr)
+        self.assertFalse(self.runtime.exists())
+        self.assertFalse(list(self.root.glob('external-runtime.stage.*')))
+
+    def test_existing_destination_is_preserved_without_build(self):
+        self.runtime.mkdir()
+        sentinel = self.runtime / 'synthetic-sentinel'
+        sentinel.write_bytes(b'synthetic existing bytes')
+        result = self.run_recipe()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(sentinel.read_bytes(), b'synthetic existing bytes')
+        self.assertFalse(self.marker.exists())
 
     def test_rejects_checkout_outputs_and_overlapping_directories_before_cmake(self):
         cases = (
@@ -113,7 +149,7 @@ fi
         self.assertTrue((self.runtime / 'bin/llama-server').is_file())
         self.assertTrue((self.runtime / 'bin/libsynthetic.so').is_symlink())
         self.assertEqual((self.runtime / 'LICENSE').read_text(), 'Synthetic licence fixture\n')
-        subprocess.run(['sha256sum', '-c', 'SHA256SUMS'], cwd=self.runtime, check=True, capture_output=True)
+        subprocess.run(['sha256sum', '-c', 'SHA256SUMS'], cwd=self.runtime, check=True, capture_output=True, timeout=10)
 
 
 if __name__ == '__main__':

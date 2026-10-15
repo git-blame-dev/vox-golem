@@ -56,6 +56,7 @@ class GmsAssistantInputTransportTest {
         lateinit var messages: MessageClient.OnMessageReceivedListener
         val closed = CopyOnWriteArrayList<ChannelClient.Channel>()
         val sent = CountDownLatch(1)
+        val terminalSent = CountDownLatch(1)
         val requestedOutput = CountDownLatch(1)
         val output = DelayedReaderOutput()
         var outputTask: Task<OutputStream> = Tasks.forResult(output)
@@ -76,8 +77,9 @@ class GmsAssistantInputTransportTest {
         })
         override fun send(node: String, path: String, bytes: ByteArray): Task<Int> {
             sent.countDown()
-            return if (AssistantInputWire.decode(bytes).kind in setOf(InputKind.FINAL, InputKind.ERROR))
-                terminalSendTask ?: Tasks.forResult(1) else Tasks.forResult(1)
+            return if (AssistantInputWire.decode(bytes).kind in setOf(InputKind.FINAL, InputKind.ERROR)) {
+                terminalSent.countDown(); terminalSendTask ?: Tasks.forResult(1)
+            } else Tasks.forResult(1)
         }
         override fun open(node: String, path: String): Task<ChannelClient.Channel> = Tasks.forResult(Channel(path, node))
         override fun input(channel: ChannelClient.Channel) = inputTask
@@ -147,7 +149,7 @@ class GmsAssistantInputTransportTest {
             val pcm = ByteArray(640) { 7 }
             assertTrue(transport.audio(pcm)); transport.finishAudio()
             assertTrue(clients.output.halfClosed.await(2, TimeUnit.SECONDS))
-            Thread.sleep(100)
+            assertTrue(transport.awaitAudioIoRetired(2000))
             assertTrue("Normal source EOF must not close the whole Channel", clients.closed.isEmpty())
             val delayed = clients.output.readAfterHalfClose()
             assertArrayEquals(pcm, PcmChannelWire.read(delayed)); assertNull(PcmChannelWire.read(delayed))
@@ -166,10 +168,10 @@ class GmsAssistantInputTransportTest {
         try {
             val incoming = Channel(AssistantInputWire.audioPath(session))
             clients.callback.onChannelOpened(incoming)
-            waitUntil { ended }; Thread.sleep(100)
+            waitUntil { ended }; assertTrue(transport.awaitAudioIoRetired(2000))
             assertTrue("Receiver must retain its accepted handle while STT finishes", clients.closed.isEmpty())
             transport.control("synthetic-peer", start().copy(kind = InputKind.FINAL, sequence = 1, text = "synthetic final"))
-            Thread.sleep(100); assertTrue(clients.closed.isEmpty())
+            assertTrue(clients.terminalSent.await(2, TimeUnit.SECONDS)); assertTrue(clients.closed.isEmpty())
             terminal.setResult(1)
             waitUntil { clients.closed.contains(incoming) }
         } finally { transport.close() }
@@ -183,6 +185,8 @@ class GmsAssistantInputTransportTest {
             assertTrue(clients.requestedOutput.await(2, TimeUnit.SECONDS))
             transport.cancelAudio(); result.setResult(clients.output)
             assertTrue(clients.output.halfClosed.await(2, TimeUnit.SECONDS))
+            waitUntil { clients.closed.isNotEmpty() }
+            assertEquals(1, clients.closed.size)
             assertTrue(clients.closed.all { it.path == AssistantInputWire.audioPath(session) })
         } finally { transport.close() }
     }

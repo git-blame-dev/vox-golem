@@ -88,5 +88,10 @@ same process/boot share the native elapsed-realtime observer; Rust `Instant`,
 logcat timestamps and WebView performance timestamps must not be subtracted from
 one another. Separate process-cold, warm resume, first provider request and reused
 request trials; keep build, model, effort, synthetic history and instrumentation
-conditions comparable. The legacy `scripts/android-e2e-smoke.py` whole-document
-text-growth heuristic is not valid first-answer latency evidence.
+conditions comparable. `scripts/android-e2e-smoke.py` requires explicit local ADB
+routing and a DevTools target. It observes a newly UI-admitted request, correlated
+nonblank text, authoritative successful terminal metadata, and a sleeping shell;
+disabled Send, error/refusal/cancellation, or missing metadata fail closed. Its
+metric is **first new answer observed**, not provider TTFB or painted pixels.
+Live CDP execution requires the existing Python `websockets` prerequisite. The
+synthetic observer tests do not establish actual WebView or provider acceptance.

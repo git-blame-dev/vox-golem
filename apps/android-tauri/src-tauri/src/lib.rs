@@ -138,7 +138,22 @@ async fn list_assistant_heads<R: Runtime>(
 native_command!(assistant_voice_status);
 native_command!(open_speech_services_store);
 native_command!(finish_assistant_dictation);
-native_command!(stop_assistant_voice);
+#[tauri::command]
+async fn stop_assistant_voice<R: Runtime>(
+    app: AppHandle<R>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<Value, StructuredPluginInvokeError> {
+    let arguments = match request.body() {
+        tauri::ipc::InvokeBody::Json(body) => tauri_plugin_assistant::voice_stop_arguments(body)?,
+        tauri::ipc::InvokeBody::Raw(_) => {
+            return Err(StructuredPluginInvokeError {
+                code: "invalid_input".into(),
+                message: "Voice session ID is invalid".into(),
+            })
+        }
+    };
+    tauri_plugin_assistant::forward(app, "stop_assistant_voice", arguments).await
+}
 native_command!(assistant_pairing_status);
 native_command!(new_voice_shortcut_status);
 native_command!(pin_new_voice_shortcut);

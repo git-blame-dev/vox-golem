@@ -86,7 +86,7 @@ class ApplicationAssistantInputPeersTest {
             val peers = ApplicationAssistantInputPeers(State(selection), sdk)
             try {
                 peers.onForeground(true); assertTrue(sdk.requested.await(2, TimeUnit.SECONDS))
-                Thread.sleep(100); shadowOf(Looper.getMainLooper()).idle()
+                await { !peers.resolutionPending() }
                 assertNull(peers.selected()); assertFalse(peers.accepts("synthetic-node", peer, local))
             } finally { peers.close() }
         }
@@ -96,7 +96,7 @@ class ApplicationAssistantInputPeersTest {
         val peers = ApplicationAssistantInputPeers(State(selection), sdk)
         try {
             peers.onForeground(true); assertTrue(sdk.requested.await(2, TimeUnit.SECONDS))
-            Thread.sleep(100); shadowOf(Looper.getMainLooper()).idle()
+            await { !peers.resolutionPending() }
             assertNull(peers.selected())
         } finally { peers.close() }
     }
@@ -108,7 +108,8 @@ class ApplicationAssistantInputPeersTest {
         try {
             peers.onForeground(true); assertTrue(sdk.requested.await(2, TimeUnit.SECONDS))
             peers.onForeground(false); pending.setResult(sdk.capabilityValue())
-            Thread.sleep(50); shadowOf(Looper.getMainLooper()).idle(); assertNull(peers.selected())
+            peers.resolutionBarrier().get(2, TimeUnit.SECONDS)
+            shadowOf(Looper.getMainLooper()).idle(); assertNull(peers.selected())
             sdk.deferred = null; peers.onForeground(true); await { peers.selected() != null }
             time = 3001; assertNull(peers.selected()); assertFalse(peers.accepts("synthetic-node", peer, local))
         } finally { peers.close() }
@@ -127,9 +128,15 @@ class ApplicationAssistantInputPeersTest {
                 .put("installation", peer).put("replica", replica).put("credentials", false))
         }
         val state = ApplicationInputPeerState(context)
-        assertEquals(InputPeerSelection(installation, peer, replica, association, AssistantPeerRole.WATCH), state.selected())
+        val published = requireNotNull(state.selected())
+        assertEquals(InputPeerSelection(installation, peer, replica, association, AssistantPeerRole.WATCH, published.approvalVersion), published)
+        assertTrue(state.stillApproved(published))
         assertFalse(File(root, "assistant-auth.json").exists())
         EnrolledPeerRegistry(context).use { it.revoke(replica) }
+        assertFalse(state.stillApproved(published))
         assertNull(state.selected())
+        EnrolledPeerRegistry(context).use { it.rememberPeer(ApprovedPeerBinding(replica, association)) }
+        assertNotNull(state.selected())
+        assertFalse("Exact rebinding cannot revive the older approval publication", state.stillApproved(published))
     }
 }

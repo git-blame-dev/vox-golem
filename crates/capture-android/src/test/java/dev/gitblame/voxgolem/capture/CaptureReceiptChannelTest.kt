@@ -23,9 +23,10 @@ class CaptureReceiptChannelTest {
     }
     @Test fun finiteDeadlineRejectsLateCommitAndClosesLateResource() {
         val nativeClosed = CountDownLatch(1)
-        val lifetime = CaptureChannelRetirementOwner(1).reserve(20)!!
-        lifetime.acquiredNative { completed -> nativeClosed.countDown(); completed(true) }
+        val lifetime = CaptureChannelRetirementOwner(1).reserve()!!
         lifetime.beginStreamAcquisition()
+        lifetime.acquiredNative { completed -> nativeClosed.countDown(); completed(true) }
+        lifetime.close()
         assertTrue(nativeClosed.await(2, TimeUnit.SECONDS))
         var committed = false
         assertFalse(lifetime.ifActive { committed = true })

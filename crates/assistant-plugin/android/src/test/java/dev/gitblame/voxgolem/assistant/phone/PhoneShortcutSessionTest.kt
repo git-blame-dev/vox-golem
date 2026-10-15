@@ -31,7 +31,7 @@ class PhoneShortcutSessionTest {
         var stops = 0
         override fun busy() = busy
         override fun saveSpeechDraft(text: String) { drafts += text }
-        override fun stopAll() { stops++ }
+        override fun stopSpeechRequest(requestId: String) { stops++ }
         override fun nativePreferences() = JSONObject().put("tts_enabled", false)
         override var speechStatus: JSONObject? = null
         override var onPreferencesChanged: ((Boolean) -> Unit)? = null

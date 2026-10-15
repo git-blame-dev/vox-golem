@@ -165,7 +165,10 @@ class WatchReplyLatencyTest {
                     }
                     matched
                 }
-                val expectedLabel = "Assistant · $measured ms"
+                assertEquals("999 ms", dev.gitblame.voxgolem.android.wear.formatVisibleDuration(999))
+                assertEquals("1 s", dev.gitblame.voxgolem.android.wear.formatVisibleDuration(1000))
+                assertEquals("1.25 s", dev.gitblame.voxgolem.android.wear.formatVisibleDuration(1250))
+                val expectedLabel = "Assistant · ${dev.gitblame.voxgolem.android.wear.formatVisibleDuration(measured)}"
                 val initiallyVisible = hasVisibleExactLabel(expectedLabel)
                 instrumentation.sendStatus(0, Bundle().apply {
                     putString("stream", "\nphase=native-history-metric-retained " +
@@ -174,7 +177,7 @@ class WatchReplyLatencyTest {
                 // Following the reply's end can leave its header above the round viewport.
                 // Scroll only the owned synthetic chat; do not inspect message contents.
                 if (!initiallyVisible) scrollChatBackward()
-                await("The completed reply must display its exact millisecond label") {
+                await("The completed reply must display its exact public duration label") {
                     hasVisibleExactLabel(expectedLabel)
                 }
                 assertTrue("No later admission or metric replacement is allowed", !duplicate.get() && !invalidMetric.get())

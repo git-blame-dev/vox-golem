@@ -14,10 +14,12 @@ import android.view.inputmethod.EditorInfo
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import dev.gitblame.voxgolem.assistant.AssistantDraftBudget
 
 internal object AssistantTextInput {
     const val KEY = "assistant-draft"
     const val DRAFT = "assistant.initial-draft"
+    fun accepts(text: String): Boolean = AssistantDraftBudget.accepts(text)
     fun result(text: String): Intent = Intent().also { result ->
         RemoteInput.addResultsToIntent(arrayOf(RemoteInput.Builder(KEY).build()), result, Bundle().apply { putCharSequence(KEY, text) })
     }
@@ -57,7 +59,6 @@ class AssistantTextEntryActivity : Activity() {
             setHintTextColor(Color.LTGRAY)
             setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 16f)
             backgroundTintList = ColorStateList.valueOf(Color.WHITE)
-            filters = arrayOf(android.text.InputFilter.LengthFilter(32 * 1024))
             setSelection(text.length)
             setOnEditorActionListener { _, action, _ ->
                 if (action == EditorInfo.IME_ACTION_DONE) { confirmDraft(); true } else false
@@ -94,7 +95,12 @@ class AssistantTextEntryActivity : Activity() {
     }
     private fun confirmDraft() {
         if (isFinishing) return
-        setResult(RESULT_OK, AssistantTextInput.result(input.text.toString()))
+        val draft = input.text.toString()
+        if (!AssistantTextInput.accepts(draft)) {
+            input.error = "Draft exceeds 32 KiB. Shorten it before using text."
+            return // Never truncate or close the only copy of a rejected draft.
+        }
+        setResult(RESULT_OK, AssistantTextInput.result(draft))
         finish()
     }
     override fun onSaveInstanceState(outState: Bundle) {

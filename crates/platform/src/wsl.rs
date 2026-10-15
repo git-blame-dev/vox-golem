@@ -16,35 +16,68 @@ const ETXTBSY_RETRY_COUNT: usize = 20;
 const ETXTBSY_RETRY_DELAY: Duration = Duration::from_millis(10);
 const OWNED_PROCESS_WRAPPER: &str = r#"
 mode=$0
-child=$1
-shift
-exec 3<&0
-if [ "$mode" = quiet ]; then
-    setsid "$child" "$@" </dev/null >/dev/null 2>/dev/null &
-elif [ "$mode" = capture ]; then
-    setsid "$child" "$@" </dev/null &
-else
-    exit 2
-fi
-pid=$!
-terminate_group() {
-    kill -TERM -"$pid" 2>/dev/null || true
-    count=0
-    while kill -0 -"$pid" 2>/dev/null && [ "$count" -lt 10 ]; do
-        sleep 0.05
-        count=$((count + 1))
-    done
-    kill -KILL -"$pid" 2>/dev/null || true
+case "$mode" in quiet|capture) ;; *) exit 2 ;; esac
+umask 077
+directory=$(mktemp -d) || exit 125
+cleanup() {
+    exec 4>&-
+    rm -f "$directory/events" "$directory/status"
+    rmdir "$directory"
 }
-trap 'terminate_group; exit 143' HUP INT TERM
-( IFS= read -r _ <&3 || true; terminate_group ) &
-monitor=$!
+mkfifo "$directory/events" || { cleanup; exit 125; }
+exec 4<>"$directory/events" || { cleanup; exit 125; }
+exec 3<&0
+setsid sh -c '
+    mode=$1
+    result=$2
+    shift 2
+    trap "" TERM HUP INT
+    ( IFS= read -r _ <&3 || true; printf "cancel 143\n" >&4 ) &
+    (
+        trap - TERM HUP INT
+        if [ "$mode" = quiet ]; then
+            "$@" </dev/null 3<&- 4>&- >/dev/null 2>/dev/null
+        else
+            "$@" </dev/null 3<&- 4>&-
+        fi
+        status=$?
+        printf "done %s\n" "$status" >&4
+    ) &
+    exec 3<&-
+    IFS=" " read -r event status extra <&4 || exit 125
+    case "$event:$status:$extra" in
+        cancel:143:) ;;
+        done:*:) case "$status" in ""|*[!0-9]*) exit 125 ;; esac
+                 [ "$status" -le 255 ] || exit 125 ;;
+        *) exit 125 ;;
+    esac
+    if [ "$event" = cancel ]; then
+        kill -TERM -"$$" 2>/dev/null || true
+        sleep 0.5
+    fi
+    printf "%s\n" "$status" >"$result" || exit 125
+    # Both signals are shell builtins issued by the live group leader itself.
+    # Final KILL releases the reservation and cannot be followed by another signal.
+    kill -KILL -"$$"
+' owned-supervisor "$mode" "$directory/status" "$@" &
+pid=$!
+interrupted=0
+cancel_sent=0
+trap 'interrupted=1; if [ "$cancel_sent" -eq 0 ]; then cancel_sent=1; printf "cancel 143\n" >&4; fi' HUP INT TERM
 exec 3<&-
-wait "$pid"
-status=$?
-kill "$monitor" 2>/dev/null || true
-wait "$monitor" 2>/dev/null || true
-kill -KILL -"$pid" 2>/dev/null || true
+while :; do
+    interrupted=0
+    wait "$pid" 2>/dev/null
+    [ "$interrupted" -eq 0 ] && break
+done
+trap '' HUP INT TERM
+status=125
+if [ -f "$directory/status" ]; then
+    IFS= read -r status <"$directory/status" || status=125
+    case "$status" in ""|*[!0-9]*) status=125 ;; esac
+    [ "$status" -le 255 ] || status=125
+fi
+cleanup
 exit "$status"
 "#;
 
@@ -290,10 +323,11 @@ impl WslRunner {
             .stderr(Stdio::piped());
         crate::managed_process::configure_owned(&mut command);
         let deadline = Instant::now() + self.timeout;
-        let mut child = spawn_command(&mut command).map_err(|_| WslError::Unavailable)?;
-        let pid = child.id();
-        let stdout_pipe = child.stdout.take().ok_or(WslError::Failed("output"))?;
-        let stderr_pipe = child.stderr.take().ok_or(WslError::Failed("output"))?;
+        let child = spawn_command(&mut command).map_err(|_| WslError::Unavailable)?;
+        let mut child = crate::managed_process::ManagedProcess::from_owned_child(child)
+            .map_err(|_| WslError::Failed("process ownership"))?;
+        let stdout_pipe = child.take_stdout().ok_or(WslError::Failed("output"))?;
+        let stderr_pipe = child.take_stderr().ok_or(WslError::Failed("output"))?;
         let max_output = self.max_output;
         let (stdout_sender, stdout_receiver) = mpsc::channel();
         let (stderr_sender, stderr_receiver) = mpsc::channel();
@@ -308,12 +342,12 @@ impl WslRunner {
                 Ok(Some(status)) => break status,
                 Ok(None) => {}
                 Err(_) => {
-                    stop_run_child(&mut child, pid);
+                    stop_run_child(&mut child);
                     return Err(WslError::Failed("wait"));
                 }
             }
             if Instant::now() >= deadline {
-                stop_run_child(&mut child, pid);
+                stop_run_child(&mut child);
                 return Err(WslError::Timeout);
             }
             thread::sleep(Duration::from_millis(5));
@@ -321,14 +355,14 @@ impl WslRunner {
         let stdout = match receive_output(stdout_receiver, deadline) {
             Ok(output) => output,
             Err(error) => {
-                stop_run_child(&mut child, pid);
+                stop_run_child(&mut child);
                 return Err(error);
             }
         };
         let stderr = match receive_output(stderr_receiver, deadline) {
             Ok(output) => output,
             Err(error) => {
-                stop_run_child(&mut child, pid);
+                stop_run_child(&mut child);
                 return Err(error);
             }
         };
@@ -405,8 +439,8 @@ fn receive_output(
         .map_err(|_| WslError::Failed("output"))
 }
 
-fn stop_run_child(child: &mut std::process::Child, _pid: u32) {
-    drop(child.stdin.take());
+fn stop_run_child(child: &mut crate::managed_process::ManagedProcess) {
+    drop(child.take_stdin());
     let deadline = Instant::now() + Duration::from_millis(750);
     while Instant::now() < deadline {
         if child.try_wait().ok().flatten().is_some() {
@@ -414,10 +448,7 @@ fn stop_run_child(child: &mut std::process::Child, _pid: u32) {
         }
         thread::sleep(Duration::from_millis(5));
     }
-    #[cfg(unix)]
-    let _ = crate::managed_process::terminate_group(_pid, true);
-    let _ = child.kill();
-    let _ = child.wait();
+    let _ = child.terminate(Duration::from_millis(750));
 }
 
 fn text(output: CapturedOutput, what: &'static str) -> Result<String, WslError> {
@@ -515,12 +546,271 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn supervisor_preserves_capture_status_and_literal_argv() {
+        for status in [0, 7, 125, 255] {
+            for mode in ["capture", "quiet"] {
+                let mut child = Command::new("sh")
+                    .args([
+                        "-c",
+                        OWNED_PROCESS_WRAPPER,
+                        mode,
+                        "sh",
+                        "-c",
+                        "printf '%s\\n' \"$1\"; printf diagnostic >&2; exit \"$2\"",
+                        "synthetic-command",
+                        "literal '; $(exit 99) 🧪",
+                        &status.to_string(),
+                    ])
+                    .env("TMPDIR", "/tmp/opencode")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("production wrapper");
+                let control = child.stdin.take().expect("control writer");
+                let deadline = Instant::now() + Duration::from_secs(3);
+                loop {
+                    if child.try_wait().expect("wrapper status").is_some() {
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        drop(control);
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("capture wrapper did not retire");
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                let output = child.wait_with_output().expect("captured result");
+                drop(control);
+                assert_eq!(output.status.code(), Some(status));
+                if mode == "capture" {
+                    assert_eq!(output.stdout, "literal '; $(exit 99) 🧪\n".as_bytes());
+                    assert_eq!(output.stderr, b"diagnostic");
+                } else {
+                    assert!(output.stdout.is_empty());
+                    assert!(output.stderr.is_empty());
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    struct SupervisorFixture {
+        directory: PathBuf,
+        children: Vec<std::process::Child>,
+    }
+
+    #[cfg(unix)]
+    impl SupervisorFixture {
+        fn new() -> Self {
+            let output = Command::new("mktemp")
+                .args(["-d", "/tmp/opencode/wsl-supervisor-test.XXXXXXXX"])
+                .output()
+                .expect("private fixture directory");
+            assert!(output.status.success());
+            Self {
+                directory: PathBuf::from(String::from_utf8(output.stdout).unwrap().trim()),
+                children: Vec::new(),
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        fn launch(&mut self, script: &str) -> usize {
+            let gate = self.directory.join("gate");
+            std::fs::write(&gate, "synthetic gate").unwrap();
+            let child = Command::new("sh")
+                .args([
+                    "-c",
+                    OWNED_PROCESS_WRAPPER,
+                    "quiet",
+                    "sh",
+                    "-c",
+                    script,
+                    "fixture",
+                ])
+                .arg(&self.directory)
+                .env("TMPDIR", "/tmp/opencode")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("production supervisor");
+            self.children.push(child);
+            self.children.len() - 1
+        }
+
+        fn marker(&self, name: &str) -> u32 {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                if let Ok(value) = std::fs::read_to_string(self.directory.join(name)) {
+                    if let Ok(pid) = value.trim().parse() {
+                        return pid;
+                    }
+                }
+                assert!(Instant::now() < deadline, "missing marker {name}");
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        fn wait(&mut self, index: usize) -> std::process::ExitStatus {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                if let Some(status) = self.children[index].try_wait().unwrap() {
+                    return status;
+                }
+                assert!(Instant::now() < deadline, "supervisor did not retire");
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for SupervisorFixture {
+        fn drop(&mut self) {
+            // Releasing the fixture gate also retires survivors of intentional
+            // anchor death, without ever signaling a potentially reused PGID.
+            let _ = std::fs::remove_file(self.directory.join("gate"));
+            for child in &mut self.children {
+                if let Some(control) = child.stdin.take() {
+                    drop(control);
+                    // Give EOF-driven guest cleanup time to finish before a
+                    // panic-path fallback kills only the retained outer child.
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_running(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| stat.rsplit_once(") ").map(|(_, fields)| fields.to_owned()))
+            .is_some_and(|fields| !fields.starts_with("Z ") && !fields.starts_with("X "))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_process_retired(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while process_running(pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!process_running(pid), "owned process {pid} did not retire");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervisor_control_eof_and_explicit_cancel_retire_descendants_only() {
+        for cancellation in ["eof", "explicit", "outer-signal"] {
+            let mut fixture = SupervisorFixture::new();
+            fixture
+                .children
+                .push(Command::new("sleep").arg("30").spawn().unwrap());
+            let index = fixture.launch(
+                "sh -c 'printf %s $$ > \"$1/descendant\"; while [ -f \"$1/gate\" ]; do sleep 0.01; done' descendant \"$1\" & wait",
+            );
+            let descendant = fixture.marker("descendant");
+            if cancellation == "explicit" {
+                use std::io::Write;
+                fixture.children[index]
+                    .stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(b"stop\n")
+                    .unwrap();
+            } else if cancellation == "outer-signal" {
+                assert!(Command::new("kill")
+                    .args(["-TERM", &fixture.children[index].id().to_string()])
+                    .status()
+                    .unwrap()
+                    .success());
+            } else {
+                drop(fixture.children[index].stdin.take());
+            }
+            assert_eq!(fixture.wait(index).code(), Some(143));
+            assert_process_retired(descendant);
+            assert!(fixture.children[0].try_wait().unwrap().is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervisor_does_not_expose_control_descriptors_to_program() {
+        let mut fixture = SupervisorFixture::new();
+        let index =
+            fixture.launch("[ ! -e /proc/$$/fd/3 ] && [ ! -e /proc/$$/fd/4 ] || exit 99; exit 41");
+        assert_eq!(fixture.wait(index).code(), Some(41));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervisor_cleans_successor_after_program_leader_exits() {
+        let mut fixture = SupervisorFixture::new();
+        std::fs::write(
+            fixture.directory.join("successor.sh"),
+            "printf %s $$ > \"$1/successor\"; while [ -f \"$1/gate\" ]; do sleep 0.01; done\n",
+        )
+        .unwrap();
+        let index = fixture.launch(
+            "sh -c 'sh \"$1/successor.sh\" \"$1\" & while [ ! -s \"$1/successor\" ]; do sleep 0.01; done; exit 0' handoff \"$1\" & wait; exit 7",
+        );
+        let successor = fixture.marker("successor");
+        assert_eq!(fixture.wait(index).code(), Some(7));
+        assert_process_retired(successor);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unexpected_guest_supervisor_death_fails_closed_without_killing_survivors() {
+        let mut fixture = SupervisorFixture::new();
+        let index = fixture.launch(
+            "printf %s $$ > \"$1/program\"; printf %s \"$PPID\" > \"$1/runner\"; while [ -f \"$1/gate\" ]; do sleep 0.01; done",
+        );
+        let program = fixture.marker("program");
+        let runner = fixture.marker("runner");
+        let status = std::fs::read_to_string(format!("/proc/{runner}/status")).unwrap();
+        let supervisor = status
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:"))
+            .unwrap()
+            .trim();
+        let stat = std::fs::read_to_string(format!("/proc/{supervisor}/stat")).unwrap();
+        assert_eq!(
+            stat.rsplit_once(") ").unwrap().1.split_whitespace().nth(2),
+            Some(supervisor),
+            "the live supervisor must own the fresh process group"
+        );
+        assert!(Command::new("kill")
+            .args(["-KILL", supervisor])
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(fixture.wait(index).code(), Some(125));
+        assert!(
+            process_running(program),
+            "missing reservation must fail closed"
+        );
+        // The fixture gate, not a stale group number, retires the survivor.
+        std::fs::remove_file(fixture.directory.join("gate")).unwrap();
+        drop(fixture.children[index].stdin.take());
+        assert_process_retired(program);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn owned_launch_closes_control_pipe_and_terminates_only_its_process_group() {
         use std::os::unix::fs::PermissionsExt;
 
-        let suffix = format!("{}-{:?}", std::process::id(), Instant::now());
-        let fake_wsl = std::env::temp_dir().join(format!("voxgolem-fake-wsl-{suffix}"));
-        let marker = std::env::temp_dir().join(format!("voxgolem-owned-pid-{suffix}"));
+        let mut fixture = SupervisorFixture::new();
+        let fake_wsl = fixture.directory.join("wsl-forwarder");
+        let marker = fixture.directory.join("owned-pid");
         std::fs::write(
             &fake_wsl,
             "#!/bin/sh\n[ \"$1\" = --exec ] || exit 2\nshift\nexec \"$@\"\n",
@@ -539,53 +829,32 @@ mod tests {
         );
         let mut command = launch.to_command(None);
         command
+            .env("TMPDIR", "/tmp/opencode")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut owned = command.spawn().expect("owned WSL process");
-        let mut unrelated = Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("unrelated process");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let owned_pid = loop {
-            if let Ok(pid) = std::fs::read_to_string(&marker) {
-                break pid.trim().parse::<u32>().expect("owned Linux PID");
-            }
-            assert!(Instant::now() < deadline, "owned PID was not written");
-            thread::sleep(Duration::from_millis(10));
-        };
+        fixture
+            .children
+            .push(spawn_command(&mut command).expect("owned WSL process"));
+        fixture.children.push(
+            Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("unrelated process"),
+        );
+        let owned_pid = fixture.marker("owned-pid");
 
-        drop(owned.stdin.take());
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let exited = loop {
-            if owned.try_wait().expect("owned process status").is_some() {
-                break true;
-            }
-            if Instant::now() >= deadline {
-                break false;
-            }
-            thread::sleep(Duration::from_millis(10));
-        };
-        if !exited {
-            let _ = owned.kill();
-            let _ = owned.wait();
-        }
+        drop(fixture.children[0].stdin.take());
+        assert_eq!(fixture.wait(0).code(), Some(143));
         let owned_alive = Command::new("/usr/bin/kill")
             .args(["-0", &owned_pid.to_string()])
             .stderr(Stdio::null())
             .status()
             .is_ok_and(|status| status.success());
-        let unrelated_alive = unrelated
+        let unrelated_alive = fixture.children[1]
             .try_wait()
             .expect("unrelated process status")
             .is_none();
-        let _ = unrelated.kill();
-        let _ = unrelated.wait();
-        let _ = std::fs::remove_file(&fake_wsl);
-        let _ = std::fs::remove_file(&marker);
-
-        assert!(exited, "control-pipe closure must stop the WSL wrapper");
         assert!(!owned_alive, "owned Linux process must be terminated");
         assert!(unrelated_alive, "unrelated Linux process must survive");
     }
