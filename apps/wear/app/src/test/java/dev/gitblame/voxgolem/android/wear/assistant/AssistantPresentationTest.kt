@@ -1,6 +1,7 @@
 package dev.gitblame.voxgolem.android.wear.assistant
 
 import androidx.compose.ui.unit.sp
+import androidx.compose.runtime.saveable.SaverScope
 import androidx.wear.compose.material3.Typography
 import dev.gitblame.voxgolem.assistant.recognition.DictationPhase
 import dev.gitblame.voxgolem.assistant.recognition.DictationState
@@ -195,6 +196,393 @@ class AssistantPresentationTest {
         }
     }
 
+    @Test fun manuallyReachingBottomDoesNotRearmTheCurrentResponse() {
+        val reading = AssistantReadingPosition()
+        reading.readOlder()
+        reading.scrolled(true, false)
+        assertFalse(reading.followsLatest)
+    }
+
+    @Test fun manualBottomVisitRestoresPrimaryControlWithoutRearmingTheCurrentReply() {
+        val reading = AssistantReadingPosition()
+        reading.observeRequest("synthetic-bottom:1", manuallyScrolling = false)
+        reading.replyPositioned(32, 32)
+        reading.scrolled(inProgress = true, canScrollForward = false)
+        assertFalse("Reaching bottom hides Jump to latest even during the gesture", reading.readingOlder)
+        assertFalse(reading.followsLatest)
+        reading.scrolled(inProgress = false, canScrollForward = false)
+        assertFalse(reading.readingOlder)
+        reading.observeRequest("synthetic-bottom:1", manuallyScrolling = false)
+        assertFalse(reading.followsLatest)
+        reading.scrolled(inProgress = true, canScrollForward = true)
+        reading.scrolled(inProgress = false, canScrollForward = true)
+        assertTrue("Moving away shows Jump to latest again", reading.readingOlder)
+        assertFalse(reading.followsLatest)
+    }
+
+    @Test fun idleEndChangesAffectOnlyTheVisualControlUntilARealManualEndQualifiesNextReply() {
+        val reading = AssistantReadingPosition()
+        reading.observeRequest("synthetic-bottom:1", manuallyScrolling = false)
+        reading.readOlder()
+        reading.scrolled(inProgress = false, canScrollForward = false)
+        assertFalse("Idle end geometry restores the primary control", reading.readingOlder)
+        reading.scrolled(inProgress = false, canScrollForward = true)
+        assertTrue("Later text growth restores Jump to latest", reading.readingOlder)
+        reading.observeRequest("synthetic-bottom:1", manuallyScrolling = false)
+        assertFalse(reading.followsLatest)
+        reading.scrolled(inProgress = false, canScrollForward = false)
+        reading.observeRequest("synthetic-bottom:2", manuallyScrolling = false)
+        assertFalse("Idle end changes cannot manufacture next-request eligibility", reading.followsLatest)
+        reading.scrolled(inProgress = true, canScrollForward = false)
+        reading.scrolled(inProgress = false, canScrollForward = false)
+        reading.scrolled(inProgress = false, canScrollForward = true)
+        assertTrue(reading.readingOlder)
+        reading.observeRequest("synthetic-bottom:2", manuallyScrolling = false)
+        assertFalse("Even a real bottom visit never rearms the current request", reading.followsLatest)
+        reading.observeRequest("synthetic-bottom:3", manuallyScrolling = false)
+        assertTrue("The real manual end qualifies only a new request", reading.followsLatest)
+    }
+
+    @Test fun boundaryPreScrollAndCompletedOverflowKeepBottomAndEligibilityTruthful() {
+        val reading = AssistantReadingPosition()
+        reading.observeRequest("synthetic-boundary:1", manuallyScrolling = false)
+        reading.replyPositioned(24, 24)
+        reading.scrolled(inProgress = true, canScrollForward = false)
+        reading.scrolled(inProgress = false, canScrollForward = false)
+        assertFalse(reading.readingOlder)
+        // Extra downward rotary/drag input at the bottom boundary cannot clobber end state.
+        reading.readOlder(canScrollForward = false)
+        assertFalse("Boundary downward input at bottom keeps primary control", reading.readingOlder)
+        reading.observeRequest("synthetic-boundary:2", manuallyScrolling = false)
+        assertTrue("Next request stays eligible after boundary downward input at bottom", reading.followsLatest)
+        // If an ARMED reply completes while still overflowing, completed(true) records overflow.
+        reading.completed(canScrollForward = true)
+        assertTrue("Overflowing completion shows Jump to latest", reading.readingOlder)
+        reading.observeRequest("synthetic-boundary:3", manuallyScrolling = false)
+        assertFalse("Overflowing completion without reaching bottom does not follow next reply", reading.followsLatest)
+
+        val deletedThenSelected = AssistantChatScreenIdentity()
+        val firstConv = ready.copy(conversation = conversation, clientRequestToken = "synthetic-prior:1")
+        val key1 = deletedThenSelected.key(firstConv)
+        val cleared = firstConv.copy(conversation = null)
+        val key2 = deletedThenSelected.key(cleared)
+        assertNotEquals(key1, key2)
+        val secondConv = cleared.copy(conversation = turnId("91"))
+        val key3 = deletedThenSelected.key(secondConv)
+        assertNotEquals("Selecting an existing conversation after a cleared conversation is not a first-request promotion",
+            key2, key3)
+    }
+
+    @Test fun streamingTextGrowthReusesKeysForStructurallyEqualHistoryAndTheSameRequest() {
+        val presentation = AssistantHistoryPresentation()
+        val saved = turn("30")
+        val history = AssistantHistoryState(conversation, saved.id, listOf(saved))
+        val busy = ready.copy(selectedHead = saved.id, busy = true, clientRequestToken = "synthetic-client:1",
+            providerRequestId = "synthetic-provider:1", provisional = "Synthetic first chunk")
+        val first = presentation.update(busy, history, true, null)
+        val grown = presentation.update(busy.copy(provisional = "Synthetic first chunk with more text"),
+            history.copy(turns = history.turns.map { it.copy() }), true, null)
+        assertSame(first.itemKeys, grown.itemKeys)
+        assertEquals(2, grown.itemKeys.index(grown.itemKeys.answer(saved)))
+    }
+
+    @Test fun projectedRequestAndHistoryContentChangesInvalidateMemoizedCollisionKeys() {
+        val presentation = AssistantHistoryPresentation()
+        val saved = turn("30").copy(requestKey = "synthetic-shared:1")
+        val history = AssistantHistoryState(conversation, saved.id, listOf(saved))
+        val busy = ready.copy(selectedHead = saved.id, busy = true, clientRequestToken = "synthetic-client:1",
+            providerRequestId = "synthetic-other:1", provisional = "Synthetic stream")
+        val first = presentation.update(busy, history, true, null).itemKeys
+        assertEquals(assistantAnswerItemKey("synthetic-shared:1"), first.answer(saved))
+        val collided = presentation.update(busy.copy(providerRequestId = "synthetic-shared:1"), history, true, null).itemKeys
+        assertNotSame(first, collided)
+        assertEquals("answer:${assistantIdKey(saved.id)}", collided.answer(saved))
+        assertEquals(2, collided.index(collided.answer(saved)))
+        val changed = presentation.update(busy.copy(providerRequestId = "synthetic-shared:1"),
+            history.copy(turns = listOf(saved.copy(answer = "Synthetic changed canonical content"))), true, null).itemKeys
+        assertNotSame(collided, changed)
+        assertEquals(2, changed.index(changed.answer(saved)))
+    }
+
+    @Test fun mutableHistoryInputCannotMutateTheMemoizedComparisonSnapshot() {
+        val presentation = AssistantHistoryPresentation()
+        val saved = turn("30").copy(requestKey = "synthetic-shared:1")
+        val turns = mutableListOf(saved)
+        val history = AssistantHistoryState(conversation, saved.id, turns)
+        val selected = ready.copy(selectedHead = saved.id)
+        val first = presentation.update(selected, history, false, null).itemKeys
+        val imported = saved.copy(id = turnId("31"))
+        turns += imported
+        val changed = presentation.update(selected, history, false, null).itemKeys
+        assertNotSame(first, changed)
+        assertEquals(assistantAnswerItemKey("synthetic-shared:1"), first.answer(saved))
+        assertEquals("answer:${assistantIdKey(saved.id)}", changed.answer(saved))
+        assertEquals(2, changed.index(changed.answer(saved)))
+        assertEquals(4, changed.index(changed.answer(imported)))
+    }
+
+    @Test fun aNewRequestsOwnPromptOverflowCannotErasePreviouslyEligibleReadingIntent() {
+        for (explicitLatest in listOf(false, true)) {
+            val reading = AssistantReadingPosition()
+            if (explicitLatest) reading.latest()
+            // The newly appended prompt can overflow before request admission runs.
+            reading.scrolled(inProgress = false, canScrollForward = true)
+            reading.observeRequest("synthetic-request:overflow", manuallyScrolling = false)
+            assertTrue(reading.followsLatest)
+        }
+
+        val older = AssistantReadingPosition()
+        older.readOlder()
+        older.scrolled(inProgress = false, canScrollForward = false)
+        older.observeRequest("synthetic-request:older", manuallyScrolling = false)
+        assertFalse("Idle layout changes cannot manufacture user intent", older.followsLatest)
+
+        val activeGesture = AssistantReadingPosition()
+        activeGesture.observeRequest("synthetic-request:gesture", manuallyScrolling = true)
+        assertFalse(activeGesture.followsLatest)
+    }
+
+    @Test fun firstRequestConversationPromotionRetainsTheChildReadingAndListSaveableKey() {
+        val identity = AssistantChatScreenIdentity()
+        val empty = ready.copy(conversation = null, clientRequestToken = null, providerRequestId = null)
+        val initialKey = identity.key(empty)
+        val pending = empty.copy(busy = true, clientRequestToken = "synthetic-first:1")
+        assertEquals(initialKey, identity.key(pending))
+        val created = pending.copy(conversation = conversation)
+        assertEquals("Manual reading, current request and list state share this unchanged subtree key",
+            initialKey, identity.key(created))
+        assertEquals(initialKey, identity.key(created.copy(busy = false)))
+    }
+
+    @Test fun engineCreationBeforeBusyAndCoalescedCompletionBothPreserveTheInitialScreenKey() {
+        for (busy in listOf(false, true)) {
+            val identity = AssistantChatScreenIdentity()
+            val key = identity.key(ready.copy(conversation = null, clientRequestToken = null, providerRequestId = null))
+            val created = ready.copy(busy = busy, clientRequestToken = "synthetic-first:1")
+            assertEquals("The pre-creation state need not have a request token", key, identity.key(created))
+        }
+    }
+
+    @Test fun realConversationSwitchesExplicitNewAndMismatchedRequestPromotionsResetScreenKey() {
+        val identity = AssistantChatScreenIdentity()
+        val first = ready.copy(clientRequestToken = "synthetic-first:1")
+        val firstKey = identity.key(first)
+        val switched = first.copy(conversation = turnId("90"), clientRequestToken = null, providerRequestId = null)
+        val switchedKey = identity.key(switched)
+        assertNotEquals(firstKey, switchedKey)
+        val newChat = switched.copy(conversation = null)
+        val newKey = identity.key(newChat)
+        assertNotEquals(switchedKey, newKey)
+
+        val uncreated = newChat.copy(clientRequestToken = "synthetic-uncreated:1", busy = true)
+        val pendingKey = identity.key(uncreated)
+        assertNotEquals("Clearing an uncreated request is also an explicit reset", pendingKey, identity.key(newChat))
+        val sameNullKey = identity.key(uncreated)
+        assertNotEquals("A different request cannot claim the prior request's promotion", sameNullKey,
+            identity.key(uncreated.copy(conversation = conversation, clientRequestToken = "synthetic-uncreated:2")))
+    }
+
+    @Test fun screenEpochAndPromotionOwnerSurviveSaveRestore() {
+        val scope = object : SaverScope { override fun canBeSaved(value: Any) = true }
+        val identity = AssistantChatScreenIdentity()
+        identity.key(ready)
+        val pending = ready.copy(conversation = null, busy = true, clientRequestToken = "synthetic-restored:1")
+        val pendingKey = identity.key(pending)
+        assertNotEquals(0L, pendingKey)
+        with(AssistantChatScreenIdentity.Saver) {
+            val restored = restore(scope.save(identity)!!)!!
+            assertEquals(pendingKey, restored.key(pending))
+            assertEquals("Restoration retains the same nested saveable slots across promotion", pendingKey,
+                restored.key(pending.copy(conversation = conversation)))
+            val different = restore(scope.save(identity)!!)!!
+            assertNotEquals(pendingKey, different.key(pending.copy(conversation = conversation,
+                clientRequestToken = "synthetic-restored:2")))
+        }
+    }
+
+    @Test fun nonzeroTopPaddingIsAppliedVisuallyNotTwiceToTheMeasuredRowOffset() {
+        val reading = AssistantReadingPosition()
+        val geometry = AssistantReplyGeometry(24, 300, 200, 20, 20, true, 3)
+        assertEquals(44, geometry.topPadding + geometry.targetOffset)
+        assertEquals(AssistantReplyFollowDecision.HOLD, reading.followDecision(geometry))
+        reading.replyPositioned(geometry.rowOffset!!, geometry.relativeCap)
+        assertFalse(reading.followsLatest)
+    }
+
+    @Test fun onlyANewRequestAtLatestMayRearmAfterAOneShotJump() {
+        val reading = AssistantReadingPosition()
+        reading.observeRequest("synthetic-request:1", manuallyScrolling = false)
+        reading.replyPositioned(32, 32)
+        reading.latest()
+        reading.observeRequest("synthetic-request:1", manuallyScrolling = false)
+        assertFalse("Latest must not rearm the same request", reading.followsLatest)
+        reading.observeRequest("synthetic-request:2", manuallyScrolling = false)
+        assertTrue("A new response at latest gets its own bounded follow", reading.followsLatest)
+    }
+
+    @Test fun bottomVisitsQualifyOnlyTheNextRequestAndActiveManualReadingAlwaysWins() {
+        val reading = AssistantReadingPosition()
+        reading.observeRequest("synthetic-request:1", false)
+        reading.replyPositioned(32, 32)
+        reading.scrolled(true, false)
+        reading.scrolled(false, false)
+        reading.observeRequest("synthetic-request:1", false)
+        assertFalse(reading.followsLatest)
+        reading.observeRequest("synthetic-request:2", false)
+        assertTrue(reading.followsLatest)
+        reading.readOlder()
+        reading.scrolled(false, true)
+        reading.observeRequest("synthetic-request:3", false)
+        assertFalse("An older-reading response cannot steal position", reading.followsLatest)
+        reading.latest()
+        reading.observeRequest("synthetic-request:4", true)
+        assertFalse("Even an end-positioned ongoing manual gesture wins", reading.followsLatest)
+    }
+
+    @Test fun geometryObserverDoesNotScrollForUnchangedOrShortEndClampedRows() {
+        val reading = AssistantReadingPosition()
+        val short = AssistantReplyGeometry(100, 30, 200, 20, 20, false, 3)
+        assertEquals(AssistantReplyFollowDecision.NONE, reading.followDecision(short))
+        assertEquals(AssistantReplyFollowDecision.NONE, reading.followDecision(short))
+        assertEquals(AssistantReplyFollowDecision.NONE, reading.followDecision(short.copy(rowSize = 40)))
+        val overflowing = short.copy(rowSize = 300, canScrollForward = true)
+        assertEquals(AssistantReplyFollowDecision.POSITION, reading.followDecision(overflowing))
+        assertEquals("The same measured geometry is never a repeated correction",
+            AssistantReplyFollowDecision.NONE, reading.followDecision(overflowing))
+        val atCap = overflowing.copy(rowOffset = overflowing.relativeCap)
+        assertEquals(AssistantReplyFollowDecision.HOLD, reading.followDecision(atCap))
+        reading.replyPositioned(atCap.rowOffset!!, atCap.relativeCap)
+        assertEquals(AssistantReplyFollowDecision.NONE, reading.followDecision(atCap.copy(rowSize = 600)))
+    }
+
+    @Test fun hugeOffscreenFirstChunkTargetsTheReplyRowWithoutATailStep() {
+        val reading = AssistantReadingPosition()
+        val huge = AssistantReplyGeometry(null, null, 200, 20, 20, true, 3)
+        assertEquals(24, huge.relativeCap)
+        assertEquals(AssistantReplyFollowDecision.POSITION, reading.followDecision(huge))
+        assertEquals(AssistantReplyFollowDecision.HOLD, reading.followDecision(huge.copy(rowOffset = 24, rowSize = 2_000)))
+    }
+
+    @Test fun readingRequestIdentityPrefersTheClientOwnerAndFallsBackOnlyWhenUnavailable() {
+        val busy = ready.copy(busy = true, clientRequestToken = "synthetic-client:1", providerRequestId = "synthetic-provider:1")
+        assertEquals("synthetic-client:1", assistantReadingRequestKey(busy))
+        assertEquals("synthetic-client:1", assistantReadingRequestKey(busy.copy(providerRequestId = "synthetic-provider:2")))
+        assertEquals("synthetic-provider:1", assistantReadingRequestKey(busy.copy(clientRequestToken = null)))
+        assertNull(assistantReadingRequestKey(busy.copy(busy = false)))
+    }
+
+    @Test fun delayedClientIdentityPromotionIsNotANewReplyButReusedProviderIdsAre() {
+        val reading = AssistantReadingPosition()
+        reading.observeRequest("synthetic-provider:1", false, "synthetic-provider:1")
+        reading.replyPositioned(32, 32)
+        reading.latest()
+        reading.observeRequest("synthetic-client:1", false, "synthetic-provider:1")
+        assertEquals("synthetic-client:1", reading.currentRequestKey)
+        assertFalse("Binding the preferred identity cannot rearm a capped reply", reading.followsLatest)
+        reading.observeRequest("synthetic-client:2", false, "synthetic-provider:1")
+        assertTrue("Different client owners stay distinct even when provider keys collide", reading.followsLatest)
+    }
+
+    @Test fun idleGeometryOrHistoryHydrationCannotManufactureManualBottomEligibility() {
+        val reading = AssistantReadingPosition()
+        reading.observeRequest("synthetic-request:1", false)
+        reading.readOlder()
+        reading.scrolled(false, false)
+        reading.observeRequest("synthetic-request:2", false)
+        assertFalse(reading.followsLatest)
+    }
+
+    @Test fun completionAndACapAtTheNaturalEndPreserveOnlyNextRequestEligibility() {
+        for (capAtEnd in listOf(false, true)) {
+            val reading = AssistantReadingPosition()
+            reading.observeRequest("synthetic-request:1", false)
+            if (capAtEnd) reading.replyPositioned(32, 32, canScrollForward = false) else reading.completed()
+            reading.observeRequest("synthetic-request:1", false)
+            assertFalse(reading.followsLatest)
+            reading.observeRequest("synthetic-request:2", false)
+            assertTrue(reading.followsLatest)
+        }
+    }
+
+    @Test fun savedRequestPhasePreventsSameRequestRearmingAndMigratesLegacyBooleanState() {
+        val scope = object : SaverScope { override fun canBeSaved(value: Any) = true }
+        val reading = AssistantReadingPosition()
+        reading.observeRequest("synthetic-request:1", false)
+        reading.trackReplyRow("answer:synthetic-request:1")
+        reading.replyPositioned(32, 32)
+        with(AssistantReadingPosition.Saver) {
+            val restored = restore(scope.save(reading)!!)!!
+            assertEquals("synthetic-request:1", restored.currentRequestKey)
+            assertEquals("answer:synthetic-request:1", restored.replyRowKey)
+            assertEquals(AssistantReadingPhase.HELD, restored.phase)
+            restored.latest()
+            restored.observeRequest("synthetic-request:1", false)
+            assertFalse(restored.followsLatest)
+            restored.observeRequest("synthetic-request:2", false)
+            assertTrue(restored.followsLatest)
+            assertFalse(restore(false)!!.followsLatest)
+            assertTrue(restore(true)!!.followsLatest)
+        }
+    }
+
+    @Test fun readingCapUsesMeasuredPaddingAcrossSyntheticViewportSizes() {
+        assertEquals(24, assistantReplyReadingCap(200, 20, 20))
+        assertEquals(48, assistantReplyReadingCap(400, 40, 40))
+        // Larger labels/padding reduce readable space instead of using screen height.
+        assertEquals(12, assistantReplyReadingCap(200, 60, 60))
+        assertEquals(0, assistantReplyReadingCap(40, 30, 30))
+    }
+
+    @Test fun explicitLatestIsOneShotAndDoesNotEnableLaterStreamFollowing() = runBlocking {
+        val reading = AssistantReadingPosition(false)
+        reading.latest()
+        reading.following { reading.scrolled(true, false) }
+        assertFalse(reading.followsLatest)
+        assertFalse("A completed one-shot jump restores the primary action, not another Latest", reading.readingOlder)
+        reading.scrolled(true, false)
+        assertFalse(reading.followsLatest)
+        assertFalse("A manual scroll at the end keeps the primary control", reading.readingOlder)
+        reading.scrolled(true, true)
+        assertTrue("A subsequent manual scroll away restores Latest", reading.readingOlder)
+    }
+
+    @Test fun shortAnswerMayFollowUntilItsLabelReachesCapThenAllGrowthAndBottomVisitsHold() {
+        val reading = AssistantReadingPosition()
+        val cap = assistantReplyReadingCap(200, 20, 20)
+        reading.replyPositioned(120, cap)
+        assertTrue("A short row at the real end does not need a fake footer", reading.followsLatest)
+        reading.replyPositioned(65, cap)
+        assertTrue(reading.followsLatest)
+        reading.replyPositioned(cap, cap)
+        assertFalse(reading.followsLatest)
+        reading.replyPositioned(120, cap)
+        reading.scrolled(true, false)
+        assertFalse("Growth, completion geometry and reaching bottom cannot rearm this reply", reading.followsLatest)
+    }
+
+    @Test fun hugeFirstChunkAndManualInputDuringAutomaticPositioningHoldImmediately() = runBlocking {
+        val huge = AssistantReadingPosition()
+        huge.replyPositioned(24, assistantReplyReadingCap(200, 20, 20))
+        assertFalse(huge.followsLatest)
+        val manual = AssistantReadingPosition()
+        manual.following { manual.readOlder() }
+        manual.replyPositioned(120, 32)
+        assertFalse(manual.followsLatest)
+    }
+
+    @Test fun savedReadingOwnerRetainsBothCapAndOneShotLatestIntent() {
+        val scope = object : SaverScope { override fun canBeSaved(value: Any) = true }
+        fun restored(reading: AssistantReadingPosition): AssistantReadingPosition = with(AssistantReadingPosition.Saver) {
+            restore(scope.save(reading)!!)!!
+        }
+        val capped = AssistantReadingPosition().apply { replyPositioned(32, 32) }
+        assertTrue(restored(capped).readingOlder)
+        assertFalse(restored(capped).followsLatest)
+        capped.latest()
+        assertFalse(restored(capped).readingOlder)
+        assertFalse(restored(capped).followsLatest)
+    }
+
     @Test fun userReadingPositionIsNotChangedByFollowingStreamOrPrependingPages() = runBlocking {
         val reading = AssistantReadingPosition()
         reading.following { reading.scrolled(true, true) }
@@ -206,9 +594,9 @@ class AssistantPresentationTest {
         reading.readOlder()
         assertFalse(reading.followsLatest)
         reading.latest()
-        assertTrue(reading.followsLatest)
+        assertFalse(reading.followsLatest)
         reading.scrolled(true, false)
-        assertTrue(reading.followsLatest)
+        assertFalse(reading.followsLatest)
     }
 
     @Test fun chatsExcludeDeletedAndUnresolvedRecordsWithoutFlatteningMessages() {
@@ -288,7 +676,8 @@ class AssistantPresentationTest {
         assertFalse(pending.key in live.itemKeys.rowKeys)
         assertNull(live.retiredPromptKey)
         val waitingForText = presentation.update(busy.copy(provisional = ""), history, false, null)
-        assertNull(waitingForText.reply)
+        assertEquals("", waitingForText.reply?.text)
+        assertEquals(liveReply.key, waitingForText.reply?.key)
         assertFalse("The live prompt still needs its request key before first text", pending.key in waitingForText.itemKeys.rowKeys)
         presentation.update(busy, history, false, null)
         val committed = busy.copy(busy = false, draft = "", provisional = "", selectedHead = turnId("31"))
@@ -326,16 +715,17 @@ class AssistantPresentationTest {
         assertEquals("answer:${assistantIdKey(saved.id)}", handedOff.itemKeys.answer(saved))
         assertEquals(4, handedOff.scroll?.index)
         assertEquals(17, handedOff.scroll?.offset)
+        assertEquals(false, handedOff.scroll?.fallbackToLatest)
         assertNull(handedOff.reply)
     }
 
-    @Test fun restoredReadingModeDoesNotJumpToLatestUntilExplicitlyRequested() {
+    @Test fun restoredReadingModeAndExplicitLatestNeverEnableContinuousFollowing() {
         val restored = AssistantReadingPosition(false)
         assertFalse(restored.followsLatest)
         restored.scrolled(false, true)
         assertFalse(restored.followsLatest)
         restored.latest()
-        assertTrue(restored.followsLatest)
+        assertFalse(restored.followsLatest)
     }
 
     @Test fun continuationLabelsUseTheExactNativeHeadAndDoNotSortOrMergeBranches() {
@@ -508,6 +898,7 @@ class AssistantPresentationTest {
         assertNotNull(reset.scroll)
         assertNull(reset.scroll?.index)
         assertEquals(0, reset.scroll?.offset)
+        assertEquals(true, reset.scroll?.fallbackToLatest)
     }
 
     @Test fun partialFinishingFinalSubmittedAndHistoryHandoffKeepOnePromptProjection() {
