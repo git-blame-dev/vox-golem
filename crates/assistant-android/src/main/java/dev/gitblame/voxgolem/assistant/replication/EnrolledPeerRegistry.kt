@@ -44,18 +44,23 @@ class EnrolledPeerRegistry(context: Context) : Closeable {
         ReplicationWire.uuid(replica)
         val db = database.writableDatabase
         db.beginTransaction()
-        beginApprovalMutation()
+        var mutation = false
         try {
             val existing = replicas()
-            require(replica in existing || existing.size < ReplicationWire.MAX_PEERS) { "Assistant peer limit reached" }
             val backlog = db.rawQuery("SELECT replica FROM cleanup_peers", null).use { cursor ->
                 buildSet { while (cursor.moveToNext()) add(cursor.getString(0)) }
             }
+            if (replica in existing && replica !in backlog) {
+                db.setTransactionSuccessful()
+                return
+            }
+            beginApprovalMutation(); mutation = true
+            require(replica in existing || existing.size < ReplicationWire.MAX_PEERS) { "Assistant peer limit reached" }
             require(replica in existing || replica in backlog || backlog.size < ReplicationWire.MAX_PEERS) { "Assistant peer cleanup pending" }
             db.insertWithOnConflict("peers", null, ContentValues().apply { put("replica", replica) }, SQLiteDatabase.CONFLICT_IGNORE)
             db.delete("cleanup_peers", "replica = ?", arrayOf(replica))
             db.setTransactionSuccessful()
-        } finally { try { db.endTransaction() } finally { endApprovalMutation() } }
+        } finally { try { db.endTransaction() } finally { if (mutation) endApprovalMutation() } }
     }
 
     fun revoke(replica: String) {
@@ -79,11 +84,20 @@ class EnrolledPeerRegistry(context: Context) : Closeable {
         require(key in setOf("incoming", "outgoing", "status"))
         val raw = value?.toString()
         require(raw == null || raw.toByteArray(Charsets.UTF_8).size <= 4096)
-        beginApprovalMutation()
+        val db = database.writableDatabase
+        db.beginTransaction()
+        var mutation = false
         try {
-            if (raw == null) database.writableDatabase.delete("setup", "key = ?", arrayOf(key))
-            else check(database.writableDatabase.insertWithOnConflict("setup", null, ContentValues().apply { put("key", key); put("value", raw) }, SQLiteDatabase.CONFLICT_REPLACE) != -1L)
-        } finally { endApprovalMutation() }
+            val previous = db.rawQuery("SELECT value FROM setup WHERE key = ?", arrayOf(key)).use {
+                if (it.moveToFirst()) it.getString(0) else null
+            }
+            if (previous != raw) {
+                beginApprovalMutation(); mutation = true
+                if (raw == null) db.delete("setup", "key = ?", arrayOf(key))
+                else check(db.insertWithOnConflict("setup", null, ContentValues().apply { put("key", key); put("value", raw) }, SQLiteDatabase.CONFLICT_REPLACE) != -1L)
+            }
+            db.setTransactionSuccessful()
+        } finally { try { db.endTransaction() } finally { if (mutation) endApprovalMutation() } }
     }
 
     internal fun clearLegacySetup() {
@@ -98,8 +112,18 @@ class EnrolledPeerRegistry(context: Context) : Closeable {
         listOf(binding.replica, binding.association).forEach(ReplicationWire::uuid)
         val db = database.writableDatabase
         db.beginTransaction()
-        beginApprovalMutation()
+        var mutation = false
         try {
+            val bindings = db.rawQuery("SELECT replica, association FROM native_bindings", null).use { cursor ->
+                buildList { while (cursor.moveToNext()) add(ApprovedPeerBinding(cursor.getString(0), cursor.getString(1))) }
+            }
+            val cleanupPending = db.rawQuery("SELECT 1 FROM cleanup_peers WHERE replica = ?", arrayOf(binding.replica)).use { it.moveToFirst() }
+            // Reconciliation must not revoke a live route when every approval input is unchanged.
+            if (replicas() == setOf(binding.replica) && bindings == listOf(binding) && !cleanupPending) {
+                db.setTransactionSuccessful()
+                return
+            }
+            beginApprovalMutation(); mutation = true
             replicas().filter { it != binding.replica }.forEach { revoke(it) }
             db.delete("native_bindings", "replica != ?", arrayOf(binding.replica))
             enroll(binding.replica)
@@ -107,7 +131,7 @@ class EnrolledPeerRegistry(context: Context) : Closeable {
                 put("replica", binding.replica); put("association", binding.association)
             }, SQLiteDatabase.CONFLICT_REPLACE) != -1L)
             db.setTransactionSuccessful()
-        } finally { try { db.endTransaction() } finally { endApprovalMutation() } }
+        } finally { try { db.endTransaction() } finally { if (mutation) endApprovalMutation() } }
     }
 
     override fun close() = database.close()

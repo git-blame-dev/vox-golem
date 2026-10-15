@@ -48,6 +48,8 @@ import androidx.wear.compose.foundation.rotary.rotaryScrollable
 import androidx.wear.compose.foundation.rememberSwipeToDismissBoxState as rememberWearDismissState
 import dev.gitblame.voxgolem.assistant.replication.PeerPairingState
 import dev.gitblame.voxgolem.assistant.runtime.AssistantModels
+import dev.gitblame.voxgolem.assistant.runtime.AssistantRuntime
+import dev.gitblame.voxgolem.assistant.runtime.OptionalProviderReadiness
 import dev.gitblame.voxgolem.assistant.runtime.AssistantState
 import dev.gitblame.voxgolem.assistant.runtime.speechAdmission
 import dev.gitblame.voxgolem.assistant.recognition.DictationPhase
@@ -508,7 +510,7 @@ private fun SettingsScreen(state: AssistantState, voice: AssistantVoiceState, pa
         }
         if (!state.webEnabled) item { Text("Enable Web access to use Verify or Research. Quick chat remains available.") }
         item { Text("Model", style = wearTextStyle(MaterialTheme.typography.titleMedium)) }
-        items(AssistantModels.aliases) { model -> ActionButton(if (model == state.model) "✓ $model" else model, enabled) { actions.selectModel(model) } }
+        items(assistantSelectableModels(AssistantRuntime.optionalProviderReadiness(), state.model)) { model -> ActionButton(if (model == state.model) "✓ $model" else model, enabled) { actions.selectModel(model) } }
         item { SwitchButton(checked = preferences.readRepliesAloud, onCheckedChange = actions.tts, enabled = enabled,
             label = { Text("Speak replies") }, secondaryLabel = { Text("Local voice preferred") },
             modifier = Modifier.fillMaxWidth()) }
@@ -1015,6 +1017,10 @@ private fun assistantChats(view: JSONObject): List<AssistantChat> {
         .filter { !it.optBoolean("deleted") && !it.isNull("title") }
         .map { AssistantChat(it.getJSONObject("id").toString(), it.getString("title")) }
 }
+
+/** Models this device can actually run; the watch has no Agy executable for its ARM32 userspace. */
+internal fun assistantSelectableModels(readiness: Map<String, OptionalProviderReadiness>, selected: String): List<String> =
+    AssistantModels.aliases.filter { it == selected || it in AssistantModels.customLabels || readiness[it]?.available == true }
 
 internal fun assistantBranchLabel(view: String, id: String): String = assistantBranchLabel(JSONObject(view), id)
 private fun assistantBranchLabel(view: JSONObject, id: String): String {

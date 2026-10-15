@@ -22,11 +22,13 @@ class AgyProviderRouter(
     private val context: Context,
     private val defaultNative: ProviderNativeCalls = AssistantProviderNative,
     private val agyNative: ProviderNativeCalls = AgyProviderNative(context),
-    private val geminiNanoNative: ProviderNativeCalls = GeminiNanoProvider(context, searchNative = defaultNative)
+    private val geminiNanoNative: ProviderNativeCalls = GeminiNanoProvider(context, searchNative = defaultNative),
+    private val phoneRelay: ProviderNativeCalls? = watchPhoneRelay(context),
 ) : ProviderNativeCalls {
     private class Route(val provider: ProviderNativeCalls)
     private val requests = ConcurrentHashMap<String, Route>()
     fun prewarm(model: String) {
+        if (phoneRelay != null) return
         if (model == GeminiNanoProvider.MODEL_NAME) (geminiNanoNative as? GeminiNanoProvider)?.prewarm()
         val eligible = isAgyModel(model)
         // Every accepted selection invalidates older work, including selections routed elsewhere.
@@ -68,8 +70,8 @@ class AgyProviderRouter(
     private fun isAgyModel(model: String) = model != GeminiNanoProvider.MODEL_NAME && (model.startsWith("agy-") || model.startsWith("claude-") ||
         model.startsWith("gemini-") || model.startsWith("opus") || model.startsWith("sonnet") || model.startsWith("3.8-"))
     private fun providerFor(model: String) = when {
-        model == GeminiNanoProvider.MODEL_NAME -> geminiNanoNative
-        isAgyModel(model) -> agyNative
+        model == GeminiNanoProvider.MODEL_NAME -> phoneRelay ?: geminiNanoNative
+        isAgyModel(model) -> phoneRelay ?: agyNative
         else -> defaultNative
     }
 }
@@ -127,6 +129,7 @@ class AgyProviderNative internal constructor(private val context: Context,
     fun resolveTargetModel(requestedModel: String): String = when (requestedModel) {
         "agy-opus-high", "claude-opus-5-5-high", "opus-5.5", "opus5.5" -> "claude-opus-5-5-high"
         "agy-sonnet-high", "claude-sonnet-5-5-high", "sonnet-5.5", "sonnet5.5" -> "claude-sonnet-5-5-high"
+        "agy-sonnet-low", "claude-sonnet-5-5-low" -> "claude-sonnet-5-5-low"
         "agy-flash-low", "gemini-3.8-flash-low" -> "gemini-3.8-flash-low"
         "agy-flash-high", "gemini-3.8-flash-high", "3.8-flash-high" -> "gemini-3.8-flash-high"
         else -> if (requestedModel.startsWith("claude-") || requestedModel.startsWith("gemini-")) requestedModel else "gemini-3.8-flash-high"

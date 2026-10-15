@@ -18,6 +18,12 @@ data class PeerPairingState(val reason: PeerPairingReason, val associationId: St
 
 interface AssistantPeerSetupOwner { val assistantPeerSetup: AssistantPeerSetup }
 
+/** A fresh SDK route fenced against subsequent enrollment/setup mutations. Never persist node IDs. */
+internal data class AssistantVerifiedRoute(val nodeId: String, private val approvalVersion: Long) {
+    fun stillApproved(): Boolean = EnrolledPeerRegistry.approvalStable() &&
+        EnrolledPeerRegistry.approvalVersion() == approvalVersion
+}
+
 /** Data Layer package/signature isolation and native pairing authorize sharing; IDs only bind metadata. */
 class AssistantPeerSetup internal constructor(
     context: Context,
@@ -32,19 +38,31 @@ class AssistantPeerSetup internal constructor(
     private fun registry() = EnrolledPeerRegistry(application)
     internal fun installation() = localReplica()
 
-    internal fun replicaForNode(node: String): String? = verifiedBinding(node)?.replica
+    internal fun replicaForNode(node: String): String? = selectedPeer(node)?.first?.replica
 
-    private fun verifiedBinding(node: String): ApprovedPeerBinding? = runCatching {
-        if (state().reason != PeerPairingReason.ENROLLED) return@runCatching null
+    /** Blocking discovery/SQLite: callers must run off the main and SDK callback threads. */
+    internal fun selectedRoute(expectedNode: String? = null): AssistantVerifiedRoute? = selectedPeer(expectedNode)?.second
+
+    private fun selectedPeer(expectedNode: String?): Pair<ApprovedPeerBinding, AssistantVerifiedRoute>? = runCatching {
+        val version = EnrolledPeerRegistry.approvalVersion()
+        if (!EnrolledPeerRegistry.approvalStable()) return@runCatching null
+        val enrolled = state()
+        if (enrolled.reason != PeerPairingReason.ENROLLED) return@runCatching null
         val io = transportFactory()
-        val selection = discover(io)
-        if (selection.reason != PeerPairingReason.ENROLLED || selection.node?.nodeId != node) return@runCatching null
+        val selected = discover(io)
+        if (selected.reason != PeerPairingReason.ENROLLED) return@runCatching null
+        val node = requireNotNull(selected.node).nodeId
+        if (expectedNode != null && node != expectedNode) return@runCatching null
         if (io.reachable().none { it.nodeId == node }) return@runCatching null
-        val hello = requireNotNull(selection.hello)
+        val hello = requireNotNull(selected.hello)
         if (hello.installation == installation()) return@runCatching null
-        registry().use { db ->
-            db.bindingFor(hello.replica, hello.replica)?.takeIf { it.replica in db.replicas() }
+        val binding = registry().use { db ->
+            val binding = db.bindingFor(hello.replica, hello.replica)
+            binding?.takeIf { hello.replica in db.replicas() && enrolled.peerReplica == hello.replica &&
+                enrolled.associationId == it.association }
         }
+        val route = AssistantVerifiedRoute(node, version)
+        if (binding != null && route.stillApproved()) binding to route else null
     }.getOrNull()
 
     fun state(): PeerPairingState = registry().use { db ->

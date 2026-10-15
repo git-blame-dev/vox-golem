@@ -46,4 +46,38 @@ class AgyProviderRouterTest {
             assertEquals(2, agyCalls); assertEquals(2, terminalRetirements)
         } finally { worker.close() }
     }
+
+    @Test fun geminiNanoNeverRoutesToAgyAndSonnetEffortsResolveToDistinctAgyModels() {
+        fun provider(tag: String, hits: MutableList<String>) = object : ProviderNativeCalls {
+            override fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String {
+                hits += tag; return """{"status":"complete"}"""
+            }
+            override fun cancel(requestId: String) {}
+        }
+        val hits = mutableListOf<String>()
+        val router = AgyProviderRouter(RuntimeEnvironment.getApplication(), provider("default", hits), provider("agy", hits), provider("nano", hits))
+        listOf("gemini-nano", "agy-sonnet-low", "agy-sonnet-high", "custom-sol-high").forEachIndexed { i, model ->
+            router.respond("r$i", "", """{"model":"$model"}""", object : ProviderDeltaCallback { override fun onReady() {}; override fun onDelta(text: String) {} })
+        }
+        assertEquals(listOf("nano", "agy", "agy", "default"), hits)
+        val agy = AgyProviderNative(RuntimeEnvironment.getApplication())
+        assertEquals("claude-sonnet-5-5-low", agy.resolveTargetModel("agy-sonnet-low"))
+        assertEquals("claude-sonnet-5-5-high", agy.resolveTargetModel("agy-sonnet-high"))
+    }
+
+    @Test fun watchRoutesAgyAndNanoThroughThePhoneRelayButNotCustom() {
+        fun provider(tag: String, hits: MutableList<String>) = object : ProviderNativeCalls {
+            override fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String {
+                hits += tag; return """{"status":"complete"}"""
+            }
+            override fun cancel(requestId: String) {}
+        }
+        val hits = mutableListOf<String>()
+        val router = AgyProviderRouter(RuntimeEnvironment.getApplication(), provider("default", hits), provider("localAgy", hits),
+            provider("nano", hits), provider("phoneRelay", hits))
+        listOf("agy-sonnet-low", "agy-flash-high", "gemini-nano", "custom-sol-high").forEachIndexed { i, model ->
+            router.respond("w$i", "", """{"model":"$model"}""", object : ProviderDeltaCallback { override fun onReady() {}; override fun onDelta(text: String) {} })
+        }
+        assertEquals(listOf("phoneRelay", "phoneRelay", "phoneRelay", "default"), hits)
+    }
 }

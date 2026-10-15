@@ -1158,8 +1158,20 @@ class AssistantActivityTest {
         assertTrue(assistantErrorText("auth_expired").contains("Draft retained"))
         assertFalse(assistantErrorText("auth_expired").contains("Import"))
         assertTrue(assistantErrorText("not_saved").contains("Draft retained"))
-        assertEquals(10, AssistantModels.aliases.size)
+        assertEquals(11, AssistantModels.aliases.size)
         assertTrue("gemini-nano" in AssistantModels.aliases)
+    }
+
+    @Test fun watchModelPickerHidesProvidersWithoutAnInstalledRouteButKeepsTheCurrentSelection() {
+        val ready = mapOf(
+            "gemini-nano" to dev.gitblame.voxgolem.assistant.runtime.OptionalProviderReadiness(true, "Synthetic route"),
+            "agy-sonnet-low" to dev.gitblame.voxgolem.assistant.runtime.OptionalProviderReadiness(false, "Synthetic missing executable"),
+        )
+        val picker = assistantSelectableModels(ready, "custom-sol-high")
+        assertTrue("gemini-nano" in picker); assertTrue("custom-sol-high" in picker)
+        assertFalse("agy-sonnet-low" in picker); assertFalse("agy-flash-high" in picker); assertFalse("local-fast" in picker)
+        assertTrue("agy-sonnet-low" in assistantSelectableModels(ready, "agy-sonnet-low"))
+        assertTrue(assistantErrorText("unsupported_model").contains("not available on the watch"))
     }
 
     @Test fun lateMicrophonePermissionAfterBackgroundCannotStartAnyRecognizerOrLoop() {

@@ -39,4 +39,14 @@ class AndroidProviderReadinessTest {
         assertFalse(AndroidProviderReadiness.inspect(context).getValue("agy-flash-high").available)
         assertTrue(snapshot.getValue("agy-flash-high").available) // Immutable publication, not a live file-backed getter.
     }
+
+    @Test fun watchRunsAgyAndNanoOnThePairedPhoneInsteadOfNeedingLocalExecution() {
+        val context = RuntimeEnvironment.getApplication()
+        assertFalse(AndroidProviderReadiness.inspect(context).getValue("agy-sonnet-low").available)
+        org.robolectric.Shadows.shadowOf(context.packageManager).setSystemFeature(android.content.pm.PackageManager.FEATURE_WATCH, true)
+        val watch = AndroidProviderReadiness.inspect(context)
+        assertTrue(watch.getValue("agy-sonnet-low").available); assertTrue(watch.getValue("agy-sonnet-high").available)
+        assertTrue(watch.getValue("gemini-nano").available)
+        assertFalse(watch.getValue("local-fast").available)
+    }
 }

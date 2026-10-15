@@ -56,6 +56,7 @@ class AssistantRequestWorkerDispatchTest {
         val events = mutableListOf<AssistantTiming.Event>()
         val timing = timing({ now }, events)
         val durations = mutableListOf<Long>()
+        val dispatches = mutableListOf<String>()
         val native = object : ProviderNativeCalls {
             override fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String {
                 now += 10_000_000; callback.onReady()
@@ -69,6 +70,7 @@ class AssistantRequestWorkerDispatchTest {
         }
         val worker = AssistantRequestWorker(Executor { it.run() }, native)
         assertTrue(worker.submit("synthetic-dispatch", "/synthetic/auth", "{}", object : AssistantRequestListener {
+            override fun onRequestDispatched(requestId: String) { dispatches += requestId }
             override fun onFirstText(requestId: String, milliseconds: Long) {
                 durations += milliseconds
                 timing.mark(Stage.FIRST_TEXT)
@@ -83,6 +85,7 @@ class AssistantRequestWorkerDispatchTest {
         assertEquals(listOf(0L, 10_000_000L, 20_000_000L, 40_000_000L), marks.map { it.elapsedNanos })
         assertEquals(5_020_000_000L, marks.single { it.stage == Stage.REQUEST_DISPATCHED }.observedNanos)
         assertEquals(listOf(123L), durations)
+        assertEquals(listOf("synthetic-dispatch"), dispatches)
         worker.close()
     }
 

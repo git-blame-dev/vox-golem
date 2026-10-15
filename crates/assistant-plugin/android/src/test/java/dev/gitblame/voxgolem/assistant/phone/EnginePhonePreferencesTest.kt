@@ -95,6 +95,21 @@ class EnginePhonePreferencesTest {
 
     @After fun resetAdmission() { AssistantRuntime.configureCaptureResourceAdmission(false) }
 
+    @Test fun sonnetLowRoundTripsWithoutLosingSlateOrEnablingUnsupportedCapabilities() {
+        Fixture(false).use { f ->
+            val input = f.backend.nativePreferences().put("instant", "agy-sonnet-low")
+                .put("deep", "agy-sonnet-low").put("review", "agy-sonnet-low").put("ui_theme", "slate")
+            val result = f.update(input).getOrThrow() as JSONObject
+            val restored = PhonePreferences(f.context).read("agy-sonnet-low")
+            for (value in listOf(result, f.backend.nativePreferences(), restored)) {
+                for (key in listOf("instant", "deep", "review")) assertEquals("agy-sonnet-low", value.getString(key))
+                assertEquals("slate", value.getString("ui_theme"))
+                assertFalse(value.getBoolean("deep_enabled")); assertFalse(value.getBoolean("review_enabled"))
+            }
+            assertEquals(listOf("agy-sonnet-low"), f.prewarmed)
+        }
+    }
+
     @Test fun allThemesRoundTripThroughNativePublicationAndStorageWithoutInvalidWrites() {
         Fixture(false).use { f ->
             assertEquals("dark", f.backend.nativePreferences().getString("ui_theme"))

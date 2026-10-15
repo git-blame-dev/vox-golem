@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.database.sqlite.SQLiteDatabase
 import dev.gitblame.voxgolem.assistant.AssistantStore
 import dev.gitblame.voxgolem.assistant.AssistantStoreRunner
+import dev.gitblame.voxgolem.assistant.runtime.PhoneRelaySessionTest
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Rule
@@ -17,6 +18,7 @@ import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import java.io.File
 import java.util.concurrent.Executors
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 @RunWith(AssistantStoreRunner::class)
@@ -145,6 +147,85 @@ class AssistantPeerSetupTest {
         assertNull(pair.left.replicaForNode("synthetic-right-node"))
         pair.leftSdk.capabilityError = null
         assertEquals(PeerPairingReason.ENROLLED, pair.left.retry(a, pair.leftIo).reason)
+    }
+
+    @Test fun selectedRelayRouteUsesFreshOppositeRoleBindingAndRevocationFence() = worker {
+        val pair = PairFixture(); pair.link()
+        val route = requireNotNull(pair.left.selectedRoute())
+        assertEquals("synthetic-right-node", route.nodeId)
+        assertTrue(route.stillApproved())
+        assertNull(pair.left.selectedRoute("synthetic-unselected-node"))
+        EnrolledPeerRegistry(pair.leftContext).use { it.revoke(b) }
+        assertFalse(route.stillApproved())
+        assertNull(pair.left.selectedRoute())
+    }
+
+    @Test fun reconciliationKeepsActualSelectedRouteApprovedThroughDuplexCompletionAndRetry() = worker {
+        val pair = PairFixture(); pair.link()
+        val route = requireNotNull(pair.left.selectedRoute())
+        val relayTests = PhoneRelaySessionTest()
+        relayTests.Fixture().use { fixture ->
+            fixture.routeApproval = route::stillApproved
+            val continueProvider = CountDownLatch(1)
+            fixture.native.run = { callback ->
+                assertTrue(continueProvider.await(5, TimeUnit.SECONDS))
+                callback.onDelta("Synthetic reconciled answer")
+                """{"status":"complete","text":"Synthetic reconciled answer"}"""
+            }
+            val response = fixture.start()
+            assertTrue(fixture.native.entered.await(5, TimeUnit.SECONDS))
+            repeat(3) { assertEquals(PeerPairingReason.ENROLLED, pair.left.retry(a, pair.leftIo).reason) }
+            assertTrue(route.stillApproved())
+            continueProvider.countDown()
+            assertEquals("complete", JSONObject(response.get(5, TimeUnit.SECONDS)).getString("status"))
+            fixture.retireAndAdmitNext()
+            EnrolledPeerRegistry(pair.leftContext).use { it.revoke(b) }
+            assertFalse(route.stillApproved())
+        }
+    }
+
+    @Test fun selectedRelayRouteRejectsAmbiguityWrongRoleAndOfflineNodes() = worker {
+        val pair = PairFixture(); pair.link()
+        pair.mailbox.unreachableNodes.add("synthetic-right-node")
+        assertNull(pair.left.selectedRoute())
+        pair.mailbox.unreachableNodes.clear()
+        pair.publish(pair.rightIo, b, "phone")
+        assertNull(pair.left.selectedRoute())
+        pair.publish(pair.rightIo, b, "watch")
+        pair.publish(GmsReplicationTransport(pair.mailbox.sdk("synthetic-extra-watch"), budget()), c, "watch")
+        assertNull(pair.left.selectedRoute())
+    }
+
+    @Test fun realReconciliationChangesAndFailuresInvalidatePreviouslySelectedRoutes() = worker {
+        val pair = PairFixture(); pair.link()
+        var route = requireNotNull(pair.left.selectedRoute())
+        EnrolledPeerRegistry(pair.leftContext).use { it.enroll(b) }
+        assertTrue(route.stillApproved())
+        pair.publish(pair.rightIo, b, "phone")
+        assertEquals(PeerPairingReason.WAITING_FOR_PEER, pair.left.retry(a, pair.leftIo).reason)
+        assertFalse(route.stillApproved())
+        pair.publish(pair.rightIo, b, "watch")
+        pair.left.retry(a, pair.leftIo)
+        route = requireNotNull(pair.left.selectedRoute())
+        val extra = GmsReplicationTransport(pair.mailbox.sdk("synthetic-extra-watch"), budget())
+        pair.publish(extra, c, "watch")
+        assertEquals(PeerPairingReason.MULTIPLE_PEERS, pair.left.retry(a, pair.leftIo).reason)
+        assertFalse(route.stillApproved())
+        pair.mailbox.nodes.remove("synthetic-extra-watch")
+        pair.left.retry(a, pair.leftIo)
+        route = requireNotNull(pair.left.selectedRoute())
+        pair.leftSdk.capabilityError = IllegalStateException("Synthetic discovery failure")
+        assertEquals(PeerPairingReason.DISCOVERY_FAILED, pair.left.retry(a, pair.leftIo).reason)
+        assertFalse(route.stillApproved())
+        pair.leftSdk.capabilityError = null
+        pair.left.retry(a, pair.leftIo)
+        route = requireNotNull(pair.left.selectedRoute())
+        pair.publish(pair.rightIo, c, "watch")
+        assertEquals(PeerPairingReason.ENROLLED, pair.left.retry(a, pair.leftIo).reason)
+        assertFalse(route.stillApproved())
+        route = requireNotNull(pair.left.selectedRoute())
+        pair.left.recordFailure(PeerPairingReason.STORAGE_FAILURE)
+        assertFalse(route.stillApproved())
     }
 
     @Test fun identityHintsBootstrapAndOldInvitationPathsAreNeverQueued() = worker {

@@ -10,6 +10,7 @@ interface AssistantRequestListener {
     fun onOutcome(requestId: String, outcomeJson: String)
     fun onRetired(requestId: String) {}
     fun onFirstText(requestId: String, milliseconds: Long) {}
+    fun onRequestDispatched(requestId: String) {}
 }
 
 /** Transport-only owner. Supply a background executor and promptly returning listeners. */
@@ -57,6 +58,7 @@ class AssistantRequestWorker(
                             request.dispatchMeasured = true
                             // Android elapsed-realtime receipt, not the Rust dispatch instant or network headers.
                             timing?.mark(Stage.REQUEST_DISPATCHED)
+                            listener.onRequestDispatched(request.id)
                         }
                         override fun onFirstText(milliseconds: Long) = synchronized(lock) {
                             if (active !== request || request.returned || request.cancelled || request.firstTextMeasured) return@synchronized

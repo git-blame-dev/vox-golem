@@ -58,7 +58,8 @@ interface AssistantModelStorage {
 object AssistantModels {
     val customLabels = mapOf("custom-sol-high" to "Sol High", "custom-sol-none" to "Sol None", "custom-luna-none" to "Luna None", "custom-luna-low" to "Luna Low")
     val optionalLabels = mapOf("local-fast" to "Local: Llama 3.2 3B", "gemini-nano" to "Local: Gemini Nano", "agy-flash-low" to "Agy: Gemini 3.8 Flash Low",
-        "agy-flash-high" to "Agy: Gemini 3.8 Flash High", "agy-opus-high" to "Agy: Claude Opus 5.5 High", "agy-sonnet-high" to "Agy: Claude Sonnet 5.5 High")
+        "agy-flash-high" to "Agy: Gemini 3.8 Flash High", "agy-opus-high" to "Agy: Claude Opus 5.5 High",
+        "agy-sonnet-low" to "Agy: Claude Sonnet 5.5 Low", "agy-sonnet-high" to "Agy: Claude Sonnet 5.5 High")
     val aliases = (customLabels.keys + optionalLabels.keys).toList()
 }
 

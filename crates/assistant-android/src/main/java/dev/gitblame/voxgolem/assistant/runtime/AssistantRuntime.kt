@@ -23,6 +23,10 @@ object AssistantRuntime {
         agyRouter?.prewarm(model)
     }
 
+    /** The single provider router for this process: the engine and the watch relay must share its Agy owner. */
+    @Synchronized internal fun router(application: Context): AgyProviderRouter =
+        agyRouter ?: AgyProviderRouter(application).also { agyRouter = it }
+
     /** Enable only after Note/live/replay/probe owners all use RecognitionResourceLease.process. */
     fun configureCaptureResourceAdmission(ready: Boolean) { captureAdmissionReady = ready }
     fun captureResourceAdmissionReady(): Boolean = captureAdmissionReady
@@ -91,7 +95,7 @@ object AssistantRuntime {
             override fun read() = preferences.getString("model", "custom-sol-high") ?: "custom-sol-high"
             override fun write(value: String) { check(preferences.edit().putString("model", value).commit()) }
         }
-        val router = AgyProviderRouter(application).also { agyRouter = it }
+        val router = router(application)
         val initialModel = modelStorage.read()
         router.prewarm(initialModel)
 

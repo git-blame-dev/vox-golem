@@ -5,11 +5,11 @@ import android.app.job.JobService
 import com.google.android.gms.wearable.CapabilityInfo
 import com.google.android.gms.wearable.DataEvent
 import com.google.android.gms.wearable.DataEventBuffer
-import com.google.android.gms.wearable.MessageEvent
+import com.google.android.gms.wearable.ChannelClient
 import com.google.android.gms.wearable.Node
 import com.google.android.gms.wearable.WearableListenerService
-import dev.gitblame.voxgolem.assistant.runtime.GeminiNanoRelayBridge
-import dev.gitblame.voxgolem.assistant.runtime.GeminiNanoRelayWire
+import dev.gitblame.voxgolem.assistant.runtime.PhoneRelayBridge
+import dev.gitblame.voxgolem.assistant.runtime.PhoneRelayWire
 import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -21,9 +21,9 @@ class AssistantReplicationListenerService : WearableListenerService() {
             if (event.type == DataEvent.TYPE_CHANGED) AssistantReplication.onData(applicationContext, event.dataItem)
         }
     }
-    override fun onMessageReceived(messageEvent: MessageEvent) {
-        if (messageEvent.path.startsWith(GeminiNanoRelayWire.PREFIX)) {
-            GeminiNanoRelayBridge.onMessageReceived(applicationContext, messageEvent)
+    override fun onChannelOpened(channel: ChannelClient.Channel) {
+        if (PhoneRelayWire.validPath(channel.path)) {
+            PhoneRelayBridge.onChannelOpened(applicationContext, channel)
         }
     }
     override fun onPeerConnected(node: Node) {
