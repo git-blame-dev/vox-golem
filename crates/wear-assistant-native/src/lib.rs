@@ -355,7 +355,7 @@ enum CallbackEvent<'a> {
     RequestDispatched,
     FirstText(u64),
     Delta(&'a str),
-    Status(&'static str),
+    Status(&'a str),
 }
 
 #[derive(Default)]
@@ -1648,7 +1648,7 @@ mod tests {
             &mut |event| match event {
                 CallbackEvent::RequestDispatched => Ok(()),
                 CallbackEvent::Status(status) => {
-                    statuses.push(status);
+                    statuses.push(status.to_string());
                     Err(ErrorCode::CallbackFailed)
                 }
                 CallbackEvent::FirstText(_) | CallbackEvent::Delta(_) => {

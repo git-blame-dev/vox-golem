@@ -1771,6 +1771,11 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       if (event.kind === 'reasoning') {
         setPromptActivity({ text: `Reasoning: ${event.text}`, compact: true })
       }
+      const waitingStatus = event.kind === 'status' ? event.message : event.kind === 'tool' ? event.detail : undefined
+      if (waitingStatus !== undefined && /^(Searching|Reading|Fallback|Partial)\b/u.test(waitingStatus)) {
+        setMessages((current) => current.map((message) => message.id === active.assistantId && message.content.length === 0
+          ? { ...message, thinkingStatus: waitingStatus } : message))
+      }
       if (event.kind === 'status') {
         setPromptActivity({ text: event.message, compact: true })
       }

@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use voxgolem_core::assistant::{AgentModel, AssistantPolicy, Content, InstantModel};
 use voxgolem_core::conversation::SessionId;
-use voxgolem_core::search::{truncate_utf8, Failure, Mode, Source};
+use voxgolem_core::search::{truncate_utf8, EvidenceKind, Failure, Mode, Source};
 use voxgolem_platform::custom_openai::tools::ModelEvent;
 use voxgolem_platform::custom_openai::{
     CustomOpenAiAuthRevision, CustomOpenAiClient, CustomOpenAiConfig, CustomOpenAiPrompt,
@@ -216,13 +216,28 @@ fn project_event(
                 tool: "native_web".into(),
                 status: "completed".into(),
                 detail: if outcome.partial || outcome.evidence_unavailable {
-                    "Partial web evidence; some results could not be retained or read"
+                    "Partial web evidence; some results could not be retained or read".to_string()
                 } else if outcome.sources.is_empty() {
-                    "Web lookup completed with no results"
+                    "Web lookup completed with no results".to_string()
                 } else {
-                    "Web evidence received"
-                }
-                .into(),
+                    let pages = outcome
+                        .sources
+                        .iter()
+                        .filter(|s| s.kind == EvidenceKind::PageRead)
+                        .count();
+                    if pages > 0 {
+                        format!(
+                            "Reading · {pages} {}",
+                            if pages == 1 { "page" } else { "pages" }
+                        )
+                    } else {
+                        let n = outcome.sources.len();
+                        format!(
+                            "Searching · {n} {}",
+                            if n == 1 { "result" } else { "results" }
+                        )
+                    }
+                },
             });
             if !outcome.sources.is_empty() {
                 events.push(PromptExecutionEventPayload::Sources {

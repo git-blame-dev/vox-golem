@@ -11,7 +11,7 @@ export function ChatBubble({ message }: ChatBubbleProps): JSX.Element {
   return (
     <article className={`message message--${message.role}`}>
       <p className="message__content">
-        {isAssistantWaiting ? <span className="message__thinking">Thinking…</span> : message.content}
+        {isAssistantWaiting ? <span className="message__thinking">{message.thinkingStatus ?? 'Thinking…'}</span> : message.content}
       </p>
       {message.role === 'assistant' && message.customDirectTimings ? (
         <small className="conversation__timings">
