@@ -58,7 +58,7 @@ class AcknowledgedAssistantDelivery(
     }
 
     override fun deliverStatus(status: AssistantToolStatus): Boolean {
-        if (status.status !in AssistantSearchModes.statuses) { cancel(); return false }
+        if (!AssistantSearchModes.isValidStatus(status.status)) { cancel(); return false }
         if (synchronized(lock) { ++statuses > AssistantSearchModes.MAX_STATUS_EVENTS }) { cancel(); return false }
         return publish(AssistantDeliveryPacket(status.clientRequestToken, status.providerRequestId, status.sequence, toolStatus = status.status), false)
     }

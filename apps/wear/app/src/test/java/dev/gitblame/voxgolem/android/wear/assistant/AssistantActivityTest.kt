@@ -138,6 +138,31 @@ class SyntheticAssistantVoice : AssistantVoiceController {
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class AssistantActivityTest {
+    @Test fun talkLaunchPrecedesHistoryAndWaitsForForegroundHydration() {
+        Shadows.shadowOf(RuntimeEnvironment.getApplication()).grantPermissions(Manifest.permission.RECORD_AUDIO)
+        val client = SyntheticAssistantClient().apply {
+            state = state.copy(foreground = false, conversation = "{\"replica\":\"synthetic-launch-order\",\"sequence\":\"1\"}")
+        }
+        SyntheticAssistantActivity.retainedClient = client
+        val controller = Robolectric.buildActivity(SyntheticAssistantActivity::class.java, conversationLaunchIntent()).create().start()
+        val activity = controller.get()
+        activity.audio.onConversation = {
+            assertTrue(client.historyReads.isEmpty())
+            assertEquals(true, activity.audio.foregrounds.last())
+            assertTrue(activity.audio.speechChoices.isNotEmpty())
+        }
+        try {
+            controller.resume()
+            Shadows.shadowOf(Looper.getMainLooper()).idle()
+            assertTrue(client.historyReads.isEmpty())
+            assertEquals(0, activity.audio.conversations)
+            client.publish(client.state.copy(foreground = true))
+            Shadows.shadowOf(Looper.getMainLooper()).idle()
+            assertEquals(1, activity.audio.conversations)
+            assertEquals(1, client.historyReads.size)
+        } finally { controller.pause().stop().destroy(); SyntheticAssistantActivity.retainedClient = null }
+    }
+
     @Test fun resumeQueuesForegroundBeforeReadingSelectedConversationHistory() {
         val previous = SyntheticAssistantActivity.retainedClient
         val client = SyntheticAssistantClient().apply {

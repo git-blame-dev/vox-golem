@@ -57,6 +57,285 @@ class AssistantEngineTest {
     private fun prepare() { engine.setDraft("Synthetic question"); io.drain(); engine.send(); io.drain() }
     private fun settle() { providerQueue.drain(); io.drain() }
 
+    @Test fun unchangedActorOperationsStillInvokeSettledCallbacksWithoutDuplicatePublications() {
+        var publications = 0
+        var callbacks = 0
+        val subscription = engine.subscribe { publications++ }
+        io.drain(); publications = 0
+        try {
+            repeat(2) { engine.setDraft(state.draft) { callbacks++ } }
+            io.drain()
+            assertEquals(2, callbacks)
+            assertEquals(0, publications)
+        } finally { subscription.close() }
+    }
+
+    @Test fun utf8CallbackBudgetAcceptsBoundaryAndRejectsOverflowWithoutDurableCompletion() {
+        val boundary = "🧪".repeat(AssistantRequestWorker.MAX_CALLBACK_BYTES / 4)
+        provider.body = { callback ->
+            callback.onReady(); callback.onDelta(boundary)
+            io.drain()
+            assertEquals(boundary, state.provisional)
+            callback.onDelta("x")
+            error("Overflow must be rejected by the callback budget")
+        }
+        prepare(); settle()
+        assertFalse(state.busy)
+        assertEquals("", state.provisional)
+        assertNotNull(state.error)
+        assertEquals(1, store.snapshot().getJSONArray("records").length())
+    }
+
+    @Test fun pendingBurstFollowedByProviderErrorIsClearedAndDoesNotCommit() {
+        provider.body = { callback ->
+            callback.onReady(); callback.onDelta("Synthetic "); callback.onDelta("failed burst")
+            """{"status":"error","code":"internal_error"}"""
+        }
+        prepare(); settle()
+        assertFalse(state.busy)
+        assertEquals("", state.provisional)
+        assertEquals(1, store.snapshot().getJSONArray("records").length())
+    }
+
+    @Test fun idleHydrationAndResumeInstallOnlyOneProjection() {
+        val calls = mutableListOf<JSONObject>()
+        val queue = Queue()
+        val worker = AssistantRequestWorker(providerQueue, provider)
+        val instance = AssistantEngine(store, queue, worker, { "/synthetic/private/auth.json" }, models,
+            projectionGateway = dev.gitblame.voxgolem.assistant.DomainGateway { raw ->
+                calls += JSONObject(raw)
+                dev.gitblame.voxgolem.assistant.AssistantDomainNative.apply(raw)
+            })
+        try {
+            instance.resume(); queue.drain()
+            assertTrue(instance.snapshot().foreground)
+            assertEquals(1, calls.size)
+            instance.resume(); queue.drain()
+            assertEquals(1, calls.size)
+        } finally { instance.stop(); queue.drain(); worker.close() }
+    }
+
+    @Test fun failedRefreshAndRetiredBusyProjectionCannotAuthorizeIdleReuse() {
+        val conversation = store.createConversation("Synthetic invalidation owner").getJSONObject("operation").getJSONObject("id")
+        store.selectConversation(conversation, null)
+        var calls = 0
+        var fail = false
+        val queue = Queue()
+        val worker = AssistantRequestWorker(providerQueue, provider)
+        val instance = AssistantEngine(store, queue, worker, { "/synthetic/private/auth.json" }, models,
+            projectionGateway = dev.gitblame.voxgolem.assistant.DomainGateway { raw ->
+                calls++
+                if (fail) error("Synthetic projection failure")
+                dev.gitblame.voxgolem.assistant.AssistantDomainNative.apply(raw)
+            })
+        try {
+            instance.resume(); queue.drain()
+            fail = true
+            instance.refresh(); queue.drain()
+            fail = false
+            val afterFailure = calls
+            instance.setSpeechDraft("Synthetic recovered draft", conversation.toString(), requireHeadOwner = true)
+            queue.drain()
+            assertEquals(afterFailure + 1, calls)
+            instance.submitSpeech("synthetic-busy-invalidation", "Synthetic cancelled voice", conversation.toString(),
+                AssistantResultListener { _, _ -> }, expectedHead = null)
+            queue.drain()
+            assertTrue(instance.snapshot().busy)
+            instance.stop(); providerQueue.drain(); queue.drain()
+            val afterRetirement = calls
+            instance.resume(); queue.drain()
+            assertEquals(afterRetirement + 1, calls)
+            assertFalse(instance.snapshot().busy)
+        } finally { instance.stop(); providerQueue.drain(); queue.drain(); worker.close() }
+    }
+
+    @Test fun ownedPartialsPersistOnEachActorTurnWithoutRestoringAnUnchangedProjection() {
+        val conversation = store.createConversation("Synthetic dictation owner").getJSONObject("operation").getJSONObject("id")
+        store.selectConversation(conversation, null)
+        val calls = mutableListOf<JSONObject>()
+        val queue = Queue()
+        val worker = AssistantRequestWorker(providerQueue, provider)
+        val instance = AssistantEngine(store, queue, worker, { "/synthetic/private/auth.json" }, models,
+            projectionGateway = dev.gitblame.voxgolem.assistant.DomainGateway { raw ->
+                calls += JSONObject(raw)
+                dev.gitblame.voxgolem.assistant.AssistantDomainNative.apply(raw)
+            })
+        try {
+            instance.resume(); queue.drain(); calls.clear()
+            val port = AssistantEnginePort(instance)
+            port.beginInput()
+            for (text in listOf("Synthetic", "Synthetic partial", "Synthetic final")) {
+                val before = store.draft(conversation).getString("text")
+                port.setDraft(text)
+                assertEquals(before, store.draft(conversation).getString("text"))
+                queue.drain()
+                assertEquals(text, store.draft(conversation).getString("text"))
+                assertEquals(text, instance.snapshot().draft)
+            }
+            // An unchanged final must still save, not be dropped by text deduplication.
+            store.saveDraft(conversation, "Synthetic durable sentinel")
+            port.setDraft("Synthetic final"); queue.drain()
+            assertEquals("Synthetic final", store.draft(conversation).getString("text"))
+            assertTrue("Owned partials must not restore the domain", calls.isEmpty())
+        } finally { instance.stop(); queue.drain(); worker.close() }
+    }
+
+    @Test fun ownedDraftValidationRefreshesOnRevisionAndLocalSelectionChanges() {
+        val first = store.createConversation("Synthetic first owner").getJSONObject("operation").getJSONObject("id")
+        val second = store.createConversation("Synthetic second owner").getJSONObject("operation").getJSONObject("id")
+        store.selectConversation(first, null)
+        val calls = mutableListOf<JSONObject>()
+        val queue = Queue()
+        val worker = AssistantRequestWorker(providerQueue, provider)
+        val instance = AssistantEngine(store, queue, worker, { "/synthetic/private/auth.json" }, models,
+            projectionGateway = dev.gitblame.voxgolem.assistant.DomainGateway { raw ->
+                calls += JSONObject(raw)
+                dev.gitblame.voxgolem.assistant.AssistantDomainNative.apply(raw)
+            })
+        try {
+            instance.resume(); queue.drain(); calls.clear()
+            store.createConversation("Synthetic external revision")
+            instance.setSpeechDraft("Synthetic accepted partial", first.toString(), requireHeadOwner = true)
+            queue.drain()
+            assertEquals(1, calls.size)
+            assertEquals("Synthetic accepted partial", store.draft(first).getString("text"))
+            calls.clear()
+            val revision = store.snapshot().getString("revision")
+            store.saveDraft(second, "Synthetic other owner's draft")
+            store.selectConversation(second, null)
+            assertEquals(revision, store.snapshot().getString("revision"))
+            instance.setSpeechDraft("Synthetic stale partial", first.toString(), requireHeadOwner = true)
+            queue.drain()
+            assertEquals(1, calls.size)
+            assertEquals(second.toString(), instance.snapshot().conversation)
+            assertEquals("Synthetic other owner's draft", instance.snapshot().draft)
+            assertEquals("Synthetic accepted partial", store.draft(first).getString("text"))
+            assertEquals("Synthetic other owner's draft", store.draft(second).getString("text"))
+        } finally { instance.stop(); queue.drain(); worker.close() }
+    }
+
+    @Test fun ownedAdmissionReusesValidationButKeepsBudgetedContextAndBusyProjection() {
+        val conversation = store.createConversation("Synthetic voice admission").getJSONObject("operation").getJSONObject("id")
+        store.selectConversation(conversation, null)
+        val calls = mutableListOf<JSONObject>()
+        val queue = Queue()
+        val worker = AssistantRequestWorker(providerQueue, provider)
+        val instance = AssistantEngine(store, queue, worker, { "/synthetic/private/auth.json" }, models,
+            projectionGateway = dev.gitblame.voxgolem.assistant.DomainGateway { raw ->
+                calls += JSONObject(raw)
+                dev.gitblame.voxgolem.assistant.AssistantDomainNative.apply(raw)
+            })
+        try {
+            instance.resume(); queue.drain(); calls.clear()
+            val prompt = "Synthetic voice 🧪"
+            instance.submitSpeech("synthetic-owned-budget", prompt, conversation.toString(),
+                AssistantResultListener { _, _ -> }, expectedHead = null)
+            queue.drain()
+            assertTrue(instance.snapshot().busy)
+            assertEquals(2, calls.size)
+            val read = calls.first().getJSONObject("request").getJSONObject("read")
+            assertEquals("context", read.getString("kind"))
+            assertEquals(256 * 1024 - prompt.toByteArray(Charsets.UTF_8).size, read.getInt("max_text_bytes"))
+        } finally { instance.stop(); providerQueue.drain(); queue.drain(); worker.close() }
+    }
+
+    @Test fun ownedAdmissionRejectsAReplicaHeadChangeDuringMandatoryContextProjection() {
+        prepare(); settle()
+        val conversation = JSONObject(state.conversation!!)
+        val head = JSONObject(state.selectedHead!!)
+        val queue = Queue()
+        val worker = AssistantRequestWorker(providerQueue, provider)
+        var inject = false
+        val instance = AssistantEngine(store, queue, worker, { "/synthetic/private/auth.json" }, models,
+            projectionGateway = dev.gitblame.voxgolem.assistant.DomainGateway { raw ->
+                val request = JSONObject(raw)
+                if (inject && request.getJSONObject("request").optJSONObject("read")?.optString("kind") == "context") {
+                    inject = false
+                    commitSyntheticDescendant(conversation, head)
+                    // Model a replica commit after the caller began its context read.
+                    val snapshot = store.committedSnapshot().rawJson
+                    request.put("snapshot", JSONObject(snapshot))
+                }
+                dev.gitblame.voxgolem.assistant.AssistantDomainNative.apply(request.toString())
+            })
+        try {
+            instance.resume(); queue.drain()
+            val before = provider.requests.size
+            var result: AssistantRequestResult? = null
+            inject = true
+            instance.submitSpeech("synthetic-context-race", "Synthetic raced voice", conversation.toString(),
+                AssistantResultListener { value, _ -> result = value }, expectedHead = head.toString())
+            queue.drain(); providerQueue.drain(); queue.drain()
+            assertFalse("Mandatory context read must execute", inject)
+            assertEquals("conversation_changed", result!!.code)
+            assertEquals(before, provider.requests.size)
+        } finally { instance.stop(); providerQueue.drain(); queue.drain(); worker.close() }
+    }
+
+    @Test fun burstDeltasKeepImmediateTransportPacketsButUseOneOrderedActorPublication() {
+        val pieces = listOf("Synthetic ", "ordered ", "🧪", "\n", "tail")
+        val packets = mutableListOf<AssistantDeliveryPacket>()
+        val seen = mutableListOf<AssistantState>()
+        val subscription = engine.subscribe { seen += it }
+        lateinit var delivery: AcknowledgedAssistantDelivery
+        delivery = AcknowledgedAssistantDelivery("synthetic-burst", { packet ->
+            packets += packet
+            delivery.acknowledge(packet.clientRequestToken, packet.providerRequestId, packet.sequence)
+        })
+        provider.body = { callback ->
+            callback.onReady()
+            pieces.forEach(callback::onDelta)
+            assertEquals(pieces, packets.map { it.delta })
+            assertEquals((1L..pieces.size.toLong()).toList(), packets.map { it.sequence })
+            assertEquals("A burst must schedule only one presentation drain", 1, io.tasks.size)
+            io.drain()
+            assertEquals(pieces.joinToString(""), state.provisional)
+            assertEquals(1, seen.count { it.provisional.isNotEmpty() })
+            """{"status":"complete","text":"Synthetic durable burst","contentType":"output_text"}"""
+        }
+        try {
+            engine.submit("synthetic-burst", "Synthetic burst question", delivery, AssistantResultListener { _, _ -> })
+            io.drain(); seen.clear(); settle()
+            assertFalse(state.busy)
+            assertEquals("", state.provisional)
+        } finally { subscription.close() }
+    }
+
+    @Test fun outcomeBeforeActorDrainFlushesOrderedBurstAndCannotReviveItAfterSettlement() {
+        val seen = mutableListOf<String>()
+        val subscription = engine.subscribe { if (it.provisional.isNotEmpty()) seen += it.provisional }
+        provider.body = { callback ->
+            callback.onReady(); callback.onDelta("Synthetic "); callback.onDelta("terminal burst")
+            """{"status":"complete","text":"Synthetic durable terminal","contentType":"output_text"}"""
+        }
+        try {
+            prepare(); seen.clear(); providerQueue.drain(); io.drain()
+            assertEquals(listOf("Synthetic terminal burst"), seen)
+            assertEquals("", state.provisional)
+            assertFalse(state.busy)
+            io.drain()
+            assertEquals("", state.provisional)
+        } finally { subscription.close() }
+    }
+
+    @Test fun cancellationBeforePendingDrainDiscardsBurstAndStaleCallbacks() {
+        val seen = mutableListOf<String>()
+        val subscription = engine.subscribe { if (it.provisional.isNotEmpty()) seen += it.provisional }
+        provider.body = { callback ->
+            callback.onReady(); callback.onDelta("Synthetic pending")
+            engine.stop()
+            callback.onDelta(" synthetic stale")
+            """{"status":"complete","text":"Synthetic cancelled final","contentType":"output_text"}"""
+        }
+        try {
+            prepare(); seen.clear(); settle()
+            assertTrue(seen.isEmpty())
+            assertFalse(state.busy)
+            assertEquals("", state.provisional)
+            assertEquals(1, store.snapshot().getJSONArray("records").length())
+        } finally { subscription.close() }
+    }
+
     @Test fun providerFirstTextAppearsDuringStreamingSurvivesCompletionAndResetsForTheNextRequest() {
         provider.body = { callback ->
             callback.onReady(); callback.onFirstText(432)
@@ -1082,5 +1361,19 @@ class AssistantEngineTest {
         assertEquals("Synthetic retained followup", store.draft(null).getString("text"))
         assertEquals("Synthetic question", store.draft(JSONObject(previous)).getString("text"))
         store.beforeCommit = null
+    }
+
+    @Test fun selectingAnotherConversationClearsPriorRequestMetadata() {
+        val other = store.createConversation("Second").getJSONObject("operation").getJSONObject("id")
+        prepare(); settle()
+        assertNotNull(state.clientRequestToken)
+        assertNotNull(state.providerRequestId)
+        engine.selectConversation(other.toString())
+        io.drain()
+        assertEquals(other.toString(), state.conversation)
+        assertNull(state.clientRequestToken)
+        assertNull(state.providerRequestId)
+        assertNull(state.firstTextMs)
+        assertNull(state.toolStatus)
     }
 }

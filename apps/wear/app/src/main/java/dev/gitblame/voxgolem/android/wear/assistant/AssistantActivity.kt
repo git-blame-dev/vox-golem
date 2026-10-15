@@ -97,7 +97,7 @@ open class AssistantActivity : ComponentActivity() {
             replyMetrics.remember(projection.providerRequestId, projection.firstTextMs)
             state = projection
             if (resumed && state.foreground) startupTiming?.finish(Stage.FIRST_PROJECTION)
-            if (resumed) { history.select(state); consumeVoiceLaunch() }
+            if (resumed && state.foreground) { consumeVoiceLaunch(); history.select(state) }
         }
     }
     private val updateLink = object : Runnable {
@@ -108,7 +108,7 @@ open class AssistantActivity : ComponentActivity() {
         }
     }
 
-    protected open fun assistantClient(): AssistantClient = AssistantRuntime.get(applicationContext)
+    protected open fun assistantClient(): AssistantClient = AssistantRuntime.get(applicationContext, startupTiming)
     protected open fun assistantVoice(client: AssistantClient): AssistantVoiceController = WearAssistantVoice(this, client as AssistantEngine)
     internal open fun assistantVoiceSettings(): WearVoiceSettings = WearVoiceSettings(this)
     private fun admitLaunch(entry: Boolean?) {
@@ -207,14 +207,14 @@ open class AssistantActivity : ComponentActivity() {
         resumed = true
         screenAwake.resume(client.snapshot(), voice.snapshot())
         client.resume()
-        history.select(client.snapshot())
         voice.foreground(true)
         readVoicePreferences()
         voice.tts(voicePreferences.readRepliesAloud)
-        if (client is AssistantEngine) recheck()
+        if (client is AssistantEngine) AssistantReplication.reconcileNow(applicationContext)
         handler.removeCallbacks(updateLink)
         handler.post(updateLink)
         consumeVoiceLaunch()
+        if (client.snapshot().foreground) history.select(client.snapshot())
     }
 
     override fun onNewIntent(intent: Intent) {

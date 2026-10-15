@@ -17,6 +17,7 @@ class AssistantRequestWorker(
     private val executor: Executor,
     private val native: ProviderNativeCalls = AssistantProviderNative,
 ) : AutoCloseable {
+    companion object { internal const val MAX_CALLBACK_BYTES = 256 * 1024 }
     private class Request(val id: String) {
         var cancelled = false
         var nativeReady = false
@@ -71,13 +72,13 @@ class AssistantRequestWorker(
                         override fun onDelta(text: String) = synchronized(lock) {
                             if (active !== request || request.cancelled) return@synchronized
                             request.deliveredBytes += text.toByteArray(Charsets.UTF_8).size
-                            check(request.deliveredBytes <= 256 * 1024) { "Native output exceeds callback budget" }
+                            check(request.deliveredBytes <= MAX_CALLBACK_BYTES) { "Native output exceeds callback budget" }
                             listener.onDelta(request.id, text)
                         }
 
                         override fun onStatus(status: String) = synchronized(lock) {
                             if (active !== request || request.cancelled) return@synchronized
-                            check(status in AssistantSearchModes.statuses) { "Invalid native tool status" }
+                            check(AssistantSearchModes.isValidStatus(status)) { "Invalid native tool status" }
                             check(++request.deliveredStatuses <= AssistantSearchModes.MAX_STATUS_EVENTS) { "Native status exceeds callback budget" }
                             listener.onStatus(request.id, status)
                         }
