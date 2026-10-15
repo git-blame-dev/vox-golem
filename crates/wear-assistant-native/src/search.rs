@@ -763,14 +763,14 @@ mod tests {
                 r#"{"requestId":"synthetic-req-1","prompt":"Synthetic query","webEnabled":false,"searchMode":"verify"}"#,
             )
             .unwrap();
-            let mut statuses = Vec::new();
+            let mut statuses: Vec<String> = Vec::new();
             let (prep, status) = prepare_search_context_with_service(
                 &mut web,
                 &req,
                 &Cancellation::default(),
                 &mut |event| {
                     if let CallbackEvent::Status(s) = event {
-                        statuses.push(s);
+                        statuses.push(s.to_string());
                     }
                     Ok(())
                 },
@@ -817,14 +817,14 @@ mod tests {
                 r#"{"requestId":"synthetic-req-2","messages":[{"role":"user","content":"What happened in synthetic event?"}],"web_enabled":true,"web_search_mode":"verify"}"#,
             )
             .unwrap();
-            let mut statuses = Vec::new();
+            let mut statuses: Vec<String> = Vec::new();
             let (prep, status) = prepare_search_context_with_service(
                 &mut web,
                 &req,
                 &Cancellation::default(),
                 &mut |event| {
                     if let CallbackEvent::Status(s) = event {
-                        statuses.push(s);
+                        statuses.push(s.to_string());
                     }
                     Ok(())
                 },
@@ -883,14 +883,14 @@ mod tests {
                 r#"{"requestId":"synthetic-req-3","prompt":"Fallback query","webEnabled":true,"searchMode":"verify"}"#,
             )
             .unwrap();
-            let mut statuses = Vec::new();
+            let mut statuses: Vec<String> = Vec::new();
             let (prep, status) = prepare_search_context_with_service(
                 &mut web,
                 &req,
                 &Cancellation::default(),
                 &mut |event| {
                     if let CallbackEvent::Status(s) = event {
-                        statuses.push(s);
+                        statuses.push(s.to_string());
                     }
                     Ok(())
                 },
