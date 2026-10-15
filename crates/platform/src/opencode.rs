@@ -5,13 +5,14 @@ use std::process::{Command, Output};
 use std::thread;
 use std::time::Duration;
 
+use crate::managed_process::ManagedTokioProcess as Child;
 use crate::managed_process::{
     configure_owned_tokio, terminate_tokio, terminate_tokio_on_drop, ProcessOwnership,
 };
 use futures_util::StreamExt;
 use reqwest::{StatusCode, Url};
 use serde::Deserialize;
-use tokio::process::{Child, Command as TokioCommand};
+use tokio::process::Command as TokioCommand;
 
 const MAX_JSON_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_SSE_FRAME_BYTES: usize = 256 * 1024;
@@ -763,12 +764,14 @@ async fn spawn_server_process(
             Err(error) if is_executable_busy(&error) && attempt + 1 < ETXTBSY_RETRY_COUNT => {
                 tokio::time::sleep(ETXTBSY_RETRY_DELAY).await;
             }
-            result => return result,
+            result => return result.and_then(Child::from_owned_child),
         }
     }
 
     #[cfg(not(unix))]
-    return server_command(launch, port, password).spawn();
+    return server_command(launch, port, password)
+        .spawn()
+        .and_then(Child::from_owned_child);
 
     #[cfg(unix)]
     unreachable!("the bounded server spawn retry loop always returns")
@@ -1008,7 +1011,7 @@ where
         terminate_tokio_on_drop(child, ProcessOwnership::Owned);
         return;
     }
-    drop(child.stdin.take());
+    drop(child.take_stdin());
     let _ = std::thread::Builder::new()
         .name(String::from("wsl-opencode-reaper"))
         .spawn(move || {
@@ -1157,7 +1160,7 @@ async fn read_json_response(
 
 async fn terminate_child(child: &mut Child, wsl_owned: bool) {
     if wsl_owned {
-        drop(child.stdin.take());
+        drop(child.take_stdin());
         if matches!(
             tokio::time::timeout(Duration::from_secs(2), child.wait()).await,
             Ok(Ok(_))
@@ -1201,21 +1204,13 @@ struct StreamPart {
 }
 
 fn parse_sse_event(
-    frame: &str,
+    data: &str,
     active_session: Option<&str>,
     expected_user_message: Option<&str>,
     assistant_message: &mut Option<String>,
     request_started: &mut bool,
     stream_parts: &mut HashMap<String, StreamPart>,
 ) -> Result<Option<OpencodeEvent>, OpencodeServerError> {
-    let data = frame
-        .lines()
-        .filter_map(|line| {
-            line.strip_prefix("data:")
-                .map(|data| data.strip_prefix(' ').unwrap_or(data))
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
     let value: serde_json::Value = serde_json::from_str(data.trim())
         .map_err(|e| OpencodeServerError::InvalidResponse(e.to_string()))?;
     let kind = value
@@ -1530,6 +1525,7 @@ fn map_tool_event(part: &serde_json::Value) -> Result<OpencodeEvent, OpencodeSer
 /// Incremental SSE framing for arbitrary network chunk boundaries.
 pub struct OpencodeSseDecoder {
     buffer: Vec<u8>,
+    boundary: crate::sse::Boundary,
     active_session: Option<String>,
     expected_user_message: Option<String>,
     assistant_message: Option<String>,
@@ -1550,6 +1546,7 @@ impl OpencodeSseDecoder {
     fn with_message(active_session: String, expected_user_message: Option<String>) -> Self {
         Self {
             buffer: Vec::new(),
+            boundary: crate::sse::Boundary::default(),
             active_session: Some(active_session),
             expected_user_message,
             assistant_message: None,
@@ -1565,7 +1562,7 @@ impl OpencodeSseDecoder {
         }
         self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
-        while let Some((end, delimiter_len)) = sse_frame_end(&self.buffer) {
+        while let Some((end, delimiter_len)) = self.boundary.separator(&mut self.buffer) {
             let frame = self.buffer.drain(..end + delimiter_len).collect::<Vec<_>>();
             if frame.len() > MAX_SSE_FRAME_BYTES {
                 events.push(Err(OpencodeServerError::FrameTooLarge));
@@ -1573,9 +1570,12 @@ impl OpencodeSseDecoder {
             }
             if frame.contains(&b':') {
                 match std::str::from_utf8(&frame) {
-                    Ok(text) if text.lines().any(|line| line.starts_with("data:")) => {
+                    Ok(text) => {
+                        let Some(data) = crate::sse::data_if_present(text) else {
+                            continue;
+                        };
                         match parse_sse_event(
-                            text,
+                            &data,
                             self.active_session.as_deref(),
                             self.expected_user_message.as_deref(),
                             &mut self.assistant_message,
@@ -1585,7 +1585,7 @@ impl OpencodeSseDecoder {
                             Ok(Some(event)) => {
                                 let mut evidence = Vec::new();
                                 collect_tool_evidence(
-                                    text,
+                                    &data,
                                     self.active_session.as_deref(),
                                     self.assistant_message.as_deref(),
                                     &mut evidence,
@@ -1648,7 +1648,6 @@ impl OpencodeSseDecoder {
                         }
                     }
                     Err(_) => events.push(Err(OpencodeServerError::InvalidUtf8)),
-                    _ => {}
                 }
             }
         }
@@ -1661,18 +1660,12 @@ impl OpencodeSseDecoder {
 }
 
 fn collect_tool_evidence(
-    frame: &str,
+    data: &str,
     active_session: Option<&str>,
     expected_message: Option<&str>,
     evidence: &mut Vec<OpencodeToolEvidence>,
 ) {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(
-        &frame
-            .lines()
-            .filter_map(|line| line.strip_prefix("data:").map(|v| v.trim_start()))
-            .collect::<Vec<_>>()
-            .join("\n"),
-    ) else {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
         return;
     };
     if value.get("type").and_then(serde_json::Value::as_str) != Some("message.part.updated") {
@@ -1729,18 +1722,6 @@ fn collect_tool_evidence(
         status: OpencodeToolUseStatus::Completed,
         detail: input_url.into(),
     });
-}
-
-fn sse_frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
-    let lf = buffer.windows(2).position(|window| window == b"\n\n");
-    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
-    match (lf, crlf) {
-        (Some(lf), Some(crlf)) if lf <= crlf => Some((lf, 2)),
-        (Some(_), Some(crlf)) => Some((crlf, 4)),
-        (Some(lf), None) => Some((lf, 2)),
-        (None, Some(crlf)) => Some((crlf, 4)),
-        (None, None) => None,
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1875,7 +1856,9 @@ mod tests {
         let mut command = tokio::process::Command::new("sh");
         command.args(["-c", "exec sleep 30"]).kill_on_drop(true);
         crate::managed_process::configure_owned_tokio(&mut command);
-        let child = command.spawn().expect("test child should start");
+        let child =
+            super::Child::from_owned_child(command.spawn().expect("test child should start"))
+                .unwrap();
         let pid = child.id().expect("test child should expose its pid");
 
         terminate_child_on_drop(child, false, ());
@@ -1898,7 +1881,9 @@ mod tests {
             .stdin(std::process::Stdio::piped())
             .kill_on_drop(true);
         crate::managed_process::configure_owned_tokio(&mut command);
-        let child = command.spawn().expect("test child should start");
+        let child =
+            super::Child::from_owned_child(command.spawn().expect("test child should start"))
+                .unwrap();
         let pid = child.id().expect("test child should expose its pid");
         let guard_dropped = Arc::new(AtomicBool::new(false));
 
@@ -2289,6 +2274,81 @@ mod tests {
     }
 
     #[test]
+    fn sse_admission_preserves_prefixed_data_and_ignores_heartbeats_at_every_byte_split() {
+        for ending in ["\r", "\r\n", "\n"] {
+            for prefix in [
+                format!(": synthetic comment{ending}"),
+                format!("event: synthetic update{ending}"),
+                "\u{feff}".to_owned(),
+            ] {
+                let wire = format!("{prefix}data: {{\"type\":\"message.part.updated\",\"properties\":{{\"part\":{{\"type\":\"text\",\"sessionID\":\"ses_synthetic\"}},\"delta\":\"Synthetic é 🧪\"}}}}{ending}{ending}: synthetic heartbeat{ending}event: heartbeat{ending}{ending}event: synthetic update{ending}data: {{\"type\":\"session.idle\",\"properties\":{{\"sessionID\":\"ses_synthetic\"}}}}{ending}{ending}").into_bytes();
+                for split in 0..=wire.len() {
+                    let mut decoder = OpencodeSseDecoder::new("ses_synthetic".into());
+                    let mut events = decoder.push(&wire[..split]);
+                    events.extend(decoder.push(&wire[split..]));
+                    let events = events.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+                    assert_eq!(
+                        events,
+                        [
+                            OpencodeEvent::Text("Synthetic é 🧪".into()),
+                            OpencodeEvent::Completed,
+                        ],
+                        "ending {ending:?}, prefix {prefix:?}, split {split}"
+                    );
+                }
+                let mut decoder = OpencodeSseDecoder::new("ses_synthetic".into());
+                let events = wire
+                    .chunks(1)
+                    .flat_map(|chunk| decoder.push(chunk))
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(
+                    events,
+                    [
+                        OpencodeEvent::Text("Synthetic é 🧪".into()),
+                        OpencodeEvent::Completed,
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sse_admission_distinguishes_heartbeat_from_empty_data() {
+        let mut decoder = OpencodeSseDecoder::new("ses_synthetic".into());
+        assert!(decoder
+            .push(b": synthetic heartbeat\r\revent: heartbeat\r\r")
+            .is_empty());
+        assert!(matches!(
+            decoder.push(b"data:\r\r").as_slice(),
+            [Err(OpencodeServerError::InvalidResponse(_))]
+        ));
+    }
+
+    #[test]
+    fn review_sse_ending_pairs_preserve_unicode_and_terminal_across_every_split() {
+        for (pair, separator) in crate::test_support::sse_ending_pairs() {
+            let wire = format!("data: {{\"type\":\"message.part.updated\",\"properties\":{{\"part\":{{\"type\":\"text\",\"sessionID\":\"ses_synthetic\"}},\"delta\":\"Synthetic é 🧪\"}}}}{separator}data: {{\"type\":\"session.idle\",\"properties\":{{\"sessionID\":\"ses_synthetic\"}}}}{separator}").into_bytes();
+            for split in 0..=wire.len() {
+                let mut decoder = OpencodeSseDecoder::new("ses_synthetic".into());
+                let mut events = Vec::new();
+                for chunk in [&wire[..split], &wire[split..]] {
+                    events.extend(decoder.push(chunk));
+                }
+                let events = events.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+                assert_eq!(
+                    events,
+                    [
+                        OpencodeEvent::Text("Synthetic é 🧪".into()),
+                        OpencodeEvent::Completed
+                    ],
+                    "pair {pair}, split {split}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn incrementally_frames_sse_across_network_chunks() {
         let mut decoder = OpencodeSseDecoder::new("ses_1".into());
         assert!(decoder
@@ -2326,57 +2386,72 @@ mod tests {
         assert!(events.is_empty());
     }
 
-    async fn fake_reset_server(abort_delay: Duration, delete_delay: Duration) -> String {
+    async fn fake_reset_server(
+        abort_delay: Duration,
+        delete_delay: Duration,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("fake server should bind");
         let address = listener
             .local_addr()
             .expect("fake server should expose its address");
-        tokio::spawn(async move {
-            for _ in 0..3 {
-                let (mut stream, _) = listener.accept().await.expect("request should connect");
-                let mut request = Vec::new();
-                let mut chunk = [0; 1024];
-                loop {
-                    let count = stream
-                        .read(&mut chunk)
-                        .await
-                        .expect("request should be readable");
-                    if count == 0 {
-                        break;
+        let (abort_tx, abort_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(5), async move {
+                let mut abort_tx = Some(abort_tx);
+                for _ in 0..3 {
+                    let (mut stream, _) = listener.accept().await.expect("request should connect");
+                    let mut request = Vec::new();
+                    let mut chunk = [0; 1024];
+                    loop {
+                        let count =
+                            tokio::time::timeout(Duration::from_secs(2), stream.read(&mut chunk))
+                                .await
+                                .expect("reset fixture read deadline")
+                                .expect("request should be readable");
+                        if count == 0 {
+                            panic!("EOF before reset request headers");
+                        }
+                        request.extend_from_slice(&chunk[..count]);
+                        assert!(request.len() < 16 * 1024);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
                     }
-                    request.extend_from_slice(&chunk[..count]);
-                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
-                    }
+                    let request = String::from_utf8_lossy(&request);
+                    let (delay, body) = if request.contains("POST /session/") {
+                        if let Some(tx) = abort_tx.take() {
+                            let _ = tx.send(());
+                        }
+                        (abort_delay, "true")
+                    } else if request.contains("DELETE /session/") {
+                        (delete_delay, "true")
+                    } else {
+                        (Duration::ZERO, "{\"id\":\"ses_new\"}")
+                    };
+                    tokio::time::sleep(delay).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
                 }
-                let request = String::from_utf8_lossy(&request);
-                let (delay, body) = if request.contains("POST /session/") {
-                    (abort_delay, "true")
-                } else if request.contains("DELETE /session/") {
-                    (delete_delay, "true")
-                } else {
-                    (Duration::ZERO, "{\"id\":\"ses_new\"}")
-                };
-                tokio::time::sleep(delay).await;
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream
-                    .write_all(response.as_bytes())
-                    .await
-                    .expect("response should be writable");
-            }
+            })
+            .await
+            .expect("reset fixture accept/response deadline");
         });
-        format!("http://{address}")
+        (format!("http://{address}"), abort_rx, server)
     }
 
     #[tokio::test]
     async fn reset_installs_replacement_before_independently_bounded_cleanup() {
-        let base_url =
+        let (base_url, _abort_seen, server) =
             fake_reset_server(Duration::from_millis(100), Duration::from_millis(100)).await;
         let mut client = OpencodeServer {
             client: reqwest::Client::new(),
@@ -2396,11 +2471,14 @@ mod tests {
 
         assert_eq!(client.session_id(), "ses_new");
         assert!(matches!(result, Err(OpencodeServerError::RequestTimeout)));
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
     async fn reset_cancellation_after_installation_retains_replacement() {
-        let base_url = fake_reset_server(Duration::from_millis(100), Duration::ZERO).await;
+        let (base_url, abort_seen, server) =
+            fake_reset_server(Duration::from_secs(10), Duration::ZERO).await;
         let mut client = OpencodeServer {
             client: reqwest::Client::new(),
             base_url,
@@ -2418,11 +2496,13 @@ mod tests {
             tokio::pin!(reset);
             tokio::select! {
                 _ = &mut reset => panic!("cleanup should still be stalled"),
-                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                ack = tokio::time::timeout(Duration::from_secs(3), abort_seen) => { ack.expect("abort phase deadline").expect("abort phase acknowledgement"); }
             }
         }
 
         assert_eq!(client.session_id(), "ses_new");
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]
@@ -2438,6 +2518,12 @@ mod tests {
         let mut decoder = OpencodeSseDecoder::new("ses_active".into());
         let rejected = decoder.push(b"data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"type\":\"tool\",\"tool\":\"websearch\",\"sessionID\":\"ses_active\",\"state\":{\"status\":\"completed\",\"output\":\"https://example.test/search\"}}}}\n\ndata: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"type\":\"tool\",\"tool\":\"webfetch\",\"sessionID\":\"ses_other\",\"state\":{\"status\":\"completed\",\"input\":{\"url\":\"https://example.test/other\"},\"output\":\"other session\"}}}}\n\ndata: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"type\":\"tool\",\"tool\":\"webfetch\",\"sessionID\":\"ses_active\",\"state\":{\"status\":\"error\",\"input\":{\"url\":\"https://example.test/error\"},\"output\":\"error\"}}}}\n\ndata: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"type\":\"tool\",\"tool\":\"webfetch\",\"sessionID\":\"ses_active\",\"state\":{\"status\":\"completed\",\"input\":{\"url\":\"not a URL\"},\"output\":\"https://user@example.test/private\"}}}}\n\ndata: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"type\":\"tool\",\"tool\":\"webfetch\",\"sessionID\":\"ses_active\",\"state\":{\"status\":\"completed\",\"output\":\"https://output-only.example/page\"}}}}\n\n");
         assert!(rejected.iter().all(Result::is_ok));
+        assert!(
+            !rejected
+                .iter()
+                .any(|event| matches!(event, Ok(OpencodeEvent::ToolEvidence(_)))),
+            "rejected tool results must not escape as evidence"
+        );
     }
 
     #[test]

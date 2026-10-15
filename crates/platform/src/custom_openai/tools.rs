@@ -18,31 +18,21 @@ pub struct ToolResponseDecoder {
 
 impl ToolResponseDecoder {
     pub fn event(&mut self, event: Value) -> Result<bool, CustomOpenAiError> {
+        let kind = event["type"]
+            .as_str()
+            .ok_or(CustomOpenAiError::MalformedStream)?;
+        if let Some((delta, kind)) = text_delta(kind, event["delta"].as_str())? {
+            self.text.push(delta, kind)?;
+        }
         match event["type"].as_str() {
-            Some("response.output_text.delta" | "response.refusal.delta") => {
-                let delta = event["delta"]
-                    .as_str()
-                    .ok_or(CustomOpenAiError::MalformedStream)?;
-                let kind = if event["type"] == "response.refusal.delta" {
-                    CustomOpenAiContentType::Refusal
-                } else {
-                    CustomOpenAiContentType::OutputText
-                };
-                self.text.push(delta, kind)?;
-            }
             Some("response.output_item.done") => self.item(event["item"].clone())?,
             Some("response.completed" | "response.done") => {
                 let response = event
                     .get("response")
                     .ok_or(CustomOpenAiError::MalformedStream)?;
-                if response["error"] != Value::Null
-                    || response["incomplete_details"] != Value::Null
-                    || response
-                        .get("status")
-                        .is_some_and(|status| status != "completed")
-                {
-                    return Err(CustomOpenAiError::Incomplete);
-                }
+                let metadata: ResponseMetadata = serde_json::from_value(response.clone())
+                    .map_err(|_| CustomOpenAiError::MalformedStream)?;
+                metadata.validate()?;
                 if let Some(output) = response.get("output") {
                     let output = output
                         .as_array()
@@ -75,10 +65,7 @@ impl ToolResponseDecoder {
                 if self.output.is_empty() && self.text.text.trim().is_empty() {
                     return Err(CustomOpenAiError::EmptyResponse);
                 }
-                self.metadata = Some(
-                    serde_json::from_value(response.clone())
-                        .map_err(|_| CustomOpenAiError::MalformedStream)?,
-                );
+                self.metadata = Some(metadata);
                 return Ok(true);
             }
             Some("response.failed" | "error") => return Err(CustomOpenAiError::Failed),
@@ -154,44 +141,7 @@ impl ToolResponseDecoder {
     }
 
     fn finish(self) -> Result<ModelRound, CustomOpenAiError> {
-        let mut terminal = OutputAccumulator::default();
-        for content in self
-            .output
-            .iter()
-            .filter(|item| item["type"] == "message")
-            .filter_map(|item| item["content"].as_array())
-            .flatten()
-        {
-            let (text, kind) = match content["type"].as_str() {
-                Some("output_text") => (
-                    content["text"]
-                        .as_str()
-                        .ok_or(CustomOpenAiError::MalformedStream)?,
-                    CustomOpenAiContentType::OutputText,
-                ),
-                Some("refusal") => (
-                    content["refusal"]
-                        .as_str()
-                        .ok_or(CustomOpenAiError::MalformedStream)?,
-                    CustomOpenAiContentType::Refusal,
-                ),
-                _ => continue,
-            };
-            terminal.push(text, kind)?;
-        }
-        if self
-            .text
-            .content_type
-            .zip(terminal.content_type)
-            .is_some_and(|(streamed, final_kind)| streamed != final_kind)
-        {
-            return Err(CustomOpenAiError::MixedContent);
-        }
-        let accumulator = if !terminal.text.is_empty() {
-            terminal
-        } else {
-            self.text
-        };
+        let accumulator = self.text.reconcile(&self.output)?;
         let text = accumulator.text;
         let content_type = accumulator
             .content_type
@@ -199,17 +149,7 @@ impl ToolResponseDecoder {
         if self.calls.is_empty() && text.trim().is_empty() {
             return Err(CustomOpenAiError::EmptyResponse);
         }
-        if text.len() > MAX_OUTPUT_BYTES {
-            return Err(CustomOpenAiError::TooLarge);
-        }
         let metadata = self.metadata.ok_or(CustomOpenAiError::Incomplete)?;
-        if metadata
-            .model
-            .as_ref()
-            .is_some_and(|model| model.len() > 256 || model.trim().is_empty())
-        {
-            return Err(CustomOpenAiError::MalformedStream);
-        }
         Ok(ModelRound {
             response: CustomOpenAiResponse {
                 text,
@@ -444,7 +384,6 @@ impl CustomOpenAiClient {
             let mut decoder = ToolResponseDecoder::default();
             let mut total = 0;
             let mut first_text_at = None;
-            let mut streamed_text = false;
             loop {
                 let chunk = tokio::time::timeout(self.config.idle_timeout, stream.next())
                     .await
@@ -474,7 +413,6 @@ impl CustomOpenAiClient {
                     let completed = decoder.event(event)?;
                     if let Some((text, kind)) = delta {
                         if !text.is_empty() {
-                            streamed_text = true;
                             record_first_visible_text(&mut first_text_at, started, &text);
                             on_event(ModelEvent::TextDelta {
                                 text: &text,
@@ -484,16 +422,16 @@ impl CustomOpenAiClient {
                         }
                     }
                     if completed {
+                        // Reuse the bounded text accumulator as the publication
+                        // prefix; a boolean loses partial terminal extensions.
+                        let streamed_text = decoder.text.text.clone();
                         let mut round = decoder.finish()?;
                         round.auth_revision = Some(auth_revision);
-                        if !streamed_text && !round.response.text.is_empty() {
-                            record_first_visible_text(
-                                &mut first_text_at,
-                                started,
-                                &round.response.text,
-                            );
+                        let suffix = terminal_suffix(&streamed_text, &round.response.text);
+                        if !suffix.is_empty() {
+                            record_first_visible_text(&mut first_text_at, started, suffix);
                             on_event(ModelEvent::TextDelta {
-                                text: &round.response.text,
+                                text: suffix,
                                 content_type: round.response.content_type,
                             })
                             .map_err(|_| RoundError::CallbackFailed)?;
@@ -519,18 +457,99 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
+    async fn review_tool_transport_delivers_terminal_suffix_once_and_propagates_callback_failure() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (_, separator) in crate::test_support::sse_ending_pairs() {
+            for refusal in [false, true] {
+                for fail_suffix in [false, true] {
+                    let fixture = crate::test_support::TestDir::new("tool-suffix");
+                    let path = fixture.path().join("auth.json");
+                    std::fs::write(
+                        &path,
+                        r#"{"openai":{"access":"synthetic-suffix","expires":4102444800}}"#,
+                    )
+                    .unwrap();
+                    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                        .await
+                        .unwrap();
+                    let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+                    let kind = if refusal { "refusal" } else { "output_text" };
+                    let field = if refusal { "refusal" } else { "text" };
+                    let delta =
+                        json!({"type":format!("response.{kind}.delta"),"delta":"Synthetic é"});
+                    let terminal = json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":kind,field:"Synthetic é 🧪"}]}]}});
+                    let body = format!("data: {delta}{separator}data: {terminal}{separator}");
+                    let server = tokio::spawn(async move {
+                        tokio::time::timeout(Duration::from_secs(5), async move {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        let mut bytes = Vec::new();
+                        let mut buffer = [0;4096];
+                        loop {
+                            let count = socket.read(&mut buffer).await.unwrap();
+                            assert_ne!(count,0);
+                            bytes.extend_from_slice(&buffer[..count]);
+                            assert!(bytes.len() <= MAX_REQUEST_BYTES + 16384);
+                            if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                                let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                                let length: usize = headers.lines().find_map(|line| line.strip_prefix("content-length:")).unwrap().trim().parse().unwrap();
+                                assert!(length <= MAX_REQUEST_BYTES);
+                                if bytes.len() >= end + 4 + length { break; }
+                            }
+                        }
+                        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                    }).await.expect("tool suffix fixture deadline");
+                    });
+                    let client = CustomOpenAiClient::new(CustomOpenAiConfig {
+                        endpoint,
+                        auth_path: path,
+                        total_timeout: Duration::from_secs(3),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                    let mut deltas = Vec::new();
+                    let result = client
+                        .tool_round_with_events(
+                            RoundRequest {
+                                session_id: "synthetic-suffix",
+                                input: &[],
+                                instructions: "Synthetic policy",
+                                tools: &[],
+                            },
+                            RoundOptions {
+                                deadline: tokio::time::Instant::now() + Duration::from_secs(3),
+                                expected_auth_revision: None,
+                                require_tool: false,
+                            },
+                            |event| {
+                                if let ModelEvent::TextDelta { text, .. } = event {
+                                    deltas.push(text.to_owned());
+                                    if fail_suffix && text == " 🧪" {
+                                        return Err(());
+                                    }
+                                }
+                                Ok(())
+                            },
+                        )
+                        .await;
+                    server.await.unwrap();
+                    assert_eq!(deltas, ["Synthetic é", " 🧪"]);
+                    if fail_suffix {
+                        assert!(matches!(result, Err(RoundError::CallbackFailed)));
+                    } else {
+                        assert_eq!(result.unwrap().response.text, deltas.concat());
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn failed_dispatch_callback_prevents_the_http_request() {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
-        let id = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "vox-synthetic-dispatch-failure-{}-{id}.json",
-            std::process::id()
-        ));
+        let auth_dir = crate::test_support::TestDir::new("dispatch-failure");
+        let path = auth_dir.path().join("auth.json");
         std::fs::write(
             &path,
             r#"{"openai":{"access":"synthetic-dispatch","expires":4102444800}}"#,
@@ -564,13 +583,38 @@ mod tests {
                 },
             )
             .await;
-        std::fs::remove_file(path).unwrap();
         assert!(matches!(result, Err(RoundError::CallbackFailed)));
         assert!(
             tokio::time::timeout(Duration::from_millis(20), listener.accept())
                 .await
                 .is_err()
         );
+    }
+
+    #[test]
+    fn search_decoder_partition_matrix_preserves_utf8_and_opaque_continuations() {
+        for (pair, separator) in crate::test_support::sse_ending_pairs() {
+            let wire = format!(
+            "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"Synthetic é\"}}{separator}data: {{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\",\"output\":[{{\"type\":\"reasoning\",\"id\":\"synthetic-reasoning\",\"encrypted_content\":\"synthetic-opaque\"}},{{\"type\":\"message\",\"content\":[{{\"type\":\"output_text\",\"text\":\"Synthetic é 🧪\"}}]}}]}}}}{separator}"
+        ).into_bytes();
+            for split in 0..=wire.len() {
+                let mut framer = SseDecoder::default();
+                let mut decoder = ToolResponseDecoder::default();
+                let mut completed = false;
+                for chunk in [&wire[..split], &wire[split..]] {
+                    framer.push(chunk);
+                    while let Some(data) = framer.next_data().unwrap() {
+                        assert!(!completed, "no extra terminal record");
+                        completed = decoder.event(serde_json::from_str(&data).unwrap()).unwrap();
+                    }
+                }
+                assert!(completed, "pair {pair}, split {split}");
+                let round = decoder.finish().unwrap();
+                assert_eq!(round.response.text, "Synthetic é 🧪");
+                assert_eq!(round.output[0]["encrypted_content"], "synthetic-opaque");
+                assert!(round.calls.is_empty());
+            }
+        }
     }
 
     #[test]

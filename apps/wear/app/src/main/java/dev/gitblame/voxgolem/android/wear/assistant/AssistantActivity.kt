@@ -88,6 +88,7 @@ open class AssistantActivity : ComponentActivity() {
     private var startupTiming: AssistantTiming? = null
     @Volatile private var observerEpoch = 0L
     private var input = AssistantImeSession()
+    private lateinit var editorDraftMemory: AssistantEditorDraftMemory
     private val editor = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result -> receiveText(result.resultCode, result.data) }
     private val microphone = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted -> receiveMicrophonePermission(granted) }
     private val updateUi = Runnable {
@@ -97,7 +98,7 @@ open class AssistantActivity : ComponentActivity() {
             replyMetrics.remember(projection.providerRequestId, projection.firstTextMs)
             state = projection
             if (resumed && state.foreground) startupTiming?.finish(Stage.FIRST_PROJECTION)
-            if (resumed) { history.select(state); consumeVoiceLaunch() }
+            if (resumed && state.foreground) { consumeVoiceLaunch(); history.select(state) }
         }
     }
     private val updateLink = object : Runnable {
@@ -108,7 +109,7 @@ open class AssistantActivity : ComponentActivity() {
         }
     }
 
-    protected open fun assistantClient(): AssistantClient = AssistantRuntime.get(applicationContext)
+    protected open fun assistantClient(): AssistantClient = AssistantRuntime.get(applicationContext, startupTiming)
     protected open fun assistantVoice(client: AssistantClient): AssistantVoiceController = WearAssistantVoice(this, client as AssistantEngine)
     internal open fun assistantVoiceSettings(): WearVoiceSettings = WearVoiceSettings(this)
     private fun admitLaunch(entry: Boolean?) {
@@ -146,6 +147,8 @@ open class AssistantActivity : ComponentActivity() {
         }, initial = historyState) { historyState = it; historyMemory.snapshot = it; projectPrompts() }
         projectPrompts()
         input = AssistantImeSession(savedInstanceState?.getBoolean("assistant.editor.pending") ?: false)
+        editorDraftMemory = ViewModelProvider(this)[AssistantEditorDraftMemory::class.java]
+        editorDraftMemory.restore(savedInstanceState, state)
         setContent {
             SideEffect {
                 val engine = client as? AssistantEngine
@@ -207,14 +210,14 @@ open class AssistantActivity : ComponentActivity() {
         resumed = true
         screenAwake.resume(client.snapshot(), voice.snapshot())
         client.resume()
-        history.select(client.snapshot())
         voice.foreground(true)
         readVoicePreferences()
         voice.tts(voicePreferences.readRepliesAloud)
-        if (client is AssistantEngine) recheck()
+        if (client is AssistantEngine) AssistantReplication.reconcileNow(applicationContext)
         handler.removeCallbacks(updateLink)
         handler.post(updateLink)
         consumeVoiceLaunch()
+        if (client.snapshot().foreground) history.select(client.snapshot())
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -266,6 +269,7 @@ open class AssistantActivity : ComponentActivity() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putBoolean("assistant.editor.pending", input.pending)
+        editorDraftMemory.save(outState)
         entryMode?.let { outState.putString("assistant.voice.entry", it.name) }
         super.onSaveInstanceState(outState)
     }
@@ -273,7 +277,7 @@ open class AssistantActivity : ComponentActivity() {
     internal fun editDraft() {
         if (!visible || !resumed || isFinishing || isDestroyed || client.snapshot().busy || !input.begin()) return
         val currentVoice = voice.snapshot()
-        val prefill = currentVoice.dictation.takeIf {
+        val prefill = editorDraftMemory.prefill(client.snapshot()) ?: currentVoice.dictation.takeIf {
             it.phase in setOf(dev.gitblame.voxgolem.assistant.recognition.DictationPhase.LISTENING,
                 dev.gitblame.voxgolem.assistant.recognition.DictationPhase.FINISHING) && it.draft.isNotBlank()
         }?.draft ?: client.snapshot().draft
@@ -285,7 +289,17 @@ open class AssistantActivity : ComponentActivity() {
     private fun projectPrompts() { pendingPrompts = promptPresentation.project(promptSource, voiceState, historyState) }
 
     internal fun receiveText(resultCode: Int, intent: Intent?) {
-        input.accept(resultCode, intent)?.let(client::setDraft)
+        val text = input.accept(resultCode, intent) ?: return
+        val memory = editorDraftMemory
+        val ticket = memory.begin(text, client.snapshot())
+        if (!AssistantTextInput.accepts(text)) return
+        saveEditorDraft(text) { settled -> memory.settle(ticket, settled) }
+    }
+
+    internal open fun saveEditorDraft(text: String, onSettled: (AssistantState) -> Unit) {
+        val engine = client as? AssistantEngine
+        if (engine != null) engine.setDraft(text, onSettled)
+        else { client.setDraft(text); onSettled(client.snapshot()) }
     }
 
     internal fun sendManually() {

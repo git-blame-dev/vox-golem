@@ -66,4 +66,42 @@ class WavPcmReaderTest {
             assertThrows(IllegalArgumentException::class.java) { it.read(1) }
         }
     }
+
+    @Test fun canonicalRecoveryUsesSharedValidationWithIndependentRiffAndHashOracles() {
+        val canonical = ByteBuffer.allocate(48).order(ByteOrder.LITTLE_ENDIAN)
+            .put("RIFF".toByteArray()).putInt(40).put("WAVEfmt ".toByteArray()).putInt(16)
+            .putShort(1).putShort(1).putInt(16_000).putInt(32_000).putShort(2).putShort(16)
+            .put("data".toByteArray()).putInt(4).putShort(1).putShort(2).array()
+        val file = temporary.newFile("synthetic-canonical.wav").apply { writeBytes(canonical) }
+        val manifest = CaptureFileIntegrity.canonicalManifest(id, file, CaptureFormat())
+        assertEquals(2L, manifest.frameCount); assertEquals(4L, manifest.pcmByteLength); assertEquals(48L, manifest.wavByteLength)
+        assertEquals(java.security.MessageDigest.getInstance("SHA-256").digest(canonical).joinToString("") { "%02x".format(it) }, manifest.sha256)
+        // One malformed field at a time: independent RIFF boundaries, fmt shape, byte rate, alignment.
+        for ((offset, replacement) in listOf(4 to 39, 16 to 17, 28 to 31_999, 40 to 3)) {
+            val invalid = canonical.copyOf()
+            ByteBuffer.wrap(invalid).order(ByteOrder.LITTLE_ENDIAN).putInt(offset, replacement)
+            file.writeBytes(invalid)
+            assertThrows(IOException::class.java) { CaptureFileIntegrity.canonicalManifest(id, file, CaptureFormat()) }
+        }
+        val invalidAlignment = canonical.copyOf()
+        ByteBuffer.wrap(invalidAlignment).order(ByteOrder.LITTLE_ENDIAN).putShort(32, 1)
+        file.writeBytes(invalidAlignment)
+        assertThrows(IOException::class.java) { WavPcmReader(file).close() }
+        file.writeBytes(canonical + byteArrayOf(11, 22))
+        assertThrows(IOException::class.java) { CaptureFileIntegrity.canonicalManifest(id, file, CaptureFormat()) }
+    }
+
+    @Test fun streamingDigestCopiesExactBytesAndPropagatesPartialCopyFailure() {
+        val bytes = ByteArray(130_001) { (it % 251).toByte() }
+        val output = java.io.ByteArrayOutputStream()
+        val actual = CaptureFileIntegrity.digest(bytes.inputStream(), output)
+        assertArrayEquals(bytes, output.toByteArray())
+        assertEquals(bytes.size.toLong(), actual.byteLength)
+        assertEquals(java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }, actual.sha256)
+        assertThrows(IOException::class.java) {
+            CaptureFileIntegrity.digest(bytes.inputStream(), object : java.io.OutputStream() {
+                override fun write(value: Int) = throw IOException("Synthetic partial copy failure")
+            })
+        }
+    }
 }

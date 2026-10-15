@@ -19,6 +19,22 @@ afterEach(() => {
 })
 
 describe('production Android App runtime', () => {
+  it('does not offer unsupported Android Prefetch or emit an invalid preference proposal', async () => {
+    vi.stubEnv('VITE_VOXGOLEM_RUNTIME', 'android'); vi.resetModules(); window.history.replaceState(null, '')
+    const invoke = vi.fn(async (command: string) => command === 'get_app_snapshot' ? wireSnapshot() : null)
+    window.__TAURI_INTERNALS__ = { invoke }
+    const { default: App } = await import('./App')
+    container = document.createElement('div'); document.body.append(container); root = createRoot(container)
+    await act(async () => { root?.render(<App />) })
+    await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
+    const prefetch = Array.from(container.querySelectorAll('label')).find((label) => label.textContent === ' Prefetch')?.querySelector<HTMLInputElement>('input')
+    expect(prefetch).toBeDefined()
+    expect(prefetch!.disabled).toBe(true)
+    await act(async () => { prefetch!.click() })
+    expect(invoke.mock.calls.some(([command]) => command === 'set_preferences')).toBe(false)
+    window.history.replaceState(null, '')
+  })
+
   it.each([
     { streamed: true, enabled: false }, { streamed: false, enabled: false },
     { streamed: true, enabled: true }, { streamed: false, enabled: true },
@@ -31,10 +47,11 @@ describe('production Android App runtime', () => {
     vi.spyOn(performance, 'now').mockImplementation(() => now)
     let frame: FrameRequestCallback | undefined
     vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => { frame = callback; return 1 })
+    const domAtCommit: boolean[] = []
     const log = vi.spyOn(console, 'info').mockImplementation((_label, value) => {
       const metadata = typeof value === 'string' ? JSON.parse(value) as Record<string, unknown> : undefined
       if (metadata?.['stage'] === 'FIRST_TEXT_DOM_COMMITTED') {
-        expect(Array.from(container!.querySelectorAll('.answer-stage__answer')).some((answer) => answer.textContent?.trim() === 'Synthetic answer')).toBe(true)
+        domAtCommit.push(Array.from(container!.querySelectorAll('.answer-stage__answer')).some((answer) => answer.textContent?.trim() === 'Synthetic answer'))
       }
     })
     let updates: (value: unknown) => void = () => undefined
@@ -61,6 +78,8 @@ describe('production Android App runtime', () => {
     const input = container.querySelector<HTMLTextAreaElement>('#promptComposer')!
     await act(async () => { Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set?.call(input, 'Synthetic timing question'); input.dispatchEvent(new Event('input', { bubbles: true })) })
     await act(async () => { container!.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })
+    const pendingRow = Array.from(container.querySelectorAll<HTMLElement>('[data-turn-role="assistant"]')).find((row) => row.dataset['requestId'] === requestId)!
+    expect(pendingRow.dataset).toMatchObject({ requestId, turnOutcome: 'pending', stageStatus: 'running', contentKind: 'text' })
     now = 125
     await act(async () => { updates({ kind: 'status', message: 'Thinking' }) })
     expect(container.querySelector('.message__thinking')).not.toBeNull()
@@ -85,11 +104,14 @@ describe('production Android App runtime', () => {
     transcript = [...transcript, turn]
     await act(async () => { finish({ kind: 'completed', turn, first_text_ms: 7, completed_ms: 900_009 }) })
     const answer = session.getMessagesSnapshot().find((message) => message.id === '4')
+    const settledRow = Array.from(container.querySelectorAll<HTMLElement>('[data-turn-role="assistant"]')).find((row) => row.dataset['requestId'] === requestId)!
+    expect(settledRow.dataset).toMatchObject({ requestId, turnOutcome: 'completed', stageStatus: 'completed', contentKind: 'text' })
     expect(answer?.customDirectTimings).toEqual({ firstTextMs: streamed ? 100 : 300, completedMs: 300 })
     const stages = invoke.mock.calls.filter(([command]) => command === 'report_startup_stage').map(([, args]) => (args as { stage: string }).stage)
     expect(stages).toEqual(enabled ? ['frontend_ready', 'first_response_dom'] : [])
     const metadata = log.mock.calls.filter(([label]) => label === '[frontend-timing]').map(([, value]) => JSON.parse(value as string) as Record<string, unknown>)
     if (enabled) {
+      expect(domAtCommit).toEqual([true])
       expect(metadata.filter((entry) => entry['stage'] === 'FIRST_NONBLANK_RECEIVED')).toEqual([{ scope: 'frontend_request', request: 1, stage: 'FIRST_NONBLANK_RECEIVED', atMs: streamed ? 200 : 400, elapsedMs: streamed ? 100 : 300 }])
       expect(metadata.filter((entry) => entry['stage'] === 'FIRST_TEXT_DOM_COMMITTED')).toEqual([{ scope: 'frontend_request', request: 1, stage: 'FIRST_TEXT_DOM_COMMITTED', atMs: streamed ? 225 : 400, elapsedMs: streamed ? 125 : 300 }])
       expect(metadata.filter((entry) => entry['stage'] === 'SETTLED')).toEqual([{ scope: 'frontend_request', request: 1, stage: 'SETTLED', atMs: 400, elapsedMs: 300 }])

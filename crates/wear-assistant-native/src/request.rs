@@ -114,6 +114,13 @@ pub(crate) fn parse(input: &str) -> Result<Request, ErrorCode> {
         "local-fast" => CustomOpenAiModel::LocalFast,
         _ => return Err(ErrorCode::InvalidRequest),
     };
+    // Local chat cannot fulfill explicit verification/research. Reject before
+    // registration, callbacks or dispatch rather than silently degrading the route.
+    if model == CustomOpenAiModel::LocalFast
+        && matches!(wire.search_mode, Some(Mode::Verify | Mode::Research))
+    {
+        return Err(ErrorCode::InvalidRequest);
+    }
     let text_bytes: usize = wire
         .messages
         .iter()
@@ -191,6 +198,55 @@ mod tests {
                 {"role": "user", "content": "Synthetic current question"}
             ]
         })
+    }
+
+    #[test]
+    fn real_json_parser_rejects_duplicate_admission_fields_and_enforces_raw_byte_boundary() {
+        for duplicate in [
+            r#""requestId":"synthetic-parser","requestId":"synthetic-other""#,
+            r#""requestId":"synthetic-parser","model":"local-fast","model":"custom-sol-high""#,
+            r#""requestId":"synthetic-parser","webEnabled":false,"webEnabled":true"#,
+            r#""requestId":"synthetic-parser","searchMode":"verify","searchMode":"quick""#,
+        ] {
+            let input = format!(
+                r#"{{{duplicate},"conversationId":"synthetic-conversation:1","instructions":"Synthetic policy","messages":[{{"role":"user","content":"Synthetic draft"}}]}}"#
+            );
+            assert!(
+                matches!(parse(&input), Err(ErrorCode::InvalidRequest)),
+                "duplicate fields must reach the production parser intact"
+            );
+        }
+        let duplicate_message = r#"{"requestId":"synthetic-parser","instructions":"Synthetic policy","messages":[{"role":"assistant","role":"user","content":"Synthetic draft"}]}"#;
+        assert!(matches!(
+            parse(duplicate_message),
+            Err(ErrorCode::InvalidRequest)
+        ));
+        let mut input = fixture().to_string();
+        input.push_str(&" ".repeat(MAX_REQUEST_BYTES - input.len()));
+        assert!(
+            parse(&input).is_ok(),
+            "valid JSON at the exact raw byte limit"
+        );
+        input.push(' ');
+        assert!(matches!(parse(&input), Err(ErrorCode::InvalidRequest)));
+    }
+
+    #[test]
+    fn local_verify_and_research_are_rejected_at_json_admission() {
+        for mode in ["verify", "research"] {
+            let mut value = fixture();
+            value["model"] = json!("local-fast");
+            value["searchMode"] = json!(mode);
+            value["conversationId"] = json!("synthetic-conversation:1");
+            assert!(matches!(
+                parse(&value.to_string()),
+                Err(ErrorCode::InvalidRequest)
+            ));
+            assert_eq!(
+                value["messages"][2]["content"],
+                "Synthetic current question"
+            );
+        }
     }
 
     #[test]

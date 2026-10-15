@@ -147,6 +147,18 @@ pub fn validate_review_input(input: &ReviewInput) -> Result<(), ContractError> {
     Ok(())
 }
 
+pub fn fit_review_history_to_prompt_budget(
+    mut input: ReviewInput,
+) -> Result<ReviewInput, ContractError> {
+    while typed_review_prompt(&input).len() > MAX_REVIEW_PROMPT_BYTES
+        && input.canonical_history.len() >= 2
+    {
+        input.canonical_history.drain(..2);
+    }
+    validate_review_input(&input)?;
+    Ok(input)
+}
+
 fn format_history(history: &[HistoryEntry]) -> String {
     history
         .iter()

@@ -31,13 +31,14 @@ macro_rules! bail {
     };
 }
 use crate::inference::{ActualInferenceProvider, InferencePolicy};
+use crate::managed_process::ManagedTokioProcess as Child;
 use crate::managed_process::{
     configure_owned_tokio, terminate_tokio, terminate_tokio_on_drop, ProcessOwnership,
 };
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
@@ -193,6 +194,7 @@ impl CompletionRuntime {
         configure_owned_tokio(&mut command);
         let mut child = command
             .spawn()
+            .and_then(Child::from_owned_child)
             .with_context(|| format!("failed to start {}", server.display()))?;
         // This server is owned by the runtime; descendants must share its
         // Unix process group (Windows keeps tokio's existing behavior).
@@ -793,7 +795,8 @@ mod tests {
         let mut command = Command::new("sh");
         command.args(["-c", "exec sleep 30"]).kill_on_drop(true);
         configure_owned_tokio(&mut command);
-        let child = command.spawn().expect("test child should start");
+        let child =
+            Child::from_owned_child(command.spawn().expect("test child should start")).unwrap();
         let pid = child.id().expect("test child should expose its pid");
         let runtime = CompletionRuntime {
             server: Some(child),

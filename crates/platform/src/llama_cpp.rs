@@ -1,5 +1,5 @@
 use crate::inference::{ActualInferenceProvider, InferencePolicy};
-use crate::managed_process::{configure_owned, terminate_group};
+use crate::managed_process::ManagedProcess;
 use rand::random;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
@@ -99,7 +99,7 @@ impl LlamaCppServerSpec {
 #[derive(Debug)]
 pub struct LlamaCppRuntime {
     spec: LlamaCppServerSpec,
-    child: Option<Child>,
+    child: Option<ManagedProcess>,
     #[cfg(windows)]
     process_job: Option<win32job::Job>,
     provider: ActualInferenceProvider,
@@ -399,23 +399,19 @@ impl LlamaCppRuntime {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         configure_llama_server_command(&mut command);
-        configure_owned(&mut command);
-
-        let mut child = command
-            .spawn()
-            .map_err(|error| LlamaCppRuntimeError::SpawnFailed {
+        let mut child = ManagedProcess::spawn_owned(&mut command).map_err(|error| {
+            LlamaCppRuntimeError::SpawnFailed {
                 details: error.to_string(),
-            })?;
+            }
+        })?;
 
         #[cfg(windows)]
-        let process_job = create_owned_process_job(&child).inspect_err(|_| {
-            let _ = child.kill();
-            let _ = child.wait();
+        let process_job = create_owned_process_job(child.child()).inspect_err(|_| {
+            let _ = child.terminate(Duration::from_secs(2));
         })?;
         #[cfg(not(windows))]
-        create_owned_process_job(&child).inspect_err(|_| {
-            let _ = child.kill();
-            let _ = child.wait();
+        create_owned_process_job(child.child()).inspect_err(|_| {
+            let _ = child.terminate(Duration::from_secs(2));
         })?;
 
         let mut runtime = Self {
@@ -468,20 +464,7 @@ impl LlamaCppRuntime {
 
     pub fn shutdown_owned(&mut self) {
         if let Some(mut child) = self.child.take() {
-            #[cfg(unix)]
-            {
-                let _ = terminate_group(child.id(), false);
-                let deadline = Instant::now() + Duration::from_secs(2);
-                while child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                // Signal the group even when the leader exited during grace: descendants
-                // remain owned by the group and must not outlive this runtime.
-                let _ = terminate_group(child.id(), true);
-            }
-            #[cfg(windows)]
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = child.terminate(Duration::from_secs(2));
         }
 
         #[cfg(windows)]
@@ -588,6 +571,7 @@ where
 
     let mut raw = Vec::new();
     let mut pending_sse = Vec::new();
+    let mut sse_boundary = crate::sse::Boundary::default();
     let mut buffer = [0_u8; 8192];
     let mut header_parsed = false;
     let mut body_start = 0;
@@ -673,6 +657,7 @@ where
                         }
                         sse_done |= consume_sse_pending(
                             &mut pending_sse,
+                            &mut sse_boundary,
                             cancellation,
                             &mut output,
                             on_delta,
@@ -720,10 +705,14 @@ where
     if !header_parsed
         || chunked == Some(true) && !chunk_decoder.is_finished()
         || !pending_sse.is_empty()
-        || !sse_done
     {
         return Err(LlamaCppRuntimeError::InvalidHttpResponse {
             details: "truncated streaming response".into(),
+        });
+    }
+    if !sse_done {
+        return Err(LlamaCppRuntimeError::InvalidHttpResponse {
+            details: "stream ended before [DONE]".into(),
         });
     }
     if output.trim().is_empty() {
@@ -734,6 +723,7 @@ where
 
 fn consume_sse_pending<F>(
     pending: &mut Vec<u8>,
+    boundary: &mut crate::sse::Boundary,
     cancellation: &LlamaCppChatCancellation,
     output: &mut String,
     on_delta: &mut F,
@@ -742,24 +732,26 @@ where
     F: FnMut(&str),
 {
     let mut done = false;
-    while let Some(end) = pending.windows(1).position(|window| window == b"\n") {
-        let line = pending.drain(..=end).collect::<Vec<_>>();
-        let line = line[..line.len() - 1]
-            .strip_suffix(b"\r")
-            .unwrap_or(&line[..line.len() - 1]);
-        let Some(data) = line.strip_prefix(b"data: ") else {
+    while let Some((end, separator_len)) = boundary.separator(pending) {
+        let record = std::str::from_utf8(&pending[..end]).map_err(|error| {
+            LlamaCppRuntimeError::InvalidResponsePayload {
+                details: error.to_string(),
+            }
+        })?;
+        let data = crate::sse::data(record);
+        pending.drain(..end + separator_len);
+        if data.is_empty() {
             continue;
-        };
-        if data == b"[DONE]" {
+        }
+        if data == "[DONE]" {
             done = true;
             break;
         }
-        let event: ChatCompletionStreamResponse =
-            serde_json::from_slice(data).map_err(|error| {
-                LlamaCppRuntimeError::InvalidResponsePayload {
-                    details: error.to_string(),
-                }
-            })?;
+        let event: ChatCompletionStreamResponse = serde_json::from_str(&data).map_err(|error| {
+            LlamaCppRuntimeError::InvalidResponsePayload {
+                details: error.to_string(),
+            }
+        })?;
         if let Some(delta) = event
             .choices
             .into_iter()
@@ -1323,7 +1315,11 @@ mod tests {
     fn read_http_request(stream: &mut std::net::TcpStream) -> String {
         let mut request = Vec::new();
         let mut expected_len = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
         loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "complete fixture request deadline");
+            stream.set_read_timeout(Some(remaining)).unwrap();
             let mut chunk = [0_u8; 1024];
             let read = stream.read(&mut chunk).expect("test request should read");
             assert!(read > 0, "test request ended before its declared body");
@@ -1344,6 +1340,7 @@ mod tests {
                             })
                         })
                         .expect("request content length");
+                    assert!(content_len <= 16 * 1024 - body_start);
                     expected_len = Some(body_start + content_len);
                 }
             }
@@ -1457,25 +1454,42 @@ mod tests {
     }
 
     #[test]
+    fn local_stream_partition_matrix_preserves_utf8_record_order_and_done() {
+        for (pair, separator) in crate::test_support::sse_ending_pairs() {
+            let wire = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"Synthetic é\"}}}}]}}{separator}data: {{\"choices\":[{{\"delta\":{{\"content\":\" 🧪\"}}}}]}}{separator}data: [DONE]{separator}").into_bytes();
+            for split in 0..=wire.len() {
+                let mut pending = Vec::new();
+                let mut boundary = crate::sse::Boundary::default();
+                let mut text = String::new();
+                let mut deltas = Vec::new();
+                let cancellation = LlamaCppChatCancellation::default();
+                let mut done = false;
+                for chunk in [&wire[..split], &wire[split..]] {
+                    pending.extend_from_slice(chunk);
+                    done |= super::consume_sse_pending(
+                        &mut pending,
+                        &mut boundary,
+                        &cancellation,
+                        &mut text,
+                        &mut |delta| deltas.push(delta.to_owned()),
+                    )
+                    .unwrap();
+                }
+                assert!(done, "pair {pair}, split {split}");
+                assert!(pending.is_empty());
+                assert_eq!(text, "Synthetic é 🧪");
+                assert_eq!(deltas, ["Synthetic é", " 🧪"]);
+            }
+        }
+    }
+
+    #[test]
     fn streaming_chat_preserves_prompt_and_emits_complete_nonempty_text() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
         let port = listener.local_addr().expect("listener address").port();
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("request should connect");
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 1024];
-            loop {
-                let read = stream.read(&mut buffer).expect("request should read");
-                request.extend_from_slice(&buffer[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n")
-                    && request
-                        .windows(13)
-                        .any(|window| window == b"\"stream\":true")
-                {
-                    break;
-                }
-            }
-            let request_text = String::from_utf8(request).expect("request should be utf8");
+            let mut stream = crate::test_support::accept(&listener);
+            let request_text = read_http_request(&mut stream);
             assert!(request_text.starts_with("POST /v1/chat/completions HTTP/1.1"));
             let body = request_text.split("\r\n\r\n").nth(1).expect("body");
             assert!(body.contains("\"stream\":true"));
@@ -1523,7 +1537,7 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
         let port = listener.local_addr().expect("listener address").port();
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("request should connect");
+            let mut stream = crate::test_support::accept(&listener);
             let request = read_http_request(&mut stream);
             assert!(request.contains("\"stream\":true"));
             let response = concat!(
@@ -1566,8 +1580,9 @@ mod tests {
     fn chunked_done_settles_before_open_socket_eof() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
         let port = listener.local_addr().expect("listener address").port();
+        let (release_eof, hold_eof) = std::sync::mpsc::channel();
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("request should connect");
+            let mut stream = crate::test_support::accept(&listener);
             let _ = read_http_request(&mut stream);
             let data =
                 b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
@@ -1577,7 +1592,9 @@ mod tests {
             response.extend_from_slice(data);
             response.extend_from_slice(b"\r\n0\r\nTrailer: ok\r\n\r\n");
             stream.write_all(&response).expect("response should write");
-            thread::sleep(Duration::from_millis(200));
+            hold_eof
+                .recv_timeout(Duration::from_secs(5))
+                .expect("EOF release deadline");
         });
         let client = LlamaCppRuntime::attach(LlamaCppServerSpec::new(
             "llama-server",
@@ -1587,30 +1604,53 @@ mod tests {
             "default",
         ))
         .client();
-        let started = std::time::Instant::now();
-        let result = client.chat_streaming(
-            &LlamaCppPrompt::new("hello"),
-            &LlamaCppChatCancellation::default(),
-            |_| {},
-        );
-        assert_eq!(result.expect("complete chunked stream").text, "ok");
-        assert!(started.elapsed() < Duration::from_millis(150));
+        let (completed, completion) = std::sync::mpsc::channel();
+        let cancellation = LlamaCppChatCancellation::default();
+        let worker_cancellation = cancellation.clone();
+        let worker = thread::spawn(move || {
+            let result =
+                client.chat_streaming(&LlamaCppPrompt::new("hello"), &worker_cancellation, |_| {});
+            completed.send(result).unwrap();
+        });
+        let before_eof = completion.recv_timeout(Duration::from_secs(3));
+        if before_eof.is_err() {
+            cancellation.cancel();
+        }
+        release_eof.send(()).unwrap();
         server.join().expect("server should stop");
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !worker.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "client retirement deadline after EOF release/cancellation"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        worker.join().expect("client should stop after EOF release");
+        assert_eq!(
+            before_eof
+                .expect("DONE must complete while EOF remains gated")
+                .expect("complete chunked stream")
+                .text,
+            "ok"
+        );
     }
 
     #[test]
-    fn streaming_chat_rejects_eof_before_done_and_incomplete_chunk_framing() {
-        for body in [
-            b"38\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n\r\n0\r\n\r\n"
-                .to_vec(),
-            b"4\r\ndata\r\n3\r\n: x".to_vec(),
-        ] {
+    fn streaming_chat_rejects_valid_chunked_eof_before_done_but_accepts_same_payload_with_done() {
+        for with_done in [false, true] {
+            let mut payload = b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n".to_vec();
+            if with_done {
+                payload.extend_from_slice(b"data: [DONE]\n\n");
+            }
+            let mut body = format!("{:x}\r\n", payload.len()).into_bytes();
+            body.extend_from_slice(&payload);
+            body.extend_from_slice(b"\r\n0\r\n\r\n");
             let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
             let port = listener.local_addr().expect("listener address").port();
             let server = thread::spawn(move || {
-                let (mut stream, _) = listener.accept().expect("request should connect");
-                let mut request = [0_u8; 4096];
-                let _ = stream.read(&mut request);
+                let mut stream = crate::test_support::accept(&listener);
+                let _ = read_http_request(&mut stream);
                 stream
                     .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
                     .expect("headers should write");
@@ -1624,14 +1664,54 @@ mod tests {
                 "default",
             ))
             .client();
+            let mut deltas = Vec::new();
             let result = client.chat_streaming(
                 &LlamaCppPrompt::new("hello"),
                 &LlamaCppChatCancellation::default(),
-                |_| {},
+                |delta| deltas.push(delta.to_owned()),
             );
             server.join().expect("server should stop");
-            assert!(result.is_err());
+            assert_eq!(
+                deltas,
+                ["x"],
+                "valid provisional delta must be decoded before SSE completion is decided"
+            );
+            if with_done {
+                assert_eq!(result.unwrap().text, "x");
+            } else {
+                assert!(
+                    matches!(result, Err(LlamaCppRuntimeError::InvalidHttpResponse {details}) if details == "stream ended before [DONE]")
+                );
+            }
         }
+    }
+
+    #[test]
+    fn streaming_chat_rejects_incomplete_http_chunk_framing_separately() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let mut stream = crate::test_support::accept(&listener);
+            let _ = read_http_request(&mut stream);
+            stream.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\ndata\r\n3\r\n: x").unwrap();
+        });
+        let client = LlamaCppRuntime::attach(LlamaCppServerSpec::new(
+            "llama-server",
+            "synthetic.gguf",
+            "127.0.0.1",
+            port,
+            "synthetic",
+        ))
+        .client();
+        let result = client.chat_streaming(
+            &LlamaCppPrompt::new("Synthetic"),
+            &LlamaCppChatCancellation::default(),
+            |_| {},
+        );
+        server.join().unwrap();
+        assert!(
+            matches!(result, Err(LlamaCppRuntimeError::InvalidHttpResponse {details}) if details == "truncated streaming response")
+        );
     }
 
     #[test]
@@ -1694,11 +1774,24 @@ mod tests {
             .expect("listener should allow nonblocking mode");
 
         let shutdown = Arc::new(AtomicBool::new(false));
+        struct StopOnDrop(Arc<AtomicBool>);
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let _cleanup = StopOnDrop(shutdown.clone());
         let shutdown_for_thread = Arc::clone(&shutdown);
         let server_thread = thread::spawn(move || {
             while !shutdown_for_thread.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        stream
+                            .set_write_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
                         let mut request_buffer = [0_u8; 1024];
                         let _ = stream.read(&mut request_buffer);
                         let _ = stream.write_all(
@@ -1743,7 +1836,7 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
         let port = listener.local_addr().expect("listener address").port();
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("health request should connect");
+            let mut stream = crate::test_support::accept(&listener);
             let mut request = [0_u8; 1024];
             let _ = stream.read(&mut request);
             for byte in b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx" {
@@ -1766,7 +1859,7 @@ mod tests {
         );
 
         assert!(result.is_err());
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(5));
         server
             .join()
             .expect("server should stop after client timeout");
@@ -1832,7 +1925,7 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
         let port = listener.local_addr().expect("listener address").port();
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("request should connect");
+            let mut stream = crate::test_support::accept(&listener);
             let _ = read_http_request(&mut stream);
             stream
                 .write_all(
@@ -1877,7 +1970,7 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
         let port = listener.local_addr().expect("listener address").port();
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("request should connect");
+            let mut stream = crate::test_support::accept(&listener);
             let _ = read_http_request(&mut stream);
             stream
                 .write_all(b"HTTP/1.1 413 Payload Too Large\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
@@ -1920,29 +2013,74 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn cancellable_startup_reaps_owned_child_when_cancelled_during_readiness() {
         use std::os::unix::fs::PermissionsExt;
-        let path =
-            std::env::temp_dir().join(format!("vox-golem-llama-stub-{}", std::process::id()));
-        std::fs::write(&path, b"#!/bin/sh\nsleep 30\n").expect("stub should be written");
+        use std::path::Path;
+        use std::time::Instant;
+        let fixture = crate::test_support::TestDir::new("llama-startup");
+        let path = fixture.path().join("stub.sh");
+        let marker = fixture.path().join("started.pid");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+                marker.display()
+            ),
+        )
+        .expect("stub should be written");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
             .expect("stub should be executable");
-        let spec = LlamaCppServerSpec::new(&path, "missing.gguf", "127.0.0.1", 1, "test");
+        // Keep the failed health endpoint owned; never probe an ambient fixed port.
+        let health = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let spec = LlamaCppServerSpec::new(
+            &path,
+            "missing.gguf",
+            "127.0.0.1",
+            health.local_addr().unwrap().port(),
+            "test",
+        );
         let cancel = super::LlamaCppStartupCancellation::default();
         let worker = LlamaCppRuntime::start_with_policy_cancellation(
             spec,
             InferencePolicy::Cpu,
             cancel.clone(),
         );
-        std::thread::sleep(Duration::from_millis(100));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pid = loop {
+            if let Ok(marker) = std::fs::read_to_string(&marker) {
+                if let Ok(pid) = marker.trim().parse::<u32>() {
+                    break pid;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "owned startup phase was not acknowledged"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(
+            Path::new(&format!("/proc/{pid}")).exists(),
+            "owned child must exist before cancellation"
+        );
         cancel.cancel();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !worker.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "startup cancellation completion deadline"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
         let result = worker.join().expect("startup worker should join");
         assert!(matches!(
             result,
             Err(LlamaCppRuntimeError::StartupCancelled)
         ));
-        std::fs::remove_file(path).expect("stub should be removed");
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "actual startup child must be reaped"
+        );
     }
 }

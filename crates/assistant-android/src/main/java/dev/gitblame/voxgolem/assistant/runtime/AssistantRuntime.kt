@@ -10,6 +10,9 @@ object AssistantRuntime {
     @Volatile private var engine: AssistantEngine? = null
     @Volatile private var captureAdmissionReady = false
     @Volatile private var agyRouter: AgyProviderRouter? = null
+    @Volatile private var optionalReadiness: Map<String, OptionalProviderReadiness> = emptyMap()
+    fun optionalProviderReadiness(): Map<String, OptionalProviderReadiness> = optionalReadiness
+    internal fun publishOptionalProviderReadiness(context: Context) { optionalReadiness = AndroidProviderReadiness.inspect(context) }
 
     fun prewarm(model: String) {
         agyRouter?.prewarm(model)
@@ -27,6 +30,7 @@ object AssistantRuntime {
         val application = context.applicationContext
         val credentials = ProviderAuthSource(application)
         val io = Executors.newSingleThreadExecutor { command -> Thread(command, "assistant-store") }
+        io.execute { publishOptionalProviderReadiness(application) }
         val provider = Executors.newSingleThreadExecutor { command -> Thread(command, "assistant-provider") }
         val modelStorage = object : AssistantModelStorage {
             private val preferences by lazy { application.getSharedPreferences("assistant-runtime", Context.MODE_PRIVATE) }

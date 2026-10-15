@@ -86,7 +86,7 @@ class PhoneCaptureOriginAuthorizationTest {
     @Test fun legacyUnboundCapturePreservesLocalAudioHistoryAndExportButCannotBindFromRemoteRequests() {
         val record = archived(RecognitionState.FINAL, "Synthetic legacy private transcript")
         repository.save(record)
-        val audio = File(record.localAudioPath!!).readBytes()
+        val audio = File(requireNotNull(record.localAudioPath)).readBytes()
         for (node in listOf(a, b)) {
             coordinator.respondStatus(id, node); coordinator.retryCapture(id, node)
             assertThrows(CaptureOriginAuthorizationException::class.java) { coordinator.onArchiveReceived(record, node) }
@@ -96,7 +96,7 @@ class PhoneCaptureOriginAuthorizationTest {
         assertTrue(messages.all { it.second.optString("stage") == "AUTHORIZATION_FAILED" })
         assertTrue(messages.none { it.second.has("finalText") || it.second.has("archiveHash") })
         assertNull(CaptureRepository(context).phoneOrigin(id)); assertEquals(record, repository.get(id))
-        assertArrayEquals(audio, File(record.localAudioPath).readBytes())
+        assertArrayEquals(audio, File(requireNotNull(record.localAudioPath)).readBytes())
         coordinator.retryCapture(id)
         messages.clear()
         assertTrue(coordinator.awaitIdle()); assertTrue(exports.contains(id))

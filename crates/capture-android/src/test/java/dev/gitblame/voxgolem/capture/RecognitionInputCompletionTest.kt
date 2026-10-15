@@ -37,8 +37,10 @@ class RecognitionInputCompletionTest {
                 check(allowClose.await(2, TimeUnit.SECONDS))
             } }
             assertTrue(enteredClose.await(2, TimeUnit.SECONDS))
-            val terminal = executor.submit<Boolean> { completion.canAcceptFinal() }
-            assertFalse(terminal.isDone)
+            val terminalEntered = CountDownLatch(1)
+            val terminal = executor.submit<Boolean> { terminalEntered.countDown(); completion.canAcceptFinal() }
+            assertTrue(terminalEntered.await(2, TimeUnit.SECONDS))
+            assertThrows(java.util.concurrent.TimeoutException::class.java) { terminal.get(100, TimeUnit.MILLISECONDS) }
             allowClose.countDown()
             writer.get(2, TimeUnit.SECONDS)
             assertTrue(terminal.get(2, TimeUnit.SECONDS))

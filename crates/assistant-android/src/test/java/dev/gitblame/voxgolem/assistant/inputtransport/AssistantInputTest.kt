@@ -10,6 +10,8 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.EOFException
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 class AssistantInputTest {
     private val source = UUID(0, 1).toString()
@@ -52,7 +54,8 @@ class AssistantInputTest {
         val original = frame(InputKind.PARTIAL, 7, "synthetic draft")
         assertEquals(original, AssistantInputWire.decode(AssistantInputWire.encode(original)))
         assertThrows(IllegalArgumentException::class.java) { AssistantInputWire.decode(AssistantInputWire.encode(original) + 0) }
-        assertThrows(IllegalArgumentException::class.java) { AssistantInputWire.encode(frame(text = "x".repeat(9000))) }
+        assertEquals("x".repeat(8192), AssistantInputWire.decode(AssistantInputWire.encode(frame(InputKind.PARTIAL, 1, "x".repeat(8192)))).text)
+        assertThrows(IllegalArgumentException::class.java) { AssistantInputWire.encode(frame(InputKind.PARTIAL, 1, "x".repeat(8193))) }
         assertThrows(IllegalArgumentException::class.java) { AssistantInputWire.encode(frame().copy(session = "not-a-uuid")) }
         assertThrows(IllegalArgumentException::class.java) { AssistantInputWire.encode(frame().copy(language = "und")) }
     }
@@ -81,8 +84,8 @@ class AssistantInputTest {
         val stopped = f.phone.stop(frame().session)
         assertFalse(stopped.isDone)
         f.sdk.events.final("synthetic authoritative final")
-        assertTrue(stopped.join().authoritative)
-        assertEquals("synthetic authoritative final", stopped.join().text)
+        assertTrue(stopped.get(2, TimeUnit.SECONDS).authoritative)
+        assertEquals("synthetic authoritative final", stopped.get(2, TimeUnit.SECONDS).text)
         assertNull(f.lease.current())
         val previous = f.sdk.events
         assertTrue(f.phone.receive("synthetic-watch", frame().copy(session = UUID(0, 4).toString())))
@@ -107,8 +110,8 @@ class AssistantInputTest {
         val result = g.phone.stop(frame().session)
         g.now = 4000
         g.phone.tick()
-        assertFalse(result.join().authoritative)
-        assertEquals("synthetic timeout draft", result.join().text)
+        assertFalse(result.get(2, TimeUnit.SECONDS).authoritative)
+        assertEquals("synthetic timeout draft", result.get(2, TimeUnit.SECONDS).text)
     }
     @Test fun sourceBindingSequenceAndForegroundAreRechecked() {
         val f = Fixture()
@@ -158,9 +161,9 @@ class AssistantInputTest {
         val stopped = f.phone.stop(frame().session)
         f.sdk.closeFails = true
         f.sdk.events.final("synthetic available final draft")
-        assertFalse(stopped.join().authoritative)
-        assertEquals("synthetic available final draft", stopped.join().text)
-        assertEquals("sdk_retirement_failed", stopped.join().error)
+        assertFalse(stopped.get(2, TimeUnit.SECONDS).authoritative)
+        assertEquals("synthetic available final draft", stopped.get(2, TimeUnit.SECONDS).text)
+        assertEquals("sdk_retirement_failed", stopped.get(2, TimeUnit.SECONDS).error)
         assertNotNull(f.lease.current())
         f.sdk.closeFails = false; assertTrue(f.lease.retryFailedRetirement())
     }
@@ -181,9 +184,9 @@ class AssistantInputTest {
         f.sdk.events.partial("synthetic available draft")
         val stopped = f.phone.stop(frame().session)
         f.sdk.events.final("")
-        assertEquals("synthetic available draft", stopped.join().text)
-        assertFalse(stopped.join().authoritative)
-        assertEquals("recognition_empty_final", stopped.join().error)
+        assertEquals("synthetic available draft", stopped.get(2, TimeUnit.SECONDS).text)
+        assertFalse(stopped.get(2, TimeUnit.SECONDS).authoritative)
+        assertEquals("recognition_empty_final", stopped.get(2, TimeUnit.SECONDS).error)
     }
     @Test fun supportQueryTimeoutRetiresAndLateApprovalCannotStart() {
         val f = Fixture(); f.sdk.deferredSupport = true
@@ -198,15 +201,21 @@ class AssistantInputTest {
     @Test fun simultaneousNoteAndAssistantAdmissionHasOnlyOneOwner() {
         val lease = RecognitionResourceLease()
         val ready = CountDownLatch(2); val go = CountDownLatch(1)
-        val tokens = arrayOfNulls<RecognitionResourceLease.Token>(2)
-        val threads = listOf(RecognitionResourceLease.Kind.CHAT, RecognitionResourceLease.Kind.WATCH_NOTE_AUDIO)
-            .mapIndexed { index, kind -> Thread {
-                ready.countDown(); go.await(); tokens[index] = lease.tryAcquire(kind)
-            }.apply { start() } }
-        ready.await(); go.countDown(); threads.forEach { it.join() }
-        assertEquals(1, tokens.count { it != null })
-        assertSame(tokens.filterNotNull().single(), lease.current())
-        tokens.filterNotNull().single().close()
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val futures = listOf(RecognitionResourceLease.Kind.CHAT, RecognitionResourceLease.Kind.WATCH_NOTE_AUDIO).map { kind ->
+                executor.submit<RecognitionResourceLease.Token?> {
+                    ready.countDown(); check(go.await(2, TimeUnit.SECONDS)); lease.tryAcquire(kind)
+                }
+            }
+            assertTrue(ready.await(2, TimeUnit.SECONDS)); go.countDown()
+            val tokens = futures.map { it.get(2, TimeUnit.SECONDS) }
+            assertEquals(1, tokens.count { it != null })
+            assertSame(tokens.filterNotNull().single(), lease.current())
+        } finally {
+            go.countDown(); executor.shutdownNow(); assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS))
+            lease.current()?.close()
+        }
         assertNull(lease.current())
     }
 }

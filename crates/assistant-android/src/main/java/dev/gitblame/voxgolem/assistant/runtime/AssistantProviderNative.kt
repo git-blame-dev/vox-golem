@@ -1,6 +1,7 @@
 package dev.gitblame.voxgolem.assistant.runtime
 
 interface ProviderDeltaCallback {
+    /** Cancellation registration is established; this does not assert model/process readiness. */
     fun onReady()
     /** Receipt near HTTP dispatch, before response headers; JNI crossing is included in observation time. */
     fun onRequestDispatched() {}
@@ -14,6 +15,8 @@ interface ProviderNativeCalls {
     fun cancel(requestId: String)
     fun prepareSearch(requestJson: String, callback: ProviderDeltaCallback): String =
         """{"evidenceContext":null,"sourceFooter":"","sources":[]}"""
+    /** A returned outcome need not mean an external process has physically retired. */
+    fun whenRetired(requestId: String, retired: () -> Unit) { retired() }
 }
 
 object AssistantProviderNative : ProviderNativeCalls {

@@ -3,5 +3,4 @@
 
 pub mod buffers;
 pub mod capture;
-pub mod conversion;
 pub mod playback;

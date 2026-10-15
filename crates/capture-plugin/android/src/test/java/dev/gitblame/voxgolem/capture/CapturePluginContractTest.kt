@@ -80,6 +80,64 @@ class CapturePluginContractTest {
         PhoneCaptureCoordinator.resetSharedForTests()
     }
 
+    @Test fun actualUpdateCommandAcceptsBaselineVersionThenRejectsStaleEditorWithoutChangingTheRow() {
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        val activity = controller.get()
+        val repository = CaptureRepository(activity)
+        val plugin = CapturePlugin(activity)
+        val original = repository.save(CaptureRecord("123e4567-e89b-42d3-a456-426614174094",
+            createdAtUtc = "2026-01-02T03:04:05Z", captureState = CaptureState.SAVED,
+            recognitionState = RecognitionState.FINAL, finalText = "Synthetic exported baseline", transcriptVersion = 3,
+            orgState = OrgState.EXPORTED, exportTranscriptVersion = 3, exportDestinationId = "synthetic-destination"))
+        val responses = mutableListOf<Pair<Long, String>>()
+        val sender: (Long, String) -> Unit = { callback, value -> responses += callback to value }
+        try {
+            val args = JSONObject().put("captureId", original.captureId).put("text", "Synthetic accepted edit").put("expectedVersion", 3)
+            plugin.update_transcript(invoke("update_transcript", args.toString(), sender))
+            assertEquals(10L, responses.single().first)
+            assertTrue(PhoneCaptureCoordinator.shared(activity).awaitIdle())
+            val accepted = repository.get(original.captureId)!!
+            assertEquals(4L, accepted.transcriptVersion)
+            assertEquals("Synthetic accepted edit", accepted.finalText)
+            assertEquals(OrgState.EXPORTED, accepted.orgState)
+            assertEquals(3L, accepted.exportTranscriptVersion)
+            responses.clear()
+            args.put("text", "Synthetic rejected stale editor")
+            plugin.update_transcript(invoke("update_transcript", args.toString(), sender))
+            assertEquals(11L, responses.single().first)
+            assertEquals("transcript-conflict", JSONObject(responses.single().second).getString("message"))
+            assertTrue(PhoneCaptureCoordinator.shared(activity).awaitIdle())
+            assertEquals(accepted, repository.get(original.captureId))
+        } finally { controller.pause().stop().destroy() }
+    }
+
+    @Test fun actualUpdateCommandAndArgumentParserRejectNonIntegerOrNegativeVersionsWithoutMutation() {
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        val activity = controller.get()
+        val repository = CaptureRepository(activity)
+        val plugin = CapturePlugin(activity)
+        val original = repository.save(CaptureRecord("123e4567-e89b-42d3-a456-426614174095",
+            createdAtUtc = "2026-01-02T03:04:05Z", captureState = CaptureState.SAVED,
+            recognitionState = RecognitionState.FINAL, finalText = "Synthetic retained baseline", transcriptVersion = 3))
+        try {
+            for (literal in listOf("-1", "1.0", "1.25", "1e0", "\"3\"", "true", "null", "[]", "{}", "9223372036854775808")) {
+                // Preserve the actual JSON numeric token; JSONObject.toString could normalize 1.0.
+                val raw = """{"captureId":"${original.captureId}","text":"Synthetic rejected edit","expectedVersion":$literal}"""
+                org.junit.Assert.assertThrows(IllegalArgumentException::class.java) { UpdateTranscriptArgs.fromJson(JSONObject(raw)) }
+                val responses = mutableListOf<Pair<Long, String>>()
+                plugin.update_transcript(invoke("update_transcript", raw) { callback, value -> responses += callback to value })
+                assertEquals(11L, responses.single().first)
+                assertEquals("transcript-update-unavailable", JSONObject(responses.single().second).getString("message"))
+                assertEquals(original, repository.get(original.captureId))
+            }
+            for (literal in listOf("0", "3", "9223372036854775807")) {
+                val raw = """{"captureId":"${original.captureId}","text":"Synthetic edit","expectedVersion":$literal}"""
+                assertEquals(literal.toLong(), UpdateTranscriptArgs.fromJson(JSONObject(raw)).expectedVersion)
+            }
+            assertEquals(null, UpdateTranscriptArgs.fromJson(JSONObject().put("captureId", original.captureId).put("text", "Synthetic legacy edit")).expectedVersion)
+        } finally { controller.pause().stop().destroy() }
+    }
+
     @Test fun consentWithoutForegroundReadinessProjectsStartingNotSetupFailure() {
         val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
         shadowOf(RuntimeEnvironment.getApplication()).grantPermissions(

@@ -17,15 +17,17 @@ export function settleCanonicalAnswerStages(stages: readonly AnswerStageStatusEn
 
 export function projectCommittedTranscript(transcript: readonly Turn[]): readonly ChatMessage[] {
   return transcript.flatMap((turn) => [
-    { id: canonicalMessageId(turn.user), role: 'user' as const, content: turn.user.content.text },
+    { id: canonicalMessageId(turn.user), role: 'user' as const, content: turn.user.content.text,
+      observation: { requestId: turn.requestId, outcome: 'completed' as const, stageStatus: 'completed' as const, contentKind: 'text' as const } },
     { id: canonicalMessageId(turn.answer), role: 'assistant' as const, content: turn.answer.content.text, contentKind: turn.answer.content.kind,
+      observation: { requestId: turn.requestId, outcome: 'completed' as const, stageStatus: 'completed' as const,
+        contentKind: turn.answer.content.text.trim().length === 0 ? 'error' as const : turn.answer.content.kind },
       answerStage: { stages: [{ stage: turn.finalStage, status: 'completed' as const }], priorVersions: [] } },
   ])
 }
 
 export function replaceCommittedTranscript(current: readonly ChatMessage[], transcript: readonly Turn[]): readonly ChatMessage[] {
   return [
-    ...current.filter((message) => message.role === 'system'),
     ...projectCommittedTranscript(transcript).map((message) => {
       const previous = current.find((candidate) => candidate.id === message.id && candidate.role === message.role)
       if (previous === undefined || message.answerStage === undefined || previous.content !== message.content || (previous.contentKind ?? 'text') !== message.contentKind) return message

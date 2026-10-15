@@ -83,22 +83,25 @@ pub struct Receipt {
 }
 
 fn inventory(store: &Store) -> BTreeMap<OperationId, InventoryEntry> {
-    let snapshot = store.export();
-    let quarantined: BTreeSet<_> = snapshot.quarantine.into_iter().map(|q| q.id).collect();
-    snapshot
-        .records
-        .into_iter()
-        .filter(|r| !quarantined.contains(&r.operation.id))
-        .map(|r| {
-            let entry = InventoryEntry {
-                id: r.operation.id.clone(),
-                conversation: r.operation.conversation().clone(),
-                body_key: r.body_key,
-                tombstone: matches!(r.operation.body, OperationBody::ConversationDeleted { .. }),
-            };
-            (entry.id.clone(), entry)
-        })
+    inventory_entries(store)
+        .map(|entry| (entry.id.clone(), entry))
         .collect()
+}
+
+fn inventory_entries(store: &Store) -> impl Iterator<Item = InventoryEntry> + '_ {
+    store
+        .retained_records()
+        .filter(|r| !store.is_quarantined(&r.operation.id))
+        .map(inventory_entry)
+}
+
+fn inventory_entry(r: &crate::durable_conversation::Record) -> InventoryEntry {
+    InventoryEntry {
+        id: r.operation.id.clone(),
+        conversation: r.operation.conversation().clone(),
+        body_key: r.body_key.clone(),
+        tombstone: matches!(r.operation.body, OperationBody::ConversationDeleted { .. }),
+    }
 }
 
 pub fn inventory_page(
@@ -123,18 +126,20 @@ pub fn inventory_page(
     let max = request
         .max_items
         .min((MAX_CONTROL_BYTES - PAGE_BYTES_OVERHEAD) / ENTRY_BYTES_UPPER_BOUND);
-    let remaining: Vec<_> = inventory(store)
-        .into_values()
-        .filter(|entry| {
-            request
-                .cursor
-                .after
-                .as_ref()
-                .is_none_or(|after| &entry.id > after)
+    let mut remaining = store
+        .retained_records()
+        .filter(|record| {
+            !store.is_quarantined(&record.operation.id)
+                && request
+                    .cursor
+                    .after
+                    .as_ref()
+                    .is_none_or(|after| &record.operation.id > after)
         })
-        .collect();
-    let entries: Vec<_> = remaining.iter().take(max).cloned().collect();
-    let next = if remaining.len() > entries.len() {
+        .map(inventory_entry)
+        .peekable();
+    let entries: Vec<_> = remaining.by_ref().take(max).collect();
+    let next = if remaining.peek().is_some() {
         Some(InventoryCursor {
             revision: store.revision().into(),
             after: entries.last().map(|e| e.id.clone()),
@@ -154,10 +159,8 @@ pub fn reconcile_page(store: &Store, page: InventoryPage) -> Result<ReconcilePla
     validate_page(&page)?;
     let local = inventory(store);
     let keys = body_keys(store);
-    let snapshot = store.export();
-    let retained_metadata: BTreeMap<_, _> = snapshot
-        .records
-        .iter()
+    let retained_metadata: BTreeMap<_, _> = store
+        .retained_records()
         .map(|r| {
             (
                 r.operation.id.clone(),
@@ -168,11 +171,7 @@ pub fn reconcile_page(store: &Store, page: InventoryPage) -> Result<ReconcilePla
             )
         })
         .collect();
-    let retired: BTreeMap<_, _> = snapshot
-        .retired
-        .into_iter()
-        .map(|r| (r.id.clone(), r))
-        .collect();
+    let retired: BTreeMap<_, _> = store.retired_records().map(|r| (r.id.clone(), r)).collect();
     let locally_deleted: BTreeSet<_> = local
         .values()
         .filter(|e| e.tombstone)
@@ -338,12 +337,14 @@ pub fn unacknowledged(
 }
 
 fn body_keys(store: &Store) -> BTreeMap<OperationId, String> {
-    let snapshot = store.export();
-    snapshot
-        .records
-        .into_iter()
-        .map(|r| (r.operation.id, r.body_key))
-        .chain(snapshot.retired.into_iter().map(|r| (r.id, r.body_key)))
+    store
+        .retained_records()
+        .map(|r| (r.operation.id.clone(), r.body_key.clone()))
+        .chain(
+            store
+                .retired_records()
+                .map(|r| (r.id.clone(), r.body_key.clone())),
+        )
         .collect()
 }
 

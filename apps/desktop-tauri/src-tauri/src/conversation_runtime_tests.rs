@@ -40,6 +40,7 @@ fn owner_admission_captures_permission_policy_and_mode_without_root_state() {
         capabilities: vec![],
     }));
     let server = Mutex::new(None);
+    let exit_cleanup_started = AtomicBool::new(false);
     let network = Mutex::new(NetworkPreferences {
         web_enabled: true,
         ..Default::default()
@@ -56,6 +57,7 @@ fn owner_admission_captures_permission_policy_and_mode_without_root_state() {
     let request = runtime
         .admit(
             PromptAdmissionResources {
+                exit_cleanup_started: &exit_cleanup_started,
                 startup_state: &startup,
                 opencode_server: &server,
                 network_preferences: &network,

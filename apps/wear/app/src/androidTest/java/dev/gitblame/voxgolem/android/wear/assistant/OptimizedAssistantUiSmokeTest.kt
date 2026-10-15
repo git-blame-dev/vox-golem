@@ -38,7 +38,7 @@ class OptimizedAssistantUiSmokeTest {
                 }
                 await("The optimized app must render its native chat without the relocated New target", 65_000) {
                     val visible = nodes().filter { it.isVisibleToUser }
-                    visible.any { it.contentDescription?.toString()?.startsWith("Mic:") == true ||
+                    visible.any { it.contentDescription?.toString() in setOf("Ask once", "Talk continuously") ||
                         it.contentDescription?.toString() == "Send draft" } &&
                         visible.none { it.contentDescription?.toString() == "New chat" || it.text?.toString() == "New chat" }
                 }
@@ -84,7 +84,7 @@ class OptimizedAssistantUiSmokeTest {
                     val visible = nodes().filter { it.isVisibleToUser }
                     visible.any { it.text?.toString()?.trimEnd('\r', '\n') == "OPT_WEAR_OK" } &&
                         visible.none(::isUnsettled) &&
-                        visible.any { it.contentDescription?.toString()?.startsWith("Mic:") == true } &&
+                        visible.any { it.contentDescription?.toString() in setOf("Ask once", "Talk continuously") } &&
                         visible.none { it.contentDescription?.toString() == "Send draft" }
                 }
             } finally {

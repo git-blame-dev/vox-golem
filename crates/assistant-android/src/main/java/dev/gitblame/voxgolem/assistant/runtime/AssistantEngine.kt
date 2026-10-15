@@ -1,6 +1,7 @@
 package dev.gitblame.voxgolem.assistant.runtime
 
 import dev.gitblame.voxgolem.assistant.AssistantDomain
+import dev.gitblame.voxgolem.assistant.AssistantDraftBudget
 import dev.gitblame.voxgolem.assistant.AssistantDomainException
 import dev.gitblame.voxgolem.assistant.AssistantDomainNative
 import dev.gitblame.voxgolem.assistant.AssistantProjectionRead
@@ -52,13 +53,18 @@ interface AssistantModelStorage {
 }
 
 object AssistantModels {
-    val aliases = listOf("custom-sol-high", "custom-sol-none", "custom-luna-none", "custom-luna-low", "local-fast", "agy-flash-low", "agy-flash-high", "agy-opus-high", "agy-sonnet-high", "gemini-nano")
+    val customLabels = mapOf("custom-sol-high" to "Sol High", "custom-sol-none" to "Sol None", "custom-luna-none" to "Luna None", "custom-luna-low" to "Luna Low")
+    val optionalLabels = mapOf("local-fast" to "Local: Llama 3.2 3B", "gemini-nano" to "Local: Gemini Nano", "agy-flash-low" to "Agy: Gemini 3.8 Flash Low",
+        "agy-flash-high" to "Agy: Gemini 3.8 Flash High", "agy-opus-high" to "Agy: Claude Opus 5.5 High", "agy-sonnet-high" to "Agy: Claude Sonnet 5.5 High")
+    val aliases = (customLabels.keys + optionalLabels.keys).toList()
 }
 
 object AssistantSearchModes {
     const val MAX_STATUS_EVENTS = 256
     val values = setOf("quick", "verify", "research")
     val statuses = setOf("Searching", "Reading", "Fallback", "Partial")
+    private val counted = Regex("^(Searching|Reading) · [1-9][0-9]? (result|results|page|pages)$")
+    fun isValidStatus(status: String): Boolean = status in statuses || counted.matches(status)
 }
 
 /** One IO actor per process. Observers receive immutable projections on that actor, not the UI thread. */
@@ -101,7 +107,13 @@ class AssistantEngine @JvmOverloads internal constructor(
         val admittedAt: Long = android.os.SystemClock.elapsedRealtime(),
         var firstTextMs: Long? = null,
         var outcomeJson: String? = null,
-    )
+    ) {
+        val pendingLock = Any()
+        val pendingText = StringBuilder()
+        var pendingBytes = 0
+        var drainScheduled = false
+        var streamClosed = false
+    }
     private val domain = AssistantDomain(projectionGateway)
     private val observers = CopyOnWriteArrayList<(AssistantState) -> Unit>()
     private val epoch = AtomicLong(0)
@@ -116,6 +128,8 @@ class AssistantEngine @JvmOverloads internal constructor(
     private var active: Active? = null
     private data class StartupContext(val json: String?, val revision: String, val conversation: String?, val head: String?)
     private var startupContext: StartupContext? = null
+    private data class ProjectionStamp(val revision: String, val conversation: String?, val head: String?, val busy: Boolean)
+    private var projectionStamp: ProjectionStamp? = null
     private var state = policies.read().let { AssistantState(webEnabled = it.webEnabled, speechNetworkFallback = it.speechNetworkFallback,
         speechLanguage = it.speechLanguage, speechTtsProvider = it.speechTtsProvider, speechTtsVoice = it.speechTtsVoice) }
     @Volatile private var published = state
@@ -178,6 +192,8 @@ class AssistantEngine @JvmOverloads internal constructor(
             state.conversation == prepared.conversation && state.selectedHead == prepared.head &&
             store.projectionStillCurrent(prepared.revision, prepared.conversation, prepared.head)) {
             state = state.copy(credential = credentials?.status())
+        } else if (currentIdleProjectionValidated()) {
+            state = state.copy(credential = credentials?.status())
         } else refreshProjection()
     }
     override fun refresh() = dispatch { refreshProjection() }
@@ -229,14 +245,15 @@ class AssistantEngine @JvmOverloads internal constructor(
     fun setSpeechDraft(text: String, expectedConversation: String?, interrupted: Boolean = false,
         expectedHead: String? = null, requireHeadOwner: Boolean = false) = dispatch {
         if (requireHeadOwner) {
-            refreshProjection()
+            if (currentIdleProjectionValidated()) state = state.copy(credential = credentials?.status())
+            else refreshProjection()
             if (state.conversation == expectedConversation && state.selectedHead == expectedHead) updateDraft(text, interrupted)
             else loadDraft()
         } else if (state.conversation == expectedConversation) updateDraft(text, interrupted)
     }
     private fun updateDraft(text: String, interrupted: Boolean = false) {
         if (!idle()) return
-        if (text.toByteArray(Charsets.UTF_8).size > 32 * 1024) {
+        if (!AssistantDraftBudget.accepts(text)) {
             state = state.copy(error = "prompt_too_large"); return
         }
         store.saveDraft(conversation(), text, interrupted)
@@ -307,6 +324,7 @@ class AssistantEngine @JvmOverloads internal constructor(
     }
 
     private fun createNewConversation() {
+        projectionStamp = null
         val creation = store.createConversation("Conversation")
         val id = creation.getJSONObject("operation").getJSONObject("id")
         store.selectConversation(id, null)
@@ -321,7 +339,7 @@ class AssistantEngine @JvmOverloads internal constructor(
     fun resetWithDraft(draft: String, onSettled: (AssistantState) -> Unit) = enqueueReset(draft, onSettled)
 
     private fun enqueueReset(draft: String?, onSettled: ((AssistantState) -> Unit)?) {
-        if (draft != null && draft.toByteArray(Charsets.UTF_8).size > 32 * 1024) {
+        if (draft != null && !AssistantDraftBudget.accepts(draft)) {
             dispatch(onSettled) { state = state.copy(error = "prompt_too_large") }
             return
         }
@@ -341,6 +359,7 @@ class AssistantEngine @JvmOverloads internal constructor(
     }
 
     private fun createNewWithDraft(draft: String) {
+        projectionStamp = null
         store.saveDraft(null, draft)
         store.selectConversation(null, null)
         state = state.copy(conversation = null, selectedHead = null, branchChoices = emptyList(), draft = draft, interrupted = false, provisional = "", error = null, clientRequestToken = null, providerRequestId = null, searchMode = "quick", toolStatus = null)
@@ -375,13 +394,14 @@ class AssistantEngine @JvmOverloads internal constructor(
     fun selectConversation(id: String, onSettled: (AssistantState) -> Unit) = dispatch(onSettled) { updateConversation(id) }
     private fun updateConversation(id: String) {
         if (!idle()) return
+        projectionStamp = null
         val candidate = JSONObject(id)
         val visible = store.view().getJSONArray("conversations")
         require((0 until visible.length()).any { visible.getJSONObject(it).let { view ->
             sameId(view.getJSONObject("id"), candidate) && !view.getBoolean("deleted") && !view.isNull("title")
         } })
         store.selectConversation(candidate, null)
-        state = state.copy(conversation = candidate.toString(), selectedHead = null, error = null)
+        state = state.copy(conversation = candidate.toString(), selectedHead = null, error = null, clientRequestToken = null, providerRequestId = null, firstTextMs = null, toolStatus = null)
         loadDraft(); refreshProjection()
     }
 
@@ -389,6 +409,7 @@ class AssistantEngine @JvmOverloads internal constructor(
     fun selectHead(id: String, onSettled: (AssistantState) -> Unit) = dispatch(onSettled) { updateHead(id) }
     private fun updateHead(id: String) {
         if (!idle()) return
+        projectionStamp = null
         val conversation = conversation() ?: return
         val head = JSONObject(id)
         store.context(conversation, head)
@@ -440,6 +461,7 @@ class AssistantEngine @JvmOverloads internal constructor(
                 admit(ticket, promptOverride, searchMode,
                     if (requireConversationOwner) VoiceInputContext(expectedConversation, expectedHead) else null)
             } catch (error: RuntimeException) {
+                projectionStamp = null
                 val code = domainCode(error)
                 state = state.copy(interrupted = true, error = code)
                 if (active?.ticket === ticket) {
@@ -462,7 +484,8 @@ class AssistantEngine @JvmOverloads internal constructor(
             }
             if (!idle()) { fail(if (ticket.cancelled.get()) "interrupted" else "busy", ticket.cancelled.get()); return }
             if (voiceOwner != null) {
-                refreshProjection()
+                if (currentIdleProjectionValidated()) state = state.copy(credential = credentials?.status())
+                else refreshProjection()
                 if (state.conversation != voiceOwner.conversation || state.selectedHead != voiceOwner.selectedHead) {
                     loadDraft(); fail("conversation_changed"); return
                 }
@@ -470,7 +493,7 @@ class AssistantEngine @JvmOverloads internal constructor(
             val capturedMode = searchMode ?: state.searchMode
             if (capturedMode !in AssistantSearchModes.values) { fail("unsupported_search_mode"); return }
             if (promptOverride != null) {
-                if (promptOverride.toByteArray(Charsets.UTF_8).size > 32 * 1024) { fail("prompt_too_large"); return }
+                if (!AssistantDraftBudget.accepts(promptOverride)) { fail("prompt_too_large"); return }
                 if (voiceOwner == null) state = state.copy(draft = promptOverride)
             }
             if (voiceOwner == null && state.draft.isNotBlank()) {
@@ -517,6 +540,7 @@ class AssistantEngine @JvmOverloads internal constructor(
             val context = if (fresh) {
                 val projection = domain.project(store.committedSnapshot().rawJson,
                     pinnedConversation, pinnedHead, false, contextRead)
+                projectionStamp = null
                 state = state.copy(viewJson = projection.view.toString())
                 requireNotNull(projection.read())
             } else requireNotNull(projectedContext)
@@ -551,6 +575,7 @@ class AssistantEngine @JvmOverloads internal constructor(
                 ticket.failure.get()?.let { fail(it); return }
                 if (ticket.cancelled.get() || ticket.epoch != epoch.get()) { state = state.copy(interrupted = true); fail("interrupted", true); return }
                 active = turn
+                projectionStamp = null
                 cancellationOwner.set(ticket)
                 state = state.copy(busy = true, provisional = "", firstTextMs = null, toolStatus = null, interrupted = false, error = null, clientRequestToken = ticket.token, providerRequestId = id)
                 ticket.timing.mark(Stage.ADMITTED)
@@ -569,13 +594,22 @@ class AssistantEngine @JvmOverloads internal constructor(
                             try { gate.deliver(AssistantDelta(ticket.token, id, sequence, text)) } catch (_: RuntimeException) { false }
                         } ?: true
                         if (!delivered) { ticket.failure.set("delivery_failed"); throw IllegalStateException("Assistant delivery failed") }
-                        dispatch {
-                            if (active === turn && turn.epoch == epoch.get()) state = state.copy(provisional = state.provisional + text)
+                        // Worker callbacks are serialized; presentation batches independently of transport ACKs.
+                        val schedule = synchronized(turn.pendingLock) {
+                            if (turn.streamClosed || turn.epoch != epoch.get() || ticket.cancelled.get()) false
+                            else {
+                                val bytes = text.toByteArray(Charsets.UTF_8).size
+                                check(turn.pendingBytes + bytes <= AssistantRequestWorker.MAX_CALLBACK_BYTES)
+                                turn.pendingText.append(text)
+                                turn.pendingBytes += bytes
+                                if (turn.drainScheduled) false else { turn.drainScheduled = true; true }
+                            }
                         }
+                        if (schedule) dispatch { drainPendingText(turn) }
                     }
                     override fun onStatus(requestId: String, status: String) {
                         if (requestId != turn.id || ticket.cancelled.get() || turn.epoch != epoch.get()) return
-                        check(status in AssistantSearchModes.statuses)
+                        check(AssistantSearchModes.isValidStatus(status))
                         val sequence = ticket.sequence.incrementAndGet()
                         val delivered = ticket.delivery?.let { gate ->
                             try { gate.deliverStatus(AssistantToolStatus(ticket.token, id, sequence, status)) } catch (_: RuntimeException) { false }
@@ -596,9 +630,13 @@ class AssistantEngine @JvmOverloads internal constructor(
                             if (ready) ticket.timing.mark(Stage.DELIVERY_READY)
                             if (!ready) ticket.failure.set("delivery_failed")
                         }
-                        dispatch { if (active === turn) turn.outcomeJson = outcomeJson }
+                        dispatch {
+                            drainPendingText(turn, close = true)
+                            if (active === turn) turn.outcomeJson = outcomeJson
+                        }
                     }
                     override fun onRetired(requestId: String) = dispatch {
+                        drainPendingText(turn, close = true)
                         val outcome = turn.outcomeJson
                         if (active === turn && turn.epoch == epoch.get() && !ticket.cancelled.get() && outcome != null) {
                             settle(turn, outcome)
@@ -706,6 +744,28 @@ class AssistantEngine @JvmOverloads internal constructor(
 
     private fun ticketFailure(ticket: Ticket) = ticket.failure.get()
 
+    private fun drainPendingText(turn: Active, close: Boolean = false) {
+        val text = synchronized(turn.pendingLock) {
+            val value = turn.pendingText.toString()
+            turn.pendingText.setLength(0)
+            turn.pendingBytes = 0
+            turn.drainScheduled = false
+            if (close) turn.streamClosed = true
+            value
+        }
+        if (text.isNotEmpty() && active === turn && turn.epoch == epoch.get() && !turn.ticket.cancelled.get())
+            state = state.copy(provisional = state.provisional + text)
+    }
+
+    private fun currentIdleProjectionValidated(): Boolean {
+        val stamp = projectionStamp ?: return false
+        val valid = active == null && !state.busy && !stamp.busy &&
+            state.conversation == stamp.conversation && state.selectedHead == stamp.head &&
+            store.projectionStillCurrent(stamp.revision, stamp.conversation, stamp.head)
+        if (!valid) projectionStamp = null
+        return valid
+    }
+
     private fun finish(ticket: Ticket, status: String, code: String?, providerId: String? = null, record: String? = null, speechText: String? = null, firstTextMs: Long? = null, completedMs: Long? = null, terminalContextJson: String? = null) {
         if (ticket.finished) return
         ticket.finished = true
@@ -738,6 +798,7 @@ class AssistantEngine @JvmOverloads internal constructor(
     }
 
     private fun refreshProjection(read: AssistantProjectionRead? = null): JSONObject? {
+        projectionStamp = null
         startupContext = null
         state = state.copy(credential = credentials?.status())
         startupTiming?.mark(Stage.CREDENTIAL_STATUS_READ)
@@ -750,12 +811,17 @@ class AssistantEngine @JvmOverloads internal constructor(
         val projection = domain.project(raw, conversation(), head(), active != null, read)
         startupTiming?.mark(Stage.DOMAIN_PROJECTION_COMPLETED)
         state = state.copy(viewJson = projection.view.toString())
-        val conversation = conversation() ?: return null
+        val conversation = conversation()
+        if (conversation == null) {
+            stampProjection()
+            return null
+        }
         val decision = projection.continuation
         if (decision == null) {
             store.selectConversation(null, null)
-            state = state.copy(conversation = null, selectedHead = null, branchChoices = emptyList())
+            state = state.copy(conversation = null, selectedHead = null, branchChoices = emptyList(), clientRequestToken = null, providerRequestId = null, firstTextMs = null, toolStatus = null)
             loadDraft()
+            stampProjection()
             return null
         }
         when (decision.getString("kind")) {
@@ -770,7 +836,14 @@ class AssistantEngine @JvmOverloads internal constructor(
             }
             "keep" -> state = state.copy(branchChoices = emptyList())
         }
-        return projection.read()
+        val result = projection.read()
+        stampProjection()
+        return result
+    }
+
+    private fun stampProjection() {
+        projectionStamp = ProjectionStamp(JSONObject(state.viewJson).getString("revision"),
+            state.conversation, state.selectedHead, active != null || state.busy)
     }
 
     private fun loadDraft() {
@@ -786,10 +859,12 @@ class AssistantEngine @JvmOverloads internal constructor(
     private fun dispatch(onSettled: ((AssistantState) -> Unit)? = null, action: () -> Unit) {
         io.execute {
             try { action() } catch (error: RuntimeException) {
+                projectionStamp = null
                 state = state.copy(error = domainCode(error))
             }
+            val changed = published != state
             published = state
-            observers.forEach { observer -> try { observer(state) } catch (_: RuntimeException) { /* Consumer failure must not retire the actor. */ } }
+            if (changed) observers.forEach { observer -> try { observer(state) } catch (_: RuntimeException) { /* Consumer failure must not retire the actor. */ } }
             try { onSettled?.invoke(state) } catch (_: RuntimeException) { /* A command result consumer cannot retire the actor. */ }
         }
     }
@@ -799,6 +874,7 @@ class AssistantEngine @JvmOverloads internal constructor(
         private const val SPOKEN_INSTRUCTIONS = "For this spoken turn, give the shortest complete natural answer, usually one or two short sentences. Preserve essential qualifications, safety information, evidence and tool use. Give more detail when requested or necessary; preserve requested structured output, including valid JSON, rather than forcing conversational prose."
         private val PROVIDER_ERRORS = setOf("invalid_request", "duplicate_request", "busy", "auth_unavailable", "auth_expired",
             "unauthorized", "forbidden", "rate_limited", "timeout", "transport", "provider_http_error", "invalid_response", "too_large", "callback_failed", "internal_error",
+            "unsupported_model", "unsupported_search_mode", "provider_failure", "retirement_failed",
             "aicore_not_available", "aicore_needs_update", "aicore_busy", "aicore_unavailable", "aicore_downloading")
         private fun JSONObject.objectOrNull(name: String) = if (isNull(name)) null else getJSONObject(name)
         private fun sameId(a: JSONObject, b: JSONObject) = a.getString("replica") == b.getString("replica") && a.getString("sequence") == b.getString("sequence")

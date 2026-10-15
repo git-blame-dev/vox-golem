@@ -6,7 +6,7 @@ import java.io.IOException
 import java.io.RandomAccessFile
 
 /** Reads the data chunk from a validated PCM16 RIFF/WAVE file without buffering the recording. */
-class WavPcmReader(file: File, expected: CaptureFormat? = null) : Closeable {
+class WavPcmReader(file: File, expected: CaptureFormat? = null, requireCanonical: Boolean = false) : Closeable {
     private val input = RandomAccessFile(file, "r")
     private val dataStart: Long
     private val dataLength: Long
@@ -25,6 +25,7 @@ class WavPcmReader(file: File, expected: CaptureFormat? = null) : Closeable {
             val riffEnd = riffLength + 8
             var parsedFormat: CaptureFormat? = null
             var foundData: Pair<Long, Long>? = null
+            var canonicalFormat = false
             while (input.filePointer + 8 <= riffEnd) {
                 val chunkId = readFourCc()
                 val chunkLength = readUInt32()
@@ -33,17 +34,22 @@ class WavPcmReader(file: File, expected: CaptureFormat? = null) : Closeable {
                 if (chunkEnd < chunkStart || chunkEnd > riffEnd) throw IOException("WAV chunk exceeds RIFF bounds")
                 when (chunkId) {
                     "fmt " -> {
-                        if (chunkLength < 16) throw IOException("WAV fmt chunk is incomplete")
+                        if (chunkLength < 16 || parsedFormat != null) throw IOException("WAV fmt chunk is incomplete or duplicated")
                         val encoding = readUInt16()
                         val channels = readUInt16()
                         val sampleRate = readUInt32()
-                        readUInt32() // byte rate
-                        readUInt16() // block alignment
+                        val byteRate = readUInt32()
+                        val alignment = readUInt16()
                         val bits = readUInt16()
                         if (encoding != 1) throw IOException("WAV audio must be PCM")
                         parsedFormat = CaptureFormat(sampleRate.toInt(), channels, bits)
+                        if (alignment != channels * bits / 8 || byteRate != sampleRate * alignment) throw IOException("WAV byte rate or block alignment is invalid")
+                        canonicalFormat = chunkStart == 20L && chunkLength == 16L
                     }
-                    "data" -> if (foundData == null) foundData = chunkStart to chunkLength
+                    "data" -> {
+                        if (foundData != null) throw IOException("WAV data chunk is duplicated")
+                        foundData = chunkStart to chunkLength
+                    }
                 }
                 input.seek(chunkEnd + (chunkLength and 1L))
             }
@@ -52,6 +58,9 @@ class WavPcmReader(file: File, expected: CaptureFormat? = null) : Closeable {
                 throw IOException("WAV PCM format does not match capture metadata")
             }
             val (start, length) = foundData ?: throw IOException("WAV data chunk is missing")
+            if (requireCanonical && (!canonicalFormat || start != 44L || riffEnd != fileLength || fileLength != 44L + length)) {
+                throw IOException("WAV is not a canonical capture file")
+            }
             frameBytes = format.channels * format.bitsPerSample / 8
             if (length % frameBytes != 0L) throw IOException("WAV data chunk ends inside a PCM frame")
             dataStart = start

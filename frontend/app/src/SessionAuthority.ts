@@ -8,10 +8,15 @@ import type { AudioInputDevice } from './lib/liveAudioSource'
 import type { SearchMode } from './lib/searchMode'
 import type { ChatMessage, CueAssetPaths, RuntimeStatus, StartupState, UiTextSize, UiTheme, UserNotice } from './types/chat'
 import { getInitialMessages } from './state/appShell'
-import { applySnapshotModelOptions, capabilityMap, instantMatchesResponseProfile } from './sessionPolicy'
+import { applySnapshotModelOptions, capabilityMap, generationIneligibility } from './sessionPolicy'
 import { admittedSearchMode } from './lib/searchMode'
 import { transitionRuntimeStatus } from './state/runtimeMachine'
 import type { AnswerSource, AnswerStageStatusEntry, AnswerPriorVersion } from './components/AnswerStage'
+import { SessionPromptController, cancelPromptProjectionFrame } from './controllers/SessionPromptController'
+export { cancelPromptProjectionFrame } from './controllers/SessionPromptController'
+import { SessionSelectionController } from './controllers/SessionSelectionController'
+import { SessionPreferencesController } from './controllers/SessionPreferencesController'
+import { SessionAudioController } from './controllers/SessionAudioController'
 
 export type PromptProjection = {
   id: string
@@ -123,6 +128,10 @@ type ViewSnapshot<N extends ViewName> = Pick<ControlsSnapshot, (typeof VIEW_KEYS
 
 /** Instance-local transition authority. Construction neither starts resources nor performs I/O. */
 export class SessionAuthority {
+  readonly prompt = new SessionPromptController()
+  readonly selection = new SessionSelectionController()
+  readonly preferences = new SessionPreferencesController()
+  readonly audio = new SessionAudioController()
   private state: State
   private controls: ControlsSnapshot
   private messages: readonly ChatMessage[] = getInitialMessages()
@@ -207,17 +216,13 @@ export class SessionAuthority {
     const selected = startup.kind === 'ready' ? applySnapshotModelOptions(
       instantOptions(capabilityMap(startup)), runtime.snapshotModelOptions,
     ).find((option) => option.value === settings.instant) : undefined
-    const shortcut = this.resources.get('shortcutDraft')?.current as { readonly needsNew: boolean } | null | undefined
+    const shortcut = this.selection.shortcutDraft.current
     if (!this.active || this.promptAdmission !== null || prompt.trim().length === 0 || startup.kind !== 'ready' ||
-      updateBlocked || selected?.available !== true || !instantMatchesResponseProfile(startup, settings.instant) ||
-      runtime.assistantSettingsPending || runtime.searchModePending || !runtime.snapshotControlsFresh ||
-      interaction.isSwitchingResponseProfile || interaction.resetPending ||
+       generationIneligibility({ ...runtime, ...interaction }, selected?.available === true, updateBlocked) !== null ||
       shortcut?.needsNew === true ||
-      this.resources.get('selectionRecovery')?.current != null ||
+       this.selection.recovery.current !== null ||
       (source === 'typed' && nativeRequestId === undefined && interaction.androidVoiceActive) ||
-      (interaction.androidAssistant?.branchChoices.length ?? 0) > 0 ||
-      ['saved_local_state_failed', 'draft_not_saved', 'storage_error'].includes(interaction.androidAssistant?.error ?? '') ||
-      this.resources.get('prompt')?.current != null) return null
+       this.prompt.active.current !== null) return null
     const executingStatus = transitionRuntimeStatus(runtime.runtimeStatus, 'submit_prompt')
     if (executingStatus === runtime.runtimeStatus) return null
     const admission = {
@@ -241,7 +246,7 @@ export class SessionAuthority {
   }
 
   stopPromptPresentation(): { readonly requestId: string; readonly recover: () => void } | null {
-    const prompt = this.resources.get('prompt')?.current as PromptProjection | null | undefined
+    const prompt = this.prompt.active.current
     if (prompt == null || prompt.terminal || prompt.cancelPending) return null
     prompt.cancelPending = true
     prompt.presentationCancelled = true
@@ -249,7 +254,7 @@ export class SessionAuthority {
     this.transition('promptState', 'stopping')
     const isCurrent = this.captureLifetime()
     return { requestId: prompt.id, recover: () => {
-      if (!isCurrent() || this.resources.get('prompt')?.current !== prompt || prompt.terminal) return
+      if (!isCurrent() || this.prompt.active.current !== prompt || prompt.terminal) return
       prompt.cancelPending = false
       // A rejected command does not revive already-fenced presentation callbacks.
       // The original request still owns native settlement and canonical recovery.
@@ -261,6 +266,7 @@ export class SessionAuthority {
     if (!this.active || projection.presentationCancelled) return
     const projectedMessage: ChatMessage = {
       id: projection.assistantId, role: 'assistant', content: projection.text,
+      observation: { requestId: projection.id, outcome: 'pending', stageStatus: 'running', contentKind: 'text' },
       ...(projection.customDirectTimings === undefined ? {} : { customDirectTimings: projection.customDirectTimings }),
       // The arrays are replaced at their own semantic transitions, never copied per token.
       answerStage: { stages: projection.stages, priorVersions: projection.priorVersions, sources: projection.sources },
@@ -276,16 +282,7 @@ export class SessionAuthority {
   }
 
   schedulePromptProjection(projection: PromptProjection): void {
-    if (projection.renderFrameId !== null) return
-    const revision = ++projection.renderFrameRevision
-    const isCurrent = this.captureLifetime()
-    const frameId = window.requestAnimationFrame(() => {
-      if (projection.renderFrameRevision !== revision || projection.renderFrameId !== frameId) return
-      projection.renderFrameId = null
-      if (!isCurrent() || this.resources.get('prompt')?.current !== projection || projection.terminal) return
-      this.renderPromptProjection(projection)
-    })
-    projection.renderFrameId = frameId
+    this.prompt.schedule(projection, this.captureLifetime(), () => this.renderPromptProjection(projection))
   }
 
   transaction<T>(intent: () => T): T {
@@ -452,11 +449,4 @@ export function sessionAuthority(owner: object, options?: ConstructorParameters<
     authorities.set(owner, authority)
   }
   return authority
-}
-
-export function cancelPromptProjectionFrame(projection: PromptProjection): void {
-  if (projection.renderFrameId === null) return
-  window.cancelAnimationFrame(projection.renderFrameId)
-  projection.renderFrameId = null
-  projection.renderFrameRevision += 1
 }

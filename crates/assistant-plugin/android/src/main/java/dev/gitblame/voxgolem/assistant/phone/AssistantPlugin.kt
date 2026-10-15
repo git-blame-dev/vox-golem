@@ -27,6 +27,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.lang.ref.WeakReference
 import dev.gitblame.voxgolem.assistant.runtime.AssistantRuntime
+import dev.gitblame.voxgolem.assistant.AssistantDraftBudget
 import dev.gitblame.voxgolem.assistant.AssistantTiming.Stage
 
 @InvokeArg
@@ -49,10 +50,13 @@ class VoiceArgs {
 
 @TauriPlugin(permissions = [Permission(alias = "assistantMic", strings = [Manifest.permission.RECORD_AUDIO])])
 class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
+    internal constructor(activity: Activity, speech: PhoneSpeechSession) : this(activity) { suppliedSpeech = speech }
     private val lock = Any()
     private var request: String? = null
     private val backend by lazy { AssistantPhoneBindings.get(activity) }
-    private val speech by lazy { PhoneSpeechSession(activity.applicationContext, backend) }
+    private var suppliedSpeech: PhoneSpeechSession? = null
+    private val speechOwner = lazy { suppliedSpeech ?: PhoneSpeechSession(activity.applicationContext, backend) }
+    private val speech get() = speechOwner.value
     private val main = Handler(Looper.getMainLooper())
     private val visible = AtomicBoolean(false)
     private val inputEpoch = AtomicLong()
@@ -60,6 +64,7 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
     private data class PendingVoice(val epoch: Long, val args: VoiceArgs, val invoke: Invoke, val owner: SpeechAdmissionSnapshot)
     private var pendingVoice: PendingVoice? = null
     private var promptWakeLock: PowerManager.WakeLock? = null
+    private val promptProtection by lazy { PromptWakeProtection(::acquirePromptWakeLock, ::releasePromptWakeLock) }
 
     private fun isScreenOffOrLocked(): Boolean {
         val pm = activity.getSystemService(Context.POWER_SERVICE) as? PowerManager
@@ -69,13 +74,14 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
         return screenOff || locked
     }
 
-    private fun acquirePromptWakeLock() {
+    private fun acquirePromptWakeLock(timeoutMs: Long) {
         try {
             if (promptWakeLock == null) {
                 val pm = activity.getSystemService(Context.POWER_SERVICE) as? PowerManager
                 promptWakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "VoxGolem:PromptExecution")
+                promptWakeLock?.setReferenceCounted(false)
             }
-            promptWakeLock?.takeIf { !it.isHeld }?.acquire(60_000)
+            promptWakeLock?.acquire(timeoutMs)
         } catch (_: RuntimeException) {}
     }
 
@@ -94,15 +100,15 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
         (activity as? LifecycleOwner)?.lifecycle?.addObserver(object : DefaultLifecycleObserver {
             override fun onResume(owner: LifecycleOwner) = setForeground(true)
             override fun onPause(owner: LifecycleOwner) {
-                if (!isScreenOffOrLocked()) setForeground(false)
+                setForeground(false, isScreenOffOrLocked())
             }
             override fun onStop(owner: LifecycleOwner) {
-                if (!isScreenOffOrLocked()) setForeground(false)
+                setForeground(false, isScreenOffOrLocked())
             }
             override fun onDestroy(owner: LifecycleOwner) {
-                setForeground(false)
-                speech.close()
-                releasePromptWakeLock()
+                try { setForeground(false); speech.close() }
+                finally { promptProtection.close() }
+                // Worker-retired settlement releases request protection, not Activity destruction.
             }
         })
         setForeground((activity as? LifecycleOwner)?.lifecycle?.currentState?.isAtLeast(Lifecycle.State.RESUMED) == true)
@@ -122,13 +128,13 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
         }
     } }
 
-    private fun setForeground(visible: Boolean) {
+    private fun setForeground(visible: Boolean, llmEligible: Boolean = visible) {
         val wasVisible = this.visible.get()
         this.visible.set(visible)
         if (!visible) { inputEpoch.incrementAndGet(); pendingVoice = null }
         if (!visible && wasVisible) NewVoiceShortcutLauncher.cancelEntries()
-        try { backend.foreground(visible) } catch (_: AssistantPhoneFailure) { /* Commands report the unavailable binding. */ }
-        speech.foreground(visible)
+        try { backend.foreground(llmEligible) } catch (_: AssistantPhoneFailure) { /* Commands report the unavailable binding. */ }
+        speech.foreground(visible, retainGeneration = llmEligible)
         if (visible && NewVoiceShortcutLauncher.actions.hasPending()) notifyShortcut()
     }
 
@@ -202,7 +208,7 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
     @Command fun start_assistant_voice(invoke: Invoke) {
         try {
             val args = invoke.parseArgs(VoiceArgs::class.java)
-            require(args.sessionId.isNotEmpty() && args.sessionId.toByteArray(Charsets.UTF_8).size <= 128 && args.draft.toByteArray(Charsets.UTF_8).size <= 32 * 1024)
+            require(args.sessionId.isNotBlank() && args.sessionId.toByteArray(Charsets.UTF_8).size <= 128 && AssistantDraftBudget.accepts(args.draft))
             require(args.completionPolicy in setOf("manual", "stop_send_new", "single_turn", "repeat_after_reply"))
             if (args.completionPolicy == "stop_send_new" && (args.loopMode || args.launchToken == null || !NewVoiceShortcutLauncher.actions.active(args.launchToken!!))) {
                 reject(invoke, "invalid_input", "A deliberate voice shortcut launch is required"); return
@@ -241,7 +247,30 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
         } catch (error: RuntimeException) { pending.args.launchToken?.let(NewVoiceShortcutLauncher.actions::release); reply(invoke, Result.failure(error)) }
     }
     @Command fun finish_assistant_dictation(invoke: Invoke) { speech.finish(); invoke.resolve() }
-    @Command fun stop_assistant_voice(invoke: Invoke) { inputEpoch.incrementAndGet(); pendingVoice = null; NewVoiceShortcutLauncher.cancelEntries(); speech.stop(); invoke.resolve() }
+    @Command fun stop_assistant_voice(invoke: Invoke) {
+        if (Looper.myLooper() != Looper.getMainLooper()) { main.post { stop_assistant_voice(invoke) }; return }
+        val args = invoke.getArgs()
+        if (!args.has("sessionId")) {
+            // Deliberate legacy Stop, unlike observer-owned cleanup, retires current input consent.
+            inputEpoch.incrementAndGet(); pendingVoice = null
+            NewVoiceShortcutLauncher.cancelEntries(); speech.stop(); invoke.resolve(); return
+        }
+        val id = args.opt("sessionId") as? String
+        if (id == null || id.isBlank() || id.toByteArray(Charsets.UTF_8).size > 128) {
+            reject(invoke, "invalid_input", "Voice session ID is invalid"); return
+        }
+        val pending = pendingVoice?.takeIf { it.args.sessionId == id }
+        val current = if (speechOwner.isInitialized()) speechOwner.value else suppliedSpeech
+        val ownsSpeech = current?.ownsSession(id) == true
+        if (pending == null && !ownsSpeech) { invoke.resolve(); return }
+        if (pending != null) {
+            inputEpoch.incrementAndGet(); pendingVoice = null
+            pending.args.launchToken?.let(NewVoiceShortcutLauncher.actions::release)
+        }
+        // Main-thread compare and stop are one ownership decision. Never touch a newer session.
+        if (ownsSpeech) current?.stop()
+        invoke.resolve()
+    }
 
     @Command fun cancel_prompt(invoke: Invoke) {
         val id = invoke.getArgs().optString("requestId")
@@ -264,7 +293,7 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
         if (args.searchMode != null && args.searchMode !in dev.gitblame.voxgolem.assistant.runtime.AssistantSearchModes.values) {
             reject(invoke, "invalid_input", "Invalid search mode"); return
         }
-        if (args.requestId.isEmpty() || args.requestId.toByteArray(Charsets.UTF_8).size > 128 || args.prompt.isBlank() || args.prompt.toByteArray(Charsets.UTF_8).size > 32 * 1024) {
+        if (args.requestId.isEmpty() || args.requestId.toByteArray(Charsets.UTF_8).size > 128 || args.prompt.isBlank() || !AssistantDraftBudget.accepts(args.prompt)) {
             reject(invoke, "invalid_input", "Prompt or request ID is empty or too long"); return
         }
         val isAlive = !activity.isFinishing && !activity.isDestroyed
@@ -283,16 +312,13 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
         }
         val ended = AtomicBoolean(false)
         val replyTicket = speech.onRequestSubmitted(args.requestId)
-        acquirePromptWakeLock()
+        promptProtection.begin(args.requestId)
         val terminal: (Result<Any?>) -> Unit = { result ->
-            try {
-                if (ended.compareAndSet(false, true)) {
-                    synchronized(lock) { if (request == args.requestId) request = null }
-                    speech.onRequestResult(args.requestId, result, replyTicket)
-                    reply(invoke, result)
-                }
-            } finally {
-                releasePromptWakeLock()
+            if (ended.compareAndSet(false, true)) {
+                promptProtection.retired(args.requestId)
+                synchronized(lock) { if (request == args.requestId) request = null }
+                speech.onRequestResult(args.requestId, result, replyTicket)
+                reply(invoke, result)
             }
         }
         try {

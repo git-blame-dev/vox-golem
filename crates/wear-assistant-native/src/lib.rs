@@ -355,7 +355,7 @@ enum CallbackEvent<'a> {
     RequestDispatched,
     FirstText(u64),
     Delta(&'a str),
-    Status(&'static str),
+    Status(&'a str),
 }
 
 #[derive(Default)]
@@ -783,6 +783,70 @@ mod tests {
         }
     }
 
+    fn accept_fixture(listener: std::net::TcpListener) -> std::net::TcpStream {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((socket, _)) => {
+                    socket
+                        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                        .unwrap();
+                    socket
+                        .set_write_timeout(Some(std::time::Duration::from_secs(3)))
+                        .unwrap();
+                    return socket;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "native fixture accept deadline (including pre-dispatch failures)"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => panic!("native fixture accept: {error}"),
+            }
+        }
+    }
+
+    fn read_fixture_request(
+        socket: &mut std::net::TcpStream,
+        limit: usize,
+    ) -> (String, serde_json::Value) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 4096];
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "native complete-request deadline");
+            socket.set_read_timeout(Some(remaining)).unwrap();
+            let count = socket.read(&mut buffer).unwrap();
+            assert_ne!(count, 0, "EOF before complete native request");
+            bytes.extend_from_slice(&buffer[..count]);
+            assert!(bytes.len() <= limit);
+            if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+                let length = headers
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .unwrap()
+                    .1
+                    .trim()
+                    .parse::<usize>()
+                    .unwrap();
+                let start = end + 4;
+                assert!(length <= limit - start);
+                if bytes.len() >= start + length {
+                    return (
+                        headers.to_owned(),
+                        serde_json::from_slice(&bytes[start..start + length]).unwrap(),
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn source_kind_only_allows_absent_or_recognized_generation_zero_metadata() {
         let fixture = AuthFixture::new();
@@ -827,35 +891,8 @@ mod tests {
             listener.local_addr().unwrap()
         );
         let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            socket
-                .set_read_timeout(Some(Duration::from_secs(3)))
-                .unwrap();
-            let mut request = Vec::new();
-            let mut chunk = [0; 1024];
-            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                let count = socket.read(&mut chunk).unwrap();
-                assert!(count > 0 && request.len() < 4096);
-                request.extend_from_slice(&chunk[..count]);
-            }
-            let header_end = request
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n")
-                .unwrap()
-                + 4;
-            let headers = std::str::from_utf8(&request[..header_end]).unwrap();
-            let length = headers
-                .lines()
-                .filter_map(|line| line.split_once(':'))
-                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                .map(|(_, value)| value.trim().parse::<usize>().unwrap())
-                .unwrap();
-            assert!(header_end + length <= 4096);
-            while request.len() < header_end + length {
-                let count = socket.read(&mut chunk).unwrap();
-                assert!(count > 0);
-                request.extend_from_slice(&chunk[..count]);
-            }
+            let mut socket = accept_fixture(listener);
+            let _ = read_fixture_request(&mut socket, 4096);
             socket
                 .write_all(
                     b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -1107,36 +1144,26 @@ mod tests {
         CustomOpenAiConfig,
         std::thread::JoinHandle<serde_json::Value>,
     ) {
+        search_server_with_prefix(auth, output, delay, terminal_only, None)
+    }
+
+    fn search_server_with_prefix(
+        auth: &AuthFixture,
+        output: serde_json::Value,
+        delay: std::time::Duration,
+        terminal_only: bool,
+        prefix: Option<String>,
+    ) -> (
+        CustomOpenAiConfig,
+        std::thread::JoinHandle<serde_json::Value>,
+    ) {
         use std::io::Write;
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let endpoint = format!("http://{}/synthetic", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            socket
-                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
-                .unwrap();
-            let mut bytes = Vec::new();
-            let mut buffer = [0; 4096];
-            let request = loop {
-                let count = socket.read(&mut buffer).unwrap();
-                assert!(count > 0 && bytes.len() < request::MAX_REQUEST_BYTES);
-                bytes.extend_from_slice(&buffer[..count]);
-                if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-                    let headers = std::str::from_utf8(&bytes[..end]).unwrap();
-                    let length = headers
-                        .lines()
-                        .filter_map(|line| line.split_once(':'))
-                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                        .unwrap()
-                        .1
-                        .trim()
-                        .parse::<usize>()
-                        .unwrap();
-                    if bytes.len() >= end + 4 + length {
-                        break serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap();
-                    }
-                }
-            };
+            let mut socket = accept_fixture(listener);
+            let (_, request) =
+                read_fixture_request(&mut socket, request::MAX_REQUEST_BYTES + 16 * 1024);
             let mut body = String::new();
             if let Some(content) = output
                 .get("content")
@@ -1145,7 +1172,11 @@ mod tests {
                 .filter(|_| !terminal_only)
             {
                 let refusal = content["type"] == "refusal";
-                let event = serde_json::json!({"type": if refusal { "response.refusal.delta" } else { "response.output_text.delta" }, "delta": content[if refusal { "refusal" } else { "text" }]});
+                let delta = prefix
+                    .as_ref()
+                    .map(|prefix| serde_json::json!(prefix))
+                    .unwrap_or_else(|| content[if refusal { "refusal" } else { "text" }].clone());
+                let event = serde_json::json!({"type": if refusal { "response.refusal.delta" } else { "response.output_text.delta" }, "delta": delta});
                 body.push_str(&format!("data: {event}\r\n\r\n"));
             }
             let completed = serde_json::json!({"type":"response.completed","response":{"status":"completed","model":"synthetic-returned-model","output":[output]}});
@@ -1272,6 +1303,154 @@ mod tests {
                 .unwrap()
                 .contains(voxgolem_core::response_style::PLAIN_TEXT_POLICY));
             assert!(!sent.to_string().contains("synthetic-private-conversation"));
+        }
+    }
+
+    #[test]
+    fn review_native_search_transport_delivers_terminal_suffix_and_preserves_cancellation_and_failure(
+    ) {
+        for refusal in [false, true] {
+            for disposition in ["complete", "fail_suffix", "cancel_prefix", "cancel_suffix"] {
+                let fixture = AuthFixture::new();
+                fixture.replace("synthetic-native-suffix");
+                let kind = if refusal { "refusal" } else { "output_text" };
+                let field = if refusal { "refusal" } else { "text" };
+                let output = serde_json::json!({"type":"message","content":[{"type":kind,field:"Synthetic é 🧪"}]});
+                let (config, server) = search_server_with_prefix(
+                    &fixture,
+                    output,
+                    std::time::Duration::ZERO,
+                    false,
+                    Some("Synthetic é".into()),
+                );
+                let request = request::parse(r#"{"requestId":"synthetic-native-suffix","searchMode":"quick","conversationId":"synthetic-conversation:1","webEnabled":false,"instructions":"Synthetic policy","messages":[{"role":"user","content":"Synthetic question"}]}"#).unwrap();
+                let process = search::ProcessProvider::new(config.clone()).unwrap();
+                let (cancel, rx) = watch::channel(false);
+                let mut deltas = Vec::new();
+                let outcome = process.runtime.block_on(search::respond(
+                    &process,
+                    config,
+                    &request,
+                    rx,
+                    &mut |event| {
+                        if let CallbackEvent::Delta(delta) = event {
+                            deltas.push(delta.to_owned());
+                            if disposition == "fail_suffix" && delta == " 🧪" {
+                                return Err(ErrorCode::CallbackFailed);
+                            }
+                            if (disposition == "cancel_prefix" && delta == "Synthetic é")
+                                || (disposition == "cancel_suffix" && delta == " 🧪")
+                            {
+                                cancel.send(true).unwrap();
+                            }
+                        }
+                        Ok(())
+                    },
+                ));
+                server.join().unwrap();
+                let value: serde_json::Value = serde_json::from_str(&outcome.json()).unwrap();
+                match disposition {
+                    "complete" => {
+                        assert_eq!(value["status"], "complete");
+                        assert_eq!(value["contentType"], kind);
+                        assert_eq!(value["text"], deltas.concat());
+                        assert_eq!(deltas, ["Synthetic é", " 🧪"]);
+                    }
+                    "fail_suffix" => {
+                        assert_eq!(value["code"], "callback_failed");
+                        assert_eq!(deltas, ["Synthetic é", " 🧪"]);
+                    }
+                    "cancel_prefix" => {
+                        assert_eq!(value["status"], "cancelled");
+                        assert_eq!(deltas, ["Synthetic é"]);
+                    }
+                    "cancel_suffix" => {
+                        assert_eq!(value["status"], "cancelled");
+                        assert_eq!(deltas, ["Synthetic é", " 🧪"]);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_local_search_never_admits_callbacks_or_consumes_the_draft() {
+        for mode in ["verify", "research"] {
+            let input = serde_json::json!({"requestId":"synthetic-local-unsupported","model":"local-fast","searchMode":mode,"conversationId":"synthetic-conversation:1","instructions":"Synthetic policy","messages":[{"role":"user","content":"Synthetic preserved draft"}]}).to_string();
+            let before = input.clone();
+            let outcome = respond(
+                "synthetic-local-unsupported",
+                "/synthetic/missing/cloud-auth.json",
+                &input,
+                |_| panic!("unsupported route must reject before callback/dispatch"),
+            );
+            assert_eq!(
+                outcome.json(),
+                r#"{"status":"error","code":"invalid_request"}"#
+            );
+            assert_eq!(input, before);
+        }
+    }
+
+    #[test]
+    fn terminal_only_direct_search_and_local_routes_keep_kind_and_revision_boundaries() {
+        for route in ["direct", "search", "local"] {
+            for refusal in [false, true] {
+                let fixture = AuthFixture::new();
+                fixture.replace("synthetic-cloud-auth-must-not-be-used-locally");
+                let input = serde_json::json!({"requestId":"synthetic-terminal-matrix","model":if route == "local" {"local-fast"} else {"custom-sol-high"},"webEnabled":false,"searchMode":"quick","conversationId":"synthetic-conversation:1","instructions":"Synthetic policy","messages":[{"role":"user","content":"Synthetic question"}]}).to_string();
+                let request = request::parse(&input).unwrap();
+                let kind = if refusal { "refusal" } else { "output_text" };
+                let field = if refusal { "refusal" } else { "text" };
+                let (mut config, server) = search_server_timed(
+                    &fixture,
+                    serde_json::json!({"type":"message","content":[{"type":kind,field:"Synthetic terminal 🧪 answer"}]}),
+                    std::time::Duration::ZERO,
+                    true,
+                );
+                config.model = request.model;
+                let process = search::ProcessProvider::new(config.clone()).unwrap();
+                let (_cancel, rx) = watch::channel(false);
+                let mut text = String::new();
+                let mut callback = |event: CallbackEvent<'_>| {
+                    if let CallbackEvent::Delta(delta) = event {
+                        text.push_str(delta);
+                    }
+                    Ok(())
+                };
+                let outcome = if route == "search" {
+                    process.runtime.block_on(search::respond(
+                        &process,
+                        config,
+                        &request,
+                        rx,
+                        &mut callback,
+                    ))
+                } else {
+                    let client = process.client(config).unwrap();
+                    process
+                        .runtime
+                        .block_on(direct_response(&client, &request, rx, &mut callback))
+                };
+                let sent = server.join().unwrap();
+                assert!(sent
+                    .get("tools")
+                    .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty)));
+                let result: serde_json::Value = serde_json::from_str(&outcome.json()).unwrap();
+                assert_eq!(result["status"], "complete", "route {route}");
+                assert_eq!(result["contentType"], kind);
+                assert_eq!(result["text"], "Synthetic terminal 🧪 answer");
+                assert_eq!(
+                    text, "Synthetic terminal 🧪 answer",
+                    "visible callback must deliver exactly once"
+                );
+                if route == "local" {
+                    assert!(result.get("authRevision").is_none());
+                } else {
+                    assert!(result["authRevision"].is_string());
+                }
+            }
         }
     }
 
@@ -1595,41 +1774,13 @@ mod tests {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let endpoint = format!("http://{}/synthetic", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            socket
-                .set_read_timeout(Some(Duration::from_secs(3)))
-                .unwrap();
+            let mut socket = accept_fixture(listener);
             let mut requests = Vec::<(String, serde_json::Value)>::new();
             // All three requests must arrive on this single accepted socket.
             for round in 0..3 {
-                let mut bytes = Vec::new();
-                let mut buffer = [0; 4096];
-                loop {
-                    let count = socket.read(&mut buffer).unwrap();
-                    assert!(count > 0 && bytes.len() < request::MAX_REQUEST_BYTES);
-                    bytes.extend_from_slice(&buffer[..count]);
-                    if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-                        let headers = std::str::from_utf8(&bytes[..end])
-                            .unwrap()
-                            .to_ascii_lowercase();
-                        let length = headers
-                            .lines()
-                            .filter_map(|line| line.split_once(':'))
-                            .find(|(name, _)| *name == "content-length")
-                            .unwrap()
-                            .1
-                            .trim()
-                            .parse::<usize>()
-                            .unwrap();
-                        if bytes.len() >= end + 4 + length {
-                            requests.push((
-                                headers,
-                                serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap(),
-                            ));
-                            break;
-                        }
-                    }
-                }
+                let (headers, body) =
+                    read_fixture_request(&mut socket, request::MAX_REQUEST_BYTES + 16 * 1024);
+                requests.push((headers.to_ascii_lowercase(), body));
                 let body = if round == 1 {
                     // Invalid arguments exercise continuation without an external web request.
                     let call = serde_json::json!({"type":"function_call","id":"synthetic-item","call_id":"synthetic-call","name":"web_search","arguments":"not-json","status":"completed"});
@@ -1740,7 +1891,7 @@ mod tests {
             &mut |event| match event {
                 CallbackEvent::RequestDispatched => Ok(()),
                 CallbackEvent::Status(status) => {
-                    statuses.push(status);
+                    statuses.push(status.to_string());
                     Err(ErrorCode::CallbackFailed)
                 }
                 CallbackEvent::FirstText(_) | CallbackEvent::Delta(_) => {

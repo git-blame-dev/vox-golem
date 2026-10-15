@@ -20,7 +20,6 @@ import java.io.File
 import java.io.FileOutputStream
 import java.time.Instant
 import java.time.ZoneId
-import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 
 /** Watch adapter over the shared capture schema, SQLite repository, and PCM/WAV implementation. */
@@ -60,13 +59,7 @@ class CaptureRepository(context: Context) {
         return shared.recent(CapturePurpose.NOTE, limit)
     }
 
-    fun pendingTransfers(): List<CaptureRecord> = recordPages().flatten().filter { record ->
-        record.captureState in setOf(CaptureState.SAVED, CaptureState.INTERRUPTED) &&
-            record.purpose == CapturePurpose.NOTE &&
-            (record.transferState != TransferState.PHONE_ARCHIVED ||
-                (record.captureState == CaptureState.SAVED && !record.completionNotified && record.recognitionState != RecognitionState.NO_SPEECH)) &&
-            record.localAudioPath?.endsWith(".wav") == true
-    }.toList()
+    fun pendingTransfers(): List<CaptureRecord> = shared.pendingNoteTransfers()
 
     private fun recordPages(): Sequence<List<CaptureRecord>> = generateSequence(0) { it + 500 }
         .map { shared.list(it, 500) }.takeWhile { it.isNotEmpty() }
@@ -366,41 +359,8 @@ class CaptureRepository(context: Context) {
     private fun recoveryAttemptsFile(id: String) = File(File(File(appContext.filesDir, "captures"), id), "wav-recovery-attempts")
 
     private fun manifestFromWav(record: CaptureRecord, wav: File): dev.gitblame.voxgolem.capture.CaptureManifest? {
-        val frameBytes = record.format.channels * record.format.bitsPerSample / 8
-        if (wav.length() < 44 || (wav.length() - 44) % frameBytes != 0L) return null
-        val dataBytes = wav.length() - 44
-        val header = ByteArray(44)
-        wav.inputStream().use { input ->
-            var read = 0
-            while (read < header.size) {
-                val count = input.read(header, read, header.size - read)
-                if (count < 0) return null
-                read += count
-            }
-        }
-        if (String(header, 0, 4, Charsets.US_ASCII) != "RIFF" ||
-            String(header, 8, 4, Charsets.US_ASCII) != "WAVE" ||
-            String(header, 12, 4, Charsets.US_ASCII) != "fmt " ||
-            String(header, 36, 4, Charsets.US_ASCII) != "data" ||
-            le32(header, 4) != wav.length() - 8 || le16(header, 20) != 1 ||
-            le16(header, 22) != record.format.channels || le32(header, 24) != record.format.sampleRate.toLong() ||
-            le16(header, 34) != record.format.bitsPerSample || le32(header, 40) != dataBytes) return null
-        return dev.gitblame.voxgolem.capture.CaptureManifest(
-            captureId = record.captureId,
-            format = record.format,
-            frameCount = (wav.length() - 44) / frameBytes,
-            pcmByteLength = wav.length() - 44,
-            wavByteLength = wav.length(),
-            sha256 = sha256(wav),
-        ).takeIf(CaptureProtocol::validateManifest)
+        return runCatching { dev.gitblame.voxgolem.capture.CaptureFileIntegrity.canonicalManifest(record.captureId, wav, record.format) }.getOrNull()
     }
-
-    private fun le16(bytes: ByteArray, offset: Int): Int =
-        (bytes[offset].toInt() and 0xff) or ((bytes[offset + 1].toInt() and 0xff) shl 8)
-
-    private fun le32(bytes: ByteArray, offset: Int): Long =
-        (bytes[offset].toLong() and 0xff) or ((bytes[offset + 1].toLong() and 0xff) shl 8) or
-            ((bytes[offset + 2].toLong() and 0xff) shl 16) or ((bytes[offset + 3].toLong() and 0xff) shl 24)
 
     private fun File.readTextOrZero(): Int =
         if (!exists()) 0 else runCatching { readText().trim().toInt().coerceIn(0, MAX_RECOVERY_FINALIZATION_ATTEMPTS) }.getOrDefault(0)
@@ -412,19 +372,6 @@ class CaptureRepository(context: Context) {
             output.fd.sync()
         }
         check(temp.renameTo(this)) { "Could not persist WAV recovery attempt" }
-    }
-
-    private fun sha256(file: File): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        file.inputStream().buffered().use { input ->
-            val buffer = ByteArray(16 * 1024)
-            while (true) {
-                val count = input.read(buffer)
-                if (count < 0) break
-                digest.update(buffer, 0, count)
-            }
-        }
-        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     private fun TransferState.maxWith(other: TransferState): TransferState =

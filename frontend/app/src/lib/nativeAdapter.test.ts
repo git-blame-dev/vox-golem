@@ -39,7 +39,11 @@ describe('native shortcut adapter contract', () => {
 
   it('parses frames with the actual producer field names and readiness-before-dictation ordering', () => {
     const producer = source('crates/assistant-plugin/android/src/main/java/dev/gitblame/voxgolem/assistant/phone/PhoneSpeechSession.kt')
-    expect(producer.indexOf('.put("kind", "shortcut_ready")')).toBeLessThan(producer.indexOf('.put("kind", "dictation")'))
+    const readiness = producer.indexOf('.put("kind", "shortcut_ready")')
+    const dictation = producer.indexOf('.put("kind", "dictation")')
+    expect(readiness).toBeGreaterThanOrEqual(0)
+    expect(dictation).toBeGreaterThanOrEqual(0)
+    expect(readiness).toBeLessThan(dictation)
     for (const field of ['sessionId', 'requestId', 'text', 'draft', 'shortcutPhase']) expect(producer).toContain(`.put("${field}",`)
     const sessionId = 'synthetic-session'
     expect(parseAndroidVoiceEvent({ kind: 'shortcut_ready', sessionId })).toEqual({ kind: 'shortcut_ready', sessionId })

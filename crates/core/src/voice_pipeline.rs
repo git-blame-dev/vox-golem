@@ -265,6 +265,92 @@ pub fn apply_voice_pipeline_event(
     }
 }
 
+/// A validated frame update. Dropping it leaves the pipeline unchanged, allowing
+/// callers to complete fallible runtime work before committing captured audio.
+pub struct VoiceFrameUpdate<'a> {
+    state: &'a mut VoicePipelineState,
+    frame: &'a [f32],
+    next_session: SessionState,
+    begin_without_preroll: bool,
+    listening: bool,
+}
+
+impl VoiceFrameUpdate<'_> {
+    pub fn commit(self) {
+        if self.begin_without_preroll {
+            self.state.capture.begin_utterance_without_preroll();
+        }
+        if self.listening {
+            // Preparation checked the actual buffer capacity and this plan holds
+            // its exclusive borrow until commit, so the append cannot overflow.
+            self.state
+                .capture
+                .record_listening_frame(self.frame)
+                .expect("frame capacity validated under exclusive pipeline borrow");
+        } else {
+            self.state.capture.record_sleeping_frame(self.frame);
+        }
+        self.state.session = self.next_session;
+    }
+}
+
+pub fn prepare_audio_frame_update<'a>(
+    state: &'a mut VoicePipelineState,
+    config: VoicePipelineConfig,
+    frame: &'a [f32],
+    wake_at: Option<u64>,
+    speech_at: Option<u64>,
+) -> Result<VoiceFrameUpdate<'a>, VoicePipelineError> {
+    let begin_without_preroll =
+        state.session.runtime().phase() == RuntimePhase::Sleeping && wake_at.is_some();
+    let mut next_session = if begin_without_preroll {
+        apply_session_event(
+            &state.session,
+            config.session(),
+            SessionEvent::WakeWordDetected {
+                now_ms: wake_at.expect("wake timestamp checked above"),
+            },
+        )
+        .map_err(VoicePipelineError::Session)?
+    } else {
+        state.session.clone()
+    };
+    let listening = next_session.runtime().phase() == RuntimePhase::Listening;
+    if listening && (begin_without_preroll || state.capture.capturing_utterance()) {
+        let attempted_total = if begin_without_preroll {
+            frame.len()
+        } else {
+            state.capture.utterance_len().saturating_add(frame.len())
+        };
+        let max_samples = state.capture.max_utterance_samples();
+        if attempted_total > max_samples {
+            return Err(VoicePipelineError::Capture(
+                voxgolem_audio::buffers::AudioBufferError::CapacityExceeded {
+                    max_samples,
+                    attempted_total,
+                },
+            ));
+        }
+    }
+    if listening {
+        if let Some(now_ms) = speech_at {
+            next_session = apply_session_event(
+                &next_session,
+                config.session(),
+                SessionEvent::SpeechDetected { now_ms },
+            )
+            .map_err(VoicePipelineError::Session)?;
+        }
+    }
+    Ok(VoiceFrameUpdate {
+        state,
+        frame,
+        next_session,
+        begin_without_preroll,
+        listening,
+    })
+}
+
 pub fn ingest_audio_frame(
     state: &VoicePipelineState,
     config: VoicePipelineConfig,
@@ -281,6 +367,7 @@ pub fn ingest_audio_frame(
 
 #[cfg(test)]
 mod tests {
+    use super::prepare_audio_frame_update;
     use crate::runtime::RuntimePhase;
     use crate::session::SessionConfig;
     use crate::turn_capture::TurnCaptureConfig;
@@ -302,6 +389,205 @@ mod tests {
             TurnCaptureConfig::new(4, 16).expect("valid turn capture config"),
             PARAKEET_SAMPLE_RATE_HZ,
         )
+    }
+
+    fn immutable_frame_update(
+        state: &VoicePipelineState,
+        config: VoicePipelineConfig,
+        frame: &[f32],
+        wake_at: Option<u64>,
+        speech_at: Option<u64>,
+    ) -> Result<VoicePipelineState, VoicePipelineError> {
+        let mut next = state.clone();
+        if state.session().runtime().phase() == RuntimePhase::Sleeping {
+            if let Some(now_ms) = wake_at {
+                next = apply_voice_pipeline_event(
+                    &next,
+                    config,
+                    VoicePipelineEvent::WakeWordDetected { now_ms },
+                )?
+                .0;
+            }
+        }
+        next = ingest_audio_frame(&next, config, frame.to_vec())?;
+        if next.session().runtime().phase() == RuntimePhase::Listening {
+            if let Some(now_ms) = speech_at {
+                next = apply_voice_pipeline_event(
+                    &next,
+                    config,
+                    VoicePipelineEvent::SpeechDetected { now_ms },
+                )?
+                .0;
+            }
+        }
+        Ok(next)
+    }
+
+    fn assert_same_state(actual: &VoicePipelineState, expected: &VoicePipelineState) {
+        assert_eq!(actual.session(), expected.session());
+        assert_eq!(
+            actual.capture().utterance_samples(),
+            expected.capture().utterance_samples()
+        );
+        assert_eq!(
+            actual.capture().capturing_utterance(),
+            expected.capture().capturing_utterance()
+        );
+        assert_eq!(
+            actual.capture().max_utterance_samples(),
+            expected.capture().max_utterance_samples()
+        );
+        // Observe the complete private preroll through the real capture API.
+        let mut actual_capture = actual.capture().clone();
+        let mut expected_capture = expected.capture().clone();
+        assert_eq!(
+            actual_capture.begin_utterance(),
+            expected_capture.begin_utterance()
+        );
+        assert_eq!(
+            actual_capture.utterance_samples(),
+            expected_capture.utterance_samples()
+        );
+    }
+
+    #[test]
+    fn prepared_frames_match_immutable_events_across_phases_and_overflow() {
+        let config = pipeline_config();
+        let initial = VoicePipelineState::new(config).unwrap();
+        let ready =
+            apply_voice_pipeline_event(&initial, config, VoicePipelineEvent::StartupValidated)
+                .unwrap()
+                .0;
+        let listening = immutable_frame_update(&ready, config, &[0.25], Some(100), None).unwrap();
+        let mut inactive = listening.clone();
+        inactive.capture.reset();
+        let error = apply_voice_pipeline_event(
+            &initial,
+            config,
+            VoicePipelineEvent::StartupFailed {
+                message: "synthetic failure".into(),
+            },
+        )
+        .unwrap()
+        .0;
+        let executing =
+            apply_voice_pipeline_event(&ready, config, VoicePipelineEvent::SubmitPrompt)
+                .unwrap()
+                .0;
+        for state in [initial, ready, listening, inactive, error, executing] {
+            for (frame, wake, speech) in [
+                (vec![0.5, -0.5], None, None),
+                (vec![2.0, -2.0], Some(200), Some(250)),
+                (vec![0.0; 17], Some(200), Some(250)),
+                (vec![], Some(50), Some(1)),
+            ] {
+                let expected = immutable_frame_update(&state, config, &frame, wake, speech);
+                let mut actual = state.clone();
+                match prepare_audio_frame_update(&mut actual, config, &frame, wake, speech) {
+                    Ok(plan) => {
+                        plan.commit();
+                        assert_same_state(&actual, &expected.unwrap());
+                    }
+                    Err(error) => {
+                        assert_eq!(error, expected.unwrap_err());
+                        assert_same_state(&actual, &state);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dropped_plan_and_wake_overflow_preserve_every_sample_and_session() {
+        let config = pipeline_config();
+        let mut state = apply_voice_pipeline_event(
+            &VoicePipelineState::new(config).unwrap(),
+            config,
+            VoicePipelineEvent::StartupValidated,
+        )
+        .unwrap()
+        .0;
+        state.capture.record_sleeping_frame(&[0.1, 0.2, 0.3]);
+        // Retained old capture must not be cleared by a planned wake.
+        state.capture.begin_utterance_without_preroll();
+        state.capture.record_listening_frame(&[0.75]).unwrap();
+        let before = state.clone();
+        let pointer = state.capture().utterance_samples().as_ptr();
+        {
+            let _uncommitted =
+                prepare_audio_frame_update(&mut state, config, &[0.5], Some(100), None).unwrap();
+            // Models any caller-side clock/reset error before commit.
+        }
+        assert_same_state(&state, &before);
+        assert_eq!(pointer, state.capture().utterance_samples().as_ptr());
+        let larger_config = VoicePipelineConfig::new(
+            config.session(),
+            TurnCaptureConfig::new(4, 64).unwrap(),
+            config.sample_rate_hz(),
+        );
+        assert!(matches!(
+            prepare_audio_frame_update(&mut state, larger_config, &[0.0; 17], Some(100), None),
+            Err(VoicePipelineError::Capture(
+                voxgolem_audio::buffers::AudioBufferError::CapacityExceeded {
+                    max_samples: 16,
+                    attempted_total: 17
+                }
+            ))
+        ));
+        assert_same_state(&state, &before);
+        assert_eq!(pointer, state.capture().utterance_samples().as_ptr());
+    }
+
+    #[test]
+    fn long_frame_sequence_retains_reserved_capture_and_matches_immutable_audio() {
+        let base = pipeline_config();
+        let config = VoicePipelineConfig::new(
+            base.session(),
+            TurnCaptureConfig::new(4, 512).unwrap(),
+            base.sample_rate_hz(),
+        );
+        let mut state = apply_voice_pipeline_event(
+            &VoicePipelineState::new(config).unwrap(),
+            config,
+            VoicePipelineEvent::StartupValidated,
+        )
+        .unwrap()
+        .0;
+        for _ in 0..32 {
+            prepare_audio_frame_update(&mut state, config, &[0.9; 8], None, None)
+                .unwrap()
+                .commit();
+            assert_eq!(state.capture().preroll_len(), 4);
+        }
+        let mut reference = state.clone();
+        let mut audio = Vec::new();
+        let mut pointer = None;
+        for index in 0..128 {
+            let frame = [index as f32 / 128.0; 4];
+            let wake = (index == 0).then_some(100);
+            let speech = (index > 0).then_some(100 + index);
+            reference = immutable_frame_update(&reference, config, &frame, wake, speech).unwrap();
+            prepare_audio_frame_update(&mut state, config, &frame, wake, speech)
+                .unwrap()
+                .commit();
+            audio.extend_from_slice(&frame);
+            if let Some(pointer) = pointer {
+                assert_eq!(state.capture().utterance_samples().as_ptr(), pointer);
+            } else {
+                // Admission may restore capacity lost by the immutable startup clone.
+                pointer = Some(state.capture().utterance_samples().as_ptr());
+            }
+            assert_eq!(state.capture().utterance_samples(), audio);
+            assert_same_state(&state, &reference);
+            assert!(state.capture().utterance_len() <= state.capture().max_utterance_samples());
+        }
+        let before = state.clone();
+        drop(prepare_audio_frame_update(&mut state, config, &[], None, Some(300)).unwrap());
+        assert_same_state(&state, &before);
+        assert!(prepare_audio_frame_update(&mut state, config, &[0.0], None, Some(300)).is_err());
+        assert_same_state(&state, &before);
+        assert_eq!(state.capture().utterance_len(), 512);
+        assert_eq!(Some(state.capture().utterance_samples().as_ptr()), pointer);
     }
 
     #[test]

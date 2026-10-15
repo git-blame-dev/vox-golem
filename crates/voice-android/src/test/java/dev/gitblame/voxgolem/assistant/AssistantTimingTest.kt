@@ -139,15 +139,16 @@ class AssistantTimingTest {
         val events = mutableListOf<AssistantTiming.Event>()
         val timing = AssistantTiming.begin(context, Operation.TTS_UTTERANCE, { 0L }, AssistantTiming.Sink { events += it })
         val start = CountDownLatch(1)
-        val done = CountDownLatch(8)
-        repeat(8) {
-            Thread {
-                try { start.await(); timing.mark(Stage.ON_START); timing.finish(Stage.ON_DONE) }
-                finally { done.countDown() }
-            }.start()
-        }
-        start.countDown()
-        assertTrue(done.await(5, TimeUnit.SECONDS))
+        val executor = java.util.concurrent.Executors.newFixedThreadPool(8)
+        try {
+            val tasks = (0 until 8).map {
+                executor.submit {
+                    check(start.await(2, TimeUnit.SECONDS)); timing.mark(Stage.ON_START); timing.finish(Stage.ON_DONE)
+                }
+            }
+            start.countDown()
+            tasks.forEach { it.get(5, TimeUnit.SECONDS) }
+        } finally { start.countDown(); executor.shutdownNow(); assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS)) }
         assertEquals(1, events.count { it.kind == Kind.END })
         assertEquals(Kind.END, events.last().kind)
         assertTrue(events.count { it.stage == Stage.ON_START } <= 1)

@@ -64,7 +64,8 @@ describe('capture IPC adapter', () => {
         if (command === 'plugin:capture|snapshot') return { available: true, notesFolderUri: null, captures: [record()], error: null }
         if (command === 'plugin:capture|list_captures') return [record()]
         if (command === 'plugin:capture|enable_capture') return { available: true, setupRequired: false, notesFolderUri: null, captures: [record()], error: null }
-        return null
+        if (command === 'plugin:capture|play_capture' || command === 'plugin:capture|update_transcript') return null
+        throw new Error(`Unexpected capture fixture command: ${command}`)
       },
     }
     const capture = await import('./captures')
@@ -72,13 +73,17 @@ describe('capture IPC adapter', () => {
     expect(await capture.listCaptures(100, 20)).toHaveLength(1)
     expect((await capture.enableCapture()).setupRequired).toBe(false)
     await capture.playCapture('synthetic-capture-1')
+    await capture.updateCaptureTranscript('synthetic-capture-1', 'Synthetic correction', 2)
     expect(calls).toEqual([
       ['plugin:capture|snapshot', undefined],
       ['plugin:capture|list_captures', { offset: 100, limit: 20 }],
       ['plugin:capture|enable_capture', undefined],
       ['plugin:capture|play_capture', { captureId: 'synthetic-capture-1' }],
+      ['plugin:capture|update_transcript', { captureId: 'synthetic-capture-1', text: 'Synthetic correction', expectedVersion: 2 }],
     ])
     await expect(capture.listCaptures(-1)).rejects.toThrow('Capture page is invalid')
+    await expect(capture.updateCaptureTranscript('synthetic-capture-1', 'Synthetic correction', -1)).rejects.toThrow('Capture correction version is invalid')
+    expect(calls).toHaveLength(5)
   })
 
   it('does not invoke native capture IPC outside Android', async () => {

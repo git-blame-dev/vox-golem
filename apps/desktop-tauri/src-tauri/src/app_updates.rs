@@ -485,6 +485,8 @@ pub(crate) struct PendingUpdate {
     session: Mutex<UpdaterSession<Update>>,
     auto_download_enabled: AtomicBool,
     auto_install_enabled: AtomicBool,
+    automatic_install_waiter: Mutex<AutomaticInstallOwnership>,
+    policy_changed: tokio::sync::Notify,
 }
 
 impl Default for PendingUpdate {
@@ -493,6 +495,8 @@ impl Default for PendingUpdate {
             session: Mutex::new(UpdaterSession::new(String::new(), true, true)),
             auto_download_enabled: AtomicBool::new(true),
             auto_install_enabled: AtomicBool::new(true),
+            automatic_install_waiter: Mutex::new(AutomaticInstallOwnership::default()),
+            policy_changed: tokio::sync::Notify::new(),
         }
     }
 }
@@ -543,6 +547,7 @@ pub(crate) fn discard_update(
         session.snapshot.clone()
     };
     emit_snapshot(&app, &snapshot);
+    pending.policy_changed.notify_waiters();
     Ok(snapshot)
 }
 
@@ -584,6 +589,7 @@ pub(crate) fn set_auto_update_install(
         session.snapshot.clone()
     };
     emit_snapshot(&app, &snapshot);
+    pending.policy_changed.notify_waiters();
     if enabled {
         start_automatic_install(app);
     }
@@ -604,9 +610,30 @@ async fn perform_install(
     pending: &PendingUpdate,
     app_state: &crate::AppState,
 ) -> Result<UpdateSnapshot, String> {
+    perform_install_reserved(app, pending, app_state, None).await
+}
+
+async fn perform_install_reserved(
+    app: &AppHandle,
+    pending: &PendingUpdate,
+    app_state: &crate::AppState,
+    reserved: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+) -> Result<UpdateSnapshot, String> {
     crate::ensure_update_installation_is_idle(app_state)?;
+    let automatic = reserved.is_some();
     let (id, update, bytes, metadata, installing) = {
         let mut session = lock_session(pending)?;
+        if automatic
+            && !should_automatically_install(
+                &session,
+                pending.auto_install_enabled.load(Ordering::Acquire),
+                true,
+            )
+        {
+            return Err(String::from(
+                "automatic installation was deferred or superseded",
+            ));
+        }
         session
             .install_exit
             .reserve_installation()
@@ -627,7 +654,10 @@ async fn perform_install(
     };
     emit_snapshot(app, &installing);
 
-    let installation_guard = match crate::begin_update_installation(app_state) {
+    let installation_guard = match reserved
+        .map(Ok)
+        .unwrap_or_else(|| crate::begin_update_installation(app_state))
+    {
         Ok(guard) => guard,
         Err(error) => {
             restore_install(pending, id, update, bytes, metadata, error.clone())?;
@@ -888,15 +918,161 @@ async fn perform_check(
     Ok(snapshot)
 }
 
-async fn attempt_automatic_install(app: &AppHandle, pending: &PendingUpdate) {
-    let app_state = app.state::<crate::AppState>();
-    let idle = crate::ensure_update_installation_is_idle(&app_state).is_ok();
-    let enabled = pending.auto_install_enabled.load(Ordering::Acquire);
-    let should_install = lock_session(pending)
-        .map(|session| should_automatically_install(&session, enabled, idle))
-        .unwrap_or(false);
-    if should_install {
-        let _ = perform_install(app, pending, &app_state).await;
+fn attempt_automatic_install<'a>(
+    app: &'a AppHandle,
+    pending: &'a PendingUpdate,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    // The boxed boundary also bounds the type of a cancellation replacement task.
+    Box::pin(async move {
+        if !lock_install_ownership(&pending.automatic_install_waiter).request() {
+            return;
+        }
+        let app_state = app.state::<crate::AppState>();
+        let mut owner = AutomaticInstallOwner::new(&pending.automatic_install_waiter, || {
+            let app = app.clone();
+            schedule_install_replacement(&app_state.exit_cleanup_started, async move {
+                let pending = app.state::<PendingUpdate>();
+                attempt_automatic_install(&app, &pending).await;
+            });
+        });
+        loop {
+            if let Some(guard) = wait_for_automatic_install(
+                &pending.session,
+                &pending.auto_install_enabled,
+                &pending.policy_changed,
+                &app_state,
+            )
+            .await
+            {
+                let _ = perform_install_reserved(app, pending, &app_state, Some(guard)).await;
+            }
+            // A failure does not itself request a retry. Only another explicit
+            // attempt earns a fresh policy/resource check under retained ownership.
+            if !owner.complete_or_rerun() {
+                return;
+            }
+        }
+    })
+}
+
+fn schedule_install_replacement(
+    exit_started: &AtomicBool,
+    replacement: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    if !exit_started.load(Ordering::Acquire) {
+        tauri::async_runtime::spawn(replacement);
+    }
+}
+
+#[derive(Default)]
+struct AutomaticInstallOwnership {
+    running: bool,
+    rerun: bool,
+}
+
+impl AutomaticInstallOwnership {
+    fn request(&mut self) -> bool {
+        if self.running {
+            self.rerun = true;
+            false
+        } else {
+            self.running = true;
+            self.rerun = false;
+            true
+        }
+    }
+
+    fn complete_or_rerun(&mut self) -> bool {
+        if std::mem::take(&mut self.rerun) {
+            true
+        } else {
+            self.running = false;
+            false
+        }
+    }
+
+    fn abandon(&mut self) -> bool {
+        self.running = false;
+        std::mem::take(&mut self.rerun)
+    }
+}
+
+fn lock_install_ownership(
+    ownership: &Mutex<AutomaticInstallOwnership>,
+) -> std::sync::MutexGuard<'_, AutomaticInstallOwnership> {
+    ownership
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+struct AutomaticInstallOwner<'a, F: FnOnce()> {
+    ownership: &'a Mutex<AutomaticInstallOwnership>,
+    on_pending_abandon: Option<F>,
+}
+
+impl<'a, F: FnOnce()> AutomaticInstallOwner<'a, F> {
+    fn new(ownership: &'a Mutex<AutomaticInstallOwnership>, on_pending_abandon: F) -> Self {
+        Self {
+            ownership,
+            on_pending_abandon: Some(on_pending_abandon),
+        }
+    }
+
+    fn complete_or_rerun(&mut self) -> bool {
+        let rerun = lock_install_ownership(self.ownership).complete_or_rerun();
+        if !rerun {
+            // No suspension between relinquishing ownership and disarming Drop.
+            self.on_pending_abandon = None;
+        }
+        rerun
+    }
+}
+
+impl<F: FnOnce()> Drop for AutomaticInstallOwner<'_, F> {
+    fn drop(&mut self) {
+        if let Some(schedule) = self.on_pending_abandon.take() {
+            let pending = lock_install_ownership(self.ownership).abandon();
+            if pending {
+                // Scheduling occurs after releasing the ownership mutex.
+                schedule();
+            }
+        }
+    }
+}
+
+async fn wait_for_automatic_install<U>(
+    session: &Mutex<UpdaterSession<U>>,
+    enabled: &AtomicBool,
+    policy_changed: &tokio::sync::Notify,
+    app_state: &crate::AppState,
+) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
+    loop {
+        // Register before observing state so retirement between observation and
+        // suspension cannot strand a retained verified download.
+        let activity = app_state.update_installation_gate.notified();
+        let prompt = app_state.prompt_cleanup.notify.notified();
+        let prefetch = app_state.prefetch_cleanup.notify.notified();
+        let policy = policy_changed.notified();
+        if app_state.exit_cleanup_started.load(Ordering::Acquire)
+            || !session
+                .lock()
+                .map(|session| {
+                    should_automatically_install(&session, enabled.load(Ordering::Acquire), true)
+                })
+                .unwrap_or(false)
+        {
+            return None;
+        }
+        if crate::ensure_update_installation_is_idle(app_state).is_ok() {
+            if let Ok(guard) = crate::begin_update_installation(app_state) {
+                if crate::ensure_update_installation_is_idle(app_state).is_ok() {
+                    return Some(guard);
+                }
+            }
+        }
+        tokio::select! {
+            _ = activity => {}, _ = prompt => {}, _ = prefetch => {}, _ = policy => {},
+        }
     }
 }
 
@@ -1026,6 +1202,285 @@ mod tests {
             version: String::from("2.0.0"),
             notes: Some(String::new()),
         }
+    }
+
+    fn ready_session() -> Mutex<UpdaterSession<()>> {
+        let mut ready = session();
+        ready.resource = Some(UpdateResource::Ready {
+            update: (),
+            bytes: vec![1],
+            metadata: metadata(),
+        });
+        ready.snapshot.phase = UpdatePhase::Ready;
+        Mutex::new(ready)
+    }
+
+    fn idle_runtime() -> crate::AppState {
+        crate::build_nonfatal_config_error_app_state(
+            crate::default_voice_pipeline_config(),
+            crate::embedded_cue_asset_paths(),
+            "synthetic absent assets".into(),
+        )
+    }
+
+    #[tokio::test]
+    async fn reenable_before_owner_retirement_keeps_a_waiter() {
+        let state = idle_runtime();
+        let session = ready_session();
+        let enabled = AtomicBool::new(false);
+        let policy = tokio::sync::Notify::new();
+        let ownership = Mutex::new(AutomaticInstallOwnership::default());
+        assert!(lock_install_ownership(&ownership).request());
+        let mut owner = AutomaticInstallOwner::new(&ownership, || {
+            panic!("normal completion must not schedule")
+        });
+        assert!(
+            wait_for_automatic_install(&session, &enabled, &policy, &state)
+                .await
+                .is_none()
+        );
+        enabled.store(true, Ordering::Release);
+        assert!(!lock_install_ownership(&ownership).request());
+        assert!(
+            owner.complete_or_rerun(),
+            "reenable must retain an installation owner"
+        );
+        assert!(lock_install_ownership(&ownership).running);
+        let lease = state.update_installation_gate.operation().unwrap();
+        let wait = wait_for_automatic_install(&session, &enabled, &policy, &state);
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(wait.as_mut()).is_pending());
+        drop(lease);
+        let installation = tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .unwrap()
+            .unwrap();
+        session
+            .lock()
+            .unwrap()
+            .reserve(UpdateOperation::Install, false)
+            .unwrap();
+        assert!(
+            wait_for_automatic_install(&session, &enabled, &policy, &state)
+                .await
+                .is_none()
+        );
+        assert!(!owner.complete_or_rerun());
+        drop(owner);
+        assert!(!lock_install_ownership(&ownership).running);
+        drop(installation);
+    }
+
+    #[test]
+    fn normal_failure_does_not_retry_and_disarmed_owner_cannot_clear_a_successor() {
+        let ownership = Mutex::new(AutomaticInstallOwnership::default());
+        assert!(lock_install_ownership(&ownership).request());
+        let mut owner = AutomaticInstallOwner::new(&ownership, || panic!("no pending request"));
+        // Retirement is identical after an installer failure or an ineligible policy check.
+        assert!(!owner.complete_or_rerun());
+        assert!(lock_install_ownership(&ownership).request());
+        drop(owner);
+        assert!(lock_install_ownership(&ownership).running);
+        assert!(!lock_install_ownership(&ownership).complete_or_rerun());
+    }
+
+    #[test]
+    fn cancellation_without_pending_request_only_releases_ownership() {
+        let ownership = Mutex::new(AutomaticInstallOwnership::default());
+        assert!(lock_install_ownership(&ownership).request());
+        drop(AutomaticInstallOwner::new(&ownership, || {
+            panic!("no replacement without a request")
+        }));
+        assert!(lock_install_ownership(&ownership).request());
+    }
+
+    #[tokio::test]
+    async fn pending_rerun_rechecks_defer_and_exit_before_reserving() {
+        for exit in [false, true] {
+            let state = idle_runtime();
+            let session = ready_session();
+            let ownership = Mutex::new(AutomaticInstallOwnership::default());
+            assert!(lock_install_ownership(&ownership).request());
+            let mut owner = AutomaticInstallOwner::new(&ownership, || panic!("normal retirement"));
+            assert!(!lock_install_ownership(&ownership).request());
+            if exit {
+                crate::begin_exit_cleanup(&state);
+            } else {
+                session.lock().unwrap().defer().unwrap();
+            }
+            assert!(owner.complete_or_rerun());
+            assert!(wait_for_automatic_install(
+                &session,
+                &AtomicBool::new(true),
+                &tokio::sync::Notify::new(),
+                &state,
+            )
+            .await
+            .is_none());
+            assert!(!owner.complete_or_rerun());
+            assert!(!lock_install_ownership(&ownership).running);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_owner_schedules_pending_replacement_that_waits_for_retirement() {
+        let ownership = std::sync::Arc::new(Mutex::new(AutomaticInstallOwnership::default()));
+        let state = std::sync::Arc::new(idle_runtime());
+        let session = std::sync::Arc::new(ready_session());
+        let lease = state.update_installation_gate.operation().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (replacement_tx, replacement_rx) = tokio::sync::oneshot::channel();
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+        let cancelled_ownership = std::sync::Arc::clone(&ownership);
+        let worker = tokio::spawn(async move {
+            assert!(lock_install_ownership(&cancelled_ownership).request());
+            let replacement_ownership = std::sync::Arc::clone(&cancelled_ownership);
+            let _owner = AutomaticInstallOwner::new(&cancelled_ownership, move || {
+                // Simulated AppHandle scheduling callback; the real ownership guard,
+                // Tauri scheduler, policy wait and writer reservation are exercised.
+                schedule_install_replacement(&AtomicBool::new(false), async move {
+                    assert!(lock_install_ownership(&replacement_ownership).request());
+                    let mut replacement =
+                        AutomaticInstallOwner::new(&replacement_ownership, || {
+                            panic!("no further request")
+                        });
+                    let enabled = AtomicBool::new(true);
+                    let policy = tokio::sync::Notify::new();
+                    let wait = wait_for_automatic_install(&session, &enabled, &policy, &state);
+                    tokio::pin!(wait);
+                    assert!(futures_util::poll!(wait.as_mut()).is_pending());
+                    let _ = waiting_tx.send(());
+                    let installation = wait.await.unwrap();
+                    let reserved = session
+                        .lock()
+                        .unwrap()
+                        .reserve(UpdateOperation::Install, false);
+                    assert!(!replacement.complete_or_rerun());
+                    drop(installation);
+                    let _ = replacement_tx.send(reserved);
+                });
+            });
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let started = tokio::time::timeout(Duration::from_secs(5), started_rx).await;
+        let pending = if started.is_ok() {
+            !lock_install_ownership(&ownership).request()
+        } else {
+            false
+        };
+        worker.abort();
+        let cancelled = tokio::time::timeout(Duration::from_secs(5), worker).await;
+        let waiting = tokio::time::timeout(Duration::from_secs(5), waiting_rx).await;
+        // Release the activity even when a setup assertion will fail.
+        drop(lease);
+        started.unwrap().unwrap();
+        assert!(pending);
+        assert!(cancelled.unwrap().unwrap_err().is_cancelled());
+        waiting.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), replacement_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!lock_install_ownership(&ownership).running);
+    }
+
+    #[tokio::test]
+    async fn pending_cancellation_during_exit_does_not_schedule_a_replacement() {
+        let ownership = Mutex::new(AutomaticInstallOwnership::default());
+        assert!(lock_install_ownership(&ownership).request());
+        assert!(!lock_install_ownership(&ownership).request());
+        let exit_started = AtomicBool::new(true);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        drop(AutomaticInstallOwner::new(&ownership, || {
+            schedule_install_replacement(&exit_started, async move {
+                let _ = started_tx.send(());
+            });
+        }));
+        assert!(!lock_install_ownership(&ownership).running);
+        assert!(tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .unwrap()
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn retained_download_waits_for_retirement_then_reserves_installation_once() {
+        let state = idle_runtime();
+        let session = ready_session();
+        let enabled = AtomicBool::new(true);
+        let policy = tokio::sync::Notify::new();
+        let lease = state.update_installation_gate.operation().unwrap();
+        let wait = wait_for_automatic_install(&session, &enabled, &policy, &state);
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(wait.as_mut()).is_pending());
+        drop(lease);
+        let installation = tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .unwrap()
+            .expect("retirement must wake the retained download");
+        assert!(state.update_installation_gate.operation().is_err());
+        session
+            .lock()
+            .unwrap()
+            .reserve(UpdateOperation::Install, false)
+            .unwrap();
+        assert!(
+            wait_for_automatic_install(&session, &enabled, &policy, &state)
+                .await
+                .is_none()
+        );
+        drop(installation);
+    }
+
+    #[tokio::test]
+    async fn disable_defer_and_exit_cancel_idle_wait_without_retiring_work() {
+        for action in ["disable", "defer", "exit"] {
+            let state = idle_runtime();
+            let session = ready_session();
+            let enabled = AtomicBool::new(true);
+            let policy = tokio::sync::Notify::new();
+            let lease = state.update_installation_gate.operation().unwrap();
+            let wait = wait_for_automatic_install(&session, &enabled, &policy, &state);
+            tokio::pin!(wait);
+            assert!(futures_util::poll!(wait.as_mut()).is_pending());
+            match action {
+                "disable" => enabled.store(false, Ordering::Release),
+                "defer" => session.lock().unwrap().defer().unwrap(),
+                "exit" => {
+                    crate::begin_exit_cleanup(&state);
+                }
+                _ => unreachable!(),
+            }
+            policy.notify_waiters();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), wait)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{action}"
+            );
+            assert!(state.update_installation_gate.installation().is_err());
+            drop(lease);
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_download_waits_for_detached_prompt_cleanup() {
+        let state = idle_runtime();
+        let session = ready_session();
+        let enabled = AtomicBool::new(true);
+        let policy = tokio::sync::Notify::new();
+        let cleanup = state.prompt_cleanup.register();
+        let wait = wait_for_automatic_install(&session, &enabled, &policy, &state);
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(wait.as_mut()).is_pending());
+        drop(cleanup);
+        assert!(tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[test]

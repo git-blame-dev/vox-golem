@@ -279,9 +279,9 @@ class SyntheticKeyboardDraftFixtureTest {
                         matchesFixture(engine.snapshot(), conversation) && engine.snapshot().foreground
                     }
                      await("The SDK capability must render a microphone edge action without starting capture") {
-                        currentNodes().any { it.isVisibleToUser && it.contentDescription?.toString()?.startsWith("Mic:") == true }
+                        currentNodes().any { it.isVisibleToUser && it.contentDescription?.toString() in setOf("Ask once", "Talk continuously") }
                     }
-                    val mic = currentNodes().first { it.isVisibleToUser && it.contentDescription?.toString()?.startsWith("Mic:") == true }
+                    val mic = currentNodes().first { it.isVisibleToUser && it.contentDescription?.toString() in setOf("Ask once", "Talk continuously") }
                     micEnabled = clickableNode(mic).isEnabled
                      assertPolarBounds(mic.contentDescription.toString(), geometry.widthPixels, geometry.heightPixels, configuration.isScreenRound)
                     assertDraft(settled { engine.setDraft(draft, it) }, conversation, draft)
@@ -295,8 +295,11 @@ class SyntheticKeyboardDraftFixtureTest {
                     saveScreenshot(File(screenshotDirectory, "$fixtureName-main.png"))
                      openSettings()
                     val settingsBefore = inspectSettings()
-                    if (!micEnabled) assertTrue("Settings must explain the SDK-disabled microphone's Keyboard fallback",
-                        settingsBefore.first.any { it.contains("Native dictation is unavailable. Keyboard remains available.") })
+                     if (!micEnabled) assertTrue("Settings must explain the disabled Ask/Talk action through current speech readiness or policy",
+                         settingsBefore.first.any { it in setOf(
+                             "Native dictation is unavailable under the current speech policy. Keyboard remains available.",
+                             "Speech resources are not ready. This does not establish whether offline recognition is available. Keyboard remains available.",
+                             "Speech Recognition & Synthesis by Google is required for local dictation. Install from Play Store to enable.") })
                      assertNotNull("The persisted Speak replies choice must be observable", settingsBefore.second)
                     tapSettingsModel(alternative)
                     await("Model selection must update the actual engine without sending") { engine.snapshot().model == alternative }

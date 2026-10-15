@@ -914,13 +914,47 @@ mod tests {
     #[test]
     fn concurrent_native_id_reservations_are_unique_and_bounded() {
         let service = Arc::new(AudioCaptureService::new());
-        let mut reservations = (0..32)
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let mut starts = Vec::new();
+        let workers = (0..32)
             .map(|_| {
                 let service = Arc::clone(&service);
-                thread::spawn(move || service.reserve_id().expect("reserve capture"))
+                let ready_sender = ready_sender.clone();
+                let result_sender = result_sender.clone();
+                let (start_sender, start_receiver) = mpsc::channel();
+                starts.push(start_sender);
+                thread::spawn(move || {
+                    if ready_sender.send(()).is_err()
+                        || start_receiver.recv_timeout(Duration::from_secs(5)).is_err()
+                    {
+                        return;
+                    }
+                    let _ = result_sender.send(service.reserve_id());
+                })
             })
-            .map(|worker| worker.join().expect("reservation worker"))
             .collect::<Vec<_>>();
+        drop(ready_sender);
+        drop(result_sender);
+        for _ in 0..32 {
+            ready_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("all reservation workers should reach the coordinated start");
+        }
+        for start in starts {
+            start.send(()).expect("reservation worker should be ready");
+        }
+        let mut reservations = (0..32)
+            .map(|_| {
+                result_receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("reservation worker should finish within the bound")
+                    .expect("reserve capture")
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().expect("reservation worker");
+        }
         reservations.sort_unstable();
         assert_eq!(reservations, (1..=32).collect::<Vec<_>>());
 

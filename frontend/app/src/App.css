@@ -506,6 +506,8 @@
   margin: 0;
   line-height: 1.5;
   color: var(--message-text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .message__thinking {

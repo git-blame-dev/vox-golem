@@ -126,6 +126,7 @@ app-version:
 	@printf '%s\n' '$(APP_VERSION)'
 
 test:
+	mkdir -p /tmp/opencode
 	bun install --frozen-lockfile
 	bun run typecheck
 	bun run lint
@@ -133,6 +134,7 @@ test:
 	bun run build
 	$(MAKE) --no-print-directory test-release-tools
 	$(MAKE) --no-print-directory test-android-tools
+	$(MAKE) --no-print-directory test-local-runtime-tools
 	cargo fmt --all -- --check
 	cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 	cargo test --locked --workspace
@@ -142,9 +144,16 @@ test-release-tools:
 	bash scripts/test-release-tools.sh
 
 test-android-tools:
+	mkdir -p /tmp/opencode
 	python3 scripts/test-prepare-android-capture.py
 	python3 -B -m unittest discover -s scripts -p test_generate_icons.py
 	python3 -B -m unittest discover -s scripts -p test_generate_mobile_cues.py
+
+.PHONY: test-local-runtime-tools
+test-local-runtime-tools:
+	mkdir -p /tmp/opencode
+	python3 -B scripts/test_build_local_llama.py
+	python3 -B scripts/test_android_e2e_smoke.py
 
 icons:
 	python3 scripts/generate-icons.py

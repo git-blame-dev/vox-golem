@@ -73,7 +73,7 @@ class ReplicationControllerTest {
         pair.enroll()
         pair.leftStore.add(record(a, "1"))
         pair.right.reconcile()
-        while (pair.rightStore.records.isEmpty()) pair.deliverOne()
+        pair.deliverUntil { pair.rightStore.records.isNotEmpty() }
         pair.queue.clear() // Synthetic process death between durable import and ACK delivery.
         pair.restartRight()
         pair.right.reconcile()
@@ -99,7 +99,7 @@ class ReplicationControllerTest {
         val original = record(a, "1")
         pair.leftStore.add(original)
         pair.right.reconcile()
-        while (pair.queue.none { JSONObject(String(it.bytes)).getString("kind") == "records" }) pair.deliverOne()
+        pair.deliverUntil { pair.queue.any { JSONObject(String(it.bytes)).getString("kind") == "records" } }
         val transfer = pair.queue.removeAt(pair.queue.indexOfFirst { JSONObject(String(it.bytes)).getString("kind") == "records" })
         val bad = JSONObject(original.toString()).put("body_key", "f".repeat(64)).toString().toByteArray()
         assertFalse(pair.right.onData("node-a", transfer.path, transfer.bytes, mapOf("body_0" to bad)))
@@ -262,12 +262,16 @@ internal class PairHarness(private val a: String, private val b: String, private
         }, { node -> when (node) { "node-a" -> a; "node-b" -> b; else -> null } }, { UUIDs.next() },
     )
     fun deliverOne(reverse: Boolean = false, duplicate: Boolean = false) {
-        if (queue.isEmpty()) return
+        check(queue.isNotEmpty()) { "Replication queue exhausted before expected progress" }
         val packet = queue.removeAt(if (reverse) queue.lastIndex else 0)
         val target = if (packet.sender == a) right else left
         val node = if (packet.sender == a) "node-a" else "node-b"
         target.onData(node, packet.path, packet.bytes, packet.assets)
         if (duplicate) target.onData(node, packet.path, packet.bytes, packet.assets)
+    }
+    fun deliverUntil(done: () -> Boolean) {
+        var deliveries = 0
+        while (!done()) { check(deliveries++ < 1000) { "Replication did not reach expected phase" }; deliverOne() }
     }
     fun drain(duplicate: Boolean = false, reverse: Boolean = false) {
         var count = 0

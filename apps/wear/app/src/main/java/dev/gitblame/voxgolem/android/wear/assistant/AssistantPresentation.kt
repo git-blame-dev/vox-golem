@@ -14,7 +14,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -29,6 +28,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.rotary.onPreRotaryScrollEvent
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.CustomAccessibilityAction
@@ -57,6 +59,7 @@ import dev.gitblame.voxgolem.android.wear.CompactEdgeButtonDefaults
 import dev.gitblame.voxgolem.android.wear.formatVisibleDuration
 import org.json.JSONObject
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 
 @Composable
 internal fun AssistantTheme(content: @Composable () -> Unit) {
@@ -123,9 +126,13 @@ internal fun AssistantScreen(
     replyMetrics: (String?) -> Long? = { null },
 ) {
     var page by rememberSaveable { mutableStateOf(if (voice.missingSpeechServices && voice.entryMode != null) AssistantPage.MISSING_SPEECH else AssistantPage.CHAT) }
-    val chats = remember(state.viewJson) { assistantChats(state.viewJson) }
+    val view = remember(state.viewJson) { JSONObject(state.viewJson) }
+    val chats = remember(view) { assistantChats(view) }
+    val branchLabels = remember(view, state.branchChoices) { state.branchChoices.associateWith { assistantBranchLabel(view, it) } }
     val title = chats.firstOrNull { it.id.let(::assistantIdKey) == state.conversation?.let(::assistantIdKey) }?.title ?: "Assistant"
     val promptPresentation = remember { AssistantPromptPresentation() }
+    val chatScreenIdentity = rememberSaveable(saver = AssistantChatScreenIdentity.Saver) { AssistantChatScreenIdentity() }
+    val chatScreenKey = chatScreenIdentity.key(state)
     val pendingPrompts = observedPrompts ?: promptPresentation.project(state, voice, history)
     LaunchedEffect(page, state.foreground, state.busy, voice.active) {
         if (page in setOf(AssistantPage.SETTINGS, AssistantPage.SPEECH_LANGUAGE, AssistantPage.SPEECH_ENGINE, AssistantPage.SPEECH_VOICE) &&
@@ -134,11 +141,11 @@ internal fun AssistantScreen(
     BackHandler(page != AssistantPage.CHAT) { page = page.backPage() }
     WearSurface {
         AssistantArtwork(state, page == AssistantPage.CHAT, assistantArtworkListening(voice))
-        key(state.conversation?.let(::assistantIdKey)) {
+        key(chatScreenKey) {
             CompositionLocalProvider(LocalScreenIsActive provides (page == AssistantPage.CHAT && LocalScreenIsActive.current)) {
                 val repeatAfterReply = assistantRepeatsAfterReply(voice, preferences)
                 ChatScreen(state, voice, history, pendingPrompts, actions, repeatAfterReply, page == AssistantPage.CHAT,
-                    { page = AssistantPage.SETTINGS }, replyMetrics, onMissingSpeech = { page = AssistantPage.MISSING_SPEECH })
+                    { page = AssistantPage.SETTINGS }, replyMetrics, branchLabels, onMissingSpeech = { page = AssistantPage.MISSING_SPEECH })
             }
         }
         if (page != AssistantPage.CHAT) {
@@ -183,13 +190,25 @@ private fun ChatScreen(
     pendingPrompts: List<AssistantPendingPrompt>,
     actions: AssistantActions, conversationMode: Boolean, active: Boolean, settings: () -> Unit,
     replyMetrics: (String?) -> Long?,
+    branchLabels: Map<String, String>,
     onMissingSpeech: () -> Unit = {},
 ) {
     val list = rememberLazyListState()
     val reading = rememberSaveable(saver = AssistantReadingPosition.Saver) { AssistantReadingPosition() }
+    var initialHistoryPositioned by rememberSaveable { mutableStateOf(false) }
+    val requestIdentity = assistantReadingRequestKey(state)
+    val scope = rememberCoroutineScope()
+    val manualScroll = remember(list, reading) { object : NestedScrollConnection {
+        override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+            if (source == NestedScrollSource.UserInput && available.y != 0f) {
+                reading.readOlder(list.canScrollForward || (available.y > 0f && list.canScrollBackward))
+            }
+            return Offset.Zero
+        }
+    } }
     var olderAnchor by remember { mutableStateOf<Pair<String, Int>?>(null) }
     val continuity = remember { AssistantHistoryPresentation() }
-    val visibleAnchor = assistantVisibleReadingAnchor(list)
+    val visibleAnchor = assistantVisibleReadingAnchor(list, reading.replyRowKey)
     val transition = continuity.update(state, history, reading.followsLatest, visibleAnchor)
     val readyHistory = transition.ready
     val turns = transition.turns
@@ -204,7 +223,7 @@ private fun ChatScreen(
         olderAnchor = null
         reading.following {
             if (scroll.index != null) list.scrollToItem(scroll.index + if (history.error != null) 1 else 0, scroll.offset)
-            else {
+            else if (scroll.fallbackToLatest) {
                 reading.latest()
                 val count = list.layoutInfo.totalItemsCount
                 if (count > 0) list.scrollToItem(count - 1)
@@ -225,27 +244,84 @@ private fun ChatScreen(
             if (!following) reading.scrolled(scrolling, canForward)
         }
     }
-    LaunchedEffect(turns, reply, visiblePrompts, history.loading, active, reading.followsLatest) {
-        snapshotFlow { list.layoutInfo.totalItemsCount }.collect { count ->
-            if (active && reading.followsLatest && count > 0) {
-                snapshotFlow { !list.isScrollInProgress && list.layoutInfo.viewportSize.height > 0 }.first { it }
-                reading.following { list.scrollToItem(count - 1) }
+    val activeRequestOwner = assistantRequestOwnerKey(state)
+    val settledCanonicalTurn = if (readyHistory && reply == null && !state.busy && reading.followsLatest && activeRequestOwner != null &&
+        reading.currentRequestKey == activeRequestOwner) {
+        turns.lastOrNull {
+            (state.providerRequestId != null && it.requestKey == state.providerRequestId) ||
+                assistantIdKey(it.id) == state.selectedHead?.let(::assistantIdKey)
+        }
+    } else null
+    val replyIndex = when {
+        reply != null -> 1 + (if (state.conversation == null) 1 + (if (voice.missingSpeechServices) 1 else 0) else 0) +
+            (if (history.error != null) 1 else 0) + turns.size * 2 + promptsBeforeReply.size
+        settledCanonicalTurn != null -> itemKeys.index(itemKeys.answer(settledCanonicalTurn))?.let {
+            it + if (history.error != null) 1 else 0
+        }
+        else -> null
+    }
+    val replyRowKey = reply?.key ?: settledCanonicalTurn?.let(itemKeys::answer)
+    LaunchedEffect(requestIdentity, state.providerRequestId, state.busy, readyHistory, replyRowKey, state.error, state.interrupted) {
+        if (requestIdentity != null) reading.observeRequest(requestIdentity,
+            manuallyScrolling = list.isScrollInProgress && !reading.isFollowing,
+            providerKey = state.providerRequestId?.takeIf(String::isNotBlank))
+        else if (!state.busy && (replyRowKey == null || !reading.followsLatest) &&
+            (readyHistory || state.error != null || state.interrupted || state.conversation == null)) {
+            reading.completed(list.canScrollForward)
+        }
+    }
+    LaunchedEffect(replyRowKey, replyIndex, requestIdentity, state.busy, readyHistory, active, reading.phase, transition.scroll) {
+        val index = replyIndex ?: return@LaunchedEffect
+        val rowKey = replyRowKey ?: return@LaunchedEffect
+        initialHistoryPositioned = true
+        if (!active || !reading.followsLatest || transition.scroll != null) return@LaunchedEffect
+        reading.trackReplyRow(rowKey)
+        snapshotFlow {
+            val layout = list.layoutInfo
+            val row = layout.visibleItemsInfo.firstOrNull { it.key == rowKey }
+            AssistantReplyGeometry(row?.offset, row?.size, layout.viewportSize.height,
+                layout.beforeContentPadding, layout.afterContentPadding, list.canScrollForward, layout.totalItemsCount)
+        }.collect { geometry ->
+            if (!reading.followsLatest || geometry.itemCount <= index) return@collect
+            when (reading.followDecision(geometry)) {
+                AssistantReplyFollowDecision.NONE -> if (!state.busy && readyHistory && reply == null && geometry.rowOffset != null) {
+                    reading.completed(geometry.canScrollForward)
+                }
+                AssistantReplyFollowDecision.HOLD -> if (reply?.text?.isNotBlank() != false) {
+                    reading.replyPositioned(geometry.rowOffset!!, geometry.relativeCap, geometry.canScrollForward)
+                }
+                AssistantReplyFollowDecision.POSITION -> {
+                    // End-clamping gives short replies their natural position without a footer.
+                    // A huge first chunk targets its label directly, never its tail.
+                    reading.following { list.scrollToItem(index, -geometry.relativeCap) }
+                }
             }
         }
     }
-    val showLatest = assistantShowsLatest(state, voice, !reading.followsLatest)
+    LaunchedEffect(readyHistory, turns.size, active, state.busy) {
+        if (!active || !readyHistory || state.busy || initialHistoryPositioned || reading.currentRequestKey != null ||
+            !reading.followsLatest) return@LaunchedEffect
+        snapshotFlow { list.layoutInfo }.first { it.viewportSize.height > 0 && it.totalItemsCount >= 1 + turns.size * 2 }
+        if (!reading.followsLatest) return@LaunchedEffect
+        initialHistoryPositioned = true
+        reading.following { list.scrollToItem(list.layoutInfo.totalItemsCount - 1) }
+    }
+    val showLatest = assistantShowsLatest(state, voice, reading.readingOlder)
     val layoutDirection = LocalLayoutDirection.current
     ScreenScaffold(scrollState = list, modifier = Modifier.fillMaxSize().settingsSwipe(active, settings)) { contentPadding ->
         val readingPadding = PaddingValues(
             start = contentPadding.calculateStartPadding(layoutDirection),
             top = contentPadding.calculateTopPadding(),
             end = contentPadding.calculateEndPadding(layoutDirection),
-            bottom = if (showLatest) contentPadding.calculateBottomPadding() else 0.dp,
+            bottom = 0.dp,
         )
         Box(Modifier.fillMaxSize()) {
             LazyColumn(Modifier.fillMaxSize()
-                .padding(bottom = if (showLatest) 0.dp else maxOf(48.dp, CompactEdgeButtonDefaults.Height) + 3.dp)
-                .listRotary(list, active) { delta -> if (delta < 0) reading.readOlder() }
+                .padding(bottom = maxOf(48.dp, CompactEdgeButtonDefaults.Height) + 3.dp)
+                .listRotary(list, active) { delta ->
+                    if (delta != 0f) reading.readOlder(list.canScrollForward || (delta < 0f && list.canScrollBackward))
+                }
+                .nestedScroll(manualScroll)
                 .clipToBounds(), state = list,
                 contentPadding = readingPadding,
                 verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -253,7 +329,7 @@ private fun ChatScreen(
                      if (history.olderBefore != null && readyHistory) ActionButton("Older messages", !history.loading && history.error == null) {
                         reading.readOlder()
                         list.layoutInfo.visibleItemsInfo.firstOrNull { itemKeys.index(it.key.toString()) != null }?.let {
-                            olderAnchor = itemKeys.anchorKey(it.key.toString()) to (list.layoutInfo.beforeContentPadding - it.offset)
+                            olderAnchor = itemKeys.anchorKey(it.key.toString()) to -it.offset
                         }
                         actions.older()
                     }
@@ -269,7 +345,7 @@ private fun ChatScreen(
                 if (state.branchChoices.isNotEmpty()) {
                     item(key = "branches") { Text("Choose a continuation", color = MaterialTheme.colorScheme.primary) }
                     items(state.branchChoices, key = { "branch:${assistantIdKey(it)}" }) { id ->
-                        ActionButton(assistantBranchLabel(state.viewJson, id), !state.busy && !voice.active) { actions.selectHead(id) }
+                        ActionButton(branchLabels.getValue(id), !state.busy && !voice.active) { actions.selectHead(id) }
                     }
                 } else if (state.conversation != null && turns.isEmpty() && reply == null && visiblePrompts.isEmpty()) item(key = "empty") {
                     Text(if (history.error != null) "Conversation unavailable" else if (history.loading || !readyHistory) "Loading conversation…" else "No messages yet. Ask a question.")
@@ -300,9 +376,10 @@ private fun ChatScreen(
                 }
                 reply?.let { projected -> item(key = projected.key) {
                     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text(assistantReplyLabel(projected.requestKey?.let { replyMetrics(it) ?: projected.firstTextMs }, provisional = true),
+                        val waiting = projected.text.isBlank()
+                        Text(assistantReplyLabel(if (waiting) null else projected.requestKey?.let { replyMetrics(it) ?: projected.firstTextMs }, provisional = true),
                             style = wearTextStyle(MaterialTheme.typography.labelMedium))
-                        Text(projected.text)
+                        Text(if (waiting) assistantToolActivity(state) ?: "Thinking…" else projected.text)
                     }
                 } }
                 items(promptsAfterReply, key = { it.key }) { prompt ->
@@ -311,7 +388,7 @@ private fun ChatScreen(
                         Text(prompt.text)
                     }
                 }
-                assistantToolActivity(state)?.let { activity -> item(key = "tool-activity") {
+                assistantToolActivity(state)?.takeIf { reply == null || reply.text.isNotBlank() }?.let { activity -> item(key = "tool-activity") {
                     Text(activity, style = wearTextStyle(MaterialTheme.typography.labelMedium), color = MaterialTheme.colorScheme.primary)
                 } }
                 state.error?.let { item(key = "request-error") { Text(assistantErrorText(it), color = MaterialTheme.colorScheme.error) } }
@@ -330,8 +407,14 @@ private fun ChatScreen(
                 }
             }
             if (showLatest) {
-                // Latest intentionally floats over text; only the primary/Stop reserves reading clearance.
-                IconButton(onClick = { reading.latest() }, modifier = Modifier.align(Alignment.BottomCenter)
+                // Both dock controls share the same viewport clearance, so swapping preserves the readable end.
+                IconButton(onClick = {
+                    reading.latest()
+                    scope.launch { reading.following {
+                        val count = list.layoutInfo.totalItemsCount
+                        if (count > 0) list.scrollToItem(count - 1)
+                    } }
+                }, modifier = Modifier.align(Alignment.BottomCenter)
                     .padding(bottom = 6.dp).size(48.dp).semantics { contentDescription = "Jump to latest" },
                     colors = IconButtonDefaults.iconButtonColors(containerColor = Color.Transparent,
                         disabledContainerColor = Color.Transparent, contentColor = MaterialTheme.colorScheme.onBackground)) {
@@ -602,25 +685,6 @@ private fun ActionGlyph(action: AssistantActionIcon, description: String) {
     }
 }
 
-internal class AssistantReadingPosition(followLatest: Boolean = true) {
-    var followsLatest by mutableStateOf(followLatest)
-        private set
-    private var following = 0
-    var isFollowing by mutableStateOf(false)
-        private set
-    fun scrolled(inProgress: Boolean, canScrollForward: Boolean) { if (inProgress && !isFollowing) followsLatest = !canScrollForward }
-    fun readOlder() { followsLatest = false }
-    fun latest() { followsLatest = true }
-    suspend fun following(action: suspend () -> Unit) {
-        following++
-        isFollowing = true
-        try { action() } finally { following--; isFollowing = following > 0 }
-    }
-    companion object {
-        val Saver = Saver<AssistantReadingPosition, Boolean>(save = { it.followsLatest }, restore = { AssistantReadingPosition(it) })
-    }
-}
-
 internal fun assistantCanSend(state: AssistantState, voice: AssistantVoiceState): Boolean = state.foreground &&
     !state.busy && !voice.active && state.draft.isNotBlank() &&
     state.branchChoices.isEmpty() && state.model in AssistantModels.aliases
@@ -790,14 +854,16 @@ internal fun assistantTurnItemIndex(turns: List<AssistantTurn>, key: String): In
     return AssistantTurnItemKeys(turns).index(key)
 }
 
-private fun assistantVisibleReadingAnchor(list: LazyListState): Pair<String, Int>? = Snapshot.withoutReadObservation {
+private fun assistantVisibleReadingAnchor(list: LazyListState, preferredKey: String? = null): Pair<String, Int>? = Snapshot.withoutReadObservation {
     val layout = list.layoutInfo
-    layout.visibleItemsInfo.firstOrNull {
+    (layout.visibleItemsInfo.firstOrNull { it.key == preferredKey } ?: layout.visibleItemsInfo.firstOrNull {
         it.key.toString().startsWith("prompt:") || it.key.toString().startsWith("answer:")
-    }?.let { it.key.toString() to (layout.beforeContentPadding - it.offset) }
+    })?.let { it.key.toString() to -it.offset }
 }
 
-internal data class AssistantHistoryScroll(val generation: Long, val index: Int?, val offset: Int = 0)
+internal data class AssistantHistoryScroll(
+    val generation: Long, val index: Int?, val offset: Int = 0, val fallbackToLatest: Boolean = false,
+)
 internal data class AssistantProjectedReply(val requestKey: String?, val text: String, val firstTextMs: Long?) {
     val key: String get() = requestKey?.let(::assistantAnswerItemKey) ?: "stream"
 }
@@ -820,7 +886,10 @@ internal class AssistantHistoryPresentation {
     private var savedAnchor: Pair<String, Int>? = null
     private var generation = 0L
     private var pendingScroll: AssistantHistoryScroll? = null
-    private var previousItemKeys = AssistantTurnItemKeys(emptyList())
+    private var keyedTurns: List<AssistantTurn> = emptyList()
+    private var keyedRequest: String? = null
+    private var cachedItemKeys = AssistantTurnItemKeys(keyedTurns)
+    private var previousItemKeys = cachedItemKeys
 
     fun update(state: AssistantState, history: AssistantHistoryState, followsLatest: Boolean, anchor: Pair<String, Int>?): AssistantHistoryTransition {
         val selected = state.conversation?.let(::assistantIdKey) to state.selectedHead?.let(::assistantIdKey)
@@ -853,7 +922,7 @@ internal class AssistantHistoryPresentation {
             assistantIdKey(it.id) == owner.settledHead && it.requestKey == owner.requestKey
         } else null
         val canonicalReply = canonicalTurn != null
-        val reply = if (canonicalReply) null else owner?.takeIf { it.text.isNotBlank() }?.let {
+        val reply = if (canonicalReply) null else owner?.takeIf { it.text.isNotBlank() || state.busy }?.let {
             AssistantProjectedReply(it.requestKey, it.text, it.firstTextMs)
         } ?: if (owner == null && (requestKey == null || token == null) && state.foreground && successful &&
             (stoppedRequest == null || requestKey != stoppedRequest) && state.branchChoices.isEmpty()) {
@@ -861,7 +930,12 @@ internal class AssistantHistoryPresentation {
         } else null
         val displayedTurns = if (ready || retainPrefix) history.turns else emptyList()
         val projectedRequestKey = if (state.busy || (owner != null && !canonicalReply)) requestKey else reply?.requestKey
-        val itemKeys = AssistantTurnItemKeys(displayedTurns, projectedRequestKey)
+        if (keyedTurns != displayedTurns || keyedRequest != projectedRequestKey) {
+            keyedTurns = displayedTurns.toList()
+            keyedRequest = projectedRequestKey
+            cachedItemKeys = AssistantTurnItemKeys(keyedTurns, keyedRequest)
+        }
+        val itemKeys = cachedItemKeys
         val readingAnchor = anchor?.let { previousItemKeys.anchorKey(it.first) to it.second }
         val retiredPromptKey = if (ready && !state.busy && requestKey != null) history.turns.firstOrNull {
             assistantIdKey(it.id) == selected.second && it.requestKey == requestKey
@@ -891,7 +965,8 @@ internal class AssistantHistoryPresentation {
                     }
                 }
                 val index = key?.let(itemKeys::index)
-                pendingScroll = AssistantHistoryScroll(++generation, index, if (index != null) savedAnchor!!.second else 0)
+                pendingScroll = AssistantHistoryScroll(++generation, index, if (index != null) savedAnchor!!.second else 0,
+                    fallbackToLatest = index == null && canonicalTurn == null && owner?.settledHead == null)
             }
             waiting = false
             wasReading = false
@@ -910,15 +985,17 @@ internal class AssistantHistoryPresentation {
 }
 
 internal data class AssistantChat(val id: String, val title: String)
-internal fun assistantChats(view: String): List<AssistantChat> {
-    val conversations = JSONObject(view).getJSONArray("conversations")
+internal fun assistantChats(view: String): List<AssistantChat> = assistantChats(JSONObject(view))
+private fun assistantChats(view: JSONObject): List<AssistantChat> {
+    val conversations = view.getJSONArray("conversations")
     return (0 until conversations.length()).map { conversations.getJSONObject(it) }
         .filter { !it.optBoolean("deleted") && !it.isNull("title") }
         .map { AssistantChat(it.getJSONObject("id").toString(), it.getString("title")) }
 }
 
-internal fun assistantBranchLabel(view: String, id: String): String {
-    val records = JSONObject(view).getJSONArray("records")
+internal fun assistantBranchLabel(view: String, id: String): String = assistantBranchLabel(JSONObject(view), id)
+private fun assistantBranchLabel(view: JSONObject, id: String): String {
+    val records = view.getJSONArray("records")
     val operation = (0 until records.length()).map { records.getJSONObject(it).getJSONObject("operation") }
         .firstOrNull { assistantIdKey(it.getJSONObject("id").toString()) == assistantIdKey(id) }
     val prompt = operation?.optJSONObject("body")?.optString("prompt").orEmpty().replace('\n', ' ').trim()

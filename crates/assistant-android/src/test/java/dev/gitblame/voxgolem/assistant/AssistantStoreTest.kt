@@ -29,6 +29,29 @@ class AssistantStoreTest {
     private fun open(gateway: DomainGateway) = AssistantStore(context, gateway).also(stores::add)
     @After fun closeStores() { stores.forEach(AssistantStore::close) }
 
+    @Test fun portableRustPromptBudgetAgreesWithMobileValidatorThroughTheActualGateway() {
+        val library = System.getProperty("assistant.native.library")
+        assumeTrue("Set -PassistantNativeLibrary to an existing host JNI library", library != null)
+        val id = JSONObject().put("replica", peer).put("sequence", "2")
+        val conversation = JSONObject().put("replica", peer).put("sequence", "1")
+        val request = JSONObject().put("replica", peer).put("sequence", "3")
+        for (text in listOf("x".repeat(AssistantDraftBudget.MAX_BYTES),
+            "é".repeat(AssistantDraftBudget.MAX_BYTES / 2), "🙂".repeat(AssistantDraftBudget.MAX_BYTES / 4))) {
+            val operation = completed(id, conversation, null, request, JSONArray())
+            operation.getJSONObject("body").put("prompt", text)
+            fun evaluate() = JSONObject(AssistantDomainNative.apply(JSONObject().put("kind", "record").put("operation", operation).toString()))
+            assertTrue(AssistantDraftBudget.accepts(text))
+            assertTrue("Valid boundary fixture must reach Rust acceptance", evaluate().getBoolean("ok"))
+            // Change only prompt bytes. The gateway, not the mobile validator, decides this outcome.
+            operation.getJSONObject("body").put("prompt", text + "x")
+            assertFalse(AssistantDraftBudget.accepts(text + "x"))
+            val rejected = evaluate()
+            assertFalse(rejected.getBoolean("ok"))
+            assertEquals("limit_exceeded", rejected.getJSONObject("error").getString("kind"))
+            assertEquals("prompt", rejected.getJSONObject("error").getString("limit"))
+        }
+    }
+
     @Test fun coldRestoreKeepsImmutableRecordsReplicaSequenceAndDurablePublications() {
         val store = nativeStore()
         val record = store.createConversation("Synthetic conversation")

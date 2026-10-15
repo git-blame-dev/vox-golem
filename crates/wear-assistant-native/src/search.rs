@@ -525,6 +525,33 @@ async fn admit<'a, T>(
     cancellation.guard(deadline, service.lock()).await
 }
 
+fn count_status(sources: &[voxgolem_core::search::Source]) -> Option<String> {
+    use voxgolem_core::search::EvidenceKind;
+    let pages = sources
+        .iter()
+        .filter(|s| s.kind == EvidenceKind::PageRead)
+        .count()
+        .min(99);
+    let results = sources
+        .iter()
+        .filter(|s| s.kind == EvidenceKind::SearchExcerpt)
+        .count()
+        .min(99);
+    if pages > 0 {
+        Some(format!(
+            "Reading · {pages} {}",
+            if pages == 1 { "page" } else { "pages" }
+        ))
+    } else if results > 0 {
+        Some(format!(
+            "Searching · {results} {}",
+            if results == 1 { "result" } else { "results" }
+        ))
+    } else {
+        None
+    }
+}
+
 pub(crate) async fn respond(
     process: &ProcessProvider,
     mut config: CustomOpenAiConfig,
@@ -606,6 +633,8 @@ pub(crate) async fn respond(
                             && (outcome.partial || outcome.evidence_unavailable)
                         {
                             callback(CallbackEvent::Status("Partial"))
+                        } else if let Some(status) = count_status(&outcome.sources) {
+                            callback(CallbackEvent::Status(&status))
                         } else {
                             Ok(())
                         }

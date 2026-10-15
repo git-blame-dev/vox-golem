@@ -2,6 +2,9 @@ package dev.gitblame.voxgolem.assistant.runtime
 
 import org.junit.Assert.*
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 class AssistantDeliveryGateTest {
     @Test fun statusDoesNotReduceExactTextCallbackBudget() {
@@ -74,14 +77,19 @@ class AssistantDeliveryGateTest {
     }
     @Test fun boundedWindowAndCancellationWakeBlockedDeliveryWithoutAnotherPacket() {
         val packets = mutableListOf<AssistantDeliveryPacket>()
-        val gate = AcknowledgedAssistantDelivery("synthetic-client", { packets += it }, maxInFlight = 1, timeoutMillis = 1000)
+        val blocked = CountDownLatch(1)
+        val gate = AcknowledgedAssistantDelivery("synthetic-client", { packets += it }, maxInFlight = 1,
+            timeoutMillis = 15000, onBlocked = { blocked.countDown() })
         assertTrue(gate.deliver(AssistantDelta("synthetic-client", "synthetic-provider", 1, "Synthetic")))
-        val thread = Thread { assertFalse(gate.deliver(AssistantDelta("synthetic-client", "synthetic-provider", 2, "Synthetic late"))) }
-        thread.start()
-        gate.cancel()
-        thread.join(1000)
-        assertFalse(thread.isAlive)
-        assertEquals(1, packets.size)
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val result = executor.submit<Boolean> { gate.deliver(AssistantDelta("synthetic-client", "synthetic-provider", 2, "Synthetic late")) }
+            assertTrue(blocked.await(1, TimeUnit.SECONDS))
+            assertFalse(result.isDone)
+            gate.cancel()
+            assertFalse(result.get(1, TimeUnit.SECONDS)) // Well before the 15-second ACK timeout.
+            assertEquals(1, packets.size)
+        } finally { gate.cancel(); executor.shutdownNow(); assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS)) }
     }
     @Test fun duplicateAcknowledgementsAreIdempotentAndWrongDeltaSequenceFailsClosed() {
         val gate = AcknowledgedAssistantDelivery("synthetic-client", {}, timeoutMillis = 10)

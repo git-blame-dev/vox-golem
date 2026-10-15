@@ -117,7 +117,7 @@ class AssistantStore(
 
     /** Null conversation is a fresh, not-yet-created draft. Interrupted never implies replay. */
     @Synchronized fun saveDraft(conversation: JSONObject?, text: String, interrupted: Boolean = false) {
-        require(text.toByteArray(Charsets.UTF_8).size <= 32 * 1024) { "Assistant draft too large" }
+        require(AssistantDraftBudget.accepts(text)) { "Assistant draft too large" }
         transaction { db ->
             if (conversation != null) checkNotDeleted(db, conversation)
             check(db.insertWithOnConflict("drafts", null, ContentValues().apply {

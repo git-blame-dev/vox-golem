@@ -17,7 +17,7 @@ parallel history/provider reducers.
 | [Headless JNI domain gateway](../wear-assistant-native/src/domain.rs) / [Android gateway](src/main/java/dev/gitblame/voxgolem/assistant/AssistantDomain.kt) | Bounded native calls into core; no credentials, provider execution or in-memory history authority |
 | [AssistantStore](src/main/java/dev/gitblame/voxgolem/assistant/AssistantStore.kt) | App-private SQLite authority: identity/counter allocation, compare-and-commit, drafts, selection, outboxes and exact receipts |
 | [AssistantRuntime](src/main/java/dev/gitblame/voxgolem/assistant/runtime/AssistantRuntime.kt) / [AssistantEngine](src/main/java/dev/gitblame/voxgolem/assistant/runtime/AssistantEngine.kt) | One process engine/IO actor, foreground request lifecycle, correlated delivery and committed projections |
-| [Provider adapter](src/main/java/dev/gitblame/voxgolem/assistant/runtime/AssistantProviderNative.kt) | JNI worker calling the existing Rust Custom client; no duplicate provider implementation |
+| [Provider adapter](src/main/java/dev/gitblame/voxgolem/assistant/runtime/AssistantProviderNative.kt) / [Agy router](src/main/java/dev/gitblame/voxgolem/assistant/runtime/AgyProvider.kt) | JNI worker reusing the Rust transport, or the installed CLI under bounded process/IO ownership; neither owns canonical history |
 | [AssistantApplication](src/main/java/dev/gitblame/voxgolem/assistant/replication/AssistantApplication.kt) | Cold-start native association/replication setup; does not create an engine or initiate generation |
 | [Common voice library](../voice-android/README.md) | SDK speech, cues, resource leases and lightweight preference backing; no Assistant/JNI dependency |
 
@@ -42,7 +42,10 @@ settle successfully before a validated completed turn can be committed and publi
 Phone delivery ACK means Rust-to-WebView enqueue, not proof of browser rendering or
 another database commit. Stop, background loss and delivery failure retire active
 requests; retained drafts require deliberate retry. Sync never starts generation.
-Each device executes its own Custom request when foreground, provisioned and online.
+Each device executes its own admitted provider request when eligible, provisioned
+and online. The phone distinguishes a true background transition from screen-off
+or keyguard pauses: ongoing LLM work remains eligible while speech visibility and
+new recognition consent are fenced separately.
 Cancellation is ordered at Store transaction admission. Stop before admission prevents
 the completion transaction; once admitted, the SQLite transaction wins (or rolls back
 on its own failure), including its publication and consumption of that exact draft.
@@ -52,6 +55,21 @@ not `not_saved`. That warning pauses speech/automatic next-turn admission.
 Desktop local models, wake/VAD/Parakeet, OpenCode subprocesses and Deep/Review are not
 part of this native mobile runtime.
 
+`ProviderDeltaCallback.onReady` establishes cancellation registration, not process
+or model readiness. Worker settlement and replacement admission remain held until
+`ProviderNativeCalls.whenRetired` confirms physical retirement. Request-owned wake
+protection spans that retirement boundary, including Activity recreation/destruction.
+Drafts share `AssistantDraftBudget`'s 32 KiB UTF-8 limit; blank-send validation is
+separate, and Note capture/export quotas are not Assistant draft quotas.
+
+The optional Agy route requires Android 26+, an installed executable, and externally
+provisioned, nonempty app-private access and installation-identity files under
+`filesDir/home/.gemini/antigravity-cli`. No token, identity or settings file is
+bootstrapped from APK assets. Requests use fresh processes with quoted, role-preserving
+canonical context and the application instructions; an unused prewarm may be consumed
+once. EOF is not success: an explicit successful terminal and nonblank answer are
+required. Startup, writes, output and retirement are bounded independently.
+
 `NativeAssistantPolicyStorage` adapts the common installation-preference backing for
 installation-local `web_enabled` and
 `speech_network_fallback`, both defaulting to true. `AssistantClient.setWebEnabled`
@@ -60,8 +78,11 @@ They are not conversation operations and are never replicated. A provider reques
 captures `webEnabled` once at admission. `externalSessionId` is a random UUID from
 a process-local 256-entry LRU, stable while that conversation remains cached, never
 the canonical conversation ID and never persisted. The JNI gateway owns web-off
-tool/transport enforcement; Quick/Verify/Research are separate from permission,
-and Verify/Research are explicit lookup requests rather than keyword detection.
+tool/transport enforcement for the JNI route; Quick/Verify/Research are separate
+from permission, and Verify/Research are explicit lookup requests rather than
+keyword detection. Local JNI lookup modes are explicitly unsupported. Agy with
+web disabled is unavailable because no verified CLI tool-denial protocol exists;
+the existing web-enabled CLI permission mode is not a tool sandbox.
 
 Supported speech selections use installation-local strings `speech_language`,
 `speech_tts_provider`, and `speech_tts_voice`; each defaults to the empty string

@@ -110,6 +110,16 @@ impl UtteranceAudioBuffer {
         &self.samples
     }
 
+    pub fn max_samples(&self) -> usize {
+        self.max_samples
+    }
+
+    pub fn reserve_capacity(&mut self) {
+        // Cloning retains samples, not spare capacity. Restore the declared
+        // budget once at admission so subsequent frames need no growth.
+        self.samples.reserve(self.max_samples - self.samples.len());
+    }
+
     pub fn clear(&mut self) {
         self.samples.clear();
     }

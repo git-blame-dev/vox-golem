@@ -12,6 +12,22 @@ class PhoneSnapshotEncoderTest {
         .put("id", id(sequence)).put("body", JSONObject().put("kind", "turn_completed").put("conversation", id("1"))
             .put("request", id(request)).put("prompt", "Synthetic question").put("answer", JSONObject().put("kind", "text").put("text", answer)).put("terminal_stage", "instant")))
 
+    @Test fun optionalModelsRequirePublishedReadinessAndEnforceWebPolicyInsteadOfPrefixAvailability() {
+        val view = JSONObject().put("revision", "0").put("conversations", JSONArray())
+        val state = AssistantState(viewJson = view.toString())
+        fun options(readiness: Map<String, dev.gitblame.voxgolem.assistant.runtime.OptionalProviderReadiness>, web: Boolean = true): List<JSONObject> {
+            val array = PhoneSnapshotEncoder.encode(state.copy(webEnabled = web), null, PhonePreferences.defaults(), emptyMap(),
+                optionalProviders = readiness).getJSONArray("model_options")
+            return (0 until array.length()).map(array::getJSONObject)
+        }
+        assertTrue(options(emptyMap()).filter { it.getString("id") in dev.gitblame.voxgolem.assistant.runtime.AssistantModels.optionalLabels }
+            .all { !it.getBoolean("available") && !it.isNull("unavailable_reason") })
+        val ready = mapOf("agy-flash-high" to dev.gitblame.voxgolem.assistant.runtime.OptionalProviderReadiness(true, "Synthetic installed route"))
+        assertTrue(options(ready).single { it.getString("id") == "agy-flash-high" }.getBoolean("available"))
+        assertFalse(options(ready, false).single { it.getString("id") == "agy-flash-high" }.getBoolean("available"))
+        assertFalse(options(ready).single { it.getString("id") == "local-fast" }.getBoolean("available"))
+    }
+
     @Test fun boundedPickerIncludesSelectedConversationAndDoesNotSkipReplacedPageEntry() {
         val conversations = JSONArray()
         for (sequence in 1..129) conversations.put(JSONObject().put("id", id(sequence.toString())).put("title", "Synthetic conversation $sequence").put("deleted", false))

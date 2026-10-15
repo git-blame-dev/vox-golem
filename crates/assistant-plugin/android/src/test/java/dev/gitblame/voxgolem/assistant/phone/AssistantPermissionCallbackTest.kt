@@ -20,6 +20,28 @@ class AssistantPermissionCallbackTest {
     private fun callback(plugin: AssistantPlugin, invoke: Invoke) {
         AssistantPlugin::class.java.getDeclaredMethod("assistantMicGranted", Invoke::class.java).apply { isAccessible = true }.invoke(plugin, invoke)
     }
+    @Test fun scopedCleanupCannotConsumeANewerPermissionAdmission() {
+        val activity = Robolectric.buildActivity(Activity::class.java).create().get()
+        val plugin = AssistantPlugin(activity)
+        val replies = mutableListOf<String>()
+        val newer = invoke(2, replies)
+        val type = AssistantPlugin::class.java.declaredClasses.single { it.simpleName == "PendingVoice" }
+        val args = VoiceArgs().apply { sessionId = "synthetic-new-permission" }
+        val pending = type.getDeclaredConstructor(java.lang.Long.TYPE, VoiceArgs::class.java, Invoke::class.java, SpeechAdmissionSnapshot::class.java)
+            .apply { isAccessible = true }.newInstance(2L, args, newer,
+                SpeechAdmissionSnapshot(SpeechInputOwner("synthetic-conversation", null), "Synthetic draft"))
+        val field = AssistantPlugin::class.java.getDeclaredField("pendingVoice").apply { isAccessible = true }
+        field.set(plugin, pending)
+        val response: (Long, String) -> Unit = { _, data -> replies += data }
+        val mapper = Class.forName("com.fasterxml.jackson.databind.ObjectMapper").getDeclaredConstructor().newInstance()
+        val stop = Invoke::class.java.declaredConstructors.single().newInstance(3L, "stop_assistant_voice", 1L, 2L, response,
+            """{"sessionId":"synthetic-old-permission"}""", mapper) as Invoke
+        plugin.stop_assistant_voice(stop)
+        assertSame(pending, field.get(plugin))
+        val epoch = AssistantPlugin::class.java.getDeclaredField("inputEpoch").apply { isAccessible = true }.get(plugin) as java.util.concurrent.atomic.AtomicLong
+        assertEquals(0L, epoch.get())
+        assertEquals(1, replies.size)
+    }
     @Test fun retiredPermissionCallbackCannotConsumeANewerAdmission() {
         val activity = Robolectric.buildActivity(Activity::class.java).create().get()
         val plugin = AssistantPlugin(activity)

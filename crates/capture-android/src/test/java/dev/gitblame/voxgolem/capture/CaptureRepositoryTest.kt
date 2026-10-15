@@ -82,6 +82,52 @@ class CaptureRepositoryTest {
         assertNull(repository.update("123e4567-e89b-42d3-a456-426614174002") { error("must not run") })
     }
 
+    @Test fun correctionComparesTheSelectedVersionAndRejectedAttemptsRollBackEveryField() {
+        val original = repository.save(CaptureRecord(id, createdAtUtc = "2026-01-02T03:04:05Z",
+            captureState = CaptureState.SAVED, recognitionState = RecognitionState.RUNNING,
+            recognitionSessionId = "123e4567-e89b-42d3-a456-426614174096", transcriptVersion = 3,
+            orgState = OrgState.EXPORTED, exportTranscriptVersion = 2, finalText = "Synthetic baseline"))
+        assertThrows(CaptureTranscriptConflictException::class.java) { repository.correctTranscript(id, "Synthetic stale correction", 2) }
+        assertEquals(original, openRepository().get(id))
+        assertThrows(IllegalArgumentException::class.java) { repository.correctTranscript(id, "Synthetic negative version", -1) }
+        assertEquals(original, openRepository().get(id))
+        val accepted = repository.correctTranscript(id, "Synthetic matched correction", 3)
+        assertEquals(4L, accepted.transcriptVersion)
+        assertNull(accepted.recognitionSessionId)
+        assertEquals(OrgState.EXPORTED, accepted.orgState)
+        assertEquals(2L, accepted.exportTranscriptVersion)
+        assertThrows(CaptureTranscriptConflictException::class.java) { openRepository().correctTranscript(id, "Synthetic later stale correction", 3) }
+        assertEquals(accepted, repository.get(id))
+        val legacy = repository.correctTranscript(id, "Synthetic legacy edit")
+        assertEquals(5L, legacy.transcriptVersion)
+    }
+
+    @Test fun separateRepositoryWritersCannotBothCommitTheSameSelectedVersion() {
+        repository.save(CaptureRecord(id, createdAtUtc = "2026-01-02T03:04:05Z", captureState = CaptureState.SAVED))
+        val writers = listOf(openRepository(), openRepository())
+        val entered = java.util.concurrent.CountDownLatch(2)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val executor = java.util.concurrent.Executors.newFixedThreadPool(2)
+        try {
+            val attempts = writers.mapIndexed { index, writer -> executor.submit<Result<CaptureRecord>> {
+                entered.countDown()
+                check(release.await(3, java.util.concurrent.TimeUnit.SECONDS))
+                runCatching { writer.correctTranscript(id, "Synthetic competing editor $index", 0) }
+            } }
+            assertTrue(entered.await(3, java.util.concurrent.TimeUnit.SECONDS))
+            release.countDown()
+            val results = attempts.map { it.get(5, java.util.concurrent.TimeUnit.SECONDS) }
+            assertEquals(1, results.count { it.isSuccess })
+            assertEquals(1, results.count { it.exceptionOrNull() is CaptureTranscriptConflictException })
+            val winner = results.single { it.isSuccess }.getOrThrow()
+            assertEquals(1L, winner.transcriptVersion)
+            assertEquals(winner, repository.get(id))
+        } finally {
+            release.countDown(); executor.shutdownNow()
+            assertTrue(executor.awaitTermination(3, java.util.concurrent.TimeUnit.SECONDS))
+        }
+    }
+
     @Test fun recoveryTrimsIncompleteFramesAndPersistsOnlyActiveRecords() {
         val spool = repository.createPcmSpool(id).apply { writeBytes(byteArrayOf(1, 2, 3, 4, 5)) }
         repository.save(CaptureRecord(id, createdAtUtc = "2026-01-02T03:04:05Z", captureState = CaptureState.RECORDING,

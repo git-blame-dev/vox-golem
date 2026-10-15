@@ -97,4 +97,32 @@ class AssistantTextInputTest {
         assertTrue(activity.isFinishing)
         controller.pause().stop().destroy()
     }
+
+    @Test fun utf8BudgetRejectsWithoutTruncatingOrClosingAndRetainsRejectedTextAcrossRecreation() {
+        assertTrue(AssistantTextInput.accepts("a".repeat(32 * 1024)))
+        assertTrue(AssistantTextInput.accepts("é".repeat(16 * 1024)))
+        assertTrue(AssistantTextInput.accepts("😀".repeat(8 * 1024)))
+        assertFalse(AssistantTextInput.accepts("é".repeat(16 * 1024 + 1)))
+        assertFalse(AssistantTextInput.accepts("😀".repeat(8 * 1024 + 1)))
+        val controller = Robolectric.buildActivity(AssistantTextEntryActivity::class.java, editorIntent()).setup()
+        val rejected = "Synthetic rejected UTF-8 draft " + "😀".repeat(9 * 1024)
+        val input = controller.get().findViewById<EditText>(android.R.id.edit)
+        try {
+            input.setText(rejected)
+            controller.get().findViewById<Button>(android.R.id.button1).performClick()
+            assertFalse(controller.get().isFinishing)
+            assertEquals(rejected, input.text.toString())
+            assertNotNull(input.error)
+            assertEquals(Activity.RESULT_CANCELED, Shadows.shadowOf(controller.get()).resultCode)
+            val saved = Bundle()
+            controller.saveInstanceState(saved)
+            val restored = Robolectric.buildActivity(AssistantTextEntryActivity::class.java, editorIntent()).create(saved).start().resume().visible()
+            try {
+                assertEquals(rejected, restored.get().findViewById<EditText>(android.R.id.edit).text.toString())
+                restored.get().findViewById<EditText>(android.R.id.edit).setText("Synthetic shortened accepted draft")
+                restored.get().findViewById<Button>(android.R.id.button1).performClick()
+                assertEquals(Activity.RESULT_OK, Shadows.shadowOf(restored.get()).resultCode)
+            } finally { restored.pause().stop().destroy() }
+        } finally { controller.pause().stop().destroy() }
+    }
 }

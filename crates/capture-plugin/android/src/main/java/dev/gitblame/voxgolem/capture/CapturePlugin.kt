@@ -177,27 +177,11 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun update_transcript(invoke: Invoke) {
         try {
-            val args = invoke.parseArgs(UpdateTranscriptArgs::class.java)
-            require(CaptureProtocol.isValidUuid(args.captureId)) { "Invalid capture ID" }
-            require(args.text.length <= 1_000_000) { "Transcript is too long" }
-            val updated = repository.update(args.captureId) { record ->
-                require(record.purpose == CapturePurpose.NOTE) { "Only Note transcripts can be edited" }
-                require(record.captureState == CaptureState.SAVED) { "Only finalized captures can be edited" }
-                record.copy(
-                    finalText = args.text,
-                    previewText = args.text,
-                    recognitionState = if (args.text.isBlank()) RecognitionState.NO_SPEECH else RecognitionState.FINAL,
-                    transcriptVersion = record.transcriptVersion + 1,
-                    orgState = when {
-                        record.orgState == OrgState.EXPORTED -> OrgState.EXPORTED
-                        args.text.isBlank() -> OrgState.WAITING_FOR_TRANSCRIPT
-                        else -> OrgState.READY
-                    },
-                )
-            }
-            require(updated != null) { "Capture was not found" }
-            if (args.text.isNotBlank()) phoneCoordinator.retryCapture(args.captureId)
+            val args = UpdateTranscriptArgs.fromJson(invoke.getArgs())
+            phoneCoordinator.correctTranscript(args.captureId, args.text, args.expectedVersion)
             invoke.resolve()
+        } catch (_: CaptureTranscriptConflictException) {
+            invoke.reject("transcript-conflict")
         } catch (error: Exception) {
             invoke.reject("transcript-update-unavailable")
         }
@@ -248,4 +232,23 @@ class ListCapturesArgs {
 class UpdateTranscriptArgs {
     lateinit var captureId: String
     lateinit var text: String
+    var expectedVersion: Long? = null
+
+    companion object {
+        /** Do not let the binding coerce strings, booleans, fractions, or explicit null to a version. */
+        fun fromJson(value: org.json.JSONObject): UpdateTranscriptArgs {
+            val captureId = value.opt("captureId")
+            val text = value.opt("text")
+            require(captureId is String && text is String) { "Invalid transcript arguments" }
+            val version = if (!value.has("expectedVersion")) null else when (val raw = value.opt("expectedVersion")) {
+                is Int -> raw.toLong()
+                is Long -> raw
+                else -> throw IllegalArgumentException("Invalid transcript version")
+            }
+            require(version == null || version >= 0) { "Invalid transcript version" }
+            return UpdateTranscriptArgs().also {
+                it.captureId = captureId; it.text = text; it.expectedVersion = version
+            }
+        }
+    }
 }

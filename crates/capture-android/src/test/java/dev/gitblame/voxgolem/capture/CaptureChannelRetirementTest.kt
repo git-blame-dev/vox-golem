@@ -43,9 +43,10 @@ class CaptureChannelRetirementTest {
     }
     @Test fun nativeConfirmationCannotFreeSlotBeforeLateStreamAcquisitionAndFailedStreamRecovery() {
         val owner = CaptureChannelRetirementOwner(1)
-        val lifetime = owner.reserve(20)!!
-        lifetime.acquiredNative { it(true) }
+        val lifetime = owner.reserve()!!
         lifetime.beginStreamAcquisition()
+        lifetime.acquiredNative { it(true) }
+        lifetime.close()
         await { lifetime.nativeRetired }
         assertEquals(1, owner.size); assertNull(owner.reserve())
         val attempts = AtomicInteger()
@@ -98,10 +99,16 @@ class CaptureChannelRetirementTest {
             late.acquiredNative { it(true) }
             late.close(); adopted.countDown()
         }
-        worker.start(); assertTrue(started.await(2, TimeUnit.SECONDS))
-        assertEquals(1L, adopted.count); assertEquals(1, owner.size)
-        held.confirmNativeRetired()
-        assertTrue(adopted.await(2, TimeUnit.SECONDS)); worker.join(2_000)
+        worker.start()
+        try {
+            assertTrue(started.await(2, TimeUnit.SECONDS))
+            assertEquals(1L, adopted.count); assertEquals(1, owner.size)
+            held.confirmNativeRetired()
+            assertTrue(adopted.await(2, TimeUnit.SECONDS))
+        } finally {
+            held.confirmNativeRetired()
+            worker.join(2_000)
+        }
         assertFalse(worker.isAlive); await { owner.size == 0 }
     }
     private fun await(condition: () -> Boolean) {

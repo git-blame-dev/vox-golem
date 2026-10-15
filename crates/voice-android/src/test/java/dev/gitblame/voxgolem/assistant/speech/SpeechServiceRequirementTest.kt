@@ -1,6 +1,8 @@
 package dev.gitblame.voxgolem.assistant.speech
 
 import android.content.Context
+import android.content.ContextWrapper
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.ResolveInfo
 import android.content.pm.ServiceInfo
@@ -57,8 +59,27 @@ class SpeechServiceRequirementTest {
 
     @Test
     fun opensPlayStoreFallsBackSafely() {
-        // In Robolectric without Play Store, openPlayStore should handle all fallbacks without crashing
-        assertNotNull(SpeechServiceRequirement.PLAY_STORE_MARKET_URI)
-        assertNotNull(SpeechServiceRequirement.PLAY_STORE_WEB_URI)
+        for (successAt in 0..3) {
+            val attempts = mutableListOf<Intent>()
+            val launcher = object : ContextWrapper(context) {
+                override fun startActivity(intent: Intent) {
+                    attempts += intent
+                    if (attempts.size - 1 != successAt) throw ActivityNotFoundException("Synthetic unavailable handler")
+                }
+            }
+            assertEquals(successAt < 3, SpeechServiceRequirement.openPlayStore(launcher))
+            assertEquals(minOf(successAt + 1, 3), attempts.size)
+            assertEquals("com.android.vending", attempts.first().`package`)
+            assertEquals(SpeechServiceRequirement.PLAY_STORE_MARKET_URI, attempts.first().data.toString())
+            if (attempts.size > 1) {
+                assertNull(attempts[1].`package`)
+                assertEquals(SpeechServiceRequirement.PLAY_STORE_MARKET_URI, attempts[1].data.toString())
+            }
+            if (attempts.size > 2) {
+                assertEquals(SpeechServiceRequirement.PLAY_STORE_WEB_URI, attempts[2].data.toString())
+                assertTrue(attempts[2].hasCategory(Intent.CATEGORY_BROWSABLE))
+            }
+            assertTrue(attempts.all { it.flags and Intent.FLAG_ACTIVITY_NEW_TASK != 0 })
+        }
     }
 }

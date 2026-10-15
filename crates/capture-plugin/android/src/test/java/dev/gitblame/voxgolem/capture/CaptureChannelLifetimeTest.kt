@@ -58,12 +58,14 @@ class CaptureChannelLifetimeTest {
     private val closed = CopyOnWriteArrayList<ChannelClient.Channel>()
     private val receipts = CopyOnWriteArrayList<Pair<String, JSONObject>>()
     private var acquire: ((ChannelClient.Channel) -> InputStream)? = null
+    private val retirements = CaptureChannelRetirementOwner(64)
 
     @Before
     fun setUp() {
         CaptureChannelReceiver.stopShared()
         context.deleteDatabase("captures.db")
         context.filesDir.resolve("captures").deleteRecursively()
+        context.filesDir.resolve("capture-quarantine").listFiles()?.filter { it.name.startsWith("$CAPTURE-") }?.forEach(File::delete)
         shadowOf(RuntimeEnvironment.getApplication()).grantPermissions(Manifest.permission.RECORD_AUDIO)
         speech = RecordingSpeech()
         coordinator = PhoneCaptureCoordinator(context, speech, { node, _, bytes -> receipts += node to JSONObject(String(bytes, Charsets.UTF_8)) },
@@ -75,7 +77,7 @@ class CaptureChannelLifetimeTest {
         receiver = CaptureChannelReceiver(context, coordinator,
             acquireInput = { channel -> acquired += channel; acquire?.invoke(channel) ?: streams.getValue(channel) },
             closeChannel = { closed += it }, now = now::get,
-            liveExecutor = { liveWork }, archiveExecutor = { archiveWork }, deadlineExecutor = { deadlines })
+            liveExecutor = { liveWork }, archiveExecutor = { archiveWork }, deadlineExecutor = { deadlines }, retirements = retirements)
         CaptureChannelReceiver::class.java.getDeclaredField("instance").apply { isAccessible = true }.set(null, receiver)
     }
 
@@ -87,6 +89,8 @@ class CaptureChannelLifetimeTest {
         archiveWork.shutdownNow()
         deadlines.shutdownNow()
         coordinator.shutdownForTests()
+        try { PhoneCaptureCoordinator.shared(context).shutdownForTests() }
+        finally { PhoneCaptureCoordinator.resetSharedForTests() }
     }
 
     @Test
@@ -112,6 +116,7 @@ class CaptureChannelLifetimeTest {
         assertArrayEquals(byteArrayOf(1, 2, 3, 4, 5, 6, 7, 8), speech.pcm.toByteArray())
         assertEquals(4L, CaptureRepository(context).get(CAPTURE)?.observedFrames)
         assertEquals(0, speech.cancels.get())
+        awaitClosed(channel)
         assertEquals(listOf(channel), closed)
         assertEquals(1, stream.closeCount.get())
         assertReleased()
@@ -139,6 +144,7 @@ class CaptureChannelLifetimeTest {
         WavPcmReader(java.io.File(record.localAudioPath!!), record.format).use {
             assertArrayEquals(byteArrayOf(11, 12, 13, 14), it.read())
         }
+        awaitClosed(channel)
         assertEquals(listOf(channel), closed)
         assertReleased()
     }
@@ -160,6 +166,7 @@ class CaptureChannelLifetimeTest {
 
         listener.destroy()
 
+        awaitClosed(archive)
         assertEquals(listOf(archive), closed)
         assertEquals(0, speech.cancels.get())
         stream.feed(frame(1, byteArrayOf(3, 4)) + eof())
@@ -193,6 +200,7 @@ class CaptureChannelLifetimeTest {
         runtime.destroy()
 
         assertTrue(liveWork.awaitTermination(2, TimeUnit.SECONDS))
+        awaitClosed(active, queued)
         assertEquals(listOf(active), acquired)
         assertEquals(setOf(active, queued), closed.toSet())
         assertEquals(2, closed.size)
@@ -235,6 +243,7 @@ class CaptureChannelLifetimeTest {
         assertTrue(stream.isClosed.get())
         assertEquals(1, speech.cancels.get())
         assertEquals("live-input-timeout", CaptureRepository(context).get(CAPTURE)?.lastErrorCode)
+        awaitClosed(channel)
         assertEquals(listOf(channel), closed)
         assertReleased()
     }
@@ -258,6 +267,7 @@ class CaptureChannelLifetimeTest {
         fence(archiveWork)
 
         assertTrue(blocked.isClosed.get())
+        awaitClosed(archive, live)
         assertEquals(setOf(archive, live), closed.toSet())
         assertReleased()
     }
@@ -280,11 +290,13 @@ class CaptureChannelLifetimeTest {
             receiver.onChannelOpened(channel)
             assertTrue(acquiring.await(2, TimeUnit.SECONDS))
             receiver.shutdown()
+            awaitClosed(channel)
             assertEquals(listOf(channel), closed)
         } finally {
             release.countDown()
         }
         assertTrue(liveWork.awaitTermination(2, TimeUnit.SECONDS))
+        await { stream.isClosed.get() }
         assertTrue(stream.isClosed.get())
         assertEquals(1, stream.closeCount.get())
         assertEquals(1L, stream.waiting.count)
@@ -299,6 +311,7 @@ class CaptureChannelLifetimeTest {
 
         receiver.onChannelOpened(channel)
 
+        awaitClosed(channel)
         assertEquals(listOf(channel), closed)
         assertTrue(acquired.isEmpty())
         assertReleased()
@@ -317,11 +330,13 @@ class CaptureChannelLifetimeTest {
         assertEquals(1L, speech.finished.count)
         assertEquals(0, speech.pcm.size())
         assertEquals("live-input-failed", CaptureRepository(context).get(CAPTURE)?.lastErrorCode)
+        awaitClosed(channel)
         assertEquals(listOf(channel), closed)
         assertReleased()
     }
 
     private fun assertReleased() {
+        await { retirements.size == 0 }
         val channels = CaptureChannelReceiver::class.java.getDeclaredField("openChannels").apply { isAccessible = true }
             .get(receiver) as Map<*, *>
         assertTrue(channels.isEmpty())
@@ -329,6 +344,13 @@ class CaptureChannelLifetimeTest {
     }
 
     private fun fence(executor: ExecutorService) = executor.submit {}.get(2, TimeUnit.SECONDS)
+    private fun awaitClosed(vararg channels: ChannelClient.Channel) = await { channels.all { channel ->
+        closed.contains(channel) && (streams[channel] as? ChunkedInput)?.let { !acquired.contains(channel) || it.isClosed.get() } != false
+    } }
+    private fun await(condition: () -> Boolean) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+        while (!condition()) { check(System.nanoTime() < deadline) { "Synthetic cleanup did not complete" }; Thread.sleep(1) }
+    }
 
     @Test fun activeSessionWithoutAChannelCannotReceiveAnotherBoundCapturesPcmOrTerminalOperations() {
         val a = "synthetic-watch-node"
@@ -340,6 +362,7 @@ class CaptureChannelLifetimeTest {
         val foreign = TestChannel("${CaptureWire.LIVE}/$OTHER_CAPTURE/$SESSION", b)
         streams[foreign] = liveBytes(frame(0, byteArrayOf(9, 0)) + eof(), OTHER_CAPTURE).inputStream()
         receiver.onChannelOpened(foreign); fence(liveWork); assertTrue(coordinator.awaitIdle())
+        awaitClosed(foreign)
         assertFalse(acquired.contains(foreign)); assertTrue(closed.contains(foreign))
         assertEquals(0, speech.pcm.size()); assertEquals(0, speech.cancels.get()); assertEquals(1L, speech.finished.count)
         assertEquals(1, speech.starts.get())
@@ -389,6 +412,7 @@ class CaptureChannelLifetimeTest {
         val channel = liveChannel()
         streams[channel] = liveBytes(frame(0, byteArrayOf(1, 0)) + eof()).inputStream()
         receiver.onChannelOpened(channel); fence(liveWork); assertTrue(coordinator.awaitIdle())
+        awaitClosed(channel)
         assertTrue(closed.contains(channel)); assertEquals(0, speech.starts.get()); assertEquals(0, speech.pcm.size())
         val record = CaptureRepository(context).get(CAPTURE)!!
         assertEquals(CaptureState.RECORDING, record.captureState)
@@ -406,7 +430,7 @@ class CaptureChannelLifetimeTest {
         assertTrue(coordinator.awaitIdle())
         val repository = CaptureRepository(context)
         val saved = repository.get(CAPTURE)!!
-        val audio = File(saved.localAudioPath!!).readBytes()
+        val audio = File(requireNotNull(saved.localAudioPath)).readBytes()
         val headerLength = DataInputStream(full.inputStream()).readInt()
         val headerOnly = full.copyOf(4 + headerLength + 8)
         val other = TestChannel(original.path, "synthetic-other-watch")
@@ -418,7 +442,7 @@ class CaptureChannelLifetimeTest {
         assertTrue(receipts.all { it.first == "synthetic-other-watch" && it.second.optString("errorCode") == "capture-origin-not-authorized" })
         assertTrue(receipts.none { it.second.has("finalText") || it.second.has("fullText") || it.second.has("archiveHash") })
         assertEquals(saved, repository.get(CAPTURE))
-        assertArrayEquals(audio, File(saved.localAudioPath).readBytes())
+        assertArrayEquals(audio, File(requireNotNull(saved.localAudioPath)).readBytes())
         context.openOrCreateDatabase("captures.db", 0, null).use { it.execSQL("DELETE FROM phone_capture_origins") }
         val legacy = TestChannel(original.path)
         receipts.clear()
@@ -426,7 +450,185 @@ class CaptureChannelLifetimeTest {
         receiver.onChannelOpened(legacy); fence(archiveWork); assertTrue(coordinator.awaitIdle())
         assertTrue(receipts.all { it.second.optString("stage") == "AUTHORIZATION_FAILED" })
         assertTrue(receipts.none { it.second.has("finalText") || it.second.has("archiveHash") }); assertNull(repository.phoneOrigin(CAPTURE))
-        assertEquals(saved, repository.get(CAPTURE)); assertArrayEquals(audio, File(saved.localAudioPath).readBytes())
+        assertEquals(saved, repository.get(CAPTURE)); assertArrayEquals(audio, File(requireNotNull(saved.localAudioPath)).readBytes())
+    }
+
+    @Test fun orphanedVerifiedWavCannotAuthorizeByHeaderButFreshBodyCanRecoverWithoutDeletingEvidence() {
+        val full = archiveBytes(byteArrayOf(1, 0, 2, 0))
+        val headerSize = DataInputStream(full.inputStream()).readInt()
+        val wavBytes = full.copyOfRange(4 + headerSize + 8, full.size)
+        val directory = File(context.filesDir, "captures/$CAPTURE").apply { mkdirs() }
+        File(directory, "received.wav").writeBytes(wavBytes)
+        val headerOnly = archiveChannel()
+        streams[headerOnly] = full.copyOf(4 + headerSize + 8).inputStream()
+        receiver.onChannelOpened(headerOnly); fence(archiveWork)
+        val repository = CaptureRepository(context)
+        assertNull(repository.get(CAPTURE)); assertNull(repository.phoneOrigin(CAPTURE))
+        val evidence = File(context.filesDir, "capture-quarantine").listFiles()!!.single()
+        assertArrayEquals(wavBytes, evidence.readBytes())
+        val retry = archiveChannel()
+        streams[retry] = full.inputStream()
+        receiver.onChannelOpened(retry); fence(archiveWork)
+        assertTrue(coordinator.awaitIdle())
+        assertEquals("synthetic-watch-node", repository.phoneOrigin(CAPTURE))
+        assertArrayEquals(wavBytes, File(repository.get(CAPTURE)!!.localAudioPath!!).readBytes())
+        assertArrayEquals(wavBytes, evidence.readBytes())
+    }
+
+    @Test fun renameFollowedByFailedMetadataCommitIsRecoverableOnlyThroughAnotherVerifiedBody() {
+        val full = archiveBytes(byteArrayOf(1, 0, 2, 0))
+        // Open schema, then fail the first atomic capture/origin insertion after the file rename.
+        val repository = CaptureRepository(context)
+        repository.get(CAPTURE)
+        context.openOrCreateDatabase("captures.db", Context.MODE_PRIVATE, null).use {
+            it.execSQL("CREATE TRIGGER synthetic_archive_commit_failure BEFORE INSERT ON captures BEGIN SELECT RAISE(ABORT, 'Synthetic archive metadata failure'); END")
+        }
+        try {
+            val first = archiveChannel()
+            streams[first] = full.inputStream()
+            receiver.onChannelOpened(first); fence(archiveWork)
+            assertNull(repository.get(CAPTURE)); assertNull(repository.phoneOrigin(CAPTURE))
+            assertTrue(File(context.filesDir, "captures/$CAPTURE/received.wav").isFile)
+        } finally {
+            context.openOrCreateDatabase("captures.db", Context.MODE_PRIVATE, null).use { it.execSQL("DROP TRIGGER synthetic_archive_commit_failure") }
+        }
+        val retry = archiveChannel()
+        streams[retry] = full.inputStream()
+        receiver.onChannelOpened(retry); fence(archiveWork)
+        assertTrue(coordinator.awaitIdle())
+        assertEquals("synthetic-watch-node", repository.phoneOrigin(CAPTURE))
+        assertEquals(48L, repository.get(CAPTURE)!!.finalizedByteLength)
+        assertEquals(1, File(context.filesDir, "capture-quarantine").listFiles()!!.size)
+    }
+
+    @Test fun actualInputTaskCompletingAfterTimeoutAndFailedCloseTasksRetainAdmissionUntilRecovery() {
+        receiver.shutdown()
+        val owner = CaptureChannelRetirementOwner(1)
+        val late = com.google.android.gms.tasks.TaskCompletionSource<InputStream>()
+        val requested = CountDownLatch(1)
+        val closeAttempts = AtomicInteger()
+        val streamAttempts = AtomicInteger()
+        val recovered = AtomicBoolean(false)
+        val workers = Executors.newSingleThreadExecutor()
+        val taskReceiver = CaptureChannelReceiver(context, coordinator,
+            inputTask = { requested.countDown(); late.task },
+            closeTask = {
+                closeAttempts.incrementAndGet()
+                if (recovered.get()) com.google.android.gms.tasks.Tasks.forResult<Void>(null)
+                else com.google.android.gms.tasks.Tasks.forException<Void>(IOException("Synthetic asynchronous close failure"))
+            }, archiveExecutor = { workers }, retirements = owner, inputTimeoutMs = 20, observeNativeClosures = {})
+        try {
+            taskReceiver.onChannelOpened(archiveChannel())
+            assertTrue(requested.await(2, TimeUnit.SECONDS))
+            fence(workers) // The actual Tasks.await timed out, not a synchronous fake acquisition.
+            await { closeAttempts.get() == 3 }
+            assertEquals(1, owner.size); assertNull(owner.reserve())
+            late.setResult(object : InputStream() {
+                override fun read(): Int = throw AssertionError("Revoked late input must never be read")
+                override fun close() {
+                    streamAttempts.incrementAndGet()
+                    if (!recovered.get()) throw IOException("Synthetic late stream close failure")
+                }
+            })
+            await { streamAttempts.get() == 3 }
+            assertEquals(1, owner.size); assertNull(owner.reserve())
+            assertNull(CaptureRepository(context).phoneOrigin(CAPTURE))
+            recovered.set(true); owner.retryFailedRetirements()
+            await { owner.size == 0 }
+            assertTrue(closeAttempts.get() >= 4); assertTrue(streamAttempts.get() >= 4)
+        } finally {
+            recovered.set(true)
+            if (!late.task.isComplete) late.setException(IOException("Synthetic acquisition cancelled"))
+            taskReceiver.shutdown(); owner.retryFailedRetirements()
+            workers.shutdownNow(); assertTrue(workers.awaitTermination(2, TimeUnit.SECONDS))
+        }
+    }
+
+    @Test fun bodyReadCompletingAfterRuntimeRevocationCannotCommitArchiveOrOrigin() {
+        val source = archiveBytes(byteArrayOf(1, 0, 2, 0)).inputStream()
+        val bodyRead = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val stream = object : java.io.FilterInputStream(source) {
+            override fun read(bytes: ByteArray, offset: Int, length: Int): Int {
+                val count = source.read(bytes, offset, length)
+                if (count > 0 && source.available() == 0) {
+                    bodyRead.countDown()
+                    val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+                    while (release.count > 0) {
+                        check(System.nanoTime() < deadline) { "Synthetic body read was not released" }
+                        try { release.await(100, TimeUnit.MILLISECONDS) } catch (_: InterruptedException) { }
+                    }
+                }
+                return count
+            }
+            override fun close() = Unit // Models already-read bytes arriving despite a successful close.
+        }
+        val channel = archiveChannel()
+        streams[channel] = stream
+        try {
+            receiver.onChannelOpened(channel)
+            assertTrue(bodyRead.await(2, TimeUnit.SECONDS))
+            receiver.shutdown()
+        } finally { release.countDown() }
+        assertTrue(archiveWork.awaitTermination(2, TimeUnit.SECONDS))
+        assertNull(CaptureRepository(context).get(CAPTURE))
+        assertNull(CaptureRepository(context).phoneOrigin(CAPTURE))
+        assertFalse(File(context.filesDir, "captures/$CAPTURE/received.wav").exists())
+    }
+
+    @Test fun exactNativeCloseWhileAdmissionWaitsIsRememberedAndPendingInputStillKeepsItsSlot() {
+        receiver.shutdown()
+        val owner = CaptureChannelRetirementOwner(1)
+        val held = owner.reserve()!!
+        held.acquiredNative { }; held.close()
+        val beforeWait = CountDownLatch(1)
+        val inputRequested = CountDownLatch(1)
+        val input = com.google.android.gms.tasks.TaskCompletionSource<InputStream>()
+        val closeRequests = AtomicInteger()
+        val readers = Executors.newSingleThreadExecutor()
+        val dispatch = Executors.newSingleThreadExecutor()
+        val incoming = CaptureChannelReceiver(context, coordinator, retirements = owner,
+            inputTask = { inputRequested.countDown(); input.task },
+            closeTask = { closeRequests.incrementAndGet(); com.google.android.gms.tasks.Tasks.forException<Void>(IOException("Synthetic already-closed handle")) },
+            observeNativeClosures = { beforeWait.countDown() }, archiveExecutor = { readers })
+        try {
+            val channel = archiveChannel()
+            val adopting = dispatch.submit { incoming.onChannelOpened(channel) }
+            assertTrue(beforeWait.await(2, TimeUnit.SECONDS)) // Exact pending marker exists before capacity wait.
+            CaptureChannelReceiver.confirmNativeRetired(TestChannel(channel.path, channel.nodeId))
+            assertThrows(java.util.concurrent.TimeoutException::class.java) { adopting.get(100, TimeUnit.MILLISECONDS) }
+            CaptureChannelReceiver.confirmNativeRetired(channel)
+            assertEquals(1, owner.size) // The unrelated held owner cannot be released by this callback.
+            held.confirmNativeRetired()
+            adopting.get(3, TimeUnit.SECONDS)
+            await { owner.size == 0 }
+            assertEquals(0, closeRequests.get())
+            assertEquals(1L, inputRequested.count)
+            assertNull(CaptureRepository(context).phoneOrigin(CAPTURE))
+
+            val acquiring = archiveChannel()
+            incoming.onChannelOpened(acquiring)
+            assertTrue(inputRequested.await(2, TimeUnit.SECONDS))
+            CaptureChannelReceiver.confirmNativeRetired(TestChannel(acquiring.path, acquiring.nodeId))
+            assertEquals(1, owner.size)
+            CaptureChannelReceiver.confirmNativeRetired(acquiring)
+            assertEquals("Native confirmation cannot erase an actual pending input Task", 1, owner.size)
+            assertNull(owner.reserve())
+            val streamClosed = CountDownLatch(1)
+            input.setResult(object : java.io.ByteArrayInputStream(byteArrayOf()) {
+                override fun close() { streamClosed.countDown() }
+            })
+            assertTrue(streamClosed.await(2, TimeUnit.SECONDS))
+            fence(readers); await { owner.size == 0 }
+            assertEquals(0, closeRequests.get())
+        } finally {
+            held.confirmNativeRetired()
+            if (!input.task.isComplete) input.setException(IOException("Synthetic acquisition cancelled"))
+            incoming.shutdown(); owner.retryFailedRetirements()
+            dispatch.shutdownNow(); readers.shutdownNow()
+            assertTrue(dispatch.awaitTermination(3, TimeUnit.SECONDS))
+            assertTrue(readers.awaitTermination(3, TimeUnit.SECONDS))
+        }
     }
 
     private fun liveChannel(id: String = CAPTURE, session: String = SESSION) = TestChannel("${CaptureWire.LIVE}/$id/$session")

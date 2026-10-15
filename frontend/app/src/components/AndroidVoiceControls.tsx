@@ -1,4 +1,4 @@
-import { useId, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { AndroidVoiceAdapterView } from '../lib/useAndroidVoiceAdapter'
 import { visibleSpeechError, openSpeechServicesStore } from '../lib/androidVoice'
@@ -19,6 +19,22 @@ interface Props {
 export function AndroidVoiceControls({ voice, disabled, generationAvailable, compact = false, modelControl, secondaryControls }: Props) {
   const descriptionId = useId()
   const [showMissingSpeechPrompt, setShowMissingSpeechPrompt] = useState(false)
+  const speechDialogRef = useRef<HTMLDialogElement>(null)
+  const speechInvokerRef = useRef<HTMLElement | null>(null)
+  const openMissingSpeechPrompt = (invoker: HTMLElement) => {
+    speechInvokerRef.current = invoker
+    setShowMissingSpeechPrompt(true)
+  }
+  useEffect(() => {
+    if (!showMissingSpeechPrompt) return
+    const dialog = speechDialogRef.current!
+    const invoker = speechInvokerRef.current
+    dialog.showModal()
+    return () => {
+      dialog.close()
+      if (invoker?.isConnected) invoker.focus()
+    }
+  }, [showMissingSpeechPrompt])
   const { status, pending, error, ownedSessionError, statusError, confirmationRequired, active,
     start, stop, finishDictation, finishShortcut, toggleSpeech } = voice
   const sessionError = visibleSpeechError(error ?? ownedSessionError)
@@ -37,20 +53,22 @@ export function AndroidVoiceControls({ voice, disabled, generationAvailable, com
   const voiceActionDisabled = (actionAllowsMissing = true) =>
     disabled || active || !generationAvailable || (status?.available !== true && (!actionAllowsMissing || !isMissingSpeech))
 
-  const handleVoiceAction = (action: () => void) => {
+  const handleVoiceAction = (action: () => void, invoker: HTMLElement) => {
     if (isMissingSpeech) {
-      setShowMissingSpeechPrompt(true)
+      openMissingSpeechPrompt(invoker)
       return
     }
     action()
   }
 
   const missingSpeechDialog = showMissingSpeechPrompt ? (
-    <div className="speech-prompt-dialog" role="dialog" aria-modal="true" aria-labelledby={`${descriptionId}-missing-title`}>
-      <div className="speech-prompt-dialog__backdrop" onClick={() => setShowMissingSpeechPrompt(false)} />
+    <dialog ref={speechDialogRef} className="speech-prompt-dialog" role="dialog" aria-labelledby={`${descriptionId}-missing-title`}
+      aria-describedby={`${descriptionId}-missing-description`}
+      onCancel={(event) => { event.preventDefault(); setShowMissingSpeechPrompt(false) }}
+      onClick={(event) => { if (event.target === event.currentTarget) setShowMissingSpeechPrompt(false) }}>
       <div className="speech-prompt-dialog__content">
         <h4 id={`${descriptionId}-missing-title`}>Speech Services Required</h4>
-        <p>{missingRequirementText}</p>
+        <p id={`${descriptionId}-missing-description`}>{missingRequirementText}</p>
         <div className="speech-prompt-dialog__actions">
           <button type="button" className="shell__control shell__action-button" onClick={() => {
             setShowMissingSpeechPrompt(false)
@@ -58,12 +76,12 @@ export function AndroidVoiceControls({ voice, disabled, generationAvailable, com
           }}>
             Open Play Store
           </button>
-          <button type="button" className="shell__control" onClick={() => setShowMissingSpeechPrompt(false)}>
+          <button type="button" autoFocus className="shell__control" onClick={() => setShowMissingSpeechPrompt(false)}>
             Cancel
           </button>
         </div>
       </div>
-    </div>
+    </dialog>
   ) : null
 
   if (compact) {
@@ -84,10 +102,10 @@ export function AndroidVoiceControls({ voice, disabled, generationAvailable, com
     const speakerDescription = compactError ?? (pending ? 'Voice controls busy' : status === null ? 'Checking speech availability…' : speakerState === 'speaking' ? 'Speaking…' : status.ttsEnabled ? 'Speak replies enabled' : status.ttsAvailable ? 'Speak replies off' : 'Native speech output is unavailable')
     const iconClass = 'shell__control shell__icon-control'
     return <div className="composer__actions android-voice-controls android-voice-controls--compact" role="group" aria-label="Android voice controls">
-      <button type="button" className={iconClass} aria-label={micLabel} title={`${micLabel}: ${micDescription}`} aria-describedby={`${descriptionId}-mic`} aria-pressed={status?.mode === 'ask' && active} disabled={voiceActionDisabled()} onClick={() => handleVoiceAction(() => void start(false, undefined, 'single_turn'))}><ControlIcon kind="mic" state={!active && !generationAvailable && compactError === null ? 'unavailable' : voiceState} /></button>
-      <button type="button" className={iconClass} aria-label={conversationLabel} title={`${conversationLabel}: ${conversationDescription}`} aria-describedby={`${descriptionId}-conversation`} aria-pressed={conversing} disabled={!active && voiceActionDisabled()} onClick={active ? stop : () => handleVoiceAction(() => void start(true))}><ControlIcon kind={active ? 'stop' : 'conversation'} state={!active && !generationAvailable && compactError === null ? 'unavailable' : voiceState} /></button>
+      <button type="button" className={iconClass} aria-label={micLabel} title={`${micLabel}: ${micDescription}`} aria-describedby={`${descriptionId}-mic`} aria-pressed={status?.mode === 'ask' && active} disabled={voiceActionDisabled()} onClick={(event) => handleVoiceAction(() => void start(false, undefined, 'single_turn'), event.currentTarget)}><ControlIcon kind="mic" state={!active && !generationAvailable && compactError === null ? 'unavailable' : voiceState} /></button>
+      <button type="button" className={iconClass} aria-label={conversationLabel} title={`${conversationLabel}: ${conversationDescription}`} aria-describedby={`${descriptionId}-conversation`} aria-pressed={conversing} disabled={!active && voiceActionDisabled()} onClick={active ? stop : (event) => handleVoiceAction(() => void start(true), event.currentTarget)}><ControlIcon kind={active ? 'stop' : 'conversation'} state={!active && !generationAvailable && compactError === null ? 'unavailable' : voiceState} /></button>
       <PhoneActionOverflow>
-        <button type="button" className={iconClass} aria-label="Speak replies" title={`Speak replies: ${speakerDescription}`} aria-describedby={`${descriptionId}-speaker`} aria-pressed={status?.ttsEnabled ?? false} disabled={speechDisabled} onClick={isMissingSpeech ? () => setShowMissingSpeechPrompt(true) : toggleSpeech}><ControlIcon kind="speaker" state={speakerState} /></button>
+        <button type="button" className={iconClass} aria-label="Speak replies" title={`Speak replies: ${speakerDescription}`} aria-describedby={`${descriptionId}-speaker`} aria-pressed={status?.ttsEnabled ?? false} disabled={speechDisabled} onClick={isMissingSpeech ? (event) => openMissingSpeechPrompt(event.currentTarget) : toggleSpeech}><ControlIcon kind="speaker" state={speakerState} /></button>
         {modelControl}
         {secondaryControls}
       </PhoneActionOverflow>
@@ -100,10 +118,10 @@ export function AndroidVoiceControls({ voice, disabled, generationAvailable, com
     </div>
   }
   return <div className="composer__actions android-voice-controls" role="group" aria-label="Android voice controls">
-    <button type="button" aria-label="Dictate" title="Dictate" aria-pressed={dictating} disabled={disabled || active || (status?.available !== true && !isMissingSpeech)} onClick={() => handleVoiceAction(() => void start(false))}>Dictate</button>
-    <button type="button" aria-label="Ask" title="Ask" aria-pressed={status?.mode === 'ask' && active} disabled={voiceActionDisabled()} onClick={() => handleVoiceAction(() => void start(false, undefined, 'single_turn'))}>Ask</button>
-    <button type="button" aria-label="Talk" title="Talk" aria-pressed={conversing} disabled={voiceActionDisabled()} onClick={() => handleVoiceAction(() => void start(true))}>Talk</button>
-    <button type="button" aria-label="Speak replies" title="Speak replies" aria-pressed={status?.ttsEnabled ?? false} disabled={speechDisabled} onClick={isMissingSpeech ? () => setShowMissingSpeechPrompt(true) : toggleSpeech}>Speak replies</button>
+    <button type="button" aria-label="Dictate" title="Dictate" aria-pressed={dictating} disabled={disabled || active || (status?.available !== true && !isMissingSpeech)} onClick={(event) => handleVoiceAction(() => void start(false), event.currentTarget)}>Dictate</button>
+    <button type="button" aria-label="Ask" title="Ask" aria-pressed={status?.mode === 'ask' && active} disabled={voiceActionDisabled()} onClick={(event) => handleVoiceAction(() => void start(false, undefined, 'single_turn'), event.currentTarget)}>Ask</button>
+    <button type="button" aria-label="Talk" title="Talk" aria-pressed={conversing} disabled={voiceActionDisabled()} onClick={(event) => handleVoiceAction(() => void start(true), event.currentTarget)}>Talk</button>
+    <button type="button" aria-label="Speak replies" title="Speak replies" aria-pressed={status?.ttsEnabled ?? false} disabled={speechDisabled} onClick={isMissingSpeech ? (event) => openMissingSpeechPrompt(event.currentTarget) : toggleSpeech}>Speak replies</button>
     {modelControl}
     {confirmationRequired ? <span role="status" data-voice-confirmation>Tap Ask to start voice in this chat.</span> : null}
     {shortcutCanFinish ? <button type="button" disabled={status.shortcutPhase === 'finishing'} onClick={finishShortcut}>Stop &amp; send</button> : status?.dictation === 'listening' ? <button type="button" onClick={finishDictation}>Finish dictation</button> : null}

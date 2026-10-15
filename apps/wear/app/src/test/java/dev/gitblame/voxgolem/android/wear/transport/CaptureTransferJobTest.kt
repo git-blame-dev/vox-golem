@@ -95,7 +95,7 @@ class CaptureTransferJobTest {
             sha256 = "a".repeat(64),
         ))
 
-        WearCaptureTransport(context).transferPending(started)
+        WearCaptureTransport(context, offlineSdk()).use { it.transferPending(started) }
 
         val attempted = shared.get(id)!!
         assertEquals(TransferState.SENDING, attempted.transferState)
@@ -120,19 +120,34 @@ class CaptureTransferJobTest {
             retryCount = 0,
             nextRetryAtUtc = start.plusSeconds(30).toString(),
         ))
-        val transport = WearCaptureTransport(context)
+        val sdk = FakeCaptureWearSdk() // One arranged reachable peer; sends succeed, no receipt is delivered.
+        val transport = WearCaptureTransport(context, sdk)
+        val worker = java.util.concurrent.Executors.newSingleThreadExecutor()
+        fun transfer(at: Instant) = worker.submit { transport.transferPending(at) }.get(15, java.util.concurrent.TimeUnit.SECONDS)
+        try {
+            transfer(start.plusSeconds(29))
+            assertEquals(start.plusSeconds(30).toString(), shared.get(id)!!.nextRetryAtUtc)
+            assertTrue(sdk.sent.isEmpty())
 
-        transport.transferPending(start.plusSeconds(29))
-        assertEquals(start.plusSeconds(30).toString(), shared.get(id)!!.nextRetryAtUtc)
+            transfer(start.plusSeconds(30))
+            val polled = shared.get(id)!!
+            assertEquals(TransferState.PHONE_STAGED, polled.transferState)
+            assertEquals(start.plusSeconds(90).toString(), polled.nextRetryAtUtc)
+            assertEquals(1, polled.retryCount)
+            assertEquals(listOf(dev.gitblame.voxgolem.capture.CaptureProtocol.STATUS), sdk.sent)
+            val request = org.json.JSONObject(String(sdk.sentBodies.single().second, Charsets.UTF_8))
+            assertEquals(id, request.getString("captureId"))
+            assertEquals("PHONE_STAGED", request.getString("knownStage"))
+            assertTrue(dev.gitblame.voxgolem.capture.CaptureProtocol.isValidUuid(request.getString("requestId")))
 
-        transport.transferPending(start.plusSeconds(30))
-        val polled = shared.get(id)!!
-        assertEquals(TransferState.PHONE_STAGED, polled.transferState)
-        assertEquals(start.plusSeconds(90).toString(), polled.nextRetryAtUtc)
-        assertEquals(1, polled.retryCount)
-
-        transport.transferPending(start.plusSeconds(31))
-        assertEquals(start.plusSeconds(90).toString(), shared.get(id)!!.nextRetryAtUtc)
+            transfer(start.plusSeconds(31))
+            assertEquals(start.plusSeconds(90).toString(), shared.get(id)!!.nextRetryAtUtc)
+            assertEquals(1, sdk.sent.size)
+        } finally {
+            transport.close()
+            worker.shutdownNow()
+            assertTrue(worker.awaitTermination(15, java.util.concurrent.TimeUnit.SECONDS))
+        }
     }
 
     @Test
@@ -176,7 +191,7 @@ class CaptureTransferJobTest {
         val malformedDeadline = pending(1, "synthetic invalid timestamp")
         val future = pending(2, at.plusSeconds(90).toString())
         val staged = pending(3, at.toString(), TransferState.PHONE_STAGED)
-        WearCaptureTransport(context).transferPending(at)
+        WearCaptureTransport(context, offlineSdk()).use { it.transferPending(at) }
         for (record in listOf(first, malformedDeadline)) {
             val attempted = shared.get(record.captureId)!!
             assertEquals(TransferState.SENDING, attempted.transferState)
@@ -222,5 +237,9 @@ class CaptureTransferJobTest {
             watch.updateTransfer(record.captureId, TransferState.PENDING, at)
             assertEquals(status, shared.get(record.captureId)!!.transferState)
         }
+    }
+
+    private fun offlineSdk() = FakeCaptureWearSdk().apply {
+        phoneTask = { com.google.android.gms.tasks.Tasks.forException(IllegalStateException("Synthetic peer offline")) }
     }
 }

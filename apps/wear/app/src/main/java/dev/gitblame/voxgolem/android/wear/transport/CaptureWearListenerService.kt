@@ -187,6 +187,7 @@ class CaptureWearListenerService : com.google.android.gms.wearable.WearableListe
         private fun confirmedClosed(channel: ChannelClient.Channel) {
             pendingNativeClosures[channel]?.set(true)
             receiptLifetimes[channel]?.confirmNativeRetired()
+            CaptureChannelOwnership.confirmNativeRetired(channel)
         }
         /** SDK callback dispatch is independent of the backpressured WearableListenerService queue. */
         private fun observeClosures(context: android.content.Context) {
@@ -203,6 +204,7 @@ class CaptureWearListenerService : com.google.android.gms.wearable.WearableListe
             } } catch (_: Exception) { observerRequested.set(false) }
         }
         internal fun retryReceiptRetirements() { requestObserver(); processRetirements.retryFailedRetirements() }
+        internal fun observeCaptureClosures(context: android.content.Context) = observeClosures(context)
         private val receiptLifetimes = java.util.concurrent.ConcurrentHashMap<ChannelClient.Channel, CaptureChannelLifetime>()
         private val receiptWorkers = java.util.concurrent.ThreadPoolExecutor(2, 2, 0, TimeUnit.MILLISECONDS,
             java.util.concurrent.ArrayBlockingQueue(8), { runnable -> Thread(runnable, "capture-receipt").apply { isDaemon = true } })

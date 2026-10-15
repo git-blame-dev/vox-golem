@@ -6,7 +6,6 @@ import android.net.Uri
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import org.json.JSONObject
-import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.IOException
@@ -20,7 +19,11 @@ interface NotesDestinationStore {
 }
 
 /** SAF-backed folder preference and verified recording archive. */
-class SafNotesStore(context: Context) : NotesDestinationStore {
+class SafNotesStore(
+    context: Context,
+    private val openArchiveOutput: (Uri) -> java.io.OutputStream? = { context.contentResolver.openOutputStream(it, "wt") },
+    private val commitArchiveJournal: ((String, String) -> Boolean)? = null,
+) : NotesDestinationStore {
     private val resolver: ContentResolver = context.contentResolver
     private val preferences = context.applicationContext.getSharedPreferences("capture_notes", Context.MODE_PRIVATE)
     private val lock = processArchiveLock
@@ -53,7 +56,7 @@ class SafNotesStore(context: Context) : NotesDestinationStore {
     ): Uri = synchronized(lock) {
         require(CaptureProtocol.isValidUuid(captureId)) { "Invalid capture UUID" }
         require(sourceWav.isFile && sourceWav.length() == expectedByteLength) { "Staged WAV length does not match manifest" }
-        require(sha256(sourceWav) == expectedSha256.lowercase()) { "Staged WAV hash does not match manifest" }
+        require(CaptureFileIntegrity.digest(sourceWav).sha256 == expectedSha256.lowercase()) { "Staged WAV hash does not match manifest" }
         val recordings = findOrCreateDirectory(destination.treeUri, "recordings")
         val name = "${captureId.lowercase()}.wav"
         val existing = children(recordings).filter { it.name == name }
@@ -73,7 +76,9 @@ class SafNotesStore(context: Context) : NotesDestinationStore {
             val created = DocumentsContract.createDocument(resolver, recordings, "audio/wav", name)
                 ?: throw IOException("Provider refused to create $name")
             val stored = JSONObject().put("uri", created.toString()).put("hash", expectedSha256.lowercase()).put("length", expectedByteLength)
-            if (!preferences.edit().putString(journalKey, stored.toString()).commit()) throw IOException("Cannot journal new recording document")
+            val committed = commitArchiveJournal?.invoke(journalKey, stored.toString())
+                ?: preferences.edit().putString(journalKey, stored.toString()).commit()
+            if (!committed) throw IOException("Cannot journal new recording document")
             if (documentName(created) != name) throw IOException("Provider changed the requested recording name; journal retained for review")
             created
         }
@@ -81,8 +86,8 @@ class SafNotesStore(context: Context) : NotesDestinationStore {
         if (knownJournal.optString("hash") != expectedSha256.lowercase() || knownJournal.optLong("length", -1) != expectedByteLength) {
             throw IOException("Journaled recording belongs to a different archive attempt")
         }
-        resolver.openOutputStream(target, "wt")?.use { output ->
-            FileInputStream(sourceWav).use { input -> input.copyTo(output, COPY_BUFFER_BYTES) }
+        openArchiveOutput(target)?.use { output ->
+            FileInputStream(sourceWav).use { input -> CaptureFileIntegrity.digest(input, output) }
         } ?: throw IOException("Provider cannot open recording for replacement")
         if (!contentMatches(target, expectedSha256, expectedByteLength)) throw IOException("Archived recording failed read-back verification")
         return@synchronized target
@@ -142,39 +147,16 @@ class SafNotesStore(context: Context) : NotesDestinationStore {
 
     private fun contentMatches(uri: Uri, expectedHash: String, expectedLength: Long): Boolean {
         val input = resolver.openInputStream(uri) ?: throw IOException("Provider cannot read archived recording")
-        val digest = MessageDigest.getInstance("SHA-256")
-        var length = 0L
-        input.use { stream ->
-            val buffer = ByteArray(COPY_BUFFER_BYTES)
-            while (true) {
-                val count = stream.read(buffer)
-                if (count < 0) break
-                length += count
-                digest.update(buffer, 0, count)
-            }
-        }
-        return length == expectedLength && digest.digest().hex() == expectedHash.lowercase()
+        val actual = input.use { CaptureFileIntegrity.digest(it) }
+        return actual.byteLength == expectedLength && actual.sha256 == expectedHash.lowercase()
     }
 
     companion object {
         private const val KEY_TREE_URI = "selected_tree_uri"
-        private const val COPY_BUFFER_BYTES = 64 * 1024
         private val processArchiveLock = Any()
 
         private fun destinationId(uri: Uri): String = digest(uri.toString())
         private fun digest(value: String): String = MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8)).hex()
-        private fun sha256(file: File): String {
-            val digest = MessageDigest.getInstance("SHA-256")
-            BufferedInputStream(FileInputStream(file)).use { input ->
-                val buffer = ByteArray(COPY_BUFFER_BYTES)
-                while (true) {
-                    val count = input.read(buffer)
-                    if (count < 0) break
-                    digest.update(buffer, 0, count)
-                }
-            }
-            return digest.digest().hex()
-        }
         private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
     }
 }

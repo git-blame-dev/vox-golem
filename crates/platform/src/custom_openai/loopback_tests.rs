@@ -8,6 +8,7 @@ use tokio::net::TcpListener;
 const CHILD_TEST: &str = "custom_openai::loopback_tests::constructor_dispatch_child";
 const CHILD_ENDPOINT: &str = "VOX_SYNTHETIC_LOOPBACK_ENDPOINT";
 const CHILD_AUTH: &str = "VOX_SYNTHETIC_LOOPBACK_AUTH";
+const CHILD_MODEL: &str = "VOX_SYNTHETIC_LOOPBACK_MODEL";
 static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
 struct AuthFixture(PathBuf);
@@ -80,7 +81,11 @@ fn constructor_dispatch_child() {
             connect_timeout: Duration::from_secs(2),
             idle_timeout: Duration::from_secs(2),
             total_timeout: Duration::from_secs(3),
-            ..Default::default()
+            model: if std::env::var(CHILD_MODEL).as_deref() == Ok("local") {
+                CustomOpenAiModel::LocalFast
+            } else {
+                CustomOpenAiModel::SolHigh
+            },
         };
         let owner = CustomOpenAiClient::new(config.clone()).expect("accepted loopback spelling");
         // Trimming remains compatible; this fix must not broaden cross-origin pool reuse.
@@ -96,13 +101,21 @@ fn constructor_dispatch_child() {
             Err(CustomOpenAiError::InvalidConfig)
         ));
         let response = client
-            .respond(
+            .respond_with_auth_revision(
                 &CustomOpenAiPrompt {
                     session_id: "synthetic-loopback-session".into(),
                     prompt: "Synthetic loopback question".into(),
                     history: vec![],
                 },
+                None,
                 |_| {},
+                |_| {
+                    assert_ne!(
+                        client.config().model,
+                        CustomOpenAiModel::LocalFast,
+                        "local requests must not observe cloud revisions"
+                    )
+                },
             )
             .await
             .expect("direct synthetic loopback response");
@@ -176,6 +189,7 @@ async fn public_constructor_bypasses_ambient_proxy_for_accepted_loopback_spellin
             .args(["--exact", CHILD_TEST, "--nocapture"])
             .env(CHILD_ENDPOINT, &endpoint)
             .env(CHILD_AUTH, &auth.0)
+            .env_remove(CHILD_MODEL)
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
         // All proxy changes are confined to a fresh test-harness process. Clearing
@@ -207,4 +221,55 @@ async fn public_constructor_bypasses_ambient_proxy_for_accepted_loopback_spellin
         assert!(status.success(), "actual constructor/dispatch child failed");
         origin_task.await.unwrap();
     }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn local_dispatch_does_not_open_a_blocking_cloud_credential_source() {
+    let fixture = crate::test_support::TestDir::new("local-auth-fifo");
+    let auth = fixture.path().join("cloud-auth.fifo");
+    assert!(Command::new("mkfifo")
+        .arg(&auth)
+        .status()
+        .unwrap()
+        .success());
+    let origin = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let endpoint = format!("http://{}/responses", origin.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            let (mut socket, _) = origin.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut buffer = [0; 4096];
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert_ne!(count, 0, "complete local request required");
+                request.extend_from_slice(&buffer[..count]);
+                assert!(request.len() < MAX_REQUEST_BYTES + 16 * 1024);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    let length: usize = headers.lines().find_map(|line| line.strip_prefix("content-length:")).unwrap().trim().parse().unwrap();
+                    if request.len() < end + 4 + length { continue; }
+                    assert!(!headers.contains("authorization:"));
+                    assert!(!headers.contains("chatgpt-account-id:"));
+                    break;
+                }
+            }
+            let body = b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Synthetic loopback answer\"}]}]}}\n\n";
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+            socket.write_all(body).await.unwrap();
+        }).await.expect("local fixture dispatch deadline");
+    });
+    let mut child = HarnessChild(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", CHILD_TEST, "--nocapture"])
+            .env(CHILD_ENDPOINT, endpoint)
+            .env(CHILD_AUTH, &auth)
+            .env(CHILD_MODEL, "local")
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    assert!(child.wait().await.success(), "local dispatch must complete without opening the FIFO (subprocess deadline bounds a regression)");
+    server.await.unwrap();
 }

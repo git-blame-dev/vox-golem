@@ -40,6 +40,7 @@ class AcknowledgedAssistantDelivery(
     private val enqueue: (AssistantDeliveryPacket) -> Unit,
     private val maxInFlight: Int = 64,
     private val timeoutMillis: Long = 5000,
+    private val onBlocked: () -> Unit = {},
 ) : AssistantDeliveryGate {
     private val lock = Object()
     private var providerId: String? = null
@@ -58,7 +59,7 @@ class AcknowledgedAssistantDelivery(
     }
 
     override fun deliverStatus(status: AssistantToolStatus): Boolean {
-        if (status.status !in AssistantSearchModes.statuses) { cancel(); return false }
+        if (!AssistantSearchModes.isValidStatus(status.status)) { cancel(); return false }
         if (synchronized(lock) { ++statuses > AssistantSearchModes.MAX_STATUS_EVENTS }) { cancel(); return false }
         return publish(AssistantDeliveryPacket(status.clientRequestToken, status.providerRequestId, status.sequence, toolStatus = status.status), false)
     }
@@ -104,6 +105,7 @@ class AcknowledgedAssistantDelivery(
         while (!failed && !condition()) {
             val remaining = deadline - System.nanoTime()
             if (remaining <= 0) { failed = true; break }
+            onBlocked()
             try { lock.wait((remaining / 1_000_000).coerceAtLeast(1)) } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt(); failed = true
             }
