@@ -15,4 +15,17 @@ class AssistantProviderNativeTest {
         assertEquals("""{"status":"cancelled"}""", AssistantProviderNative.respond(id, "/synthetic/private/auth.json", request, callback))
         assertEquals(1, ready)
     }
+
+    @Test fun nativePrepareSearchReturnsStructuredEmptyJsonWhenWebDisabled() {
+        val statuses = mutableListOf<String>()
+        val callback = object : ProviderDeltaCallback {
+            override fun onReady() {}
+            override fun onDelta(text: String) {}
+            override fun onStatus(status: String) { statuses.add(status) }
+        }
+        val request = """{"requestId":"synthetic-jni-search-off","prompt":"What is the weather?","webEnabled":false}"""
+        val json = AssistantProviderNative.prepareSearch(request, callback)
+        assertEquals("""{"evidenceContext":null,"sourceFooter":"","sources":[]}""", json)
+        assertTrue(statuses.isEmpty())
+    }
 }

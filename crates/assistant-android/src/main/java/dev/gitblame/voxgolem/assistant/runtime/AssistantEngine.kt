@@ -482,7 +482,7 @@ class AssistantEngine @JvmOverloads internal constructor(
             if (ticket.cancelled.get() || ticket.epoch != epoch.get()) { fail("interrupted", true); return }
             if (!state.foreground) { fail("background", true); return }
             val auth = credentials?.selection()
-            if (state.model != "local-fast" && !state.model.startsWith("agy-")) {
+            if (state.model != "local-fast" && state.model != GeminiNanoProvider.MODEL_NAME && !state.model.startsWith("agy-")) {
                 val credential = auth?.status
                 state = state.copy(credential = credential)
                 when (credential?.reason) {

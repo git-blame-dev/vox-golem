@@ -333,7 +333,7 @@ class EnginePhoneBackend internal constructor(
              "unsupported_tts_voice" -> AssistantPhoneFailure("unavailable", "Selected TTS voice is not available for this provider, language or network policy")
              "invalid_speech_selection" -> AssistantPhoneFailure("invalid_input", "Invalid speech selection")
              "background", "backgrounded" -> AssistantPhoneFailure("unavailable", "The app must be in the foreground to send a request")
-            "aicore_not_available" -> AssistantPhoneFailure("unavailable", "Gemini Nano is not ready. In Developer options > AICore Settings, enable 'On-device GenAI', connect to Wi-Fi, and plug into power to download.")
+            "aicore_not_available" -> AssistantPhoneFailure("unavailable", "Gemini Nano is not available on this device yet. It needs a locked bootloader, an up-to-date AICore, and (on Pixel 8) enrolment in the AICore developer preview. Other models still work.")
             "aicore_needs_update" -> AssistantPhoneFailure("unavailable", "Gemini Nano requires an AICore update from Google Play")
             "aicore_busy" -> AssistantPhoneFailure("busy", "Gemini Nano on-device service is busy")
             "aicore_downloading" -> AssistantPhoneFailure("unavailable", "Gemini Nano model is downloading in the background. Please wait and try again shortly.")

@@ -632,6 +632,98 @@ pub extern "system" fn Java_dev_gitblame_voxgolem_assistant_runtime_AssistantPro
     cancel_jni(env, receiver, request_id);
 }
 
+pub(crate) fn prepare_search<F>(input: &str, mut on_status: F) -> search::SearchPreparation
+where
+    F: FnMut(&str),
+{
+    let Ok(parsed) = search::SearchPrepareRequest::parse(input) else {
+        return search::SearchPreparation::default();
+    };
+    if !parsed.web_enabled {
+        return search::SearchPreparation::default();
+    }
+    let registration = parsed
+        .request_id
+        .as_deref()
+        .and_then(|id| cancellation::registry().register(id).ok());
+    let (_fallback_tx, fallback_rx) = watch::channel(false);
+    let rx = registration
+        .as_ref()
+        .map(|reg| reg.cancelled.clone())
+        .unwrap_or(fallback_rx);
+    let Ok(process) = search::process() else {
+        return search::SearchPreparation::default();
+    };
+    let (preparation, _status) =
+        process
+            .runtime
+            .block_on(search::prepare(process, &parsed, rx, &mut |event| {
+                if let CallbackEvent::Status(status) = event {
+                    on_status(status);
+                }
+                Ok(())
+            }));
+    preparation
+}
+
+fn prepare_search_jni(
+    mut env: JNIEnv<'_>,
+    _receiver: JObject<'_>,
+    request_json: JString<'_>,
+    callback: JObject<'_>,
+) -> jstring {
+    let preparation = catch_unwind(AssertUnwindSafe(|| {
+        let Ok(input) = read_string(&mut env, &request_json, request::MAX_REQUEST_BYTES) else {
+            return search::SearchPreparation::default();
+        };
+        prepare_search(&input, |status| {
+            if callback.is_null() {
+                return;
+            }
+            let delivered: jni::errors::Result<()> = env.with_local_frame(2, |env| {
+                let text = env.new_string(status)?;
+                env.call_method(
+                    &callback,
+                    "onStatus",
+                    "(Ljava/lang/String;)V",
+                    &[JValue::Object(text.as_ref())],
+                )?;
+                Ok(())
+            });
+            if delivered.is_err() {
+                clear_exception(&env);
+            }
+        })
+    }))
+    .unwrap_or_default();
+    clear_exception(&env);
+    env.new_string(preparation.json())
+        .map(JString::into_raw)
+        .unwrap_or(std::ptr::null_mut())
+}
+
+#[allow(unsafe_code)]
+#[no_mangle]
+pub extern "system" fn Java_dev_gitblame_voxgolem_assistant_runtime_AssistantProviderNative_nativePrepareSearch(
+    env: JNIEnv<'_>,
+    receiver: JObject<'_>,
+    request_json: JString<'_>,
+    callback: JObject<'_>,
+) -> jstring {
+    prepare_search_jni(env, receiver, request_json, callback)
+}
+
+#[allow(unsafe_code)]
+#[no_mangle]
+pub extern "system" fn Java_dev_gitblame_voxgolem_android_wear_assistant_WearAssistantNative_nativePrepareSearch(
+    env: JNIEnv<'_>,
+    receiver: JObject<'_>,
+    request_json: JString<'_>,
+    callback: JObject<'_>,
+) -> jstring {
+    prepare_search_jni(env, receiver, request_json, callback)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1752,6 +1844,27 @@ mod tests {
         assert_eq!(
             outcome.json(),
             r#"{"status":"error","code":"invalid_request"}"#
+        );
+    }
+
+    #[test]
+    fn prepare_search_returns_empty_json_contract_when_disabled_or_invalid() {
+        let mut statuses = Vec::new();
+        let disabled = prepare_search(
+            r#"{"requestId":"synthetic-search-off","prompt":"What is the weather?","webEnabled":false}"#,
+            |status| statuses.push(status.to_string()),
+        );
+        assert!(statuses.is_empty());
+        assert_eq!(
+            disabled.json(),
+            r#"{"evidenceContext":null,"sourceFooter":"","sources":[]}"#
+        );
+
+        let invalid = prepare_search("{invalid", |status| statuses.push(status.to_string()));
+        assert!(statuses.is_empty());
+        assert_eq!(
+            invalid.json(),
+            r#"{"evidenceContext":null,"sourceFooter":"","sources":[]}"#
         );
     }
 }

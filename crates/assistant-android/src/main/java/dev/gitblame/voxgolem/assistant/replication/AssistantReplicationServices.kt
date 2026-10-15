@@ -5,8 +5,11 @@ import android.app.job.JobService
 import com.google.android.gms.wearable.CapabilityInfo
 import com.google.android.gms.wearable.DataEvent
 import com.google.android.gms.wearable.DataEventBuffer
+import com.google.android.gms.wearable.MessageEvent
 import com.google.android.gms.wearable.Node
 import com.google.android.gms.wearable.WearableListenerService
+import dev.gitblame.voxgolem.assistant.runtime.GeminiNanoRelayBridge
+import dev.gitblame.voxgolem.assistant.runtime.GeminiNanoRelayWire
 import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -16,6 +19,11 @@ class AssistantReplicationListenerService : WearableListenerService() {
         for (event in events) {
             if (count++ == 64) break
             if (event.type == DataEvent.TYPE_CHANGED) AssistantReplication.onData(applicationContext, event.dataItem)
+        }
+    }
+    override fun onMessageReceived(messageEvent: MessageEvent) {
+        if (messageEvent.path.startsWith(GeminiNanoRelayWire.PREFIX)) {
+            GeminiNanoRelayBridge.onMessageReceived(applicationContext, messageEvent)
         }
     }
     override fun onPeerConnected(node: Node) {

@@ -12,6 +12,8 @@ interface ProviderDeltaCallback {
 interface ProviderNativeCalls {
     fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String
     fun cancel(requestId: String)
+    fun prepareSearch(requestJson: String, callback: ProviderDeltaCallback): String =
+        """{"evidenceContext":null,"sourceFooter":"","sources":[]}"""
 }
 
 object AssistantProviderNative : ProviderNativeCalls {
@@ -19,4 +21,7 @@ object AssistantProviderNative : ProviderNativeCalls {
     external fun observeAuth(authPath: String): String
     external override fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String
     external override fun cancel(requestId: String)
+    external fun nativePrepareSearch(requestJson: String, callback: ProviderDeltaCallback): String
+    override fun prepareSearch(requestJson: String, callback: ProviderDeltaCallback): String =
+        nativePrepareSearch(requestJson, callback)
 }

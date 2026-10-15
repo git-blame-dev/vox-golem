@@ -480,6 +480,8 @@ internal fun assistantErrorText(code: String): String = when (code) {
     "unsupported_model" -> "Choose a supported Custom model."
     "prompt_too_large" -> "Draft exceeds 32 KiB. Previous draft retained."
     "saved_local_state_failed" -> "Answer saved, but local selection/draft update failed."
+    "aicore_not_available", "aicore_unavailable", "aicore_needs_update" -> "Gemini Nano is unavailable on the paired phone. Draft retained."
+    "aicore_busy", "aicore_downloading" -> "Gemini Nano is busy or downloading on the phone. Retry shortly."
     else -> "Assistant error ($code). Draft retained; no automatic retry."
 }
 

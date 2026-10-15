@@ -16,7 +16,7 @@ class AgyProviderRouter(
     private val context: Context,
     private val defaultNative: ProviderNativeCalls = AssistantProviderNative,
     private val agyNative: ProviderNativeCalls = AgyProviderNative(context),
-    private val geminiNanoNative: ProviderNativeCalls = GeminiNanoProvider(context)
+    private val geminiNanoNative: ProviderNativeCalls = GeminiNanoProvider(context, searchNative = defaultNative)
 ) : ProviderNativeCalls {
     fun prewarm(model: String) {
         if (model == GeminiNanoProvider.MODEL_NAME) {
@@ -47,6 +47,9 @@ class AgyProviderRouter(
         agyNative.cancel(requestId)
         defaultNative.cancel(requestId)
     }
+
+    override fun prepareSearch(requestJson: String, callback: ProviderDeltaCallback): String =
+        defaultNative.prepareSearch(requestJson, callback)
 }
 
 class AgyProviderNative(private val context: Context) : ProviderNativeCalls {

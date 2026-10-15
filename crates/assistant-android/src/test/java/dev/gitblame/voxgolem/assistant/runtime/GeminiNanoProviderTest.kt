@@ -2,6 +2,7 @@ package dev.gitblame.voxgolem.assistant.runtime
 
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
+import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
@@ -9,6 +10,7 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
+import java.nio.charset.StandardCharsets
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35], manifest = Config.NONE)
@@ -37,6 +39,28 @@ class GeminiNanoProviderTest {
         }
     }
 
+    private class FakeSearchNative(
+        val onPrepareSearch: (String, ProviderDeltaCallback) -> String = { _, _ ->
+            """{"evidenceContext":null,"sourceFooter":"","sources":[]}"""
+        }
+    ) : ProviderNativeCalls {
+        val cancelledIds = mutableListOf<String>()
+
+        override fun respond(
+            requestId: String,
+            authPath: String,
+            requestJson: String,
+            callback: ProviderDeltaCallback
+        ): String = """{"status":"error","code":"invalid_request"}"""
+
+        override fun cancel(requestId: String) {
+            cancelledIds.add(requestId)
+        }
+
+        override fun prepareSearch(requestJson: String, callback: ProviderDeltaCallback): String =
+            onPrepareSearch(requestJson, callback)
+    }
+
     private class RecordingCallback : ProviderDeltaCallback {
         val ready = mutableListOf<Boolean>()
         val deltas = mutableListOf<String>()
@@ -54,7 +78,12 @@ class GeminiNanoProviderTest {
     @Test
     fun standardInferenceStreamsDeltasAndCompletes() {
         val fakeEngine = FakeEngine()
-        val provider = GeminiNanoProvider(RuntimeEnvironment.getApplication(), engineFactory = { fakeEngine })
+        val provider = GeminiNanoProvider(
+            RuntimeEnvironment.getApplication(),
+            searchNative = FakeSearchNative(),
+            isWatchDevice = { false },
+            engineFactory = { fakeEngine }
+        )
         val callback = RecordingCallback()
 
         val requestJson = JSONObject()
@@ -70,6 +99,7 @@ class GeminiNanoProviderTest {
         assertEquals("complete", result.getString("status"))
         assertEquals("output_text", result.getString("contentType"))
         assertEquals("Hello from Gemini Nano", result.getString("text"))
+        assertFalse(result.has("speechText"))
         assertEquals("gemini-nano", result.getString("returnedModel"))
         assertTrue(result.has("firstTextMs"))
         assertTrue(result.has("completedMs"))
@@ -82,11 +112,27 @@ class GeminiNanoProviderTest {
     }
 
     @Test
-    fun searchGroundedInferenceEmitsStatusesAndAugmentsPrompt() {
+    fun searchGroundedInferenceUsesNativeSearchAndAppendsSourceFooter() {
         var capturedPrompt = ""
         val fakeEngine = FakeEngine(onStreamPrompt = { capturedPrompt = it })
-        val provider = GeminiNanoProvider(RuntimeEnvironment.getApplication(), engineFactory = { fakeEngine })
-        provider.searchProvider = { query -> "Search evidence snippet for $query" }
+        val footer = "\n\nSources:\nhttps://example.com/game-recap\n"
+        val fakeSearch = FakeSearchNative { reqJson, cb ->
+            val obj = JSONObject(reqJson)
+            assertEquals("req-2", obj.getString("requestId"))
+            cb.onStatus("Searching")
+            cb.onStatus("Reading")
+            JSONObject()
+                .put("evidenceContext", "[1] Game Recap (https://example.com/game-recap)\nSearch evidence snippet for Who won the game?")
+                .put("sourceFooter", footer)
+                .put("sources", JSONArray())
+                .toString()
+        }
+        val provider = GeminiNanoProvider(
+            RuntimeEnvironment.getApplication(),
+            searchNative = fakeSearch,
+            isWatchDevice = { false },
+            engineFactory = { fakeEngine }
+        )
         val callback = RecordingCallback()
 
         val requestJson = JSONObject()
@@ -104,14 +150,26 @@ class GeminiNanoProviderTest {
         assertTrue(capturedPrompt.contains("[Web Search Context:"))
         assertTrue(capturedPrompt.contains("Search evidence snippet for Who won the game?"))
         assertTrue(capturedPrompt.contains("Who won the game?"))
+        assertEquals(listOf("Hello", " from", " Gemini Nano", footer), callback.deltas)
+        assertEquals("Hello from Gemini Nano$footer", result.getString("text"))
+        assertEquals("Hello from Gemini Nano", result.getString("speechText"))
     }
 
     @Test
     fun searchFallbackEmittedWhenSearchReturnsEmpty() {
         var capturedPrompt = ""
         val fakeEngine = FakeEngine(onStreamPrompt = { capturedPrompt = it })
-        val provider = GeminiNanoProvider(RuntimeEnvironment.getApplication(), engineFactory = { fakeEngine })
-        provider.searchProvider = { "" }
+        val fakeSearch = FakeSearchNative { _, cb ->
+            cb.onStatus("Searching")
+            cb.onStatus("Fallback")
+            """{"evidenceContext":null,"sourceFooter":"","sources":[]}"""
+        }
+        val provider = GeminiNanoProvider(
+            RuntimeEnvironment.getApplication(),
+            searchNative = fakeSearch,
+            isWatchDevice = { false },
+            engineFactory = { fakeEngine }
+        )
         val callback = RecordingCallback()
 
         val requestJson = JSONObject()
@@ -128,25 +186,83 @@ class GeminiNanoProviderTest {
         assertEquals(listOf("Searching", "Fallback"), callback.statuses)
         assertFalse(capturedPrompt.contains("[Web Search Context:"))
         assertTrue(capturedPrompt.contains("Obscure fact question"))
+        assertEquals(listOf("Hello", " from", " Gemini Nano"), callback.deltas)
     }
 
     @Test
-    fun prewarmCallsPrepareInferenceEngine() {
+    fun multiTurnConversationHistoryFormatsPriorTurnsAndStripsPriorSourceFooters() {
+        var capturedPrompt = ""
+        val fakeEngine = FakeEngine(onStreamPrompt = { capturedPrompt = it })
+        val provider = GeminiNanoProvider(
+            RuntimeEnvironment.getApplication(),
+            searchNative = FakeSearchNative(),
+            isWatchDevice = { false },
+            engineFactory = { fakeEngine }
+        )
+        val callback = RecordingCallback()
+
+        val messages = JSONArray()
+            .put(JSONObject().put("role", "user").put("content", "Tell me about Chicago."))
+            .put(JSONObject().put("role", "assistant").put("content", "Chicago is a major city in Illinois.\n\nSources:\nhttps://example.com/chicago\n"))
+            .put(JSONObject().put("role", "user").put("content", "What is its population?"))
+
+        val requestJson = JSONObject()
+            .put("model", "gemini-nano")
+            .put("instructions", "You are a helpful assistant. For this spoken turn, be concise.")
+            .put("messages", messages)
+            .put("webEnabled", false)
+            .toString()
+
+        val resultStr = provider.respond("req-history", "/synthetic/auth", requestJson, callback)
+        val result = JSONObject(resultStr)
+
+        assertEquals("complete", result.getString("status"))
+        assertTrue(capturedPrompt.contains("System Instructions:\nYou are a helpful assistant."))
+        assertTrue(capturedPrompt.contains("[System note: For this spoken response, give a concise answer in 1-2 short natural sentences.]"))
+        assertTrue(capturedPrompt.contains("Conversation History:\nUser: Tell me about Chicago.\nAssistant: Chicago is a major city in Illinois."))
+        assertFalse(capturedPrompt.contains("https://example.com/chicago"))
+        assertTrue(capturedPrompt.endsWith("User: What is its population?\nAssistant:"))
+    }
+
+    @Test
+    fun prewarmCallsPrepareInferenceEngineOnPhoneAndSkipsOnWatch() {
         val fakeEngine = FakeEngine()
-        val provider = GeminiNanoProvider(RuntimeEnvironment.getApplication(), engineFactory = { fakeEngine })
+        val phoneProvider = GeminiNanoProvider(
+            RuntimeEnvironment.getApplication(),
+            searchNative = FakeSearchNative(),
+            isWatchDevice = { false },
+            engineFactory = { fakeEngine }
+        )
 
         assertFalse(fakeEngine.prewarmed)
-        provider.prewarm(async = false)
+        phoneProvider.prewarm(async = false)
         assertTrue(fakeEngine.prewarmed)
+
+        val watchEngine = FakeEngine()
+        val watchProvider = GeminiNanoProvider(
+            RuntimeEnvironment.getApplication(),
+            searchNative = FakeSearchNative(),
+            isWatchDevice = { true },
+            engineFactory = { watchEngine }
+        )
+        assertNull(watchProvider.prewarm(async = false))
+        assertFalse(watchEngine.prewarmed)
     }
 
     @Test
-    fun cancelAbortsActiveRequest() {
+    fun cancelAbortsActiveRequestAndForwardsToNativeSearch() {
         val fakeEngine = FakeEngine(chunks = listOf("First", "Second"))
-        val provider = GeminiNanoProvider(RuntimeEnvironment.getApplication(), engineFactory = { fakeEngine })
+        val fakeSearch = FakeSearchNative()
+        val provider = GeminiNanoProvider(
+            RuntimeEnvironment.getApplication(),
+            searchNative = fakeSearch,
+            isWatchDevice = { false },
+            engineFactory = { fakeEngine }
+        )
         val callback = RecordingCallback()
 
         provider.cancel("req-cancelled")
+        assertEquals(listOf("req-cancelled"), fakeSearch.cancelledIds)
         val resultStr = provider.respond(
             "req-cancelled",
             "/synthetic/auth",
@@ -158,9 +274,110 @@ class GeminiNanoProviderTest {
     }
 
     @Test
+    fun watchDeviceRelaysRespondAndCancelToPhoneAndStreamsEventsBack() {
+        val app = RuntimeEnvironment.getApplication()
+        val phoneEngine = FakeEngine(chunks = listOf("Relayed", " answer"))
+        val phoneProvider = GeminiNanoProvider(
+            app,
+            searchNative = FakeSearchNative { _, cb ->
+                cb.onStatus("Searching")
+                JSONObject()
+                    .put("evidenceContext", "Phone search context")
+                    .put("sourceFooter", "\n\nSources:\nhttps://example.com/phone\n")
+                    .put("sources", JSONArray())
+                    .toString()
+            },
+            isWatchDevice = { false },
+            engineFactory = { phoneEngine }
+        )
+
+        val prevFactory = GeminiNanoRelayBridge.phoneProviderFactory
+        val prevSender = GeminiNanoRelayBridge.phoneEventSender
+        try {
+            GeminiNanoRelayBridge.phoneProviderFactory = { phoneProvider }
+            val relayedEvents = mutableListOf<ByteArray>()
+            GeminiNanoRelayBridge.phoneEventSender = { _, _, bytes ->
+                relayedEvents.add(bytes)
+                GeminiNanoRelayBridge.deliverWatchEvent(bytes)
+            }
+
+            var cancelledOnWatchRelay: String? = null
+            val fakeWatchRelay = object : GeminiNanoWatchRelay {
+                override fun respond(requestId: String, requestJson: String, callback: ProviderDeltaCallback): String {
+                    val session = GeminiNanoRelayBridge.registerWatchSession(requestId)
+                    try {
+                        val reqBytes = JSONObject()
+                            .put("requestId", requestId)
+                            .put("requestJson", requestJson)
+                            .toString()
+                            .toByteArray(StandardCharsets.UTF_8)
+                        GeminiNanoRelayBridge.handlePhoneRelayRequest(app, "watch-node-1", reqBytes)
+                        while (true) {
+                            val evt = session.events.poll() ?: break
+                            when (evt.optString("type")) {
+                                "ready" -> callback.onReady()
+                                "dispatched" -> callback.onRequestDispatched()
+                                "status" -> callback.onStatus(evt.optString("status"))
+                                "first_text" -> callback.onFirstText(evt.optLong("milliseconds"))
+                                "delta" -> callback.onDelta(evt.optString("text"))
+                                "outcome" -> return evt.getString("outcomeJson")
+                            }
+                        }
+                        return JSONObject().put("status", "error").toString()
+                    } finally {
+                        GeminiNanoRelayBridge.unregisterWatchSession(requestId)
+                    }
+                }
+
+                override fun cancel(requestId: String) {
+                    cancelledOnWatchRelay = requestId
+                }
+            }
+
+            val watchProvider = GeminiNanoProvider(
+                app,
+                watchRelay = fakeWatchRelay,
+                isWatchDevice = { true },
+                engineFactory = { error("Watch must not instantiate local GeminiNanoEngine") }
+            )
+
+            val callback = RecordingCallback()
+            val reqJson = JSONObject()
+                .put("model", "gemini-nano")
+                .put("prompt", "Watch question")
+                .put("webEnabled", true)
+                .put("searchMode", "verify")
+                .toString()
+
+            val outcomeStr = watchProvider.respond("req-watch-1", "/auth", reqJson, callback)
+            val outcome = JSONObject(outcomeStr)
+
+            assertEquals("complete", outcome.getString("status"))
+            assertEquals("Relayed answer\n\nSources:\nhttps://example.com/phone\n", outcome.getString("text"))
+            assertEquals("Relayed answer", outcome.getString("speechText"))
+            assertEquals(listOf("Searching"), callback.statuses)
+            assertEquals(
+                listOf("Relayed", " answer", "\n\nSources:\nhttps://example.com/phone\n"),
+                callback.deltas
+            )
+
+            watchProvider.cancel("req-watch-cancel")
+            assertEquals("req-watch-cancel", cancelledOnWatchRelay)
+        } finally {
+            GeminiNanoRelayBridge.phoneProviderFactory = prevFactory
+            GeminiNanoRelayBridge.phoneEventSender = prevSender
+        }
+    }
+
+    @Test
     fun routerDispatchesGeminiNanoSeparatelyFromAgyAndDefault() {
         val fakeEngine = FakeEngine()
-        val nanoProvider = GeminiNanoProvider(RuntimeEnvironment.getApplication(), engineFactory = { fakeEngine })
+        val nanoProvider = GeminiNanoProvider(
+            RuntimeEnvironment.getApplication(),
+            searchNative = FakeSearchNative(),
+            isWatchDevice = { false },
+            engineFactory = { fakeEngine }
+        )
 
         var agyCalled = false
         val fakeAgy = object : ProviderNativeCalls {
@@ -172,12 +389,17 @@ class GeminiNanoProviderTest {
         }
 
         var defaultCalled = false
+        var prepareSearchCalled = false
         val fakeDefault = object : ProviderNativeCalls {
             override fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String {
                 defaultCalled = true
                 return JSONObject().put("status", "complete").put("model", "default").toString()
             }
             override fun cancel(requestId: String) {}
+            override fun prepareSearch(requestJson: String, callback: ProviderDeltaCallback): String {
+                prepareSearchCalled = true
+                return """{"evidenceContext":"ctx","sourceFooter":"","sources":[]}"""
+            }
         }
 
         val router = AgyProviderRouter(
@@ -190,7 +412,12 @@ class GeminiNanoProviderTest {
         val callback = RecordingCallback()
 
         // 1. gemini-nano should hit GeminiNanoProvider
-        val nanoResult = router.respond("req-nano", "/auth", JSONObject().put("model", "gemini-nano").put("prompt", "Hi").toString(), callback)
+        val nanoResult = router.respond(
+            "req-nano",
+            "/auth",
+            JSONObject().put("model", "gemini-nano").put("prompt", "Hi").put("webEnabled", false).toString(),
+            callback
+        )
         assertEquals("complete", JSONObject(nanoResult).getString("status"))
         assertEquals("gemini-nano", JSONObject(nanoResult).getString("returnedModel"))
         assertFalse(agyCalled)
@@ -204,5 +431,11 @@ class GeminiNanoProviderTest {
         // 3. custom-sol-high should hit defaultNative
         router.respond("req-custom", "/auth", JSONObject().put("model", "custom-sol-high").put("prompt", "Hi").toString(), callback)
         assertTrue(defaultCalled)
+
+        // 4. prepareSearch delegates to defaultNative
+        val prep = router.prepareSearch("""{"prompt":"Hi"}""", callback)
+        assertTrue(prepareSearchCalled)
+        assertEquals("ctx", JSONObject(prep).getString("evidenceContext"))
     }
 }
+
