@@ -269,10 +269,12 @@ class GeminiNanoProvider(
                         errorResult = cancelledResult()
                     } catch (e: GenerativeAIException) {
                         Log.e(TAG, "Gemini Nano GenerativeAIException (code ${e.errorCode}): ${e.message}", e)
-                        val code = when (e.errorCode) {
-                            GenerativeAIException.ErrorCode.NOT_AVAILABLE -> "aicore_not_available"
-                            GenerativeAIException.ErrorCode.NEEDS_SYSTEM_UPDATE -> "aicore_needs_update"
-                            GenerativeAIException.ErrorCode.BUSY -> "aicore_busy"
+                        val msg = (e.message ?: "") + " " + (e.cause?.message ?: "")
+                        val code = when {
+                            e.errorCode == GenerativeAIException.ErrorCode.NOT_AVAILABLE || msg.contains("NOT_AVAILABLE") || msg.contains("not found", ignoreCase = true) -> "aicore_not_available"
+                            e.errorCode == GenerativeAIException.ErrorCode.NEEDS_SYSTEM_UPDATE || msg.contains("UPDATE") -> "aicore_needs_update"
+                            e.errorCode == GenerativeAIException.ErrorCode.BUSY || msg.contains("BUSY") -> "aicore_busy"
+                            isDownloading.get() || msg.contains("download", ignoreCase = true) -> "aicore_downloading"
                             else -> "aicore_unavailable"
                         }
                         errorResult = JSONObject()
