@@ -12,6 +12,7 @@ export const MODEL_CATALOG = [
   { id: 'agy-flash-low', label: 'Agy: Gemini 3.8 Flash Low', agent: true, preview: false },
   { id: 'agy-flash-high', label: 'Agy: Gemini 3.8 Flash High', agent: true, preview: false },
   { id: 'agy-opus-high', label: 'Agy: Claude Opus 5.5 High', agent: true, preview: false },
+  { id: 'agy-sonnet-low', label: 'Agy: Claude Sonnet 5.5 Low', agent: true, preview: false },
   { id: 'agy-sonnet-high', label: 'Agy: Claude Sonnet 5.5 High', agent: true, preview: false },
 ] as const
 

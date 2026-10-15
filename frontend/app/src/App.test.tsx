@@ -4178,7 +4178,7 @@ describe('App', () => {
     const select = await getResponseProfileSelect(container)
 
     expect(select.value).toBe('local-fast')
-    expect(Array.from(select.options).map((option) => option.text)).toEqual(['Local: Llama 3.2 3B', 'Local: Quality', 'Custom: GPT-6.1 Sol High', 'Custom: GPT-6.1 Sol No Reasoning', 'Custom: GPT-6 Luna No Reasoning', 'Custom: GPT-5.6 Luna Low', 'OpenCode: GPT-6.1 Sol High', 'OpenCode: GPT-5.6 Luna Low', 'Agy: Gemini 3.8 Flash Low', 'Agy: Gemini 3.8 Flash High', 'Agy: Claude Opus 5.5 High', 'Agy: Claude Sonnet 5.5 High'])
+    expect(Array.from(select.options).map((option) => option.text)).toEqual(['Local: Llama 3.2 3B', 'Local: Quality', 'Custom: GPT-6.1 Sol High', 'Custom: GPT-6.1 Sol No Reasoning', 'Custom: GPT-6 Luna No Reasoning', 'Custom: GPT-5.6 Luna Low', 'OpenCode: GPT-6.1 Sol High', 'OpenCode: GPT-5.6 Luna Low', 'Agy: Gemini 3.8 Flash Low', 'Agy: Gemini 3.8 Flash High', 'Agy: Claude Opus 5.5 High', 'Agy: Claude Sonnet 5.5 Low', 'Agy: Claude Sonnet 5.5 High'])
   })
 
   it('invokes switch_response_profile when selecting Quality profile', async () => {

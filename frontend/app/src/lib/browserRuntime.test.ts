@@ -87,7 +87,7 @@ describe('browser preview runtime', () => {
     expect(snapshot.modelOptions.map((model) => model.id)).toEqual([
       'local-fast', 'local-quality', 'custom-sol-high', 'custom-sol-none',
       'custom-luna-none', 'custom-luna-low', 'opencode-sol-high', 'opencode-luna-low',
-      'agy-flash-low', 'agy-flash-high', 'agy-opus-high', 'agy-sonnet-high',
+      'agy-flash-low', 'agy-flash-high', 'agy-opus-high', 'agy-sonnet-low', 'agy-sonnet-high',
     ])
     expect(snapshot.modelOptions.filter((model) => model.available).map((model) => model.id)).toEqual(['local-fast'])
     expect(snapshot.modelOptions.find((model) => model.id === 'custom-sol-none')).toEqual({
