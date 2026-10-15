@@ -4,6 +4,8 @@ interface AssistantClient {
     fun snapshot(): AssistantState
     fun subscribe(observer: (AssistantState) -> Unit): AutoCloseable
     fun resume()
+    fun resume(reconcile: Boolean) = resume()
+    fun prewarm() {}
     fun refresh()
     fun background()
     fun stop()

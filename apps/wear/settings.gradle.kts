@@ -16,6 +16,7 @@ dependencyResolutionManagement {
 
 rootProject.name = "VoxGolemWear"
 include(":app")
+include(":voice-benchmark")
 
 include(":voice-android")
 project(":voice-android").projectDir = file("../../crates/voice-android")

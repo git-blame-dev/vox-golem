@@ -22,6 +22,7 @@ import dev.gitblame.voxgolem.assistant.speech.SpeechSelection
 import dev.gitblame.voxgolem.assistant.AssistantTiming
 import dev.gitblame.voxgolem.assistant.AssistantTiming.Operation
 import dev.gitblame.voxgolem.assistant.AssistantTiming.Stage
+import dev.gitblame.voxgolem.assistant.AssistantDiagnosticJournal.Metadata
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
@@ -59,7 +60,8 @@ open class AssistantActivity : ComponentActivity() {
         private set
     private var voiceState by mutableStateOf(AssistantVoiceState())
     private var voiceSubscription: AutoCloseable? = null
-    private data class VoiceAdmission(val conversationMode: Boolean, val draft: String, val conversation: String?, val head: String?)
+    private data class VoiceAdmission(val conversationMode: Boolean, val draft: String, val conversation: String?, val head: String?, val timing: AssistantTiming)
+    private var voiceFlowTiming: AssistantTiming? = null
     private var permissionAction: VoiceAdmission? by mutableStateOf(null)
     private var entryMode by mutableStateOf<AssistantVoiceEntryMode?>(null)
     private var permissionError by mutableStateOf<String?>(null)
@@ -97,10 +99,15 @@ open class AssistantActivity : ComponentActivity() {
             val projection = latest.get()
             replyMetrics.remember(projection.providerRequestId, projection.firstTextMs)
             state = projection
-            if (resumed && state.foreground) startupTiming?.finish(Stage.FIRST_PROJECTION)
-            if (resumed && state.foreground) { consumeVoiceLaunch(); history.select(state) }
+            if (resumed && state.contextReady && client.snapshot().foreground) startupTiming?.finish(Stage.FIRST_PROJECTION)
+            if (resumed && client.snapshot().foreground) {
+                consumeVoiceLaunch()
+                if (!startupSyncDeferred && state.contextReady) history.select(state)
+            }
         }
     }
+    private var startupSyncDeferred = false
+    private val deferredStartupSync = Runnable { flushDeferredStartupSync() }
     private val updateLink = object : Runnable {
         override fun run() {
             if (!visible || !resumed) return
@@ -109,9 +116,35 @@ open class AssistantActivity : ComponentActivity() {
         }
     }
 
-    protected open fun assistantClient(): AssistantClient = AssistantRuntime.get(applicationContext, startupTiming)
-    protected open fun assistantVoice(client: AssistantClient): AssistantVoiceController = WearAssistantVoice(this, client as AssistantEngine)
-    internal open fun assistantVoiceSettings(): WearVoiceSettings = WearVoiceSettings(this)
+    private fun startBackgroundSync() {
+        if (SyntheticAskBenchmark.active(client)) return
+        if (client is AssistantEngine) AssistantReplication.reconcileNow(applicationContext)
+        handler.removeCallbacks(updateLink)
+        updateLink.run()
+    }
+
+    private fun flushDeferredStartupSync() {
+        if (!startupSyncDeferred) return
+        startupSyncDeferred = false
+        handler.removeCallbacks(deferredStartupSync)
+        if (!visible || !resumed) return
+        startBackgroundSync()
+        val current = client.snapshot()
+        if (current.foreground && current.contextReady) history.select(current)
+    }
+
+    private fun deferStartupSync() {
+        startupSyncDeferred = true
+        handler.removeCallbacks(updateLink)
+        handler.removeCallbacks(deferredStartupSync)
+        handler.postDelayed(deferredStartupSync, DEFERRED_STARTUP_SYNC_DELAY_MS)
+    }
+
+    protected open fun assistantClient(): AssistantClient = SyntheticAskBenchmark.client(this)
+        ?: AssistantRuntime.get(applicationContext, startupTiming)
+    protected open fun assistantVoice(client: AssistantClient): AssistantVoiceController = SyntheticAskBenchmark.voice(this, client)
+        ?: WearAssistantVoice(this, client as AssistantEngine)
+    internal open fun assistantVoiceSettings(): WearVoiceSettings = WearVoiceSettings(SyntheticAskBenchmark.context(client) ?: this)
     private fun admitLaunch(entry: Boolean?) {
         pendingVoiceLaunch = null
         if (entry == null || voice.snapshot().active || permissionAction != null) return
@@ -121,17 +154,18 @@ open class AssistantActivity : ComponentActivity() {
 
     private fun beginStartup(stage: Stage) {
         startupTiming?.finish(Stage.REPLACED)
-        startupTiming = AssistantTiming.begin(applicationContext, Operation.ACTIVITY).also { it.mark(stage) }
+        startupTiming = (SyntheticAskBenchmark.timing(applicationContext, Operation.ACTIVITY)
+            ?: AssistantTiming.begin(applicationContext, Operation.ACTIVITY)).also { it.mark(stage) }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         beginStartup(Stage.ACTIVITY_CREATED)
-        replyMetrics = AssistantReplyMetrics(applicationContext)
         val launchEntry = if (savedInstanceState == null) voiceEntry(intent) else null
         entryMode = savedInstanceState?.getString("assistant.voice.entry")?.let { runCatching { AssistantVoiceEntryMode.valueOf(it) }.getOrNull() }
         client = assistantClient()
-        if (client is AssistantEngine) AssistantRuntime.configureCaptureResourceAdmission(true)
+        replyMetrics = AssistantReplyMetrics(SyntheticAskBenchmark.context(client) ?: applicationContext)
+        if (client is AssistantEngine && !SyntheticAskBenchmark.active(client)) AssistantRuntime.configureCaptureResourceAdmission(true)
         voice = assistantVoice(client)
         voiceSettings = assistantVoiceSettings()
         readVoicePreferences()
@@ -161,7 +195,9 @@ open class AssistantActivity : ComponentActivity() {
                         { requestVoice(false) }, { requestVoice(true) }, voice::endUtterance, ::setReadRepliesAloud, voice::speak,
                          ::recheck, history::older, history::retry, ::setConversationMode, client::selectSearchMode,
                            ::setWebEnabled, ::setSpeechNetworkFallback, ::setSpeechLanguage, ::setSpeechTtsProvider,
-                             ::setSpeechTtsVoice, ::resetSpeechSelection, prepareSpeechOptions = ::prepareSpeechOptions, openSpeechStore = ::openSpeechStore), pendingPrompts, speechSelectionError, speechSelectionPending,
+                              ::setSpeechTtsVoice, ::resetSpeechSelection, prepareSpeechOptions = ::prepareSpeechOptions, openSpeechStore = ::openSpeechStore,
+                              replyLayout = { (client as? AssistantEngine)?.markReplyLayout(it) },
+                              replyDrawSubmitted = { (client as? AssistantEngine)?.markReplyDrawSubmitted(it) }), pendingPrompts, speechSelectionError, speechSelectionPending,
                     replyMetrics = replyMetrics::get)
             }
         }
@@ -194,13 +230,15 @@ open class AssistantActivity : ComponentActivity() {
         voiceSubscription = voice.subscribe { projection ->
             val awakeToken = screenAwake.token
             val occurredAt = SystemClock.uptimeMillis()
-            handler.post {
+            val deliver = Runnable {
                 if (visible && observerEpoch == token) {
                     screenAwake.voiceProgress(projection, awakeToken, occurredAt)
                     voiceState = projection
                     projectPrompts()
+                    if (pendingVoiceLaunch == null && startupVoiceSettled(projection)) flushDeferredStartupSync()
                 }
             }
+            if (Looper.myLooper() == Looper.getMainLooper()) deliver.run() else handler.post(deliver)
         }
     }
 
@@ -213,34 +251,57 @@ open class AssistantActivity : ComponentActivity() {
         voice.foreground(true)
         readVoicePreferences()
         voice.tts(voicePreferences.readRepliesAloud)
-        if (client is AssistantEngine) AssistantReplication.reconcileNow(applicationContext)
-        handler.removeCallbacks(updateLink)
-        handler.post(updateLink)
-        consumeVoiceLaunch()
-        if (client.snapshot().foreground) history.select(client.snapshot())
+        val launchedVoice = consumeVoiceLaunch()
+        if (pendingVoiceLaunch != null || (launchedVoice && !startupVoiceSettled(voiceState))) {
+            deferStartupSync()
+        } else {
+            startupSyncDeferred = false
+            handler.removeCallbacks(deferredStartupSync)
+            startBackgroundSync()
+        }
+        val current = client.snapshot()
+        if (!startupSyncDeferred && current.foreground && current.contextReady) history.select(current)
     }
+
+    private fun startupVoiceSettled(projection: AssistantVoiceState): Boolean =
+        projection.dictation.readyForSpeech || projection.error != null || projection.loop.error != null ||
+            projection.dictation.phase in setOf(
+                dev.gitblame.voxgolem.assistant.recognition.DictationPhase.FINAL,
+                dev.gitblame.voxgolem.assistant.recognition.DictationPhase.ERROR)
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        SyntheticAskBenchmark.requireAttached(client)
         beginStartup(Stage.REQUESTED)
-        if (visible && resumed && client.snapshot().foreground) startupTiming?.finish(Stage.READY_REUSED)
+        if (visible && resumed && client.snapshot().let { it.foreground && it.contextReady }) startupTiming?.finish(Stage.READY_REUSED)
         setIntent(intent)
         admitLaunch(voiceEntry(intent))
-        consumeVoiceLaunch()
+        val launchedVoice = consumeVoiceLaunch()
+        if (visible && resumed && (pendingVoiceLaunch != null || (launchedVoice && !startupVoiceSettled(voiceState)))) deferStartupSync()
     }
 
-    private fun consumeVoiceLaunch() {
-        val conversation = pendingVoiceLaunch ?: return
-        if (!visible || !resumed || !client.snapshot().foreground) return
+    private fun consumeVoiceLaunch(): Boolean {
+        val conversation = pendingVoiceLaunch ?: return false
+        if (!visible || !resumed) return false
+        val current = client.snapshot()
+        // Only context hydration may keep a launch pending; all other admission fences retire it.
+        if (current.busy || voice.snapshot().active || input.pending || permissionAction != null || isFinishing || isDestroyed) {
+            pendingVoiceLaunch = null
+            return false
+        }
+        if (!current.contextReady) return false
         pendingVoiceLaunch = null
-        if (isFinishing || isDestroyed || client.snapshot().busy || voice.snapshot().active || input.pending || permissionAction != null) return
         requestVoice(conversation)
+        return true
     }
 
     override fun onPause() {
+        voiceFlowTiming?.finish(Stage.CANCELLED)
         startupTiming?.finish(Stage.CANCELLED)
         retireSpeechSelection()
         pendingVoiceLaunch = null
+        startupSyncDeferred = false
+        handler.removeCallbacks(deferredStartupSync)
         screenAwake.suspend()
         permissionAction = null
         history.suspendReads()
@@ -254,6 +315,8 @@ open class AssistantActivity : ComponentActivity() {
     override fun onStop() {
         retireSpeechSelection()
         pendingVoiceLaunch = null
+        startupSyncDeferred = false
+        handler.removeCallbacks(deferredStartupSync)
         permissionAction = null
         screenAwake.suspend()
         visible = false
@@ -309,16 +372,32 @@ open class AssistantActivity : ComponentActivity() {
     }
 
     internal fun requestVoice(conversation: Boolean) {
-        if (!visible || !resumed || isFinishing || isDestroyed || !client.snapshot().foreground || client.snapshot().busy || voice.snapshot().active || input.pending || permissionAction != null) return
-        entryMode = if (conversation) AssistantVoiceEntryMode.TALK else AssistantVoiceEntryMode.ASK
+        val mode = if (conversation) AssistantVoiceEntryMode.TALK else AssistantVoiceEntryMode.ASK
+        if (!AssistantVoiceLaunchGate.shouldStart(
+                visible = visible,
+                resumed = resumed,
+                state = client.snapshot(),
+                pendingMode = mode,
+                voiceActive = voice.snapshot().active,
+                inputPending = input.pending,
+                permissionPending = permissionAction != null,
+                finishingOrDestroyed = isFinishing || isDestroyed,
+            )) return
+        entryMode = mode
         pendingVoiceLaunch = null
         permissionError = null
+        voiceFlowTiming?.finish(Stage.REPLACED)
+        val timing = (startupTiming?.fork(Operation.VOICE_FLOW) ?: AssistantTiming.begin(applicationContext, Operation.VOICE_FLOW)).also {
+            it.mark(Stage.REQUESTED)
+            it.metadata(Metadata(entry = if (conversation) "talk" else "ask"))
+        }
+        voiceFlowTiming = timing
         if (!voice.snapshot().admissionReady) {
-            if (conversation) voice.conversation(client.snapshot().draft) else voice.ask(client.snapshot().draft)
+            if (conversation) voice.conversation(client.snapshot().draft, timing) else voice.ask(client.snapshot().draft, timing)
             return
         }
         val current = client.snapshot()
-        permissionAction = VoiceAdmission(conversation, current.draft, current.conversation, current.selectedHead)
+        permissionAction = VoiceAdmission(conversation, current.draft, current.conversation, current.selectedHead, timing)
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) receiveMicrophonePermission(true)
         else microphone.launch(Manifest.permission.RECORD_AUDIO)
     }
@@ -326,15 +405,29 @@ open class AssistantActivity : ComponentActivity() {
     internal fun receiveMicrophonePermission(granted: Boolean) {
         val admission = permissionAction ?: return
         permissionAction = null
-        if (!visible || !resumed || isFinishing || isDestroyed || !client.snapshot().foreground || client.snapshot().busy || voice.snapshot().active ||
+        val mode = if (admission.conversationMode) AssistantVoiceEntryMode.TALK else AssistantVoiceEntryMode.ASK
+        if (!AssistantVoiceLaunchGate.shouldStart(
+                visible = visible,
+                resumed = resumed,
+                state = client.snapshot(),
+                pendingMode = mode,
+                voiceActive = voice.snapshot().active,
+                finishingOrDestroyed = isFinishing || isDestroyed,
+            ) ||
             client.snapshot().conversation != admission.conversation || client.snapshot().selectedHead != admission.head || client.snapshot().draft != admission.draft) return
         if (granted) {
-            if (admission.conversationMode) voice.conversation(admission.draft) else voice.ask(admission.draft)
-        } else permissionError = "microphone_permission_required"
+            if (admission.conversationMode) voice.conversation(admission.draft, admission.timing) else voice.ask(admission.draft, admission.timing)
+        } else { admission.timing.finish(Stage.FAILED); permissionError = "microphone_permission_required" }
     }
 
-    internal fun stopAll() { pendingVoiceLaunch = null; permissionAction = null; voice.stop(); client.stop() }
-    internal fun openSpeechStore() { dev.gitblame.voxgolem.assistant.speech.SpeechServiceRequirement.openPlayStore(this) }
+    internal fun stopAll() { voiceFlowTiming?.finish(Stage.CANCELLED); pendingVoiceLaunch = null; permissionAction = null; voice.stop(); client.stop() }
+    internal fun openSpeechStore() {
+        if (!voiceState.missingSpeechServices && assistantNeedsTtsDataInstall(presentedVoiceState())) {
+            dev.gitblame.voxgolem.assistant.speech.SpeechServiceRequirement.openTtsDataInstall(this)
+            return
+        }
+        dev.gitblame.voxgolem.assistant.speech.SpeechServiceRequirement.openPlayStore(this)
+    }
     private fun canChangeVoiceContext() = visible && resumed && !voiceAdmissionPending && !voice.snapshot().active && !client.snapshot().busy
     internal fun newConversation() { if (canChangeVoiceContext()) client.newConversation() }
     internal fun selectConversation(id: String) { if (canChangeVoiceContext()) client.selectConversation(id) }
@@ -391,6 +484,10 @@ open class AssistantActivity : ComponentActivity() {
         pendingSpeechSelection = null
     }
     private fun readVoicePreferences() {
+        if (SyntheticAskBenchmark.active(client)) {
+            voicePreferences = WearVoicePreferences(readRepliesAloud = true, conversationMode = false)
+            return
+        }
         voicePreferences = voiceSettings.current()
         try { voicePreferences = voiceSettings.read() }
         catch (_: IllegalStateException) { permissionError = "settings_not_saved" }
@@ -427,13 +524,16 @@ open class AssistantActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        voiceFlowTiming?.finish(Stage.CANCELLED)
         screenAwake.suspend()
+        startupSyncDeferred = false
+        handler.removeCallbacks(deferredStartupSync)
         retireSpeechSelection(); voice.close(); handler.removeCallbacks(updateUi); handler.removeCallbacks(updateLink)
         super.onDestroy()
     }
 
     protected open fun readLinkStatus(result: (PeerPairingState) -> Unit) {
-        if (client is AssistantEngine) AssistantReplication.pairingState(applicationContext, result)
+        if (client is AssistantEngine && !SyntheticAskBenchmark.active(client)) AssistantReplication.pairingState(applicationContext, result)
         else result(PeerPairingState(PeerPairingReason.UNAVAILABLE))
     }
 
@@ -451,12 +551,14 @@ open class AssistantActivity : ComponentActivity() {
 
     private fun recheck() {
         client.refresh()
+        if (SyntheticAskBenchmark.active(client)) return
         if (client !is AssistantEngine) return
         refreshLinkStatus()
         AssistantReplication.reconcileNow(applicationContext)
     }
 
     companion object {
+        internal const val DEFERRED_STARTUP_SYNC_DELAY_MS = 500L
         internal const val VOICE_ENTRY = "dev.gitblame.voxgolem.android.wear.assistant.AssistantVoiceEntry"
         internal const val CONVERSATION_ENTRY = "dev.gitblame.voxgolem.android.wear.assistant.AssistantConversationEntry"
         private fun voiceEntry(intent: Intent?): Boolean? {
@@ -468,6 +570,22 @@ open class AssistantActivity : ComponentActivity() {
                 else -> null
             }
         }
+    }
+}
+
+internal fun assistantIsInstallableVoiceError(error: String, voice: AssistantVoiceState = AssistantVoiceState()): Boolean =
+    voice.missingSpeechServices ||
+        error in setOf("local_language_unavailable", "recognition_error_12", "recognition_error_13") ||
+        error == "local_voice_unavailable" ||
+        error.contains("voice data", ignoreCase = true) ||
+        error.contains("not installed", ignoreCase = true)
+
+internal fun assistantNeedsTtsDataInstall(voice: AssistantVoiceState): Boolean {
+    val messages = assistantVisibleVoiceErrors(voice) + listOfNotNull(voice.speechRequirementMessage)
+    return messages.any { error ->
+        error == "local_voice_unavailable" ||
+            error.contains("voice data", ignoreCase = true) ||
+            error.contains("not installed", ignoreCase = true)
     }
 }
 
@@ -500,10 +618,11 @@ internal fun assistantErrorText(code: String): String = when (code) {
 internal fun assistantVoiceErrorText(code: String): String = when (code) {
     "settings_not_saved" -> "Settings could not be saved. Recheck your choice before continuing."
     "capture_admission_unavailable" -> "Microphone sharing is not connected. Use keyboard."
-    "on_device_recognition_unavailable", "local_language_unavailable" -> "Native dictation is unavailable for this language. Use keyboard; no voice-model download."
+    "on_device_recognition_unavailable", "local_language_unavailable", "recognition_error_12", "recognition_error_13" ->
+        "Install the matching offline language in Speech Recognition & Synthesis by Google, then retry. Typing remains available."
     "recognition_busy" -> "Audio is busy. Note is not preempted; use keyboard."
     "recognition_error_7", "no_speech" -> "No speech recognized. Tap Mic to try again."
-    "local_voice_unavailable" -> "No installed matching TTS voice. No voice-model download."
+    "local_voice_unavailable" -> "Install a matching offline Google TTS voice, then retry."
     "microphone_permission_required" -> "Microphone permission required. Tap Mic again deliberately."
     else -> "Speech stopped ($code). Typing remains available; resume deliberately."
 }

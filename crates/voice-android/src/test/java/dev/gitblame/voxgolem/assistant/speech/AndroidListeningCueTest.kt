@@ -47,6 +47,25 @@ class AndroidListeningCueTest {
         assertEquals(1, pool.plays)
         cue.close()
     }
+
+    @Test fun coldStartPlayBeforeLoadCompletesPlaysImmediatelyWhenReadyUnlessFinished() {
+        val pool = FakePool()
+        val cue = AndroidListeningCue(context) { pool }
+        cue.play()
+        assertEquals(0, pool.plays)
+        pool.loaded()
+        assertEquals(1, pool.plays)
+        assertEquals(listOf(pool.loadId), pool.playedSounds)
+        cue.close()
+
+        val cancelledByFinish = FakePool()
+        val cue2 = AndroidListeningCue(context) { cancelledByFinish }
+        cue2.play()
+        cue2.finish()
+        cancelledByFinish.loaded()
+        assertEquals(0, cancelledByFinish.plays)
+        cue2.close()
+    }
     @Test fun endCueUsesItsOwnLoadedAssetAndUnreadyOrRetiredRequestsAreNeverQueued() {
         val pool = FakePool()
         val cue = AndroidListeningCue(context) { attributes ->

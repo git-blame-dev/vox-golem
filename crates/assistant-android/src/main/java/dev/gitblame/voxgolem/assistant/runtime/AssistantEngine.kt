@@ -10,6 +10,7 @@ import dev.gitblame.voxgolem.assistant.DomainGateway
 import dev.gitblame.voxgolem.assistant.AssistantTiming
 import dev.gitblame.voxgolem.assistant.AssistantTiming.Operation
 import dev.gitblame.voxgolem.assistant.AssistantTiming.Stage
+import dev.gitblame.voxgolem.assistant.AssistantDiagnosticJournal.Metadata
 import dev.gitblame.voxgolem.assistant.speech.VoiceInputContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -45,6 +46,8 @@ data class AssistantState(
     val speechTtsProvider: String = "",
     val speechTtsVoice: String = "",
     val speechOptions: dev.gitblame.voxgolem.assistant.speech.SpeechOptions = dev.gitblame.voxgolem.assistant.speech.SpeechOptions(),
+    /** Persisted selection/draft and the initial canonical projection have settled successfully. */
+    val contextReady: Boolean = true,
 )
 
 interface AssistantModelStorage {
@@ -93,6 +96,7 @@ class AssistantEngine @JvmOverloads internal constructor(
         val terminalContext: Boolean,
     ) {
         var finished = false
+        var presentationKey: String? = null
         val failure = AtomicReference<String?>(null)
         val sequence = AtomicLong(0)
         val cancelled = AtomicBoolean(false)
@@ -116,6 +120,8 @@ class AssistantEngine @JvmOverloads internal constructor(
     }
     private val domain = AssistantDomain(projectionGateway)
     private val observers = CopyOnWriteArrayList<(AssistantState) -> Unit>()
+    private val streamObservers = CopyOnWriteArrayList<(String?, String) -> Unit>()
+    private val presentationTimings = ConcurrentHashMap<String, AssistantTiming>()
     private val epoch = AtomicLong(0)
     private val settlement = Any()
     private val admission = Any()
@@ -130,9 +136,10 @@ class AssistantEngine @JvmOverloads internal constructor(
     private var startupContext: StartupContext? = null
     private data class ProjectionStamp(val revision: String, val conversation: String?, val head: String?, val busy: Boolean)
     private var projectionStamp: ProjectionStamp? = null
-    private var state = policies.read().let { AssistantState(webEnabled = it.webEnabled, speechNetworkFallback = it.speechNetworkFallback,
+    private var state = policies.read().let { AssistantState(contextReady = false, webEnabled = it.webEnabled, speechNetworkFallback = it.speechNetworkFallback,
         speechLanguage = it.speechLanguage, speechTtsProvider = it.speechTtsProvider, speechTtsVoice = it.speechTtsVoice) }
     @Volatile private var published = state
+    @Volatile private var foregroundRequested = false
 
     init {
         startupTiming?.mark(Stage.HYDRATION_QUEUED)
@@ -151,11 +158,19 @@ class AssistantEngine @JvmOverloads internal constructor(
             if (preparePhoneContext) startupContext = StartupContext(prepared?.toString(),
                 JSONObject(state.viewJson).getString("revision"), state.conversation, state.selectedHead)
             if (state.model !in AssistantModels.aliases) state = state.copy(error = "unsupported_model")
+            state = state.copy(contextReady = true, foreground = foregroundRequested)
             startupTiming?.mark(Stage.HYDRATION_COMPLETED)
         }
     }
 
-    override fun snapshot(): AssistantState = published
+    override fun snapshot(): AssistantState = published.let {
+        if (it.foreground == foregroundRequested) it else it.copy(foreground = foregroundRequested)
+    }
+
+    internal fun observeProvisionalStream(listener: (String?, String) -> Unit): AutoCloseable {
+        streamObservers += listener
+        return AutoCloseable { streamObservers -= listener }
+    }
 
     /** Blocking store IO on the result actor. Evidence is current at this transaction,
      * not a promise that replication cannot commit again before the UI receives it. */
@@ -179,22 +194,38 @@ class AssistantEngine @JvmOverloads internal constructor(
         clientRequestToken?.let { submitted[it]?.timing?.mark(Stage.PROVISIONAL_STATE_APPLIED) }
     }
 
+    fun markReplyLayout(requestKey: String?) { requestKey?.let { presentationTimings[it]?.mark(Stage.TEXT_LAYOUT_OBSERVED) } }
+    fun markReplyDrawSubmitted(requestKey: String?) {
+        requestKey?.let { presentationTimings.remove(it)?.finish(Stage.TEXT_DRAW_SUBMITTED) }
+    }
+
     override fun subscribe(observer: (AssistantState) -> Unit): AutoCloseable {
         observers += observer
         io.execute { if (observer in observers) observer(published) }
         return AutoCloseable { observers -= observer }
     }
 
-    override fun resume() = dispatch {
-        state = state.copy(foreground = true)
-        val prepared = startupContext
-        if (prepared != null && active == null && !state.busy &&
-            state.conversation == prepared.conversation && state.selectedHead == prepared.head &&
-            store.projectionStillCurrent(prepared.revision, prepared.conversation, prepared.head)) {
-            state = state.copy(credential = credentials?.status())
-        } else if (currentIdleProjectionValidated()) {
-            state = state.copy(credential = credentials?.status())
-        } else refreshProjection()
+    override fun resume() = resume(true)
+    override fun resume(reconcile: Boolean) {
+        foregroundRequested = true
+        dispatch {
+            state = state.copy(foreground = true)
+            if (!reconcile) return@dispatch
+            val prepared = startupContext
+            if (prepared != null && active == null && !state.busy &&
+                state.conversation == prepared.conversation && state.selectedHead == prepared.head &&
+                store.projectionStillCurrent(prepared.revision, prepared.conversation, prepared.head)) {
+                state = state.copy(credential = credentials?.status())
+            } else if (currentIdleProjectionValidated()) {
+                state = state.copy(credential = credentials?.status())
+            } else refreshProjection()
+        }
+    }
+    override fun prewarm() {
+        val current = snapshot()
+        if (current.busy || !current.foreground) return
+        AssistantRuntime.prewarm(current.model)
+        worker.prewarm(current.model) { credentials?.selection()?.path ?: authPath() }
     }
     override fun refresh() = dispatch { refreshProjection() }
     fun refresh(onSettled: (AssistantState) -> Unit) = dispatch(onSettled) { refreshProjection() }
@@ -225,6 +256,7 @@ class AssistantEngine @JvmOverloads internal constructor(
     override fun stop() = retire(false)
 
     private fun retire(background: Boolean) {
+        if (background) foregroundRequested = false
         synchronized(admission) {
             epoch.incrementAndGet()
             cancellationOwner.get()?.let { owner -> owner.cancelled.set(true); owner.delivery?.cancel() }
@@ -427,9 +459,9 @@ class AssistantEngine @JvmOverloads internal constructor(
     }
     fun submitSpeech(clientRequestToken: String, prompt: String, expectedConversation: String?, resultListener: AssistantResultListener,
         expectedHead: String? = snapshot().selectedHead, delivery: AssistantDeliveryGate? = null, searchMode: String? = null,
-        terminalContext: Boolean = false) {
+        terminalContext: Boolean = false, timingParent: AssistantTiming? = null) {
         enqueueSubmission(clientRequestToken, prompt, delivery, resultListener, searchMode, expectedConversation = expectedConversation,
-            expectedHead = expectedHead, requireConversationOwner = true, terminalContext = terminalContext)
+            expectedHead = expectedHead, requireConversationOwner = true, terminalContext = terminalContext, timingParent = timingParent)
     }
 
     fun submit(clientRequestToken: String, prompt: String, delivery: AssistantDeliveryGate? = null, resultListener: AssistantResultListener, searchMode: String?, terminalContext: Boolean = false) {
@@ -438,9 +470,9 @@ class AssistantEngine @JvmOverloads internal constructor(
 
     private fun enqueueSubmission(token: String, promptOverride: String?, delivery: AssistantDeliveryGate?, listener: AssistantResultListener?, searchMode: String? = null,
         expectedConversation: String? = null, requireConversationOwner: Boolean = false, expectedHead: String? = null,
-        terminalContext: Boolean = false) {
+        terminalContext: Boolean = false, timingParent: AssistantTiming? = null) {
         val requestedEpoch = epoch.get()
-        val ticket = Ticket(token, requestedEpoch, delivery, listener, beginTiming(Operation.GENERATION),
+        val ticket = Ticket(token, requestedEpoch, delivery, listener, timingParent?.fork(Operation.GENERATION) ?: beginTiming(Operation.GENERATION),
             spokenResponse = requireConversationOwner || token.startsWith("voice-"), terminalContext = terminalContext)
         ticket.timing.mark(Stage.REQUESTED)
         val duplicate = submitted.putIfAbsent(token, ticket) != null
@@ -451,6 +483,7 @@ class AssistantEngine @JvmOverloads internal constructor(
             while (requests.size >= 256) {
                 val oldest = requests.entries.firstOrNull { it.value.finished } ?: break
                 requests.remove(oldest.key)
+                oldest.value.presentationKey?.let { presentationTimings.remove(it)?.finish(Stage.CANCELLED) }
                 durableTokens.entries.removeAll { it.value == oldest.key }
             }
             requests[token] = ticket
@@ -545,6 +578,8 @@ class AssistantEngine @JvmOverloads internal constructor(
                 requireNotNull(projection.read())
             } else requireNotNull(projectedContext)
             ticket.timing.mark(Stage.CONTEXT_PREPARED)
+            ticket.timing.metadata(Metadata(model = state.model, searchMode = capturedMode,
+                webEnabled = state.webEnabled, count = context.getJSONArray("turns").length()))
             if (voiceOwner != null) {
                 // A replica may commit between reconciliation and snapshot capture. Never let context's automatic head selection reparent this voice turn.
                 val sameParent = if (pinnedHead == null) context.isNull("parent")
@@ -579,6 +614,8 @@ class AssistantEngine @JvmOverloads internal constructor(
                 cancellationOwner.set(ticket)
                 state = state.copy(busy = true, provisional = "", firstTextMs = null, toolStatus = null, interrupted = false, error = null, clientRequestToken = ticket.token, providerRequestId = id)
                 ticket.timing.mark(Stage.ADMITTED)
+                ticket.presentationKey = id
+                presentationTimings[id] = ticket.timing.fork(Operation.PRESENTATION)
                 val admitted = worker.submit(id, selectedAuthPath, serializedRequest, object : AssistantRequestListener {
                     override fun onFirstText(requestId: String, milliseconds: Long) = dispatch {
                         if (requestId == turn.id && active === turn && turn.epoch == epoch.get() && !ticket.cancelled.get()) {
@@ -753,8 +790,12 @@ class AssistantEngine @JvmOverloads internal constructor(
             if (close) turn.streamClosed = true
             value
         }
-        if (text.isNotEmpty() && active === turn && turn.epoch == epoch.get() && !turn.ticket.cancelled.get())
+        if (text.isNotEmpty() && active === turn && turn.epoch == epoch.get() && !turn.ticket.cancelled.get()) {
             state = state.copy(provisional = state.provisional + text)
+            streamObservers.forEach { observer ->
+                try { observer(turn.ticket.token, state.provisional) } catch (_: RuntimeException) {}
+            }
+        }
     }
 
     private fun currentIdleProjectionValidated(): Boolean {
@@ -769,6 +810,7 @@ class AssistantEngine @JvmOverloads internal constructor(
     private fun finish(ticket: Ticket, status: String, code: String?, providerId: String? = null, record: String? = null, speechText: String? = null, firstTextMs: Long? = null, completedMs: Long? = null, terminalContextJson: String? = null) {
         if (ticket.finished) return
         ticket.finished = true
+        if (status != "complete") ticket.presentationKey?.let { presentationTimings.remove(it)?.finish(Stage.CANCELLED) }
         ticket.timing.finish(when (status) { "complete" -> Stage.SETTLED; "cancelled" -> Stage.CANCELLED; else -> Stage.FAILED })
         submitted.remove(ticket.token, ticket)
         val listener = ticket.listener

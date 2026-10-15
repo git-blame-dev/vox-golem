@@ -31,11 +31,15 @@ class AssistantEngineTest {
     private class Provider : ProviderNativeCalls {
         val requests = mutableListOf<JSONObject>()
         val cancelled = mutableListOf<String>()
+        val prewarmed = mutableListOf<Pair<String, String>>()
         var deferRetirement = false
         lateinit var retired: () -> Unit
         var body: (ProviderDeltaCallback) -> String = { callback ->
             callback.onReady(); callback.onDelta("Synthetic provisional")
             """{"status":"complete","text":"Synthetic final answer","contentType":"output_text"}"""
+        }
+        override fun prewarm(model: String, authPath: String) {
+            prewarmed += model to authPath
         }
         override fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String {
             requests += JSONObject(requestJson)
@@ -61,6 +65,53 @@ class AssistantEngineTest {
     @After fun closeStore() { engine.stop(); providerQueue.drain(); io.drain(); store.close() }
     private fun prepare() { engine.setDraft("Synthetic question"); io.drain(); engine.send(); io.drain() }
     private fun settle() { providerQueue.drain(); io.drain() }
+
+    @Test fun voiceGenerationAndLateCanonicalDrawKeepOneCorrelatedPresentationSpan() {
+        context.applicationInfo.flags = context.applicationInfo.flags or ApplicationInfo.FLAG_DEBUGGABLE
+        val events = mutableListOf<AssistantTiming.Event>()
+        val turn = AssistantTiming.begin(context, AssistantTiming.Operation.VOICE_TURN, sink = AssistantTiming.Sink(events::add))
+        engine.submitSpeech("synthetic-diagnostic-request", "Synthetic question", state.conversation,
+            AssistantResultListener { _, _ -> }, expectedHead = state.selectedHead, timingParent = turn)
+        io.drain()
+        val requestKey = state.providerRequestId
+        assertNotNull(requestKey)
+        settle()
+        assertFalse(state.busy)
+        assertNull(state.error)
+        val generation = events.single { it.operation == AssistantTiming.Operation.GENERATION && it.kind == AssistantTiming.Kind.BEGIN }
+        val presentation = events.single { it.operation == AssistantTiming.Operation.PRESENTATION && it.kind == AssistantTiming.Kind.BEGIN }
+        assertEquals(turn.run, generation.parentRun)
+        assertEquals(generation.run, presentation.parentRun)
+        engine.markReplyLayout(requestKey)
+        engine.markReplyDrawSubmitted(requestKey)
+        engine.markReplyDrawSubmitted(requestKey)
+        engine.markReplyLayout(requestKey)
+        val drawn = events.filter { it.run == presentation.run }
+        assertEquals(1, drawn.count { it.kind == AssistantTiming.Kind.END })
+        assertEquals(listOf(Stage.TEXT_LAYOUT_OBSERVED, Stage.TEXT_DRAW_SUBMITTED),
+            drawn.filter { it.kind == AssistantTiming.Kind.MARK }.map { it.stage })
+        assertFalse(events.toString().contains("synthetic-diagnostic-request"))
+        turn.finish(Stage.SETTLED)
+    }
+
+    @Test fun cancelledVoicePresentationCannotLaterClaimLayoutOrDrawSubmission() {
+        context.applicationInfo.flags = context.applicationInfo.flags or ApplicationInfo.FLAG_DEBUGGABLE
+        val events = mutableListOf<AssistantTiming.Event>()
+        val turn = AssistantTiming.begin(context, AssistantTiming.Operation.VOICE_TURN, sink = AssistantTiming.Sink(events::add))
+        engine.submitSpeech("synthetic-cancelled-diagnostic", "Synthetic question", state.conversation,
+            AssistantResultListener { _, _ -> }, expectedHead = state.selectedHead, timingParent = turn)
+        io.drain()
+        val requestKey = state.providerRequestId
+        engine.cancel("synthetic-cancelled-diagnostic")
+        settle()
+        engine.markReplyLayout(requestKey)
+        engine.markReplyDrawSubmitted(requestKey)
+        val presentation = events.filter { it.operation == AssistantTiming.Operation.PRESENTATION }
+        assertEquals(1, presentation.count { it.kind == AssistantTiming.Kind.END })
+        assertEquals(Stage.CANCELLED, presentation.last().stage)
+        assertFalse(presentation.any { it.stage == Stage.TEXT_LAYOUT_OBSERVED || it.stage == Stage.TEXT_DRAW_SUBMITTED })
+        turn.finish(Stage.CANCELLED)
+    }
 
     @Test fun unchangedActorOperationsStillInvokeSettledCallbacksWithoutDuplicatePublications() {
         var publications = 0
@@ -100,6 +151,64 @@ class AssistantEngineTest {
         assertFalse(state.busy)
         assertEquals("", state.provisional)
         assertEquals(1, store.snapshot().getJSONArray("records").length())
+    }
+
+    @Test fun coldForegroundIntentDoesNotAuthorizeInputUntilPersistedContextIsHydrated() {
+        prepare(); settle()
+        engine.setDraft("Synthetic persisted cold draft"); io.drain()
+        val conversation = state.conversation
+        val head = state.selectedHead
+        assertNotNull(conversation)
+        assertNotNull(head)
+        val queue = Queue()
+        val worker = AssistantRequestWorker(providerQueue, provider)
+        val instance = AssistantEngine(store, queue, worker, { "/synthetic/private/auth.json" }, models)
+        val notifications = mutableListOf<AssistantState>()
+        val subscription = instance.subscribe { notifications += it }
+        try {
+            assertFalse(instance.snapshot().contextReady)
+            instance.resume()
+            val pending = instance.snapshot()
+            assertTrue("Foreground intent is synchronous, hydration is not", pending.foreground)
+            assertFalse(pending.contextReady)
+            assertNull(pending.conversation)
+            assertNull(pending.selectedHead)
+            assertEquals("", pending.draft)
+
+            // Run only mandatory startup hydration, not subscribe or the queued resume refresh.
+            queue.tasks.remove().run()
+            val hydrated = instance.snapshot()
+            assertTrue(hydrated.contextReady)
+            assertTrue(hydrated.foreground)
+            assertEquals(conversation, hydrated.conversation)
+            assertEquals(head, hydrated.selectedHead)
+            assertEquals("Synthetic persisted cold draft", hydrated.draft)
+            assertTrue(notifications.single().contextReady)
+            assertTrue(notifications.single().foreground)
+            assertEquals(conversation, notifications.single().conversation)
+            assertEquals(head, notifications.single().selectedHead)
+            assertEquals("Synthetic persisted cold draft", notifications.single().draft)
+
+            val port = AssistantEnginePort(instance)
+            port.beginInput()
+            port.setDraft("Synthetic correctly owned partial")
+            queue.drain()
+            assertEquals("Synthetic correctly owned partial", store.draft(JSONObject(conversation!!)).getString("text"))
+            assertEquals(head, instance.snapshot().selectedHead)
+        } finally { subscription.close(); instance.stop(); queue.drain(); worker.close() }
+    }
+
+    @Test fun failedStartupProjectionDoesNotPublishContextReadiness() {
+        val queue = Queue()
+        val worker = AssistantRequestWorker(providerQueue, provider)
+        val instance = AssistantEngine(store, queue, worker, { "/synthetic/private/auth.json" }, models,
+            projectionGateway = dev.gitblame.voxgolem.assistant.DomainGateway { error("Synthetic startup projection failure") })
+        try {
+            instance.resume(); queue.drain()
+            assertTrue(instance.snapshot().foreground)
+            assertFalse(instance.snapshot().contextReady)
+            assertEquals("storage_error", instance.snapshot().error)
+        } finally { instance.stop(); queue.drain(); worker.close() }
     }
 
     @Test fun idleHydrationAndResumeInstallOnlyOneProjection() {
@@ -399,7 +508,7 @@ class AssistantEngineTest {
             Stage.SETTLEMENT_PROJECTED, Stage.SETTLED),
             timings.filter { it.kind == AssistantTiming.Kind.MARK }.takeLast(5).map { it.stage })
         assertEquals(1, timings.count { it.kind == AssistantTiming.Kind.END })
-        assertEquals(1, timings.map { it.run }.distinct().size)
+        assertEquals(1, timings.filter { it.operation == AssistantTiming.Operation.GENERATION }.map { it.run }.distinct().size)
         assertFalse(state.busy)
     }
 
@@ -428,7 +537,7 @@ class AssistantEngineTest {
         context.applicationInfo.flags = context.applicationInfo.flags or ApplicationInfo.FLAG_DEBUGGABLE
         prepare(); engine.stop(); providerQueue.drain(); io.drain()
         assertFalse(timings.any { it.stage == Stage.WORKER_STARTED || it.stage == Stage.NATIVE_READY })
-        assertEquals(1, timings.count { it.kind == AssistantTiming.Kind.END })
+        assertEquals(1, timings.count { it.operation == AssistantTiming.Operation.GENERATION && it.kind == AssistantTiming.Kind.END })
         assertEquals(Stage.CANCELLED, timings.last().stage)
         assertTrue(provider.requests.isEmpty())
     }
@@ -1406,5 +1515,49 @@ class AssistantEngineTest {
         assertNull(state.providerRequestId)
         assertNull(state.firstTextMs)
         assertNull(state.toolStatus)
+    }
+
+    @Test fun deferredResumePrewarmAndEnginePortStreamObservationReflectActiveVoiceRequestOnly() {
+        engine.background()
+        assertFalse(engine.snapshot().foreground)
+        io.drain()
+
+        engine.resume(reconcile = false)
+        assertTrue(engine.snapshot().foreground)
+        io.drain()
+
+        val ioTasksBeforePrewarm = io.tasks.size
+        engine.prewarm()
+        assertEquals(ioTasksBeforePrewarm, io.tasks.size)
+        providerQueue.drain()
+        assertEquals(listOf("custom-sol-high" to "/synthetic/private/codex-auth.json"), provider.prewarmed)
+
+        val port = AssistantEnginePort(engine)
+        val streamed = mutableListOf<String>()
+        val subscription = port.observeStreamText { streamed += it }
+        try {
+            // Unrelated non-port request should not emit to port's stream observer.
+            prepare(); settle()
+            assertTrue(streamed.isEmpty())
+
+            provider.body = { callback ->
+                callback.onReady()
+                callback.onDelta("First ")
+                io.drain()
+                callback.onDelta("sentence.")
+                io.drain()
+                """{"status":"complete","text":"First sentence.","contentType":"output_text"}"""
+            }
+            var terminal: dev.gitblame.voxgolem.assistant.speech.GenerationResult? = null
+            port.sendFinal("Synthetic voice prompt") { terminal = it }
+            io.drain(); settle()
+            assertEquals(listOf("First ", "First sentence."), streamed)
+            assertEquals(
+                "First sentence.",
+                (terminal as dev.gitblame.voxgolem.assistant.speech.GenerationResult.Complete).finalText,
+            )
+        } finally {
+            subscription.close()
+        }
     }
 }

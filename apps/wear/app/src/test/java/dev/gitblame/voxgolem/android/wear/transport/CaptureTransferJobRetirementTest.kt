@@ -23,7 +23,7 @@ import java.util.concurrent.atomic.AtomicInteger
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class CaptureTransferJobRetirementTest {
-    @Test fun separatelyUnmarshalledStopParametersRetireTheSameSchedulerJobsArchiveImmediately() {
+    @Test fun separatelyUnmarshalledStopParametersRetireTheSameSchedulerJobsArchiveWithoutBlockingTheCaller() {
         val context = RuntimeEnvironment.getApplication()
         val id = "123e4567-e89b-42d3-a456-426614174083"
         val watch = dev.gitblame.voxgolem.android.wear.capture.CaptureRepository(context)
@@ -53,7 +53,8 @@ class CaptureTransferJobRetirementTest {
             service.onStartJob(parameters)
             assertTrue(writing.await(2, TimeUnit.SECONDS))
             assertTrue(service.onStopJob(stopParameters))
-            assertEquals("Stop must retire resources immediately despite a different Binder parameter object", 0L, sdk.closed.count)
+            // Authority is revoked inline; the existing lifetime owner submits native close off-main.
+            // Verify that actual close is requested, not a race against its executor at return time.
             assertTrue(sdk.closed.await(2, TimeUnit.SECONDS))
             shadowOf(Looper.getMainLooper()).idle()
             assertEquals(0, finished.get())

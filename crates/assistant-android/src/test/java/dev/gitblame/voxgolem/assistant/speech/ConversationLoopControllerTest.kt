@@ -2,6 +2,9 @@ package dev.gitblame.voxgolem.assistant.speech
 
 import android.os.Looper
 import dev.gitblame.voxgolem.assistant.recognition.*
+import dev.gitblame.voxgolem.assistant.AssistantTiming
+import dev.gitblame.voxgolem.assistant.AssistantTiming.Operation
+import dev.gitblame.voxgolem.assistant.AssistantTiming.Kind
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -38,20 +41,35 @@ class ConversationLoopControllerTest {
         val sent = mutableListOf<String>()
         val draftWrites = mutableListOf<String>()
         lateinit var result: (GenerationResult) -> Unit
+        var streamListener: ((String) -> Unit)? = null
+        var prewarms = 0
         var stops = 0
         var currentDraft = ""
         override fun setDraft(text: String) { draftWrites += text; currentDraft = text }
+        override fun prewarm() { prewarms++ }
+        override fun observeStreamText(listener: (String) -> Unit): AutoCloseable {
+            streamListener = listener
+            return AutoCloseable { if (streamListener === listener) streamListener = null }
+        }
         override fun sendFinal(text: String, onTerminal: (GenerationResult) -> Unit) { sent += text; result = onTerminal }
         override fun stop() { stops++ }
     }
     private class Tts : LocalTtsFactory {
         lateinit var ready: (Boolean) -> Unit
         lateinit var done: (String?) -> Unit
+        val spokenTexts = mutableListOf<String>()
+        val doneCallbacks = ArrayDeque<(String?) -> Unit>()
         var spoken = 0
         var creates = 0
         override fun create(onReady: (Boolean) -> Unit): LocalTtsSession { creates++; ready = onReady; return object : LocalTtsSession {
             override fun voices() = listOf(LocalVoice("synthetic-local", Locale.US, false, true))
-            override fun speak(text: String, voice: LocalVoice, onTerminal: (String?) -> Unit): Boolean { spoken++; done = onTerminal; return true }
+            override fun speak(text: String, voice: LocalVoice, onTerminal: (String?) -> Unit): Boolean {
+                spoken++
+                spokenTexts += text
+                done = onTerminal
+                doneCallbacks.addLast(onTerminal)
+                return true
+            }
             override fun stop() {}
             override fun shutdown() {}
         } }
@@ -68,6 +86,92 @@ class ConversationLoopControllerTest {
     private val loop = ConversationLoopController(dictation, output, engine)
     private fun drain() = shadowOf(Looper.getMainLooper()).idle()
     private fun start(ttsEnabled: Boolean = false) { loop.setForeground(true); output.setEnabled(ttsEnabled); loop.start("en-US"); drain() }
+
+    @Test fun voiceFlowCorrelatesItsTurnAndRecognitionWithoutCouplingSpanRetirement() {
+        val context = org.robolectric.RuntimeEnvironment.getApplication()
+        context.applicationInfo.flags = context.applicationInfo.flags or android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE
+        val events = mutableListOf<AssistantTiming.Event>()
+        val flow = AssistantTiming.begin(context, Operation.VOICE_FLOW, sink = AssistantTiming.Sink(events::add))
+        loop.setForeground(true)
+        loop.start("en-US", policy = VoiceSessionPolicy.SINGLE_TURN, timingParent = flow); drain()
+        recognition.sessions.single().events.final("Synthetic question"); drain()
+        engine.result(GenerationResult.Complete("Synthetic answer")); drain()
+        val turn = events.single { it.operation == Operation.VOICE_TURN && it.kind == Kind.BEGIN }
+        val recognition = events.single { it.operation == Operation.RECOGNITION && it.kind == Kind.BEGIN }
+        assertEquals(flow.run, turn.parentRun)
+        assertEquals(turn.run, recognition.parentRun)
+        assertEquals(1, events.count { it.run == flow.run && it.kind == Kind.END })
+        assertEquals(1, events.count { it.run == recognition.run && it.kind == Kind.END })
+        loop.close(); dictation.close(); output.close(); drain()
+        assertEquals(1, events.count { it.run == flow.run && it.kind == Kind.END })
+    }
+
+    @Test fun foregroundMainThreadStartAcquiresRecognitionBeforeReturningWithoutQueueHops() {
+        loop.setForeground(true)
+        loop.start("en-US")
+        assertEquals(LoopPhase.LISTENING, loop.snapshot().phase)
+        assertEquals(DictationPhase.CHECKING, dictation.snapshot().phase)
+        assertEquals(1, recognition.sessions.size)
+        drain()
+        assertEquals(1, recognition.sessions.single().starts)
+        loop.close(); dictation.close(); output.close(); drain()
+    }
+
+    @Test fun starvedStreamThenTwoClauseBurstSpeaksEveryClauseAndSettlesAsk() {
+        loop.setForeground(true); output.setEnabled(true)
+        loop.start("en-US", policy = VoiceSessionPolicy.SINGLE_TURN); drain()
+        recognition.sessions.single().events.final("Synthetic test question"); drain()
+        engine.streamListener!!("Synthetic first sentence."); drain(); tts.ready(true); drain()
+        assertEquals(listOf("Synthetic first sentence."), tts.spokenTexts)
+        tts.doneCallbacks.removeFirst()(null); drain()
+        assertEquals(LoopPhase.GENERATING, loop.snapshot().phase)
+        val full = "Synthetic first sentence. Synthetic second sentence. Synthetic third sentence."
+        engine.streamListener!!(full); drain()
+        engine.result(GenerationResult.Complete(full)); drain()
+        assertEquals(listOf("Synthetic first sentence.", "Synthetic second sentence.", "Synthetic third sentence."), tts.spokenTexts)
+        while (tts.doneCallbacks.isNotEmpty()) { tts.doneCallbacks.removeFirst()(null); drain() }
+        assertEquals(LoopPhase.IDLE, loop.snapshot().phase)
+        assertEquals(SpeechPhase.IDLE, output.snapshot().phase)
+        loop.close(); dictation.close(); output.close(); drain()
+    }
+
+    @Test fun appendedSourcesDoNotResetAlreadySpokenAnswerAtTrailingNewline() {
+        val accumulator = SentenceStreamAccumulator()
+        assertEquals(listOf("Synthetic first sentence."), accumulator.onDelta("Synthetic first sentence.\n"))
+        assertTrue(accumulator.flushRemainder("Synthetic first sentence.\nSources:\nsynthetic citation").isEmpty())
+    }
+
+    @Test fun disableQueuedBehindFinalButAheadOfStreamInitializationStillSettlesAsk() {
+        loop.setForeground(true); output.setEnabled(true)
+        loop.start("en-US", policy = VoiceSessionPolicy.SINGLE_TURN); drain()
+        recognition.sessions.single().events.final("Synthetic test question"); drain()
+        val answer = "Synthetic first sentence."
+        engine.streamListener!!(answer)
+        engine.result(GenerationResult.Complete(answer))
+        android.os.Handler(Looper.getMainLooper()).post { output.setEnabled(false) }
+        drain()
+        assertNotEquals(LoopPhase.SPEAKING, loop.snapshot().phase)
+        tts.ready(true); drain()
+        assertNotEquals(LoopPhase.SPEAKING, loop.snapshot().phase)
+        assertTrue(tts.spokenTexts.isEmpty())
+        loop.close(); dictation.close(); output.close(); drain()
+    }
+
+    @Test fun disablingReadAloudAfterStreamedGenerationCannotLeaveAskSpeakingForever() {
+        loop.setForeground(true); output.setEnabled(true)
+        loop.start("en-US", policy = VoiceSessionPolicy.SINGLE_TURN); drain()
+        recognition.sessions.single().events.final("Synthetic test question"); drain()
+        val answer = "Synthetic first sentence. Synthetic second sentence."
+        engine.streamListener!!(answer); drain(); tts.ready(true); drain()
+        engine.result(GenerationResult.Complete(answer)); drain()
+        assertEquals(LoopPhase.SPEAKING, loop.snapshot().phase)
+        output.setEnabled(false); drain()
+        assertNotEquals(LoopPhase.SPEAKING, loop.snapshot().phase)
+        assertNotEquals(SpeechPhase.SPEAKING, output.snapshot().phase)
+        tts.doneCallbacks.forEach { it(null) }; drain()
+        assertNotEquals(LoopPhase.SPEAKING, loop.snapshot().phase)
+        loop.close(); dictation.close(); output.close(); drain()
+    }
 
     @Test fun unchangedRecognitionPublicationsSkipDraftWritesButIdenticalFinalStillWritesAndSendsOnce() {
         recognition.delaySupport = true
@@ -254,7 +358,9 @@ class ConversationLoopControllerTest {
         assertEquals(1, recognition.sessions.size)
     }
     @Test fun stopBeforeStartAllocationAndPendingRestartAreCancelled() {
-        loop.setForeground(true); loop.start("en-US"); loop.stop(); drain()
+        loop.setForeground(true)
+        Thread { loop.start("en-US") }.apply { start(); join() }
+        loop.stop(); drain()
         assertTrue(recognition.sessions.isEmpty())
         start(); recognition.sessions.single().events.final("Synthetic prompt"); drain()
         engine.result(GenerationResult.Complete("Synthetic answer")); drain(); loop.stop(); drain()
@@ -312,5 +418,95 @@ class ConversationLoopControllerTest {
         engine.result(GenerationResult.Complete("Synthetic late answer")); drain()
         shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
         assertEquals(1, recognition.sessions.size)
+    }
+
+    @Test fun readyForSpeechPrewarmsTtsOnceBeforeFinalWithoutDuplicatePrepareOnFinal() {
+        start(true)
+        val session = recognition.sessions.single()
+        assertEquals(0, tts.creates)
+        session.events.ready(); drain()
+        assertEquals(LoopPhase.LISTENING, loop.snapshot().phase)
+        assertEquals(1, tts.creates)
+        tts.ready(true); drain()
+        session.events.final("Synthetic question"); drain()
+        assertEquals(LoopPhase.GENERATING, loop.snapshot().phase)
+        assertEquals(1, tts.creates)
+        loop.close(); dictation.close(); output.close(); drain()
+    }
+
+    @Test fun rapidPartialsPrewarmEngineOnceCoalesceIntermediateDraftWritesAndFlushOnError() {
+        var nowMillis = 1_000L
+        val throttledLoop = ConversationLoopController(
+            dictation, output, engine,
+            draftSyncIntervalMillis = 200L,
+            clockMillis = { nowMillis },
+        )
+        throttledLoop.setForeground(true)
+        throttledLoop.start("en-US"); drain()
+        val session = recognition.sessions.single()
+        session.events.ready(); drain()
+
+        session.events.partial("Synthetic first"); drain()
+        assertEquals(1, engine.prewarms)
+        assertEquals("Synthetic first", throttledLoop.snapshot().draft)
+        assertEquals(listOf("Synthetic first"), engine.draftWrites)
+
+        nowMillis = 1_050L
+        session.events.partial("Synthetic first second"); drain()
+        assertEquals(1, engine.prewarms)
+        assertEquals("Synthetic first second", throttledLoop.snapshot().draft)
+        assertEquals(listOf("Synthetic first"), engine.draftWrites)
+
+        nowMillis = 1_250L
+        session.events.partial("Synthetic first second third"); drain()
+        assertEquals(listOf("Synthetic first", "Synthetic first second third"), engine.draftWrites)
+
+        nowMillis = 1_300L
+        session.events.partial("Synthetic unsynced before error"); drain()
+        assertEquals(listOf("Synthetic first", "Synthetic first second third"), engine.draftWrites)
+        session.events.error("recognition_error_7"); drain()
+        assertEquals(LoopPhase.ERROR, throttledLoop.snapshot().phase)
+        assertEquals(
+            listOf("Synthetic first", "Synthetic first second third", "Synthetic unsynced before error"),
+            engine.draftWrites,
+        )
+        throttledLoop.close(); dictation.close(); output.close(); drain()
+    }
+
+    @Test fun streamingProvisionalSentencesAndMultiClauseFinalReplySpeakIncrementallyAndSanitizeMarkdown() {
+        assertEquals(
+            "Heading Hello world with code and link.",
+            SpeechTextSanitizer.sanitize("# Heading\n- **Hello** *world* with `code` and [link](https://example.invalid)."),
+        )
+        start(true)
+        val session = recognition.sessions.single()
+        session.events.ready(); drain()
+        tts.ready(true); drain()
+        session.events.final("Synthetic streaming prompt"); drain()
+        assertEquals(LoopPhase.GENERATING, loop.snapshot().phase)
+
+        val stream = requireNotNull(engine.streamListener)
+        stream("**First sentence** is ready now. Second part")
+        drain()
+        assertEquals(LoopPhase.GENERATING, loop.snapshot().phase)
+        assertEquals(listOf("First sentence is ready now."), tts.spokenTexts)
+
+        engine.result(
+            GenerationResult.Complete(
+                "**First sentence** is ready now. Second part is `complete`.\n\nSources:\n- https://example.invalid"
+            )
+        )
+        drain()
+        assertEquals(LoopPhase.SPEAKING, loop.snapshot().phase)
+        assertEquals(
+            listOf("First sentence is ready now.", "Second part is complete."),
+            tts.spokenTexts,
+        )
+        assertEquals(2, tts.doneCallbacks.size)
+        tts.doneCallbacks.removeFirst().invoke(null); drain()
+        assertEquals(LoopPhase.SPEAKING, loop.snapshot().phase)
+        tts.doneCallbacks.removeFirst().invoke(null); drain()
+        assertEquals(LoopPhase.BETWEEN_TURNS, loop.snapshot().phase)
+        loop.close(); dictation.close(); output.close(); drain()
     }
 }

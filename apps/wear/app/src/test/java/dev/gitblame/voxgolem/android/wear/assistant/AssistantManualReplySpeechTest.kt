@@ -61,9 +61,13 @@ class AssistantManualReplySpeechTest {
     }
     private class Recognition : LocalRecognizerFactory {
         var delaySupport = false
+        var localAvailable = false
+        var recordingChecks = 0
         var route: RecognitionRoute? = null
         val sessions = mutableListOf<Session>()
         override fun available() = true
+        override fun localOnlyAvailable() = localAvailable
+        override fun recordingEnabled(): Boolean { recordingChecks++; return false }
         override fun create() = Session().also { sessions += it }
         inner class Session : LocalRecognizerSession {
             override val route: RecognitionRoute? get() = this@Recognition.route
@@ -105,15 +109,17 @@ class AssistantManualReplySpeechTest {
     }
     private class Tts : LocalTtsFactory {
         val spoken = mutableListOf<String>()
+        val terminals = mutableListOf<(String?) -> Unit>()
+        var offered = listOf(LocalVoice("synthetic-local", Locale.US, false, true))
         val ready = mutableListOf<(Boolean) -> Unit>()
         var beforeSpeak: (() -> Unit)? = null
         override fun providers(): List<String?> = listOf(null, "synthetic.tts")
         override fun create(onReady: (Boolean) -> Unit): LocalTtsSession {
             ready += onReady
             return object : LocalTtsSession {
-                override fun voices() = listOf(LocalVoice("synthetic-local", Locale.US, false, true))
+                override fun voices() = offered
                 override fun speak(text: String, voice: LocalVoice, onTerminal: (String?) -> Unit): Boolean {
-                    beforeSpeak?.invoke(); spoken += text; return true
+                    beforeSpeak?.invoke(); spoken += text; terminals += onTerminal; return true
                 }
                 override fun stop() {}
                 override fun shutdown() {}
@@ -131,8 +137,9 @@ class AssistantManualReplySpeechTest {
     }, leases = leases)
     private val generation = Generation()
     private var admissionReady = true
+    private var admissionChecks = 0
     private val cue = Cue()
-    private val voice = WearAssistantVoice(client, dictation, output, generation, admissionReady = { admissionReady }, language = "en-US", listeningCue = cue)
+    private val voice = WearAssistantVoice(client, dictation, output, generation, admissionReady = { admissionChecks++; admissionReady }, language = "en-US", listeningCue = cue)
     private fun drain() = shadowOf(Looper.getMainLooper()).idle()
     private fun start(enabled: Boolean = true) { voice.foreground(true); voice.tts(enabled); drain() }
     private fun prepareOptions() { voice.prepareSpeechOptions(); drain() }
@@ -183,6 +190,111 @@ class AssistantManualReplySpeechTest {
         voice.close(); drain()
     }
 
+    @Test fun unchangedSnapshotsAndPlaybackUpdatesReuseTheCombinedOptionsProjection() {
+        start(false); prepareOptions(); ready()
+        val options = voice.snapshot().speechOptions
+        repeat(20) { assertSame(options, voice.snapshot().speechOptions) }
+        voice.tts(true); drain()
+        assertSame(options, voice.snapshot().speechOptions)
+        voice.tts(false); drain()
+        assertSame(options, voice.snapshot().speechOptions)
+        voice.close(); drain()
+    }
+
+    @Test fun combinedOptionsRefreshInstalledSupportedAndLocalCapabilityWithoutSizeBasedKeys() {
+        start(false)
+        fun observe(installed: List<String>?, supported: List<String>?): SpeechOptions {
+            recognition.route = RecognitionRoute("synthetic.recognition", "en-US",
+                installedLanguages = installed, supportedLanguages = supported)
+            voice.dictate(""); drain()
+            recognition.sessions.last().events.partial("Synthetic partial"); drain()
+            val options = voice.snapshot().speechOptions
+            voice.stop(); drain()
+            return options
+        }
+        val initial = observe(listOf("en-US"), listOf("en-US"))
+        val changedInstalled = observe(listOf("en-AU"), listOf("en-US"))
+        assertNotSame(initial, changedInstalled)
+        assertEquals(listOf("en-AU"), changedInstalled.recognitionInstalledLanguages)
+        val changedSupported = observe(listOf("en-AU"), listOf("en-AU"))
+        assertNotSame(changedInstalled, changedSupported)
+        assertEquals(listOf("en-AU"), changedSupported.recognitionSupportedLanguages)
+        val unknown = observe(null, null)
+        val empty = observe(emptyList(), emptyList())
+        assertNull(unknown.recognitionInstalledLanguages)
+        assertNull(unknown.recognitionSupportedLanguages)
+        assertEquals(emptyList<String>(), empty.recognitionInstalledLanguages)
+        assertEquals(emptyList<String>(), empty.recognitionSupportedLanguages)
+        recognition.localAvailable = true
+        voice.foreground(true); drain()
+        assertTrue(voice.snapshot().speechOptions.localOnlyRecognitionAvailable)
+        voice.foreground(false); drain()
+        assertFalse(voice.snapshot().speechOptions.localOnlyRecognitionAvailable)
+        recognition.localAvailable = false
+        voice.foreground(true); drain()
+        assertFalse(voice.snapshot().speechOptions.localOnlyRecognitionAvailable)
+        voice.close(); drain()
+    }
+
+    @Test fun operationStatusMatchesLivePhasesAndErrorsWithoutSnapshotCapabilityOrAdmissionProbes() {
+        start(false)
+        fun checkStatus() {
+            val full = voice.snapshot()
+            val recordingBefore = recognition.recordingChecks
+            val admissionBefore = admissionChecks
+            repeat(20) {
+                val status = voice.operationStatus()
+                assertEquals(full.active, status.active)
+                assertEquals(full.error != null || full.dictation.error != null || full.speech.error != null || full.loop.error != null,
+                    status.failed)
+            }
+            assertEquals(recordingBefore, recognition.recordingChecks)
+            assertEquals(admissionBefore, admissionChecks)
+        }
+        checkStatus()
+        recognition.delaySupport = true
+        voice.ask(""); drain(); checkStatus()
+        recognition.sessions.last().support(true); drain(); checkStatus()
+        recognition.sessions.last().events.final("Synthetic final"); drain(); checkStatus()
+        complete(); checkStatus()
+        voice.tts(true); drain()
+        voice.speak("Synthetic speech"); drain(); checkStatus()
+        ready(); checkStatus()
+        output.stop(); drain(); checkStatus()
+        voice.ask(""); drain()
+        recognition.sessions.last().support(true); drain()
+        recognition.sessions.last().events.error("synthetic_recognition_failure"); drain(); checkStatus()
+        assertTrue(voice.operationStatus().failed)
+        voice.stop(); drain()
+        voice.speak("Synthetic failed speech"); drain(); ready()
+        tts.terminals.last()("synthetic_speech_failure"); drain(); checkStatus()
+        assertTrue(voice.operationStatus().failed)
+        voice.close(); drain(); checkStatus()
+    }
+
+    @Test fun cachedCatalogueTracksMutableLanguageObservationsAndReplacementOutputInventory() {
+        start(false); prepareOptions(); ready()
+        val installed = mutableListOf("en-US")
+        recognition.route = RecognitionRoute("synthetic.recognition", "en-US",
+            installedLanguages = installed, supportedLanguages = listOf("en-US"))
+        voice.dictate(""); drain()
+        val sdk = recognition.sessions.last()
+        sdk.events.partial("Synthetic first partial"); drain()
+        val before = voice.snapshot().speechOptions
+        installed[0] = "en-AU"
+        sdk.events.partial("Synthetic next partial"); drain()
+        val after = voice.snapshot().speechOptions
+        assertNotSame(before, after)
+        assertEquals(listOf("en-US"), before.recognitionInstalledLanguages)
+        assertEquals(listOf("en-AU"), after.recognitionInstalledLanguages)
+        assertEquals(listOf("en-US"), after.recognitionSupportedLanguages)
+        voice.stop(); voice.foreground(false); drain()
+        tts.offered = listOf(LocalVoice("synthetic-replacement", Locale.US, false, true))
+        start(false); prepareOptions(); ready()
+        assertEquals(listOf("synthetic-replacement"), voice.snapshot().speechOptions.ttsVoices.map { it.name })
+        voice.close(); drain()
+    }
+
     @Test fun askUsesTheSameFinalOnlyLifecycleButIdlesWhileTalkAloneReopensListening() {
         start(false)
         voice.ask("Synthetic retained draft"); drain()
@@ -216,6 +328,46 @@ class AssistantManualReplySpeechTest {
         sdk.events.final("Synthetic stale final"); drain()
         assertTrue(generation.prompts.isEmpty())
         assertEquals("Synthetic newer-head draft", client.state.draft)
+        voice.close(); drain()
+    }
+
+    @Test fun directColdVoiceCallsRejectUnhydratedContextWithoutAdoptingAnOwnerLater() {
+        client.state = client.state.copy(foreground = true, contextReady = false, conversation = null, selectedHead = null)
+        start(false)
+        voice.ask(""); voice.conversation(""); voice.dictate("")
+        drain()
+        assertTrue(recognition.sessions.isEmpty())
+        assertTrue(generation.prompts.isEmpty())
+        assertEquals("context_not_ready", voice.snapshot().error)
+        client.publish(client.state.copy(
+            contextReady = true,
+            conversation = "{\"replica\":\"synthetic-hydrated-conversation\",\"sequence\":\"1\"}",
+            selectedHead = "{\"replica\":\"synthetic-hydrated-head\",\"sequence\":\"2\"}"
+        ))
+        drain()
+        assertTrue("Rejected direct calls do not become delayed capture requests", recognition.sessions.isEmpty())
+        voice.ask("Synthetic hydrated draft"); drain()
+        val sdk = recognition.sessions.single()
+        assertEquals(1, sdk.starts)
+        assertFalse(sdk.destroyed)
+        assertEquals(LoopPhase.LISTENING, voice.snapshot().loop.phase)
+        sdk.events.final("Synthetic cold start question")
+        drain()
+        assertEquals(listOf("Synthetic hydrated draft Synthetic cold start question"), generation.prompts)
+        voice.close(); drain()
+    }
+
+    @Test fun warmHydratedVoiceDoesNotWaitForRedundantForegroundProjectionOrAdoptAnotherContext() {
+        client.state = client.state.copy(foreground = false, contextReady = true)
+        start(false); voice.ask(""); drain()
+        val sdk = recognition.sessions.single()
+        assertEquals(1, sdk.starts)
+        client.publish(client.state.copy(foreground = true,
+            conversation = "{\"replica\":\"synthetic-new-owner\",\"sequence\":\"1\"}")); drain()
+        assertTrue(sdk.destroyed)
+        assertEquals(LoopPhase.ERROR, voice.snapshot().loop.phase)
+        sdk.events.final("Synthetic stale owner final"); drain()
+        assertTrue(generation.prompts.isEmpty())
         voice.close(); drain()
     }
     private inner class SelectionFixture(prepareChoices: Boolean = true) : AutoCloseable {

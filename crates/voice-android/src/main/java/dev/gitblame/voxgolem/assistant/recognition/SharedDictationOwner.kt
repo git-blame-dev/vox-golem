@@ -101,23 +101,24 @@ class SharedDictationOwner(
     }
     fun setForeground(visible: Boolean) {
         if (!visible) epoch.incrementAndGet()
-        main.post { foreground = visible; if (!visible) retireProjection() }
+        onMain { foreground = visible; if (!visible) retireProjection() }
     }
     fun start(language: String, draft: String = state.draft, emptyNoMatchIsIdle: Boolean = false,
-        purpose: VoiceCapturePurpose = VoiceCapturePurpose.DRAFT): Long {
+        purpose: VoiceCapturePurpose = VoiceCapturePurpose.DRAFT, immediateAdmission: Boolean = false,
+        timingParent: AssistantTiming? = null): Long {
         val ticket = epoch.incrementAndGet()
-        val timing = beginTiming().also { it.mark(Stage.REQUESTED) }
-        main.post {
-            if (ticket != epoch.get() || closed) { timing.finish(Stage.CANCELLED); return@post }
+        val timing = (timingParent?.fork(Operation.RECOGNITION) ?: beginTiming()).also { it.mark(Stage.REQUESTED) }
+        val admission = admission@{
+            if (ticket != epoch.get() || closed) { timing.finish(Stage.CANCELLED); return@admission }
             timing.mark(Stage.WORKER_STARTED)
-            if (!dispose(Stage.REPLACED)) { timing.finish(Stage.RETIREMENT_FAILED); publish(DictationState(phase = DictationPhase.ERROR, draft = draft, error = "recognition_cleanup_failed", utterance = ticket)); return@post }
+            if (!dispose(Stage.REPLACED)) { timing.finish(Stage.RETIREMENT_FAILED); publish(DictationState(phase = DictationPhase.ERROR, draft = draft, error = "recognition_cleanup_failed", utterance = ticket)); return@admission }
             recognitionTiming = timing
             prefix = draft.trim()
             this.emptyNoMatchIsIdle = emptyNoMatchIsIdle && prefix.isEmpty()
             recognizedWords = false
             this.purpose = purpose
             publish(DictationState(draft = draft, utterance = ticket))
-            if (ticket != epoch.get() || closed) return@post
+            if (ticket != epoch.get() || closed) return@admission
             admittedConfiguration = configuration?.invoke()
             admittedRecording = factory.recordingEnabled()
             val locale = SpeechLocales.parse(admittedConfiguration?.selection?.language?.ifEmpty { language } ?: language)
@@ -128,6 +129,9 @@ class SharedDictationOwner(
                 else -> admit(ticket, locale.toLanguageTag(), timing)
             }
         }
+        // Ordinary dictation callers bind the returned utterance before receiving callbacks.
+        // ConversationLoopController owns its callback queue and can explicitly admit inline.
+        if (immediateAdmission) onMain(admission) else main.post { admission() }
         return ticket
     }
     private fun admit(ticket: Long, language: String, timing: AssistantTiming) {
@@ -152,6 +156,7 @@ class SharedDictationOwner(
             timeout = deadline; main.postDelayed(deadline, timeoutMillis)
             sdk.checkSelectedLanguage(language, admitted?.selection?.language?.isNotEmpty() == true) { supported -> main.post {
                 if (!current(ticket, sdk) || state.phase != DictationPhase.CHECKING) return@post
+                timing.mark(Stage.SUPPORT_MAIN_DELIVERED)
                 state = state.copy(route = sdk.route)
                 if (!supported) { fail(ticket, "local_language_unavailable"); return@post }
                 if (!foreground || !microphoneGranted()) { fail(ticket, "microphone_permission_required"); return@post }
@@ -213,7 +218,7 @@ class SharedDictationOwner(
     } }
     fun stop() {
         epoch.incrementAndGet()
-        main.post { retireProjection() }
+        onMain { retireProjection() }
     }
     private fun fail(ticket: Long, code: String) {
         if (ticket != epoch.get()) return
@@ -233,6 +238,7 @@ class SharedDictationOwner(
         session?.let { state = state.copy(route = it.route, recordedAudio = it.recordedAudio ?: state.recordedAudio) }
         val sdk = session ?: retired; session = null; retired = null
         if (sdk != null) {
+            timing?.mark(Stage.RETIREMENT_STARTED)
             runCatching { sdk.cancel() }
             if (runCatching { sdk.destroy() }.isFailure) {
                 timing?.mark(Stage.RETIREMENT_FAILED)
@@ -258,7 +264,10 @@ class SharedDictationOwner(
     private fun publish(value: DictationState) { state = value; observers.forEach { it(value) } }
     override fun close() {
         epoch.incrementAndGet()
-        main.post { closed = true; retireProjection(); observers.clear() }
+        onMain { closed = true; retireProjection(); observers.clear() }
+    }
+    private fun onMain(action: () -> Unit) {
+        if (Looper.myLooper() == main.looper) action() else main.post { action() }
     }
     companion object {
         fun configured(context: Context, admission: () -> SpeechAdmission) = configuredWithAudio(context, admission)

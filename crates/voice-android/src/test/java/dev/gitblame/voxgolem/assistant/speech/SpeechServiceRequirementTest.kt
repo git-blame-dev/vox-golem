@@ -82,4 +82,52 @@ class SpeechServiceRequirementTest {
             assertTrue(attempts.all { it.flags and Intent.FLAG_ACTIVITY_NEW_TASK != 0 })
         }
     }
+
+    @Test
+    fun rejectsNonGoogleSpeechServices() {
+        val packageManager = shadowOf(context.packageManager)
+
+        val samsungStt = ResolveInfo().apply {
+            serviceInfo = ServiceInfo().apply {
+                packageName = "com.samsung.SMT"
+                name = "com.samsung.SMT.SamsungRecognitionService"
+            }
+        }
+        packageManager.addResolveInfoForIntent(Intent(RecognitionService.SERVICE_INTERFACE), samsungStt)
+
+        val samsungTts = ResolveInfo().apply {
+            serviceInfo = ServiceInfo().apply {
+                packageName = "com.samsung.SMT"
+                name = "com.samsung.SMT.SamsungTtsService"
+            }
+        }
+        packageManager.addResolveInfoForIntent(Intent(TextToSpeech.Engine.INTENT_ACTION_TTS_SERVICE), samsungTts)
+
+        assertFalse(SpeechServiceRequirement.isSttInstalled(context))
+        assertFalse(SpeechServiceRequirement.hasRecognitionService(context))
+        assertFalse(SpeechServiceRequirement.hasGoogleRecognitionService(context))
+        assertFalse(SpeechServiceRequirement.isTtsInstalled(context))
+        assertTrue(SpeechServiceRequirement.isMissing(context))
+    }
+
+    @Test
+    fun opensTtsDataInstallAndFallsBackToPlayStore() {
+        for (successAt in 0..1) {
+            val attempts = mutableListOf<Intent>()
+            val launcher = object : ContextWrapper(context) {
+                override fun startActivity(intent: Intent) {
+                    attempts += intent
+                    if (attempts.size - 1 != successAt) throw ActivityNotFoundException("Synthetic unavailable handler")
+                }
+            }
+            assertTrue(SpeechServiceRequirement.openTtsDataInstall(launcher))
+            assertEquals(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA, attempts.first().action)
+            assertEquals(SpeechServiceRequirement.GOOGLE_SPEECH_PACKAGE, attempts.first().`package`)
+            assertTrue(attempts.first().flags and Intent.FLAG_ACTIVITY_NEW_TASK != 0)
+            if (successAt == 1) {
+                assertEquals(2, attempts.size)
+                assertEquals("com.android.vending", attempts[1].`package`)
+            }
+        }
+    }
 }

@@ -113,6 +113,20 @@ class AssistantRequestWorker(
         return true
     }
 
+    fun prewarm(model: String, authPath: () -> String = { "" }) {
+        val canPrewarm = synchronized(lock) { !closed && active == null }
+        if (!canPrewarm) return
+        try {
+            executor.execute {
+                val stillIdle = synchronized(lock) { !closed && active == null }
+                if (!stillIdle) return@execute
+                try {
+                    native.prewarm(model, authPath())
+                } catch (_: RuntimeException) {}
+            }
+        } catch (_: RuntimeException) {}
+    }
+
     fun cancel(): Unit = synchronized(lock) {
         active?.let { request ->
             if (!request.cancelled) {

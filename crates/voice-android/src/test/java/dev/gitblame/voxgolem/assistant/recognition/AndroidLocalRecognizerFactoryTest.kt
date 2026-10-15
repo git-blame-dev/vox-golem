@@ -32,6 +32,40 @@ import java.time.Duration
 @Config(sdk = [35], manifest = Config.NONE)
 @LooperMode(LooperMode.Mode.PAUSED)
 class AndroidLocalRecognizerFactoryTest {
+    @Test fun diagnosticsDistinguishEffectiveRegionalFallbackExactMatchAndCachedLanguage() {
+        val context = RuntimeEnvironment.getApplication()
+        context.applicationInfo.flags = context.applicationInfo.flags or ApplicationInfo.FLAG_DEBUGGABLE
+        registerService(dev.gitblame.voxgolem.assistant.speech.SpeechServiceRequirement.GOOGLE_SPEECH_PACKAGE,
+            dev.gitblame.voxgolem.assistant.speech.SpeechServiceRequirement.GOOGLE_RECOGNITION_SERVICE_CLASS)
+        val cache = GoogleSttSupportCache(context, versionCodeProvider = { 321L }).also { it.clear() }
+        val factory = AndroidLocalRecognizerFactory(context, supportCache = cache, strictGoogleOnly = true)
+        fun run(installed: List<String>?, expected: String, cached: Boolean) {
+            val metadata = mutableListOf<dev.gitblame.voxgolem.assistant.AssistantDiagnosticJournal.Metadata>()
+            val sink = object : AssistantTiming.MetadataSink {
+                override fun emit(event: AssistantTiming.Event) {}
+                override fun emitMetadata(operation: Operation, run: Int, parentRun: Int?, observedNanos: Long,
+                    value: dev.gitblame.voxgolem.assistant.AssistantDiagnosticJournal.Metadata) { metadata += value }
+            }
+            val timing = AssistantTiming.begin(context, Operation.RECOGNITION, sink = sink)
+            val session = factory.createForPolicy(false, timing)
+            session.checkLanguage("en-AU") { assertTrue(it) }; drain()
+            val sdk = shadowOf(ShadowSpeechRecognizer.getLatestSpeechRecognizer())
+            if (installed != null) {
+                sdk.triggerSupportResult(RecognitionSupport.Builder().setInstalledOnDeviceLanguages(installed).build()); drain()
+            }
+            session.start("en-AU", RecordingEvents()); drain()
+            assertEquals(expected, sdk.lastRecognizerIntent.getStringExtra(RecognizerIntent.EXTRA_LANGUAGE))
+            val listening = metadata.last { it.language != null }
+            assertEquals("en-AU", listening.requestedLanguage)
+            assertEquals(expected, listening.language)
+            assertEquals(cached, metadata.single { it.cacheHit != null }.cacheHit)
+            session.destroy(); timing.finish(Stage.CANCELLED)
+        }
+        run(listOf("en-US"), "en-US", false)
+        run(listOf("en-AU"), "en-AU", false)
+        run(null, "en-AU", true)
+    }
+
     @Test fun setupErrorOnRecognitionListenerSettlesSupportWithCauseWithoutWaitingForDeadline() {
         ShadowSpeechRecognizer.setIsOnDeviceRecognitionAvailable(true)
         val session = AndroidLocalRecognizerFactory(RuntimeEnvironment.getApplication(), false).create()
@@ -718,6 +752,229 @@ class AndroidLocalRecognizerFactoryTest {
         assertTrue(owner.snapshot().route!!.localPreferred)
         assertTrue(sdk.isDestroyed); assertNull(sdk.latestModelDownloadIntent)
     }
+
+    @Test fun strictGoogleModeRejectsOnlineOnlyLanguageEvenWhenPersistedFallbackIsEnabled() {
+        registerService(dev.gitblame.voxgolem.assistant.speech.SpeechServiceRequirement.GOOGLE_SPEECH_PACKAGE,
+            dev.gitblame.voxgolem.assistant.speech.SpeechServiceRequirement.GOOGLE_RECOGNITION_SERVICE_CLASS)
+        val session = AndroidLocalRecognizerFactory(RuntimeEnvironment.getApplication(),
+            allowProviderFallback = true, strictGoogleOnly = true).create()
+        val results = mutableListOf<Boolean>()
+        session.checkLanguage("en-AU") { results += it }; drain()
+        val sdk = shadowOf(ShadowSpeechRecognizer.getLatestSpeechRecognizer())
+        sdk.triggerSupportResult(RecognitionSupport.Builder().setOnlineLanguages(listOf("en-AU")).build()); drain()
+        assertEquals(listOf(false), results)
+        assertTrue(session.route!!.onDeviceOnly)
+        assertNull(sdk.lastRecognizerIntent)
+        session.destroy()
+    }
+
+    @Test fun strictGoogleModePinsExclusivelyToGoogleAndRejectsSamsungAndSystemDefault() {
+        registerService("com.samsung.SMT", "com.samsung.SMT.SamsungRecognitionService")
+        registerService(
+            dev.gitblame.voxgolem.assistant.speech.SpeechServiceRequirement.GOOGLE_SPEECH_PACKAGE,
+            dev.gitblame.voxgolem.assistant.speech.SpeechServiceRequirement.GOOGLE_RECOGNITION_SERVICE_CLASS,
+        )
+        android.provider.Settings.Secure.putString(
+            RuntimeEnvironment.getApplication().contentResolver,
+            "voice_recognition_service",
+            "com.samsung.SMT/com.samsung.SMT.SamsungRecognitionService",
+        )
+        ShadowSpeechRecognizer.setIsOnDeviceRecognitionAvailable(true)
+        val factory = AndroidLocalRecognizerFactory(
+            RuntimeEnvironment.getApplication(),
+            allowProviderFallback = false,
+            strictGoogleOnly = true,
+        )
+        assertTrue(factory.available())
+        assertTrue(factory.localOnlyAvailable())
+        val session = factory.create()
+        val results = mutableListOf<Boolean>()
+        session.checkLanguage("en-AU") { results += it }; drain()
+        val sdk = ShadowSpeechRecognizer.getLatestSpeechRecognizer()
+        assertEquals(
+            ComponentName(
+                dev.gitblame.voxgolem.assistant.speech.SpeechServiceRequirement.GOOGLE_SPEECH_PACKAGE,
+                dev.gitblame.voxgolem.assistant.speech.SpeechServiceRequirement.GOOGLE_RECOGNITION_SERVICE_CLASS,
+            ).flattenToShortString(),
+            session.route?.provider,
+        )
+        assertEquals(true, session.route?.onDeviceOnly)
+        shadowOf(sdk).triggerSupportResult(RecognitionSupport.Builder().setInstalledOnDeviceLanguages(listOf("en-AU")).build()); drain()
+        assertEquals(listOf(true), results)
+        session.start("en-AU", RecordingEvents()); drain()
+        assertTrue(shadowOf(sdk).lastRecognizerIntent.getBooleanExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false))
+        session.destroy(); drain()
+    }
+
+    @Test fun supportCacheSeparatesPolicyAndNeverPersistsRegionalFallback() {
+        val context = RuntimeEnvironment.getApplication()
+        val cache = GoogleSttSupportCache(context, versionCodeProvider = { 731L })
+        cache.clear()
+        val entry = CachedSttSupport("en-AU", listOf("en-AU"), listOf("en-AU", "de-DE"))
+        cache.put("synthetic.provider", "en-AU", entry, true)
+        assertEquals(entry, cache.get("synthetic.provider", "en-AU", true))
+        assertNull(cache.get("synthetic.provider", "en-AU", false))
+        cache.put("synthetic.provider", "en-GB", entry, true)
+        assertNull(cache.get("synthetic.provider", "en-GB", true))
+        val restarted = GoogleSttSupportCache(context, versionCodeProvider = { 731L })
+        assertEquals(entry, restarted.get("synthetic.provider", "en-AU", true))
+        assertNull(restarted.get("synthetic.provider", "en-GB", true))
+        restarted.invalidate("synthetic.provider", "en-AU")
+        assertNull(GoogleSttSupportCache(context, versionCodeProvider = { 731L }).get("synthetic.provider", "en-AU", true))
+    }
+
+    @Test fun preRollStartsDuringSupportAndStopsAtSpeechEndpoint() {
+        registerGoogle()
+        val pipe = android.os.ParcelFileDescriptor.createPipe()
+        val calls = mutableListOf<String>()
+        val source = object : PreRollAudioSource {
+            override val readDescriptor = pipe[0]
+            override val isRecording = true
+            override fun startStreaming() { calls += "stream" }
+            override fun configureIntent(intent: Intent) = intent
+            override fun stopCapture() { calls += "stop" }
+            override fun close() { calls += "close"; pipe.forEach { it.close() } }
+        }
+        val session = AndroidLocalRecognizerFactory(RuntimeEnvironment.getApplication(),
+            preRollFactory = PreRollAudioSourceFactory { calls += "open"; source }).create()
+        session.checkLanguage("en-AU") {}; drain()
+        assertEquals(listOf("open"), calls)
+        val sdk = shadowOf(ShadowSpeechRecognizer.getLatestSpeechRecognizer())
+        assertNull(sdk.lastRecognizerIntent)
+        sdk.triggerSupportResult(RecognitionSupport.Builder().setInstalledOnDeviceLanguages(listOf("en-AU")).build()); drain()
+        session.start("en-AU", RecordingEvents()); drain()
+        sdk.triggerOnEndOfSpeech(); drain()
+        assertEquals(listOf("open", "stream", "stop"), calls)
+        session.destroy()
+        assertEquals("close", calls.last())
+    }
+
+    @Test fun cachedGoogleSupportSkipsCheckRecognitionSupportUntilInvalidatedByLanguageError() {
+        val context = RuntimeEnvironment.getApplication()
+        registerService(dev.gitblame.voxgolem.assistant.speech.SpeechServiceRequirement.GOOGLE_SPEECH_PACKAGE,
+            dev.gitblame.voxgolem.assistant.speech.SpeechServiceRequirement.GOOGLE_RECOGNITION_SERVICE_CLASS)
+        val cache = GoogleSttSupportCache(context, versionCodeProvider = { 42L })
+        cache.clear()
+        val factory = AndroidLocalRecognizerFactory(
+            context,
+            supportCache = cache,
+            strictGoogleOnly = true,
+        )
+        val owner = SharedDictationOwner(factory, { true }, RecognitionResourceLease())
+        owner.setForeground(true)
+
+        // First turn: cache miss -> runs checkRecognitionSupport
+        owner.start("en-AU"); drain()
+        assertEquals(DictationPhase.CHECKING, owner.snapshot().phase)
+        val firstSdk = shadowOf(ShadowSpeechRecognizer.getLatestSpeechRecognizer())
+        assertNull(firstSdk.lastRecognizerIntent)
+        firstSdk.triggerSupportResult(
+            RecognitionSupport.Builder().setInstalledOnDeviceLanguages(listOf("en-US", "en-AU")).build(),
+        ); drain()
+        assertEquals(DictationPhase.LISTENING, owner.snapshot().phase)
+        assertEquals("en-AU", firstSdk.lastRecognizerIntent.getStringExtra(RecognizerIntent.EXTRA_LANGUAGE))
+        firstSdk.triggerOnResults(result("First utterance")); drain()
+        assertEquals(DictationPhase.FINAL, owner.snapshot().phase)
+
+        // Second turn: cache hit -> skips checkRecognitionSupport completely and starts listening immediately!
+        owner.start("en-AU"); drain()
+        val secondSdk = shadowOf(ShadowSpeechRecognizer.getLatestSpeechRecognizer())
+        assertEquals(DictationPhase.LISTENING, owner.snapshot().phase)
+        assertNotNull(secondSdk.lastRecognizerIntent)
+        assertEquals("en-AU", secondSdk.lastRecognizerIntent.getStringExtra(RecognizerIntent.EXTRA_LANGUAGE))
+        assertEquals("en-AU", owner.snapshot().route?.selectedLanguage)
+        assertEquals(listOf("en-US", "en-AU"), owner.snapshot().route?.installedLanguages)
+
+        // Language error (13) invalidates the cache entry
+        secondSdk.triggerOnError(SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE); drain()
+        assertEquals("recognition_error_13", owner.snapshot().error)
+        assertNull(cache.get("com.google.android.tts/synthetic.GoogleRecognitionService", "en-AU"))
+
+        // Third turn after invalidation: re-runs checkRecognitionSupport
+        owner.start("en-AU"); drain()
+        assertEquals(DictationPhase.CHECKING, owner.snapshot().phase)
+        owner.close(); drain()
+    }
+
+    @Test fun preRollAudioSourceAttachesPipeFiresImmediateReadyOnceAndClosesPipeOnStop() {
+        val context = RuntimeEnvironment.getApplication()
+        registerService(dev.gitblame.voxgolem.assistant.speech.SpeechServiceRequirement.GOOGLE_SPEECH_PACKAGE,
+            dev.gitblame.voxgolem.assistant.speech.SpeechServiceRequirement.GOOGLE_RECOGNITION_SERVICE_CLASS)
+        val cache = GoogleSttSupportCache(context, versionCodeProvider = { 99L })
+        cache.put(
+            ComponentName(dev.gitblame.voxgolem.assistant.speech.SpeechServiceRequirement.GOOGLE_SPEECH_PACKAGE,
+                dev.gitblame.voxgolem.assistant.speech.SpeechServiceRequirement.GOOGLE_RECOGNITION_SERVICE_CLASS).flattenToShortString(),
+            "en-AU",
+            CachedSttSupport("en-AU", listOf("en-AU"), listOf("en-AU")),
+            networkFallback = false,
+        )
+        val pipe = android.os.ParcelFileDescriptor.createPipe()
+        var streamingStarted = false
+        var captureStopped = false
+        var preRollClosed = false
+        val fakePreRoll = object : PreRollAudioSource {
+            override val readDescriptor = pipe[0]
+            override val isRecording = true
+            override fun startStreaming() { streamingStarted = true }
+            override fun configureIntent(intent: Intent): Intent = intent
+                .putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, readDescriptor)
+                .putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
+                .putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, android.media.AudioFormat.ENCODING_PCM_16BIT)
+                .putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, 16_000)
+            override fun stopCapture() {
+                captureStopped = true
+                runCatching { pipe[1].close() }
+            }
+            override fun close() {
+                preRollClosed = true
+                stopCapture()
+                runCatching { pipe[0].close() }
+            }
+        }
+        val factory = AndroidLocalRecognizerFactory(
+            context,
+            supportCache = cache,
+            preRollFactory = PreRollAudioSourceFactory { fakePreRoll },
+            strictGoogleOnly = true,
+        )
+        var readyCount = 0
+        val session = factory.create()
+        session.checkLanguage("en-AU") { assertTrue(it) }
+        session.start("en-AU", object : LocalRecognizerEvents {
+            override fun ready() { readyCount++ }
+            override fun partial(text: String) {}
+            override fun final(text: String) {}
+            override fun error(code: String) {}
+        })
+        drain()
+        assertTrue(streamingStarted)
+        assertEquals(1, readyCount)
+        val sdk = shadowOf(ShadowSpeechRecognizer.getLatestSpeechRecognizer())
+        assertSame(
+            pipe[0],
+            sdk.lastRecognizerIntent.getParcelableExtra(
+                RecognizerIntent.EXTRA_AUDIO_SOURCE,
+                android.os.ParcelFileDescriptor::class.java,
+            ),
+        )
+        assertEquals(1, sdk.lastRecognizerIntent.getIntExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 0))
+        assertEquals(
+            android.media.AudioFormat.ENCODING_PCM_16BIT,
+            sdk.lastRecognizerIntent.getIntExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, 0),
+        )
+        assertEquals(16_000, sdk.lastRecognizerIntent.getIntExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, 0))
+
+        // Late onReadyForSpeech from Google service is idempotent and does not fire ready() a second time
+        sdk.triggerOnReadyForSpeech(Bundle()); drain()
+        assertEquals(1, readyCount)
+
+        // stop() immediately closes capture/pipe write end before final results arrive
+        session.stop()
+        assertTrue(captureStopped)
+        session.destroy()
+        assertTrue(preRollClosed)
+    }
+
     private fun result(text: String, final: Boolean = false, locale: String? = null) = Bundle().apply {
         putStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION, arrayListOf(text))
         putBoolean("final_result", final)

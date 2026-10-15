@@ -1,0 +1,146 @@
+package dev.gitblame.voxgolem.android.wear.assistant
+
+import android.content.Intent
+import android.os.ParcelFileDescriptor
+import dev.gitblame.voxgolem.assistant.recognition.LocalRecognizerEvents
+import dev.gitblame.voxgolem.assistant.recognition.LocalRecognizerSession
+import org.junit.Assert.*
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [35])
+class SyntheticAskBenchmarkTest {
+    @Test fun cleanupAttemptsActivityAudioAndProviderStagesAndRetainsTheFirstFailure() {
+        for (failed in listOf("activity", "audio", "provider")) {
+            val visited = mutableListOf<String>()
+            val failure = IllegalStateException("synthetic_$failed")
+            var released = false
+            val result = runCatching {
+                runSyntheticCleanup(listOf("activity", "audio", "provider", "store").map { name ->
+                    { visited += name; if (name == failed) throw failure }
+                })
+                released = true
+            }
+            assertSame(failure, result.exceptionOrNull())
+            assertEquals(listOf("activity", "audio", "provider", "store"), visited)
+            assertFalse(released)
+        }
+    }
+    private class Delegate : LocalRecognizerSession {
+        var starts = 0
+        lateinit var events: LocalRecognizerEvents
+        override fun checkLanguage(language: String, result: (Boolean) -> Unit) = result(true)
+        override fun start(language: String, events: LocalRecognizerEvents) { starts++; this.events = events }
+        override fun stop() = Unit
+        override fun cancel() = Unit
+        override fun destroy() = Unit
+    }
+    private class Input(override val eof: Boolean = true, override val isRecording: Boolean = true) : SyntheticAskInput {
+        private val pipe = ParcelFileDescriptor.createPipe()
+        override val readDescriptor = pipe[0]
+        override val writerRetired = true
+        override fun configureIntent(intent: Intent) = intent
+        override fun startStreaming() = Unit
+        override fun stopCapture() = Unit
+        override fun close() { pipe.forEach { it.close() } }
+    }
+    private class Events : LocalRecognizerEvents {
+        val finals = mutableListOf<String>()
+        val partials = mutableListOf<String>()
+        val errors = mutableListOf<String>()
+        override fun final(text: String) { finals += text }
+        override fun partial(text: String) { partials += text }
+        override fun error(code: String) { errors += code }
+    }
+
+    @Test fun exactSyntheticTokensRejectAdditionalDigitsWordsUnicodeAndOversizedContent() {
+        assertTrue(SyntheticAskContract.matches("Alpha, bravo charlie delta!"))
+        listOf("Alpha bravo charlie delta 42", "Alpha bravo charlie delta synthetic extra",
+            "Alpha bravo charlie delta Ω", "bravo charlie delta", "Alpha bravo charlie delta" + " ".repeat(200))
+            .forEach { assertFalse(SyntheticAskContract.matches(it)) }
+    }
+
+    @Test fun missingClosedOrInactivePipeNeverCallsTheRealStartMethod() {
+        val delegate = Delegate()
+        val absent = SyntheticAskRecognizerSession(delegate, { null }, {}, {})
+        assertTrue(runCatching { absent.start("en-AU", Events()) }.isFailure)
+        Input(isRecording = false).use { input ->
+            val inactive = SyntheticAskRecognizerSession(delegate, { input }, {}, {})
+            assertTrue(runCatching { inactive.start("en-AU", Events()) }.isFailure)
+        }
+        Input().also { input ->
+            input.close()
+            val closed = SyntheticAskRecognizerSession(delegate, { input }, {}, {})
+            assertTrue(runCatching { closed.start("en-AU", Events()) }.isFailure)
+        }
+        assertEquals(0, delegate.starts)
+    }
+
+    @Test fun actualDelegateFinalIsForwardedExactlyOnceOnlyAfterFiniteFixtureEof() {
+        Input().use { input ->
+            val delegate = Delegate()
+            var accepted = 0
+            val events = Events()
+            SyntheticAskRecognizerSession(delegate, { input }, { accepted++ }, { fail("unexpected rejection") })
+                .start("en-AU", events)
+            delegate.events.partial("Alpha bravo")
+            delegate.events.partial("Synthetic unrelated words")
+            delegate.events.final(SyntheticAskContract.PHRASE)
+            delegate.events.final(SyntheticAskContract.PHRASE)
+            assertEquals(1, accepted)
+            assertEquals(listOf(SyntheticAskContract.PHRASE), events.finals)
+            assertEquals(listOf("Alpha bravo"), events.partials)
+            assertTrue(events.errors.isEmpty())
+        }
+    }
+
+    @Test fun unexpectedAuthoritativeTextOrPrematureFinalCannotReachTheLoopOrModel() {
+        listOf(false to SyntheticAskContract.PHRASE, true to "Synthetic unrelated words").forEach { (eof, text) ->
+            Input(eof = eof).use { input ->
+                val delegate = Delegate()
+                val events = Events()
+                var rejected = 0
+                SyntheticAskRecognizerSession(delegate, { input }, { fail("unexpected acceptance") }, { rejected++ })
+                    .start("en-AU", events)
+                delegate.events.final(text)
+                delegate.events.final(SyntheticAskContract.PHRASE)
+                assertEquals(1, rejected)
+                assertTrue(events.finals.isEmpty())
+                assertEquals(listOf("synthetic_input_rejected"), events.errors)
+            }
+        }
+    }
+
+    @Test fun finalGuardDiagnosticsDistinguishTextMismatchFromMissingEofWithoutExportingText() {
+        for ((eof, text) in listOf(false to SyntheticAskContract.PHRASE, true to "Synthetic other words")) {
+            Input(eof = eof).use { input ->
+                val delegate = Delegate()
+                val observed = mutableListOf<Triple<Boolean, Boolean, Int>>()
+                val events = Events()
+                SyntheticAskRecognizerSession(delegate, { input }, { fail("unexpected acceptance") }, {},
+                    { matched, ended, words -> observed += Triple(matched, ended, words) }).start("en-AU", events)
+                delegate.events.final(text)
+                assertEquals(listOf(Triple(SyntheticAskContract.matches(text), eof, SyntheticAskContract.wordCount(text))), observed)
+                assertTrue(events.finals.isEmpty())
+            }
+        }
+    }
+
+    @Test fun ordinaryAppHasNoBenchmarkOverrideWithoutInstrumentationInstallation() {
+        val client = SyntheticAssistantClient()
+        assertFalse(SyntheticAskBenchmark.active(client))
+        assertNull(SyntheticAskBenchmark.context(client))
+        SyntheticAskBenchmark.requireAttached(client)
+    }
+
+    @Test fun unauthenticatedInstrumentationCannotArmReadOrRetireASession() {
+        val stranger = android.app.Instrumentation()
+        assertTrue(runCatching { SyntheticAskBenchmark.prepareTrial(stranger) }.isFailure)
+        assertTrue(runCatching { SyntheticAskBenchmark.status(stranger) }.isFailure)
+        assertTrue(runCatching { SyntheticAskBenchmark.finishTrial(stranger) }.isFailure)
+        assertTrue(runCatching { SyntheticAskBenchmark.close(stranger) }.isFailure)
+    }
+}

@@ -5,15 +5,19 @@ import android.media.AudioAttributes
 import android.media.SoundPool
 import android.util.Log
 import dev.gitblame.voxgolem.voice.R
+import dev.gitblame.voxgolem.assistant.AssistantTiming
+import dev.gitblame.voxgolem.assistant.AssistantTiming.Operation
+import dev.gitblame.voxgolem.assistant.AssistantTiming.Stage
 
 interface ListeningCue : AutoCloseable {
+    fun timing(parent: AssistantTiming?) {}
     fun play()
     fun finish() { stop() }
     fun stop()
     override fun close()
 }
 
-/** Two preloaded microphone cues; an unready request is dropped, never queued. */
+/** Two preloaded microphone cues; one pending start survives cold load until finish/stop/close. */
 class AndroidListeningCue internal constructor(
     context: Context,
     createPool: (AudioAttributes) -> ListeningCueSoundPool,
@@ -27,6 +31,12 @@ class AndroidListeningCue internal constructor(
     private var stream = 0
     private var ready = false
     private var endReady = false
+    private var pendingStart = false
+    private var parentTiming: AssistantTiming? = null
+    private var startTiming: AssistantTiming? = null
+    private val loadTiming = AssistantTiming.begin(context.applicationContext, Operation.MICROPHONE_CUE).also { it.mark(Stage.CREATE_REQUESTED) }
+
+    override fun timing(parent: AssistantTiming?) { synchronized(lock) { parentTiming = parent } }
 
     init {
         synchronized(lock) {
@@ -38,7 +48,21 @@ class AndroidListeningCue internal constructor(
                     synchronized(lock) {
                         if (pool === created) {
                             when (loadedSound) {
-                                sound -> if (status == 0) ready = true else fail("load")
+                                sound -> if (status == 0) {
+                                    ready = true
+                                    loadTiming.finish(Stage.CUE_LOAD_READY)
+                                    if (pendingStart && sound != 0) {
+                                        pendingStart = false
+                                        try {
+                                            stopStream(created)
+                                            stream = created.play(sound)
+                                            if (stream == 0) fail("play")
+                                            else startTiming?.finish(Stage.CUE_PLAY_SUBMITTED)
+                                        } catch (_: RuntimeException) {
+                                            fail("play")
+                                        }
+                                    }
+                                } else fail("load")
                                 endSound -> if (status == 0) endReady = true else fail("load")
                             }
                         }
@@ -64,8 +88,22 @@ class AndroidListeningCue internal constructor(
             val active = pool ?: return
             try {
                 stopStream(active)
-                if (if (ending) !endReady else !ready) return
-                stream = active.play(if (ending) endSound else sound)
+                if (ending) {
+                    startTiming?.finish(Stage.CANCELLED)
+                    pendingStart = false
+                    if (!endReady) return
+                    stream = active.play(endSound)
+                } else {
+                    startTiming?.finish(Stage.REPLACED)
+                    startTiming = (parentTiming ?: loadTiming).fork(Operation.MICROPHONE_CUE).also { it.mark(Stage.CUE_PLAY_REQUESTED) }
+                    if (!ready) {
+                        pendingStart = true
+                        return
+                    }
+                    pendingStart = false
+                    stream = active.play(sound)
+                    if (stream != 0) startTiming?.finish(Stage.CUE_PLAY_SUBMITTED)
+                }
                 if (stream == 0) fail("play")
             } catch (_: RuntimeException) {
                 fail("play")
@@ -75,6 +113,8 @@ class AndroidListeningCue internal constructor(
 
     override fun stop() {
         synchronized(lock) {
+            pendingStart = false
+            startTiming?.finish(Stage.CANCELLED)
             val active = pool ?: return
             try { stopStream(active) } catch (_: RuntimeException) { fail("stop") }
         }
@@ -88,11 +128,16 @@ class AndroidListeningCue internal constructor(
     }
 
     private fun fail(stage: String) {
+        startTiming?.finish(Stage.FAILED)
+        loadTiming.finish(Stage.FAILED)
         Log.w(TAG, "Listening cue unavailable ($stage)")
         release()
     }
 
     private fun release() {
+        startTiming?.finish(Stage.CANCELLED)
+        loadTiming.finish(Stage.CANCELLED)
+        pendingStart = false
         val retired = pool ?: return
         pool = null
         ready = false

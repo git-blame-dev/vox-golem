@@ -18,6 +18,7 @@ import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.geometry.Offset
@@ -91,6 +92,8 @@ internal data class AssistantActions(
     val resetSpeechSelection: () -> Unit,
     val prepareSpeechOptions: () -> Unit = {},
     val openSpeechStore: () -> Unit = {},
+    val replyLayout: (String?) -> Unit = {},
+    val replyDrawSubmitted: (String?) -> Unit = {},
 )
 
 private enum class AssistantPage { CHAT, CHATS, SETTINGS, SPEECH_LANGUAGE, SPEECH_ENGINE, SPEECH_VOICE, MISSING_SPEECH }
@@ -364,7 +367,11 @@ private fun ChatScreen(
                     item(key = itemKeys.answer(turn)) {
                         Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                             Text(assistantCompletedReplyLabel(turn, replyMetrics), style = wearTextStyle(MaterialTheme.typography.labelMedium))
-                            Text(turn.answer)
+                            Text(turn.answer, onTextLayout = { actions.replyLayout(turn.requestKey) },
+                                modifier = Modifier.drawWithContent {
+                                    drawContent()
+                                    actions.replyDrawSubmitted(turn.requestKey)
+                                })
                         }
                     }
                 }
@@ -379,7 +386,12 @@ private fun ChatScreen(
                         val waiting = projected.text.isBlank()
                         Text(assistantReplyLabel(if (waiting) null else projected.requestKey?.let { replyMetrics(it) ?: projected.firstTextMs }, provisional = true),
                             style = wearTextStyle(MaterialTheme.typography.labelMedium))
-                        Text(if (waiting) assistantToolActivity(state) ?: "Thinking…" else projected.text)
+                        Text(if (waiting) assistantToolActivity(state) ?: "Thinking…" else projected.text,
+                            onTextLayout = { if (!waiting) actions.replyLayout(projected.requestKey) },
+                            modifier = Modifier.drawWithContent {
+                                drawContent()
+                                if (!waiting) actions.replyDrawSubmitted(projected.requestKey)
+                            })
                     }
                 } }
                 items(promptsAfterReply, key = { it.key }) { prompt ->
@@ -393,7 +405,18 @@ private fun ChatScreen(
                 } }
                 state.error?.let { item(key = "request-error") { Text(assistantErrorText(it), color = MaterialTheme.colorScheme.error) } }
                 assistantVisibleVoiceErrors(voice).forEach { error ->
-                    item(key = "voice-error:$error") { Text(assistantVoiceErrorText(error), color = MaterialTheme.colorScheme.error) }
+                    item(key = "voice-error:$error") {
+                        Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text(assistantVoiceErrorText(error), color = MaterialTheme.colorScheme.error)
+                            if (assistantIsInstallableVoiceError(error, voice)) {
+                                ActionButton(
+                                    if (voice.missingSpeechServices) "Open Play Store" else "Install voice data",
+                                    true,
+                                    actions.openSpeechStore
+                                )
+                            }
+                        }
+                    }
                 }
                 if (voice.launchConfirmationRequired) item(key = "voice-confirmation") {
                     Text("Tap ${if (voice.entryMode == AssistantVoiceEntryMode.TALK) "Talk" else "Ask"} to start voice.")

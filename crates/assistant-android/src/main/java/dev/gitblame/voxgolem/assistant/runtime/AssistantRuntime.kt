@@ -1,9 +1,14 @@
 package dev.gitblame.voxgolem.assistant.runtime
 
 import android.content.Context
+import android.content.ContextWrapper
+import android.os.Looper
 import dev.gitblame.voxgolem.assistant.AssistantStore
 import dev.gitblame.voxgolem.assistant.AssistantTiming
+import java.io.File
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.Future
 
 /** Phone and Wear use this process owner; native listeners must not create another store/engine. */
 object AssistantRuntime {
@@ -23,6 +28,55 @@ object AssistantRuntime {
     fun captureResourceAdmissionReady(): Boolean = captureAdmissionReady
 
     fun refreshIfStarted() { engine?.refresh() }
+    fun idleForSyntheticSession(): Boolean = engine?.snapshot()?.let { !it.busy && !it.foreground } ?: true
+
+    /** In-process instrumentation owner only; never installs itself as the process runtime. */
+    fun syntheticSession(context: Context, directory: File,
+        beginTiming: (AssistantTiming.Operation) -> AssistantTiming): SyntheticSession {
+        require(directory.parentFile?.canonicalFile == context.cacheDir.canonicalFile &&
+            directory.name.matches(Regex("synthetic-ask-[a-f0-9-]{36}")))
+        check(directory.mkdir())
+        val isolated = object : ContextWrapper(context.applicationContext) {
+            override fun getApplicationContext(): Context = this
+            override fun getNoBackupFilesDir(): File = directory
+        }
+        val store = AssistantStore(isolated)
+        val io = Executors.newSingleThreadExecutor { Thread(it, "synthetic-assistant-store") }
+        val provider = Executors.newSingleThreadExecutor { Thread(it, "synthetic-assistant-provider") }
+        val worker = AssistantRequestWorker(provider)
+        val credentials = ProviderAuthSource(context.applicationContext)
+        val models = object : AssistantModelStorage {
+            override fun read() = "custom-luna-none"
+            override fun write(value: String) { require(value == read()) }
+        }
+        val policies = object : AssistantPolicyStorage {
+            private val value = AssistantPolicy(webEnabled = false, speechNetworkFallback = false,
+                speechLanguage = "en-AU", speechTtsProvider = "com.google.android.tts")
+            override fun read() = value
+            override fun write(value: AssistantPolicy) { require(value == this.value) }
+        }
+        val isolatedEngine = AssistantEngine(store, io, worker, credentials::pathForProvider,
+            models, credentials, policies, beginTiming = beginTiming)
+        var retirementRequested = false
+        var storeClose: Future<*>? = null
+        return SyntheticSession(isolatedEngine) {
+            check(Looper.myLooper() != Looper.getMainLooper())
+            if (!retirementRequested) { isolatedEngine.background(); retirementRequested = true }
+            worker.close()
+            provider.shutdown()
+            check(provider.awaitTermination(15, TimeUnit.SECONDS)) { "synthetic_provider_retirement_timeout" }
+            // Provider callbacks enqueue their final actor work before the store-close barrier.
+            if (storeClose == null) storeClose = io.submit { store.close() }
+            storeClose!!.get(15, TimeUnit.SECONDS)
+            io.shutdown()
+            check(io.awaitTermination(15, TimeUnit.SECONDS)) { "synthetic_store_retirement_timeout" }
+            check(directory.deleteRecursively()) { "synthetic_store_cleanup_failed" }
+        }
+    }
+
+    class SyntheticSession internal constructor(val engine: AssistantEngine, private val cleanup: () -> Unit) : AutoCloseable {
+        @Synchronized override fun close() = cleanup()
+    }
 
     @Synchronized fun get(context: Context, startupTiming: AssistantTiming? = null, preparePhoneContext: Boolean = false): AssistantEngine {
         engine?.let { startupTiming?.mark(AssistantTiming.Stage.RUNTIME_REUSED); return it }
