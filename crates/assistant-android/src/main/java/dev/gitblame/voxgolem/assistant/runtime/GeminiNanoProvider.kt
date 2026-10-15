@@ -38,22 +38,22 @@ class DefaultGeminiNanoEngine(private val context: Context) : GeminiNanoEngine {
 
     private var model: GenerativeModel? = null
     private var workerExecutor: ExecutorService? = null
+    private var callbackExecutor: ExecutorService? = null
 
     private fun getModel(): GenerativeModel {
         model?.let { return it }
-        val worker = Executors.newCachedThreadPool()
-        workerExecutor = worker
-        val callbackExec = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
-            context.mainExecutor
-        } else {
-            Executor { command ->
-                android.os.Handler(android.os.Looper.getMainLooper()).post(command)
-            }
+        val worker = Executors.newCachedThreadPool { r ->
+            Thread(r, "gemini-nano-worker").apply { isDaemon = true }
         }
+        val callback = Executors.newCachedThreadPool { r ->
+            Thread(r, "gemini-nano-callback").apply { isDaemon = true }
+        }
+        workerExecutor = worker
+        callbackExecutor = callback
         val config = GenerationConfig.Builder().also { builder ->
             builder.context = context
             builder.workerExecutor = worker
-            builder.callbackExecutor = callbackExec
+            builder.callbackExecutor = callback
         }.build()
 
         val downloadCallback = object : DownloadCallback {
@@ -124,6 +124,12 @@ class DefaultGeminiNanoEngine(private val context: Context) : GeminiNanoEngine {
             Log.w(TAG, "Error shutting down workerExecutor: ${e.message}")
         }
         workerExecutor = null
+        try {
+            callbackExecutor?.shutdown()
+        } catch (e: Throwable) {
+            Log.w(TAG, "Error shutting down callbackExecutor: ${e.message}")
+        }
+        callbackExecutor = null
     }
 }
 
@@ -153,16 +159,18 @@ class GeminiNanoProvider(
     }
 
     fun prewarm() {
-        try {
-            Log.i(TAG, "Prewarming Gemini Nano...")
-            val eng = getOrCreateModel()
-            runBlocking(Dispatchers.IO) {
-                eng.prepareInferenceEngine()
+        Thread({
+            try {
+                Log.i(TAG, "Prewarming Gemini Nano in background thread...")
+                val eng = getOrCreateModel()
+                runBlocking(Dispatchers.IO) {
+                    eng.prepareInferenceEngine()
+                }
+                Log.i(TAG, "Gemini Nano prewarm completed successfully")
+            } catch (e: Throwable) {
+                Log.w(TAG, "Gemini Nano prewarm failed: ${e.message}", e)
             }
-            Log.i(TAG, "Gemini Nano prewarm completed successfully")
-        } catch (e: Throwable) {
-            Log.w(TAG, "Gemini Nano prewarm failed: ${e.message}", e)
-        }
+        }, "gemini-nano-prewarm").start()
     }
 
     override fun respond(
