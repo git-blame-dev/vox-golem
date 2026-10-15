@@ -77,18 +77,18 @@ describe('Android runtime contract helpers', () => {
     expect(isExpectedCanonicalTurn(parsedTurn, 'r', '1', new Set([canonicalExecutionKey(parsedTurn)]))).toBe(false)
   })
 
-  it('maps legacy settings through only the canonical preference command', async () => {
+  it.each(['dark', 'slate', 'light'])('maps legacy %s settings through only the canonical preference command', async (theme) => {
     cacheAndroidSnapshot(snapshot)
     const invoke = vi.fn(async (command: string, args?: unknown) => {
       expect(command).toBe('set_preferences')
       const proposal = (args as { preferences: Record<string, unknown> }).preferences
-      return { ...proposal, ui_theme: 'light' }
+      return { ...proposal, ui_theme: theme }
     })
     window.__TAURI_INTERNALS__ = { invoke }
 
-    await expect(invokeAndroidCommand('set_ui_theme', { theme: 'light' })).resolves.toBe('light')
+    await expect(invokeAndroidCommand('set_ui_theme', { theme })).resolves.toBe(theme)
     expect(invoke).toHaveBeenCalledTimes(1)
-    expect(invoke.mock.calls[0]?.[1]).toMatchObject({ preferences: { ui_theme: 'light', response_profile: 'quality' } })
+    expect(invoke.mock.calls[0]?.[1]).toMatchObject({ preferences: { ui_theme: theme, response_profile: 'quality' } })
 
     await expect(invokeAndroidCommand('unknown_desktop_command')).rejects.toMatchObject({ code: 'unavailable', message: 'Command is unavailable on Android' })
     expect(invoke).toHaveBeenCalledTimes(1)
@@ -141,10 +141,10 @@ describe('Android runtime contract helpers', () => {
     expect(updated.capabilities.find((item) => item['id'] === 'custom_provider')?.['state']).toBe('unavailable')
   })
 
-  it('preserves preferences changed after a snapshot request started', () => {
+  it.each(['dark', 'slate', 'light'] as const)('preserves %s preferences changed after a snapshot request started', (theme) => {
     cacheAndroidSnapshot(snapshot)
     const snapshotPreferenceRevision = getAndroidPreferencePublicationRevision()
-    const updatedPreferences = { ...preferences, uiTheme: 'light' as const }
+    const updatedPreferences = { ...preferences, uiTheme: theme }
     setCachedAndroidPreferences(updatedPreferences)
 
     const published = cacheAndroidSnapshot(
@@ -153,7 +153,7 @@ describe('Android runtime contract helpers', () => {
     )
     expect(published.preferences).toEqual(updatedPreferences)
     expect(androidPreferenceProposal('set_ui_text_size', { textSize: 'small' }, published.preferences))
-      .toMatchObject({ ui_theme: 'light', ui_text_size: 'small' })
+      .toMatchObject({ ui_theme: theme, ui_text_size: 'small' })
   })
 
   it('parses a native snapshot exactly once through the actual Android branch', async () => {

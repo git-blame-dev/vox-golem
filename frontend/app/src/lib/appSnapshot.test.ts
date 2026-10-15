@@ -40,6 +40,16 @@ afterEach(() => {
 })
 
 describe('app snapshot contract', () => {
+  it.each(['dark', 'slate', 'light'])('preserves the native %s theme', (theme) => {
+    const wire = validSnapshot()
+    ;(wire['preferences'] as Record<string, unknown>)['ui_theme'] = theme
+    expect(parseAppSnapshot(wire).preferences.uiTheme).toBe(theme)
+  })
+  it.each(['sepia', 'dim', 'sleek-dark', null, undefined, 0])('rejects invalid theme %j', (theme) => {
+    const wire = validSnapshot()
+    ;(wire['preferences'] as Record<string, unknown>)['ui_theme'] = theme
+    expect(() => parseAppSnapshot(wire)).toThrow(/ui_theme/)
+  })
   it.each(['speech_language', 'speech_tts_provider', 'speech_tts_voice'])('accepts legacy omission and enforces the 512 UTF-8 byte string boundary for %s', (field) => {
     const wire = validSnapshot()
     expect(parseAppSnapshot(wire).preferences).toMatchObject({ speechLanguage: '', speechTtsProvider: '', speechTtsVoice: '' })

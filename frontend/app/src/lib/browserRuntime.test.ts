@@ -230,7 +230,7 @@ describe('browser preview runtime', () => {
     })
   })
 
-  it('publishes complete validated preferences and rejects partial proposals atomically', async () => {
+  it.each(['dark', 'slate', 'light'])('publishes complete %s preferences and rejects partial proposals atomically', async (theme) => {
     const runtime = getBrowserPreviewInternals()
     const proposal = {
       instant: 'local-fast',
@@ -242,7 +242,7 @@ describe('browser preview runtime', () => {
       completion: false,
       response_profile: 'fast',
       tts_enabled: false,
-      ui_theme: 'light',
+      ui_theme: theme,
       ui_text_size: 'large',
     }
 
@@ -257,7 +257,7 @@ describe('browser preview runtime', () => {
       completion: false,
       responseProfile: 'fast',
       ttsEnabled: false,
-      uiTheme: 'light',
+      uiTheme: theme,
       uiTextSize: 'large',
       webEnabled: true,
       speechNetworkFallback: true,
@@ -267,7 +267,7 @@ describe('browser preview runtime', () => {
     returned['ui_theme'] = 'dark'
     await expect(runtime.invoke('set_preferences', { preferences: { ui_theme: 'dark' } })).rejects.toMatchObject({ code: 'invalid_input' })
     expect(parseAppSnapshot(await runtime.invoke('get_app_snapshot')).preferences).toMatchObject({
-      uiTheme: 'light',
+      uiTheme: theme,
       uiTextSize: 'large',
     })
   })

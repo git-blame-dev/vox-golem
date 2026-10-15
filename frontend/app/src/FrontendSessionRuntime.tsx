@@ -3687,7 +3687,7 @@ function parseUiTextSize(value: unknown): UiTextSize {
 }
 
 function parseUiTheme(value: unknown): UiTheme {
-  if (value === 'light' || value === 'dark') {
+  if (value === 'light' || value === 'dark' || value === 'slate') {
     return value
   }
 
