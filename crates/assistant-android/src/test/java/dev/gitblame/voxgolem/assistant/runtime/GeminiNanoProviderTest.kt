@@ -136,7 +136,7 @@ class GeminiNanoProviderTest {
         val provider = GeminiNanoProvider(RuntimeEnvironment.getApplication(), engineFactory = { fakeEngine })
 
         assertFalse(fakeEngine.prewarmed)
-        provider.prewarm()
+        provider.prewarm(async = false)
         assertTrue(fakeEngine.prewarmed)
     }
 

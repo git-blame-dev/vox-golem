@@ -158,8 +158,8 @@ class GeminiNanoProvider(
         }
     }
 
-    fun prewarm() {
-        Thread({
+    fun prewarm(async: Boolean = true): Thread? {
+        val task = Runnable {
             try {
                 Log.i(TAG, "Prewarming Gemini Nano in background thread...")
                 val eng = getOrCreateModel()
@@ -170,7 +170,13 @@ class GeminiNanoProvider(
             } catch (e: Throwable) {
                 Log.w(TAG, "Gemini Nano prewarm failed: ${e.message}", e)
             }
-        }, "gemini-nano-prewarm").start()
+        }
+        return if (async) {
+            Thread(task, "gemini-nano-prewarm").apply { start() }
+        } else {
+            task.run()
+            null
+        }
     }
 
     override fun respond(
@@ -274,7 +280,7 @@ class GeminiNanoProvider(
                             e.errorCode == GenerativeAIException.ErrorCode.NOT_AVAILABLE || msg.contains("NOT_AVAILABLE") || msg.contains("not found", ignoreCase = true) -> "aicore_not_available"
                             e.errorCode == GenerativeAIException.ErrorCode.NEEDS_SYSTEM_UPDATE || msg.contains("UPDATE") -> "aicore_needs_update"
                             e.errorCode == GenerativeAIException.ErrorCode.BUSY || msg.contains("BUSY") -> "aicore_busy"
-                            isDownloading.get() || msg.contains("download", ignoreCase = true) -> "aicore_downloading"
+                            msg.contains("download", ignoreCase = true) -> "aicore_downloading"
                             else -> "aicore_unavailable"
                         }
                         errorResult = JSONObject()
