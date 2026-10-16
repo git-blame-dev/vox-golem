@@ -405,7 +405,7 @@ private fun ChatScreen(
                 assistantToolActivity(state)?.takeIf { reply == null || reply.text.isNotBlank() }?.let { activity -> item(key = "tool-activity") {
                     Text(activity, style = wearTextStyle(MaterialTheme.typography.labelMedium), color = MaterialTheme.colorScheme.primary)
                 } }
-                state.error?.let { item(key = "request-error") { Text(assistantErrorText(it), color = MaterialTheme.colorScheme.error) } }
+                assistantRequestError(state)?.let { item(key = "request-error") { Text(assistantErrorText(it), color = MaterialTheme.colorScheme.error) } }
                 assistantVisibleVoiceErrors(voice).forEach { error ->
                     item(key = "voice-error:$error") {
                         Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -527,7 +527,7 @@ private fun SettingsScreen(state: AssistantState, voice: AssistantVoiceState, pa
         item { Text("Language, engine and voice are persisted requests, not proof of the active processing route. Labels change only when native state reports the choice.") }
         if (speechSelectionPending) item { Text("Waiting for native speech-settings settlement") }
         speechSelectionError?.let { error -> item { Text(assistantSpeechSelectionErrorText(error), color = MaterialTheme.colorScheme.error) } }
-        state.error?.let { error -> item { Text(assistantErrorText(error), color = MaterialTheme.colorScheme.error) } }
+        assistantRequestError(state)?.let { error -> item { Text(assistantErrorText(error), color = MaterialTheme.colorScheme.error) } }
         item { ActionButton("Speech language: ${state.speechLanguage.ifEmpty { "Automatic" }}", true) { openSpeech(AssistantSpeechField.LANGUAGE) } }
         item { Text("Changing engine explicitly clears the old voice to Automatic. No other engine or voice is substituted.") }
         item { ActionButton("Reply voice engine: ${state.speechTtsProvider.ifEmpty { "Automatic" }}", true) { openSpeech(AssistantSpeechField.ENGINE) } }
@@ -714,6 +714,9 @@ internal fun assistantCanSend(state: AssistantState, voice: AssistantVoiceState)
     !state.busy && !voice.active && state.draft.isNotBlank() &&
     state.branchChoices.isEmpty() && state.model in AssistantModels.aliases
 
+internal fun assistantRequestError(state: AssistantState): String? =
+    if (state.model !in AssistantModels.aliases) "unsupported_model" else state.error
+
 internal enum class AssistantPrimaryAction(val description: String) {
     STOP("Stop microphone, response and playback"), SEND("Send draft"),
     TALK("Talk continuously"), ASK("Ask once"),
@@ -733,10 +736,10 @@ internal fun assistantPrimaryControl(state: AssistantState, voice: AssistantVoic
     voice.active -> AssistantPrimaryControl(AssistantPrimaryAction.STOP, true)
     voice.launchConfirmationRequired -> AssistantPrimaryControl(
         if (voice.entryMode == AssistantVoiceEntryMode.TALK) AssistantPrimaryAction.TALK else AssistantPrimaryAction.ASK,
-        state.foreground && state.branchChoices.isEmpty() && (voice.missingSpeechServices || (voice.admissionReady && voice.recognitionServiceAvailable)))
+        state.foreground && state.model in AssistantModels.aliases && state.branchChoices.isEmpty() && (voice.missingSpeechServices || (voice.admissionReady && voice.recognitionServiceAvailable)))
     state.draft.isNotBlank() -> AssistantPrimaryControl(AssistantPrimaryAction.SEND, assistantCanSend(state, voice))
     else -> AssistantPrimaryControl(if (conversationMode) AssistantPrimaryAction.TALK else AssistantPrimaryAction.ASK,
-        state.foreground && state.branchChoices.isEmpty() && (voice.missingSpeechServices || (voice.admissionReady && voice.recognitionServiceAvailable)))
+        state.foreground && state.model in AssistantModels.aliases && state.branchChoices.isEmpty() && (voice.missingSpeechServices || (voice.admissionReady && voice.recognitionServiceAvailable)))
 }
 
 internal fun assistantShowsLatest(state: AssistantState, voice: AssistantVoiceState, readingOlder: Boolean): Boolean =

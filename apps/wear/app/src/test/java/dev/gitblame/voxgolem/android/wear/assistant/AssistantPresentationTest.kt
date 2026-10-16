@@ -164,7 +164,8 @@ class AssistantPresentationTest {
             idle to voice.copy(admissionReady = false), idle to voice.copy(recognitionServiceAvailable = false))) {
             assertFalse(assistantPrimaryControl(state, capability, false).enabled)
         }
-        assertTrue("Do not add a model gate to idle Mic", assistantPrimaryControl(idle.copy(model = "synthetic-unsupported"), voice, false).enabled)
+        assertFalse("Idle Ask generates a reply and must not admit an unsupported model",
+            assistantPrimaryControl(idle.copy(model = "synthetic-unsupported"), voice, false).enabled)
         assertEquals("Send draft", AssistantPrimaryAction.SEND.description)
         assertEquals("Stop microphone, response and playback", AssistantPrimaryAction.STOP.description)
         assertEquals("Ask once", AssistantPrimaryAction.ASK.description)

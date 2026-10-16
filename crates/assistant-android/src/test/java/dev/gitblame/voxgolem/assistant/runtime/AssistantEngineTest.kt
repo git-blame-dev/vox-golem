@@ -66,6 +66,69 @@ class AssistantEngineTest {
     private fun prepare() { engine.setDraft("Synthetic question"); io.drain(); engine.send(); io.drain() }
     private fun settle() { providerQueue.drain(); io.drain() }
 
+    @Test fun androidModelAliasesContainOnlyCustomNanoAndAgy() {
+        assertEquals(setOf("gemini-nano", "agy-flash-low", "agy-flash-high", "agy-opus-high",
+            "agy-sonnet-low", "agy-sonnet-high"), AssistantModels.optionalLabels.keys)
+        assertEquals(AssistantModels.customLabels.keys + AssistantModels.optionalLabels.keys, AssistantModels.aliases.toSet())
+    }
+
+    @Test fun localFastCannotBeSelectedOrPersistedThroughPreferences() {
+        val original = state.model
+        engine.selectModel("local-fast"); io.drain()
+        assertEquals("unsupported_model", state.error)
+        assertEquals(original, state.model)
+        assertEquals(original, models.model)
+        var persisted = false
+        var reply: AssistantState? = null
+        engine.updatePreferences("local-fast", AssistantPolicy(false, false), { persisted = true }) { reply = it }
+        io.drain()
+        assertEquals("unsupported_model", reply?.error)
+        assertEquals(original, state.model)
+        assertEquals(original, models.model)
+        assertFalse(persisted)
+    }
+
+    @Test fun restoredLocalFastSendFailsBeforeCredentialsOrProviderAndRetainsDraft() {
+        engine.stop(); io.drain()
+        models.model = "local-fast"
+        context.applicationInfo.flags = context.applicationInfo.flags or ApplicationInfo.FLAG_DEBUGGABLE
+        for (authCode in listOf("auth_expired", "auth_unavailable")) {
+            var observations = 0
+            val credentials = ProviderAuthSource(java.io.File("/synthetic/missing-primary.json"),
+                java.io.File("/synthetic/missing-legacy.json")) {
+                observations++
+                JSONObject().put("code", authCode).put("sourceKind", "absent").toString()
+            }
+            val restored = AssistantEngine(store, io, AssistantRequestWorker(providerQueue, provider),
+                { error("Unsupported model must not request an auth path") }, models, credentials,
+                beginTiming = { AssistantTiming.begin(context, it, sink = AssistantTiming.Sink(timings::add)) })
+            try {
+                restored.resume(); io.drain()
+                assertEquals("local-fast", restored.snapshot().model)
+                assertEquals("unsupported_model", restored.snapshot().error)
+                restored.setDraft("Synthetic retained unsupported draft"); io.drain()
+                val recordsBefore = store.snapshot().getJSONArray("records").length()
+                observations = 0
+                timings.clear()
+                restored.send(); io.drain()
+                val rejected = restored.snapshot()
+                assertEquals("unsupported_model", rejected.error)
+                assertEquals("local-fast", rejected.model)
+                assertEquals("local-fast", models.model)
+                assertEquals("Synthetic retained unsupported draft", rejected.draft)
+                assertFalse(rejected.busy)
+                assertNull(rejected.conversation)
+                assertNull(rejected.providerRequestId)
+                assertEquals(recordsBefore, store.snapshot().getJSONArray("records").length())
+                assertEquals(0, observations)
+                assertTrue(providerQueue.tasks.isEmpty())
+                assertTrue(provider.requests.isEmpty())
+                assertEquals(Stage.FAILED, timings.single { it.kind == AssistantTiming.Kind.END }.stage)
+                assertFalse(timings.any { it.stage == Stage.CREDENTIAL_CHECKED })
+            } finally { restored.stop(); io.drain() }
+        }
+    }
+
     @Test fun voiceGenerationAndLateCanonicalDrawKeepOneCorrelatedPresentationSpan() {
         context.applicationInfo.flags = context.applicationInfo.flags or ApplicationInfo.FLAG_DEBUGGABLE
         val events = mutableListOf<AssistantTiming.Event>()

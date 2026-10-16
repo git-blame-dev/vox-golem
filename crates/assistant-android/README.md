@@ -54,6 +54,9 @@ immediately; later selection/projection failure reports `saved_local_state_faile
 not `not_saved`. That warning pauses speech/automatic next-turn admission.
 Desktop local models, wake/VAD/Parakeet, OpenCode subprocesses and Deep/Review are not
 part of this native mobile runtime.
+The mobile model catalog contains Custom GPT, Gemini Nano and Agy only. Legacy
+desktop Local Fast selections are rejected before credential checks or provider
+dispatch, without changing the saved selection, draft or history.
 
 `ProviderDeltaCallback.onReady` establishes cancellation registration, not process
 or model readiness. Worker settlement and replacement admission remain held until

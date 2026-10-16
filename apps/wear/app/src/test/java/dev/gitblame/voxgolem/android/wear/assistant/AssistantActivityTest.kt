@@ -1158,7 +1158,7 @@ class AssistantActivityTest {
         assertTrue(assistantErrorText("auth_expired").contains("Draft retained"))
         assertFalse(assistantErrorText("auth_expired").contains("Import"))
         assertTrue(assistantErrorText("not_saved").contains("Draft retained"))
-        assertEquals(11, AssistantModels.aliases.size)
+        assertEquals(10, AssistantModels.aliases.size)
         assertTrue("gemini-nano" in AssistantModels.aliases)
     }
 
@@ -1172,6 +1172,47 @@ class AssistantActivityTest {
         assertFalse("agy-sonnet-low" in picker); assertFalse("agy-flash-high" in picker); assertFalse("local-fast" in picker)
         assertTrue("agy-sonnet-low" in assistantSelectableModels(ready, "agy-sonnet-low"))
         assertTrue(assistantErrorText("unsupported_model").contains("not available on the watch"))
+    }
+
+    @Test fun savedDesktopLocalModelIsNeverAWearChoiceEvenIfStaleReadinessClaimsItIsReady() {
+        val ready = mapOf("local-fast" to OptionalProviderReadiness(true, "Synthetic stale route"))
+        assertFalse("local-fast" in assistantSelectableModels(ready, "local-fast"))
+        assertTrue(AssistantModels.aliases.all {
+            it in AssistantModels.customLabels || it == "gemini-nano" || it.startsWith("agy-")
+        })
+    }
+
+    @Test fun unsupportedSavedModelDisablesSendAskTalkAndVoiceLaunchWithoutHidingStop() {
+        val stale = AssistantState(model = "local-fast", foreground = true)
+        val voice = AssistantVoiceState(admissionReady = true)
+        assertFalse(assistantCanSend(stale.copy(draft = "Synthetic retained draft"), voice))
+        assertFalse(assistantPrimaryControl(stale, voice, false).enabled)
+        assertFalse(assistantPrimaryControl(stale, voice, true).enabled)
+        assertFalse(AssistantVoiceLaunchGate.shouldStart(true, true, stale, AssistantVoiceEntryMode.ASK))
+        assertFalse(AssistantVoiceLaunchGate.shouldStart(true, true, stale, AssistantVoiceEntryMode.TALK))
+        assertEquals(AssistantPrimaryControl(AssistantPrimaryAction.STOP, true),
+            assistantPrimaryControl(stale.copy(busy = true), voice, true))
+    }
+
+    @Test fun staleLocalSelectionCannotStartAudioOrSendThroughActivityEntryPoints() {
+        val controller = Robolectric.buildActivity(SyntheticAssistantActivity::class.java).setup()
+        val activity = controller.get()
+        activity.synthetic.state = activity.synthetic.state.copy(model = "local-fast")
+        activity.requestVoice(false)
+        activity.requestVoice(true)
+        activity.sendManually()
+        assertEquals(0, activity.audio.dictations)
+        assertEquals(0, activity.audio.conversations)
+        assertEquals(0, activity.synthetic.sends)
+        assertEquals("Synthetic old draft", activity.synthetic.state.draft)
+        controller.pause().stop().destroy()
+    }
+
+    @Test fun unsupportedModelRecoveryRemainsVisibleAfterDraftEditingClearsThePreviousError() {
+        assertEquals("unsupported_model", assistantRequestError(AssistantState(model = "local-fast", error = null)))
+        assertEquals("unsupported_model", assistantRequestError(AssistantState(model = "local-fast", error = "transport")))
+        assertEquals("auth_expired", assistantRequestError(AssistantState(error = "auth_expired")))
+        assertNull(assistantRequestError(AssistantState()))
     }
 
     @Test fun lateMicrophonePermissionAfterBackgroundCannotStartAnyRecognizerOrLoop() {

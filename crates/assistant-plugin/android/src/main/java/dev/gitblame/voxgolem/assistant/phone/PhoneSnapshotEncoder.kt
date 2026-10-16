@@ -51,15 +51,14 @@ object PhoneSnapshotEncoder {
             "vad" to "Voice activity detection is unavailable on Android", "parakeet" to "Desktop transcription is unavailable on Android",
             "tts" to "Text to speech is unavailable on Android", "deep" to "Deep execution is disabled on Android", "review" to "Review execution is disabled on Android",
         )) {
-            val localReady = optionalProviders["local-fast"]?.available == true
-            val available = (id == "custom_provider" && providerAvailable) || (id == "local_fast" && localReady)
+            val available = id == "custom_provider" && providerAvailable
             capabilities.put(JSONObject().put("id", id).put("state", if (available) "available" else "unavailable")
-                .put("reason", if (available) "ready" else reason).put("actual_provider", if (id == "custom_provider" && available) "custom_openai" else if (id == "local_fast" && localReady) "llama.cpp" else JSONObject.NULL))
+                .put("reason", if (available) "ready" else reason).put("actual_provider", if (available) "custom_openai" else JSONObject.NULL))
         }
         val options = JSONArray()
         for ((id, label) in dev.gitblame.voxgolem.assistant.runtime.AssistantModels.optionalLabels) {
             val readiness = optionalProviders[id]
-            val policyAllowed = id == "local-fast" || id == dev.gitblame.voxgolem.assistant.runtime.GeminiNanoProvider.MODEL_NAME || state.webEnabled
+            val policyAllowed = id == dev.gitblame.voxgolem.assistant.runtime.GeminiNanoProvider.MODEL_NAME || state.webEnabled
             val available = readiness?.available == true && policyAllowed
             options.put(JSONObject().put("id", id).put("label", label).put("available", available)
                 .put("unavailable_reason", if (available) JSONObject.NULL else if (!policyAllowed) "Agy cannot enforce disabled web tools" else readiness?.reason ?: "Provider readiness is not published"))

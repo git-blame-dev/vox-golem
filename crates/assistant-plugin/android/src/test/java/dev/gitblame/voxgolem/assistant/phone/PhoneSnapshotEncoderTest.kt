@@ -25,7 +25,25 @@ class PhoneSnapshotEncoderTest {
         val ready = mapOf("agy-flash-high" to dev.gitblame.voxgolem.assistant.runtime.OptionalProviderReadiness(true, "Synthetic installed route"))
         assertTrue(options(ready).single { it.getString("id") == "agy-flash-high" }.getBoolean("available"))
         assertFalse(options(ready, false).single { it.getString("id") == "agy-flash-high" }.getBoolean("available"))
-        assertFalse(options(ready).single { it.getString("id") == "local-fast" }.getBoolean("available"))
+        assertFalse(options(ready).any { it.getString("id") == "local-fast" })
+    }
+
+    @Test fun removedDesktopModelIsNotReintroducedByStaleReadinessOrSavedPreferences() {
+        val state = AssistantState(model = "local-fast", draft = "Synthetic retained draft", error = "unsupported_model")
+        val preferences = PhonePreferences.defaults().put("instant", state.model)
+        val readiness = mapOf("local-fast" to dev.gitblame.voxgolem.assistant.runtime.OptionalProviderReadiness(true, "Synthetic stale route"))
+        val encoded = PhoneSnapshotEncoder.encode(state, null, preferences, emptyMap(), optionalProviders = readiness)
+        val options = encoded.getJSONArray("model_options")
+        assertFalse((0 until options.length()).any { options.getJSONObject(it).getString("id") == "local-fast" })
+        val capabilities = encoded.getJSONArray("capabilities")
+        val local = (0 until capabilities.length()).map(capabilities::getJSONObject).single { it.getString("id") == "local_fast" }
+        assertEquals("unavailable", local.getString("state"))
+        assertTrue(local.isNull("actual_provider"))
+        assertEquals("local-fast", encoded.getJSONObject("preferences").getString("instant"))
+        assertEquals("Synthetic retained draft", encoded.getJSONObject("assistant").getString("draft"))
+        assertEquals("unsupported_model", encoded.getJSONObject("assistant").getString("error"))
+        assertEquals("sleeping", encoded.getString("runtime_phase"))
+        assertTrue(encoded.isNull("active_request"))
     }
 
     @Test fun boundedPickerIncludesSelectedConversationAndDoesNotSkipReplacedPageEntry() {

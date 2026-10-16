@@ -37,7 +37,7 @@ internal object AssistantVoiceLaunchGate {
     ): Boolean {
         if (!visible || !resumed || finishingOrDestroyed || pendingMode == null || !hasRecordAudioPermission ||
             voiceActive || inputPending || permissionPending) return false
-        if (state == null || !state.contextReady || state.busy) return false
+        if (state == null || !state.contextReady || state.busy || state.model !in AssistantModels.aliases) return false
         return true
     }
 }

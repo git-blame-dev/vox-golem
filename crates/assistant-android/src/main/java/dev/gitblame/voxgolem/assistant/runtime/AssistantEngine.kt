@@ -57,7 +57,7 @@ interface AssistantModelStorage {
 
 object AssistantModels {
     val customLabels = mapOf("custom-sol-high" to "Sol High", "custom-sol-none" to "Sol None", "custom-luna-none" to "Luna None", "custom-luna-low" to "Luna Low")
-    val optionalLabels = mapOf("local-fast" to "Local: Llama 3.2 3B", "gemini-nano" to "Local: Gemini Nano", "agy-flash-low" to "Agy: Gemini 3.8 Flash Low",
+    val optionalLabels = mapOf("gemini-nano" to "Local: Gemini Nano", "agy-flash-low" to "Agy: Gemini 3.8 Flash Low",
         "agy-flash-high" to "Agy: Gemini 3.8 Flash High", "agy-opus-high" to "Agy: Claude Opus 5.5 High",
         "agy-sonnet-low" to "Agy: Claude Sonnet 5.5 Low", "agy-sonnet-high" to "Agy: Claude Sonnet 5.5 High")
     val aliases = (customLabels.keys + optionalLabels.keys).toList()
@@ -330,7 +330,7 @@ class AssistantEngine @JvmOverloads internal constructor(
     }
     fun updatePreferences(model: String, policy: AssistantPolicy, persist: () -> Unit, onSettled: (AssistantState) -> Unit) = dispatch(onSettled) {
         if (!idle()) return@dispatch
-        require(model in AssistantModels.aliases)
+        if (model !in AssistantModels.aliases) { state = state.copy(error = "unsupported_model"); return@dispatch }
         if (policy.selection() != currentPolicy().selection()) state.speechOptions.validate(policy.selection(), policy.speechNetworkFallback)
         else policy.selection().validateShape()
         val previousModel = state.model
@@ -538,8 +538,9 @@ class AssistantEngine @JvmOverloads internal constructor(
             ticket.failure.get()?.let { fail(it); return }
             if (ticket.cancelled.get() || ticket.epoch != epoch.get()) { fail("interrupted", true); return }
             if (!state.foreground) { fail("background", true); return }
+            if (state.model !in AssistantModels.aliases) { fail("unsupported_model"); return }
             val auth = credentials?.selection()
-            if (state.model != "local-fast" && state.model != GeminiNanoProvider.MODEL_NAME && !state.model.startsWith("agy-")) {
+            if (state.model != GeminiNanoProvider.MODEL_NAME && !state.model.startsWith("agy-")) {
                 val credential = auth?.status
                 state = state.copy(credential = credential)
                 when (credential?.reason) {
@@ -552,7 +553,6 @@ class AssistantEngine @JvmOverloads internal constructor(
                 state = state.copy(credential = null)
             }
             ticket.timing.mark(Stage.CREDENTIAL_CHECKED)
-            if (state.model !in AssistantModels.aliases) { fail("unsupported_model"); return }
             if ((if (voiceOwner != null) promptOverride ?: state.draft else state.draft).isBlank()) { fail("empty_prompt"); return }
             val prompt = if (voiceOwner != null) promptOverride ?: state.draft else state.draft
             val contextRead = AssistantProjectionRead.Context(256 * 1024 - prompt.toByteArray(Charsets.UTF_8).size)

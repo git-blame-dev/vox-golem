@@ -367,6 +367,7 @@ open class AssistantActivity : ComponentActivity() {
 
     internal fun sendManually() {
         if (!visible || !resumed || isFinishing || isDestroyed || client.snapshot().busy || voiceAdmissionPending) return
+        if (client.snapshot().model !in AssistantModels.aliases) return
         permissionAction = null
         if (!voice.send()) client.send()
     }
@@ -609,7 +610,7 @@ internal fun assistantErrorText(code: String): String = when (code) {
     "interrupted" -> "Stopped. Draft retained."
     "choose_continuation" -> "Choose a continuation before sending."
     "busy" -> "Wait for the current request to retire."
-    "unsupported_model" -> "This model is not available on the watch. Choose another."
+    "unsupported_model" -> "Selected model is not available on the watch. Choose Nano, Agy or Custom GPT in Settings. Draft retained."
     "prompt_too_large" -> "Draft exceeds 32 KiB. Previous draft retained."
     "saved_local_state_failed" -> "Answer saved, but local selection/draft update failed."
     "aicore_not_available", "aicore_unavailable", "aicore_needs_update" -> "Gemini Nano is unavailable on the paired phone. Draft retained."

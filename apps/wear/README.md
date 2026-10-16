@@ -17,6 +17,11 @@ are launcher-only variants; in-app emblems and the Note background are unchanged
 Ask/Talk retain their existing exported, one-tap microphone behavior, permission
 and foreground/cancellation checks. Another app can also invoke these entries.
 
+Wear offers Custom GPT directly on the watch, plus Gemini Nano and Agy through the
+paired phone. Desktop Local Fast/Local Quality are not Wear models. An old saved
+unsupported model remains non-executable until a supported model is deliberately
+selected in Settings; drafts/history are preserved and never automatically resent.
+
 The shell uses Kotlin/Compose, not Tauri or a WebView. It directly depends on the
 ordinary [capture-android](../../crates/capture-android/README.md) and
 [assistant-android](../../crates/assistant-android/README.md) and
