@@ -24,6 +24,7 @@ interface AssistantPeerAssociationOwner {
 
 /** App-private replication bookkeeping; conversation records are stored separately. */
 class EnrolledPeerRegistry(context: Context) : Closeable {
+    private val application = context.applicationContext
     private val database = ReplicationDatabase(context.applicationContext)
     companion object {
         // All enrollment/setup mutations use this process owner. Readers publish immutable
@@ -73,7 +74,9 @@ class EnrolledPeerRegistry(context: Context) : Closeable {
                 db.insertWithOnConflict("cleanup_peers", null, ContentValues().apply { put("replica", replica) }, SQLiteDatabase.CONFLICT_IGNORE)
             }
             db.setTransactionSuccessful()
-        } finally { try { db.endTransaction() } finally { endApprovalMutation() } }
+        } finally {
+            try { db.endTransaction() } finally { endApprovalMutation(); ChatGptAccessSync.changed(application) }
+        }
     }
 
     internal fun setupValue(key: String): JSONObject? = database.readableDatabase.rawQuery("SELECT value FROM setup WHERE key = ?", arrayOf(key)).use {
@@ -107,6 +110,13 @@ class EnrolledPeerRegistry(context: Context) : Closeable {
     internal fun bindingFor(installation: String, replica: String): ApprovedPeerBinding? = database.readableDatabase.rawQuery(
         "SELECT association FROM native_bindings WHERE replica = ? AND replica = ?", arrayOf(replica, installation),
     ).use { if (it.moveToFirst()) ApprovedPeerBinding(replica, it.getString(0)) else null }
+
+    /** Local approval only: a disconnected phone must not erase a still-valid watch access token. */
+    internal fun credentialAssociation(): String? {
+        if (!approvalStable()) return null
+        val enrolled = replicas().singleOrNull() ?: return null
+        return bindingFor(enrolled, enrolled)?.association
+    }
 
     internal fun rememberPeer(binding: ApprovedPeerBinding) {
         listOf(binding.replica, binding.association).forEach(ReplicationWire::uuid)

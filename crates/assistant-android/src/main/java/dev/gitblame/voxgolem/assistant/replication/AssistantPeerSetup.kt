@@ -37,6 +37,7 @@ class AssistantPeerSetup internal constructor(
     })
     private fun registry() = EnrolledPeerRegistry(application)
     internal fun installation() = localReplica()
+    internal fun credentialAssociation(): String? = registry().use { it.credentialAssociation() }
 
     internal fun replicaForNode(node: String): String? = selectedPeer(node)?.first?.replica
 
@@ -75,6 +76,7 @@ class AssistantPeerSetup internal constructor(
 
     internal fun recordFailure(reason: PeerPairingReason) {
         registry().use { it.saveSetup("status", JSONObject().put("reason", reason.name)) }
+        ChatGptAccessSync.changed(application)
     }
 
     /** Shared startup, capability, identity-arrival and retry path; no invitation or ACK ceremony. */
@@ -104,6 +106,7 @@ class AssistantPeerSetup internal constructor(
                 db.saveSetup("status", JSONObject().put("reason", result.reason.name)
                     .put("association", result.associationId).put("installation", result.peerInstallationId).put("replica", result.peerReplica))
             }
+            ChatGptAccessSync.changed(application)
             result
         } catch (_: Exception) { PeerPairingState(PeerPairingReason.STORAGE_FAILURE) }
     }

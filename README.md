@@ -46,13 +46,15 @@ Rust core owns immutable operations, snapshot validation, merge/deletion rules a
 
 Conversation replication uses bounded, finite GMS DataItem/Asset exchanges of immutable records, never an imported database snapshot or a remote-generation command. Receiver commit precedes exact-body ACK; SDK submission alone is not proof of synchronization. Wear Data Layer may route through encrypted Google servers when direct connectivity is unavailable, so this is **not a cloud-free transport**. Custom prompts and answers also go to the configured remote provider. See the [shared native Assistant guide](crates/assistant-android/README.md) for ownership and canonical source links.
 
-### Provider access: external development setup only
+### ChatGPT device-code sign-in
 
-Phone and Watch consume existing access from their own app-private provider files, read-only. There is no credential settings panel, document-picker import, phone-to-Watch credential copy, login, renewal or refresh workflow. Normal chat still reports unavailable, expired or rejected provider access and retains drafts for deliberate retry.
+On Linux/Windows desktop or Android, open **Settings → Model → Continue with ChatGPT**. Open the sign-in page and enter the displayed one-time code. Device-code login may need enabling in ChatGPT security settings or workspace permissions. Only authorize a code you started in VoxGolem. Closing Settings does not cancel a pending attempt; **Cancel** does. Attempts expire after at most 15 minutes. No local callback server or second login method is used.
 
-For authorized development, manually inject an existing compatible access-only file into each selected app's private provider location using external developer tooling. Keep that tooling and all source/staging files outside this repository, publish a complete owner-only file (0600), verify the target and publication without printing contents, then restart the app. Preserve upstream auth, histories and other app data. Do not put runtime keys in prompts, logs, examples or project artifacts. There is no maintained provisioning/export helper in this repository; non-debuggable installations cannot be assumed to permit `run-as`.
+The native app owns token renewal and keeps credentials outside the WebView. Desktop stores `chatgpt/chatgpt-auth.json` under its configuration directory in a dedicated private subdirectory; Android uses its private, backup-excluded directory. Signing in explicitly selects this source for Custom models without modifying existing imported credential files or provider configuration. Signing out keeps an empty source-selection record, so the app does not silently fall back to imported credentials. Do not put runtime keys in prompts, logs, examples or project artifacts.
 
-Conversation sharing remains automatic over native-paired, matching-package/signature Wear Data Layer apps. Version-3 peer identity is independent of provider access; sync neither transfers credentials nor requires usable access. Each device needs its own valid access and internet route to generate an answer. A proper device-auth flow is deferred, not available in the current app.
+Wear has no sign-in screen. The Android phone shares short-lived access only with its verified native-paired, matching-package/signature watch through a separate transient credential channel, never conversation replication. Refresh and ID tokens stay on the phone. An offline watch can use already-shared access until it expires; renewal requires the phone. Sign-out clearing reaches the watch when it reconnects; it cannot instantly erase an offline watch's cached access. Conversation sharing remains independent of provider access.
+
+This uses the Codex-compatible device flow also implemented by OpenCode, labelled **legacy** in OpenCode and **beta** in Codex documentation. It uses ChatGPT plan allowance, not separate API credits, and does not bypass plan/model/workspace restrictions. Authentication success does not prove a model request will be admitted. No silent paid-API fallback is performed. See [Codex authentication](https://developers.openai.com/codex/auth) and [OpenCode provider accounts](https://opencode.ai/v2/docs/cli/providers).
 
 ### Phone voice entries and shortcut
 
@@ -136,7 +138,7 @@ cargo install tauri-cli --version 2.11.1 --locked
 
 Copy [`config.example.toml`](config.example.toml) to `${XDG_CONFIG_HOME:-$HOME/.config}/voxgolem/config.toml` (or set `VOXGOLEM_CONFIG_PATH`). When using Local Fast or Local Quality on any platform, also create a non-empty `SOUL.md` beside that config; copying the example is therefore a config-only setup step, and the required soul text must be supplied separately. Missing local assets or `SOUL.md` disable only the local response capability. XDG defaults are `~/.config/voxgolem`, `~/.local/share/voxgolem`, `~/.local/state/voxgolem`, and `~/.cache/voxgolem`. Relative paths resolve beside the config. Keep model files external; there is no model downloader.
 
-Desktop OpenCode uses its existing CLI login/auth state; the desktop app does not perform login or renewal. Mobile external development access setup is described above. Custom endpoints are experimental, especially private endpoints; inspect the endpoint and auth configuration before use. Never put secrets in examples or source control.
+The separate desktop OpenCode provider still uses its existing CLI login/auth state. VoxGolem's ChatGPT device-code connection owns its own credentials and renewal for direct Custom requests; it does not change OpenCode's login. Custom endpoints are experimental, especially private endpoints; inspect the endpoint and auth configuration before use. Never put secrets in examples or source control.
 
 ### Standalone local llama.cpp runtime
 

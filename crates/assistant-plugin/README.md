@@ -66,19 +66,18 @@ Stop and dropped invocation retire work; interrupted drafts require deliberate
 retry. Remote conversation ACKs are a separate exact-body, per-peer protocol after
 receiver SQLite commit, not this UI delivery ACK.
 
-## Read-only provider access and automatic conversation sharing
+## Provider access and automatic conversation sharing
 
-The bridge has no credential import, status, retry or transfer commands. Native
-provider execution reads existing externally injected app-private access; token
-bytes do not enter JavaScript. Normal chat availability and request errors still
+The bridge exposes `chatgpt_auth` for device-code start/status/cancel/sign-out and
+`open_chatgpt_sign_in` for the fixed OpenAI verification page. The shared native
+owner handles credentials and renewal; token bytes do not enter JavaScript.
+Normal chat availability and request errors still
 distinguish missing/expired access, 401 rejection and model/account 403 denial.
 Drafts remain available for deliberate retry, never automatic prompt replay.
 
-Authorized development uses external manual file injection separately on phone and
-Watch, not a Settings action or repository provisioning/export script. See the
-[root access guidance](../../README.md#provider-access-external-development-setup-only).
-The app has no login, refresh or renewal implementation. Proper device authentication
-is deferred, not available now.
+The phone owns refresh and sends only short-lived access to its verified paired
+watch. Existing imported files remain read-only. See the
+[root sign-in guidance](../../README.md#chatgpt-device-code-sign-in).
 
 Native Wear Data Layer pairing and matching package/signature isolation authorize
 automatic conversation sharing. The shared setup controller exchanges v3 peer

@@ -5,6 +5,7 @@ import android.app.KeyguardManager
 import android.content.Context
 import android.Manifest
 import android.content.Intent
+import android.net.Uri
 import android.content.pm.PackageManager
 import android.os.Handler
 import android.os.Looper
@@ -27,6 +28,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.lang.ref.WeakReference
 import dev.gitblame.voxgolem.assistant.runtime.AssistantRuntime
+import dev.gitblame.voxgolem.assistant.runtime.ChatGptAuth
 import dev.gitblame.voxgolem.assistant.AssistantDraftBudget
 import dev.gitblame.voxgolem.assistant.AssistantTiming.Stage
 
@@ -193,6 +195,25 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
     @Command fun list_assistant_conversations(invoke: Invoke) = execute(invoke)
     @Command fun list_assistant_heads(invoke: Invoke) = execute(invoke)
     @Command fun assistant_pairing_status(invoke: Invoke) = execute(invoke)
+
+    @Command fun chatgpt_auth(invoke: Invoke) {
+        val action = invoke.getArgs().optString("action")
+        if (action !in setOf("start", "status", "cancel", "sign_out")) {
+            reject(invoke, "invalid_input", "Unknown authentication action"); return
+        }
+        ChatGptAuth.command(activity.applicationContext, action) { status ->
+            main.post { invoke.resolve(JSObject(status.toString())) }
+        }
+    }
+
+    @Command fun open_chatgpt_sign_in(invoke: Invoke) {
+        main.post {
+            try {
+                activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(ChatGptAuth.VERIFICATION_URL)))
+                invoke.resolve()
+            } catch (_: RuntimeException) { reject(invoke, "unavailable", "Unable to open the sign-in browser") }
+        }
+    }
 
     @Command fun assistant_voice_status(invoke: Invoke) { invoke.resolve(JSObject(speech.status().toString())) }
     @Command fun open_speech_services_store(invoke: Invoke) {

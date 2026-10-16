@@ -7,6 +7,7 @@ import com.google.android.gms.wearable.DataEvent
 import com.google.android.gms.wearable.DataEventBuffer
 import com.google.android.gms.wearable.ChannelClient
 import com.google.android.gms.wearable.Node
+import com.google.android.gms.wearable.MessageEvent
 import com.google.android.gms.wearable.WearableListenerService
 import dev.gitblame.voxgolem.assistant.runtime.PhoneRelayBridge
 import dev.gitblame.voxgolem.assistant.runtime.PhoneRelayWire
@@ -14,6 +15,7 @@ import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicBoolean
 
 class AssistantReplicationListenerService : WearableListenerService() {
+    override fun onMessageReceived(message: MessageEvent) { ChatGptAccessSync.onMessage(applicationContext, message) }
     override fun onDataChanged(events: DataEventBuffer) {
         var count = 0
         for (event in events) {
@@ -28,10 +30,14 @@ class AssistantReplicationListenerService : WearableListenerService() {
     }
     override fun onPeerConnected(node: Node) {
         AssistantReplication.reconcileNow(applicationContext)
+        ChatGptAccessSync.changed(applicationContext)
     }
     override fun onPeerDisconnected(node: Node) { AssistantReplication.reconcileNow(applicationContext) }
     override fun onCapabilityChanged(info: CapabilityInfo) {
-        if (info.name == ReplicationWire.CAPABILITY) AssistantReplication.reconcileNow(applicationContext)
+        if (info.name == ReplicationWire.CAPABILITY) {
+            AssistantReplication.reconcileNow(applicationContext)
+            ChatGptAccessSync.changed(applicationContext)
+        }
     }
 }
 

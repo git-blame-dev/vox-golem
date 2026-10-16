@@ -1,3 +1,4 @@
+mod auth_bridge;
 mod cancellation;
 mod domain;
 mod outcome;

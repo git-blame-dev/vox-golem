@@ -3,7 +3,7 @@
 Ordinary Android library used by the phone's thin Tauri
 [assistant-plugin](../assistant-plugin/README.md) and the native
 [Wear shell](../../apps/wear/README.md). It owns native runtime, persistence,
-read-only provider access, replication and conversation-bound speech adapters. SDK
+provider access, replication and conversation-bound speech adapters. SDK
 speech facilities and the backing installation-preference store are exported from
 [voice-android](../voice-android/README.md). It contains no WebView UI or Note
 capture/export pipeline. The phone and watch use the same implementation, not
@@ -159,19 +159,21 @@ owns lifecycle and wire details. Target fields are routing metadata, not selecti
 encryption among installations sharing the same package/signature. GMS may carry
 encrypted traffic through Google servers; this is not a cloud-free guarantee.
 
-Provider execution consumes existing externally injected access read-only from an
-app-private file. The app does not import, store updates, copy credentials, log in,
-refresh or renew access. There is no credential status/settings panel or transfer
-protocol. Missing/expired access, 401 rejection and account/model 403 denial remain
-normal provider availability/error states; drafts survive for deliberate retry.
-Access availability does not gate conversation reconciliation.
+Android's settings expose only ChatGPT device-code authorization. Shared Rust owns
+the bounded attempt, token exchange and serialized refresh; JNI keeps credentials
+out of the WebView. `chatgpt-auth.json` in `noBackupFilesDir` takes precedence over
+legacy imported files once selected, including an explicit signed-out record.
+Existing imported provider files remain read-only and are not deleted or renewed.
 
-Authorized development uses external manual file injection on each selected app,
-with complete owner-only publication and no secret/account output. Keep developer
-tooling and runtime files outside Git; see the
-[root access guidance](../../README.md#provider-access-external-development-setup-only).
-Proper device authentication is deferred. Existing provider files and upstream
-auth must be preserved, not deleted during code removal or metadata migration.
+The phone is the sole refresh owner. A separate transient paired-peer credential
+channel sends access-only snapshots to Wear; refresh and ID tokens never enter that
+channel or durable conversation replication. Peer identity, approval and update
+ordering are checked before publication. Wear needs the phone to renew expired
+access, but uses its own provider/network path while cached access is valid.
+Sign-out cannot immediately clear a disconnected watch. Missing/expired access,
+401 rejection and account/model 403 denial remain normal provider availability/error
+states; drafts survive for deliberate retry. Provider availability never gates
+conversation reconciliation. See the [root sign-in guidance](../../README.md#chatgpt-device-code-sign-in).
 
 ## Speech admission and current wiring
 

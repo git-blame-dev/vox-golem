@@ -20,6 +20,9 @@ import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.ArrayDeque
+import java.util.UUID
+import java.util.concurrent.Executor
 
 @RunWith(AssistantStoreRunner::class)
 @Config(sdk = [24, 35], manifest = Config.NONE)
@@ -160,6 +163,177 @@ class AssistantPeerSetupTest {
         assertNull(pair.left.selectedRoute())
     }
 
+    @Test fun accessOnlyMessagesUseCurrentPeerAndFenceSignoutReplayAndTransientExportFailures() = worker {
+        val pair = PairFixture(); pair.link()
+        val phoneFile = File(pair.leftContext.noBackupFilesDir, "chatgpt-auth.json").apply { writeText("{}") }
+        val watchFile = File(pair.rightContext.noBackupFilesDir, "chatgpt-auth.json")
+        val imported = File(pair.rightContext.noBackupFilesDir, "assistant-auth.json").apply { writeText("Synthetic imported credentials preserved") }
+        var exported = JSONObject().put("voxgolemChatgpt", 1).put("openai", JSONObject().put("type", "oauth")
+            .put("access", "synthetic-access-only").put("expires", System.currentTimeMillis() + 3_600_000)).toString()
+        val requests = mutableListOf<ByteArray>()
+        val states = mutableListOf<ByteArray>()
+        var exports = 0
+        val phone = ChatGptAccessSync.Owner(pair.leftContext, pair.left,
+            export = { exports++; exported }, message = { _, kind, bytes -> assertEquals("state", kind); states.add(bytes) })
+        val watch = ChatGptAccessSync.Owner(pair.rightContext, pair.right,
+            export = { error("Watch must never own refresh/export") },
+            message = { _, kind, bytes ->
+                if (kind == "request") requests.add(bytes)
+                else { assertEquals("ack", kind); phone.receive("synthetic-right-node", "ack", bytes) }
+            })
+        fun request() {
+            watch.receive("synthetic-left-node", "hint", JSONObject().put("exchange", UUID.randomUUID().toString()).toString().toByteArray())
+            phone.receive("synthetic-right-node", "request", requests.last())
+        }
+        phone.receive("synthetic-unselected-node", "request", "{}".toByteArray())
+        assertEquals(0, exports)
+        request()
+        val first = states.last()
+        watch.receive("synthetic-unselected-node", "state", first)
+        assertFalse(watchFile.exists())
+        watch.receive("synthetic-left-node", "state", first)
+        assertEquals("synthetic-access-only", JSONObject(watchFile.readText()).getJSONObject("openai").getString("access"))
+        assertFalse(watchFile.readText().contains("refresh"))
+        val beforeError = watchFile.readBytes()
+        exported = """{"error":"synthetic-transient-failure"}"""
+        request()
+        assertEquals(1, states.size)
+        assertArrayEquals(beforeError, watchFile.readBytes())
+        exported = "null"
+        request()
+        assertEquals(1, states.size) // An invalid/missing native store is not a sign-out.
+        phoneFile.writeText(ChatGptAccessProtocol.tombstone().toString())
+        request()
+        val signout = states.last()
+        assertTrue(JSONObject(signout.toString(Charsets.UTF_8)).isNull("credential"))
+        watch.receive("synthetic-left-node", "state", signout)
+        assertTrue(JSONObject(watchFile.readText()).getBoolean("signedOut"))
+        val signedOut = watchFile.readBytes()
+        // A fresh challenge prevents even a previous-association/process response from restoring access.
+        watch.receive("synthetic-left-node", "hint", JSONObject().put("exchange", UUID.randomUUID().toString()).toString().toByteArray())
+        try { watch.receive("synthetic-left-node", "state", first); fail("Expected stale response rejection") }
+        catch (_: IllegalArgumentException) {}
+        assertArrayEquals(signedOut, watchFile.readBytes())
+        assertEquals("Synthetic imported credentials preserved", imported.readText())
+        assertTrue(JSONObject(phoneFile.readText()).getBoolean("signedOut"))
+    }
+
+    @Test fun accessAssociationSurvivesOfflineDiscoveryButReplacementAndRevocationInvalidateLocally() = worker {
+        val pair = PairFixture(); pair.link()
+        val association = pair.right.credentialAssociation()
+        val file = File(pair.rightContext.noBackupFilesDir, "chatgpt-auth.json")
+        ChatGptAccessProtocol.publish(file, JSONObject().put("openai", JSONObject().put("access", "synthetic-access-only")
+            .put("expires", System.currentTimeMillis() + 3_600_000)).put(ChatGptAccessProtocol.META,
+            JSONObject().put("association", association).put("generation", 7)))
+        val watch = ChatGptAccessSync.Owner(pair.rightContext, pair.right, message = { _, _, _ -> })
+        pair.rightSdk.capabilityError = IllegalStateException("Synthetic offline SDK")
+        pair.right.retry(b, pair.rightIo)
+        assertEquals(association, pair.right.credentialAssociation())
+        watch.receive("synthetic-unselected-node", "hint", "{}".toByteArray())
+        assertTrue(JSONObject(file.readText()).has("openai"))
+        pair.rightSdk.capabilityError = null
+        pair.publish(pair.leftIo, c, "phone")
+        pair.right.retry(b, pair.rightIo)
+        assertNotEquals(association, pair.right.credentialAssociation())
+        watch.receive("synthetic-unselected-node", "hint", "{}".toByteArray())
+        assertTrue(JSONObject(file.readText()).getBoolean("signedOut"))
+        EnrolledPeerRegistry(pair.rightContext).use { it.revoke(c) }
+        assertNull(pair.right.credentialAssociation())
+    }
+
+    @Test fun expiryExportFailureRenewsWithoutAnotherLifecycleEvent() = worker {
+        val f = CredentialFixture(); f.boot()
+        f.token = "synthetic-renewed-access"; f.expires = f.clock.now + 3_600_000
+        f.exportFailures = 1
+        f.tick() // Existing 60-second-margin expiry timer, then one failed export.
+        assertEquals("synthetic-original-access", f.access())
+        f.until { f.access() == "synthetic-renewed-access" }
+        assertEquals(0, f.clock.live("phone").size)
+        assertEquals(1, f.clock.live("watch").size) // Only next credential expiry remains.
+    }
+
+    @Test fun expiryRequestSendFailureRenewsUsingBoundedBackoffWithoutLifecycleEvent() = worker {
+        val f = CredentialFixture(); f.boot()
+        f.token = "synthetic-renewed-access"; f.expires = f.clock.now + 3_600_000
+        f.failSend["watch:request"] = 1
+        f.tick()
+        assertEquals("synthetic-original-access", f.access())
+        assertTrue(f.clock.live().all { it.due > f.clock.now })
+        f.until { f.access() == "synthetic-renewed-access" }
+        assertEquals(0, f.clock.live("phone").size)
+        assertEquals(1, f.clock.live("watch").size)
+    }
+
+    @Test fun droppedTombstoneSendAcknowledgementDoesNotCountAsRemotePersistence() = worker {
+        val f = CredentialFixture(); f.boot()
+        f.phoneFile.writeText(ChatGptAccessProtocol.tombstone().toString())
+        f.dropSend["phone:state"] = 1 // SDK send returns success, but remote delivery never happens.
+        f.phone.changed(); f.drain()
+        assertEquals("synthetic-original-access", f.access())
+        f.until { f.watchState().optBoolean("signedOut") }
+        assertFalse(f.watchState().has("openai"))
+        assertTrue(f.clock.live().isEmpty())
+        assertTrue(f.queue.isEmpty())
+    }
+
+    @Test fun tombstoneHintSendFailureRecoversAndAcknowledgementLossRetriesWithoutRewritingCredentials() = worker {
+        val f = CredentialFixture(); f.boot()
+        f.phoneFile.writeText(ChatGptAccessProtocol.tombstone().toString())
+        f.failSend["phone:hint"] = 1
+        f.dropSend["watch:ack"] = 1
+        f.phone.changed(); f.drain()
+        assertEquals("synthetic-original-access", f.access())
+        f.until { f.watchState().optBoolean("signedOut") }
+        val committed = f.watchFile.readBytes()
+        assertFalse(f.clock.live("phone").isEmpty()) // Local commit is not a received phone ACK.
+        f.until { f.clock.live().isEmpty() }
+        assertArrayEquals(committed, f.watchFile.readBytes())
+        val ack = f.sent.last { it.first == "watch:ack" }.second
+        assertEquals(setOf("association", "nonce", "generation"), JSONObject(ack.toString(Charsets.UTF_8)).keys().asSequence().toSet())
+    }
+
+    @Test fun incompleteRenewalStopsAfterFiniteAttemptsWithoutAnImmediateExpiryMarginLoop() = worker {
+        val f = CredentialFixture(); f.boot()
+        f.exportFailures = 100
+        f.tick() // Enter expiry margin.
+        val before = f.watchFile.readBytes()
+        f.until { f.clock.live().isEmpty() }
+        assertArrayEquals(before, f.watchFile.readBytes())
+        assertTrue(f.sent.count { it.first == "watch:request" } <= 1 + ChatGptAccessSync.Owner.MAX_ATTEMPTS)
+        assertTrue(f.clock.now < f.expires) // Budget ends before token expiry, not a zero-delay loop.
+    }
+
+    @Test fun onlyCurrentApprovedPeerAndExactPublicationReceiptCanRetirePhoneRetries() = worker {
+        val f = CredentialFixture()
+        f.dropSend["watch:ack"] = 1
+        f.boot()
+        val receipt = f.sent.last { it.first == "watch:ack" }.second
+        f.phone.submit { receive("synthetic-unselected-node", "ack", receipt) }
+        for (field in listOf("association", "nonce", "generation")) {
+            val wrong = JSONObject(receipt.toString(Charsets.UTF_8))
+                .put(field, if (field == "generation") 999 else "synthetic-stale")
+            f.phone.submit { receive("synthetic-right-node", "ack", wrong.toString().toByteArray()) }
+        }
+        f.drain()
+        assertEquals(1, f.clock.live("phone").size)
+        f.phone.submit { receive("synthetic-right-node", "ack", receipt) }
+        f.drain()
+        assertTrue(f.clock.live("phone").isEmpty())
+        assertEquals(1, f.clock.live("watch").size) // Normal future expiry only.
+    }
+
+    @Test fun revocationFencesScheduledRenewalRetryAndClearsWatchAccess() = worker {
+        val f = CredentialFixture(); f.boot()
+        f.failSend["watch:request"] = 1
+        f.tick()
+        EnrolledPeerRegistry(f.pair.rightContext).use { it.revoke(a) }
+        assertFalse(f.watch.watchApproved())
+        f.tick()
+        assertTrue(f.clock.live("watch").isEmpty())
+        assertTrue(f.watchState().getBoolean("signedOut"))
+        assertFalse(f.watchState().has("openai"))
+    }
+
     @Test fun reconciliationKeepsActualSelectedRouteApprovedThroughDuplexCompletionAndRetry() = worker {
         val pair = PairFixture(); pair.link()
         val route = requireNotNull(pair.left.selectedRoute())
@@ -245,6 +419,72 @@ class AssistantPeerSetupTest {
             assertEquals(delay, state.retryDelay(now))
             repeat(12) { assertTrue(state.failed(now, kotlin.random.Random(7)) in 30_000..DurableReplicationState.MAX_BACKOFF) }
         }
+    }
+
+    private class CredentialClock {
+        class Entry(val owner: String, val work: Runnable, val due: Long, var removed: Boolean = false)
+        var now = 1_800_000_000_000L
+        private val entries = mutableListOf<Entry>()
+        fun live(owner: String? = null) = entries.filter { !it.removed && (owner == null || it.owner == owner) }
+        fun scheduler(owner: String): (Runnable, Long) -> (() -> Unit) = { work, delay ->
+            val entry = Entry(owner, work, now + delay).also(entries::add)
+            val cancel: () -> Unit = { entry.removed = true }
+            cancel
+        }
+        fun tick() {
+            val entry = live().minBy { it.due }
+            entry.removed = true
+            now = maxOf(now, entry.due)
+            entry.work.run()
+        }
+    }
+
+    private inner class CredentialFixture {
+        val pair = PairFixture().apply { link() }
+        val clock = CredentialClock()
+        val queue = ArrayDeque<Runnable>()
+        val failSend = mutableMapOf<String, Int>()
+        val dropSend = mutableMapOf<String, Int>()
+        val sent = mutableListOf<Pair<String, ByteArray>>()
+        var token = "synthetic-original-access"
+        var expires = clock.now + 120_000
+        var exportFailures = 0
+        val phoneFile = File(pair.leftContext.noBackupFilesDir, "chatgpt-auth.json").apply { writeText("{}") }
+        val watchFile = File(pair.rightContext.noBackupFilesDir, "chatgpt-auth.json")
+        val phone: ChatGptAccessSync.Owner
+        val watch: ChatGptAccessSync.Owner
+        init {
+            val executor = Executor { queue.add(it) }
+            phone = ChatGptAccessSync.Owner(pair.leftContext, pair.left, export = {
+                if (exportFailures > 0) { exportFailures--; """{"error":"synthetic-transient-failure"}""" }
+                else if (JSONObject(phoneFile.readText()).optBoolean("signedOut")) "null"
+                else JSONObject().put("voxgolemChatgpt", 1).put("openai", JSONObject().put("access", token).put("expires", expires)).toString()
+            }, message = { _, kind, bytes -> transmit("phone", kind, bytes) }, executor = executor,
+                schedule = clock.scheduler("phone"), now = { clock.now })
+            watch = ChatGptAccessSync.Owner(pair.rightContext, pair.right, export = { error("Watch cannot export") },
+                message = { _, kind, bytes -> transmit("watch", kind, bytes) }, executor = executor,
+                schedule = clock.scheduler("watch"), now = { clock.now })
+        }
+        private fun transmit(from: String, kind: String, bytes: ByteArray) {
+            val key = "$from:$kind"
+            sent.add(key to bytes.copyOf())
+            if ((failSend[key] ?: 0) > 0) { failSend[key] = failSend.getValue(key) - 1; error("synthetic_send_failed") }
+            if ((dropSend[key] ?: 0) > 0) { dropSend[key] = dropSend.getValue(key) - 1; return }
+            if (from == "phone") watch.submit { receive("synthetic-left-node", kind, bytes) }
+            else phone.submit { receive("synthetic-right-node", kind, bytes) }
+        }
+        fun drain() {
+            var count = 0
+            while (queue.isNotEmpty()) { check(++count <= 100); queue.removeFirst().run() }
+        }
+        fun boot() { phone.changed(); drain(); assertEquals("synthetic-original-access", access()) }
+        fun tick() { clock.tick(); drain() }
+        fun until(done: () -> Boolean) {
+            repeat(25) { if (done()) return; tick() }
+            assertTrue("Bounded synthetic exchange did not settle", done())
+        }
+        fun watchState() = JSONObject(watchFile.readText())
+        fun access(): String? = watchState().optJSONObject("openai")?.optString("access")
     }
 
     private inner class PairFixture {

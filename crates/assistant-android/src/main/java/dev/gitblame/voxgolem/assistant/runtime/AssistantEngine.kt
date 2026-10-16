@@ -209,6 +209,7 @@ class AssistantEngine @JvmOverloads internal constructor(
     override fun resume() = resume(true)
     override fun resume(reconcile: Boolean) {
         foregroundRequested = true
+        dev.gitblame.voxgolem.assistant.replication.ChatGptAccessSync.changed()
         dispatch {
             state = state.copy(foreground = true)
             if (!reconcile) return@dispatch

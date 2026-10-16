@@ -19,6 +19,56 @@ afterEach(() => {
 })
 
 describe('production Android App runtime', () => {
+  it('refreshes real Android snapshot-derived model availability after device sign-in and sign-out', async () => {
+    vi.useFakeTimers(); vi.stubEnv('VITE_VOXGOLEM_RUNTIME', 'android'); vi.resetModules(); window.history.replaceState(null, '')
+    let phase = 'signed_out'
+    let snapshotReads = 0
+    const authActions: string[] = []
+    window.__TAURI_INTERNALS__ = { invoke: async (command, args) => {
+      if (command === 'assistant_voice_status') return speechStatus(wireSnapshot()['preferences'] as Record<string, unknown>)
+      if (command === 'chatgpt_auth') {
+        const { action } = args as { action: string }
+        authActions.push(action)
+        if (action === 'start') phase = 'pending'
+        if (action === 'sign_out') phase = 'signed_out'
+        return { phase, userCode: phase === 'pending' ? 'TEST-CODE' : null, verificationUrl: null, error: null }
+      }
+      if (command === 'get_app_snapshot') {
+        snapshotReads += 1
+        const snapshot = wireSnapshot()
+        const available = phase === 'connected'
+        return { ...snapshot,
+          capabilities: (snapshot['capabilities'] as Record<string, unknown>[]).map((capability) => capability['id'] === 'custom_provider' ? { ...capability, state: available ? 'available' : 'not_configured', reason: available ? 'Ready' : 'Synthetic sign-in required' } : capability),
+          model_options: (snapshot['model_options'] as Record<string, unknown>[]).map((option) => ({ ...option, available, unavailable_reason: available ? null : 'Synthetic sign-in required' })),
+        }
+      }
+      return null
+    } }
+    const { default: App } = await import('./App')
+    container = document.createElement('div'); document.body.append(container); root = createRoot(container)
+    await act(async () => { root?.render(<App />) })
+    expect(authActions).toEqual([])
+    await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
+    const option = () => container!.querySelector<HTMLOptionElement>('#assistantInstantSelect option[value="custom-sol-high"]')!
+    const button = (text: string) => Array.from(container!.querySelectorAll('button')).find((item) => item.textContent === text)!
+    expect(option().disabled).toBe(true)
+    expect(authActions).toEqual(['status'])
+    await act(async () => { button('Continue with ChatGPT').click() })
+    expect(container.querySelector<HTMLInputElement>('[aria-label="ChatGPT device code"]')!.value).toBe('TEST-CODE')
+    const beforeConnection = snapshotReads
+    phase = 'connected'
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000) })
+    expect(snapshotReads).toBe(beforeConnection + 1)
+    expect(option().disabled).toBe(false)
+    expect(container.textContent).toContain('Connected to ChatGPT')
+    await act(async () => { button('Sign out').click() })
+    expect(snapshotReads).toBe(beforeConnection + 2)
+    expect(option().disabled).toBe(true)
+    expect(authActions).toEqual(['status', 'start', 'status', 'sign_out'])
+    expect(container.querySelector('[role="alert"]')).toBeNull()
+    window.history.replaceState(null, '')
+  })
+
   it('keeps Instant before speech and omits unsupported Android model controls without invalid preference proposals', async () => {
     vi.stubEnv('VITE_VOXGOLEM_RUNTIME', 'android'); vi.resetModules(); window.history.replaceState(null, '')
     const invoke = vi.fn(async (command: string) => command === 'get_app_snapshot' ? wireSnapshot() : null)
@@ -401,6 +451,7 @@ describe('production Android App runtime', () => {
     const proposals: Record<string, unknown>[] = []
     let settle: (accepted: boolean, message?: string) => void = () => undefined
     window.__TAURI_INTERNALS__ = { invoke: async (command, args) => {
+      if (command === 'chatgpt_auth') { expect(args).toEqual({ action: 'status' }); return { phase: 'signed_out' } }
       if (command === 'get_app_snapshot') return { ...wireSnapshot(), preferences }
       if (command === 'assistant_voice_status') return speechStatus(preferences, true)
       if (command === 'plugin:capture|snapshot') return { available: true, notesFolderUri: null, captures: [], error: null }

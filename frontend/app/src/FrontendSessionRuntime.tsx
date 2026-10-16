@@ -26,6 +26,7 @@ import { PhoneActionOverflow } from './components/PhoneActionOverflow'
 import headerIcon from '../../../apps/desktop-tauri/src-tauri/icons/icon.svg?url'
 import { UserNoticeToast } from './components/UserNoticeToast'
 import { UpdateSettings } from './components/UpdateSettings'
+import { ChatGptAuth } from './components/ChatGptAuth'
 import { playCueWithFallback, prepareVoiceCues } from './lib/audioCues'
 import { shouldSubmitComposer } from './lib/composer'
 import { listAudioInputDevices, startLiveAudioSource } from './lib/liveAudioSource'
@@ -3152,6 +3153,10 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     onSubmit, onComposerKeyDown, acceptTypedCompletion, clearCompletion, changeComposer,
     patchAssistantSettings, voiceDraftChanged, voiceSubmitted,
     voiceSettled: () => refreshAndroidSnapshotControlsRef.current(),
+    refreshChatGptAuth: async () => {
+      if (isAndroidRuntime) refreshAndroidSnapshotControlsRef.current()
+      else applyStartupState(await loadStartupState(), false)
+    },
     beginCurrentVoiceDraft, onAndroidVoiceActivity, onAndroidSpeechStatus, onAndroidVoiceInputCancelled,
     changeInstant, changeSearchMode, resetSession, retryCustom, cancelPrompt,
     changeUiTheme, adjustUiTextSize, toggleTts, toggleMic, changeAudioInputDevice,
@@ -3392,7 +3397,7 @@ const SessionSettings = memo(function SessionSettings({ session, view }: Session
     canEnableDeep, canEnableReview, appUpdates, updateInstallationDisabled, customFailure, customRetryPending } = usePresentation(session, view, 'settings')
   const { settingsOpen, settingsPanelRef, settingsCloseButtonRef, closeSettings, onSettingsKeyDown } = view.navigation
   const { changeUiTheme, adjustUiTextSize, changeAudioInputDevice, setAutoStopOnSilence, toggleTts, patchAssistantSettings,
-    changeInstant, clearCompletion, retryCustom } = view.actions
+    changeInstant, clearCompletion, retryCustom, refreshChatGptAuth } = view.actions
   return settingsOpen ? (
         <div
           className="settings-overlay"
@@ -3465,6 +3470,7 @@ const SessionSettings = memo(function SessionSettings({ session, view }: Session
             </div>
             <section className="settings-panel__assistant" aria-labelledby="model-settings-title">
               <h3 id="model-settings-title">Model</h3>
+              <ChatGptAuth onChanged={refreshChatGptAuth} />
               <label className="settings-panel__interactive"><strong>Instant</strong><InstantModelSelect id="assistantInstantSelect" label="Instant" value={assistantSettings.instant} options={instantAssistantOptions} disabled={instantControlsDisabled} canRetry={(value) => localInstantCanRetry(startupState, value)} onChange={(value) => void changeInstant(value)} /></label>
               {startupState.kind === 'ready' && !assistantCapabilities.custom ? <div>
                 <p className="settings-panel__hint">Custom connection: {customFailure?.reason ?? 'unavailable'}</p>

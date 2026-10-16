@@ -491,6 +491,10 @@
 }
 
 .settings-panel__assistant { display: grid; gap: .65rem; margin-top: 1rem; }
+.chatgpt-auth { display: grid; gap: .5rem; min-width: 0; }
+.chatgpt-auth p { margin: 0; overflow-wrap: anywhere; }
+.chatgpt-auth input { box-sizing: border-box; width: 100%; min-width: 0; min-height: 48px; padding: .5rem; border: 1px solid var(--border-strong); border-radius: .5rem; background: var(--surface-glass); color: var(--text-primary); font: inherit; }
+.chatgpt-auth input:focus-visible { outline: 2px solid var(--text-primary); outline-offset: 2px; }
 .settings-panel__assistant label { display: grid; gap: .25rem; color: var(--text-primary); }
 .settings-panel__assistant select { min-width: 0; padding: .45rem; border: 1px solid var(--border-strong); border-radius: .5rem; background: var(--surface-glass); color: var(--text-primary); font: inherit; }
 .settings-panel details > summary { cursor: pointer; padding-block: .65rem; font-weight: 500; }

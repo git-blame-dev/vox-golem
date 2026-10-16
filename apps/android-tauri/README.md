@@ -1,6 +1,6 @@
 # Android Tauri Shell
 
-This Android-only Tauri shell exposes canonical IPC commands and foreground lifecycle hooks through the thin `assistant-plugin` bridge. The shared `assistant-android` runtime owns durable conversations, read-only provider access and phone/Watch replication; the reusable Custom transport remains in `voxgolem-platform`. Desktop audio/models/plugins stay outside this crate. The authored `tauri-plugin-capture` mobile plugin adds native watch dictation, persistent recording/history state, permission setup and SAF notes export independently of chat. A zero-asset install still starts and reports only the affected provider capability as unavailable.
+This Android-only Tauri shell exposes canonical IPC commands and foreground lifecycle hooks through the thin `assistant-plugin` bridge. The shared `assistant-android` runtime owns durable conversations, provider access and phone/Watch replication; the reusable Custom transport remains in `voxgolem-platform`. Desktop audio/models/plugins stay outside this crate. The authored `tauri-plugin-capture` mobile plugin adds native watch dictation, persistent recording/history state, permission setup and SAF notes export independently of chat. A zero-asset install still starts and reports only the affected provider capability as unavailable.
 
 `src-tauri/gen/android` is generator-owned apart from the explicit exceptions below. Regenerate it only with the root `make android-init` wrapper, which pins and verifies Tauri CLI 2.11.1 and runs `make icons` before and after scaffold generation. The canonical artwork is `apps/desktop-tauri/src-tauri/icons/icon.svg`; `make icons` derives desktop PNG/ICO files, the tracked Android `src-tauri/icons/icon.png`, and Android launcher resources from that one SVG. The emblem fills 90% of the visible icon width. Android uses a black background with foreground and monochrome layers sized for its 72dp masked viewport; legacy launcher PNGs are rendered directly without additional inset. Wear consumes the same generated launcher resources. Build the arm64 debug APK with `make android-build`.
 
@@ -20,24 +20,21 @@ Ask/Talk are explicit exported launcher entry points, matching Wear's one-tap be
 
 ## Provider access and conversation sharing
 
-The app reads externally injected access from its app-private provider file. It
-does not import documents, manage credentials, copy them to the Watch, log in or
-refresh them. Missing, expired and rejected access remain normal chat availability/
-error states; drafts are retained and prompts are never replayed automatically.
-
-Authorized development setup is an external manual file-injection step on each
-selected app, not a repository helper or Settings action. Publish only compatible
-existing access, owner-only and complete, without printing keys or account data.
-Keep developer tooling, source/staging files and runtime evidence outside Git and
-preserve upstream auth and app data. The [root access guidance](../../README.md#provider-access-external-development-setup-only)
-describes the boundary; proper device authentication is deferred.
+Settings provides ChatGPT device-code sign-in through the shared native owner.
+The phone refreshes its own credentials and shares access-only snapshots with its
+verified paired watch through a separate transient channel. Tokens never enter
+JavaScript. Existing imported files remain read-only. See the
+[root sign-in guidance](../../README.md#chatgpt-device-code-sign-in) for setup,
+sign-out and offline-watch limitations. Drafts survive access failures; prompts
+are never replayed automatically.
 
 Phone/Watch conversation sharing remains automatic over native Wear Data Layer
 pairing. Both apps require matching package IDs and actual signing certificates,
 with compatible v3 role/replica identity metadata independent of credentials. One
 unambiguous opposite-form-factor counterpart is selected; unavailable access does
 not prevent reconciliation. Startup, foreground resume, SDK events and bounded
-jobs drive setup and conversation retries, never credential transfer or generation.
+jobs drive setup and conversation retries, never generation. Credential sharing
+has a separate bounded protocol and does not enter conversation payloads.
 See the [shared library guide](../../crates/assistant-android/README.md) for native
 ownership. Linux checks do not establish physical phone/Watch readiness.
 

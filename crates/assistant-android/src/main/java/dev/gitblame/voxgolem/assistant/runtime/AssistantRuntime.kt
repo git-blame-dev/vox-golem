@@ -35,6 +35,8 @@ object AssistantRuntime {
     fun captureResourceAdmissionReady(): Boolean = captureAdmissionReady
 
     fun refreshIfStarted() { engine?.refresh() }
+    /** Explicit logout retires this request, not the foreground/lifecycle owner. */
+    internal fun cancelActiveForSignOut() { engine?.stop() }
     fun idleForSyntheticSession(): Boolean = engine?.snapshot()?.let { !it.busy && !it.foreground } ?: true
 
     /** Fixed synthetic routes only; validate before allocating storage or provider resources. */

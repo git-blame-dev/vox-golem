@@ -4318,6 +4318,8 @@ describe('App', () => {
       invoke: async (command) => {
         invokedCommands.push(command)
 
+        if (command === 'chatgpt_auth') return { phase: 'signed_out' }
+
         if (command === 'get_assistant_settings') return defaultAssistantSettings()
 
         if (command === 'get_startup_state') {
@@ -4394,6 +4396,7 @@ describe('App', () => {
     expect(startupStateCallCount).toBe(3)
     expect(nonDiagnosticCommands(invokedCommands)).toEqual([
       'get_startup_state',
+      'chatgpt_auth',
       'switch_response_profile',
       'get_startup_state',
       'get_startup_state',
@@ -8898,6 +8901,8 @@ describe('App', () => {
       invoke: async (command) => {
         invokedCommands.push(command)
 
+        if (command === 'chatgpt_auth') return { phase: 'signed_out' }
+
         if (command === 'get_startup_state') {
           return {
             kind: 'ready',
@@ -8953,6 +8958,7 @@ describe('App', () => {
 
     expect(nonDiagnosticCommands(invokedCommands)).toEqual([
       'get_startup_state',
+      'chatgpt_auth',
       'ingest_audio_frame',
       'ingest_audio_frame',
     ])

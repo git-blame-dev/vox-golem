@@ -22,6 +22,7 @@ describe('prompt terminal presentation and speech', () => {
     let ttsEnabled = true
     const unexpected: string[] = []
     const invoke = vi.fn(async (command: string, args?: unknown): Promise<unknown> => {
+      if (command === 'chatgpt_auth') { expect(args).toEqual({ action: 'status' }); return { phase: 'signed_out' } }
       if (command === 'get_startup_state') return readyStartupState({ voice_input_available: false, tts_enabled: true, prompt_cancellation_available: true })
       if (command === 'get_app_snapshot') return appSnapshot(transcript, { tts_enabled: ttsEnabled })
       if (command === 'get_assistant_settings') return defaultAssistantSettings()
@@ -73,6 +74,7 @@ describe('prompt terminal presentation and speech', () => {
       expect(container.querySelector('.shell')?.getAttribute('data-runtime-status')).toBe('sleeping')
       expect(invoke.mock.calls.filter(([command]) => command === 'speak_local_tts')).toHaveLength(policy === 'enabled' ? 1 : 0)
       expect(unexpected).toEqual([])
+      expect(invoke.mock.calls.filter(([command]) => command === 'chatgpt_auth')).toEqual(policy === 'disabled' ? [['chatgpt_auth', { action: 'status' }]] : [])
     } finally {
       await act(async () => { root.unmount() }); container.remove()
       Reflect.deleteProperty(window, '__voxSmoke')

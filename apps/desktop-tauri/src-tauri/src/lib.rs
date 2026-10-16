@@ -15,6 +15,7 @@ use tauri::ipc::Channel;
 use tauri::{Emitter, Manager};
 
 mod app_updates;
+mod chatgpt_auth;
 #[cfg(test)]
 mod conversation_runtime_tests;
 mod livekit_wakeword;
@@ -1652,7 +1653,7 @@ async fn lock_live_settings_operation(
 }
 
 #[tauri::command]
-fn get_app_snapshot(
+async fn get_app_snapshot(
     app_state: tauri::State<'_, AppState>,
 ) -> Result<voxgolem_core::ipc::AppSnapshot, voxgolem_core::ipc::CommandError> {
     get_app_snapshot_from_state(&app_state)
@@ -1661,6 +1662,7 @@ fn get_app_snapshot(
 fn get_app_snapshot_from_state(
     app_state: &AppState,
 ) -> Result<voxgolem_core::ipc::AppSnapshot, voxgolem_core::ipc::CommandError> {
+    chatgpt_auth::refresh(app_state);
     let _lifecycle = app_state
         .lifecycle_gate
         .lock()
@@ -2431,11 +2433,14 @@ async fn execute_llama_preference_change(
 }
 
 #[tauri::command]
-fn get_startup_state(app_state: tauri::State<'_, AppState>) -> StartupSettingsPayload {
-    get_startup_state_from_state(&app_state)
+async fn get_startup_state(
+    app_state: tauri::State<'_, AppState>,
+) -> Result<StartupSettingsPayload, String> {
+    Ok(get_startup_state_from_state(&app_state))
 }
 
 fn get_startup_state_from_state(app_state: &AppState) -> StartupSettingsPayload {
+    chatgpt_auth::refresh(app_state);
     let state = app_state
         .startup_state
         .lock()
@@ -2576,6 +2581,17 @@ fn custom_auth_path(
         .map_err(|_| String::from("Custom auth state lock is poisoned"))?
         .clone()
         .ok_or_else(|| String::from("Custom WSL auth is unavailable; retry Custom"))
+}
+
+fn effective_custom_config(
+    app_state: &AppState,
+) -> Option<voxgolem_core::config::CustomOpenAiConfig> {
+    chatgpt_auth::configuration(
+        app_state
+            .runtime_config
+            .as_ref()
+            .and_then(|config| config.custom_openai.as_ref()),
+    )
 }
 
 #[tauri::command]
@@ -4242,12 +4258,7 @@ fn ensure_agent_prerequisites(
     use voxgolem_core::assistant::AgentModel;
     match model {
         AgentModel::CustomSolHigh | AgentModel::CustomLunaLow => {
-            if app_state
-                .runtime_config
-                .as_ref()
-                .and_then(|config| config.custom_openai.as_ref())
-                .is_none()
-            {
+            if effective_custom_config(app_state).is_none() {
                 return Err(String::from("Custom provider is not configured"));
             }
         }
@@ -5841,10 +5852,7 @@ async fn submit_custom_prompt(
             cancellation.control,
         );
     }
-    let config = app_state
-        .runtime_config
-        .as_ref()
-        .and_then(|config| config.custom_openai.as_ref());
+    let config = effective_custom_config(app_state);
     let Some(config) = config else {
         return fail_started_prompt(
             app,
@@ -5870,7 +5878,7 @@ async fn submit_custom_prompt(
         }
         _ => unreachable!("custom dispatch requires a Custom model"),
     };
-    let auth_path = match custom_auth_path(app_state, config) {
+    let auth_path = match custom_auth_path(app_state, &config) {
         Ok(path) => path,
         Err(error) => {
             return fail_started_prompt(
@@ -7296,10 +7304,7 @@ async fn run_agent_text(
     match model {
         voxgolem_core::assistant::AgentModel::CustomSolHigh
         | voxgolem_core::assistant::AgentModel::CustomLunaLow => {
-            let config = app_state
-                .runtime_config
-                .as_ref()
-                .and_then(|config| config.custom_openai.as_ref())
+            let config = effective_custom_config(app_state)
                 .ok_or_else(|| String::from("Custom provider is not configured"))?;
             let model = match model {
                 voxgolem_core::assistant::AgentModel::CustomSolHigh => {
@@ -7313,7 +7318,7 @@ async fn run_agent_text(
             let client = voxgolem_platform::custom_openai::CustomOpenAiClient::new(
                 voxgolem_platform::custom_openai::CustomOpenAiConfig {
                     endpoint: config.endpoint.clone(),
-                    auth_path: custom_auth_path(app_state, config)?,
+                    auth_path: custom_auth_path(app_state, &config)?,
                     model,
                     ..Default::default()
                 },
@@ -8931,6 +8936,14 @@ fn queue_assistant_prefetch(
             coordinator.policy(),
             coordinator.has_active_execution(),
         ) {
+            if !coordinator.has_active_execution()
+                && search_runtime::native_search_eligible(coordinator.policy())
+            {
+                drop(coordinator);
+                drop(_lifecycle);
+                drop(update_guard);
+                spawn_custom_and_web_prewarm(app);
+            }
             return Ok(());
         }
         (
@@ -9283,30 +9296,15 @@ async fn run_assistant_prefetch(
         | InstantModel::CustomLunaNone
         | InstantModel::CustomLunaLow => {
             let app_state = app.state::<AppState>();
-            let config = app_state
-                .runtime_config
-                .as_ref()
-                .and_then(|config| config.custom_openai.as_ref())
+            let config = effective_custom_config(&app_state)
                 .ok_or_else(|| String::from("Custom provider is not configured"))?;
-            let model = match key.model {
-                InstantModel::CustomSolHigh => {
-                    voxgolem_platform::custom_openai::CustomOpenAiModel::SolHigh
-                }
-                InstantModel::CustomSolNone => {
-                    voxgolem_platform::custom_openai::CustomOpenAiModel::SolNone
-                }
-                InstantModel::CustomLunaNone => {
-                    voxgolem_platform::custom_openai::CustomOpenAiModel::LunaNone
-                }
-                InstantModel::CustomLunaLow => {
-                    voxgolem_platform::custom_openai::CustomOpenAiModel::LunaLow
-                }
-                _ => unreachable!("custom prefetch requires a Custom model"),
+            let Some(model) = custom_openai_model_for_instant(key.model) else {
+                unreachable!("custom prefetch requires a Custom model");
             };
             let client = voxgolem_platform::custom_openai::CustomOpenAiClient::new(
                 voxgolem_platform::custom_openai::CustomOpenAiConfig {
                     endpoint: config.endpoint.clone(),
-                    auth_path: custom_auth_path(&app_state, config)?,
+                    auth_path: custom_auth_path(&app_state, &config)?,
                     model,
                     ..Default::default()
                 },
@@ -10471,7 +10469,7 @@ const CAPABILITY_IDS: [&str; 11] = [
 fn configured_capabilities(
     config: &voxgolem_core::config::RuntimeConfig,
 ) -> Vec<CapabilityPayload> {
-    CAPABILITY_IDS
+    let mut capabilities = CAPABILITY_IDS
         .into_iter()
         .map(|id| {
             let issue = config.capability_issues.iter().find(|issue| {
@@ -10549,7 +10547,9 @@ fn configured_capabilities(
                 },
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    chatgpt_auth::apply_capabilities(&mut capabilities);
+    capabilities
 }
 
 fn apply_wsl_custom_auth_resolution(
@@ -10603,6 +10603,9 @@ where
 
 #[cfg(target_os = "windows")]
 fn resolve_platform_provider_paths(config: &mut voxgolem_core::config::RuntimeConfig) {
+    if chatgpt_auth::path().is_ok_and(|path| path.exists()) {
+        return;
+    }
     let Some(custom) = config
         .custom_openai
         .as_ref()
@@ -12744,6 +12747,8 @@ pub fn run() {
             app_updates::restart_for_update,
             get_startup_state,
             retry_custom_provider,
+            chatgpt_auth::chatgpt_auth,
+            chatgpt_auth::open_chatgpt_sign_in,
             set_tts_enabled,
             reserve_local_tts_playback_id,
             prepare_voice_cues,

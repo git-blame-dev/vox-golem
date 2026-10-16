@@ -28,6 +28,9 @@ object AssistantProviderNative : ProviderNativeCalls {
         }
     }
     external fun observeAuth(authPath: String): String
+    external fun chatGptAuth(authPath: String, action: String): String
+    /** Access-only envelope, literal null for signed out, or {error:...}; never JS-facing. */
+    external fun exportChatGptAccess(authPath: String): String
     external override fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String
     external override fun cancel(requestId: String)
     external fun nativePrepareSearch(requestJson: String, callback: ProviderDeltaCallback): String

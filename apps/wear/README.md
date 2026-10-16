@@ -101,15 +101,13 @@ peers, including offline devices, are considered; ambiguity blocks setup rather
 than selecting whichever device is online. Peer identity is independent of provider
 access; missing or expired access does not disable conversation synchronization.
 
-Startup/resume, SDK events and bounded retry jobs drive conversation sharing. Each
-app reads its own externally injected app-private access file; there is no phone
-import/copy, credential status/settings panel, login or refresh workflow. Normal
-chat reports unavailable, expired or rejected access while retaining drafts for
-deliberate retry. Authorized development uses external manual file injection on
-each selected app, with private tooling/staging outside Git and no token output;
-see the [root access guidance](../../README.md#provider-access-external-development-setup-only).
-Proper device authentication is deferred, not currently available. Migration must
-preserve local histories, provider files and drafts.
+Startup/resume, SDK events and bounded retry jobs drive conversation sharing.
+Wear has no login UI: sign in with a device code on the phone, which sends
+access-only snapshots over a separate verified paired-peer channel and owns
+renewal. Without the phone, cached access works only until expiry. Existing
+imported provider files and local histories/drafts are preserved. Normal chat
+retains drafts for deliberate retry after unavailable/expired/rejected access.
+See the [root sign-in guidance](../../README.md#chatgpt-device-code-sign-in).
 
 The same conversation IDs and completed turns reconcile through finite GMS
 DataItem/Asset exchanges after automatic setup. Drafts, selected heads, running requests,

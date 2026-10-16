@@ -22,8 +22,41 @@ class ProviderAuthSourceTest {
     @get:Rule val folder = TemporaryFolder()
     private val primary get() = File(folder.root, "assistant-auth.json")
     private val legacy get() = File(folder.root, "codex-auth.json")
+    private val managed get() = File(folder.root, "chatgpt-auth.json")
     private fun envelope(access: String = "synthetic-access", expiry: Long = System.currentTimeMillis() + 3_600_000,
         metadata: Boolean = false) = """{${if (metadata) "\"_assistant\":{\"version\":1,\"installationId\":\"00000000-0000-4000-8000-000000000001\",\"generation\":\"7\"}," else ""}"openai":{"access":"$access","expires":$expiry}}"""
+
+    @Test fun managedSelectionAndSignedOutTombstoneNeverFallBackOrMutateImportedFiles() {
+        primary.writeText(envelope("synthetic-import"))
+        legacy.writeText(envelope("synthetic-legacy"))
+        val before = primary.readBytes(); val legacyBefore = legacy.readBytes()
+        val source = ProviderAuthSource(primary, legacy, managed)
+        assertEquals(primary.path, source.selection().path)
+        managed.writeText(JSONObject(envelope("synthetic-managed")).put("voxgolemChatgpt", 1).toString())
+        assertEquals(ProviderAuthReason.READY, source.status().reason)
+        assertEquals(managed.path, source.pathForProvider())
+        for (contents in listOf("""{"voxgolemChatgpt":1,"signedOut":true}""", "{}", "not-json")) {
+            managed.writeText(contents)
+            assertNotEquals(ProviderAuthReason.READY, source.status().reason)
+            assertEquals(managed.path, source.pathForProvider())
+            assertEquals(contents, managed.readText())
+        }
+        assertArrayEquals(before, primary.readBytes()); assertArrayEquals(legacyBefore, legacy.readBytes())
+    }
+
+    @Test fun watchAdmissionFailsClosedUntilAssociationValidationWithoutFallingBackToImports() {
+        primary.writeText(envelope("synthetic-import"))
+        managed.writeText(JSONObject(envelope("synthetic-watch-access")).put("voxgolemChatgpt", 1).toString())
+        var approved = false
+        val source = ProviderAuthSource(primary, legacy, managed, { approved })
+        assertNotEquals(ProviderAuthReason.READY, source.status().reason)
+        assertEquals(managed.path, source.pathForProvider())
+        approved = true
+        assertEquals(ProviderAuthReason.READY, source.status().reason)
+        approved = false
+        assertNotEquals(ProviderAuthReason.READY, source.status().reason)
+        assertEquals(managed.path, source.pathForProvider())
+    }
 
     @Test fun missingInvalidAndExpiredFilesUseTheRealRustParserWithoutMutation() {
         val source = ProviderAuthSource(primary, legacy)

@@ -170,6 +170,7 @@ export async function invokeAndroidCommand(command: string, args?: unknown): Pro
   const invoke = async (name: string, payload?: unknown): Promise<unknown> => {
     try { return await nativeInvoke(name, payload) } catch (error) { throw normalizeTauriError(error) }
   }
+  if (command === 'chatgpt_auth' || command === 'open_chatgpt_sign_in') return invoke(command, args)
   if (command === 'get_app_snapshot') {
     return invoke(command, args)
   }

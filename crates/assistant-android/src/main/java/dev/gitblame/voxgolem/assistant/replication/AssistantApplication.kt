@@ -11,5 +11,6 @@ open class AssistantApplication : Application(), AssistantPeerAssociationOwner, 
     override fun onCreate() {
         super.onCreate()
         AssistantReplication.start(this, assistantPeerAssociationProvider, AssistantRuntime::refreshIfStarted)
+        ChatGptAccessSync.start(this)
     }
 }

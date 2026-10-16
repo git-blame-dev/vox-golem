@@ -112,11 +112,10 @@ already obtained by an offline peer. No operation triggers remote generation or 
 ## Provider access and verification boundary
 
 Conversation synchronization does not transfer credentials and does not depend on usable
-provider access. Each app reads its own existing externally injected app-private access
-file, without import, login, renewal or refresh implementation. Normal chat reports
-unavailable/expired/rejected access and retains drafts for deliberate retry. Authorized
-development file injection and its private tooling stay outside the repository; proper
-device authentication is deferred, not currently available.
+provider access. Android's device-code sign-in and paired access-only sharing use a
+separate transient credential channel; refresh tokens stay on the phone. Existing imported
+provider files remain read-only. Normal chat reports unavailable/expired/rejected access
+and retains drafts for deliberate retry. See the shared library's provider-access guidance.
 
 Use the maintained verification targets in the [shared library guide](../../../../../../../../README.md#verification).
 Synthetic SDK/controller and SQLite/Rust JNI tests establish policy, ordering and recovery,

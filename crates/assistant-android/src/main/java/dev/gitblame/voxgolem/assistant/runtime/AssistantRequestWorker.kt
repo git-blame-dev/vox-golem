@@ -92,6 +92,9 @@ class AssistantRequestWorker(
                     } catch (_: RuntimeException) {
                         """{"status":"error","code":"internal_error"}"""
                     }
+                    // Shared Rust may have rotated a phone-owned refresh token during this request.
+                    // Only enqueue a bounded peer-sync hint; never wait on GMS on the provider path.
+                    dev.gitblame.voxgolem.assistant.replication.ChatGptAccessSync.changed()
                     val deliverOutcome = synchronized(lock) { request.returned = true; active === request && !request.cancelled }
                     if (deliverOutcome) listener.onOutcome(request.id, outcome)
                 } finally {
