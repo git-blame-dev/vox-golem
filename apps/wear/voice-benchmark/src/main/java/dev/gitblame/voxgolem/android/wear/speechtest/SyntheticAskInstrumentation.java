@@ -17,6 +17,7 @@ public final class SyntheticAskInstrumentation extends Instrumentation {
     private Class<?> facade;
     private String phase = "startup";
     private int completed;
+    private String model;
 
     @Override public void onCreate(Bundle arguments) {
         super.onCreate(arguments);
@@ -39,7 +40,11 @@ public final class SyntheticAskInstrumentation extends Instrumentation {
                     .invoke(null, this, arguments);
                 installed = true;
                 require("fixture_ready".equals(ready.getString("stage")));
-                for (int trial = 1; trial <= 3; trial++) {
+                model = ready.getString("model");
+                require("custom-luna-none".equals(model) || "gemini-nano".equals(model) || "agy-flash-low".equals(model));
+                int trials = ready.getInt("trials");
+                require(trials == 1 || trials == 3);
+                for (int trial = 1; trial <= trials; trial++) {
                     require(SystemClock.elapsedRealtime() < deadline);
                     phase = "trial_" + trial;
                     call("prepareTrial");
@@ -93,6 +98,7 @@ public final class SyntheticAskInstrumentation extends Instrumentation {
         Bundle result = new Bundle();
         result.putString("benchmark_result", failure == null ? (startupOnly ? "ready" : "complete") : "failed");
         result.putInt("completed_trials", completed);
+        if (model != null) result.putString("model", model);
         result.putString("phase", phase);
         if (failure != null) {
             Throwable cause = failure instanceof InvocationTargetException && failure.getCause() != null

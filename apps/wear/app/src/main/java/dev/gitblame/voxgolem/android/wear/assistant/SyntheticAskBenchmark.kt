@@ -40,29 +40,41 @@ object SyntheticAskBenchmark {
     private var trials = 0
     private var pcm: ByteArray? = null
     private var expiresAt = 0L
+    private var model = "custom-luna-none"
+    private var trialLimit = 3
+
+    internal fun parseArguments(arguments: Bundle): Pair<String, Int> {
+        val model = AssistantRuntime.validateSyntheticModel(arguments.getString("model") ?: "custom-luna-none")
+        val trials = arguments.getString("trials") ?: "3"
+        require(trials == "1" || trials == "3")
+        return model to trials.toInt()
+    }
 
     @JvmStatic fun install(instrumentation: Instrumentation, arguments: Bundle): Bundle {
         check(Looper.myLooper() != Looper.getMainLooper())
         verify(instrumentation)
         check(arguments.getString("liveProvider") == "true" && arguments.getString("syntheticAudio") == "true")
+        val selection = parseArguments(arguments)
         synchronized(this) {
             check(!consumed && owner == null && trial == null)
             check(AssistantRuntime.idleForSyntheticSession() && RecognitionResourceLease.process.current() == null)
             consumed = true
+            model = selection.first
+            trialLimit = selection.second
             owner = instrumentation
             expiresAt = SystemClock.elapsedRealtime() + TimeUnit.MINUTES.toMillis(10)
         }
         try { pcm = SyntheticAskFixture.create(instrumentation, instrumentation.targetContext.applicationContext) }
         catch (failure: Exception) { owner = null; throw IllegalStateException("synthetic_fixture_failed") }
-        return Bundle().apply { putString("stage", "fixture_ready"); putInt("trials", 3) }
+        return Bundle().apply { putString("stage", "fixture_ready"); putInt("trials", trialLimit); putString("model", model) }
     }
 
     @JvmStatic fun prepareTrial(instrumentation: Instrumentation): Bundle {
         authorize(instrumentation)
         check(Looper.myLooper() != Looper.getMainLooper())
-        check(trial == null && trials < 3 && RecognitionResourceLease.process.current() == null)
+        check(trial == null && trials < trialLimit && RecognitionResourceLease.process.current() == null)
         val application = instrumentation.targetContext.applicationContext
-        val current = Trial(application, requireNotNull(pcm))
+        val current = Trial(application, requireNotNull(pcm), model)
         trial = current
         trials++
         return Bundle().apply { putString("stage", "armed"); putInt("trial", trials) }
@@ -186,7 +198,7 @@ object SyntheticAskBenchmark {
         check(context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
     }
 
-    private class Trial(application: Context, val pcm: ByteArray) {
+    private class Trial(application: Context, val pcm: ByteArray, val model: String) {
         val counts = ConcurrentHashMap<String, AtomicInteger>()
         val observed = ConcurrentHashMap<String, Long>()
         val finals = AtomicInteger()
@@ -211,7 +223,7 @@ object SyntheticAskBenchmark {
                 metadata: AssistantDiagnosticJournal.Metadata) = journal.offerMetadata(operation, run, parentRun, observedNanos, metadata)
         }
         private val directory = File(application.cacheDir, "synthetic-ask-${UUID.randomUUID()}")
-        val handle = AssistantRuntime.syntheticSession(application, directory) {
+        val handle = AssistantRuntime.syntheticSession(application, directory, model) {
             AssistantTiming.begin(application, it, sink = sink)
         }
         val context = ScopedContext(application, directory)
@@ -223,6 +235,7 @@ object SyntheticAskBenchmark {
                 count("PRESENTATION_TEXT_DRAW_SUBMITTED") >= 1 && count("TTS_UTTERANCE_ON_START") >= 1 &&
                 count("TTS_UTTERANCE_ON_DONE") >= 1 && count("VOICE_FLOW_SETTLED") == 1 && idle
             return Bundle().apply {
+                putString("model", model)
                 putString("stage", if (failed) "failed" else if (complete) "complete" else "running")
                 putInt("finals", finals.get()); putBoolean("idle", idle)
                 counts.forEach { (key, value) -> putInt(key, value.get()) }

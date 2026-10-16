@@ -212,6 +212,16 @@ and warm/mixed rather than a cold-process launch. Fixture generation occurs befo
 measurement and warms Google speech. Three samples establish only a small happy-path
 baseline—not general STT accuracy, tail percentiles, acoustic output or painted pixels.
 
+For a cheaper single-provider smoke, add `-e trials 1`. The exact model allowlist is
+`custom-luna-none` (default, direct Custom), `gemini-nano` (phone relay), and
+`agy-flash-low` (phone relay), selected with `-e model <model>`. These arguments affect
+only the isolated synthetic session, not the user's saved selection or draft. Custom
+and Nano keep web disabled; Agy uses its required web-enabled policy rather than
+claiming an unsupported tool-denial mode. The synthetic question does not request a
+lookup. Stop and reconcile each failed run before testing the next provider; no route
+fallback or automatic rerun occurs. Success with one trial requires
+`completed_trials=1` as well as `benchmark_result=complete` and instrumentation code-1.
+
 Success requires `benchmark_result=complete`, `completed_trials=3` and instrumentation
 code-1. On any failure/timeout, return HOME and force-stop only the identity-verified
 target if retirement is uncertain; reconnect and reconcile before any new attempt.

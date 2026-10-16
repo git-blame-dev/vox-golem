@@ -13,6 +13,38 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class SyntheticAskBenchmarkTest {
+    @Test fun syntheticArgumentsDefaultToCustomAndThreeTrialsAndAllowOnlyCheapRoutes() {
+        assertEquals("custom-luna-none" to 3, SyntheticAskBenchmark.parseArguments(android.os.Bundle()))
+        for (model in listOf("custom-luna-none", "gemini-nano", "agy-flash-low")) {
+            for (trials in listOf("1", "3")) {
+                val args = android.os.Bundle().apply { putString("model", model); putString("trials", trials) }
+                assertEquals(model to trials.toInt(), SyntheticAskBenchmark.parseArguments(args))
+            }
+        }
+        for (model in listOf("", "custom-sol-high", "agy-flash-high", "GEMINI-NANO")) {
+            assertTrue(runCatching {
+                SyntheticAskBenchmark.parseArguments(android.os.Bundle().apply { putString("model", model) })
+            }.exceptionOrNull() is IllegalArgumentException)
+        }
+        for (trials in listOf("", "0", "2", "4", "01")) {
+            assertTrue(runCatching {
+                SyntheticAskBenchmark.parseArguments(android.os.Bundle().apply { putString("trials", trials) })
+            }.exceptionOrNull() is IllegalArgumentException)
+        }
+    }
+
+    @Test fun unknownSyntheticModelIsRejectedBeforeAnyContextOrFilesystemAccess() {
+        val untouched = object : android.content.ContextWrapper(null) {
+            override fun getCacheDir(): java.io.File = error("unexpected_context_access")
+            override fun getApplicationContext(): android.content.Context = error("unexpected_context_access")
+        }
+        val failure = runCatching {
+            dev.gitblame.voxgolem.assistant.runtime.AssistantRuntime.syntheticSession(
+                untouched, java.io.File("synthetic-unused"), "custom-sol-high") { error("unexpected_timing") }
+        }.exceptionOrNull()
+        assertTrue(failure is IllegalArgumentException)
+    }
+
     @Test fun cleanupAttemptsActivityAudioAndProviderStagesAndRetainsTheFirstFailure() {
         for (failed in listOf("activity", "audio", "provider")) {
             val visited = mutableListOf<String>()
