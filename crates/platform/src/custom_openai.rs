@@ -242,16 +242,24 @@ impl Display for CustomOpenAiError {
 
 impl std::error::Error for CustomOpenAiError {}
 
+const PREWARM_COOLDOWN: Duration = Duration::from_secs(45);
+const PREWARM_TIMEOUT: Duration = Duration::from_secs(4);
+
 pub struct CustomOpenAiClient {
     config: CustomOpenAiConfig,
     client: Client,
+    last_prewarm: std::sync::Arc<std::sync::Mutex<Option<Instant>>>,
 }
 
 impl CustomOpenAiClient {
     pub fn new(config: CustomOpenAiConfig) -> Result<Self, CustomOpenAiError> {
         let config = Self::validated_config(config)?;
         let client = Self::transport(&config)?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            last_prewarm: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        })
     }
 
     /// Reuse this owner's pool with fresh request configuration and credentials.
@@ -269,11 +277,79 @@ impl CustomOpenAiClient {
         Ok(Self {
             config,
             client: self.client.clone(),
+            last_prewarm: self.last_prewarm.clone(),
         })
     }
 
     pub fn config(&self) -> &CustomOpenAiConfig {
         &self.config
+    }
+
+    pub(crate) fn record_transport_active(&self) {
+        if let Ok(mut guard) = self.last_prewarm.lock() {
+            *guard = Some(Instant::now());
+        }
+    }
+
+    pub async fn prewarm(&self) -> Result<(), CustomOpenAiError> {
+        if self.config.model == CustomOpenAiModel::LocalFast {
+            return Ok(());
+        }
+        let timeout = self.config.connect_timeout.min(PREWARM_TIMEOUT);
+        let deadline = tokio::time::Instant::now() + timeout;
+        let should_warm_transport = {
+            let mut guard = self
+                .last_prewarm
+                .lock()
+                .map_err(|_| CustomOpenAiError::Transport)?;
+            let now = Instant::now();
+            if guard
+                .is_some_and(|instant| now.saturating_duration_since(instant) < PREWARM_COOLDOWN)
+            {
+                false
+            } else {
+                *guard = Some(now);
+                true
+            }
+        };
+        let auth_check = async {
+            tokio::time::timeout_at(
+                deadline,
+                crate::chatgpt_auth::ensure_fresh(&self.config.auth_path),
+            )
+            .await
+            .map_err(|_| CustomOpenAiError::Timeout)??;
+            let credential = load_request_credential(&self.config.auth_path)?;
+            credential.validate_endpoint(&self.config.endpoint)?;
+            Ok::<(), CustomOpenAiError>(())
+        };
+        if !should_warm_transport {
+            return auth_check.await;
+        }
+        let transport_warm = async {
+            let result = self
+                .client
+                .head(&self.config.endpoint)
+                .timeout(timeout)
+                .send()
+                .await
+                .map_err(map_transport_error);
+            match result {
+                Ok(_) => {
+                    self.record_transport_active();
+                    Ok(())
+                }
+                Err(error) => {
+                    if let Ok(mut guard) = self.last_prewarm.lock() {
+                        *guard = None;
+                    }
+                    Err(error)
+                }
+            }
+        };
+        let (auth_result, transport_result) = tokio::join!(auth_check, transport_warm);
+        auth_result?;
+        transport_result
     }
 
     fn validated_config(
@@ -466,6 +542,7 @@ impl CustomOpenAiClient {
             .await
             .map_err(map_transport_error)?;
         let headers_at = started.elapsed();
+        self.record_transport_active();
         if !response.status().is_success() {
             return Err(map_http_status(response.status()));
         }
@@ -2323,4 +2400,65 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn prewarm_warms_transport_without_exposing_authorization_and_deduplicates_across_reused_pool(
+    ) {
+        let dir = crate::test_support::TestDir::new("prewarm-auth");
+        let auth_path = dir.path().join("auth.json");
+        std::fs::write(
+            &auth_path,
+            br#"{"openai":{"access":"synthetic-prewarm-token","expires":4102444800000,"accountId":"synthetic-account"}}"#,
+        )
+        .unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let endpoint = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+        let head_requests = std::sync::Arc::new(AtomicU64::new(0));
+        let seen = head_requests.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut bytes = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                let headers = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+                assert!(headers.starts_with("head /v1/responses "));
+                assert!(!headers.contains("authorization:"));
+                assert!(!headers.contains("chatgpt-account-id:"));
+                seen.fetch_add(1, Ordering::SeqCst);
+                socket
+                    .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+        let config = CustomOpenAiConfig {
+            endpoint: endpoint.clone(),
+            auth_path: auth_path.clone(),
+            model: CustomOpenAiModel::LunaLow,
+            ..Default::default()
+        };
+        let client = CustomOpenAiClient::new(config).unwrap();
+        client.prewarm().await.unwrap();
+        assert_eq!(head_requests.load(Ordering::SeqCst), 1);
+
+        let reused = client
+            .with_reused_transport(CustomOpenAiConfig {
+                endpoint,
+                auth_path,
+                model: CustomOpenAiModel::SolHigh,
+                ..Default::default()
+            })
+            .unwrap();
+        reused.prewarm().await.unwrap();
+        assert_eq!(head_requests.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
 }

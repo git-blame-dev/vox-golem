@@ -312,8 +312,35 @@ impl CustomOpenAiClient {
         instructions: &str,
         tools: &[Value],
         options: RoundOptions,
+        preparation_check: impl FnMut() -> Result<(), CustomOpenAiError>,
+        on_event: impl FnMut(ModelEvent<'_>) -> Result<(), ()>,
+    ) -> Result<ModelRound, RoundError> {
+        self.projected_round_with_refresh(
+            session_id,
+            input,
+            instructions,
+            tools,
+            options,
+            preparation_check,
+            on_event,
+            crate::chatgpt_auth::ensure_fresh(&self.config.auth_path),
+        )
+        .await
+    }
+
+    // Keep the refresh dependency explicit so the complete round's ordering can
+    // be exercised with the real auth engine against synthetic HTTP endpoints.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn projected_round_with_refresh(
+        &self,
+        session_id: &str,
+        input: InputProjection<'_>,
+        instructions: &str,
+        tools: &[Value],
+        options: RoundOptions,
         mut preparation_check: impl FnMut() -> Result<(), CustomOpenAiError>,
         mut on_event: impl FnMut(ModelEvent<'_>) -> Result<(), ()>,
+        refresh: impl std::future::Future<Output = Result<(), CustomOpenAiError>>,
     ) -> Result<ModelRound, RoundError> {
         let started = Instant::now();
         let deadline = options.deadline;
@@ -332,7 +359,15 @@ impl CustomOpenAiClient {
         if tokio::time::Instant::now() >= deadline {
             return Err(CustomOpenAiError::Timeout.into());
         }
+        if options.expected_auth_revision.is_none() {
+            preparation_check()?;
+            tokio::time::timeout_at(deadline, refresh)
+                .await
+                .map_err(|_| CustomOpenAiError::Timeout)??;
+            preparation_check()?;
+        }
         let credential = load_request_credential(&self.config.auth_path)?;
+        credential.validate_endpoint(&self.config.endpoint)?;
         let auth_revision = credential.revision;
         if options
             .expected_auth_revision
@@ -373,6 +408,7 @@ impl CustomOpenAiClient {
                 .await
                 .map_err(map_transport_error)?;
             let headers_at = started.elapsed();
+            self.record_transport_active();
             if !response.status().is_success() {
                 return Err(map_http_status(response.status()).into());
             }

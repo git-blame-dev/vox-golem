@@ -205,6 +205,14 @@ impl From<Failure> for ProviderFailure {
 }
 
 pub trait WebTransport: Send {
+    fn prewarm(
+        &mut self,
+        _provider: Provider,
+        _deadline: Instant,
+        _cancel: &Cancellation,
+    ) -> impl std::future::Future<Output = Result<(), ProviderFailure>> + Send {
+        async { Ok(()) }
+    }
     fn call(
         &mut self,
         provider: Provider,
@@ -215,11 +223,14 @@ pub trait WebTransport: Send {
     ) -> impl std::future::Future<Output = Result<Value, ProviderFailure>> + Send;
 }
 
+const MCP_PREWARM_FRESHNESS: Duration = Duration::from_secs(45);
+
 #[derive(Default)]
 pub struct McpTransport {
     parallel: Option<RunningService<RoleClient, ()>>,
     exa: Option<RunningService<RoleClient, ()>>,
     budgets: [Option<bounded_http::BoundedHttp>; 2],
+    last_active: [Option<Instant>; 2],
     #[cfg(test)]
     endpoints: Option<[String; 2]>,
 }
@@ -231,18 +242,16 @@ impl McpTransport {
                 let _ = service.close_with_timeout(Duration::from_secs(2)).await;
             }
         }
+        self.last_active = [None, None];
     }
-}
 
-impl WebTransport for McpTransport {
-    async fn call(
+    async fn ensure_connected(
         &mut self,
         provider: Provider,
-        operation: &Operation,
         conversation_id: &str,
         deadline: Instant,
         cancel: &Cancellation,
-    ) -> Result<Value, ProviderFailure> {
+    ) -> Result<usize, ProviderFailure> {
         let endpoint = provider.endpoint();
         #[cfg(test)]
         let endpoint = self
@@ -257,6 +266,7 @@ impl WebTransport for McpTransport {
         };
         if slot.as_ref().is_some_and(|service| service.is_closed()) {
             *slot = None;
+            self.last_active[index] = None;
         }
         if slot.is_none() {
             let mut config = StreamableHttpClientTransportConfig::with_uri(endpoint.to_string())
@@ -337,8 +347,88 @@ impl WebTransport for McpTransport {
             }
             initializing.0.take();
             self.budgets[index] = Some(client);
+            self.last_active[index] = Some(Instant::now());
             *slot = Some(service);
         }
+        Ok(index)
+    }
+}
+
+impl WebTransport for McpTransport {
+    async fn prewarm(
+        &mut self,
+        provider: Provider,
+        deadline: Instant,
+        cancel: &Cancellation,
+    ) -> Result<(), ProviderFailure> {
+        let index = if provider == Provider::Parallel { 0 } else { 1 };
+        let stale =
+            self.last_active[index].is_some_and(|active| active.elapsed() >= MCP_PREWARM_FRESHNESS);
+        if stale {
+            let slot = match provider {
+                Provider::Parallel => &mut self.parallel,
+                Provider::Exa => &mut self.exa,
+            };
+            if slot.as_ref().is_some_and(|service| !service.is_closed()) {
+                if let Some(budget) = self.budgets[index].as_ref() {
+                    budget.reset_budget();
+                }
+                let refresh = if let Some(service) = slot.as_ref() {
+                    let mut on_drop = CancelOnDrop(Some(service.cancellation_token()));
+                    let result = cancel
+                        .guard(
+                            deadline,
+                            service
+                                .list_tools(Some(rmcp::model::PaginatedRequestParams::default())),
+                        )
+                        .await;
+                    if result.is_ok() {
+                        on_drop.0.take();
+                    }
+                    result
+                } else {
+                    Ok(Ok(rmcp::model::ListToolsResult::default()))
+                };
+                match refresh {
+                    Ok(Ok(_)) => {
+                        self.last_active[index] = Some(Instant::now());
+                        return Ok(());
+                    }
+                    Ok(Err(error)) if cancel.is_cancelled() => {
+                        return Err(classify_service_error(error));
+                    }
+                    Err(error) if error == Failure::Cancelled => {
+                        return Err(error.into());
+                    }
+                    _ => {
+                        if let Some(service) = slot.take() {
+                            service.cancellation_token().cancel();
+                        }
+                        self.last_active[index] = None;
+                    }
+                }
+            }
+        }
+        self.ensure_connected(provider, "Synthetic", deadline, cancel)
+            .await
+            .map(|_| ())
+    }
+
+    async fn call(
+        &mut self,
+        provider: Provider,
+        operation: &Operation,
+        conversation_id: &str,
+        deadline: Instant,
+        cancel: &Cancellation,
+    ) -> Result<Value, ProviderFailure> {
+        let index = self
+            .ensure_connected(provider, conversation_id, deadline, cancel)
+            .await?;
+        let slot = match provider {
+            Provider::Parallel => &mut self.parallel,
+            Provider::Exa => &mut self.exa,
+        };
         self.budgets[index]
             .as_ref()
             .ok_or(Failure::Transport)?
@@ -364,6 +454,7 @@ impl WebTransport for McpTransport {
         }
         let result = match response {
             Ok(Ok(CallToolResponse::Complete(result))) => {
+                self.last_active[index] = Some(Instant::now());
                 serde_json::to_value(result).map_err(|_| Failure::InvalidUpstream)?
             }
             Ok(Ok(_)) => return Err(Failure::Unsupported.into()),
@@ -372,6 +463,7 @@ impl WebTransport for McpTransport {
                     if let Some(service) = slot.take() {
                         service.cancellation_token().cancel();
                     }
+                    self.last_active[index] = None;
                 }
                 return Err(classify_service_error(error));
             }
@@ -379,6 +471,7 @@ impl WebTransport for McpTransport {
                 if let Some(service) = slot.take() {
                     service.cancellation_token().cancel();
                 }
+                self.last_active[index] = None;
                 return Err(error.into());
             }
         };
@@ -616,6 +709,54 @@ impl<T: WebTransport> WebService<T> {
             cooldowns: [None, None],
             next_source: 0,
         }
+    }
+    pub async fn prewarm(
+        &mut self,
+        deadline: Instant,
+        cancel: &Cancellation,
+    ) -> Result<(), Failure> {
+        let mut provider = if self.ready(Provider::Parallel) {
+            Provider::Parallel
+        } else {
+            Provider::Exa
+        };
+        if !self.ready(provider) {
+            return Err(Failure::Service);
+        }
+        for attempt in 0..2 {
+            if cancel.is_cancelled() {
+                return Err(Failure::Cancelled);
+            }
+            let attempt_deadline = deadline.min(Instant::now() + ATTEMPT_TIME);
+            if attempt_deadline <= Instant::now() {
+                return Err(Failure::Deadline);
+            }
+            match self
+                .transport
+                .prewarm(provider, attempt_deadline, cancel)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    if error.kind == Failure::Cancelled {
+                        return Err(Failure::Cancelled);
+                    }
+                    if error.kind == Failure::RateLimited {
+                        self.cooldown(
+                            provider,
+                            error.retry_after.unwrap_or(Duration::from_secs(60)),
+                        );
+                    } else if error.kind.fallback() {
+                        self.cooldown(provider, Duration::from_secs(15));
+                    }
+                    if !error.kind.fallback() || attempt == 1 || !self.ready(provider.alternate()) {
+                        return Err(error.kind);
+                    }
+                    provider = provider.alternate();
+                }
+            }
+        }
+        Err(Failure::Service)
     }
     async fn attempt(
         &mut self,
@@ -1483,6 +1624,132 @@ mod tests {
         assert_eq!(initialized.load(Ordering::SeqCst), 2);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         transport.close().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn prewarm_establishes_mcp_session_and_first_search_skips_discovery() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let initialized = Arc::new(AtomicUsize::new(0));
+        let listed = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let init_seen = initialized.clone();
+        let list_seen = listed.clone();
+        let calls_seen = calls.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = vec![];
+                let mut buffer = [0; 4096];
+                let (headers, body) = loop {
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    if count == 0 {
+                        break (String::new(), Value::Null);
+                    }
+                    bytes.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = bytes.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("content-length:")?
+                                    .trim()
+                                    .parse::<usize>()
+                                    .ok()
+                            })
+                            .unwrap_or(0);
+                        if bytes.len() >= end + 4 + length {
+                            break (
+                                headers,
+                                serde_json::from_slice(&bytes[end + 4..end + 4 + length])
+                                    .unwrap_or(Value::Null),
+                            );
+                        }
+                    }
+                    assert!(bytes.len() < 64 * 1024);
+                };
+                if headers.is_empty() {
+                    continue;
+                }
+                let mut status = 200;
+                let mut session_header = String::new();
+                let response = match body["method"].as_str() {
+                    Some("initialize") => {
+                        let number = init_seen.fetch_add(1, Ordering::SeqCst) + 1;
+                        session_header = format!("Mcp-Session-Id: synthetic-prewarm-{number}\r\n");
+                        json!({"jsonrpc":"2.0","id":body["id"],"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"synthetic-test-service","version":"1"}}})
+                    }
+                    Some("tools/list") => {
+                        list_seen.fetch_add(1, Ordering::SeqCst);
+                        json!({"jsonrpc":"2.0","id":body["id"],"result":{"tools":[
+                            {"name":"web_search","inputSchema":{"type":"object","properties":{"objective":{"type":"string"},"search_queries":{"type":"array"},"session_id":{"type":"string"},"user_agent":{"type":"string"}},"required":["objective"]}},
+                            {"name":"web_fetch","inputSchema":{"type":"object","properties":{"urls":{"type":"array"},"objective":{"type":"string"},"session_id":{"type":"string"}},"required":["urls"]}}
+                        ]}})
+                    }
+                    Some("tools/call") => {
+                        calls_seen.fetch_add(1, Ordering::SeqCst);
+                        json!({"jsonrpc":"2.0","id":body["id"],"result":{"content":[],"structuredContent":{"results":[{"url":"https://example.com/prewarmed","title":"Prewarmed","excerpts":["Fast search"]}]},"isError":false}})
+                    }
+                    Some(method) if method.starts_with("notifications/") => {
+                        status = 202;
+                        Value::Null
+                    }
+                    _ => {
+                        status = 405;
+                        Value::Null
+                    }
+                };
+                let content = if response.is_null() {
+                    String::new()
+                } else {
+                    response.to_string()
+                };
+                let wire = format!("HTTP/1.1 {status} Synthetic\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{session_header}Connection: close\r\n\r\n{content}", content.len());
+                let _ = socket.write_all(wire.as_bytes()).await;
+            }
+        });
+        let mut service = WebService::new(McpTransport {
+            endpoints: Some([endpoint.clone(), endpoint]),
+            ..Default::default()
+        });
+        let cancel = Cancellation::default();
+        service
+            .prewarm(Instant::now() + Duration::from_secs(5), &cancel)
+            .await
+            .unwrap();
+        assert_eq!(initialized.load(Ordering::SeqCst), 1);
+        assert_eq!(listed.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // Repeated prewarm within the freshness window is a no-op.
+        service
+            .prewarm(Instant::now() + Duration::from_secs(5), &cancel)
+            .await
+            .unwrap();
+        assert_eq!(initialized.load(Ordering::SeqCst), 1);
+        assert_eq!(listed.load(Ordering::SeqCst), 1);
+
+        // First search call reuses the prewarmed MCP session directly without re-running initialize or tools/list.
+        let result = service
+            .execute(
+                &Operation::Search {
+                    objective: "Synthetic objective".into(),
+                    queries: vec!["Synthetic query".into()],
+                    limit: 3,
+                },
+                "synthetic-conversation",
+                "synthetic-run",
+                Instant::now() + Duration::from_secs(5),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.sources.len(), 1);
+        assert_eq!(initialized.load(Ordering::SeqCst), 1);
+        assert_eq!(listed.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        service.transport.close().await;
         server.abort();
     }
 }

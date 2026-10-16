@@ -494,3 +494,71 @@ async fn run_with_client_events_since<T: WebTransport>(
     }
     Err(RunError::Tool(Failure::Budget))
 }
+
+pub const PREWARM_WEB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
+#[derive(Default)]
+pub struct WebPrewarmGate {
+    inner: std::sync::Mutex<WebPrewarmGateInner>,
+}
+
+#[derive(Default)]
+struct WebPrewarmGateInner {
+    active_prewarm: Option<Cancellation>,
+    waiters: usize,
+}
+
+struct WebWaiterGuard<'a>(&'a std::sync::Mutex<WebPrewarmGateInner>);
+
+impl Drop for WebWaiterGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.0.lock() {
+            inner.waiters = inner.waiters.saturating_sub(1);
+        }
+    }
+}
+
+/// Admits a real search turn to the shared `WebService`, immediately cancelling any
+/// in-flight background `prewarm_web` and blocking new prewarms while waiting.
+pub async fn admit_web<'a, T>(
+    service: &'a tokio::sync::Mutex<T>,
+    gate: &'a WebPrewarmGate,
+    cancellation: &Cancellation,
+    deadline: Instant,
+) -> Result<tokio::sync::MutexGuard<'a, T>, Failure> {
+    let _waiter = {
+        let mut inner = gate.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.waiters += 1;
+        if let Some(active) = inner.active_prewarm.take() {
+            active.cancel();
+        }
+        WebWaiterGuard(&gate.inner)
+    };
+    cancellation.guard(deadline, service.lock()).await
+}
+
+/// Best-effort non-blocking prewarm of a shared `WebService` behind a `tokio::sync::Mutex`.
+/// Uses `try_lock` so prewarming never contends with an active search turn, and registers
+/// with `WebPrewarmGate` so an arriving prompt turn immediately aborts an in-flight prewarm.
+pub async fn prewarm_web<T: WebTransport>(
+    service: &tokio::sync::Mutex<WebService<T>>,
+    gate: &WebPrewarmGate,
+) {
+    let (mut web, cancel) = {
+        let mut inner = gate.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.waiters > 0 {
+            return;
+        }
+        let Ok(web) = service.try_lock() else {
+            return;
+        };
+        let cancel = Cancellation::default();
+        inner.active_prewarm = Some(cancel.clone());
+        (web, cancel)
+    };
+    let deadline = Instant::now() + PREWARM_WEB_TIMEOUT;
+    let _ = web.prewarm(deadline, &cancel).await;
+    if let Ok(mut inner) = gate.inner.lock() {
+        inner.active_prewarm = None;
+    }
+}
