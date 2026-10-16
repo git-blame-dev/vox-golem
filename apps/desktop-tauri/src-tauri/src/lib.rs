@@ -1708,10 +1708,13 @@ fn get_app_snapshot_from_state(
 
 #[tauri::command]
 async fn set_preferences(
+    app: tauri::AppHandle,
     preferences: voxgolem_core::ipc::ValidatedPreferences,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<voxgolem_core::ipc::ValidatedPreferences, voxgolem_core::ipc::CommandError> {
-    set_preferences_from_state(preferences, &app_state).await
+    let result = set_preferences_from_state(preferences, &app_state).await?;
+    spawn_custom_and_web_prewarm(&app);
+    Ok(result)
 }
 
 async fn set_preferences_from_state(
@@ -5863,20 +5866,8 @@ async fn submit_custom_prompt(
             String::from("Custom provider is not configured"),
         );
     };
-    let model = match assistant_request.instant_model {
-        voxgolem_core::assistant::InstantModel::CustomSolHigh => {
-            voxgolem_platform::custom_openai::CustomOpenAiModel::SolHigh
-        }
-        voxgolem_core::assistant::InstantModel::CustomSolNone => {
-            voxgolem_platform::custom_openai::CustomOpenAiModel::SolNone
-        }
-        voxgolem_core::assistant::InstantModel::CustomLunaNone => {
-            voxgolem_platform::custom_openai::CustomOpenAiModel::LunaNone
-        }
-        voxgolem_core::assistant::InstantModel::CustomLunaLow => {
-            voxgolem_platform::custom_openai::CustomOpenAiModel::LunaLow
-        }
-        _ => unreachable!("custom dispatch requires a Custom model"),
+    let Some(model) = custom_openai_model_for_instant(assistant_request.instant_model) else {
+        unreachable!("custom dispatch requires a Custom model");
     };
     let auth_path = match custom_auth_path(app_state, &config) {
         Ok(path) => path,
@@ -5897,7 +5888,10 @@ async fn submit_custom_prompt(
         model,
         ..Default::default()
     };
-    let client = voxgolem_platform::custom_openai::CustomOpenAiClient::new(provider_config.clone());
+    let client = app_state
+        .conversation
+        .search
+        .client_for(provider_config.clone());
     let client = match client {
         Ok(client) => client,
         Err(error) => {
@@ -7315,15 +7309,16 @@ async fn run_agent_text(
                 }
                 _ => unreachable!(),
             };
-            let client = voxgolem_platform::custom_openai::CustomOpenAiClient::new(
-                voxgolem_platform::custom_openai::CustomOpenAiConfig {
+            let client = app_state
+                .conversation
+                .search
+                .client_for(voxgolem_platform::custom_openai::CustomOpenAiConfig {
                     endpoint: config.endpoint.clone(),
                     auth_path: custom_auth_path(app_state, &config)?,
                     model,
                     ..Default::default()
-                },
-            )
-            .map_err(|error| error.to_string())?;
+                })
+                .map_err(|error| error.to_string())?;
             let agent_prompt = voxgolem_platform::custom_openai::CustomOpenAiPrompt {
                 session_id: request_id.to_string(),
                 prompt: prompt.to_string(),
@@ -8905,6 +8900,73 @@ fn prefetch_result_is_current(
         && policy_is_current
 }
 
+fn custom_openai_model_for_instant(
+    model: voxgolem_core::assistant::InstantModel,
+) -> Option<voxgolem_platform::custom_openai::CustomOpenAiModel> {
+    match model {
+        voxgolem_core::assistant::InstantModel::CustomSolHigh => {
+            Some(voxgolem_platform::custom_openai::CustomOpenAiModel::SolHigh)
+        }
+        voxgolem_core::assistant::InstantModel::CustomSolNone => {
+            Some(voxgolem_platform::custom_openai::CustomOpenAiModel::SolNone)
+        }
+        voxgolem_core::assistant::InstantModel::CustomLunaNone => {
+            Some(voxgolem_platform::custom_openai::CustomOpenAiModel::LunaNone)
+        }
+        voxgolem_core::assistant::InstantModel::CustomLunaLow => {
+            Some(voxgolem_platform::custom_openai::CustomOpenAiModel::LunaLow)
+        }
+        voxgolem_core::assistant::InstantModel::LocalFast
+        | voxgolem_core::assistant::InstantModel::LocalQuality
+        | voxgolem_core::assistant::InstantModel::OpenCodeSolHigh
+        | voxgolem_core::assistant::InstantModel::OpenCodeLunaLow => None,
+    }
+}
+
+fn spawn_custom_and_web_prewarm(app: &tauri::AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let app_state = app.state::<AppState>();
+        if app_state.exit_cleanup_started.load(Ordering::Acquire) {
+            return;
+        }
+        let (policy, active) = {
+            let Ok(session) = app_state.conversation_session.lock() else {
+                return;
+            };
+            (session.policy().clone(), session.has_active_execution())
+        };
+        if active {
+            return;
+        }
+        let web_enabled = app_state
+            .network_preferences
+            .lock()
+            .map(|prefs| prefs.web_enabled)
+            .unwrap_or(false)
+            && search_runtime::native_search_eligible(&policy);
+        let custom_config =
+            custom_openai_model_for_instant(policy.instant_model).and_then(|model| {
+                let config = effective_custom_config(&app_state)?;
+                let auth_path = custom_auth_path(&app_state, &config).ok()?;
+                Some(voxgolem_platform::custom_openai::CustomOpenAiConfig {
+                    endpoint: config.endpoint,
+                    auth_path,
+                    model,
+                    ..Default::default()
+                })
+            });
+        if custom_config.is_none() && !web_enabled {
+            return;
+        }
+        app_state
+            .conversation
+            .search
+            .prewarm(custom_config, web_enabled)
+            .await;
+    });
+}
+
 fn queue_assistant_prefetch(
     app: &tauri::AppHandle,
     prompt: String,
@@ -9301,15 +9363,16 @@ async fn run_assistant_prefetch(
             let Some(model) = custom_openai_model_for_instant(key.model) else {
                 unreachable!("custom prefetch requires a Custom model");
             };
-            let client = voxgolem_platform::custom_openai::CustomOpenAiClient::new(
-                voxgolem_platform::custom_openai::CustomOpenAiConfig {
+            let client = app_state
+                .conversation
+                .search
+                .client_for(voxgolem_platform::custom_openai::CustomOpenAiConfig {
                     endpoint: config.endpoint.clone(),
                     auth_path: custom_auth_path(&app_state, &config)?,
                     model,
                     ..Default::default()
-                },
-            )
-            .map_err(|error| error.to_string())?;
+                })
+                .map_err(|error| error.to_string())?;
             let prefetch_prompt = voxgolem_platform::custom_openai::CustomOpenAiPrompt {
                 session_id: format!("prefetch-{generation}"),
                 prompt: key.prompt.clone(),

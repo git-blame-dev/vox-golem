@@ -17,7 +17,9 @@ use voxgolem_platform::web::{McpTransport, WebService};
 pub(super) struct DesktopSearchState {
     mode: Mutex<Mode>,
     nonce: String,
+    transport: Option<CustomOpenAiClient>,
     service: tokio::sync::Mutex<WebService<McpTransport>>,
+    prewarm_gate: voxgolem_platform::search::WebPrewarmGate,
 }
 
 impl Default for DesktopSearchState {
@@ -37,12 +39,22 @@ impl Default for DesktopSearchState {
 impl DesktopSearchState {
     pub(super) async fn shutdown(&self) {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
-        if tokio::time::timeout_at(deadline, async {
-            self.service.lock().await.transport.close().await;
-        })
+        let cancel = Cancellation::default();
+        if let Ok(mut service) = voxgolem_platform::search::admit_web(
+            &self.service,
+            &self.prewarm_gate,
+            &cancel,
+            deadline,
+        )
         .await
-        .is_err()
         {
+            if tokio::time::timeout_at(deadline, service.transport.close())
+                .await
+                .is_err()
+            {
+                eprintln!("native search shutdown exceeded its retirement deadline");
+            }
+        } else {
             eprintln!("native search shutdown exceeded its retirement deadline");
         }
     }
@@ -50,8 +62,36 @@ impl DesktopSearchState {
         Self {
             mode: Mutex::new(Mode::Quick),
             nonce,
+            transport: CustomOpenAiClient::new(CustomOpenAiConfig::default()).ok(),
             service: tokio::sync::Mutex::new(WebService::new(McpTransport::default())),
+            prewarm_gate: voxgolem_platform::search::WebPrewarmGate::default(),
         }
+    }
+
+    pub(super) fn client_for(
+        &self,
+        config: CustomOpenAiConfig,
+    ) -> Result<CustomOpenAiClient, voxgolem_platform::custom_openai::CustomOpenAiError> {
+        match &self.transport {
+            Some(transport) => transport.with_reused_transport(config),
+            None => CustomOpenAiClient::new(config),
+        }
+    }
+
+    pub(super) async fn prewarm(&self, config: Option<CustomOpenAiConfig>, web_enabled: bool) {
+        let client_warm = async {
+            if let Some(config) = config {
+                if let Ok(client) = self.client_for(config) {
+                    let _ = client.prewarm().await;
+                }
+            }
+        };
+        let web_warm = async {
+            if web_enabled {
+                voxgolem_platform::search::prewarm_web(&self.service, &self.prewarm_gate).await;
+            }
+        };
+        tokio::join!(client_warm, web_warm);
     }
 
     pub(super) fn set_mode(&self, mode: Mode) -> Result<(), String> {
@@ -122,10 +162,25 @@ pub(super) async fn run_custom(
     let started = tokio::time::Instant::now();
     let cancel = Cancellation::from_receiver(cancellation.signal.subscribe());
     let deadline = tokio::time::Instant::now() + config.total_timeout;
-    let mut service = cancel
-        .guard(deadline, state.service.lock())
-        .await
-        .map_err(RunError::Tool)?;
+    let mut isolated_service = (!web_enabled).then(|| WebService::new(McpTransport::default()));
+    let mut shared_service = if web_enabled {
+        Some(
+            voxgolem_platform::search::admit_web(
+                &state.service,
+                &state.prewarm_gate,
+                &cancel,
+                deadline,
+            )
+            .await
+            .map_err(RunError::Tool)?,
+        )
+    } else {
+        None
+    };
+    let service = match (shared_service.as_deref_mut(), isolated_service.as_mut()) {
+        (Some(service), _) | (_, Some(service)) => service,
+        _ => unreachable!("either shared or isolated web service is present"),
+    };
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {
         return Err(RunError::Provider(
@@ -149,7 +204,7 @@ pub(super) async fn run_custom(
             explicit_search: mode != Mode::Quick,
             web_enabled,
         },
-        &mut service,
+        service,
         &cancel,
         |event| {
             let events = project_event(event, &mut auth_revision);
