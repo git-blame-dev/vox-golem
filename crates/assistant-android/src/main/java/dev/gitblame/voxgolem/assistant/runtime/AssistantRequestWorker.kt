@@ -33,6 +33,7 @@ class AssistantRequestWorker(
     private val lock = Any()
     private var active: Request? = null
     private var closed = false
+    private var prewarmSequence = 0L
 
     /** Rust checks requestId against the request projection; IDs must not be reused. */
     fun submit(
@@ -44,6 +45,7 @@ class AssistantRequestWorker(
     ): Boolean {
         val request = synchronized(lock) {
             if (closed || active != null) return false
+            ++prewarmSequence
             Request(requestId).also { active = it }
         }
         try {
@@ -118,15 +120,19 @@ class AssistantRequestWorker(
         return true
     }
 
-    fun prewarm(model: String, authPath: () -> String = { "" }) {
-        val canPrewarm = synchronized(lock) { !closed && active == null }
-        if (!canPrewarm) return
+    fun prewarm(model: String, authPath: () -> String = { "" }) = prewarm(model, true, authPath)
+
+    fun prewarm(model: String, webEnabled: Boolean, authPath: () -> String = { "" }) {
+        val sequence = synchronized(lock) {
+            if (closed || active != null) return
+            ++prewarmSequence
+        }
         try {
             executor.execute {
-                val stillIdle = synchronized(lock) { !closed && active == null }
-                if (!stillIdle) return@execute
+                val stillCurrent = synchronized(lock) { !closed && active == null && prewarmSequence == sequence }
+                if (!stillCurrent) return@execute
                 try {
-                    native.prewarm(model, authPath())
+                    native.prewarm(model, authPath(), webEnabled)
                 } catch (_: RuntimeException) {}
             }
         } catch (_: RuntimeException) {}

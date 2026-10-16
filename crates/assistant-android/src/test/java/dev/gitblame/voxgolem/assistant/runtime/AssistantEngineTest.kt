@@ -32,6 +32,7 @@ class AssistantEngineTest {
         val requests = mutableListOf<JSONObject>()
         val cancelled = mutableListOf<String>()
         val prewarmed = mutableListOf<Pair<String, String>>()
+        val prewarmedWeb = mutableListOf<Triple<String, String, Boolean>>()
         var deferRetirement = false
         lateinit var retired: () -> Unit
         var body: (ProviderDeltaCallback) -> String = { callback ->
@@ -40,6 +41,10 @@ class AssistantEngineTest {
         }
         override fun prewarm(model: String, authPath: String) {
             prewarmed += model to authPath
+        }
+        override fun prewarm(model: String, authPath: String, webEnabled: Boolean) {
+            prewarmed += model to authPath
+            prewarmedWeb += Triple(model, authPath, webEnabled)
         }
         override fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String {
             requests += JSONObject(requestJson)
@@ -1622,5 +1627,21 @@ class AssistantEngineTest {
         } finally {
             subscription.close()
         }
+    }
+
+    @Test fun modelAndWebEnablementPrewarmWithUpdatedPolicyState() {
+        engine.setWebEnabled(false); io.drain(); providerQueue.drain()
+        provider.prewarmedWeb.clear()
+        engine.setWebEnabled(true); io.drain(); providerQueue.drain()
+        assertEquals(
+            listOf(Triple("custom-sol-high", "/synthetic/private/codex-auth.json", true)),
+            provider.prewarmedWeb,
+        )
+        provider.prewarmedWeb.clear()
+        engine.selectModel("custom-luna-low"); io.drain(); providerQueue.drain()
+        assertEquals(
+            listOf(Triple("custom-luna-low", "/synthetic/private/codex-auth.json", true)),
+            provider.prewarmedWeb,
+        )
     }
 }

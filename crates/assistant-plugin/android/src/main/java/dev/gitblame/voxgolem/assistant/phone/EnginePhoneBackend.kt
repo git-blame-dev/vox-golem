@@ -47,6 +47,7 @@ class EnginePhoneBackend internal constructor(
         engine.setSpeechDraft(text, conversation, expectedHead = head, requireHeadOwner = true)
     }
     fun stopSpeechRequest(requestId: String) { cancelDelivery(requestId) }
+    fun prewarm() { runCatching { engine.prewarm() } }
 
     override fun command(name: String, arguments: JSONObject, reply: (Result<Any?>) -> Unit) {
         if (name == "cancel_prompt") {
@@ -81,7 +82,14 @@ class EnginePhoneBackend internal constructor(
                 }
                 "select_conversation" -> engine.selectConversation(PhoneIdentity.native(arguments.getString("conversationId")), ::settled)
                 "select_conversation_head" -> engine.selectHead(PhoneIdentity.native(arguments.getString("headId")), ::settled)
-                "save_assistant_draft" -> engine.setDraft(arguments.getString("text")) { state -> reply(runCatching { requireSettled(state); null }) }
+                "save_assistant_draft" -> {
+                    val text = arguments.getString("text")
+                    val wasBlank = engine.snapshot().draft.isBlank()
+                    engine.setDraft(text) { state ->
+                        if (wasBlank && text.isNotBlank() && state.error == null) runCatching { engine.prewarm() }
+                        reply(runCatching { requireSettled(state); null })
+                    }
+                }
                 "set_preferences" -> updatePreferences(arguments.getJSONObject("preferences"), reply)
                 "set_search_mode" -> engine.selectSearchMode(arguments.getString("mode")) { state ->
                     reply(runCatching { requireSettled(state); JSONObject().put("mode", state.searchMode) })
@@ -202,10 +210,13 @@ class EnginePhoneBackend internal constructor(
         }
         val selectedModel = value.getString("instant")
         var previousModel: String? = null
+        var previousWebEnabled = false
         engine.updatePreferences(selectedModel, dev.gitblame.voxgolem.assistant.runtime.AssistantPolicy(
             value.getBoolean("web_enabled"), value.getBoolean("speech_network_fallback"), value.getString("speech_language"),
             value.getString("speech_tts_provider"), value.getString("speech_tts_voice")), {
-            previousModel = engine.snapshot().model
+            val before = engine.snapshot()
+            previousModel = before.model
+            previousWebEnabled = before.webEnabled
             preferences.write(value)
         }) { selected ->
             preferencesPending.set(false)
@@ -213,6 +224,8 @@ class EnginePhoneBackend internal constructor(
             else {
                 if (previousModel != null && selected.model == selectedModel && selected.model != previousModel) {
                     runCatching { prewarm(selected.model) }
+                } else if (!previousWebEnabled && selected.webEnabled && selected.foreground) {
+                    runCatching { engine.prewarm() }
                 }
                 // A view listener failure must not misclassify already persisted settings.
                 runCatching { onPreferencesChanged?.invoke(value.getBoolean("tts_enabled")) }
@@ -301,7 +314,11 @@ class EnginePhoneBackend internal constructor(
     }
 
     override fun foreground(visible: Boolean) {
-        if (visible) { engine.resume(); AssistantReplication.reconcileNow(context) } else {
+        if (visible) {
+            engine.resume()
+            runCatching { engine.prewarm() }
+            AssistantReplication.reconcileNow(context)
+        } else {
             delivery.get()?.cancel()
             engine.background()
         }

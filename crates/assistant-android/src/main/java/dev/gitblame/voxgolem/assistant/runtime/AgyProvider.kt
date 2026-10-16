@@ -27,7 +27,9 @@ class AgyProviderRouter(
 ) : ProviderNativeCalls {
     private class Route(val provider: ProviderNativeCalls)
     private val requests = ConcurrentHashMap<String, Route>()
+    @Volatile private var selectedModel: String? = null
     fun prewarm(model: String) {
+        selectedModel = model
         if (phoneRelay != null) return
         if (model == GeminiNanoProvider.MODEL_NAME) (geminiNanoNative as? GeminiNanoProvider)?.prewarm()
         val eligible = isAgyModel(model)
@@ -36,8 +38,17 @@ class AgyProviderRouter(
     }
 
     override fun prewarm(model: String, authPath: String) {
+        prewarm(model, authPath, true)
+    }
+
+    override fun prewarm(model: String, authPath: String, webEnabled: Boolean) {
+        if (phoneRelay != null) return
+        val current = selectedModel
+        if (current != null && current != model) return
         prewarm(model)
-        if (!isAgyModel(model)) defaultNative.prewarm(model, authPath)
+        if (!isAgyModel(model)) {
+            defaultNative.prewarm(model, authPath, webEnabled)
+        }
     }
 
     override fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String {
@@ -107,8 +118,14 @@ class AgyProviderNative internal constructor(private val context: Context,
     private var retirementOwner: String? = null
     private val cancelled = AtomicBoolean(false)
     private var prewarmGeneration = 0L
+    private var prewarmTargetModel: String? = null
+    private var prewarmInFlight = false
 
-    private fun advancePrewarmSelection(): Long = synchronized(lock) { ++prewarmGeneration }
+    private fun advancePrewarmSelection(): Long = synchronized(lock) {
+        prewarmTargetModel = null
+        prewarmInFlight = false
+        ++prewarmGeneration
+    }
 
     private fun preparePrivateEnvironment(): Boolean {
         val provisioned = AgyPrivateEnvironment.prepare(context)
@@ -204,19 +221,42 @@ class AgyProviderNative internal constructor(private val context: Context,
     }
 
     fun prewarm(requestedModel: String, eligible: Boolean) {
-        val generation = advancePrewarmSelection()
-        if (!eligible) return
+        if (!eligible) {
+            advancePrewarmSelection()
+            return
+        }
+        val targetAgyModel = resolveTargetModel(requestedModel)
+        val effort = if (targetAgyModel.endsWith("-low")) "low" else "high"
+        val generation = synchronized(lock) {
+            if (activeRequestId != null || !ioRetired) return
+            if (prewarmTargetModel == targetAgyModel &&
+                (prewarmInFlight || (!processUsed && activeModel == targetAgyModel && agyAlive(process)))) {
+                return
+            }
+            prewarmTargetModel = targetAgyModel
+            prewarmInFlight = true
+            ++prewarmGeneration
+        }
         try {
             io.execute {
-                if (synchronized(lock) { generation != prewarmGeneration || activeRequestId != null }) return@execute
-                val executable = getExecutable() ?: return@execute
-                val targetAgyModel = resolveTargetModel(requestedModel)
-                val effort = if (targetAgyModel.endsWith("-low")) "low" else "high"
-                if (acquirePrewarmProcess(executable, targetAgyModel, effort, generation)) {
-                    Log.i(TAG, "Prewarm acquired local engine process; readiness not verified")
-                } else Log.i(TAG, "Prewarm was not acquired; readiness not verified")
+                try {
+                    if (synchronized(lock) { generation != prewarmGeneration || activeRequestId != null }) return@execute
+                    val executable = getExecutable() ?: return@execute
+                    if (acquirePrewarmProcess(executable, targetAgyModel, effort, generation)) {
+                        Log.i(TAG, "Prewarm acquired local engine process; readiness not verified")
+                    } else Log.i(TAG, "Prewarm was not acquired; readiness not verified")
+                } finally {
+                    synchronized(lock) {
+                        if (generation == prewarmGeneration) prewarmInFlight = false
+                    }
+                }
             }
-        } catch (_: RuntimeException) { Log.w(TAG, "Prewarm was not admitted") }
+        } catch (_: RuntimeException) {
+            synchronized(lock) {
+                if (generation == prewarmGeneration) prewarmInFlight = false
+            }
+            Log.w(TAG, "Prewarm was not admitted")
+        }
     }
 
     override fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String {

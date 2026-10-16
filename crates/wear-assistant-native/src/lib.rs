@@ -725,6 +725,52 @@ pub extern "system" fn Java_dev_gitblame_voxgolem_android_wear_assistant_WearAss
     prepare_search_jni(env, receiver, request_json, callback)
 }
 
+fn prewarm_model_config(model: &str, auth_path: &str) -> Option<CustomOpenAiConfig> {
+    if !valid_auth_path(auth_path) {
+        return None;
+    }
+    let model = match model {
+        "custom-sol-high" => CustomOpenAiModel::SolHigh,
+        "custom-sol-none" => CustomOpenAiModel::SolNone,
+        "custom-luna-none" => CustomOpenAiModel::LunaNone,
+        "custom-luna-low" => CustomOpenAiModel::LunaLow,
+        _ => return None,
+    };
+    Some(CustomOpenAiConfig {
+        endpoint: "https://chatgpt.com/backend-api/codex/responses".to_string(),
+        auth_path: auth_path.into(),
+        model,
+        ..Default::default()
+    })
+}
+
+pub(crate) fn prewarm(model: &str, auth_path: &str, web_enabled: bool) {
+    let config = prewarm_model_config(model, auth_path);
+    if config.is_none() && !web_enabled {
+        return;
+    }
+    search::prewarm(config, web_enabled);
+}
+
+#[allow(unsafe_code)]
+#[no_mangle]
+pub extern "system" fn Java_dev_gitblame_voxgolem_assistant_runtime_AssistantProviderNative_nativePrewarm(
+    mut env: JNIEnv<'_>,
+    _receiver: JObject<'_>,
+    model: JString<'_>,
+    auth_path: JString<'_>,
+    web_enabled: jni::sys::jboolean,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let Ok(model) = read_string(&mut env, &model, 128) else {
+            return;
+        };
+        let auth_path = read_string(&mut env, &auth_path, 4096).unwrap_or_default();
+        prewarm(&model, &auth_path, web_enabled != jni::sys::JNI_FALSE);
+    }));
+    clear_exception(&env);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2018,5 +2064,28 @@ mod tests {
             invalid.json(),
             r#"{"evidenceContext":null,"sourceFooter":"","sources":[]}"#
         );
+    }
+
+    #[test]
+    fn prewarm_model_config_accepts_only_custom_models_and_valid_auth_paths() {
+        for (model, expected) in [
+            ("custom-sol-high", CustomOpenAiModel::SolHigh),
+            ("custom-sol-none", CustomOpenAiModel::SolNone),
+            ("custom-luna-none", CustomOpenAiModel::LunaNone),
+            ("custom-luna-low", CustomOpenAiModel::LunaLow),
+        ] {
+            let config = prewarm_model_config(model, "/synthetic/private/auth.json").unwrap();
+            assert_eq!(config.model, expected);
+            assert_eq!(
+                config.endpoint,
+                "https://chatgpt.com/backend-api/codex/responses"
+            );
+        }
+        for rejected_model in ["local-fast", "gemini-nano", "agy-flash-high", "unknown"] {
+            assert!(prewarm_model_config(rejected_model, "/synthetic/private/auth.json").is_none());
+        }
+        for rejected_path in ["", "relative/auth.json", "/synthetic/../auth.json"] {
+            assert!(prewarm_model_config("custom-luna-low", rejected_path).is_none());
+        }
     }
 }

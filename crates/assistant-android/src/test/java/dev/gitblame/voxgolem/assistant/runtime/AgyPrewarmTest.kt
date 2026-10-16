@@ -63,13 +63,19 @@ class AgyPrewarmTest {
     @Test fun nonAgySelectionInvalidatesDelayedAgyAcquisitionEvenForSameLiveModel() {
         val provider = AgyProviderNative(context())
         val delayedA = provider.acceptSelection()
+        val forwarded = mutableListOf<Triple<String, String, Boolean>>()
         // The router must forward non-AGY selections to invalidate pending work too.
         val defaultNative = object : ProviderNativeCalls {
             override fun respond(requestId: String, authPath: String, requestJson: String,
                 callback: ProviderDeltaCallback) = error("No response expected")
             override fun cancel(requestId: String) {}
+            override fun prewarm(model: String, authPath: String, webEnabled: Boolean) {
+                forwarded += Triple(model, authPath, webEnabled)
+            }
         }
-        AgyProviderRouter(RuntimeEnvironment.getApplication(), defaultNative, provider).prewarm("custom-sol-high")
+        AgyProviderRouter(RuntimeEnvironment.getApplication(), defaultNative, provider)
+            .prewarm("custom-sol-high", "/synthetic/private/codex-auth.json", true)
+        assertEquals(listOf(Triple("custom-sol-high", "/synthetic/private/codex-auth.json", true)), forwarded)
         val process = LiveProcess()
         provider.set("process", process)
         provider.set("activeModel", "gemini-3.8-flash-high")
@@ -151,5 +157,57 @@ class AgyPrewarmTest {
         provider.cancel("synthetic-completed")
         assertTrue(provider.acquire("gemini-3.8-flash-high"))
         assertFalse(process.destroyed)
+    }
+
+    @Test fun repeatedSameModelPrewarmCoalescesAndSkipsDefaultNative() {
+        val started = mutableListOf<LiveProcess>()
+        val defaultForwarded = mutableListOf<Triple<String, String, Boolean>>()
+        val defaultNative = object : ProviderNativeCalls {
+            override fun respond(requestId: String, authPath: String, requestJson: String,
+                callback: ProviderDeltaCallback) = error("No response expected")
+            override fun cancel(requestId: String) {}
+            override fun prewarm(model: String, authPath: String, webEnabled: Boolean) {
+                defaultForwarded += Triple(model, authPath, webEnabled)
+            }
+        }
+        val executable = folder.newFile("libagy.so").apply { setExecutable(true) }
+        AgyProviderNative(context(), { executable }, { _, _, _ -> LiveProcess().also(started::add) }).use { provider ->
+            val router = AgyProviderRouter(RuntimeEnvironment.getApplication(), defaultNative, provider)
+            repeat(6) {
+                router.prewarm("agy-sonnet-high")
+                router.prewarm("agy-sonnet-high", "/synthetic/private/codex-auth.json", true)
+            }
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+            while (started.isEmpty() && System.nanoTime() < deadline) {
+                Thread.sleep(10)
+            }
+            assertEquals(1, started.size)
+            assertFalse(started.single().destroyed)
+            assertSame(started.single(), provider.get("process"))
+            assertTrue(defaultForwarded.isEmpty())
+        }
+    }
+
+    @Test fun staleAgyWorkerPrewarmDoesNotReEnableAfterCustomModelSelection() {
+        val started = mutableListOf<LiveProcess>()
+        val defaultForwarded = mutableListOf<Triple<String, String, Boolean>>()
+        val defaultNative = object : ProviderNativeCalls {
+            override fun respond(requestId: String, authPath: String, requestJson: String,
+                callback: ProviderDeltaCallback) = error("No response expected")
+            override fun cancel(requestId: String) {}
+            override fun prewarm(model: String, authPath: String, webEnabled: Boolean) {
+                defaultForwarded += Triple(model, authPath, webEnabled)
+            }
+        }
+        val executable = folder.newFile("libagy-stale.so").apply { setExecutable(true) }
+        AgyProviderNative(context(), { executable }, { _, _, _ -> LiveProcess().also(started::add) }).use { provider ->
+            val router = AgyProviderRouter(RuntimeEnvironment.getApplication(), defaultNative, provider)
+            router.prewarm("custom-sol-high")
+            router.prewarm("agy-sonnet-high", "/synthetic/private/codex-auth.json", true)
+            Thread.sleep(50)
+            assertTrue(started.isEmpty())
+            assertNull(provider.get("process"))
+            assertTrue(defaultForwarded.isEmpty())
+        }
     }
 }

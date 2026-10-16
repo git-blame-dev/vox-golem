@@ -23,6 +23,15 @@ object AssistantRuntime {
     internal fun publishOptionalProviderReadiness(context: Context) { optionalReadiness = AndroidProviderReadiness.inspect(context) }
 
     fun prewarm(model: String) {
+        val currentEngine = engine
+        if (currentEngine != null) {
+            currentEngine.prewarmSelected(model)
+        } else {
+            agyRouter?.prewarm(model)
+        }
+    }
+
+    internal fun prewarmRouter(model: String) {
         agyRouter?.prewarm(model)
     }
 
@@ -133,10 +142,17 @@ object AssistantRuntime {
         }
         val router = router(application)
         val initialModel = modelStorage.read()
-        router.prewarm(initialModel)
+        val policyStorage = NativeAssistantPolicyStorage(application)
+        val initialPolicy = policyStorage.read()
+        val worker = AssistantRequestWorker(provider, router)
+        if (initialModel in AssistantModels.aliases) {
+            worker.prewarm(initialModel, initialPolicy.webEnabled) { credentials.selection().path }
+        } else {
+            router.prewarm(initialModel)
+        }
 
-        return AssistantEngine(AssistantStore(application), io, AssistantRequestWorker(provider, router),
-            credentials::pathForProvider, modelStorage, credentials, NativeAssistantPolicyStorage(application),
+        return AssistantEngine(AssistantStore(application), io, worker,
+            credentials::pathForProvider, modelStorage, credentials, policyStorage,
             beginTiming = { AssistantTiming.begin(application, it) }, startupTiming = startupTiming,
             preparePhoneContext = preparePhoneContext).also {
                 engine = it

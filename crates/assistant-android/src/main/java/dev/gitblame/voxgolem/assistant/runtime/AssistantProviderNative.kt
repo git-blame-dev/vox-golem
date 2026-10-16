@@ -12,6 +12,7 @@ interface ProviderDeltaCallback {
 
 interface ProviderNativeCalls {
     fun prewarm(model: String, authPath: String = "") {}
+    fun prewarm(model: String, authPath: String, webEnabled: Boolean) { prewarm(model, authPath) }
     fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String
     fun cancel(requestId: String)
     fun prepareSearch(requestJson: String, callback: ProviderDeltaCallback): String =
@@ -23,10 +24,17 @@ interface ProviderNativeCalls {
 object AssistantProviderNative : ProviderNativeCalls {
     init { System.loadLibrary("wear_assistant_native") }
     override fun prewarm(model: String, authPath: String) {
-        if (authPath.isNotEmpty() && !model.startsWith("agy-") && model != "local-fast") {
+        prewarm(model, authPath, true)
+    }
+    override fun prewarm(model: String, authPath: String, webEnabled: Boolean) {
+        if (authPath.isNotEmpty() && !model.startsWith("agy-") && model != "local-fast" && model != GeminiNanoProvider.MODEL_NAME) {
             runCatching { observeAuth(authPath) }
         }
+        if (model != "local-fast" && !model.startsWith("agy-")) {
+            runCatching { nativePrewarm(model, authPath, webEnabled) }
+        }
     }
+    external fun nativePrewarm(model: String, authPath: String, webEnabled: Boolean)
     external fun observeAuth(authPath: String): String
     external fun chatGptAuth(authPath: String, action: String): String
     /** Access-only envelope, literal null for signed out, or {error:...}; never JS-facing. */

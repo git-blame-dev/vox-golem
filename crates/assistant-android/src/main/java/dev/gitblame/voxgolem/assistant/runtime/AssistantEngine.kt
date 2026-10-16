@@ -225,10 +225,20 @@ class AssistantEngine @JvmOverloads internal constructor(
     }
     override fun prewarm() {
         val current = snapshot()
-        if (current.busy || !current.foreground) return
-        AssistantRuntime.prewarm(current.model)
-        worker.prewarm(current.model) { credentials?.selection()?.path ?: authPath() }
+        if (current.busy || !current.foreground || current.model !in AssistantModels.aliases) return
+        prewarmSelected(current.model, current.webEnabled, current.busy)
     }
+
+    internal fun prewarmSelected(
+        model: String,
+        webEnabled: Boolean = snapshot().webEnabled,
+        busy: Boolean = snapshot().busy,
+    ) {
+        AssistantRuntime.prewarmRouter(model)
+        if (busy || model !in AssistantModels.aliases) return
+        worker.prewarm(model, webEnabled) { credentials?.selection()?.path ?: authPath() }
+    }
+
     override fun refresh() = dispatch { refreshProjection() }
     fun refresh(onSettled: (AssistantState) -> Unit) = dispatch(onSettled) { refreshProjection() }
 
@@ -299,8 +309,12 @@ class AssistantEngine @JvmOverloads internal constructor(
     private fun updateModel(model: String) {
         if (!idle()) return
         if (model !in AssistantModels.aliases) { state = state.copy(error = "unsupported_model"); return }
+        val previousModel = state.model
         models.write(model)
         state = state.copy(model = model, error = null)
+        if (model != previousModel) {
+            prewarmSelected(state.model, state.webEnabled, state.busy)
+        }
     }
 
     override fun selectSearchMode(mode: String) = dispatch { updateSearchMode(mode) }
@@ -325,9 +339,13 @@ class AssistantEngine @JvmOverloads internal constructor(
     fun updatePolicy(policy: AssistantPolicy, onSettled: (AssistantState) -> Unit) = dispatch(onSettled) { updatePolicy(policy) }
     private fun updatePolicy(policy: AssistantPolicy) {
         if (policy.selection() != currentPolicy().selection()) state.speechOptions.validate(policy.selection(), policy.speechNetworkFallback)
+        val previousWebEnabled = state.webEnabled
         policies.write(policy)
         state = state.copy(webEnabled = policy.webEnabled, speechNetworkFallback = policy.speechNetworkFallback,
             speechLanguage = policy.speechLanguage, speechTtsProvider = policy.speechTtsProvider, speechTtsVoice = policy.speechTtsVoice, error = null)
+        if (!previousWebEnabled && policy.webEnabled) {
+            prewarmSelected(state.model, state.webEnabled, state.busy)
+        }
     }
     fun updatePreferences(model: String, policy: AssistantPolicy, persist: () -> Unit, onSettled: (AssistantState) -> Unit) = dispatch(onSettled) {
         if (!idle()) return@dispatch

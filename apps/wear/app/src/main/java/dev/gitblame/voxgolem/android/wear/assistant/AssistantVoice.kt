@@ -294,6 +294,7 @@ internal class WearAssistantVoice(
         mode = false; entryMode = null; loop.stop()
         val owner = engine.snapshot()
         draftConversation = owner.conversation; draftHead = owner.selectedHead
+        generation.prewarm()
         draftUtterance = dictation.start(language, draft)
     }
     override fun conversation(draft: String) {

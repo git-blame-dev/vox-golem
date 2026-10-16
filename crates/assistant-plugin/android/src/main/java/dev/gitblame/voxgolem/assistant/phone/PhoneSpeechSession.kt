@@ -44,6 +44,7 @@ internal interface PhoneSpeechBackend {
     }
     fun publishSpeechOptions(options: SpeechOptions) {}
     fun stopSpeechRequest(requestId: String)
+    fun prewarm() {}
     fun nativePreferences(): JSONObject
     var speechStatus: JSONObject?
     var onPreferencesChanged: ((Boolean) -> Unit)?
@@ -71,6 +72,7 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
         override fun saveOwnedSpeechDraft(text: String, conversation: String?, head: String?) = backend.saveOwnedSpeechDraft(text, conversation, head)
         override fun publishSpeechOptions(options: SpeechOptions) = backend.publishSpeechOptions(options)
         override fun stopSpeechRequest(requestId: String) = backend.stopSpeechRequest(requestId)
+        override fun prewarm() = backend.prewarm()
         override fun nativePreferences() = backend.nativePreferences()
         override var speechStatus: JSONObject?
             get() = backend.speechStatus
@@ -120,6 +122,7 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
     private var inputAudio: RecordedAudioResult? = null
     private val loop = ConversationLoopController(dictation, output, object : EnginePort {
         override fun beginInput() { val owner = backend.speechOwner(); draftConversation = owner.conversation; draftHead = owner.selectedHead }
+        override fun prewarm() = backend.prewarm()
         override fun setDraft(text: String) = backend.saveOwnedSpeechDraft(text, draftConversation, draftHead)
         override fun setRecordedAudio(audio: RecordedAudioResult?) { inputAudio = audio }
         override fun sendFinal(text: String, onTerminal: (GenerationResult) -> Unit) {
@@ -280,9 +283,11 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
         sessionId = id; sink = events; mode = if (legacyShortcut) "shortcut" else if (singleTurn) "ask" else if (repeat) "loop" else "dictation"
         shortcutToken = shortcutLaunch
         if (legacyShortcut) {
+            backend.prewarm()
             shortcut = StopSendNewPolicy(); shortcutToken = shortcutLaunch; shortcutPrepared = false; shortcutReady = false; shortcutPhase = "listening"
             shortcutUtterance = dictation.start(language, "", purpose = VoiceCapturePurpose.ASK)
         } else if (singleTurn || repeat) loop.start(language, draft, if (singleTurn) VoiceSessionPolicy.SINGLE_TURN else VoiceSessionPolicy.REPEAT_AFTER_REPLY) else {
+            backend.prewarm()
             draftConversation = owner.conversation; draftHead = owner.selectedHead
             draftUtterance = dictation.start(language, draft)
         }

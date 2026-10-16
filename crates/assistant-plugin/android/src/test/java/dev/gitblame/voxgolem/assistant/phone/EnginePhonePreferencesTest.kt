@@ -35,6 +35,7 @@ class EnginePhonePreferencesTest {
         private val store = AssistantStore(context, gateway)
         var rejectModelWrite = false
         val prewarmed = mutableListOf<String>()
+        val workerPrewarmed = mutableListOf<Triple<String, String, Boolean>>()
         var prewarmFails = false
         private val models = object : AssistantModelStorage {
             private var value = "custom-sol-high"
@@ -51,6 +52,9 @@ class EnginePhonePreferencesTest {
             override fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String =
                 error("Preference updates must not submit a provider request")
             override fun cancel(requestId: String) {}
+            override fun prewarm(model: String, authPath: String, webEnabled: Boolean) {
+                workerPrewarmed += Triple(model, authPath, webEnabled)
+            }
         })
         private val authPath: () -> String = { "/synthetic/private/provider.json" }
         // The shared actor's constructor is Kotlin-internal to its module; use its JVM constructor without changing that boundary.
@@ -270,6 +274,34 @@ class EnginePhonePreferencesTest {
                 assertTrue(f.duplicatePolicyKeys().isEmpty())
                 assertTrue(f.persisted().getBoolean("tts_enabled")); assertFalse(f.backend.busy())
             }
+        }
+    }
+
+    @Test fun foregroundResumeBlankDraftTransitionAndWebEnableTriggerEnginePrewarm() {
+        Fixture(false).use { f ->
+            f.update(f.backend.nativePreferences().put("web_enabled", false)).getOrThrow()
+            f.workerPrewarmed.clear()
+
+            f.backend.foreground(true)
+            f.drain()
+            assertEquals(listOf(Triple("custom-sol-high", "/synthetic/private/provider.json", false)), f.workerPrewarmed)
+
+            f.workerPrewarmed.clear()
+            var draftReply: Result<Any?>? = null
+            f.backend.command("save_assistant_draft", JSONObject().put("text", "H")) { draftReply = it }
+            f.drain()
+            draftReply!!.getOrThrow()
+            assertEquals(listOf(Triple("custom-sol-high", "/synthetic/private/provider.json", false)), f.workerPrewarmed)
+
+            f.workerPrewarmed.clear()
+            f.backend.command("save_assistant_draft", JSONObject().put("text", "Hello")) { draftReply = it }
+            f.drain()
+            draftReply!!.getOrThrow()
+            assertTrue(f.workerPrewarmed.isEmpty())
+
+            f.update(f.backend.nativePreferences().put("web_enabled", true)).getOrThrow()
+            f.drain()
+            assertEquals(listOf(Triple("custom-sol-high", "/synthetic/private/provider.json", true)), f.workerPrewarmed)
         }
     }
 }

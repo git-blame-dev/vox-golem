@@ -118,7 +118,10 @@ open class AssistantActivity : ComponentActivity() {
 
     private fun startBackgroundSync() {
         if (SyntheticAskBenchmark.active(client)) return
-        if (client is AssistantEngine) AssistantReplication.reconcileNow(applicationContext)
+        if (client is AssistantEngine) {
+            (client as AssistantEngine).prewarm()
+            AssistantReplication.reconcileNow(applicationContext)
+        }
         handler.removeCallbacks(updateLink)
         updateLink.run()
     }
@@ -346,6 +349,7 @@ open class AssistantActivity : ComponentActivity() {
         }?.draft ?: client.snapshot().draft
         pendingVoiceLaunch = null; permissionAction = null
         voice.stop()
+        if (!SyntheticAskBenchmark.active(client)) (client as? AssistantEngine)?.prewarm()
         editor.launch(Intent(this, AssistantTextEntryActivity::class.java).putExtra(AssistantTextInput.DRAFT, prefill))
     }
 

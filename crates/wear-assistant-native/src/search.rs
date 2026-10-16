@@ -5,7 +5,9 @@ use crate::{
 use serde::Serialize;
 use std::cell::Cell;
 use std::sync::OnceLock;
-use tokio::sync::{watch, Mutex, MutexGuard};
+#[cfg(test)]
+use tokio::sync::MutexGuard;
+use tokio::sync::{watch, Mutex};
 use tokio::time::Instant;
 use voxgolem_core::search::{has_readable_text, truncate_utf8, Failure, Mode, Source};
 use voxgolem_platform::custom_openai::{
@@ -439,7 +441,14 @@ pub(crate) async fn prepare(
 ) -> (SearchPreparation, SearchPreparationStatus) {
     let cancellation = Cancellation::from_receiver(cancelled);
     let deadline = Instant::now() + request.mode.policy().tool_time;
-    let mut web = match admit(&process.web, &cancellation, deadline).await {
+    let mut web = match voxgolem_platform::search::admit_web(
+        &process.web,
+        &process.prewarm_gate,
+        &cancellation,
+        deadline,
+    )
+    .await
+    {
         Ok(service) => service,
         Err(Failure::Cancelled) => {
             return (
@@ -464,6 +473,7 @@ pub(crate) struct ProcessProvider {
     pub runtime: tokio::runtime::Runtime,
     transport: CustomOpenAiClient,
     web: Mutex<WebService<McpTransport>>,
+    prewarm_gate: voxgolem_platform::search::WebPrewarmGate,
 }
 
 impl ProcessProvider {
@@ -478,6 +488,7 @@ impl ProcessProvider {
             runtime,
             transport,
             web: Mutex::new(WebService::new(McpTransport::default())),
+            prewarm_gate: voxgolem_platform::search::WebPrewarmGate::default(),
         })
     }
 
@@ -517,12 +528,22 @@ pub(crate) fn process() -> Result<&'static ProcessProvider, ErrorCode> {
     Ok(PROCESS.get_or_init(|| process))
 }
 
-async fn admit<'a, T>(
-    service: &'a Mutex<T>,
-    cancellation: &Cancellation,
-    deadline: Instant,
-) -> Result<MutexGuard<'a, T>, Failure> {
-    cancellation.guard(deadline, service.lock()).await
+pub(crate) fn prewarm(config: Option<CustomOpenAiConfig>, web_enabled: bool) {
+    let Ok(process) = process() else {
+        return;
+    };
+    if let Some(config) = config {
+        if let Ok(client) = process.client(config) {
+            process.runtime.spawn(async move {
+                let _ = client.prewarm().await;
+            });
+        }
+    }
+    if web_enabled {
+        process.runtime.spawn(async move {
+            voxgolem_platform::search::prewarm_web(&process.web, &process.prewarm_gate).await;
+        });
+    }
 }
 
 fn count_status(sources: &[voxgolem_core::search::Source]) -> Option<String> {
@@ -563,7 +584,14 @@ pub(crate) async fn respond(
     let deadline = Instant::now() + config.total_timeout;
     let mut isolated_web = (!request.web_enabled).then(|| WebService::new(McpTransport::default()));
     let mut shared_web = if request.web_enabled {
-        match admit(&process.web, &cancellation, deadline).await {
+        match voxgolem_platform::search::admit_web(
+            &process.web,
+            &process.prewarm_gate,
+            &cancellation,
+            deadline,
+        )
+        .await
+        {
             Ok(service) => Some(service),
             Err(Failure::Cancelled) => return Outcome::Cancelled,
             Err(_) => return Outcome::error(ErrorCode::Timeout),
@@ -721,6 +749,7 @@ mod tests {
     fn waiting_for_shared_service_is_cancelled_without_admission() {
         process().unwrap().runtime.block_on(async {
             let service = Mutex::new(());
+            let gate = voxgolem_platform::search::WebPrewarmGate::default();
             let _owner = service.lock().await;
             let (tx, rx) = watch::channel(false);
             let cancellation = Cancellation::from_receiver(rx);
@@ -729,8 +758,9 @@ mod tests {
                 tx.send(true).unwrap();
             };
             let (result, ()) = tokio::join!(
-                admit(
+                voxgolem_platform::search::admit_web(
                     &service,
+                    &gate,
                     &cancellation,
                     Instant::now() + std::time::Duration::from_secs(1)
                 ),
@@ -741,12 +771,76 @@ mod tests {
     }
 
     #[test]
+    fn in_flight_web_prewarm_is_immediately_preempted_by_admit_web() {
+        struct SlowPrewarmTransport;
+        impl WebTransport for SlowPrewarmTransport {
+            async fn prewarm(
+                &mut self,
+                _provider: Provider,
+                deadline: Instant,
+                cancel: &Cancellation,
+            ) -> Result<(), ProviderFailure> {
+                cancel
+                    .guard(
+                        deadline,
+                        tokio::time::sleep(std::time::Duration::from_secs(10)),
+                    )
+                    .await
+                    .map_err(ProviderFailure::from)
+            }
+            async fn call(
+                &mut self,
+                _provider: Provider,
+                _operation: &Operation,
+                _conversation_id: &str,
+                _deadline: Instant,
+                _cancel: &Cancellation,
+            ) -> Result<Value, ProviderFailure> {
+                Ok(json!({}))
+            }
+        }
+
+        process().unwrap().runtime.block_on(async {
+            let service = Mutex::new(WebService::new(SlowPrewarmTransport));
+            let gate = voxgolem_platform::search::WebPrewarmGate::default();
+            let started = Instant::now();
+            let prewarm_task = async {
+                voxgolem_platform::search::prewarm_web(&service, &gate).await;
+            };
+            let admit_task = async {
+                tokio::task::yield_now().await;
+                let cancel = Cancellation::default();
+                let guard = voxgolem_platform::search::admit_web(
+                    &service,
+                    &gate,
+                    &cancel,
+                    Instant::now() + std::time::Duration::from_secs(1),
+                )
+                .await;
+                assert!(guard.is_ok());
+            };
+            tokio::join!(prewarm_task, admit_task);
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(200),
+                "admit_web must immediately preempt in-flight prewarm without waiting for timeout"
+            );
+        });
+    }
+
+    #[test]
     fn runtime_and_service_share_one_process_lifetime_and_admission_deadline() {
         assert!(std::ptr::eq(process().unwrap(), process().unwrap()));
         process().unwrap().runtime.block_on(async {
             let service = Mutex::new(());
+            let gate = voxgolem_platform::search::WebPrewarmGate::default();
             let _owner = service.lock().await;
-            let result = admit(&service, &Cancellation::default(), Instant::now()).await;
+            let result = voxgolem_platform::search::admit_web(
+                &service,
+                &gate,
+                &Cancellation::default(),
+                Instant::now(),
+            )
+            .await;
             assert!(matches!(result, Err(Failure::Deadline)));
         });
     }
