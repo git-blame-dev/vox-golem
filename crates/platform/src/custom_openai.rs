@@ -163,13 +163,22 @@ pub struct CustomOpenAiAuthObservation {
     pub status: Result<(), CustomOpenAiError>,
 }
 
-/// Inspect access using the same bounded read, parser and expiry policy as a request.
+/// Inspect admission using the bounded credential reader and request parser.
+/// Expired managed access remains admissible when it can refresh at dispatch;
+/// expired imported/access-only credentials remain unavailable.
 /// No HTTP client is constructed and no credentials or observations are retained.
 pub fn observe_custom_openai_auth(path: &Path) -> CustomOpenAiAuthObservation {
     match read_credential_file(path) {
         Ok((contents, revision)) => CustomOpenAiAuthObservation {
             revision: Some(revision),
-            status: parse_request_credential(&contents, revision).map(|_| ()),
+            status: match parse_request_credential(&contents, revision) {
+                Err(CustomOpenAiError::AuthExpired)
+                    if crate::chatgpt_auth::renewable_contents(&contents) =>
+                {
+                    Ok(())
+                }
+                result => result.map(|_| ()),
+            },
         },
         Err(error) => CustomOpenAiAuthObservation {
             revision: None,
@@ -281,7 +290,7 @@ impl CustomOpenAiClient {
         Ok(CustomOpenAiConfig { endpoint, ..config })
     }
 
-    fn transport(config: &CustomOpenAiConfig) -> Result<Client, CustomOpenAiError> {
+    pub(crate) fn transport(config: &CustomOpenAiConfig) -> Result<Client, CustomOpenAiError> {
         let endpoint =
             Url::parse(&config.endpoint).map_err(|_| CustomOpenAiError::InvalidConfig)?;
         #[allow(unused_mut)]
@@ -312,6 +321,7 @@ impl CustomOpenAiClient {
         client_builder
             .redirect(redirect::Policy::none())
             .connect_timeout(config.connect_timeout)
+            .pool_max_idle_per_host(2)
             .tcp_keepalive(None)
             .build()
             .map_err(|_| CustomOpenAiError::Transport)
@@ -415,7 +425,15 @@ impl CustomOpenAiClient {
         let credential = if self.config.model == CustomOpenAiModel::LocalFast {
             None
         } else {
-            Some(load_request_credential(&self.config.auth_path)?)
+            tokio::time::timeout_at(
+                deadline,
+                crate::chatgpt_auth::ensure_fresh(&self.config.auth_path),
+            )
+            .await
+            .map_err(|_| CustomOpenAiError::Timeout)??;
+            let credential = load_request_credential(&self.config.auth_path)?;
+            credential.validate_endpoint(&self.config.endpoint)?;
+            Some(credential)
         };
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -662,6 +680,16 @@ struct RequestCredential {
     authorization: HeaderValue,
     account_id: Option<HeaderValue>,
     revision: CustomOpenAiAuthRevision,
+    managed: bool,
+}
+
+impl RequestCredential {
+    fn validate_endpoint(&self, endpoint: &str) -> Result<(), CustomOpenAiError> {
+        if self.managed && endpoint != DEFAULT_ENDPOINT {
+            return Err(CustomOpenAiError::InvalidConfig);
+        }
+        Ok(())
+    }
 }
 
 fn metadata_auth_revision(metadata: &std::fs::Metadata) -> Option<CustomOpenAiAuthRevision> {
@@ -747,6 +775,7 @@ fn parse_request_credential(
         authorization,
         account_id,
         revision,
+        managed: crate::chatgpt_auth::marked_contents(contents),
     })
 }
 
@@ -1012,6 +1041,14 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn managed_expired_access_remains_admissible_for_dispatch_refresh() {
+        let dir = crate::test_support::TestDir::new("renewable-auth");
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, br#"{"voxgolemChatgpt":1,"openai":{"access":"synthetic-expired","refresh":"synthetic-renewable","expires":1}}"#).unwrap();
+        assert_eq!(observe_custom_openai_auth(&path).status, Ok(()));
+    }
 
     fn prompt() -> CustomOpenAiPrompt {
         CustomOpenAiPrompt {
@@ -2285,4 +2322,5 @@ mod tests {
             CustomOpenAiError::Http(502)
         );
     }
+
 }

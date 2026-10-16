@@ -21,6 +21,9 @@ custom-openai = [
   "reqwest/stream",
   "dep:tokio",
   "tokio/time",
+  "tokio/net",
+  "tokio/rt-multi-thread",
+  "tokio/sync",
 ]
 custom-openai-webpki = [
   "dep:voxgolem-core",
@@ -32,6 +35,9 @@ custom-openai-webpki = [
   "dep:rustls",
   "dep:tokio",
   "tokio/time",
+  "tokio/net",
+  "tokio/rt-multi-thread",
+  "tokio/sync",
   "dep:webpki-roots",
 ]
 desktop = [

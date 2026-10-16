@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 #![deny(unused_must_use)]
 
+#[cfg(any(feature = "custom-openai", feature = "custom-openai-webpki"))]
+pub mod chatgpt_auth;
+
 #[cfg(feature = "desktop")]
 pub mod completion;
 #[cfg(any(feature = "custom-openai", feature = "custom-openai-webpki"))]
