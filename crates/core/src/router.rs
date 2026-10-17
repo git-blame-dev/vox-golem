@@ -374,7 +374,6 @@ const ELLIPTICAL_PREFIXES: &[&str] = &[
     "do the",
     "do they",
     "can the",
-    "can you",
     "can i",
     "can it",
     "can that",
@@ -588,6 +587,7 @@ fn apply_elliptical_follow_up(text: &str, prev_user_turn: Option<&str>) -> Strin
         && !SMART_KEYWORDS.iter().any(|k| lower.contains(k))
         && !is_self_identity(&lower)
         && !is_pure_arithmetic_or_greeting(&lower)
+        && !classify_lexical_fallback(text).needs_search()
         && classify_lexical_fallback(prev_trimmed).needs_search();
 
     if !starts_elliptical && !is_short_anaphoric && !is_contextual_search_follow_up {

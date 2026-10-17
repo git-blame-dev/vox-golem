@@ -84,7 +84,7 @@ LINUX_ORT_PROVIDER_LIBS := \
 
 .DEFAULT_GOAL := help
 
-.PHONY: wakeword-bench test-wakeword-bench
+.PHONY: wakeword-bench test-wakeword-bench search-bench test-search-bench
 
 wakeword-bench:
 	@test -n '$(WAKE_WORD_MODEL)' || { printf '%s\n' 'Set WAKE_WORD_MODEL to a local classifier ONNX file.' >&2; exit 1; }
@@ -93,6 +93,13 @@ wakeword-bench:
 test-wakeword-bench:
 	python3 -m unittest discover -s tools/wakeword-bench -p 'test_*.py'
 	cargo test --locked -p vox-golem --example wakeword_bench
+
+search-bench:
+	cargo run --locked -p vox-golem --example search_bench -- --mode live $(SEARCH_BENCH_FLAGS)
+
+test-search-bench:
+	cargo test --locked -p vox-golem --example search_bench
+	cargo run --locked -p vox-golem --example search_bench -- --mode deterministic
 
 .PHONY: help app-version icons test test-release-tools test-android-tools check-android-tools android-init android-build android-capture-test check-wear-tools wear-test wear-build wear-performance check-linux-tools app app-smoke packaged-smoke app-dev linux dist stage-linux-existing verify-dist prepare-appimage-tools update-bundle postprocess-update-bundle verify-update-bundle update-bundle-smoke check-pc-tools prepare-pc-bundle pc pc-dist verify-pc-dist pc-installer verify-pc-installer clean
 
@@ -103,6 +110,8 @@ help:
 	@printf '%s\n' '  make packaged-smoke Run the staged Linux package from a separate directory'
 	@printf '%s\n' '  make app-dev  Run only the frontend development server'
 	@printf '%s\n' '  make test     Run deterministic Linux frontend and Rust checks'
+	@printf '%s\n' '  make search-bench [SEARCH_BENCH_FLAGS="--with-llm"]  Run the cross-codepath search benchmark'
+	@printf '%s\n' '  make test-search-bench  Run deterministic offline search & router benchmark'
 	@printf '%s\n' '  make wakeword-bench WAKE_WORD_MODEL=/path/model.onnx  Run the synthetic wake-word benchmark'
 	@printf '%s\n' '  make app-version Print the generated application build identity'
 	@printf '%s\n' '  make icons    Regenerate native icons from the canonical SVG'

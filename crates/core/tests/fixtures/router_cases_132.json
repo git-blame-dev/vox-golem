@@ -1,0 +1,794 @@
+[
+  {
+    "exp": "F",
+    "prompt": "Hey there, how's it going?",
+    "prev": null,
+    "py_norm": "Hey there, how's it going?"
+  },
+  {
+    "exp": "F",
+    "prompt": "Rewrite this sentence to sound more professional: Thanks for sending the file",
+    "prev": null,
+    "py_norm": "Translate, summarize, rewrite, or fix typos in this provided text passage."
+  },
+  {
+    "exp": "F",
+    "prompt": "What is 15% of 240?",
+    "prev": null,
+    "py_norm": "What is 15% of 240?"
+  },
+  {
+    "exp": "F",
+    "prompt": "How many centimeters are in 2.5 meters?",
+    "prev": null,
+    "py_norm": "How many centimeters are in 2.5 meters?"
+  },
+  {
+    "exp": "F",
+    "prompt": "Hello! Summarize this in one line: The package arrived on Tuesday at 3pm and was signed for by the receptionist.",
+    "prev": null,
+    "py_norm": "Translate, summarize, rewrite, or fix typos in this provided text passage."
+  },
+  {
+    "exp": "S",
+    "prompt": "weather in New York City today",
+    "prev": null,
+    "py_norm": "weather in New York City today"
+  },
+  {
+    "exp": "S",
+    "prompt": "what is the current stock price of Nvidia?",
+    "prev": null,
+    "py_norm": "what is the current stock price of Nvidia?"
+  },
+  {
+    "exp": "S",
+    "prompt": "what is the unemployment rate in the United States right now",
+    "prev": null,
+    "py_norm": "what is the unemployment rate in the United States right now"
+  },
+  {
+    "exp": "S",
+    "prompt": "who won the latest Premier League match between Arsenal and Chelsea?",
+    "prev": null,
+    "py_norm": "who won the latest Premier League match between Arsenal and Chelsea?"
+  },
+  {
+    "exp": "S",
+    "prompt": "what time is it in Tokyo right now and what's the USD to JPY exchange rate?",
+    "prev": null,
+    "py_norm": "what time is it in Tokyo right now and what's the USD to JPY exchange rate?"
+  },
+  {
+    "exp": "C",
+    "prompt": "Write a thread-safe LRU cache in Rust using Arc and Mutex.",
+    "prev": null,
+    "py_norm": "Write a thread-safe LRU cache in Rust using Arc and Mutex."
+  },
+  {
+    "exp": "C",
+    "prompt": "Hello, can you debug this Kotlin coroutine deadlock when calling runBlocking inside Dispatchers.Main?",
+    "prev": null,
+    "py_norm": "Hello, can you debug this Kotlin coroutine deadlock when calling runBlocking inside Dispatchers.Main?"
+  },
+  {
+    "exp": "C",
+    "prompt": "Design a normalized PostgreSQL schema for a multi-tenant billing system with usage-based tiers.",
+    "prev": null,
+    "py_norm": "Design a normalized PostgreSQL schema for a multi-tenant billing system with usage-based tiers."
+  },
+  {
+    "exp": "C",
+    "prompt": "Prove by induction that the sum of the first n odd integers is n^2.",
+    "prev": null,
+    "py_norm": "Prove by induction that the sum of the first n odd integers is n^2."
+  },
+  {
+    "exp": "C",
+    "prompt": "Refactor this Python function to avoid O(n^2) list lookups and explain the time complexity.",
+    "prev": null,
+    "py_norm": "Refactor this Python function to avoid O(n^2) list lookups and explain the time complexity."
+  },
+  {
+    "exp": "R",
+    "prompt": "Compare the Galaxy A17 Exynos 1330 vs Pixel 8 Tensor G3 for running quantized local LLMs and NPU delegation.",
+    "prev": null,
+    "py_norm": "Compare the Galaxy A17 Exynos 1330 vs Pixel 8 Tensor G3 for running quantized local LLMs and NPU delegation."
+  },
+  {
+    "exp": "R",
+    "prompt": "In MTG, what does haste do and does it work if a spell gives a creature haste while it already has summoning sickness, or if Dress Down enters the battlefield after?",
+    "prev": null,
+    "py_norm": "In MTG, what does haste do and does it work if a spell gives a creature haste while it already has summoning sickness, or if Dress Down enters the battlefield after?"
+  },
+  {
+    "exp": "R",
+    "prompt": "What are the main architectural tradeoffs between SQLite FTS5 + MiniLM reranking vs a dedicated vector database for a 15GB offline mobile knowledge base?",
+    "prev": null,
+    "py_norm": "What are the main architectural tradeoffs between SQLite FTS5 + MiniLM reranking vs a dedicated vector database for a 15GB offline mobile knowledge base?"
+  },
+  {
+    "exp": "R",
+    "prompt": "Research the current 2026 US Federal Reserve interest rate outlook across major bank forecasts and summarize where economists disagree.",
+    "prev": null,
+    "py_norm": "Research the current 2026 US Federal Reserve interest rate outlook across major bank forecasts and summarize where economists disagree."
+  },
+  {
+    "exp": "R",
+    "prompt": "Should I buy a Framework Laptop 13 or a ThinkPad T14s Gen 6 for Linux Wayland development? Compare battery life, repairability, and Linux kernel support.",
+    "prev": null,
+    "py_norm": "Should I buy a Framework Laptop 13 or a ThinkPad T14s Gen 6 for Linux Wayland development? Compare battery life, repairability, and Linux kernel support."
+  },
+  {
+    "exp": "F",
+    "prompt": "Translate this weather report into Spanish: Today in New York City it is 75 degrees Fahrenheit and sunny.",
+    "prev": null,
+    "py_norm": "Translate, summarize, rewrite, or fix typos in this provided text passage."
+  },
+  {
+    "exp": "F",
+    "prompt": "Summarize this stock market paragraph: Nvidia shares rose 4% on Tuesday after earnings.",
+    "prev": null,
+    "py_norm": "Translate, summarize, rewrite, or fix typos in this provided text passage."
+  },
+  {
+    "exp": "F",
+    "prompt": "Fix the typos in this git commit message: Refactored the PostgreSQL schema and fixed the Rust mutex deadlock.",
+    "prev": null,
+    "py_norm": "Translate, summarize, rewrite, or fix typos in this provided text passage."
+  },
+  {
+    "exp": "F",
+    "prompt": "Yo, thanks for helping me debug that code earlier!",
+    "prev": null,
+    "py_norm": "Yo, thanks for helping me debug that code earlier!"
+  },
+  {
+    "exp": "F",
+    "prompt": "Extract just the email address from this text: Contact support@example.invalid for comparisons and pricing.",
+    "prev": null,
+    "py_norm": "Translate, summarize, rewrite, or fix typos in this provided text passage."
+  },
+  {
+    "exp": "S",
+    "prompt": "Hey quick question, is it raining in Los Angeles right now?",
+    "prev": null,
+    "py_norm": "Hey quick question, is it raining in Los Angeles right now?"
+  },
+  {
+    "exp": "S",
+    "prompt": "What is the latest stable version number of Rust released this month?",
+    "prev": null,
+    "py_norm": "What is the latest stable version number of Rust released this month?"
+  },
+  {
+    "exp": "S",
+    "prompt": "How much does a base MacBook Air M4 cost in USD today?",
+    "prev": null,
+    "py_norm": "How much does a base MacBook Air M4 cost in USD today?"
+  },
+  {
+    "exp": "S",
+    "prompt": "Who is the current CEO of Intel as of today?",
+    "prev": null,
+    "py_norm": "Who is the current CEO of Intel as of today?"
+  },
+  {
+    "exp": "S",
+    "prompt": "What was the final score of the Chicago Bulls game last night?",
+    "prev": null,
+    "py_norm": "What was the final score of the Chicago Bulls game last night?"
+  },
+  {
+    "exp": "C",
+    "prompt": "What is the time complexity and space complexity of merge sort in the worst case, and prove why?",
+    "prev": null,
+    "py_norm": "What is the time complexity and space complexity of merge sort in the worst case, and prove why?"
+  },
+  {
+    "exp": "C",
+    "prompt": "Write a Python script that parses a JSON weather forecast array and calculates the 7-day moving average temperature.",
+    "prev": null,
+    "py_norm": "Write a Python script that parses a JSON weather forecast array and calculates the 7-day moving average temperature."
+  },
+  {
+    "exp": "C",
+    "prompt": "Why does my C++ std::vector invalidate iterators when push_back reallocates memory?",
+    "prev": null,
+    "py_norm": "Why does my C++ std::vector invalidate iterators when push_back reallocates memory?"
+  },
+  {
+    "exp": "C",
+    "prompt": "Solve this system of equations step by step: 3x + 2y = 16 and 7x - 5y = -11.",
+    "prev": null,
+    "py_norm": "Solve this system of equations step by step: 3x + 2y = 16 and 7x - 5y = -11."
+  },
+  {
+    "exp": "C",
+    "prompt": "Review this SQL query for SQL injection vulnerabilities: SELECT * FROM users WHERE name = '\" + userInput + \"'",
+    "prev": null,
+    "py_norm": "Review this SQL query for SQL injection vulnerabilities: SELECT * FROM users WHERE name = '\" + userInput + \"'"
+  },
+  {
+    "exp": "R",
+    "prompt": "What is the current stock price of AMD vs Nvidia, and how do their data center revenue growth rates compare over the last two quarters?",
+    "prev": null,
+    "py_norm": "What is the current stock price of AMD vs Nvidia, and how do their data center revenue growth rates compare over the last two quarters?"
+  },
+  {
+    "exp": "R",
+    "prompt": "In Warhammer 40k 10th edition, if a unit with Fights First is charged by another unit that also has Fights First, which player activates their unit first and why?",
+    "prev": null,
+    "py_norm": "In Warhammer 40k 10th edition, if a unit with Fights First is charged by another unit that also has Fights First, which player activates their unit first and why?"
+  },
+  {
+    "exp": "R",
+    "prompt": "Look up the latest 2026 benchmarks for SQLite vs DuckDB for analytical queries on mobile devices and summarize the tradeoffs.",
+    "prev": null,
+    "py_norm": "Look up the latest 2026 benchmarks for SQLite vs DuckDB for analytical queries on mobile devices and summarize the tradeoffs."
+  },
+  {
+    "exp": "R",
+    "prompt": "Is it better to lock in a fixed mortgage rate in the United States right now or choose an adjustable-rate mortgage given the latest inflation numbers and Federal Reserve commentary?",
+    "prev": null,
+    "py_norm": "Is it better to lock in a fixed mortgage rate in the United States right now or choose an adjustable-rate mortgage given the latest inflation numbers and Federal Reserve commentary?"
+  },
+  {
+    "exp": "R",
+    "prompt": "Compare the pros and cons of using ONNX Runtime vs LiteRT-LM for deploying int8 quantized models on Android phones.",
+    "prev": null,
+    "py_norm": "Compare the pros and cons of using ONNX Runtime vs LiteRT-LM for deploying int8 quantized models on Android phones."
+  },
+  {
+    "exp": "F",
+    "prompt": "um hey ai how's your day going",
+    "prev": null,
+    "py_norm": "hey ai how's your day going"
+  },
+  {
+    "exp": "F",
+    "prompt": "uh what is twenty percent of eighty five",
+    "prev": null,
+    "py_norm": "what is twenty percent of eighty five"
+  },
+  {
+    "exp": "F",
+    "prompt": "can you please fix the grammar here: me and him goes to the shop",
+    "prev": null,
+    "py_norm": "Translate, summarize, rewrite, or fix typos in this provided text passage."
+  },
+  {
+    "exp": "F",
+    "prompt": "how many grams is three point five kilograms",
+    "prev": null,
+    "py_norm": "how many grams is three point five kilograms"
+  },
+  {
+    "exp": "F",
+    "prompt": "thanks mate that's all i needed",
+    "prev": null,
+    "py_norm": "thanks mate that's all i needed"
+  },
+  {
+    "exp": "S",
+    "prompt": "qhat is unemployment rate in New York City now",
+    "prev": null,
+    "py_norm": "qhat is unemployment rate in New York City now"
+  },
+  {
+    "exp": "S",
+    "prompt": "um hey what's the weather like in tokyo tomorrow",
+    "prev": null,
+    "py_norm": "hey what's the weather like in tokyo tomorrow"
+  },
+  {
+    "exp": "S",
+    "prompt": "how much is one bitcoin worth in US dollars right now",
+    "prev": null,
+    "py_norm": "how much is one bitcoin worth in US dollars right now"
+  },
+  {
+    "exp": "S",
+    "prompt": "who won the f1 race on sunday",
+    "prev": null,
+    "py_norm": "who won the f1 race on sunday"
+  },
+  {
+    "exp": "S",
+    "prompt": "what time does the NYSE open in New York City today",
+    "prev": null,
+    "py_norm": "what time does the NYSE open in New York City today"
+  },
+  {
+    "exp": "C",
+    "prompt": "uh write a rust macro that implements display for an enum",
+    "prev": null,
+    "py_norm": "write a rust macro that implements display for an enum"
+  },
+  {
+    "exp": "C",
+    "prompt": "how do i fix a borrow checker error when mutating a hashmap inside a loop in rust",
+    "prev": null,
+    "py_norm": "how do i fix a borrow checker error when mutating a hashmap inside a loop in rust"
+  },
+  {
+    "exp": "C",
+    "prompt": "write a regex that matches ipv4 addresses but rejects leading zeros",
+    "prev": null,
+    "py_norm": "write a regex that matches ipv4 addresses but rejects leading zeros"
+  },
+  {
+    "exp": "C",
+    "prompt": "explain how raft consensus handles split votes during leader election",
+    "prev": null,
+    "py_norm": "explain how raft consensus handles split votes during leader election"
+  },
+  {
+    "exp": "C",
+    "prompt": "convert this recursion into an iterative dynamic programming solution in python",
+    "prev": null,
+    "py_norm": "convert this recursion into an iterative dynamic programming solution in python"
+  },
+  {
+    "exp": "R",
+    "prompt": "what is the weather in Chicago today and what are the best indoor museums to visit if it rains?",
+    "prev": null,
+    "py_norm": "what is the weather in Chicago today and what are the best indoor museums to visit if it rains?"
+  },
+  {
+    "exp": "R",
+    "prompt": "how much does the pixel 8 pro cost right now and is its camera worth the upgrade over the regular pixel 8?",
+    "prev": null,
+    "py_norm": "how much does the pixel 8 pro cost right now and is its camera worth the upgrade over the regular pixel 8?"
+  },
+  {
+    "exp": "R",
+    "prompt": "in magic the gathering if i cast blood moon while urza's saga is on chapter two what happens to the saga?",
+    "prev": null,
+    "py_norm": "in magic the gathering if i cast blood moon while urza's saga is on chapter two what happens to the saga?"
+  },
+  {
+    "exp": "R",
+    "prompt": "compare the latest 2026 benchmarks of bun vs deno vs node for high concurrency http servers",
+    "prev": null,
+    "py_norm": "compare the latest 2026 benchmarks of bun vs deno vs node for high concurrency http servers"
+  },
+  {
+    "exp": "R",
+    "prompt": "what is the current federal funds target range in the United States and what do major US banks predict for rate cuts this year?",
+    "prev": null,
+    "py_norm": "what is the current federal funds target range in the United States and what do major US banks predict for rate cuts this year?"
+  },
+  {
+    "exp": "F",
+    "prompt": "Good evening! Hope you're having a great week.",
+    "prev": null,
+    "py_norm": "Good evening! Hope you're having a great week."
+  },
+  {
+    "exp": "F",
+    "prompt": "Awesome, appreciate the quick reply!",
+    "prev": null,
+    "py_norm": "Awesome, appreciate the quick reply!"
+  },
+  {
+    "exp": "F",
+    "prompt": "What is 120 divided by 8?",
+    "prev": null,
+    "py_norm": "What is 120 divided by 8?"
+  },
+  {
+    "exp": "F",
+    "prompt": "How many ounces are in 2 pounds?",
+    "prev": null,
+    "py_norm": "How many ounces are in 2 pounds?"
+  },
+  {
+    "exp": "F",
+    "prompt": "Convert 100 degrees Celsius to Fahrenheit.",
+    "prev": null,
+    "py_norm": "Convert 100 degrees Celsius to Fahrenheit."
+  },
+  {
+    "exp": "F",
+    "prompt": "What is 35 plus 89?",
+    "prev": null,
+    "py_norm": "What is 35 plus 89?"
+  },
+  {
+    "exp": "F",
+    "prompt": "Summarize this medical note: Patient presented with mild fever of 38.1C and was advised rest and fluids.",
+    "prev": null,
+    "py_norm": "Translate, summarize, rewrite, or fix typos in this provided text passage."
+  },
+  {
+    "exp": "F",
+    "prompt": "Translate this legal clause into plain English: Hereby the lessee agrees to indemnify the lessor against all claims.",
+    "prev": null,
+    "py_norm": "Translate, summarize, rewrite, or fix typos in this provided text passage."
+  },
+  {
+    "exp": "F",
+    "prompt": "Rewrite this email to be shorter: Hi team, I wanted to reach out and ask if we could move our sync to 4pm today.",
+    "prev": null,
+    "py_norm": "Translate, summarize, rewrite, or fix typos in this provided text passage."
+  },
+  {
+    "exp": "F",
+    "prompt": "Fix the spelling in this sentence: The acomodation at the mediteranean hotel wasexcelent.",
+    "prev": null,
+    "py_norm": "Translate, summarize, rewrite, or fix typos in this provided text passage."
+  },
+  {
+    "exp": "S",
+    "prompt": "what is the air quality index in Singapore right now?",
+    "prev": null,
+    "py_norm": "what is the air quality index in Singapore right now?"
+  },
+  {
+    "exp": "S",
+    "prompt": "how much is gold trading for per ounce today?",
+    "prev": null,
+    "py_norm": "how much is gold trading for per ounce today?"
+  },
+  {
+    "exp": "S",
+    "prompt": "who is the current Secretary of Health and Human Services in the United States?",
+    "prev": null,
+    "py_norm": "who is the current Secretary of Health and Human Services in the United States?"
+  },
+  {
+    "exp": "S",
+    "prompt": "what time is sunset in San Francisco tonight?",
+    "prev": null,
+    "py_norm": "what time is sunset in San Francisco tonight?"
+  },
+  {
+    "exp": "S",
+    "prompt": "what was the score of the latest Wallabies rugby match?",
+    "prev": null,
+    "py_norm": "what was the score of the latest Wallabies rugby match?"
+  },
+  {
+    "exp": "S",
+    "prompt": "is the Brooklyn Bridge open to traffic right now or are there closures?",
+    "prev": null,
+    "py_norm": "is the Brooklyn Bridge open to traffic right now or are there closures?"
+  },
+  {
+    "exp": "S",
+    "prompt": "what is the current EUR to USD exchange rate today?",
+    "prev": null,
+    "py_norm": "what is the current EUR to USD exchange rate today?"
+  },
+  {
+    "exp": "S",
+    "prompt": "when does daylight saving time start in New York State this year?",
+    "prev": null,
+    "py_norm": "when does daylight saving time start in New York State this year?"
+  },
+  {
+    "exp": "S",
+    "prompt": "what is Tesla's market cap today?",
+    "prev": null,
+    "py_norm": "what is Tesla's market cap today?"
+  },
+  {
+    "exp": "S",
+    "prompt": "what is the current snow depth at Perisher ski resort?",
+    "prev": null,
+    "py_norm": "what is the current snow depth at Perisher ski resort?"
+  },
+  {
+    "exp": "C",
+    "prompt": "Write a lock-free single-producer single-consumer ring buffer in C++20 using std::atomic.",
+    "prev": null,
+    "py_norm": "Write a lock-free single-producer single-consumer ring buffer in C++20 using std::atomic."
+  },
+  {
+    "exp": "C",
+    "prompt": "Debug this React useEffect infinite loop when updating an object dependency in state.",
+    "prev": null,
+    "py_norm": "Debug this React useEffect infinite loop when updating an object dependency in state."
+  },
+  {
+    "exp": "C",
+    "prompt": "Write a Bash script using awk and sed to extract the top 10 IP addresses from an nginx access log.",
+    "prev": null,
+    "py_norm": "Write a Bash script using awk and sed to extract the top 10 IP addresses from an nginx access log."
+  },
+  {
+    "exp": "C",
+    "prompt": "Explain why the halting problem is undecidable using a diagonalization proof.",
+    "prev": null,
+    "py_norm": "Explain why the halting problem is undecidable using a diagonalization proof."
+  },
+  {
+    "exp": "C",
+    "prompt": "Design a database sharding strategy for a chat app handling 50 million concurrent WebSocket connections.",
+    "prev": null,
+    "py_norm": "Design a database sharding strategy for a chat app handling 50 million concurrent WebSocket connections."
+  },
+  {
+    "exp": "C",
+    "prompt": "Write a Rust procedural macro that derives a builder pattern for any struct.",
+    "prev": null,
+    "py_norm": "Write a Rust procedural macro that derives a builder pattern for any struct."
+  },
+  {
+    "exp": "C",
+    "prompt": "Solve this differential equation step by step: dy/dx + 2y = e^(-x).",
+    "prev": null,
+    "py_norm": "Solve this differential equation step by step: dy/dx + 2y = e^(-x)."
+  },
+  {
+    "exp": "C",
+    "prompt": "How does the Linux kernel CFS scheduler use red-black trees to track vruntime?",
+    "prev": null,
+    "py_norm": "How does the Linux kernel CFS scheduler use red-black trees to track vruntime?"
+  },
+  {
+    "exp": "C",
+    "prompt": "Refactor this TypeScript async loop so it executes promises with a bounded concurrency limit of 5.",
+    "prev": null,
+    "py_norm": "Refactor this TypeScript async loop so it executes promises with a bounded concurrency limit of 5."
+  },
+  {
+    "exp": "C",
+    "prompt": "Write a GLSL fragment shader that renders a signed distance field rounded rectangle with anti-aliasing.",
+    "prev": null,
+    "py_norm": "Write a GLSL fragment shader that renders a signed distance field rounded rectangle with anti-aliasing."
+  },
+  {
+    "exp": "R",
+    "prompt": "Compare the Sony WH-1000XM5 vs Bose QuietComfort Ultra headphones for microphone call quality in noisy wind and multipoint Bluetooth stability.",
+    "prev": null,
+    "py_norm": "Compare the Sony WH-1000XM5 vs Bose QuietComfort Ultra headphones for microphone call quality in noisy wind and multipoint Bluetooth stability."
+  },
+  {
+    "exp": "R",
+    "prompt": "In Pathfinder 2e remaster, how does the Grabbed condition interact with Manipulate actions and casting a spell with somatic components?",
+    "prev": null,
+    "py_norm": "In Pathfinder 2e remaster, how does the Grabbed condition interact with Manipulate actions and casting a spell with somatic components?"
+  },
+  {
+    "exp": "R",
+    "prompt": "Research the latest clinical trial comparisons between semaglutide and tirzepatide for cardiovascular risk reduction and side-effect profiles.",
+    "prev": null,
+    "py_norm": "Research the latest clinical trial comparisons between semaglutide and tirzepatide for cardiovascular risk reduction and side-effect profiles."
+  },
+  {
+    "exp": "R",
+    "prompt": "Compare the pros and cons of using Tauri 2 vs Flutter for building a low-latency cross-platform voice assistant on Android and Linux.",
+    "prev": null,
+    "py_norm": "Compare the pros and cons of using Tauri 2 vs Flutter for building a low-latency cross-platform voice assistant on Android and Linux."
+  },
+  {
+    "exp": "R",
+    "prompt": "What are the current 2026 US federal capital gains rules for selling a former primary residence after renting it out, including ownership/use timing, the home-sale exclusion and rental depreciation?",
+    "prev": null,
+    "py_norm": "What are the current 2026 US federal capital gains rules for selling a former primary residence after renting it out, including ownership/use timing, the home-sale exclusion and rental depreciation?"
+  },
+  {
+    "exp": "R",
+    "prompt": "Compare Garmin Fenix 8 vs Apple Watch Ultra 2 vs Galaxy Watch7 GPS accuracy and battery life during multi-day hiking.",
+    "prev": null,
+    "py_norm": "Compare Garmin Fenix 8 vs Apple Watch Ultra 2 vs Galaxy Watch7 GPS accuracy and battery life during multi-day hiking."
+  },
+  {
+    "exp": "R",
+    "prompt": "In chess tournament rules (FIDE laws), what happens if a player makes an illegal move in blitz while their opponent's flag has already fallen, but nobody called the flag yet?",
+    "prev": null,
+    "py_norm": "In chess tournament rules (FIDE laws), what happens if a player makes an illegal move in blitz while their opponent's flag has already fallen, but nobody called the flag yet?"
+  },
+  {
+    "exp": "R",
+    "prompt": "Analyze the tradeoffs between WebRTC data channels and QUIC/WebTransport for real-time low-latency audio streaming in 2026.",
+    "prev": null,
+    "py_norm": "Analyze the tradeoffs between WebRTC data channels and QUIC/WebTransport for real-time low-latency audio streaming in 2026."
+  },
+  {
+    "exp": "R",
+    "prompt": "What is the current price of electricity per kWh in New York State vs California and which solar net-metering plans offer the best payback period in 2026?",
+    "prev": null,
+    "py_norm": "What is the current price of electricity per kWh in New York State vs California and which solar net-metering plans offer the best payback period in 2026?"
+  },
+  {
+    "exp": "R",
+    "prompt": "Compare the compiler optimization tradeoffs between LLVM -O3 and -Os for ARM64 mobile binaries with LTO enabled.",
+    "prev": null,
+    "py_norm": "Compare the compiler optimization tradeoffs between LLVM -O3 and -Os for ARM64 mobile binaries with LTO enabled."
+  },
+  {
+    "exp": "S",
+    "prompt": "What about Nvidia?",
+    "prev": "What is the current stock price of AMD right now?",
+    "py_norm": "What is the current stock price of AMD right now? What about Nvidia?"
+  },
+  {
+    "exp": "S",
+    "prompt": "And what about tomorrow morning?",
+    "prev": "What's the weather like in Chicago today?",
+    "py_norm": "What's the weather like in Chicago today? And what about tomorrow morning?"
+  },
+  {
+    "exp": "S",
+    "prompt": "What was the final score?",
+    "prev": "Who won the Lakers game last night?",
+    "py_norm": "Who won the Lakers game last night? What was the final score?"
+  },
+  {
+    "exp": "S",
+    "prompt": "How about Ethereum?",
+    "prev": "How much is Bitcoin trading for in USD today?",
+    "py_norm": "How much is Bitcoin trading for in USD today? How about Ethereum?"
+  },
+  {
+    "exp": "S",
+    "prompt": "Are there any delays on the FDR Drive either?",
+    "prev": "Is the Brooklyn Bridge open right now?",
+    "py_norm": "Is the Brooklyn Bridge open right now? Are there any delays on the FDR Drive either?"
+  },
+  {
+    "exp": "R",
+    "prompt": "Why has it underperformed Nvidia this quarter and what are analysts projecting for MI350 margins?",
+    "prev": "What is the current stock price of AMD right now?",
+    "py_norm": "What is the current stock price of AMD right now? Why has it underperformed Nvidia this quarter and what are analysts projecting for MI350 margins?"
+  },
+  {
+    "exp": "R",
+    "prompt": "What are the major US banks forecasting for interest rate cuts over the next 12 months?",
+    "prev": "What is the current Federal Reserve federal funds target range in the United States?",
+    "py_norm": "What are the major US banks forecasting for interest rate cuts over the next 12 months?"
+  },
+  {
+    "exp": "R",
+    "prompt": "Is it worth buying over the Bose QuietComfort Ultra for windy outdoor calls and multipoint stability?",
+    "prev": "How much does the Sony WH-1000XM5 cost today?",
+    "py_norm": "How much does the Sony WH-1000XM5 cost today? Is it worth buying over the Bose QuietComfort Ultra for windy outdoor calls and multipoint stability?"
+  },
+  {
+    "exp": "C",
+    "prompt": "What if a field has a newline inside quotes?",
+    "prev": "Write a Python function to parse CSV files into dictionaries.",
+    "py_norm": "Write a Python function to parse CSV files into dictionaries. What if a field has a newline inside quotes?"
+  },
+  {
+    "exp": "C",
+    "prompt": "Now modify it to delete the older rows and keep only the most recent id.",
+    "prev": "Write a SQL query to find duplicate email addresses in a users table.",
+    "py_norm": "Write a SQL query to find duplicate email addresses in a users table. Now modify it to delete the older rows and keep only the most recent id."
+  },
+  {
+    "exp": "C",
+    "prompt": "That still re-renders twice when the prop is an empty array, why is it doing that?",
+    "prev": "Debug this React useEffect infinite loop when updating an object dependency.",
+    "py_norm": "Debug this React useEffect infinite loop when updating an object dependency. That still re-renders twice when the prop is an empty array, why is it doing that?"
+  },
+  {
+    "exp": "C",
+    "prompt": "Do we need Acquire/Release ordering there or is Relaxed enough on ARM64?",
+    "prev": "Write a lock-free SPSC ring buffer in Rust using atomics.",
+    "py_norm": "Write a lock-free SPSC ring buffer in Rust using atomics. Do we need Acquire/Release ordering there or is Relaxed enough on ARM64?"
+  },
+  {
+    "exp": "C",
+    "prompt": "Now find the particular solution when y(0) = 3.",
+    "prev": "Solve this differential equation step by step: dy/dx + 2y = e^(-x).",
+    "py_norm": "Solve this differential equation step by step: dy/dx + 2y = e^(-x). Now find the particular solution when y(0) = 3."
+  },
+  {
+    "exp": "F",
+    "prompt": "Can you summarize that in one short sentence for my manager?",
+    "prev": "Compare PostgreSQL vs MongoDB for a high-write event sourcing system.",
+    "py_norm": "Can you summarize that in one short sentence for my manager?"
+  },
+  {
+    "exp": "F",
+    "prompt": "Translate that explanation into Spanish please.",
+    "prev": "Explain how the Linux kernel CFS scheduler uses red-black trees to track vruntime.",
+    "py_norm": "Translate that explanation into Spanish please."
+  },
+  {
+    "exp": "F",
+    "prompt": "Awesome, thank you so much!",
+    "prev": "Write a Python function to parse CSV files into dictionaries.",
+    "py_norm": "Awesome, thank you so much!"
+  },
+  {
+    "exp": "F",
+    "prompt": "Rewrite your last paragraph as three simple bullet points for a patient handout.",
+    "prev": "Research the latest clinical trial comparisons between semaglutide and tirzepatide.",
+    "py_norm": "Rewrite your last paragraph as three simple bullet points for a patient handout."
+  },
+  {
+    "exp": "C",
+    "prompt": "Can you write a C++20 coroutine generator for Fibonacci numbers?",
+    "prev": "Hey there, good morning!",
+    "py_norm": "Can you write a C++20 coroutine generator for Fibonacci numbers?"
+  },
+  {
+    "exp": "S",
+    "prompt": "Actually, check what the exact USD to EUR exchange rate is right now.",
+    "prev": "What is 100 times 1.55?",
+    "py_norm": "Actually, check what the exact USD to EUR exchange rate is right now."
+  },
+  {
+    "exp": "R",
+    "prompt": "Compare the pros and cons of Zoom vs Microsoft Teams vs Slack Huddles for low-bandwidth screen sharing in 2026.",
+    "prev": "Summarize this note: Meeting moved to Tuesday at 3pm.",
+    "py_norm": "Compare the pros and cons of Zoom vs Microsoft Teams vs Slack Huddles for low-bandwidth screen sharing in 2026."
+  },
+  {
+    "exp": "F",
+    "prompt": "Summarize this article in two bullet points: Synthetic battery laboratory exercise: a fictional workshop compares two imaginary electric-vehicle cell designs under fixed test conditions. The first design uses a solid separator and a ceramic contact layer; the second uses a liquid separator and the same electrode recipe. Both designs begin with equal capacity, receive identical charging current, and are measured after each repeated cycle. At lower temperatures, the solid design develops more resistance at the contact boundary, while the liquid design loses capacity more gradually. A revised clamp reduces gaps between the solid layers but adds mass and manufacturing steps. The workshop records voltage, resistance, temperature, and cycle count in an invented table with no measurements from real vehicles or people. An alternative synthetic batch changes only the clamp pressure so that its results can be compared with the original control. The exercise asks readers to distinguish measured behavior within this fictional setup from predictions about large-scale production. It makes no claim about any actual manufacturer, research team, production schedule, or commercial battery performance.",
+    "prev": null,
+    "py_norm": "Translate, summarize, rewrite, or fix typos in this provided text passage."
+  },
+  {
+    "exp": "F",
+    "prompt": "Translate the following technical abstract into German: Synthetic battery laboratory exercise: a fictional workshop compares two imaginary electric-vehicle cell designs under fixed test conditions. The first design uses a solid separator and a ceramic contact layer; the second uses a liquid separator and the same electrode recipe. Both designs begin with equal capacity, receive identical charging current, and are measured after each repeated cycle. At lower temperatures, the solid design develops more resistance at the contact boundary, while the liquid design loses capacity more gradually. A revised clamp reduces gaps between the solid layers but adds mass and manufacturing steps. The workshop records voltage, resistance, temperature, and cycle count in an invented table with no measurements from real vehicles or people. An alternative synthetic batch changes only the clamp pressure so that its results can be compared with the original control. The exercise asks readers to distinguish measured behavior within this fictional setup from predictions about large-scale production. It makes no claim about any actual manufacturer, research team, production schedule, or commercial battery performance.",
+    "prev": null,
+    "py_norm": "Translate, summarize, rewrite, or fix typos in this provided text passage."
+  },
+  {
+    "exp": "F",
+    "prompt": "Synthetic battery laboratory exercise: a fictional workshop compares two imaginary electric-vehicle cell designs under fixed test conditions. The first design uses a solid separator and a ceramic contact layer; the second uses a liquid separator and the same electrode recipe. Both designs begin with equal capacity, receive identical charging current, and are measured after each repeated cycle. At lower temperatures, the solid design develops more resistance at the contact boundary, while the liquid design loses capacity more gradually. A revised clamp reduces gaps between the solid layers but adds mass and manufacturing steps. The workshop records voltage, resistance, temperature, and cycle count in an invented table with no measurements from real vehicles or people. An alternative synthetic batch changes only the clamp pressure so that its results can be compared with the original control. The exercise asks readers to distinguish measured behavior within this fictional setup from predictions about large-scale production. It makes no claim about any actual manufacturer, research team, production schedule, or commercial battery performance.\n\nCan you summarize the above passage in one short sentence?",
+    "prev": null,
+    "py_norm": "Translate, summarize, rewrite, or fix typos in this provided text passage."
+  },
+  {
+    "exp": "F",
+    "prompt": "Synthetic battery laboratory exercise: a fictional workshop compares two imaginary electric-vehicle cell designs under fixed test conditions. The first design uses a solid separator and a ceramic contact layer; the second uses a liquid separator and the same electrode recipe. Both designs begin with equal capacity, receive identical charging current, and are measured after each repeated cycle. At lower temperatures, the solid design develops more resistance at the contact boundary, while the liquid design loses capacity more gradually. A revised clamp reduces gaps between the solid layers but adds mass and manufacturing steps. The workshop records voltage, resistance, temperature, and cycle count in an invented table with no measurements from real vehicles or people. An alternative synthetic batch changes only the clamp pressure so that its results can be compared with the original control. The exercise asks readers to distinguish measured behavior within this fictional setup from predictions about large-scale production. It makes no claim about any actual manufacturer, research team, production schedule, or commercial battery performance.\n\nRewrite the text above at a 5th-grade reading level.",
+    "prev": null,
+    "py_norm": "Translate, summarize, rewrite, or fix typos in this provided text passage."
+  },
+  {
+    "exp": "C",
+    "prompt": "Find the memory safety and concurrency bugs in this Rust code:\npub struct RingBuffer<T, const N: usize> {\n    buf: [std::mem::MaybeUninit<T>; N],\n    head: std::sync::atomic::AtomicUsize,\n    tail: std::sync::atomic::AtomicUsize,\n}\nimpl<T, const N: usize> RingBuffer<T, N> {\n    pub fn push(&self, item: T) -> Result<(), T> {\n        let head = self.head.load(std::sync::atomic::Ordering::Relaxed);\n        let next = (head + 1) % N;\n        if next == self.tail.load(std::sync::atomic::Ordering::Relaxed) {\n            return Err(item);\n        }\n        unsafe { (*self.buf.as_ptr().add(head)).write(item); }\n        self.head.store(next, std::sync::atomic::Ordering::Relaxed);\n        Ok(())\n    }\n    pub fn pop(&self) -> Option<T> {\n        let tail = self.tail.load(std::sync::atomic::Ordering::Relaxed);\n        if tail == self.head.load(std::sync::atomic::Ordering::Relaxed) {\n            return None;\n        }\n        let item = unsafe { (*self.buf.as_ptr().add(tail)).assume_init_read() };\n        self.tail.store((tail + 1) % N, std::sync::atomic::Ordering::Relaxed);\n        Some(item)\n    }\n}",
+    "prev": null,
+    "py_norm": "Find the memory safety and concurrency bugs in this Rust code:"
+  },
+  {
+    "exp": "C",
+    "prompt": "pub struct RingBuffer<T, const N: usize> {\n    buf: [std::mem::MaybeUninit<T>; N],\n    head: std::sync::atomic::AtomicUsize,\n    tail: std::sync::atomic::AtomicUsize,\n}\nimpl<T, const N: usize> RingBuffer<T, N> {\n    pub fn push(&self, item: T) -> Result<(), T> {\n        let head = self.head.load(std::sync::atomic::Ordering::Relaxed);\n        let next = (head + 1) % N;\n        if next == self.tail.load(std::sync::atomic::Ordering::Relaxed) {\n            return Err(item);\n        }\n        unsafe { (*self.buf.as_ptr().add(head)).write(item); }\n        self.head.store(next, std::sync::atomic::Ordering::Relaxed);\n        Ok(())\n    }\n    pub fn pop(&self) -> Option<T> {\n        let tail = self.tail.load(std::sync::atomic::Ordering::Relaxed);\n        if tail == self.head.load(std::sync::atomic::Ordering::Relaxed) {\n            return None;\n        }\n        let item = unsafe { (*self.buf.as_ptr().add(tail)).assume_init_read() };\n        self.tail.store((tail + 1) % N, std::sync::atomic::Ordering::Relaxed);\n        Some(item)\n    }\n}\n\nWhy does this ring buffer cause undefined behavior on ARM64 multi-core CPUs and how do I fix the UnsafeCell and Atomic ordering?",
+    "prev": null,
+    "py_norm": "Why does this ring buffer cause undefined behavior on ARM64 multi-core CPUs and how do I fix the UnsafeCell and Atomic ordering?"
+  },
+  {
+    "exp": "C",
+    "prompt": "Refactor this Rust implementation to support batch slices and add a unit test:\npub struct RingBuffer<T, const N: usize> {\n    buf: [std::mem::MaybeUninit<T>; N],\n    head: std::sync::atomic::AtomicUsize,\n    tail: std::sync::atomic::AtomicUsize,\n}\nimpl<T, const N: usize> RingBuffer<T, N> {\n    pub fn push(&self, item: T) -> Result<(), T> {\n        let head = self.head.load(std::sync::atomic::Ordering::Relaxed);\n        let next = (head + 1) % N;\n        if next == self.tail.load(std::sync::atomic::Ordering::Relaxed) {\n            return Err(item);\n        }\n        unsafe { (*self.buf.as_ptr().add(head)).write(item); }\n        self.head.store(next, std::sync::atomic::Ordering::Relaxed);\n        Ok(())\n    }\n    pub fn pop(&self) -> Option<T> {\n        let tail = self.tail.load(std::sync::atomic::Ordering::Relaxed);\n        if tail == self.head.load(std::sync::atomic::Ordering::Relaxed) {\n            return None;\n        }\n        let item = unsafe { (*self.buf.as_ptr().add(tail)).assume_init_read() };\n        self.tail.store((tail + 1) % N, std::sync::atomic::Ordering::Relaxed);\n        Some(item)\n    }\n}",
+    "prev": null,
+    "py_norm": "Refactor this Rust implementation to support batch slices and add a unit test:"
+  },
+  {
+    "exp": "C",
+    "prompt": "pub struct RingBuffer<T, const N: usize> {\n    buf: [std::mem::MaybeUninit<T>; N],\n    head: std::sync::atomic::AtomicUsize,\n    tail: std::sync::atomic::AtomicUsize,\n}\nimpl<T, const N: usize> RingBuffer<T, N> {\n    pub fn push(&self, item: T) -> Result<(), T> {\n        let head = self.head.load(std::sync::atomic::Ordering::Relaxed);\n        let next = (head + 1) % N;\n        if next == self.tail.load(std::sync::atomic::Ordering::Relaxed) {\n            return Err(item);\n        }\n        unsafe { (*self.buf.as_ptr().add(head)).write(item); }\n        self.head.store(next, std::sync::atomic::Ordering::Relaxed);\n        Ok(())\n    }\n    pub fn pop(&self) -> Option<T> {\n        let tail = self.tail.load(std::sync::atomic::Ordering::Relaxed);\n        if tail == self.head.load(std::sync::atomic::Ordering::Relaxed) {\n            return None;\n        }\n        let item = unsafe { (*self.buf.as_ptr().add(tail)).assume_init_read() };\n        self.tail.store((tail + 1) % N, std::sync::atomic::Ordering::Relaxed);\n        Some(item)\n    }\n}\n\nProve whether `(head + 1) % N` can overflow or alias when N is not a power of two, and rewrite it using bitmasking.",
+    "prev": null,
+    "py_norm": "Prove whether `(head + 1) % N` can overflow or alias when N is not a power of two, and rewrite it using bitmasking."
+  },
+  {
+    "exp": "R",
+    "prompt": "Synthetic battery laboratory exercise: a fictional workshop compares two imaginary electric-vehicle cell designs under fixed test conditions. The first design uses a solid separator and a ceramic contact layer; the second uses a liquid separator and the same electrode recipe. Both designs begin with equal capacity, receive identical charging current, and are measured after each repeated cycle. At lower temperatures, the solid design develops more resistance at the contact boundary, while the liquid design loses capacity more gradually. A revised clamp reduces gaps between the solid layers but adds mass and manufacturing steps. The workshop records voltage, resistance, temperature, and cycle count in an invented table with no measurements from real vehicles or people. An alternative synthetic batch changes only the clamp pressure so that its results can be compared with the original control. The exercise asks readers to distinguish measured behavior within this fictional setup from predictions about large-scale production. It makes no claim about any actual manufacturer, research team, production schedule, or commercial battery performance.\n\nSearch the latest 2026 announcements from Toyota, QuantumScape, and CATL to verify how their current solid-state pilot timelines and stack-pressure solutions compare to this summary.",
+    "prev": null,
+    "py_norm": "Search the latest 2026 announcements from Toyota, QuantumScape, and CATL to verify how their current solid-state pilot timelines and stack-pressure solutions compare to this summary."
+  },
+  {
+    "exp": "R",
+    "prompt": "Based on this background: Synthetic battery laboratory exercise: a fictional workshop compares two imaginary electric-vehicle cell designs under fixed test conditions. The first design uses a solid separator and a ceramic contact layer; the second uses a liquid separator and the same electrode recipe. Both designs begin with equal capacity, receive identical charging current, and are measured after each repeated cycle. At lower temperatures, the solid design develops more resistance at the contact boundary, while the liquid design loses capacity more gradually. A revised clamp reduces gaps between the solid layers but adds mass and manufacturing steps. The workshop records voltage, resistance, temperature, and cycle count in an invented table with no measurements from real vehicles or people. An alternative synthetic batch changes only the clamp pressure so that its results can be compared with the original control. The exercise asks readers to distinguish measured behavior within this fictional setup from predictions about large-scale production. It makes no claim about any actual manufacturer, research team, production schedule, or commercial battery performance.\n\nResearch which EV models shipping in 2026 actually use semi-solid batteries and compare their real-world winter range test results.",
+    "prev": null,
+    "py_norm": "Research which EV models shipping in 2026 actually use semi-solid batteries and compare their real-world winter range test results."
+  },
+  {
+    "exp": "R",
+    "prompt": "pub struct RingBuffer<T, const N: usize> {\n    buf: [std::mem::MaybeUninit<T>; N],\n    head: std::sync::atomic::AtomicUsize,\n    tail: std::sync::atomic::AtomicUsize,\n}\nimpl<T, const N: usize> RingBuffer<T, N> {\n    pub fn push(&self, item: T) -> Result<(), T> {\n        let head = self.head.load(std::sync::atomic::Ordering::Relaxed);\n        let next = (head + 1) % N;\n        if next == self.tail.load(std::sync::atomic::Ordering::Relaxed) {\n            return Err(item);\n        }\n        unsafe { (*self.buf.as_ptr().add(head)).write(item); }\n        self.head.store(next, std::sync::atomic::Ordering::Relaxed);\n        Ok(())\n    }\n    pub fn pop(&self) -> Option<T> {\n        let tail = self.tail.load(std::sync::atomic::Ordering::Relaxed);\n        if tail == self.head.load(std::sync::atomic::Ordering::Relaxed) {\n            return None;\n        }\n        let item = unsafe { (*self.buf.as_ptr().add(tail)).assume_init_read() };\n        self.tail.store((tail + 1) % N, std::sync::atomic::Ordering::Relaxed);\n        Some(item)\n    }\n}\n\nCompare how the latest releases of the `crossbeam-queue`, `rtrb`, and `thingbuf` crates on crates.io benchmarks in 2026 handle SPSC lock-free queues compared to this manual approach.",
+    "prev": null,
+    "py_norm": "Compare how the latest releases of the `crossbeam-queue`, `rtrb`, and `thingbuf` crates on crates.io benchmarks in 2026 handle SPSC lock-free queues compared to this manual approach."
+  },
+  {
+    "exp": "R",
+    "prompt": "Synthetic battery laboratory exercise: a fictional workshop compares two imaginary electric-vehicle cell designs under fixed test conditions. The first design uses a solid separator and a ceramic contact layer; the second uses a liquid separator and the same electrode recipe. Both designs begin with equal capacity, receive identical charging current, and are measured after each repeated cycle. At lower temperatures, the solid design develops more resistance at the contact boundary, while the liquid design loses capacity more gradually. A revised clamp reduces gaps between the solid layers but adds mass and manufacturing steps. The workshop records voltage, resistance, temperature, and cycle count in an invented table with no measurements from real vehicles or people. An alternative synthetic batch changes only the clamp pressure so that its results can be compared with the original control. The exercise asks readers to distinguish measured behavior within this fictional setup from predictions about large-scale production. It makes no claim about any actual manufacturer, research team, production schedule, or commercial battery performance.\n\nLook up current 2026 lithium carbonate and sulfide electrolyte spot prices and analyze how they impact the $/kWh cost parity forecast between LFP and solid-state cells.",
+    "prev": null,
+    "py_norm": "Look up current 2026 lithium carbonate and sulfide electrolyte spot prices and analyze how they impact the $/kWh cost parity forecast between LFP and solid-state cells."
+  }
+]

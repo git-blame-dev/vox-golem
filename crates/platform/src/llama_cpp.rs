@@ -2294,9 +2294,12 @@ mod tests {
 
     #[test]
     fn e2e_bge_small_132_cases_when_env_configured() {
-        let Some(cases_path) = std::env::var_os("VOXGOLEM_BENCH_CASES_JSON") else {
-            return;
-        };
+        let cases_path = std::env::var_os("VOXGOLEM_BENCH_CASES_JSON")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../core/tests/fixtures/router_cases_132.json")
+            });
         let attach_port = std::env::var("VOXGOLEM_BENCH_ATTACH_PORT")
             .ok()
             .and_then(|s| s.parse::<u16>().ok());
