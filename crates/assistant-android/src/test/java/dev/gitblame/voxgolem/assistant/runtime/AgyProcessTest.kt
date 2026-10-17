@@ -295,4 +295,85 @@ class AgyProcessTest {
             assertTrue(retired.await(1, TimeUnit.SECONDS))
         }
     }
+
+    @Test fun agyUsesPreparedSearchRouteAndAppendsSourceFooterOnLiveQuery() {
+        val footer = "\n\nSources:\nhttps://example.com/weather\n"
+        var prepareSearchCalls = 0
+        val fakeSearchNative = object : ProviderNativeCalls {
+            override fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String = error("Not used")
+            override fun cancel(requestId: String) {}
+            override fun prepareSearch(requestJson: String, callback: ProviderDeltaCallback): String {
+                prepareSearchCalls++
+                callback.onStatus("Searching")
+                return JSONObject()
+                    .put("evidenceContext", "Tokyo weather is 18C and clear.")
+                    .put("sourceFooter", footer)
+                    .put("needsEscalation", false)
+                    .toString()
+            }
+        }
+        val engines = mutableListOf<Engine>()
+        val testContext = agyTestContext(folder.newFolder())
+        AgyProviderNative(
+            context = testContext,
+            executableSource = { File("/synthetic/agycli") },
+            processFactory = { _, _, _ -> Engine("$delta\n$success\n").also { engines += it } },
+            requestTimeoutMs = 5000,
+            searchNative = fakeSearchNative
+        ).use { native ->
+            val callback = Callback()
+            val req = JSONObject()
+                .put("model", "agy-flash-high")
+                .put("webEnabled", true)
+                .put("searchMode", "quick")
+                .put("prompt", "What is the weather in Tokyo today?")
+            val resStr = native.respond("req-search-test", "", req.toString(), callback)
+            val res = JSONObject(resStr)
+
+            assertEquals(1, prepareSearchCalls)
+            assertEquals("complete", res.getString("status"))
+            assertEquals("Synthetic answer$footer", res.getString("text"))
+            assertEquals("Synthetic answer", res.getString("speechText"))
+            assertEquals("Synthetic answer$footer", callback.text.toString())
+
+            val wire = JSONObject(engines.single().input.toString("UTF-8"))
+            assertEquals("user", wire.getString("event"))
+            val content = wire.getJSONObject("message").getString("content")
+            val canonical = JSONObject(content.substringAfter('\n'))
+            assertTrue(canonical.has("webEvidence"))
+            assertEquals("Tokyo weather is 18C and clear.", canonical.getString("webEvidence"))
+            assertTrue(content.substringBefore('\n').contains("Use the provided webEvidence field directly to answer"))
+        }
+    }
+
+    @Test fun agyPrivateEnvironmentPrepareWritesPureVoiceAssistantAgentAndEmptySkills() {
+        val testContext = agyTestContext(folder.newFolder())
+        assertTrue(AgyPrivateEnvironment.prepare(testContext))
+
+        val workspace = File(testContext.filesDir, "ws")
+        val agentFile = File(workspace, ".agents/agents/vox-assistant.md")
+        assertTrue("vox-assistant.md must exist", agentFile.isFile)
+        val agentContent = agentFile.readText(Charsets.UTF_8)
+        assertTrue(agentContent.contains("name: vox-assistant"))
+        assertTrue(agentContent.contains("enable_write_tools: false"))
+        assertTrue(agentContent.contains("enable_mcp_tools: false"))
+        assertTrue(agentContent.contains("enable_subagent_tools: false"))
+        assertTrue(agentContent.contains("You are VoxGolem, a fast, direct voice and chat assistant."))
+
+        val wsSkillsFile = File(workspace, ".agents/skills.json")
+        assertTrue("ws skills.json must exist", wsSkillsFile.isFile)
+        assertEquals("{\"entries\":[]}", wsSkillsFile.readText(Charsets.UTF_8))
+
+        val wsRulesFile = File(workspace, ".agents/rules.json")
+        assertTrue("ws rules.json must exist", wsRulesFile.isFile)
+        assertEquals("{\"entries\":[]}", wsRulesFile.readText(Charsets.UTF_8))
+
+        val configSkillsFile = File(testContext.filesDir, "home/.gemini/config/skills.json")
+        assertTrue("home skills.json must exist", configSkillsFile.isFile)
+        assertEquals("{\"entries\":[]}", configSkillsFile.readText(Charsets.UTF_8))
+
+        val configPluginsFile = File(testContext.filesDir, "home/.gemini/config/plugins.json")
+        assertTrue("home plugins.json must exist", configPluginsFile.isFile)
+        assertEquals("{\"entries\":[]}", configPluginsFile.readText(Charsets.UTF_8))
+    }
 }

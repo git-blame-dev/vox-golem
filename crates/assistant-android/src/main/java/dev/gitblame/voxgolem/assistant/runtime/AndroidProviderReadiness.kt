@@ -20,6 +20,6 @@ internal object AndroidProviderReadiness {
             if (Build.VERSION.SDK_INT >= 34) "On-device Gemini Nano via AICore; availability is checked on request" else "Gemini Nano requires Android 14+")
         return mapOf("local-fast" to OptionalProviderReadiness(false, "No owned local server readiness is published on Android"),
             GeminiNanoProvider.MODEL_NAME to nano,
-            "agy-flash-low" to agy, "agy-flash-high" to agy, "agy-opus-high" to agy, "agy-sonnet-low" to agy, "agy-sonnet-high" to agy)
+            "agy-flash-none" to agy, "agy-flash-low" to agy, "agy-flash-high" to agy, "agy-opus-high" to agy, "agy-sonnet-low" to agy, "agy-sonnet-high" to agy)
     }
 }

@@ -579,4 +579,114 @@ class GeminiNanoProviderTest {
         assertTrue(prepareSearchCalled)
         assertEquals("ctx", JSONObject(prep).getString("evidenceContext"))
     }
+
+    @Test
+    fun shouldRunWebSearchSkipsSuppliedTextTransformationsEvenWithKeywords() {
+        // Prefix colon-supplied text
+        val prefixQuery = "Fix the typos in this sentence: What is the weather in Tokyo today?"
+        assertFalse(GeminiNanoProvider.shouldRunWebSearch(true, "quick", prefixQuery))
+
+        val prefixWithFillers = "Um, like, please summarize: What is the weather today?"
+        assertFalse(GeminiNanoProvider.shouldRunWebSearch(true, "quick", prefixWithFillers))
+
+        // Tail-supplied text on long paste (> 180 chars)
+        val longPaste = "The year 2026 global economic report shows severe weather events in multiple regions across the continent, affecting agriculture and energy distribution infrastructure significantly. Please summarize the above article."
+        assertTrue(longPaste.length > 180)
+        assertTrue(longPaste.contains("2026"))
+        assertTrue(longPaste.contains("weather"))
+        assertFalse(GeminiNanoProvider.shouldRunWebSearch(true, "quick", longPaste))
+    }
+
+    @Test
+    fun shouldRunWebSearchHandlesMultiTurnEllipticalFollowUps() {
+        val prevQuery = "What is the stock price of AMD right now?"
+        val followUp = "What about Nvidia?"
+
+        // Multi-turn elliptical follow-up triggers search using prevUserQuery context
+        assertTrue(GeminiNanoProvider.shouldRunWebSearch(true, "quick", followUp, prevQuery))
+
+        // Without prevUserQuery, "What about Nvidia?" alone does not match keywords
+        assertFalse(GeminiNanoProvider.shouldRunWebSearch(true, "quick", followUp, null))
+        assertFalse(GeminiNanoProvider.shouldRunWebSearch(true, "quick", followUp))
+
+        // De-escalating format request does not trigger search even with elliptical prefix
+        val deEscalating = "What about a shorter bullet points summary?"
+        assertFalse(GeminiNanoProvider.shouldRunWebSearch(true, "quick", deEscalating, prevQuery))
+    }
+
+    @Test
+    fun shouldRunWebSearchIgnoresKeywordsBuriedInLongPastedCodeBlocks() {
+        val codeBlock = """
+            // Ring buffer implementation in Rust for audio processing
+            // Initialized in release cycle 2026 with fixed capacity
+            struct RingBuffer {
+                head: usize,
+                tail: usize,
+                buf: [f32; 1024],
+            }
+            impl RingBuffer {
+                fn push(&mut self, val: f32) {
+                    self.buf[self.head] = val;
+                    self.head += 1;
+                }
+            }
+        """.trimIndent()
+        val promptWithInstruction = "$codeBlock\n\nWhy does this Rust ring buffer panic?"
+        assertTrue(promptWithInstruction.length > 300)
+        assertTrue(promptWithInstruction.contains("2026"))
+        assertFalse(GeminiNanoProvider.shouldRunWebSearch(true, "quick", promptWithInstruction))
+    }
+
+    @Test
+    fun multiTurnEllipticalFollowUpRunsSearchInRespondLifecycle() {
+        var searchCallCount = 0
+        val fakeSearch = FakeSearchNative { _, cb ->
+            searchCallCount += 1
+            cb.onStatus("Searching")
+            JSONObject()
+                .put("evidenceContext", "Nvidia NVDA is trading at $130.")
+                .put("sourceFooter", "\n\nSources:\nhttps://example.com/nvda\n")
+                .put("sources", JSONArray())
+                .toString()
+        }
+        val provider = GeminiNanoProvider(
+            RuntimeEnvironment.getApplication(),
+            searchNative = fakeSearch,
+            engineFactory = { FakeEngine() }
+        )
+
+        val messages = JSONArray()
+            .put(JSONObject().put("role", "user").put("content", "What is the stock price of AMD right now?"))
+            .put(JSONObject().put("role", "assistant").put("content", "AMD is trading at $150."))
+            .put(JSONObject().put("role", "user").put("content", "What about Nvidia?"))
+
+        val requestJson = JSONObject()
+            .put("model", "gemini-nano")
+            .put("messages", messages)
+            .put("webEnabled", true)
+            .put("searchMode", "quick")
+            .toString()
+
+        val callback = RecordingCallback()
+        val res = JSONObject(provider.respond("req-elliptical", "/auth", requestJson, callback))
+        assertEquals("complete", res.getString("status"))
+        assertEquals(1, searchCallCount)
+        assertEquals(listOf("Searching"), callback.statuses)
+    }
+
+    @Test
+    fun shouldRunWebSearchMatchesRust2dRouterParityForLiveOverridesFactualAndCodingQueries() {
+        // Live overrides beat coding keywords and trigger search
+        assertTrue(PreparedSearchRoute.shouldRunWebSearch(true, "quick", "What is the latest version of Rust in 2026?"))
+        assertTrue(PreparedSearchRoute.shouldRunWebSearch(true, "quick", "Double check online how Exa works officially and what community can do unofficially"))
+
+        // Factual / quick search keywords trigger search
+        assertTrue(PreparedSearchRoute.shouldRunWebSearch(true, "quick", "Who is the President of the United States?"))
+        assertTrue(PreparedSearchRoute.shouldRunWebSearch(true, "quick", "What are the specs of the Pixel 8?"))
+
+        // Self-identity, coding/direct, and pure math queries skip search
+        assertFalse(PreparedSearchRoute.shouldRunWebSearch(true, "quick", "What model are you?"))
+        assertFalse(PreparedSearchRoute.shouldRunWebSearch(true, "quick", "Why does this Rust ring buffer panic?"))
+        assertFalse(PreparedSearchRoute.shouldRunWebSearch(true, "quick", "What is 14 * 15?"))
+    }
 }

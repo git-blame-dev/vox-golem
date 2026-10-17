@@ -35,6 +35,11 @@ class AssistantDiagnosticJournal(
         val webEnabled: Boolean? = null,
         val bytes: Long? = null, val count: Int? = null, val sdkError: Int? = null,
         val requestedLanguage: String? = null,
+        val route: String? = null,
+        val warm: Boolean? = null,
+        val searchMs: Long? = null,
+        val firstTextMs: Long? = null,
+        val completedMs: Long? = null,
     )
     private data class Record(val operation: AssistantTiming.Operation, val run: Int, val parent: Int?,
         val observed: Long, val event: AssistantTiming.Event? = null, val metadata: Metadata? = null)
@@ -66,7 +71,7 @@ class AssistantDiagnosticJournal(
     fun offerMetadata(operation: AssistantTiming.Operation, run: Int, parentRun: Int?, observedNanos: Long,
         metadata: Metadata) {
         // Constant-time admission bounds memory too; detailed token validation remains on the worker.
-        if (listOf(metadata.engine, metadata.voice, metadata.language, metadata.requestedLanguage, metadata.model, metadata.searchMode, metadata.entry)
+        if (listOf(metadata.engine, metadata.voice, metadata.language, metadata.requestedLanguage, metadata.model, metadata.searchMode, metadata.entry, metadata.route)
                 .any { it != null && it.length > 256 }) {
             dropped.incrementAndGet()
             return
@@ -232,6 +237,11 @@ class AssistantDiagnosticJournal(
             value("entry", it.entry?.takeIf { s -> s in ENTRIES })
             value("onDevice", it.onDevice); value("networkRequired", it.networkRequired); value("cacheHit", it.cacheHit)
             value("webEnabled", it.webEnabled)
+            value("route", it.route?.takeIf { s -> ROUTE.matches(s) })
+            value("warm", it.warm)
+            value("search_ms", it.searchMs?.takeIf { n -> n >= 0L })
+            value("first_text_ms", it.firstTextMs?.takeIf { n -> n >= 0L })
+            value("completed_ms", it.completedMs?.takeIf { n -> n >= 0L })
             value("bytes", it.bytes?.takeIf { n -> n in 0..1_073_741_824L })
             value("count", it.count?.takeIf { n -> n in 0..1_000_000 })
             // Android SpeechRecognizer errors 1..15; TextToSpeech errors -1..-9, success 0.
@@ -244,11 +254,14 @@ class AssistantDiagnosticJournal(
         private val FILE_NAME = Regex("assistant-timing-(0|[1-9][0-9]{0,18})-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-[1-9][0-9]*\\.jsonl")
         private val VOICE = Regex("[a-z]{2,3}-[a-z]{2}(?:-x-[a-z]{3}-(?:local|network)|-language)")
         private val LANGUAGE = Regex("[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*")
+        private val ROUTE = Regex("[A-Za-z0-9_-]{1,32}")
         private val SEARCH_MODES = setOf("quick", "verify", "research", "direct")
         private val ENTRIES = setOf("ask", "talk", "chat", "manual")
         // Explicit aliases/server IDs from AgyProvider and platform/custom_openai; never arbitrary server names.
         private val MODELS = setOf("agy-opus-high", "claude-opus-5-5-high", "opus-5.5", "opus5.5",
-            "agy-sonnet-high", "claude-sonnet-5-5-high", "sonnet-5.5", "sonnet5.5", "agy-flash-low",
+            "agy-sonnet-high", "claude-sonnet-5-5-high", "sonnet-5.5", "sonnet5.5",
+            "agy-sonnet-low", "claude-sonnet-5-5-low", "gemini-nano",
+            "agy-flash-none", "gemini-3.8-flash-none", "agy-flash-low",
             "gemini-3.8-flash-low", "agy-flash-high", "gemini-3.8-flash-high", "3.8-flash-high",
             "custom-sol-high", "custom-sol-none", "custom-luna-none", "custom-luna-low", "local-fast",
             "gpt-6.1-sol", "gpt-6-luna", "gpt-5.6-luna")

@@ -57,7 +57,7 @@ interface AssistantModelStorage {
 
 object AssistantModels {
     val customLabels = mapOf("custom-sol-high" to "Sol High", "custom-sol-none" to "Sol None", "custom-luna-none" to "Luna None", "custom-luna-low" to "Luna Low")
-    val optionalLabels = mapOf("gemini-nano" to "Local: Gemini Nano", "agy-flash-low" to "Agy: Gemini 3.8 Flash Low",
+    val optionalLabels = mapOf("gemini-nano" to "Local: Gemini Nano", "agy-flash-none" to "Agy: Gemini 3.8 Flash None", "agy-flash-low" to "Agy: Gemini 3.8 Flash Low",
         "agy-flash-high" to "Agy: Gemini 3.8 Flash High", "agy-opus-high" to "Agy: Claude Opus 5.5 High",
         "agy-sonnet-low" to "Agy: Claude Sonnet 5.5 Low", "agy-sonnet-high" to "Agy: Claude Sonnet 5.5 High")
     val aliases = (customLabels.keys + optionalLabels.keys).toList()
@@ -225,7 +225,7 @@ class AssistantEngine @JvmOverloads internal constructor(
     }
     override fun prewarm() {
         val current = snapshot()
-        if (current.busy || !current.foreground || current.model !in AssistantModels.aliases) return
+        if (current.busy || !current.foreground || !current.contextReady || current.model !in AssistantModels.aliases) return
         prewarmSelected(current.model, current.webEnabled, current.busy)
     }
 
@@ -678,7 +678,36 @@ class AssistantEngine @JvmOverloads internal constructor(
                     }
                     override fun onOutcome(requestId: String, outcomeJson: String) {
                         ticket.timing.mark(Stage.OUTCOME_RECEIVED)
-                        val isComplete = try { JSONObject(outcomeJson).optString("status") == "complete" } catch (_: RuntimeException) { false }
+                        val outcome = try { JSONObject(outcomeJson) } catch (_: RuntimeException) { null }
+                        val status = outcome?.optString("status", "")?.takeIf { it.isNotEmpty() } ?: "invalid"
+                        val returnedModel = outcome?.optString("returnedModel", "")?.takeIf { !outcome.isNull("returnedModel") && it.isNotEmpty() }
+                        val firstTextMs = outcome?.optLong("firstTextMs", -1L)?.takeIf { it >= 0L } ?: turn.firstTextMs
+                        val completedMs = outcome?.optLong("completedMs", -1L)?.takeIf { it >= 0L }
+                        val searchMs = outcome?.optLong("searchMs", -1L)?.takeIf { it >= 0L }
+                        val route = outcome?.optString("route", "")?.takeIf { !outcome.isNull("route") && it.isNotEmpty() }
+                        val warm = if (outcome != null && outcome.has("warm") && !outcome.isNull("warm")) outcome.optBoolean("warm") else null
+                        val requestedModel = turn.model
+                        val searchMode = turn.searchMode
+                        val webEnabled = turn.webEnabled
+                        ticket.timing.metadata(
+                            Metadata(
+                                model = returnedModel ?: requestedModel,
+                                searchMode = searchMode,
+                                webEnabled = webEnabled,
+                                route = route,
+                                warm = warm,
+                                searchMs = searchMs,
+                                firstTextMs = firstTextMs,
+                                completedMs = completedMs,
+                            )
+                        )
+                        runCatching {
+                            android.util.Log.i(
+                                "VoxGolemWorkflowTiming",
+                                "turn_outcome status=$status model=${returnedModel ?: requestedModel} search_mode=$searchMode web=$webEnabled route=${route ?: "auto"} warm=${warm ?: "unknown"} search_ms=${searchMs ?: -1} first_text_ms=${firstTextMs ?: -1} completed_ms=${completedMs ?: -1}"
+                            )
+                        }
+                        val isComplete = status == "complete"
                         if (isComplete && turn.epoch == epoch.get()) {
                             val ready = ticket.delivery?.let { gate ->
                                 ticket.timing.mark(Stage.DELIVERY_WAIT)

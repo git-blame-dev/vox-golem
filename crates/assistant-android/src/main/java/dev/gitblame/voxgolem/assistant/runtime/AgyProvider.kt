@@ -21,7 +21,7 @@ import java.util.concurrent.ConcurrentHashMap
 class AgyProviderRouter(
     private val context: Context,
     private val defaultNative: ProviderNativeCalls = AssistantProviderNative,
-    private val agyNative: ProviderNativeCalls = AgyProviderNative(context),
+    private val agyNative: ProviderNativeCalls = AgyProviderNative(context, searchNative = defaultNative),
     private val geminiNanoNative: ProviderNativeCalls = GeminiNanoProvider(context, searchNative = defaultNative),
     private val phoneRelay: ProviderNativeCalls? = watchPhoneRelay(context),
 ) : ProviderNativeCalls {
@@ -87,12 +87,14 @@ class AgyProviderRouter(
     }
 }
 
-class AgyProviderNative internal constructor(private val context: Context,
+class AgyProviderNative internal constructor(
+    private val context: Context,
     private val executableSource: (() -> File?)? = null,
     private val processFactory: ((File, String, String) -> Process)? = null,
     private val requestTimeoutMs: Long = 180_000,
+    private val searchNative: ProviderNativeCalls? = null,
 ) : ProviderNativeCalls, AutoCloseable {
-    constructor(context: Context) : this(context, null, null)
+    constructor(context: Context, searchNative: ProviderNativeCalls? = null) : this(context, null, null, 180_000, searchNative)
     companion object {
         private const val TAG = "AgyProvider"
     }
@@ -147,7 +149,7 @@ class AgyProviderNative internal constructor(private val context: Context,
         "agy-opus-high", "claude-opus-5-5-high", "opus-5.5", "opus5.5" -> "claude-opus-5-5-high"
         "agy-sonnet-high", "claude-sonnet-5-5-high", "sonnet-5.5", "sonnet5.5" -> "claude-sonnet-5-5-high"
         "agy-sonnet-low", "claude-sonnet-5-5-low" -> "claude-sonnet-5-5-low"
-        "agy-flash-low", "gemini-3.8-flash-low" -> "gemini-3.8-flash-low"
+        "agy-flash-none", "gemini-3.8-flash-none", "agy-flash-low", "gemini-3.8-flash-low" -> "gemini-3.8-flash-low"
         "agy-flash-high", "gemini-3.8-flash-high", "3.8-flash-high" -> "gemini-3.8-flash-high"
         else -> if (requestedModel.startsWith("claude-") || requestedModel.startsWith("gemini-")) requestedModel else "gemini-3.8-flash-high"
     }
@@ -168,6 +170,7 @@ class AgyProviderNative internal constructor(private val context: Context,
                 "--output-format", "stream-json",
                 "--dangerously-skip-permissions",
                 "--disable-slash-commands",
+                "--agent", "vox-assistant",
                 "--effort", effort,
                 "--model", targetAgyModel
             )
@@ -180,7 +183,10 @@ class AgyProviderNative internal constructor(private val context: Context,
             env["ANDROID_ROOT"] = "/system"
             env["ANDROID_DATA"] = "/data"
 
-            val p = processFactory?.invoke(executable, targetAgyModel, effort) ?: pb.start()
+            val p = processFactory?.invoke(executable, targetAgyModel, effort) ?: pb.start().also { started ->
+                // Trigger stream-json session initialization immediately during prewarm so Turn 1 does not wait ~4s for init.
+                runCatching { writeAgyInput(started, "{\"event\":\"init\"}\n") }
+            }
             val admitted = synchronized(lock) {
                 process = p
                 activeModel = targetAgyModel
@@ -270,32 +276,39 @@ class AgyProviderNative internal constructor(private val context: Context,
         }
 
         var retired = false
+        var reprewarmTarget: String? = null
+        val consumed = AtomicBoolean(false)
         val outcome = try {
             // Registration, not process/model readiness. Never call the worker under our monitor:
             // it may immediately forward a cancellation latched before this handshake.
             callback.onReady()
             if (cancelled.get()) JSONObject().put("status", "cancelled").toString()
-            else respondOwned(requestJson, callback)
+            else respondOwned(requestJson, callback, consumed)
         } catch (_: Exception) {
             failure("internal_error", "Agy request failed")
         } finally {
             // Each admitted input permanently mutates implicit CLI history. Never reuse it.
             val owned = synchronized(lock) { process?.takeIf { processUsed } }
-            owned?.let { retire(it) }
+            owned?.let {
+                consumed.set(true)
+                retire(it)
+            }
             synchronized(lock) {
                 retired = ioRetired && !agyAlive(process?.takeIf { processUsed })
                 retirementOwner = if (retired) null else requestId
                 if (activeRequestId == requestId) activeRequestId = null
+                if (retired && consumed.get()) reprewarmTarget = prewarmTargetModel
             }
         }
         if (!retired) {
             Log.w(TAG, "Agy request retirement is unconfirmed; admission remains blocked")
             return failure("retirement_failed", "Agy process retirement is unconfirmed; route remains owned")
         }
+        reprewarmTarget?.let { prewarm(it, true) }
         return outcome
     }
 
-    private fun respondOwned(requestJson: String, callback: ProviderDeltaCallback): String {
+    private fun respondOwned(requestJson: String, callback: ProviderDeltaCallback, consumed: AtomicBoolean): String {
         val executable = getExecutable()
         if (executable == null) {
             return JSONObject().put("status", "error").put("code", "unsupported_model")
@@ -309,7 +322,8 @@ class AgyProviderNative internal constructor(private val context: Context,
         val webEnabled = reqObj.optBoolean("webEnabled", true)
         // Authored CLI contract has no verified tool-denial protocol. Prompt text is not enforcement.
         if (!webEnabled) return failure("unsupported_search_mode", "Agy cannot enforce disabled web tools")
-        val serializedRequest = canonicalInput(reqObj)
+        // Validate canonical input structure upfront before launching process or search.
+        canonicalInput(reqObj)
         synchronized(lock) {
             if (cancelled.get()) return JSONObject().put("status", "cancelled").toString()
             ioRetired = false
@@ -322,9 +336,14 @@ class AgyProviderNative internal constructor(private val context: Context,
                 if (cancelled.get()) return@submit JSONObject().put("status", "cancelled").toString()
                 if (!preparePrivateEnvironment()) return@submit failure("auth_unavailable", "Agy requires externally provisioned app-private access and installation identity")
                 if (cancelled.get()) return@submit JSONObject().put("status", "cancelled").toString()
+                val wasWarm = synchronized(lock) { !processUsed && activeModel == targetAgyModel && agyAlive(process) }
                 if (!startProcess(executable, targetAgyModel, effort)) return@submit failure("internal_error", "Failed to start Agy process")
-                val owned = synchronized(lock) { processUsed = true; requireNotNull(process) }
-                exchange(owned, serializedRequest, targetAgyModel, callback)
+                val owned = synchronized(lock) { processUsed = true; consumed.set(true); requireNotNull(process) }
+                val currentReqId = synchronized(lock) { activeRequestId } ?: ""
+                val prepared = PreparedSearchRoute.prepare(currentReqId, reqObj, searchNative, callback) { cancelled.get() }
+                if (cancelled.get()) return@submit JSONObject().put("status", "cancelled").toString()
+                val serializedRequest = canonicalInput(reqObj, prepared.evidenceContext)
+                exchange(owned, serializedRequest, targetAgyModel, callback, prepared, wasWarm)
             }
             finally { synchronized(lock) { ioRetired = true }; exited.countDown() }
         } } catch (error: RuntimeException) { synchronized(lock) { ioRetired = true }; throw error }
@@ -345,7 +364,15 @@ class AgyProviderNative internal constructor(private val context: Context,
         }
     }
 
-    private fun exchange(owned: Process, serializedRequest: String, targetAgyModel: String, callback: ProviderDeltaCallback): String {
+    private fun exchange(
+        owned: Process,
+        serializedRequest: String,
+        targetAgyModel: String,
+        callback: ProviderDeltaCallback,
+        prepared: PreparedSearchResult = PreparedSearchResult(null, "", false),
+        wasWarm: Boolean = false,
+    ): String {
+        val sourceFooter = prepared.sourceFooter
         val accumulated = StringBuilder()
         val reader = AgyLines(owned.inputStream)
         try {
@@ -390,6 +417,29 @@ class AgyProviderNative internal constructor(private val context: Context,
                         val text = accumulated.toString()
                         if (text.isBlank()) return failure("provider_failure", "Agy terminal success contained no answer")
                         val completedMs = timing.completedMs()
+                        runCatching {
+                            Log.i(
+                                "VoxGolemWorkflowTiming",
+                                "provider=agy model=$targetAgyModel route=${prepared.route} warm=$wasWarm search_ms=${prepared.searchMs} sources=${prepared.sourcesCount} evidence_bytes=${prepared.evidenceBytes} first_text_ms=${timing.firstTextMs} completed_ms=$completedMs"
+                            )
+                        }
+                        if (sourceFooter.isNotEmpty()) {
+                            callback.onDelta(sourceFooter)
+                            return JSONObject()
+                                .put("status", "complete")
+                                .put("contentType", "output_text")
+                                .put("text", text + sourceFooter)
+                                .put("speechText", text)
+                                .put("returnedModel", targetAgyModel)
+                                .put("firstTextMs", timing.firstTextMs)
+                                .put("completedMs", completedMs)
+                                .put("route", prepared.route)
+                                .put("searchMs", prepared.searchMs)
+                                .put("sourcesCount", prepared.sourcesCount)
+                                .put("evidenceBytes", prepared.evidenceBytes)
+                                .put("warm", wasWarm)
+                                .toString()
+                        }
                         return JSONObject()
                             .put("status", "complete")
                             .put("contentType", "output_text")
@@ -397,6 +447,11 @@ class AgyProviderNative internal constructor(private val context: Context,
                             .put("returnedModel", targetAgyModel)
                             .put("firstTextMs", timing.firstTextMs)
                             .put("completedMs", completedMs)
+                            .put("route", prepared.route)
+                            .put("searchMs", prepared.searchMs)
+                            .put("sourcesCount", prepared.sourcesCount)
+                            .put("evidenceBytes", prepared.evidenceBytes)
+                            .put("warm", wasWarm)
                             .toString()
                     } else {
                         return JSONObject()
@@ -417,12 +472,21 @@ class AgyProviderNative internal constructor(private val context: Context,
     }
 
     override fun cancel(requestId: String) {
+        var shouldCancelSearch = false
         val owned = synchronized(lock) {
             if (activeRequestId == requestId || retirementOwner == requestId) {
+                if (activeRequestId == requestId) {
+                    shouldCancelSearch = true
+                }
                 cancelled.set(true)
                 // Registration may precede acquisition: an unused prewarm is not request IO.
                 process?.takeIf { processUsed }
             } else null
+        }
+        if (shouldCancelSearch) {
+            try {
+                searchNative?.cancel(requestId)
+            } catch (_: Throwable) {}
         }
         // Never wait for or perform blocked request IO under the cancellation monitor.
         owned?.let { beginRetirement(it) }
@@ -455,8 +519,10 @@ class AgyProviderNative internal constructor(private val context: Context,
         if (ready) retired()
     }
     private fun observeRetirement() {
+        var reprewarmTarget: String? = null
         val callback = synchronized(lock) {
             if (!ioRetired || agyAlive(process?.takeIf { processUsed })) return
+            reprewarmTarget = prewarmTargetModel
             waitingRetirement?.second.also {
                 waitingRetirement = null
                 retirementOwner = null
@@ -465,12 +531,14 @@ class AgyProviderNative internal constructor(private val context: Context,
         }
         if (callback != null) {
             Log.i(TAG, "Agy request retirement confirmed")
+            reprewarmTarget?.let { prewarm(it, true) }
             callback.invoke()
         }
     }
 
     override fun close() {
         cancelled.set(true)
+        advancePrewarmSelection()
         synchronized(lock) { process }?.let { retire(it) }
         io.shutdownNow()
         io.awaitTermination(1000, TimeUnit.MILLISECONDS)
@@ -480,7 +548,7 @@ class AgyProviderNative internal constructor(private val context: Context,
         retirementMonitor.shutdownNow()
     }
 
-    internal fun canonicalInput(request: JSONObject): String {
+    internal fun canonicalInput(request: JSONObject, evidenceContext: String? = null): String {
         val messages = request.optJSONArray("messages") ?: JSONArray().put(JSONObject().put("role", "user").put("content", request.optString("prompt")))
         require(messages.length() in 1..41)
         val canonical = JSONArray()
@@ -498,10 +566,17 @@ class AgyProviderNative internal constructor(private val context: Context,
         }
         val payload = JSONObject().put("instructions", request.optString("instructions"))
             .put("searchMode", request.optString("searchMode", "quick")).put("messages", canonical)
-        val searchInstruction = when (request.optString("searchMode", "quick")) {
-            "verify" -> "Verify statements and facts using web search. "
-            "research" -> "Conduct in-depth research using web search. "
-            else -> ""
+        if (!evidenceContext.isNullOrBlank()) {
+            payload.put("webEvidence", evidenceContext)
+        }
+        val searchInstruction = if (!evidenceContext.isNullOrBlank()) {
+            "Use the provided webEvidence field directly to answer and do not invoke built-in search tools. "
+        } else {
+            when (request.optString("searchMode", "quick")) {
+                "verify" -> "Verify statements and facts using web search. "
+                "research" -> "Conduct in-depth research using web search. "
+                else -> ""
+            }
         }
         // The supported stream-json input admits user content only. Use a fresh stateless process,
         // quote role-labelled canonical context, and retain full application instructions.

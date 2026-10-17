@@ -47,6 +47,7 @@ class AssistantTiming private constructor(
         PRIME_REQUESTED, PRIME_ACCEPTED, PRIME_REJECTED, PRIME_COMPLETED, PRIME_FAILED,
         CUE_PLAY_REQUESTED, CUE_LOAD_READY, CUE_PLAY_SUBMITTED,
         FIRST_CLAUSE_READY, TEXT_LAYOUT_OBSERVED, TEXT_DRAW_SUBMITTED,
+        SEARCH_PREPARED, SEARCH_SKIPPED,
     }
     enum class Kind { BEGIN, MARK, END }
     data class Event(val operation: Operation, val run: Int, val parentRun: Int?, val kind: Kind,

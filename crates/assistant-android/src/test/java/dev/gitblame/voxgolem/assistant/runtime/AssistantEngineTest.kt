@@ -72,7 +72,7 @@ class AssistantEngineTest {
     private fun settle() { providerQueue.drain(); io.drain() }
 
     @Test fun androidModelAliasesContainOnlyCustomNanoAndAgy() {
-        assertEquals(setOf("gemini-nano", "agy-flash-low", "agy-flash-high", "agy-opus-high",
+        assertEquals(setOf("gemini-nano", "agy-flash-none", "agy-flash-low", "agy-flash-high", "agy-opus-high",
             "agy-sonnet-low", "agy-sonnet-high"), AssistantModels.optionalLabels.keys)
         assertEquals(AssistantModels.customLabels.keys + AssistantModels.optionalLabels.keys, AssistantModels.aliases.toSet())
     }

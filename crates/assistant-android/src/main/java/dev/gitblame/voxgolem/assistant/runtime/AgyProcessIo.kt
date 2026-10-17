@@ -40,6 +40,7 @@ internal class AgyLines(private val input: InputStream, private val maxLineBytes
 /** Retain the Process until exit is confirmed; destroy() alone is only a request. */
 internal fun retireAgyProcess(process: Process, budgetMs: Long = 1000): Boolean {
     if (!agyAlive(process)) return true
+    runCatching { process.outputStream.close() }
     process.destroy()
     // Bounded wait and forced retirement are supported Process APIs only from Android 26.
     if (Build.VERSION.SDK_INT < 26) return !agyAlive(process)

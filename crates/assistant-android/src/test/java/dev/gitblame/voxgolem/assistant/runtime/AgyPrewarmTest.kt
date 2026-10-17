@@ -210,4 +210,32 @@ class AgyPrewarmTest {
             assertTrue(defaultForwarded.isEmpty())
         }
     }
+
+    @Test fun consumedPrewarmProcessAutomaticallyReprewarmsAfterRetirement() {
+        val started = java.util.concurrent.CopyOnWriteArrayList<LiveProcess>()
+        val executable = folder.newFile("libagy-reprewarm.so").apply { setExecutable(true) }
+        AgyProviderNative(context(), { executable }, { _, _, _ -> LiveProcess().also(started::add) }).use { provider ->
+            provider.prewarm("agy-flash-none", true)
+            val deadline1 = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+            while (started.size < 1 && System.nanoTime() < deadline1) Thread.sleep(10)
+            assertEquals(1, started.size)
+            val first = started[0]
+            assertFalse(first.destroyed)
+
+            val req = org.json.JSONObject()
+                .put("model", "agy-flash-none")
+                .put("webEnabled", true)
+                .put("prompt", "What is 3 plus 5?")
+                .toString()
+            provider.respond("req-1", "", req, callback)
+            assertTrue("Consumed first process must be retired after respond", first.destroyed)
+
+            val deadline2 = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+            while (started.size < 2 && System.nanoTime() < deadline2) Thread.sleep(10)
+            assertEquals("Replacement warm process must be automatically prewarmed for Turn 2", 2, started.size)
+            assertFalse(started[1].destroyed)
+            assertSame(started[1], provider.get("process"))
+            assertEquals(false, provider.get("processUsed"))
+        }
+    }
 }
