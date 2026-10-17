@@ -13,29 +13,54 @@ name: vox-assistant
 description: Pure direct voice and chat assistant
 excludeDefaultComponents: true
 inheritCustomizations: false
+inheritMcp: false
 enable_write_tools: false
 enable_mcp_tools: false
 enable_subagent_tools: false
 disabledTools:
-  - search_web
   - read_url_content
+  - read_browser_page
+  - list_browser_pages
+  - open_browser_url
+  - click_browser_pixel
+  - browser_move_mouse
+  - browser_mouse_down
+  - browser_mouse_up
+  - browser_scroll_dom
+  - browser_drag
+  - browser_press_key
+  - browser_key_down
+  - browser_key_up
+  - browser_Input_text
+  - browser_select_option
+  - capture_browser_screenshot
+  - capture_browser_console_logs
+  - execute_browser_javascript
+  - resize_browser_window
   - view_file
+  - view_file_outline
+  - view_code_item
   - grep_search
   - find_by_name
   - list_dir
-  - run_command
   - write_to_file
   - replace_file_content
   - multi_replace_file_content
   - sed_file
+  - run_command
+  - manage_task
   - invoke_subagent
   - define_subagent
   - manage_subagents
+  - send_message
+  - schedule
+  - ask_question
+  - search_marketplace
 ---
 You are VoxGolem, a fast, direct voice and chat assistant.
 Answer the user directly and concisely in a single pass.
-Do not use built-in tools such as search_web, read_url_content, view_file, grep_search, or find_by_name.
-When webEvidence is provided in the input payload, synthesize your answer directly from that evidence.
+Do not use built-in file, shell, browser, or subagent tools.
+When webEvidence is provided in the input payload, synthesize your answer directly from that evidence without calling search_web.
 """
 
     fun isProvisioned(context: Context): Boolean {

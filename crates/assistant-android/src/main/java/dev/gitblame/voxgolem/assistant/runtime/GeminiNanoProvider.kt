@@ -36,10 +36,6 @@ class GeminiNanoProvider(
 
         internal fun stripSourceFooter(text: String): String = PreparedSearchRoute.stripSourceFooter(text)
 
-        internal fun stripLeadingFillers(text: String): String = PreparedSearchRoute.stripLeadingFillers(text)
-
-        internal fun isolateLongPasteInstruction(text: String): String = PreparedSearchRoute.isolateLongPasteInstruction(text)
-
         internal fun extractUserQuery(reqObj: JSONObject): String = PreparedSearchRoute.extractUserQuery(reqObj)
 
         internal fun extractPreviousUserQuery(reqObj: JSONObject, currentQuery: String): String? =
@@ -321,7 +317,7 @@ class GeminiNanoProvider(
             runCatching {
                 Log.i(
                     "VoxGolemWorkflowTiming",
-                    "provider=gemini_nano model=gemini-nano route=${prepared.route} warm=$isEngineWarm search_ms=${prepared.searchMs} sources=${prepared.sourcesCount} evidence_bytes=${prepared.evidenceBytes} first_text_ms=$firstTextMs completed_ms=$completedMs"
+                    "provider=gemini_nano model=gemini-nano route=${prepared.route} warm=$isEngineWarm search_ms=${prepared.searchMs} search_status=${prepared.searchStatus} fallback=${prepared.fallbackUsed} sources=${prepared.sourcesCount} evidence_bytes=${prepared.evidenceBytes} first_text_ms=$firstTextMs completed_ms=$completedMs retire_ms=0"
                 )
             }
             val responseJson = JSONObject()
@@ -333,9 +329,12 @@ class GeminiNanoProvider(
                 .put("completedMs", completedMs)
                 .put("route", prepared.route)
                 .put("searchMs", prepared.searchMs)
+                .put("searchStatus", prepared.searchStatus)
+                .put("fallbackUsed", prepared.fallbackUsed)
                 .put("sourcesCount", prepared.sourcesCount)
                 .put("evidenceBytes", prepared.evidenceBytes)
                 .put("warm", isEngineWarm)
+                .put("retireMs", 0L)
             if (sourceFooter.isNotEmpty()) {
                 responseJson.put("speechText", answerText)
             }

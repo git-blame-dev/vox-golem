@@ -688,5 +688,85 @@ class GeminiNanoProviderTest {
         assertFalse(PreparedSearchRoute.shouldRunWebSearch(true, "quick", "What model are you?"))
         assertFalse(PreparedSearchRoute.shouldRunWebSearch(true, "quick", "Why does this Rust ring buffer panic?"))
         assertFalse(PreparedSearchRoute.shouldRunWebSearch(true, "quick", "What is 14 * 15?"))
+        assertTrue(PreparedSearchRoute.shouldRunWebSearch(true, "quick", "Compare the Pixel 8 vs Pixel 9"))
+    }
+
+    @Test
+    fun preparedSearchRouteParsesFallbackUsedAndStatusCode() {
+        val fakeSearch = FakeSearchNative { _, _ ->
+            JSONObject()
+                .put("evidenceContext", "[1] Fallback Result")
+                .put("sourceFooter", "\n\nSources:\nhttps://example.com/fallback\n")
+                .put("sources", JSONArray().put(JSONObject().put("url", "https://example.com/fallback")))
+                .put("fallbackUsed", true)
+                .put("statusCode", "fallback_ddg")
+                .put("route", "S")
+                .toString()
+        }
+        val provider = GeminiNanoProvider(
+            RuntimeEnvironment.getApplication(),
+            searchNative = fakeSearch,
+            engineFactory = { FakeEngine() }
+        )
+        val req = JSONObject()
+            .put("model", "gemini-nano")
+            .put("prompt", "What is the weather in New York City today?")
+            .put("webEnabled", true)
+            .put("searchMode", "quick")
+            .toString()
+        val res = JSONObject(provider.respond("req-fallback", "/auth", req, RecordingCallback()))
+        assertEquals("complete", res.getString("status"))
+        assertTrue(res.getBoolean("fallbackUsed"))
+        assertEquals("fallback_ddg", res.getString("searchStatus"))
+        assertEquals(0L, res.getLong("retireMs"))
+    }
+
+    @Test
+    fun threeTurnConversationFoldsAnchorTopicForExtractPreviousUserQueryAndShouldRunWebSearch() {
+        val turn1 = "What are the specs of the Pixel 8?"
+        val turn2 = "What about its battery?"
+        val turn3 = "And what if it gets hot?"
+
+        val messages = JSONArray()
+            .put(JSONObject().put("role", "user").put("content", turn1))
+            .put(JSONObject().put("role", "assistant").put("content", "The Pixel 8 has a Tensor G3 chip.\n\nSources:\nhttps://example.com/pixel8\n"))
+            .put(JSONObject().put("role", "user").put("content", "$turn2\n\nSources:\nhttps://example.com/pixel8\n"))
+            .put(JSONObject().put("role", "assistant").put("content", "It has a 4575 mAh battery."))
+            .put(JSONObject().put("role", "user").put("content", turn3))
+
+        val reqObj = JSONObject()
+            .put("model", "gemini-nano")
+            .put("messages", messages)
+            .put("webEnabled", true)
+            .put("searchMode", "quick")
+
+        val extractedQuery = PreparedSearchRoute.extractUserQuery(reqObj)
+        assertEquals(turn3, extractedQuery)
+
+        val prevUserQuery = PreparedSearchRoute.extractPreviousUserQuery(reqObj, extractedQuery)
+        assertEquals("$turn1 $turn2", prevUserQuery)
+        assertTrue(PreparedSearchRoute.shouldRunWebSearch(true, "quick", extractedQuery, prevUserQuery))
+    }
+
+    @Test
+    fun preparedSearchRouteReportsAccurate2dRouteCodeOnSkippedSearches() {
+        val fakeSearch = FakeSearchNative()
+        val codingReq = JSONObject()
+            .put("model", "gemini-nano")
+            .put("prompt", "Why does this Rust ring buffer panic?")
+            .put("webEnabled", true)
+            .put("searchMode", "quick")
+        val codingPrep = PreparedSearchRoute.prepare("req-route-c", codingReq, fakeSearch, RecordingCallback()) { false }
+        assertEquals("C", codingPrep.route)
+        assertEquals("skipped", codingPrep.searchStatus)
+
+        val fastReq = JSONObject()
+            .put("model", "gemini-nano")
+            .put("prompt", "What is 14 * 15?")
+            .put("webEnabled", true)
+            .put("searchMode", "quick")
+        val fastPrep = PreparedSearchRoute.prepare("req-route-f", fastReq, fakeSearch, RecordingCallback()) { false }
+        assertEquals("F", fastPrep.route)
+        assertEquals("skipped", fastPrep.searchStatus)
     }
 }

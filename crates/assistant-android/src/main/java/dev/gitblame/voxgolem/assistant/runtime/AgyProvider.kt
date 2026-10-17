@@ -219,6 +219,7 @@ class AgyProviderNative internal constructor(
             if (activeRequestId != null || !ioRetired) return false
         }
         if (!preparePrivateEnvironment()) return false
+        runCatching { searchNative?.prewarm("", "", true) }
         synchronized(lock) {
             if (generation != prewarmGeneration || activeRequestId != null || !ioRetired) return false
             if (!processUsed && activeModel == targetModel && agyAlive(process)) return true
@@ -336,12 +337,13 @@ class AgyProviderNative internal constructor(
                 if (cancelled.get()) return@submit JSONObject().put("status", "cancelled").toString()
                 if (!preparePrivateEnvironment()) return@submit failure("auth_unavailable", "Agy requires externally provisioned app-private access and installation identity")
                 if (cancelled.get()) return@submit JSONObject().put("status", "cancelled").toString()
+                val currentReqId = synchronized(lock) { activeRequestId } ?: ""
                 val wasWarm = synchronized(lock) { !processUsed && activeModel == targetAgyModel && agyAlive(process) }
                 if (!startProcess(executable, targetAgyModel, effort)) return@submit failure("internal_error", "Failed to start Agy process")
-                val owned = synchronized(lock) { processUsed = true; consumed.set(true); requireNotNull(process) }
-                val currentReqId = synchronized(lock) { activeRequestId } ?: ""
+                if (cancelled.get()) return@submit JSONObject().put("status", "cancelled").toString()
                 val prepared = PreparedSearchRoute.prepare(currentReqId, reqObj, searchNative, callback) { cancelled.get() }
                 if (cancelled.get()) return@submit JSONObject().put("status", "cancelled").toString()
+                val owned = synchronized(lock) { processUsed = true; consumed.set(true); requireNotNull(process) }
                 val serializedRequest = canonicalInput(reqObj, prepared.evidenceContext)
                 exchange(owned, serializedRequest, targetAgyModel, callback, prepared, wasWarm)
             }
@@ -358,7 +360,7 @@ class AgyProviderNative internal constructor(
             return JSONObject().put("status", "cancelled").toString()
         } finally {
             cancelled.set(true)
-            synchronized(lock) { process }?.let { retire(it) }
+            synchronized(lock) { process?.takeIf { processUsed } }?.let { retire(it) }
             // A failed/uncooperative reader remains owned and blocks another admission.
             exited.await(1000, TimeUnit.MILLISECONDS)
         }
@@ -417,10 +419,14 @@ class AgyProviderNative internal constructor(
                         val text = accumulated.toString()
                         if (text.isBlank()) return failure("provider_failure", "Agy terminal success contained no answer")
                         val completedMs = timing.completedMs()
+                        val retireStartNanos = runCatching { SystemClock.elapsedRealtimeNanos() }.getOrDefault(0L)
+                        retire(owned)
+                        val retireEndNanos = runCatching { SystemClock.elapsedRealtimeNanos() }.getOrDefault(retireStartNanos)
+                        val retireMs = ((retireEndNanos - retireStartNanos).coerceAtLeast(0L)) / 1_000_000L
                         runCatching {
                             Log.i(
                                 "VoxGolemWorkflowTiming",
-                                "provider=agy model=$targetAgyModel route=${prepared.route} warm=$wasWarm search_ms=${prepared.searchMs} sources=${prepared.sourcesCount} evidence_bytes=${prepared.evidenceBytes} first_text_ms=${timing.firstTextMs} completed_ms=$completedMs"
+                                "provider=agy model=$targetAgyModel route=${prepared.route} warm=$wasWarm search_ms=${prepared.searchMs} search_status=${prepared.searchStatus} fallback=${prepared.fallbackUsed} sources=${prepared.sourcesCount} evidence_bytes=${prepared.evidenceBytes} first_text_ms=${timing.firstTextMs} completed_ms=$completedMs retire_ms=$retireMs"
                             )
                         }
                         if (sourceFooter.isNotEmpty()) {
@@ -435,9 +441,12 @@ class AgyProviderNative internal constructor(
                                 .put("completedMs", completedMs)
                                 .put("route", prepared.route)
                                 .put("searchMs", prepared.searchMs)
+                                .put("searchStatus", prepared.searchStatus)
+                                .put("fallbackUsed", prepared.fallbackUsed)
                                 .put("sourcesCount", prepared.sourcesCount)
                                 .put("evidenceBytes", prepared.evidenceBytes)
                                 .put("warm", wasWarm)
+                                .put("retireMs", retireMs)
                                 .toString()
                         }
                         return JSONObject()
@@ -449,9 +458,12 @@ class AgyProviderNative internal constructor(
                             .put("completedMs", completedMs)
                             .put("route", prepared.route)
                             .put("searchMs", prepared.searchMs)
+                            .put("searchStatus", prepared.searchStatus)
+                            .put("fallbackUsed", prepared.fallbackUsed)
                             .put("sourcesCount", prepared.sourcesCount)
                             .put("evidenceBytes", prepared.evidenceBytes)
                             .put("warm", wasWarm)
+                            .put("retireMs", retireMs)
                             .toString()
                     } else {
                         return JSONObject()

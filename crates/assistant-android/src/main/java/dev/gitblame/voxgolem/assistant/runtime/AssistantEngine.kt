@@ -365,6 +365,9 @@ class AssistantEngine @JvmOverloads internal constructor(
         }
         state = state.copy(model = model, webEnabled = policy.webEnabled, speechNetworkFallback = policy.speechNetworkFallback,
             speechLanguage = policy.speechLanguage, speechTtsProvider = policy.speechTtsProvider, speechTtsVoice = policy.speechTtsVoice, error = null)
+        if (model != previousModel || (!previousPolicy.webEnabled && policy.webEnabled)) {
+            prewarmSelected(state.model, state.webEnabled, state.busy)
+        }
     }
 
     override fun newConversation() = dispatch {
@@ -684,6 +687,9 @@ class AssistantEngine @JvmOverloads internal constructor(
                         val firstTextMs = outcome?.optLong("firstTextMs", -1L)?.takeIf { it >= 0L } ?: turn.firstTextMs
                         val completedMs = outcome?.optLong("completedMs", -1L)?.takeIf { it >= 0L }
                         val searchMs = outcome?.optLong("searchMs", -1L)?.takeIf { it >= 0L }
+                        val searchStatus = outcome?.optString("searchStatus", "")?.takeIf { !outcome.isNull("searchStatus") && it.isNotEmpty() }
+                        val fallbackUsed = if (outcome != null && outcome.has("fallbackUsed") && !outcome.isNull("fallbackUsed")) outcome.optBoolean("fallbackUsed") else null
+                        val retireMs = outcome?.optLong("retireMs", -1L)?.takeIf { it >= 0L }
                         val route = outcome?.optString("route", "")?.takeIf { !outcome.isNull("route") && it.isNotEmpty() }
                         val warm = if (outcome != null && outcome.has("warm") && !outcome.isNull("warm")) outcome.optBoolean("warm") else null
                         val requestedModel = turn.model
@@ -704,7 +710,7 @@ class AssistantEngine @JvmOverloads internal constructor(
                         runCatching {
                             android.util.Log.i(
                                 "VoxGolemWorkflowTiming",
-                                "turn_outcome status=$status model=${returnedModel ?: requestedModel} search_mode=$searchMode web=$webEnabled route=${route ?: "auto"} warm=${warm ?: "unknown"} search_ms=${searchMs ?: -1} first_text_ms=${firstTextMs ?: -1} completed_ms=${completedMs ?: -1}"
+                                "turn_outcome status=$status model=${returnedModel ?: requestedModel} search_mode=$searchMode web=$webEnabled route=${route ?: "auto"} warm=${warm ?: "unknown"} search_ms=${searchMs ?: -1} search_status=${searchStatus ?: "unknown"} fallback=${fallbackUsed ?: false} first_text_ms=${firstTextMs ?: -1} completed_ms=${completedMs ?: -1} retire_ms=${retireMs ?: 0}"
                             )
                         }
                         val isComplete = status == "complete"

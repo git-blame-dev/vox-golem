@@ -23,6 +23,7 @@ interface ProviderNativeCalls {
 
 object AssistantProviderNative : ProviderNativeCalls {
     init { System.loadLibrary("wear_assistant_native") }
+    private fun ensureLoaded() {}
     override fun prewarm(model: String, authPath: String) {
         prewarm(model, authPath, true)
     }
@@ -44,4 +45,30 @@ object AssistantProviderNative : ProviderNativeCalls {
     external fun nativePrepareSearch(requestJson: String, callback: ProviderDeltaCallback): String
     override fun prepareSearch(requestJson: String, callback: ProviderDeltaCallback): String =
         nativePrepareSearch(requestJson, callback)
+    external fun nativeShouldRunWebSearch(
+        webEnabled: Boolean,
+        searchMode: String,
+        query: String,
+        prevUserQuery: String,
+    ): Boolean
+    fun shouldRunWebSearch(
+        webEnabled: Boolean,
+        searchMode: String,
+        query: String,
+        prevUserQuery: String? = null,
+    ): Boolean {
+        ensureLoaded()
+        return nativeShouldRunWebSearch(webEnabled, searchMode, query, prevUserQuery ?: "")
+    }
+    external fun nativeRoutePrompt2d(
+        query: String,
+        prevUserQuery: String,
+    ): String
+    fun routePrompt2d(
+        query: String,
+        prevUserQuery: String? = null,
+    ): String {
+        ensureLoaded()
+        return nativeRoutePrompt2d(query, prevUserQuery ?: "")
+    }
 }
