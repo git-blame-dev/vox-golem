@@ -9,6 +9,7 @@ struct PromptCancellation<'a> {
     cancelled: &'a AtomicBool,
     signal: &'a tokio::sync::watch::Sender<bool>,
 }
+#[derive(Clone)]
 struct SourcePayload {
     url: String,
     title: String,

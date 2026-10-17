@@ -9,6 +9,9 @@ use std::sync::OnceLock;
 use tokio::sync::MutexGuard;
 use tokio::sync::{watch, Mutex};
 use tokio::time::Instant;
+use voxgolem_core::router::{
+    check_search_snippets_sufficiency, classify_prompt_2d, SnippetSufficiency,
+};
 use voxgolem_core::search::{has_readable_text, truncate_utf8, Failure, Mode, Source};
 use voxgolem_platform::custom_openai::{
     tools::ModelEvent, CustomOpenAiAuthRevision, CustomOpenAiClient, CustomOpenAiConfig,
@@ -28,6 +31,12 @@ pub(crate) struct SearchPreparation {
     pub evidence_context: Option<String>,
     pub source_footer: String,
     pub sources: Vec<Source>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub needs_escalation: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub needs_search: bool,
 }
 
 impl SearchPreparation {
@@ -54,6 +63,8 @@ pub(crate) struct SearchPrepareRequest {
     pub query: String,
     pub web_enabled: bool,
     pub mode: Mode,
+    pub prev_user_turn: Option<String>,
+    pub enforce_quick_router: bool,
 }
 
 impl SearchPrepareRequest {
@@ -110,8 +121,8 @@ impl SearchPrepareRequest {
             .filter(|s| !s.is_empty())
             .map(str::to_string);
 
-        let query = if let Some(prompt) = prompt_field {
-            prompt
+        let query = if let Some(prompt) = prompt_field.as_ref() {
+            prompt.clone()
         } else if let Some(messages) = obj.get("messages").and_then(|v| v.as_array()) {
             messages
                 .iter()
@@ -133,6 +144,41 @@ impl SearchPrepareRequest {
             String::new()
         };
 
+        let prev_user_turn = obj
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .and_then(|messages| {
+                let user_msgs: Vec<String> = messages
+                    .iter()
+                    .filter_map(|msg| {
+                        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+                        if role.eq_ignore_ascii_case("user") {
+                            msg.get("content")
+                                .and_then(|c| c.as_str())
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                let last_user_msg = user_msgs.last();
+                if let Some(prompt) = prompt_field.as_deref() {
+                    if last_user_msg.map(|s| s.as_str()) != Some(prompt) {
+                        return last_user_msg
+                            .filter(|msg| msg.as_str() != query.as_str())
+                            .cloned();
+                    }
+                }
+                if user_msgs.len() >= 2 {
+                    user_msgs.get(user_msgs.len() - 2).cloned()
+                } else {
+                    None
+                }
+            });
+
         let raw_session = obj
             .get("externalSessionId")
             .or_else(|| obj.get("external_session_id"))
@@ -148,6 +194,12 @@ impl SearchPrepareRequest {
             .map(voxgolem_core::external_correlation::external_id)
             .unwrap_or_else(|| conversation_id.clone());
 
+        let enforce_quick_router = obj
+            .get("enforceQuickRouter")
+            .or_else(|| obj.get("enforce_quick_router"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         Ok(Self {
             request_id,
             conversation_id,
@@ -155,6 +207,8 @@ impl SearchPrepareRequest {
             query,
             web_enabled,
             mode,
+            prev_user_turn,
+            enforce_quick_router,
         })
     }
 }
@@ -171,6 +225,21 @@ pub(crate) async fn prepare_search_context_with_service<T: WebTransport>(
             SearchPreparationStatus::Skipped,
         );
     }
+    let routing = classify_prompt_2d(&request.query, request.prev_user_turn.as_deref(), None);
+    if request.mode == Mode::Quick
+        && !routing.needs_search()
+        && (request.enforce_quick_router
+            || routing.normalized_input == voxgolem_core::router::CANONICAL_SUPPLIED_TEXT_INTENT)
+    {
+        return (
+            SearchPreparation {
+                route: Some(routing.primary.code().to_string()),
+                needs_search: false,
+                ..SearchPreparation::default()
+            },
+            SearchPreparationStatus::Skipped,
+        );
+    }
     if cancellation.is_cancelled() {
         return (
             SearchPreparation::default(),
@@ -180,7 +249,14 @@ pub(crate) async fn prepare_search_context_with_service<T: WebTransport>(
 
     let policy = request.mode.policy();
     let deadline = Instant::now() + policy.tool_time;
-    let query = truncate_utf8(request.query.trim(), 2048);
+    let raw_query = if request.prev_user_turn.is_some()
+        && routing.normalized_input != voxgolem_core::router::CANONICAL_SUPPLIED_TEXT_INTENT
+    {
+        routing.normalized_input.trim()
+    } else {
+        request.query.trim()
+    };
+    let query = truncate_utf8(raw_query, 2048);
     let limit = match request.mode {
         Mode::Quick => 3,
         Mode::Verify => 5,
@@ -271,9 +347,16 @@ pub(crate) async fn prepare_search_context_with_service<T: WebTransport>(
     }
 
     let mut collected_sources = search_outcome.sources;
+    let snippet_sufficiency = check_search_snippets_sufficiency(&request.query, &collected_sources);
 
     let max_reads = match request.mode {
-        Mode::Quick => 1,
+        Mode::Quick => {
+            if matches!(snippet_sufficiency, SnippetSufficiency::NeedsEscalation(_)) {
+                2
+            } else {
+                0
+            }
+        }
         Mode::Verify => 2,
         Mode::Research => 3,
     };
@@ -423,11 +506,19 @@ pub(crate) async fn prepare_search_context_with_service<T: WebTransport>(
         );
     }
 
+    let needs_escalation = matches!(
+        check_search_snippets_sufficiency(&request.query, &collected_sources),
+        SnippetSufficiency::NeedsEscalation(_)
+    );
+
     (
         SearchPreparation {
             evidence_context,
             source_footer,
             sources: collected_sources,
+            needs_escalation,
+            route: Some(routing.primary.code().to_string()),
+            needs_search: routing.needs_search(),
         },
         SearchPreparationStatus::Ready,
     )
@@ -571,6 +662,24 @@ fn count_status(sources: &[voxgolem_core::search::Source]) -> Option<String> {
     } else {
         None
     }
+}
+
+pub(crate) fn route_prompt_2d(
+    prompt: &voxgolem_platform::custom_openai::CustomOpenAiPrompt,
+) -> voxgolem_core::router::RoutingDecision {
+    let prev_user = prompt
+        .history
+        .iter()
+        .rev()
+        .find(|msg| {
+            matches!(
+                msg.role,
+                voxgolem_platform::custom_openai::CustomOpenAiRole::User
+            )
+        })
+        .map(|msg| msg.text.as_str())
+        .filter(|text| !text.trim().is_empty());
+    classify_prompt_2d(&prompt.prompt, prev_user, None)
 }
 
 pub(crate) async fn respond(
@@ -718,6 +827,7 @@ pub(crate) async fn respond(
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+    use voxgolem_core::router::Route2D;
     use voxgolem_core::search::Provider;
     use voxgolem_platform::web::ProviderFailure;
 
@@ -892,7 +1002,11 @@ mod tests {
                                 "excerpts": ["Key synthetic search excerpt one."]
                             }
                         ]
-                    }
+                    },
+                    "content": [{
+                        "type": "text",
+                        "text": "Title: Synthetic Article One\nURL: https://example.com/article-1\nHighlights:\nKey synthetic search excerpt one."
+                    }]
                 })),
                 fetch_response: Ok(json!({
                     "structuredContent": {
@@ -903,7 +1017,11 @@ mod tests {
                                 "full_content": "Full page body text from synthetic article one."
                             }
                         ]
-                    }
+                    },
+                    "content": [{
+                        "type": "text",
+                        "text": "# Synthetic Article One\nURL: https://example.com/article-1\n\nFull page body text from synthetic article one."
+                    }]
                 })),
                 calls: vec![],
             });
@@ -949,30 +1067,43 @@ mod tests {
     #[test]
     fn prepare_search_emits_fallback_and_partial_when_primary_fails_or_empty() {
         process().unwrap().runtime.block_on(async {
-            struct FallbackTransport;
+            struct FallbackTransport {
+                search_attempts: usize,
+            }
             impl WebTransport for FallbackTransport {
                 async fn call(
                     &mut self,
-                    provider: Provider,
+                    _provider: Provider,
                     operation: &Operation,
                     _conversation_id: &str,
                     _deadline: Instant,
                     _cancel: &Cancellation,
                 ) -> Result<Value, ProviderFailure> {
-                    if provider == Provider::Parallel || operation.fetch() {
+                    if operation.fetch() {
+                        return Err(Failure::Service.into());
+                    }
+                    self.search_attempts += 1;
+                    if self.search_attempts == 1 {
                         Err(Failure::Service.into())
                     } else {
                         Ok(json!({
+                            "structuredContent": {
+                                "results": [{
+                                    "url": "https://example.org/fallback",
+                                    "title": "Fallback Result",
+                                    "excerpts": ["Fallback evidence snippet"]
+                                }]
+                            },
                             "content": [{
                                 "type": "text",
-                                "text": "Title: Exa Fallback Result\nURL: https://example.org/fallback\nHighlights:\nFallback evidence snippet"
+                                "text": "Title: Fallback Result\nURL: https://example.org/fallback\nHighlights:\nFallback evidence snippet"
                             }]
                         }))
                     }
                 }
             }
 
-            let mut web = WebService::new(FallbackTransport);
+            let mut web = WebService::new(FallbackTransport { search_attempts: 0 });
             let req = SearchPrepareRequest::parse(
                 r#"{"requestId":"synthetic-req-3","prompt":"Fallback query","webEnabled":true,"searchMode":"verify"}"#,
             )
@@ -1001,6 +1132,271 @@ mod tests {
                 prep.source_footer,
                 "\n\nSources:\nhttps://example.org/fallback\n"
             );
+        });
+    }
+
+    #[test]
+    fn prepare_search_skips_in_quick_mode_for_supplied_text_intent() {
+        process().unwrap().runtime.block_on(async {
+            let mut web = WebService::new(SyntheticWebTransport {
+                search_response: Err(Failure::Service.into()),
+                fetch_response: Err(Failure::Service.into()),
+                calls: vec![],
+            });
+            let req = SearchPrepareRequest::parse(
+                r#"{"requestId":"req-skip-supplied","prompt":"Fix the typos in this sentence: Who won the game today?","webEnabled":true,"searchMode":"quick"}"#,
+            )
+            .unwrap();
+            let mut statuses: Vec<String> = Vec::new();
+            let (prep, status) = prepare_search_context_with_service(
+                &mut web,
+                &req,
+                &Cancellation::default(),
+                &mut |event| {
+                    if let CallbackEvent::Status(s) = event {
+                        statuses.push(s.to_string());
+                    }
+                    Ok(())
+                },
+            )
+            .await;
+            assert_eq!(status, SearchPreparationStatus::Skipped);
+            assert!(prep.evidence_context.is_none());
+            assert_eq!(prep.source_footer, "");
+            assert!(prep.sources.is_empty());
+            assert!(!prep.needs_escalation);
+            assert_eq!(prep.route, Some("F".to_string()));
+            assert!(!prep.needs_search);
+            assert!(statuses.is_empty());
+            assert!(web.transport.calls.is_empty());
+        });
+    }
+
+    #[test]
+    fn prepare_search_escalates_and_upgrades_max_reads_on_stub_snippets_without_digits() {
+        process().unwrap().runtime.block_on(async {
+            struct StubTransport {
+                fetched_urls: Vec<String>,
+            }
+            impl WebTransport for StubTransport {
+                async fn call(
+                    &mut self,
+                    _provider: Provider,
+                    operation: &Operation,
+                    _conversation_id: &str,
+                    _deadline: Instant,
+                    _cancel: &Cancellation,
+                ) -> Result<Value, ProviderFailure> {
+                    match operation {
+                        Operation::Search { .. } => Ok(json!({
+                            "structuredContent": {
+                                "results": [
+                                    {
+                                        "url": "https://example.com/amd-1",
+                                        "title": "AMD Chart One",
+                                        "excerpts": ["Click to view full chart"]
+                                    },
+                                    {
+                                        "url": "https://example.com/amd-2",
+                                        "title": "AMD Chart Two",
+                                        "excerpts": ["See full chart on page"]
+                                    }
+                                ]
+                            },
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Title: AMD Chart One\nURL: https://example.com/amd-1\nHighlights:\nClick to view full chart"
+                                },
+                                {
+                                    "type": "text",
+                                    "text": "Title: AMD Chart Two\nURL: https://example.com/amd-2\nHighlights:\nSee full chart on page"
+                                }
+                            ]
+                        })),
+                        Operation::Fetch { urls, .. } => {
+                            self.fetched_urls.extend(urls.iter().cloned());
+                            let results: Vec<Value> = urls
+                                .iter()
+                                .map(|url| {
+                                    json!({
+                                        "url": url,
+                                        "title": "AMD Chart",
+                                        "full_content": "Full page without numeric price details."
+                                    })
+                                })
+                                .collect();
+                            let content: Vec<Value> = urls
+                                .iter()
+                                .map(|url| {
+                                    json!({
+                                        "type": "text",
+                                        "text": format!("# AMD Chart\nURL: {url}\n\nFull page without numeric price details.")
+                                    })
+                                })
+                                .collect();
+                            Ok(json!({
+                                "structuredContent": { "results": results },
+                                "content": content
+                            }))
+                        }
+                    }
+                }
+            }
+
+            let mut web = WebService::new(StubTransport {
+                fetched_urls: Vec::new(),
+            });
+            let req = SearchPrepareRequest::parse(
+                r#"{"requestId":"req-escalate-numeric","prompt":"What is the stock price of AMD today?","webEnabled":true,"searchMode":"quick"}"#,
+            )
+            .unwrap();
+            let mut statuses: Vec<String> = Vec::new();
+            let (prep, status) = prepare_search_context_with_service(
+                &mut web,
+                &req,
+                &Cancellation::default(),
+                &mut |event| {
+                    if let CallbackEvent::Status(s) = event {
+                        statuses.push(s.to_string());
+                    }
+                    Ok(())
+                },
+            )
+            .await;
+            assert_eq!(status, SearchPreparationStatus::Ready);
+            assert_eq!(statuses, vec!["Searching", "Reading"]);
+            // In Quick mode, max_reads normally defaults to 1.
+            // Because snippet sufficiency was NeedsEscalation, max_reads was upgraded to 2!
+            assert_eq!(
+                web.transport.fetched_urls,
+                vec![
+                    "https://example.com/amd-1".to_string(),
+                    "https://example.com/amd-2".to_string(),
+                ]
+            );
+            assert!(prep.needs_escalation);
+
+            let serialized: Value = serde_json::from_str(&prep.json()).unwrap();
+            assert_eq!(serialized["needsEscalation"], true);
+        });
+    }
+
+    #[test]
+    fn route_prompt_2d_skips_quick_search_for_direct_fast_and_preserves_multiturn_followup() {
+        use voxgolem_platform::custom_openai::{
+            CustomOpenAiContentType, CustomOpenAiMessage, CustomOpenAiPrompt, CustomOpenAiRole,
+        };
+
+        let supplied_prompt = CustomOpenAiPrompt {
+            session_id: "test-session".to_string(),
+            prompt: "Fix the typos in this sentence: What is the weather in Tokyo today?"
+                .to_string(),
+            history: vec![],
+        };
+        let supplied_route = route_prompt_2d(&supplied_prompt);
+        assert_eq!(supplied_route.primary, Route2D::DirectFast);
+        assert!(!supplied_route.needs_search());
+
+        let followup_prompt = CustomOpenAiPrompt {
+            session_id: "test-session".to_string(),
+            prompt: "What about Nvidia?".to_string(),
+            history: vec![CustomOpenAiMessage {
+                role: CustomOpenAiRole::User,
+                content_type: CustomOpenAiContentType::OutputText,
+                text: "What is the current stock price of AMD right now?".to_string(),
+            }],
+        };
+        let followup_route = route_prompt_2d(&followup_prompt);
+        assert_eq!(followup_route.primary, Route2D::SearchFast);
+        assert!(followup_route.needs_search());
+    }
+
+    #[test]
+    fn prepare_search_enforce_quick_router_skips_direct_and_runs_search_fast() {
+        process().unwrap().runtime.block_on(async {
+            // 1. DirectFast with enforceQuickRouter: true skips search
+            let mut web = WebService::new(SyntheticWebTransport {
+                search_response: Err(Failure::Service.into()),
+                fetch_response: Err(Failure::Service.into()),
+                calls: vec![],
+            });
+            let req_fast = SearchPrepareRequest::parse(
+                r#"{"requestId":"req-fast","prompt":"Hello, what is 2+2?","webEnabled":true,"searchMode":"quick","enforceQuickRouter":true}"#,
+            )
+            .unwrap();
+            let mut statuses = Vec::new();
+            let (prep_fast, status_fast) = prepare_search_context_with_service(
+                &mut web,
+                &req_fast,
+                &Cancellation::default(),
+                &mut |event| {
+                    if let CallbackEvent::Status(s) = event {
+                        statuses.push(s.to_string());
+                    }
+                    Ok(())
+                },
+            )
+            .await;
+            assert_eq!(status_fast, SearchPreparationStatus::Skipped);
+            assert_eq!(prep_fast.route, Some("F".to_string()));
+            assert!(!prep_fast.needs_search);
+            assert!(web.transport.calls.is_empty());
+            assert!(statuses.is_empty());
+
+            // 2. DirectSmart with enforceQuickRouter: true skips search
+            let req_smart = SearchPrepareRequest::parse(
+                r#"{"requestId":"req-smart","prompt":"How do I write a rust macro with pattern matching?","webEnabled":true,"searchMode":"quick","enforceQuickRouter":true}"#,
+            )
+            .unwrap();
+            let (prep_smart, status_smart) = prepare_search_context_with_service(
+                &mut web,
+                &req_smart,
+                &Cancellation::default(),
+                &mut |_| Ok(()),
+            )
+            .await;
+            assert_eq!(status_smart, SearchPreparationStatus::Skipped);
+            assert_eq!(prep_smart.route, Some("C".to_string()));
+            assert!(!prep_smart.needs_search);
+            assert!(web.transport.calls.is_empty());
+
+            // 3. SearchFast with enforceQuickRouter: true proceeds to search
+            let mut web_search = WebService::new(SyntheticWebTransport {
+                search_response: Ok(json!({
+                    "structuredContent": {
+                        "results": [
+                            {
+                                "url": "https://example.com/weather-tokyo",
+                                "title": "Tokyo Weather",
+                                "excerpts": ["Current Tokyo temperature is 18C and clear."]
+                            }
+                        ]
+                    },
+                    "content": [{
+                        "type": "text",
+                        "text": "Title: Tokyo Weather\nURL: https://example.com/weather-tokyo\nHighlights:\nCurrent Tokyo temperature is 18C and clear."
+                    }]
+                })),
+                fetch_response: Err(Failure::Service.into()),
+                calls: vec![],
+            });
+            let req_search = SearchPrepareRequest::parse(
+                r#"{"requestId":"req-search","prompt":"What is the current weather in Tokyo?","webEnabled":true,"searchMode":"quick","enforceQuickRouter":true}"#,
+            )
+            .unwrap();
+            let (prep_search, status_search) = prepare_search_context_with_service(
+                &mut web_search,
+                &req_search,
+                &Cancellation::default(),
+                &mut |_| Ok(()),
+            )
+            .await;
+            assert_eq!(status_search, SearchPreparationStatus::Ready);
+            assert_eq!(prep_search.route, Some("S".to_string()));
+            assert!(prep_search.needs_search);
+            assert_eq!(web_search.transport.calls.len(), 1);
+            assert_eq!(prep_search.sources.len(), 1);
         });
     }
 }

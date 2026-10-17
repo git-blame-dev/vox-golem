@@ -39,9 +39,10 @@ impl WebTransport for EvidenceTransport {
         _: &Cancellation,
     ) -> Result<Value, ProviderFailure> {
         self.calls.push((provider, operation.fetch()));
-        Ok(
-            json!({"structuredContent":{"results":[{"url":"https://example.com/source", "title":"Synthetic source", "excerpts":["Synthetic fact from source"]}],"errors":[]}}),
-        )
+        Ok(json!({
+            "structuredContent":{"results":[{"url":"https://example.com/source", "title":"Synthetic source", "excerpts":["Synthetic fact from source"]}],"errors":[]},
+            "content":[{"type":"text","text":"Title: Synthetic source\nURL: https://example.com/source\nPublished: N/A\nAuthor: N/A\nHighlights:\nSynthetic fact from source"}]
+        }))
     }
 }
 
@@ -398,7 +399,10 @@ async fn changed_credentials_are_rejected_before_sending_continuation() {
             _: &Cancellation,
         ) -> Result<Value, ProviderFailure> {
             std::fs::write(&self.0,r#"{"openai":{"access":"synthetic-replacement-access","accountId":"synthetic-replacement-account","expires":4102444800}}"#).unwrap();
-            Ok(json!({"structuredContent":{"results":[]}}))
+            Ok(json!({
+                "structuredContent":{"results":[]},
+                "content":[{"type":"text","text":"Title: Empty\nURL: https://example.com/empty\nPublished: N/A\nAuthor: N/A\nHighlights:\nSynthetic"}]
+            }))
         }
     }
     let (config, auth, server) = fixture(vec![vec![search_call("synthetic-search")]]).await;
@@ -529,9 +533,10 @@ async fn per_turn_model_ids_do_not_rotate_the_stable_parallel_conversation_ident
             _: &Cancellation,
         ) -> Result<Value, ProviderFailure> {
             self.0.push(conversation.into());
-            Ok(
-                json!({"structuredContent":{"results":[{"url":"https://example.com/source","title":"Synthetic source","excerpts":["Synthetic evidence"]}]}}),
-            )
+            Ok(json!({
+                "structuredContent":{"results":[{"url":"https://example.com/source","title":"Synthetic source","excerpts":["Synthetic evidence"]}]},
+                "content":[{"type":"text","text":"Title: Synthetic source\nURL: https://example.com/source\nPublished: N/A\nAuthor: N/A\nHighlights:\nSynthetic evidence"}]
+            }))
         }
     }
     let mut web = WebService::new(IdentifiedTransport(vec![]));
@@ -934,9 +939,10 @@ async fn operation_timing_includes_tools_and_rounds_but_not_suppressed_text() {
         ) -> Result<Value, ProviderFailure> {
             tokio::time::sleep(Duration::from_millis(20)).await;
             self.after_tools = self.origin.elapsed();
-            Ok(
-                json!({"structuredContent":{"results":[{"url":"https://example.com/source","excerpts":["Synthetic source-page content"]}]}}),
-            )
+            Ok(json!({
+                "structuredContent":{"results":[{"url":"https://example.com/source","excerpts":["Synthetic source-page content"]}]},
+                "content":[{"type":"text","text":"Title: Source\nURL: https://example.com/source\nPublished: N/A\nAuthor: N/A\nHighlights:\nSynthetic source-page content"}]
+            }))
         }
     }
     let (config, _auth, server) = fixture(vec![
@@ -1136,17 +1142,28 @@ async fn verification_gate_rechecks_readability_after_the_run_evidence_budget() 
             _: Instant,
             _: &Cancellation,
         ) -> Result<Value, ProviderFailure> {
-            let sources = if operation.fetch() {
-                vec![
-                    json!({"url":"https://example.com/source","title":"Synthetic page","excerpts":[format!("{}Readable synthetic content","\0".repeat(3000))]}),
-                ]
+            let (sources, content) = if operation.fetch() {
+                (
+                    vec![
+                        json!({"url":"https://example.com/source","title":"Synthetic page","excerpts":[format!("{}Readable synthetic content","\0".repeat(3000))]}),
+                    ],
+                    vec![
+                        json!({"type":"text","text":format!("Title: Synthetic page\nURL: https://example.com/source\nText:\n{}Readable synthetic content","\0".repeat(3000))}),
+                    ],
+                )
             } else {
-                vec![
-                    json!({"url":"https://example.com/one","title":"Synthetic one","excerpts":["a".repeat(11000)]}),
-                    json!({"url":"https://example.com/two","title":"Synthetic two","excerpts":["b".repeat(11000)]}),
-                ]
+                (
+                    vec![
+                        json!({"url":"https://example.com/one","title":"Synthetic one","excerpts":["a".repeat(11000)]}),
+                        json!({"url":"https://example.com/two","title":"Synthetic two","excerpts":["b".repeat(11000)]}),
+                    ],
+                    vec![
+                        json!({"type":"text","text":format!("Title: Synthetic one\nURL: https://example.com/one\nPublished: N/A\nAuthor: N/A\nHighlights:\n{}","a".repeat(11000))}),
+                        json!({"type":"text","text":format!("Title: Synthetic two\nURL: https://example.com/two\nPublished: N/A\nAuthor: N/A\nHighlights:\n{}","b".repeat(11000))}),
+                    ],
+                )
             };
-            Ok(json!({"structuredContent":{"results":sources}}))
+            Ok(json!({"structuredContent":{"results":sources},"content":content}))
         }
     }
     let (config, _auth, server) = fixture(vec![
@@ -1189,4 +1206,56 @@ async fn verification_gate_rechecks_readability_after_the_run_evidence_budget() 
         .text
         .starts_with("Source verification incomplete:"));
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn quick_mode_presearches_and_answers_in_single_llm_round_when_snippets_are_sufficient() {
+    struct PriceSnippetTransport;
+    impl WebTransport for PriceSnippetTransport {
+        async fn call(
+            &mut self,
+            _: Provider,
+            _: &Operation,
+            _: &str,
+            _: Instant,
+            _: &Cancellation,
+        ) -> Result<Value, ProviderFailure> {
+            Ok(json!({
+                "structuredContent": {
+                    "results": [{
+                        "url": "https://example.com/amd-price",
+                        "title": "AMD Stock Quote",
+                        "excerpts": ["Advanced Micro Devices (AMD) is currently trading at $156.40 USD today."]
+                    }]
+                },
+                "content": [{
+                    "type": "text",
+                    "text": "Title: AMD Stock Quote\nURL: https://example.com/amd-price\nPublished: N/A\nAuthor: N/A\nHighlights:\nAdvanced Micro Devices (AMD) is currently trading at $156.40 USD today."
+                }]
+            }))
+        }
+    }
+
+    let (config, _auth, server) = fixture(vec![vec![answer()]]).await;
+    let mut web = WebService::new(PriceSnippetTransport);
+    let mut amd_prompt = prompt();
+    amd_prompt.prompt = "What is the current stock price of AMD right now?".into();
+    let result = run(
+        config,
+        &amd_prompt,
+        Mode::Quick,
+        &mut web,
+        &Cancellation::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!((result.rounds, result.searches, result.reads), (1, 1, 0));
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["tool_choice"], "none");
+    assert_eq!(requests[0]["tools"], json!([]));
+    assert!(requests[0]["instructions"]
+        .as_str()
+        .unwrap()
+        .contains("156.40"));
 }

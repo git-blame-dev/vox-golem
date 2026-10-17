@@ -263,14 +263,20 @@ fn respond(
             return Outcome::Cancelled;
         }
         if request.model != CustomOpenAiModel::LocalFast && request.search_mode.is_some() {
-            return search::respond(
-                process,
-                provider_config(auth_path, &request),
-                &request,
-                registration.cancelled.clone(),
-                &mut callback,
-            )
-            .await;
+            let skip_quick_search = request.web_enabled
+                && request.search_mode == Some(voxgolem_core::search::Mode::Quick)
+                && search::route_prompt_2d(&request.prompt).normalized_input
+                    == voxgolem_core::router::CANONICAL_SUPPLIED_TEXT_INTENT;
+            if !skip_quick_search {
+                return search::respond(
+                    process,
+                    provider_config(auth_path, &request),
+                    &request,
+                    registration.cancelled.clone(),
+                    &mut callback,
+                )
+                .await;
+            }
         }
         let client = match process.client(provider_config(auth_path, &request)) {
             Ok(client) => client,
