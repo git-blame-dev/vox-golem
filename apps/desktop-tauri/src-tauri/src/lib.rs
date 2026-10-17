@@ -5394,17 +5394,17 @@ impl DesktopStageDispatcher<'_> {
             sync_llama_history(&app_state, &assistant_request.history)?;
             let mut local_prompt = prompt.clone();
             let local_search = if assistant_request.web_enabled {
-                let prev_user_turn = assistant_request
-                    .history
-                    .iter()
-                    .rev()
-                    .find(|turn| matches!(turn.role, voxgolem_core::assistant::Role::User))
-                    .map(|turn| assistant_content_text(&turn.content))
-                    .filter(|text| !text.trim().is_empty());
+                let prev_user_turn = search_runtime::fold_previous_user_turns(
+                    assistant_request
+                        .history
+                        .iter()
+                        .filter(|turn| matches!(turn.role, voxgolem_core::assistant::Role::User))
+                        .map(|turn| assistant_content_text(&turn.content)),
+                );
                 let prepared = search_runtime::prepare_local_search(
                     &app_state.conversation.search,
                     &prompt,
-                    prev_user_turn,
+                    prev_user_turn.as_deref(),
                     assistant_request.search_mode,
                     assistant_request.web_enabled,
                     assistant_request.generation.session_id,
@@ -5566,14 +5566,24 @@ impl DesktopStageDispatcher<'_> {
                 }
                 final_answer.push_str(&local_search.source_footer);
             }
+            let escalate_to_deep = assistant_request.preferences.deep_enabled
+                && (local_search.needs_escalation
+                    || voxgolem_core::router::is_natural_abstention(&answer));
+            let instant_outcome = if escalate_to_deep {
+                voxgolem_core::assistant::InstantOutcome::NeedsDeep(
+                    voxgolem_core::assistant::Content::Text(final_answer),
+                )
+            } else {
+                voxgolem_core::assistant::InstantOutcome::Complete(
+                    voxgolem_core::assistant::Content::Text(final_answer),
+                )
+            };
             let instant_result = finish_assistant_request(
                 &app_state,
                 &request_id,
                 generation,
                 assistant_request.generation,
-                voxgolem_core::assistant::InstantOutcome::Complete(
-                    voxgolem_core::assistant::Content::Text(final_answer),
-                ),
+                instant_outcome,
             )?;
             if let Err(error) = resolve_enabled_agents(
                 stage_context(
@@ -6150,16 +6160,24 @@ async fn submit_custom_prompt(
             voxgolem_core::assistant::Content::Refusal(answer.clone())
         }
     };
+    let escalate_to_deep = assistant_request.preferences.deep_enabled
+        && search_result.as_ref().is_some_and(|result| {
+            search_runtime::should_escalate_post_search(prompt, result, &answer)
+        });
+    let instant_outcome = if escalate_to_deep {
+        voxgolem_core::assistant::InstantOutcome::NeedsDeep(answer_content)
+    } else {
+        voxgolem_core::assistant::InstantOutcome::Complete(answer_content)
+    };
     let instant_result = finish_assistant_request(
         app_state,
         request_id,
         cancellation.active_generation,
         assistant_request.generation,
-        voxgolem_core::assistant::InstantOutcome::Complete(answer_content),
+        instant_outcome,
     )?;
     if let Some(result) = search_result.as_ref() {
         if assistant_request.preferences.deep_enabled {
-            let _escalate = search_runtime::should_escalate_post_search(prompt, result, &answer);
             let enriched_prompt = search_runtime::deep_request(prompt, result);
             deep_task = start_deep_task(
                 app,

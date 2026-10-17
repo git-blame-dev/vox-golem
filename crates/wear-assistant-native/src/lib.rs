@@ -9,9 +9,10 @@ mod search;
 mod domain_tests;
 
 pub use domain::{apply_json, MAX_GATEWAY_BYTES, MAX_NATIVE_SNAPSHOT_BYTES};
+pub use search::{route_code_for_query, should_run_web_search};
 
-use jni::objects::{JObject, JString, JValue};
-use jni::sys::jstring;
+use jni::objects::{JClass, JObject, JString, JValue};
+use jni::sys::{jboolean, jstring, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 use outcome::Outcome;
 use std::borrow::Cow;
@@ -729,6 +730,93 @@ pub extern "system" fn Java_dev_gitblame_voxgolem_android_wear_assistant_WearAss
     callback: JObject<'_>,
 ) -> jstring {
     prepare_search_jni(env, receiver, request_json, callback)
+}
+
+fn should_run_web_search_jni(
+    mut env: JNIEnv<'_>,
+    web_enabled: jboolean,
+    search_mode: JString<'_>,
+    query: JString<'_>,
+    prev_user_query: JString<'_>,
+) -> jboolean {
+    let should_run = catch_unwind(AssertUnwindSafe(|| {
+        if web_enabled == JNI_FALSE {
+            return false;
+        }
+        let search_mode = read_string(&mut env, &search_mode, 128).unwrap_or_default();
+        let Ok(query) = read_string(&mut env, &query, request::MAX_REQUEST_BYTES) else {
+            return false;
+        };
+        let prev_user_query = if prev_user_query.is_null() {
+            None
+        } else {
+            read_string(&mut env, &prev_user_query, request::MAX_REQUEST_BYTES)
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        };
+        search::should_run_web_search(true, &search_mode, &query, prev_user_query.as_deref())
+    }))
+    .unwrap_or(false);
+    clear_exception(&env);
+    if should_run {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+#[allow(unsafe_code)]
+#[no_mangle]
+pub extern "system" fn Java_dev_gitblame_voxgolem_assistant_runtime_AssistantProviderNative_nativeShouldRunWebSearch(
+    env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    web_enabled: jboolean,
+    search_mode: JString<'_>,
+    query: JString<'_>,
+    prev_user_query: JString<'_>,
+) -> jboolean {
+    should_run_web_search_jni(env, web_enabled, search_mode, query, prev_user_query)
+}
+
+#[allow(unsafe_code)]
+#[no_mangle]
+pub extern "system" fn Java_dev_gitblame_voxgolem_android_wear_assistant_WearAssistantNative_nativeShouldRunWebSearch(
+    env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    web_enabled: jboolean,
+    search_mode: JString<'_>,
+    query: JString<'_>,
+    prev_user_query: JString<'_>,
+) -> jboolean {
+    should_run_web_search_jni(env, web_enabled, search_mode, query, prev_user_query)
+}
+
+#[allow(unsafe_code)]
+#[no_mangle]
+pub extern "system" fn Java_dev_gitblame_voxgolem_assistant_runtime_AssistantProviderNative_nativeRoutePrompt2d(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    query: JString<'_>,
+    prev_user_query: JString<'_>,
+) -> jstring {
+    let route = catch_unwind(AssertUnwindSafe(|| {
+        let Ok(query) = read_string(&mut env, &query, request::MAX_REQUEST_BYTES) else {
+            return "F";
+        };
+        let prev_user_query = if prev_user_query.is_null() {
+            None
+        } else {
+            read_string(&mut env, &prev_user_query, request::MAX_REQUEST_BYTES)
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        };
+        search::route_code_for_query(&query, prev_user_query.as_deref())
+    }))
+    .unwrap_or("F");
+    clear_exception(&env);
+    env.new_string(route)
+        .map(JString::into_raw)
+        .unwrap_or(std::ptr::null_mut())
 }
 
 fn prewarm_model_config(model: &str, auth_path: &str) -> Option<CustomOpenAiConfig> {

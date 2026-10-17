@@ -15,6 +15,16 @@ pub(crate) enum Outcome {
         auth_revision: Option<String>,
         #[serde(rename = "speechText", skip_serializing_if = "Option::is_none")]
         speech_text: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        route: Option<String>,
+        #[serde(rename = "searchMs", skip_serializing_if = "Option::is_none")]
+        search_ms: Option<u64>,
+        #[serde(rename = "searchStatus", skip_serializing_if = "Option::is_none")]
+        search_status: Option<&'static str>,
+        #[serde(rename = "fallbackUsed", skip_serializing_if = "Option::is_none")]
+        fallback_used: Option<bool>,
+        #[serde(rename = "completedMs", skip_serializing_if = "Option::is_none")]
+        completed_ms: Option<u64>,
     },
     Cancelled,
     Error {
@@ -42,6 +52,32 @@ impl Outcome {
         self
     }
 
+    pub fn with_search_telemetry(
+        mut self,
+        route: String,
+        search_ms: u64,
+        search_status: &'static str,
+        fallback_used: bool,
+        completed_ms: u64,
+    ) -> Self {
+        if let Self::Complete {
+            route: out_route,
+            search_ms: out_search_ms,
+            search_status: out_search_status,
+            fallback_used: out_fallback_used,
+            completed_ms: out_completed_ms,
+            ..
+        } = &mut self
+        {
+            *out_route = Some(route);
+            *out_search_ms = Some(search_ms);
+            *out_search_status = Some(search_status);
+            *out_fallback_used = Some(fallback_used);
+            *out_completed_ms = Some(completed_ms);
+        }
+        self
+    }
+
     pub fn from_response(result: Result<CustomOpenAiResponse, CustomOpenAiError>) -> Self {
         match result {
             Ok(response) if response.text.len() > MAX_OUTPUT_BYTES => {
@@ -64,6 +100,11 @@ impl Outcome {
                 returned_model: response.model,
                 auth_revision: None,
                 speech_text: None,
+                route: None,
+                search_ms: None,
+                search_status: None,
+                fallback_used: None,
+                completed_ms: None,
             },
             Err(error) => Self::error(error.into()),
         }

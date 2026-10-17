@@ -9,21 +9,48 @@ use std::sync::OnceLock;
 use tokio::sync::MutexGuard;
 use tokio::sync::{watch, Mutex};
 use tokio::time::Instant;
-use voxgolem_core::router::{
-    check_search_snippets_sufficiency, classify_prompt_2d, SnippetSufficiency,
-};
-use voxgolem_core::search::{has_readable_text, truncate_utf8, Failure, Mode, Source};
+use voxgolem_core::router::classify_prompt_2d;
+use voxgolem_core::search::{Failure, Mode, Source};
 use voxgolem_platform::custom_openai::{
     tools::ModelEvent, CustomOpenAiAuthRevision, CustomOpenAiClient, CustomOpenAiConfig,
 };
 use voxgolem_platform::search::{
-    append_source_footer, run_with_client_events, RunContext, RunError, RunEvent,
+    prepare_round_zero_search_with_events, run_with_client_events, RunContext, RunError, RunEvent,
 };
 use voxgolem_platform::search_control::Cancellation;
-use voxgolem_platform::web::{McpTransport, Operation, WebService, WebTransport};
+#[cfg(test)]
+use voxgolem_platform::web::Operation;
+use voxgolem_platform::web::{McpTransport, WebService, WebTransport};
 
-pub(crate) const MAX_PREPARED_EVIDENCE_BYTES: usize = 4096;
-const MAX_SOURCE_EXCERPT_BYTES: usize = 1200;
+pub fn should_run_web_search(
+    web_enabled: bool,
+    search_mode: &str,
+    query: &str,
+    prev_user_query: Option<&str>,
+) -> bool {
+    if !web_enabled || query.trim().is_empty() {
+        return false;
+    }
+    let normalized_mode = search_mode.trim().to_ascii_lowercase();
+    if matches!(normalized_mode.as_str(), "off" | "disabled" | "none") {
+        return false;
+    }
+    let mode = match normalized_mode.as_str() {
+        "verify" => Mode::Verify,
+        "research" => Mode::Research,
+        _ => Mode::Quick,
+    };
+    if mode != Mode::Quick {
+        return true;
+    }
+    let prev = prev_user_query.map(str::trim).filter(|s| !s.is_empty());
+    classify_prompt_2d(query, prev, None).needs_search()
+}
+
+pub fn route_code_for_query(query: &str, prev_user_query: Option<&str>) -> &'static str {
+    let prev = prev_user_query.map(str::trim).filter(|s| !s.is_empty());
+    classify_prompt_2d(query, prev, None).primary.code()
+}
 
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,6 +64,10 @@ pub(crate) struct SearchPreparation {
     pub route: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub needs_search: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fallback_used: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status_code: String,
 }
 
 impl SearchPreparation {
@@ -65,6 +96,50 @@ pub(crate) struct SearchPrepareRequest {
     pub mode: Mode,
     pub prev_user_turn: Option<String>,
     pub enforce_quick_router: bool,
+}
+
+fn strip_source_footer(text: &str) -> &str {
+    match text.find("\n\nSources:\n") {
+        Some(idx) => text[..idx].trim_end(),
+        None => text,
+    }
+}
+
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].trim_end()
+}
+
+fn fold_prior_user_turns<'a>(
+    user_msgs: impl IntoIterator<Item = &'a str>,
+    current_query: &str,
+) -> Option<String> {
+    let trimmed_current = strip_source_footer(current_query.trim()).trim();
+    let mut prior: Vec<&'a str> = user_msgs
+        .into_iter()
+        .map(|msg| strip_source_footer(msg.trim()).trim())
+        .filter(|msg| !msg.is_empty())
+        .collect();
+    if !trimmed_current.is_empty() && prior.last().copied() == Some(trimmed_current) {
+        prior.pop();
+    }
+    match prior.len() {
+        0 => None,
+        1 => Some(prior[0].to_string()),
+        len => {
+            let window = &prior[len.saturating_sub(3)..];
+            let first = window[0];
+            let last = window[window.len() - 1];
+            let combined = format!("{first} {last}");
+            Some(truncate_utf8(&combined, 200).to_string())
+        }
+    }
 }
 
 impl SearchPrepareRequest {
@@ -110,7 +185,7 @@ impl SearchPrepareRequest {
             }
             Some("verify") => Mode::Verify,
             Some("research") => Mode::Research,
-            Some("quick") | None => Mode::Quick,
+            Some("quick" | "auto" | "") | None => Mode::Quick,
             Some(_) => return Err(ErrorCode::InvalidRequest),
         };
 
@@ -148,35 +223,15 @@ impl SearchPrepareRequest {
             .get("messages")
             .and_then(|v| v.as_array())
             .and_then(|messages| {
-                let user_msgs: Vec<String> = messages
-                    .iter()
-                    .filter_map(|msg| {
-                        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-                        if role.eq_ignore_ascii_case("user") {
-                            msg.get("content")
-                                .and_then(|c| c.as_str())
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                                .map(str::to_string)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
-                let last_user_msg = user_msgs.last();
-                if let Some(prompt) = prompt_field.as_deref() {
-                    if last_user_msg.map(|s| s.as_str()) != Some(prompt) {
-                        return last_user_msg
-                            .filter(|msg| msg.as_str() != query.as_str())
-                            .cloned();
+                let user_msgs = messages.iter().filter_map(|msg| {
+                    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+                    if role.eq_ignore_ascii_case("user") {
+                        msg.get("content").and_then(|c| c.as_str())
+                    } else {
+                        None
                     }
-                }
-                if user_msgs.len() >= 2 {
-                    user_msgs.get(user_msgs.len() - 2).cloned()
-                } else {
-                    None
-                }
+                });
+                fold_prior_user_turns(user_msgs, &query)
             });
 
         let raw_session = obj
@@ -221,304 +276,154 @@ pub(crate) async fn prepare_search_context_with_service<T: WebTransport>(
 ) -> (SearchPreparation, SearchPreparationStatus) {
     if !request.web_enabled || request.query.trim().is_empty() {
         return (
-            SearchPreparation::default(),
-            SearchPreparationStatus::Skipped,
-        );
-    }
-    let routing = classify_prompt_2d(&request.query, request.prev_user_turn.as_deref(), None);
-    if request.mode == Mode::Quick
-        && !routing.needs_search()
-        && (request.enforce_quick_router
-            || routing.normalized_input == voxgolem_core::router::CANONICAL_SUPPLIED_TEXT_INTENT)
-    {
-        return (
             SearchPreparation {
-                route: Some(routing.primary.code().to_string()),
-                needs_search: false,
+                status_code: "skipped".to_string(),
                 ..SearchPreparation::default()
             },
             SearchPreparationStatus::Skipped,
         );
     }
-    if cancellation.is_cancelled() {
-        return (
-            SearchPreparation::default(),
-            SearchPreparationStatus::Cancelled,
-        );
-    }
-
-    let policy = request.mode.policy();
-    let deadline = Instant::now() + policy.tool_time;
-    let raw_query = if request.prev_user_turn.is_some()
-        && routing.normalized_input != voxgolem_core::router::CANONICAL_SUPPLIED_TEXT_INTENT
+    let deadline = Instant::now() + request.mode.policy().tool_time;
+    let mut callback_error = None;
+    let prepared = match prepare_round_zero_search_with_events(
+        web,
+        &request.conversation_id,
+        &request.execution_id,
+        &request.query,
+        request.prev_user_turn.as_deref(),
+        request.mode,
+        request.web_enabled,
+        request.enforce_quick_router,
+        deadline,
+        cancellation,
+        |event| {
+            let res = match event {
+                RunEvent::ToolStarted { name, .. } => {
+                    callback(CallbackEvent::Status(if name == "web_fetch" {
+                        "Reading"
+                    } else {
+                        "Searching"
+                    }))
+                }
+                RunEvent::ToolCompleted { outcome, .. } => {
+                    let fallback = if outcome.fallback_used {
+                        callback(CallbackEvent::Status("Fallback"))
+                    } else {
+                        Ok(())
+                    };
+                    fallback.and_then(|()| {
+                        if !cancellation.is_cancelled()
+                            && (outcome.partial || outcome.evidence_unavailable)
+                        {
+                            callback(CallbackEvent::Status("Partial"))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                }
+                RunEvent::ToolFailed { .. } => callback(CallbackEvent::Status("Partial")),
+                RunEvent::Model(_) => Ok(()),
+            };
+            if let Err(err) = res {
+                callback_error = Some(err);
+                Err(())
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .await
     {
-        routing.normalized_input.trim()
-    } else {
-        request.query.trim()
-    };
-    let query = truncate_utf8(raw_query, 2048);
-    let limit = match request.mode {
-        Mode::Quick => 3,
-        Mode::Verify => 5,
-        Mode::Research => 8,
-    };
-    let search_op = Operation::Search {
-        objective: query.clone(),
-        queries: vec![query.clone()],
-        limit,
-    };
-
-    if let Err(error) = callback(CallbackEvent::Status("Searching")) {
-        return (
-            SearchPreparation::default(),
-            SearchPreparationStatus::Failed(error),
-        );
-    }
-    if cancellation.is_cancelled() {
-        return (
-            SearchPreparation::default(),
-            SearchPreparationStatus::Cancelled,
-        );
-    }
-
-    let search_outcome = match web
-        .execute(
-            &search_op,
-            &request.conversation_id,
-            &request.execution_id,
-            deadline,
-            cancellation,
-        )
-        .await
-    {
-        Err(Failure::Cancelled) => {
+        Ok(prepared) => prepared,
+        Err(RunError::CallbackFailed) => {
             return (
-                SearchPreparation::default(),
+                SearchPreparation {
+                    status_code: "unavailable".to_string(),
+                    ..SearchPreparation::default()
+                },
+                SearchPreparationStatus::Failed(
+                    callback_error.unwrap_or(ErrorCode::CallbackFailed),
+                ),
+            );
+        }
+        Err(RunError::Tool(Failure::Cancelled)) => {
+            return (
+                SearchPreparation {
+                    status_code: "cancelled".to_string(),
+                    ..SearchPreparation::default()
+                },
                 SearchPreparationStatus::Cancelled,
             );
         }
-        Err(_) if cancellation.is_cancelled() => {
+        Err(RunError::Tool(Failure::InvalidArguments)) => {
+            if cancellation.is_cancelled() {
+                return (
+                    SearchPreparation {
+                        status_code: "cancelled".to_string(),
+                        ..SearchPreparation::default()
+                    },
+                    SearchPreparationStatus::Cancelled,
+                );
+            }
             return (
-                SearchPreparation::default(),
-                SearchPreparationStatus::Cancelled,
+                SearchPreparation {
+                    status_code: "invalid".to_string(),
+                    ..SearchPreparation::default()
+                },
+                SearchPreparationStatus::Ready,
             );
         }
         Err(_) => {
-            if let Err(error) = callback(CallbackEvent::Status("Partial")) {
+            if cancellation.is_cancelled() {
                 return (
-                    SearchPreparation::default(),
-                    SearchPreparationStatus::Failed(error),
-                );
-            }
-            return (SearchPreparation::default(), SearchPreparationStatus::Ready);
-        }
-        Ok(outcome) => outcome,
-    };
-
-    if cancellation.is_cancelled() {
-        return (
-            SearchPreparation::default(),
-            SearchPreparationStatus::Cancelled,
-        );
-    }
-    if search_outcome.fallback_used {
-        if let Err(error) = callback(CallbackEvent::Status("Fallback")) {
-            return (
-                SearchPreparation::default(),
-                SearchPreparationStatus::Failed(error),
-            );
-        }
-    }
-    if !cancellation.is_cancelled()
-        && (search_outcome.partial || search_outcome.evidence_unavailable)
-    {
-        if let Err(error) = callback(CallbackEvent::Status("Partial")) {
-            return (
-                SearchPreparation::default(),
-                SearchPreparationStatus::Failed(error),
-            );
-        }
-    }
-    if cancellation.is_cancelled() {
-        return (
-            SearchPreparation::default(),
-            SearchPreparationStatus::Cancelled,
-        );
-    }
-
-    let mut collected_sources = search_outcome.sources;
-    let snippet_sufficiency = check_search_snippets_sufficiency(&request.query, &collected_sources);
-
-    let max_reads = match request.mode {
-        Mode::Quick => {
-            if matches!(snippet_sufficiency, SnippetSufficiency::NeedsEscalation(_)) {
-                2
-            } else {
-                0
-            }
-        }
-        Mode::Verify => 2,
-        Mode::Research => 3,
-    };
-    let mut fetch_urls = Vec::new();
-    for source in &collected_sources {
-        if fetch_urls.len() >= max_reads {
-            break;
-        }
-        if let Ok(normalized) = voxgolem_platform::web::public_url(&source.url) {
-            if !fetch_urls.contains(&normalized) {
-                fetch_urls.push(normalized);
-            }
-        }
-    }
-
-    if !fetch_urls.is_empty() && Instant::now() < deadline {
-        if let Err(error) = callback(CallbackEvent::Status("Reading")) {
-            return (
-                SearchPreparation::default(),
-                SearchPreparationStatus::Failed(error),
-            );
-        }
-        if cancellation.is_cancelled() {
-            return (
-                SearchPreparation::default(),
-                SearchPreparationStatus::Cancelled,
-            );
-        }
-        let fetch_op = Operation::Fetch {
-            urls: fetch_urls,
-            focus: truncate_utf8(&query, 200),
-        };
-        match web
-            .execute(
-                &fetch_op,
-                &request.conversation_id,
-                &request.execution_id,
-                deadline,
-                cancellation,
-            )
-            .await
-        {
-            Err(Failure::Cancelled) => {
-                return (
-                    SearchPreparation::default(),
+                    SearchPreparation {
+                        status_code: "cancelled".to_string(),
+                        ..SearchPreparation::default()
+                    },
                     SearchPreparationStatus::Cancelled,
                 );
             }
-            Err(_) if cancellation.is_cancelled() => {
-                return (
-                    SearchPreparation::default(),
-                    SearchPreparationStatus::Cancelled,
-                );
-            }
-            Err(_) => {
-                if let Err(error) = callback(CallbackEvent::Status("Partial")) {
-                    return (
-                        SearchPreparation::default(),
-                        SearchPreparationStatus::Failed(error),
-                    );
-                }
-            }
-            Ok(fetch_outcome) => {
-                if cancellation.is_cancelled() {
-                    return (
-                        SearchPreparation::default(),
-                        SearchPreparationStatus::Cancelled,
-                    );
-                }
-                if fetch_outcome.fallback_used {
-                    if let Err(error) = callback(CallbackEvent::Status("Fallback")) {
-                        return (
-                            SearchPreparation::default(),
-                            SearchPreparationStatus::Failed(error),
-                        );
-                    }
-                }
-                if !cancellation.is_cancelled()
-                    && (fetch_outcome.partial || fetch_outcome.evidence_unavailable)
-                {
-                    if let Err(error) = callback(CallbackEvent::Status("Partial")) {
-                        return (
-                            SearchPreparation::default(),
-                            SearchPreparationStatus::Failed(error),
-                        );
-                    }
-                }
-                collected_sources.extend(fetch_outcome.sources);
-            }
+            return (
+                SearchPreparation {
+                    status_code: "unavailable".to_string(),
+                    ..SearchPreparation::default()
+                },
+                SearchPreparationStatus::Ready,
+            );
         }
-    }
+    };
 
-    if cancellation.is_cancelled() {
+    if prepared.searches == 0 && !prepared.needs_search {
         return (
-            SearchPreparation::default(),
-            SearchPreparationStatus::Cancelled,
+            SearchPreparation {
+                route: Some(prepared.route.code().to_string()),
+                needs_search: false,
+                fallback_used: false,
+                status_code: "skipped".to_string(),
+                ..SearchPreparation::default()
+            },
+            SearchPreparationStatus::Skipped,
         );
     }
 
-    let mut evidence_bytes = 0usize;
-    for source in &mut collected_sources {
-        let remaining = policy.evidence_bytes.saturating_sub(evidence_bytes);
-        if source.text.len() > remaining {
-            source.text = truncate_utf8(&source.text, remaining);
-            source.truncated = true;
-        }
-        evidence_bytes += source.text.len();
-    }
-
-    let mut formatted_context = String::new();
-    let mut item_index = 0usize;
-    for source in &collected_sources {
-        if !has_readable_text(&source.text) && source.title.trim().is_empty() {
-            continue;
-        }
-        let snippet = truncate_utf8(source.text.trim(), MAX_SOURCE_EXCERPT_BYTES);
-        let title = if source.title.trim().is_empty() {
-            source.url.trim()
-        } else {
-            source.title.trim()
-        };
-        item_index += 1;
-        let entry = format!(
-            "[{}] {} ({})\n{}\n\n",
-            item_index,
-            title,
-            source.url.trim(),
-            snippet
-        );
-        if formatted_context.len() + entry.len() > MAX_PREPARED_EVIDENCE_BYTES {
-            let remaining = MAX_PREPARED_EVIDENCE_BYTES.saturating_sub(formatted_context.len());
-            if remaining > 64 {
-                formatted_context.push_str(&truncate_utf8(&entry, remaining));
-            }
-            break;
-        }
-        formatted_context.push_str(&entry);
-    }
-
-    let evidence_context =
-        (!formatted_context.trim().is_empty()).then(|| formatted_context.trim_end().to_string());
-    let mut source_footer = String::new();
-    if evidence_context.is_some() {
-        append_source_footer(
-            &mut source_footer,
-            collected_sources.iter().map(|source| source.url.as_str()),
-        );
-    }
-
-    let needs_escalation = matches!(
-        check_search_snippets_sufficiency(&request.query, &collected_sources),
-        SnippetSufficiency::NeedsEscalation(_)
-    );
+    let status_code = if prepared.evidence_context.is_none() && prepared.sources.is_empty() {
+        "unavailable"
+    } else if prepared.partial {
+        "partial"
+    } else {
+        "ready"
+    };
 
     (
         SearchPreparation {
-            evidence_context,
-            source_footer,
-            sources: collected_sources,
-            needs_escalation,
-            route: Some(routing.primary.code().to_string()),
-            needs_search: routing.needs_search(),
+            evidence_context: prepared.evidence_context,
+            source_footer: prepared.source_footer,
+            sources: prepared.sources,
+            needs_escalation: prepared.needs_escalation,
+            route: Some(prepared.route.code().to_string()),
+            needs_search: prepared.needs_search,
+            fallback_used: prepared.fallbacks > 0,
+            status_code: status_code.to_string(),
         },
         SearchPreparationStatus::Ready,
     )
@@ -543,18 +448,30 @@ pub(crate) async fn prepare(
         Ok(service) => service,
         Err(Failure::Cancelled) => {
             return (
-                SearchPreparation::default(),
+                SearchPreparation {
+                    status_code: "cancelled".to_string(),
+                    ..SearchPreparation::default()
+                },
                 SearchPreparationStatus::Cancelled,
             )
         }
         Err(_) => {
             if let Err(error) = callback(CallbackEvent::Status("Partial")) {
                 return (
-                    SearchPreparation::default(),
+                    SearchPreparation {
+                        status_code: "unavailable".to_string(),
+                        ..SearchPreparation::default()
+                    },
                     SearchPreparationStatus::Failed(error),
                 );
             }
-            return (SearchPreparation::default(), SearchPreparationStatus::Ready);
+            return (
+                SearchPreparation {
+                    status_code: "unavailable".to_string(),
+                    ..SearchPreparation::default()
+                },
+                SearchPreparationStatus::Ready,
+            );
         }
     };
     prepare_search_context_with_service(&mut web, request, &cancellation, callback).await
@@ -667,19 +584,17 @@ fn count_status(sources: &[voxgolem_core::search::Source]) -> Option<String> {
 pub(crate) fn route_prompt_2d(
     prompt: &voxgolem_platform::custom_openai::CustomOpenAiPrompt,
 ) -> voxgolem_core::router::RoutingDecision {
-    let prev_user = prompt
-        .history
-        .iter()
-        .rev()
-        .find(|msg| {
+    let prev_user = fold_prior_user_turns(
+        prompt.history.iter().filter_map(|msg| {
             matches!(
                 msg.role,
                 voxgolem_platform::custom_openai::CustomOpenAiRole::User
             )
-        })
-        .map(|msg| msg.text.as_str())
-        .filter(|text| !text.trim().is_empty());
-    classify_prompt_2d(&prompt.prompt, prev_user, None)
+            .then_some(msg.text.as_str())
+        }),
+        &prompt.prompt,
+    );
+    classify_prompt_2d(&prompt.prompt, prev_user.as_deref(), None)
 }
 
 pub(crate) async fn respond(
@@ -689,10 +604,25 @@ pub(crate) async fn respond(
     cancelled: watch::Receiver<bool>,
     callback: &mut impl FnMut(CallbackEvent<'_>) -> Result<(), ErrorCode>,
 ) -> Outcome {
+    let turn_started = Instant::now();
+    let routing = route_prompt_2d(&request.prompt);
+    let route_code = routing.primary.code().to_string();
+    let mode = request.search_mode.expect("search admission requires mode");
+    let effective_mode = if request.web_enabled {
+        routing.primary.effective_search_mode(mode).unwrap_or(mode)
+    } else {
+        mode
+    };
+    let use_shared_web = request.web_enabled
+        && (mode != voxgolem_core::search::Mode::Quick
+            || routing.needs_search()
+            || !process.prewarm_gate.is_prewarming());
+    let search_started = Cell::<Option<Instant>>::new(None);
+    let search_elapsed_ms = Cell::<u64>::new(0);
     let cancellation = Cancellation::from_receiver(cancelled);
     let deadline = Instant::now() + config.total_timeout;
-    let mut isolated_web = (!request.web_enabled).then(|| WebService::new(McpTransport::default()));
-    let mut shared_web = if request.web_enabled {
+    let mut isolated_web = (!use_shared_web).then(|| WebService::new(McpTransport::default()));
+    let mut shared_web = if use_shared_web {
         match voxgolem_platform::search::admit_web(
             &process.web,
             &process.prewarm_gate,
@@ -727,11 +657,11 @@ pub(crate) async fn respond(
     let result = run_with_client_events(
         &client,
         &request.prompt,
-        request.search_mode.expect("search admission requires mode"),
+        effective_mode,
         RunContext {
             conversation_id: &request.prompt.session_id,
             instructions: &request.instructions,
-            explicit_search: request.search_mode != Some(voxgolem_core::search::Mode::Quick),
+            explicit_search: mode != voxgolem_core::search::Mode::Quick,
             web_enabled: request.web_enabled,
         },
         &mut *web,
@@ -753,6 +683,9 @@ pub(crate) async fn respond(
                     callback,
                 ),
                 RunEvent::ToolStarted { name, .. } => {
+                    if search_started.get().is_none() {
+                        search_started.set(Some(Instant::now()));
+                    }
                     callback(CallbackEvent::Status(if name == "web_fetch" {
                         "Reading"
                     } else {
@@ -760,6 +693,10 @@ pub(crate) async fn respond(
                     }))
                 }
                 RunEvent::ToolCompleted { outcome, .. } => {
+                    if let Some(started) = search_started.take() {
+                        let elapsed = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                        search_elapsed_ms.set(search_elapsed_ms.get().saturating_add(elapsed));
+                    }
                     let fallback = if outcome.fallback_used {
                         callback(CallbackEvent::Status("Fallback"))
                     } else {
@@ -777,7 +714,13 @@ pub(crate) async fn respond(
                         }
                     })
                 }
-                RunEvent::ToolFailed { .. } => callback(CallbackEvent::Status("Partial")),
+                RunEvent::ToolFailed { .. } => {
+                    if let Some(started) = search_started.take() {
+                        let elapsed = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                        search_elapsed_ms.set(search_elapsed_ms.get().saturating_add(elapsed));
+                    }
+                    callback(CallbackEvent::Status("Partial"))
+                }
             };
             if let Err(error) = delivered {
                 callback_failure = Some(error);
@@ -796,6 +739,16 @@ pub(crate) async fn respond(
     } else {
         match result {
             Ok(result) => {
+                let search_status = if result.searches == 0 {
+                    "skipped"
+                } else if result.sources.is_empty() {
+                    "unavailable"
+                } else if result.partial {
+                    "partial"
+                } else {
+                    "ready"
+                };
+                let fallback_used = result.fallbacks > 0;
                 let persisted = result.persisted_text();
                 let outcome = Outcome::from_search_response(result.response, persisted);
                 // Some search output is withheld until the final outcome, not streamed.
@@ -811,7 +764,14 @@ pub(crate) async fn respond(
                         return Outcome::Cancelled;
                     }
                 }
-                outcome
+                let completed_ms = turn_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                outcome.with_search_telemetry(
+                    route_code,
+                    search_elapsed_ms.get(),
+                    search_status,
+                    fallback_used,
+                    completed_ms,
+                )
             }
             Err(RunError::Provider(error)) => Outcome::error(error.into()),
             Err(RunError::Tool(Failure::Cancelled)) => Outcome::Cancelled,
@@ -1395,8 +1355,149 @@ mod tests {
             assert_eq!(status_search, SearchPreparationStatus::Ready);
             assert_eq!(prep_search.route, Some("S".to_string()));
             assert!(prep_search.needs_search);
+            assert!(!prep_search.fallback_used);
+            assert_eq!(prep_search.status_code, "ready");
             assert_eq!(web_search.transport.calls.len(), 1);
             assert_eq!(prep_search.sources.len(), 1);
         });
+    }
+
+    #[test]
+    fn should_run_web_search_delegates_to_2d_router_and_respects_modes() {
+        assert!(!should_run_web_search(
+            false,
+            "verify",
+            "What is the weather in Tokyo?",
+            None
+        ));
+        assert!(!should_run_web_search(true, "verify", "   ", None));
+        assert!(!should_run_web_search(
+            true,
+            "off",
+            "What is the weather in Tokyo?",
+            None
+        ));
+        assert!(should_run_web_search(true, "verify", "Hello", None));
+        assert!(should_run_web_search(true, "research", "Hello", None));
+
+        // DirectFast -> false
+        assert!(!should_run_web_search(
+            true,
+            "quick",
+            "What is 14 * 15?",
+            None
+        ));
+        assert!(!should_run_web_search(
+            true,
+            "quick",
+            "Fix typos: Who won the game today?",
+            None
+        ));
+
+        // DirectSmart -> false
+        assert!(!should_run_web_search(
+            true,
+            "quick",
+            "Why does this Rust ring buffer panic?",
+            None
+        ));
+
+        // SearchFast -> true
+        assert!(should_run_web_search(
+            true,
+            "quick",
+            "What is the current weather in Tokyo?",
+            None
+        ));
+
+        // ResearchSmart -> true
+        assert!(should_run_web_search(
+            true,
+            "quick",
+            "Compare and contrast Tokio and async-std with a deep dive into their schedulers",
+            None
+        ));
+
+        // Multi-turn elliptical follow-up -> true when previous turn was search
+        assert!(should_run_web_search(
+            true,
+            "quick",
+            "And what about the other one?",
+            Some("What is the current stock price of AMD right now?")
+        ));
+        assert!(!should_run_web_search(
+            true,
+            "quick",
+            "And what about the other one?",
+            None
+        ));
+    }
+
+    #[test]
+    fn three_turn_conversation_folds_root_topic_into_parse_and_route_prompt_2d() {
+        use voxgolem_platform::custom_openai::{
+            CustomOpenAiContentType, CustomOpenAiMessage, CustomOpenAiPrompt, CustomOpenAiRole,
+        };
+
+        let turn1 = "In Magic: The Gathering, how does Urza's Saga work?";
+        let turn2 = "What about its second ability?";
+        let turn3 = "And what if it gets destroyed?";
+
+        let req_json = json!({
+            "requestId": "req-three-turn",
+            "webEnabled": true,
+            "searchMode": "quick",
+            "messages": [
+                { "role": "user", "content": turn1 },
+                { "role": "assistant", "content": "It is an enchantment land with chapter abilities.\n\nSources:\nhttps://example.com/mtg\n" },
+                { "role": "user", "content": format!("{turn2}\n\nSources:\nhttps://example.com/mtg\n") },
+                { "role": "assistant", "content": "Chapter II creates Construct tokens." },
+                { "role": "user", "content": turn3 }
+            ]
+        })
+        .to_string();
+
+        let parsed = SearchPrepareRequest::parse(&req_json).unwrap();
+        assert_eq!(parsed.query, turn3);
+        assert_eq!(
+            parsed.prev_user_turn.as_deref(),
+            Some("In Magic: The Gathering, how does Urza's Saga work? What about its second ability?")
+        );
+        assert!(should_run_web_search(
+            true,
+            "quick",
+            &parsed.query,
+            parsed.prev_user_turn.as_deref()
+        ));
+
+        let prompt = CustomOpenAiPrompt {
+            session_id: "test-session".to_string(),
+            prompt: turn3.to_string(),
+            history: vec![
+                CustomOpenAiMessage {
+                    role: CustomOpenAiRole::User,
+                    content_type: CustomOpenAiContentType::OutputText,
+                    text: turn1.to_string(),
+                },
+                CustomOpenAiMessage {
+                    role: CustomOpenAiRole::Assistant,
+                    content_type: CustomOpenAiContentType::OutputText,
+                    text: "It is an enchantment land.".to_string(),
+                },
+                CustomOpenAiMessage {
+                    role: CustomOpenAiRole::User,
+                    content_type: CustomOpenAiContentType::OutputText,
+                    text: turn2.to_string(),
+                },
+                CustomOpenAiMessage {
+                    role: CustomOpenAiRole::Assistant,
+                    content_type: CustomOpenAiContentType::OutputText,
+                    text: "Chapter II creates tokens.".to_string(),
+                },
+            ],
+        };
+        let decision = route_prompt_2d(&prompt);
+        assert_eq!(decision.primary, Route2D::SearchFast);
+        assert!(decision.needs_search());
     }
 }

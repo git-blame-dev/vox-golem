@@ -7,9 +7,7 @@ use voxgolem_core::router::{
     check_search_snippets_sufficiency, classify_prompt_2d, is_natural_abstention, RoutingDecision,
     SnippetSufficiency,
 };
-use voxgolem_core::search::{
-    has_readable_text, truncate_utf8, EvidenceKind, Failure, Mode, Source,
-};
+use voxgolem_core::search::{truncate_utf8, EvidenceKind, Failure, Mode, Source};
 use voxgolem_platform::custom_openai::tools::ModelEvent;
 pub(super) use voxgolem_platform::custom_openai::CustomOpenAiMessage as CustomOpenAiHistoryTurn;
 use voxgolem_platform::custom_openai::{
@@ -17,18 +15,19 @@ use voxgolem_platform::custom_openai::{
     CustomOpenAiRole,
 };
 use voxgolem_platform::search::{
-    append_source_footer, run_with_client_events, RunContext, RunError, RunEvent, RunResult,
+    prepare_round_zero_search_with_events, run_with_client_events, RunContext, RunError, RunEvent,
+    RunResult,
 };
 use voxgolem_platform::search_control::Cancellation;
-use voxgolem_platform::web::{public_url, McpTransport, Operation, WebService};
+use voxgolem_platform::web::{McpTransport, WebService};
 
-const MAX_PREPARED_EVIDENCE_BYTES: usize = 4096;
-const MAX_SOURCE_EXCERPT_BYTES: usize = 1200;
-
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub(super) struct LocalPreparedSearch {
     pub evidence_context: Option<String>,
     pub source_footer: String,
+    pub needs_escalation: bool,
+    #[allow(dead_code)]
+    pub sources: Vec<SourcePayload>,
 }
 
 pub(super) struct DesktopSearchState {
@@ -185,17 +184,70 @@ impl RoleExt for CustomOpenAiRole {
     }
 }
 
-pub(super) fn previous_user_turn(history: &[CustomOpenAiHistoryTurn]) -> Option<&str> {
-    history
-        .iter()
-        .rev()
-        .find(|turn| turn.role.eq_ignore_ascii_case("user"))
-        .map(|turn| turn.text.as_str())
-        .filter(|text| !text.trim().is_empty())
+pub(super) fn fold_previous_user_turns<'a>(
+    turns: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    let cleaned: Vec<&str> = turns
+        .into_iter()
+        .map(|text| text.split("\n\nSources:\n").next().unwrap_or(text).trim())
+        .filter(|text| !text.is_empty())
+        .collect();
+    let window = if cleaned.len() > 3 {
+        &cleaned[cleaned.len() - 3..]
+    } else {
+        &cleaned[..]
+    };
+    match window {
+        [] => None,
+        [single] => Some(truncate_utf8(single, 200)),
+        [anchor, .., latest] => {
+            if anchor.eq_ignore_ascii_case(latest) {
+                Some(truncate_utf8(latest, 200))
+            } else {
+                let combined = format!(
+                    "{} {}",
+                    truncate_utf8(anchor, 100),
+                    truncate_utf8(latest, 100)
+                );
+                Some(truncate_utf8(&combined, 200))
+            }
+        }
+    }
+}
+
+pub(super) fn previous_user_turn(history: &[CustomOpenAiHistoryTurn]) -> Option<String> {
+    fold_previous_user_turns(
+        history
+            .iter()
+            .filter(|turn| turn.role.eq_ignore_ascii_case("user"))
+            .map(|turn| turn.text.as_str()),
+    )
 }
 
 pub(super) fn route_prompt_2d(prompt: &CustomOpenAiPrompt) -> RoutingDecision {
-    classify_prompt_2d(&prompt.prompt, previous_user_turn(&prompt.history), None)
+    route_prompt_2d_with_embedding(prompt, None)
+}
+
+pub(super) fn route_prompt_2d_with_embedding(
+    prompt: &CustomOpenAiPrompt,
+    bge_embedding: Option<&[f32]>,
+) -> RoutingDecision {
+    let prev_user = previous_user_turn(&prompt.history);
+    classify_prompt_2d(&prompt.prompt, prev_user.as_deref(), bge_embedding)
+}
+
+pub(super) fn resolve_2d_search_plan(
+    routing: &RoutingDecision,
+    requested_mode: Mode,
+    web_enabled: bool,
+) -> (bool, Mode) {
+    if !web_enabled {
+        return (false, requested_mode);
+    }
+    match routing.primary.effective_search_mode(requested_mode) {
+        Some(effective_mode) => (true, effective_mode),
+        None => (false, Mode::Quick),
+    }
 }
 
 pub(super) fn should_escalate_post_search(
@@ -228,14 +280,10 @@ pub(super) async fn run_custom(
     let effective_web_enabled = web_enabled
         && (mode != Mode::Quick
             || routing.normalized_input != voxgolem_core::router::CANONICAL_SUPPLIED_TEXT_INTENT);
-    let effective_mode = if effective_web_enabled {
-        routing.primary.effective_search_mode(mode).unwrap_or(mode)
-    } else {
-        mode
-    };
-    let mut isolated_service =
-        (!effective_web_enabled).then(|| WebService::new(McpTransport::default()));
-    let mut shared_service = if effective_web_enabled {
+    let use_shared_web = effective_web_enabled
+        && (mode != Mode::Quick || routing.needs_search() || !state.prewarm_gate.is_prewarming());
+    let mut isolated_service = (!use_shared_web).then(|| WebService::new(McpTransport::default()));
+    let mut shared_service = if use_shared_web {
         Some(
             voxgolem_platform::search::admit_web(
                 &state.service,
@@ -269,7 +317,7 @@ pub(super) async fn run_custom(
     let mut result = run_with_client_events(
         &request_client,
         prompt,
-        effective_mode,
+        mode,
         RunContext {
             conversation_id: &conversation_key,
             instructions: voxgolem_core::response_style::PLAIN_TEXT_POLICY,
@@ -316,7 +364,7 @@ pub(super) async fn prepare_local_search(
     mut publish: impl FnMut(PromptExecutionEventPayload) -> Result<(), ()>,
 ) -> LocalPreparedSearch {
     let routing = classify_prompt_2d(prompt, prev_user_turn, None);
-    let effective_web = web_enabled && (mode != Mode::Quick || routing.needs_search());
+    let (effective_web, effective_mode) = resolve_2d_search_plan(&routing, mode, web_enabled);
     if !effective_web || prompt.trim().is_empty() {
         return LocalPreparedSearch::default();
     }
@@ -332,7 +380,6 @@ pub(super) async fn prepare_local_search(
         return LocalPreparedSearch::default();
     }
 
-    let effective_mode = routing.primary.effective_search_mode(mode).unwrap_or(mode);
     let policy = effective_mode.policy();
     let deadline = tokio::time::Instant::now() + policy.tool_time;
 
@@ -351,117 +398,46 @@ pub(super) async fn prepare_local_search(
         return LocalPreparedSearch::default();
     }
 
-    if publish(PromptExecutionEventPayload::Status {
-        message: String::from("Searching the web"),
-    })
-    .is_err()
-    {
-        cancel.cancel();
-        cancellation
-            .cancelled
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        cancellation.signal.send_replace(true);
-        return LocalPreparedSearch::default();
-    }
-
-    let limit = match effective_mode {
-        Mode::Quick => 3,
-        Mode::Verify => 5,
-        Mode::Research => 8,
-    };
-    let raw_query = if prev_user_turn.is_some()
-        && routing.normalized_input != voxgolem_core::router::CANONICAL_SUPPLIED_TEXT_INTENT
-    {
-        routing.normalized_input.trim()
-    } else {
-        prompt.trim()
-    };
-    let query = truncate_utf8(raw_query, 2048);
-    let search_op = Operation::Search {
-        objective: query.clone(),
-        queries: vec![query],
-        limit,
-    };
     let conversation_key = state.conversation_key(session);
     let execution_id = format!("{}-round0", conversation_key);
-
-    let search_outcome = match service
-        .execute(
-            &search_op,
-            &conversation_key,
-            &execution_id,
-            deadline,
-            &cancel,
-        )
-        .await
+    let prepared = match prepare_round_zero_search_with_events(
+        &mut service,
+        &conversation_key,
+        &execution_id,
+        prompt,
+        prev_user_turn,
+        effective_mode,
+        true,
+        true,
+        deadline,
+        &cancel,
+        |event| match event {
+            RunEvent::ToolStarted { name, .. } => {
+                let message = String::from(if name == "web_fetch" {
+                    "Reading sources"
+                } else {
+                    "Searching the web"
+                });
+                if publish(PromptExecutionEventPayload::Status { message }).is_err() {
+                    cancel.cancel();
+                    cancellation
+                        .cancelled
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    cancellation.signal.send_replace(true);
+                    return Err(());
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        },
+    )
+    .await
     {
-        Ok(outcome) => outcome,
-        Err(_) => return LocalPreparedSearch::default(),
+        Ok(prepared) if !cancel.is_cancelled() => prepared,
+        _ => return LocalPreparedSearch::default(),
     };
-    if cancel.is_cancelled() {
-        return LocalPreparedSearch::default();
-    }
 
-    let mut collected_sources = search_outcome.sources;
-    let sufficiency = check_search_snippets_sufficiency(prompt, &collected_sources);
-    let should_fetch = effective_mode != Mode::Quick
-        || matches!(sufficiency, SnippetSufficiency::NeedsEscalation(_));
-
-    if should_fetch {
-        let max_reads = match effective_mode {
-            Mode::Quick => 2,
-            Mode::Verify => 2,
-            Mode::Research => 3,
-        };
-        let mut fetch_urls = Vec::new();
-        for source in &collected_sources {
-            if fetch_urls.len() >= max_reads {
-                break;
-            }
-            if let Ok(normalized) = public_url(&source.url) {
-                if !fetch_urls.contains(&normalized) {
-                    fetch_urls.push(normalized);
-                }
-            }
-        }
-        if !fetch_urls.is_empty() && tokio::time::Instant::now() < deadline {
-            if publish(PromptExecutionEventPayload::Status {
-                message: String::from("Reading sources"),
-            })
-            .is_err()
-            {
-                cancel.cancel();
-                cancellation
-                    .cancelled
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                cancellation.signal.send_replace(true);
-                return LocalPreparedSearch::default();
-            }
-            if !cancel.is_cancelled() {
-                let fetch_op = Operation::Fetch {
-                    urls: fetch_urls,
-                    focus: truncate_utf8(prompt.trim(), 200),
-                };
-                if let Ok(fetch_outcome) = service
-                    .execute(
-                        &fetch_op,
-                        &conversation_key,
-                        &execution_id,
-                        deadline,
-                        &cancel,
-                    )
-                    .await
-                {
-                    collected_sources.extend(fetch_outcome.sources);
-                }
-            }
-        }
-    }
-    if cancel.is_cancelled() {
-        return LocalPreparedSearch::default();
-    }
-
-    let source_payloads: Vec<SourcePayload> = source_links(&collected_sources)
+    let source_payloads: Vec<SourcePayload> = source_links(&prepared.sources)
         .into_iter()
         .map(|source| SourcePayload {
             url: source.url,
@@ -483,56 +459,11 @@ pub(super) async fn prepare_local_search(
         return LocalPreparedSearch::default();
     }
 
-    let mut evidence_bytes = 0usize;
-    for source in &mut collected_sources {
-        let remaining = policy.evidence_bytes.saturating_sub(evidence_bytes);
-        if source.text.len() > remaining {
-            source.text = truncate_utf8(&source.text, remaining);
-            source.truncated = true;
-        }
-        evidence_bytes += source.text.len();
-    }
-
-    let mut formatted_context = String::new();
-    let mut item_index = 0usize;
-    for source in &collected_sources {
-        if !has_readable_text(&source.text) && source.title.trim().is_empty() {
-            continue;
-        }
-        let snippet = truncate_utf8(source.text.trim(), MAX_SOURCE_EXCERPT_BYTES);
-        let title = if source.title.trim().is_empty() {
-            source.url.trim()
-        } else {
-            source.title.trim()
-        };
-        item_index += 1;
-        let entry = format!(
-            "[{item_index}] {title} ({})\n{snippet}\n\n",
-            source.url.trim()
-        );
-        if formatted_context.len() + entry.len() > MAX_PREPARED_EVIDENCE_BYTES {
-            let remaining = MAX_PREPARED_EVIDENCE_BYTES.saturating_sub(formatted_context.len());
-            if remaining > 64 {
-                formatted_context.push_str(&truncate_utf8(&entry, remaining));
-            }
-            break;
-        }
-        formatted_context.push_str(&entry);
-    }
-
-    let evidence_context =
-        (!formatted_context.trim().is_empty()).then(|| formatted_context.trim_end().to_string());
-    let mut source_footer = String::new();
-    if evidence_context.is_some() {
-        append_source_footer(
-            &mut source_footer,
-            collected_sources.iter().map(|source| source.url.as_str()),
-        );
-    }
-
     LocalPreparedSearch {
-        evidence_context,
-        source_footer,
+        evidence_context: prepared.evidence_context,
+        source_footer: prepared.source_footer,
+        needs_escalation: prepared.needs_escalation,
+        sources: source_payloads,
     }
 }
 
@@ -926,6 +857,40 @@ mod tests {
         let followup_routing = route_prompt_2d(&followup_prompt);
         assert_eq!(followup_routing.primary, Route2D::SearchFast);
         assert!(followup_routing.needs_search());
+
+        let turn3_prompt = CustomOpenAiPrompt {
+            session_id: "test-session".into(),
+            prompt: "How about Intel?".into(),
+            history: vec![
+                CustomOpenAiHistoryTurn {
+                    role: CustomOpenAiRole::User,
+                    content_type: CustomOpenAiContentType::OutputText,
+                    text: "What is the current stock price of AMD right now?\n\nSources:\n- https://example.com".into(),
+                },
+                CustomOpenAiHistoryTurn {
+                    role: CustomOpenAiRole::Assistant,
+                    content_type: CustomOpenAiContentType::OutputText,
+                    text: "AMD is trading around $150.".into(),
+                },
+                CustomOpenAiHistoryTurn {
+                    role: CustomOpenAiRole::User,
+                    content_type: CustomOpenAiContentType::OutputText,
+                    text: "What about Nvidia?".into(),
+                },
+                CustomOpenAiHistoryTurn {
+                    role: CustomOpenAiRole::Assistant,
+                    content_type: CustomOpenAiContentType::OutputText,
+                    text: "Nvidia is trading around $120.".into(),
+                },
+            ],
+        };
+        let folded = previous_user_turn(&turn3_prompt.history).expect("folded turn");
+        assert!(!folded.contains("Sources:"));
+        assert!(folded.contains("stock price of AMD"));
+        assert!(folded.contains("What about Nvidia?"));
+        let turn3_routing = route_prompt_2d(&turn3_prompt);
+        assert_eq!(turn3_routing.primary, Route2D::SearchFast);
+        assert!(turn3_routing.needs_search());
     }
 
     #[test]
@@ -995,5 +960,69 @@ mod tests {
             &grounded_result,
             "Apple is currently trading at $225.50."
         ));
+    }
+
+    #[test]
+    fn resolve_2d_search_plan_routes_all_four_classes_autonomously() {
+        let make_decision = |primary: Route2D| RoutingDecision {
+            primary,
+            secondary: Route2D::DirectFast,
+            margin: 0.5,
+            parallel_fast_and_smart: primary == Route2D::ResearchSmart,
+            normalized_input: "test".into(),
+        };
+
+        assert_eq!(
+            resolve_2d_search_plan(&make_decision(Route2D::DirectFast), Mode::Quick, true),
+            (false, Mode::Quick)
+        );
+        assert_eq!(
+            resolve_2d_search_plan(&make_decision(Route2D::DirectSmart), Mode::Quick, true),
+            (false, Mode::Quick)
+        );
+        assert_eq!(
+            resolve_2d_search_plan(&make_decision(Route2D::SearchFast), Mode::Quick, true),
+            (true, Mode::Quick)
+        );
+        assert_eq!(
+            resolve_2d_search_plan(&make_decision(Route2D::ResearchSmart), Mode::Quick, true),
+            (true, Mode::Research)
+        );
+
+        // Explicit Verify/Research overrides remain respected when web_enabled is true
+        assert_eq!(
+            resolve_2d_search_plan(&make_decision(Route2D::DirectFast), Mode::Verify, true),
+            (true, Mode::Verify)
+        );
+        assert_eq!(
+            resolve_2d_search_plan(&make_decision(Route2D::DirectSmart), Mode::Research, true),
+            (true, Mode::Research)
+        );
+
+        // Disabled web_enabled always disables search
+        for route in Route2D::ALL {
+            assert_eq!(
+                resolve_2d_search_plan(&make_decision(route), Mode::Quick, false),
+                (false, Mode::Quick)
+            );
+        }
+
+        // BGE-small embedding routing via route_prompt_2d_with_embedding
+        let prompt = CustomOpenAiPrompt {
+            session_id: "test-bge".into(),
+            prompt: "Compare and contrast Tokio and async-std with a deep dive".into(),
+            history: vec![],
+        };
+        let mut emb = [0.0_f32; voxgolem_core::router_weights::BGE_SMALL_EMBEDDING_DIM];
+        emb[0] = 1.0;
+        let with_emb = route_prompt_2d_with_embedding(&prompt, Some(&emb));
+        assert!(Route2D::ALL.contains(&with_emb.primary));
+
+        let fallback = route_prompt_2d_with_embedding(&prompt, None);
+        assert_eq!(fallback.primary, Route2D::ResearchSmart);
+        assert_eq!(
+            resolve_2d_search_plan(&fallback, Mode::Quick, true),
+            (true, Mode::Research)
+        );
     }
 }
