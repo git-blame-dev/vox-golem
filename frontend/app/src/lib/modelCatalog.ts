@@ -9,6 +9,7 @@ export const MODEL_CATALOG = [
   { id: 'custom-luna-low', label: 'Custom: GPT-5.6 Luna Low', agent: true, preview: false },
   { id: 'opencode-sol-high', label: 'OpenCode: GPT-6.1 Sol High', agent: true, preview: false },
   { id: 'opencode-luna-low', label: 'OpenCode: GPT-5.6 Luna Low', agent: true, preview: false },
+  { id: 'agy-flash-none', label: 'Agy: Gemini 3.8 Flash None', agent: false, preview: false },
   { id: 'agy-flash-low', label: 'Agy: Gemini 3.8 Flash Low', agent: true, preview: false },
   { id: 'agy-flash-high', label: 'Agy: Gemini 3.8 Flash High', agent: true, preview: false },
   { id: 'agy-opus-high', label: 'Agy: Claude Opus 5.5 High', agent: true, preview: false },
