@@ -62,7 +62,7 @@ impl Route2D {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct RoutingDecision {
     pub primary: Route2D,
     pub secondary: Route2D,
@@ -268,6 +268,284 @@ fn match_tail_supplied_text_instruction(text: &str) -> bool {
     false
 }
 
+fn strip_leading_discourse_markers(mut lower: &str) -> &str {
+    const DISCOURSE_MARKERS: &[&str] = &[
+        "wait", "okay", "ok", "so", "well", "hmm", "oh", "hey", "actually", "also", "and", "but",
+        "then",
+    ];
+    loop {
+        lower = lower.trim_start();
+        let mut stripped = false;
+        for marker in DISCOURSE_MARKERS {
+            if let Some(rem) = lower.strip_prefix(marker) {
+                if rem.is_empty() {
+                    return "";
+                }
+                let first = rem.chars().next().unwrap();
+                if first.is_whitespace() || first.is_ascii_punctuation() {
+                    let mut trimmed = rem;
+                    while let Some(c) = trimmed.chars().next() {
+                        if c.is_whitespace() || c.is_ascii_punctuation() {
+                            trimmed = &trimmed[c.len_utf8()..];
+                        } else {
+                            break;
+                        }
+                    }
+                    lower = trimmed;
+                    stripped = true;
+                    break;
+                }
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+    lower
+}
+
+fn has_anaphoric_follow_up_cue(lower: &str) -> bool {
+    const ANAPHORIC_PHRASES: &[&str] = &[
+        "its first",
+        "its second",
+        "its third",
+        "the first ability",
+        "the second ability",
+        "the third ability",
+        "first ability",
+        "second ability",
+        "third ability",
+        "chapter one",
+        "chapter two",
+        "chapter three",
+        "chapter 1",
+        "chapter 2",
+        "chapter 3",
+        "does that trigger",
+        "does it trigger",
+        "when it enters",
+        "when it leaves",
+        "when it dies",
+        "if it's",
+        "if it is",
+        "while it's",
+        "while it is",
+        "on the stack",
+        "in play",
+        "on the battlefield",
+    ];
+    ANAPHORIC_PHRASES
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+}
+
+const ELLIPTICAL_PREFIXES: &[&str] = &[
+    "what about",
+    "and what about",
+    "how about",
+    "and how about",
+    "what if",
+    "and if",
+    "if i",
+    "if it",
+    "if they",
+    "if there",
+    "if you",
+    "and what",
+    "what was the",
+    "what is its",
+    "what are its",
+    "what does it",
+    "what do they",
+    "what happens when",
+    "what happens if",
+    "what happens",
+    "are there any",
+    "is there any",
+    "why has it",
+    "why is it",
+    "why does it",
+    "why did it",
+    "how does that",
+    "how does it",
+    "does the",
+    "does that",
+    "does it",
+    "do the",
+    "do they",
+    "can the",
+    "can you",
+    "can i",
+    "can it",
+    "can that",
+    "could it",
+    "could that",
+    "should i",
+    "should it",
+    "which one",
+    "which of",
+    "so if",
+    "so does",
+    "so is",
+    "even if",
+    "or if",
+    "and does",
+    "and can",
+    "and is",
+    "would that",
+    "would it",
+    "will that",
+    "will it",
+    "is that",
+    "is it",
+    "when it",
+    "when that",
+    "on chapter",
+    "for the first",
+    "for the second",
+    "for the third",
+    "that still",
+    "now modify",
+    "now change",
+    "now find",
+    "now make",
+    "do we need",
+];
+
+const SMART_KEYWORDS: &[&str] = &[
+    "rust",
+    "python",
+    "javascript",
+    "typescript",
+    "c++",
+    "golang",
+    "function",
+    "fn ",
+    "def ",
+    "class ",
+    "struct ",
+    "compile",
+    "compiler",
+    "error",
+    "exception",
+    "panic",
+    "debug",
+    "bug",
+    "traceback",
+    "stack trace",
+    "regex",
+    "algorithm",
+    "complexity",
+    "big o",
+    "sql",
+    "database schema",
+    "architecture",
+    "refactor",
+    "equation",
+    "derivative",
+    "integral",
+    "solve for",
+    "calculus",
+    "linear algebra",
+    "proof",
+    "matrix multiplication",
+];
+
+fn starts_with_elliptical_prefix(core_lower: &str) -> bool {
+    ELLIPTICAL_PREFIXES.iter().any(|prefix| {
+        if let Some(rem) = core_lower.strip_prefix(prefix) {
+            rem.is_empty()
+                || rem.chars().next().unwrap().is_whitespace()
+                || rem.chars().next().unwrap().is_ascii_punctuation()
+        } else {
+            false
+        }
+    })
+}
+
+fn has_interrogative_lead(core_lower: &str) -> bool {
+    const INTERROGATIVE_STARTS: &[&str] = &[
+        "what ", "who ", "where ", "when ", "which ", "why ", "how ", "does ", "did ", "do ",
+        "is ", "are ", "was ", "were ", "can ", "could ", "should ", "would ", "will ", "compare ",
+    ];
+    INTERROGATIVE_STARTS
+        .iter()
+        .any(|prefix| core_lower.starts_with(prefix))
+}
+
+fn is_self_identity(lower: &str) -> bool {
+    let trimmed = lower.trim_start();
+    trimmed.starts_with("what model are you") || trimmed.starts_with("who are you")
+}
+
+fn has_referential_continuation_cue(lower: &str) -> bool {
+    if lower.contains("the ") {
+        return true;
+    }
+    const REFERENTIAL_WORDS: &[&str] = &[
+        "the", "that", "this", "it", "its", "they", "their", "them", "instead", "too", "also",
+        "either", "both", "first", "second", "third", "other", "same",
+    ];
+    lower
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| REFERENTIAL_WORDS.contains(&word))
+}
+
+fn strip_sources_footer(text: &str) -> &str {
+    match text.split_once("\n\nSources:\n") {
+        Some((before, _)) => before.trim(),
+        None => text.trim(),
+    }
+}
+
+fn is_elliptical_or_anaphoric_turn(text: &str) -> bool {
+    let lower = strip_leading_fillers(text.trim()).to_lowercase();
+    let core_lower = strip_leading_discourse_markers(&lower);
+    starts_with_elliptical_prefix(core_lower)
+        || (text.len() <= 160 && has_anaphoric_follow_up_cue(&lower))
+}
+
+pub fn fold_user_history<'a>(
+    turns: impl IntoIterator<Item = &'a str>,
+    current_prompt: &str,
+) -> Option<String> {
+    let current_clean = strip_sources_footer(current_prompt);
+    let mut prior: Vec<&str> = turns
+        .into_iter()
+        .map(strip_sources_footer)
+        .filter(|t| !t.is_empty())
+        .collect();
+    if prior
+        .last()
+        .is_some_and(|last| !current_clean.is_empty() && *last == current_clean)
+    {
+        prior.pop();
+    }
+    match prior.len() {
+        0 => None,
+        1 => Some(truncate_utf8(prior[0], 200)),
+        _ => {
+            let prev = *prior.last().unwrap();
+            let window_start = prior.len().saturating_sub(3);
+            let anchor = prior[..prior.len() - 1]
+                .iter()
+                .rev()
+                .copied()
+                .find(|t| !is_elliptical_or_anaphoric_turn(t))
+                .unwrap_or(prior[window_start]);
+            if anchor == prev {
+                Some(truncate_utf8(prev, 200))
+            } else {
+                Some(format!(
+                    "{} {}",
+                    truncate_utf8(anchor, 120),
+                    truncate_utf8(prev, 100)
+                ))
+            }
+        }
+    }
+}
+
 fn apply_elliptical_follow_up(text: &str, prev_user_turn: Option<&str>) -> String {
     let Some(prev) = prev_user_turn else {
         return text.to_string();
@@ -278,39 +556,6 @@ fn apply_elliptical_follow_up(text: &str, prev_user_turn: Option<&str>) -> Strin
     }
 
     let lower = text.to_lowercase();
-
-    const ELLIPTICAL_PREFIXES: &[&str] = &[
-        "what about",
-        "and what about",
-        "how about",
-        "and how about",
-        "what if",
-        "and what",
-        "what was the",
-        "are there any",
-        "why has it",
-        "why is it",
-        "that still",
-        "now modify",
-        "now change",
-        "now find",
-        "now make",
-        "do we need",
-    ];
-
-    let starts_elliptical = ELLIPTICAL_PREFIXES.iter().any(|prefix| {
-        if let Some(rem) = lower.strip_prefix(prefix) {
-            rem.is_empty()
-                || rem.chars().next().unwrap().is_whitespace()
-                || rem.chars().next().unwrap().is_ascii_punctuation()
-        } else {
-            false
-        }
-    });
-
-    if !starts_elliptical {
-        return text.to_string();
-    }
 
     const DE_ESCALATING_PHRASES: &[&str] = &[
         "summarize",
@@ -325,14 +570,31 @@ fn apply_elliptical_follow_up(text: &str, prev_user_turn: Option<&str>) -> Strin
         "awesome",
     ];
 
-    let has_de_escalating = DE_ESCALATING_PHRASES
+    if DE_ESCALATING_PHRASES
         .iter()
-        .any(|phrase| lower.contains(phrase));
-    if has_de_escalating {
+        .any(|phrase| lower.contains(phrase))
+    {
         return text.to_string();
     }
 
-    format!("{} {}", truncate_utf8(prev_trimmed, 140), text)
+    let core_lower = strip_leading_discourse_markers(&lower);
+    let starts_elliptical = starts_with_elliptical_prefix(core_lower);
+    let is_short_anaphoric = text.len() <= 160 && has_anaphoric_follow_up_cue(&lower);
+    let is_contextual_search_follow_up = !starts_elliptical
+        && !is_short_anaphoric
+        && text.len() <= 140
+        && (text.contains('?') || has_interrogative_lead(core_lower))
+        && has_referential_continuation_cue(&lower)
+        && !SMART_KEYWORDS.iter().any(|k| lower.contains(k))
+        && !is_self_identity(&lower)
+        && !is_pure_arithmetic_or_greeting(&lower)
+        && classify_lexical_fallback(prev_trimmed).needs_search();
+
+    if !starts_elliptical && !is_short_anaphoric && !is_contextual_search_follow_up {
+        return text.to_string();
+    }
+
+    format!("{} {}", truncate_utf8(prev_trimmed, 200), text)
 }
 
 fn isolate_long_paste_instruction(t: &str) -> String {
@@ -371,9 +633,11 @@ pub fn normalize_for_routing(prompt: &str, prev_user_turn: Option<&str>) -> Stri
         return CANONICAL_SUPPLIED_TEXT_INTENT.to_string();
     }
 
-    let t = apply_elliptical_follow_up(t, prev_user_turn);
+    if t.len() > 260 {
+        return isolate_long_paste_instruction(t);
+    }
 
-    isolate_long_paste_instruction(&t)
+    apply_elliptical_follow_up(t, prev_user_turn)
 }
 
 pub fn classify_bge_small_embedding(
@@ -427,6 +691,87 @@ pub fn classify_bge_small_embedding(
     })
 }
 
+fn is_pure_arithmetic_or_greeting(lower: &str) -> bool {
+    let trimmed = lower.trim_matches(|c: char| c.is_whitespace() || c.is_ascii_punctuation());
+    if matches!(
+        trimmed,
+        "hi" | "hello"
+            | "hey"
+            | "yo"
+            | "thanks"
+            | "thank you"
+            | "good morning"
+            | "good afternoon"
+            | "good evening"
+            | "how are you"
+    ) {
+        return true;
+    }
+
+    let has_digits = lower.chars().any(|c| c.is_ascii_digit());
+    if !has_digits {
+        return false;
+    }
+    let has_math_op = lower.contains('+')
+        || lower.contains('*')
+        || lower.contains(" + ")
+        || lower.contains(" - ")
+        || lower.contains(" / ")
+        || lower.contains(" times ")
+        || lower.contains(" plus ")
+        || lower.contains(" minus ")
+        || lower.contains(" multiplied by ")
+        || lower.contains(" divided by ");
+    if !has_math_op {
+        return false;
+    }
+    let has_non_math_topic = [
+        "stock", "price", "weather", "year", "version", "release", "magic", "chapter", "level",
+        "ability", "damage", "mana", "card", "rule",
+    ]
+    .iter()
+    .any(|w| lower.contains(w));
+    !has_non_math_topic
+}
+
+fn has_structural_factual_or_entity_signal(normalized: &str, lower: &str) -> bool {
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let core_lower = strip_leading_discourse_markers(lower);
+    if (core_lower.starts_with("what about ") || core_lower.starts_with("how about "))
+        && trimmed.split_whitespace().count() <= 3
+    {
+        return false;
+    }
+    let is_question = trimmed.contains('?') || has_interrogative_lead(core_lower);
+    if !is_question {
+        return false;
+    }
+
+    // Check for proper nouns (capitalized words after the first word of a sentence)
+    // or quoted entity names.
+    let has_quoted_entity = trimmed.contains('"') || trimmed.contains('\u{201c}');
+    let mut has_proper_noun = false;
+    for (idx, raw_word) in trimmed.split_whitespace().enumerate() {
+        if idx == 0 {
+            continue;
+        }
+        let clean = raw_word.trim_matches(|c: char| !c.is_alphanumeric());
+        if clean.len() >= 2 && clean != "I" && clean != "I'm" && clean != "I've" {
+            if let Some(first) = clean.chars().next() {
+                if first.is_ascii_uppercase() {
+                    has_proper_noun = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    has_proper_noun || has_quoted_entity
+}
+
 pub fn classify_lexical_fallback(normalized: &str) -> RoutingDecision {
     if normalized == CANONICAL_SUPPLIED_TEXT_INTENT {
         return RoutingDecision {
@@ -463,8 +808,8 @@ pub fn classify_lexical_fallback(normalized: &str) -> RoutingDecision {
         };
     }
 
-    // 2. Self-referential identity questions -> DirectFast
-    if lower.starts_with("what model are you") || lower.starts_with("who are you") {
+    // 2. Self-referential identity questions & pure arithmetic / greetings -> DirectFast
+    if is_self_identity(&lower) || is_pure_arithmetic_or_greeting(&lower) {
         return RoutingDecision {
             primary: Route2D::DirectFast,
             secondary: Route2D::DirectSmart,
@@ -474,9 +819,10 @@ pub fn classify_lexical_fallback(normalized: &str) -> RoutingDecision {
         };
     }
 
-    // 3. Explicit live/temporal/lookup markers -> SearchFast (checked BEFORE SMART_KEYWORDS
-    // so technical queries with live/temporal intent still trigger search).
-    const LIVE_OVERRIDE_KEYWORDS: &[&str] = &[
+    // 3. Explicit live/temporal/lookup & domain/game-rules markers -> SearchFast
+    // (checked BEFORE SMART_KEYWORDS so technical or rules queries with "stack",
+    // "function", "class", or live/temporal intent still trigger search).
+    const LIVE_AND_RULES_OVERRIDE_KEYWORDS: &[&str] = &[
         "search",
         "google",
         "look up",
@@ -516,8 +862,80 @@ pub fn classify_lexical_fallback(normalized: &str) -> RoutingDecision {
         "official docs",
         "officially",
         "unofficially",
+        // Game rules, TCG (Magic: The Gathering, etc.), tabletop RPGs, and card/ability interactions:
+        "magic: the gathering",
+        "magic the gathering",
+        "in magic",
+        "mtg",
+        "dungeons & dragons",
+        "dungeons and dragons",
+        "d&d",
+        "dnd",
+        "pathfinder",
+        "warhammer",
+        "yu-gi-oh",
+        "yugioh",
+        "lorcana",
+        "flesh and blood",
+        "scryfall",
+        "gatherer",
+        "oracle text",
+        "comprehensive rules",
+        "state-based",
+        "mana value",
+        "converted mana cost",
+        "planeswalker",
+        "battlefield",
+        "graveyard",
+        "command zone",
+        "commander",
+        "combat damage",
+        "trample",
+        "deathtouch",
+        "lifelink",
+        "hexproof",
+        "indestructible",
+        "flashback",
+        "prowess",
+        "cascade",
+        "saga",
+        "lore counter",
+        "chapter one",
+        "chapter two",
+        "chapter three",
+        "chapter 1",
+        "chapter 2",
+        "chapter 3",
+        "triggered ability",
+        "activated ability",
+        "replacement effect",
+        "continuous effect",
+        "first ability",
+        "second ability",
+        "third ability",
+        "saving throw",
+        "spell slot",
+        "cantrip",
+        "armor class",
+        "sneak attack",
+        "opportunity attack",
+        "banlist",
+        "ruling",
+        "rulings",
+        "interact with",
+        "interacts with",
+        "interaction between",
+        "what happens if i cast",
+        "what happens when i cast",
+        "what happens if you cast",
+        "does that trigger",
+        "does it trigger",
+        "when it enters",
     ];
-    if LIVE_OVERRIDE_KEYWORDS.iter().any(|k| lower.contains(k)) {
+    if LIVE_AND_RULES_OVERRIDE_KEYWORDS
+        .iter()
+        .any(|k| lower.contains(k))
+    {
         return RoutingDecision {
             primary: Route2D::SearchFast,
             secondary: Route2D::DirectFast,
@@ -528,44 +946,6 @@ pub fn classify_lexical_fallback(normalized: &str) -> RoutingDecision {
     }
 
     // 4. Coding / math / debugging / architecture keywords -> DirectSmart
-    const SMART_KEYWORDS: &[&str] = &[
-        "rust",
-        "python",
-        "javascript",
-        "typescript",
-        "c++",
-        "golang",
-        "function",
-        "fn ",
-        "def ",
-        "class ",
-        "struct ",
-        "compile",
-        "compiler",
-        "error",
-        "exception",
-        "panic",
-        "debug",
-        "bug",
-        "traceback",
-        "stack trace",
-        "regex",
-        "algorithm",
-        "complexity",
-        "big o",
-        "sql",
-        "database schema",
-        "architecture",
-        "refactor",
-        "equation",
-        "derivative",
-        "integral",
-        "solve for",
-        "calculus",
-        "linear algebra",
-        "proof",
-        "matrix multiplication",
-    ];
     if SMART_KEYWORDS.iter().any(|k| lower.contains(k)) {
         return RoutingDecision {
             primary: Route2D::DirectSmart,
@@ -576,7 +956,7 @@ pub fn classify_lexical_fallback(normalized: &str) -> RoutingDecision {
         };
     }
 
-    // 5. General factual / world-knowledge / lookup keywords -> SearchFast
+    // 5. General factual / world-knowledge / lookup keywords & structural entity questions -> SearchFast
     const SEARCH_KEYWORDS: &[&str] = &[
         "search",
         "google",
@@ -632,12 +1012,24 @@ pub fn classify_lexical_fallback(normalized: &str) -> RoutingDecision {
         "how much is",
         "what time is it",
         "who is",
+        "who was",
+        "who directed",
+        "who wrote",
+        "who invented",
+        "who founded",
         "what is the",
         "what are the",
+        "what was the",
+        "what happens",
+        "what happened",
+        "what does",
+        "how does",
         "when is",
         "when did",
         "when was",
         "where is",
+        "where was",
+        "where did",
         "how much",
         "how many",
         "official",
@@ -672,8 +1064,16 @@ pub fn classify_lexical_fallback(normalized: &str) -> RoutingDecision {
         "treatment",
         "law",
         "policy",
+        "ability",
+        "abilities",
+        "trigger",
+        "triggers",
+        "interact",
+        "interaction",
     ];
-    if SEARCH_KEYWORDS.iter().any(|k| lower.contains(k)) {
+    if SEARCH_KEYWORDS.iter().any(|k| lower.contains(k))
+        || has_structural_factual_or_entity_signal(normalized, &lower)
+    {
         return RoutingDecision {
             primary: Route2D::SearchFast,
             secondary: Route2D::DirectFast,
@@ -777,6 +1177,16 @@ pub fn check_search_snippets_sufficiency(query: &str, sources: &[Source]) -> Sni
     ];
 
     let query_lower = query.to_lowercase();
+    let is_verification = query_lower.contains("is it true")
+        || query_lower.contains("fact check")
+        || query_lower.contains("fact-check")
+        || query_lower.contains("verify whether")
+        || query_lower.contains("verify if")
+        || (query_lower.contains("did ") && query_lower.contains(" really "));
+    if is_verification {
+        return SnippetSufficiency::NeedsEscalation(EscalationReason::StubOrPaywall);
+    }
+
     let is_quantitative = QUANTITATIVE_PHRASES.iter().any(|q| query_lower.contains(q));
     if is_quantitative && !combined.chars().any(|c| c.is_ascii_digit()) {
         return SnippetSufficiency::NeedsEscalation(EscalationReason::MissingNumericFact);
@@ -1038,6 +1448,80 @@ mod tests {
     }
 
     #[test]
+    fn classify_mtg_rules_and_multi_turn_follow_ups_route_to_search() {
+        for query in [
+            "In Magic: The Gathering, what happens if I cast Blood Moon while Urza's Saga is on the battlefield?",
+            "How does Dress Down interact with Urza's Saga?",
+            "What happens when the third lore counter is placed on a Saga?",
+            "Does that trigger prowess?",
+            "In D&D 5e, can a Rogue use Sneak Attack on an opportunity attack?",
+            "Who directed Oppenheimer?",
+        ] {
+            let decision = classify_prompt_2d(query, None, None);
+            assert!(
+                decision.needs_search(),
+                "expected needs_search() == true for query: {query}, got {:?}",
+                decision.primary
+            );
+        }
+
+        let prev_mtg = "In Magic: The Gathering, how does Urza's Saga work with Blood Moon?";
+        for follow_up in [
+            "Wait what about its second ability?",
+            "And if I have Dress Down in play?",
+            "What if it's on chapter two?",
+            "Does that trigger constellation?",
+        ] {
+            let decision = classify_prompt_2d(follow_up, Some(prev_mtg), None);
+            assert!(
+                decision.needs_search(),
+                "expected needs_search() == true for follow-up: {follow_up}, got {:?}",
+                decision.primary
+            );
+            assert!(
+                decision.normalized_input.contains("Magic: The Gathering"),
+                "expected normalized_input to inherit previous turn context for: {follow_up}, got: {}",
+                decision.normalized_input
+            );
+        }
+    }
+
+    #[test]
+    fn fold_user_history_preserves_turn_one_anchor_across_three_turns() {
+        let turn1 = "In Magic: The Gathering, how does Urza's Saga work?\n\nSources:\n- https://example.com/urza";
+        let turn2 = "What about its second ability?";
+        for turn3 in [
+            "And what if it gets destroyed?",
+            "Does the token keep its ability?",
+            "What happens if it loses all abilities before chapter three?",
+        ] {
+            let folded = fold_user_history([turn1, turn2, turn3], turn3)
+                .expect("folded prior user history should be present");
+            assert!(
+                folded.contains("Urza's Saga"),
+                "expected folded history to preserve Turn 1 anchor, got: {folded}"
+            );
+            assert!(
+                !folded.contains("Sources:"),
+                "expected folded history to strip Sources footer, got: {folded}"
+            );
+            let decision = classify_prompt_2d(turn3, Some(&folded), None);
+            assert_eq!(
+                decision.primary,
+                Route2D::SearchFast,
+                "expected SearchFast for Turn 3 {turn3}, got {:?}",
+                decision.primary
+            );
+            assert!(decision.needs_search());
+            assert!(
+                decision.normalized_input.contains("Urza's Saga"),
+                "expected normalized_input to preserve Urza's Saga for Turn 3 {turn3}, got: {}",
+                decision.normalized_input
+            );
+        }
+    }
+
+    #[test]
     fn classify_prompt_2d_falls_back_when_no_embedding() {
         let dec = classify_prompt_2d("how to compile rust code?", None, None);
         assert_eq!(dec.primary, Route2D::DirectSmart);
@@ -1121,6 +1605,25 @@ mod tests {
             ),
             SnippetSufficiency::Sufficient
         );
+
+        // Explicit verification / fact-check queries escalate to web_fetch
+        for verify_query in [
+            "Is it true that the Eiffel Tower was built in 1889?",
+            "Fact check whether the company announced a buyout",
+            "Please fact-check this claim about solar efficiency",
+            "Verify whether the API supports WebSockets",
+            "Verify if the release happened in 2026",
+            "Did Napoleon really ban that book in 1805?",
+        ] {
+            assert_eq!(
+                check_search_snippets_sufficiency(
+                    verify_query,
+                    &[make_source("The Eiffel Tower was constructed from 1887 to 1889 as the centerpiece of the 1889 World's Fair in Paris.")]
+                ),
+                SnippetSufficiency::NeedsEscalation(EscalationReason::StubOrPaywall),
+                "query should escalate: {verify_query}"
+            );
+        }
     }
 
     #[test]
