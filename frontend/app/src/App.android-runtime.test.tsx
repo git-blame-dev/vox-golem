@@ -325,60 +325,40 @@ describe('production Android App runtime', () => {
     expect(container.textContent).toContain('Synthetic fresh answer')
   })
 
-  it.each(['android', 'desktop'] as const)('keeps one native Search selector with unchanged gating and accepted selection on %s', async (platform) => {
+  it.each(['android', 'desktop'] as const)('omits manual Search mode dropdown and syncs automatic Quick with Settings web toggle on %s', async (platform) => {
     vi.stubEnv('VITE_VOXGOLEM_RUNTIME', platform); vi.resetModules(); window.history.replaceState(null, '')
     let webEnabled = true
-    let acceptMode: () => void = () => undefined
-    const invoke = vi.fn(async (command: string, args?: unknown) => {
-      if (command === 'get_app_snapshot') return { ...wireSnapshot(), preferences: { ...(wireSnapshot()['preferences'] as Record<string, unknown>), web_enabled: webEnabled } }
-      if (command === 'get_startup_state') return desktopStartupState()
-      if (command === 'set_search_mode') {
-        if ((args as { mode: string }).mode === 'quick') return null
-        return new Promise((resolve) => { acceptMode = () => resolve(null) })
+    const invoke = vi.fn(async (command: string) => {
+      if (command === 'get_app_snapshot' || command === 'reset_session') {
+        return { ...wireSnapshot(), preferences: { ...(wireSnapshot()['preferences'] as Record<string, unknown>), web_enabled: webEnabled } }
       }
+      if (command === 'get_startup_state') return desktopStartupState()
+      if (command === 'set_search_mode') return null
       return null
     })
     window.__TAURI_INTERNALS__ = { invoke }
     const { default: App } = await import('./App')
     container = document.createElement('div'); document.body.append(container); root = createRoot(container)
     await act(async () => { root?.render(<App />) })
-    const search = container.querySelector<HTMLSelectElement>('[aria-label="Search mode"]')!
     const promptRow = container.querySelector('.composer__prompt-row')!
-    expect(container.querySelectorAll('[aria-label="Search mode"]')).toHaveLength(1)
+    expect(container.querySelector('[aria-label="Search mode"]')).toBeNull()
     expect(container.querySelector('.shell')?.getAttribute('data-platform')).toBe(platform)
     if (platform === 'android') {
-      expect(search.closest('.shell__header-actions')).not.toBeNull()
       expect(container.querySelector('.composer__utility-row [aria-label="Ask"]')).not.toBeNull()
       expect(container.querySelector('.composer__search')).toBeNull()
-      expect(search.closest('.native-icon-select')?.querySelector('svg[data-icon-kind="search"]')).not.toBeNull()
-      expect(search.closest('.search-mode')?.querySelector('.search-mode__label')).toBeNull()
-      expect(search.getAttribute('title')).toBe('Search mode: Quick')
+      expect(invoke).toHaveBeenCalledWith('set_search_mode', { mode: 'quick' })
     } else {
       expect(container.querySelector('.composer__search')).toBeNull()
-      expect(search.closest('.native-icon-select')).toBeNull()
-      expect(search.closest('label')?.firstChild?.textContent).toBe('Search:')
-      expect(promptRow.compareDocumentPosition(search) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
       expect(promptRow.querySelector('button[type="submit"]')?.getAttribute('aria-label')).toBe('Send')
     }
-    expect(search.value).toBe('quick')
-    expect(search.disabled).toBe(false)
-    await act(async () => { search.value = 'verify'; search.dispatchEvent(new Event('change', { bubbles: true })) })
-    expect(search.disabled).toBe(true)
-    expect(search.value).toBe('quick')
-    expect(invoke).toHaveBeenCalledWith('set_search_mode', { mode: 'verify' })
-    await act(async () => { acceptMode() })
-    expect(search.value).toBe('verify')
-    if (platform === 'android') expect(search.getAttribute('title')).toBe('Search mode: Verify')
-    expect(search.disabled).toBe(false)
     webEnabled = false
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="New Chat"]')!.click() })
-    expect(search.disabled).toBe(true)
-    expect(search.value).toBe('quick')
-    const reasonId = search.getAttribute('aria-describedby')!
-    expect(reasonId).toBeTruthy()
-    expect(document.getElementById(reasonId)?.textContent).toContain('Web is off. Normal chat remains available')
-    expect(document.getElementById(reasonId)?.classList.contains('sr-only')).toBe(platform === 'android')
-    if (platform === 'android') expect(search.getAttribute('title')).toContain('Web is off. Normal chat remains available')
+    expect(container.querySelector('[aria-label="Search mode"]')).toBeNull()
+    expect(invoke).toHaveBeenCalledWith('set_search_mode', { mode: 'quick' })
+    await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
+    const web = container.querySelector<HTMLInputElement>('[aria-label="Allow web access"]')!
+    expect(web.checked).toBe(false)
+    window.history.replaceState(null, '')
   })
 
   it.each(['android', 'desktop'] as const)('keeps routine progress screen-reader accessible and retains detailed failures on %s', async (platform) => {
@@ -723,7 +703,7 @@ describe('production Android App runtime', () => {
     expect(preferences).toMatchObject({ web_enabled: false, speech_network_fallback: false, ui_theme: 'dark', instant: 'custom-sol-high' })
     expect(invoke.mock.calls.filter(([command]) => command === 'set_preferences')).toHaveLength(2)
     expect(invoke.mock.calls.some(([command]) => command === 'set_assistant_settings')).toBe(false)
-    expect(container.querySelector<HTMLSelectElement>('[aria-label="Search mode"]')!.disabled).toBe(true)
+    expect(container.querySelector('[aria-label="Search mode"]')).toBeNull()
     await act(async () => { root?.unmount() }); container.remove()
     container = document.createElement('div'); document.body.append(container); root = createRoot(container)
     await act(async () => { root?.render(<App />) })

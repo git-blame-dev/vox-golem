@@ -2,8 +2,14 @@ import type { AssistantSettings } from './assistantSettings'
 import { getTauriInternals, isAndroidRuntime, isBrowserPreviewRuntime, normalizeTauriError } from './tauri'
 
 export type SearchMode = 'quick' | 'verify' | 'research'
+export const DEFAULT_SEARCH_MODE: SearchMode = 'quick'
 export const SEARCH_MODES: readonly SearchMode[] = ['quick', 'verify', 'research']
 export const SEARCH_MODE_LABELS: Record<SearchMode, string> = { quick: 'Quick', verify: 'Verify', research: 'Research' }
+
+export function normalizeSearchMode(value: unknown): SearchMode {
+  if (value === 'verify' || value === 'research') return value
+  return DEFAULT_SEARCH_MODE
+}
 
 export function searchModeAvailability(settings: AssistantSettings, modelAvailable: boolean): { available: boolean; reason?: string } {
   if (!settings.webEnabled) return { available: false, reason: 'Web is off. Normal chat remains available; Verify and Research require web access.' }
@@ -18,7 +24,7 @@ export function searchModeAvailability(settings: AssistantSettings, modelAvailab
 }
 
 export function admittedSearchMode(mode: SearchMode, settings: AssistantSettings, modelAvailable: boolean): SearchMode {
-  return searchModeAvailability(settings, modelAvailable).available ? mode : 'quick'
+  return searchModeAvailability(settings, modelAvailable).available ? normalizeSearchMode(mode) : DEFAULT_SEARCH_MODE
 }
 
 export async function selectNativeSearchMode(mode: SearchMode): Promise<void> {

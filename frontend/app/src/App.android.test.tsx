@@ -198,7 +198,7 @@ describe('Android App lifecycle', () => {
     expect(picker.closest('.native-icon-select')?.querySelector('svg')).toBeTruthy()
     const send = container.querySelector('button[aria-label="Send"]')!
     expect(send.closest('.composer__prompt-row')?.querySelector('textarea')).toBeTruthy()
-    const search = container.querySelector('[aria-label="Search mode"]')!
+    expect(container.querySelector('[aria-label="Search mode"]')).toBeNull()
     const toolbar = container.querySelector('.shell__header-actions')!
     const overflow = toolbar.querySelector('details.shell__overflow')!
     expect(overflow).not.toBeNull()
@@ -215,7 +215,6 @@ describe('Android App lifecycle', () => {
     })
     expect(overflow.hasAttribute('open')).toBe(false)
     expect(document.activeElement).toBe(overflow.querySelector('summary'))
-    expect(search.closest('.shell__header-actions')).toBe(toolbar)
     expect(picker.closest('.shell__header-actions')).toBeNull()
     expect(container.querySelector('.composer__search')).toBeNull()
     expect(container.querySelector('.composer [aria-label="Android voice controls"]')).not.toBeNull()
@@ -223,11 +222,9 @@ describe('Android App lifecycle', () => {
     expect(toolbar.querySelector('[aria-label="Settings"] svg')).not.toBeNull()
     await act(async () => { toolbar.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
     expect(Array.from(container.querySelectorAll<HTMLOptionElement>('[role="dialog"] [aria-label="Theme"] option')).map((option) => option.value)).toEqual(['dark', 'slate', 'light'])
+    expect(container.querySelector<HTMLInputElement>('[role="dialog"] [aria-label="Allow web access"]')?.checked).toBe(true)
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Close settings"]')!.click() })
-    expect(search.closest('.native-icon-select')?.querySelector('svg[data-icon-kind="search"]')).not.toBeNull()
-    expect(search.closest('.search-mode')?.querySelector('.search-mode__label')).toBeNull()
-    expect(search.getAttribute('title')).toBe('Search mode: Quick')
-    expect(container.querySelectorAll('[aria-label="Search mode"]')).toHaveLength(1)
+    expect(container.querySelectorAll('[aria-label="Search mode"]')).toHaveLength(0)
     expect(container.querySelectorAll('button[type="submit"]')).toHaveLength(1)
     expect(container.querySelector('.answer-stage__answer')?.textContent).toBe('Synthetic saved answer')
     expect(container.querySelector('.answer-stage h2')).toBeNull()
@@ -260,9 +257,8 @@ describe('Android App lifecycle', () => {
     expect(container.querySelector('.composer__utility-row [aria-label="Ask"]')).not.toBeNull()
     expect(container.querySelector('.composer__utility-row [aria-label="New Chat"]')).not.toBeNull()
     expect(input.getAttribute('rows')).toBe('1')
-    const search = container.querySelector('[aria-label="Search mode"]')!
-    expect(styleFor('.shell__header-actions select', search).minHeight).toBe('48px')
-    expect(styleFor('.shell__header-actions', search.closest('.shell__header-actions')!).flexWrap).toBe('nowrap')
+    expect(container.querySelector('[aria-label="Search mode"]')).toBeNull()
+    expect(styleFor('.shell__header-actions', container.querySelector('.shell__header-actions')!).flexWrap).toBe('nowrap')
     const ask = container.querySelector('[aria-label="Ask"]')!
     expect(ask.closest('.composer__utility-row')).not.toBeNull()
     for (const icon of container.querySelectorAll('.shell__header-actions .shell__icon-control svg')) {

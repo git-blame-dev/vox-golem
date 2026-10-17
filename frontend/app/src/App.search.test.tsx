@@ -82,8 +82,7 @@ describe('admitted search mode and generation-owned presentation', () => {
     window.history.replaceState(null, '')
     const { requests, settings } = fixture()
     const container = await render()
-    const selector = container.querySelector<HTMLSelectElement>('[aria-label="Search mode"]')!
-    await act(async () => { selector.value = 'research'; selector.dispatchEvent(new Event('change', { bubbles: true })) })
+    expect(container.querySelector('[aria-label="Search mode"]')).toBeNull()
     await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
     const web = container.querySelector<HTMLInputElement>('[aria-label="Allow web access"]')!
     expect(web.checked).toBe(true)
@@ -91,9 +90,6 @@ describe('admitted search mode and generation-owned presentation', () => {
     await act(async () => { web.click() })
     expect(settings.web_enabled).toBe(false)
     expect(settings.speech_network_fallback).toBe(false)
-    expect(selector.disabled).toBe(true)
-    expect(selector.value).toBe('quick')
-    expect(container.textContent).toContain('Normal chat remains available')
     expect(container.textContent).toContain('answers are not web-verified')
     await enterPrompt(container)
     await act(async () => { container.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })
@@ -103,7 +99,9 @@ describe('admitted search mode and generation-owned presentation', () => {
     // Reattachment uses the backend's persisted permission, not an ephemeral UI default.
     await act(async () => { root?.unmount() }); container.remove()
     const reattached = await render()
-    expect(reattached.querySelector<HTMLSelectElement>('[aria-label="Search mode"]')!.disabled).toBe(true)
+    expect(reattached.querySelector('[aria-label="Search mode"]')).toBeNull()
+    await act(async () => { reattached.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
+    expect(reattached.querySelector<HTMLInputElement>('[aria-label="Allow web access"]')!.checked).toBe(false)
     window.history.replaceState(null, '')
   })
 
@@ -126,67 +124,53 @@ describe('admitted search mode and generation-owned presentation', () => {
     expect(container.textContent).toContain('Assistant settings failed')
     window.history.replaceState(null, '')
   })
-  it('aligns the native voice loop with ephemeral Quick when a native UI attaches', async () => {
+
+  it('aligns the native voice loop with automatic Quick when a native UI attaches without rendering a manual mode dropdown', async () => {
     vi.spyOn(tauri, 'isNativeTauriRuntime').mockReturnValue(true)
     const { modeCalls } = fixture()
     const container = await render()
     expect(modeCalls).toEqual(['quick'])
-    expect(container.querySelector<HTMLSelectElement>('[aria-label="Search mode"]')!.value).toBe('quick')
-  })
-  it('waits for the native mode acknowledgement before admitting typed or voice work and retains Quick on failure', async () => {
-    let fail: ((error: Error) => void) | undefined
-    fixture(false, (mode) => mode === 'quick' ? Promise.resolve() : new Promise((_resolve, reject) => { fail = reject }))
-    const container = await render()
-    await enterPrompt(container)
-    const selector = container.querySelector<HTMLSelectElement>('[aria-label="Search mode"]')!
-    await act(async () => { selector.value = 'research'; selector.dispatchEvent(new Event('change', { bubbles: true })) })
-    expect(selector.disabled).toBe(true)
-    expect(container.querySelector<HTMLButtonElement>('button[type="submit"]')!.disabled).toBe(true)
-    await act(async () => { fail?.(new Error('Synthetic native rejection')) })
-    expect(selector.value).toBe('quick')
-    expect(selector.disabled).toBe(false)
-    expect(container.textContent).toContain('Search mode not changed')
+    expect(container.querySelector('[aria-label="Search mode"]')).toBeNull()
   })
 
-  it('preserves the ephemeral selection across model settings changes but admits Quick on unsupported routes', async () => {
+  it('admits automatic Quick across model changes without rendering a manual search mode selector', async () => {
     const { requests } = fixture()
     const container = await render()
-    const selector = container.querySelector<HTMLSelectElement>('[aria-label="Search mode"]')!
-    await act(async () => { selector.value = 'verify'; selector.dispatchEvent(new Event('change', { bubbles: true })) })
+    expect(container.querySelector('[aria-label="Search mode"]')).toBeNull()
     const instant = container.querySelector<HTMLSelectElement>('#composerInstantSelect')!
     await act(async () => { instant.value = 'opencode-sol-high'; instant.dispatchEvent(new Event('change', { bubbles: true })) })
-    expect(selector.value).toBe('quick')
-    expect(selector.disabled).toBe(true)
     await enterPrompt(container)
     await act(async () => { container.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })
     expect(requests[0]?.searchMode).toBe('quick')
     await act(async () => { requests[0]!.finish() })
     await act(async () => { instant.value = 'custom-sol-high'; instant.dispatchEvent(new Event('change', { bubbles: true })) })
-    expect(selector.value).toBe('verify')
-    expect(selector.disabled).toBe(false)
-  })
-
-  it('captures Verify, disables selection while busy, and resets New to Quick without accepting late old search activity', async () => {
-    const { requests, modeCalls } = fixture()
-    const container = await render()
-    const selector = container.querySelector<HTMLSelectElement>('[aria-label="Search mode"]')!
-    expect(selector.value).toBe('quick')
-    expect(selector.disabled).toBe(false)
-    await act(async () => { selector.value = 'verify'; selector.dispatchEvent(new Event('change', { bubbles: true })) })
-    expect(modeCalls).toEqual(['verify'])
-    expect(selector.value).toBe('verify')
     await enterPrompt(container)
     await act(async () => { container.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })
-    expect(requests[0]?.searchMode).toBe('verify')
-    expect(selector.disabled).toBe(true)
+    expect(requests[1]?.searchMode).toBe('quick')
+    await act(async () => { requests[1]!.finish() })
+  })
+
+  it('presents automatic search status and citations, resets New Chat to Quick, and ignores stale search activity', async () => {
+    const { requests, modeCalls } = fixture()
+    const container = await render()
+    expect(container.querySelector('[aria-label="Search mode"]')).toBeNull()
+    await enterPrompt(container)
+    await act(async () => { container.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })
+    expect(requests[0]?.searchMode).toBe('quick')
     for (const message of ['Searching', 'Reading', 'Fallback', 'Partial']) {
       await act(async () => { requests[0]!.updates.send({ kind: 'status', message }) })
       expect(container.querySelector('.composer [role="status"].sr-only')?.textContent).toBe(message)
       expect(container.querySelector('.composer__status')).toBeNull()
     }
+    await act(async () => {
+      requests[0]!.updates.send({ kind: 'text', text: 'Synthetic grounded answer' })
+      requests[0]!.updates.send({ kind: 'sources', sources: [{ url: 'https://example.test/source', title: 'Synthetic citation' }] })
+    })
+    const sourceLink = container.querySelector<HTMLAnchorElement>('.answer-stage__sources a')
+    expect(sourceLink?.getAttribute('href')).toBe('https://example.test/source')
+    expect(sourceLink?.textContent).toBe('Synthetic citation')
     await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="New Chat"]')!.click() })
-    expect(selector.value).toBe('quick')
-    expect(modeCalls).toEqual(['verify', 'quick'])
+    expect(modeCalls).toEqual(['quick'])
     await enterPrompt(container)
     await act(async () => { container.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })
     expect(requests[1]?.searchMode).toBe('quick')
@@ -200,13 +184,10 @@ describe('admitted search mode and generation-owned presentation', () => {
     await act(async () => { requests[1]!.finish() })
   })
 
-  it('disables native mode selection and explains exclusive OpenCode Deep ownership', async () => {
+  it('admits Quick when OpenCode Deep is enabled without a manual search mode selector', async () => {
     const { requests, modeCalls } = fixture(true)
     const container = await render()
-    const selector = container.querySelector<HTMLSelectElement>('[aria-label="Search mode"]')!
-    expect(selector.disabled).toBe(true)
-    expect(container.textContent).toContain('OpenCode Deep owns research for this turn.')
-    await act(async () => { selector.value = 'research'; selector.dispatchEvent(new Event('change', { bubbles: true })) })
+    expect(container.querySelector('[aria-label="Search mode"]')).toBeNull()
     expect(modeCalls).toEqual([])
     await enterPrompt(container)
     await act(async () => { container.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })

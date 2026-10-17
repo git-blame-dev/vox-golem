@@ -1,11 +1,21 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { DEFAULT_ASSISTANT_SETTINGS } from './assistantSettings'
-import { admittedSearchMode, searchModeAvailability, selectNativeSearchMode } from './searchMode'
+import { DEFAULT_SEARCH_MODE, admittedSearchMode, normalizeSearchMode, searchModeAvailability, selectNativeSearchMode } from './searchMode'
 
 afterEach(() => { delete window.__TAURI_INTERNALS__ })
 
 describe('native search mode routing', () => {
   const settings = { ...DEFAULT_ASSISTANT_SETTINGS, instant: 'custom-sol-high' as const }
+
+  it('defaults to quick and normalizes auto or unknown values to quick', () => {
+    expect(DEFAULT_SEARCH_MODE).toBe('quick')
+    expect(normalizeSearchMode('quick')).toBe('quick')
+    expect(normalizeSearchMode('verify')).toBe('verify')
+    expect(normalizeSearchMode('research')).toBe('research')
+    expect(normalizeSearchMode('auto')).toBe('quick')
+    expect(normalizeSearchMode(undefined)).toBe('quick')
+    expect(normalizeSearchMode('unknown')).toBe('quick')
+  })
 
   it.each(['custom-sol-high', 'custom-sol-none', 'custom-luna-none', 'custom-luna-low'] as const)('allows exactly the supported Custom alias %s', (instant) => {
     expect(searchModeAvailability({ ...settings, instant }, true).available).toBe(true)
