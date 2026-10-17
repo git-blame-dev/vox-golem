@@ -135,6 +135,28 @@ pub fn decode_result(
             let mut source_count = 0;
             let mut unparsed = Vec::new();
             for block in blocks {
+                if !operation.fetch()
+                    && max > 1
+                    && block.contains("\n\n---\n\n")
+                    && exa_is_strict_multi_record_block(block)
+                {
+                    for part in block.split("\n\n---\n\n") {
+                        if source_count < max {
+                            let added = match exa_leading_record(part, false) {
+                                Some((url, title, body)) => {
+                                    add_source(url, title, body.into(), None)?
+                                }
+                                None => false,
+                            };
+                            if added {
+                                source_count += 1;
+                                continue;
+                            }
+                        }
+                        unparsed.push(part);
+                    }
+                    continue;
+                }
                 // Search prose separators may come from highlights, not provider-owned records.
                 if source_count < max && (operation.fetch() || !block.contains("\n\n---\n\n")) {
                     let added = match exa_leading_record(block, operation.fetch()) {
@@ -180,6 +202,42 @@ pub fn decode_result(
         result.partial |= !result.failures.is_empty();
     }
     Ok(result)
+}
+
+fn exa_is_strict_multi_record_block(block: &str) -> bool {
+    let mut count = 0;
+    for part in block.split("\n\n---\n\n") {
+        let Some(rest) = part.strip_prefix("Title:") else {
+            return false;
+        };
+        let Some((_, rest)) = rest.split_once('\n') else {
+            return false;
+        };
+        let Some(rest) = rest.strip_prefix("URL:") else {
+            return false;
+        };
+        let Some((_, rest)) = rest.split_once('\n') else {
+            return false;
+        };
+        let Some(rest) = rest.strip_prefix("Published:") else {
+            return false;
+        };
+        let Some((_, rest)) = rest.split_once('\n') else {
+            return false;
+        };
+        let Some(rest) = rest.strip_prefix("Author:") else {
+            return false;
+        };
+        let Some((_, rest)) = rest.split_once('\n') else {
+            return false;
+        };
+        let (marker, _) = rest.split_once('\n').unwrap_or((rest, ""));
+        if !matches!(marker, "Highlights:" | "Content:" | "Text:") {
+            return false;
+        }
+        count += 1;
+    }
+    count >= 2
 }
 
 fn exa_leading_record(block: &str, fetch: bool) -> Option<(&str, &str, &str)> {

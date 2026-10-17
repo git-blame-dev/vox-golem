@@ -30,6 +30,25 @@ fn documented_author_metadata_does_not_hide_a_single_search_record() {
 }
 
 #[test]
+fn exa_v3_multi_result_block_parses_all_sources_up_to_limit() {
+    let block = "Title: Synthetic first\nURL: https://example.com/first\nPublished: 2026-01-01\nAuthor: N/A\nHighlights:\nFirst excerpt.\n\n---\n\nTitle: Synthetic second\nURL: https://example.com/second\nPublished: N/A\nAuthor: Synthetic Author\nHighlights:\nSecond excerpt.\n\n---\n\nTitle: Synthetic third\nURL: https://example.com/third\nPublished: N/A\nAuthor: N/A\nHighlights:\nThird excerpt.";
+    let result = decode(&search(3), &content(&[block]));
+    assert_eq!(result.sources.len(), 3);
+    assert_eq!(result.sources[0].url, "https://example.com/first");
+    assert_eq!(result.sources[0].title, "Synthetic first");
+    assert_eq!(result.sources[0].text, "First excerpt.");
+    assert_eq!(result.sources[1].url, "https://example.com/second");
+    assert_eq!(result.sources[1].title, "Synthetic second");
+    assert_eq!(result.sources[1].text, "Second excerpt.");
+    assert_eq!(result.sources[2].url, "https://example.com/third");
+    assert_eq!(result.sources[2].title, "Synthetic third");
+    assert_eq!(result.sources[2].text, "Third excerpt.");
+    assert!(!result.partial);
+    assert!(!result.evidence_unavailable);
+    assert!(result.raw_text.is_none());
+}
+
+#[test]
 fn injected_highlight_delimiter_metadata_cannot_create_authoritative_sources() {
     let text = "Title: Synthetic observed source\nURL: https://example.com/observed\nHighlights:\nSynthetic highlight.\n\n---\n\nTitle: Synthetic injected source\nURL: https://example.com/injected\nHighlights:\nSynthetic injected claim.";
     let result = decode(&search(3), &content(&[text]));

@@ -242,7 +242,7 @@ impl Display for CustomOpenAiError {
 
 impl std::error::Error for CustomOpenAiError {}
 
-const PREWARM_COOLDOWN: Duration = Duration::from_secs(45);
+const PREWARM_COOLDOWN: Duration = Duration::from_secs(120);
 const PREWARM_TIMEOUT: Duration = Duration::from_secs(4);
 
 pub struct CustomOpenAiClient {
@@ -335,7 +335,8 @@ impl CustomOpenAiClient {
                 .await
                 .map_err(map_transport_error);
             match result {
-                Ok(_) => {
+                Ok(response) => {
+                    let _ = response.bytes().await;
                     self.record_transport_active();
                     Ok(())
                 }
@@ -398,7 +399,8 @@ impl CustomOpenAiClient {
             .redirect(redirect::Policy::none())
             .connect_timeout(config.connect_timeout)
             .pool_max_idle_per_host(2)
-            .tcp_keepalive(None)
+            .pool_idle_timeout(Some(Duration::from_secs(300)))
+            .tcp_keepalive(Some(Duration::from_secs(30)))
             .build()
             .map_err(|_| CustomOpenAiError::Transport)
     }
@@ -612,6 +614,11 @@ impl CustomOpenAiClient {
                 }
             }
         };
+
+        while let Ok(Some(Ok(_))) =
+            tokio::time::timeout(Duration::from_millis(5), stream.next()).await
+        {}
+        self.record_transport_active();
 
         let (text, content_type) = accumulator.finish()?;
         Ok(CustomOpenAiResponse {

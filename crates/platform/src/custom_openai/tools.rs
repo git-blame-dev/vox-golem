@@ -477,6 +477,11 @@ impl CustomOpenAiClient {
                             first_text_at,
                             completed_at: started.elapsed(),
                         };
+                        while let Ok(Some(Ok(_))) =
+                            tokio::time::timeout(Duration::from_millis(5), stream.next()).await
+                        {
+                        }
+                        self.record_transport_active();
                         return Ok(round);
                     }
                 }

@@ -223,7 +223,7 @@ pub trait WebTransport: Send {
     ) -> impl std::future::Future<Output = Result<Value, ProviderFailure>> + Send;
 }
 
-const MCP_PREWARM_FRESHNESS: Duration = Duration::from_secs(45);
+const MCP_PREWARM_FRESHNESS: Duration = Duration::from_secs(120);
 
 #[derive(Default)]
 pub struct McpTransport {
@@ -395,9 +395,17 @@ impl WebTransport for McpTransport {
                         return Ok(());
                     }
                     Ok(Err(error)) if cancel.is_cancelled() => {
+                        if let Some(service) = slot.take() {
+                            service.cancellation_token().cancel();
+                        }
+                        self.last_active[index] = None;
                         return Err(classify_service_error(error));
                     }
                     Err(error) if error == Failure::Cancelled => {
+                        if let Some(service) = slot.take() {
+                            service.cancellation_token().cancel();
+                        }
+                        self.last_active[index] = None;
                         return Err(error.into());
                     }
                     _ => {
@@ -521,6 +529,9 @@ fn http_client() -> Result<reqwest::Client, ProviderFailure> {
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(4))
         .timeout(ATTEMPT_TIME)
+        .pool_max_idle_per_host(2)
+        .pool_idle_timeout(Some(Duration::from_secs(300)))
+        .tcp_keepalive(Some(Duration::from_secs(30)))
         .build()
         .map_err(|_| Failure::Transport.into())
 }
@@ -715,10 +726,10 @@ impl<T: WebTransport> WebService<T> {
         deadline: Instant,
         cancel: &Cancellation,
     ) -> Result<(), Failure> {
-        let mut provider = if self.ready(Provider::Parallel) {
-            Provider::Parallel
-        } else {
+        let mut provider = if self.ready(Provider::Exa) {
             Provider::Exa
+        } else {
+            Provider::Parallel
         };
         if !self.ready(provider) {
             return Err(Failure::Service);
@@ -857,10 +868,10 @@ impl<T: WebTransport> WebService<T> {
         deadline: Instant,
         cancel: &Cancellation,
     ) -> Result<ToolResult, Failure> {
-        let mut provider = if self.ready(Provider::Parallel) {
-            Provider::Parallel
-        } else {
+        let mut provider = if self.ready(Provider::Exa) {
             Provider::Exa
+        } else {
+            Provider::Parallel
         };
         if !self.ready(provider) {
             return Err(Failure::Service);
@@ -1259,13 +1270,13 @@ mod tests {
                 cancel: &Cancellation,
             ) -> Result<Value, ProviderFailure> {
                 self.providers.push(provider);
-                if provider == Provider::Parallel {
+                if provider == Provider::Exa {
                     self.mcp
                         .call(provider, operation, conversation_id, deadline, cancel)
                         .await
                 } else {
                     Ok(
-                        json!({"content":[{"type":"text","text":"Title: Synthetic alternate\nURL: https://example.com/alternate\nHighlights:\nSynthetic evidence"}]}),
+                        json!({"structuredContent":{"results":[{"url":"https://example.com/alternate","title":"Synthetic alternate","excerpts":["Synthetic evidence"]}],"errors":[]}}),
                     )
                 }
             }
@@ -1295,8 +1306,8 @@ mod tests {
             .await
             .unwrap();
         assert!(result.fallback_used);
-        assert_eq!(result.sources[0].provider, Provider::Exa);
-        let until = service.cooldowns[0].expect("actual startup 429 must cool down primary");
+        assert_eq!(result.sources[0].provider, Provider::Parallel);
+        let until = service.cooldowns[1].expect("actual startup 429 must cool down primary");
         assert!(
             until >= before + Duration::from_secs(60),
             "default must be 60s, not transient 15s"
@@ -1316,7 +1327,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             service.transport.providers,
-            vec![Provider::Parallel, Provider::Exa, Provider::Exa]
+            vec![Provider::Exa, Provider::Parallel, Provider::Parallel]
         );
         assert_eq!(requests.load(Ordering::SeqCst), count);
         server.abort();
@@ -1683,13 +1694,13 @@ mod tests {
                     Some("tools/list") => {
                         list_seen.fetch_add(1, Ordering::SeqCst);
                         json!({"jsonrpc":"2.0","id":body["id"],"result":{"tools":[
-                            {"name":"web_search","inputSchema":{"type":"object","properties":{"objective":{"type":"string"},"search_queries":{"type":"array"},"session_id":{"type":"string"},"user_agent":{"type":"string"}},"required":["objective"]}},
-                            {"name":"web_fetch","inputSchema":{"type":"object","properties":{"urls":{"type":"array"},"objective":{"type":"string"},"session_id":{"type":"string"}},"required":["urls"]}}
+                            {"name":"web_search_exa","inputSchema":{"type":"object","properties":{"objective":{"type":"string"},"query":{"type":"string"},"numResults":{"type":"integer"}},"required":["query"],"additionalProperties":false}},
+                            {"name":"web_fetch_exa","inputSchema":{"type":"object","properties":{"urls":{"type":"array"},"maxCharacters":{"type":"integer"}},"required":["urls"],"additionalProperties":false}}
                         ]}})
                     }
                     Some("tools/call") => {
                         calls_seen.fetch_add(1, Ordering::SeqCst);
-                        json!({"jsonrpc":"2.0","id":body["id"],"result":{"content":[],"structuredContent":{"results":[{"url":"https://example.com/prewarmed","title":"Prewarmed","excerpts":["Fast search"]}]},"isError":false}})
+                        json!({"jsonrpc":"2.0","id":body["id"],"result":{"content":[{"type":"text","text":"Title: Prewarmed\nURL: https://example.com/prewarmed\nPublished: N/A\nAuthor: N/A\nHighlights:\nFast search"}],"isError":false}})
                     }
                     Some(method) if method.starts_with("notifications/") => {
                         status = 202;
