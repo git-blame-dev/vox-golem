@@ -213,6 +213,28 @@ pub trait WebTransport: Send {
     ) -> impl std::future::Future<Output = Result<(), ProviderFailure>> + Send {
         async { Ok(()) }
     }
+    fn prewarm_both(
+        &mut self,
+        exa: bool,
+        parallel: bool,
+        deadline: Instant,
+        cancel: &Cancellation,
+    ) -> impl std::future::Future<Output = (Result<(), ProviderFailure>, Result<(), ProviderFailure>)>
+           + Send {
+        async move {
+            let exa_res = if exa {
+                self.prewarm(Provider::Exa, deadline, cancel).await
+            } else {
+                Ok(())
+            };
+            let par_res = if parallel && !cancel.is_cancelled() {
+                self.prewarm(Provider::Parallel, deadline, cancel).await
+            } else {
+                Ok(())
+            };
+            (exa_res, par_res)
+        }
+    }
     fn call(
         &mut self,
         provider: Provider,
@@ -245,28 +267,20 @@ impl McpTransport {
         self.last_active = [None, None];
     }
 
-    async fn ensure_connected(
-        &mut self,
+    #[allow(clippy::too_many_arguments)]
+    async fn connect_slot(
+        slot: &mut Option<RunningService<RoleClient, ()>>,
+        budget_slot: &mut Option<bounded_http::BoundedHttp>,
+        last_active_slot: &mut Option<Instant>,
         provider: Provider,
+        endpoint: &str,
         conversation_id: &str,
         deadline: Instant,
         cancel: &Cancellation,
-    ) -> Result<usize, ProviderFailure> {
-        let endpoint = provider.endpoint();
-        #[cfg(test)]
-        let endpoint = self
-            .endpoints
-            .as_ref()
-            .map(|endpoints| endpoints[if provider == Provider::Parallel { 0 } else { 1 }].as_str())
-            .unwrap_or(endpoint);
-        let index = if provider == Provider::Parallel { 0 } else { 1 };
-        let slot = match provider {
-            Provider::Parallel => &mut self.parallel,
-            Provider::Exa => &mut self.exa,
-        };
+    ) -> Result<(), ProviderFailure> {
         if slot.as_ref().is_some_and(|service| service.is_closed()) {
             *slot = None;
-            self.last_active[index] = None;
+            *last_active_slot = None;
         }
         if slot.is_none() {
             let mut config = StreamableHttpClientTransportConfig::with_uri(endpoint.to_string())
@@ -346,10 +360,113 @@ impl McpTransport {
                 return Err(Failure::IncompatibleSchema.into());
             }
             initializing.0.take();
-            self.budgets[index] = Some(client);
-            self.last_active[index] = Some(Instant::now());
+            *budget_slot = Some(client);
+            *last_active_slot = Some(Instant::now());
             *slot = Some(service);
         }
+        Ok(())
+    }
+
+    async fn prewarm_slot(
+        slot: &mut Option<RunningService<RoleClient, ()>>,
+        budget_slot: &mut Option<bounded_http::BoundedHttp>,
+        last_active_slot: &mut Option<Instant>,
+        provider: Provider,
+        endpoint: &str,
+        deadline: Instant,
+        cancel: &Cancellation,
+    ) -> Result<(), ProviderFailure> {
+        let stale =
+            last_active_slot.is_some_and(|active| active.elapsed() >= MCP_PREWARM_FRESHNESS);
+        if stale && slot.as_ref().is_some_and(|service| !service.is_closed()) {
+            if let Some(budget) = budget_slot.as_ref() {
+                budget.reset_budget();
+            }
+            let refresh = if let Some(service) = slot.as_ref() {
+                let mut on_drop = CancelOnDrop(Some(service.cancellation_token()));
+                let result = cancel
+                    .guard(
+                        deadline,
+                        service.list_tools(Some(rmcp::model::PaginatedRequestParams::default())),
+                    )
+                    .await;
+                if result.is_ok() {
+                    on_drop.0.take();
+                }
+                result
+            } else {
+                Ok(Ok(rmcp::model::ListToolsResult::default()))
+            };
+            match refresh {
+                Ok(Ok(_)) => {
+                    *last_active_slot = Some(Instant::now());
+                    return Ok(());
+                }
+                Ok(Err(error)) if cancel.is_cancelled() => {
+                    if let Some(service) = slot.take() {
+                        service.cancellation_token().cancel();
+                    }
+                    *last_active_slot = None;
+                    return Err(classify_service_error(error));
+                }
+                Err(error) if error == Failure::Cancelled => {
+                    if let Some(service) = slot.take() {
+                        service.cancellation_token().cancel();
+                    }
+                    *last_active_slot = None;
+                    return Err(error.into());
+                }
+                _ => {
+                    if let Some(service) = slot.take() {
+                        service.cancellation_token().cancel();
+                    }
+                    *last_active_slot = None;
+                }
+            }
+        }
+        Self::connect_slot(
+            slot,
+            budget_slot,
+            last_active_slot,
+            provider,
+            endpoint,
+            "Synthetic",
+            deadline,
+            cancel,
+        )
+        .await
+    }
+
+    async fn ensure_connected(
+        &mut self,
+        provider: Provider,
+        conversation_id: &str,
+        deadline: Instant,
+        cancel: &Cancellation,
+    ) -> Result<usize, ProviderFailure> {
+        let endpoint = provider.endpoint();
+        #[cfg(test)]
+        let endpoint = self
+            .endpoints
+            .as_ref()
+            .map(|endpoints| endpoints[if provider == Provider::Parallel { 0 } else { 1 }].as_str())
+            .unwrap_or(endpoint);
+        let index = if provider == Provider::Parallel { 0 } else { 1 };
+        let slot = match provider {
+            Provider::Parallel => &mut self.parallel,
+            Provider::Exa => &mut self.exa,
+        };
+        Self::connect_slot(
+            slot,
+            &mut self.budgets[index],
+            &mut self.last_active[index],
+            provider,
+            endpoint,
+            conversation_id,
+            deadline,
+            cancel,
+        )
+        .await?;
         Ok(index)
     }
 }
@@ -361,65 +478,82 @@ impl WebTransport for McpTransport {
         deadline: Instant,
         cancel: &Cancellation,
     ) -> Result<(), ProviderFailure> {
+        let endpoint = provider.endpoint();
+        #[cfg(test)]
+        let endpoint = self
+            .endpoints
+            .as_ref()
+            .map(|endpoints| endpoints[if provider == Provider::Parallel { 0 } else { 1 }].as_str())
+            .unwrap_or(endpoint);
         let index = if provider == Provider::Parallel { 0 } else { 1 };
-        let stale =
-            self.last_active[index].is_some_and(|active| active.elapsed() >= MCP_PREWARM_FRESHNESS);
-        if stale {
-            let slot = match provider {
-                Provider::Parallel => &mut self.parallel,
-                Provider::Exa => &mut self.exa,
-            };
-            if slot.as_ref().is_some_and(|service| !service.is_closed()) {
-                if let Some(budget) = self.budgets[index].as_ref() {
-                    budget.reset_budget();
-                }
-                let refresh = if let Some(service) = slot.as_ref() {
-                    let mut on_drop = CancelOnDrop(Some(service.cancellation_token()));
-                    let result = cancel
-                        .guard(
-                            deadline,
-                            service
-                                .list_tools(Some(rmcp::model::PaginatedRequestParams::default())),
-                        )
-                        .await;
-                    if result.is_ok() {
-                        on_drop.0.take();
-                    }
-                    result
-                } else {
-                    Ok(Ok(rmcp::model::ListToolsResult::default()))
-                };
-                match refresh {
-                    Ok(Ok(_)) => {
-                        self.last_active[index] = Some(Instant::now());
-                        return Ok(());
-                    }
-                    Ok(Err(error)) if cancel.is_cancelled() => {
-                        if let Some(service) = slot.take() {
-                            service.cancellation_token().cancel();
-                        }
-                        self.last_active[index] = None;
-                        return Err(classify_service_error(error));
-                    }
-                    Err(error) if error == Failure::Cancelled => {
-                        if let Some(service) = slot.take() {
-                            service.cancellation_token().cancel();
-                        }
-                        self.last_active[index] = None;
-                        return Err(error.into());
-                    }
-                    _ => {
-                        if let Some(service) = slot.take() {
-                            service.cancellation_token().cancel();
-                        }
-                        self.last_active[index] = None;
-                    }
-                }
+        let slot = match provider {
+            Provider::Parallel => &mut self.parallel,
+            Provider::Exa => &mut self.exa,
+        };
+        Self::prewarm_slot(
+            slot,
+            &mut self.budgets[index],
+            &mut self.last_active[index],
+            provider,
+            endpoint,
+            deadline,
+            cancel,
+        )
+        .await
+    }
+
+    async fn prewarm_both(
+        &mut self,
+        exa: bool,
+        parallel: bool,
+        deadline: Instant,
+        cancel: &Cancellation,
+    ) -> (Result<(), ProviderFailure>, Result<(), ProviderFailure>) {
+        #[cfg(test)]
+        let (par_endpoint, exa_endpoint) = match &self.endpoints {
+            Some([par, exa]) => (par.as_str(), exa.as_str()),
+            None => (Provider::Parallel.endpoint(), Provider::Exa.endpoint()),
+        };
+        #[cfg(not(test))]
+        let (par_endpoint, exa_endpoint) =
+            (Provider::Parallel.endpoint(), Provider::Exa.endpoint());
+        let par_slot = &mut self.parallel;
+        let exa_slot = &mut self.exa;
+        let [par_budget, exa_budget] = &mut self.budgets;
+        let [par_active, exa_active] = &mut self.last_active;
+        let exa_fut = async {
+            if exa {
+                Self::prewarm_slot(
+                    exa_slot,
+                    exa_budget,
+                    exa_active,
+                    Provider::Exa,
+                    exa_endpoint,
+                    deadline,
+                    cancel,
+                )
+                .await
+            } else {
+                Ok(())
             }
-        }
-        self.ensure_connected(provider, "Synthetic", deadline, cancel)
-            .await
-            .map(|_| ())
+        };
+        let par_fut = async {
+            if parallel {
+                Self::prewarm_slot(
+                    par_slot,
+                    par_budget,
+                    par_active,
+                    Provider::Parallel,
+                    par_endpoint,
+                    deadline,
+                    cancel,
+                )
+                .await
+            } else {
+                Ok(())
+            }
+        };
+        tokio::join!(exa_fut, par_fut)
     }
 
     async fn call(
@@ -757,7 +891,7 @@ impl<T: WebTransport> WebService<T> {
                             provider,
                             error.retry_after.unwrap_or(Duration::from_secs(60)),
                         );
-                    } else if error.kind.fallback() {
+                    } else if error.kind.fallback() && error.kind != Failure::Deadline {
                         self.cooldown(provider, Duration::from_secs(15));
                     }
                     if !error.kind.fallback() || attempt == 1 || !self.ready(provider.alternate()) {
@@ -768,6 +902,71 @@ impl<T: WebTransport> WebService<T> {
             }
         }
         Err(Failure::Service)
+    }
+    pub async fn prewarm_alternate(
+        &mut self,
+        deadline: Instant,
+        cancel: &Cancellation,
+    ) -> Result<(), Failure> {
+        let provider = Provider::Parallel;
+        if !self.ready(provider) {
+            return Err(Failure::Service);
+        }
+        if cancel.is_cancelled() {
+            return Err(Failure::Cancelled);
+        }
+        let attempt_deadline = deadline.min(Instant::now() + ATTEMPT_TIME);
+        if attempt_deadline <= Instant::now() {
+            return Err(Failure::Deadline);
+        }
+        match self
+            .transport
+            .prewarm(provider, attempt_deadline, cancel)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if error.kind == Failure::Cancelled {
+                    return Err(Failure::Cancelled);
+                }
+                if error.kind == Failure::RateLimited {
+                    self.cooldown(
+                        provider,
+                        error.retry_after.unwrap_or(Duration::from_secs(60)),
+                    );
+                } else if error.kind.fallback() && error.kind != Failure::Deadline {
+                    self.cooldown(provider, Duration::from_secs(15));
+                }
+                Err(error.kind)
+            }
+        }
+    }
+    pub async fn prewarm_all(&mut self, deadline: Instant, cancel: &Cancellation) {
+        let exa_ready = self.ready(Provider::Exa);
+        let par_ready = self.ready(Provider::Parallel);
+        if (!exa_ready && !par_ready) || cancel.is_cancelled() {
+            return;
+        }
+        let attempt_deadline = deadline.min(Instant::now() + ATTEMPT_TIME);
+        if attempt_deadline <= Instant::now() {
+            return;
+        }
+        let (exa_res, par_res) = self
+            .transport
+            .prewarm_both(exa_ready, par_ready, attempt_deadline, cancel)
+            .await;
+        for (provider, result) in [(Provider::Exa, exa_res), (Provider::Parallel, par_res)] {
+            if let Err(error) = result {
+                if error.kind == Failure::RateLimited {
+                    self.cooldown(
+                        provider,
+                        error.retry_after.unwrap_or(Duration::from_secs(60)),
+                    );
+                } else if error.kind.fallback() && error.kind != Failure::Deadline {
+                    self.cooldown(provider, Duration::from_secs(15));
+                }
+            }
+        }
     }
     async fn attempt(
         &mut self,
@@ -816,6 +1015,10 @@ impl<T: WebTransport> WebService<T> {
             }
             match result {
                 Ok(result) => {
+                    let rate_limited = result
+                        .failures
+                        .iter()
+                        .any(|failure| failure.failure == Failure::RateLimited);
                     combined.sources.extend(result.sources);
                     combined.failures.extend(result.failures);
                     combined.partial |= result.partial;
@@ -825,6 +1028,24 @@ impl<T: WebTransport> WebService<T> {
                             .raw_text
                             .get_or_insert_with(String::new)
                             .push_str(&text);
+                    }
+                    if rate_limited {
+                        let cooldown_duration = if provider == Provider::Exa {
+                            Duration::from_secs(300)
+                        } else {
+                            Duration::from_secs(60)
+                        };
+                        self.cooldown(provider, cooldown_duration);
+                        for remaining in &parts[index + 1..] {
+                            if let Operation::Fetch { urls, .. } = remaining {
+                                combined.failures.push(PageFailure {
+                                    url: urls[0].clone(),
+                                    failure: Failure::RateLimited,
+                                });
+                            }
+                        }
+                        combined.partial = true;
+                        break;
                     }
                 }
                 Err(error) if error.kind == Failure::Cancelled => return Err(error),
@@ -916,7 +1137,12 @@ impl<T: WebTransport> WebService<T> {
                         .iter()
                         .any(|failure| failure.failure == Failure::RateLimited)
                     {
-                        self.cooldown(provider, Duration::from_secs(60));
+                        let cooldown_duration = if provider == Provider::Exa {
+                            Duration::from_secs(300)
+                        } else {
+                            Duration::from_secs(60)
+                        };
+                        self.cooldown(provider, cooldown_duration);
                     }
                     if let Some(mut previous) = retained.take() {
                         previous.failures.retain(|failure| {
@@ -967,6 +1193,10 @@ impl<T: WebTransport> WebService<T> {
                                 fallback = true;
                                 continue;
                             }
+                        } else if result.sources.is_empty() {
+                            provider = provider.alternate();
+                            fallback = true;
+                            continue;
                         }
                     }
                     return Ok(result);
@@ -1762,5 +1992,74 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         service.transport.close().await;
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn prewarm_deadline_does_not_cooldown_exa_or_parallel() {
+        struct DeadlinePrewarmTransport {
+            prewarm_providers: Vec<Provider>,
+        }
+        impl WebTransport for DeadlinePrewarmTransport {
+            async fn prewarm(
+                &mut self,
+                provider: Provider,
+                _deadline: Instant,
+                _cancel: &Cancellation,
+            ) -> Result<(), ProviderFailure> {
+                self.prewarm_providers.push(provider);
+                Err(Failure::Deadline.into())
+            }
+            async fn call(
+                &mut self,
+                _provider: Provider,
+                _operation: &Operation,
+                _conversation_id: &str,
+                _deadline: Instant,
+                _cancel: &Cancellation,
+            ) -> Result<Value, ProviderFailure> {
+                unreachable!("prewarm should not call tools")
+            }
+        }
+
+        let mut service = WebService::new(DeadlinePrewarmTransport {
+            prewarm_providers: vec![],
+        });
+        let cancel = Cancellation::default();
+        let err = service
+            .prewarm(Instant::now() + Duration::from_secs(5), &cancel)
+            .await
+            .unwrap_err();
+        assert_eq!(err, Failure::Deadline);
+        assert_eq!(service.cooldowns, [None, None]);
+        assert_eq!(
+            service.transport.prewarm_providers,
+            vec![Provider::Exa, Provider::Parallel]
+        );
+
+        let alt_err = service
+            .prewarm_alternate(Instant::now() + Duration::from_secs(5), &cancel)
+            .await
+            .unwrap_err();
+        assert_eq!(alt_err, Failure::Deadline);
+        assert_eq!(service.cooldowns, [None, None]);
+        assert_eq!(
+            service.transport.prewarm_providers,
+            vec![Provider::Exa, Provider::Parallel, Provider::Parallel]
+        );
+
+        service
+            .prewarm_all(Instant::now() + Duration::from_secs(5), &cancel)
+            .await;
+        assert_eq!(service.cooldowns, [None, None]);
+        assert_eq!(
+            service.transport.prewarm_providers,
+            vec![
+                Provider::Exa,
+                Provider::Parallel,
+                Provider::Parallel,
+                Provider::Exa,
+                Provider::Parallel,
+            ]
+        );
     }
 }

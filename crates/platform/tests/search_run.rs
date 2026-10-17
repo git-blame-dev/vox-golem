@@ -18,8 +18,12 @@ use voxgolem_platform::custom_openai::tools::ModelEvent;
 use voxgolem_platform::{custom_openai::*, search::*, search_control::Cancellation, web::*};
 
 static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+static FIXTURE_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 
-struct AuthFixture(std::path::PathBuf);
+struct AuthFixture(
+    std::path::PathBuf,
+    #[allow(dead_code)] tokio::sync::SemaphorePermit<'static>,
+);
 impl Drop for AuthFixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
@@ -67,6 +71,7 @@ async fn fixture(
     AuthFixture,
     tokio::task::JoinHandle<Vec<Value>>,
 ) {
+    let permit = FIXTURE_LIMIT.acquire().await.unwrap();
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let path = std::env::temp_dir().join(format!(
@@ -148,7 +153,7 @@ async fn fixture(
             total_timeout: Duration::from_secs(5),
             ..Default::default()
         },
-        AuthFixture(path),
+        AuthFixture(path, permit),
         task,
     )
 }
@@ -1258,4 +1263,75 @@ async fn quick_mode_presearches_and_answers_in_single_llm_round_when_snippets_ar
         .as_str()
         .unwrap()
         .contains("156.40"));
+}
+
+#[tokio::test]
+async fn prepare_round_zero_search_handles_mtg_follow_up_and_exa_soft_rate_limit_fallback() {
+    struct SoftRateLimitExaThenParallel {
+        calls: Vec<Provider>,
+    }
+    impl WebTransport for SoftRateLimitExaThenParallel {
+        async fn call(
+            &mut self,
+            provider: Provider,
+            _: &Operation,
+            _: &str,
+            _: Instant,
+            _: &Cancellation,
+        ) -> Result<Value, ProviderFailure> {
+            self.calls.push(provider);
+            match provider {
+                Provider::Exa => Ok(json!({
+                    "isError": false,
+                    "content": [{
+                        "type": "text",
+                        "text": "You've hit Exa's free MCP rate limit. To continue using Exa MCP without limits, set up your own Exa API key."
+                    }]
+                })),
+                Provider::Parallel => Ok(json!({
+                    "structuredContent": {
+                        "results": [{
+                            "url": "https://example.com/urzas-saga",
+                            "title": "Urza's Saga Rulings",
+                            "excerpts": ["Urza's Saga chapter II grants the ability to create a 0/0 Construct artifact creature token."]
+                        }],
+                        "errors": []
+                    }
+                })),
+            }
+        }
+    }
+
+    let mut web = WebService::new(SoftRateLimitExaThenParallel { calls: vec![] });
+    let outcome: RoundZeroSearchOutcome = prepare_round_zero_search(
+        &mut web,
+        "synthetic-conversation",
+        "synthetic-session",
+        "Wait what about its second ability?",
+        Some("In Magic: The Gathering, how does Urza's Saga work?"),
+        Mode::Quick,
+        true,
+        Instant::now() + Duration::from_secs(5),
+        &Cancellation::default(),
+    )
+    .await;
+
+    assert!(outcome.needs_search);
+    assert!(outcome.routing.needs_search());
+    assert_eq!(outcome.provider_used, Some("parallel"));
+    assert!(outcome.fallback_used);
+    assert!(!outcome.partial);
+    assert!(!outcome.needs_escalation);
+    assert_eq!(outcome.context.sources.len(), 1);
+    assert!(outcome
+        .context
+        .evidence_context
+        .as_deref()
+        .unwrap()
+        .contains("Construct artifact creature token"));
+    assert!(outcome
+        .context
+        .source_footer
+        .contains("https://example.com/urzas-saga"));
+    assert_eq!(web.transport.calls, vec![Provider::Exa, Provider::Parallel]);
 }

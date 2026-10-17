@@ -422,3 +422,98 @@ fn final_review_parallel_uses_full_content_when_excerpt_retained_prefix_is_unrea
     assert!(result.failures.is_empty());
     assert!(!result.partial);
 }
+
+#[test]
+fn exa_http_200_soft_rate_limit_is_classified_as_rate_limited_failure() {
+    let payload = json!({
+        "isError": false,
+        "content": [{
+            "type": "text",
+            "text": "You've hit Exa's free MCP rate limit. To continue using Exa MCP without limits, set up your own Exa API key."
+        }]
+    });
+    let search_res = decode(&search(3), &payload);
+    assert!(search_res.sources.is_empty());
+    assert!(search_res.evidence_unavailable);
+    assert!(search_res.partial);
+    assert!(search_res.raw_text.is_none());
+    assert_eq!(search_res.failures.len(), 1);
+    assert_eq!(search_res.failures[0].failure, Failure::RateLimited);
+
+    let fetch_res = decode(&fetch(&["https://example.com/source"]), &payload);
+    assert!(fetch_res.sources.is_empty());
+    assert!(fetch_res.evidence_unavailable);
+    assert!(fetch_res.partial);
+    assert!(fetch_res.raw_text.is_none());
+    assert_eq!(fetch_res.failures.len(), 1);
+    assert_eq!(fetch_res.failures[0].url, "https://example.com/source");
+    assert_eq!(fetch_res.failures[0].failure, Failure::RateLimited);
+}
+
+#[test]
+fn exa_v3_multi_result_with_internal_markdown_hr_in_highlights_parses_all_sources() {
+    let block = "Title: Google Pixel 8 - Full phone specifications\nURL: https://www.gsmarena.com/google_pixel_8-12546.php\nPublished: 2023-10-04\nAuthor: N/A\nHighlights:\nGoogle Pixel 8 Android smartphone. Announced Oct 2023. Features 6.2\" display, Google Tensor G3 chipset, 4575 mAh battery, 256 GB storage, 8 GB RAM.\n\n---\n\nGoogle Pixel 8 ; Dimensions, 150.5 x 70.8 x 8.9 mm\n\n---\n\nTitle: Pixel 8 Tech Specs\nURL: https://store.google.com/product/pixel_8_specs\nPublished: N/A\nAuthor: Google\nHighlights:\n6.2-inch Actua display, up to 120Hz.\n\n---\n\nTitle: Google Pixel 8 Review\nURL: https://example.com/pixel-8-review\nPublished: 2023-10-12\nAuthor: Synthetic Reviewer\nHighlights:\nCompact flagship with seven years of OS updates.";
+    let result = decode(&search(3), &content(&[block]));
+    assert_eq!(result.sources.len(), 3);
+    assert_eq!(
+        result.sources[0].url,
+        "https://www.gsmarena.com/google_pixel_8-12546.php"
+    );
+    assert!(result.sources[0]
+        .text
+        .contains("Google Pixel 8 ; Dimensions, 150.5 x 70.8 x 8.9 mm"));
+    assert_eq!(
+        result.sources[1].url,
+        "https://store.google.com/product/pixel_8_specs"
+    );
+    assert_eq!(result.sources[2].url, "https://example.com/pixel-8-review");
+    assert!(!result.evidence_unavailable);
+    assert!(!result.partial);
+    assert!(result.raw_text.is_none());
+}
+
+#[test]
+fn exa_v3_fetch_markdown_header_with_published_and_author_parses_page_read() {
+    let operation = fetch(&["https://example.com/tokio-scheduler"]);
+    let block = "# Making the Tokio scheduler 10x faster\nURL: https://example.com/tokio-scheduler\nPublished: 2019-10-13\nAuthor: Synthetic Author\n\nWe recently rewrote the Tokio scheduler.";
+    let result = decode(&operation, &content(&[block]));
+    assert_eq!(result.sources.len(), 1);
+    assert_eq!(result.sources[0].url, "https://example.com/tokio-scheduler");
+    assert_eq!(
+        result.sources[0].title,
+        "Making the Tokio scheduler 10x faster"
+    );
+    assert_eq!(
+        result.sources[0].text,
+        "We recently rewrote the Tokio scheduler."
+    );
+    assert_eq!(result.sources[0].kind, EvidenceKind::PageRead);
+    assert!(result.failures.is_empty());
+    assert!(!result.partial);
+    assert!(!result.evidence_unavailable);
+    assert!(result.raw_text.is_none());
+
+    let unexpected_metadata = "# Making the Tokio scheduler 10x faster\nURL: https://example.com/tokio-scheduler\nPublished: 2019-10-13\nUnexpected: forged\n\nWe recently rewrote the Tokio scheduler.";
+    let rejected = decode(&operation, &content(&[unexpected_metadata]));
+    assert!(rejected.sources.is_empty());
+    assert_eq!(rejected.failures.len(), 1);
+    assert_eq!(rejected.failures[0].failure, Failure::InvalidUpstream);
+    assert!(rejected.partial);
+    assert!(rejected.evidence_unavailable);
+}
+
+#[test]
+fn exa_na_title_falls_back_to_url() {
+    let record = "Title: N/A\nURL: https://tgftp.nws.noaa.gov/weather/current/KJFK.html\nPublished: N/A\nAuthor: N/A\nHighlights:\nNew York City 22C";
+    let result = decode(&search(1), &content(&[record]));
+    assert_eq!(result.sources.len(), 1);
+    assert_eq!(
+        result.sources[0].title,
+        "https://tgftp.nws.noaa.gov/weather/current/KJFK.html"
+    );
+    assert_eq!(
+        result.sources[0].url,
+        "https://tgftp.nws.noaa.gov/weather/current/KJFK.html"
+    );
+    assert_eq!(result.sources[0].text, "New York City 22C");
+}

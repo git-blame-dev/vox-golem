@@ -41,11 +41,12 @@ pub fn decode_result(
                 return Ok(false);
             }
             *next_source += 1;
+            let trimmed_title = title.trim();
             let title = truncate_utf8(
-                if title.trim().is_empty() {
+                if trimmed_title.is_empty() || trimmed_title.eq_ignore_ascii_case("n/a") {
                     &url
                 } else {
-                    title.trim()
+                    trimmed_title
                 },
                 512,
             );
@@ -135,27 +136,25 @@ pub fn decode_result(
             let mut source_count = 0;
             let mut unparsed = Vec::new();
             for block in blocks {
-                if !operation.fetch()
-                    && max > 1
-                    && block.contains("\n\n---\n\n")
-                    && exa_is_strict_multi_record_block(block)
-                {
-                    for part in block.split("\n\n---\n\n") {
-                        if source_count < max {
-                            let added = match exa_leading_record(part, false) {
-                                Some((url, title, body)) => {
-                                    add_source(url, title, body.into(), None)?
+                if !operation.fetch() && max > 1 && block.contains("\n\n---\n\n") {
+                    if let Some(parts) = exa_split_strict_records(block) {
+                        for part in parts {
+                            if source_count < max {
+                                let added = match exa_leading_record(part, false) {
+                                    Some((url, title, body)) => {
+                                        add_source(url, title, body.into(), None)?
+                                    }
+                                    None => false,
+                                };
+                                if added {
+                                    source_count += 1;
+                                    continue;
                                 }
-                                None => false,
-                            };
-                            if added {
-                                source_count += 1;
-                                continue;
                             }
+                            unparsed.push(part);
                         }
-                        unparsed.push(part);
+                        continue;
                     }
-                    continue;
                 }
                 // Search prose separators may come from highlights, not provider-owned records.
                 if source_count < max && (operation.fetch() || !block.contains("\n\n---\n\n")) {
@@ -176,7 +175,24 @@ pub fn decode_result(
             result.evidence_unavailable = result.sources.is_empty();
             result.partial = !unparsed.is_empty();
             if !unparsed.is_empty() {
-                result.raw_text = Some(truncate_utf8(&unparsed.join("\n\n"), 12000));
+                let raw = truncate_utf8(&unparsed.join("\n\n"), 12000);
+                if result.sources.is_empty() && is_exa_soft_rate_limit(&raw) {
+                    if let Operation::Fetch { urls, .. } = operation {
+                        for url in urls {
+                            result.failures.push(PageFailure {
+                                url: url.clone(),
+                                failure: Failure::RateLimited,
+                            });
+                        }
+                    } else {
+                        result.failures.push(PageFailure {
+                            url: String::new(),
+                            failure: Failure::RateLimited,
+                        });
+                    }
+                } else {
+                    result.raw_text = Some(raw);
+                }
             }
         }
     }
@@ -204,40 +220,59 @@ pub fn decode_result(
     Ok(result)
 }
 
-fn exa_is_strict_multi_record_block(block: &str) -> bool {
-    let mut count = 0;
-    for part in block.split("\n\n---\n\n") {
-        let Some(rest) = part.strip_prefix("Title:") else {
-            return false;
-        };
-        let Some((_, rest)) = rest.split_once('\n') else {
-            return false;
-        };
-        let Some(rest) = rest.strip_prefix("URL:") else {
-            return false;
-        };
-        let Some((_, rest)) = rest.split_once('\n') else {
-            return false;
-        };
-        let Some(rest) = rest.strip_prefix("Published:") else {
-            return false;
-        };
-        let Some((_, rest)) = rest.split_once('\n') else {
-            return false;
-        };
-        let Some(rest) = rest.strip_prefix("Author:") else {
-            return false;
-        };
-        let Some((_, rest)) = rest.split_once('\n') else {
-            return false;
-        };
-        let (marker, _) = rest.split_once('\n').unwrap_or((rest, ""));
-        if !matches!(marker, "Highlights:" | "Content:" | "Text:") {
-            return false;
-        }
-        count += 1;
+fn exa_has_strict_record_header(part: &str) -> bool {
+    let Some(rest) = part.strip_prefix("Title:") else {
+        return false;
+    };
+    let Some((_, rest)) = rest.split_once('\n') else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix("URL:") else {
+        return false;
+    };
+    let Some((_, rest)) = rest.split_once('\n') else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix("Published:") else {
+        return false;
+    };
+    let Some((_, rest)) = rest.split_once('\n') else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix("Author:") else {
+        return false;
+    };
+    let Some((_, rest)) = rest.split_once('\n') else {
+        return false;
+    };
+    let (marker, _) = rest.split_once('\n').unwrap_or((rest, ""));
+    matches!(marker, "Highlights:" | "Content:" | "Text:")
+}
+
+fn exa_split_strict_records(block: &str) -> Option<Vec<&str>> {
+    if !exa_has_strict_record_header(block) {
+        return None;
     }
-    count >= 2
+    const DELIM: &str = "\n\n---\n\n";
+    let mut records = Vec::new();
+    let mut record_start = 0;
+    let mut search_from = 0;
+    while let Some(rel_pos) = block[search_from..].find(DELIM) {
+        let delim_start = search_from + rel_pos;
+        let after_start = delim_start + DELIM.len();
+        let after = &block[after_start..];
+        if exa_has_strict_record_header(after) {
+            records.push(&block[record_start..delim_start]);
+            record_start = after_start;
+            search_from = after_start;
+        } else if after.starts_with("Title:") || after.starts_with("URL:") {
+            return None;
+        } else {
+            search_from = after_start;
+        }
+    }
+    records.push(&block[record_start..]);
+    Some(records)
 }
 
 fn exa_leading_record(block: &str, fetch: bool) -> Option<(&str, &str, &str)> {
@@ -246,7 +281,9 @@ fn exa_leading_record(block: &str, fetch: bool) -> Option<(&str, &str, &str)> {
         let mut lines = metadata.lines();
         let title = lines.next()?.strip_prefix("# ")?;
         let url = lines.next()?.strip_prefix("URL: ")?;
-        return lines.next().is_none().then_some((url, title, body));
+        return lines
+            .all(|line| line.starts_with("Published:") || line.starts_with("Author:"))
+            .then_some((url, title, body));
     }
     let (title, rest) = if let Some(rest) = block.strip_prefix("Title:") {
         let (title, rest) = rest.split_once('\n')?;
@@ -267,4 +304,12 @@ fn exa_leading_record(block: &str, fetch: bool) -> Option<(&str, &str, &str)> {
     };
     let (marker, body) = rest.split_once('\n').unwrap_or((rest, ""));
     matches!(marker, "Highlights:" | "Content:" | "Text:").then_some((url.trim(), title, body))
+}
+
+fn is_exa_soft_rate_limit(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("exa's free mcp rate limit")
+        || lower.contains("hit exa's free")
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
 }

@@ -288,26 +288,91 @@ fn source_url_digits_do_not_turn_page_service_errors_into_rate_limits() {
 }
 
 #[tokio::test]
-async fn primary_success_uses_one_provider_and_empty_result_does_not_fallback() {
-    for response in [
-        exa(),
-        json!({"content":[{"type":"text","text":"Synthetic empty search result"}]}),
-    ] {
-        let mut service = service(vec![Ok(response)]);
-        let result = service
-            .execute(
-                &search(),
-                "synthetic-conversation",
-                "synthetic-run",
-                Instant::now() + Duration::from_secs(20),
-                &Cancellation::default(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(service.transport.calls.len(), 1);
-        assert!(!result.fallback_used);
-        assert_eq!(service.transport.calls[0].0, Provider::Exa);
-    }
+async fn primary_success_uses_one_provider_and_empty_search_falls_back_to_alternate() {
+    let mut primary_service = service(vec![Ok(exa())]);
+    let result = primary_service
+        .execute(
+            &search(),
+            "synthetic-conversation",
+            "synthetic-run",
+            Instant::now() + Duration::from_secs(20),
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(primary_service.transport.calls.len(), 1);
+    assert!(!result.fallback_used);
+    assert_eq!(primary_service.transport.calls[0].0, Provider::Exa);
+
+    let mut fallback_service = service(vec![
+        Ok(json!({"content":[{"type":"text","text":"Synthetic empty search result"}]})),
+        Ok(parallel()),
+    ]);
+    let fallback_result = fallback_service
+        .execute(
+            &search(),
+            "synthetic-conversation",
+            "synthetic-run",
+            Instant::now() + Duration::from_secs(20),
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fallback_service.transport.calls.len(), 2);
+    assert!(fallback_result.fallback_used);
+    assert_eq!(fallback_result.sources.len(), 1);
+    assert_eq!(fallback_result.sources[0].provider, Provider::Parallel);
+}
+
+#[tokio::test]
+async fn exa_soft_rate_limit_cools_down_primary_and_falls_back_to_parallel() {
+    let mut service = service(vec![
+        Ok(json!({
+            "isError": false,
+            "content": [{
+                "type": "text",
+                "text": "You've hit Exa's free MCP rate limit. To continue using Exa MCP without limits, set up your own Exa API key."
+            }]
+        })),
+        Ok(parallel()),
+        Ok(parallel()),
+    ]);
+    let cancel = Cancellation::default();
+    let result = service
+        .execute(
+            &search(),
+            "synthetic-conversation",
+            "synthetic-run-1",
+            Instant::now() + Duration::from_secs(20),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    assert!(result.fallback_used);
+    assert_eq!(result.sources.len(), 1);
+    assert_eq!(result.sources[0].provider, Provider::Parallel);
+
+    let second = service
+        .execute(
+            &search(),
+            "synthetic-conversation",
+            "synthetic-run-2",
+            Instant::now() + Duration::from_secs(20),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    assert!(!second.fallback_used);
+    assert_eq!(second.sources[0].provider, Provider::Parallel);
+    assert_eq!(
+        service
+            .transport
+            .calls
+            .iter()
+            .map(|call| call.0)
+            .collect::<Vec<_>>(),
+        vec![Provider::Exa, Provider::Parallel, Provider::Parallel]
+    );
 }
 
 #[tokio::test]

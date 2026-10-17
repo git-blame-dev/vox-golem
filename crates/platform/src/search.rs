@@ -257,208 +257,47 @@ async fn run_with_client_events_since<T: WebTransport>(
         && !context.explicit_search
         && context.web_enabled
         && prompt.prompt != "Synthetic current question"
+        && client.auth_revision().is_some()
     {
-        let prev_user = prompt
-            .history
-            .iter()
-            .rev()
-            .find(|msg| matches!(msg.role, crate::custom_openai::CustomOpenAiRole::User))
-            .map(|msg| msg.text.as_str())
-            .filter(|text| !text.trim().is_empty());
-        let routing = voxgolem_core::router::classify_prompt_2d(&prompt.prompt, prev_user, None);
-        if routing.needs_search() && client.auth_revision().is_some() {
-            let query = truncate_utf8(routing.normalized_input.trim(), 2048);
-            let search_op = Operation::Search {
-                objective: query.clone(),
-                queries: vec![query.clone()],
-                limit: 3,
-            };
-            deliver_event(
-                cancellation,
-                &mut on_event,
-                RunEvent::Model(ModelEvent::RequestDispatched(std::time::Instant::now())),
-            )?;
-            deliver_event(
-                cancellation,
-                &mut on_event,
-                RunEvent::ToolStarted {
-                    call_id: "quick-presearch",
-                    name: "web_search",
-                },
-            )?;
-            result.searches += 1;
-            let search_started = Instant::now();
-            let tool_deadline =
-                deadline.min(search_started + policy.tool_time.saturating_sub(tool_time));
-            let outcome = web
-                .execute(
-                    &search_op,
-                    context.conversation_id,
-                    &prompt.session_id,
-                    tool_deadline,
-                    cancellation,
-                )
-                .await;
-            tool_time += search_started.elapsed();
-            match outcome {
-                Err(Failure::Cancelled) => return Err(RunError::Tool(Failure::Cancelled)),
-                Err(error) => {
-                    result.partial = true;
-                    deliver_event(
-                        cancellation,
-                        &mut on_event,
-                        RunEvent::ToolFailed {
-                            call_id: "quick-presearch",
-                            failure: error,
-                        },
-                    )?;
-                }
-                Ok(mut outcome) => {
-                    if outcome.fallback_used {
-                        result.fallbacks += 1;
-                    }
-                    for source in &mut outcome.sources {
-                        let remaining = policy.evidence_bytes.saturating_sub(evidence_bytes);
-                        if source.text.len() > remaining {
-                            source.text = truncate_utf8(&source.text, remaining);
-                            source.truncated = true;
-                            outcome.partial = true;
-                        }
-                        evidence_bytes += source.text.len();
-                    }
-                    if let Some(raw) = &mut outcome.raw_text {
-                        let remaining = policy.evidence_bytes.saturating_sub(evidence_bytes);
-                        if raw.len() > remaining {
-                            *raw = truncate_utf8(raw, remaining);
-                            outcome.partial = true;
-                        }
-                        evidence_bytes += raw.len();
-                    }
-                    result.partial |= outcome.partial || outcome.evidence_unavailable;
-                    deliver_event(
-                        cancellation,
-                        &mut on_event,
-                        RunEvent::ToolCompleted {
-                            call_id: "quick-presearch",
-                            outcome: &outcome,
-                        },
-                    )?;
-                    result.sources.extend(outcome.sources.clone());
-                    let presearch_payload = json!({"untrusted_web_evidence": outcome});
-                    instructions
-                        .push_str("\n\nPre-retrieved web_search evidence for this prompt:\n");
-                    instructions.push_str(&presearch_payload.to_string());
-
-                    if matches!(
-                        voxgolem_core::router::check_search_snippets_sufficiency(
-                            &prompt.prompt,
-                            &result.sources
-                        ),
-                        voxgolem_core::router::SnippetSufficiency::NeedsEscalation(_)
-                    ) && Instant::now() < deadline
-                        && tool_time < policy.tool_time
-                        && evidence_bytes < policy.evidence_bytes
-                    {
-                        let mut fetch_urls = Vec::new();
-                        for s in &result.sources {
-                            if fetch_urls.len() >= 2 {
-                                break;
-                            }
-                            if let Ok(normalized) = crate::web::public_url(&s.url) {
-                                if !fetch_urls.contains(&normalized) {
-                                    fetch_urls.push(normalized);
-                                }
-                            }
-                        }
-                        if !fetch_urls.is_empty() {
-                            deliver_event(
-                                cancellation,
-                                &mut on_event,
-                                RunEvent::ToolStarted {
-                                    call_id: "quick-prefetch",
-                                    name: "web_fetch",
-                                },
-                            )?;
-                            result.reads += 1;
-                            let fetch_started = Instant::now();
-                            let fetch_deadline = deadline
-                                .min(fetch_started + policy.tool_time.saturating_sub(tool_time));
-                            let fetch_op = Operation::Fetch {
-                                urls: fetch_urls,
-                                focus: truncate_utf8(&query, 200),
-                            };
-                            let fetch_outcome = web
-                                .execute(
-                                    &fetch_op,
-                                    context.conversation_id,
-                                    &prompt.session_id,
-                                    fetch_deadline,
-                                    cancellation,
-                                )
-                                .await;
-                            tool_time += fetch_started.elapsed();
-                            match fetch_outcome {
-                                Err(Failure::Cancelled) => {
-                                    return Err(RunError::Tool(Failure::Cancelled))
-                                }
-                                Err(error) => {
-                                    result.partial = true;
-                                    deliver_event(
-                                        cancellation,
-                                        &mut on_event,
-                                        RunEvent::ToolFailed {
-                                            call_id: "quick-prefetch",
-                                            failure: error,
-                                        },
-                                    )?;
-                                }
-                                Ok(mut fetch_outcome) => {
-                                    if fetch_outcome.fallback_used {
-                                        result.fallbacks += 1;
-                                    }
-                                    for source in &mut fetch_outcome.sources {
-                                        let remaining =
-                                            policy.evidence_bytes.saturating_sub(evidence_bytes);
-                                        if source.text.len() > remaining {
-                                            source.text = truncate_utf8(&source.text, remaining);
-                                            source.truncated = true;
-                                            fetch_outcome.partial = true;
-                                        }
-                                        evidence_bytes += source.text.len();
-                                    }
-                                    if let Some(raw) = &mut fetch_outcome.raw_text {
-                                        let remaining =
-                                            policy.evidence_bytes.saturating_sub(evidence_bytes);
-                                        if raw.len() > remaining {
-                                            *raw = truncate_utf8(raw, remaining);
-                                            fetch_outcome.partial = true;
-                                        }
-                                        evidence_bytes += raw.len();
-                                    }
-                                    result.partial |=
-                                        fetch_outcome.partial || fetch_outcome.evidence_unavailable;
-                                    deliver_event(
-                                        cancellation,
-                                        &mut on_event,
-                                        RunEvent::ToolCompleted {
-                                            call_id: "quick-prefetch",
-                                            outcome: &fetch_outcome,
-                                        },
-                                    )?;
-                                    result.sources.extend(fetch_outcome.sources.clone());
-                                    let prefetch_payload =
-                                        json!({"untrusted_web_evidence": fetch_outcome});
-                                    instructions.push_str(
-                                        "\n\nPre-retrieved web_fetch evidence for this prompt:\n",
-                                    );
-                                    instructions.push_str(&prefetch_payload.to_string());
-                                }
-                            }
-                        }
-                    }
-
-                    round_zero_presearch_completed = !result.sources.is_empty();
-                }
+        let prev_user = voxgolem_core::router::fold_user_history(
+            prompt
+                .history
+                .iter()
+                .filter(|msg| matches!(msg.role, crate::custom_openai::CustomOpenAiRole::User))
+                .map(|msg| msg.text.as_str()),
+            &prompt.prompt,
+        );
+        let presearch_started = Instant::now();
+        let prepared = prepare_round_zero_search_with_events(
+            web,
+            context.conversation_id,
+            &prompt.session_id,
+            &prompt.prompt,
+            prev_user.as_deref(),
+            Mode::Quick,
+            context.web_enabled,
+            true,
+            deadline.min(started + policy.tool_time),
+            cancellation,
+            &mut on_event,
+        )
+        .await?;
+        if prepared.searches > 0 {
+            tool_time += presearch_started.elapsed();
+            result.searches += prepared.searches;
+            result.reads += prepared.reads;
+            result.fallbacks += prepared.fallbacks;
+            result.partial |= prepared.partial;
+            result.source_read_observed |= prepared
+                .sources
+                .iter()
+                .any(|s| s.kind == EvidenceKind::PageRead && has_readable_text(&s.text));
+            evidence_bytes += prepared.sources.iter().map(|s| s.text.len()).sum::<usize>();
+            result.sources.extend(prepared.sources);
+            if let Some(ctx) = prepared.evidence_context.as_deref() {
+                instructions.push_str("\n\nPre-retrieved web_search evidence for this prompt:\n");
+                instructions.push_str(ctx);
+                round_zero_presearch_completed = true;
             }
         }
     }
@@ -730,6 +569,15 @@ pub struct WebPrewarmGate {
     inner: std::sync::Mutex<WebPrewarmGateInner>,
 }
 
+impl WebPrewarmGate {
+    pub fn is_prewarming(&self) -> bool {
+        self.inner
+            .lock()
+            .map(|g| g.active_prewarm.is_some())
+            .unwrap_or(false)
+    }
+}
+
 #[derive(Default)]
 struct WebPrewarmGateInner {
     active_prewarm: Option<Cancellation>,
@@ -784,28 +632,76 @@ pub async fn prewarm_web<T: WebTransport>(
         inner.active_prewarm = Some(cancel.clone());
         (web, cancel)
     };
-    let deadline = Instant::now() + PREWARM_WEB_TIMEOUT;
-    let _ = web.prewarm(deadline, &cancel).await;
+    web.prewarm_all(Instant::now() + PREWARM_WEB_TIMEOUT, &cancel)
+        .await;
     if let Ok(mut inner) = gate.inner.lock() {
         inner.active_prewarm = None;
     }
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct PreparedRoundZeroSearch {
-    pub route: voxgolem_core::router::Route2D,
-    pub needs_search: bool,
+pub struct PreparedSearchContext {
     pub evidence_context: Option<String>,
     pub source_footer: String,
     pub sources: Vec<Source>,
 }
 
+impl PartialEq for PreparedSearchContext {
+    fn eq(&self, other: &Self) -> bool {
+        self.evidence_context == other.evidence_context
+            && self.source_footer == other.source_footer
+            && self.sources.len() == other.sources.len()
+            && self.sources.iter().zip(&other.sources).all(|(a, b)| {
+                a.id == b.id
+                    && a.url == b.url
+                    && a.title == b.title
+                    && a.provider == b.provider
+                    && a.kind == b.kind
+                    && a.text == b.text
+                    && a.retrieved_unix_ms == b.retrieved_unix_ms
+                    && a.publisher_date == b.publisher_date
+                    && a.truncated == b.truncated
+            })
+    }
+}
+
+impl Eq for PreparedSearchContext {}
+
+#[derive(Debug, Clone, Default)]
+pub struct PreparedRoundZeroSearch {
+    pub route: voxgolem_core::router::Route2D,
+    pub routing: voxgolem_core::router::RoutingDecision,
+    pub needs_search: bool,
+    pub evidence_context: Option<String>,
+    pub source_footer: String,
+    pub sources: Vec<Source>,
+    pub context: PreparedSearchContext,
+    pub provider_used: Option<&'static str>,
+    pub fallback_used: bool,
+    pub needs_escalation: bool,
+    pub searches: usize,
+    pub reads: usize,
+    pub fallbacks: usize,
+    pub partial: bool,
+}
+
+pub type RoundZeroSearchOutcome = PreparedRoundZeroSearch;
+
 impl PartialEq for PreparedRoundZeroSearch {
     fn eq(&self, other: &Self) -> bool {
         self.route == other.route
+            && self.routing == other.routing
             && self.needs_search == other.needs_search
             && self.evidence_context == other.evidence_context
             && self.source_footer == other.source_footer
+            && self.context == other.context
+            && self.provider_used == other.provider_used
+            && self.fallback_used == other.fallback_used
+            && self.needs_escalation == other.needs_escalation
+            && self.searches == other.searches
+            && self.reads == other.reads
+            && self.fallbacks == other.fallbacks
+            && self.partial == other.partial
             && self.sources.len() == other.sources.len()
             && self.sources.iter().zip(&other.sources).all(|(a, b)| {
                 a.id == b.id
@@ -835,26 +731,84 @@ pub async fn prepare_round_zero_search<T: WebTransport>(
     deadline: Instant,
     cancellation: &Cancellation,
 ) -> PreparedRoundZeroSearch {
-    let routing = voxgolem_core::router::classify_prompt_2d(prompt, prev_user_turn, None);
-    if !web_enabled || prompt.trim().is_empty() || (mode == Mode::Quick && !routing.needs_search())
-    {
-        return PreparedRoundZeroSearch {
+    prepare_round_zero_search_with_events(
+        web,
+        conversation_id,
+        session_id,
+        prompt,
+        prev_user_turn,
+        mode,
+        web_enabled,
+        true,
+        deadline,
+        cancellation,
+        |_| Ok(()),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        let routing = voxgolem_core::router::classify_prompt_2d(prompt, prev_user_turn, None);
+        PreparedRoundZeroSearch {
             route: routing.primary,
+            needs_search: web_enabled
+                && !prompt.trim().is_empty()
+                && (mode != Mode::Quick || routing.needs_search()),
+            routing,
+            partial: true,
+            ..Default::default()
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_round_zero_search_with_events<T: WebTransport>(
+    web: &mut WebService<T>,
+    conversation_id: &str,
+    session_id: &str,
+    prompt: &str,
+    prev_user_turn: Option<&str>,
+    mode: Mode,
+    web_enabled: bool,
+    enforce_quick_router: bool,
+    deadline: Instant,
+    cancellation: &Cancellation,
+    mut on_event: impl FnMut(RunEvent<'_>) -> Result<(), ()>,
+) -> Result<PreparedRoundZeroSearch, RunError> {
+    let routing = voxgolem_core::router::classify_prompt_2d(prompt, prev_user_turn, None);
+    if !web_enabled
+        || prompt.trim().is_empty()
+        || (mode == Mode::Quick
+            && !routing.needs_search()
+            && (enforce_quick_router
+                || routing.normalized_input
+                    == voxgolem_core::router::CANONICAL_SUPPLIED_TEXT_INTENT))
+    {
+        return Ok(PreparedRoundZeroSearch {
+            route: routing.primary,
+            routing,
             needs_search: false,
             ..Default::default()
-        };
+        });
     }
-    if cancellation.is_cancelled() || Instant::now() >= deadline {
-        return PreparedRoundZeroSearch {
-            route: routing.primary,
-            needs_search: true,
-            ..Default::default()
-        };
+    if cancellation.is_cancelled() {
+        return Err(RunError::Tool(Failure::Cancelled));
     }
     let policy = mode.policy();
-    let query = truncate_utf8(routing.normalized_input.trim(), 2048);
+    let raw_query = if prev_user_turn.is_some()
+        && routing.normalized_input != voxgolem_core::router::CANONICAL_SUPPLIED_TEXT_INTENT
+    {
+        routing.normalized_input.trim()
+    } else {
+        prompt.trim()
+    };
+    let query = truncate_utf8(raw_query, 2048);
     let limit = match mode {
-        Mode::Quick => 3,
+        Mode::Quick => {
+            if routing.primary == voxgolem_core::router::Route2D::ResearchSmart {
+                6
+            } else {
+                3
+            }
+        }
         Mode::Verify => 5,
         Mode::Research => 8,
     };
@@ -863,7 +817,15 @@ pub async fn prepare_round_zero_search<T: WebTransport>(
         queries: vec![query.clone()],
         limit,
     };
-    let search_res = web
+    on_event(RunEvent::ToolStarted {
+        call_id: "quick-presearch",
+        name: "web_search",
+    })
+    .map_err(|_| RunError::CallbackFailed)?;
+    if cancellation.is_cancelled() {
+        return Err(RunError::Tool(Failure::Cancelled));
+    }
+    let search_outcome = match web
         .execute(
             &search_op,
             conversation_id,
@@ -871,20 +833,78 @@ pub async fn prepare_round_zero_search<T: WebTransport>(
             deadline,
             cancellation,
         )
-        .await;
-    let mut collected_sources = match search_res {
-        Ok(outcome) => outcome.sources,
-        Err(_) => Vec::new(),
+        .await
+    {
+        Err(Failure::Cancelled) => return Err(RunError::Tool(Failure::Cancelled)),
+        Err(_) if cancellation.is_cancelled() => return Err(RunError::Tool(Failure::Cancelled)),
+        Err(failure) => {
+            on_event(RunEvent::ToolFailed {
+                call_id: "quick-presearch",
+                failure,
+            })
+            .map_err(|_| RunError::CallbackFailed)?;
+            if cancellation.is_cancelled() {
+                return Err(RunError::Tool(Failure::Cancelled));
+            }
+            return Ok(PreparedRoundZeroSearch {
+                route: routing.primary,
+                routing,
+                needs_search: true,
+                searches: 1,
+                partial: true,
+                ..Default::default()
+            });
+        }
+        Ok(outcome) => {
+            if cancellation.is_cancelled() {
+                return Err(RunError::Tool(Failure::Cancelled));
+            }
+            outcome
+        }
     };
+    let provider_used = search_outcome
+        .sources
+        .first()
+        .map(|s| match s.provider {
+            Provider::Exa => "exa",
+            Provider::Parallel => "parallel",
+        })
+        .or(Some(if search_outcome.fallback_used {
+            "parallel"
+        } else {
+            "exa"
+        }));
+    let searches = 1usize;
+    let mut reads = 0usize;
+    let mut fallbacks = usize::from(search_outcome.fallback_used);
+    let mut partial = search_outcome.partial || search_outcome.evidence_unavailable;
+    on_event(RunEvent::ToolCompleted {
+        call_id: "quick-presearch",
+        outcome: &search_outcome,
+    })
+    .map_err(|_| RunError::CallbackFailed)?;
+    if cancellation.is_cancelled() {
+        return Err(RunError::Tool(Failure::Cancelled));
+    }
+    let mut collected_sources = search_outcome.sources;
 
     let sufficiency =
         voxgolem_core::router::check_search_snippets_sufficiency(prompt, &collected_sources);
+    let needs_escalation = matches!(
+        sufficiency,
+        voxgolem_core::router::SnippetSufficiency::NeedsEscalation(_)
+    );
+    let readable_snippet_bytes: usize = collected_sources
+        .iter()
+        .filter(|s| has_readable_text(&s.text))
+        .map(|s| s.text.trim().len())
+        .sum();
     let max_reads = match mode {
         Mode::Quick => {
-            if matches!(
-                sufficiency,
-                voxgolem_core::router::SnippetSufficiency::NeedsEscalation(_)
-            ) {
+            if needs_escalation
+                || (routing.primary == voxgolem_core::router::Route2D::ResearchSmart
+                    && readable_snippet_bytes < 1600)
+            {
                 2
             } else {
                 0
@@ -911,11 +931,20 @@ pub async fn prepare_round_zero_search<T: WebTransport>(
             }
         }
         if !fetch_urls.is_empty() {
+            on_event(RunEvent::ToolStarted {
+                call_id: "quick-prefetch",
+                name: "web_fetch",
+            })
+            .map_err(|_| RunError::CallbackFailed)?;
+            if cancellation.is_cancelled() {
+                return Err(RunError::Tool(Failure::Cancelled));
+            }
+            reads = 1;
             let fetch_op = Operation::Fetch {
                 urls: fetch_urls,
                 focus: truncate_utf8(&query, 200),
             };
-            if let Ok(fetch_outcome) = web
+            match web
                 .execute(
                     &fetch_op,
                     conversation_id,
@@ -925,7 +954,37 @@ pub async fn prepare_round_zero_search<T: WebTransport>(
                 )
                 .await
             {
-                collected_sources.extend(fetch_outcome.sources);
+                Err(Failure::Cancelled) => return Err(RunError::Tool(Failure::Cancelled)),
+                Err(_) if cancellation.is_cancelled() => {
+                    return Err(RunError::Tool(Failure::Cancelled));
+                }
+                Err(failure) => {
+                    partial = true;
+                    on_event(RunEvent::ToolFailed {
+                        call_id: "quick-prefetch",
+                        failure,
+                    })
+                    .map_err(|_| RunError::CallbackFailed)?;
+                    if cancellation.is_cancelled() {
+                        return Err(RunError::Tool(Failure::Cancelled));
+                    }
+                }
+                Ok(fetch_outcome) => {
+                    if cancellation.is_cancelled() {
+                        return Err(RunError::Tool(Failure::Cancelled));
+                    }
+                    fallbacks += usize::from(fetch_outcome.fallback_used);
+                    partial |= fetch_outcome.partial || fetch_outcome.evidence_unavailable;
+                    on_event(RunEvent::ToolCompleted {
+                        call_id: "quick-prefetch",
+                        outcome: &fetch_outcome,
+                    })
+                    .map_err(|_| RunError::CallbackFailed)?;
+                    if cancellation.is_cancelled() {
+                        return Err(RunError::Tool(Failure::Cancelled));
+                    }
+                    collected_sources.extend(fetch_outcome.sources);
+                }
             }
         }
     }
@@ -940,16 +999,31 @@ pub async fn prepare_round_zero_search<T: WebTransport>(
         evidence_bytes += source.text.len();
     }
 
-    const MAX_PREPARED_EVIDENCE_BYTES: usize = 4096;
+    const MAX_PREPARED_EVIDENCE_BYTES: usize = 6144;
+    const MAX_PAGE_READ_BYTES: usize = 2000;
     const MAX_SOURCE_EXCERPT_BYTES: usize = 1200;
+
+    let ordered_sources = collected_sources
+        .iter()
+        .filter(|s| s.kind == EvidenceKind::PageRead)
+        .chain(
+            collected_sources
+                .iter()
+                .filter(|s| s.kind != EvidenceKind::PageRead),
+        );
 
     let mut formatted_context = String::new();
     let mut item_index = 0usize;
-    for source in &collected_sources {
+    for source in ordered_sources {
         if !has_readable_text(&source.text) && source.title.trim().is_empty() {
             continue;
         }
-        let snippet = truncate_utf8(source.text.trim(), MAX_SOURCE_EXCERPT_BYTES);
+        let max_item_bytes = if source.kind == EvidenceKind::PageRead {
+            MAX_PAGE_READ_BYTES
+        } else {
+            MAX_SOURCE_EXCERPT_BYTES
+        };
+        let snippet = truncate_utf8(source.text.trim(), max_item_bytes);
         let title = if source.title.trim().is_empty() {
             source.url.trim()
         } else {
@@ -983,13 +1057,33 @@ pub async fn prepare_round_zero_search<T: WebTransport>(
         );
     }
 
-    PreparedRoundZeroSearch {
+    let final_needs_escalation = matches!(
+        voxgolem_core::router::check_search_snippets_sufficiency(prompt, &collected_sources),
+        voxgolem_core::router::SnippetSufficiency::NeedsEscalation(_)
+    );
+
+    let context = PreparedSearchContext {
+        evidence_context: evidence_context.clone(),
+        source_footer: source_footer.clone(),
+        sources: collected_sources.clone(),
+    };
+
+    Ok(PreparedRoundZeroSearch {
         route: routing.primary,
-        needs_search: true,
+        needs_search: routing.needs_search() || mode != Mode::Quick,
+        routing,
         evidence_context,
         source_footer,
         sources: collected_sources,
-    }
+        context,
+        provider_used,
+        fallback_used: fallbacks > 0,
+        needs_escalation: final_needs_escalation,
+        searches,
+        reads,
+        fallbacks,
+        partial,
+    })
 }
 
 #[cfg(test)]
@@ -1262,6 +1356,161 @@ mod tests {
         ));
         assert!(matches!(
             web_escalate.transport.operations[1],
+            Operation::Fetch { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn prepare_round_zero_search_prioritizes_page_read_first_when_excerpts_exceed_4096_bytes()
+    {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let cancel = Cancellation::default();
+
+        let long_excerpt =
+            "alphabetic words without digits for quantitative escalation ".repeat(18);
+        assert!(long_excerpt.len() > 1000);
+
+        let search_results = (1..=5)
+            .map(|i| {
+                sample_source(
+                    &format!("https://example.com/amd-{i}"),
+                    &format!("AMD Article {i}"),
+                    &long_excerpt,
+                    EvidenceKind::SearchExcerpt,
+                )
+            })
+            .collect::<Vec<_>>();
+        let total_excerpt_bytes: usize = search_results.iter().map(|s| s.text.len()).sum();
+        assert!(total_excerpt_bytes > 4096);
+
+        let mut web = WebService::new(MockWebTransport {
+            search_results,
+            fetch_results: vec![sample_source(
+                "https://example.com/amd-1",
+                "AMD Live Quote",
+                "AMD stock closed today at 155.20 USD with strong volume.",
+                EvidenceKind::PageRead,
+            )],
+            operations: vec![],
+        });
+
+        let prep = prepare_round_zero_search(
+            &mut web,
+            "conv-1",
+            "sess-1",
+            "what is the stock price of AMD today?",
+            None,
+            Mode::Quick,
+            true,
+            deadline,
+            &cancel,
+        )
+        .await;
+
+        let ctx = prep
+            .evidence_context
+            .as_deref()
+            .expect("expected evidence_context");
+        assert!(
+            ctx.starts_with("[1] AMD Live Quote (https://example.com/amd-1)\nAMD stock closed today at 155.20 USD"),
+            "expected PageRead source to be formatted first as [1], got: {ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_round_zero_search_research_smart_skips_fetch_when_snippets_rich() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let cancel = Cancellation::default();
+        let prompt =
+            "Compare and contrast Tokio and async-std with a deep dive into their schedulers";
+
+        let rich_text = "Tokio uses a multi-threaded work-stealing scheduler with local queues and a global injection queue, whereas async-std uses an executor built around async-task and work-stealing queues designed for general async workloads. ".repeat(4);
+        assert!(rich_text.len() >= 850);
+
+        // Rich snippets (>= 1,600 bytes total) and needs_escalation == false -> skips Operation::Fetch
+        let mut web_rich = WebService::new(MockWebTransport {
+            search_results: vec![
+                sample_source(
+                    "https://example.com/tokio-vs-async-std-1",
+                    "Tokio vs async-std Scheduler Architecture Part 1",
+                    &rich_text,
+                    EvidenceKind::SearchExcerpt,
+                ),
+                sample_source(
+                    "https://example.com/tokio-vs-async-std-2",
+                    "Tokio vs async-std Scheduler Architecture Part 2",
+                    &rich_text,
+                    EvidenceKind::SearchExcerpt,
+                ),
+            ],
+            fetch_results: vec![],
+            operations: vec![],
+        });
+
+        let prep_rich = prepare_round_zero_search(
+            &mut web_rich,
+            "conv-1",
+            "sess-1",
+            prompt,
+            None,
+            Mode::Quick,
+            true,
+            deadline,
+            &cancel,
+        )
+        .await;
+        assert_eq!(
+            prep_rich.route,
+            voxgolem_core::router::Route2D::ResearchSmart
+        );
+        assert_eq!(prep_rich.reads, 0);
+        assert_eq!(web_rich.transport.operations.len(), 1);
+        assert!(matches!(
+            web_rich.transport.operations[0],
+            Operation::Search { .. }
+        ));
+
+        // Thin snippets (< 1,600 bytes total) -> runs Operation::Fetch
+        let mut web_thin = WebService::new(MockWebTransport {
+            search_results: vec![sample_source(
+                "https://example.com/tokio-vs-async-std-thin",
+                "Brief overview of Tokio and async-std",
+                "A short comparison of Tokio and async-std runtimes in Rust.",
+                EvidenceKind::SearchExcerpt,
+            )],
+            fetch_results: vec![sample_source(
+                "https://example.com/tokio-vs-async-std-thin",
+                "Brief overview of Tokio and async-std",
+                "Detailed scheduler comparison between Tokio work-stealing and async-std.",
+                EvidenceKind::PageRead,
+            )],
+            operations: vec![],
+        });
+
+        let prep_thin = prepare_round_zero_search(
+            &mut web_thin,
+            "conv-1",
+            "sess-1",
+            prompt,
+            None,
+            Mode::Quick,
+            true,
+            deadline,
+            &cancel,
+        )
+        .await;
+        assert_eq!(
+            prep_thin.route,
+            voxgolem_core::router::Route2D::ResearchSmart
+        );
+        assert_eq!(prep_thin.reads, 1);
+        assert_eq!(web_thin.transport.operations.len(), 2);
+        assert!(matches!(
+            web_thin.transport.operations[0],
+            Operation::Search { .. }
+        ));
+        assert!(matches!(
+            web_thin.transport.operations[1],
             Operation::Fetch { .. }
         ));
     }
