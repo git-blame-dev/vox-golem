@@ -98,51 +98,19 @@ pub(crate) struct SearchPrepareRequest {
     pub enforce_quick_router: bool,
 }
 
-fn strip_source_footer(text: &str) -> &str {
-    match text.find("\n\nSources:\n") {
-        Some(idx) => text[..idx].trim_end(),
-        None => text,
-    }
-}
-
-fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s[..end].trim_end()
-}
-
-fn fold_prior_user_turns<'a>(
-    user_msgs: impl IntoIterator<Item = &'a str>,
-    current_query: &str,
-) -> Option<String> {
-    let trimmed_current = strip_source_footer(current_query.trim()).trim();
-    let mut prior: Vec<&'a str> = user_msgs
-        .into_iter()
-        .map(|msg| strip_source_footer(msg.trim()).trim())
-        .filter(|msg| !msg.is_empty())
-        .collect();
-    if !trimmed_current.is_empty() && prior.last().copied() == Some(trimmed_current) {
-        prior.pop();
-    }
-    match prior.len() {
-        0 => None,
-        1 => Some(prior[0].to_string()),
-        len => {
-            let window = &prior[len.saturating_sub(3)..];
-            let first = window[0];
-            let last = window[window.len() - 1];
-            let combined = format!("{first} {last}");
-            Some(truncate_utf8(&combined, 200).to_string())
-        }
-    }
-}
-
 impl SearchPrepareRequest {
+    pub(crate) fn skipped_preparation(&self) -> Option<SearchPreparation> {
+        let routing = classify_prompt_2d(&self.query, self.prev_user_turn.as_deref(), None);
+        (!self.web_enabled
+            || self.query.trim().is_empty()
+            || !routing.needs_presearch(self.mode, self.enforce_quick_router))
+        .then(|| SearchPreparation {
+            route: Some(routing.primary.code().to_string()),
+            status_code: "skipped".to_string(),
+            ..Default::default()
+        })
+    }
+
     pub fn parse(input: &str) -> Result<Self, ErrorCode> {
         if input.len() > request::MAX_REQUEST_BYTES {
             return Err(ErrorCode::InvalidRequest);
@@ -196,43 +164,46 @@ impl SearchPrepareRequest {
             .filter(|s| !s.is_empty())
             .map(str::to_string);
 
-        let query = if let Some(prompt) = prompt_field.as_ref() {
-            prompt.clone()
-        } else if let Some(messages) = obj.get("messages").and_then(|v| v.as_array()) {
-            messages
-                .iter()
-                .rev()
-                .find_map(|msg| {
-                    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-                    if role.eq_ignore_ascii_case("user") {
-                        msg.get("content")
+        let messages = obj.get("messages").and_then(|v| v.as_array());
+        // A messages-only request contains its current user message. With an
+        // explicit prompt, messages are prior history, including repeated text.
+        let current_index = if prompt_field.is_none() {
+            messages.and_then(|messages| {
+                messages.iter().rposition(|msg| {
+                    msg.get("role")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("user")
+                        .eq_ignore_ascii_case("user")
+                        && msg
+                            .get("content")
                             .and_then(|c| c.as_str())
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_string)
-                    } else {
-                        None
-                    }
+                            .is_some_and(|text| !text.trim().is_empty())
                 })
-                .unwrap_or_default()
+            })
         } else {
-            String::new()
+            None
         };
+        let query = prompt_field.unwrap_or_else(|| {
+            messages
+                .and_then(|messages| current_index.map(|index| &messages[index]))
+                .and_then(|message| message.get("content").and_then(|c| c.as_str()))
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        });
 
-        let prev_user_turn = obj
-            .get("messages")
-            .and_then(|v| v.as_array())
-            .and_then(|messages| {
-                let user_msgs = messages.iter().filter_map(|msg| {
-                    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-                    if role.eq_ignore_ascii_case("user") {
-                        msg.get("content").and_then(|c| c.as_str())
-                    } else {
-                        None
-                    }
-                });
-                fold_prior_user_turns(user_msgs, &query)
+        let prev_user_turn = messages.and_then(|messages| {
+            let prior = &messages[..current_index.unwrap_or(messages.len())];
+            let user_msgs = prior.iter().filter_map(|msg| {
+                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+                if role.eq_ignore_ascii_case("user") {
+                    msg.get("content").and_then(|c| c.as_str())
+                } else {
+                    None
+                }
             });
+            voxgolem_core::router::fold_user_history(user_msgs)
+        });
 
         let raw_session = obj
             .get("externalSessionId")
@@ -436,6 +407,18 @@ pub(crate) async fn prepare(
     callback: &mut impl FnMut(CallbackEvent<'_>) -> Result<(), ErrorCode>,
 ) -> (SearchPreparation, SearchPreparationStatus) {
     let cancellation = Cancellation::from_receiver(cancelled);
+    if cancellation.is_cancelled() {
+        return (
+            SearchPreparation {
+                status_code: "cancelled".into(),
+                ..Default::default()
+            },
+            SearchPreparationStatus::Cancelled,
+        );
+    }
+    if let Some(skipped) = request.skipped_preparation() {
+        return (skipped, SearchPreparationStatus::Skipped);
+    }
     let deadline = Instant::now() + request.mode.policy().tool_time;
     let mut web = match voxgolem_platform::search::admit_web(
         &process.web,
@@ -584,16 +567,14 @@ fn count_status(sources: &[voxgolem_core::search::Source]) -> Option<String> {
 pub(crate) fn route_prompt_2d(
     prompt: &voxgolem_platform::custom_openai::CustomOpenAiPrompt,
 ) -> voxgolem_core::router::RoutingDecision {
-    let prev_user = fold_prior_user_turns(
-        prompt.history.iter().filter_map(|msg| {
+    let prev_user =
+        voxgolem_core::router::fold_user_history(prompt.history.iter().filter_map(|msg| {
             matches!(
                 msg.role,
                 voxgolem_platform::custom_openai::CustomOpenAiRole::User
             )
             .then_some(msg.text.as_str())
-        }),
-        &prompt.prompt,
-    );
+        }));
     classify_prompt_2d(&prompt.prompt, prev_user.as_deref(), None)
 }
 
@@ -813,6 +794,33 @@ mod tests {
                 self.search_response.clone()
             }
         }
+    }
+
+    #[test]
+    fn direct_preparation_does_not_wait_for_the_web_service() {
+        let process = ProcessProvider::new(CustomOpenAiConfig::default()).unwrap();
+        process.runtime.block_on(async {
+            let _held = process.web.lock().await;
+            let request = SearchPrepareRequest::parse(
+                &json!({
+                    "prompt":"Why does this Rust ring buffer panic?",
+                    "webEnabled":true,"enforceQuickRouter":true
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let (_tx, rx) = watch::channel(false);
+            let (result, status) = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                prepare(&process, &request, rx, &mut |_| {
+                    panic!("direct requests do not use tools")
+                }),
+            )
+            .await
+            .expect("direct routing must not wait for web/prewarm ownership");
+            assert_eq!(status, SearchPreparationStatus::Skipped);
+            assert_eq!(result.route.as_deref(), Some("C"));
+        });
     }
 
     #[test]
@@ -1431,6 +1439,34 @@ mod tests {
             "And what about the other one?",
             None
         ));
+    }
+
+    #[test]
+    fn search_preparation_folds_only_structurally_prior_messages() {
+        let root = "What is the current price of Synthetic Widget?";
+        let followup = "What about its fifth edition?";
+        let messages = json!([
+            {"role":"user","content":root},
+            {"role":"user","content":"What about its second edition?"},
+            {"role":"user","content":"What about its third edition?"},
+            {"role":"user","content":"What about its fourth edition?"},
+            {"role":"user","content":followup},
+            {"role":"user","content":followup}
+        ]);
+        let parsed =
+            SearchPrepareRequest::parse(&json!({"messages":messages}).to_string()).unwrap();
+        assert_eq!(parsed.query, followup);
+        assert_eq!(parsed.prev_user_turn, Some(format!("{root} {followup}")));
+
+        let parsed = SearchPrepareRequest::parse(
+            &json!({
+                "prompt":followup,
+                "messages":[{"role":"user","content":root},{"role":"user","content":followup}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(parsed.prev_user_turn, Some(format!("{root} {followup}")));
     }
 
     #[test]

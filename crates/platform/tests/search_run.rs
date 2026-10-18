@@ -20,6 +20,90 @@ use voxgolem_platform::{custom_openai::*, search::*, search_control::Cancellatio
 static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 static FIXTURE_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 
+#[tokio::test]
+async fn final_terminal_near_search_deadline_does_not_wait_for_open_tail() {
+    let (mut config, _auth, unused_server) = fixture(vec![]).await;
+    unused_server.await.unwrap();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    config.endpoint = format!("http://{}", listener.local_addr().unwrap());
+    config.total_timeout = Duration::from_millis(100);
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0; 4096];
+        loop {
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert_ne!(count, 0);
+            request.extend_from_slice(&buffer[..count]);
+            assert!(request.len() < 1024 * 1024);
+            if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                if request.len() >= end + 4 + length {
+                    break;
+                }
+            }
+        }
+        let terminal = json!({"type":"response.completed","response":{"status":"completed","output":[answer()]}});
+        let body = format!("data: {terminal}\n\n");
+        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n", body.len()).as_bytes()).await.unwrap();
+        // Keep the HTTP body pending after the validated terminal event.
+        let mut byte = [0];
+        let _ = socket.read(&mut byte).await;
+    });
+    let client = CustomOpenAiClient::new(config).unwrap();
+    let mut web = WebService::new(EvidenceTransport { calls: vec![] });
+    let prompt = prompt();
+    let cancellation = Cancellation::default();
+    let deadline = Instant::now() + Duration::from_millis(100);
+    let mut terminal_seen = false;
+    let result = run_with_client_events(
+        &client,
+        &prompt,
+        Mode::Quick,
+        RunContext {
+            conversation_id: "synthetic-deadline",
+            instructions: "Synthetic policy",
+            explicit_search: false,
+            web_enabled: true,
+        },
+        &mut web,
+        &cancellation,
+        |event| {
+            if let RunEvent::Model(ModelEvent::TextDelta { text, .. }) = event {
+                assert_eq!(text, "Synthetic final answer.");
+                assert!(!terminal_seen);
+                terminal_seen = true;
+                // There were no deltas: this callback follows terminal validation.
+                while Instant::now() < deadline - Duration::from_millis(1) {
+                    std::hint::spin_loop();
+                }
+                assert!(Instant::now() < deadline);
+            }
+            Ok(())
+        },
+    )
+    .await;
+    server.abort();
+    assert!(
+        terminal_seen,
+        "must reach validated terminal before the deadline"
+    );
+    assert_eq!(
+        result
+            .expect("cleanup must not discard a validated final answer")
+            .response
+            .text,
+        "Synthetic final answer."
+    );
+}
+
 struct AuthFixture(
     std::path::PathBuf,
     #[allow(dead_code)] tokio::sync::SemaphorePermit<'static>,
@@ -161,7 +245,7 @@ async fn fixture(
 fn prompt() -> CustomOpenAiPrompt {
     CustomOpenAiPrompt {
         session_id: "synthetic-conversation".into(),
-        prompt: "Synthetic current question".into(),
+        prompt: "Synthetic ordinary greeting".into(),
         history: vec![
             CustomOpenAiMessage {
                 role: CustomOpenAiRole::User,
@@ -287,12 +371,19 @@ async fn quick_budget_prevents_third_search_and_reserves_tools_disabled_final_ro
     ])
     .await;
     let mut web = WebService::new(EvidenceTransport { calls: vec![] });
-    let result = run(
+    let result = run_with_events(
         config,
         &prompt(),
         Mode::Quick,
+        RunContext {
+            conversation_id: "synthetic-conversation",
+            instructions: "Synthetic style.",
+            explicit_search: true,
+            web_enabled: true,
+        },
         &mut web,
         &Cancellation::default(),
+        |_| Ok(()),
     )
     .await
     .unwrap();
@@ -333,12 +424,19 @@ async fn replayed_call_uses_cached_result_and_conflicting_reuse_never_reexecutes
         };
         let (config, _auth, server) = fixture(rounds).await;
         let mut web = WebService::new(EvidenceTransport { calls: vec![] });
-        let result = run(
+        let result = run_with_events(
             config,
             &prompt(),
             Mode::Quick,
+            RunContext {
+                conversation_id: "synthetic-conversation",
+                instructions: "Synthetic style.",
+                explicit_search: true,
+                web_enabled: true,
+            },
             &mut web,
             &Cancellation::default(),
+            |_| Ok(()),
         )
         .await;
         if conflicting {
@@ -1214,6 +1312,30 @@ async fn verification_gate_rechecks_readability_after_the_run_evidence_budget() 
 }
 
 #[tokio::test]
+async fn quick_routing_has_no_special_case_for_fixture_prompt_text() {
+    for text in ["Synthetic current question", "Synthetic current question."] {
+        let (config, _auth, server) = fixture(vec![vec![answer()]]).await;
+        let mut request = prompt();
+        request.prompt = text.into();
+        let mut web = WebService::new(EvidenceTransport { calls: vec![] });
+        let result = run(
+            config,
+            &request,
+            Mode::Quick,
+            &mut web,
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.searches, 1,
+            "both current-information questions take the real fast path"
+        );
+        assert_eq!(server.await.unwrap()[0]["tools"], json!([]));
+    }
+}
+
+#[tokio::test]
 async fn quick_mode_presearches_and_answers_in_single_llm_round_when_snippets_are_sufficient() {
     struct PriceSnippetTransport;
     impl WebTransport for PriceSnippetTransport {
@@ -1322,15 +1444,13 @@ async fn prepare_round_zero_search_handles_mtg_follow_up_and_exa_soft_rate_limit
     assert!(outcome.fallback_used);
     assert!(!outcome.partial);
     assert!(!outcome.needs_escalation);
-    assert_eq!(outcome.context.sources.len(), 1);
+    assert_eq!(outcome.sources.len(), 1);
     assert!(outcome
-        .context
         .evidence_context
         .as_deref()
         .unwrap()
         .contains("Construct artifact creature token"));
     assert!(outcome
-        .context
         .source_footer
         .contains("https://example.com/urzas-saga"));
     assert_eq!(web.transport.calls, vec![Provider::Exa, Provider::Parallel]);

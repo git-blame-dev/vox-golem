@@ -36,11 +36,6 @@ class GeminiNanoProvider(
 
         internal fun stripSourceFooter(text: String): String = PreparedSearchRoute.stripSourceFooter(text)
 
-        internal fun extractUserQuery(reqObj: JSONObject): String = PreparedSearchRoute.extractUserQuery(reqObj)
-
-        internal fun extractPreviousUserQuery(reqObj: JSONObject, currentQuery: String): String? =
-            PreparedSearchRoute.extractPreviousUserQuery(reqObj, currentQuery)
-
         internal fun shouldRunWebSearch(
             webEnabled: Boolean,
             searchMode: String,
@@ -201,12 +196,8 @@ class GeminiNanoProvider(
             }
             val webEnabled = reqObj.optBoolean("webEnabled", reqObj.optBoolean("web_enabled", true))
             val searchMode = reqObj.optString("searchMode", reqObj.optString("web_search_mode", "quick"))
-            val userQuery = extractUserQuery(reqObj)
-            val prevUserQuery = extractPreviousUserQuery(reqObj, userQuery)
-            val doSearch = shouldRunWebSearch(webEnabled, searchMode, userQuery, prevUserQuery)
-
             val modeForLog = when (searchMode) { "quick", "verify", "research" -> searchMode; else -> "other" }
-            Log.i(TAG, "stage=request_started search_mode=$modeForLog web_enabled=$webEnabled search_requested=$doSearch")
+            Log.i(TAG, "stage=request_started search_mode=$modeForLog web_enabled=$webEnabled")
             callback.onReady()
 
             val prepared = PreparedSearchRoute.prepare(requestId, reqObj, searchNative ?: AssistantProviderNative, callback) {

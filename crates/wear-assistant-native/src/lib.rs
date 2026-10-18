@@ -650,6 +650,9 @@ where
     if !parsed.web_enabled {
         return search::SearchPreparation::default();
     }
+    if let Some(skipped) = parsed.skipped_preparation() {
+        return skipped;
+    }
     let registration = parsed
         .request_id
         .as_deref()

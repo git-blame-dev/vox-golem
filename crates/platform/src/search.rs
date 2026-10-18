@@ -256,7 +256,6 @@ async fn run_with_client_events_since<T: WebTransport>(
     if mode == Mode::Quick
         && !context.explicit_search
         && context.web_enabled
-        && prompt.prompt != "Synthetic current question"
         && client.auth_revision().is_some()
     {
         let prev_user = voxgolem_core::router::fold_user_history(
@@ -265,7 +264,6 @@ async fn run_with_client_events_since<T: WebTransport>(
                 .iter()
                 .filter(|msg| matches!(msg.role, crate::custom_openai::CustomOpenAiRole::User))
                 .map(|msg| msg.text.as_str()),
-            &prompt.prompt,
         );
         let presearch_started = Instant::now();
         let prepared = prepare_round_zero_search_with_events(
@@ -304,7 +302,6 @@ async fn run_with_client_events_since<T: WebTransport>(
     for round in 0..policy.rounds {
         let quick_snippets_sufficient = mode == Mode::Quick
             && !context.explicit_search
-            && prompt.prompt != "Synthetic current question"
             && (round_zero_presearch_completed
                 || (result.searches > 0
                     && matches!(
@@ -640,34 +637,6 @@ pub async fn prewarm_web<T: WebTransport>(
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct PreparedSearchContext {
-    pub evidence_context: Option<String>,
-    pub source_footer: String,
-    pub sources: Vec<Source>,
-}
-
-impl PartialEq for PreparedSearchContext {
-    fn eq(&self, other: &Self) -> bool {
-        self.evidence_context == other.evidence_context
-            && self.source_footer == other.source_footer
-            && self.sources.len() == other.sources.len()
-            && self.sources.iter().zip(&other.sources).all(|(a, b)| {
-                a.id == b.id
-                    && a.url == b.url
-                    && a.title == b.title
-                    && a.provider == b.provider
-                    && a.kind == b.kind
-                    && a.text == b.text
-                    && a.retrieved_unix_ms == b.retrieved_unix_ms
-                    && a.publisher_date == b.publisher_date
-                    && a.truncated == b.truncated
-            })
-    }
-}
-
-impl Eq for PreparedSearchContext {}
-
-#[derive(Debug, Clone, Default)]
 pub struct PreparedRoundZeroSearch {
     pub route: voxgolem_core::router::Route2D,
     pub routing: voxgolem_core::router::RoutingDecision,
@@ -675,7 +644,6 @@ pub struct PreparedRoundZeroSearch {
     pub evidence_context: Option<String>,
     pub source_footer: String,
     pub sources: Vec<Source>,
-    pub context: PreparedSearchContext,
     pub provider_used: Option<&'static str>,
     pub fallback_used: bool,
     pub needs_escalation: bool,
@@ -694,7 +662,6 @@ impl PartialEq for PreparedRoundZeroSearch {
             && self.needs_search == other.needs_search
             && self.evidence_context == other.evidence_context
             && self.source_footer == other.source_footer
-            && self.context == other.context
             && self.provider_used == other.provider_used
             && self.fallback_used == other.fallback_used
             && self.needs_escalation == other.needs_escalation
@@ -776,11 +743,7 @@ pub async fn prepare_round_zero_search_with_events<T: WebTransport>(
     let routing = voxgolem_core::router::classify_prompt_2d(prompt, prev_user_turn, None);
     if !web_enabled
         || prompt.trim().is_empty()
-        || (mode == Mode::Quick
-            && !routing.needs_search()
-            && (enforce_quick_router
-                || routing.normalized_input
-                    == voxgolem_core::router::CANONICAL_SUPPLIED_TEXT_INTENT))
+        || !routing.needs_presearch(mode, enforce_quick_router)
     {
         return Ok(PreparedRoundZeroSearch {
             route: routing.primary,
@@ -1062,12 +1025,6 @@ pub async fn prepare_round_zero_search_with_events<T: WebTransport>(
         voxgolem_core::router::SnippetSufficiency::NeedsEscalation(_)
     );
 
-    let context = PreparedSearchContext {
-        evidence_context: evidence_context.clone(),
-        source_footer: source_footer.clone(),
-        sources: collected_sources.clone(),
-    };
-
     Ok(PreparedRoundZeroSearch {
         route: routing.primary,
         needs_search: routing.needs_search() || mode != Mode::Quick,
@@ -1075,7 +1032,6 @@ pub async fn prepare_round_zero_search_with_events<T: WebTransport>(
         evidence_context,
         source_footer,
         sources: collected_sources,
-        context,
         provider_used,
         fallback_used: fallbacks > 0,
         needs_escalation: final_needs_escalation,
