@@ -1,4 +1,6 @@
 use serde::Deserialize;
+#[path = "search_bench/encoder.rs"]
+mod encoder;
 use serde_json::{json, Value};
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -26,6 +28,7 @@ use voxgolem_platform::web::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BenchMode {
+    Encoder,
     Deterministic,
     Live,
 }
@@ -37,6 +40,11 @@ struct BenchArgs {
     cases_path: PathBuf,
     model: CustomOpenAiModel,
     repetitions: usize,
+    encoder_server: Option<PathBuf>,
+    encoder_model: Option<PathBuf>,
+    encoder_input: Option<encoder::Input>,
+    encoder_task: Option<encoder::Task>,
+    encoder_features: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -265,6 +273,11 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<BenchArgs, 
     let mut with_llm = false;
     let mut model = CustomOpenAiModel::LunaNone;
     let mut repetitions = 1;
+    let mut encoder_server = None;
+    let mut encoder_model = None;
+    let mut encoder_input = None;
+    let mut encoder_task = None;
+    let mut encoder_features = None;
     let mut cases_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../../crates/core/tests/fixtures/router_cases_132.json");
 
@@ -276,9 +289,10 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<BenchArgs, 
                 mode = match value.as_str() {
                     "deterministic" => BenchMode::Deterministic,
                     "live" => BenchMode::Live,
+                    "encoder" => BenchMode::Encoder,
                     other => {
                         return Err(format!(
-                            "unsupported --mode '{other}' (expected deterministic or live)"
+                            "unsupported --mode '{other}' (expected deterministic, live or encoder)"
                         )
                         .into())
                     }
@@ -286,6 +300,31 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<BenchArgs, 
             }
             "--with-llm" => {
                 with_llm = true;
+            }
+            "--encoder-server" => {
+                encoder_server = Some(PathBuf::from(args.next().ok_or("missing encoder server")?))
+            }
+            "--encoder-model" => {
+                encoder_model = Some(PathBuf::from(args.next().ok_or("missing encoder model")?))
+            }
+            "--encoder-input" => {
+                encoder_input = Some(match args.next().as_deref() {
+                    Some("legacy") => encoder::Input::Legacy,
+                    Some("literal") => encoder::Input::Literal,
+                    _ => return Err("expected encoder input legacy|literal".into()),
+                })
+            }
+            "--encoder-task" => {
+                encoder_task = Some(match args.next().as_deref() {
+                    Some("routes") => encoder::Task::Routes,
+                    Some("early-lookup") => encoder::Task::EarlyLookup,
+                    _ => return Err("expected encoder task routes|early-lookup".into()),
+                });
+            }
+            "--encoder-features" => {
+                encoder_features = Some(PathBuf::from(
+                    args.next().ok_or("missing feature output path")?,
+                ));
             }
             "--model" => {
                 model = match args.next().as_deref() {
@@ -306,7 +345,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<BenchArgs, 
             }
             "--help" | "-h" => {
                 println!(
-                    "Usage: cargo run --locked -p vox-golem --example search_bench -- [--mode deterministic|live] [--with-llm] [--model luna-none|sol-high] [--repetitions 1..=3] [--cases PATH]\nDefaults: deterministic, luna-none, one repetition. Live is anonymous-only unless --with-llm. Model matrix: six requests per repetition, at most 18; 600 second whole-matrix budget. Measures local callback text, not pixels/audio; semantic/citation accuracy unassessed."
+                    "Usage: cargo run --locked -p vox-golem --example search_bench -- [--mode deterministic|live|encoder] [--with-llm] [--model luna-none|sol-high] [--repetitions 1..=3] [--cases PATH]\nEncoder requires --encoder-server PATH --encoder-model PATH; optional --encoder-input legacy|literal (default legacy), --encoder-task routes|early-lookup (default routes). Early-lookup requires its distinct expected-decision fixture and reports both fixed S-only and S-or-R mappings, without training. Explicit --encoder-features ABSOLUTE_PATH exports synthetic-fixture vectors outside the repository without reporting predictions; requires early-lookup, literal input, one repetition and new output. Encoder is isolated, CPU-only, owned local server; rejects --with-llm. Coverage completion is not semantic quality acceptance.\nDefaults: deterministic, luna-none, one repetition. Live is anonymous-only unless --with-llm. Model matrix: six requests per repetition, at most 18; 600 second whole-matrix budget. Measures local callback text, not pixels/audio; semantic/citation accuracy unassessed."
                 );
                 std::process::exit(0);
             }
@@ -316,12 +355,42 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<BenchArgs, 
         }
     }
 
+    if mode == BenchMode::Encoder {
+        if with_llm {
+            return Err("encoder mode rejects --with-llm".into());
+        }
+        if encoder_server.is_none() || encoder_model.is_none() {
+            return Err("encoder mode requires explicit server and model paths".into());
+        }
+        if encoder_features.is_some()
+            && (encoder_task != Some(encoder::Task::EarlyLookup)
+                || !matches!(encoder_input, Some(encoder::Input::Literal))
+                || repetitions != 1)
+        {
+            return Err(
+                "feature export requires early-lookup task, literal input and one repetition"
+                    .into(),
+            );
+        }
+    } else if encoder_server.is_some()
+        || encoder_model.is_some()
+        || encoder_input.is_some()
+        || encoder_task.is_some()
+        || encoder_features.is_some()
+    {
+        return Err("encoder flags require encoder mode".into());
+    }
     Ok(BenchArgs {
         mode,
         with_llm,
         cases_path,
         model,
         repetitions,
+        encoder_server,
+        encoder_model,
+        encoder_input,
+        encoder_task,
+        encoder_features,
     })
 }
 
@@ -1373,6 +1442,13 @@ async fn main() {
         }
     };
 
+    if args.mode == BenchMode::Encoder {
+        // The owner is retired inside run before a nonzero exit, including failure paths.
+        if !encoder::run(&args) {
+            std::process::exit(1);
+        }
+        return;
+    }
     let det_rows = match run_deterministic_suite(&args.cases_path).await {
         Ok(rows) => rows,
         Err(err) => {
@@ -1415,6 +1491,88 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoder_accepts_explicit_literal_feature_export() {
+        assert!(args(&[
+            "--mode",
+            "encoder",
+            "--encoder-server",
+            "synthetic-server",
+            "--encoder-model",
+            "synthetic-model",
+            "--encoder-task",
+            "early-lookup",
+            "--encoder-input",
+            "literal",
+            "--encoder-features",
+            "/tmp/opencode/synthetic-features.json",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn encoder_accepts_retrieval_opportunity_task() {
+        assert!(args(&[
+            "--mode",
+            "encoder",
+            "--encoder-server",
+            "synthetic-server",
+            "--encoder-model",
+            "synthetic-model",
+            "--encoder-task",
+            "early-lookup",
+        ])
+        .is_ok());
+        assert!(args(&[
+            "--encoder-features",
+            "/tmp/opencode/synthetic-features.json"
+        ])
+        .is_err());
+        assert!(args(&[
+            "--mode",
+            "encoder",
+            "--encoder-server",
+            "synthetic-server",
+            "--encoder-model",
+            "synthetic-model",
+            "--encoder-features",
+            "/tmp/opencode/synthetic-features.json"
+        ])
+        .is_err());
+        assert!(args(&[
+            "--mode",
+            "encoder",
+            "--encoder-server",
+            "synthetic-server",
+            "--encoder-model",
+            "synthetic-model",
+            "--encoder-task",
+            "early-lookup",
+            "--encoder-input",
+            "literal",
+            "--repetitions",
+            "2",
+            "--encoder-features",
+            "/tmp/opencode/synthetic-features.json"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn encoder_cli_is_isolated() {
+        assert!(args(&[
+            "--mode",
+            "encoder",
+            "--encoder-server",
+            "synthetic-server",
+            "--encoder-model",
+            "synthetic-model"
+        ])
+        .is_ok());
+        assert!(args(&["--mode", "encoder", "--with-llm"]).is_err());
+        assert!(args(&["--encoder-input", "literal"]).is_err());
+    }
 
     fn args(values: &[&str]) -> Result<BenchArgs, Box<dyn Error>> {
         parse_args_from(values.iter().map(|value| (*value).to_string()))

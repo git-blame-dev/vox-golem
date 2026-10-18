@@ -1,0 +1,65 @@
+{
+  "schema": {
+    "container": "plain JSON array in each split file",
+    "required_fields": ["id", "family", "expected", "prompt", "prev", "reason"],
+    "id": "globally unique lowercase ASCII identifier",
+    "family": "lowercase ASCII family identifier",
+    "expected": "one of labels",
+    "prompt": "English string; maximum 400 characters",
+    "prev": "English string of at most 180 characters, or null; previous user context only",
+    "reason": "annotation rationale, never encoder input"
+  },
+  "input_version": "literal-labelled-context-v1",
+  "labels": ["early_lookup", "model_led"],
+  "provenance": "synthetic",
+  "split_policy": {
+    "fixed": true,
+    "seed": 20261018,
+    "seed_role": "recorded experiment identifier; assignments are authored and fixed, not a random sample",
+    "grouping_unit": "semantic instruction/context construction family",
+    "examples_per_family": 12,
+    "labels_per_family": {"early_lookup": 6, "model_led": 6},
+    "reassignment_after_predictions": false
+  },
+  "counts": {
+    "total": 360,
+    "families": 30,
+    "early_lookup": 180,
+    "model_led": 180
+  },
+  "splits": {
+    "train": {
+      "file": "train.json",
+      "count": 180,
+      "early_lookup": 90,
+      "model_led": 90,
+      "families": ["direct_scope", "historical_check", "supplied_calculation", "quoted_operation", "referent_completeness", "planning_gate", "edit_plus_verify", "implicit_need", "format_or_refresh", "fictional_dataset", "resolved_condition", "source_or_method", "closing_or_reopen", "conflict_authority", "essential_parameters"]
+    },
+    "calibration": {
+      "file": "calibration.json",
+      "count": 60,
+      "early_lookup": 30,
+      "model_led": 30,
+      "families": ["scope_brackets", "explicit_repair", "date_source_boundary", "ordered_two_tasks", "flagged_branch"]
+    },
+    "heldout": {
+      "file": "heldout.json",
+      "count": 120,
+      "early_lookup": 60,
+      "model_led": 60,
+      "families": ["form_field_ownership", "outstanding_item_ledger", "redaction_relevance", "reported_request_adoption", "revision_target", "menu_exclusion", "dependency_graph", "superseded_request", "evidence_scope_audit", "rubric_object_selection"]
+    }
+  },
+  "limitations": [
+    "Authored balanced screening corpus, not representative traffic or blind certification.",
+    "Rows within a family are correlated; 360 rows are not 360 independent instruction constructions.",
+    "Competencies intentionally recur across splits; family separation does not prove semantic independence.",
+    "Held-out construction novelty is an authored claim requiring independent pre-fit adjudication, not a measured property.",
+    "Paired instructions can create lexical shortcuts; paired public topics and varied transformations mitigate but do not eliminate them.",
+    "Identifiers, family, expected labels and reasons are metadata and must not enter encoder features.",
+    "Character limits are not a tokenizer-specific guarantee of the 256-token reference budget.",
+    "Relative dates are deliberately unresolved lookup targets; no live facts or answers are stored.",
+    "Classification cannot establish retrieval usefulness, supported-answer latency, provider behavior or physical performance.",
+    "No training, feature extraction, inference, predictions or network lookup was performed during corpus preparation."
+  ]
+}

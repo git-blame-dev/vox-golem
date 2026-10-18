@@ -84,7 +84,7 @@ LINUX_ORT_PROVIDER_LIBS := \
 
 .DEFAULT_GOAL := help
 
-.PHONY: wakeword-bench test-wakeword-bench search-bench test-search-bench
+.PHONY: wakeword-bench test-wakeword-bench search-bench encoder-bench test-search-bench test-router-head
 
 wakeword-bench:
 	@test -n '$(WAKE_WORD_MODEL)' || { printf '%s\n' 'Set WAKE_WORD_MODEL to a local classifier ONNX file.' >&2; exit 1; }
@@ -97,9 +97,18 @@ test-wakeword-bench:
 search-bench:
 	cargo run --locked -p vox-golem --example search_bench -- --mode live $(SEARCH_BENCH_FLAGS)
 
+encoder-bench:
+	@test -n '$(ENCODER_SERVER)' -a -n '$(ENCODER_MODEL)' || { printf '%s\n' 'Set ENCODER_SERVER and ENCODER_MODEL to existing local artifacts; no downloads are performed.' >&2; exit 1; }
+	cargo run --locked -p vox-golem --example search_bench -- --mode encoder --encoder-server '$(ENCODER_SERVER)' --encoder-model '$(ENCODER_MODEL)' $(ENCODER_BENCH_FLAGS)
+
 test-search-bench:
 	cargo test --locked -p vox-golem --example search_bench
 	cargo run --locked -p vox-golem --example search_bench -- --mode deterministic
+
+test-router-head:
+	@python3 -c 'import importlib.util; raise SystemExit(0 if importlib.util.find_spec("numpy") else "This optional test target requires an existing NumPy installation; no packages are installed automatically.")'
+	mkdir -p /tmp/opencode
+	python3 -m unittest discover -s tools/router-head -p 'test_*.py'
 
 .PHONY: help app-version icons test test-release-tools test-android-tools check-android-tools android-init android-build android-capture-test check-wear-tools wear-test wear-build wear-performance check-linux-tools app app-smoke packaged-smoke app-dev linux dist stage-linux-existing verify-dist prepare-appimage-tools update-bundle postprocess-update-bundle verify-update-bundle update-bundle-smoke check-pc-tools prepare-pc-bundle pc pc-dist verify-pc-dist pc-installer verify-pc-installer clean
 
@@ -111,7 +120,9 @@ help:
 	@printf '%s\n' '  make app-dev  Run only the frontend development server'
 	@printf '%s\n' '  make test     Run deterministic Linux frontend and Rust checks'
 	@printf '%s\n' '  make search-bench [SEARCH_BENCH_FLAGS="--with-llm"]  Run the cross-codepath search benchmark'
+	@printf '%s\n' '  make encoder-bench ENCODER_SERVER=/path/llama-server ENCODER_MODEL=/path/bge.gguf  Run the isolated local encoder benchmark'
 	@printf '%s\n' '  make test-search-bench  Run deterministic offline search & router benchmark'
+	@printf '%s\n' '  make test-router-head  Run offline synthetic head-fitting tests (requires existing NumPy)'
 	@printf '%s\n' '  make wakeword-bench WAKE_WORD_MODEL=/path/model.onnx  Run the synthetic wake-word benchmark'
 	@printf '%s\n' '  make app-version Print the generated application build identity'
 	@printf '%s\n' '  make icons    Regenerate native icons from the canonical SVG'
