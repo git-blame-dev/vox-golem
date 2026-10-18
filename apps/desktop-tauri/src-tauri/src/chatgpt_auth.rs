@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
-use voxgolem_core::config::{CustomOpenAiAuthSource, CustomOpenAiConfig};
+use voxgolem_core::config::CustomOpenAiConfig;
 
 pub(super) fn path() -> Result<PathBuf, String> {
-    Ok(super::application_config_path()?
-        .with_file_name("chatgpt")
-        .join("chatgpt-auth.json"))
+    Ok(voxgolem_core::config::managed_chatgpt_auth_path(
+        &super::application_config_path()?,
+    ))
 }
 
 pub(super) fn configuration(fallback: Option<&CustomOpenAiConfig>) -> Option<CustomOpenAiConfig> {
@@ -15,19 +15,12 @@ fn configuration_at(
     path: Option<&Path>,
     fallback: Option<&CustomOpenAiConfig>,
 ) -> Option<CustomOpenAiConfig> {
-    if let Some(path) = path.filter(|path| path.exists()) {
-        return Some(CustomOpenAiConfig {
-            endpoint: "https://chatgpt.com/backend-api/codex/responses".into(),
-            auth_path: path.into(),
-            auth_source: CustomOpenAiAuthSource::Native,
-        });
-    }
-    fallback.cloned()
+    voxgolem_core::config::effective_custom_openai_config(path, fallback)
 }
 
 pub(super) fn apply_capabilities(capabilities: &mut [super::CapabilityPayload]) {
     let Ok(path) = path() else { return };
-    if !path.exists() {
+    if configuration_at(Some(&path), None).is_none() {
         return;
     }
     let ready = voxgolem_platform::custom_openai::observe_custom_openai_auth(&path)
@@ -129,6 +122,7 @@ pub(super) async fn open_chatgpt_sign_in() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use voxgolem_core::config::CustomOpenAiAuthSource;
 
     fn legacy() -> CustomOpenAiConfig {
         CustomOpenAiConfig {
@@ -158,6 +152,18 @@ mod tests {
         let path = dir.path().join("chatgpt-auth.json");
         std::fs::write(&path, "{}").unwrap();
         assert_eq!(configuration_at(Some(&path), None).unwrap().auth_path, path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_managed_selection_never_falls_back_to_imported_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chatgpt-auth.json");
+        std::os::unix::fs::symlink(dir.path().join("absent-target.json"), &path).unwrap();
+
+        let selected = configuration_at(Some(&path), Some(&legacy())).unwrap();
+        assert_eq!(selected.auth_path, path);
+        assert_eq!(selected.auth_source, CustomOpenAiAuthSource::Native);
     }
 
     #[test]

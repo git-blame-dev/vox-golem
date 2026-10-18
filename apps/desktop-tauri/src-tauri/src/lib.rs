@@ -10756,7 +10756,7 @@ where
 
 #[cfg(target_os = "windows")]
 fn resolve_platform_provider_paths(config: &mut voxgolem_core::config::RuntimeConfig) {
-    if chatgpt_auth::path().is_ok_and(|path| path.exists()) {
+    if chatgpt_auth::configuration(None).is_some() {
         return;
     }
     let Some(custom) = config

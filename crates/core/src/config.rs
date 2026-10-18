@@ -191,6 +191,32 @@ pub struct CustomOpenAiConfig {
     pub auth_source: CustomOpenAiAuthSource,
 }
 
+pub fn managed_chatgpt_auth_path(config_path: &Path) -> PathBuf {
+    config_path
+        .with_file_name("chatgpt")
+        .join("chatgpt-auth.json")
+}
+
+/// Select the app-owned source without reading credentials or changing storage.
+/// Only an absent managed selection permits imported fallback; a signed-out,
+/// malformed, inaccessible or dangling selection must not switch accounts.
+pub fn effective_custom_openai_config(
+    managed_auth_path: Option<&Path>,
+    fallback: Option<&CustomOpenAiConfig>,
+) -> Option<CustomOpenAiConfig> {
+    let selected = managed_auth_path.filter(|path| {
+        !matches!(fs::symlink_metadata(path), Err(error) if error.kind() == ErrorKind::NotFound)
+    });
+    if let Some(path) = selected {
+        return Some(CustomOpenAiConfig {
+            endpoint: default_private_endpoint(),
+            auth_path: path.into(),
+            auth_source: CustomOpenAiAuthSource::Native,
+        });
+    }
+    fallback.cloned()
+}
+
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CustomOpenAiAuthSource {
@@ -1182,14 +1208,16 @@ fn is_absolute_linux_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_auth_path_from_env, default_private_endpoint, linux_app_dir_from_env,
-        load_runtime_config, platform_dirs_from_env, record_custom_auth_issue,
-        soul_path_for_config, valid_custom_endpoint, ConfigError, CustomOpenAiAuthSource,
+        default_auth_path_from_env, default_private_endpoint, effective_custom_openai_config,
+        linux_app_dir_from_env, load_runtime_config, managed_chatgpt_auth_path,
+        platform_dirs_from_env, record_custom_auth_issue, soul_path_for_config,
+        valid_custom_endpoint, ConfigError, CustomOpenAiAuthSource, CustomOpenAiConfig,
         InferencePolicy, OpencodeRuntime, RawCompletionConfig, RawLlamaCppConfig,
         ResponseBackendConfig,
     };
     use std::collections::HashMap;
     use std::fs;
+    use std::io::ErrorKind;
 
     #[test]
     fn private_endpoint_defaults_to_chatgpt_codex_responses() {
@@ -1197,6 +1225,80 @@ mod tests {
             default_private_endpoint(),
             "https://chatgpt.com/backend-api/codex/responses"
         );
+    }
+
+    fn imported_custom_config() -> CustomOpenAiConfig {
+        CustomOpenAiConfig {
+            endpoint: "http://127.0.0.1:12345/responses".into(),
+            auth_path: "/synthetic/imported-auth.json".into(),
+            auth_source: CustomOpenAiAuthSource::Wsl,
+        }
+    }
+
+    #[test]
+    fn managed_auth_path_stays_beside_the_platform_config_file() {
+        let root = TempDir::new();
+        let config_path = root.path().join("config.toml");
+        assert_eq!(
+            managed_chatgpt_auth_path(&config_path),
+            root.path().join("chatgpt").join("chatgpt-auth.json")
+        );
+    }
+
+    #[test]
+    fn absent_managed_source_preserves_the_configured_provider() {
+        let root = TempDir::new();
+        let missing = root.path().join("absent-auth.json");
+        let imported = imported_custom_config();
+        assert_eq!(
+            effective_custom_openai_config(Some(&missing), Some(&imported)),
+            Some(imported.clone())
+        );
+        assert_eq!(
+            effective_custom_openai_config(None, Some(&imported)),
+            Some(imported)
+        );
+        assert!(effective_custom_openai_config(Some(&missing), None).is_none());
+    }
+
+    #[test]
+    fn managed_selection_fences_imported_fallback_even_when_signed_out_or_malformed() {
+        let root = TempDir::new();
+        let managed = root.path().join("managed-auth.json");
+        for contents in [
+            r#"{"voxgolemChatgpt":1,"signedOut":true}"#,
+            "synthetic-invalid-record",
+        ] {
+            fs::write(&managed, contents).unwrap();
+            let selected =
+                effective_custom_openai_config(Some(&managed), Some(&imported_custom_config()))
+                    .unwrap();
+            assert_eq!(selected.auth_path, managed);
+            assert_eq!(selected.auth_source, CustomOpenAiAuthSource::Native);
+            assert_eq!(selected.endpoint, default_private_endpoint());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_and_inaccessible_managed_selection_do_not_switch_provider() {
+        let root = TempDir::new();
+        let dangling = root.path().join("dangling-auth.json");
+        std::os::unix::fs::symlink(root.path().join("absent-target.json"), &dangling).unwrap();
+        let blocker = root.path().join("not-a-directory");
+        fs::write(&blocker, "synthetic path blocker").unwrap();
+        let inaccessible = blocker.join("managed-auth.json");
+        assert_ne!(
+            fs::symlink_metadata(&inaccessible).unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+        for managed in [&dangling, &inaccessible] {
+            let selected =
+                effective_custom_openai_config(Some(managed), Some(&imported_custom_config()))
+                    .unwrap();
+            assert_eq!(selected.auth_path, *managed);
+            assert_eq!(selected.endpoint, default_private_endpoint());
+        }
     }
 
     #[test]
