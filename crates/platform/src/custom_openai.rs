@@ -1,4 +1,4 @@
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{redirect, Client, StatusCode, Url};
 use serde::{de, Deserialize, Deserializer};
@@ -615,9 +615,7 @@ impl CustomOpenAiClient {
             }
         };
 
-        while let Ok(Some(Ok(_))) =
-            tokio::time::timeout(Duration::from_millis(5), stream.next()).await
-        {}
+        drain_completed_response(&mut stream, true).await;
         self.record_transport_active();
 
         let (text, content_type) = accumulator.finish()?;
@@ -633,6 +631,29 @@ impl CustomOpenAiClient {
                 completed_at,
             },
         })
+    }
+}
+
+// Bound opportunistic connection reuse by one deadline and byte budget. Final tool
+// answers only consume ready data: yielding for cleanup could lose validated success
+// to the enclosing round/search deadline. Intermediate rounds may wait for pool reuse.
+async fn drain_completed_response<S, B, E>(stream: &mut S, wait_for_tail: bool)
+where
+    S: futures_util::Stream<Item = Result<B, E>> + Unpin,
+    B: AsRef<[u8]>,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(5);
+    let mut remaining = 16 * 1024_usize;
+    while remaining > 0 && tokio::time::Instant::now() < deadline {
+        let next = if wait_for_tail {
+            tokio::time::timeout_at(deadline, stream.next()).await.ok()
+        } else {
+            stream.next().now_or_never()
+        };
+        match next {
+            Some(Some(Ok(chunk))) => remaining = remaining.saturating_sub(chunk.as_ref().len()),
+            _ => break,
+        }
     }
 }
 

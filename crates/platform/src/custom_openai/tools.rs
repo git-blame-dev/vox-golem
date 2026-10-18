@@ -477,10 +477,7 @@ impl CustomOpenAiClient {
                             first_text_at,
                             completed_at: started.elapsed(),
                         };
-                        while let Ok(Some(Ok(_))) =
-                            tokio::time::timeout(Duration::from_millis(5), stream.next()).await
-                        {
-                        }
+                        drain_completed_response(&mut stream, !round.calls.is_empty()).await;
                         self.record_transport_active();
                         return Ok(round);
                     }
@@ -496,6 +493,153 @@ impl CustomOpenAiClient {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn direct_terminal_cleanup_is_bounded_despite_timely_trailing_chunks() {
+        terminal_cleanup_fixture(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn tool_terminal_cleanup_is_bounded_despite_timely_trailing_chunks() {
+        terminal_cleanup_fixture(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn final_tool_terminal_near_deadline_does_not_wait_for_open_tail() {
+        terminal_cleanup_fixture(true, true).await;
+    }
+
+    async fn terminal_cleanup_fixture(tools: bool, near_deadline: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        {
+            let fixture = crate::test_support::TestDir::new("bounded-terminal");
+            let path = fixture.path().join("auth.json");
+            std::fs::write(
+                &path,
+                r#"{"openai":{"access":"synthetic-cleanup","expires":4102444800}}"#,
+            )
+            .unwrap();
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                socket.set_nodelay(true).unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                loop {
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    assert!(request.len() <= MAX_REQUEST_BYTES + 16384);
+                    if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .unwrap()
+                            .trim()
+                            .parse()
+                            .unwrap();
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+                let terminal = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Synthetic success\"}]}]}}\n\n";
+                socket
+                    .write_all(format!("{:x}\r\n{terminal}\r\n", terminal.len()).as_bytes())
+                    .await
+                    .unwrap();
+                if near_deadline {
+                    let _ = socket.read(&mut buffer).await;
+                    return;
+                }
+                // Every chunk arrives within the old per-chunk timeout; the body never ends.
+                for _ in 0..1000 {
+                    if socket.write_all(b"3\r\n: \n\r\n").await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            });
+            let client = CustomOpenAiClient::new(CustomOpenAiConfig {
+                endpoint,
+                auth_path: path,
+                total_timeout: Duration::from_millis(400),
+                ..Default::default()
+            })
+            .unwrap();
+            let result = tokio::time::timeout(Duration::from_millis(150), async {
+                if tools {
+                    let deadline = tokio::time::Instant::now() + Duration::from_millis(80);
+                    let validated_text = std::cell::Cell::new(false);
+                    let round = client.tool_round_with_events(
+                        RoundRequest {
+                            session_id: "synthetic-cleanup",
+                            input: &[],
+                            instructions: "Synthetic policy",
+                            tools: &[],
+                        },
+                        RoundOptions {
+                            deadline,
+                            expected_auth_revision: None,
+                            require_tool: false,
+                        },
+                        |event| {
+                            if near_deadline && matches!(event, ModelEvent::TextDelta { .. }) {
+                                assert!(!validated_text.replace(true));
+                                // Terminal-only text is published after decoder.finish().
+                                while tokio::time::Instant::now()
+                                    < deadline - Duration::from_millis(1)
+                                {
+                                    std::hint::spin_loop();
+                                }
+                                assert!(tokio::time::Instant::now() < deadline);
+                            }
+                            Ok(())
+                        },
+                    );
+                    let mut round = std::pin::pin!(round);
+                    std::future::poll_fn(|cx| {
+                        let result = std::future::Future::poll(round.as_mut(), cx);
+                        assert!(
+                            !near_deadline || !validated_text.get() || result.is_ready(),
+                            "validated final round must not yield for tail cleanup"
+                        );
+                        result
+                    })
+                    .await
+                    .map(|round| round.response.text)
+                    .map_err(|error| format!("{error:?}"))
+                } else {
+                    client
+                        .respond(
+                            &CustomOpenAiPrompt {
+                                session_id: "synthetic-cleanup".into(),
+                                prompt: "Synthetic request".into(),
+                                history: vec![],
+                            },
+                            |_| {},
+                        )
+                        .await
+                        .map(|response| response.text)
+                        .map_err(|error| format!("{error:?}"))
+                }
+            })
+            .await;
+            server.abort();
+            assert_eq!(
+                result
+                    .expect("terminal cleanup must return promptly")
+                    .expect("cleanup must not mask validated success"),
+                "Synthetic success",
+                "tools={tools}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn review_tool_transport_delivers_terminal_suffix_once_and_propagates_callback_failure() {
