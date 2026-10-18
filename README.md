@@ -170,6 +170,18 @@ make pc-installer # build and verify the Windows NSIS installer on Linux
 
 `make app-smoke` proves only that the zero-asset Tauri shell reaches its startup marker (shell setup); it does not prove providers, models, voice, completion, or TTS, which require their own runtime checks.
 
+### Search and model benchmarks
+
+```bash
+make test-search-bench # deterministic fixtures and 132-case routing-normalizer parity; no live calls
+cargo run --locked -p vox-golem --example search_bench -- --mode live
+cargo run --locked -p vox-golem --example search_bench -- --mode live --with-llm --model luna-none --repetitions 3
+```
+
+Live mode without `--with-llm` exercises search-service preparation only. Explicit model coverage uses the same managed-sign-in/configured-source selection as desktop; it never starts sign-in or silently imports another account's credentials. Imported WSL-only sources are explicitly skipped by this standalone native benchmark; desktop's existing Windows WSL adapter remains separate. Select `luna-none` or `sol-high`. One repetition is the default, with one to three repetitions supported: six direct/coding/Quick/Verify/Research/history scenarios per repetition, at most 18 logical requests, under the existing per-mode budgets and a 600-second matrix request budget. A logical request can contain multiple model rounds and search/page-read calls and consumes the selected provider's allowance.
+
+Requested coverage that fails or is skipped produces a nonzero exit instead of an all-green report. First-visible-text timing excludes whitespace; an unobserved callback has no invented time. Partial evidence and fallback remain explicit. These are native backend callback/completion measurements, not painted pixels, audible output, semantic/citation-quality validation, or physical Android/Wear/Windows acceptance. Synthetic fixture latency is not live search or model latency.
+
 For repeatable synthetic wake-word accuracy checks, run `make wakeword-bench WAKE_WORD_MODEL=/path/to/hey_livekit.onnx`. The [benchmark guide](tools/wakeword-bench/README.md) describes corpus generation, calibration/holdout evaluation, artifact verification, and the limits of artificial speech tests.
 
 When the microphone is active, VoxGolem saves up to 0.8 seconds of pre-trigger wake audio for each new detection as a local PCM16 WAV; older 0.5-, 0.55-, 0.7-, 0.75-, 1.5- and three-second clips remain playable. This tight window can truncate a slowly spoken wake phrase, so review recordings before using them for training. Clips are grouped by the detecting model filename and a local content-derived revision ID. The revision ID distinguishes replaced model bytes with the same filename; it is not a cryptographic checksum and may change with Rust toolchain versions. In Settings → Wake clips, you can pause saving, choose an absolute local save directory, browse clips in pages, play them, label them true/false wakes, or delete them. Clips start unreviewed: the detector's model name is a prediction, not proof of what was said. The default folder is `wake-clips` beside your local VoxGolem configuration (`%APPDATA%\VoxGolem\wake-clips` on Windows); the selected directory is stored locally in `wake-clips.json`. No storage quota or automatic deletion is applied. Save failures appear as a notice without stopping the microphone. Recordings, models, and runtime settings are local user data and stay out of Git.
