@@ -1,5 +1,6 @@
 import org.gradle.api.file.DirectoryProperty
 import org.gradle.api.tasks.Internal
+import org.gradle.api.tasks.PathSensitivity
 
 plugins {
     id("com.android.library")
@@ -44,6 +45,7 @@ tasks.withType<Test>().configureEach {
     dependsOn("buildAssistantNativeJvm")
     val library = providers.gradleProperty("assistantNativeLibrary").orNull?.let(::file)
         ?: layout.buildDirectory.file("rust-native/debug/libwear_assistant_native.so").get().asFile
+    inputs.file(library).withPropertyName("assistantNativeLibrary").withPathSensitivity(PathSensitivity.NONE)
     systemProperty("assistant.native.library", library.absolutePath)
     systemProperty("java.library.path", library.parent)
 }

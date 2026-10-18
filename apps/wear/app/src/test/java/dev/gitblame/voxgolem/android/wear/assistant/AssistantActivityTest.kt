@@ -1158,8 +1158,6 @@ class AssistantActivityTest {
         assertTrue(assistantErrorText("auth_expired").contains("Draft retained"))
         assertFalse(assistantErrorText("auth_expired").contains("Import"))
         assertTrue(assistantErrorText("not_saved").contains("Draft retained"))
-        assertEquals(10, AssistantModels.aliases.size)
-        assertTrue("gemini-nano" in AssistantModels.aliases)
     }
 
     @Test fun watchModelPickerHidesProvidersWithoutAnInstalledRouteButKeepsTheCurrentSelection() {

@@ -72,8 +72,13 @@ class AssistantEngineTest {
     private fun settle() { providerQueue.drain(); io.drain() }
 
     @Test fun androidModelAliasesContainOnlyCustomNanoAndAgy() {
+        val expectedAliases = setOf("custom-sol-high", "custom-sol-none", "custom-luna-none", "custom-luna-low",
+            "gemini-nano", "agy-flash-none", "agy-flash-low", "agy-flash-high", "agy-opus-high",
+            "agy-sonnet-low", "agy-sonnet-high")
         assertEquals(setOf("gemini-nano", "agy-flash-none", "agy-flash-low", "agy-flash-high", "agy-opus-high",
             "agy-sonnet-low", "agy-sonnet-high"), AssistantModels.optionalLabels.keys)
+        assertEquals(expectedAliases, AssistantModels.aliases.toSet())
+        assertEquals(expectedAliases.size, AssistantModels.aliases.size)
         assertEquals(AssistantModels.customLabels.keys + AssistantModels.optionalLabels.keys, AssistantModels.aliases.toSet())
     }
 
