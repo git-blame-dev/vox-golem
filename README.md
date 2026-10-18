@@ -50,6 +50,8 @@ Conversation replication uses bounded, finite GMS DataItem/Asset exchanges of im
 
 On Linux/Windows desktop or Android, open **Settings → Model → Continue with ChatGPT**. Open the sign-in page and enter the displayed one-time code. Device-code login may need enabling in ChatGPT security settings or workspace permissions. Only authorize a code you started in VoxGolem. Closing Settings does not cancel a pending attempt; **Cancel** does. Attempts expire after at most 15 minutes. No local callback server or second login method is used.
 
+Linux uses the `xdg-open` browser helper from `xdg-utils`. If browser launching is unavailable (for example, in a headless or WSL session), manually open the displayed device-code URL in an ordinary browser and enter the code there. Installing the helper does not establish that a browser opened, authentication succeeded, or a model request works; those require separate interactive acceptance.
+
 The native app owns token renewal and keeps credentials outside the WebView. Desktop stores `chatgpt/chatgpt-auth.json` under its configuration directory in a dedicated private subdirectory; Android uses its private, backup-excluded directory. Signing in explicitly selects this source for Custom models without modifying existing imported credential files or provider configuration. Signing out keeps an empty source-selection record, so the app does not silently fall back to imported credentials. Do not put runtime keys in prompts, logs, examples or project artifacts.
 
 Wear has no sign-in screen. The Android phone shares short-lived access only with its verified native-paired, matching-package/signature watch through a separate transient credential channel, never conversation replication. Refresh and ID tokens stay on the phone. An offline watch can use already-shared access until it expires; renewal requires the phone. Sign-out clearing reaches the watch when it reconnects; it cannot instantly erase an offline watch's cached access. Conversation sharing remains independent of provider access.
@@ -132,9 +134,11 @@ The default locations are `$HOME/.local/share/opencode/auth.json` and `$HOME/.op
 Install Bun 1.3.9, Rust 1.95.0, Tauri CLI 2.11.1, and the Ubuntu WebKitGTK/GTK, audio, CMake, Ninja, Clang/LLVM, and eSpeak development packages. WSLg supplies the Linux GUI and microphone integration; verify those manually on your machine.
 
 ```bash
-sudo apt-get install libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev libssl-dev libxdo-dev libespeak-dev cmake ninja-build clang lld llvm pkg-config
+sudo apt-get install libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev libssl-dev libxdo-dev libespeak-dev cmake ninja-build clang lld llvm pkg-config p7zip-full xdg-utils
 cargo install tauri-cli --version 2.11.1 --locked
 ```
+
+This package recipe targets the supported Ubuntu 24.04 baseline. Release-tool tests (`scripts/test-release-tools.sh`, also run by `make test`) require the `7z` command supplied by `p7zip-full` there. Newer Ubuntu distributions may instead supply it through `7zip` (Ubuntu 26.04 uses `sudo apt-get install 7zip xdg-utils` for these two prerequisites); that package-name guidance does not expand the supported release baseline. Install the distribution package, including its codecs, rather than copying a standalone executable onto `PATH`.
 
 Copy [`config.example.toml`](config.example.toml) to `${XDG_CONFIG_HOME:-$HOME/.config}/voxgolem/config.toml` (or set `VOXGOLEM_CONFIG_PATH`). When using Local Fast or Local Quality on any platform, also create a non-empty `SOUL.md` beside that config; copying the example is therefore a config-only setup step, and the required soul text must be supplied separately. Missing local assets or `SOUL.md` disable only the local response capability. XDG defaults are `~/.config/voxgolem`, `~/.local/share/voxgolem`, `~/.local/state/voxgolem`, and `~/.cache/voxgolem`. Relative paths resolve beside the config. Keep model files external; there is no model downloader.
 

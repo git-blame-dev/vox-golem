@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -eu -o pipefail
 
+if ! command -v 7z >/dev/null 2>&1; then
+  printf '%s\n' 'Release-tool tests require 7z on PATH (Ubuntu 24.04: p7zip-full; Ubuntu 26.04: 7zip).' >&2
+  exit 1
+fi
+
 root="$(cd "$(dirname "$0")/.." && pwd)"
 temp_dir="$(mktemp -d)"
 trap 'rm -rf "$temp_dir"' EXIT
