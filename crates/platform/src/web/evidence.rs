@@ -119,6 +119,7 @@ pub fn decode_result(
                 }
             }
             result.partial = !result.failures.is_empty();
+            result.evidence_unavailable = result.sources.is_empty();
         }
         Provider::Exa => {
             let content = value["content"]
