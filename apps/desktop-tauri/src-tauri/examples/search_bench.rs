@@ -429,23 +429,18 @@ async fn run_deterministic_suite(cases_path: &Path) -> Result<Vec<ScenarioRow>, 
         )
         .await
         .expect("SearchFast succeeds");
-        let first_title = out
-            .context
-            .sources
-            .first()
-            .map(|s| s.title.as_str())
-            .unwrap_or("");
+        let first_title = out.sources.first().map(|s| s.title.as_str()).unwrap_or("");
         let passed = out.routing.primary == Route2D::SearchFast
-            && out.context.sources.len() == 1
+            && out.sources.len() == 1
             && first_title == "https://tgftp.nws.noaa.gov/weather/current/KJFK.html"
-            && !out.context.source_footer.contains("[N/A]");
+            && !out.source_footer.contains("[N/A]");
         rows.push(ScenarioRow {
             id: "04_search_fast_title_na",
             codepath: "platform::round_zero",
             route: out.routing.primary.code().to_string(),
             elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
             passed,
-            detail: format!("sources={} title={first_title}", out.context.sources.len()),
+            detail: format!("sources={} title={first_title}", out.sources.len()),
         });
     }
 
@@ -472,20 +467,14 @@ async fn run_deterministic_suite(cases_path: &Path) -> Result<Vec<ScenarioRow>, 
         )
         .await
         .expect("multi-record parse succeeds");
-        let passed = out.context.sources.len() == 3
-            && !out.partial
-            && out.context.evidence_context.is_some();
+        let passed = out.sources.len() == 3 && !out.partial && out.evidence_context.is_some();
         rows.push(ScenarioRow {
             id: "05_exa_internal_hr_split",
             codepath: "web::evidence",
             route: out.routing.primary.code().to_string(),
             elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
             passed,
-            detail: format!(
-                "sources={} partial={}",
-                out.context.sources.len(),
-                out.partial
-            ),
+            detail: format!("sources={} partial={}", out.sources.len(), out.partial),
         });
     }
 
@@ -512,7 +501,7 @@ async fn run_deterministic_suite(cases_path: &Path) -> Result<Vec<ScenarioRow>, 
         let t1 = "In Magic: The Gathering, how does Urza's Saga work?";
         let t2 = "What about its second ability?";
         let t3 = "Does the token keep its ability if the land is destroyed?";
-        let folded = fold_user_history([t1, t2, t3], t3).unwrap_or_default();
+        let folded = fold_user_history([t1, t2]).unwrap_or_default();
         let decision = classify_prompt_2d(t3, Some(&folded), None);
         let mut service = WebService::new(DeterministicTransport::default());
         let cancel = Cancellation::default();
@@ -534,7 +523,7 @@ async fn run_deterministic_suite(cases_path: &Path) -> Result<Vec<ScenarioRow>, 
         let passed = folded.contains("Urza's Saga")
             && decision.needs_search()
             && decision.normalized_input.contains("Urza's Saga")
-            && !out.context.sources.is_empty();
+            && !out.sources.is_empty();
         rows.push(ScenarioRow {
             id: "07_three_turn_root_fold",
             codepath: "core::fold_user_history",
@@ -584,7 +573,6 @@ async fn run_deterministic_suite(cases_path: &Path) -> Result<Vec<ScenarioRow>, 
             && !out.needs_escalation
             && !saw_fetch_event
             && out
-                .context
                 .sources
                 .iter()
                 .all(|s| s.kind == EvidenceKind::SearchExcerpt);
@@ -594,10 +582,7 @@ async fn run_deterministic_suite(cases_path: &Path) -> Result<Vec<ScenarioRow>, 
             route: out.routing.primary.code().to_string(),
             elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
             passed,
-            detail: format!(
-                "saw_fetch={saw_fetch_event} sources={}",
-                out.context.sources.len()
-            ),
+            detail: format!("saw_fetch={saw_fetch_event} sources={}", out.sources.len()),
         });
     }
 
@@ -624,14 +609,10 @@ async fn run_deterministic_suite(cases_path: &Path) -> Result<Vec<ScenarioRow>, 
         )
         .await
         .expect("escalated fetch succeeds");
-        let ctx = out.context.evidence_context.unwrap_or_default();
+        let ctx = out.evidence_context.unwrap_or_default();
         let page_read_first = ctx.starts_with("[1] Apple 2026 Quarterly Dividend Official Release");
         let passed = !out.needs_escalation
-            && out
-                .context
-                .sources
-                .iter()
-                .any(|s| s.kind == EvidenceKind::PageRead)
+            && out.sources.iter().any(|s| s.kind == EvidenceKind::PageRead)
             && page_read_first
             && ctx.contains("USD 0.74 per share");
         rows.push(ScenarioRow {
@@ -696,7 +677,7 @@ async fn run_deterministic_suite(cases_path: &Path) -> Result<Vec<ScenarioRow>, 
                 .any(|f| f.failure == Failure::RateLimited)
             && out.fallback_used
             && out.provider_used == Some("parallel")
-            && out.context.sources.len() == 1;
+            && out.sources.len() == 1;
         rows.push(ScenarioRow {
             id: "10_exa_soft_ratelimit_fallback",
             codepath: "web::execute",
@@ -775,10 +756,8 @@ async fn run_deterministic_suite(cases_path: &Path) -> Result<Vec<ScenarioRow>, 
         )
         .await
         .expect("search succeeds");
-        let suff = check_search_snippets_sufficiency(
-            "What are the specs of the Pixel 8?",
-            &out.context.sources,
-        );
+        let suff =
+            check_search_snippets_sufficiency("What are the specs of the Pixel 8?", &out.sources);
         let passed = suff == SnippetSufficiency::Sufficient;
         rows.push(ScenarioRow {
             id: "12_snippet_sufficiency_guard",
@@ -846,12 +825,12 @@ async fn run_live_suite(with_llm: bool) -> Result<Vec<ScenarioRow>, Box<dyn Erro
             codepath: "platform::round_zero",
             route: out.routing.primary.code().to_string(),
             elapsed_ms: ms,
-            passed: !out.context.sources.is_empty(),
+            passed: !out.sources.is_empty(),
             detail: format!(
                 "provider={:?} fallback={} sources={}",
                 out.provider_used,
                 out.fallback_used,
-                out.context.sources.len()
+                out.sources.len()
             ),
         });
     }
@@ -862,7 +841,7 @@ async fn run_live_suite(with_llm: bool) -> Result<Vec<ScenarioRow>, Box<dyn Erro
         let t1 = "In Magic: The Gathering, how does Urza's Saga work?";
         let t2 = "What about its second ability?";
         let t3 = "Does the token keep its ability if the land is destroyed?";
-        let folded = fold_user_history([t1, t2, t3], t3);
+        let folded = fold_user_history([t1, t2]);
         let cancel = Cancellation::default();
         let mut service = admit_web(
             &web_mutex,
@@ -893,11 +872,11 @@ async fn run_live_suite(with_llm: bool) -> Result<Vec<ScenarioRow>, Box<dyn Erro
             codepath: "platform::round_zero",
             route: out.routing.primary.code().to_string(),
             elapsed_ms: ms,
-            passed: !out.context.sources.is_empty() && out.context.evidence_context.is_some(),
+            passed: !out.sources.is_empty() && out.evidence_context.is_some(),
             detail: format!(
                 "sources={} footer_len={}",
-                out.context.sources.len(),
-                out.context.source_footer.len()
+                out.sources.len(),
+                out.source_footer.len()
             ),
         });
     }

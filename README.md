@@ -90,8 +90,8 @@ Web access defaults on and is persisted per installation through Settings, separ
 from Quick/Verify/Research effort. Verify and Research are explicit lookup actions, not
 prompt-keyword heuristics. Disabling web access keeps ordinary chat available, advertises
 no web tools and prevents native lookup/provider-fallback calls; it does not make remote
-chat or provider-controlled speech offline. Native lookup sends model-generated queries,
-focus text and URLs to Parallel, with Exa as the disclosed fallback. OpenCode research is
+chat or provider-controlled speech offline. Native lookup sends question-derived queries,
+focus text and URLs to Exa, with Parallel as the disclosed fallback. OpenCode research is
 delegated to its configured runtime, whose external provider identity may be unknown.
 External correlation is process-scoped rather than the canonical local conversation ID.
 

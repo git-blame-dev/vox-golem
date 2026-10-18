@@ -1486,6 +1486,19 @@ mod tests {
 
     #[tokio::test]
     async fn stock_startup_http_429_sets_default_cooldown_and_skips_primary_next_time() {
+        assert_startup_status_fallback(429, None).await;
+    }
+
+    #[tokio::test]
+    async fn stock_http_status_overrides_conflicting_rpc_errors() {
+        for status in [429, 503] {
+            for code in [-32603, -32602] {
+                assert_startup_status_fallback(status, Some((code, "Synthetic RPC failure"))).await;
+            }
+        }
+    }
+
+    async fn assert_startup_status_fallback(status: u16, rpc_error: Option<(i64, &'static str)>) {
         struct StockPrimary {
             mcp: McpTransport,
             providers: Vec<Provider>,
@@ -1511,7 +1524,7 @@ mod tests {
                 }
             }
         }
-        let (endpoint, requests, server) = startup_failure_server(429, None).await;
+        let (endpoint, requests, server) = startup_failure_server(status, rpc_error).await;
         let mut service = WebService::new(StockPrimary {
             mcp: McpTransport {
                 endpoints: Some([endpoint.clone(), endpoint]),
@@ -1537,12 +1550,13 @@ mod tests {
             .unwrap();
         assert!(result.fallback_used);
         assert_eq!(result.sources[0].provider, Provider::Parallel);
-        let until = service.cooldowns[1].expect("actual startup 429 must cool down primary");
+        let until = service.cooldowns[1].expect("HTTP failure must cool down primary");
+        let cooldown = if status == 429 { 60 } else { 15 };
         assert!(
-            until >= before + Duration::from_secs(60),
-            "default must be 60s, not transient 15s"
+            until >= before + Duration::from_secs(cooldown),
+            "HTTP status must determine cooldown"
         );
-        assert!(until <= Instant::now() + Duration::from_secs(60));
+        assert!(until <= Instant::now() + Duration::from_secs(cooldown));
         let count = requests.load(Ordering::SeqCst);
         assert!(count > 0, "stock client must hit the local HTTP server");
         service

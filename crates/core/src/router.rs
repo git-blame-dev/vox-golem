@@ -72,6 +72,12 @@ pub struct RoutingDecision {
 }
 
 impl RoutingDecision {
+    pub fn needs_presearch(&self, mode: Mode, enforce_quick_router: bool) -> bool {
+        mode != Mode::Quick
+            || self.needs_search()
+            || (!enforce_quick_router && self.normalized_input != CANONICAL_SUPPLIED_TEXT_INTENT)
+    }
+
     pub fn needs_search(&self) -> bool {
         self.primary.needs_search()
     }
@@ -504,41 +510,32 @@ fn is_elliptical_or_anaphoric_turn(text: &str) -> bool {
         || (text.len() <= 160 && has_anaphoric_follow_up_cue(&lower))
 }
 
-pub fn fold_user_history<'a>(
-    turns: impl IntoIterator<Item = &'a str>,
-    current_prompt: &str,
-) -> Option<String> {
-    let current_clean = strip_sources_footer(current_prompt);
-    let mut prior: Vec<&str> = turns
+/// Fold prior user turns only. Callers remove the current message by position,
+/// never by text equality: repeating a question is a valid new turn.
+pub fn fold_user_history<'a>(turns: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let prior: Vec<&str> = turns
         .into_iter()
         .map(strip_sources_footer)
         .filter(|t| !t.is_empty())
         .collect();
-    if prior
-        .last()
-        .is_some_and(|last| !current_clean.is_empty() && *last == current_clean)
-    {
-        prior.pop();
-    }
     match prior.len() {
         0 => None,
         1 => Some(truncate_utf8(prior[0], 200)),
         _ => {
             let prev = *prior.last().unwrap();
-            let window_start = prior.len().saturating_sub(3);
             let anchor = prior[..prior.len() - 1]
                 .iter()
                 .rev()
                 .copied()
                 .find(|t| !is_elliptical_or_anaphoric_turn(t))
-                .unwrap_or(prior[window_start]);
+                .unwrap_or(prior[0]);
             if anchor == prev {
                 Some(truncate_utf8(prev, 200))
             } else {
                 Some(format!(
                     "{} {}",
-                    truncate_utf8(anchor, 120),
-                    truncate_utf8(prev, 100)
+                    truncate_utf8(anchor, 100),
+                    truncate_utf8(prev, 99)
                 ))
             }
         }
@@ -1487,6 +1484,43 @@ mod tests {
     }
 
     #[test]
+    fn fold_user_history_keeps_repeated_prior_turns_and_bounds_multibyte_context() {
+        let root = "What is the current price of Synthetic Widget?";
+        let latest = "What about its second edition?";
+        let folded = fold_user_history([root, latest]).unwrap();
+        assert!(folded.contains(root));
+        assert!(
+            folded.contains(latest),
+            "a repeated prompt is still a prior turn"
+        );
+
+        let long_root = format!("{root} {}", "🧪é".repeat(100));
+        let long_latest = format!("{latest} {}", "🧪é".repeat(100));
+        let folded = fold_user_history([long_root.as_str(), long_latest.as_str()]).unwrap();
+        assert!(folded.len() <= 200);
+        assert!(folded.contains(root));
+        assert!(folded.contains(latest));
+    }
+
+    #[test]
+    fn fold_user_history_preserves_root_and_latest_after_five_followups() {
+        for root in [
+            "What is the current price of Synthetic Widget?",
+            "Can you tell me the current price of Synthetic Widget?",
+        ] {
+            let prior = [
+                root,
+                "What about its second edition?",
+                "What about its third edition?",
+                "What about its fourth edition?",
+                "What about its fifth edition?",
+            ];
+            let folded = fold_user_history(prior).unwrap();
+            assert_eq!(folded, format!("{root} {}", prior[4]));
+        }
+    }
+
+    #[test]
     fn fold_user_history_preserves_turn_one_anchor_across_three_turns() {
         let turn1 = "In Magic: The Gathering, how does Urza's Saga work?\n\nSources:\n- https://example.com/urza";
         let turn2 = "What about its second ability?";
@@ -1495,7 +1529,7 @@ mod tests {
             "Does the token keep its ability?",
             "What happens if it loses all abilities before chapter three?",
         ] {
-            let folded = fold_user_history([turn1, turn2, turn3], turn3)
+            let folded = fold_user_history([turn1, turn2])
                 .expect("folded prior user history should be present");
             assert!(
                 folded.contains("Urza's Saga"),

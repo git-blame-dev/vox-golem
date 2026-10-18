@@ -3565,7 +3565,7 @@ const SessionSettings = memo(function SessionSettings({ session, view }: Session
               <h3 id="web-settings-title">Web access</h3>
               <label className="shell__toggle settings-panel__interactive"><input type="checkbox" aria-label="Allow web access" checked={assistantSettings.webEnabled} disabled={instantControlsDisabled}
                 onChange={(event) => patchAssistantSettings({ webEnabled: event.target.checked })} /> Allow web access</label>
-              <p className="settings-panel__hint">{assistantSettings.webEnabled ? 'Native search may send question-derived queries and public-page requests to external providers: Parallel is primary, with Exa as fallback when needed. Delegated OpenCode routes may use their own search providers.' : 'Web is off: no web lookup or search fallback. Normal chat still uses the selected chat provider; answers are not web-verified.'}</p>
+              <p className="settings-panel__hint">{assistantSettings.webEnabled ? 'Native search may send question-derived queries and public-page requests to external providers: Exa is primary, with Parallel as fallback when needed. Delegated OpenCode routes may use their own search providers.' : 'Web is off: no web lookup or search fallback. Normal chat still uses the selected chat provider; answers are not web-verified.'}</p>
               <p className="settings-panel__hint">Search effort (Quick, Verify, Research) is separate from this permission. Providers used depend on availability; search and fallback activity appear in the response status when reported.</p>
             </section>
             {isAndroidRuntime ? <NewVoiceShortcutSettings /> : null}

@@ -86,7 +86,7 @@ describe('admitted search mode and generation-owned presentation', () => {
     await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
     const web = container.querySelector<HTMLInputElement>('[aria-label="Allow web access"]')!
     expect(web.checked).toBe(true)
-    expect(container.textContent).toContain('Parallel is primary, with Exa as fallback')
+    expect(container.textContent).toContain('Exa is primary, with Parallel as fallback')
     await act(async () => { web.click() })
     expect(settings.web_enabled).toBe(false)
     expect(settings.speech_network_fallback).toBe(false)

@@ -380,9 +380,14 @@ class GeminiNanoProviderTest {
     }
 
     @Test
-    fun quickModeSkipsSearchForGeneralPromptsAndRunsForLiveQueries() {
+    fun quickModeUsesNativeSkippedAndReadyPreparationOutcomes() {
+        var preparationCallCount = 0
         var searchCallCount = 0
-        val fakeSearch = FakeSearchNative { _, cb ->
+        val fakeSearch = FakeSearchNative { requestJson, cb ->
+            preparationCallCount += 1
+            if (JSONObject(requestJson).getString("requestId") == "req-q1") {
+                return@FakeSearchNative """{"route":"F","statusCode":"skipped","evidenceContext":null,"sources":[]}"""
+            }
             searchCallCount += 1
             cb.onStatus("Searching")
             JSONObject()
@@ -408,6 +413,8 @@ class GeminiNanoProviderTest {
         val res1 = JSONObject(provider.respond("req-q1", "/auth", req1, cb1))
         assertEquals("complete", res1.getString("status"))
         assertEquals(0, searchCallCount)
+        assertEquals(1, preparationCallCount)
+        assertEquals("skipped", res1.getString("searchStatus"))
         assertTrue(cb1.statuses.isEmpty())
 
         // 2. Live/current query in quick mode -> runs web search
@@ -421,6 +428,7 @@ class GeminiNanoProviderTest {
         val res2 = JSONObject(provider.respond("req-q2", "/auth", req2, cb2))
         assertEquals("complete", res2.getString("status"))
         assertEquals(1, searchCallCount)
+        assertEquals(2, preparationCallCount)
         assertEquals(listOf("Searching"), cb2.statuses)
     }
 
@@ -722,35 +730,47 @@ class GeminiNanoProviderTest {
     }
 
     @Test
-    fun threeTurnConversationFoldsAnchorTopicForExtractPreviousUserQueryAndShouldRunWebSearch() {
-        val turn1 = "What are the specs of the Pixel 8?"
-        val turn2 = "What about its battery?"
-        val turn3 = "And what if it gets hot?"
-
+    fun preparedSearchForwardsLongRepeatedMultibyteHistoryUnchanged() {
+        val repeated = "🧪 合成の文脈 ".repeat(80)
         val messages = JSONArray()
-            .put(JSONObject().put("role", "user").put("content", turn1))
-            .put(JSONObject().put("role", "assistant").put("content", "The Pixel 8 has a Tensor G3 chip.\n\nSources:\nhttps://example.com/pixel8\n"))
-            .put(JSONObject().put("role", "user").put("content", "$turn2\n\nSources:\nhttps://example.com/pixel8\n"))
-            .put(JSONObject().put("role", "assistant").put("content", "It has a 4575 mAh battery."))
-            .put(JSONObject().put("role", "user").put("content", turn3))
-
+            .put(JSONObject().put("role", "user").put("content", "What are the specs of the Pixel 8?"))
+        repeat(5) {
+            messages.put(JSONObject().put("role", "assistant").put("content", "Synthetic reply $it"))
+            messages.put(JSONObject().put("role", "user").put("content", repeated))
+        }
+        messages.put(JSONObject().put("role", "user").put("content", "What is 14 * 15?"))
         val reqObj = JSONObject()
             .put("model", "gemini-nano")
             .put("messages", messages)
             .put("webEnabled", true)
             .put("searchMode", "quick")
-
-        val extractedQuery = PreparedSearchRoute.extractUserQuery(reqObj)
-        assertEquals(turn3, extractedQuery)
-
-        val prevUserQuery = PreparedSearchRoute.extractPreviousUserQuery(reqObj, extractedQuery)
-        assertEquals("$turn1 $turn2", prevUserQuery)
-        assertTrue(PreparedSearchRoute.shouldRunWebSearch(true, "quick", extractedQuery, prevUserQuery))
+        val originalRequest = reqObj.toString()
+        var calls = 0
+        val fakeSearch = FakeSearchNative { requestJson, _ ->
+            calls += 1
+            val forwarded = JSONObject(requestJson)
+            assertEquals(messages.toString(), forwarded.getJSONArray("messages").toString())
+            assertFalse(forwarded.has("prompt"))
+            assertEquals("req-history", forwarded.getString("requestId"))
+            assertTrue(forwarded.getBoolean("enforceQuickRouter"))
+            """{"evidenceContext":null,"sourceFooter":"","sources":[],"route":"S","statusCode":"empty"}"""
+        }
+        val result = PreparedSearchRoute.prepare("req-history", reqObj, fakeSearch, RecordingCallback()) { false }
+        assertEquals(1, calls)
+        assertEquals("S", result.route)
+        assertEquals("empty", result.searchStatus)
+        assertEquals(originalRequest, reqObj.toString())
     }
 
     @Test
     fun preparedSearchRouteReportsAccurate2dRouteCodeOnSkippedSearches() {
-        val fakeSearch = FakeSearchNative()
+        var calls = 0
+        val fakeSearch = FakeSearchNative { requestJson, _ ->
+            calls += 1
+            val route = if (JSONObject(requestJson).getString("requestId") == "req-route-c") "C" else "F"
+            JSONObject().put("route", route).put("statusCode", "skipped")
+                .put("evidenceContext", JSONObject.NULL).put("sources", JSONArray()).toString()
+        }
         val codingReq = JSONObject()
             .put("model", "gemini-nano")
             .put("prompt", "Why does this Rust ring buffer panic?")
@@ -768,5 +788,21 @@ class GeminiNanoProviderTest {
         val fastPrep = PreparedSearchRoute.prepare("req-route-f", fastReq, fakeSearch, RecordingCallback()) { false }
         assertEquals("F", fastPrep.route)
         assertEquals("skipped", fastPrep.searchStatus)
+        assertEquals(2, calls)
+    }
+
+    @Test
+    fun preparedSearchSkipsNativeForWebOffMissingAdapterAndCancellation() {
+        var calls = 0
+        val fakeSearch = FakeSearchNative { _, _ ->
+            calls += 1
+            error("Native preparation must not run")
+        }
+        val request = JSONObject().put("prompt", "Synthetic request").put("webEnabled", false)
+        assertEquals("skipped", PreparedSearchRoute.prepare("off", request, fakeSearch, RecordingCallback()) { false }.searchStatus)
+        request.put("webEnabled", true)
+        assertEquals("skipped", PreparedSearchRoute.prepare("absent", request, null, RecordingCallback()) { false }.searchStatus)
+        assertEquals("cancelled", PreparedSearchRoute.prepare("cancelled", request, fakeSearch, RecordingCallback()) { true }.searchStatus)
+        assertEquals(0, calls)
     }
 }

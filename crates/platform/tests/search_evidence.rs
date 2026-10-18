@@ -21,6 +21,22 @@ fn decode(operation: &Operation, value: &Value) -> ToolResult {
 }
 
 #[test]
+fn valid_empty_parallel_search_is_unavailable_without_partial_failure() {
+    let result = decode_result(
+        Provider::Parallel,
+        &search(3),
+        &json!({"structuredContent":{"results":[],"errors":[]}}),
+        "synthetic-run",
+        &mut 0,
+    )
+    .unwrap();
+    assert!(result.sources.is_empty());
+    assert!(result.evidence_unavailable);
+    assert!(!result.partial);
+    assert!(result.failures.is_empty());
+}
+
+#[test]
 fn documented_author_metadata_does_not_hide_a_single_search_record() {
     let result = decode(&search(1), &content(&["Title: Synthetic source\nURL: https://example.com/source\nPublished: N/A\nAuthor: N/A\nHighlights:\nSynthetic evidence"]));
     assert_eq!(result.sources.len(), 1);

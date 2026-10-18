@@ -187,32 +187,7 @@ impl RoleExt for CustomOpenAiRole {
 pub(super) fn fold_previous_user_turns<'a>(
     turns: impl IntoIterator<Item = &'a str>,
 ) -> Option<String> {
-    let cleaned: Vec<&str> = turns
-        .into_iter()
-        .map(|text| text.split("\n\nSources:\n").next().unwrap_or(text).trim())
-        .filter(|text| !text.is_empty())
-        .collect();
-    let window = if cleaned.len() > 3 {
-        &cleaned[cleaned.len() - 3..]
-    } else {
-        &cleaned[..]
-    };
-    match window {
-        [] => None,
-        [single] => Some(truncate_utf8(single, 200)),
-        [anchor, .., latest] => {
-            if anchor.eq_ignore_ascii_case(latest) {
-                Some(truncate_utf8(latest, 200))
-            } else {
-                let combined = format!(
-                    "{} {}",
-                    truncate_utf8(anchor, 100),
-                    truncate_utf8(latest, 100)
-                );
-                Some(truncate_utf8(&combined, 200))
-            }
-        }
-    }
+    voxgolem_core::router::fold_user_history(turns)
 }
 
 pub(super) fn previous_user_turn(history: &[CustomOpenAiHistoryTurn]) -> Option<String> {
@@ -678,6 +653,25 @@ mod tests {
             })
             .expect("bounded optional evidence must not discard the successful answer");
         voxgolem_core::agent_pipeline::validate_review_input(&input).unwrap();
+    }
+
+    #[test]
+    fn desktop_folding_preserves_root_after_many_followups() {
+        for root in [
+            "What is the current price of Synthetic Widget?",
+            "Can you tell me the current price of Synthetic Widget?",
+        ] {
+            let latest = "What about its fifth edition?";
+            let folded = fold_previous_user_turns([
+                root,
+                "What about its second edition?",
+                "What about its third edition?",
+                "What about its fourth edition?",
+                latest,
+            ])
+            .unwrap();
+            assert_eq!(folded, format!("{root} {latest}"));
+        }
     }
 
     #[test]

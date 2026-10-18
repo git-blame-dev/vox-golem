@@ -179,6 +179,13 @@ impl StreamableHttpClient for BoundedHttp {
             }
         }
         if !status.is_success() {
+            // Capacity failures remain transport failures even when a proxy or
+            // legacy endpoint wraps them in a conflicting JSON-RPC error.
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+                return Err(StreamableHttpError::UnexpectedServerResponse(
+                    format!("HTTP {}", status.as_u16()).into(),
+                ));
+            }
             let parsed = serde_json::from_slice::<ServerJsonRpcMessage>(&bytes)
                 .ok()
                 .filter(|message| matches!(message, ServerJsonRpcMessage::Error(_)));

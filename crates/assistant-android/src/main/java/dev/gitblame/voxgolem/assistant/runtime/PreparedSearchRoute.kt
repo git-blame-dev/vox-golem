@@ -25,50 +25,6 @@ internal object PreparedSearchRoute {
         return if (idx >= 0) text.substring(0, idx).trimEnd() else text
     }
 
-    fun extractUserQuery(reqObj: JSONObject): String {
-        val direct = reqObj.optString("prompt", "").trim()
-        if (direct.isNotEmpty()) return direct
-        val messages = reqObj.optJSONArray("messages") ?: return ""
-        for (i in messages.length() - 1 downTo 0) {
-            val msg = messages.optJSONObject(i) ?: continue
-            val role = msg.optString("role", "user").trim()
-            if (role.equals("user", ignoreCase = true)) {
-                val content = msg.optString("content", "").trim()
-                if (content.isNotEmpty()) return content
-            }
-        }
-        return ""
-    }
-
-    fun extractPreviousUserQuery(reqObj: JSONObject, currentQuery: String): String? {
-        val messages = reqObj.optJSONArray("messages") ?: return null
-        val trimmedCurrent = stripSourceFooter(currentQuery.trim()).trim()
-        val prior = mutableListOf<String>()
-        for (i in 0 until messages.length()) {
-            val msg = messages.optJSONObject(i) ?: continue
-            val role = msg.optString("role", "user").trim()
-            if (role.equals("user", ignoreCase = true)) {
-                val rawContent = msg.optString("content", "").trim()
-                val content = stripSourceFooter(rawContent).trim()
-                if (content.isNotEmpty()) {
-                    prior.add(content)
-                }
-            }
-        }
-        if (trimmedCurrent.isNotEmpty() && prior.lastOrNull() == trimmedCurrent) {
-            prior.removeAt(prior.lastIndex)
-        }
-        return when {
-            prior.isEmpty() -> null
-            prior.size == 1 -> prior[0]
-            else -> {
-                val window = prior.takeLast(3)
-                val combined = "${window.first()} ${window.last()}"
-                if (combined.length > 200) combined.substring(0, 200).trimEnd() else combined
-            }
-        }
-    }
-
     fun shouldRunWebSearch(
         webEnabled: Boolean,
         searchMode: String,
@@ -130,19 +86,8 @@ internal object PreparedSearchRoute {
             return PreparedSearchResult(null, "", false, searchStatus = if (isCancelled()) "cancelled" else "skipped")
         }
         val webEnabled = reqObj.optBoolean("webEnabled", reqObj.optBoolean("web_enabled", false))
-        val searchMode = reqObj.optString("searchMode", reqObj.optString("web_search_mode", "quick"))
-        val userQuery = extractUserQuery(reqObj)
-        val prevUserQuery = extractPreviousUserQuery(reqObj, userQuery)
-
-        if (!shouldRunWebSearch(webEnabled, searchMode, userQuery, prevUserQuery) || isCancelled()) {
-            val route = if (userQuery.isBlank()) "F" else runCatching { routePrompt2d(userQuery, prevUserQuery) }.getOrDefault("F")
-            return PreparedSearchResult(
-                null,
-                "",
-                false,
-                route = route,
-                searchStatus = if (isCancelled()) "cancelled" else "skipped",
-            )
+        if (!webEnabled) {
+            return PreparedSearchResult(null, "", false)
         }
 
         val prepareReq = JSONObject(reqObj.toString()).put("requestId", requestId).put("enforceQuickRouter", true)
