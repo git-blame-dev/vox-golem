@@ -19,7 +19,7 @@ fn record(operation: Operation) -> Record {
 }
 fn create() -> Record {
     record(Operation {
-        version: 1,
+        version: 2,
         id: id(A, 1),
         body: OperationBody::ConversationCreated {
             title: "Synthetic chat".into(),
@@ -33,9 +33,10 @@ fn turn(
     context: Vec<OperationId>,
 ) -> Record {
     record(Operation {
-        version: 1,
+        version: 2,
         id: id(replica, sequence),
         body: OperationBody::TurnCompleted {
+            sources: vec![],
             conversation: id(A, 1),
             parent,
             request: id(replica, sequence + 1000),
@@ -58,7 +59,7 @@ fn turn(
 }
 fn delete() -> Record {
     record(Operation {
-        version: 1,
+        version: 2,
         id: id(B, 99),
         body: OperationBody::ConversationDeleted {
             conversation: id(A, 1),
@@ -79,6 +80,79 @@ fn import(store: &Store, records: Vec<Record>) -> Store {
 }
 fn empty() -> Store {
     Store::restore(StoreSnapshot::empty()).unwrap()
+}
+
+#[test]
+fn summary_contains_only_graph_metadata_not_record_or_answer_bodies() {
+    let mut large = turn(A, 2, None, vec![]);
+    if let OperationBody::TurnCompleted { answer, .. } = &mut large.operation.body {
+        *answer = Answer::Text {
+            text: "Synthetic private answer marker ".repeat(7000),
+        };
+    }
+    let store = import(&empty(), vec![create(), large]);
+    let summary = store.summary();
+    assert_eq!(summary.revision, store.revision());
+    assert_eq!(summary.conversations, store.snapshot().conversations);
+    let encoded = serde_json::to_value(summary).unwrap();
+    assert!(encoded.get("records").is_none());
+    assert!(encoded.get("retired").is_none());
+    assert!(!encoded.to_string().contains("private answer marker"));
+    assert!(encoded.to_string().len() < 1024);
+}
+
+#[test]
+fn v2_sources_roundtrip_validate_and_count_against_context_and_turn_budgets() {
+    let mut sourced = turn(A, 2, None, vec![]);
+    let source = crate::sources::SourceLink {
+        url: "https://example.test/synthetic".into(),
+        title: "Synthetic source".into(),
+    };
+    if let OperationBody::TurnCompleted { sources, .. } = &mut sourced.operation.body {
+        sources.push(source.clone());
+    }
+    sourced.validate().unwrap();
+    let encoded = serde_json::to_string(&sourced).unwrap();
+    assert_eq!(serde_json::from_str::<Record>(&encoded).unwrap(), sourced);
+    let store = import(&empty(), vec![create(), sourced.clone()]);
+    assert_eq!(
+        Store::restore(store.export())
+            .unwrap()
+            .history(&id(A, 1), &id(A, 2))
+            .unwrap(),
+        vec![sourced.clone()]
+    );
+    assert!(sourced.operation.context_bytes() > sourced.operation.text_bytes());
+    for count in [2, 33] {
+        let mut invalid = sourced.clone();
+        if let OperationBody::TurnCompleted { sources, .. } = &mut invalid.operation.body {
+            *sources = vec![source.clone(); count];
+        }
+        assert!(invalid.validate().is_err());
+    }
+    let mut invalid = sourced.clone();
+    if let OperationBody::TurnCompleted { answer, .. } = &mut invalid.operation.body {
+        *answer = Answer::Refusal {
+            reason: "Synthetic refusal".into(),
+        };
+    }
+    assert!(invalid.validate().is_err());
+    let mut invalid = sourced.clone();
+    if let OperationBody::TurnCompleted { answer, prompt, .. } = &mut invalid.operation.body {
+        *answer = Answer::Text {
+            text: "x".repeat(MAX_TURN_TEXT_BYTES - prompt.len()),
+        };
+    }
+    assert!(invalid.validate().is_err());
+    let mut missing = serde_json::to_value(&sourced.operation).unwrap();
+    missing["body"].as_object_mut().unwrap().remove("sources");
+    assert!(serde_json::from_value::<Operation>(missing).is_err());
+    let mut legacy = StoreSnapshot::empty();
+    legacy.version = 1;
+    assert!(matches!(
+        Store::restore(legacy),
+        Err(DomainError::UnsupportedVersion { version: 1 })
+    ));
 }
 
 #[test]
@@ -493,7 +567,7 @@ fn delete_before_create_and_late_completion_never_resurrect_and_purge_text() {
 fn revision_plans_do_not_mutate_and_clear_is_atomic() {
     let store = import(&empty(), vec![create(), turn(A, 2, None, vec![])]);
     let new = record(Operation {
-        version: 1,
+        version: 2,
         id: id(B, 100),
         body: OperationBody::ConversationCreated {
             title: "Synthetic fresh".into(),
@@ -536,7 +610,7 @@ fn serde_rejects_unknown_fields_and_decimal_identifiers_are_strings() {
 #[test]
 fn wrong_conversation_and_disordered_context_are_rejected() {
     let other = record(Operation {
-        version: 1,
+        version: 2,
         id: id(B, 1),
         body: OperationBody::ConversationCreated {
             title: "Synthetic other".into(),
@@ -644,7 +718,7 @@ fn a_pinned_inflight_context_remains_valid_after_sync_and_stale_revision_does_no
 fn retired_parent_in_another_conversation_cannot_become_an_eternal_pending_record() {
     let deleted = import(&empty(), vec![create(), turn(A, 2, None, vec![]), delete()]);
     let other = record(Operation {
-        version: 1,
+        version: 2,
         id: id(B, 1),
         body: OperationBody::ConversationCreated {
             title: "Synthetic other".into(),
@@ -674,10 +748,10 @@ fn bounds_invalid_versions_identifiers_and_restore_corruption_are_rejected() {
         Err(DomainError::LimitExceeded { .. })
     ));
     let mut version = create();
-    version.operation.version = 2;
+    version.operation.version = 1;
     assert_eq!(
         version.validate(),
-        Err(DomainError::UnsupportedVersion { version: 2 })
+        Err(DomainError::UnsupportedVersion { version: 1 })
     );
     for sequence in ["0", "01", "-1", "18446744073709551616"] {
         assert!(OperationId {
@@ -755,7 +829,7 @@ fn every_small_import_order_converges_even_with_deletion_and_restarts() {
 #[test]
 fn canonical_operation_json_is_a_stable_body_key_input() {
     let json = serde_json::to_string(&create().operation).unwrap();
-    assert_eq!(json, concat!("{\"version\":1,\"id\":{\"replica\":\"00000000-0000-4000-8000-000000000001\",\"sequence\":\"1\"},",
+    assert_eq!(json, concat!("{\"version\":2,\"id\":{\"replica\":\"00000000-0000-4000-8000-000000000001\",\"sequence\":\"1\"},",
         "\"body\":{\"kind\":\"conversation_created\",\"title\":\"Synthetic chat\"}}"));
     let mut value = serde_json::to_value(turn(A, 2, None, vec![]).operation).unwrap();
     value["body"]["provenance"]["system_instruction"] =
@@ -764,9 +838,10 @@ fn canonical_operation_json_is_a_stable_body_key_input() {
     let refused = Record {
         body_key: key(5),
         operation: Operation {
-            version: 1,
+            version: 2,
             id: id(A, 5),
             body: OperationBody::TurnCompleted {
+                sources: vec![],
                 conversation: id(A, 1),
                 parent: None,
                 request: id(A, 1005),
@@ -829,7 +904,7 @@ fn formerly_pending_invalid_children_do_not_block_authentic_dependencies() {
         *conversation = id(B, 1);
     }
     let other_create = record(Operation {
-        version: 1,
+        version: 2,
         id: id(B, 1),
         body: OperationBody::ConversationCreated {
             title: "Synthetic other".into(),
@@ -838,7 +913,7 @@ fn formerly_pending_invalid_children_do_not_block_authentic_dependencies() {
     let parent_types = [
         (
             record(Operation {
-                version: 1,
+                version: 2,
                 id: parent_id.clone(),
                 body: OperationBody::ConversationCreated {
                     title: "Synthetic parent identity".into(),
@@ -1044,7 +1119,7 @@ fn quarantine_propagates_to_old_pending_descendants_but_not_valid_history() {
 }
 
 #[test]
-fn quarantine_restore_is_bounded_validated_and_old_v1_snapshots_default_to_empty() {
+fn quarantine_restore_is_bounded_validated_and_optional_v2_ledger_defaults_to_empty() {
     let mut old_json = serde_json::to_value(StoreSnapshot::empty()).unwrap();
     old_json.as_object_mut().unwrap().remove("quarantine");
     assert!(Store::restore(serde_json::from_value(old_json).unwrap())
@@ -1085,7 +1160,7 @@ fn quarantine_restore_is_bounded_validated_and_old_v1_snapshots_default_to_empty
 #[test]
 fn unknown_conversation_reference_cannot_poison_a_real_turn_of_that_identity() {
     let other_create = record(Operation {
-        version: 1,
+        version: 2,
         id: id(B, 1),
         body: OperationBody::ConversationCreated {
             title: "Synthetic other".into(),
@@ -1118,7 +1193,7 @@ fn unknown_conversation_reference_cannot_poison_a_real_turn_of_that_identity() {
 #[test]
 fn invalid_unknown_tombstone_is_dispositioned_without_retiring_the_authentic_turn() {
     let other = record(Operation {
-        version: 1,
+        version: 2,
         id: id(B, 1),
         body: OperationBody::ConversationCreated {
             title: "Synthetic real conversation".into(),
@@ -1151,7 +1226,7 @@ fn invalid_unknown_tombstone_is_dispositioned_without_retiring_the_authentic_tur
 fn a_quarantined_only_continuation_cannot_silently_become_empty_provider_context() {
     let pending = import(&empty(), vec![create(), turn(A, 3, Some(id(B, 2)), vec![])]);
     let authentic = record(Operation {
-        version: 1,
+        version: 2,
         id: id(B, 2),
         body: OperationBody::ConversationCreated {
             title: "Synthetic unrelated create".into(),
@@ -1173,7 +1248,7 @@ fn a_quarantined_only_continuation_cannot_silently_become_empty_provider_context
 #[test]
 fn exact_two_conversation_quarantine_survives_deletion_of_its_context_witness() {
     let other_create = record(Operation {
-        version: 1,
+        version: 2,
         id: id(B, 1),
         body: OperationBody::ConversationCreated {
             title: "Synthetic D".into(),
@@ -1186,7 +1261,7 @@ fn exact_two_conversation_quarantine_survives_deletion_of_its_context_witness() 
     }
     // Exact persisted state after authentic A2 resolved Q: B2 and A88 are still absent.
     let before_delete = Store::restore(StoreSnapshot {
-        version: 1,
+        version: 2,
         revision: "3".into(),
         records: vec![
             create(),
@@ -1246,7 +1321,7 @@ fn exact_two_conversation_quarantine_survives_deletion_of_its_context_witness() 
 fn known_context_conversation_and_type_are_validated_even_with_a_missing_parent() {
     let mut known_turn = turn(A, 3, None, vec![]);
     let other_create = record(Operation {
-        version: 1,
+        version: 2,
         id: id(B, 1),
         body: OperationBody::ConversationCreated {
             title: "Synthetic D".into(),
@@ -1301,7 +1376,7 @@ fn known_context_conversation_and_type_are_validated_even_with_a_missing_parent(
 #[test]
 fn two_conversation_witness_deletion_is_restorable_at_every_public_plan_boundary() {
     let other_create = record(Operation {
-        version: 1,
+        version: 2,
         id: id(B, 1),
         body: OperationBody::ConversationCreated {
             title: "Synthetic D".into(),

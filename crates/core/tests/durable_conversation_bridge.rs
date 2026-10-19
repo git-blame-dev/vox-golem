@@ -8,8 +8,8 @@ use voxgolem_core::durable_conversation::{
 };
 
 // Synthetic keys represent keys independently computed by the trusted native adapter.
-const CREATE_JSON: &str = r#"{"version":1,"id":{"replica":"00000000-0000-4000-8000-000000000001","sequence":"1"},"body":{"kind":"conversation_created","title":"Synthetic bridge chat"}}"#;
-const TURN_JSON: &str = r#"{"version":1,"id":{"replica":"00000000-0000-4000-8000-000000000001","sequence":"3"},"body":{"kind":"turn_completed","conversation":{"replica":"00000000-0000-4000-8000-000000000001","sequence":"1"},"parent":null,"request":{"replica":"00000000-0000-4000-8000-000000000001","sequence":"2"},"prompt":"Synthetic bridge question","answer":{"kind":"text","text":"Synthetic bridge answer"},"terminal_stage":"instant","provenance":{"requested_model":"synthetic-model","returned_model":null,"policy_id":"synthetic-policy","policy_version":"1","instruction_profile_id":"synthetic-profile","instruction_profile_version":"1","context":[]}}}"#;
+const CREATE_JSON: &str = r#"{"version":2,"id":{"replica":"00000000-0000-4000-8000-000000000001","sequence":"1"},"body":{"kind":"conversation_created","title":"Synthetic bridge chat"}}"#;
+const TURN_JSON: &str = r#"{"version":2,"id":{"replica":"00000000-0000-4000-8000-000000000001","sequence":"3"},"body":{"kind":"turn_completed","conversation":{"replica":"00000000-0000-4000-8000-000000000001","sequence":"1"},"parent":null,"request":{"replica":"00000000-0000-4000-8000-000000000001","sequence":"2"},"prompt":"Synthetic bridge question","answer":{"kind":"text","text":"Synthetic bridge answer"},"sources":[],"terminal_stage":"instant","provenance":{"requested_model":"synthetic-model","returned_model":null,"policy_id":"synthetic-policy","policy_version":"1","instruction_profile_id":"synthetic-profile","instruction_profile_version":"1","context":[]}}}"#;
 
 fn normalized_record(json: &str, n: u64) -> Record {
     let operation: Operation = serde_json::from_str(json).unwrap();

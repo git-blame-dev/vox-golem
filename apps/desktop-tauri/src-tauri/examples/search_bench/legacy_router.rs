@@ -1,14 +1,16 @@
 #![forbid(unsafe_code)]
+#![allow(dead_code)] // Preserve historical research helpers and their pure unit tests.
 
+//! Historical research benchmark, not product routing policy.
 //! 2D Intent Router: classifies incoming turns into one of 4 routes:
 //! - DirectFast (F): low complexity, no external evidence needed.
 //! - SearchFast (S): low complexity, needs single-round search lookup.
 //! - DirectSmart (C): high complexity (coding, math, reasoning), no external evidence.
 //! - ResearchSmart (R): high complexity, needs deep multi-step search/evidence.
 
-use crate::router_weights::{BGE_SMALL_EMBEDDING_DIM, BGE_SMALL_EN_V15_RIDGE_W};
-use crate::search::{has_readable_text, truncate_utf8, Mode, Source};
+use super::legacy_router_weights::{BGE_SMALL_EMBEDDING_DIM, BGE_SMALL_EN_V15_RIDGE_W};
 use serde::{Deserialize, Serialize};
+use voxgolem_core::search::{has_readable_text, truncate_utf8, Source};
 
 pub const PARALLEL_MARGIN_THRESHOLD: f32 = 0.14;
 pub const CANONICAL_SUPPLIED_TEXT_INTENT: &str =
@@ -48,18 +50,6 @@ impl Route2D {
     pub fn needs_smart(self) -> bool {
         matches!(self, Self::DirectSmart | Self::ResearchSmart)
     }
-
-    pub fn effective_search_mode(self, requested: Mode) -> Option<Mode> {
-        if requested != Mode::Quick {
-            Some(requested)
-        } else {
-            match self {
-                Self::DirectFast | Self::DirectSmart => None,
-                Self::SearchFast => Some(Mode::Quick),
-                Self::ResearchSmart => Some(Mode::Research),
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -72,12 +62,6 @@ pub struct RoutingDecision {
 }
 
 impl RoutingDecision {
-    pub fn needs_presearch(&self, mode: Mode, enforce_quick_router: bool) -> bool {
-        mode != Mode::Quick
-            || self.needs_search()
-            || (!enforce_quick_router && self.normalized_input != CANONICAL_SUPPLIED_TEXT_INTENT)
-    }
-
     pub fn needs_search(&self) -> bool {
         self.primary.needs_search()
     }
@@ -1214,7 +1198,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn route2d_helpers_and_effective_search_mode() {
+    fn parked_route2d_label_helpers() {
         assert_eq!(Route2D::DirectFast.code(), "F");
         assert_eq!(Route2D::SearchFast.code(), "S");
         assert_eq!(Route2D::DirectSmart.code(), "C");
@@ -1229,31 +1213,6 @@ mod tests {
         assert!(!Route2D::SearchFast.needs_smart());
         assert!(Route2D::DirectSmart.needs_smart());
         assert!(Route2D::ResearchSmart.needs_smart());
-
-        // When requested is not Quick (e.g., Verify or Research), preserve requested mode
-        assert_eq!(
-            Route2D::DirectFast.effective_search_mode(Mode::Verify),
-            Some(Mode::Verify)
-        );
-        assert_eq!(
-            Route2D::SearchFast.effective_search_mode(Mode::Research),
-            Some(Mode::Research)
-        );
-
-        // When requested is Quick:
-        assert_eq!(Route2D::DirectFast.effective_search_mode(Mode::Quick), None);
-        assert_eq!(
-            Route2D::DirectSmart.effective_search_mode(Mode::Quick),
-            None
-        );
-        assert_eq!(
-            Route2D::SearchFast.effective_search_mode(Mode::Quick),
-            Some(Mode::Quick)
-        );
-        assert_eq!(
-            Route2D::ResearchSmart.effective_search_mode(Mode::Quick),
-            Some(Mode::Research)
-        );
     }
 
     #[test]
@@ -1568,8 +1527,8 @@ mod tests {
                 id: "test".into(),
                 url: "https://example.com".into(),
                 title: "Test".into(),
-                provider: crate::search::Provider::Parallel,
-                kind: crate::search::EvidenceKind::SearchExcerpt,
+                provider: voxgolem_core::search::Provider::Parallel,
+                kind: voxgolem_core::search::EvidenceKind::SearchExcerpt,
                 text: text.into(),
                 retrieved_unix_ms: 0,
                 publisher_date: None,

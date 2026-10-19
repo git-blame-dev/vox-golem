@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub const MAX_TEXT_BYTES: usize = 128 * 1024;
-pub const MAX_SOURCES: usize = 32;
+pub use crate::sources::{SourceLink as Source, MAX_SOURCES};
 pub const MAX_REVIEW_PROMPT_BYTES: usize = 512 * 1024;
 pub const MAX_HISTORY_ENTRIES: usize = 128;
 
@@ -14,13 +14,6 @@ pub const MAX_HISTORY_ENTRIES: usize = 128;
 pub struct HistoryEntry {
     pub role: String,
     pub content: Content,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Source {
-    pub url: String,
-    pub title: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,54 +201,7 @@ pub fn validate_deep_report(report: &DeepReport) -> Result<(), ContractError> {
 }
 
 fn validate_source(source: &Source) -> Result<(), ContractError> {
-    let url = source.url.as_bytes();
-    let remainder = source
-        .url
-        .strip_prefix("https://")
-        .or_else(|| source.url.strip_prefix("http://"))
-        .unwrap_or_default();
-    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
-    let authority = &remainder[..authority_end];
-    if url.is_empty()
-        || url.len() > 2048
-        || source.title.trim().is_empty()
-        || source.title.len() > 512
-        || authority.is_empty()
-        || authority.contains('@')
-        || source.url.chars().any(|c| c.is_whitespace())
-        || !valid_http_authority(authority)
-    {
-        return Err(ContractError("invalid source provenance".into()));
-    }
-    Ok(())
-}
-
-fn valid_http_authority(authority: &str) -> bool {
-    if let Some(ipv6) = authority.strip_prefix('[') {
-        let Some((host, port)) = ipv6.split_once(']') else {
-            return false;
-        };
-        return host.parse::<std::net::Ipv6Addr>().is_ok() && valid_optional_port(port);
-    }
-    let (host, port) = authority
-        .rsplit_once(':')
-        .map_or((authority, ""), |(host, port)| (host, port));
-    !host.is_empty()
-        && host.split('.').all(|label| {
-            !label.is_empty()
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-        })
-        && (port.is_empty() || valid_port(port))
-}
-
-fn valid_optional_port(port: &str) -> bool {
-    port.is_empty() || port.strip_prefix(':').is_some_and(valid_port)
-}
-
-fn valid_port(port: &str) -> bool {
-    port.parse::<u16>().is_ok_and(|port| port != 0)
+    crate::sources::validate_source(source).map_err(|error| ContractError(error.to_string()))
 }
 
 #[derive(Deserialize)]

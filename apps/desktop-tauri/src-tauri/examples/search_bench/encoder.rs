@@ -1,4 +1,5 @@
 //! PC-only benchmark adapter; neither input variant changes production routing.
+use super::legacy_router::{classify_bge_small_embedding, normalize_for_routing, Route2D};
 use super::BenchArgs;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -7,7 +8,6 @@ use std::{
     path::{Path, PathBuf},
     time::Instant,
 };
-use voxgolem_core::router::{classify_bge_small_embedding, normalize_for_routing, Route2D};
 use voxgolem_platform::{
     inference::InferencePolicy,
     llama_cpp::{

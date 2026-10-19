@@ -390,3 +390,4 @@ pub const BGE_SMALL_EN_V15_RIDGE_W: [[f32; 4]; BGE_SMALL_EMBEDDING_DIM] = [
     [0.25602394, 0.07219052, -0.04740468, -0.29938263],
     [-0.24294260, 0.09353698, 0.16736084, 0.02943307],
 ];
+// Historical research weights owned only by the private search benchmark.

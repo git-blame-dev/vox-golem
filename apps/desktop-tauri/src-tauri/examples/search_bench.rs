@@ -1,25 +1,25 @@
 use serde::Deserialize;
 #[path = "search_bench/encoder.rs"]
 mod encoder;
+#[path = "search_bench/legacy_router.rs"]
+mod legacy_router;
+#[path = "search_bench/legacy_router_weights.rs"]
+mod legacy_router_weights;
+use legacy_router::{classify_prompt_2d, normalize_for_routing, Route2D};
 use serde_json::{json, Value};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant as StdInstant};
 use tokio::sync::Mutex;
 use tokio::time::Instant;
-use voxgolem_core::router::{
-    check_search_snippets_sufficiency, classify_prompt_2d, fold_user_history,
-    normalize_for_routing, Route2D, SnippetSufficiency, CANONICAL_SUPPLIED_TEXT_INTENT,
-};
-use voxgolem_core::search::{EvidenceKind, Failure, Mode, Provider};
+use voxgolem_core::search::{EvidenceKind, Failure, Provider};
 use voxgolem_platform::custom_openai::tools::ModelEvent;
 use voxgolem_platform::custom_openai::{
     CustomOpenAiClient, CustomOpenAiConfig, CustomOpenAiContentType, CustomOpenAiError,
     CustomOpenAiMessage, CustomOpenAiModel, CustomOpenAiPrompt, CustomOpenAiRole,
 };
 use voxgolem_platform::search::{
-    admit_web, prepare_round_zero_search_with_events, prewarm_web, run_with_client_events,
-    RunContext, RunError, RunEvent, WebPrewarmGate,
+    admit_web, prewarm_web, run_with_client_events, RunContext, RunError, RunEvent, WebPrewarmGate,
 };
 use voxgolem_platform::search_control::Cancellation;
 use voxgolem_platform::web::{
@@ -98,9 +98,6 @@ impl ScenarioRow {
 #[derive(Default)]
 struct DeterministicTransport {
     mode: DeterministicScenarioMode,
-    exa_calls: usize,
-    parallel_calls: usize,
-    fetch_calls: usize,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -136,15 +133,17 @@ impl WebTransport for DeterministicTransport {
         _deadline: Instant,
         _cancel: &Cancellation,
     ) -> Result<Value, ProviderFailure> {
-        if operation.fetch() {
-            self.fetch_calls += 1;
-        } else if provider == Provider::Exa {
-            self.exa_calls += 1;
-        } else {
-            self.parallel_calls += 1;
+        if let Operation::Search {
+            objective, queries, ..
+        } = operation
+        {
+            assert_eq!(queries, std::slice::from_ref(objective));
         }
 
         match (self.mode, provider, operation) {
+            (DeterministicScenarioMode::ExaRichSnippets, _, Operation::Fetch { .. }) => {
+                Ok(json!({"content": []}))
+            }
             (
                 DeterministicScenarioMode::ExaUntitledWeather,
                 Provider::Exa,
@@ -222,7 +221,7 @@ impl WebTransport for DeterministicTransport {
             ) => Ok(json!({
                 "content": [{
                     "type": "text",
-                    "text": "# Apple 2026 Quarterly Dividend Official Release\nURL: https://example.com/apple-dividend\nPublished: 2026-02-18\nAuthor: Synthetic Investor Relations\n\nSynthetic fixture: Apple declared a quarterly cash dividend of USD 0.74 per share payable on 2026-03-27."
+                    "text": "Title: Apple 2026 Quarterly Dividend Official Release\nURL: https://example.com/apple-dividend\nPublished: 2026-02-18\nAuthor: Synthetic IR Team\nText:\nSynthetic fixture: Apple declared a quarterly dividend of USD 0.74 per share."
                 }]
             })),
             (
@@ -422,475 +421,171 @@ fn verify_router_132_cases(cases_path: &Path) -> Result<(usize, f64), Box<dyn Er
 
 async fn run_deterministic_suite(cases_path: &Path) -> Result<Vec<ScenarioRow>, Box<dyn Error>> {
     let (case_count, avg_us) = verify_router_132_cases(cases_path)?;
-    let mut rows = Vec::with_capacity(14);
+    let mut rows = Vec::new();
     rows.push(ScenarioRow {
         id: "00_router_132_suite",
-        codepath: "core::router",
+        codepath: "search_bench::legacy_router",
         route: "F/S/C/R".to_string(),
         elapsed_ms: (avg_us * (case_count as f64)) / 1000.0,
         status: (case_count == 132).into(),
-        detail: format!("{case_count}/132 normalizer parity verified ({avg_us:.2} us/case)"),
+        detail: format!("parked legacy research: {case_count}/132 normalizer parity ({avg_us:.2} us/case); not production route or quality acceptance"),
     });
 
-    // 1. DirectFast skips search in Quick mode
-    {
-        let t0 = StdInstant::now();
-        let prompt = "What is 14 * 15?";
-        let decision = classify_prompt_2d(prompt, None, None);
-        let mut service = WebService::new(DeterministicTransport::default());
+    // Component timings use synthetic transport responses, not model routing or live latency.
+    let search = Operation::Search {
+        objective: "Synthetic component query".into(),
+        queries: vec!["Synthetic component query".into()],
+        limit: 3,
+    };
+    for (id, mode) in [
+        (
+            "title_url_fallback",
+            DeterministicScenarioMode::ExaUntitledWeather,
+        ),
+        (
+            "internal_hr_records",
+            DeterministicScenarioMode::ExaMultiRecordInternalHr,
+        ),
+        (
+            "empty_fetch_gap",
+            DeterministicScenarioMode::ExaRichSnippets,
+        ),
+        (
+            "published_page_read",
+            DeterministicScenarioMode::ExaThinSnippetsAndPublishedFetch,
+        ),
+        (
+            "soft_ratelimit_fallback",
+            DeterministicScenarioMode::ExaSoftRateLimitToParallel,
+        ),
+        (
+            "prewarm_deadline_no_cooldown",
+            DeterministicScenarioMode::PrewarmDeadline,
+        ),
+    ] {
+        let started = StdInstant::now();
+        let mut service = WebService::new(DeterministicTransport { mode });
         let cancel = Cancellation::default();
-        let out = prepare_round_zero_search_with_events(
-            &mut service,
-            "conv-f",
-            "req-f",
-            prompt,
-            None,
-            Mode::Quick,
-            true,
-            true,
-            Instant::now() + Duration::from_secs(5),
-            &cancel,
-            |_| Ok(()),
-        )
-        .await
-        .expect("DirectFast succeeds");
-        let passed = decision.primary == Route2D::DirectFast
-            && !decision.needs_search()
-            && out.sources.is_empty()
-            && out.provider_used.is_none();
-        rows.push(ScenarioRow {
-            id: "01_direct_fast_skip",
-            codepath: "core + round_zero",
-            route: decision.primary.code().to_string(),
-            elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
-            status: passed.into(),
-            detail: format!("needs_search={} sources=0", decision.needs_search()),
-        });
-    }
-
-    // 2. DirectSmart skips Round-0 search, reports "C" (not "F"), and preserves background prewarm
-    {
-        let t0 = StdInstant::now();
-        let prompt = "Why does a Rust Vec reallocation invalidate raw pointers?";
-        let decision = classify_prompt_2d(prompt, None, None);
-        let gate = WebPrewarmGate::default();
-        let mut service = WebService::new(DeterministicTransport::default());
-        let cancel = Cancellation::default();
-        let out = prepare_round_zero_search_with_events(
-            &mut service,
-            "conv-c",
-            "req-c",
-            prompt,
-            None,
-            Mode::Quick,
-            true,
-            true,
-            Instant::now() + Duration::from_secs(5),
-            &cancel,
-            |_| Ok(()),
-        )
-        .await
-        .expect("DirectSmart succeeds");
-        let passed = decision.primary == Route2D::DirectSmart
-            && decision.primary.code() == "C"
-            && out.routing.primary == Route2D::DirectSmart
-            && out.sources.is_empty()
-            && !gate.is_prewarming();
-        rows.push(ScenarioRow {
-            id: "02_direct_smart_route_c",
-            codepath: "core + round_zero",
-            route: out.routing.primary.code().to_string(),
-            elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
-            status: passed.into(),
-            detail: format!(
-                "route={} needs_search={}",
-                out.routing.primary.code(),
-                out.routing.needs_search()
-            ),
-        });
-    }
-
-    // 3. Supplied-text payload guard
-    {
-        let t0 = StdInstant::now();
-        let prompt = "Fix the typos in this sentence: What is the weather in Tokyo today in 2026?";
-        let decision = classify_prompt_2d(prompt, None, None);
-        let passed = decision.normalized_input == CANONICAL_SUPPLIED_TEXT_INTENT
-            && decision.primary == Route2D::DirectFast
-            && !decision.needs_search();
-        rows.push(ScenarioRow {
-            id: "03_supplied_text_guard",
-            codepath: "core::router",
-            route: decision.primary.code().to_string(),
-            elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
-            status: passed.into(),
-            detail: "masked temporal/weather tokens inside colon-supplied text".to_string(),
-        });
-    }
-
-    // 4. SearchFast with Exa "Title: N/A" fallback to URL
-    {
-        let t0 = StdInstant::now();
-        let mut service = WebService::new(DeterministicTransport {
-            mode: DeterministicScenarioMode::ExaUntitledWeather,
-            ..Default::default()
-        });
-        let cancel = Cancellation::default();
-        let out = prepare_round_zero_search_with_events(
-            &mut service,
-            "conv-s",
-            "req-s",
-            "What is the current weather temperature in New York City today?",
-            None,
-            Mode::Quick,
-            true,
-            true,
-            Instant::now() + Duration::from_secs(5),
-            &cancel,
-            |_| Ok(()),
-        )
-        .await
-        .expect("SearchFast succeeds");
-        let first_title = out.sources.first().map(|s| s.title.as_str()).unwrap_or("");
-        let passed = out.routing.primary == Route2D::SearchFast
-            && out.sources.len() == 1
-            && first_title == "https://tgftp.nws.noaa.gov/weather/current/KJFK.html"
-            && !out.source_footer.contains("[N/A]");
-        rows.push(ScenarioRow {
-            id: "04_search_fast_title_na",
-            codepath: "platform::round_zero",
-            route: out.routing.primary.code().to_string(),
-            elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
-            status: passed.into(),
-            detail: format!("sources={} title={first_title}", out.sources.len()),
-        });
-    }
-
-    // 5. Exa v3.5.0 multi-result block with internal Markdown `---` divider inside Highlights
-    {
-        let t0 = StdInstant::now();
-        let mut service = WebService::new(DeterministicTransport {
-            mode: DeterministicScenarioMode::ExaMultiRecordInternalHr,
-            ..Default::default()
-        });
-        let cancel = Cancellation::default();
-        let out = prepare_round_zero_search_with_events(
-            &mut service,
-            "conv-hr",
-            "req-hr",
-            "What are the specs of the Pixel 8?",
-            None,
-            Mode::Quick,
-            true,
-            true,
-            Instant::now() + Duration::from_secs(5),
-            &cancel,
-            |_| Ok(()),
-        )
-        .await
-        .expect("multi-record parse succeeds");
-        let passed = out.sources.len() == 3 && !out.partial && out.evidence_context.is_some();
-        rows.push(ScenarioRow {
-            id: "05_exa_internal_hr_split",
-            codepath: "web::evidence",
-            route: out.routing.primary.code().to_string(),
-            elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
-            status: passed.into(),
-            detail: format!("sources={} partial={}", out.sources.len(), out.partial),
-        });
-    }
-
-    // 6. 2-turn elliptical follow-up
-    {
-        let t0 = StdInstant::now();
-        let prev = "What are the specs of the Pixel 8?";
-        let cur = "What about the battery capacity and charging speed?";
-        let decision = classify_prompt_2d(cur, Some(prev), None);
-        let passed = decision.needs_search() && decision.normalized_input.contains("Pixel 8");
-        rows.push(ScenarioRow {
-            id: "06_two_turn_followup",
-            codepath: "core::router",
-            route: decision.primary.code().to_string(),
-            elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
-            status: passed.into(),
-            detail: format!("norm={:?}", decision.normalized_input),
-        });
-    }
-
-    // 7. 3-turn deep follow-up preserving Turn 1 root topic via fold_user_history
-    {
-        let t0 = StdInstant::now();
-        let t1 = "In Magic: The Gathering, how does Urza's Saga work?";
-        let t2 = "What about its second ability?";
-        let t3 = "Does the token keep its ability if the land is destroyed?";
-        let folded = fold_user_history([t1, t2]).unwrap_or_default();
-        let decision = classify_prompt_2d(t3, Some(&folded), None);
-        let mut service = WebService::new(DeterministicTransport::default());
-        let cancel = Cancellation::default();
-        let out = prepare_round_zero_search_with_events(
-            &mut service,
-            "conv-3turn",
-            "req-3turn",
-            t3,
-            Some(&folded),
-            Mode::Quick,
-            true,
-            true,
-            Instant::now() + Duration::from_secs(5),
-            &cancel,
-            |_| Ok(()),
-        )
-        .await
-        .expect("3-turn search succeeds");
-        let passed = folded.contains("Urza's Saga")
-            && decision.needs_search()
-            && decision.normalized_input.contains("Urza's Saga")
-            && !out.sources.is_empty();
-        rows.push(ScenarioRow {
-            id: "07_three_turn_root_fold",
-            codepath: "core::fold_user_history",
-            route: decision.primary.code().to_string(),
-            elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
-            status: passed.into(),
-            detail: format!("folded={folded:?}"),
-        });
-    }
-
-    // 8. ResearchSmart skips redundant web_fetch in Mode::Quick when snippets >= 1,600 bytes
-    {
-        let t0 = StdInstant::now();
-        let mut service = WebService::new(DeterministicTransport {
-            mode: DeterministicScenarioMode::ExaRichSnippets,
-            ..Default::default()
-        });
-        let cancel = Cancellation::default();
-        let mut saw_fetch_event = false;
-        let out = prepare_round_zero_search_with_events(
-            &mut service,
-            "conv-rich",
-            "req-rich",
-            "Compare and contrast Tokio and async-std with a deep dive into their schedulers",
-            None,
-            Mode::Quick,
-            true,
-            true,
-            Instant::now() + Duration::from_secs(5),
-            &cancel,
-            |ev| {
-                if matches!(
-                    ev,
-                    RunEvent::ToolStarted {
-                        name: "web_fetch",
-                        ..
-                    }
-                ) {
-                    saw_fetch_event = true;
+        if matches!(mode, DeterministicScenarioMode::PrewarmDeadline) {
+            service
+                .prewarm_all(Instant::now() + Duration::from_secs(1), &cancel)
+                .await;
+        }
+        let out = service
+            .execute(
+                &search,
+                "synthetic-component",
+                id,
+                Instant::now() + Duration::from_secs(5),
+                &cancel,
+            )
+            .await
+            .map_err(|_| "synthetic Search failed")?;
+        let passed = match mode {
+            DeterministicScenarioMode::ExaUntitledWeather => {
+                out.sources.len() == 1 && out.sources[0].title == out.sources[0].url
+            }
+            DeterministicScenarioMode::ExaMultiRecordInternalHr => {
+                out.sources.len() == 3
+                    && out
+                        .sources
+                        .iter()
+                        .all(|s| s.kind == EvidenceKind::SearchExcerpt)
+            }
+            DeterministicScenarioMode::ExaRichSnippets
+            | DeterministicScenarioMode::ExaThinSnippetsAndPublishedFetch => {
+                let fetch = Operation::Fetch {
+                    urls: vec![out.sources[0].url.clone()],
+                    focus: "Synthetic payout details".into(),
+                };
+                let fetched = service
+                    .execute(
+                        &fetch,
+                        "synthetic-component",
+                        id,
+                        Instant::now() + Duration::from_secs(5),
+                        &cancel,
+                    )
+                    .await;
+                if matches!(mode, DeterministicScenarioMode::ExaRichSnippets) {
+                    // The empty SDK payload is invalid evidence, including after
+                    // fallback; do not disguise a typed failure as a readable page.
+                    matches!(fetched, Err(Failure::InvalidUpstream))
+                } else {
+                    fetched
+                        .map_err(|_| "synthetic Fetch failed")?
+                        .sources
+                        .iter()
+                        .any(|s| {
+                            s.kind == EvidenceKind::PageRead
+                                && s.title == "Apple 2026 Quarterly Dividend Official Release"
+                                && s.url == "https://example.com/apple-dividend"
+                                && s.text.contains("USD 0.74")
+                        })
                 }
-                Ok(())
-            },
-        )
-        .await
-        .expect("rich ResearchSmart succeeds");
-        let passed = out.routing.primary == Route2D::ResearchSmart
-            && !out.needs_escalation
-            && !saw_fetch_event
-            && out
-                .sources
-                .iter()
-                .all(|s| s.kind == EvidenceKind::SearchExcerpt);
-        rows.push(ScenarioRow {
-            id: "08_research_rich_skip_fetch",
-            codepath: "platform::round_zero",
-            route: out.routing.primary.code().to_string(),
-            elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
-            status: passed.into(),
-            detail: format!("saw_fetch={saw_fetch_event} sources={}", out.sources.len()),
-        });
-    }
-
-    // 9. Escalation runs web_fetch, parses Published:/Author: header, and orders PageRead first
-    {
-        let t0 = StdInstant::now();
-        let mut service = WebService::new(DeterministicTransport {
-            mode: DeterministicScenarioMode::ExaThinSnippetsAndPublishedFetch,
-            ..Default::default()
-        });
-        let cancel = Cancellation::default();
-        let out = prepare_round_zero_search_with_events(
-            &mut service,
-            "conv-fetch",
-            "req-fetch",
-            "How much is the 2026 Apple quarterly dividend per share?",
-            None,
-            Mode::Quick,
-            true,
-            true,
-            Instant::now() + Duration::from_secs(5),
-            &cancel,
-            |_| Ok(()),
-        )
-        .await
-        .expect("escalated fetch succeeds");
-        let ctx = out.evidence_context.unwrap_or_default();
-        let page_read_first = ctx.starts_with("[1] Apple 2026 Quarterly Dividend Official Release");
-        let passed = !out.needs_escalation
-            && out.sources.iter().any(|s| s.kind == EvidenceKind::PageRead)
-            && page_read_first
-            && ctx.contains("USD 0.74 per share");
-        rows.push(ScenarioRow {
-            id: "09_fetch_published_pageread_first",
-            codepath: "platform + evidence",
-            route: out.routing.primary.code().to_string(),
-            elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
-            status: passed.into(),
-            detail: format!(
-                "post_fetch_escalate={} page_read_first={page_read_first}",
-                out.needs_escalation
-            ),
-        });
-    }
-
-    // 10. Exa HTTP-200 soft rate limit -> no raw_text pollution + automatic Parallel fallback
-    {
-        let t0 = StdInstant::now();
-        let op = Operation::Search {
-            objective: "Federal Reserve federal funds target range".to_string(),
-            queries: vec!["Federal Reserve federal funds target range".to_string()],
-            limit: 3,
+            }
+            DeterministicScenarioMode::ExaSoftRateLimitToParallel => {
+                out.fallback_used
+                    && out.sources.iter().any(|s| s.provider == Provider::Parallel)
+                    && out.raw_text.is_none()
+            }
+            DeterministicScenarioMode::PrewarmDeadline => {
+                !out.fallback_used && out.sources.iter().all(|s| s.provider == Provider::Exa)
+            }
+            _ => false,
         };
-        let mut next_id = 1usize;
-        let decoded = decode_result(
-            Provider::Exa,
-            &op,
-            &json!({
-                "content": [{
-                    "type": "text",
-                    "text": "You've hit Exa's free MCP rate limit."
-                }]
-            }),
-            "call-rl",
-            &mut next_id,
-        )
-        .expect("decode soft rate limit");
-        let mut service = WebService::new(DeterministicTransport {
-            mode: DeterministicScenarioMode::ExaSoftRateLimitToParallel,
-            ..Default::default()
+        rows.push(ScenarioRow {
+            id,
+            codepath: "web::execute",
+            route: "component/mock".into(),
+            elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+            status: passed.into(),
+            detail:
+                "Synthetic Search/Fetch operations; no model/tool-selection or live-latency claim"
+                    .into(),
         });
-        let cancel = Cancellation::default();
-        let out = prepare_round_zero_search_with_events(
-            &mut service,
-            "conv-rl",
-            "req-rl",
-            "What is the current Federal Reserve federal funds target range in the United States today?",
-            None,
-            Mode::Quick,
-            true,
-            true,
-            Instant::now() + Duration::from_secs(5),
-            &cancel,
-            |_| Ok(()),
-        )
-        .await
-        .expect("fallback to Parallel succeeds");
-        let passed = decoded.raw_text.is_none()
+    }
+    // Decode soft failures without turning provider error text into evidence.
+    let mut next_id = 1;
+    let decoded = decode_result(
+        Provider::Exa,
+        &search,
+        &json!({"content":[{"type":"text","text":"You've hit Exa's free MCP rate limit."}]}),
+        "synthetic-rate-limit",
+        &mut next_id,
+    )
+    .map_err(|_| "synthetic soft-failure decode failed")?;
+    rows.push(ScenarioRow {
+        id: "soft_failure_decode",
+        codepath: "web::decode_result",
+        route: "component/mock".into(),
+        elapsed_ms: f64::NAN,
+        status: (decoded.raw_text.is_none()
             && decoded
                 .failures
                 .iter()
-                .any(|f| f.failure == Failure::RateLimited)
-            && out.fallback_used
-            && out.provider_used == Some("parallel")
-            && out.sources.len() == 1;
-        rows.push(ScenarioRow {
-            id: "10_exa_soft_ratelimit_fallback",
-            codepath: "web::execute",
-            route: out.routing.primary.code().to_string(),
-            elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
-            status: passed.into(),
-            detail: format!(
-                "raw_text_none={} fallback={} provider={:?}",
-                decoded.raw_text.is_none(),
-                out.fallback_used,
-                out.provider_used
-            ),
-        });
-    }
+                .any(|f| f.failure == Failure::RateLimited))
+        .into(),
+        detail: "Provider soft failure is not evidence; latency not measured".into(),
+    });
 
-    // 11. Prewarm Failure::Deadline does not place providers into cooldown
-    {
-        let t0 = StdInstant::now();
-        let mut service = WebService::new(DeterministicTransport {
-            mode: DeterministicScenarioMode::PrewarmDeadline,
-            ..Default::default()
-        });
+    for (id, cancelled) in [
+        ("expired_operation_deadline", false),
+        ("cancelled_operation", true),
+    ] {
+        let mut service = WebService::new(DeterministicTransport::default());
         let cancel = Cancellation::default();
-        service
-            .prewarm_all(Instant::now() + Duration::from_secs(1), &cancel)
+        if cancelled {
+            cancel.cancel();
+        }
+        let result = service
+            .execute(&search, "synthetic-component", id, Instant::now(), &cancel)
             .await;
-        let out = prepare_round_zero_search_with_events(
-            &mut service,
-            "conv-pw",
-            "req-pw",
-            "What is the current weather temperature in New York City today?",
-            None,
-            Mode::Quick,
-            true,
-            true,
-            Instant::now() + Duration::from_secs(5),
-            &cancel,
-            |_| Ok(()),
-        )
-        .await
-        .expect("Exa remains primary after prewarm deadline");
-        let passed = out.provider_used == Some("exa") && !out.fallback_used;
-        rows.push(ScenarioRow {
-            id: "11_prewarm_deadline_no_cooldown",
-            codepath: "web::prewarm_all",
-            route: out.routing.primary.code().to_string(),
-            elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
-            status: passed.into(),
-            detail: format!(
-                "provider={:?} fallback={}",
-                out.provider_used, out.fallback_used
-            ),
-        });
+        rows.push(ScenarioRow { id, codepath: "web::execute", route: "component/mock".into(),
+            elapsed_ms: f64::NAN,
+            status: matches!(result, Err(failure) if failure == if cancelled { Failure::Cancelled } else { Failure::Deadline }).into(),
+            detail: "Expired/cancelled operation rejected before provider call; latency not measured".into() });
     }
-
-    // 12. Snippet Sufficiency Guard (<0.1ms numeric / stub escalation check)
-    {
-        let t0 = StdInstant::now();
-        let mut service = WebService::new(DeterministicTransport {
-            mode: DeterministicScenarioMode::ExaMultiRecordInternalHr,
-            ..Default::default()
-        });
-        let cancel = Cancellation::default();
-        let out = prepare_round_zero_search_with_events(
-            &mut service,
-            "conv-suff",
-            "req-suff",
-            "What are the specs of the Pixel 8?",
-            None,
-            Mode::Quick,
-            true,
-            true,
-            Instant::now() + Duration::from_secs(5),
-            &cancel,
-            |_| Ok(()),
-        )
-        .await
-        .expect("search succeeds");
-        let suff =
-            check_search_snippets_sufficiency("What are the specs of the Pixel 8?", &out.sources);
-        let passed = suff == SnippetSufficiency::Sufficient;
-        rows.push(ScenarioRow {
-            id: "12_snippet_sufficiency_guard",
-            codepath: "core::router",
-            route: out.routing.primary.code().to_string(),
-            elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
-            status: passed.into(),
-            detail: format!("sufficiency={suff:?}"),
-        });
-    }
-
     Ok(rows)
 }
 
@@ -1088,11 +783,11 @@ struct ModelOutcome {
 }
 
 impl ModelOutcome {
-    fn passes(&self, id: &str, direct: bool) -> bool {
+    fn passes(&self, id: &str, allows_no_sources: bool) -> bool {
         self.kind == CustomOpenAiContentType::OutputText
             && !self.text.trim().is_empty()
-            && (direct || self.sources > 0)
-            && (!matches!(id, "verify_reads" | "research")
+            && (allows_no_sources || self.sources > 0)
+            && (!matches!(id, "page_read" | "mixed")
                 || (self.source_read_observed && self.page_reads > 0))
             && (id != "arithmetic" || self.text.trim() == "210")
             && (id != "history" || self.text.trim() == "SYNTHETIC-ORBIT-42")
@@ -1101,42 +796,12 @@ impl ModelOutcome {
 
 async fn run_model_matrix(args: &BenchArgs) -> Vec<ScenarioRow> {
     let cases = [
-        (
-            "arithmetic",
-            "What is 14 * 15? Reply only with the number.",
-            Mode::Quick,
-            true,
-        ),
-        (
-            "coding",
-            "Write a Rust function that sums a slice of i32. No web lookup.",
-            Mode::Quick,
-            true,
-        ),
-        (
-            "quick_lookup",
-            "What is the current Federal Reserve federal funds target range?",
-            Mode::Quick,
-            false,
-        ),
-        (
-            "verify_reads",
-            "Verify the current Federal Reserve federal funds target range using an official page read.",
-            Mode::Verify,
-            false,
-        ),
-        (
-            "research",
-            "Compare Tokio and async-std schedulers using current official sources.",
-            Mode::Research,
-            false,
-        ),
-        (
-            "history",
-            "What was the synthetic marker? Reply only with the marker.",
-            Mode::Quick,
-            true,
-        ),
+        ("arithmetic", "What is 14 * 15? Reply only with the number.", false, true),
+        ("coding", "Write a Rust function that sums a slice of i32. No web lookup.", true, true),
+        ("lookup", "What is the current Federal Reserve federal funds target range?", true, false),
+        ("page_read", "Verify the current Federal Reserve federal funds target range using an official page read.", true, false),
+        ("mixed", "Improve this text: async runtimes is useful. Then compare Tokio and async-std schedulers using current official sources and read the relevant pages.", true, false),
+        ("history", "What was the synthetic marker? Reply only with the marker.", false, true),
     ];
     let client = benchmark_client(args.model);
     let deadline = Instant::now() + Duration::from_secs(600);
@@ -1144,7 +809,7 @@ async fn run_model_matrix(args: &BenchArgs) -> Vec<ScenarioRow> {
     let mut service = WebService::new(McpTransport::default());
     let mut stopped = None;
     for repetition in 1..=args.repetitions {
-        for (id, text, mode, direct) in cases {
+        for (id, text, web_enabled, allows_no_sources) in cases {
             if let Some(reason) = stopped {
                 rows.push(skipped_model_row(id, reason, repetition));
                 continue;
@@ -1173,73 +838,48 @@ async fn run_model_matrix(args: &BenchArgs) -> Vec<ScenarioRow> {
             let cancel = Cancellation::default();
             let mut observer = TextObserver::new();
             let request = async {
-                if direct {
-                    client
-                        .respond_with_instructions(
-                            &prompt,
-                            Some(voxgolem_core::response_style::PLAIN_TEXT_POLICY),
-                            |text| observer.observe(text),
-                        )
-                        .await
-                        .map(|response| ModelOutcome {
-                            text: response.text,
-                            kind: response.content_type,
-                            sources: 0,
-                            searches: 0,
-                            reads: 0,
-                            page_reads: 0,
-                            source_read_observed: false,
-                            partial: false,
-                            fallbacks: 0,
+                run_with_client_events(
+                    client,
+                    &prompt,
+                    RunContext {
+                        conversation_id: "synthetic-benchmark",
+                        instructions: voxgolem_core::response_style::PLAIN_TEXT_POLICY,
+                        web_enabled,
+                    },
+                    &mut service,
+                    &cancel,
+                    |event| {
+                        if let RunEvent::Model(ModelEvent::TextDelta { text, .. }) = event {
+                            observer.observe(text);
+                        }
+                        Ok(())
+                    },
+                )
+                .await
+                .map(|done| ModelOutcome {
+                    text: done.response.text,
+                    kind: done.response.content_type,
+                    sources: done.sources.len(),
+                    searches: done.searches,
+                    reads: done.reads,
+                    page_reads: done
+                        .sources
+                        .iter()
+                        .filter(|source| {
+                            source.kind == EvidenceKind::PageRead && !source.text.trim().is_empty()
                         })
-                        .map_err(BenchFailure::from)
-                } else {
-                    run_with_client_events(
-                        client,
-                        &prompt,
-                        mode,
-                        RunContext {
-                            conversation_id: "synthetic-benchmark",
-                            instructions: voxgolem_core::response_style::PLAIN_TEXT_POLICY,
-                            explicit_search: mode != Mode::Quick,
-                            web_enabled: true,
-                        },
-                        &mut service,
-                        &cancel,
-                        |event| {
-                            if let RunEvent::Model(ModelEvent::TextDelta { text, .. }) = event {
-                                observer.observe(text);
-                            }
-                            Ok(())
-                        },
-                    )
-                    .await
-                    .map(|done| ModelOutcome {
-                        text: done.response.text,
-                        kind: done.response.content_type,
-                        sources: done.sources.len(),
-                        searches: done.searches,
-                        reads: done.reads,
-                        page_reads: done
-                            .sources
-                            .iter()
-                            .filter(|source| {
-                                source.kind == EvidenceKind::PageRead
-                                    && !source.text.trim().is_empty()
-                            })
-                            .count(),
-                        source_read_observed: done.source_read_observed,
-                        partial: done.partial,
-                        fallbacks: done.fallbacks,
-                    })
-                    .map_err(BenchFailure::from)
-                }
+                        .count(),
+                    source_read_observed: done.source_read_observed,
+                    partial: done.partial,
+                    fallbacks: done.fallbacks,
+                })
+                .map_err(BenchFailure::from)
             };
             let result = tokio::time::timeout_at(deadline, request).await;
-            let mut row = ScenarioRow { id, codepath: if direct { "CustomOpenAi::respond" } else { "search::run_with_client_events" }, route: "-".into(), elapsed_ms: observer.started.elapsed().as_secs_f64() * 1000.0, status: RowStatus::Failed, detail: format!("model={} repetition={repetition} scope=local_request_to_visible_text_callback first_visible_text_ms={:?}; semantic/citation_accuracy=unassessed", args.model.model_id(), observer.first_ms) };
+            let mut row = ScenarioRow { id, codepath: "search::run_with_client_events", route: "-".into(), elapsed_ms: observer.started.elapsed().as_secs_f64() * 1000.0, status: RowStatus::Failed, detail: format!("model={} repetition={repetition} scope=local_request_to_visible_text_callback first_visible_text_ms={:?}; semantic/citation_accuracy=unassessed", args.model.model_id(), observer.first_ms) };
             match result {
                 Ok(Ok(outcome)) => {
-                    row.status = outcome.passes(id, direct).into();
+                    row.status = outcome.passes(id, allows_no_sources).into();
                     row.detail.push_str(&format!(" output_kind={} sources={} searches={} reads={} readable_page_reads={} source_read_observed={} partial={} fallbacks={}", outcome.kind.as_str(), outcome.sources, outcome.searches, outcome.reads, outcome.page_reads, outcome.source_read_observed, outcome.partial, outcome.fallbacks));
                 }
                 Ok(Err(error)) => {
@@ -1295,9 +935,15 @@ async fn run_anonymous_suite() -> Result<Vec<ScenarioRow>, Box<dyn Error>> {
         rows.push(prewarm_row(snapshot, ms));
     }
 
-    // 2. Live SearchFast via warm MCP session
-    {
-        let t0 = StdInstant::now();
+    // Explicit component operations; this does not benchmark automatic model selection.
+    for (id, objective) in [
+        ("live_02_warm_search", "Current New York City weather temperature"),
+        (
+            "live_03_rules_search",
+            "Urza's Saga Construct token ability after land destruction",
+        ),
+    ] {
+        let started = StdInstant::now();
         let cancel = Cancellation::default();
         let mut service = admit_web(
             &web_mutex,
@@ -1306,80 +952,32 @@ async fn run_anonymous_suite() -> Result<Vec<ScenarioRow>, Box<dyn Error>> {
             Instant::now() + Duration::from_secs(5),
         )
         .await
-        .map_err(|_| "admit_web timed out")?;
-        let out = prepare_round_zero_search_with_events(
-            &mut service,
-            "live-s",
-            "req-live-s",
-            "What is the current weather temperature in New York City today?",
-            None,
-            Mode::Quick,
-            true,
-            true,
-            Instant::now() + Duration::from_secs(12),
-            &cancel,
-            |_| Ok(()),
-        )
-        .await
-        .map_err(|_| "live SearchFast failed")?;
-        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        .map_err(|_| "web admission failed")?;
+        let operation = Operation::Search {
+            objective: objective.into(),
+            queries: vec![objective.into()],
+            limit: 3,
+        };
+        let out = service
+            .execute(
+                &operation,
+                "synthetic-live-component",
+                id,
+                Instant::now() + Duration::from_secs(12),
+                &cancel,
+            )
+            .await
+            .map_err(|_| "live search failed")?;
         rows.push(ScenarioRow {
-            id: "live_02_warm_search_fast",
-            codepath: "platform::round_zero",
-            route: out.routing.primary.code().to_string(),
-            elapsed_ms: ms,
+            id,
+            codepath: "web::execute",
+            route: "explicit Search component".into(),
+            elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
             status: (!out.sources.is_empty()).into(),
             detail: format!(
-                "provider={:?} fallback={} sources={}",
-                out.provider_used,
-                out.fallback_used,
-                out.sources.len()
-            ),
-        });
-    }
-
-    // 3. Live 3-turn MTG follow-up via Round-0 search
-    {
-        let t0 = StdInstant::now();
-        let t1 = "In Magic: The Gathering, how does Urza's Saga work?";
-        let t2 = "What about its second ability?";
-        let t3 = "Does the token keep its ability if the land is destroyed?";
-        let folded = fold_user_history([t1, t2]);
-        let cancel = Cancellation::default();
-        let mut service = admit_web(
-            &web_mutex,
-            &gate,
-            &cancel,
-            Instant::now() + Duration::from_secs(5),
-        )
-        .await
-        .map_err(|_| "admit_web timed out")?;
-        let out = prepare_round_zero_search_with_events(
-            &mut service,
-            "live-mtg",
-            "req-live-mtg",
-            t3,
-            folded.as_deref(),
-            Mode::Quick,
-            true,
-            true,
-            Instant::now() + Duration::from_secs(12),
-            &cancel,
-            |_| Ok(()),
-        )
-        .await
-        .map_err(|_| "live 3-turn MTG search failed")?;
-        let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        rows.push(ScenarioRow {
-            id: "live_03_three_turn_mtg",
-            codepath: "platform::round_zero",
-            route: out.routing.primary.code().to_string(),
-            elapsed_ms: ms,
-            status: (!out.sources.is_empty() && out.evidence_context.is_some()).into(),
-            detail: format!(
-                "sources={} footer_len={}",
+                "sources={} fallback={}; no model selection exercised",
                 out.sources.len(),
-                out.source_footer.len()
+                out.fallback_used
             ),
         });
     }
@@ -1400,7 +998,7 @@ fn prewarm_row(snapshot: [Option<bool>; 2], elapsed_ms: f64) -> ScenarioRow {
 
 fn print_table(title: &str, rows: &[ScenarioRow]) {
     println!("### {title}");
-    println!("| Scenario | Codepath | Route | Latency (ms) | Status | Detail |");
+    println!("| Scenario | Codepath | Model / component / parked diagnostic | Latency (ms) | Status | Detail |");
     println!("| :--- | :--- | :---: | ---: | :---: | :--- |");
     for row in rows {
         let status = match row.status {
@@ -1457,7 +1055,7 @@ async fn main() {
         }
     };
     print_table(
-        "Deterministic Cross-Codepath Search & Router Suite",
+        "Deterministic Web Components & Parked Router Diagnostics",
         &det_rows,
     );
 
@@ -1648,15 +1246,15 @@ mod tests {
     #[test]
     fn read_attempts_without_readable_page_evidence_do_not_pass() {
         let mut done = outcome();
-        assert!(done.passes("quick_lookup", false));
-        for id in ["verify_reads", "research"] {
+        assert!(done.passes("lookup", false));
+        for id in ["page_read", "mixed"] {
             assert!(!done.passes(id, false));
         }
         done.source_read_observed = true;
-        assert!(!done.passes("verify_reads", false));
+        assert!(!done.passes("page_read", false));
         done.page_reads = 1;
-        assert!(done.passes("verify_reads", false));
-        assert!(done.passes("research", false));
+        assert!(done.passes("page_read", false));
+        assert!(done.passes("mixed", false));
         // Partial evidence/fallback are disclosed, not blanket failures.
         assert!(done.partial);
     }
@@ -1667,7 +1265,7 @@ mod tests {
         assert!(done.passes("coding", true));
         done.kind = CustomOpenAiContentType::Refusal;
         assert!(!done.passes("coding", true));
-        assert!(!done.passes("research", false));
+        assert!(!done.passes("mixed", false));
     }
 
     #[test]
@@ -1697,7 +1295,6 @@ mod tests {
     async fn single_provider_prewarm_forwards_failure() {
         let mut transport = ObservedTransport::new(DeterministicTransport {
             mode: DeterministicScenarioMode::PrewarmDeadline,
-            ..Default::default()
         });
         assert!(transport
             .prewarm(
@@ -1777,7 +1374,6 @@ mod tests {
     async fn fast_prewarm_failure_is_not_readiness() {
         let mut transport = ObservedTransport::new(DeterministicTransport {
             mode: DeterministicScenarioMode::PrewarmDeadline,
-            ..Default::default()
         });
         let _ = transport
             .prewarm_both(
@@ -1801,11 +1397,22 @@ mod tests {
         let rows = run_deterministic_suite(&cases_path)
             .await
             .expect("deterministic suite runs");
-        assert_eq!(
-            rows.len(),
-            13,
-            "preserve every original deterministic scenario"
-        );
+        for id in [
+            "title_url_fallback",
+            "internal_hr_records",
+            "empty_fetch_gap",
+            "published_page_read",
+            "soft_ratelimit_fallback",
+            "prewarm_deadline_no_cooldown",
+            "soft_failure_decode",
+            "expired_operation_deadline",
+            "cancelled_operation",
+        ] {
+            assert!(
+                rows.iter().any(|row| row.id == id),
+                "missing component: {id}"
+            );
+        }
         for row in &rows {
             assert!(
                 row.passed(),

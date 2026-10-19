@@ -1,14 +1,8 @@
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::time::Duration;
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Mode {
-    Quick,
-    Verify,
-    Research,
-}
-
+/// Hard ceilings for the selected model's native tools, not a requested effort
+/// level or a minimum amount of work. Ordinary answers may use no tools at all.
 #[derive(Clone, Copy, Debug)]
 pub struct Policy {
     pub searches: usize,
@@ -18,19 +12,14 @@ pub struct Policy {
     pub evidence_bytes: usize,
 }
 
-impl Mode {
-    pub fn policy(self) -> Policy {
-        let (searches, reads, rounds, seconds, evidence_bytes) = match self {
-            Self::Quick => (2, 2, 4, 20, 24 * 1024),
-            Self::Verify => (4, 4, 6, 45, 48 * 1024),
-            Self::Research => (8, 8, 10, 90, 96 * 1024),
-        };
-        Policy {
-            searches,
-            reads,
-            rounds,
-            tool_time: Duration::from_secs(seconds),
-            evidence_bytes,
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            searches: 8,
+            reads: 8,
+            rounds: 10,
+            tool_time: Duration::from_secs(90),
+            evidence_bytes: 96 * 1024,
         }
     }
 }
@@ -148,24 +137,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mode_wire_names_and_budgets_are_stable() {
-        for (wire, mode, searches, reads, rounds, seconds, bytes) in [
-            ("quick", Mode::Quick, 2, 2, 4, 20, 24 * 1024),
-            ("verify", Mode::Verify, 4, 4, 6, 45, 48 * 1024),
-            ("research", Mode::Research, 8, 8, 10, 90, 96 * 1024),
-        ] {
-            assert_eq!(serde_json::to_value(mode).unwrap(), wire);
-            assert_eq!(
-                serde_json::from_value::<Mode>(serde_json::json!(wire)).unwrap(),
-                mode
-            );
-            let policy = mode.policy();
-            assert_eq!(policy.searches, searches);
-            assert_eq!(policy.reads, reads);
-            assert_eq!(policy.rounds, rounds);
-            assert_eq!(policy.tool_time, Duration::from_secs(seconds));
-            assert_eq!(policy.evidence_bytes, bytes);
-        }
+    fn one_policy_keeps_bounded_native_allowances_without_a_mode() {
+        let policy = Policy::default();
+        assert_eq!((policy.searches, policy.reads, policy.rounds), (8, 8, 10));
+        assert_eq!(policy.tool_time, Duration::from_secs(90));
+        assert_eq!(policy.evidence_bytes, 96 * 1024);
     }
 
     #[test]

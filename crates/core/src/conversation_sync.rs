@@ -426,7 +426,7 @@ mod tests {
             .map(|n| Record {
                 body_key: format!("{n:064x}"),
                 operation: Operation {
-                    version: 1,
+                    version: 2,
                     id: id(n),
                     body: OperationBody::ConversationCreated {
                         title: "Synthetic".into(),
@@ -435,7 +435,7 @@ mod tests {
             })
             .collect();
         Store::restore(StoreSnapshot {
-            version: 1,
+            version: 2,
             revision: "1".into(),
             records,
             retired: vec![],
@@ -455,6 +455,23 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn legacy_v1_sync_envelopes_are_rejected() {
+        let store = store(1);
+        let mut legacy = page(&store);
+        legacy.version = 1;
+        assert!(matches!(
+            reconcile_page(&store, legacy),
+            Err(DomainError::UnsupportedVersion { version: 1 })
+        ));
+        let mut receipts = receipts_after_commit(&store, B, &[id(1)]).unwrap();
+        receipts[0].version = 1;
+        assert!(matches!(
+            merge_receipts(&store, B, vec![], receipts),
+            Err(DomainError::UnsupportedVersion { version: 1 })
+        ));
     }
 
     #[test]
@@ -542,7 +559,7 @@ mod tests {
         let deletion = Record {
             body_key: format!("{:064x}", 100),
             operation: Operation {
-                version: 1,
+                version: 2,
                 id: id(100),
                 body: OperationBody::ConversationDeleted {
                     conversation: id(1),

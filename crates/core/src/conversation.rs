@@ -2,6 +2,9 @@ use crate::assistant::{
     resolve_with_stage, AssistantPolicy, Content, DeepOutcome, InstantOutcome, Role, Stage,
     StageResult,
 };
+use crate::sources::{
+    merge_sources, source_bytes, with_source_footer, SourceLink, SourceValidationError,
+};
 use serde::{Deserialize, Serialize};
 
 pub const MAX_REQUEST_ID_BYTES: usize = 128;
@@ -32,6 +35,7 @@ pub struct Message {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Turn {
+    pub sources: Vec<SourceLink>,
     pub request_id: RequestId,
     pub execution_id: ExecutionId,
     pub user: Message,
@@ -114,6 +118,7 @@ pub struct ConversationSnapshot {
 
 #[derive(Debug, Clone)]
 struct Active {
+    sources: Vec<SourceLink>,
     snapshot: AdmissionSnapshot,
     instant: Option<InstantOutcome>,
     deep: Option<DeepOutcome>,
@@ -130,6 +135,7 @@ pub struct ConversationSession {
     next_session: u64,
     next_generation: u64,
     next_message: u64,
+    retain_committed_history: bool,
 }
 
 impl ConversationSession {
@@ -143,6 +149,17 @@ impl ConversationSession {
             next_session: 2,
             next_generation: 1,
             next_message: 1,
+            retain_committed_history: true,
+        }
+    }
+
+    /// Coordinate one execution while a durable store exclusively owns history.
+    /// Admission context must come from that store; settled turns are returned,
+    /// never retained as a second independently mutable transcript.
+    pub fn execution_only(policy: AssistantPolicy) -> Self {
+        Self {
+            retain_committed_history: false,
+            ..Self::new(policy)
         }
     }
     pub fn session_id(&self) -> SessionId {
@@ -168,7 +185,7 @@ impl ConversationSession {
                     },
                     crate::assistant::ConversationTurn {
                         role: Role::Assistant,
-                        content: turn.answer.content.clone(),
+                        content: context_answer(turn),
                     },
                 ]
             })
@@ -208,6 +225,44 @@ impl ConversationSession {
             }),
         }
     }
+    pub fn hydrate_turns(
+        &mut self,
+        session_id: SessionId,
+        turns: Vec<Turn>,
+    ) -> Result<(), SettlementError> {
+        if self.active.is_some() {
+            return Err(SettlementError::NotResolved);
+        }
+        self.session_id = session_id;
+        self.next_session = self.next_session.max(session_id.0.saturating_add(1));
+        self.turns.clear();
+        self.text_bytes = 0;
+        for turn in turns {
+            let text = content_bytes(&turn.user.content)
+                + content_bytes(&turn.answer.content)
+                + source_bytes(&turn.sources);
+            let context_text = match &turn.answer.content {
+                Content::Text(text) => {
+                    text.len() + crate::sources::source_footer_bytes(&turn.sources)
+                }
+                Content::Refusal(text) => text.len(),
+            } + content_bytes(&turn.user.content);
+            if text > MAX_COMMITTED_TEXT_BYTES || context_text > MAX_COMMITTED_TEXT_BYTES {
+                return Err(SettlementError::TranscriptTooLarge);
+            }
+            self.next_generation = self
+                .next_generation
+                .max(turn.execution_id.generation.0.saturating_add(1));
+            self.next_message = self
+                .next_message
+                .max(turn.user.id.0.saturating_add(1))
+                .max(turn.answer.id.0.saturating_add(1));
+            self.text_bytes += text;
+            self.turns.push(turn);
+            self.trim();
+        }
+        Ok(())
+    }
     pub fn admit(
         &mut self,
         request_id: &str,
@@ -236,7 +291,11 @@ impl ConversationSession {
         let history = self
             .turns
             .iter()
-            .flat_map(|t| [t.user.clone(), t.answer.clone()])
+            .flat_map(|t| {
+                let mut answer = t.answer.clone();
+                answer.content = context_answer(t);
+                [t.user.clone(), answer]
+            })
             .collect();
         let snapshot = AdmissionSnapshot {
             execution_id,
@@ -246,6 +305,7 @@ impl ConversationSession {
             policy: self.policy.clone(),
         };
         self.active = Some(Active {
+            sources: Vec::new(),
             instant: None,
             deep: None,
             review: None,
@@ -253,6 +313,22 @@ impl ConversationSession {
             resolved: None,
         });
         Ok(snapshot)
+    }
+    pub fn observe_sources(
+        &mut self,
+        execution_id: ExecutionId,
+        sources: &[SourceLink],
+    ) -> Result<bool, SourceValidationError> {
+        let Some(active) = self
+            .active
+            .as_mut()
+            .filter(|active| active.snapshot.execution_id == execution_id)
+        else {
+            return Ok(false);
+        };
+        let merged = merge_sources(&active.sources, sources)?;
+        active.sources = merged;
+        Ok(true)
     }
     pub fn update(
         &mut self,
@@ -331,8 +407,17 @@ impl ConversationSession {
         else {
             return SettlementResult::Rejected(SettlementError::NotResolved);
         };
-        let text = active_text_bytes(&active.snapshot.prompt, &content);
-        if text > MAX_COMMITTED_TEXT_BYTES {
+        let sources = if matches!(content, Content::Refusal(_)) {
+            Vec::new()
+        } else {
+            active.sources.clone()
+        };
+        let text = active_text_bytes(&active.snapshot.prompt, &content) + source_bytes(&sources);
+        let context_text = match &content {
+            Content::Text(text) => text.len() + crate::sources::source_footer_bytes(&sources),
+            Content::Refusal(text) => text.len(),
+        } + active.snapshot.prompt.len();
+        if text > MAX_COMMITTED_TEXT_BYTES || context_text > MAX_COMMITTED_TEXT_BYTES {
             return SettlementResult::Rejected(SettlementError::TranscriptTooLarge);
         }
         let active = self.active.take().expect("active checked above");
@@ -347,15 +432,18 @@ impl ConversationSession {
             content: content.clone(),
         };
         let turn = Turn {
+            sources,
             request_id: active.snapshot.request_id,
             execution_id,
             user,
             answer,
             final_stage,
         };
-        self.text_bytes += text;
-        self.turns.push(turn.clone());
-        self.trim();
+        if self.retain_committed_history {
+            self.text_bytes += text;
+            self.turns.push(turn.clone());
+            self.trim();
+        }
         SettlementResult::Applied(if matches!(content, Content::Refusal(_)) {
             AppliedOutcome::Refused(turn)
         } else {
@@ -383,11 +471,28 @@ impl ConversationSession {
     fn trim(&mut self) {
         while self.turns.len() * 2 > MAX_COMMITTED_MESSAGES
             || self.text_bytes > MAX_COMMITTED_TEXT_BYTES
+            || self
+                .turns
+                .iter()
+                .map(|turn| {
+                    content_bytes(&turn.user.content)
+                        + content_bytes(&turn.answer.content)
+                        + crate::sources::source_footer_bytes(&turn.sources)
+                })
+                .sum::<usize>()
+                > MAX_COMMITTED_TEXT_BYTES
         {
             let old = self.turns.remove(0);
-            self.text_bytes -=
-                content_bytes(&old.user.content) + content_bytes(&old.answer.content);
+            self.text_bytes -= content_bytes(&old.user.content)
+                + content_bytes(&old.answer.content)
+                + source_bytes(&old.sources);
         }
+    }
+}
+fn context_answer(turn: &Turn) -> Content {
+    match &turn.answer.content {
+        Content::Text(text) => Content::Text(with_source_footer(text, &turn.sources)),
+        Content::Refusal(text) => Content::Refusal(text.clone()),
     }
 }
 fn active_text_bytes(prompt: &str, answer: &Content) -> usize {
@@ -424,6 +529,129 @@ mod tests {
     use super::*;
     fn policy() -> AssistantPolicy {
         AssistantPolicy::default()
+    }
+    #[test]
+    fn externally_owned_history_is_never_cached_by_the_execution_coordinator() {
+        let mut session = ConversationSession::execution_only(policy());
+        let first = session
+            .admit("synthetic-first", "Synthetic prompt")
+            .unwrap();
+        complete(
+            &mut session,
+            first.execution_id,
+            Content::Text("Synthetic answer".into()),
+        );
+        assert!(matches!(
+            session.settle(first.execution_id, SettlementIntent::Success),
+            SettlementResult::Applied(AppliedOutcome::Completed(_))
+        ));
+        assert!(session.turns().is_empty());
+        assert!(session.snapshot().turns.is_empty());
+        assert!(session.provider_history().is_empty());
+        let next = session
+            .admit("synthetic-next", "Synthetic follow-up")
+            .unwrap();
+        assert!(next.history.is_empty());
+        assert_ne!(first.execution_id, next.execution_id);
+        assert_eq!(session.active_execution(), Some(next.execution_id));
+    }
+    #[test]
+    fn source_footer_overhead_cannot_oversize_admission_context() {
+        let mut session = ConversationSession::new(policy());
+        let execution = session.admit("synthetic-budget", "p").unwrap().execution_id;
+        let sources = vec![SourceLink {
+            url: "https://example.test/e".into(),
+            title: "S".into(),
+        }];
+        session.observe_sources(execution, &sources).unwrap();
+        let answer = "a".repeat(MAX_COMMITTED_TEXT_BYTES - 1 - source_bytes(&sources));
+        complete(&mut session, execution, Content::Text(answer));
+        assert_eq!(
+            session.settle(execution, SettlementIntent::Success),
+            SettlementResult::Rejected(SettlementError::TranscriptTooLarge)
+        );
+        assert!(session.turns().is_empty());
+        assert_eq!(session.active_execution(), Some(execution));
+    }
+
+    #[test]
+    fn observed_sources_are_canonical_but_context_is_derived_and_stale_is_inert() {
+        let mut session = ConversationSession::new(policy());
+        let source = SourceLink {
+            url: "https://example.test/evidence".into(),
+            title: "Synthetic evidence".into(),
+        };
+        let first = session
+            .admit("synthetic-first", "question")
+            .unwrap()
+            .execution_id;
+        assert_eq!(
+            session.observe_sources(first, std::slice::from_ref(&source)),
+            Ok(true)
+        );
+        assert!(session
+            .observe_sources(
+                first,
+                &[
+                    SourceLink {
+                        url: "https://example.test/new".into(),
+                        title: "New".into()
+                    },
+                    SourceLink {
+                        url: "invalid".into(),
+                        title: "Invalid".into()
+                    }
+                ]
+            )
+            .is_err());
+        complete(&mut session, first, Content::Text("plain answer".into()));
+        session.settle(first, SettlementIntent::Success);
+        assert_eq!(
+            session.turns()[0].answer.content,
+            Content::Text("plain answer".into())
+        );
+        assert_eq!(session.turns()[0].sources, vec![source.clone()]);
+        let provider = session.provider_history();
+        let next = session.admit("synthetic-next", "follow up").unwrap();
+        assert_eq!(next.history[1].content, provider[1].content);
+        assert_eq!(
+            provider[1].content,
+            Content::Text(with_source_footer(
+                "plain answer",
+                std::slice::from_ref(&source)
+            ))
+        );
+        assert_eq!(
+            session.observe_sources(
+                first,
+                &[SourceLink {
+                    url: "bad".into(),
+                    title: "bad".into()
+                }]
+            ),
+            Ok(false)
+        );
+        assert!(session
+            .observe_sources(next.execution_id, &vec![source.clone(); 33])
+            .is_err());
+        assert_eq!(
+            session.observe_sources(next.execution_id, &[source]),
+            Ok(true)
+        );
+        complete(
+            &mut session,
+            next.execution_id,
+            Content::Refusal("no".into()),
+        );
+        session.settle(next.execution_id, SettlementIntent::Success);
+        assert!(session.turns()[1].sources.is_empty());
+        let cancelled = session
+            .admit("synthetic-cancel", "question")
+            .unwrap()
+            .execution_id;
+        session.settle(cancelled, SettlementIntent::Cancelled);
+        assert_eq!(session.observe_sources(cancelled, &[]), Ok(false));
+        assert_eq!(session.turns().len(), 2);
     }
     fn complete(s: &mut ConversationSession, e: ExecutionId, content: Content) {
         assert!(matches!(

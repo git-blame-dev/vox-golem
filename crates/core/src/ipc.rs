@@ -57,6 +57,13 @@ impl WireId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub fn from_operation_id(
+        id: &crate::durable_conversation::OperationId,
+    ) -> Result<Self, crate::durable_conversation::DomainError> {
+        id.validate()?;
+        Ok(Self(format!("{}:{}", id.replica, id.sequence)))
+    }
 }
 
 impl Serialize for WireId {
@@ -74,6 +81,16 @@ impl<'de> Deserialize<'de> for WireId {
         D: Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
+        if let Some((replica, sequence)) = value.split_once(':') {
+            let id = crate::durable_conversation::OperationId {
+                replica: replica.to_string(),
+                sequence: sequence.to_string(),
+            };
+            id.validate().map_err(|_| {
+                serde::de::Error::custom("identifier must use canonical graph operation encoding")
+            })?;
+            return Ok(Self(value));
+        }
         let parsed = value.parse::<u64>().map_err(|_| {
             serde::de::Error::custom("identifier must be an unsigned decimal string")
         })?;
@@ -125,12 +142,43 @@ pub struct Message {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "TurnWire")]
 pub struct Turn {
+    pub sources: Vec<crate::sources::SourceLink>,
     pub request_id: String,
     pub execution_id: ExecutionId,
     pub user: Message,
     pub answer: Message,
     pub final_stage: Stage,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TurnWire {
+    sources: Vec<crate::sources::SourceLink>,
+    request_id: String,
+    execution_id: ExecutionId,
+    user: Message,
+    answer: Message,
+    final_stage: Stage,
+}
+impl TryFrom<TurnWire> for Turn {
+    type Error = &'static str;
+    fn try_from(wire: TurnWire) -> Result<Self, Self::Error> {
+        crate::sources::validate_sources(&wire.sources).map_err(|_| "invalid sources")?;
+        if matches!(wire.answer.content, MessageContentKind::Refusal(_)) && !wire.sources.is_empty()
+        {
+            return Err("refusal cannot carry sources");
+        }
+        Ok(Self {
+            sources: wire.sources,
+            request_id: wire.request_id,
+            execution_id: wire.execution_id,
+            user: wire.user,
+            answer: wire.answer,
+            final_stage: wire.final_stage,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -388,6 +436,7 @@ pub struct RefusedTurn(Turn);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptOutcomeValidationError {
+    InvalidSources,
     ExpectedTextAnswer,
     ExpectedRefusalAnswer,
     FailedIsNotAnOutcome,
@@ -407,6 +456,8 @@ impl RefusedTurn {
 
 impl PromptOutcome {
     pub fn completed(turn: Turn) -> Result<Self, PromptOutcomeValidationError> {
+        crate::sources::validate_sources(&turn.sources)
+            .map_err(|_| PromptOutcomeValidationError::InvalidSources)?;
         if !matches!(turn.answer.content, MessageContentKind::Text(_)) {
             return Err(PromptOutcomeValidationError::ExpectedTextAnswer);
         }
@@ -416,6 +467,9 @@ impl PromptOutcome {
     }
 
     pub fn refused(turn: Turn) -> Result<Self, PromptOutcomeValidationError> {
+        if !turn.sources.is_empty() {
+            return Err(PromptOutcomeValidationError::InvalidSources);
+        }
         if !matches!(turn.answer.content, MessageContentKind::Refusal(_)) {
             return Err(PromptOutcomeValidationError::ExpectedRefusalAnswer);
         }
@@ -599,6 +653,7 @@ impl From<AgentModelChoice> for assistant::AgentModel {
 impl From<conversation::Turn> for Turn {
     fn from(v: conversation::Turn) -> Self {
         Self {
+            sources: v.sources,
             request_id: v.request_id.0,
             execution_id: v.execution_id.into(),
             user: v.user.into(),
@@ -610,6 +665,7 @@ impl From<conversation::Turn> for Turn {
 impl From<&conversation::Turn> for Turn {
     fn from(v: &conversation::Turn) -> Self {
         Self {
+            sources: v.sources.clone(),
             request_id: v.request_id.0.clone(),
             execution_id: v.execution_id.into(),
             user: (&v.user).into(),
@@ -617,6 +673,65 @@ impl From<&conversation::Turn> for Turn {
             final_stage: v.final_stage.into(),
         }
     }
+}
+
+/// Project a trusted, native hash-verified durable record without deriving
+/// identity or source provenance from answer text. The alias is request-local
+/// presentation correlation, never part of the immutable stored operation.
+pub fn turn_from_record(
+    record: &crate::durable_conversation::Record,
+    client_request_alias: Option<&str>,
+) -> Result<Turn, crate::durable_conversation::DomainError> {
+    use crate::durable_conversation::{Answer, DomainError, OperationBody, TerminalStage};
+    record.validate()?;
+    let OperationBody::TurnCompleted {
+        conversation,
+        request,
+        prompt,
+        answer,
+        sources,
+        terminal_stage,
+        ..
+    } = &record.operation.body
+    else {
+        return Err(DomainError::Invalid {
+            field: "canonical_turn".into(),
+        });
+    };
+    let turn_id = WireId::from_operation_id(&record.operation.id)?;
+    let request_id = WireId::from_operation_id(request)?;
+    let alias = client_request_alias.unwrap_or(request_id.as_str());
+    if alias.is_empty() || alias.len() > conversation::MAX_REQUEST_ID_BYTES {
+        return Err(DomainError::Invalid {
+            field: "client_request_id".into(),
+        });
+    }
+    Ok(Turn {
+        request_id: alias.into(),
+        execution_id: ExecutionId {
+            session_id: WireId::from_operation_id(conversation)?,
+            generation: request_id,
+        },
+        user: Message {
+            id: turn_id.clone(),
+            role: MessageRole::User,
+            content: MessageContentKind::Text(prompt.clone()),
+        },
+        answer: Message {
+            id: turn_id,
+            role: MessageRole::Assistant,
+            content: match answer {
+                Answer::Text { text } => MessageContentKind::Text(text.clone()),
+                Answer::Refusal { reason } => MessageContentKind::Refusal(reason.clone()),
+            },
+        },
+        final_stage: match terminal_stage {
+            TerminalStage::Instant => Stage::Instant,
+            TerminalStage::Deep => Stage::Deep,
+            TerminalStage::Review => Stage::Review,
+        },
+        sources: sources.clone(),
+    })
 }
 impl From<&conversation::ActiveExecutionSummary> for ActiveRequestSummary {
     fn from(v: &conversation::ActiveExecutionSummary) -> Self {
@@ -645,6 +760,69 @@ impl TryFrom<conversation::AppliedOutcome> for PromptOutcome {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn durable_turn_projection_keeps_canonical_sources_and_request_local_alias_separate() {
+        use crate::durable_conversation::Record;
+        let id = |sequence| {
+            serde_json::json!({
+                "replica": "11111111-1111-4111-8111-111111111111", "sequence": sequence,
+            })
+        };
+        let record: Record = serde_json::from_value(serde_json::json!({
+            "body_key": "a".repeat(64),
+            "operation": {"version": 2, "id": id("3"), "body": {
+                "kind": "turn_completed", "conversation": id("1"), "parent": null,
+                "request": id("2"), "prompt": "Synthetic prompt",
+                "answer": {"kind": "text", "text": "Synthetic answer"},
+                "sources": [{"url": "https://example.test/document", "title": "Synthetic observed source"}],
+                "terminal_stage": "instant", "provenance": {
+                    "requested_model": "synthetic-model", "returned_model": null,
+                    "policy_id": "synthetic-policy", "policy_version": "2",
+                    "instruction_profile_id": "synthetic-profile", "instruction_profile_version": "2", "context": [],
+                },
+            }},
+        })).unwrap();
+        let original = record.clone();
+        let projected = super::turn_from_record(&record, Some("synthetic-active-request")).unwrap();
+        assert_eq!(projected.request_id, "synthetic-active-request");
+        assert_eq!(projected.user.id, projected.answer.id);
+        assert_eq!(projected.sources[0].url, "https://example.test/document");
+        assert_eq!(
+            projected.answer.content,
+            super::MessageContentKind::Text("Synthetic answer".into())
+        );
+        assert_eq!(record, original);
+        let cold = super::turn_from_record(&record, None).unwrap();
+        assert_eq!(cold.request_id, "11111111-1111-4111-8111-111111111111:2");
+        assert!(super::turn_from_record(&record, Some("")).is_err());
+    }
+
+    #[test]
+    fn canonical_graph_ids_round_trip_without_numeric_coercion() {
+        let value = "11111111-1111-4111-8111-111111111111:18446744073709551615";
+        let id: super::WireId = serde_json::from_value(serde_json::json!(value)).unwrap();
+        assert_eq!(id.as_str(), value);
+        assert_eq!(serde_json::to_value(id).unwrap(), value);
+        let operation = crate::durable_conversation::OperationId {
+            replica: "11111111-1111-4111-8111-111111111111".into(),
+            sequence: u64::MAX.to_string(),
+        };
+        assert_eq!(
+            super::WireId::from_operation_id(&operation)
+                .unwrap()
+                .as_str(),
+            value
+        );
+        for invalid in [
+            "11111111-1111-4111-8111-111111111111:0",
+            "11111111-1111-4111-8111-111111111111:01",
+            "11111111-1111-4111-8111-111111111111:18446744073709551616",
+            "synthetic-invalid:1",
+        ] {
+            assert!(serde_json::from_value::<super::WireId>(serde_json::json!(invalid)).is_err());
+        }
+    }
+
     #[test]
     fn portable_model_catalog_matches_wire_and_domain_contracts() {
         use super::InstantModelChoice as Wire;
@@ -724,6 +902,7 @@ mod tests {
 
     fn refusal_turn() -> conversation::Turn {
         conversation::Turn {
+            sources: Vec::new(),
             request_id: RequestId("request".into()),
             execution_id: ConversationExecutionId {
                 session_id: SessionId(4),
@@ -941,6 +1120,33 @@ mod tests {
     }
 
     #[test]
+    fn sourceful_ipc_roundtrip_rejects_invalid_metadata() {
+        let mut canonical = text_turn();
+        canonical.sources = vec![crate::sources::SourceLink {
+            url: "https://example.test/synthetic".into(),
+            title: "Synthetic source".into(),
+        }];
+        let turn = Turn::from(canonical);
+        let encoded = serde_json::to_string(&turn).unwrap();
+        assert_eq!(serde_json::from_str::<Turn>(&encoded).unwrap(), turn);
+        assert!(PromptOutcome::completed(turn.clone()).is_ok());
+        let mut invalid = turn.clone();
+        invalid.sources = vec![turn.sources[0].clone(); 33];
+        assert_eq!(
+            PromptOutcome::completed(invalid.clone()),
+            Err(PromptOutcomeValidationError::InvalidSources)
+        );
+        assert!(serde_json::from_value::<Turn>(serde_json::to_value(invalid).unwrap()).is_err());
+        let mut refusal = Turn::from(refusal_turn());
+        refusal.sources = turn.sources;
+        assert_eq!(
+            PromptOutcome::refused(refusal.clone()),
+            Err(PromptOutcomeValidationError::InvalidSources)
+        );
+        assert!(serde_json::from_value::<Turn>(serde_json::to_value(refusal).unwrap()).is_err());
+    }
+
+    #[test]
     fn canonical_turn_conversion_preserves_full_identity_and_refusal() {
         let ipc = Turn::from(refusal_turn());
         assert_eq!(
@@ -959,7 +1165,8 @@ mod tests {
                 "execution_id": { "session_id": "4", "generation": "9" },
                 "user": { "id": "1", "role": "user", "content": { "kind": "text", "text": "ask" } },
                 "answer": { "id": "2", "role": "assistant", "content": { "kind": "refusal", "text": "no" } },
-                "final_stage": "review"
+                "final_stage": "review",
+                "sources": []
             })
         );
     }

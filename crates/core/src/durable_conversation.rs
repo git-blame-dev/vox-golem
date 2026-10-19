@@ -30,7 +30,7 @@
 //! Quarantined duplicates remain exact-body ACKable and are dispositioned again in the plan.
 //! Retired duplicates appear in `suppressed` as well as `duplicates`; neither republish nor
 //! advance revision. Consumer completion code must examine disposition, not just duplicates.
-//! The optional v1 input `quarantine` field defaults empty; canonical exports always include
+//! The optional v2 input `quarantine` field defaults empty; canonical exports always include
 //! it, ordered by ID. Canonical snapshot hashing must serialize `restore(input)?.export()`,
 //! including that ledger. Operation body-key hashing is unchanged and never includes it.
 //! Known context IDs must name turns of the same conversation, including compact retired
@@ -40,7 +40,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 pub const MAX_BATCH_RECORDS: usize = 128;
 pub const MAX_PROMPT_BYTES: usize = 32 * 1024;
 pub const MAX_TURN_TEXT_BYTES: usize = 256 * 1024;
@@ -142,6 +142,7 @@ pub enum OperationBody {
         request: OperationId,
         prompt: String,
         answer: Answer,
+        sources: Vec<crate::sources::SourceLink>,
         terminal_stage: TerminalStage,
         provenance: Provenance,
     },
@@ -263,6 +264,15 @@ pub struct StoreView {
     pub conversations: Vec<ConversationView>,
     pub pending: Vec<OperationId>,
     #[serde(default)]
+    pub quarantine: Vec<QuarantinedRecord>,
+}
+
+/// Derived graph metadata only. This type deliberately cannot contain Record or Answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StoreSummary {
+    pub revision: String,
+    pub conversations: Vec<ConversationView>,
+    pub pending: Vec<OperationId>,
     pub quarantine: Vec<QuarantinedRecord>,
 }
 
@@ -477,6 +487,17 @@ impl Store {
         }
     }
 
+    /// Body-free projection: scans borrowed records and clones only metadata/identities.
+    pub fn summary(&self) -> StoreSummary {
+        let (conversations, pending) = self.conversation_views();
+        StoreSummary {
+            revision: self.revision.clone(),
+            conversations,
+            pending,
+            quarantine: self.quarantine_entries(),
+        }
+    }
+
     fn conversation_views(&self) -> (Vec<ConversationView>, Vec<OperationId>) {
         let deleted = self.deleted();
         let mut conversations = BTreeMap::new();
@@ -636,7 +657,7 @@ impl Store {
         Ok(true)
     }
 
-    fn check_revision(&self, expected: &str) -> Result<(), DomainError> {
+    pub fn check_revision(&self, expected: &str) -> Result<(), DomainError> {
         decimal(expected, true)?;
         if expected != self.revision {
             return Err(DomainError::RevisionConflict {
@@ -645,6 +666,14 @@ impl Store {
             });
         }
         Ok(())
+    }
+
+    /// Body-free prompt preview for a turn operation, normalized and truncated on a UTF-8 boundary.
+    pub fn prompt_preview(&self, id: &OperationId) -> Option<String> {
+        match &self.records.get(id)?.operation.body {
+            OperationBody::TurnCompleted { prompt, .. } => Some(branch_prompt_preview(prompt)),
+            _ => None,
+        }
     }
 
     fn deleted(&self) -> BTreeSet<OperationId> {
@@ -1051,7 +1080,7 @@ impl Store {
         let mut turns = vec![];
         let mut bytes = 0;
         for record in history.into_iter().flatten().rev().take(request.max_turns) {
-            let size = record.operation.text_bytes();
+            let size = record.operation.context_bytes();
             if size > request.max_text_bytes - bytes {
                 break;
             }
@@ -1162,6 +1191,28 @@ fn title_preview(prompt: &str) -> String {
     preview
 }
 
+pub fn branch_prompt_preview(prompt: &str) -> String {
+    const MAX_BYTES: usize = 128;
+    const MAX_SCALARS: usize = 100;
+    let mut characters = prompt
+        .split_whitespace()
+        .flat_map(|word| std::iter::once(' ').chain(word.chars()))
+        .skip(1);
+    let mut preview = String::new();
+    let mut count = 0;
+    while count < MAX_SCALARS {
+        let Some(ch) = characters.next() else {
+            break;
+        };
+        if preview.len() + ch.len_utf8() > MAX_BYTES {
+            break;
+        }
+        preview.push(ch);
+        count += 1;
+    }
+    preview
+}
+
 impl Operation {
     pub fn conversation(&self) -> &OperationId {
         match &self.body {
@@ -1173,10 +1224,33 @@ impl Operation {
     pub fn text_bytes(&self) -> usize {
         match &self.body {
             OperationBody::ConversationCreated { title } => title.len(),
-            OperationBody::TurnCompleted { prompt, answer, .. } => {
-                prompt.len() + answer.text().len()
-            }
+            OperationBody::TurnCompleted {
+                prompt,
+                answer,
+                sources,
+                ..
+            } => prompt.len() + answer.text().len() + crate::sources::source_bytes(sources),
             OperationBody::ConversationDeleted { .. } => 0,
+        }
+    }
+    /// Actual derived provider text, including footer punctuation, plus retained titles.
+    pub fn context_bytes(&self) -> usize {
+        match &self.body {
+            OperationBody::TurnCompleted {
+                prompt,
+                answer,
+                sources,
+                ..
+            } => {
+                prompt.len()
+                    + answer.text().len()
+                    + crate::sources::source_footer_bytes(sources)
+                    + sources
+                        .iter()
+                        .map(|source| source.title.len())
+                        .sum::<usize>()
+            }
+            _ => self.text_bytes(),
         }
     }
 }
@@ -1207,6 +1281,7 @@ impl Record {
                 request,
                 prompt,
                 answer,
+                sources,
                 provenance,
                 ..
             } => {
@@ -1219,6 +1294,10 @@ impl Record {
                 request.validate()?;
                 bounded_text(prompt, "prompt", MAX_PROMPT_BYTES, true)?;
                 bounded_text(answer.text(), "answer", MAX_TURN_TEXT_BYTES, true)?;
+                crate::sources::validate_sources(sources).map_err(|_| limit("sources"))?;
+                if matches!(answer, Answer::Refusal { .. }) && !sources.is_empty() {
+                    return Err(limit("refusal_sources"));
+                }
                 if op.text_bytes() > MAX_TURN_TEXT_BYTES {
                     return Err(limit("turn_text_bytes"));
                 }

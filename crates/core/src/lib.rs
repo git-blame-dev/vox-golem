@@ -10,8 +10,6 @@ pub mod durable_conversation;
 pub mod external_correlation;
 pub mod ipc;
 pub mod response_style;
-pub mod router;
-pub mod router_weights;
 pub mod runtime;
 pub mod search;
 pub mod session;
@@ -32,3 +30,4 @@ mod tests {
         assert_eq!(APP_NAME, "VoxGolem");
     }
 }
+pub mod sources;
