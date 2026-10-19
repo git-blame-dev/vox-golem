@@ -3,6 +3,7 @@ name = "voxgolem-platform"
 edition.workspace = true
 
 [features]
+app-benchmark = ["custom-openai"]
 default = ["desktop", "custom-openai"]
 web-search = [
   "custom-openai-webpki",

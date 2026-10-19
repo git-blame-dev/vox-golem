@@ -1,0 +1,1226 @@
+#!/usr/bin/env python3
+"""One real-app workflow benchmark. Offline unless explicitly --live.
+
+Run with the pinned benchmark-tools interpreter. Fixtures and reports never use
+personal audio/history. Live generation is additionally fenced inside Rust.
+"""
+import argparse
+import fcntl
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import signal
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import tomllib
+
+from fixtures import CASES, URLS, FakeServices, expected_answer, generate_fixtures
+
+ROOT = Path(__file__).resolve().parents[2]
+MAX_ASSIGNMENT_CALLS = 100
+LIVE_BATCH_ALLOWANCE = 12
+ASSIGNMENT_LEDGER = ROOT.parent / 'artifacts' / 'unified-app-bench-live-budget.json'
+ARTIFACT_ROOT = ROOT.parent / 'artifacts'
+PHASE = 'preflight'
+APP_PID = None
+CAPABILITY = b'voxgolem:app-bench:synthetic-input-only:v1'
+CANCEL_POST_RELEASE_SECONDS = 0.5
+WORKFLOW_SAFETY_CHECKS = ('empty_admission', 'duplicate_ui_submission', 'cancellation_retirement',
+    'warm_context', 'longer_history', 'relaunch_preferences', 'relaunch_without_generation')
+
+
+def private_json(path, value):
+    with open(path, 'x', opener=lambda p, f: os.open(p, f, 0o600)) as stream:
+        json.dump(value, stream, indent=2, sort_keys=True)
+        stream.flush()
+        os.fsync(stream.fileno())
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try: os.fsync(directory)
+    finally: os.close(directory)
+
+
+def prune_owned_reports(parent, now=None, max_bytes=8*1024*1024, max_files=128):
+    """Only this controller's marked metadata reports, never fixtures or ledgers."""
+    now = time.time() if now is None else now
+    owned = []
+    for directory in parent.iterdir():
+        marker = directory/'.app-bench-run.json'
+        try:
+            if not directory.is_dir() or directory.is_symlink() or marker.is_symlink(): continue
+            if marker.stat().st_size > 1024: continue
+            value = json.loads(marker.read_text())
+            created = value['created_epoch_seconds']
+            if (value.get('owner') != 'voxgolem-app-bench' or value.get('schema') != 1 or
+                    type(created) not in (int, float) or not math.isfinite(created) or created < 0): continue
+            for name in ['report.json', 'driver-free-diagnostic.json']:
+                report = directory/name
+                if report.is_file() and not report.is_symlink():
+                    owned.append((created, report, report.stat().st_size))
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    total = sum(size for _, _, size in owned)
+    count = len(owned)
+    for created, report, size in sorted(owned):
+        if created > now or now-created > 90*86400 or total > max_bytes or count > max_files:
+            try: report.unlink()
+            except FileNotFoundError: pass
+            total -= size
+            count -= 1
+
+
+def reserve_live_budget(ledger, reservation):
+    """Reservations survive disposable runs; uncertainty never refunds calls."""
+    if ledger.is_symlink() or any(p.is_symlink() for p in ledger.parents):
+        raise ValueError('Budget ledger must not be a symlink')
+    ledger = ledger.resolve()
+    if ledger.is_relative_to(reservation.parent.resolve()):
+        raise ValueError('Budget ledger must be outside disposable run storage')
+    if not ledger.parent.is_dir():
+        raise ValueError('Budget ledger requires an existing durable parent')
+    descriptor = os.open(ledger, os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(descriptor, 'r+') as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        stream.seek(0)
+        text = stream.read(8193)
+        value = json.loads(text) if text else {'schema': 1, 'reserved': 0}
+        if (len(text) > 8192 or value.get('schema') != 1 or
+                type(value.get('reserved')) is not int or
+                not 0 <= value['reserved'] <= MAX_ASSIGNMENT_CALLS - LIVE_BATCH_ALLOWANCE):
+            raise ValueError('Budget ledger invalid or allowance exhausted')
+        # Persist the debit first. A failed subsequent reservation burns it.
+        value['reserved'] += LIVE_BATCH_ALLOWANCE
+        stream.seek(0)
+        json.dump(value, stream, sort_keys=True)
+        stream.truncate()
+        stream.flush()
+        os.fsync(stream.fileno())
+        # A durable file does not make a newly created directory entry durable.
+        directory = os.open(ledger.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        private_json(reservation, {'schema': 1, 'allowance': LIVE_BATCH_ALLOWANCE})
+    return value['reserved']
+
+
+def validate_offline_namespace(original, current, interfaces):
+    if (not isinstance(original, str) or not re.fullmatch(r'net:\[\d+\]', original) or
+            original == current or set(interfaces) != {'lo'}):
+        raise ValueError('Offline mode requires a distinct loopback-only namespace')
+
+
+def validate_private_session(original_pidns, current_pidns, original_bus, current_bus):
+    if (not isinstance(original_pidns, str) or not re.fullmatch(r'pid:\[\d+\]', original_pidns) or
+            original_pidns == current_pidns or original_bus is None or
+            not current_bus or current_bus == original_bus):
+        raise ValueError('Benchmark requires an owned process namespace and private session bus')
+
+
+def free_port():
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        return sock.getsockname()[1]
+
+
+def harness_identity():
+    digest = hashlib.sha256()
+    for name in ['runner.py', 'fixtures.py']:
+        digest.update(name.encode())
+        digest.update(Path(__file__).with_name(name).read_bytes())
+    return digest.hexdigest()
+
+
+def validate_benchmark_binary(binary):
+    if not binary.is_file() or binary.stat().st_size > 256*1024*1024:
+        raise ValueError('Benchmark executable is unavailable or oversized')
+    if CAPABILITY not in binary.read_bytes():
+        raise ValueError('Refusing to launch an executable without the synthetic-input capability')
+
+
+def validate_offline_evidence(path, binary, fixtures, speech_identity, entry='voice'):
+    if path is None or path.stat().st_size > 128*1024:
+        raise ValueError('A bounded successful offline report is required')
+    evidence = json.loads(path.read_text())
+    rows = evidence.get('rows', [])
+    if entry == 'typed':
+        if (evidence.get('schema') != 2 or evidence.get('mode') != 'offline' or
+                evidence.get('entry') != 'typed' or evidence.get('coverage') != 'typed-workflow' or
+                evidence.get('diagnostic_only') is not False or
+                evidence.get('binary_sha256') != hashlib.sha256(binary.read_bytes()).hexdigest() or
+                evidence.get('harness_sha256') != harness_identity() or
+                evidence.get('workflow_identity') != typed_identity() or
+                evidence.get('cleanup', {}).get('app_exit_before_group_termination_observed') is not True or
+                {r.get('case') for r in rows if r.get('qualification_eligible') is True} != set(CASES) or
+                len(rows) != len(CASES) or
+                any(r.get('qualification_eligible') is not True or
+                    typed_eligibility(r.get('checks', {}))[1] is not True or
+                    any(r.get('checks', {}).get(name) is not True for name in (
+                        'fixture_answer_exact', 'request_contract_and_history',
+                        'fixture_operations_exact', 'bounded_stream_gate')) or
+                    (r.get('case') == 'quick' and r.get('checks', {}).get('quick_answer_correct') is not True)
+                    for r in rows) or
+                not workflow_safety_passed(evidence.get('safety_checks', {}))):
+            raise ValueError('Matching offline typed-workflow and safety evidence is required')
+        return
+    if (evidence.get('schema') != 1 or evidence.get('mode') != 'offline' or evidence.get('entry') != 'voice' or
+            evidence.get('diagnostic_only') is not False or
+            evidence.get('wake_score_diagnostics') is not False or
+            evidence.get('browser_call_probes') is not False or
+            evidence.get('binary_sha256') != hashlib.sha256(binary.read_bytes()).hexdigest() or
+            evidence.get('harness_sha256') != harness_identity() or
+            evidence.get('fixture_metadata') != fixtures or
+            evidence.get('speech_identity') != speech_identity or
+            evidence.get('cleanup', {}).get('app_exit_before_group_termination_observed') is not True or
+            {r.get('case') for r in rows if r.get('passed') is True} != set(CASES) or
+            any(r.get('passed') is not True or r.get('dropped') != 0 for r in rows)):
+        raise ValueError('Offline acceptance does not match this binary and all happy paths')
+
+
+def typed_identity():
+    return {'entry': 'typed', 'model': 'custom-luna-none', 'effort': 'none',
+            'web_enabled': True, 'tts_enabled': False, 'completion': False,
+            'speech_assets_loaded': False, 'prompts_sha256': hashlib.sha256(
+                json.dumps(CASES, sort_keys=True).encode()).hexdigest(),
+            'deferred_checks': ['desktop_capture', 'ui_source_projection', 'desktop_history_relaunch']}
+
+
+def speech_configuration_identity(source_config):
+    config = tomllib.loads(source_config.read_text())
+    identity = {key: config.get(key, default) for key, default in [
+        ('initial_silence_timeout_ms', 2500), ('silence_timeout_ms', 750),
+        ('wake_word_detection_threshold', 0.68)]}
+    hashes = {}
+    for key in ['wake_word_model_path', 'silero_vad_model', 'parakeet_model_dir']:
+        path = Path(config[key])
+        if not path.is_absolute(): path = source_config.parent/path
+        digest = hashlib.sha256()
+        files = sorted(p for p in path.rglob('*') if p.is_file()) if path.is_dir() else [path]
+        for file in files:
+            if path.is_dir(): digest.update(str(file.relative_to(path)).encode())
+            with file.open('rb') as stream:
+                while block := stream.read(1024*1024): digest.update(block)
+        hashes[key] = digest.hexdigest()
+    identity['asset_sha256'] = hashes
+    identity.update(source_rate_hz=16000, source_channels=1, frame_samples=480,
+                    web_enabled=True, tts_enabled=False, completion=False, partial_asr=True)
+    return identity
+
+
+def selected_live_authority(source_config, original):
+    """Preserve managed selection (including a broken/signed-out selection).
+
+    Credential contents/refresh/revision validation stay in the real Rust client.
+    An absent Custom configuration must not silently select another account.
+    """
+    managed = source_config.parent/'chatgpt'/'chatgpt-auth.json'
+    try:
+        managed.lstat()
+        selected = managed
+        endpoint = 'https://chatgpt.com/backend-api/codex/responses'
+    except FileNotFoundError:
+        custom = original.get('custom_openai')
+        if not isinstance(custom, dict) or custom.get('auth_source', 'native') != 'native':
+            raise ValueError('Approved native credential configuration unavailable')
+        configured = custom.get('auth_path')
+        if configured is None:
+            source_home = os.environ.get('VOXGOLEM_BENCH_SOURCE_HOME', os.environ.get('HOME', ''))
+            source_data = os.environ.get('VOXGOLEM_BENCH_SOURCE_DATA_HOME', os.environ.get('XDG_DATA_HOME', ''))
+            if not source_home or not Path(source_home).is_absolute():
+                raise ValueError('Original native credential location unavailable')
+            default_data = Path(source_data) if source_data and Path(source_data).is_absolute() else Path(source_home)/'.local/share'
+            configured = str(default_data/'opencode'/'auth.json')
+        selected = Path(configured)
+        if not selected.is_absolute():
+            selected = source_config.parent/selected
+        endpoint = custom.get('endpoint', 'https://chatgpt.com/backend-api/codex/responses')
+    if not selected.is_file():
+        raise ValueError('Selected credential authority unavailable; no fallback permitted')
+    return selected, endpoint
+
+
+def isolated_environment(run, source_config, endpoint, live=False, reservation=None, entry='voice'):
+    original = tomllib.loads(source_config.read_text())
+    env = os.environ.copy()
+    if not env.get('XAUTHORITY') and (Path(env.get('HOME', ''))/'.Xauthority').is_file():
+        env['XAUTHORITY'] = str(Path(env['HOME'])/'.Xauthority')
+    wayland = env.get('WAYLAND_DISPLAY')
+    if wayland and not Path(wayland).is_absolute() and env.get('XDG_RUNTIME_DIR'):
+        env['WAYLAND_DISPLAY'] = str(Path(env['XDG_RUNTIME_DIR'])/wayland)
+    for key in list(env):
+        if key.lower().endswith('_proxy'):
+            del env[key]
+    for name, folder in [('HOME', 'home'), ('XDG_CONFIG_HOME', 'config'),
+                         ('XDG_DATA_HOME', 'data'), ('XDG_STATE_HOME', 'state'),
+                         ('XDG_CACHE_HOME', 'cache'), ('XDG_RUNTIME_DIR', 'runtime')]:
+        path = run / folder
+        path.mkdir(mode=0o700, exist_ok=True)
+        env[name] = str(path)
+    config_path = run / 'config' / 'config.toml'
+    config = []
+    for key in ([] if entry == 'typed' else ['wake_word_model_path', 'parakeet_model_dir', 'silero_vad_model']):
+        path = Path(original[key])
+        if not path.is_absolute():
+            path = source_config.parent / path
+        if not path.exists():
+            raise ValueError('Required speech asset missing')
+        config.append(f'{key} = {json.dumps(str(path.resolve()))}')
+    for key, default in [('initial_silence_timeout_ms', 2500), ('silence_timeout_ms', 750),
+                         ('wake_word_detection_threshold', 0.68)]:
+        config.append(f'{key} = {original.get(key, default)}')
+    # Custom is selected in assistant settings, not the legacy backend enum.
+    # No OpenCode table means no unrelated server is started.
+    config += ['web_enabled = true', 'response_backend = "opencode"', '[custom_openai]']
+    if live:
+        auth, live_endpoint = selected_live_authority(source_config, original)
+        config += [f'endpoint = {json.dumps(live_endpoint)}',
+                   f'auth_path = {json.dumps(str(auth))}', 'auth_source = "native"']
+    else:
+        auth = run / 'synthetic-auth.json'
+        private_json(auth, {'openai': {'access': 'synthetic-benchmark-access',
+                                     'expires': 4102444800000}})
+        config += [f'endpoint = {json.dumps(endpoint)}',
+                   f'auth_path = {json.dumps(str(auth))}', 'auth_source = "native"']
+    # Omit the optional TTS table: even a disabled table requires model_path.
+    config += ['[telemetry]', 'enabled = false',
+               '[logging]', 'enabled = false']
+    config_path.write_text('\n'.join(config) + '\n')
+    (config_path.parent / 'state.toml').write_text('''web_enabled = true
+tts_enabled = false
+auto_update_download = false
+auto_update_install = false
+assistant_instant = "custom-luna-none"
+assistant_deep = "opencode-sol-high"
+assistant_review = "custom-sol-high"
+assistant_deep_enabled = false
+assistant_review_enabled = false
+assistant_prefetch = false
+assistant_completion = false
+''')
+    env.update(VOXGOLEM_BENCH_MODE='live' if live else 'offline',
+               VOXGOLEM_BENCH_ENTRY='typed' if entry == 'typed' else 'voice',
+               VOXGOLEM_BENCH_ROOT=str(run), VOXGOLEM_CONFIG_PATH=str(config_path),
+               TAURI_AUTOMATION='true')
+    env.pop('VOXGOLEM_BENCH_AUTO_DIAGNOSTIC_CASE', None)
+    env.pop('VOXGOLEM_BENCH_MCP_ENDPOINT', None)
+    env.pop('VOXGOLEM_BENCH_PERMITS', None)
+    if reservation:
+        env['VOXGOLEM_BENCH_PERMITS'] = str(reservation)
+    return env
+
+
+def invoke(driver, command, args=None):
+    global APP_PID
+    value = driver.execute_async_script('''const done = arguments[arguments.length - 1];
+window.__TAURI_INTERNALS__.invoke(arguments[0], arguments[1]).then(
+  value => done({ok:true, value}), () => done({ok:false}));''', command, args or {})
+    if not isinstance(value, dict) or value.get('ok') is not True:
+        raise RuntimeError('Application observation/admission command failed')
+    result = value['value']
+    if command == 'benchmark_snapshot':
+        pid = result.pop('process_id', None)
+        if type(pid) is int:
+            if APP_PID is not None and APP_PID != pid:
+                raise RuntimeError('Application process correlation changed')
+            APP_PID = pid
+    return result
+
+
+def app_running(pid):
+    if pid is None: return False
+    try:
+        stat = Path(f'/proc/{pid}/stat').read_text()
+        return stat.rsplit(')', 1)[1].strip().split()[0] != 'Z'
+    except FileNotFoundError:
+        return False
+
+
+def shutdown_owned(driver, process):
+    started = time.perf_counter()
+    quit_error = False
+    forced = False
+    if driver:
+        try: driver.quit()
+        except Exception: quit_error = True
+    deadline = time.monotonic()+3
+    while app_running(APP_PID) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    graceful = APP_PID is not None and not app_running(APP_PID)
+    if process:
+        try:
+            if app_running(APP_PID): forced = True
+            os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=10)
+        except ProcessLookupError:
+            pass
+        except subprocess.TimeoutExpired:
+            forced = True
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+    return {'app_exit_observed': APP_PID is not None and not app_running(APP_PID),
+            'app_exit_before_group_termination_observed': graceful, 'forced_group_termination': forced,
+            'webdriver_quit_error': quit_error,
+            'elapsed_ms': (time.perf_counter()-started)*1000}
+
+
+def wait_for(check, seconds, label):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        value = check()
+        if value:
+            return value
+        time.sleep(0.1)
+    raise TimeoutError(label)
+
+
+def ui_state(driver):
+    return driver.execute_script('''const phase=document.querySelector('.shell')?.dataset.runtimeStatus;const text=document.body.textContent.toLowerCase();const allowed=['channel support','unavailable','not configured','invalid','credential','authentication','stale','cancelled','stream','permission','unknown command','failed','request is','model','auth'];return {
+failure_categories:allowed.filter(word=>text.includes(word)),
+turn_states:Array.from(document.querySelectorAll('[data-turn-role=assistant][data-request-id]')).map(e=>({outcome:e.dataset.turnOutcome,stage:e.dataset.stageStatus,kind:e.dataset.contentKind})),
+composer_length:document.getElementById('promptComposer')?.value.length||0,
+user_rows:document.querySelectorAll('[data-turn-role=user][data-request-id]').length,
+submit_enabled:document.querySelector('.composer button[type=submit]')?.disabled===false,
+runtime_status:['initializing','sleeping','listening','processing','executing','error'].includes(phase)?phase:'unknown'};''')
+
+
+OBSERVE = '''const prior=arguments[0];
+const noticeText=Array.from(document.querySelectorAll('.notice-toast__message')).map(e=>e.textContent).join(' ').toLowerCase();
+const metadata={notice_categories:['fell behind','invalid','failed','unavailable','cancelled','stopped','overflow'].filter(c=>noticeText.includes(c))};
+const users=Array.from(document.querySelectorAll('[data-turn-role="user"][data-request-id]'))
+ .filter(e=>!prior.includes(e.dataset.requestId));
+if(users.length!==1) return {...metadata,admitted:false, count:users.length};
+const id=users[0].dataset.requestId;
+const rows=Array.from(document.querySelectorAll('[data-turn-role="assistant"][data-request-id]'))
+ .filter(e=>e.dataset.requestId===id);
+if(rows.length!==1) return {...metadata,admitted:true, answer:false};
+const row=rows[0], text=row.querySelector('.answer-stage__answer,.message__content');
+return {...metadata,admitted:true, answer:true, outcome:row.dataset.turnOutcome,
+ kind:row.dataset.contentKind, stage:row.dataset.stageStatus,
+ nonblank:!!text?.textContent?.trim()&&!text.querySelector('.message__thinking'),
+ source_links:row.querySelectorAll('.answer-stage__sources a').length};'''
+
+
+def accepted_flow(case, final, native, canonical_added_once, sources_preserved,
+                  saw_inflight, service=None, require_voice=True):
+    flow = max((e['flow'] for e in native['events']), default=0)
+    events = [e for e in native['events'] if e['flow'] == flow]
+    stages = {e['stage'] for e in events}
+    required = {'generation_dispatched'}
+    if require_voice:
+        required |= {'source_samples_completed', 'wake_detected', 'final_asr_started', 'final_asr_completed'}
+    if (not canonical_added_once or native['dropped'] != 0 or not required <= stages):
+        return False
+    if not final.get('nonblank') or final.get('canonical_ui_match') is not True:
+        return False
+    pages = 0 if case == 'quick' else (1 if case == 'short_research' else 2)
+    if case == 'quick' and not final['quick_correct']:
+        return False
+    if pages and (native.get('readable_pages', 0) < pages or
+                  native.get('tool_failures', 0) != 0 or not sources_preserved):
+        return False
+    if service is not None:
+        if (final.get('offline_fixture_match') is not True or not saw_inflight or service['failures'] != 0 or
+                not service['transcript_matches'] or not service['model_matches'] or
+                not service['terminal']):
+            return False
+        for actual, expected in [('generation_requests', 'expected_model_rounds'),
+                                 ('searches', 'expected_searches'),
+                                 ('fetches', 'expected_fetches'),
+                                 ('readable_sources', 'expected_readable_sources')]:
+            if service[actual] != service[expected]:
+                return False
+        if sum(e['stage'] == 'generation_dispatched' for e in events) != service['expected_model_rounds']:
+            return False
+    return True
+
+
+def answer_integrity(case, canonical, rendered, urls, offline, canonical_sources=None):
+    parts = canonical.rsplit('\n\nSources:\n', 1)
+    if isinstance(canonical_sources, list) and canonical_sources:
+        plain_canonical = canonical
+        saved = [
+            item['url'].strip()
+            for item in canonical_sources
+            if isinstance(item, dict) and isinstance(item.get('url'), str) and item['url'].strip()
+        ]
+        has_canonical_sources = bool(saved)
+    elif len(parts) == 2:
+        plain_canonical = parts[0]
+        saved = parts[1].strip().split('\n')
+        has_canonical_sources = True
+    else:
+        plain_canonical = parts[0]
+        saved = []
+        has_canonical_sources = False
+    expected_urls = [] if case == 'quick' else URLS
+    sources_preserved = len(urls) == len(saved) and set(urls) == set(saved)
+    if case != 'quick': sources_preserved &= bool(urls)
+    if offline: sources_preserved &= set(urls) == set(expected_urls)
+    return {'canonical_ui_match': bool(canonical.strip()) and (
+                canonical.strip() == rendered.strip() or plain_canonical.strip() == rendered.strip()),
+            'canonical_sources_expected': set(saved) == set(expected_urls) if offline else (case == 'quick' or bool(saved)),
+            'sources_preserved': sources_preserved,
+            'canonical_source_count': len(saved), 'ui_source_count': len(urls),
+            'expected_source_count': len(expected_urls) if offline else None,
+            'offline_fixture_match': offline and plain_canonical == expected_answer(case) and
+                has_canonical_sources == bool(expected_urls)}
+
+
+def quick_answer_correct(text):
+    return len(text.strip()) <= 128 and re.search(r'\b42\b', text) is not None
+
+
+INSTALL_TYPED_OBSERVER = '''
+window.__voxBenchObserve?.retire();
+const prior=new Set(arguments[0]);
+const state={submit_ms:null,first_text_ms:null,terminal_ms:null,inflight_text:false,users:0};
+const submit=()=>{if(state.submit_ms===null)state.submit_ms=performance.now()};
+document.addEventListener('submit',submit,true);
+const observe=()=>{
+ const users=Array.from(document.querySelectorAll('[data-turn-role="user"][data-request-id]')).filter(e=>!prior.has(e.dataset.requestId));
+ state.users=users.length;if(users.length!==1)return;
+ const row=Array.from(document.querySelectorAll('[data-turn-role="assistant"][data-request-id]')).find(e=>e.dataset.requestId===users[0].dataset.requestId);
+ if(!row)return;const terminal=['completed','cancelled','error','refused'].includes(row.dataset.turnOutcome);
+ const text=row.querySelector('.answer-stage__answer,.message__content');
+ if(state.first_text_ms===null&&text?.textContent?.trim()&&!text.querySelector('.message__thinking')){
+  state.first_text_ms=performance.now();state.inflight_text=!terminal;
+ }
+ if(terminal&&state.terminal_ms===null)state.terminal_ms=performance.now();
+};
+const observer=new MutationObserver(observe);observer.observe(document.body,{subtree:true,childList:true,characterData:true,attributes:true,attributeFilter:['data-turn-outcome','data-stage-status','data-content-kind']});
+window.__voxBenchObserve={read:()=>({...state}),retire:()=>{observer.disconnect();document.removeEventListener('submit',submit,true)}};
+'''
+
+
+def fill_composer(driver, text):
+    driver.execute_script('''const field=document.getElementById('promptComposer');
+Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(field,arguments[0]);
+field.dispatchEvent(new Event('input',{bubbles:true}));''', text)
+    wait_for(lambda: driver.execute_script('return document.querySelector(".composer button[type=submit]")?.disabled===false'),
+             5, 'typed_admission_ready')
+
+
+def stage_breakdown(events):
+    """All intervals here use one native monotonic origin; none are summed."""
+    def first(name):
+        return next((e['elapsed_us'] for e in events if e['stage'] == name), None)
+    def between(start, end):
+        a, b = first(start), first(end)
+        return (b-a)/1000 if a is not None and b is not None and b >= a else None
+    tools = []
+    for event in events:
+        if event['stage'] not in ('search_started', 'read_started'): continue
+        finish = next((e for e in events if e['round'] == event['round'] and
+                       e['elapsed_us'] >= event['elapsed_us'] and
+                       e['stage'] in ('tool_completed', 'tool_failed')), None)
+        tools.append({'operation': 'read' if event['stage'] == 'read_started' else 'search',
+                      'round': event['round'], 'completed': bool(finish and finish['stage'] == 'tool_completed'),
+                      'duration_ms': (finish['elapsed_us']-event['elapsed_us'])/1000 if finish else None})
+    rounds = []
+    for dispatch in (e for e in events if e['stage'] == 'generation_dispatched'):
+        text = next((e for e in events if e['round'] == dispatch['round'] and e['stage'] == 'first_model_text'), None)
+        rounds.append({'round': dispatch['round'], 'dispatch_to_first_text_ms':
+                       (text['elapsed_us']-dispatch['elapsed_us'])/1000 if text else None})
+    return {'native_admission_ms': between('prompt_command_started', 'prompt_admitted'),
+            'admission_to_dispatch_ms': between('prompt_admitted', 'generation_dispatched'),
+            'provider_and_tools_ms': between('generation_dispatched', 'provider_run_completed'),
+            'provider_to_canonical_commit_ms': between('provider_run_completed', 'canonical_turn_committed'),
+            'commit_to_command_result_ready_ms': between('canonical_turn_committed', 'command_result_ready'),
+            'model_rounds': rounds, 'tools': tools}
+
+
+def typed_checks(case, integrity, native, service, added_once, observed):
+    stages = {e['stage'] for e in native['events']}
+    checks = {'canonical_turn_added_once': added_once,
+              'canonical_ui_answer_match': integrity['canonical_ui_match'],
+              'canonical_sources_retained': integrity.get('canonical_sources_expected', False),
+              'no_dropped_observations': native['dropped'] == 0,
+              'normal_admission_and_commit': {'prompt_admitted', 'generation_dispatched', 'canonical_turn_committed'} <= stages,
+              'tool_reads_completed': case == 'quick' or (native['readable_pages'] >= 1 and native['tool_failures'] == 0),
+              'inflight_stream_presented': observed['inflight_text'],
+              'ui_sources_preserved': integrity['sources_preserved']}
+    if service is not None:
+        checks['fixture_answer_exact'] = integrity['offline_fixture_match']
+        checks['request_contract_and_history'] = service['model_matches'] and service['transcript_matches'] and service['history_matches']
+        checks['fixture_operations_exact'] = (service['failures'] == 0 and service['terminal'] and
+            all(service[a] == service[e] for a, e in [
+                ('generation_requests', 'expected_model_rounds'), ('searches', 'expected_searches'),
+                ('fetches', 'expected_fetches'), ('readable_sources', 'expected_readable_sources')]) and
+            sum(e['stage'] == 'generation_dispatched' for e in native['events']) == service['expected_model_rounds'])
+        checks['bounded_stream_gate'] = not service['stream_gate_timed_out']
+    return checks
+
+
+def typed_eligibility(checks):
+    required = {'canonical_turn_added_once', 'canonical_ui_answer_match', 'canonical_sources_retained',
+                'no_dropped_observations', 'normal_admission_and_commit', 'tool_reads_completed',
+                'completed_text_outcome'}
+    core = required <= checks.keys() and all(value is True for name, value in checks.items()
+               if name not in ('ui_sources_preserved', 'inflight_stream_presented'))
+    return core, core and checks.get('inflight_stream_presented') is True
+
+
+def exercise_typed(driver, case, services=None, timeout=180, duplicate_click=False):
+    before = invoke(driver, 'get_app_snapshot')
+    invoke(driver, 'benchmark_begin_flow')
+    if services:
+        if not services.wait_quiescent(): raise RuntimeError('Previous synthetic generation did not retire')
+        services.expected_case = case
+        services.expect_history(before['transcript'])
+    baseline = driver.execute_script('return Array.from(document.querySelectorAll("[data-turn-role=user][data-request-id]")).map(e=>e.dataset.requestId)')
+    driver.execute_script(INSTALL_TYPED_OBSERVER, baseline)
+    fill_composer(driver, CASES[case])
+    host_started = time.perf_counter()
+    button = driver.find_element('css selector', '.composer button[type=submit]')
+    if duplicate_click:
+        # Two browser form admissions, not direct native requests or a Stop click.
+        driver.execute_script('const form=document.querySelector(".composer");form.requestSubmit();form.requestSubmit()')
+    else:
+        button.click()
+    deadline = time.monotonic()+timeout
+    final = None
+    while time.monotonic() < deadline:
+        observation = driver.execute_script('return window.__voxBenchObserve.read()')
+        if services and observation['inflight_text']: services.release_stream()
+        state = driver.execute_script(OBSERVE, baseline)
+        if state.get('outcome') == 'completed' and state.get('stage') == 'completed' and state.get('kind') == 'text':
+            final = state
+            break
+        if state.get('outcome') in ('error', 'failed', 'cancelled', 'refused'):
+            break
+        time.sleep(0.05)
+    host_completed = time.perf_counter()
+    observation = driver.execute_script('return window.__voxBenchObserve.read()')
+    driver.execute_script('window.__voxBenchObserve.retire()')
+    if services:
+        services.release_stream()
+        if not services.wait_quiescent(): raise RuntimeError('Synthetic generation did not retire')
+    after = invoke(driver, 'get_app_snapshot')
+    native = invoke(driver, 'benchmark_snapshot')
+    added_once = len(after['transcript']) == len(before['transcript'])+1 and observation['users'] == 1
+    turn = after['transcript'][-1] if added_once else {}
+    text = turn.get('answer', {}).get('content', {}).get('text', '')
+    delivered = driver.execute_script('''const id=arguments[0];const row=Array.from(document.querySelectorAll('[data-turn-role=assistant][data-request-id]')).find(e=>e.dataset.requestId===id);
+return {text:row?.querySelector('.answer-stage__answer,.message__content')?.textContent||'',urls:Array.from(row?.querySelectorAll('.answer-stage__sources a')||[]).map(a=>a.href)};''', turn.get('request_id'))
+    integrity = answer_integrity(case, text, delivered['text'], delivered['urls'], services is not None, turn.get('sources'))
+    service = services.snapshot() if services else None
+    checks = typed_checks(case, integrity, native, service, added_once, observation)
+    checks['completed_text_outcome'] = final is not None
+    if case == 'quick': checks['quick_answer_correct'] = quick_answer_correct(text)
+    # The user deferred source-list projection repair, not canonical integrity.
+    core, qualification = typed_eligibility(checks)
+    def elapsed(end):
+        start = observation['submit_ms']
+        value = observation[end]
+        return value-start if start is not None and value is not None and value >= start else None
+    return {'case': case, 'coverage': 'typed-workflow', 'workflow_completed': core,
+            'qualification_eligible': qualification, 'all_checks_passed': all(checks.values()),
+            'checks': checks, 'defects': [name for name, passed in checks.items() if not passed],
+            'ui_submit_to_first_text_dom_ms': elapsed('first_text_ms'),
+            'ui_submit_to_terminal_dom_ms': elapsed('terminal_ms'),
+            'host_click_to_completed_observation_ms': (host_completed-host_started)*1000,
+            'native_breakdown': stage_breakdown(native['events']),
+            'native_events': native['events'], 'generation_counts': native['generation'],
+            'readable_pages': native['readable_pages'], 'integrity': integrity,
+            'service_metadata': service, 'canonical_turns_before': len(before['transcript']),
+            'canonical_turns_after': len(after['transcript']), 'dropped': native['dropped']}
+
+
+def typed_empty_admission(driver):
+    before = invoke(driver, 'get_app_snapshot')
+    count = invoke(driver, 'benchmark_snapshot')['generation']['generation_attempts']
+    driver.execute_script('''const field=document.getElementById('promptComposer');
+Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(field,'');
+field.dispatchEvent(new Event('input',{bubbles:true}));document.querySelector('.composer').requestSubmit();''')
+    time.sleep(0.2)
+    after = invoke(driver, 'get_app_snapshot')
+    return (before['transcript'] == after['transcript'] and after.get('active_request') is None and
+            invoke(driver, 'benchmark_snapshot')['generation']['generation_attempts'] == count)
+
+
+def typed_cancellation(driver, services):
+    before = invoke(driver, 'get_app_snapshot')
+    before_generations = invoke(driver, 'benchmark_snapshot')['generation']['generation_attempts']
+    invoke(driver, 'benchmark_begin_flow')
+    services.expected_case = 'quick'
+    services.expect_history(before['transcript'])
+    fill_composer(driver, CASES['quick'])
+    driver.find_element('css selector', '.composer button[type=submit]').click()
+    try:
+        wait_for(lambda: services.snapshot()['first_delta_sent'], 5, 'cancel_after_dispatch')
+        stop = wait_for(lambda: driver.find_elements('css selector', '.composer button[aria-label=Stop]'),
+                        5, 'cancel_control_available')[0]
+        stop.click()
+        def settled():
+            snapshot = invoke(driver, 'get_app_snapshot')
+            return snapshot if snapshot.get('active_request') is None and snapshot['runtime_phase'] == 'sleeping' else None
+        after = wait_for(settled, 5, 'native_cancellation_settlement')
+        if before['transcript'] != after['transcript'] or services.snapshot()['generation_requests'] != 1:
+            return False
+        services.release_stream()
+        if not services.wait_quiescent(): return False
+        # A cancellation receipt precedes the delayed provider completion. Check
+        # again after it is released/drained; server quiescence alone is not proof
+        # that the application ignored a late result.
+        deadline = time.monotonic()+CANCEL_POST_RELEASE_SECONDS
+        while True:
+            after = invoke(driver, 'get_app_snapshot')
+            generations = invoke(driver, 'benchmark_snapshot')['generation']['generation_attempts']
+            if (after['transcript'] != before['transcript'] or after.get('active_request') is not None or
+                    after['runtime_phase'] != 'sleeping' or generations != before_generations+1 or
+                    services.snapshot()['generation_requests'] != 1):
+                return False
+            if time.monotonic() >= deadline: return True
+            time.sleep(0.05)
+    finally:
+        services.release_stream()
+        if not services.wait_quiescent(): raise RuntimeError('Cancelled synthetic transport did not retire')
+
+
+def workflow_safety_passed(checks):
+    return all(checks.get(name) is True for name in WORKFLOW_SAFETY_CHECKS)
+
+
+def finding_dispositions(rows, relaunch, safety):
+    deferred, failures = set(), set()
+    for row in rows:
+        for name, passed in row['checks'].items():
+            if passed is True: continue
+            if name == 'ui_sources_preserved': deferred.add('ui_source_projection')
+            else: failures.add(name)
+    if relaunch and not relaunch['canonical_history_retained']: deferred.add('desktop_history_relaunch')
+    for name in WORKFLOW_SAFETY_CHECKS:
+        if name in safety and safety[name] is not True: failures.add('safety:'+name)
+    return sorted(deferred), sorted(failures)
+
+
+def start_typed_app(args, env):
+    global PHASE, APP_PID
+    from selenium import webdriver
+    from selenium.webdriver.common.options import BaseOptions
+    class Options(BaseOptions):
+        def to_capabilities(self): return self._caps
+        @property
+        def default_capabilities(self): return {'browserName': 'wry'}
+    APP_PID = None
+    port, native_port = free_port(), free_port()
+    PHASE = 'webdriver_starting'
+    process = subprocess.Popen([str(args.tools/'bin/tauri-driver'), '--port', str(port),
+        '--native-port', str(native_port), '--native-driver',
+        str(args.tools/'webkit/extracted/usr/bin/WebKitWebDriver')], env=env,
+        start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    driver = None
+    try:
+        wait_for(lambda: can_connect(port), 15, 'webdriver_startup')
+        options = Options()
+        options.set_capability('tauri:options', {'application': str(args.binary.resolve())})
+        PHASE = 'typed_app_launch'
+        started = time.perf_counter()
+        driver = webdriver.Remote(command_executor=f'http://127.0.0.1:{port}', options=options)
+        driver.set_script_timeout(30)
+        def ready():
+            native = invoke(driver, 'benchmark_snapshot')
+            return (native['entry'] == 'typed' and not native['capture_active'] and
+                    native['phase'] == 'sleeping' and
+                    driver.execute_script('return document.getElementById("composerInstantSelect")?.value') == 'custom-luna-none')
+        wait_for(ready, 30, 'typed_model_ready_without_capture')
+        snapshot = invoke(driver, 'get_app_snapshot')
+        if snapshot['preferences'].get('web_enabled') is not True:
+            raise RuntimeError('Web permission does not match the typed workflow')
+        return driver, process, (time.perf_counter()-started)*1000
+    except Exception as error:
+        print(json.dumps({'stage': PHASE, 'failure_category': type(error).__name__,
+                          'driver_exit_code': process.poll(), 'app_pid_observed': APP_PID is not None}))
+        shutdown_owned(driver, process)
+        raise
+
+
+def execute_typed(args):
+    global PHASE
+    run = args.output.resolve()
+    service = FakeServices(gated_stream=True) if not args.live else None
+    if service: service.__enter__()
+    driver = process = None
+    rows, supporting = [], []
+    safety, relaunch = {}, {}
+    try:
+        reservation = run/'reservation.json' if args.live else None
+        if args.live:
+            validate_offline_evidence(args.offline_evidence, args.binary, {}, {}, 'typed')
+            reserved = reserve_live_budget(args.ledger, reservation)
+        else:
+            reserved = 0
+        env = isolated_environment(run, args.config.resolve(), service.generation_endpoint if service else None,
+                                    args.live, reservation, entry='typed')
+        if service: env['VOXGOLEM_BENCH_MCP_ENDPOINT'] = service.mcp_endpoint
+        driver, process, launch_ms = start_typed_app(args, env)
+        for case in args.cases:
+            PHASE = 'typed_workflow'
+            result = exercise_typed(driver, case, service, args.flow_timeout)
+            rows.append(result)
+            if not result['workflow_completed']: break
+        if args.extended and len(rows) == len(CASES) and all(row['workflow_completed'] for row in rows):
+            PHASE = 'offline_context_and_safety'
+            safety['empty_admission'] = typed_empty_admission(driver)
+            warm = exercise_typed(driver, 'quick', service, args.flow_timeout)
+            safety['warm_context'] = warm['workflow_completed'] and warm['service_metadata']['history_turns_observed'] >= 3
+            supporting.append({'scenario': 'warm_followup', **warm})
+            history_ok = True
+            for index in range(14):
+                seeded = exercise_typed(driver, 'quick', service, args.flow_timeout)
+                history_ok &= seeded['workflow_completed'] and seeded['service_metadata']['history_matches']
+                supporting.append({'scenario': 'history_seed', 'index': index,
+                    **{k: v for k, v in seeded.items() if k not in ('native_events', 'service_metadata')}})
+                if not history_ok: break
+            followup = exercise_typed(driver, 'long_research', service, args.flow_timeout) if history_ok else None
+            safety['longer_history'] = bool(followup and followup['workflow_completed'] and
+                followup['service_metadata']['history_turns_observed'] >= 18)
+            if followup: supporting.append({'scenario': 'long_history_followup', **followup})
+            duplicate = exercise_typed(driver, 'quick', service, args.flow_timeout, duplicate_click=True)
+            safety['duplicate_ui_submission'] = duplicate['workflow_completed'] and duplicate['service_metadata']['generation_requests'] == 1
+            supporting.append({'scenario': 'duplicate_ui_submission', **duplicate})
+            safety['cancellation_retirement'] = typed_cancellation(driver, service)
+            previous = invoke(driver, 'get_app_snapshot')
+            previous_requests = service.snapshot()['generation_requests']
+            prior_exit = shutdown_owned(driver, process)
+            driver = process = None
+            if not prior_exit['app_exit_before_group_termination_observed']:
+                raise RuntimeError('Pre-relaunch application did not exit')
+            driver, process, relaunch_ms = start_typed_app(args, env)
+            restored = invoke(driver, 'get_app_snapshot')
+            safety['relaunch_preferences'] = previous['preferences'] == restored['preferences']
+            safety['relaunch_without_generation'] = (service.snapshot()['generation_requests'] == previous_requests and
+                invoke(driver, 'benchmark_snapshot')['generation']['generation_attempts'] == 0)
+            relaunch = {'launch_ms': relaunch_ms, 'canonical_turns_before': len(previous['transcript']),
+                'canonical_turns_after': len(restored['transcript']),
+                'canonical_history_retained': previous['transcript'] == restored['transcript'],
+                'preferences_retained': safety['relaunch_preferences'],
+                'no_new_generation': safety['relaunch_without_generation']}
+        safety['passed'] = workflow_safety_passed(safety)
+        cleanup = shutdown_owned(driver, process)
+        driver = process = None
+        summary = {'schema': 2, 'mode': 'live' if args.live else 'offline', 'entry': 'typed',
+            'coverage': 'typed-workflow', 'voice_tested': False, 'speech_assets_loaded': False,
+            'physical_microphone_tested': False, 'windows_or_phone_acceptance': False,
+            'diagnostic_only': False, 'workflow_identity': typed_identity(),
+            'binary_sha256': hashlib.sha256(args.binary.read_bytes()).hexdigest(),
+            'harness_sha256': harness_identity(), 'launch_to_typed_ready_observed_ms': launch_ms,
+            'rows': rows, 'supporting_rows': supporting, 'safety_checks': safety,
+            'relaunch': relaunch, 'cleanup': cleanup,
+            'live_batch_reserved': LIVE_BATCH_ALLOWANCE if args.live else 0, 'assignment_reserved': reserved,
+            'cancellation_post_release_observation_ms': CANCEL_POST_RELEASE_SECONDS*1000 if args.extended else None,
+            'offline_timing_note': 'Gated synthetic SSE delay is measured separately; not real-provider latency' if service else None}
+        completed = (len(rows) == len(args.cases) and all(row['workflow_completed'] for row in rows) and
+                     cleanup['app_exit_before_group_termination_observed'])
+        summary['workflow_completed'] = completed
+        summary['qualified_for_live'] = (not args.live and completed and len(rows) == len(CASES) and
+            all(row['qualification_eligible'] for row in rows) and safety['passed'])
+        summary['deferred_findings'], summary['failed_checks'] = finding_dispositions(rows+supporting, relaunch, safety)
+        private_json(run/'report.json', summary)
+        prune_owned_reports(run.parent)
+        print(json.dumps({'workflow_completed': completed, 'qualified_for_live': summary['qualified_for_live'],
+            'coverage': 'typed-workflow', 'completed_cases': len(rows), 'deferred_findings': summary['deferred_findings']}))
+        return 0 if completed else 1
+    finally:
+        if driver or process: shutdown_owned(driver, process)
+        if service: service.__exit__(None, None, None)
+
+
+def exercise(driver, case, timeout=180, wake_diagnostics=False, services=None, poll_interval=0.1, entry='voice'):
+    page_at_start = driver.execute_script('return {visibility:document.visibilityState, focused:document.hasFocus()}')
+    baseline = driver.execute_script('return Array.from(document.querySelectorAll("[data-turn-role=user][data-request-id]")).map(e=>e.dataset.requestId)')
+    before = invoke(driver, 'get_app_snapshot')
+    if wake_diagnostics:
+        invoke(driver, 'set_wake_diagnostics', {'enabled': True})
+    if entry == 'typed-control':
+        driver.execute_script('''const field=document.getElementById('promptComposer');Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(field,arguments[0]);field.dispatchEvent(new Event('input',{bubbles:true}));''', CASES[case])
+        wait_for(lambda: driver.execute_script('return !document.querySelector(".composer button[type=submit]")?.disabled'), 5, 'typed_control_admission')
+    started = time.perf_counter()
+    deadline = time.monotonic() + timeout
+    try:
+        if entry == 'voice':
+            invoke(driver, 'benchmark_queue', {'fixture': case})
+        else:
+            driver.find_element('css selector', '.composer button[type=submit]').click()
+    except RuntimeError:
+        return {'case': case, 'passed': False, 'failure': 'source_retired_before_completion',
+                'ui_state': ui_state(driver),
+                'page_at_start': page_at_start,
+                'page_at_outcome': driver.execute_script('return {visibility:document.visibilityState, focused:document.hasFocus()}'),
+                'audio_callback_metadata': driver.execute_script('return window.__VOXGOLEM_APP_BENCH_AUDIO__?.() || null'),
+                'service_metadata': services.snapshot() if services else None,
+                'native': invoke(driver, 'benchmark_snapshot')}
+    source_end_observed = time.perf_counter()
+    first = None
+    final = None
+    saw_inflight = False
+    next_diagnostic = time.monotonic() + 2
+    wake_metrics = {'maximum_score': 0, 'maximum_peak': 0, 'sample_position': 0}
+    failure = 'flow_deadline'
+    notices = set()
+    while time.monotonic() < deadline:
+        if wake_diagnostics and time.monotonic() >= next_diagnostic:
+            diagnostics = invoke(driver, 'get_wake_diagnostics')
+            for event in diagnostics.get('events', []):
+                if event.get('kind') == 'score':
+                    wake_metrics['maximum_score'] = max(wake_metrics['maximum_score'], event['score'])
+                    wake_metrics['maximum_peak'] = max(wake_metrics['maximum_peak'], event['peak'])
+                    wake_metrics['sample_position'] = max(wake_metrics['sample_position'], event['sample_position'])
+            next_diagnostic = time.monotonic() + 2
+            current_native = invoke(driver, 'benchmark_snapshot')
+            if not current_native['capture_active']:
+                failure = 'capture_retired_before_completion'
+                break
+        state = driver.execute_script(OBSERVE, baseline)
+        notices.update(state.get('notice_categories', []))
+        now = time.perf_counter()
+        if state.get('outcome') in ('error', 'failed', 'cancelled', 'refused'):
+            raise RuntimeError('Correlated turn failed')
+        if state.get('nonblank') and first is None:
+            first = now
+        if state.get('nonblank') and state.get('outcome') not in ('completed', 'cancelled', 'error', 'refused'):
+            saw_inflight = True
+        if state.get('outcome') == 'completed' and state.get('stage') == 'completed' and state.get('kind') == 'text':
+            final = state
+            break
+        time.sleep(poll_interval)
+    if final is None or first is None:
+        # Fixed numeric/category evidence is safe even when a preceding stage failed.
+        return {'case': case, 'passed': False, 'failure': failure,
+                'ui_state': ui_state(driver),
+                'page_at_start': page_at_start,
+                'page_at_outcome': driver.execute_script('return {visibility:document.visibilityState, focused:document.hasFocus()}'),
+                'wake_diagnostic_metadata': wake_metrics if wake_diagnostics else None,
+                'notice_categories': sorted(notices),
+                'audio_callback_metadata': driver.execute_script('return window.__VOXGOLEM_APP_BENCH_AUDIO__?.() || null'),
+                'service_metadata': services.snapshot() if services else None,
+                'native': invoke(driver, 'benchmark_snapshot')}
+    after = invoke(driver, 'get_app_snapshot')
+    native = invoke(driver, 'benchmark_snapshot')
+    flow = max((e['flow'] for e in native['events']), default=0)
+    events = [e for e in native['events'] if e['flow'] == flow]
+    canonical_added_once = len(after['transcript']) == len(before['transcript'])+1
+    text = after['transcript'][-1].get('answer', {}).get('content', {}).get('text', '') if canonical_added_once else ''
+    # Compare internally; neither canonical text nor source addresses enter reports.
+    request_id = after['transcript'][-1].get('request_id') if canonical_added_once else None
+    delivered = driver.execute_script('''const id=arguments[0];
+const rows=Array.from(document.querySelectorAll('[data-turn-role="assistant"][data-request-id]')).filter(e=>e.dataset.requestId===id);
+if(rows.length!==1)return {text:'',urls:[]};
+const rendered=rows[0].querySelector('.answer-stage__answer,.message__content')?.textContent||'';
+const urls=Array.from(rows[0].querySelectorAll('.answer-stage__sources a')).map(a=>a.href);
+return {text:rendered,urls};''', request_id)
+    integrity = answer_integrity(case, text, delivered['text'], delivered['urls'], services is not None,
+                                 after['transcript'][-1].get('sources') if canonical_added_once else None)
+    final.update(integrity)
+    final['quick_correct'] = quick_answer_correct(text)
+    sources_preserved = integrity['sources_preserved']
+    service_metadata = services.snapshot() if services else None
+    passed = accepted_flow(case, final, native, canonical_added_once, sources_preserved,
+                           saw_inflight, service_metadata, entry == 'voice')
+    return {'case': case, 'passed': bool(passed),
+            'page_at_start': page_at_start,
+            'page_at_outcome': driver.execute_script('return {visibility:document.visibilityState, focused:document.hasFocus()}'),
+            'queue_to_first_text_observed_ms': (first-started)*1000,
+            'queue_to_completed_observed_ms': (now-started)*1000,
+            'source_end_receipt_to_first_text_observed_ms': (first-source_end_observed)*1000 if entry == 'voice' else None,
+            'source_end_receipt_to_completed_observed_ms': (now-source_end_observed)*1000 if entry == 'voice' else None,
+            'source_queue_completion_receipt_ms': (source_end_observed-started)*1000 if entry == 'voice' else None,
+            'canonical_turn_added_once': len(after['transcript']) == len(before['transcript'])+1,
+            'canonical_sources_preserved': sources_preserved,
+            'canonical_ui_match': final['canonical_ui_match'],
+            'canonical_source_count': final['canonical_source_count'],
+            'ui_source_count': final['ui_source_count'],
+            'expected_source_count': final['expected_source_count'],
+            'offline_fixture_match': final['offline_fixture_match'] if services else None,
+            'observed_inflight_text': saw_inflight,
+            'readable_pages': native.get('readable_pages', 0),
+            'service_metadata': service_metadata,
+            'source_links': final['source_links'], 'native_events': events,
+            'dropped': native['dropped']}
+
+
+def execute(args):
+    global PHASE
+    validate_benchmark_binary(args.binary)
+    if args.entry == 'typed':
+        return execute_typed(args)
+    from selenium import webdriver
+    from selenium.webdriver.common.options import BaseOptions
+
+    class Options(BaseOptions):
+        def to_capabilities(self):
+            return self._caps
+        @property
+        def default_capabilities(self):
+            return {'browserName': 'wry'}
+
+    run = args.output.resolve()
+    fixtures = generate_fixtures(run / 'fixtures', voice=args.voice, wake_phrase=args.wake_phrase)
+    if sum(fixture['byte_count'] for fixture in fixtures.values()) > 16*1024*1024:
+        raise ValueError('Synthetic fixture bundle exceeds its byte budget')
+    speech_identity = speech_configuration_identity(args.config.resolve())
+    services = FakeServices() if not args.live else None
+    if services:
+        services.__enter__()
+    driver = None
+    process = None
+    rows = []
+    try:
+        reservation = run / 'reservation.json' if args.live else None
+        if args.live:
+            validate_offline_evidence(args.offline_evidence, args.binary, fixtures, speech_identity)
+            reserved = reserve_live_budget(args.ledger, reservation)
+        else:
+            reserved = 0
+        env = isolated_environment(run, args.config.resolve(),
+                                   services.generation_endpoint if services else None,
+                                   args.live, reservation)
+        if services:
+            env['VOXGOLEM_BENCH_MCP_ENDPOINT'] = services.mcp_endpoint
+        if args.driver_free_diagnostic:
+            return driver_free_diagnostic(args, run, fixtures, env, services)
+        port, native_port = free_port(), free_port()
+        PHASE = 'webdriver_starting'
+        process = subprocess.Popen([str(args.tools/'bin/tauri-driver'), '--port', str(port),
+             '--native-port', str(native_port), '--native-driver',
+             str(args.tools/'webkit/extracted/usr/bin/WebKitWebDriver')],
+             env=env, start_new_session=True, stdout=subprocess.DEVNULL,
+             stderr=subprocess.DEVNULL)
+        wait_for(lambda: can_connect(port), 15, 'webdriver_startup')
+        options = Options()
+        options.set_capability('tauri:options', {'application': str(args.binary.resolve())})
+        PHASE = 'app_launch'
+        launch = time.perf_counter()
+        driver = webdriver.Remote(command_executor=f'http://127.0.0.1:{port}', options=options)
+        driver.set_script_timeout(75)
+        PHASE = 'automatic_capture_start'
+        ready = wait_for(lambda: invoke(driver, 'benchmark_snapshot').get('capture_active'),
+                         60, 'automatic_capture_start')
+        launch_ms = (time.perf_counter()-launch)*1000
+        selected = driver.execute_script('return document.getElementById("composerInstantSelect")?.value')
+        if selected != 'custom-luna-none':
+            raise RuntimeError('Requested model was not selected')
+        if args.event_loop_diagnostic:
+            driver.execute_script('''const metrics={ticks:0,max_tick_gap_ms:0};window.__benchLoopDiagnostic=metrics;let previous=performance.now();setInterval(()=>{const now=performance.now();metrics.max_tick_gap_ms=Math.max(metrics.max_tick_gap_ms,now-previous);metrics.ticks++;previous=now;},50);''')
+        for case in args.cases:
+            PHASE = 'voice_flow'
+            if services:
+                services.expected_case = case
+            wait_for(lambda: invoke(driver, 'benchmark_snapshot')['phase'] == 'sleeping',
+                     15, 'idle_before_input')
+            result = exercise(driver, case, args.flow_timeout, args.wake_diagnostics, services, args.poll_interval, args.entry)
+            if args.entry == 'typed-control':
+                result['typed_control_passed'] = result['passed']
+                result['passed'] = False
+            if args.event_loop_diagnostic:
+                result['event_loop_diagnostic'] = driver.execute_script('return window.__benchLoopDiagnostic')
+            result['launch_to_capture_observed_ms'] = launch_ms if not rows else None
+            rows.append(result)
+            if not result.get('typed_control_passed', result['passed']):
+                break
+        summary = {'schema': 1, 'mode': 'live' if args.live else 'offline',
+                   'requested_model': 'custom-luna-none', 'effort': 'none',
+                   'entry': args.entry,
+                   'software_input': True, 'physical_microphone_tested': False,
+                   'diagnostic_only': args.entry != 'voice' or args.wake_diagnostics or args.event_loop_diagnostic or args.poll_interval != 0.1,
+                   'wake_score_diagnostics': args.wake_diagnostics,
+                   'browser_call_probes': args.event_loop_diagnostic,
+                   'windows_or_phone_acceptance': False,
+                   'gpu_runtime_devices_available': any(Path(p).exists() for p in ['/dev/dri', '/dev/dxg']),
+                   'shared_memory_available': Path('/dev/shm').is_dir(),
+                   'private_session_bus': True, 'private_process_namespace': True,
+                   'binary_sha256': hashlib.sha256(args.binary.read_bytes()).hexdigest(),
+                   'harness_sha256': harness_identity(),
+                   'fixture_metadata': fixtures, 'rows': rows,
+                   'speech_identity': speech_identity,
+                   'live_batch_reserved': LIVE_BATCH_ALLOWANCE if args.live else 0,
+                   'assignment_reserved': reserved,
+                   'nominal_observation_interval_ms': args.poll_interval*1000}
+        cleanup = shutdown_owned(driver, process)
+        driver = None
+        process = None
+        summary['cleanup'] = cleanup
+        private_json(run/'report.json', summary)
+        prune_owned_reports(run.parent)
+        passed = (not summary['diagnostic_only'] and len(rows)==len(args.cases) and
+                  all(r['passed'] for r in rows) and cleanup['app_exit_before_group_termination_observed'])
+        print(json.dumps({'passed': passed,
+                          'mode': summary['mode'], 'completed_flows': len(rows)}))
+        return 0 if passed else 1
+    except Exception:
+        if driver is not None and PHASE == 'automatic_capture_start':
+            try:
+                startup = invoke(driver, 'get_startup_state')
+                native = invoke(driver, 'benchmark_snapshot')
+                print(json.dumps({'stage': PHASE, 'startup_kind': startup.get('kind'),
+                    'voice_input_available': startup.get('voice_input_available'),
+                    'capabilities': [{'id': c.get('id'), 'state': c.get('state')} for c in startup.get('capabilities', [])],
+                    'native': native}))
+            except Exception:
+                print(json.dumps({'stage': PHASE, 'snapshot_available': False}))
+        raise
+    finally:
+        if driver or process:
+            shutdown_owned(driver, process)
+        if services:
+            services.__exit__(None, None, None)
+
+
+def can_connect(port):
+    try:
+        with socket.create_connection(('127.0.0.1', port), timeout=0.2):
+            return True
+    except OSError:
+        return False
+
+
+def driver_free_diagnostic(args, run, fixtures, env, services):
+    """Equivalent source/app control with no automation session. Never acceptance."""
+    case = args.cases[0]
+    services.expected_case = case
+    env.pop('TAURI_AUTOMATION', None)
+    env['VOXGOLEM_BENCH_AUTO_DIAGNOSTIC_CASE'] = case
+    process = subprocess.Popen([str(args.binary.resolve())], env=env, start_new_session=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(min(args.flow_timeout, fixtures[case]['duration_seconds']+13))
+        process.terminate()
+        process.wait(timeout=15)
+        path = run/'driver-free-diagnostic.json'
+        native = json.loads(path.read_text()) if path.exists() and path.stat().st_size <= 128*1024 else None
+        private_json(run/'report.json', {'schema': 1, 'mode': 'offline',
+            'diagnostic_only': True, 'driver_free': True,
+            'snapshot_after_shutdown': True,
+            'binary_sha256': hashlib.sha256(args.binary.read_bytes()).hexdigest(),
+            'rows': [{'case': case, 'passed': False, 'native': native,
+                      'service_metadata': services.snapshot()}],
+            'exit_code': process.returncode})
+        if path.exists(): path.unlink()
+        print(json.dumps({'passed': False, 'diagnostic_only': True,
+                          'driver_free': True, 'service_metadata': services.snapshot()}))
+        return 1
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--binary', type=Path, required=True)
+    parser.add_argument('--tools', type=Path, required=True)
+    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--config', type=Path, required=True)
+    parser.add_argument('--wake-phrase', help='Required for voice, unused by typed-workflow')
+    parser.add_argument('--voice', default='en-gb', choices=['en-gb', 'en-us', 'en-us+f3', 'en-gb+f2'])
+    parser.add_argument('--cases', nargs='+', choices=list(CASES), default=list(CASES))
+    parser.add_argument('--entry', choices=['voice', 'typed', 'typed-control'], default='voice', help='Typed is workflow coverage excluding capture; typed-control remains diagnostic')
+    parser.add_argument('--extended', action='store_true', help='Offline typed context/history/cancellation/relaunch matrix')
+    parser.add_argument('--flow-timeout', type=float, default=180)
+    parser.add_argument('--poll-interval', type=float, default=0.1, help='Non-default intervals are observer-effect diagnostics, not qualifying evidence')
+    parser.add_argument('--wake-diagnostics', action='store_true', help='Bounded score diagnostics for fixture qualification, not final timing runs')
+    parser.add_argument('--event-loop-diagnostic', action='store_true', help='Temporary browser heartbeat probe; never qualifying evidence')
+    parser.add_argument('--driver-free-diagnostic', action='store_true', help='Offline automation-effect control only; never qualifying evidence')
+    parser.add_argument('--live', action='store_true')
+    parser.add_argument('--offline-evidence', type=Path, help='Matching successful offline report, required before live reservation')
+    parser.add_argument('--ledger', type=Path, default=ASSIGNMENT_LEDGER)
+    parser.add_argument('--inside-offline', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--inside-session', action='store_true', help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    args.tools = args.tools.resolve()
+    if args.entry != 'typed' and not args.wake_phrase:
+        parser.error('Voice and legacy controls require an explicit synthetic wake phrase')
+    if args.extended and (args.entry != 'typed' or args.live):
+        parser.error('Extended safety/context tests are offline typed-workflow only')
+    if (not args.output.resolve().is_relative_to(ARTIFACT_ROOT.resolve()) or
+            args.output.resolve() in (ARTIFACT_ROOT.resolve(), ASSIGNMENT_LEDGER.resolve())):
+        parser.error('Benchmark artifacts must use a private run under the outer project artifacts tree')
+    if not 10 <= args.flow_timeout <= 180:
+        parser.error('Flow timeout must be between 10 and 180 seconds')
+    if not 0.05 <= args.poll_interval <= 1:
+        parser.error('Observer interval must be 0.05..1 seconds')
+    if args.driver_free_diagnostic and (args.live or len(args.cases) != 1 or args.entry != 'voice'):
+        parser.error('Driver-free diagnostic requires exactly one offline case')
+    if args.entry == 'typed-control' and len(args.cases) != 1:
+        parser.error('Typed controls use one fresh app/case, not a substitute voice matrix')
+    if args.live and args.inside_offline:
+        parser.error('The internal namespace continuation cannot be used for live mode')
+    if args.inside_session and not args.live:
+        parser.error('Offline continuation requires its network namespace')
+    if args.entry == 'typed' and (args.wake_diagnostics or args.event_loop_diagnostic or args.poll_interval != 0.1):
+        parser.error('Typed-workflow measurements cannot enable diagnostic probes')
+    if args.live and (args.entry not in ('voice', 'typed') or args.wake_diagnostics or args.event_loop_diagnostic or args.poll_interval != 0.1):
+        parser.error('Diagnostic probes cannot qualify or run final live measurement')
+    if args.live and args.cases != list(CASES):
+        parser.error('The final live batch runs each approved case once, in order')
+    if args.ledger.resolve() != ASSIGNMENT_LEDGER.resolve():
+        parser.error('Live allowance uses the fixed assignment-wide ledger')
+    inside = args.inside_offline or args.inside_session
+    if not inside:
+        args.output = args.output.resolve()
+        args.output.mkdir(mode=0o700, parents=True, exist_ok=False)
+        private_json(args.output/'.app-bench-run.json', {'schema': 1,
+            'owner': 'voxgolem-app-bench', 'created_epoch_seconds': time.time()})
+        prune_owned_reports(args.output.parent)
+    if not inside:
+        env = os.environ.copy()
+        env['VOXGOLEM_BENCH_ORIGINAL_NETNS'] = os.readlink('/proc/self/ns/net')
+        env['VOXGOLEM_BENCH_ORIGINAL_PIDNS'] = os.readlink('/proc/self/ns/pid')
+        env['VOXGOLEM_BENCH_ORIGINAL_DBUS'] = env.get('DBUS_SESSION_BUS_ADDRESS', '')
+        env['VOXGOLEM_BENCH_SOURCE_HOME'] = env.get('HOME', '')
+        env['VOXGOLEM_BENCH_SOURCE_DATA_HOME'] = env.get('XDG_DATA_HOME', '')
+        runtime = args.output/'runtime'
+        runtime.mkdir(mode=0o700)
+        if env.get('WAYLAND_DISPLAY') and not Path(env['WAYLAND_DISPLAY']).is_absolute() and env.get('XDG_RUNTIME_DIR'):
+            env['WAYLAND_DISPLAY'] = str(Path(env['XDG_RUNTIME_DIR'])/env['WAYLAND_DISPLAY'])
+        env['XDG_RUNTIME_DIR'] = str(runtime)
+        for name, folder in [('HOME','home'),('XDG_CONFIG_HOME','config'),('XDG_DATA_HOME','data'),
+                             ('XDG_STATE_HOME','state'),('XDG_CACHE_HOME','cache')]:
+            path = args.output/folder
+            path.mkdir(mode=0o700)
+            env[name] = str(path)
+        dbus = shutil.which('dbus-run-session')
+        if dbus is None: raise RuntimeError('Private D-Bus session tooling is required')
+        command = ['bwrap', '--unshare-pid', '--die-with-parent']
+        if not args.live: command += ['--unshare-net']
+        command += ['--bind' if args.live else '--ro-bind', '/', '/',
+                   '--dev', '/dev', '--tmpfs', '/dev/shm', '--proc', '/proc', '--tmpfs', '/tmp',
+                   '--dir', '/tmp/opencode', '--bind', str(args.tools), str(args.tools),
+                   '--bind', str(args.output), str(args.output)]
+        # Keep normal graphics resources without exposing any audio input device.
+        for graphics in ['/dev/dri', '/dev/dxg']:
+            if Path(graphics).exists(): command += ['--dev-bind', graphics, graphics]
+        if Path('/tmp/.X11-unix').is_dir():
+            command += ['--ro-bind', '/tmp/.X11-unix', '/tmp/.X11-unix']
+        command += [dbus, '--', sys.executable, str(Path(__file__).resolve()), *sys.argv[1:],
+                    '--inside-session' if args.live else '--inside-offline']
+        return subprocess.call(command, env=env, stderr=subprocess.DEVNULL)
+    validate_private_session(os.environ.get('VOXGOLEM_BENCH_ORIGINAL_PIDNS'),
+        os.readlink('/proc/self/ns/pid'), os.environ.get('VOXGOLEM_BENCH_ORIGINAL_DBUS'),
+        os.environ.get('DBUS_SESSION_BUS_ADDRESS'))
+    subprocess.run(['gdbus', 'call', '--session', '--dest', 'org.freedesktop.DBus',
+        '--object-path', '/org/freedesktop/DBus', '--method', 'org.freedesktop.DBus.Peer.Ping'],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+    if not args.live:
+        interfaces = [line.split(':')[0].strip() for line in Path('/proc/net/dev').read_text().splitlines() if ':' in line]
+        validate_offline_namespace(os.environ.get('VOXGOLEM_BENCH_ORIGINAL_NETNS'),
+                                   os.readlink('/proc/self/ns/net'), interfaces)
+    for key in list(os.environ):
+        if key.lower().endswith('_proxy'):
+            del os.environ[key]
+    try:
+        return execute(args)
+    except Exception as error:
+        # Deliberately do not print WebDriver/provider exception payloads.
+        print(json.dumps({'passed': False, 'stage': PHASE, 'failure_category': type(error).__name__}))
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

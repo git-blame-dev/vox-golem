@@ -2,6 +2,9 @@
 name = "voxgolem-audio"
 edition.workspace = true
 
+[features]
+benchmark-input = []
+
 [dependencies]
 rodio = { version = "=0.22.2", default-features = false, features = ["playback"] }
 

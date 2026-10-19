@@ -4,6 +4,8 @@
 #[cfg(any(feature = "custom-openai", feature = "custom-openai-webpki"))]
 pub mod chatgpt_auth;
 
+#[cfg(feature = "app-benchmark")]
+pub mod app_benchmark;
 #[cfg(feature = "desktop")]
 pub mod completion;
 #[cfg(any(feature = "custom-openai", feature = "custom-openai-webpki"))]

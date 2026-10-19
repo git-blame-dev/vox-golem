@@ -4,6 +4,9 @@ edition.workspace = true
 publish = false
 build = "build.rs"
 
+[features]
+app-benchmark = ["voxgolem-audio/benchmark-input", "voxgolem-platform/app-benchmark"]
+
 [lib]
 name = "vox_golem_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]

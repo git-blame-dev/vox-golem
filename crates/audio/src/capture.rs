@@ -8,6 +8,11 @@ use rodio::cpal;
 use rodio::cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rodio::cpal::Sample as _;
 
+#[cfg(feature = "benchmark-input")]
+mod benchmark;
+#[cfg(feature = "benchmark-input")]
+pub use benchmark::BenchmarkAudioBoundary;
+
 const MAX_CAPTURE_ID: u64 = 9_007_199_254_740_991;
 const SAMPLE_QUEUE_CAPACITY: usize = 32;
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -84,6 +89,8 @@ impl std::error::Error for CaptureError {}
 
 pub struct AudioCaptureService {
     shared: Arc<Shared>,
+    #[cfg(feature = "benchmark-input")]
+    benchmark_input: Option<(u32, usize)>,
 }
 
 struct Shared {
@@ -103,9 +110,34 @@ struct State {
 }
 
 struct ActiveCapture {
-    stream: cpal::Stream,
+    stream: SourceHandle,
     control: mpsc::Sender<WorkerControl>,
     worker: JoinHandle<()>,
+}
+
+enum SourceHandle {
+    Native(cpal::Stream),
+    #[cfg(feature = "benchmark-input")]
+    Benchmark(benchmark::Producer),
+}
+
+impl SourceHandle {
+    fn play(&self) -> Result<(), CaptureError> {
+        match self {
+            Self::Native(stream) => stream
+                .play()
+                .map_err(|error| CaptureError::InputFailed(error.to_string())),
+            #[cfg(feature = "benchmark-input")]
+            Self::Benchmark(_) => Ok(()),
+        }
+    }
+
+    fn activate(&self) {
+        #[cfg(feature = "benchmark-input")]
+        if let Self::Benchmark(producer) = self {
+            producer.activate();
+        }
+    }
 }
 
 enum WorkerControl {
@@ -117,6 +149,8 @@ enum WorkerControl {
 impl AudioCaptureService {
     pub fn new() -> Self {
         Self {
+            #[cfg(feature = "benchmark-input")]
+            benchmark_input: None,
             shared: Arc::new(Shared {
                 operation_lock: Mutex::new(()),
                 state: Mutex::new(State::default()),
@@ -126,6 +160,10 @@ impl AudioCaptureService {
     }
 
     pub fn list_input_devices(&self) -> Result<Vec<InputDevice>, CaptureError> {
+        #[cfg(feature = "benchmark-input")]
+        if self.benchmark_input.is_some() {
+            return Ok(Vec::new());
+        }
         enumerate_input_devices()
     }
 
@@ -196,7 +234,31 @@ impl AudioCaptureService {
             stop_active(previous, &self.shared)?;
         }
 
-        let (active, fell_back_to_default) = prepare_capture(
+        #[cfg(feature = "benchmark-input")]
+        let prepared = if let Some((rate, channels)) = self.benchmark_input {
+            benchmark::prepare(
+                Arc::downgrade(&self.shared),
+                capture_id,
+                rate,
+                channels,
+                target_rate_hz,
+                frame_size,
+                callback,
+                terminal_callback,
+            )
+        } else {
+            prepare_capture(
+                Arc::downgrade(&self.shared),
+                capture_id,
+                selected_device_id.as_deref(),
+                target_rate_hz,
+                frame_size,
+                callback,
+                terminal_callback,
+            )
+        };
+        #[cfg(not(feature = "benchmark-input"))]
+        let prepared = prepare_capture(
             Arc::downgrade(&self.shared),
             capture_id,
             selected_device_id.as_deref(),
@@ -204,10 +266,11 @@ impl AudioCaptureService {
             frame_size,
             callback,
             terminal_callback,
-        )?;
+        );
+        let (active, fell_back_to_default) = prepared?;
         if let Err(error) = active.stream.play() {
             let _ = stop_uninstalled_active(active, &self.shared);
-            return Err(CaptureError::InputFailed(error.to_string()));
+            return Err(error);
         }
         {
             let mut state = self
@@ -241,6 +304,12 @@ impl AudioCaptureService {
                     "audio capture worker stopped during startup".to_string(),
                 ));
             }
+            state
+                .active
+                .as_ref()
+                .expect("active capture was just started")
+                .stream
+                .activate();
         }
 
         Ok(CaptureStart {
@@ -428,7 +497,7 @@ fn prepare_capture(
     });
     Ok((
         ActiveCapture {
-            stream,
+            stream: SourceHandle::Native(stream),
             control: worker_control,
             worker,
         },
