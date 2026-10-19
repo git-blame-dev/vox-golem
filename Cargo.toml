@@ -7,6 +7,7 @@ members = [
   "crates/assistant-plugin",
   "crates/capture-plugin",
   "crates/core",
+  "crates/conversation-store",
   "crates/model",
   "crates/platform",
   "crates/wear-assistant-native"

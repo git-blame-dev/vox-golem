@@ -1,0 +1,14 @@
+[package]
+name = "voxgolem-conversation-store"
+edition.workspace = true
+publish = false
+
+[dependencies]
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "cache"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sha2 = "=0.10.9"
+voxgolem-core = { path = "../core", default-features = false }
+
+[lints]
+workspace = true
