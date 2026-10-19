@@ -57,7 +57,7 @@ internal class ReplicationController(
                         require(payload.length() == 2)
                         val offers = payload.getJSONArray("offers")
                         ReplicationWire.entries(offers)
-                        domain.reconcile(store.snapshot(), JSONObject().put("version", 1).put("revision", payload.getString("revision"))
+                        domain.reconcile(store.snapshot(), JSONObject().put("version", 2).put("revision", payload.getString("revision"))
                             .put("entries", offers).put("next", JSONObject.NULL))
                     }
                     if (state.load(peer) == null) begin(peer)
@@ -127,7 +127,7 @@ internal class ReplicationController(
         val payload = frame.getJSONObject("payload")
         require(payload.length() == 1)
         val page = payload.getJSONObject("page")
-        require(page.length() == 4 && page.get("version") == 1)
+        require(page.length() == 4 && page.get("version") == 2)
         val entries = page.getJSONArray("entries")
         ReplicationWire.entries(entries)
         val peer = frame.getString("sender")
@@ -291,7 +291,7 @@ internal class ReplicationController(
 
     private fun requestNewAncestors(session: JSONObject) {
         if (session.getString("phase") != "records") return
-        val page = JSONObject().put("version", 1).put("revision", session.getString("revision")).put("entries", JSONArray()).put("next", JSONObject.NULL)
+        val page = JSONObject().put("version", 2).put("revision", session.getString("revision")).put("entries", JSONArray()).put("next", JSONObject.NULL)
         val missing = domain.reconcile(store.snapshot(), page).getJSONArray("missing_ancestors")
         val attempts = attemptedAncestors(session)
         val remaining = session.getJSONArray("remaining")
@@ -312,7 +312,7 @@ internal class ReplicationController(
         val receipts = payload.getJSONArray("receipts")
         require(receipts.length() in 1..ReplicationWire.MAX_ITEMS)
         for (receipt in ReplicationWire.arrayObjects(receipts)) {
-            require(receipt.length() == 4 && receipt.get("version") == 1 && receipt.getString("recipient_replica") == frame.getString("sender"))
+            require(receipt.length() == 4 && receipt.get("version") == 2 && receipt.getString("recipient_replica") == frame.getString("sender"))
             ReplicationWire.idKey(receipt.getJSONObject("operation")); ReplicationWire.bodyKey(receipt.getString("body_key"))
         }
         store.acknowledge(frame.getString("sender"), receipts)

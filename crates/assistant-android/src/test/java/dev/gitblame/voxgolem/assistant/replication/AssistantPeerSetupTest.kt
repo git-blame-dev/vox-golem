@@ -63,8 +63,8 @@ class AssistantPeerSetupTest {
         assertNull(reopened.replicaForNode("synthetic-new-right-node"))
     }
 
-    @Test fun directV1AndV2MigrationsPreserveHistoryOutboxSessionsCleanupAndProviderFiles() = worker {
-        for (oldVersion in 1..2) {
+    @Test fun historyEpochResetsOnlySessionsAndPreservesCurrentTrustedBindingsAndProviderFiles() = worker {
+        for (oldVersion in 1..3) {
             val context = isolated("synthetic-migration-$oldVersion")
             val auth = File(context.noBackupFilesDir, "assistant-auth.json").apply { writeText("Synthetic externally owned metadata and access") }
             val legacy = File(context.filesDir, "codex-auth.json").apply { writeText("Synthetic externally owned legacy access") }
@@ -81,24 +81,28 @@ class AssistantPeerSetupTest {
                     db.execSQL("CREATE TABLE peers (replica TEXT PRIMARY KEY, session TEXT)")
                     db.execSQL("CREATE TABLE cleanup_peers (replica TEXT PRIMARY KEY)")
                     db.execSQL("CREATE TABLE setup (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-                    db.execSQL("CREATE TABLE native_bindings (replica TEXT PRIMARY KEY, peer_installation TEXT NOT NULL, association TEXT NOT NULL, hub TEXT NOT NULL, credentials_allowed INTEGER NOT NULL)")
+                    if (oldVersion < 3) db.execSQL("CREATE TABLE native_bindings (replica TEXT PRIMARY KEY, peer_installation TEXT NOT NULL, association TEXT NOT NULL, hub TEXT NOT NULL, credentials_allowed INTEGER NOT NULL)")
+                    else db.execSQL("CREATE TABLE native_bindings (replica TEXT PRIMARY KEY, association TEXT NOT NULL)")
                     db.execSQL("CREATE TABLE retry (singleton INTEGER PRIMARY KEY, attempts INTEGER NOT NULL, due INTEGER NOT NULL)")
                     db.execSQL("INSERT INTO retry VALUES (1, 2, 1800000030000)")
                     db.execSQL("INSERT INTO peers VALUES (?, ?)", arrayOf(b, "{\"synthetic_session\":true}"))
                     db.execSQL("INSERT INTO cleanup_peers VALUES (?)", arrayOf(c))
                     db.execSQL("INSERT INTO setup VALUES ('status', '{\"reason\":\"INVITATION_PENDING\"}')")
-                    db.execSQL("INSERT INTO native_bindings VALUES (?, ?, ?, ?, 1)", arrayOf(b, c, a, a))
+                    if (oldVersion < 3) db.execSQL("INSERT INTO native_bindings VALUES (?, ?, ?, ?, 1)", arrayOf(b, c, a, a))
+                    else db.execSQL("INSERT INTO native_bindings VALUES (?, ?)", arrayOf(b, a))
                     db.version = oldVersion
                 }
                 EnrolledPeerRegistry(context).use { registry ->
-                    assertNull(registry.setupValue("status"))
+                    if (oldVersion < 3) assertNull(registry.setupValue("status"))
+                    else assertEquals("INVITATION_PENDING", registry.setupValue("status")!!.getString("reason"))
                     assertEquals(setOf(b), registry.replicas())
-                    assertNull(registry.bindingFor(b, b))
+                    if (oldVersion < 3) assertNull(registry.bindingFor(b, b))
+                    else assertEquals(a, registry.bindingFor(b, b)!!.association)
                 }
                 DurableReplicationState(context).use { state ->
-                    assertTrue(state.load(b)!!.getBoolean("synthetic_session"))
+                    assertNull(state.load(b))
                     assertEquals(setOf(c), state.cleanupReplicas())
-                    assertEquals(30_000L, state.retryDelay(1_800_000_000_000L))
+                    assertEquals(0L, state.retryDelay(1_800_000_000_000L))
                 }
                 assertEquals(historyBefore, history.snapshot().toString())
                 assertEquals(publicationsBefore, history.publications(b, 128).toString())

@@ -14,7 +14,7 @@ object PhoneRelayWire {
     const val MAX_REQUEST_BYTES = 256 * 1024
     private val path = Regex("^${PREFIX}[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
     private val safeCodes = setOf("relay_error", "transport", "timeout", "invalid_response", "unavailable", "unsupported_model", "not_ready", "busy", "output_limit",
-        "internal_error", "retirement_failed", "unsupported_search_mode", "auth_unavailable", "provider_failure",
+        "internal_error", "retirement_failed", "unsupported_web_permission", "auth_unavailable", "provider_failure",
         "aicore_not_available", "aicore_needs_update", "aicore_busy", "aicore_unavailable", "too_large")
 
     fun validPath(path: String): Boolean = this.path.matches(path)
@@ -49,6 +49,8 @@ object PhoneRelayWire {
         val model = request.get("model")
         require(model is String && model in AssistantModels.aliases &&
             (model == "gemini-nano" || model.startsWith("agy-"))) { "Unsupported relay model" }
+        // Older Wear peers may include this field; it is not a provider control anymore.
+        request.remove("searchMode")
         return request.put("requestId", localId).toString().also {
             require(it.toByteArray(UTF_8).size <= MAX_REQUEST_BYTES) { "Relay request too large" }
         }
@@ -57,11 +59,15 @@ object PhoneRelayWire {
     fun safeOutcome(raw: String): String {
         require(raw.toByteArray(UTF_8).size in 1..MAX_FRAME_BYTES) { "Relay outcome too large" }
         val outcome = JSONObject(raw)
+        // Older phones used a mode-named code for Agy's enforced Web-off capability failure.
+        val code = (outcome.opt("code") as? String)?.let {
+            if (it == "unsupported_search_mode") "unsupported_web_permission" else it
+        }
         return when (outcome.get("status")) {
             "complete" -> raw
             "cancelled" -> JSONObject().put("status", "cancelled").toString()
             "error" -> JSONObject().put("status", "error")
-                .put("code", (outcome.opt("code") as? String)?.takeIf { it in safeCodes } ?: "relay_error")
+                .put("code", code?.takeIf { it in safeCodes } ?: "relay_error")
                 .put("message", "Phone relay request failed").toString()
             else -> throw IllegalArgumentException("Invalid relay outcome status")
         }
@@ -102,9 +108,9 @@ internal class PhoneRelayEvents(private val wireRequestId: String) {
         when (type) {
             "dispatched" -> require(!outcome && !dispatched)
             "status" -> {
-                require(!outcome && statuses < AssistantSearchModes.MAX_STATUS_EVENTS)
+                require(!outcome && statuses < AssistantToolStatuses.MAX_STATUS_EVENTS)
                 val status = event.get("status")
-                require(status is String && AssistantSearchModes.isValidStatus(status))
+                require(status is String && AssistantToolStatuses.isValidStatus(status))
             }
             "first_text" -> {
                 require(!outcome && !firstText)

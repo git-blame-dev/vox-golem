@@ -114,7 +114,7 @@ class AssistantStoreTest {
         val store = nativeStore()
         val first = store.createConversation("Synthetic first")
         val second = store.createConversation("Synthetic second")
-        val receipt = JSONObject().put("version", 1).put("recipient_replica", peer)
+        val receipt = JSONObject().put("version", 2).put("recipient_replica", peer)
             .put("operation", second.getJSONObject("operation").getJSONObject("id"))
             .put("body_key", second.getString("body_key"))
         store.acknowledge(peer, JSONArray().put(receipt))
@@ -136,7 +136,7 @@ class AssistantStoreTest {
             JSONObject().put("kind", "text").put("text", "Synthetic private answer"), "instant", provenance())
         store.selectConversation(conversation, null)
         store.saveDraft(conversation, "Synthetic private draft", true)
-        val deletion = JSONObject().put("version", 1).put("id", store.allocateId()).put("body",
+        val deletion = JSONObject().put("version", 2).put("id", store.allocateId()).put("body",
             JSONObject().put("kind", "conversation_deleted").put("conversation", conversation))
         store.importRecords(JSONArray().put(canonical(deletion)))
         assertEquals(1, store.publications().length())
@@ -191,34 +191,12 @@ class AssistantStoreTest {
 
     @Test fun incomingRecordsCannotInstallTrustedRetiredSnapshotOrForgeBodyKeys() {
         val store = nativeStore()
-        val forged = JSONObject().put("version", 1).put("revision", "99").put("records", JSONArray())
+        val forged = JSONObject().put("version", 2).put("revision", "99").put("records", JSONArray())
             .put("retired", JSONArray())
         assertThrows(Exception::class.java) { store.importRecords(JSONArray().put(forged)) }
         val record = canonical(remoteCreate("1", "Synthetic digest")).put("body_key", "0".repeat(64))
         assertThrows(AssistantDomainException::class.java) { store.importRecords(JSONArray().put(record)) }
         assertEquals("0", store.snapshot().getString("revision"))
-    }
-
-    @Test fun rawCommittedSnapshotIsBoundedBeforeJsonParsingOrGatewayInvocation() {
-        var called = false
-        val store = open(DomainGateway { called = true; error("must not call gateway") })
-        store.allocateId()
-        SQLiteDatabase.openDatabase(File(context.noBackupFilesDir, "assistant.db").path, null, 0).use {
-            it.execSQL("UPDATE state SET snapshot = ?", arrayOf(" ".repeat(4 * 1024 * 1024 + 1)))
-        }
-        assertThrows(IllegalStateException::class.java) { store.view() }
-        assertFalse(called)
-    }
-
-    @Test fun snapshotAboveCursorWindowSizeRestoresRawBytesThroughActualJni() {
-        val store = nativeStore()
-        store.allocateId()
-        val raw = """{"version":1,"revision":"0","records":[],"retired":[]}""" + " ".repeat(2 * 1024 * 1024)
-        SQLiteDatabase.openDatabase(File(context.noBackupFilesDir, "assistant.db").path, null, 0).use {
-            it.execSQL("UPDATE state SET snapshot = ?", arrayOf(raw))
-        }
-        assertEquals("0", store.view().getString("revision"))
-        assertEquals(0, store.snapshot().getJSONArray("records").length())
     }
 
     @Test fun lateCompletionAfterDeletionStaysRetiredAndDoesNotPurgeTheTombstonePublication() {
@@ -227,7 +205,7 @@ class AssistantStoreTest {
         val conversation = created.getJSONObject("operation").getJSONObject("id")
         val selection = store.context(conversation, null)
         val request = store.allocateId()
-        val deletion = canonical(JSONObject().put("version", 1).put("id", store.allocateId()).put("body",
+        val deletion = canonical(JSONObject().put("version", 2).put("id", store.allocateId()).put("body",
             JSONObject().put("kind", "conversation_deleted").put("conversation", conversation)))
         store.importRecords(JSONArray().put(deletion))
         assertThrows(AssistantCompletionSuppressedException::class.java) {
@@ -240,7 +218,7 @@ class AssistantStoreTest {
         assertFalse(store.snapshot().toString().contains("Synthetic late answer"))
         store.importRecords(JSONArray().put(deletion))
         assertEquals(deletion.toString(), store.publications().getJSONObject(0).toString())
-        assertThrows(IllegalStateException::class.java) { store.saveDraft(conversation, "Synthetic blocked") }
+        assertThrows(AssistantDomainException::class.java) { store.saveDraft(conversation, "Synthetic blocked") }
     }
 
     @Test fun failedDeletionCommitPreservesDraftSelectionAndExistingPublications() {
@@ -250,7 +228,7 @@ class AssistantStoreTest {
         store.selectConversation(conversation, null)
         store.saveDraft(conversation, "Synthetic retain on failure")
         val before = store.snapshot().toString()
-        val deletion = canonical(JSONObject().put("version", 1).put("id", store.allocateId()).put("body",
+        val deletion = canonical(JSONObject().put("version", 2).put("id", store.allocateId()).put("body",
             JSONObject().put("kind", "conversation_deleted").put("conversation", conversation)))
         store.beforeCommit = { error("Synthetic interrupted deletion") }
         assertThrows(IllegalStateException::class.java) { store.importRecords(JSONArray().put(deletion)) }
@@ -271,7 +249,7 @@ class AssistantStoreTest {
         assertEquals(4, store.publications().length())
         assertEquals(2, store.receiptsToPublish(limit = 2).length())
         assertEquals(2, store.receiptsToPublish(limit = 2, after = lastId).length())
-        assertThrows(IllegalStateException::class.java) { store.publications(maxBytes = 2) }
+        assertThrows(AssistantDomainException::class.java) { store.publications(maxBytes = 2) }
     }
 
     @Test fun postImportNativeSnapshotQuotaFailureNeverEvictsPreviouslyCommittedHistoryOrOutbox() {
@@ -283,11 +261,11 @@ class AssistantStoreTest {
         val records = JSONArray().put(canonical(remoteCreate("1", "Synthetic oversized batch")))
         for (sequence in 2..20) {
             val id = JSONObject().put("replica", peer).put("sequence", sequence.toString())
-            val body = JSONObject().put("kind", "turn_completed").put("conversation", conversation)
+            val body = JSONObject().put("kind", "turn_completed").put("sources", JSONArray()).put("conversation", conversation)
                 .put("parent", JSONObject.NULL).put("request", id).put("prompt", "Synthetic quota prompt")
                 .put("answer", JSONObject().put("kind", "text").put("text", "s".repeat(230 * 1024)))
                 .put("terminal_stage", "instant").put("provenance", provenance().put("context", JSONArray()))
-            records.put(canonical(JSONObject().put("version", 1).put("id", id).put("body", body)))
+            records.put(canonical(JSONObject().put("version", 2).put("id", id).put("body", body)))
         }
         val failure = assertThrows(AssistantDomainException::class.java) { store.importRecords(records) }
         assertEquals("native_snapshot_bytes", failure.error.getString("limit"))
@@ -321,14 +299,15 @@ class AssistantStoreTest {
         assertEquals(childId.toString(), duplicate.getJSONArray("quarantined").getJSONObject(0).toString())
         assertFalse(hasRecord(store.publications(), childId))
         assertEquals(child.getString("body_key"), store.receiptsToPublish().getJSONObject(0).getString("body_key"))
-        val receipt = JSONObject().put("version", 1).put("recipient_replica", peer).put("operation", childId)
+        val receipt = JSONObject().put("version", 2).put("recipient_replica", peer).put("operation", childId)
             .put("body_key", child.getString("body_key"))
         store.acknowledge(peer, JSONArray().put(receipt))
         store.close()
         val restored = nativeStore()
         assertTrue(hasRecord(restored.snapshot().getJSONArray("records"), childId))
         assertFalse(hasRecord(restored.publications(), childId))
-        assertEquals(1, restored.view().getJSONArray("quarantine").length())
+        assertEquals(1, restored.view().getInt("quarantine_count"))
+        assertEquals(1, restored.snapshot().getJSONArray("quarantine").length())
     }
 
     @Test fun quarantineTransactionFailureKeepsOldStagingAndCannotPublishTheParentAck() {
@@ -398,8 +377,8 @@ class AssistantStoreTest {
             .put(JSONObject().put("replica", c.getString("replica")).put("sequence", "88")).put(a2)))
         store.importRecords(JSONArray().put(q))
         store.importRecords(JSONArray().put(canonical(completed(a2, c, null, store.allocateId(), JSONArray()))))
-        assertEquals(2, store.view().getJSONArray("quarantine").length())
-        val deletion = canonical(JSONObject().put("version", 1).put("id", store.allocateId()).put("body",
+        assertEquals(2, store.view().getInt("quarantine_count"))
+        val deletion = canonical(JSONObject().put("version", 2).put("id", store.allocateId()).put("body",
             JSONObject().put("kind", "conversation_deleted").put("conversation", c)))
         store.importRecords(JSONArray().put(deletion))
         assertTrue(hasRecord(store.snapshot().getJSONArray("records"), b3))
@@ -410,8 +389,8 @@ class AssistantStoreTest {
         })
         store.close()
         val restored = nativeStore()
-        assertEquals(1, restored.view().getJSONArray("quarantine").length())
-        assertEquals(b3.toString(), restored.view().getJSONArray("quarantine").getJSONObject(0).getJSONObject("id").toString())
+        assertEquals(1, restored.view().getInt("quarantine_count"))
+        assertEquals(b3.toString(), restored.snapshot().getJSONArray("quarantine").getJSONObject(0).getJSONObject("id").toString())
         val failure = assertThrows(AssistantDomainException::class.java) { restored.context(d, b3) }
         assertEquals("quarantined", failure.error.getString("kind"))
         assertFalse(hasRecord(restored.publications(), b3))
@@ -423,21 +402,72 @@ class AssistantStoreTest {
         assertFalse(hasRecord(restored.publications(), b3))
     }
 
-    @Test fun malformedQuarantinedDispositionCannotCommitOrProduceAnAck() {
+    @Test fun injectedCanonicalCodecCannotBypassNativeHashVerification() {
         assumeTrue("Host JNI library required", System.getProperty("assistant.native.library") != null)
         val store = open(DomainGateway { raw ->
             val response = JSONObject(AssistantDomainNative.apply(raw))
-            if (JSONObject(raw).getString("kind") == "plan" && response.getBoolean("ok")) {
-                response.getJSONObject("value").put("quarantined", false)
+            if (response.getBoolean("ok")) {
+                response.getJSONObject("value").put("body_key", "0".repeat(64))
             }
             response.toString()
         })
-        val incoming = canonical(remoteCreate("1", "Synthetic malformed disposition"))
-        assertThrows(org.json.JSONException::class.java) { store.importRecords(JSONArray().put(incoming)) }
+        assertThrows(AssistantDomainException::class.java) { store.createConversation("Synthetic forged codec") }
         assertEquals("0", store.snapshot().getString("revision"))
         assertEquals(0, store.snapshot().getJSONArray("records").length())
         assertEquals(0, store.publications().length())
         assertEquals(0, store.receiptsToPublish().length())
+    }
+
+    @Test fun compactViewExcludesLargeBodiesAndSupportsRevisionFencedPagination() {
+        val store = nativeStore()
+        val created = store.createConversation("Synthetic compact view chat")
+        val conversation = created.getJSONObject("operation").getJSONObject("id")
+        val largeAnswer = "LARGE_TURN_BODY_SENTINEL_".repeat(600)
+        val initialContext = store.context(conversation, null)
+        val branch1 = store.completeTurn(
+            store.allocateId(),
+            initialContext,
+            "First branch\n   prompt   preview",
+            JSONObject().put("kind", "text").put("text", largeAnswer),
+            "instant",
+            provenance()
+        ).getJSONObject("operation").getJSONObject("id")
+        val branch2 = store.completeTurn(
+            store.allocateId(),
+            initialContext,
+            "Second branch prompt preview",
+            JSONObject().put("kind", "text").put("text", largeAnswer),
+            "instant",
+            provenance()
+        ).getJSONObject("operation").getJSONObject("id")
+        val projection = store.project(conversation, null, false)
+        val view = projection.view
+        assertFalse(view.has("records"))
+        assertFalse(view.has("quarantine"))
+        assertFalse(view.toString().contains("LARGE_TURN_BODY_SENTINEL_"))
+        assertEquals(1, view.getInt("conversation_count"))
+        assertEquals(1, view.getInt("conversation_offset"))
+        assertEquals(2, view.getInt("branch_count"))
+        assertEquals(2, view.getInt("branch_offset"))
+        val previews = view.getJSONArray("branch_previews")
+        assertEquals(2, previews.length())
+        assertEquals("First branch prompt preview", previews.getJSONObject(0).getString("prompt_preview"))
+        assertEquals("Second branch prompt preview", previews.getJSONObject(1).getString("prompt_preview"))
+
+        val rev = view.getString("revision")
+        val headPage1 = store.headPage(conversation, offset = 0, limit = 1, expectedRevision = rev, selectedHead = null)
+        assertEquals(2, headPage1.getInt("head_count"))
+        assertEquals(1, headPage1.getInt("next_offset"))
+        assertEquals(branch1.toString(), headPage1.getJSONArray("heads").getJSONObject(0).toString())
+        assertEquals("First branch prompt preview", headPage1.getJSONArray("head_previews").getJSONObject(0).getString("prompt_preview"))
+        val headPage2 = store.headPage(conversation, offset = 1, limit = 1, expectedRevision = rev, selectedHead = null)
+        assertEquals(branch2.toString(), headPage2.getJSONArray("heads").getJSONObject(0).toString())
+        assertEquals("Second branch prompt preview", headPage2.getJSONArray("head_previews").getJSONObject(0).getString("prompt_preview"))
+
+        val revConflict = assertThrows(AssistantDomainException::class.java) {
+            store.conversationPage(offset = 0, limit = 10, expectedRevision = "999999")
+        }
+        assertEquals("revision_conflict", revConflict.error.getString("kind"))
     }
 
     private fun hasRecord(records: JSONArray, id: JSONObject): Boolean = (0 until records.length()).any {
@@ -446,7 +476,7 @@ class AssistantStoreTest {
     }
 
     private fun completed(id: JSONObject, conversation: JSONObject, parent: JSONObject?, request: JSONObject, ancestors: JSONArray) =
-        JSONObject().put("version", 1).put("id", id).put("body", JSONObject().put("kind", "turn_completed")
+        JSONObject().put("version", 2).put("id", id).put("body", JSONObject().put("kind", "turn_completed").put("sources", JSONArray())
             .put("conversation", conversation).put("parent", parent ?: JSONObject.NULL).put("request", request)
             .put("prompt", "Synthetic pending prompt").put("answer", JSONObject().put("kind", "text").put("text", "Synthetic pending answer"))
             .put("terminal_stage", "instant").put("provenance", provenance().put("context", ancestors)))
@@ -456,7 +486,7 @@ class AssistantStoreTest {
         assertTrue(result.toString(), result.getBoolean("ok"))
         return result.getJSONObject("value")
     }
-    private fun remoteCreate(sequence: String, title: String) = JSONObject().put("version", 1)
+    private fun remoteCreate(sequence: String, title: String) = JSONObject().put("version", 2)
         .put("id", JSONObject().put("replica", peer).put("sequence", sequence))
         .put("body", JSONObject().put("kind", "conversation_created").put("title", title))
     private fun provenance() = JSONObject().put("requested_model", "synthetic-model")
@@ -468,6 +498,7 @@ class AssistantStoreRunner(testClass: Class<*>) : RobolectricTestRunner(testClas
     override fun createClassLoaderConfig(method: FrameworkMethod): InstrumentationConfiguration =
         InstrumentationConfiguration.Builder(super.createClassLoaderConfig(method))
             .doNotAcquireClass("dev.gitblame.voxgolem.assistant.AssistantDomainNative")
+            .doNotAcquireClass("dev.gitblame.voxgolem.assistant.AssistantStoreNative")
             .doNotAcquireClass("dev.gitblame.voxgolem.assistant.runtime.AssistantProviderNative")
             .doNotAcquireClass("dev.gitblame.voxgolem.assistant.runtime.ProviderNativeCalls")
             .doNotAcquireClass("dev.gitblame.voxgolem.assistant.runtime.ProviderDeltaCallback").build()

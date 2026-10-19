@@ -24,15 +24,14 @@ object AssistantRuntime {
 
     fun prewarm(model: String) {
         val currentEngine = engine
+        // Without a hydrated engine, wait for policy-aware worker prewarming.
         if (currentEngine != null) {
             currentEngine.prewarmSelected(model)
-        } else {
-            agyRouter?.prewarm(model)
         }
     }
 
-    internal fun prewarmRouter(model: String) {
-        agyRouter?.prewarm(model)
+    internal fun prewarmRouter(model: String, webEnabled: Boolean) {
+        agyRouter?.prewarmSelection(model, webEnabled)
     }
 
     /** The single provider router for this process: the engine and the watch relay must share its Agy owner. */
@@ -148,7 +147,7 @@ object AssistantRuntime {
         if (initialModel in AssistantModels.aliases) {
             worker.prewarm(initialModel, initialPolicy.webEnabled) { credentials.selection().path }
         } else {
-            router.prewarm(initialModel)
+            router.prewarmSelection(initialModel, initialPolicy.webEnabled)
         }
 
         return AssistantEngine(AssistantStore(application), io, worker,

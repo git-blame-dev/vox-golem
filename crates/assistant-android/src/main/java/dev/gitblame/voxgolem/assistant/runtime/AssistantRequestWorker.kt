@@ -84,8 +84,8 @@ class AssistantRequestWorker(
 
                         override fun onStatus(status: String) = synchronized(lock) {
                             if (active !== request || request.returned || request.cancelled) return@synchronized
-                            check(AssistantSearchModes.isValidStatus(status)) { "Invalid native tool status" }
-                            check(++request.deliveredStatuses <= AssistantSearchModes.MAX_STATUS_EVENTS) { "Native status exceeds callback budget" }
+                            check(AssistantToolStatuses.isValidStatus(status)) { "Invalid native tool status" }
+                            check(++request.deliveredStatuses <= AssistantToolStatuses.MAX_STATUS_EVENTS) { "Native status exceeds callback budget" }
                             listener.onStatus(request.id, status)
                         }
                     }

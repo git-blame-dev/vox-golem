@@ -16,7 +16,7 @@ import org.robolectric.annotation.Config
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executor
 
-@RunWith(RobolectricTestRunner::class)
+@RunWith(PhoneAssistantRunner::class)
 @Config(sdk = [35], manifest = Config.NONE)
 class EnginePhonePreferencesTest {
     private class Queue : Executor {
@@ -98,6 +98,32 @@ class EnginePhonePreferencesTest {
     }
 
     @After fun resetAdmission() { AssistantRuntime.configureCaptureResourceAdmission(false) }
+
+    @Test fun removedModeCommandsFailImmediatelyWithoutChangingStateOrPreferences() {
+        Fixture(false).use { f ->
+            f.engine.setWebEnabled(false); f.drain()
+            assertFalse(f.engine.snapshot().webEnabled)
+            val before = f.engine.snapshot()
+            val preferences = f.persisted().toString()
+            val policy = f.persistedPolicy()
+            val prewarmed = f.prewarmed.toList()
+            val workerPrewarmed = f.workerPrewarmed.toList()
+            for (name in listOf("set_search_mode", "select_search_mode", "synthetic_unknown_command")) {
+                var replies = 0
+                var failure: Throwable? = null
+                f.backend.command(name, JSONObject().put("mode", "research")) {
+                    replies++; failure = it.exceptionOrNull()
+                }
+                assertEquals(1, replies)
+                assertTrue(failure is AssistantPhoneFailure)
+                assertEquals("invalid_input", (failure as AssistantPhoneFailure).code)
+                assertEquals(before, f.engine.snapshot())
+                assertEquals(preferences, f.persisted().toString())
+                assertEquals(policy, f.persistedPolicy())
+            }
+            assertEquals(prewarmed, f.prewarmed); assertEquals(workerPrewarmed, f.workerPrewarmed)
+        }
+    }
 
     @Test fun sonnetLowRoundTripsWithoutLosingSlateOrEnablingUnsupportedCapabilities() {
         Fixture(false).use { f ->

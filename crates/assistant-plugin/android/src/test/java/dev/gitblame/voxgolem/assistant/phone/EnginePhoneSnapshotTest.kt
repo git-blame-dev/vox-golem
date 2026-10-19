@@ -14,7 +14,7 @@ import org.robolectric.annotation.Config
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executor
 
-@RunWith(RobolectricTestRunner::class)
+@RunWith(PhoneAssistantRunner::class)
 @Config(sdk = [35], manifest = Config.NONE)
 class EnginePhoneSnapshotTest {
     private class Queue : Executor {
@@ -27,39 +27,29 @@ class EnginePhoneSnapshotTest {
         private val context = RuntimeEnvironment.getApplication()
         private val io = Queue()
         val calls = mutableListOf<String>()
-        val conversation = id("1")
-        private val head = id("3")
-        private val gateway = DomainGateway { raw ->
-            // Simulate only the domain boundary. The real actor/store own refresh, draft,
-            // selection and fresh-snapshot construction; no provider is involved.
-            val input = JSONObject(raw)
-            val kind = input.getString("kind")
-            calls += kind
-            val revision = input.getJSONObject("snapshot").getString("revision")
-            val value = when (kind) {
-                "projection" -> {
-                    val request = input.getJSONObject("request")
-                    check(request.getJSONObject("conversation").toString() == conversation.toString())
-                    val decision = if (choose) JSONObject().put("kind", "choose").put("heads", JSONArray().put(head).put(id("5")))
-                        else JSONObject().put("kind", "keep").put("selected_head", head)
-                    var read: Any = JSONObject.NULL
-                    if (!request.isNull("read") && !choose) {
-                        check(request.getJSONObject("selected_head").toString() == head.toString())
-                        val query = request.getJSONObject("read")
-                        check(query.getString("kind") == "context")
-                        check(query.getInt("max_turns") == 20 && query.getInt("max_text_bytes") == 256 * 1024)
-                        read = if (rejectContext) JSONObject().put("ok", false).put("error", JSONObject().put("kind", "invalid").put("field", "synthetic_context"))
-                            else JSONObject().put("ok", true).put("value", JSONObject().put("revision", revision).put("turns", JSONArray()))
-                    }
-                    JSONObject().put("view", JSONObject().put("revision", revision).put("records", JSONArray()).put("pending", JSONArray())
-                        .put("conversations", JSONArray().put(JSONObject().put("id", conversation).put("title", "Synthetic conversation").put("deleted", false))))
-                        .put("continuation", decision).put("read", read)
-                }
-                else -> error("Unexpected domain call: $kind")
+        lateinit var conversation: JSONObject
+        private lateinit var head: JSONObject
+        private val store = AssistantStore(context).apply {
+            conversation = createConversation("Synthetic conversation").getJSONObject("operation").getJSONObject("id")
+            val ctx = context(conversation, null)
+            head = completeTurn(
+                allocateId(),
+                ctx,
+                "Synthetic question 1",
+                JSONObject().put("kind", "text").put("text", "Synthetic answer 1"),
+                "instant",
+                provenance()
+            ).getJSONObject("operation").getJSONObject("id")
+            if (choose) {
+                completeTurn(
+                    allocateId(),
+                    ctx,
+                    "Synthetic question 2",
+                    JSONObject().put("kind", "text").put("text", "Synthetic answer 2"),
+                    "instant",
+                    provenance()
+                )
             }
-            JSONObject().put("ok", true).put("value", value).toString()
-        }
-        private val store = AssistantStore(context, gateway).apply {
             selectConversation(conversation, if (choose) null else head)
             saveDraft(conversation, "Synthetic retained draft")
         }
@@ -73,11 +63,29 @@ class EnginePhoneSnapshotTest {
             override fun cancel(requestId: String) {}
         })
         // Use the existing JVM overload, preserving the shared module's internal constructor.
+        private val evaluateOwnedRead = AssistantStore::class.java.declaredMethods.single {
+            it.name.startsWith("evaluateOwnedRead") && it.parameterTypes.size == 1
+        }.apply { isAccessible = true }
         private val engine = AssistantEngine::class.java.declaredConstructors.single {
             it.parameterTypes.size == 8 && it.parameterTypes.first() == AssistantStore::class.java
         }.newInstance(store, io, worker, { "/synthetic/private/provider.json" }, models, null,
-            NativeAssistantPolicyStorage(context), gateway) as AssistantEngine
-        private val backend = EnginePhoneBackend(context, engine)
+            NativeAssistantPolicyStorage(context), DomainGateway { raw ->
+                val request = JSONObject(raw)
+                calls += request.getString("kind")
+                if (rejectContext) {
+                    val inner = request.getJSONObject("request")
+                    if (!inner.isNull("read") && inner.getJSONObject("read").getString("kind") == "context") {
+                        val base = JSONObject(evaluateOwnedRead.invoke(store, JSONObject(raw).apply {
+                            getJSONObject("request").put("read", JSONObject.NULL)
+                        }.toString()) as String)
+                        base.getJSONObject("value").put("read", JSONObject().put("ok", false)
+                            .put("error", JSONObject().put("kind", "invalid").put("field", "selected_head")))
+                        return@DomainGateway base.toString()
+                    }
+                }
+                evaluateOwnedRead.invoke(store, raw) as String
+            }) as AssistantEngine
+        val backend = EnginePhoneBackend(context, engine)
         init { io.drain(); calls.clear() }
         fun snapshot(): Result<Any?> {
             var outcome: Result<Any?>? = null
@@ -85,13 +93,22 @@ class EnginePhoneSnapshotTest {
             io.drain()
             return outcome ?: error("Snapshot did not settle")
         }
+        fun command(name: String, arguments: JSONObject): Result<Any?> {
+            var outcome: Result<Any?>? = null
+            backend.command(name, arguments) { outcome = it }
+            io.drain()
+            return outcome ?: error("Command $name did not settle")
+        }
+        fun createAdditionalConversation(title: String): JSONObject =
+            store.createConversation(title).getJSONObject("operation").getJSONObject("id")
         fun terminalAfterMutation(localSelectionOnly: Boolean): JSONObject {
             // Simulate the already-committed result boundary; the real engine/store fence
             // and phone encoder run here without requiring a provider or host JNI.
             val captured = engine.snapshot()
-            val raw = JSONObject().put("revision", JSONObject(captured.viewJson).getString("revision"))
+            val revision = JSONObject(captured.viewJson).getString("revision")
+            val raw = JSONObject().put("revision", revision)
                 .put("conversation", conversation).put("parent", head).put("turns", JSONArray()).toString()
-            val result = AssistantRequestResult("synthetic-client", status = "complete", revision = "0",
+            val result = AssistantRequestResult("synthetic-client", status = "complete", revision = revision,
                 recordJson = "{\"syntheticDurableRecord\":true}", terminalContextJson = raw)
             val durableTurn = JSONObject().put("id", "synthetic-durable-turn")
             val voiceContext = JSONObject().put("conversation", "synthetic-committed-conversation").put("selectedHead", "synthetic-committed-head")
@@ -100,17 +117,7 @@ class EnginePhoneSnapshotTest {
             check(outcome.has("app_snapshot"))
             outcome.remove("app_snapshot")
             if (localSelectionOnly) store.selectConversation(conversation, null)
-            else android.database.sqlite.SQLiteDatabase.openDatabase(
-                java.io.File(context.noBackupFilesDir, "assistant.db").path, null, 0,
-            ).use { db ->
-                // Another store/process transaction commits a synthetic canonical revision.
-                db.beginTransaction()
-                try {
-                    db.execSQL("UPDATE state SET revision = '1', snapshot = ?", arrayOf(
-                        "{\"version\":1,\"revision\":\"1\",\"records\":[],\"retired\":[]}"))
-                    db.setTransactionSuccessful()
-                } finally { db.endTransaction() }
-            }
+            else store.createConversation("Synthetic concurrent")
             backend.attachTerminalSnapshot(outcome, result, captured)
             assertEquals(durableTurn.toString(), outcome.getJSONObject("turn").toString())
             assertEquals(voiceContext.toString(), outcome.getJSONObject("voiceContext").toString())
@@ -118,7 +125,9 @@ class EnginePhoneSnapshotTest {
         }
         override fun close() { engine.stop(); io.drain(); worker.close(); store.close() }
         companion object {
-            fun id(sequence: String) = JSONObject().put("replica", "00000000-0000-4000-8000-000000000701").put("sequence", sequence)
+            private fun provenance() = JSONObject().put("requested_model", "synthetic-model")
+                .put("returned_model", JSONObject.NULL).put("policy_id", "synthetic-policy").put("policy_version", "1")
+                .put("instruction_profile_id", "synthetic-instructions").put("instruction_profile_version", "1")
         }
     }
 
@@ -156,4 +165,45 @@ class EnginePhoneSnapshotTest {
     @Test fun localSelectionOnlyMutationOmitsInlineSnapshotButPreservesDurableOutcome() {
         Fixture().use { assertFalse(it.terminalAfterMutation(localSelectionOnly = true).has("app_snapshot")) }
     }
+
+    @Test fun conversationAndHeadPagesReturnBoundedItemsAndMapRevisionConflictToBusy() {
+        Fixture(choose = true).use { f ->
+            f.createAdditionalConversation("Synthetic second")
+            val snap = f.snapshot().getOrThrow() as JSONObject
+            val revision = snap.getJSONObject("assistant").getString("revision")
+            f.calls.clear()
+
+            val convPage = f.command("list_assistant_conversations", JSONObject().put("expectedRevision", revision).put("offset", 0)).getOrThrow() as JSONObject
+            assertEquals(revision, convPage.getString("revision"))
+            assertEquals(2, convPage.getJSONArray("conversations").length())
+            assertEquals(2, convPage.getInt("next_offset"))
+
+            val headPage = f.command("list_assistant_heads", JSONObject().put("expectedRevision", revision).put("conversationId", PhoneSnapshotEncoder.wireId(f.conversation)).put("offset", 0)).getOrThrow() as JSONObject
+            assertEquals(revision, headPage.getString("revision"))
+            assertEquals(2, headPage.getJSONArray("heads").length())
+            assertEquals(2, headPage.getInt("next_offset"))
+            assertTrue("Pagination reads must not invoke projection refresh", f.calls.isEmpty())
+
+            val staleRevision = "0"
+            val staleConv = f.command("list_assistant_conversations", JSONObject().put("expectedRevision", staleRevision).put("offset", 0)).exceptionOrNull() as AssistantPhoneFailure
+            assertEquals("busy", staleConv.code)
+
+            val staleHeads = f.command("list_assistant_heads", JSONObject().put("expectedRevision", staleRevision).put("conversationId", PhoneSnapshotEncoder.wireId(f.conversation)).put("offset", 0)).exceptionOrNull() as AssistantPhoneFailure
+            assertEquals("busy", staleHeads.code)
+            assertTrue("Pagination conflicts must not invoke projection refresh", f.calls.isEmpty())
+
+            val recovered = f.snapshot().getOrThrow() as JSONObject
+            assertTrue("Global assistant error must remain null after pagination revision conflict", recovered.getJSONObject("assistant").isNull("error"))
+        }
+    }
+}
+
+class PhoneAssistantRunner(testClass: Class<*>) : RobolectricTestRunner(testClass) {
+    override fun createClassLoaderConfig(method: org.junit.runners.model.FrameworkMethod): org.robolectric.internal.bytecode.InstrumentationConfiguration =
+        org.robolectric.internal.bytecode.InstrumentationConfiguration.Builder(super.createClassLoaderConfig(method))
+            .doNotAcquireClass("dev.gitblame.voxgolem.assistant.AssistantDomainNative")
+            .doNotAcquireClass("dev.gitblame.voxgolem.assistant.AssistantStoreNative")
+            .doNotAcquireClass("dev.gitblame.voxgolem.assistant.runtime.AssistantProviderNative")
+            .doNotAcquireClass("dev.gitblame.voxgolem.assistant.runtime.ProviderNativeCalls")
+            .doNotAcquireClass("dev.gitblame.voxgolem.assistant.runtime.ProviderDeltaCallback").build()
 }

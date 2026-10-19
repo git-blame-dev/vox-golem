@@ -1,7 +1,7 @@
 # Android / Wear conversation replication integration
 
-This package transports completed immutable operations only. Rust validates records and
-reconciles committed SQLite snapshots; snapshots, retired ledgers, drafts, running requests,
+This package transports completed immutable operations only. The portable Rust conversation
+store owns bundled SQLite, canonical validation and incremental commits; snapshots, retired ledgers, drafts, running requests,
 provider calls and credential envelopes are never conversation payloads.
 
 ## Native paired-app setup
@@ -27,6 +27,10 @@ confirmation checkbox or manual enrollment is required.
 - The replication database migration clears legacy setup metadata, including pending
   invitations. It does not erase conversation history, drafts, credentials, backups or
   upstream access sources. Reassociation replaces bookkeeping, not personal content.
+- History epoch 2 resets conversation sessions/retries, not current trusted bindings or
+  setup metadata. Its one-time conversation-database reset drops only owned history tables,
+  preserving the replica UUID/counter and leaving credential/settings/capture storage alone.
+  Legacy history bodies are discarded, never migrated or rehashed.
 
 ## Application and lifecycle hooks
 
@@ -43,7 +47,8 @@ confirmation checkbox or manual enrollment is required.
   presentation callbacks to the UI thread.
 - Use `AssistantRuntime::refreshIfStarted` as `onCommitted` to refresh an existing engine
   after imports. The headless listener's Store handle uses the same SQLite database and
-  pure JNI domain gateway, not another in-memory conversation authority.
+  Rust SQLite owner, not another Kotlin database/cache authority. Ordinary admission,
+  draft, completion and projection calls do not round-trip a full snapshot through JNI.
 
 ## Build and source ownership
 
@@ -63,11 +68,12 @@ do not maintain a second wire schema or copied registration block here.
 ## Wire, durability and bounds
 
 - One public metadata-only `/voxgolem/assistant/v1/identity` Hello carries v3 setup identity.
-  The conversation namespace remains v1; identity version 3 does not change record
-  wire versions. Old `/pair/request` and `/pair/ack` invitation slots no longer
+   Conversation operations, inventory, receipts and history envelopes use schema 2 in a
+   separate v2 namespace. Old queued history cannot repopulate the reset graph; identity
+   and pairing retain their independent protocol. Old `/pair/request` and `/pair/ack` invitation slots no longer
   enroll a peer. No credential envelope or user content is staged in identity metadata.
 - Eight fixed slots per enrolled peer live at
-  `/voxgolem/assistant/v1/<sender-replica>/<target-replica>/<kind>`: `hint`,
+  `/voxgolem/assistant/v2/<sender-replica>/<target-replica>/<kind>`: `hint`,
   `inventory_request`, `inventory`, `record_request`, `records`, `ack`, `ack_confirmed`,
   `restart`. Envelope sender/target/session/token and SDK URI/source must agree.
 - A revision-pinned inventory walk commits **all pages' tombstones first**, then walks body
@@ -90,6 +96,12 @@ do not maintain a second wire schema or copied registration block here.
 - Controls are at most 32 KiB/128 items. A body is at most 2 MiB; at most eight Assets and
   4 MiB aggregate are read per response. JSON rejects duplicate keys, bad UTF-8 and depth
   over 32. Polling uses exact SDK slots, not an unbounded DataItem prefix buffer.
+- Canonical history including retired/quarantine ledgers is capped at 4 MiB encoded;
+  drafts at 4 MiB aggregate, each draft at 32 KiB; each outgoing/receipt outbox at 8 MiB
+  and 65,536 rows; peer receipts at 65,536 rows. SQLite has a 64 MiB page budget and a
+  16 MiB retained WAL budget with automatic checkpoints. Explicit truncating checkpoints
+  are idle maintenance, not admission/stream/cancellation work. WAL may grow transiently
+  while a transaction or reader is active; these are storage budgets, not forensic-erasure claims.
 - There are at most eight enrolled peers. Enrollment is blocked when deferred revocation
   cleanup would accumulate unbounded old slots. Revoked-peer cleanup metadata persists
   until the SDK delete succeeds.

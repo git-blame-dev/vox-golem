@@ -44,7 +44,7 @@ class AssistantDiagnosticJournalTest {
         val journal = AssistantDiagnosticJournal({ dir }, worker, { 1000L })
         journal.offerMetadata(AssistantTiming.Operation.SPEECH, 1, null, 99,
             AssistantDiagnosticJournal.Metadata(engine = "com.google.android.tts", voice = "en-us-x-tpf-local",
-                language = "en-US", model = "private-server-name", entry = "ask", searchMode = "quick",
+                language = "en-US", model = "private-server-name", entry = "ask",
                 bytes = -1, count = Int.MAX_VALUE, sdkError = 999, networkRequired = false))
         journal.offerMetadata(AssistantTiming.Operation.SPEECH, 1, null, 100,
             AssistantDiagnosticJournal.Metadata(voice = "en-US-private@example.invalid", language = "bad language",

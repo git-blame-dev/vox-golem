@@ -11,6 +11,7 @@ import android.graphics.drawable.Icon
 import android.os.Build
 import android.os.Bundle
 import androidx.annotation.RequiresApi
+import dev.gitblame.voxgolem.assistant.AssistantTiming.Stage
 import org.json.JSONObject
 import java.util.UUID
 
@@ -84,18 +85,23 @@ object NewVoiceShortcutLauncher {
 open class NewVoiceShortcutActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        reportVoiceEntryStage(this, Stage.ENTRY_REQUESTED)
         val mode = if (savedInstanceState == null) NewVoiceShortcutLauncher.entryMode(this, intent) else null
         if (mode != null) {
             val token = UUID.randomUUID().toString()
             if (NewVoiceShortcutLauncher.actions.offer(token, mode)) {
+                reportVoiceEntryStage(this, Stage.ENTRY_OFFERED)
                 try {
                     val main = NewVoiceShortcutLauncher.mainIntent(this)
                     main.action = NewVoiceShortcutLauncher.MAIN_ACTION
                     main.putExtra(NewVoiceShortcutLauncher.TOKEN_EXTRA, token)
                     startActivity(main)
                 } catch (error: RuntimeException) { NewVoiceShortcutLauncher.cancelEntries(); throw error }
-            } else startActivity(NewVoiceShortcutLauncher.mainIntent(this))
-        }
+            } else {
+                reportVoiceEntryStage(this, Stage.ENTRY_BUSY)
+                startActivity(NewVoiceShortcutLauncher.mainIntent(this))
+            }
+        } else reportVoiceEntryStage(this, Stage.ENTRY_REJECTED)
         finish()
     }
 }

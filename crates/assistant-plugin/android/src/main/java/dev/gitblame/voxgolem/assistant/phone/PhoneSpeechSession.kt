@@ -112,6 +112,7 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
     private var shortcutRequest: String? = null
     private var shortcutTimer: Runnable? = null
     @Volatile private var visible = false
+    private var generationEligible = false
     private var draftUtterance: Long? = null
     private var draftConversation: String? = null
     private var draftHead: String? = null
@@ -126,7 +127,7 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
         override fun setDraft(text: String) = backend.saveOwnedSpeechDraft(text, draftConversation, draftHead)
         override fun setRecordedAudio(audio: RecordedAudioResult?) { inputAudio = audio }
         override fun sendFinal(text: String, onTerminal: (GenerationResult) -> Unit) {
-            if (backend.speechOwner() != SpeechInputOwner(draftConversation, draftHead)) { onTerminal(GenerationResult.Failed("conversation_changed")); return }
+            if (closed || !visible || backend.speechOwner() != SpeechInputOwner(draftConversation, draftHead)) { onTerminal(GenerationResult.Failed("conversation_changed")); return }
             val requestId = "voice-${UUID.randomUUID()}"
             waiting = requestId to onTerminal
             waitingAudio = requestId to inputAudio
@@ -151,7 +152,7 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
                 backend.saveOwnedSpeechDraft(value.draft, draftConversation, draftHead)
                 if (value.phase in setOf(DictationPhase.FINAL, DictationPhase.ERROR)) draftUtterance = null
             }
-            if (value.phase == DictationPhase.FINAL && output.snapshot().enabled) output.prepare(language)
+            if (visible && value.phase == DictationPhase.FINAL && output.snapshot().enabled) output.prepare(language)
             if (mode == "shortcut" && shortcut != null) {
                 shortcutAction = shortcut!!.state(value.phase.name.lowercase(), value.draft, value.error)
                 projectedDraft = shortcut!!.latest
@@ -173,7 +174,18 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
             publishStatus()
         },
         output.subscribe { value -> microphoneCues.onSpeech(value); publishStatus() },
-        backend.observeSpeechContext { if (!closed) loop.reconcileInputOwner() },
+        backend.observeSpeechContext {
+            if (!closed) {
+                loop.reconcileInputOwner()
+                // Engine publications may arrive on its actor; voice consent
+                // and session fields are inspected only on their main owner.
+                main.post {
+                    synchronized(replyLock) {
+                        if (!closed && waitingInputContextChanged()) stop()
+                    }
+                }
+            }
+        },
     )
 
     init {
@@ -192,6 +204,8 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
         val recordingEnabled = dictation.recordingEnabled()
         val recordingAvailable = visible && runCatching { dictation.recordingAvailable() }.getOrDefault(false)
         return JSONObject().put("kind", "voice_status").put("available", available)
+            .put("inputForeground", visible)
+            .put("retainedSubmissionId", retainedSubmissionId() ?: JSONObject.NULL)
             .put("reason", if (!admissionReady) "Native recognition resource sharing is not ready; typing remains available"
                 else if (missingSpeech && missingMessage != null) "$missingMessage Install from Play Store to enable."
                 else if (recordingEnabled && !recordingAvailable) "Recorded input requires a validated supplied-audio provider and local archive adapter; typing remains available"
@@ -251,16 +265,24 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
     }
 
     fun foreground(visible: Boolean, retainGeneration: Boolean = false) {
+        val retainVoice = !visible && retainGeneration && authorizedVoiceRequest() != null
         synchronized(replyLock) {
             if (closed) return
+            generationEligible = visible || retainGeneration
             this.visible = visible
-            if (!visible) replyOwner = null
+            if (!visible && (!retainVoice || replyOwner?.requestId != authorizedVoiceRequest())) replyOwner = null
         }
         if (!visible) preserveActiveDraft()
         microphoneCues.foreground(visible)
-        if (!visible) { cancelShortcut(); sessionId = null; sink = null; waiting = null }
+        if (!visible) {
+            cancelShortcut(retainRequest = retainVoice)
+            if (!retainVoice) { waiting = null; waitingAudio = null; inputAudio = null }
+        }
         loop.setForeground(visible, retireGeneration = !retainGeneration)
         if (visible && output.snapshot().enabled) output.prepare(language)
+        // The registered channel must see native lifecycle authority before it is retired.
+        publishStatus()
+        if (!visible && !retainVoice) { sessionId = null; sink = null }
     }
 
     fun start(id: String, loopMode: Boolean, draft: String, events: (JSONObject) -> Unit, shortcutLaunch: String? = null,
@@ -342,6 +364,7 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
                 shortcutTimer?.let(main::removeCallbacks); shortcutTimer = restart; main.postDelayed(restart, 300)
             }
             is StopSendNewPolicy.Action.Submit -> {
+                if (closed || !visible) return
                 shortcutTimer?.let(main::removeCallbacks); shortcutTimer = null
                 dictation.stop(); shortcutPhase = "submitted"
                 val requestId = "shortcut-${UUID.randomUUID()}"; shortcutRequest = requestId
@@ -357,10 +380,11 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
             StopSendNewPolicy.Action.None -> Unit
         }
     }
-    private fun cancelShortcut() {
+    private fun cancelShortcut(retainRequest: Boolean = false) {
         shortcut?.cancel(); shortcutTimer?.let(main::removeCallbacks); shortcutTimer = null
         shortcutToken?.let(NewVoiceShortcutLauncher.actions::release)
-        shortcut = null; shortcutToken = null; shortcutRequest = null; shortcutPhase = "idle"
+        shortcut = null; shortcutToken = null
+        if (!retainRequest) { shortcutRequest = null; shortcutPhase = "idle" }
     }
     fun stop() {
         stopOwnedVoiceRequest()
@@ -368,8 +392,10 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
         preserveActiveDraft()
         microphoneCues.cancel()
         cancelShortcut()
-        sessionId = null; sink = null; waiting = null
+        waiting = null; waitingAudio = null; inputAudio = null
         loop.stop()
+        publishStatus()
+        sessionId = null; sink = null
     }
     private fun preserveActiveDraft() {
         val value = dictation.snapshot()
@@ -380,7 +406,9 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
     }
     /** Register before submission: even a synchronous terminal must carry this exact ownership ticket. */
     fun onRequestSubmitted(requestId: String): Long = synchronized(replyLock) {
-        if (closed || !visible) return@synchronized 0L
+        val nativeVoice = requestId.startsWith("voice-") || requestId.startsWith("shortcut-")
+        if (closed || (!visible && retainedSubmissionId() != requestId) ||
+            (nativeVoice && submissionOwner(requestId) == null)) return@synchronized 0L
         if (waiting?.first == requestId || shortcutRequest == requestId) ownedVoiceRequest = requestId
         val owner = ReplyOwner(requestId, ++replySerial, waiting?.first == requestId)
         replyOwner = owner
@@ -391,18 +419,33 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
         val requestId = synchronized(replyLock) { ownedVoiceRequest.also { ownedVoiceRequest = null } }
         requestId?.let(backend::stopSpeechRequest)
     }
-    /** Revalidate native-minted auto-submit consent when the frontend returns over IPC. */
+    private fun authorizedVoiceRequest(): String? = waiting?.first ?: shortcutRequest
+    private fun hasRegisteredReply(requestId: String): Boolean = synchronized(replyLock) { replyOwner?.requestId == requestId }
+    // Waiting input consent is context-bound. After registration, AssistantEngine owns admission
+    // and settlement; graph-head publications (including its own commit) cannot revoke delivery.
+    private fun waitingInputContextChanged(): Boolean = authorizedVoiceRequest()?.let {
+        !hasRegisteredReply(it) && backend.speechOwner() != SpeechInputOwner(draftConversation, draftHead)
+    } ?: false
+    private fun retainedSubmissionId(): String? {
+        if (closed || visible || !generationEligible) return null
+        val requestId = authorizedVoiceRequest() ?: return null
+        return requestId.takeIf { hasRegisteredReply(it) || backend.speechOwner() == SpeechInputOwner(draftConversation, draftHead) }
+    }
+    /** Fresh admission still requires the native-minted input's exact canonical context. */
     fun submissionOwner(requestId: String): SpeechInputOwner? {
-        if (closed || !visible || (waiting?.first != requestId && shortcutRequest != requestId) ||
+        if (closed || (!visible && retainedSubmissionId() != requestId) || (waiting?.first != requestId && shortcutRequest != requestId) ||
             backend.speechOwner() != SpeechInputOwner(draftConversation, draftHead)) return null
         return SpeechInputOwner(draftConversation, draftHead)
     }
     fun admitsVoiceSubmission(requestId: String): Boolean = submissionOwner(requestId) != null
     fun onRequestResult(requestId: String, result: Result<Any?>, replyTicket: Long) {
-        synchronized(replyLock) { if (ownedVoiceRequest == requestId) ownedVoiceRequest = null }
+        synchronized(replyLock) {
+            if (replyOwner?.let { it.requestId == requestId && it.ticket == replyTicket } == true &&
+                ownedVoiceRequest == requestId) ownedVoiceRequest = null
+        }
         main.post {
             synchronized(replyLock) {
-                val owner = replyOwner?.takeIf { !closed && visible && it.requestId == requestId && it.ticket == replyTicket }
+                val owner = replyOwner?.takeIf { !closed && (visible || generationEligible) && it.requestId == requestId && it.ticket == replyTicket }
                     ?: return@post
                 replyOwner = null
                 if (shortcutRequest == requestId) { shortcutToken?.let(NewVoiceShortcutLauncher.actions::release); shortcutRequest = null }
@@ -410,9 +453,11 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
                 val turn = value?.optJSONObject("turn")
                 val pending = waiting?.takeIf { it.first == requestId }
                 if (pending == null) {
-                    if (!owner.loopReply && value != null && !value.has("warning") && turn != null && AssistantRuntime.captureResourceAdmissionReady() && output.snapshot().enabled && value.optString("kind") in setOf("completed", "refused") && loop.snapshot().phase !in setOf(LoopPhase.GENERATING, LoopPhase.SPEAKING, LoopPhase.LISTENING)) {
+                    if (visible && !owner.loopReply && value != null && !value.has("warning") && turn != null && AssistantRuntime.captureResourceAdmissionReady() && output.snapshot().enabled && value.optString("kind") in setOf("completed", "refused") && loop.snapshot().phase !in setOf(LoopPhase.GENERATING, LoopPhase.SPEAKING, LoopPhase.LISTENING)) {
                         output.speak(value.optString("speechText").takeIf { it.isNotBlank() } ?: turn.getJSONObject("answer").getJSONObject("content").let { it.getString(if (it.getString("kind") == "refusal") "reason" else "text") }, language) { publishStatus() }
                     }
+                    publishStatus()
+                    if (!visible) { sessionId = null; sink = null }
                     return@post
                 }
                 val audio = waitingAudio?.takeIf { it.first == requestId }?.second
@@ -424,6 +469,8 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
                             if (context.isNull("conversation")) null else context.getString("conversation"),
                             if (context.isNull("selectedHead")) null else context.getString("selectedHead")) }, audio)
                 } else GenerationResult.Failed((result.exceptionOrNull() as? AssistantPhoneFailure)?.boundedMessage ?: "Request interrupted"))
+                publishStatus()
+                if (!visible) { sessionId = null; sink = null }
             }
         }
     }

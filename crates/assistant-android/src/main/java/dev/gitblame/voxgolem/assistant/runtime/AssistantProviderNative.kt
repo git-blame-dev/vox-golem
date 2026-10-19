@@ -15,15 +15,12 @@ interface ProviderNativeCalls {
     fun prewarm(model: String, authPath: String, webEnabled: Boolean) { prewarm(model, authPath) }
     fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String
     fun cancel(requestId: String)
-    fun prepareSearch(requestJson: String, callback: ProviderDeltaCallback): String =
-        """{"evidenceContext":null,"sourceFooter":"","sources":[]}"""
     /** A returned outcome need not mean an external process has physically retired. */
     fun whenRetired(requestId: String, retired: () -> Unit) { retired() }
 }
 
 object AssistantProviderNative : ProviderNativeCalls {
     init { System.loadLibrary("wear_assistant_native") }
-    private fun ensureLoaded() {}
     override fun prewarm(model: String, authPath: String) {
         prewarm(model, authPath, true)
     }
@@ -31,7 +28,7 @@ object AssistantProviderNative : ProviderNativeCalls {
         if (authPath.isNotEmpty() && !model.startsWith("agy-") && model != "local-fast" && model != GeminiNanoProvider.MODEL_NAME) {
             runCatching { observeAuth(authPath) }
         }
-        if (model != "local-fast" && !model.startsWith("agy-")) {
+        if (model.startsWith("custom-")) {
             runCatching { nativePrewarm(model, authPath, webEnabled) }
         }
     }
@@ -42,33 +39,4 @@ object AssistantProviderNative : ProviderNativeCalls {
     external fun exportChatGptAccess(authPath: String): String
     external override fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String
     external override fun cancel(requestId: String)
-    external fun nativePrepareSearch(requestJson: String, callback: ProviderDeltaCallback): String
-    override fun prepareSearch(requestJson: String, callback: ProviderDeltaCallback): String =
-        nativePrepareSearch(requestJson, callback)
-    external fun nativeShouldRunWebSearch(
-        webEnabled: Boolean,
-        searchMode: String,
-        query: String,
-        prevUserQuery: String,
-    ): Boolean
-    fun shouldRunWebSearch(
-        webEnabled: Boolean,
-        searchMode: String,
-        query: String,
-        prevUserQuery: String? = null,
-    ): Boolean {
-        ensureLoaded()
-        return nativeShouldRunWebSearch(webEnabled, searchMode, query, prevUserQuery ?: "")
-    }
-    external fun nativeRoutePrompt2d(
-        query: String,
-        prevUserQuery: String,
-    ): String
-    fun routePrompt2d(
-        query: String,
-        prevUserQuery: String? = null,
-    ): String {
-        ensureLoaded()
-        return nativeRoutePrompt2d(query, prevUserQuery ?: "")
-    }
 }

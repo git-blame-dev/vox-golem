@@ -30,7 +30,7 @@ class AssistantDiagnosticJournal(
 ) {
     data class Metadata(
         val engine: String? = null, val voice: String? = null, val language: String? = null,
-        val model: String? = null, val searchMode: String? = null, val entry: String? = null,
+        val model: String? = null, val entry: String? = null,
         val onDevice: Boolean? = null, val networkRequired: Boolean? = null, val cacheHit: Boolean? = null,
         val webEnabled: Boolean? = null,
         val bytes: Long? = null, val count: Int? = null, val sdkError: Int? = null,
@@ -71,7 +71,7 @@ class AssistantDiagnosticJournal(
     fun offerMetadata(operation: AssistantTiming.Operation, run: Int, parentRun: Int?, observedNanos: Long,
         metadata: Metadata) {
         // Constant-time admission bounds memory too; detailed token validation remains on the worker.
-        if (listOf(metadata.engine, metadata.voice, metadata.language, metadata.requestedLanguage, metadata.model, metadata.searchMode, metadata.entry, metadata.route)
+        if (listOf(metadata.engine, metadata.voice, metadata.language, metadata.requestedLanguage, metadata.model, metadata.entry, metadata.route)
                 .any { it != null && it.length > 256 }) {
             dropped.incrementAndGet()
             return
@@ -233,7 +233,6 @@ class AssistantDiagnosticJournal(
             value("requestedLanguage", it.requestedLanguage?.takeIf { s -> s.length <= 64 && LANGUAGE.matches(s) &&
                 Locale.forLanguageTag(s).toLanguageTag() == s && s != "und" })
             value("model", it.model?.takeIf { s -> s in MODELS })
-            value("searchMode", it.searchMode?.takeIf { s -> s in SEARCH_MODES })
             value("entry", it.entry?.takeIf { s -> s in ENTRIES })
             value("onDevice", it.onDevice); value("networkRequired", it.networkRequired); value("cacheHit", it.cacheHit)
             value("webEnabled", it.webEnabled)
@@ -255,7 +254,6 @@ class AssistantDiagnosticJournal(
         private val VOICE = Regex("[a-z]{2,3}-[a-z]{2}(?:-x-[a-z]{3}-(?:local|network)|-language)")
         private val LANGUAGE = Regex("[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*")
         private val ROUTE = Regex("[A-Za-z0-9_-]{1,32}")
-        private val SEARCH_MODES = setOf("quick", "verify", "research", "direct")
         private val ENTRIES = setOf("ask", "talk", "chat", "manual")
         // Explicit aliases/server IDs from AgyProvider and platform/custom_openai; never arbitrary server names.
         private val MODELS = setOf("agy-opus-high", "claude-opus-5-5-high", "opus-5.5", "opus5.5",

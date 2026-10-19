@@ -59,13 +59,13 @@ class AcknowledgedAssistantDelivery(
     }
 
     override fun deliverStatus(status: AssistantToolStatus): Boolean {
-        if (!AssistantSearchModes.isValidStatus(status.status)) { cancel(); return false }
-        if (synchronized(lock) { ++statuses > AssistantSearchModes.MAX_STATUS_EVENTS }) { cancel(); return false }
+        if (!AssistantToolStatuses.isValidStatus(status.status)) { cancel(); return false }
+        if (synchronized(lock) { ++statuses > AssistantToolStatuses.MAX_STATUS_EVENTS }) { cancel(); return false }
         return publish(AssistantDeliveryPacket(status.clientRequestToken, status.providerRequestId, status.sequence, toolStatus = status.status), false)
     }
 
     override fun awaitReady(boundary: AssistantDeliveryBoundary): Boolean {
-        if (boundary.outcomeJson.toByteArray(Charsets.UTF_8).size > 2 * 1024 * 1024 || boundary.lastDeltaSequence !in 0..262144 + AssistantSearchModes.MAX_STATUS_EVENTS) {
+        if (boundary.outcomeJson.toByteArray(Charsets.UTF_8).size > 2 * 1024 * 1024 || boundary.lastDeltaSequence !in 0..262144 + AssistantToolStatuses.MAX_STATUS_EVENTS) {
             cancel(); return false
         }
         val target = boundary.lastDeltaSequence + 1
@@ -77,7 +77,7 @@ class AcknowledgedAssistantDelivery(
 
     private fun publish(packet: AssistantDeliveryPacket, candidate: Boolean): Boolean {
         synchronized(lock) {
-            if (failed || terminal || packet.clientRequestToken != clientRequestToken || packet.sequence != sent + 1 || packet.sequence > 262145 + AssistantSearchModes.MAX_STATUS_EVENTS ||
+            if (failed || terminal || packet.clientRequestToken != clientRequestToken || packet.sequence != sent + 1 || packet.sequence > 262145 + AssistantToolStatuses.MAX_STATUS_EVENTS ||
                 (providerId != null && providerId != packet.providerRequestId)) { failed = true; lock.notifyAll(); return false }
             providerId = packet.providerRequestId
             if (!waitUntil { sent - contiguous < maxInFlight }) return false

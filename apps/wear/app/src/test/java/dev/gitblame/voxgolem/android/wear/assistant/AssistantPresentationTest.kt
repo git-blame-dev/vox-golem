@@ -730,10 +730,134 @@ class AssistantPresentationTest {
     }
 
     @Test fun continuationLabelsUseTheExactNativeHeadAndDoNotSortOrMergeBranches() {
-        val operation = JSONObject().put("id", JSONObject(conversation)).put("body", JSONObject().put("prompt", "Synthetic\nbranch prompt"))
-        val view = JSONObject().put("records", JSONArray(listOf(JSONObject().put("operation", operation)))).toString()
-        assertEquals("Continue: Synthetic branch prompt", assistantBranchLabel(view, conversation))
-        assertEquals("Continuation awaiting messages", assistantBranchLabel(view, "{\"replica\":\"synthetic-other\",\"sequence\":\"1\"}"))
+        val compactView = JSONObject()
+            .put("branch_previews", JSONArray(listOf(
+                JSONObject().put("id", JSONObject(conversation)).put("prompt_preview", "Synthetic\nbranch prompt")
+            ))).toString()
+        assertEquals("Continue: Synthetic branch prompt", assistantBranchLabel(compactView, conversation))
+        assertEquals("Continuation awaiting messages", assistantBranchLabel(compactView, "{\"replica\":\"synthetic-other\",\"sequence\":\"1\"}"))
+        val headPage = JSONObject()
+            .put("head_previews", JSONArray(listOf(
+                JSONObject().put("id", JSONObject(conversation)).put("prompt_preview", "Synthetic paged head preview")
+            ))).toString()
+        assertEquals("Continue: Synthetic paged head preview", assistantBranchLabel(headPage, conversation))
+    }
+
+    @Test fun pagedChatsAndBranchesPreserveSelectedSlotMergeWithoutDuplicatesAndFenceRevisionOrOwnerChanges() {
+        fun chatObj(seq: Int) = JSONObject()
+            .put("id", JSONObject(turnId(seq.toString())))
+            .put("title", "Synthetic chat $seq")
+            .put("deleted", false)
+        val first127 = (1..127).map(::chatObj)
+        val selected129 = chatObj(129)
+        val compactViewObj = JSONObject()
+            .put("revision", "7")
+            .put("conversations", JSONArray(first127 + selected129))
+            .put("conversation_count", 129)
+            .put("conversation_offset", 127)
+            .put("branch_count", 129)
+            .put("branch_offset", 128)
+            .put("branch_previews", JSONArray(
+                (1..128).map { seq ->
+                    JSONObject().put("id", JSONObject(turnId(seq.toString()))).put("prompt_preview", "Preview $seq")
+                }
+            ))
+        val compactView = compactViewObj.toString()
+        val settledChatsState = ready.copy(viewJson = compactView, conversation = turnId("129"))
+        val initialChats = assistantInitialPagedChats(compactViewObj, settledChatsState.conversation)
+        assertEquals("7", initialChats.revision)
+        assertEquals(128, initialChats.chats.size)
+        assertEquals(129, initialChats.count)
+        assertEquals(127, initialChats.nextOffset)
+        assertTrue(initialChats.hasMore)
+        assertEquals("Synthetic chat 129", initialChats.chats.last().title)
+
+        // Page 2 starting at 127 returns chat 128 and chat 129; merge deduplicates 129 and reaches 129 items.
+        val page2Chats = JSONObject()
+            .put("revision", "7")
+            .put("conversation_count", 129)
+            .put("next_offset", 129)
+            .put("conversations", JSONArray(listOf(chatObj(128), selected129)))
+            .toString()
+        val mergedChats = assistantMergePagedChats(initialChats.copy(loading = true), page2Chats, settledChatsState)
+        assertFalse(mergedChats.loading)
+        assertNull(mergedChats.error)
+        assertEquals(129, mergedChats.chats.size)
+        assertEquals(129, mergedChats.nextOffset)
+        assertFalse(mergedChats.hasMore)
+
+        // Stale revision in settled state is fenced and fails cleanly without mutating chats.
+        val fencedChats = assistantMergePagedChats(
+            initialChats.copy(loading = true),
+            page2Chats,
+            settledChatsState.copy(viewJson = JSONObject(compactView).put("revision", "8").toString())
+        )
+        assertFalse(fencedChats.loading)
+        assertEquals("Chats changed. Recheck and try again.", fencedChats.error)
+        assertEquals(128, fencedChats.chats.size)
+
+        // Branches initial and paged merge
+        val stateWithBranches = ready.copy(
+            viewJson = compactView,
+            conversation = conversation,
+            selectedHead = null,
+            branchChoices = (1..128).map { turnId(it.toString()) }
+        )
+        val initialBranches = assistantInitialPagedBranches(compactViewObj, stateWithBranches)
+        assertEquals("7", initialBranches.revision)
+        assertEquals(128, initialBranches.heads.size)
+        assertEquals(129, initialBranches.count)
+        assertEquals(128, initialBranches.nextOffset)
+        assertTrue(initialBranches.hasMore)
+        assertEquals("Continue: Preview 128", initialBranches.labels[turnId("128")])
+
+        val page2Branches = JSONObject()
+            .put("revision", "7")
+            .put("conversation", JSONObject(conversation))
+            .put("head_count", 129)
+            .put("next_offset", 129)
+            .put("heads", JSONArray(listOf(JSONObject(turnId("129")))))
+            .put("head_previews", JSONArray(listOf(
+                JSONObject().put("id", JSONObject(turnId("129"))).put("prompt_preview", "Preview 129")
+            )))
+            .toString()
+        val mergedBranches = assistantMergePagedBranches(initialBranches.copy(loading = true), page2Branches, stateWithBranches)
+        assertFalse(mergedBranches.loading)
+        assertNull(mergedBranches.error)
+        assertEquals(129, mergedBranches.heads.size)
+        assertFalse(mergedBranches.hasMore)
+        assertEquals("Continue: Preview 129", mergedBranches.labels[turnId("129")])
+
+        // Request-scoped revision_conflict errorCode fences branch merge even when settled.error is null
+        val conflictBranches = assistantMergePagedBranches(
+            initialBranches.copy(loading = true),
+            null,
+            stateWithBranches,
+            errorCode = "revision_conflict",
+        )
+        assertFalse(conflictBranches.loading)
+        assertEquals("Continuations changed. Recheck and try again.", conflictBranches.error)
+        assertEquals(128, conflictBranches.heads.size)
+
+        val conflictChats = assistantMergePagedChats(
+            initialChats.copy(loading = true),
+            null,
+            settledChatsState,
+            errorCode = "revision_conflict",
+        )
+        assertFalse(conflictChats.loading)
+        assertEquals("Chats changed. Recheck and try again.", conflictChats.error)
+        assertEquals(128, conflictChats.chats.size)
+
+        // Revision mismatch or conversation change fences branch merge
+        val fencedBranches = assistantMergePagedBranches(
+            initialBranches.copy(loading = true),
+            page2Branches,
+            stateWithBranches.copy(conversation = turnId("999"))
+        )
+        assertFalse(fencedBranches.loading)
+        assertEquals("Continuations changed. Recheck and try again.", fencedBranches.error)
+        assertEquals(128, fencedBranches.heads.size)
     }
 
     @Test fun provisionalAssistantRequiresSubstantiveBusyTextAndKeepsItUnmodified() {
@@ -753,11 +877,10 @@ class AssistantPresentationTest {
         assertTrue(assistantVisibleVoiceErrors(voice.copy(error = "microphone_permission_required")).contains("microphone_permission_required"))
     }
 
-    @Test fun futureRequestPolicyDefaultsOnAndWebOffDisablesEffortNotOrdinarySend() {
+    @Test fun futureRequestPolicyDefaultsOnAndWebOffPreservesOrdinarySend() {
         assertTrue(AssistantState().webEnabled)
         assertTrue(AssistantState().speechNetworkFallback)
         val webOff = ready.copy(webEnabled = false)
-        assertFalse(assistantCanSelectSearchMode(webOff, AssistantVoiceState()))
         assertTrue(assistantCanSend(webOff, AssistantVoiceState()))
     }
 

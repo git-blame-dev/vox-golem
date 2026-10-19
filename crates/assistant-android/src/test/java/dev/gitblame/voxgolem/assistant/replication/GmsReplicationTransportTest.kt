@@ -174,7 +174,7 @@ class GmsReplicationTransportTest {
     }
 
     private fun budget(timeout: Long = 5_000) = BoundedGmsWait(System.nanoTime() + TimeUnit.SECONDS.toNanos(30), timeout)
-    private fun record() = JSONObject().put("body_key", "1".repeat(64)).put("operation", JSONObject().put("version", 1)
+    private fun record() = JSONObject().put("body_key", "1".repeat(64)).put("operation", JSONObject().put("version", 2)
         .put("id", JSONObject().put("replica", a).put("sequence", "1"))
         .put("body", JSONObject().put("kind", "conversation_created").put("title", "Synthetic SDK conversation")))
     private fun worker(block: () -> Unit) {

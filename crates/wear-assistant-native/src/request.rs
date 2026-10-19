@@ -1,6 +1,5 @@
 use crate::ErrorCode;
 use serde::Deserialize;
-use voxgolem_core::search::Mode;
 use voxgolem_platform::custom_openai::{
     CustomOpenAiContentType, CustomOpenAiMessage, CustomOpenAiModel, CustomOpenAiPrompt,
     CustomOpenAiRole,
@@ -26,8 +25,8 @@ struct WireRequest {
     web_enabled: bool,
     #[serde(default)]
     external_session_id: Option<String>,
-    #[serde(default)]
-    search_mode: Option<Mode>,
+    #[serde(default, rename = "searchMode")]
+    legacy_search_mode: Option<String>,
     #[serde(default)]
     conversation_id: Option<String>,
 }
@@ -70,7 +69,6 @@ pub(crate) struct Request {
     pub prompt: CustomOpenAiPrompt,
     pub instructions: String,
     pub web_enabled: bool,
-    pub search_mode: Option<Mode>,
 }
 
 pub(crate) fn valid_request_id(id: &str) -> bool {
@@ -96,9 +94,10 @@ pub(crate) fn parse(input: &str) -> Result<Request, ErrorCode> {
             .conversation_id
             .as_ref()
             .is_some_and(|id| !valid_conversation_id(id))
-        || (wire.search_mode.is_some()
-            && wire.conversation_id.is_none()
-            && wire.external_session_id.is_none())
+        || wire
+            .legacy_search_mode
+            .as_deref()
+            .is_some_and(|mode| !matches!(mode, "quick" | "verify" | "research"))
         || wire.instructions.trim().is_empty()
         || wire.instructions.len() > MAX_INSTRUCTIONS_BYTES
         || wire.messages.is_empty()
@@ -114,13 +113,6 @@ pub(crate) fn parse(input: &str) -> Result<Request, ErrorCode> {
         "local-fast" => CustomOpenAiModel::LocalFast,
         _ => return Err(ErrorCode::InvalidRequest),
     };
-    // Local chat cannot fulfill explicit verification/research. Reject before
-    // registration, callbacks or dispatch rather than silently degrading the route.
-    if model == CustomOpenAiModel::LocalFast
-        && matches!(wire.search_mode, Some(Mode::Verify | Mode::Research))
-    {
-        return Err(ErrorCode::InvalidRequest);
-    }
     let text_bytes: usize = wire
         .messages
         .iter()
@@ -170,7 +162,6 @@ pub(crate) fn parse(input: &str) -> Result<Request, ErrorCode> {
         model,
         instructions: wire.instructions,
         web_enabled: wire.web_enabled,
-        search_mode: wire.search_mode,
     })
 }
 
@@ -232,16 +223,16 @@ mod tests {
     }
 
     #[test]
-    fn local_verify_and_research_are_rejected_at_json_admission() {
+    fn legacy_modes_do_not_change_local_admission_or_web_permission() {
         for mode in ["verify", "research"] {
             let mut value = fixture();
             value["model"] = json!("local-fast");
             value["searchMode"] = json!(mode);
             value["conversationId"] = json!("synthetic-conversation:1");
-            assert!(matches!(
-                parse(&value.to_string()),
-                Err(ErrorCode::InvalidRequest)
-            ));
+            value["webEnabled"] = json!(false);
+            let request = parse(&value.to_string()).unwrap();
+            assert_eq!(request.model, CustomOpenAiModel::LocalFast);
+            assert!(!request.web_enabled);
             assert_eq!(
                 value["messages"][2]["content"],
                 "Synthetic current question"
@@ -250,11 +241,11 @@ mod tests {
     }
 
     #[test]
-    fn search_requires_valid_mode_and_stable_conversation_identity() {
+    fn legacy_modes_are_ignored_and_optional_identity_remains_stable() {
         for mode in ["quick", "verify", "research"] {
             let mut value = fixture();
             value["searchMode"] = json!(mode);
-            assert!(parse(&value.to_string()).is_err());
+            assert!(parse(&value.to_string()).is_ok());
             value["conversationId"] = json!("synthetic-replica:1");
             let first = parse(&value.to_string()).expect("valid search request");
             assert!(!first.prompt.session_id.contains("synthetic"));
@@ -265,6 +256,8 @@ mod tests {
         for (field, replacement) in [
             ("searchMode", json!("unknown")),
             ("searchMode", json!("Quick")),
+            ("searchMode", json!("off")),
+            ("searchMode", json!(false)),
             ("conversationId", json!("")),
             ("conversationId", json!("synthetic identity with spaces")),
             ("conversationId", json!("x".repeat(257))),
@@ -277,6 +270,21 @@ mod tests {
                 parse(&value.to_string()),
                 Err(ErrorCode::InvalidRequest)
             ));
+        }
+    }
+
+    #[test]
+    fn omitted_or_null_legacy_mode_has_no_authority_over_permission_or_model() {
+        for web_enabled in [false, true] {
+            let mut value = fixture();
+            value["webEnabled"] = json!(web_enabled);
+            let omitted = parse(&value.to_string()).unwrap();
+            value["searchMode"] = serde_json::Value::Null;
+            let legacy_null = parse(&value.to_string()).unwrap();
+            assert_eq!(legacy_null.web_enabled, web_enabled);
+            assert_eq!(legacy_null.model, omitted.model);
+            assert_eq!(legacy_null.prompt.session_id, omitted.prompt.session_id);
+            assert_eq!(legacy_null.prompt.prompt, omitted.prompt.prompt);
         }
     }
 

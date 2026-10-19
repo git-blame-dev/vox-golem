@@ -5,7 +5,7 @@ const A: &str = "00000000-0000-4000-8000-000000000001";
 const B: &str = "00000000-0000-4000-8000-000000000002";
 
 fn operation() -> Value {
-    json!({"version":1,"id":{"replica":A,"sequence":"1"},"body":{"kind":"conversation_created","title":"Synthetic 🧪"}})
+    json!({"version":2,"id":{"replica":A,"sequence":"1"},"body":{"kind":"conversation_created","title":"Synthetic 🧪"}})
 }
 
 fn call(input: Value) -> Value {
@@ -13,7 +13,7 @@ fn call(input: Value) -> Value {
 }
 
 fn empty() -> Value {
-    json!({"version":1,"revision":"0","records":[],"retired":[]})
+    json!({"version":2,"revision":"0","records":[],"retired":[]})
 }
 
 fn record(op: Value) -> Value {
@@ -56,7 +56,7 @@ fn projection_empty_missing_and_deleted_selections_return_the_same_view_without_
     let deleted = plan(
         populated.clone(),
         vec![record(
-            json!({"version":1,"id":{"replica":A,"sequence":"4"},
+            json!({"version":2,"id":{"replica":A,"sequence":"4"},
         "body":{"kind":"conversation_deleted","conversation":creation["operation"]["id"]}}),
         )],
     )["value"]["snapshot"]
@@ -178,7 +178,7 @@ fn projection_history_preserves_cursor_replay_and_reports_read_errors_with_the_f
     let changed = plan(
         snapshot.clone(),
         vec![record(
-            json!({"version":1,"id":{"replica":B,"sequence":"77"},
+            json!({"version":2,"id":{"replica":B,"sequence":"77"},
         "body":{"kind":"conversation_created","title":"Synthetic other conversation"}}),
         )],
     )["value"]["snapshot"]
@@ -231,7 +231,7 @@ fn projection_keeps_snapshot_hash_graph_and_read_quotas() {
     );
     let mut cycle = turn("2", operation()["id"].clone());
     cycle["body"]["parent"] = cycle["id"].clone();
-    let graph = json!({"version":1,"revision":"1","records":[record(operation()),record(cycle)],"retired":[]});
+    let graph = json!({"version":2,"revision":"1","records":[record(operation()),record(cycle)],"retired":[]});
     let legacy = call(json!({"kind":"view","snapshot":graph}));
     assert_eq!(legacy["ok"], false);
     assert_eq!(
@@ -360,7 +360,7 @@ fn history_cursor_replay_branch_change_revision_change_and_malformed_are_explici
         history(&snapshot, head.clone(), json!("malformed"), 1)["error"]["field"],
         "history_cursor"
     );
-    let changed = plan(snapshot.clone(), vec![record(json!({"version":1,"id":{"replica":B,"sequence":"77"},"body":{"kind":"conversation_created","title":"Synthetic other chat"}}))])["value"]["snapshot"].clone();
+    let changed = plan(snapshot.clone(), vec![record(json!({"version":2,"id":{"replica":B,"sequence":"77"},"body":{"kind":"conversation_created","title":"Synthetic other chat"}}))])["value"]["snapshot"].clone();
     assert_eq!(
         history(&changed, head, cursor, 1)["error"]["field"],
         "history_cursor_stale"
@@ -534,7 +534,7 @@ fn history_rejects_missing_pending_deleted_and_quarantined_paths() {
             json!([root.clone()])
         );
     }
-    let deletion = record(json!({"version":1,"id":{"replica":A,"sequence":"4"},
+    let deletion = record(json!({"version":2,"id":{"replica":A,"sequence":"4"},
         "body":{"kind":"conversation_deleted","conversation":c["operation"]["id"]}}));
     let deleted = plan(snapshot, vec![deletion])["value"]["snapshot"].clone();
     assert_eq!(
@@ -547,13 +547,13 @@ fn history_rejects_missing_pending_deleted_and_quarantined_paths() {
 fn canonical_body_hash_ignores_key_order_whitespace_and_unicode_escapes() {
     let result = record(operation());
     let reordered = format!(
-        r#"{{"operation":{{"body":{{"title":"Synthetic \ud83e\uddea","kind":"conversation_created"}},"id":{{"sequence":"1","replica":"{A}"}},"version":1}},"kind":"record"}}"#
+        r#"{{"operation":{{"body":{{"title":"Synthetic \ud83e\uddea","kind":"conversation_created"}},"id":{{"sequence":"1","replica":"{A}"}},"version":2}},"kind":"record"}}"#
     );
     let alternate: Value = serde_json::from_str(&apply_json(&reordered)).unwrap();
     assert_eq!(result, alternate["value"]);
     assert_eq!(
         result["body_key"],
-        "63fb5f4ae23359b8632ff27a178d958d60a82d57be7f6fdf59e3a86276974b5b"
+        "35d4212614f45e21f4a614a7fbc4b0ad677f6a21f84dae1cf637d2430f01945e"
     );
 }
 
@@ -607,7 +607,7 @@ fn forged_import_and_restore_body_keys_are_rejected_not_rewritten() {
     let result = plan(empty(), vec![forged.clone()]);
     assert_eq!(result["ok"], false);
     assert_eq!(result["error"]["field"], "body_key_sha256_mismatch");
-    let snapshot = json!({"version":1,"revision":"1","records":[forged],"retired":[]});
+    let snapshot = json!({"version":2,"revision":"1","records":[forged],"retired":[]});
     let result = call(json!({"kind":"view","snapshot":snapshot}));
     assert_eq!(result["ok"], false);
     assert_eq!(result["error"]["field"], "body_key_sha256_mismatch");
@@ -616,10 +616,10 @@ fn forged_import_and_restore_body_keys_are_rejected_not_rewritten() {
 #[test]
 fn strict_parse_errors_do_not_echo_input_or_accept_duplicate_fields() {
     for input in [
-        r#"{"kind":"view","snapshot":{"version":1,"revision":"0","records":[],"retired":[]},"secret":"Synthetic sensitive marker"}"#,
+        r#"{"kind":"view","snapshot":{"version":2,"revision":"0","records":[],"retired":[]},"secret":"Synthetic sensitive marker"}"#,
         r#"{"kind":"view","kind":"record","operation":{}}"#,
-        r#"{"kind":"record","operation":{"version":1,"version":1}}"#,
-        r#"{"kind":"record","operation":{"version":1,"id":{"replica":"bad","sequence":"1"},"body":{"kind":"conversation_created","title":"Synthetic","extra":true}}}"#,
+        r#"{"kind":"record","operation":{"version":2,"version":2}}"#,
+        r#"{"kind":"record","operation":{"version":2,"id":{"replica":"bad","sequence":"1"},"body":{"kind":"conversation_created","title":"Synthetic","extra":true}}}"#,
     ] {
         let result: Value = serde_json::from_str(&apply_json(input)).unwrap();
         assert_eq!(result["ok"], false);
@@ -648,10 +648,10 @@ fn native_raw_request_operation_and_snapshot_bounds_are_checked_before_parsing()
 
 fn turn(sequence: &str, conversation: Value) -> Value {
     json!({
-        "version":1,"id":{"replica":A,"sequence":sequence},
+        "version":2,"id":{"replica":A,"sequence":sequence},
         "body":{"kind":"turn_completed","conversation":conversation,"parent":null,
             "request":{"replica":A,"sequence":"100"},"prompt":"Synthetic question",
-            "answer":{"kind":"text","text":"Synthetic answer"},"terminal_stage":"instant",
+            "answer":{"kind":"text","text":"Synthetic answer"},"sources":[],"terminal_stage":"instant",
             "provenance":{"requested_model":"custom-sol-none","returned_model":null,
                 "policy_id":"synthetic-policy","policy_version":"1",
                 "instruction_profile_id":"synthetic-profile","instruction_profile_version":"1","context":[]}}
@@ -681,7 +681,7 @@ fn core_context_continuation_forks_and_tombstones_are_not_reimplemented() {
     let context = call(json!({"kind":"context","snapshot":fork_snapshot,"request":fork_request}));
     assert_eq!(context["error"]["kind"], "ambiguous_heads");
     let delete = record(
-        json!({"version":1,"id":{"replica":A,"sequence":"4"},"body":{"kind":"conversation_deleted","conversation":conversation}}),
+        json!({"version":2,"id":{"replica":A,"sequence":"4"},"body":{"kind":"conversation_deleted","conversation":conversation}}),
     );
     let deleted = plan(fork_snapshot, vec![delete]);
     assert_eq!(
@@ -833,7 +833,7 @@ fn real_hashed_cross_conversation_quarantine_remains_restorable_after_witness_de
     }
     assert_eq!(snapshot["quarantine"].as_array().unwrap().len(), 2);
     let deletion = record(
-        json!({"version":1,"id":{"replica":B,"sequence":"99"},"body":{"kind":"conversation_deleted","conversation":c["operation"]["id"]}}),
+        json!({"version":2,"id":{"replica":B,"sequence":"99"},"body":{"kind":"conversation_deleted","conversation":c["operation"]["id"]}}),
     );
     let deleted = plan(snapshot, vec![deletion]);
     assert_eq!(deleted["ok"], true, "{deleted}");

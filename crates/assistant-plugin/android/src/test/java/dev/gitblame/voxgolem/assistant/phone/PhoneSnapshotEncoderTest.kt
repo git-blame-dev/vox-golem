@@ -10,7 +10,16 @@ class PhoneSnapshotEncoderTest {
     private fun id(sequence: String) = JSONObject().put("replica", "11111111-1111-4111-8111-111111111111").put("sequence", sequence)
     private fun record(sequence: String, request: String, answer: String) = JSONObject().put("operation", JSONObject()
         .put("id", id(sequence)).put("body", JSONObject().put("kind", "turn_completed").put("conversation", id("1"))
-            .put("request", id(request)).put("prompt", "Synthetic question").put("answer", JSONObject().put("kind", "text").put("text", answer)).put("terminal_stage", "instant")))
+            .put("request", id(request)).put("prompt", "Synthetic question").put("answer", JSONObject().put("kind", "text").put("text", answer)).put("sources", JSONArray()).put("terminal_stage", "instant")))
+
+    @Test fun canonicalObservedSourcesSurviveColdSnapshotProjectionWithoutTextFooterParsing() {
+        val record = record("3", "2", "Synthetic answer without a source footer")
+        val sources = JSONArray().put(JSONObject().put("url", "https://example.test/document").put("title", "Synthetic observed document"))
+        record.getJSONObject("operation").getJSONObject("body").put("sources", sources)
+        val turn = PhoneSnapshotEncoder.turn(record, emptyMap())
+        assertEquals(sources.toString(), turn.getJSONArray("sources").toString())
+        assertEquals("Synthetic answer without a source footer", turn.getJSONObject("answer").getJSONObject("content").getString("text"))
+    }
 
     @Test fun optionalModelsRequirePublishedReadinessAndEnforceWebPolicyInsteadOfPrefixAvailability() {
         val view = JSONObject().put("revision", "0").put("conversations", JSONArray())
@@ -56,6 +65,33 @@ class PhoneSnapshotEncoderTest {
         assertEquals(129, projection.getInt("conversation_count"))
         assertEquals(127, projection.getInt("conversation_offset"))
         assertEquals(PhoneSnapshotEncoder.wireId(id("129")), projection.getJSONArray("conversations").getJSONObject(127).getString("id"))
+
+        // CompactView shape from Rust (already bounded to 128 items, no records array, explicit counts and offsets)
+        val compactConversations = JSONArray()
+        for (sequence in 1..127) compactConversations.put(JSONObject().put("id", id(sequence.toString())).put("title", "Synthetic conversation $sequence").put("deleted", false))
+        compactConversations.put(JSONObject().put("id", id("129")).put("title", "Synthetic conversation 129").put("deleted", false))
+        val compactView = JSONObject()
+            .put("revision", "2")
+            .put("conversations", compactConversations)
+            .put("conversation_count", 129)
+            .put("conversation_offset", 127)
+            .put("branch_count", 129)
+            .put("branch_offset", 128)
+            .put("branch_previews", JSONArray())
+            .put("pending", JSONArray())
+            .put("quarantine_count", 0)
+        val compactState = AssistantState(
+            viewJson = compactView.toString(),
+            conversation = id("129").toString(),
+            branchChoices = (1..128).map { id(it.toString()).toString() }
+        )
+        val compactProjection = PhoneSnapshotEncoder.encode(compactState, null, PhonePreferences.defaults(), emptyMap()).getJSONObject("assistant")
+        assertEquals(128, compactProjection.getJSONArray("conversations").length())
+        assertEquals(129, compactProjection.getInt("conversation_count"))
+        assertEquals(127, compactProjection.getInt("conversation_offset"))
+        assertEquals(129, compactProjection.getInt("branch_count"))
+        assertEquals(128, compactProjection.getInt("branch_offset"))
+        assertEquals(PhoneSnapshotEncoder.wireId(id("129")), compactProjection.getJSONArray("conversations").getJSONObject(127).getString("id"))
     }
 
     @Test fun projectsOnlyRustSelectedPathNotAllGraphRecords() {

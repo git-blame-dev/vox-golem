@@ -40,8 +40,9 @@ internal interface ReplicationDomain {
 }
 
 internal object ReplicationWire {
-    const val PREFIX = "/voxgolem/assistant/v1/"
-    const val IDENTITY_PATH = "${PREFIX}identity"
+    const val PREFIX = "/voxgolem/assistant/v2/"
+    // Pairing/credential associations retain their independent metadata protocol.
+    const val IDENTITY_PATH = "/voxgolem/assistant/v1/identity"
     const val CAPABILITY = "voxgolem_assistant_v1"
     const val MAX_CONTROL_BYTES = 32 * 1024
     const val MAX_RECORD_BYTES = 2 * 1024 * 1024
@@ -74,7 +75,7 @@ internal object ReplicationWire {
     }
 
     fun frame(sender: String, target: String, session: String, token: String, kind: String, payload: JSONObject): JSONObject =
-        JSONObject().put("version", 1).put("sender", uuid(sender)).put("target", uuid(target))
+        JSONObject().put("version", 2).put("sender", uuid(sender)).put("target", uuid(target))
             .put("session", uuid(session)).put("token", uuid(token)).put("kind", kind).put("payload", payload)
 
     fun encode(frame: JSONObject): ByteArray = frame.toString().toByteArray(Charsets.UTF_8).also {
@@ -117,7 +118,7 @@ internal object ReplicationWire {
     }
 
     fun validateFrame(frame: JSONObject, path: String, local: String, authenticatedPeer: String) {
-        require(frame.length() == 7 && frame.get("version") == 1)
+        require(frame.length() == 7 && frame.get("version") == 2)
         require(frame.getString("sender") == authenticatedPeer && frame.getString("target") == local)
         uuid(frame.getString("session")); uuid(frame.getString("token"))
         require(path == path(authenticatedPeer, local, frame.getString("kind")))

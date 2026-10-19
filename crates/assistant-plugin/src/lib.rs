@@ -323,7 +323,6 @@ mod android {
         request_id: String,
         prompt: String,
         updates: Channel<Value>,
-        search_mode: Option<String>,
     ) -> Result<Value, StructuredPluginInvokeError> {
         let bridge = app.state::<Bridge<R>>();
         {
@@ -380,7 +379,6 @@ mod android {
                 "submit_prompt",
                 serde_json::json!({
                     "requestId": request_id, "prompt": prompt, "updates": bridge.channel,
-                    "searchMode": search_mode,
                 }),
             )
             .await
@@ -470,23 +468,13 @@ pub async fn submit<R: Runtime>(
     prompt: String,
     updates: tauri::ipc::Channel<Value>,
 ) -> Result<Value, StructuredPluginInvokeError> {
-    submit_with_search_mode(app, request_id, prompt, updates, None).await
-}
-
-pub async fn submit_with_search_mode<R: Runtime>(
-    app: tauri::AppHandle<R>,
-    request_id: String,
-    prompt: String,
-    updates: tauri::ipc::Channel<Value>,
-    search_mode: Option<String>,
-) -> Result<Value, StructuredPluginInvokeError> {
     #[cfg(target_os = "android")]
     {
-        android::submit(app, request_id, prompt, updates, search_mode).await
+        android::submit(app, request_id, prompt, updates).await
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = (app, request_id, prompt, updates, search_mode);
+        let _ = (app, request_id, prompt, updates);
         Err(StructuredPluginInvokeError::bounded(
             Some("unavailable"),
             Some("Assistant mobile bridge is available only on Android"),

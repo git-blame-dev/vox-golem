@@ -135,18 +135,21 @@ class AssistantUxEmulatorTest {
         }
     }
 
-    @Test(timeout = 90_000) fun webPermissionAndSpeechFallbackTogglesAreSeparateFromSearchEffortAndVoiceChoices() {
+    @Test(timeout = 90_000) fun oneWebResearchPermissionToggleIsSeparateFromSpeechAndVoiceChoices() {
         launch().use { scenario ->
             scenario.onActivity { it.seedSpeechChoices() }
             val before = snapshot(scenario)
             assertTrue(before.state.webEnabled)
             assertTrue(before.state.speechNetworkFallback)
             openSettingsByPointer()
-            scrollTextIntoView("Web access")
-            tap("Web access", description = false)
+            scrollTextIntoView("Web research")
+            assertEquals(1, visibleNodes().count { it.text == "Web research" })
+            assertTrue(visibleNodes().none { it.text?.startsWith("Search:") == true })
+            tap("Web research", description = false)
             await("Web permission changes native-projected state") { !snapshot(scenario).state.webEnabled }
-            scrollTextIntoView("Search: Quick")
-            assertFalse("Effort is disabled, not relocated to chat", visibleNodes().first { it.text == "Search: Quick" }.enabled)
+            scrollTextIntoView("Web tools will not be dispatched")
+            scrollTextIntoView("Web research")
+            assertTrue("Web permission remains available when off", visibleNodes().first { it.text == "Web research" }.enabled)
             scrollTextIntoView("Speech network fallback")
             tap("Speech network fallback", description = false)
             await("Speech policy changes separately") { !snapshot(scenario).state.speechNetworkFallback }

@@ -6,21 +6,21 @@ import org.junit.Test
 
 class AssistantDomainNativeTest {
     private val replica = "00000000-0000-4000-8000-000000000001"
-    private val operation = """{"version":1,"id":{"replica":"$replica","sequence":"1"},"body":{"kind":"conversation_created","title":"Synthetic 🧪"}}"""
-    private val bodyKey = "63fb5f4ae23359b8632ff27a178d958d60a82d57be7f6fdf59e3a86276974b5b"
-    private val empty = """{"version":1,"revision":"0","records":[],"retired":[]}"""
+    private val operation = """{"version":2,"id":{"replica":"$replica","sequence":"1"},"body":{"kind":"conversation_created","title":"Synthetic 🧪"}}"""
+    private val bodyKey = "35d4212614f45e21f4a614a7fbc4b0ad677f6a21f84dae1cf637d2430f01945e"
+    private val empty = """{"version":2,"revision":"0","records":[],"retired":[]}"""
 
     @Test fun bothJniNamesUseSameCanonicalHashWithoutProviderOrCredentials() {
         val request = """{"kind":"record","operation":$operation}"""
         val expected = """{"ok":true,"value":{"body_key":"$bodyKey","operation":$operation}}"""
         assertEquals(expected, AssistantDomainNative.apply(request))
         assertEquals(expected, WearAssistantNative.apply(request))
-        val reordered = """{"kind":"record","operation":{"body":{"title":"Synthetic \ud83e\uddea","kind":"conversation_created"},"version":1,"id":{"sequence":"1","replica":"$replica"}}}"""
+        val reordered = """{"kind":"record","operation":{"body":{"title":"Synthetic \ud83e\uddea","kind":"conversation_created"},"version":2,"id":{"sequence":"1","replica":"$replica"}}}"""
         assertEquals(expected, AssistantDomainNative.apply(reordered))
     }
 
     @Test fun forgedSnapshotDigestIsRejectedByActualJniRestore() {
-        val snapshot = """{"version":1,"revision":"1","records":[{"body_key":"${"0".repeat(64)}","operation":$operation}],"retired":[]}"""
+        val snapshot = """{"version":2,"revision":"1","records":[{"body_key":"${"0".repeat(64)}","operation":$operation}],"retired":[]}"""
         assertEquals("""{"ok":false,"error":{"kind":"invalid","field":"body_key_sha256_mismatch"}}""",
             AssistantDomainNative.apply("""{"kind":"view","snapshot":$snapshot}"""))
     }

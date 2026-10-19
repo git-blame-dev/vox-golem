@@ -20,6 +20,13 @@ object PhoneSnapshotEncoder {
             val turn = turn(turns.getJSONObject(index), clientRequestIds)
             bytes += turn.getJSONObject("user").getJSONObject("content").getString("text").toByteArray(Charsets.UTF_8).size
             bytes += turn.getJSONObject("answer").getJSONObject("content").getString("text").toByteArray(Charsets.UTF_8).size
+            val sources = turn.getJSONArray("sources")
+            require(sources.length() <= 32)
+            for (sourceIndex in 0 until sources.length()) {
+                val source = sources.getJSONObject(sourceIndex)
+                bytes += source.getString("url").toByteArray(Charsets.UTF_8).size
+                bytes += source.getString("title").toByteArray(Charsets.UTF_8).size
+            }
             transcript.put(turn)
         }
         require(bytes <= 256 * 1024)
@@ -30,7 +37,7 @@ object PhoneSnapshotEncoder {
         var nextConversationOffset = 128
         for (index in 0 until canonical.length()) {
             val item = canonical.getJSONObject(index)
-            if (!item.getBoolean("deleted") && !item.isNull("title")) {
+            if (!item.optBoolean("deleted") && !item.isNull("title")) {
                 conversationCount++
                 val projected = JSONObject().put("id", wireId(item.getJSONObject("id"))).put("title", item.getString("title"))
                 if (state.conversation?.let { wireId(JSONObject(it)) } == projected.getString("id")) selectedConversation = projected
@@ -42,6 +49,20 @@ object PhoneSnapshotEncoder {
                 conversations.put(127, selected)
                 nextConversationOffset = 127
             }
+        }
+        val totalConversations = view.optInt("conversation_count", conversationCount).coerceAtLeast(conversationCount)
+        val conversationOffset = if (view.has("conversation_offset")) {
+            view.getInt("conversation_offset")
+        } else if (totalConversations > conversations.length()) {
+            nextConversationOffset
+        } else {
+            totalConversations
+        }
+        val totalBranches = view.optInt("branch_count", state.branchChoices.size).coerceAtLeast(state.branchChoices.size)
+        val branchOffset = if (view.has("branch_offset") && state.branchChoices.isNotEmpty()) {
+            view.getInt("branch_offset")
+        } else {
+            state.branchChoices.size.coerceAtMost(128)
         }
         val capabilities = JSONArray()
         for ((id, reason) in mapOf(
@@ -76,11 +97,11 @@ object PhoneSnapshotEncoder {
             .put("transcript", transcript).put("active_request", active ?: JSONObject.NULL)
             .put("capabilities", capabilities).put("model_options", options).put("preferences", preferences)
             .put("assistant", JSONObject().put("revision", view.getString("revision")).put("conversations", conversations)
-                .put("conversation_count", conversationCount)
-                .put("conversation_offset", if (conversationCount > conversations.length()) nextConversationOffset else conversationCount)
+                .put("conversation_count", totalConversations)
+                .put("conversation_offset", conversationOffset)
                 .put("selected_head", state.selectedHead?.let { wireId(JSONObject(it)) } ?: JSONObject.NULL)
                 .put("branch_choices", JSONArray(state.branchChoices.take(128).map { wireId(JSONObject(it)) }))
-                .put("branch_count", state.branchChoices.size).put("branch_offset", state.branchChoices.size.coerceAtMost(128))
+                .put("branch_count", totalBranches).put("branch_offset", branchOffset)
                 .put("draft", state.draft).put("interrupted", state.interrupted).put("error", state.error ?: JSONObject.NULL))
     }
 
@@ -97,6 +118,7 @@ object PhoneSnapshotEncoder {
             .put("execution_id", JSONObject().put("session_id", wireId(body.getJSONObject("conversation"))).put("generation", requestId))
             .put("user", JSONObject().put("id", turnId).put("role", "user").put("content", JSONObject().put("kind", "text").put("text", body.getString("prompt"))))
             .put("answer", JSONObject().put("id", turnId).put("role", "assistant").put("content", JSONObject().put("kind", kind).put("text", answer.getString(if (kind == "refusal") "reason" else "text"))))
+            .put("sources", body.getJSONArray("sources"))
             .put("final_stage", body.getString("terminal_stage"))
     }
 

@@ -60,14 +60,14 @@ nativeAbis.forEach { require(it in nativeTargets) { "Unsupported assistant nativ
 android.defaultConfig.ndk.abiFilters.addAll(nativeAbis)
 val nativeInputs = files(nativeCheckout.resolve("Cargo.toml"), nativeCheckout.resolve("Cargo.lock"),
     fileTree(nativeCheckout.resolve("crates/wear-assistant-native")), fileTree(nativeCheckout.resolve("crates/platform")),
-    fileTree(nativeCheckout.resolve("crates/core")))
+    fileTree(nativeCheckout.resolve("crates/core")), fileTree(nativeCheckout.resolve("crates/conversation-store")))
 
 fun registerNativeBuild(name: String, target: String?, release: Boolean) = tasks.register<Exec>(name) {
     workingDir(nativeCheckout)
     inputs.files(nativeInputs)
     val profile = if (release) "release" else "debug"
     outputs.file(nativeBuildDirectory.map { it.file("${target?.let { t -> "$t/" } ?: ""}$profile/libwear_assistant_native.so") })
-    val args = mutableListOf("cargo", "build", "--offline", "--locked", "-p", "voxgolem-wear-assistant-native",
+    val args = mutableListOf("cargo", "build", "--offline", "--locked", "--jobs", "2", "-p", "voxgolem-wear-assistant-native",
         "--target-dir", nativeBuildDirectory.get().asFile.absolutePath)
     if (release) args += "--release"
     if (target != null) {

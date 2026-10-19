@@ -11,9 +11,6 @@ interface AssistantPhoneBackend {
     fun command(name: String, arguments: JSONObject, reply: (Result<Any?>) -> Unit)
     /** Exactly one correlated terminal callback, after save or definitive retirement. Never poll busy. */
     fun submit(clientRequestId: String, prompt: String, update: (JSONObject) -> Unit, terminal: (Result<Any?>) -> Unit)
-    fun submit(clientRequestId: String, prompt: String, update: (JSONObject) -> Unit, terminal: (Result<Any?>) -> Unit, searchMode: String?) {
-        submit(clientRequestId, prompt, update, terminal)
-    }
     fun acknowledge(clientRequestId: String, providerRequestId: String, revision: String, accepted: Boolean): Boolean
     fun cancelDelivery(clientRequestId: String)
     fun foreground(visible: Boolean)

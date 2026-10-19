@@ -187,7 +187,7 @@ internal class DurableReplicationState(context: Context) : ReplicationState, Clo
 }
 
 private class ReplicationDatabase(context: Context) : SQLiteOpenHelper(context,
-    File(context.noBackupFilesDir, "assistant-replication.db").absolutePath, null, 3) {
+    File(context.noBackupFilesDir, "assistant-replication.db").absolutePath, null, 4) {
     override fun onConfigure(db: SQLiteDatabase) {
         db.execSQL("PRAGMA foreign_keys = ON")
         db.rawQuery("PRAGMA secure_delete = ON", null).use { check(it.moveToFirst()) }
@@ -201,10 +201,17 @@ private class ReplicationDatabase(context: Context) : SQLiteOpenHelper(context,
         db.execSQL("INSERT INTO retry VALUES (1, 0, 0)")
     }
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        check(oldVersion in 1..2 && newVersion == 3)
-        db.delete("setup", null, null)
-        db.execSQL("DROP TABLE IF EXISTS native_bindings")
-        db.execSQL("CREATE TABLE native_bindings (replica TEXT PRIMARY KEY, association TEXT NOT NULL)")
+        check(oldVersion in 1..3 && newVersion == 4)
+        if (oldVersion < 3) {
+            // Existing authorization-format upgrade, unchanged by the history epoch.
+            db.delete("setup", null, null)
+            db.execSQL("DROP TABLE IF EXISTS native_bindings")
+            db.execSQL("CREATE TABLE native_bindings (replica TEXT PRIMARY KEY, association TEXT NOT NULL)")
+        }
+        // New history epoch only: preserve setup, enrolled identities and trusted bindings.
+        db.execSQL("CREATE TABLE IF NOT EXISTS native_bindings (replica TEXT PRIMARY KEY, association TEXT NOT NULL)")
+        db.execSQL("UPDATE peers SET session = NULL")
+        db.execSQL("UPDATE retry SET attempts = 0, due = 0 WHERE singleton = 1")
     }
 }
 

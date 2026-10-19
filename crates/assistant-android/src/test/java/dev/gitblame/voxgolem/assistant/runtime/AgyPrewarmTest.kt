@@ -174,7 +174,7 @@ class AgyPrewarmTest {
         AgyProviderNative(context(), { executable }, { _, _, _ -> LiveProcess().also(started::add) }).use { provider ->
             val router = AgyProviderRouter(RuntimeEnvironment.getApplication(), defaultNative, provider)
             repeat(6) {
-                router.prewarm("agy-sonnet-high")
+                router.prewarmSelection("agy-sonnet-high", true)
                 router.prewarm("agy-sonnet-high", "/synthetic/private/codex-auth.json", true)
             }
             val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
@@ -202,7 +202,7 @@ class AgyPrewarmTest {
         val executable = folder.newFile("libagy-stale.so").apply { setExecutable(true) }
         AgyProviderNative(context(), { executable }, { _, _, _ -> LiveProcess().also(started::add) }).use { provider ->
             val router = AgyProviderRouter(RuntimeEnvironment.getApplication(), defaultNative, provider)
-            router.prewarm("custom-sol-high")
+            router.prewarmSelection("custom-sol-high", true)
             router.prewarm("agy-sonnet-high", "/synthetic/private/codex-auth.json", true)
             Thread.sleep(50)
             assertTrue(started.isEmpty())

@@ -23,3 +23,11 @@ dependencies {
     testImplementation("org.json:json:20240303")
     testImplementation("org.robolectric:robolectric:4.14.1")
 }
+
+tasks.withType<Test>().configureEach {
+    dependsOn(":assistant-android:buildAssistantNativeJvm")
+    val library = providers.gradleProperty("assistantNativeLibrary").orNull?.let(::file)
+        ?: rootProject.layout.buildDirectory.file("assistant-android/rust-native/debug/libwear_assistant_native.so").get().asFile
+    systemProperty("assistant.native.library", library.absolutePath)
+    systemProperty("java.library.path", library.parent)
+}

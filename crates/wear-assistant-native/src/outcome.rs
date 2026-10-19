@@ -1,5 +1,6 @@
 use crate::{request::MAX_OUTPUT_BYTES, ErrorCode};
 use serde::Serialize;
+use voxgolem_core::sources::{merge_sources, source_bytes, SourceLink};
 use voxgolem_platform::custom_openai::{CustomOpenAiError, CustomOpenAiResponse};
 
 #[derive(Serialize)]
@@ -7,6 +8,7 @@ use voxgolem_platform::custom_openai::{CustomOpenAiError, CustomOpenAiResponse};
 pub(crate) enum Outcome {
     Complete {
         text: String,
+        sources: Vec<SourceLink>,
         #[serde(rename = "contentType")]
         content_type: &'static str,
         #[serde(rename = "returnedModel", skip_serializing_if = "Option::is_none")]
@@ -15,8 +17,6 @@ pub(crate) enum Outcome {
         auth_revision: Option<String>,
         #[serde(rename = "speechText", skip_serializing_if = "Option::is_none")]
         speech_text: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        route: Option<String>,
         #[serde(rename = "searchMs", skip_serializing_if = "Option::is_none")]
         search_ms: Option<u64>,
         #[serde(rename = "searchStatus", skip_serializing_if = "Option::is_none")]
@@ -54,14 +54,12 @@ impl Outcome {
 
     pub fn with_search_telemetry(
         mut self,
-        route: String,
         search_ms: u64,
         search_status: &'static str,
         fallback_used: bool,
         completed_ms: u64,
     ) -> Self {
         if let Self::Complete {
-            route: out_route,
             search_ms: out_search_ms,
             search_status: out_search_status,
             fallback_used: out_fallback_used,
@@ -69,7 +67,6 @@ impl Outcome {
             ..
         } = &mut self
         {
-            *out_route = Some(route);
             *out_search_ms = Some(search_ms);
             *out_search_status = Some(search_status);
             *out_fallback_used = Some(fallback_used);
@@ -96,11 +93,11 @@ impl Outcome {
             }
             Ok(response) => Self::Complete {
                 text: response.text,
+                sources: Vec::new(),
                 content_type: response.content_type.as_str(),
                 returned_model: response.model,
                 auth_revision: None,
                 speech_text: None,
-                route: None,
                 search_ms: None,
                 search_status: None,
                 fallback_used: None,
@@ -115,19 +112,38 @@ impl Outcome {
             .unwrap_or_else(|_| r#"{"status":"error","code":"internal_error"}"#.to_string())
     }
 
-    pub fn from_search_response(response: CustomOpenAiResponse, persisted_text: String) -> Self {
+    pub fn from_search_response(
+        response: CustomOpenAiResponse,
+        observed_sources: Vec<SourceLink>,
+    ) -> Self {
         let speech_text = response.text.clone();
-        let mut outcome = Self::from_response(Ok(response));
-        if persisted_text.len() > MAX_OUTPUT_BYTES {
+        let mut canonical_sources = Vec::new();
+        if response.content_type
+            != voxgolem_platform::custom_openai::CustomOpenAiContentType::Refusal
+        {
+            for source in observed_sources {
+                canonical_sources = match merge_sources(&canonical_sources, &[source]) {
+                    Ok(sources) => sources,
+                    Err(_) => return Self::error(ErrorCode::InvalidResponse),
+                };
+            }
+        }
+        if response
+            .text
+            .len()
+            .saturating_add(source_bytes(&canonical_sources))
+            > MAX_OUTPUT_BYTES
+        {
             return Self::error(ErrorCode::TooLarge);
         }
+        let mut outcome = Self::from_response(Ok(response));
         if let Self::Complete {
-            text,
+            sources,
             speech_text: speech,
             ..
         } = &mut outcome
         {
-            *text = persisted_text;
+            *sources = canonical_sources;
             *speech = Some(speech_text);
         }
         outcome
@@ -160,28 +176,35 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&outcome.json()).unwrap(),
             serde_json::json!({
                 "status": "complete", "text": "Synthetic \"answer\"\n", "contentType": "refusal",
-                "returnedModel": "synthetic-model"
+                "returnedModel": "synthetic-model", "sources": []
             })
         );
     }
 
     #[test]
-    fn search_projection_bounds_persisted_sources_and_keeps_speech_answer_only() {
-        let final_text = "Synthetic answer\n\nSources:\n- https://example.invalid/synthetic\n";
+    fn search_projection_keeps_plain_answer_and_authoritative_source_links() {
+        let source = SourceLink {
+            url: "https://example.test/synthetic".into(),
+            title: "Synthetic source".into(),
+        };
         let value: serde_json::Value = serde_json::from_str(
             &Outcome::from_search_response(
                 response("Synthetic answer", CustomOpenAiContentType::OutputText),
-                final_text.into(),
+                vec![source.clone(), source.clone()],
             )
             .json(),
         )
         .unwrap();
-        assert_eq!(value["text"], final_text);
+        assert_eq!(value["text"], "Synthetic answer");
+        assert_eq!(value["sources"], serde_json::json!([source]));
         assert_eq!(value["speechText"], "Synthetic answer");
         assert_eq!(
             Outcome::from_search_response(
-                response("Synthetic answer", CustomOpenAiContentType::OutputText),
-                "x".repeat(MAX_OUTPUT_BYTES + 1)
+                response(
+                    &"x".repeat(MAX_OUTPUT_BYTES),
+                    CustomOpenAiContentType::OutputText
+                ),
+                vec![source.clone()]
             )
             .json(),
             r#"{"status":"error","code":"too_large"}"#
@@ -189,13 +212,22 @@ mod tests {
         let boundary = "🧪".repeat(MAX_OUTPUT_BYTES / 4);
         let value: serde_json::Value = serde_json::from_str(
             &Outcome::from_search_response(
-                response("Synthetic answer", CustomOpenAiContentType::OutputText),
-                boundary.clone(),
+                response(&boundary, CustomOpenAiContentType::OutputText),
+                vec![],
             )
             .json(),
         )
         .unwrap();
         assert_eq!(value["text"], boundary);
+        let refusal: serde_json::Value = serde_json::from_str(
+            &Outcome::from_search_response(
+                response("Synthetic refusal", CustomOpenAiContentType::Refusal),
+                vec![source],
+            )
+            .json(),
+        )
+        .unwrap();
+        assert_eq!(refusal["sources"], serde_json::json!([]));
     }
 
     #[test]

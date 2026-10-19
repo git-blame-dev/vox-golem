@@ -85,7 +85,6 @@ internal data class AssistantActions(
     val endUtterance: () -> Unit, val tts: (Boolean) -> Unit, val speak: (String) -> Unit,
     val recheck: () -> Unit, val older: () -> Unit, val retryHistory: () -> Unit,
     val setConversationMode: (Boolean) -> Unit = {},
-    val selectSearchMode: (String) -> Unit = {},
     val setWebEnabled: (Boolean) -> Unit,
     val setSpeechNetworkFallback: (Boolean) -> Unit,
     val selectSpeechLanguage: (String) -> Unit,
@@ -96,6 +95,8 @@ internal data class AssistantActions(
     val openSpeechStore: () -> Unit = {},
     val replyLayout: (String?) -> Unit = {},
     val replyDrawSubmitted: (String?) -> Unit = {},
+    val loadConversations: (String, Int, (String?, AssistantState, String?) -> Unit) -> Unit = { _, _, _ -> },
+    val loadBranches: (String, String, String?, Int, (String?, AssistantState, String?) -> Unit) -> Unit = { _, _, _, _, _ -> },
 )
 
 private enum class AssistantPage { CHAT, CHATS, SETTINGS, SPEECH_LANGUAGE, SPEECH_ENGINE, SPEECH_VOICE, MISSING_SPEECH }
@@ -121,6 +122,125 @@ private fun assistantReplyLabel(firstTextMs: Long?, refusal: Boolean = false, pr
     if (provisional) append(" · not saved yet")
 }
 
+internal data class AssistantPagedChatsState(
+    val revision: String = "0",
+    val selectedConversationKey: String? = null,
+    val chats: List<AssistantChat> = emptyList(),
+    val count: Int = 0,
+    val nextOffset: Int = 0,
+    val loading: Boolean = false,
+    val error: String? = null,
+) {
+    val hasMore: Boolean get() = nextOffset < count
+}
+
+internal data class AssistantPagedBranchesState(
+    val revision: String = "0",
+    val conversationKey: String? = null,
+    val selectedHeadKey: String? = null,
+    val heads: List<String> = emptyList(),
+    val labels: Map<String, String> = emptyMap(),
+    val count: Int = 0,
+    val nextOffset: Int = 0,
+    val loading: Boolean = false,
+    val error: String? = null,
+) {
+    val hasMore: Boolean get() = nextOffset < count
+}
+
+internal fun assistantInitialPagedChats(view: JSONObject, selectedConversation: String?): AssistantPagedChatsState {
+    val initial = assistantChats(view)
+    val count = view.optInt("conversation_count", initial.size).coerceAtLeast(initial.size)
+    val offset = if (view.has("conversation_offset")) view.getInt("conversation_offset") else initial.size
+    return AssistantPagedChatsState(
+        revision = view.optString("revision", "0"),
+        selectedConversationKey = selectedConversation?.let(::assistantIdKey),
+        chats = initial,
+        count = count,
+        nextOffset = offset.coerceAtMost(count),
+    )
+}
+
+internal fun assistantMergePagedChats(
+    current: AssistantPagedChatsState,
+    rawPage: String?,
+    settled: AssistantState,
+    errorCode: String? = null,
+): AssistantPagedChatsState {
+    val settledView = runCatching { JSONObject(settled.viewJson) }.getOrNull()
+    val settledRev = settledView?.optString("revision")
+    val settledSelected = settled.conversation?.let(::assistantIdKey)
+    if (errorCode == "revision_conflict" || settledRev != current.revision || settledSelected != current.selectedConversationKey) {
+        return current.copy(loading = false, error = "Chats changed. Recheck and try again.")
+    }
+    return try {
+        require(rawPage != null)
+        val page = JSONObject(rawPage)
+        require(page.getString("revision") == current.revision)
+        val records = page.getJSONArray("conversations")
+        val incoming = (0 until records.length()).map { records.getJSONObject(it) }
+            .filter { !it.optBoolean("deleted") && !it.isNull("title") }
+            .map { AssistantChat(it.getJSONObject("id").toString(), it.getString("title")) }
+        val existingKeys = current.chats.map { assistantIdKey(it.id) }.toHashSet()
+        val merged = current.chats + incoming.filter { existingKeys.add(assistantIdKey(it.id)) }
+        val total = page.optInt("conversation_count", current.count).coerceAtLeast(merged.size)
+        val nextOffset = page.optInt("next_offset", (current.nextOffset + incoming.size).coerceAtMost(total)).coerceAtMost(total)
+        require(nextOffset > current.nextOffset || nextOffset >= total)
+        current.copy(chats = merged, count = total, nextOffset = nextOffset, loading = false, error = null)
+    } catch (_: Exception) {
+        current.copy(loading = false, error = (errorCode ?: settled.error)?.let(::assistantErrorText) ?: "Chats unavailable. Retry.")
+    }
+}
+
+internal fun assistantInitialPagedBranches(view: JSONObject, state: AssistantState): AssistantPagedBranchesState {
+    val initial = state.branchChoices
+    val labels = initial.associateWith { assistantBranchLabel(view, it) }
+    val count = view.optInt("branch_count", initial.size).coerceAtLeast(initial.size)
+    val offset = if (view.has("branch_offset") && initial.isNotEmpty()) view.getInt("branch_offset") else initial.size
+    return AssistantPagedBranchesState(
+        revision = view.optString("revision", "0"),
+        conversationKey = state.conversation?.let(::assistantIdKey),
+        selectedHeadKey = state.selectedHead?.let(::assistantIdKey),
+        heads = initial,
+        labels = labels,
+        count = count,
+        nextOffset = offset.coerceAtMost(count),
+    )
+}
+
+internal fun assistantMergePagedBranches(
+    current: AssistantPagedBranchesState,
+    rawPage: String?,
+    settled: AssistantState,
+    errorCode: String? = null,
+): AssistantPagedBranchesState {
+    val settledView = runCatching { JSONObject(settled.viewJson) }.getOrNull()
+    val settledRev = settledView?.optString("revision")
+    val settledConv = settled.conversation?.let(::assistantIdKey)
+    val settledHead = settled.selectedHead?.let(::assistantIdKey)
+    if (errorCode == "revision_conflict" || settledRev != current.revision || settledConv != current.conversationKey || settledHead != current.selectedHeadKey) {
+        return current.copy(loading = false, error = "Continuations changed. Recheck and try again.")
+    }
+    return try {
+        require(rawPage != null)
+        val page = JSONObject(rawPage)
+        require(page.getString("revision") == current.revision)
+        require(assistantIdKey(page.getJSONObject("conversation").toString()) == current.conversationKey)
+        val headsJson = page.getJSONArray("heads")
+        val incoming = (0 until headsJson.length()).map { headsJson.getJSONObject(it).toString() }
+        val existingKeys = current.heads.map(::assistantIdKey).toHashSet()
+        val mergedHeads = current.heads + incoming.filter { existingKeys.add(assistantIdKey(it)) }
+        val mergedLabels = current.labels.toMutableMap()
+        incoming.forEach { id -> mergedLabels[id] = assistantBranchLabel(page, id) }
+        val total = page.optInt("head_count", current.count).coerceAtLeast(mergedHeads.size)
+        val nextOffset = page.optInt("next_offset", (current.nextOffset + incoming.size).coerceAtMost(total)).coerceAtMost(total)
+        require(nextOffset > current.nextOffset || nextOffset >= total)
+        current.copy(heads = mergedHeads, labels = mergedLabels, count = total, nextOffset = nextOffset, loading = false, error = null)
+    } catch (_: Exception) {
+        current.copy(loading = false, error = (errorCode ?: settled.error)?.let(::assistantErrorText) ?: "Continuations unavailable. Retry.")
+    }
+}
+
 @Composable
 internal fun AssistantScreen(
     state: AssistantState, voice: AssistantVoiceState, history: AssistantHistoryState,
@@ -132,8 +252,46 @@ internal fun AssistantScreen(
 ) {
     var page by rememberSaveable { mutableStateOf(if (voice.missingSpeechServices && voice.entryMode != null) AssistantPage.MISSING_SPEECH else AssistantPage.CHAT) }
     val view = remember(state.viewJson) { JSONObject(state.viewJson) }
-    val chats = remember(view) { assistantChats(view) }
-    val branchLabels = remember(view, state.branchChoices) { state.branchChoices.associateWith { assistantBranchLabel(view, it) } }
+    val viewRevision = view.optString("revision", "0")
+    val selectedConversationKey = state.conversation?.let(::assistantIdKey)
+    val selectedHeadKey = state.selectedHead?.let(::assistantIdKey)
+    var pagedChats by remember(viewRevision, selectedConversationKey, state.viewJson) {
+        mutableStateOf(assistantInitialPagedChats(view, state.conversation))
+    }
+    var chatsRequestToken by remember(viewRevision, selectedConversationKey, state.viewJson) { mutableStateOf(0L) }
+    val loadMoreChats: () -> Unit = {
+        if (!pagedChats.loading && pagedChats.hasMore && !state.busy && !voice.active) {
+            val token = ++chatsRequestToken
+            val expectedRevision = pagedChats.revision
+            val offset = pagedChats.nextOffset
+            pagedChats = pagedChats.copy(loading = true, error = null)
+            actions.loadConversations(expectedRevision, offset) { raw, settled, errorCode ->
+                if (token == chatsRequestToken) {
+                    pagedChats = assistantMergePagedChats(pagedChats, raw, settled, errorCode)
+                }
+            }
+        }
+    }
+    var pagedBranches by remember(viewRevision, selectedConversationKey, selectedHeadKey, state.branchChoices, state.viewJson) {
+        mutableStateOf(assistantInitialPagedBranches(view, state))
+    }
+    var branchesRequestToken by remember(viewRevision, selectedConversationKey, selectedHeadKey, state.branchChoices, state.viewJson) { mutableStateOf(0L) }
+    val loadMoreBranches: () -> Unit = {
+        val conv = state.conversation
+        if (conv != null && !pagedBranches.loading && pagedBranches.hasMore && !state.busy && !voice.active) {
+            val token = ++branchesRequestToken
+            val expectedRevision = pagedBranches.revision
+            val offset = pagedBranches.nextOffset
+            pagedBranches = pagedBranches.copy(loading = true, error = null)
+            actions.loadBranches(expectedRevision, conv, state.selectedHead, offset) { raw, settled, errorCode ->
+                if (token == branchesRequestToken) {
+                    pagedBranches = assistantMergePagedBranches(pagedBranches, raw, settled, errorCode)
+                }
+            }
+        }
+    }
+    val chats = pagedChats.chats
+    val branchLabels = pagedBranches.labels
     val title = chats.firstOrNull { it.id.let(::assistantIdKey) == state.conversation?.let(::assistantIdKey) }?.title ?: "Assistant"
     val promptPresentation = remember { AssistantPromptPresentation() }
     val chatScreenIdentity = rememberSaveable(saver = AssistantChatScreenIdentity.Saver) { AssistantChatScreenIdentity() }
@@ -150,7 +308,9 @@ internal fun AssistantScreen(
             CompositionLocalProvider(LocalScreenIsActive provides (page == AssistantPage.CHAT && LocalScreenIsActive.current)) {
                 val repeatAfterReply = assistantRepeatsAfterReply(voice, preferences)
                 ChatScreen(state, voice, history, pendingPrompts, actions, repeatAfterReply, page == AssistantPage.CHAT,
-                    { page = AssistantPage.SETTINGS }, replyMetrics, branchLabels, onMissingSpeech = { page = AssistantPage.MISSING_SPEECH })
+                    { page = AssistantPage.SETTINGS }, replyMetrics, branchLabels,
+                    pagedBranches = pagedBranches, onLoadMoreBranches = loadMoreBranches,
+                    onMissingSpeech = { page = AssistantPage.MISSING_SPEECH })
             }
         }
         if (page != AssistantPage.CHAT) {
@@ -161,7 +321,7 @@ internal fun AssistantScreen(
                             Text(if (page.backPage() == AssistantPage.SETTINGS) "Settings" else title)
                         }
                         else when (page) {
-                            AssistantPage.CHATS -> ChatsScreen(chats, state, voice, actions) { page = AssistantPage.CHAT }
+                            AssistantPage.CHATS -> ChatsScreen(pagedChats, state, voice, actions, loadMoreChats) { page = AssistantPage.CHAT }
                              AssistantPage.SETTINGS -> SettingsScreen(state, voice, pairing, actions, preferences,
                                  { page = AssistantPage.CHAT }, { page = AssistantPage.CHATS },
                                  { page = AssistantPage.CHAT; actions.edit() }, speechSelectionError, speechSelectionPending) { field ->
@@ -196,6 +356,8 @@ private fun ChatScreen(
     actions: AssistantActions, conversationMode: Boolean, active: Boolean, settings: () -> Unit,
     replyMetrics: (String?) -> Long?,
     branchLabels: Map<String, String>,
+    pagedBranches: AssistantPagedBranchesState = AssistantPagedBranchesState(heads = state.branchChoices, labels = branchLabels),
+    onLoadMoreBranches: () -> Unit = {},
     onMissingSpeech: () -> Unit = {},
 ) {
     val list = rememberLazyListState()
@@ -348,9 +510,24 @@ private fun ChatScreen(
                     }
                 }
                 if (state.branchChoices.isNotEmpty()) {
+                    val displayedBranches = pagedBranches.heads.ifEmpty { state.branchChoices }
                     item(key = "branches") { Text("Choose a continuation", color = MaterialTheme.colorScheme.primary) }
-                    items(state.branchChoices, key = { "branch:${assistantIdKey(it)}" }) { id ->
-                        ActionButton(branchLabels.getValue(id), !state.busy && !voice.active) { actions.selectHead(id) }
+                    items(displayedBranches, key = { "branch:${assistantIdKey(it)}" }) { id ->
+                        ActionButton(pagedBranches.labels[id] ?: branchLabels[id] ?: "Continuation awaiting messages", !state.busy && !voice.active) { actions.selectHead(id) }
+                    }
+                    pagedBranches.error?.let { branchError ->
+                        item(key = "branches-error") {
+                            Text(branchError, color = MaterialTheme.colorScheme.error)
+                        }
+                    }
+                    if (pagedBranches.hasMore) {
+                        item(key = "branches-more") {
+                            ActionButton(
+                                if (pagedBranches.loading) "Loading continuations…" else "More continuations",
+                                !state.busy && !voice.active && !pagedBranches.loading,
+                                onLoadMoreBranches,
+                            )
+                        }
                     }
                 } else if (state.conversation != null && turns.isEmpty() && reply == null && visiblePrompts.isEmpty()) item(key = "empty") {
                     Text(if (history.error != null) "Conversation unavailable" else if (history.loading || !readyHistory) "Loading conversation…" else "No messages yet. Ask a question.")
@@ -472,7 +649,15 @@ private fun Modifier.settingsSwipe(active: Boolean, open: () -> Unit): Modifier 
 }
 
 @Composable
-private fun ChatsScreen(chats: List<AssistantChat>, state: AssistantState, voice: AssistantVoiceState, actions: AssistantActions, back: () -> Unit) {
+private fun ChatsScreen(
+    pagedChats: AssistantPagedChatsState,
+    state: AssistantState,
+    voice: AssistantVoiceState,
+    actions: AssistantActions,
+    onLoadMore: () -> Unit = {},
+    back: () -> Unit,
+) {
+    val chats = pagedChats.chats
     val enabled = !state.busy && !voice.active
     ScreenList("Chats", back) {
         item { ActionButton("New chat", enabled) { actions.new(); back() } }
@@ -482,6 +667,18 @@ private fun ChatsScreen(chats: List<AssistantChat>, state: AssistantState, voice
                 label = { Text(chat.title, maxLines = Int.MAX_VALUE, overflow = TextOverflow.Clip) }, secondaryLabel = {
                     Text(if (chat.id.let(::assistantIdKey) == state.conversation?.let(::assistantIdKey)) "Selected" else "Open conversation")
                 }, modifier = Modifier.fillMaxWidth())
+        }
+        pagedChats.error?.let { chatError ->
+            item { Text(chatError, color = MaterialTheme.colorScheme.error) }
+        }
+        if (pagedChats.hasMore) {
+            item {
+                ActionButton(
+                    if (pagedChats.loading) "Loading chats…" else "More chats",
+                    enabled && !pagedChats.loading,
+                    onLoadMore,
+                )
+            }
         }
     }
 }
@@ -497,18 +694,8 @@ private fun SettingsScreen(state: AssistantState, voice: AssistantVoiceState, pa
         item { ActionButton("Chats", state.foreground && enabled, chats) }
         item { ActionButton("Keyboard", state.foreground && !state.busy, edit) }
         item { SwitchButton(checked = state.webEnabled, onCheckedChange = actions.setWebEnabled,
-            label = { Text("Web access") }, secondaryLabel = { Text(if (state.webEnabled) "Future requests may search" else "Chat only · search effort disabled",
+            label = { Text("Web research") }, secondaryLabel = { Text(if (state.webEnabled) "Allows web tools when supported by the selected model" else "Web tools will not be dispatched",
                 maxLines = Int.MAX_VALUE, overflow = TextOverflow.Clip) }, modifier = Modifier.fillMaxWidth()) }
-        item(key = "search-mode") {
-            val next = assistantNextSearchMode(state.searchMode)
-            FilledTonalButton(onClick = { actions.selectSearchMode(next) }, enabled = assistantCanSelectSearchMode(state, voice),
-                label = { Text("Search: ${assistantSearchModeLabel(state)}") },
-                modifier = Modifier.fillMaxWidth().semantics {
-                    contentDescription = "Search mode: ${assistantSearchModeLabel(state)}. " + if (state.webEnabled)
-                        "Tap for ${assistantSearchModeLabel(state.copy(searchMode = next))}." else "Disabled while Web access is off."
-                })
-        }
-        if (!state.webEnabled) item { Text("Enable Web access to use Verify or Research. Quick chat remains available.") }
         item { Text("Model", style = wearTextStyle(MaterialTheme.typography.titleMedium)) }
         items(assistantSelectableModels(AssistantRuntime.optionalProviderReadiness(), state.model)) { model -> ActionButton(if (model == state.model) "✓ $model" else model, enabled) { actions.selectModel(model) } }
         item { SwitchButton(checked = preferences.readRepliesAloud, onCheckedChange = actions.tts, enabled = enabled,
@@ -745,26 +932,11 @@ internal fun assistantPrimaryControl(state: AssistantState, voice: AssistantVoic
 internal fun assistantShowsLatest(state: AssistantState, voice: AssistantVoiceState, readingOlder: Boolean): Boolean =
     readingOlder && !state.busy && !voice.active && !voice.launchConfirmationRequired
 
-internal fun assistantCanSelectSearchMode(state: AssistantState, voice: AssistantVoiceState): Boolean =
-    state.webEnabled && state.foreground && !state.busy && !voice.active && state.model in AssistantModels.aliases
-
 internal fun assistantProvisionalAnswer(state: AssistantState): String? = state.provisional.takeIf { state.busy && it.isNotBlank() }
 
 internal fun assistantVisibleVoiceErrors(voice: AssistantVoiceState): List<String> =
     listOfNotNull(voice.error, voice.dictation.error, voice.speech.error, voice.loop.error).distinct()
         .filterNot { it == "recognition_error_7" || it == "no_speech" }
-
-internal fun assistantSearchModeLabel(state: AssistantState): String = when (state.searchMode) {
-    "verify" -> "Verify"
-    "research" -> "Research"
-    else -> "Quick"
-}
-
-internal fun assistantNextSearchMode(mode: String): String = when (mode) {
-    "quick" -> "verify"
-    "verify" -> "research"
-    else -> "quick"
-}
 
 internal fun assistantToolActivity(state: AssistantState): String? = state.toolStatus.takeIf { state.busy }
 
@@ -1027,9 +1199,23 @@ internal fun assistantSelectableModels(readiness: Map<String, OptionalProviderRe
 
 internal fun assistantBranchLabel(view: String, id: String): String = assistantBranchLabel(JSONObject(view), id)
 private fun assistantBranchLabel(view: JSONObject, id: String): String {
-    val records = view.getJSONArray("records")
-    val operation = (0 until records.length()).map { records.getJSONObject(it).getJSONObject("operation") }
-        .firstOrNull { assistantIdKey(it.getJSONObject("id").toString()) == assistantIdKey(id) }
-    val prompt = operation?.optJSONObject("body")?.optString("prompt").orEmpty().replace('\n', ' ').trim()
-    return if (prompt.isBlank()) "Continuation awaiting messages" else "Continue: ${prompt.take(100)}"
+    val targetKey = assistantIdKey(id)
+    val previews = view.optJSONArray("branch_previews") ?: view.optJSONArray("head_previews")
+    if (previews != null) {
+        val preview = (0 until previews.length()).map { previews.getJSONObject(it) }
+            .firstOrNull { assistantIdKey(it.getJSONObject("id").toString()) == targetKey }
+            ?.optString("prompt_preview")
+            .orEmpty()
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        if (preview.isNotEmpty()) return "Continue: ${preview.take(100)}"
+    }
+    val records = view.optJSONArray("records")
+    if (records != null) {
+        val operation = (0 until records.length()).map { records.getJSONObject(it).getJSONObject("operation") }
+            .firstOrNull { assistantIdKey(it.getJSONObject("id").toString()) == targetKey }
+        val prompt = operation?.optJSONObject("body")?.optString("prompt").orEmpty().replace('\n', ' ').trim()
+        if (prompt.isNotBlank()) return "Continue: ${prompt.take(100)}"
+    }
+    return "Continuation awaiting messages"
 }

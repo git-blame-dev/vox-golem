@@ -22,4 +22,10 @@ class PhoneIdentityTest {
         assertFalse(forbidden.boundedMessage.contains("expired"))
         assertEquals("unavailable", forbidden.code)
     }
+    @Test fun unsupportedWebPermissionHasExplicitCapabilityGuidance() {
+        val failure = EnginePhoneBackend.providerFailure("unsupported_web_permission")
+        assertEquals("unavailable", failure.code)
+        assertEquals("Selected model cannot enforce disabled web tools. Choose another model or change Web permission explicitly.", failure.boundedMessage)
+        assertEquals("Prompt or request ID is invalid", EnginePhoneBackend.providerFailure("invalid_request").boundedMessage)
+    }
 }

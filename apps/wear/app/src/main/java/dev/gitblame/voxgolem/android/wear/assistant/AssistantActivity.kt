@@ -196,11 +196,21 @@ open class AssistantActivity : ComponentActivity() {
                     AssistantActions(::editDraft, ::sendManually, ::stopAll, ::newConversation,
                         ::selectConversation, ::selectHead, client::selectModel,
                         { requestVoice(false) }, { requestVoice(true) }, voice::endUtterance, ::setReadRepliesAloud, voice::speak,
-                         ::recheck, history::older, history::retry, ::setConversationMode, client::selectSearchMode,
+                         ::recheck, history::older, history::retry, ::setConversationMode,
                            ::setWebEnabled, ::setSpeechNetworkFallback, ::setSpeechLanguage, ::setSpeechTtsProvider,
                               ::setSpeechTtsVoice, ::resetSpeechSelection, prepareSpeechOptions = ::prepareSpeechOptions, openSpeechStore = ::openSpeechStore,
                               replyLayout = { (client as? AssistantEngine)?.markReplyLayout(it) },
-                              replyDrawSubmitted = { (client as? AssistantEngine)?.markReplyDrawSubmitted(it) }), pendingPrompts, speechSelectionError, speechSelectionPending,
+                              replyDrawSubmitted = { (client as? AssistantEngine)?.markReplyDrawSubmitted(it) },
+                              loadConversations = { expectedRevision, offset, settled ->
+                                  client.conversationPage(expectedRevision, offset) { page, projection, errorCode ->
+                                      handler.post { settled(page, projection, errorCode) }
+                                  }
+                              },
+                              loadBranches = { expectedRevision, conversation, selectedHead, offset, settled ->
+                                  client.headPage(expectedRevision, conversation, selectedHead, offset) { page, projection, errorCode ->
+                                      handler.post { settled(page, projection, errorCode) }
+                                  }
+                              }), pendingPrompts, speechSelectionError, speechSelectionPending,
                     replyMetrics = replyMetrics::get)
             }
         }

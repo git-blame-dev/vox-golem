@@ -1,4 +1,5 @@
 -keep class dev.gitblame.voxgolem.assistant.AssistantDomainNative { *; }
+-keep class dev.gitblame.voxgolem.assistant.AssistantStoreNative { *; }
 -keep class dev.gitblame.voxgolem.assistant.runtime.AssistantProviderNative { *; }
 -keep interface dev.gitblame.voxgolem.assistant.runtime.ProviderDeltaCallback { *; }
 -keepclassmembers class * implements dev.gitblame.voxgolem.assistant.runtime.ProviderDeltaCallback {

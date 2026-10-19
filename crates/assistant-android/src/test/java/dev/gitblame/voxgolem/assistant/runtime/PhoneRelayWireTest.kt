@@ -82,6 +82,9 @@ class PhoneRelayWireTest {
         for (model in AssistantModels.aliases.filter { it == "gemini-nano" || it.startsWith("agy-") }) {
             assertEquals("synthetic-local", JSONObject(PhoneRelayWire.prepareRequest("synthetic-wire", request(model).toString(), "synthetic-local")).getString("requestId"))
         }
+        val legacy = request().put("searchMode", "research").put("webEnabled", false)
+        val prepared = JSONObject(PhoneRelayWire.prepareRequest("synthetic-wire", legacy.toString(), "synthetic-local"))
+        assertFalse(prepared.has("searchMode")); assertFalse(prepared.getBoolean("webEnabled"))
         for (model in listOf("custom-sol-high", "local-fast", "agy-unknown")) {
             rejected { PhoneRelayWire.prepareRequest("synthetic-wire", request(model).toString(), "synthetic-local") }
         }
@@ -98,6 +101,10 @@ class PhoneRelayWireTest {
         assertFalse(safe.toString().contains("sensitive"))
         assertFalse(safe.has("extra"))
         assertEquals("timeout", JSONObject(PhoneRelayWire.safeOutcome("{\"status\":\"error\",\"code\":\"timeout\"}")).getString("code"))
+        for (code in listOf("unsupported_web_permission", "unsupported_search_mode")) {
+            val outcome = JSONObject(PhoneRelayWire.safeOutcome(JSONObject().put("status", "error").put("code", code).toString()))
+            assertEquals("unsupported_web_permission", outcome.getString("code"))
+        }
         rejected { PhoneRelayWire.safeOutcome("{\"status\":\"unknown\"}") }
         rejected { PhoneRelayWire.safeOutcome(JSONObject().put("status", "complete").put("text", "a".repeat(PhoneRelayWire.MAX_FRAME_BYTES)).toString()) }
     }

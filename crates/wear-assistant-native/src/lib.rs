@@ -4,15 +4,15 @@ mod domain;
 mod outcome;
 mod request;
 mod search;
+mod store_bridge;
 
 #[cfg(test)]
 mod domain_tests;
 
 pub use domain::{apply_json, MAX_GATEWAY_BYTES, MAX_NATIVE_SNAPSHOT_BYTES};
-pub use search::{route_code_for_query, should_run_web_search};
 
-use jni::objects::{JClass, JObject, JString, JValue};
-use jni::sys::{jboolean, jstring, JNI_FALSE, JNI_TRUE};
+use jni::objects::{JObject, JString, JValue};
+use jni::sys::jstring;
 use jni::JNIEnv;
 use outcome::Outcome;
 use std::borrow::Cow;
@@ -252,6 +252,8 @@ fn respond(
         Ok(registration) => registration,
         Err(error) => return Outcome::error(error),
     };
+    let started = std::time::Instant::now();
+    let mut config = provider_config(auth_path, &request);
     if let Err(error) = callback(CallbackEvent::Ready) {
         return Outcome::error(error);
     }
@@ -263,23 +265,21 @@ fn respond(
         if *registration.cancelled.borrow() {
             return Outcome::Cancelled;
         }
-        if request.model != CustomOpenAiModel::LocalFast && request.search_mode.is_some() {
-            let skip_quick_search = request.web_enabled
-                && request.search_mode == Some(voxgolem_core::search::Mode::Quick)
-                && search::route_prompt_2d(&request.prompt).normalized_input
-                    == voxgolem_core::router::CANONICAL_SUPPLIED_TEXT_INTENT;
-            if !skip_quick_search {
-                return search::respond(
-                    process,
-                    provider_config(auth_path, &request),
-                    &request,
-                    registration.cancelled.clone(),
-                    &mut callback,
-                )
-                .await;
-            }
+        config.total_timeout = config.total_timeout.saturating_sub(started.elapsed());
+        if config.total_timeout.is_zero() {
+            return Outcome::error(ErrorCode::Timeout);
         }
-        let client = match process.client(provider_config(auth_path, &request)) {
+        if request.model != CustomOpenAiModel::LocalFast {
+            return search::respond(
+                process,
+                config,
+                &request,
+                registration.cancelled.clone(),
+                &mut callback,
+            )
+            .await;
+        }
+        let client = match process.client(config) {
             Ok(client) => client,
             Err(error) => return Outcome::error(error),
         };
@@ -640,188 +640,6 @@ pub extern "system" fn Java_dev_gitblame_voxgolem_assistant_runtime_AssistantPro
     cancel_jni(env, receiver, request_id);
 }
 
-pub(crate) fn prepare_search<F>(input: &str, mut on_status: F) -> search::SearchPreparation
-where
-    F: FnMut(&str),
-{
-    let Ok(parsed) = search::SearchPrepareRequest::parse(input) else {
-        return search::SearchPreparation::default();
-    };
-    if !parsed.web_enabled {
-        return search::SearchPreparation::default();
-    }
-    if let Some(skipped) = parsed.skipped_preparation() {
-        return skipped;
-    }
-    let registration = parsed
-        .request_id
-        .as_deref()
-        .and_then(|id| cancellation::registry().register(id).ok());
-    let (_fallback_tx, fallback_rx) = watch::channel(false);
-    let rx = registration
-        .as_ref()
-        .map(|reg| reg.cancelled.clone())
-        .unwrap_or(fallback_rx);
-    let Ok(process) = search::process() else {
-        return search::SearchPreparation::default();
-    };
-    let (preparation, _status) =
-        process
-            .runtime
-            .block_on(search::prepare(process, &parsed, rx, &mut |event| {
-                if let CallbackEvent::Status(status) = event {
-                    on_status(status);
-                }
-                Ok(())
-            }));
-    preparation
-}
-
-fn prepare_search_jni(
-    mut env: JNIEnv<'_>,
-    _receiver: JObject<'_>,
-    request_json: JString<'_>,
-    callback: JObject<'_>,
-) -> jstring {
-    let preparation = catch_unwind(AssertUnwindSafe(|| {
-        let Ok(input) = read_string(&mut env, &request_json, request::MAX_REQUEST_BYTES) else {
-            return search::SearchPreparation::default();
-        };
-        prepare_search(&input, |status| {
-            if callback.is_null() {
-                return;
-            }
-            let delivered: jni::errors::Result<()> = env.with_local_frame(2, |env| {
-                let text = env.new_string(status)?;
-                env.call_method(
-                    &callback,
-                    "onStatus",
-                    "(Ljava/lang/String;)V",
-                    &[JValue::Object(text.as_ref())],
-                )?;
-                Ok(())
-            });
-            if delivered.is_err() {
-                clear_exception(&env);
-            }
-        })
-    }))
-    .unwrap_or_default();
-    clear_exception(&env);
-    env.new_string(preparation.json())
-        .map(JString::into_raw)
-        .unwrap_or(std::ptr::null_mut())
-}
-
-#[allow(unsafe_code)]
-#[no_mangle]
-pub extern "system" fn Java_dev_gitblame_voxgolem_assistant_runtime_AssistantProviderNative_nativePrepareSearch(
-    env: JNIEnv<'_>,
-    receiver: JObject<'_>,
-    request_json: JString<'_>,
-    callback: JObject<'_>,
-) -> jstring {
-    prepare_search_jni(env, receiver, request_json, callback)
-}
-
-#[allow(unsafe_code)]
-#[no_mangle]
-pub extern "system" fn Java_dev_gitblame_voxgolem_android_wear_assistant_WearAssistantNative_nativePrepareSearch(
-    env: JNIEnv<'_>,
-    receiver: JObject<'_>,
-    request_json: JString<'_>,
-    callback: JObject<'_>,
-) -> jstring {
-    prepare_search_jni(env, receiver, request_json, callback)
-}
-
-fn should_run_web_search_jni(
-    mut env: JNIEnv<'_>,
-    web_enabled: jboolean,
-    search_mode: JString<'_>,
-    query: JString<'_>,
-    prev_user_query: JString<'_>,
-) -> jboolean {
-    let should_run = catch_unwind(AssertUnwindSafe(|| {
-        if web_enabled == JNI_FALSE {
-            return false;
-        }
-        let search_mode = read_string(&mut env, &search_mode, 128).unwrap_or_default();
-        let Ok(query) = read_string(&mut env, &query, request::MAX_REQUEST_BYTES) else {
-            return false;
-        };
-        let prev_user_query = if prev_user_query.is_null() {
-            None
-        } else {
-            read_string(&mut env, &prev_user_query, request::MAX_REQUEST_BYTES)
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-        };
-        search::should_run_web_search(true, &search_mode, &query, prev_user_query.as_deref())
-    }))
-    .unwrap_or(false);
-    clear_exception(&env);
-    if should_run {
-        JNI_TRUE
-    } else {
-        JNI_FALSE
-    }
-}
-
-#[allow(unsafe_code)]
-#[no_mangle]
-pub extern "system" fn Java_dev_gitblame_voxgolem_assistant_runtime_AssistantProviderNative_nativeShouldRunWebSearch(
-    env: JNIEnv<'_>,
-    _class: JClass<'_>,
-    web_enabled: jboolean,
-    search_mode: JString<'_>,
-    query: JString<'_>,
-    prev_user_query: JString<'_>,
-) -> jboolean {
-    should_run_web_search_jni(env, web_enabled, search_mode, query, prev_user_query)
-}
-
-#[allow(unsafe_code)]
-#[no_mangle]
-pub extern "system" fn Java_dev_gitblame_voxgolem_android_wear_assistant_WearAssistantNative_nativeShouldRunWebSearch(
-    env: JNIEnv<'_>,
-    _class: JClass<'_>,
-    web_enabled: jboolean,
-    search_mode: JString<'_>,
-    query: JString<'_>,
-    prev_user_query: JString<'_>,
-) -> jboolean {
-    should_run_web_search_jni(env, web_enabled, search_mode, query, prev_user_query)
-}
-
-#[allow(unsafe_code)]
-#[no_mangle]
-pub extern "system" fn Java_dev_gitblame_voxgolem_assistant_runtime_AssistantProviderNative_nativeRoutePrompt2d(
-    mut env: JNIEnv<'_>,
-    _class: JClass<'_>,
-    query: JString<'_>,
-    prev_user_query: JString<'_>,
-) -> jstring {
-    let route = catch_unwind(AssertUnwindSafe(|| {
-        let Ok(query) = read_string(&mut env, &query, request::MAX_REQUEST_BYTES) else {
-            return "F";
-        };
-        let prev_user_query = if prev_user_query.is_null() {
-            None
-        } else {
-            read_string(&mut env, &prev_user_query, request::MAX_REQUEST_BYTES)
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-        };
-        search::route_code_for_query(&query, prev_user_query.as_deref())
-    }))
-    .unwrap_or("F");
-    clear_exception(&env);
-    env.new_string(route)
-        .map(JString::into_raw)
-        .unwrap_or(std::ptr::null_mut())
-}
-
 fn prewarm_model_config(model: &str, auth_path: &str) -> Option<CustomOpenAiConfig> {
     if !valid_auth_path(auth_path) {
         return None;
@@ -842,10 +660,9 @@ fn prewarm_model_config(model: &str, auth_path: &str) -> Option<CustomOpenAiConf
 }
 
 pub(crate) fn prewarm(model: &str, auth_path: &str, web_enabled: bool) {
-    let config = prewarm_model_config(model, auth_path);
-    if config.is_none() && !web_enabled {
+    let Some(config) = prewarm_model_config(model, auth_path) else {
         return;
-    }
+    };
     search::prewarm(config, web_enabled);
 }
 
@@ -1394,6 +1211,79 @@ mod tests {
     }
 
     #[test]
+    fn selected_model_keeps_tools_for_mixed_supplied_text_without_web_admission() {
+        for (model, mode) in [
+            "custom-sol-high",
+            "custom-sol-none",
+            "custom-luna-none",
+            "custom-luna-low",
+        ]
+        .into_iter()
+        .flat_map(|model| {
+            [None, Some("quick"), Some("verify"), Some("research")].map(|mode| (model, mode))
+        }) {
+            let fixture = AuthFixture::new();
+            fixture.replace("synthetic-selected-model-auth");
+            let mut value = serde_json::json!({
+                "requestId": "synthetic-mixed-model",
+                "conversationId": "synthetic-mixed-conversation:1",
+                "model": model,
+                "instructions": "Synthetic trusted policy",
+                "webEnabled": true,
+                "messages": [{"role":"user", "content":"Summarize this text: synthetic notes. Also check the latest official release online."}]
+            });
+            if let Some(mode) = mode {
+                value["searchMode"] = serde_json::json!(mode);
+            }
+            let request = request::parse(&value.to_string()).unwrap();
+            let (mut config, server) = search_server(
+                &fixture,
+                serde_json::json!({
+                    "type":"message", "role":"assistant", "status":"completed",
+                    "content":[{"type":"refusal", "refusal":"Synthetic selected refusal"}]
+                }),
+            );
+            config.model = request.model;
+            let process = search::ProcessProvider::new(config.clone()).unwrap();
+            let (_cancel, rx) = watch::channel(false);
+            let mut events = Vec::new();
+            let outcome = process.runtime.block_on(async {
+                let _held = process.hold_web_for_test().await;
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    search::respond(&process, config, &request, rx, &mut |event| {
+                        events.push(match event {
+                            CallbackEvent::RequestDispatched => "dispatch",
+                            CallbackEvent::FirstText(_) => "first",
+                            CallbackEvent::Delta(_) => "delta",
+                            _ => "other",
+                        });
+                        Ok(())
+                    }),
+                )
+                .await
+                .expect("model response must not acquire the web service")
+            });
+            let result: serde_json::Value = serde_json::from_str(&outcome.json()).unwrap();
+            assert_eq!(result["status"], "complete", "legacy mode={mode:?}");
+            assert!(result.get("route").is_none());
+            assert_eq!(events, ["dispatch", "first", "delta"]);
+            let sent = server.join().unwrap();
+            assert_eq!(sent["tools"].as_array().unwrap().len(), 2);
+            assert_eq!(sent["model"], request.model.model_id());
+            assert_eq!(
+                sent["reasoning"]["effort"],
+                request.model.reasoning_effort()
+            );
+            assert!(sent["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("Synthetic trusted policy"));
+            assert!(!sent["instructions"].as_str().unwrap().contains("Mode:"));
+        }
+    }
+
+    #[test]
     fn web_off_native_route_keeps_chat_without_tools_or_shared_service_wait() {
         for mode in ["quick", "verify", "research"] {
             let fixture = AuthFixture::new();
@@ -1430,18 +1320,13 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .ends_with("Synthetic ordinary answer"));
-            if mode != "quick" {
-                assert!(value["text"]
-                    .as_str()
-                    .unwrap()
-                    .starts_with("Web lookup disabled:"));
-            }
+            assert_eq!(value["text"], "Synthetic ordinary answer");
             let sent = server.join().unwrap();
             assert!(sent["tools"].as_array().unwrap().is_empty());
             assert!(sent["instructions"]
                 .as_str()
                 .unwrap()
-                .contains("Web lookup is disabled by native permission"));
+                .contains("Web research is disabled by native permission"));
             assert!(sent["instructions"]
                 .as_str()
                 .unwrap()
@@ -1519,21 +1404,97 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_local_search_never_admits_callbacks_or_consumes_the_draft() {
-        for mode in ["verify", "research"] {
-            let input = serde_json::json!({"requestId":"synthetic-local-unsupported","model":"local-fast","searchMode":mode,"conversationId":"synthetic-conversation:1","instructions":"Synthetic policy","messages":[{"role":"user","content":"Synthetic preserved draft"}]}).to_string();
-            let before = input.clone();
-            let outcome = respond(
-                "synthetic-local-unsupported",
-                "/synthetic/missing/cloud-auth.json",
-                &input,
-                |_| panic!("unsupported route must reject before callback/dispatch"),
-            );
-            assert_eq!(
-                outcome.json(),
-                r#"{"status":"error","code":"invalid_request"}"#
-            );
-            assert_eq!(input, before);
+    fn web_off_rejects_unsolicited_model_tool_calls_without_admitting_web_work() {
+        let fixture = AuthFixture::new();
+        fixture.replace("synthetic-no-web-auth");
+        let request = request::parse(r#"{"requestId":"synthetic-no-web-tool","webEnabled":false,"searchMode":"research","instructions":"Synthetic policy","messages":[{"role":"user","content":"Synthetic question"}]}"#).unwrap();
+        let (config, server) = search_server(
+            &fixture,
+            serde_json::json!({
+                "type":"function_call", "id":"synthetic-item", "call_id":"synthetic-call",
+                "name":"web_search", "arguments":"{\"objective\":\"Synthetic lookup\",\"queries\":[\"Synthetic\"]}",
+                "status":"completed"
+            }),
+        );
+        let process = search::ProcessProvider::new(config.clone()).unwrap();
+        let (_cancel, rx) = watch::channel(false);
+        let mut events = Vec::new();
+        let outcome = process.runtime.block_on(async {
+            let _held = process.hold_web_for_test().await;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                search::respond(&process, config, &request, rx, &mut |event| {
+                    events.push(match event {
+                        CallbackEvent::RequestDispatched => "dispatch",
+                        _ => "unexpected web work or text",
+                    });
+                    Ok(())
+                }),
+            )
+            .await
+            .expect("denied tools must not acquire the web service")
+        });
+        let result: serde_json::Value = serde_json::from_str(&outcome.json()).unwrap();
+        assert_eq!(result["status"], "error");
+        assert_eq!(result["code"], "invalid_response");
+        assert_eq!(events, ["dispatch"]);
+        let sent = server.join().unwrap();
+        assert_eq!(sent["tools"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn local_legacy_modes_preserve_plain_prompt_history_and_no_tool_capability() {
+        for mode in [None, Some("quick"), Some("verify"), Some("research")] {
+            for web_enabled in [false, true] {
+                let fixture = AuthFixture::new();
+                let mut value = serde_json::json!({
+                    "requestId":"synthetic-local-legacy", "model":"local-fast",
+                    "webEnabled":web_enabled, "instructions":"Synthetic policy",
+                    "messages":[
+                        {"role":"user", "content":"Synthetic earlier question"},
+                        {"role":"assistant", "content":"Synthetic earlier answer"},
+                        {"role":"user", "content":"  Synthetic current request\n"}
+                    ]
+                });
+                if let Some(mode) = mode {
+                    value["searchMode"] = serde_json::json!(mode);
+                }
+                let request = request::parse(&value.to_string()).unwrap();
+                let (mut config, server) = search_server(
+                    &fixture,
+                    serde_json::json!({
+                        "type":"message", "content":[{"type":"output_text", "text":"Synthetic local answer"}]
+                    }),
+                );
+                config.model = request.model;
+                let process = search::ProcessProvider::new(config.clone()).unwrap();
+                let client = process.client(config).unwrap();
+                let (_cancel, rx) = watch::channel(false);
+                let outcome =
+                    process
+                        .runtime
+                        .block_on(direct_response(&client, &request, rx, &mut |_| Ok(())));
+                let result: serde_json::Value = serde_json::from_str(&outcome.json()).unwrap();
+                assert_eq!(result["status"], "complete");
+                assert_eq!(result["text"], "Synthetic local answer");
+                assert!(result.get("authRevision").is_none());
+                let sent = server.join().unwrap();
+                assert_eq!(sent["model"], "local-fast");
+                assert!(sent.get("tools").is_none());
+                assert!(sent["instructions"]
+                    .as_str()
+                    .unwrap()
+                    .contains("No tools are available"));
+                assert_eq!(sent["input"].as_array().unwrap().len(), 3);
+                assert_eq!(
+                    sent["input"][0]["content"][0]["text"],
+                    "Synthetic earlier question"
+                );
+                assert_eq!(
+                    sent["input"][2]["content"][0]["text"],
+                    "  Synthetic current request\n"
+                );
+            }
         }
     }
 
@@ -2143,27 +2104,6 @@ mod tests {
     }
 
     #[test]
-    fn prepare_search_returns_empty_json_contract_when_disabled_or_invalid() {
-        let mut statuses = Vec::new();
-        let disabled = prepare_search(
-            r#"{"requestId":"synthetic-search-off","prompt":"What is the weather?","webEnabled":false}"#,
-            |status| statuses.push(status.to_string()),
-        );
-        assert!(statuses.is_empty());
-        assert_eq!(
-            disabled.json(),
-            r#"{"evidenceContext":null,"sourceFooter":"","sources":[]}"#
-        );
-
-        let invalid = prepare_search("{invalid", |status| statuses.push(status.to_string()));
-        assert!(statuses.is_empty());
-        assert_eq!(
-            invalid.json(),
-            r#"{"evidenceContext":null,"sourceFooter":"","sources":[]}"#
-        );
-    }
-
-    #[test]
     fn prewarm_model_config_accepts_only_custom_models_and_valid_auth_paths() {
         for (model, expected) in [
             ("custom-sol-high", CustomOpenAiModel::SolHigh),
@@ -2183,6 +2123,132 @@ mod tests {
         }
         for rejected_path in ["", "relative/auth.json", "/synthetic/../auth.json"] {
             assert!(prewarm_model_config("custom-luna-low", rejected_path).is_none());
+        }
+    }
+
+    #[test]
+    fn fetch_only_and_failed_fallback_web_operations_report_truthful_search_telemetry() {
+        use std::io::Write;
+        use voxgolem_core::search::{EvidenceKind, Failure, Provider};
+        use voxgolem_platform::web::{Operation, ProviderFailure, WebService, WebTransport};
+
+        struct ScriptedWeb {
+            fail_both: bool,
+        }
+        impl WebTransport for ScriptedWeb {
+            async fn call(
+                &mut self,
+                _: Provider,
+                _: &Operation,
+                _: &str,
+                _: tokio::time::Instant,
+                _: &voxgolem_platform::search_control::Cancellation,
+            ) -> Result<serde_json::Value, ProviderFailure> {
+                if self.fail_both {
+                    return Err(ProviderFailure {
+                        kind: Failure::Transport,
+                        retry_after: None,
+                    });
+                }
+                Ok(serde_json::json!({
+                    "structuredContent": {
+                        "results": [{
+                            "url": "https://example.com/doc",
+                            "title": "Synthetic Doc",
+                            "text": "Synthetic readable body"
+                        }]
+                    },
+                    "content": [{
+                        "type": "text",
+                        "text": "Title: Synthetic Doc\nURL: https://example.com/doc\nPublished: N/A\nAuthor: N/A\nHighlights:\nSynthetic readable body"
+                    }]
+                }))
+            }
+        }
+
+        for (fail_both, expected_status, expected_fallback, expected_callbacks) in [
+            (false, "ready", false, vec!["Reading", "Reading · 1 page"]),
+            (
+                true,
+                "unavailable",
+                true,
+                vec!["Reading", "Fallback", "Partial"],
+            ),
+        ] {
+            let fixture = AuthFixture::new();
+            fixture.replace("synthetic-fetch-telemetry-auth");
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let endpoint = format!("http://{}/synthetic", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let mut socket = accept_fixture(listener);
+                for round in 0..2 {
+                    let _ =
+                        read_fixture_request(&mut socket, request::MAX_REQUEST_BYTES + 16 * 1024);
+                    let body = if round == 0 {
+                        let call = serde_json::json!({
+                            "type": "function_call",
+                            "id": "synthetic-fetch-item",
+                            "call_id": "synthetic-fetch-call",
+                            "name": "web_fetch",
+                            "arguments": serde_json::json!({"urls": ["https://example.com/doc"], "focus": "Synthetic focus"}).to_string(),
+                            "status": "completed"
+                        });
+                        format!(
+                            "data: {}\n\n",
+                            serde_json::json!({"type":"response.completed","response":{"status":"completed","output":[call]}})
+                        )
+                    } else {
+                        concat!(
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Synthetic answer\"}\n\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"Synthetic answer\"}]}]}}\n\n"
+                        )
+                        .to_string()
+                    };
+                    socket
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .unwrap();
+                }
+            });
+            let config = CustomOpenAiConfig {
+                endpoint,
+                auth_path: fixture.path(),
+                total_timeout: std::time::Duration::from_secs(3),
+                ..Default::default()
+            };
+            let process = search::ProcessProvider::new(config.clone()).unwrap();
+            let request = request::parse(r#"{"requestId":"synthetic-fetch-telemetry","conversationId":"synthetic-conversation:1","instructions":"Synthetic policy","messages":[{"role":"user","content":"Read https://example.com/doc"}]}"#).unwrap();
+            let (_cancel, rx) = watch::channel(false);
+            let mut web = WebService::new(ScriptedWeb { fail_both });
+            let mut statuses = Vec::new();
+            let outcome = process.runtime.block_on(search::respond_with_web(
+                &process,
+                config,
+                &request,
+                &mut web,
+                rx,
+                &mut |event| {
+                    if let CallbackEvent::Status(status) = event {
+                        statuses.push(status.to_string());
+                    }
+                    Ok(())
+                },
+            ));
+            server.join().unwrap();
+            let value: serde_json::Value = serde_json::from_str(&outcome.json()).unwrap();
+            assert_eq!(value["status"], "complete");
+            assert_eq!(value["searchStatus"], expected_status);
+            assert_eq!(value["fallbackUsed"], expected_fallback);
+            assert_eq!(statuses, expected_callbacks);
+            let _ = (
+                EvidenceKind::PageRead,
+                voxgolem_core::search::Provider::Parallel,
+            );
         }
     }
 }

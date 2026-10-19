@@ -207,6 +207,155 @@ class PhoneFinishSessionTest {
         assertTrue(backend.cancelledRequests.isEmpty())
     }
 
+    @Test @Config(shadows = [PhoneCueTtsShadow::class]) fun lockedWindowAdmitsOnlyItsAlreadyEmittedFinalAndSettlesWithoutSpeechOrRestart() {
+        val tts = enableTts()
+        start(true)
+        val sdk = factory.sessions.single()
+        sdk.events.final("Synthetic question awaiting frontend freshness"); drain()
+        val requestId = submits().single().getString("requestId")
+        assertTrue(phone.status().getBoolean("inputForeground"))
+        assertTrue(phone.status().isNull("retainedSubmissionId"))
+        phone.foreground(false, retainGeneration = true); drain()
+        phone.foreground(false, retainGeneration = true); drain() // onStop follows the eligible onPause.
+        assertFalse(phone.status().getBoolean("inputForeground"))
+        assertEquals(requestId, phone.status().getString("retainedSubmissionId"))
+        assertEquals(requestId, events.last { it.getString("kind") == "voice_status" }.getString("retainedSubmissionId"))
+        assertEquals(SpeechInputOwner(backend.conversation, backend.head), phone.submissionOwner(requestId))
+        assertNull(phone.submissionOwner("voice-synthetic-stale"))
+        assertEquals(0L, phone.onRequestSubmitted("voice-synthetic-stale"))
+        val ticket = phone.onRequestSubmitted(requestId)
+        assertTrue(ticket > 0L)
+        phone.onRequestResult(requestId, answer(), ticket); drain()
+        assertTrue(phone.status().isNull("retainedSubmissionId"))
+        assertFalse(phone.admitsVoiceSubmission(requestId))
+        assertFalse(phone.ownsSession("synthetic-session"))
+        assertTrue(events.last { it.getString("kind") == "voice_status" }.isNull("retainedSubmissionId"))
+        assertTrue(tts.spoken.isEmpty()); assertNull(leases.current())
+        sdk.events.final("Synthetic late final"); drain()
+        phone.foreground(true); drain()
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
+        assertEquals(1, factory.sessions.size); assertEquals(1, submits().size)
+        assertTrue(tts.spoken.isEmpty())
+    }
+
+    @Test fun trueBackgroundPublishesRetirementBeforeDiscardingItsChannelAndRejectsDelayedSubmission() {
+        start(true)
+        factory.sessions.single().events.final("Synthetic final"); drain()
+        val requestId = submits().single().getString("requestId")
+        phone.foreground(false); drain()
+        val retired = events.last { it.getString("kind") == "voice_status" }
+        assertFalse(retired.getBoolean("inputForeground")); assertTrue(retired.isNull("retainedSubmissionId"))
+        assertFalse(phone.ownsSession("synthetic-session"))
+        assertNull(phone.submissionOwner(requestId)); assertEquals(0L, phone.onRequestSubmitted(requestId))
+    }
+
+    @Test fun retainedWaitingConsentIsRetiredByStopTrueBackgroundOrChangedContext() {
+        for (retirement in listOf("stop", "background", "context")) {
+            phone.foreground(true); drain()
+            start(true)
+            factory.sessions.last().events.final("Synthetic final before $retirement"); drain()
+            val requestId = submits().last().getString("requestId")
+            phone.foreground(false, retainGeneration = true); drain()
+            assertNotNull(phone.submissionOwner(requestId))
+            val ticket = if (retirement == "context") 0L else phone.onRequestSubmitted(requestId)
+            when (retirement) {
+                "stop" -> phone.stop()
+                "background" -> phone.foreground(false)
+                else -> backend.publishHead("synthetic-context-change")
+            }
+            drain()
+            assertNull(phone.submissionOwner(requestId))
+            assertEquals(0L, phone.onRequestSubmitted(requestId))
+            assertTrue(phone.status().isNull("retainedSubmissionId"))
+            assertEquals(retirement != "context", backend.cancelledRequests.contains(requestId))
+            phone.onRequestResult(requestId, answer(), ticket); drain()
+            assertTrue(phone.status().isNull("retainedSubmissionId"))
+        }
+    }
+
+    @Test fun lockingBeforeRecognitionFinalCannotMintANewSubmissionOrResumeInput() {
+        start(true)
+        val sdk = factory.sessions.single()
+        phone.foreground(false, retainGeneration = true); drain()
+        assertFalse(phone.status().getBoolean("inputForeground"))
+        assertTrue(phone.status().isNull("retainedSubmissionId"))
+        sdk.events.final("Synthetic retired recognition final"); drain()
+        phone.foreground(true); drain()
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
+        assertTrue(submits().isEmpty()); assertEquals(1, factory.sessions.size); assertNull(leases.current())
+    }
+
+    @Test fun retainedFinalRejectsChangedContextBeforeBackendAdmissionAndCannotRegainConsent() {
+        start(true)
+        factory.sessions.single().events.final("Synthetic final awaiting admission"); drain()
+        val requestId = submits().single().getString("requestId")
+        phone.foreground(false, retainGeneration = true); drain()
+        backend.head = "synthetic-other-head"
+        assertNull(phone.submissionOwner(requestId)); assertEquals(0L, phone.onRequestSubmitted(requestId))
+        assertTrue(phone.status().isNull("retainedSubmissionId"))
+        backend.publishHead(backend.head); drain()
+        backend.publishHead(null); drain()
+        assertNull(phone.submissionOwner(requestId)); assertEquals(0L, phone.onRequestSubmitted(requestId))
+        assertTrue(backend.cancelledRequests.isEmpty())
+        assertFalse(phone.ownsSession("synthetic-session"))
+    }
+
+    private fun registeredReplySurvivesOwnHeadPublication(terminalAlreadyReceived: Boolean) {
+        val tts = enableTts()
+        start(true)
+        factory.sessions.single().events.final("Synthetic registered question"); drain()
+        val requestId = submits().single().getString("requestId")
+        val ticket = phone.onRequestSubmitted(requestId)
+        phone.foreground(false, retainGeneration = true); drain()
+        if (terminalAlreadyReceived) phone.onRequestResult(requestId, answer(), ticket)
+        backend.publishHead("synthetic-successful-core-commit-head")
+        if (!terminalAlreadyReceived) {
+            drain() // The publication can be consumed before the backend terminal arrives.
+            assertTrue(backend.cancelledRequests.isEmpty())
+            assertTrue(phone.ownsSession("synthetic-session"))
+        }
+        assertEquals(requestId, phone.status().getString("retainedSubmissionId"))
+        assertNull(phone.submissionOwner(requestId)) // Retained delivery is not fresh admission consent.
+        assertNull(phone.submissionOwner("voice-synthetic-foreign"))
+        assertEquals(0L, phone.onRequestSubmitted("voice-synthetic-foreign"))
+        if (!terminalAlreadyReceived) phone.onRequestResult(requestId, answer(), ticket)
+        drain()
+        assertTrue(phone.status().isNull("retainedSubmissionId"))
+        assertTrue(events.last { it.getString("kind") == "voice_status" }.isNull("retainedSubmissionId"))
+        assertFalse(phone.ownsSession("synthetic-session"))
+        assertTrue(backend.cancelledRequests.isEmpty()); assertTrue(tts.spoken.isEmpty()); assertNull(leases.current())
+        phone.foreground(true); drain()
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
+        assertEquals(1, factory.sessions.size); assertTrue(tts.spoken.isEmpty())
+    }
+
+    @Test @Config(shadows = [PhoneCueTtsShadow::class]) fun registeredReplySurvivesOwnHeadPublicationBeforeTerminalArrives() =
+        registeredReplySurvivesOwnHeadPublication(terminalAlreadyReceived = false)
+
+    @Test @Config(shadows = [PhoneCueTtsShadow::class]) fun registeredReplySurvivesOwnHeadPublicationWhileTerminalDeliveryIsQueued() =
+        registeredReplySurvivesOwnHeadPublication(terminalAlreadyReceived = true)
+
+    @Test fun wrongReplyTicketCannotConsumeRetainedOwnershipAndFailureSettlesTheBoundChannel() {
+        start(true)
+        factory.sessions.single().events.final("Synthetic retained question"); drain()
+        val requestId = submits().single().getString("requestId")
+        phone.foreground(false, retainGeneration = true); drain()
+        val ticket = phone.onRequestSubmitted(requestId)
+        phone.onRequestResult(requestId, answer(), ticket + 1); drain()
+        assertEquals(requestId, phone.status().getString("retainedSubmissionId"))
+        phone.stop(); drain()
+        assertEquals(listOf(requestId), backend.cancelledRequests)
+
+        phone.foreground(true); drain(); start(true)
+        factory.sessions.last().events.final("Synthetic second retained question"); drain()
+        val next = submits().last().getString("requestId")
+        phone.foreground(false, retainGeneration = true); drain()
+        phone.onRequestResult(next, Result.failure(AssistantPhoneFailure("unavailable", "Synthetic failure")), phone.onRequestSubmitted(next)); drain()
+        assertTrue(phone.status().isNull("retainedSubmissionId"))
+        assertTrue(events.last { it.getString("kind") == "voice_status" }.isNull("retainedSubmissionId"))
+        assertFalse(phone.ownsSession("synthetic-session")); assertNull(leases.current())
+    }
+
     @Test fun recordedAskPublishesOnlyTheFinalArtifactReferenceAndKeepsDraftOwnership() {
         factory.archiveExpected = true
         val artifact = RecordedAudioResult("123e4567-e89b-42d3-a456-426614174000", "c".repeat(64), 4)

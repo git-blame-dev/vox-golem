@@ -23,7 +23,7 @@ class ReplicationControllerTest {
         val request = pair.queue.removeAt(0)
         assertFalse(pair.right.onData("wrong-node", request.path, request.bytes, request.assets))
         assertFalse(pair.right.onData("node-a", request.path, JSONObject(String(request.bytes))
-            .put("version", 2).toString().toByteArray(), request.assets))
+            .put("version", 1).toString().toByteArray(), request.assets))
         assertFalse(pair.right.onData("node-a", request.path, JSONObject(String(request.bytes))
             .put("target", a).toString().toByteArray(), request.assets))
         assertTrue(pair.rightStore.imports.isEmpty())
@@ -149,7 +149,7 @@ class ReplicationControllerTest {
 
     private fun record(replica: String, sequence: String, tombstone: Boolean = false): JSONObject = JSONObject()
         .put("body_key", (if (tombstone) "d" else sequence.takeLast(1)).repeat(64))
-        .put("operation", JSONObject().put("version", 1).put("id", id(replica, sequence))
+        .put("operation", JSONObject().put("version", 2).put("id", id(replica, sequence))
             .put("body", if (tombstone) JSONObject().put("kind", "conversation_deleted").put("conversation", id(replica, "1"))
                 else JSONObject().put("kind", "conversation_created").put("title", "Synthetic conversation")))
 
@@ -173,7 +173,7 @@ internal class FakeReplicationStore(override val replica: String) : ReplicationS
     var filterPublicationsByQuarantine = true
     var revision = 0
     fun add(record: JSONObject) { records[key(record.getJSONObject("operation").getJSONObject("id"))] = record; revision++ }
-    override fun snapshot() = JSONObject().put("version", 1).put("revision", revision.toString())
+    override fun snapshot() = JSONObject().put("version", 2).put("revision", revision.toString())
         .put("records", JSONArray(records.values.toList())).put("retired", JSONArray())
         .put("quarantine", JSONArray(quarantined.map { JSONObject().put("id", parseId(it)) }))
     override fun publications(peer: String, after: JSONObject?, limit: Int) = JSONArray(records.filter {
@@ -212,7 +212,7 @@ internal class FakeReplicationDomain(private val pageSize: Int) : ReplicationDom
             .sortedWith { a, b -> compareId(a.getJSONObject("id"), b.getJSONObject("id")) }
             .filter { cursor.isNull("after") || compareId(it.getJSONObject("id"), cursor.getJSONObject("after")) > 0 }
         val page = entries.take(pageSize)
-        return JSONObject().put("version", 1).put("revision", snapshot.getString("revision")).put("entries", JSONArray(page))
+        return JSONObject().put("version", 2).put("revision", snapshot.getString("revision")).put("entries", JSONArray(page))
             .put("next", if (entries.size > page.size) JSONObject().put("revision", snapshot.getString("revision")).put("after", page.last().getJSONObject("id")) else JSONObject.NULL)
     }
     override fun reconcile(snapshot: JSONObject, page: JSONObject): JSONObject {
@@ -227,7 +227,7 @@ internal class FakeReplicationDomain(private val pageSize: Int) : ReplicationDom
     }
     override fun receipts(snapshot: JSONObject, replica: String, ids: JSONArray): JSONArray {
         val records = snapshot.getJSONArray("records").objects().associateBy { FakeReplicationStore.key(it.getJSONObject("operation").getJSONObject("id")) }
-        return JSONArray(ids.objects().map { id -> JSONObject().put("version", 1).put("recipient_replica", replica).put("operation", id)
+        return JSONArray(ids.objects().map { id -> JSONObject().put("version", 2).put("recipient_replica", replica).put("operation", id)
             .put("body_key", records.getValue(FakeReplicationStore.key(id)).getString("body_key")) })
     }
     private fun entry(record: JSONObject): JSONObject {

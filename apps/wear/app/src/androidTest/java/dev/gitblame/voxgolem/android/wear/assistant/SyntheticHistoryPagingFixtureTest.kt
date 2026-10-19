@@ -71,7 +71,8 @@ class SyntheticHistoryPagingFixtureTest {
                 sameId(it.getJSONObject("id"), conversation)
             }
             assertEquals(title, fixture.getString("title"))
-            val heads = fixture.getJSONArray("heads").objects()
+            assertEquals(2, fixture.getInt("head_count"))
+            val heads = store.headPage(conversation).getJSONArray("heads").objects()
             assertEquals(2, heads.size)
             assertTrue("Both synthetic terminal branches must remain valid",
                 heads.any { sameId(it, mainHead) } && heads.any { sameId(it, sibling) })

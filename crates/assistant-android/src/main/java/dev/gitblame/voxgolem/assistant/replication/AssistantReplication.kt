@@ -45,7 +45,14 @@ object AssistantReplication {
     }
 
     fun onData(context: Context, item: DataItem) {
-        if (!acceptsData(item)) return
+        if (!acceptsData(item)) {
+            // Old queued history is inert after the alpha epoch reset; pairing/identity
+            // retain their independent v1 namespace and are not classified as history.
+            val old = item.uri.path?.removePrefix("/voxgolem/assistant/v1/")?.split('/')
+            if (item.uri.path?.startsWith("/voxgolem/assistant/v1/") == true &&
+                old?.size == 3 && old[2] in ReplicationWire.kinds) status = AssistantReplicationStatus.REJECTED
+            return
+        }
         val current = resolve(context) ?: return
         if (item.uri.path == ReplicationWire.IDENTITY_PATH) {
             // The event is a hint only. Re-query capability and exact host-scoped SDK identity.

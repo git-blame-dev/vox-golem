@@ -419,8 +419,10 @@ class SyntheticKeyboardDraftFixtureTest {
         await("The entire actual Settings list must be inspected within sixty-five seconds", 65_000) {
             val nodes = currentNodes().filter { it.isVisibleToUser }
             val texts = nodes.mapNotNull { it.text?.toString() }
-            assertTrue("Web access is policy, not provider credential or Access management",
-                texts.none { forbidden.containsMatchIn(it.replace("Web access", "")) })
+            assertTrue("Settings contains no provider credential or Access management controls",
+                texts.none { forbidden.containsMatchIn(it) })
+            assertTrue("Web research is the only search control; no manual search modes remain",
+                texts.none { it.startsWith("Search:") || it.startsWith("Search mode:") })
             labels += texts
             nodes.firstOrNull { it.isCheckable && it.text?.toString()?.contains("Speak replies") == true }?.let { speechChecked = it.isChecked }
             val scroll = nodes.lastOrNull { it.isScrollable }

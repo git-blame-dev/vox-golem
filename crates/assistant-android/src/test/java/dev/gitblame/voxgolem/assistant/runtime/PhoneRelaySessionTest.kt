@@ -509,30 +509,25 @@ class PhoneRelaySessionTest {
         }
     }
 
-    @Test fun realNanoProviderRelayPreservesSearchFooterAndSpeechContract() {
+    @Test fun realNanoProviderRelayPreservesLocalCapabilityAndRetirementContract() {
         Fixture().use { fixture ->
-            val footer = "\n\nSources:\nhttps://example.invalid/relay-source\n"
-            fixture.phoneProvider = GeminiNanoProvider(RuntimeEnvironment.getApplication(), searchNative = object : ProviderNativeCalls {
-                override fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback) = "{}"
-                override fun cancel(requestId: String) {}
-                override fun prepareSearch(requestJson: String, callback: ProviderDeltaCallback): String {
-                    callback.onStatus("Searching")
-                    return JSONObject().put("evidenceContext", "Synthetic evidence").put("sourceFooter", footer).toString()
-                }
-            }, engineFactory = {
+            fixture.phoneProvider = GeminiNanoProvider(RuntimeEnvironment.getApplication(), engineFactory = {
                 object : GeminiNanoEngine {
                     override suspend fun prepareInferenceEngine() {}
-                    override fun generateContentStream(prompt: String): Flow<String> = flow { emit("Relayed"); emit(" answer") }
+                    override fun generateContentStream(prompt: String): Flow<String> = flow {
+                        assertTrue(prompt.contains("no browser or web tools"))
+                        emit("Relayed"); emit(" answer")
+                    }
                     override fun close() {}
                 }
             })
             val callback = Callback()
-            val json = JSONObject(request()).put("webEnabled", true).put("searchMode", "verify").toString()
+            val json = JSONObject(request()).put("webEnabled", true).toString()
             val outcome = JSONObject(fixture.start(callback, json = json).get(5, TimeUnit.SECONDS))
-            assertEquals("Relayed answer$footer", outcome.getString("text"))
-            assertEquals("Relayed answer", outcome.getString("speechText"))
-            assertEquals(listOf("Relayed", " answer", footer), callback.deltas)
-            assertEquals(listOf("Searching"), callback.statuses)
+            assertEquals("Relayed answer", outcome.getString("text"))
+            assertFalse(outcome.has("speechText"))
+            assertEquals(listOf("Relayed", " answer"), callback.deltas)
+            assertTrue(callback.statuses.isEmpty())
             val retired = CountDownLatch(1)
             fixture.watch.whenRetired(requestId) { retired.countDown() }
             await(retired)

@@ -91,27 +91,52 @@ class EnginePhoneBackend internal constructor(
                     }
                 }
                 "set_preferences" -> updatePreferences(arguments.getJSONObject("preferences"), reply)
-                "set_search_mode" -> engine.selectSearchMode(arguments.getString("mode")) { state ->
-                    reply(runCatching { requireSettled(state); JSONObject().put("mode", state.searchMode) })
+                "list_assistant_conversations" -> {
+                    val expectedRevision = arguments.getString("expectedRevision")
+                    val offset = arguments.getInt("offset")
+                    require(offset in 0..16384)
+                    engine.conversationPage(expectedRevision, offset) { raw, state, errorCode ->
+                        reply(runCatching {
+                            if (raw == null) {
+                                if (errorCode == "revision_conflict") throw AssistantPhoneFailure("busy", "Conversation inventory changed; refresh and retry")
+                                errorCode?.let { throw providerFailure(it) }
+                                requireSettled(state)
+                                throw AssistantPhoneFailure("internal", "Conversation page is unavailable")
+                            }
+                            val page = JSONObject(raw)
+                            val records = page.getJSONArray("conversations")
+                            val projected = org.json.JSONArray()
+                            for (index in 0 until records.length()) {
+                                val item = records.getJSONObject(index)
+                                projected.put(JSONObject().put("id", PhoneSnapshotEncoder.wireId(item.getJSONObject("id"))).put("title", item.getString("title")))
+                            }
+                            JSONObject().put("revision", page.getString("revision")).put("conversations", projected).put("next_offset", page.getInt("next_offset"))
+                        })
+                    }
                 }
-                "list_assistant_conversations" -> engine.refresh { state -> reply(runCatching {
-                    val view = JSONObject(state.viewJson)
-                    if (view.getString("revision") != arguments.getString("expectedRevision")) throw AssistantPhoneFailure("busy", "Conversation inventory changed; refresh and retry")
+                "list_assistant_heads" -> {
+                    val expectedRevision = arguments.getString("expectedRevision")
+                    val conversation = PhoneIdentity.native(arguments.getString("conversationId"))
                     val offset = arguments.getInt("offset")
                     require(offset in 0..16384)
-                    val records = view.getJSONArray("conversations")
-                    val visible = (0 until records.length()).map { records.getJSONObject(it) }.filter { !it.getBoolean("deleted") && !it.isNull("title") }
-                    val page = org.json.JSONArray(visible.drop(offset).take(128).map { JSONObject().put("id", PhoneSnapshotEncoder.wireId(it.getJSONObject("id"))).put("title", it.getString("title")) })
-                    JSONObject().put("revision", view.getString("revision")).put("conversations", page).put("next_offset", (offset + page.length()).coerceAtMost(visible.size))
-                }) }
-                "list_assistant_heads" -> engine.refresh { state -> reply(runCatching {
-                    val view = JSONObject(state.viewJson)
-                    if (view.getString("revision") != arguments.getString("expectedRevision") || state.conversation?.let { PhoneSnapshotEncoder.wireId(JSONObject(it)) } != arguments.getString("conversationId")) throw AssistantPhoneFailure("busy", "Continuation inventory changed; refresh and retry")
-                    val offset = arguments.getInt("offset")
-                    require(offset in 0..16384)
-                    val page = state.branchChoices.drop(offset).take(128).map { PhoneSnapshotEncoder.wireId(JSONObject(it)) }
-                    JSONObject().put("revision", view.getString("revision")).put("heads", org.json.JSONArray(page)).put("next_offset", (offset + page.size).coerceAtMost(state.branchChoices.size))
-                }) }
+                    engine.headPage(expectedRevision, conversation, null, offset) { raw, state, errorCode ->
+                        reply(runCatching {
+                            if (raw == null) {
+                                if (errorCode == "revision_conflict") throw AssistantPhoneFailure("busy", "Continuation inventory changed; refresh and retry")
+                                errorCode?.let { throw providerFailure(it) }
+                                requireSettled(state)
+                                throw AssistantPhoneFailure("internal", "Continuation page is unavailable")
+                            }
+                            val page = JSONObject(raw)
+                            val records = page.getJSONArray("heads")
+                            val projected = org.json.JSONArray()
+                            for (index in 0 until records.length()) {
+                                projected.put(PhoneSnapshotEncoder.wireId(records.getJSONObject(index)))
+                            }
+                            JSONObject().put("revision", page.getString("revision")).put("heads", projected).put("next_offset", page.getInt("next_offset"))
+                        })
+                    }
+                }
                 "assistant_pairing_status" -> AssistantReplication.pairingState(context) { state -> reply(Result.success(pairingValue(state))) }
                 else -> reply(Result.failure(AssistantPhoneFailure("invalid_input", "Unknown Assistant command")))
             }
@@ -235,18 +260,14 @@ class EnginePhoneBackend internal constructor(
     }
 
     override fun submit(clientRequestId: String, prompt: String, update: (JSONObject) -> Unit, terminal: (Result<Any?>) -> Unit) {
-        submit(clientRequestId, prompt, update, terminal, null)
-    }
-
-    override fun submit(clientRequestId: String, prompt: String, update: (JSONObject) -> Unit, terminal: (Result<Any?>) -> Unit, searchMode: String?) {
-        submitForOwner(clientRequestId, prompt, update, terminal, searchMode, null)
+        submitForOwner(clientRequestId, prompt, update, terminal, null)
     }
     fun submitOwnedSpeech(clientRequestId: String, prompt: String, update: (JSONObject) -> Unit, terminal: (Result<Any?>) -> Unit,
-        searchMode: String?, owner: SpeechInputOwner) {
-        submitForOwner(clientRequestId, prompt, update, terminal, searchMode, owner)
+        owner: SpeechInputOwner) {
+        submitForOwner(clientRequestId, prompt, update, terminal, owner)
     }
     private fun submitForOwner(clientRequestId: String, prompt: String, update: (JSONObject) -> Unit, terminal: (Result<Any?>) -> Unit,
-        searchMode: String?, owner: SpeechInputOwner?) {
+        owner: SpeechInputOwner?) {
         val current = PhoneRequestDelivery(clientRequestId, update, { engine.rejectDelivery(clientRequestId) })
         val admitted = synchronized(admission) { !preferencesPending.get() && !initializingConversation && delivery.compareAndSet(null, current) }
         if (!admitted) {
@@ -290,9 +311,9 @@ class EnginePhoneBackend internal constructor(
                 }
             } catch (error: RuntimeException) { terminal(Result.failure(error)) }
         }
-        if (owner == null) engine.submit(clientRequestId, prompt, current.gate, listener, searchMode, terminalContext = true)
+        if (owner == null) engine.submit(clientRequestId, prompt, current.gate, listener, terminalContext = true)
         else engine.submitSpeech(clientRequestId, prompt, owner.conversation, listener,
-            expectedHead = owner.selectedHead, delivery = current.gate, searchMode = searchMode, terminalContext = true)
+            expectedHead = owner.selectedHead, delivery = current.gate, terminalContext = true)
     }
 
     override fun acknowledge(clientRequestId: String, providerRequestId: String, revision: String, accepted: Boolean): Boolean =
@@ -330,8 +351,8 @@ class EnginePhoneBackend internal constructor(
 
         fun providerFailure(code: String?): AssistantPhoneFailure = when (code) {
             "busy" -> AssistantPhoneFailure("busy", "A request is already active")
-            "invalid_request", "empty_prompt", "prompt_too_large" -> AssistantPhoneFailure("invalid_input", "Prompt, request ID or search mode is invalid")
-            "unsupported_search_mode" -> AssistantPhoneFailure("unavailable", "Selected model cannot enforce this search or web policy. Choose another model or change the policy explicitly.")
+            "invalid_request", "empty_prompt", "prompt_too_large" -> AssistantPhoneFailure("invalid_input", "Prompt or request ID is invalid")
+            "unsupported_web_permission" -> AssistantPhoneFailure("unavailable", "Selected model cannot enforce disabled web tools. Choose another model or change Web permission explicitly.")
             "retirement_failed" -> AssistantPhoneFailure("unavailable", "Engine retirement exceeded its deadline. The draft is retained; retry explicitly.")
             "duplicate_request" -> AssistantPhoneFailure("invalid_input", "This request identity has already been used")
             "auth_expired" -> AssistantPhoneFailure("unavailable", "Provider access has expired. Update the app-private provider file externally, then retry explicitly.")

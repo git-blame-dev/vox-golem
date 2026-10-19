@@ -118,6 +118,36 @@ class PhoneShortcutSessionTest {
         phone.foreground(false); drain(); phone.foreground(true); drain(); advance()
         assertEquals(1, factory.sessions.size); assertTrue(kind("submit").isEmpty())
     }
+    @Test fun lockedWindowRetainsOnlyTheAlreadySubmittedShortcutAndSettlesItsChannel() {
+        start(); val sdk = factory.sessions.single()
+        sdk.events.partial("Synthetic shortcut question"); drain()
+        phone.shortcutPrepared("synthetic-session")
+        phone.stopAndSendShortcut(); drain()
+        sdk.events.final("Synthetic shortcut final"); drain()
+        val requestId = kind("submit").single().getString("requestId")
+        phone.foreground(false, retainGeneration = true); drain()
+        assertEquals(requestId, phone.status().getString("retainedSubmissionId"))
+        assertNotNull(phone.submissionOwner(requestId))
+        val ticket = phone.onRequestSubmitted(requestId)
+        assertTrue(ticket > 0L)
+        phone.onRequestResult(requestId, Result.success(JSONObject().put("kind", "cancelled")), ticket); drain()
+        assertTrue(phone.status().isNull("retainedSubmissionId"))
+        assertTrue(kind("voice_status").last().isNull("retainedSubmissionId"))
+        assertFalse(phone.ownsSession("synthetic-session"))
+        phone.foreground(true); drain(); advance()
+        assertEquals(1, factory.sessions.size); assertEquals(1, kind("submit").size); assertEquals(0, backend.stops)
+    }
+    @Test fun lockingBeforeShortcutFinalRetiresItsSendAndSegmentRestartConsent() {
+        start(); val sdk = factory.sessions.single()
+        sdk.events.partial("Synthetic shortcut partial"); drain()
+        phone.shortcutPrepared("synthetic-session")
+        phone.stopAndSendShortcut(); drain()
+        phone.foreground(false, retainGeneration = true); drain()
+        sdk.events.final("Synthetic late shortcut final"); drain()
+        assertTrue(phone.status().isNull("retainedSubmissionId"))
+        phone.foreground(true); drain(); advance()
+        assertTrue(kind("submit").isEmpty()); assertEquals(1, factory.sessions.size); assertNull(leases.current())
+    }
     @Test fun busyProviderAndExistingCaptureLeaseAreNeverCancelledByShortcutAdmission() {
         backend.busy = true; val stops = backend.stops
         try { start(); fail("existing provider owns admission") } catch (failure: AssistantPhoneFailure) { assertEquals("busy", failure.code) }

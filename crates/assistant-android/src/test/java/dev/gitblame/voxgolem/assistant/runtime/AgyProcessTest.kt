@@ -58,9 +58,11 @@ class AgyProcessTest {
     }
     private class Callback : ProviderDeltaCallback {
         val text = StringBuilder()
+        val statuses = mutableListOf<String>()
         var ready = 0
         override fun onReady() { ready++ }
         override fun onDelta(text: String) { this.text.append(text) }
+        override fun onStatus(status: String) { statuses += status }
     }
     private fun request(previous: String = "Synthetic previous") = JSONObject().put("model", "agy-flash-high")
         .put("webEnabled", true).put("instructions", "Synthetic full application instructions: keep roles and quote history")
@@ -109,8 +111,8 @@ class AgyProcessTest {
         var launches = 0
         provider { launches++; Engine("") }.use { native ->
             val callback = Callback()
-            val result = JSONObject(native.respond("synthetic-web-off", "", request().put("webEnabled", false).toString(), callback))
-            assertEquals("unsupported_search_mode", result.getString("code"))
+            val result = JSONObject(native.respond("synthetic-web-off", "", request().put("webEnabled", false).put("searchMode", "research").toString(), callback))
+            assertEquals("unsupported_web_permission", result.getString("code"))
             assertEquals(0, launches); assertEquals(1, callback.ready)
         }
     }
@@ -296,59 +298,6 @@ class AgyProcessTest {
         }
     }
 
-    @Test fun agyUsesPreparedSearchRouteAndAppendsSourceFooterOnLiveQuery() {
-        val footer = "\n\nSources:\nhttps://example.com/weather\n"
-        var prepareSearchCalls = 0
-        val fakeSearchNative = object : ProviderNativeCalls {
-            override fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String = error("Not used")
-            override fun cancel(requestId: String) {}
-            override fun prepareSearch(requestJson: String, callback: ProviderDeltaCallback): String {
-                prepareSearchCalls++
-                callback.onStatus("Searching")
-                return JSONObject()
-                    .put("evidenceContext", "Tokyo weather is 18C and clear.")
-                    .put("sourceFooter", footer)
-                    .put("needsEscalation", false)
-                    .toString()
-            }
-        }
-        val engines = mutableListOf<Engine>()
-        val testContext = agyTestContext(folder.newFolder())
-        AgyProviderNative(
-            context = testContext,
-            executableSource = { File("/synthetic/agycli") },
-            processFactory = { _, _, _ -> Engine("$delta\n$success\n").also { engines += it } },
-            requestTimeoutMs = 5000,
-            searchNative = fakeSearchNative
-        ).use { native ->
-            val callback = Callback()
-            val req = JSONObject()
-                .put("model", "agy-flash-high")
-                .put("webEnabled", true)
-                .put("searchMode", "quick")
-                .put("prompt", "What is the weather in Tokyo today?")
-            val resStr = native.respond("req-search-test", "", req.toString(), callback)
-            val res = JSONObject(resStr)
-
-            assertEquals(1, prepareSearchCalls)
-            assertEquals("complete", res.getString("status"))
-            assertEquals("Synthetic answer$footer", res.getString("text"))
-            assertEquals("Synthetic answer", res.getString("speechText"))
-            assertEquals("Synthetic answer$footer", callback.text.toString())
-            assertTrue(res.has("retireMs"))
-            assertTrue(res.has("searchStatus"))
-            assertFalse(res.getBoolean("fallbackUsed"))
-
-            val wire = JSONObject(engines.single().input.toString("UTF-8"))
-            assertEquals("user", wire.getString("event"))
-            val content = wire.getJSONObject("message").getString("content")
-            val canonical = JSONObject(content.substringAfter('\n'))
-            assertTrue(canonical.has("webEvidence"))
-            assertEquals("Tokyo weather is 18C and clear.", canonical.getString("webEvidence"))
-            assertTrue(content.substringBefore('\n').contains("Use the provided webEvidence field directly to answer"))
-        }
-    }
-
     @Test fun agyPrivateEnvironmentPrepareWritesPureVoiceAssistantAgentAndEmptySkills() {
         val testContext = agyTestContext(folder.newFolder())
         assertTrue(AgyPrivateEnvironment.prepare(testContext))
@@ -386,86 +335,50 @@ class AgyProcessTest {
         assertEquals("{\"entries\":[]}", configPluginsFile.readText(Charsets.UTF_8))
     }
 
-    @Test fun cancellationDuringRoundZeroSearchPreservesPrewarmedProcessForNextRequest() {
-        val testContext = agyTestContext(folder.newFolder())
-        val warmEngine = Engine("$delta\n$success\n")
-        var launches = 0
-        var prepareSearchCalls = 0
-        lateinit var nativeRef: AgyProviderNative
-
-        val fakeSearchNative = object : ProviderNativeCalls {
-            override fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String = error("Not used")
-            override fun cancel(requestId: String) {}
-            override fun prepareSearch(requestJson: String, callback: ProviderDeltaCallback): String {
-                prepareSearchCalls++
-                if (prepareSearchCalls == 1) {
-                    nativeRef.cancel("req-cancel-in-search")
-                    return """{"evidenceContext":null,"sourceFooter":"","sources":[]}"""
-                }
-                return JSONObject()
-                    .put("evidenceContext", "Tokyo weather is 18C and clear.")
-                    .put("sourceFooter", "\n\nSources:\nhttps://example.com/weather\n")
-                    .put("needsEscalation", false)
-                    .toString()
-            }
-        }
-
+    @Test fun plainCurrentAndMixedPromptsHaveOneCliLookupOwnerAndPreserveCurrentPrompt() {
+        val engines = mutableListOf<Engine>()
+        val tool = """{"event":"step_update","step_update":{"step_type":"tool","state":"ACTIVE"}}"""
         AgyProviderNative(
-            context = testContext,
+            context = agyTestContext(folder.newFolder()),
             executableSource = { File("/synthetic/agycli") },
-            processFactory = { _, _, _ ->
-                launches++
-                if (launches == 1) warmEngine else Engine("$delta\n$success\n")
-            },
+            processFactory = { _, _, _ -> Engine("$tool\n$delta\n$success\n").also { engines += it } },
             requestTimeoutMs = 5000,
-            searchNative = fakeSearchNative
         ).use { native ->
-            nativeRef = native
-            native.prewarm("agy-flash-high", true)
-            val io = native.javaClass.getDeclaredField("io").apply { isAccessible = true }.get(native) as java.util.concurrent.ThreadPoolExecutor
-            io.submit { }.get(2, TimeUnit.SECONDS)
-            assertEquals(1, launches)
-            assertFalse(warmEngine.exited)
-
-            val req = JSONObject()
-                .put("model", "agy-flash-high")
-                .put("webEnabled", true)
-                .put("searchMode", "quick")
-                .put("prompt", "What is the weather in Tokyo today?")
-
-            // 1. Cancelled during prepareSearch -> warmEngine is NOT retired or written to
-            val res1 = JSONObject(native.respond("req-cancel-in-search", "", req.toString(), Callback()))
-            assertEquals("cancelled", res1.getString("status"))
-            assertEquals(1, prepareSearchCalls)
-            assertEquals(1, launches)
-            assertFalse("Prewarmed process must remain alive when cancelled during Round-0 search", warmEngine.exited)
-            assertEquals(0, warmEngine.input.size())
-
-            // 2. Subsequent request reuses the preserved warmEngine without launching a new process
-            val res2 = JSONObject(native.respond("req-reuse-warm", "", req.toString(), Callback()))
-            assertEquals("complete", res2.getString("status"))
-            assertTrue("Subsequent request must report warm=true", res2.getBoolean("warm"))
-            assertEquals(2, prepareSearchCalls)
-            assertEquals(1, launches)
-            assertTrue(warmEngine.input.size() > 0)
-            assertTrue(warmEngine.exited)
+            listOf(
+                "Hello, synthetic assistant.",
+                "What is the weather in Tokyo today?",
+                "Explain cloud formation and tell me the weather in Tokyo today.",
+            ).forEachIndexed { index, prompt ->
+                val callback = Callback()
+                val req = JSONObject().put("model", "agy-flash-high")
+                    .put("webEnabled", true).put("searchMode", "research").put("prompt", prompt)
+                val result = JSONObject(native.respond("req-quick-$index", "", req.toString(), callback))
+                assertEquals("complete", result.getString("status"))
+                assertFalse(result.has("route"))
+                assertEquals("Synthetic answer", result.getString("text"))
+                assertEquals("Synthetic answer", callback.text.toString())
+                assertEquals(listOf("Searching"), callback.statuses)
+                val engine = engines[index]
+                val wire = JSONObject(engine.input.toString("UTF-8"))
+                val content = wire.getJSONObject("message").getString("content")
+                assertFalse(content.contains("Conduct in-depth research"))
+                assertFalse(content.contains("Verify statements and facts"))
+                val canonical = JSONObject(content.substringAfter('\n'))
+                assertFalse(canonical.has("searchMode"))
+                assertFalse(canonical.has("webEvidence"))
+                val messages = canonical.getJSONArray("messages")
+                assertEquals(1, messages.length())
+                assertEquals("user", messages.getJSONObject(0).getString("role"))
+                assertEquals(prompt, messages.getJSONObject(0).getString("content"))
+                assertTrue(engine.exited)
+            }
+            assertEquals(3, engines.size)
         }
     }
 
-    @Test fun agyPrewarmTriggersSearchNativePrewarmAndColdRespondStartsProcessBeforeSearch() {
+    @Test fun agyColdRespondAndPrewarmOnlyStartTheCliProcess() {
         val testContext = agyTestContext(folder.newFolder())
         val events = mutableListOf<String>()
-        val fakeSearchNative = object : ProviderNativeCalls {
-            override fun prewarm(model: String, authPath: String, webEnabled: Boolean) {
-                if (webEnabled) events += "search_prewarm"
-            }
-            override fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String = error("Not used")
-            override fun cancel(requestId: String) {}
-            override fun prepareSearch(requestJson: String, callback: ProviderDeltaCallback): String {
-                events += "prepare_search"
-                return """{"evidenceContext":null,"sourceFooter":"","sources":[]}"""
-            }
-        }
         AgyProviderNative(
             context = testContext,
             executableSource = { File("/synthetic/agycli") },
@@ -474,22 +387,37 @@ class AgyProcessTest {
                 Engine("$delta\n$success\n")
             },
             requestTimeoutMs = 5000,
-            searchNative = fakeSearchNative,
         ).use { native ->
             val req = JSONObject()
                 .put("model", "agy-flash-high")
                 .put("webEnabled", true)
-                .put("searchMode", "quick")
                 .put("prompt", "What is the weather in Tokyo today?")
             val res = JSONObject(native.respond("req-cold-order", "", req.toString(), Callback()))
             assertEquals("complete", res.getString("status"))
-            assertEquals(listOf("process_launch", "prepare_search"), events)
+            assertEquals(listOf("process_launch"), events)
 
             events.clear()
             native.prewarm("agy-flash-high", true)
             val io = native.javaClass.getDeclaredField("io").apply { isAccessible = true }.get(native) as java.util.concurrent.ThreadPoolExecutor
             io.submit { }.get(2, TimeUnit.SECONDS)
-            assertEquals(listOf("search_prewarm", "process_launch"), events)
+            assertEquals(listOf("process_launch"), events)
+        }
+    }
+
+    @Test fun routerWebOffPrewarmDoesNotLaunchCliOrWarmCustomNative() {
+        val context = agyTestContext(folder.newFolder())
+        var launches = 0
+        val custom = object : ProviderNativeCalls {
+            override fun prewarm(model: String, authPath: String, webEnabled: Boolean) { fail("Optional provider must not warm Custom native") }
+            override fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String = error("Not used")
+            override fun cancel(requestId: String) {}
+        }
+        AgyProviderNative(context, { File("/synthetic/agycli") }, { _, _, _ -> launches++; Engine("") }).use { native ->
+            val router = AgyProviderRouter(context, defaultNative = custom, agyNative = native, phoneRelay = null)
+            router.prewarm("agy-flash-high", "", false)
+            val io = native.javaClass.getDeclaredField("io").apply { isAccessible = true }.get(native) as java.util.concurrent.ThreadPoolExecutor
+            io.submit { }.get(2, TimeUnit.SECONDS)
+            assertEquals(0, launches)
         }
     }
 }

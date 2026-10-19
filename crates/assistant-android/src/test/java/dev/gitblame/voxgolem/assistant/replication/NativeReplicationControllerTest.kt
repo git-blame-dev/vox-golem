@@ -46,7 +46,7 @@ class NativeReplicationControllerTest {
                 assertEquals(0, left.publications(harness.rightReplica).length())
                 assertEquals(0, right.publications(harness.leftReplica).length())
 
-                val tombstone = canonical(JSONObject().put("version", 1).put("id", right.allocateId()).put("body",
+                val tombstone = canonical(JSONObject().put("version", 2).put("id", right.allocateId()).put("body",
                     JSONObject().put("kind", "conversation_deleted").put("conversation", conversation)))
                 right.importRecords(JSONArray().put(tombstone))
                 harness.begin()
@@ -61,17 +61,19 @@ class NativeReplicationControllerTest {
         }
     }
 
-    @Test fun forgedCanonicalBodyAndFailedActualSqliteCommitNeverProduceAck() {
+    @Test fun forgedCanonicalBodyAndInjectedCommitFailureNeverProduceAck() {
         assumeTrue("Parent supplies the host JNI library", System.getProperty("assistant.native.library") != null)
         AssistantStore(isolated("synthetic-source"), gateway).use { left ->
             AssistantStore(isolated("synthetic-target"), gateway).use { right ->
                 left.createConversation("Synthetic transactional import")
                 val harness = NativeHarness(left, right, gateway)
                 var attemptedCommits = 0
-                right.beforeCommit = { attemptedCommits++; error("Synthetic durable commit fault") }
                 harness.begin()
                 harness.drain(forgeFirstRecord = true)
                 assertEquals(0, attemptedCommits)
+                assertEquals(0, right.snapshot().getJSONArray("records").length())
+                assertEquals(0, right.receiptsToPublish().length())
+                right.beforeCommit = { attemptedCommits++; error("Synthetic durable commit fault") }
                 harness.begin()
                 harness.drain()
                 assertTrue(attemptedCommits > 0)
@@ -98,16 +100,16 @@ class NativeReplicationControllerTest {
                 val conversation = id(late, "8")
                 val parent = id(late, "9")
                 for (range in listOf(1..128, 129..131)) {
-                    left.importRecords(JSONArray(range.map { sequence -> canonical(JSONObject().put("version", 1).put("id", id(middle, sequence.toString()))
+                    left.importRecords(JSONArray(range.map { sequence -> canonical(JSONObject().put("version", 2).put("id", id(middle, sequence.toString()))
                         .put("body", JSONObject().put("kind", "conversation_created").put("title", "Synthetic bounded ancestor page"))) }))
                 }
-                fun turn(operation: JSONObject, ancestor: JSONObject?, context: JSONArray) = canonical(JSONObject().put("version", 1).put("id", operation)
-                    .put("body", JSONObject().put("kind", "turn_completed").put("conversation", conversation)
+                fun turn(operation: JSONObject, ancestor: JSONObject?, context: JSONArray) = canonical(JSONObject().put("version", 2).put("id", operation)
+                    .put("body", JSONObject().put("kind", "turn_completed").put("sources", JSONArray()).put("conversation", conversation)
                         .put("parent", ancestor ?: JSONObject.NULL).put("request", operation).put("prompt", "Synthetic ancestor prompt")
                         .put("answer", JSONObject().put("kind", "text").put("text", "Synthetic ancestor answer"))
                         .put("terminal_stage", "instant").put("provenance", provenance().put("context", context))))
                 left.importRecords(JSONArray().put(turn(id(early, "1"), parent, JSONArray().put(parent))))
-                left.importRecords(JSONArray().put(turn(parent, null, JSONArray())).put(canonical(JSONObject().put("version", 1).put("id", conversation)
+                left.importRecords(JSONArray().put(turn(parent, null, JSONArray())).put(canonical(JSONObject().put("version", 2).put("id", conversation)
                     .put("body", JSONObject().put("kind", "conversation_created").put("title", "Synthetic late conversation")))))
                 val harness = NativeHarness(left, right, gateway)
                 harness.begin()
@@ -126,12 +128,12 @@ class NativeReplicationControllerTest {
                 val replica = "00000000-0000-4000-8000-000000000001"
                 val other = "00000000-0000-4000-8000-000000000002"
                 val conversation = id(replica, "1")
-                fun turn(sequence: String, parent: JSONObject?, context: JSONArray) = canonical(JSONObject().put("version", 1).put("id", id(replica, sequence))
-                    .put("body", JSONObject().put("kind", "turn_completed").put("conversation", conversation)
+                fun turn(sequence: String, parent: JSONObject?, context: JSONArray) = canonical(JSONObject().put("version", 2).put("id", id(replica, sequence))
+                    .put("body", JSONObject().put("kind", "turn_completed").put("sources", JSONArray()).put("conversation", conversation)
                         .put("parent", parent ?: JSONObject.NULL).put("request", id(replica, "1$sequence"))
                         .put("prompt", "Synthetic quarantine prompt").put("answer", JSONObject().put("kind", "text").put("text", "Synthetic quarantine answer"))
                         .put("terminal_stage", "instant").put("provenance", provenance().put("context", context))))
-                val create = canonical(JSONObject().put("version", 1).put("id", conversation).put("body",
+                val create = canonical(JSONObject().put("version", 2).put("id", conversation).put("body",
                     JSONObject().put("kind", "conversation_created").put("title", "Synthetic quarantine conversation")))
                 val poison = turn("4", id(replica, "3"), JSONArray().put(id(other, "88")).put(id(replica, "3")))
                 left.importRecords(JSONArray().put(create).put(turn("2", null, JSONArray())).put(poison))
@@ -159,7 +161,7 @@ class NativeReplicationControllerTest {
         AssistantStore(isolated("synthetic-lexical-source"), gateway).use { left ->
             AssistantStore(isolated("synthetic-lexical-target"), gateway).use { right ->
                 val operationReplica = "00000000-0000-4000-8000-000000000001"
-                left.importRecords(JSONArray(listOf("1", "10", "2").map { sequence -> canonical(JSONObject().put("version", 1)
+                left.importRecords(JSONArray(listOf("1", "10", "2").map { sequence -> canonical(JSONObject().put("version", 2)
                     .put("id", id(operationReplica, sequence)).put("body", JSONObject().put("kind", "conversation_created").put("title", "Synthetic lexical page"))) }))
                 val snapshot = left.snapshot()
                 val cursor = JSONObject().put("revision", snapshot.getString("revision")).put("after", id(operationReplica, "10"))
@@ -194,7 +196,7 @@ class NativeReplicationControllerTest {
         AssistantStore(isolated("synthetic-hint-source"), gateway).use { left ->
             AssistantStore(isolated("synthetic-hint-target"), gateway).use { right ->
                 val operationReplica = "00000000-0000-4000-8000-000000000001"
-                left.importRecords(JSONArray(listOf("2", "10").map { sequence -> canonical(JSONObject().put("version", 1)
+                left.importRecords(JSONArray(listOf("2", "10").map { sequence -> canonical(JSONObject().put("version", 2)
                     .put("id", id(operationReplica, sequence)).put("body", JSONObject().put("kind", "conversation_created").put("title", "Synthetic lexical hint"))) }))
                 val harness = NativeHarness(left, right, gateway)
                 harness.begin(); harness.drain(duplicate = true)

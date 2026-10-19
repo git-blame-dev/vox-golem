@@ -312,7 +312,6 @@ internal class AssistantUxFixtureMemory : ViewModel() {
         },
         retryHistory = {},
         setConversationMode = ::setConversationMode,
-        selectSearchMode = { state = state.copy(searchMode = it) },
         setWebEnabled = { state = state.copy(webEnabled = it) },
         setSpeechNetworkFallback = { state = state.copy(speechNetworkFallback = it) },
         selectSpeechLanguage = { state = state.copy(speechLanguage = it) },

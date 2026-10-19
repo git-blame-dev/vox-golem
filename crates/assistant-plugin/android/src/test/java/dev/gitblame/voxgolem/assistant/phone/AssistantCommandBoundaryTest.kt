@@ -21,5 +21,12 @@ class AssistantCommandBoundaryTest {
         assertFalse("import_access_credential" in commands)
         assertFalse("retry_credential_transfer" in commands)
         assertTrue(commands.none { it.contains("credential") })
+        assertFalse("set_search_mode" in commands)
+        assertFalse("select_search_mode" in commands)
+    }
+
+    @Test fun promptDtoContainsOnlyRequestIdentityPromptAndDeliveryChannel() {
+        val fields = SubmitArgs::class.java.declaredFields.filterNot { it.isSynthetic }.map { it.name }.toSet()
+        assertEquals(setOf("requestId", "prompt", "updates"), fields)
     }
 }

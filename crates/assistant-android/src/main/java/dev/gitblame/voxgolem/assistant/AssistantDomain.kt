@@ -38,6 +38,15 @@ internal data class AssistantProjection(
 }
 
 internal class AssistantDomain(private val gateway: DomainGateway) {
+    /** Evaluated against the owner's pinned DB revision; no snapshot crosses JNI. */
+    fun projectOwned(conversation: JSONObject?, head: JSONObject?, busy: Boolean,
+        read: AssistantProjectionRead? = null): AssistantProjection {
+        val value = evaluate("projection", fields = JSONObject().put("request", JSONObject()
+            .put("conversation", conversation ?: JSONObject.NULL).put("selected_head", head ?: JSONObject.NULL)
+            .put("local_work_in_flight", busy).put("read", read?.request() ?: JSONObject.NULL))) as JSONObject
+        return AssistantProjection(value.getJSONObject("view"), value.optJSONObject("continuation"), value.optJSONObject("read"))
+    }
+
     fun project(snapshot: String, conversation: JSONObject?, head: JSONObject?, busy: Boolean,
         read: AssistantProjectionRead? = null): AssistantProjection {
         val value = evaluate("projection", snapshot, JSONObject().put("request", JSONObject()
