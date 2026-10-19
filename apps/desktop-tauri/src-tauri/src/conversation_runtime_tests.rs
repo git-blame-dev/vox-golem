@@ -67,19 +67,10 @@ fn owner_admission_captures_permission_policy_and_mode_without_root_state() {
             "synthetic-admission",
             "Synthetic current",
             CompletionSource::Typed,
-            voxgolem_core::search::Mode::Verify,
         )
         .unwrap();
     network.lock().unwrap().web_enabled = false;
-    runtime
-        .search
-        .set_mode(voxgolem_core::search::Mode::Research)
-        .unwrap();
     assert!(request.request.web_enabled);
-    assert_eq!(
-        request.request.search_mode,
-        voxgolem_core::search::Mode::Verify
-    );
     assert_eq!(request.request.instant_model, InstantModel::CustomSolHigh);
     assert_eq!(request.request.prompt, "Synthetic current");
     drop(request);
@@ -216,4 +207,144 @@ fn mandatory_unpaired_desktop_projection_is_not_silently_discarded() {
         projected[0].content_type,
         voxgolem_platform::custom_openai::CustomOpenAiContentType::Refusal
     );
+}
+
+#[test]
+fn desktop_durable_store_persists_canonical_sources_and_hydrates_on_restart_and_clears_on_reset() {
+    let temp = tempfile::tempdir().unwrap();
+    let _scope = test_storage::ScopedRoot::new(temp.path().to_path_buf());
+
+    let first_runtime = owner();
+    assert!(first_runtime.durable_store.lock().unwrap().store.is_none());
+
+    let execution = first_runtime
+        .conversation_session
+        .lock()
+        .unwrap()
+        .admit("synthetic-search-turn", "Synthetic search question")
+        .unwrap()
+        .execution_id;
+    let (active_generation, _, _, _) = register_active_prompt(
+        &first_runtime.active_prompt,
+        &first_runtime.active_prompt_generation,
+        "synthetic-search-turn",
+        execution,
+        None,
+        0,
+    )
+    .unwrap();
+    let control = first_runtime
+        .active_prompt
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .clone();
+
+    let sources = vec![voxgolem_core::agent_pipeline::Source {
+        url: String::from("https://example.test/source-1"),
+        title: String::from("Synthetic Source 1"),
+    }];
+    assert!(first_runtime
+        .observe_sources(
+            "synthetic-search-turn",
+            active_generation,
+            execution,
+            &sources,
+        )
+        .unwrap());
+    assert!(matches!(
+        first_runtime
+            .accept_stage(
+                "synthetic-search-turn",
+                active_generation,
+                execution,
+                Stage::Instant,
+                StageResult::Instant(InstantOutcome::Complete(Content::Text(String::from(
+                    "Synthetic grounded answer."
+                )))),
+            )
+            .unwrap(),
+        UpdateResult::Resolved { .. }
+    ));
+    assert_eq!(
+        first_runtime
+            .commit(
+                "synthetic-search-turn",
+                active_generation,
+                execution,
+                &control,
+                || {},
+            )
+            .unwrap(),
+        CommitAssistantResult::Committed
+    );
+
+    let first_turns = first_runtime
+        .conversation_session
+        .lock()
+        .unwrap()
+        .turns()
+        .to_vec();
+    assert_eq!(first_turns.len(), 1);
+    assert_eq!(
+        first_turns[0].answer.content,
+        Content::Text(String::from("Synthetic grounded answer."))
+    );
+    assert_eq!(first_turns[0].sources, sources);
+
+    let restarted_runtime = owner();
+    assert!(restarted_runtime
+        .durable_store
+        .lock()
+        .unwrap()
+        .store
+        .is_none());
+    restarted_runtime.ensure_hydrated().unwrap();
+
+    let restored_session = restarted_runtime.conversation_session.lock().unwrap();
+    assert_eq!(restored_session.turns(), first_turns.as_slice());
+    let provider_history = restored_session.provider_history();
+    assert_eq!(provider_history.len(), 2);
+    assert_eq!(
+        provider_history[1].content,
+        Content::Text(String::from(
+            "Synthetic grounded answer.\n\nSources:\n- https://example.test/source-1"
+        ))
+    );
+    drop(restored_session);
+
+    assert!(restarted_runtime
+        .begin_reset(|| Err(String::from("voice reset failed")))
+        .is_err());
+    assert_eq!(
+        restarted_runtime
+            .conversation_session
+            .lock()
+            .unwrap()
+            .turns(),
+        first_turns.as_slice()
+    );
+    let after_failed_reset_runtime = owner();
+    after_failed_reset_runtime.ensure_hydrated().unwrap();
+    assert_eq!(
+        after_failed_reset_runtime
+            .conversation_session
+            .lock()
+            .unwrap()
+            .turns(),
+        first_turns.as_slice()
+    );
+
+    let (_, guard) = restarted_runtime.begin_reset(|| Ok(())).unwrap();
+    drop(guard);
+
+    let post_reset_runtime = owner();
+    post_reset_runtime.ensure_hydrated().unwrap();
+    assert!(post_reset_runtime
+        .conversation_session
+        .lock()
+        .unwrap()
+        .turns()
+        .is_empty());
 }

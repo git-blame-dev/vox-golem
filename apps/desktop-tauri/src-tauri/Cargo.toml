@@ -12,6 +12,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 base64 = "0.22"
 espeak-rs = { version = "0.1.9", default-features = false }
 futures-util = "0.3"
+hound = "3"
 ndarray = "0.17"
 ort = { version = "=2.0.0-rc.12", features = ["ndarray", "cuda"] }
 serde = { version = "1", features = ["derive"] }
@@ -24,6 +25,7 @@ thiserror = "2"
 toml = "0.8"
 transcribe-rs = { version = "=0.3.11", features = ["onnx"] }
 voxgolem-audio = { path = "../../../crates/audio" }
+voxgolem-conversation-store = { path = "../../../crates/conversation-store" }
 voxgolem-core = { path = "../../../crates/core" }
 voxgolem-model = { path = "../../../crates/model" }
 voxgolem-platform = { path = "../../../crates/platform", features = ["web-search"] }
@@ -33,9 +35,6 @@ tauri-plugin-single-instance = "=2.4.3"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
-
-[dev-dependencies]
-hound = "3"
 
 [lints]
 workspace = true

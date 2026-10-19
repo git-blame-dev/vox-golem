@@ -41,6 +41,10 @@ pub(super) fn state_directory() -> PathBuf {
     current().0.path.join("VoxGolem")
 }
 
+pub(super) fn has_explicit_scope() -> bool {
+    current().0._directory.is_none()
+}
+
 pub(super) struct ScopedRoot {
     previous: Option<Context>,
     // A scope must restore the same thread that installed it.

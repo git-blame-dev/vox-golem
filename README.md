@@ -88,14 +88,25 @@ independent of local-first speech processing.
 
 ### Web permission and response presentation
 
-Web access defaults on and is persisted per installation through Settings, separately
-from Quick/Verify/Research effort. Verify and Research are explicit lookup actions, not
-prompt-keyword heuristics. Disabling web access keeps ordinary chat available, advertises
+One global Web permission defaults on and is persisted per installation through Settings.
+The selected answer model automatically chooses permitted tools; there are no manual
+search modes, prompt-keyword heuristics or routing model. Disabling Web keeps ordinary chat available, advertises
 no web tools and prevents native lookup/provider-fallback calls; it does not make remote
 chat or provider-controlled speech offline. Native lookup sends question-derived queries,
 focus text and URLs to Exa, with Parallel as the disclosed fallback. OpenCode research is
 delegated to its configured runtime, whose external provider identity may be unknown.
 External correlation is process-scoped rather than the canonical local conversation ID.
+
+Custom-provider desktop, Android and Wear adapters use one shared tool runtime with the
+user-selected answer model unchanged, with one bounded automatic tool path: at most eight
+searches, eight submitted URL reads, ten model rounds, 90 seconds of cumulative tool-operation
+time and 96 KiB of cumulative retained evidence per run. These are ceilings, not required work.
+There is no forced initial search or separate planner. Process-owned web sessions are borrowed per operation, not locked across
+model waits. A readable page observation is structural evidence only, not certification
+that an answer's facts or citations are correct. Native evidence instructions distinguish
+search excerpts, readable pages, failures and gaps. Local/Nano backends without tool support
+do not gain invented tools. Agy uses its own CLI capabilities; these native loop budgets
+are not claimed to govern that external runtime.
 
 One portable app-owned policy requests plain text and the shortest complete answer,
 without a duplicate lead summary. Tool calls, required structured stage JSON, refusals,
@@ -177,16 +188,23 @@ make pc-installer # build and verify the Windows NSIS installer on Linux
 ### Search and model benchmarks
 
 ```bash
-make test-search-bench # deterministic fixtures and 132-case routing-normalizer parity; no live calls
+make test-search-bench # deterministic WebService components and parked legacy diagnostics; no live calls
 cargo run --locked -p vox-golem --example search_bench -- --mode live
 cargo run --locked -p vox-golem --example search_bench -- --mode live --with-llm --model luna-none --repetitions 3
 ```
 
-Live mode without `--with-llm` exercises search-service preparation only. Explicit model coverage uses the same managed-sign-in/configured-source selection as desktop; it never starts sign-in or silently imports another account's credentials. Imported WSL-only sources are explicitly skipped by this standalone native benchmark; desktop's existing Windows WSL adapter remains separate. Select `luna-none` or `sol-high`. One repetition is the default, with one to three repetitions supported: six direct/coding/Quick/Verify/Research/history scenarios per repetition, at most 18 logical requests, under the existing per-mode budgets and a 600-second matrix request budget. A logical request can contain multiple model rounds and search/page-read calls and consumes the selected provider's allowance.
+Live mode without `--with-llm` exercises explicit anonymous WebService Search components and session prewarm only, not automatic model tool selection. Explicit model coverage uses the same managed-sign-in/configured-source selection as desktop; it never starts sign-in or silently imports another account's credentials. Imported WSL-only sources are explicitly skipped by this standalone native benchmark; desktop's existing Windows WSL adapter remains separate. Select `luna-none` or `sol-high`. One repetition is the default, with one to three repetitions supported: six arithmetic/coding/lookup/page-read/mixed/history prompts per repetition, at most 18 logical requests, using the same bounded automatic tool loop with Web permission and a 600-second matrix request budget. A logical request can contain multiple model rounds and search/page-read calls and consumes the selected provider's allowance.
 
 Requested coverage that fails or is skipped produces a nonzero exit instead of an all-green report. First-visible-text timing excludes whitespace; an unobserved callback has no invented time. Partial evidence and fallback remain explicit. These are native backend callback/completion measurements, not painted pixels, audible output, semantic/citation-quality validation, or physical Android/Wear/Windows acceptance. Synthetic fixture latency is not live search or model latency.
 
-### Local embedding-router benchmark
+The deterministic suite exercises decoding, fallback, empty-page gaps, page metadata and
+prewarm-deadline behavior through synthetic WebService operations. Its frozen 132-case
+normalizer/classifier diagnostic is explicitly parked research, not production routing
+or semantic-quality acceptance. Anonymous live rows exercise explicit Search components,
+not the model-led application entry. Read counters count submitted URLs, not fetch operations.
+These are source CLI benchmark components, not phone delivery or runtime acceptance.
+
+### Parked local embedding-router benchmark
 
 The same example has an isolated encoder-only mode. It starts one owned CPU `llama-server` on an ephemeral IPv4 loopback port, retains the model/runtime across the suite, and sends embeddings directly to the existing BGE classifier head. It does not run MCP search, load Custom-provider configuration or credentials, contact an answer model, download artifacts, or fall back to lexical classification.
 
@@ -195,7 +213,7 @@ make encoder-bench ENCODER_SERVER=/absolute/path/to/llama-server ENCODER_MODEL=/
 make encoder-bench ENCODER_SERVER=/absolute/path/to/llama-server ENCODER_MODEL=/absolute/path/to/bge-small-en-v1.5-q8_0.gguf ENCODER_BENCH_FLAGS="--encoder-input literal --cases crates/core/tests/fixtures/router_cases_development_v2.json --repetitions 3"
 ```
 
-Default `--encoder-input legacy` applies the current production normalizer to the frozen 132-case fixture. `literal` preserves the current question verbatim and, when present, adds explicitly labelled prior user context. These are separately reported benchmark input versions, not production changes or equivalently validated pipelines. Use the compatible BGE-small model/tokenizer/native pooling and existing 384-dimensional head; a different encoder or input representation needs its own compatibility and quality evaluation. This command does not provision a mobile encoder.
+Default `--encoder-input legacy` applies the parked legacy normalizer to the frozen 132-case fixture. `literal` preserves the current question verbatim and, when present, adds explicitly labelled prior user context. These are separately reported research input versions, not production paths or equivalently validated pipelines. Use the compatible BGE-small model/tokenizer/native pooling and existing 384-dimensional head; a different encoder or input representation needs its own compatibility and quality evaluation. This command does not provision a mobile encoder. The optional early-lookup experiment is parked after failed qualification (88.33% / 89.17%); those fixture results establish neither population quality nor application runtime benefit.
 
 `router_cases_development_v2.json` adds 32 synthetic development cases covering weather, economic evidence, rules, comparisons, mixed requests, supplied text, conversation and verification. It is not an untouched holdout, a training set, or proof that an answer model supports the expected claims. The original 132 cases remain unchanged. Record the source revision, server/model hashes and input version alongside measured reports; successful inference alone does not validate the full tokenizer/pooling/head compatibility unit.
 
