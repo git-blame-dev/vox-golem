@@ -41,9 +41,10 @@ describe('AnswerStage', () => {
     expect(container.querySelector('details')?.textContent).toContain('Synthetic prior answer')
     const refusal = render({ compact: true, contentKind: 'refusal', answer: 'Synthetic refusal', stages: [{ stage: 'instant', status: 'failed' }] })
     expect(refusal.querySelector('h2')?.textContent).toBe('Assistant refusal')
-    expect(refusal.querySelector('[data-status="failed"]')).toBeTruthy()
-    const busy = render({ compact: true, answer: 'Synthetic stream', stages: [{ stage: 'instant', status: 'running' }] })
-    expect(busy.querySelector('[data-status="running"]')).toBeTruthy()
+    expect(refusal.querySelector('.answer-stage__statuses')).toBeNull()
+    const busy = render({ compact: true, answer: '', thinkingStatus: 'Searching', stages: [{ stage: 'instant', status: 'running' }] })
+    expect(busy.querySelector('.answer-stage__statuses')).toBeNull()
+    expect(busy.querySelector('.message__thinking')?.textContent).toBe('Searching')
   })
   it('exposes the authoritative answer and accessible status names', () => {
     const container = render({

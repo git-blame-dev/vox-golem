@@ -68,7 +68,7 @@ const TranscriptRow = memo(function TranscriptRow({ message, onAnswerDomCommitte
   }, [message.content, message.id, message.role, onAnswerDomCommitted])
   if (!message.answerStage || message.role !== 'assistant') return <ChatBubble message={message} />
   return <div className="conversation__answer" {...turnObservationAttributes(message)}>
-    <AnswerStage compact answer={message.content} className="message message--assistant" {...(message.contentKind === undefined ? {} : { contentKind: message.contentKind })} {...message.answerStage} />
+    <AnswerStage compact answer={message.content} {...(message.thinkingStatus === undefined ? {} : { thinkingStatus: message.thinkingStatus })} className="message message--assistant" {...(message.contentKind === undefined ? {} : { contentKind: message.contentKind })} {...message.answerStage} />
     {message.customDirectTimings ? <small className="conversation__timings">{duration(message.customDirectTimings.firstTextMs)}</small> : null}
   </div>
 })

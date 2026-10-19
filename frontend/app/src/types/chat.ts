@@ -18,6 +18,7 @@ export interface ChatMessage {
   readonly contentKind?: MessageContentKind
   readonly answerStage?: AnswerStageMetadata
   readonly customDirectTimings?: CustomDirectTimings
+  readonly thinkingStatus?: string
   readonly observation?: TurnObservation
 }
 

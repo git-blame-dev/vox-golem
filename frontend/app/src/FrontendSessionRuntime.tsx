@@ -1748,7 +1748,8 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
           : stage)
         setMessages((current) => current.map((message) => message.id === active.assistantId
           ? { ...message, answerStage: { stages: active.stages, priorVersions: active.priorVersions, sources: active.sources } } : message))
-        setPromptActivity({ text: `${event.stage[0]?.toUpperCase()}${event.stage.slice(1)} stage ${event.status}`, compact: event.status !== 'failed' })
+        const stagePrefix = event.stage === 'instant' ? 'Response' : `${event.stage[0]?.toUpperCase()}${event.stage.slice(1)} stage`
+        setPromptActivity({ text: `${stagePrefix} ${event.status}`, compact: event.status !== 'failed' })
       }
       if (event.kind === 'sources') {
         active.sources = mergeAnswerSources(active.sources, event.sources)
@@ -1769,7 +1770,8 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       }
       const waitingStatus = event.kind === 'status' ? event.message : event.kind === 'tool' ? event.detail : undefined
       if (waitingStatus !== undefined && /^(Searching|Reading|Fallback|Partial)\b/u.test(waitingStatus)) {
-        setMessages((current) => current.map((message) => message.id === active.assistantId && message.content.length === 0
+        active.thinkingStatus = waitingStatus
+        setMessages((current) => current.map((message) => message.id === active.assistantId && message.content.trim().length === 0
           ? { ...message, thinkingStatus: waitingStatus } : message))
       }
       if (event.kind === 'status') {
@@ -3276,7 +3278,7 @@ function usePresentation(session: FrontendSession, view: SessionViewProps['view'
 
 const SessionToolbar = memo(function SessionToolbar({ session, view }: SessionViewProps) {
   const {
-    updateRuntimeBlocked, runtimeStatus, shortcutStaging, androidAssistant, androidConversationId,
+    updateRuntimeBlocked, shortcutStaging, androidAssistant, androidConversationId,
     headPagePending, androidVoiceActive, voiceNotesOpen,
     snapshotControlsFresh,
     promptState, resetPending,
@@ -3313,7 +3315,6 @@ const SessionToolbar = memo(function SessionToolbar({ session, view }: SessionVi
           <img className="shell__logo" src={headerIcon} alt="VoxGolem" width={32} height={32} data-busy={headerBusy} />
           <div className="shell__runtime">
             {isBrowserPreviewRuntime() ? <span data-browser-preview>Browser preview</span> : null}
-            {!isAndroidRuntime && runtimeStatus !== 'sleeping' ? <span data-runtime-phase role="status">Runtime: {runtimeStatus}</span> : null}
           </div>
         </div>
         <div className="shell__header-actions" role={isAndroidRuntime ? 'group' : undefined} aria-label={isAndroidRuntime ? 'Android toolbar' : undefined} aria-describedby={isAndroidRuntime && shortcutStaging ? 'new-voice-draft-status' : undefined}>

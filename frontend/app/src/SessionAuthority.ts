@@ -34,6 +34,7 @@ export type PromptProjection = {
   renderFrameId: number | null
   renderFrameRevision: number
   customDirectTimings?: import('./types/chat').CustomDirectTimings
+  thinkingStatus?: string
   admittedAt?: number
 }
 
@@ -264,6 +265,7 @@ export class SessionAuthority {
       id: projection.assistantId, role: 'assistant', content: projection.text,
       observation: { requestId: projection.id, outcome: 'pending', stageStatus: 'running', contentKind: 'text' },
       ...(projection.customDirectTimings === undefined ? {} : { customDirectTimings: projection.customDirectTimings }),
+      ...(projection.thinkingStatus === undefined ? {} : { thinkingStatus: projection.thinkingStatus }),
       // The arrays are replaced at their own semantic transitions, never copied per token.
       answerStage: { stages: projection.stages, priorVersions: projection.priorVersions, sources: projection.sources },
     }

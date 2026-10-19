@@ -395,9 +395,11 @@ describe('production Android App runtime', () => {
       expect(status.getAttribute('aria-live')).toBe('polite')
       expect(status.classList.contains('sr-only')).toBe(true)
       expect(container.querySelector('.composer__status')).toBeNull()
+      expect(container.querySelector('.answer-stage__statuses')).toBeNull()
+      expect(container.querySelector('.message__thinking')?.textContent).toBe(message === 'Executing prompt…' ? 'Thinking…' : message)
     }
     for (const [event, expected] of [
-      [{ kind: 'stage', stage: 'instant', status: 'failed', detail: 'Synthetic stage failure' }, 'Instant stage failed'],
+      [{ kind: 'stage', stage: 'instant', status: 'failed', detail: 'Synthetic stage failure' }, 'Response failed'],
       [{ kind: 'correction', stage: 'instant', text: 'Synthetic corrected answer', correction: 'Correction: Synthetic actionable correction' }, 'Correction: Synthetic actionable correction'],
       ...(platform === 'desktop' ? [
         [{ kind: 'tool', tool: 'Synthetic tool', status: 'error', detail: 'Synthetic tool failure' }, 'Synthetic tool: error - Synthetic tool failure'],

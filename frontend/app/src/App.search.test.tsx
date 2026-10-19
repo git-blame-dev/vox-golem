@@ -251,6 +251,8 @@ describe('Web research permission and generation-owned presentation', () => {
       await act(async () => { requests[0]!.updates.send({ kind: 'status', message }) })
       expect(container.querySelector('.composer [role="status"].sr-only')?.textContent).toBe(message)
       expect(container.querySelector('.composer__status')).toBeNull()
+      expect(container.querySelector('.answer-stage__statuses')).toBeNull()
+      expect(container.querySelector('.message__thinking')?.textContent).toBe(message)
     }
     await act(async () => {
       requests[0]!.updates.send({ kind: 'text', text: 'Synthetic grounded answer' })

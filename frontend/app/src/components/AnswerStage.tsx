@@ -33,6 +33,7 @@ export interface AnswerStageProps {
   readonly sources?: readonly AnswerSource[]
   readonly className?: string
   readonly compact?: boolean
+  readonly thinkingStatus?: string
 }
 
 const stageLabels: Record<AnswerStageName, string> = {
@@ -56,17 +57,17 @@ function PlainText({ children }: { readonly children: string }): ReactNode {
   return children
 }
 
-export function AnswerStage({ answer, contentKind = 'text', stages, priorVersions = [], sources = [], className, compact = false }: AnswerStageProps) {
+export function AnswerStage({ answer, contentKind = 'text', stages, priorVersions = [], sources = [], className, compact = false, thinkingStatus }: AnswerStageProps) {
   const rootClassName = className === undefined ? 'answer-stage' : `answer-stage ${className}`
   const stageDetails = stages.filter(({ detail }) => typeof detail === 'string' && detail.trim() !== '')
   const hasDetails = sources.length > 0 || stageDetails.length > 0 || priorVersions.length > 0
-  const visibleStages = compact ? stages.filter(({ stage, status }) => stage !== 'instant' || status !== 'completed') : stages
+  const visibleStages = compact ? stages.filter(({ stage }) => stage !== 'instant') : stages
   const pending = stages.some(({ status }) => status === 'queued' || status === 'running')
 
   return (
     <section className={rootClassName} aria-label={contentKind === 'refusal' ? 'Assistant refusal' : compact ? 'Assistant answer' : 'Current answer'} data-content-kind={contentKind}>
       {!compact || contentKind === 'refusal' ? <h2>{contentKind === 'refusal' ? 'Assistant refusal' : 'Current answer'}</h2> : null}
-      <p className="answer-stage__answer">{answer.trim().length === 0 ? pending ? <span className="message__thinking">Thinking…</span> : 'No response was returned.' : <PlainText>{answer}</PlainText>}</p>
+      <p className="answer-stage__answer">{answer.trim().length === 0 ? pending ? <span className="message__thinking">{thinkingStatus ?? 'Thinking…'}</span> : 'No response was returned.' : <PlainText>{answer}</PlainText>}</p>
       {!compact || visibleStages.length > 0 ? <ul className="answer-stage__statuses" aria-label="Answer stage status">
          {visibleStages.map(({ stage, status }, index) => (
           <li key={`${stage}-${status}-${index}`} data-stage={stage} data-status={status}>
