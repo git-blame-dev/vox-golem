@@ -54,6 +54,15 @@ interface TestHistoryHarness {
 
 let historyHarness: TestHistoryHarness | null = null
 
+// Synthetic native boundary: the real CuePlayer/IPC selection remains exercised,
+// while output hardware and native completion are covered by Rust service fakes.
+const nativeCueFixture = {
+  nextTicket: 1000,
+  requests: [] as { playbackId: number; cueType: string }[],
+  onActivate: null as ((request: { playbackId: number; cueType: string }) => Promise<void> | void) | null,
+  onFinish: null as ((playbackId: number) => void) | null,
+}
+
 function installHistoryHarness(): void {
   const initialState = window.history.state
   const entries: unknown[] = [initialState]
@@ -122,6 +131,10 @@ function installHistoryHarness(): void {
 
 beforeEach(() => {
   installHistoryHarness()
+  nativeCueFixture.nextTicket = 1000
+  nativeCueFixture.requests = []
+  nativeCueFixture.onActivate = null
+  nativeCueFixture.onFinish = null
 })
 
 afterEach(() => {
@@ -355,7 +368,8 @@ describe('App', () => {
           send?.({ kind: 'text', text: 'Provisional answer' })
           send?.({ kind: 'custom_direct_timings', first_text_ms: firstText, completed_ms: completed })
           send?.({ kind: 'sources', sources: [{ url: 'https://example.com/evidence', title: 'Synthetic evidence' }] })
-          committed.push(canonicalTurn('301', '302', 'Synthetic question', 'Canonical answer', request.requestId))
+          committed.push({ ...canonicalTurn('301', '302', 'Synthetic question', 'Canonical answer', request.requestId),
+            sources: [{ url: 'https://example.com/evidence', title: 'Synthetic evidence' }] })
           return { request_id: request.requestId, runtime_phase: 'sleeping', outcome: 'completed', error_message: null }
         }
         return null
@@ -428,10 +442,14 @@ describe('App', () => {
     expect(container.querySelector('.message__thinking')).not.toBeNull()
     scrollToSpy.mockClear()
     await act(async () => { updates({ kind: 'text', text: 'Synthetic answer-only growth' }) })
+    expect(container.querySelector('.answer-stage__answer')?.textContent).toBe('Synthetic answer-only growth')
+    expect(scrollToSpy).toHaveBeenCalledOnce()
+    scrollToSpy.mockClear()
+    await act(async () => { updates({ kind: 'text', text: ' with a later delta' }) })
     expect(scrollToSpy).not.toHaveBeenCalled()
     expect(frame).toBeTypeOf('function')
     await act(async () => { frame!(16) })
-    expect(container.querySelector('.answer-stage__answer')?.textContent).toBe('Synthetic answer-only growth')
+    expect(container.querySelector('.answer-stage__answer')?.textContent).toBe('Synthetic answer-only growth with a later delta')
     expect(composer.value).toBe('')
     expect(scrollToSpy).toHaveBeenCalledOnce()
     expect(unexpected).toEqual([])
@@ -2486,6 +2504,7 @@ describe('App', () => {
       setTextAreaValue(getComposer(container), 'Unmount prompt')
       getSendButton(container).click()
       await Promise.resolve()
+      promptEventHandler?.({ payload: { request_id: requestId, kind: 'text', text: 'Visible first output' } })
       promptEventHandler?.({ payload: { request_id: requestId, kind: 'text', text: 'Queued output' } })
     })
     expect(requestFrame).toHaveBeenCalledTimes(1)
@@ -5187,8 +5206,10 @@ describe('App', () => {
       setTextAreaValue(getComposer(container), 'Synthetic cancellable question')
       getSendButton(container).click()
       await Promise.resolve()
+      send?.({ payload: { request_id: requestId, kind: 'text', text: 'Synthetic visible prefix' } })
       send?.({ payload: { request_id: requestId, kind: 'text', text: 'Synthetic queued answer' } })
     })
+    expect(getConversation(container).textContent).toContain('Synthetic visible prefix')
     expect(frames).toHaveLength(1)
     await act(async () => {
       getButtonByLabel(container, 'Stop').click()
@@ -5330,7 +5351,8 @@ describe('App', () => {
     expect(requestFrame).toHaveBeenCalledTimes(1)
     expect(container.querySelectorAll('.message--assistant')).toHaveLength(1)
     expect(getConversation(container).textContent).not.toContain('Frame one')
-    expect(container.querySelector('.message__thinking')).not.toBeNull()
+    expect(container.querySelector('.answer-stage__answer')?.textContent).toBe('Frame ')
+    expect(container.querySelector('.message__thinking')).toBeNull()
     await act(async () => { scheduledFrames[0]?.(16); await Promise.resolve() })
     expect(getConversation(container).textContent).toContain('Frame one')
     expect(container.querySelector('.message__thinking')).toBeNull()
@@ -5692,7 +5714,10 @@ describe('App', () => {
     }
     const { container } = await renderApp()
     await act(async () => { setTextAreaValue(getComposer(container), 'Synthetic cancelled presentation'); getSendButton(container).click() })
-    await act(async () => { channel({ kind: 'text', text: 'Synthetic obsolete queued text' }) })
+    await act(async () => {
+      channel({ kind: 'text', text: 'Synthetic visible prefix' })
+      channel({ kind: 'text', text: 'Synthetic obsolete queued text' })
+    })
     expect(frames).toHaveLength(1)
     await act(async () => { getButtonByLabel(container, 'Stop').click() })
     await act(async () => {
@@ -5832,7 +5857,7 @@ describe('App', () => {
     })
 
     expect(startupCalls).toBe(2)
-    expect(session.getControlsSnapshot()).toMatchObject({ runtimeStatus: 'sleeping', assistantSettingsPending: false, snapshotControlsFresh: true, searchModePending: false, assistantSettings: { instant: 'local-quality' } })
+    expect(session.getControlsSnapshot()).toMatchObject({ runtimeStatus: 'sleeping', assistantSettingsPending: false, snapshotControlsFresh: true, assistantSettings: { instant: 'local-quality' } })
     expect(container.textContent).not.toContain('Model loading:')
     expect(getComposer(container).disabled).toBe(false)
     await act(async () => { setTextAreaValue(getComposer(container), 'Synthetic ready question') })
@@ -6200,7 +6225,8 @@ describe('App', () => {
       await vi.advanceTimersByTimeAsync(0)
     })
 
-    expect(playedSources).toEqual([voice.start_listening, voice.stop_listening])
+    expect(playedSources).toEqual([])
+    expect(nativeCueFixture.requests.map(({ cueType }) => cueType)).toEqual(['start_listening', 'stop_listening'])
     expect(savedWakeClips).toHaveLength(1)
     expect(savedWakeClips[0]).toHaveLength(2)
     expect(savedWakeClips[0]?.[0]).toBeCloseTo(0.04)
@@ -6243,7 +6269,8 @@ describe('App', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(2_050) })
     expect(preparations).toBe(2)
     await act(async () => { await onFrame?.([0.04, -0.04]); await Promise.resolve() })
-    expect(played).toContain(voice.start_listening)
+    expect(played).toEqual([])
+    expect(nativeCueFixture.requests.map(({ cueType }) => cueType)).toEqual(['start_listening'])
     expect(startLiveAudioSourceMock).toHaveBeenCalledTimes(1)
   })
 
@@ -6304,7 +6331,7 @@ describe('App', () => {
     expect(container.textContent).not.toContain('Reset to idle')
   })
 
-  it('plays the configured start-listening cue path from startup state', async () => {
+  it('uses typed native cues instead of renderer paths from startup state', async () => {
     vi.useFakeTimers()
     const stop = vi.fn()
     let onFrame: ((frame: readonly number[]) => Promise<void> | void) | null = null
@@ -6403,7 +6430,8 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(playedSources).toEqual(['test-assets/configured-start.mp3'])
+    expect(playedSources).toEqual([])
+    expect(nativeCueFixture.requests.map(({ cueType }) => cueType)).toEqual(['start_listening'])
     nowMs = 2_000
 
     await act(async () => {
@@ -6412,10 +6440,8 @@ describe('App', () => {
       await vi.advanceTimersByTimeAsync(0)
     })
 
-    expect(playedSources).toEqual([
-      'test-assets/configured-start.mp3',
-      'test-assets/configured-stop.mp3',
-    ])
+    expect(playedSources).toEqual([])
+    expect(nativeCueFixture.requests.map(({ cueType }) => cueType)).toEqual(['start_listening', 'stop_listening'])
     expect(container.textContent).not.toContain('transcription_ready:\n3200 samples captured')
   })
 
@@ -8314,6 +8340,14 @@ describe('App', () => {
     let resolveStopCue: () => void = () => {
       throw new Error('stop cue was not pending')
     }
+    nativeCueFixture.onActivate = ({ cueType }) => {
+      if (cueType !== 'stop_listening') return
+      stopCueCalls += 1
+      return new Promise<void>((resolve) => {
+        hasPendingStopCue = true
+        resolveStopCue = resolve
+      })
+    }
 
     class FakeAudio {
       source: string
@@ -8445,6 +8479,16 @@ describe('App', () => {
     let onFrame: StartLiveAudioSourceOptions['onFrame'] | null = null
     let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
     const order: string[] = []
+    let processingCueTicket: number | null = null
+    nativeCueFixture.onActivate = ({ playbackId, cueType }) => {
+      if (cueType === 'stop_listening') {
+        processingCueTicket = playbackId
+        order.push('processing cue started')
+      }
+    }
+    nativeCueFixture.onFinish = (playbackId) => {
+      if (playbackId === processingCueTicket) order.push('processing cue stopped')
+    }
     let nowMs = 100
     Date.now = () => nowMs
     Object.defineProperty(globalThis, 'Audio', {
@@ -8474,6 +8518,8 @@ describe('App', () => {
         if (command === 'mark_silence') return { runtime_phase: 'processing', transcription_ready_samples: 3200, transcript_text: 'Synthetic question', last_activity_ms: null, heard_speech: false, capturing_utterance: false, preroll_samples: 4, utterance_samples: 0 }
         if (command === 'submit_prompt') {
           const requestId = (args as { requestId: string }).requestId
+          // Establish an active processing cue before exercising speech preemption.
+          await vi.waitFor(() => expect(processingCueTicket).not.toBeNull())
           promptEventHandler?.({ payload: { request_id: requestId, kind: 'text', text: 'Synthetic answer' } })
           return { request_id: requestId, outcome: 'completed', error_message: null, runtime_phase: 'sleeping' }
         }
@@ -8487,7 +8533,10 @@ describe('App', () => {
     await act(async () => { await onFrame?.([0.1, -0.1]); await Promise.resolve() })
     nowMs = 850
     await act(async () => { await onFrame?.([0.001, -0.001]); await Promise.resolve() })
-    await vi.waitFor(() => expect(order).toContain('assistant speech requested'))
+    await act(async () => {
+      await vi.waitFor(() => expect(order).toContain('assistant speech requested'))
+      await Promise.resolve()
+    })
 
     expect(order).toEqual(['processing cue started', 'processing cue stopped', 'assistant speech requested'])
   })
@@ -9078,6 +9127,7 @@ describe('Settings-only desktop speech diagnostics', () => {
 })
 
 async function renderApp(strict = false, session?: FrontendSession): Promise<{ container: HTMLElement }> {
+  installNativeCueFixture()
   installPromptChannelFixture()
   const container = document.createElement('div')
   document.body.append(container)
@@ -9090,6 +9140,27 @@ async function renderApp(strict = false, session?: FrontendSession): Promise<{ c
   })
 
   return { container }
+}
+
+function installNativeCueFixture(): void {
+  const fixture = window.__TAURI_INTERNALS__
+  if (fixture === undefined) return
+  const invoke = fixture.invoke
+  window.__TAURI_INTERNALS__ = { ...fixture, invoke: async (command, args) => {
+    if (command === 'set_native_audio_active') return null
+    if (command === 'reserve_cue_playback_id') return ++nativeCueFixture.nextTicket
+    if (command === 'finish_cue_playback') {
+      nativeCueFixture.onFinish?.((args as { playbackId: number }).playbackId)
+      return null
+    }
+    if (command === 'activate_voice_cue') {
+      const request = args as { playbackId: number; cueType: string }
+      nativeCueFixture.requests.push(request)
+      await nativeCueFixture.onActivate?.(request)
+      return { playback_id: request.playbackId, stage: 'activated' }
+    }
+    return invoke(command, args)
+  } }
 }
 
 function installPromptChannelFixture(): void {

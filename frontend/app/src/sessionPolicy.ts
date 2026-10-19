@@ -10,7 +10,6 @@ export function generationIneligibility(state: {
   readonly startupState: StartupState
   readonly assistantSettings: Readonly<AssistantSettings>
   readonly assistantSettingsPending: boolean
-  readonly searchModePending: boolean
   readonly snapshotControlsFresh: boolean
   readonly resetPending: boolean
   readonly isSwitchingResponseProfile: boolean
@@ -21,7 +20,6 @@ export function generationIneligibility(state: {
   if (!instantMatchesResponseProfile(state.startupState, state.assistantSettings.instant)) return 'profile-mismatch'
   if (updateBlocked) return 'update-blocked'
   if (state.assistantSettingsPending) return 'settings-pending'
-  if (state.searchModePending) return 'search-pending'
   if (!state.snapshotControlsFresh) return 'controls-stale'
   if (state.resetPending) return 'reset-pending'
   if (state.isSwitchingResponseProfile) return 'profile-changing'

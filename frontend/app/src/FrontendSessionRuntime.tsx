@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useLayoutEffect } from 'react'
-import { FrontendTiming } from './lib/frontendTiming'
+import { FrontendTiming, reportAppBenchmarkStage } from './lib/frontendTiming'
 import { useSessionView } from './FrontendSession'
 import type { FrontendSession } from './FrontendSession'
 import { SessionAuthority, cancelPromptProjectionFrame, sessionAuthority, useSessionControls, useSessionIntents } from './SessionAuthority'
@@ -11,9 +11,6 @@ import { persistAudioInputDeviceId } from './lib/audioInputPreference'
 import { useAndroidVoiceAdapter } from './lib/useAndroidVoiceAdapter'
 import { ResponseAnnouncements, SessionTranscript } from './SessionTranscript'
 import { PromptComposer } from './components/PromptComposer'
-import { SearchModeSelect } from './components/SearchModeSelect'
-import { searchModeAvailability, selectNativeSearchMode } from './lib/searchMode'
-import type { SearchMode } from './lib/searchMode'
 import { AndroidVoiceControlsProvider, AndroidComposerVoiceControl, AndroidVoiceSecondaryControls } from './components/AndroidVoiceControls'
 import { SpeechSettings } from './components/SpeechSettings'
 import type { AndroidVoiceContext, AndroidVoiceStatus } from './lib/androidVoice'
@@ -27,10 +24,11 @@ import headerIcon from '../../../apps/desktop-tauri/src-tauri/icons/icon.svg?url
 import { UserNoticeToast } from './components/UserNoticeToast'
 import { UpdateSettings } from './components/UpdateSettings'
 import { ChatGptAuth } from './components/ChatGptAuth'
-import { playCueWithFallback, prepareVoiceCues } from './lib/audioCues'
+import { createNativeAudioLifecycle, playCueWithFallback, prepareVoiceCues } from './lib/audioCues'
 import { shouldSubmitComposer } from './lib/composer'
 import { listAudioInputDevices, startLiveAudioSource } from './lib/liveAudioSource'
 import { executePrompt } from './lib/promptExecution'
+import { mergeAnswerSources } from './lib/answerSources'
 import { appendCanonicalTurn, canonicalExecutionKey, isExpectedCanonicalTurn, loadAppSnapshot, parseAppSnapshot, parseAndroidConversationPage, parseAndroidHeadPage } from './lib/appSnapshot'
 import type { AppSnapshot, Capability, Turn, ValidatedPreferences } from './lib/appSnapshot'
 import {
@@ -149,7 +147,8 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   const [headPagePending, setHeadPagePending] = session.fieldState('headPagePending')
   const [androidVoiceActive, setAndroidVoiceActive] = session.fieldState('androidVoiceActive')
   const androidVoiceActiveRef = session.fieldRef('androidVoiceActive')
-  const [, setAndroidVoiceStatus] = session.fieldState('androidVoiceStatus')
+  const [androidVoiceStatus, setAndroidVoiceStatus] = session.fieldState('androidVoiceStatus')
+  const androidVoiceStatusRef = session.fieldRef('androidVoiceStatus')
   const [, setAndroidSpeechStatusError] = session.fieldState('androidSpeechStatusError')
   const onAndroidSpeechStatus = useCallback((status: AndroidVoiceStatus | null, statusError: string | null): void => {
     setAndroidVoiceStatus(status)
@@ -199,12 +198,6 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   const [, setUiThemeWriteError] = session.fieldState('uiThemeWriteError')
   const [customRetryPending, setCustomRetryPending] = session.fieldState('customRetryPending')
   const [assistantSettings, setAssistantSettings] = session.fieldState('assistantSettings')
-  const [, setSearchMode] = session.fieldState('searchMode')
-  const searchModeRef = session.fieldRef('searchMode')
-  const [searchModePending, setSearchModePending] = session.fieldState('searchModePending')
-  const searchModePendingRef = session.fieldRef('searchModePending')
-  const searchModeInitializedRef = session.operationRef('searchInitialized', () => !isNativeTauriRuntime() && !isAndroidRuntime)
-  const searchModeWriteRef = session.operationRef<Promise<void>>('searchWrites', () => Promise.resolve())
   const [, setSnapshotModelOptions] = session.fieldState('snapshotModelOptions')
   const snapshotModelOptionsRef = session.fieldRef('snapshotModelOptions')
   const assistantSettingsRef = session.fieldRef('assistantSettings')
@@ -299,6 +292,24 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   const ttsEnabledRef = session.fieldRef('ttsEnabled')
   const ttsPlaybackIdRef = session.audio.speechPlayback
   const cuePlayerRef = session.audio.cues
+  const nativeAudioLifecycleRef = session.operationRef('nativeAudioLifecycle', createNativeAudioLifecycle)
+  useEffect(() => {
+    if (!supportsDesktopRuntime) return
+    cuePlayerRef.current.stop()
+    const player = nativeAudioLifecycleRef.current.createCuePlayer()
+    cuePlayerRef.current = player
+    const setActive = (active: boolean): void => nativeAudioLifecycleRef.current.setActive(active)
+    const visibilityChanged = (): void => {
+      setActive(!document.hidden)
+    }
+    visibilityChanged()
+    document.addEventListener('visibilitychange', visibilityChanged)
+    return () => {
+      document.removeEventListener('visibilitychange', visibilityChanged)
+      setActive(false)
+      player.retire()
+    }
+  }, [cuePlayerRef, nativeAudioLifecycleRef, supportsDesktopRuntime])
   const cueAssetPathsRef = session.operationRef<CueAssetPaths>('cuePaths', () => DEFAULT_CUE_ASSET_PATHS)
   const fallbackCueAssetPathsRef = session.operationRef<CueAssetPaths>('fallbackCuePaths', () => DEFAULT_CUE_ASSET_PATHS)
   const ttsPersistedRevisionRef = session.preferences.tts.persistedRevision
@@ -1243,6 +1254,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   useEffect(() => {
     const cuePlayer = cuePlayerRef.current
     session.activate(() => {
+      if (import.meta.env.VITE_VOXGOLEM_BENCHMARK === '1') reportAppBenchmarkStage('benchmark_lifetime_retire')
       timingRef.current.retireRequest()
       cuePlayer.stop()
       const activePrompt = promptRef.current
@@ -1316,42 +1328,6 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   const assistantControlsDisabled = startupState.kind !== 'ready' || assistantSettingsPending || isSwitchingResponseProfile || !snapshotControlsFresh || updateRuntimeBlocked || androidVoiceActive
   const instantControlsDisabled = assistantControlsDisabled || resetPending || promptState !== 'idle' ||
     runtimeStatus === 'processing' || runtimeStatus === 'executing'
-  useEffect(() => {
-    if (searchModeInitializedRef.current || startupState.kind !== 'ready' || runtimeStatus !== 'sleeping' ||
-      promptState !== 'idle' || !snapshotControlsFresh || assistantSettingsPending || resetPending) return
-    searchModeInitializedRef.current = true
-    timingRef.current.startup('INITIAL_SEARCH_MODE_REQUESTED')
-    const write = selectNativeSearchMode('quick')
-    searchModeWriteRef.current = write.catch(() => undefined)
-    void write.then(() => {
-      if (appActiveRef.current) timingRef.current.startup('INITIAL_SEARCH_MODE_ACK')
-    }).catch((error) => {
-      if (appActiveRef.current) addNotice({ tone: 'error', title: 'Search mode not initialized', message: toDisplayErrorMessage(error) })
-    }).finally(() => {
-      searchModePendingRef.current = false
-      if (appActiveRef.current) setSearchModePending(false)
-    })
-  }, [addNotice, appActiveRef, assistantSettingsPending, promptState, resetPending, runtimeStatus, searchModeInitializedRef, searchModePendingRef, searchModeWriteRef, setSearchModePending, snapshotControlsFresh, startupState.kind, timingRef])
-  const changeSearchMode = async (mode: SearchMode): Promise<void> => {
-    if (instantControlsDisabled || runtimeStatusRef.current !== 'sleeping' || micStarting || micActive ||
-      searchModePendingRef.current || resetPendingRef.current || promptRef.current !== null ||
-      !searchModeAvailability(assistantSettingsRef.current, selectedInstantOption?.available === true).available) return
-    searchModePendingRef.current = true
-    setSearchModePending(true)
-    const write = selectNativeSearchMode(mode)
-    searchModeWriteRef.current = write.catch(() => undefined)
-    try {
-      await write
-      if (!appActiveRef.current || resetPendingRef.current) return
-      searchModeRef.current = mode
-      setSearchMode(mode)
-    } catch (error) {
-      if (appActiveRef.current) addNotice({ tone: 'error', title: 'Search mode not changed', message: toDisplayErrorMessage(error) })
-    } finally {
-      searchModePendingRef.current = false
-      if (appActiveRef.current) setSearchModePending(false)
-    }
-  }
   const clearAssistantSettingsWriteFeedback = (): void => {
     setAssistantSettingsWriteError(null)
     setNotices((current) => {
@@ -1426,14 +1402,12 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
 
     console.error('[cue] playback failure', {
       cueType,
-      cueAssetPaths,
       runtimeStatus: runtimeStatusRef.current,
-      error,
     })
 
     recordRuntimeDiagnostic(
       'cue',
-      `Cue playback error: ${message} [cue=${cueType}, startCue=${cueAssetPaths.startListening}, stopCue=${cueAssetPaths.stopListening}]`,
+      `Cue playback error: ${message} [cue=${cueType}]`,
     )
     addNotice({
       tone: 'error',
@@ -1485,12 +1459,11 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
           })
         })
         .catch((error: unknown) => {
+          if (import.meta.env.VITE_VOXGOLEM_BENCHMARK === '1') reportAppBenchmarkStage('benchmark_cue_error')
           console.error('[cue] playback failure while applying runtime status', {
             cueType,
-            cueAssetPaths,
             runtimeStatusBefore: previousStatus,
             runtimeStatusAfter: nextStatus,
-            error,
           })
 
           enterRuntimeError()
@@ -1659,7 +1632,6 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     const currentSettings = admission.settings
     const executingStatus = applyTransition(runtimeStatusRef.current, 'submit_prompt')
     const promptRuntimeActivityRevision = runtimeActivityRevisionRef.current
-    const admittedMode = admission.mode
     const expectedCanonicalSessionId = snapshotSessionIdRef.current
     const promptComposerRevision = composerEditRevisionRef.current
     const priorCanonicalExecutions = new Set(
@@ -1727,8 +1699,8 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         if (source === 'voice' && active.text.length === 0 && event.text.length > 0) {
           voiceTelemetry.record('provider_first_text')
         }
-        const timings = requestTiming.received(event.text)
-        if (isAndroidRuntime && timings !== undefined) active.customDirectTimings = timings
+        const firstTextTimings = requestTiming.received(event.text)
+        if (isAndroidRuntime && firstTextTimings !== undefined) active.customDirectTimings = firstTextTimings
         const hadCompleteLine = active.text.includes('\n')
         active.text += event.text
         if (source === 'voice' && !hadCompleteLine && active.text.includes('\n')) {
@@ -1747,7 +1719,8 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
             void synthesizeAndPlayAssistantReply(firstLine)
           }
         }
-        session.schedulePromptProjection(active)
+        if (firstTextTimings !== undefined) session.flushPromptProjection(active)
+        else session.schedulePromptProjection(active)
       }
       if (event.kind === 'correction') {
         cancelPromptProjectionFrame(active)
@@ -1778,7 +1751,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         setPromptActivity({ text: `${event.stage[0]?.toUpperCase()}${event.stage.slice(1)} stage ${event.status}`, compact: event.status !== 'failed' })
       }
       if (event.kind === 'sources') {
-        active.sources = [...event.sources]
+        active.sources = mergeAnswerSources(active.sources, event.sources)
         setMessages((current) => current.map((message) => message.id === active.assistantId
           ? { ...message, answerStage: { stages: active.stages, priorVersions: active.priorVersions, sources: active.sources } } : message))
       }
@@ -1820,7 +1793,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     const inlineAssistant = androidAssistantRef.current
     try {
       requestTiming.dispatch()
-      result = await executePrompt(requestId, prompt, handleEvent, source, admittedMode)
+      result = await executePrompt(requestId, prompt, handleEvent, source)
     } catch (error) {
       const message = error instanceof Error
         ? error.message
@@ -2096,13 +2069,16 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       const pending = pendingAndroidVoiceRequestRef.current
       if (pending === null) return
       if (pending.inputEpoch !== androidVoiceInputEpochRef.current || pending.composerRevision !== composerEditRevisionRef.current) { pendingAndroidVoiceRequestRef.current = null; return }
-      if (!appActiveRef.current || document.visibilityState !== 'visible') return
+      if (!appActiveRef.current || (document.visibilityState !== 'visible' &&
+        androidVoiceStatusRef.current?.retainedSubmissionId !== pending.requestId)) return
       if (shortcutDraftRef.current?.needsNew === true || androidSelectionRecoveryRef.current !== null || promptRef.current !== null || resetPendingRef.current || !snapshotControlsFreshRef.current || assistantSettingsPendingRef.current) return
       if (pending.sessionId !== snapshotSessionIdRef.current || pending.selectedHead !== (androidAssistantRef.current?.selectedHead ?? null)) { pendingAndroidVoiceRequestRef.current = null; androidVoiceStopRef.current?.(); return }
       pendingAndroidVoiceRequestRef.current = null
       void runPrompt(pending.text, 'typed', pending.requestId)
     }
   })
+
+  useEffect(() => { drainAndroidVoiceRequestRef.current() }, [androidVoiceStatus, drainAndroidVoiceRequestRef])
 
   async function synthesizeAndPlayAssistantReply(text: string): Promise<void> {
     let commandPending = false
@@ -2118,7 +2094,10 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         await invokeTauriCommand('reserve_local_tts_playback_id'),
         'TTS playback',
       )
-      if (generation !== ttsGenerationRef.current || !ttsEnabledRef.current) return
+      if (generation !== ttsGenerationRef.current || !ttsEnabledRef.current) {
+        await invokeTauriCommand('finish_tts_playback', { playbackId })
+        return
+      }
       ttsPlaybackIdRef.current = playbackId
       setTtsPlaying(true)
       commandPending = true
@@ -2233,6 +2212,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   }
 
   const reportLiveAudioError = (error: unknown): void => {
+    if (import.meta.env.VITE_VOXGOLEM_BENCHMARK === '1') reportAppBenchmarkStage('benchmark_audio_error')
     const message = error instanceof Error ? error.message : 'Live audio capture failed'
     const recovery = message === 'Native microphone processing fell behind'
       ? ' Capture stopped; select Start mic to resume.'
@@ -2676,11 +2656,13 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
 
   useEffect(() => {
     if (!voiceSnapshotControlsUsable) {
+      if (import.meta.env.VITE_VOXGOLEM_BENCHMARK === '1') reportAppBenchmarkStage('benchmark_controls_retire')
       micAutoStartedRef.current = false
       if (micActive || micStarting || micStartInFlightRef.current) stopLiveAudio()
       return
     }
     if (startupState.kind === 'ready' && !voiceInputReady(startupState)) {
+      if (import.meta.env.VITE_VOXGOLEM_BENCHMARK === '1') reportAppBenchmarkStage('benchmark_capability_retire')
       micAutoStartedRef.current = false
       if (micActive || micStarting || micStartInFlightRef.current) stopLiveAudio()
       return
@@ -2776,8 +2758,6 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
 
     if (getTauriInternals() === null) {
       timingRef.current.retireRequest()
-      searchModeRef.current = 'quick'
-      setSearchMode('quick')
       if (activePrompt !== null) {
         cancelPromptProjectionFrame(activePrompt)
         activePrompt.terminal = true
@@ -2818,19 +2798,10 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       if (isAndroidRuntime) await invokeTauriCommand('stop_assistant_voice')
       if (!appActiveRef.current) return
       await androidDraftWriteChainRef.current
-      await searchModeWriteRef.current
       resetDraftRevision = composerEditRevisionRef.current
       if (androidSelectionRecoveryRef.current !== null) androidSelectionRecoveryRef.current = { transcriptRevision, composerRevision: resetDraftRevision }
       await invokeTauriCommand('reset_session', isAndroidRuntime ? { draft: composerValueRef.current } : undefined)
       if (appActiveRef.current) timingRef.current.retireRequest()
-      searchModeInitializedRef.current = true
-      searchModeRef.current = 'quick'
-      setSearchMode('quick')
-      try { await selectNativeSearchMode('quick') }
-      finally {
-        searchModePendingRef.current = false
-        if (appActiveRef.current) setSearchModePending(false)
-      }
       if (!appActiveRef.current) return
       if (isAndroidRuntime && composerEditRevisionRef.current === resetDraftRevision) {
         androidDraftPendingRef.current = null
@@ -3014,13 +2985,13 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     const captureAvailable = (): boolean => !['saved_local_state_failed', 'draft_not_saved', 'storage_error', 'corrupt_store'].includes(androidAssistantRef.current?.error ?? '') &&
       (androidAssistantRef.current?.branchChoices.length ?? 0) === 0 &&
       (completionPolicy === 'manual' || generationAvailable())
-    if (!isAndroidRuntime || !captureAvailable() || updateRuntimeBlocked || resetPendingRef.current || promptRef.current !== null || androidVoiceActiveRef.current || androidSelectionRecoveryRef.current !== null || !snapshotControlsFreshRef.current || assistantSettingsPendingRef.current || !searchModeInitializedRef.current || searchModePendingRef.current || shortcutDraftRef.current?.needsNew === true) throw new Error('Voice chat is busy; existing work was preserved')
+    if (!isAndroidRuntime || !captureAvailable() || updateRuntimeBlocked || resetPendingRef.current || promptRef.current !== null || androidVoiceActiveRef.current || androidSelectionRecoveryRef.current !== null || !snapshotControlsFreshRef.current || assistantSettingsPendingRef.current || shortcutDraftRef.current?.needsNew === true) throw new Error('Voice chat is busy; existing work was preserved')
     const conversation = snapshotSessionIdRef.current
     const selectedHead = androidAssistantRef.current?.selectedHead ?? null
     const revision = composerEditRevisionRef.current
     await androidDraftWriteChainRef.current
     if (androidDraftWriteFailureRef.current !== null) throw androidDraftWriteFailureRef.current
-    if (!appActiveRef.current || !captureAvailable() || updateRuntimeBlocked || document.visibilityState !== 'visible' || resetPendingRef.current || promptRef.current !== null || androidSelectionRecoveryRef.current !== null || !snapshotControlsFreshRef.current || snapshotSessionIdRef.current !== conversation || (androidAssistantRef.current?.selectedHead ?? null) !== selectedHead || composerEditRevisionRef.current !== revision || assistantSettingsPendingRef.current || !searchModeInitializedRef.current || searchModePendingRef.current) throw new Error('Voice chat was interrupted; existing work was preserved')
+    if (!appActiveRef.current || !captureAvailable() || updateRuntimeBlocked || document.visibilityState !== 'visible' || resetPendingRef.current || promptRef.current !== null || androidSelectionRecoveryRef.current !== null || !snapshotControlsFreshRef.current || snapshotSessionIdRef.current !== conversation || (androidAssistantRef.current?.selectedHead ?? null) !== selectedHead || composerEditRevisionRef.current !== revision || assistantSettingsPendingRef.current) throw new Error('Voice chat was interrupted; existing work was preserved')
     if (settingsOpen) closeSettings()
     return composerValueRef.current
   }
@@ -3158,7 +3129,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       else applyStartupState(await loadStartupState(), false)
     },
     beginCurrentVoiceDraft, onAndroidVoiceActivity, onAndroidSpeechStatus, onAndroidVoiceInputCancelled,
-    changeInstant, changeSearchMode, resetSession, retryCustom, cancelPrompt,
+    changeInstant, resetSession, retryCustom, cancelPrompt,
     changeUiTheme, adjustUiTextSize, toggleTts, toggleMic, changeAudioInputDevice,
     setAutoStopOnSilence, setVoiceNotesOpen, setNoticeInteraction,
     loadMoreAndroidConversations, loadMoreAndroidHeads, selectAndroidConversation,
@@ -3168,9 +3139,10 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     enabled: isAndroidRuntime && !voiceNotesOpen,
     statusEnabled: isAndroidRuntime && (!voiceNotesOpen || settingsOpen),
     draft: composerValue,
-    disabled: searchModePending || resetPending || promptState !== 'idle' || !snapshotControlsFresh || assistantSettingsPending,
+    disabled: resetPending || promptState !== 'idle' || !snapshotControlsFresh || assistantSettingsPending,
     generationAvailable: !nativeConversationNeedsRecovery && selectedInstantOption?.available === true && (androidAssistant?.branchChoices.length ?? 0) === 0,
     shortcutReady: snapshotHydrationState === 'succeeded' && androidAssistant !== null && snapshotControlsFresh && !snapshotControlsInvalidated,
+    launchContext: { sessionId: snapshotSessionIdRef.current ?? '0', selectedHead: androidAssistant?.selectedHead ?? null },
     stopRef: androidVoiceStopRef,
     onBeforeStart: actions.beginCurrentVoiceDraft,
     onActivity: actions.onAndroidVoiceActivity,
@@ -3192,7 +3164,6 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       startupState.kind === 'ready' &&
       snapshotControlsFresh &&
       !assistantSettingsPending &&
-      !searchModePending &&
       !resetPending &&
       !isSwitchingResponseProfile &&
       !updateRuntimeBlocked &&
@@ -3212,7 +3183,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       document.documentElement.dataset['appReadyToSendMs'] = String(elapsed)
       ;(window as unknown as { __appReadyToSendMs?: number }).__appReadyToSendMs = elapsed
     }
-  }, [androidAssistant?.branchChoices.length, androidSelectionRecoveryRef, androidVoiceActive, assistantSettings.instant, assistantSettingsPending, isSwitchingResponseProfile, nativeConversationNeedsRecovery, promptState, resetPending, runtimeStatus, searchModePending, selectedInstantOption?.available, shortcutDraftRef, snapshotControlsFresh, startupState, startupTelemetrySentRef, timingRef, updateRuntimeBlocked])
+  }, [androidAssistant?.branchChoices.length, androidSelectionRecoveryRef, androidVoiceActive, assistantSettings.instant, assistantSettingsPending, isSwitchingResponseProfile, nativeConversationNeedsRecovery, promptState, resetPending, runtimeStatus, selectedInstantOption?.available, shortcutDraftRef, snapshotControlsFresh, startupState, startupTelemetrySentRef, timingRef, updateRuntimeBlocked])
 
   return {
     actions,
@@ -3256,11 +3227,11 @@ const SessionViews = memo(function SessionViews({ session, view }: SessionViewPr
 }, sameExternalView)
 
 function SessionVoiceControls({ session, view, children }: SessionViewProps & { readonly children: ReactNode }) {
-  const { searchModePending, resetPending, promptState, snapshotControlsFresh, assistantSettingsPending,
+  const { resetPending, promptState, snapshotControlsFresh, assistantSettingsPending,
     nativeConversationNeedsRecovery, selectedInstantOption, androidAssistant, updateRuntimeBlocked } = usePresentation(session, view, 'toolbar')
   if (!isAndroidRuntime) return children
   return <AndroidVoiceControlsProvider voice={view.voice}
-    disabled={updateRuntimeBlocked || nativeConversationNeedsRecovery || searchModePending || resetPending || promptState !== 'idle' || !snapshotControlsFresh || assistantSettingsPending || (androidAssistant?.branchChoices.length ?? 0) > 0}
+    disabled={updateRuntimeBlocked || nativeConversationNeedsRecovery || resetPending || promptState !== 'idle' || !snapshotControlsFresh || assistantSettingsPending || (androidAssistant?.branchChoices.length ?? 0) > 0}
     generationAvailable={!nativeConversationNeedsRecovery && selectedInstantOption?.available === true && (androidAssistant?.branchChoices.length ?? 0) === 0}
     interactionBlocked={view.navigation.settingsOpen}>{children}</AndroidVoiceControlsProvider>
 }
@@ -3270,7 +3241,7 @@ function usePresentation(session: FrontendSession, view: SessionViewProps['view'
   const state = session.getControlsSnapshot()
   const { startupState, assistantSettings, runtimeStatus, promptState, resetPending,
     assistantSettingsPending, androidVoiceActive, isSwitchingResponseProfile, snapshotControlsFresh,
-    searchModePending, micActive, micStarting } = state
+    micActive, micStarting } = state
   const options = session.getModelsSnapshot()
   const selectedInstantOption = options.instantAssistantOptions.find((option) => option.value === assistantSettings.instant)
   const selectedInstantProfileReady = instantMatchesResponseProfile(startupState, assistantSettings.instant)
@@ -3284,11 +3255,10 @@ function usePresentation(session: FrontendSession, view: SessionViewProps['view'
     ...state, ...options, appUpdates: view.appUpdates, supportsDesktopRuntime: !isAndroidRuntime && !isBrowserPreviewRuntime(),
     updateRuntimeBlocked, selectedInstantOption, selectedInstantProfileReady, nativeConversationNeedsRecovery,
     selectedInstantRetryable: localInstantCanRetry(startupState, assistantSettings.instant),
-    searchAvailability: searchModeAvailability(assistantSettings, selectedInstantOption?.available === true),
     assistantControlsDisabled, instantControlsDisabled,
     canSend: generationIneligibility(state, selectedInstantOption?.available === true, updateRuntimeBlocked) === null &&
       !androidVoiceActive && promptState === 'idle' && runtimeStatus === 'sleeping' && state.composerValue.trim().length > 0,
-    canToggleMic: !updateRuntimeBlocked && (micActive || (!searchModePending && voiceControlsUsable && voiceInputReady(startupState) && !micStarting && !resetPending)),
+    canToggleMic: !updateRuntimeBlocked && (micActive || (voiceControlsUsable && voiceInputReady(startupState) && !micStarting && !resetPending)),
     canToggleTts: startupState.kind === 'ready' && capabilityIsAvailable(startupState, 'tts') && !isSwitchingResponseProfile && !updateRuntimeBlocked,
     voiceInputUnavailableReason: startupState.kind === 'ready' ? startupState.voiceInputError ?? (startupState.capabilities.filter((capability) =>
       ['wake_word', 'vad', 'parakeet'].includes(capability.id) && capability.state !== 'available').map((capability) => capability.reason ?? `${capabilityLabel(capability.id)} unavailable`).join('; ') || 'required voice capabilities are unavailable') : 'voice input is still starting',
@@ -3307,19 +3277,16 @@ function usePresentation(session: FrontendSession, view: SessionViewProps['view'
 const SessionToolbar = memo(function SessionToolbar({ session, view }: SessionViewProps) {
   const {
     updateRuntimeBlocked, runtimeStatus, shortcutStaging, androidAssistant, androidConversationId,
-    headPagePending, androidVoiceActive, micStarting, micActive, voiceNotesOpen,
-    snapshotControlsFresh, searchMode, searchModePending,
+    headPagePending, androidVoiceActive, voiceNotesOpen,
+    snapshotControlsFresh,
     promptState, resetPending,
-    searchAvailability, instantControlsDisabled, headerBusy,
+    headerBusy,
   } = usePresentation(session, view, 'toolbar')
   const { settingsOpen, settingsButtonRef, openSettings } = view.navigation
   const {
-    changeSearchMode, resetSession,
+    resetSession,
     setVoiceNotesOpen, selectAndroidConversation,
   } = view.actions
-  const searchModeControl = <SearchModeSelect iconOnly={isAndroidRuntime} value={searchAvailability.available ? searchMode : 'quick'}
-    disabled={!searchAvailability.available || instantControlsDisabled || searchModePending || runtimeStatus !== 'sleeping' || micStarting || micActive}
-    reason={searchAvailability.reason} onChange={(mode) => void changeSearchMode(mode)} />
   const notesControl = <button type="button" className="shell__control shell__icon-control" aria-label={voiceNotesOpen ? 'Chat' : 'Voice notes'} title={voiceNotesOpen ? 'Chat' : 'Voice notes'} aria-pressed={voiceNotesOpen} onClick={() => setVoiceNotesOpen((open) => !open)}>
     <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 3h10l4 4v14H5z M15 3v5h4 M8 12h8 M8 16h6" /></svg>
     <span className="shell__overflow-label" aria-hidden="true">{voiceNotesOpen ? 'Chat' : 'Voice notes'}</span>
@@ -3352,9 +3319,8 @@ const SessionToolbar = memo(function SessionToolbar({ session, view }: SessionVi
         <div className="shell__header-actions" role={isAndroidRuntime ? 'group' : undefined} aria-label={isAndroidRuntime ? 'Android toolbar' : undefined} aria-describedby={isAndroidRuntime && shortcutStaging ? 'new-voice-draft-status' : undefined}>
           {isAndroidRuntime ? <>{voiceNotesOpen ? notesControl : null}{conversationControl}<PhoneActionOverflow>
             {!voiceNotesOpen ? <AndroidVoiceSecondaryControls /> : null}
-            {!voiceNotesOpen ? notesControl : newChatControl}{searchModeControl}{settingsControl}
+            {!voiceNotesOpen ? notesControl : newChatControl}{settingsControl}
           </PhoneActionOverflow></> : null}
-          {!isAndroidRuntime ? searchModeControl : null}
           {!isAndroidRuntime ? settingsControl : null}
         </div>
       </header>
@@ -3564,9 +3530,9 @@ const SessionSettings = memo(function SessionSettings({ session, view }: Session
             <section className="settings-panel__web" aria-labelledby="web-settings-title">
               <h3 id="web-settings-title">Web access</h3>
               <label className="shell__toggle settings-panel__interactive"><input type="checkbox" aria-label="Allow web access" checked={assistantSettings.webEnabled} disabled={instantControlsDisabled}
-                onChange={(event) => patchAssistantSettings({ webEnabled: event.target.checked })} /> Allow web access</label>
+                onChange={(event) => patchAssistantSettings({ webEnabled: event.target.checked })} /> Web research</label>
               <p className="settings-panel__hint">{assistantSettings.webEnabled ? 'Native search may send question-derived queries and public-page requests to external providers: Exa is primary, with Parallel as fallback when needed. Delegated OpenCode routes may use their own search providers.' : 'Web is off: no web lookup or search fallback. Normal chat still uses the selected chat provider; answers are not web-verified.'}</p>
-              <p className="settings-panel__hint">Search effort (Quick, Verify, Research) is separate from this permission. Providers used depend on availability; search and fallback activity appear in the response status when reported.</p>
+              <p className="settings-panel__hint">The selected model decides whether to use available web tools. Models without tool support can still chat but cannot browse automatically. Search activity appears in the response status when reported.</p>
             </section>
             {isAndroidRuntime ? <NewVoiceShortcutSettings /> : null}
             <UpdateSettings updates={appUpdates} installationDisabled={updateInstallationDisabled} />

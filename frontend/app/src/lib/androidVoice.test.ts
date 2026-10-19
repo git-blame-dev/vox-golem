@@ -2,6 +2,21 @@ import { describe, expect, it } from 'vitest'
 import { parseAndroidVoiceEvent, parseAndroidVoiceStatus } from './androidVoice'
 
 describe('native Android voice boundary', () => {
+  it('accepts native lifecycle authority only with a bounded retained identity and retired input', () => {
+    const wire = { kind: 'voice_status', available: true, reason: 'Synthetic speech service', mode: 'ask', dictation: 'final', loop: 'paused', ttsEnabled: false, ttsAvailable: false, ttsPhase: 'idle', error: null }
+    expect(parseAndroidVoiceStatus(wire).inputForeground).toBeUndefined()
+    expect(parseAndroidVoiceStatus({ ...wire, inputForeground: false, retainedSubmissionId: 'voice-synthetic-retained' })).toMatchObject({ inputForeground: false, retainedSubmissionId: 'voice-synthetic-retained' })
+    expect(parseAndroidVoiceStatus({ ...wire, inputForeground: false, retainedSubmissionId: null }).retainedSubmissionId).toBeNull()
+    for (const fields of [
+      { inputForeground: 'false', retainedSubmissionId: null },
+      { inputForeground: true, retainedSubmissionId: 'voice-synthetic-retained' },
+      { retainedSubmissionId: 'voice-synthetic-retained' },
+      { inputForeground: false, retainedSubmissionId: '' },
+      { inputForeground: false, retainedSubmissionId: 1 },
+      { inputForeground: false, retainedSubmissionId: 'x'.repeat(129) },
+    ]) expect(() => parseAndroidVoiceStatus({ ...wire, ...fields })).toThrow()
+  })
+
   it('parses reported speech selection options with legacy omission compatibility and strict inventory bounds', () => {
     const wire = { kind: 'voice_status', available: true, reason: 'Synthetic speech service', mode: 'dictation', dictation: 'idle', loop: 'idle', ttsEnabled: true, ttsAvailable: true, ttsPhase: 'idle', error: null }
     const options = { ttsProviders: ['synthetic.tts.engine'], ttsVoices: [{ provider: '', name: 'synthetic-system-voice', language: 'en-AU', networkRequired: false }], recognitionInstalledLanguages: ['en-AU'], recognitionSupportedLanguages: null, localOnlyRecognitionAvailable: true, modelSelectionAvailable: false, modelIdentifiers: null }

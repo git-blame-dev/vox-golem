@@ -10,6 +10,15 @@ function encoderTurn(sequence: number) {
 }
 
 describe('actual Android encoder-shaped transcript projection', () => {
+  it('hydrates observed sources from canonical data without previous presentation state or footer parsing', () => {
+    const turn = { ...encoderTurn(3), sources: [{ url: 'https://example.test/a', title: 'Synthetic observed source' }] }
+    const projected = projectCommittedTranscript([turn])
+    expect(projected[1]?.answerStage?.sources).toEqual(turn.sources)
+    const restored = replaceCommittedTranscript([], [turn])
+    expect(restored[1]?.answerStage?.sources).toEqual(turn.sources)
+    const noSources = { ...turn, sources: [] }
+    expect(replaceCommittedTranscript(restored, [noSources])[1]?.answerStage?.sources).toEqual([])
+  })
   it.each(['', ' \n'])('does not expose an empty canonical answer as successful text to runtime observers', (text) => {
     const turn = encoderTurn(3)
     const [user, answer] = projectCommittedTranscript([{ ...turn, answer: { ...turn.answer, content: { kind: 'text', text } } }])
@@ -43,7 +52,7 @@ describe('actual Android encoder-shaped transcript projection', () => {
     const reconciled = replaceCommittedTranscript(projected, [changed])
     expect(reconciled[1]?.contentKind).toBe('refusal')
     expect(reconciled[1]?.answerStage?.priorVersions).toEqual([])
-    expect(reconciled[1]?.answerStage?.sources).toBeUndefined()
+    expect(reconciled[1]?.answerStage?.sources).toEqual([])
     expect(reconciled[1]?.answerStage?.stages).toEqual([{ stage: 'instant', status: 'completed' }])
   })
   it('leaves desktop decimal message identities unchanged', () => {

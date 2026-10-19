@@ -14,6 +14,10 @@ export async function prepareVoiceCues(): Promise<CueAssetPaths> {
     throw new Error('Local voice cue response is invalid')
   }
   const record = payload as Record<string, unknown>
+  if (record['native_ready'] === true) {
+    // Readiness markers only: native PCM and fallback assets never enter the WebView.
+    return { startListening: 'native:start', stopListening: 'native:stop', stopListeningShort: 'native:stop-short' }
+  }
   const startListening = parseVoiceCueUrl(record['start_listening'])
   const stopListening = parseVoiceCueUrl(record['stop_listening'])
   const stopListeningShort = parseVoiceCueUrl(record['stop_listening_short'])
@@ -35,10 +39,15 @@ function parseVoiceCueUrl(value: unknown): string {
 
 export interface CuePlayer {
   play(source: string): Promise<void | boolean>
+  playNativeCue?(cueType: CueType | 'stop_listening_short'): Promise<boolean>
 }
 
 export interface BrowserCuePlayer extends CuePlayer {
   stop(): void
+}
+
+export interface NativeCuePlayer extends BrowserCuePlayer {
+  retire(): void
 }
 
 export async function playCue(
@@ -46,6 +55,7 @@ export async function playCue(
   cueAssetPaths: CueAssetPaths,
   cuePlayer: CuePlayer = createBrowserCuePlayer(),
 ): Promise<boolean> {
+  if (cuePlayer.playNativeCue !== undefined) return cuePlayer.playNativeCue(cueType)
   const configuredSource = resolveCueSource(cueType, cueAssetPaths)
   const source = resolveCuePlaybackSource(configuredSource)
 
@@ -58,11 +68,147 @@ export async function playCueWithFallback(
   fallback: CueAssetPaths,
   cuePlayer: CuePlayer = createBrowserCuePlayer(),
 ): Promise<boolean> {
+  if (cuePlayer.playNativeCue !== undefined) return cuePlayer.playNativeCue(cueType)
   try {
     return await playCue(cueType, preferred, cuePlayer)
   } catch (error) {
     if (resolveCueSource(cueType, preferred) === resolveCueSource(cueType, fallback)) throw error
     return playCue(cueType, fallback, cuePlayer)
+  }
+}
+
+/** An activation receipt is distinct from completion (and from acoustic output).
+ * Native completion retains its own update/lifetime lease after this resolves. */
+export function createNativeCuePlayer(isActive: () => boolean): NativeCuePlayer {
+  let generation = 0
+  let ticket: number | null = null
+  let retired = false
+  const admitted = (): boolean => !retired && isActive()
+  const invoke = async (command: string, args?: Record<string, unknown>): Promise<unknown> => {
+    const tauri = getTauriInternals()
+    if (tauri === null) throw new Error('Native cue runtime is unavailable')
+    return tauri.invoke(command, args)
+  }
+  const retire = async (playbackId: number): Promise<void> => {
+    await invoke('finish_cue_playback', { playbackId })
+  }
+  const stop = (): void => {
+    generation += 1
+    const previous = ticket
+    ticket = null
+    if (previous !== null) void retire(previous).catch(() => {
+      console.error('[cue] native cancellation failed')
+    })
+  }
+  return {
+    stop,
+    retire(): void {
+      retired = true
+      stop()
+    },
+    async play(): Promise<boolean> {
+      throw new Error('Native cues require a typed cue request')
+    },
+    async playNativeCue(cueType): Promise<boolean> {
+      if (!admitted()) return false
+      const revision = ++generation
+      const previous = ticket
+      ticket = null
+      if (previous !== null) await retire(previous)
+      if (revision !== generation || !admitted()) return false
+      const reserved = await invoke('reserve_cue_playback_id')
+      if (reserved === null) return false // Speech owns output; cues may not interrupt it.
+      if (typeof reserved !== 'number' || !Number.isSafeInteger(reserved) || reserved <= 0) {
+        throw new Error('Native cue admission response is invalid')
+      }
+      if (revision !== generation || !admitted()) {
+        await retire(reserved)
+        return false
+      }
+      ticket = reserved
+      try {
+        const result = await invoke('activate_voice_cue', { playbackId: reserved, cueType })
+        if (revision !== generation || !admitted()) return false
+        if (typeof result === 'object' && result !== null &&
+          (result as Record<string, unknown>)['playback_id'] === reserved &&
+          (result as Record<string, unknown>)['stage'] === 'cancelled') {
+          if (ticket === reserved) ticket = null
+          return false
+        }
+        if (typeof result !== 'object' || result === null ||
+          (result as Record<string, unknown>)['playback_id'] !== reserved ||
+          (result as Record<string, unknown>)['stage'] !== 'activated') {
+          throw new Error('Native cue activation response is invalid')
+        }
+        return true
+      } catch {
+        await retire(reserved)
+        if (revision !== generation) return false
+        if (ticket === reserved) ticket = null
+        throw new Error('Native cue activation failed')
+      }
+    },
+  }
+}
+
+/** One in-flight lifecycle IPC and one coalesced desired state, including remounts. */
+export function createNativeAudioLifecycle(): {
+  createCuePlayer(): NativeCuePlayer
+  setActive(active: boolean): void
+} {
+  let desired = false
+  let ready = false
+  let revision = 0
+  let running = false
+  let closePending = false
+  let closing = false
+  let player: NativeCuePlayer | null = null
+  return {
+    createCuePlayer(): NativeCuePlayer {
+      player?.retire()
+      player = createNativeCuePlayer(() => desired && ready)
+      return player
+    },
+    setActive(active): void {
+      desired = active
+      revision += 1
+      // Synchronous admission closure and generation retirement precede any IPC.
+      // Showing again never replays a hidden request, even if native close lags.
+      if (!active) {
+        ready = false
+        player?.stop()
+        if (!closing) closePending = true
+      }
+      if (running) return
+      running = true
+      void (async () => {
+        let applied = -1
+        try {
+          while (applied !== revision || closePending) {
+            applied = revision
+            const requested = closePending ? false : desired
+            closePending = false
+            closing = !requested
+            try {
+              const tauri = getTauriInternals()
+              if (tauri === null) throw new Error('Native audio runtime is unavailable')
+              await tauri.invoke('set_native_audio_active', { active: requested })
+              if (applied === revision && requested === desired && !closePending) ready = requested
+            } catch {
+              ready = false
+              console.error('[cue] native audio lifecycle transition failed')
+            } finally {
+              closing = false
+            }
+            // A hide is a durable retirement boundary, not a latest-state hint.
+            // Resume only after that close was acknowledged, even after rapid show.
+            if (requested !== desired) applied = -1
+          }
+        } finally {
+          running = false
+        }
+      })()
+    },
   }
 }
 
@@ -91,16 +237,9 @@ export function createBrowserCuePlayer(): BrowserCuePlayer {
 
       element.onerror = () => {
         console.error('[cue] audio element reported an error', {
-          source,
-          currentSrc: element.currentSrc,
           networkState: element.networkState,
           readyState: element.readyState,
-          error: element.error
-            ? {
-                code: element.error.code,
-                message: element.error.message,
-              }
-            : null,
+          code: element.error?.code ?? null,
         })
       }
 
@@ -109,19 +248,15 @@ export function createBrowserCuePlayer(): BrowserCuePlayer {
       if (playback !== undefined) {
         try {
           await playback
-        } catch (error) {
+        } catch {
           if (activeAudio !== element) return false
-          const message = error instanceof Error ? error.message : String(error)
 
           console.error('[cue] audio playback failed', {
-            source,
-            currentSrc: element.currentSrc,
             networkState: element.networkState,
             readyState: element.readyState,
-            error,
           })
 
-          throw new Error(`Audio playback failed for source ${source}: ${message}`)
+          throw new Error('Audio playback failed')
         }
       }
       return true

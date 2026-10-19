@@ -14,6 +14,9 @@ export interface AndroidVoiceStatus extends SpeechSelection {
   readonly ttsPhase: string
   readonly error: string | null
   readonly shortcutPhase: string | null
+  /** Native lifecycle authority, not inferred from WebView document visibility. */
+  readonly inputForeground?: boolean
+  readonly retainedSubmissionId?: string | null
   readonly recognitionRoute?: string | null
   readonly ttsRoute?: string | null
   readonly localOnlyRecognitionAvailable?: boolean
@@ -72,8 +75,14 @@ function text(value: unknown, bytes: number, empty = true): string {
 export function parseAndroidVoiceStatus(value: unknown): AndroidVoiceStatus {
   if (!isRecord(value) || value['kind'] !== 'voice_status' || typeof value['available'] !== 'boolean' || typeof value['ttsEnabled'] !== 'boolean' || typeof value['ttsAvailable'] !== 'boolean' || !['dictation', 'loop', 'shortcut', 'ask'].includes(value['mode'] as string)) throw new Error('Native voice status is invalid')
   if (value['readyForSpeech'] !== undefined && typeof value['readyForSpeech'] !== 'boolean') throw new Error('Native voice status is invalid')
+  if (value['inputForeground'] !== undefined && typeof value['inputForeground'] !== 'boolean') throw new Error('Native input lifecycle is invalid')
+  const retainedSubmissionId = value['retainedSubmissionId'] === undefined || value['retainedSubmissionId'] === null
+    ? value['retainedSubmissionId'] : text(value['retainedSubmissionId'], 128, false)
+  if (retainedSubmissionId !== undefined && retainedSubmissionId !== null && value['inputForeground'] !== false) throw new Error('Native retained submission requires retired input capture')
   if (value['localOnlyRecognitionAvailable'] !== undefined && typeof value['localOnlyRecognitionAvailable'] !== 'boolean') throw new Error('Native speech fallback capability is invalid')
   return { available: value['available'], reason: text(value['reason'], 512), mode: value['mode'] as AndroidVoiceStatus['mode'],
+    ...(value['inputForeground'] === undefined ? {} : { inputForeground: value['inputForeground'] }),
+    ...(retainedSubmissionId === undefined ? {} : { retainedSubmissionId }),
     speechLanguage: parseSpeechSelectionString(value, 'speechLanguage'), speechTtsProvider: parseSpeechSelectionString(value, 'speechTtsProvider'), speechTtsVoice: parseSpeechSelectionString(value, 'speechTtsVoice'),
     speechOptions: parseSpeechOptions(value['speechOptions']),
     localOnlyRecognitionAvailable: value['localOnlyRecognitionAvailable'] === true,
@@ -162,4 +171,3 @@ export async function openSpeechServicesStore(): Promise<void> {
     }
   }
 }
-

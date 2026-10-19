@@ -1,7 +1,7 @@
 import type { CustomDirectTimings } from '../types/chat'
 import { invokeTauriCommand, isAndroidRuntime } from './tauri'
 
-type StartupStage = 'SHELL_DOM_COMMITTED' | 'INITIAL_SNAPSHOT_REQUESTED' | 'INITIAL_SNAPSHOT_RECEIVED' | 'INITIAL_SNAPSHOT_APPLIED' | 'INITIAL_SEARCH_MODE_REQUESTED' | 'INITIAL_SEARCH_MODE_ACK' | 'STATE_READY'
+type StartupStage = 'SHELL_DOM_COMMITTED' | 'INITIAL_SNAPSHOT_REQUESTED' | 'INITIAL_SNAPSHOT_RECEIVED' | 'INITIAL_SNAPSHOT_APPLIED' | 'STATE_READY'
 type RequestStage = 'ADMITTED' | 'IPC_DISPATCH' | 'FIRST_NONBLANK_RECEIVED' | 'FIRST_TEXT_DOM_COMMITTED' | 'INLINE_SNAPSHOT_ACCEPTED' | 'TERMINAL_SNAPSHOT_RPC_REQUESTED' | 'SETTLED'
 
 export function frontendTimingEnabled(): boolean {
@@ -12,6 +12,31 @@ function reportNativeStage(stage: 'frontend_ready' | 'first_response_dom'): void
   if (!isAndroidRuntime) return
   // Native reports bridge arrival, not WebView commit time or painted pixels.
   void invokeTauriCommand('report_startup_stage', { stage }).catch(() => undefined)
+}
+
+type VoiceEntryStage = 'entry_frontend_ready' | 'entry_frontend_claimed' | 'entry_frontend_invalidated' |
+  'entry_frontend_busy' | 'entry_frontend_unavailable' | 'entry_draft_requested' | 'entry_draft_admitted' |
+  'entry_draft_rejected' | 'entry_channel_unavailable' | 'entry_dispatched' | 'entry_resolved' |
+  'entry_native_rejected' | 'entry_event_invalid'
+
+/** Fixed control-boundary categories only; native opt-in and its bounded journal own persistence. */
+export function reportVoiceEntryStage(stage: VoiceEntryStage): void {
+  if (!isAndroidRuntime) return
+  try { void invokeTauriCommand('report_startup_stage', { stage }).catch(() => undefined) }
+  catch { /* Optional diagnostics cannot change entry admission. */ }
+}
+
+type AppBenchmarkStage = 'benchmark_lifetime_retire' | 'benchmark_controls_retire' |
+  'benchmark_capability_retire' | 'benchmark_audio_error' | 'benchmark_cue_error'
+
+/** Compiled out of ordinary frontend builds; fixed categories, no payloads. */
+export function reportAppBenchmarkStage(stage: AppBenchmarkStage): void {
+  if (import.meta.env.VITE_VOXGOLEM_BENCHMARK !== '1') return
+  try {
+    void invokeTauriCommand('record_frontend_runtime_diagnostic', {
+      event: { kind: 'audio', detail: stage },
+    }).catch(() => undefined)
+  } catch { /* Benchmark evidence cannot retire the operation. */ }
 }
 
 function emit(metadata: Record<string, string | number>): void {

@@ -40,6 +40,37 @@ afterEach(() => {
 })
 
 describe('app snapshot contract', () => {
+  it('retains canonical observed sources and counts their UTF-8 bytes', () => {
+    const wire = validSnapshot()
+    const turn = (wire['transcript'] as Record<string, unknown>[])[0]!
+    turn['answer'] = { id: '2', role: 'assistant', content: { kind: 'text', text: 'Synthetic sourced answer' } }
+    const sources = [{ url: 'https://example.test/document', title: 'Synthetic observed document' }]
+    turn['sources'] = sources
+    const parsed = parseAppSnapshot(wire)
+    expect(parsed.transcript[0]?.sources).toEqual(sources)
+    sources[0]!.title = 'Synthetic later mutation'
+    expect(parsed.transcript[0]?.sources[0]?.title).toBe('Synthetic observed document')
+    ;(turn['answer'] as { content: { text: string } }).content.text = 'x'.repeat(256 * 1024 - 'question'.length)
+    expect(() => parseAppSnapshot(wire)).toThrow(/bounds|source|content/)
+  })
+
+  it('rejects malformed, duplicate and refusal source metadata', () => {
+    for (const sources of [null, Array(1), [{ url: 'https://example.test/a', title: '' }],
+      [{ url: 'https://synthetic-user@example.test/a', title: 'Synthetic source' }],
+      Array.from({ length: 33 }, (_, i) => ({ url: `https://example.test/${i}`, title: 'Synthetic source' })),
+      [{ url: 'https://example.test/a', title: 'Synthetic first' }, { url: 'https://example.test/a', title: 'Synthetic duplicate' }],
+    ]) {
+      const wire = validSnapshot()
+      const turn = (wire['transcript'] as Record<string, unknown>[])[0]!
+      turn['answer'] = { id: '2', role: 'assistant', content: { kind: 'text', text: 'Synthetic answer' } }
+      turn['sources'] = sources
+      expect(() => parseAppSnapshot(wire)).toThrow(/sources/)
+    }
+    const refusal = validSnapshot()
+    ;(refusal['transcript'] as Record<string, unknown>[])[0]!['sources'] = [{ url: 'https://example.test/a', title: 'Synthetic source' }]
+    expect(() => parseAppSnapshot(refusal)).toThrow(/refusal.*sources/)
+  })
+
   it.each(['dark', 'slate', 'light'])('preserves the native %s theme', (theme) => {
     const wire = validSnapshot()
     ;(wire['preferences'] as Record<string, unknown>)['ui_theme'] = theme
@@ -92,6 +123,23 @@ describe('app snapshot contract', () => {
     expect(isExpectedCanonicalTurn(canonical, canonical.requestId, '0', new Set())).toBe(false)
     expect(isExpectedCanonicalTurn(canonical, canonical.requestId, '0', new Set(), true)).toBe(true)
     expect(() => parseAppSnapshot({ ...wire, session_id: id.replace(':184', ':0184') }, true)).toThrow(/session_id/)
+  })
+  it('accepts distributed identities on desktop only with a validated canonical graph projection', () => {
+    const wire = validSnapshot()
+    const id = '11111111-1111-4111-8111-111111111111:3'
+    wire['session_id'] = id
+    wire['active_request'] = null
+    const turn = (wire['transcript'] as Record<string, unknown>[])[0]!
+    turn['execution_id'] = { session_id: id, generation: id }
+    ;(turn['user'] as Record<string, unknown>)['id'] = id
+    ;(turn['answer'] as Record<string, unknown>)['id'] = id
+    expect(() => parseAppSnapshot(wire, false)).toThrow(/decimal/)
+    wire['assistant'] = { revision: '1', conversations: [{ id, title: 'Synthetic desktop conversation' }],
+      selected_head: id, branch_choices: [], draft: '', interrupted: false, error: null }
+    expect(parseAppSnapshot(wire, false).assistant?.selectedHead).toBe(id)
+    expect(parseAppSnapshot(wire, false).transcript[0]?.answer.id).toBe(id)
+    wire['assistant'] = { interrupted: false }
+    expect(() => parseAppSnapshot(wire, false)).toThrow(/assistant/)
   })
   it.each(['custom-sol-high', 'custom-sol-none', 'custom-luna-none', 'custom-luna-low'] as const)(
     'accepts the current Custom Instant selection %s in canonical preferences',

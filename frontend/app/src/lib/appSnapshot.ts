@@ -4,6 +4,8 @@ import { invokeTauriCommand, isAndroidRuntime } from './tauri'
 import { isRecord, parseRuntimePhase, utf8ByteLength } from './wire'
 import type { BackendRuntimePhase, ResponseProfile, UiTextSize, UiTheme } from '../types/chat'
 import { INSTANT_CHOICES as instantChoices, AGENT_CHOICES as agentChoices } from './modelCatalog'
+import { parseSourceLinks, sourceBytes } from './answerSources'
+import type { SourceLink } from './answerSources'
 
 const U64_MAX = 18_446_744_073_709_551_615n
 const CAPABILITY_ID_MAX_BYTES = 64
@@ -39,6 +41,7 @@ export interface Turn {
   readonly user: Message & { readonly role: 'user' }
   readonly answer: Message & { readonly role: 'assistant' }
   readonly finalStage: Stage
+  readonly sources: readonly SourceLink[]
 }
 
 export interface ActiveRequestSummary {
@@ -85,10 +88,10 @@ export interface AppSnapshot {
   readonly capabilities: readonly Capability[]
   readonly modelOptions: readonly ModelOption[]
   readonly preferences: ValidatedPreferences
-  readonly assistant?: AndroidAssistantProjection
+  readonly assistant?: AssistantProjection
 }
 
-export interface AndroidAssistantProjection {
+export interface AssistantProjection {
   readonly revision: string
   readonly conversations: readonly { readonly id: string; readonly title: string }[]
   readonly conversationCount: number
@@ -101,6 +104,7 @@ export interface AndroidAssistantProjection {
   readonly interrupted: boolean
   readonly error: string | null
 }
+export type AndroidAssistantProjection = AssistantProjection
 
 export function parseAppSnapshot(payload: unknown, android = isAndroidRuntime): AppSnapshot {
   if (!isRecord(payload)) throw new Error('App snapshot must be an object')
@@ -112,19 +116,21 @@ export function parseAppSnapshot(payload: unknown, android = isAndroidRuntime): 
   rejectDuplicateIds(capabilities, 'capability')
   const modelOptions = Array.from(payload['model_options'], parseModelOption)
   rejectDuplicateIds(modelOptions, 'model option')
-  const transcript = Array.from(payload['transcript'], (turn) => parseCanonicalTurn(turn, android))
+  const assistant = payload['assistant'] === undefined ? undefined : parseAssistantProjection(payload['assistant'])
+  const distributedIds = android || assistant !== undefined
+  const transcript = Array.from(payload['transcript'], (turn) => parseCanonicalTurn(turn, distributedIds))
   if (transcript.length > COMMITTED_TURN_MAX_COUNT || transcriptTextBytes(transcript) > COMMITTED_TEXT_MAX_BYTES) {
     throw new Error('App snapshot transcript exceeds canonical history bounds')
   }
   return {
-    sessionId: parseWireId(payload['session_id'], 'session_id', android),
+    sessionId: parseWireId(payload['session_id'], 'session_id', distributedIds),
     runtimePhase: parseRuntimePhase(payload['runtime_phase'], 'runtime_phase'),
     transcript,
-    activeRequest: payload['active_request'] === null ? null : parseActiveRequest(payload['active_request'], android),
+    activeRequest: payload['active_request'] === null ? null : parseActiveRequest(payload['active_request'], distributedIds),
     capabilities,
     modelOptions,
     preferences: parsePreferences(payload['preferences']),
-    ...(android && payload['assistant'] !== undefined ? { assistant: parseAndroidAssistant(payload['assistant']) } : {}),
+    ...(assistant === undefined ? {} : { assistant }),
   }
 }
 
@@ -190,21 +196,24 @@ export function parseCanonicalTurn(value: unknown, android = false): Turn {
   if (!isRecord(value) || typeof value['request_id'] !== 'string' || value['request_id'].length === 0 || utf8ByteLength(value['request_id']) > REQUEST_ID_MAX_BYTES) throw new Error('turn must include a bounded request_id')
   const user = parseMessage(value['user'], android)
   const answer = parseMessage(value['answer'], android)
+  const sources = 'sources' in value ? parseSourceLinks(value['sources']) : []
   if (user.role !== 'user') throw new Error('turn must include the user role')
   if (answer.role !== 'assistant') throw new Error('turn must include the assistant role')
   if (user.content.kind !== 'text' || user.content.text.trim().length === 0 || utf8ByteLength(user.content.text) > PROMPT_MAX_BYTES) throw new Error('turn user content must be a bounded prompt')
-  if (utf8ByteLength(user.content.text) + utf8ByteLength(answer.content.text) > COMMITTED_TEXT_MAX_BYTES) throw new Error('turn content exceeds canonical history bounds')
+  if (answer.content.kind === 'refusal' && sources.length > 0) throw new Error('Canonical refusal must not include sources')
+  if (utf8ByteLength(user.content.text) + utf8ByteLength(answer.content.text) + sourceBytes(sources) > COMMITTED_TEXT_MAX_BYTES) throw new Error('turn content exceeds canonical history bounds')
   return {
     requestId: value['request_id'],
     executionId: parseExecutionId(value['execution_id'], android),
     user: user as Turn['user'],
     answer: answer as Turn['answer'],
     finalStage: parseStage(value['final_stage']),
+    sources,
   }
 }
 
 function transcriptTextBytes(transcript: readonly Turn[]): number {
-  return transcript.reduce((total, turn) => total + utf8ByteLength(turn.user.content.text) + utf8ByteLength(turn.answer.content.text), 0)
+  return transcript.reduce((total, turn) => total + utf8ByteLength(turn.user.content.text) + utf8ByteLength(turn.answer.content.text) + sourceBytes(turn.sources), 0)
 }
 
 function parseActiveRequest(value: unknown, android = false): ActiveRequestSummary {
@@ -214,22 +223,22 @@ function parseActiveRequest(value: unknown, android = false): ActiveRequestSumma
   return { executionId: parseExecutionId(value['execution_id'], android), requestId: value['request_id'], prompt: value['prompt'] }
 }
 
-function parseAndroidAssistant(value: unknown): AndroidAssistantProjection {
-  if (!isRecord(value) || !Array.isArray(value['conversations']) || value['conversations'].length > 128 || !Array.isArray(value['branch_choices']) || value['branch_choices'].length > 128 || typeof value['interrupted'] !== 'boolean') throw new Error('Android assistant projection is invalid')
+function parseAssistantProjection(value: unknown): AssistantProjection {
+  if (!isRecord(value) || !Array.isArray(value['conversations']) || value['conversations'].length > 128 || !Array.isArray(value['branch_choices']) || value['branch_choices'].length > 128 || typeof value['interrupted'] !== 'boolean') throw new Error('Canonical assistant projection is invalid')
   const conversations = Array.from(value['conversations'], (item: unknown) => {
-    if (!isRecord(item)) throw new Error('Android conversation is invalid')
+    if (!isRecord(item)) throw new Error('Canonical conversation is invalid')
     return { id: parseWireId(item['id'], 'conversation.id', true), title: parseBoundedString(item['title'], 256, 'conversation.title') }
   })
   rejectDuplicateIds(conversations, 'conversation')
   const branches = Array.from(value['branch_choices'], (id: unknown) => parseWireId(id, 'branch choice', true))
-  if (new Set(branches).size !== branches.length) throw new Error('Android branch choices contain duplicate IDs')
+  if (new Set(branches).size !== branches.length) throw new Error('Canonical branch choices contain duplicate IDs')
   const count = value['conversation_count'] ?? conversations.length
-  if (!Number.isSafeInteger(count) || (count as number) < conversations.length || (count as number) > 16_384) throw new Error('Android conversation count is invalid')
+  if (!Number.isSafeInteger(count) || (count as number) < conversations.length || (count as number) > 16_384) throw new Error('Canonical conversation count is invalid')
   const offset = value['conversation_offset'] ?? conversations.length
-  if (!Number.isSafeInteger(offset) || (offset as number) < 0 || (offset as number) > (count as number)) throw new Error('Android conversation offset is invalid')
+  if (!Number.isSafeInteger(offset) || (offset as number) < 0 || (offset as number) > (count as number)) throw new Error('Canonical conversation offset is invalid')
   const branchCount = value['branch_count'] ?? branches.length
   const branchOffset = value['branch_offset'] ?? branches.length
-  if (!Number.isSafeInteger(branchCount) || (branchCount as number) < branches.length || (branchCount as number) > 16_384 || !Number.isSafeInteger(branchOffset) || (branchOffset as number) < 0 || (branchOffset as number) > (branchCount as number)) throw new Error('Android continuation count is invalid')
+  if (!Number.isSafeInteger(branchCount) || (branchCount as number) < branches.length || (branchCount as number) > 16_384 || !Number.isSafeInteger(branchOffset) || (branchOffset as number) < 0 || (branchOffset as number) > (branchCount as number)) throw new Error('Canonical continuation count is invalid')
   return {
     revision: parseWireId(value['revision'], 'assistant.revision'), conversations, conversationCount: count as number, conversationOffset: offset as number,
     selectedHead: value['selected_head'] === null ? null : parseWireId(value['selected_head'], 'selected_head', true),

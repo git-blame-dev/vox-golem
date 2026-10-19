@@ -2,6 +2,12 @@ import { getTauriInternals } from './tauri'
 
 const MAX_PENDING_FRAMES = 32
 
+declare global {
+  interface Window {
+    __VOXGOLEM_APP_BENCH_AUDIO__?: () => Record<string, number>
+  }
+}
+
 export interface LiveAudioSource {
   stop(): void
 }
@@ -43,6 +49,19 @@ export async function startLiveAudioSource(
   let firstFrameReported = false
   let deliveringFrames = false
   let pendingFrames: number[][] = []
+  const benchmark = import.meta.env.VITE_VOXGOLEM_BENCHMARK === '1'
+    ? { calls: 0, completed: 0, rejected: 0, maxMs: 0, totalMs: 0, started: null as number | null, pendingMax: 0,
+      received: 0, previousArrival: null as number | null, maxArrivalGap: 0, burstArrivals: 0 }
+    : null
+  if (import.meta.env.VITE_VOXGOLEM_BENCHMARK === '1' && benchmark !== null) window.__VOXGOLEM_APP_BENCH_AUDIO__ = () => ({
+    calls: benchmark.calls, completed: benchmark.completed, rejected: benchmark.rejected,
+    max_frame_callback_ms: benchmark.maxMs, pending_max: benchmark.pendingMax,
+    total_frame_callback_ms: benchmark.totalMs,
+    mean_frame_callback_ms: benchmark.completed === 0 ? 0 : benchmark.totalMs / benchmark.completed,
+    received_frames: benchmark.received, max_frame_arrival_gap_ms: benchmark.maxArrivalGap,
+    burst_arrivals_under_5ms: benchmark.burstArrivals,
+    current_frame_callback_ms: benchmark.started === null ? 0 : performance.now() - benchmark.started,
+  })
   let abortListener: (() => void) | undefined
   const listeners: { frame?: () => void; terminal?: () => void } = {}
 
@@ -72,7 +91,20 @@ export async function startLiveAudioSource(
       while (!stopped) {
         const frame = pendingFrames.shift()
         if (frame === undefined) return
-        await options.onFrame(frame)
+        if (import.meta.env.VITE_VOXGOLEM_BENCHMARK === '1' && benchmark !== null) { benchmark.calls += 1; benchmark.started = performance.now() }
+        try {
+          await options.onFrame(frame)
+        } catch (error) {
+          if (import.meta.env.VITE_VOXGOLEM_BENCHMARK === '1' && benchmark !== null) benchmark.rejected += 1
+          throw error
+        } finally {
+          if (import.meta.env.VITE_VOXGOLEM_BENCHMARK === '1' && benchmark !== null) {
+            const elapsed = performance.now() - benchmark.started!
+            benchmark.maxMs = Math.max(benchmark.maxMs, elapsed)
+            benchmark.totalMs += elapsed
+            benchmark.started = null; benchmark.completed += 1
+          }
+        }
       }
     } catch (error) {
       reportError(error)
@@ -91,6 +123,15 @@ export async function startLiveAudioSource(
       return
     }
     if (parsed.captureId !== captureId) return
+    if (import.meta.env.VITE_VOXGOLEM_BENCHMARK === '1' && benchmark !== null) {
+      const now = performance.now()
+      if (benchmark.previousArrival !== null) {
+        const gap = now - benchmark.previousArrival
+        benchmark.maxArrivalGap = Math.max(benchmark.maxArrivalGap, gap)
+        if (gap < 5) benchmark.burstArrivals += 1
+      }
+      benchmark.previousArrival = now; benchmark.received += 1
+    }
     if (!firstFrameReported) {
       firstFrameReported = true
       options.onStatus?.('first_frame')
@@ -100,6 +141,7 @@ export async function startLiveAudioSource(
       return
     }
     pendingFrames.push([...parsed.frame])
+    if (import.meta.env.VITE_VOXGOLEM_BENCHMARK === '1' && benchmark !== null) benchmark.pendingMax = Math.max(benchmark.pendingMax, pendingFrames.length)
     void drainFrames()
   })
   try {

@@ -21,7 +21,13 @@ describe('prompt terminal presentation and speech', () => {
     let transcript: Record<string, unknown>[] = []
     let ttsEnabled = true
     const unexpected: string[] = []
+    const audioTransitions: boolean[] = []
     const invoke = vi.fn(async (command: string, args?: unknown): Promise<unknown> => {
+      if (command === 'set_native_audio_active') {
+        expect(args).toEqual({ active: expect.any(Boolean) })
+        audioTransitions.push((args as { active: boolean }).active)
+        return null
+      }
       if (command === 'chatgpt_auth') { expect(args).toEqual({ action: 'status' }); return { phase: 'signed_out' } }
       if (command === 'get_startup_state') return readyStartupState({ voice_input_available: false, tts_enabled: true, prompt_cancellation_available: true })
       if (command === 'get_app_snapshot') return appSnapshot(transcript, { tts_enabled: ttsEnabled })
@@ -73,10 +79,13 @@ describe('prompt terminal presentation and speech', () => {
       expect(observe(window, document)).toEqual({ admitted: true, request: requestId, outcome: 'completed', stage: 'completed', kind: 'text', runtimeStatus: 'sleeping', nonblank: true })
       expect(container.querySelector('.shell')?.getAttribute('data-runtime-status')).toBe('sleeping')
       expect(invoke.mock.calls.filter(([command]) => command === 'speak_local_tts')).toHaveLength(policy === 'enabled' ? 1 : 0)
+      // TTS preference/Stop retires speech, not the shared foreground cue owner.
+      expect(audioTransitions).toEqual([true])
       expect(unexpected).toEqual([])
       expect(invoke.mock.calls.filter(([command]) => command === 'chatgpt_auth')).toEqual(policy === 'disabled' ? [['chatgpt_auth', { action: 'status' }]] : [])
     } finally {
       await act(async () => { root.unmount() }); container.remove()
+      expect(audioTransitions).toEqual([true, false])
       Reflect.deleteProperty(window, '__voxSmoke')
     }
   })

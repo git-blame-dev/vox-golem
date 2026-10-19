@@ -28,6 +28,121 @@ afterEach(() => {
 })
 
 describe('Android App lifecycle', () => {
+  it.each([false, true])('starts a pending cold Vox Ask entry once without a second tap (TTS ready: %s)', async (ttsAvailable) => {
+    vi.useFakeTimers()
+    const token = '12345678-1234-4234-8234-123456789abc'
+    let pendingLaunch = true
+    const voice = { kind: 'voice_status', available: true, reason: 'Synthetic ready speech service', mode: 'dictation', dictation: 'idle', loop: 'idle', ttsEnabled: false, ttsAvailable, ttsPhase: 'idle', error: null }
+    const invoke = vi.fn(async (command: string) => {
+      if (command === 'get_app_snapshot') return { ...appSnapshot(), assistant: { revision: '1', conversations: [], selected_head: null, branch_choices: [], draft: '', interrupted: false } }
+      if (command === 'get_startup_state') return readyStartupState()
+      if (command === 'assistant_voice_status') return voice
+      if (command === 'consume_new_voice_shortcut') {
+        const value = pendingLaunch ? token : null
+        pendingLaunch = false
+        return { token: value, error: null, mode: 'ask' }
+      }
+      if (command === 'start_assistant_voice') return { ...voice, mode: 'ask', dictation: 'listening', loop: 'listening' }
+      return null
+    })
+    window.__TAURI_INTERNALS__ = { invoke, createChannel: <T,>(send: (value: T) => void) => ({ send }) }
+    container = document.createElement('div'); document.body.append(container); root = createRoot(container)
+    await act(async () => { root?.render(<App />) })
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+    expect(invoke.mock.calls.filter(([command]) => command === 'start_assistant_voice')).toHaveLength(1)
+    expect(invoke).toHaveBeenCalledWith('start_assistant_voice', expect.objectContaining({ completionPolicy: 'single_turn', loopMode: false, launchToken: token }))
+    expect(invoke.mock.calls.filter(([command]) => command === 'report_startup_stage').map((call) => (call as unknown as [string, { stage: string }])[1].stage)).toEqual(expect.arrayContaining([
+      'entry_frontend_ready', 'entry_frontend_claimed', 'entry_draft_requested', 'entry_draft_admitted', 'entry_dispatched', 'entry_resolved',
+    ]))
+  })
+
+  it.each(['same', 'conversation', 'head', 'background'] as const)('revalidates a claimed Vox Ask across passive snapshot refresh: %s', async (outcome) => {
+    vi.useFakeTimers()
+    const token = '23456789-2345-4345-8345-23456789abcd'
+    let launch = false
+    let holdSnapshot = false
+    let selected = '1'
+    let selectedHead: string | null = null
+    let completeConsume: (value: unknown) => void = () => undefined
+    let completeSnapshot: () => void = () => undefined
+    const voice = { kind: 'voice_status', available: true, reason: 'Synthetic ready speech', mode: 'dictation', dictation: 'idle', loop: 'idle', ttsEnabled: false, ttsAvailable: false, ttsPhase: 'idle', error: null }
+    const snapshot = () => ({ ...appSnapshot(selectedHead === null ? [] : [canonicalTurn('2', '3', 'Synthetic imported question', 'Synthetic imported answer', 'synthetic-import')]), session_id: selected, assistant: { revision: '1', conversations: [], selected_head: selectedHead, branch_choices: [], draft: '', interrupted: false } })
+    const invoke = vi.fn(async (command: string) => {
+      if (command === 'get_app_snapshot') return holdSnapshot ? new Promise((resolve) => { completeSnapshot = () => { holdSnapshot = false; resolve(snapshot()) } }) : snapshot()
+      if (command === 'get_startup_state') return readyStartupState()
+      if (command === 'assistant_voice_status') return voice
+      if (command === 'consume_new_voice_shortcut') {
+        if (!launch) return { token: null, error: null }
+        launch = false
+        return new Promise((resolve) => { completeConsume = resolve })
+      }
+      if (command === 'start_assistant_voice') return { ...voice, mode: 'ask', dictation: 'listening', loop: 'listening' }
+      return null
+    })
+    window.__TAURI_INTERNALS__ = { invoke, createChannel: <T,>(send: (value: T) => void) => ({ send }) }
+    container = document.createElement('div'); document.body.append(container); root = createRoot(container)
+    await act(async () => { root?.render(<App />) })
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+    launch = true
+    await act(async () => { window.dispatchEvent(new Event('voxgolem-new-voice-chat')); await vi.advanceTimersByTimeAsync(1) })
+    holdSnapshot = true
+    await act(async () => { window.dispatchEvent(new Event('focus')) })
+    await act(async () => { completeConsume({ token, error: null, mode: 'ask' }) })
+    expect(invoke.mock.calls.some(([command]) => command === 'start_assistant_voice')).toBe(false)
+    expect(invoke.mock.calls.some(([command]) => command === 'release_new_voice_shortcut')).toBe(false)
+    if (outcome === 'conversation') selected = '2'
+    if (outcome === 'head') selectedHead = '3'
+    if (outcome === 'background') await act(async () => { vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden'); document.dispatchEvent(new Event('visibilitychange')) })
+    await act(async () => { completeSnapshot(); await vi.advanceTimersByTimeAsync(1) })
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+    expect(invoke.mock.calls.filter(([command]) => command === 'start_assistant_voice')).toHaveLength(outcome === 'same' ? 1 : 0)
+    expect(invoke.mock.calls.some(([command]) => command === 'release_new_voice_shortcut')).toBe(outcome !== 'same')
+  })
+
+  it.each([
+    ['hidden-first', 'locked'], ['native-first', 'locked'], ['hidden-first', 'background'], ['native-first', 'background'], ['hidden-first', 'other-retained'], ['native-first', 'other-retained'],
+  ] as const)('uses native admission retention after a final utterance (%s, %s)', async (order, disposition) => {
+    vi.useFakeTimers()
+    const token = '34567890-3456-4456-8456-34567890abcd'
+    const requestId = 'voice-synthetic-retained'
+    let launch = false
+    let holdSnapshot = false
+    let completeSnapshot: () => void = () => undefined
+    let input: (value: unknown) => void = () => undefined
+    let sessionId = ''
+    const voice = { kind: 'voice_status', available: true, reason: 'Synthetic ready speech', mode: 'dictation', dictation: 'idle', loop: 'idle', ttsEnabled: false, ttsAvailable: false, ttsPhase: 'idle', error: null, inputForeground: true, retainedSubmissionId: null }
+    const snapshot = () => ({ ...appSnapshot(), assistant: { revision: '1', conversations: [], selected_head: null, branch_choices: [], draft: '', interrupted: false } })
+    const invoke = vi.fn(async (command: string, args?: unknown) => {
+      if (command === 'get_app_snapshot') return holdSnapshot ? new Promise((resolve) => { completeSnapshot = () => { holdSnapshot = false; resolve(snapshot()) } }) : snapshot()
+      if (command === 'get_startup_state') return readyStartupState()
+      if (command === 'assistant_voice_status') return voice
+      if (command === 'consume_new_voice_shortcut') { const value = launch ? token : null; launch = false; return { token: value, error: null, mode: 'ask' } }
+      if (command === 'start_assistant_voice') { sessionId = (args as { sessionId: string }).sessionId; return { ...voice, mode: 'ask', dictation: 'listening', loop: 'listening' } }
+      if (command === 'submit_prompt') return { kind: 'cancelled' }
+      return null
+    })
+    window.__TAURI_INTERNALS__ = { invoke, createChannel: <T,>(handler: (value: T) => void) => { input = handler as (value: unknown) => void; return {} } }
+    container = document.createElement('div'); document.body.append(container); root = createRoot(container)
+    await act(async () => { root?.render(<App />) })
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+    launch = true
+    await act(async () => { window.dispatchEvent(new Event('voxgolem-new-voice-chat')); await vi.advanceTimersByTimeAsync(1) })
+    holdSnapshot = true
+    await act(async () => { window.dispatchEvent(new Event('focus')) })
+    await act(async () => {
+      input({ sessionId, kind: 'dictation', phase: 'final', draft: 'Synthetic authorized final', utterance: '1', error: null })
+      input({ sessionId, kind: 'submit', requestId, text: 'Synthetic authorized final', context: { sessionId: '1', selectedHead: null } })
+    })
+    const hide = (): void => { vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden'); document.dispatchEvent(new Event('visibilitychange')) }
+    const nativePause = (): void => { input({ ...voice, sessionId, mode: 'ask', dictation: 'final', loop: 'paused', inputForeground: false, retainedSubmissionId: disposition === 'locked' ? requestId : disposition === 'other-retained' ? 'voice-synthetic-other' : null }) }
+    await act(async () => { if (order === 'hidden-first') { hide(); nativePause() } else { nativePause(); hide() } })
+    if (disposition !== 'background') expect(invoke.mock.calls.some(([command]) => command === 'stop_assistant_voice')).toBe(false)
+    await act(async () => { completeSnapshot() })
+    expect(invoke.mock.calls.filter(([command]) => command === 'submit_prompt')).toHaveLength(disposition === 'locked' ? 1 : 0)
+    await act(async () => { input({ sessionId, kind: 'submit', requestId, text: 'Synthetic duplicate', context: { sessionId: '1', selectedHead: null } }) })
+    expect(invoke.mock.calls.filter(([command]) => command === 'submit_prompt')).toHaveLength(disposition === 'locked' ? 1 : 0)
+  })
+
   it('allows explicit draft-only dictation without a model while Ask cannot start generation', async () => {
     let input: (value: unknown) => void = () => undefined
     let sessionId = ''
@@ -55,6 +170,8 @@ describe('Android App lifecycle', () => {
     expect(dictate.disabled).toBe(false)
     await act(async () => { dictate.click() })
     expect(invoke).toHaveBeenCalledWith('start_assistant_voice', expect.objectContaining({ loopMode: false, completionPolicy: 'manual' }))
+    expect(invoke.mock.calls.some(([command]) => command === 'set_search_mode' || command === 'get_search_mode')).toBe(false)
+    expect(invoke.mock.calls.find(([command]) => command === 'start_assistant_voice')?.[1]).not.toHaveProperty('searchMode')
     expect(container.querySelector('[aria-label="Finish dictation"]')).not.toBeNull()
     await act(async () => { input({ sessionId, kind: 'dictation', phase: 'final', draft: 'Synthetic manually dictated draft' }); input({ ...voice, sessionId, dictation: 'final' }) })
     expect(container.querySelector<HTMLTextAreaElement>('#promptComposer')?.value).toBe('Synthetic manually dictated draft')
@@ -88,6 +205,8 @@ describe('Android App lifecycle', () => {
     launch = true
     await act(async () => { window.dispatchEvent(new Event('voxgolem-new-voice-chat')); await vi.advanceTimersByTimeAsync(0) })
     expect(invoke).toHaveBeenCalledWith('start_assistant_voice', expect.objectContaining({ loopMode: true }))
+    expect(invoke.mock.calls.some(([command]) => command === 'set_search_mode' || command === 'get_search_mode')).toBe(false)
+    expect(invoke.mock.calls.find(([command]) => command === 'start_assistant_voice')?.[1]).not.toHaveProperty('searchMode')
     await act(async () => { input({ sessionId, kind: 'dictation', phase: 'final', draft: 'Synthetic authoritative loop final' }); input({ ...voice, sessionId, dictation: 'final', loop: 'generating' }) })
     expect(container.querySelector<HTMLButtonElement>('button[type="submit"]')!.disabled).toBe(true)
     await act(async () => { input({ sessionId, kind: 'submit', requestId: 'synthetic-native-loop-request', text: 'Synthetic authoritative loop final' }); input({ sessionId, kind: 'submit', requestId: 'synthetic-native-loop-request', text: 'Synthetic duplicate' }) })

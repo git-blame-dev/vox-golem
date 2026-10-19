@@ -12,18 +12,19 @@ afterEach(() => { act(() => root?.unmount()); container?.remove(); delete window
 const capabilities = ['custom_provider', 'opencode', 'local_fast', 'local_quality', 'qwen_prediction', 'wake_word', 'vad', 'parakeet', 'tts', 'deep', 'review']
   .map((id) => ({ id, state: 'available', reason: 'Synthetic capability', actual_provider: null }))
 
-function fixture(deepEnabled = false, writeMode?: (mode: string) => Promise<void>, webEnabled = true, writeSettings?: () => Promise<void>) {
+function fixture(deepEnabled = false, webEnabled = true, writeSettings?: () => Promise<void>) {
   const settings = { instant: 'custom-sol-high', deep: 'opencode-sol-high', review: 'custom-sol-high', deep_enabled: deepEnabled, review_enabled: false, prefetch: false, completion: false, web_enabled: webEnabled, speech_network_fallback: false, speech_language: 'en-AU', speech_tts_provider: 'synthetic.tts.engine', speech_tts_voice: 'synthetic-installed-voice' }
   const snapshot = () => ({
     session_id: '1', runtime_phase: 'sleeping', transcript: [], active_request: null, capabilities,
     model_options: ['custom-sol-high', 'custom-sol-none', 'custom-luna-none', 'custom-luna-low', 'opencode-sol-high', 'local-fast'].map((id) => ({ id, label: id, available: true, unavailable_reason: null })),
     preferences: { ...settings, response_profile: 'fast', tts_enabled: false, ui_theme: 'dark', ui_text_size: 'medium' },
   })
-  const requests: Array<{ requestId: string; searchMode: string; updates: { send: (payload: unknown) => void }; finish: () => void }> = []
-  const modeCalls: string[] = []
+  const requests: Array<{ requestId: string; prompt: string; updates: { send: (payload: unknown) => void }; finish: () => void }> = []
+  const commands: string[] = []
   window.__TAURI_INTERNALS__ = {
     createChannel: <T,>(send: (message: T) => void) => ({ send }),
     invoke: async (command, args) => {
+      commands.push(command)
       if (command === 'get_app_snapshot' || command === 'reset_session') return snapshot()
       if (command === 'get_startup_state') return {
         kind: 'ready', cue_asset_paths: { start_listening: 'synthetic-start.wav', stop_listening: 'synthetic-stop.wav' },
@@ -32,12 +33,6 @@ function fixture(deepEnabled = false, writeMode?: (mode: string) => Promise<void
       }
       if (command === 'get_assistant_settings') return settings
       if (command === 'set_assistant_settings') { await writeSettings?.(); Object.assign(settings, (args as { settings: unknown }).settings); return settings }
-      if (command === 'set_search_mode') {
-        const mode = (args as { mode: string }).mode
-        modeCalls.push(mode)
-        await writeMode?.(mode)
-        return null
-      }
       if (command === 'submit_prompt') return new Promise((resolve) => {
         const request = args as typeof requests[number]
         requests.push({ ...request, finish: () => resolve({ request_id: request.requestId, runtime_phase: 'sleeping', outcome: 'cancelled' }) })
@@ -45,7 +40,7 @@ function fixture(deepEnabled = false, writeMode?: (mode: string) => Promise<void
       return null
     },
   }
-  return { requests, modeCalls, settings }
+  return { requests, commands, settings }
 }
 
 async function render() {
@@ -64,7 +59,85 @@ async function enterPrompt(container: HTMLElement) {
   })
 }
 
-describe('admitted search mode and generation-owned presentation', () => {
+describe('Web research permission and generation-owned presentation', () => {
+  it.each(['', ' \n'])('publishes first nonblank text without waiting for a frame (prefix=%j)', async (prefix) => {
+    const frames: FrameRequestCallback[] = []
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => { frames.push(callback); return frames.length })
+    const cancelFrame = vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => undefined)
+    const { requests } = fixture()
+    const container = await render()
+    await enterPrompt(container)
+    await act(async () => { container.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })
+    if (prefix !== '') await act(async () => { requests[0]!.updates.send({ kind: 'text', text: prefix }) })
+    await act(async () => { requests[0]!.updates.send({ kind: 'text', text: 'Synthetic first text' }) })
+    expect(container.querySelector('.answer-stage__answer')?.textContent?.trim()).toBe('Synthetic first text')
+    if (prefix !== '') {
+      expect(cancelFrame).toHaveBeenCalledWith(1)
+      await act(async () => { frames[0]!(16) })
+      expect(container.querySelector('.answer-stage__answer')?.textContent?.trim()).toBe('Synthetic first text')
+    }
+    const priorFrameCount = frames.length
+    await act(async () => { requests[0]!.updates.send({ kind: 'text', text: ' plus later text' }) })
+    expect(frames).toHaveLength(priorFrameCount + 1)
+    expect(container.querySelector('.answer-stage__answer')?.textContent?.trim()).toBe('Synthetic first text')
+    await act(async () => { frames.at(-1)!(32) })
+    expect(container.querySelector('.answer-stage__answer')?.textContent?.trim()).toBe('Synthetic first text plus later text')
+    await act(async () => { requests[0]!.finish() })
+  })
+
+  it('retains cumulative sources and first titles when a later read returns only a subset', async () => {
+    const { requests } = fixture()
+    const container = await render()
+    await enterPrompt(container)
+    await act(async () => { container.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })
+    await act(async () => {
+      requests[0]!.updates.send({ kind: 'sources', sources: [
+        { url: 'https://example.test/source-a', title: 'Synthetic first title' },
+        { url: 'https://example.test/source-b', title: 'Synthetic second source' },
+      ] })
+      requests[0]!.updates.send({ kind: 'sources', sources: [
+        { url: 'https://example.test/source-a', title: 'Synthetic later title' },
+      ] })
+    })
+    const links = Array.from(container.querySelectorAll<HTMLAnchorElement>('.answer-stage__sources a'))
+    expect(links.map((link) => link.getAttribute('href'))).toEqual(['https://example.test/source-a', 'https://example.test/source-b'])
+    expect(links.map((link) => link.textContent)).toEqual(['Synthetic first title', 'Synthetic second source'])
+    await act(async () => { requests[0]!.finish() })
+  })
+
+  it('bounds cumulative sources to the native limit and ignores late sources and frames from a retired request', async () => {
+    const frames: FrameRequestCallback[] = []
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => { frames.push(callback); return frames.length })
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => undefined)
+    const { requests } = fixture()
+    const container = await render()
+    await enterPrompt(container)
+    await act(async () => { container.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })
+    const sources = Array.from({ length: 40 }, (_, index) => ({ url: `https://example.test/source-${index}`, title: `Synthetic source ${index}` }))
+    await act(async () => {
+      requests[0]!.updates.send({ kind: 'sources', sources: sources.slice(0, 24) })
+      requests[0]!.updates.send({ kind: 'sources', sources: sources.slice(16) })
+      requests[0]!.updates.send({ kind: 'text', text: 'Synthetic first text' })
+      requests[0]!.updates.send({ kind: 'text', text: ' retired frame' })
+    })
+    expect(container.querySelectorAll('.answer-stage__sources a')).toHaveLength(32)
+    expect(Array.from(container.querySelectorAll<HTMLAnchorElement>('.answer-stage__sources a')).map((link) => link.getAttribute('href'))).toEqual(sources.slice(0, 32).map((source) => source.url))
+    await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="New Chat"]')!.click() })
+    await enterPrompt(container)
+    await act(async () => { container.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })
+    await act(async () => {
+      requests[1]!.updates.send({ kind: 'text', text: 'Synthetic new answer' })
+      requests[1]!.updates.send({ kind: 'sources', sources: [{ url: 'https://example.test/new-source', title: 'Synthetic new source' }] })
+      requests[0]!.updates.send({ kind: 'text', text: 'Synthetic stale text' })
+      requests[0]!.updates.send({ kind: 'sources', sources: sources.slice(0, 1) })
+      for (const callback of frames) callback(48)
+    })
+    expect(container.textContent).not.toContain('retired frame')
+    expect(container.textContent).not.toContain('Synthetic stale text')
+    expect(Array.from(container.querySelectorAll<HTMLAnchorElement>('.answer-stage__sources a')).map((link) => link.getAttribute('href'))).toEqual(['https://example.test/new-source'])
+    await act(async () => { requests[0]!.finish(); requests[1]!.finish() })
+  })
+
   it('preserves desktop speech selection strings through ordinary model changes without advertising SDK selectors', async () => {
     window.history.replaceState(null, '')
     const { settings } = fixture()
@@ -78,7 +151,7 @@ describe('admitted search mode and generation-owned presentation', () => {
     expect(container.querySelector('[aria-label="Allow speech network fallback"]')).toBeNull()
     window.history.replaceState(null, '')
   })
-  it('persists web-off independently of search effort, preserves speech policy and admits ordinary chat without verification', async () => {
+  it('persists web-off, preserves speech policy and admits ordinary chat without verification', async () => {
     window.history.replaceState(null, '')
     const { requests, settings } = fixture()
     const container = await render()
@@ -86,6 +159,8 @@ describe('admitted search mode and generation-owned presentation', () => {
     await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
     const web = container.querySelector<HTMLInputElement>('[aria-label="Allow web access"]')!
     expect(web.checked).toBe(true)
+    expect(web.closest('label')?.textContent).toContain('Web research')
+    expect(container.querySelectorAll('[aria-label="Allow web access"]')).toHaveLength(1)
     expect(container.textContent).toContain('Exa is primary, with Parallel as fallback')
     await act(async () => { web.click() })
     expect(settings.web_enabled).toBe(false)
@@ -93,7 +168,8 @@ describe('admitted search mode and generation-owned presentation', () => {
     expect(container.textContent).toContain('answers are not web-verified')
     await enterPrompt(container)
     await act(async () => { container.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })
-    expect(requests[0]?.searchMode).toBe('quick')
+    expect(requests[0]).not.toHaveProperty('searchMode')
+    expect(requests[0]?.prompt).toBe('Synthetic search question')
     expect(web.disabled).toBe(true)
     await act(async () => { requests[0]!.finish() })
     // Reattachment uses the backend's persisted permission, not an ephemeral UI default.
@@ -108,7 +184,7 @@ describe('admitted search mode and generation-owned presentation', () => {
   it('blocks admission during a web preference write and rolls back a rejected save', async () => {
     window.history.replaceState(null, '')
     let reject: (error: Error) => void = () => undefined
-    fixture(false, undefined, true, () => new Promise((_resolve, fail) => { reject = fail }))
+    fixture(false, true, () => new Promise((_resolve, fail) => { reject = fail }))
     const container = await render()
     await enterPrompt(container)
     await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
@@ -125,38 +201,52 @@ describe('admitted search mode and generation-owned presentation', () => {
     window.history.replaceState(null, '')
   })
 
-  it('aligns the native voice loop with automatic Quick when a native UI attaches without rendering a manual mode dropdown', async () => {
+  it('admits native startup without a mode command or manual mode hints', async () => {
     vi.spyOn(tauri, 'isNativeTauriRuntime').mockReturnValue(true)
-    const { modeCalls } = fixture()
+    const { commands } = fixture()
     const container = await render()
-    expect(modeCalls).toEqual(['quick'])
+    expect(commands).not.toContain('set_search_mode')
     expect(container.querySelector('[aria-label="Search mode"]')).toBeNull()
+    expect(container.textContent).not.toMatch(/Quick|Verify|automatic Quick/)
+    await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
+    expect(container.textContent).not.toMatch(/Quick|Verify|Search effort/)
   })
 
-  it('admits automatic Quick across model changes without rendering a manual search mode selector', async () => {
-    const { requests } = fixture()
+  it('admits chat across model changes without adding a mode or substituting the selected model', async () => {
+    const { requests, settings, commands } = fixture()
     const container = await render()
     expect(container.querySelector('[aria-label="Search mode"]')).toBeNull()
     const instant = container.querySelector<HTMLSelectElement>('#composerInstantSelect')!
     await act(async () => { instant.value = 'opencode-sol-high'; instant.dispatchEvent(new Event('change', { bubbles: true })) })
     await enterPrompt(container)
     await act(async () => { container.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })
-    expect(requests[0]?.searchMode).toBe('quick')
+    expect(requests[0]).not.toHaveProperty('searchMode')
+    expect(settings.instant).toBe('opencode-sol-high')
     await act(async () => { requests[0]!.finish() })
     await act(async () => { instant.value = 'custom-sol-high'; instant.dispatchEvent(new Event('change', { bubbles: true })) })
     await enterPrompt(container)
     await act(async () => { container.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })
-    expect(requests[1]?.searchMode).toBe('quick')
+    expect(requests[1]).not.toHaveProperty('searchMode')
+    expect(settings.instant).toBe('custom-sol-high')
+    expect(commands).not.toContain('set_search_mode')
     await act(async () => { requests[1]!.finish() })
+    await act(async () => { instant.value = 'local-fast'; instant.dispatchEvent(new Event('change', { bubbles: true })) })
+    await enterPrompt(container)
+    await act(async () => { container.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })
+    expect(requests[2]?.prompt).toBe('Synthetic search question')
+    expect(requests[2]).not.toHaveProperty('searchMode')
+    expect(settings.instant).toBe('local-fast')
+    expect(settings.web_enabled).toBe(true)
+    await act(async () => { requests[2]!.finish() })
   })
 
-  it('presents automatic search status and citations, resets New Chat to Quick, and ignores stale search activity', async () => {
-    const { requests, modeCalls } = fixture()
+  it('presents search status and citations, starts New Chat without a mode write, and ignores stale search activity', async () => {
+    const { requests, commands } = fixture()
     const container = await render()
     expect(container.querySelector('[aria-label="Search mode"]')).toBeNull()
     await enterPrompt(container)
     await act(async () => { container.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })
-    expect(requests[0]?.searchMode).toBe('quick')
+    expect(requests[0]).not.toHaveProperty('searchMode')
     for (const message of ['Searching', 'Reading', 'Fallback', 'Partial']) {
       await act(async () => { requests[0]!.updates.send({ kind: 'status', message }) })
       expect(container.querySelector('.composer [role="status"].sr-only')?.textContent).toBe(message)
@@ -170,10 +260,10 @@ describe('admitted search mode and generation-owned presentation', () => {
     expect(sourceLink?.getAttribute('href')).toBe('https://example.test/source')
     expect(sourceLink?.textContent).toBe('Synthetic citation')
     await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="New Chat"]')!.click() })
-    expect(modeCalls).toEqual(['quick'])
+    expect(commands).not.toContain('set_search_mode')
     await enterPrompt(container)
     await act(async () => { container.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })
-    expect(requests[1]?.searchMode).toBe('quick')
+    expect(requests[1]).not.toHaveProperty('searchMode')
     await act(async () => {
       requests[1]!.updates.send({ kind: 'status', message: 'Reading' })
       requests[0]!.updates.send({ kind: 'status', message: 'Synthetic stale fallback' })
@@ -184,14 +274,14 @@ describe('admitted search mode and generation-owned presentation', () => {
     await act(async () => { requests[1]!.finish() })
   })
 
-  it('admits Quick when OpenCode Deep is enabled without a manual search mode selector', async () => {
-    const { requests, modeCalls } = fixture(true)
+  it('admits the selected stages when OpenCode Deep is enabled without a mode selector', async () => {
+    const { requests, commands } = fixture(true)
     const container = await render()
     expect(container.querySelector('[aria-label="Search mode"]')).toBeNull()
-    expect(modeCalls).toEqual([])
+    expect(commands).not.toContain('set_search_mode')
     await enterPrompt(container)
     await act(async () => { container.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })
-    expect(requests[0]?.searchMode).toBe('quick')
+    expect(requests[0]).not.toHaveProperty('searchMode')
     await act(async () => { requests[0]!.finish() })
   })
 })

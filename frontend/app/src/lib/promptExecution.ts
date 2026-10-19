@@ -1,12 +1,12 @@
 import { TauriCommandError, getTauriInternals, isAndroidRuntime, isBrowserPreviewRuntime, normalizeTauriError } from './tauri'
 import { parseAppSnapshot, parseCanonicalTurn } from './appSnapshot'
 import { isRecord, parseRuntimePhase, utf8ByteLength } from './wire'
+import { MAX_ANSWER_SOURCES, isSourceLink } from './answerSources'
 import type {
   PromptExecutionEvent,
   PromptExecutionResult,
 } from '../types/chat'
 import type { AnswerSource } from '../components/AnswerStage'
-import type { SearchMode } from './searchMode'
 
 export function parseAndroidPromptUpdate(payload: unknown, requestId: string): PromptExecutionEvent {
   if (!isRecord(payload) || typeof payload['kind'] !== 'string') throw new Error('Android prompt update must include kind')
@@ -68,6 +68,8 @@ export function parseAndroidPromptOutcome(payload: unknown, requestId: string): 
   }
   return { requestId, runtimePhase: 'sleeping', outcome: 'completed', errorMessage: null, canonicalOutcome: payload['kind'], canonicalTurn: turn, ...(terminalSnapshot === undefined ? {} : { terminalSnapshot }), ...(customDirectTimings === undefined ? {} : { customDirectTimings }) }
 }
+
+export const parseCanonicalPromptOutcome = parseAndroidPromptOutcome
 
 export function parseAndroidPromptOutcomeForExecution(payload: unknown, requestId: string): PromptExecutionResult {
   try { return parseAndroidPromptOutcome(payload, requestId) } catch (error) { throw normalizeTauriError(error) }
@@ -134,7 +136,7 @@ export function parsePromptExecutionEvent(payload: unknown): PromptExecutionEven
   }
   if (kind === 'sources') {
     const sources = payload['sources']
-    if (!Array.isArray(sources) || sources.length > 32 || !sources.every(isSource)) throw new Error('Sources event must include bounded URL/title pairs')
+    if (!Array.isArray(sources) || sources.length > MAX_ANSWER_SOURCES || !Array.from(sources).every(isSourceLink)) throw new Error('Sources event must include bounded URL/title pairs')
     return { requestId, kind, sources: sources as AnswerSource[] }
   }
 
@@ -202,7 +204,6 @@ export async function executePrompt(
   prompt: string,
   onEvent: (event: PromptExecutionEvent) => void,
   source: 'typed' | 'voice' = 'typed',
-  searchMode: SearchMode = 'quick',
 ): Promise<PromptExecutionResult> {
   const tauri = typeof window === 'undefined' ? null : getTauriInternals()
   if (tauri === null) throw new Error('Prompt execution requires a runtime adapter')
@@ -225,7 +226,7 @@ export async function executePrompt(
 
     let payload: unknown
     try {
-      payload = await tauri.invoke('submit_prompt', isAndroidRuntime ? { requestId, prompt, searchMode, updates } : { requestId, prompt, source, searchMode, updates })
+      payload = await tauri.invoke('submit_prompt', isAndroidRuntime ? { requestId, prompt, updates } : { requestId, prompt, source, updates })
     } catch (error) {
       if (isAndroidRuntime) throw normalizeTauriError(error)
       throw error
@@ -233,6 +234,8 @@ export async function executePrompt(
     let result: PromptExecutionResult
     if (canonicalRuntime) {
       result = parseAndroidPromptOutcomeForExecution(payload, requestId)
+    } else if (isRecord(payload) && typeof payload['kind'] === 'string' && ['completed', 'refused', 'cancelled'].includes(payload['kind'])) {
+      result = parseCanonicalPromptOutcome(payload, requestId)
     } else {
       result = parsePromptExecutionResult(payload)
     }
@@ -250,7 +253,3 @@ function isToolStatus(value: unknown): value is 'pending' | 'running' | 'complet
 }
 function isStage(value: unknown): value is 'instant' | 'deep' | 'review' { return value === 'instant' || value === 'deep' || value === 'review' }
 function isStageStatus(value: unknown): value is import('../components/AnswerStage').AnswerStageStatus { return ['queued', 'running', 'completed', 'kept', 'corrected', 'cancelled', 'failed', 'stale'].includes(value as string) }
-function isSource(value: unknown): value is AnswerSource {
-  if (!isRecord(value) || typeof value['url'] !== 'string' || typeof value['title'] !== 'string' || value['title'].trim() === '' || utf8ByteLength(value['title']) > 512) return false
-  try { const url = new URL(value['url']); return (url.protocol === 'http:' || url.protocol === 'https:') && value['url'].length <= 2048 } catch { return false }
-}

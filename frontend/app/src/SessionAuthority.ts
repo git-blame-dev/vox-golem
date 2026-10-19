@@ -5,11 +5,9 @@ import type { AssistantCapabilities, AssistantOption, AssistantSettings } from '
 import type { AndroidAssistantProjection, ModelOption } from './lib/appSnapshot'
 import type { AndroidVoiceStatus } from './lib/androidVoice'
 import type { AudioInputDevice } from './lib/liveAudioSource'
-import type { SearchMode } from './lib/searchMode'
 import type { ChatMessage, CueAssetPaths, RuntimeStatus, StartupState, UiTextSize, UiTheme, UserNotice } from './types/chat'
 import { getInitialMessages } from './state/appShell'
 import { applySnapshotModelOptions, capabilityMap, generationIneligibility } from './sessionPolicy'
-import { admittedSearchMode } from './lib/searchMode'
 import { transitionRuntimeStatus } from './state/runtimeMachine'
 import type { AnswerSource, AnswerStageStatusEntry, AnswerPriorVersion } from './components/AnswerStage'
 import { SessionPromptController, cancelPromptProjectionFrame } from './controllers/SessionPromptController'
@@ -51,8 +49,6 @@ export interface RuntimeProjection {
   readonly snapshotControlsFresh: boolean
   readonly snapshotControlsInvalidated: boolean
   readonly snapshotModelOptions: readonly ModelOption[] | null
-  readonly searchMode: SearchMode
-  readonly searchModePending: boolean
   readonly uiTextSize: UiTextSize
   readonly uiTheme: UiTheme
   readonly ttsEnabled: boolean
@@ -109,12 +105,12 @@ const VIEW_KEYS = {
   conversation: ['voiceNotesOpen', 'shortcutStaging', 'composerValue', 'uiTextSize', 'notices'],
   toolbar: ['startupState', 'runtimeStatus', 'assistantSettings', 'assistantSettingsPending',
     'snapshotHydrationState', 'snapshotControlsFresh', 'snapshotControlsInvalidated', 'snapshotModelOptions',
-    'searchMode', 'searchModePending', 'androidAssistant', 'androidConversationId', 'androidVoiceActive',
+    'androidAssistant', 'androidConversationId', 'androidVoiceActive',
     'voiceNotesOpen', 'promptState', 'promptActivity', 'resetPending', 'isSwitchingResponseProfile',
     'micStarting', 'micActive', 'headPagePending', 'shortcutStaging', 'uiTheme'],
   composer: ['startupState', 'runtimeStatus', 'assistantSettings', 'assistantSettingsPending',
-    'assistantSettingsLoadError', 'snapshotControlsFresh', 'snapshotModelOptions', 'searchMode',
-    'searchModePending', 'composerValue', 'partialTranscript', 'typedCompletionSuffix', 'voiceCompletionSuffix',
+    'assistantSettingsLoadError', 'snapshotControlsFresh', 'snapshotModelOptions',
+    'composerValue', 'partialTranscript', 'typedCompletionSuffix', 'voiceCompletionSuffix',
     'androidAssistant', 'androidVoiceActive', 'conversationPagePending', 'headPagePending', 'voiceNotesOpen',
     'promptState', 'promptActivity', 'resetPending', 'micStarting', 'micActive', 'shortcutStaging',
     'uiTextSize', 'wakeConfidence', 'isSwitchingResponseProfile', 'snapshotControlsInvalidated', 'customRetryPending'],
@@ -122,7 +118,7 @@ const VIEW_KEYS = {
     'assistantSettingsLoadError', 'assistantSettingsWriteError', 'uiThemeWriteError', 'snapshotControlsFresh', 'snapshotModelOptions',
     'uiTextSize', 'uiTheme', 'ttsEnabled', 'autoStopOnSilence', 'audioInputDevices', 'audioInputDeviceId',
     'androidVoiceStatus', 'androidSpeechStatusError', 'androidVoiceActive', 'promptState', 'resetPending',
-    'isSwitchingResponseProfile', 'micStarting', 'ttsPlaying', 'pendingTtsCommands', 'searchModePending', 'androidAssistant', 'customRetryPending'],
+    'isSwitchingResponseProfile', 'micStarting', 'ttsPlaying', 'pendingTtsCommands', 'androidAssistant', 'customRetryPending'],
 } as const satisfies Record<string, readonly (keyof ControlsSnapshot)[]>
 type ViewName = keyof typeof VIEW_KEYS
 type ViewSnapshot<N extends ViewName> = Pick<ControlsSnapshot, (typeof VIEW_KEYS)[N][number]>
@@ -158,7 +154,7 @@ export class SessionAuthority {
   } | null = null
   readonly activeRef: { readonly current: boolean }
 
-  constructor({ snapshotAvailable = true, nativeSearch = false, android = false, audioInputDeviceId = null }: { snapshotAvailable?: boolean; nativeSearch?: boolean; android?: boolean; audioInputDeviceId?: string | null } = {}) {
+  constructor({ snapshotAvailable = true, android = false, audioInputDeviceId = null }: { snapshotAvailable?: boolean; android?: boolean; audioInputDeviceId?: string | null } = {}) {
     this.android = android
     this.state = {
       runtimeProjection: {
@@ -167,7 +163,7 @@ export class SessionAuthority {
         assistantSettingsLoadError: null, assistantSettingsWriteError: null, uiThemeWriteError: null,
         snapshotHydrationState: snapshotAvailable ? 'pending' : 'unavailable',
         snapshotControlsFresh: !snapshotAvailable, snapshotControlsInvalidated: false,
-        snapshotModelOptions: null, searchMode: 'quick', searchModePending: nativeSearch,
+        snapshotModelOptions: null,
         uiTextSize: 'medium', uiTheme: 'dark', ttsEnabled: false, autoStopOnSilence: true,
         preparedCueAssetPaths: null, audioInputDeviceId, audioInputDevices: [],
       },
@@ -228,7 +224,6 @@ export class SessionAuthority {
     if (executingStatus === runtime.runtimeStatus) return null
     const admission = {
       isCurrent: this.captureLifetime(), startup, settings, executingStatus,
-      mode: admittedSearchMode(runtime.searchMode, settings, true),
     }
     this.promptAdmission = admission
     this.transaction(() => {

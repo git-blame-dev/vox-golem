@@ -1,11 +1,31 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { FrontendTiming, frontendTimingEnabled } from './frontendTiming'
+import { FrontendTiming, frontendTimingEnabled, reportVoiceEntryStage, reportAppBenchmarkStage } from './frontendTiming'
 import { invokeTauriCommand } from './tauri'
 
 vi.mock('./tauri', () => ({ isAndroidRuntime: true, invokeTauriCommand: vi.fn().mockResolvedValue(null) }))
 afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); vi.mocked(invokeTauriCommand).mockClear() })
 
 describe('frontend timing boundaries', () => {
+  it('keeps application benchmark receipts opt-in and payload-free', () => {
+    vi.stubEnv('VITE_VOXGOLEM_BENCHMARK', '0')
+    reportAppBenchmarkStage('benchmark_controls_retire')
+    expect(invokeTauriCommand).not.toHaveBeenCalled()
+    vi.stubEnv('VITE_VOXGOLEM_BENCHMARK', '1')
+    reportAppBenchmarkStage('benchmark_controls_retire')
+    expect(invokeTauriCommand).toHaveBeenCalledExactlyOnceWith('record_frontend_runtime_diagnostic', {
+      event: { kind: 'audio', detail: 'benchmark_controls_retire' },
+    })
+  })
+
+  it('reports only the entry category and cannot reject control work when the bridge fails', async () => {
+    vi.mocked(invokeTauriCommand).mockRejectedValueOnce(new Error('Synthetic bridge rejection'))
+    expect(() => reportVoiceEntryStage('entry_draft_requested')).not.toThrow()
+    await Promise.resolve()
+    expect(invokeTauriCommand).toHaveBeenCalledExactlyOnceWith('report_startup_stage', { stage: 'entry_draft_requested' })
+    vi.mocked(invokeTauriCommand).mockImplementationOnce(() => { throw new Error('Synthetic bridge throw') })
+    expect(() => reportVoiceEntryStage('entry_dispatched')).not.toThrow()
+  })
+
   it('requires exact explicit opt-in', () => {
     for (const value of ['', '0', 'true']) {
       vi.stubEnv('VITE_VOXGOLEM_TIMING', value)

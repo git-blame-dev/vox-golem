@@ -601,8 +601,6 @@
 .shell__identity strong { color: var(--text-strong); letter-spacing: 0.02em; }
 .shell__identity span { color: var(--text-muted); font-size: 0.76em; text-transform: capitalize; }
 .shell__header-actions { display: flex; flex: 0 1 auto; flex-wrap: wrap; align-items: center; gap: 0.45rem; min-width: 0; max-width: 100%; }
-.shell__header-actions .search-mode { min-width: 0; max-width: 100%; }
-.shell__header-actions .search-mode__reason { overflow-wrap: anywhere; }
 .shell__header .shell__control { min-width: 2.75rem; min-height: 2.75rem; }
 .shell__new-chat { white-space: nowrap; }
 .status-announcer { display: contents; }
@@ -943,11 +941,8 @@
 .shell__overflow > summary:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
 .shell__overflow-actions { position: absolute; z-index: 10; top: 100%; inset-inline-end: 0; display: grid; gap: .35rem; width: max-content; max-width: calc(100vw - 32px); max-height: calc(100dvh - 100px); overflow-y: auto; padding: .5rem; box-sizing: border-box; border: 1px solid var(--border-soft); border-radius: 20px; background: var(--surface-panel-strong); box-shadow: 0 .5rem 1.5rem #0004; }
 .shell__overflow-actions > * { min-width: 0; max-width: 100%; }
-.shell .shell__overflow .shell__overflow-actions .shell__control,
-.shell .shell__overflow .shell__overflow-actions .search-mode__icon-control { display: grid; grid-template-columns: 24px minmax(0, 1fr); align-items: center; justify-content: start; gap: .75rem; width: 100%; height: auto; min-width: 48px; min-height: 48px; padding: .5rem .75rem; box-sizing: border-box; text-align: start; white-space: normal; overflow-wrap: anywhere; }
-.shell .shell__overflow .shell__overflow-actions .shell__control > svg,
-.shell .shell__overflow .shell__overflow-actions .search-mode__icon-control > svg { width: 24px; height: 24px; margin: 0; }
-.shell__overflow-actions .search-mode { display: block; }
+.shell .shell__overflow .shell__overflow-actions .shell__control { display: grid; grid-template-columns: 24px minmax(0, 1fr); align-items: center; justify-content: start; gap: .75rem; width: 100%; height: auto; min-width: 48px; min-height: 48px; padding: .5rem .75rem; box-sizing: border-box; text-align: start; white-space: normal; overflow-wrap: anywhere; }
+.shell .shell__overflow .shell__overflow-actions .shell__control > svg { width: 24px; height: 24px; margin: 0; }
 .shell__overflow-label { display: none; }
 .shell__overflow-actions .shell__overflow-label { display: inline; }
 .shell[data-platform='android'] .composer { padding-top: .35rem; padding-bottom: calc(.5rem + env(safe-area-inset-bottom)); }

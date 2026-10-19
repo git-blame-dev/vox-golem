@@ -1,4 +1,6 @@
 import type { ReactNode } from 'react'
+import type { SourceLink as AnswerSource } from '../lib/answerSources'
+export type { SourceLink as AnswerSource } from '../lib/answerSources'
 
 export type AnswerStageName = 'instant' | 'deep' | 'review'
 export type AnswerStageStatus =
@@ -22,7 +24,6 @@ export interface AnswerPriorVersion {
   readonly text: string
   readonly label?: string
 }
-export interface AnswerSource { readonly url: string; readonly title: string }
 
 export interface AnswerStageProps {
   readonly answer: string

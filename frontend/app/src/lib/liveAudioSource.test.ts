@@ -3,6 +3,8 @@ import { listAudioInputDevices, startLiveAudioSource } from './liveAudioSource'
 
 afterEach(() => {
   Reflect.deleteProperty(window, '__TAURI_INTERNALS__')
+  Reflect.deleteProperty(window, '__VOXGOLEM_APP_BENCH_AUDIO__')
+  vi.unstubAllEnvs()
 })
 
 describe('native live audio source', () => {
@@ -123,6 +125,7 @@ describe('native live audio source', () => {
   })
 
   it('stops capture instead of retaining an unbounded frame backlog', async () => {
+    vi.stubEnv('VITE_VOXGOLEM_BENCHMARK', '1')
     const handlers = new Map<string, (event: { payload: unknown }) => void>()
     let releaseFirstFrame: () => void = () => undefined
     const firstFrameBlocked = new Promise<void>((resolve) => {
@@ -154,9 +157,11 @@ describe('native live audio source', () => {
     await vi.waitFor(() => expect(onError).toHaveBeenCalledOnce())
     expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('fell behind') }))
     expect(invoke).toHaveBeenCalledWith('stop_native_microphone', { captureId })
+    expect(window.__VOXGOLEM_APP_BENCH_AUDIO__?.()).toMatchObject({ calls: 1, completed: 0, pending_max: 32, rejected: 0 })
     releaseFirstFrame()
     await Promise.resolve()
     expect(onFrame).toHaveBeenCalledOnce()
+    await vi.waitFor(() => expect(window.__VOXGOLEM_APP_BENCH_AUDIO__?.()).toMatchObject({ completed: 1 }))
   })
 
   it('drains a transient native frame burst after ingestion resumes', async () => {

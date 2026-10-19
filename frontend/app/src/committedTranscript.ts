@@ -22,7 +22,7 @@ export function projectCommittedTranscript(transcript: readonly Turn[]): readonl
     { id: canonicalMessageId(turn.answer), role: 'assistant' as const, content: turn.answer.content.text, contentKind: turn.answer.content.kind,
       observation: { requestId: turn.requestId, outcome: 'completed' as const, stageStatus: 'completed' as const,
         contentKind: turn.answer.content.text.trim().length === 0 ? 'error' as const : turn.answer.content.kind },
-      answerStage: { stages: [{ stage: turn.finalStage, status: 'completed' as const }], priorVersions: [] } },
+       answerStage: { stages: [{ stage: turn.finalStage, status: 'completed' as const }], priorVersions: [], sources: turn.sources } },
   ])
 }
 
@@ -33,7 +33,7 @@ export function replaceCommittedTranscript(current: readonly ChatMessage[], tran
       if (previous === undefined || message.answerStage === undefined || previous.content !== message.content || (previous.contentKind ?? 'text') !== message.contentKind) return message
       const finalStage = message.answerStage.stages[0]!.stage
       return { ...message, ...(previous.customDirectTimings === undefined ? {} : { customDirectTimings: previous.customDirectTimings }),
-        answerStage: { ...message.answerStage, stages: settleCanonicalAnswerStages(previous.answerStage?.stages ?? [], finalStage), priorVersions: previous.answerStage?.priorVersions ?? [], sources: previous.answerStage?.sources ?? [] } }
+        answerStage: { ...message.answerStage, stages: settleCanonicalAnswerStages(previous.answerStage?.stages ?? [], finalStage), priorVersions: previous.answerStage?.priorVersions ?? [] } }
     }),
   ]
 }

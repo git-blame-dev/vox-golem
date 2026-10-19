@@ -143,7 +143,7 @@ describe('production Android App runtime', () => {
     window.__TAURI_INTERNALS__ = { invoke, createChannel: <T,>(send: (value: T) => void) => ({ send }) }
     const { default: App } = await import('./App')
     const { FrontendSession } = await import('./FrontendSession')
-    const session = new FrontendSession({ android: true, nativeSearch: true })
+    const session = new FrontendSession({ android: true })
     container = document.createElement('div'); document.body.append(container); root = createRoot(container)
     await act(async () => { root?.render(<App session={session} />) })
     expect(invoke.mock.calls.filter(([command, args]) => command === 'report_startup_stage' && (args as { stage: string }).stage === 'first_response_dom')).toHaveLength(0)
@@ -165,7 +165,8 @@ describe('production Android App runtime', () => {
     if (streamed) {
       now = 200
       await act(async () => { updates({ kind: 'delta', text: 'Synthetic answer' }) })
-      expect(invoke.mock.calls.filter(([command, args]) => command === 'report_startup_stage' && (args as { stage: string }).stage === 'first_response_dom')).toHaveLength(0)
+      expect(invoke.mock.calls.filter(([command, args]) => command === 'report_startup_stage' && (args as { stage: string }).stage === 'first_response_dom')).toHaveLength(enabled ? 1 : 0)
+      expect(pendingRow.querySelector('.answer-stage__answer')?.textContent?.trim()).toBe('Synthetic answer')
       now = 225
       await act(async () => { frame?.(now) })
       now = 250
@@ -186,10 +187,10 @@ describe('production Android App runtime', () => {
     if (enabled) {
       expect(domAtCommit).toEqual([true])
       expect(metadata.filter((entry) => entry['stage'] === 'FIRST_NONBLANK_RECEIVED')).toEqual([{ scope: 'frontend_request', request: 1, stage: 'FIRST_NONBLANK_RECEIVED', atMs: streamed ? 200 : 400, elapsedMs: streamed ? 100 : 300 }])
-      expect(metadata.filter((entry) => entry['stage'] === 'FIRST_TEXT_DOM_COMMITTED')).toEqual([{ scope: 'frontend_request', request: 1, stage: 'FIRST_TEXT_DOM_COMMITTED', atMs: streamed ? 225 : 400, elapsedMs: streamed ? 125 : 300 }])
+      expect(metadata.filter((entry) => entry['stage'] === 'FIRST_TEXT_DOM_COMMITTED')).toEqual([{ scope: 'frontend_request', request: 1, stage: 'FIRST_TEXT_DOM_COMMITTED', atMs: streamed ? 200 : 400, elapsedMs: streamed ? 100 : 300 }])
       expect(metadata.filter((entry) => entry['stage'] === 'SETTLED')).toEqual([{ scope: 'frontend_request', request: 1, stage: 'SETTLED', atMs: 400, elapsedMs: 300 }])
       expect(metadata.filter((entry) => entry['scope'] === 'provider_request')).toHaveLength(0)
-      expect(metadata.filter((entry) => entry['scope'] === 'webview_navigation').map((entry) => entry['stage'])).toEqual(['SHELL_DOM_COMMITTED', 'INITIAL_SNAPSHOT_REQUESTED', 'INITIAL_SNAPSHOT_RECEIVED', 'INITIAL_SNAPSHOT_APPLIED', 'INITIAL_SEARCH_MODE_REQUESTED', 'INITIAL_SEARCH_MODE_ACK', 'STATE_READY'])
+      expect(metadata.filter((entry) => entry['scope'] === 'webview_navigation').map((entry) => entry['stage'])).toEqual(['SHELL_DOM_COMMITTED', 'INITIAL_SNAPSHOT_REQUESTED', 'INITIAL_SNAPSHOT_RECEIVED', 'INITIAL_SNAPSHOT_APPLIED', 'STATE_READY'])
       expect(JSON.stringify(metadata)).not.toContain('Synthetic')
       expect(JSON.stringify(metadata)).not.toContain(requestId)
     } else expect(log).not.toHaveBeenCalled()
@@ -291,7 +292,7 @@ describe('production Android App runtime', () => {
     window.__TAURI_INTERNALS__ = { invoke, createChannel: <T,>(send: (value: T) => void) => ({ send }) }
     const { default: App } = await import('./App')
     const { FrontendSession } = await import('./FrontendSession')
-    const session = new FrontendSession({ android: true, nativeSearch: true })
+    const session = new FrontendSession({ android: true })
     container = document.createElement('div'); document.body.append(container); root = createRoot(container)
     await act(async () => { root?.render(<App session={session} />) })
     const submit = async () => {
@@ -325,7 +326,7 @@ describe('production Android App runtime', () => {
     expect(container.textContent).toContain('Synthetic fresh answer')
   })
 
-  it.each(['android', 'desktop'] as const)('omits manual Search mode dropdown and syncs automatic Quick with Settings web toggle on %s', async (platform) => {
+  it.each(['android', 'desktop'] as const)('omits mode commands and controls while preserving the Settings web toggle on %s', async (platform) => {
     vi.stubEnv('VITE_VOXGOLEM_RUNTIME', platform); vi.resetModules(); window.history.replaceState(null, '')
     let webEnabled = true
     const invoke = vi.fn(async (command: string) => {
@@ -333,7 +334,6 @@ describe('production Android App runtime', () => {
         return { ...wireSnapshot(), preferences: { ...(wireSnapshot()['preferences'] as Record<string, unknown>), web_enabled: webEnabled } }
       }
       if (command === 'get_startup_state') return desktopStartupState()
-      if (command === 'set_search_mode') return null
       return null
     })
     window.__TAURI_INTERNALS__ = { invoke }
@@ -346,7 +346,7 @@ describe('production Android App runtime', () => {
     if (platform === 'android') {
       expect(container.querySelector('.composer__utility-row [aria-label="Ask"]')).not.toBeNull()
       expect(container.querySelector('.composer__search')).toBeNull()
-      expect(invoke).toHaveBeenCalledWith('set_search_mode', { mode: 'quick' })
+      expect(invoke.mock.calls.some(([command]) => command === 'set_search_mode')).toBe(false)
     } else {
       expect(container.querySelector('.composer__search')).toBeNull()
       expect(promptRow.querySelector('button[type="submit"]')?.getAttribute('aria-label')).toBe('Send')
@@ -354,7 +354,7 @@ describe('production Android App runtime', () => {
     webEnabled = false
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="New Chat"]')!.click() })
     expect(container.querySelector('[aria-label="Search mode"]')).toBeNull()
-    expect(invoke).toHaveBeenCalledWith('set_search_mode', { mode: 'quick' })
+    expect(invoke.mock.calls.some(([command]) => command === 'set_search_mode')).toBe(false)
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
     const web = container.querySelector<HTMLInputElement>('[aria-label="Allow web access"]')!
     expect(web.checked).toBe(false)

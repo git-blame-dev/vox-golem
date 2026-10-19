@@ -6,6 +6,7 @@ import { parseAndroidVoiceEvent, parseAndroidVoiceStatus } from './androidVoice'
 import type { AndroidVoiceStatus, AndroidVoiceContext } from './androidVoice'
 import { NEW_VOICE_SHORTCUT_EVENT, parsePendingNewVoiceAction, pendingNewVoiceToken } from './newVoiceShortcut'
 import { NativeVoiceStatusPoller } from './nativeVoiceStatusPoller'
+import { reportVoiceEntryStage } from './frontendTiming'
 
 export interface AndroidVoiceAdapterInputs {
   readonly enabled?: boolean
@@ -21,6 +22,8 @@ export interface AndroidVoiceAdapterInputs {
   readonly onSettled: () => void
   readonly onStatus?: (status: AndroidVoiceStatus | null, statusError: string | null) => void
   readonly shortcutReady?: boolean
+  /** Canonical owner used to distinguish refresh delay from a different input context. */
+  readonly launchContext?: AndroidVoiceContext
   /** Flush and bind the current conversation/draft before microphone permission admission. */
   readonly onBeforeStart?: (completionPolicy: 'manual' | 'single_turn' | 'repeat_after_reply') => Promise<string>
   readonly onShortcutBeforeStart?: () => Promise<string>
@@ -29,7 +32,7 @@ export interface AndroidVoiceAdapterInputs {
   readonly onShortcutCancelled?: (oldDraft: string, prepared: boolean) => void
 }
 
-export function useAndroidVoiceAdapter({ enabled = true, statusEnabled = enabled, draft, disabled, generationAvailable, stopRef, onDraft, onSubmit, onActivity, onInputCancelled, onSettled, onStatus, shortcutReady = false, onBeforeStart, onShortcutBeforeStart, onShortcutStarted, onShortcutPrepare, onShortcutCancelled }: AndroidVoiceAdapterInputs) {
+export function useAndroidVoiceAdapter({ enabled = true, statusEnabled = enabled, draft, disabled, generationAvailable, stopRef, onDraft, onSubmit, onActivity, onInputCancelled, onSettled, onStatus, shortcutReady = false, launchContext, onBeforeStart, onShortcutBeforeStart, onShortcutStarted, onShortcutPrepare, onShortcutCancelled }: AndroidVoiceAdapterInputs) {
   const [status, setStatus] = useState<AndroidVoiceStatus | null>(null)
   const [pending, setPending] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -41,14 +44,9 @@ export function useAndroidVoiceAdapter({ enabled = true, statusEnabled = enabled
   const statusRevisionRef = useRef(0)
   const lifecycleEpochRef = useRef(0)
   const [statusPoller] = useState(() => new NativeVoiceStatusPoller())
+  const latestStatusRef = useRef<AndroidVoiceStatus | null>(null)
   useEffect(() => { statusCallbackRef.current = onStatus }, [onStatus])
   useEffect(() => { statusCallbackRef.current?.(status, statusError) }, [status, statusError])
-  const acceptStatus = useCallback((next: AndroidVoiceStatus): void => {
-    statusRevisionRef.current += 1
-    setStatus(next)
-    setStatusError(null)
-    setOwnedSessionError(sessionRef.current !== null ? next.error : null)
-  }, [])
   const mounted = useRef(true)
   const ttsAvailable = useRef(false)
   const settledRef = useRef(onSettled)
@@ -57,7 +55,14 @@ export function useAndroidVoiceAdapter({ enabled = true, statusEnabled = enabled
   const scanPendingRef = useRef<object | null>(null)
   const startingRef = useRef(false)
   const launchEpochRef = useRef(0)
-  const launchHintsRef = useRef({ shortcutReady, disabled, active: false, available: status?.available })
+  const contextKey = launchContext === undefined ? null : JSON.stringify([launchContext.sessionId, launchContext.selectedHead])
+  const claimedLaunchRef = useRef<{ token: string; mode: 'ask' | 'talk'; epoch: number; contextKey: string | null } | null>(null)
+  const launchHintsRef = useRef({ shortcutReady, disabled, active: false, available: status?.available, contextKey })
+  const releaseClaimedLaunch = useCallback(() => {
+    const claim = claimedLaunchRef.current
+    claimedLaunchRef.current = null
+    if (claim !== null) void invokeTauriCommand('release_new_voice_shortcut', { token: claim.token }).catch(() => undefined)
+  }, [])
   const consumedTokensRef = useRef(new Set<string>())
   const cancelShortcutCallbackRef = useRef(onShortcutCancelled)
   const inputCancelledCallbackRef = useRef(onInputCancelled)
@@ -66,15 +71,21 @@ export function useAndroidVoiceAdapter({ enabled = true, statusEnabled = enabled
   useEffect(() => { settledRef.current = onSettled }, [onSettled])
   const active = pending || (status !== null && (status.shortcutPhase === 'listening' || status.shortcutPhase === 'finishing' || status.ttsPhase === 'speaking' || ['checking', 'listening', 'finishing'].includes(status.dictation) || ['listening', 'generating', 'speaking', 'between_turns'].includes(status.loop)))
   useEffect(() => {
-    if (launchHintsRef.current.shortcutReady !== shortcutReady) launchEpochRef.current += 1
-    launchHintsRef.current = { shortcutReady, disabled, active, available: status?.available }
-  }, [shortcutReady, disabled, active, status?.available])
-  const retireVoice = useCallback((explicit: boolean) => {
+    if (launchHintsRef.current.contextKey !== contextKey ||
+      (contextKey === null && launchHintsRef.current.shortcutReady !== shortcutReady)) {
+      launchEpochRef.current += 1
+      releaseClaimedLaunch()
+    }
+    launchHintsRef.current = { shortcutReady, disabled, active, available: status?.available, contextKey }
+  }, [shortcutReady, disabled, active, status?.available, contextKey, releaseClaimedLaunch])
+  const retireVoice = useCallback((explicit: boolean, notifyNative = true) => {
     const sessionId = sessionRef.current
-    if (sessionId === null && !explicit) return
+    if (sessionId === null && !explicit && claimedLaunchRef.current === null && scanPendingRef.current === null) return
     statusRevisionRef.current += 1
     launchEpochRef.current += 1
+    releaseClaimedLaunch()
     setConfirmationRequired(false)
+    if (sessionId === null && !explicit) return
     inputCancelledCallbackRef.current?.()
     const shortcut = shortcutRef.current
     shortcutRef.current = null
@@ -85,11 +96,27 @@ export function useAndroidVoiceAdapter({ enabled = true, statusEnabled = enabled
     onActivity(false)
     setPending(false)
     setStatus((current) => current === null ? null : { ...current, mode: current.mode === 'shortcut' ? 'dictation' : current.mode, dictation: 'idle', loop: 'idle', ttsPhase: 'idle', shortcutPhase: null, readyForSpeech: false })
-    void invokeTauriCommand('stop_assistant_voice', sessionId === null ? undefined : { sessionId }).catch(() => undefined)
-  }, [onActivity])
+    if (notifyNative) void invokeTauriCommand('stop_assistant_voice', sessionId === null ? undefined : { sessionId }).catch(() => undefined)
+  }, [onActivity, releaseClaimedLaunch])
   // Only a deliberate user action may target observed native voice without an owned ticket.
   const stop = useCallback(() => retireVoice(true), [retireVoice])
   const retireOwned = useCallback(() => retireVoice(false), [retireVoice])
+  const acceptStatus = useCallback((next: AndroidVoiceStatus): void => {
+    latestStatusRef.current = next
+    statusRevisionRef.current += 1
+    setStatus(next)
+    setStatusError(null)
+    setOwnedSessionError(sessionRef.current !== null ? next.error : null)
+    if (next.inputForeground === false && next.retainedSubmissionId == null) retireVoice(false, false)
+  }, [retireVoice])
+  const hidden = useCallback(() => {
+    // A hidden document is not proof of true backgrounding. Native lifecycle
+    // retires capture and decides whether an already-authorized final survives.
+    launchEpochRef.current += 1
+    releaseClaimedLaunch()
+    setConfirmationRequired(false)
+    if (latestStatusRef.current?.inputForeground === undefined) retireOwned()
+  }, [releaseClaimedLaunch, retireOwned])
   useEffect(() => {
     if (!enabled) return undefined
     mounted.current = true
@@ -114,13 +141,14 @@ export function useAndroidVoiceAdapter({ enabled = true, statusEnabled = enabled
         if (next.ttsAvailable !== ttsAvailable.current) { ttsAvailable.current = next.ttsAvailable; settledRef.current() }
       },
       fail: () => setStatusError('Native speech status is unavailable'),
-      hidden: retireOwned,
+      hidden,
     })
-  }, [acceptStatus, statusEnabled, statusPoller, retireOwned])
+  }, [acceptStatus, statusEnabled, statusPoller, hidden])
   useEffect(() => { onActivity(enabled && active) }, [active, enabled, onActivity])
 
   useEffect(() => {
     if (!enabled || !shortcutReady) return undefined
+    reportVoiceEntryStage('entry_frontend_ready')
     let timer: number | null = null
     const scan = (): void => {
       if (timer !== null) window.clearTimeout(timer)
@@ -135,9 +163,10 @@ export function useAndroidVoiceAdapter({ enabled = true, statusEnabled = enabled
   }, [enabled, shortcutReady, status?.available])
 
   const start = async (loopMode: boolean, launchToken?: string, completionPolicy: 'manual' | 'single_turn' | 'repeat_after_reply' = loopMode ? 'repeat_after_reply' : 'manual'): Promise<void> => {
+    if (launchToken === undefined) { launchEpochRef.current += 1; releaseClaimedLaunch() }
     const releaseLaunch = (): void => { if (launchToken !== undefined) void invokeTauriCommand('release_new_voice_shortcut', { token: launchToken }).catch(() => undefined) }
     if (!enabled || startingRef.current || active || pending ||
-      (onBeforeStart === undefined && (disabled || ((loopMode || completionPolicy === 'single_turn') && !generationAvailable)))) { releaseLaunch(); return }
+      (onBeforeStart === undefined && (disabled || ((loopMode || completionPolicy === 'single_turn') && !generationAvailable)))) { if (launchToken !== undefined) reportVoiceEntryStage('entry_frontend_busy'); releaseLaunch(); return }
     if (launchToken === undefined && shortcutRef.current !== null) {
       const previous = shortcutRef.current
       if (!previous.prepared) { setError('Review and send the new voice draft before starting another voice session'); return }
@@ -145,7 +174,7 @@ export function useAndroidVoiceAdapter({ enabled = true, statusEnabled = enabled
       shortcutRef.current = null; cancelShortcutCallbackRef.current?.(previous.oldDraft, true)
     }
     const internals = getTauriInternals()
-    if (internals?.createChannel === undefined) { releaseLaunch(); setError('Native voice requires Channel support'); return }
+    if (internals?.createChannel === undefined) { if (launchToken !== undefined) reportVoiceEntryStage('entry_channel_unavailable'); releaseLaunch(); setError('Native voice requires Channel support'); return }
     if (sessionRef.current !== null) inputCancelledCallbackRef.current?.()
     startingRef.current = true
     const sessionId = crypto.randomUUID()
@@ -162,10 +191,13 @@ export function useAndroidVoiceAdapter({ enabled = true, statusEnabled = enabled
     const legacyShortcut = launchToken !== undefined && onBeforeStart === undefined && onShortcutBeforeStart !== undefined
     if (onBeforeStart !== undefined) {
       try {
+        if (launchToken !== undefined) reportVoiceEntryStage('entry_draft_requested')
         ownedDraft = await onBeforeStart(completionPolicy)
-        if (!ownsStart() || document.visibilityState !== 'visible') { releaseLaunch(); if (lifecycleEpoch === lifecycleEpochRef.current) startingRef.current = false; if (ownsStart()) setPending(false); return }
+        if (!ownsStart() || document.visibilityState !== 'visible') { if (launchToken !== undefined) reportVoiceEntryStage('entry_frontend_invalidated'); releaseLaunch(); if (lifecycleEpoch === lifecycleEpochRef.current) startingRef.current = false; if (ownsStart()) setPending(false); return }
+        if (launchToken !== undefined) reportVoiceEntryStage('entry_draft_admitted')
         if (launchToken !== undefined) shortcutRef.current = { token: launchToken, oldDraft: ownedDraft, prepared: true, prepare: Promise.resolve() }
       } catch (failure) {
+        if (launchToken !== undefined) reportVoiceEntryStage('entry_draft_rejected')
         releaseLaunch()
         if (lifecycleEpoch === lifecycleEpochRef.current) startingRef.current = false
         if (mounted.current && sessionRef.current === sessionId) {
@@ -239,13 +271,16 @@ export function useAndroidVoiceAdapter({ enabled = true, statusEnabled = enabled
             const shortcut = shortcutRef.current
             if (shortcut !== null && event.draft === '' && !shortcut.prepared) retireOwned()
           }
-        } catch { setError('Native voice returned an invalid event'); retireOwned() }
+        } catch { if (launchToken !== undefined) reportVoiceEntryStage('entry_event_invalid'); setError('Native voice returned an invalid event'); retireOwned() }
       })
       const statusRevision = statusRevisionRef.current
+      if (launchToken !== undefined) reportVoiceEntryStage('entry_dispatched')
       const value = await invokeTauriCommand('start_assistant_voice', { sessionId, loopMode, draft: legacyShortcut ? '' : ownedDraft, updates, completionPolicy: legacyShortcut ? 'stop_send_new' : completionPolicy, ...(launchToken === undefined ? {} : { launchToken }) })
       nativeAdmitted = true
+      if (launchToken !== undefined) reportVoiceEntryStage('entry_resolved')
       if (mounted.current && sessionRef.current === sessionId) { const next = parseAndroidVoiceStatus(value); if (statusRevision === statusRevisionRef.current) acceptStatus(next); if (legacyShortcut && !receivedDraft) onShortcutStarted?.() }
     } catch (failure) {
+      if (launchToken !== undefined) reportVoiceEntryStage(nativeAdmitted ? 'entry_event_invalid' : 'entry_native_rejected')
       if (sessionRef.current === sessionId) {
         inputCancelledCallbackRef.current?.()
         if (nativeAdmitted) void invokeTauriCommand('stop_assistant_voice', { sessionId }).catch(() => undefined)
@@ -261,31 +296,51 @@ export function useAndroidVoiceAdapter({ enabled = true, statusEnabled = enabled
       const scan = {}
       scanPendingRef.current = scan
       const epoch = launchEpochRef.current
+      const owner = launchHintsRef.current.contextKey
       let token: string | null = null
       try {
-        const payload = await invokeTauriCommand('consume_new_voice_shortcut')
-        token = pendingNewVoiceToken(payload)
-        const action = parsePendingNewVoiceAction(payload)
-        const confirmation = isRecord(payload) ? payload['confirmationRequired'] : undefined
-        if (confirmation !== undefined && typeof confirmation !== 'boolean') throw new Error('Native launch confirmation is invalid')
-        if (confirmation === true) {
-          if (token !== null) await invokeTauriCommand('release_new_voice_shortcut', { token })
-          token = null
-          if (mounted.current && epoch === launchEpochRef.current && document.visibilityState === 'visible' && !launchHintsRef.current.active) setConfirmationRequired(true)
+        let claim = claimedLaunchRef.current
+        if (claim === null) {
+          const payload = await invokeTauriCommand('consume_new_voice_shortcut')
+          token = pendingNewVoiceToken(payload)
+          const action = parsePendingNewVoiceAction(payload)
+          const confirmation = isRecord(payload) ? payload['confirmationRequired'] : undefined
+          if (confirmation !== undefined && typeof confirmation !== 'boolean') throw new Error('Native launch confirmation is invalid')
+          if (confirmation === true) {
+            if (token !== null) await invokeTauriCommand('release_new_voice_shortcut', { token })
+            token = null
+            if (mounted.current && epoch === launchEpochRef.current && document.visibilityState === 'visible' && !launchHintsRef.current.active) setConfirmationRequired(true)
+            return
+          }
+          if (action.error !== null) { if (token !== null) await invokeTauriCommand('release_new_voice_shortcut', { token }); token = null; if (mounted.current) setError(action.error); return }
+          if (action.token === null) return
+          reportVoiceEntryStage('entry_frontend_claimed')
+          if (consumedTokensRef.current.has(action.token)) { token = null; return }
+          consumedTokensRef.current.add(action.token)
+          if (consumedTokensRef.current.size > 256) { const oldest = consumedTokensRef.current.values().next().value; if (oldest !== undefined) consumedTokensRef.current.delete(oldest) }
+          claim = { token: action.token, mode: action.mode, epoch, contextKey: owner }
+        }
+        const hints = launchHintsRef.current
+        if (!mounted.current || claim.epoch !== launchEpochRef.current || claim.contextKey !== hints.contextKey || document.visibilityState !== 'visible') {
+          reportVoiceEntryStage('entry_frontend_invalidated')
+          claimedLaunchRef.current = null
+          await invokeTauriCommand('release_new_voice_shortcut', { token: claim.token }); token = null
           return
         }
-        if (action.error !== null) { if (token !== null) await invokeTauriCommand('release_new_voice_shortcut', { token }); token = null; if (mounted.current) setError(action.error); return }
-        if (action.token === null) return
-        if (consumedTokensRef.current.has(action.token)) { token = null; return }
-        consumedTokensRef.current.add(action.token)
-        if (consumedTokensRef.current.size > 256) { const oldest = consumedTokensRef.current.values().next().value; if (oldest !== undefined) consumedTokensRef.current.delete(oldest) }
-        const hints = launchHintsRef.current
-        if (!mounted.current || epoch !== launchEpochRef.current || document.visibilityState !== 'visible' || !hints.shortcutReady || (onBeforeStart === undefined && hints.disabled) || hints.active || startingRef.current || !hints.available) {
-          await invokeTauriCommand('release_new_voice_shortcut', { token: action.token }); token = null; if (mounted.current) setError('New voice chat is busy or native dictation is unavailable; existing work was preserved'); return
+        if (!hints.shortcutReady) {
+          claimedLaunchRef.current = claim
+          token = null
+          return
         }
+        if ((onBeforeStart === undefined && hints.disabled) || hints.active || startingRef.current || !hints.available) {
+          reportVoiceEntryStage(hints.available ? 'entry_frontend_busy' : 'entry_frontend_unavailable')
+          claimedLaunchRef.current = null
+          await invokeTauriCommand('release_new_voice_shortcut', { token: claim.token }); token = null; setError('New voice chat is busy or native dictation is unavailable; existing work was preserved'); return
+        }
+        claimedLaunchRef.current = null
         token = null
-        await start(action.mode === 'talk', action.token, action.mode === 'talk' ? 'repeat_after_reply' : 'single_turn')
-      } catch { if (token !== null) { void invokeTauriCommand('release_new_voice_shortcut', { token }).catch(() => undefined); if (mounted.current) setError('Native shortcut launch is invalid; existing work was preserved') } }
+        await start(claim.mode === 'talk', claim.token, claim.mode === 'talk' ? 'repeat_after_reply' : 'single_turn')
+      } catch { reportVoiceEntryStage('entry_event_invalid'); if (token !== null) { void invokeTauriCommand('release_new_voice_shortcut', { token }).catch(() => undefined); if (mounted.current) setError('Native shortcut launch is invalid; existing work was preserved') } }
        finally { if (scanPendingRef.current === scan) scanPendingRef.current = null }
     }
   })

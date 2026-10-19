@@ -14,6 +14,23 @@ afterEach(() => {
 })
 
 describe('prompt payload parsing', () => {
+  it('accepts a desktop canonical completion without losing distributed identity or observed sources', async () => {
+    const id = '11111111-1111-4111-8111-111111111111:3'
+    const turn = { request_id: 'synthetic-desktop-request', execution_id: { session_id: id, generation: id },
+      user: { id, role: 'user', content: { kind: 'text', text: 'Synthetic question' } },
+      answer: { id, role: 'assistant', content: { kind: 'text', text: 'Synthetic answer' } },
+      sources: [{ url: 'https://example.test/document', title: 'Synthetic observed document' }], final_stage: 'instant' }
+    window.__TAURI_INTERNALS__ = { createChannel: () => ({}), invoke: async (command) => {
+      expect(command).toBe('submit_prompt')
+      return { kind: 'completed', turn }
+    } }
+    const result = await executePrompt('synthetic-desktop-request', 'Synthetic question', () => undefined)
+    expect(result.canonicalTurn?.sources).toEqual(turn.sources)
+    expect(result.canonicalTurn?.executionId.sessionId).toBe(id)
+    expect(result.canonicalOutcome).toBe('completed')
+    await expect(executePrompt('synthetic-other-request', 'Synthetic question', () => undefined)).rejects.toThrow(/request ID/)
+  })
+
   it('parses a valid final result', () => {
     expect(
       parsePromptExecutionResult({
@@ -159,16 +176,16 @@ describe('prompt payload parsing', () => {
 })
 
 describe('executePrompt', () => {
-  it.each(['quick', 'verify', 'research'] as const)('passes the admitted %s mode for voice submissions', async (searchMode) => {
+  it('passes voice submissions verbatim without mode', async () => {
     window.__TAURI_INTERNALS__ = {
       createChannel: () => 'synthetic-channel',
       invoke: async (command, args) => {
         expect(command).toBe('submit_prompt')
-        expect(args).toEqual({ requestId: 'synthetic-request', prompt: 'Synthetic question', source: 'voice', searchMode, updates: 'synthetic-channel' })
+        expect(args).toEqual({ requestId: 'synthetic-request', prompt: 'Synthetic question', source: 'voice', updates: 'synthetic-channel' })
         return { request_id: 'synthetic-request', runtime_phase: 'sleeping', outcome: 'completed' }
       },
     }
-    await executePrompt('synthetic-request', 'Synthetic question', () => undefined, 'voice', searchMode)
+    await executePrompt('synthetic-request', 'Synthetic question', () => undefined, 'voice')
   })
   it('uses API wrappers for native-shaped Tauri internals', () => {
     window.__TAURI_INTERNALS__ = Object.assign(
@@ -220,7 +237,7 @@ describe('executePrompt', () => {
       invoke: async (command, args) => {
         order.push('invoke')
         expect(command).toBe('submit_prompt')
-        expect(args).toEqual({ requestId: 'request-1', prompt: 'Draft release notes', source: 'typed', searchMode: 'quick', updates: 'channel' })
+        expect(args).toEqual({ requestId: 'request-1', prompt: 'Draft release notes', source: 'typed', updates: 'channel' })
         send?.({ request_id: 'stale', kind: 'text', text: 'Ignore me' })
         send?.({ kind: 'text', text: 'OpenCode response' })
         return {

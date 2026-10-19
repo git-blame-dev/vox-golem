@@ -35,6 +35,7 @@ async function mount(initial: Availability = 'available', session = new Frontend
   let snapshotResponse: (() => Promise<unknown>) | null = null
   let startupResponse: (() => Promise<unknown>) | null = null
   const unexpected: string[] = []
+  const audioTransitions: boolean[] = []
   const snapshot = (state = availability) => appSnapshot(transcript, {}, {
     session_id: sessionId, runtime_phase: state === 'warming' ? 'initializing' : 'sleeping',
     capabilities: completeCapabilities({ local_fast: state }),
@@ -47,6 +48,11 @@ async function mount(initial: Availability = 'available', session = new Frontend
     capabilities: completeCapabilities({ local_fast: state }),
   })
   const invoke = vi.fn(async (command: string, args?: unknown): Promise<unknown> => {
+    if (command === 'set_native_audio_active') {
+      expect(args).toEqual({ active: expect.any(Boolean) })
+      audioTransitions.push((args as { active: boolean }).active)
+      return null
+    }
     if (command === 'get_app_snapshot') return snapshotResponse === null ? snapshot() : snapshotResponse()
     if (command === 'get_startup_state') return startupResponse === null ? startup() : startupResponse()
     if (command === 'submit_prompt') {
@@ -57,7 +63,6 @@ async function mount(initial: Availability = 'available', session = new Frontend
     }
     if (command === 'reset_session') { sessionId = '3'; transcript = []; return snapshot() }
     if (command === 'get_update_snapshot') return { revision: 1, phase: 'up_to_date', operation: null, current_version: 'synthetic-version', version: null, notes: null, progress_phase: null, downloaded_bytes: 0, total_bytes: null, error: null, reason: null, auto_download_enabled: false, auto_install_enabled: false }
-    if (command === 'set_search_mode') return { mode: 'quick' }
     if (['record_frontend_runtime_diagnostic', 'write_runtime_log', 'check_for_update', 'clear_completion'].includes(command)) return null
     unexpected.push(command)
     throw new Error(`Unexpected desktop controls fixture command: ${command}`)
@@ -66,7 +71,7 @@ async function mount(initial: Availability = 'available', session = new Frontend
   container = document.createElement('div'); document.body.append(container); root = createRoot(container)
   await act(async () => { root!.render(<App session={session} />) })
   return {
-    session, invoke, snapshot, startup, unexpected,
+    session, invoke, snapshot, startup, unexpected, audioTransitions,
     setAvailability: (next: Availability) => { availability = next },
     setSnapshotResponse: (response: (() => Promise<unknown>) | null) => { snapshotResponse = response },
     setStartupResponse: (response: (() => Promise<unknown>) | null) => { startupResponse = response },
@@ -85,6 +90,23 @@ const sendButton = () => container!.querySelector<HTMLButtonElement>('button[typ
 const poll = async (milliseconds = 1_000) => { await act(async () => { await vi.advanceTimersByTimeAsync(milliseconds) }) }
 
 describe('desktop change-triggered canonical model controls', () => {
+  it('owns native audio only while mounted and foreground, without admitting cues for typed-only controls', async () => {
+    const state = await mount()
+    expect(state.audioTransitions).toEqual([true])
+    try {
+      Object.defineProperty(document, 'hidden', { configurable: true, value: true })
+      await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
+      Object.defineProperty(document, 'hidden', { configurable: true, value: false })
+      await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
+      expect(state.audioTransitions).toEqual([true, false, true])
+      await act(async () => { root!.unmount(); root = null })
+      expect(state.audioTransitions).toEqual([true, false, true, false])
+      expect(state.invoke.mock.calls.filter(([command]) => command === 'reserve_cue_playback_id' || command === 'activate_voice_cue')).toEqual([])
+      expect(state.unexpected).toEqual([])
+    } finally {
+      Reflect.deleteProperty(document, 'hidden')
+    }
+  })
   it('refreshes a successfully hydrated warming snapshot when startup becomes ready and admits Send', async () => {
     const state = await mount('warming')
     expect(state.snapshots()).toBe(1)
