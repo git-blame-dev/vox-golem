@@ -163,7 +163,9 @@ class FixtureTests(unittest.TestCase):
             self.assertFalse(matches_transcript(case, "Synthetic unrelated request"))
         self.assertTrue(matches_transcript("quick", "What is 17 plus 25 reply only with the number"))
         self.assertTrue(matches_transcript("short_research", CASES["short_research"].replace("Once Lock", "OnceLock").replace("release", "version")))
+        self.assertTrue(matches_transcript("short_research", CASES["short_research"].replace("Once Lock", "once locked").replace("sourced", "source")))
         self.assertTrue(matches_transcript("long_research", CASES["long_research"].replace("Lazy Lock", "LazyLock").replace("behavior", "behaviour")))
+        self.assertTrue(matches_transcript("long_research", CASES["long_research"].replace("Once Lock", "once locked").replace("Lazy Lock", "lazy locked")))
         self.assertFalse(matches_transcript("quick", "What is 18 plus 25 reply only with the number"))
         self.assertFalse(matches_transcript("unknown", ""))
 

@@ -882,6 +882,9 @@ def exercise(driver, case, timeout=180, wake_diagnostics=False, services=None, p
         now = time.perf_counter()
         if state.get('outcome') in ('error', 'failed', 'cancelled', 'refused'):
             raise RuntimeError('Correlated turn failed')
+        if services is not None and services.snapshot().get('failures', 0) > 0:
+            failure = 'service_contract_failure'
+            break
         if state.get('nonblank') and first is None:
             first = now
         if state.get('nonblank') and state.get('outcome') not in ('completed', 'cancelled', 'error', 'refused'):
