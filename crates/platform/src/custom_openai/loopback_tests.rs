@@ -6,8 +6,137 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 const CHILD_TEST: &str = "custom_openai::loopback_tests::constructor_dispatch_child";
+
+#[tokio::test]
+async fn cancelled_prewarm_does_not_claim_transport_activity() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let auth = AuthFixture::new();
+    let client = CustomOpenAiClient::new(CustomOpenAiConfig {
+        endpoint: format!("http://{}/responses", listener.local_addr().unwrap()),
+        auth_path: auth.0.clone(),
+        ..Default::default()
+    })
+    .unwrap();
+    let mut warm = Box::pin(client.prewarm());
+    let socket = tokio::select! {
+        result = &mut warm => panic!("unexpected completion: {result:?}"),
+        accepted = listener.accept() => accepted.unwrap().0,
+    };
+    drop(warm);
+    drop(socket);
+    let activity = client.activity.lock().unwrap();
+    assert!(activity.recent.is_none());
+    assert!(activity.active_attempt.is_none());
+}
 const CHILD_ENDPOINT: &str = "VOX_SYNTHETIC_LOOPBACK_ENDPOINT";
 const CHILD_AUTH: &str = "VOX_SYNTHETIC_LOOPBACK_AUTH";
+
+#[test]
+fn pool_reuses_normalized_transport_with_fresh_config_and_replaces_incompatible_owner() {
+    let pool = CustomOpenAiClientPool::default();
+    let config = CustomOpenAiConfig {
+        endpoint: "http://127.0.0.1:43210/responses".into(),
+        ..Default::default()
+    };
+    let first = pool.client_for(config.clone()).unwrap();
+    let mut fresh = config.clone();
+    fresh.endpoint = " HTTP://127.0.0.1:43210/responses ".into();
+    fresh.model = CustomOpenAiModel::LunaLow;
+    fresh.auth_path = PathBuf::from("/synthetic/new-auth.json");
+    fresh.idle_timeout = Duration::from_secs(7);
+    fresh.total_timeout = Duration::from_secs(11);
+    let reused = pool.client_for(fresh.clone()).unwrap();
+    assert!(Arc::ptr_eq(&first.activity, &reused.activity));
+    assert_eq!(reused.config.model, fresh.model);
+    assert_eq!(reused.config.auth_path, fresh.auth_path);
+    assert_eq!(reused.config.idle_timeout, fresh.idle_timeout);
+    assert_eq!(reused.config.total_timeout, fresh.total_timeout);
+    let mut changed = config.clone();
+    changed.connect_timeout += Duration::from_secs(1);
+    let replacement = pool.client_for(changed).unwrap();
+    assert!(!Arc::ptr_eq(&first.activity, &replacement.activity));
+    let mut changed_endpoint = config.clone();
+    changed_endpoint.endpoint = "http://127.0.0.1:43211/responses".into();
+    let replacement = pool.client_for(changed_endpoint).unwrap();
+    assert!(!Arc::ptr_eq(&first.activity, &replacement.activity));
+    let returned = pool.client_for(config).unwrap();
+    assert!(!Arc::ptr_eq(&first.activity, &returned.activity));
+    first.record_transport_active();
+    assert!(first.activity.lock().unwrap().recent.is_some());
+    assert!(returned.activity.lock().unwrap().recent.is_none());
+}
+
+#[tokio::test]
+async fn prewarm_deduplicates_and_failure_preserves_foreground_activity_and_fresh_auth() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let auth = AuthFixture::new();
+    let client = CustomOpenAiClient::new(CustomOpenAiConfig {
+        endpoint: format!("http://{}/responses", listener.local_addr().unwrap()),
+        auth_path: auth.0.clone(),
+        ..Default::default()
+    })
+    .unwrap();
+    let mut first = Box::pin(client.prewarm());
+    let mut socket = tokio::select! {
+        result = &mut first => panic!("unexpected completion: {result:?}"),
+        accepted = listener.accept() => accepted.unwrap().0,
+    };
+    let mut headers = Vec::new();
+    loop {
+        let mut byte = [0];
+        tokio::select! {
+            result = &mut first => panic!("unexpected completion: {result:?}"),
+            read = socket.read_exact(&mut byte) => { read.unwrap(); },
+        }
+        headers.push(byte[0]);
+        if headers.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    let headers = String::from_utf8(headers).unwrap().to_ascii_lowercase();
+    assert!(headers.starts_with("head "));
+    assert!(!headers.contains("authorization:"));
+    assert!(!headers.contains("chatgpt-account-id:"));
+    assert_eq!(client.prewarm().await, Ok(()));
+    client.record_transport_active();
+    let recorded = client.activity.lock().unwrap().recent;
+    socket.write_all(b"invalid HTTP\r\n\r\n").await.unwrap();
+    drop(socket);
+    assert_eq!(first.await, Err(CustomOpenAiError::Transport));
+    assert_eq!(client.activity.lock().unwrap().recent, recorded);
+    assert!(client.activity.lock().unwrap().active_attempt.is_none());
+    std::fs::write(&auth.0, b"{}").unwrap();
+    assert_eq!(
+        client.prewarm().await,
+        Err(CustomOpenAiError::AuthUnavailable)
+    );
+    assert!(listener.accept().now_or_never().is_none());
+}
+
+#[tokio::test]
+async fn failed_prewarm_can_retry_immediately() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let auth = AuthFixture::new();
+    let client = CustomOpenAiClient::new(CustomOpenAiConfig {
+        endpoint: format!("http://{}/responses", listener.local_addr().unwrap()),
+        auth_path: auth.0.clone(),
+        ..Default::default()
+    })
+    .unwrap();
+    for _ in 0..2 {
+        let mut warm = Box::pin(client.prewarm());
+        let mut socket = tokio::select! {
+            result = &mut warm => panic!("unexpected completion: {result:?}"),
+            accepted = listener.accept() => accepted.unwrap().0,
+        };
+        socket.write_all(b"invalid HTTP\r\n\r\n").await.unwrap();
+        drop(socket);
+        assert_eq!(warm.await, Err(CustomOpenAiError::Transport));
+        let activity = client.activity.lock().unwrap();
+        assert!(activity.recent.is_none());
+        assert!(activity.active_attempt.is_none());
+    }
+}
 const CHILD_MODEL: &str = "VOX_SYNTHETIC_LOOPBACK_MODEL";
 static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 

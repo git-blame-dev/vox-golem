@@ -215,15 +215,13 @@ pub fn request_body(
     input: &[Value],
     instructions: &str,
     tools: &[Value],
-    require_tool: bool,
 ) -> Value {
-    envelope::tool_value(config, session_id, input, instructions, tools, require_tool)
+    envelope::tool_value(config, session_id, input, instructions, tools)
 }
 
 pub struct RoundOptions {
     pub deadline: tokio::time::Instant,
     pub expected_auth_revision: Option<CustomOpenAiAuthRevision>,
-    pub require_tool: bool,
 }
 
 pub struct RoundRequest<'a> {
@@ -353,7 +351,6 @@ impl CustomOpenAiClient {
             input,
             instructions,
             Some(tools),
-            options.require_tool,
             &mut preparation_check,
         )?;
         if tokio::time::Instant::now() >= deadline {
@@ -402,6 +399,8 @@ impl CustomOpenAiClient {
             if remaining.is_zero() {
                 return Err(CustomOpenAiError::Timeout.into());
             }
+            #[cfg(feature = "app-benchmark")]
+            crate::app_benchmark::before_generation(&self.config)?;
             let response = builder
                 .timeout(remaining)
                 .send()
@@ -586,7 +585,6 @@ mod tests {
                         RoundOptions {
                             deadline,
                             expected_auth_revision: None,
-                            require_tool: false,
                         },
                         |event| {
                             if near_deadline && matches!(event, ModelEvent::TextDelta { .. }) {
@@ -703,7 +701,6 @@ mod tests {
                             RoundOptions {
                                 deadline: tokio::time::Instant::now() + Duration::from_secs(3),
                                 expected_auth_revision: None,
-                                require_tool: false,
                             },
                             |event| {
                                 if let ModelEvent::TextDelta { text, .. } = event {
@@ -757,7 +754,6 @@ mod tests {
                 RoundOptions {
                     deadline: tokio::time::Instant::now() + Duration::from_secs(1),
                     expected_auth_revision: None,
-                    require_tool: false,
                 },
                 |event| {
                     if matches!(event, ModelEvent::RequestDispatched(_)) {

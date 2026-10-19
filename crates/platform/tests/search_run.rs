@@ -20,6 +20,224 @@ use voxgolem_platform::{custom_openai::*, search::*, search_control::Cancellatio
 static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 static FIXTURE_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 
+fn tool_output(request: &Value, call_id: &str) -> Value {
+    let output = request["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "function_call_output" && item["call_id"] == call_id)
+        .unwrap();
+    serde_json::from_str(output["output"].as_str().unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn denied_url_reaches_the_model_as_a_typed_failure_without_web_execution() {
+    let (config, _auth, server) = fixture(vec![
+        vec![call(
+            "synthetic-denied-url",
+            "web_fetch",
+            json!({"urls":["http://127.0.0.1/private"],"focus":"Synthetic focus"}),
+        )],
+        vec![answer()],
+    ])
+    .await;
+    let mut web = WebService::new(EvidenceTransport { calls: vec![] });
+    let result = run(config, &prompt(), &mut web, &Cancellation::default())
+        .await
+        .unwrap();
+    assert!(result.partial);
+    assert_eq!(result.reads, 0);
+    assert!(web.transport.calls.is_empty());
+    let requests = server.await.unwrap();
+    assert_eq!(
+        tool_output(&requests[1], "synthetic-denied-url")["error"],
+        "denied_url"
+    );
+    assert_eq!(requests[1]["tool_choice"], "auto");
+}
+
+#[tokio::test]
+async fn refusal_after_search_does_not_append_a_source_footer() {
+    let refusal = json!({"type":"message","id":"synthetic-refusal","content":[{"type":"refusal","refusal":"Synthetic refusal"}]});
+    let (config, _auth, server) =
+        fixture(vec![vec![search_call("synthetic-search")], vec![refusal]]).await;
+    let mut web = WebService::new(EvidenceTransport { calls: vec![] });
+    let result = run(config, &prompt(), &mut web, &Cancellation::default())
+        .await
+        .unwrap();
+    assert!(!result.sources.is_empty());
+    assert_eq!(
+        result.response.content_type,
+        CustomOpenAiContentType::Refusal
+    );
+    assert_eq!(result.persisted_text(), "Synthetic refusal");
+    assert_eq!(server.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn eight_searches_leave_a_budget_error_and_tenth_round_for_supported_synthesis() {
+    let mut rounds: Vec<_> = (0..9)
+        .map(|index| vec![search_call(&format!("synthetic-search-{index}"))])
+        .collect();
+    let mut qualified = answer();
+    qualified["content"][0]["text"] =
+        json!("Synthetic partial findings; further lookup was unavailable.");
+    rounds.push(vec![qualified]);
+    let (config, _auth, server) = fixture(rounds).await;
+    let mut web = WebService::new(EvidenceTransport { calls: vec![] });
+    let result = run(config, &prompt(), &mut web, &Cancellation::default())
+        .await
+        .unwrap();
+    assert_eq!((result.rounds, result.searches, result.reads), (10, 8, 0));
+    assert_eq!(web.transport.calls.len(), 8);
+    assert!(result.partial);
+    assert_eq!(
+        result.response.text,
+        "Synthetic partial findings; further lookup was unavailable."
+    );
+    let requests = server.await.unwrap();
+    for request in &requests[..9] {
+        assert_eq!(request["tool_choice"], "auto");
+        assert_eq!(request["tools"].as_array().unwrap().len(), 2);
+    }
+    assert_eq!(requests[9]["tools"], json!([]));
+    assert_eq!(requests[9]["tool_choice"], "none");
+    assert_eq!(
+        tool_output(&requests[9], "synthetic-search-8")["error"],
+        "budget"
+    );
+    // This scripted answer proves transport and settlement, not real-model honesty.
+}
+
+#[tokio::test]
+async fn url_read_allowance_counts_failed_urls_and_denies_an_over_budget_batch_atomically() {
+    struct FailedReads(usize);
+    impl WebExecutor for FailedReads {
+        async fn execute(
+            &mut self,
+            operation: &Operation,
+            _: &str,
+            _: &str,
+            _: Instant,
+            _: &Cancellation,
+        ) -> Result<ToolResult, Failure> {
+            self.0 += operation.read_count();
+            Err(Failure::Transport)
+        }
+    }
+    let fetch = |id: &str, start: usize, count: usize| {
+        call(
+            id,
+            "web_fetch",
+            json!({
+                "urls":(start..start+count).map(|index| format!("https://example.com/page-{index}")).collect::<Vec<_>>(),
+                "focus":"Synthetic focus"
+            }),
+        )
+    };
+    let (config, _auth, server) = fixture(vec![
+        vec![fetch("synthetic-first", 0, 3)],
+        vec![fetch("synthetic-second", 3, 3)],
+        vec![fetch("synthetic-too-many", 6, 3)],
+        vec![fetch("synthetic-last-two", 6, 2)],
+        vec![fetch("synthetic-exhausted", 8, 1)],
+        vec![answer()],
+    ])
+    .await;
+    let mut web = FailedReads(0);
+    let result = run(config, &prompt(), &mut web, &Cancellation::default())
+        .await
+        .unwrap();
+    assert_eq!(result.reads, 8);
+    assert_eq!(web.0, 8);
+    assert!(result.partial);
+    assert!(!result.source_read_observed);
+    let requests = server.await.unwrap();
+    assert_eq!(
+        tool_output(&requests[1], "synthetic-first")["error"],
+        "transport"
+    );
+    assert_eq!(
+        tool_output(&requests[3], "synthetic-too-many")["error"],
+        "budget"
+    );
+    assert_eq!(
+        tool_output(&requests[4], "synthetic-last-two")["error"],
+        "transport"
+    );
+    assert_eq!(
+        tool_output(&requests[5], "synthetic-exhausted")["error"],
+        "budget"
+    );
+    assert!(requests
+        .iter()
+        .all(|request| request["tool_choice"] == "auto"));
+}
+
+#[tokio::test]
+async fn unreadable_or_failed_pages_deliver_typed_gaps_with_corrective_tools_still_available() {
+    struct GapTransport {
+        unreadable: bool,
+        calls: usize,
+    }
+    impl WebTransport for GapTransport {
+        async fn call(
+            &mut self,
+            _: Provider,
+            _: &Operation,
+            _: &str,
+            _: Instant,
+            _: &Cancellation,
+        ) -> Result<Value, ProviderFailure> {
+            self.calls += 1;
+            if self.unreadable {
+                Ok(
+                    json!({"structuredContent":{"results":[{"url":"https://example.com/source","excerpts":[" \t\u{0000}"]}],"errors":[]},
+                    "content":[{"type":"text","text":"Title: Synthetic page\nURL: https://example.com/source\nText:\n \t"}]}),
+                )
+            } else {
+                Err(Failure::Transport.into())
+            }
+        }
+    }
+    for unreadable in [false, true] {
+        let (config, _auth, server) = fixture(vec![
+            vec![call(
+                "synthetic-gap",
+                "web_fetch",
+                json!({"urls":["https://example.com/source"],"focus":"Synthetic focus"}),
+            )],
+            vec![answer()],
+        ])
+        .await;
+        let mut web = WebService::new(GapTransport {
+            unreadable,
+            calls: 0,
+        });
+        let result = run(config, &prompt(), &mut web, &Cancellation::default())
+            .await
+            .unwrap();
+        assert!(result.partial);
+        assert!(!result.source_read_observed);
+        assert_eq!(result.rounds, 2);
+        assert_eq!(result.response.text, "Synthetic final answer.");
+        let requests = server.await.unwrap();
+        assert_eq!(requests[1]["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(requests[1]["tool_choice"], "auto");
+        let output = tool_output(&requests[1], "synthetic-gap");
+        if unreadable {
+            let evidence = &output["untrusted_web_evidence"];
+            assert_eq!(evidence["evidence_unavailable"], true);
+            assert_eq!(evidence["partial"], true);
+            assert_eq!(evidence["sources"], json!([]));
+            assert_eq!(evidence["failures"][0]["failure"], "invalid_upstream");
+        } else {
+            assert_eq!(output["error"], "transport");
+        }
+        assert!(web.transport.calls > 0);
+    }
+}
+
 #[tokio::test]
 async fn final_terminal_near_search_deadline_does_not_wait_for_open_tail() {
     let (mut config, _auth, unused_server) = fixture(vec![]).await;
@@ -66,11 +284,9 @@ async fn final_terminal_near_search_deadline_does_not_wait_for_open_tail() {
     let result = run_with_client_events(
         &client,
         &prompt,
-        Mode::Quick,
         RunContext {
             conversation_id: "synthetic-deadline",
             instructions: "Synthetic policy",
-            explicit_search: false,
             web_enabled: true,
         },
         &mut web,
@@ -275,15 +491,9 @@ async fn exact_current_request_history_auth_and_opaque_tool_continuation_reach_f
     ])
     .await;
     let mut web = WebService::new(EvidenceTransport { calls: vec![] });
-    let result = run(
-        config,
-        &prompt(),
-        Mode::Verify,
-        &mut web,
-        &Cancellation::default(),
-    )
-    .await
-    .unwrap();
+    let result = run(config, &prompt(), &mut web, &Cancellation::default())
+        .await
+        .unwrap();
     assert_eq!((result.rounds, result.searches, result.reads), (3, 1, 1));
     assert!(result.source_read_observed);
     assert!(!result.partial);
@@ -307,8 +517,8 @@ async fn exact_current_request_history_auth_and_opaque_tool_continuation_reach_f
 }
 
 #[tokio::test]
-async fn dispatch_is_forwarded_for_each_round_while_text_waits_for_readable_evidence() {
-    let filtered = json!({"type":"response.output_text.delta","delta":"Synthetic withheld text"});
+async fn dispatch_and_text_are_forwarded_in_each_model_chosen_tool_round() {
+    let filtered = json!({"type":"response.output_text.delta","delta":"Synthetic progress text"});
     let (config, _auth, server) = fixture(vec![
         vec![filtered.clone(), search_call("synthetic-search")],
         vec![
@@ -328,11 +538,9 @@ async fn dispatch_is_forwarded_for_each_round_while_text_waits_for_readable_evid
     let result = run_with_events(
         config,
         &prompt(),
-        Mode::Verify,
         RunContext {
             conversation_id: "synthetic-conversation",
             instructions: "Synthetic policy",
-            explicit_search: false,
             web_enabled: true,
         },
         &mut web,
@@ -341,10 +549,10 @@ async fn dispatch_is_forwarded_for_each_round_while_text_waits_for_readable_evid
             match event {
                 RunEvent::Model(ModelEvent::RequestDispatched(instant)) => {
                     dispatches.push(instant);
-                    assert!(texts.is_empty());
+                    assert_eq!(texts.len(), dispatches.len() - 1);
                 }
                 RunEvent::Model(ModelEvent::TextDelta { text, .. }) => {
-                    assert_eq!(dispatches.len(), 3);
+                    assert_eq!(dispatches.len(), texts.len() + 1);
                     texts.push(text.to_string());
                 }
                 _ => {}
@@ -357,12 +565,19 @@ async fn dispatch_is_forwarded_for_each_round_while_text_waits_for_readable_evid
     server.await.unwrap();
     assert_eq!(dispatches.len(), result.rounds);
     assert!(dispatches.windows(2).all(|pair| pair[0] <= pair[1]));
-    assert_eq!(texts, ["Synthetic final answer."]);
+    assert_eq!(
+        texts,
+        [
+            "Synthetic progress text",
+            "Synthetic progress text",
+            "Synthetic final answer."
+        ]
+    );
     assert!(result.source_read_observed);
 }
 
 #[tokio::test]
-async fn quick_budget_prevents_third_search_and_reserves_tools_disabled_final_round() {
+async fn automatic_limits_allow_multi_step_search_without_a_preset() {
     let (config, _auth, server) = fixture(vec![
         vec![search_call("synthetic-one")],
         vec![search_call("synthetic-two")],
@@ -374,11 +589,9 @@ async fn quick_budget_prevents_third_search_and_reserves_tools_disabled_final_ro
     let result = run_with_events(
         config,
         &prompt(),
-        Mode::Quick,
         RunContext {
             conversation_id: "synthetic-conversation",
             instructions: "Synthetic style.",
-            explicit_search: true,
             web_enabled: true,
         },
         &mut web,
@@ -387,18 +600,12 @@ async fn quick_budget_prevents_third_search_and_reserves_tools_disabled_final_ro
     )
     .await
     .unwrap();
-    assert_eq!(result.searches, 2);
-    assert_eq!(web.transport.calls.len(), 2);
-    assert!(result.partial);
+    assert_eq!(result.searches, 3);
+    assert_eq!(web.transport.calls.len(), 3);
+    assert!(!result.partial);
     let requests = server.await.unwrap();
-    assert_eq!(requests[3]["tool_choice"], "none");
-    assert_eq!(requests[3]["tools"], json!([]));
-    assert!(
-        requests[3]["input"].as_array().unwrap().last().unwrap()["output"]
-            .as_str()
-            .unwrap()
-            .contains("budget")
-    );
+    assert_eq!(requests[3]["tool_choice"], "auto");
+    assert!(!requests[3]["tools"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -427,11 +634,9 @@ async fn replayed_call_uses_cached_result_and_conflicting_reuse_never_reexecutes
         let result = run_with_events(
             config,
             &prompt(),
-            Mode::Quick,
             RunContext {
                 conversation_id: "synthetic-conversation",
                 instructions: "Synthetic style.",
-                explicit_search: true,
                 web_enabled: true,
             },
             &mut web,
@@ -455,15 +660,9 @@ async fn malformed_arguments_are_returned_to_model_without_network_execution() {
     invalid["arguments"] = json!("{unfinished");
     let (config, _auth, server) = fixture(vec![vec![invalid], vec![answer()]]).await;
     let mut web = WebService::new(EvidenceTransport { calls: vec![] });
-    let result = run(
-        config,
-        &prompt(),
-        Mode::Quick,
-        &mut web,
-        &Cancellation::default(),
-    )
-    .await
-    .unwrap();
+    let result = run(config, &prompt(), &mut web, &Cancellation::default())
+        .await
+        .unwrap();
     assert!(web.transport.calls.is_empty());
     assert!(result.partial);
     assert!(!result.source_read_observed);
@@ -477,16 +676,18 @@ async fn malformed_arguments_are_returned_to_model_without_network_execution() {
 }
 
 #[tokio::test]
-async fn verify_and_research_cannot_settle_without_retrieval_or_explicit_failure() {
-    for mode in [Mode::Verify, Mode::Research] {
-        let (config, _auth, server) = fixture(vec![vec![answer()]]).await;
-        let mut web = WebService::new(EvidenceTransport { calls: vec![] });
-        let outcome = run(config, &prompt(), mode, &mut web, &Cancellation::default()).await;
-        assert!(matches!(outcome, Err(RunError::Tool(Failure::Unsupported))));
-        let requests = server.await.unwrap();
-        assert_eq!(requests[0]["tool_choice"], "required");
-        assert!(web.transport.calls.is_empty());
-    }
+async fn ordinary_answer_can_settle_without_any_retrieval() {
+    let (config, _auth, server) = fixture(vec![vec![answer()]]).await;
+    let mut web = WebService::new(EvidenceTransport { calls: vec![] });
+    let outcome = run(config, &prompt(), &mut web, &Cancellation::default())
+        .await
+        .unwrap();
+    assert_eq!(outcome.response.text, "Synthetic final answer.");
+    assert_eq!(outcome.rounds, 1);
+    assert!(!outcome.partial);
+    let requests = server.await.unwrap();
+    assert_eq!(requests[0]["tool_choice"], "auto");
+    assert!(web.transport.calls.is_empty());
 }
 
 #[tokio::test]
@@ -510,14 +711,7 @@ async fn changed_credentials_are_rejected_before_sending_continuation() {
     }
     let (config, auth, server) = fixture(vec![vec![search_call("synthetic-search")]]).await;
     let mut web = WebService::new(ReplacingTransport(auth.0.clone()));
-    let result = run(
-        config,
-        &prompt(),
-        Mode::Quick,
-        &mut web,
-        &Cancellation::default(),
-    )
-    .await;
+    let result = run(config, &prompt(), &mut web, &Cancellation::default()).await;
     assert!(matches!(
         result,
         Err(RunError::Provider(CustomOpenAiError::AuthUnavailable))
@@ -531,14 +725,7 @@ async fn pre_cancelled_run_never_calls_model_or_tools() {
     cancel.cancel();
     let mut web = WebService::new(EvidenceTransport { calls: vec![] });
     assert!(matches!(
-        run(
-            CustomOpenAiConfig::default(),
-            &prompt(),
-            Mode::Quick,
-            &mut web,
-            &cancel
-        )
-        .await,
+        run(CustomOpenAiConfig::default(), &prompt(), &mut web, &cancel).await,
         Err(RunError::Tool(Failure::Cancelled))
     ));
     assert!(web.transport.calls.is_empty());
@@ -591,11 +778,9 @@ async fn native_style_and_terminal_stream_callback_reach_the_current_provider_co
     let result = run_with_events(
         config,
         &prompt(),
-        Mode::Quick,
         RunContext {
             conversation_id: "synthetic-conversation-key",
             instructions: "Synthetic compact watch style.",
-            explicit_search: false,
             web_enabled: true,
         },
         &mut web,
@@ -651,11 +836,9 @@ async fn per_turn_model_ids_do_not_rotate_the_stable_parallel_conversation_ident
         let result = run_with_events(
             config,
             &prompt,
-            Mode::Quick,
             RunContext {
                 conversation_id: "synthetic-conversation-key",
                 instructions: "Synthetic style.",
-                explicit_search: false,
                 web_enabled: true,
             },
             &mut web,
@@ -681,11 +864,9 @@ async fn failed_native_text_consumer_prevents_a_completed_result() {
     let result = run_with_events(
         config,
         &prompt(),
-        Mode::Quick,
         RunContext {
             conversation_id: "synthetic-conversation-key",
             instructions: "Synthetic style.",
-            explicit_search: false,
             web_enabled: true,
         },
         &mut web,
@@ -704,7 +885,7 @@ async fn failed_native_text_consumer_prevents_a_completed_result() {
 }
 
 #[tokio::test]
-async fn verification_deltas_wait_for_page_evidence_and_tools_never_enter_the_text_stream() {
+async fn progress_messages_stream_while_tools_never_enter_the_text_stream() {
     let mut preliminary = answer();
     preliminary["content"][0]["text"] = json!("Synthetic unverified claim.");
     let (config, _auth, server) = fixture(vec![
@@ -722,11 +903,9 @@ async fn verification_deltas_wait_for_page_evidence_and_tools_never_enter_the_te
     let result = run_with_events(
         config,
         &prompt(),
-        Mode::Verify,
         RunContext {
             conversation_id: "synthetic-conversation-key",
             instructions: "Synthetic style.",
-            explicit_search: true,
             web_enabled: true,
         },
         &mut web,
@@ -740,7 +919,10 @@ async fn verification_deltas_wait_for_page_evidence_and_tools_never_enter_the_te
     )
     .await
     .unwrap();
-    assert_eq!(deltas, vec!["Synthetic final answer."]);
+    assert_eq!(
+        deltas,
+        vec!["Synthetic unverified claim.", "Synthetic final answer."]
+    );
     assert!(result.source_read_observed);
     assert_eq!(result.response.text, "Synthetic final answer.");
     assert!(result
@@ -761,14 +943,7 @@ async fn native_parent_cancellation_and_closed_registration_prevent_network_admi
         let cancel = Cancellation::from_receiver(receiver);
         let mut web = WebService::new(EvidenceTransport { calls: vec![] });
         assert!(matches!(
-            run(
-                CustomOpenAiConfig::default(),
-                &prompt(),
-                Mode::Quick,
-                &mut web,
-                &cancel
-            )
-            .await,
+            run(CustomOpenAiConfig::default(), &prompt(), &mut web, &cancel).await,
             Err(RunError::Tool(Failure::Cancelled))
         ));
         assert!(web.transport.calls.is_empty());
@@ -790,11 +965,9 @@ async fn actual_utf8_text_deltas_stream_without_replaying_the_terminal_message()
     let result = run_with_events(
         config,
         &prompt(),
-        Mode::Quick,
         RunContext {
             conversation_id: "synthetic-conversation-key",
             instructions: "Synthetic style.",
-            explicit_search: false,
             web_enabled: true,
         },
         &mut web,
@@ -831,11 +1004,9 @@ async fn cancellation_during_a_delta_stops_later_callbacks_and_result_settlement
     let result = run_with_events(
         config,
         &prompt(),
-        Mode::Quick,
         RunContext {
             conversation_id: "synthetic-conversation-key",
             instructions: "Synthetic style.",
-            explicit_search: false,
             web_enabled: true,
         },
         &mut web,
@@ -862,11 +1033,9 @@ async fn refusal_keeps_native_kind_and_is_not_relabelled_as_unsupported_search()
     let result = run_with_events(
         config,
         &prompt(),
-        Mode::Verify,
         RunContext {
             conversation_id: "synthetic-conversation-key",
             instructions: "Synthetic style.",
-            explicit_search: true,
             web_enabled: true,
         },
         &mut web,
@@ -885,82 +1054,75 @@ async fn refusal_keeps_native_kind_and_is_not_relabelled_as_unsupported_search()
 }
 
 #[tokio::test]
-async fn trusted_library_explicit_quick_search_cannot_complete_without_a_retrieval_attempt() {
+async fn permitted_web_does_not_force_lookup_or_prefix_an_ordinary_answer() {
     let (config, _auth, server) = fixture(vec![vec![answer()]]).await;
     let mut web = WebService::new(EvidenceTransport { calls: vec![] });
     let result = run_with_events(
         config,
         &prompt(),
-        Mode::Quick,
         RunContext {
             conversation_id: "synthetic-conversation-key",
             instructions: "Synthetic style.",
-            explicit_search: true,
             web_enabled: true,
         },
         &mut web,
         &Cancellation::default(),
         |_| Ok(()),
     )
-    .await;
-    assert!(matches!(result, Err(RunError::Tool(Failure::Unsupported))));
-    assert_eq!(server.await.unwrap()[0]["tool_choice"], "required");
+    .await
+    .unwrap();
+    assert_eq!(result.response.text, "Synthetic final answer.");
+    assert!(web.transport.calls.is_empty());
+    assert_eq!(server.await.unwrap()[0]["tool_choice"], "auto");
 }
 
 #[tokio::test]
-async fn disabled_web_keeps_chat_and_verify_research_but_advertises_no_tools_or_fallback() {
-    for mode in [Mode::Quick, Mode::Verify, Mode::Research] {
-        let (config, _auth, server) = fixture(vec![vec![answer()]]).await;
-        let mut web = WebService::new(EvidenceTransport { calls: vec![] });
-        let mut deltas = String::new();
-        let composed =
-            voxgolem_core::response_style::compose_instructions("Synthetic custom instructions.");
-        let result = run_with_events(
-            config,
-            &prompt(),
-            mode,
-            RunContext {
-                conversation_id: "synthetic-conversation",
-                instructions: &composed,
-                explicit_search: mode != Mode::Quick,
-                web_enabled: false,
-            },
-            &mut web,
-            &Cancellation::default(),
-            |event| {
-                if let RunEvent::Model(ModelEvent::TextDelta { text, .. }) = event {
-                    deltas.push_str(text);
-                }
-                Ok(())
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(result.response.text, deltas);
-        assert!(result.response.text.ends_with("Synthetic final answer."));
-        if mode != Mode::Quick {
-            assert!(result.response.text.starts_with("Web lookup disabled:"));
-        }
-        assert!(web.transport.calls.is_empty());
-        assert_eq!((result.searches, result.reads, result.fallbacks), (0, 0, 0));
-        assert!(!result.source_read_observed);
-        let requests = server.await.unwrap();
-        assert_eq!(requests[0]["tools"], json!([]));
-        assert_eq!(requests[0]["tool_choice"], "none");
-        let instructions = requests[0]["instructions"].as_str().unwrap();
-        assert!(instructions.contains("Web lookup is disabled by native permission"));
-        assert!(instructions.contains(voxgolem_core::response_style::PLAIN_TEXT_POLICY));
-        assert_eq!(
-            instructions
-                .matches(voxgolem_core::response_style::PLAIN_TEXT_POLICY)
-                .count(),
-            1
-        );
-    }
+async fn disabled_web_keeps_chat_but_advertises_no_tools_or_fallback() {
+    let (config, _auth, server) = fixture(vec![vec![answer()]]).await;
+    let mut web = WebService::new(EvidenceTransport { calls: vec![] });
+    let mut deltas = String::new();
+    let composed =
+        voxgolem_core::response_style::compose_instructions("Synthetic custom instructions.");
+    let result = run_with_events(
+        config,
+        &prompt(),
+        RunContext {
+            conversation_id: "synthetic-conversation",
+            instructions: &composed,
+            web_enabled: false,
+        },
+        &mut web,
+        &Cancellation::default(),
+        |event| {
+            if let RunEvent::Model(ModelEvent::TextDelta { text, .. }) = event {
+                deltas.push_str(text);
+            }
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.response.text, deltas);
+    assert_eq!(result.response.text, "Synthetic final answer.");
+    assert!(web.transport.calls.is_empty());
+    assert_eq!((result.searches, result.reads, result.fallbacks), (0, 0, 0));
+    assert!(!result.source_read_observed);
+    let requests = server.await.unwrap();
+    assert_eq!(requests[0]["tools"], json!([]));
+    assert_eq!(requests[0]["tool_choice"], "none");
+    let instructions = requests[0]["instructions"].as_str().unwrap();
+    assert!(instructions.contains("Web research is disabled by native permission"));
+    assert!(instructions.contains(voxgolem_core::response_style::PLAIN_TEXT_POLICY));
+    assert_eq!(
+        instructions
+            .matches(voxgolem_core::response_style::PLAIN_TEXT_POLICY)
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
-async fn disabled_lookup_disclosure_preserves_refusal_kind_in_stream_and_terminal() {
+async fn disabled_web_preserves_refusal_kind_without_injecting_a_prefix() {
     let refusal = json!({"type":"message","id":"synthetic-refusal","content":[{"type":"refusal","refusal":"Synthetic refusal"}]});
     let (config, _auth, server) = fixture(vec![vec![refusal]]).await;
     let mut web = WebService::new(EvidenceTransport { calls: vec![] });
@@ -968,11 +1130,9 @@ async fn disabled_lookup_disclosure_preserves_refusal_kind_in_stream_and_termina
     let result = run_with_events(
         config,
         &prompt(),
-        Mode::Verify,
         RunContext {
             conversation_id: "synthetic-conversation",
             instructions: "Synthetic instructions.",
-            explicit_search: true,
             web_enabled: false,
         },
         &mut web,
@@ -996,7 +1156,7 @@ async fn disabled_lookup_disclosure_preserves_refusal_kind_in_stream_and_termina
         CustomOpenAiContentType::Refusal
     );
     assert_eq!(result.response.text, text);
-    assert!(text.ends_with("Synthetic refusal"));
+    assert_eq!(text, "Synthetic refusal");
     assert!(web.transport.calls.is_empty());
     server.await.unwrap();
 }
@@ -1008,11 +1168,9 @@ async fn disabled_permission_rejects_provider_tool_calls_before_any_transport() 
     let result = run_with_events(
         config,
         &prompt(),
-        Mode::Research,
         RunContext {
             conversation_id: "synthetic-conversation",
             instructions: "Synthetic instructions.",
-            explicit_search: true,
             web_enabled: false,
         },
         &mut web,
@@ -1026,7 +1184,7 @@ async fn disabled_permission_rejects_provider_tool_calls_before_any_transport() 
 }
 
 #[tokio::test]
-async fn operation_timing_includes_tools_and_rounds_but_not_suppressed_text() {
+async fn operation_timing_includes_tools_and_rounds_and_first_progress_text() {
     struct TimedTransport {
         origin: Instant,
         after_tools: Duration,
@@ -1050,7 +1208,7 @@ async fn operation_timing_includes_tools_and_rounds_but_not_suppressed_text() {
     }
     let (config, _auth, server) = fixture(vec![
         vec![
-            json!({"type":"response.output_text.delta","delta":"Synthetic suppressed claim"}),
+            json!({"type":"response.output_text.delta","delta":"Synthetic progress"}),
             search_call("synthetic-search"),
         ],
         vec![call(
@@ -1069,11 +1227,9 @@ async fn operation_timing_includes_tools_and_rounds_but_not_suppressed_text() {
     let result = run_with_events(
         config,
         &prompt(),
-        Mode::Verify,
         RunContext {
             conversation_id: "synthetic-conversation",
             instructions: "Synthetic instructions.",
-            explicit_search: true,
             web_enabled: true,
         },
         &mut web,
@@ -1087,9 +1243,12 @@ async fn operation_timing_includes_tools_and_rounds_but_not_suppressed_text() {
     )
     .await
     .unwrap();
-    assert_eq!(deltas, vec!["Synthetic final answer."]);
+    assert_eq!(
+        deltas,
+        vec!["Synthetic progress", "Synthetic final answer."]
+    );
     // Common observer; a small origin offset is measured rather than assumed.
-    assert!(result.response.timings.first_text_at.unwrap() >= Duration::from_millis(40));
+    assert!(result.response.timings.first_text_at.unwrap() < web.transport.after_tools);
     assert!(result.response.timings.completed_at >= Duration::from_millis(40));
     assert!(result.response.timings.headers_at < result.response.timings.first_text_at.unwrap());
     assert!(result.response.timings.first_text_at.unwrap() <= result.response.timings.completed_at);
@@ -1106,11 +1265,9 @@ fn shared_runner_future_can_use_the_desktop_send_executor() {
     assert_send(run_with_events(
         CustomOpenAiConfig::default(),
         &prompt,
-        Mode::Quick,
         RunContext {
             conversation_id: "synthetic-conversation-key",
             instructions: "Synthetic style.",
-            explicit_search: false,
             web_enabled: true,
         },
         &mut web,
@@ -1131,14 +1288,7 @@ async fn terminal_omitted_or_conflicting_calls_never_reach_web_transport() {
         let (config, _auth, server) =
             fixture(vec![vec![search_call("synthetic-call"), terminal]]).await;
         let mut web = WebService::new(EvidenceTransport { calls: vec![] });
-        let result = run(
-            config,
-            &prompt(),
-            Mode::Quick,
-            &mut web,
-            &Cancellation::default(),
-        )
-        .await;
+        let result = run(config, &prompt(), &mut web, &Cancellation::default()).await;
         assert!(matches!(
             result,
             Err(RunError::Provider(CustomOpenAiError::MalformedStream))
@@ -1168,11 +1318,9 @@ async fn cancelling_first_tool_failure_prevents_later_callbacks_in_the_same_roun
     let result = run_with_events(
         config,
         &prompt(),
-        Mode::Quick,
         RunContext {
             conversation_id: "synthetic-conversation-key",
             instructions: "Synthetic style.",
-            explicit_search: false,
             web_enabled: true,
         },
         &mut web,
@@ -1205,11 +1353,9 @@ async fn cancelling_completed_tool_prevents_a_following_invalid_call_callback() 
     let result = run_with_events(
         config,
         &prompt(),
-        Mode::Quick,
         RunContext {
             conversation_id: "synthetic-conversation-key",
             instructions: "Synthetic style.",
-            explicit_search: false,
             web_enabled: true,
         },
         &mut web,
@@ -1234,7 +1380,7 @@ async fn cancelling_completed_tool_prevents_a_following_invalid_call_callback() 
 }
 
 #[tokio::test]
-async fn verification_gate_rechecks_readability_after_the_run_evidence_budget() {
+async fn evidence_budget_truncation_rechecks_readability_without_suppressing_text() {
     struct BudgetedTransport;
     impl WebTransport for BudgetedTransport {
         async fn call(
@@ -1248,29 +1394,23 @@ async fn verification_gate_rechecks_readability_after_the_run_evidence_budget() 
             let (sources, content) = if operation.fetch() {
                 (
                     vec![
-                        json!({"url":"https://example.com/source","title":"Synthetic page","excerpts":[format!("{}Readable synthetic content","\0".repeat(3000))]}),
+                        json!({"url":"https://example.com/source","title":"Synthetic page","excerpts":[format!("{}Readable synthetic content","\0".repeat(5000))]}),
                     ],
                     vec![
-                        json!({"type":"text","text":format!("Title: Synthetic page\nURL: https://example.com/source\nText:\n{}Readable synthetic content","\0".repeat(3000))}),
+                        json!({"type":"text","text":format!("Title: Synthetic page\nURL: https://example.com/source\nText:\n{}Readable synthetic content","\0".repeat(5000))}),
                     ],
                 )
             } else {
                 (
-                    vec![
-                        json!({"url":"https://example.com/one","title":"Synthetic one","excerpts":["a".repeat(11000)]}),
-                        json!({"url":"https://example.com/two","title":"Synthetic two","excerpts":["b".repeat(11000)]}),
-                    ],
-                    vec![
-                        json!({"type":"text","text":format!("Title: Synthetic one\nURL: https://example.com/one\nPublished: N/A\nAuthor: N/A\nHighlights:\n{}","a".repeat(11000))}),
-                        json!({"type":"text","text":format!("Title: Synthetic two\nURL: https://example.com/two\nPublished: N/A\nAuthor: N/A\nHighlights:\n{}","b".repeat(11000))}),
-                    ],
+                    (0..8).map(|index| json!({"url":format!("https://example.com/source-{index}"),"title":"Synthetic source","excerpts":["a".repeat(12000)]})).collect(),
+                    vec![],
                 )
             };
             Ok(json!({"structuredContent":{"results":sources},"content":content}))
         }
     }
     let (config, _auth, server) = fixture(vec![
-        vec![search_call("synthetic-search")],
+        vec![call("synthetic-search", "web_search", json!({"objective":"Synthetic objective","queries":["Synthetic query"],"num_results":8}))],
         vec![call(
             "synthetic-fetch",
             "web_fetch",
@@ -1284,11 +1424,9 @@ async fn verification_gate_rechecks_readability_after_the_run_evidence_budget() 
     let result = run_with_events(
         config,
         &prompt(),
-        Mode::Quick,
         RunContext {
             conversation_id: "synthetic-conversation-key",
             instructions: "Synthetic style.",
-            explicit_search: true,
             web_enabled: true,
         },
         &mut web,
@@ -1303,40 +1441,58 @@ async fn verification_gate_rechecks_readability_after_the_run_evidence_budget() 
     .await
     .unwrap();
     assert!(!result.source_read_observed);
-    assert!(deltas.is_empty());
-    assert!(result
-        .response
-        .text
-        .starts_with("Source verification incomplete:"));
-    server.await.unwrap();
+    assert!(result.partial);
+    assert_eq!(
+        result
+            .sources
+            .iter()
+            .map(|source| source.text.len())
+            .sum::<usize>(),
+        96 * 1024
+    );
+    let page = result
+        .sources
+        .iter()
+        .find(|source| source.kind == EvidenceKind::PageRead)
+        .unwrap();
+    assert!(page.truncated);
+    assert!(!has_readable_text(&page.text));
+    assert_eq!(deltas, ["Synthetic final answer."]);
+    assert_eq!(result.response.text, "Synthetic final answer.");
+    let requests = server.await.unwrap();
+    assert_eq!(requests[2]["tools"], json!([]));
+    assert_eq!(requests[2]["tool_choice"], "none");
+    let evidence = &tool_output(&requests[2], "synthetic-fetch")["untrusted_web_evidence"];
+    assert_eq!(evidence["partial"], true);
+    assert_eq!(
+        evidence["sources"].as_array().unwrap().last().unwrap()["truncated"],
+        true
+    );
 }
 
 #[tokio::test]
-async fn quick_routing_has_no_special_case_for_fixture_prompt_text() {
+async fn model_first_execution_never_classifies_fixture_prompt_text() {
     for text in ["Synthetic current question", "Synthetic current question."] {
         let (config, _auth, server) = fixture(vec![vec![answer()]]).await;
         let mut request = prompt();
         request.prompt = text.into();
         let mut web = WebService::new(EvidenceTransport { calls: vec![] });
-        let result = run(
-            config,
-            &request,
-            Mode::Quick,
-            &mut web,
-            &Cancellation::default(),
-        )
-        .await
-        .unwrap();
+        let result = run(config, &request, &mut web, &Cancellation::default())
+            .await
+            .unwrap();
         assert_eq!(
-            result.searches, 1,
-            "both current-information questions take the real fast path"
+            result.searches, 0,
+            "the selected model owns lookup decisions for every prompt"
         );
-        assert_eq!(server.await.unwrap()[0]["tools"], json!([]));
+        assert!(!server.await.unwrap()[0]["tools"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 }
 
 #[tokio::test]
-async fn quick_mode_presearches_and_answers_in_single_llm_round_when_snippets_are_sufficient() {
+async fn runner_never_presearches_or_injects_evidence_before_the_selected_model() {
     struct PriceSnippetTransport;
     impl WebTransport for PriceSnippetTransport {
         async fn call(
@@ -1367,32 +1523,134 @@ async fn quick_mode_presearches_and_answers_in_single_llm_round_when_snippets_ar
     let mut web = WebService::new(PriceSnippetTransport);
     let mut amd_prompt = prompt();
     amd_prompt.prompt = "What is the current stock price of AMD right now?".into();
-    let result = run(
-        config,
-        &amd_prompt,
-        Mode::Quick,
-        &mut web,
-        &Cancellation::default(),
-    )
-    .await
-    .unwrap();
-    assert_eq!((result.rounds, result.searches, result.reads), (1, 1, 0));
+    let result = run(config, &amd_prompt, &mut web, &Cancellation::default())
+        .await
+        .unwrap();
+    assert_eq!((result.rounds, result.searches, result.reads), (1, 0, 0));
     let requests = server.await.unwrap();
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0]["tool_choice"], "none");
-    assert_eq!(requests[0]["tools"], json!([]));
-    assert!(requests[0]["instructions"]
+    assert_eq!(requests[0]["tool_choice"], "auto");
+    assert!(!requests[0]["tools"].as_array().unwrap().is_empty());
+    assert!(!requests[0]["instructions"]
         .as_str()
         .unwrap()
         .contains("156.40"));
 }
 
 #[tokio::test]
-async fn prepare_round_zero_search_handles_mtg_follow_up_and_exa_soft_rate_limit_fallback() {
-    struct SoftRateLimitExaThenParallel {
-        calls: Vec<Provider>,
-    }
-    impl WebTransport for SoftRateLimitExaThenParallel {
+async fn selected_model_completes_while_shared_web_service_is_busy() {
+    let (config, _auth, server) = fixture(vec![vec![answer()]]).await;
+    let client = CustomOpenAiClient::new(config).unwrap();
+    let service = tokio::sync::Mutex::new(WebService::new(EvidenceTransport { calls: vec![] }));
+    let gate = WebPrewarmGate::default();
+    let busy = service.lock().await;
+    let mut web = SharedWebService::new(&service, &gate);
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        run_with_client_events(
+            &client,
+            &prompt(),
+            RunContext {
+                conversation_id: "synthetic-busy-web",
+                instructions: "Synthetic policy",
+                web_enabled: true,
+            },
+            &mut web,
+            &Cancellation::default(),
+            |_| Ok(()),
+        ),
+    )
+    .await
+    .expect("model execution must not wait for web admission")
+    .unwrap();
+    assert_eq!(result.rounds, 1);
+    assert_eq!(result.searches, 0);
+    assert!(busy.transport.calls.is_empty());
+    assert_eq!(server.await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn excerpts_remain_search_results_without_forcing_an_extra_read_or_synthesis() {
+    let (config, _auth, server) =
+        fixture(vec![vec![search_call("synthetic-search")], vec![answer()]]).await;
+    let mut web = WebService::new(EvidenceTransport { calls: vec![] });
+    let result = run(config, &prompt(), &mut web, &Cancellation::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        result.reads, 0,
+        "the model, not a deterministic recovery pass, chooses reads"
+    );
+    assert_eq!(result.rounds, 2);
+    assert!(!result.source_read_observed);
+    assert!(result
+        .sources
+        .iter()
+        .all(|source| source.kind == EvidenceKind::SearchExcerpt));
+    assert_eq!(result.response.text, "Synthetic final answer.");
+    assert!(!result.partial);
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1]["tools"].as_array().unwrap().len(), 2);
+    assert_eq!(requests[1]["tool_choice"], "auto");
+}
+
+#[tokio::test]
+async fn shared_web_ownership_releases_between_selected_model_rounds_and_keeps_tools_available() {
+    let fetch = call(
+        "synthetic-shared-read",
+        "web_fetch",
+        json!({"urls":["https://example.com/source"],"focus":"Synthetic source"}),
+    );
+    let (config, _auth, server) = fixture(vec![
+        vec![search_call("synthetic-shared-search")],
+        vec![fetch],
+        vec![answer()],
+    ])
+    .await;
+    let client = CustomOpenAiClient::new(config).unwrap();
+    let service = tokio::sync::Mutex::new(WebService::new(EvidenceTransport { calls: vec![] }));
+    let gate = WebPrewarmGate::default();
+    let mut web = SharedWebService::new(&service, &gate);
+    let mut dispatches = 0;
+    let result = run_with_client_events(
+        &client,
+        &prompt(),
+        RunContext {
+            conversation_id: "synthetic-shared-tools",
+            instructions: "Synthetic policy",
+            web_enabled: true,
+        },
+        &mut web,
+        &Cancellation::default(),
+        |event| {
+            if matches!(event, RunEvent::Model(ModelEvent::RequestDispatched(_))) {
+                dispatches += 1;
+                assert!(
+                    service.try_lock().is_ok(),
+                    "model waits must not own shared web"
+                );
+            }
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!((result.rounds, result.searches, result.reads), (3, 1, 1));
+    assert_eq!(dispatches, 3);
+    assert!(result.source_read_observed);
+    assert_eq!(service.lock().await.transport.calls.len(), 2);
+    let requests = server.await.unwrap();
+    assert!(
+        !requests[1]["tools"].as_array().unwrap().is_empty(),
+        "search excerpts must not heuristically disable corrective tools"
+    );
+}
+
+#[tokio::test]
+async fn failed_provider_fallback_is_recorded_when_both_providers_fail() {
+    struct BothFailTransport(Vec<Provider>);
+    impl WebTransport for BothFailTransport {
         async fn call(
             &mut self,
             provider: Provider,
@@ -1401,57 +1659,51 @@ async fn prepare_round_zero_search_handles_mtg_follow_up_and_exa_soft_rate_limit
             _: Instant,
             _: &Cancellation,
         ) -> Result<Value, ProviderFailure> {
-            self.calls.push(provider);
-            match provider {
-                Provider::Exa => Ok(json!({
-                    "isError": false,
-                    "content": [{
-                        "type": "text",
-                        "text": "You've hit Exa's free MCP rate limit. To continue using Exa MCP without limits, set up your own Exa API key."
-                    }]
-                })),
-                Provider::Parallel => Ok(json!({
-                    "structuredContent": {
-                        "results": [{
-                            "url": "https://example.com/urzas-saga",
-                            "title": "Urza's Saga Rulings",
-                            "excerpts": ["Urza's Saga chapter II grants the ability to create a 0/0 Construct artifact creature token."]
-                        }],
-                        "errors": []
-                    }
-                })),
-            }
+            self.0.push(provider);
+            Err(ProviderFailure::from(Failure::Transport))
         }
     }
 
-    let mut web = WebService::new(SoftRateLimitExaThenParallel { calls: vec![] });
-    let outcome: RoundZeroSearchOutcome = prepare_round_zero_search(
-        &mut web,
-        "synthetic-conversation",
-        "synthetic-session",
-        "Wait what about its second ability?",
-        Some("In Magic: The Gathering, how does Urza's Saga work?"),
-        Mode::Quick,
-        true,
-        Instant::now() + Duration::from_secs(5),
-        &Cancellation::default(),
-    )
+    let (config, _auth, server) = fixture(vec![
+        vec![search_call("synthetic-both-fail")],
+        vec![answer()],
+    ])
     .await;
-
-    assert!(outcome.needs_search);
-    assert!(outcome.routing.needs_search());
-    assert_eq!(outcome.provider_used, Some("parallel"));
-    assert!(outcome.fallback_used);
-    assert!(!outcome.partial);
-    assert!(!outcome.needs_escalation);
-    assert_eq!(outcome.sources.len(), 1);
-    assert!(outcome
-        .evidence_context
-        .as_deref()
-        .unwrap()
-        .contains("Construct artifact creature token"));
-    assert!(outcome
-        .source_footer
-        .contains("https://example.com/urzas-saga"));
-    assert_eq!(web.transport.calls, vec![Provider::Exa, Provider::Parallel]);
+    let client = CustomOpenAiClient::new(config).unwrap();
+    let service = tokio::sync::Mutex::new(WebService::new(BothFailTransport(vec![])));
+    let gate = WebPrewarmGate::default();
+    let mut web = SharedWebService::new(&service, &gate);
+    let mut failed_fallback = None;
+    let result = run_with_client_events(
+        &client,
+        &prompt(),
+        RunContext {
+            conversation_id: "synthetic-fallback-failure",
+            instructions: "Synthetic policy",
+            web_enabled: true,
+        },
+        &mut web,
+        &Cancellation::default(),
+        |event| {
+            if let RunEvent::ToolFailed {
+                failure,
+                fallback_used,
+                ..
+            } = event
+            {
+                failed_fallback = Some((failure, fallback_used));
+            }
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        service.lock().await.transport.0,
+        vec![Provider::Exa, Provider::Parallel]
+    );
+    assert_eq!(failed_fallback, Some((Failure::Transport, true)));
+    assert_eq!(result.fallbacks, 1);
+    assert!(result.partial);
+    assert_eq!(server.await.unwrap().len(), 2);
 }

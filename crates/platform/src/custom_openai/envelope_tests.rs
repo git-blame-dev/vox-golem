@@ -95,7 +95,6 @@ fn opaque_continuation_and_linked_results_are_never_evicted() {
         InputProjection::initial(&prompt, &continuation),
         "Synthetic policy",
         Some(&[]),
-        false,
     )
     .unwrap();
     let request: Value = serde_json::from_slice(&bytes).unwrap();
@@ -110,7 +109,6 @@ fn opaque_continuation_and_linked_results_are_never_evicted() {
             InputProjection::initial(&prompt, &impossible),
             "Synthetic policy",
             Some(&[]),
-            false
         ),
         Err(CustomOpenAiError::TooLarge)
     );
@@ -216,7 +214,6 @@ async fn transport_sends_the_exact_checked_json_buffer_for_direct_and_tool_reque
                     InputProjection::initial(&prompt, &[]),
                     "Synthetic policy",
                     Some(&[]),
-                    false,
                 )
                 .unwrap();
                 client
@@ -228,7 +225,6 @@ async fn transport_sends_the_exact_checked_json_buffer_for_direct_and_tool_reque
                         tools::RoundOptions {
                             deadline: tokio::time::Instant::now() + Duration::from_secs(3),
                             expected_auth_revision: None,
-                            require_tool: false,
                         },
                         || Ok(()),
                         |_| Ok(()),
@@ -277,7 +273,6 @@ async fn tool_mandatory_overflow_and_expired_deadline_do_not_read_auth_or_dispat
                             Duration::from_secs(1)
                         },
                     expected_auth_revision: None,
-                    require_tool: false,
                 },
                 |_| panic!("no auth or dispatch event"),
             )

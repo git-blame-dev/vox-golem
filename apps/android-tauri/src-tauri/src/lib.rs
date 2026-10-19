@@ -23,10 +23,8 @@ async fn submit_prompt<R: Runtime>(
     request_id: String,
     prompt: String,
     updates: tauri::ipc::Channel<Value>,
-    search_mode: Option<String>,
 ) -> Result<Value, StructuredPluginInvokeError> {
-    tauri_plugin_assistant::submit_with_search_mode(app, request_id, prompt, updates, search_mode)
-        .await
+    tauri_plugin_assistant::submit(app, request_id, prompt, updates).await
 }
 
 #[tauri::command]
@@ -70,14 +68,6 @@ async fn select_conversation<R: Runtime>(
         json!({ "conversationId": conversation_id }),
     )
     .await
-}
-
-#[tauri::command]
-async fn set_search_mode<R: Runtime>(
-    app: AppHandle<R>,
-    mode: String,
-) -> Result<Value, StructuredPluginInvokeError> {
-    tauri_plugin_assistant::forward(app, "set_search_mode", json!({"mode":mode})).await
 }
 
 #[tauri::command]
@@ -223,7 +213,6 @@ pub fn run() {
             cancel_prompt,
             reset_session,
             set_preferences,
-            set_search_mode,
             select_conversation,
             select_conversation_head,
             save_assistant_draft,

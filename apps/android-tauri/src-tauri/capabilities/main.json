@@ -10,7 +10,6 @@
     "allow-cancel-prompt",
     "allow-reset-session",
     "allow-set-preferences",
-    "allow-set-search-mode",
     "allow-select-conversation",
     "allow-select-conversation-head",
     "allow-save-assistant-draft",

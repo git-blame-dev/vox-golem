@@ -1033,7 +1033,6 @@ async fn tool_round_never_sends_managed_access_to_custom_endpoint() {
             RoundOptions {
                 deadline: tokio::time::Instant::now() + Duration::from_secs(2),
                 expected_auth_revision: None,
-                require_tool: false,
             },
             |_| Ok(()),
         )
@@ -1069,7 +1068,6 @@ async fn first_tool_round_refreshes_managed_access_before_loading_or_publishing_
             RoundOptions {
                 deadline: tokio::time::Instant::now() + Duration::from_secs(3),
                 expected_auth_revision: None,
-                require_tool: false,
             },
             || {
                 ordering.lock().unwrap().push("check");
@@ -1137,7 +1135,6 @@ async fn continuation_never_refreshes_away_its_established_auth_revision() {
             RoundOptions {
                 deadline: tokio::time::Instant::now() + Duration::from_secs(1),
                 expected_auth_revision: revision,
-                require_tool: false,
             },
             || Ok(()),
             |_| panic!("expired continuation cannot dispatch or publish"),

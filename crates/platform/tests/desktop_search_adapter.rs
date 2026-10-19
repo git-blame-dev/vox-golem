@@ -2,12 +2,52 @@
 // Compile the actual desktop search adapter without the unrelated Tauri/audio build.
 #![allow(dead_code)]
 
-use std::sync::atomic::AtomicBool;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex,
+};
+
+// Only the cancellation-facing portion of desktop prompt registration is needed
+// by the included adapter tests; app lifecycle and publication remain shell-owned.
+#[derive(Clone)]
+struct ActivePrompt {
+    generation: u64,
+    cancelled: Arc<AtomicBool>,
+    cancellation_signal: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+fn register_active_prompt(
+    active_prompt: &Mutex<Option<ActivePrompt>>,
+    generation_counter: &AtomicU64,
+    _request_id: &str,
+    _assistant_generation: voxgolem_core::conversation::ExecutionId,
+    _client: Option<()>,
+    _publication_epoch: u64,
+) -> Result<(), String> {
+    let mut active = active_prompt
+        .lock()
+        .map_err(|_| String::from("active prompt lock is poisoned"))?;
+    if active.is_some() {
+        return Err(String::from("another prompt is already active"));
+    }
+    let generation = generation_counter
+        .fetch_add(1, Ordering::SeqCst)
+        .saturating_add(1);
+    let (signal, _) = tokio::sync::watch::channel(false);
+    *active = Some(ActivePrompt {
+        generation,
+        cancelled: Arc::new(AtomicBool::new(false)),
+        cancellation_signal: Arc::new(signal),
+    });
+    Ok(())
+}
 
 #[derive(Clone, Copy)]
 struct PromptCancellation<'a> {
+    active_generation: u64,
     cancelled: &'a AtomicBool,
     signal: &'a tokio::sync::watch::Sender<bool>,
+    control: &'a ActivePrompt,
 }
 #[derive(Clone)]
 struct SourcePayload {
@@ -35,7 +75,7 @@ enum PromptExecutionEventPayload {
 mod search_runtime;
 
 #[tokio::test]
-async fn actual_desktop_quick_web_off_trims_escaped_history_and_streams_using_the_owned_client() {
+async fn actual_desktop_web_off_trims_escaped_history_and_streams_using_the_owned_client() {
     use std::{
         sync::atomic::{AtomicU64, Ordering},
         time::Duration,
@@ -101,7 +141,6 @@ async fn actual_desktop_quick_web_off_trims_escaped_history_and_streams_using_th
         socket.write_all(response).await.unwrap();
         wire
     });
-    let client = CustomOpenAiClient::new(config.clone()).unwrap();
     let prompt = CustomOpenAiPrompt {
         session_id: "synthetic-desktop-envelope".into(),
         prompt: "Synthetic current".into(),
@@ -123,20 +162,33 @@ async fn actual_desktop_quick_web_off_trims_escaped_history_and_streams_using_th
             .collect(),
     };
     let state = search_runtime::DesktopSearchState::default();
-    let cancelled = AtomicBool::new(false);
-    let (signal, _) = tokio::sync::watch::channel(false);
+    let active = Mutex::new(None);
+    register_active_prompt(
+        &active,
+        &AtomicU64::new(0),
+        "synthetic-request",
+        voxgolem_core::conversation::ExecutionId {
+            session_id: voxgolem_core::conversation::SessionId(1),
+            generation: voxgolem_core::conversation::GenerationId(1),
+        },
+        None,
+        0,
+    )
+    .unwrap();
+    let control = active.into_inner().unwrap().unwrap();
     let mut delivered = String::new();
     let (result, revision) = search_runtime::run_custom(
         &state,
-        &client,
         config,
+        tokio::time::Instant::now(),
         &prompt,
-        voxgolem_core::search::Mode::Quick,
         false,
         voxgolem_core::conversation::SessionId(1),
         PromptCancellation {
-            cancelled: &cancelled,
-            signal: &signal,
+            active_generation: control.generation,
+            cancelled: &control.cancelled,
+            signal: &control.cancellation_signal,
+            control: &control,
         },
         |event| {
             if let PromptExecutionEventPayload::Text { text } = event {

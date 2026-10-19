@@ -181,17 +181,10 @@ pub(crate) fn checked_envelope(
     projection: InputProjection<'_>,
     instructions: &str,
     tools: Option<&[Value]>,
-    require_tool: bool,
 ) -> Result<Vec<u8>, CustomOpenAiError> {
-    checked_envelope_with_check(
-        config,
-        session_id,
-        projection,
-        instructions,
-        tools,
-        require_tool,
-        || Ok(()),
-    )
+    checked_envelope_with_check(config, session_id, projection, instructions, tools, || {
+        Ok(())
+    })
 }
 
 pub(crate) fn checked_envelope_with_check(
@@ -200,7 +193,6 @@ pub(crate) fn checked_envelope_with_check(
     projection: InputProjection<'_>,
     instructions: &str,
     tools: Option<&[Value]>,
-    require_tool: bool,
     mut check: impl FnMut() -> Result<(), CustomOpenAiError>,
 ) -> Result<Vec<u8>, CustomOpenAiError> {
     check()?;
@@ -226,7 +218,6 @@ pub(crate) fn checked_envelope_with_check(
         InputProjection::mandatory(&[]),
         &instructions,
         tools,
-        require_tool,
     );
     let mut total = encoded_len(&envelope, MAX_REQUEST_BYTES)?;
     let mut count = 0;
@@ -316,7 +307,6 @@ fn envelope<'a>(
     projection: InputProjection<'a>,
     instructions: &'a str,
     tools: Option<&'a [Value]>,
-    require_tool: bool,
 ) -> Envelope<'a> {
     Envelope {
         model: config.model.model_id(),
@@ -333,15 +323,7 @@ fn envelope<'a>(
         prompt_cache_key: session_id,
         parallel_tool_calls: false,
         tools,
-        tool_choice: tools.map(|tools| {
-            if tools.is_empty() {
-                "none"
-            } else if require_tool {
-                "required"
-            } else {
-                "auto"
-            }
-        }),
+        tool_choice: tools.map(|tools| if tools.is_empty() { "none" } else { "auto" }),
         include: tools.map(|_| ["reasoning.encrypted_content"]),
     }
 }
@@ -363,7 +345,6 @@ pub(crate) fn initial_value(
         InputProjection::initial(prompt, &[]),
         &instructions,
         None,
-        false,
     ))
     .expect("JSON view is serializable")
 }
@@ -375,7 +356,6 @@ pub(crate) fn tool_value(
     input: &[Value],
     instructions: &str,
     tools: &[Value],
-    require_tool: bool,
 ) -> Value {
     let instructions = voxgolem_core::response_style::compose_instructions(instructions);
     serde_json::to_value(envelope(
@@ -384,7 +364,6 @@ pub(crate) fn tool_value(
         InputProjection::mandatory(input),
         &instructions,
         Some(tools),
-        require_tool,
     ))
     .expect("JSON view is serializable")
 }
@@ -401,6 +380,5 @@ pub fn checked_request(
         InputProjection::initial(prompt, &[]),
         instructions.unwrap_or(DEFAULT_INSTRUCTIONS),
         None,
-        false,
     )
 }

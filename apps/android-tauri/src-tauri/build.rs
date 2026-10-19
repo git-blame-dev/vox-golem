@@ -7,7 +7,6 @@ fn main() {
             "cancel_prompt",
             "reset_session",
             "set_preferences",
-            "set_search_mode",
             "select_conversation",
             "select_conversation_head",
             "save_assistant_draft",

@@ -245,10 +245,61 @@ impl std::error::Error for CustomOpenAiError {}
 const PREWARM_COOLDOWN: Duration = Duration::from_secs(120);
 const PREWARM_TIMEOUT: Duration = Duration::from_secs(4);
 
+/// One active transport owner. Callers must continuously drive its Tokio runtime.
+#[derive(Default)]
+pub struct CustomOpenAiClientPool {
+    active: std::sync::Mutex<Option<CustomOpenAiClient>>,
+}
+
+impl CustomOpenAiClientPool {
+    pub fn client_for(
+        &self,
+        config: CustomOpenAiConfig,
+    ) -> Result<CustomOpenAiClient, CustomOpenAiError> {
+        let config = CustomOpenAiClient::validated_config(config)?;
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| CustomOpenAiError::Transport)?;
+        if let Some(owner) = active.as_ref() {
+            if owner.config.endpoint == config.endpoint
+                && owner.config.connect_timeout == config.connect_timeout
+            {
+                return owner.with_reused_transport(config);
+            }
+        }
+        let client = CustomOpenAiClient::new(config)?;
+        *active = Some(client.with_reused_transport(client.config.clone())?);
+        Ok(client)
+    }
+}
+
+#[derive(Default)]
+struct TransportActivity {
+    recent: Option<Instant>,
+    active_attempt: Option<u64>,
+    next_attempt: u64,
+}
+
+struct PrewarmAttempt {
+    activity: std::sync::Arc<std::sync::Mutex<TransportActivity>>,
+    id: u64,
+}
+
+impl Drop for PrewarmAttempt {
+    fn drop(&mut self) {
+        if let Ok(mut activity) = self.activity.lock() {
+            if activity.active_attempt == Some(self.id) {
+                activity.active_attempt = None;
+            }
+        }
+    }
+}
+
 pub struct CustomOpenAiClient {
     config: CustomOpenAiConfig,
     client: Client,
-    last_prewarm: std::sync::Arc<std::sync::Mutex<Option<Instant>>>,
+    activity: std::sync::Arc<std::sync::Mutex<TransportActivity>>,
 }
 
 impl CustomOpenAiClient {
@@ -258,7 +309,7 @@ impl CustomOpenAiClient {
         Ok(Self {
             config,
             client,
-            last_prewarm: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            activity: Default::default(),
         })
     }
 
@@ -277,7 +328,7 @@ impl CustomOpenAiClient {
         Ok(Self {
             config,
             client: self.client.clone(),
-            last_prewarm: self.last_prewarm.clone(),
+            activity: self.activity.clone(),
         })
     }
 
@@ -286,8 +337,8 @@ impl CustomOpenAiClient {
     }
 
     pub(crate) fn record_transport_active(&self) {
-        if let Ok(mut guard) = self.last_prewarm.lock() {
-            *guard = Some(Instant::now());
+        if let Ok(mut guard) = self.activity.lock() {
+            guard.recent = Some(Instant::now());
         }
     }
 
@@ -297,19 +348,26 @@ impl CustomOpenAiClient {
         }
         let timeout = self.config.connect_timeout.min(PREWARM_TIMEOUT);
         let deadline = tokio::time::Instant::now() + timeout;
-        let should_warm_transport = {
+        let attempt = {
             let mut guard = self
-                .last_prewarm
+                .activity
                 .lock()
                 .map_err(|_| CustomOpenAiError::Transport)?;
             let now = Instant::now();
-            if guard
-                .is_some_and(|instant| now.saturating_duration_since(instant) < PREWARM_COOLDOWN)
+            if guard.active_attempt.is_some()
+                || guard.recent.is_some_and(|instant| {
+                    now.saturating_duration_since(instant) < PREWARM_COOLDOWN
+                })
             {
-                false
+                None
             } else {
-                *guard = Some(now);
-                true
+                guard.next_attempt = guard.next_attempt.wrapping_add(1);
+                let id = guard.next_attempt;
+                guard.active_attempt = Some(id);
+                Some(PrewarmAttempt {
+                    activity: self.activity.clone(),
+                    id,
+                })
             }
         };
         let auth_check = async {
@@ -323,30 +381,27 @@ impl CustomOpenAiClient {
             credential.validate_endpoint(&self.config.endpoint)?;
             Ok::<(), CustomOpenAiError>(())
         };
-        if !should_warm_transport {
+        let Some(attempt) = attempt else {
             return auth_check.await;
-        }
+        };
         let transport_warm = async {
-            let result = self
-                .client
-                .head(&self.config.endpoint)
-                .timeout(timeout)
-                .send()
-                .await
-                .map_err(map_transport_error);
-            match result {
-                Ok(response) => {
-                    let _ = response.bytes().await;
-                    self.record_transport_active();
-                    Ok(())
-                }
-                Err(error) => {
-                    if let Ok(mut guard) = self.last_prewarm.lock() {
-                        *guard = None;
-                    }
-                    Err(error)
-                }
-            }
+            let _attempt = attempt;
+            tokio::time::timeout_at(deadline, async {
+                #[cfg(feature = "app-benchmark")]
+                crate::app_benchmark::validate_generation(&self.config)?;
+                let response = self
+                    .client
+                    .head(&self.config.endpoint)
+                    .timeout(timeout)
+                    .send()
+                    .await
+                    .map_err(map_transport_error)?;
+                response.bytes().await.map_err(map_transport_error)?;
+                self.record_transport_active();
+                Ok(())
+            })
+            .await
+            .map_err(|_| CustomOpenAiError::Timeout)?
         };
         let (auth_result, transport_result) = tokio::join!(auth_check, transport_warm);
         auth_result?;
@@ -356,6 +411,8 @@ impl CustomOpenAiClient {
     fn validated_config(
         config: CustomOpenAiConfig,
     ) -> Result<CustomOpenAiConfig, CustomOpenAiError> {
+        #[cfg(feature = "app-benchmark")]
+        crate::app_benchmark::validate_generation(&config)?;
         let endpoint = config.endpoint.trim().to_string();
         if !valid_endpoint(&endpoint)
             || config.connect_timeout.is_zero()
@@ -364,6 +421,9 @@ impl CustomOpenAiClient {
         {
             return Err(CustomOpenAiError::InvalidConfig);
         }
+        let endpoint = Url::parse(&endpoint)
+            .map_err(|_| CustomOpenAiError::InvalidConfig)?
+            .to_string();
         Ok(CustomOpenAiConfig { endpoint, ..config })
     }
 
@@ -394,6 +454,10 @@ impl CustomOpenAiClient {
         #[cfg(not(all(feature = "custom-openai-webpki", not(feature = "custom-openai"))))]
         {
             client_builder = client_builder.use_rustls_tls();
+        }
+        #[cfg(feature = "app-benchmark")]
+        {
+            client_builder = client_builder.retry(reqwest::retry::never());
         }
         client_builder
             .redirect(redirect::Policy::none())
@@ -538,6 +602,8 @@ impl CustomOpenAiClient {
         if remaining.is_zero() {
             return Err(CustomOpenAiError::Timeout);
         }
+        #[cfg(feature = "app-benchmark")]
+        crate::app_benchmark::before_generation(&self.config)?;
         let response = request_builder
             .timeout(remaining)
             .send()
@@ -695,7 +761,7 @@ fn default_auth_path() -> PathBuf {
         .join(".local/share/opencode/auth.json")
 }
 
-fn valid_endpoint(endpoint: &str) -> bool {
+pub(crate) fn valid_endpoint(endpoint: &str) -> bool {
     let Ok(url) = Url::parse(endpoint.trim()) else {
         return false;
     };
@@ -1668,7 +1734,7 @@ mod tests {
             total_timeout: Duration::from_secs(3),
             ..Default::default()
         };
-        let owner = CustomOpenAiClient::new(config.clone()).unwrap();
+        let owner = CustomOpenAiClientPool::default();
         let mut revisions = Vec::new();
         for access in ["synthetic-first", "synthetic-second"] {
             std::fs::write(
@@ -1676,7 +1742,7 @@ mod tests {
                 format!(r#"{{"openai":{{"access":"{access}","expires":4102444800}}}}"#),
             )
             .unwrap();
-            let client = owner.with_reused_transport(config.clone()).unwrap();
+            let client = owner.client_for(config.clone()).unwrap();
             assert_eq!(
                 client
                     .respond_with_auth_revision(
@@ -1829,7 +1895,6 @@ mod tests {
                         RoundOptions {
                             deadline: tokio::time::Instant::now() + Duration::from_secs(3),
                             expected_auth_revision: None,
-                            require_tool: false,
                         },
                         |event| {
                             match event {

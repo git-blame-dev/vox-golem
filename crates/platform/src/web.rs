@@ -278,6 +278,13 @@ impl McpTransport {
         deadline: Instant,
         cancel: &Cancellation,
     ) -> Result<(), ProviderFailure> {
+        #[cfg(feature = "app-benchmark")]
+        let _ = endpoint; // Feature builds exclusively use the validated benchmark resolver.
+        #[cfg(feature = "app-benchmark")]
+        let benchmark_endpoint = crate::app_benchmark::mcp_endpoint(provider.endpoint())
+            .map_err(|_| ProviderFailure::from(Failure::InvalidUpstream))?;
+        #[cfg(feature = "app-benchmark")]
+        let endpoint = benchmark_endpoint.as_str();
         if slot.as_ref().is_some_and(|service| service.is_closed()) {
             *slot = None;
             *last_active_slot = None;
@@ -291,7 +298,23 @@ impl McpTransport {
             config.retry_config = std::sync::Arc::new(
                 rmcp::transport::common::client_side_sse::NeverRetry::default(),
             );
+            #[cfg(not(feature = "app-benchmark"))]
             let client = bounded_http::BoundedHttp::new(http_client()?);
+            #[cfg(feature = "app-benchmark")]
+            let client = bounded_http::BoundedHttp::new(if endpoint.starts_with("http:") {
+                crate::owned_loopback::client_builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .retry(reqwest::retry::never())
+                    .connect_timeout(Duration::from_secs(4))
+                    .timeout(ATTEMPT_TIME)
+                    .pool_max_idle_per_host(2)
+                    .pool_idle_timeout(Some(Duration::from_secs(300)))
+                    .tcp_keepalive(Some(Duration::from_secs(30)))
+                    .build()
+                    .map_err(|_| ProviderFailure::from(Failure::InvalidUpstream))?
+            } else {
+                http_client()?
+            });
             let transport = StreamableHttpClientTransport::with_client(client.clone(), config);
             let service = cancel
                 .guard(deadline, ().serve(transport))
@@ -658,7 +681,10 @@ fn http_client() -> Result<reqwest::Client, ProviderFailure> {
     .map_err(|_| Failure::Transport)?
     .with_root_certificates(roots)
     .with_no_client_auth();
-    reqwest::Client::builder()
+    let builder = reqwest::Client::builder();
+    #[cfg(feature = "app-benchmark")]
+    let builder = builder.retry(reqwest::retry::never());
+    builder
         .use_preconfigured_tls(tls)
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(4))
@@ -845,6 +871,7 @@ pub struct WebService<T> {
     pub transport: T,
     cooldowns: [Option<Instant>; 2],
     next_source: usize,
+    last_fallback_used: bool,
 }
 
 impl<T: WebTransport> WebService<T> {
@@ -853,7 +880,12 @@ impl<T: WebTransport> WebService<T> {
             transport,
             cooldowns: [None, None],
             next_source: 0,
+            last_fallback_used: false,
         }
+    }
+
+    pub fn last_fallback_used(&self) -> bool {
+        self.last_fallback_used
     }
     pub async fn prewarm(
         &mut self,
@@ -1089,6 +1121,7 @@ impl<T: WebTransport> WebService<T> {
         deadline: Instant,
         cancel: &Cancellation,
     ) -> Result<ToolResult, Failure> {
+        self.last_fallback_used = false;
         let mut provider = if self.ready(Provider::Exa) {
             Provider::Exa
         } else {
@@ -1119,6 +1152,7 @@ impl<T: WebTransport> WebService<T> {
                 }
                 return Err(Failure::Deadline);
             }
+            self.last_fallback_used = fallback;
             let result = self
                 .attempt(
                     provider,
