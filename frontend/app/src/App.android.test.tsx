@@ -143,18 +143,11 @@ describe('Android App lifecycle', () => {
     expect(invoke.mock.calls.filter(([command]) => command === 'submit_prompt')).toHaveLength(disposition === 'locked' ? 1 : 0)
   })
 
-  it('allows explicit draft-only dictation without a model while Ask cannot start generation', async () => {
-    let input: (value: unknown) => void = () => undefined
-    let sessionId = ''
+  it('blocks Ask when no generation model is available and omits Dictate into draft', async () => {
     const voice = { kind: 'voice_status', available: true, reason: 'Synthetic speech service', mode: 'dictation', dictation: 'idle', loop: 'idle', ttsEnabled: false, ttsAvailable: true, ttsPhase: 'idle', error: null }
-    const invoke = vi.fn(async (command: string, args?: unknown) => {
+    const invoke = vi.fn(async (command: string) => {
       if (command === 'get_app_snapshot') return { ...appSnapshot(), model_options: [{ id: 'custom-sol-high', label: 'Sol High', available: false, unavailable_reason: 'Synthetic provider unavailable' }] }
       if (command === 'assistant_voice_status') return voice
-      if (command === 'start_assistant_voice') {
-        const request = args as { sessionId: string; updates: { send: (value: unknown) => void } }
-        sessionId = request.sessionId; input = request.updates.send
-        return { ...voice, dictation: 'listening' }
-      }
       return null
     })
     window.__TAURI_INTERNALS__ = { invoke, createChannel: <T,>(send: (value: T) => void) => ({ send }) }
@@ -164,17 +157,8 @@ describe('Android App lifecycle', () => {
     expect(ask.disabled).toBe(false)
     await act(async () => { ask.click() })
     expect(invoke.mock.calls.some(([command]) => command === 'start_assistant_voice')).toBe(false)
-    const overflow = container.querySelector('details.shell__overflow')!
-    await act(async () => { overflow.setAttribute('open', '') })
-    const dictate = overflow.querySelector<HTMLButtonElement>('[aria-label="Dictate into draft"]')!
-    expect(dictate.disabled).toBe(false)
-    await act(async () => { dictate.click() })
-    expect(invoke).toHaveBeenCalledWith('start_assistant_voice', expect.objectContaining({ loopMode: false, completionPolicy: 'manual' }))
-    expect(invoke.mock.calls.some(([command]) => command === 'set_search_mode' || command === 'get_search_mode')).toBe(false)
-    expect(invoke.mock.calls.find(([command]) => command === 'start_assistant_voice')?.[1]).not.toHaveProperty('searchMode')
-    expect(container.querySelector('[aria-label="Finish dictation"]')).not.toBeNull()
-    await act(async () => { input({ sessionId, kind: 'dictation', phase: 'final', draft: 'Synthetic manually dictated draft' }); input({ ...voice, sessionId, dictation: 'final' }) })
-    expect(container.querySelector<HTMLTextAreaElement>('#promptComposer')?.value).toBe('Synthetic manually dictated draft')
+    expect(container.querySelector('details.shell__overflow')).toBeNull()
+    expect(container.querySelector('[aria-label="Dictate into draft"]')).toBeNull()
     expect(invoke.mock.calls.some(([command]) => command === 'submit_prompt')).toBe(false)
   })
 
@@ -295,19 +279,20 @@ describe('Android App lifecycle', () => {
     container = document.createElement('div'); document.body.append(container); root = createRoot(container)
     await act(async () => { root?.render(<App />) })
     const logo = container.querySelector('img.shell__logo')!
-    expect(logo.getAttribute('width')).toBe('32')
+    expect(logo.getAttribute('width')).toBe('40')
+    expect(logo.getAttribute('height')).toBe('40')
     expect(container.querySelector('[data-runtime-phase]')).toBeNull()
     expect(container.querySelector('.shell')?.getAttribute('data-platform')).toBe('android')
     for (const name of ['Ask', 'Speak replies']) {
       const button = container.querySelector<HTMLButtonElement>(`button[aria-label="${name}"]`)!
       expect(button.querySelector('svg[aria-hidden="true"]')).toBeTruthy()
-      expect(button.textContent).toBe(name === 'Ask' ? '' : name)
+      expect(button.textContent).toBe('')
       expect(button.getAttribute('title')).toContain(name)
       const descriptionId = button.getAttribute('aria-describedby')!
       expect(descriptionId).toBeTruthy()
       expect(document.getElementById(descriptionId)?.classList.contains('sr-only')).toBe(true)
       expect(document.getElementById(descriptionId)?.textContent).toBeTruthy()
-      expect(button.classList.contains('shell__icon-control')).toBe(name === 'Ask')
+      expect(button.classList.contains('shell__icon-control')).toBe(true)
       if (name === 'Speak replies') expect(button.getAttribute('aria-pressed')).toBe('true')
     }
     const picker = container.querySelector<HTMLSelectElement>('#composerInstantSelect')!
@@ -316,24 +301,17 @@ describe('Android App lifecycle', () => {
     expect(picker.closest('.composer__utility-row')).toBeTruthy()
     expect(picker.closest('.native-icon-select')?.querySelector('svg')).toBeTruthy()
     const send = container.querySelector('button[aria-label="Send"]')!
-    expect(send.closest('.composer__prompt-row')?.querySelector('textarea')).toBeTruthy()
+    expect(send.closest('.composer__utility-row')).toBeTruthy()
     expect(container.querySelector('[aria-label="Search mode"]')).toBeNull()
     const toolbar = container.querySelector('.shell__header-actions')!
-    const overflow = toolbar.querySelector('details.shell__overflow')!
-    expect(overflow).not.toBeNull()
-    expect(overflow.hasAttribute('open')).toBe(false)
-    expect(overflow.querySelector('summary')?.getAttribute('aria-label')).toBe('More actions')
+    expect(toolbar.querySelector('details.shell__overflow')).toBeNull()
     expect(container.querySelector('.composer [aria-label="Ask"]')).not.toBeNull()
     expect(container.querySelector('[aria-label="Talk"]')).toBeNull()
-    expect(overflow.querySelector('[aria-label="Dictate into draft"]')).not.toBeNull()
-    expect(toolbar.querySelector('[aria-label="Speak replies"]')?.closest('details')).toBe(overflow)
-    await act(async () => {
-      overflow.setAttribute('open', '')
-      toolbar.querySelector<HTMLButtonElement>('[aria-label="Speak replies"]')!.focus()
-      overflow.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
-    })
-    expect(overflow.hasAttribute('open')).toBe(false)
-    expect(document.activeElement).toBe(overflow.querySelector('summary'))
+    expect(container.querySelector('[aria-label="Dictate into draft"]')).toBeNull()
+    expect(toolbar.querySelector('[aria-label="Speak replies"]')).not.toBeNull()
+    expect(toolbar.querySelector('[aria-label="New Chat"]')).not.toBeNull()
+    expect(toolbar.querySelector('[aria-label="Voice notes"]')).not.toBeNull()
+    expect(toolbar.querySelector('[aria-label="Settings"]')).not.toBeNull()
     expect(picker.closest('.shell__header-actions')).toBeNull()
     expect(container.querySelector('.composer__search')).toBeNull()
     expect(container.querySelector('.composer [aria-label="Android voice controls"]')).not.toBeNull()
@@ -368,13 +346,14 @@ describe('Android App lifecycle', () => {
     }
     const input = container.querySelector<HTMLTextAreaElement>('#promptComposer')!
     const send = container.querySelector('[aria-label="Send"]')!
-    const row = send.closest('.composer__prompt-row')!
+    const row = input.closest('.composer__prompt-row')!
+    const utilityRow = send.closest('.composer__utility-row')!
     expect(row.querySelector('textarea')).toBe(input)
-    expect(styleFor('.composer__prompt-row > .composer__button', send).width).toBe('48px')
-    expect(styleFor('.composer__prompt-row > .composer__button', send).height).toBe('48px')
+    expect(styleFor('.composer__utility-actions > .composer__button', send).width).toBe('48px')
+    expect(styleFor('.composer__utility-actions > .composer__button', send).height).toBe('48px')
     expect(container.querySelector('.composer__utility-row [aria-label="Instant model"]')).not.toBeNull()
     expect(container.querySelector('.composer__utility-row [aria-label="Ask"]')).not.toBeNull()
-    expect(container.querySelector('.composer__utility-row [aria-label="New Chat"]')).not.toBeNull()
+    expect(container.querySelector('.shell__header-actions [aria-label="New Chat"]')).not.toBeNull()
     expect(input.getAttribute('rows')).toBe('1')
     expect(container.querySelector('[aria-label="Search mode"]')).toBeNull()
     expect(styleFor('.shell__header-actions', container.querySelector('.shell__header-actions')!).flexWrap).toBe('nowrap')
@@ -404,7 +383,7 @@ describe('Android App lifecycle', () => {
     await act(async () => { window.dispatchEvent(new Event('resize')) })
     expect(input.style.height).toBe('44px')
     expect(input.style.overflowY).toBe('hidden')
-    expect(send.closest('.composer__prompt-row')).toBe(row)
+    expect(send.closest('.composer__utility-row')).toBe(utilityRow)
   })
 
   it.each(['completed', 'cancelled', 'error'] as const)('rotates the phone emblem from pending through stream and stage completion until %s retirement', async (outcome) => {
@@ -899,12 +878,12 @@ describe('Android App lifecycle', () => {
     })
     await act(async () => { type('Synthetic pending selection text') })
     expect(saves).toEqual([])
-    expect(container.querySelector<HTMLButtonElement>('.composer__prompt-row > .composer__button')?.disabled).toBe(true)
+    expect(container.querySelector<HTMLButtonElement>('.composer__utility-row .composer__button')?.disabled).toBe(true)
     await act(async () => { await vi.advanceTimersByTimeAsync(250); type('Synthetic newer recovery text'); await vi.advanceTimersByTimeAsync(500) })
     expect(recoveryReads).toBe(3)
     expect(saves).toEqual([])
     expect(composer.value).toBe('Synthetic newer recovery text')
-    expect(container.querySelector<HTMLButtonElement>('.composer__prompt-row > .composer__button')?.disabled).toBe(true)
+    expect(container.querySelector<HTMLButtonElement>('.composer__utility-row .composer__button')?.disabled).toBe(true)
     if (exhaustRecovery) {
       expect(container.textContent).toContain('selection recovery required')
       await act(async () => { type('Synthetic after recovery exhaustion') })
@@ -1191,7 +1170,7 @@ describe('Android App lifecycle', () => {
     container = document.createElement('div'); document.body.append(container); root = createRoot(container)
     await act(async () => { root?.render(<App />) })
     const composer = container.querySelector<HTMLTextAreaElement>('#promptComposer')!
-    const primary = container.querySelector<HTMLButtonElement>('.composer__prompt-row > .composer__button')!
+    const primary = container.querySelector<HTMLButtonElement>('.composer__utility-row .composer__button')!
     await act(async () => {
       Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set?.call(composer, 'Synthetic pending question')
       composer.dispatchEvent(new Event('input', { bubbles: true }))
@@ -1241,7 +1220,7 @@ describe('Android App lifecycle', () => {
     root = createRoot(container)
     await act(async () => { root?.render(<App />) })
     expect(container.textContent).toContain('Choose continuation')
-    expect(container.querySelector<HTMLButtonElement>('.composer__prompt-row > .composer__button')?.disabled).toBe(true)
+    expect(container.querySelector<HTMLButtonElement>('.composer__utility-row .composer__button')?.disabled).toBe(true)
     const chooser = container.querySelector<HTMLSelectElement>('[aria-label="Choose continuation"]')
     expect(chooser).not.toBeNull()
     await act(async () => { chooser!.value = head; chooser!.dispatchEvent(new Event('change', { bubbles: true })) })
@@ -1286,8 +1265,7 @@ describe('Android App lifecycle', () => {
   it('uses snapshot membership for both Instant selectors, not the desktop catalog or a fixed Android list', async () => {
     const snapshot = { ...appSnapshot(), model_options: [
       { id: 'custom-sol-high', label: 'Synthetic Sol High', available: true, unavailable_reason: null },
-      { id: 'custom-sol-none', label: 'Synthetic Sol None', available: false, unavailable_reason: 'Synthetic model unavailable' },
-      { id: 'custom-luna-none', label: 'Synthetic Luna None', available: true, unavailable_reason: null },
+      { id: 'custom-luna-none', label: 'Synthetic Luna None', available: false, unavailable_reason: 'Synthetic model unavailable' },
       { id: 'custom-luna-low', label: 'Synthetic Luna Low', available: true, unavailable_reason: null },
     ] }
     window.__TAURI_INTERNALS__ = { invoke: async (command) => {
@@ -1304,9 +1282,9 @@ describe('Android App lifecycle', () => {
       const select = container.querySelector<HTMLSelectElement>(`#${id}`)!
       expect(select).not.toBeNull()
       expect(Array.from(select.options).map((option) => option.value)).toEqual([
-        'custom-sol-high', 'custom-sol-none', 'custom-luna-none', 'custom-luna-low',
+        'custom-sol-high', 'custom-luna-none', 'custom-luna-low',
       ])
-      const unavailable = select.querySelector<HTMLOptionElement>('[value="custom-sol-none"]')!
+      const unavailable = select.querySelector<HTMLOptionElement>('[value="custom-luna-none"]')!
       expect(unavailable.disabled).toBe(true)
       expect(unavailable.textContent).toContain('Synthetic model unavailable')
     }

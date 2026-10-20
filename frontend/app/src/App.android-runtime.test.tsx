@@ -242,7 +242,7 @@ describe('production Android App runtime', () => {
     const input = container.querySelector<HTMLTextAreaElement>('#promptComposer')!
     await act(async () => { Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set?.call(input, 'Synthetic desktop question'); input.dispatchEvent(new Event('input', { bubbles: true })) })
     await act(async () => { container!.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })
-    expect(container.querySelector('.conversation__timings')?.textContent).toBe('450 ms')
+    expect(container.querySelector('.conversation__timings')?.textContent).toBe('450 ms · 1.25 s')
     const provider = log.mock.calls.filter(([label]) => label === '[frontend-timing]').map(([, value]) => JSON.parse(value as string) as Record<string, unknown>).filter((metadata) => metadata['scope'] === 'provider_request')
     expect(provider).toEqual([{ scope: 'provider_request', request: 1, stage: 'PROVIDER_DURATIONS', firstTextMs: 450, completedMs: 1250 }])
   })
@@ -349,7 +349,8 @@ describe('production Android App runtime', () => {
       expect(invoke.mock.calls.some(([command]) => command === 'set_search_mode')).toBe(false)
     } else {
       expect(container.querySelector('.composer__search')).toBeNull()
-      expect(promptRow.querySelector('button[type="submit"]')?.getAttribute('aria-label')).toBe('Send')
+      expect(promptRow.querySelector('textarea')).not.toBeNull()
+      expect(container.querySelector('.composer__utility-row button[type="submit"]')?.getAttribute('aria-label')).toBe('Send')
     }
     webEnabled = false
     await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="New Chat"]')!.click() })
@@ -383,7 +384,7 @@ describe('production Android App runtime', () => {
     const input = container.querySelector<HTMLTextAreaElement>('#promptComposer')!
     await act(async () => { Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set?.call(input, 'Synthetic compact status question'); input.dispatchEvent(new Event('input', { bubbles: true })) })
     await act(async () => { container!.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })
-    const stop = container.querySelector<HTMLButtonElement>('.composer__prompt-row > button[aria-label="Stop"]')!
+    const stop = container.querySelector<HTMLButtonElement>('.composer__utility-row button[aria-label="Stop"]')!
     expect(stop).not.toBeNull()
     expect(stop.disabled).toBe(false)
     expect(stop.querySelector('svg[aria-hidden="true"]')).not.toBeNull()

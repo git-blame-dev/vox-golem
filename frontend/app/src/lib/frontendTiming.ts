@@ -137,10 +137,12 @@ export class FrontendRequestTiming {
   }
 
   private badgeTimings(): CustomDirectTimings | undefined {
-    if (this.firstNonblankAt === null) return undefined
+    if (this.firstNonblankAt === null && this.settledAt === null) return undefined
+    const completedAt = this.settledAt ?? this.firstNonblankAt ?? performance.now()
+    const firstTextAt = this.firstNonblankAt ?? completedAt
     return {
-      firstTextMs: Math.max(0, Math.round(this.firstNonblankAt - this.admittedAt)),
-      completedMs: Math.max(0, Math.round((this.settledAt ?? this.firstNonblankAt) - this.admittedAt)),
+      firstTextMs: Math.max(0, Math.round(firstTextAt - this.admittedAt)),
+      completedMs: Math.max(0, Math.round(completedAt - this.admittedAt)),
     }
   }
 

@@ -55,7 +55,7 @@ function expectIconOnlyRow() {
   expect(group.querySelectorAll('button')).toHaveLength(1)
   expect(group.querySelector('button svg[aria-hidden="true"]')).not.toBeNull()
   expect(compactButton('Talk')).toBeNull()
-  expect(compactButton('Dictate into draft')).not.toBeNull()
+  expect(compactButton('Dictate into draft')).toBeNull()
   expect(compactButton('Speak replies')).not.toBeNull()
 }
 
@@ -113,13 +113,13 @@ describe('compact Android composer voice controls', () => {
     [{ mode: 'loop', loop: 'generating' }, 'Stop voice', 'generating', 'Responding…'],
     [{ mode: 'loop', loop: 'speaking' }, 'Stop voice', 'speaking', 'Speaking…'],
     [{ mode: 'loop', loop: 'between_turns' }, 'Stop voice', 'between-turns', 'Ready for next turn…'],
-  ])('keeps one composer intent with an accessible shape mark for %j', async (status, label, state, description) => {
+  ])('keeps one composer intent with an accessible shape mark for %j', async (status, label, _state, description) => {
     await setup(true, status as Record<string, unknown>)
     expectIconOnlyRow()
     const button = compactButton(label as string)
     const icon = button.querySelector('svg')!
-    expect(icon.getAttribute('data-icon-state')).toBe(state)
-    expect(icon.querySelector('[data-state-mark] path')?.getAttribute('d')).toBeTruthy()
+    expect(icon.getAttribute('data-icon-kind')).toBe(label === 'Ask' ? 'mic' : 'stop')
+    expect(icon.querySelector('[data-state-mark]')).toBeNull()
     expect(button.title).toContain(description)
     if (label === 'Finishing dictation') {
       expect(button.disabled).toBe(true)
@@ -174,7 +174,6 @@ describe('compact Android composer voice controls', () => {
     expectIconOnlyRow()
     const actionable = error.startsWith('Microphone')
     expect(container!.querySelector('[role="alert"]')?.textContent ?? null).toBe(actionable ? error : null)
-    expect(compactButton('Ask').querySelector('svg')?.getAttribute('data-icon-state')).toBe(actionable ? 'error' : 'ready')
     if (actionable) {
       expect(compactButton('Ask').title).toContain(error)
       expect(container!.querySelector('[role="alert"]')?.classList.contains('sr-only')).toBe(true)
@@ -194,20 +193,19 @@ describe('compact Android composer voice controls', () => {
     }
     expect(new Set(marks).size).toBe(3)
   })
-  it('uses different SVG mark shapes for all voice phases, not color alone', async () => {
+  it('keeps the composer mic icon clean without corner state marks across voice phases', async () => {
     const state = await setup(true)
     await act(async () => { compactButton('Ask').click() })
-    const marks: string[] = []
     for (const phase of [
       { dictation: 'checking' }, { dictation: 'listening' }, { dictation: 'finishing' },
       { dictation: 'idle', loop: 'generating' }, { loop: 'speaking' }, { loop: 'between_turns' },
       { loop: 'idle' }, { available: false }, { dictation: 'error', error: 'Synthetic actionable failure' },
     ]) {
       await act(async () => { state.event({ ...wire, ...phase }) })
-      marks.push(container!.querySelector('[data-state-mark] path')!.getAttribute('d')!)
+      const group = container!.querySelector('[aria-label="Android voice controls"]')!
+      expect(group.querySelector('[data-state-mark]')).toBeNull()
       expectIconOnlyRow()
     }
-    expect(new Set(marks).size).toBe(marks.length)
   })
   it.each([
     ['Speak replies', { ttsAvailable: true }, 'set_tts_enabled', 'Synthetic speech preference failure'],
@@ -231,7 +229,7 @@ describe('compact Android composer voice controls', () => {
     const state = await setup(true, { ttsEnabled: true, ttsAvailable: false }, { generationAvailable: false, disabled: true })
     expect(compactButton('Ask').disabled).toBe(true)
     expect(compactButton('Talk')).toBeNull()
-    expect(compactButton('Dictate into draft').disabled).toBe(true)
+    expect(compactButton('Dictate into draft')).toBeNull()
     expect(compactButton('Speak replies').disabled).toBe(false)
     await act(async () => { compactButton('Speak replies').click() })
     expect(state.native).toHaveBeenCalledWith('set_tts_enabled', { enabled: false })
@@ -247,14 +245,12 @@ describe('compact Android composer voice controls', () => {
     expect(compactButton('Ask').getAttribute('data-voice-mode')).toBe('idle')
     expectIconOnlyRow()
   })
-  it('explains unavailable generation without admitting Ask and still allows draft-only dictation', async () => {
+  it('explains unavailable generation without admitting Ask', async () => {
     const state = await setup(true, {}, { generationAvailable: false })
     await act(async () => { compactButton('Ask').click() })
     expect(state.native.mock.calls.some(([name]) => name === 'start_assistant_voice')).toBe(false)
     expect(container!.querySelector('[role="status"]')?.textContent).toContain('Ask requires an available model')
-    await act(async () => { compactButton('Dictate into draft').click() })
-    expect(state.native).toHaveBeenCalledWith('start_assistant_voice', expect.objectContaining({ loopMode: false, completionPolicy: 'manual' }))
-    expect(compactButton('Finish dictation').disabled).toBe(false)
+    expect(compactButton('Dictate into draft')).toBeNull()
     expect(state.onSubmit).not.toHaveBeenCalled()
   })
   it.each(['pending', 'unavailable'] as const)('keeps initial readiness %s accessible without a visible status row', async (outcome) => {
@@ -265,11 +261,11 @@ describe('compact Android composer voice controls', () => {
     await act(async () => { root?.render(<AndroidVoiceControls draft="" disabled={false} generationAvailable compact stopRef={{ current: null }} onDraft={vi.fn()} onSubmit={vi.fn()} onActivity={vi.fn()} onSettled={vi.fn()} modelControl={<button aria-label="Model"><ControlIcon kind="model" /></button>} />) })
     expectIconOnlyRow()
     expect(compactButton('Ask').disabled).toBe(true)
-    expect(compactButton('Ask').querySelector('svg')?.getAttribute('data-icon-state')).toBe('busy')
+    expect(compactButton('Ask').querySelector('svg')?.getAttribute('data-icon-kind')).toBe('mic')
     expect(compactButton('Ask').title).toContain('Checking voice availability')
     await act(async () => { if (outcome === 'pending') resolve(wire); else reject(new Error('Synthetic unavailable speech status')) })
     expectIconOnlyRow()
-    expect(compactButton('Ask').querySelector('svg')?.getAttribute('data-icon-state')).toBe(outcome === 'pending' ? 'ready' : 'error')
+    expect(compactButton('Speak replies').querySelector('svg')?.getAttribute('data-icon-state')).toBe(outcome === 'pending' ? 'unavailable' : 'error')
     if (outcome === 'unavailable') expect(container!.querySelector('[role="alert"]')?.textContent).toBe('Native speech status is unavailable')
   })
   it('marks a pending start as busy and lets the Stop icon retire it without late activation', async () => {
@@ -279,9 +275,9 @@ describe('compact Android composer voice controls', () => {
     await act(async () => { compactButton('Ask').click() })
     expectIconOnlyRow()
     expect(compactButton('Stop voice').disabled).toBe(false)
-    expect(compactButton('Stop voice').querySelector('svg')?.getAttribute('data-icon-state')).toBe('busy')
+    expect(compactButton('Stop voice').querySelector('svg')?.getAttribute('data-icon-kind')).toBe('stop')
     expect(container!.querySelector('[role="status"]')?.textContent).toContain('Starting voice…')
-    expect(container!.querySelector('[role="status"]')?.classList.contains('sr-only')).toBe(false)
+    expect(container!.querySelector('[role="status"]')?.classList.contains('sr-only')).toBe(true)
     expect(compactButton('Stop voice').disabled).toBe(false)
     await act(async () => { compactButton('Stop voice').click(); resolveStart({ ...wire, dictation: 'listening' }) })
     expect(compactButton('Talk')).toBeNull()
@@ -337,7 +333,7 @@ describe('Android native voice controls', () => {
     expect(native.mock.calls.some(([name]) => name === 'start_assistant_voice')).toBe(false)
     const message = container.querySelector('[data-voice-confirmation]')!
     expect(message.textContent).toContain('Tap Ask')
-    expect(message.classList.contains('sr-only')).toBe(false)
+    expect(message.classList.contains('sr-only')).toBe(true)
     await act(async () => { window.dispatchEvent(new Event('focus')); await vi.advanceTimersByTimeAsync(1000) })
     expect(native.mock.calls.some(([name]) => name === 'start_assistant_voice')).toBe(false)
     await act(async () => { compactButton('Ask').click() })
@@ -377,7 +373,7 @@ describe('Android native voice controls', () => {
   })
   it.each(['no_speech', 'recognition_retirement_failed'])('preserves partial drafts without auto-send and only warns for actionable failure %s', async (error) => {
     const { event, onDraft, onSubmit } = await setup()
-    await act(async () => { compactButton('Dictate into draft').click() })
+    await act(async () => { compactButton('Ask').click() })
     await act(async () => { event({ kind: 'dictation', phase: 'partial', draft: 'Synthetic unconfirmed draft' }); event({ ...wire, dictation: 'error', error }) })
     expect(onDraft).toHaveBeenCalledWith('Synthetic unconfirmed draft')
     expect(onSubmit).not.toHaveBeenCalled()
@@ -414,7 +410,7 @@ describe('Android native voice controls', () => {
   })
   it.each([['dictation', false], ['loop', false], ['shortcut', false], ['dictation', true], ['loop', true], ['shortcut', true]] as const)('presents %s as starting until native speech readiness is known (compact=%s)', async (mode, compact) => {
     const state = await setup(compact)
-    await act(async () => { compactButton('Dictate into draft').click() })
+    await act(async () => { compactButton('Ask').click() })
     const listening = { ...wire, mode, dictation: 'listening', loop: mode === 'loop' ? 'listening' : 'idle', shortcutPhase: mode === 'shortcut' ? 'listening' : null }
     await act(async () => { state.event(listening) })
     expect(container!.querySelector('[role="status"]')?.textContent).toBe(mode === 'dictation' ? 'Dictating · draft only · Starting voice…' : 'Starting voice…')
@@ -508,7 +504,7 @@ describe('Android native voice controls', () => {
     }
     container = document.createElement('div'); document.body.append(container); root = createRoot(container)
     await act(async () => { root?.render(<Harness />) })
-    await act(async () => { compactButton(mode === 'loop' ? 'Test loop adapter entry' : 'Dictate into draft').click() })
+    await act(async () => { compactButton(mode === 'loop' ? 'Test loop adapter entry' : 'Ask').click() })
     await act(async () => {
       if (hasPartial) channel({ sessionId, kind: 'dictation', phase: 'partial', draft: partial })
       if (mode === 'loop') channel({ sessionId, kind: 'loop', phase: 'error', error: message })
@@ -581,7 +577,7 @@ describe('Android native voice controls', () => {
     const render = (disabled: boolean) => <AndroidVoiceControls draft="" disabled={disabled} generationAvailable stopRef={stopRef} onDraft={vi.fn()} onSubmit={vi.fn()} onActivity={onActivity} onSettled={vi.fn()} onStatus={onStatus} />
     container = document.createElement('div'); document.body.append(container); root = createRoot(container)
     await act(async () => { root?.render(render(false)) })
-    await act(async () => { compactButton('Dictate into draft').click() })
+    await act(async () => { compactButton('Ask').click() })
     await act(async () => { root?.render(render(true)); await vi.advanceTimersByTimeAsync(1000) })
     expect(native.mock.calls.some(([name]) => name === 'stop_assistant_voice')).toBe(false)
     await act(async () => {
@@ -610,7 +606,7 @@ describe('Android native voice controls', () => {
     const onStatus = vi.fn()
     container = document.createElement('div'); document.body.append(container); root = createRoot(container)
     await act(async () => { root?.render(<AndroidVoiceControls draft="" disabled={false} generationAvailable stopRef={{ current: null }} onDraft={vi.fn()} onSubmit={vi.fn()} onActivity={vi.fn()} onSettled={vi.fn()} onStatus={onStatus} />) })
-    await act(async () => { compactButton('Dictate into draft').click() })
+    await act(async () => { compactButton('Ask').click() })
     await act(async () => { channel({ ...wire, sessionId, dictation: 'error', error: 'Microphone permission denied; enable access in system Settings' }); resolveStart({ ...wire, dictation: 'listening' }) })
     expect(onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ dictation: 'error' }), null)
     expect(container.querySelector('[role="alert"]')?.textContent).toContain('Microphone permission denied')
@@ -714,7 +710,7 @@ describe('Android native voice controls', () => {
   })
   it('retains a shortcut timeout draft for manual review without execution', async () => {
     const state = await setup()
-    await act(async () => { compactButton('Dictate into draft').click() })
+    await act(async () => { compactButton('Ask').click() })
     await act(async () => { state.event({ kind: 'shortcut_review', draft: 'Synthetic uncertain partial', reason: 'Final recognition timed out; review before sending' }) })
     expect(state.onDraft).toHaveBeenCalledWith('Synthetic uncertain partial')
     expect(state.onSubmit).not.toHaveBeenCalled()
@@ -747,13 +743,13 @@ describe('Android native voice controls', () => {
     expect(onDraft).toHaveBeenCalledWith('Synthetic uncertain partial')
     expect(cancelled).not.toHaveBeenCalled()
     expect(onSubmit).not.toHaveBeenCalled()
-    await act(async () => { compactButton('Dictate into draft').click() })
+    await act(async () => { compactButton('Ask').click() })
     expect(native.mock.calls.filter(([name]) => name === 'start_assistant_voice')).toHaveLength(1)
     expect(container.textContent).toContain('Review and send the new voice draft')
   })
   it('fills the composer on dictation final without sending and drops callbacks after Stop', async () => {
     const state = await setup()
-    await act(async () => { compactButton('Dictate into draft').click() })
+    await act(async () => { compactButton('Ask').click() })
     await act(async () => { state.event({ kind: 'dictation', phase: 'final', draft: 'Synthetic final words', utterance: '1', error: null }) })
     expect(state.onDraft).toHaveBeenCalledWith('Synthetic final words')
     expect(state.onSubmit).not.toHaveBeenCalled()
