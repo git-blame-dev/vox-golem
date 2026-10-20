@@ -103,8 +103,14 @@ export function parsePromptExecutionEvent(payload: unknown): PromptExecutionEven
 
   const requestId = payload['request_id']
   const kind = payload['kind']
-  if (typeof requestId !== 'string' || typeof kind !== 'string') {
+  if (typeof requestId !== 'string' || requestId.length === 0 || utf8ByteLength(requestId) > 512 || typeof kind !== 'string') {
     throw new Error('Prompt execution event must include request_id and kind')
+  }
+  for (const key of ['text', 'correction', 'message', 'detail', 'tool']) {
+    const value = payload[key]
+    if (typeof value === 'string' && utf8ByteLength(value) > (key === 'text' ? 256 * 1024 : 4096)) {
+      throw new Error('Prompt execution event exceeds presentation budget')
+    }
   }
 
   if (kind === 'text' || kind === 'reasoning') {

@@ -19,8 +19,15 @@ mod app_updates;
 mod chatgpt_auth;
 #[cfg(test)]
 mod conversation_runtime_tests;
+mod desktop_observation;
+mod desktop_speech_adapter;
+mod desktop_voice;
+mod desktop_voice_adapter;
+#[cfg(test)]
+mod desktop_voice_integration_tests;
 mod livekit_wakeword;
 mod partial_transcription;
+mod reply_speech;
 mod search_runtime;
 mod state_store;
 mod update_activity;
@@ -105,9 +112,26 @@ struct AppState {
     wake_word_runtime: Option<Mutex<wake_word::WakeWordRuntime>>,
     voice_activity_runtime: Option<Mutex<voice_activity::VoiceActivityRuntime>>,
     microphone_capture: Arc<voxgolem_audio::capture::AudioCaptureService>,
+    native_voice: Arc<desktop_voice::DesktopVoiceRuntime>,
+    native_observation: Mutex<desktop_observation::DesktopObservation>,
+    native_reply: Arc<Mutex<reply_speech::ReplySpeech>>,
+    native_speech_pending: Mutex<Option<reply_speech::SpeechRequest>>,
+    native_speech_running: AtomicBool,
+    native_reply_execution: Mutex<Option<voxgolem_core::conversation::ExecutionId>>,
+    native_speech_worker: Arc<tokio::sync::Semaphore>,
+    native_voice_work: Arc<PromptCleanupTracker>,
+    native_final_asr: Arc<tokio::sync::Semaphore>,
+    voice_input_reset_pending: AtomicBool,
+    voice_auto_stop: AtomicBool,
+    voice_autostart_available: AtomicBool,
+    voice_effects: Mutex<desktop_voice_adapter::VoiceEffects>,
+    native_voice_cue: Mutex<Option<u64>>,
+    native_cue_preparing: AtomicBool,
+    voice_clock_origin: Instant,
     parakeet_runtime: Option<Arc<Mutex<transcription::ParakeetRuntime>>>,
     partial_transcription: Arc<Mutex<partial_transcription::PartialTranscriptionScheduler>>,
     partial_voice_session: AtomicU64,
+    native_partial_authority: Mutex<Option<desktop_voice_adapter::VoiceAdmissionToken>>,
     completion_runtime: Mutex<Option<voxgolem_platform::completion::CompletionRuntime>>,
     completion_request: Arc<Mutex<Option<voxgolem_platform::completion::CompletionRequestHandle>>>,
     completion_context: Arc<Mutex<Option<CompletionRequestContext>>>,
@@ -244,6 +268,11 @@ struct PromptAdmissionResources<'a> {
     network_preferences: &'a Mutex<NetworkPreferences>,
     voice_pipeline_state: &'a Arc<Mutex<voxgolem_core::voice_pipeline::VoicePipelineState>>,
     voice_pipeline_config: voxgolem_core::voice_pipeline::VoicePipelineConfig,
+    native_voice: Option<(
+        &'a desktop_voice::DesktopVoiceRuntime,
+        &'a AtomicU64,
+        desktop_voice_adapter::VoiceAdmissionToken,
+    )>,
 }
 
 impl AppState {
@@ -255,6 +284,7 @@ impl AppState {
             network_preferences: &self.network_preferences,
             voice_pipeline_state: &self.voice_pipeline_state,
             voice_pipeline_config: self.voice_pipeline_config,
+            native_voice: None,
         }
     }
 }
@@ -577,6 +607,7 @@ struct ActivePrompt {
     publication_epoch: u64,
     terminal_kind: Arc<Mutex<Option<TerminalKind>>>,
     updates: Arc<Mutex<Option<Channel<PromptExecutionEventPayload>>>>,
+    native_owned: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -670,6 +701,7 @@ struct SettingsPublicationGuard {
 
 #[derive(Clone)]
 struct PreferencePublicationState {
+    native_reply: Arc<Mutex<reply_speech::ReplySpeech>>,
     network_preferences: Arc<Mutex<NetworkPreferences>>,
     lifecycle_gate: Arc<Mutex<()>>,
     exit_cleanup_started: Arc<AtomicBool>,
@@ -864,12 +896,7 @@ fn repair_cancelled_prompt_runtime(app_state: &AppState) {
     if current_runtime_phase(&app_state.voice_pipeline_state)
         .is_ok_and(|phase| phase != RuntimePhasePayload::Sleeping)
     {
-        let _ = reset_voice_pipeline_to_waiting(
-            &app_state.voice_pipeline_state,
-            &app_state.wake_word_runtime,
-            &app_state.voice_activity_runtime,
-            app_state.voice_pipeline_config,
-        );
+        let _ = reset_voice_runtime_session(app_state);
     }
 }
 
@@ -920,6 +947,7 @@ impl Drop for SettingsPublicationGuard {
 impl PreferencePublicationState {
     fn new(app_state: &AppState) -> Self {
         Self {
+            native_reply: Arc::clone(&app_state.native_reply),
             network_preferences: Arc::clone(&app_state.network_preferences),
             lifecycle_gate: Arc::clone(&app_state.lifecycle_gate),
             exit_cleanup_started: Arc::clone(&app_state.exit_cleanup_started),
@@ -1466,18 +1494,6 @@ struct StartNativeMicrophonePayload {
     fell_back_to_default: bool,
 }
 
-#[derive(Clone, Debug, Serialize)]
-struct NativeMicrophoneFramePayload {
-    capture_id: u64,
-    frame: Vec<f32>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct NativeMicrophoneTerminalPayload {
-    capture_id: u64,
-    message: String,
-}
-
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 struct CapabilityPayload {
     id: &'static str,
@@ -1763,6 +1779,10 @@ fn publish_validated_preferences(
         .startup_state
         .lock()
         .map_err(|_| ipc_command_error("capability state is unavailable"))?;
+    let mut native_reply = state
+        .native_reply
+        .lock()
+        .map_err(|_| ipc_command_error("native speech owner unavailable"))?;
     let mut tts_runtime = state
         .local_tts_runtime
         .lock()
@@ -1778,6 +1798,7 @@ fn publish_validated_preferences(
         ));
     }
     if tts_changed {
+        let _ = native_reply.set_enabled(preferences.tts_enabled);
         if preferences.tts_enabled {
             state
                 .tts_audio_playback
@@ -1955,6 +1976,90 @@ async fn get_app_snapshot(
     get_app_snapshot_from_state(&app_state)
 }
 
+#[tauri::command]
+async fn read_desktop_runtime(
+    since_revision: Option<u64>,
+    app: tauri::AppHandle,
+    app_state: tauri::State<'_, AppState>,
+) -> Result<desktop_observation::ReadDesktopRuntimePayload, String> {
+    if since_revision.is_none() {
+        desktop_voice_adapter::publish_voice(&app, None);
+    }
+    app_state
+        .native_observation
+        .lock()
+        .map(|mut observer| observer.read(since_revision))
+        .map_err(|_| String::from("Native desktop observation is unavailable"))
+}
+
+#[tauri::command]
+async fn get_desktop_request_owner(
+    request_id: String,
+    execution_id: voxgolem_core::ipc::ExecutionId,
+    app_state: tauri::State<'_, AppState>,
+) -> Result<Option<&'static str>, String> {
+    get_desktop_request_owner_from_state(&app_state, &request_id, &execution_id)
+}
+
+fn get_desktop_request_owner_from_state(
+    app_state: &AppState,
+    request_id: &str,
+    execution_id: &voxgolem_core::ipc::ExecutionId,
+) -> Result<Option<&'static str>, String> {
+    let _publication = app_state
+        .prompt_publication_gate
+        .lock()
+        .map_err(|_| String::from("prompt publication unavailable"))?;
+    let _lifecycle = app_state
+        .lifecycle_gate
+        .lock()
+        .map_err(|_| String::from("lifecycle unavailable"))?;
+    let active = app_state
+        .active_prompt
+        .lock()
+        .map_err(|_| String::from("active request unavailable"))?;
+    Ok(active
+        .as_ref()
+        .filter(|active| {
+            active.request_id == request_id
+                && ipc_execution_matches(active.assistant_generation, execution_id)
+        })
+        .map(|active| {
+            if active.native_owned.load(Ordering::Acquire) {
+                "native_voice"
+            } else {
+                "renderer"
+            }
+        }))
+}
+
+fn ipc_execution_matches(
+    native: voxgolem_core::conversation::ExecutionId,
+    wire: &voxgolem_core::ipc::ExecutionId,
+) -> bool {
+    wire.session_id.as_str() == native.session_id.0.to_string()
+        && wire.generation.as_str() == native.generation.0.to_string()
+}
+
+#[tauri::command]
+async fn set_voice_auto_stop(
+    enabled: bool,
+    app: tauri::AppHandle,
+    app_state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    let _operation = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
+    {
+        let _lifecycle = app_state
+            .lifecycle_gate
+            .lock()
+            .map_err(|_| String::from("voice lifecycle unavailable"))?;
+        ensure_app_running(&app_state.exit_cleanup_started)?;
+        app_state.voice_auto_stop.store(enabled, Ordering::Release);
+    }
+    desktop_voice_adapter::publish_voice(&app, None);
+    Ok(enabled)
+}
+
 fn get_app_snapshot_from_state(
     app_state: &AppState,
 ) -> Result<voxgolem_core::ipc::AppSnapshot, voxgolem_core::ipc::CommandError> {
@@ -2011,6 +2116,7 @@ async fn set_preferences(
 ) -> Result<voxgolem_core::ipc::ValidatedPreferences, voxgolem_core::ipc::CommandError> {
     let result = set_preferences_from_state(preferences, &app_state).await?;
     spawn_custom_and_web_prewarm(&app);
+    desktop_voice_adapter::prepare_cues(&app);
     Ok(result)
 }
 
@@ -2892,6 +2998,7 @@ fn effective_custom_config(
 #[tauri::command]
 async fn set_tts_enabled(
     enabled: bool,
+    app: tauri::AppHandle,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<SetTtsEnabledPayload, String> {
     let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
@@ -2924,6 +3031,11 @@ async fn set_tts_enabled(
     )
     .await?;
     let proposed_runtime = persist_tts_preference(enabled, proposed_runtime)?;
+    let mut native_reply = app_state
+        .native_reply
+        .lock()
+        .map_err(|_| String::from("native speech owner unavailable"))?;
+    let _ = native_reply.set_enabled(enabled);
     let mut runtime_guard = app_state
         .local_tts_runtime
         .lock()
@@ -2970,6 +3082,7 @@ async fn set_tts_enabled(
             tts::TtsActualProvider::Cpu => "cpu",
         });
     drop(runtime_guard);
+    drop(native_reply);
     drop(unused_proposed_runtime);
     drop(old_runtime);
     let _lifecycle = app_state
@@ -2998,6 +3111,8 @@ async fn set_tts_enabled(
         }
     }
 
+    drop(_lifecycle);
+    desktop_voice_adapter::prepare_cues(&app);
     Ok(SetTtsEnabledPayload {
         enabled,
         sample_rate_hz,
@@ -3062,6 +3177,21 @@ async fn prepare_voice_cues(
     app_state: tauri::State<'_, AppState>,
 ) -> Result<PreparedVoiceCuesPayload, String> {
     let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
+    let existing = app_state
+        .local_tts_runtime
+        .lock()
+        .map_err(|_| String::from("local voice runtime lock is poisoned"))?
+        .clone();
+    prepare_voice_cues_from_runtime(&app_state, existing).await
+}
+
+// The native adapter retains its update lease through any abandoned synthesis.
+// Passing the captured runtime prevents TTS-off racing this job into
+// initialization of a new model merely because the published slot became empty.
+async fn prepare_voice_cues_from_runtime(
+    app_state: &AppState,
+    existing: Option<Arc<tts::LocalTtsRuntime>>,
+) -> Result<PreparedVoiceCuesPayload, String> {
     app_state
         .voice_cue_cache
         .get_or_try_init(|| async {
@@ -3074,11 +3204,6 @@ async fn prepare_voice_cues(
             }
             let spec = config.local_tts.clone();
             let logging_enabled = config.logging.enabled;
-            let existing = app_state
-                .local_tts_runtime
-                .lock()
-                .map_err(|_| String::from("local voice runtime lock is poisoned"))?
-                .clone();
             spawn_runtime_blocking(move || {
                 let owned = if existing.is_none() {
                     initialize_local_tts_runtime(&spec, true, logging_enabled)?.map(Arc::new)
@@ -3280,6 +3405,15 @@ async fn speak_local_tts(
     playback_id: u64,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<SynthesizeLocalTtsPayload, String> {
+    speak_local_tts_from_state(text, playback_id, &app_state, None).await
+}
+
+async fn speak_local_tts_from_state(
+    text: String,
+    playback_id: u64,
+    app_state: &AppState,
+    speech_generation: Option<u64>,
+) -> Result<SynthesizeLocalTtsPayload, String> {
     let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
     ensure_app_running(&app_state.exit_cleanup_started)?;
     if !app_state
@@ -3299,6 +3433,18 @@ async fn speak_local_tts(
         .unwrap_or(false);
     let (runtime, generation) = {
         let _operation_guard = app_state.tts_operation_lock.lock().await;
+        let _reply_guard = if let Some(generation) = speech_generation {
+            let reply = app_state
+                .native_reply
+                .lock()
+                .map_err(|_| String::from("native speech owner unavailable"))?;
+            if !reply.valid(generation) {
+                return Err(String::from("native speech was retired"));
+            }
+            Some(reply)
+        } else {
+            None
+        };
         let runtime_guard = app_state
             .local_tts_runtime
             .lock()
@@ -3314,7 +3460,11 @@ async fn speak_local_tts(
             );
             String::from("local tts runtime is not available")
         })?);
-        register_tts_playback(&app_state.tts_playback, playback_id)?;
+        if speech_generation.is_some() {
+            ensure_tts_playback_current(&app_state.tts_playback, playback_id)?;
+        } else {
+            register_tts_playback(&app_state.tts_playback, playback_id)?;
+        }
         let generation = runtime.start_generation();
         (runtime, generation)
     };
@@ -3328,10 +3478,7 @@ async fn speak_local_tts(
         Ok(Ok(audio)) => audio,
         Ok(Err(error)) => {
             finish_tts_playback_state(&app_state.tts_playback, playback_id)?;
-            log_tts_runtime_event(
-                runtime_file_logging_enabled,
-                &format!("synthesis failed: {error}"),
-            );
+            log_tts_runtime_event(runtime_file_logging_enabled, "synthesis failed");
             return Err(error);
         }
         Err(error) => {
@@ -3339,12 +3486,8 @@ async fn speak_local_tts(
             return Err(format!("local tts synthesis task failed: {error}"));
         }
     };
-    ensure_tts_playback_current(&app_state.tts_playback, playback_id).map_err(|error| {
-        log_tts_runtime_event(
-            runtime_file_logging_enabled,
-            &format!("synthesis superseded: {error}"),
-        );
-        error
+    ensure_tts_playback_current(&app_state.tts_playback, playback_id).inspect_err(|_error| {
+        log_tts_runtime_event(runtime_file_logging_enabled, "synthesis superseded");
     })?;
     let duration_ms = audio.duration_ms;
     let output_gain_db = app_state
@@ -3372,10 +3515,7 @@ async fn speak_local_tts(
         }
         Ok(Err(error)) => {
             finish_tts_playback_state(&app_state.tts_playback, playback_id)?;
-            log_tts_runtime_event(
-                runtime_file_logging_enabled,
-                &format!("playback failed: {error}"),
-            );
+            log_tts_runtime_event(runtime_file_logging_enabled, "playback failed");
             return Err(format!("local tts playback failed: {error}"));
         }
         Err(error) => {
@@ -3430,6 +3570,9 @@ fn reserve_native_microphone_capture_id(
 ) -> Result<u64, String> {
     let _update_guard = begin_native_microphone_operation(&app_state.update_installation_gate)?;
     app_state
+        .voice_autostart_available
+        .store(false, Ordering::Release);
+    app_state
         .microphone_capture
         .reserve_id()
         .map_err(|error| error.to_string())
@@ -3470,115 +3613,18 @@ async fn start_native_microphone(
     app: tauri::AppHandle,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<StartNativeMicrophonePayload, String> {
-    let _update_guard = begin_native_microphone_operation(&app_state.update_installation_gate)?;
-    ensure_startup_ready_for_prompt(&app_state.startup_state)?;
-    let event_app = app.clone();
-    let terminal_app = app;
-    let first_frame = Arc::new(AtomicBool::new(false));
-    let callback_first_frame = Arc::clone(&first_frame);
-    let logging_enabled = app_state
-        .runtime_config
-        .as_ref()
-        .is_some_and(|config| config.logging.enabled);
-    let microphone_capture = Arc::clone(&app_state.microphone_capture);
-    let sample_rate_hz = app_state.voice_pipeline_config.sample_rate_hz();
-    let start = spawn_runtime_blocking(move || {
-        microphone_capture.start(
-            capture_id,
-            device_id,
-            sample_rate_hz,
-            NATIVE_MICROPHONE_FRAME_SAMPLES,
-            Box::new(move |frame| {
-                if !callback_first_frame.swap(true, Ordering::AcqRel) {
-                    let _ = append_runtime_log_line(
-                        logging_enabled,
-                        "audio",
-                        "native microphone produced first frame",
-                    );
-                    #[cfg(feature = "app-benchmark")]
-                    app_benchmark::mark("first_capture_frame");
-                }
-                #[cfg(feature = "app-benchmark")]
-                let emit_started = Instant::now();
-                let emitted = event_app.emit(
-                    "native-microphone-frame",
-                    NativeMicrophoneFramePayload { capture_id, frame },
-                );
-                #[cfg(feature = "app-benchmark")]
-                app_benchmark::emitted_frame(emit_started, emit_started.elapsed());
-                if emitted.is_err() {
-                    let _ = append_runtime_log_line(
-                        logging_enabled,
-                        "audio",
-                        "native microphone frame event failed",
-                    );
-                }
-            }),
-            Box::new(move |terminal| {
-                #[cfg(feature = "app-benchmark")]
-                app_benchmark::mark(
-                    if terminal.error == voxgolem_audio::capture::CaptureError::ChannelOverflow {
-                        "capture_queue_overflow"
-                    } else {
-                        "capture_terminal_failure"
-                    },
-                );
-                let message = terminal.error.to_string();
-                let _ = append_runtime_log_line(
-                    logging_enabled,
-                    "audio",
-                    &format!("native microphone stopped unexpectedly: {message}"),
-                );
-                if terminal_app
-                    .emit(
-                        "native-microphone-terminal",
-                        NativeMicrophoneTerminalPayload {
-                            capture_id: terminal.capture_id,
-                            message,
-                        },
-                    )
-                    .is_err()
-                {
-                    let _ = append_runtime_log_line(
-                        logging_enabled,
-                        "audio",
-                        "native microphone terminal event failed",
-                    );
-                }
-            }),
-        )
-    })
-    .await
-    .map_err(|error| format!("native microphone startup task failed: {error}"))?
-    .map_err(|error| error.to_string())?;
-    let _ = append_runtime_log_line(logging_enabled, "audio", "native microphone started");
-    #[cfg(feature = "app-benchmark")]
-    app_benchmark::automatic_diagnostic(Arc::clone(&app_state.microphone_capture));
-    Ok(StartNativeMicrophonePayload {
-        fell_back_to_default: start.fell_back_to_default,
-    })
+    desktop_voice_adapter::start_capture(app, &app_state, capture_id, device_id).await
 }
 
 #[tauri::command]
-fn stop_native_microphone(
+async fn stop_native_microphone(
     capture_id: u64,
+    app: tauri::AppHandle,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     #[cfg(feature = "app-benchmark")]
     app_benchmark::mark("capture_stop_requested");
-    app_state
-        .microphone_capture
-        .stop(capture_id)
-        .map_err(|error| error.to_string())?;
-    let _ = append_runtime_log_line(
-        app_state
-            .runtime_config
-            .as_ref()
-            .is_some_and(|config| config.logging.enabled),
-        "audio",
-        "native microphone stopped",
-    );
-    Ok(())
+    desktop_voice_adapter::stop_capture(app, &app_state, capture_id).await
 }
 
 fn register_tts_playback(state: &Mutex<TtsPlaybackState>, playback_id: u64) -> Result<(), String> {
@@ -3747,11 +3793,10 @@ async fn set_wake_clip_settings(
     .await
 }
 
-#[tauri::command]
-async fn save_wake_clip(
+async fn save_wake_clip_from_state(
     samples: Vec<f32>,
     confidence: f32,
-    app_state: tauri::State<'_, AppState>,
+    app_state: &AppState,
 ) -> Result<Option<wake_clips::ClipMetadata>, String> {
     let permit = Arc::clone(&app_state.wake_clip_writers)
         .try_acquire_owned()
@@ -4859,6 +4904,15 @@ impl DesktopConversationRuntime {
             .lock()
             .map_err(|_| String::from("lifecycle gate is poisoned"))?;
         ensure_app_running(resources.exit_cleanup_started)?;
+        if let Some((runtime, utterance, token)) = resources.native_voice {
+            if !runtime.is_current(token.capture_id, token.epoch)
+                || utterance.load(Ordering::Acquire) != token.utterance
+                || current_runtime_phase(resources.voice_pipeline_state)?
+                    != RuntimePhasePayload::Processing
+            {
+                return Err(String::from("voice utterance was retired before admission"));
+            }
+        }
         if app_state.reset_in_progress.load(Ordering::Acquire) {
             return Err(String::from("session reset is in progress"));
         }
@@ -4960,6 +5014,9 @@ impl DesktopConversationRuntime {
             })
             .cloned()
             .ok_or_else(|| String::from("active prompt registration disappeared"))?;
+        control
+            .native_owned
+            .store(resources.native_voice.is_some(), Ordering::Release);
         if let Err(error) = apply_voice_pipeline_transition(
             resources.voice_pipeline_state,
             resources.voice_pipeline_config,
@@ -5557,7 +5614,7 @@ async fn submit_prompt(
     #[cfg(feature = "app-benchmark")]
     app_benchmark::mark("prompt_command_started");
     let result = DesktopStageDispatcher { app_state, app }
-        .submit(request_id, prompt, source, updates)
+        .submit(request_id, prompt, source, Some(updates), None)
         .await;
     #[cfg(feature = "app-benchmark")]
     if result.is_ok() {
@@ -5579,7 +5636,41 @@ impl DesktopStageDispatcher<'_> {
         request_id: String,
         prompt: String,
         source: Option<CompletionSource>,
-        updates: Channel<PromptExecutionEventPayload>,
+        updates: Option<Channel<PromptExecutionEventPayload>>,
+        voice: Option<desktop_voice_adapter::VoiceAdmissionToken>,
+    ) -> Result<PromptFinalPayload, String> {
+        let app = self.app.clone();
+        let execution = Arc::new(Mutex::new(None));
+        let result = self
+            .execute(
+                request_id.clone(),
+                prompt,
+                source,
+                updates,
+                voice,
+                Arc::clone(&execution),
+            )
+            .await;
+        if let Some(execution) = execution.lock().ok().and_then(|execution| *execution) {
+            desktop_voice_adapter::finish_reply(
+                &app,
+                &request_id,
+                execution,
+                voice.is_some(),
+                &result,
+            );
+        }
+        result
+    }
+
+    async fn execute(
+        self,
+        request_id: String,
+        prompt: String,
+        source: Option<CompletionSource>,
+        updates: Option<Channel<PromptExecutionEventPayload>>,
+        voice: Option<desktop_voice_adapter::VoiceAdmissionToken>,
+        execution_receipt: Arc<Mutex<Option<voxgolem_core::conversation::ExecutionId>>>,
     ) -> Result<PromptFinalPayload, String> {
         let app_state = self.app_state;
         let app = self.app;
@@ -5587,12 +5678,31 @@ impl DesktopStageDispatcher<'_> {
         ensure_startup_ready_for_prompt(&app_state.startup_state)?;
         validate_prompt_request_id(&request_id)?;
         let prompt = validate_prompt_text(prompt)?;
+        // Keep capture independent of preference preparation; native admission
+        // waits for its existing owner once before the canonical policy snapshot.
+        let settings_admission = if voice.is_some() {
+            Some(lock_live_settings_operation(&app_state).await?)
+        } else {
+            None
+        };
+        let mut resources = app_state.prompt_admission_resources();
+        if let Some(token) = voice {
+            resources.native_voice = Some((
+                &app_state.native_voice,
+                &app_state.partial_voice_session,
+                token,
+            ));
+        }
+        if updates.is_none() && voice.is_none() {
+            return Err(String::from("prompt observation authority is unavailable"));
+        }
         let registered = app_state.conversation.admit(
-            app_state.prompt_admission_resources(),
+            resources,
             &request_id,
             &prompt,
             source.unwrap_or(CompletionSource::Typed),
         )?;
+        drop(settings_admission);
         let RegisteredAssistantRequest {
             request: assistant_request,
             physical_generation: generation,
@@ -5602,13 +5712,17 @@ impl DesktopStageDispatcher<'_> {
             control: active_prompt_control,
             guard: active_prompt_guard,
         } = registered;
+        *execution_receipt
+            .lock()
+            .map_err(|_| String::from("execution receipt unavailable"))? =
+            Some(assistant_request.generation);
         #[cfg(feature = "app-benchmark")]
         app_benchmark::mark("prompt_admitted");
-        active_prompt_control
+        *active_prompt_control
             .updates
             .lock()
-            .map_err(|_| String::from("prompt update channel lock is poisoned"))?
-            .replace(updates);
+            .map_err(|_| String::from("prompt update channel lock is poisoned"))? = updates;
+        desktop_voice_adapter::begin_reply(&app, &request_id, &prompt, &active_prompt_control)?;
         if !assistant_request.web_enabled {
             emit_prompt_event_controlled(
                 &app,
@@ -5624,7 +5738,6 @@ impl DesktopStageDispatcher<'_> {
         }
         let native_search = search_runtime::native_search_eligible(&assistant_request.preferences);
         let is_opencode = opencode_client.is_some();
-        cancel_active_tts_generation(&app_state);
         if assistant_request.preferences.deep_enabled {
             if let Err(error) =
                 ensure_agent_prerequisites(&app_state, assistant_request.preferences.deep_model)
@@ -6992,6 +7105,23 @@ fn prompt_execution_text(events: &[PromptExecutionEventPayload]) -> String {
 }
 
 fn cancel_active_tts_generation(app_state: &AppState) {
+    if let Ok(mut reply) = app_state.native_reply.lock() {
+        let _ = reply.reset();
+    }
+    if let Ok(mut pending) = app_state.native_speech_pending.lock() {
+        pending.take();
+    }
+    let playback_id = app_state
+        .tts_playback
+        .lock()
+        .ok()
+        .and_then(|mut state| state.current_id.take());
+    if let Some(playback_id) = playback_id {
+        let _ = app_state.tts_audio_playback.cancel_owned(
+            playback_id,
+            voxgolem_audio::playback::PlaybackPurpose::Speech,
+        );
+    }
     if let Ok(runtime) = app_state.local_tts_runtime.lock() {
         if let Some(runtime) = runtime.as_ref() {
             runtime.cancel_generation();
@@ -8019,14 +8149,30 @@ fn emit_prompt_event_controlled(
     event: PromptExecutionEventPayload,
 ) -> Result<(), PromptControlError> {
     let state = app.state::<AppState>();
-    state
-        .conversation
-        .publish(request_id, generation, event, |current| {
+    state.conversation.publish(
+        request_id,
+        generation,
+        event,
+        |current, event| {
+            desktop_speech_adapter::event(app, request_id, current.assistant_generation, event);
+            if current.native_owned.load(Ordering::Acquire) {
+                let revision = state
+                    .native_observation
+                    .lock()
+                    .map_err(|_| String::from("native observation unavailable"))?
+                    .update_prompt(request_id, event)
+                    .map_err(|error| error.to_string())?;
+                desktop_voice_adapter::notify(app, revision);
+            }
+            Ok(())
+        },
+        |current| {
             cancel_matching_prompt_tts(Some(current), &current.request_id, || {
                 cancel_active_tts_generation(&state)
             });
             repair_cancelled_prompt_runtime(&state);
-        })
+        },
+    )
 }
 
 impl DesktopConversationRuntime {
@@ -8035,6 +8181,7 @@ impl DesktopConversationRuntime {
         request_id: &str,
         generation: u64,
         event: PromptExecutionEventPayload,
+        observe: impl FnOnce(&ActivePrompt, &PromptExecutionEventPayload) -> Result<(), String>,
         repair: impl FnOnce(&ActivePrompt),
     ) -> Result<(), PromptControlError> {
         let terminal = matches!(&event, PromptExecutionEventPayload::Cancelled { .. });
@@ -8042,7 +8189,7 @@ impl DesktopConversationRuntime {
         let _publication_guard = state.prompt_publication_gate.lock().map_err(|_| {
             PromptControlError::Error(String::from("prompt publication gate is poisoned"))
         })?;
-        let (updates, execution_id) = {
+        let (updates, current) = {
             let active = state.active_prompt.lock().map_err(|_| {
                 PromptControlError::Error(String::from("active prompt lock is poisoned"))
             })?;
@@ -8068,9 +8215,13 @@ impl DesktopConversationRuntime {
                     ))
                 })?
                 .clone();
-            (updates, active.assistant_generation)
+            (updates, active.clone())
         };
         if terminal {
+            return Ok(());
+        }
+        observe(&current, &event).map_err(PromptControlError::Error)?;
+        if current.native_owned.load(Ordering::Acquire) {
             return Ok(());
         }
         let Some(updates) = updates else {
@@ -8080,7 +8231,7 @@ impl DesktopConversationRuntime {
         };
         if updates.send(event).is_err() {
             drop(_publication_guard);
-            let _ = self.cancel(execution_id, repair);
+            let _ = self.cancel(current.assistant_generation, repair);
             return Err(PromptControlError::Cancelled);
         }
         Ok(())
@@ -8237,6 +8388,7 @@ fn register_active_prompt(
         publication_epoch,
         terminal_kind,
         updates: Arc::new(Mutex::new(None)),
+        native_owned: Arc::new(AtomicBool::new(false)),
     });
     Ok((generation, cancelled, cancellation_signal, settled))
 }
@@ -8482,9 +8634,55 @@ async fn stream_opencode_prompt(
 #[tauri::command]
 async fn cancel_prompt(
     request_id: String,
+    expected_execution_id: Option<voxgolem_core::ipc::ExecutionId>,
+    app: tauri::AppHandle,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<bool, String> {
-    cancel_prompt_if_active(&app_state, &request_id)
+    let expected = expected_execution_id.as_ref().map(|wire| {
+        app_state.active_prompt.lock().ok().and_then(|active| {
+            active
+                .as_ref()
+                .filter(|active| {
+                    active.request_id == request_id
+                        && ipc_execution_matches(active.assistant_generation, wire)
+                })
+                .map(|active| active.assistant_generation)
+        })
+    });
+    if matches!(expected, Some(None)) {
+        return Ok(false);
+    }
+    let cancelled = if let Some(Some(execution)) = expected {
+        matches!(
+            app_state.conversation.cancel(execution, |current| {
+                cancel_matching_prompt_tts(Some(current), &current.request_id, || {
+                    cancel_active_tts_generation(&app_state)
+                });
+                repair_cancelled_prompt_runtime(&app_state);
+            }),
+            voxgolem_core::conversation::SettlementResult::Applied(
+                voxgolem_core::conversation::AppliedOutcome::Cancelled
+            )
+        )
+    } else {
+        cancel_prompt_if_active(&app_state, &request_id)?
+    };
+    let _publication = app_state
+        .prompt_publication_gate
+        .lock()
+        .map_err(|_| String::from("prompt publication unavailable"))?;
+    let speech_current = expected.is_none_or(|execution| {
+        app_state
+            .native_reply_execution
+            .lock()
+            .map(|current| *current == execution)
+            .unwrap_or(false)
+    });
+    let may_stop_speech = expected.is_none() || cancelled;
+    Ok(
+        (may_stop_speech && speech_current && desktop_speech_adapter::cancel(&app, &request_id))
+            || cancelled,
+    )
 }
 
 fn cancel_prompt_if_active(app_state: &AppState, request_id: &str) -> Result<bool, String> {
@@ -8534,118 +8732,6 @@ impl DesktopConversationRuntime {
 }
 
 #[tauri::command]
-async fn record_speech_activity(
-    now_ms: u64,
-    app_state: tauri::State<'_, AppState>,
-) -> Result<RuntimePhaseResponsePayload, String> {
-    let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
-    let _operation_guard =
-        lock_response_backend_operation(&app_state.response_backend_operation_lock)?;
-    let _lifecycle = app_state
-        .lifecycle_gate
-        .lock()
-        .map_err(|_| String::from("lifecycle gate is poisoned"))?;
-    ensure_startup_ready_for_prompt(&app_state.startup_state)?;
-    apply_voice_pipeline_transition(
-        &app_state.voice_pipeline_state,
-        app_state.voice_pipeline_config,
-        voxgolem_core::voice_pipeline::VoicePipelineEvent::SpeechDetected { now_ms },
-    )?;
-
-    Ok(RuntimePhaseResponsePayload {
-        ..current_runtime_phase_response(&app_state.voice_pipeline_state, None, None)?
-    })
-}
-
-#[tauri::command]
-async fn mark_silence(
-    telemetry_frame_id: Option<String>,
-    app: tauri::AppHandle,
-) -> Result<RuntimePhaseResponsePayload, String> {
-    spawn_runtime_blocking(move || {
-        let app_state = app.state::<AppState>();
-        mark_silence_from_state(telemetry_frame_id, &app_state)
-    })
-    .await
-    .map_err(|error| format!("mark_silence worker failed: {error}"))?
-}
-
-fn mark_silence_from_state(
-    telemetry_frame_id: Option<String>,
-    app_state: &AppState,
-) -> Result<RuntimePhaseResponsePayload, String> {
-    let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
-    let _operation_guard =
-        lock_response_backend_operation(&app_state.response_backend_operation_lock)?;
-    ensure_startup_ready_for_prompt(&app_state.startup_state)?;
-    let now_ms = current_time_ms()?;
-
-    let action = apply_silence_check_with_input_reset(app_state, now_ms)?;
-
-    let should_measure_transcription = matches!(
-        action,
-        voxgolem_core::voice_pipeline::VoicePipelineAction::FinishedUtterance { .. }
-    );
-    if should_measure_transcription {
-        app_state
-            .partial_transcription
-            .lock()
-            .map_err(|_| String::from("partial transcription lock is poisoned"))?
-            .finalize();
-        let _lifecycle = app_state
-            .completion_lifecycle_lock
-            .lock()
-            .map_err(|_| String::from("completion lifecycle lock is poisoned"))?;
-        clear_completion_request_state_locked(app_state, false)?;
-    }
-    let transcription_started_ms = if should_measure_transcription {
-        Some(current_time_ms()?)
-    } else {
-        None
-    };
-
-    let transcript_text = match transcribe_finished_utterance(&action, &app_state.parakeet_runtime)
-    {
-        Ok(transcript_text) => transcript_text,
-        Err(error) => {
-            let _lifecycle = app_state
-                .lifecycle_gate
-                .lock()
-                .map_err(|_| String::from("lifecycle gate is poisoned"))?;
-            reset_voice_pipeline_to_waiting(
-                &app_state.voice_pipeline_state,
-                &app_state.wake_word_runtime,
-                &app_state.voice_activity_runtime,
-                app_state.voice_pipeline_config,
-            )?;
-
-            return Err(error);
-        }
-    };
-
-    let transcription_completed_ms = if should_measure_transcription {
-        Some(current_time_ms()?)
-    } else {
-        None
-    };
-
-    build_mark_silence_response(
-        &app_state.voice_pipeline_state,
-        &action,
-        transcript_text,
-        Some(RuntimeTelemetryPayload {
-            frame_id: telemetry_frame_id,
-            backend_ingest_started_ms: None,
-            backend_ingest_completed_ms: None,
-            wake_detected_ms: None,
-            wake_confidence: None,
-            transcription_started_ms,
-            transcription_completed_ms,
-        }),
-    )
-}
-
-#[tauri::command]
 async fn reset_session(
     app_state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
@@ -8688,11 +8774,19 @@ impl DesktopStageDispatcher<'_> {
         let app_state = self.app_state;
         let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
         let _reset_guard = app_state.reset_operation_lock.lock().await;
-        cancel_active_tts_generation(&app_state);
         ensure_startup_ready_for_prompt(&app_state.startup_state)?;
-        let (reset_execution, _admission_guard) = app_state
-            .conversation
-            .begin_reset(|| reset_voice_runtime_session(&app_state))?;
+        let mut observation_revision = None;
+        let (reset_execution, _admission_guard) = app_state.conversation.begin_reset(|| {
+            reset_voice_runtime_session(&app_state)?;
+            observation_revision = app_state
+                .native_observation
+                .lock()
+                .map_err(|_| String::from("native observation unavailable"))?
+                .clear_prompt()
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        })?;
+        desktop_voice_adapter::notify(&self.app, observation_revision);
         let cleanup = reset_execution.cleanup;
         reset_llama_session(&app_state)?;
         reset_runtime_session(&app_state)?;
@@ -8709,6 +8803,8 @@ impl DesktopStageDispatcher<'_> {
             reset_opencode_session(&app_state).await?;
         }
         spawn_custom_and_web_prewarm(&self.app);
+
+        desktop_voice_adapter::publish_voice(&self.app, None);
 
         Ok(RuntimePhaseResponsePayload {
             ..current_runtime_phase_response(&app_state.voice_pipeline_state, None, None)?
@@ -8727,17 +8823,25 @@ fn reset_runtime_session(app_state: &AppState) -> Result<(), String> {
 }
 
 fn reset_voice_runtime_session(app_state: &AppState) -> Result<(), String> {
-    if current_runtime_phase(&app_state.voice_pipeline_state)? == RuntimePhasePayload::Sleeping {
-        reset_wake_word_runtime(&app_state.wake_word_runtime)?;
-        reset_voice_activity_runtime(&app_state.voice_activity_runtime)?;
-        return Ok(());
-    }
-    reset_voice_pipeline_to_waiting(
+    // Callers own canonical publication/lifecycle admission. Retire speech in
+    // this transaction, not in a preliminary phase that a new admission can pass.
+    cancel_active_tts_generation(app_state);
+    app_state
+        .native_partial_authority
+        .lock()
+        .map_err(|_| String::from("partial voice authority unavailable"))?
+        .take();
+    app_state.native_voice.invalidate()?;
+    desktop_voice_adapter::cancel_voice_cue(app_state);
+    app_state
+        .voice_input_reset_pending
+        .store(true, Ordering::Release);
+    apply_voice_pipeline_transition(
         &app_state.voice_pipeline_state,
-        &app_state.wake_word_runtime,
-        &app_state.voice_activity_runtime,
         app_state.voice_pipeline_config,
-    )
+        voxgolem_core::voice_pipeline::VoicePipelineEvent::ResetToIdle,
+    )?;
+    Ok(())
 }
 
 fn reset_llama_session(app_state: &AppState) -> Result<(), String> {
@@ -8793,46 +8897,15 @@ async fn reset_opencode_session(app_state: &AppState) -> Result<(), String> {
         .map_err(|error| format!("OpenCode reset task failed: {error}"))?
 }
 
-#[tauri::command]
-async fn ingest_audio_frame(
-    frame: Vec<f32>,
-    telemetry_frame_id: Option<String>,
-    app: tauri::AppHandle,
-    app_state: tauri::State<'_, AppState>,
-) -> Result<RuntimePhaseResponsePayload, String> {
-    let ingested = ingest_audio_frame_from_state(frame, telemetry_frame_id, &app_state)?;
-    if ingested
-        .response
-        .telemetry
-        .as_ref()
-        .is_some_and(|telemetry| telemetry.wake_detected_ms.is_some())
-    {
-        spawn_custom_and_web_prewarm(&app);
-    }
-    if let Some(parakeet_runtime) = app_state.parakeet_runtime.as_ref() {
-        spawn_partial_transcription(
-            app,
-            ingested.partial_action,
-            Arc::clone(parakeet_runtime),
-            Arc::clone(&app_state.partial_transcription),
-            app_state.voice_pipeline_config.sample_rate_hz(),
-            ingested.update_guard,
-        );
-    }
-    #[cfg(feature = "app-benchmark")]
-    if ingested.response.runtime_phase == RuntimePhasePayload::Listening {
-        app_benchmark::mark_once("listening_result_returned");
-    }
-    Ok(ingested.response)
-}
-
+#[cfg(test)]
 struct IngestedAudioFrame<'a> {
     response: RuntimePhaseResponsePayload,
-    partial_action: partial_transcription::PartialTranscriptionAction,
-    update_guard: UpdateOperationLease,
+    _partial_action: partial_transcription::PartialTranscriptionAction,
+    _update_guard: UpdateOperationLease,
     _lifecycle: MutexGuard<'a, ()>,
 }
 
+#[cfg(test)]
 fn ingest_audio_frame_from_state(
     frame: Vec<f32>,
     telemetry_frame_id: Option<String>,
@@ -8944,8 +9017,8 @@ fn ingest_audio_frame_from_state(
 
     Ok(IngestedAudioFrame {
         response,
-        partial_action,
-        update_guard,
+        _partial_action: partial_action,
+        _update_guard: update_guard,
         _lifecycle,
     })
 }
@@ -8963,7 +9036,7 @@ fn spawn_partial_transcription(
     };
 
     tauri::async_runtime::spawn(async move {
-        let _update_guard = update_guard;
+        let mut update_guard = Some(update_guard);
         let mut next_action = action;
         while let partial_transcription::PartialTranscriptionAction::StartSnapshot {
             session_id,
@@ -8973,64 +9046,99 @@ fn spawn_partial_transcription(
         {
             let started = Instant::now();
             let runtime = Arc::clone(&parakeet_runtime);
+            // The scheduler may hand an old worker a newer session's pending
+            // snapshot. Resolve authority for THIS action, never for the worker.
+            let native_voice =
+                desktop_voice_adapter::partial_authority(&app.state::<AppState>(), session_id);
+            let inference_app = app.clone();
+            let physical = app.state::<AppState>().native_voice_work.register();
+            let operation = update_guard
+                .take()
+                .expect("partial worker owns operation lease");
             let result = spawn_runtime_blocking(move || {
-                #[cfg(feature = "app-benchmark")]
-                app_benchmark::mark_once("partial_asr_started");
-                let input = voxgolem_model::parakeet::ParakeetTranscriptionInput::new(
-                    sample_rate_hz,
-                    samples,
-                )
-                .map_err(|_| String::from("invalid partial transcription input"))?;
-                let transcript = runtime
-                    .lock()
-                    .map_err(|_| String::from("partial transcription runtime lock is poisoned"))?
-                    .transcribe(&input)
-                    .map_err(|_| String::from("partial transcription inference failed"))?;
-                #[cfg(feature = "app-benchmark")]
-                app_benchmark::mark_once("partial_asr_completed");
-                Ok::<String, String>(transcript.text().to_string())
+                let _physical = physical;
+                let result = (|| {
+                    let Some(token) = native_voice else {
+                        return Ok(None);
+                    };
+                    let input = voxgolem_model::parakeet::ParakeetTranscriptionInput::new(
+                        sample_rate_hz,
+                        samples,
+                    )
+                    .map_err(|_| String::from("invalid partial transcription input"))?;
+                    let mut runtime = runtime.lock().map_err(|_| {
+                        String::from("partial transcription runtime lock is poisoned")
+                    })?;
+                    let state = inference_app.state::<AppState>();
+                    if desktop_voice_adapter::partial_authority(&state, session_id).is_none_or(
+                        |current| {
+                            current.capture_id != token.capture_id || current.epoch != token.epoch
+                        },
+                    ) {
+                        return Ok(None);
+                    }
+                    #[cfg(feature = "app-benchmark")]
+                    app_benchmark::mark_once("partial_asr_started");
+                    let transcript = runtime
+                        .transcribe(&input)
+                        .map_err(|_| String::from("partial transcription inference failed"))?;
+                    #[cfg(feature = "app-benchmark")]
+                    app_benchmark::mark_once("partial_asr_completed");
+                    Ok::<Option<String>, String>(Some(transcript.text().to_string()))
+                })();
+                (result, operation)
             })
-            .await
-            .map_err(|_| String::from("partial transcription worker failed"))
-            .and_then(|result| result);
+            .await;
+            let result = match result {
+                Ok((result, operation)) => {
+                    update_guard = Some(operation);
+                    result
+                }
+                Err(_) => break,
+            };
 
             let succeeded = result.is_ok();
-            let text = result.unwrap_or_default();
+            let retired = matches!(&result, Ok(None));
+            let text = result.ok().flatten().unwrap_or_default();
             let app_state = app.state::<AppState>();
-            append_telemetry(
-                &app_state.telemetry_sink,
-                telemetry::TelemetryMetadata {
-                    schema_version: telemetry::SCHEMA_VERSION,
-                    timestamp_ms: current_time_ms().unwrap_or_default(),
-                    request_id: format!("partial-{session_id}-{revision}"),
-                    generation: revision,
-                    input_source: telemetry::InputSource::Voice,
-                    provider: telemetry::Provider::Local,
-                    model: String::from("parakeet-v2-int8"),
-                    stage: telemetry::Stage::PartialTranscription,
-                    transport: telemetry::Transport::InProcess,
-                    inference_provider: telemetry::InferenceProvider::Cpu,
-                    speculative_origin: telemetry::SpeculativeOrigin::System,
-                    input_tokens: None,
-                    output_tokens: None,
-                    duration_ms: Some(started.elapsed().as_millis() as u64),
-                    status: if succeeded {
-                        telemetry::Status::Ok
-                    } else {
-                        telemetry::Status::Error
+            if !retired {
+                append_telemetry(
+                    &app_state.telemetry_sink,
+                    telemetry::TelemetryMetadata {
+                        schema_version: telemetry::SCHEMA_VERSION,
+                        timestamp_ms: current_time_ms().unwrap_or_default(),
+                        request_id: format!("partial-{session_id}-{revision}"),
+                        generation: revision,
+                        input_source: telemetry::InputSource::Voice,
+                        provider: telemetry::Provider::Local,
+                        model: String::from("parakeet-v2-int8"),
+                        stage: telemetry::Stage::PartialTranscription,
+                        transport: telemetry::Transport::InProcess,
+                        inference_provider: telemetry::InferenceProvider::Cpu,
+                        speculative_origin: telemetry::SpeculativeOrigin::System,
+                        input_tokens: None,
+                        output_tokens: None,
+                        duration_ms: Some(started.elapsed().as_millis() as u64),
+                        status: if succeeded {
+                            telemetry::Status::Ok
+                        } else {
+                            telemetry::Status::Error
+                        },
+                        error_category: if succeeded {
+                            telemetry::ErrorCategory::None
+                        } else {
+                            telemetry::ErrorCategory::Internal
+                        },
                     },
-                    error_category: if succeeded {
-                        telemetry::ErrorCategory::None
-                    } else {
-                        telemetry::ErrorCategory::Internal
-                    },
-                },
-            );
-            next_action = match current_time_ms() {
-                Ok(now_ms) => match scheduler.lock() {
-                    Ok(mut scheduler) => scheduler.complete(now_ms, session_id, revision, text),
-                    Err(_) => break,
-                },
+                );
+            }
+            next_action = match scheduler.lock() {
+                Ok(mut scheduler) => scheduler.complete(
+                    desktop_voice_adapter::monotonic_ms(&app_state),
+                    session_id,
+                    revision,
+                    text,
+                ),
                 Err(_) => break,
             };
 
@@ -9040,21 +9148,13 @@ fn spawn_partial_transcription(
                 text,
             } = &next_action
             {
-                if !text.trim().is_empty() {
-                    let _ = app.emit(
-                        "partial-transcription-event",
-                        PartialTranscriptionEventPayload {
-                            session_id: *session_id,
-                            revision: *revision,
-                            text: text.clone(),
-                        },
-                    );
-                    let _ = queue_completion_request(
-                        CompletionSource::Voice,
+                if let Some(native_voice) = native_voice.filter(|_| !text.trim().is_empty()) {
+                    let _ = desktop_voice_adapter::publish_partial(
+                        &app,
+                        native_voice,
+                        *session_id,
                         *revision,
-                        Some(*session_id),
-                        text.clone(),
-                        &app_state,
+                        text,
                     );
                 }
                 break;
@@ -9174,6 +9274,18 @@ fn queue_completion_request(
         .completion_lifecycle_lock
         .lock()
         .map_err(|_| String::from("completion lifecycle lock is poisoned"))?;
+    queue_completion_request_locked(source, client_revision, voice_session_id, prompt, app_state)
+}
+
+// Caller owns completion_lifecycle_lock; native callers also hold the canonical
+// lifecycle gate in that order so retirement cannot race speculative admission.
+fn queue_completion_request_locked(
+    source: CompletionSource,
+    client_revision: u64,
+    voice_session_id: Option<partial_transcription::VoiceSessionId>,
+    prompt: String,
+    app_state: &AppState,
+) -> Result<(), String> {
     invalidate_prefetch(app_state)?;
     if !assistant_completion_enabled(&app_state.conversation_session)? {
         clear_completion_state_locked(app_state, false)?;
@@ -11715,6 +11827,22 @@ fn initialize_app_state(init: AppStateInit) -> AppState {
         custom_auth_path: init.custom_auth_path,
         custom_retry_lock: init.custom_retry_lock,
         microphone_capture: init.microphone_capture,
+        native_voice: Arc::new(desktop_voice::DesktopVoiceRuntime::new()),
+        native_observation: Mutex::new(desktop_observation::DesktopObservation::new()),
+        native_reply: Arc::new(Mutex::new(reply_speech::ReplySpeech::default())),
+        native_speech_pending: Mutex::new(None),
+        native_speech_running: AtomicBool::new(false),
+        native_reply_execution: Mutex::new(None),
+        native_speech_worker: Arc::new(tokio::sync::Semaphore::new(1)),
+        native_voice_work: Arc::new(PromptCleanupTracker::default()),
+        native_final_asr: Arc::new(tokio::sync::Semaphore::new(1)),
+        voice_input_reset_pending: AtomicBool::new(true),
+        voice_auto_stop: AtomicBool::new(true),
+        voice_autostart_available: AtomicBool::new(true),
+        voice_effects: Mutex::new(desktop_voice_adapter::VoiceEffects::new()),
+        native_voice_cue: Mutex::new(None),
+        native_cue_preparing: AtomicBool::new(false),
+        voice_clock_origin: Instant::now(),
         completion_update_guard: Arc::new(Mutex::new(None)),
         update_installation_gate: Arc::new(UpdateActivity::default()),
         tts_playback: Arc::new(Mutex::new(TtsPlaybackState::default())),
@@ -11740,6 +11868,7 @@ fn initialize_app_state(init: AppStateInit) -> AppState {
         parakeet_runtime: init.parakeet_runtime,
         partial_transcription: new_partial_transcription_scheduler(),
         partial_voice_session: AtomicU64::new(0),
+        native_partial_authority: Mutex::new(None),
         completion_runtime: Mutex::new(None),
         completion_request: Arc::new(Mutex::new(None)),
         completion_context: Arc::new(Mutex::new(None)),
@@ -12418,6 +12547,11 @@ pub(crate) fn ensure_update_installation_is_idle(app_state: &AppState) -> Result
             .load(Ordering::Acquire)
         || app_state.prompt_cleanup.has_pending()
         || app_state.prefetch_cleanup.has_pending()
+        || app_state.native_voice_work.has_pending()
+        || tts::physical_work_pending()
+        || app_state.native_speech_running.load(Ordering::Acquire)
+        || (app_state.native_voice.current_capture_id().is_none()
+            && app_state.native_voice.pending_workers() != 0)
         || app_state
             .conversation_session
             .lock()
@@ -12697,6 +12831,7 @@ fn apply_optional_speech_activity(
     .map_err(|error| format!("speech activity transition failed: {error:?}"))
 }
 
+#[cfg(test)]
 fn wake_word_event_timestamp(
     now_ms: u64,
     wake_word_detection: Option<wake_word::WakeWordDetection>,
@@ -12766,6 +12901,7 @@ fn apply_voice_pipeline_transition(
     Ok(action)
 }
 
+#[cfg(test)]
 fn apply_silence_check_with_input_reset(
     app_state: &AppState,
     now_ms: u64,
@@ -12800,6 +12936,7 @@ fn apply_silence_check_with_input_reset(
     Ok(action)
 }
 
+#[cfg(test)]
 fn apply_voice_pipeline_transition_with_input_runtime_reset(
     voice_pipeline_state: &Mutex<voxgolem_core::voice_pipeline::VoicePipelineState>,
     wake_word_runtime: &Option<Mutex<wake_word::WakeWordRuntime>>,
@@ -12980,6 +13117,7 @@ fn is_llama_context_overflow_error(error_message: &str) -> bool {
     has_status && mentions_context && mentions_overflow
 }
 
+#[cfg(test)]
 fn transcription_ready_samples(
     action: &voxgolem_core::voice_pipeline::VoicePipelineAction,
 ) -> Option<usize> {
@@ -12991,6 +13129,7 @@ fn transcription_ready_samples(
     }
 }
 
+#[cfg(test)]
 fn transcribe_finished_utterance(
     action: &voxgolem_core::voice_pipeline::VoicePipelineAction,
     parakeet_runtime: &Option<Arc<Mutex<transcription::ParakeetRuntime>>>,
@@ -13019,6 +13158,7 @@ fn transcribe_finished_utterance(
     Ok(Some(transcript.text().to_string()))
 }
 
+#[cfg(test)]
 fn build_mark_silence_response(
     voice_pipeline_state: &Mutex<voxgolem_core::voice_pipeline::VoicePipelineState>,
     action: &voxgolem_core::voice_pipeline::VoicePipelineAction,
@@ -13037,6 +13177,7 @@ fn build_mark_silence_response(
     ))
 }
 
+#[cfg(test)]
 fn reset_voice_pipeline_to_waiting(
     voice_pipeline_state: &Mutex<voxgolem_core::voice_pipeline::VoicePipelineState>,
     wake_word_runtime: &Option<Mutex<wake_word::WakeWordRuntime>>,
@@ -13116,24 +13257,61 @@ pub(crate) fn shutdown_runtime_for_exit(app_state: &AppState) {
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) async fn shutdown_runtime_for_update(app_state: &AppState) {
+pub(crate) async fn shutdown_runtime_for_update(app_state: &AppState) -> Result<(), String> {
     shutdown_runtime(app_state).await;
+    if app_state.shutdown_complete.load(Ordering::Acquire) {
+        Ok(())
+    } else {
+        Err(String::from(
+            "Native work is still retiring; update installation was not started",
+        ))
+    }
 }
 
 async fn shutdown_runtime(app_state: &AppState) {
     begin_exit_cleanup(app_state);
+    // Logical cancellation is independent of whether an unrelated native call
+    // can physically retire. Never defer provider cancellation to that wait.
+    let request_id = app_state
+        .active_prompt
+        .lock()
+        .ok()
+        .and_then(|active| active.as_ref().map(|active| active.request_id.clone()));
+    if let Some(request_id) = request_id {
+        let _ = cancel_prompt_if_active(app_state, &request_id);
+    }
+    let _ = invalidate_prefetch(app_state);
+    let _ = clear_completion_state(app_state);
     run_serialized_shutdown(
         &app_state.shutdown_lock,
         &app_state.exit_cleanup_started,
         &app_state.shutdown_complete,
         || async {
-            let request_id = app_state
-                .active_prompt
-                .lock()
-                .ok()
-                .and_then(|active| active.as_ref().map(|active| active.request_id.clone()));
-            if let Some(request_id) = request_id {
-                let _ = cancel_prompt_if_active(app_state, &request_id);
+            let voice = Arc::clone(&app_state.native_voice);
+            let capture = Arc::clone(&app_state.microphone_capture);
+            let voice_retirement = spawn_runtime_blocking(move || {
+                let deadline = Instant::now() + Duration::from_secs(8);
+                let _ = voice.shutdown();
+                capture.shutdown();
+                voice.wait_for_retirement(deadline.saturating_duration_since(Instant::now()))
+                    && capture
+                        .wait_for_retirement(deadline.saturating_duration_since(Instant::now()))
+            });
+            let tts_retirement = spawn_runtime_blocking(|| {
+                tts::wait_for_physical_retirement(Duration::from_secs(8))
+            });
+            let (voice_retired, tts_retired, inference_retired) = tokio::join!(
+                voice_retirement,
+                tts_retirement,
+                tokio::time::timeout(Duration::from_secs(8), app_state.native_voice_work.wait()),
+            );
+            if !voice_retired.unwrap_or(false)
+                || !tts_retired.unwrap_or(false)
+                || inference_retired.is_err()
+            {
+                // Native calls cannot be preempted safely. Retain their owners and
+                // report incomplete cleanup rather than authorizing an installer.
+                return false;
             }
             shutdown_prefetch(app_state).await;
             app_state.conversation.retire_search().await;
@@ -13156,6 +13334,7 @@ async fn shutdown_runtime(app_state: &AppState) {
             if let Some(server) = opencode_server {
                 let _ = server.shutdown().await;
             }
+            true
         },
     )
     .await;
@@ -13168,15 +13347,15 @@ async fn run_serialized_shutdown<F, Fut>(
     cleanup: F,
 ) where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = ()>,
+    Fut: std::future::Future<Output = bool>,
 {
     let _guard = lock.lock().await;
     if complete.load(Ordering::Acquire) {
         return;
     }
     started.store(true, Ordering::Release);
-    cleanup().await;
-    complete.store(true, Ordering::Release);
+    let retired = cleanup().await;
+    complete.store(retired, Ordering::Release);
 }
 
 fn invalidate_runtime_startups_for_exit(app_state: &AppState) {
@@ -13193,6 +13372,9 @@ fn begin_exit_cleanup(app_state: &AppState) -> bool {
     if app_state.exit_cleanup_started.swap(true, Ordering::SeqCst) {
         return false;
     }
+    let _ = app_state.native_voice.request_stop(None);
+    desktop_voice_adapter::cancel_voice_cue(app_state);
+    cancel_active_tts_generation(app_state);
     invalidate_runtime_startups_for_exit(app_state);
     app_state.update_installation_gate.signal_change();
     true
@@ -13527,6 +13709,9 @@ pub fn run() {
         .invoke_handler({
             let regular: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
                 get_app_snapshot,
+                read_desktop_runtime,
+                get_desktop_request_owner,
+                set_voice_auto_stop,
                 set_preferences,
                 app_updates::check_for_update,
                 app_updates::download_update,
@@ -13566,16 +13751,12 @@ pub fn run() {
                 mark_wake_diagnostics,
                 get_wake_clip_settings,
                 set_wake_clip_settings,
-                save_wake_clip,
                 list_wake_clips,
                 play_wake_clip,
                 label_wake_clip,
                 delete_wake_clip,
                 submit_prompt,
                 cancel_prompt,
-                record_speech_activity,
-                ingest_audio_frame,
-                mark_silence,
                 reset_session,
                 request_completion,
                 clear_completion
@@ -15635,6 +15816,7 @@ mod tests {
                     run_serialized_shutdown(&lock, &started, &complete, || async move {
                         attempts.fetch_add(1, Ordering::SeqCst);
                         tokio::task::yield_now().await;
+                        true
                     })
                     .await;
                 })
@@ -15646,6 +15828,30 @@ mod tests {
 
         assert!(complete.load(Ordering::SeqCst));
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn incomplete_physical_retirement_never_publishes_shutdown_success() {
+        let lock = tokio::sync::Mutex::new(());
+        let started = AtomicBool::new(false);
+        let complete = AtomicBool::new(false);
+        run_serialized_shutdown(&lock, &started, &complete, || async { false }).await;
+        assert!(
+            !complete.load(Ordering::Acquire),
+            "an incomplete attempt must not authorize an installer"
+        );
+        let attempts = AtomicUsize::new(0);
+        run_serialized_shutdown(&lock, &started, &complete, || async {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            true
+        })
+        .await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "incomplete cleanup remains retryable"
+        );
+        assert!(complete.load(Ordering::Acquire));
     }
 
     #[test]

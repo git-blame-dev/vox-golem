@@ -79,7 +79,7 @@ impl DesktopSearchState {
         self.clients.client_for(config)
     }
 
-    #[cfg(any(test, not(feature = "app-benchmark")))]
+    #[cfg(not(feature = "app-benchmark"))]
     pub(super) async fn prewarm(&self, config: Option<CustomOpenAiConfig>, web_enabled: bool) {
         let client = config.and_then(|config| self.client_for(config).ok());
         voxgolem_platform::search::prewarm_client_and_web(

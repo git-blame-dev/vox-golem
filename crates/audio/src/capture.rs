@@ -1,6 +1,6 @@
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex, Weak};
+use std::sync::{mpsc, Arc, Condvar, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -96,6 +96,7 @@ pub struct AudioCaptureService {
 struct Shared {
     operation_lock: Mutex<()>,
     state: Mutex<State>,
+    retired: Condvar,
     shutting_down: AtomicBool,
 }
 
@@ -107,6 +108,39 @@ struct State {
     current_id: Option<u64>,
     active: Option<ActiveCapture>,
     teardown_count: usize,
+    start_in_progress: bool,
+}
+
+struct StartLease<'a>(&'a Shared);
+
+impl<'a> StartLease<'a> {
+    fn begin(shared: &'a Shared) -> Result<Self, CaptureError> {
+        let mut state = shared
+            .state
+            .lock()
+            .map_err(|_| CaptureError::StatePoisoned)?;
+        if shared.shutting_down.load(Ordering::Acquire) {
+            return Err(CaptureError::ShuttingDown);
+        }
+        state.start_in_progress = true;
+        Ok(Self(shared))
+    }
+}
+
+impl Drop for StartLease<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.state.lock() {
+            state.start_in_progress = false;
+        }
+        self.0.retired.notify_all();
+    }
+}
+
+fn fully_retired(state: &State) -> bool {
+    state.current_id.is_none()
+        && state.active.is_none()
+        && state.teardown_count == 0
+        && !state.start_in_progress
 }
 
 struct ActiveCapture {
@@ -119,6 +153,8 @@ enum SourceHandle {
     Native(cpal::Stream),
     #[cfg(feature = "benchmark-input")]
     Benchmark(benchmark::Producer),
+    #[cfg(test)]
+    Test(Box<dyn Send>),
 }
 
 impl SourceHandle {
@@ -129,6 +165,8 @@ impl SourceHandle {
                 .map_err(|error| CaptureError::InputFailed(error.to_string())),
             #[cfg(feature = "benchmark-input")]
             Self::Benchmark(_) => Ok(()),
+            #[cfg(test)]
+            Self::Test(_source) => Ok(()),
         }
     }
 
@@ -154,6 +192,7 @@ impl AudioCaptureService {
             shared: Arc::new(Shared {
                 operation_lock: Mutex::new(()),
                 state: Mutex::new(State::default()),
+                retired: Condvar::new(),
                 shutting_down: AtomicBool::new(false),
             }),
         }
@@ -216,6 +255,7 @@ impl AudioCaptureService {
         if self.shared.shutting_down.load(Ordering::Acquire) {
             return Err(CaptureError::ShuttingDown);
         }
+        let _starting = StartLease::begin(&self.shared)?;
         let previous = {
             let mut state = self
                 .shared
@@ -329,7 +369,9 @@ impl AudioCaptureService {
             state.cancelled_through = state.cancelled_through.max(capture_id);
             if state.current_id == Some(capture_id) {
                 state.current_id = None;
-                take_active_for_teardown(&mut state)
+                let active = take_active_for_teardown(&mut state);
+                self.shared.retired.notify_all();
+                active
             } else {
                 None
             }
@@ -348,10 +390,74 @@ impl AudioCaptureService {
         }
         let active = self.shared.state.lock().ok().and_then(|mut state| {
             state.current_id = None;
-            take_active_for_teardown(&mut state)
+            let active = take_active_for_teardown(&mut state);
+            self.shared.retired.notify_all();
+            active
         });
         if let Some(active) = active {
             let _ = stop_active(active, &self.shared);
+        }
+    }
+
+    /// Stop the physical owner's current source, independently of downstream
+    /// processing state. All IDs reserved before this operation are tombstoned;
+    /// a later reservation can restart after actual retirement. The caller must
+    /// close application-level start admission first when installing an update.
+    pub fn stop_current(&self) -> Result<bool, CaptureError> {
+        let _operation = self
+            .shared
+            .operation_lock
+            .lock()
+            .map_err(|_| CaptureError::StatePoisoned)?;
+        let (active, had_current) = {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .map_err(|_| CaptureError::StatePoisoned)?;
+            let through = state
+                .next_id
+                .max(state.latest_id)
+                .max(state.current_id.unwrap_or_default());
+            state.latest_id = through;
+            state.cancelled_through = state.cancelled_through.max(through);
+            let had_current = state.current_id.take().is_some();
+            let active = take_active_for_teardown(&mut state);
+            self.shared.retired.notify_all();
+            (active, had_current)
+        };
+        let had_active = active.is_some();
+        if let Some(active) = active {
+            stop_active(active, &self.shared)?;
+        }
+        let state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| CaptureError::StatePoisoned)?;
+        if !fully_retired(&state) {
+            return Err(CaptureError::StopTimedOut);
+        }
+        Ok(had_current || had_active)
+    }
+
+    /// Wait for physical stream drop and capture-worker exit, not merely a
+    /// cleared current ID. Admission must already be closed by the caller.
+    /// A start preparing an uninstalled backend is also still physical activity.
+    pub fn wait_for_retirement(&self, timeout: Duration) -> bool {
+        if self.shared.operation_lock.is_poisoned() {
+            return false;
+        }
+        let Ok(state) = self.shared.state.lock() else {
+            return false;
+        };
+        match self
+            .shared
+            .retired
+            .wait_timeout_while(state, timeout, |state| !fully_retired(state))
+        {
+            Ok((state, _)) => fully_retired(&state) && !self.shared.operation_lock.is_poisoned(),
+            Err(_) => false,
         }
     }
 }
@@ -601,6 +707,7 @@ fn finish_teardown(shared: &Shared) {
     if let Ok(mut state) = shared.state.lock() {
         state.teardown_count = state.teardown_count.saturating_sub(1);
     }
+    shared.retired.notify_all();
 }
 
 fn stop_uninstalled_active(
@@ -711,14 +818,15 @@ fn publish_terminal(
         }
         state.current_id = None;
         let active = take_active_for_teardown(&mut state);
+        shared.retired.notify_all();
         (true, active)
     });
     if let Some(active) = active {
         let ActiveCapture { stream, worker, .. } = active;
-        drop(worker);
         let teardown_shared = Arc::clone(&shared);
         thread::spawn(move || {
             drop(stream);
+            let _ = worker.join();
             finish_teardown(&teardown_shared);
         });
     }
@@ -782,6 +890,81 @@ impl Resampler {
 mod tests {
     use super::*;
     use std::sync::Barrier;
+
+    struct TestSourceDrop {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+        dropped: mpsc::Sender<()>,
+    }
+
+    impl Drop for TestSourceDrop {
+        fn drop(&mut self) {
+            let _ = self.entered.send(());
+            let _ = self.release.recv_timeout(Duration::from_secs(5));
+            let _ = self.dropped.send(());
+        }
+    }
+
+    struct SourceRetirementProbe {
+        entered: mpsc::Receiver<()>,
+        release: mpsc::Sender<()>,
+        dropped: mpsc::Receiver<()>,
+    }
+
+    fn test_source() -> (SourceHandle, SourceRetirementProbe) {
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let (dropped_tx, dropped) = mpsc::channel();
+        (
+            SourceHandle::Test(Box::new(TestSourceDrop {
+                entered: entered_tx,
+                release: release_rx,
+                dropped: dropped_tx,
+            })),
+            SourceRetirementProbe {
+                entered,
+                release,
+                dropped,
+            },
+        )
+    }
+
+    struct CaptureRetirementProbe {
+        source: SourceRetirementProbe,
+        worker_stopping: mpsc::Receiver<()>,
+        release_worker: mpsc::Sender<()>,
+    }
+
+    fn install_test_capture(service: &AudioCaptureService, id: u64) -> CaptureRetirementProbe {
+        let (stream, source) = test_source();
+        let (control, controls) = mpsc::channel();
+        let (stopping_tx, worker_stopping) = mpsc::channel();
+        let (release_worker, release_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            if matches!(
+                controls.recv_timeout(Duration::from_secs(5)),
+                Ok(WorkerControl::Stop)
+            ) {
+                let _ = stopping_tx.send(());
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            }
+        });
+        let mut state = service.shared.state.lock().unwrap();
+        assert!(fully_retired(&state));
+        state.latest_id = id;
+        state.next_id = id;
+        state.current_id = Some(id);
+        state.active = Some(ActiveCapture {
+            stream,
+            control,
+            worker,
+        });
+        CaptureRetirementProbe {
+            source,
+            worker_stopping,
+            release_worker,
+        }
+    }
 
     #[test]
     fn capture_status_tracks_the_authoritative_capture_not_reserved_ids() {
@@ -877,6 +1060,187 @@ mod tests {
             ensure_teardown_complete(&state),
             Err(CaptureError::StopTimedOut)
         );
+    }
+
+    #[test]
+    fn stop_current_does_not_report_idle_while_a_detached_teardown_is_pending() {
+        let service = AudioCaptureService::new();
+        service.shared.state.lock().unwrap().teardown_count = 1;
+        assert_eq!(service.stop_current(), Err(CaptureError::StopTimedOut));
+        assert!(!service.wait_for_retirement(Duration::ZERO));
+        finish_teardown(&service.shared);
+        assert!(service.wait_for_retirement(Duration::ZERO));
+    }
+
+    #[test]
+    fn stop_current_retires_physical_source_then_worker_and_allows_a_fresh_id() {
+        let service = Arc::new(AudioCaptureService::new());
+        let probe = install_test_capture(&service, 7);
+        let reserved_before_stop = service.reserve_id().unwrap();
+        let stopping = Arc::clone(&service);
+        let stop = thread::spawn(move || stopping.stop_current());
+        probe
+            .worker_stopping
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        probe
+            .source
+            .entered
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(stop.join().unwrap(), Err(CaptureError::StopTimedOut));
+        assert!(!service.is_capturing().unwrap());
+        assert_eq!(service.stop_current(), Err(CaptureError::StopTimedOut));
+        assert!(!service.wait_for_retirement(Duration::ZERO));
+        probe.source.release.send(()).unwrap();
+        probe
+            .source
+            .dropped
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            !service.wait_for_retirement(Duration::from_millis(10)),
+            "worker is still held after source drop"
+        );
+        assert_eq!(service.shared.state.lock().unwrap().teardown_count, 1);
+        let waiting = Arc::clone(&service);
+        let waiter = thread::spawn(move || waiting.wait_for_retirement(Duration::from_secs(5)));
+        probe.release_worker.send(()).unwrap();
+        assert!(waiter.join().unwrap());
+        assert!(service.wait_for_retirement(Duration::ZERO));
+        assert!(!service.stop_current().unwrap());
+        let next = service.reserve_id().unwrap();
+        assert!(next > reserved_before_stop);
+        let replacement = install_test_capture(&service, next);
+        assert!(
+            !service.stop(7).unwrap(),
+            "stale ID stop must not retire replacement"
+        );
+        assert_eq!(service.shared.state.lock().unwrap().current_id, Some(next));
+        replacement.source.release.send(()).unwrap();
+        replacement.release_worker.send(()).unwrap();
+        assert!(service.stop_current().unwrap());
+        assert!(service.wait_for_retirement(Duration::ZERO));
+    }
+
+    #[test]
+    fn terminal_retirement_includes_the_publishing_worker_callback() {
+        let service = Arc::new(AudioCaptureService::new());
+        let (stream, source) = test_source();
+        let (control, _controls) = mpsc::channel();
+        let (start_tx, start_rx) = mpsc::channel();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let shared = Arc::downgrade(&service.shared);
+        let worker = thread::spawn(move || {
+            start_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            publish_terminal(
+                shared,
+                9,
+                CaptureError::InvalidSample,
+                Box::new(move |_| {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                }),
+            );
+        });
+        {
+            let mut state = service.shared.state.lock().unwrap();
+            state.latest_id = 9;
+            state.current_id = Some(9);
+            state.active = Some(ActiveCapture {
+                stream,
+                control,
+                worker,
+            });
+        }
+        start_tx.send(()).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        source.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        source.release.send(()).unwrap();
+        source.dropped.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(service.stop_current(), Err(CaptureError::StopTimedOut));
+        assert!(
+            !service.wait_for_retirement(Duration::from_millis(10)),
+            "terminal publication is not worker exit"
+        );
+        release_tx.send(()).unwrap();
+        assert!(service.wait_for_retirement(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn stop_current_serializes_with_start_and_tombstones_reserved_installations() {
+        let service = Arc::new(AudioCaptureService::new());
+        let operation = service.shared.operation_lock.lock().unwrap();
+        let starting = StartLease::begin(&service.shared).unwrap();
+        let reserved = service.reserve_id().unwrap();
+        let stopping = Arc::clone(&service);
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || done_tx.send(stopping.stop_current()).unwrap());
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(10)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(!service.wait_for_retirement(Duration::ZERO));
+        drop(starting);
+        drop(operation);
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(5)), Ok(Ok(false)));
+        worker.join().unwrap();
+        let state = service.shared.state.lock().unwrap();
+        assert_eq!(state.cancelled_through, reserved);
+        assert_eq!(
+            ensure_install_authorized(&service.shared, &state, reserved),
+            Err(CaptureError::Superseded)
+        );
+        drop(state);
+        assert!(service.reserve_id().unwrap() > reserved);
+    }
+
+    #[cfg(feature = "benchmark-input")]
+    #[test]
+    fn stop_current_allows_restart_through_the_software_capture_backend() {
+        let service = AudioCaptureService::new_benchmark(16_000, 1).unwrap();
+        let first = service.reserve_id().unwrap();
+        service
+            .start(first, None, 16_000, 480, Box::new(|_| {}), Box::new(|_| {}))
+            .unwrap();
+        assert!(service.stop_current().unwrap());
+        assert!(service.wait_for_retirement(Duration::ZERO));
+        let second = service.reserve_id().unwrap();
+        assert!(second > first);
+        service
+            .start(
+                second,
+                None,
+                16_000,
+                480,
+                Box::new(|_| {}),
+                Box::new(|_| {}),
+            )
+            .unwrap();
+        assert!(!service.stop(first).unwrap());
+        assert!(service.is_capturing().unwrap());
+        service.shutdown();
+        assert!(service.wait_for_retirement(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn shutdown_waits_for_uninstalled_start_and_poison_fails_closed() {
+        let service = AudioCaptureService::new();
+        let starting = StartLease::begin(&service.shared).unwrap();
+        service.shutdown();
+        assert!(!service.wait_for_retirement(Duration::ZERO));
+        drop(starting);
+        assert!(service.wait_for_retirement(Duration::ZERO));
+        assert_eq!(service.reserve_id(), Err(CaptureError::ShuttingDown));
+
+        let poisoned = AudioCaptureService::new();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = poisoned.shared.state.lock().unwrap();
+            panic!("synthetic capture state poison");
+        }));
+        assert!(!poisoned.wait_for_retirement(Duration::ZERO));
+        assert_eq!(poisoned.stop_current(), Err(CaptureError::StatePoisoned));
     }
 
     #[test]
@@ -1117,6 +1481,7 @@ mod tests {
     fn terminal_cleanup_is_scoped_to_the_authoritative_capture() {
         let shared = Arc::new(Shared {
             operation_lock: Mutex::new(()),
+            retired: Condvar::new(),
             state: Mutex::new(State {
                 latest_id: 2,
                 current_id: Some(2),

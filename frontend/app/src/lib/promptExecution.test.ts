@@ -14,6 +14,10 @@ afterEach(() => {
 })
 
 describe('prompt payload parsing', () => {
+  it('rejects unbounded desktop observer text and request identity', () => {
+    expect(() => parsePromptExecutionEvent({ request_id: 'synthetic', kind: 'text', text: 'x'.repeat(256 * 1024 + 1) })).toThrow()
+    expect(() => parsePromptExecutionEvent({ request_id: 'x'.repeat(513), kind: 'status', message: 'Ready' })).toThrow()
+  })
   it('accepts a desktop canonical completion without losing distributed identity or observed sources', async () => {
     const id = '11111111-1111-4111-8111-111111111111:3'
     const turn = { request_id: 'synthetic-desktop-request', execution_id: { session_id: id, generation: id },

@@ -5,7 +5,7 @@ import type { AssistantCapabilities, AssistantOption, AssistantSettings } from '
 import type { AndroidAssistantProjection, ModelOption } from './lib/appSnapshot'
 import type { AndroidVoiceStatus } from './lib/androidVoice'
 import type { AudioInputDevice } from './lib/liveAudioSource'
-import type { ChatMessage, CueAssetPaths, RuntimeStatus, StartupState, UiTextSize, UiTheme, UserNotice } from './types/chat'
+import type { ChatMessage, RuntimeStatus, StartupState, UiTextSize, UiTheme, UserNotice } from './types/chat'
 import { getInitialMessages } from './state/appShell'
 import { applySnapshotModelOptions, capabilityMap, generationIneligibility } from './sessionPolicy'
 import { transitionRuntimeStatus } from './state/runtimeMachine'
@@ -17,6 +17,8 @@ import { SessionPreferencesController } from './controllers/SessionPreferencesCo
 import { SessionAudioController } from './controllers/SessionAudioController'
 
 export type PromptProjection = {
+  nativeOwned?: boolean
+  executionId?: import('./lib/appSnapshot').ExecutionId
   id: string
   userId: string
   assistantId: string
@@ -25,12 +27,9 @@ export type PromptProjection = {
   terminal: boolean
   presentationCancelled: boolean
   cancelPending: boolean
-  tts: boolean
-  corrected: boolean
   stages: AnswerStageStatusEntry[]
   priorVersions: AnswerPriorVersion[]
   sources: AnswerSource[]
-  ttsFirstLineSpoken: boolean
   renderFrameId: number | null
   renderFrameRevision: number
   customDirectTimings?: import('./types/chat').CustomDirectTimings
@@ -39,6 +38,7 @@ export type PromptProjection = {
 }
 
 export interface RuntimeProjection {
+  readonly desktopRuntimeReady: boolean
   readonly startupState: StartupState
   readonly runtimeStatus: RuntimeStatus
   readonly assistantSettings: Readonly<AssistantSettings>
@@ -54,7 +54,6 @@ export interface RuntimeProjection {
   readonly uiTheme: UiTheme
   readonly ttsEnabled: boolean
   readonly autoStopOnSilence: boolean
-  readonly preparedCueAssetPaths: CueAssetPaths | null
   readonly audioInputDeviceId: string | null
   readonly audioInputDevices: readonly AudioInputDevice[]
 }
@@ -102,10 +101,10 @@ export interface ModelsSnapshot {
 const VIEW_KEYS = {
   shell: ['uiTextSize', 'uiTheme', 'runtimeStatus'],
   conversation: ['voiceNotesOpen', 'shortcutStaging', 'composerValue', 'uiTextSize', 'notices'],
-  runtime: ['startupState', 'runtimeStatus', 'assistantSettings', 'assistantSettingsPending',
+  runtime: ['desktopRuntimeReady', 'startupState', 'runtimeStatus', 'assistantSettings', 'assistantSettingsPending',
     'assistantSettingsLoadError', 'assistantSettingsWriteError', 'uiThemeWriteError',
     'snapshotHydrationState', 'snapshotControlsFresh', 'snapshotControlsInvalidated', 'snapshotModelOptions',
-    'uiTextSize', 'uiTheme', 'ttsEnabled', 'autoStopOnSilence', 'preparedCueAssetPaths',
+    'uiTextSize', 'uiTheme', 'ttsEnabled', 'autoStopOnSilence',
     'audioInputDeviceId', 'audioInputDevices', 'shortcutStaging', 'androidAssistant',
     'androidConversationId', 'conversationPagePending', 'headPagePending', 'androidVoiceActive',
     'androidVoiceStatus', 'androidSpeechStatusError', 'ttsPlaying', 'pendingTtsCommands',
@@ -172,8 +171,8 @@ export class SessionAuthority {
         snapshotHydrationState: snapshotAvailable ? 'pending' : 'unavailable',
         snapshotControlsFresh: !snapshotAvailable, snapshotControlsInvalidated: false,
         snapshotModelOptions: null,
-        uiTextSize: 'medium', uiTheme: 'dark', ttsEnabled: false, autoStopOnSilence: true,
-        preparedCueAssetPaths: null, audioInputDeviceId, audioInputDevices: [],
+        desktopRuntimeReady: false, uiTextSize: 'medium', uiTheme: 'dark', ttsEnabled: false, autoStopOnSilence: true,
+        audioInputDeviceId, audioInputDevices: [],
       },
       conversationInteraction: {
         composerValue: '', shortcutStaging: false, androidAssistant: null, androidConversationId: '0',
@@ -210,6 +209,16 @@ export class SessionAuthority {
   captureLifetime(): () => boolean {
     const lifecycle = this.lifecycle
     return () => this.active && this.lifecycle === lifecycle
+  }
+
+  /** Attach presentation to work already admitted by the canonical native owner. */
+  attachNativePrompt() {
+    // Admission already happened under the native canonical fence. Stale renderer
+    // capability/startup projections must never reject or re-admit that work.
+    if (!this.active || this.read('resetPending') || this.prompt.active.current !== null || this.promptAdmission !== null) return null
+    const admission = { isCurrent: this.captureLifetime(), startup: this.read('startupState'), settings: this.read('assistantSettings'), executingStatus: 'executing' as const }
+    this.promptAdmission = admission
+    return admission
   }
 
   /** Admission reads the atomic accepted context, not a render's captured props. */

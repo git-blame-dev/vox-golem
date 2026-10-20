@@ -672,14 +672,22 @@ async fn perform_install_reserved(
         return Err(error);
     }
 
+    if let Err(error) = crate::desktop_voice_adapter::stop_for_update(app, app_state).await {
+        drop(installation_guard);
+        restore_install(pending, id, update, bytes, metadata, error.clone())?;
+        emit_current_snapshot(app, pending)?;
+        return Err(error);
+    }
+
     #[cfg(target_os = "windows")]
     let cleanup_result = {
         let cleanup_app = app.clone();
         tauri::async_runtime::spawn(async move {
-            crate::shutdown_runtime_for_update(&cleanup_app.state::<crate::AppState>()).await;
+            crate::shutdown_runtime_for_update(&cleanup_app.state::<crate::AppState>()).await
         })
         .await
         .map_err(|error| format!("update cleanup task failed: {error}"))
+        .and_then(|result| result)
     };
     #[cfg(not(target_os = "windows"))]
     let cleanup_result = Ok(());

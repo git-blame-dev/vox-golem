@@ -41,12 +41,23 @@ impl RollingAudioBuffer {
     }
 
     pub fn append_frame(&mut self, frame: &[f32]) -> usize {
-        self.samples.extend(frame.iter().copied());
+        let overflow = self
+            .samples
+            .len()
+            .saturating_add(frame.len())
+            .saturating_sub(self.max_samples);
 
-        let overflow = self.samples.len().saturating_sub(self.max_samples);
-
-        if overflow > 0 {
+        // Evict before extending so even oversized input cannot grow the ring
+        // beyond its sample budget. Clones may have lost spare capacity.
+        self.samples
+            .reserve_exact(self.max_samples - self.samples.len());
+        if frame.len() >= self.max_samples {
+            self.samples.clear();
+            self.samples
+                .extend(frame[frame.len() - self.max_samples..].iter().copied());
+        } else {
             self.samples.drain(0..overflow);
+            self.samples.extend(frame.iter().copied());
         }
 
         overflow
@@ -62,6 +73,10 @@ impl RollingAudioBuffer {
 
     pub fn as_vec(&self) -> Vec<f32> {
         self.samples.iter().copied().collect()
+    }
+
+    pub fn clear(&mut self) {
+        self.samples.clear();
     }
 }
 
@@ -147,6 +162,41 @@ mod tests {
         assert_eq!(buffer.append_frame(&[0.4, 0.5]), 1);
         assert_eq!(buffer.as_vec(), vec![0.2, 0.3, 0.4, 0.5]);
         assert_eq!(buffer.len(), 4);
+    }
+
+    #[test]
+    fn rolling_append_evicts_before_growth_and_handles_oversized_frames() {
+        let mut buffer = RollingAudioBuffer::new(4).unwrap();
+        let capacity = buffer.samples.capacity();
+        buffer.append_frame(&[0.0; 4]);
+        assert_eq!(buffer.append_frame(&[1.0, 2.0]), 2);
+        assert_eq!(buffer.as_vec(), vec![0.0, 0.0, 1.0, 2.0]);
+        assert_eq!(buffer.samples.capacity(), capacity);
+        assert_eq!(buffer.append_frame(&[3.0, 4.0, 5.0, 6.0, 7.0, 8.0]), 6);
+        assert_eq!(buffer.as_vec(), vec![5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(buffer.samples.capacity(), capacity);
+        assert_eq!(buffer.append_frame(&[]), 0);
+        assert_eq!(buffer.append_frame(&[9.0; 4]), 4);
+        assert_eq!(buffer.as_vec(), vec![9.0; 4]);
+        assert_eq!(buffer.samples.capacity(), capacity);
+    }
+
+    #[test]
+    fn rolling_frames_match_suffix_reference_without_reallocation() {
+        for max_samples in [1, 3, 7] {
+            let mut buffer = RollingAudioBuffer::new(max_samples).unwrap();
+            let capacity = buffer.samples.capacity();
+            let mut reference = Vec::new();
+            for frame_len in [0, 1, 2, 1, 4, 0, 3, 9, 1, 2] {
+                let frame: Vec<_> = (0..frame_len).map(|index| index as f32).collect();
+                reference.extend_from_slice(&frame);
+                let overflow = reference.len().saturating_sub(max_samples);
+                reference.drain(..overflow);
+                assert_eq!(buffer.append_frame(&frame), overflow);
+                assert_eq!(buffer.as_vec(), reference);
+                assert_eq!(buffer.samples.capacity(), capacity);
+            }
+        }
     }
 
     #[test]

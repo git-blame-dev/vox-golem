@@ -35,7 +35,6 @@ async function mount(initial: Availability = 'available', session = new Frontend
   let snapshotResponse: (() => Promise<unknown>) | null = null
   let startupResponse: (() => Promise<unknown>) | null = null
   const unexpected: string[] = []
-  const audioTransitions: boolean[] = []
   const snapshot = (state = availability) => appSnapshot(transcript, {}, {
     session_id: sessionId, runtime_phase: state === 'warming' ? 'initializing' : 'sleeping',
     capabilities: completeCapabilities({ local_fast: state }),
@@ -48,11 +47,6 @@ async function mount(initial: Availability = 'available', session = new Frontend
     capabilities: completeCapabilities({ local_fast: state }),
   })
   const invoke = vi.fn(async (command: string, args?: unknown): Promise<unknown> => {
-    if (command === 'set_native_audio_active') {
-      expect(args).toEqual({ active: expect.any(Boolean) })
-      audioTransitions.push((args as { active: boolean }).active)
-      return null
-    }
     if (command === 'get_app_snapshot') return snapshotResponse === null ? snapshot() : snapshotResponse()
     if (command === 'get_startup_state') return startupResponse === null ? startup() : startupResponse()
     if (command === 'submit_prompt') {
@@ -71,7 +65,7 @@ async function mount(initial: Availability = 'available', session = new Frontend
   container = document.createElement('div'); document.body.append(container); root = createRoot(container)
   await act(async () => { root!.render(<App session={session} />) })
   return {
-    session, invoke, snapshot, startup, unexpected, audioTransitions,
+    session, invoke, snapshot, startup, unexpected,
     setAvailability: (next: Availability) => { availability = next },
     setSnapshotResponse: (response: (() => Promise<unknown>) | null) => { snapshotResponse = response },
     setStartupResponse: (response: (() => Promise<unknown>) | null) => { startupResponse = response },
@@ -90,17 +84,17 @@ const sendButton = () => container!.querySelector<HTMLButtonElement>('button[typ
 const poll = async (milliseconds = 1_000) => { await act(async () => { await vi.advanceTimersByTimeAsync(milliseconds) }) }
 
 describe('desktop change-triggered canonical model controls', () => {
-  it('owns native audio only while mounted and foreground, without admitting cues for typed-only controls', async () => {
+  it('does not suppress autonomous native audio on hide or renderer detach, and admits no typed-control cues', async () => {
     const state = await mount()
-    expect(state.audioTransitions).toEqual([true])
+    expect(state.invoke.mock.calls.filter(([command]) => command === 'set_native_audio_active')).toEqual([])
     try {
       Object.defineProperty(document, 'hidden', { configurable: true, value: true })
       await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
       Object.defineProperty(document, 'hidden', { configurable: true, value: false })
       await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
-      expect(state.audioTransitions).toEqual([true, false, true])
+      expect(state.invoke.mock.calls.filter(([command]) => command === 'set_native_audio_active')).toEqual([])
       await act(async () => { root!.unmount(); root = null })
-      expect(state.audioTransitions).toEqual([true, false, true, false])
+      expect(state.invoke.mock.calls.filter(([command]) => command === 'set_native_audio_active')).toEqual([])
       expect(state.invoke.mock.calls.filter(([command]) => command === 'reserve_cue_playback_id' || command === 'activate_voice_cue')).toEqual([])
       expect(state.unexpected).toEqual([])
     } finally {

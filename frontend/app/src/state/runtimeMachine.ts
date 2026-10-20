@@ -1,4 +1,3 @@
-import type { CueType } from '../lib/audioCues'
 import type { RuntimeStatus } from '../types/chat'
 
 export type RuntimeEvent =
@@ -28,15 +27,4 @@ export function transitionRuntimeStatus(
     default:
       return current
   }
-}
-
-export function cueForTransition(
-  previous: RuntimeStatus,
-  next: RuntimeStatus,
-): CueType | null {
-  if (previous === 'sleeping' && next === 'listening') {
-    return 'start_listening'
-  }
-
-  return null
 }

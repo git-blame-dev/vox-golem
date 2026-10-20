@@ -2,7 +2,7 @@ use std::env;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -73,11 +73,70 @@ type AbandonedSynthesis = (
 static PENDING_INITIALIZATIONS: OnceLock<Mutex<Vec<thread::JoinHandle<()>>>> = OnceLock::new();
 static ABANDONED_SYNTHESIS: OnceLock<Mutex<Vec<thread::JoinHandle<()>>>> = OnceLock::new();
 static SYNTHESIS_PERMIT_OCCUPIED: AtomicBool = AtomicBool::new(false);
+static PHYSICAL_WORK: Mutex<usize> = Mutex::new(0);
+static PHYSICAL_WORK_RETIRED: Condvar = Condvar::new();
+
+/// Snapshot of queued/admitted synthesis, constructor/engine initialization, and
+/// actual native synthesis (including cancelled calls whose callers already returned).
+/// Idle engine-owning workers and finished retained thread handles are not busy work.
+/// This does not close admission: callers must hold their lifecycle/update gate to
+/// prevent new constructors or synthesis requests racing an installation idle check.
+pub(crate) fn physical_work_pending() -> bool {
+    match PHYSICAL_WORK.lock() {
+        Ok(work) => *work != 0 || SYNTHESIS_PERMIT_OCCUPIED.load(Ordering::Acquire),
+        Err(_) => true,
+    }
+}
+
+/// Wait without polling or cancelling native work. True observes physical quiescence
+/// under the notifier mutex; it is not a promise that later admission cannot occur.
+/// Close admission first for shutdown/update. Timeout or poisoned tracking fails closed.
+pub(crate) fn wait_for_physical_retirement(timeout: Duration) -> bool {
+    let Ok(work) = PHYSICAL_WORK.lock() else {
+        return false;
+    };
+    match PHYSICAL_WORK_RETIRED.wait_timeout_while(work, timeout, |work| {
+        *work != 0 || SYNTHESIS_PERMIT_OCCUPIED.load(Ordering::Acquire)
+    }) {
+        Ok((work, _)) => *work == 0 && !SYNTHESIS_PERMIT_OCCUPIED.load(Ordering::Acquire),
+        Err(_) => false,
+    }
+}
+
+/// Reserved before publishing work to another thread, so startup and queue handoffs
+/// cannot temporarily appear idle. The native permit takes over cancelled synthesis.
+#[derive(Debug)]
+struct PhysicalWork;
+
+impl PhysicalWork {
+    fn begin() -> Self {
+        let mut work = PHYSICAL_WORK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *work = work
+            .checked_add(1)
+            .expect("tts physical work count exhausted");
+        Self
+    }
+}
+
+impl Drop for PhysicalWork {
+    fn drop(&mut self) {
+        let mut work = PHYSICAL_WORK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *work -= 1;
+        PHYSICAL_WORK_RETIRED.notify_all();
+    }
+}
 
 struct SynthesisPermit;
 
 impl SynthesisPermit {
     fn acquire() -> Option<Self> {
+        let _work = PHYSICAL_WORK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         SYNTHESIS_PERMIT_OCCUPIED
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()
@@ -87,7 +146,11 @@ impl SynthesisPermit {
 
 impl Drop for SynthesisPermit {
     fn drop(&mut self) {
+        let _work = PHYSICAL_WORK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         SYNTHESIS_PERMIT_OCCUPIED.store(false, Ordering::Release);
+        PHYSICAL_WORK_RETIRED.notify_all();
     }
 }
 
@@ -193,6 +256,7 @@ struct SynthesisJob {
     response: mpsc::Sender<Result<LocalTtsAudio, String>>,
     cancelled: Arc<AtomicBool>,
     generation: u64,
+    _physical_work: PhysicalWork,
 }
 
 const SYNTHESIS_CANCELLED: &str = "local tts synthesis request was cancelled or superseded";
@@ -207,6 +271,7 @@ impl LocalTtsRuntime {
         spec: LocalTtsRuntimeSpec,
         engine_factory: SynthesisEngineFactory,
     ) -> Result<Self, String> {
+        let _construction_work = PhysicalWork::begin();
         if reap_pending_initializations() {
             return Err(String::from(
                 "local tts initialization is still pending from a previous attempt",
@@ -261,7 +326,9 @@ impl LocalTtsRuntime {
             let worker_generation = Arc::clone(&generation);
             let worker_init_tx = init_tx.clone();
             let worker_shutdown = Arc::clone(&shutdown);
+            let initialization_work = PhysicalWork::begin();
             workers.push(thread::spawn(move || {
+                let mut initialization_work = Some(initialization_work);
                 match worker_engine_factory(
                     worker_model_path.clone(),
                     sample_rate_hz,
@@ -285,6 +352,10 @@ impl LocalTtsRuntime {
                                 }
                                 return;
                             }
+                            // An initializer that outlived its constructor remains
+                            // tracked through shutdown cleanup, not just factory return.
+                            // Ordinary idle, engine-owning workers do not count as work.
+                            drop(initialization_work.take());
                             let next_job = {
                                 let guard = match worker_receiver.lock() {
                                     Ok(guard) => guard,
@@ -542,6 +613,7 @@ impl LocalTtsRuntime {
                 response: response_tx,
                 cancelled: Arc::clone(&cancelled),
                 generation,
+                _physical_work: PhysicalWork::begin(),
             })
             .map_err(|error| match error {
                 mpsc::TrySendError::Full(_) => String::from("local tts synthesis queue is full"),
@@ -1079,6 +1151,11 @@ fn synthesize_fake_audio(text: &str, sample_rate_hz: u32) -> Result<LocalTtsAudi
 }
 
 #[cfg(test)]
+pub(super) fn test_runtime_guard() -> impl Drop {
+    tests::test_runtime_guard()
+}
+
+#[cfg(test)]
 mod tests {
     use super::{LocalTtsRuntime, LocalTtsRuntimeSpec};
     use std::fs;
@@ -1091,27 +1168,22 @@ mod tests {
 
     static TTS_RUNTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    struct TestRuntimeGuard(std::sync::MutexGuard<'static, ()>);
+    pub(super) struct TestRuntimeGuard(std::sync::MutexGuard<'static, ()>);
 
     impl Drop for TestRuntimeGuard {
         fn drop(&mut self) {
-            let deadline = Instant::now() + TEST_WAIT_BOUND;
-            while super::SYNTHESIS_PERMIT_OCCUPIED.load(std::sync::atomic::Ordering::Acquire)
-                && Instant::now() < deadline
-            {
-                thread::sleep(Duration::from_millis(1));
-            }
+            let retired = super::wait_for_physical_retirement(TEST_WAIT_BOUND);
             let _ = super::reap_abandoned_synthesis();
             if !thread::panicking() {
                 assert!(
-                    !super::SYNTHESIS_PERMIT_OCCUPIED.load(std::sync::atomic::Ordering::Acquire),
-                    "test synthesis did not retire within the cleanup bound"
+                    retired,
+                    "test physical work did not retire within the cleanup bound"
                 );
             }
         }
     }
 
-    fn test_runtime_guard() -> TestRuntimeGuard {
+    pub(super) fn test_runtime_guard() -> TestRuntimeGuard {
         TestRuntimeGuard(
             TTS_RUNTIME_TEST_LOCK
                 .lock()
@@ -1599,13 +1671,22 @@ mod tests {
             .expect_err("cancelled synthesis must fail");
         assert_eq!(first_error, super::SYNTHESIS_CANCELLED);
 
+        assert!(super::physical_work_pending());
+        assert!(!super::wait_for_physical_retirement(Duration::from_millis(
+            20
+        )));
+
         let replacement_generation = runtime.start_generation();
         let error = runtime
             .synthesize_for_generation("replacement", replacement_generation)
             .expect_err("a second blocked cancellation must exhaust the worker budget");
         assert!(error.contains("abandoned synthesis budget exhausted"));
 
+        let retirement = spawn_test_worker(|| super::wait_for_physical_retirement(TEST_WAIT_BOUND));
         release_on_drop.release();
+        assert!(retirement.recv_timeout(TEST_WAIT_BOUND).unwrap());
+        assert!(super::wait_for_physical_retirement(TEST_WAIT_BOUND));
+        assert!(!super::physical_work_pending());
     }
 
     #[test]
@@ -1769,6 +1850,101 @@ mod tests {
     }
 
     #[test]
+    fn physical_work_tracks_replacement_engine_factory() {
+        struct FailingEngine;
+        impl super::SynthesisEngine for FailingEngine {
+            fn synthesize(&mut self, _: &str) -> Result<super::LocalTtsAudio, String> {
+                Err("synthetic synthesis failure".into())
+            }
+        }
+
+        let _test_runtime_guard = test_runtime_guard();
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let model_path = temp_dir.path().join("synthetic-voice.onnx");
+        fs::write(&model_path, b"fixture").expect("model fixture should be written");
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_on_drop = ReleaseOnDrop(Arc::clone(&release));
+        let (started_tx, started_rx) = mpsc::channel();
+        let calls = AtomicUsize::new(0);
+        let runtime = Arc::new(
+            LocalTtsRuntime::new_with_engine_factory(
+                LocalTtsRuntimeSpec {
+                    model_path: Some(model_path),
+                    worker_count: 1,
+                    max_queue: 1,
+                    sample_rate_hz: 22_050,
+                    max_duration_s: 300,
+                    provider_policy: super::TtsProviderPolicy::Cpu,
+                },
+                Arc::new(move |_, sample_rate_hz, _| {
+                    if calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 0 {
+                        return Ok((Box::new(FailingEngine), super::TtsActualProvider::Cpu));
+                    }
+                    let _ = started_tx.send(());
+                    wait_for_release(&release)?;
+                    Ok((
+                        Box::new(FakeSynthesisEngine { sample_rate_hz }),
+                        super::TtsActualProvider::Cpu,
+                    ))
+                }),
+            )
+            .unwrap(),
+        );
+        assert!(runtime.synthesize("first").is_err());
+        let synthesizing_runtime = Arc::clone(&runtime);
+        let result = spawn_test_worker(move || synthesizing_runtime.synthesize("replacement"));
+        started_rx.recv_timeout(TEST_WAIT_BOUND).unwrap();
+        assert!(!super::SYNTHESIS_PERMIT_OCCUPIED.load(std::sync::atomic::Ordering::Acquire));
+        assert!(super::physical_work_pending());
+        assert!(!super::wait_for_physical_retirement(Duration::ZERO));
+        release_on_drop.release();
+        result.recv_timeout(TEST_WAIT_BOUND).unwrap().unwrap();
+        assert!(super::wait_for_physical_retirement(TEST_WAIT_BOUND));
+    }
+
+    #[test]
+    fn physical_work_tracks_initialization_before_constructor_returns() {
+        let _test_runtime_guard = test_runtime_guard();
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let model_path = temp_dir.path().join("synthetic-voice.onnx");
+        fs::write(&model_path, b"fixture").expect("model fixture should be written");
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_on_drop = ReleaseOnDrop(Arc::clone(&release));
+        let (started_tx, started_rx) = mpsc::channel();
+        let result = spawn_test_worker(move || {
+            LocalTtsRuntime::new_with_engine_factory(
+                LocalTtsRuntimeSpec {
+                    model_path: Some(model_path),
+                    worker_count: 1,
+                    max_queue: 1,
+                    sample_rate_hz: 22_050,
+                    max_duration_s: 300,
+                    provider_policy: super::TtsProviderPolicy::Cpu,
+                },
+                Arc::new(move |_, sample_rate_hz, _| {
+                    let _ = started_tx.send(());
+                    wait_for_release(&release)?;
+                    Ok((
+                        Box::new(FakeSynthesisEngine { sample_rate_hz }),
+                        super::TtsActualProvider::Cpu,
+                    ))
+                }),
+            )
+        });
+        started_rx.recv_timeout(TEST_WAIT_BOUND).unwrap();
+        assert!(super::physical_work_pending());
+        assert!(!super::wait_for_physical_retirement(Duration::ZERO));
+        release_on_drop.release();
+        let runtime = result.recv_timeout(TEST_WAIT_BOUND).unwrap().unwrap();
+        assert!(super::wait_for_physical_retirement(TEST_WAIT_BOUND));
+        assert!(
+            !super::physical_work_pending(),
+            "idle workers are not physical work"
+        );
+        drop(runtime);
+    }
+
+    #[test]
     fn timed_out_initialization_is_owned_and_reaped_before_retry() {
         let _test_runtime_guard = test_runtime_guard();
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
@@ -1805,7 +1981,12 @@ mod tests {
         assert!(second.contains("still pending"));
         assert_eq!(calls.load(std::sync::atomic::Ordering::Acquire), 1);
 
+        assert!(super::physical_work_pending());
+        assert!(!super::wait_for_physical_retirement(Duration::from_millis(
+            20
+        )));
         release_on_drop.release();
+        assert!(super::wait_for_physical_retirement(TEST_WAIT_BOUND));
         let deadline = Instant::now() + TEST_WAIT_BOUND;
         let third = loop {
             match LocalTtsRuntime::new_with_engine_factory(spec(), Arc::clone(&factory)) {

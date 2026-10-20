@@ -1,6 +1,7 @@
 //! Explicitly compiled, isolated software-input benchmark. Never a shipping IPC surface.
 use super::*;
 use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::AtomicU64;
 use std::sync::{LazyLock, OnceLock};
 const CAPABILITY: &str = "voxgolem:app-bench:synthetic-input-only:v1";
 #[cfg(not(test))]
@@ -29,6 +30,109 @@ struct Trace {
     max_emit_call_us: u64,
     burst_emissions: u64,
     commands: BTreeMap<&'static str, CommandStats>,
+    native_baseline: NativeAudioCounts,
+}
+
+#[derive(Clone, Copy, Default, Serialize)]
+struct NativeAudioCounts {
+    admitted_frames: u64,
+    admitted_samples: u64,
+    processed_frames: u64,
+    overflows: u64,
+    stalls: u64,
+    capture_failures: u64,
+    processing_failures: u64,
+}
+
+#[derive(Default)]
+struct NativeAudioCounters {
+    admitted_frames: AtomicU64,
+    admitted_samples: AtomicU64,
+    processed_frames: AtomicU64,
+    overflows: AtomicU64,
+    stalls: AtomicU64,
+    capture_failures: AtomicU64,
+    processing_failures: AtomicU64,
+}
+
+impl NativeAudioCounters {
+    fn snapshot(&self) -> NativeAudioCounts {
+        NativeAudioCounts {
+            admitted_frames: self.admitted_frames.load(Ordering::Relaxed),
+            admitted_samples: self.admitted_samples.load(Ordering::Relaxed),
+            processed_frames: self.processed_frames.load(Ordering::Relaxed),
+            overflows: self.overflows.load(Ordering::Relaxed),
+            stalls: self.stalls.load(Ordering::Relaxed),
+            capture_failures: self.capture_failures.load(Ordering::Relaxed),
+            processing_failures: self.processing_failures.load(Ordering::Relaxed),
+        }
+    }
+}
+
+static NATIVE_AUDIO: NativeAudioCounters = NativeAudioCounters {
+    admitted_frames: AtomicU64::new(0),
+    admitted_samples: AtomicU64::new(0),
+    processed_frames: AtomicU64::new(0),
+    overflows: AtomicU64::new(0),
+    stalls: AtomicU64::new(0),
+    capture_failures: AtomicU64::new(0),
+    processing_failures: AtomicU64::new(0),
+};
+
+/// Benchmark-only callback instrumentation: no trace mutex, allocation or events
+/// on frame admission. Process-lifetime totals are differenced at flow reset.
+pub(crate) fn native_frame_admitted(sample_count: usize) {
+    NATIVE_AUDIO.admitted_frames.fetch_add(1, Ordering::Relaxed);
+    NATIVE_AUDIO
+        .admitted_samples
+        .fetch_add(sample_count as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn native_frame_processed() {
+    NATIVE_AUDIO
+        .processed_frames
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+/// Fixed categorical outcomes only. Unknown categories fail qualification too.
+pub(crate) fn native_voice_failure(category: &'static str) {
+    let counter = match category {
+        "overflow" => &NATIVE_AUDIO.overflows,
+        "stall" => &NATIVE_AUDIO.stalls,
+        "capture" => &NATIVE_AUDIO.capture_failures,
+        _ => &NATIVE_AUDIO.processing_failures,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+fn native_audio_metadata(trace: &Trace, totals: NativeAudioCounts) -> serde_json::Value {
+    let baseline = trace.native_baseline;
+    serde_json::json!({
+        "schema": 1,
+        "admitted_frames": totals.admitted_frames.saturating_sub(baseline.admitted_frames),
+        "admitted_samples": totals.admitted_samples.saturating_sub(baseline.admitted_samples),
+        "processed_frames": totals.processed_frames.saturating_sub(baseline.processed_frames),
+        "pcm_events_emitted": trace.frame_emissions,
+        "overflows": totals.overflows.saturating_sub(baseline.overflows),
+        "stalls": totals.stalls.saturating_sub(baseline.stalls),
+        "capture_failures": totals.capture_failures.saturating_sub(baseline.capture_failures),
+        "processing_failures": totals.processing_failures.saturating_sub(baseline.processing_failures),
+    })
+}
+
+fn command_metadata(trace: &Trace) -> BTreeMap<&'static str, CommandStats> {
+    let mut commands = trace.commands.clone();
+    // Explicit zero receipts are required by qualification; missing metadata is
+    // never interpreted as proof that a forbidden production handler was absent.
+    for name in [
+        "ingest_audio_frame",
+        "mark_silence",
+        "record_speech_activity",
+        "save_wake_clip",
+    ] {
+        commands.entry(name).or_default();
+    }
+    commands
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -56,6 +160,7 @@ pub(crate) fn command(name: &str) -> CommandObservation {
         "save_wake_clip" => "save_wake_clip",
         "get_startup_state" => "get_startup_state",
         "get_app_snapshot" => "get_app_snapshot",
+        "read_desktop_runtime" => "read_desktop_runtime",
         "get_assistant_settings" => "get_assistant_settings",
         "get_ui_theme" => "get_ui_theme",
         "get_ui_text_size" => "get_ui_text_size",
@@ -99,6 +204,7 @@ fn reset_flow(trace: &mut Trace) -> u64 {
     let flow = trace.flow.saturating_add(1);
     *trace = Trace {
         flow,
+        native_baseline: NATIVE_AUDIO.snapshot(),
         ..Trace::default()
     };
     flow
@@ -251,6 +357,9 @@ pub(crate) fn mark_once(stage: &'static str) {
     }
 }
 
+// Keep the outbound-route guard available even though native voice has no PCM
+// emitter. Any reintroduced benchmark-instrumented emission must increment it.
+#[allow(dead_code)]
 pub(crate) fn emitted_frame(at: Instant, call_duration: Duration) {
     if let Ok(mut trace) = TRACE.lock() {
         if let Some(previous) = trace.last_emission {
@@ -494,7 +603,16 @@ pub(crate) fn benchmark_snapshot(
 
 fn snapshot(app_state: &AppState) -> Result<serde_json::Value, String> {
     // Never hold diagnostic state while acquiring a production lifecycle lock.
-    let (flow, events, dropped, readable_pages, tool_failures, frame_metadata, commands) = {
+    let (
+        flow,
+        events,
+        dropped,
+        readable_pages,
+        tool_failures,
+        frame_metadata,
+        commands,
+        native_audio,
+    ) = {
         let trace = TRACE
             .lock()
             .map_err(|_| "Benchmark observations unavailable")?;
@@ -507,7 +625,8 @@ fn snapshot(app_state: &AppState) -> Result<serde_json::Value, String> {
             serde_json::json!({"emitted_frames":trace.frame_emissions,
                 "max_emission_gap_us":trace.max_emission_gap_us,"max_emit_call_us":trace.max_emit_call_us,
                 "burst_emissions_under_5ms":trace.burst_emissions}),
-            trace.commands.clone(),
+            command_metadata(&trace),
+            native_audio_metadata(&trace, NATIVE_AUDIO.snapshot()),
         )
     };
     Ok(serde_json::json!({
@@ -524,6 +643,7 @@ fn snapshot(app_state: &AppState) -> Result<serde_json::Value, String> {
         "readable_pages": readable_pages,
         "tool_failures": tool_failures,
         "native_frame_metadata": frame_metadata,
+        "native_audio": native_audio,
         "handler_call_metadata": commands,
         "generation": voxgolem_platform::app_benchmark::get_counts(),
     }))
@@ -532,6 +652,64 @@ fn snapshot(app_state: &AppState) -> Result<serde_json::Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_audio_metadata_separates_audio_failures_from_trace_loss() {
+        let trace = Trace {
+            dropped: 7,
+            frame_emissions: 2,
+            native_baseline: NativeAudioCounts {
+                admitted_frames: 100,
+                admitted_samples: 48_000,
+                processed_frames: 99,
+                overflows: 1,
+                stalls: 2,
+                capture_failures: 3,
+                processing_failures: 4,
+            },
+            ..Trace::default()
+        };
+        let metadata = native_audio_metadata(
+            &trace,
+            NativeAudioCounts {
+                admitted_frames: 180,
+                admitted_samples: 86_400,
+                processed_frames: 178,
+                overflows: 2,
+                stalls: 4,
+                capture_failures: 6,
+                processing_failures: 8,
+            },
+        );
+        assert_eq!(
+            metadata,
+            serde_json::json!({
+                "schema": 1, "admitted_frames": 80, "admitted_samples": 38_400,
+                "processed_frames": 79, "pcm_events_emitted": 2,
+                "overflows": 1, "stalls": 2, "capture_failures": 3, "processing_failures": 4,
+            })
+        );
+        assert_eq!(trace.dropped, 7);
+    }
+
+    #[test]
+    fn zero_handler_metadata_is_explicit_and_retains_observed_calls() {
+        let mut trace = Trace::default();
+        trace.commands.insert(
+            "ingest_audio_frame",
+            CommandStats {
+                calls: 1,
+                total_us: 4,
+                max_us: 4,
+            },
+        );
+        let commands = command_metadata(&trace);
+        assert_eq!(commands["ingest_audio_frame"].calls, 1);
+        for name in ["mark_silence", "record_speech_activity", "save_wake_clip"] {
+            assert_eq!(commands[name].calls, 0);
+        }
+        assert_eq!(trace.commands.len(), 1);
+    }
 
     #[test]
     fn entry_is_explicit_and_automatic_capture_is_voice_only() {
@@ -593,5 +771,18 @@ mod tests {
             (0, 0, 0)
         );
         assert_eq!(reset_flow(&mut trace), 9);
+        let metadata = native_audio_metadata(&trace, trace.native_baseline);
+        for name in [
+            "admitted_frames",
+            "admitted_samples",
+            "processed_frames",
+            "pcm_events_emitted",
+            "overflows",
+            "stalls",
+            "capture_failures",
+            "processing_failures",
+        ] {
+            assert_eq!(metadata[name], 0, "flow reset must retire {name}");
+        }
     }
 }

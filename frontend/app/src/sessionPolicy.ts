@@ -175,7 +175,7 @@ export function usePresentation(
     assistantControlsDisabled, instantControlsDisabled,
     canSend: generationIneligibility(state, selectedInstantOption?.available === true, updateRuntimeBlocked) === null &&
       !androidVoiceActive && promptState === 'idle' && runtimeStatus === 'sleeping' && state.composerValue.trim().length > 0,
-    canToggleMic: !updateRuntimeBlocked && (micActive || (voiceControlsUsable && voiceInputReady(startupState) && !micStarting && !resetPending)),
+    canToggleMic: !updateRuntimeBlocked && !resetPending && (micActive || (voiceControlsUsable && voiceInputReady(startupState) && !micStarting)),
     canToggleTts: startupState.kind === 'ready' && capabilityIsAvailable(startupState, 'tts') && !isSwitchingResponseProfile && !updateRuntimeBlocked,
     voiceInputUnavailableReason: startupState.kind === 'ready' ? startupState.voiceInputError ?? (startupState.capabilities.filter((capability) =>
       ['wake_word', 'vad', 'parakeet'].includes(capability.id) && capability.state !== 'available').map((capability) => capability.reason ?? `${capabilityLabel(capability.id)} unavailable`).join('; ') || 'required voice capabilities are unavailable') : 'voice input is still starting',

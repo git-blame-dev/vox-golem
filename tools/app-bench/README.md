@@ -22,19 +22,23 @@ No readiness is forced, no native history is injected and no direct submit IPC i
 used. Synthetic questions go through the actual composer and its normal browser
 form admission.
 
-Each report distinguishes `workflow_completed`, individual `checks`,
+Typed reports distinguish `workflow_completed`, individual `checks`,
 `all_checks_passed` and `qualification_eligible`. Canonical answer/source integrity,
 model/effort, context, safe admission/cancellation and resource retirement remain
-required. A failed displayed-source-list check remains visible without hiding the
-completed provider/canonical workflow. Active source accumulation is now fixed;
-canonical source metadata/cold hydration is still separate, unimplemented scope.
-Desktop history lost
-across process relaunch is likewise reported, not repaired by a second store.
-Preferences and absence of regeneration on relaunch are independently checked.
+required. The typed qualification profile's displayed-source and history-relaunch
+deferrals are explicit flags, not claims about the current implementation. Inspect
+the report's individual results; preferences and absence of regeneration on
+relaunch are independently checked.
 
-The voice path currently encounters renderer/frame-backlog failures after real
-wake/VAD/ASR. It is deliberately deferred, not certified by typed measurements.
-There is no transcript injection, wake bypass or threshold retuning.
+Voice qualification additionally requires measured native frame admission and
+processing, explicit zero outbound PCM events, zero legacy frame/silence/activity/
+clip IPC calls, and zero native overflow/stall/capture/processing failures. The
+capture callback feeds the native voice owner; the renderer observes bounded
+`desktop-runtime-changed` invalidations through `read_desktop_runtime`, not PCM
+callbacks. No frontend audio-callback hook is needed. Typed measurements do not
+certify voice. There is no transcript injection, wake bypass or threshold retuning.
+These are acceptance requirements, not a claim that an optimized runtime run has
+passed on the current source.
 
 ## Prerequisites
 
@@ -96,6 +100,42 @@ measure DOM submission, not painted pixels. `--extended` adds real UI-seeded war
 and longer canonical histories, duplicate/empty submission, Stop/cancellation,
 retirement and relaunch checks. It is prohibited for live execution.
 
+## Offline native-observer hold diagnostic
+
+Add `--entry voice --cases quick --hold-native-observer --wake-phrase "$SYNTHETIC_WAKE_PHRASE"`
+to the ordinary offline invocation (with the same binary/tools/config/output arguments).
+This lane is deliberately **diagnostic-only**: `passed` stays false, live
+qualification stays false, and the controller exits **1 even on diagnostic success**.
+It rejects live, typed, multiple/non-quick cases and combinations with other probes.
+
+After initial capture readiness and the initial application snapshot, the runner
+temporarily wraps `window.__TAURI_INTERNALS__.invoke`. Only the first
+`read_desktop_runtime` invocation is withheld **before** calling native code, so
+it cannot acknowledge a runtime read. At most one deferred closure is retained;
+a second attempted read rejects and fails the diagnostic. Other commands retain
+their original receiver and arguments, including `benchmark_queue` and
+`get_app_snapshot`. The synthetic clip still traverses real capture, wake/VAD,
+Parakeet and normal native prompt admission; no transcript/prompt is injected.
+
+After the queue completion receipt, independent canonical snapshots and fake-service
+terminal/count metadata are polled for at most ten seconds, also bounded by the
+normal flow deadline. `native_observer_hold` records booleans/counts only: an
+actual held read, canonical completion with no projected user/pending row, exact
+generation count, restored invocation, matching canonical/UI reconciliation once,
+normal native flow/audio ownership and a bounded half-second no-extra-admission
+observation. The original invocation is restored and the held read executed through
+it; the frontend uses its real snapshot/delta protocol to catch up. A `finally`
+also restores/releases on failure before owned application shutdown.
+
+Report-level `diagnostic_success` additionally requires observed application exit
+before process-group termination. Full in-flight streaming presentation is not
+observed while withholding through completion, so normal `accepted_flow` and
+voice qualification requirements are not relaxed. This simulates a stalled
+observer, **not** unresponsive renderer JavaScript, physical capture, painted
+pixels or acoustic output. TTS remains disabled in this synthetic lane; absence
+of acoustic replay is not established. Unit/mock-driver and executed JavaScript
+wrapper tests do not replace the optimized target-app diagnostic run.
+
 ## Live safety
 
 Live execution is disabled by default and reserved for the final minimum flows
@@ -138,6 +178,25 @@ Marked metadata reports have a 90-day maximum age and an 8 MiB/128-file budget p
 run collection. Cleanup targets only the controller's marked report/diagnostic
 files, never the assignment ledger, code snapshots, credentials or synthetic
 fixtures. Frozen synthetic fixture bundles are limited to 16 MiB per run.
+
+Voice rows retain `native_audio` and `handler_call_metadata`. Native frame/sample
+admission and processed-frame counters are process-lifetime atomics differenced
+at each flow's reset; continuous background silence may leave admission and
+processing at different counts. Failure counters are also per-flow differences.
+`native_audio.pcm_events_emitted` counts the instrumented outbound PCM route, and
+legacy handlers have explicit zero-count entries even when never invoked.
+Missing fields fail qualification rather than meaning zero. Keep source inspection
+of PCM emitters alongside this instrumentation; a counter cannot detect an
+un-instrumented new emitter. `dropped` counts trace-observation overflow, **not**
+audio-frame loss, and cannot substitute for native overflow/stall counters.
+
+The standard voice matrix does not prove native completion while a renderer is
+stalled/detached or duplicate-free reload/reattachment. Focus loss is not renderer
+suspension. Those paths require separate authorized runtime evidence of native
+canonical completion during the hold and UI reconciliation afterward, including
+generation/turn/speech duplication checks. No driver busy-loop or fragile invoke
+interception is installed here. The existing longer research question exercises a
+longer utterance, but does not establish stress-length capture or recovery limits.
 
 `--entry typed-control` is a single-case offline control using the actual composer
 and shared generation path. It never qualifies as voice acceptance. Optional

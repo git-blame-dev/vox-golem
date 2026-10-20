@@ -172,7 +172,7 @@ function parseWireId(value: unknown, field: string, android = false): WireId {
   return value
 }
 
-function parseExecutionId(value: unknown, android = false): ExecutionId {
+export function parseExecutionId(value: unknown, android = false): ExecutionId {
   if (!isRecord(value)) throw new Error('execution_id must be an object')
   return {
     sessionId: parseWireId(value['session_id'], 'execution_id.session_id', android),

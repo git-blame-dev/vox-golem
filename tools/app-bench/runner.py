@@ -179,7 +179,9 @@ def validate_offline_evidence(path, binary, fixtures, speech_identity, entry='vo
             evidence.get('speech_identity') != speech_identity or
             evidence.get('cleanup', {}).get('app_exit_before_group_termination_observed') is not True or
             {r.get('case') for r in rows if r.get('passed') is True} != set(CASES) or
-            any(r.get('passed') is not True or r.get('dropped') != 0 for r in rows)):
+            len(rows) != len(CASES) or
+            any(r.get('passed') is not True or r.get('dropped') != 0 or
+                not native_audio_owned(r) for r in rows)):
         raise ValueError('Offline acceptance does not match this binary and all happy paths')
 
 
@@ -406,6 +408,34 @@ return {...metadata,admitted:true, answer:true, outcome:row.dataset.turnOutcome,
  source_links:row.querySelectorAll('.answer-stage__sources a').length};'''
 
 
+def native_audio_owned(evidence):
+    """Require measured native work and explicit zero counters, never absent keys.
+
+    Capture admission and processing run concurrently, so this does not require
+    equality of independently sampled counters during continuous silence capture.
+    These hooks plus source inspection cover the native route; trace.dropped is
+    only lost diagnostic observations, not an audio-loss measurement.
+    """
+    audio = evidence.get('native_audio')
+    handlers = evidence.get('handler_call_metadata')
+    if (not isinstance(audio, dict) or not isinstance(handlers, dict) or
+            type(audio.get('schema')) is not int or audio['schema'] != 1):
+        return False
+    def counter(value):
+        return type(value) is int and 0 <= value <= 2**53-1
+    for name in ('admitted_frames', 'admitted_samples', 'processed_frames'):
+        if not counter(audio.get(name)) or audio[name] <= 0:
+            return False
+    for name in ('pcm_events_emitted', 'overflows', 'stalls', 'capture_failures', 'processing_failures'):
+        if not counter(audio.get(name)) or audio[name] != 0:
+            return False
+    for name in ('ingest_audio_frame', 'mark_silence', 'record_speech_activity', 'save_wake_clip'):
+        stats = handlers.get(name)
+        if not isinstance(stats, dict) or not counter(stats.get('calls')) or stats['calls'] != 0:
+            return False
+    return True
+
+
 def accepted_flow(case, final, native, canonical_added_once, sources_preserved,
                   saw_inflight, service=None, require_voice=True):
     flow = max((e['flow'] for e in native['events']), default=0)
@@ -414,6 +444,8 @@ def accepted_flow(case, final, native, canonical_added_once, sources_preserved,
     required = {'generation_dispatched'}
     if require_voice:
         required |= {'source_samples_completed', 'wake_detected', 'final_asr_started', 'final_asr_completed'}
+        if not native_audio_owned(native):
+            return False
     if (not canonical_added_once or native['dropped'] != 0 or not required <= stages):
         return False
     if not final.get('nonblank') or final.get('canonical_ui_match') is not True:
@@ -832,10 +864,48 @@ def execute_typed(args):
         if service: service.__exit__(None, None, None)
 
 
-def exercise(driver, case, timeout=180, wake_diagnostics=False, services=None, poll_interval=0.1, entry='voice'):
+INSTALL_NATIVE_OBSERVER_HOLD = '''
+if(window.__voxNativeHold)throw new Error('hold already installed');
+const api=window.__TAURI_INTERNALS__, original=api.invoke;
+let pending=null,held=0,extra=0,released=false;
+function wrapper(...args){
+ if(args[0]!=='read_desktop_runtime'||released)return original.apply(this,args);
+ held++;
+ if(held>1){extra++;return Promise.reject(new Error('second held read'));}
+ const receiver=this;
+ return new Promise((resolve,reject)=>{pending=()=>{
+  try{Promise.resolve(original.apply(receiver,args)).then(resolve,reject);}catch(e){reject(e);}
+ };});
+}
+api.invoke=wrapper;
+if(api.invoke!==wrapper)throw new Error('invoke is not replaceable');
+window.__voxNativeHold={read:()=>({read_actually_held:held===1,held_reads:held,extra_reads:extra}),
+ release:()=>{released=true;api.invoke=original;const run=pending;pending=null;if(run)run();
+ return {restored:api.invoke===original};}};
+'''
+RELEASE_NATIVE_OBSERVER = '''const hold=window.__voxNativeHold;
+if(!hold)return {restored:true};const result=hold.release();delete window.__voxNativeHold;return result;'''
+
+
+def exercise(driver, case, timeout=180, wake_diagnostics=False, services=None, poll_interval=0.1,
+             entry='voice', hold_native_observer=False):
+    if hold_native_observer and (entry != 'voice' or case != 'quick' or services is None):
+        raise ValueError('Observer hold requires offline quick voice')
+    try:
+        return _exercise(driver, case, timeout, wake_diagnostics, services, poll_interval,
+                         entry, hold_native_observer)
+    finally:
+        if hold_native_observer:
+            driver.execute_script(RELEASE_NATIVE_OBSERVER)
+
+
+def _exercise(driver, case, timeout, wake_diagnostics, services, poll_interval, entry, hold_native_observer):
     page_at_start = driver.execute_script('return {visibility:document.visibilityState, focused:document.hasFocus()}')
     baseline = driver.execute_script('return Array.from(document.querySelectorAll("[data-turn-role=user][data-request-id]")).map(e=>e.dataset.requestId)')
     before = invoke(driver, 'get_app_snapshot')
+    hold = None
+    if hold_native_observer:
+        driver.execute_script(INSTALL_NATIVE_OBSERVER_HOLD)
     if wake_diagnostics:
         invoke(driver, 'set_wake_diagnostics', {'enabled': True})
     if entry == 'typed-control':
@@ -853,10 +923,14 @@ def exercise(driver, case, timeout=180, wake_diagnostics=False, services=None, p
                 'ui_state': ui_state(driver),
                 'page_at_start': page_at_start,
                 'page_at_outcome': driver.execute_script('return {visibility:document.visibilityState, focused:document.hasFocus()}'),
-                'audio_callback_metadata': driver.execute_script('return window.__VOXGOLEM_APP_BENCH_AUDIO__?.() || null'),
                 'service_metadata': services.snapshot() if services else None,
                 'native': invoke(driver, 'benchmark_snapshot')}
     source_end_observed = time.perf_counter()
+    if hold_native_observer:
+        hold = observe_native_completion_held(driver, before, baseline, services,
+                                              min(deadline, time.monotonic()+10))
+        hold.update(driver.execute_script('return window.__voxNativeHold.read()'))
+        hold['invoke_restored'] = driver.execute_script(RELEASE_NATIVE_OBSERVER)['restored']
     first = None
     final = None
     saw_inflight = False
@@ -896,12 +970,12 @@ def exercise(driver, case, timeout=180, wake_diagnostics=False, services=None, p
     if final is None or first is None:
         # Fixed numeric/category evidence is safe even when a preceding stage failed.
         return {'case': case, 'passed': False, 'failure': failure,
+                'native_observer_hold': hold, 'diagnostic_success': False,
                 'ui_state': ui_state(driver),
                 'page_at_start': page_at_start,
                 'page_at_outcome': driver.execute_script('return {visibility:document.visibilityState, focused:document.hasFocus()}'),
                 'wake_diagnostic_metadata': wake_metrics if wake_diagnostics else None,
                 'notice_categories': sorted(notices),
-                'audio_callback_metadata': driver.execute_script('return window.__VOXGOLEM_APP_BENCH_AUDIO__?.() || null'),
                 'service_metadata': services.snapshot() if services else None,
                 'native': invoke(driver, 'benchmark_snapshot')}
     after = invoke(driver, 'get_app_snapshot')
@@ -926,7 +1000,30 @@ return {text:rendered,urls};''', request_id)
     service_metadata = services.snapshot() if services else None
     passed = accepted_flow(case, final, native, canonical_added_once, sources_preserved,
                            saw_inflight, service_metadata, entry == 'voice')
-    return {'case': case, 'passed': bool(passed),
+    if hold is not None:
+        hold['canonical_prefix_preserved'] = after['transcript'][:-1] == before['transcript']
+        hold['canonical_ui_reconciled_once'] = canonical_added_once and final['canonical_ui_match'] and driver.execute_script('''const prior=arguments[0],id=arguments[1];return Array.from(document.querySelectorAll('[data-turn-role=user][data-request-id]')).filter(e=>!prior.includes(e.dataset.requestId)).length===1&&document.querySelectorAll('[data-turn-role=assistant][data-request-id]').length===prior.length+1&&Array.from(document.querySelectorAll('[data-turn-role=user][data-request-id]')).filter(e=>e.dataset.requestId===id).length===1;''', baseline, request_id)
+        hold['normal_native_flow_and_exact_operations'] = accepted_flow(
+            case, final, native, canonical_added_once, sources_preserved, True, service_metadata, True)
+        hold['no_late_duplicate_admission'] = True
+        retirement_deadline = min(deadline, time.monotonic()+0.5)
+        while time.monotonic() < retirement_deadline:
+            settled = invoke(driver, 'get_app_snapshot')
+            metadata = services.snapshot()
+            ui = driver.execute_script(OBSERVE, baseline)
+            current_native = invoke(driver, 'benchmark_snapshot')
+            if (settled['transcript'] != after['transcript'] or settled.get('active_request') is not None or
+                    metadata['generation_requests'] != service_metadata['expected_model_rounds'] or
+                    metadata['failures'] != 0 or ui.get('outcome') != 'completed' or
+                    ui_state(driver)['user_rows'] != len(baseline)+1 or
+                    current_native['generation'] != native['generation']):
+                hold['no_late_duplicate_admission'] = False
+                break
+            time.sleep(0.05)
+        hold['post_release_observation_completed'] = time.monotonic() < deadline
+    return {'case': case, 'passed': bool(passed) and not hold_native_observer,
+            'native_observer_hold': hold,
+            'diagnostic_success': hold is not None and all(value is True for key, value in hold.items() if key not in ('held_reads', 'extra_reads')) and hold['held_reads'] == 1 and hold['extra_reads'] == 0,
             'page_at_start': page_at_start,
             'page_at_outcome': driver.execute_script('return {visibility:document.visibilityState, focused:document.hasFocus()}'),
             'queue_to_first_text_observed_ms': (first-started)*1000,
@@ -945,7 +1042,34 @@ return {text:rendered,urls};''', request_id)
             'readable_pages': native.get('readable_pages', 0),
             'service_metadata': service_metadata,
             'source_links': final['source_links'], 'native_events': events,
+            'native_audio': native.get('native_audio'),
+            'handler_call_metadata': native.get('handler_call_metadata'),
+            'native_audio_owned': native_audio_owned(native) if entry == 'voice' else None,
             'dropped': native['dropped']}
+
+
+def observe_native_completion_held(driver, before, baseline, services, deadline):
+    result = {'canonical_completed_while_held': False, 'ui_user_row_absent_before_release': False,
+              'ui_pending_row_absent_before_release': False,
+              'exact_generation_count_while_held': False}
+    while time.monotonic() < deadline:
+        state = driver.execute_script('return window.__voxNativeHold.read()')
+        result.update(state)
+        if state['extra_reads']:
+            break
+        snapshot = invoke(driver, 'get_app_snapshot')
+        service = services.snapshot()
+        complete = (snapshot['transcript'][:-1] == before['transcript'] and
+                    len(snapshot['transcript']) == len(before['transcript'])+1 and
+                    snapshot.get('active_request') is None and service['terminal'])
+        if complete:
+            result['canonical_completed_while_held'] = state['read_actually_held']
+            result['ui_user_row_absent_before_release'] = driver.execute_script(OBSERVE, baseline).get('count') == 0
+            result['ui_pending_row_absent_before_release'] = driver.execute_script('''return document.querySelectorAll('[data-turn-role=assistant]').length===arguments[0]&&document.querySelectorAll('[data-turn-role=user]').length===arguments[0];''', len(baseline)) is True
+            result['exact_generation_count_while_held'] = (service['generation_requests'] == service['expected_model_rounds'] == 1 and service['failures'] == 0)
+            break
+        time.sleep(0.1)
+    return result
 
 
 def execute(args):
@@ -1017,7 +1141,7 @@ def execute(args):
                 services.expected_case = case
             wait_for(lambda: invoke(driver, 'benchmark_snapshot')['phase'] == 'sleeping',
                      15, 'idle_before_input')
-            result = exercise(driver, case, args.flow_timeout, args.wake_diagnostics, services, args.poll_interval, args.entry)
+            result = exercise(driver, case, args.flow_timeout, args.wake_diagnostics, services, args.poll_interval, args.entry, args.hold_native_observer)
             if args.entry == 'typed-control':
                 result['typed_control_passed'] = result['passed']
                 result['passed'] = False
@@ -1031,7 +1155,8 @@ def execute(args):
                    'requested_model': 'custom-luna-none', 'effort': 'none',
                    'entry': args.entry,
                    'software_input': True, 'physical_microphone_tested': False,
-                   'diagnostic_only': args.entry != 'voice' or args.wake_diagnostics or args.event_loop_diagnostic or args.poll_interval != 0.1,
+                   'diagnostic_only': args.hold_native_observer or args.entry != 'voice' or args.wake_diagnostics or args.event_loop_diagnostic or args.poll_interval != 0.1,
+                   'hold_native_observer': args.hold_native_observer,
                    'wake_score_diagnostics': args.wake_diagnostics,
                    'browser_call_probes': args.event_loop_diagnostic,
                    'windows_or_phone_acceptance': False,
@@ -1049,11 +1174,16 @@ def execute(args):
         driver = None
         process = None
         summary['cleanup'] = cleanup
+        summary['diagnostic_success'] = (args.hold_native_observer and len(rows) == 1 and
+            rows[0].get('diagnostic_success') is True and cleanup['app_exit_before_group_termination_observed'])
+        if args.hold_native_observer:
+            summary['qualified_for_live'] = False
         private_json(run/'report.json', summary)
         prune_owned_reports(run.parent)
         passed = (not summary['diagnostic_only'] and len(rows)==len(args.cases) and
                   all(r['passed'] for r in rows) and cleanup['app_exit_before_group_termination_observed'])
         print(json.dumps({'passed': passed,
+                          'diagnostic_success': summary['diagnostic_success'],
                           'mode': summary['mode'], 'completed_flows': len(rows)}))
         return 0 if passed else 1
     except Exception:
@@ -1130,6 +1260,7 @@ def main():
     parser.add_argument('--wake-diagnostics', action='store_true', help='Bounded score diagnostics for fixture qualification, not final timing runs')
     parser.add_argument('--event-loop-diagnostic', action='store_true', help='Temporary browser heartbeat probe; never qualifying evidence')
     parser.add_argument('--driver-free-diagnostic', action='store_true', help='Offline automation-effect control only; never qualifying evidence')
+    parser.add_argument('--hold-native-observer', action='store_true', help='Offline quick voice consumer-stall diagnostic only; always exits 1')
     parser.add_argument('--live', action='store_true')
     parser.add_argument('--offline-evidence', type=Path, help='Matching successful offline report, required before live reservation')
     parser.add_argument('--ledger', type=Path, default=ASSIGNMENT_LEDGER)
@@ -1137,6 +1268,10 @@ def main():
     parser.add_argument('--inside-session', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
     args.tools = args.tools.resolve()
+    if args.hold_native_observer and (args.live or args.entry != 'voice' or args.cases != ['quick'] or
+            args.driver_free_diagnostic or args.wake_diagnostics or args.event_loop_diagnostic or
+            args.extended or args.poll_interval != 0.1):
+        parser.error('Native observer hold requires exactly one offline quick voice case without other probes')
     if args.entry != 'typed' and not args.wake_phrase:
         parser.error('Voice and legacy controls require an explicit synthetic wake phrase')
     if args.extended and (args.entry != 'typed' or args.live):

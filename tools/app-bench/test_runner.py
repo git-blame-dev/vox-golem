@@ -1,5 +1,8 @@
 import json
 import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -8,7 +11,122 @@ from unittest.mock import patch
 import runner
 
 
+def native_audio_evidence():
+    return {'native_audio': {'schema': 1, 'admitted_frames': 80, 'admitted_samples': 38400,
+        'processed_frames': 79, 'pcm_events_emitted': 0, 'overflows': 0, 'stalls': 0,
+        'capture_failures': 0, 'processing_failures': 0},
+        'handler_call_metadata': {name: {'calls': 0, 'total_us': 0, 'max_us': 0}
+            for name in ('ingest_audio_frame', 'mark_silence', 'record_speech_activity', 'save_wake_clip')}}
+
+
 class SafetyTests(unittest.TestCase):
+    def test_observer_hold_executes_one_pending_native_read_and_preserves_receiver(self):
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('Node required for actual injected JavaScript execution')
+        script = '''const assert=require('node:assert/strict');
+global.window={};let calls=[];
+window.__TAURI_INTERNALS__={invoke:function(command,args){
+ assert.equal(this,window.__TAURI_INTERNALS__);calls.push(command);return Promise.resolve(args);
+}};
+(async()=>{
+new Function(''' + json.dumps(runner.INSTALL_NATIVE_OBSERVER_HOLD) + ''')();
+const api=window.__TAURI_INTERNALS__;
+let resolved=false;const pending=api.invoke('read_desktop_runtime',{synthetic:true}).then(v=>{resolved=true;return v});
+await api.invoke('benchmark_queue',{});await api.invoke('get_app_snapshot',{});
+assert.deepEqual(calls,['benchmark_queue','get_app_snapshot']);assert.equal(resolved,false);
+await assert.rejects(api.invoke('read_desktop_runtime',{}));
+assert.deepEqual(window.__voxNativeHold.read(),{read_actually_held:false,held_reads:2,extra_reads:1});
+const release=new Function(''' + json.dumps(runner.RELEASE_NATIVE_OBSERVER) + ''');
+assert.equal(release().restored,true);assert.deepEqual(await pending,{synthetic:true});
+assert.equal(calls.filter(c=>c==='read_desktop_runtime').length,1);
+await api.invoke('read_desktop_runtime',{});assert.equal(calls.length,4);
+assert.equal(release().restored,true);
+})().catch(()=>{process.exitCode=1});'''
+        result = subprocess.run([node, '-e', script], capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+
+    def test_hold_cli_rejects_non_offline_quick_voice_and_probe_combinations(self):
+        base = ['runner', '--binary', '/synthetic/app', '--tools', '/synthetic/tools',
+                '--config', '/synthetic/config', '--output', str(runner.ARTIFACT_ROOT/'synthetic-hold'),
+                '--wake-phrase', 'synthetic wake', '--hold-native-observer']
+        for flags in [[], ['--cases', 'quick', 'short_research'], ['--cases', 'short_research'],
+                      ['--cases', 'quick', '--live'], ['--cases', 'quick', '--entry', 'typed'],
+                      ['--cases', 'quick', '--entry', 'typed-control'],
+                      ['--cases', 'quick', '--driver-free-diagnostic'],
+                      ['--cases', 'quick', '--event-loop-diagnostic']]:
+            with self.subTest(flags=flags), patch.object(sys, 'argv', base+flags), \
+                    patch.object(runner.argparse.ArgumentParser, 'error', side_effect=ValueError('rejected')):
+                with self.assertRaises(ValueError): runner.main()
+
+    def test_held_completion_requires_independent_canonical_terminal_and_no_ui_row(self):
+        class Driver:
+            def execute_script(self, script, *args):
+                if script == runner.OBSERVE: return {'count': 0}
+                if 'document.querySelectorAll' in script: return True
+                return {'read_actually_held': True, 'held_reads': 1, 'extra_reads': 0}
+        class Service:
+            def snapshot(self):
+                return {'terminal': True, 'generation_requests': 1, 'expected_model_rounds': 1, 'failures': 0}
+        before = {'transcript': []}
+        after = {'transcript': [{'answer': 'synthetic answer'}], 'active_request': None}
+        with patch.object(runner, 'invoke', return_value=after):
+            result = runner.observe_native_completion_held(Driver(), before, [], Service(), runner.time.monotonic()+1)
+        self.assertTrue(result['canonical_completed_while_held'])
+        self.assertTrue(result['ui_user_row_absent_before_release'])
+        self.assertTrue(result['ui_pending_row_absent_before_release'])
+        self.assertTrue(result['exact_generation_count_while_held'])
+        with patch.object(runner, 'invoke', return_value=before):
+            result = runner.observe_native_completion_held(Driver(), before, [], Service(), runner.time.monotonic()+0.001)
+        self.assertFalse(result['canonical_completed_while_held'])
+
+    def test_hold_releases_on_failed_exercise(self):
+        class Driver:
+            scripts = []
+            def execute_script(self, script, *args):
+                self.scripts.append(script)
+                return {'restored': True}
+        driver = Driver()
+        with patch.object(runner, '_exercise', side_effect=RuntimeError('synthetic failure')):
+            with self.assertRaises(RuntimeError):
+                runner.exercise(driver, 'quick', services=object(), hold_native_observer=True)
+        self.assertIn(runner.RELEASE_NATIVE_OBSERVER, driver.scripts)
+
+    def test_voice_acceptance_requires_explicit_native_audio_evidence(self):
+        stages = ['source_samples_completed', 'wake_detected', 'final_asr_started',
+                  'final_asr_completed', 'generation_dispatched']
+        native = {'events': [{'flow': 1, 'stage': stage} for stage in stages], 'dropped': 0}
+        final = {'nonblank': True, 'canonical_ui_match': True, 'quick_correct': True}
+        self.assertFalse(runner.accepted_flow('quick', final, native, True, True, True),
+                         'wake/ASR stages alone must not prove zero-IPC native ownership')
+        self.assertTrue(runner.accepted_flow('quick', final, {**native, **native_audio_evidence()}, True, True, True))
+
+    def test_native_audio_proof_rejects_missing_noninteger_failure_and_ipc_counters(self):
+        good = native_audio_evidence()
+        self.assertTrue(runner.native_audio_owned(good))
+        for name in good['native_audio']:
+            altered = json.loads(json.dumps(good))
+            del altered['native_audio'][name]
+            self.assertFalse(runner.native_audio_owned(altered), name)
+        for name in ('admitted_frames', 'admitted_samples', 'processed_frames'):
+            for value in (0, -1, True, '80', 1.5, 2**53):
+                altered = json.loads(json.dumps(good))
+                altered['native_audio'][name] = value
+                self.assertFalse(runner.native_audio_owned(altered), (name, value))
+        for name in ('pcm_events_emitted', 'overflows', 'stalls', 'capture_failures', 'processing_failures'):
+            for value in (1, -1, False, None):
+                altered = json.loads(json.dumps(good))
+                altered['native_audio'][name] = value
+                self.assertFalse(runner.native_audio_owned(altered), (name, value))
+        for name in good['handler_call_metadata']:
+            altered = json.loads(json.dumps(good))
+            del altered['handler_call_metadata'][name]
+            self.assertFalse(runner.native_audio_owned(altered), name)
+            altered = json.loads(json.dumps(good))
+            altered['handler_call_metadata'][name]['calls'] = 1
+            self.assertFalse(runner.native_audio_owned(altered), name)
+
+
     def test_only_explicitly_deferred_checks_receive_deferred_labels(self):
         rows = [{'checks': {'canonical_sources_retained': False, 'ui_sources_preserved': False,
                             'inflight_stream_presented': False}}]
@@ -266,7 +384,7 @@ class SafetyTests(unittest.TestCase):
         stages = ['source_samples_completed', 'wake_detected', 'final_asr_started',
                   'final_asr_completed'] + ['generation_dispatched']*3
         native = {'events': [{'flow': 1, 'stage': stage} for stage in stages],
-                  'dropped': 0, 'readable_pages': 2, 'tool_failures': 0}
+                  'dropped': 0, 'readable_pages': 2, 'tool_failures': 0, **native_audio_evidence()}
         service = {'failures': 0, 'transcript_matches': True, 'model_matches': True,
             'terminal': True, 'generation_requests': 3, 'expected_model_rounds': 3,
             'searches': 1, 'expected_searches': 1, 'fetches': 2, 'expected_fetches': 2,
@@ -328,7 +446,7 @@ class SafetyTests(unittest.TestCase):
                 'cleanup': {'app_exit_before_group_termination_observed': True},
                 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
                 'harness_sha256': runner.harness_identity(),
-                'rows': [{'case': case, 'passed': True, 'dropped': 0} for case in runner.CASES]}
+                'rows': [{'case': case, 'passed': True, 'dropped': 0, **native_audio_evidence()} for case in runner.CASES]}
             report.write_text(json.dumps(evidence))
             runner.validate_offline_evidence(report, binary, fixtures, speech)
             for change in [{'mode': 'live'}, {'entry': 'typed-control'}, {'diagnostic_only': True},
@@ -347,6 +465,18 @@ class SafetyTests(unittest.TestCase):
                 incomplete = {**evidence}
                 del incomplete[missing]
                 report.write_text(json.dumps(incomplete))
+                with self.assertRaises(ValueError):
+                    runner.validate_offline_evidence(report, binary, fixtures, speech)
+            for field in ['native_audio', 'handler_call_metadata']:
+                altered = json.loads(json.dumps(evidence))
+                del altered['rows'][0][field]
+                report.write_text(json.dumps(altered))
+                with self.assertRaises(ValueError):
+                    runner.validate_offline_evidence(report, binary, fixtures, speech)
+            for field in ['pcm_events_emitted', 'overflows', 'stalls']:
+                altered = json.loads(json.dumps(evidence))
+                altered['rows'][0]['native_audio'][field] = 1
+                report.write_text(json.dumps(altered))
                 with self.assertRaises(ValueError):
                     runner.validate_offline_evidence(report, binary, fixtures, speech)
 

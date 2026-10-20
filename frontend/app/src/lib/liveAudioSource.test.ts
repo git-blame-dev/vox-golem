@@ -1,286 +1,76 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { listAudioInputDevices, startLiveAudioSource } from './liveAudioSource'
 
-afterEach(() => {
-  Reflect.deleteProperty(window, '__TAURI_INTERNALS__')
-  Reflect.deleteProperty(window, '__VOXGOLEM_APP_BENCH_AUDIO__')
-  vi.unstubAllEnvs()
-})
-
-describe('native live audio source', () => {
-  it('lists validated native input devices', async () => {
-    window.__TAURI_INTERNALS__ = {
-      invoke: vi.fn(async (command) => command === 'list_audio_input_devices'
-        ? [{ device_id: 'mic-id', label: 'Studio microphone' }]
-        : null),
-    }
-
-    await expect(listAudioInputDevices()).resolves.toEqual([
-      { deviceId: 'mic-id', label: 'Studio microphone' },
-    ])
-  })
-
-  it('starts native capture and delivers only matching frames sequentially', async () => {
-    const handlers = new Map<string, (event: { payload: unknown }) => void>()
-    const invoke = vi.fn<(command: string, args?: unknown) => Promise<unknown>>(async (command) => {
-      if (command === 'reserve_native_microphone_capture_id') return 41
-      if (command === 'start_native_microphone') return { fell_back_to_default: false }
-      return null
-    })
-    window.__TAURI_INTERNALS__ = {
-      invoke,
-      listen: vi.fn(async (event, handler) => {
-        handlers.set(event, handler)
-        return vi.fn()
-      }),
-    }
-    const received: number[][] = []
-    const statuses: string[] = []
-    const source = await startLiveAudioSource({
-      onFrame: async (frame) => { received.push([...frame]) },
-      onError: () => undefined,
-      onStatus: (status) => statuses.push(status),
-    })
-    const startArgs = invoke.mock.calls.find(([command]) => command === 'start_native_microphone')?.[1]
-    const captureId = (startArgs as { captureId: number }).captureId
-    const frameHandler = handlers.get('native-microphone-frame')
-    expect(frameHandler).toBeDefined()
-    expect(captureId).toBe(41)
-
-    frameHandler?.({ payload: { capture_id: captureId + 1, frame: [9] } })
-    frameHandler?.({ payload: { capture_id: captureId, frame: [1, 2] } })
-    frameHandler?.({ payload: { capture_id: captureId, frame: [3, 4] } })
-    await vi.waitFor(() => expect(received).toEqual([[1, 2], [3, 4]]))
-    expect(statuses).toEqual(['starting_native_input', 'native_input_started', 'first_frame'])
-
-    source.stop()
-    expect(invoke).toHaveBeenCalledWith('stop_native_microphone', { captureId })
-  })
-
-  it('uses process-lifetime native IDs after the frontend module reloads', async () => {
-    const reservedIds = [401, 902]
-    const invoke = vi.fn<(command: string, args?: unknown) => Promise<unknown>>(async (command) => {
-      if (command === 'reserve_native_microphone_capture_id') return reservedIds.shift()
-      if (command === 'start_native_microphone') return { fell_back_to_default: false }
-      return null
-    })
-    window.__TAURI_INTERNALS__ = {
-      invoke,
-      listen: vi.fn(async () => vi.fn()),
-    }
-
-    const first = await startLiveAudioSource({ onFrame: () => undefined, onError: () => undefined })
-    vi.resetModules()
-    const reloaded = await import('./liveAudioSource')
-    const second = await reloaded.startLiveAudioSource({ onFrame: () => undefined, onError: () => undefined })
-    const captureIds = invoke.mock.calls
-      .filter(([command]) => command === 'start_native_microphone')
-      .map(([, args]) => (args as { captureId: number }).captureId)
-
-    expect(captureIds).toEqual([401, 902])
-    first.stop()
-    second.stop()
-  })
-
-  it('reports only matching native capture failures and cleans up both listeners', async () => {
-    const handlers = new Map<string, (event: { payload: unknown }) => void>()
-    const unlistenFrame = vi.fn()
-    const unlistenTerminal = vi.fn()
+afterEach(() => { delete window.__TAURI_INTERNALS__ })
+describe('native microphone control handle', () => {
+  it.each(['completed', 'failed'] as const)('exposes the same physical-retirement promise to every Stop caller: %s', async (outcome) => {
+    let resolve!: (value: unknown) => void
+    let reject!: (error: Error) => void
+    const pending = new Promise((yes, no) => { resolve = yes; reject = no })
     const onError = vi.fn()
-    window.__TAURI_INTERNALS__ = {
-      invoke: vi.fn(async (command) => {
-        if (command === 'reserve_native_microphone_capture_id') return 42
-        if (command === 'start_native_microphone') return { fell_back_to_default: false }
-        return null
-      }),
-      listen: vi.fn(async (event, handler) => {
-        handlers.set(event, handler)
-        return event === 'native-microphone-frame' ? unlistenFrame : unlistenTerminal
-      }),
-    }
-
-    const source = await startLiveAudioSource({
-      onFrame: () => undefined,
-      onError,
-    })
-    const terminalHandler = handlers.get('native-microphone-terminal')
-    const frameHandler = handlers.get('native-microphone-frame')
-    expect(terminalHandler).toBeDefined()
-    expect(frameHandler).toBeDefined()
-    const startCall = vi.mocked(window.__TAURI_INTERNALS__.invoke).mock.calls
-      .find(([command]) => command === 'start_native_microphone')
-    const captureId = (startCall?.[1] as { captureId: number }).captureId
-
-    terminalHandler?.({ payload: { capture_id: captureId + 1, message: 'stale failure' } })
-    expect(onError).not.toHaveBeenCalled()
-    terminalHandler?.({ payload: { capture_id: captureId, message: 'device removed' } })
-    expect(onError).toHaveBeenCalledOnce()
-    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: 'device removed' }))
-    expect(unlistenFrame).toHaveBeenCalledOnce()
-    expect(unlistenTerminal).toHaveBeenCalledOnce()
-
-    frameHandler?.({ payload: { capture_id: captureId, frame: [1, 2] } })
-    source.stop()
-    expect(onError).toHaveBeenCalledOnce()
-  })
-
-  it('stops capture instead of retaining an unbounded frame backlog', async () => {
-    vi.stubEnv('VITE_VOXGOLEM_BENCHMARK', '1')
-    const handlers = new Map<string, (event: { payload: unknown }) => void>()
-    let releaseFirstFrame: () => void = () => undefined
-    const firstFrameBlocked = new Promise<void>((resolve) => {
-      releaseFirstFrame = resolve
-    })
-    const onFrame = vi.fn(async () => firstFrameBlocked)
-    const onError = vi.fn()
-    const invoke = vi.fn<(command: string, args?: unknown) => Promise<unknown>>(async (command) => {
-      if (command === 'reserve_native_microphone_capture_id') return 43
+    const invoke = vi.fn(async (command: string) => {
+      if (command === 'reserve_native_microphone_capture_id') return 21
       if (command === 'start_native_microphone') return { fell_back_to_default: false }
-      return null
+      return pending
     })
-    window.__TAURI_INTERNALS__ = {
-      invoke,
-      listen: vi.fn(async (event, handler) => {
-        handlers.set(event, handler)
-        return vi.fn()
-      }),
-    }
-    await startLiveAudioSource({ onFrame, onError })
-    const startCall = invoke.mock.calls.find(([command]) => command === 'start_native_microphone')
-    const captureId = (startCall?.[1] as { captureId: number }).captureId
-    const frameHandler = handlers.get('native-microphone-frame')
-
-    for (let index = 0; index < 40; index += 1) {
-      frameHandler?.({ payload: { capture_id: captureId, frame: [index] } })
-    }
-
-    await vi.waitFor(() => expect(onError).toHaveBeenCalledOnce())
-    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('fell behind') }))
-    expect(invoke).toHaveBeenCalledWith('stop_native_microphone', { captureId })
-    expect(window.__VOXGOLEM_APP_BENCH_AUDIO__?.()).toMatchObject({ calls: 1, completed: 0, pending_max: 32, rejected: 0 })
-    releaseFirstFrame()
+    window.__TAURI_INTERNALS__ = { invoke }
+    const source = await startLiveAudioSource({ onError })
+    const retired = source.stop()
+    expect(source.stop()).toBe(retired)
+    let settled = false
+    void retired.then(() => { settled = true }, () => { settled = true })
     await Promise.resolve()
-    expect(onFrame).toHaveBeenCalledOnce()
-    await vi.waitFor(() => expect(window.__VOXGOLEM_APP_BENCH_AUDIO__?.()).toMatchObject({ completed: 1 }))
-  })
-
-  it('drains a transient native frame burst after ingestion resumes', async () => {
-    const handlers = new Map<string, (event: { payload: unknown }) => void>()
-    let releaseFirstFrame: () => void = () => undefined
-    const firstFrameBlocked = new Promise<void>((resolve) => {
-      releaseFirstFrame = resolve
-    })
-    const received: number[] = []
-    const onError = vi.fn()
-    const invoke = vi.fn<(command: string, args?: unknown) => Promise<unknown>>(async (command) => {
-      if (command === 'reserve_native_microphone_capture_id') return 47
-      if (command === 'start_native_microphone') return { fell_back_to_default: false }
-      return null
-    })
-    window.__TAURI_INTERNALS__ = {
-      invoke,
-      listen: vi.fn(async (event, handler) => {
-        handlers.set(event, handler)
-        return vi.fn()
-      }),
-    }
-
-    const source = await startLiveAudioSource({
-      onFrame: async (frame) => {
-        received.push(frame[0]!)
-        if (received.length === 1) await firstFrameBlocked
-      },
-      onError,
-    })
-    const frameHandler = handlers.get('native-microphone-frame')
-    for (let index = 0; index < 16; index += 1) {
-      frameHandler?.({ payload: { capture_id: 47, frame: [index] } })
-    }
-
-    expect(onError).not.toHaveBeenCalled()
-    releaseFirstFrame()
-    await vi.waitFor(() => expect(received).toEqual(Array.from({ length: 16 }, (_, index) => index)))
-    expect(invoke).not.toHaveBeenCalledWith('stop_native_microphone', { captureId: 47 })
-    source.stop()
-  })
-
-  it('cancels native startup before the start command settles', async () => {
-    let resolveStart: (payload: unknown) => void = () => undefined
-    const startPending = new Promise<unknown>((resolve) => {
-      resolveStart = resolve
-    })
-    const invoke = vi.fn<(command: string, args?: unknown) => Promise<unknown>>(async (command) => {
-      if (command === 'reserve_native_microphone_capture_id') return 44
-      if (command === 'start_native_microphone') return startPending
-      return null
-    })
-    window.__TAURI_INTERNALS__ = {
-      invoke,
-      listen: vi.fn(async () => vi.fn()),
-    }
-    const controller = new AbortController()
-    const sourcePending = startLiveAudioSource({
-      signal: controller.signal,
-      onFrame: () => undefined,
-      onError: () => undefined,
-    })
-    await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith(
-      'start_native_microphone',
-      expect.objectContaining({ captureId: expect.any(Number) }),
-    ))
-    const startCall = invoke.mock.calls.find(([command]) => command === 'start_native_microphone')
-    const captureId = (startCall?.[1] as { captureId: number }).captureId
-
-    controller.abort()
-
-    await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith('stop_native_microphone', { captureId }))
-    resolveStart({ fell_back_to_default: false })
-    const source = await sourcePending
-    source.stop()
+    expect(settled).toBe(false)
+    if (outcome === 'completed') { resolve(null); await expect(retired).resolves.toBeUndefined() }
+    else { reject(new Error('Synthetic retirement failed')); await expect(retired).rejects.toThrow('Synthetic retirement failed') }
+    expect(settled).toBe(true)
+    expect(onError).toHaveBeenCalledTimes(outcome === 'failed' ? 1 : 0)
     expect(invoke.mock.calls.filter(([command]) => command === 'stop_native_microphone')).toHaveLength(1)
   })
-
-  it('reports stale selected-device fallback from the native service', async () => {
-    const onSelectedDeviceFallback = vi.fn()
-    window.__TAURI_INTERNALS__ = {
-      invoke: vi.fn(async (command) => {
-        if (command === 'reserve_native_microphone_capture_id') return 45
-        if (command === 'start_native_microphone') return { fell_back_to_default: true }
-        return null
-      }),
-      listen: vi.fn(async () => vi.fn()),
-    }
-
-    const source = await startLiveAudioSource({
-      deviceId: 'missing microphone',
-      onFrame: () => undefined,
-      onError: () => undefined,
-      onSelectedDeviceFallback,
+  it('reserves process lifetime identity and starts/stops without any frame subscription', async () => {
+    const listen = vi.fn()
+    const invoke = vi.fn(async (command: string) => {
+      if (command === 'reserve_native_microphone_capture_id') return 17
+      if (command === 'start_native_microphone') return { fell_back_to_default: false }
+      return null
     })
-
-    expect(onSelectedDeviceFallback).toHaveBeenCalledWith('missing microphone')
-    source.stop()
+    window.__TAURI_INTERNALS__ = { invoke, listen }
+    const source = await startLiveAudioSource({ deviceId: 'synthetic-input', onError: vi.fn() })
+    expect(source.captureId).toBe(17)
+    expect(invoke.mock.calls).toEqual([['reserve_native_microphone_capture_id'], ['start_native_microphone', { captureId: 17, deviceId: 'synthetic-input' }]])
+    expect(listen).not.toHaveBeenCalled()
+    source.stop(); source.stop()
+    expect(invoke).toHaveBeenLastCalledWith('stop_native_microphone', { captureId: 17 })
+    expect(invoke).toHaveBeenCalledTimes(3)
   })
-
-  it('cleans up the listener when native startup fails', async () => {
-    const unlistenFrame = vi.fn()
-    const unlistenTerminal = vi.fn()
-    window.__TAURI_INTERNALS__ = {
-      invoke: vi.fn(async (command) => {
-        if (command === 'reserve_native_microphone_capture_id') return 46
-        if (command === 'start_native_microphone') throw new Error('input unavailable')
-        return null
-      }),
-      listen: vi.fn(async (event) => event === 'native-microphone-frame'
-        ? unlistenFrame
-        : unlistenTerminal),
-    }
-
-    await expect(startLiveAudioSource({
-      onFrame: () => undefined,
-      onError: () => undefined,
-    })).rejects.toThrow('input unavailable')
-    expect(unlistenFrame).toHaveBeenCalledOnce()
-    expect(unlistenTerminal).toHaveBeenCalledOnce()
+  it('detach and subsequent renderer abort are observation loss, not native capture cancellation', async () => {
+    const invoke = vi.fn(async (command: string) => command === 'reserve_native_microphone_capture_id' ? 18 : { fell_back_to_default: false })
+    window.__TAURI_INTERNALS__ = { invoke }
+    const abort = new AbortController()
+    const source = await startLiveAudioSource({ signal: abort.signal, onError: vi.fn() })
+    source.detach(); abort.abort(); source.stop()
+    expect(invoke).toHaveBeenCalledTimes(2)
+  })
+  it('preserves explicit startup abort and selected device fallback', async () => {
+    const invoke = vi.fn(async (command: string) => command === 'reserve_native_microphone_capture_id' ? 19 : { fell_back_to_default: true })
+    window.__TAURI_INTERNALS__ = { invoke }
+    const fallback = vi.fn()
+    const abort = new AbortController()
+    const source = await startLiveAudioSource({ deviceId: 'synthetic-removed', signal: abort.signal, onError: vi.fn(), onSelectedDeviceFallback: fallback })
+    expect(fallback).toHaveBeenCalledWith('synthetic-removed')
+    abort.abort(); source.stop()
+    expect(invoke.mock.calls.filter(([command]) => command === 'stop_native_microphone')).toHaveLength(1)
+  })
+  it('rejects unsafe process identities without starting capture', async () => {
+    const invoke = vi.fn().mockResolvedValue(Number.MAX_SAFE_INTEGER + 1)
+    window.__TAURI_INTERNALS__ = { invoke }
+    await expect(startLiveAudioSource({ onError: vi.fn() })).rejects.toThrow(/capture ID/)
+    expect(invoke).toHaveBeenCalledTimes(1)
+  })
+  it('lists native input selection without requesting capture', async () => {
+    const invoke = vi.fn().mockResolvedValue([{ device_id: 'synthetic-input', label: 'Synthetic microphone' }])
+    window.__TAURI_INTERNALS__ = { invoke }
+    expect(await listAudioInputDevices()).toEqual([{ deviceId: 'synthetic-input', label: 'Synthetic microphone' }])
+    expect(invoke).toHaveBeenCalledWith('list_audio_input_devices')
   })
 })

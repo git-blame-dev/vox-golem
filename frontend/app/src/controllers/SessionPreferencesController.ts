@@ -52,5 +52,5 @@ export class SessionPreferencesController {
   readonly textSize = new PreferenceJournal<UiTextSize>('medium')
   readonly theme = new PreferenceJournal<UiTheme>('dark')
   readonly tts = new PreferenceJournal(false)
+  readonly autoStop = new PreferenceJournal(true)
 }
-

@@ -191,25 +191,3 @@ export type RuntimeStatus =
   | 'processing'
   | 'executing'
   | 'error'
-
-export interface RuntimeControlResult {
-  readonly runtimePhase: BackendRuntimePhase
-  readonly transcriptionReadySamples: number | null
-  readonly transcriptText: string | null
-  readonly lastActivityMs: number | null
-  readonly heardSpeech: boolean
-  readonly capturingUtterance: boolean
-  readonly prerollSamples: number
-  readonly utteranceSamples: number
-  readonly telemetry: RuntimeControlTelemetry | null
-}
-
-export interface RuntimeControlTelemetry {
-  readonly frameId: string | null
-  readonly backendIngestStartedMs: number | null
-  readonly backendIngestCompletedMs: number | null
-  readonly wakeDetectedMs: number | null
-  readonly wakeConfidence: number | null
-  readonly transcriptionStartedMs: number | null
-  readonly transcriptionCompletedMs: number | null
-}

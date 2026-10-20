@@ -337,6 +337,8 @@ class FixtureTests(unittest.TestCase):
                     self.assertEqual(text, LONG_ANSWER)
                     self.assertGreaterEqual(len(text.split()), 200)
                     self.assertGreater(len(wire), 4)
+                # Receiving flushed SSE bytes can precede the handler's terminal update.
+                self.assertTrue(service.wait_quiescent())
                 stats = service.snapshot()
                 self.assertTrue(stats["terminal"])
                 self.assertEqual((stats["model_rounds"], stats["searches"], stats["fetches"]), (3, 1, 1 if case == "short_research" else 2))

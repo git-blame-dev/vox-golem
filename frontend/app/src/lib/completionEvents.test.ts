@@ -2,6 +2,12 @@ import { describe, expect, it } from 'vitest'
 import { parseCompletionEvent } from './completionEvents'
 
 describe('parseCompletionEvent', () => {
+  it('bounds the single pending voice candidate by UTF-8 bytes, including multibyte suffixes', () => {
+    const payload = { source: 'voice', revision: 4, voice_session_id: 9, suffix: 'é'.repeat(128 * 1024) }
+    expect(parseCompletionEvent(payload).suffix).toBe(payload.suffix)
+    expect(() => parseCompletionEvent({ ...payload, suffix: `${payload.suffix}é` })).toThrow(/presentation budget/)
+    expect(() => parseCompletionEvent({ ...payload, suffix: 'x'.repeat(256 * 1024 + 1) })).toThrow(/presentation budget/)
+  })
   it('parses typed completion events', () => {
     expect(parseCompletionEvent({ source: 'typed', revision: 3, voice_session_id: null, suffix: ' draft' })).toEqual({
       source: 'typed', revision: 3, voiceSessionId: null, suffix: ' draft',

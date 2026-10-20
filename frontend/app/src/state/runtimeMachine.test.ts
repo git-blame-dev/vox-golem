@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { cueForTransition, transitionRuntimeStatus } from './runtimeMachine'
+import { transitionRuntimeStatus } from './runtimeMachine'
 
 describe('transitionRuntimeStatus', () => {
   it('transitions from listening to processing on end_listening', () => {
@@ -28,16 +28,5 @@ describe('transitionRuntimeStatus', () => {
 
   it('recovers from error back to sleeping', () => {
     expect(transitionRuntimeStatus('error', 'recover_from_error')).toBe('sleeping')
-  })
-})
-
-describe('cueForTransition', () => {
-  it('requests start-listening cue for sleeping to listening', () => {
-    expect(cueForTransition('sleeping', 'listening')).toBe('start_listening')
-  })
-
-  it('does not request a cue for unrelated transitions', () => {
-    expect(cueForTransition('listening', 'processing')).toBe(null)
-    expect(cueForTransition('processing', 'sleeping')).toBe(null)
   })
 })

@@ -32,28 +32,21 @@ import { SessionToolbar } from './components/SessionToolbar'
 import type { AndroidVoiceContext, AndroidVoiceStatus } from './lib/androidVoice'
 import { isConfirmedNewVoiceContext, NEW_VOICE_SHORTCUT_EVENT } from './lib/newVoiceShortcut'
 import { canonicalMessageId, replaceCommittedTranscript, settleCanonicalAnswerStages } from './committedTranscript'
-import { createNativeAudioLifecycle, playCueWithFallback, prepareVoiceCues } from './lib/audioCues'
 import { shouldSubmitComposer } from './lib/composer'
 import { listAudioInputDevices, startLiveAudioSource } from './lib/liveAudioSource'
 import { executePrompt } from './lib/promptExecution'
 import { mergeAnswerSources } from './lib/answerSources'
 import { appendCanonicalTurn, canonicalExecutionKey, isExpectedCanonicalTurn, loadAppSnapshot, parseAppSnapshot, parseAndroidConversationPage, parseAndroidHeadPage } from './lib/appSnapshot'
 import type { AppSnapshot, Capability, Turn, ValidatedPreferences } from './lib/appSnapshot'
-import {
-  ingestAudioFrame,
-  invokeRuntimeControl,
-} from './lib/runtimeControl'
-import type { RuntimeControlArgs } from './lib/runtimeControl'
+import { DesktopRuntimeObserver } from './lib/desktopRuntime'
+import type { DesktopRuntimeEvent, DesktopRuntimeSnapshot, NativePromptProjection, VoiceProjection, SpeechProjection } from './lib/desktopRuntime'
 import {
   CAPABILITY_IDS,
-  DEFAULT_CUE_ASSET_PATHS,
-  DEFAULT_INITIAL_SILENCE_TIMEOUT_MS,
-  DEFAULT_SILENCE_TIMEOUT_MS,
   isStartupStateSettled,
   loadStartupState,
   startupStateFromSnapshot,
 } from './lib/startupState'
-import { cacheAndroidSnapshot, getAndroidPreferencePublicationRevision, getTauriInternals, invokeTauriCommand, isAndroidRuntime, isBrowserPreviewRuntime, isNativeTauriRuntime } from './lib/tauri'
+import { cacheAndroidSnapshot, getAndroidPreferencePublicationRevision, getTauriInternals, invokeTauriCommand, isAndroidRuntime, isBrowserPreviewRuntime } from './lib/tauri'
 import { teardownBrowserPreviewRuntime } from './lib/browserRuntime'
 import { useAppUpdates } from './lib/useAppUpdates'
 import { instantOptions, parseAssistantSettings, serializeAssistantSettings } from './lib/assistantSettings'
@@ -61,20 +54,11 @@ import type { AssistantSettings } from './lib/assistantSettings'
 import { acceptsPartialTranscriptionEvent, parsePartialTranscriptionEvent } from './lib/partialTranscription'
 import { parseCompletionEvent } from './lib/completionEvents'
 import { createVoiceTelemetryRecorder } from './lib/voiceTelemetry'
-import { createWakeClipBuffer } from './lib/wakeClipBuffer'
-import {
-  createVoiceActivityState,
-  syncVoiceActivityState,
-  updateVoiceActivityState,
-} from './lib/voiceActivity'
-import { cueForTransition, transitionRuntimeStatus } from './state/runtimeMachine'
-import { firstNonEmptyStreamingLine, isValidTtsFirstLine } from './lib/ttsValidation'
+import { transitionRuntimeStatus } from './state/runtimeMachine'
 import type {
   BackendRuntimePhase,
   ChatMessage,
-  CueAssetPaths,
   PromptExecutionResult,
-  RuntimeControlResult,
   ResponseProfile,
   RuntimeStatus,
   StartupState,
@@ -85,24 +69,36 @@ import type {
 import './App.css'
 
 const NOTICE_AUTO_DISMISS_MS = 4_000
-const WAKE_CONFIDENCE_PEAK_HOLD_MS = 1_000
 const MAX_NOTICE_QUEUE_LENGTH = 3
 const ASSISTANT_SETTINGS_WRITE_FAILURE_TITLE = 'Assistant settings failed'
 
 type RuntimeDiagnosticKind =
   | 'frontend_notice'
-  | 'cue'
   | 'runtime_control'
   | 'execution'
   | 'tts'
   | 'audio'
   | 'profile'
 
+type CaptureContinuation = {
+  readonly lifetime: () => boolean
+  readonly inputRevision: number
+  readonly contextRevision: number
+  readonly retirement: Promise<void>
+}
+
 function useFrontendSessionRuntime(session: SessionAuthority) {
   useAuthorityView(session, 'runtime')
   const timingRef = session.operationRef('frontendTiming', () => new FrontendTiming())
   useLayoutEffect(() => { timingRef.current.startup('SHELL_DOM_COMMITTED') }, [timingRef])
   const supportsDesktopRuntime = !isAndroidRuntime && !isBrowserPreviewRuntime()
+  const [desktopRuntimeReady, setDesktopRuntimeReady] = session.fieldState('desktopRuntimeReady')
+  const desktopCaptureIdRef = session.operationRef<number | null>('desktopCaptureId', () => null)
+  const desktopCaptureErrorRef = session.operationRef<string | null>('desktopCaptureError', () => null)
+  const desktopAutoStartRef = session.operationRef('desktopAutoStart', () => false)
+  const desktopAutoStartConsumedRef = session.operationRef('desktopAutoStartConsumed', () => false)
+  const autoStopWriteRef = session.operationRef('autoStopWrite', () => 0)
+  const autoStopPendingRef = session.operationRef<number | null>('autoStopPending', () => null)
   const appUpdates = useAppUpdates()
   const updateRuntimeBlocked = appUpdateBlocksRuntime(appUpdates.state)
   const [startupState, setStartupState] = session.fieldState('startupState')
@@ -127,7 +123,6 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   const androidVoiceStatusRef = session.fieldRef('androidVoiceStatus')
   const [, setTtsEnabled] = session.fieldState('ttsEnabled')
   const ttsEnabledRef = session.fieldRef('ttsEnabled')
-  const ttsGenerationRef = session.audio.speechRevision
   const ttsPendingRevisionRef = session.preferences.tts.pending
   const [, setAndroidSpeechStatusError] = session.fieldState('androidSpeechStatusError')
   const onAndroidSpeechStatus = useCallback((status: AndroidVoiceStatus | null, statusError: string | null): void => {
@@ -154,7 +149,24 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   const [, setTypedCompletionSuffix] = session.fieldState('typedCompletionSuffix')
   const [, setVoiceCompletionSuffix] = session.fieldState('voiceCompletionSuffix')
   const [, setAutoStopOnSilence] = session.fieldState('autoStopOnSilence')
-  const [preparedCueAssetPaths, setPreparedCueAssetPaths] = session.fieldState('preparedCueAssetPaths')
+  const changeAutoStopOnSilence = (enabled: boolean): void => {
+    if (!supportsDesktopRuntime) { setAutoStopOnSilence(enabled); return }
+    const revision = ++autoStopWriteRef.current
+    autoStopPendingRef.current = revision
+    const lifetime = session.captureLifetime()
+    // Keep the last native-effective value until publication succeeds. Failed
+    // or superseded commands cannot manufacture a preference or roll it back.
+    void session.preferences.autoStop.enqueue(() => invokeTauriCommand('set_voice_auto_stop', { enabled })).then((value) => {
+      if (!lifetime() || autoStopPendingRef.current !== revision) return
+      if (typeof value !== 'boolean') throw new Error('Invalid native auto-stop response')
+      setAutoStopOnSilence(value)
+    }).catch(() => undefined).finally(() => {
+      if (!lifetime() || autoStopPendingRef.current !== revision) return
+      desktopObserverRef.current?.observer.invalidate()
+      autoStopPendingRef.current = null
+      void desktopObserverRef.current?.observer.refresh().catch(() => undefined)
+    })
+  }
   const [, setTtsPlaying] = session.fieldState('ttsPlaying')
   const [, setPendingTtsCommands] = session.fieldState('pendingTtsCommands')
   const [, setWakeConfidence] = session.fieldState('wakeConfidence')
@@ -198,13 +210,17 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   const [promptState, setPromptState] = session.fieldState('promptState')
   const [resetPending, setResetPending] = session.fieldState('resetPending')
   const promptRef = session.prompt.active
+  const desktopObserverRef = session.operationRef<{ observer: DesktopRuntimeObserver; ready: Promise<DesktopRuntimeSnapshot | null> } | null>('desktopObserver', () => null)
+  const desktopSnapshotRef = session.operationRef<(snapshot: DesktopRuntimeSnapshot) => void>('desktopSnapshot', () => () => undefined)
+  const desktopEventRef = session.operationRef<(event: DesktopRuntimeEvent) => void>('desktopEvent', () => () => undefined)
+  const desktopCanonicalReadRef = session.operationRef('desktopCanonicalRead', () => 0)
   const promptProjectionRevisionRef = session.prompt.revision
   const liveAudioSourceRef = session.audio.liveSource
   const liveAudioStartAbortRef = session.audio.startAbort
   const audioInputDeviceIdRef = session.fieldRef('audioInputDeviceId')
   const liveAudioSessionIdRef = session.audio.inputRevision
-  const liveAudioInFlightFramesRef = session.audio.inFlightFrames
-  const markSilenceInFlightRef = session.audio.silenceInFlight
+  const captureRetirementRef = session.operationRef<{ captureId: number | null; promise: Promise<void> } | null>('captureRetirement', () => null)
+  const profileCaptureContinuationRef = session.operationRef<CaptureContinuation | null>('profileCaptureContinuation', () => null)
   const initialSnapshotPreferencesRef = session.operationRef<ValidatedPreferences | null>('initialPreferences', () => null)
   const snapshotCapabilitiesRef = session.operationRef<readonly import('./types/chat').StartupCapability[] | null>('acceptedCapabilities', () => null)
   const snapshotResponseProfileRef = session.operationRef<ResponseProfile | null>('acceptedResponseProfile', () => null)
@@ -219,14 +235,12 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   const uiThemePendingRevisionRef = session.preferences.theme.pending
   const isSwitchingResponseProfileRef = session.fieldRef('isSwitchingResponseProfile')
   const appActiveRef = session.activeRef
-  const autoStopOnSilenceRef = session.fieldRef('autoStopOnSilence')
   const micAutoStartedRef = session.operationRef('micAutoStarted', () => false)
   const micStartInFlightRef = session.operationRef('micStartInFlight', () => false)
   const runtimeStatusRef = session.fieldRef('runtimeStatus')
   const runtimeActivityRevisionRef = session.operationRef('runtimeRevision', () => 0)
   const snapshotRuntimeHydratedRef = session.operationRef('runtimeHydrated', () => false)
   const startupStateRef = session.fieldRef('startupState')
-  const voiceActivityStateRef = session.operationRef('voiceActivity', createVoiceActivityState)
   const voiceTelemetryRef = session.operationRef<ReturnType<typeof createVoiceTelemetryRecorder> | null>('voiceTelemetry', () => null)
   const partialTranscriptionRef = session.operationRef<{
     sessionId: number
@@ -234,10 +248,12 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     active: boolean
   } | null>('partialTranscription', () => null)
   const partialTranscriptionAllowedRef = session.operationRef('partialAllowed', () => false)
-  const expectedPartialSessionIdRef = session.operationRef('partialSessionRevision', () => 0)
   const completionRevisionRef = session.operationRef('completionRevision', () => 0)
   const latestTypedCompletionRef = session.operationRef<{ revision: number; lifecycle: number } | null>('typedCompletion', () => null)
   const completionLifecycleRef = session.operationRef('completionLifecycle', () => 0)
+  const pendingVoiceCompletionRef = session.operationRef<{
+    sessionId: number; revision: number; suffix: string | null; lifecycle: number; context: number; closed: boolean
+  } | null>('pendingVoiceCompletion', () => null)
   const resetPendingRef = session.fieldRef('resetPending')
   const transcriptRevisionRef = session.selection.contextRevision
   const canonicalTranscriptRef = session.selection.transcript
@@ -271,34 +287,10 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       setMessages((current) => replaceCommittedTranscript(current, snapshot.transcript))
     }
   }, [androidAssistantRef, canonicalTranscriptRef, composerEditRevisionRef, restoredDraftAnnouncementRef, setAndroidAssistant, setAndroidConversationId, setComposerValue, setMessages, setResponseAnnouncement, shortcutDraftRef, snapshotSessionIdRef, timingRef])
-  const cuePlayerRef = session.audio.cues
-  const nativeAudioLifecycleRef = session.operationRef('nativeAudioLifecycle', createNativeAudioLifecycle)
-  useEffect(() => {
-    if (!supportsDesktopRuntime) return
-    cuePlayerRef.current.stop()
-    const player = nativeAudioLifecycleRef.current.createCuePlayer()
-    cuePlayerRef.current = player
-    const setActive = (active: boolean): void => nativeAudioLifecycleRef.current.setActive(active)
-    const visibilityChanged = (): void => {
-      setActive(!document.hidden)
-    }
-    visibilityChanged()
-    document.addEventListener('visibilitychange', visibilityChanged)
-    return () => {
-      document.removeEventListener('visibilitychange', visibilityChanged)
-      setActive(false)
-      player.retire()
-    }
-  }, [cuePlayerRef, nativeAudioLifecycleRef, supportsDesktopRuntime])
-  const cueAssetPathsRef = session.operationRef<CueAssetPaths>('cuePaths', () => DEFAULT_CUE_ASSET_PATHS)
-  const fallbackCueAssetPathsRef = session.operationRef<CueAssetPaths>('fallbackCuePaths', () => DEFAULT_CUE_ASSET_PATHS)
   const ttsPersistedRevisionRef = session.preferences.tts.persistedRevision
   const ttsPersistedValueRef = session.preferences.tts.persisted
   const ttsPersistedInitializedRef = session.preferences.tts.initialized
   const ttsWriteRevisionRef = session.preferences.tts.revision
-  const wakeConfidenceRef = session.fieldRef('wakeConfidence')
-  const pendingWakeConfidenceRef = session.operationRef<number | null>('wakeConfidencePending', () => null)
-  const wakeConfidenceHoldRef = session.operationRef<number | null>('wakeConfidenceTimer', () => null)
 
   const publishRuntimeStatus = useCallback((nextStatus: RuntimeStatus, claimActivity: boolean): RuntimeStatus => {
     if (claimActivity) runtimeActivityRevisionRef.current += 1
@@ -316,7 +308,89 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     let latestRuntimeActivityRevision: number | null = null
     for (let attempt = 0; attempt < 3 && latest.activeRequest !== null; attempt += 1) {
       if (!appActiveRef.current || !isCurrent() || transcriptRevision !== transcriptRevisionRef.current) return
-      await invokeTauriCommand('cancel_prompt', { requestId: latest.activeRequest.requestId }).catch(() => undefined)
+      if (supportsDesktopRuntime) {
+        // A native receipt is not a crashed renderer's typed command. Establish
+        // observation before orphan recovery; unknown ownership fails closed.
+        const observation = desktopObserverRef.current
+        if (observation === null) return
+        try {
+          await observation.ready
+          const root = await observation.observer.refresh()
+          if (!appActiveRef.current || !isCurrent() || transcriptRevision !== transcriptRevisionRef.current) return
+          if (root === null) return
+          if (root.prompt?.requestId === latest.activeRequest.requestId &&
+            root.prompt.executionId.sessionId === latest.activeRequest.executionId.sessionId &&
+            root.prompt.executionId.generation === latest.activeRequest.executionId.generation) {
+            desktopSnapshotRef.current(root)
+            return
+          }
+          const queriedRequest = latest.activeRequest
+          const executionId = queriedRequest.executionId
+          const owner = await invokeTauriCommand('get_desktop_request_owner', {
+            requestId: queriedRequest.requestId,
+            executionId: { session_id: executionId.sessionId, generation: executionId.generation },
+          })
+          if (!appActiveRef.current || !isCurrent() || transcriptRevision !== transcriptRevisionRef.current) return
+          if (owner === null) {
+            const history = canonicalTranscriptRef.current
+            const selectedSession = snapshotSessionIdRef.current
+            const runtimeRevision = runtimeActivityRevisionRef.current
+            const canonical = await loadAppSnapshot()
+            if (!appActiveRef.current || !isCurrent() || transcriptRevision !== transcriptRevisionRef.current ||
+              history !== canonicalTranscriptRef.current || selectedSession !== snapshotSessionIdRef.current) return
+            const current = canonical.activeRequest
+            if (current?.requestId === queriedRequest.requestId && current.executionId.sessionId === executionId.sessionId &&
+              current.executionId.generation === executionId.generation) return
+
+            // Null also means this exact execution retired while hydration was
+            // in flight. Reconcile A; a successor is never a new cancel target.
+            const turn = canonical.transcript.find((item) => item.requestId === queriedRequest.requestId &&
+              item.executionId.sessionId === executionId.sessionId && item.executionId.generation === executionId.generation)
+            const projection = promptRef.current
+            if (projection?.nativeOwned && projection.id === queriedRequest.requestId &&
+              projection.executionId?.sessionId === executionId.sessionId && projection.executionId.generation === executionId.generation) {
+              session.prompt.finishNative(projection.id, { requestId: projection.id, runtimePhase: canonical.runtimePhase,
+                outcome: turn === undefined ? 'cancelled' : 'completed', errorMessage: null,
+                ...(turn === undefined ? {} : { canonicalTurn: turn }) })
+              return
+            }
+            if (projection !== null && canonical.sessionId !== selectedSession) return
+            // B already attached through its native receipt: add only A's
+            // committed turn and preserve B's existing presentation resources.
+            const transcript = projection === null ? canonical.transcript : appendCanonicalTurn(history, turn)
+            canonicalTranscriptRef.current = transcript
+            if (projection === null) snapshotSessionIdRef.current = canonical.sessionId
+            setMessages((messages) => [
+              ...replaceCommittedTranscript(messages, transcript),
+              ...(projection === null ? [] : messages.filter((message) => message.id === projection.userId || message.id === projection.assistantId)),
+            ])
+            snapshotRuntimeHydratedRef.current = true
+            if (projection === null) {
+              if (runtimeRevision === runtimeActivityRevisionRef.current) publishRuntimeStatus(toRuntimeStatus(canonical.runtimePhase), false)
+              setPromptActivity(null)
+              setPromptState('idle')
+              if (current !== null) await observation.observer.refresh().catch(() => undefined)
+            }
+            return
+          }
+          if (promptRef.current?.nativeOwned === true) return
+          // Canonical admission can precede observation publication. Absence of
+          // a projection is not renderer ownership; await its actual receipt.
+          if (owner !== 'renderer') return
+        } catch {
+          if (!appActiveRef.current || !isCurrent() || transcriptRevision !== transcriptRevisionRef.current || promptRef.current?.nativeOwned === true) return
+          setPromptState('reconciling')
+          setPromptActivity({ text: 'Native session observation unavailable. Use New Chat to recover.', compact: false })
+          return
+        }
+      }
+      await invokeTauriCommand('cancel_prompt', {
+        requestId: latest.activeRequest.requestId,
+        ...(supportsDesktopRuntime ? { expectedExecutionId: {
+          session_id: latest.activeRequest.executionId.sessionId,
+          generation: latest.activeRequest.executionId.generation,
+        } } : {}),
+      }).catch(() => undefined)
       if (!appActiveRef.current || !isCurrent() || transcriptRevision !== transcriptRevisionRef.current) return
       try {
         const runtimeActivityRevision = runtimeActivityRevisionRef.current
@@ -326,6 +400,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         if (attempt < 2) await new Promise((resolve) => window.setTimeout(resolve, 250 * (attempt + 1)))
       }
       if (!appActiveRef.current || !isCurrent() || transcriptRevision !== transcriptRevisionRef.current) return
+      if (supportsDesktopRuntime && promptRef.current?.nativeOwned === true) return
       if (latest.activeRequest !== null && attempt < 2) {
         await new Promise((resolve) => window.setTimeout(resolve, 250 * (attempt + 1)))
       }
@@ -346,50 +421,14 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     }
     setPromptActivity(null)
     setPromptState('idle')
-  }, [androidDraftPendingRef, appActiveRef, canonicalTranscriptRef, composerValueRef, persistAndroidDraftRef, publishRuntimeStatus, runtimeActivityRevisionRef, setMessages, setPromptActivity, setPromptState, snapshotRuntimeHydratedRef, snapshotSessionIdRef, transcriptRevisionRef])
-
-  const cancelTts = useCallback((): void => {
-    session.audio.cancelSpeech((playbackId) => invokeTauriCommand('finish_tts_playback', { playbackId }), () => setTtsPlaying(false))
-  }, [session, setTtsPlaying])
+  }, [androidDraftPendingRef, appActiveRef, canonicalTranscriptRef, composerValueRef, desktopObserverRef, desktopSnapshotRef, persistAndroidDraftRef, promptRef, publishRuntimeStatus, runtimeActivityRevisionRef, session, setMessages, setPromptActivity, setPromptState, snapshotRuntimeHydratedRef, snapshotSessionIdRef, supportsDesktopRuntime, transcriptRevisionRef])
 
   const resetWakeConfidence = (): void => {
-    if (wakeConfidenceHoldRef.current !== null) {
-      window.clearTimeout(wakeConfidenceHoldRef.current)
-      wakeConfidenceHoldRef.current = null
-    }
-    wakeConfidenceRef.current = null
-    pendingWakeConfidenceRef.current = null
     setWakeConfidence(null)
   }
 
-  const updateWakeConfidence = (nextConfidence: number): void => {
-    if (!Number.isFinite(nextConfidence) || nextConfidence < 0 || nextConfidence > 1) return
-    if (wakeConfidenceRef.current === null || nextConfidence > wakeConfidenceRef.current) {
-      if (wakeConfidenceHoldRef.current !== null) {
-        window.clearTimeout(wakeConfidenceHoldRef.current)
-      }
-      wakeConfidenceRef.current = nextConfidence
-      pendingWakeConfidenceRef.current = nextConfidence
-      setWakeConfidence(nextConfidence)
-      wakeConfidenceHoldRef.current = window.setTimeout(() => {
-        wakeConfidenceHoldRef.current = null
-        wakeConfidenceRef.current = pendingWakeConfidenceRef.current
-        setWakeConfidence(pendingWakeConfidenceRef.current)
-      }, WAKE_CONFIDENCE_PEAK_HOLD_MS)
-      return
-    }
-
-    pendingWakeConfidenceRef.current = nextConfidence
-    if (wakeConfidenceHoldRef.current === null) {
-      wakeConfidenceHoldRef.current = window.setTimeout(() => {
-        wakeConfidenceHoldRef.current = null
-        wakeConfidenceRef.current = pendingWakeConfidenceRef.current
-        setWakeConfidence(pendingWakeConfidenceRef.current)
-      }, WAKE_CONFIDENCE_PEAK_HOLD_MS)
-    }
-  }
-
   useEffect(() => {
+    if (supportsDesktopRuntime) return undefined
     const tauri = getTauriInternals()
     if (tauri?.listen === undefined) return undefined
     let active = true
@@ -400,7 +439,6 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         const parsed = parsePartialTranscriptionEvent(event.payload)
         if (!partialTranscriptionAllowedRef.current) return
         if (!acceptsPartialTranscriptionEvent(partialTranscriptionRef.current, parsed)) return
-        expectedPartialSessionIdRef.current = parsed.sessionId
         partialTranscriptionRef.current = {
           sessionId: parsed.sessionId,
           revision: parsed.revision,
@@ -415,7 +453,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       }
     }).then((cleanup) => active ? (unlisten = cleanup) : cleanup()).catch(() => undefined)
     return () => { active = false; unlisten?.() }
-  }, [expectedPartialSessionIdRef, partialTranscriptionAllowedRef, partialTranscriptionRef, setPartialTranscript, setVoiceCompletionSuffix])
+  }, [partialTranscriptionAllowedRef, partialTranscriptionRef, setPartialTranscript, setVoiceCompletionSuffix, supportsDesktopRuntime])
 
   useEffect(() => {
     const tauri = getTauriInternals()
@@ -432,23 +470,44 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
           latestTypedCompletionRef.current = null
           if (active) setTypedCompletionSuffix(parsed.suffix ?? '')
         } else {
+          const candidate = pendingVoiceCompletionRef.current
+          if (candidate?.closed === true && candidate.sessionId === parsed.voiceSessionId) return
           const transcript = partialTranscriptionRef.current
-          if (transcript === null || !transcript.active || parsed.revision !== transcript.revision || parsed.voiceSessionId !== transcript.sessionId) return
-          if (active) setVoiceCompletionSuffix(parsed.suffix ?? '')
+          if (transcript?.sessionId === parsed.voiceSessionId) {
+            if (!transcript.active || parsed.revision < transcript.revision) return
+            if (parsed.revision === transcript.revision) {
+              pendingVoiceCompletionRef.current = null
+              setVoiceCompletionSuffix(parsed.suffix ?? '')
+              return
+            }
+          }
+          if (!supportsDesktopRuntime || resetPendingRef.current) return
+          pendingVoiceCompletionRef.current = {
+            sessionId: parsed.voiceSessionId!, revision: parsed.revision, suffix: parsed.suffix,
+            lifecycle: completionLifecycleRef.current, context: transcriptRevisionRef.current, closed: false,
+          }
         }
       } catch { return }
     }).then((cleanup) => active ? (unlisten = cleanup) : cleanup()).catch(() => undefined)
     return () => { active = false; unlisten?.() }
-  }, [completionLifecycleRef, latestTypedCompletionRef, partialTranscriptionRef, setTypedCompletionSuffix, setVoiceCompletionSuffix])
+  }, [completionLifecycleRef, latestTypedCompletionRef, partialTranscriptionRef, pendingVoiceCompletionRef, resetPendingRef, setTypedCompletionSuffix, setVoiceCompletionSuffix, supportsDesktopRuntime, transcriptRevisionRef])
 
   const clearPartialTranscript = useCallback((): void => {
     partialTranscriptionAllowedRef.current = false
     if (partialTranscriptionRef.current !== null) {
       partialTranscriptionRef.current = { ...partialTranscriptionRef.current, active: false }
+    } else if (pendingVoiceCompletionRef.current !== null) {
+      const candidate = pendingVoiceCompletionRef.current
+      partialTranscriptionRef.current = { sessionId: candidate.sessionId, revision: candidate.revision, active: false }
+    }
+    if (pendingVoiceCompletionRef.current !== null) {
+      // Retain only the retired identity, not its suffix, so a repeated event
+      // cannot masquerade as a new post-reset/endpoint candidate.
+      pendingVoiceCompletionRef.current = { ...pendingVoiceCompletionRef.current, suffix: null, closed: true }
     }
     setPartialTranscript('')
     setVoiceCompletionSuffix('')
-  }, [partialTranscriptionAllowedRef, partialTranscriptionRef, setPartialTranscript, setVoiceCompletionSuffix])
+  }, [partialTranscriptionAllowedRef, partialTranscriptionRef, pendingVoiceCompletionRef, setPartialTranscript, setVoiceCompletionSuffix])
 
   const cancelPrompt = useCallback((): void => {
     if (isAndroidRuntime && androidVoiceActiveRef.current) androidVoiceStopRef.current?.()
@@ -457,9 +516,8 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     androidVoiceInputEpochRef.current += 1
     pendingAndroidVoiceRequestRef.current = null
     clearPartialTranscript()
-    cancelTts()
     void invokeTauriCommand('cancel_prompt', { requestId: cancellation.requestId }).catch(cancellation.recover)
-  }, [androidVoiceActiveRef, androidVoiceInputEpochRef, androidVoiceStopRef, cancelTts, clearPartialTranscript, pendingAndroidVoiceRequestRef, session])
+  }, [androidVoiceActiveRef, androidVoiceInputEpochRef, androidVoiceStopRef, clearPartialTranscript, pendingAndroidVoiceRequestRef, session])
 
   const clearCompletionDisplay = (): void => {
     completionLifecycleRef.current += 1
@@ -669,7 +727,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         canonicalTranscriptRef.current = snapshot.transcript
         const coldDraftPending = isAndroidRuntime && androidAssistantRef.current === null && androidDraftPendingRef.current !== null
         adoptAndroidConversation(snapshot, coldDraftPending ? -1 : composerRevision, false)
-        const activeRequestMessage: ChatMessage[] = snapshot.activeRequest === null ? [] : [{
+        const activeRequestMessage: ChatMessage[] = snapshot.activeRequest === null || supportsDesktopRuntime ? [] : [{
           id: `recovered-user-${snapshot.activeRequest.executionId.sessionId}-${snapshot.activeRequest.executionId.generation}`,
           role: 'user',
           content: snapshot.activeRequest.prompt,
@@ -686,6 +744,10 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         snapshotHydrationStateRef.current = 'succeeded'
         setSnapshotHydrationState('succeeded')
         timingRef.current.startup('INITIAL_SNAPSHOT_APPLIED')
+        if (supportsDesktopRuntime && snapshot.activeRequest === null) {
+          const observation = desktopObserverRef.current
+          if (observation !== null) void observation.ready.then(() => observation.observer.refresh()).catch(() => undefined)
+        }
         if (snapshot.activeRequest === null && androidDraftPendingRef.current !== null) persistAndroidDraftRef.current(composerValueRef.current)
         if (snapshot.activeRequest === null && !resetPendingRef.current && promptRef.current === null) {
           setPromptActivity(null)
@@ -731,7 +793,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       active = false
       if (retryTimer !== null) window.clearTimeout(retryTimer)
     }
-  }, [adoptAndroidConversation, adoptSnapshotControls, androidAssistantRef, androidDraftPendingRef, canonicalTranscriptRef, composerEditRevisionRef, composerValueRef, persistAndroidDraftRef, promptRef, recoverOrphanedRequest, resetPendingRef, runtimeActivityRevisionRef, setMessages, setPromptActivity, setPromptState, setSnapshotControlsFresh, setSnapshotControlsInvalidated, setSnapshotHydrationState, setTtsEnabled, snapshotControlRequestRevisionRef, snapshotControlsFreshRef, snapshotControlsInvalidatedRef, snapshotHydrationStateRef, snapshotRuntimeHydratedRef, snapshotSessionIdRef, startupStateRef, synchronizeHydratedRuntimeStatus, timingRef, transcriptRevisionRef, ttsEnabledRef, ttsPersistedInitializedRef, ttsPersistedValueRef, ttsWriteRevisionRef])
+  }, [adoptAndroidConversation, adoptSnapshotControls, androidAssistantRef, androidDraftPendingRef, canonicalTranscriptRef, composerEditRevisionRef, composerValueRef, desktopObserverRef, persistAndroidDraftRef, promptRef, recoverOrphanedRequest, resetPendingRef, runtimeActivityRevisionRef, setMessages, setPromptActivity, setPromptState, setSnapshotControlsFresh, setSnapshotControlsInvalidated, setSnapshotHydrationState, setTtsEnabled, snapshotControlRequestRevisionRef, snapshotControlsFreshRef, snapshotControlsInvalidatedRef, snapshotHydrationStateRef, snapshotRuntimeHydratedRef, snapshotSessionIdRef, startupStateRef, supportsDesktopRuntime, synchronizeHydratedRuntimeStatus, timingRef, transcriptRevisionRef, ttsEnabledRef, ttsPersistedInitializedRef, ttsPersistedValueRef, ttsWriteRevisionRef])
 
   useEffect(() => {
     if (!isAndroidRuntime) return undefined
@@ -917,24 +979,6 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     return () => { active = false }
   }, [addNotice, assistantSettingsPendingRef, assistantSettingsRef, assistantSettingsWriteRevisionRef, persistedAssistantSettingsRef, setAssistantSettings, setAssistantSettingsLoadError, setAssistantSettingsPending, snapshotHydrationState])
 
-  const voiceCuesCanPrepare = startupState.kind === 'ready' && capabilityIsAvailable(startupState, 'tts')
-  useEffect(() => {
-    if (!voiceCuesCanPrepare || !isNativeTauriRuntime() || preparedCueAssetPaths !== null) return
-    let active = true
-    let attempts = 0
-    let retry: ReturnType<typeof setTimeout> | null = null
-    const prepare = (): void => {
-      attempts += 1
-      void prepareVoiceCues()
-        .then((paths) => { if (active) setPreparedCueAssetPaths(paths) })
-        .catch(() => {
-          if (active && attempts < 3) retry = setTimeout(prepare, 2_000)
-        })
-    }
-    prepare()
-    return () => { active = false; if (retry !== null) clearTimeout(retry) }
-  }, [voiceCuesCanPrepare, preparedCueAssetPaths, setPreparedCueAssetPaths])
-
   useEffect(() => {
     const onEscape = (event: globalThis.KeyboardEvent) => {
       if (
@@ -1032,30 +1076,6 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     if (nextTheme !== uiTheme) void persistUiTheme(nextTheme, uiTheme)
   }
 
-  const currentSilenceTimeoutMs = (): number => {
-    if (
-      startupStateRef.current.kind === 'ready' ||
-      startupStateRef.current.kind === 'warming_model'
-    ) {
-      return startupStateRef.current.silenceTimeoutMs
-    }
-
-    return DEFAULT_SILENCE_TIMEOUT_MS
-  }
-
-  const currentInitialSilenceTimeoutMs = (): number => {
-    if (startupStateRef.current.kind === 'ready' || startupStateRef.current.kind === 'warming_model') {
-      return startupStateRef.current.initialSilenceTimeoutMs
-    }
-    return DEFAULT_INITIAL_SILENCE_TIMEOUT_MS
-  }
-
-  const waitForInFlightLiveAudioFrames = async (): Promise<void> => {
-    while (appActiveRef.current && liveAudioInFlightFramesRef.current > 0) {
-      await new Promise((resolve) => setTimeout(resolve, 10))
-    }
-  }
-
   const applyStartupState = useCallback((
     nextState: StartupState,
     syncRuntimeStatus = true,
@@ -1084,6 +1104,11 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     }
     startupStateRef.current = publishedState
     setStartupState(publishedState)
+    if (publishedState.kind === 'ready' && publishedState.capabilities.every(({ id, state }) =>
+      ['wake_word', 'vad', 'parakeet', 'tts'].includes(id) || !['not_configured', 'unavailable', 'failed'].includes(state))) {
+      setNotices((current) => current.some((notice) => notice.title === 'Startup capabilities unavailable')
+        ? current.filter((notice) => notice.title !== 'Startup capabilities unavailable') : current)
+    }
     const startupTtsStateIsFresh =
       snapshotHydrationStateRef.current !== 'succeeded' ||
       startupSnapshotRevision === snapshotHydrationRevisionRef.current
@@ -1119,7 +1144,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       }
     }
     return publishedState
-  }, [publishRuntimeStatus, setStartupState, setTtsEnabled, snapshotCapabilitiesRef, snapshotHydrationRevisionRef, snapshotHydrationStateRef, snapshotResponseProfileRef, startupStateRef, synchronizeHydratedRuntimeStatus, ttsEnabledRef, ttsPersistedInitializedRef, ttsPersistedValueRef, ttsWriteRevisionRef])
+  }, [publishRuntimeStatus, setNotices, setStartupState, setTtsEnabled, snapshotCapabilitiesRef, snapshotHydrationRevisionRef, snapshotHydrationStateRef, snapshotResponseProfileRef, startupStateRef, synchronizeHydratedRuntimeStatus, ttsEnabledRef, ttsPersistedInitializedRef, ttsPersistedValueRef, ttsWriteRevisionRef])
 
   const startupLoadAllowed = !isAndroidRuntime || snapshotHydrationState !== 'pending'
   useEffect(() => {
@@ -1201,11 +1226,9 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   }, [addNotice, applyStartupState, isSwitchingResponseProfileRef, observeDesktopStartupRef, runtimeActivityRevisionRef, runtimeStatusRef, snapshotHydrationRevisionRef, snapshotRuntimeHydratedRef, startupLoadAllowed, startupStateRef])
 
   useEffect(() => {
-    const cuePlayer = cuePlayerRef.current
     session.activate(() => {
       if (import.meta.env.VITE_VOXGOLEM_BENCHMARK === '1') reportAppBenchmarkStage('benchmark_lifetime_retire')
       timingRef.current.retireRequest()
-      cuePlayer.stop()
       const activePrompt = promptRef.current
       if (activePrompt !== null) {
         if (activePrompt.renderFrameId !== null) window.cancelAnimationFrame(activePrompt.renderFrameId)
@@ -1214,27 +1237,55 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         activePrompt.terminal = true
       }
       promptRef.current = null
-      cancelTts()
-      if (wakeConfidenceHoldRef.current !== null) {
-        window.clearTimeout(wakeConfidenceHoldRef.current)
-      }
-      wakeConfidenceHoldRef.current = null
-      pendingWakeConfidenceRef.current = null
+      session.prompt.detachNative()
       partialTranscriptionAllowedRef.current = false
       partialTranscriptionRef.current = null
+      pendingVoiceCompletionRef.current = null
       completionLifecycleRef.current += 1
       latestTypedCompletionRef.current = null
       micStartInFlightRef.current = false
       micAutoStartedRef.current = false
       liveAudioSessionIdRef.current += 1
-      liveAudioStartAbortRef.current?.abort()
+      if (!supportsDesktopRuntime) liveAudioStartAbortRef.current?.abort()
       liveAudioStartAbortRef.current = null
-      liveAudioSourceRef.current?.stop()
+      if (supportsDesktopRuntime) liveAudioSourceRef.current?.detach()
+      else liveAudioSourceRef.current?.stop()
       liveAudioSourceRef.current = null
       if (isBrowserPreviewRuntime()) teardownBrowserPreviewRuntime()
     })
     return () => session.dispose()
-  }, [cancelTts, completionLifecycleRef, cuePlayerRef, latestTypedCompletionRef, liveAudioSessionIdRef, liveAudioSourceRef, liveAudioStartAbortRef, micAutoStartedRef, micStartInFlightRef, partialTranscriptionAllowedRef, partialTranscriptionRef, pendingWakeConfidenceRef, promptRef, session, timingRef, wakeConfidenceHoldRef])
+  }, [completionLifecycleRef, latestTypedCompletionRef, liveAudioSessionIdRef, liveAudioSourceRef, liveAudioStartAbortRef, micAutoStartedRef, micStartInFlightRef, partialTranscriptionAllowedRef, partialTranscriptionRef, pendingVoiceCompletionRef, promptRef, session, supportsDesktopRuntime, timingRef])
+
+  useEffect(() => {
+    if (!supportsDesktopRuntime) return
+    const tauri = getTauriInternals()
+    if (tauri?.listen === undefined) return
+    const observer = new DesktopRuntimeObserver({
+      listen: (receive) => tauri.listen!('desktop-runtime-changed', (event) => receive(event.payload)),
+      read: (sinceRevision) => tauri.invoke('read_desktop_runtime', { sinceRevision }),
+      snapshot: (snapshot) => desktopSnapshotRef.current(snapshot),
+      event: (event) => desktopEventRef.current(event),
+      error: () => {
+        setDesktopRuntimeReady(false)
+        // Loss of observation neither retires native work nor sends Stop.
+        if (appActiveRef.current && promptRef.current?.nativeOwned) {
+          setPromptActivity({ text: 'Reconnecting to native response…', compact: true })
+        }
+      },
+    })
+    const ready = observer.start()
+    desktopObserverRef.current = { observer, ready }
+    void ready.catch(() => undefined)
+    const reconnect = (): void => { void observer.refresh().catch(() => undefined) }
+    window.addEventListener('focus', reconnect)
+    window.addEventListener('online', reconnect)
+    return () => {
+      window.removeEventListener('focus', reconnect)
+      window.removeEventListener('online', reconnect)
+      observer.stop()
+      desktopObserverRef.current = null
+    }
+  }, [appActiveRef, desktopEventRef, desktopObserverRef, desktopSnapshotRef, promptRef, setDesktopRuntimeReady, setPromptActivity, supportsDesktopRuntime])
 
   useEffect(() => {
     if (!settingsOpen || !supportsDesktopRuntime) {
@@ -1266,14 +1317,6 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   const voiceSnapshotControlsUsableNow = (): boolean => snapshotControlsFreshRef.current || (
     !snapshotControlsInvalidatedRef.current && snapshotHydrationStateRef.current === 'pending'
   )
-  const fallbackCueAssetPaths = startupState.kind === 'ready'
-    ? startupState.cueAssetPaths
-    : DEFAULT_CUE_ASSET_PATHS
-  const cueAssetPaths = preparedCueAssetPaths ?? fallbackCueAssetPaths
-  useEffect(() => {
-    cueAssetPathsRef.current = cueAssetPaths
-    fallbackCueAssetPathsRef.current = fallbackCueAssetPaths
-  }, [cueAssetPaths, cueAssetPathsRef, fallbackCueAssetPaths, fallbackCueAssetPathsRef])
   const assistantControlsDisabled = startupState.kind !== 'ready' || assistantSettingsPending || isSwitchingResponseProfile || !snapshotControlsFresh || updateRuntimeBlocked || androidVoiceActive
   const instantControlsDisabled = assistantControlsDisabled || resetPending || promptState !== 'idle' ||
     runtimeStatus === 'processing' || runtimeStatus === 'executing'
@@ -1325,48 +1368,36 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     const revision = ++instantSelectionRevisionRef.current
     const option = instantAssistantOptions.find((item) => item.value === instant)
     if (!option || (!option.available && !localInstantCanRetry(startupStateRef.current, instant))) return
-    let previousProfile: ResponseProfile | null = null
-    let switchedProfile = false
-    if (instant === 'local-fast' || instant === 'local-quality') {
-      const profile = instant === 'local-fast' ? 'fast' : 'quality'
-      if (startupState.kind !== 'ready') return
-      previousProfile = startupState.selectedResponseProfile
-      if (previousProfile !== profile || localInstantCanRetry(startupStateRef.current, instant)) {
-        if (!await switchResponseProfile(profile)) return
-        switchedProfile = true
+    try {
+      let previousProfile: ResponseProfile | null = null
+      let switchedProfile = false
+      if (instant === 'local-fast' || instant === 'local-quality') {
+        const profile = instant === 'local-fast' ? 'fast' : 'quality'
+        if (startupState.kind !== 'ready') return
+        previousProfile = startupState.selectedResponseProfile
+        if (previousProfile !== profile || localInstantCanRetry(startupStateRef.current, instant)) {
+          if (!await switchResponseProfile(profile)) return
+          switchedProfile = true
+        }
+        if (revision !== instantSelectionRevisionRef.current) return
+        if (startupStateRef.current.kind !== 'ready' || startupStateRef.current.selectedResponseProfile !== profile) return
       }
       if (revision !== instantSelectionRevisionRef.current) return
-      if (startupStateRef.current.kind !== 'ready' || startupStateRef.current.selectedResponseProfile !== profile) return
-    }
-    if (revision !== instantSelectionRevisionRef.current) return
-    const persisted = await persistAssistantSettings({ ...assistantSettingsRef.current, instant })
-    if (!persisted && revision === instantSelectionRevisionRef.current && switchedProfile && previousProfile !== null) {
-      await switchResponseProfile(previousProfile)
+      const persisted = await persistAssistantSettings({ ...assistantSettingsRef.current, instant })
+      if (!persisted && revision === instantSelectionRevisionRef.current && switchedProfile && previousProfile !== null) {
+        await switchResponseProfile(previousProfile)
+      }
+    } finally {
+      const intent = profileCaptureContinuationRef.current
+      profileCaptureContinuationRef.current = null
+      if (intent !== null && revision === instantSelectionRevisionRef.current) await resumeUserCapture(intent)
     }
   }
 
-
-  const reportCuePlaybackError = (cueType: 'start_listening' | 'stop_listening', error: unknown): void => {
-    const message = error instanceof Error ? error.message : 'Unknown cue playback error'
-
-    console.error('[cue] playback failure', {
-      cueType,
-      runtimeStatus: runtimeStatusRef.current,
-    })
-
-    recordRuntimeDiagnostic(
-      'cue',
-      `Cue playback error: ${message} [cue=${cueType}]`,
-    )
-    addNotice({
-      tone: 'error',
-      title: 'Cue playback failed',
-      message,
-    })
-  }
 
   const applyRuntimeStatus = (nextStatus: RuntimeStatus): RuntimeStatus => {
     const previousStatus = publishRuntimeStatus(nextStatus, true)
+    if (supportsDesktopRuntime) return nextStatus
 
     if (nextStatus === previousStatus) {
       return previousStatus
@@ -1374,50 +1405,12 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
 
     if (nextStatus === 'listening' && previousStatus !== 'listening') {
       resetWakeConfidence()
-      expectedPartialSessionIdRef.current += 1
-      partialTranscriptionRef.current = {
-        sessionId: expectedPartialSessionIdRef.current,
-        revision: 0,
-        active: true,
-      }
+      partialTranscriptionRef.current = null
       partialTranscriptionAllowedRef.current = true
     } else if (nextStatus !== 'listening') {
       partialTranscriptionAllowedRef.current = false
-      voiceActivityStateRef.current = createVoiceActivityState()
       resetWakeConfidence()
       clearPartialTranscript()
-    }
-
-    const cueType = cueForTransition(previousStatus, nextStatus)
-
-    if (cueType !== null) {
-      voiceTelemetry.record('cue_play_requested', {
-        details: {
-          cueType,
-          source: 'apply_runtime_status',
-        },
-      })
-
-       void playCueWithFallback(cueType, cueAssetPathsRef.current, fallbackCueAssetPathsRef.current, cuePlayerRef.current)
-        .then((started) => {
-          if (started) voiceTelemetry.record('cue_play_started', {
-            details: {
-              cueType,
-              source: 'apply_runtime_status',
-            },
-          })
-        })
-        .catch((error: unknown) => {
-          if (import.meta.env.VITE_VOXGOLEM_BENCHMARK === '1') reportAppBenchmarkStage('benchmark_cue_error')
-          console.error('[cue] playback failure while applying runtime status', {
-            cueType,
-            runtimeStatusBefore: previousStatus,
-            runtimeStatusAfter: nextStatus,
-          })
-
-          enterRuntimeError()
-          reportCuePlaybackError(cueType, error)
-        })
     }
 
     return nextStatus
@@ -1428,166 +1421,27 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     event: Parameters<typeof transitionRuntimeStatus>[1],
   ): RuntimeStatus => applyRuntimeStatus(transitionRuntimeStatus(previousStatus, event))
 
-  const recordRuntimeControlTelemetry = (runtimePhase: RuntimeControlResult): void => {
-    const telemetry = runtimePhase.telemetry
-
-    if (telemetry === null) {
-      return
-    }
-
-    if (telemetry.backendIngestStartedMs !== null) {
-      voiceTelemetry.record('backend_ingest_started', {
-        atMs: telemetry.backendIngestStartedMs,
-        frameId: telemetry.frameId,
-      })
-    }
-
-    if (telemetry.backendIngestCompletedMs !== null) {
-      voiceTelemetry.record('backend_ingest_completed', {
-        atMs: telemetry.backendIngestCompletedMs,
-        frameId: telemetry.frameId,
-      })
-    }
-
-    if (telemetry.wakeDetectedMs !== null) {
-      voiceTelemetry.record('wake_detected', {
-        atMs: telemetry.wakeDetectedMs,
-        frameId: telemetry.frameId,
-      })
-    }
-
-    if (telemetry.transcriptionStartedMs !== null) {
-      voiceTelemetry.record('transcription_started', {
-        atMs: telemetry.transcriptionStartedMs,
-        frameId: telemetry.frameId,
-      })
-    }
-
-    if (telemetry.transcriptionCompletedMs !== null) {
-      voiceTelemetry.record('transcription_completed', {
-        atMs: telemetry.transcriptionCompletedMs,
-        frameId: telemetry.frameId,
-      })
-    }
-  }
-
-  const enterRuntimeError = (): void => {
-    applyRuntimeStatus('error')
-  }
-
-  const transitionFromCurrentStatus = (
-    event: Parameters<typeof transitionRuntimeStatus>[1],
-  ): void => {
-    if (startupStateRef.current.kind !== 'ready') {
-      return
-    }
-
-    applyTransition(runtimeStatusRef.current, event)
-  }
-
-  const applyRuntimeControlResult = (
-    runtimePhase: RuntimeControlResult,
-  ): void => {
-    const previousStatus = runtimeStatusRef.current
-    const nextStatus = toRuntimeStatus(runtimePhase.runtimePhase)
-
-    applyRuntimeStatus(nextStatus)
-    if (
-      previousStatus === 'sleeping' ||
-      typeof runtimePhase.telemetry?.transcriptionStartedMs === 'number' ||
-      typeof runtimePhase.telemetry?.transcriptionCompletedMs === 'number'
-    ) {
-      recordRuntimeControlTelemetry(runtimePhase)
-    }
-
-    if (
-      nextStatus === 'sleeping' &&
-      runtimePhase.telemetry?.wakeConfidence === null
-    ) {
-      resetWakeConfidence()
-    } else if (
-      nextStatus === 'sleeping' &&
-      runtimePhase.telemetry?.wakeConfidence !== null &&
-      runtimePhase.telemetry?.wakeConfidence !== undefined
-    ) {
-      updateWakeConfidence(runtimePhase.telemetry.wakeConfidence)
-    }
-
-    if (previousStatus !== 'listening' && nextStatus === 'listening') {
-      voiceTelemetry.record('runtime_status_set_listening', {
-        frameId: runtimePhase.telemetry?.frameId ?? null,
-      })
-    }
-
-  }
-
-  const syncRuntimeControl = async (
-    command: 'mark_silence',
-    options: {
-      readonly args?: RuntimeControlArgs
-      readonly fallbackEvent?: Parameters<typeof transitionRuntimeStatus>[1]
-      readonly isCurrent?: () => boolean
-    } = {},
-  ): Promise<RuntimeControlResult | null> => {
-    if (startupStateRef.current.kind !== 'ready') {
-      return null
-    }
-
-    const { args, fallbackEvent, isCurrent } = options
-    runtimeActivityRevisionRef.current += 1
-
-    try {
-      const runtimePhase = await invokeRuntimeControl(command, args)
-      if (isCurrent !== undefined && !isCurrent()) return null
-
-      if (runtimePhase === null) {
-        if (fallbackEvent !== undefined) {
-          transitionFromCurrentStatus(fallbackEvent)
-        }
-
-        return null
-      }
-
-      applyRuntimeControlResult(runtimePhase)
-      return runtimePhase
-    } catch (error) {
-      if (isCurrent !== undefined && !isCurrent()) return null
-      const message = toDisplayErrorMessage(error)
-
-      recoverFromRuntimeControlError()
-      addNotice({
-        tone: 'error',
-        title: 'Runtime control failed',
-        message,
-      })
-      recordRuntimeDiagnostic('runtime_control', `Runtime control error (${command}): ${message}`)
-      return null
-    }
-  }
-
-  const recoverFromRuntimeControlError = (): void => {
-    applyRuntimeStatus('sleeping')
-  }
-
   const runPrompt = async (
     prompt: string,
     source: 'typed' | 'voice',
     nativeRequestId?: string,
+    nativeProjection?: NativePromptProjection,
   ): Promise<void> => {
-    const admission = session.admitPrompt(prompt, source, nativeRequestId, updateRuntimeBlocked)
+    const admission = nativeProjection === undefined
+      ? session.admitPrompt(prompt, source, nativeRequestId, updateRuntimeBlocked)
+      : session.attachNativePrompt()
     if (admission === null) return
     const admittedAt = performance.now()
     const appActiveRef = { get current() { return admission.isCurrent() } }
     const currentSettings = admission.settings
     const executingStatus = applyTransition(runtimeStatusRef.current, 'submit_prompt')
     const promptRuntimeActivityRevision = runtimeActivityRevisionRef.current
-    const expectedCanonicalSessionId = snapshotSessionIdRef.current
+    const expectedCanonicalSessionId = nativeProjection?.executionId.sessionId ?? snapshotSessionIdRef.current
     const promptComposerRevision = composerEditRevisionRef.current
     const priorCanonicalExecutions = new Set(
       canonicalTranscriptRef.current.map((turn) => executionKey(turn)),
     )
     clearPartialTranscript()
-    cancelTts()
     setResponseAnnouncement('')
 
     const requestId = nativeRequestId ?? `request-${Date.now()}-${Math.random().toString(36).slice(2)}`
@@ -1596,6 +1450,8 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     const assistantId = `assistant-${projectionRevision}-${requestId}`
     const requestTiming = timingRef.current.admit(assistantId, admittedAt)
     const promptProjection: PromptProjection = {
+      nativeOwned: nativeProjection !== undefined,
+      ...(nativeProjection === undefined ? {} : { executionId: nativeProjection.executionId }),
       id: requestId,
       userId,
       assistantId,
@@ -1604,8 +1460,6 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       terminal: false,
       presentationCancelled: false,
       cancelPending: false,
-      tts: !isAndroidRuntime && ttsEnabledRef.current,
-      corrected: false,
       stages: [
         { stage: 'instant', status: 'running' },
         ...(currentSettings.deepEnabled ? [{ stage: 'deep', status: 'queued' } as const] : []),
@@ -1613,7 +1467,6 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       ],
       priorVersions: [],
       sources: [],
-      ttsFirstLineSpoken: false,
       renderFrameId: null,
       renderFrameRevision: 0,
       admittedAt,
@@ -1655,45 +1508,28 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         if (source === 'voice' && !hadCompleteLine && active.text.includes('\n')) {
           voiceTelemetry.record('provider_first_line')
         }
-        if (
-          active.tts &&
-          ttsEnabledRef.current &&
-          !active.ttsFirstLineSpoken &&
-          active.text.includes('\n')
-        ) {
-          const firstLine = firstNonEmptyStreamingLine(active.text)
-          if (firstLine !== null && isValidTtsFirstLine(firstLine)) {
-            active.ttsFirstLineSpoken = true
-            void synthesizeAndPlayAssistantReply(firstLine)
-          }
-        }
         if (firstTextTimings !== undefined) session.flushPromptProjection(active)
         else session.schedulePromptProjection(active)
       }
       if (event.kind === 'correction') {
         cancelPromptProjectionFrame(active)
-        active.corrected = true
         if (active.text.trim().length > 0) {
           active.priorVersions = [...active.priorVersions, { id: `instant-${active.priorVersions.length + 1}`, text: active.text, label: 'Before correction' }]
         }
         active.text = event.text
         const timings = requestTiming.received(event.text)
         if (isAndroidRuntime && timings !== undefined) active.customDirectTimings = timings
-        active.stages = active.stages.map((stage) => stage.stage === event.stage ? { ...stage, status: 'corrected', detail: event.correction } : stage)
+        active.stages = active.stages.some((stage) => stage.stage === event.stage)
+          ? active.stages.map((stage) => stage.stage === event.stage ? { ...stage, status: 'corrected', detail: event.correction } : stage)
+          : [...active.stages, { stage: event.stage, status: 'corrected', detail: event.correction }]
         session.renderPromptProjection(active)
         setPromptActivity({ text: event.correction, compact: false })
-        if (
-          snapshotHydrationStateRef.current !== 'succeeded' &&
-          active.tts &&
-          ttsEnabledRef.current
-        ) {
-          void synthesizeAndPlayAssistantReply(event.correction.replace(/^Correction:\s*/u, ''))
-        }
       }
       if (event.kind === 'stage') {
-        active.stages = active.stages.map((stage) => stage.stage === event.stage
-          ? { stage: event.stage, status: event.status, ...(event.detail === undefined ? {} : { detail: event.detail }) }
-          : stage)
+        const entry = { stage: event.stage, status: event.status, ...(event.detail === undefined ? {} : { detail: event.detail }) }
+        active.stages = active.stages.some((stage) => stage.stage === event.stage)
+          ? active.stages.map((stage) => stage.stage === event.stage ? entry : stage)
+          : [...active.stages, entry]
         setMessages((current) => current.map((message) => message.id === active.assistantId
           ? { ...message, answerStage: { stages: active.stages, priorVersions: active.priorVersions, sources: active.sources } } : message))
         const stagePrefix = event.stage === 'instant' ? 'Response' : `${event.stage[0]?.toUpperCase()}${event.stage.slice(1)} stage`
@@ -1743,7 +1579,18 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     const inlineAssistant = androidAssistantRef.current
     try {
       requestTiming.dispatch()
-      result = await executePrompt(requestId, prompt, handleEvent, source)
+      result = nativeProjection === undefined
+        ? await executePrompt(requestId, prompt, handleEvent, source)
+        : await session.prompt.observeNative(nativeProjection, handleEvent, () => {
+          cancelPromptProjectionFrame(promptProjection)
+          promptProjection.text = ''
+          promptProjection.error = null
+          promptProjection.stages = [{ stage: 'instant', status: 'running' }]
+          promptProjection.sources = []
+          promptProjection.priorVersions = []
+          delete promptProjection.thinkingStatus
+          session.renderPromptProjection(promptProjection)
+        })
     } catch (error) {
       const message = error instanceof Error
         ? error.message
@@ -1783,7 +1630,8 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
           }
         }
       }
-      const acceptedCanonicalTurn = result.canonicalTurn !== undefined && isExpectedCanonicalTurn(
+      const acceptedCanonicalTurn = result.canonicalTurn !== undefined &&
+        (nativeProjection === undefined || result.canonicalTurn.executionId.generation === nativeProjection.executionId.generation) && isExpectedCanonicalTurn(
         result.canonicalTurn,
         requestId,
         expectedCanonicalSessionId,
@@ -1803,7 +1651,6 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
           errorMessage: 'The returned response did not match the active execution.',
         }
       }
-      if (result.outcome !== 'completed') cancelTts()
       if (result.outcome === 'completed') {
         session.flushPromptProjection(active)
       } else {
@@ -1869,6 +1716,18 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
             runtimeRevision: () => runtimeActivityRevisionRef.current,
             load: loadAppSnapshot,
             requested: () => requestTiming.reconciliation('rpc'),
+            ...(nativeProjection === undefined || (result.outcome === 'completed' && acceptedCanonicalTurn === undefined) ? {} : {
+              // The correlated terminal receipt plus canonical A-not-active
+              // retires A even for cancellation/failure without a committed turn.
+              // A successor is not a reason to wait for global idleness.
+              acceptRetiredRequest: (snapshot: AppSnapshot) => snapshot.sessionId === expectedCanonicalSessionId &&
+                !(snapshot.activeRequest?.requestId === requestId &&
+                  snapshot.activeRequest.executionId.sessionId === nativeProjection.executionId.sessionId &&
+                  snapshot.activeRequest.executionId.generation === nativeProjection.executionId.generation) &&
+                (result.outcome !== 'completed' || snapshot.transcript.some((turn) =>
+                  turn.requestId === requestId && turn.executionId.sessionId === nativeProjection.executionId.sessionId &&
+                  turn.executionId.generation === nativeProjection.executionId.generation)),
+            }),
           })
           snapshot = reconciliation?.snapshot ?? null
           reconciledRuntimeActivityRevision = reconciliation?.runtimeRevision ?? null
@@ -1966,7 +1825,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
             ...message.answerStage,
             stages: settleCanonicalAnswerStages(observedStages, reconciledTurn.finalStage),
             priorVersions: [...active.priorVersions],
-            sources: [...active.sources],
+            sources: [...reconciledTurn.sources],
           },
         } : message))
       }
@@ -1977,7 +1836,6 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         ))
       }
       if (effectiveOutcome !== 'completed') {
-        cancelTts()
         addNotice({
           tone: effectiveOutcome === 'error' ? 'error' : 'info',
           title: effectiveOutcome === 'error' ? 'Response failed' : 'Response cancelled',
@@ -1995,15 +1853,6 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
           title: 'No response',
           message: 'No response was returned. Try again.',
         })
-      } else if (
-        appActiveRef.current &&
-        !active.presentationCancelled &&
-        active.tts &&
-        ttsEnabledRef.current &&
-        !(active.corrected && snapshotHydrationStateRef.current !== 'succeeded') &&
-        !active.ttsFirstLineSpoken
-      ) {
-        void synthesizeAndPlayAssistantReply(terminalText)
       }
       if (
         commandRejected &&
@@ -2012,6 +1861,117 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       ) {
         applyTransition(executingStatus, 'fail')
       }
+    }
+    if (supportsDesktopRuntime && appActiveRef.current && !resetPendingRef.current && promptRef.current === null) {
+      // Native may have admitted its next request while this renderer was still
+      // reconciling the previous terminal result. Reattach, never resubmit it.
+      void desktopObserverRef.current?.observer.refresh().catch(() => undefined)
+    }
+  }
+
+  const projectDesktopVoice = (voice: VoiceProjection, revision: number): void => {
+    if (!appActiveRef.current || resetPendingRef.current) return
+    desktopCaptureIdRef.current = voice.captureId
+    if (!voice.autoStartAvailable) desktopAutoStartConsumedRef.current = true
+    desktopAutoStartRef.current = voice.autoStartAvailable && !desktopAutoStartConsumedRef.current
+    if (autoStopPendingRef.current === null) setAutoStopOnSilence(voice.autoStopOnSilence)
+    if ((voice.state === 'stopped' || voice.state === 'error') && liveAudioSourceRef.current !== null) {
+      liveAudioSourceRef.current.detach()
+      liveAudioSourceRef.current = null
+    }
+    publishRuntimeStatus(toRuntimeStatus(voice.runtimePhase), true)
+    setMicStarting(voice.state === 'starting')
+    setMicActive(voice.state === 'active')
+    setWakeConfidence(voice.wakeConfidence)
+    const partial = voice.partialTranscript
+    const previousPartial = partialTranscriptionRef.current
+    partialTranscriptionAllowedRef.current = partial !== null
+    partialTranscriptionRef.current = partial === null
+      ? previousPartial === null ? null : { ...previousPartial, active: false }
+      : { sessionId: partial.sessionId, revision: partial.revision, active: true }
+    setPartialTranscript(partial?.text ?? '')
+    if (partial === null || previousPartial === null || previousPartial.sessionId !== partial.sessionId || previousPartial.revision !== partial.revision) setVoiceCompletionSuffix('')
+    const candidate = pendingVoiceCompletionRef.current
+    if (candidate !== null && partial !== null) {
+      const matchingSession = candidate.sessionId === partial.sessionId
+      if (!candidate.closed && candidate.lifecycle === completionLifecycleRef.current && candidate.context === transcriptRevisionRef.current &&
+        matchingSession && candidate.revision === partial.revision) {
+        setVoiceCompletionSuffix(candidate.suffix ?? '')
+      }
+      // Do not consume a hinted successor while a newer native invalidation is
+      // still waiting to be read. Revisions compare only within one session.
+      if ((!matchingSession && desktopObserverRef.current?.observer.hasNewerInvalidation(revision) !== true) || (!candidate.closed && ((matchingSession && candidate.revision <= partial.revision) ||
+        candidate.lifecycle !== completionLifecycleRef.current || candidate.context !== transcriptRevisionRef.current))) pendingVoiceCompletionRef.current = null
+    } else if (candidate !== null && (voice.runtimePhase !== 'listening' || voice.state === 'error' || voice.state === 'stopped') &&
+      desktopObserverRef.current?.observer.hasNewerInvalidation(revision) !== true) {
+      if (partialTranscriptionRef.current === null) partialTranscriptionRef.current = { sessionId: candidate.sessionId, revision: candidate.revision, active: false }
+      if (!candidate.closed) pendingVoiceCompletionRef.current = { ...candidate, suffix: null, closed: true }
+    }
+    const error = voice.error ?? (voice.state === 'error' ? 'Native microphone capture failed' : null)
+    if (error !== null && error !== desktopCaptureErrorRef.current) {
+      if (voice.state === 'error') {
+        liveAudioSessionIdRef.current += 1
+        profileCaptureContinuationRef.current = null
+      }
+      addNotice({ tone: 'error', title: 'Microphone unavailable', message: error })
+    }
+    desktopCaptureErrorRef.current = error
+  }
+  const projectDesktopSpeech = (speech: SpeechProjection): void => {
+    if (!appActiveRef.current) return
+    setTtsPlaying(speech.playing)
+    setPendingTtsCommands(speech.pending ? 1 : 0)
+  }
+  const projectNativePrompt = (prompt: NativePromptProjection): void => {
+    if (!appActiveRef.current || resetPendingRef.current || snapshotHydrationStateRef.current !== 'succeeded' || prompt.executionId.sessionId !== snapshotSessionIdRef.current) return
+    if (canonicalTranscriptRef.current.some((turn) => turn.executionId.sessionId === prompt.executionId.sessionId && turn.executionId.generation === prompt.executionId.generation)) return
+    const active = promptRef.current
+    if (active !== null) {
+      if (!active.nativeOwned || active.id !== prompt.requestId || active.terminal) return
+      session.prompt.replaceNative(prompt)
+      session.flushPromptProjection(active)
+    } else {
+      void runPrompt(prompt.prompt, 'voice', prompt.requestId, prompt)
+    }
+  }
+  desktopSnapshotRef.current = (snapshot): void => {
+    setDesktopRuntimeReady(true)
+    projectDesktopVoice(snapshot.voice, snapshot.revision)
+    projectDesktopSpeech(snapshot.speech)
+    if (resetPendingRef.current || snapshotHydrationStateRef.current !== 'succeeded') return
+    if (snapshot.prompt !== null) {
+      projectNativePrompt(snapshot.prompt)
+      if (promptRef.current === null || promptRef.current.id === snapshot.prompt.requestId) return
+    }
+    // The bounded native projection may already have retired while detached.
+    // Recover committed history through its existing canonical parser/owner.
+    const active = promptRef.current
+    if (active !== null && !active.nativeOwned) return
+    if (active === null && session.fieldRef('promptState').current !== 'idle') return
+    const context = transcriptRevisionRef.current
+    const lifetime = session.captureLifetime()
+    const history = canonicalTranscriptRef.current
+    const readRevision = ++desktopCanonicalReadRef.current
+    void loadAppSnapshot().then((canonical) => {
+      if (!lifetime() || readRevision !== desktopCanonicalReadRef.current || history !== canonicalTranscriptRef.current || resetPendingRef.current || context !== transcriptRevisionRef.current || promptRef.current !== active || canonical.sessionId !== snapshotSessionIdRef.current) return
+      if (active !== null) {
+        const turn = canonical.transcript.find((turn) => turn.requestId === active.id && turn.executionId.sessionId === active.executionId?.sessionId && turn.executionId.generation === active.executionId.generation)
+        if (canonical.activeRequest?.requestId === active.id) return
+        session.prompt.finishNative(active.id, { requestId: active.id, outcome: turn === undefined ? 'cancelled' : 'completed', errorMessage: null, runtimePhase: canonical.runtimePhase, ...(turn === undefined ? {} : { canonicalTurn: turn }) })
+      } else if (canonical.activeRequest === null) {
+        canonicalTranscriptRef.current = canonical.transcript
+        setMessages((current) => replaceCommittedTranscript(current, canonical.transcript))
+      }
+    }).catch(() => undefined)
+  }
+  desktopEventRef.current = (event): void => {
+    if (!appActiveRef.current || resetPendingRef.current) return
+    switch (event.kind) {
+      case 'voice': projectDesktopVoice(event.voice, event.revision); break
+      case 'speech': projectDesktopSpeech(event.speech); break
+      case 'prompt_started': projectNativePrompt(event.prompt); break
+      case 'prompt_update': session.prompt.updateNative(event.requestId, event.update); break
+      case 'prompt_finished': session.prompt.finishNative(event.requestId, event.result); break
     }
   }
 
@@ -2031,93 +1991,38 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
 
   useEffect(() => { drainAndroidVoiceRequestRef.current() }, [androidVoiceStatus, drainAndroidVoiceRequestRef])
 
-  async function synthesizeAndPlayAssistantReply(text: string): Promise<void> {
-    await session.audio.speakReply(text, {
-      ttsGeneration: ttsGenerationRef,
-      ttsEnabledRef,
-      voiceTelemetry,
-      reservePlaybackId: () => invokeTauriCommand('reserve_local_tts_playback_id'),
-      finishPlayback: (playbackId) => invokeTauriCommand('finish_tts_playback', { playbackId }),
-      speakTts: (speechText, playbackId) => invokeTauriCommand('speak_local_tts', { text: speechText, playbackId }),
-      parseRequestId: (val, ctx) => parseNativeAudioRequestId(val, ctx),
-      toDisplayErrorMessage,
-      addNotice,
-      recordDiagnostic: (category, message) => recordRuntimeDiagnostic(category as RuntimeDiagnosticKind, message),
-      setPlaying: setTtsPlaying,
-      setPendingCount: setPendingTtsCommands,
-    })
-  }
-
-  const maybeRunVoiceTranscript = (
-    runtimePhase: RuntimeControlResult | null,
-  ): void => {
-    if (runtimePhase === null || runtimePhase.transcriptText === null) {
-      return
-    }
-
-    void runPrompt(runtimePhase.transcriptText, 'voice')
-  }
-
-  const handleMarkSilence = async (
-    liveAudioSessionId: number,
-    telemetryFrameId: string | null = null,
-    heardSpeech = true,
-  ): Promise<void> => {
-    if (!voiceSnapshotControlsUsableNow()) return
-    voiceTelemetry.record('silence_detected')
-    if (heardSpeech) {
-      voiceTelemetry.record('cue_play_requested', {
-        details: {
-          cueType: 'stop_listening',
-          source: 'mark_silence',
-        },
-      })
-      void playCueWithFallback('stop_listening', cueAssetPathsRef.current, fallbackCueAssetPathsRef.current, cuePlayerRef.current)
-        .then((started) => { if (started) voiceTelemetry.record('cue_play_started', {
-          details: {
-            cueType: 'stop_listening',
-            source: 'mark_silence',
-          },
-        }) })
-        .catch((error: unknown) => reportCuePlaybackError('stop_listening', error))
-    }
-
-    if (liveAudioSessionId !== liveAudioSessionIdRef.current || !voiceSnapshotControlsUsableNow()) return
-
-    voiceTelemetry.record('mark_silence_submitted')
-    const runtimePhase = await syncRuntimeControl(
-      'mark_silence',
-      telemetryFrameId === null
-        ? {
-            fallbackEvent: 'end_listening',
-            isCurrent: () => liveAudioSessionId === liveAudioSessionIdRef.current,
-          }
-        : {
-            args: { telemetryFrameId },
-            fallbackEvent: 'end_listening',
-            isCurrent: () => liveAudioSessionId === liveAudioSessionIdRef.current,
-          },
-    )
-
-    if (liveAudioSessionId !== liveAudioSessionIdRef.current || !voiceSnapshotControlsUsableNow()) return
-    voiceTelemetry.record('mark_silence_resolved')
-    clearPartialTranscript()
-    maybeRunVoiceTranscript(runtimePhase)
-  }
-
-  const stopLiveAudio = (): void => {
+  const stopLiveAudio = (): Promise<void> => {
+    desktopAutoStartConsumedRef.current = true
+    desktopAutoStartRef.current = false
     liveAudioSessionIdRef.current += 1
-    markSilenceInFlightRef.current = null
     liveAudioStartAbortRef.current?.abort()
     liveAudioStartAbortRef.current = null
-    liveAudioSourceRef.current?.stop()
+    const source = liveAudioSourceRef.current
+    const captureId = source?.captureId ?? desktopCaptureIdRef.current
+    const pending = captureRetirementRef.current
+    const retirement = pending !== null && (captureId === null || pending.captureId === captureId)
+      ? pending.promise
+      : source !== null ? source.stop()
+        : supportsDesktopRuntime && captureId !== null
+          ? invokeTauriCommand('stop_native_microphone', { captureId }).then(() => undefined)
+          : Promise.resolve()
+    if ((source !== null || captureId !== null || pending !== null) && pending?.promise !== retirement) {
+      const operation = { captureId, promise: retirement }
+      captureRetirementRef.current = operation
+      void retirement.catch(() => undefined).finally(() => {
+        if (captureRetirementRef.current === operation) captureRetirementRef.current = null
+        if (appActiveRef.current) void desktopObserverRef.current?.observer.refresh().catch(() => undefined)
+      })
+    }
+    desktopCaptureIdRef.current = null
     liveAudioSourceRef.current = null
-    voiceActivityStateRef.current = createVoiceActivityState()
     resetWakeConfidence()
-    setMicStarting(false)
-    setMicActive(false)
+    if (!supportsDesktopRuntime) {
+      setMicStarting(false)
+      setMicActive(false)
+    }
     clearPartialTranscript()
-
+    return retirement
   }
 
   const reportLiveAudioError = (error: unknown): void => {
@@ -2137,17 +2042,19 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   }
 
   const startMic = async (): Promise<void> => {
-    if (updateRuntimeBlocked || resetPendingRef.current || !voiceSnapshotControlsUsableNow() || !voiceInputReady(startupStateRef.current) || liveAudioSourceRef.current !== null || micStarting || micStartInFlightRef.current) {
+    if (!supportsDesktopRuntime || !session.fieldRef('desktopRuntimeReady').current || session.fieldRef('micActive').current) return
+    if (updateRuntimeBlocked || resetPendingRef.current || !voiceSnapshotControlsUsableNow() || !voiceInputReady(startupStateRef.current) || liveAudioSourceRef.current !== null || session.fieldRef('micStarting').current || micStartInFlightRef.current) {
       return
     }
     micStartInFlightRef.current = true
+    desktopAutoStartConsumedRef.current = true
+    desktopAutoStartRef.current = false
+    const startLifetime = session.captureLifetime()
     const startAbort = new AbortController()
     liveAudioStartAbortRef.current = startAbort
 
     const liveAudioSessionId = liveAudioSessionIdRef.current + 1
     liveAudioSessionIdRef.current = liveAudioSessionId
-    const wakeClipBuffer = createWakeClipBuffer()
-    let wakeClipSleeping = true
 
     setMicStarting(true)
 
@@ -2157,115 +2064,18 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         ...(audioInputDeviceIdRef.current === null
           ? {}
           : { deviceId: audioInputDeviceIdRef.current }),
-        onFrame: async (frame) => {
-          if (
-            liveAudioSessionId !== liveAudioSessionIdRef.current ||
-            !voiceSnapshotControlsUsableNow() ||
-            !voiceInputReady(startupStateRef.current)
-          ) {
-            return
-          }
-
-          runtimeActivityRevisionRef.current += 1
-          liveAudioInFlightFramesRef.current += 1
-
-          try {
-            if (wakeClipSleeping) wakeClipBuffer.push(frame)
-            const nowMs = Date.now()
-            const frameId = voiceTelemetry.nextFrameId(nowMs)
-
-            voiceTelemetry.record('frontend_frame_captured', {
-              atMs: nowMs,
-              frameId,
-              details: {
-                sampleCount: frame.length,
-              },
-            })
-            voiceTelemetry.record('frontend_frame_sent', {
-              frameId,
-            })
-
-            const status = await ingestAudioFrame(
-              frame,
-              frameId === null ? {} : { telemetryFrameId: frameId },
-            )
-
-            const detected = typeof status?.telemetry?.wakeDetectedMs === 'number'
-            if (detected) {
-              const samples = wakeClipBuffer.take()
-              const confidence = status?.telemetry?.wakeConfidence
-              if (typeof confidence === 'number' && Number.isFinite(confidence)) {
-                void invokeTauriCommand('save_wake_clip', { samples, confidence }).catch((reason: unknown) => {
-                  addNotice({ tone: 'error', title: 'Wake clip not saved', message: reason instanceof Error ? reason.message : String(reason) })
-                })
-              }
-            }
-            if (liveAudioSessionId !== liveAudioSessionIdRef.current || !voiceSnapshotControlsUsableNow() || !voiceInputReady(startupStateRef.current)) {
-              wakeClipBuffer.clear()
-              return
-            }
-
-            if (status !== null) {
-              const nextStatus = toRuntimeStatus(status.runtimePhase)
-              if (!detected && nextStatus !== 'sleeping') wakeClipBuffer.clear()
-              wakeClipSleeping = nextStatus === 'sleeping'
-
-              applyRuntimeControlResult(status)
-              voiceActivityStateRef.current = syncVoiceActivityState(
-                voiceActivityStateRef.current,
-                  nextStatus,
-                  status.lastActivityMs,
-                  status.heardSpeech,
-              )
-
-              if (nextStatus === 'listening' && autoStopOnSilenceRef.current) {
-                const voiceActivityUpdate = updateVoiceActivityState(
-                  voiceActivityStateRef.current,
-                  nowMs,
-                  currentInitialSilenceTimeoutMs(),
-                  currentSilenceTimeoutMs(),
-                )
-
-                voiceActivityStateRef.current = voiceActivityUpdate.state
-
-                if (voiceActivityUpdate.shouldMarkSilence && markSilenceInFlightRef.current === null) {
-                  markSilenceInFlightRef.current = liveAudioSessionId
-                  void handleMarkSilence(liveAudioSessionId, frameId, voiceActivityUpdate.state.heardSpeech)
-                    .catch((error: unknown) => {
-                      if (liveAudioSessionId !== liveAudioSessionIdRef.current) return
-                      enterRuntimeError()
-                      reportLiveAudioError(error)
-                    })
-                    .finally(() => {
-                      if (markSilenceInFlightRef.current === liveAudioSessionId) {
-                        markSilenceInFlightRef.current = null
-                      }
-                    })
-                }
-              }
-            }
-          } catch (error) {
-            if (
-              liveAudioSessionId !== liveAudioSessionIdRef.current ||
-              !voiceSnapshotControlsUsableNow() ||
-              !voiceInputReady(startupStateRef.current)
-            ) {
-              return
-            }
-
-            enterRuntimeError()
-            throw error
-          } finally {
-            liveAudioInFlightFramesRef.current = Math.max(0, liveAudioInFlightFramesRef.current - 1)
-          }
+        onError: (error) => {
+          if (!startLifetime()) return
+          if (liveAudioSessionId === liveAudioSessionIdRef.current) reportLiveAudioError(error)
+          else void desktopObserverRef.current?.observer.refresh().catch(() => undefined)
         },
-        onError: reportLiveAudioError,
         onStatus: (status) => {
+          if (!startLifetime() || liveAudioSessionId !== liveAudioSessionIdRef.current) return
           recordRuntimeDiagnostic('audio', `Microphone startup: ${status}`)
         },
         onSelectedDeviceFallback: (attemptedDeviceId) => {
           if (
-            liveAudioSessionId !== liveAudioSessionIdRef.current ||
+            !startLifetime() || liveAudioSessionId !== liveAudioSessionIdRef.current ||
             audioInputDeviceIdRef.current !== attemptedDeviceId
           ) {
             return
@@ -2276,30 +2086,29 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         },
       })
 
+      if (!startLifetime()) {
+        liveAudioSource.detach()
+        return
+      }
+
       if (
-        !appActiveRef.current ||
         liveAudioSessionId !== liveAudioSessionIdRef.current ||
         !voiceSnapshotControlsUsableNow() ||
         (startupStateRef.current.kind === 'ready' && !voiceInputReady(startupStateRef.current))
       ) {
         liveAudioSource.stop()
-        if (appActiveRef.current && voiceSnapshotControlsUsableNow() && voiceInputReady(startupStateRef.current)) {
-          micAutoStartedRef.current = false
-          queueMicrotask(() => void startMic())
-        }
         return
       }
 
       liveAudioSourceRef.current = liveAudioSource
-       setMicStarting(false)
-       setMicActive(true)
-       persistAudioInputDeviceId(audioInputDeviceIdRef.current)
+      if (!session.fieldRef('micStarting').current && !session.fieldRef('micActive').current) {
+        // A terminal projection can precede the start command response.
+        liveAudioSource.detach()
+        liveAudioSourceRef.current = null
+      }
+      persistAudioInputDeviceId(audioInputDeviceIdRef.current)
     } catch (error) {
       if (!appActiveRef.current || liveAudioSessionId !== liveAudioSessionIdRef.current) {
-        if (appActiveRef.current && voiceSnapshotControlsUsableNow() && voiceInputReady(startupStateRef.current)) {
-          micAutoStartedRef.current = false
-          queueMicrotask(() => void startMic())
-        }
         return
       }
 
@@ -2323,15 +2132,32 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     void startMic()
   }
 
+  const resumeUserCapture = async (intent: CaptureContinuation): Promise<void> => {
+    const current = (): boolean => intent.lifetime() && intent.contextRevision === transcriptRevisionRef.current &&
+      intent.inputRevision === liveAudioSessionIdRef.current && !resetPendingRef.current && !isSwitchingResponseProfileRef.current
+    try {
+      await intent.retirement
+      if (!current()) return
+      const root = await desktopObserverRef.current?.observer.refresh()
+      if (!current() || root?.voice.state !== 'stopped') return
+      await startMic()
+    } catch {
+      // Retirement failure is not permission to start a second capture. Native
+      // projection/error reporting remains authoritative for the existing one.
+    }
+  }
+
   const changeAudioInputDevice = (deviceId: string): void => {
     const selectedDeviceId = deviceId.length === 0 ? null : deviceId
     audioInputDeviceIdRef.current = selectedDeviceId
     setAudioInputDeviceId(selectedDeviceId)
+    persistAudioInputDeviceId(selectedDeviceId)
 
-    const shouldRestart = liveAudioSourceRef.current !== null
-    stopLiveAudio()
+    const shouldRestart = session.fieldRef('micActive').current || liveAudioSourceRef.current !== null
+    const retirement = stopLiveAudio()
     if (shouldRestart) {
-      queueMicrotask(() => void startMic())
+      void resumeUserCapture({ lifetime: session.captureLifetime(), inputRevision: liveAudioSessionIdRef.current,
+        contextRevision: transcriptRevisionRef.current, retirement })
     }
   }
 
@@ -2386,17 +2212,21 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     }
 
     isSwitchingResponseProfileRef.current = true
-    cancelTts()
     clearPartialTranscript()
     setIsSwitchingResponseProfile(true)
     const requestedCapabilityId = profile === 'quality' ? 'local_quality' : 'local_fast'
 
-    const hadLiveAudio =
-      micActive || micStarting || liveAudioSourceRef.current !== null
+    const priorIntent = profileCaptureContinuationRef.current
+    const preservedIntent = priorIntent !== null && priorIntent.lifetime() &&
+      priorIntent.inputRevision === liveAudioSessionIdRef.current && priorIntent.contextRevision === transcriptRevisionRef.current
+    const hadLiveAudio = session.fieldRef('micActive').current || liveAudioSourceRef.current !== null
     if (hadLiveAudio) micAutoStartedRef.current = false
-    stopLiveAudio()
+    const retirement = stopLiveAudio()
+    profileCaptureContinuationRef.current = hadLiveAudio || preservedIntent ? {
+      lifetime: preservedIntent ? priorIntent.lifetime : session.captureLifetime(),
+      inputRevision: liveAudioSessionIdRef.current, contextRevision: transcriptRevisionRef.current, retirement,
+    } : null
 
-    await waitForInFlightLiveAudioFrames()
 
     const settleStartupState = async (): Promise<StartupState> => {
       while (true) {
@@ -2451,6 +2281,8 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     applyRuntimeStatus('initializing')
 
     try {
+       await retirement
+       if (!appActiveRef.current || resetPendingRef.current) return false
        await invokeTauriCommand('switch_response_profile', { profile })
 
        const settled = await settleStartupState()
@@ -2517,7 +2349,6 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
 
   const toggleTts = async (enabled: boolean): Promise<void> => {
     const previousEnabled = ttsEnabledRef.current
-    if (!enabled) cancelTts()
     await session.preferences.tts.mutate({
       next: enabled,
       fallback: initialSnapshotPreferencesRef.current?.ttsEnabled ?? previousEnabled,
@@ -2544,19 +2375,22 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   }
 
   useEffect(() => {
+    if (supportsDesktopRuntime && (!desktopRuntimeReady || snapshotHydrationStateRef.current !== 'succeeded')) return
     if (!voiceSnapshotControlsUsable) {
       if (import.meta.env.VITE_VOXGOLEM_BENCHMARK === '1') reportAppBenchmarkStage('benchmark_controls_retire')
       micAutoStartedRef.current = false
-      if (micActive || micStarting || micStartInFlightRef.current) stopLiveAudio()
+      if (!supportsDesktopRuntime && (micActive || micStarting || micStartInFlightRef.current)) stopLiveAudio()
       return
     }
     if (startupState.kind === 'ready' && !voiceInputReady(startupState)) {
+      if (supportsDesktopRuntime) return
       if (import.meta.env.VITE_VOXGOLEM_BENCHMARK === '1') reportAppBenchmarkStage('benchmark_capability_retire')
       micAutoStartedRef.current = false
       if (micActive || micStarting || micStartInFlightRef.current) stopLiveAudio()
       return
     }
     if (!voiceInputReady(startupState)) return
+    if (supportsDesktopRuntime && !desktopAutoStartRef.current) return
     if (
       resetPending ||
       resetPendingRef.current ||
@@ -2570,7 +2404,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     micAutoStartedRef.current = true
     void startMic()
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [micActive, micStarting, resetPending, startupState, voiceSnapshotControlsUsable, updateRuntimeBlocked])
+  }, [desktopRuntimeReady, micActive, micStarting, resetPending, startupState, supportsDesktopRuntime, voiceSnapshotControlsUsable, updateRuntimeBlocked])
 
   const sendPrompt = async (): Promise<void> => {
     if (runtimeStatusRef.current !== 'sleeping' || androidVoiceActiveRef.current || isSwitchingResponseProfileRef.current || resetPendingRef.current) {
@@ -2630,6 +2464,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       catch (error) { addNotice({ tone: 'error', title: 'Voice draft preservation failed', message: toDisplayErrorMessage(error) }); return }
     }
     resetPendingRef.current = true
+    desktopObserverRef.current?.observer.invalidate()
     const transcriptRevision = ++transcriptRevisionRef.current
     if (androidSelectionRecoveryRef.current !== null) androidSelectionRecoveryRef.current = { transcriptRevision, composerRevision: composerEditRevisionRef.current }
     setResetPending(true)
@@ -2640,7 +2475,6 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     const resetRuntimeActivityRevision = runtimeActivityRevisionRef.current
     const activePrompt = promptRef.current
     let resetDraftRevision = composerEditRevisionRef.current
-    cancelTts()
     clearPartialTranscript()
     clearCompletion()
     setResponseAnnouncement('')
@@ -2662,6 +2496,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       }
       resetPendingRef.current = false
       setResetPending(false)
+      if (supportsDesktopRuntime) void desktopObserverRef.current?.observer.refresh().catch(() => undefined)
       return
     }
 
@@ -2673,6 +2508,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     if (activePrompt !== null && !activePrompt.terminal) {
       cancelPromptProjectionFrame(activePrompt)
       activePrompt.terminal = true
+      if (activePrompt.nativeOwned) session.prompt.detachNative()
       setPromptState('stopping')
       try {
         await invokeTauriCommand('cancel_prompt', { requestId: activePrompt.id })
@@ -2682,7 +2518,6 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       if (!appActiveRef.current) return
     }
     try {
-      await waitForInFlightLiveAudioFrames()
       if (!appActiveRef.current) return
       if (isAndroidRuntime) await invokeTauriCommand('stop_assistant_voice')
       if (!appActiveRef.current) return
@@ -2766,7 +2601,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         adoptSnapshotControls(snapshot, snapshotControlRevision, snapshotPreferenceRevision)
         adoptAndroidConversation(snapshot, -1, false)
         if (snapshot.activeRequest === null && snapshot.assistant !== undefined) androidSelectionRecoveryRef.current = null
-        const activeRequestMessage: ChatMessage[] = snapshot.activeRequest === null ? [] : [{
+        const activeRequestMessage: ChatMessage[] = snapshot.activeRequest === null || supportsDesktopRuntime ? [] : [{
           id: `recovered-user-${snapshot.activeRequest.executionId.sessionId}-${snapshot.activeRequest.executionId.generation}`,
           role: 'user',
           content: snapshot.activeRequest.prompt,
@@ -2793,6 +2628,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     } finally {
       resetPendingRef.current = false
       setResetPending(false)
+      if (supportsDesktopRuntime) void desktopObserverRef.current?.observer.refresh().catch(() => undefined)
       if (androidDraftPendingRef.current !== null) persistAndroidDraft(composerValueRef.current)
     }
   }
@@ -3020,7 +2856,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     beginCurrentVoiceDraft, onAndroidVoiceActivity, onAndroidSpeechStatus, onAndroidVoiceInputCancelled,
     changeInstant, resetSession, retryCustom, cancelPrompt,
     changeUiTheme, adjustUiTextSize, toggleTts, toggleMic, changeAudioInputDevice,
-    setAutoStopOnSilence, setVoiceNotesOpen, setNoticeInteraction,
+    setAutoStopOnSilence: changeAutoStopOnSilence, setVoiceNotesOpen, setNoticeInteraction,
     loadMoreAndroidConversations, loadMoreAndroidHeads, selectAndroidConversation,
     canRetry: (value: AssistantSettings['instant']) => localInstantCanRetry(startupStateRef.current, value),
   })
@@ -3136,13 +2972,6 @@ function toDisplayErrorMessage(error: unknown): string {
   }
 
   return String(error)
-}
-
-function parseNativeAudioRequestId(payload: unknown, label: string): number {
-  if (typeof payload !== 'number' || !Number.isSafeInteger(payload) || payload <= 0) {
-    throw new Error(`${label} ID is invalid`)
-  }
-  return payload
 }
 
 function toStartupCapabilities(capabilities: readonly Capability[]): readonly import('./types/chat').StartupCapability[] {

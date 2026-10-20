@@ -7,7 +7,10 @@ export function parseCompletionEvent(payload: unknown): CompletionEvent {
   if (typeof value['revision'] !== 'number' || !Number.isSafeInteger(value['revision']) || value['revision'] < 0) throw new Error('Invalid completion revision')
   if (value['voice_session_id'] !== null && (typeof value['voice_session_id'] !== 'number' || !Number.isSafeInteger(value['voice_session_id']) || value['voice_session_id'] < 0)) throw new Error('Invalid voice session id')
   if (value['suffix'] !== null && typeof value['suffix'] !== 'string') throw new Error('Invalid completion suffix')
+  if (value['source'] === 'voice' && typeof value['suffix'] === 'string' &&
+    (value['suffix'].length > 256 * 1024 || utf8ByteLength(value['suffix']) > 256 * 1024)) throw new Error('Voice completion exceeds presentation budget')
   if (value['source'] === 'typed' && value['voice_session_id'] !== null) throw new Error('Typed completion cannot have a voice session')
   if (value['source'] === 'voice' && value['voice_session_id'] === null) throw new Error('Voice completion requires a voice session')
   return { source: value['source'], revision: value['revision'], voiceSessionId: value['voice_session_id'], suffix: value['suffix'] }
 }
+import { utf8ByteLength } from './wire'

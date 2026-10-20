@@ -173,37 +173,9 @@ pub fn apply_voice_pipeline_event(
             ))
         }
         VoicePipelineEvent::SilenceCheck { now_ms } => {
-            let previous_phase = state.session().runtime().phase();
-            let session = apply_session_event(
-                state.session(),
-                config.session(),
-                SessionEvent::SilenceCheck { now_ms },
-            )
-            .map_err(VoicePipelineError::Session)?;
-            let mut capture = state.capture.clone();
-
-            let action = if previous_phase == RuntimePhase::Listening
-                && session.runtime().phase() == RuntimePhase::Processing
-            {
-                let transcription_input = ParakeetTranscriptionInput::new(
-                    config.sample_rate_hz(),
-                    capture.finish_utterance(),
-                )
-                .map_err(VoicePipelineError::TranscriptionInput)?;
-
-                VoicePipelineAction::FinishedUtterance {
-                    transcription_input,
-                }
-            } else if previous_phase == RuntimePhase::Listening
-                && session.runtime().phase() == RuntimePhase::Sleeping
-            {
-                capture.reset();
-                VoicePipelineAction::ExpiredWithoutSpeech
-            } else {
-                VoicePipelineAction::None
-            };
-
-            Ok((VoicePipelineState { session, capture }, action))
+            let mut next_state = state.clone();
+            let action = prepare_silence_check(&mut next_state, config, now_ms)?.commit();
+            Ok((next_state, action))
         }
         VoicePipelineEvent::SubmitPrompt => {
             let session = apply_session_event(
@@ -263,6 +235,72 @@ pub fn apply_voice_pipeline_event(
             ))
         }
     }
+}
+
+/// A prepared silence transition. Dropping it preserves session and audio state,
+/// allowing callers to finish fallible input-runtime resets before committing.
+#[must_use = "a prepared silence transition must be committed to update the pipeline"]
+pub struct VoiceSilenceUpdate<'a> {
+    state: &'a mut VoicePipelineState,
+    next_session: SessionState,
+    action: VoicePipelineAction,
+}
+
+impl VoiceSilenceUpdate<'_> {
+    pub fn action(&self) -> &VoicePipelineAction {
+        &self.action
+    }
+
+    pub fn commit(self) -> VoicePipelineAction {
+        if matches!(
+            self.action,
+            VoicePipelineAction::FinishedUtterance { .. }
+                | VoicePipelineAction::ExpiredWithoutSpeech
+        ) {
+            self.state.capture.reset();
+        }
+        self.state.session = self.next_session;
+        self.action
+    }
+}
+
+pub fn prepare_silence_check(
+    state: &mut VoicePipelineState,
+    config: VoicePipelineConfig,
+    now_ms: u64,
+) -> Result<VoiceSilenceUpdate<'_>, VoicePipelineError> {
+    let previous_phase = state.session().runtime().phase();
+    let next_session = apply_session_event(
+        state.session(),
+        config.session(),
+        SessionEvent::SilenceCheck { now_ms },
+    )
+    .map_err(VoicePipelineError::Session)?;
+    let action = if previous_phase == RuntimePhase::Listening
+        && next_session.runtime().phase() == RuntimePhase::Processing
+    {
+        // Copy only at the endpoint, retaining the capture allocation for reuse.
+        // Validation must succeed before either captured audio or phase changes.
+        let transcription_input = ParakeetTranscriptionInput::new(
+            config.sample_rate_hz(),
+            state.capture().utterance_samples().to_vec(),
+        )
+        .map_err(VoicePipelineError::TranscriptionInput)?;
+        VoicePipelineAction::FinishedUtterance {
+            transcription_input,
+        }
+    } else if previous_phase == RuntimePhase::Listening
+        && next_session.runtime().phase() == RuntimePhase::Sleeping
+    {
+        VoicePipelineAction::ExpiredWithoutSpeech
+    } else {
+        VoicePipelineAction::None
+    };
+    Ok(VoiceSilenceUpdate {
+        state,
+        next_session,
+        action,
+    })
 }
 
 /// A validated frame update. Dropping it leaves the pipeline unchanged, allowing
@@ -389,6 +427,162 @@ mod tests {
             TurnCaptureConfig::new(4, 16).expect("valid turn capture config"),
             PARAKEET_SAMPLE_RATE_HZ,
         )
+    }
+
+    fn silence_test_state(heard_speech: bool, samples: &[f32]) -> VoicePipelineState {
+        let config = pipeline_config();
+        let mut state = VoicePipelineState::new(config).unwrap();
+        for event in [
+            VoicePipelineEvent::StartupValidated,
+            VoicePipelineEvent::WakeWordDetected { now_ms: 100 },
+            VoicePipelineEvent::RecordListeningFrame {
+                frame: samples.to_vec(),
+            },
+        ] {
+            state = apply_voice_pipeline_event(&state, config, event).unwrap().0;
+        }
+        if heard_speech {
+            state = apply_voice_pipeline_event(
+                &state,
+                config,
+                VoicePipelineEvent::SpeechDetected { now_ms: 200 },
+            )
+            .unwrap()
+            .0;
+        }
+        state
+    }
+
+    #[test]
+    fn silence_transaction_preserves_audio_allocation_on_noop_and_finish() {
+        let config = pipeline_config();
+        let mut state = silence_test_state(true, &[0.25, 0.5]);
+        let pointer = state.capture().utterance_samples().as_ptr();
+        let update = super::prepare_silence_check(&mut state, config, 1_399).unwrap();
+        assert_eq!(update.action(), &VoicePipelineAction::None);
+        assert_eq!(update.commit(), VoicePipelineAction::None);
+        assert_eq!(state.capture().utterance_samples().as_ptr(), pointer);
+        let update = super::prepare_silence_check(&mut state, config, 1_400).unwrap();
+        let action = update.commit();
+        assert_eq!(
+            action,
+            VoicePipelineAction::FinishedUtterance {
+                transcription_input: ParakeetTranscriptionInput::new(16_000, vec![0.25, 0.5])
+                    .unwrap(),
+            }
+        );
+        assert_eq!(state.session().runtime().phase(), RuntimePhase::Processing);
+        assert!(!state.capture().capturing_utterance());
+        assert!(state.capture().utterance_samples().is_empty());
+        assert_eq!(state.capture().utterance_samples().as_ptr(), pointer);
+    }
+
+    #[test]
+    fn dropping_silence_transaction_preserves_state_until_successful_retry() {
+        let config = pipeline_config();
+        for heard_speech in [false, true] {
+            let mut state = silence_test_state(heard_speech, &[0.25, 0.5]);
+            let before = state.clone();
+            let pointer = state.capture().utterance_samples().as_ptr();
+            // Equivalent to a caller returning early after a fallible reset.
+            drop(super::prepare_silence_check(&mut state, config, 1_400).unwrap());
+            assert_same_state(&state, &before);
+            assert_eq!(state.capture().utterance_samples().as_ptr(), pointer);
+            let action = super::prepare_silence_check(&mut state, config, 1_400)
+                .unwrap()
+                .commit();
+            assert_eq!(
+                state.session().runtime().phase(),
+                if heard_speech {
+                    RuntimePhase::Processing
+                } else {
+                    RuntimePhase::Sleeping
+                }
+            );
+            assert_eq!(
+                matches!(action, VoicePipelineAction::ExpiredWithoutSpeech),
+                !heard_speech
+            );
+            assert!(!state.capture().capturing_utterance());
+            assert!(state.capture().utterance_samples().is_empty());
+            assert_eq!(
+                super::prepare_silence_check(&mut state, config, 1_401)
+                    .unwrap()
+                    .commit(),
+                VoicePipelineAction::None
+            );
+        }
+    }
+
+    #[test]
+    fn silence_transaction_validation_errors_preserve_state_and_precedence() {
+        let config = pipeline_config();
+        let cases = [
+            (Vec::new(), TranscriptionInputError::EmptyAudio),
+            (
+                vec![2.0, f32::INFINITY],
+                TranscriptionInputError::NonFiniteSample {
+                    index: 1,
+                    value: f32::INFINITY,
+                },
+            ),
+            (
+                vec![0.0, 2.0],
+                TranscriptionInputError::OutOfRangeSample {
+                    index: 1,
+                    value: 2.0,
+                },
+            ),
+        ];
+        for (samples, expected) in cases {
+            let mut state = silence_test_state(true, &samples);
+            let before = state.clone();
+            assert!(
+                matches!(super::prepare_silence_check(&mut state, config, 1_400), Err(VoicePipelineError::TranscriptionInput(error)) if error == expected)
+            );
+            assert_same_state(&state, &before);
+            let wrong_rate = VoicePipelineConfig::new(config.session(), config.capture(), 44_100);
+            assert!(matches!(
+                super::prepare_silence_check(&mut state, wrong_rate, 1_400),
+                Err(VoicePipelineError::TranscriptionInput(
+                    TranscriptionInputError::UnsupportedSampleRate { .. }
+                ))
+            ));
+            assert_same_state(&state, &before);
+        }
+    }
+
+    #[test]
+    fn silence_transaction_only_validates_audio_at_speech_endpoint() {
+        let config = pipeline_config();
+        let mut state = silence_test_state(true, &[f32::NAN]);
+        let pointer = state.capture().utterance_samples().as_ptr();
+        assert_eq!(
+            super::prepare_silence_check(&mut state, config, 1_399)
+                .unwrap()
+                .commit(),
+            VoicePipelineAction::None
+        );
+        assert!(matches!(
+            super::prepare_silence_check(&mut state, config, 1_400),
+            Err(VoicePipelineError::TranscriptionInput(
+                TranscriptionInputError::NonFiniteSample { index: 0, value }
+            )) if value.is_nan()
+        ));
+        assert_eq!(state.capture().utterance_samples().as_ptr(), pointer);
+        assert!(state.capture().utterance_samples()[0].is_nan());
+        assert!(state.capture().capturing_utterance());
+        assert_eq!(state.session().runtime().phase(), RuntimePhase::Listening);
+        assert_eq!(state.session().voice_turn().last_activity_ms(), Some(200));
+
+        let mut no_speech = silence_test_state(false, &[f32::NAN]);
+        assert_eq!(
+            super::prepare_silence_check(&mut no_speech, config, 1_300)
+                .unwrap()
+                .commit(),
+            VoicePipelineAction::ExpiredWithoutSpeech
+        );
+        assert!(no_speech.capture().utterance_samples().is_empty());
     }
 
     fn immutable_frame_update(
