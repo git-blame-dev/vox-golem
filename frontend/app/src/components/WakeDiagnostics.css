@@ -1,8 +1,9 @@
 .wake-diagnostics {
   margin-block: 1rem;
-  border: 1px solid var(--border-color, #555);
-  border-radius: 0.5rem;
-  padding: 0.75rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 1rem;
+  background: var(--surface-panel);
+  padding: 0.85rem 1rem;
 }
 
 .wake-diagnostics > summary {
@@ -29,18 +30,23 @@
 
 .wake-diagnostics__measurements > div {
   min-width: 0;
+  background: var(--surface-pill);
+  border-radius: 0.75rem;
+  padding: 0.5rem 0.75rem;
 }
 
 .wake-diagnostics__measurements dt {
   font-size: 0.85em;
-  opacity: 0.75;
+  color: var(--text-muted);
 }
 
 .wake-diagnostics__measurements dd {
   margin-inline-start: 0;
   overflow-wrap: anywhere;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
 }
 
 .wake-diagnostics__error {
-  color: var(--error-color, #b42318);
+  color: var(--status-error-text);
 }

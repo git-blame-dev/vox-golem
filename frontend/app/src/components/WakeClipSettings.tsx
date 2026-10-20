@@ -100,23 +100,23 @@ export function WakeClipSettings(): JSX.Element {
   return <section className="settings-panel__row" aria-label="Wake clips">
     <div><strong>Wake clips</strong><p className="settings-panel__hint">Short local clips are saved when the microphone detects a wake. A folder names the detecting model, not necessarily the words spoken. No storage quota or automatic deletion.</p></div>
     {settings === null ? <p>{error ?? 'Loading wake clip settings…'}</p> : <div className="settings-panel__mic-row">
-      <label><input aria-label="Save wake clips" type="checkbox" checked={settings.enabled} disabled={busy} onChange={(event) => void save(event.target.checked, settings.directory)} /> Save each detected wake</label>
-      <label>Save directory<input aria-label="Wake clip directory" value={directory} onChange={(event) => setDirectory(event.target.value)} /></label>
-      <button type="button" disabled={busy || directory === settings.directory} onClick={() => void save(settings.enabled, directory)}>Save directory</button>
-      <button type="button" onClick={() => void refresh(offset)}>Refresh clips</button>
+      <label><input aria-label="Save wake clips" type="checkbox" className="settings-panel__interactive" checked={settings.enabled} disabled={busy} onChange={(event) => void save(event.target.checked, settings.directory)} /> Save each detected wake</label>
+      <label>Save directory<input aria-label="Wake clip directory" className="settings-panel__interactive" value={directory} onChange={(event) => setDirectory(event.target.value)} /></label>
+      <button type="button" className="shell__control" disabled={busy || directory === settings.directory} onClick={() => void save(settings.enabled, directory)}>Save directory</button>
+      <button type="button" className="shell__control" onClick={() => void refresh(offset)}>Refresh clips</button>
       <p className="settings-panel__hint">Showing up to 100 clips per page; older clips remain saved.</p>
       <div>
-        <button type="button" disabled={offset === 0} onClick={() => void refresh(Math.max(0, offset - 100))}>Newer clips</button>{' '}
-        <button type="button" disabled={!hasOlder} onClick={() => void refresh(offset + 100)}>Older clips</button>
+        <button type="button" className="shell__control" disabled={offset === 0} onClick={() => void refresh(Math.max(0, offset - 100))}>Newer clips</button>{' '}
+        <button type="button" className="shell__control" disabled={!hasOlder} onClick={() => void refresh(offset + 100)}>Older clips</button>
       </div>
-      {error !== null ? <p role="alert">{error}</p> : null}
+      {error !== null ? <p role="alert" className="shell__error">{error}</p> : null}
       <ul>{clips.map((clip) => <li key={`${clip.profile}/${clip.id}`}>
         <strong>{clip.model_file}</strong> · revision {clip.model_revision} · {new Date(clip.created_ms).toLocaleString()} · score {clip.confidence.toFixed(2)}{' '}
-        <select aria-label="Clip label" value={clip.label} onChange={(event) => void label(clip, event.target.value as Clip['label'])}>
+        <select aria-label="Clip label" className="settings-panel__interactive" value={clip.label} onChange={(event) => void label(clip, event.target.value as Clip['label'])}>
           <option value="unreviewed">Unreviewed</option><option value="true_wake">True wake</option><option value="false_wake">False wake</option>
         </select>{' '}
-        <button type="button" onClick={() => void play(clip)}>Play</button>{' '}
-        <button type="button" onClick={() => void remove(clip)}>Delete</button>
+        <button type="button" className="shell__control" onClick={() => void play(clip)}>Play</button>{' '}
+        <button type="button" className="shell__control" onClick={() => void remove(clip)}>Delete</button>
       </li>)}</ul>
     </div>}
   </section>

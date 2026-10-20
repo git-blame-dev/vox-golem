@@ -27,6 +27,10 @@
   --on-danger: #ffffff;
   --warning-bg: rgb(88 56 10 / 0.92);
   --on-warning: #ffffff;
+  --status-warning-bg: rgb(251 188 4 / 0.14);
+  --status-warning-border: rgb(251 188 4 / 0.36);
+  --status-warning-text: #fdd663;
+  --status-error-text: var(--danger);
   --info-bg: rgb(16 55 102 / 0.92);
   --on-info: #ffffff;
   --message-assistant-bg: transparent;
@@ -68,6 +72,9 @@
   --message-user-bg: #282a2c;
   --border-soft: rgb(255 255 255 / .08);
   --border-strong: rgb(168 199 250 / .3);
+  --status-warning-bg: rgb(251 188 4 / 0.16);
+  --status-warning-border: rgb(251 188 4 / 0.4);
+  --status-warning-text: #fde293;
 }
 
 .shell > * {
@@ -91,6 +98,10 @@
   --danger: #8c1d18;
   --danger-bg: #8c1d18;
   --warning-bg: #7a4f00;
+  --status-warning-bg: rgb(254 247 224 / 0.92);
+  --status-warning-border: rgb(176 96 0 / 0.34);
+  --status-warning-text: #5f3800;
+  --status-error-text: #8c1d18;
   --info-bg: #17396a;
   --message-user-bg: #e9eef6;
   --focus-ring: #0b57d0;
@@ -719,41 +730,48 @@
 
 .composer__wake {
   display: inline-flex;
-  flex-direction: column;
-  gap: 0.05rem;
-  padding: 0.2rem 0.45rem;
-  border-radius: 0.55rem;
-  border: 1px solid var(--border-strong);
-  background: var(--surface-glass);
-  min-width: 6.2rem;
+  align-items: center;
+  justify-content: center;
+  min-height: 36px;
+  padding: 0.25rem 0.65rem;
+  border-radius: 999px;
+  border: 1px solid var(--border-soft);
+  background: var(--surface-pill);
+  font-variant-numeric: tabular-nums;
 }
 
 .composer__wake-primary {
-  font-size: 0.72em;
+  font-size: 0.78em;
   line-height: 1.1;
-  color: var(--text-primary);
+  color: var(--text-muted);
   font-weight: 600;
 }
 
 .composer__wake--low {
-  border-color: #d8dbe0;
-  background: #f8f9fb;
+  border-color: var(--border-soft);
+  background: var(--surface-pill);
+}
+
+.composer__wake--low .composer__wake-primary {
+  color: var(--text-muted);
 }
 
 .composer__wake--medium {
-  border-color: #e5c37a;
-  background: #fff6e0;
+  border-color: var(--status-warning-border);
+  background: var(--status-warning-bg);
+}
+
+.composer__wake--medium .composer__wake-primary {
+  color: var(--status-warning-text);
 }
 
 .composer__wake--high {
-  border-color: #91d1ad;
-  background: #e9f8ef;
+  border-color: var(--accent-primary);
+  background: var(--accent-primary);
 }
 
-.composer__wake--low .composer__wake-primary,
-.composer__wake--medium .composer__wake-primary,
 .composer__wake--high .composer__wake-primary {
-  color: #17324f;
+  color: var(--accent-primary-text);
 }
 
 .composer__button {

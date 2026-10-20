@@ -1,10 +1,11 @@
 export type ControlIconState = 'ready' | 'busy' | 'listening' | 'finishing' | 'generating' | 'speaking' | 'between-turns' | 'unavailable' | 'error' | 'off'
 
-export function ControlIcon({ kind, state }: { readonly kind: 'plus' | 'mic' | 'conversation' | 'speaker' | 'model' | 'send' | 'search' | 'settings' | 'finish' | 'stop' | 'stop-send' | 'copy' | 'check'; readonly state?: ControlIconState }) {
+export function ControlIcon({ kind, state }: { readonly kind: 'plus' | 'mic' | 'conversation' | 'notes' | 'speaker' | 'model' | 'send' | 'search' | 'settings' | 'finish' | 'stop' | 'stop-send' | 'copy' | 'check'; readonly state?: ControlIconState }) {
   const paths = {
     plus: 'M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z',
     mic: 'M9 5a3 3 0 0 1 6 0v7a3 3 0 0 1-6 0z M5 10v2a7 7 0 0 0 14 0v-2 M12 19v3 M8 22h8',
     conversation: 'M4 4h16v12H9l-5 4z M8 8h8 M8 12h6',
+    notes: 'M5 3h10l4 4v14H5z M15 3v5h4 M8 12h8 M8 16h6',
     speaker: 'M3 9h4l5-4v14l-5-4H3z M16 8a6 6 0 0 1 0 8 M19 5a10 10 0 0 1 0 14',
     model: 'M7 7h10v10H7z M9 2v5 M15 2v5 M9 17v5 M15 17v5 M2 9h5 M2 15h5 M17 9h5 M17 15h5',
     send: 'M3 3l18 9-18 9 4-9z M7 12h14',

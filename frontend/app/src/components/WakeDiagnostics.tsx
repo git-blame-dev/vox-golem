@@ -191,12 +191,12 @@ export function WakeDiagnostics({ disabled = false }: WakeDiagnosticsProps): JSX
         <p>This diagnostics panel keeps numeric data only and does not upload audio. Wake clips may separately save local audio on detection; manage them in Settings. Keep this panel open during the test and export the marked snapshot before closing; snapshots are session-local.</p>
         <div className="wake-diagnostics__actions">
           {collecting
-            ? <button type="button" disabled={pending} onClick={() => void stop()}>Stop collection</button>
-            : <button type="button" disabled={disabled || pending} onClick={() => void start()}>Start collection</button>}
-          <button type="button" disabled={disabled || !collecting || pending} onClick={() => void mark('wake_attempt')}>Mark wake attempt</button>
-          <button type="button" disabled={disabled || !collecting || pending} onClick={() => void mark('false_wake')}>Mark false wake</button>
-          <button type="button" disabled={snapshot === null} onClick={() => snapshot && exportSnapshot(snapshot, 'wake-diagnostics.json')}>Export current snapshot</button>
-          <button type="button" disabled={markedSnapshot === null} onClick={() => markedSnapshot && exportSnapshot(markedSnapshot, 'wake-diagnostics-marked.json')}>Export marked snapshot</button>
+            ? <button type="button" className="shell__control" disabled={pending} onClick={() => void stop()}>Stop collection</button>
+            : <button type="button" className="shell__control" disabled={disabled || pending} onClick={() => void start()}>Start collection</button>}
+          <button type="button" className="shell__control" disabled={disabled || !collecting || pending} onClick={() => void mark('wake_attempt')}>Mark wake attempt</button>
+          <button type="button" className="shell__control" disabled={disabled || !collecting || pending} onClick={() => void mark('false_wake')}>Mark false wake</button>
+          <button type="button" className="shell__control" disabled={snapshot === null} onClick={() => snapshot && exportSnapshot(snapshot, 'wake-diagnostics.json')}>Export current snapshot</button>
+          <button type="button" className="shell__control" disabled={markedSnapshot === null} onClick={() => markedSnapshot && exportSnapshot(markedSnapshot, 'wake-diagnostics-marked.json')}>Export marked snapshot</button>
         </div>
         {error !== null ? <p className="wake-diagnostics__error" role="alert">Wake diagnostics error: {error}</p> : null}
         {snapshot !== null ? (

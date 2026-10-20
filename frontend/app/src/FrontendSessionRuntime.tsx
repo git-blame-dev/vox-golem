@@ -2,28 +2,36 @@ import { memo, useCallback, useEffect, useLayoutEffect } from 'react'
 import { FrontendTiming, reportAppBenchmarkStage } from './lib/frontendTiming'
 import { useSessionView } from './FrontendSession'
 import type { FrontendSession } from './FrontendSession'
-import { SessionAuthority, cancelPromptProjectionFrame, sessionAuthority, useSessionControls, useSessionIntents } from './SessionAuthority'
+import { SessionAuthority, cancelPromptProjectionFrame, sessionAuthority, useSessionIntents, useSessionView as useAuthorityView } from './SessionAuthority'
 import type { PromptProjection } from './SessionAuthority'
-import { applySnapshotModelOptions, capabilityIsAvailable, capabilityMap, generationIneligibility, instantMatchesResponseProfile } from './sessionPolicy'
+import {
+  appUpdateBlocksRuntime,
+  applySnapshotModelOptions,
+  capabilityIsAvailable,
+  capabilityLabel,
+  capabilityMap,
+  instantMatchesResponseProfile,
+  localInstantCanRetry,
+  parseUiTextSize,
+  parseUiTheme,
+  sameExternalView,
+  UI_TEXT_SIZE_STEPS,
+  usePresentation,
+  voiceInputReady,
+} from './sessionPolicy'
+import type { SessionViewProps } from './sessionPolicy'
 import type { ChangeEvent, FormEvent, KeyboardEvent, ReactNode } from 'react'
-import { SETTINGS_DIALOG_ID, useSettingsNavigation } from './lib/useSettingsNavigation'
+import { useSettingsNavigation } from './lib/useSettingsNavigation'
 import { persistAudioInputDeviceId } from './lib/audioInputPreference'
 import { useAndroidVoiceAdapter } from './lib/useAndroidVoiceAdapter'
-import { ResponseAnnouncements, SessionTranscript } from './SessionTranscript'
-import { PromptComposer } from './components/PromptComposer'
-import { AndroidVoiceControlsProvider, AndroidComposerVoiceControl, AndroidVoiceSecondaryControls } from './components/AndroidVoiceControls'
-import { SpeechSettings } from './components/SpeechSettings'
+import { AndroidVoiceControlsProvider } from './components/AndroidVoiceControls'
+import { SessionComposer } from './components/SessionComposer'
+import { SessionConversation } from './components/SessionConversation'
+import { SessionSettings } from './components/SessionSettings'
+import { SessionToolbar } from './components/SessionToolbar'
 import type { AndroidVoiceContext, AndroidVoiceStatus } from './lib/androidVoice'
-import { NewVoiceShortcutSettings } from './components/NewVoiceShortcutSettings'
 import { isConfirmedNewVoiceContext, NEW_VOICE_SHORTCUT_EVENT } from './lib/newVoiceShortcut'
 import { canonicalMessageId, replaceCommittedTranscript, settleCanonicalAnswerStages } from './committedTranscript'
-import { InstantModelSelect } from './components/InstantModelSelect'
-import { CopyConversationButton } from './components/ChatBubble'
-import { ControlIcon } from './components/ControlIcon'
-import headerIcon from '../../../apps/desktop-tauri/src-tauri/icons/icon.svg?url'
-import { UserNoticeToast } from './components/UserNoticeToast'
-import { UpdateSettings } from './components/UpdateSettings'
-import { ChatGptAuth } from './components/ChatGptAuth'
 import { createNativeAudioLifecycle, playCueWithFallback, prepareVoiceCues } from './lib/audioCues'
 import { shouldSubmitComposer } from './lib/composer'
 import { listAudioInputDevices, startLiveAudioSource } from './lib/liveAudioSource'
@@ -37,25 +45,22 @@ import {
 } from './lib/runtimeControl'
 import type { RuntimeControlArgs } from './lib/runtimeControl'
 import {
+  CAPABILITY_IDS,
   DEFAULT_CUE_ASSET_PATHS,
   DEFAULT_INITIAL_SILENCE_TIMEOUT_MS,
   DEFAULT_SILENCE_TIMEOUT_MS,
   isStartupStateSettled,
   loadStartupState,
-  parseStartupState,
+  startupStateFromSnapshot,
 } from './lib/startupState'
-import { buildAndroidStartupState, cacheAndroidSnapshot, getAndroidPreferencePublicationRevision, getTauriInternals, invokeTauriCommand, isAndroidRuntime, isBrowserPreviewRuntime, isNativeTauriRuntime } from './lib/tauri'
+import { cacheAndroidSnapshot, getAndroidPreferencePublicationRevision, getTauriInternals, invokeTauriCommand, isAndroidRuntime, isBrowserPreviewRuntime, isNativeTauriRuntime } from './lib/tauri'
 import { teardownBrowserPreviewRuntime } from './lib/browserRuntime'
 import { useAppUpdates } from './lib/useAppUpdates'
-import type { UpdateState } from './lib/useAppUpdates'
 import { instantOptions, parseAssistantSettings, serializeAssistantSettings } from './lib/assistantSettings'
 import type { AssistantSettings } from './lib/assistantSettings'
 import { acceptsPartialTranscriptionEvent, parsePartialTranscriptionEvent } from './lib/partialTranscription'
 import { parseCompletionEvent } from './lib/completionEvents'
 import { createVoiceTelemetryRecorder } from './lib/voiceTelemetry'
-import { WakeDiagnostics } from './components/WakeDiagnostics'
-import { WakeClipSettings } from './components/WakeClipSettings'
-import { CaptureHistory } from './components/CaptureHistory'
 import { createWakeClipBuffer } from './lib/wakeClipBuffer'
 import {
   createVoiceActivityState,
@@ -83,28 +88,6 @@ const NOTICE_AUTO_DISMISS_MS = 4_000
 const WAKE_CONFIDENCE_PEAK_HOLD_MS = 1_000
 const MAX_NOTICE_QUEUE_LENGTH = 3
 const ASSISTANT_SETTINGS_WRITE_FAILURE_TITLE = 'Assistant settings failed'
-const UI_TEXT_SIZE_STEPS: readonly UiTextSize[] = ['small', 'medium', 'large', 'extra_large']
-const DEFAULT_UI_TEXT_SIZE: UiTextSize = 'medium'
-const DEFAULT_UI_THEME: UiTheme = 'dark'
-
-const voiceInputReady = (state: StartupState): boolean =>
-  state.kind === 'ready' &&
-  state.voiceInputAvailable &&
-  hasAvailableCapabilities(state, ['wake_word', 'vad', 'parakeet'])
-
-const UI_TEXT_SIZE_LABELS: Record<UiTextSize, string> = {
-  small: 'Small',
-  medium: 'Medium',
-  large: 'Large',
-  extra_large: 'Extra Large',
-}
-
-const UI_TEXT_SIZE_PERCENTAGES: Record<UiTextSize, string> = {
-  small: '90%',
-  medium: '100%',
-  large: '112.5%',
-  extra_large: '125%',
-}
 
 type RuntimeDiagnosticKind =
   | 'frontend_notice'
@@ -115,15 +98,8 @@ type RuntimeDiagnosticKind =
   | 'audio'
   | 'profile'
 
-function appUpdateBlocksRuntime(state: UpdateState): boolean {
-  return state.kind === 'snapshot' && (
-    state.snapshot.phase === 'installing' ||
-    state.snapshot.phase === 'restart_required'
-  )
-}
-
 function useFrontendSessionRuntime(session: SessionAuthority) {
-  useSessionControls(session)
+  useAuthorityView(session, 'runtime')
   const timingRef = session.operationRef('frontendTiming', () => new FrontendTiming())
   useLayoutEffect(() => { timingRef.current.startup('SHELL_DOM_COMMITTED') }, [timingRef])
   const supportsDesktopRuntime = !isAndroidRuntime && !isBrowserPreviewRuntime()
@@ -319,8 +295,6 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   const ttsPersistedRevisionRef = session.preferences.tts.persistedRevision
   const ttsPersistedValueRef = session.preferences.tts.persisted
   const ttsPersistedInitializedRef = session.preferences.tts.initialized
-  const uiTextSizeWriteRevisionRef = session.preferences.textSize.revision
-  const uiThemeWriteRevisionRef = session.preferences.theme.revision
   const ttsWriteRevisionRef = session.preferences.tts.revision
   const wakeConfidenceRef = session.fieldRef('wakeConfidence')
   const pendingWakeConfidenceRef = session.operationRef<number | null>('wakeConfidencePending', () => null)
@@ -609,7 +583,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     snapshotModelOptionsRef.current = acceptedSnapshot.modelOptions
     setSnapshotModelOptions(acceptedSnapshot.modelOptions)
     const controlledState = isAndroidRuntime && startupStateRef.current.kind === 'loading'
-      ? parseStartupState(buildAndroidStartupState(acceptedSnapshot))
+      ? startupStateFromSnapshot(acceptedSnapshot)
       : applySnapshotControlState(
           startupStateRef.current,
           capabilities,
@@ -1010,35 +984,17 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   }, [setUiTheme, snapshotHydrationState, uiThemePendingRevisionRef, uiThemePersistedInitializedRef, uiThemePersistedRevisionRef, uiThemePersistedValueRef])
 
   const persistUiTextSize = async (nextTextSize: UiTextSize, previousTextSize: UiTextSize): Promise<void> => {
-    const revision = ++uiTextSizeWriteRevisionRef.current
-    uiTextSizePendingRevisionRef.current = revision
-    setUiTextSize(nextTextSize)
-
-    try {
-      const write = session.preferences.textSize.enqueue(() =>
-        invokeTauriCommand('set_ui_text_size', { textSize: nextTextSize }),
-      )
-      const payload = await write
-      const persistedTextSize = parseUiTextSize(payload)
-      uiTextSizePersistedRevisionRef.current = revision
-      uiTextSizePersistedValueRef.current = persistedTextSize
-      uiTextSizePersistedInitializedRef.current = true
-      if (revision === uiTextSizeWriteRevisionRef.current) {
-        uiTextSizePendingRevisionRef.current = null
-        setUiTextSize(persistedTextSize)
-      }
-    } catch (error) {
-      if (revision !== uiTextSizeWriteRevisionRef.current) return
-      uiTextSizePendingRevisionRef.current = null
-      setUiTextSize(uiTextSizePersistedInitializedRef.current
-        ? uiTextSizePersistedValueRef.current
-        : initialSnapshotPreferencesRef.current?.uiTextSize ?? previousTextSize)
-      addNotice({
+    await session.preferences.textSize.mutate({
+      next: nextTextSize,
+      fallback: initialSnapshotPreferencesRef.current?.uiTextSize ?? previousTextSize,
+      apply: setUiTextSize,
+      save: async () => parseUiTextSize(await invokeTauriCommand('set_ui_text_size', { textSize: nextTextSize })),
+      onError: (error) => addNotice({
         tone: 'error',
         title: 'Setting not saved',
         message: toDisplayErrorMessage(error),
-      })
-    }
+      }),
+    })
   }
 
   const adjustUiTextSize = (direction: -1 | 1): void => {
@@ -1054,37 +1010,22 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   }
 
   const persistUiTheme = async (nextTheme: UiTheme, previousTheme: UiTheme): Promise<void> => {
-    const revision = ++uiThemeWriteRevisionRef.current
     setUiThemeWriteError(null)
-    uiThemePendingRevisionRef.current = revision
-    setUiTheme(nextTheme)
-
-    try {
-      const write = session.preferences.theme.enqueue(() =>
-        invokeTauriCommand('set_ui_theme', { theme: nextTheme }),
-      )
-      const payload = await write
-      const persistedTheme = parseUiTheme(payload)
-      uiThemePersistedRevisionRef.current = revision
-      uiThemePersistedValueRef.current = persistedTheme
-      uiThemePersistedInitializedRef.current = true
-      if (revision === uiThemeWriteRevisionRef.current) {
-        uiThemePendingRevisionRef.current = null
-        setUiTheme(persistedTheme)
-      }
-    } catch (error) {
-      if (revision !== uiThemeWriteRevisionRef.current) return
-      uiThemePendingRevisionRef.current = null
-      setUiThemeWriteError(toDisplayErrorMessage(error))
-      setUiTheme(uiThemePersistedInitializedRef.current
-        ? uiThemePersistedValueRef.current
-        : initialSnapshotPreferencesRef.current?.uiTheme ?? previousTheme)
-      addNotice({
-        tone: 'error',
-        title: 'Theme not saved',
-        message: toDisplayErrorMessage(error),
-      })
-    }
+    await session.preferences.theme.mutate({
+      next: nextTheme,
+      fallback: initialSnapshotPreferencesRef.current?.uiTheme ?? previousTheme,
+      apply: setUiTheme,
+      save: async () => parseUiTheme(await invokeTauriCommand('set_ui_theme', { theme: nextTheme })),
+      onError: (error) => {
+        const message = toDisplayErrorMessage(error)
+        setUiThemeWriteError(message)
+        addNotice({
+          tone: 'error',
+          title: 'Theme not saved',
+          message,
+        })
+      },
+    })
   }
 
   const changeUiTheme = (nextTheme: UiTheme): void => {
@@ -1184,6 +1125,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   useEffect(() => {
     if (!startupLoadAllowed) return undefined
     let active = true
+    let initialStartupCheck = true
 
     void (async () => {
       while (active) {
@@ -1197,6 +1139,8 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
 
         const previousState = startupStateRef.current
         const previousKind = previousState.kind
+        const isFirstStartupPass = initialStartupCheck
+        initialStartupCheck = false
         const hydrated = previousKind !== 'loading'
         if (nextState.kind === 'error' && hydrated && previousKind === 'ready') {
           await new Promise((resolve) => window.setTimeout(resolve, 1_000))
@@ -1219,7 +1163,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
             if (isAndroidRuntime && ['opencode', 'local_quality', 'qwen_prediction', 'deep', 'review', 'wake_word', 'vad', 'parakeet', 'tts'].includes(id)) return false
             if (['wake_word', 'vad', 'parakeet', 'tts'].includes(id)) return false
             if (state !== 'not_configured' && state !== 'unavailable' && state !== 'failed') return false
-            if (previousKind !== 'ready') return true
+            if (previousKind !== 'ready' || isFirstStartupPass) return true
             const previousCapability = previousState.capabilities.find((capability) => capability.id === id)
             return previousCapability !== undefined && previousCapability.state !== state
           })
@@ -1241,6 +1185,8 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
             message: nextState.message,
           })
         }
+
+        if (isAndroidRuntime && isStartupStateSettled(nextState)) return
 
         await new Promise((resolve) => window.setTimeout(
           resolve,
@@ -2570,51 +2516,31 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   }
 
   const toggleTts = async (enabled: boolean): Promise<void> => {
-    const revision = ++ttsWriteRevisionRef.current
-    ttsPendingRevisionRef.current = revision
     const previousEnabled = ttsEnabledRef.current
-    ttsEnabledRef.current = enabled
-    setTtsEnabled(enabled)
     if (!enabled) cancelTts()
-
-    try {
-      const write = session.preferences.tts.enqueue(() =>
-        invokeTauriCommand('set_tts_enabled', { enabled }),
-      )
-      const payload = await write
-      const persistedEnabled =
-        typeof payload === 'object' &&
-        payload !== null &&
-        'enabled' in payload &&
-        typeof payload.enabled === 'boolean'
+    await session.preferences.tts.mutate({
+      next: enabled,
+      fallback: initialSnapshotPreferencesRef.current?.ttsEnabled ?? previousEnabled,
+      apply: (value) => {
+        ttsEnabledRef.current = value
+        setTtsEnabled(value)
+      },
+      save: async () => {
+        const payload = await invokeTauriCommand('set_tts_enabled', { enabled })
+        return typeof payload === 'object' && payload !== null && 'enabled' in payload && typeof payload.enabled === 'boolean'
           ? payload.enabled
           : enabled
-      ttsPersistedRevisionRef.current = revision
-      ttsPersistedValueRef.current = persistedEnabled
-      ttsPersistedInitializedRef.current = true
-      if (revision !== ttsWriteRevisionRef.current) return
-      if (revision === ttsWriteRevisionRef.current) {
-        ttsPendingRevisionRef.current = null
-        ttsEnabledRef.current = ttsPersistedValueRef.current
-        setTtsEnabled(ttsPersistedValueRef.current)
-      }
-    } catch (error) {
-      if (revision !== ttsWriteRevisionRef.current) return
-      const message = toDisplayErrorMessage(error)
-
-      ttsPendingRevisionRef.current = null
-      const rollbackEnabled = ttsPersistedInitializedRef.current
-        ? ttsPersistedValueRef.current
-        : initialSnapshotPreferencesRef.current?.ttsEnabled ?? previousEnabled
-      ttsEnabledRef.current = rollbackEnabled
-      setTtsEnabled(rollbackEnabled)
-      addNotice({
-        tone: 'error',
-        title: 'TTS setting failed',
-        message,
-      })
-      recordRuntimeDiagnostic('tts', `TTS toggle error: ${message}`)
-    }
+      },
+      onError: (error) => {
+        const message = toDisplayErrorMessage(error)
+        addNotice({
+          tone: 'error',
+          title: 'TTS setting failed',
+          message,
+        })
+        recordRuntimeDiagnostic('tts', `TTS toggle error: ${message}`)
+      },
+    })
   }
 
   useEffect(() => {
@@ -3161,21 +3087,8 @@ export function FrontendSessionRuntime({ session }: { readonly session: Frontend
   return <SessionViews session={session} view={view} />
 }
 
-export type FrontendSessionIntents = ReturnType<typeof useFrontendSessionRuntime>['actions']
-
-type SessionViewProps = { readonly session: FrontendSession; readonly view: ReturnType<typeof useFrontendSessionRuntime> }
-
-// Native/update/navigation adapters may change independently of session state.
-// A state publication is consumed by the named boundary, not by all siblings.
-function sameExternalView(previous: SessionViewProps, next: SessionViewProps): boolean {
-  const sameValues = (left: object, right: object) => Object.keys(left).every((key) =>
-    Object.is(Reflect.get(left, key), Reflect.get(right, key)))
-  return previous.session === next.session && previous.view.actions === next.view.actions &&
-    sameValues(previous.view.navigation, next.view.navigation) &&
-    sameValues(previous.view.appUpdates, next.view.appUpdates) &&
-    Object.entries(previous.view.voice).every(([key, value]) =>
-      typeof value === 'function' || Object.is(value, Reflect.get(next.view.voice, key)))
-}
+export type FrontendSessionRuntimeView = ReturnType<typeof useFrontendSessionRuntime>
+export type FrontendSessionIntents = FrontendSessionRuntimeView['actions']
 
 const SessionViews = memo(function SessionViews({ session, view }: SessionViewProps) {
   const { uiTextSize, uiTheme, runtimeStatus } = useSessionView(session, 'shell')
@@ -3199,417 +3112,9 @@ function SessionVoiceControls({ session, view, children }: SessionViewProps & { 
     interactionBlocked={view.navigation.settingsOpen}>{children}</AndroidVoiceControlsProvider>
 }
 
-function usePresentation(session: FrontendSession, view: SessionViewProps['view'], name: Parameters<typeof session.getViewSnapshot>[0]) {
-  useSessionView(session, name)
-  const state = session.getControlsSnapshot()
-  const { startupState, assistantSettings, runtimeStatus, promptState, resetPending,
-    assistantSettingsPending, androidVoiceActive, isSwitchingResponseProfile, snapshotControlsFresh,
-    micActive, micStarting } = state
-  const options = session.getModelsSnapshot()
-  const selectedInstantOption = options.instantAssistantOptions.find((option) => option.value === assistantSettings.instant)
-  const selectedInstantProfileReady = instantMatchesResponseProfile(startupState, assistantSettings.instant)
-  const nativeConversationNeedsRecovery = ['saved_local_state_failed', 'draft_not_saved', 'storage_error'].includes(state.androidAssistant?.error ?? '')
-  const updateRuntimeBlocked = appUpdateBlocksRuntime(view.appUpdates.state)
-  const assistantControlsDisabled = startupState.kind !== 'ready' || assistantSettingsPending || isSwitchingResponseProfile || !snapshotControlsFresh || updateRuntimeBlocked || androidVoiceActive
-  const instantControlsDisabled = assistantControlsDisabled || resetPending || promptState !== 'idle' || runtimeStatus === 'processing' || runtimeStatus === 'executing'
-  const voiceControlsUsable = snapshotControlsFresh || (!state.snapshotControlsInvalidated && state.snapshotHydrationState === 'pending')
-  const sizeIndex = Math.max(0, UI_TEXT_SIZE_STEPS.indexOf(state.uiTextSize))
-  return {
-    ...state, ...options, appUpdates: view.appUpdates, supportsDesktopRuntime: !isAndroidRuntime && !isBrowserPreviewRuntime(),
-    updateRuntimeBlocked, selectedInstantOption, selectedInstantProfileReady, nativeConversationNeedsRecovery,
-    selectedInstantRetryable: localInstantCanRetry(startupState, assistantSettings.instant),
-    assistantControlsDisabled, instantControlsDisabled,
-    canSend: generationIneligibility(state, selectedInstantOption?.available === true, updateRuntimeBlocked) === null &&
-      !androidVoiceActive && promptState === 'idle' && runtimeStatus === 'sleeping' && state.composerValue.trim().length > 0,
-    canToggleMic: !updateRuntimeBlocked && (micActive || (voiceControlsUsable && voiceInputReady(startupState) && !micStarting && !resetPending)),
-    canToggleTts: startupState.kind === 'ready' && capabilityIsAvailable(startupState, 'tts') && !isSwitchingResponseProfile && !updateRuntimeBlocked,
-    voiceInputUnavailableReason: startupState.kind === 'ready' ? startupState.voiceInputError ?? (startupState.capabilities.filter((capability) =>
-      ['wake_word', 'vad', 'parakeet'].includes(capability.id) && capability.state !== 'available').map((capability) => capability.reason ?? `${capabilityLabel(capability.id)} unavailable`).join('; ') || 'required voice capabilities are unavailable') : 'voice input is still starting',
-    updateInstallationDisabled: startupState.kind !== 'ready' || runtimeStatus !== 'sleeping' || promptState !== 'idle' || resetPending ||
-      isSwitchingResponseProfile || assistantSettingsPending || micStarting || state.ttsPlaying || state.pendingTtsCommands > 0,
-    selectedAudioInputDevice: state.audioInputDevices.find((device) => device.deviceId === state.audioInputDeviceId),
-    canDecreaseTextSize: sizeIndex > 0, canIncreaseTextSize: sizeIndex < UI_TEXT_SIZE_STEPS.length - 1,
-    customFailure: startupState.kind === 'ready' || startupState.kind === 'warming_model' ? startupState.capabilities.find((capability) =>
-      capability.id === 'custom_provider' && (capability.state === 'failed' || capability.state === 'unavailable')) : undefined,
-    canEnableDeep: options.deepAssistantOptions.some((option) => option.value === assistantSettings.deep && option.available),
-    canEnableReview: options.reviewAssistantOptions.some((option) => option.value === assistantSettings.review && option.available),
-    headerBusy: androidVoiceActive || ['listening', 'processing', 'executing'].includes(runtimeStatus) || promptState !== 'idle' || resetPending || isSwitchingResponseProfile || startupState.kind === 'warming_model',
-  }
-}
-
-const SessionToolbar = memo(function SessionToolbar({ session, view }: SessionViewProps) {
-  const {
-    updateRuntimeBlocked, shortcutStaging, androidAssistant, androidConversationId,
-    headPagePending, androidVoiceActive, voiceNotesOpen,
-    snapshotControlsFresh,
-    promptState, resetPending,
-    headerBusy,
-    supportsDesktopRuntime, ttsPlaying, ttsEnabled, canToggleTts,
-  } = usePresentation(session, view, 'toolbar')
-  const { settingsOpen, settingsButtonRef, openSettings } = view.navigation
-  const {
-    resetSession,
-    setVoiceNotesOpen, selectAndroidConversation, toggleTts,
-  } = view.actions
-  const notesControl = <button type="button" className="shell__control shell__icon-control" aria-label={voiceNotesOpen ? 'Chat' : 'Voice notes'} title={voiceNotesOpen ? 'Chat' : 'Voice notes'} aria-pressed={voiceNotesOpen} onClick={() => setVoiceNotesOpen((open) => !open)}>
-    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 3h10l4 4v14H5z M15 3v5h4 M8 12h8 M8 16h6" /></svg>
-  </button>
-  const conversationControl = androidAssistant !== null ? <label className="shell__control shell__icon-control shell__conversation-picker" title={androidAssistant.conversations.find((item) => item.id === androidConversationId)?.title ?? 'Conversation'}>
-    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 4h16v12H9l-5 4z M8 8h8 M8 12h6" /></svg>
-    <select className="shell__conversation-select" aria-label="Conversation" value={androidConversationId} disabled={shortcutStaging || resetPending || promptState !== 'idle' || androidVoiceActive || headPagePending || !snapshotControlsFresh} onChange={(event) => void selectAndroidConversation('select_conversation', event.target.value)}>
-      <option value="0" disabled>New draft</option>
-      {androidAssistant.conversations.map((conversation) => <option key={conversation.id} value={conversation.id}>{conversation.title}</option>)}
-    </select>
-  </label> : null
-  const exportConversationControl = <CopyConversationButton session={session} disabled={shortcutStaging || resetPending || updateRuntimeBlocked} />
-  const newChatControl = <button type="button" className="shell__control shell__new-chat shell__icon-control" onClick={() => void resetSession()} aria-label="New Chat" aria-busy={resetPending} title={resetPending ? 'Starting new chat…' : 'New Chat'} disabled={resetPending || updateRuntimeBlocked}>
-    <ControlIcon kind="plus" />
-  </button>
-  const settingsControl = <button ref={settingsButtonRef} type="button" className={`shell__control shell__settings-button${isAndroidRuntime ? ' shell__icon-control' : ''}`} onClick={openSettings} aria-label="Settings" aria-haspopup="dialog" aria-controls={SETTINGS_DIALOG_ID} aria-expanded={settingsOpen} title="Settings">
-    {isAndroidRuntime ? <ControlIcon kind="settings" /> : '⚙'}
-  </button>
-  const desktopSpeakerState: import('./components/ControlIcon').ControlIconState = ttsPlaying ? 'speaking' : ttsEnabled ? 'ready' : canToggleTts ? 'off' : 'unavailable'
-  const desktopSpeakerDescription = ttsPlaying ? 'Speaking…' : ttsEnabled ? 'Speak replies enabled' : canToggleTts ? 'Speak replies off' : 'Speech output is unavailable'
-  const desktopSpeakerControl = supportsDesktopRuntime ? (
-    <button
-      type="button"
-      className="shell__control shell__icon-control"
-      aria-label="Speak replies"
-      title={`Speak replies: ${desktopSpeakerDescription}`}
-      aria-pressed={ttsEnabled}
-      disabled={!canToggleTts && !ttsEnabled}
-      onClick={() => void toggleTts(!ttsEnabled)}
-    >
-      <ControlIcon kind="speaker" state={desktopSpeakerState} />
-      <span className="shell__overflow-label" aria-hidden="true">Speak replies</span>
-    </button>
-  ) : null
-
-  return (
-      <header className="shell__header" aria-label="VoxGolem">
-        <div className="shell__identity" data-shell-identity>
-          <img className="shell__logo" src={headerIcon} alt="VoxGolem" width={40} height={40} data-busy={headerBusy} />
-          <div className="shell__runtime">
-            {isBrowserPreviewRuntime() ? <span data-browser-preview>Browser preview</span> : null}
-          </div>
-        </div>
-        <div className="shell__header-actions" role={isAndroidRuntime ? 'group' : undefined} aria-label={isAndroidRuntime ? 'Android toolbar' : undefined} aria-describedby={isAndroidRuntime && shortcutStaging ? 'new-voice-draft-status' : undefined}>
-          {isAndroidRuntime ? <>{!voiceNotesOpen ? <AndroidVoiceSecondaryControls /> : null}{notesControl}{conversationControl}{exportConversationControl}{newChatControl}{settingsControl}</> : null}
-          {!isAndroidRuntime ? <>{desktopSpeakerControl}{exportConversationControl}{newChatControl}{settingsControl}</> : null}
-        </div>
-      </header>
-  )
-}, sameExternalView)
-
-const SessionConversation = memo(function SessionConversation({ session, view }: SessionViewProps) {
-  const { voiceNotesOpen,
-    shortcutStaging, composerValue, uiTextSize, notices } = usePresentation(session, view, 'conversation')
-  const { setVoiceNotesOpen, setNoticeInteraction } = view.actions
-  return voiceNotesOpen ? <CaptureHistory onBack={() => setVoiceNotesOpen(false)} /> : <>
-      <div className="conversation-region">
-        <SessionTranscript session={session} staging={shortcutStaging} composerValue={composerValue} textSize={uiTextSize} noticeId={notices[0]?.id} />
-
-        <div
-          className="conversation-notice"
-          onFocus={() => setNoticeInteraction((current) => ({ ...current, focused: true }))}
-          onBlur={(event) => {
-            if (!event.currentTarget.contains(event.relatedTarget)) {
-              setNoticeInteraction((current) => ({ ...current, focused: false }))
-            }
-          }}
-          onMouseEnter={() => setNoticeInteraction((current) => ({ ...current, hovered: true }))}
-          onMouseLeave={() => setNoticeInteraction((current) => ({ ...current, hovered: false }))}
-        >
-          <UserNoticeToast notice={notices[0] ?? null} />
-        </div>
-      </div>
-
-      <ResponseAnnouncements session={session} />
-      </>
-}, sameExternalView)
-
-const SessionSettings = memo(function SessionSettings({ session, view }: SessionViewProps) {
-  const { uiTheme, assistantSettingsWriteError, uiThemeWriteError, uiTextSize, canDecreaseTextSize, canIncreaseTextSize,
-    supportsDesktopRuntime, selectedAudioInputDevice, audioInputDeviceId, micStarting, updateRuntimeBlocked, audioInputDevices,
-    autoStopOnSilence, startupState, voiceInputUnavailableReason, ttsEnabled, canToggleTts, androidVoiceStatus,
-    androidSpeechStatusError, assistantSettings, instantControlsDisabled, instantAssistantOptions, assistantCapabilities,
-    selectedInstantRetryable, selectedInstantOption, assistantControlsDisabled, deepAssistantOptions, reviewAssistantOptions,
-    canEnableDeep, canEnableReview, appUpdates, updateInstallationDisabled, customFailure, customRetryPending } = usePresentation(session, view, 'settings')
-  const { settingsOpen, settingsPanelRef, settingsCloseButtonRef, closeSettings, onSettingsKeyDown } = view.navigation
-  const { changeUiTheme, adjustUiTextSize, changeAudioInputDevice, setAutoStopOnSilence, toggleTts, patchAssistantSettings,
-    changeInstant, clearCompletion, retryCustom, refreshChatGptAuth } = view.actions
-  return settingsOpen ? (
-        <div
-          className="settings-overlay"
-          onMouseDown={() => closeSettings()}
-          onKeyDown={onSettingsKeyDown}
-        >
-          <section
-            ref={settingsPanelRef}
-            className="settings-panel"
-            role="dialog"
-            id={SETTINGS_DIALOG_ID}
-            aria-modal="true"
-            aria-labelledby="settings-title"
-            onMouseDown={(event) => event.stopPropagation()}
-          >
-            <div className="settings-panel__header">
-              <div>
-                <h2 id="settings-title">Settings</h2>
-              </div>
-              <button
-                ref={settingsCloseButtonRef}
-                type="button"
-                className="settings-panel__close"
-                onClick={() => closeSettings()}
-                aria-label="Close settings"
-              >
-                ×
-              </button>
-              {assistantSettingsWriteError !== null || uiThemeWriteError !== null ? (
-                <div className="settings-panel__write-error" role="alert" tabIndex={0}>
-                  {assistantSettingsWriteError !== null ? <p className="shell__error">Assistant settings could not be saved: {assistantSettingsWriteError}</p> : null}
-                  {uiThemeWriteError !== null ? <p className="shell__error">Theme could not be saved: {uiThemeWriteError}</p> : null}
-                </div>
-              ) : null}
-            </div>
-            <div className="settings-panel__row">
-              <label htmlFor="uiTheme"><strong>Theme</strong></label>
-              <select id="uiTheme" className="shell__control settings-panel__interactive" aria-label="Theme" value={uiTheme} onChange={(event) => changeUiTheme(parseUiTheme(event.target.value))}>
-                <option value="dark">OLED Night</option><option value="slate">Slate</option><option value="light">Light</option>
-              </select>
-            </div>
-            <div className="settings-panel__row">
-              <div>
-                <strong>Text size</strong>
-                <p className="settings-panel__hint">Applies to chat, composer, and controls.</p>
-              </div>
-              <div className="settings-panel__stepper" aria-label="Text size controls">
-                <button
-                  type="button"
-                  className="settings-panel__step-button settings-panel__interactive"
-                  onClick={() => adjustUiTextSize(-1)}
-                  disabled={!canDecreaseTextSize}
-                  aria-label="Decrease text size"
-                >
-                  −
-                </button>
-                <span className="settings-panel__size" aria-live="polite">
-                  {UI_TEXT_SIZE_LABELS[uiTextSize]} ({UI_TEXT_SIZE_PERCENTAGES[uiTextSize]})
-                </span>
-                <button
-                  type="button"
-                  className="settings-panel__step-button settings-panel__interactive"
-                  onClick={() => adjustUiTextSize(1)}
-                  disabled={!canIncreaseTextSize}
-                  aria-label="Increase text size"
-                >
-                  +
-                </button>
-              </div>
-            </div>
-            <section className="settings-panel__assistant" aria-labelledby="model-settings-title">
-              <h3 id="model-settings-title">Model</h3>
-              <ChatGptAuth onChanged={refreshChatGptAuth} />
-              <label className="settings-panel__interactive"><strong>Instant</strong><InstantModelSelect id="assistantInstantSelect" label="Instant" value={assistantSettings.instant} options={instantAssistantOptions} disabled={instantControlsDisabled} canRetry={(value) => localInstantCanRetry(startupState, value)} onChange={(value) => void changeInstant(value)} /></label>
-              {startupState.kind === 'ready' && !assistantCapabilities.custom ? <div>
-                <p className="settings-panel__hint">Custom connection: {customFailure?.reason ?? 'unavailable'}</p>
-                {customFailure && supportsDesktopRuntime ? <button type="button" className="shell__control" aria-label="Retry Custom" disabled={customRetryPending || updateRuntimeBlocked} onClick={() => void retryCustom()}>{customRetryPending ? 'Retrying…' : 'Retry Custom'}</button> : null}
-              </div> : null}
-              {selectedInstantRetryable && selectedInstantOption ? <button className="settings-panel__interactive" type="button" aria-label="Retry local profile" disabled={instantControlsDisabled} onClick={() => void changeInstant(assistantSettings.instant)}>Retry local profile</button> : null}
-              {!isAndroidRuntime ? <details className="settings-panel__advanced">
-                <summary>Advanced model settings</summary>
-                <label className="settings-panel__interactive"><strong>Deep model</strong><select aria-label="Deep model" value={assistantSettings.deep} disabled={assistantControlsDisabled} onChange={(event) => {
-                  const value = event.target.value as AssistantSettings['deep']
-                  if (deepAssistantOptions.find((option) => option.value === value)?.available) patchAssistantSettings({ deep: value })
-                }}>
-                  {deepAssistantOptions.map((option) => <option key={option.value} value={option.value} disabled={!option.available} title={option.reason}>{option.label}</option>)}
-                </select></label>
-                <label className="settings-panel__interactive"><strong>Review model</strong><select aria-label="Review model" value={assistantSettings.review} disabled={assistantControlsDisabled} onChange={(event) => {
-                  const value = event.target.value as AssistantSettings['review']
-                  if (reviewAssistantOptions.find((option) => option.value === value)?.available) patchAssistantSettings({ review: value })
-                }}>
-                  {reviewAssistantOptions.map((option) => <option key={option.value} value={option.value} disabled={!option.available} title={option.reason}>{option.label}</option>)}
-                </select></label>
-                <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.deepEnabled} disabled={assistantControlsDisabled || (!assistantSettings.deepEnabled && !canEnableDeep)} onChange={(event) => patchAssistantSettings({ deepEnabled: event.target.checked })} /> Deep</label>
-                <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.reviewEnabled} disabled={assistantControlsDisabled || (!assistantSettings.reviewEnabled && !canEnableReview)} onChange={(event) => patchAssistantSettings({ reviewEnabled: event.target.checked })} /> Review</label>
-                <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.completion} disabled={assistantControlsDisabled || (!assistantSettings.completion && !assistantCapabilities.qwenPrediction)} onChange={(event) => {
-                  if (!event.target.checked) clearCompletion()
-                  patchAssistantSettings({ completion: event.target.checked })
-                }} /> Completion</label>
-                <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.prefetch} disabled={assistantControlsDisabled || !supportsDesktopRuntime} aria-describedby="prefetch-help" onChange={(event) => patchAssistantSettings({ prefetch: event.target.checked })} /> Prefetch</label>
-                <p id="prefetch-help" className="settings-panel__hint">{supportsDesktopRuntime ? 'Prefetch may transmit unaccepted predicted text when enabled.' : 'Prefetch is unavailable on this runtime.'}</p>
-              </details> : null}
-            </section>
-            {supportsDesktopRuntime ? <div className="settings-panel__row settings-panel__mic-row">
-              <div>
-                <label htmlFor="audioInputDevice"><strong>Microphone</strong></label>
-                <p className="settings-panel__hint">Choose the input used for wake-word listening.</p>
-              </div>
-               <select
-                 className="settings-panel__interactive"
-                id="audioInputDevice"
-                aria-label="Microphone"
-                title={selectedAudioInputDevice?.label ?? ''}
-                value={audioInputDeviceId ?? ''}
-                disabled={micStarting || updateRuntimeBlocked}
-                onChange={(event) => changeAudioInputDevice(event.target.value)}
-              >
-                <option value="">System selected microphone</option>
-               {audioInputDevices.map((device) => (
-                  <option key={device.deviceId} value={device.deviceId}>{device.label}</option>
-                ))}
-              </select>
-              {selectedAudioInputDevice && (
-                <p className="settings-panel__hint settings-panel__mic-name">{selectedAudioInputDevice.label}</p>
-              )}
-           </div> : null}
-            {supportsDesktopRuntime ? <div className="settings-panel__row">
-              <div>
-                <strong>Voice input</strong>
-                <p className="settings-panel__hint">Stop listening automatically after silence.</p>
-              </div>
-               <label className="shell__toggle settings-panel__interactive">
-                <input
-                  type="checkbox"
-                  checked={autoStopOnSilence}
-                  onChange={(event) => setAutoStopOnSilence(event.target.checked)}
-                  disabled={!voiceInputReady(startupState) || updateRuntimeBlocked}
-                  aria-describedby={!voiceInputReady(startupState) ? 'voice-input-help' : undefined}
-                />
-                <span>Auto Stop</span>
-              </label>
-              {!voiceInputReady(startupState) ? <span id="voice-input-help" className="sr-only">{voiceInputUnavailableReason}</span> : null}
-            </div> : null}
-            {supportsDesktopRuntime || isAndroidRuntime ? <div className="settings-panel__row">
-              <div>
-                <strong>Speech output</strong>
-                <p className="settings-panel__hint">Read assistant responses aloud.</p>
-              </div>
-               <label className="shell__toggle settings-panel__interactive">
-                <input
-                  id="tts-toggle"
-                  type="checkbox"
-                  checked={isAndroidRuntime ? (androidVoiceStatus?.ttsEnabled ?? ttsEnabled) : ttsEnabled}
-                  disabled={isAndroidRuntime ? (view.voice.pending || (androidVoiceStatus?.ttsEnabled !== true && (instantControlsDisabled || androidVoiceStatus?.ttsAvailable !== true))) : !canToggleTts}
-                  onChange={isAndroidRuntime ? () => view.voice.toggleSpeech() : (event) => { void toggleTts(event.target.checked) }}
-                />
-                <span>TTS</span>
-              </label>
-            </div> : null}
-            {isAndroidRuntime || supportsDesktopRuntime ? <SpeechSettings android={isAndroidRuntime} androidStatus={androidVoiceStatus} statusError={androidSpeechStatusError} startupState={startupState}
-              speechNetworkFallback={assistantSettings.speechNetworkFallback} speechSelection={assistantSettings} disabled={instantControlsDisabled}
-              onSpeechSelectionChange={patchAssistantSettings}
-              onSpeechNetworkFallbackChange={(enabled) => patchAssistantSettings({ speechNetworkFallback: enabled })} /> : null}
-            <section className="settings-panel__web" aria-labelledby="web-settings-title">
-              <h3 id="web-settings-title">Web access</h3>
-              <label className="shell__toggle settings-panel__interactive"><input type="checkbox" aria-label="Allow web access" checked={assistantSettings.webEnabled} disabled={instantControlsDisabled}
-                onChange={(event) => patchAssistantSettings({ webEnabled: event.target.checked })} /> Web research</label>
-              <p className="settings-panel__hint">{assistantSettings.webEnabled ? 'Native search may send question-derived queries and public-page requests to external providers: Exa is primary, with Parallel as fallback when needed. Delegated OpenCode routes may use their own search providers.' : 'Web is off: no web lookup or search fallback. Normal chat still uses the selected chat provider; answers are not web-verified.'}</p>
-              <p className="settings-panel__hint">The selected model decides whether to use available web tools. Models without tool support can still chat but cannot browse automatically. Search activity appears in the response status when reported.</p>
-            </section>
-            {isAndroidRuntime ? <NewVoiceShortcutSettings /> : null}
-            <UpdateSettings updates={appUpdates} installationDisabled={updateInstallationDisabled} />
-            {!isAndroidRuntime && !isBrowserPreviewRuntime() ? <>
-              <WakeDiagnostics disabled={!voiceInputReady(startupState) || updateRuntimeBlocked} />
-              <WakeClipSettings />
-            </> : null}
-          </section>
-        </div>
-      ) : null
-}, sameExternalView)
-
-const SessionComposer = memo(function SessionComposer({ session, view }: SessionViewProps) {
-  const { voiceNotesOpen, shortcutStaging, androidAssistant, conversationPagePending, resetPending, promptState,
-    androidVoiceActive, headPagePending, snapshotControlsFresh, composerValue, uiTextSize, partialTranscript,
-    typedCompletionSuffix, voiceCompletionSuffix, canSend, startupState, assistantSettingsLoadError, selectedInstantOption,
-    selectedInstantProfileReady, canToggleMic, micStarting, micActive, assistantSettings, instantAssistantOptions,
-    instantControlsDisabled, runtimeStatus, updateRuntimeBlocked,
-    promptActivity, wakeConfidence, customFailure, supportsDesktopRuntime, customRetryPending } = usePresentation(session, view, 'composer')
-  const { onSubmit, loadMoreAndroidConversations, loadMoreAndroidHeads, selectAndroidConversation, changeComposer,
-     onComposerKeyDown, acceptTypedCompletion, clearCompletion, toggleMic, changeInstant, cancelPrompt, retryCustom } = view.actions
-  const canStop = (promptState === 'executing' || promptState === 'stopping') && startupState.kind === 'ready' && startupState.promptCancellationAvailable
-  const busy = promptState !== 'idle' || runtimeStatus === 'processing' || runtimeStatus === 'executing'
-  const actionLabel = canStop ? promptState === 'stopping' ? 'Stopping…' : 'Stop' : busy ? 'Working…' : 'Send'
-  const selectedUnavailable = startupState.kind === 'ready' && (selectedInstantOption?.available !== true || !selectedInstantProfileReady)
-  let unavailableReason = selectedInstantOption?.reason ?? 'selected provider is unavailable'
-  if (selectedInstantOption?.available === true && !selectedInstantProfileReady) unavailableReason = 'selected local model profile is not loaded'
-  if (unavailableReason === 'response_backend is not configured') unavailableReason = 'selected provider is not configured'
-  const showAvailability = startupState.kind === 'error' || startupState.kind === 'warming_model' || assistantSettingsLoadError !== null || selectedUnavailable
-  return !voiceNotesOpen ? <form className="composer" onSubmit={onSubmit}>
-        {shortcutStaging ? <p id="new-voice-draft-status" className={isAndroidRuntime ? 'sr-only' : undefined} role="status">New voice draft — Stop &amp; send starts a new conversation. Previous history and draft are preserved.</p> : null}
-        {isAndroidRuntime && androidAssistant !== null ? <div className="composer__actions">
-          {androidAssistant.conversationOffset < androidAssistant.conversationCount ? <button type="button" disabled={conversationPagePending || resetPending || promptState !== 'idle' || androidVoiceActive} onClick={() => void loadMoreAndroidConversations()}>{conversationPagePending ? 'Loading conversations…' : 'More conversations'}</button> : null}
-          {androidAssistant.branchChoices.length > 0 ? <label>Choose continuation <select aria-label="Choose continuation" value="" disabled={shortcutStaging || resetPending || promptState !== 'idle' || androidVoiceActive || headPagePending || !snapshotControlsFresh} onChange={(event) => void selectAndroidConversation('select_conversation_head', event.target.value)}>
-            <option value="" disabled>Choose continuation</option>
-            {androidAssistant.branchChoices.map((head, index) => <option key={head} value={head}>Continuation {index + 1}</option>)}
-          </select></label> : null}
-          {androidAssistant.branchOffset < androidAssistant.branchCount ? <button type="button" disabled={headPagePending || resetPending || promptState !== 'idle' || androidVoiceActive} onClick={() => void loadMoreAndroidHeads()}>{headPagePending ? 'Loading continuations…' : 'More continuations'}</button> : null}
-          {androidAssistant.error !== null && androidAssistant.error !== 'interrupted' ? <span role="status">Native conversation status: {androidAssistant.error.replaceAll('_', ' ')}</span> : null}
-        </div> : null}
-        <div className="composer__surface">
-        <div className="composer__prompt-row">
-        <PromptComposer
-          id="promptComposer"
-          className="composer__input"
-          aria-label="Prompt"
-           value={composerValue}
-           typographyRevision={uiTextSize}
-          partialTranscript={partialTranscript}
-          ghostSuffix={typedCompletionSuffix}
-           onChange={changeComposer}
-          onKeyDown={onComposerKeyDown}
-          onAcceptCompletion={acceptTypedCompletion}
-           onDismissCompletion={clearCompletion}
-           partialCompletionSuffix={voiceCompletionSuffix}
-            placeholder="Ask Assistant…"
-            rows={1}
-            maxRows={6}
-          />
-        </div>
-        <div className="composer__utility-row">
-          <InstantModelSelect variant="pill" id="composerInstantSelect" label="Instant model" value={assistantSettings.instant} options={instantAssistantOptions} disabled={instantControlsDisabled} canRetry={(value) => localInstantCanRetry(startupState, value)} onChange={(value) => void changeInstant(value)} />
-          <div className="composer__utility-actions">
-            {isAndroidRuntime ? <AndroidComposerVoiceControl /> : voiceInputReady(startupState) ? <button type="button" className="shell__control shell__icon-control" onClick={toggleMic} disabled={!canToggleMic} aria-label={micStarting ? 'Starting mic…' : micActive ? 'Stop mic' : 'Start mic'} title={micActive ? 'Stop mic' : 'Start mic'}><ControlIcon kind={micActive ? 'stop' : 'mic'} /></button> : null}
-            <button type={busy ? 'button' : 'submit'} className="composer__button shell__icon-control" aria-label={actionLabel} title={actionLabel}
-              disabled={canStop ? promptState === 'stopping' || updateRuntimeBlocked : busy || !canSend} onClick={canStop ? cancelPrompt : undefined}>
-              <ControlIcon kind={canStop ? 'stop' : 'send'} />
-            </button>
-          </div>
-        </div>
-        {showAvailability ? <div className="composer__availability">
-        {startupState.kind === 'error' ? (
-          <p className="shell__error">Startup error: {startupState.message}</p>
-        ) : null}
-        {assistantSettingsLoadError !== null ? (
-          <p className="shell__error">Assistant settings unavailable: {assistantSettingsLoadError}</p>
-        ) : null}
-        {selectedUnavailable ? (
-          <p className="shell__error" role="status">
-            Sending disabled: {unavailableReason}
-          </p>
-        ) : null}
-        {selectedUnavailable && assistantSettings.instant.startsWith('custom-') && customFailure && supportsDesktopRuntime ? <button type="button" className="shell__control" aria-label="Retry Custom" disabled={customRetryPending || updateRuntimeBlocked} onClick={() => void retryCustom()}>{customRetryPending ? 'Retrying…' : 'Retry Custom'}</button> : null}
-        {startupState.kind === 'warming_model' ? (
-          <p className="shell__loading">Model loading: {startupState.message}</p>
-        ) : null}
-        </div> : null}
-        </div>
-          <div className="composer__actions composer__actions--secondary">
-            {runtimeStatus === 'sleeping' && wakeConfidence !== null ? (
-              <div className={wakeConfidence >= 0.7 ? 'composer__wake composer__wake--high' : wakeConfidence >= 0.4 ? 'composer__wake composer__wake--medium' : 'composer__wake composer__wake--low'}>
-                <span className="composer__wake-primary">wake: {(wakeConfidence * 100).toFixed(2)}%</span>
-              </div>
-            ) : null}
-          {promptActivity !== null ? <div className={promptActivity.compact ? 'sr-only' : 'composer__status'} role="status" aria-live="polite">{promptActivity.text}</div> : null}
-        </div>
-      </form> : null
-}, sameExternalView)
-
 function toRuntimeStatus(runtimePhase: BackendRuntimePhase): RuntimeStatus {
   return runtimePhase
 }
-
 
 function formatResponseAnnouncement(kind: 'text' | 'refusal', text: string): string {
   const boundedText = text.trim().slice(0, 240)
@@ -3619,27 +3124,6 @@ function formatResponseAnnouncement(kind: 'text' | 'refusal', text: string): str
 
 function getResponseProfileLabel(profile: ResponseProfile): 'Fast' | 'Quality' {
   return profile === 'fast' ? 'Fast' : 'Quality'
-}
-
-function parseUiTextSize(value: unknown): UiTextSize {
-  if (
-    value === 'small' ||
-    value === 'medium' ||
-    value === 'large' ||
-    value === 'extra_large'
-  ) {
-    return value
-  }
-
-  return DEFAULT_UI_TEXT_SIZE
-}
-
-function parseUiTheme(value: unknown): UiTheme {
-  if (value === 'light' || value === 'dark' || value === 'slate') {
-    return value
-  }
-
-  return DEFAULT_UI_THEME
 }
 
 function toDisplayErrorMessage(error: unknown): string {
@@ -3661,15 +3145,10 @@ function parseNativeAudioRequestId(payload: unknown, label: string): number {
   return payload
 }
 
-const CAPABILITY_IDS = new Set<import('./types/chat').CapabilityId>([
-  'custom_provider', 'opencode', 'local_fast', 'local_quality', 'qwen_prediction',
-  'wake_word', 'vad', 'parakeet', 'tts', 'deep', 'review',
-])
-
 function toStartupCapabilities(capabilities: readonly Capability[]): readonly import('./types/chat').StartupCapability[] {
   return capabilities
     .filter((capability): capability is Capability & { readonly id: import('./types/chat').CapabilityId } =>
-      CAPABILITY_IDS.has(capability.id as import('./types/chat').CapabilityId))
+      CAPABILITY_IDS.includes(capability.id as import('./types/chat').CapabilityId))
     .map((capability) => ({
       id: capability.id,
       state: capability.state,
@@ -3711,30 +3190,6 @@ function findNewTurnForRequest(
 
 function executionKey(turn: Turn): string {
   return canonicalExecutionKey(turn)
-}
-
-function localInstantCanRetry(
-  state: StartupState,
-  instant: AssistantSettings['instant'],
-): boolean {
-  const capabilityId = instant === 'local-fast'
-    ? 'local_fast'
-    : instant === 'local-quality'
-      ? 'local_quality'
-      : null
-  return capabilityId !== null && state.kind === 'ready' &&
-    state.capabilities.some((capability) => capability.id === capabilityId && capability.state === 'failed')
-}
-
-function hasAvailableCapabilities(
-  state: StartupState,
-  ids: readonly import('./types/chat').CapabilityId[],
-): boolean {
-  return ids.every((id) => capabilityIsAvailable(state, id))
-}
-
-function capabilityLabel(id: import('./types/chat').CapabilityId): string {
-  return id.split('_').map((part) => part[0]?.toUpperCase() + part.slice(1)).join(' ')
 }
 
 function startupStateToRuntimeStatus(startupState: StartupState): RuntimeStatus {

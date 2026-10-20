@@ -296,4 +296,22 @@ describe('desktop change-triggered canonical model controls', () => {
     expect(sendButton().disabled).toBe(true)
     expect(state.unexpected).toEqual([])
   })
+
+  it('renders unified desktop header icon controls and places wake confidence in composer utility actions', async () => {
+    const state = await mount()
+    const headerActions = container!.querySelector('.shell__header-actions')!
+    expect(headerActions.querySelector('[aria-label="Speak replies"] [data-icon-kind="speaker"]')).not.toBeNull()
+    expect(headerActions.querySelector('[aria-label="Copy conversation"] [data-icon-kind="copy"]')).not.toBeNull()
+    expect(headerActions.querySelector('[aria-label="New Chat"] [data-icon-kind="plus"]')).not.toBeNull()
+    expect(headerActions.querySelector('[aria-label="Settings"] [data-icon-kind="settings"]')).not.toBeNull()
+
+    const authority = sessionAuthority(state.session)
+    await act(async () => {
+      authority.fieldState('runtimeStatus')[1]('sleeping')
+      authority.fieldState('wakeConfidence')[1](0.55)
+    })
+    const wakeChip = container!.querySelector('.composer__utility-actions .composer__wake--medium')
+    expect(wakeChip?.textContent).toBe('wake: 55.00%')
+    expect(state.unexpected).toEqual([])
+  })
 })
