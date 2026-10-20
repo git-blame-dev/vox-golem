@@ -20,6 +20,26 @@ def native_audio_evidence():
 
 
 class SafetyTests(unittest.TestCase):
+    def test_shared_suite_outer_entry_keeps_private_namespace_launcher(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root/'new-run'
+            argv = ['runner.py', '--binary', str(root/'binary'), '--tools', str(root/'tools'),
+                    '--config', str(root/'config'), '--output', str(output), '--entry', 'typed',
+                    '--live', '--offline-evidence', str(root/'evidence'), '--shared-suite']
+            with patch.object(sys, 'argv', argv), patch.object(runner, 'ARTIFACT_ROOT', root), \
+                    patch.object(runner.shutil, 'which', return_value='/synthetic/dbus-run-session'), \
+                    patch.object(runner.subprocess, 'call', return_value=2) as launch, \
+                    patch.object(runner, 'execute') as execute:
+                self.assertEqual(runner.main(), 2)
+            command = launch.call_args.args[0]
+            self.assertEqual(command[:3], ['bwrap', '--unshare-pid', '--die-with-parent'])
+            self.assertIn('/synthetic/dbus-run-session', command)
+            self.assertIn('--inside-session', command)
+            self.assertIn('--shared-suite', command)
+            self.assertNotIn('--unshare-net', command)
+            execute.assert_not_called()
+
     def test_observer_hold_executes_one_pending_native_read_and_preserves_receiver(self):
         node = shutil.which('node')
         if not node:

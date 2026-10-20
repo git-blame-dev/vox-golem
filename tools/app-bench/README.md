@@ -1,5 +1,13 @@
 # Unified application benchmark
 
+For the shared cross-platform **typed question suite**, start with
+`make benchmark PLATFORM=desktop BENCHMARK_FLAGS="--help"` and
+`tools/benchmark/README.md`. Its scenario/validation/report layer is shared with
+the Android driver. This document describes the existing isolated desktop
+qualification and voice workflows; their safety and live-call gates remain
+separate and are not bypassed by the shared command. Adapter unit tests alone do
+not establish desktop runtime acceptance or Windows support.
+
 One controller exercises the optimized desktop app, normal composer admission,
 Custom Responses streaming and MCP tools, canonical settlement, correlated UI
 completion, context and cancellation. The `typed` workflow profile excludes

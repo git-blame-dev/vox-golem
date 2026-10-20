@@ -794,22 +794,38 @@ impl ModelOutcome {
     }
 }
 
+fn model_matrix_cases() -> Vec<(&'static str, &'static str, bool, bool)> {
+    static SCENARIOS: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(|| {
+        serde_json::from_str(include_str!("../../../../tools/benchmark/scenarios.json"))
+            .expect("checked-in synthetic model matrix must be valid JSON")
+    });
+    let scenarios: &'static serde_json::Value = &SCENARIOS;
+    scenarios
+        .as_array()
+        .expect("model matrix must be an array")
+        .iter()
+        .map(|case| {
+            (
+                case["id"].as_str().expect("scenario id"),
+                case["prompt"].as_str().expect("scenario prompt"),
+                case["web_enabled"].as_bool().expect("scenario Web flag"),
+                case["allows_no_sources"]
+                    .as_bool()
+                    .expect("scenario source policy"),
+            )
+        })
+        .collect()
+}
+
 async fn run_model_matrix(args: &BenchArgs) -> Vec<ScenarioRow> {
-    let cases = [
-        ("arithmetic", "What is 14 * 15? Reply only with the number.", false, true),
-        ("coding", "Write a Rust function that sums a slice of i32. No web lookup.", true, true),
-        ("lookup", "What is the current Federal Reserve federal funds target range?", true, false),
-        ("page_read", "Verify the current Federal Reserve federal funds target range using an official page read.", true, false),
-        ("mixed", "Improve this text: async runtimes is useful. Then compare Tokio and async-std schedulers using current official sources and read the relevant pages.", true, false),
-        ("history", "What was the synthetic marker? Reply only with the marker.", false, true),
-    ];
+    let cases = model_matrix_cases();
     let client = benchmark_client(args.model);
     let deadline = Instant::now() + Duration::from_secs(600);
     let mut rows = Vec::new();
     let mut service = WebService::new(McpTransport::default());
     let mut stopped = None;
     for repetition in 1..=args.repetitions {
-        for (id, text, web_enabled, allows_no_sources) in cases {
+        for &(id, text, web_enabled, allows_no_sources) in &cases {
             if let Some(reason) = stopped {
                 rows.push(skipped_model_row(id, reason, repetition));
                 continue;
@@ -826,6 +842,7 @@ async fn run_model_matrix(args: &BenchArgs) -> Vec<ScenarioRow> {
                 continue;
             }
             let history = if id == "history" {
+                // Host component condition: 24 injected messages, not the full-app UI seed/followup.
                 (0..24).map(|i| CustomOpenAiMessage { role: CustomOpenAiRole::User, content_type: CustomOpenAiContentType::OutputText, text: if i == 0 { "The synthetic marker is SYNTHETIC-ORBIT-42.".into() } else { format!("Synthetic history turn {i}: retain the marker while discussing integer arithmetic.") } }).collect()
             } else {
                 Vec::new()
@@ -877,6 +894,11 @@ async fn run_model_matrix(args: &BenchArgs) -> Vec<ScenarioRow> {
             };
             let result = tokio::time::timeout_at(deadline, request).await;
             let mut row = ScenarioRow { id, codepath: "search::run_with_client_events", route: "-".into(), elapsed_ms: observer.started.elapsed().as_secs_f64() * 1000.0, status: RowStatus::Failed, detail: format!("model={} repetition={repetition} scope=local_request_to_visible_text_callback first_visible_text_ms={:?}; semantic/citation_accuracy=unassessed", args.model.model_id(), observer.first_ms) };
+            row.detail.push_str(&format!(" web_enabled={web_enabled}"));
+            if id == "history" {
+                row.detail
+                    .push_str(" history_condition=24-injected-user-messages-not-ui-seeded");
+            }
             match result {
                 Ok(Ok(outcome)) => {
                     row.status = outcome.passes(id, allows_no_sources).into();
@@ -1088,6 +1110,18 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shared_model_matrix_loads_through_production_parser() {
+        let cases = super::model_matrix_cases();
+        assert_eq!(cases.len(), 6);
+        assert!(cases.iter().all(|(_, prompt, _, _)| !prompt.is_empty()));
+        assert_eq!(cases[0].0, "arithmetic");
+        assert!(!cases[0].2);
+        assert!(cases[1].2); // Preserve the historical coding Web flag.
+        assert_eq!(cases[5].0, "history");
+        assert!(!cases[5].2);
+    }
+
     use super::*;
 
     #[test]

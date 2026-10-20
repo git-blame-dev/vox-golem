@@ -1,0 +1,8 @@
+[
+  {"id":"arithmetic","prompt":"What is 14 * 15? Reply only with the number.","web_enabled":false,"allows_no_sources":true,"expected":"210"},
+  {"id":"coding","prompt":"Write a Rust function that sums a slice of i32. No web lookup.","web_enabled":true,"allows_no_sources":true},
+  {"id":"lookup","prompt":"What is the current Federal Reserve federal funds target range?","web_enabled":true,"allows_no_sources":false,"official_hosts":["federalreserve.gov"]},
+  {"id":"page_read","prompt":"Verify the current Federal Reserve federal funds target range using an official page read.","web_enabled":true,"allows_no_sources":false,"official_hosts":["federalreserve.gov"],"requires_page_read":true},
+  {"id":"mixed","prompt":"Improve this text: async runtimes is useful. Then compare Tokio and async-std schedulers using current official sources and read the relevant pages.","web_enabled":true,"allows_no_sources":false,"official_hosts":["tokio.rs","async.rs"],"requires_page_read":true},
+  {"id":"history","prompt":"What was the synthetic marker? Reply only with the marker.","web_enabled":false,"allows_no_sources":true,"expected":"SYNTHETIC-ORBIT-42","seed":"The synthetic marker is SYNTHETIC-ORBIT-42. Retain it for the next question. Reply only OK.","history_condition":"one-ui-seed-plus-followup-not-24-message-host-history"}
+]

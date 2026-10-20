@@ -100,6 +100,46 @@ class SmokeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, 'correlation'):
             await self.run_ui(FakeSocket([pending, changed]))
 
+    async def test_optional_confirmation_precedes_send_and_terminal_observer_gets_correlation(self):
+        socket = FakeSocket([terminal()])
+        events = []
+        async def ready():
+            self.assertFalse(any('button.click()' in e for e in socket.expressions))
+            events.append('ready')
+        async def terminal_observer(request, metrics):
+            self.assertEqual(request, 'synthetic-new-request')
+            self.assertGreaterEqual(metrics['completed_ms'], metrics['first_answer_ms'])
+            events.append('terminal')
+        await smoke.exercise_ui(smoke.CDP(socket, .1), 'synthetic-model', 'Synthetic question',
+                                turn_timeout=.02, poll_interval=.001,
+                                confirm_ready=ready, terminal_observer=terminal_observer)
+        self.assertEqual(events, ['ready', 'terminal'])
+
+    async def test_confirmation_failure_never_submits_and_removes_probe(self):
+        socket = FakeSocket([terminal()])
+        async def ready():
+            raise RuntimeError('synthetic configuration mismatch')
+        with self.assertRaisesRegex(RuntimeError, 'configuration mismatch'):
+            await smoke.exercise_ui(smoke.CDP(socket, .1), 'synthetic-model', 'Synthetic question',
+                                    poll_interval=.001, confirm_ready=ready)
+        self.assertFalse(any('button.click()' in e for e in socket.expressions))
+        self.assertEqual(socket.expressions[-1], 'delete window.__voxSmoke')
+
+    async def test_admission_callback_runs_before_failed_turn_raises(self):
+        state = terminal()
+        state['outcome'] = 'failed'
+        socket = FakeSocket([state])
+        events = []
+        async def submitted():
+            events.append('submitted')
+        async def admitted(request):
+            events.append(request)
+        with self.assertRaisesRegex(RuntimeError, 'failed'):
+            await smoke.exercise_ui(smoke.CDP(socket, .1), 'synthetic-model', 'Synthetic question',
+                                    poll_interval=.001, submission_observer=submitted,
+                                    admission_observer=admitted)
+        self.assertEqual(events, ['submitted', 'synthetic-new-request'])
+
     async def test_unbounded_cdp_events_are_bounded_by_deadline(self):
         class Events(FakeSocket):
             async def recv(self):

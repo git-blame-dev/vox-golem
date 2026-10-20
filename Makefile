@@ -84,7 +84,14 @@ LINUX_ORT_PROVIDER_LIBS := \
 
 .DEFAULT_GOAL := help
 
-.PHONY: wakeword-bench test-wakeword-bench search-bench encoder-bench test-search-bench test-router-head
+.PHONY: benchmark test-benchmark wakeword-bench test-wakeword-bench search-bench encoder-bench test-search-bench test-router-head
+
+benchmark:
+	@test -n '$(PLATFORM)' || { printf '%s\n' 'Set PLATFORM=android or PLATFORM=desktop; use BENCHMARK_FLAGS="--help" with either platform for options.' >&2; exit 1; }
+	python3 tools/benchmark/benchmark.py --platform '$(PLATFORM)' $(if $(DEVICE),--device '$(DEVICE)') $(BENCHMARK_FLAGS)
+
+test-benchmark:
+	python3 -m unittest discover -s tools/benchmark -p 'test_*.py'
 
 wakeword-bench:
 	@test -n '$(WAKE_WORD_MODEL)' || { printf '%s\n' 'Set WAKE_WORD_MODEL to a local classifier ONNX file.' >&2; exit 1; }
@@ -119,6 +126,8 @@ help:
 	@printf '%s\n' '  make packaged-smoke Run the staged Linux package from a separate directory'
 	@printf '%s\n' '  make app-dev  Run only the frontend development server'
 	@printf '%s\n' '  make test     Run deterministic Linux frontend and Rust checks'
+	@printf '%s\n' '  make benchmark PLATFORM=android|desktop [DEVICE=a17] BENCHMARK_FLAGS="..."  Run the shared typed-app suite (explicit runtime flags required)'
+	@printf '%s\n' '  make test-benchmark  Run shared benchmark controller and adapter unit tests without device access'
 	@printf '%s\n' '  make search-bench [SEARCH_BENCH_FLAGS="--with-llm"]  Run the cross-codepath search benchmark'
 	@printf '%s\n' '  make encoder-bench ENCODER_SERVER=/path/llama-server ENCODER_MODEL=/path/bge.gguf  Run the isolated local encoder benchmark'
 	@printf '%s\n' '  make test-search-bench  Run deterministic offline search & router benchmark'

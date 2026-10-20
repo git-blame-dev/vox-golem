@@ -45,6 +45,30 @@ to enable shell profiling and content-free capture-stage timing in that artifact
 Ordinary release builds leave this opt-in disabled. It records stage names and
 elapsed timings, never audio, transcripts, capture IDs, peer addresses or credentials.
 
+## Shared typed-app benchmark
+
+Use the shared suite controller rather than manually invoking one smoke turn per
+question:
+
+```sh
+make benchmark PLATFORM=android DEVICE=a17 BENCHMARK_FLAGS="--help"
+make benchmark PLATFORM=android DEVICE=a17 BENCHMARK_FLAGS="--list"
+```
+
+See `tools/benchmark/README.md` for the complete authorized local/SSH device-run
+command, prerequisites, cleanup and report semantics. The shared controller owns
+scenario sequencing and validation; `scripts/android-e2e-smoke.py` remains the
+reused single-turn CDP observer. The computer may control the run, but the measured
+application executes on the explicitly selected physical phone. Help/listing must
+not access devices. No automatic installation, pairing, dependency download,
+microphone test or app-data reset is part of this command.
+
+The shared desktop adapter is not evidence of phone performance, and an Android
+run does not certify desktop, Windows or Wear. Unsupported/unobserved checks must
+remain explicit in the report. Use the build and clock conditions below when
+interpreting results; a debuggable WebView run does not establish optimized-release
+performance.
+
 ## Debug startup and response timing
 
 Build an inspectable ARM64 debug APK with the existing JDK/SDK/NDK environment:

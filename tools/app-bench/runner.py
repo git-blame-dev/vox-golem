@@ -1075,6 +1075,13 @@ def observe_native_completion_held(driver, before, baseline, services, deadline)
 def execute(args):
     global PHASE
     validate_benchmark_binary(args.binary)
+    if getattr(args, 'shared_suite', False):
+        import importlib.util
+        from types import SimpleNamespace
+        spec = importlib.util.spec_from_file_location('typed_benchmark_desktop', ROOT/'tools/benchmark/desktop.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.execute_inside(args, SimpleNamespace(**globals()))
     if args.entry == 'typed':
         return execute_typed(args)
     from selenium import webdriver
@@ -1262,12 +1269,16 @@ def main():
     parser.add_argument('--driver-free-diagnostic', action='store_true', help='Offline automation-effect control only; never qualifying evidence')
     parser.add_argument('--hold-native-observer', action='store_true', help='Offline quick voice consumer-stall diagnostic only; always exits 1')
     parser.add_argument('--live', action='store_true')
+    parser.add_argument('--shared-suite', action='store_true', help='Qualified live typed shared scenario suite')
     parser.add_argument('--offline-evidence', type=Path, help='Matching successful offline report, required before live reservation')
     parser.add_argument('--ledger', type=Path, default=ASSIGNMENT_LEDGER)
     parser.add_argument('--inside-offline', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--inside-session', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
     args.tools = args.tools.resolve()
+    if args.shared_suite and (not args.live or args.entry != 'typed' or args.extended or
+            args.driver_free_diagnostic or args.hold_native_observer):
+        parser.error('Shared suite requires live typed entry without extended or diagnostic modes')
     if args.hold_native_observer and (args.live or args.entry != 'voice' or args.cases != ['quick'] or
             args.driver_free_diagnostic or args.wake_diagnostics or args.event_loop_diagnostic or
             args.extended or args.poll_interval != 0.1):

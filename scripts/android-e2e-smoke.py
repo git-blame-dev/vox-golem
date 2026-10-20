@@ -43,7 +43,8 @@ class CDP:
             self.counter += 1
             call_id = self.counter
             await self.ws.send(json.dumps({'id': call_id, 'method': 'Runtime.evaluate',
-                                          'params': {'expression': expression, 'returnByValue': True}}))
+                                          'params': {'expression': expression, 'returnByValue': True,
+                                                     'awaitPromise': True}}))
             while True:
                 message = json.loads(await self.ws.recv())
                 if message.get('id') != call_id:
@@ -76,7 +77,9 @@ OBSERVE = """(() => {
 })()"""
 
 
-async def exercise_ui(cdp, model, prompt, turn_timeout=30, poll_interval=0.1):
+async def exercise_ui(cdp, model, prompt, turn_timeout=30, poll_interval=0.1,
+                      confirm_ready=None, terminal_observer=None, admission_observer=None,
+                      submission_observer=None):
     evaluate = cdp.evaluate
     ids = await evaluate(BASELINE)
     if not isinstance(ids, list):
@@ -98,6 +101,8 @@ async def exercise_ui(cdp, model, prompt, turn_timeout=30, poll_interval=0.1):
         if ready is not True:
             raise RuntimeError('Composer or selected model unavailable')
         await asyncio.sleep(poll_interval)
+        if confirm_ready is not None:
+            await confirm_ready()
         started = time.perf_counter()
         sent = await evaluate("""(() => {
  const ta = document.getElementById('promptComposer');
@@ -107,6 +112,8 @@ async def exercise_ui(cdp, model, prompt, turn_timeout=30, poll_interval=0.1):
 })()""")
         if sent is not True:
             raise RuntimeError('UI submission not admitted: Send unavailable')
+        if submission_observer is not None:
+            await submission_observer()
         first = None
         request = None
         while time.perf_counter() - started < turn_timeout:
@@ -118,6 +125,8 @@ async def exercise_ui(cdp, model, prompt, turn_timeout=30, poll_interval=0.1):
                 current = state.get('request')
                 if not current or (request is not None and current != request):
                     raise RuntimeError('Turn correlation changed')
+                if request is None and admission_observer is not None:
+                    await admission_observer(current)
                 request = current
                 if state.get('outcome') in ('error', 'failed', 'cancelled', 'refused', 'refusal') or state.get('stage') == 'failed' or state.get('kind') in ('error', 'refusal'):
                     raise RuntimeError('New turn failed or was refused')
@@ -127,8 +136,11 @@ async def exercise_ui(cdp, model, prompt, turn_timeout=30, poll_interval=0.1):
                     if first is None or state.get('stage') != 'completed' or state.get('kind') != 'text':
                         raise RuntimeError('Terminal turn lacks a successful text answer')
                     if state.get('runtimeStatus') == 'sleeping':
-                        return {'first_answer_ms': (first - started) * 1000,
-                                'completed_ms': (now - started) * 1000}
+                        metrics = {'first_answer_ms': (first - started) * 1000,
+                                   'completed_ms': (now - started) * 1000}
+                        if terminal_observer is not None:
+                            await terminal_observer(request, metrics)
+                        return metrics
             await asyncio.sleep(poll_interval)
         raise TimeoutError('No correlated successful terminal answer before deadline')
     finally:
