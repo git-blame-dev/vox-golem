@@ -98,7 +98,11 @@ object AssistantToolStatuses {
     const val MAX_STATUS_EVENTS = 256
     val statuses = setOf("Searching", "Reading", "Fallback", "Partial")
     private val counted = Regex("^(Searching|Reading) · [1-9][0-9]? (result|results|page|pages)$")
-    fun isValidStatus(status: String): Boolean = status in statuses || counted.matches(status)
+    private val rateLimited = Regex("^Rate limited · (Exa|Parallel) · provider wait (unknown|[0-9]{1,20} s) · local wait [0-9]{1,20} s$")
+    private val waitNumber = Regex("[0-9]+")
+    fun isValidStatus(status: String): Boolean = status in statuses || counted.matches(status) ||
+        (status.length <= 128 && rateLimited.matches(status) &&
+            waitNumber.findAll(status).all { it.value.toULongOrNull() != null })
 }
 
 /** One IO actor per process. Observers receive immutable projections on that actor, not the UI thread. */

@@ -14,11 +14,18 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
 
 type HttpError = StreamableHttpError<reqwest::Error>;
+
+#[derive(Clone, Copy)]
+struct HttpFailure {
+    status: u16,
+    retry_after: Option<std::time::Duration>,
+    observed: tokio::time::Instant,
+}
 
 /// rmcp retains session/version negotiation and request correlation. This adapter
 /// bounds request-POST bodies before JSON/SSE parsing, including HTTP error bodies.
@@ -26,6 +33,7 @@ type HttpError = StreamableHttpError<reqwest::Error>;
 pub(super) struct BoundedHttp {
     client: reqwest::Client,
     remaining: Arc<AtomicUsize>,
+    failure: Arc<Mutex<Option<HttpFailure>>>,
 }
 
 impl BoundedHttp {
@@ -33,10 +41,27 @@ impl BoundedHttp {
         Self {
             client,
             remaining: Arc::new(AtomicUsize::new(MAX_BODY_BYTES)),
+            failure: Arc::new(Mutex::new(None)),
         }
     }
     pub(super) fn reset_budget(&self) {
         self.remaining.store(MAX_BODY_BYTES, Ordering::SeqCst);
+        *self.failure.lock().unwrap() = None;
+    }
+    pub(super) fn with_failure(&self, fallback: super::ProviderFailure) -> super::ProviderFailure {
+        if fallback.kind == voxgolem_core::search::Failure::Cancelled {
+            return fallback;
+        }
+        match *self.failure.lock().unwrap() {
+            Some(failure) => super::ProviderFailure {
+                kind: super::classify_http_status(failure.status),
+                retry_after: failure
+                    .retry_after
+                    .map(|delay| delay.saturating_sub(failure.observed.elapsed())),
+                http_rate_limit: failure.status == 429,
+            },
+            None => fallback,
+        }
     }
     fn charge(&self, bytes: usize) -> Result<(), HttpError> {
         self.remaining
@@ -112,8 +137,26 @@ impl StreamableHttpClient for BoundedHttp {
             .send()
             .await
             .map_err(StreamableHttpError::Client)?;
-        self.check_length(&response)?;
         let status = response.status();
+        if matches!(status.as_u16(), 429 | 503) {
+            *self.failure.lock().unwrap() = Some(HttpFailure {
+                status: status.as_u16(),
+                retry_after: super::retry_after::parse(
+                    response.headers(),
+                    std::time::SystemTime::now(),
+                ),
+                observed: tokio::time::Instant::now(),
+            });
+        }
+        self.check_length(&response)?;
+        if matches!(status.as_u16(), 429 | 503) {
+            // Capacity status and Retry-After are authoritative at the headers.
+            // Drop the irrelevant body rather than letting a stalled error stream
+            // turn suppression into a deadline failure. No body is retained.
+            return Err(StreamableHttpError::UnexpectedServerResponse(
+                format!("HTTP {}", status.as_u16()).into(),
+            ));
+        }
         if status == reqwest::StatusCode::NOT_FOUND && attached {
             return Err(StreamableHttpError::SessionExpired);
         }
@@ -348,8 +391,15 @@ mod tests {
                     let result = client
                         .post_message(uri.into(), message, None, None, HashMap::new())
                         .await;
+                    let expected = if status == 503 && chunked {
+                        // Definitive capacity headers discard the body entirely.
+                        assert_eq!(client.remaining.load(Ordering::SeqCst), MAX_BODY_BYTES);
+                        "HTTP 503"
+                    } else {
+                        "byte budget"
+                    };
                     assert!(
-                        matches!(result, Err(StreamableHttpError::UnexpectedServerResponse(ref message)) if message.contains("byte budget")),
+                        matches!(result, Err(StreamableHttpError::UnexpectedServerResponse(ref message)) if message.contains(expected)),
                         "{method} {status} {mime} chunked={chunked}: {result:?}"
                     );
                     assert!(client.remaining.load(Ordering::SeqCst) <= MAX_BODY_BYTES);

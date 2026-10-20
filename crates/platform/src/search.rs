@@ -14,6 +14,9 @@ use voxgolem_core::search::*;
 
 /// One complete admitted web operation, including its bounded provider fallback.
 pub trait WebExecutor {
+    fn rate_limits(&self) -> Vec<crate::web::RateLimitInfo> {
+        vec![]
+    }
     fn execute(
         &mut self,
         operation: &Operation,
@@ -29,6 +32,9 @@ pub trait WebExecutor {
 }
 
 impl<T: WebTransport> WebExecutor for WebService<T> {
+    fn rate_limits(&self) -> Vec<crate::web::RateLimitInfo> {
+        WebService::rate_limits(self)
+    }
     async fn execute(
         &mut self,
         operation: &Operation,
@@ -57,6 +63,7 @@ impl<T: WebTransport> WebExecutor for WebService<T> {
 pub struct SharedWebService<'a, T> {
     service: &'a tokio::sync::Mutex<WebService<T>>,
     gate: &'a WebPrewarmGate,
+    rate_limits: Vec<crate::web::RateLimitInfo>,
     last_fallback_used: bool,
 }
 
@@ -65,12 +72,16 @@ impl<'a, T> SharedWebService<'a, T> {
         Self {
             service,
             gate,
+            rate_limits: vec![],
             last_fallback_used: false,
         }
     }
 }
 
 impl<T: WebTransport> WebExecutor for SharedWebService<'_, T> {
+    fn rate_limits(&self) -> Vec<crate::web::RateLimitInfo> {
+        self.rate_limits.clone()
+    }
     async fn execute(
         &mut self,
         operation: &Operation,
@@ -80,6 +91,7 @@ impl<T: WebTransport> WebExecutor for SharedWebService<'_, T> {
         cancellation: &Cancellation,
     ) -> Result<ToolResult, Failure> {
         self.last_fallback_used = false;
+        self.rate_limits.clear();
         let mut service = admit_web(self.service, self.gate, cancellation, deadline).await?;
         let outcome = service
             .execute(
@@ -91,6 +103,7 @@ impl<T: WebTransport> WebExecutor for SharedWebService<'_, T> {
             )
             .await;
         self.last_fallback_used = service.last_fallback_used();
+        self.rate_limits = service.rate_limits();
         outcome
     }
 
@@ -127,6 +140,9 @@ pub struct RunContext<'a> {
 }
 
 pub enum RunEvent<'a> {
+    RateLimit {
+        info: crate::web::RateLimitInfo,
+    },
     Model(ModelEvent<'a>),
     ToolStarted {
         call_id: &'a str,
@@ -530,6 +546,9 @@ async fn run_with_client_events_since<T: WebExecutor>(
                     }
                 }
             };
+            for info in web.rate_limits() {
+                deliver_event(cancellation, &mut on_event, RunEvent::RateLimit { info })?;
+            }
             let output = json!({"type":"function_call_output", "call_id":call.call_id, "output":payload.to_string()});
             executed.push((call, output.clone()));
             outputs.push(output);

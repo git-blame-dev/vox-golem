@@ -18,6 +18,19 @@ import java.util.concurrent.Executor
 @RunWith(AssistantStoreRunner::class)
 @Config(sdk = [35], manifest = Config.NONE)
 class AssistantEngineTest {
+    @Test fun rateLimitStatusAcceptsOnlyTheSharedBoundedGrammar() {
+        for (provider in listOf("Exa", "Parallel")) {
+            assertTrue(AssistantToolStatuses.isValidStatus("Rate limited · $provider · provider wait unknown · local wait 60 s"))
+            assertTrue(AssistantToolStatuses.isValidStatus("Rate limited · $provider · provider wait 18446744073709551615 s · local wait 18446744073709551615 s"))
+        }
+        for (status in listOf(
+            "Rate limited · Other · provider wait 60 s · local wait 60 s",
+            "Rate limited · Exa · provider wait 18446744073709551616 s · local wait 60 s",
+            "Rate limited · Exa · provider wait -1 s · local wait 60 s",
+            "Rate limited · Exa · provider wait unknown · local wait 60 s\nsecret",
+            "Rate limited · Exa · provider wait https://example.com · local wait 60 s",
+        )) assertFalse(status, AssistantToolStatuses.isValidStatus(status))
+    }
     private class Queue : Executor {
         val tasks = ConcurrentLinkedQueue<Runnable>()
         override fun execute(command: Runnable) { tasks.add(command) }

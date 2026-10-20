@@ -2147,6 +2147,7 @@ mod tests {
                     return Err(ProviderFailure {
                         kind: Failure::Transport,
                         retry_after: None,
+                        http_rate_limit: false,
                     });
                 }
                 Ok(serde_json::json!({

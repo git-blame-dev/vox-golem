@@ -199,6 +199,7 @@ pub(crate) async fn respond_with_web<W: voxgolem_platform::search::WebExecutor>(
                         "Searching"
                     }))
                 }
+                RunEvent::RateLimit { info } => callback(CallbackEvent::Status(&info.status())),
                 RunEvent::ToolCompleted { outcome, .. } => {
                     if let Some(started) = search_started.take() {
                         let elapsed = started.elapsed().as_millis().min(u64::MAX as u128) as u64;

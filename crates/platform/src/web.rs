@@ -15,6 +15,7 @@ use voxgolem_core::search::*;
 
 mod bounded_http;
 mod evidence;
+mod retry_after;
 pub use evidence::decode_result;
 
 pub const MAX_BODY_BYTES: usize = 512 * 1024;
@@ -193,6 +194,7 @@ fn same_public_url(left: &str, right: &str) -> bool {
 pub struct ProviderFailure {
     pub kind: Failure,
     pub retry_after: Option<Duration>,
+    pub http_rate_limit: bool,
 }
 
 impl From<Failure> for ProviderFailure {
@@ -200,6 +202,7 @@ impl From<Failure> for ProviderFailure {
         Self {
             kind,
             retry_after: None,
+            http_rate_limit: false,
         }
     }
 }
@@ -320,7 +323,7 @@ impl McpTransport {
                 .guard(deadline, ().serve(transport))
                 .await
                 .map_err(ProviderFailure::from)?
-                .map_err(classify_initialize_error)?;
+                .map_err(|error| client.with_failure(classify_initialize_error(error)))?;
             let mut initializing = CancelOnDrop(Some(service.cancellation_token()));
             let mut cursor = None;
             let mut seen_cursors = std::collections::HashSet::new();
@@ -336,7 +339,7 @@ impl McpTransport {
                     )
                     .await
                     .map_err(ProviderFailure::from)?
-                    .map_err(classify_service_error)?;
+                    .map_err(|error| client.with_failure(classify_service_error(error)))?;
                 tool_count += page.tools.len();
                 if tool_count > 64 {
                     return Err(Failure::InvalidUpstream.into());
@@ -440,10 +443,18 @@ impl McpTransport {
                     return Err(error.into());
                 }
                 _ => {
+                    let failure = budget_slot
+                        .as_ref()
+                        .map(|budget| budget.with_failure(Failure::Transport.into()));
                     if let Some(service) = slot.take() {
                         service.cancellation_token().cancel();
                     }
                     *last_active_slot = None;
+                    if let Some(error) = failure {
+                        if error.http_rate_limit || error.retry_after.is_some() {
+                            return Err(error);
+                        }
+                    }
                 }
             }
         }
@@ -630,7 +641,10 @@ impl WebTransport for McpTransport {
                     }
                     self.last_active[index] = None;
                 }
-                return Err(classify_service_error(error));
+                return Err(self.budgets[index]
+                    .as_ref()
+                    .unwrap()
+                    .with_failure(classify_service_error(error)));
             }
             Err(error) => {
                 if let Some(service) = slot.take() {
@@ -867,9 +881,52 @@ pub fn validate_discovery(schema: &Value, arguments: &Value) -> Result<(), Failu
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RateLimitEvidence {
+    Http429,
+    ProviderMessage,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RateLimitInfo {
+    pub provider: Provider,
+    pub provider_wait_seconds: Option<u64>,
+    pub local_wait_seconds: u64,
+    pub evidence: RateLimitEvidence,
+}
+
+impl RateLimitInfo {
+    /// Fixed, payload-free grammar shared by desktop and JNI status consumers.
+    pub fn status(&self) -> String {
+        let provider = match self.provider {
+            Provider::Exa => "Exa",
+            Provider::Parallel => "Parallel",
+        };
+        let wait = self
+            .provider_wait_seconds
+            .map_or_else(|| "unknown".into(), |seconds| format!("{seconds} s"));
+        format!(
+            "Rate limited · {provider} · provider wait {wait} · local wait {} s",
+            self.local_wait_seconds
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Wait {
+    started: Instant,
+    duration: Duration,
+}
+impl Wait {
+    fn remaining(self) -> Duration {
+        self.duration.saturating_sub(self.started.elapsed())
+    }
+}
+
 pub struct WebService<T> {
     pub transport: T,
-    cooldowns: [Option<Instant>; 2],
+    cooldowns: [Option<Wait>; 2],
+    rate_limits: [Option<(RateLimitEvidence, Option<Wait>)>; 2],
     next_source: usize,
     last_fallback_used: bool,
 }
@@ -879,6 +936,7 @@ impl<T: WebTransport> WebService<T> {
         Self {
             transport,
             cooldowns: [None, None],
+            rate_limits: [None, None],
             next_source: 0,
             last_fallback_used: false,
         }
@@ -887,18 +945,82 @@ impl<T: WebTransport> WebService<T> {
     pub fn last_fallback_used(&self) -> bool {
         self.last_fallback_used
     }
+    pub fn rate_limits(&self) -> Vec<RateLimitInfo> {
+        [Provider::Exa, Provider::Parallel]
+            .into_iter()
+            .filter_map(|provider| {
+                let index = Self::index(provider);
+                let (evidence, wait) = self.rate_limits[index]?;
+                let local = self.cooldowns[index]?.remaining();
+                if local.is_zero() {
+                    return None;
+                }
+                Some(RateLimitInfo {
+                    provider,
+                    evidence,
+                    provider_wait_seconds: wait.map(|wait| {
+                        let remaining = wait.remaining();
+                        remaining
+                            .as_secs()
+                            .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+                    }),
+                    local_wait_seconds: local
+                        .as_secs()
+                        .saturating_add(u64::from(local.subsec_nanos() > 0)),
+                })
+            })
+            .collect()
+    }
+    fn suppress(&mut self, provider: Provider, error: ProviderFailure) {
+        if error.kind == Failure::RateLimited {
+            let index = Self::index(provider);
+            let wait = error.retry_after.map(|duration| Wait {
+                started: Instant::now(),
+                duration,
+            });
+            self.rate_limits[index] = Some((
+                if error.http_rate_limit {
+                    RateLimitEvidence::Http429
+                } else {
+                    RateLimitEvidence::ProviderMessage
+                },
+                wait,
+            ));
+            self.cooldown(
+                provider,
+                error
+                    .retry_after
+                    .unwrap_or_default()
+                    .max(Duration::from_secs(60)),
+            );
+        } else if let Some(wait) = error.retry_after {
+            self.cooldown(provider, wait.max(Duration::from_secs(15)));
+        }
+    }
+    fn retire_expired_rate_limits(&mut self) {
+        for index in 0..2 {
+            if self.cooldowns[index].is_none_or(|wait| wait.remaining().is_zero()) {
+                self.rate_limits[index] = None;
+            }
+        }
+    }
     pub async fn prewarm(
         &mut self,
         deadline: Instant,
         cancel: &Cancellation,
     ) -> Result<(), Failure> {
+        self.retire_expired_rate_limits();
         let mut provider = if self.ready(Provider::Exa) {
             Provider::Exa
         } else {
             Provider::Parallel
         };
         if !self.ready(provider) {
-            return Err(Failure::Service);
+            return Err(if self.rate_limits().is_empty() {
+                Failure::Service
+            } else {
+                Failure::RateLimited
+            });
         }
         for attempt in 0..2 {
             if cancel.is_cancelled() {
@@ -915,6 +1037,7 @@ impl<T: WebTransport> WebService<T> {
             {
                 Ok(()) => return Ok(()),
                 Err(error) => {
+                    self.suppress(provider, error);
                     if error.kind == Failure::Cancelled {
                         return Err(Failure::Cancelled);
                     }
@@ -940,6 +1063,7 @@ impl<T: WebTransport> WebService<T> {
         deadline: Instant,
         cancel: &Cancellation,
     ) -> Result<(), Failure> {
+        self.retire_expired_rate_limits();
         let provider = Provider::Parallel;
         if !self.ready(provider) {
             return Err(Failure::Service);
@@ -958,6 +1082,7 @@ impl<T: WebTransport> WebService<T> {
         {
             Ok(()) => Ok(()),
             Err(error) => {
+                self.suppress(provider, error);
                 if error.kind == Failure::Cancelled {
                     return Err(Failure::Cancelled);
                 }
@@ -974,6 +1099,7 @@ impl<T: WebTransport> WebService<T> {
         }
     }
     pub async fn prewarm_all(&mut self, deadline: Instant, cancel: &Cancellation) {
+        self.retire_expired_rate_limits();
         let exa_ready = self.ready(Provider::Exa);
         let par_ready = self.ready(Provider::Parallel);
         if (!exa_ready && !par_ready) || cancel.is_cancelled() {
@@ -989,6 +1115,7 @@ impl<T: WebTransport> WebService<T> {
             .await;
         for (provider, result) in [(Provider::Exa, exa_res), (Provider::Parallel, par_res)] {
             if let Err(error) = result {
+                self.suppress(provider, error);
                 if error.kind == Failure::RateLimited {
                     self.cooldown(
                         provider,
@@ -1062,6 +1189,7 @@ impl<T: WebTransport> WebService<T> {
                             .push_str(&text);
                     }
                     if rate_limited {
+                        self.suppress(provider, Failure::RateLimited.into());
                         let cooldown_duration = if provider == Provider::Exa {
                             Duration::from_secs(300)
                         } else {
@@ -1081,7 +1209,11 @@ impl<T: WebTransport> WebService<T> {
                     }
                 }
                 Err(error) if error.kind == Failure::Cancelled => return Err(error),
-                Err(error) if matches!(error.kind, Failure::RateLimited | Failure::Deadline) => {
+                Err(error)
+                    if matches!(error.kind, Failure::RateLimited | Failure::Deadline)
+                        || error.retry_after.is_some() =>
+                {
+                    self.suppress(provider, error);
                     if error.kind == Failure::RateLimited {
                         self.cooldown(
                             provider,
@@ -1122,13 +1254,18 @@ impl<T: WebTransport> WebService<T> {
         cancel: &Cancellation,
     ) -> Result<ToolResult, Failure> {
         self.last_fallback_used = false;
+        self.retire_expired_rate_limits();
         let mut provider = if self.ready(Provider::Exa) {
             Provider::Exa
         } else {
             Provider::Parallel
         };
         if !self.ready(provider) {
-            return Err(Failure::Service);
+            return Err(if self.rate_limits().is_empty() {
+                Failure::Service
+            } else {
+                Failure::RateLimited
+            });
         }
         let mut fallback = false;
         let mut attempt_operation = operation.clone();
@@ -1171,6 +1308,9 @@ impl<T: WebTransport> WebService<T> {
                         .iter()
                         .any(|failure| failure.failure == Failure::RateLimited)
                     {
+                        if self.rate_limits[Self::index(provider)].is_none() {
+                            self.suppress(provider, Failure::RateLimited.into());
+                        }
                         let cooldown_duration = if provider == Provider::Exa {
                             Duration::from_secs(300)
                         } else {
@@ -1236,6 +1376,7 @@ impl<T: WebTransport> WebService<T> {
                     return Ok(result);
                 }
                 Err(error) => {
+                    self.suppress(provider, error);
                     if error.kind == Failure::Cancelled {
                         return Err(Failure::Cancelled);
                     }
@@ -1276,13 +1417,16 @@ impl<T: WebTransport> WebService<T> {
         }
     }
     fn ready(&self, provider: Provider) -> bool {
-        self.cooldowns[Self::index(provider)].is_none_or(|until| until <= Instant::now())
+        self.cooldowns[Self::index(provider)].is_none_or(|wait| wait.remaining().is_zero())
     }
     fn cooldown(&mut self, provider: Provider, duration: Duration) {
         let index = Self::index(provider);
-        let until = Instant::now() + duration.min(Duration::from_secs(3600));
-        self.cooldowns[index] =
-            Some(self.cooldowns[index].map_or(until, |existing| existing.max(until)));
+        let duration =
+            self.cooldowns[index].map_or(duration, |existing| existing.remaining().max(duration));
+        self.cooldowns[index] = Some(Wait {
+            started: Instant::now(),
+            duration,
+        });
     }
 }
 
@@ -1468,6 +1612,14 @@ mod tests {
         status: u16,
         rpc_error: Option<(i64, &'static str)>,
     ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        startup_failure_server_with_headers(status, rpc_error, "").await
+    }
+
+    async fn startup_failure_server_with_headers(
+        status: u16,
+        rpc_error: Option<(i64, &'static str)>,
+        extra_headers: &'static str,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1511,7 +1663,7 @@ mod tests {
                 ));
                 seen.fetch_add(1, Ordering::SeqCst);
                 let content = rpc_error.map(|(code, message)| json!({"jsonrpc":"2.0","id":body["id"],"error":{"code":code,"message":message}}).to_string()).unwrap_or_default();
-                let wire = format!("HTTP/1.1 {status} Synthetic\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{content}", content.len());
+                let wire = format!("HTTP/1.1 {status} Synthetic\r\n{extra_headers}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{content}", content.len());
                 socket.write_all(wire.as_bytes()).await.unwrap();
             }
         });
@@ -1524,6 +1676,203 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_rate_evidence_does_not_revive_on_nonrate_prewarm() {
+        struct Unavailable(Failure, Option<Duration>);
+        impl WebTransport for Unavailable {
+            async fn prewarm(
+                &mut self,
+                _: Provider,
+                _: Instant,
+                _: &Cancellation,
+            ) -> Result<(), ProviderFailure> {
+                Err(ProviderFailure {
+                    kind: self.0,
+                    retry_after: self.1,
+                    http_rate_limit: false,
+                })
+            }
+            async fn call(
+                &mut self,
+                _: Provider,
+                _: &Operation,
+                _: &str,
+                _: Instant,
+                _: &Cancellation,
+            ) -> Result<Value, ProviderFailure> {
+                panic!("cooling providers must not be called")
+            }
+        }
+        for (kind, retry) in [
+            (Failure::Service, None),
+            (Failure::Service, Some(Duration::from_secs(7200))),
+            (Failure::Transport, None),
+        ] {
+            for admission in 0..3 {
+                let mut service = WebService::new(Unavailable(kind, retry));
+                for provider in [Provider::Exa, Provider::Parallel] {
+                    service.suppress(
+                        provider,
+                        ProviderFailure {
+                            kind: Failure::RateLimited,
+                            retry_after: None,
+                            http_rate_limit: true,
+                        },
+                    );
+                    service.cooldowns[WebService::<Unavailable>::index(provider)] = Some(Wait {
+                        started: Instant::now() - Duration::from_secs(61),
+                        duration: Duration::from_secs(60),
+                    });
+                }
+                let cancel = Cancellation::default();
+                let deadline = Instant::now() + ATTEMPT_TIME;
+                match admission {
+                    0 => service.prewarm_all(deadline, &cancel).await,
+                    1 => {
+                        assert_eq!(service.prewarm(deadline, &cancel).await, Err(kind));
+                    }
+                    _ => {
+                        assert_eq!(
+                            service.prewarm_alternate(deadline, &cancel).await,
+                            Err(kind)
+                        );
+                        service.prewarm(deadline, &cancel).await.unwrap_err();
+                    }
+                }
+                assert!(
+                    service.rate_limits().is_empty(),
+                    "expired 429 evidence revived"
+                );
+                assert!(!service.ready(Provider::Parallel));
+                let operation = Operation::Search {
+                    objective: "Synthetic".into(),
+                    queries: vec!["Synthetic".into()],
+                    limit: 3,
+                };
+                assert_eq!(
+                    service
+                        .execute(&operation, "synthetic", "synthetic", deadline, &cancel)
+                        .await
+                        .unwrap_err(),
+                    Failure::Service
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn capacity_headers_do_not_wait_for_stalled_error_bodies() {
+        for status in [429, 503] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let mut sockets = tokio::task::JoinSet::new();
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    sockets.spawn(async move {
+                        let mut request = [0; 4096];
+                        assert!(socket.read(&mut request).await.unwrap() > 0);
+                        socket.write_all(format!("HTTP/1.1 {status} Synthetic\r\nRetry-After: 7200\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n").as_bytes()).await.unwrap();
+                        std::future::pending::<()>().await;
+                    });
+                }
+            });
+            let mut service = WebService::new(McpTransport {
+                endpoints: Some([endpoint.clone(), endpoint]),
+                ..Default::default()
+            });
+            let cancel = Cancellation::default();
+            service
+                .prewarm_all(Instant::now() + Duration::from_secs(1), &cancel)
+                .await;
+            assert!(
+                !service.ready(Provider::Exa),
+                "HTTP {status} header must establish suppression before body/deadline"
+            );
+            assert!(service.cooldowns[0].unwrap().remaining() > Duration::from_secs(7100));
+            assert_eq!(
+                service.rate_limits().len(),
+                if status == 429 { 2 } else { 0 }
+            );
+            cancel.cancel();
+            assert_eq!(
+                service
+                    .transport
+                    .prewarm(Provider::Exa, Instant::now() + ATTEMPT_TIME, &cancel)
+                    .await
+                    .unwrap_err()
+                    .kind,
+                Failure::Cancelled
+            );
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_retry_header_survives_successful_provider_fallback() {
+        assert_startup_status_fallback_headers(429, None, "Retry-After: 7200\r\n").await;
+    }
+
+    #[tokio::test]
+    async fn retry_headers_survive_initialize_prewarm_and_bound_diagnostics() {
+        for (status, headers, known) in [
+            (429, "Retry-After: 7200\r\n", true),
+            (429, "Retry-After: invalid-secret\r\n", false),
+            (429, "Retry-After: 10\r\nRetry-After: 20\r\n", false),
+            (429, "", false),
+            (503, "Retry-After: 7200\r\n", true),
+        ] {
+            let (endpoint, _, server) =
+                startup_failure_server_with_headers(status, None, headers).await;
+            let mut service = WebService::new(McpTransport {
+                endpoints: Some([endpoint.clone(), endpoint]),
+                ..Default::default()
+            });
+            let cancel = Cancellation::default();
+            service
+                .prewarm_all(Instant::now() + ATTEMPT_TIME, &cancel)
+                .await;
+            assert!(!service.ready(Provider::Exa));
+            assert!(!service.ready(Provider::Parallel));
+            if known {
+                assert!(service.cooldowns[0].unwrap().remaining() > Duration::from_secs(7100));
+            }
+            let info = service.rate_limits();
+            if status == 429 {
+                assert_eq!(info.len(), 2);
+                for info in info {
+                    assert_eq!(info.evidence, RateLimitEvidence::Http429);
+                    assert_eq!(info.provider_wait_seconds.is_some(), known);
+                    assert!(info.status().len() <= 128);
+                    assert!(!info.status().contains("secret"));
+                    assert!(!info.status().contains("http"));
+                }
+                let operation = Operation::Search {
+                    objective: "Synthetic".into(),
+                    queries: vec!["Synthetic".into()],
+                    limit: 3,
+                };
+                assert_eq!(
+                    service
+                        .execute(
+                            &operation,
+                            "synthetic",
+                            "synthetic",
+                            Instant::now() + ATTEMPT_TIME,
+                            &cancel
+                        )
+                        .await
+                        .unwrap_err(),
+                    Failure::RateLimited
+                );
+            } else {
+                assert!(info.is_empty(), "503 is suppression, not rate limiting");
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn stock_http_status_overrides_conflicting_rpc_errors() {
         for status in [429, 503] {
             for code in [-32603, -32602] {
@@ -1533,6 +1882,14 @@ mod tests {
     }
 
     async fn assert_startup_status_fallback(status: u16, rpc_error: Option<(i64, &'static str)>) {
+        assert_startup_status_fallback_headers(status, rpc_error, "").await;
+    }
+
+    async fn assert_startup_status_fallback_headers(
+        status: u16,
+        rpc_error: Option<(i64, &'static str)>,
+        headers: &'static str,
+    ) {
         struct StockPrimary {
             mcp: McpTransport,
             providers: Vec<Provider>,
@@ -1558,7 +1915,8 @@ mod tests {
                 }
             }
         }
-        let (endpoint, requests, server) = startup_failure_server(status, rpc_error).await;
+        let (endpoint, requests, server) =
+            startup_failure_server_with_headers(status, rpc_error, headers).await;
         let mut service = WebService::new(StockPrimary {
             mcp: McpTransport {
                 endpoints: Some([endpoint.clone(), endpoint]),
@@ -1584,8 +1942,26 @@ mod tests {
             .unwrap();
         assert!(result.fallback_used);
         assert_eq!(result.sources[0].provider, Provider::Parallel);
-        let until = service.cooldowns[1].expect("HTTP failure must cool down primary");
-        let cooldown = if status == 429 { 60 } else { 15 };
+        let wait = service.cooldowns[1].expect("HTTP failure must cool down primary");
+        let until = wait.started + wait.duration;
+        let cooldown = if !headers.is_empty() {
+            7200
+        } else if status == 429 {
+            60
+        } else {
+            15
+        };
+        let info = service.rate_limits();
+        if status == 429 {
+            assert_eq!(info.len(), 1);
+            assert_eq!(info[0].evidence, RateLimitEvidence::Http429);
+            assert_eq!(
+                info[0].provider_wait_seconds,
+                if headers.is_empty() { None } else { Some(7200) }
+            );
+        } else {
+            assert!(info.is_empty());
+        }
         assert!(
             until >= before + Duration::from_secs(cooldown),
             "HTTP status must determine cooldown"

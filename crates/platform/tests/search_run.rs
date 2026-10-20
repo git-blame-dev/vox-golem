@@ -20,6 +20,71 @@ use voxgolem_platform::{custom_openai::*, search::*, search_control::Cancellatio
 static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 static FIXTURE_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 
+#[tokio::test]
+async fn shared_rate_diagnostics_follow_tool_completion_even_when_fallback_succeeds() {
+    struct Limited(EvidenceTransport);
+    impl WebTransport for Limited {
+        async fn call(
+            &mut self,
+            provider: Provider,
+            operation: &Operation,
+            conversation: &str,
+            deadline: Instant,
+            cancel: &Cancellation,
+        ) -> Result<Value, ProviderFailure> {
+            if provider == Provider::Exa {
+                Err(ProviderFailure {
+                    kind: Failure::RateLimited,
+                    retry_after: Some(Duration::from_secs(7200)),
+                    http_rate_limit: true,
+                })
+            } else {
+                self.0
+                    .call(provider, operation, conversation, deadline, cancel)
+                    .await
+            }
+        }
+    }
+    let (config, _auth, server) =
+        fixture(vec![vec![search_call("synthetic-rate")], vec![answer()]]).await;
+    let service = tokio::sync::Mutex::new(WebService::new(Limited(EvidenceTransport {
+        calls: vec![],
+    })));
+    let gate = WebPrewarmGate::default();
+    let mut web = SharedWebService::new(&service, &gate);
+    let mut events = vec![];
+    let result = run_with_events(
+        config,
+        &prompt(),
+        RunContext {
+            conversation_id: "synthetic-conversation",
+            instructions: "Synthetic style.",
+            web_enabled: true,
+        },
+        &mut web,
+        &Cancellation::default(),
+        |event| {
+            match event {
+                RunEvent::ToolCompleted { .. } => events.push("completed".to_string()),
+                RunEvent::RateLimit { info } => events.push(info.status()),
+                _ => {}
+            }
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.fallbacks, 1);
+    assert_eq!(
+        events,
+        [
+            "completed",
+            "Rate limited · Exa · provider wait 7200 s · local wait 7200 s"
+        ]
+    );
+    assert_eq!(server.await.unwrap().len(), 2);
+}
+
 fn tool_output(request: &Value, call_id: &str) -> Value {
     let output = request["input"]
         .as_array()

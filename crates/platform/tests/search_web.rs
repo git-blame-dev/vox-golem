@@ -352,6 +352,15 @@ async fn exa_soft_rate_limit_cools_down_primary_and_falls_back_to_parallel() {
     assert_eq!(result.sources.len(), 1);
     assert_eq!(result.sources[0].provider, Provider::Parallel);
 
+    let diagnostics = service.rate_limits();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].provider_wait_seconds, None);
+    assert_eq!(diagnostics[0].local_wait_seconds, 300);
+    assert_eq!(
+        diagnostics[0].status(),
+        "Rate limited · Exa · provider wait unknown · local wait 300 s"
+    );
+
     let second = service
         .execute(
             &search(),
@@ -381,6 +390,7 @@ async fn rate_limit_falls_back_once_and_next_call_skips_cooling_primary() {
         Err(ProviderFailure {
             kind: Failure::RateLimited,
             retry_after: Some(Duration::from_secs(90)),
+            http_rate_limit: true,
         }),
         Ok(parallel()),
         Ok(parallel()),
@@ -398,6 +408,14 @@ async fn rate_limit_falls_back_once_and_next_call_skips_cooling_primary() {
         .unwrap();
     assert!(result.fallback_used);
     assert_eq!(result.sources[0].provider, Provider::Parallel);
+    let diagnostics = service.rate_limits();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].provider_wait_seconds, Some(90));
+    assert_eq!(diagnostics[0].local_wait_seconds, 90);
+    assert_eq!(
+        diagnostics[0].status(),
+        "Rate limited · Exa · provider wait 90 s · local wait 90 s"
+    );
     service
         .execute(
             &search(),

@@ -224,6 +224,9 @@ fn project_event(
     auth_revision: &mut Option<CustomOpenAiAuthRevision>,
 ) -> Vec<PromptExecutionEventPayload> {
     match event {
+        RunEvent::RateLimit { info } => vec![PromptExecutionEventPayload::Status {
+            message: info.status(),
+        }],
         RunEvent::Model(ModelEvent::RequestDispatched(_)) => vec![],
         RunEvent::Model(ModelEvent::AuthRevision(revision)) => {
             *auth_revision = Some(revision);
@@ -382,6 +385,20 @@ pub(super) fn deep_request(prompt: &str, result: &RunResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_limit_projects_the_shared_safe_status() {
+        let info = voxgolem_platform::web::RateLimitInfo {
+            provider: voxgolem_core::search::Provider::Exa,
+            provider_wait_seconds: None,
+            local_wait_seconds: 300,
+            evidence: voxgolem_platform::web::RateLimitEvidence::ProviderMessage,
+        };
+        let events = project_event(RunEvent::RateLimit { info }, &mut None);
+        assert!(
+            matches!(&events[..], [PromptExecutionEventPayload::Status { message }] if message == "Rate limited · Exa · provider wait unknown · local wait 300 s")
+        );
+    }
 
     fn policy(model: InstantModel) -> AssistantPolicy {
         AssistantPolicy {
