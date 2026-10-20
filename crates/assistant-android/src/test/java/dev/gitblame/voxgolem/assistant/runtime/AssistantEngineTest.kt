@@ -1792,4 +1792,19 @@ class AssistantEngineTest {
             tested.stop(); io.drain()
         }
     }
+
+    @Test fun baseInstructionsAlignWithDirectSnippetSynthesisAndGeminiNanoStripsThem() {
+        assertFalse(
+            AssistantEngine.BASE_INSTRUCTIONS.contains(
+                "Distinguish discovery excerpts from readable source evidence."
+            )
+        )
+        val formatted = GeminiNanoProvider.formatPrompt(
+            JSONObject()
+                .put("instructions", "${AssistantEngine.BASE_INSTRUCTIONS}\n\nKeep plain text.")
+                .put("prompt", "Synthetic local prompt")
+        )
+        assertFalse(formatted.contains(AssistantEngine.BASE_INSTRUCTIONS))
+        assertTrue(formatted.contains("Keep plain text."))
+    }
 }

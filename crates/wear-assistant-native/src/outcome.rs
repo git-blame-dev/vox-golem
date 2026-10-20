@@ -23,6 +23,12 @@ pub(crate) enum Outcome {
         fallback_used: Option<bool>,
         #[serde(rename = "completedMs", skip_serializing_if = "Option::is_none")]
         completed_ms: Option<u64>,
+        #[serde(rename = "rounds", skip_serializing_if = "Option::is_none")]
+        rounds: Option<u64>,
+        #[serde(rename = "searches", skip_serializing_if = "Option::is_none")]
+        searches: Option<u64>,
+        #[serde(rename = "reads", skip_serializing_if = "Option::is_none")]
+        reads: Option<u64>,
     },
     Cancelled,
     Error {
@@ -30,6 +36,16 @@ pub(crate) enum Outcome {
         #[serde(rename = "authRevision", skip_serializing_if = "Option::is_none")]
         auth_revision: Option<String>,
     },
+}
+
+pub(crate) struct SearchTelemetry {
+    pub search_ms: u64,
+    pub search_status: &'static str,
+    pub fallback_used: bool,
+    pub completed_ms: u64,
+    pub rounds: u64,
+    pub searches: u64,
+    pub reads: u64,
 }
 
 impl Outcome {
@@ -50,25 +66,25 @@ impl Outcome {
         self
     }
 
-    pub fn with_search_telemetry(
-        mut self,
-        search_ms: u64,
-        search_status: &'static str,
-        fallback_used: bool,
-        completed_ms: u64,
-    ) -> Self {
+    pub fn with_search_telemetry(mut self, telemetry: SearchTelemetry) -> Self {
         if let Self::Complete {
             search_ms: out_search_ms,
             search_status: out_search_status,
             fallback_used: out_fallback_used,
             completed_ms: out_completed_ms,
+            rounds: out_rounds,
+            searches: out_searches,
+            reads: out_reads,
             ..
         } = &mut self
         {
-            *out_search_ms = Some(search_ms);
-            *out_search_status = Some(search_status);
-            *out_fallback_used = Some(fallback_used);
-            *out_completed_ms = Some(completed_ms);
+            *out_search_ms = Some(telemetry.search_ms);
+            *out_search_status = Some(telemetry.search_status);
+            *out_fallback_used = Some(telemetry.fallback_used);
+            *out_completed_ms = Some(telemetry.completed_ms);
+            *out_rounds = Some(telemetry.rounds);
+            *out_searches = Some(telemetry.searches);
+            *out_reads = Some(telemetry.reads);
         }
         self
     }
@@ -99,6 +115,9 @@ impl Outcome {
                 search_status: None,
                 fallback_used: None,
                 completed_ms: None,
+                rounds: None,
+                searches: None,
+                reads: None,
             },
             Err(error) => Self::error(error.into()),
         }
@@ -218,6 +237,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(refusal["sources"], serde_json::json!([]));
+        let telemetry: serde_json::Value = serde_json::from_str(
+            &Outcome::from_search_response(
+                response("Synthetic answer", CustomOpenAiContentType::OutputText),
+                vec![],
+            )
+            .with_search_telemetry(SearchTelemetry {
+                search_ms: 120,
+                search_status: "ready",
+                fallback_used: false,
+                completed_ms: 340,
+                rounds: 2,
+                searches: 1,
+                reads: 0,
+            })
+            .json(),
+        )
+        .unwrap();
+        assert_eq!(telemetry["searchMs"], serde_json::json!(120));
+        assert_eq!(telemetry["searchStatus"], serde_json::json!("ready"));
+        assert_eq!(telemetry["fallbackUsed"], serde_json::json!(false));
+        assert_eq!(telemetry["completedMs"], serde_json::json!(340));
+        assert_eq!(telemetry["rounds"], serde_json::json!(2));
+        assert_eq!(telemetry["searches"], serde_json::json!(1));
+        assert_eq!(telemetry["reads"], serde_json::json!(0));
     }
 
     #[test]

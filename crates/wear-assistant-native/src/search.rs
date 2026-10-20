@@ -1,6 +1,7 @@
 use crate::{
-    auth_revision_string, deliver_timed_delta, outcome::Outcome, request, CallbackEvent, ErrorCode,
-    FirstTextTiming,
+    auth_revision_string, deliver_timed_delta,
+    outcome::{Outcome, SearchTelemetry},
+    request, CallbackEvent, ErrorCode, FirstTextTiming,
 };
 use std::cell::Cell;
 use std::sync::OnceLock;
@@ -283,12 +284,15 @@ pub(crate) async fn respond_with_web<W: voxgolem_platform::search::WebExecutor>(
                     }
                 }
                 let completed_ms = turn_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                outcome.with_search_telemetry(
-                    search_elapsed_ms.get(),
+                outcome.with_search_telemetry(SearchTelemetry {
+                    search_ms: search_elapsed_ms.get(),
                     search_status,
                     fallback_used,
                     completed_ms,
-                )
+                    rounds: result.rounds as u64,
+                    searches: result.searches as u64,
+                    reads: result.reads as u64,
+                })
             }
             Err(RunError::Provider(error)) => Outcome::error(error.into()),
             Err(RunError::Tool(Failure::Cancelled)) => Outcome::Cancelled,
