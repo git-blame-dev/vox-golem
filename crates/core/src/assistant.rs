@@ -7,7 +7,6 @@ pub enum InstantModel {
     LocalFast,
     LocalQuality,
     CustomSolHigh,
-    CustomSolNone,
     CustomLunaNone,
     CustomLunaLow,
     OpenCodeSolHigh,
@@ -31,7 +30,6 @@ impl InstantModel {
         match self {
             Self::LocalFast | Self::LocalQuality => Provider::Local,
             Self::CustomSolHigh
-            | Self::CustomSolNone
             | Self::CustomLunaNone
             | Self::CustomLunaLow => Provider::Custom,
             Self::OpenCodeSolHigh | Self::OpenCodeLunaLow => Provider::OpenCode,

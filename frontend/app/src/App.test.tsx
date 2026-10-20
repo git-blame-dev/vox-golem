@@ -265,7 +265,7 @@ describe('App', () => {
       if (command === 'get_startup_state') return readyStartupState({ voice_input_available: false })
       if (command === 'get_assistant_settings') return { ...defaultAssistantSettings(), instant: 'custom-sol-high' }
       if (command === 'set_assistant_settings') {
-        expect(args).toMatchObject({ settings: { instant: 'custom-sol-none' } })
+        expect(args).toMatchObject({ settings: { instant: 'custom-luna-none' } })
         return new Promise((_resolve, reject) => { rejectWrite = reject })
       }
       return null
@@ -275,14 +275,14 @@ describe('App', () => {
     expect(inline?.value).toBe('custom-sol-high')
     await act(async () => {
       setTextAreaValue(getComposer(container), 'Synthetic preserved draft')
-      setSelectValue(inline, 'custom-sol-none')
+      setSelectValue(inline, 'custom-luna-none')
       await Promise.resolve()
     })
     expect(inline.disabled).toBe(true)
     expect(getSendButton(container).disabled).toBe(true)
     await act(async () => { getButtonByLabel(container, 'Settings').click(); await Promise.resolve() })
     const settings = container.querySelector<HTMLSelectElement>('#assistantInstantSelect')!
-    expect(settings.value).toBe('custom-sol-none')
+    expect(settings.value).toBe('custom-luna-none')
     expect(settings.disabled).toBe(true)
     await act(async () => { setSelectValue(settings, 'custom-luna-low'); await Promise.resolve() })
     expect(calls.filter((command) => command === 'set_assistant_settings')).toHaveLength(1)
@@ -329,7 +329,7 @@ describe('App', () => {
     expect(calls).not.toContain('set_assistant_settings')
     await act(async () => { getButtonByText(container, 'Stop').click(); await Promise.resolve() })
     expect(inline.disabled).toBe(true)
-    await act(async () => { setSelectValue(inline, 'custom-sol-none'); await Promise.resolve() })
+    await act(async () => { setSelectValue(inline, 'custom-luna-none'); await Promise.resolve() })
     expect(calls.filter((command) => command === 'cancel_prompt')).toHaveLength(1)
     expect(calls.filter((command) => command === 'submit_prompt')).toHaveLength(1)
     await act(async () => {
@@ -356,7 +356,7 @@ describe('App', () => {
       },
       invoke: async (command, args) => {
         if (command === 'get_startup_state') return readyStartupState({ voice_input_available: false })
-        if (command === 'get_app_snapshot') return appSnapshot(committed, { instant: 'custom-sol-none' })
+        if (command === 'get_app_snapshot') return appSnapshot(committed, { instant: 'custom-luna-none' })
         if (command === 'submit_prompt') {
           const request = args as { requestId: string; updates: unknown }
           expect(request.updates).toBe('desktop-channel')
@@ -4197,7 +4197,7 @@ describe('App', () => {
     const select = await getResponseProfileSelect(container)
 
     expect(select.value).toBe('local-fast')
-    expect(Array.from(select.options).map((option) => option.text)).toEqual(['Local: Llama 3.2 3B', 'Local: Quality', 'Custom: GPT-6.1 Sol High', 'Custom: GPT-6.1 Sol No Reasoning', 'Custom: GPT-6 Luna No Reasoning', 'Custom: GPT-5.6 Luna Low', 'OpenCode: GPT-6.1 Sol High', 'OpenCode: GPT-5.6 Luna Low', 'Agy: Gemini 3.8 Flash None', 'Agy: Gemini 3.8 Flash Low', 'Agy: Gemini 3.8 Flash High', 'Agy: Claude Opus 5.5 High', 'Agy: Claude Sonnet 5.5 Low', 'Agy: Claude Sonnet 5.5 High'])
+    expect(Array.from(select.options).map((option) => option.text)).toEqual(['Local: Llama 3.2 3B', 'Local: Quality', 'Custom: GPT-6.1 Sol High', 'Custom: GPT-6 Luna No Reasoning', 'Custom: GPT-5.6 Luna Low', 'OpenCode: GPT-6.1 Sol High', 'OpenCode: GPT-5.6 Luna Low', 'Agy: Gemini 3.8 Flash None', 'Agy: Gemini 3.8 Flash Low', 'Agy: Gemini 3.8 Flash High', 'Agy: Claude Opus 5.5 High', 'Agy: Claude Sonnet 5.5 Low', 'Agy: Claude Sonnet 5.5 High'])
   })
 
   it('invokes switch_response_profile when selecting Quality profile', async () => {
@@ -4886,7 +4886,7 @@ describe('App', () => {
     await act(async () => { getButtonByLabel(container, 'Settings').click(); await Promise.resolve() })
     expect(container.textContent).toContain('Custom connection: WSL OpenCode auth file is unavailable')
     const select = container.querySelector<HTMLSelectElement>('select[aria-label="Instant"]')!
-    expect(select.querySelector<HTMLOptionElement>('option[value="custom-sol-none"]')?.disabled).toBe(true)
+    expect(select.querySelector<HTMLOptionElement>('option[value="custom-sol-high"]')?.disabled).toBe(true)
     expect(select.querySelector<HTMLOptionElement>('option[value="custom-luna-none"]')?.disabled).toBe(true)
   })
 
@@ -4936,9 +4936,9 @@ describe('App', () => {
     const select = await getResponseProfileSelect(container)
     expect(select.value).toBe('custom-luna-none')
     expect(select.querySelector('option[value="custom-luna-none"]')).not.toBeNull()
-    await act(async () => { setSelectValue(select, 'custom-sol-none'); await Promise.resolve() })
-    expect(selected).toBe('custom-sol-none')
-    expect(indicator?.querySelector<HTMLSelectElement>('select')?.selectedOptions[0]?.textContent).toBe('Custom: GPT-6.1 Sol No Reasoning')
+    await act(async () => { setSelectValue(select, 'custom-luna-none'); await Promise.resolve() })
+    expect(selected).toBe('custom-luna-none')
+    expect(indicator?.querySelector<HTMLSelectElement>('select')?.selectedOptions[0]?.textContent).toBe('Custom: GPT-6 Luna No Reasoning')
   })
 
   it('renders only user and assistant prompt execution output when submit command succeeds', async () => {
@@ -5386,7 +5386,7 @@ describe('App', () => {
       listen: async (_event, handler) => { promptEventHandler = handler; return () => undefined },
       invoke: async (command, args) => {
         if (command === 'get_startup_state') return readyStartupState()
-        if (command === 'get_assistant_settings') return { ...defaultAssistantSettings(), instant: 'custom-sol-none' }
+        if (command === 'get_assistant_settings') return { ...defaultAssistantSettings(), instant: 'custom-sol-high' }
         expect(command).toBe('submit_prompt')
         const requestId = (args as { requestId: string }).requestId
         submissions += 1

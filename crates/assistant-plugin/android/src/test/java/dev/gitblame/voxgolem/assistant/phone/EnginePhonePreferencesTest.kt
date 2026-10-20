@@ -183,8 +183,8 @@ class EnginePhonePreferencesTest {
                 f.update(input).getOrThrow()
                 assertEquals(listOf("agy-flash-high"), f.prewarmed)
             }
-            f.update(f.backend.nativePreferences().put("instant", "custom-sol-none")).getOrThrow()
-            assertEquals(listOf("agy-flash-high", "custom-sol-none"), f.prewarmed)
+            f.update(f.backend.nativePreferences().put("instant", "custom-luna-none")).getOrThrow()
+            assertEquals(listOf("agy-flash-high", "custom-luna-none"), f.prewarmed)
         }
     }
 

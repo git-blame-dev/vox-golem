@@ -652,7 +652,7 @@ fn turn(sequence: &str, conversation: Value) -> Value {
         "body":{"kind":"turn_completed","conversation":conversation,"parent":null,
             "request":{"replica":A,"sequence":"100"},"prompt":"Synthetic question",
             "answer":{"kind":"text","text":"Synthetic answer"},"sources":[],"terminal_stage":"instant",
-            "provenance":{"requested_model":"custom-sol-none","returned_model":null,
+            "provenance":{"requested_model":"custom-sol-high","returned_model":null,
                 "policy_id":"synthetic-policy","policy_version":"1",
                 "instruction_profile_id":"synthetic-profile","instruction_profile_version":"1","context":[]}}
     })

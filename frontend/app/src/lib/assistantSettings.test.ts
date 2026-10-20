@@ -14,8 +14,8 @@ describe('assistant settings contract', () => {
   })
   it('has safe defaults', () => expect(DEFAULT_ASSISTANT_SETTINGS).toEqual({ instant: 'local-fast', deep: 'opencode-sol-high', review: 'opencode-sol-high', deepEnabled: false, reviewEnabled: false, prefetch: false, completion: true, webEnabled: true, speechNetworkFallback: true, speechLanguage: '', speechTtsProvider: '', speechTtsVoice: '' }))
   it('labels every choice with its provider', () => {
-    expect(instantOptions(all)).toHaveLength(14); expect(deepOptions(all)).toHaveLength(9); expect(reviewOptions(all)).toHaveLength(9)
-    expect(instantOptions(all).map((x) => x.label)).toEqual(['Local: Llama 3.2 3B', 'Local: Quality', 'Custom: GPT-6.1 Sol High', 'Custom: GPT-6.1 Sol No Reasoning', 'Custom: GPT-6 Luna No Reasoning', 'Custom: GPT-5.6 Luna Low', 'OpenCode: GPT-6.1 Sol High', 'OpenCode: GPT-5.6 Luna Low', 'Agy: Gemini 3.8 Flash None', 'Agy: Gemini 3.8 Flash Low', 'Agy: Gemini 3.8 Flash High', 'Agy: Claude Opus 5.5 High', 'Agy: Claude Sonnet 5.5 Low', 'Agy: Claude Sonnet 5.5 High'])
+    expect(instantOptions(all)).toHaveLength(13); expect(deepOptions(all)).toHaveLength(9); expect(reviewOptions(all)).toHaveLength(9)
+    expect(instantOptions(all).map((x) => x.label)).toEqual(['Local: Llama 3.2 3B', 'Local: Quality', 'Custom: GPT-6.1 Sol High', 'Custom: GPT-6 Luna No Reasoning', 'Custom: GPT-5.6 Luna Low', 'OpenCode: GPT-6.1 Sol High', 'OpenCode: GPT-5.6 Luna Low', 'Agy: Gemini 3.8 Flash None', 'Agy: Gemini 3.8 Flash Low', 'Agy: Gemini 3.8 Flash High', 'Agy: Claude Opus 5.5 High', 'Agy: Claude Sonnet 5.5 Low', 'Agy: Claude Sonnet 5.5 High'])
     expect(deepOptions(all).map((x) => x.value)).toEqual(['custom-sol-high', 'custom-luna-low', 'opencode-sol-high', 'opencode-luna-low', 'agy-flash-low', 'agy-flash-high', 'agy-opus-high', 'agy-sonnet-low', 'agy-sonnet-high'])
     expect(reviewOptions(all).map((x) => x.value)).toEqual(['custom-sol-high', 'custom-luna-low', 'opencode-sol-high', 'opencode-luna-low', 'agy-flash-low', 'agy-flash-high', 'agy-opus-high', 'agy-sonnet-low', 'agy-sonnet-high'])
     expect(deepOptions(all).map((x) => x.description)).toEqual(['Custom reasoning-only', 'Custom reasoning-only', 'OpenCode search', 'OpenCode search', 'Google Antigravity search', 'Google Antigravity search', 'Google Antigravity search', 'Google Antigravity search', 'Google Antigravity search'])
@@ -32,14 +32,14 @@ describe('assistant settings contract', () => {
 
   it('round-trips a direct non-reasoning Instant choice without adding it to Deep or Review', () => {
     const payload = {
-      instant: 'custom-sol-none', deep: 'custom-sol-high', review: 'opencode-sol-high',
+      instant: 'custom-luna-none', deep: 'custom-sol-high', review: 'opencode-sol-high',
       deep_enabled: false, review_enabled: false, prefetch: false, completion: true,
     }
     expect(serializeAssistantSettings(parseAssistantSettings(payload))).toEqual({ ...payload, web_enabled: true, speech_network_fallback: true, speech_language: '', speech_tts_provider: '', speech_tts_voice: '' })
-    expect(instantOptions(all).find((option) => option.value === 'custom-sol-none')).toMatchObject({
+    expect(instantOptions(all).find((option) => option.value === 'custom-luna-none')).toMatchObject({
       available: true, description: 'Direct Custom connection; reasoning disabled',
     })
-    expect(deepOptions(all).map((option) => option.value)).not.toContain('custom-sol-none')
+    expect(deepOptions(all).map((option) => option.value)).not.toContain('custom-luna-none')
   })
   it('round-trips direct GPT-6 Luna None and keeps it Instant-only', () => {
     const payload = { instant: 'custom-luna-none', deep: 'custom-sol-high', review: 'custom-luna-low', deep_enabled: false, review_enabled: false, prefetch: true, completion: true }

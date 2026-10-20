@@ -110,7 +110,7 @@ class AssistantEngineTest {
     }
 
     @Test fun androidModelAliasesContainOnlyCustomNanoAndAgy() {
-        val expectedAliases = setOf("custom-sol-high", "custom-sol-none", "custom-luna-none", "custom-luna-low",
+        val expectedAliases = setOf("custom-sol-high", "custom-luna-none", "custom-luna-low",
             "gemini-nano", "agy-flash-none", "agy-flash-low", "agy-flash-high", "agy-opus-high",
             "agy-sonnet-low", "agy-sonnet-high")
         assertEquals(setOf("gemini-nano", "agy-flash-none", "agy-flash-low", "agy-flash-high", "agy-opus-high",
@@ -685,17 +685,17 @@ class AssistantEngineTest {
     }
     @Test fun preferencePersistenceFailureRollsBackModelAndBothAuthoritativePolicies() {
         var settled: AssistantState? = null
-        engine.updatePreferences("custom-sol-none", AssistantPolicy(false, false), { error("Synthetic persistence failure") }) { settled = it }
+        engine.updatePreferences("custom-luna-none", AssistantPolicy(false, false), { error("Synthetic persistence failure") }) { settled = it }
         io.drain()
         assertEquals("storage_error", settled!!.error)
         assertEquals("custom-sol-high", models.model)
         assertEquals("custom-sol-high", state.model)
         assertTrue(state.webEnabled); assertTrue(state.speechNetworkFallback)
-        engine.updatePreferences("custom-sol-none", AssistantPolicy(false, false), {}) { settled = it }
+        engine.updatePreferences("custom-luna-none", AssistantPolicy(false, false), {}) { settled = it }
         io.drain()
         assertNull(settled!!.error)
         assertFalse(state.webEnabled); assertFalse(state.speechNetworkFallback)
-        assertEquals("custom-sol-none", models.model)
+        assertEquals("custom-luna-none", models.model)
     }
     @Test fun speechSelectionsRequireObservedSdkChoicesAndBooleanChangesPreserveThem() {
         val choices = dev.gitblame.voxgolem.assistant.speech.SpeechOptions(ttsProviders = listOf("synthetic.tts"),

@@ -4,7 +4,6 @@ export const MODEL_CATALOG = [
   { id: 'local-quality', label: 'Local: Quality', agent: false, preview: false },
   { id: 'gemini-nano', label: 'Local: Gemini Nano', agent: false, preview: false },
   { id: 'custom-sol-high', label: 'Custom: GPT-6.1 Sol High', agent: true, preview: false },
-  { id: 'custom-sol-none', label: 'Custom: GPT-6.1 Sol No Reasoning', agent: false, preview: false },
   { id: 'custom-luna-none', label: 'Custom: GPT-6 Luna No Reasoning', agent: false, preview: false },
   { id: 'custom-luna-low', label: 'Custom: GPT-5.6 Luna Low', agent: true, preview: false },
   { id: 'opencode-sol-high', label: 'OpenCode: GPT-6.1 Sol High', agent: true, preview: false },

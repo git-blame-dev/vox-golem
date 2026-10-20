@@ -46,7 +46,7 @@ describe('InstantModelSelect', () => {
     const { select, onChange } = renderSelect([
       { value: 'custom-sol-high', label: 'Synthetic selected model', available: true },
       { value: 'local-fast', label: 'Synthetic retry model', available: false, reason: 'Synthetic warming' },
-      { value: 'custom-sol-none', label: 'Synthetic unavailable model', available: false },
+      { value: 'custom-luna-none', label: 'Synthetic unavailable model', available: false },
     ], disabled, (value) => value === 'local-fast', variant)
     expect(select.closest('.native-icon-select')?.querySelector('svg')).toBeTruthy()
     expect(select.getAttribute('aria-label')).toBe('Instant model')
@@ -65,9 +65,9 @@ describe('InstantModelSelect', () => {
   it('rejects an unavailable model even when a change event bypasses the disabled option', () => {
     const { select, onChange } = renderSelect([
       { value: 'custom-sol-high', label: 'Synthetic selected model', available: true },
-      { value: 'custom-sol-none', label: 'Synthetic unavailable model', available: false, reason: 'Synthetic provider offline' },
+      { value: 'custom-luna-none', label: 'Synthetic unavailable model', available: false, reason: 'Synthetic provider offline' },
     ])
-    act(() => { select.value = 'custom-sol-none'; select.dispatchEvent(new Event('change', { bubbles: true })) })
+    act(() => { select.value = 'custom-luna-none'; select.dispatchEvent(new Event('change', { bubbles: true })) })
     expect(onChange).not.toHaveBeenCalled()
     expect(select.options[1]?.disabled).toBe(true)
     expect(select.options[1]?.title).toBe('Synthetic provider offline')

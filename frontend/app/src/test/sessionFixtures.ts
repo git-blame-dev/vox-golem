@@ -18,7 +18,7 @@ export function defaultAssistantSettings(instant: 'local-fast' | 'local-quality'
 export function appSnapshot(transcript: readonly Record<string, unknown>[] = [], preferenceOverrides: Record<string, unknown> = {}, snapshotOverrides: Record<string, unknown> = {}): Record<string, unknown> {
   return { session_id: '1', runtime_phase: 'sleeping', transcript, active_request: null, capabilities: completeCapabilities(),
     model_options: [
-      ['local-fast', 'Local: Fast'], ['local-quality', 'Local: Quality'], ['custom-sol-none', 'Custom: GPT-6 Sol No Reasoning'],
+      ['local-fast', 'Local: Fast'], ['local-quality', 'Local: Quality'],
       ['custom-luna-none', 'Custom: GPT-6 Luna No Reasoning'], ['custom-sol-high', 'Custom: GPT-5.6 Sol High'],
       ['custom-luna-low', 'Custom: GPT-5.6 Luna Low'], ['opencode-sol-high', 'OpenCode: GPT-5.6 Sol High'], ['opencode-luna-low', 'OpenCode: GPT-5.6 Luna Low'],
     ].map(([id, label]) => ({ id, label, available: true, unavailable_reason: null })),

@@ -107,7 +107,6 @@ pub(crate) fn parse(input: &str) -> Result<Request, ErrorCode> {
     }
     let model = match wire.model.as_str() {
         "custom-sol-high" => CustomOpenAiModel::SolHigh,
-        "custom-sol-none" => CustomOpenAiModel::SolNone,
         "custom-luna-none" => CustomOpenAiModel::LunaNone,
         "custom-luna-low" => CustomOpenAiModel::LunaLow,
         "local-fast" => CustomOpenAiModel::LocalFast,

@@ -1286,7 +1286,6 @@ describe('Android App lifecycle', () => {
   it('uses snapshot membership for both Instant selectors, not the desktop catalog or a fixed Android list', async () => {
     const snapshot = { ...appSnapshot(), model_options: [
       { id: 'custom-sol-high', label: 'Synthetic Sol High', available: true, unavailable_reason: null },
-      { id: 'custom-sol-none', label: 'Synthetic Sol None', available: false, unavailable_reason: 'Synthetic model unavailable' },
       { id: 'custom-luna-none', label: 'Synthetic Luna None', available: true, unavailable_reason: null },
       { id: 'custom-luna-low', label: 'Synthetic Luna Low', available: true, unavailable_reason: null },
     ] }
@@ -1304,11 +1303,8 @@ describe('Android App lifecycle', () => {
       const select = container.querySelector<HTMLSelectElement>(`#${id}`)!
       expect(select).not.toBeNull()
       expect(Array.from(select.options).map((option) => option.value)).toEqual([
-        'custom-sol-high', 'custom-sol-none', 'custom-luna-none', 'custom-luna-low',
+        'custom-sol-high', 'custom-luna-none', 'custom-luna-low',
       ])
-      const unavailable = select.querySelector<HTMLOptionElement>('[value="custom-sol-none"]')!
-      expect(unavailable.disabled).toBe(true)
-      expect(unavailable.textContent).toContain('Synthetic model unavailable')
     }
     snapshot.model_options = snapshot.model_options.filter((option) => option.id === 'custom-sol-high')
     await act(async () => { window.dispatchEvent(new Event('focus')); await Promise.resolve(); await Promise.resolve() })

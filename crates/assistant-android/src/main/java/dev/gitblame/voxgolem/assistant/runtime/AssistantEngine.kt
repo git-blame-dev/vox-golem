@@ -54,7 +54,7 @@ interface AssistantModelStorage {
 }
 
 object AssistantModels {
-    val customLabels = mapOf("custom-sol-high" to "Sol High", "custom-sol-none" to "Sol None", "custom-luna-none" to "Luna None", "custom-luna-low" to "Luna Low")
+    val customLabels = mapOf("custom-sol-high" to "Sol High", "custom-luna-none" to "Luna None", "custom-luna-low" to "Luna Low")
     val optionalLabels = mapOf("gemini-nano" to "Local: Gemini Nano", "agy-flash-none" to "Agy: Gemini 3.8 Flash None", "agy-flash-low" to "Agy: Gemini 3.8 Flash Low",
         "agy-flash-high" to "Agy: Gemini 3.8 Flash High", "agy-opus-high" to "Agy: Claude Opus 5.5 High",
         "agy-sonnet-low" to "Agy: Claude Sonnet 5.5 Low", "agy-sonnet-high" to "Agy: Claude Sonnet 5.5 High")

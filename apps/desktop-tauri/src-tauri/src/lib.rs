@@ -2079,7 +2079,6 @@ async fn update_preferences_from_state(
             Some(voxgolem_core::ipc::ResponseProfile::Quality)
         }
         voxgolem_core::ipc::InstantModelChoice::CustomSolHigh
-        | voxgolem_core::ipc::InstantModelChoice::CustomSolNone
         | voxgolem_core::ipc::InstantModelChoice::CustomLunaNone
         | voxgolem_core::ipc::InstantModelChoice::CustomLunaLow
         | voxgolem_core::ipc::InstantModelChoice::OpenCodeSolHigh
@@ -5871,7 +5870,6 @@ impl DesktopStageDispatcher<'_> {
         if matches!(
             assistant_request.instant_model,
             voxgolem_core::assistant::InstantModel::CustomSolHigh
-                | voxgolem_core::assistant::InstantModel::CustomSolNone
                 | voxgolem_core::assistant::InstantModel::CustomLunaNone
                 | voxgolem_core::assistant::InstantModel::CustomLunaLow
         ) {
@@ -7616,11 +7614,6 @@ fn instant_telemetry_identity(
             telemetry::InferenceProvider::AttachedUnknown,
         ),
         InstantModel::CustomSolHigh => (
-            telemetry::Provider::Custom,
-            "gpt-6.1-sol",
-            telemetry::InferenceProvider::Remote,
-        ),
-        InstantModel::CustomSolNone => (
             telemetry::Provider::Custom,
             "gpt-6.1-sol",
             telemetry::InferenceProvider::Remote,
@@ -9468,9 +9461,6 @@ fn custom_openai_model_for_instant(
         voxgolem_core::assistant::InstantModel::CustomSolHigh => {
             Some(voxgolem_platform::custom_openai::CustomOpenAiModel::SolHigh)
         }
-        voxgolem_core::assistant::InstantModel::CustomSolNone => {
-            Some(voxgolem_platform::custom_openai::CustomOpenAiModel::SolNone)
-        }
         voxgolem_core::assistant::InstantModel::CustomLunaNone => {
             Some(voxgolem_platform::custom_openai::CustomOpenAiModel::LunaNone)
         }
@@ -9736,7 +9726,6 @@ fn local_profile_for_model(
         InstantModel::LocalFast => Some(ResponseProfilePayload::Fast),
         InstantModel::LocalQuality => Some(ResponseProfilePayload::Quality),
         InstantModel::CustomSolHigh
-        | InstantModel::CustomSolNone
         | InstantModel::CustomLunaNone
         | InstantModel::CustomLunaLow
         | InstantModel::OpenCodeSolHigh
@@ -9916,7 +9905,6 @@ async fn run_assistant_prefetch(
             result
         }
         InstantModel::CustomSolHigh
-        | InstantModel::CustomSolNone
         | InstantModel::CustomLunaNone
         | InstantModel::CustomLunaLow => {
             let app_state = app.state::<AppState>();
@@ -14071,15 +14059,13 @@ mod tests {
             voxgolem_core::ipc::UiTextSize::Large
         );
         assert_eq!(snapshot.capabilities.len(), 2);
-        assert_eq!(snapshot.model_options.len(), 8);
+        assert_eq!(snapshot.model_options.len(), 7);
         assert!(snapshot.model_options[2].available);
-        assert_eq!(snapshot.model_options[3].id.as_str(), "custom-sol-none");
+        assert_eq!(snapshot.model_options[3].id.as_str(), "custom-luna-none");
         assert!(snapshot.model_options[3].available);
-        assert_eq!(snapshot.model_options[4].id.as_str(), "custom-luna-none");
-        assert!(snapshot.model_options[4].available);
-        assert!(!snapshot.model_options[6].available);
+        assert!(!snapshot.model_options[5].available);
         assert_eq!(
-            snapshot.model_options[6]
+            snapshot.model_options[5]
                 .unavailable_reason
                 .as_ref()
                 .expect("unavailable reason")
@@ -16081,40 +16067,11 @@ mod tests {
     }
 
     #[test]
-    fn direct_sol_no_reasoning_choice_round_trips_as_custom_instant() {
-        let settings = AssistantSettingsPayload {
-            instant: InstantChoicePayload::CustomSolNone,
-            ..AssistantSettingsPayload::default()
-        };
-        let wire = serde_json::to_value(settings).unwrap();
-        assert_eq!(wire["instant"], "custom-sol-none");
-        assert_eq!(settings.instant.capability_id(), "custom_provider");
-        assert_eq!(
-            AssistantSettingsPayload::from(&voxgolem_core::assistant::AssistantPolicy::from(
-                settings
-            )),
-            settings
-        );
-        assert_eq!(
-            parse_persisted_state("assistant_instant = \"custom-sol-none\"\nassistant_deep = \"custom-sol-high\"\nassistant_review = \"custom-sol-high\"\nassistant_deep_enabled = false\nassistant_review_enabled = false\nassistant_prefetch = false\nassistant_completion = false\n").unwrap().assistant_settings.unwrap().instant,
-            InstantChoicePayload::CustomSolNone
-        );
-        assert_eq!(
-            super::instant_telemetry_identity(
-                voxgolem_core::assistant::InstantModel::CustomSolNone
-            )
-            .0,
-            crate::telemetry::Provider::Custom
-        );
-    }
-
-    #[test]
     fn custom_instant_admission_does_not_require_an_opencode_server() {
         use voxgolem_core::assistant::InstantModel;
 
         for model in [
             InstantModel::CustomSolHigh,
-            InstantModel::CustomSolNone,
             InstantModel::CustomLunaNone,
             InstantModel::CustomLunaLow,
         ] {

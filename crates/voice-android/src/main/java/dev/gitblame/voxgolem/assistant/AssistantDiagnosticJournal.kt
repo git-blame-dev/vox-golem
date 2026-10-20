@@ -261,7 +261,7 @@ class AssistantDiagnosticJournal(
             "agy-sonnet-low", "claude-sonnet-5-5-low", "gemini-nano",
             "agy-flash-none", "gemini-3.8-flash-none", "agy-flash-low",
             "gemini-3.8-flash-low", "agy-flash-high", "gemini-3.8-flash-high", "3.8-flash-high",
-            "custom-sol-high", "custom-sol-none", "custom-luna-none", "custom-luna-low", "local-fast",
+            "custom-sol-high", "custom-luna-none", "custom-luna-low", "local-fast",
             "gpt-6.1-sol", "gpt-6-luna", "gpt-5.6-luna")
         @Volatile private var instance: AssistantDiagnosticJournal? = null
         fun forContext(context: Context): AssistantDiagnosticJournal = instance ?: synchronized(this) {

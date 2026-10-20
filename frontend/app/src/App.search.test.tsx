@@ -16,7 +16,7 @@ function fixture(deepEnabled = false, webEnabled = true, writeSettings?: () => P
   const settings = { instant: 'custom-sol-high', deep: 'opencode-sol-high', review: 'custom-sol-high', deep_enabled: deepEnabled, review_enabled: false, prefetch: false, completion: false, web_enabled: webEnabled, speech_network_fallback: false, speech_language: 'en-AU', speech_tts_provider: 'synthetic.tts.engine', speech_tts_voice: 'synthetic-installed-voice' }
   const snapshot = () => ({
     session_id: '1', runtime_phase: 'sleeping', transcript: [], active_request: null, capabilities,
-    model_options: ['custom-sol-high', 'custom-sol-none', 'custom-luna-none', 'custom-luna-low', 'opencode-sol-high', 'local-fast'].map((id) => ({ id, label: id, available: true, unavailable_reason: null })),
+    model_options: ['custom-sol-high', 'custom-luna-none', 'custom-luna-low', 'opencode-sol-high', 'local-fast'].map((id) => ({ id, label: id, available: true, unavailable_reason: null })),
     preferences: { ...settings, response_profile: 'fast', tts_enabled: false, ui_theme: 'dark', ui_text_size: 'medium' },
   })
   const requests: Array<{ requestId: string; prompt: string; updates: { send: (payload: unknown) => void }; finish: () => void }> = []
@@ -142,8 +142,8 @@ describe('Web research permission and generation-owned presentation', () => {
     window.history.replaceState(null, '')
     const { settings } = fixture()
     const container = await render()
-    await act(async () => { const instant = container.querySelector<HTMLSelectElement>('#composerInstantSelect')!; instant.value = 'custom-sol-none'; instant.dispatchEvent(new Event('change', { bubbles: true })) })
-    expect(settings).toMatchObject({ instant: 'custom-sol-none', speech_language: 'en-AU', speech_tts_provider: 'synthetic.tts.engine', speech_tts_voice: 'synthetic-installed-voice' })
+    await act(async () => { const instant = container.querySelector<HTMLSelectElement>('#composerInstantSelect')!; instant.value = 'custom-sol-high'; instant.dispatchEvent(new Event('change', { bubbles: true })) })
+    expect(settings).toMatchObject({ instant: 'custom-sol-high', speech_language: 'en-AU', speech_tts_provider: 'synthetic.tts.engine', speech_tts_voice: 'synthetic-installed-voice' })
     await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="Settings"]')!.click() })
     expect(container.querySelector('[aria-label="Speech language"]')).toBeNull()
     expect(container.querySelector('[aria-label="TTS engine"]')).toBeNull()

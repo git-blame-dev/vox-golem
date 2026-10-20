@@ -241,7 +241,6 @@ pub enum InstantModelChoice {
     LocalFast,
     LocalQuality,
     CustomSolHigh,
-    CustomSolNone,
     CustomLunaNone,
     CustomLunaLow,
     #[serde(rename = "opencode-sol-high")]
@@ -251,11 +250,10 @@ pub enum InstantModelChoice {
 }
 
 impl InstantModelChoice {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 7] = [
         Self::LocalFast,
         Self::LocalQuality,
         Self::CustomSolHigh,
-        Self::CustomSolNone,
         Self::CustomLunaNone,
         Self::CustomLunaLow,
         Self::OpenCodeSolHigh,
@@ -267,7 +265,6 @@ impl InstantModelChoice {
             Self::LocalFast => "local-fast",
             Self::LocalQuality => "local-quality",
             Self::CustomSolHigh => "custom-sol-high",
-            Self::CustomSolNone => "custom-sol-none",
             Self::CustomLunaNone => "custom-luna-none",
             Self::CustomLunaLow => "custom-luna-low",
             Self::OpenCodeSolHigh => "opencode-sol-high",
@@ -280,7 +277,6 @@ impl InstantModelChoice {
             Self::LocalFast => "local_fast",
             Self::LocalQuality => "local_quality",
             Self::CustomSolHigh
-            | Self::CustomSolNone
             | Self::CustomLunaNone
             | Self::CustomLunaLow => "custom_provider",
             Self::OpenCodeSolHigh | Self::OpenCodeLunaLow => "opencode",
@@ -292,7 +288,6 @@ impl InstantModelChoice {
             Self::LocalFast => "Local: Fast",
             Self::LocalQuality => "Local: Quality",
             Self::CustomSolHigh => "Custom: GPT-6.1 Sol High",
-            Self::CustomSolNone => "Custom: GPT-6.1 Sol None",
             Self::CustomLunaNone => "Custom: GPT-6 Luna None",
             Self::CustomLunaLow => "Custom: GPT-5.6 Luna Low",
             Self::OpenCodeSolHigh => "OpenCode: GPT-6.1 Sol High",
@@ -606,7 +601,6 @@ impl From<assistant::InstantModel> for InstantModelChoice {
             assistant::InstantModel::LocalFast => Self::LocalFast,
             assistant::InstantModel::LocalQuality => Self::LocalQuality,
             assistant::InstantModel::CustomSolHigh => Self::CustomSolHigh,
-            assistant::InstantModel::CustomSolNone => Self::CustomSolNone,
             assistant::InstantModel::CustomLunaNone => Self::CustomLunaNone,
             assistant::InstantModel::CustomLunaLow => Self::CustomLunaLow,
             assistant::InstantModel::OpenCodeSolHigh => Self::OpenCodeSolHigh,
@@ -621,7 +615,6 @@ impl From<InstantModelChoice> for assistant::InstantModel {
             InstantModelChoice::LocalFast => Self::LocalFast,
             InstantModelChoice::LocalQuality => Self::LocalQuality,
             InstantModelChoice::CustomSolHigh => Self::CustomSolHigh,
-            InstantModelChoice::CustomSolNone => Self::CustomSolNone,
             InstantModelChoice::CustomLunaNone => Self::CustomLunaNone,
             InstantModelChoice::CustomLunaLow => Self::CustomLunaLow,
             InstantModelChoice::OpenCodeSolHigh => Self::OpenCodeSolHigh,
@@ -844,12 +837,6 @@ mod tests {
                 Wire::CustomSolHigh,
                 Domain::CustomSolHigh,
                 "custom-sol-high",
-                "custom_provider",
-            ),
-            (
-                Wire::CustomSolNone,
-                Domain::CustomSolNone,
-                "custom-sol-none",
                 "custom_provider",
             ),
             (
@@ -1099,7 +1086,7 @@ mod tests {
     #[test]
     fn model_choices_use_exact_kebab_case_names() {
         for (model, name) in [
-            (assistant::InstantModel::CustomSolNone, "custom-sol-none"),
+            (assistant::InstantModel::CustomSolHigh, "custom-sol-high"),
             (assistant::InstantModel::CustomLunaNone, "custom-luna-none"),
         ] {
             let choice = InstantModelChoice::from(model);

@@ -102,7 +102,6 @@ pub(super) fn native_search_eligible(policy: &AssistantPolicy) -> bool {
     matches!(
         policy.instant_model,
         InstantModel::CustomSolHigh
-            | InstantModel::CustomSolNone
             | InstantModel::CustomLunaNone
             | InstantModel::CustomLunaLow
     ) && !(policy.deep_enabled
@@ -481,7 +480,6 @@ mod tests {
         let state = DesktopSearchState::new("synthetic-process".into());
         for model in [
             CustomOpenAiModel::SolHigh,
-            CustomOpenAiModel::SolNone,
             CustomOpenAiModel::LunaNone,
             CustomOpenAiModel::LunaLow,
         ] {
@@ -582,10 +580,9 @@ mod tests {
     }
 
     #[test]
-    fn desktop_search_four_custom_aliases_share_native_routing() {
+    fn desktop_search_three_custom_aliases_share_native_routing() {
         for model in [
             InstantModel::CustomSolHigh,
-            InstantModel::CustomSolNone,
             InstantModel::CustomLunaNone,
             InstantModel::CustomLunaLow,
         ] {

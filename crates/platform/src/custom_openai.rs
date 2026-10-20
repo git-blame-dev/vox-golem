@@ -30,7 +30,6 @@ const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CustomOpenAiModel {
     SolHigh,
-    SolNone,
     LunaNone,
     LunaLow,
     LocalFast,
@@ -39,7 +38,7 @@ pub enum CustomOpenAiModel {
 impl CustomOpenAiModel {
     pub fn model_id(self) -> &'static str {
         match self {
-            Self::SolHigh | Self::SolNone => "gpt-6.1-sol",
+            Self::SolHigh => "gpt-6.1-sol",
             Self::LunaNone => "gpt-6-luna",
             Self::LunaLow => "gpt-5.6-luna",
             Self::LocalFast => "local-fast",
@@ -49,7 +48,7 @@ impl CustomOpenAiModel {
     pub fn reasoning_effort(self) -> &'static str {
         match self {
             Self::SolHigh => "high",
-            Self::SolNone | Self::LunaNone | Self::LocalFast => "none",
+            Self::LunaNone | Self::LocalFast => "none",
             Self::LunaLow => "low",
         }
     }
@@ -2075,23 +2074,8 @@ mod tests {
     fn maps_sol_and_luna_without_substitution() {
         assert_eq!(CustomOpenAiModel::SolHigh.model_id(), "gpt-6.1-sol");
         assert_eq!(CustomOpenAiModel::SolHigh.reasoning_effort(), "high");
-        assert_eq!(CustomOpenAiModel::SolNone.model_id(), "gpt-6.1-sol");
-        assert_eq!(CustomOpenAiModel::SolNone.reasoning_effort(), "none");
         assert_eq!(CustomOpenAiModel::LunaLow.model_id(), "gpt-5.6-luna");
         assert_eq!(CustomOpenAiModel::LunaLow.reasoning_effort(), "low");
-    }
-
-    #[test]
-    fn direct_sol_without_reasoning_preserves_the_custom_request_contract() {
-        let config = CustomOpenAiConfig {
-            model: CustomOpenAiModel::SolNone,
-            ..CustomOpenAiConfig::default()
-        };
-        let request = build_request(&config, &prompt(), None);
-        assert_eq!(request["model"], "gpt-6.1-sol");
-        assert_eq!(request["reasoning"]["effort"], "none");
-        assert_eq!(request["store"], false);
-        assert!(request.get("tools").is_none());
     }
 
     #[test]
