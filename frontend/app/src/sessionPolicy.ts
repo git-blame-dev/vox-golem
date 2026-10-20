@@ -185,8 +185,6 @@ export function usePresentation(
     canDecreaseTextSize: sizeIndex > 0, canIncreaseTextSize: sizeIndex < UI_TEXT_SIZE_STEPS.length - 1,
     customFailure: startupState.kind === 'ready' || startupState.kind === 'warming_model' ? startupState.capabilities.find((capability) =>
       capability.id === 'custom_provider' && (capability.state === 'failed' || capability.state === 'unavailable')) : undefined,
-    canEnableDeep: options.deepAssistantOptions.some((option) => option.value === assistantSettings.deep && option.available),
-    canEnableReview: options.reviewAssistantOptions.some((option) => option.value === assistantSettings.review && option.available),
     headerBusy: androidVoiceActive || ['listening', 'processing', 'executing'].includes(runtimeStatus) || promptState !== 'idle' || resetPending || isSwitchingResponseProfile || startupState.kind === 'warming_model',
   }
 }

@@ -1,6 +1,6 @@
 import { useCallback, useLayoutEffect, useRef, useSyncExternalStore } from 'react'
 import type { Dispatch, SetStateAction } from 'react'
-import { DEFAULT_ASSISTANT_SETTINGS, deepOptions, instantOptions, reviewOptions } from './lib/assistantSettings'
+import { DEFAULT_ASSISTANT_SETTINGS, instantOptions } from './lib/assistantSettings'
 import type { AssistantCapabilities, AssistantOption, AssistantSettings } from './lib/assistantSettings'
 import type { AndroidAssistantProjection, ModelOption } from './lib/appSnapshot'
 import type { AndroidVoiceStatus } from './lib/androidVoice'
@@ -97,8 +97,6 @@ export type ControlsSnapshot = Omit<SessionState, 'messages' | 'responseAnnounce
 export interface ModelsSnapshot {
   readonly assistantCapabilities: Readonly<AssistantCapabilities>
   readonly instantAssistantOptions: readonly Readonly<AssistantOption<AssistantSettings['instant']>>[]
-  readonly deepAssistantOptions: readonly Readonly<AssistantOption<AssistantSettings['deep']>>[]
-  readonly reviewAssistantOptions: readonly Readonly<AssistantOption<AssistantSettings['review']>>[]
 }
 
 const VIEW_KEYS = {
@@ -330,8 +328,6 @@ export class SessionAuthority {
       assistantCapabilities,
       instantAssistantOptions: applySnapshotModelOptions(instantOptions(assistantCapabilities).filter((option) =>
         models === null ? !this.android : models.some((model) => model.id === option.value)), models),
-      deepAssistantOptions: applySnapshotModelOptions(deepOptions(assistantCapabilities), models),
-      reviewAssistantOptions: applySnapshotModelOptions(reviewOptions(assistantCapabilities), models),
     }
   }
 

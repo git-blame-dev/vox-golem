@@ -4850,11 +4850,12 @@ describe('App', () => {
     } }
     const { container } = await renderApp()
     await openSettings(container)
-    const instant = container.querySelector<HTMLSelectElement>('#assistantInstantSelect')!
+    const instant = container.querySelector<HTMLSelectElement>('select[aria-label="Model"]')!
     const theme = getThemeSelect(container)
     const textSize = getButtonByLabel(container, 'Increase text size')
     const speech = container.querySelector('[aria-labelledby="speech-settings-title"]')!
     expect(instant).not.toBeNull()
+    expect(instant.id).toBe('assistantInstantSelect')
     expect(speech).not.toBeNull()
     expect(theme.compareDocumentPosition(instant) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(textSize.compareDocumentPosition(instant) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
@@ -4862,8 +4863,9 @@ describe('App', () => {
     expect(instant.closest('details')).toBeNull()
     const advanced = container.querySelector<HTMLDetailsElement>('details.settings-panel__advanced')!
     expect(advanced.open).toBe(false)
-    expect(advanced.querySelector('[aria-label="Deep model"]')).not.toBeNull()
-    expect(advanced.querySelector('[aria-label="Review model"]')).not.toBeNull()
+    expect(advanced.querySelector('[aria-label="Deep model"]')).toBeNull()
+    expect(advanced.querySelector('[aria-label="Review model"]')).toBeNull()
+    expect(advanced.textContent).toContain('Completion')
     await act(async () => { advanced.querySelector('summary')!.click() })
     expect(advanced.open).toBe(true)
     const diagnostics = Array.from(speech.querySelectorAll('details')).find((details) => details.querySelector('summary')?.textContent === 'Speech details and diagnostics')!
@@ -4888,7 +4890,7 @@ describe('App', () => {
     const { container } = await renderApp()
     await act(async () => { getButtonByLabel(container, 'Settings').click(); await Promise.resolve() })
     expect(container.textContent).toContain('Custom connection: WSL OpenCode auth file is unavailable')
-    const select = container.querySelector<HTMLSelectElement>('select[aria-label="Instant"]')!
+    const select = container.querySelector<HTMLSelectElement>('select[aria-label="Model"]')!
     expect(select.querySelector<HTMLOptionElement>('option[value="custom-sol-low"]')?.disabled).toBe(true)
     expect(select.querySelector<HTMLOptionElement>('option[value="custom-luna-none"]')?.disabled).toBe(true)
   })
@@ -4912,7 +4914,7 @@ describe('App', () => {
     expect(container.querySelector('[aria-label="Retry Custom"]')).toBeNull()
     await act(async () => { getButtonByLabel(container, 'Settings').click(); await Promise.resolve() })
     expect(container.querySelector('[role="dialog"]')?.textContent).toContain('Custom connection: failed to resolve WSL OpenCode auth: WSL command timed out')
-    const select = container.querySelector<HTMLSelectElement>('select[aria-label="Instant"]')!
+    const select = container.querySelector<HTMLSelectElement>('select[aria-label="Model"]')!
     expect(select.querySelector<HTMLOptionElement>('option[value="custom-luna-none"]')?.disabled).toBe(true)
     await act(async () => { getButtonByLabel(container, 'Retry Custom').click(); await Promise.resolve() })
     expect(calls).toContain('retry_custom_provider')

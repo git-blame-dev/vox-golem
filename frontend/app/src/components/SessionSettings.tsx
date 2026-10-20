@@ -1,5 +1,4 @@
 import { memo } from 'react'
-import type { AssistantSettings } from '../lib/assistantSettings'
 import { isAndroidRuntime, isBrowserPreviewRuntime } from '../lib/tauri'
 import { SETTINGS_DIALOG_ID } from '../lib/useSettingsNavigation'
 import {
@@ -25,8 +24,7 @@ export const SessionSettings = memo(function SessionSettings({ session, view }: 
     supportsDesktopRuntime, selectedAudioInputDevice, audioInputDeviceId, micStarting, updateRuntimeBlocked, audioInputDevices,
     autoStopOnSilence, startupState, voiceInputUnavailableReason, ttsEnabled, canToggleTts, androidVoiceStatus,
     androidSpeechStatusError, assistantSettings, instantControlsDisabled, instantAssistantOptions, assistantCapabilities,
-    selectedInstantRetryable, selectedInstantOption, assistantControlsDisabled, deepAssistantOptions, reviewAssistantOptions,
-    canEnableDeep, canEnableReview, appUpdates, updateInstallationDisabled, customFailure, customRetryPending } = usePresentation(session, view, 'settings')
+    selectedInstantRetryable, selectedInstantOption, appUpdates, updateInstallationDisabled, customFailure, customRetryPending } = usePresentation(session, view, 'settings')
   const { settingsOpen, settingsPanelRef, settingsCloseButtonRef, closeSettings, onSettingsKeyDown } = view.navigation
   const { changeUiTheme, adjustUiTextSize, changeAudioInputDevice, setAutoStopOnSilence, toggleTts, patchAssistantSettings,
     changeInstant, clearCompletion, retryCustom, refreshChatGptAuth } = view.actions
@@ -103,7 +101,7 @@ export const SessionSettings = memo(function SessionSettings({ session, view }: 
             <section className="settings-panel__assistant" aria-labelledby="model-settings-title">
               <h3 id="model-settings-title">Model</h3>
               <ChatGptAuth onChanged={refreshChatGptAuth} />
-              <label className="settings-panel__interactive"><strong>Instant</strong><InstantModelSelect id="assistantInstantSelect" label="Instant" value={assistantSettings.instant} options={instantAssistantOptions} disabled={instantControlsDisabled} canRetry={(value) => localInstantCanRetry(startupState, value)} onChange={(value) => void changeInstant(value)} /></label>
+              <label className="settings-panel__interactive"><strong>Model</strong><InstantModelSelect id="assistantInstantSelect" label="Model" value={assistantSettings.instant} options={instantAssistantOptions} disabled={instantControlsDisabled} canRetry={(value) => localInstantCanRetry(startupState, value)} onChange={(value) => void changeInstant(value)} /></label>
               {startupState.kind === 'ready' && !assistantCapabilities.custom ? <div>
                 <p className="settings-panel__hint">Custom connection: {customFailure?.reason ?? 'unavailable'}</p>
                 {customFailure && supportsDesktopRuntime ? <button type="button" className="shell__control" aria-label="Retry Custom" disabled={customRetryPending || updateRuntimeBlocked} onClick={() => void retryCustom()}>{customRetryPending ? 'Retrying…' : 'Retry Custom'}</button> : null}
@@ -111,26 +109,10 @@ export const SessionSettings = memo(function SessionSettings({ session, view }: 
               {selectedInstantRetryable && selectedInstantOption ? <button className="settings-panel__interactive" type="button" aria-label="Retry local profile" disabled={instantControlsDisabled} onClick={() => void changeInstant(assistantSettings.instant)}>Retry local profile</button> : null}
               {!isAndroidRuntime ? <details className="settings-panel__advanced">
                 <summary>Advanced model settings</summary>
-                <label className="settings-panel__interactive"><strong>Deep model</strong><select aria-label="Deep model" value={assistantSettings.deep} disabled={assistantControlsDisabled} onChange={(event) => {
-                  const value = event.target.value as AssistantSettings['deep']
-                  if (deepAssistantOptions.find((option) => option.value === value)?.available) patchAssistantSettings({ deep: value })
-                }}>
-                  {deepAssistantOptions.map((option) => <option key={option.value} value={option.value} disabled={!option.available} title={option.reason}>{option.label}</option>)}
-                </select></label>
-                <label className="settings-panel__interactive"><strong>Review model</strong><select aria-label="Review model" value={assistantSettings.review} disabled={assistantControlsDisabled} onChange={(event) => {
-                  const value = event.target.value as AssistantSettings['review']
-                  if (reviewAssistantOptions.find((option) => option.value === value)?.available) patchAssistantSettings({ review: value })
-                }}>
-                  {reviewAssistantOptions.map((option) => <option key={option.value} value={option.value} disabled={!option.available} title={option.reason}>{option.label}</option>)}
-                </select></label>
-                <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.deepEnabled} disabled={assistantControlsDisabled || (!assistantSettings.deepEnabled && !canEnableDeep)} onChange={(event) => patchAssistantSettings({ deepEnabled: event.target.checked })} /> Deep</label>
-                <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.reviewEnabled} disabled={assistantControlsDisabled || (!assistantSettings.reviewEnabled && !canEnableReview)} onChange={(event) => patchAssistantSettings({ reviewEnabled: event.target.checked })} /> Review</label>
-                <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.completion} disabled={assistantControlsDisabled || (!assistantSettings.completion && !assistantCapabilities.qwenPrediction)} onChange={(event) => {
+                <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.completion} disabled={instantControlsDisabled || (!assistantSettings.completion && !assistantCapabilities.qwenPrediction)} onChange={(event) => {
                   if (!event.target.checked) clearCompletion()
                   patchAssistantSettings({ completion: event.target.checked })
                 }} /> Completion</label>
-                <label className="settings-panel__interactive"><input type="checkbox" checked={assistantSettings.prefetch} disabled={assistantControlsDisabled || !supportsDesktopRuntime} aria-describedby="prefetch-help" onChange={(event) => patchAssistantSettings({ prefetch: event.target.checked })} /> Prefetch</label>
-                <p id="prefetch-help" className="settings-panel__hint">{supportsDesktopRuntime ? 'Prefetch may transmit unaccepted predicted text when enabled.' : 'Prefetch is unavailable on this runtime.'}</p>
               </details> : null}
             </section>
             {supportsDesktopRuntime ? <div className="settings-panel__row settings-panel__mic-row">
