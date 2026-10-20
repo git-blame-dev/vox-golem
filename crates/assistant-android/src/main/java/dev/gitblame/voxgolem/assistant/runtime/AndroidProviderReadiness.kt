@@ -18,8 +18,7 @@ internal object AndroidProviderReadiness {
             if (!supported) "Agy requires Android 26+ for bounded process retirement" else if (!executable) "Agy executable is not installed" else if (!credentials) "Agy requires externally provisioned app-private access and installation identity" else "Installed Agy route; account access is checked on request")
         val nano = if (watch) OptionalProviderReadiness(true, "Runs on the paired phone; its Gemini Nano readiness is checked on request") else OptionalProviderReadiness(Build.VERSION.SDK_INT >= 34,
             if (Build.VERSION.SDK_INT >= 34) "On-device Gemini Nano via AICore; availability is checked on request" else "Gemini Nano requires Android 14+")
-        return mapOf("local-fast" to OptionalProviderReadiness(false, "No owned local server readiness is published on Android"),
-            GeminiNanoProvider.MODEL_NAME to nano,
-            "agy-flash-none" to agy, "agy-flash-low" to agy, "agy-flash-high" to agy, "agy-opus-high" to agy, "agy-sonnet-low" to agy, "agy-sonnet-high" to agy)
+        return AssistantModels.optionalLabels.keys.associateWith { if (it == GeminiNanoProvider.MODEL_NAME) nano else agy } +
+            ("local-fast" to OptionalProviderReadiness(false, "No owned local server readiness is published on Android"))
     }
 }

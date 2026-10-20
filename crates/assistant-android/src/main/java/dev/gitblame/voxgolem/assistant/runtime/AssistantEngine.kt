@@ -54,11 +54,44 @@ interface AssistantModelStorage {
 }
 
 object AssistantModels {
-    val customLabels = mapOf("custom-sol-high" to "Sol High", "custom-sol-none" to "Sol None", "custom-luna-none" to "Luna None", "custom-luna-low" to "Luna Low")
-    val optionalLabels = mapOf("gemini-nano" to "Local: Gemini Nano", "agy-flash-none" to "Agy: Gemini 3.8 Flash None", "agy-flash-low" to "Agy: Gemini 3.8 Flash Low",
-        "agy-flash-high" to "Agy: Gemini 3.8 Flash High", "agy-opus-high" to "Agy: Claude Opus 5.5 High",
-        "agy-sonnet-low" to "Agy: Claude Sonnet 5.5 Low", "agy-sonnet-high" to "Agy: Claude Sonnet 5.5 High")
+    val customLabels = mapOf(
+        "custom-sol-low" to "Sol Low",
+        "custom-sol-medium" to "Sol Medium",
+        "custom-sol-high" to "Sol High",
+        "custom-sol-xhigh" to "Sol X-High",
+        "custom-sol-max" to "Sol Max",
+        "custom-luna-none" to "Luna None",
+        "custom-luna6-low" to "GPT-6 Luna Low",
+        "custom-luna6-medium" to "GPT-6 Luna Medium",
+        "custom-luna6-high" to "GPT-6 Luna High",
+        "custom-luna6-xhigh" to "GPT-6 Luna X-High",
+        "custom-luna6-max" to "GPT-6 Luna Max",
+        "custom-luna56-none" to "GPT-5.6 Luna None",
+        "custom-luna-low" to "Luna Low",
+        "custom-luna56-medium" to "GPT-5.6 Luna Medium",
+        "custom-luna56-high" to "GPT-5.6 Luna High",
+        "custom-luna56-xhigh" to "GPT-5.6 Luna X-High",
+        "custom-luna56-max" to "GPT-5.6 Luna Max"
+    )
+    val optionalLabels = mapOf(
+        "gemini-nano" to "Local: Gemini Nano",
+        "agy-argon-low" to "Agy: Gemini 4 Argon Low",
+        "agy-argon-medium" to "Agy: Gemini 4 Argon Medium",
+        "agy-argon-high" to "Agy: Gemini 4 Argon High",
+        "agy-flash-none" to "Agy: Gemini 3.8 Flash None",
+        "agy-flash-low" to "Agy: Gemini 3.8 Flash Low",
+        "agy-flash-medium" to "Agy: Gemini 3.8 Flash Medium",
+        "agy-flash-high" to "Agy: Gemini 3.8 Flash High",
+        "agy-opus-low" to "Agy: Claude Opus 5.5 Low",
+        "agy-opus-medium" to "Agy: Claude Opus 5.5 Medium",
+        "agy-opus-high" to "Agy: Claude Opus 5.5 High",
+        "agy-sonnet-low" to "Agy: Claude Sonnet 5.5 Low",
+        "agy-sonnet-medium" to "Agy: Claude Sonnet 5.5 Medium",
+        "agy-sonnet-high" to "Agy: Claude Sonnet 5.5 High"
+    )
     val aliases = (customLabels.keys + optionalLabels.keys).toList()
+    val nonAgentAliases = setOf("gemini-nano", "agy-flash-none", "custom-luna-none", "custom-luna56-none")
+    val agentAliases: Set<String> = aliases.filterNot { it in nonAgentAliases }.toSet()
 }
 
 object AssistantToolStatuses {

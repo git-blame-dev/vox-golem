@@ -110,14 +110,41 @@ class AssistantEngineTest {
     }
 
     @Test fun androidModelAliasesContainOnlyCustomNanoAndAgy() {
-        val expectedAliases = setOf("custom-sol-high", "custom-sol-none", "custom-luna-none", "custom-luna-low",
-            "gemini-nano", "agy-flash-none", "agy-flash-low", "agy-flash-high", "agy-opus-high",
-            "agy-sonnet-low", "agy-sonnet-high")
-        assertEquals(setOf("gemini-nano", "agy-flash-none", "agy-flash-low", "agy-flash-high", "agy-opus-high",
-            "agy-sonnet-low", "agy-sonnet-high"), AssistantModels.optionalLabels.keys)
-        assertEquals(expectedAliases, AssistantModels.aliases.toSet())
-        assertEquals(expectedAliases.size, AssistantModels.aliases.size)
-        assertEquals(AssistantModels.customLabels.keys + AssistantModels.optionalLabels.keys, AssistantModels.aliases.toSet())
+        val expectedCustom = setOf(
+            "custom-sol-low", "custom-sol-medium", "custom-sol-high", "custom-sol-xhigh", "custom-sol-max",
+            "custom-luna-none", "custom-luna6-low", "custom-luna6-medium", "custom-luna6-high", "custom-luna6-xhigh", "custom-luna6-max",
+            "custom-luna56-none", "custom-luna-low", "custom-luna56-medium", "custom-luna56-high", "custom-luna56-xhigh", "custom-luna56-max"
+        )
+        val expectedOptional = setOf(
+            "gemini-nano", "agy-argon-low", "agy-argon-medium", "agy-argon-high",
+            "agy-flash-none", "agy-flash-low", "agy-flash-medium", "agy-flash-high",
+            "agy-opus-low", "agy-opus-medium", "agy-opus-high",
+            "agy-sonnet-low", "agy-sonnet-medium", "agy-sonnet-high"
+        )
+        assertEquals(expectedCustom, AssistantModels.customLabels.keys)
+        assertEquals(expectedOptional, AssistantModels.optionalLabels.keys)
+        assertEquals(expectedCustom + expectedOptional, AssistantModels.aliases.toSet())
+        assertEquals((expectedCustom + expectedOptional).size, AssistantModels.aliases.size)
+    }
+
+    @Test fun agyProviderResolveTargetModelAndEffortCoverNewAliases() {
+        val providerNative = AgyProviderNative(context)
+        assertEquals("gemini-4-argon-low", providerNative.resolveTargetModel("agy-argon-low"))
+        assertEquals("gemini-4-argon-medium", providerNative.resolveTargetModel("agy-argon-medium"))
+        assertEquals("gemini-4-argon-high", providerNative.resolveTargetModel("agy-argon-high"))
+        assertEquals("gemini-4-argon-high", providerNative.resolveTargetModel("argon-4"))
+        assertEquals("gemini-3.8-flash-low", providerNative.resolveTargetModel("agy-flash-none"))
+        assertEquals("gemini-3.8-flash-medium", providerNative.resolveTargetModel("agy-flash-medium"))
+        assertEquals("claude-opus-5-5-low", providerNative.resolveTargetModel("agy-opus-low"))
+        assertEquals("claude-opus-5-5-medium", providerNative.resolveTargetModel("agy-opus-medium"))
+        assertEquals("claude-sonnet-medium", providerNative.resolveTargetModel("claude-sonnet-medium"))
+
+        assertEquals("low", providerNative.resolveEffort("gemini-4-argon-low"))
+        assertEquals("medium", providerNative.resolveEffort("gemini-4-argon-medium"))
+        assertEquals("high", providerNative.resolveEffort("gemini-4-argon-high"))
+        assertEquals("low", providerNative.resolveEffort("agy-flash-low"))
+        assertEquals("medium", providerNative.resolveEffort("agy-flash-medium"))
+        assertEquals("high", providerNative.resolveEffort("agy-flash-high"))
     }
 
     @Test fun localFastCannotBeSelectedOrPersistedThroughPreferences() {
@@ -685,17 +712,17 @@ class AssistantEngineTest {
     }
     @Test fun preferencePersistenceFailureRollsBackModelAndBothAuthoritativePolicies() {
         var settled: AssistantState? = null
-        engine.updatePreferences("custom-sol-none", AssistantPolicy(false, false), { error("Synthetic persistence failure") }) { settled = it }
+        engine.updatePreferences("custom-sol-low", AssistantPolicy(false, false), { error("Synthetic persistence failure") }) { settled = it }
         io.drain()
         assertEquals("storage_error", settled!!.error)
         assertEquals("custom-sol-high", models.model)
         assertEquals("custom-sol-high", state.model)
         assertTrue(state.webEnabled); assertTrue(state.speechNetworkFallback)
-        engine.updatePreferences("custom-sol-none", AssistantPolicy(false, false), {}) { settled = it }
+        engine.updatePreferences("custom-sol-low", AssistantPolicy(false, false), {}) { settled = it }
         io.drain()
         assertNull(settled!!.error)
         assertFalse(state.webEnabled); assertFalse(state.speechNetworkFallback)
-        assertEquals("custom-sol-none", models.model)
+        assertEquals("custom-sol-low", models.model)
     }
     @Test fun speechSelectionsRequireObservedSdkChoicesAndBooleanChangesPreserveThem() {
         val choices = dev.gitblame.voxgolem.assistant.speech.SpeechOptions(ttsProviders = listOf("synthetic.tts"),

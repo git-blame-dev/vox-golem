@@ -256,13 +256,21 @@ class AssistantDiagnosticJournal(
         private val ROUTE = Regex("[A-Za-z0-9_-]{1,32}")
         private val ENTRIES = setOf("ask", "talk", "chat", "manual")
         // Explicit aliases/server IDs from AgyProvider and platform/custom_openai; never arbitrary server names.
-        private val MODELS = setOf("agy-opus-high", "claude-opus-5-5-high", "opus-5.5", "opus5.5",
+        private val MODELS = setOf(
+            "agy-argon-low", "gemini-4-argon-low", "agy-argon-medium", "gemini-4-argon-medium",
+            "agy-argon-high", "gemini-4-argon-high", "argon-4", "argon4",
+            "agy-opus-low", "claude-opus-5-5-low", "agy-opus-medium", "claude-opus-5-5-medium",
+            "agy-opus-high", "claude-opus-5-5-high", "opus-5.5", "opus5.5",
+            "agy-sonnet-low", "claude-sonnet-5-5-low", "agy-sonnet-medium", "claude-sonnet-5-5-medium",
             "agy-sonnet-high", "claude-sonnet-5-5-high", "sonnet-5.5", "sonnet5.5",
-            "agy-sonnet-low", "claude-sonnet-5-5-low", "gemini-nano",
-            "agy-flash-none", "gemini-3.8-flash-none", "agy-flash-low",
-            "gemini-3.8-flash-low", "agy-flash-high", "gemini-3.8-flash-high", "3.8-flash-high",
-            "custom-sol-high", "custom-sol-none", "custom-luna-none", "custom-luna-low", "local-fast",
-            "gpt-6.1-sol", "gpt-6-luna", "gpt-5.6-luna")
+            "gemini-nano",
+            "agy-flash-none", "gemini-3.8-flash-none", "agy-flash-low", "gemini-3.8-flash-low",
+            "agy-flash-medium", "gemini-3.8-flash-medium", "agy-flash-high", "gemini-3.8-flash-high", "3.8-flash-high",
+            "custom-sol-low", "custom-sol-medium", "custom-sol-high", "custom-sol-xhigh", "custom-sol-max", "custom-sol-none",
+            "custom-luna-none", "custom-luna6-low", "custom-luna6-medium", "custom-luna6-high", "custom-luna6-xhigh", "custom-luna6-max",
+            "custom-luna56-none", "custom-luna-low", "custom-luna56-medium", "custom-luna56-high", "custom-luna56-xhigh", "custom-luna56-max",
+            "local-fast", "gpt-6.1-sol", "gpt-6-luna", "gpt-5.6-luna",
+        )
         @Volatile private var instance: AssistantDiagnosticJournal? = null
         fun forContext(context: Context): AssistantDiagnosticJournal = instance ?: synchronized(this) {
             instance ?: run {

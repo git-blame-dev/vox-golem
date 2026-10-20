@@ -75,7 +75,7 @@ class AgyProviderRouter(
         }
     }
     private fun isAgyModel(model: String) = model != GeminiNanoProvider.MODEL_NAME && (model.startsWith("agy-") || model.startsWith("claude-") ||
-        model.startsWith("gemini-") || model.startsWith("opus") || model.startsWith("sonnet") || model.startsWith("3.8-"))
+        model.startsWith("gemini-") || model.startsWith("opus") || model.startsWith("sonnet") || model.startsWith("3.8-") || model.startsWith("argon"))
     private fun providerFor(model: String) = when {
         model == GeminiNanoProvider.MODEL_NAME -> phoneRelay ?: geminiNanoNative
         isAgyModel(model) -> phoneRelay ?: agyNative
@@ -141,12 +141,25 @@ class AgyProviderNative internal constructor(
     }
 
     fun resolveTargetModel(requestedModel: String): String = when (requestedModel) {
+        "agy-argon-low", "gemini-4-argon-low" -> "gemini-4-argon-low"
+        "agy-argon-medium", "gemini-4-argon-medium" -> "gemini-4-argon-medium"
+        "agy-argon-high", "gemini-4-argon-high", "argon-4", "argon4" -> "gemini-4-argon-high"
+        "agy-opus-low", "claude-opus-5-5-low" -> "claude-opus-5-5-low"
+        "agy-opus-medium", "claude-opus-5-5-medium" -> "claude-opus-5-5-medium"
         "agy-opus-high", "claude-opus-5-5-high", "opus-5.5", "opus5.5" -> "claude-opus-5-5-high"
-        "agy-sonnet-high", "claude-sonnet-5-5-high", "sonnet-5.5", "sonnet5.5" -> "claude-sonnet-5-5-high"
         "agy-sonnet-low", "claude-sonnet-5-5-low" -> "claude-sonnet-5-5-low"
+        "agy-sonnet-medium", "claude-sonnet-5-5-medium" -> "claude-sonnet-5-5-medium"
+        "agy-sonnet-high", "claude-sonnet-5-5-high", "sonnet-5.5", "sonnet5.5" -> "claude-sonnet-5-5-high"
         "agy-flash-none", "gemini-3.8-flash-none", "agy-flash-low", "gemini-3.8-flash-low" -> "gemini-3.8-flash-low"
+        "agy-flash-medium", "gemini-3.8-flash-medium" -> "gemini-3.8-flash-medium"
         "agy-flash-high", "gemini-3.8-flash-high", "3.8-flash-high" -> "gemini-3.8-flash-high"
         else -> if (requestedModel.startsWith("claude-") || requestedModel.startsWith("gemini-")) requestedModel else "gemini-3.8-flash-high"
+    }
+
+    fun resolveEffort(targetAgyModel: String): String = when {
+        targetAgyModel.endsWith("-low") -> "low"
+        targetAgyModel.endsWith("-medium") -> "medium"
+        else -> "high"
     }
 
     /** Called only by the IO actor. Startup and retirement never hold the cancellation monitor. */
@@ -227,7 +240,7 @@ class AgyProviderNative internal constructor(
             return
         }
         val targetAgyModel = resolveTargetModel(requestedModel)
-        val effort = if (targetAgyModel.endsWith("-low")) "low" else "high"
+        val effort = resolveEffort(targetAgyModel)
         val generation = synchronized(lock) {
             if (activeRequestId != null || !ioRetired) return
             if (prewarmTargetModel == targetAgyModel &&
@@ -313,7 +326,7 @@ class AgyProviderNative internal constructor(
         val reqObj = JSONObject(requestJson)
         val requestedModel = reqObj.optString("model", "agy-flash-high")
         val targetAgyModel = resolveTargetModel(requestedModel)
-        val effort = if (targetAgyModel.endsWith("-low")) "low" else "high"
+        val effort = resolveEffort(targetAgyModel)
         val webEnabled = reqObj.optBoolean("webEnabled", true)
         // Authored CLI contract has no verified tool-denial protocol. Prompt text is not enforcement.
         if (!webEnabled) return failure("unsupported_web_permission", "Agy cannot enforce disabled web tools")

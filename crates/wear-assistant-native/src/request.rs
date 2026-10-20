@@ -105,14 +105,7 @@ pub(crate) fn parse(input: &str) -> Result<Request, ErrorCode> {
     {
         return Err(ErrorCode::InvalidRequest);
     }
-    let model = match wire.model.as_str() {
-        "custom-sol-high" => CustomOpenAiModel::SolHigh,
-        "custom-sol-none" => CustomOpenAiModel::SolNone,
-        "custom-luna-none" => CustomOpenAiModel::LunaNone,
-        "custom-luna-low" => CustomOpenAiModel::LunaLow,
-        "local-fast" => CustomOpenAiModel::LocalFast,
-        _ => return Err(ErrorCode::InvalidRequest),
-    };
+    let model = CustomOpenAiModel::from_wire_id(&wire.model).ok_or(ErrorCode::InvalidRequest)?;
     let text_bytes: usize = wire
         .messages
         .iter()

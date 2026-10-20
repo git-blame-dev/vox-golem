@@ -122,7 +122,8 @@ class AssistantDiagnosticJournalTest {
     @Test fun customModelsAndWebRouteHaveOnlyExplicitTypedValues() {
         val worker = Worker(); val dir = temporary.newFolder()
         val journal = AssistantDiagnosticJournal({ dir }, worker, { 1000L })
-        val models = listOf("custom-sol-high", "custom-sol-none", "custom-luna-none", "custom-luna-low",
+        val models = listOf("custom-sol-low", "custom-sol-high", "custom-luna-none", "custom-luna-low",
+            "agy-argon-low", "agy-argon-medium", "agy-argon-high", "gemini-4-argon-high",
             "local-fast", "gpt-6.1-sol", "gpt-6-luna", "gpt-5.6-luna")
         models.forEach { model -> journal.offerMetadata(AssistantTiming.Operation.GENERATION, 1, null, 42,
             AssistantDiagnosticJournal.Metadata(model = model, webEnabled = false)) }
