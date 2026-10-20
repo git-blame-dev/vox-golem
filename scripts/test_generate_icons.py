@@ -24,7 +24,7 @@ icons = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(icons)
 CANONICAL_SVG = icons.DESKTOP_ICONS / "icon.svg"
 SYNTHETIC_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="10 20 60 60" color="#12ABCD">
-<g id="mark"><circle cx="40" cy="50" fill="#000000" stroke="none" r="30"/>
+<g id="mark"><circle cx="40" cy="50" fill="#000000" stroke="none" r="28"/>
 <circle cx="40" cy="50" fill="#F74638" r="20"/></g></svg>"""
 LAUNCHER_FILES = tuple(
     f"mipmap-{density}/{filename}"
@@ -50,8 +50,10 @@ class IconGenerationTests(unittest.TestCase):
         self.assertEqual(len({icons.ET.tostring(layer) for layer in variants}), 4)
         for layer in variants:
             badge = layer.find(f"{icons.SVG}g[@id='entry-badge']")
-            self.assertEqual(badge.get("transform"), "translate(55 65) scale(1.07143)")
-            self.assertLess(math.hypot(15, 15) + 7.5, 30)
+            self.assertEqual(badge.get("transform"), "translate(54 64) scale(2)")
+            radius = 28
+            width = 60
+            self.assertLessEqual(0.5 * radius + 7.5 * (radius / 14), width / 2)
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="test-icons-", dir="/tmp/opencode")
@@ -211,10 +213,12 @@ class IconGenerationTests(unittest.TestCase):
                                          "fill": "#000000", "stroke": "none"})
         plus = badge.find(f"{icons.SVG}path")
         self.assertIn("A2 2", plus.get("d"))
-        self.assertEqual(plus.get("stroke"), "#12ABCD")
+        self.assertEqual(plus.get("stroke"), "#F74638")
         self.assertEqual(plus.get("stroke-width"), "1.4")
         self.assertEqual(plus.get("stroke-linecap"), "round")
-        self.assertLess(math.hypot(15, 15) + 7.5, 30)
+        radius = 28
+        width = 60
+        self.assertLessEqual(0.5 * radius + 7.5 * (radius / 14), width / 2)
 
     def test_shortcut_requires_concrete_source_color_and_mark(self):
         for color in (None, "", "currentColor", "url(https://invalid.example/color)", "#NOTHEX"):
@@ -334,8 +338,8 @@ class IconGenerationTests(unittest.TestCase):
             x, y, width, _ = map(float, source.get("viewBox").split())
             radius = icons.artwork_geometry(source) * width / 2
             def note_pixel(dx, dy):
-                px = int((width / 2 + radius / 2 + dx * radius / 28) * 48 / width)
-                py = int((width / 2 + radius / 2 + dy * radius / 28) * 48 / width)
+                px = int((width / 2 + radius / 2 + dx * radius / 14) * 48 / width)
+                py = int((width / 2 + radius / 2 + dy * radius / 14) * 48 / width)
                 return pixels[(py * 48 + px) * 4:(py * 48 + px) * 4 + 4]
             self.assertGreater(note_pixel(-3, 1)[0], note_pixel(0, -3)[0] + 60)
             self.assertGreater(note_pixel(0, 2)[0], note_pixel(0, -3)[0] + 60)
@@ -360,7 +364,7 @@ class IconGenerationTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("cargo") and shutil.which("ffmpeg"),
                          "requires existing cargo tauri renderer and ffmpeg pixel decoder")
-    def test_real_shortcut_yellow_badge_stays_inside_circle_and_preserves_normal_outputs(self):
+    def test_real_shortcut_red_badge_stays_inside_circle_and_preserves_normal_outputs(self):
         shutil.copyfile(CANONICAL_SVG, self.desktop / "icon.svg")
         self.invoke()
         before = file_bytes(self.root)
@@ -395,8 +399,7 @@ class IconGenerationTests(unittest.TestCase):
         ], timeout=30)
         self.assertEqual(len(pixels), width * height * 4)
         source = icons.ET.parse(self.desktop / "icon.svg").getroot()
-        color = source.get("color").lstrip("#")
-        yellow = bytes.fromhex(color) + b"\xff"
+        red = bytes.fromhex("F74638") + b"\xff"
         x, y, view_width, view_height = map(float, source.get("viewBox").split())
 
         def pixel_at(svg_x, svg_y):
@@ -406,11 +409,11 @@ class IconGenerationTests(unittest.TestCase):
             return pixels[offset:offset + 4]
 
         radius = icons.artwork_geometry(source) * view_width / 2
-        bx, by, scale = x + view_width / 2 + radius / 2, y + view_height / 2 + radius / 2, radius / 28
+        bx, by, scale = x + view_width / 2 + radius / 2, y + view_height / 2 + radius / 2, radius / 14
         # The microphone has two capsule sides, a lower stand and a black interior.
         for dx, dy in ((-2, -2), (2, -2), (0, 5), (-1, 6), (1, 6)):
             point = (bx + dx * scale, by + dy * scale)
-            self.assertEqual(pixel_at(*point), yellow)
+            self.assertEqual(pixel_at(*point), red)
         self.assertEqual(pixel_at(bx, by - 2 * scale), b"\x00\x00\x00\xff")
         # Decode the actual renderer output at launcher size. Each badge must keep
         # visible ink, a black counter and a distinct silhouette after downsampling.
@@ -426,8 +429,7 @@ class IconGenerationTests(unittest.TestCase):
                 "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1",
             ], timeout=30)
             self.assertTrue(all(
-                (index % width + .5 - width / 2) ** 2
-                + (index // width + .5 - height / 2) ** 2 <= (radius * width / view_width + 1) ** 2
+                0 <= index % width < width and 0 <= index // width < height
                 for index in range(width * height) if rgba[index * 4 + 3]
             ), purpose)
             small = subprocess.check_output([
@@ -448,7 +450,7 @@ class IconGenerationTests(unittest.TestCase):
             (index % width + 0.5 - width / 2) ** 2 + (index // width + 0.5 - height / 2) ** 2
             for index in range(width * height) if pixels[index * 4 + 3]
         )
-        self.assertLessEqual(max_radius_squared, (width / 2) ** 2)
+        self.assertLessEqual(max_radius_squared, (width / math.sqrt(2)) ** 2)
         print(f"Shortcut PNG: sha256={hashlib.sha256(png.read_bytes()).hexdigest()}, "
               f"nontransparent radius={math.sqrt(max_radius_squared) * view_width / width:.4f} SVG units")
         self.invoke()
