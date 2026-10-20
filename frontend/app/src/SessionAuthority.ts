@@ -104,6 +104,15 @@ export interface ModelsSnapshot {
 const VIEW_KEYS = {
   shell: ['uiTextSize', 'uiTheme', 'runtimeStatus'],
   conversation: ['voiceNotesOpen', 'shortcutStaging', 'composerValue', 'uiTextSize', 'notices'],
+  runtime: ['startupState', 'runtimeStatus', 'assistantSettings', 'assistantSettingsPending',
+    'assistantSettingsLoadError', 'assistantSettingsWriteError', 'uiThemeWriteError',
+    'snapshotHydrationState', 'snapshotControlsFresh', 'snapshotControlsInvalidated', 'snapshotModelOptions',
+    'uiTextSize', 'uiTheme', 'ttsEnabled', 'autoStopOnSilence', 'preparedCueAssetPaths',
+    'audioInputDeviceId', 'audioInputDevices', 'shortcutStaging', 'androidAssistant',
+    'androidConversationId', 'conversationPagePending', 'headPagePending', 'androidVoiceActive',
+    'androidVoiceStatus', 'androidSpeechStatusError', 'ttsPlaying', 'pendingTtsCommands',
+    'isSwitchingResponseProfile', 'micStarting', 'micActive', 'voiceNotesOpen', 'customRetryPending',
+    'notices', 'noticeInteraction', 'promptActivity', 'promptState', 'resetPending'],
   toolbar: ['startupState', 'runtimeStatus', 'assistantSettings', 'assistantSettingsPending',
     'snapshotHydrationState', 'snapshotControlsFresh', 'snapshotControlsInvalidated', 'snapshotModelOptions',
     'androidAssistant', 'androidConversationId', 'androidVoiceActive',
@@ -329,7 +338,9 @@ export class SessionAuthority {
   getViewSnapshot<N extends ViewName>(name: N): ViewSnapshot<N> {
     const prior = this.views.get(name)
     if (prior?.source === this.controls) return prior.snapshot as ViewSnapshot<N>
-    const keys = VIEW_KEYS[name]
+    const keys = name === 'runtime' && this.android
+      ? ([...VIEW_KEYS.runtime, 'composerValue'] as const)
+      : VIEW_KEYS[name]
     const values = keys.map((key) => this.controls[key])
     const unchanged = prior !== undefined && values.every((value, index) => Object.is(value, prior.values[index]))
     const snapshot = unchanged ? prior.snapshot : Object.fromEntries(keys.map((key, index) => [key, values[index]]))

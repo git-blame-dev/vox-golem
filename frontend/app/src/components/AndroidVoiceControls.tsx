@@ -1,10 +1,19 @@
-import { createContext, useContext, useEffect, useId, useRef, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useId, useMemo, useRef, useState } from 'react'
 import type { MouseEvent, ReactNode } from 'react'
 import type { AndroidVoiceAdapterView } from '../lib/useAndroidVoiceAdapter'
 import { visibleSpeechError, openSpeechServicesStore } from '../lib/androidVoice'
 import { ControlIcon } from './ControlIcon'
 import type { ControlIconState } from './ControlIcon'
 import './AndroidVoiceControls.css'
+
+export function SpeechServicesInstallPrompt({ message = 'Google Speech Services is missing or disabled for offline speech recognition.' }: { readonly message?: string }) {
+  return (
+    <div className="settings-panel__missing-speech" role="alert">
+      <p><strong>Speech services required:</strong> {message}</p>
+      <button type="button" className="shell__control settings-panel__interactive" onClick={() => void openSpeechServicesStore()}>Open Play Store</button>
+    </div>
+  )
+}
 
 interface VoiceProps {
   readonly voice: AndroidVoiceAdapterView
@@ -26,7 +35,7 @@ function useVoiceControls({ voice, disabled, generationAvailable, interactionBlo
     dialog.showModal()
     return () => { dialog.close(); if (invoker?.isConnected) invoker.focus() }
   }, [showMissingSpeechPrompt])
-  const { status, pending, error, ownedSessionError, statusError, active } = voice
+  const { status, pending, error, ownedSessionError, statusError, active, start: startVoice } = voice
   const sessionError = visibleSpeechError(error ?? ownedSessionError)
   const isMissingSpeech = status?.missingSpeechServices === true
   const missingRequirementText = status?.speechRequirementMessage || 'Speech Recognition & Synthesis by Google is required for local STT or TTS on this device.'
@@ -52,37 +61,43 @@ function useVoiceControls({ voice, disabled, generationAvailable, interactionBlo
     : status.reason || 'Native dictation is unavailable'
   const voiceDescription = active && status?.mode === 'loop' ? `${rawVoiceDescription}. Cancel recognition, request and playback; do not submit.` : `${rawVoiceDescription}.`
   const startDisabled = disabled || active || interactionBlocked || showMissingSpeechPrompt || (status?.available !== true && !isMissingSpeech)
-  const withSpeechServices = (action: () => void, invoker: HTMLElement) => {
+  const withSpeechServices = useCallback((action: () => void, invoker: HTMLElement) => {
     if (isMissingSpeech) { speechInvokerRef.current = invoker; setShowMissingSpeechPrompt(true) }
     else action()
-  }
-  const start = (policy: 'single_turn', invoker: HTMLElement) => {
+  }, [isMissingSpeech])
+  const start = useCallback((policy: 'single_turn', invoker: HTMLElement) => {
     if (startDisabled) return
     if (!generationAvailable) {
       setIntentNotice('Ask requires an available model.')
       return
     }
     setIntentNotice(null)
-    withSpeechServices(() => { void voice.start(false, undefined, policy) }, invoker)
-  }
+    withSpeechServices(() => { void startVoice(false, undefined, policy) }, invoker)
+  }, [generationAvailable, startDisabled, startVoice, withSpeechServices])
   const speechDisabled = pending || interactionBlocked || (status?.ttsEnabled !== true && (disabled || (status?.ttsAvailable !== true && !isMissingSpeech)))
   const speakerState: ControlIconState = compactError !== null ? 'error' : pending || status === null ? 'busy' : status.ttsPhase === 'speaking' || status.loop === 'speaking' ? 'speaking' : status.ttsEnabled ? 'ready' : status.ttsAvailable ? 'off' : 'unavailable'
   const speakerDescription = compactError ?? (pending ? 'Voice controls busy' : status === null ? 'Checking speech availability…' : speakerState === 'speaking' ? 'Speaking…' : status.ttsEnabled ? 'Speak replies enabled' : status.ttsAvailable ? 'Speak replies off' : 'Native speech output is unavailable')
-  const dialog = showMissingSpeechPrompt ? (
+  const closeMissingSpeechPrompt = useCallback(() => setShowMissingSpeechPrompt(false), [])
+  const dialog = useMemo(() => showMissingSpeechPrompt ? (
     <dialog ref={speechDialogRef} className="speech-prompt-dialog" aria-labelledby={`${descriptionId}-missing-title`} aria-describedby={`${descriptionId}-missing-description`}
-      onCancel={(event) => { event.preventDefault(); setShowMissingSpeechPrompt(false) }}
-      onClick={(event) => { if (event.target === event.currentTarget) setShowMissingSpeechPrompt(false) }}>
+      onCancel={(event) => { event.preventDefault(); closeMissingSpeechPrompt() }}
+      onClick={(event) => { if (event.target === event.currentTarget) closeMissingSpeechPrompt() }}>
       <div className="speech-prompt-dialog__content">
         <h4 id={`${descriptionId}-missing-title`}>Speech Services Required</h4><p id={`${descriptionId}-missing-description`}>{missingRequirementText}</p>
         <div className="speech-prompt-dialog__actions">
-          <button type="button" className="shell__control" onClick={() => { setShowMissingSpeechPrompt(false); void openSpeechServicesStore() }}>Open Play Store</button>
-          <button type="button" autoFocus className="shell__control" onClick={() => setShowMissingSpeechPrompt(false)}>Cancel</button>
+          <button type="button" className="shell__control" onClick={() => { closeMissingSpeechPrompt(); void openSpeechServicesStore() }}>Open Play Store</button>
+          <button type="button" autoFocus className="shell__control" onClick={closeMissingSpeechPrompt}>Cancel</button>
         </div>
       </div>
     </dialog>
-  ) : null
-  return { voice, descriptionId, start, startDisabled, compactError, sessionError, intentNotice, progress, voiceDescription, voiceState,
-    speechDisabled, speakerState, speakerDescription, withSpeechServices, dialog, isMissingSpeech }
+  ) : null, [closeMissingSpeechPrompt, descriptionId, missingRequirementText, showMissingSpeechPrompt])
+  return useMemo(() => ({
+    voice, descriptionId, start, startDisabled, compactError, sessionError, intentNotice, progress, voiceDescription, voiceState,
+    speechDisabled, speakerState, speakerDescription, withSpeechServices, dialog, isMissingSpeech,
+  }), [
+    voice, descriptionId, start, startDisabled, compactError, sessionError, intentNotice, progress, voiceDescription, voiceState,
+    speechDisabled, speakerState, speakerDescription, withSpeechServices, dialog, isMissingSpeech,
+  ])
 }
 const VoiceControlsContext = createContext<ReturnType<typeof useVoiceControls> | null>(null)
 function useControls() {

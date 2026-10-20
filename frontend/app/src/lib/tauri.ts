@@ -10,7 +10,7 @@ import { getBrowserPreviewInternals } from './browserRuntime'
 import { utf8ByteLength } from './wire'
 import { NEW_VOICE_SHORTCUT_COMMANDS } from './newVoiceShortcut'
 import { serializeAssistantSettings } from './assistantSettings'
-const ANDROID_CAPABILITY_IDS = ['custom_provider', 'opencode', 'local_fast', 'local_quality', 'qwen_prediction', 'wake_word', 'vad', 'parakeet', 'tts', 'deep', 'review'] as const
+import { CAPABILITY_IDS } from './startupState'
 const COMMAND_ERROR_CODES = ['invalid_input', 'not_found', 'busy', 'unavailable', 'internal'] as const
 type CommandErrorCode = typeof COMMAND_ERROR_CODES[number]
 
@@ -146,7 +146,7 @@ export function buildAndroidStartupState(snapshot: AppSnapshot): Record<string, 
     runtime_phase: snapshot.runtimePhase, voice_input_available: false, voice_input_error: 'Desktop audio input is unavailable on Android; native dictation has separate availability',
     silence_timeout_ms: 1500, selected_response_profile: snapshot.preferences.responseProfile, supported_response_profiles: [],
     prompt_cancellation_available: true, tts_enabled: snapshot.preferences.ttsEnabled, tts_output_gain_db: 3,
-    capabilities: ANDROID_CAPABILITY_IDS.map((id) => {
+    capabilities: CAPABILITY_IDS.map((id) => {
       const capability = capabilities.get(id)
       return capability === undefined
         ? { id, state: 'not_configured', reason: 'Unavailable on Android zero-asset runtime', actual_provider: null }

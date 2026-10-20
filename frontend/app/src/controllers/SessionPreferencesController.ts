@@ -17,6 +17,33 @@ class PreferenceJournal<T> {
     this.writes.current = write.then(() => undefined, () => undefined)
     return write
   }
+
+  async mutate(options: {
+    readonly next: T
+    readonly fallback: T
+    readonly apply: (value: T) => void
+    readonly save: () => Promise<T>
+    readonly onError: (error: unknown) => void
+  }): Promise<void> {
+    const revision = ++this.revision.current
+    this.pending.current = revision
+    options.apply(options.next)
+    try {
+      const persisted = await this.enqueue(options.save)
+      this.persistedRevision.current = revision
+      this.persisted.current = persisted
+      this.initialized.current = true
+      if (revision === this.revision.current) {
+        this.pending.current = null
+        options.apply(persisted)
+      }
+    } catch (error) {
+      if (revision !== this.revision.current) return
+      this.pending.current = null
+      options.apply(this.initialized.current ? this.persisted.current : options.fallback)
+      options.onError(error)
+    }
+  }
 }
 
 export class SessionPreferencesController {
@@ -26,3 +53,4 @@ export class SessionPreferencesController {
   readonly theme = new PreferenceJournal<UiTheme>('dark')
   readonly tts = new PreferenceJournal(false)
 }
+

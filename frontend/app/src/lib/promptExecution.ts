@@ -8,6 +8,27 @@ import type {
 } from '../types/chat'
 import type { AnswerSource } from '../components/AnswerStage'
 
+function parseCustomDirectTimings(payload: Record<string, unknown>): import('../types/chat').CustomDirectTimings {
+  const firstTextMs = payload['first_text_ms']
+  const completedMs = payload['completed_ms']
+  if (
+    !Number.isSafeInteger(firstTextMs) ||
+    !Number.isSafeInteger(completedMs) ||
+    (firstTextMs as number) < 0 ||
+    (completedMs as number) < (firstTextMs as number)
+  ) {
+    throw new Error('Custom direct timings must include ordered nonnegative milliseconds')
+  }
+  return { firstTextMs: firstTextMs as number, completedMs: completedMs as number }
+}
+
+function parseOptionalAnswerSources(sources: unknown): readonly AnswerSource[] {
+  if (!Array.isArray(sources) || sources.length > MAX_ANSWER_SOURCES || !Array.from(sources).every(isSourceLink)) {
+    throw new Error('Sources event must include bounded URL/title pairs')
+  }
+  return sources as AnswerSource[]
+}
+
 export function parseAndroidPromptUpdate(payload: unknown, requestId: string): PromptExecutionEvent {
   if (!isRecord(payload) || typeof payload['kind'] !== 'string') throw new Error('Android prompt update must include kind')
   const kind = payload['kind']
@@ -16,13 +37,7 @@ export function parseAndroidPromptUpdate(payload: unknown, requestId: string): P
     return { requestId, kind: 'text', text: payload['text'] }
   }
   if (kind === 'custom_direct_timings') {
-    const firstTextMs = payload['first_text_ms']
-    const completedMs = payload['completed_ms']
-    if (!Number.isSafeInteger(firstTextMs) || !Number.isSafeInteger(completedMs) ||
-        (firstTextMs as number) < 0 || (completedMs as number) < (firstTextMs as number)) {
-      throw new Error('Custom direct timings must include ordered nonnegative milliseconds')
-    }
-    return { requestId, kind: 'custom_direct_timings', timings: { firstTextMs: firstTextMs as number, completedMs: completedMs as number } }
+    return { requestId, kind: 'custom_direct_timings', timings: parseCustomDirectTimings(payload) }
   }
   if (kind === 'stage') {
     if (!isStage(payload['stage']) || !isStageStatus(payload['status']) || (payload['detail'] !== undefined && payload['detail'] !== null && (typeof payload['detail'] !== 'string' || utf8ByteLength(payload['detail']) > 512))) throw new Error('Android stage update is invalid')
@@ -101,13 +116,7 @@ export function parsePromptExecutionEvent(payload: unknown): PromptExecutionEven
   }
 
   if (kind === 'custom_direct_timings') {
-    const firstTextMs = payload['first_text_ms']
-    const completedMs = payload['completed_ms']
-    if (!Number.isSafeInteger(firstTextMs) || !Number.isSafeInteger(completedMs) ||
-        (firstTextMs as number) < 0 || (completedMs as number) < (firstTextMs as number)) {
-      throw new Error('Custom direct timings must include ordered nonnegative milliseconds')
-    }
-    return { requestId, kind, timings: { firstTextMs: firstTextMs as number, completedMs: completedMs as number } }
+    return { requestId, kind, timings: parseCustomDirectTimings(payload) }
   }
 
   if (kind === 'correction') {
@@ -135,9 +144,7 @@ export function parsePromptExecutionEvent(payload: unknown): PromptExecutionEven
     return { requestId, kind, stage, status, ...(typeof detail === 'string' ? { detail } : {}) }
   }
   if (kind === 'sources') {
-    const sources = payload['sources']
-    if (!Array.isArray(sources) || sources.length > MAX_ANSWER_SOURCES || !Array.from(sources).every(isSourceLink)) throw new Error('Sources event must include bounded URL/title pairs')
-    return { requestId, kind, sources: sources as AnswerSource[] }
+    return { requestId, kind, sources: parseOptionalAnswerSources(payload['sources']) }
   }
 
   if (kind === 'status') {
