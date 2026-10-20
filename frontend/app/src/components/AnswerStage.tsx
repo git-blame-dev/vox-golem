@@ -67,7 +67,7 @@ export function AnswerStage({ answer, contentKind = 'text', stages, priorVersion
   return (
     <section className={rootClassName} aria-label={contentKind === 'refusal' ? 'Assistant refusal' : compact ? 'Assistant answer' : 'Current answer'} data-content-kind={contentKind}>
       {!compact || contentKind === 'refusal' ? <h2>{contentKind === 'refusal' ? 'Assistant refusal' : 'Current answer'}</h2> : null}
-      <p className="answer-stage__answer">{answer.trim().length === 0 ? pending ? <span className="message__thinking">{thinkingStatus ?? 'Thinking…'}</span> : 'No response was returned.' : <PlainText>{answer}</PlainText>}</p>
+      <p className="answer-stage__answer">{answer.trim().length === 0 ? pending ? <span className="message__thinking message__status-pill">{thinkingStatus ?? 'Thinking…'}</span> : 'No response was returned.' : <PlainText>{answer}</PlainText>}</p>
       {!compact || visibleStages.length > 0 ? <ul className="answer-stage__statuses" aria-label="Answer stage status">
          {visibleStages.map(({ stage, status }, index) => (
           <li key={`${stage}-${status}-${index}`} data-stage={stage} data-status={status}>
@@ -80,7 +80,7 @@ export function AnswerStage({ answer, contentKind = 'text', stages, priorVersion
       </ul> : null}
 
       {hasDetails ? <details className="answer-stage__details">
-        <summary>Details</summary>
+        <summary>Sources</summary>
         {sources.length === 0 ? null : <ul className="answer-stage__sources" aria-label="Sources">
           {sources.map((source, index) => <li key={`${source.url}-${index}`}><a href={source.url} target="_blank" rel="noreferrer">{source.title}</a></li>)}
         </ul>}

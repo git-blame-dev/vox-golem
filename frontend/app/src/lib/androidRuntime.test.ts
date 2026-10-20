@@ -4,9 +4,10 @@ import { missingPromptStreamingSupportError, parseAndroidPromptOutcome, parseAnd
 import type { AppSnapshot, ValidatedPreferences } from './appSnapshot'
 import { appendCanonicalTurn, canonicalExecutionKey, isExpectedCanonicalTurn, parseAppSnapshot, parseCanonicalTurn, parseValidatedPreferences } from './appSnapshot'
 import { initialUpdateState } from './useAppUpdates'
+import type { AgentChoice } from './modelCatalog'
 
 const preferences: ValidatedPreferences = {
-  instant: 'local-fast', deep: 'opencode-sol-high', review: 'opencode-luna-low', deepEnabled: false, reviewEnabled: true,
+  instant: 'local-fast', deep: 'opencode-sol-high' as AgentChoice, review: 'opencode-luna-low' as AgentChoice, deepEnabled: false, reviewEnabled: true,
   prefetch: true, completion: false, responseProfile: 'quality', ttsEnabled: true, uiTheme: 'dark', uiTextSize: 'large',
   webEnabled: false, speechNetworkFallback: false,
   speechLanguage: 'en-AU', speechTtsProvider: 'synthetic.tts.engine', speechTtsVoice: 'synthetic-local-voice',

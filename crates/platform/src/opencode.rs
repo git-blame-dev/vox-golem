@@ -68,15 +68,33 @@ pub enum OpencodePromptError {
 /// The model configurations approved for prompts sent by the platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpencodeModel {
+    Gpt6SolLow,
+    Gpt6SolMedium,
     Gpt6SolHigh,
+    Gpt6SolXhigh,
+    Gpt6SolMax,
+    Gpt56LunaNone,
     Gpt56LunaLow,
+    Gpt56LunaMedium,
+    Gpt56LunaHigh,
+    Gpt56LunaXhigh,
+    Gpt56LunaMax,
 }
 
 impl OpencodeModel {
     fn request_fields(self) -> serde_json::Value {
         let model = match self {
-            Self::Gpt6SolHigh => "gpt-6.1-sol",
-            Self::Gpt56LunaLow => "gpt-5.6-luna",
+            Self::Gpt6SolLow
+            | Self::Gpt6SolMedium
+            | Self::Gpt6SolHigh
+            | Self::Gpt6SolXhigh
+            | Self::Gpt6SolMax => "gpt-6.1-sol",
+            Self::Gpt56LunaNone
+            | Self::Gpt56LunaLow
+            | Self::Gpt56LunaMedium
+            | Self::Gpt56LunaHigh
+            | Self::Gpt56LunaXhigh
+            | Self::Gpt56LunaMax => "gpt-5.6-luna",
         };
         serde_json::json!({
             "providerID": "openai",
@@ -86,8 +104,12 @@ impl OpencodeModel {
 
     fn variant(self) -> &'static str {
         match self {
-            Self::Gpt6SolHigh => "high",
-            Self::Gpt56LunaLow => "low",
+            Self::Gpt6SolLow | Self::Gpt56LunaLow => "low",
+            Self::Gpt6SolMedium | Self::Gpt56LunaMedium => "medium",
+            Self::Gpt6SolHigh | Self::Gpt56LunaHigh => "high",
+            Self::Gpt6SolXhigh | Self::Gpt56LunaXhigh => "xhigh",
+            Self::Gpt6SolMax | Self::Gpt56LunaMax => "max",
+            Self::Gpt56LunaNone => "none",
         }
     }
 }

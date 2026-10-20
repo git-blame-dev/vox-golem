@@ -99,13 +99,36 @@ impl DesktopSearchState {
 pub(super) fn native_search_eligible(policy: &AssistantPolicy) -> bool {
     matches!(
         policy.instant_model,
-        InstantModel::CustomSolHigh
+        InstantModel::CustomSolLow
+            | InstantModel::CustomSolMedium
+            | InstantModel::CustomSolHigh
+            | InstantModel::CustomSolXhigh
+            | InstantModel::CustomSolMax
             | InstantModel::CustomLunaNone
+            | InstantModel::CustomLuna6Low
+            | InstantModel::CustomLuna6Medium
+            | InstantModel::CustomLuna6High
+            | InstantModel::CustomLuna6Xhigh
+            | InstantModel::CustomLuna6Max
+            | InstantModel::CustomLuna56None
             | InstantModel::CustomLunaLow
+            | InstantModel::CustomLuna56Medium
+            | InstantModel::CustomLuna56High
+            | InstantModel::CustomLuna56Xhigh
+            | InstantModel::CustomLuna56Max
     ) && !(policy.deep_enabled
         && matches!(
             policy.deep_model,
-            AgentModel::OpenCodeSolHigh | AgentModel::OpenCodeLunaLow
+            AgentModel::OpenCodeSolLow
+                | AgentModel::OpenCodeSolMedium
+                | AgentModel::OpenCodeSolHigh
+                | AgentModel::OpenCodeSolXhigh
+                | AgentModel::OpenCodeSolMax
+                | AgentModel::OpenCodeLunaLow
+                | AgentModel::OpenCodeLunaMedium
+                | AgentModel::OpenCodeLunaHigh
+                | AgentModel::OpenCodeLunaXhigh
+                | AgentModel::OpenCodeLunaMax
         ))
 }
 
@@ -486,6 +509,7 @@ mod tests {
         let state = DesktopSearchState::new("synthetic-process".into());
         for model in [
             CustomOpenAiModel::SolHigh,
+            CustomOpenAiModel::SolLow,
             CustomOpenAiModel::LunaNone,
             CustomOpenAiModel::LunaLow,
         ] {
@@ -586,9 +610,10 @@ mod tests {
     }
 
     #[test]
-    fn desktop_search_three_custom_aliases_share_native_routing() {
+    fn desktop_search_four_custom_aliases_share_native_routing() {
         for model in [
             InstantModel::CustomSolHigh,
+            InstantModel::CustomSolLow,
             InstantModel::CustomLunaNone,
             InstantModel::CustomLunaLow,
         ] {

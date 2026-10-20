@@ -18,8 +18,8 @@ import { NewVoiceShortcutSettings } from './components/NewVoiceShortcutSettings'
 import { isConfirmedNewVoiceContext, NEW_VOICE_SHORTCUT_EVENT } from './lib/newVoiceShortcut'
 import { canonicalMessageId, replaceCommittedTranscript, settleCanonicalAnswerStages } from './committedTranscript'
 import { InstantModelSelect } from './components/InstantModelSelect'
+import { CopyConversationButton } from './components/ChatBubble'
 import { ControlIcon } from './components/ControlIcon'
-import { PhoneActionOverflow } from './components/PhoneActionOverflow'
 import headerIcon from '../../../apps/desktop-tauri/src-tauri/icons/icon.svg?url'
 import { UserNoticeToast } from './components/UserNoticeToast'
 import { UpdateSettings } from './components/UpdateSettings'
@@ -3253,7 +3253,6 @@ const SessionToolbar = memo(function SessionToolbar({ session, view }: SessionVi
   } = view.actions
   const notesControl = <button type="button" className="shell__control shell__icon-control" aria-label={voiceNotesOpen ? 'Chat' : 'Voice notes'} title={voiceNotesOpen ? 'Chat' : 'Voice notes'} aria-pressed={voiceNotesOpen} onClick={() => setVoiceNotesOpen((open) => !open)}>
     <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 3h10l4 4v14H5z M15 3v5h4 M8 12h8 M8 16h6" /></svg>
-    <span className="shell__overflow-label" aria-hidden="true">{voiceNotesOpen ? 'Chat' : 'Voice notes'}</span>
   </button>
   const conversationControl = androidAssistant !== null ? <label className="shell__control shell__icon-control shell__conversation-picker" title={androidAssistant.conversations.find((item) => item.id === androidConversationId)?.title ?? 'Conversation'}>
     <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 4h16v12H9l-5 4z M8 8h8 M8 12h6" /></svg>
@@ -3262,13 +3261,12 @@ const SessionToolbar = memo(function SessionToolbar({ session, view }: SessionVi
       {androidAssistant.conversations.map((conversation) => <option key={conversation.id} value={conversation.id}>{conversation.title}</option>)}
     </select>
   </label> : null
+  const exportConversationControl = <CopyConversationButton session={session} disabled={shortcutStaging || resetPending || updateRuntimeBlocked} />
   const newChatControl = <button type="button" className="shell__control shell__new-chat shell__icon-control" onClick={() => void resetSession()} aria-label="New Chat" aria-busy={resetPending} title={resetPending ? 'Starting new chat…' : 'New Chat'} disabled={resetPending || updateRuntimeBlocked}>
     <ControlIcon kind="plus" />
-    <span className="shell__overflow-label" aria-hidden="true">New Chat</span>
   </button>
   const settingsControl = <button ref={settingsButtonRef} type="button" className={`shell__control shell__settings-button${isAndroidRuntime ? ' shell__icon-control' : ''}`} onClick={openSettings} aria-label="Settings" aria-haspopup="dialog" aria-controls={SETTINGS_DIALOG_ID} aria-expanded={settingsOpen} title="Settings">
     {isAndroidRuntime ? <ControlIcon kind="settings" /> : '⚙'}
-    <span className="shell__overflow-label" aria-hidden="true">Settings</span>
   </button>
   const desktopSpeakerState: import('./components/ControlIcon').ControlIconState = ttsPlaying ? 'speaking' : ttsEnabled ? 'ready' : canToggleTts ? 'off' : 'unavailable'
   const desktopSpeakerDescription = ttsPlaying ? 'Speaking…' : ttsEnabled ? 'Speak replies enabled' : canToggleTts ? 'Speak replies off' : 'Speech output is unavailable'
@@ -3290,17 +3288,14 @@ const SessionToolbar = memo(function SessionToolbar({ session, view }: SessionVi
   return (
       <header className="shell__header" aria-label="VoxGolem">
         <div className="shell__identity" data-shell-identity>
-          <img className="shell__logo" src={headerIcon} alt="VoxGolem" width={32} height={32} data-busy={headerBusy} />
+          <img className="shell__logo" src={headerIcon} alt="VoxGolem" width={40} height={40} data-busy={headerBusy} />
           <div className="shell__runtime">
             {isBrowserPreviewRuntime() ? <span data-browser-preview>Browser preview</span> : null}
           </div>
         </div>
         <div className="shell__header-actions" role={isAndroidRuntime ? 'group' : undefined} aria-label={isAndroidRuntime ? 'Android toolbar' : undefined} aria-describedby={isAndroidRuntime && shortcutStaging ? 'new-voice-draft-status' : undefined}>
-          {isAndroidRuntime ? <>{voiceNotesOpen ? notesControl : null}{conversationControl}<PhoneActionOverflow>
-            {!voiceNotesOpen ? <AndroidVoiceSecondaryControls /> : null}
-            {!voiceNotesOpen ? notesControl : newChatControl}{settingsControl}
-          </PhoneActionOverflow></> : null}
-          {!isAndroidRuntime ? <>{desktopSpeakerControl}{settingsControl}</> : null}
+          {isAndroidRuntime ? <>{!voiceNotesOpen ? <AndroidVoiceSecondaryControls /> : null}{notesControl}{conversationControl}{exportConversationControl}{newChatControl}{settingsControl}</> : null}
+          {!isAndroidRuntime ? <>{desktopSpeakerControl}{exportConversationControl}{newChatControl}{settingsControl}</> : null}
         </div>
       </header>
   )
@@ -3532,7 +3527,7 @@ const SessionComposer = memo(function SessionComposer({ session, view }: Session
     instantControlsDisabled, runtimeStatus, updateRuntimeBlocked,
     promptActivity, wakeConfidence, customFailure, supportsDesktopRuntime, customRetryPending } = usePresentation(session, view, 'composer')
   const { onSubmit, loadMoreAndroidConversations, loadMoreAndroidHeads, selectAndroidConversation, changeComposer,
-     onComposerKeyDown, acceptTypedCompletion, clearCompletion, toggleMic, changeInstant, cancelPrompt, resetSession, retryCustom } = view.actions
+     onComposerKeyDown, acceptTypedCompletion, clearCompletion, toggleMic, changeInstant, cancelPrompt, retryCustom } = view.actions
   const canStop = (promptState === 'executing' || promptState === 'stopping') && startupState.kind === 'ready' && startupState.promptCancellationAvailable
   const busy = promptState !== 'idle' || runtimeStatus === 'processing' || runtimeStatus === 'executing'
   const actionLabel = canStop ? promptState === 'stopping' ? 'Stopping…' : 'Stop' : busy ? 'Working…' : 'Send'
@@ -3571,16 +3566,15 @@ const SessionComposer = memo(function SessionComposer({ session, view }: Session
             rows={1}
             maxRows={6}
           />
-        <button type={busy ? 'button' : 'submit'} className="composer__button shell__icon-control" aria-label={actionLabel} title={actionLabel}
-          disabled={canStop ? promptState === 'stopping' || updateRuntimeBlocked : busy || !canSend} onClick={canStop ? cancelPrompt : undefined}>
-          <ControlIcon kind={canStop ? 'stop' : 'send'} />
-        </button>
         </div>
         <div className="composer__utility-row">
           <InstantModelSelect variant="pill" id="composerInstantSelect" label="Instant model" value={assistantSettings.instant} options={instantAssistantOptions} disabled={instantControlsDisabled} canRetry={(value) => localInstantCanRetry(startupState, value)} onChange={(value) => void changeInstant(value)} />
           <div className="composer__utility-actions">
             {isAndroidRuntime ? <AndroidComposerVoiceControl /> : voiceInputReady(startupState) ? <button type="button" className="shell__control shell__icon-control" onClick={toggleMic} disabled={!canToggleMic} aria-label={micStarting ? 'Starting mic…' : micActive ? 'Stop mic' : 'Start mic'} title={micActive ? 'Stop mic' : 'Start mic'}><ControlIcon kind={micActive ? 'stop' : 'mic'} /></button> : null}
-            <button type="button" className="shell__control shell__icon-control shell__new-chat" aria-label="New Chat" title={resetPending ? 'Starting new chat…' : 'New Chat'} aria-busy={resetPending} disabled={resetPending || updateRuntimeBlocked} onClick={() => void resetSession()}><ControlIcon kind="plus" /></button>
+            <button type={busy ? 'button' : 'submit'} className="composer__button shell__icon-control" aria-label={actionLabel} title={actionLabel}
+              disabled={canStop ? promptState === 'stopping' || updateRuntimeBlocked : busy || !canSend} onClick={canStop ? cancelPrompt : undefined}>
+              <ControlIcon kind={canStop ? 'stop' : 'send'} />
+            </button>
           </div>
         </div>
         {showAvailability ? <div className="composer__availability">

@@ -240,35 +240,113 @@ pub enum StageStatus {
 pub enum InstantModelChoice {
     LocalFast,
     LocalQuality,
+    CustomSolLow,
+    CustomSolMedium,
     CustomSolHigh,
+    CustomSolXhigh,
+    CustomSolMax,
     CustomLunaNone,
+    CustomLuna6Low,
+    CustomLuna6Medium,
+    CustomLuna6High,
+    CustomLuna6Xhigh,
+    CustomLuna6Max,
+    CustomLuna56None,
     CustomLunaLow,
+    CustomLuna56Medium,
+    CustomLuna56High,
+    CustomLuna56Xhigh,
+    CustomLuna56Max,
+    #[serde(rename = "opencode-sol-low")]
+    OpenCodeSolLow,
+    #[serde(rename = "opencode-sol-medium")]
+    OpenCodeSolMedium,
     #[serde(rename = "opencode-sol-high")]
     OpenCodeSolHigh,
+    #[serde(rename = "opencode-sol-xhigh")]
+    OpenCodeSolXhigh,
+    #[serde(rename = "opencode-sol-max")]
+    OpenCodeSolMax,
+    #[serde(rename = "opencode-luna-none")]
+    OpenCodeLunaNone,
     #[serde(rename = "opencode-luna-low")]
     OpenCodeLunaLow,
+    #[serde(rename = "opencode-luna-medium")]
+    OpenCodeLunaMedium,
+    #[serde(rename = "opencode-luna-high")]
+    OpenCodeLunaHigh,
+    #[serde(rename = "opencode-luna-xhigh")]
+    OpenCodeLunaXhigh,
+    #[serde(rename = "opencode-luna-max")]
+    OpenCodeLunaMax,
 }
 
 impl InstantModelChoice {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 30] = [
         Self::LocalFast,
         Self::LocalQuality,
+        Self::CustomSolLow,
+        Self::CustomSolMedium,
         Self::CustomSolHigh,
+        Self::CustomSolXhigh,
+        Self::CustomSolMax,
         Self::CustomLunaNone,
+        Self::CustomLuna6Low,
+        Self::CustomLuna6Medium,
+        Self::CustomLuna6High,
+        Self::CustomLuna6Xhigh,
+        Self::CustomLuna6Max,
+        Self::CustomLuna56None,
         Self::CustomLunaLow,
+        Self::CustomLuna56Medium,
+        Self::CustomLuna56High,
+        Self::CustomLuna56Xhigh,
+        Self::CustomLuna56Max,
+        Self::OpenCodeSolLow,
+        Self::OpenCodeSolMedium,
         Self::OpenCodeSolHigh,
+        Self::OpenCodeSolXhigh,
+        Self::OpenCodeSolMax,
+        Self::OpenCodeLunaNone,
         Self::OpenCodeLunaLow,
+        Self::OpenCodeLunaMedium,
+        Self::OpenCodeLunaHigh,
+        Self::OpenCodeLunaXhigh,
+        Self::OpenCodeLunaMax,
     ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::LocalFast => "local-fast",
             Self::LocalQuality => "local-quality",
+            Self::CustomSolLow => "custom-sol-low",
+            Self::CustomSolMedium => "custom-sol-medium",
             Self::CustomSolHigh => "custom-sol-high",
+            Self::CustomSolXhigh => "custom-sol-xhigh",
+            Self::CustomSolMax => "custom-sol-max",
             Self::CustomLunaNone => "custom-luna-none",
+            Self::CustomLuna6Low => "custom-luna6-low",
+            Self::CustomLuna6Medium => "custom-luna6-medium",
+            Self::CustomLuna6High => "custom-luna6-high",
+            Self::CustomLuna6Xhigh => "custom-luna6-xhigh",
+            Self::CustomLuna6Max => "custom-luna6-max",
+            Self::CustomLuna56None => "custom-luna56-none",
             Self::CustomLunaLow => "custom-luna-low",
+            Self::CustomLuna56Medium => "custom-luna56-medium",
+            Self::CustomLuna56High => "custom-luna56-high",
+            Self::CustomLuna56Xhigh => "custom-luna56-xhigh",
+            Self::CustomLuna56Max => "custom-luna56-max",
+            Self::OpenCodeSolLow => "opencode-sol-low",
+            Self::OpenCodeSolMedium => "opencode-sol-medium",
             Self::OpenCodeSolHigh => "opencode-sol-high",
+            Self::OpenCodeSolXhigh => "opencode-sol-xhigh",
+            Self::OpenCodeSolMax => "opencode-sol-max",
+            Self::OpenCodeLunaNone => "opencode-luna-none",
             Self::OpenCodeLunaLow => "opencode-luna-low",
+            Self::OpenCodeLunaMedium => "opencode-luna-medium",
+            Self::OpenCodeLunaHigh => "opencode-luna-high",
+            Self::OpenCodeLunaXhigh => "opencode-luna-xhigh",
+            Self::OpenCodeLunaMax => "opencode-luna-max",
         }
     }
 
@@ -276,10 +354,34 @@ impl InstantModelChoice {
         match self {
             Self::LocalFast => "local_fast",
             Self::LocalQuality => "local_quality",
-            Self::CustomSolHigh
+            Self::CustomSolLow
+            | Self::CustomSolMedium
+            | Self::CustomSolHigh
+            | Self::CustomSolXhigh
+            | Self::CustomSolMax
             | Self::CustomLunaNone
-            | Self::CustomLunaLow => "custom_provider",
-            Self::OpenCodeSolHigh | Self::OpenCodeLunaLow => "opencode",
+            | Self::CustomLuna6Low
+            | Self::CustomLuna6Medium
+            | Self::CustomLuna6High
+            | Self::CustomLuna6Xhigh
+            | Self::CustomLuna6Max
+            | Self::CustomLuna56None
+            | Self::CustomLunaLow
+            | Self::CustomLuna56Medium
+            | Self::CustomLuna56High
+            | Self::CustomLuna56Xhigh
+            | Self::CustomLuna56Max => "custom_provider",
+            Self::OpenCodeSolLow
+            | Self::OpenCodeSolMedium
+            | Self::OpenCodeSolHigh
+            | Self::OpenCodeSolXhigh
+            | Self::OpenCodeSolMax
+            | Self::OpenCodeLunaNone
+            | Self::OpenCodeLunaLow
+            | Self::OpenCodeLunaMedium
+            | Self::OpenCodeLunaHigh
+            | Self::OpenCodeLunaXhigh
+            | Self::OpenCodeLunaMax => "opencode",
         }
     }
 
@@ -287,11 +389,34 @@ impl InstantModelChoice {
         match self {
             Self::LocalFast => "Local: Fast",
             Self::LocalQuality => "Local: Quality",
+            Self::CustomSolLow => "Custom: GPT-6.1 Sol Low",
+            Self::CustomSolMedium => "Custom: GPT-6.1 Sol Medium",
             Self::CustomSolHigh => "Custom: GPT-6.1 Sol High",
+            Self::CustomSolXhigh => "Custom: GPT-6.1 Sol X-High",
+            Self::CustomSolMax => "Custom: GPT-6.1 Sol Max",
             Self::CustomLunaNone => "Custom: GPT-6 Luna None",
+            Self::CustomLuna6Low => "Custom: GPT-6 Luna Low",
+            Self::CustomLuna6Medium => "Custom: GPT-6 Luna Medium",
+            Self::CustomLuna6High => "Custom: GPT-6 Luna High",
+            Self::CustomLuna6Xhigh => "Custom: GPT-6 Luna X-High",
+            Self::CustomLuna6Max => "Custom: GPT-6 Luna Max",
+            Self::CustomLuna56None => "Custom: GPT-5.6 Luna None",
             Self::CustomLunaLow => "Custom: GPT-5.6 Luna Low",
+            Self::CustomLuna56Medium => "Custom: GPT-5.6 Luna Medium",
+            Self::CustomLuna56High => "Custom: GPT-5.6 Luna High",
+            Self::CustomLuna56Xhigh => "Custom: GPT-5.6 Luna X-High",
+            Self::CustomLuna56Max => "Custom: GPT-5.6 Luna Max",
+            Self::OpenCodeSolLow => "OpenCode: GPT-6.1 Sol Low",
+            Self::OpenCodeSolMedium => "OpenCode: GPT-6.1 Sol Medium",
             Self::OpenCodeSolHigh => "OpenCode: GPT-6.1 Sol High",
+            Self::OpenCodeSolXhigh => "OpenCode: GPT-6.1 Sol X-High",
+            Self::OpenCodeSolMax => "OpenCode: GPT-6.1 Sol Max",
+            Self::OpenCodeLunaNone => "OpenCode: GPT-5.6 Luna None",
             Self::OpenCodeLunaLow => "OpenCode: GPT-5.6 Luna Low",
+            Self::OpenCodeLunaMedium => "OpenCode: GPT-5.6 Luna Medium",
+            Self::OpenCodeLunaHigh => "OpenCode: GPT-5.6 Luna High",
+            Self::OpenCodeLunaXhigh => "OpenCode: GPT-5.6 Luna X-High",
+            Self::OpenCodeLunaMax => "OpenCode: GPT-5.6 Luna Max",
         }
     }
 }
@@ -299,19 +424,71 @@ impl InstantModelChoice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AgentModelChoice {
+    CustomSolLow,
+    CustomSolMedium,
     CustomSolHigh,
+    CustomSolXhigh,
+    CustomSolMax,
+    CustomLuna6Low,
+    CustomLuna6Medium,
+    CustomLuna6High,
+    CustomLuna6Xhigh,
+    CustomLuna6Max,
     CustomLunaLow,
+    CustomLuna56Medium,
+    CustomLuna56High,
+    CustomLuna56Xhigh,
+    CustomLuna56Max,
+    #[serde(rename = "opencode-sol-low")]
+    OpenCodeSolLow,
+    #[serde(rename = "opencode-sol-medium")]
+    OpenCodeSolMedium,
     #[serde(rename = "opencode-sol-high")]
     OpenCodeSolHigh,
+    #[serde(rename = "opencode-sol-xhigh")]
+    OpenCodeSolXhigh,
+    #[serde(rename = "opencode-sol-max")]
+    OpenCodeSolMax,
     #[serde(rename = "opencode-luna-low")]
     OpenCodeLunaLow,
+    #[serde(rename = "opencode-luna-medium")]
+    OpenCodeLunaMedium,
+    #[serde(rename = "opencode-luna-high")]
+    OpenCodeLunaHigh,
+    #[serde(rename = "opencode-luna-xhigh")]
+    OpenCodeLunaXhigh,
+    #[serde(rename = "opencode-luna-max")]
+    OpenCodeLunaMax,
 }
 
 impl AgentModelChoice {
     pub fn capability_id(self) -> &'static str {
         match self {
-            Self::CustomSolHigh | Self::CustomLunaLow => "custom_provider",
-            Self::OpenCodeSolHigh | Self::OpenCodeLunaLow => "opencode",
+            Self::CustomSolLow
+            | Self::CustomSolMedium
+            | Self::CustomSolHigh
+            | Self::CustomSolXhigh
+            | Self::CustomSolMax
+            | Self::CustomLuna6Low
+            | Self::CustomLuna6Medium
+            | Self::CustomLuna6High
+            | Self::CustomLuna6Xhigh
+            | Self::CustomLuna6Max
+            | Self::CustomLunaLow
+            | Self::CustomLuna56Medium
+            | Self::CustomLuna56High
+            | Self::CustomLuna56Xhigh
+            | Self::CustomLuna56Max => "custom_provider",
+            Self::OpenCodeSolLow
+            | Self::OpenCodeSolMedium
+            | Self::OpenCodeSolHigh
+            | Self::OpenCodeSolXhigh
+            | Self::OpenCodeSolMax
+            | Self::OpenCodeLunaLow
+            | Self::OpenCodeLunaMedium
+            | Self::OpenCodeLunaHigh
+            | Self::OpenCodeLunaXhigh
+            | Self::OpenCodeLunaMax => "opencode",
         }
     }
 }
@@ -600,11 +777,34 @@ impl From<assistant::InstantModel> for InstantModelChoice {
         match v {
             assistant::InstantModel::LocalFast => Self::LocalFast,
             assistant::InstantModel::LocalQuality => Self::LocalQuality,
+            assistant::InstantModel::CustomSolLow => Self::CustomSolLow,
+            assistant::InstantModel::CustomSolMedium => Self::CustomSolMedium,
             assistant::InstantModel::CustomSolHigh => Self::CustomSolHigh,
+            assistant::InstantModel::CustomSolXhigh => Self::CustomSolXhigh,
+            assistant::InstantModel::CustomSolMax => Self::CustomSolMax,
             assistant::InstantModel::CustomLunaNone => Self::CustomLunaNone,
+            assistant::InstantModel::CustomLuna6Low => Self::CustomLuna6Low,
+            assistant::InstantModel::CustomLuna6Medium => Self::CustomLuna6Medium,
+            assistant::InstantModel::CustomLuna6High => Self::CustomLuna6High,
+            assistant::InstantModel::CustomLuna6Xhigh => Self::CustomLuna6Xhigh,
+            assistant::InstantModel::CustomLuna6Max => Self::CustomLuna6Max,
+            assistant::InstantModel::CustomLuna56None => Self::CustomLuna56None,
             assistant::InstantModel::CustomLunaLow => Self::CustomLunaLow,
+            assistant::InstantModel::CustomLuna56Medium => Self::CustomLuna56Medium,
+            assistant::InstantModel::CustomLuna56High => Self::CustomLuna56High,
+            assistant::InstantModel::CustomLuna56Xhigh => Self::CustomLuna56Xhigh,
+            assistant::InstantModel::CustomLuna56Max => Self::CustomLuna56Max,
+            assistant::InstantModel::OpenCodeSolLow => Self::OpenCodeSolLow,
+            assistant::InstantModel::OpenCodeSolMedium => Self::OpenCodeSolMedium,
             assistant::InstantModel::OpenCodeSolHigh => Self::OpenCodeSolHigh,
+            assistant::InstantModel::OpenCodeSolXhigh => Self::OpenCodeSolXhigh,
+            assistant::InstantModel::OpenCodeSolMax => Self::OpenCodeSolMax,
+            assistant::InstantModel::OpenCodeLunaNone => Self::OpenCodeLunaNone,
             assistant::InstantModel::OpenCodeLunaLow => Self::OpenCodeLunaLow,
+            assistant::InstantModel::OpenCodeLunaMedium => Self::OpenCodeLunaMedium,
+            assistant::InstantModel::OpenCodeLunaHigh => Self::OpenCodeLunaHigh,
+            assistant::InstantModel::OpenCodeLunaXhigh => Self::OpenCodeLunaXhigh,
+            assistant::InstantModel::OpenCodeLunaMax => Self::OpenCodeLunaMax,
         }
     }
 }
@@ -614,21 +814,65 @@ impl From<InstantModelChoice> for assistant::InstantModel {
         match choice {
             InstantModelChoice::LocalFast => Self::LocalFast,
             InstantModelChoice::LocalQuality => Self::LocalQuality,
+            InstantModelChoice::CustomSolLow => Self::CustomSolLow,
+            InstantModelChoice::CustomSolMedium => Self::CustomSolMedium,
             InstantModelChoice::CustomSolHigh => Self::CustomSolHigh,
+            InstantModelChoice::CustomSolXhigh => Self::CustomSolXhigh,
+            InstantModelChoice::CustomSolMax => Self::CustomSolMax,
             InstantModelChoice::CustomLunaNone => Self::CustomLunaNone,
+            InstantModelChoice::CustomLuna6Low => Self::CustomLuna6Low,
+            InstantModelChoice::CustomLuna6Medium => Self::CustomLuna6Medium,
+            InstantModelChoice::CustomLuna6High => Self::CustomLuna6High,
+            InstantModelChoice::CustomLuna6Xhigh => Self::CustomLuna6Xhigh,
+            InstantModelChoice::CustomLuna6Max => Self::CustomLuna6Max,
+            InstantModelChoice::CustomLuna56None => Self::CustomLuna56None,
             InstantModelChoice::CustomLunaLow => Self::CustomLunaLow,
+            InstantModelChoice::CustomLuna56Medium => Self::CustomLuna56Medium,
+            InstantModelChoice::CustomLuna56High => Self::CustomLuna56High,
+            InstantModelChoice::CustomLuna56Xhigh => Self::CustomLuna56Xhigh,
+            InstantModelChoice::CustomLuna56Max => Self::CustomLuna56Max,
+            InstantModelChoice::OpenCodeSolLow => Self::OpenCodeSolLow,
+            InstantModelChoice::OpenCodeSolMedium => Self::OpenCodeSolMedium,
             InstantModelChoice::OpenCodeSolHigh => Self::OpenCodeSolHigh,
+            InstantModelChoice::OpenCodeSolXhigh => Self::OpenCodeSolXhigh,
+            InstantModelChoice::OpenCodeSolMax => Self::OpenCodeSolMax,
+            InstantModelChoice::OpenCodeLunaNone => Self::OpenCodeLunaNone,
             InstantModelChoice::OpenCodeLunaLow => Self::OpenCodeLunaLow,
+            InstantModelChoice::OpenCodeLunaMedium => Self::OpenCodeLunaMedium,
+            InstantModelChoice::OpenCodeLunaHigh => Self::OpenCodeLunaHigh,
+            InstantModelChoice::OpenCodeLunaXhigh => Self::OpenCodeLunaXhigh,
+            InstantModelChoice::OpenCodeLunaMax => Self::OpenCodeLunaMax,
         }
     }
 }
 impl From<assistant::AgentModel> for AgentModelChoice {
     fn from(v: assistant::AgentModel) -> Self {
         match v {
+            assistant::AgentModel::CustomSolLow => Self::CustomSolLow,
+            assistant::AgentModel::CustomSolMedium => Self::CustomSolMedium,
             assistant::AgentModel::CustomSolHigh => Self::CustomSolHigh,
+            assistant::AgentModel::CustomSolXhigh => Self::CustomSolXhigh,
+            assistant::AgentModel::CustomSolMax => Self::CustomSolMax,
+            assistant::AgentModel::CustomLuna6Low => Self::CustomLuna6Low,
+            assistant::AgentModel::CustomLuna6Medium => Self::CustomLuna6Medium,
+            assistant::AgentModel::CustomLuna6High => Self::CustomLuna6High,
+            assistant::AgentModel::CustomLuna6Xhigh => Self::CustomLuna6Xhigh,
+            assistant::AgentModel::CustomLuna6Max => Self::CustomLuna6Max,
             assistant::AgentModel::CustomLunaLow => Self::CustomLunaLow,
+            assistant::AgentModel::CustomLuna56Medium => Self::CustomLuna56Medium,
+            assistant::AgentModel::CustomLuna56High => Self::CustomLuna56High,
+            assistant::AgentModel::CustomLuna56Xhigh => Self::CustomLuna56Xhigh,
+            assistant::AgentModel::CustomLuna56Max => Self::CustomLuna56Max,
+            assistant::AgentModel::OpenCodeSolLow => Self::OpenCodeSolLow,
+            assistant::AgentModel::OpenCodeSolMedium => Self::OpenCodeSolMedium,
             assistant::AgentModel::OpenCodeSolHigh => Self::OpenCodeSolHigh,
+            assistant::AgentModel::OpenCodeSolXhigh => Self::OpenCodeSolXhigh,
+            assistant::AgentModel::OpenCodeSolMax => Self::OpenCodeSolMax,
             assistant::AgentModel::OpenCodeLunaLow => Self::OpenCodeLunaLow,
+            assistant::AgentModel::OpenCodeLunaMedium => Self::OpenCodeLunaMedium,
+            assistant::AgentModel::OpenCodeLunaHigh => Self::OpenCodeLunaHigh,
+            assistant::AgentModel::OpenCodeLunaXhigh => Self::OpenCodeLunaXhigh,
+            assistant::AgentModel::OpenCodeLunaMax => Self::OpenCodeLunaMax,
         }
     }
 }
@@ -636,10 +880,31 @@ impl From<assistant::AgentModel> for AgentModelChoice {
 impl From<AgentModelChoice> for assistant::AgentModel {
     fn from(choice: AgentModelChoice) -> Self {
         match choice {
+            AgentModelChoice::CustomSolLow => Self::CustomSolLow,
+            AgentModelChoice::CustomSolMedium => Self::CustomSolMedium,
             AgentModelChoice::CustomSolHigh => Self::CustomSolHigh,
+            AgentModelChoice::CustomSolXhigh => Self::CustomSolXhigh,
+            AgentModelChoice::CustomSolMax => Self::CustomSolMax,
+            AgentModelChoice::CustomLuna6Low => Self::CustomLuna6Low,
+            AgentModelChoice::CustomLuna6Medium => Self::CustomLuna6Medium,
+            AgentModelChoice::CustomLuna6High => Self::CustomLuna6High,
+            AgentModelChoice::CustomLuna6Xhigh => Self::CustomLuna6Xhigh,
+            AgentModelChoice::CustomLuna6Max => Self::CustomLuna6Max,
             AgentModelChoice::CustomLunaLow => Self::CustomLunaLow,
+            AgentModelChoice::CustomLuna56Medium => Self::CustomLuna56Medium,
+            AgentModelChoice::CustomLuna56High => Self::CustomLuna56High,
+            AgentModelChoice::CustomLuna56Xhigh => Self::CustomLuna56Xhigh,
+            AgentModelChoice::CustomLuna56Max => Self::CustomLuna56Max,
+            AgentModelChoice::OpenCodeSolLow => Self::OpenCodeSolLow,
+            AgentModelChoice::OpenCodeSolMedium => Self::OpenCodeSolMedium,
             AgentModelChoice::OpenCodeSolHigh => Self::OpenCodeSolHigh,
+            AgentModelChoice::OpenCodeSolXhigh => Self::OpenCodeSolXhigh,
+            AgentModelChoice::OpenCodeSolMax => Self::OpenCodeSolMax,
             AgentModelChoice::OpenCodeLunaLow => Self::OpenCodeLunaLow,
+            AgentModelChoice::OpenCodeLunaMedium => Self::OpenCodeLunaMedium,
+            AgentModelChoice::OpenCodeLunaHigh => Self::OpenCodeLunaHigh,
+            AgentModelChoice::OpenCodeLunaXhigh => Self::OpenCodeLunaXhigh,
+            AgentModelChoice::OpenCodeLunaMax => Self::OpenCodeLunaMax,
         }
     }
 }
@@ -834,9 +1099,33 @@ mod tests {
                 "local_quality",
             ),
             (
+                Wire::CustomSolLow,
+                Domain::CustomSolLow,
+                "custom-sol-low",
+                "custom_provider",
+            ),
+            (
+                Wire::CustomSolMedium,
+                Domain::CustomSolMedium,
+                "custom-sol-medium",
+                "custom_provider",
+            ),
+            (
                 Wire::CustomSolHigh,
                 Domain::CustomSolHigh,
                 "custom-sol-high",
+                "custom_provider",
+            ),
+            (
+                Wire::CustomSolXhigh,
+                Domain::CustomSolXhigh,
+                "custom-sol-xhigh",
+                "custom_provider",
+            ),
+            (
+                Wire::CustomSolMax,
+                Domain::CustomSolMax,
+                "custom-sol-max",
                 "custom_provider",
             ),
             (
@@ -846,10 +1135,82 @@ mod tests {
                 "custom_provider",
             ),
             (
+                Wire::CustomLuna6Low,
+                Domain::CustomLuna6Low,
+                "custom-luna6-low",
+                "custom_provider",
+            ),
+            (
+                Wire::CustomLuna6Medium,
+                Domain::CustomLuna6Medium,
+                "custom-luna6-medium",
+                "custom_provider",
+            ),
+            (
+                Wire::CustomLuna6High,
+                Domain::CustomLuna6High,
+                "custom-luna6-high",
+                "custom_provider",
+            ),
+            (
+                Wire::CustomLuna6Xhigh,
+                Domain::CustomLuna6Xhigh,
+                "custom-luna6-xhigh",
+                "custom_provider",
+            ),
+            (
+                Wire::CustomLuna6Max,
+                Domain::CustomLuna6Max,
+                "custom-luna6-max",
+                "custom_provider",
+            ),
+            (
+                Wire::CustomLuna56None,
+                Domain::CustomLuna56None,
+                "custom-luna56-none",
+                "custom_provider",
+            ),
+            (
                 Wire::CustomLunaLow,
                 Domain::CustomLunaLow,
                 "custom-luna-low",
                 "custom_provider",
+            ),
+            (
+                Wire::CustomLuna56Medium,
+                Domain::CustomLuna56Medium,
+                "custom-luna56-medium",
+                "custom_provider",
+            ),
+            (
+                Wire::CustomLuna56High,
+                Domain::CustomLuna56High,
+                "custom-luna56-high",
+                "custom_provider",
+            ),
+            (
+                Wire::CustomLuna56Xhigh,
+                Domain::CustomLuna56Xhigh,
+                "custom-luna56-xhigh",
+                "custom_provider",
+            ),
+            (
+                Wire::CustomLuna56Max,
+                Domain::CustomLuna56Max,
+                "custom-luna56-max",
+                "custom_provider",
+            ),
+            (
+                Wire::OpenCodeSolLow,
+                Domain::OpenCodeSolLow,
+                "opencode-sol-low",
+                "opencode",
+            ),
+            (
+                Wire::OpenCodeSolMedium,
+                Domain::OpenCodeSolMedium,
+                "opencode-sol-medium",
+                "opencode",
             ),
             (
                 Wire::OpenCodeSolHigh,
@@ -858,9 +1219,51 @@ mod tests {
                 "opencode",
             ),
             (
+                Wire::OpenCodeSolXhigh,
+                Domain::OpenCodeSolXhigh,
+                "opencode-sol-xhigh",
+                "opencode",
+            ),
+            (
+                Wire::OpenCodeSolMax,
+                Domain::OpenCodeSolMax,
+                "opencode-sol-max",
+                "opencode",
+            ),
+            (
+                Wire::OpenCodeLunaNone,
+                Domain::OpenCodeLunaNone,
+                "opencode-luna-none",
+                "opencode",
+            ),
+            (
                 Wire::OpenCodeLunaLow,
                 Domain::OpenCodeLunaLow,
                 "opencode-luna-low",
+                "opencode",
+            ),
+            (
+                Wire::OpenCodeLunaMedium,
+                Domain::OpenCodeLunaMedium,
+                "opencode-luna-medium",
+                "opencode",
+            ),
+            (
+                Wire::OpenCodeLunaHigh,
+                Domain::OpenCodeLunaHigh,
+                "opencode-luna-high",
+                "opencode",
+            ),
+            (
+                Wire::OpenCodeLunaXhigh,
+                Domain::OpenCodeLunaXhigh,
+                "opencode-luna-xhigh",
+                "opencode",
+            ),
+            (
+                Wire::OpenCodeLunaMax,
+                Domain::OpenCodeLunaMax,
+                "opencode-luna-max",
                 "opencode",
             ),
         ];
@@ -1086,8 +1489,11 @@ mod tests {
     #[test]
     fn model_choices_use_exact_kebab_case_names() {
         for (model, name) in [
-            (assistant::InstantModel::CustomSolHigh, "custom-sol-high"),
             (assistant::InstantModel::CustomLunaNone, "custom-luna-none"),
+            (
+                assistant::InstantModel::CustomLuna56None,
+                "custom-luna56-none",
+            ),
         ] {
             let choice = InstantModelChoice::from(model);
             assert_eq!(serde_json::to_value(choice).unwrap(), name);

@@ -141,7 +141,7 @@ describe('app snapshot contract', () => {
     wire['assistant'] = { interrupted: false }
     expect(() => parseAppSnapshot(wire, false)).toThrow(/assistant/)
   })
-  it.each(['custom-sol-high', 'custom-luna-none', 'custom-luna-low'] as const)(
+  it.each(['custom-sol-high', 'custom-sol-low', 'custom-luna-none', 'custom-luna-low'] as const)(
     'accepts the current Custom Instant selection %s in canonical preferences',
     (instant) => {
       const wire = validSnapshot()

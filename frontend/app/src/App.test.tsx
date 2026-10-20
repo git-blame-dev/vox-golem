@@ -9,6 +9,7 @@ import * as tauriModule from './lib/tauri'
 import * as instantModelSelectModule from './components/InstantModelSelect'
 import type { StartLiveAudioSourceOptions } from './lib/liveAudioSource'
 import { configureBrowserPreviewFixture } from './lib/browserRuntime'
+import { MODEL_CATALOG } from './lib/modelCatalog'
 import { useSettingsNavigation } from './lib/useSettingsNavigation'
 import App from './App'
 import { FrontendSession } from './FrontendSession'
@@ -466,7 +467,7 @@ describe('App', () => {
     expect(header?.querySelector('[data-runtime-phase]')).toBeNull()
     expect(header?.querySelector('[aria-label="Theme"]')).toBeNull()
     expect(header?.querySelector('[aria-label="Settings"]')).not.toBeNull()
-    expect(container.querySelector('.composer [aria-label="New Chat"]')).not.toBeNull()
+    expect(header?.querySelector('[aria-label="New Chat"]')).not.toBeNull()
     expect(container.querySelectorAll('button[aria-label="New Chat"]')).toHaveLength(1)
     expect(getConversation(container).hasAttribute('aria-live')).toBe(false)
     expect(shell.querySelector('main.conversation')).not.toBeNull()
@@ -4197,7 +4198,9 @@ describe('App', () => {
     const select = await getResponseProfileSelect(container)
 
     expect(select.value).toBe('local-fast')
-    expect(Array.from(select.options).map((option) => option.text)).toEqual(['Local: Llama 3.2 3B', 'Local: Quality', 'Custom: GPT-6.1 Sol High', 'Custom: GPT-6 Luna No Reasoning', 'Custom: GPT-5.6 Luna Low', 'OpenCode: GPT-6.1 Sol High', 'OpenCode: GPT-5.6 Luna Low', 'Agy: Gemini 3.8 Flash None', 'Agy: Gemini 3.8 Flash Low', 'Agy: Gemini 3.8 Flash High', 'Agy: Claude Opus 5.5 High', 'Agy: Claude Sonnet 5.5 Low', 'Agy: Claude Sonnet 5.5 High'])
+    expect(Array.from(select.options).map((option) => option.text)).toEqual(
+      MODEL_CATALOG.filter((item) => item.id !== 'gemini-nano').map((item) => item.label),
+    )
   })
 
   it('invokes switch_response_profile when selecting Quality profile', async () => {
@@ -4886,7 +4889,7 @@ describe('App', () => {
     await act(async () => { getButtonByLabel(container, 'Settings').click(); await Promise.resolve() })
     expect(container.textContent).toContain('Custom connection: WSL OpenCode auth file is unavailable')
     const select = container.querySelector<HTMLSelectElement>('select[aria-label="Instant"]')!
-    expect(select.querySelector<HTMLOptionElement>('option[value="custom-sol-high"]')?.disabled).toBe(true)
+    expect(select.querySelector<HTMLOptionElement>('option[value="custom-sol-low"]')?.disabled).toBe(true)
     expect(select.querySelector<HTMLOptionElement>('option[value="custom-luna-none"]')?.disabled).toBe(true)
   })
 
@@ -4936,9 +4939,9 @@ describe('App', () => {
     const select = await getResponseProfileSelect(container)
     expect(select.value).toBe('custom-luna-none')
     expect(select.querySelector('option[value="custom-luna-none"]')).not.toBeNull()
-    await act(async () => { setSelectValue(select, 'custom-luna-none'); await Promise.resolve() })
-    expect(selected).toBe('custom-luna-none')
-    expect(indicator?.querySelector<HTMLSelectElement>('select')?.selectedOptions[0]?.textContent).toBe('Custom: GPT-6 Luna No Reasoning')
+    await act(async () => { setSelectValue(select, 'custom-sol-high'); await Promise.resolve() })
+    expect(selected).toBe('custom-sol-high')
+    expect(indicator?.querySelector<HTMLSelectElement>('select')?.selectedOptions[0]?.textContent).toBe('Custom: GPT-6.1 Sol High')
   })
 
   it('renders only user and assistant prompt execution output when submit command succeeds', async () => {
@@ -5386,7 +5389,7 @@ describe('App', () => {
       listen: async (_event, handler) => { promptEventHandler = handler; return () => undefined },
       invoke: async (command, args) => {
         if (command === 'get_startup_state') return readyStartupState()
-        if (command === 'get_assistant_settings') return { ...defaultAssistantSettings(), instant: 'custom-sol-high' }
+        if (command === 'get_assistant_settings') return { ...defaultAssistantSettings(), instant: 'custom-luna-none' }
         expect(command).toBe('submit_prompt')
         const requestId = (args as { requestId: string }).requestId
         submissions += 1
@@ -5408,7 +5411,7 @@ describe('App', () => {
     const answers = container.querySelectorAll('.message--assistant')
     expect(answers).toHaveLength(2)
     expect(answers[1]?.textContent).toContain('Response 2')
-    expect(answers[1]?.nextElementSibling).toBeNull()
+    expect(answers[1]?.parentElement?.querySelector('[data-custom-direct-timings]')).toBeNull()
   })
 
   it('shows string errors rejected by the Tauri prompt command', async () => {
@@ -9230,7 +9233,7 @@ function getResponseAnnouncer(container: HTMLElement): HTMLElement {
 
 function getSendButton(container: HTMLElement): HTMLButtonElement {
   assertSettingsClosed(container)
-  const button = container.querySelector<HTMLButtonElement>('.composer__prompt-row > .composer__button')
+  const button = container.querySelector<HTMLButtonElement>('.composer__utility-row .composer__button')
 
   if (button === null) {
     throw new Error('Missing send button')

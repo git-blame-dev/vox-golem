@@ -45,6 +45,8 @@ export interface AssistantOption<T extends string> {
 export const DEFAULT_ASSISTANT_SETTINGS: Readonly<AssistantSettings> = {
   ...DEFAULT_SPEECH_SELECTION,
   ...DEFAULT_MODEL_CHOICES,
+  deep: 'opencode-sol-high' as AgentChoice,
+  review: 'opencode-sol-high' as AgentChoice,
   deepEnabled: false, reviewEnabled: false, prefetch: false, completion: true, webEnabled: true, speechNetworkFallback: true,
 }
 
@@ -60,7 +62,7 @@ function options<T extends string>(labels: Record<T, string>, capabilities: Assi
     const provider = value.startsWith('local') || value === 'none' || value === 'gemini-nano' ? 'local' : value.startsWith('custom') ? 'custom' : value.startsWith('agy') ? 'agy' : 'openCode'
     const available = value === 'local-fast' ? capabilities.localFast : value === 'local-quality' ? capabilities.localQuality : value === 'gemini-nano' ? isAndroid : provider === 'custom' ? capabilities.custom : provider === 'agy' ? true : capabilities.openCode
     const providerName = provider === 'agy' ? 'Agy' : provider === 'openCode' ? 'OpenCode' : provider === 'custom' ? 'Custom' : 'Local'
-    const description = value === 'custom-luna-none' ? 'Direct Custom connection; reasoning disabled' : value === 'gemini-nano' ? 'Pixel 8 on-device model' : value.startsWith('agy') ? 'Google Antigravity search' : value.startsWith('opencode') ? 'OpenCode search' : value.startsWith('custom') ? 'Custom reasoning-only' : undefined
+    const description = value.endsWith('-none') ? (provider === 'custom' ? 'Direct Custom connection; reasoning disabled' : 'Direct connection; reasoning disabled') : value === 'gemini-nano' ? 'Pixel 8 on-device model' : value.startsWith('agy') ? 'Google Antigravity search' : value.startsWith('opencode') ? 'OpenCode search' : value.startsWith('custom') ? 'Custom reasoning-only' : undefined
     const featureUnavailable = labels === deepLabels ? !capabilities.deep : labels === reviewLabels ? !capabilities.review : false
     return { value, label: labels[value], available: available && !featureUnavailable, ...(description ? { description } : {}), ...(available && !featureUnavailable ? {} : { reason: featureUnavailable ? `${providerName} does not support this option` : `${providerName} is unavailable` }) }
   })

@@ -648,12 +648,8 @@ fn prewarm_model_config(model: &str, auth_path: &str) -> Option<CustomOpenAiConf
     if !valid_auth_path(auth_path) {
         return None;
     }
-    let model = match model {
-        "custom-sol-high" => CustomOpenAiModel::SolHigh,
-        "custom-luna-none" => CustomOpenAiModel::LunaNone,
-        "custom-luna-low" => CustomOpenAiModel::LunaLow,
-        _ => return None,
-    };
+    let model = CustomOpenAiModel::from_wire_id(model)
+        .filter(|model| *model != CustomOpenAiModel::LocalFast)?;
     Some(CustomOpenAiConfig {
         endpoint: "https://chatgpt.com/backend-api/codex/responses".to_string(),
         auth_path: auth_path.into(),
@@ -1217,6 +1213,7 @@ mod tests {
     fn selected_model_keeps_tools_for_mixed_supplied_text_without_web_admission() {
         for (model, mode) in [
             "custom-sol-high",
+            "custom-sol-low",
             "custom-luna-none",
             "custom-luna-low",
         ]
@@ -2049,7 +2046,7 @@ mod tests {
 
     #[test]
     fn provider_configuration_reuses_portable_defaults_and_explicit_auth_path() {
-        let request = request::parse(r#"{"requestId":"synthetic-1","model":"custom-sol-high","instructions":"Be brief.","messages":[{"role":"user","content":"Synthetic question"}]}"#).unwrap();
+        let request = request::parse(r#"{"requestId":"synthetic-1","model":"custom-sol-low","instructions":"Be brief.","messages":[{"role":"user","content":"Synthetic question"}]}"#).unwrap();
         let config = provider_config("/synthetic/private/codex-auth.json", &request);
         assert_eq!(config.endpoint, CustomOpenAiConfig::default().endpoint);
         assert_eq!(
@@ -2109,6 +2106,7 @@ mod tests {
     fn prewarm_model_config_accepts_only_custom_models_and_valid_auth_paths() {
         for (model, expected) in [
             ("custom-sol-high", CustomOpenAiModel::SolHigh),
+            ("custom-sol-low", CustomOpenAiModel::SolLow),
             ("custom-luna-none", CustomOpenAiModel::LunaNone),
             ("custom-luna-low", CustomOpenAiModel::LunaLow),
         ] {

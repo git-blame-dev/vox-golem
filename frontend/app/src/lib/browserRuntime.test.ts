@@ -6,6 +6,7 @@ import {
   resetBrowserPreviewRuntime,
   teardownBrowserPreviewRuntime,
 } from './browserRuntime'
+import { MODEL_CATALOG } from './modelCatalog'
 
 afterEach(() => {
   resetBrowserPreviewRuntime()
@@ -84,11 +85,9 @@ describe('browser preview runtime', () => {
 
   it('publishes all stable Instant choices through the production snapshot parser without enabling native-only models', async () => {
     const snapshot = parseAppSnapshot(await getBrowserPreviewInternals().invoke('get_app_snapshot'))
-    expect(snapshot.modelOptions.map((model) => model.id)).toEqual([
-      'local-fast', 'local-quality', 'custom-sol-high',
-      'custom-luna-none', 'custom-luna-low', 'opencode-sol-high', 'opencode-luna-low',
-      'agy-flash-none', 'agy-flash-low', 'agy-flash-high', 'agy-opus-high', 'agy-sonnet-low', 'agy-sonnet-high',
-    ])
+    expect(snapshot.modelOptions.map((model) => model.id)).toEqual(
+      MODEL_CATALOG.filter((model) => model.id !== 'gemini-nano').map((model) => model.id)
+    )
     expect(snapshot.modelOptions.filter((model) => model.available).map((model) => model.id)).toEqual(['local-fast'])
     expect(snapshot.modelOptions.find((model) => model.id === 'custom-luna-none')).toEqual({
       id: 'custom-luna-none', label: 'Custom: GPT-6 Luna No Reasoning', available: false,

@@ -59,6 +59,15 @@ def entry_layer(source, purpose):
     mark = layer.find(f"{SVG}g[@id='mark']")
     if mark is None:
         raise ValueError("The icon must contain its artwork in the mark group")
+    badge_color = None
+    for shape in mark:
+        if shape.tag == SVG + "circle":
+            fill = shape.get("fill")
+            if fill not in (None, "none", "#000000"):
+                badge_color = fill
+                break
+    if badge_color is None or re.fullmatch(r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})", badge_color) is None:
+        raise ValueError("The shortcut entry badge requires a valid hex badge color")
     fraction = artwork_geometry(source)
     x, y, width, height = map(float, source.attrib["viewBox"].split())
     cx, cy = x + width / 2, y + height / 2
@@ -73,7 +82,7 @@ def entry_layer(source, purpose):
     layer.insert(mark_index, scaled)
     badge = ET.SubElement(layer, SVG + "g", {
         "id": "entry-badge",
-        "transform": f"translate({cx + radius * .5:g} {cy + radius * .5:g}) scale({radius / 28:g})",
+        "transform": f"translate({cx + radius * .5:g} {cy + radius * .5:g}) scale({radius / 14:g})",
     })
     ET.SubElement(badge, SVG + "circle", {
         "cx": "0", "cy": "0", "r": "7", "fill": "#000000", "stroke": "none",
@@ -87,7 +96,7 @@ def entry_layer(source, purpose):
     if purpose not in glyphs:
         raise ValueError(f"Unknown entry purpose: {purpose}")
     ET.SubElement(badge, SVG + "path", {
-        "d": glyphs[purpose], "fill": "none", "stroke": color,
+        "d": glyphs[purpose], "fill": "none", "stroke": badge_color,
         "stroke-width": "1.4", "stroke-linecap": "round", "stroke-linejoin": "round",
     })
     return layer

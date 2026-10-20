@@ -6,18 +6,83 @@ use serde::{Deserialize, Serialize};
 pub enum InstantModel {
     LocalFast,
     LocalQuality,
+    CustomSolLow,
+    CustomSolMedium,
     CustomSolHigh,
+    CustomSolXhigh,
+    CustomSolMax,
     CustomLunaNone,
+    CustomLuna6Low,
+    CustomLuna6Medium,
+    CustomLuna6High,
+    CustomLuna6Xhigh,
+    CustomLuna6Max,
+    CustomLuna56None,
     CustomLunaLow,
+    CustomLuna56Medium,
+    CustomLuna56High,
+    CustomLuna56Xhigh,
+    CustomLuna56Max,
+    #[serde(rename = "opencode-sol-low")]
+    OpenCodeSolLow,
+    #[serde(rename = "opencode-sol-medium")]
+    OpenCodeSolMedium,
+    #[serde(rename = "opencode-sol-high")]
     OpenCodeSolHigh,
+    #[serde(rename = "opencode-sol-xhigh")]
+    OpenCodeSolXhigh,
+    #[serde(rename = "opencode-sol-max")]
+    OpenCodeSolMax,
+    #[serde(rename = "opencode-luna-none")]
+    OpenCodeLunaNone,
+    #[serde(rename = "opencode-luna-low")]
     OpenCodeLunaLow,
+    #[serde(rename = "opencode-luna-medium")]
+    OpenCodeLunaMedium,
+    #[serde(rename = "opencode-luna-high")]
+    OpenCodeLunaHigh,
+    #[serde(rename = "opencode-luna-xhigh")]
+    OpenCodeLunaXhigh,
+    #[serde(rename = "opencode-luna-max")]
+    OpenCodeLunaMax,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentModel {
+    CustomSolLow,
+    CustomSolMedium,
     CustomSolHigh,
+    CustomSolXhigh,
+    CustomSolMax,
+    CustomLuna6Low,
+    CustomLuna6Medium,
+    CustomLuna6High,
+    CustomLuna6Xhigh,
+    CustomLuna6Max,
     CustomLunaLow,
+    CustomLuna56Medium,
+    CustomLuna56High,
+    CustomLuna56Xhigh,
+    CustomLuna56Max,
+    #[serde(rename = "opencode-sol-low")]
+    OpenCodeSolLow,
+    #[serde(rename = "opencode-sol-medium")]
+    OpenCodeSolMedium,
+    #[serde(rename = "opencode-sol-high")]
     OpenCodeSolHigh,
+    #[serde(rename = "opencode-sol-xhigh")]
+    OpenCodeSolXhigh,
+    #[serde(rename = "opencode-sol-max")]
+    OpenCodeSolMax,
+    #[serde(rename = "opencode-luna-low")]
     OpenCodeLunaLow,
+    #[serde(rename = "opencode-luna-medium")]
+    OpenCodeLunaMedium,
+    #[serde(rename = "opencode-luna-high")]
+    OpenCodeLunaHigh,
+    #[serde(rename = "opencode-luna-xhigh")]
+    OpenCodeLunaXhigh,
+    #[serde(rename = "opencode-luna-max")]
+    OpenCodeLunaMax,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
@@ -29,18 +94,65 @@ impl InstantModel {
     pub fn provider(self) -> Provider {
         match self {
             Self::LocalFast | Self::LocalQuality => Provider::Local,
-            Self::CustomSolHigh
+            Self::CustomSolLow
+            | Self::CustomSolMedium
+            | Self::CustomSolHigh
+            | Self::CustomSolXhigh
+            | Self::CustomSolMax
             | Self::CustomLunaNone
-            | Self::CustomLunaLow => Provider::Custom,
-            Self::OpenCodeSolHigh | Self::OpenCodeLunaLow => Provider::OpenCode,
+            | Self::CustomLuna6Low
+            | Self::CustomLuna6Medium
+            | Self::CustomLuna6High
+            | Self::CustomLuna6Xhigh
+            | Self::CustomLuna6Max
+            | Self::CustomLuna56None
+            | Self::CustomLunaLow
+            | Self::CustomLuna56Medium
+            | Self::CustomLuna56High
+            | Self::CustomLuna56Xhigh
+            | Self::CustomLuna56Max => Provider::Custom,
+            Self::OpenCodeSolLow
+            | Self::OpenCodeSolMedium
+            | Self::OpenCodeSolHigh
+            | Self::OpenCodeSolXhigh
+            | Self::OpenCodeSolMax
+            | Self::OpenCodeLunaNone
+            | Self::OpenCodeLunaLow
+            | Self::OpenCodeLunaMedium
+            | Self::OpenCodeLunaHigh
+            | Self::OpenCodeLunaXhigh
+            | Self::OpenCodeLunaMax => Provider::OpenCode,
         }
     }
 }
 impl AgentModel {
     pub fn provider(self) -> Provider {
         match self {
-            Self::CustomSolHigh | Self::CustomLunaLow => Provider::Custom,
-            Self::OpenCodeSolHigh | Self::OpenCodeLunaLow => Provider::OpenCode,
+            Self::CustomSolLow
+            | Self::CustomSolMedium
+            | Self::CustomSolHigh
+            | Self::CustomSolXhigh
+            | Self::CustomSolMax
+            | Self::CustomLuna6Low
+            | Self::CustomLuna6Medium
+            | Self::CustomLuna6High
+            | Self::CustomLuna6Xhigh
+            | Self::CustomLuna6Max
+            | Self::CustomLunaLow
+            | Self::CustomLuna56Medium
+            | Self::CustomLuna56High
+            | Self::CustomLuna56Xhigh
+            | Self::CustomLuna56Max => Provider::Custom,
+            Self::OpenCodeSolLow
+            | Self::OpenCodeSolMedium
+            | Self::OpenCodeSolHigh
+            | Self::OpenCodeSolXhigh
+            | Self::OpenCodeSolMax
+            | Self::OpenCodeLunaLow
+            | Self::OpenCodeLunaMedium
+            | Self::OpenCodeLunaHigh
+            | Self::OpenCodeLunaXhigh
+            | Self::OpenCodeLunaMax => Provider::OpenCode,
         }
     }
 }

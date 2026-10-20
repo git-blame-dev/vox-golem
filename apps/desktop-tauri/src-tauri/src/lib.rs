@@ -2078,11 +2078,7 @@ async fn update_preferences_from_state(
         voxgolem_core::ipc::InstantModelChoice::LocalQuality => {
             Some(voxgolem_core::ipc::ResponseProfile::Quality)
         }
-        voxgolem_core::ipc::InstantModelChoice::CustomSolHigh
-        | voxgolem_core::ipc::InstantModelChoice::CustomLunaNone
-        | voxgolem_core::ipc::InstantModelChoice::CustomLunaLow
-        | voxgolem_core::ipc::InstantModelChoice::OpenCodeSolHigh
-        | voxgolem_core::ipc::InstantModelChoice::OpenCodeLunaLow => None,
+        _ => None,
     };
     if required_local_profile.is_some_and(|profile| profile != preferences.response_profile) {
         return Err(preference_command_error(
@@ -4719,11 +4715,7 @@ fn start_deep_task(
             original_request: prompt,
             canonical_history: agent_history(&history),
         };
-        let is_opencode = matches!(
-            model,
-            voxgolem_core::assistant::AgentModel::OpenCodeSolHigh
-                | voxgolem_core::assistant::AgentModel::OpenCodeLunaLow
-        );
+        let is_opencode = model.provider() == voxgolem_core::assistant::Provider::OpenCode;
         let sources_allowed = is_opencode && web_enabled;
         let prompt = if sources_allowed {
             voxgolem_core::agent_pipeline::opencode_deep_prompt(&request)
@@ -4806,14 +4798,13 @@ fn ensure_agent_prerequisites(
     app_state: &AppState,
     model: voxgolem_core::assistant::AgentModel,
 ) -> Result<(), String> {
-    use voxgolem_core::assistant::AgentModel;
-    match model {
-        AgentModel::CustomSolHigh | AgentModel::CustomLunaLow => {
+    match model.provider() {
+        voxgolem_core::assistant::Provider::Custom => {
             if effective_custom_config(app_state).is_none() {
                 return Err(String::from("Custom provider is not configured"));
             }
         }
-        AgentModel::OpenCodeSolHigh | AgentModel::OpenCodeLunaLow => {
+        voxgolem_core::assistant::Provider::OpenCode => {
             if app_state
                 .opencode_server
                 .lock()
@@ -4822,6 +4813,9 @@ fn ensure_agent_prerequisites(
             {
                 return Err(String::from("OpenCode server is not available"));
             }
+        }
+        voxgolem_core::assistant::Provider::Local => {
+            unreachable!("agent models are never local")
         }
     }
     Ok(())
@@ -4920,8 +4914,17 @@ impl DesktopConversationRuntime {
             .map_err(|_| String::from("assistant coordinator lock is poisoned"))?;
         let is_opencode = matches!(
             coordinator.policy().instant_model,
-            voxgolem_core::assistant::InstantModel::OpenCodeSolHigh
+            voxgolem_core::assistant::InstantModel::OpenCodeSolLow
+                | voxgolem_core::assistant::InstantModel::OpenCodeSolMedium
+                | voxgolem_core::assistant::InstantModel::OpenCodeSolHigh
+                | voxgolem_core::assistant::InstantModel::OpenCodeSolXhigh
+                | voxgolem_core::assistant::InstantModel::OpenCodeSolMax
+                | voxgolem_core::assistant::InstantModel::OpenCodeLunaNone
                 | voxgolem_core::assistant::InstantModel::OpenCodeLunaLow
+                | voxgolem_core::assistant::InstantModel::OpenCodeLunaMedium
+                | voxgolem_core::assistant::InstantModel::OpenCodeLunaHigh
+                | voxgolem_core::assistant::InstantModel::OpenCodeLunaXhigh
+                | voxgolem_core::assistant::InstantModel::OpenCodeLunaMax
         );
         if is_opencode && opencode_client.is_none() {
             return Err(String::from("OpenCode server is not available"));
@@ -5870,12 +5873,7 @@ impl DesktopStageDispatcher<'_> {
                 error_message: None,
             });
         }
-        if matches!(
-            assistant_request.instant_model,
-            voxgolem_core::assistant::InstantModel::CustomSolHigh
-                | voxgolem_core::assistant::InstantModel::CustomLunaNone
-                | voxgolem_core::assistant::InstantModel::CustomLunaLow
-        ) {
+        if custom_openai_model_for_instant(assistant_request.instant_model).is_some() {
             return submit_custom_prompt(
                 &request_id,
                 &prompt,
@@ -7616,27 +7614,50 @@ fn instant_telemetry_identity(
             "gemma-quality",
             telemetry::InferenceProvider::AttachedUnknown,
         ),
-        InstantModel::CustomSolHigh => (
+        InstantModel::CustomSolLow
+        | InstantModel::CustomSolMedium
+        | InstantModel::CustomSolHigh
+        | InstantModel::CustomSolXhigh
+        | InstantModel::CustomSolMax => (
             telemetry::Provider::Custom,
             "gpt-6.1-sol",
             telemetry::InferenceProvider::Remote,
         ),
-        InstantModel::CustomLunaNone => (
+        InstantModel::CustomLunaNone
+        | InstantModel::CustomLuna6Low
+        | InstantModel::CustomLuna6Medium
+        | InstantModel::CustomLuna6High
+        | InstantModel::CustomLuna6Xhigh
+        | InstantModel::CustomLuna6Max => (
             telemetry::Provider::Custom,
             "gpt-6-luna",
             telemetry::InferenceProvider::Remote,
         ),
-        InstantModel::CustomLunaLow => (
+        InstantModel::CustomLuna56None
+        | InstantModel::CustomLunaLow
+        | InstantModel::CustomLuna56Medium
+        | InstantModel::CustomLuna56High
+        | InstantModel::CustomLuna56Xhigh
+        | InstantModel::CustomLuna56Max => (
             telemetry::Provider::Custom,
             "gpt-5.6-luna",
             telemetry::InferenceProvider::Remote,
         ),
-        InstantModel::OpenCodeSolHigh => (
+        InstantModel::OpenCodeSolLow
+        | InstantModel::OpenCodeSolMedium
+        | InstantModel::OpenCodeSolHigh
+        | InstantModel::OpenCodeSolXhigh
+        | InstantModel::OpenCodeSolMax => (
             telemetry::Provider::OpenCode,
             "gpt-6.1-sol",
             telemetry::InferenceProvider::Remote,
         ),
-        InstantModel::OpenCodeLunaLow => (
+        InstantModel::OpenCodeLunaNone
+        | InstantModel::OpenCodeLunaLow
+        | InstantModel::OpenCodeLunaMedium
+        | InstantModel::OpenCodeLunaHigh
+        | InstantModel::OpenCodeLunaXhigh
+        | InstantModel::OpenCodeLunaMax => (
             telemetry::Provider::OpenCode,
             "gpt-5.6-luna",
             telemetry::InferenceProvider::Remote,
@@ -7653,22 +7674,47 @@ fn agent_telemetry_identity(
 ) {
     use voxgolem_core::assistant::AgentModel;
     match model {
-        AgentModel::CustomSolHigh => (
+        AgentModel::CustomSolLow
+        | AgentModel::CustomSolMedium
+        | AgentModel::CustomSolHigh
+        | AgentModel::CustomSolXhigh
+        | AgentModel::CustomSolMax => (
             telemetry::Provider::Custom,
             "gpt-6.1-sol",
             telemetry::InferenceProvider::Remote,
         ),
-        AgentModel::CustomLunaLow => (
+        AgentModel::CustomLuna6Low
+        | AgentModel::CustomLuna6Medium
+        | AgentModel::CustomLuna6High
+        | AgentModel::CustomLuna6Xhigh
+        | AgentModel::CustomLuna6Max => (
+            telemetry::Provider::Custom,
+            "gpt-6-luna",
+            telemetry::InferenceProvider::Remote,
+        ),
+        AgentModel::CustomLunaLow
+        | AgentModel::CustomLuna56Medium
+        | AgentModel::CustomLuna56High
+        | AgentModel::CustomLuna56Xhigh
+        | AgentModel::CustomLuna56Max => (
             telemetry::Provider::Custom,
             "gpt-5.6-luna",
             telemetry::InferenceProvider::Remote,
         ),
-        AgentModel::OpenCodeSolHigh => (
+        AgentModel::OpenCodeSolLow
+        | AgentModel::OpenCodeSolMedium
+        | AgentModel::OpenCodeSolHigh
+        | AgentModel::OpenCodeSolXhigh
+        | AgentModel::OpenCodeSolMax => (
             telemetry::Provider::OpenCode,
             "gpt-6.1-sol",
             telemetry::InferenceProvider::Remote,
         ),
-        AgentModel::OpenCodeLunaLow => (
+        AgentModel::OpenCodeLunaLow
+        | AgentModel::OpenCodeLunaMedium
+        | AgentModel::OpenCodeLunaHigh
+        | AgentModel::OpenCodeLunaXhigh
+        | AgentModel::OpenCodeLunaMax => (
             telemetry::Provider::OpenCode,
             "gpt-5.6-luna",
             telemetry::InferenceProvider::Remote,
@@ -7836,98 +7882,78 @@ async fn run_agent_text(
     if cancelled.load(Ordering::SeqCst) {
         return Err(String::from("assistant request cancelled"));
     }
-    match model {
-        voxgolem_core::assistant::AgentModel::CustomSolHigh
-        | voxgolem_core::assistant::AgentModel::CustomLunaLow => {
-            let config = effective_custom_config(app_state)
-                .ok_or_else(|| String::from("Custom provider is not configured"))?;
-            let model = match model {
-                voxgolem_core::assistant::AgentModel::CustomSolHigh => {
-                    voxgolem_platform::custom_openai::CustomOpenAiModel::SolHigh
-                }
-                voxgolem_core::assistant::AgentModel::CustomLunaLow => {
-                    voxgolem_platform::custom_openai::CustomOpenAiModel::LunaLow
-                }
-                _ => unreachable!(),
-            };
-            let client = app_state
-                .conversation
-                .search
-                .client_for(voxgolem_platform::custom_openai::CustomOpenAiConfig {
-                    endpoint: config.endpoint.clone(),
-                    auth_path: custom_auth_path(app_state, &config)?,
-                    model,
-                    ..Default::default()
-                })
-                .map_err(|error| error.to_string())?;
-            let agent_prompt = voxgolem_platform::custom_openai::CustomOpenAiPrompt {
-                session_id: request_id.to_string(),
-                prompt: prompt.to_string(),
-                history: Vec::new(),
-            };
-            let mut cancellation_receiver = cancellation_signal.subscribe();
-            if *cancellation_receiver.borrow() {
-                return Err(String::from("assistant request cancelled"));
-            }
-            tokio::select! {
-                biased;
-                _ = cancellation_receiver.changed() => Err(String::from("assistant request cancelled")),
-                result = client.respond_with_instructions(
-                    &agent_prompt,
-                    Some(if request_id.ends_with("-review") {
-                        "Return only strict review JSON. Preserve refusal responses as refusals."
-                    } else {
-                        "Return only the strict stage JSON contract. Do not invent completed outcomes or sources. Preserve refusal responses as refusals."
-                    }),
-                    |_| {},
-                ) => {
-                    result
-                        .map(|response| AgentTextResult {
-                            text: response.text,
-                            evidence: Vec::new(),
-                            refusal: response.content_type
-                                == voxgolem_platform::custom_openai::CustomOpenAiContentType::Refusal,
-                        })
-                        .map_err(|error| error.to_string())
-                },
-            }
+    if let Some(model) = custom_openai_model_for_agent(model) {
+        let config = effective_custom_config(app_state)
+            .ok_or_else(|| String::from("Custom provider is not configured"))?;
+        let client = app_state
+            .conversation
+            .search
+            .client_for(voxgolem_platform::custom_openai::CustomOpenAiConfig {
+                endpoint: config.endpoint.clone(),
+                auth_path: custom_auth_path(app_state, &config)?,
+                model,
+                ..Default::default()
+            })
+            .map_err(|error| error.to_string())?;
+        let agent_prompt = voxgolem_platform::custom_openai::CustomOpenAiPrompt {
+            session_id: request_id.to_string(),
+            prompt: prompt.to_string(),
+            history: Vec::new(),
+        };
+        let mut cancellation_receiver = cancellation_signal.subscribe();
+        if *cancellation_receiver.borrow() {
+            return Err(String::from("assistant request cancelled"));
         }
-        voxgolem_core::assistant::AgentModel::OpenCodeSolHigh
-        | voxgolem_core::assistant::AgentModel::OpenCodeLunaLow => {
-            let base_client = app_state
-                .opencode_server
-                .lock()
-                .map_err(|_| String::from("opencode server lock is poisoned"))?
-                .as_ref()
-                .map(voxgolem_platform::opencode::OpencodeServer::client)
-                .ok_or_else(|| String::from("OpenCode server is not available"))?;
-            let client = create_transient_opencode_client(
-                &base_client,
-                cancellation_signal,
-                &app_state.prompt_cleanup,
-            )
-            .await?;
-            let result = collect_opencode_agent(
-                &client.client,
-                request_id,
-                prompt,
-                match model {
-                    voxgolem_core::assistant::AgentModel::OpenCodeSolHigh => {
-                        voxgolem_platform::opencode::OpencodeModel::Gpt6SolHigh
-                    }
-                    voxgolem_core::assistant::AgentModel::OpenCodeLunaLow => {
-                        voxgolem_platform::opencode::OpencodeModel::Gpt56LunaLow
-                    }
-                    _ => unreachable!(),
-                },
-                tool_policy,
-                cancelled,
-                cancellation_signal,
-            )
-            .await;
-            client.finish().await;
-            result
+        tokio::select! {
+            biased;
+            _ = cancellation_receiver.changed() => Err(String::from("assistant request cancelled")),
+            result = client.respond_with_instructions(
+                &agent_prompt,
+                Some(if request_id.ends_with("-review") {
+                    "Return only strict review JSON. Preserve refusal responses as refusals."
+                } else {
+                    "Return only the strict stage JSON contract. Do not invent completed outcomes or sources. Preserve refusal responses as refusals."
+                }),
+                |_| {},
+            ) => {
+                result
+                    .map(|response| AgentTextResult {
+                        text: response.text,
+                        evidence: Vec::new(),
+                        refusal: response.content_type
+                            == voxgolem_platform::custom_openai::CustomOpenAiContentType::Refusal,
+                    })
+                    .map_err(|error| error.to_string())
+            },
         }
+    } else if let Some(model) = opencode_model_for_agent(model) {
+        let base_client = app_state
+            .opencode_server
+            .lock()
+            .map_err(|_| String::from("opencode server lock is poisoned"))?
+            .as_ref()
+            .map(voxgolem_platform::opencode::OpencodeServer::client)
+            .ok_or_else(|| String::from("OpenCode server is not available"))?;
+        let client = create_transient_opencode_client(
+            &base_client,
+            cancellation_signal,
+            &app_state.prompt_cleanup,
+        )
+        .await?;
+        let result = collect_opencode_agent(
+            &client.client,
+            request_id,
+            prompt,
+            model,
+            tool_policy,
+            cancelled,
+            cancellation_signal,
+        )
+        .await;
+        client.finish().await;
+        result
+    } else {
+        unreachable!("agent model is always Custom or OpenCode")
     }
 }
 
@@ -8370,16 +8396,8 @@ async fn stream_opencode_prompt(
         },
     };
     futures_util::pin_mut!(events);
-    let model = match model {
-        voxgolem_core::assistant::InstantModel::OpenCodeSolHigh => {
-            voxgolem_platform::opencode::OpencodeModel::Gpt6SolHigh
-        }
-        voxgolem_core::assistant::InstantModel::OpenCodeLunaLow => {
-            voxgolem_platform::opencode::OpencodeModel::Gpt56LunaLow
-        }
-        _ => {
-            return OpencodePromptResult::Failed(String::from("invalid OpenCode model selection"));
-        }
+    let Some(model) = opencode_model_for_instant(model) else {
+        return OpencodePromptResult::Failed(String::from("invalid OpenCode model selection"));
     };
     if *cancellation_receiver.borrow() {
         return OpencodePromptResult::Cancelled;
@@ -9485,20 +9503,146 @@ fn prefetch_result_is_current(
 fn custom_openai_model_for_instant(
     model: voxgolem_core::assistant::InstantModel,
 ) -> Option<voxgolem_platform::custom_openai::CustomOpenAiModel> {
+    use voxgolem_core::assistant::InstantModel;
+    use voxgolem_platform::custom_openai::CustomOpenAiModel;
     match model {
-        voxgolem_core::assistant::InstantModel::CustomSolHigh => {
-            Some(voxgolem_platform::custom_openai::CustomOpenAiModel::SolHigh)
-        }
-        voxgolem_core::assistant::InstantModel::CustomLunaNone => {
-            Some(voxgolem_platform::custom_openai::CustomOpenAiModel::LunaNone)
-        }
-        voxgolem_core::assistant::InstantModel::CustomLunaLow => {
-            Some(voxgolem_platform::custom_openai::CustomOpenAiModel::LunaLow)
-        }
-        voxgolem_core::assistant::InstantModel::LocalFast
-        | voxgolem_core::assistant::InstantModel::LocalQuality
-        | voxgolem_core::assistant::InstantModel::OpenCodeSolHigh
-        | voxgolem_core::assistant::InstantModel::OpenCodeLunaLow => None,
+        InstantModel::CustomSolLow => Some(CustomOpenAiModel::SolLow),
+        InstantModel::CustomSolMedium => Some(CustomOpenAiModel::SolMedium),
+        InstantModel::CustomSolHigh => Some(CustomOpenAiModel::SolHigh),
+        InstantModel::CustomSolXhigh => Some(CustomOpenAiModel::SolXhigh),
+        InstantModel::CustomSolMax => Some(CustomOpenAiModel::SolMax),
+        InstantModel::CustomLunaNone => Some(CustomOpenAiModel::LunaNone),
+        InstantModel::CustomLuna6Low => Some(CustomOpenAiModel::Luna6Low),
+        InstantModel::CustomLuna6Medium => Some(CustomOpenAiModel::Luna6Medium),
+        InstantModel::CustomLuna6High => Some(CustomOpenAiModel::Luna6High),
+        InstantModel::CustomLuna6Xhigh => Some(CustomOpenAiModel::Luna6Xhigh),
+        InstantModel::CustomLuna6Max => Some(CustomOpenAiModel::Luna6Max),
+        InstantModel::CustomLuna56None => Some(CustomOpenAiModel::Luna56None),
+        InstantModel::CustomLunaLow => Some(CustomOpenAiModel::LunaLow),
+        InstantModel::CustomLuna56Medium => Some(CustomOpenAiModel::Luna56Medium),
+        InstantModel::CustomLuna56High => Some(CustomOpenAiModel::Luna56High),
+        InstantModel::CustomLuna56Xhigh => Some(CustomOpenAiModel::Luna56Xhigh),
+        InstantModel::CustomLuna56Max => Some(CustomOpenAiModel::Luna56Max),
+        InstantModel::LocalFast
+        | InstantModel::LocalQuality
+        | InstantModel::OpenCodeSolLow
+        | InstantModel::OpenCodeSolMedium
+        | InstantModel::OpenCodeSolHigh
+        | InstantModel::OpenCodeSolXhigh
+        | InstantModel::OpenCodeSolMax
+        | InstantModel::OpenCodeLunaNone
+        | InstantModel::OpenCodeLunaLow
+        | InstantModel::OpenCodeLunaMedium
+        | InstantModel::OpenCodeLunaHigh
+        | InstantModel::OpenCodeLunaXhigh
+        | InstantModel::OpenCodeLunaMax => None,
+    }
+}
+
+fn custom_openai_model_for_agent(
+    model: voxgolem_core::assistant::AgentModel,
+) -> Option<voxgolem_platform::custom_openai::CustomOpenAiModel> {
+    use voxgolem_core::assistant::AgentModel;
+    use voxgolem_platform::custom_openai::CustomOpenAiModel;
+    match model {
+        AgentModel::CustomSolLow => Some(CustomOpenAiModel::SolLow),
+        AgentModel::CustomSolMedium => Some(CustomOpenAiModel::SolMedium),
+        AgentModel::CustomSolHigh => Some(CustomOpenAiModel::SolHigh),
+        AgentModel::CustomSolXhigh => Some(CustomOpenAiModel::SolXhigh),
+        AgentModel::CustomSolMax => Some(CustomOpenAiModel::SolMax),
+        AgentModel::CustomLuna6Low => Some(CustomOpenAiModel::Luna6Low),
+        AgentModel::CustomLuna6Medium => Some(CustomOpenAiModel::Luna6Medium),
+        AgentModel::CustomLuna6High => Some(CustomOpenAiModel::Luna6High),
+        AgentModel::CustomLuna6Xhigh => Some(CustomOpenAiModel::Luna6Xhigh),
+        AgentModel::CustomLuna6Max => Some(CustomOpenAiModel::Luna6Max),
+        AgentModel::CustomLunaLow => Some(CustomOpenAiModel::LunaLow),
+        AgentModel::CustomLuna56Medium => Some(CustomOpenAiModel::Luna56Medium),
+        AgentModel::CustomLuna56High => Some(CustomOpenAiModel::Luna56High),
+        AgentModel::CustomLuna56Xhigh => Some(CustomOpenAiModel::Luna56Xhigh),
+        AgentModel::CustomLuna56Max => Some(CustomOpenAiModel::Luna56Max),
+        AgentModel::OpenCodeSolLow
+        | AgentModel::OpenCodeSolMedium
+        | AgentModel::OpenCodeSolHigh
+        | AgentModel::OpenCodeSolXhigh
+        | AgentModel::OpenCodeSolMax
+        | AgentModel::OpenCodeLunaLow
+        | AgentModel::OpenCodeLunaMedium
+        | AgentModel::OpenCodeLunaHigh
+        | AgentModel::OpenCodeLunaXhigh
+        | AgentModel::OpenCodeLunaMax => None,
+    }
+}
+
+fn opencode_model_for_instant(
+    model: voxgolem_core::assistant::InstantModel,
+) -> Option<voxgolem_platform::opencode::OpencodeModel> {
+    use voxgolem_core::assistant::InstantModel;
+    use voxgolem_platform::opencode::OpencodeModel;
+    match model {
+        InstantModel::OpenCodeSolLow => Some(OpencodeModel::Gpt6SolLow),
+        InstantModel::OpenCodeSolMedium => Some(OpencodeModel::Gpt6SolMedium),
+        InstantModel::OpenCodeSolHigh => Some(OpencodeModel::Gpt6SolHigh),
+        InstantModel::OpenCodeSolXhigh => Some(OpencodeModel::Gpt6SolXhigh),
+        InstantModel::OpenCodeSolMax => Some(OpencodeModel::Gpt6SolMax),
+        InstantModel::OpenCodeLunaNone => Some(OpencodeModel::Gpt56LunaNone),
+        InstantModel::OpenCodeLunaLow => Some(OpencodeModel::Gpt56LunaLow),
+        InstantModel::OpenCodeLunaMedium => Some(OpencodeModel::Gpt56LunaMedium),
+        InstantModel::OpenCodeLunaHigh => Some(OpencodeModel::Gpt56LunaHigh),
+        InstantModel::OpenCodeLunaXhigh => Some(OpencodeModel::Gpt56LunaXhigh),
+        InstantModel::OpenCodeLunaMax => Some(OpencodeModel::Gpt56LunaMax),
+        InstantModel::LocalFast
+        | InstantModel::LocalQuality
+        | InstantModel::CustomSolLow
+        | InstantModel::CustomSolMedium
+        | InstantModel::CustomSolHigh
+        | InstantModel::CustomSolXhigh
+        | InstantModel::CustomSolMax
+        | InstantModel::CustomLunaNone
+        | InstantModel::CustomLuna6Low
+        | InstantModel::CustomLuna6Medium
+        | InstantModel::CustomLuna6High
+        | InstantModel::CustomLuna6Xhigh
+        | InstantModel::CustomLuna6Max
+        | InstantModel::CustomLuna56None
+        | InstantModel::CustomLunaLow
+        | InstantModel::CustomLuna56Medium
+        | InstantModel::CustomLuna56High
+        | InstantModel::CustomLuna56Xhigh
+        | InstantModel::CustomLuna56Max => None,
+    }
+}
+
+fn opencode_model_for_agent(
+    model: voxgolem_core::assistant::AgentModel,
+) -> Option<voxgolem_platform::opencode::OpencodeModel> {
+    use voxgolem_core::assistant::AgentModel;
+    use voxgolem_platform::opencode::OpencodeModel;
+    match model {
+        AgentModel::OpenCodeSolLow => Some(OpencodeModel::Gpt6SolLow),
+        AgentModel::OpenCodeSolMedium => Some(OpencodeModel::Gpt6SolMedium),
+        AgentModel::OpenCodeSolHigh => Some(OpencodeModel::Gpt6SolHigh),
+        AgentModel::OpenCodeSolXhigh => Some(OpencodeModel::Gpt6SolXhigh),
+        AgentModel::OpenCodeSolMax => Some(OpencodeModel::Gpt6SolMax),
+        AgentModel::OpenCodeLunaLow => Some(OpencodeModel::Gpt56LunaLow),
+        AgentModel::OpenCodeLunaMedium => Some(OpencodeModel::Gpt56LunaMedium),
+        AgentModel::OpenCodeLunaHigh => Some(OpencodeModel::Gpt56LunaHigh),
+        AgentModel::OpenCodeLunaXhigh => Some(OpencodeModel::Gpt56LunaXhigh),
+        AgentModel::OpenCodeLunaMax => Some(OpencodeModel::Gpt56LunaMax),
+        AgentModel::CustomSolLow
+        | AgentModel::CustomSolMedium
+        | AgentModel::CustomSolHigh
+        | AgentModel::CustomSolXhigh
+        | AgentModel::CustomSolMax
+        | AgentModel::CustomLuna6Low
+        | AgentModel::CustomLuna6Medium
+        | AgentModel::CustomLuna6High
+        | AgentModel::CustomLuna6Xhigh
+        | AgentModel::CustomLuna6Max
+        | AgentModel::CustomLunaLow
+        | AgentModel::CustomLuna56Medium
+        | AgentModel::CustomLuna56High
+        | AgentModel::CustomLuna56Xhigh
+        | AgentModel::CustomLuna56Max => None,
     }
 }
 
@@ -9757,11 +9901,7 @@ fn local_profile_for_model(
     match model {
         InstantModel::LocalFast => Some(ResponseProfilePayload::Fast),
         InstantModel::LocalQuality => Some(ResponseProfilePayload::Quality),
-        InstantModel::CustomSolHigh
-        | InstantModel::CustomLunaNone
-        | InstantModel::CustomLunaLow
-        | InstantModel::OpenCodeSolHigh
-        | InstantModel::OpenCodeLunaLow => None,
+        _ => None,
     }
 }
 
@@ -9936,9 +10076,7 @@ async fn run_assistant_prefetch(
                 .take();
             result
         }
-        InstantModel::CustomSolHigh
-        | InstantModel::CustomLunaNone
-        | InstantModel::CustomLunaLow => {
+        model if custom_openai_model_for_instant(model).is_some() => {
             let app_state = app.state::<AppState>();
             let config = effective_custom_config(&app_state)
                 .ok_or_else(|| String::from("Custom provider is not configured"))?;
@@ -9981,7 +10119,10 @@ async fn run_assistant_prefetch(
                 },
             }
         }
-        InstantModel::OpenCodeSolHigh | InstantModel::OpenCodeLunaLow => {
+        model => {
+            let Some(opencode_model) = opencode_model_for_instant(model) else {
+                unreachable!("prefetch model is Local, Custom, or OpenCode");
+            };
             let app_state = app.state::<AppState>();
             let base_client = app_state
                 .opencode_server
@@ -10000,11 +10141,7 @@ async fn run_assistant_prefetch(
                 &client.client,
                 &format!("prefetch-{generation}"),
                 &render_provider_prompt(&key.history, &key.prompt),
-                if key.model == InstantModel::OpenCodeSolHigh {
-                    voxgolem_platform::opencode::OpencodeModel::Gpt6SolHigh
-                } else {
-                    voxgolem_platform::opencode::OpencodeModel::Gpt56LunaLow
-                },
+                opencode_model,
                 voxgolem_platform::opencode::OpencodeToolPolicy::AnswerOnly,
                 cancelled,
                 cancellation_signal,
@@ -10962,18 +11099,43 @@ fn apply_opencode_startup_failure(
     );
     if capability_available(capabilities, "custom_provider") {
         settings.instant = match settings.instant {
+            InstantChoicePayload::OpenCodeSolLow => InstantChoicePayload::CustomSolLow,
+            InstantChoicePayload::OpenCodeSolMedium => InstantChoicePayload::CustomSolMedium,
             InstantChoicePayload::OpenCodeSolHigh => InstantChoicePayload::CustomSolHigh,
+            InstantChoicePayload::OpenCodeSolXhigh => InstantChoicePayload::CustomSolXhigh,
+            InstantChoicePayload::OpenCodeSolMax => InstantChoicePayload::CustomSolMax,
+            InstantChoicePayload::OpenCodeLunaNone => InstantChoicePayload::CustomLuna56None,
             InstantChoicePayload::OpenCodeLunaLow => InstantChoicePayload::CustomLunaLow,
+            InstantChoicePayload::OpenCodeLunaMedium => InstantChoicePayload::CustomLuna56Medium,
+            InstantChoicePayload::OpenCodeLunaHigh => InstantChoicePayload::CustomLuna56High,
+            InstantChoicePayload::OpenCodeLunaXhigh => InstantChoicePayload::CustomLuna56Xhigh,
+            InstantChoicePayload::OpenCodeLunaMax => InstantChoicePayload::CustomLuna56Max,
             choice => choice,
         };
         settings.deep = match settings.deep {
+            AgentChoicePayload::OpenCodeSolLow => AgentChoicePayload::CustomSolLow,
+            AgentChoicePayload::OpenCodeSolMedium => AgentChoicePayload::CustomSolMedium,
             AgentChoicePayload::OpenCodeSolHigh => AgentChoicePayload::CustomSolHigh,
+            AgentChoicePayload::OpenCodeSolXhigh => AgentChoicePayload::CustomSolXhigh,
+            AgentChoicePayload::OpenCodeSolMax => AgentChoicePayload::CustomSolMax,
             AgentChoicePayload::OpenCodeLunaLow => AgentChoicePayload::CustomLunaLow,
+            AgentChoicePayload::OpenCodeLunaMedium => AgentChoicePayload::CustomLuna56Medium,
+            AgentChoicePayload::OpenCodeLunaHigh => AgentChoicePayload::CustomLuna56High,
+            AgentChoicePayload::OpenCodeLunaXhigh => AgentChoicePayload::CustomLuna56Xhigh,
+            AgentChoicePayload::OpenCodeLunaMax => AgentChoicePayload::CustomLuna56Max,
             choice => choice,
         };
         settings.review = match settings.review {
+            AgentChoicePayload::OpenCodeSolLow => AgentChoicePayload::CustomSolLow,
+            AgentChoicePayload::OpenCodeSolMedium => AgentChoicePayload::CustomSolMedium,
             AgentChoicePayload::OpenCodeSolHigh => AgentChoicePayload::CustomSolHigh,
+            AgentChoicePayload::OpenCodeSolXhigh => AgentChoicePayload::CustomSolXhigh,
+            AgentChoicePayload::OpenCodeSolMax => AgentChoicePayload::CustomSolMax,
             AgentChoicePayload::OpenCodeLunaLow => AgentChoicePayload::CustomLunaLow,
+            AgentChoicePayload::OpenCodeLunaMedium => AgentChoicePayload::CustomLuna56Medium,
+            AgentChoicePayload::OpenCodeLunaHigh => AgentChoicePayload::CustomLuna56High,
+            AgentChoicePayload::OpenCodeLunaXhigh => AgentChoicePayload::CustomLuna56Xhigh,
+            AgentChoicePayload::OpenCodeLunaMax => AgentChoicePayload::CustomLuna56Max,
             choice => choice,
         };
     } else {
@@ -14094,13 +14256,14 @@ mod tests {
             voxgolem_core::ipc::UiTextSize::Large
         );
         assert_eq!(snapshot.capabilities.len(), 2);
-        assert_eq!(snapshot.model_options.len(), 7);
+        assert_eq!(snapshot.model_options.len(), 30);
         assert!(snapshot.model_options[2].available);
-        assert_eq!(snapshot.model_options[3].id.as_str(), "custom-luna-none");
-        assert!(snapshot.model_options[3].available);
-        assert!(!snapshot.model_options[5].available);
+        assert_eq!(snapshot.model_options[2].id.as_str(), "custom-sol-low");
+        assert!(snapshot.model_options[7].available);
+        assert_eq!(snapshot.model_options[7].id.as_str(), "custom-luna-none");
+        assert!(!snapshot.model_options[19].available);
         assert_eq!(
-            snapshot.model_options[5]
+            snapshot.model_options[19]
                 .unavailable_reason
                 .as_ref()
                 .expect("unavailable reason")
@@ -16102,11 +16265,38 @@ mod tests {
     }
 
     #[test]
+    fn direct_sol_low_reasoning_choice_round_trips_as_custom_instant() {
+        let settings = AssistantSettingsPayload {
+            instant: InstantChoicePayload::CustomSolLow,
+            ..AssistantSettingsPayload::default()
+        };
+        let wire = serde_json::to_value(settings).unwrap();
+        assert_eq!(wire["instant"], "custom-sol-low");
+        assert_eq!(settings.instant.capability_id(), "custom_provider");
+        assert_eq!(
+            AssistantSettingsPayload::from(&voxgolem_core::assistant::AssistantPolicy::from(
+                settings
+            )),
+            settings
+        );
+        assert_eq!(
+            parse_persisted_state("assistant_instant = \"custom-sol-low\"\nassistant_deep = \"custom-sol-high\"\nassistant_review = \"custom-sol-high\"\nassistant_deep_enabled = false\nassistant_review_enabled = false\nassistant_prefetch = false\nassistant_completion = false\n").unwrap().assistant_settings.unwrap().instant,
+            InstantChoicePayload::CustomSolLow
+        );
+        assert_eq!(
+            super::instant_telemetry_identity(voxgolem_core::assistant::InstantModel::CustomSolLow)
+                .0,
+            crate::telemetry::Provider::Custom
+        );
+    }
+
+    #[test]
     fn custom_instant_admission_does_not_require_an_opencode_server() {
         use voxgolem_core::assistant::InstantModel;
 
         for model in [
             InstantModel::CustomSolHigh,
+            InstantModel::CustomSolLow,
             InstantModel::CustomLunaNone,
             InstantModel::CustomLunaLow,
         ] {

@@ -29,27 +29,80 @@ const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CustomOpenAiModel {
+    SolLow,
+    SolMedium,
     SolHigh,
+    SolXhigh,
+    SolMax,
     LunaNone,
+    Luna6Low,
+    Luna6Medium,
+    Luna6High,
+    Luna6Xhigh,
+    Luna6Max,
+    Luna56None,
     LunaLow,
+    Luna56Medium,
+    Luna56High,
+    Luna56Xhigh,
+    Luna56Max,
     LocalFast,
 }
 
 impl CustomOpenAiModel {
     pub fn model_id(self) -> &'static str {
         match self {
-            Self::SolHigh => "gpt-6.1-sol",
-            Self::LunaNone => "gpt-6-luna",
-            Self::LunaLow => "gpt-5.6-luna",
+            Self::SolLow | Self::SolMedium | Self::SolHigh | Self::SolXhigh | Self::SolMax => {
+                "gpt-6.1-sol"
+            }
+            Self::LunaNone
+            | Self::Luna6Low
+            | Self::Luna6Medium
+            | Self::Luna6High
+            | Self::Luna6Xhigh
+            | Self::Luna6Max => "gpt-6-luna",
+            Self::Luna56None
+            | Self::LunaLow
+            | Self::Luna56Medium
+            | Self::Luna56High
+            | Self::Luna56Xhigh
+            | Self::Luna56Max => "gpt-5.6-luna",
             Self::LocalFast => "local-fast",
         }
     }
 
     pub fn reasoning_effort(self) -> &'static str {
         match self {
-            Self::SolHigh => "high",
-            Self::LunaNone | Self::LocalFast => "none",
-            Self::LunaLow => "low",
+            Self::SolLow | Self::Luna6Low | Self::LunaLow => "low",
+            Self::SolMedium | Self::Luna6Medium | Self::Luna56Medium => "medium",
+            Self::SolHigh | Self::Luna6High | Self::Luna56High => "high",
+            Self::SolXhigh | Self::Luna6Xhigh | Self::Luna56Xhigh => "xhigh",
+            Self::SolMax | Self::Luna6Max | Self::Luna56Max => "max",
+            Self::LunaNone | Self::Luna56None | Self::LocalFast => "none",
+        }
+    }
+
+    pub fn from_wire_id(id: &str) -> Option<Self> {
+        match id {
+            "custom-sol-low" => Some(Self::SolLow),
+            "custom-sol-medium" => Some(Self::SolMedium),
+            "custom-sol-high" => Some(Self::SolHigh),
+            "custom-sol-xhigh" => Some(Self::SolXhigh),
+            "custom-sol-max" => Some(Self::SolMax),
+            "custom-luna-none" => Some(Self::LunaNone),
+            "custom-luna6-low" => Some(Self::Luna6Low),
+            "custom-luna6-medium" => Some(Self::Luna6Medium),
+            "custom-luna6-high" => Some(Self::Luna6High),
+            "custom-luna6-xhigh" => Some(Self::Luna6Xhigh),
+            "custom-luna6-max" => Some(Self::Luna6Max),
+            "custom-luna56-none" => Some(Self::Luna56None),
+            "custom-luna-low" => Some(Self::LunaLow),
+            "custom-luna56-medium" => Some(Self::Luna56Medium),
+            "custom-luna56-high" => Some(Self::Luna56High),
+            "custom-luna56-xhigh" => Some(Self::Luna56Xhigh),
+            "custom-luna56-max" => Some(Self::Luna56Max),
+            "local-fast" => Some(Self::LocalFast),
+            _ => None,
         }
     }
 }
@@ -2076,6 +2129,19 @@ mod tests {
         assert_eq!(CustomOpenAiModel::SolHigh.reasoning_effort(), "high");
         assert_eq!(CustomOpenAiModel::LunaLow.model_id(), "gpt-5.6-luna");
         assert_eq!(CustomOpenAiModel::LunaLow.reasoning_effort(), "low");
+    }
+
+    #[test]
+    fn direct_sol_without_reasoning_preserves_the_custom_request_contract() {
+        let config = CustomOpenAiConfig {
+            model: CustomOpenAiModel::SolLow,
+            ..CustomOpenAiConfig::default()
+        };
+        let request = build_request(&config, &prompt(), None);
+        assert_eq!(request["model"], "gpt-6.1-sol");
+        assert_eq!(request["reasoning"]["effort"], "low");
+        assert_eq!(request["store"], false);
+        assert!(request.get("tools").is_none());
     }
 
     #[test]
