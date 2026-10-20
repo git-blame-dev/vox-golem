@@ -559,7 +559,7 @@ impl Store {
         (conversations.into_values().collect(), pending)
     }
 
-    pub fn plan(&self, command: Command) -> Result<MutationPlan, DomainError> {
+    pub fn plan_with_store(&self, command: Command) -> Result<(MutationPlan, Self), DomainError> {
         let Command::Import {
             expected_revision,
             records,
@@ -624,17 +624,24 @@ impl Store {
             .collect();
         let snapshot = next.export();
         // Validate the post-purge state through the same boundary used after a native commit.
-        Self::restore(snapshot.clone())?;
-        Ok(MutationPlan {
-            base_revision: self.revision.clone(),
-            snapshot,
-            accepted: accepted.into_iter().collect(),
-            duplicates: duplicates.into_iter().collect(),
-            suppressed,
-            purge_conversations,
-            publish,
-            quarantined,
-        })
+        let next_store = Self::restore(snapshot.clone())?;
+        Ok((
+            MutationPlan {
+                base_revision: self.revision.clone(),
+                snapshot,
+                accepted: accepted.into_iter().collect(),
+                duplicates: duplicates.into_iter().collect(),
+                suppressed,
+                purge_conversations,
+                publish,
+                quarantined,
+            },
+            next_store,
+        ))
+    }
+
+    pub fn plan(&self, command: Command) -> Result<MutationPlan, DomainError> {
+        self.plan_with_store(command).map(|(plan, _)| plan)
     }
 
     fn insert(&mut self, record: Record) -> Result<bool, DomainError> {

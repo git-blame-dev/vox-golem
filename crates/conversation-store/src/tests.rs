@@ -844,3 +844,67 @@ fn compact_projection_excludes_large_turn_bodies_and_preserves_bounded_previews_
         Err(Error::Domain(DomainError::RevisionConflict { .. }))
     ));
 }
+
+#[test]
+fn test_persist_settled_turn_single_transaction_and_atomic_rollback() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+
+    use voxgolem_core::durable_conversation::{Answer, Provenance, TerminalStage};
+    let provenance = Provenance {
+        requested_model: "test-model".into(),
+        returned_model: None,
+        policy_id: "bench-1-quick".into(),
+        policy_version: "1".into(),
+        instruction_profile_id: "test-instructions".into(),
+        instruction_profile_version: "1".into(),
+        context: Vec::new(),
+    };
+
+    let settled = store
+        .persist_settled_turn(
+            1024,
+            "Test prompt".into(),
+            Answer::Text {
+                text: "Test answer".into(),
+            },
+            Vec::new(),
+            TerminalStage::Instant,
+            provenance.clone(),
+        )
+        .unwrap();
+
+    assert!(settled.saved);
+    let selection = store.selection().unwrap();
+    assert!(selection.conversation.is_some());
+    assert_eq!(
+        selection.selected_head,
+        Some(settled.record.operation.id.clone())
+    );
+
+    // Verify atomic rollback on failure when an invalid prompt is passed on a fresh store
+    // (where ConversationCreated is planned first inside the transaction, then TurnCompleted fails):
+    let mut fresh_store = Fixture::new().open();
+    let revision_before = fresh_store.revision().unwrap();
+    let res = fresh_store.persist_settled_turn(
+        1024,
+        "   ".into(),
+        Answer::Text {
+            text: "Another answer".into(),
+        },
+        Vec::new(),
+        TerminalStage::Instant,
+        provenance,
+    );
+    assert!(res.is_err());
+    assert_eq!(fresh_store.revision().unwrap(), revision_before);
+    assert_eq!(
+        fresh_store
+            .conversations(0, 10)
+            .unwrap()
+            .conversations
+            .len(),
+        0
+    );
+    assert_eq!(fresh_store.allocate_id().unwrap().sequence, "1");
+}

@@ -402,24 +402,6 @@ impl DesktopConversationRuntime {
             .lock()
             .map_err(|_| String::from("durable conversation store lock is poisoned"))?;
         let store = durable.ensure_store()?;
-        let selection = store.selection().map_err(|error| error.to_string())?;
-        let conversation = match selection.conversation {
-            Some(conversation) => conversation,
-            None => {
-                let created = store
-                    .create_conversation(String::from("Conversation"))
-                    .map_err(|error| error.to_string())?;
-                created.operation.id
-            }
-        };
-        let context = store
-            .context(
-                conversation.clone(),
-                selection.selected_head,
-                voxgolem_core::conversation::MAX_COMMITTED_TEXT_BYTES,
-            )
-            .map_err(|error| error.to_string())?;
-        let request = store.allocate_id().map_err(|error| error.to_string())?;
         let prompt = match &turn.user.content {
             voxgolem_core::assistant::Content::Text(text)
             | voxgolem_core::assistant::Content::Refusal(text) => text.clone(),
@@ -450,15 +432,14 @@ impl DesktopConversationRuntime {
         } else {
             turn.request_id.0.clone()
         };
-        let completed = store
-            .complete_turn(voxgolem_conversation_store::TurnCompletion {
-                request,
-                context,
+        store
+            .persist_settled_turn(
+                voxgolem_core::conversation::MAX_COMMITTED_TEXT_BYTES,
                 prompt,
                 answer,
-                sources: turn.sources.clone(),
+                turn.sources.clone(),
                 terminal_stage,
-                provenance: voxgolem_core::durable_conversation::Provenance {
+                voxgolem_core::durable_conversation::Provenance {
                     requested_model,
                     returned_model: None,
                     policy_id,
@@ -473,13 +454,7 @@ impl DesktopConversationRuntime {
                     instruction_profile_version: String::from("1"),
                     context: Vec::new(),
                 },
-            })
-            .map_err(|error| error.to_string())?;
-        store
-            .select(voxgolem_conversation_store::Selection {
-                conversation: Some(conversation),
-                selected_head: Some(completed.record.operation.id),
-            })
+            )
             .map_err(|error| error.to_string())?;
         durable.hydrated = true;
         Ok(())

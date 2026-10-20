@@ -236,12 +236,25 @@ impl Store {
     }
 
     pub fn create_conversation(&mut self, title: String) -> Result<Record> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id = allocate_id(&tx)?;
         let record = codec::record(Operation {
             version: SCHEMA_VERSION,
-            id: self.allocate_id()?,
+            id,
             body: OperationBody::ConversationCreated { title },
         })?;
-        self.import_records(vec![record.clone()], false, None)?;
+        let (_, next) = Self::import_within_tx_with_hook(
+            &mut self.core,
+            &tx,
+            vec![record.clone()],
+            false,
+            None,
+            |_| Ok(()),
+        )?;
+        tx.commit()?;
+        self.core = next;
         Ok(record)
     }
 
@@ -325,11 +338,11 @@ impl Store {
                     title: "Conversation".into(),
                 },
             })?;
-            let plan = self.core.plan(Command::Import {
+            let (plan, next_store) = self.core.plan_with_store(Command::Import {
                 expected_revision: self.core.revision().into(),
                 records: vec![record.clone()],
             })?;
-            next = Some(CoreStore::restore(plan.snapshot.clone())?);
+            next = Some(next_store);
             apply_plan(&tx, &self.core, &plan)?;
             tx.execute(
                 "UPDATE history_local SET conversation=?,selected_head=NULL WHERE singleton=1",
@@ -456,12 +469,26 @@ impl Store {
         self.read(|core| gateway::history_page(core, request))
     }
     pub fn delete_conversation(&mut self, conversation: OperationId) -> Result<CommitOutcome> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id = allocate_id(&tx)?;
         let record = codec::record(Operation {
             version: SCHEMA_VERSION,
-            id: self.allocate_id()?,
+            id,
             body: OperationBody::ConversationDeleted { conversation },
         })?;
-        self.import_records(vec![record], false, None)
+        let (outcome, next) = Self::import_within_tx_with_hook(
+            &mut self.core,
+            &tx,
+            vec![record],
+            false,
+            None,
+            |_| Ok(()),
+        )?;
+        tx.commit()?;
+        self.core = next;
+        Ok(outcome)
     }
     pub fn complete_turn(&mut self, mut completion: TurnCompletion) -> Result<CompletedTurn> {
         completion.provenance.context = completion.context.ancestor_ids;
@@ -483,18 +510,133 @@ impl Store {
         if !matches!(body, OperationBody::TurnCompleted { .. }) {
             return Err(invalid("completion_body").into());
         }
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id = allocate_id(&tx)?;
         let record = codec::record(Operation {
             version: SCHEMA_VERSION,
-            id: self.allocate_id()?,
+            id,
             body,
         })?;
-        let outcome =
-            self.import_records(vec![record.clone()], false, Some(&record.operation.id))?;
+        let (outcome, next) = Self::import_within_tx_with_hook(
+            &mut self.core,
+            &tx,
+            vec![record.clone()],
+            false,
+            Some(&record.operation.id),
+            |_| Ok(()),
+        )?;
+        tx.commit()?;
+        self.core = next;
         let saved = !outcome.suppressed.contains(&record.operation.id)
             && !outcome.quarantined.contains(&record.operation.id);
         Ok(CompletedTurn { record, saved })
     }
+    pub fn persist_settled_turn(
+        &mut self,
+        max_text_bytes: usize,
+        prompt: String,
+        answer: voxgolem_core::durable_conversation::Answer,
+        sources: Vec<voxgolem_core::sources::SourceLink>,
+        terminal_stage: voxgolem_core::durable_conversation::TerminalStage,
+        provenance: voxgolem_core::durable_conversation::Provenance,
+    ) -> Result<CompletedTurn> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        refresh(&tx, &mut self.core)?;
 
+        let (selected_conversation, selected_head): (Option<String>, Option<String>) = tx
+            .query_row(
+                "SELECT conversation,selected_head FROM history_local WHERE singleton=1",
+                [],
+                |r| Ok((optional_text(r, 0, 256)?, optional_text(r, 1, 256)?)),
+            )?;
+        let selected_conversation: Option<OperationId> = selected_conversation
+            .map(|s| serde_json::from_str(&s).map_err(|_| Error::Storage))
+            .transpose()?;
+        let selected_head: Option<OperationId> = selected_head
+            .map(|s| serde_json::from_str(&s).map_err(|_| Error::Storage))
+            .transpose()?;
+
+        let mut created_core = None;
+        let conversation = match selected_conversation {
+            Some(conversation) => conversation,
+            None => {
+                let id = allocate_id(&tx)?;
+                let create_record = codec::record(Operation {
+                    version: SCHEMA_VERSION,
+                    id: id.clone(),
+                    body: OperationBody::ConversationCreated {
+                        title: "Conversation".into(),
+                    },
+                })?;
+                let (plan, next_store) = self.core.plan_with_store(Command::Import {
+                    expected_revision: self.core.revision().into(),
+                    records: vec![create_record],
+                })?;
+                apply_plan(&tx, &self.core, &plan)?;
+                created_core = Some(next_store);
+                id
+            }
+        };
+
+        let working_core = created_core.as_mut().unwrap_or(&mut self.core);
+        let context = working_core.select_context(ContextRequest {
+            expected_revision: working_core.revision().into(),
+            conversation: conversation.clone(),
+            selected_head,
+            max_turns: 20,
+            max_text_bytes,
+        })?;
+
+        let request = allocate_id(&tx)?;
+        let turn_id = allocate_id(&tx)?;
+        let mut prov = provenance;
+        prov.context = context.ancestor_ids;
+
+        let record = codec::record(Operation {
+            version: SCHEMA_VERSION,
+            id: turn_id.clone(),
+            body: OperationBody::TurnCompleted {
+                conversation: conversation.clone(),
+                parent: context.parent,
+                request,
+                prompt,
+                answer,
+                sources,
+                terminal_stage,
+                provenance: prov,
+            },
+        })?;
+
+        let (outcome, next_core) = Self::import_within_tx_with_hook(
+            working_core,
+            &tx,
+            vec![record.clone()],
+            false,
+            Some(&record.operation.id),
+            |_| Ok(()),
+        )?;
+
+        next_core.continuation(voxgolem_core::durable_conversation::ContinuationRequest {
+            expected_revision: next_core.revision().into(),
+            conversation: conversation.clone(),
+            selected_head: Some(turn_id.clone()),
+            local_work_in_flight: true,
+        })?;
+        tx.execute(
+            "UPDATE history_local SET conversation=?,selected_head=? WHERE singleton=1",
+            params![json_id(&conversation)?, json_id(&turn_id)?],
+        )?;
+
+        tx.commit()?;
+        self.core = next_core;
+        let saved = !outcome.suppressed.contains(&record.operation.id)
+            && !outcome.quarantined.contains(&record.operation.id);
+        Ok(CompletedTurn { record, saved })
+    }
     /// Commit an immutable completion constructed from its pre-inference ContextSelection.
     /// The caller's cancellation/admission lock must cover this entire call, including COMMIT.
     /// A revision change reloads the DB and replans the same records; inference is never rerun.
@@ -514,6 +656,30 @@ impl Store {
         completion: Option<&OperationId>,
         before_commit: impl FnOnce() -> Result<()>,
     ) -> Result<CommitOutcome> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (outcome, next) = Self::import_within_tx_with_hook(
+            &mut self.core,
+            &tx,
+            records,
+            receive,
+            completion,
+            |_| before_commit(),
+        )?;
+        tx.commit()?;
+        self.core = next; // Only advance the pinned reducer after SQLite COMMIT succeeds.
+        Ok(outcome)
+    }
+
+    pub(crate) fn import_within_tx_with_hook(
+        core: &mut CoreStore,
+        tx: &Transaction<'_>,
+        records: Vec<Record>,
+        receive: bool,
+        completion: Option<&OperationId>,
+        before_commit: impl FnOnce(&Transaction<'_>) -> Result<()>,
+    ) -> Result<(CommitOutcome, CoreStore)> {
         if records.len() > 128 {
             return Err(limit("batch_records").into());
         }
@@ -522,22 +688,17 @@ impl Store {
                 return Err(invalid("body_key_sha256_mismatch").into());
             }
         }
-        let tx = self
-            .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        refresh(&tx, &mut self.core)?;
+        refresh(tx, core)?;
         if let Some(completion_id) = completion {
             let completed = records
                 .iter()
                 .find(|r| &r.operation.id == completion_id)
                 .ok_or_else(|| invalid("completion_record"))?;
             let conversation = completed.operation.conversation();
-            if !self
-                .core
+            if !core
                 .retained_records()
                 .any(|r| r.operation.conversation() == conversation)
-                && !self
-                    .core
+                && !core
                     .retired_records()
                     .any(|r| &r.conversation == conversation)
             {
@@ -551,13 +712,11 @@ impl Store {
         let completion_body = completion
             .and_then(|id| records.iter().find(|r| &r.operation.id == id))
             .map(|r| &r.operation.body);
-        let plan = self.core.plan(Command::Import {
-            expected_revision: self.core.revision().into(),
+        let (plan, next) = core.plan_with_store(Command::Import {
+            expected_revision: core.revision().into(),
             records: records.clone(),
         })?;
-        // Core restoration validates speculative state before any SQL and before saved ACK.
-        let next = CoreStore::restore(plan.snapshot.clone())?;
-        apply_plan(&tx, &self.core, &plan)?;
+        apply_plan(tx, core, &plan)?;
         if receive {
             let replica: String = tx.query_row(
                 "SELECT replica FROM history_state WHERE singleton=1",
@@ -584,18 +743,19 @@ impl Store {
                 )?;
             }
         }
-        quotas(&tx)?;
-        before_commit()?;
-        tx.commit()?;
-        self.core = next; // Only advance the pinned reducer after SQLite COMMIT succeeds.
-        Ok(CommitOutcome {
-            base_revision: plan.base_revision,
-            revision: plan.snapshot.revision,
-            accepted: plan.accepted,
-            duplicates: plan.duplicates,
-            suppressed: plan.suppressed,
-            quarantined: plan.quarantined,
-        })
+        quotas(tx)?;
+        before_commit(tx)?;
+        Ok((
+            CommitOutcome {
+                base_revision: plan.base_revision,
+                revision: plan.snapshot.revision,
+                accepted: plan.accepted,
+                duplicates: plan.duplicates,
+                suppressed: plan.suppressed,
+                quarantined: plan.quarantined,
+            },
+            next,
+        ))
     }
 
     pub fn select(&mut self, selection: Selection) -> Result<()> {
