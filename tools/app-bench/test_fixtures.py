@@ -164,8 +164,10 @@ class FixtureTests(unittest.TestCase):
         self.assertTrue(matches_transcript("quick", "What is 17 plus 25 reply only with the number"))
         self.assertTrue(matches_transcript("short_research", CASES["short_research"].replace("Once Lock", "OnceLock").replace("release", "version")))
         self.assertTrue(matches_transcript("short_research", CASES["short_research"].replace("Once Lock", "once locked").replace("sourced", "source")))
+        self.assertTrue(matches_transcript("short_research", "What Rust release introduced one's luck? Read the official documentation and give a brief sourced answer."))
         self.assertTrue(matches_transcript("long_research", CASES["long_research"].replace("Lazy Lock", "LazyLock").replace("behavior", "behaviour")))
         self.assertTrue(matches_transcript("long_research", CASES["long_research"].replace("Once Lock", "once locked").replace("Lazy Lock", "lazy locked")))
+        self.assertTrue(matches_transcript("long_research", "Research One's lock and lazy lock in Rust. Read the official documentation and compare their release versions, initialization timing, panic behavior, and ability to reset. Explain the important differences in several short paragraphs with sources."))
         self.assertFalse(matches_transcript("quick", "What is 18 plus 25 reply only with the number"))
         self.assertFalse(matches_transcript("unknown", ""))
 

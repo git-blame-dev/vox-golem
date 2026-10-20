@@ -38,7 +38,7 @@ def matches_transcript(case, text):
     if case not in CASES or not isinstance(text, str):
         return False
     value = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
-    value = re.sub(r"\bonce\s*lock(?:ed)?\b", "oncelock", value)
+    value = re.sub(r"\b(?:once|one(?:\s+s)?)\s*l(?:ock(?:ed)?|uck)\b", "oncelock", value)
     value = re.sub(r"\blazy\s*lock(?:ed)?\b", "lazylock", value)
     value = re.sub(r"\bseventeen\b", "17", value)
     value = re.sub(r"\btwenty five\b", "25", value)

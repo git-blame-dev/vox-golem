@@ -8541,7 +8541,7 @@ impl DesktopConversationRuntime {
 }
 
 #[tauri::command]
-fn record_speech_activity(
+async fn record_speech_activity(
     now_ms: u64,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<RuntimePhaseResponsePayload, String> {
@@ -8565,9 +8565,21 @@ fn record_speech_activity(
 }
 
 #[tauri::command]
-fn mark_silence(
+async fn mark_silence(
     telemetry_frame_id: Option<String>,
-    app_state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<RuntimePhaseResponsePayload, String> {
+    spawn_runtime_blocking(move || {
+        let app_state = app.state::<AppState>();
+        mark_silence_from_state(telemetry_frame_id, &app_state)
+    })
+    .await
+    .map_err(|error| format!("mark_silence worker failed: {error}"))?
+}
+
+fn mark_silence_from_state(
+    telemetry_frame_id: Option<String>,
+    app_state: &AppState,
 ) -> Result<RuntimePhaseResponsePayload, String> {
     let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
     let _operation_guard =
@@ -8575,7 +8587,7 @@ fn mark_silence(
     ensure_startup_ready_for_prompt(&app_state.startup_state)?;
     let now_ms = current_time_ms()?;
 
-    let action = apply_silence_check_with_input_reset(&app_state, now_ms)?;
+    let action = apply_silence_check_with_input_reset(app_state, now_ms)?;
 
     let should_measure_transcription = matches!(
         action,
@@ -8591,7 +8603,7 @@ fn mark_silence(
             .completion_lifecycle_lock
             .lock()
             .map_err(|_| String::from("completion lifecycle lock is poisoned"))?;
-        clear_completion_request_state_locked(&app_state, false)?;
+        clear_completion_request_state_locked(app_state, false)?;
     }
     let transcription_started_ms = if should_measure_transcription {
         Some(current_time_ms()?)
@@ -8789,7 +8801,7 @@ async fn reset_opencode_session(app_state: &AppState) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn ingest_audio_frame(
+async fn ingest_audio_frame(
     frame: Vec<f32>,
     telemetry_frame_id: Option<String>,
     app: tauri::AppHandle,
@@ -19362,6 +19374,75 @@ mod tests {
             assert_eq!(response.runtime_phase, RuntimePhasePayload::Sleeping);
             assert_eq!(response.preroll_samples, 3);
             assert_eq!(response.utterance_samples, 0);
+        });
+    }
+
+    #[test]
+    fn mark_silence_processing_allows_independent_audio_ingestion() {
+        let state = build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            super::embedded_cue_asset_paths(),
+            "synthetic".into(),
+        );
+        reset_voice_pipeline_to_waiting(
+            &state.voice_pipeline_state,
+            &state.wake_word_runtime,
+            &state.voice_activity_runtime,
+            state.voice_pipeline_config,
+        )
+        .expect("ready");
+        super::apply_voice_pipeline_transition(
+            &state.voice_pipeline_state,
+            state.voice_pipeline_config,
+            voxgolem_core::voice_pipeline::VoicePipelineEvent::WakeWordDetected { now_ms: 100 },
+        )
+        .expect("wake");
+        super::apply_voice_pipeline_transition(
+            &state.voice_pipeline_state,
+            state.voice_pipeline_config,
+            voxgolem_core::voice_pipeline::VoicePipelineEvent::SpeechDetected { now_ms: 200 },
+        )
+        .expect("speech");
+        super::ingest_audio_frame_from_state(
+            vec![0.1, 0.2, 0.3, 0.4],
+            Some("utterance-frame".into()),
+            &state,
+        )
+        .expect("ingest speech samples");
+        state
+            .partial_transcription
+            .lock()
+            .expect("partial scheduler")
+            .start_session(1);
+
+        let now_ms = 3_000;
+        let action = super::apply_silence_check_with_input_reset(&state, now_ms)
+            .expect("silence check should apply");
+        assert!(matches!(
+            action,
+            voxgolem_core::voice_pipeline::VoicePipelineAction::FinishedUtterance { .. }
+        ));
+
+        let response_operation = state.response_backend_operation_lock.lock().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let result = super::ingest_audio_frame_from_state(
+                    vec![0.1, 0.2, 0.3],
+                    Some("preroll-frame".into()),
+                    &state,
+                )
+                .map(|ingested| ingested.response);
+                sender.send(result).unwrap();
+            });
+            let result = receiver.recv_timeout(Duration::from_secs(5));
+            drop(response_operation);
+            worker.join().expect("frame ingestion worker");
+            let response = result
+                .expect("actual frame ingestion must not wait for response ownership")
+                .unwrap();
+            assert_eq!(response.runtime_phase, RuntimePhasePayload::Processing);
+            assert_eq!(response.preroll_samples, 3);
         });
     }
 
