@@ -63,7 +63,7 @@ import {
   updateVoiceActivityState,
 } from './lib/voiceActivity'
 import { cueForTransition, transitionRuntimeStatus } from './state/runtimeMachine'
-import { firstNonEmptyCompletedLine, firstNonEmptyStreamingLine, isValidTtsFirstLine } from './lib/ttsValidation'
+import { firstNonEmptyStreamingLine, isValidTtsFirstLine } from './lib/ttsValidation'
 import type {
   BackendRuntimePhase,
   ChatMessage,
@@ -149,11 +149,19 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   const androidVoiceActiveRef = session.fieldRef('androidVoiceActive')
   const [androidVoiceStatus, setAndroidVoiceStatus] = session.fieldState('androidVoiceStatus')
   const androidVoiceStatusRef = session.fieldRef('androidVoiceStatus')
+  const [, setTtsEnabled] = session.fieldState('ttsEnabled')
+  const ttsEnabledRef = session.fieldRef('ttsEnabled')
+  const ttsGenerationRef = session.audio.speechRevision
+  const ttsPendingRevisionRef = session.preferences.tts.pending
   const [, setAndroidSpeechStatusError] = session.fieldState('androidSpeechStatusError')
   const onAndroidSpeechStatus = useCallback((status: AndroidVoiceStatus | null, statusError: string | null): void => {
     setAndroidVoiceStatus(status)
     setAndroidSpeechStatusError(statusError)
-  }, [setAndroidSpeechStatusError, setAndroidVoiceStatus])
+    if (status !== null && ttsPendingRevisionRef.current === null) {
+      ttsEnabledRef.current = status.ttsEnabled
+      setTtsEnabled(status.ttsEnabled)
+    }
+  }, [setAndroidSpeechStatusError, setAndroidVoiceStatus, setTtsEnabled, ttsEnabledRef, ttsPendingRevisionRef])
   const androidVoiceStopRef = session.operationRef<(() => void) | null>('voiceStop', () => null)
   const androidVoiceInputEpochRef = session.operationRef('voiceInputRevision', () => 0)
   const pendingAndroidVoiceRequestRef = session.operationRef<{ readonly requestId: string; readonly text: string; readonly sessionId: string | null; readonly selectedHead: string | null; readonly composerRevision: number; readonly inputEpoch: number } | null>('voicePending', () => null)
@@ -170,7 +178,6 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   const [, setTypedCompletionSuffix] = session.fieldState('typedCompletionSuffix')
   const [, setVoiceCompletionSuffix] = session.fieldState('voiceCompletionSuffix')
   const [, setAutoStopOnSilence] = session.fieldState('autoStopOnSilence')
-  const [, setTtsEnabled] = session.fieldState('ttsEnabled')
   const [preparedCueAssetPaths, setPreparedCueAssetPaths] = session.fieldState('preparedCueAssetPaths')
   const [, setTtsPlaying] = session.fieldState('ttsPlaying')
   const [, setPendingTtsCommands] = session.fieldState('pendingTtsCommands')
@@ -288,9 +295,6 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       setMessages((current) => replaceCommittedTranscript(current, snapshot.transcript))
     }
   }, [androidAssistantRef, canonicalTranscriptRef, composerEditRevisionRef, restoredDraftAnnouncementRef, setAndroidAssistant, setAndroidConversationId, setComposerValue, setMessages, setResponseAnnouncement, shortcutDraftRef, snapshotSessionIdRef, timingRef])
-  const ttsGenerationRef = session.audio.speechRevision
-  const ttsEnabledRef = session.fieldRef('ttsEnabled')
-  const ttsPlaybackIdRef = session.audio.speechPlayback
   const cuePlayerRef = session.audio.cues
   const nativeAudioLifecycleRef = session.operationRef('nativeAudioLifecycle', createNativeAudioLifecycle)
   useEffect(() => {
@@ -315,7 +319,6 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   const ttsPersistedRevisionRef = session.preferences.tts.persistedRevision
   const ttsPersistedValueRef = session.preferences.tts.persisted
   const ttsPersistedInitializedRef = session.preferences.tts.initialized
-  const ttsPendingRevisionRef = session.preferences.tts.pending
   const uiTextSizeWriteRevisionRef = session.preferences.textSize.revision
   const uiThemeWriteRevisionRef = session.preferences.theme.revision
   const ttsWriteRevisionRef = session.preferences.tts.revision
@@ -1707,7 +1710,6 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
           voiceTelemetry.record('provider_first_line')
         }
         if (
-          snapshotHydrationStateRef.current !== 'succeeded' &&
           active.tts &&
           ttsEnabledRef.current &&
           !active.ttsFirstLineSpoken &&
@@ -2029,6 +2031,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         ))
       }
       if (effectiveOutcome !== 'completed') {
+        cancelTts()
         addNotice({
           tone: effectiveOutcome === 'error' ? 'error' : 'info',
           title: effectiveOutcome === 'error' ? 'Response failed' : 'Response cancelled',
@@ -2083,62 +2086,20 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   useEffect(() => { drainAndroidVoiceRequestRef.current() }, [androidVoiceStatus, drainAndroidVoiceRequestRef])
 
   async function synthesizeAndPlayAssistantReply(text: string): Promise<void> {
-    let commandPending = false
-    let playbackId: number | null = null
-    cancelTts()
-    const generation = ttsGenerationRef.current
-
-    try {
-      const speechText = firstNonEmptyCompletedLine(text) ?? ''
-      if (!isValidTtsFirstLine(speechText)) return
-      voiceTelemetry.record('tts_synthesis_requested')
-      playbackId = parseNativeAudioRequestId(
-        await invokeTauriCommand('reserve_local_tts_playback_id'),
-        'TTS playback',
-      )
-      if (generation !== ttsGenerationRef.current || !ttsEnabledRef.current) {
-        await invokeTauriCommand('finish_tts_playback', { playbackId })
-        return
-      }
-      ttsPlaybackIdRef.current = playbackId
-      setTtsPlaying(true)
-      commandPending = true
-      setPendingTtsCommands((count) => count + 1)
-      cuePlayerRef.current.stop()
-      const payload = await invokeTauriCommand('speak_local_tts', {
-        text: speechText,
-        playbackId,
-      })
-      voiceTelemetry.record('tts_playback_completed')
-      if (generation !== ttsGenerationRef.current || !ttsEnabledRef.current) return
-
-      if (
-        !isRecord(payload) ||
-        typeof payload['duration_ms'] !== 'number' ||
-        payload['duration_ms'] < 0 ||
-        !Number.isFinite(payload['duration_ms'])
-      ) {
-        throw new Error('TTS synthesis payload is invalid')
-      }
-    } catch (error) {
-      if (generation !== ttsGenerationRef.current) return
-      const message = toDisplayErrorMessage(error)
-
-      addNotice({
-        tone: 'error',
-        title: 'TTS playback failed',
-        message,
-      })
-      recordRuntimeDiagnostic('tts', `TTS error: ${message}`)
-    } finally {
-      if (commandPending) {
-        setPendingTtsCommands((count) => Math.max(0, count - 1))
-      }
-      if (playbackId !== null && ttsPlaybackIdRef.current === playbackId) {
-        ttsPlaybackIdRef.current = null
-        setTtsPlaying(false)
-      }
-    }
+    await session.audio.speakReply(text, {
+      ttsGeneration: ttsGenerationRef,
+      ttsEnabledRef,
+      voiceTelemetry,
+      reservePlaybackId: () => invokeTauriCommand('reserve_local_tts_playback_id'),
+      finishPlayback: (playbackId) => invokeTauriCommand('finish_tts_playback', { playbackId }),
+      speakTts: (speechText, playbackId) => invokeTauriCommand('speak_local_tts', { text: speechText, playbackId }),
+      parseRequestId: (val, ctx) => parseNativeAudioRequestId(val, ctx),
+      toDisplayErrorMessage,
+      addNotice,
+      recordDiagnostic: (category, message) => recordRuntimeDiagnostic(category as RuntimeDiagnosticKind, message),
+      setPlaying: setTtsPlaying,
+      setPendingCount: setPendingTtsCommands,
+    })
   }
 
   const maybeRunVoiceTranscript = (
@@ -3283,11 +3244,12 @@ const SessionToolbar = memo(function SessionToolbar({ session, view }: SessionVi
     snapshotControlsFresh,
     promptState, resetPending,
     headerBusy,
+    supportsDesktopRuntime, ttsPlaying, ttsEnabled, canToggleTts,
   } = usePresentation(session, view, 'toolbar')
   const { settingsOpen, settingsButtonRef, openSettings } = view.navigation
   const {
     resetSession,
-    setVoiceNotesOpen, selectAndroidConversation,
+    setVoiceNotesOpen, selectAndroidConversation, toggleTts,
   } = view.actions
   const notesControl = <button type="button" className="shell__control shell__icon-control" aria-label={voiceNotesOpen ? 'Chat' : 'Voice notes'} title={voiceNotesOpen ? 'Chat' : 'Voice notes'} aria-pressed={voiceNotesOpen} onClick={() => setVoiceNotesOpen((open) => !open)}>
     <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 3h10l4 4v14H5z M15 3v5h4 M8 12h8 M8 16h6" /></svg>
@@ -3308,6 +3270,22 @@ const SessionToolbar = memo(function SessionToolbar({ session, view }: SessionVi
     {isAndroidRuntime ? <ControlIcon kind="settings" /> : '⚙'}
     <span className="shell__overflow-label" aria-hidden="true">Settings</span>
   </button>
+  const desktopSpeakerState: import('./components/ControlIcon').ControlIconState = ttsPlaying ? 'speaking' : ttsEnabled ? 'ready' : canToggleTts ? 'off' : 'unavailable'
+  const desktopSpeakerDescription = ttsPlaying ? 'Speaking…' : ttsEnabled ? 'Speak replies enabled' : canToggleTts ? 'Speak replies off' : 'Speech output is unavailable'
+  const desktopSpeakerControl = supportsDesktopRuntime ? (
+    <button
+      type="button"
+      className="shell__control shell__icon-control"
+      aria-label="Speak replies"
+      title={`Speak replies: ${desktopSpeakerDescription}`}
+      aria-pressed={ttsEnabled}
+      disabled={!canToggleTts && !ttsEnabled}
+      onClick={() => void toggleTts(!ttsEnabled)}
+    >
+      <ControlIcon kind="speaker" state={desktopSpeakerState} />
+      <span className="shell__overflow-label" aria-hidden="true">Speak replies</span>
+    </button>
+  ) : null
 
   return (
       <header className="shell__header" aria-label="VoxGolem">
@@ -3322,7 +3300,7 @@ const SessionToolbar = memo(function SessionToolbar({ session, view }: SessionVi
             {!voiceNotesOpen ? <AndroidVoiceSecondaryControls /> : null}
             {!voiceNotesOpen ? notesControl : newChatControl}{settingsControl}
           </PhoneActionOverflow></> : null}
-          {!isAndroidRuntime ? settingsControl : null}
+          {!isAndroidRuntime ? <>{desktopSpeakerControl}{settingsControl}</> : null}
         </div>
       </header>
   )
@@ -3491,7 +3469,7 @@ const SessionSettings = memo(function SessionSettings({ session, view }: Session
                 <p className="settings-panel__hint settings-panel__mic-name">{selectedAudioInputDevice.label}</p>
               )}
            </div> : null}
-            {supportsDesktopRuntime ? <><div className="settings-panel__row">
+            {supportsDesktopRuntime ? <div className="settings-panel__row">
               <div>
                 <strong>Voice input</strong>
                 <p className="settings-panel__hint">Stop listening automatically after silence.</p>
@@ -3507,8 +3485,8 @@ const SessionSettings = memo(function SessionSettings({ session, view }: Session
                 <span>Auto Stop</span>
               </label>
               {!voiceInputReady(startupState) ? <span id="voice-input-help" className="sr-only">{voiceInputUnavailableReason}</span> : null}
-            </div>
-            <div className="settings-panel__row">
+            </div> : null}
+            {supportsDesktopRuntime || isAndroidRuntime ? <div className="settings-panel__row">
               <div>
                 <strong>Speech output</strong>
                 <p className="settings-panel__hint">Read assistant responses aloud.</p>
@@ -3517,13 +3495,13 @@ const SessionSettings = memo(function SessionSettings({ session, view }: Session
                 <input
                   id="tts-toggle"
                   type="checkbox"
-                  checked={ttsEnabled}
-                  disabled={!canToggleTts}
-                  onChange={(event) => { void toggleTts(event.target.checked) }}
+                  checked={isAndroidRuntime ? (androidVoiceStatus?.ttsEnabled ?? ttsEnabled) : ttsEnabled}
+                  disabled={isAndroidRuntime ? (view.voice.pending || (androidVoiceStatus?.ttsEnabled !== true && (instantControlsDisabled || androidVoiceStatus?.ttsAvailable !== true))) : !canToggleTts}
+                  onChange={isAndroidRuntime ? () => view.voice.toggleSpeech() : (event) => { void toggleTts(event.target.checked) }}
                 />
                 <span>TTS</span>
               </label>
-            </div></> : null}
+            </div> : null}
             {isAndroidRuntime || supportsDesktopRuntime ? <SpeechSettings android={isAndroidRuntime} androidStatus={androidVoiceStatus} statusError={androidSpeechStatusError} startupState={startupState}
               speechNetworkFallback={assistantSettings.speechNetworkFallback} speechSelection={assistantSettings} disabled={instantControlsDisabled}
               onSpeechSelectionChange={patchAssistantSettings}
@@ -3680,10 +3658,6 @@ function toDisplayErrorMessage(error: unknown): string {
   }
 
   return String(error)
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null
 }
 
 function parseNativeAudioRequestId(payload: unknown, label: string): number {

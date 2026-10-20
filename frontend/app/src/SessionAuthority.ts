@@ -108,7 +108,7 @@ const VIEW_KEYS = {
     'snapshotHydrationState', 'snapshotControlsFresh', 'snapshotControlsInvalidated', 'snapshotModelOptions',
     'androidAssistant', 'androidConversationId', 'androidVoiceActive',
     'voiceNotesOpen', 'promptState', 'promptActivity', 'resetPending', 'isSwitchingResponseProfile',
-    'micStarting', 'micActive', 'headPagePending', 'shortcutStaging', 'uiTheme'],
+    'micStarting', 'micActive', 'headPagePending', 'shortcutStaging', 'uiTheme', 'ttsEnabled', 'ttsPlaying'],
   composer: ['startupState', 'runtimeStatus', 'assistantSettings', 'assistantSettingsPending',
     'assistantSettingsLoadError', 'snapshotControlsFresh', 'snapshotModelOptions',
     'composerValue', 'partialTranscript', 'typedCompletionSuffix', 'voiceCompletionSuffix',

@@ -89,4 +89,70 @@ describe('prompt terminal presentation and speech', () => {
       Reflect.deleteProperty(window, '__voxSmoke')
     }
   })
+
+  it('toggles TTS from the desktop header speaker button and speaks only the first paragraph during live streaming', async () => {
+    const container = document.createElement('div'); document.body.append(container)
+    const root = createRoot(container)
+    let finish!: (value: unknown) => void
+    let streamChannel: ((value: unknown) => void) | undefined
+    let requestId = ''
+    let transcript: Record<string, unknown>[] = []
+    let ttsEnabled = false
+    const spokenTexts: string[] = []
+    const invoke = vi.fn(async (command: string, args?: unknown): Promise<unknown> => {
+      if (command === 'set_native_audio_active') return null
+      if (command === 'get_startup_state') return readyStartupState({ voice_input_available: false, tts_enabled: false, prompt_cancellation_available: true })
+      if (command === 'get_app_snapshot') return appSnapshot(transcript, { tts_enabled: ttsEnabled })
+      if (command === 'get_assistant_settings') return defaultAssistantSettings()
+      if (command === 'set_tts_enabled') { ttsEnabled = (args as { enabled: boolean }).enabled; return { enabled: ttsEnabled } }
+      if (command === 'submit_prompt') {
+        requestId = (args as { requestId: string }).requestId
+        streamChannel = (args as { updates?: { send: (value: unknown) => void } }).updates?.send
+        return new Promise((resolve) => { finish = resolve })
+      }
+      if (command === 'reserve_local_tts_playback_id') return 55
+      if (command === 'speak_local_tts') {
+        spokenTexts.push((args as { text: string }).text)
+        return { duration_ms: 1 }
+      }
+      if (command === 'get_ui_theme') return { theme: 'dark' }
+      if (command === 'get_ui_text_size') return { size: 'medium' }
+      if (command === 'get_update_snapshot') return { revision: 1, phase: 'up_to_date', operation: null, current_version: 'synthetic-version', version: null, notes: null, progress_phase: null, downloaded_bytes: 0, total_bytes: null, error: null, reason: null, auto_download_enabled: false, auto_install_enabled: false }
+      if (command === 'get_wake_clip_settings') return { enabled: false, directory: '/tmp/synthetic-clips' }
+      if (command === 'list_wake_clips') return []
+      if (command === 'list_audio_input_devices') return []
+      if (['cancel_local_tts_playback', 'finish_tts_playback', 'record_frontend_runtime_diagnostic', 'write_runtime_log', 'check_for_update'].includes(command)) return null
+      throw new Error(`Unexpected fixture command: ${command}`)
+    })
+    window.__TAURI_INTERNALS__ = { invoke, createChannel: <T,>(send: (value: T) => void) => ({ send }) }
+    try {
+      await act(async () => { root.render(<App />) })
+      const speakerButton = container.querySelector<HTMLButtonElement>('button[aria-label="Speak replies"]')!
+      expect(speakerButton).not.toBeNull()
+      expect(speakerButton.getAttribute('aria-pressed')).toBe('false')
+      await act(async () => { speakerButton.click() })
+      expect(ttsEnabled).toBe(true)
+      expect(speakerButton.getAttribute('aria-pressed')).toBe('true')
+
+      const composer = container.querySelector<HTMLTextAreaElement>('#promptComposer')!
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(composer, 'Synthetic streaming question')
+        composer.dispatchEvent(new Event('input', { bubbles: true }))
+      })
+      const send = container.querySelector<HTMLButtonElement>('button[type="submit"]')!
+      await act(async () => { send.click() })
+      expect(requestId).not.toBe('')
+
+      await act(async () => {
+        streamChannel?.({ kind: 'text', text: 'First paragraph spoken lead.\n\nSecond paragraph detailed context.' })
+      })
+      expect(spokenTexts).toEqual(['First paragraph spoken lead.'])
+
+      transcript = [canonicalTurn('1', '2', 'Synthetic streaming question', 'First paragraph spoken lead.\n\nSecond paragraph detailed context.', requestId)]
+      await act(async () => { finish({ request_id: requestId, outcome: 'completed', runtime_phase: 'sleeping' }) })
+      expect(spokenTexts).toEqual(['First paragraph spoken lead.'])
+    } finally {
+      await act(async () => { root.unmount() }); container.remove()
+    }
+  })
 })
