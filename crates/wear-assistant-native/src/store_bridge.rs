@@ -5,9 +5,11 @@ use jni::sys::{jlong, jstring};
 use jni::JNIEnv;
 use serde::Deserialize;
 use serde_json::value::RawValue;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 use voxgolem_conversation_store::{codec, Error, Store};
 use voxgolem_core::conversation_sync::Receipt;
 use voxgolem_core::durable_conversation::{
@@ -15,6 +17,115 @@ use voxgolem_core::durable_conversation::{
 };
 
 type SharedStore = Arc<Mutex<Store>>;
+#[derive(Default, serde::Serialize)]
+struct Metric {
+    count: u64,
+    total_ns: u64,
+    max_ns: u64,
+}
+thread_local! {
+    static METRICS: RefCell<Option<BTreeMap<&'static str, Metric>>> = const { RefCell::new(None) };
+}
+fn measured<T>(phase: &'static str, action: impl FnOnce() -> T) -> T {
+    if !METRICS.with(|metrics| metrics.borrow().is_some()) {
+        return action();
+    }
+    let start = Instant::now();
+    let result = action();
+    let ns = start.elapsed().as_nanos().min(i64::MAX as u128) as u64;
+    METRICS.with(|metrics| {
+        if let Some(metrics) = metrics.borrow_mut().as_mut() {
+            let metric = metrics.entry(phase).or_default();
+            metric.count = metric.count.saturating_add(1).min(1_000_000);
+            metric.total_ns = metric.total_ns.saturating_add(ns).min(i64::MAX as u64);
+            metric.max_ns = metric.max_ns.max(ns);
+        }
+    });
+    result
+}
+fn profiled(action: impl FnOnce() -> String) -> String {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            METRICS.with(|m| {
+                m.borrow_mut().take();
+            });
+        }
+    }
+    METRICS.with(|metrics| *metrics.borrow_mut() = Some(BTreeMap::new()));
+    let _reset = Reset;
+    let (output, summary) = voxgolem_conversation_store::timing::capture(true, action);
+    let mut summary = match summary.and_then(|s| serde_json::to_value(s).ok()) {
+        Some(summary) => summary,
+        None => return output,
+    };
+    METRICS.with(|metrics| {
+        if let Some(target) = summary["metrics"].as_object_mut() {
+            if let Some(metrics) = metrics.borrow().as_ref() {
+                for (key, metric) in metrics {
+                    let prior = target.get(*key);
+                    let count = prior
+                        .and_then(|m| m["count"].as_u64())
+                        .unwrap_or(0)
+                        .saturating_add(metric.count);
+                    let total_ns = prior
+                        .and_then(|m| m["total_ns"].as_u64())
+                        .unwrap_or(0)
+                        .saturating_add(metric.total_ns);
+                    let max_ns = prior
+                        .and_then(|m| m["max_ns"].as_u64())
+                        .unwrap_or(0)
+                        .max(metric.max_ns);
+                    target.insert(
+                        (*key).into(),
+                        serde_json::json!({"count":count,"total_ns":total_ns,"max_ns":max_ns}),
+                    );
+                }
+            }
+        }
+    });
+    if let Some(metrics) = summary["metrics"].as_object_mut() {
+        metrics.retain(|_, metric| {
+            metric["count"].as_u64().is_some_and(|count| {
+                count > 0
+                    || (metric["total_ns"].as_u64() == Some(0)
+                        && metric["max_ns"].as_u64() == Some(0))
+            })
+        });
+        for metric in metrics.values_mut() {
+            for (key, limit) in [
+                ("count", 1_000_000),
+                ("total_ns", i64::MAX as u64),
+                ("max_ns", i64::MAX as u64),
+            ] {
+                if let Some(value) = metric[key].as_u64() {
+                    metric[key] = value.min(limit).into();
+                }
+            }
+        }
+    }
+    attach_summary(output, summary)
+}
+fn attach_summary(output: String, summary: serde_json::Value) -> String {
+    // Preserve the original envelope bytes and error/value contracts; omit diagnostics at the limit.
+    let Ok(summary) = serde_json::to_string(&summary) else {
+        return output;
+    };
+    let addition = format!(",\"storageTiming\":{summary}}}");
+    if !output.ends_with('}')
+        || output
+            .len()
+            .saturating_sub(1)
+            .saturating_add(addition.len())
+            > domain::MAX_GATEWAY_BYTES
+    {
+        return output;
+    }
+    let mut output = output;
+    output.pop();
+    output.push_str(&addition);
+    output
+}
 #[derive(Default)]
 struct Handles {
     next: i64,
@@ -143,8 +254,10 @@ impl Request {
     }
 }
 fn parse<T: serde::de::DeserializeOwned>(field: &Field) -> Result<T, Error> {
-    serde_json::from_str(raw(field)?)
-        .map_err(|_| Error::Domain(codec::invalid("store_request_json")))
+    let raw = raw(field)?;
+    measured("native_request_decode", || {
+        serde_json::from_str(raw).map_err(|_| Error::Domain(codec::invalid("store_request_json")))
+    })
 }
 fn raw(field: &Field) -> Result<&str, Error> {
     field
@@ -160,13 +273,14 @@ fn execute(store: &mut Store, raw: &str) -> Result<String, Error> {
     if raw.len() > domain::MAX_GATEWAY_BYTES {
         return Err(codec::limit("native_request_bytes").into());
     }
-    let request: Request =
-        serde_json::from_str(raw).map_err(|_| codec::invalid("store_request_json"))?;
+    let request: Request = measured("native_request_decode", || {
+        serde_json::from_str(raw).map_err(|_| codec::invalid("store_request_json"))
+    })?;
     request.validate_shape()?;
-    match request.kind {
+    measured("native_dispatch", || match request.kind {
         Kind::Read => {
             let input = self::raw(&request.request)?;
-            store.read(|core| domain::read_owned(core, input))
+            store.read_owned(input)
         }
         Kind::Snapshot => success(store.snapshot()?),
         Kind::Revision => success(store.revision()?),
@@ -272,7 +386,7 @@ fn execute(store: &mut Store, raw: &str) -> Result<String, Error> {
             )?;
             success(true)
         }
-    }
+    })
 }
 fn failure(error: Error) -> String {
     domain::failure(match error {
@@ -282,6 +396,23 @@ fn failure(error: Error) -> String {
     })
 }
 
+fn open_store(env: &mut JNIEnv<'_>, path: &JString<'_>) -> Result<i64, Error> {
+    let path = measured("native_input_decode", || {
+        crate::read_string(env, path, 4096)
+    })
+    .map_err(|_| Error::Storage)?;
+    let store = measured("native_dispatch", || Store::open(Path::new(&path)))?;
+    let mut registry =
+        measured("native_registry_wait", || handles().lock()).map_err(|_| Error::Storage)?;
+    if registry.stores.len() >= 32 {
+        return Err(Error::Domain(codec::limit("store_handles")));
+    }
+    registry.next = registry.next.checked_add(1).ok_or(Error::Storage)?;
+    let handle = registry.next;
+    registry.stores.insert(handle, Arc::new(Mutex::new(store)));
+    Ok(handle)
+}
+
 #[allow(unsafe_code)]
 #[no_mangle]
 pub extern "system" fn Java_dev_gitblame_voxgolem_assistant_AssistantStoreNative_open(
@@ -289,19 +420,9 @@ pub extern "system" fn Java_dev_gitblame_voxgolem_assistant_AssistantStoreNative
     _receiver: JObject<'_>,
     path: JString<'_>,
 ) -> jlong {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let path = crate::read_string(&mut env, &path, 4096).map_err(|_| Error::Storage)?;
-        let store = Store::open(Path::new(&path))?;
-        let mut registry = handles().lock().map_err(|_| Error::Storage)?;
-        if registry.stores.len() >= 32 {
-            return Err(Error::Domain(codec::limit("store_handles")));
-        }
-        registry.next = registry.next.checked_add(1).ok_or(Error::Storage)?;
-        let handle = registry.next;
-        registry.stores.insert(handle, Arc::new(Mutex::new(store)));
-        Ok(handle)
-    }))
-    .unwrap_or(Err(Error::Storage));
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| open_store(&mut env, &path)))
+            .unwrap_or(Err(Error::Storage));
     crate::clear_exception(&env);
     match result {
         Ok(handle) => handle,
@@ -317,27 +438,77 @@ pub extern "system" fn Java_dev_gitblame_voxgolem_assistant_AssistantStoreNative
 
 #[allow(unsafe_code)]
 #[no_mangle]
-pub extern "system" fn Java_dev_gitblame_voxgolem_assistant_AssistantStoreNative_execute(
+pub extern "system" fn Java_dev_gitblame_voxgolem_assistant_AssistantStoreNative_openProfiled(
     mut env: JNIEnv<'_>,
+    _receiver: JObject<'_>,
+    path: JString<'_>,
+) -> jstring {
+    let output = profiled(|| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            open_store(&mut env, &path).and_then(success)
+        }))
+        .unwrap_or(Err(Error::Storage))
+        .unwrap_or_else(failure)
+    });
+    crate::clear_exception(&env);
+    env.new_string(output)
+        .map(JString::into_raw)
+        .unwrap_or(std::ptr::null_mut())
+}
+
+#[allow(unsafe_code)]
+#[no_mangle]
+pub extern "system" fn Java_dev_gitblame_voxgolem_assistant_AssistantStoreNative_execute(
+    env: JNIEnv<'_>,
     _receiver: JObject<'_>,
     handle: jlong,
     request: JString<'_>,
 ) -> jstring {
-    let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let input = crate::read_string(&mut env, &request, domain::MAX_GATEWAY_BYTES)
+    execute_jni(env, handle, request, false)
+}
+
+#[allow(unsafe_code)]
+#[no_mangle]
+pub extern "system" fn Java_dev_gitblame_voxgolem_assistant_AssistantStoreNative_executeProfiled(
+    env: JNIEnv<'_>,
+    _receiver: JObject<'_>,
+    handle: jlong,
+    request: JString<'_>,
+) -> jstring {
+    execute_jni(env, handle, request, true)
+}
+
+fn execute_jni(
+    mut env: JNIEnv<'_>,
+    handle: jlong,
+    request: JString<'_>,
+    profiling: bool,
+) -> jstring {
+    let mut action = || {
+        let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let input = measured("native_input_decode", || {
+                crate::read_string(&mut env, &request, domain::MAX_GATEWAY_BYTES)
+            })
             .map_err(|_| Error::Domain(codec::limit("native_request_bytes")))?;
-        let store = handles()
-            .lock()
-            .map_err(|_| Error::Storage)?
-            .stores
-            .get(&handle)
-            .cloned()
-            .ok_or(Error::Closed)?;
-        let mut store = store.lock().map_err(|_| Error::Storage)?;
-        execute(&mut store, &input)
-    }))
-    .unwrap_or(Err(Error::Storage))
-    .unwrap_or_else(failure);
+            let store = measured("native_registry_wait", || handles().lock())
+                .map_err(|_| Error::Storage)?
+                .stores
+                .get(&handle)
+                .cloned()
+                .ok_or(Error::Closed)?;
+            let mut store =
+                measured("native_store_wait", || store.lock()).map_err(|_| Error::Storage)?;
+            execute(&mut store, &input)
+        }))
+        .unwrap_or(Err(Error::Storage))
+        .unwrap_or_else(failure);
+        output
+    };
+    let output = if profiling {
+        profiled(action)
+    } else {
+        action()
+    };
     crate::clear_exception(&env);
     env.new_string(output)
         .map(JString::into_raw)
@@ -365,6 +536,80 @@ pub extern "system" fn Java_dev_gitblame_voxgolem_assistant_AssistantStoreNative
 mod tests {
     use super::*;
     #[test]
+    fn profiled_envelope_preserves_values_and_explicit_portable_zero_metrics() {
+        let ordinary = success(serde_json::json!({"synthetic": "ordinary value"})).unwrap();
+        assert!(!ordinary.contains("storageTiming"));
+        let output = profiled(|| {
+            measured("native_dispatch", || {
+                success(serde_json::json!({"synthetic": "ordinary value"})).unwrap()
+            })
+        });
+        let mut value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let summary = value
+            .as_object_mut()
+            .unwrap()
+            .remove("storageTiming")
+            .unwrap();
+        assert_eq!(
+            value,
+            serde_json::from_str::<serde_json::Value>(&ordinary).unwrap()
+        );
+        assert_eq!(summary["schema"], 1);
+        assert_eq!(summary["metrics"]["native_dispatch"]["count"], 1);
+        assert_eq!(summary["metrics"]["native_response_encode"]["count"], 1);
+        assert_eq!(
+            summary["metrics"]["sqlite_read"],
+            serde_json::json!({"count":0,"total_ns":0,"max_ns":0})
+        );
+        assert_eq!(
+            summary["metrics"]["refresh_reload"],
+            serde_json::json!({"count":0,"total_ns":0,"max_ns":0})
+        );
+        assert!(summary["metrics"].get("native_store_wait").is_none());
+        assert!(!summary.to_string().contains("ordinary value"));
+        assert!(output.len() < 2048);
+    }
+
+    #[test]
+    fn optional_summary_never_breaks_envelope_limit() {
+        let ordinary = format!(
+            "{{\"value\":\"{}\"}}",
+            "x".repeat(domain::MAX_GATEWAY_BYTES - 12)
+        );
+        assert!(ordinary.len() <= domain::MAX_GATEWAY_BYTES);
+        assert_eq!(
+            attach_summary(
+                ordinary.clone(),
+                serde_json::json!({"schema":1,"metrics":{}})
+            ),
+            ordinary
+        );
+    }
+
+    #[test]
+    fn profiled_failures_are_categorical_and_collector_retires() {
+        let output = profiled(|| {
+            measured("native_request_decode", || {
+                failure(codec::invalid("store_request_json").into())
+            })
+        });
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(
+            value["storageTiming"]["metrics"]["native_request_decode"]["count"],
+            1
+        );
+        assert!(METRICS.with(|m| m.borrow().is_none()));
+        let _ = std::panic::catch_unwind(|| profiled(|| panic!("synthetic panic")));
+        assert!(METRICS.with(|m| m.borrow().is_none()));
+        let next = profiled(|| success(true).unwrap());
+        let next: serde_json::Value = serde_json::from_str(&next).unwrap();
+        assert_eq!(
+            next["storageTiming"]["metrics"]["native_request_decode"]["count"],
+            0
+        );
+    }
+    #[test]
     fn owned_envelopes_preserve_raw_records_and_do_not_require_snapshot_roundtrips() {
         let root = std::path::PathBuf::from("/tmp/opencode")
             .join(format!("synthetic-owned-envelope-{}", std::process::id()));
@@ -380,6 +625,59 @@ mod tests {
         let view: serde_json::Value = serde_json::from_str(&view).unwrap();
         assert_eq!(view["value"]["conversations"].as_array().unwrap().len(), 1);
         assert_eq!(view["value"]["conversation_count"], 1);
+        for input in [
+            r#"{"kind":"read","request":{"kind":"view"}}"#,
+            r#"{"kind":"read","request":{"kind":"projection","request":{"conversation":null,"selected_head":null,"local_work_in_flight":false,"read":null}}}"#,
+            r#"{"kind":"read","request":{"kind":"context","request":{"expected_revision":"1","conversation":{"replica":"00000000-0000-4000-8000-000000000001","sequence":"1"},"selected_head":null,"max_turns":20,"max_text_bytes":4096}}}"#,
+        ] {
+            let ordinary = execute(&mut store, input).unwrap();
+            let output = profiled(|| execute(&mut store, input).unwrap());
+            let mut value: serde_json::Value = serde_json::from_str(&output).unwrap();
+            let summary = value
+                .as_object_mut()
+                .unwrap()
+                .remove("storageTiming")
+                .unwrap();
+            assert_eq!(
+                value,
+                serde_json::from_str::<serde_json::Value>(&ordinary).unwrap()
+            );
+            let metrics = &summary["metrics"];
+            assert_eq!(
+                metrics["native_request_decode"]["count"],
+                if input.contains("projection") || input.contains("context") {
+                    3
+                } else {
+                    2
+                }
+            );
+            assert_eq!(metrics["native_response_encode"]["count"], 1);
+            assert_eq!(metrics["projection"]["count"], 1);
+            assert_eq!(metrics["sqlite_commit"]["count"], 1);
+        }
+        let completed = serde_json::json!({
+            "kind":"complete", "completion": {
+                "kind":"turn_completed",
+                "conversation":record.operation.id,
+                "parent":null, "request":store.allocate_id().unwrap(),
+                "prompt":"Synthetic prompt", "answer":{"kind":"text","text":"Synthetic answer"},
+                "sources":[], "terminal_stage":"instant",
+                "provenance":{"requested_model":"synthetic-model","returned_model":null,
+                    "policy_id":"synthetic-policy","policy_version":"1",
+                    "instruction_profile_id":"synthetic-profile","instruction_profile_version":"1","context":[]}
+            }
+        }).to_string();
+        let output = profiled(|| execute(&mut store, &completed).unwrap());
+        let output: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(output["ok"], true);
+        assert_eq!(
+            output["storageTiming"]["metrics"]["native_request_decode"]["count"],
+            2
+        );
+        assert_eq!(
+            output["storageTiming"]["metrics"]["native_response_encode"]["count"],
+            1
+        );
         assert!(!view["value"].as_object().unwrap().contains_key("records"));
         assert!(!view["value"]
             .as_object()

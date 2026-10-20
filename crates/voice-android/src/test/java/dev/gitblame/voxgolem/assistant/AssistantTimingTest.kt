@@ -41,6 +41,46 @@ class AssistantTimingTest {
         assertTrue(timing.isFinished)
     }
 
+    @Test fun storageScopesRestoreOnFailureDoNotDeduplicateAndFlushAfterExit() {
+        val records = mutableListOf<Pair<Int, Int>>()
+        var dropped = 0L
+        var inside = false
+        val sink = object : AssistantTiming.StorageSink {
+            override fun emit(event: AssistantTiming.Event) {}
+            override fun emitStorage(run: Int, parentRun: Int, observedNanos: Long, summary: AssistantDiagnosticJournal.Storage) {
+                assertFalse(inside)
+                records += run to parentRun
+            }
+            override fun storageDropped(count: Long) { dropped += count }
+        }
+        val timing = AssistantTiming.begin(context, Operation.GENERATION, { 123L }, sink)
+        val summary = AssistantDiagnosticJournal.Storage(AssistantDiagnosticJournal.StorageCall.PROJECTION,
+            AssistantDiagnosticJournal.StorageOutcome.OK, mapOf("store_total" to AssistantDiagnosticJournal.Metric(1, 10, 10)))
+        assertFalse(AssistantTiming.storageEnabled())
+        assertThrows(IllegalStateException::class.java) {
+            timing.scoped {
+                inside = true
+                try {
+                    assertTrue(AssistantTiming.storageEnabled())
+                    repeat(260) { AssistantTiming.storage(summary) }
+                    assertTrue(records.isEmpty())
+                    error("Synthetic failure")
+                } finally { inside = false }
+            }
+        }
+        assertFalse(AssistantTiming.storageEnabled())
+        assertEquals(256, records.size)
+        assertEquals(256, records.map { it.first }.toSet().size)
+        assertTrue(records.all { it.second == timing.run })
+        assertEquals(4L, dropped)
+        val disabled = AssistantTiming.begin(null, Operation.GENERATION, { error("Disabled clock") }, sink)
+        timing.scoped {
+            disabled.scoped { assertFalse(AssistantTiming.storageEnabled()); AssistantTiming.storage(summary) }
+            assertTrue(AssistantTiming.storageEnabled())
+        }
+        assertEquals(256, records.size)
+    }
+
     @Test fun fixedVocabularyBoundsRepeatedEmission() {
         val events = mutableListOf<AssistantTiming.Event>()
         val timing = AssistantTiming.begin(context, Operation.PREPARATION, sink = AssistantTiming.Sink { events += it })

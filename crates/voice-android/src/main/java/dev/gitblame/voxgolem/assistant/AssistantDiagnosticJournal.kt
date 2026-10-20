@@ -41,8 +41,15 @@ class AssistantDiagnosticJournal(
         val firstTextMs: Long? = null,
         val completedMs: Long? = null,
     )
+    data class Metric(val count: Long, val totalNs: Long, val maxNs: Long)
+    enum class StorageCall { PROJECTION, CONTEXT, COMPLETE, SELECT, SAVE_DRAFT, ALLOCATE_ID, LOCAL_STATE, DRAFT,
+        CREATE_CONVERSATION, READ, SNAPSHOT, REPLICA, CONVERSATIONS, HEADS, COMMIT, PROJECTION_STILL_CURRENT,
+        PUBLICATIONS, RECEIPTS_TO_PUBLISH, ACKNOWLEDGE, CLOSE, OTHER }
+    enum class StorageOutcome { OK, ERROR }
+    data class Storage(val call: StorageCall, val outcome: StorageOutcome, val metrics: Map<String, Metric>)
     private data class Record(val operation: AssistantTiming.Operation, val run: Int, val parent: Int?,
-        val observed: Long, val event: AssistantTiming.Event? = null, val metadata: Metadata? = null)
+        val observed: Long, val event: AssistantTiming.Event? = null, val metadata: Metadata? = null,
+        val storage: Storage? = null)
     private val queue = ConcurrentLinkedQueue<Record>()
     private val queued = AtomicInteger()
     private val scheduled = AtomicBoolean()
@@ -67,6 +74,15 @@ class AssistantDiagnosticJournal(
         event.observedNanos, event = event))
 
     fun isIdle(): Boolean = queued.get() == 0 && !scheduled.get()
+    fun storageDropped(count: Long) { if (count in 1..1_000_000L) dropped.addAndGet(count) }
+
+    fun offerStorage(run: Int, parentRun: Int, observedNanos: Long, summary: Storage) {
+        if (summary.metrics.size > STORAGE_PHASES.size) { dropped.incrementAndGet(); return }
+        val safe = summary.copy(metrics = summary.metrics.filter { (key, metric) -> key in STORAGE_PHASES &&
+            metric.count in 0..1_000_000L && metric.totalNs >= 0 && metric.maxNs in 0..metric.totalNs &&
+            (metric.count > 0 || (metric.totalNs == 0L && metric.maxNs == 0L)) })
+        enqueue(Record(AssistantTiming.Operation.STORAGE, run, parentRun, observedNanos, storage = safe))
+    }
 
     fun offerMetadata(operation: AssistantTiming.Operation, run: Int, parentRun: Int?, observedNanos: Long,
         metadata: Metadata) {
@@ -246,10 +262,22 @@ class AssistantDiagnosticJournal(
             // Android SpeechRecognizer errors 1..15; TextToSpeech errors -1..-9, success 0.
             value("sdkError", it.sdkError?.takeIf { n -> n in -9..15 })
         }
+        record.storage?.let { storage ->
+            value("kind", "STORAGE")
+            value("call", storage.call.name.lowercase(Locale.ROOT))
+            value("outcome", storage.outcome.name.lowercase(Locale.ROOT))
+            fields += "\"metrics\":" + storage.metrics.entries.joinToString(",", "{", "}") { (key, metric) ->
+                "\"$key\":{\"count\":${metric.count},\"total_ns\":${metric.totalNs},\"max_ns\":${metric.maxNs}}"
+            }
+        }
         return fields.joinToString(",", "{", "}\n")
     }
 
     companion object {
+        val STORAGE_PHASES = setOf("sqlite_begin", "sqlite_read", "sqlite_write", "sqlite_commit", "sqlite_prepare",
+            "record_encode", "record_decode", "reducer", "projection", "refresh_reload", "quota_check", "final_notify",
+            "store_lock_wait", "store_total", "kotlin_request_encode", "kotlin_response_decode", "jni_execute", "native_open",
+            "native_input_decode", "native_registry_wait", "native_store_wait", "native_request_decode", "native_dispatch", "native_response_encode")
         private val FILE_NAME = Regex("assistant-timing-(0|[1-9][0-9]{0,18})-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-[1-9][0-9]*\\.jsonl")
         private val VOICE = Regex("[a-z]{2,3}-[a-z]{2}(?:-x-[a-z]{3}-(?:local|network)|-language)")
         private val LANGUAGE = Regex("[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*")

@@ -2,6 +2,8 @@
 //! The reducer is pinned to the same database revision, never independently writable.
 pub mod codec;
 pub mod gateway;
+pub mod timing;
+use timing::{ConnectionTiming, StatementTiming, TransactionTiming};
 
 use codec::{encode, invalid, limit};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -180,24 +182,26 @@ impl Store {
                 .map_err(|_| Error::Storage)?;
         }
         db.busy_timeout(std::time::Duration::from_secs(2))?;
-        db.execute_batch(&format!("PRAGMA page_size=4096; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON; PRAGMA foreign_keys=ON; PRAGMA journal_size_limit={MAX_WAL_BYTES}; PRAGMA wal_autocheckpoint=512;"))?;
+        db.timed_execute_batch(&format!("PRAGMA page_size=4096; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON; PRAGMA foreign_keys=ON; PRAGMA journal_size_limit={MAX_WAL_BYTES}; PRAGMA wal_autocheckpoint=512;"))?;
         let page_size: usize =
-            db.query_row("PRAGMA page_size", [], |r| r.get::<_, u32>(0))? as usize;
-        let pages: u32 = db.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+            db.timed_query_row("PRAGMA page_size", [], |r| r.get::<_, u32>(0))? as usize;
+        let pages: u32 = db.timed_query_row("PRAGMA page_count", [], |r| r.get(0))?;
         if (pages as usize).saturating_mul(page_size) > MAX_DATABASE_BYTES {
             return Err(limit("database_bytes").into());
         }
-        db.pragma_update(
-            None,
-            "max_page_count",
-            (MAX_DATABASE_BYTES / page_size) as u32,
-        )?;
+        timing::measure(timing::Phase::sqlite_write, || {
+            db.pragma_update(
+                None,
+                "max_page_count",
+                (MAX_DATABASE_BYTES / page_size) as u32,
+            )
+        })?;
         let mut db = db;
         bootstrap(&mut db)?;
-        let tx = db.transaction()?;
+        let tx = db.timed_transaction()?;
         identity(&tx)?;
         let core = load(&tx)?;
-        tx.commit()?;
+        tx.timed_commit()?;
         Ok(Self { db, core })
     }
 
@@ -206,20 +210,29 @@ impl Store {
         &mut self,
         read: impl FnOnce(&CoreStore) -> std::result::Result<T, DomainError>,
     ) -> Result<T> {
-        let tx = self.db.transaction()?;
+        let tx = self.db.timed_transaction()?;
         refresh(&tx, &mut self.core)?;
-        let result = read(&self.core)?;
-        tx.commit()?;
+        let result = timing::measure(timing::Phase::projection, || read(&self.core))?;
+        tx.timed_commit()?;
         Ok(result)
     }
     pub fn snapshot(&mut self) -> Result<StoreSnapshot> {
         self.read(|core| Ok(core.export()))
     }
+    /// Owned gateway times parsing, pure projection and encoding independently.
+    /// Serialization remains inside the read transaction, before COMMIT.
+    pub fn read_owned(&mut self, input: &str) -> Result<String> {
+        let tx = self.db.timed_transaction()?;
+        refresh(&tx, &mut self.core)?;
+        let result = gateway::read_owned(&self.core, input)?;
+        tx.timed_commit()?;
+        Ok(result)
+    }
     pub fn revision(&mut self) -> Result<String> {
         self.read(|core| Ok(core.revision().into()))
     }
     pub fn replica(&self) -> Result<String> {
-        Ok(self.db.query_row(
+        Ok(self.db.timed_query_row(
             "SELECT replica FROM history_state WHERE singleton=1",
             [],
             |r| bounded_text(r, 0, 36),
@@ -229,16 +242,16 @@ impl Store {
     pub fn allocate_id(&mut self) -> Result<OperationId> {
         let tx = self
             .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            .timed_transaction_with_behavior(TransactionBehavior::Immediate)?;
         let id = allocate_id(&tx)?;
-        tx.commit()?;
+        tx.timed_commit()?;
         Ok(id)
     }
 
     pub fn create_conversation(&mut self, title: String) -> Result<Record> {
         let tx = self
             .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            .timed_transaction_with_behavior(TransactionBehavior::Immediate)?;
         let id = allocate_id(&tx)?;
         let record = codec::record(Operation {
             version: SCHEMA_VERSION,
@@ -253,7 +266,7 @@ impl Store {
             None,
             |_| Ok(()),
         )?;
-        tx.commit()?;
+        tx.timed_commit()?;
         self.core = next;
         Ok(record)
     }
@@ -294,9 +307,9 @@ impl Store {
         let max_text_bytes = max_text_bytes.min(256 * 1024 - prompt.len());
         let tx = self
             .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            .timed_transaction_with_behavior(TransactionBehavior::Immediate)?;
         refresh(&tx, &mut self.core)?;
-        let (conversation, head): (Option<String>, Option<String>) = tx.query_row(
+        let (conversation, head): (Option<String>, Option<String>) = tx.timed_query_row(
             "SELECT conversation,selected_head FROM history_local WHERE singleton=1",
             [],
             |r| Ok((optional_text(r, 0, 256)?, optional_text(r, 1, 256)?)),
@@ -338,17 +351,19 @@ impl Store {
                     title: "Conversation".into(),
                 },
             })?;
-            let (plan, next_store) = self.core.plan_with_store(Command::Import {
-                expected_revision: self.core.revision().into(),
-                records: vec![record.clone()],
+            let (plan, next_store) = timing::measure(timing::Phase::reducer, || {
+                self.core.plan_with_store(Command::Import {
+                    expected_revision: self.core.revision().into(),
+                    records: vec![record.clone()],
+                })
             })?;
             next = Some(next_store);
             apply_plan(&tx, &self.core, &plan)?;
-            tx.execute(
+            tx.timed_execute(
                 "UPDATE history_local SET conversation=?,selected_head=NULL WHERE singleton=1",
                 [json_id(&record.operation.id)?],
             )?;
-            tx.execute(
+            tx.timed_execute(
                 "DELETE FROM history_drafts WHERE conversation_key='new' AND text=?",
                 [prompt],
             )?;
@@ -357,14 +372,16 @@ impl Store {
             id
         };
         let core = next.as_ref().unwrap_or(&self.core);
-        let context = core.select_context(ContextRequest {
-            expected_revision: core.revision().into(),
-            conversation: conversation.clone(),
-            selected_head: expected.selected_head,
-            max_turns: 20,
-            max_text_bytes,
+        let context = timing::measure(timing::Phase::projection, || {
+            core.select_context(ContextRequest {
+                expected_revision: core.revision().into(),
+                conversation: conversation.clone(),
+                selected_head: expected.selected_head,
+                max_turns: 20,
+                max_text_bytes,
+            })
         })?;
-        tx.execute("INSERT INTO history_drafts(conversation_key,text,interrupted) VALUES(?,?,1) ON CONFLICT(conversation_key) DO UPDATE SET text=excluded.text,interrupted=1 WHERE text!=excluded.text OR interrupted!=1",params![key(&conversation),prompt])?;
+        tx.timed_execute("INSERT INTO history_drafts(conversation_key,text,interrupted) VALUES(?,?,1) ON CONFLICT(conversation_key) DO UPDATE SET text=excluded.text,interrupted=1 WHERE text!=excluded.text OR interrupted!=1",params![key(&conversation),prompt])?;
         quotas(&tx)?;
         check_quota(
             &tx,
@@ -373,7 +390,7 @@ impl Store {
             MAX_LOCAL_BYTES,
             MAX_LEDGER_ROWS,
         )?;
-        tx.commit()?;
+        tx.timed_commit()?;
         if let Some(next) = next {
             self.core = next;
         }
@@ -471,7 +488,7 @@ impl Store {
     pub fn delete_conversation(&mut self, conversation: OperationId) -> Result<CommitOutcome> {
         let tx = self
             .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            .timed_transaction_with_behavior(TransactionBehavior::Immediate)?;
         let id = allocate_id(&tx)?;
         let record = codec::record(Operation {
             version: SCHEMA_VERSION,
@@ -486,7 +503,7 @@ impl Store {
             None,
             |_| Ok(()),
         )?;
-        tx.commit()?;
+        tx.timed_commit()?;
         self.core = next;
         Ok(outcome)
     }
@@ -512,7 +529,7 @@ impl Store {
         }
         let tx = self
             .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            .timed_transaction_with_behavior(TransactionBehavior::Immediate)?;
         let id = allocate_id(&tx)?;
         let record = codec::record(Operation {
             version: SCHEMA_VERSION,
@@ -527,7 +544,7 @@ impl Store {
             Some(&record.operation.id),
             |_| Ok(()),
         )?;
-        tx.commit()?;
+        tx.timed_commit()?;
         self.core = next;
         let saved = !outcome.suppressed.contains(&record.operation.id)
             && !outcome.quarantined.contains(&record.operation.id);
@@ -544,11 +561,11 @@ impl Store {
     ) -> Result<CompletedTurn> {
         let tx = self
             .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            .timed_transaction_with_behavior(TransactionBehavior::Immediate)?;
         refresh(&tx, &mut self.core)?;
 
         let (selected_conversation, selected_head): (Option<String>, Option<String>) = tx
-            .query_row(
+            .timed_query_row(
                 "SELECT conversation,selected_head FROM history_local WHERE singleton=1",
                 [],
                 |r| Ok((optional_text(r, 0, 256)?, optional_text(r, 1, 256)?)),
@@ -572,9 +589,11 @@ impl Store {
                         title: "Conversation".into(),
                     },
                 })?;
-                let (plan, next_store) = self.core.plan_with_store(Command::Import {
-                    expected_revision: self.core.revision().into(),
-                    records: vec![create_record],
+                let (plan, next_store) = timing::measure(timing::Phase::reducer, || {
+                    self.core.plan_with_store(Command::Import {
+                        expected_revision: self.core.revision().into(),
+                        records: vec![create_record],
+                    })
                 })?;
                 apply_plan(&tx, &self.core, &plan)?;
                 created_core = Some(next_store);
@@ -583,12 +602,14 @@ impl Store {
         };
 
         let working_core = created_core.as_mut().unwrap_or(&mut self.core);
-        let context = working_core.select_context(ContextRequest {
-            expected_revision: working_core.revision().into(),
-            conversation: conversation.clone(),
-            selected_head,
-            max_turns: 20,
-            max_text_bytes,
+        let context = timing::measure(timing::Phase::projection, || {
+            working_core.select_context(ContextRequest {
+                expected_revision: working_core.revision().into(),
+                conversation: conversation.clone(),
+                selected_head,
+                max_turns: 20,
+                max_text_bytes,
+            })
         })?;
 
         let request = allocate_id(&tx)?;
@@ -626,12 +647,12 @@ impl Store {
             selected_head: Some(turn_id.clone()),
             local_work_in_flight: true,
         })?;
-        tx.execute(
+        tx.timed_execute(
             "UPDATE history_local SET conversation=?,selected_head=? WHERE singleton=1",
             params![json_id(&conversation)?, json_id(&turn_id)?],
         )?;
 
-        tx.commit()?;
+        tx.timed_commit()?;
         self.core = next_core;
         let saved = !outcome.suppressed.contains(&record.operation.id)
             && !outcome.quarantined.contains(&record.operation.id);
@@ -658,7 +679,7 @@ impl Store {
     ) -> Result<CommitOutcome> {
         let tx = self
             .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            .timed_transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (outcome, next) = Self::import_within_tx_with_hook(
             &mut self.core,
             &tx,
@@ -667,7 +688,7 @@ impl Store {
             completion,
             |_| before_commit(),
         )?;
-        tx.commit()?;
+        tx.timed_commit()?;
         self.core = next; // Only advance the pinned reducer after SQLite COMMIT succeeds.
         Ok(outcome)
     }
@@ -712,19 +733,21 @@ impl Store {
         let completion_body = completion
             .and_then(|id| records.iter().find(|r| &r.operation.id == id))
             .map(|r| &r.operation.body);
-        let (plan, next) = core.plan_with_store(Command::Import {
-            expected_revision: core.revision().into(),
-            records: records.clone(),
+        let (plan, next) = timing::measure(timing::Phase::reducer, || {
+            core.plan_with_store(Command::Import {
+                expected_revision: core.revision().into(),
+                records: records.clone(),
+            })
         })?;
         apply_plan(tx, core, &plan)?;
         if receive {
-            let replica: String = tx.query_row(
+            let replica: String = tx.timed_query_row(
                 "SELECT replica FROM history_state WHERE singleton=1",
                 [],
                 |r| bounded_text(r, 0, 36),
             )?;
             for receipt in receipts_after_commit(&next, &replica, &ids)? {
-                tx.prepare_cached("INSERT OR IGNORE INTO history_receipt_outbox(operation_key,body_key,payload) VALUES(?,?,?)")?.execute(params![key(&receipt.operation),receipt.body_key,encode(&receipt, 32*1024,"receipt_bytes")?])?;
+                tx.timed_prepare_cached("INSERT OR IGNORE INTO history_receipt_outbox(operation_key,body_key,payload) VALUES(?,?,?)")?.timed_execute(params![key(&receipt.operation),receipt.body_key,encode(&receipt, 32*1024,"receipt_bytes")?])?;
             }
         }
         if let (
@@ -737,7 +760,7 @@ impl Store {
         ) = (completion, completion_body)
         {
             if !plan.suppressed.contains(id) && !plan.quarantined.contains(id) {
-                tx.execute(
+                tx.timed_execute(
                     "DELETE FROM history_drafts WHERE conversation_key=? AND text=?",
                     params![key(conversation), prompt],
                 )?;
@@ -761,7 +784,7 @@ impl Store {
     pub fn select(&mut self, selection: Selection) -> Result<()> {
         let tx = self
             .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            .timed_transaction_with_behavior(TransactionBehavior::Immediate)?;
         refresh(&tx, &mut self.core)?;
         if let Some(conversation) = &selection.conversation {
             self.core
@@ -774,22 +797,23 @@ impl Store {
         } else if selection.selected_head.is_some() {
             return Err(invalid("selection_head").into());
         }
-        tx.execute(
+        tx.timed_execute(
             "UPDATE history_local SET conversation=?,selected_head=? WHERE singleton=1",
             params![
                 selection.conversation.as_ref().map(json_id).transpose()?,
                 selection.selected_head.as_ref().map(json_id).transpose()?
             ],
         )?;
-        tx.commit()?;
+        tx.timed_commit()?;
         Ok(())
     }
     pub fn selection(&self) -> Result<Selection> {
-        let (conversation, selected_head): (Option<String>, Option<String>) = self.db.query_row(
-            "SELECT conversation,selected_head FROM history_local WHERE singleton=1",
-            [],
-            |r| Ok((optional_text(r, 0, 256)?, optional_text(r, 1, 256)?)),
-        )?;
+        let (conversation, selected_head): (Option<String>, Option<String>) =
+            self.db.timed_query_row(
+                "SELECT conversation,selected_head FROM history_local WHERE singleton=1",
+                [],
+                |r| Ok((optional_text(r, 0, 256)?, optional_text(r, 1, 256)?)),
+            )?;
         Ok(Selection {
             conversation: conversation
                 .map(|s| serde_json::from_str(&s).map_err(|_| Error::Storage))
@@ -804,9 +828,9 @@ impl Store {
         revision: &str,
         selection: &Selection,
     ) -> Result<bool> {
-        let tx = self.db.transaction()?;
+        let tx = self.db.timed_transaction()?;
         let actual = revision_of(&tx)?;
-        let (conversation, head): (Option<String>, Option<String>) = tx.query_row(
+        let (conversation, head): (Option<String>, Option<String>) = tx.timed_query_row(
             "SELECT conversation,selected_head FROM history_local WHERE singleton=1",
             [],
             |r| Ok((optional_text(r, 0, 256)?, optional_text(r, 1, 256)?)),
@@ -814,7 +838,7 @@ impl Store {
         let same = actual == revision
             && conversation == selection.conversation.as_ref().map(json_id).transpose()?
             && head == selection.selected_head.as_ref().map(json_id).transpose()?;
-        tx.commit()?;
+        tx.timed_commit()?;
         Ok(same)
     }
 
@@ -829,12 +853,12 @@ impl Store {
         }
         let tx = self
             .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            .timed_transaction_with_behavior(TransactionBehavior::Immediate)?;
         refresh(&tx, &mut self.core)?;
         if let Some(conversation) = conversation {
             conversation.validate()?;
             // Branch ambiguity must not prevent a pinned conversation draft.
-            let deleted: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM history_records WHERE conversation_key=? AND tombstone=1 AND operation_key NOT IN (SELECT operation_key FROM history_quarantine))", [key(conversation)], |r| r.get(0))?;
+            let deleted: bool = tx.timed_query_row("SELECT EXISTS(SELECT 1 FROM history_records WHERE conversation_key=? AND tombstone=1 AND operation_key NOT IN (SELECT operation_key FROM history_quarantine))", [key(conversation)], |r| r.get(0))?;
             if deleted {
                 return Err(DomainError::Deleted {
                     conversation: conversation.clone(),
@@ -842,7 +866,7 @@ impl Store {
                 .into());
             }
         }
-        tx.prepare_cached("INSERT INTO history_drafts(conversation_key,text,interrupted) VALUES(?,?,?) ON CONFLICT(conversation_key) DO UPDATE SET text=excluded.text,interrupted=excluded.interrupted WHERE text!=excluded.text OR interrupted!=excluded.interrupted")?.execute(params![draft_key(conversation),text,interrupted])?;
+        tx.timed_prepare_cached("INSERT INTO history_drafts(conversation_key,text,interrupted) VALUES(?,?,?) ON CONFLICT(conversation_key) DO UPDATE SET text=excluded.text,interrupted=excluded.interrupted WHERE text!=excluded.text OR interrupted!=excluded.interrupted")?.timed_execute(params![draft_key(conversation),text,interrupted])?;
         check_quota(
             &tx,
             "history_drafts",
@@ -850,13 +874,13 @@ impl Store {
             MAX_LOCAL_BYTES,
             MAX_LEDGER_ROWS,
         )?;
-        tx.commit()?;
+        tx.timed_commit()?;
         Ok(())
     }
     pub fn draft(&self, conversation: Option<&OperationId>) -> Result<Draft> {
         Ok(self
             .db
-            .query_row(
+            .timed_query_row(
                 "SELECT text,interrupted FROM history_drafts WHERE conversation_key=?",
                 [draft_key(conversation)],
                 |r| {
@@ -889,8 +913,8 @@ impl Store {
         if let Some(after) = after {
             after.validate()?;
         }
-        let mut stmt = self.db.prepare_cached("SELECT o.payload FROM history_outbox o WHERE o.operation_key>? AND (? IS NULL OR NOT EXISTS(SELECT 1 FROM history_peer_receipts r WHERE r.peer=? AND r.operation_key=o.operation_key AND r.body_key=o.body_key)) ORDER BY o.operation_key LIMIT ?")?;
-        let rows = stmt.query_map(
+        let mut stmt = self.db.timed_prepare_cached("SELECT o.payload FROM history_outbox o WHERE o.operation_key>? AND (? IS NULL OR NOT EXISTS(SELECT 1 FROM history_peer_receipts r WHERE r.peer=? AND r.operation_key=o.operation_key AND r.body_key=o.body_key)) ORDER BY o.operation_key LIMIT ?")?;
+        let rows = stmt.timed_query_map(
             params![after.map(key).unwrap_or_default(), peer, peer, count as i64],
             |r| bounded_text(r, 0, MAX_CANONICAL_BYTES),
         )?;
@@ -909,8 +933,8 @@ impl Store {
         if let Some(after) = after {
             after.validate()?;
         }
-        let mut stmt = self.db.prepare_cached("SELECT payload FROM history_receipt_outbox WHERE operation_key>? ORDER BY operation_key LIMIT ?")?;
-        let rows = stmt.query_map(
+        let mut stmt = self.db.timed_prepare_cached("SELECT payload FROM history_receipt_outbox WHERE operation_key>? ORDER BY operation_key LIMIT ?")?;
+        let rows = stmt.timed_query_map(
             params![after.map(key).unwrap_or_default(), count as i64],
             |r| bounded_text(r, 0, 32 * 1024),
         )?;
@@ -924,7 +948,7 @@ impl Store {
         }
         let tx = self
             .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            .timed_transaction_with_behavior(TransactionBehavior::Immediate)?;
         refresh(&tx, &mut self.core)?;
         voxgolem_core::conversation_sync::merge_receipts(
             &self.core,
@@ -933,10 +957,10 @@ impl Store {
             receipts.clone(),
         )?;
         for receipt in receipts {
-            tx.prepare_cached("INSERT OR IGNORE INTO history_peer_receipts(peer,operation_key,body_key) VALUES(?,?,?)")?.execute(params![peer,key(&receipt.operation),receipt.body_key])?;
+            tx.timed_prepare_cached("INSERT OR IGNORE INTO history_peer_receipts(peer,operation_key,body_key) VALUES(?,?,?)")?.timed_execute(params![peer,key(&receipt.operation),receipt.body_key])?;
         }
         check_quota(&tx, "history_peer_receipts", "0", 0, MAX_LEDGER_ROWS)?;
-        tx.commit()?;
+        tx.timed_commit()?;
         Ok(())
     }
 
@@ -944,7 +968,7 @@ impl Store {
     pub fn checkpoint(&self) -> Result<()> {
         let busy: i64 = self
             .db
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+            .timed_query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
         if busy != 0 {
             return Err(Error::Database(rusqlite::ErrorCode::DatabaseBusy));
         }
@@ -990,7 +1014,7 @@ fn draft_key(id: Option<&OperationId>) -> String {
     id.map(key).unwrap_or_else(|| "new".into())
 }
 fn revision_of(tx: &Transaction<'_>) -> Result<String> {
-    Ok(tx.query_row(
+    Ok(tx.timed_query_row(
         "SELECT revision FROM history_state WHERE singleton=1",
         [],
         |r| bounded_text(r, 0, 20),
@@ -1001,7 +1025,7 @@ fn allocate_id(tx: &Transaction<'_>) -> Result<OperationId> {
     let next = sequence
         .checked_add(1)
         .ok_or_else(|| limit("sequence_u64"))?;
-    tx.execute(
+    tx.timed_execute(
         "UPDATE history_state SET last_sequence=? WHERE singleton=1",
         [next.to_string()],
     )?;
@@ -1011,7 +1035,7 @@ fn allocate_id(tx: &Transaction<'_>) -> Result<OperationId> {
     })
 }
 fn identity(tx: &Transaction<'_>) -> Result<(String, u64)> {
-    let (replica, sequence): (String, String) = tx.query_row(
+    let (replica, sequence): (String, String) = tx.timed_query_row(
         "SELECT replica,last_sequence FROM history_state WHERE singleton=1",
         [],
         |r| Ok((bounded_text(r, 0, 36)?, bounded_text(r, 1, 20)?)),
@@ -1026,6 +1050,7 @@ fn identity(tx: &Transaction<'_>) -> Result<(String, u64)> {
 }
 fn refresh(tx: &Transaction<'_>, core: &mut CoreStore) -> Result<()> {
     if revision_of(tx)? != core.revision() {
+        let _reload = timing::span(timing::Phase::refresh_reload);
         *core = load(tx)?;
     }
     Ok(())
@@ -1061,8 +1086,8 @@ fn apply_plan(tx: &Transaction<'_>, old: &CoreStore, plan: &MutationPlan) -> Res
             .binary_search_by(|r| r.id.cmp(&record.operation.id))
             .is_ok()
         {
-            tx.prepare_cached("DELETE FROM history_records WHERE operation_key=?")?
-                .execute([key(&record.operation.id)])?;
+            tx.timed_prepare_cached("DELETE FROM history_records WHERE operation_key=?")?
+                .timed_execute([key(&record.operation.id)])?;
         }
     }
     for record in &plan.snapshot.records {
@@ -1070,7 +1095,7 @@ fn apply_plan(tx: &Transaction<'_>, old: &CoreStore, plan: &MutationPlan) -> Res
             continue;
         }
         let payload = encode(record, MAX_CANONICAL_BYTES, "record_bytes")?;
-        tx.prepare_cached("INSERT OR IGNORE INTO history_records(operation_key,conversation_key,body_key,tombstone,payload) VALUES(?,?,?,?,?)")?.execute(params![key(&record.operation.id),key(record.operation.conversation()),record.body_key,matches!(record.operation.body,OperationBody::ConversationDeleted{..}),payload])?;
+        tx.timed_prepare_cached("INSERT OR IGNORE INTO history_records(operation_key,conversation_key,body_key,tombstone,payload) VALUES(?,?,?,?,?)")?.timed_execute(params![key(&record.operation.id),key(record.operation.conversation()),record.body_key,matches!(record.operation.body,OperationBody::ConversationDeleted{..}),payload])?;
     }
     let previously_retired: BTreeSet<_> = old.retired_records().map(|r| &r.id).collect();
     for retired in plan
@@ -1079,44 +1104,44 @@ fn apply_plan(tx: &Transaction<'_>, old: &CoreStore, plan: &MutationPlan) -> Res
         .iter()
         .filter(|r| !previously_retired.contains(&r.id))
     {
-        tx.prepare_cached(
+        tx.timed_prepare_cached(
             "INSERT OR IGNORE INTO history_retired(operation_key,payload) VALUES(?,?)",
         )?
-        .execute(params![
+        .timed_execute(params![
             key(&retired.id),
             encode(retired, 1024, "retired_bytes")?
         ])?;
     }
     // Bounded disposition ledger; only changed entries are written, never clear/reinsert.
-    tx.execute("DELETE FROM history_quarantine WHERE operation_key NOT IN (SELECT operation_key FROM history_records)",[])?;
+    tx.timed_execute("DELETE FROM history_quarantine WHERE operation_key NOT IN (SELECT operation_key FROM history_records)",[])?;
     for entry in &plan.snapshot.quarantine {
-        tx.prepare_cached("INSERT INTO history_quarantine(operation_key,payload) VALUES(?,?) ON CONFLICT(operation_key) DO UPDATE SET payload=excluded.payload WHERE payload!=excluded.payload")?.execute(params![key(&entry.id),encode(entry,1024,"quarantine_bytes")?])?;
+        tx.timed_prepare_cached("INSERT INTO history_quarantine(operation_key,payload) VALUES(?,?) ON CONFLICT(operation_key) DO UPDATE SET payload=excluded.payload WHERE payload!=excluded.payload")?.timed_execute(params![key(&entry.id),encode(entry,1024,"quarantine_bytes")?])?;
     }
     for conversation in &plan.purge_conversations {
         let key = key(conversation);
-        tx.execute(
+        tx.timed_execute(
             "DELETE FROM history_outbox WHERE conversation_key=? AND tombstone=0",
             [&key],
         )?;
-        tx.execute(
+        tx.timed_execute(
             "DELETE FROM history_drafts WHERE conversation_key=?",
             [&key],
         )?;
-        tx.execute("UPDATE history_local SET conversation=NULL,selected_head=NULL WHERE singleton=1 AND conversation=?",[json_id(conversation)?])?;
+        tx.timed_execute("UPDATE history_local SET conversation=NULL,selected_head=NULL WHERE singleton=1 AND conversation=?",[json_id(conversation)?])?;
     }
     for publication in &plan.publish {
         if plan.quarantined.contains(&publication.operation.id) {
             continue;
         }
-        tx.prepare_cached("INSERT OR IGNORE INTO history_outbox(operation_key,conversation_key,body_key,tombstone,payload) VALUES(?,?,?,?,?)")?.execute(params![key(&publication.operation.id),key(publication.operation.conversation()),publication.body_key,matches!(publication.operation.body,OperationBody::ConversationDeleted{..}),encode(publication,MAX_CANONICAL_BYTES,"record_bytes")?])?;
+        tx.timed_prepare_cached("INSERT OR IGNORE INTO history_outbox(operation_key,conversation_key,body_key,tombstone,payload) VALUES(?,?,?,?,?)")?.timed_execute(params![key(&publication.operation.id),key(publication.operation.conversation()),publication.body_key,matches!(publication.operation.body,OperationBody::ConversationDeleted{..}),encode(publication,MAX_CANONICAL_BYTES,"record_bytes")?])?;
     }
     for id in &plan.quarantined {
-        tx.execute(
+        tx.timed_execute(
             "DELETE FROM history_outbox WHERE operation_key=?",
             [key(id)],
         )?;
     }
-    tx.execute(
+    tx.timed_execute(
         "UPDATE history_state SET revision=? WHERE singleton=1",
         [&plan.snapshot.revision],
     )?;
@@ -1130,7 +1155,8 @@ fn check_quota(
     max_bytes: usize,
     max_rows: usize,
 ) -> Result<()> {
-    let (rows, size): (i64, i64) = tx.query_row(
+    let _quota = timing::span(timing::Phase::quota_check);
+    let (rows, size): (i64, i64) = tx.timed_query_row(
         &format!("SELECT COUNT(*),COALESCE(SUM({bytes}),0) FROM {table}"),
         [],
         |r| Ok((r.get(0)?, r.get(1)?)),
@@ -1141,6 +1167,7 @@ fn check_quota(
     Ok(())
 }
 fn quotas(tx: &Transaction<'_>) -> Result<()> {
+    let _quota = timing::span(timing::Phase::quota_check);
     // Exact compact StoreSnapshot encoded size, including commas and fixed field overhead.
     let revision = revision_of(tx)?;
     let empty = StoreSnapshot {
@@ -1153,7 +1180,7 @@ fn quotas(tx: &Transaction<'_>) -> Result<()> {
         ("history_retired", 65_536),
         ("history_quarantine", 16_384),
     ] {
-        let (rows, bytes): (i64, i64) = tx.query_row(
+        let (rows, bytes): (i64, i64) = tx.timed_query_row(
             &format!("SELECT COUNT(*),COALESCE(SUM(length(CAST(payload AS BLOB))),0) FROM {table}"),
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
@@ -1196,34 +1223,40 @@ fn load(tx: &Transaction<'_>) -> Result<CoreStore> {
         ..StoreSnapshot::empty()
     };
     for raw in tx
-        .prepare("SELECT payload FROM history_records ORDER BY operation_key")?
-        .query_map([], |r| bounded_text(r, 0, MAX_CANONICAL_BYTES))?
+        .timed_prepare("SELECT payload FROM history_records ORDER BY operation_key")?
+        .timed_query_map([], |r| bounded_text(r, 0, MAX_CANONICAL_BYTES))?
     {
         snapshot.records.push(codec::parse_record(&raw?)?);
     }
     for raw in tx
-        .prepare("SELECT payload FROM history_retired ORDER BY operation_key")?
-        .query_map([], |r| bounded_text(r, 0, 1024))?
+        .timed_prepare("SELECT payload FROM history_retired ORDER BY operation_key")?
+        .timed_query_map([], |r| bounded_text(r, 0, 1024))?
     {
         snapshot
             .retired
-            .push(serde_json::from_str(&raw?).map_err(|_| Error::Storage)?);
+            .push(timing::measure(timing::Phase::record_decode, || {
+                serde_json::from_str(&raw?).map_err(|_| Error::Storage)
+            })?);
     }
     for raw in tx
-        .prepare("SELECT payload FROM history_quarantine ORDER BY operation_key")?
-        .query_map([], |r| bounded_text(r, 0, 1024))?
+        .timed_prepare("SELECT payload FROM history_quarantine ORDER BY operation_key")?
+        .timed_query_map([], |r| bounded_text(r, 0, 1024))?
     {
         snapshot
             .quarantine
-            .push(serde_json::from_str(&raw?).map_err(|_| Error::Storage)?);
+            .push(timing::measure(timing::Phase::record_decode, || {
+                serde_json::from_str(&raw?).map_err(|_| Error::Storage)
+            })?);
     }
-    Ok(CoreStore::restore(snapshot)?)
+    Ok(timing::measure(timing::Phase::reducer, || {
+        CoreStore::restore(snapshot)
+    })?)
 }
 
 fn bootstrap(db: &mut Connection) -> Result<()> {
-    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let epoch: u32 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    let has_new: bool = tx.query_row(
+    let tx = db.timed_transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let epoch: u32 = tx.timed_query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let has_new: bool = tx.timed_query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_state')",
         [],
         |r| r.get(0),
@@ -1232,20 +1265,20 @@ fn bootstrap(db: &mut Connection) -> Result<()> {
         if epoch != SCHEMA_VERSION {
             return Err(DomainError::UnsupportedVersion { version: epoch }.into());
         }
-        tx.commit()?;
+        tx.timed_commit()?;
         return Ok(());
     }
     if epoch > 1 {
         return Err(DomainError::UnsupportedVersion { version: epoch }.into());
     }
-    let has_legacy: bool = tx.query_row(
+    let has_legacy: bool = tx.timed_query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='state')",
         [],
         |r| r.get(0),
     )?;
     // Preserve administrative identity/counter without parsing or importing any legacy body.
     let identity: Option<(String, String)> = if has_legacy {
-        Some(tx.query_row(
+        Some(tx.timed_query_row(
             "SELECT replica,last_sequence FROM state WHERE singleton=1",
             [],
             |r| Ok((bounded_text(r, 0, 36)?, bounded_text(r, 1, 20)?)),
@@ -1256,7 +1289,8 @@ fn bootstrap(db: &mut Connection) -> Result<()> {
     let (replica, sequence) = match identity {
         Some(identity) => identity,
         None => {
-            let mut bytes: Vec<u8> = tx.query_row("SELECT randomblob(16)", [], |r| r.get(0))?;
+            let mut bytes: Vec<u8> =
+                tx.timed_query_row("SELECT randomblob(16)", [], |r| r.get(0))?;
             bytes[6] = (bytes[6] & 0x0f) | 0x40;
             bytes[8] = (bytes[8] & 0x3f) | 0x80;
             let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
@@ -1292,10 +1326,10 @@ fn bootstrap(db: &mut Connection) -> Result<()> {
             "local_state",
             "drafts",
         ] {
-            tx.execute_batch(&format!("DROP TABLE IF EXISTS {table}"))?;
+            tx.timed_execute_batch(&format!("DROP TABLE IF EXISTS {table}"))?;
         }
     }
-    tx.execute_batch("CREATE TABLE history_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1),replica TEXT NOT NULL,last_sequence TEXT NOT NULL,revision TEXT NOT NULL);
+    tx.timed_execute_batch("CREATE TABLE history_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1),replica TEXT NOT NULL,last_sequence TEXT NOT NULL,revision TEXT NOT NULL);
         CREATE TABLE history_records(operation_key TEXT PRIMARY KEY,conversation_key TEXT NOT NULL,body_key TEXT NOT NULL,tombstone INTEGER NOT NULL,payload TEXT NOT NULL);
         CREATE INDEX history_records_conversation ON history_records(conversation_key,tombstone);
         CREATE TABLE history_retired(operation_key TEXT PRIMARY KEY,payload TEXT NOT NULL);
@@ -1308,11 +1342,11 @@ fn bootstrap(db: &mut Connection) -> Result<()> {
         CREATE TABLE history_drafts(conversation_key TEXT PRIMARY KEY,text TEXT NOT NULL,interrupted INTEGER NOT NULL);
         INSERT INTO history_local VALUES(1,NULL,NULL);
         PRAGMA user_version=2;")?;
-    tx.execute(
+    tx.timed_execute(
         "INSERT INTO history_state VALUES(1,?,?,'0')",
         params![replica, sequence],
     )?;
-    tx.commit()?;
+    tx.timed_commit()?;
     Ok(())
 }
 

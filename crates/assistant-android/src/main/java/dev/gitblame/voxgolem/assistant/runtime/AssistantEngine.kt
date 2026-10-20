@@ -177,6 +177,7 @@ class AssistantEngine @JvmOverloads internal constructor(
     init {
         startupTiming?.mark(Stage.HYDRATION_QUEUED)
         dispatch {
+            withStorageTiming(startupTiming) {
             startupTiming?.mark(Stage.HYDRATION_STARTED)
             val local = store.localState()
             val policy = policies.read()
@@ -193,6 +194,7 @@ class AssistantEngine @JvmOverloads internal constructor(
             if (state.model !in AssistantModels.aliases) state = state.copy(error = "unsupported_model")
             state = state.copy(contextReady = true, foreground = foregroundRequested)
             startupTiming?.mark(Stage.HYDRATION_COMPLETED)
+            }
         }
     }
 
@@ -552,6 +554,7 @@ class AssistantEngine @JvmOverloads internal constructor(
             terminalContext = terminalContext)
         ticket.timing.mark(Stage.REQUESTED)
         val duplicate = submitted.putIfAbsent(token, ticket) != null
+        ticket.timing.mark(Stage.ADMISSION_QUEUED)
         dispatch {
             ticket.timing.mark(Stage.ADMISSION_STARTED)
             if (token.isEmpty() || token.toByteArray(Charsets.UTF_8).size > 128) { finish(ticket, "error", "invalid_request"); return@dispatch }
@@ -567,8 +570,10 @@ class AssistantEngine @JvmOverloads internal constructor(
                 finish(ticket, "error", "conversation_changed"); return@dispatch
             }
             try {
-                admit(ticket, promptOverride,
-                    if (requireConversationOwner) VoiceInputContext(expectedConversation, expectedHead) else null)
+                ticket.timing.scoped {
+                    admit(ticket, promptOverride,
+                        if (requireConversationOwner) VoiceInputContext(expectedConversation, expectedHead) else null)
+                }
             } catch (error: RuntimeException) {
                 projectionStamp = null
                 val code = domainCode(error)
@@ -685,7 +690,9 @@ class AssistantEngine @JvmOverloads internal constructor(
             ticket.timing.mark(Stage.ADMISSION_PERSISTED)
             val serializedRequest = providerRequest(turn)
             ticket.timing.mark(Stage.REQUEST_SERIALIZED)
+            ticket.timing.mark(Stage.ADMISSION_LOCK_REQUESTED)
             synchronized(admission) {
+                ticket.timing.mark(Stage.ADMISSION_LOCK_ACQUIRED)
                 ticket.failure.get()?.let { fail(it); return }
                 if (ticket.cancelled.get() || ticket.epoch != epoch.get()) { state = state.copy(interrupted = true); fail("interrupted", true); return }
                 active = turn
@@ -788,23 +795,29 @@ class AssistantEngine @JvmOverloads internal constructor(
                             if (active === turn) turn.outcomeJson = outcomeJson
                         }
                     }
-                    override fun onRetired(requestId: String) = dispatch {
-                        drainPendingText(turn, close = true)
-                        val outcome = turn.outcomeJson
-                        if (active === turn && turn.epoch == epoch.get() && !ticket.cancelled.get() && outcome != null) {
-                            settle(turn, outcome)
-                            return@dispatch
-                        }
-                        if (active === turn) {
-                            active = null
-                            cancellationOwner.compareAndSet(ticket, null)
-                            val code = ticket.failure.get() ?: "interrupted"
-                            state = state.copy(busy = false, interrupted = true, provisional = "", toolStatus = null, error = code)
-                            try { store.saveDraft(conversation(), state.draft, true) }
-                            catch (_: RuntimeException) { state = state.copy(error = "draft_not_saved") }
-                            finally {
-                                finish(ticket, if (ticket.failure.get() == null) "cancelled" else "error", code, id)
-                                afterRetirement?.also { afterRetirement = null; it() }
+                    override fun onRetired(requestId: String) {
+                        ticket.timing.mark(Stage.SETTLEMENT_QUEUED)
+                        dispatch {
+                            ticket.timing.mark(Stage.SETTLEMENT_DEQUEUED)
+                            ticket.timing.scoped {
+                                drainPendingText(turn, close = true)
+                                val outcome = turn.outcomeJson
+                                if (active === turn && turn.epoch == epoch.get() && !ticket.cancelled.get() && outcome != null) {
+                                    settle(turn, outcome)
+                                    return@scoped
+                                }
+                                if (active === turn) {
+                                    active = null
+                                    cancellationOwner.compareAndSet(ticket, null)
+                                    val code = ticket.failure.get() ?: "interrupted"
+                                    state = state.copy(busy = false, interrupted = true, provisional = "", toolStatus = null, error = code)
+                                    try { store.saveDraft(conversation(), state.draft, true) }
+                                    catch (_: RuntimeException) { state = state.copy(error = "draft_not_saved") }
+                                    finally {
+                                        finish(ticket, if (ticket.failure.get() == null) "cancelled" else "error", code, id)
+                                        afterRetirement?.also { afterRetirement = null; it() }
+                                    }
+                                }
                             }
                         }
                     }
@@ -819,8 +832,20 @@ class AssistantEngine @JvmOverloads internal constructor(
             refreshProjection()
     }
 
-    private fun settle(turn: Active, raw: String) = synchronized(settlement) {
-        if (active !== turn || turn.epoch != epoch.get()) return@synchronized
+    private fun <T> withStorageTiming(timing: AssistantTiming?, action: () -> T): T =
+        if (timing == null) action() else timing.scoped(action)
+
+    private fun settle(turn: Active, raw: String) {
+        turn.ticket.timing.mark(Stage.SETTLEMENT_LOCK_REQUESTED)
+        synchronized(settlement) {
+            turn.ticket.timing.mark(Stage.SETTLEMENT_LOCK_ACQUIRED)
+            settleLocked(turn, raw)
+        }
+    }
+
+    /** Caller retains the existing settlement monitor through persistence and publication. */
+    private fun settleLocked(turn: Active, raw: String) {
+        if (active !== turn || turn.epoch != epoch.get()) return
         turn.ticket.timing.mark(Stage.SETTLEMENT_STARTED)
         var saved = false
         var savedRecord: String? = null
@@ -854,7 +879,9 @@ class AssistantEngine @JvmOverloads internal constructor(
                         .put("policy_id", "voxgolem-assistant").put("policy_version", "1")
                          .put("instruction_profile_id", "typed-custom-search").put("instruction_profile_version", "2")
                       val record = store.completeTurn(turn.request, turn.context, turn.prompt, answer, "instant", provenance, sources = sources) { transaction ->
-                         synchronized(admission) {
+                          turn.ticket.timing.mark(Stage.COMMIT_LOCK_REQUESTED)
+                          synchronized(admission) {
+                              turn.ticket.timing.mark(Stage.COMMIT_LOCK_ACQUIRED)
                              check(!turn.ticket.cancelled.get() && turn.epoch == epoch.get()) { "interrupted" }
                              transaction()
                          }

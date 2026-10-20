@@ -15,13 +15,13 @@ class AssistantTiming private constructor(
     val operation: Operation,
     val run: Int,
     private val parentRun: Int?,
-    private val enabled: Boolean,
+    val enabled: Boolean,
     private val clock: () -> Long,
     private val sink: Sink,
     origin: Long? = null,
 ) {
     enum class Operation { PREPARATION, SPEECH, TTS_INITIALIZATION, TTS_UTTERANCE, RECOGNITION, SUPPORT_CHECK, GENERATION, ACTIVITY,
-        VOICE_FLOW, VOICE_TURN, MICROPHONE_CUE, TTS_WARMUP, VOICE_INVENTORY, PRESENTATION, VOICE_ENTRY }
+        VOICE_FLOW, VOICE_TURN, MICROPHONE_CUE, TTS_WARMUP, VOICE_INVENTORY, PRESENTATION, VOICE_ENTRY, STORAGE }
     enum class Stage {
         REQUESTED, ADMITTED, READY_REUSED, PENDING_REUSED,
         CREATE_REQUESTED, INIT_CALLBACK, INIT_MAIN_DELIVERED, INIT_READY, INIT_FAILED, VOICES_READY,
@@ -38,7 +38,9 @@ class AssistantTiming private constructor(
         HYDRATION_QUEUED, HYDRATION_STARTED, LOCAL_STATE_LOADED, DRAFT_LOADED,
         CREDENTIAL_STATUS_READ, CANONICAL_SNAPSHOT_LOADED, DOMAIN_PROJECTION_COMPLETED, HYDRATION_COMPLETED,
         INITIAL_SNAPSHOT_REQUESTED, INITIAL_SNAPSHOT_REPLIED, FRONTEND_READY_ACK, FIRST_RESPONSE_DOM_ACK,
-        ADMISSION_STARTED, DRAFT_PERSISTED, CREDENTIAL_CHECKED, PROJECTION_REFRESHED,
+        ADMISSION_QUEUED, ADMISSION_STARTED, ADMISSION_LOCK_REQUESTED, ADMISSION_LOCK_ACQUIRED,
+        SETTLEMENT_QUEUED, SETTLEMENT_DEQUEUED, SETTLEMENT_LOCK_REQUESTED, SETTLEMENT_LOCK_ACQUIRED,
+        COMMIT_LOCK_REQUESTED, COMMIT_LOCK_ACQUIRED, DRAFT_PERSISTED, CREDENTIAL_CHECKED, PROJECTION_REFRESHED,
         CONTEXT_PREPARED, ADMISSION_PERSISTED, REQUEST_SERIALIZED,
         SETTLEMENT_STARTED, SELECTION_PERSISTED, SETTLEMENT_PROJECTED,
         CAPTURE_OPEN_REQUESTED, CAPTURE_RECORDING, DIRECT_MIC_FALLBACK, PROVIDER_READY_CALLBACK,
@@ -64,6 +66,35 @@ class AssistantTiming private constructor(
     interface MetadataSink : Sink {
         fun emitMetadata(operation: Operation, run: Int, parentRun: Int?, observedNanos: Long,
             metadata: AssistantDiagnosticJournal.Metadata)
+    }
+    interface StorageSink : Sink {
+        fun emitStorage(run: Int, parentRun: Int, observedNanos: Long, summary: AssistantDiagnosticJournal.Storage)
+        fun storageDropped(count: Long) {}
+    }
+
+    /** Lexical thread scope; storage records are offered only after the caller's locks have retired. */
+    fun <T> scoped(action: () -> T): T {
+        val previous = storageScope.get()
+        if (!enabled) {
+            storageScope.remove()
+            try { return action() } finally { storageScope.set(previous) }
+        }
+        val scope = StorageScope(this)
+        storageScope.set(scope)
+        try { return action() } finally {
+            storageScope.set(previous)
+            scope.records.forEach { summary ->
+                try { (sink as? StorageSink)?.emitStorage(sequence.incrementAndGet(), run, now(), summary) }
+                catch (_: RuntimeException) { /* Optional diagnostics. */ }
+            }
+            if (scope.dropped > 0) try { (sink as? StorageSink)?.storageDropped(scope.dropped) }
+            catch (_: RuntimeException) { /* Optional diagnostics. */ }
+        }
+    }
+
+    private class StorageScope(val timing: AssistantTiming) {
+        val records = ArrayList<AssistantDiagnosticJournal.Storage>()
+        var dropped = 0L
     }
 
     private val startedAt = if (enabled) origin ?: now() else 0L
@@ -132,6 +163,14 @@ class AssistantTiming private constructor(
         const val TAG = "VoxGolemAssistantTiming"
         const val ENABLED_METADATA = "dev.gitblame.voxgolem.assistant.TIMING_ENABLED"
         private val sequence = AtomicInteger()
+        private val storageScope = ThreadLocal<StorageScope?>()
+        fun storageEnabled(): Boolean = storageScope.get()?.timing?.enabled == true
+        fun storage(summary: AssistantDiagnosticJournal.Storage) {
+            storageScope.get()?.let {
+                if (it.records.size < 256) it.records.add(summary)
+                else it.dropped = (it.dropped + 1).coerceAtMost(1_000_000)
+            }
+        }
 
         fun begin(context: Context?, operation: Operation,
             clock: () -> Long = SystemClock::elapsedRealtimeNanos, sink: Sink = AndroidSink,
@@ -144,13 +183,16 @@ class AssistantTiming private constructor(
                 }.getOrDefault(false))
             val effectiveSink = if (enabled && sink === AndroidSink) {
                 val journal = AssistantDiagnosticJournal.forContext(context)
-                object : MetadataSink {
+                object : MetadataSink, StorageSink {
                     override fun emit(event: Event) {
                         try { AndroidSink.emit(event) } finally { journal.offer(event) }
                     }
                     override fun emitMetadata(operation: Operation, run: Int, parentRun: Int?, observedNanos: Long,
                         metadata: AssistantDiagnosticJournal.Metadata) =
-                        journal.offerMetadata(operation, run, parentRun, observedNanos, metadata)
+                         journal.offerMetadata(operation, run, parentRun, observedNanos, metadata)
+                    override fun emitStorage(run: Int, parentRun: Int, observedNanos: Long,
+                        summary: AssistantDiagnosticJournal.Storage) = journal.offerStorage(run, parentRun, observedNanos, summary)
+                    override fun storageDropped(count: Long) = journal.storageDropped(count)
                 }
             } else sink
             return AssistantTiming(operation, if (enabled) sequence.incrementAndGet() else 0, null, enabled, clock, effectiveSink, originNanos)

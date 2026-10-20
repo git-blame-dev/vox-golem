@@ -665,6 +665,7 @@ pub fn limit(name: &str) -> DomainError {
 }
 
 fn parse<T: serde::de::DeserializeOwned>(raw: &str) -> Result<T, DomainError> {
+    let _decode = crate::timing::span(crate::timing::Phase::native_request_decode);
     serde_json::from_str(raw).map_err(|_| invalid("native_request_json"))
 }
 
@@ -740,6 +741,7 @@ fn check_snapshot_quota(snapshot: &StoreSnapshot) -> Result<(), DomainError> {
 }
 
 pub fn success(value: impl Serialize) -> Result<String, DomainError> {
+    let _encode = crate::timing::span(crate::timing::Phase::native_response_encode);
     encode(
         &Success { ok: true, value },
         MAX_GATEWAY_BYTES,
@@ -748,6 +750,7 @@ pub fn success(value: impl Serialize) -> Result<String, DomainError> {
 }
 
 pub fn failure(error: DomainError) -> String {
+    let _encode = crate::timing::span(crate::timing::Phase::native_response_encode);
     encode(
         &Failure { ok: false, error },
         MAX_GATEWAY_BYTES,
@@ -834,24 +837,60 @@ pub fn read_owned(store: &Store, input: &str) -> Result<String, DomainError> {
     let input: Request = parse(input)?;
     input.validate_owned_shape()?;
     match input.kind {
-        RequestKind::View => success(compact_view(store)?),
-        RequestKind::Projection => success(project(store, parse(raw(&input.request)?.get())?)?),
-        RequestKind::Context => success(crate::provider_context(
-            store.select_context(parse(raw(&input.request)?.get())?)?,
-        )),
-        RequestKind::History => success(history_page(store, parse(raw(&input.request)?.get())?)?),
+        RequestKind::View => success(crate::timing::measure(
+            crate::timing::Phase::projection,
+            || compact_view(store),
+        )?),
+        RequestKind::Projection => {
+            let request = parse(raw(&input.request)?.get())?;
+            success(crate::timing::measure(
+                crate::timing::Phase::projection,
+                || project(store, request),
+            )?)
+        }
+        RequestKind::Context => {
+            let request = parse(raw(&input.request)?.get())?;
+            success(crate::timing::measure(
+                crate::timing::Phase::projection,
+                || store.select_context(request).map(crate::provider_context),
+            )?)
+        }
+        RequestKind::History => {
+            let request = parse(raw(&input.request)?.get())?;
+            success(crate::timing::measure(
+                crate::timing::Phase::projection,
+                || history_page(store, request),
+            )?)
+        }
         RequestKind::Continuation => {
-            success(store.continuation(parse(raw(&input.request)?.get())?)?)
+            let request = parse(raw(&input.request)?.get())?;
+            success(crate::timing::measure(
+                crate::timing::Phase::projection,
+                || store.continuation(request),
+            )?)
         }
         RequestKind::Inventory => {
-            success(inventory_page(store, parse(raw(&input.request)?.get())?)?)
+            let request = parse(raw(&input.request)?.get())?;
+            success(crate::timing::measure(
+                crate::timing::Phase::projection,
+                || inventory_page(store, request),
+            )?)
         }
-        RequestKind::Reconcile => success(reconcile_page(store, parse(raw(&input.page)?.get())?)?),
-        RequestKind::Receipts => success(receipts_after_commit(
-            store,
-            &parse::<String>(raw(&input.recipient)?.get())?,
-            &parse::<Vec<OperationId>>(raw(&input.operation_ids)?.get())?,
-        )?),
+        RequestKind::Reconcile => {
+            let page = parse(raw(&input.page)?.get())?;
+            success(crate::timing::measure(
+                crate::timing::Phase::projection,
+                || reconcile_page(store, page),
+            )?)
+        }
+        RequestKind::Receipts => {
+            let recipient: String = parse(raw(&input.recipient)?.get())?;
+            let operation_ids: Vec<OperationId> = parse(raw(&input.operation_ids)?.get())?;
+            success(crate::timing::measure(
+                crate::timing::Phase::projection,
+                || receipts_after_commit(store, &recipient, &operation_ids),
+            )?)
+        }
         _ => Err(invalid("owned_read_kind")),
     }
 }

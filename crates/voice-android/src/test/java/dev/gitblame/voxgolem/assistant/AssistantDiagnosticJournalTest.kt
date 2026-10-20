@@ -39,6 +39,29 @@ class AssistantDiagnosticJournalTest {
         assertTrue(output.contains("\"parentRun\":3"))
     }
 
+    @Test fun storageUsesFixedVocabularyNumericAggregatesAndExistingBoundedQueue() {
+        val worker = Worker(); val dir = temporary.newFolder()
+        var lookups = 0
+        val journal = AssistantDiagnosticJournal({ lookups++; dir }, worker, { 1000L }, capacity = 2)
+        val metrics = mapOf("sqlite_read" to AssistantDiagnosticJournal.Metric(2, 30, 20),
+            "synthetic private SQL" to AssistantDiagnosticJournal.Metric(1, 5, 5),
+            "sqlite_write" to AssistantDiagnosticJournal.Metric(0, 0, 0),
+            "record_encode" to AssistantDiagnosticJournal.Metric(0, 1, 1),
+            "native_dispatch" to AssistantDiagnosticJournal.Metric(1, -1, 0))
+        repeat(3) { journal.offerStorage(it + 10, 7, 123,
+            AssistantDiagnosticJournal.Storage(AssistantDiagnosticJournal.StorageCall.PROJECTION,
+                AssistantDiagnosticJournal.StorageOutcome.ERROR, metrics)) }
+        assertEquals(0, lookups)
+        worker.drain()
+        val output = text(dir)
+        assertEquals(2, output.lines().count { it.isNotEmpty() })
+        listOf("\"schema\":1", "\"kind\":\"STORAGE\"", "\"operation\":\"STORAGE\"", "\"parentRun\":7",
+            "\"call\":\"projection\"", "\"outcome\":\"error\"", "\"dropped\":1",
+            "\"sqlite_read\":{\"count\":2,\"total_ns\":30,\"max_ns\":20}").forEach { assertTrue(output.contains(it)) }
+        assertTrue(output.contains("\"sqlite_write\":{\"count\":0,\"total_ns\":0,\"max_ns\":0}"))
+        listOf("private", "record_encode", "native_dispatch", "native_store_wait").forEach { assertFalse(output.contains(it)) }
+    }
+
     @Test fun metadataRejectsUnsafeAndUnknownValuesRatherThanTruncating() {
         val worker = Worker(); val dir = temporary.newFolder()
         val journal = AssistantDiagnosticJournal({ dir }, worker, { 1000L })

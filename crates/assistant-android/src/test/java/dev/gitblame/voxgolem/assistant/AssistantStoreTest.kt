@@ -29,6 +29,57 @@ class AssistantStoreTest {
     private fun open(gateway: DomainGateway) = AssistantStore(context, gateway).also(stores::add)
     @After fun closeStores() { stores.forEach(AssistantStore::close) }
 
+    @Test fun profiledOuterCallsMergeNestedCallsAndRetireLocksBeforeSummarySink() {
+        val store = nativeStore()
+        context.applicationInfo.flags = context.applicationInfo.flags or android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE
+        val summaries = mutableListOf<AssistantDiagnosticJournal.Storage>()
+        val timing = AssistantTiming.begin(context, AssistantTiming.Operation.GENERATION, sink = object : AssistantTiming.StorageSink {
+            override fun emit(event: AssistantTiming.Event) {}
+            override fun emitStorage(run: Int, parentRun: Int, observedNanos: Long, summary: AssistantDiagnosticJournal.Storage) {
+                assertFalse(Thread.holdsLock(store))
+                summaries += summary
+            }
+        })
+        timing.scoped {
+            store.createConversation("Synthetic private title")
+            store.allocateId()
+            store.allocateId()
+            assertTrue(summaries.isEmpty())
+        }
+        assertEquals(listOf(AssistantDiagnosticJournal.StorageCall.CREATE_CONVERSATION,
+            AssistantDiagnosticJournal.StorageCall.ALLOCATE_ID, AssistantDiagnosticJournal.StorageCall.ALLOCATE_ID), summaries.map { it.call })
+        assertTrue(summaries.all { it.outcome == AssistantDiagnosticJournal.StorageOutcome.OK })
+        assertEquals(2L, summaries.first().metrics.getValue("jni_execute").count)
+        assertTrue(summaries.first().metrics.containsKey("native_open"))
+        assertTrue(summaries.first().metrics.containsKey("sqlite_commit"))
+        assertFalse(summaries.toString().contains("Synthetic private title"))
+        timing.scoped { store.localState(); store.localState() }
+        val warm = summaries.last().metrics
+        val zero = AssistantDiagnosticJournal.Metric(0, 0, 0)
+        listOf("sqlite_begin", "sqlite_read", "sqlite_write", "sqlite_commit", "sqlite_prepare", "record_encode",
+            "record_decode", "reducer", "projection", "refresh_reload", "quota_check").forEach { assertTrue(warm.containsKey(it)) }
+        listOf("refresh_reload", "sqlite_write", "sqlite_prepare", "record_encode", "record_decode").forEach {
+            assertEquals("Warm read must preserve explicitly observed zero $it", zero, warm.getValue(it))
+        }
+        assertFalse(warm.containsKey("native_open"))
+        store.beforeCommit = { error("Synthetic private error") }
+        timing.scoped { assertThrows(IllegalStateException::class.java) { store.createConversation("Synthetic failed") } }
+        assertEquals(AssistantDiagnosticJournal.StorageOutcome.ERROR, summaries.last().outcome)
+        assertFalse(AssistantTiming.storageEnabled())
+    }
+
+    @Test fun ordinaryNativeEnvelopeHasNoOptionalDiagnostics() {
+        nativeStore() // Require the same explicit host-JNI prerequisite as the transaction tests.
+        val handle = AssistantStoreNative.open(File(context.noBackupFilesDir, "synthetic-envelope.db").absolutePath)
+        try {
+            val ordinary = JSONObject(AssistantStoreNative.execute(handle, "{\"kind\":\"local_state\"}"))
+            assertEquals(setOf("ok", "value"), ordinary.keys().asSequence().toSet())
+            val profiled = JSONObject(AssistantStoreNative.executeProfiled(handle, "{\"kind\":\"local_state\"}"))
+            assertEquals(ordinary.get("value").toString(), profiled.get("value").toString())
+            assertEquals(1, profiled.getJSONObject("storageTiming").getInt("schema"))
+        } finally { AssistantStoreNative.close(handle) }
+    }
+
     @Test fun portableRustPromptBudgetAgreesWithMobileValidatorThroughTheActualGateway() {
         val library = System.getProperty("assistant.native.library")
         assumeTrue("Set -PassistantNativeLibrary to an existing host JNI library", library != null)

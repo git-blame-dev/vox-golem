@@ -645,17 +645,20 @@ class AssistantEngineTest {
     @Test fun generationTimingSeparatesQueuedWorkerTextOutcomeAndDurableSettlement() {
         context.applicationInfo.flags = context.applicationInfo.flags or ApplicationInfo.FLAG_DEBUGGABLE
         prepare()
-        val admissionStages = listOf(Stage.REQUESTED, Stage.ADMISSION_STARTED, Stage.DRAFT_PERSISTED,
+        val admissionStages = listOf(Stage.REQUESTED, Stage.ADMISSION_QUEUED, Stage.ADMISSION_STARTED, Stage.DRAFT_PERSISTED,
             Stage.CREDENTIAL_CHECKED, Stage.PROJECTION_REFRESHED, Stage.CONTEXT_PREPARED,
-            Stage.ADMISSION_PERSISTED, Stage.REQUEST_SERIALIZED, Stage.ADMITTED)
+            Stage.ADMISSION_PERSISTED, Stage.REQUEST_SERIALIZED, Stage.ADMISSION_LOCK_REQUESTED,
+            Stage.ADMISSION_LOCK_ACQUIRED, Stage.ADMITTED)
         assertEquals(admissionStages, timings.mapNotNull { it.stage })
         providerQueue.drain()
         assertEquals(admissionStages + listOf(Stage.WORKER_STARTED, Stage.NATIVE_READY,
-            Stage.FIRST_TEXT, Stage.OUTCOME_RECEIVED, Stage.DELIVERY_READY), timings.mapNotNull { it.stage })
+            Stage.FIRST_TEXT, Stage.OUTCOME_RECEIVED, Stage.DELIVERY_READY, Stage.SETTLEMENT_QUEUED), timings.mapNotNull { it.stage })
         io.drain()
-        assertEquals(listOf(Stage.SETTLEMENT_STARTED, Stage.DURABLE_COMMITTED, Stage.SELECTION_PERSISTED,
+        assertEquals(listOf(Stage.SETTLEMENT_DEQUEUED, Stage.SETTLEMENT_LOCK_REQUESTED, Stage.SETTLEMENT_LOCK_ACQUIRED,
+            Stage.SETTLEMENT_STARTED, Stage.COMMIT_LOCK_REQUESTED, Stage.COMMIT_LOCK_ACQUIRED,
+            Stage.DURABLE_COMMITTED, Stage.SELECTION_PERSISTED,
             Stage.SETTLEMENT_PROJECTED, Stage.SETTLED),
-            timings.filter { it.kind == AssistantTiming.Kind.MARK }.takeLast(5).map { it.stage })
+            timings.filter { it.kind == AssistantTiming.Kind.MARK }.takeLast(10).map { it.stage })
         assertEquals(1, timings.count { it.kind == AssistantTiming.Kind.END })
         assertEquals(1, timings.filter { it.operation == AssistantTiming.Operation.GENERATION }.map { it.run }.distinct().size)
         assertFalse(state.busy)

@@ -1,4 +1,205 @@
 use super::*;
+
+#[test]
+fn timing_admission_and_settlement_count_context_projection_attempts() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let (prepared, summary) = timing::capture(true, || {
+        store.prepare_context(
+            Selection {
+                conversation: None,
+                selected_head: None,
+            },
+            "Synthetic prompt",
+            4096,
+        )
+    });
+    let prepared = prepared.unwrap();
+    assert_eq!(summary.unwrap().metrics.projection.count, 1);
+    let record = turn(&mut store, &prepared.context, "Synthetic prompt");
+    let OperationBody::TurnCompleted { provenance, .. } = record.operation.body else {
+        unreachable!()
+    };
+    let revision = store.revision().unwrap();
+    let selection = store.selection().unwrap();
+    let (failed, summary) = timing::capture(true, || {
+        store.persist_settled_turn(
+            usize::MAX,
+            "Synthetic prompt".into(),
+            Answer::Text {
+                text: "Synthetic answer".into(),
+            },
+            vec![],
+            TerminalStage::Instant,
+            provenance.clone(),
+        )
+    });
+    assert!(matches!(
+        failed,
+        Err(Error::Domain(DomainError::LimitExceeded { .. }))
+    ));
+    let metrics = summary.unwrap().metrics;
+    assert_eq!(metrics.projection.count, 1);
+    assert_eq!(metrics.sqlite_commit.count, 0);
+    assert_eq!(store.revision().unwrap(), revision);
+    assert_eq!(store.selection().unwrap(), selection);
+    let (settled, summary) = timing::capture(true, || {
+        store.persist_settled_turn(
+            4096,
+            "Synthetic prompt".into(),
+            Answer::Text {
+                text: "Synthetic answer".into(),
+            },
+            vec![],
+            TerminalStage::Instant,
+            provenance,
+        )
+    });
+    assert!(settled.unwrap().saved);
+    assert_eq!(summary.unwrap().metrics.projection.count, 1);
+}
+
+#[test]
+fn timing_codec_counts_individual_serializations_and_json_parses() {
+    let operation = Operation {
+        version: SCHEMA_VERSION,
+        id: OperationId {
+            replica: "00000000-0000-4000-8000-000000000001".into(),
+            sequence: "1".into(),
+        },
+        body: OperationBody::ConversationCreated {
+            title: "Synthetic codec timing".into(),
+        },
+    };
+    let (record, summary) = timing::capture(true, || codec::record(operation).unwrap());
+    let metrics = summary.unwrap().metrics;
+    assert_eq!(metrics.record_encode.count, 1);
+    assert_eq!(metrics.record_decode.count, 0);
+    let raw = serde_json::to_string(&record).unwrap();
+    let (parsed, summary) = timing::capture(true, || codec::parse_record(&raw).unwrap());
+    assert_eq!(parsed, record);
+    let metrics = summary.unwrap().metrics;
+    assert_eq!(metrics.record_decode.count, 2);
+    assert_eq!(metrics.record_encode.count, 1);
+}
+
+#[test]
+fn timing_capture_is_scoped_bounded_and_content_free() {
+    use timing::{capture, measure, Phase};
+    assert_eq!(capture(false, || 42).0, 42);
+    assert!(capture(false, || measure(Phase::sqlite_read, || 42))
+        .1
+        .is_none());
+    let (_, outer) = capture(true, || {
+        measure(Phase::sqlite_read, || ());
+        let (_, nested) = capture(true, || measure(Phase::sqlite_write, || ()));
+        assert_eq!(nested.unwrap().metrics.sqlite_write.count, 1);
+        capture(false, || measure(Phase::sqlite_read, || ()));
+        assert!(std::panic::catch_unwind(|| capture(true, || panic!("synthetic"))).is_err());
+        measure(Phase::sqlite_read, || ());
+    });
+    let outer = outer.unwrap();
+    assert_eq!(outer.metrics.sqlite_read.count, 2);
+    assert_eq!(outer.metrics.sqlite_write.count, 0);
+    let (_, repeated) = capture(true, || {
+        for _ in 0..10_000 {
+            measure(Phase::sqlite_read, || ());
+        }
+    });
+    assert_eq!(repeated.unwrap().metrics.sqlite_read.count, 10_000);
+    let json = serde_json::to_value(outer).unwrap();
+    assert_eq!(json["schema"], 1);
+    assert_eq!(json["metrics"].as_object().unwrap().len(), 13);
+    for metric in json["metrics"].as_object().unwrap().values() {
+        assert_eq!(metric.as_object().unwrap().len(), 3);
+        for field in ["count", "total_ns", "max_ns"] {
+            assert!(metric[field].is_u64());
+        }
+    }
+    assert!(capture(false, || ()).1.is_none());
+}
+
+#[test]
+fn timing_actual_storage_counts_refresh_and_failures() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let (result, disabled) = timing::capture(false, || store.revision());
+    assert_eq!(result.unwrap(), "0");
+    assert!(disabled.is_none());
+    let (result, summary) = timing::capture(true, || store.revision());
+    assert_eq!(result.unwrap(), "0");
+    let m = summary.unwrap().metrics;
+    assert_eq!(
+        (
+            m.sqlite_begin.count,
+            m.sqlite_read.count,
+            m.sqlite_commit.count
+        ),
+        (1, 1, 1)
+    );
+    assert_eq!(m.projection.count, 1);
+    assert_eq!(m.refresh_reload.count, 0);
+    let (_, summary) = timing::capture(true, || {
+        store.save_draft(None, "Synthetic draft", false).unwrap()
+    });
+    let m = summary.unwrap().metrics;
+    assert_eq!(
+        (
+            m.sqlite_write.count,
+            m.sqlite_read.count,
+            m.quota_check.count
+        ),
+        (1, 2, 1)
+    );
+    let (_, summary) = timing::capture(true, || {
+        store
+            .select(Selection {
+                conversation: None,
+                selected_head: None,
+            })
+            .unwrap()
+    });
+    assert_eq!(summary.unwrap().metrics.sqlite_write.count, 1);
+    let mut other = fixture.open();
+    other.create_conversation("Synthetic title".into()).unwrap();
+    let (_, summary) = timing::capture(true, || store.revision().unwrap());
+    assert_eq!(summary.unwrap().metrics.refresh_reload.count, 1);
+    let (_, summary) = timing::capture(true, || store.revision().unwrap());
+    assert_eq!(summary.unwrap().metrics.refresh_reload.count, 0);
+    let conversation = store
+        .create_conversation("Synthetic completion".into())
+        .unwrap();
+    let context = store
+        .context(conversation.operation.id, None, 4096)
+        .unwrap();
+    let body = turn(&mut store, &context, "Synthetic prompt")
+        .operation
+        .body;
+    let (result, summary) = timing::capture(true, || store.complete_body(body));
+    assert!(result.unwrap().saved);
+    let m = summary.unwrap().metrics;
+    assert_eq!((m.sqlite_begin.count, m.sqlite_commit.count), (1, 1));
+    assert_eq!((m.sqlite_write.count, m.sqlite_read.count), (6, 8));
+    assert_eq!(m.reducer.count, 1);
+    assert!(m.record_encode.count > 0);
+    // Deferred foreign-key violation fails the real COMMIT, not a simulated timer.
+    store.db.execute_batch("CREATE TABLE synthetic_parent(id INTEGER PRIMARY KEY); CREATE TABLE synthetic_child(id INTEGER REFERENCES synthetic_parent(id) DEFERRABLE INITIALLY DEFERRED);").unwrap();
+    let (result, summary) = timing::capture(true, || {
+        let tx = store.db.timed_transaction()?;
+        tx.timed_execute("INSERT INTO synthetic_child VALUES(1)", [])?;
+        tx.timed_commit()
+    });
+    assert!(result.is_err());
+    assert_eq!(summary.unwrap().metrics.sqlite_commit.count, 1);
+    store.db.busy_timeout(std::time::Duration::ZERO).unwrap();
+    let _lock = other
+        .db
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    let (result, summary) = timing::capture(true, || store.allocate_id());
+    assert!(result.is_err());
+    assert_eq!(summary.unwrap().metrics.sqlite_begin.count, 1);
+}
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 static NEXT: AtomicUsize = AtomicUsize::new(0);

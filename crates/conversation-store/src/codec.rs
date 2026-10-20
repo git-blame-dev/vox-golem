@@ -20,7 +20,9 @@ pub fn canonical_record(raw: &str) -> Result<Record, DomainError> {
     if raw.len() > MAX_ENCODED_OPERATION_BYTES {
         return Err(limit("encoded_operation_bytes"));
     }
-    let operation: Operation = serde_json::from_str(raw).map_err(|_| invalid("operation_json"))?;
+    let operation: Operation = crate::timing::measure(crate::timing::Phase::record_decode, || {
+        serde_json::from_str(raw).map_err(|_| invalid("operation_json"))
+    })?;
     record(operation)
 }
 
@@ -49,7 +51,9 @@ pub fn parse_record(raw: &str) -> Result<Record, DomainError> {
     if raw.len() > MAX_ENCODED_OPERATION_BYTES + 256 {
         return Err(limit("encoded_operation_bytes"));
     }
-    let wire: WireRecord = serde_json::from_str(raw).map_err(|_| invalid("record_json"))?;
+    let wire: WireRecord = crate::timing::measure(crate::timing::Phase::record_decode, || {
+        serde_json::from_str(raw).map_err(|_| invalid("record_json"))
+    })?;
     let record = canonical_record(wire.operation.get())?;
     if record.body_key != wire.body_key {
         return Err(invalid("body_key_sha256_mismatch"));
@@ -74,6 +78,7 @@ impl Write for BoundedWriter {
     }
 }
 pub fn encode(value: &impl Serialize, max: usize, bound: &str) -> Result<String, DomainError> {
+    let _encode = crate::timing::span(crate::timing::Phase::record_encode);
     let mut writer = BoundedWriter { bytes: vec![], max };
     serde_json::to_writer(&mut writer, value).map_err(|_| limit(bound))?;
     String::from_utf8(writer.bytes).map_err(|_| invalid("encoding"))
