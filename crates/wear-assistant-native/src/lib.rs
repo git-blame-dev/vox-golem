@@ -1205,7 +1205,7 @@ mod tests {
         assert_eq!(value["status"], "complete");
         assert_eq!(value["contentType"], "refusal");
         assert_eq!(value["text"], "Synthetic refusal");
-        assert_eq!(value["speechText"], "Synthetic refusal");
+        assert!(value.get("speechText").is_none());
         assert!(value["authRevision"].is_string());
         let sent = server.join().unwrap();
         assert_eq!(sent["prompt_cache_key"], request.prompt.session_id);

@@ -45,15 +45,20 @@ class SentenceStreamAccumulatorTest {
         assertEquals(listOf("It is fine."), accumulator.onDelta("It is fine."))
     }
 
-    @Test fun pendingMarkdownDoesNotSplitInsideLinkOrCode() {
+    @Test fun firstParagraphStopsAtNewlineAndFlushesShortFirstParagraphImmediately() {
         val accumulator = SentenceStreamAccumulator()
-        assertTrue(accumulator.onDelta("Read this [short: useful").isEmpty())
-        assertTrue(accumulator.onDelta("Read this [short: useful guide](https://example.invalid/path;").isEmpty())
-        assertEquals(listOf("Read this short: useful guide."), accumulator.onDelta(
-            "Read this [short: useful guide](https://example.invalid/path;)."))
-        val code = SentenceStreamAccumulator()
-        assertTrue(code.onDelta("Try this `one; two").isEmpty())
-        assertEquals(listOf("Try this one; two."), code.onDelta("Try this `one; two`."))
+        assertEquals(listOf("First sentence is spoken.", "Second sentence too."), accumulator.onDelta(
+            "First sentence is spoken. Second sentence too.\n\nSecond paragraph is ignored."))
+        assertTrue(accumulator.isFirstParagraphComplete)
+        assertTrue(accumulator.onDelta(
+            "First sentence is spoken. Second sentence too.\n\nSecond paragraph is ignored. More details.").isEmpty())
+        assertTrue(accumulator.flushRemainder(
+            "First sentence is spoken. Second sentence too.\n\nSecond paragraph is ignored. More details.").isEmpty())
+
+        val shortFirstParagraph = SentenceStreamAccumulator()
+        assertTrue(shortFirstParagraph.onDelta("Yes.").isEmpty())
+        assertEquals(listOf("Yes."), shortFirstParagraph.onDelta("Yes.\n\nAdditional details in paragraph two."))
+        assertTrue(shortFirstParagraph.isFirstParagraphComplete)
     }
 
     @Test fun decimalAtDeltaEndWaitsForContinuation() {
@@ -62,13 +67,13 @@ class SentenceStreamAccumulatorTest {
         assertEquals(listOf("Value is 3.14."), accumulator.onDelta("Value is 3.14."))
     }
 
-    @Test fun longPlainTextHasBoundedWhitespaceSplitAndSanitizedFinalTail() {
+    @Test fun longPlainTextHasBoundedWhitespaceSplitAndFirstParagraphOnlyTail() {
         val accumulator = SentenceStreamAccumulator(hardSplitChars = 24)
         val text = "one two three four five six seven eight"
         val spoken = accumulator.onDelta(text) + accumulator.flushRemainder(text)
         assertTrue(spoken.size > 1)
         assertEquals(text, spoken.joinToString(" "))
         assertEquals(listOf("A final tail"), SentenceStreamAccumulator().flushRemainder(
-            "**A final tail**\nSources:\nhttps://example.invalid"))
+            "A final tail\n\nSources:\nhttps://example.invalid"))
     }
 }

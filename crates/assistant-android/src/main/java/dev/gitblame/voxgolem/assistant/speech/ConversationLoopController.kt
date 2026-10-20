@@ -34,146 +34,6 @@ interface EnginePort {
     fun stop()
 }
 
-/** Strips markdown formatting tokens before passing text to TextToSpeech so syntax characters are not spoken aloud. */
-object SpeechTextSanitizer {
-    private val FENCED_CODE_REGEX = Regex("```[a-zA-Z0-9_-]*\\s*([\\s\\S]*?)```")
-    private val INLINE_CODE_REGEX = Regex("`([^`]+)`")
-    private val MARKDOWN_LINK_REGEX = Regex("\\[([^\\]]+)]\\([^)]*\\)")
-    private val HEADING_REGEX = Regex("(?m)^\\s*#{1,6}\\s+")
-    private val LIST_MARKER_REGEX = Regex("(?m)^\\s*(?:[-*+]|\\d+\\.)\\s+")
-    private val BLOCKQUOTE_REGEX = Regex("(?m)^\\s*>+\\s*")
-    private val EMPHASIS_MARKER_REGEX = Regex("(\\*\\*|__|~~)")
-    private val SINGLE_ASTERISK_REGEX = Regex("(?<=\\s|^)\\*([^*\n]+)\\*(?=\\s|[.,!?;:]|$)")
-    private val WHITESPACE_REGEX = Regex("\\s+")
-
-    fun sanitize(text: String): String {
-        if (text.isBlank()) return ""
-        var result = text
-        result = FENCED_CODE_REGEX.replace(result, " $1 ")
-        result = INLINE_CODE_REGEX.replace(result, "$1")
-        result = MARKDOWN_LINK_REGEX.replace(result, "$1")
-        result = HEADING_REGEX.replace(result, "")
-        result = LIST_MARKER_REGEX.replace(result, "")
-        result = BLOCKQUOTE_REGEX.replace(result, "")
-        result = EMPHASIS_MARKER_REGEX.replace(result, "")
-        result = SINGLE_ASTERISK_REGEX.replace(result, "$1")
-        result = result.replace("`", "")
-        result = WHITESPACE_REGEX.replace(result, " ").trim()
-        return result
-    }
-}
-
-/** Incrementally splits cumulative streamed text into speakable sentence/clause chunks. */
-class SentenceStreamAccumulator(
-    private val hardSplitChars: Int = 140,
-) {
-    private var consumedLength = 0
-    private var consumedPrefix = ""
-    private var hasEmittedClause = false
-
-    fun reset() {
-        consumedLength = 0
-        consumedPrefix = ""
-        hasEmittedClause = false
-    }
-
-    fun onDelta(fullTextSoFar: String): List<String> {
-        val clean = stripSourcesSection(fullTextSoFar)
-        if (clean.length < consumedLength || !clean.startsWith(consumedPrefix)) {
-            reset()
-        }
-        val emitted = ArrayList<String>()
-        while (consumedLength < clean.length) {
-            val unconsumed = clean.substring(consumedLength)
-            val splitEnd = findNextBoundary(unconsumed) ?: break
-            var nextOffset = splitEnd
-            while (nextOffset < unconsumed.length && unconsumed[nextOffset].isWhitespace()) {
-                nextOffset++
-            }
-            val rawClause = unconsumed.substring(0, splitEnd)
-            consumedLength += nextOffset
-            consumedPrefix = clean.substring(0, consumedLength)
-            val sanitized = SpeechTextSanitizer.sanitize(rawClause)
-            if (sanitized.isNotEmpty()) {
-                emitted += sanitized
-                hasEmittedClause = true
-            }
-        }
-        return emitted
-    }
-
-    fun flushRemainder(finalText: String): List<String> {
-        val clean = stripSourcesSection(finalText)
-        val emitted = ArrayList<String>()
-        emitted += onDelta(clean)
-        if (consumedLength < clean.length) {
-            val tail = SpeechTextSanitizer.sanitize(clean.substring(consumedLength))
-            if (tail.isNotEmpty()) {
-                emitted += tail
-            }
-        }
-        consumedLength = clean.length
-        consumedPrefix = clean
-        return emitted
-    }
-
-    private fun findNextBoundary(unconsumed: String): Int? {
-        var codeDelimiter = 0
-        var brackets = 0
-        var linkParentheses = 0
-        var hardBoundary: Int? = null
-        var i = 0
-        val minimumWords = if (hasEmittedClause) 1 else 3
-        fun wordCount(end: Int): Int = SpeechTextSanitizer.sanitize(unconsumed.substring(0, end))
-            .split(Regex("\\s+"))
-            .count { word -> word.any { it.isLetterOrDigit() } }
-        while (i < unconsumed.length) {
-            val ch = unconsumed[i]
-            if (ch == '`') {
-                var end = i + 1
-                while (end < unconsumed.length && unconsumed[end] == '`') end++
-                val run = end - i
-                if (codeDelimiter == 0) codeDelimiter = run else if (codeDelimiter == run) codeDelimiter = 0
-                i = end
-                continue
-            }
-            if (codeDelimiter == 0) {
-                when (ch) {
-                    '[' -> brackets++
-                    ']' -> if (brackets > 0) brackets--
-                    '(' -> if (linkParentheses > 0 || (i > 0 && unconsumed[i - 1] == ']')) linkParentheses++
-                    ')' -> if (linkParentheses > 0) linkParentheses--
-                }
-                if (brackets == 0 && linkParentheses == 0) {
-                    val nextIsWhitespace = i + 1 < unconsumed.length && unconsumed[i + 1].isWhitespace()
-                    val atEnd = i == unconsumed.lastIndex
-                    val decimal = if (ch == '.' && i > 0 && unconsumed[i - 1].isDigit()) {
-                        val tokenStart = unconsumed.lastIndexOfAny(charArrayOf(' ', '\t', '\n'), i - 1) + 1
-                        (!atEnd && unconsumed[i + 1].isDigit()) ||
-                            (atEnd && '.' !in unconsumed.substring(tokenStart, i))
-                    } else false
-                    val sentenceBoundary = ch in ".!?:;" && !decimal && (atEnd || nextIsWhitespace)
-                    if ((ch == '\n' || sentenceBoundary) && wordCount(i + 1) >= minimumWords) return i + 1
-                    if (ch == ',' && nextIsWhitespace && wordCount(i + 1) >= 5) return i + 1
-                    if (ch.isWhitespace() && (i <= hardSplitChars || hardBoundary == null) && wordCount(i) >= minimumWords) {
-                        hardBoundary = i
-                    }
-                }
-            }
-            if (i >= hardSplitChars && hardBoundary != null) return hardBoundary
-            i++
-        }
-        return null
-    }
-
-    private fun stripSourcesSection(text: String): String {
-        val marker = text.indexOf("\nSources:")
-        // Retain the separator already consumed by earlier deltas; shortening that prefix
-        // would reset the cursor and speak the answer again when citations arrive.
-        return if (marker >= 0) text.substring(0, marker + 1) else text
-    }
-}
-
 enum class LoopPhase { IDLE, LISTENING, GENERATING, SPEAKING, BETWEEN_TURNS, PAUSED, ERROR }
 /** Transient consent for this session, never a persisted global speech preference. */
 enum class VoiceSessionPolicy { SINGLE_TURN, REPEAT_AFTER_REPLY }
@@ -207,10 +67,7 @@ class ConversationLoopController @JvmOverloads constructor(
     private var enginePrewarmedForTurn = false
     private var lastDraftSyncAt: Long? = null
     private var unsyncedDraft = false
-    private val sentenceAccumulator = SentenceStreamAccumulator()
-    private var streamedChunksInTurn = 0
-    private var pendingStreamChunksInTurn = 0
-    private var generationCompletedForTurn = false
+    private val speechStreamer = ReplySpeechStreamer(output.asController())
     private var flowTiming: AssistantTiming? = null
     private var turnTiming: AssistantTiming? = null
     private val recognitionSubscription = dictation.subscribe { value ->
@@ -260,7 +117,7 @@ class ConversationLoopController @JvmOverloads constructor(
         enginePrewarmedForTurn = false
         lastDraftSyncAt = null
         unsyncedDraft = false
-        resetStreamTurnState()
+        speechStreamer.reset()
         engine.beginInput(turnTiming)
         engine.setRecordedAudio(null)
         publish(ConversationLoopState(LoopPhase.LISTENING, draft))
@@ -321,7 +178,7 @@ class ConversationLoopController @JvmOverloads constructor(
                 if (value.archiveExpected && value.recordedAudio == null) { fail(ticket, "recording_save_failed"); return }
                 engine.setRecordedAudio(value.recordedAudio)
                 if (!current(ticket)) return
-                resetStreamTurnState()
+                speechStreamer.reset()
                 // Phase changes before any external call: repeated SDK final callbacks cannot send twice.
                 publish(state.copy(phase = LoopPhase.GENERATING))
                 if (!current(ticket)) return
@@ -348,20 +205,15 @@ class ConversationLoopController @JvmOverloads constructor(
     private fun handleStreamText(ticket: Long, turn: Long, fullTextSoFar: String) {
         if (!current(ticket) || turn != generation || state.phase != LoopPhase.GENERATING) return
         if (!output.snapshot().enabled) return
-        val clauses = sentenceAccumulator.onDelta(fullTextSoFar)
-        for (clause in clauses) {
-            if (!current(ticket) || turn != generation || state.phase != LoopPhase.GENERATING) return
-            enqueueStreamClause(ticket, turn, clause)
-        }
-    }
-    private fun enqueueStreamClause(ticket: Long, turn: Long, clause: String) {
-        turnTiming?.mark(Stage.FIRST_CLAUSE_READY)
-        streamedChunksInTurn++
-        pendingStreamChunksInTurn++
-        val isFirst = streamedChunksInTurn == 1
-        output.speakStreamChunk(clause, language, flush = isFirst, keepOpen = true, timingParent = turnTiming) { error ->
-            main.post { onStreamChunkDone(ticket, turn, error) }
-        }
+        speechStreamer.onDelta(
+            fullTextSoFar = fullTextSoFar,
+            language = language,
+            timingParent = turnTiming,
+            onFirstClause = { turnTiming?.mark(Stage.FIRST_CLAUSE_READY) },
+            onError = { error ->
+                main.post { onStreamChunkDone(ticket, turn, error) }
+            }
+        )
     }
     private fun onStreamChunkDone(ticket: Long, turn: Long, error: String?) {
         if (!current(ticket) || turn != generation) return
@@ -370,10 +222,6 @@ class ConversationLoopController @JvmOverloads constructor(
                 fail(ticket, error)
             }
             return
-        }
-        pendingStreamChunksInTurn = (pendingStreamChunksInTurn - 1).coerceAtLeast(0)
-        if (generationCompletedForTurn && pendingStreamChunksInTurn == 0 && state.phase == LoopPhase.SPEAKING) {
-            next(ticket)
         }
     }
     private fun onGeneration(ticket: Long, turn: Long, result: GenerationResult) {
@@ -386,29 +234,13 @@ class ConversationLoopController @JvmOverloads constructor(
                 onReplyCompleted(result)
                 if (!current(ticket)) return
                 if (!output.snapshot().enabled) { next(ticket); return }
-                val remainingClauses = sentenceAccumulator.flushRemainder(result.finalText)
-                if (streamedChunksInTurn == 0 && remainingClauses.size <= 1) {
-                    val spokenText = remainingClauses.firstOrNull()
-                        ?: SpeechTextSanitizer.sanitize(result.finalText).ifEmpty { result.finalText.trim() }
-                    publish(state.copy(phase = LoopPhase.SPEAKING))
-                    if (!current(ticket)) return
-                    output.speak(spokenText, language, turnTiming) { error -> main.post {
-                        if (!current(ticket) || state.phase != LoopPhase.SPEAKING) return@post
-                        if (error != null) fail(ticket, error) else next(ticket)
-                    } }
-                    return
-                }
                 publish(state.copy(phase = LoopPhase.SPEAKING))
                 if (!current(ticket)) return
-                for (clause in remainingClauses) {
-                    if (!current(ticket) || turn != generation || state.phase != LoopPhase.SPEAKING) return
-                    enqueueStreamClause(ticket, turn, clause)
-                }
-                if (!current(ticket) || turn != generation || state.phase != LoopPhase.SPEAKING) return
-                generationCompletedForTurn = true
-                output.finishStream()
-                if (pendingStreamChunksInTurn == 0) {
-                    next(ticket)
+                speechStreamer.onComplete(result.finalText, language, turnTiming) { error ->
+                    main.post {
+                        if (!current(ticket) || state.phase != LoopPhase.SPEAKING) return@post
+                        if (error != null) fail(ticket, error) else next(ticket)
+                    }
                 }
             }
         }
@@ -416,7 +248,7 @@ class ConversationLoopController @JvmOverloads constructor(
     private fun next(ticket: Long) {
         if (!current(ticket)) return
         turnTiming?.finish(Stage.SETTLED); turnTiming = null
-        resetStreamTurnState()
+        speechStreamer.reset()
         if (policy == VoiceSessionPolicy.SINGLE_TURN) {
             flowTiming?.finish(Stage.SETTLED); flowTiming = null
             engine.stop()
@@ -443,20 +275,14 @@ class ConversationLoopController @JvmOverloads constructor(
     fun stop() {
         retainInput(epoch.getAndIncrement())
         dictation.stop(); output.stop(); engine.stop()
-        onMain { clearPending(); resetStreamTurnState(); finishTimings(Stage.CANCELLED); publish(state.copy(phase = LoopPhase.IDLE, error = null)) }
+        onMain { clearPending(); speechStreamer.reset(); finishTimings(Stage.CANCELLED); publish(state.copy(phase = LoopPhase.IDLE, error = null)) }
     }
     private fun cancelOwners(retireGeneration: Boolean = true) {
         clearPending()
-        resetStreamTurnState()
+        speechStreamer.reset()
         dictation.stop()
         output.stop()
         if (retireGeneration) engine.stop()
-    }
-    private fun resetStreamTurnState() {
-        sentenceAccumulator.reset()
-        streamedChunksInTurn = 0
-        pendingStreamChunksInTurn = 0
-        generationCompletedForTurn = false
     }
     private fun retainInput(ticket: Long) {
         val input = dictation.snapshot()
@@ -478,7 +304,7 @@ class ConversationLoopController @JvmOverloads constructor(
             closed = true
             finishTimings(Stage.CANCELLED)
             clearPending()
-            resetStreamTurnState()
+            speechStreamer.reset()
             recognitionSubscription.close()
             streamSubscription.close()
             observers.clear()

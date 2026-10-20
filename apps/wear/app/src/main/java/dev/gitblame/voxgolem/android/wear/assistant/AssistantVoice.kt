@@ -139,6 +139,7 @@ internal class WearAssistantVoice(
     private var publishedOptions: SpeechOptions? = null
     private val replyEpoch = AtomicLong()
     private var manualRequest: Long? = null
+    private var manualStreamSubscription: AutoCloseable? = null
     private var foreground = false
     private var closed = false
     private var repliesEnabled = false
@@ -327,12 +328,33 @@ internal class WearAssistantVoice(
         error = null
         if (output.snapshot().phase != SpeechPhase.PREPARING) output.stop()
         if (speakReply) output.prepare(language)
+        val speechStreamer = ReplySpeechStreamer(output.asController())
+        manualStreamSubscription?.close()
+        manualStreamSubscription = if (speakReply) {
+            generation.observeStreamText { fullTextSoFar ->
+                main.post {
+                    if (manualRequest == ticket && currentReply(ticket)) {
+                        speechStreamer.onDelta(fullTextSoFar, language, onError = { failure ->
+                            main.post { if (currentReply(ticket)) { error = failure; publish() } }
+                        })
+                    }
+                }
+            }
+        } else null
         try {
             generation.sendFinal(engine.snapshot().draft) { result -> main.post {
                 if (manualRequest != ticket) return@post
                 manualRequest = null
-                if (!speakReply || !currentReply(ticket) || result !is GenerationResult.Complete || result.finalText.isBlank()) return@post
-                output.speak(result.finalText, language) { failure -> main.post {
+                manualStreamSubscription?.close()
+                manualStreamSubscription = null
+                if (!speakReply || !currentReply(ticket) || result !is GenerationResult.Complete || result.finalText.isBlank()) {
+                    if (speechStreamer.hasStreamedChunks) {
+                        speechStreamer.reset()
+                        output.stop()
+                    }
+                    return@post
+                }
+                speechStreamer.onComplete(result.finalText, language) { failure -> main.post {
                     if (currentReply(ticket)) { error = failure; publish() }
                 } }
             } }
@@ -342,7 +364,12 @@ internal class WearAssistantVoice(
         return true
     }
     private fun currentReply(ticket: Long) = ticket == replyEpoch.get() && foreground && repliesEnabled && !closed && !mode
-    private fun retireManualReply() { replyEpoch.incrementAndGet(); manualRequest = null }
+    private fun retireManualReply() {
+        replyEpoch.incrementAndGet()
+        manualRequest = null
+        manualStreamSubscription?.close()
+        manualStreamSubscription = null
+    }
     override fun endUtterance() {
         microphoneCues?.finish(dictation.snapshot().utterance)
         loop.endUtterance()
@@ -360,7 +387,9 @@ internal class WearAssistantVoice(
     }
     override fun speak(text: String) {
         if (!admit() || snapshot().listening || mode) return
-        output.speak(text, language) { failure -> error = failure; publish() }
+        val firstParagraph = FirstParagraphSpeech.extract(text)
+        if (firstParagraph.isBlank()) return
+        output.speak(firstParagraph, language) { failure -> error = failure; publish() }
     }
     private fun preservePartial() {
         val value = dictation.snapshot()

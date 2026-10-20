@@ -857,14 +857,19 @@ class AssistantEngineTest {
         engine.submit("voice-synthetic-phone-turn", "Synthetic phone question", resultListener = AssistantResultListener { _, _ -> })
         io.drain(); settle()
         val phone = provider.requests.last().getString("instructions")
-        assertTrue(phone.contains("shortest complete natural answer"))
-        assertTrue(phone.contains("valid JSON"))
+        assertTrue(phone.contains("Answer directly in plain text"))
+        assertTrue(phone.contains("Always start with a first paragraph of one or two concise natural sentences"))
+        assertTrue(phone.contains("structured stage JSON"))
         assertTrue(phone.contains("Use the available web tools"))
         engine.submitSpeech("voice:synthetic-watch-turn", "Synthetic watch question", state.conversation, AssistantResultListener { _, _ -> })
         io.drain(); settle()
-        assertTrue(provider.requests.last().getString("instructions").contains("one or two short sentences"))
+        val watch = provider.requests.last().getString("instructions")
+        assertTrue(watch.contains("Answer directly in plain text"))
+        assertTrue(watch.contains("Always start with a first paragraph of one or two concise natural sentences"))
         engine.setDraft("Synthetic typed followup"); engine.send(); io.drain(); settle()
-        assertFalse(provider.requests.last().getString("instructions").contains("For this spoken turn"))
+        val typed = provider.requests.last().getString("instructions")
+        assertEquals(phone, typed)
+        assertFalse(typed.contains("For this spoken turn"))
     }
 
     @Test fun actorRejectsOwnedSpeechDraftAndFinalIfSelectedHeadChangesAfterAsrAdmission() {
@@ -1051,7 +1056,6 @@ class AssistantEngineTest {
         var result: AssistantRequestResult? = null
         engine.submit("synthetic-speech-projection", "Synthetic question", resultListener = AssistantResultListener { final, _ -> result = final })
         io.drain(); settle()
-        assertEquals("Synthetic answer", result!!.speechText)
         val stored = JSONObject(result!!.recordJson!!).getJSONObject("operation").getJSONObject("body")
         assertEquals("Synthetic answer", stored.getJSONObject("answer").getString("text"))
         assertEquals("https://example.test/synthetic", stored.getJSONArray("sources").getJSONObject(0).getString("url"))

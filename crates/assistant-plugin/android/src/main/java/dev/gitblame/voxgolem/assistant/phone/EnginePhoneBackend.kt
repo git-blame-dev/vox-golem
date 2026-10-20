@@ -48,6 +48,7 @@ class EnginePhoneBackend internal constructor(
     }
     fun stopSpeechRequest(requestId: String) { cancelDelivery(requestId) }
     fun prewarm() { runCatching { engine.prewarm() } }
+    fun observeSpeechStream(listener: (String?, String) -> Unit): AutoCloseable = engine.observeProvisionalStream(listener)
 
     override fun command(name: String, arguments: JSONObject, reply: (Result<Any?>) -> Unit) {
         if (name == "cancel_prompt") {
@@ -286,7 +287,6 @@ class EnginePhoneBackend internal constructor(
                             outcome.put("first_text_ms", result.firstTextMs)
                             outcome.put("completed_ms", result.completedMs)
                         }
-                        result.speechText?.let { outcome.put("speechText", it) }
                         if (owner != null) committedVoiceInputContext(record).let { committed ->
                             outcome.put("voiceContext", JSONObject().put("conversation", committed.conversation)
                                 .put("selectedHead", committed.selectedHead))

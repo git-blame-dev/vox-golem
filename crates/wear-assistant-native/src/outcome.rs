@@ -15,8 +15,6 @@ pub(crate) enum Outcome {
         returned_model: Option<String>,
         #[serde(rename = "authRevision", skip_serializing_if = "Option::is_none")]
         auth_revision: Option<String>,
-        #[serde(rename = "speechText", skip_serializing_if = "Option::is_none")]
-        speech_text: Option<String>,
         #[serde(rename = "searchMs", skip_serializing_if = "Option::is_none")]
         search_ms: Option<u64>,
         #[serde(rename = "searchStatus", skip_serializing_if = "Option::is_none")]
@@ -97,7 +95,6 @@ impl Outcome {
                 content_type: response.content_type.as_str(),
                 returned_model: response.model,
                 auth_revision: None,
-                speech_text: None,
                 search_ms: None,
                 search_status: None,
                 fallback_used: None,
@@ -116,7 +113,6 @@ impl Outcome {
         response: CustomOpenAiResponse,
         observed_sources: Vec<SourceLink>,
     ) -> Self {
-        let speech_text = response.text.clone();
         let mut canonical_sources = Vec::new();
         if response.content_type
             != voxgolem_platform::custom_openai::CustomOpenAiContentType::Refusal
@@ -137,14 +133,8 @@ impl Outcome {
             return Self::error(ErrorCode::TooLarge);
         }
         let mut outcome = Self::from_response(Ok(response));
-        if let Self::Complete {
-            sources,
-            speech_text: speech,
-            ..
-        } = &mut outcome
-        {
+        if let Self::Complete { sources, .. } = &mut outcome {
             *sources = canonical_sources;
-            *speech = Some(speech_text);
         }
         outcome
     }
@@ -197,7 +187,7 @@ mod tests {
         .unwrap();
         assert_eq!(value["text"], "Synthetic answer");
         assert_eq!(value["sources"], serde_json::json!([source]));
-        assert_eq!(value["speechText"], "Synthetic answer");
+        assert!(value.get("speechText").is_none());
         assert_eq!(
             Outcome::from_search_response(
                 response(

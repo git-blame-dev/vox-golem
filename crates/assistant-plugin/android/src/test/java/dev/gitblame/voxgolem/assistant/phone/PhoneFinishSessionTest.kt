@@ -50,7 +50,15 @@ class PhoneFinishSessionTest {
         fun publishHead(value: String?) { head = value; contextObservers.toList().forEach { it() } }
         override fun saveOwnedSpeechDraft(text: String, conversation: String?) { if (this.conversation == conversation) saveSpeechDraft(text) }
         val cancelledRequests = mutableListOf<String>()
+        private val streamListeners = mutableListOf<(String?, String) -> Unit>()
         override fun stopSpeechRequest(requestId: String) { cancelledRequests += requestId }
+        override fun observeSpeechStream(listener: (String?, String) -> Unit): AutoCloseable {
+            streamListeners += listener
+            return AutoCloseable { streamListeners -= listener }
+        }
+        fun publishStream(requestId: String?, provisional: String) {
+            streamListeners.toList().forEach { it(requestId, provisional) }
+        }
         override fun nativePreferences() = JSONObject().put("tts_enabled", ttsEnabled)
         override var speechStatus: JSONObject? = null
         override var onPreferencesChanged: ((Boolean) -> Unit)? = null
@@ -123,9 +131,9 @@ class PhoneFinishSessionTest {
         return tts
     }
     private fun answer(text: String = "Synthetic answer-only speech") = Result.success<Any?>(JSONObject()
-        .put("kind", "completed").put("speechText", text)
+        .put("kind", "completed")
         .put("turn", JSONObject().put("answer", JSONObject().put("content", JSONObject()
-            .put("kind", "text").put("text", "Synthetic canonical answer")))))
+            .put("kind", "text").put("text", "$text\n\nSources:\nhttps://example.invalid")))))
 
     @Before fun prepare() {
         AssistantRuntime.configureCaptureResourceAdmission(true)
@@ -605,8 +613,8 @@ class PhoneFinishSessionTest {
         assertEquals("end", cue.active)
         val stops = cue.stops
         tts.beforeSpeak = { assertNull(cue.active); assertTrue(cue.stops > stops) }
-        val value = JSONObject().put("kind", "completed").put("speechText", "Synthetic answer-only speech")
-            .put("turn", JSONObject().put("answer", JSONObject().put("content", JSONObject().put("kind", "text").put("text", "Synthetic canonical answer"))))
+        val value = JSONObject().put("kind", "completed")
+            .put("turn", JSONObject().put("answer", JSONObject().put("content", JSONObject().put("kind", "text").put("text", "Synthetic answer-only speech\n\nSources:\nhttps://example.invalid"))))
         val replyTicket = phone.onRequestSubmitted("synthetic-typed-answer")
         phone.onRequestResult("synthetic-typed-answer", Result.success(value), replyTicket); drain()
         assertEquals(listOf("Synthetic answer-only speech"), tts.spoken)
@@ -703,6 +711,32 @@ class PhoneFinishSessionTest {
         phone.onRequestResult(id, answer(), ticket); drain()
         assertEquals(listOf("Synthetic answer-only speech"), tts.spoken)
         assertEquals(1, submits().size)
+    }
+
+    @Test @Config(shadows = [PhoneCueTtsShadow::class]) fun nonLoopStreamingSpeaksFirstParagraphOnlyAndIsolatesRepliesAcrossPreferenceAndBackgroundInterruptions() {
+        val tts = enableTts()
+        val firstTicket = phone.onRequestSubmitted("synthetic-stream-request-1")
+        backend.publishStream("synthetic-stream-request-1", "First streamed clause is ready. ")
+        drain()
+        assertEquals(listOf("First streamed clause is ready."), tts.spoken)
+        backend.ttsEnabled = false
+        backend.onPreferencesChanged!!.invoke(false)
+        drain()
+        backend.ttsEnabled = true
+        backend.onPreferencesChanged!!.invoke(true)
+        drain()
+        val reenabledTts = readyTts()
+        phone.onRequestResult("synthetic-stream-request-1", answer("First streamed clause is ready. Second clause."), firstTicket)
+        drain()
+        assertTrue(reenabledTts.spoken.isEmpty())
+
+        val secondTicket = phone.onRequestSubmitted("synthetic-stream-request-2")
+        backend.publishStream("synthetic-stream-request-2", "Second turn first clause. Second turn second clause.\n\nSecond paragraph details.")
+        drain()
+        assertEquals(listOf("Second turn first clause.", "Second turn second clause."), reenabledTts.spoken)
+        phone.onRequestResult("synthetic-stream-request-2", answer("Second turn first clause. Second turn second clause."), secondTicket)
+        drain()
+        assertEquals(listOf("Second turn first clause.", "Second turn second clause."), reenabledTts.spoken)
     }
 
     @Test fun idleBackgroundAndCloseDoNotOverwriteNewerDraftOrResurrectSentFinal() {

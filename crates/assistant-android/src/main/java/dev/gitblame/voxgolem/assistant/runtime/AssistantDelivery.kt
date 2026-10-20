@@ -24,7 +24,6 @@ data class AssistantRequestResult(
     val code: String? = null,
     val revision: String? = null,
     val recordJson: String? = null,
-    val speechText: String? = null,
     val firstTextMs: Long? = null,
     val completedMs: Long? = null,
     val terminalContextJson: String? = null,

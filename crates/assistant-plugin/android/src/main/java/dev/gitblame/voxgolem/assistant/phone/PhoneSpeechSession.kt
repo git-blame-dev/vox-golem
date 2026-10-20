@@ -12,9 +12,11 @@ import dev.gitblame.voxgolem.assistant.recognition.VoiceCapturePurpose
 import dev.gitblame.voxgolem.assistant.recognition.recognitionUiError
 import dev.gitblame.voxgolem.assistant.runtime.AssistantRuntime
 import dev.gitblame.voxgolem.assistant.speech.ConversationLoopController
+import dev.gitblame.voxgolem.assistant.speech.ReplySpeechStreamer
 import dev.gitblame.voxgolem.assistant.speech.EnginePort
 import dev.gitblame.voxgolem.assistant.speech.GenerationResult
 import dev.gitblame.voxgolem.assistant.speech.LocalSpeechOutput
+import dev.gitblame.voxgolem.assistant.speech.asController
 import dev.gitblame.voxgolem.assistant.speech.AndroidListeningCue
 import dev.gitblame.voxgolem.assistant.speech.MicrophoneCueController
 import dev.gitblame.voxgolem.assistant.speech.ListeningCue
@@ -45,6 +47,7 @@ internal interface PhoneSpeechBackend {
     fun publishSpeechOptions(options: SpeechOptions) {}
     fun stopSpeechRequest(requestId: String)
     fun prewarm() {}
+    fun observeSpeechStream(listener: (String?, String) -> Unit): AutoCloseable = AutoCloseable {}
     fun nativePreferences(): JSONObject
     var speechStatus: JSONObject?
     var onPreferencesChanged: ((Boolean) -> Unit)?
@@ -73,6 +76,7 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
         override fun publishSpeechOptions(options: SpeechOptions) = backend.publishSpeechOptions(options)
         override fun stopSpeechRequest(requestId: String) = backend.stopSpeechRequest(requestId)
         override fun prewarm() = backend.prewarm()
+        override fun observeSpeechStream(listener: (String?, String) -> Unit) = backend.observeSpeechStream(listener)
         override fun nativePreferences() = backend.nativePreferences()
         override var speechStatus: JSONObject?
             get() = backend.speechStatus
@@ -88,11 +92,19 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
     private val microphoneCues = MicrophoneCueController(listeningCue)
     private val preferenceObserver: (Boolean) -> Unit = { enabled ->
         if (!closed) {
+            if (!enabled) {
+                main.post { synchronized(replyLock) { replyOwner?.streamer }?.cancel() }
+            }
             output.setEnabled(enabled)
             if (visible && enabled) output.prepare(language)
         }
     }
-    private data class ReplyOwner(val requestId: String, val ticket: Long, val loopReply: Boolean)
+    private data class ReplyOwner(
+        val requestId: String,
+        val ticket: Long,
+        val loopReply: Boolean,
+        val streamer: ReplySpeechStreamer? = null,
+    )
     private val replyLock = Any()
     private var replySerial = 0L
     private var replyOwner: ReplyOwner? = null
@@ -126,6 +138,12 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
         override fun prewarm() = backend.prewarm()
         override fun setDraft(text: String) = backend.saveOwnedSpeechDraft(text, draftConversation, draftHead)
         override fun setRecordedAudio(audio: RecordedAudioResult?) { inputAudio = audio }
+        override fun observeStreamText(listener: (String) -> Unit): AutoCloseable = backend.observeSpeechStream { requestId: String?, provisional: String ->
+            val activeId = waiting?.first
+            if (activeId != null && activeId == requestId && provisional.isNotEmpty()) {
+                listener(provisional)
+            }
+        }
         override fun sendFinal(text: String, onTerminal: (GenerationResult) -> Unit) {
             if (closed || !visible || backend.speechOwner() != SpeechInputOwner(draftConversation, draftHead)) { onTerminal(GenerationResult.Failed("conversation_changed")); return }
             val requestId = "voice-${UUID.randomUUID()}"
@@ -182,6 +200,24 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
                 main.post {
                     synchronized(replyLock) {
                         if (!closed && waitingInputContextChanged()) stop()
+                    }
+                }
+            }
+        },
+        backend.observeSpeechStream { requestId, provisional ->
+            if (!closed && provisional.isNotEmpty() && requestId != null) {
+                main.post {
+                    val streamer = synchronized(replyLock) {
+                        replyOwner?.takeIf { !it.loopReply && it.requestId == requestId }?.streamer
+                    }
+                    if (!closed && streamer != null && visible && AssistantRuntime.captureResourceAdmissionReady() &&
+                        output.snapshot().enabled && loop.snapshot().phase !in setOf(LoopPhase.GENERATING, LoopPhase.SPEAKING, LoopPhase.LISTENING)) {
+                        streamer.onDelta(
+                            fullTextSoFar = provisional,
+                            language = language,
+                            onFirstClause = { publishStatus() },
+                            onError = { publishStatus() }
+                        )
                     }
                 }
             }
@@ -266,11 +302,16 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
 
     fun foreground(visible: Boolean, retainGeneration: Boolean = false) {
         val retainVoice = !visible && retainGeneration && authorizedVoiceRequest() != null
-        synchronized(replyLock) {
+        val retiredStreamer = synchronized(replyLock) {
             if (closed) return
             generationEligible = visible || retainGeneration
             this.visible = visible
-            if (!visible && (!retainVoice || replyOwner?.requestId != authorizedVoiceRequest())) replyOwner = null
+            if (!visible && (!retainVoice || replyOwner?.requestId != authorizedVoiceRequest())) {
+                replyOwner?.streamer.also { replyOwner = null }
+            } else null
+        }
+        retiredStreamer?.let { streamer ->
+            if (Looper.myLooper() == main.looper) streamer.cancel() else main.post { streamer.cancel() }
         }
         if (!visible) preserveActiveDraft()
         microphoneCues.foreground(visible)
@@ -410,11 +451,26 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
         if (closed || (!visible && retainedSubmissionId() != requestId) ||
             (nativeVoice && submissionOwner(requestId) == null)) return@synchronized 0L
         if (waiting?.first == requestId || shortcutRequest == requestId) ownedVoiceRequest = requestId
-        val owner = ReplyOwner(requestId, ++replySerial, waiting?.first == requestId)
+        val isLoopReply = waiting?.first == requestId
+        val previousStreamer = replyOwner?.streamer
+        val owner = ReplyOwner(
+            requestId = requestId,
+            ticket = ++replySerial,
+            loopReply = isLoopReply,
+            streamer = if (isLoopReply) null else ReplySpeechStreamer(output.asController()),
+        )
         replyOwner = owner
+        previousStreamer?.let { streamer ->
+            if (Looper.myLooper() == main.looper) streamer.cancel() else main.post { streamer.cancel() }
+        }
         owner.ticket
     }
-    private fun retireReplies() { synchronized(replyLock) { replyOwner = null } }
+    private fun retireReplies() {
+        val retiredStreamer = synchronized(replyLock) { replyOwner?.streamer.also { replyOwner = null } }
+        retiredStreamer?.let { streamer ->
+            if (Looper.myLooper() == main.looper) streamer.cancel() else main.post { streamer.cancel() }
+        }
+    }
     private fun stopOwnedVoiceRequest() {
         val requestId = synchronized(replyLock) { ownedVoiceRequest.also { ownedVoiceRequest = null } }
         requestId?.let(backend::stopSpeechRequest)
@@ -454,7 +510,11 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
                 val pending = waiting?.takeIf { it.first == requestId }
                 if (pending == null) {
                     if (visible && !owner.loopReply && value != null && !value.has("warning") && turn != null && AssistantRuntime.captureResourceAdmissionReady() && output.snapshot().enabled && value.optString("kind") in setOf("completed", "refused") && loop.snapshot().phase !in setOf(LoopPhase.GENERATING, LoopPhase.SPEAKING, LoopPhase.LISTENING)) {
-                        output.speak(value.optString("speechText").takeIf { it.isNotBlank() } ?: turn.getJSONObject("answer").getJSONObject("content").let { it.getString(if (it.getString("kind") == "refusal") "reason" else "text") }, language) { publishStatus() }
+                        val fullText = turn.getJSONObject("answer").getJSONObject("content").let { it.getString(if (it.getString("kind") == "refusal") "reason" else "text") }
+                        owner.streamer?.onComplete(fullText, language) { publishStatus() }
+                    } else if (!owner.loopReply && owner.streamer?.hasStreamedChunks == true) {
+                        owner.streamer.reset()
+                        output.stop()
                     }
                     publishStatus()
                     if (!visible) { sessionId = null; sink = null }
@@ -464,7 +524,8 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
                 waiting = null; waitingAudio = null
                 pending.second(if (value != null && value.has("warning")) GenerationResult.Failed(value.getString("warning"))
                 else if (value != null && turn != null && value.optString("kind") in setOf("completed", "refused")) {
-                    GenerationResult.Complete(value.optString("speechText").takeIf { it.isNotBlank() } ?: turn.getJSONObject("answer").getJSONObject("content").let { it.getString(if (it.getString("kind") == "refusal") "reason" else "text") },
+                    val fullText = turn.getJSONObject("answer").getJSONObject("content").let { it.getString(if (it.getString("kind") == "refusal") "reason" else "text") }
+                    GenerationResult.Complete(fullText,
                         value.optJSONObject("voiceContext")?.let { context -> SpeechInputOwner(
                             if (context.isNull("conversation")) null else context.getString("conversation"),
                             if (context.isNull("selectedHead")) null else context.getString("selectedHead")) }, audio)
@@ -476,10 +537,13 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
     }
 
     override fun close() {
-        synchronized(replyLock) {
+        val retiredStreamer = synchronized(replyLock) {
             if (closed) return
             closed = true
-            replyOwner = null
+            replyOwner?.streamer.also { replyOwner = null }
+        }
+        retiredStreamer?.let { streamer ->
+            if (Looper.myLooper() == main.looper) streamer.cancel() else main.post { streamer.cancel() }
         }
         microphoneCues.close()
         stop(); subscriptions.forEach { it.close() }; loop.close(); dictation.close(); output.close()

@@ -99,9 +99,8 @@ class GeminiNanoProviderTest {
 
     @Test fun capabilityDisclosureAndSpokenFormatQualificationRemainExplicit() {
         val request = JSONObject().put("prompt", "Return JSON.").put("instructions",
-            "Custom instruction. For this spoken turn, give the shortest complete natural answer.")
-        assertEquals(capabilityNote + "System Instructions:\nCustom instruction.\n\n" +
-            "[System note: For this spoken response, be concise; preserve requested format and essential qualifications.]\n\nReturn JSON.",
+            "Custom instruction.")
+        assertEquals(capabilityNote + "System Instructions:\nCustom instruction.\n\nReturn JSON.",
             GeminiNanoProvider.formatPrompt(request))
         assertEquals(capabilityNote + "Hello", GeminiNanoProvider.formatPrompt(JSONObject().put("prompt", "Hello")))
     }
@@ -271,9 +270,9 @@ class GeminiNanoProviderTest {
             .put(JSONObject().put("role", "assistant").put("content", "A synthetic beacon.\n\nSources:\nhttps://example.invalid/beacon"))
             .put(JSONObject().put("role", "user").put("content", "What about its color?"))
         val request = JSONObject().put("messages", messages).put("webEnabled", true)
-            .put("instructions", "You are a helpful assistant. For this spoken turn, be concise.")
+            .put("instructions", "You are a helpful assistant. Be concise.")
         assertEquals("complete", JSONObject(provider.respond("synthetic-history", "", request.toString(), RecordingCallback())).getString("status"))
-        assertFalse(captured.contains("System Instructions:")); assertTrue(captured.contains("https://example.invalid/beacon"))
+        assertTrue(captured.contains("System Instructions:")); assertTrue(captured.contains("https://example.invalid/beacon"))
         assertTrue(captured.contains("Conversation History:\nUser: Tell me about synthetic beacons.\nAssistant: A synthetic beacon."))
         assertTrue(captured.endsWith("User: What about its color?\nAssistant:"))
     }

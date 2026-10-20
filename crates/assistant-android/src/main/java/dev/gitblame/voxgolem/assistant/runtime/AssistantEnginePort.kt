@@ -54,7 +54,7 @@ class AssistantEnginePort(private val engine: AssistantEngine) : EnginePort {
                 else if (result.status == "complete" && result.recordJson != null) {
                     val record = JSONObject(result.recordJson)
                     val answer = record.getJSONObject("operation").getJSONObject("body").getJSONObject("answer")
-                    GenerationResult.Complete(result.speechText ?: answer.getString(if (answer.getString("kind") == "refusal") "reason" else "text"),
+                    GenerationResult.Complete(answer.getString(if (answer.getString("kind") == "refusal") "reason" else "text"),
                         committedVoiceInputContext(record), audio)
                 } else GenerationResult.Failed(result.code ?: "generation_failed")
             } catch (_: RuntimeException) { GenerationResult.Failed("invalid_saved_record") }

@@ -81,7 +81,7 @@ class ConversationLoopControllerTest {
     private val output = LocalSpeechOutput(tts, object : SpeechAudioFocus {
         override fun acquire(onLoss: () -> Unit) = true
         override fun release() {}
-    })
+    }, leases = leases)
     private val engine = Engine()
     private val loop = ConversationLoopController(dictation, output, engine)
     private fun drain() = shadowOf(Looper.getMainLooper()).idle()
@@ -473,11 +473,7 @@ class ConversationLoopControllerTest {
         throttledLoop.close(); dictation.close(); output.close(); drain()
     }
 
-    @Test fun streamingProvisionalSentencesAndMultiClauseFinalReplySpeakIncrementallyAndSanitizeMarkdown() {
-        assertEquals(
-            "Heading Hello world with code and link.",
-            SpeechTextSanitizer.sanitize("# Heading\n- **Hello** *world* with `code` and [link](https://example.invalid)."),
-        )
+    @Test fun streamingProvisionalSentencesAndMultiClauseFinalReplySpeakIncrementally() {
         start(true)
         val session = recognition.sessions.single()
         session.events.ready(); drain()
@@ -486,14 +482,14 @@ class ConversationLoopControllerTest {
         assertEquals(LoopPhase.GENERATING, loop.snapshot().phase)
 
         val stream = requireNotNull(engine.streamListener)
-        stream("**First sentence** is ready now. Second part")
+        stream("First sentence is ready now. Second part")
         drain()
         assertEquals(LoopPhase.GENERATING, loop.snapshot().phase)
         assertEquals(listOf("First sentence is ready now."), tts.spokenTexts)
 
         engine.result(
             GenerationResult.Complete(
-                "**First sentence** is ready now. Second part is `complete`.\n\nSources:\n- https://example.invalid"
+                "First sentence is ready now. Second part is complete.\n\nSecond paragraph details and sources:\nhttps://example.invalid"
             )
         )
         drain()
