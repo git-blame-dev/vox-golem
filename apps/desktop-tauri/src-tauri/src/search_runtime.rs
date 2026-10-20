@@ -21,8 +21,8 @@ use voxgolem_platform::web::{McpTransport, WebService};
 pub(super) struct DesktopSearchState {
     nonce: String,
     clients: CustomOpenAiClientPool,
-    service: tokio::sync::Mutex<WebService<McpTransport>>,
-    prewarm_gate: voxgolem_platform::search::WebPrewarmGate,
+    service: std::sync::Arc<tokio::sync::Mutex<WebService<McpTransport>>>,
+    prewarm_gate: std::sync::Arc<voxgolem_platform::search::WebPrewarmGate>,
 }
 
 impl Default for DesktopSearchState {
@@ -65,8 +65,10 @@ impl DesktopSearchState {
         Self {
             nonce,
             clients: CustomOpenAiClientPool::default(),
-            service: tokio::sync::Mutex::new(WebService::new(McpTransport::default())),
-            prewarm_gate: voxgolem_platform::search::WebPrewarmGate::default(),
+            service: std::sync::Arc::new(tokio::sync::Mutex::new(WebService::new(
+                McpTransport::default(),
+            ))),
+            prewarm_gate: std::sync::Arc::new(voxgolem_platform::search::WebPrewarmGate::default()),
         }
     }
 
@@ -77,20 +79,16 @@ impl DesktopSearchState {
         self.clients.client_for(config)
     }
 
+    #[cfg(any(test, not(feature = "app-benchmark")))]
     pub(super) async fn prewarm(&self, config: Option<CustomOpenAiConfig>, web_enabled: bool) {
-        let client_warm = async {
-            if let Some(config) = config {
-                if let Ok(client) = self.client_for(config) {
-                    let _ = client.prewarm().await;
-                }
-            }
-        };
-        let web_warm = async {
-            if web_enabled {
-                voxgolem_platform::search::prewarm_web(&self.service, &self.prewarm_gate).await;
-            }
-        };
-        tokio::join!(client_warm, web_warm);
+        let client = config.and_then(|config| self.client_for(config).ok());
+        voxgolem_platform::search::prewarm_client_and_web(
+            client.as_ref(),
+            &self.service,
+            &self.prewarm_gate,
+            web_enabled,
+        )
+        .await;
     }
 
     pub(super) fn conversation_key(&self, session: SessionId) -> String {
@@ -132,6 +130,14 @@ pub(super) async fn run_custom(
 ) -> Result<(RunResult, Option<CustomOpenAiAuthRevision>), RunError> {
     let cancel = Cancellation::from_receiver(cancellation.signal.subscribe());
     let deadline = started + config.total_timeout;
+    #[cfg(all(not(test), not(feature = "app-benchmark")))]
+    if web_enabled {
+        let state_service = state.service.clone();
+        let state_gate = state.prewarm_gate.clone();
+        tokio::spawn(async move {
+            voxgolem_platform::search::prewarm_web(&state_service, &state_gate).await;
+        });
+    }
     let mut service = SharedWebService::new(&state.service, &state.prewarm_gate);
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {

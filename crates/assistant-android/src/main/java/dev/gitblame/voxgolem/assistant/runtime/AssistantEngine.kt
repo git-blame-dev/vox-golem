@@ -408,6 +408,7 @@ class AssistantEngine @JvmOverloads internal constructor(
         store.selectConversation(id, null)
         state = state.copy(conversation = id.toString(), selectedHead = null, branchChoices = emptyList(), error = null, clientRequestToken = null, providerRequestId = null, toolStatus = null)
         loadDraft(); refreshProjection()
+        if (state.foreground && state.contextReady) prewarmSelected(state.model, state.webEnabled, state.busy)
     }
 
     /** New identity, never history deletion. Retires the old request before changing selection. */
@@ -448,6 +449,7 @@ class AssistantEngine @JvmOverloads internal constructor(
         state = state.copy(conversation = id.toString())
         store.saveDraft(null, "")
         refreshProjection()
+        if (state.foreground && state.contextReady) prewarmSelected(state.model, state.webEnabled, state.busy)
     }
 
     fun cancel(clientRequestToken: String) {

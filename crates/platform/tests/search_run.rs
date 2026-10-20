@@ -802,10 +802,11 @@ async fn native_style_and_terminal_stream_callback_reach_the_current_provider_co
     assert_eq!(revisions, 1);
     assert!(result.response.timings.first_text_at.is_some());
     let requests = server.await.unwrap();
-    assert!(requests[0]["instructions"]
-        .as_str()
-        .unwrap()
-        .contains("Synthetic compact watch style."));
+    let sent_instructions = requests[0]["instructions"].as_str().unwrap();
+    assert!(sent_instructions.contains("Synthetic compact watch style."));
+    assert!(sent_instructions.contains(
+        "Answer directly without web tools for ordinary conversation, established facts, timeless concepts, fiction, coding, math, or stable pre-cutoff knowledge."
+    ));
 }
 
 #[tokio::test]

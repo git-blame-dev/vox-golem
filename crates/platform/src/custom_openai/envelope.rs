@@ -324,7 +324,9 @@ fn envelope<'a>(
         parallel_tool_calls: false,
         tools,
         tool_choice: tools.map(|tools| if tools.is_empty() { "none" } else { "auto" }),
-        include: tools.map(|_| ["reasoning.encrypted_content"]),
+        include: tools
+            .filter(|tools| !tools.is_empty())
+            .map(|_| ["reasoning.encrypted_content"]),
     }
 }
 

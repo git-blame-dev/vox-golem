@@ -49,6 +49,13 @@ impl ProcessProvider {
     ) -> Result<CustomOpenAiClient, ErrorCode> {
         self.transport.client_for(config).map_err(ErrorCode::from)
     }
+
+    #[cfg(not(test))]
+    pub(crate) fn prewarm_web(&'static self) {
+        self.runtime.spawn(async move {
+            voxgolem_platform::search::prewarm_web(&self.web, &self.prewarm_gate).await;
+        });
+    }
 }
 
 #[cfg(test)]
@@ -77,16 +84,19 @@ pub(crate) fn prewarm(config: CustomOpenAiConfig, web_enabled: bool) {
     let Ok(process) = process() else {
         return;
     };
-    if let Ok(client) = process.client(config) {
-        process.runtime.spawn(async move {
-            let _ = client.prewarm().await;
-        });
+    let client = process.client(config).ok();
+    if client.is_none() && !web_enabled {
+        return;
     }
-    if web_enabled {
-        process.runtime.spawn(async move {
-            voxgolem_platform::search::prewarm_web(&process.web, &process.prewarm_gate).await;
-        });
-    }
+    process.runtime.spawn(async move {
+        voxgolem_platform::search::prewarm_client_and_web(
+            client.as_ref(),
+            &process.web,
+            &process.prewarm_gate,
+            web_enabled,
+        )
+        .await;
+    });
 }
 
 fn count_status(sources: &[voxgolem_core::search::Source]) -> Option<String> {

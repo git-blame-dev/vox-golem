@@ -235,13 +235,10 @@ class EnginePhoneBackend internal constructor(
         }
         val selectedModel = value.getString("instant")
         var previousModel: String? = null
-        var previousWebEnabled = false
         engine.updatePreferences(selectedModel, dev.gitblame.voxgolem.assistant.runtime.AssistantPolicy(
             value.getBoolean("web_enabled"), value.getBoolean("speech_network_fallback"), value.getString("speech_language"),
             value.getString("speech_tts_provider"), value.getString("speech_tts_voice")), {
-            val before = engine.snapshot()
-            previousModel = before.model
-            previousWebEnabled = before.webEnabled
+            previousModel = engine.snapshot().model
             preferences.write(value)
         }) { selected ->
             preferencesPending.set(false)
@@ -249,8 +246,6 @@ class EnginePhoneBackend internal constructor(
             else {
                 if (previousModel != null && selected.model == selectedModel && selected.model != previousModel) {
                     runCatching { prewarm(selected.model) }
-                } else if (!previousWebEnabled && selected.webEnabled && selected.foreground) {
-                    runCatching { engine.prewarm() }
                 }
                 // A view listener failure must not misclassify already persisted settings.
                 runCatching { onPreferencesChanged?.invoke(value.getBoolean("tts_enabled")) }

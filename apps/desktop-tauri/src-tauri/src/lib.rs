@@ -3976,10 +3976,13 @@ fn get_assistant_settings(
 
 #[tauri::command]
 async fn set_assistant_settings(
+    app: tauri::AppHandle,
     settings: AssistantSettingsCommandPayload,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<AssistantSettingsCommandPayload, voxgolem_core::ipc::CommandError> {
-    set_assistant_settings_from_state(settings, &app_state).await
+    let result = set_assistant_settings_from_state(settings, &app_state).await?;
+    spawn_custom_and_web_prewarm(&app);
+    Ok(result)
 }
 
 async fn set_assistant_settings_from_state(
@@ -8700,6 +8703,7 @@ impl DesktopStageDispatcher<'_> {
         if has_opencode {
             reset_opencode_session(&app_state).await?;
         }
+        spawn_custom_and_web_prewarm(&self.app);
 
         Ok(RuntimePhaseResponsePayload {
             ..current_runtime_phase_response(&app_state.voice_pipeline_state, None, None)?
@@ -8792,6 +8796,14 @@ fn ingest_audio_frame(
     app_state: tauri::State<'_, AppState>,
 ) -> Result<RuntimePhaseResponsePayload, String> {
     let ingested = ingest_audio_frame_from_state(frame, telemetry_frame_id, &app_state)?;
+    if ingested
+        .response
+        .telemetry
+        .as_ref()
+        .is_some_and(|telemetry| telemetry.wake_detected_ms.is_some())
+    {
+        spawn_custom_and_web_prewarm(&app);
+    }
     if let Some(parakeet_runtime) = app_state.parakeet_runtime.as_ref() {
         spawn_partial_transcription(
             app,
@@ -9070,10 +9082,14 @@ fn partial_transcription_worker_guard(
 
 #[tauri::command]
 fn request_completion(
+    app: tauri::AppHandle,
     revision: u64,
     prompt: String,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    if revision == 1 && !prompt.trim().is_empty() {
+        spawn_custom_and_web_prewarm(&app);
+    }
     queue_completion_request(CompletionSource::Typed, revision, None, prompt, &app_state)
 }
 
@@ -9474,6 +9490,10 @@ fn custom_openai_model_for_instant(
     }
 }
 
+#[cfg(feature = "app-benchmark")]
+fn spawn_custom_and_web_prewarm(_app: &tauri::AppHandle) {}
+
+#[cfg(not(feature = "app-benchmark"))]
 fn spawn_custom_and_web_prewarm(app: &tauri::AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -13349,7 +13369,10 @@ pub fn run() {
             }
             eprintln!("{STARTUP_READY_MARKER}");
             #[cfg(not(feature = "app-benchmark"))]
-            app_updates::start_background_update(app.handle().clone());
+            {
+                app_updates::start_background_update(app.handle().clone());
+                spawn_custom_and_web_prewarm(app.handle());
+            }
             Ok(())
         })
         .invoke_handler({

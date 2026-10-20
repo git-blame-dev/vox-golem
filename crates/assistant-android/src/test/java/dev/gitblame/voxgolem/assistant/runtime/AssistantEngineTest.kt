@@ -1683,6 +1683,13 @@ class AssistantEngineTest {
             listOf(Triple("custom-luna-low", "/synthetic/private/codex-auth.json", true)),
             provider.prewarmedWeb,
         )
+        provider.prewarmedWeb.clear()
+        engine.resume(reconcile = false); io.drain()
+        engine.newConversation(); io.drain(); providerQueue.drain()
+        assertEquals(
+            listOf(Triple("custom-luna-low", "/synthetic/private/codex-auth.json", true)),
+            provider.prewarmedWeb,
+        )
     }
 
     @Test fun conversationAndHeadPaginationDoesNotRefreshProjectionOrPolluteGlobalError() {

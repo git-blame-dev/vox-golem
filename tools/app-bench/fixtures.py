@@ -249,6 +249,9 @@ class FakeServices:
             def do_GET(self):
                 self.send(405)
 
+            def do_HEAD(self):
+                self.send(200)
+
             def do_DELETE(self):
                 self.send(200)
 
