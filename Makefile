@@ -87,7 +87,7 @@ LINUX_ORT_PROVIDER_LIBS := \
 .PHONY: benchmark test-benchmark wakeword-bench test-wakeword-bench search-bench encoder-bench test-search-bench test-router-head
 
 benchmark:
-	@test -n '$(PLATFORM)' || { printf '%s\n' 'Set PLATFORM=android or PLATFORM=desktop; use BENCHMARK_FLAGS="--help" with either platform for options.' >&2; exit 1; }
+	@test -n '$(PLATFORM)' || { printf '%s\n' 'Set PLATFORM=android, desktop or wear; use BENCHMARK_FLAGS="--help" for options.' >&2; exit 1; }
 	python3 tools/benchmark/benchmark.py --platform '$(PLATFORM)' $(if $(DEVICE),--device '$(DEVICE)') $(BENCHMARK_FLAGS)
 
 test-benchmark:

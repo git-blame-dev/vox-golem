@@ -35,7 +35,7 @@ qualified adapter is absent. Common authorization requires `--live`, `--binary`,
 repetition, a 10–180 second turn timeout, and no physical-device flags. The
 adapter owns existing runner namespace, offline-evidence and fixed-ledger gates;
 common authorization does not replace or bypass them. Desktop integration is a
-separate acceptance boundary. Windows and Wear are unsupported. Desktop runtime
+separate acceptance boundary. Windows is unsupported. Desktop runtime
 execution remains unverified. The shared command was exercised over SSH/ADB on
 the A17 (2026-10-20): six workflows completed, three passed automated checks and
 three research cases remained explicitly unverified, with zero failed checks.
@@ -43,6 +43,76 @@ Original preferences and owned forwarding/tunnel cleanup were verified. This was
 one debug/timing run, not optimized-release or matched-baseline performance.
 
 ## Commands
+
+### Native Wear adapter
+
+Wear is a separate native acceptance boundary, not the Android WebView adapter.
+The initial supported profile is the physical Watch7 `SM-L315F`, API 36,
+`armeabi-v7a`, a matching non-debuggable optimized `performance` app, and the
+same-signer typed instrumentation helper. Runtime acceptance of a changed driver
+must be recorded separately from offline adapter tests.
+
+Wear runtime acceptance remains partial: the initial six-case selection completed
+the first five workflows and its history seed, but the history follow-up failed
+Send readiness. Subsequent UI corrections have unit/build verification, not a
+fresh full-suite result. Keep the adapter experimental until that targeted history
+acceptance is completed under a separately approved live budget; do not treat the
+existing partial report as a six-case pass.
+
+The Python controller retains all six scenarios, ordering, answer validation,
+history-seed accounting, live budgets and report retention. The native driver
+prepares its synthetic draft through the existing validated native draft API,
+waits for that draft to reach the real chat UI, then uses the real Send action
+in an isolated typed session. Draft preparation is outside the timed interval;
+it must not submit through a direct engine shortcut, invoke speech, or change user preferences.
+Configuration of the isolated session is not a benchmark of the production model
+selector or settings UI. Owned synthetic stores are retired and cleaned up; this
+differs from the phone adapter's retained synthetic chats.
+
+Device-monotonic turn timings exclude SSH/mailbox response retrieval. They are
+labelled separately from phone/desktop host-observed timing and are not directly
+interchangeable baselines. Native presentation projection, accessibility-visible
+text, and layout/draw-submission observations are distinct evidence; none proves
+painted pixels. Wear source-list presentation/page-read execution checks remain
+unverified where the native surface does not expose the requisite evidence.
+
+Help/list remain transport-free:
+
+```sh
+make benchmark PLATFORM=wear DEVICE=watch7 BENCHMARK_FLAGS="--list"
+```
+
+After separately authorized build/installation, signing/artifact verification,
+physical automated-testing and live-provider approval:
+
+```sh
+make benchmark PLATFORM=wear DEVICE=watch7 BENCHMARK_FLAGS="--allow-device --live --adb $ADB --ssh $SSH_HOST --remote-adb $REMOTE_ADB --build-variant performance --apk $WEAR_APK --model custom-luna-none --max-live-calls 7"
+```
+
+Omit SSH/remote-ADB arguments for an explicitly configured local ADB. The runner
+does not pair, install, clear data, reboot, restart ADB, select a phone, or collect
+user speech. The initial profile permits one repetition, one history seed and at
+most seven turn admissions. Subsets use the same `--cases` mechanism and must be
+reported as partial coverage. Phone `--collect-stages` is not enabled for Wear.
+There is no cold-start or device-boot workload in this extension.
+
+Before spending live admissions, append `--wear-ui-probe` to the same authorized
+Wear command to prepare a long synthetic draft, exercise Latest viewport restoration,
+and reach enabled Send **without pressing it**. An unarmed native Send fence prevents
+incidental probe touches from starting generation; the timed submit path receives
+one request-bound permit immediately before its real Send action.
+This reports a separate `wear-native-ui-probe` workload with zero submissions,
+not a six-case suite pass. It uses an existing shared synthetic prompt and still
+requires explicit device authorization and a matching installed artifact.
+Starting instrumentation can terminate an old process, so Wear refuses any
+existing target app process before startup; the controller never force-stops
+pre-existing work to get past that check.
+
+This typed suite does not measure keyboard/IME navigation, microphone readiness,
+speech recognition, or spoken playback. Existing synthetic voice benchmarks remain
+separate workloads with their own permissions, evidence and budgets.
+
+### Android and desktop
 
 Help/list are transport-free:
 
@@ -206,7 +276,7 @@ URLs and path-traversal alternatives are not official-source evidence.
 Sources and answer prose do **not** prove page-read execution: those checks remain
 `unverified`, not `pass`, until an authoritative scoped event surface is available.
 
-Timings are host-monotonic UI-submit to first nonblank text and terminal-idle
+Android WebView timings are host-monotonic UI-submit to first nonblank text and terminal-idle
 observations, including 100 ms polling and transport overhead. They are warm
 attached-app measurements, not startup, provider-only, painted-pixel or acoustic
 latency; provider cold/warm state is uncontrolled. No matched baseline or speedup

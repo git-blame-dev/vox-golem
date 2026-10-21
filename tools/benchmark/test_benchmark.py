@@ -18,6 +18,175 @@ SPEC.loader.exec_module(bench)
 
 
 class SuiteTests(unittest.TestCase):
+    def test_wear_cli_gates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            apk = Path(directory) / 'synthetic.apk'
+            apk.write_bytes(b'synthetic-artifact')
+            flags = ['--platform','wear','--device','watch7','--live','--allow-device',
+                '--adb','synthetic-adb','--apk',str(apk),'--build-variant','performance']
+            bench.authorize(bench.parser().parse_args(flags))
+            for extra in (['--model','synthetic-model'], ['--device','a17'],
+                    ['--build-variant','debug'], ['--build-variant','release'],
+                    ['--repetitions','2'], ['--history-seed-turns','2'],
+                    ['--collect-stages'], ['--max-live-calls','8'], ['--max-live-calls','6'],
+                    ['--turn-timeout','9'], ['--turn-timeout','181'],
+                    ['--apk',str(apk.parent)], ['--apk',str(apk.parent / 'missing.apk')],
+                    ['--ssh','synthetic-host']):
+                with self.subTest(extra=extra), self.assertRaises(bench.Blocked):
+                    bench.authorize(bench.parser().parse_args(flags + extra))
+            for missing in ('--live', '--allow-device'):
+                with self.assertRaises(bench.Blocked):
+                    bench.authorize(bench.parser().parse_args([f for f in flags if f != missing]))
+            args = bench.parser().parse_args(flags + ['--cases','arithmetic','--max-live-calls','1'])
+            bench.authorize(args)
+            for key, value in (('adb', None), ('apk', None), ('turn_timeout', float('nan'))):
+                invalid = SimpleNamespace(**vars(args))
+                setattr(invalid, key, value)
+                with self.assertRaises(bench.Blocked): bench.authorize(invalid)
+            for size in (0, 256 * 1024 * 1024 + 1):
+                with apk.open('wb') as stream: stream.truncate(size)
+                with self.assertRaisesRegex(bench.Blocked, 'wear_bounded_local_apk_required'):
+                    bench.authorize(args)
+
+    def test_wear_dispatch_shares_common_module_and_measurement(self):
+        async def run_wear(args, report, common):
+            self.assertIs(common, bench)
+            self.assertIs(common.Blocked, bench.Blocked)
+            self.assertEqual(report['measurement']['clock'], 'device-elapsed-realtime')
+            self.assertEqual(report['measurement']['transport_overhead'], 'excluded-from-device-timing')
+            self.assertNotIn('Windows and Wear unsupported.', report['limitations'])
+            report['status'] = 'unverified'
+        loader = SimpleNamespace(exec_module=lambda module: setattr(module, 'run_wear', run_wear))
+        spec = SimpleNamespace(name='synthetic_wear_adapter', origin=__file__, loader=loader)
+        with tempfile.TemporaryDirectory() as directory:
+            apk = Path(directory) / 'synthetic.apk'
+            apk.write_bytes(b'synthetic-artifact')
+            argv = ['benchmark','--platform','wear','--device','watch7','--live','--allow-device',
+                '--adb','synthetic-adb','--apk',str(apk),'--build-variant','performance','--output',directory]
+            with patch.object(bench.sys, 'argv', argv), \
+                    patch.dict(bench.sys.modules, {bench.__name__:bench}), \
+                    patch.object(bench.importlib.util, 'spec_from_file_location', return_value=spec), \
+                    patch.object(bench.importlib.util, 'module_from_spec', return_value=SimpleNamespace()), \
+                    patch.object(bench, 'source_identity', return_value={}), \
+                    patch.object(bench, 'run_android', side_effect=AssertionError('phone dispatch')), \
+                    redirect_stdout(io.StringIO()):
+                self.assertEqual(bench.main(), 2)
+
+    def test_wear_native_sources_participate_in_harness_identity(self):
+        real_read = Path.read_bytes
+        names = ('wear.py', 'TypedAskBenchmark.kt', 'TypedAskInstrumentation.java',
+                 'AssistantActivity.kt', 'assistant-proguard-rules.pro', 'AndroidManifest.xml')
+        baseline = bench.source_identity()['harness_sha256']
+        for name in names:
+            def changed(path, name=name):
+                return b'synthetic-source-change' if path.name == name else real_read(path)
+            # Include forthcoming files even when the parent's implementation has
+            # not reached disk yet; never create or alter its owned files.
+            real_is_file = Path.is_file
+            def exists(path): return path.name == name or real_is_file(path)
+            with self.subTest(name=name), patch.object(Path, 'read_bytes', changed), patch.object(Path, 'is_file', exists):
+                self.assertNotEqual(bench.source_identity()['harness_sha256'], baseline)
+
+    def test_wear_list_has_no_transport(self):
+        with patch.object(bench.sys, 'argv', ['benchmark','--platform','wear','--list','--cases','mixed','page_read']), \
+                patch.object(bench.subprocess, 'run', side_effect=AssertionError('transport')), \
+                redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(bench.main(), 0)
+        self.assertEqual(output.getvalue().splitlines(), ['page_read web=on','mixed web=on'])
+
+    def test_semantic_driver_scenarios_budget_and_cleanup(self):
+        class Driver:
+            def __init__(self):
+                self.preferences = dict(instant='synthetic-original', web_enabled=True,
+                    tts_enabled=True, prefetch=False, completion=False)
+                self.prompts, self.cleared, self.released = [], None, False
+            async def snapshot_preferences(self): return dict(self.preferences)
+            async def begin_ownership(self): pass
+            async def ownership(self, action='check', request=None): return 'idle'
+            async def set_tts(self, value): self.preferences['tts_enabled'] = value
+            async def set_web(self, value): self.preferences['web_enabled'] = value
+            async def select_model(self, value): self.preferences['instant'] = value
+            async def confirm_configuration(self, model, web):
+                self_test.assertEqual(self.preferences['instant'], model)
+                self_test.assertIs(self.preferences['web_enabled'], web)
+            async def new_chat(self): pass
+            async def terminal_validation(self, case, request, metrics):
+                return {'answer':'pass'}
+            async def clear_owned_draft(self, prompts): self.cleared = prompts
+            async def release_ownership(self): self.released = True
+            async def read_native_status(self, request): return []
+            async def exercise(self, model, prompt, **kwargs):
+                await kwargs['confirm_ready']()
+                await kwargs['submission_observer']()
+                self.prompts.append(prompt)
+                request = f'synthetic-{len(self.prompts)}'
+                await kwargs['admission_observer'](request)
+                metrics = dict(first_answer_ms=1., completed_ms=2.)
+                await kwargs['terminal_observer'](request, metrics)
+                return metrics
+        self_test = self
+        for budget in (3, 2):
+            driver = Driver()
+            original = dict(driver.preferences)
+            args = bench.parser().parse_args(['--platform','android','--cases','history','arithmetic',
+                '--max-live-calls',str(budget)])
+            report = {'cases':[], 'cleanup':{}}
+            if budget == 3:
+                asyncio.run(bench.run_suite(None, args, report, driver=driver))
+                cases = bench.load_scenarios()
+                self.assertEqual(driver.prompts, [cases[0]['prompt'], cases[5]['seed'], cases[5]['prompt']])
+                self.assertEqual(report['admissions'], {'submitted':3, 'observed':3, 'budget':3})
+            else:
+                with self.assertRaisesRegex(bench.Blocked, 'ui_admission_budget_exhausted'):
+                    asyncio.run(bench.run_suite(None, args, report, driver=driver))
+                self.assertEqual(len(driver.prompts), 2)
+            self.assertEqual(driver.preferences, original)
+            self.assertTrue(driver.released)
+            self.assertIn(bench.load_scenarios()[5]['seed'], driver.cleared)
+            self.assertEqual(report['cleanup']['preferences'], 'pass')
+
+        # Native provider evidence uses the same shared blocker classifier and
+        # stops before mixed; integrity failures must not be hidden as blockage.
+        for integrity in ('pass', 'fail'):
+            driver = Driver()
+            async def status(request):
+                return [{'provider':'Exa', 'provider_retry_after_seconds':12,
+                    'local_cooldown_seconds':2, 'provenance':'native_provider_status',
+                    'provider_reset':'minimum_retry_delay'}]
+            async def validation(case, request, metrics):
+                metrics['source_counts'] = {'ui':0, 'canonical':0}
+                return dict(answer='pass', sources_present='fail', official_source='fail',
+                    sources_equal='pass', canonical_answer_equal=integrity,
+                    canonical_execution_and_single_ui_row='pass', page_read='unverified')
+            driver.read_native_status, driver.terminal_validation = status, validation
+            args = bench.parser().parse_args(['--platform','android','--cases','page_read','mixed'])
+            report = {'cases':[], 'cleanup':{}}
+            if integrity == 'pass':
+                asyncio.run(bench.run_suite(None, args, report, driver=driver))
+                self.assertEqual(report['status'], 'blocked')
+                self.assertEqual(report['cases'][0]['evidence'], 'native_provider_status')
+            else:
+                with self.assertRaisesRegex(bench.Blocked, 'scenario_validation_failed'):
+                    asyncio.run(bench.run_suite(None, args, report, driver=driver))
+                self.assertNotEqual(report['cases'][0]['status'], 'blocked')
+            self.assertEqual(len(driver.prompts), 1)
+            self.assertTrue(driver.released)
+            self.assertEqual(report['cleanup']['preferences'], 'pass')
+
+    def test_semantic_native_status_invalid_or_missing_is_unverified(self):
+        for records in ([], [{'unsafe':'synthetic'}]):
+            row, terminal_calls = {}, []
+            async def read(request): return records
+            async def terminal(request, metrics): terminal_calls.append(request)
+            async def exercise(model, prompt, **kwargs):
+                await kwargs['terminal_observer']('synthetic-request', {})
+            driver = SimpleNamespace(exercise=exercise, read_native_status=read)
+            asyncio.run(bench.exercise_semantic_with_native_status(driver, 'synthetic-model',
+                'synthetic-prompt', row=row, web_enabled=True, terminal_observer=terminal))
+            self.assertEqual(row['native_rate_limit_observation'], 'unverified')
+            self.assertEqual(row['native_rate_limits'], [])
+            self.assertEqual(terminal_calls, ['synthetic-request'])
+
     def test_android_native_focus_setup(self):
         class UI:
             def __init__(self, focused=False, safe=True, tab_works=True):

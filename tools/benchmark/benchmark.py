@@ -370,12 +370,13 @@ def owned_tunnel(host, port, cleanup):
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--platform', required=True, choices=['android', 'desktop'])
+    p.add_argument('--platform', required=True, choices=['android', 'desktop', 'wear'])
     p.add_argument('--list', action='store_true', help='List synthetic scenarios without transport access')
-    p.add_argument('--cases', nargs='+', choices=SCENARIO_IDS, help='Android subset, executed in canonical suite order')
+    p.add_argument('--cases', nargs='+', choices=SCENARIO_IDS, help='Android/Wear subset, executed in canonical suite order')
     p.add_argument('--live', action='store_true')
+    p.add_argument('--wear-ui-probe', action='store_true', help='Wear only: prepare the isolated draft and reach Send without generating a reply')
     p.add_argument('--allow-device', action='store_true')
-    p.add_argument('--device', choices=['a17'])
+    p.add_argument('--device', choices=['a17', 'watch7'])
     p.add_argument('--adb', help='Explicit local ADB executable')
     p.add_argument('--ssh', help='SSH host alias (not recorded)')
     p.add_argument('--remote-adb', help='Explicit remote ADB executable')
@@ -388,7 +389,7 @@ def parser():
     p.add_argument('--max-live-calls', type=int, default=7)
     p.add_argument('--turn-timeout', type=float, default=180)
     p.add_argument('--output', type=Path, default=ROOT.parent / 'artifacts/benchmarks/typed')
-    p.add_argument('--build-variant', choices=['debug', 'release', 'profileable', 'unspecified'], default='unspecified')
+    p.add_argument('--build-variant', choices=['debug', 'release', 'profileable', 'performance', 'unspecified'], default='unspecified')
     p.add_argument('--apk', type=Path, help='Optional local APK; hash only, never installed')
     for name in ('binary', 'tools', 'config', 'offline-evidence'):
         p.add_argument('--' + name, type=Path, help='Desktop qualified lifecycle prerequisite')
@@ -396,6 +397,10 @@ def parser():
 
 
 def authorize(args):
+    if getattr(args, 'build_variant', None) == 'performance' and args.platform != 'wear':
+        raise Blocked('performance_variant_requires_wear_platform')
+    if getattr(args, 'wear_ui_probe', False) and args.platform != 'wear':
+        raise Blocked('wear_ui_probe_requires_wear_platform')
     selected = select_scenarios(args)
     needed = planned_admissions(args, selected)
     if getattr(args, 'history_seed_turns', 1) not in range(1, 9):
@@ -404,6 +409,21 @@ def authorize(args):
         raise Blocked('desktop_stage_collection_unsupported')
     if args.platform == 'desktop' and getattr(args, 'history_seed_turns', 1) != 1:
         raise Blocked('desktop_history_seed_count_unsupported')
+    if args.platform == 'wear':
+        if not args.live or not args.allow_device or args.device != 'watch7':
+            raise Blocked('explicit_live_and_device_authorization_required')
+        if args.collect_stages:
+            raise Blocked('wear_stage_collection_unsupported')
+        if args.model != 'custom-luna-none' or args.repetitions != 1 or args.history_seed_turns != 1:
+            raise Blocked('wear_fixed_model_repetition_and_history_required')
+        if args.build_variant != 'performance':
+            raise Blocked('wear_performance_artifact_required')
+        if not math.isfinite(args.turn_timeout) or not 10 <= args.turn_timeout <= 180:
+            raise Blocked('wear_turn_deadline_invalid')
+        if not needed <= args.max_live_calls <= 7:
+            raise Blocked('wear_live_call_budget_invalid')
+        if args.apk is None or not args.apk.is_file() or args.apk.is_symlink() or not 0 < args.apk.stat().st_size <= 256 * 1024 * 1024:
+            raise Blocked('wear_bounded_local_apk_required')
     if not args.live or (args.platform == 'android' and (not args.allow_device or args.device != 'a17')):
         raise Blocked('explicit_live_and_device_authorization_required')
     if args.platform == 'desktop':
@@ -461,7 +481,7 @@ def write_report(directory, report):
             prior = json.loads(path.read_bytes())
         except (OSError, ValueError):
             continue
-        if not isinstance(prior, dict) or prior.get('suite') != 'typed-model-matrix' or prior.get('schema') != 1:
+        if not isinstance(prior, dict) or prior.get('suite') not in ('typed-model-matrix', 'wear-native-ui-probe') or prior.get('schema') != 1:
             continue
         if now - path.stat().st_mtime > 90 * 86400:
             path.unlink()
@@ -798,7 +818,71 @@ async def terminal_validation(ui, case, request, metrics):
     return checks
 
 
-async def run_suite(ui, args, report, exercise=None, stages=None):
+class DOMSuiteDriver:
+    """Default adapter; semantic drivers implement these async operations instead.
+
+    Native drivers additionally provide exercise(model, prompt, **callbacks) and
+    read_native_status(request). Exercise must preserve the smoke observer callback
+    contract: ready before submission, submitted once, admitted identity, then
+    terminal with metrics in the adapter's declared monotonic observer clock.
+    Status must be scoped to that execution; never combine host/device clocks.
+    Ownership/control methods must fence every mutation against foreign work;
+    clear_owned_draft only clears an owned draft matching the supplied prompts.
+    """
+    def __init__(self, ui, exercise):
+        self.ui = ui
+        self._exercise = exercise
+
+    async def snapshot_preferences(self): return await snapshot_preferences(self.ui)
+    async def begin_ownership(self): return await begin_ownership(self.ui)
+    async def ownership(self, action='check', request=None): return await ownership(self.ui, action, request)
+    async def set_tts(self, value): return await set_tts(self.ui, value)
+    async def set_web(self, value): return await set_web(self.ui, value)
+    async def select_model(self, value): return await select_model(self.ui, value)
+    async def confirm_configuration(self, model, web): return await confirm_configuration(self.ui, model, web)
+    async def new_chat(self): return await new_chat(self.ui)
+    async def terminal_validation(self, case, request, metrics):
+        return await terminal_validation(self.ui, case, request, metrics)
+    async def exercise(self, model, prompt, **kwargs):
+        return await self._exercise(self.ui, model, prompt, **kwargs)
+    async def clear_owned_draft(self, prompts):
+        cleared = await self.ui.evaluate(f"""(async () => {{
+          {IDLE_FENCE}
+          const e = document.getElementById('promptComposer');
+          if (e && {json.dumps(prompts)}.includes(e.value)) {{
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(e, '');
+            e.dispatchEvent(new Event('input', {{bubbles:true}}));
+          }}
+          return true;
+        }})()""")
+        if cleared is not True:
+            raise Blocked('cleanup_ownership_fence_changed')
+    async def release_ownership(self):
+        await self.ui.evaluate('delete window.__voxBenchmarkExecutions; delete window.__voxBenchmarkOwner; delete window.__voxBenchmarkNextSession')
+
+
+async def exercise_semantic_with_native_status(driver, model, prompt, *, row, web_enabled, **kwargs):
+    """Read execution-scoped native status before shared terminal classification.
+
+    Invalid/missing observations stay unverified, never manufacture a blocker.
+    Failed exercises remain failed and are not retried.
+    """
+    if web_enabled:
+        row['native_rate_limit_observation'] = 'unverified'
+        terminal = kwargs['terminal_observer']
+        async def observed_terminal(request, metrics):
+            try:
+                records = checked_native_diagnostics(await driver.read_native_status(request))
+            except Exception:
+                records = []
+            row['native_rate_limits'] = records
+            row['native_rate_limit_observation'] = 'observed' if records else 'unverified'
+            await terminal(request, metrics)
+        kwargs['terminal_observer'] = observed_terminal
+    return await driver.exercise(model, prompt, **kwargs)
+
+
+async def run_suite(ui, args, report, exercise=None, stages=None, *, driver=None):
     # Includes bounded admission/transition overhead; cleanup may additionally need
     # bounded cancellation/control deadlines when a timed-out operation is retired.
     selected = select_scenarios(args, report)
@@ -806,20 +890,28 @@ async def run_suite(ui, args, report, exercise=None, stages=None):
     deadline = needed * (args.turn_timeout + 30) + 180
     report['suite_deadline_seconds'] = deadline
     async with asyncio.timeout(deadline):
-        await _run_suite(ui, args, report, exercise, stages)
+        await _run_suite(ui, args, report, exercise, stages, driver=driver)
 
 
-async def _run_suite(ui, args, report, exercise=None, stages=None):
-    exercise = exercise or smoke_module().exercise_ui
+async def _run_suite(ui, args, report, exercise=None, stages=None, *, driver=None):
+    semantic = driver is not None
+    if semantic and exercise is not None:
+        raise Blocked('semantic_driver_owns_exercise')
+    if not semantic:
+        exercise = exercise or smoke_module().exercise_ui
+        driver = DOMSuiteDriver(ui, exercise)
+    async def ensure_idle():
+        if await driver.ownership() != 'idle':
+            raise Blocked('ownership_fence_not_idle')
     cases = select_scenarios(args, report)  # Validate the full source before selection/UI mutation.
-    original = await snapshot_preferences(ui)
+    original = await driver.snapshot_preferences()
     # This runner does not manufacture a desktop preference interface. Unsupported
     # enabled settings fail before generating rather than being changed natively.
     if type(original.get('instant')) is not str or original.get('prefetch') is not False or original.get('completion') is not False:
         raise Blocked('preconfigured_prefetch_completion_required')
     if original.get('deep_enabled') is True or original.get('review_enabled') is True:
         raise Blocked('single_generation_profile_required')
-    await begin_ownership(ui)
+    await driver.begin_ownership()
     report.setdefault('admissions', {'submitted':0, 'observed':0, 'budget':getattr(args, 'max_live_calls', report['planned_admissions'])})
     observed_requests = set()
     async def submitted():
@@ -829,16 +921,16 @@ async def _run_suite(ui, args, report, exercise=None, stages=None):
             observed_requests.add(request)
             report['admissions']['observed'] += 1
         async def claimed():
-            state = await ownership(ui, 'claim', request)
+            state = await driver.ownership('claim', request)
             if state == 'foreign':
                 raise Blocked('admitted_execution_not_owned')
             return state != 'pending'
         await wait_condition(claimed)
     try:
-        await ensure_owned_idle(ui)
-        await set_tts(ui, False)
-        await ensure_owned_idle(ui)
-        await select_model(ui, args.model)
+        await ensure_idle()
+        await driver.set_tts(False)
+        await ensure_idle()
+        await driver.select_model(args.model)
         for repetition in range(1, args.repetitions + 1):
             for case in cases:
                 row = {'scenario': case['id'], 'repetition': repetition,
@@ -850,15 +942,15 @@ async def _run_suite(ui, args, report, exercise=None, stages=None):
                     if row['history_seed_turns'] != 1:
                         row['history_condition'] = 'numbered-normal-ui-seeds-plus-followup-not-24-message-host-history'
                 setup_started = time.perf_counter()
-                await new_chat(ui)
+                await driver.new_chat()
                 row['new_chat_ready_observed_ms'] = (time.perf_counter() - setup_started) * 1000
-                await ensure_owned_idle(ui)
-                await set_web(ui, case['web_enabled'])
+                await ensure_idle()
+                await driver.set_web(case['web_enabled'])
                 async def confirm():
-                    await ensure_owned_idle(ui)
+                    await ensure_idle()
                     if report['admissions']['submitted'] >= report['admissions']['budget']:
                         raise Blocked('ui_admission_budget_exhausted')
-                    await confirm_configuration(ui, args.model, case['web_enabled'])
+                    await driver.confirm_configuration(args.model, case['web_enabled'])
                 async def observed_exercise(prompt, target, terminal_observer, native=False):
                     turn = None
                     async def ready():
@@ -876,9 +968,12 @@ async def _run_suite(ui, args, report, exercise=None, stages=None):
                                   terminal_observer=observed_terminal, admission_observer=admitted,
                                   submission_observer=submitted)
                     if native:
+                        if semantic:
+                            return await exercise_semantic_with_native_status(driver, args.model, prompt,
+                                row=row, web_enabled=case['web_enabled'], **kwargs)
                         return await exercise_with_native_status(ui, exercise, args.model, prompt,
                             row=row, cleanup=report['cleanup'], web_enabled=case['web_enabled'], **kwargs)
-                    return await exercise(ui, args.model, prompt, **kwargs)
+                    return await driver.exercise(args.model, prompt, **kwargs)
                 if 'seed' in case:
                     # A normal UI-admitted synthetic seed, never injected native history.
                     row['seed_profiles'] = []
@@ -890,7 +985,7 @@ async def _run_suite(ui, args, report, exercise=None, stages=None):
                             profile.update(checked_metrics(metrics))
                             row['seed_metrics'] = checked_metrics(metrics)
                             try:
-                                checks = await terminal_validation(ui, seed_case, request, metrics)
+                                checks = await driver.terminal_validation(seed_case, request, metrics)
                             finally:
                                 profile.update(checked_metrics(metrics))
                                 row['seed_metrics'] = checked_metrics(metrics)
@@ -902,7 +997,7 @@ async def _run_suite(ui, args, report, exercise=None, stages=None):
                     row.update(checked_metrics(metrics))
                     row['workflow_completed'] = True
                     try:
-                        row['checks'] = await terminal_validation(ui, case, request, metrics)
+                        row['checks'] = await driver.terminal_validation(case, request, metrics)
                         native = row.get('native_rate_limits', [])
                         if native and source_failure_only(case, row['checks'], metrics.get('source_counts')):
                             row.update(status='blocked', reason='rate_limited', evidence='native_provider_status',
@@ -928,46 +1023,36 @@ async def _run_suite(ui, args, report, exercise=None, stages=None):
         report['cleanup']['preferences'] = 'fail'
         errors = False
         try:
-            state = await ownership(ui)
+            state = await driver.ownership()
             if state == 'foreign':
                 raise Blocked('cleanup_foreign_session_or_execution')
             if state in ('owned_active', 'pending'):
-                if state == 'owned_active' and await ownership(ui, 'cancel') == 'foreign':
+                if state == 'owned_active' and await driver.ownership('cancel') == 'foreign':
                     raise Blocked('cleanup_foreign_session_or_execution')
                 async def idle():
-                    state = await ownership(ui)
+                    state = await driver.ownership()
                     if state == 'foreign':
                         raise Blocked('cleanup_foreign_session_or_execution')
                     return state == 'idle'
                 await wait_condition(idle, 20)
-            await ensure_owned_idle(ui)
+            await ensure_idle()
             prompts = [c['prompt'] for c in cases] + [prompt for c in cases if 'seed' in c for prompt in seed_prompts(args, c)]
-            cleared = await ui.evaluate(f"""(async () => {{
-                  {IDLE_FENCE}
-                  const e = document.getElementById('promptComposer');
-                  if (e && {json.dumps(prompts)}.includes(e.value)) {{
-                    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(e, '');
-                    e.dispatchEvent(new Event('input', {{bubbles:true}}));
-                  }}
-                  return true;
-                }})()""")
-            if cleared is not True:
-                raise Blocked('cleanup_ownership_fence_changed')
+            await driver.clear_owned_draft(prompts)
         except BaseException:
             # A foreign successor must never be stopped or have its preferences changed.
             report['cleanup']['preferences'] = 'blocked_ownership_fence'
             raise Blocked('cleanup_ownership_or_retirement_incomplete') from None
         # Attempt each restoration even if a different control or cancellation failed.
-        for restore, value in ((select_model, original['instant']), (set_web, original['web_enabled']), (set_tts, original['tts_enabled'])):
+        for restore, value in ((driver.select_model, original['instant']), (driver.set_web, original['web_enabled']), (driver.set_tts, original['tts_enabled'])):
             try:
-                await ensure_owned_idle(ui)
-                await restore(ui, value)
+                await ensure_idle()
+                await restore(value)
             except BaseException:
                 errors = True
         try:
-            restored = await snapshot_preferences(ui)
+            restored = await driver.snapshot_preferences()
             errors |= any(restored.get(k) != original.get(k) for k in original)
-            await ui.evaluate('delete window.__voxBenchmarkExecutions; delete window.__voxBenchmarkOwner; delete window.__voxBenchmarkNextSession')
+            await driver.release_ownership()
         except BaseException:
             errors = True
         if errors:
@@ -1032,7 +1117,16 @@ def source_identity():
     dirty = subprocess.run(['git', 'status', '--porcelain'], cwd=ROOT,
                            capture_output=True, text=True, timeout=10)
     harness = hashlib.sha256()
-    for path in [Path(__file__), ROOT / 'scripts/android-e2e-smoke.py', Path(__file__).with_name('desktop.py'), Path(__file__).with_name('stages.py')]:
+    wear = ROOT / 'apps/wear'
+    assistant = wear / 'app/src/main/java/dev/gitblame/voxgolem/android/wear/assistant'
+    for path in [Path(__file__), ROOT / 'scripts/android-e2e-smoke.py', Path(__file__).with_name('desktop.py'), Path(__file__).with_name('stages.py'),
+                 Path(__file__).with_name('wear.py'), assistant / 'TypedAskBenchmark.kt',
+                 assistant / 'AssistantActivity.kt', assistant / 'AssistantPresentation.kt', wear / 'app/assistant-proguard-rules.pro',
+                 ROOT / 'crates/assistant-android/src/main/java/dev/gitblame/voxgolem/assistant/runtime/AssistantRuntime.kt',
+                 wear / 'app/src/main/AndroidManifest.xml',
+                 wear / 'app/src/performance/AndroidManifest.xml',
+                 wear / 'voice-benchmark/src/main/AndroidManifest.xml',
+                 wear / 'voice-benchmark/src/main/java/dev/gitblame/voxgolem/android/wear/speechtest/TypedAskInstrumentation.java']:
         if path.is_file():
             harness.update(path.name.encode() + b'\0' + path.read_bytes() + b'\0')
     return {'revision': revision.stdout.strip() if revision.returncode == 0 and
@@ -1158,7 +1252,18 @@ def main():
                   'Page reads require execution evidence; sources alone do not prove them.']}
     report['limitations'] += ['Synthetic conversations are retained; no app data is deleted.',
                               'Installed signing certificate not independently verified.',
-                              'Budget bounds UI admissions, not native internal tool or provider retries.']
+                               'Budget bounds UI admissions, not native internal tool or provider retries.']
+    if args.platform == 'wear':
+        report['measurement'] = {
+            'clock':'device-elapsed-realtime',
+            'boundary':'native-UI-Send-action-to-observed-first-projected-text-and-terminal',
+            'transport_overhead':'excluded-from-device-timing',
+            'condition':'isolated-typed-session-production-config-setup-not-measured-user-selector-flow',
+            'accessibility':'separate-evidence-not-painted-pixels'}
+        report['limitations'] = [item for item in report['limitations'] if item != 'Windows and Wear unsupported.']
+        report['limitations'].append('Windows unsupported; Wear evidence is scoped to the native typed adapter.')
+        if args.collect_stages:
+            report['stage_collection'] = {'status':'unsupported', 'reason':'wear_collector_unavailable'}
     if args.collect_stages and args.platform == 'desktop':
         report['stage_collection'] = {'status':'unsupported', 'reason':'desktop_collector_unavailable'}
     def interrupted(signum, frame):
@@ -1190,10 +1295,20 @@ def main():
             result = desktop.run_desktop(args, report)
             if inspect.isawaitable(result):
                 asyncio.run(result)
+        elif args.platform == 'wear':
+            spec = importlib.util.spec_from_file_location('typed_benchmark_wear', Path(__file__).with_name('wear.py'))
+            if not Path(spec.origin).is_file():
+                raise Blocked('wear_native_adapter_unavailable')
+            wear = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = wear
+            spec.loader.exec_module(wear)
+            asyncio.run(wear.run_wear(args, report, sys.modules[__name__]))
         else:
             asyncio.run(run_android(args, report))
     except Blocked as error:
         report['failure_category'] = str(error)
+        if hasattr(error, 'native_diagnostics'):
+            report['native_failure_diagnostics'] = error.native_diagnostics
         report['status'] = 'fail'
     except (TimeoutError, subprocess.TimeoutExpired):
         report['failure_category'] = 'operation_deadline'
