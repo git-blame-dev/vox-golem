@@ -1,6 +1,8 @@
 fn main() {
     tauri_plugin::Builder::new(&[
         "snapshot",
+        "register_listener",
+        "remove_listener",
         "enable_capture",
         "list_captures",
         "select_notes_folder",

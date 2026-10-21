@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { listCaptures, loadCaptureSnapshot } from './captures'
-import type { CaptureRecord, CaptureSnapshot } from './captures'
+import { listCaptures, loadCaptureSnapshot, listenCapturePlayback } from './captures'
+import type { CaptureRecord, CaptureSnapshot, CapturePlayback } from './captures'
 
 const PAGE_SIZE = 100
 interface Correction { captureId: string; text: string; baselineText: string; version: number; conflicted: boolean; record: CaptureRecord }
@@ -9,6 +9,10 @@ const transcript = (record: CaptureRecord): string => record.finalText ?? record
 /** The history screen owns its polling lifetime, page requests and correction baseline. */
 export function useCaptureHistory() {
   const [snapshot, setSnapshot] = useState<CaptureSnapshot | null>(null)
+  const [playback, setPlayback] = useState<CapturePlayback | null>(null)
+  const projectPlayback = useCallback((next: CapturePlayback): void => {
+    setPlayback((previous) => previous === null || next.revision > previous.revision ? next : previous)
+  }, [])
   const [records, setRecords] = useState<CaptureRecord[]>([])
   const [offset, setOffset] = useState(0)
   const [hasOlder, setHasOlder] = useState(false)
@@ -38,6 +42,7 @@ export function useCaptureHistory() {
           if (!current() || nextPage !== requestedPage.current) continue
           nextRecords = [...nextRecords].sort((left, right) => Date.parse(right.createdAtUtc) - Date.parse(left.createdAtUtc))
           setSnapshot(nextSnapshot)
+          if (nextSnapshot.playback !== undefined) projectPlayback(nextSnapshot.playback)
           setRecords(nextRecords)
           setOffset(nextPage)
           setHasOlder(more)
@@ -62,11 +67,19 @@ export function useCaptureHistory() {
     })
     inFlight.current = promise
     return promise
-  }, [])
+  }, [projectPlayback])
 
   useEffect(() => {
     mounted.current = true
     lifetime.current += 1
+    const listenerEpoch = lifetime.current
+    let unlisten: (() => void) | null = null
+    void listenCapturePlayback((next) => {
+      if (mounted.current && listenerEpoch === lifetime.current) projectPlayback(next)
+    }).then((stop) => {
+      if (!mounted.current || listenerEpoch !== lifetime.current) stop()
+      else { unlisten = stop; void refresh(requestedPage.current) }
+    }).catch(() => undefined)
     let timer: number | null = null
     const poll = (): void => {
       if (timer !== null) window.clearTimeout(timer)
@@ -82,6 +95,7 @@ export function useCaptureHistory() {
     window.addEventListener('focus', poll)
     return () => {
       mounted.current = false
+      unlisten?.()
       lifetime.current += 1
       pendingPage.current = null
       inFlight.current = null
@@ -89,7 +103,7 @@ export function useCaptureHistory() {
       document.removeEventListener('visibilitychange', poll)
       window.removeEventListener('focus', poll)
     }
-  }, [refresh])
+  }, [refresh, projectPlayback])
 
   const pageRecord = records.find(({ captureId }) => captureId === correction?.captureId)
   const selected = pageRecord ?? correction?.record ?? null
@@ -100,7 +114,7 @@ export function useCaptureHistory() {
   const setDraft = (text: string): void => setCorrection((previous) => previous === null ? null : { ...previous, text })
   const acceptSavedCorrection = (captureId: string, text: string): void => setCorrection((previous) =>
     previous?.captureId === captureId && previous.text === text ? { ...previous, baselineText: text } : previous)
-  return { snapshot, setSnapshot, records, setRecords, offset, hasOlder, selected, selectedId: correction?.captureId ?? null,
+  return { snapshot, setSnapshot, playback, records, setRecords, offset, hasOlder, selected, selectedId: correction?.captureId ?? null,
     draft: correction?.text ?? '', draftVersion: correction?.version, conflict, offPage, selectRecord, setDraft, acceptSavedCorrection, markCorrectionConflict,
     error, setError, setupMessage, setSetupMessage, mounted, refresh }
 }

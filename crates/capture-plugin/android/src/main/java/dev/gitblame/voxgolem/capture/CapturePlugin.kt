@@ -32,17 +32,28 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
     private val repository by lazy { CaptureRepository(activity) }
     private val destinationStore by lazy { SafNotesStore(activity) }
     private val phoneCoordinator by lazy { PhoneCaptureCoordinator.shared(activity.applicationContext) }
-    private var player: MediaPlayer? = null
+    private var destroyed = false
+    private val playback = CapturePlayback { runCatching { trigger("playback", it) }; Unit }
+    private val enableRequest = CaptureEnableRequest<Invoke> { it.reject("capture-enable-cancelled") }
 
     override fun load(webView: android.webkit.WebView) {
         (activity as? LifecycleOwner)?.lifecycle?.addObserver(object : DefaultLifecycleObserver {
             override fun onResume(owner: LifecycleOwner) {
-                if (!isWatch() && phoneCoordinator.isEnabled() && !PhoneCaptureRuntimeService.isForegroundReady()) {
+                settleEnable()
+                if (!destroyed && !isWatch() && phoneCoordinator.isEnabled() && !PhoneCaptureRuntimeService.isForegroundReady()) {
                     phoneCoordinator.start()
                 }
             }
+            override fun onStop(owner: LifecycleOwner) { enableRequest.cancel() }
+            override fun onDestroy(owner: LifecycleOwner) { this@CapturePlugin.onDestroy() }
         })
     }
+
+    @Command
+    fun register_listener(invoke: Invoke) = super.registerListener(invoke)
+
+    @Command
+    fun remove_listener(invoke: Invoke) = super.removeListener(invoke)
 
     @Command
     fun snapshot(invoke: Invoke) {
@@ -60,20 +71,34 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
             invoke.reject("Phone capture setup is unavailable on Wear OS")
             return
         }
-        if ((activity as? LifecycleOwner)?.lifecycle?.currentState?.isAtLeast(Lifecycle.State.RESUMED) != true) {
+        if (destroyed || activity.isFinishing || activity.isDestroyed ||
+            (activity as? LifecycleOwner)?.lifecycle?.currentState?.isAtLeast(Lifecycle.State.RESUMED) != true) {
             invoke.reject("Phone capture can only be enabled from the visible app")
             return
         }
         val aliases = NativePhoneRequirements.missing(activity).map { it.alias }
+        enableRequest.begin(invoke)
         if (aliases.isNotEmpty()) {
-            requestPermissionForAliases(aliases.toTypedArray(), invoke, "capturePermissionsGranted")
+            try { requestPermissionForAliases(aliases.toTypedArray(), invoke, "capturePermissionsGranted") }
+            catch (_: Exception) { enableRequest.cancel() }
             return
         }
-        resolveEnable(invoke)
+        enableRequest.permissionResult(invoke)
+        settleEnable()
     }
 
     @PermissionCallback
-    private fun capturePermissionsGranted(invoke: Invoke) = resolveEnable(invoke)
+    private fun capturePermissionsGranted(invoke: Invoke) {
+        enableRequest.permissionResult(invoke)
+        settleEnable()
+    }
+
+    private fun settleEnable() = enableRequest.settle(
+        visible = (activity as? LifecycleOwner)?.lifecycle?.currentState?.isAtLeast(Lifecycle.State.RESUMED) == true,
+        alive = !destroyed && !activity.isFinishing && !activity.isDestroyed,
+        permitted = NativePhoneRequirements.missing(activity).isEmpty(),
+        enable = ::resolveEnable,
+    )
 
     @Command
     fun list_captures(invoke: Invoke) {
@@ -126,28 +151,34 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
             require(CaptureProtocol.isValidUuid(args.captureId)) { "Invalid capture ID" }
             val record = repository.get(args.captureId) ?: error("Capture was not found")
             require(record.captureState in setOf(CaptureState.SAVED, CaptureState.INTERRUPTED)) { "Recording is not finalized yet" }
-            stopPlayer()
+            check(!destroyed)
             val audioUri = record.archivedAudioUri?.let(Uri::parse)
             val audioFile = record.localAudioPath?.let(::File)
             require(audioUri != null || audioFile?.isFile == true) { "Recording audio is unavailable" }
-            player = MediaPlayer().apply {
-                if (audioUri != null) setDataSource(activity, audioUri) else setDataSource(audioFile!!.absolutePath)
-                setOnCompletionListener { stopPlayer() }
-                setOnErrorListener { _, _, _ -> stopPlayer(); true }
-                setOnPreparedListener { it.start() }
-                prepareAsync()
-            }
+            val player = playback.begin(record.captureId, { MediaPlayer() }) { player ->
+                player.setOnPreparedListener(null)
+                player.setOnCompletionListener(null)
+                player.setOnErrorListener(null)
+                player.release()
+            } ?: error("Previous playback cleanup is incomplete")
+            try {
+                player.apply {
+                    if (audioUri != null) setDataSource(activity, audioUri) else setDataSource(audioFile!!.absolutePath)
+                    setOnCompletionListener { playback.finish(it, "completed") }
+                    setOnErrorListener { exact, _, _ -> playback.finish(exact, "failed"); true }
+                    setOnPreparedListener { exact -> playback.prepared(exact) { exact.start() } }
+                    prepareAsync()
+                }
+            } catch (error: Exception) { playback.finish(player, "failed"); throw error }
             invoke.resolve()
         } catch (error: Exception) {
-            stopPlayer()
             invoke.reject("recording-playback-unavailable")
         }
     }
 
     @Command
     fun stop_playback(invoke: Invoke) {
-        stopPlayer()
-        invoke.resolve()
+        if (playback.stop()) invoke.resolve() else invoke.reject("recording-playback-cleanup-failed")
     }
 
     @Command
@@ -197,24 +228,23 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
     )
 
     private fun snapshotValue(): JSObject = NativeCaptureProjection.snapshot(destinationStore.selected(), repository.list(0, 100), projectionStatus())
+        .put("playback", playback.snapshot())
 
     private fun resolveEnable(invoke: Invoke) {
-        val result = phoneCoordinator.enableFromVisibleActivity()
-        invoke.resolve(NativeCaptureProjection.snapshot(destinationStore.selected(), repository.list(0, 100), projectionStatus(), result))
+        try {
+            val result = phoneCoordinator.enableFromVisibleActivity()
+            invoke.resolve(NativeCaptureProjection.snapshot(destinationStore.selected(), repository.list(0, 100), projectionStatus(), result))
+        } catch (_: Exception) { invoke.reject("capture-enable-unavailable") }
     }
 
     private fun recordValue(record: CaptureRecord): JSObject = NativeCaptureProjection.record(record)
 
-    private fun stopPlayer() {
-        player?.runCatching { stop() }
-        player?.release()
-        player = null
-    }
-
     private fun isWatch(): Boolean = NativePhoneRequirements.isWatch(activity)
 
     override fun onDestroy() {
-        stopPlayer()
+        destroyed = true
+        enableRequest.cancel()
+        playback.stop()
     }
 }
 

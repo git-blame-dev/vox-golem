@@ -2,11 +2,11 @@ import { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import type { Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { CaptureRecord } from '../lib/captures'
+import type { CaptureRecord, CapturePlayback } from '../lib/captures'
 
 const captureMocks = vi.hoisted(() => ({
   listCaptures: vi.fn(), loadCaptureSnapshot: vi.fn(), playCapture: vi.fn(), retryCapture: vi.fn(), finalizeCapture: vi.fn(),
-  selectNotesFolder: vi.fn(), stopCapturePlayback: vi.fn(), updateCaptureTranscript: vi.fn(), enableCapture: vi.fn(),
+  selectNotesFolder: vi.fn(), stopCapturePlayback: vi.fn(), updateCaptureTranscript: vi.fn(), enableCapture: vi.fn(), listenCapturePlayback: vi.fn(),
 }))
 
 vi.mock('../lib/captures', () => captureMocks)
@@ -25,11 +25,43 @@ afterEach(() => {
 })
 
 beforeEach(() => {
+  captureMocks.listenCapturePlayback.mockRejectedValue(new Error('Synthetic unavailable listener'))
   captureMocks.stopCapturePlayback.mockResolvedValue(undefined)
   captureMocks.updateCaptureTranscript.mockResolvedValue(undefined)
 })
 
 describe('CaptureHistory', () => {
+  it('projects preparation and terminals from native revisions, not play acknowledgement', async () => {
+    const record = capture()
+    let changed!: (value: CapturePlayback) => void
+    const unlisten = vi.fn()
+    captureMocks.listenCapturePlayback.mockImplementation(async (callback: typeof changed) => { changed = callback; return unlisten })
+    captureMocks.playCapture.mockResolvedValue(undefined)
+    captureMocks.loadCaptureSnapshot.mockResolvedValue({ available: true, notesFolderUri: null, captures: [record], error: null })
+    await mount()
+    await act(async () => { container!.querySelector<HTMLButtonElement>('.capture-history__record')!.click() })
+    await act(async () => { Array.from(container!.querySelectorAll('button')).find((button) => button.textContent === 'Play recording')!.click() })
+    expect(container!.textContent).not.toContain('Playing recording')
+    await act(async () => { changed({ revision: 1, captureId: record.captureId, phase: 'preparing' }) })
+    expect(container!.textContent).toContain('Preparing playback')
+    await act(async () => { changed({ revision: 2, captureId: record.captureId, phase: 'playing' }) })
+    expect(container!.textContent).toContain('Playing recording')
+    await act(async () => { changed({ revision: 3, captureId: record.captureId, phase: 'completed' }); changed({ revision: 2, captureId: record.captureId, phase: 'playing' }) })
+    expect(container!.textContent).toContain('Playback completed')
+    expect(container!.textContent).not.toContain('Stop playback')
+    await act(async () => { changed({ revision: 4, captureId: record.captureId, phase: 'failed' }) })
+    expect(container!.textContent).toContain('Playback failed')
+    // A recreated native owner has a newer initial idle sequence, even in a surviving UI.
+    await act(async () => {
+      changed({ revision: 5, captureId: null, phase: 'idle' })
+      changed({ revision: 4, captureId: record.captureId, phase: 'playing' })
+    })
+    expect(container!.textContent).not.toContain('Playing recording')
+    expect(container!.textContent).not.toContain('Stop playback')
+    act(() => root!.unmount()); root = null
+    expect(unlisten).toHaveBeenCalledOnce()
+    expect(captureMocks.stopCapturePlayback).toHaveBeenCalled()
+  })
   it('preserves a correction rejected by the atomic native version fence and requires review', async () => {
     const initial = { ...capture(), finalText: 'Synthetic initial', transcriptVersion: 2 }
     captureMocks.loadCaptureSnapshot.mockResolvedValue({ available: true, notesFolderUri: null, captures: [initial], error: null })

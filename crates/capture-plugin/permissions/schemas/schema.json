@@ -343,6 +343,30 @@
           "markdownDescription": "Denies the play_capture command without any pre-configured scope."
         },
         {
+          "description": "Enables the register_listener command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-register-listener",
+          "markdownDescription": "Enables the register_listener command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the register_listener command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-register-listener",
+          "markdownDescription": "Denies the register_listener command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the remove_listener command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-remove-listener",
+          "markdownDescription": "Enables the remove_listener command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the remove_listener command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-remove-listener",
+          "markdownDescription": "Denies the remove_listener command without any pre-configured scope."
+        },
+        {
           "description": "Enables the retry_capture command without any pre-configured scope.",
           "type": "string",
           "const": "allow-retry-capture",
@@ -403,10 +427,10 @@
           "markdownDescription": "Denies the update_transcript command without any pre-configured scope."
         },
         {
-          "description": "Allows access to all capture plugin operations.\n#### This default permission set includes:\n\n- `allow-snapshot`\n- `allow-enable-capture`\n- `allow-list-captures`\n- `allow-select-notes-folder`\n- `allow-play-capture`\n- `allow-stop-playback`\n- `allow-retry-capture`\n- `allow-finalize-capture`\n- `allow-update-transcript`",
+          "description": "Allows access to all capture plugin operations.\n#### This default permission set includes:\n\n- `allow-snapshot`\n- `allow-register-listener`\n- `allow-remove-listener`\n- `allow-enable-capture`\n- `allow-list-captures`\n- `allow-select-notes-folder`\n- `allow-play-capture`\n- `allow-stop-playback`\n- `allow-retry-capture`\n- `allow-finalize-capture`\n- `allow-update-transcript`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Allows access to all capture plugin operations.\n#### This default permission set includes:\n\n- `allow-snapshot`\n- `allow-enable-capture`\n- `allow-list-captures`\n- `allow-select-notes-folder`\n- `allow-play-capture`\n- `allow-stop-playback`\n- `allow-retry-capture`\n- `allow-finalize-capture`\n- `allow-update-transcript`"
+          "markdownDescription": "Allows access to all capture plugin operations.\n#### This default permission set includes:\n\n- `allow-snapshot`\n- `allow-register-listener`\n- `allow-remove-listener`\n- `allow-enable-capture`\n- `allow-list-captures`\n- `allow-select-notes-folder`\n- `allow-play-capture`\n- `allow-stop-playback`\n- `allow-retry-capture`\n- `allow-finalize-capture`\n- `allow-update-transcript`"
         }
       ]
     }

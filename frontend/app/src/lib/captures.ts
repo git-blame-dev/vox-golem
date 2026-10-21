@@ -1,4 +1,30 @@
 import { getTauriInternals, isAndroidRuntime } from './tauri'
+import { addPluginListener } from '@tauri-apps/api/core'
+
+export interface CapturePlayback {
+  revision: number
+  captureId: string | null
+  phase: 'idle' | 'preparing' | 'playing' | 'completed' | 'failed' | 'stopped'
+}
+
+export function parseCapturePlayback(value: unknown): CapturePlayback {
+  const item = object(value)
+  if (item === null || typeof item['revision'] !== 'number' || !Number.isSafeInteger(item['revision']) || item['revision'] < 0) {
+    throw new Error('Capture playback revision is invalid')
+  }
+  return { revision: item['revision'], captureId: nullableString(item['captureId'], 'playback capture ID'),
+    phase: state(item['phase'], ['idle', 'preparing', 'playing', 'completed', 'failed', 'stopped'] as const, 'playback phase') }
+}
+
+export async function listenCapturePlayback(changed: (value: CapturePlayback) => void): Promise<() => void> {
+  const listener = await addPluginListener<unknown>('capture', 'playback', (value) => changed(parseCapturePlayback(value)))
+  return () => {
+    // Android's base Plugin exposes the camel-case listener commands.
+    void listener.unregister().catch(() => captureInvoke('removeListener', {
+      event: 'playback', channelId: listener.channelId,
+    })).catch(() => undefined)
+  }
+}
 
 // Public enum names from crates/capture-android/.../CaptureContract.kt, not persistence JSON.
 const captureStates = ['PREPARING', 'RECORDING', 'STOPPING', 'SAVED', 'INTERRUPTED', 'FAILED'] as const
@@ -36,6 +62,7 @@ export interface CaptureRecord {
 }
 
 export interface CaptureSnapshot {
+  playback?: CapturePlayback
   available: boolean
   setupRequired: boolean
   onboardingState: CaptureOnboardingState
@@ -117,6 +144,7 @@ export function parseCaptureSnapshot(value: unknown): CaptureSnapshot {
     : state(snapshot['onboardingState'], onboardingStates, 'onboarding state')
   return {
     available: snapshot['available'],
+    ...(snapshot['playback'] === undefined ? {} : { playback: parseCapturePlayback(snapshot['playback']) }),
     setupRequired: onboardingState !== 'enabled',
     onboardingState,
     onboardingError: snapshot['onboardingError'] === undefined

@@ -5,6 +5,8 @@ Allows access to all capture plugin operations.
 #### This default permission set includes the following:
 
 - `allow-snapshot`
+- `allow-register-listener`
+- `allow-remove-listener`
 - `allow-enable-capture`
 - `allow-list-captures`
 - `allow-select-notes-folder`
@@ -123,6 +125,58 @@ Enables the play_capture command without any pre-configured scope.
 <td>
 
 Denies the play_capture command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`capture:allow-register-listener`
+
+</td>
+<td>
+
+Enables the register_listener command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`capture:deny-register-listener`
+
+</td>
+<td>
+
+Denies the register_listener command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`capture:allow-remove-listener`
+
+</td>
+<td>
+
+Enables the remove_listener command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`capture:deny-remove-listener`
+
+</td>
+<td>
+
+Denies the remove_listener command without any pre-configured scope.
 
 </td>
 </tr>

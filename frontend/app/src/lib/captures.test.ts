@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { parseCaptureRecord, parseCaptureSnapshot } from './captures'
+import { parseCaptureRecord, parseCaptureSnapshot, parseCapturePlayback } from './captures'
 
 afterEach(() => {
   delete window.__TAURI_INTERNALS__
@@ -8,6 +8,14 @@ afterEach(() => {
 })
 
 describe('capture IPC adapter', () => {
+  it('validates the native playback projection without inferring playing from admission', () => {
+    for (const phase of ['idle', 'preparing', 'playing', 'completed', 'failed', 'stopped']) {
+      expect(parseCapturePlayback({ revision: 3, captureId: null, phase })).toEqual({ revision: 3, captureId: null, phase })
+    }
+    expect(() => parseCapturePlayback({ revision: -1, captureId: null, phase: 'playing' })).toThrow()
+    expect(() => parseCapturePlayback({ revision: 1.5, captureId: null, phase: 'playing' })).toThrow()
+    expect(() => parseCapturePlayback({ revision: 1, captureId: null, phase: 'admitted' })).toThrow()
+  })
   it('preserves voice-entry purpose and treats only legacy records as Notes', () => {
     expect(parseCaptureRecord(record())).toMatchObject({ purpose: 'NOTE' })
     for (const purpose of ['NOTE', 'ASK', 'TALK', 'DRAFT']) {

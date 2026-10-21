@@ -55,6 +55,9 @@ share it. `RECORD_AUDIO` is required for supplied watch audio, `BLUETOOTH_CONNEC
 from API31 and `POST_NOTIFICATIONS` from API33. Requests require an explicit action
 in a resumed Activity; prior consent permits a visible-resume service restart.
 Service admission still rechecks consent and permissions and fails closed.
+The pending permission invocation is identity-fenced. A permission-dialog pause can
+settle after resume; genuine stop, destruction or replacement cancels the abandoned
+invocation rather than enabling capture later from its callback.
 
 The service is a visible `connectedDevice` foreground service, not a microphone
 service. Host manifest permissions and service type remain required. The supplied
@@ -80,6 +83,24 @@ but foreground readiness is not confirmed; it is neither success nor failure.
 Frontend retains legacy snapshots without onboarding fields using `setupRequired`
 and the existing `error` fallback. The Rust bridge still forwards snapshots and
 unwraps native `{captures: [...]}` list responses into the frontend array.
+
+### Local playback projection
+
+[CapturePlayback](android/src/main/java/dev/gitblame/voxgolem/capture/CapturePlayback.kt)
+owns the exact native player and its preparation, playback and terminal projection.
+Snapshots include an additive `playback` value; the `playback` plugin event carries
+the same value. The frontend parser is the authoritative public shape. Its revision
+orders projections across player/plugin replacement within the process.
+Events use `register_listener` and `remove_listener` through Tauri `addPluginListener`;
+both listener permissions are included in the existing `capture:default` permission
+set, without granting additional windows or unrelated commands.
+
+A successful `play_capture` command requests preparation; it does not establish audible
+playback. Completion and error callbacks update native state, and stale callbacks cannot
+retire a successor. Failed native cleanup retains its owner for explicit retry and is
+not acknowledged as successful Stop. History unmount removes its listener and requests
+playback cleanup. Real MediaPlayer/event delivery remains a target-runtime acceptance
+boundary, distinct from simulated callback tests.
 
 ## Wire and durable export guarantees
 

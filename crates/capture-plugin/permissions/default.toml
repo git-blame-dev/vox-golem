@@ -2,6 +2,8 @@
 description = "Allows access to all capture plugin operations."
 permissions = [
   "allow-snapshot",
+  "allow-register-listener",
+  "allow-remove-listener",
   "allow-enable-capture",
   "allow-list-captures",
   "allow-select-notes-folder",

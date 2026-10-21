@@ -11,10 +11,10 @@ import { captureErrorMessage as errorMessage, useCaptureHistory } from '../lib/u
 const PAGE_SIZE = 100
 
 export function CaptureHistory({ onBack }: { onBack: () => void }): JSX.Element {
-  const { snapshot, setSnapshot, records, setRecords, offset, hasOlder, selectedId, selected, draft, draftVersion, conflict, offPage,
+  const { snapshot, setSnapshot, playback, records, setRecords, offset, hasOlder, selectedId, selected, draft, draftVersion, conflict, offPage,
     error, setError, setupMessage, setSetupMessage, mounted, refresh, selectRecord, setDraft, acceptSavedCorrection, markCorrectionConflict } = useCaptureHistory()
   const [busy, setBusy] = useState(false)
-  const [playingId, setPlayingId] = useState<string | null>(null)
+  const playingId = playback?.phase === 'preparing' || playback?.phase === 'playing' ? playback.captureId : null
   const [editedExportedIds, setEditedExportedIds] = useState<ReadonlySet<string>>(() => new Set())
   useEffect(() => () => { void stopCapturePlayback().catch(() => undefined) }, [])
 
@@ -63,11 +63,8 @@ export function CaptureHistory({ onBack }: { onBack: () => void }): JSX.Element 
     try {
       if (playingId === record.captureId) {
         await stopCapturePlayback()
-        setPlayingId(null)
       } else {
-        if (playingId !== null) await stopCapturePlayback()
         await playCapture(record.captureId)
-        setPlayingId(record.captureId)
       }
     } catch (reason) { if (mounted.current) setError(errorMessage(reason)) }
     finally { if (mounted.current) setBusy(false) }
@@ -171,6 +168,7 @@ export function CaptureHistory({ onBack }: { onBack: () => void }): JSX.Element 
               : <p>No transcript available.</p>}
           {visibleSpeechError(selected.error) !== null ? <p className="capture-history__error">{visibleSpeechError(selected.error)}</p> : null}
           <div className="capture-history__actions">
+            {playback?.captureId === selected.captureId ? <p role="status">{playback.phase === 'preparing' ? 'Preparing playback…' : playback.phase === 'playing' ? 'Playing recording' : playback.phase === 'completed' ? 'Playback completed' : playback.phase === 'failed' ? 'Playback failed' : 'Playback stopped'}</p> : null}
             {selected.purpose === 'NOTE' && selected.captureState === 'INTERRUPTED' ? <button type="button" className="shell__control" disabled={busy} onClick={() => void finalize(selected)}>Finalize interrupted capture</button> : null}
             <button type="button" className="shell__control" disabled={busy} onClick={() => void play(selected)}>{playingId === selected.captureId ? 'Stop playback' : 'Play recording'}</button>
             <button type="button" className="shell__control" disabled={busy || !canRetry(selected)} onClick={() => void retry(selected)}>Retry processing</button>

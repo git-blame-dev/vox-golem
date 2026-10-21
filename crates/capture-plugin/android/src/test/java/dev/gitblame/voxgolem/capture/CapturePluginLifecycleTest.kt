@@ -3,6 +3,7 @@ package dev.gitblame.voxgolem.capture
 import android.Manifest
 import android.content.Context
 import android.webkit.WebView
+import app.tauri.plugin.Invoke
 import androidx.activity.ComponentActivity
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -19,6 +20,53 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class CapturePluginLifecycleTest {
+    @Suppress("UNCHECKED_CAST")
+    private fun pending(plugin: CapturePlugin): CaptureEnableRequest<Invoke> =
+        CapturePlugin::class.java.getDeclaredField("enableRequest").apply { isAccessible = true }.get(plugin) as CaptureEnableRequest<Invoke>
+
+    private fun permissionResult(plugin: CapturePlugin, invoke: Invoke) {
+        CapturePlugin::class.java.getDeclaredMethod("capturePermissionsGranted", Invoke::class.java)
+            .apply { isAccessible = true }.invoke(plugin, invoke)
+    }
+
+    private fun invocation(sender: (Long, String) -> Unit): Invoke {
+        val mapper = Class.forName("com.fasterxml.jackson.databind.ObjectMapper").getConstructor().newInstance()
+        return Invoke::class.java.constructors.single().newInstance(1L, "enable_capture", 10L, 11L, sender, "{}", mapper) as Invoke
+    }
+
+    @Test fun permissionDialogPauseThenGrantSettlesOnlyAfterResumeThroughPluginObserver() {
+        val controller = Robolectric.buildActivity(ComponentActivity::class.java).create().start().resume()
+        val plugin = CapturePlugin(controller.get())
+        plugin.load(WebView(controller.get()))
+        val responses = mutableListOf<Long>()
+        val request = invocation { callback, _ -> responses += callback }
+        pending(plugin).begin(request)
+        controller.pause()
+        permissionResult(plugin, request)
+        assertEquals(emptyList<Long>(), responses)
+        assertEquals(false, preferences.getBoolean(PhoneCaptureCoordinator.KEY_OPTED_IN, false))
+        controller.resume()
+        assertEquals(listOf(10L), responses)
+        assertEquals(true, preferences.getBoolean(PhoneCaptureCoordinator.KEY_OPTED_IN, false))
+        controller.pause().stop().destroy()
+    }
+
+    @Test fun backgroundAndDestructionRejectPendingGrantAndIgnoreItsLateCallback() {
+        for (destroy in listOf(false, true)) {
+            val controller = Robolectric.buildActivity(ComponentActivity::class.java).create().start().resume()
+            val plugin = CapturePlugin(controller.get())
+            plugin.load(WebView(controller.get()))
+            val responses = mutableListOf<Long>()
+            val request = invocation { callback, _ -> responses += callback }
+            pending(plugin).begin(request)
+            if (destroy) plugin.onDestroy() else controller.pause().stop()
+            permissionResult(plugin, request)
+            assertEquals(listOf(11L), responses)
+            assertEquals(false, preferences.getBoolean(PhoneCaptureCoordinator.KEY_OPTED_IN, false))
+            if (destroy) controller.pause().stop().destroy() else controller.destroy()
+        }
+    }
+
     private val context: Context = RuntimeEnvironment.getApplication()
     private val preferences by lazy { context.getSharedPreferences(PhoneCaptureCoordinator.PREFERENCES, Context.MODE_PRIVATE) }
 
