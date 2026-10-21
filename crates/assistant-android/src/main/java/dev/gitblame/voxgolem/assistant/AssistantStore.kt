@@ -125,6 +125,13 @@ class AssistantStore(
     internal fun committedSnapshot(): CommittedSnapshot = locked(AssistantDiagnosticJournal.StorageCall.SNAPSHOT) { snapshot().let { CommittedSnapshot(it.toString(), it.getString("revision")) } }
     fun allocateId(): JSONObject = locked(AssistantDiagnosticJournal.StorageCall.ALLOCATE_ID) { call("allocate_id") as JSONObject }
     fun replica(): String = locked(AssistantDiagnosticJournal.StorageCall.REPLICA) { call("replica") as String }
+    internal fun replication(request: JSONObject): Any = locked(AssistantDiagnosticJournal.StorageCall.READ) {
+        if (request.getString("kind") == "import") {
+            beforeCompare?.invoke()
+            beforeCommit?.invoke()
+        }
+        call("replication", JSONObject().put("request", request))
+    }
     fun conversationPage(
         offset: Int = 0,
         limit: Int = 128,
@@ -177,6 +184,15 @@ class AssistantStore(
     fun context(conversation: JSONObject, selectedHead: JSONObject?): JSONObject = locked(AssistantDiagnosticJournal.StorageCall.CONTEXT) {
         call("context", JSONObject().put("conversation", conversation).put("selected_head", selectedHead ?: JSONObject.NULL)) as JSONObject
     }
+
+    internal fun prepareMobile(conversation: JSONObject?, selectedHead: JSONObject?, prompt: String, strictParent: Boolean): JSONObject =
+        locked(AssistantDiagnosticJournal.StorageCall.CONTEXT) {
+            beforeCompare?.invoke()
+            beforeCommit?.invoke()
+            call("prepare_mobile", JSONObject().put("request", JSONObject()
+                .put("selection", selection(conversation, selectedHead)).put("prompt", prompt)
+                .put("total_text_bytes", 256 * 1024).put("strict_parent", strictParent))) as JSONObject
+        }
 
     internal fun project(conversation: JSONObject?, head: JSONObject?, busy: Boolean,
         read: AssistantProjectionRead? = null): AssistantProjection = locked(AssistantDiagnosticJournal.StorageCall.PROJECTION) {

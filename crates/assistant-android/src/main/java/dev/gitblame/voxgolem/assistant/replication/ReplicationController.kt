@@ -29,13 +29,15 @@ internal class ReplicationController(
             checkBudget()
             val saved = state.load(peer)
             if (saved == null) begin(peer) else send(saved.getJSONObject("pending"))
-            val snapshot = store.snapshot()
-            val retained = outgoing(snapshot)
-            val offers = ReplicationWire.arrayObjects(store.publications(peer, null, 32))
-                .filter { ReplicationWire.idKey(it.getJSONObject("operation").getJSONObject("id")) in retained }
-                .map(::descriptor).sortedWith { a, b -> compareId(a.getJSONObject("id"), b.getJSONObject("id")) }
+            val native = store.nativeRead(JSONObject().put("kind", "inventory").put("cursor", JSONObject.NULL)) as JSONObject?
+            val snapshot = if (native == null) store.snapshot() else null
+            val retained = snapshot?.let(::outgoing)
+            val offers = if (native != null) ReplicationWire.arrayObjects(native.getJSONArray("entries")).take(32)
+                else ReplicationWire.arrayObjects(store.publications(peer, null, 32))
+                    .filter { ReplicationWire.idKey(it.getJSONObject("operation").getJSONObject("id")) in retained!! }
+                    .map(::descriptor).sortedWith { a, b -> compareId(a.getJSONObject("id"), b.getJSONObject("id")) }
             send(ReplicationWire.frame(store.replica, peer, newToken(), newToken(), "hint", JSONObject()
-                .put("revision", snapshot.getString("revision")).put("offers", JSONArray(offers))))
+                .put("revision", (native ?: snapshot!!).getString("revision")).put("offers", JSONArray(offers))))
         }
     }
 
@@ -57,7 +59,7 @@ internal class ReplicationController(
                         require(payload.length() == 2)
                         val offers = payload.getJSONArray("offers")
                         ReplicationWire.entries(offers)
-                        domain.reconcile(store.snapshot(), JSONObject().put("version", 2).put("revision", payload.getString("revision"))
+                        reconcilePage(JSONObject().put("version", 2).put("revision", payload.getString("revision"))
                             .put("entries", offers).put("next", JSONObject.NULL))
                     }
                     if (state.load(peer) == null) begin(peer)
@@ -114,6 +116,12 @@ internal class ReplicationController(
     private fun respondInventory(request: JSONObject) {
         val payload = request.getJSONObject("payload")
         require(payload.length() == 2 && payload.getString("phase") in setOf("tombstones", "records"))
+        val native = store.nativeRead(JSONObject().put("kind", "inventory").put("cursor", payload.get("cursor"))) as JSONObject?
+        if (native != null) {
+            if (native.optBoolean("restart", false)) { reply(request, "restart", JSONObject()); return }
+            reply(request, "inventory", JSONObject().put("page", native))
+            return
+        }
         val snapshot = store.snapshot()
         val cursor = if (payload.isNull("cursor")) JSONObject().put("revision", snapshot.getString("revision")).put("after", JSONObject.NULL)
             else payload.getJSONObject("cursor")
@@ -149,12 +157,9 @@ internal class ReplicationController(
         }
         val pages = session.getInt("pages") + 1
         require(pages <= 4096)
-        val snapshot = store.snapshot()
-        val plan = domain.reconcile(snapshot, page)
-        val unknown = (ReplicationWire.arrayObjects(plan.getJSONArray("fetch_tombstones")) + ReplicationWire.arrayObjects(plan.getJSONArray("fetch_records")))
-            .map { ReplicationWire.idKey(it.getJSONObject("id")) }.toSet()
-        val knownIds = JSONArray(ReplicationWire.arrayObjects(entries).filter { ReplicationWire.idKey(it.getJSONObject("id")) !in unknown }
-            .filter { known(snapshot, it) }.map { it.getJSONObject("id") })
+        val reconciled = reconcilePage(page)
+        val plan = reconciled.getJSONObject("plan")
+        val knownReceipts = reconciled.getJSONArray("receipts")
         session.put("revision", revision).put("pages", pages).put("next", page.get("next"))
         val fetch = if (session.getString("phase") == "tombstones") plan.getJSONArray("fetch_tombstones") else plan.getJSONArray("fetch_records")
         val remaining = ReplicationWire.arrayObjects(fetch).toMutableList()
@@ -173,7 +178,7 @@ internal class ReplicationController(
         }
         session.put("remaining", JSONArray(remaining))
         if (plan.getJSONArray("offer_tombstones").length() > 0) reply(frame, "hint", JSONObject())
-        if (knownIds.length() > 0) pending(peer, session, "ack", JSONObject().put("receipts", domain.receipts(snapshot, store.replica, knownIds)))
+        if (knownReceipts.length() > 0) pending(peer, session, "ack", JSONObject().put("receipts", knownReceipts))
         else advance(peer, session)
     }
 
@@ -200,6 +205,27 @@ internal class ReplicationController(
         val entries = payload.getJSONArray("entries")
         ReplicationWire.entries(entries)
         require(entries.length() in 1..ReplicationWire.MAX_ASSETS)
+        val native = store.nativeRead(JSONObject().put("kind", "bodies").put("revision", payload.getString("revision"))
+            .put("entries", entries).put("tombstones", payload.getString("phase") == "tombstones")) as JSONObject?
+        if (native != null) {
+            if (native.getBoolean("restart")) { reply(request, "restart", JSONObject()); return }
+            val descriptors = JSONArray()
+            val assets = linkedMapOf<String, ByteArray>()
+            for (body in ReplicationWire.arrayObjects(native.getJSONArray("bodies"))) {
+                checkBudget()
+                val raw = body.getString("body").toByteArray(Charsets.UTF_8)
+                val name = "body_${assets.size}"
+                assets[name] = raw
+                descriptors.put(JSONObject().put("entry", body.getJSONObject("entry")).put("asset", name).put("bytes", raw.size))
+            }
+            // Kotlin Asset encoding can overlap a disposition commit. Preserve the
+            // original last-moment revision fence without exporting another history.
+            if (store.nativeRead(JSONObject().put("kind", "revision")) != payload.getString("revision")) {
+                reply(request, "restart", JSONObject()); return
+            }
+            reply(request, "records", JSONObject().put("records", descriptors).put("unavailable", native.getJSONArray("unavailable")), assets)
+            return
+        }
         val snapshot = store.snapshot()
         if (payload.getString("revision") != snapshot.getString("revision")) { reply(request, "restart", JSONObject()); return }
         val retained = outgoing(snapshot)
@@ -242,6 +268,7 @@ internal class ReplicationController(
         var bytes = 0
         val records = JSONArray()
         val ids = JSONArray()
+        val verifiedEntries = JSONArray()
         for (transfer in ReplicationWire.arrayObjects(transfers)) {
             checkBudget()
             require(transfer.length() == 3)
@@ -262,22 +289,23 @@ internal class ReplicationController(
             bytes += size
             val record = ReplicationWire.decode(raw, ReplicationWire.MAX_RECORD_BYTES)
             require(record.length() == 2 && sameEntry(descriptor(record), entry))
-            records.put(record); ids.put(entry.getJSONObject("id"))
+            records.put(record); ids.put(entry.getJSONObject("id")); verifiedEntries.put(entry)
         }
         for (id in ReplicationWire.arrayObjects(unavailable)) require(answered.add(ReplicationWire.idKey(id)) && ReplicationWire.idKey(id) in expected)
         require(answered == expected.keys)
         if (records.length() > 0) {
             require(frame.getString("sender") in state.enrolledReplicas() && association(node) == frame.getString("sender"))
             checkBudget()
-            store.importRecords(records) // Rust recomputes hashes; SQLite commits before ACK.
-            val expectedReceipts = domain.receipts(store.snapshot(), store.replica, ids)
-            val receipts = store.durableReceipts(ids, checkBudget) ?: expectedReceipts
-            val expectedKeys = ReplicationWire.arrayObjects(expectedReceipts).associateBy { ReplicationWire.idKey(it.getJSONObject("operation")) }
+            store.importVerified(records, verifiedEntries) // Rust rechecks metadata and hashes; SQLite commits before ACK.
+            val receipts = store.durableReceipts(ids, checkBudget) ?: exactReceipts(ids)
+            val expectedKeys = ReplicationWire.arrayObjects(verifiedEntries).associateBy { ReplicationWire.idKey(it.getJSONObject("id")) }
             require(receipts.length() == expectedKeys.size)
+            val receiptIds = HashSet<String>()
             for (receipt in ReplicationWire.arrayObjects(receipts)) {
-                val expectedReceipt = expectedKeys.getValue(ReplicationWire.idKey(receipt.getJSONObject("operation")))
-                require(receipt.length() == 4 && receipt.get("version") == expectedReceipt.get("version") &&
-                    receipt.getString("recipient_replica") == expectedReceipt.getString("recipient_replica") && receipt.getString("body_key") == expectedReceipt.getString("body_key"))
+                val key = ReplicationWire.idKey(receipt.getJSONObject("operation"))
+                val expectedEntry = expectedKeys.getValue(key)
+                require(receiptIds.add(key) && receipt.length() == 4 && receipt.get("version") == 2 &&
+                    receipt.getString("recipient_replica") == store.replica && receipt.getString("body_key") == expectedEntry.getString("body_key"))
             }
             requestNewAncestors(session)
             pending(frame.getString("sender"), session, "ack", JSONObject().put("receipts", receipts))
@@ -292,7 +320,7 @@ internal class ReplicationController(
     private fun requestNewAncestors(session: JSONObject) {
         if (session.getString("phase") != "records") return
         val page = JSONObject().put("version", 2).put("revision", session.getString("revision")).put("entries", JSONArray()).put("next", JSONObject.NULL)
-        val missing = domain.reconcile(store.snapshot(), page).getJSONArray("missing_ancestors")
+        val missing = reconcilePage(page).getJSONObject("plan").getJSONArray("missing_ancestors")
         val attempts = attemptedAncestors(session)
         val remaining = session.getJSONArray("remaining")
         val present = ReplicationWire.arrayObjects(remaining).map { ReplicationWire.idKey(it.getJSONObject("id")) }.toSet()
@@ -319,7 +347,7 @@ internal class ReplicationController(
         val ids = JSONArray(ReplicationWire.arrayObjects(receipts).map { it.getJSONObject("operation") })
         // Confirmation also proves our committed copy, so relayed publications acquire exact
         // reciprocal receipts without inferring persistence from a record or SDK submission.
-        reply(frame, "ack_confirmed", JSONObject().put("receipts", domain.receipts(store.snapshot(), store.replica, ids)))
+        reply(frame, "ack_confirmed", JSONObject().put("receipts", exactReceipts(ids)))
     }
 
     private fun matches(frame: JSONObject, kind: String? = null): JSONObject? {
@@ -342,6 +370,22 @@ internal class ReplicationController(
         val excluded = ReplicationWire.arrayObjects(quarantine).map { ReplicationWire.idKey(it.getJSONObject("id")) }.toSet()
         return ReplicationWire.arrayObjects(snapshot.getJSONArray("records"))
             .associateBy { ReplicationWire.idKey(it.getJSONObject("operation").getJSONObject("id")) }.filterKeys { it !in excluded }
+    }
+
+    private fun exactReceipts(ids: JSONArray): JSONArray =
+        store.nativeRead(JSONObject().put("kind", "receipts").put("ids", ids)) as JSONArray?
+            ?: domain.receipts(store.snapshot(), store.replica, ids)
+
+    private fun reconcilePage(page: JSONObject): JSONObject {
+        val native = store.nativeRead(JSONObject().put("kind", "reconcile").put("page", page)) as JSONObject?
+        if (native != null) return native
+        val snapshot = store.snapshot()
+        val plan = domain.reconcile(snapshot, page)
+        val unknown = (ReplicationWire.arrayObjects(plan.getJSONArray("fetch_tombstones")) + ReplicationWire.arrayObjects(plan.getJSONArray("fetch_records")))
+            .map { ReplicationWire.idKey(it.getJSONObject("id")) }.toSet()
+        val ids = JSONArray(ReplicationWire.arrayObjects(page.getJSONArray("entries"))
+            .filter { ReplicationWire.idKey(it.getJSONObject("id")) !in unknown && known(snapshot, it) }.map { it.getJSONObject("id") })
+        return JSONObject().put("plan", plan).put("receipts", domain.receipts(snapshot, store.replica, ids))
     }
 
     private fun known(snapshot: JSONObject, entry: JSONObject): Boolean {

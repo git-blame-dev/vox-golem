@@ -100,6 +100,7 @@ class AssistantEngineTest {
         assertFalse(message.contains(privateSearch))
         assertTrue(message.contains("status=complete model=custom-sol-high"))
         assertTrue(message.contains("search_status=unknown"))
+        assertTrue(message.contains("retire_ms=-1"))
         assertEquals("custom-sol-high", state.model)
         assertNull(state.error)
         assertFalse(state.busy)
@@ -120,6 +121,42 @@ class AssistantEngineTest {
         assertTrue(message.contains("search_status=ready"))
         assertFalse(state.busy)
         assertEquals("invalid_response", state.error)
+    }
+
+    @Test fun outcomeDiagnosticsPreserveMeasuredZeroRetirement() {
+        provider.body = { callback ->
+            callback.onReady()
+            JSONObject().put("status", "complete").put("text", "Synthetic zero-retirement answer")
+                .put("contentType", "output_text").put("retireMs", 0).toString()
+        }
+        org.robolectric.shadows.ShadowLog.clear()
+        prepare(); settle()
+        val message = org.robolectric.shadows.ShadowLog.getLogsForTag("VoxGolemWorkflowTiming").single().msg
+        assertTrue(message.contains("retire_ms=0"))
+    }
+
+    @Test fun preparationDoesNotHoldAdmissionMonitorAndLateStopKeepsFreshDraftWithoutExecution() {
+        val stopped = java.util.concurrent.CountDownLatch(1)
+        var stopper: Thread? = null
+        var result: AssistantRequestResult? = null
+        store.beforeCommit = {
+            store.beforeCommit = null
+            stopper = Thread { engine.stop(); stopped.countDown() }.also { it.start() }
+            // This callback runs immediately before the native preparation call.
+            // Stop must acquire admission without waiting for that SQLite work.
+            assertTrue(stopped.await(2, java.util.concurrent.TimeUnit.SECONDS))
+        }
+        try {
+            engine.submit("synthetic-stop-during-preparation", "Synthetic durable late-stop draft",
+                resultListener = AssistantResultListener { value, _ -> result = value })
+            io.drain(); settle()
+            assertEquals("cancelled", result!!.status)
+            assertTrue(provider.requests.isEmpty())
+            assertEquals(1, store.snapshot().getJSONArray("records").length())
+            assertNotNull(state.conversation)
+            assertEquals("Synthetic durable late-stop draft", store.draft(JSONObject(state.conversation!!)).getString("text"))
+            assertEquals("", store.draft(null).getString("text"))
+        } finally { store.beforeCommit = null; stopper?.join(2_000) }
     }
 
     @Test fun androidModelAliasesContainOnlyCustomNanoAndAgy() {
@@ -479,7 +516,7 @@ class AssistantEngineTest {
         } finally { instance.stop(); queue.drain(); worker.close() }
     }
 
-    @Test fun ownedAdmissionReusesValidationButKeepsBudgetedContextAndBusyProjection() {
+    @Test fun ownedAdmissionUsesCoarseNativeContextWithoutASecondProjectionContextRead() {
         val conversation = store.createConversation("Synthetic voice admission").getJSONObject("operation").getJSONObject("id")
         store.selectConversation(conversation, null)
         val calls = mutableListOf<JSONObject>()
@@ -498,41 +535,36 @@ class AssistantEngineTest {
             queue.drain()
             assertTrue(instance.snapshot().busy)
             assertEquals(2, calls.size)
-            val read = calls.first().getJSONObject("request").getJSONObject("read")
-            assertEquals("context", read.getString("kind"))
-            assertEquals(256 * 1024 - prompt.toByteArray(Charsets.UTF_8).size, read.getInt("max_text_bytes"))
+            assertTrue(calls.all { it.getJSONObject("request").isNull("read") })
+            providerQueue.drain(); queue.drain()
+            assertEquals(prompt, provider.requests.single().getJSONArray("messages").getJSONObject(0).getString("content"))
         } finally { instance.stop(); providerQueue.drain(); queue.drain(); worker.close() }
     }
 
-    @Test fun ownedAdmissionRejectsAReplicaHeadChangeDuringMandatoryContextProjection() {
+    @Test fun ownedAdmissionRejectsAReplicaHeadChangeAfterReconciliationBeforeNativePreparation() {
         prepare(); settle()
         val conversation = JSONObject(state.conversation!!)
         val head = JSONObject(state.selectedHead!!)
         val queue = Queue()
         val worker = AssistantRequestWorker(providerQueue, provider)
-        var inject = false
-        val instance = AssistantEngine(store, queue, worker, { "/synthetic/private/auth.json" }, models,
-            projectionGateway = dev.gitblame.voxgolem.assistant.DomainGateway { raw ->
-                val request = JSONObject(raw)
-                if (inject && request.getJSONObject("request").optJSONObject("read")?.optString("kind") == "context") {
-                    inject = false
-                    commitSyntheticDescendant(conversation, head)
-                    // The owned read pins the actual revision after this replica commit.
-                }
-                store.evaluateOwnedRead(request.toString())
-            })
+        var injected = false
+        val instance = AssistantEngine(store, queue, worker, { "/synthetic/private/auth.json" }, models)
         try {
             instance.resume(); queue.drain()
             val before = provider.requests.size
             var result: AssistantRequestResult? = null
-            inject = true
+            store.beforeCompare = {
+                store.beforeCompare = null
+                commitSyntheticDescendant(conversation, head)
+                injected = true
+            }
             instance.submitSpeech("synthetic-context-race", "Synthetic raced voice", conversation.toString(),
                 AssistantResultListener { value, _ -> result = value }, expectedHead = head.toString())
             queue.drain(); providerQueue.drain(); queue.drain()
-            assertFalse("Mandatory context read must execute", inject)
+            assertTrue("Replica commit must race native preparation, after actor reconciliation", injected)
             assertEquals("conversation_changed", result!!.code)
             assertEquals(before, provider.requests.size)
-        } finally { instance.stop(); providerQueue.drain(); queue.drain(); worker.close() }
+        } finally { store.beforeCompare = null; instance.stop(); providerQueue.drain(); queue.drain(); worker.close() }
     }
 
     @Test fun burstDeltasKeepImmediateTransportPacketsButUseOneOrderedActorPublication() {
@@ -1381,9 +1413,30 @@ class AssistantEngineTest {
         stale.stop(); queue.drain()
     }
 
-    @Test fun existingConversationAdmissionCombinesProjectionWithUtf8BudgetedContext() {
+    @Test fun existingConversationAdmissionUsesExactlyOneUtf8PromptReservationInCoarseNativeContext() {
         val conversation = store.createConversation("Synthetic existing conversation").getJSONObject("operation").getJSONObject("id")
-        store.selectConversation(conversation, null)
+        // Supplementary characters deliberately make UTF-8 bytes differ from both
+        // Kotlin UTF-16 length and scalar count. The newest two complete turns fit
+        // exactly after one prompt reservation; a third would exceed the budget.
+        val prompt = "🧪".repeat(8192)
+        val promptBytes = prompt.toByteArray(Charsets.UTF_8).size
+        assertEquals(32 * 1024, promptBytes)
+        val retainedTurnBytes = (256 * 1024 - promptBytes) / 2
+        var head: JSONObject? = null
+        val expectedHistory = mutableListOf<String>()
+        for (index in 0..2) {
+            val historyPrompt = "Synthetic history $index"
+            val answer = if (index == 0) "Synthetic oldest excluded answer" else
+                "a".repeat(retainedTurnBytes - historyPrompt.toByteArray(Charsets.UTF_8).size)
+            val completed = store.completeTurn(store.allocateId(), store.context(conversation, head), historyPrompt,
+                JSONObject().put("kind", "text").put("text", answer), "instant",
+                JSONObject().put("requested_model", "synthetic-model").put("returned_model", JSONObject.NULL)
+                    .put("policy_id", "synthetic-policy").put("policy_version", "1")
+                    .put("instruction_profile_id", "synthetic-instructions").put("instruction_profile_version", "1"))
+            head = completed.getJSONObject("operation").getJSONObject("id")
+            if (index > 0) { expectedHistory += historyPrompt; expectedHistory += answer }
+        }
+        store.selectConversation(conversation, head)
         val calls = mutableListOf<JSONObject>()
         val queue = Queue()
         val worker = AssistantRequestWorker(providerQueue, provider)
@@ -1393,13 +1446,17 @@ class AssistantEngineTest {
                 store.evaluateOwnedRead(raw)
             })
         instance.resume(); queue.drain(); calls.clear()
-        val prompt = "Synthetic 🧪 admission"
         instance.submit("synthetic-budget", prompt, resultListener = AssistantResultListener { _, _ -> })
         queue.drain()
         assertEquals(listOf("projection", "projection"), calls.map { it.getString("kind") })
-        val read = calls.first().getJSONObject("request").getJSONObject("read")
-        assertEquals(20, read.getInt("max_turns"))
-        assertEquals(256 * 1024 - prompt.toByteArray(Charsets.UTF_8).size, read.getInt("max_text_bytes"))
+        assertTrue(instance.snapshot().busy)
+        providerQueue.drain(); queue.drain()
+        val messages = provider.requests.single().getJSONArray("messages")
+        val actual = (0 until messages.length()).map { messages.getJSONObject(it).getString("content") }
+        assertEquals(expectedHistory + prompt, actual)
+        assertEquals(256 * 1024, actual.sumOf { it.toByteArray(Charsets.UTF_8).size })
+        assertEquals(listOf("user", "assistant", "user", "assistant", "user"),
+            (0 until messages.length()).map { messages.getJSONObject(it).getString("role") })
         instance.stop(); providerQueue.drain(); queue.drain(); worker.close()
         assertTrue(AssistantEngine::class.java.declaredConstructors.any { it.parameterTypes.size == 8 && it.parameterTypes.first() == AssistantStore::class.java })
     }

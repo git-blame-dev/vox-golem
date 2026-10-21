@@ -2,6 +2,7 @@
 //! The reducer is pinned to the same database revision, never independently writable.
 pub mod codec;
 pub mod gateway;
+pub mod replication;
 pub mod timing;
 use timing::{ConnectionTiming, StatementTiming, TransactionTiming};
 
@@ -95,6 +96,12 @@ pub struct CompletedTurn {
 pub struct PreparedContext {
     pub context: ContextSelection,
     pub created: Option<Record>,
+}
+
+#[derive(Serialize)]
+pub struct MobilePreparedContext {
+    pub context: ProviderContext,
+    pub request: OperationId,
 }
 
 #[derive(Serialize)]
@@ -298,6 +305,45 @@ impl Store {
         prompt: &str,
         max_text_bytes: usize,
     ) -> Result<PreparedContext> {
+        self.prepare_context_inner(expected, prompt, max_text_bytes, false, false)
+            .map(|(prepared, _)| prepared)
+    }
+
+    /// Mobile actor reconciles typed selection and persists its input draft first.
+    /// SQLite runs outside its admission monitor; a short final ticket check decides
+    /// whether to execute. A successful late-cancel preparation remains durable.
+    /// `total_text_bytes` includes the prompt exactly once, not a remaining budget.
+    pub fn prepare_mobile(
+        &mut self,
+        expected: Selection,
+        prompt: &str,
+        total_text_bytes: usize,
+        strict_parent: bool,
+    ) -> Result<MobilePreparedContext> {
+        if total_text_bytes > 256 * 1024 || prompt.len() > total_text_bytes {
+            return Err(limit("provider_context").into());
+        }
+        let (prepared, request) = self.prepare_context_inner(
+            expected,
+            prompt,
+            total_text_bytes - prompt.len(),
+            strict_parent,
+            true,
+        )?;
+        Ok(MobilePreparedContext {
+            context: provider_context(prepared.context),
+            request: request.ok_or(Error::Storage)?,
+        })
+    }
+
+    fn prepare_context_inner(
+        &mut self,
+        expected: Selection,
+        prompt: &str,
+        max_text_bytes: usize,
+        strict_parent: bool,
+        allocate_request: bool,
+    ) -> Result<(PreparedContext, Option<OperationId>)> {
         if prompt.trim().is_empty() || prompt.len() > 32 * 1024 {
             return Err(limit("prompt").into());
         }
@@ -372,6 +418,7 @@ impl Store {
             id
         };
         let core = next.as_ref().unwrap_or(&self.core);
+        let expected_parent = expected.selected_head.clone();
         let context = timing::measure(timing::Phase::projection, || {
             core.select_context(ContextRequest {
                 expected_revision: core.revision().into(),
@@ -381,6 +428,14 @@ impl Store {
                 max_text_bytes,
             })
         })?;
+        if strict_parent && context.parent != expected_parent {
+            return Err(invalid("selection_changed").into());
+        }
+        let request = if allocate_request {
+            Some(allocate_id(&tx)?)
+        } else {
+            None
+        };
         tx.timed_execute("INSERT INTO history_drafts(conversation_key,text,interrupted) VALUES(?,?,1) ON CONFLICT(conversation_key) DO UPDATE SET text=excluded.text,interrupted=1 WHERE text!=excluded.text OR interrupted!=1",params![key(&conversation),prompt])?;
         quotas(&tx)?;
         check_quota(
@@ -394,7 +449,7 @@ impl Store {
         if let Some(next) = next {
             self.core = next;
         }
-        Ok(PreparedContext { context, created })
+        Ok((PreparedContext { context, created }, request))
     }
 
     pub fn project(&mut self, request: gateway::ProjectionRequest) -> Result<gateway::Projection> {

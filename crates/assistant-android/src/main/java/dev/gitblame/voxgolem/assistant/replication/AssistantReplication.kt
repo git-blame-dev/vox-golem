@@ -65,7 +65,7 @@ object AssistantReplication {
                 val linked = current.setup?.retry(store.replica, transport)
                 if (linked != null && linked.reason != PeerPairingReason.ENROLLED) { current.retry(); return@withController }
                 if (!transport.receive(frozen, controller)) { status = AssistantReplicationStatus.REJECTED; current.retry() }
-                transport.cleanup(store.replica, store.snapshot(), current.state)
+                transport.cleanup(store.replica, store, current.state)
                 current.ensurePendingRetry()
             }
         }
@@ -178,8 +178,8 @@ object AssistantReplication {
                 }
                 status = AssistantReplicationStatus.SYNCING
                 controller.reconcile()
-                val accepted = transport.poll(store.replica, state, association, controller)
-                transport.cleanup(store.replica, store.snapshot(), state)
+                val accepted = transport.poll(store.replica, state, operationAssociation ?: association, controller)
+                transport.cleanup(store.replica, store, state)
                 if (accepted) {
                     ensurePendingRetry()
                     status = if (hasPending()) AssistantReplicationStatus.SYNCING else AssistantReplicationStatus.IDLE
@@ -196,12 +196,18 @@ object AssistantReplication {
             val store = nativeStore ?: NativeReplicationStore(AssistantStore(application, gateway)) { onCommitted() }.also { nativeStore = it }
             val domain = nativeDomain ?: NativeReplicationDomain(gateway).also { nativeDomain = it }
             val transport = transport()
-            val controller = ReplicationController(store, domain, state, transport, { association.replicaForNode(it) }, checkBudget = transport::checkBudget)
+            val routes = setup?.operationAssociation(transport) ?: association
+            operationAssociation = routes
+            val controller = ReplicationController(store, domain, state, transport, { routes.replicaForNode(it) }, checkBudget = transport::checkBudget)
             // Cleanup must progress even when a full retirement backlog blocks peer setup.
-            transport.cleanup(store.replica, store.snapshot(), state)
-            work(transport, store, controller)
+            try {
+                transport.cleanup(store.replica, store, state)
+                work(transport, store, controller)
+            } finally { operationAssociation = null }
             return true
         }
+
+        private var operationAssociation: PeerAssociationProvider? = null
 
         fun retry() {
             val delay = state.failed(System.currentTimeMillis())

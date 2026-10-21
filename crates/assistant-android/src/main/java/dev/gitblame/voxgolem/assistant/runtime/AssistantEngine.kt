@@ -575,14 +575,11 @@ class AssistantEngine @JvmOverloads internal constructor(
                 if (!AssistantDraftBudget.accepts(promptOverride)) { fail("prompt_too_large"); return }
                 if (voiceOwner == null) state = state.copy(draft = promptOverride)
             }
-            val preSavedConversation = if (voiceOwner == null && state.draft.isNotBlank()) {
+            if (voiceOwner == null && state.draft.isNotBlank()) {
                 val targetConversation = conversation()
                 store.saveDraft(targetConversation, state.draft, true)
                 state = state.copy(interrupted = true)
                 ticket.timing.mark(Stage.DRAFT_PERSISTED)
-                state.conversation
-            } else {
-                null
             }
             ticket.failure.get()?.let { fail(it); return }
             if (ticket.cancelled.get() || ticket.epoch != epoch.get()) { fail("interrupted", true); return }
@@ -604,41 +601,38 @@ class AssistantEngine @JvmOverloads internal constructor(
             ticket.timing.mark(Stage.CREDENTIAL_CHECKED)
             if ((if (voiceOwner != null) promptOverride ?: state.draft else state.draft).isBlank()) { fail("empty_prompt"); return }
             val prompt = if (voiceOwner != null) promptOverride ?: state.draft else state.draft
-            val contextRead = AssistantProjectionRead.Context(256 * 1024 - prompt.toByteArray(Charsets.UTF_8).size)
-            val projectedContext = refreshProjection(contextRead)
+            // Reconcile actor-owned typed selection first. Native preparation below
+            // captures context/draft/request identity in one transaction, outside the
+            // short final cancellation monitor. Voice remains exact, including null.
+            refreshProjection()
             ticket.timing.mark(Stage.PROJECTION_REFRESHED)
             if (voiceOwner != null && (state.conversation != voiceOwner.conversation || state.selectedHead != voiceOwner.selectedHead)) {
                 loadDraft(); fail("conversation_changed"); return
             }
             if (state.branchChoices.isNotEmpty()) { fail("choose_continuation"); return }
             val fresh = state.conversation == null
-            if (fresh) {
-                val creation = store.createConversation("Conversation")
-                val id = creation.getJSONObject("operation").getJSONObject("id")
-                state = state.copy(conversation = id.toString(), selectedHead = null)
+            val prepared = try {
+                store.prepareMobile(conversation(), head(), prompt, voiceOwner != null)
+            } catch (error: AssistantDomainException) {
+                if (voiceOwner != null && (error.error.optString("field") == "selection_changed" ||
+                        error.error.optString("kind") in setOf("ambiguous_heads", "missing", "deleted"))) {
+                    refreshProjection(); loadDraft(); fail("conversation_changed"); return
+                }
+                throw error
             }
-            val pinnedConversation = voiceOwner?.conversation?.let(::JSONObject) ?: conversation()
-            val pinnedHead = if (voiceOwner == null) head() else voiceOwner.selectedHead?.let(::JSONObject)
-            // A fresh conversation needs the snapshot after its actual create commit.
-            val context = if (fresh) {
-                val projection = domain.projectOwned(pinnedConversation, pinnedHead, false, contextRead)
-                projectionStamp = null
+            val context = prepared.getJSONObject("context")
+            state = state.copy(conversation = context.getJSONObject("conversation").toString(), draft = prompt, interrupted = true)
+            projectionStamp = null
+            if (fresh) {
+                // Refresh presentation only; the native result remains the admitted
+                // owner even if an unrelated replica commits during this projection.
+                val projection = domain.projectOwned(conversation(), head(), false)
                 state = state.copy(viewJson = projection.view.toString())
-                requireNotNull(projection.read())
-            } else requireNotNull(projectedContext)
+            }
             ticket.timing.mark(Stage.CONTEXT_PREPARED)
             ticket.timing.metadata(Metadata(model = state.model,
                 webEnabled = state.webEnabled, count = context.getJSONArray("turns").length()))
-            if (voiceOwner != null) {
-                // A replica may commit between reconciliation and snapshot capture. Never let context's automatic head selection reparent this voice turn.
-                val sameParent = if (pinnedHead == null) context.isNull("parent")
-                    else !context.isNull("parent") && sameId(pinnedHead, context.getJSONObject("parent"))
-                if (!sameId(requireNotNull(pinnedConversation), context.getJSONObject("conversation")) || !sameParent) {
-                    refreshProjection(); loadDraft(); fail("conversation_changed"); return
-                }
-                state = state.copy(draft = prompt, interrupted = true)
-            }
-            val request = store.allocateId()
+            val request = prepared.getJSONObject("request")
             val id = "${request.getString("replica")}:${request.getString("sequence")}"
             durableTokens[id] = ticket.token
             val selectedAuthPath = auth?.path ?: authPath()
@@ -647,13 +641,6 @@ class AssistantEngine @JvmOverloads internal constructor(
              while (externalSessions.size > 256) externalSessions.remove(externalSessions.keys.first())
              val turn = Active(ticket.epoch, id, request, context, prompt, state.model, ticket, selectedAuthPath,
                  state.webEnabled, externalSession)
-            if (fresh || voiceOwner != null || preSavedConversation != state.conversation) {
-                store.saveDraft(conversation(), prompt, true)
-            }
-            if (fresh) {
-                store.selectConversation(conversation(), null)
-                store.saveDraft(null, "")
-            }
             ticket.timing.mark(Stage.ADMISSION_PERSISTED)
             val serializedRequest = providerRequest(turn)
             ticket.timing.mark(Stage.REQUEST_SERIALIZED)
@@ -745,7 +732,7 @@ class AssistantEngine @JvmOverloads internal constructor(
                         runCatching {
                             android.util.Log.i(
                                 "VoxGolemWorkflowTiming",
-                                "turn_outcome status=$diagnosticStatus model=$diagnosticModel web=$webEnabled warm=${warm ?: "unknown"} search_ms=${searchMs ?: -1} search_status=$searchStatus rounds=${rounds ?: -1} searches=${searches ?: -1} reads=${reads ?: -1} fallback=${fallbackUsed ?: false} first_text_ms=${firstTextMs ?: -1} completed_ms=${completedMs ?: -1} retire_ms=${retireMs ?: 0}"
+                                "turn_outcome status=$diagnosticStatus model=$diagnosticModel web=$webEnabled warm=${warm ?: "unknown"} search_ms=${searchMs ?: -1} search_status=$searchStatus rounds=${rounds ?: -1} searches=${searches ?: -1} reads=${reads ?: -1} fallback=${fallbackUsed ?: false} first_text_ms=${firstTextMs ?: -1} completed_ms=${completedMs ?: -1} retire_ms=${retireMs ?: -1}"
                             )
                         }
                         val isComplete = status == "complete"

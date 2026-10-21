@@ -1,5 +1,535 @@
 use super::*;
 
+fn sync_read(store: &mut Store, request: serde_json::Value) -> serde_json::Value {
+    store
+        .replication(serde_json::from_value(request).unwrap())
+        .unwrap()
+}
+
+#[test]
+fn retained_descriptor_read_is_exact_revision_bound_and_contains_no_bodies() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    for index in 0..5 {
+        store
+            .create_conversation(format!("Synthetic private body {index}"))
+            .unwrap();
+    }
+    let page = sync_read(
+        &mut store,
+        serde_json::json!({"kind":"inventory","cursor":null}),
+    );
+    let mut entries = page["entries"].as_array().unwrap().clone();
+    entries[1]["body_key"] = "0".repeat(64).into();
+    entries[2]["conversation"] = entries[0]["id"].clone();
+    entries[3]["tombstone"] = true.into();
+    entries[4]["id"]["sequence"] = "999".into();
+    entries.reverse(); // Slot descriptors need not use inventory-page order.
+    let read = sync_read(
+        &mut store,
+        serde_json::json!({"kind":"retained_descriptors","revision":page["revision"],"entries":entries}),
+    );
+    assert_eq!(read["revision"], page["revision"]);
+    assert_eq!(read["revision_matches"], true);
+    assert_eq!(
+        read["retained"],
+        serde_json::json!([false, false, false, false, true])
+    );
+    assert!(!read.to_string().contains("Synthetic private body"));
+    assert!(serde_json::to_vec(&read).unwrap().len() < 256);
+    fixture
+        .open()
+        .create_conversation("Synthetic newer revision".into())
+        .unwrap();
+    let stale = sync_read(
+        &mut store,
+        serde_json::json!({"kind":"retained_descriptors","revision":page["revision"],"entries":[]}),
+    );
+    assert_eq!(stale["revision_matches"], false);
+    assert_eq!(stale["revision"], store.revision().unwrap());
+    let duplicate = vec![page["entries"][0].clone(); 2];
+    assert!(store.replication(serde_json::from_value(serde_json::json!({"kind":"retained_descriptors","revision":null,"entries":duplicate})).unwrap()).is_err());
+}
+
+#[test]
+fn retained_descriptor_requests_enforce_item_and_encoded_byte_bounds() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let replica = "00000000-0000-4000-8000-000000000001";
+    let entries: Vec<_> = (1..=128).map(|sequence| {
+        let id = OperationId { replica: replica.into(), sequence: sequence.to_string() };
+        serde_json::json!({"id":id,"conversation":id,"body_key":"0".repeat(64),"tombstone":false})
+    }).collect();
+    assert!(serde_json::to_vec(&entries).unwrap().len() <= 32 * 1024);
+    let result = sync_read(
+        &mut store,
+        serde_json::json!({"kind":"retained_descriptors","revision":null,"entries":entries}),
+    );
+    assert_eq!(result["retained"].as_array().unwrap().len(), 128);
+    assert!(result["retained"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|value| value == false));
+    assert!(serde_json::to_vec(&result).unwrap().len() < 1024);
+    let mut too_many = entries.clone();
+    too_many.push(entries[0].clone());
+    assert!(store.replication(serde_json::from_value(serde_json::json!({"kind":"retained_descriptors","revision":null,"entries":too_many})).unwrap()).is_err());
+    let large: Vec<_> = (0..128).map(|index| {
+        let id = OperationId { replica: replica.into(), sequence: (u64::MAX-index).to_string() };
+        serde_json::json!({"id":id,"conversation":id,"body_key":"0".repeat(64),"tombstone":false})
+    }).collect();
+    assert!(serde_json::to_vec(&large).unwrap().len() > 32 * 1024);
+    assert!(store
+        .replication(
+            serde_json::from_value(
+                serde_json::json!({"kind":"retained_descriptors","revision":null,"entries":large})
+            )
+            .unwrap()
+        )
+        .is_err());
+}
+
+#[test]
+fn native_replication_pages_have_bounded_items_bytes_and_lexical_cursors() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    for index in 0..70 {
+        store
+            .create_conversation(format!("Synthetic bounded {index}"))
+            .unwrap();
+    }
+    let mut cursor = serde_json::Value::Null;
+    let mut ids = Vec::new();
+    loop {
+        let page = sync_read(
+            &mut store,
+            serde_json::json!({"kind":"inventory","cursor":cursor}),
+        );
+        assert!(serde_json::to_vec(&page).unwrap().len() <= 32 * 1024);
+        let entries = page["entries"].as_array().unwrap();
+        assert!(entries.len() <= 63);
+        assert!(!page.to_string().contains("Synthetic bounded"));
+        ids.extend(
+            entries
+                .iter()
+                .map(|entry| serde_json::from_value::<OperationId>(entry["id"].clone()).unwrap()),
+        );
+        cursor = page["next"].clone();
+        if cursor.is_null() {
+            break;
+        }
+        assert_eq!(cursor["after"], entries.last().unwrap()["id"]);
+    }
+    assert_eq!(ids.len(), 70);
+    assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+    let revision = store.revision().unwrap();
+    let oversized = ids[..9]
+        .iter()
+        .map(|id| serde_json::json!({"id":id,"body_key":null}))
+        .collect::<Vec<_>>();
+    assert!(store.replication(serde_json::from_value(serde_json::json!({"kind":"bodies","revision":revision,"entries":oversized,"tombstones":false})).unwrap()).is_err());
+    let receipt_ids = vec![ids[0].clone(); 129];
+    assert!(store
+        .replication(
+            serde_json::from_value(serde_json::json!({"kind":"receipts","ids":receipt_ids}))
+                .unwrap()
+        )
+        .is_err());
+}
+
+/// Reusable host-only baseline. Setup and serialization are outside measured stages;
+/// do not use these numbers as Android/Wear runtime latency or an optimization claim.
+#[test]
+#[ignore = "optimized host characterization; run explicitly with --release --ignored --nocapture"]
+fn characterize_planning_vs_projection_at_short_and_near_store_budget() {
+    use std::time::Instant;
+    const REPETITIONS: usize = 20;
+    for count in [4, 96] {
+        let fixture = Fixture::new();
+        let mut store = fixture.open();
+        let conversation = store
+            .create_conversation("Synthetic characterization".into())
+            .unwrap()
+            .operation
+            .id;
+        let mut head = None;
+        for _ in 0..count {
+            let context = store
+                .context(conversation.clone(), head.clone(), 256 * 1024)
+                .unwrap();
+            let mut record = turn(&mut store, &context, &"p".repeat(16 * 1024));
+            if let OperationBody::TurnCompleted { answer, .. } = &mut record.operation.body {
+                *answer = Answer::Text {
+                    text: "a".repeat(16 * 1024),
+                };
+            }
+            let record = codec::record(record.operation).unwrap();
+            head = Some(record.operation.id.clone());
+            store.import_records(vec![record], false, None).unwrap();
+        }
+        let core = CoreStore::restore(store.snapshot().unwrap()).unwrap();
+        let source_bytes = serde_json::to_vec(&core.export()).unwrap().len();
+        assert!(source_bytes < MAX_CANONICAL_BYTES);
+        let imported = codec::record(Operation {
+            version: SCHEMA_VERSION,
+            id: store.allocate_id().unwrap(),
+            body: OperationBody::ConversationCreated {
+                title: "Synthetic unrelated planning input".into(),
+            },
+        })
+        .unwrap();
+        let mut planning = Vec::new();
+        let mut projection = Vec::new();
+        for iteration in 0..=REPETITIONS {
+            let start = Instant::now();
+            let (plan, next) = std::hint::black_box(&core)
+                .plan_with_store(Command::Import {
+                    expected_revision: core.revision().into(),
+                    records: vec![imported.clone()],
+                })
+                .unwrap();
+            let plan_ns = start.elapsed().as_nanos();
+            let start = Instant::now();
+            let context = std::hint::black_box(&core)
+                .select_context(ContextRequest {
+                    expected_revision: core.revision().into(),
+                    conversation: conversation.clone(),
+                    selected_head: head.clone(),
+                    max_turns: 20,
+                    max_text_bytes: 256 * 1024,
+                })
+                .unwrap();
+            let project_ns = start.elapsed().as_nanos();
+            assert!(!context.turns.is_empty());
+            assert_eq!(
+                CoreStore::restore(plan.snapshot).unwrap().export(),
+                next.export()
+            );
+            if iteration > 0 {
+                planning.push(plan_ns);
+                projection.push(project_ns);
+            }
+        }
+        planning.sort_unstable();
+        projection.sort_unstable();
+        eprintln!("synthetic_host_baseline turns={count} records={} source_bytes={source_bytes} repetitions={REPETITIONS} warmup=1 planning_p50_ns={} planning_p95_ns={} projection_p50_ns={} projection_p95_ns={}", count+1, planning[10], planning[18], projection[10], projection[18]);
+    }
+}
+
+#[test]
+fn native_replication_is_revision_pinned_and_serves_acked_canonical_bodies_and_retired_receipts() {
+    use voxgolem_core::conversation_sync::{inventory_page, InventoryCursor, InventoryRequest};
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let record = store
+        .create_conversation("Synthetic 😀 quote \" newline\n".into())
+        .unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let expected = inventory_page(
+        &CoreStore::restore(snapshot.clone()).unwrap(),
+        InventoryRequest {
+            cursor: InventoryCursor {
+                revision: snapshot.revision.clone(),
+                after: None,
+            },
+            max_items: 128,
+        },
+    )
+    .unwrap();
+    let page = sync_read(
+        &mut store,
+        serde_json::json!({"kind":"inventory","cursor":null}),
+    );
+    assert_eq!(page, serde_json::to_value(&expected).unwrap());
+    let peer = "00000000-0000-4000-8000-000000000002";
+    let receipts = store
+        .read(|core| receipts_after_commit(core, peer, std::slice::from_ref(&record.operation.id)))
+        .unwrap();
+    store.acknowledge(peer, receipts).unwrap();
+    assert!(store
+        .publications(Some(peer), 128, MAX_CANONICAL_BYTES, None)
+        .unwrap()
+        .is_empty());
+    let bodies = sync_read(
+        &mut store,
+        serde_json::json!({"kind":"bodies","revision":snapshot.revision,"entries":page["entries"],"tombstones":false}),
+    );
+    let raw = bodies["bodies"][0]["body"].as_str().unwrap();
+    assert_eq!(
+        raw.as_bytes(),
+        codec::encode(&record, MAX_CANONICAL_BYTES, "test")
+            .unwrap()
+            .as_bytes()
+    );
+    assert_eq!(codec::parse_record(raw).unwrap(), record);
+    let reconciled = sync_read(
+        &mut store,
+        serde_json::json!({"kind":"reconcile","page":page}),
+    );
+    assert_eq!(reconciled["receipts"].as_array().unwrap().len(), 1);
+    let mut bad = page.clone();
+    bad["entries"][0]["body_key"] = "0".repeat(64).into();
+    assert!(store
+        .replication(
+            serde_json::from_value(serde_json::json!({"kind":"reconcile","page":bad})).unwrap()
+        )
+        .is_err());
+    let mut cursor =
+        serde_json::json!({"revision":snapshot.revision,"after":{"replica":peer,"sequence":"01"}});
+    assert!(store
+        .replication(
+            serde_json::from_value(serde_json::json!({"kind":"inventory","cursor":cursor}))
+                .unwrap()
+        )
+        .is_err());
+    store
+        .delete_conversation(record.operation.id.clone())
+        .unwrap();
+    cursor["after"] = serde_json::Value::Null;
+    assert_eq!(
+        sync_read(
+            &mut store,
+            serde_json::json!({"kind":"inventory","cursor":cursor})
+        )["restart"],
+        true
+    );
+    assert_eq!(
+        sync_read(
+            &mut store,
+            serde_json::json!({"kind":"bodies","revision":snapshot.revision,"entries":page["entries"],"tombstones":false})
+        )["restart"],
+        true
+    );
+    let exact = sync_read(
+        &mut store,
+        serde_json::json!({"kind":"receipts","ids":[record.operation.id]}),
+    );
+    assert_eq!(exact[0]["body_key"], record.body_key);
+}
+
+#[test]
+fn native_replication_rejects_body_metadata_and_hash_conflicts_without_committing() {
+    let source = Fixture::new();
+    let mut source = source.open();
+    let record = source
+        .create_conversation("Synthetic source".into())
+        .unwrap();
+    let page = sync_read(
+        &mut source,
+        serde_json::json!({"kind":"inventory","cursor":null}),
+    );
+    let mut entries = page["entries"].clone();
+    entries[0]["tombstone"] = true.into();
+    assert!(source.replication(serde_json::from_value(serde_json::json!({"kind":"bodies","revision":page["revision"],"entries":entries,"tombstones":false})).unwrap()).is_err());
+    let target = Fixture::new();
+    let mut target = target.open();
+    assert!(target
+        .replication(
+            serde_json::from_value(
+                serde_json::json!({"kind":"import","records":[record],"entries":entries})
+            )
+            .unwrap()
+        )
+        .is_err());
+    let mut forged = serde_json::to_value(&record).unwrap();
+    forged["operation"]["body"]["title"] = "Synthetic changed body".into();
+    assert!(target
+        .replication(
+            serde_json::from_value(
+                serde_json::json!({"kind":"import","records":[forged],"entries":page["entries"]})
+            )
+            .unwrap()
+        )
+        .is_err());
+    assert_eq!(target.snapshot().unwrap(), StoreSnapshot::empty());
+    assert!(target.receipts_to_publish(128, None).unwrap().is_empty());
+    sync_read(
+        &mut target,
+        serde_json::json!({"kind":"import","records":[record],"entries":page["entries"]}),
+    );
+    assert_eq!(target.snapshot().unwrap().records, vec![record]);
+}
+
+#[test]
+fn native_replication_omits_quarantine_bodies_but_keeps_exact_known_receipts() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let creation = store
+        .create_conversation("Synthetic quarantine".into())
+        .unwrap();
+    let conversation = creation.operation.id.clone();
+    let context = store
+        .context(conversation.clone(), None, 256 * 1024)
+        .unwrap();
+    let authentic = turn(&mut store, &context, "Synthetic authentic parent");
+    let mut poison = turn(&mut store, &context, "Synthetic pending poison");
+    if let OperationBody::TurnCompleted {
+        parent, provenance, ..
+    } = &mut poison.operation.body
+    {
+        *parent = Some(authentic.operation.id.clone());
+        provenance.context = vec![
+            OperationId {
+                replica: "00000000-0000-4000-8000-000000000088".into(),
+                sequence: "88".into(),
+            },
+            authentic.operation.id.clone(),
+        ];
+    }
+    let poison = codec::record(poison.operation).unwrap();
+    store
+        .import_records(vec![poison.clone()], true, None)
+        .unwrap();
+    let advertised = sync_read(
+        &mut store,
+        serde_json::json!({"kind":"inventory","cursor":null}),
+    );
+    let poison_entry = advertised["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["body_key"] == poison.body_key)
+        .unwrap()
+        .clone();
+    store.import_records(vec![authentic], true, None).unwrap();
+    assert_eq!(store.snapshot().unwrap().quarantine.len(), 1);
+    let disposition = sync_read(
+        &mut store,
+        serde_json::json!({"kind":"retained_descriptors","revision":null,"entries":[poison_entry]}),
+    );
+    assert_eq!(disposition["retained"], serde_json::json!([false]));
+    let current = sync_read(
+        &mut store,
+        serde_json::json!({"kind":"inventory","cursor":null}),
+    );
+    assert!(!current["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["body_key"] == poison.body_key));
+    let served = sync_read(
+        &mut store,
+        serde_json::json!({"kind":"bodies","revision":current["revision"],"entries":[poison_entry],"tombstones":false}),
+    );
+    assert!(served["bodies"].as_array().unwrap().is_empty());
+    assert_eq!(
+        served["unavailable"][0],
+        serde_json::to_value(&poison.operation.id).unwrap()
+    );
+    let reconciled = sync_read(
+        &mut store,
+        serde_json::json!({"kind":"reconcile","page":advertised}),
+    );
+    assert!(reconciled["receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|receipt| receipt["body_key"] == poison.body_key));
+    store.delete_conversation(conversation).unwrap();
+    let retired = sync_read(
+        &mut store,
+        serde_json::json!({"kind":"retained_descriptors","revision":null,"entries":[poison_entry]}),
+    );
+    assert_eq!(retired["retained"], serde_json::json!([false]));
+    let receipts = sync_read(
+        &mut store,
+        serde_json::json!({"kind":"receipts","ids":[poison.operation.id]}),
+    );
+    assert_eq!(receipts[0]["body_key"], poison.body_key);
+}
+
+#[test]
+fn mobile_preparation_allocates_atomically_keeps_late_cancel_state_and_obeys_total_budget() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let empty = Selection {
+        conversation: None,
+        selected_head: None,
+    };
+    store.save_draft(None, "Synthetic prompt", true).unwrap();
+    let prepared = store
+        .prepare_mobile(empty.clone(), "Synthetic prompt", 256 * 1024, false)
+        .unwrap();
+    let conversation = prepared.context.selection.conversation.clone();
+    assert_eq!(prepared.request.sequence, "2");
+    // No execute/settle follows: successful preparation survives late cancellation/reopen.
+    assert_eq!(
+        fixture.open().selection().unwrap().conversation,
+        Some(conversation.clone())
+    );
+    assert_eq!(
+        fixture.open().draft(Some(&conversation)).unwrap().text,
+        "Synthetic prompt"
+    );
+    assert_eq!(store.draft(None).unwrap().text, "");
+    let selected = store.selection().unwrap();
+    fixture
+        .open()
+        .create_conversation("Synthetic unrelated".into())
+        .unwrap();
+    let first = turn(
+        &mut store,
+        &prepared.context.selection,
+        "Synthetic history prompt",
+    );
+    store
+        .import_records(vec![first.clone()], false, Some(&first.operation.id))
+        .unwrap();
+    // The local owner is still explicitly null. A sole retained head must not
+    // silently become the voice parent, nor overwrite its pre-existing draft.
+    let null_parent_owner = store.selection().unwrap();
+    assert!(null_parent_owner.selected_head.is_none());
+    assert!(store
+        .prepare_mobile(null_parent_owner, "Synthetic stale voice", 256 * 1024, true)
+        .is_err());
+    assert_eq!(
+        store.draft(Some(&conversation)).unwrap().text,
+        "Synthetic prompt"
+    );
+    // Actor reconciliation explicitly accepts the new head before typed admission.
+    store
+        .select(Selection {
+            conversation: Some(conversation),
+            selected_head: Some(first.operation.id.clone()),
+        })
+        .unwrap();
+    let selected_head = store.selection().unwrap();
+    let prompt = "Synthetic next prompt";
+    let history_bytes = first.operation.context_bytes();
+    let exact = store
+        .prepare_mobile(selected_head, prompt, history_bytes + prompt.len(), true)
+        .unwrap();
+    assert_eq!(exact.context.selection.turns.len(), 1);
+    let before = store.snapshot().unwrap();
+    assert!(store
+        .prepare_mobile(selected, prompt, 256 * 1024, true)
+        .is_err());
+    assert_eq!(store.snapshot().unwrap(), before);
+    assert!(store
+        .prepare_mobile(empty, prompt, 256 * 1024, false)
+        .is_err());
+}
+
+#[test]
+fn failed_mobile_preparation_rolls_back_identity_selection_and_preserves_input_draft() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    store.save_draft(None, "Synthetic rollback", true).unwrap();
+    store.db.execute_batch("CREATE TRIGGER synthetic_mobile_failure BEFORE INSERT ON history_drafts BEGIN SELECT RAISE(ABORT,'synthetic'); END;").unwrap();
+    let empty = Selection {
+        conversation: None,
+        selected_head: None,
+    };
+    assert!(store
+        .prepare_mobile(empty.clone(), "Synthetic rollback", 256 * 1024, true)
+        .is_err());
+    assert_eq!(store.selection().unwrap(), empty);
+    assert_eq!(store.snapshot().unwrap(), StoreSnapshot::empty());
+    assert_eq!(store.draft(None).unwrap().text, "Synthetic rollback");
+    assert_eq!(store.allocate_id().unwrap().sequence, "1");
+}
+
 #[test]
 fn timing_admission_and_settlement_count_context_projection_attempts() {
     let fixture = Fixture::new();

@@ -30,6 +30,22 @@ class GmsReplicationTransportTest {
     private val a = "00000000-0000-4000-8000-000000000001"
     private val b = "00000000-0000-4000-8000-000000000002"
 
+    @Test fun exhaustedOrInterruptedBudgetDoesNotIssueSdkTask() = worker {
+        var issued = 0
+        val expired = BoundedGmsWait(System.nanoTime() - 1)
+        assertThrows(TimeoutException::class.java) {
+            expired.issue<Int> { issued++; Tasks.forResult(1) }
+        }
+        Thread.currentThread().interrupt()
+        try {
+            assertThrows(TimeoutException::class.java) {
+                budget().issue<Int> { issued++; Tasks.forResult(1) }
+            }
+            assertTrue(Thread.currentThread().isInterrupted)
+        } finally { Thread.interrupted() }
+        assertEquals(0, issued)
+    }
+
     @Test fun actualSdkSerializationAssetsExactAckAndDeletionCleanupConverge() = worker {
         val mailbox = FakeGmsMailbox(folder.root)
         val leftSdk = mailbox.sdk("synthetic-left-node")
@@ -65,7 +81,7 @@ class GmsReplicationTransportTest {
         // The DB no longer retains the body. Even a previously staged Asset must be removed.
         left.quarantined.add("$a/1")
         left.revision++
-        leftTransport.cleanup(a, left.snapshot(), leftState)
+        leftTransport.cleanup(a, left, leftState)
         assertFalse(mailbox.slots.values.any { it.uri.host == "synthetic-left-node" && it.uri.lastPathSegment == "records" })
         assertEquals(1, left.records.size)
     }

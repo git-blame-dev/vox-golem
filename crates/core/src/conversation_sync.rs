@@ -82,6 +82,60 @@ pub struct Receipt {
     pub body_key: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct RetainedDescriptorDisposition {
+    pub revision: String,
+    pub revision_matches: bool,
+    pub retained: Vec<bool>,
+}
+
+/// Exact outgoing eligibility for a bounded set, never bodies or receipt evidence.
+/// The native owner bounds encoded bytes and pins this read to its current revision.
+pub fn retained_descriptors(
+    store: &Store,
+    revision: Option<String>,
+    entries: Vec<InventoryEntry>,
+) -> Result<RetainedDescriptorDisposition, DomainError> {
+    if let Some(revision) = &revision {
+        decimal(revision, true)?;
+    }
+    if entries.len() > MAX_CONTROL_ITEMS {
+        return Err(DomainError::LimitExceeded {
+            limit: "retained_descriptor_items".into(),
+        });
+    }
+    let mut wanted = BTreeSet::new();
+    for entry in &entries {
+        validate_entry(entry)?;
+        if !wanted.insert(&entry.id) {
+            return Err(DomainError::Invalid {
+                field: "retained_descriptor_duplicate".into(),
+            });
+        }
+    }
+    let retained = entries
+        .iter()
+        .map(|entry| {
+            store.retained_record(&entry.id).is_some_and(|record| {
+                !store.is_quarantined(&entry.id)
+                    && record.body_key == entry.body_key
+                    && record.operation.conversation() == &entry.conversation
+                    && matches!(
+                        &record.operation.body,
+                        OperationBody::ConversationDeleted { .. }
+                    ) == entry.tombstone
+            })
+        })
+        .collect();
+    Ok(RetainedDescriptorDisposition {
+        revision: store.revision().into(),
+        revision_matches: revision
+            .as_ref()
+            .is_none_or(|revision| revision == store.revision()),
+        retained,
+    })
+}
+
 fn inventory(store: &Store) -> BTreeMap<OperationId, InventoryEntry> {
     inventory_entries(store)
         .map(|entry| (entry.id.clone(), entry))
@@ -269,6 +323,32 @@ pub fn receipts_after_commit(
         .collect()
 }
 
+/// Exact known evidence for a validated inventory page, including retired/quarantined
+/// records. Build the key index once, not once per offered ID.
+pub fn known_receipts(
+    store: &Store,
+    recipient_replica: &str,
+    page: &InventoryPage,
+) -> Result<Vec<Receipt>, DomainError> {
+    validate_replica(recipient_replica)?;
+    validate_page(page)?;
+    let keys = body_keys(store);
+    Ok(page
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            keys.get(&entry.id)
+                .filter(|key| *key == &entry.body_key)
+                .map(|key| Receipt {
+                    version: SCHEMA_VERSION,
+                    recipient_replica: recipient_replica.into(),
+                    operation: entry.id.clone(),
+                    body_key: key.clone(),
+                })
+        })
+        .collect())
+}
+
 /// Native transaction owns persisting the returned ledger and revision, not a second cache.
 pub fn merge_receipts(
     store: &Store,
@@ -386,9 +466,7 @@ fn validate_page(page: &InventoryPage) -> Result<(), DomainError> {
         });
     }
     for entry in &page.entries {
-        entry.id.validate()?;
-        entry.conversation.validate()?;
-        validate_body_key(&entry.body_key)?;
+        validate_entry(entry)?;
     }
     if page.entries.windows(2).any(|pair| pair[0].id >= pair[1].id) {
         return Err(DomainError::Invalid {
@@ -408,6 +486,12 @@ fn validate_page(page: &InventoryPage) -> Result<(), DomainError> {
     Ok(())
 }
 
+fn validate_entry(entry: &InventoryEntry) -> Result<(), DomainError> {
+    entry.id.validate()?;
+    entry.conversation.validate()?;
+    validate_body_key(&entry.body_key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,6 +504,33 @@ mod tests {
             replica: A.into(),
             sequence: n.to_string(),
         }
+    }
+    #[test]
+    fn retained_descriptor_predicate_matches_snapshot_inventory_without_requiring_page_order() {
+        let store = store(128);
+        let mut entries: Vec<_> = inventory_entries(&store).collect();
+        entries.reverse();
+        let result =
+            retained_descriptors(&store, Some(store.revision().into()), entries.clone()).unwrap();
+        assert_eq!(result.retained, vec![true; 128]);
+        assert!(result.revision_matches);
+        let restored = Store::restore(store.export()).unwrap();
+        assert_eq!(
+            retained_descriptors(&restored, None, entries.clone())
+                .unwrap()
+                .retained,
+            result.retained
+        );
+        entries[0].tombstone = true;
+        let disposition =
+            retained_descriptors(&store, Some("999".into()), entries.clone()).unwrap();
+        assert!(!disposition.retained[0]);
+        assert!(disposition.retained[1..].iter().all(|retained| *retained));
+        assert!(!disposition.revision_matches);
+        assert_eq!(disposition.revision, store.revision());
+        entries[0].body_key = "invalid".into();
+        assert!(retained_descriptors(&store, None, entries).is_err());
+        assert!(retained_descriptors(&store, Some("01".into()), vec![]).is_err());
     }
     fn store(count: u64) -> Store {
         let records = (1..=count)

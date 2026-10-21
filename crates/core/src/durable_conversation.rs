@@ -456,6 +456,11 @@ impl Store {
         self.records.values()
     }
 
+    /// Exact retained identity lookup, including quarantine witnesses.
+    pub(crate) fn retained_record(&self, id: &OperationId) -> Option<&Record> {
+        self.records.get(id)
+    }
+
     /// Compact retired identities in lexical operation-ID order.
     pub fn retired_records(&self) -> impl DoubleEndedIterator<Item = &RetiredRecord> {
         self.retired.values()

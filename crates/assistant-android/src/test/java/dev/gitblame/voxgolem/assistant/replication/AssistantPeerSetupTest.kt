@@ -63,6 +63,39 @@ class AssistantPeerSetupTest {
         assertNull(reopened.replicaForNode("synthetic-new-right-node"))
     }
 
+    @Test fun unchangedSetupAndDiscoveryFailuresAreNotCredentialChanges() = worker {
+        val pair = PairFixture()
+        var changes = 0
+        shadowOf(pair.leftContext.packageManager).setSystemFeature(PackageManager.FEATURE_WATCH, false)
+        val setup = AssistantPeerSetup(pair.leftContext, { a }, { pair.leftIo }, { changes++ })
+        assertEquals(PeerPairingReason.ENROLLED, setup.retry(a, pair.leftIo).reason)
+        assertEquals(1, changes)
+        repeat(3) { setup.retry(a, pair.leftIo) }
+        setup.recordFailure(PeerPairingReason.DISCOVERY_FAILED)
+        pair.leftSdk.capabilityError = IllegalStateException("Synthetic discovery failure")
+        setup.retry(a, pair.leftIo)
+        pair.leftSdk.capabilityError = null
+        setup.retry(a, pair.leftIo)
+        assertEquals(1, changes)
+        pair.publish(pair.rightIo, c, "watch")
+        setup.retry(a, pair.leftIo)
+        assertEquals(2, changes)
+    }
+
+    @Test fun operationRouteReusesOneFreshSelectionButCannotOutliveItsBudgetOrApproval() = worker {
+        val pair = PairFixture(); pair.link()
+        val routes = pair.left.operationAssociation(pair.leftIo)
+        assertEquals(b, routes.replicaForNode("synthetic-right-node"))
+        val lookups = pair.leftSdk.lookups.size
+        assertEquals(b, routes.replicaForNode("synthetic-right-node"))
+        assertEquals(lookups, pair.leftSdk.lookups.size)
+        EnrolledPeerRegistry(pair.leftContext).use { it.revoke(b) }
+        assertNull(routes.replicaForNode("synthetic-right-node"))
+        val expired = pair.left.operationAssociation(pair.leftIo.withWait(BoundedGmsWait(System.nanoTime() - 1)))
+        assertThrows(java.util.concurrent.TimeoutException::class.java) { expired.replicaForNode("synthetic-right-node") }
+        assertEquals(lookups, pair.leftSdk.lookups.size)
+    }
+
     @Test fun historyEpochResetsOnlySessionsAndPreservesCurrentTrustedBindingsAndProviderFiles() = worker {
         for (oldVersion in 1..3) {
             val context = isolated("synthetic-migration-$oldVersion")
@@ -305,6 +338,127 @@ class AssistantPeerSetupTest {
         assertArrayEquals(before, f.watchFile.readBytes())
         assertTrue(f.sent.count { it.first == "watch:request" } <= 1 + ChatGptAccessSync.Owner.MAX_ATTEMPTS)
         assertTrue(f.clock.now < f.expires) // Budget ends before token expiry, not a zero-delay loop.
+    }
+
+    @Test fun reconnectOpportunityPreservesActiveReceiptAndDoesNotRestartHealthyExchange() = worker {
+        val f = CredentialFixture()
+        f.dropSend["watch:ack"] = 1
+        f.boot()
+        val receipt = f.sent.last { it.first == "watch:ack" }.second
+        val sends = f.sent.size
+        repeat(3) { f.pair.left.retry(a, f.pair.leftIo); f.pair.right.retry(b, f.pair.rightIo) }
+        repeat(3) { f.phone.changed(); f.watch.changed() }
+        repeat(3) { f.phone.opportunity(); f.watch.opportunity() }
+        f.drain()
+        assertEquals(sends, f.sent.size)
+        f.phone.submit { receive("synthetic-right-node", "ack", receipt) }
+        f.drain()
+        assertTrue(f.clock.live("phone").isEmpty())
+        f.phone.opportunity(); f.watch.opportunity(); f.drain()
+        assertEquals(sends, f.sent.size)
+    }
+
+    @Test fun actualAccessRotationUnderSameAssociationReplacesPendingExchange() = worker {
+        val f = CredentialFixture()
+        f.dropSend["watch:ack"] = 1
+        f.boot()
+        val association = f.pair.left.credentialAssociation()
+        val firstReceipt = f.sent.last { it.first == "watch:ack" }.second
+        f.token = "synthetic-rotated-access"
+        f.expires += 3_600_000
+        f.phoneFile.writeText(JSONObject().put("voxgolemChatgpt", 1).put("openai",
+            JSONObject().put("access", f.token).put("expires", f.expires)).toString())
+        f.phone.changed(); f.drain()
+        assertEquals(association, f.pair.left.credentialAssociation())
+        assertEquals(f.token, f.access())
+        val receipt = f.sent.last { it.first == "watch:ack" }.second
+        assertNotEquals(JSONObject(firstReceipt.toString(Charsets.UTF_8)).getString("nonce"),
+            JSONObject(receipt.toString(Charsets.UTF_8)).getString("nonce"))
+        assertTrue(f.clock.live("phone").isEmpty())
+    }
+
+    @Test fun eachObservedOutageAllowsOneFiniteReconnectBudgetAndKeepsNonceAndOfflineAccess() = worker {
+        val f = CredentialFixture(); f.boot()
+        f.exportFailures = 100
+        f.tick()
+        f.until { f.clock.live().isEmpty() }
+        val before = f.watchFile.readBytes()
+        val firstBudget = f.sent.count { it.first == "watch:request" }
+        val nonce = JSONObject(f.sent.last { it.first == "watch:request" }.second.toString(Charsets.UTF_8)).getString("nonce")
+        f.pair.mailbox.unreachableNodes.add("synthetic-left-node")
+        f.watch.opportunity(); f.drain()
+        f.pair.mailbox.unreachableNodes.clear()
+        f.watch.opportunity(); f.drain()
+        f.until { f.clock.live().isEmpty() }
+        val rearmed = f.sent.count { it.first == "watch:request" }
+        assertEquals(ChatGptAccessSync.Owner.MAX_ATTEMPTS, rearmed - firstBudget)
+        repeat(3) { f.watch.opportunity(); f.drain() }
+        assertEquals(rearmed, f.sent.count { it.first == "watch:request" })
+        assertTrue(f.clock.live().isEmpty())
+        assertArrayEquals(before, f.watchFile.readBytes())
+        f.pair.mailbox.unreachableNodes.add("synthetic-left-node")
+        f.watch.opportunity(); f.drain()
+        f.pair.mailbox.unreachableNodes.clear()
+        f.exportFailures = 0
+        f.token = "synthetic-recovered-access"; f.expires = f.clock.now + 3_600_000
+        f.watch.opportunity(); f.drain()
+        f.until { f.access() == "synthetic-recovered-access" }
+        assertEquals(nonce, JSONObject(f.sent.last { it.first == "watch:request" }.second.toString(Charsets.UTF_8)).getString("nonce"))
+        assertEquals(rearmed + 1, f.sent.count { it.first == "watch:request" })
+        assertTrue(f.clock.live("phone").isEmpty())
+    }
+
+    @Test fun unavailableObservationDuringActiveBudgetIsNotLostAndDuplicateOpportunitiesAreCoalesced() = worker {
+        val f = CredentialFixture(); f.boot()
+        f.exportFailures = 100
+        f.tick()
+        val before = f.sent.count { it.first == "watch:request" }
+        f.pair.mailbox.unreachableNodes.add("synthetic-left-node")
+        repeat(100) { f.watch.opportunity() }
+        assertEquals(1, f.queue.size)
+        f.drain()
+        f.pair.mailbox.unreachableNodes.clear()
+        repeat(100) { f.watch.opportunity() }
+        assertEquals(1, f.queue.size)
+        f.drain()
+        assertEquals(before, f.sent.count { it.first == "watch:request" }) // Active attempts are not reset.
+        f.until { f.clock.live().isEmpty() }
+        assertEquals(2 * ChatGptAccessSync.Owner.MAX_ATTEMPTS,
+            f.sent.count { it.first == "watch:request" } - 1) // Initial successful boot is separate.
+        val exhausted = f.sent.size
+        repeat(100) { f.watch.opportunity() }
+        f.drain()
+        assertEquals(exhausted, f.sent.size)
+    }
+
+    @Test fun secondObservedReconnectRecoversLostAckWithOriginalExactReceipt() = worker {
+        val f = CredentialFixture()
+        f.expires = f.clock.now + 3_600_000
+        f.dropSend["watch:ack"] = 100
+        f.boot()
+        val committed = f.watchFile.readBytes()
+        val receipt = f.sent.last { it.first == "watch:ack" }.second
+        f.until { f.clock.live("phone").isEmpty() }
+        fun reconnect() {
+            f.pair.mailbox.unreachableNodes.add("synthetic-right-node")
+            f.phone.opportunity(); f.drain()
+            f.pair.mailbox.unreachableNodes.clear()
+            f.phone.opportunity(); f.drain()
+        }
+        reconnect()
+        f.until { f.clock.live("phone").isEmpty() }
+        assertEquals(2 * ChatGptAccessSync.Owner.MAX_ATTEMPTS, f.sent.count { it.first == "phone:hint" })
+        val exhausted = f.sent.size
+        repeat(100) { f.phone.opportunity() }
+        f.drain()
+        assertEquals(exhausted, f.sent.size)
+        assertTrue(f.clock.live("phone").isEmpty())
+        f.dropSend["watch:ack"] = 0
+        reconnect()
+        f.until { f.clock.live("phone").isEmpty() }
+        assertEquals(2 * ChatGptAccessSync.Owner.MAX_ATTEMPTS + 1, f.sent.count { it.first == "phone:hint" })
+        assertArrayEquals(receipt, f.sent.last { it.first == "watch:ack" }.second)
+        assertArrayEquals(committed, f.watchFile.readBytes())
     }
 
     @Test fun onlyCurrentApprovedPeerAndExactPublicationReceiptCanRetirePhoneRetries() = worker {

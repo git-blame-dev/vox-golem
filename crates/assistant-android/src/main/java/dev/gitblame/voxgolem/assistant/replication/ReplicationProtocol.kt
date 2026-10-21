@@ -29,8 +29,37 @@ internal interface ReplicationStore {
     fun snapshot(): JSONObject
     fun publications(peer: String, after: JSONObject?, limit: Int): JSONArray
     fun importRecords(input: JSONArray)
+    fun importVerified(input: JSONArray, entries: JSONArray) = importRecords(input)
     fun acknowledge(peer: String, receipts: JSONArray)
     fun durableReceipts(ids: JSONArray, checkBudget: () -> Unit): JSONArray? = null
+    /** Stateful native owner; null is the legacy in-memory test adapter only. */
+    fun nativeRead(request: JSONObject): Any? = null
+    /** Legacy in-memory compatibility only; production overrides this bounded read. */
+    fun retainedDescriptors(entries: JSONArray, revision: String? = null): JSONObject {
+        require(entries.toString().toByteArray(Charsets.UTF_8).size <= ReplicationWire.MAX_CONTROL_BYTES)
+        ReplicationWire.entries(entries)
+        val snapshot = snapshot()
+        val quarantine = ReplicationWire.arrayObjects(snapshot.optJSONArray("quarantine") ?: JSONArray())
+            .map { ReplicationWire.idKey(it.getJSONObject("id")) }.toSet()
+        val records = ReplicationWire.arrayObjects(snapshot.getJSONArray("records"))
+            .associateBy { ReplicationWire.idKey(it.getJSONObject("operation").getJSONObject("id")) }
+        val retained = JSONArray(ReplicationWire.arrayObjects(entries).map { entry ->
+            require(entry.length() == 4 && !entry.isNull("body_key"))
+            val key = ReplicationWire.idKey(entry.getJSONObject("id"))
+            val record = records[key]
+            if (key in quarantine || record == null) false else {
+                val operation = record.getJSONObject("operation")
+                val body = operation.getJSONObject("body")
+                val kind = body.getString("kind")
+                val conversation = if (kind == "conversation_created") operation.getJSONObject("id") else body.getJSONObject("conversation")
+                record.getString("body_key") == entry.getString("body_key") &&
+                    ReplicationWire.idKey(conversation) == ReplicationWire.idKey(entry.getJSONObject("conversation")) &&
+                    (kind == "conversation_deleted") == entry.getBoolean("tombstone")
+            }
+        })
+        val current = snapshot.getString("revision")
+        return JSONObject().put("revision", current).put("revision_matches", revision == null || revision == current).put("retained", retained)
+    }
 }
 
 internal interface ReplicationDomain {

@@ -139,6 +139,8 @@ fn handles() -> &'static Mutex<Handles> {
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Kind {
+    PrepareMobile,
+    Replication,
     Read,
     Snapshot,
     Revision,
@@ -224,6 +226,8 @@ impl Request {
         ]
         .map(|field| field.0.is_some());
         let expected_indices: &[usize] = match self.kind {
+            Kind::PrepareMobile => &[0],
+            Kind::Replication => &[0],
             Kind::Read => &[0],
             Kind::Commit => &[1, 2, 3],
             Kind::Complete => &[3],
@@ -278,6 +282,24 @@ fn execute(store: &mut Store, raw: &str) -> Result<String, Error> {
     })?;
     request.validate_shape()?;
     measured("native_dispatch", || match request.kind {
+        Kind::PrepareMobile => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Preparation {
+                selection: voxgolem_conversation_store::Selection,
+                prompt: String,
+                total_text_bytes: usize,
+                strict_parent: bool,
+            }
+            let input: Preparation = parse(&request.request)?;
+            success(store.prepare_mobile(
+                input.selection,
+                &input.prompt,
+                input.total_text_bytes,
+                input.strict_parent,
+            )?)
+        }
+        Kind::Replication => success(store.replication(parse(&request.request)?)?),
         Kind::Read => {
             let input = self::raw(&request.request)?;
             store.read_owned(input)
@@ -536,6 +558,50 @@ pub extern "system" fn Java_dev_gitblame_voxgolem_assistant_AssistantStoreNative
 mod tests {
     use super::*;
     #[test]
+    fn coarse_mobile_preparation_returns_provider_context_and_request_in_one_transaction() {
+        let root = std::path::PathBuf::from("/tmp/opencode").join(format!(
+            "synthetic-mobile-preparation-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let mut store = Store::open(&root.join("history.db")).unwrap();
+        let input = r#"{"kind":"prepare_mobile","request":{"selection":{"conversation":null,"selected_head":null},"prompt":"Synthetic 😀 mobile prompt","total_text_bytes":262144,"strict_parent":true}}"#;
+        let output = profiled(|| execute(&mut store, input).unwrap());
+        let output: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(output["ok"], true);
+        assert_eq!(output["value"]["request"]["sequence"], "2");
+        assert!(output["value"]["context"]["parent"].is_null());
+        assert_eq!(
+            output["value"]["context"]["provider_messages"],
+            serde_json::json!([])
+        );
+        assert!(output["value"].get("snapshot").is_none());
+        assert_eq!(
+            output["storageTiming"]["metrics"]["sqlite_commit"]["count"],
+            1
+        );
+        assert_eq!(output["storageTiming"]["metrics"]["projection"]["count"], 1);
+        assert!(execute(&mut store, input).is_err()); // Fresh owner was durably replaced.
+        assert!(execute(
+            &mut store,
+            &input.replace(
+                "\"strict_parent\":true",
+                "\"strict_parent\":true,\"strict_parent\":false"
+            )
+        )
+        .is_err());
+        assert!(execute(
+            &mut store,
+            &input.replace(
+                "\"kind\":\"prepare_mobile\"",
+                "\"kind\":\"prepare_mobile\",\"records\":[]"
+            )
+        )
+        .is_err());
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn profiled_envelope_preserves_values_and_explicit_portable_zero_metrics() {
         let ordinary = success(serde_json::json!({"synthetic": "ordinary value"})).unwrap();
         assert!(!ordinary.contains("storageTiming"));
@@ -626,6 +692,8 @@ mod tests {
         assert_eq!(view["value"]["conversations"].as_array().unwrap().len(), 1);
         assert_eq!(view["value"]["conversation_count"], 1);
         for input in [
+            r#"{"kind":"replication","request":{"kind":"retained_descriptors","revision":"1","entries":[]}}"#,
+            r#"{"kind":"replication","request":{"kind":"inventory","cursor":null}}"#,
             r#"{"kind":"read","request":{"kind":"view"}}"#,
             r#"{"kind":"read","request":{"kind":"projection","request":{"conversation":null,"selected_head":null,"local_work_in_flight":false,"read":null}}}"#,
             r#"{"kind":"read","request":{"kind":"context","request":{"expected_revision":"1","conversation":{"replica":"00000000-0000-4000-8000-000000000001","sequence":"1"},"selected_head":null,"max_turns":20,"max_text_bytes":4096}}}"#,

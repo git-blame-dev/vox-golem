@@ -14,22 +14,18 @@ internal class NativeReplicationStore(private val store: AssistantStore, private
         val plan = store.importRecords(input)
         if (plan.getString("base_revision") != plan.getString("revision")) runCatching { onCommitted() }
     }
+    override fun importVerified(input: JSONArray, entries: JSONArray) {
+        val plan = store.replication(JSONObject().put("kind", "import").put("records", input).put("entries", entries)) as JSONObject
+        if (plan.getString("base_revision") != plan.getString("revision")) runCatching { onCommitted() }
+    }
     override fun acknowledge(peer: String, receipts: JSONArray) = store.acknowledge(peer, receipts)
+    override fun nativeRead(request: JSONObject): Any = store.replication(request)
+    override fun retainedDescriptors(entries: JSONArray, revision: String?): JSONObject =
+        store.replication(JSONObject().put("kind", "retained_descriptors").put("revision", revision ?: JSONObject.NULL)
+            .put("entries", entries)) as JSONObject
     override fun durableReceipts(ids: JSONArray, checkBudget: () -> Unit): JSONArray {
-        val wanted = ReplicationWire.arrayObjects(ids).map(ReplicationWire::idKey).toMutableSet()
-        val result = JSONArray()
-        var after: JSONObject? = null
-        repeat(512) {
-            checkBudget()
-            val page = store.receiptsToPublish(128, after)
-            for (receipt in ReplicationWire.arrayObjects(page)) {
-                if (wanted.remove(ReplicationWire.idKey(receipt.getJSONObject("operation")))) result.put(receipt)
-            }
-            if (wanted.isEmpty()) return result
-            check(page.length() > 0) { "Assistant committed receipt missing" }
-            after = page.getJSONObject(page.length() - 1).getJSONObject("operation")
-        }
-        error("Assistant committed receipt page limit")
+        checkBudget()
+        return store.replication(JSONObject().put("kind", "receipts").put("ids", ids)) as JSONArray
     }
 }
 

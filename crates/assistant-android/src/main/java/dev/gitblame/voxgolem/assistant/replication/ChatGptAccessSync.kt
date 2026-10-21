@@ -5,7 +5,6 @@ import android.content.pm.PackageManager
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import com.google.android.gms.tasks.Tasks
 import com.google.android.gms.wearable.MessageEvent
 import com.google.android.gms.wearable.Wearable
 import dev.gitblame.voxgolem.assistant.runtime.AssistantProviderNative
@@ -13,6 +12,7 @@ import dev.gitblame.voxgolem.assistant.runtime.AssistantRuntime
 import dev.gitblame.voxgolem.assistant.runtime.ChatGptAuth
 import org.json.JSONObject
 import java.io.File
+import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.Executor
@@ -34,6 +34,8 @@ object ChatGptAccessSync {
     }
     fun changed(context: Context) { start(context); owner?.changed() }
     fun changed() { owner?.changed() }
+    /** Reachability is a retry opportunity, not evidence of changed credentials. */
+    fun opportunity(context: Context) { start(context); owner?.opportunity() }
     /** Fail closed during startup/approval mutations without DB or file IO on admission. */
     internal fun managedAllowed(context: Context): Boolean =
         if (!context.packageManager.hasSystemFeature(PackageManager.FEATURE_WATCH)) true
@@ -50,9 +52,7 @@ object ChatGptAccessSync {
 
     internal class Owner(val app: Context, val setup: AssistantPeerSetup,
         private val export: (String) -> String = { path -> AssistantProviderNative.exportChatGptAccess(path) },
-        private val message: (AssistantVerifiedRoute, String, ByteArray) -> Unit = { route, kind, bytes ->
-            Tasks.await(Wearable.getMessageClient(app).sendMessage(route.nodeId, ChatGptAccessProtocol.PREFIX + kind, bytes), 5, TimeUnit.SECONDS)
-        },
+        private val message: ((AssistantVerifiedRoute, String, ByteArray) -> Unit)? = null,
         private val executor: Executor = ThreadPoolExecutor(1, 1, 30, TimeUnit.SECONDS, ArrayBlockingQueue(8),
             { work -> Thread(work, "chatgpt-peer-access") }, ThreadPoolExecutor.AbortPolicy()).apply { allowCoreThreadTimeOut(true) },
         private val schedule: (Runnable, Long) -> (() -> Unit) = { task, delay ->
@@ -71,9 +71,13 @@ object ChatGptAccessSync {
         private class Exchange(val association: String, val nonce: String = UUID.randomUUID().toString(), var attempts: Int = 0) {
             var packet: JSONObject? = null // One bounded transient access-only snapshot, never a DataItem.
             var receipt: JSONObject? = null
+            var unavailableObserved = false
+            var reconnectPending = false
         }
         private val queued = AtomicBoolean()
         private val changeRequested = AtomicBoolean()
+        private val opportunityQueued = AtomicBoolean()
+        private val opportunityRequested = AtomicBoolean()
         private val file = ChatGptAuth.managedFile(app)
         private val generationFile = File(app.noBackupFilesDir, "chatgpt-peer-generation.json")
         private var exchange: Exchange? = null
@@ -87,15 +91,55 @@ object ChatGptAccessSync {
         fun watchApproved() = EnrolledPeerRegistry.approvalStable() && validatedApproval == EnrolledPeerRegistry.approvalVersion()
         private val failed = AtomicInteger()
         private val dropped = AtomicInteger()
+        private var operationWait: BoundedGmsWait? = null
+        private var operationRoute: AssistantVerifiedRoute? = null
+        private var routeSelected = false
+        private fun selectedRoute(expectedNode: String? = null): AssistantVerifiedRoute? {
+            val wait = requireNotNull(operationWait)
+            wait.remainingMillis()
+            if (!routeSelected) {
+                operationRoute = setup.selectedRoute(null, wait)
+                routeSelected = true
+                exchange?.let { current ->
+                    if (operationRoute == null) current.unavailableObserved = true
+                    else if (current.unavailableObserved) {
+                        current.unavailableObserved = false
+                        current.reconnectPending = true
+                    }
+                }
+            }
+            return operationRoute?.takeIf { it.stillApproved() && (expectedNode == null || it.nodeId == expectedNode) }
+        }
+        private var credentialObserved = false
+        private var credentialFingerprint: ByteArray? = null
+
+        private fun currentCredentialFingerprint(): ByteArray? {
+            val stored = ChatGptAccessProtocol.read(file) ?: return null
+            val token = stored.optJSONObject("openai")
+            val relevant = if (token != null) JSONObject().apply {
+                for (key in listOf("access", "expires", "accountId")) put(key, token.opt(key))
+            } else if (stored.optInt("voxgolemChatgpt") == 1 && stored.optBoolean("signedOut"))
+                ChatGptAccessProtocol.tombstone() else return null
+            // Retain no extra bearer/account copy and never export this local comparison marker.
+            return MessageDigest.getInstance("SHA-256").digest(relevant.toString().toByteArray(Charsets.UTF_8))
+        }
         private fun report(counter: AtomicInteger, category: String) {
             val count = counter.updateAndGet { if (it == Int.MAX_VALUE) it else it + 1 }
             if ((count and (count - 1)) == 0) Log.w("ChatGptAccess", "stage=$category count=$count")
         }
         fun submit(work: Owner.() -> Unit): Boolean = try {
             executor.execute {
+                operationWait = BoundedGmsWait(System.nanoTime() + TimeUnit.SECONDS.toNanos(30))
+                operationRoute = null; routeSelected = false
                 try { work() } catch (_: Exception) { report(failed, "sync_failed") }
                 catch (_: LinkageError) { report(failed, "native_unavailable") }
-                finally { drainTimer(); if (changeRequested.get()) scheduleChange() }
+                finally {
+                    rearmObservedReconnect()
+                    operationWait = null; operationRoute = null; routeSelected = false
+                    drainTimer()
+                    if (changeRequested.get()) scheduleChange()
+                    if (opportunityRequested.get()) scheduleOpportunity()
+                }
             }; true
         } catch (_: RejectedExecutionException) { report(dropped, "queue_dropped"); false }
 
@@ -104,12 +148,56 @@ object ChatGptAccessSync {
             scheduleChange()
         }
 
+        fun opportunity() {
+            opportunityRequested.set(true)
+            scheduleOpportunity()
+        }
+
+        private fun scheduleOpportunity() {
+            if (!opportunityQueued.compareAndSet(false, true)) return
+            if (!submit {
+                try {
+                    opportunityRequested.set(false)
+                    val association = invalidateAssociation() ?: return@submit
+                    val current = exchange ?: return@submit
+                    if (current.association != association) return@submit
+                    // Observe actual fresh discovery even while attempts remain active. SDK
+                    // callback repetition is not itself evidence of a reconnect transition.
+                    selectedRoute()
+                } finally { opportunityQueued.set(false) }
+            }) opportunityQueued.set(false)
+        }
+
+        private fun rearmObservedReconnect() {
+            val current = exchange ?: return
+            if (current.attempts < MAX_ATTEMPTS || !current.reconnectPending) return
+            val exhaustedAttempts = current.attempts
+            current.reconnectPending = false
+            current.attempts = 0
+            // An observed unavailable -> approved-route edge grants one finite budget.
+            // Keep nonce/receipt, and let a late ACK retire this delayed retry normally.
+            try { later(RETRY_DELAYS[0]) { attempt() } }
+            catch (_: Exception) {
+                current.attempts = exhaustedAttempts
+                current.reconnectPending = true
+                report(failed, "retry_schedule_failed")
+            }
+        }
+
         private fun scheduleChange() {
             if (!queued.compareAndSet(false, true)) return
             if (!submit {
                 try {
                     changeRequested.set(false)
+                    val previousAssociation = boundAssociation
                     val association = invalidateAssociation() ?: return@submit
+                    val fingerprint = currentCredentialFingerprint()
+                    val credentialChanged = fingerprint != null &&
+                        (credentialFingerprint == null || !fingerprint.contentEquals(credentialFingerprint))
+                    val initial = !credentialObserved
+                    credentialObserved = true
+                    if (fingerprint != null) credentialFingerprint = fingerprint
+                    if (!initial && !credentialChanged && previousAssociation == association) return@submit
                     begin(association)
                 } finally { queued.set(false) }
             }) queued.set(false)
@@ -195,7 +283,7 @@ object ChatGptAccessSync {
             current.attempts++
             // Arm before SDK/export work: failures and acknowledgements lost after send need retry.
             retry(current)
-            val route = setup.selectedRoute() ?: return
+            val route = selectedRoute() ?: return
             if (setup.role == AssistantPeerRole.PHONE) send(route, "hint", JSONObject().put("exchange", current.nonce))
             else send(route, "request", JSONObject().put("association", current.association).put("nonce", current.nonce))
         }
@@ -204,13 +292,35 @@ object ChatGptAccessSync {
             val data = value.toString().toByteArray(Charsets.UTF_8)
             require(data.size <= ChatGptAccessProtocol.MAX_BYTES)
             check(route.stillApproved())
-            message(route, kind, data)
+            val wait = requireNotNull(operationWait)
+            wait.remainingMillis()
+            if (message != null) message.invoke(route, kind, data)
+            else wait.issue {
+                check(route.stillApproved())
+                Wearable.getMessageClient(app).sendMessage(route.nodeId, ChatGptAccessProtocol.PREFIX + kind, data)
+            }
         }
 
         fun receive(source: String, kind: String, bytes: ByteArray) {
+            val previous = operationWait
+            if (previous == null) {
+                operationWait = BoundedGmsWait(System.nanoTime() + TimeUnit.SECONDS.toNanos(30))
+                operationRoute = null; routeSelected = false
+            }
+            try { receiveInOperation(source, kind, bytes) }
+            finally {
+                operationWait = previous
+                if (previous == null) {
+                    rearmObservedReconnect()
+                    operationRoute = null; routeSelected = false
+                }
+            }
+        }
+
+        private fun receiveInOperation(source: String, kind: String, bytes: ByteArray) {
             require(bytes.size <= ChatGptAccessProtocol.MAX_BYTES)
             val association = invalidateAssociation() ?: return
-            val route = setup.selectedRoute(source) ?: return
+            val route = selectedRoute(source) ?: return
             if (setup.role == AssistantPeerRole.PHONE) {
                 if (kind == "ack") {
                     val receipt = ChatGptAccessProtocol.receipt(bytes)
@@ -284,6 +394,8 @@ object ChatGptAccessSync {
                     check(route.stillApproved())
                     if (duplicate) require(stored.toString() == state.toString())
                     else ChatGptAccessProtocol.publish(file, state) { route.stillApproved() }
+                    credentialFingerprint = currentCredentialFingerprint()
+                    credentialObserved = true
                     validatedApproval = approval
                     val receipt = ChatGptAccessProtocol.receiptFor(received)
                     persistedReceipt = receipt

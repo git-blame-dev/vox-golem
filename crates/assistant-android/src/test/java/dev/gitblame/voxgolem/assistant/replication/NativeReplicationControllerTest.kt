@@ -25,6 +25,76 @@ class NativeReplicationControllerTest {
     @get:Rule val directories = TemporaryFolder()
     private val gateway by lazy { DomainGateway(AssistantDomainNative::apply) }
 
+    @Test fun productionCleanupUsesBoundedNativeDescriptorsAndNeverExportsSnapshot() {
+        assumeTrue("Parent supplies the host JNI library", System.getProperty("assistant.native.library") != null)
+        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        try { executor.submit {
+            AssistantStore(isolated("synthetic-cleanup-native"), gateway).use { owned ->
+                val native = NativeReplicationStore(owned)
+                var queries = 0
+                var canonicalUnavailable = false
+                var invalidNativeResponse = false
+                val store = object : ReplicationStore by native {
+                    override fun snapshot(): JSONObject = error("Production cleanup exported whole history")
+                    override fun retainedDescriptors(entries: JSONArray, revision: String?): JSONObject {
+                        queries++
+                        check(!canonicalUnavailable) { "Synthetic canonical lookup unavailable" }
+                        val result = native.retainedDescriptors(entries, revision)
+                        return if (invalidNativeResponse) result.put("retained", JSONArray().put("false")) else result
+                    }
+                }
+                val peer = "00000000-0000-4000-8000-000000000002"
+                val record = owned.createConversation("Synthetic cleanup body").getJSONObject("operation").getJSONObject("id")
+                val page = owned.replication(JSONObject().put("kind", "inventory").put("cursor", JSONObject.NULL)) as JSONObject
+                val entry = page.getJSONArray("entries").getJSONObject(0)
+                val mailbox = FakeGmsMailbox(directories.newFolder("synthetic-cleanup-mailbox"))
+                val sdk = mailbox.sdk("synthetic-cleanup-node")
+                val transport = GmsReplicationTransport(sdk,
+                    BoundedGmsWait(System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(30)))
+                val state = MemoryReplicationState().apply { enrolled.add(peer) }
+                fun publish(kind: String, payload: JSONObject) {
+                    transport.publish(ReplicationWire.path(store.replica, peer, kind), ReplicationWire.encode(
+                        ReplicationWire.frame(store.replica, peer, peer, peer, kind, payload)), emptyMap())
+                }
+                fun present(kind: String) = mailbox.slots.values.any { it.uri.lastPathSegment == kind }
+                publish("inventory", JSONObject().put("page", page))
+                publish("hint", JSONObject().put("revision", page.getString("revision")).put("offers", JSONArray().put(entry)))
+                publish("records", JSONObject().put("records", JSONArray().put(JSONObject().put("entry", entry)
+                    .put("asset", "body_0").put("bytes", 2))).put("unavailable", JSONArray()))
+                canonicalUnavailable = true
+                val unavailable = assertThrows(IllegalStateException::class.java) { transport.cleanup(store.replica, store, state) }
+                assertEquals("Synthetic canonical lookup unavailable", unavailable.message)
+                assertEquals(3, mailbox.slots.size)
+                assertTrue(sdk.calls.none { it == "deleteItems" })
+                canonicalUnavailable = false
+                invalidNativeResponse = true
+                assertThrows(IllegalArgumentException::class.java) { transport.cleanup(store.replica, store, state) }
+                assertEquals(3, mailbox.slots.size)
+                assertTrue(sdk.calls.none { it == "deleteItems" })
+                invalidNativeResponse = false
+                queries = 0
+                transport.cleanup(store.replica, store, state)
+                assertEquals(3, queries)
+                assertTrue(present("inventory") && present("hint") && present("records"))
+                val wrongMetadata = JSONObject(entry.toString()).put("tombstone", true)
+                publish("hint", JSONObject().put("offers", JSONArray().put(wrongMetadata)))
+                transport.cleanup(store.replica, store, state)
+                assertFalse(present("hint")); assertTrue(present("records"))
+                owned.createConversation("Synthetic unrelated revision change")
+                transport.cleanup(store.replica, store, state)
+                assertFalse(present("inventory")); assertTrue(present("records"))
+                val tombstone = canonical(JSONObject().put("version", 2).put("id", owned.allocateId()).put("body",
+                    JSONObject().put("kind", "conversation_deleted").put("conversation", record)))
+                owned.importRecords(JSONArray().put(tombstone))
+                transport.cleanup(store.replica, store, state)
+                assertFalse(present("records"))
+                transport.publish(ReplicationWire.path(store.replica, peer, "hint"), "{}".toByteArray(), emptyMap())
+                transport.cleanup(store.replica, store, state)
+                assertFalse(present("hint")) // Malformed frames retain conservative cleanup.
+            }
+        }.get(60, java.util.concurrent.TimeUnit.SECONDS) } finally { executor.shutdownNow() }
+    }
+
     @Test fun paginatedTwoWayNativeHistoryConvergesWithGapsDuplicatesLostAckAndTombstones() {
         assumeTrue("Parent supplies the host JNI library", System.getProperty("assistant.native.library") != null)
         AssistantStore(isolated("synthetic-left"), gateway).use { left ->
@@ -225,8 +295,13 @@ class NativeReplicationControllerTest {
 }
 
 internal class NativeHarness(left: AssistantStore, right: AssistantStore, private val gateway: DomainGateway) {
-    private val leftStore = NativeReplicationStore(left)
-    private val rightStore = NativeReplicationStore(right)
+    // Every native protocol scenario must use only bounded stateful reads. Legacy
+    // in-memory adapters still exercise the stateless compatibility path elsewhere.
+    private fun snapshotFree(store: AssistantStore): ReplicationStore = object : ReplicationStore by NativeReplicationStore(store) {
+        override fun snapshot(): JSONObject = error("Production replication crossed whole history")
+    }
+    private val leftStore = snapshotFree(left)
+    private val rightStore = snapshotFree(right)
     val leftReplica = leftStore.replica
     val rightReplica = rightStore.replica
     private val leftState = MemoryReplicationState().apply { enrolled.add(rightReplica) }

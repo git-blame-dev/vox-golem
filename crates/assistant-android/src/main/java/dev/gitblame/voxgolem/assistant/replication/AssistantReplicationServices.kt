@@ -30,13 +30,16 @@ class AssistantReplicationListenerService : WearableListenerService() {
     }
     override fun onPeerConnected(node: Node) {
         AssistantReplication.reconcileNow(applicationContext)
-        ChatGptAccessSync.changed(applicationContext)
+        ChatGptAccessSync.opportunity(applicationContext)
     }
-    override fun onPeerDisconnected(node: Node) { AssistantReplication.reconcileNow(applicationContext) }
+    override fun onPeerDisconnected(node: Node) {
+        AssistantReplication.reconcileNow(applicationContext)
+        ChatGptAccessSync.opportunity(applicationContext)
+    }
     override fun onCapabilityChanged(info: CapabilityInfo) {
         if (info.name == ReplicationWire.CAPABILITY) {
             AssistantReplication.reconcileNow(applicationContext)
-            ChatGptAccessSync.changed(applicationContext)
+            ChatGptAccessSync.opportunity(applicationContext)
         }
     }
 }

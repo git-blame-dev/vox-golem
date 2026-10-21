@@ -25,6 +25,10 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 
 internal class BoundedGmsWait(private val deadlineNanos: Long, private val taskTimeoutMillis: Long = 5_000) {
+    fun <T> issue(lateCleanup: (T) -> Unit = {}, task: () -> Task<T>): T {
+        remainingMillis()
+        return await(task(), lateCleanup)
+    }
     fun remainingMillis(): Long = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime()).also {
         if (it <= 0 || Thread.currentThread().isInterrupted) throw TimeoutException("Assistant replication budget exhausted")
     }
@@ -80,10 +84,12 @@ internal class GmsReplicationTransport(private val sdk: GmsReplicationSdk, priva
 ) : ReplicationTransport {
     constructor(context: Context, wait: BoundedGmsWait) : this(AndroidGmsReplicationSdk(context), wait)
 
+    internal fun withWait(operationWait: BoundedGmsWait) = GmsReplicationTransport(sdk, operationWait, assetIo)
+
     override fun reachable() = peers(CapabilityClient.FILTER_REACHABLE)
     fun knownPeers() = peers(CapabilityClient.FILTER_ALL)
     private fun peers(filter: Int): List<PeerNode> {
-        val capability = wait.await(sdk.capability(filter))
+        val capability = wait.issue { sdk.capability(filter) }
         require(capability.name == ReplicationWire.CAPABILITY && capability.nodes.size <= 64)
         return capability.nodes.map { PeerNode(it.id, it.displayName) }
     }
@@ -99,9 +105,9 @@ internal class GmsReplicationTransport(private val sdk: GmsReplicationSdk, priva
             request.dataMap.putAsset(name, Asset.createFromBytes(body))
         }
         // Finite fixed slots per enrolled pair; target fields are routing, not encryption.
-        wait.await(sdk.putItem(request.asPutDataRequest().setUrgent())) { late ->
+        wait.issue(lateCleanup = { late: DataItem ->
             sdk.deleteItems(late.uri, DataClient.FILTER_LITERAL)
-        }
+        }) { sdk.putItem(request.asPutDataRequest().setUrgent()) }
     }
 
     fun receive(item: DataItem, controller: ReplicationController): Boolean {
@@ -126,14 +132,14 @@ internal class GmsReplicationTransport(private val sdk: GmsReplicationSdk, priva
         val request = PutDataMapRequest.create(ReplicationWire.IDENTITY_PATH)
         request.dataMap.putByteArray("frame", identity.toString().toByteArray(Charsets.UTF_8))
         // Unchanged identity must not emit another change event and cause reciprocal publication loops.
-        wait.await(sdk.putItem(request.asPutDataRequest().setUrgent()))
+        wait.issue { sdk.putItem(request.asPutDataRequest().setUrgent()) }
     }
 
     fun identityFor(nodeId: String): String? = helloFor(nodeId)?.replica
 
     fun helloFor(nodeId: String): AssistantPeerHello? {
         val uri = Uri.Builder().scheme("wear").authority(nodeId).path(ReplicationWire.IDENTITY_PATH).build()
-        val item: DataItem? = wait.await(sdk.getItem(uri))
+        val item: DataItem? = wait.issue { sdk.getItem(uri) }
         if (item == null) return null
         require(item.uri == uri && (item.data?.size ?: 0) <= 2048 && item.assets.isEmpty())
         val bytes = DataMapItem.fromDataItem(item).dataMap.getByteArray("frame") ?: return null
@@ -159,7 +165,7 @@ internal class GmsReplicationTransport(private val sdk: GmsReplicationSdk, priva
             if (peer !in enrolled || peer == local) continue
             for (kind in ReplicationWire.kinds) {
                 val uri = Uri.Builder().scheme("wear").authority(node.nodeId).path(ReplicationWire.path(peer, local, kind)).build()
-                val item: DataItem? = wait.await(sdk.getItem(uri))
+                val item: DataItem? = wait.issue { sdk.getItem(uri) }
                 // Exact slots avoid loading an attacker-sized prefix buffer in the SDK.
                 if (item != null && !receive(item, controller)) accepted = false
             }
@@ -167,53 +173,74 @@ internal class GmsReplicationTransport(private val sdk: GmsReplicationSdk, priva
         return accepted
     }
 
-    fun cleanup(local: String, snapshot: JSONObject, state: ReplicationState) {
-        val node = wait.await(sdk.localNode()).id
+    fun cleanup(local: String, store: ReplicationStore, state: ReplicationState) {
+        fun checkedRevision(value: String): String {
+            require(value.matches(Regex("0|[1-9][0-9]{0,19}")) &&
+                java.math.BigInteger(value) <= java.math.BigInteger("18446744073709551615"))
+            return value
+        }
+        val node = wait.issue { sdk.localNode() }.id
         val enrolled = state.enrolledReplicas()
         val pendingCleanup = state.cleanupReplicas()
         require(enrolled.size <= ReplicationWire.MAX_PEERS && pendingCleanup.size <= ReplicationWire.MAX_PEERS * 2)
         for (peer in pendingCleanup) {
             if (peer in enrolled) continue
             val uri = Uri.Builder().scheme("wear").authority(node).path("${ReplicationWire.PREFIX}$local/$peer/").build()
-            wait.await(sdk.deleteItems(uri, DataClient.FILTER_PREFIX))
+            wait.issue { sdk.deleteItems(uri, DataClient.FILTER_PREFIX) }
             state.cleanupComplete(peer)
         }
-        val quarantine = ReplicationWire.arrayObjects(snapshot.optJSONArray("quarantine") ?: org.json.JSONArray())
-            .map { ReplicationWire.idKey(it.getJSONObject("id")) }.toSet()
-        val retained = ReplicationWire.arrayObjects(snapshot.getJSONArray("records"))
-            .associateBy { ReplicationWire.idKey(it.getJSONObject("operation").getJSONObject("id")) }.filterKeys { it !in quarantine }
         for (peer in enrolled) {
             for (kind in listOf("hint", "inventory", "records")) {
                 wait.remainingMillis()
                 val uri = Uri.Builder().scheme("wear").authority(node).path(ReplicationWire.path(local, peer, kind)).build()
-                val item: DataItem? = wait.await(sdk.getItem(uri))
+                val item: DataItem? = wait.issue { sdk.getItem(uri) }
                 if (item == null) continue
-                val remove = runCatching {
+                val selection = runCatching {
                     require((item.data?.size ?: 0) <= ReplicationWire.MAX_CONTROL_BYTES + 16 * 1024)
                     val raw = DataMapItem.fromDataItem(item).dataMap.getByteArray("frame") ?: error("Invalid frame")
                     val frame = ReplicationWire.decode(raw)
                     require(frame.getString("sender") == local)
-                    if (frame.getString("target") != peer) true
-                    else when (frame.getString("kind")) {
-                        "inventory" -> frame.getJSONObject("payload").getJSONObject("page").getString("revision") != snapshot.getString("revision")
-                        "records" -> ReplicationWire.arrayObjects(frame.getJSONObject("payload").getJSONArray("records")).any { transfer ->
-                            val entry = transfer.getJSONObject("entry")
-                            retained[ReplicationWire.idKey(entry.getJSONObject("id"))]?.getString("body_key") != entry.getString("body_key")
-                        }
-                        "hint" -> ReplicationWire.arrayObjects(frame.getJSONObject("payload").optJSONArray("offers") ?: org.json.JSONArray()).any { entry ->
-                            retained[ReplicationWire.idKey(entry.getJSONObject("id"))]?.getString("body_key") != entry.getString("body_key")
-                        }
-                        else -> false
+                    require(frame.getString("target") == peer)
+                    val payload = frame.getJSONObject("payload")
+                    val entries = when (frame.getString("kind")) {
+                        "inventory" -> org.json.JSONArray()
+                        "records" -> org.json.JSONArray(ReplicationWire.arrayObjects(payload.getJSONArray("records"))
+                            .map { it.getJSONObject("entry") })
+                        "hint" -> payload.optJSONArray("offers") ?: org.json.JSONArray()
+                        else -> return@runCatching null
                     }
-                }.getOrDefault(true)
-                if (remove) wait.await(sdk.deleteItems(item.uri, DataClient.FILTER_LITERAL))
+                    ReplicationWire.entries(entries)
+                    require(entries.toString().toByteArray(Charsets.UTF_8).size <= ReplicationWire.MAX_CONTROL_BYTES)
+                    require(ReplicationWire.arrayObjects(entries).all { it.length() == 4 && !it.isNull("body_key") })
+                    val revision = if (frame.getString("kind") == "inventory") {
+                        val value = payload.getJSONObject("page").get("revision")
+                        require(value is String)
+                        checkedRevision(value)
+                    } else null
+                    entries to revision
+                }
+                val remove = if (selection.isFailure) true else {
+                    val (entries, revision) = selection.getOrNull() ?: continue
+                    // Only demonstrably malformed frames authorize deletion on parse
+                    // failure. Unknown canonical state or an invalid native response
+                    // must propagate to the retry owner, never become evidence to delete.
+                    val disposition = store.retainedDescriptors(entries, revision)
+                    require(disposition.length() == 3 && disposition.get("revision") is String && disposition.get("revision_matches") is Boolean)
+                    val currentRevision = checkedRevision(disposition.getString("revision"))
+                    val revisionMatches = disposition.getBoolean("revision_matches")
+                    require(revisionMatches == (revision == null || revision == currentRevision))
+                    val retained = disposition.getJSONArray("retained")
+                    require(retained.length() == entries.length() && (0 until retained.length()).all { retained.get(it) is Boolean })
+                    !revisionMatches || (0 until retained.length()).any { !retained.getBoolean(it) }
+                }
+                if (remove) wait.issue { sdk.deleteItems(item.uri, DataClient.FILTER_LITERAL) }
             }
         }
     }
 
     private fun readAsset(asset: Asset, max: Int): ByteArray {
         require(max in 2..ReplicationWire.MAX_RECORD_BYTES)
-        val result = wait.await(sdk.asset(asset)) { it.release() }
+        val result = wait.issue(lateCleanup = { it: DataClient.GetFdForAssetResponse -> it.release() }) { sdk.asset(asset) }
         try {
             val descriptor = result.fdForAsset
             val output = ByteArrayOutputStream(minOf(max, 8192))
@@ -221,6 +248,7 @@ internal class GmsReplicationTransport(private val sdk: GmsReplicationSdk, priva
             while (output.size() <= max) {
                 val timeout = minOf(5_000, wait.remainingMillis()).toInt()
                 if (assetIo.poll(descriptor.fileDescriptor, timeout) == 0) throw TimeoutException("Assistant Asset read timed out")
+                wait.remainingMillis()
                 val count = assetIo.read(descriptor.fileDescriptor, buffer, minOf(buffer.size, max + 1 - output.size()))
                 if (count == 0) return output.toByteArray()
                 output.write(buffer, 0, count)

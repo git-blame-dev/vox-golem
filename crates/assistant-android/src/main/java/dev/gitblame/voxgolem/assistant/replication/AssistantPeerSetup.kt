@@ -29,8 +29,11 @@ class AssistantPeerSetup internal constructor(
     context: Context,
     private val localReplica: () -> String,
     private val transportFactory: () -> GmsReplicationTransport,
+    private val associationChanged: (Context) -> Unit,
 ) {
     private val application = context.applicationContext
+    internal constructor(context: Context, localReplica: () -> String, transportFactory: () -> GmsReplicationTransport) :
+        this(context, localReplica, transportFactory, { ChatGptAccessSync.changed(it) })
     internal val role = if (application.packageManager.hasSystemFeature(PackageManager.FEATURE_WATCH)) AssistantPeerRole.WATCH else AssistantPeerRole.PHONE
     constructor(context: Context) : this(context, { AssistantStore(context).use { it.replica() } }, {
         GmsReplicationTransport(context.applicationContext, BoundedGmsWait(System.nanoTime() + TimeUnit.SECONDS.toNanos(30)))
@@ -41,15 +44,27 @@ class AssistantPeerSetup internal constructor(
 
     internal fun replicaForNode(node: String): String? = selectedPeer(node)?.first?.replica
 
+    /** One fresh selection per operation, never retained across reconciliation or approval changes. */
+    internal fun operationAssociation(io: GmsReplicationTransport): PeerAssociationProvider {
+        val selection by lazy { selectedPeer(null, io) }
+        return PeerAssociationProvider { node ->
+            io.checkBudget()
+            selection?.takeIf { it.second.nodeId == node && it.second.stillApproved() }?.first?.replica
+        }
+    }
+
     /** Blocking discovery/SQLite: callers must run off the main and SDK callback threads. */
     internal fun selectedRoute(expectedNode: String? = null): AssistantVerifiedRoute? = selectedPeer(expectedNode)?.second
 
-    private fun selectedPeer(expectedNode: String?): Pair<ApprovedPeerBinding, AssistantVerifiedRoute>? = runCatching {
+    internal fun selectedRoute(expectedNode: String?, wait: BoundedGmsWait): AssistantVerifiedRoute? =
+        selectedPeer(expectedNode, transportFactory().withWait(wait))?.second
+
+    private fun selectedPeer(expectedNode: String?, io: GmsReplicationTransport = transportFactory()): Pair<ApprovedPeerBinding, AssistantVerifiedRoute>? = runCatching {
+        io.checkBudget()
         val version = EnrolledPeerRegistry.approvalVersion()
         if (!EnrolledPeerRegistry.approvalStable()) return@runCatching null
         val enrolled = state()
         if (enrolled.reason != PeerPairingReason.ENROLLED) return@runCatching null
-        val io = transportFactory()
         val selected = discover(io)
         if (selected.reason != PeerPairingReason.ENROLLED) return@runCatching null
         val node = requireNotNull(selected.node).nodeId
@@ -76,11 +91,14 @@ class AssistantPeerSetup internal constructor(
 
     internal fun recordFailure(reason: PeerPairingReason) {
         registry().use { it.saveSetup("status", JSONObject().put("reason", reason.name)) }
-        ChatGptAccessSync.changed(application)
+        // Discovery failure is not a credential or association mutation. Keep offline-valid access
+        // and the current bounded exchange (including its nonce and delayed receipt) intact.
     }
 
     /** Shared startup, capability, identity-arrival and retry path; no invitation or ACK ceremony. */
     internal fun retry(localReplica: String, io: GmsReplicationTransport): PeerPairingState {
+        val previousAssociation = credentialAssociation()
+        val previouslyEnrolled = runCatching { state().reason == PeerPairingReason.ENROLLED }.getOrDefault(false)
         val selection = discover(io)
         val result = try {
             if (selection.reason != PeerPairingReason.ENROLLED) PeerPairingState(selection.reason)
@@ -106,7 +124,9 @@ class AssistantPeerSetup internal constructor(
                 db.saveSetup("status", JSONObject().put("reason", result.reason.name)
                     .put("association", result.associationId).put("installation", result.peerInstallationId).put("replica", result.peerReplica))
             }
-            ChatGptAccessSync.changed(application)
+            if (credentialAssociation() != previousAssociation) associationChanged(application)
+            else if (!previouslyEnrolled && result.reason == PeerPairingReason.ENROLLED)
+                ChatGptAccessSync.opportunity(application)
             result
         } catch (_: Exception) { PeerPairingState(PeerPairingReason.STORAGE_FAILURE) }
     }
