@@ -57,7 +57,7 @@ internal fun CaptureScreen(
     val scroll = rememberLazyListState()
     ScreenScaffold(scrollState = scroll) { contentPadding ->
         LazyColumn(
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier.fillMaxSize().listRotary(scroll),
             state = scroll,
             contentPadding = contentPadding,
             horizontalAlignment = Alignment.CenterHorizontally,

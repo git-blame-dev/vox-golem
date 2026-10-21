@@ -19,7 +19,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawWithContent
-import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -27,7 +26,6 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.input.rotary.onPreRotaryScrollEvent
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
@@ -41,10 +39,7 @@ import androidx.compose.ui.unit.dp
 import androidx.wear.compose.material3.*
 import androidx.wear.compose.foundation.BasicSwipeToDismissBox
 import androidx.wear.compose.foundation.LocalScreenIsActive
-import androidx.wear.compose.foundation.hierarchicalFocusGroup
-import androidx.wear.compose.foundation.requestFocusOnHierarchyActive
-import androidx.wear.compose.foundation.rotary.RotaryScrollableDefaults
-import androidx.wear.compose.foundation.rotary.rotaryScrollable
+import dev.gitblame.voxgolem.android.wear.listRotary
 import androidx.wear.compose.foundation.rememberSwipeToDismissBoxState as rememberWearDismissState
 import dev.gitblame.voxgolem.assistant.replication.PeerPairingState
 import dev.gitblame.voxgolem.assistant.runtime.AssistantModels
@@ -797,15 +792,6 @@ private fun ActionButton(label: String, enabled: Boolean, action: () -> Unit) {
     FilledTonalButton(onClick = action, enabled = enabled,
         label = { Text(label, style = wearTextStyle(LocalTextStyle.current), maxLines = Int.MAX_VALUE, overflow = TextOverflow.Clip) },
         modifier = Modifier.fillMaxWidth())
-}
-
-@Composable
-private fun Modifier.listRotary(state: LazyListState, active: Boolean, scrolled: (Float) -> Unit = {}): Modifier {
-    val focus = remember { FocusRequester() }
-    return hierarchicalFocusGroup(active).requestFocusOnHierarchyActive().onPreRotaryScrollEvent {
-        if (active) scrolled(it.verticalScrollPixels)
-        false
-    }.rotaryScrollable(behavior = RotaryScrollableDefaults.behavior(state), focusRequester = focus)
 }
 
 @Composable

@@ -56,6 +56,14 @@ open class AssistantActivity : ComponentActivity() {
     private var subscription: AutoCloseable? = null
     private lateinit var voice: AssistantVoiceController
     private lateinit var voiceSettings: WearVoiceSettings
+    private var voiceSettingsReady = false
+    private var voiceSettingsLoadFinished = false
+    private var voiceSettingsRequest = 0L
+    private var voiceSettingsClosed = false
+    private var voiceSettingsRejected = false
+    // Accessed only by the ordered settings worker; failed commits must not project their
+    // SharedPreferences in-memory mutation as a durable acknowledgement.
+    private var acknowledgedVoicePreferences: WearVoicePreferences? = null
     internal var voicePreferences by mutableStateOf(WearVoicePreferences())
         private set
     private var voiceState by mutableStateOf(AssistantVoiceState())
@@ -64,6 +72,8 @@ open class AssistantActivity : ComponentActivity() {
     private var voiceFlowTiming: AssistantTiming? = null
     private var permissionAction: VoiceAdmission? by mutableStateOf(null)
     private var entryMode by mutableStateOf<AssistantVoiceEntryMode?>(null)
+    private var voiceEntryOrdinal = 0L
+    private var freshEntryBeforeSettingsRead = false
     private var permissionError by mutableStateOf<String?>(null)
     internal var speechSelectionError by mutableStateOf<String?>(null)
         private set
@@ -147,11 +157,13 @@ open class AssistantActivity : ComponentActivity() {
         ?: AssistantRuntime.get(applicationContext, startupTiming)
     protected open fun assistantVoice(client: AssistantClient): AssistantVoiceController = SyntheticAskBenchmark.voice(this, client)
         ?: WearAssistantVoice(this, client as AssistantEngine)
-    internal open fun assistantVoiceSettings(): WearVoiceSettings = WearVoiceSettings(SyntheticAskBenchmark.context(client) ?: this)
+    internal open fun assistantVoiceSettings(): WearVoiceSettings = WearVoiceSettings.production(applicationContext)
     private fun admitLaunch(entry: Boolean?) {
         pendingVoiceLaunch = null
         if (entry == null || voice.snapshot().active || permissionAction != null) return
         entryMode = if (entry) AssistantVoiceEntryMode.TALK else AssistantVoiceEntryMode.ASK
+        freshEntryBeforeSettingsRead = !WearVoiceIntentOrder.seeded
+        voiceEntryOrdinal = WearVoiceIntentOrder.next()
         pendingVoiceLaunch = entry
     }
 
@@ -166,11 +178,15 @@ open class AssistantActivity : ComponentActivity() {
         beginStartup(Stage.ACTIVITY_CREATED)
         val launchEntry = if (savedInstanceState == null) voiceEntry(intent) else null
         entryMode = savedInstanceState?.getString("assistant.voice.entry")?.let { runCatching { AssistantVoiceEntryMode.valueOf(it) }.getOrNull() }
+        if (entryMode != null) {
+            voiceEntryOrdinal = if (savedInstanceState?.containsKey("assistant.voice.entry.ordinal") == true) {
+                WearVoiceIntentOrder.restore(savedInstanceState.getLong("assistant.voice.entry.ordinal"))
+            } else WearVoiceIntentOrder.next()
+        }
         client = assistantClient()
         replyMetrics = AssistantReplyMetrics(SyntheticAskBenchmark.context(client) ?: applicationContext)
         if (client is AssistantEngine && !SyntheticAskBenchmark.active(client)) AssistantRuntime.configureCaptureResourceAdmission(true)
         voice = assistantVoice(client)
-        voiceSettings = assistantVoiceSettings()
         readVoicePreferences()
         state = client.snapshot()
         if (launchEntry != null) admitLaunch(launchEntry)
@@ -262,8 +278,7 @@ open class AssistantActivity : ComponentActivity() {
         screenAwake.resume(client.snapshot(), voice.snapshot())
         client.resume()
         voice.foreground(true)
-        readVoicePreferences()
-        voice.tts(voicePreferences.readRepliesAloud)
+        if (voiceSettingsReady) voice.tts(voicePreferences.readRepliesAloud)
         val launchedVoice = consumeVoiceLaunch()
         if (pendingVoiceLaunch != null || (launchedVoice && !startupVoiceSettled(voiceState))) {
             deferStartupSync()
@@ -295,9 +310,10 @@ open class AssistantActivity : ComponentActivity() {
 
     private fun consumeVoiceLaunch(): Boolean {
         val conversation = pendingVoiceLaunch ?: return false
-        if (!visible || !resumed) return false
+        if (!visible || !resumed || !voiceSettingsReady) return false
         val current = client.snapshot()
-        // Only context hydration may keep a launch pending; all other admission fences retire it.
+        // Preference loading and context hydration may keep a launch pending;
+        // all other admission fences retire it.
         if (current.busy || voice.snapshot().active || input.pending || permissionAction != null || isFinishing || isDestroyed) {
             pendingVoiceLaunch = null
             return false
@@ -346,7 +362,13 @@ open class AssistantActivity : ComponentActivity() {
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putBoolean("assistant.editor.pending", input.pending)
         editorDraftMemory.save(outState)
-        entryMode?.let { outState.putString("assistant.voice.entry", it.name) }
+        // A fresh, unadmitted launch has no durable-comparable rank until the first
+        // read. Do not serialize its provisional ordinal as an acknowledged override.
+        // Ranked restored/explicit entries retain the existing restoration behavior.
+        if (!freshEntryBeforeSettingsRead) entryMode?.let {
+            outState.putString("assistant.voice.entry", it.name)
+            outState.putLong("assistant.voice.entry.ordinal", voiceEntryOrdinal)
+        }
         super.onSaveInstanceState(outState)
     }
 
@@ -387,6 +409,11 @@ open class AssistantActivity : ComponentActivity() {
     }
 
     internal fun requestVoice(conversation: Boolean) {
+        if (!voiceSettingsReady) {
+            if (!voiceSettingsLoadFinished && visible && resumed && !isFinishing && !isDestroyed)
+                pendingVoiceLaunch = conversation
+            return
+        }
         val mode = if (conversation) AssistantVoiceEntryMode.TALK else AssistantVoiceEntryMode.ASK
         if (!AssistantVoiceLaunchGate.shouldStart(
                 visible = visible,
@@ -399,6 +426,8 @@ open class AssistantActivity : ComponentActivity() {
                 finishingOrDestroyed = isFinishing || isDestroyed,
             )) return
         entryMode = mode
+        freshEntryBeforeSettingsRead = !WearVoiceIntentOrder.seeded
+        voiceEntryOrdinal = WearVoiceIntentOrder.next()
         pendingVoiceLaunch = null
         permissionError = null
         voiceFlowTiming?.finish(Stage.REPLACED)
@@ -501,28 +530,75 @@ open class AssistantActivity : ComponentActivity() {
     private fun readVoicePreferences() {
         if (SyntheticAskBenchmark.active(client)) {
             voicePreferences = WearVoicePreferences(readRepliesAloud = true, conversationMode = false)
+            voiceSettingsReady = true
+            voiceSettingsLoadFinished = true
             return
         }
-        voicePreferences = voiceSettings.current()
-        try { voicePreferences = voiceSettings.read() }
-        catch (_: IllegalStateException) { permissionError = "settings_not_saved" }
+        settleVoiceSettings {
+            voiceSettings = assistantVoiceSettings()
+            voiceSettings.read()
+        }
     }
     internal fun setReadRepliesAloud(enabled: Boolean) {
-        try {
+        if (!voiceSettingsReady) { permissionError = "settings_not_saved"; return }
+        settleVoiceSettings {
             voiceSettings.setReadRepliesAloud(enabled)
-            voicePreferences = voiceSettings.read()
-            permissionError = null
-            voice.tts(enabled)
-        } catch (_: IllegalStateException) { permissionError = "settings_not_saved" }
+            voiceSettings.read()
+        }
     }
 
     internal fun setConversationMode(enabled: Boolean) {
+        if (!voiceSettingsReady) { permissionError = "settings_not_saved"; return }
+        val intentOrdinal = WearVoiceIntentOrder.next()
+        settleVoiceSettings {
+            voiceSettings.setConversationMode(enabled, intentOrdinal)
+            voiceSettings.read()
+        }
+    }
+    private fun settleVoiceSettings(operation: () -> WearVoicePreferences) {
+        val request = voiceSettingsRequest + 1
         try {
-            voiceSettings.setConversationMode(enabled)
-            voicePreferences = voiceSettings.read()
-            entryMode = null
-            permissionError = null
-        } catch (_: IllegalStateException) { permissionError = "settings_not_saved" }
+            WearVoiceSettingsIo.executor.execute {
+                val result = runCatching(operation)
+                result.onSuccess { acknowledgedVoicePreferences = it }
+                val acknowledged = acknowledgedVoicePreferences
+                val successfulModeOrdinal = if (::voiceSettings.isInitialized) voiceSettings.successfulModeOrdinal else 0L
+                val saveFailed = if (::voiceSettings.isInitialized) voiceSettings.saveFailed else false
+                handler.post {
+                    if (voiceSettingsClosed || request != voiceSettingsRequest) return@post
+                    voiceSettingsLoadFinished = true
+                    voiceSettingsReady = acknowledged != null
+                    if (!voiceSettingsReady) pendingVoiceLaunch = null
+                    if (voiceSettingsReady && freshEntryBeforeSettingsRead) {
+                        // A fresh launch predates this process's disk read, not the saved
+                        // mode intent from the previous process. Restored entries never rebase.
+                        if (voiceEntryOrdinal <= successfulModeOrdinal) voiceEntryOrdinal = WearVoiceIntentOrder.next()
+                        freshEntryBeforeSettingsRead = false
+                    }
+                    // A mode write's successful effect survives snapshot coalescing, but
+                    // must not retire an Ask/Talk choice made after that write was requested.
+                    if (successfulModeOrdinal > voiceEntryOrdinal) entryMode = null
+                    acknowledged?.let {
+                        voicePreferences = it
+                        if (visible && resumed) voice.tts(it.readRepliesAloud)
+                    }
+                    result.onSuccess {
+                        if (!voiceSettingsRejected) permissionError = if (saveFailed) "settings_not_saved" else null
+                    }.onFailure { permissionError = "settings_not_saved" }
+                    if (voiceSettingsReady && visible && resumed) consumeVoiceLaunch()
+                }
+            }
+            voiceSettingsRequest = request
+            voiceSettingsRejected = false
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            // Keep the last accepted token valid: its acknowledgement must still project.
+            voiceSettingsRejected = true
+            permissionError = "settings_not_saved"
+            if (!voiceSettingsReady && voiceSettingsRequest == 0L) {
+                voiceSettingsLoadFinished = true
+                pendingVoiceLaunch = null
+            }
+        }
     }
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
         if (visible && resumed && !isFinishing && !isDestroyed && event.actionMasked in setOf(
@@ -539,6 +615,7 @@ open class AssistantActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        voiceSettingsClosed = true
         voiceFlowTiming?.finish(Stage.CANCELLED)
         screenAwake.suspend()
         startupSyncDeferred = false
@@ -564,9 +641,10 @@ open class AssistantActivity : ComponentActivity() {
         } }
     }
 
-    private fun recheck() {
+    internal fun recheck() {
         client.refresh()
         if (SyntheticAskBenchmark.active(client)) return
+        if (!voiceSettingsReady && voiceSettingsLoadFinished) readVoicePreferences()
         if (client !is AssistantEngine) return
         refreshLinkStatus()
         AssistantReplication.reconcileNow(applicationContext)

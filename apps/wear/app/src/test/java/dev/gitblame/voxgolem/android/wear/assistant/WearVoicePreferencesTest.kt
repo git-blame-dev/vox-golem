@@ -18,11 +18,11 @@ class WearVoicePreferencesTest {
     private fun preferences() = context.getSharedPreferences(name, Context.MODE_PRIVATE)
     private fun reopen() = WearVoiceSettings(preferences()).read()
 
-    @Test fun missingKeysEnableBothChoicesAndSaveThemBeforeReopening() {
+    @Test fun missingKeysEnableBothChoicesWithoutStartupWrites() {
         assertEquals(WearVoicePreferences(true, true), WearVoicePreferences())
         assertEquals(WearVoicePreferences(true, true), reopen())
-        assertEquals(true, preferences().all["read-replies-aloud"])
-        assertEquals(true, preferences().all["conversation-mode"])
+        assertFalse(preferences().contains("read-replies-aloud"))
+        assertFalse(preferences().contains("conversation-mode"))
         assertEquals(WearVoicePreferences(true, true), reopen())
     }
 
@@ -53,7 +53,7 @@ class WearVoicePreferencesTest {
         assertTrue(preferences().edit().putBoolean("read-replies-aloud", false).commit())
         assertEquals(WearVoicePreferences(false, true), reopen())
         assertEquals(false, preferences().all["read-replies-aloud"])
-        assertEquals(true, preferences().all["conversation-mode"])
+        assertFalse(preferences().contains("conversation-mode"))
     }
 
     @Test fun eachSetterThrowsWhenSynchronousCommitFails() {
@@ -64,6 +64,7 @@ class WearVoicePreferencesTest {
                 val editor = actual.edit()
                 return object : SharedPreferences.Editor by editor {
                     override fun putBoolean(key: String?, value: Boolean): SharedPreferences.Editor = this
+                    override fun putLong(key: String?, value: Long): SharedPreferences.Editor = this
                     override fun commit(): Boolean { commits++; return false }
                     override fun apply() { fail("Must synchronously commit") }
                 }
@@ -72,7 +73,7 @@ class WearVoicePreferencesTest {
         val settings = WearVoiceSettings(failed)
         assertThrows(IllegalStateException::class.java) { settings.setReadRepliesAloud(false) }
         assertThrows(IllegalStateException::class.java) { settings.setConversationMode(false) }
-        assertThrows(IllegalStateException::class.java) { settings.read() }
-        assertEquals(3, commits)
+        assertEquals(WearVoicePreferences(), settings.read())
+        assertEquals(2, commits)
     }
 }

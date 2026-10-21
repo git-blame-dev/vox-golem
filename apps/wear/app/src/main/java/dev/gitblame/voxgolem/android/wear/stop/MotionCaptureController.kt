@@ -40,7 +40,8 @@ internal class MotionCaptureController(
 
     fun update(resumed: Boolean, activeId: String?, readyId: String?) {
         captureId = activeId
-        val shouldRegister = resumed && (activeId != null || stage.isSampling) && gravity != null
+        val observingCapture = activeId != null && (thresholdDegrees != null || diagnosticsEnabled)
+        val shouldRegister = resumed && (observingCapture || stage.isSampling) && gravity != null
         if (shouldRegister && !registered) {
             diagnostics.reset(); policy.reset()
             manager.registerListener(this, gravity, 50_000)

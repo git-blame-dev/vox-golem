@@ -4,6 +4,10 @@ import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.runtime.Composable
@@ -50,36 +54,40 @@ internal fun CaptureInputScreen(transcript: String, stopEnabled: Boolean, onStop
             follow.completed(transcript)
         } finally { following = false }
     }
-    ScreenScaffold(
-        scrollState = scroll,
-        edgeButtonSpacing = 3.dp,
-        edgeButton = {
-            CompactEdgeButton(onClick = onStop, enabled = stopEnabled, contentDescription = "Stop recording") {
-                Icon(
-                    painter = painterResource(R.drawable.ic_stop),
-                    contentDescription = "Stop recording",
-                    modifier = Modifier.size(CompactEdgeButtonDefaults.IconSize),
-                )
+    ScreenScaffold(scrollState = scroll) { contentPadding ->
+        Box(Modifier.fillMaxSize()) {
+            // Reserve space in the viewport, not in the final item: Stop stays reachable
+            // while a paragraph taller than the watch is being read at any scroll offset.
+            LazyColumn(
+                modifier = Modifier.fillMaxSize()
+                    .padding(bottom = maxOf(48.dp, CompactEdgeButtonDefaults.Height) + 3.dp)
+                    .clipToBounds().listRotary(scroll),
+                state = scroll,
+                contentPadding = contentPadding,
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                item(key = "capture-transcript") {
+                    Text(
+                        text = transcript,
+                        color = MaterialTheme.colorScheme.onBackground,
+                        textAlign = TextAlign.Center,
+                        style = style,
+                        overflow = TextOverflow.Clip,
+                        maxLines = Int.MAX_VALUE,
+                        onTextLayout = { measuredTranscript = transcript; measuredHeight = it.size.height },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
             }
-        },
-    ) { contentPadding ->
-        LazyColumn(
-            modifier = Modifier.fillMaxSize(),
-            state = scroll,
-            contentPadding = contentPadding,
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            item(key = "capture-transcript") {
-                Text(
-                    text = transcript,
-                    color = MaterialTheme.colorScheme.onBackground,
-                    textAlign = TextAlign.Center,
-                    style = style,
-                    overflow = TextOverflow.Clip,
-                    maxLines = Int.MAX_VALUE,
-                    onTextLayout = { measuredTranscript = transcript; measuredHeight = it.size.height },
-                    modifier = Modifier.fillMaxWidth(),
-                )
+            Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth()
+                .height(maxOf(48.dp, CompactEdgeButtonDefaults.Height)), contentAlignment = Alignment.BottomCenter) {
+                CompactEdgeButton(onClick = onStop, enabled = stopEnabled, contentDescription = "Stop recording") {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_stop),
+                        contentDescription = null,
+                        modifier = Modifier.size(CompactEdgeButtonDefaults.IconSize),
+                    )
+                }
             }
         }
     }

@@ -64,6 +64,15 @@ open class SyntheticAssistantActivity : AssistantActivity() {
     override fun assistantVoice(client: AssistantClient): AssistantVoiceController = audio
     override fun readLinkStatus(result: (PeerPairingState) -> Unit) { linkReads.add(result) }
     override fun assistantVoiceSettings() = WearVoiceSettings(getSharedPreferences(preferenceName, MODE_PRIVATE))
+    override fun onResume() {
+        super.onResume()
+        awaitVoiceSettings()
+    }
+}
+
+internal fun awaitVoiceSettings() {
+    WearVoiceSettingsIo.executor.submit {}.get(5, java.util.concurrent.TimeUnit.SECONDS)
+    Shadows.shadowOf(Looper.getMainLooper()).idle()
 }
 
 class FailedInitialVoicePreferencesActivity : SyntheticAssistantActivity() {
@@ -75,6 +84,7 @@ class FailedInitialVoicePreferencesActivity : SyntheticAssistantActivity() {
                 val editor = actual.edit()
                 return object : android.content.SharedPreferences.Editor by editor {
                     override fun putBoolean(key: String?, value: Boolean): android.content.SharedPreferences.Editor = this
+                    override fun putLong(key: String?, value: Long): android.content.SharedPreferences.Editor = this
                     override fun commit() = false
                 }
             }
@@ -670,7 +680,7 @@ class AssistantActivityTest {
             controller.pause().stop().destroy()
         }
     }
-    @Test fun failedInitialDefaultPersistenceDoesNotCrashOrEnableExplicitlyDisabledSpeech() {
+    @Test fun readingDefaultsDoesNotAttemptPersistenceOrEnableExplicitlyDisabledSpeech() {
         val controller = Robolectric.buildActivity(FailedInitialVoicePreferencesActivity::class.java).setup()
         val activity = controller.get()
         assertEquals(WearVoicePreferences(false, true), activity.voicePreferences)
@@ -700,15 +710,15 @@ class AssistantActivityTest {
         controller.destroy()
     }
 
-    @Test fun bothDefaultsAreSavedWithoutStartingRecognitionAndFalseChoicesSurviveRestart() {
+    @Test fun defaultsDoNotWriteOrStartRecognitionAndExplicitChoicesSurviveRestart() {
         SyntheticAssistantActivity.preferenceName = "synthetic-voice-preferences-${java.util.UUID.randomUUID()}"
         val first = Robolectric.buildActivity(SyntheticAssistantActivity::class.java).setup()
         val activity = first.get()
         assertEquals(WearVoicePreferences(true, true), activity.voicePreferences)
         assertEquals(listOf(true), activity.audio.speechChoices)
         val savedPreferences = activity.getSharedPreferences(SyntheticAssistantActivity.preferenceName, Activity.MODE_PRIVATE)
-        assertEquals(true, savedPreferences.all["read-replies-aloud"])
-        assertEquals(true, savedPreferences.all["conversation-mode"])
+        assertFalse(savedPreferences.contains("read-replies-aloud"))
+        assertFalse(savedPreferences.contains("conversation-mode"))
         assertEquals(0, activity.audio.dictations)
         assertEquals(0, activity.audio.conversations)
         activity.setReadRepliesAloud(false)
