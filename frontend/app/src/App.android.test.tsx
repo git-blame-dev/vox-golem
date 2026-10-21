@@ -47,6 +47,46 @@ describe('Android App lifecycle', () => {
     expect(container.querySelector('.notice-toast')).toBeNull()
   })
 
+  it('finishes listening Ask, then uses canonical Send cancellation until native response retirement', async () => {
+    vi.useFakeTimers()
+    let sessionId = ''
+    let input: (value: unknown) => void = () => undefined
+    let retire: () => void = () => undefined
+    const voice = { kind: 'voice_status', available: true, reason: 'Synthetic local recognizer', mode: 'dictation', dictation: 'idle', loop: 'idle', ttsEnabled: false, ttsAvailable: false, ttsPhase: 'idle', error: null }
+    const invoke = vi.fn(async (command: string, args?: unknown) => {
+      if (command === 'get_app_snapshot') return appSnapshot()
+      if (command === 'assistant_voice_status') return voice
+      if (command === 'start_assistant_voice') { sessionId = (args as { sessionId: string }).sessionId; return { ...voice, mode: 'ask', dictation: 'listening', loop: 'listening', readyForSpeech: true } }
+      if (command === 'submit_prompt') return new Promise((resolve) => { retire = () => resolve({ kind: 'cancelled' }) })
+      return null
+    })
+    window.__TAURI_INTERNALS__ = { invoke, createChannel: <T,>(handler: (value: T) => void) => { input = handler as (value: unknown) => void; return {} } }
+    container = document.createElement('div'); document.body.append(container); root = createRoot(container)
+    await act(async () => { root?.render(<App />) })
+    await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Ask"]')!.click() })
+    expect(container.querySelector('header [aria-label="Cancel voice"]')).toBeNull()
+    expect(container.querySelector('.composer__button svg')?.getAttribute('data-icon-kind')).toBe('send')
+    await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Finish dictation"]')!.click() })
+    expect(invoke).toHaveBeenCalledWith('finish_assistant_dictation', { sessionId })
+    expect(invoke.mock.calls.some(([command]) => command === 'stop_assistant_voice')).toBe(false)
+    const voiceInput = input
+    await act(async () => {
+      voiceInput({ sessionId, kind: 'dictation', phase: 'final', draft: 'Synthetic finished Ask' })
+      voiceInput({ sessionId, kind: 'submit', requestId: 'synthetic-finished-ask', text: 'Synthetic finished Ask' })
+      voiceInput({ ...voice, sessionId, mode: 'ask', dictation: 'final', loop: 'generating' })
+    })
+    const stop = container.querySelector<HTMLButtonElement>('.composer__button[aria-label="Stop"]')!
+    expect(stop).not.toBeNull()
+    expect(stop.querySelector('svg')?.getAttribute('data-icon-kind')).toBe('stop')
+    expect(container.querySelector('[aria-label="Android voice controls"] svg')?.getAttribute('data-icon-kind')).toBe('mic')
+    await act(async () => { stop.click() })
+    expect(invoke).toHaveBeenCalledWith('cancel_prompt', { requestId: 'synthetic-finished-ask' })
+    expect(stop.getAttribute('aria-label')).toBe('Stopping…')
+    expect(stop.disabled).toBe(true)
+    expect(stop.querySelector('svg')?.getAttribute('data-icon-kind')).toBe('stop')
+    await act(async () => { retire() })
+    expect(container.querySelector('.composer__button')?.getAttribute('aria-label')).toBe('Send')
+  })
   it.each([false, true])('starts a pending cold Vox Ask entry once without a second tap (TTS ready: %s)', async (ttsAvailable) => {
     vi.useFakeTimers()
     const token = '12345678-1234-4234-8234-123456789abc'
@@ -736,6 +776,7 @@ describe('Android App lifecycle', () => {
     expect(container.querySelector('#new-voice-draft-status')).toBeNull()
     expect(container.querySelector<HTMLTextAreaElement>('#promptComposer')?.value).toBe(oldDraft)
     expect(container.querySelector('.composer__utility-row [aria-label="Stop voice"]')).not.toBeNull()
+    expect(container.querySelector('header [aria-label="Cancel voice"]')).toBeNull()
     await act(async () => {
       input({ ...voice, sessionId, mode: 'ask', dictation: 'error', loop: 'error', error: 'no_speech' })
     })
@@ -781,7 +822,7 @@ describe('Android App lifecycle', () => {
     await act(async () => { input({ sessionId, kind: 'dictation', phase: 'partial', draft: 'Synthetic voice draft', utterance: '1', error: null }) })
     expect(composer.value).toBe('Synthetic voice draft')
     await act(async () => {
-      if (outcome === 'stop') container!.querySelector<HTMLButtonElement>('[aria-label="Stop voice"]')!.click()
+      if (outcome === 'stop') container!.querySelector<HTMLButtonElement>('[aria-label="Cancel voice"]')!.click()
       if (outcome === 'new-chat') container!.querySelector<HTMLButtonElement>('[aria-label="New Chat"]')!.click()
       if (outcome === 'background') { vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden'); document.dispatchEvent(new Event('visibilitychange')) }
     })

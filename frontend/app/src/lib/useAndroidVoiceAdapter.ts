@@ -344,7 +344,7 @@ export function useAndroidVoiceAdapter({ enabled = true, statusEnabled = enabled
        finally { if (scanPendingRef.current === scan) scanPendingRef.current = null }
     }
   })
-  const finishDictation = (): void => { void invokeTauriCommand('finish_assistant_dictation').catch(() => setError('Dictation could not be finished')) }
+  const finishDictation = (): void => { const sessionId = sessionRef.current; void invokeTauriCommand('finish_assistant_dictation', sessionId === null ? undefined : { sessionId }).catch(() => setError('Dictation could not be finished')) }
   const finishShortcut = (): void => { void invokeTauriCommand('stop_send_new_voice_shortcut').catch(() => setError('Voice draft was not sent; review before manual Send')) }
   const toggleSpeech = (): void => {
     const lifecycleEpoch = lifecycleEpochRef.current

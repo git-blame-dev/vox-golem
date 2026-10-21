@@ -1,9 +1,10 @@
 import { createContext, useCallback, useContext, useEffect, useId, useMemo, useRef, useState } from 'react'
 import type { MouseEvent, ReactNode } from 'react'
 import type { AndroidVoiceAdapterView } from '../lib/useAndroidVoiceAdapter'
-import { visibleSpeechError, openSpeechServicesStore } from '../lib/androidVoice'
+import { androidSpeechOutputChecking, visibleSpeechError, openSpeechServicesStore } from '../lib/androidVoice'
 import { ControlIcon } from './ControlIcon'
 import type { ControlIconState } from './ControlIcon'
+import { PhoneActionOverflow } from './PhoneActionOverflow'
 import './AndroidVoiceControls.css'
 
 export function SpeechServicesInstallPrompt({ message = 'Google Speech Services is missing or disabled for offline speech recognition.' }: { readonly message?: string }) {
@@ -43,6 +44,7 @@ function useVoiceControls({ voice, disabled, generationAvailable, interactionBlo
   const voiceState: ControlIconState = compactError !== null ? 'error'
     : pending || status === null || status.dictation === 'checking' ? 'busy'
     : status.shortcutPhase === 'finishing' || status.dictation === 'finishing' ? 'finishing'
+    : ((status.dictation === 'listening' || status.shortcutPhase === 'listening' || status.loop === 'listening') && !status.readyForSpeech) ? 'busy'
     : status.ttsPhase === 'speaking' || status.loop === 'speaking' ? 'speaking'
     : status.loop === 'generating' ? 'generating'
     : status.loop === 'between_turns' ? 'between-turns'
@@ -59,7 +61,7 @@ function useVoiceControls({ voice, disabled, generationAvailable, interactionBlo
     : isMissingSpeech ? `${missingRequirementText} Tap to install from Play Store.`
     : status.available ? 'Ready to dictate'
     : status.reason || 'Native dictation is unavailable'
-  const voiceDescription = active && status?.mode === 'loop' ? `${rawVoiceDescription}. Cancel recognition, request and playback; do not submit.` : `${rawVoiceDescription}.`
+  const voiceDescription = `${rawVoiceDescription}.`
   const startDisabled = disabled || active || interactionBlocked || showMissingSpeechPrompt || (status?.available !== true && !isMissingSpeech)
   const withSpeechServices = useCallback((action: () => void, invoker: HTMLElement) => {
     if (isMissingSpeech) { speechInvokerRef.current = invoker; setShowMissingSpeechPrompt(true) }
@@ -75,8 +77,9 @@ function useVoiceControls({ voice, disabled, generationAvailable, interactionBlo
     withSpeechServices(() => { void startVoice(false, undefined, policy) }, invoker)
   }, [generationAvailable, startDisabled, startVoice, withSpeechServices])
   const speechDisabled = pending || interactionBlocked || (status?.ttsEnabled !== true && (disabled || (status?.ttsAvailable !== true && !isMissingSpeech)))
-  const speakerState: ControlIconState = compactError !== null ? 'error' : pending || status === null ? 'busy' : status.ttsPhase === 'speaking' || status.loop === 'speaking' ? 'speaking' : status.ttsEnabled ? 'ready' : status.ttsAvailable ? 'off' : 'unavailable'
-  const speakerDescription = compactError ?? (pending ? 'Voice controls busy' : status === null ? 'Checking speech availability…' : speakerState === 'speaking' ? 'Speaking…' : status.ttsEnabled ? 'Speak replies enabled' : status.ttsAvailable ? 'Speak replies off' : 'Native speech output is unavailable')
+  const outputChecking = androidSpeechOutputChecking(status)
+  const speakerState: ControlIconState = compactError !== null ? 'error' : pending || status === null || outputChecking ? 'busy' : status.ttsPhase === 'speaking' || status.loop === 'speaking' ? 'speaking' : status.ttsEnabled ? 'ready' : status.ttsAvailable ? 'off' : 'unavailable'
+  const speakerDescription = compactError ?? (pending ? 'Voice controls busy' : status === null || outputChecking ? 'Checking speech availability…' : speakerState === 'speaking' ? 'Speaking…' : status.ttsEnabled ? 'Speak replies enabled' : status.ttsAvailable ? 'Speak replies off' : 'Native speech output is unavailable')
   const closeMissingSpeechPrompt = useCallback(() => setShowMissingSpeechPrompt(false), [])
   const dialog = useMemo(() => showMissingSpeechPrompt ? (
     <dialog ref={speechDialogRef} className="speech-prompt-dialog" aria-labelledby={`${descriptionId}-missing-title`} aria-describedby={`${descriptionId}-missing-description`}
@@ -119,20 +122,20 @@ export function AndroidVoiceControlsProvider({ children, ...props }: VoiceProps 
 }
 
 function VoiceIntentButton() {
-  const { voice, descriptionId, start, startDisabled, voiceDescription } = useControls()
+  const { voice, descriptionId, start, startDisabled, voiceDescription, voiceState } = useControls()
   const { status, pending, active, stop, finishDictation, finishShortcut } = voice
-  const manualListening = !pending && status?.mode === 'dictation' && status.dictation === 'listening'
-  const manualFinishing = !pending && status?.mode === 'dictation' && status.dictation === 'finishing'
-  const shortcutListening = !pending && status?.mode === 'shortcut' && status.shortcutPhase === 'listening'
+  const recognitionListening = !pending && status?.readyForSpeech === true && status.mode !== 'shortcut' && status.dictation === 'listening'
+  const recognitionFinishing = !pending && status?.mode !== 'shortcut' && status?.dictation === 'finishing'
+  const shortcutListening = !pending && status?.readyForSpeech === true && status.mode === 'shortcut' && status.shortcutPhase === 'listening'
   const shortcutFinishing = !pending && status?.mode === 'shortcut' && status.shortcutPhase === 'finishing'
-  const label = !active ? 'Ask' : manualListening ? 'Finish dictation' : manualFinishing ? 'Finishing dictation' : shortcutListening ? 'Stop & send' : shortcutFinishing ? 'Finishing voice draft' : 'Stop voice'
+  const label = !active ? 'Ask' : recognitionListening ? 'Finish dictation' : recognitionFinishing ? 'Finishing dictation' : shortcutListening ? 'Stop & send' : shortcutFinishing ? 'Finishing voice draft' : 'Stop voice'
   const voiceMode = !active ? 'idle' : status?.mode ?? 'ask'
   const activate = (event: MouseEvent<HTMLButtonElement>) => {
     if (event.button !== 0) return
     if (active) {
-      if (manualListening) finishDictation()
+      if (recognitionListening) finishDictation()
       else if (shortcutListening) finishShortcut()
-      else if (!manualFinishing && !shortcutFinishing) stop()
+      else if (!recognitionFinishing && !shortcutFinishing) stop()
     } else {
       start('single_turn', event.currentTarget)
     }
@@ -140,25 +143,27 @@ function VoiceIntentButton() {
   return <>
     <button type="button" className="shell__control shell__icon-control" aria-label={label} title={`${label}: ${voiceDescription}`} aria-describedby={`${descriptionId}-mic`}
       data-voice-mode={voiceMode}
-      disabled={active ? manualFinishing || shortcutFinishing : startDisabled}
+      disabled={active ? recognitionFinishing || shortcutFinishing : startDisabled}
       onClick={activate}
       onContextMenu={(event) => { if (event.button !== 0) event.preventDefault() }}>
-      <ControlIcon kind={shortcutListening ? 'stop-send' : active ? 'stop' : 'mic'} />
+      {recognitionListening || shortcutListening ? <ControlIcon kind="stop" /> : <ControlIcon kind="mic" state={voiceState} />}
     </button>
     <span id={`${descriptionId}-mic`} className="sr-only">{voiceDescription}</span>
   </>
 }
 
 export function AndroidComposerVoiceControl() {
-  return <div className="android-voice-controls android-voice-controls--composer" role="group" aria-label="Android voice controls">
+  const { voice } = useControls()
+  return <><div className="android-voice-controls android-voice-controls--composer" role="group" aria-label="Android voice controls">
     <VoiceIntentButton />
   </div>
+    {voice.active ? <PhoneActionOverflow><button type="button" className="shell__control" aria-label="Cancel voice" onClick={voice.stop}>Cancel voice</button></PhoneActionOverflow> : null}
+  </>
 }
 
 export function AndroidVoiceSecondaryControls() {
   const { descriptionId, speechDisabled, speakerState, speakerDescription, withSpeechServices, voice } = useControls()
   return <>
-    {voice.active ? <button type="button" className="shell__control shell__icon-control" aria-label="Cancel voice" onClick={voice.stop}><ControlIcon kind="stop" /></button> : null}
     <button type="button" className="shell__control shell__icon-control" aria-label="Speak replies" title={`Speak replies: ${speakerDescription}`} aria-describedby={`${descriptionId}-speaker`} aria-pressed={voice.status?.ttsEnabled ?? false} disabled={speechDisabled}
       onClick={(event) => withSpeechServices(voice.toggleSpeech, event.currentTarget)}><ControlIcon kind="speaker" state={speakerState} /></button>
     <span className="sr-only" id={`${descriptionId}-speaker`}>{speakerDescription}</span>

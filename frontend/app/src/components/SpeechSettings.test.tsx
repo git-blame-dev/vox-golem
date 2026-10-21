@@ -46,10 +46,30 @@ function renderSpeech(props: Parameters<typeof SpeechSettings>[0]) {
   document.body.append(container)
   const root = createRoot(container)
   act(() => root.render(<SpeechSettings {...props} />))
-  return { container, dispose: () => { act(() => root.unmount()); container.remove() } }
+  return { container, rerender: (next: Parameters<typeof SpeechSettings>[0]) => act(() => root.render(<SpeechSettings {...next} />)), dispose: () => { act(() => root.unmount()); container.remove() } }
 }
 
 describe('SpeechSettings', () => {
+  it.each(['preparing', 'checking'])('reports %s output discovery as checking until native voices are ready', (ttsPhase) => {
+    const props = { android: true, androidStatus: voiceStatus({ ttsEnabled: false, ttsAvailable: false, ttsPhase, speechOptions: { ...speechOptions, ttsProviders: [], ttsVoices: [] } }), statusError: null, startupState: startup(), onSpeechSelectionChange: () => undefined }
+    const { container, rerender, dispose } = renderSpeech(props)
+    try {
+      expect(container.textContent).toContain('Speech output (TTS): Checking…')
+      const voices = () => container.querySelector<HTMLSelectElement>('[aria-label="TTS voice"]')!
+      expect(voices().options).toHaveLength(1)
+      expect(voices().value).toBe('')
+      rerender({ ...props, androidStatus: voiceStatus({ ttsEnabled: false, ttsAvailable: true, ttsPhase: 'ready', speechOptions }) })
+      expect(container.textContent).toContain('Speech output (TTS): Available')
+      expect(Array.from(voices().options).map((option) => option.value)).toEqual(['', 'synthetic-system-local'])
+      expect(voices().value).toBe('')
+      expect(container.querySelector<HTMLSelectElement>('[aria-label="Speech model"]')?.disabled).toBe(true)
+      rerender({ ...props, androidStatus: voiceStatus({ ttsEnabled: true, ttsAvailable: false, ttsPhase: 'error', error: 'Synthetic output preparation failure' }) })
+      expect(container.textContent).toContain('Speech output (TTS): Unavailable')
+      const failure = Array.from(container.querySelectorAll('p')).find((node) => node.textContent === 'Synthetic output preparation failure')!
+      expect(failure).toBeDefined()
+      expect(failure.closest('details')).toBeNull()
+    } finally { dispose() }
+  })
   it('summarizes desktop availability while keeping voice failures visible and identities disclosed', () => {
     const state = startup(identity)
     if (state.kind !== 'ready') throw new Error('Synthetic startup must be ready')

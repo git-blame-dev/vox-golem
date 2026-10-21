@@ -62,6 +62,39 @@ describe('composer voice intent', () => {
     expect(value.stop).toHaveBeenCalledOnce()
     expect(value.finishDictation).not.toHaveBeenCalled()
   })
+  it.each(['dictation', 'ask', 'loop'])('finishes %s listening through the existing final-result bridge', (mode) => {
+    const value = voice({ mode, dictation: 'listening', loop: mode === 'dictation' ? 'idle' : 'listening', readyForSpeech: true }); value.active = true
+    render(value)
+    const finish = button('Finish dictation')
+    expect(finish.querySelector('svg')?.getAttribute('data-icon-kind')).toBe('stop')
+    act(() => finish.click())
+    expect(value.finishDictation).toHaveBeenCalledOnce()
+    expect(value.stop).not.toHaveBeenCalled()
+    expect(container.querySelector('.shell__overflow-actions [aria-label="Cancel voice"] svg')).toBeNull()
+  })
+  it('keeps checking and finishing non-square, with cancellation in composer overflow only', () => {
+    const value = voice({ dictation: 'checking' }); value.active = true
+    render(value)
+    expect(button('Stop voice').querySelector('svg')?.getAttribute('data-icon-kind')).toBe('mic')
+    expect(button('Stop voice').querySelector('svg')?.getAttribute('data-icon-state')).toBe('busy')
+    expect(container.querySelectorAll('[aria-label="Cancel voice"]')).toHaveLength(1)
+    const disclosure = container.querySelector<HTMLElement>('summary[aria-label="More actions"]')!
+    expect(disclosure.getAttribute('role')).toBe('button')
+    const actions = document.getElementById(disclosure.getAttribute('aria-controls')!)!
+    expect(actions.querySelector('[aria-label="Cancel voice"]')).not.toBeNull()
+    act(() => disclosure.click())
+    expect(disclosure.closest('details')?.open).toBe(true)
+    act(() => actions.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })))
+    expect(disclosure.closest('details')?.open).toBe(false)
+    expect(document.activeElement).toBe(disclosure)
+  })
+  it('waits for native speech readiness before showing the listening square', () => {
+    const value = voice({ mode: 'ask', dictation: 'listening', loop: 'listening', readyForSpeech: false }); value.active = true
+    render(value)
+    expect(button('Stop voice').querySelector('svg')?.getAttribute('data-icon-kind')).toBe('mic')
+    expect(button('Stop voice').querySelector('svg')?.getAttribute('data-icon-state')).toBe('busy')
+    expect(button('Finish dictation')).toBeNull()
+  })
   it('finishes manual listening, disables repeat finish and retains explicit cancellation', () => {
     const value = voice({ mode: 'dictation', dictation: 'listening', readyForSpeech: true }); value.active = true
     render(value)

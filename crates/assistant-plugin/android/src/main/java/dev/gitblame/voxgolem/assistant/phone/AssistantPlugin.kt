@@ -307,7 +307,19 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
             invoke.resolve(JSObject(speech.status().toString()))
         } catch (error: RuntimeException) { reportVoiceEntryStage(activity, Stage.ENTRY_NATIVE_REJECTED); pending.args.launchToken?.let(NewVoiceShortcutLauncher.actions::release); reply(invoke, Result.failure(error)) }
     }
-    @Command fun finish_assistant_dictation(invoke: Invoke) { speech.finish(); invoke.resolve() }
+    @Command fun finish_assistant_dictation(invoke: Invoke) {
+        if (Looper.myLooper() != Looper.getMainLooper()) { main.post { finish_assistant_dictation(invoke) }; return }
+        val args = invoke.getArgs()
+        if (!args.has("sessionId")) { speech.finish(); invoke.resolve(); return }
+        val id = args.opt("sessionId") as? String
+        if (id == null || id.isBlank() || id.toByteArray(Charsets.UTF_8).size > 128) {
+            reject(invoke, "invalid_input", "Voice session ID is invalid"); return
+        }
+        val current = if (speechOwner.isInitialized()) speechOwner.value else suppliedSpeech
+        // Compare and finish on main without creating an owner for a stale request.
+        if (current?.ownsSession(id) == true) current.finish()
+        invoke.resolve()
+    }
     @Command fun stop_assistant_voice(invoke: Invoke) {
         if (Looper.myLooper() != Looper.getMainLooper()) { main.post { stop_assistant_voice(invoke) }; return }
         val args = invoke.getArgs()

@@ -33,6 +33,11 @@ export interface AndroidSpeechVoiceOption {
   readonly language: string
   readonly networkRequired: boolean
 }
+
+/** Discovery in progress is not evidence that native speech output is unavailable. */
+export function androidSpeechOutputChecking(status: AndroidVoiceStatus | null): boolean {
+  return status?.ttsPhase === 'preparing' || status?.ttsPhase === 'checking'
+}
 export interface AndroidSpeechOptions {
   readonly ttsProviders: readonly string[]
   readonly ttsVoices: readonly AndroidSpeechVoiceOption[]

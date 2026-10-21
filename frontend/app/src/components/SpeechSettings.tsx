@@ -1,6 +1,6 @@
 import { useId } from 'react'
 import type { AndroidSpeechMetadata, AndroidSpeechVoiceOption, AndroidVoiceStatus } from '../lib/androidVoice'
-import { visibleSpeechError } from '../lib/androidVoice'
+import { androidSpeechOutputChecking, visibleSpeechError } from '../lib/androidVoice'
 import { DEFAULT_SPEECH_SELECTION } from '../lib/assistantSettings'
 import type { SpeechSelection } from '../lib/assistantSettings'
 import type { SpeechServiceMetadata, StartupState } from '../types/chat'
@@ -37,7 +37,7 @@ export function SpeechSettings({ android, androidStatus, statusError, startupSta
       </> : null}
       {!localOnlyAvailable ? <p>{androidStatus === null ? statusError ? 'Dedicated on-device recognition capability is not reported.' : 'Checking dedicated on-device recognition capability.' : 'The dedicated on-device API is unavailable or not reported.'} {speechNetworkFallback ? 'Disabling speech network fallback is unavailable until the dedicated capability is reported.' : 'You can re-enable speech network fallback.'}</p> : null}
       {onSpeechSelectionChange ? <AndroidSpeechSelectors status={androidStatus} selection={speechSelection} fallback={speechNetworkFallback} localOnlyAvailable={localOnlyAvailable} disabled={disabled} onChange={onSpeechSelectionChange} /> : null}
-      <p>Voice input (STT): {androidStatus === null ? statusError ? 'Status not reported' : 'Checking…' : androidStatus.available ? 'Available' : 'Unavailable'} · Speech output (TTS): {androidStatus === null ? 'Status not reported' : androidStatus.ttsAvailable ? 'Available' : 'Unavailable'}{androidStatus === null ? '' : androidStatus.ttsEnabled ? ' · Speak replies enabled' : ' · Speak replies disabled'}</p>
+      <p>Voice input (STT): {androidStatus === null ? statusError ? 'Status not reported' : 'Checking…' : androidStatus.available ? 'Available' : 'Unavailable'} · Speech output (TTS): {androidStatus === null ? 'Status not reported' : androidSpeechOutputChecking(androidStatus) ? 'Checking…' : androidStatus.ttsAvailable ? 'Available' : 'Unavailable'}{androidStatus === null ? '' : androidStatus.ttsEnabled ? ' · Speak replies enabled' : ' · Speak replies disabled'}</p>
       {visibleSpeechError(androidStatus?.error) ? <p>{visibleSpeechError(androidStatus?.error)}</p> : null}
       {statusError ? <p>{statusError}</p> : null}
       <details>
