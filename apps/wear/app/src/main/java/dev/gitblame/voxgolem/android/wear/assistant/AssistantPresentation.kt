@@ -1,6 +1,8 @@
 package dev.gitblame.voxgolem.android.wear.assistant
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -25,6 +27,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
@@ -58,6 +61,7 @@ import dev.gitblame.voxgolem.android.wear.formatVisibleDuration
 import org.json.JSONObject
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 
 @Composable
 internal fun AssistantTheme(content: @Composable () -> Unit) {
@@ -94,7 +98,7 @@ internal data class AssistantActions(
     val loadBranches: (String, String, String?, Int, (String?, AssistantState, String?) -> Unit) -> Unit = { _, _, _, _, _ -> },
 )
 
-private enum class AssistantPage { CHAT, CHATS, SETTINGS, SPEECH_LANGUAGE, SPEECH_ENGINE, SPEECH_VOICE, MISSING_SPEECH }
+private enum class AssistantPage { CHAT, CHATS, SETTINGS, MODEL, SPEECH_LANGUAGE, SPEECH_ENGINE, SPEECH_VOICE, MISSING_SPEECH }
 
 private fun AssistantPage.backPage() = when (this) {
     AssistantPage.SPEECH_LANGUAGE, AssistantPage.SPEECH_ENGINE, AssistantPage.SPEECH_VOICE -> AssistantPage.SETTINGS
@@ -246,6 +250,45 @@ internal fun AssistantScreen(
     replyMetrics: (String?) -> Long? = { null },
 ) {
     var page by rememberSaveable { mutableStateOf(if (voice.missingSpeechServices && voice.entryMode != null) AssistantPage.MISSING_SPEECH else AssistantPage.CHAT) }
+    var modelOrigin by rememberSaveable { mutableStateOf(AssistantPage.CHAT) }
+    var requestedModel by rememberSaveable { mutableStateOf<String?>(null) }
+    var modelRequestToken by remember { mutableStateOf(0L) }
+    var modelSelectionError by rememberSaveable { mutableStateOf<String?>(null) }
+    val settledModel by rememberUpdatedState(state.model)
+    val modelEnabled = !state.busy && !voice.active
+    val backPage = if (page == AssistantPage.MODEL) modelOrigin else page.backPage()
+    val openModels: (AssistantPage) -> Unit = { origin ->
+        if (modelEnabled) {
+            modelOrigin = origin
+            requestedModel = null
+            modelRequestToken++
+            modelSelectionError = null
+            page = AssistantPage.MODEL
+        }
+    }
+    LaunchedEffect(requestedModel, modelRequestToken, page) {
+        val requested = requestedModel ?: return@LaunchedEffect
+        val token = modelRequestToken
+        if (page != AssistantPage.MODEL) return@LaunchedEffect
+        delay(5_000)
+        if (assistantModelConfirmationExpired(token, modelRequestToken, requested, requestedModel,
+                settledModel, page == AssistantPage.MODEL)) {
+            requestedModel = null
+            modelSelectionError = "Model selection was not confirmed. Try again."
+        }
+    }
+    LaunchedEffect(state.model, requestedModel) {
+        if (requestedModel != null && state.model == requestedModel) {
+            requestedModel = null
+            if (page == AssistantPage.MODEL) page = modelOrigin
+        }
+    }
+    LaunchedEffect(state.busy, voice.active) {
+        if ((state.busy || voice.active) && page == AssistantPage.MODEL) page = AssistantPage.CHAT
+    }
+    LaunchedEffect(state.error) {
+        if (state.error != null) requestedModel = null
+    }
     val view = remember(state.viewJson) { JSONObject(state.viewJson) }
     val viewRevision = view.optString("revision", "0")
     val selectedConversationKey = state.conversation?.let(::assistantIdKey)
@@ -296,7 +339,7 @@ internal fun AssistantScreen(
         if (page in setOf(AssistantPage.SETTINGS, AssistantPage.SPEECH_LANGUAGE, AssistantPage.SPEECH_ENGINE, AssistantPage.SPEECH_VOICE) &&
             state.foreground && !state.busy && !voice.active) actions.prepareSpeechOptions()
     }
-    BackHandler(page != AssistantPage.CHAT) { page = page.backPage() }
+    BackHandler(page != AssistantPage.CHAT) { page = backPage }
     WearSurface {
         AssistantArtwork(state, page == AssistantPage.CHAT, assistantArtworkListening(voice))
         key(chatScreenKey) {
@@ -305,21 +348,32 @@ internal fun AssistantScreen(
                 ChatScreen(state, voice, history, pendingPrompts, actions, repeatAfterReply, page == AssistantPage.CHAT,
                     { page = AssistantPage.SETTINGS }, replyMetrics, branchLabels,
                     pagedBranches = pagedBranches, onLoadMoreBranches = loadMoreBranches,
-                    onMissingSpeech = { page = AssistantPage.MISSING_SPEECH })
+                    onMissingSpeech = { page = AssistantPage.MISSING_SPEECH },
+                    openModels = { openModels(AssistantPage.CHAT) })
             }
         }
         if (page != AssistantPage.CHAT) {
             key(page) {
-                BasicSwipeToDismissBox(onDismissed = { page = page.backPage() }, state = rememberWearDismissState()) { background ->
+                var entered by remember { mutableStateOf(false) }
+                val entrance by animateFloatAsState(if (entered || page != AssistantPage.MODEL) 1f else 0f,
+                    animationSpec = tween(150), label = "Assistant page entrance")
+                LaunchedEffect(Unit) { entered = true }
+                Box(Modifier.fillMaxSize().graphicsLayer {
+                    alpha = entrance
+                    scaleX = 0.97f + 0.03f * entrance
+                    scaleY = scaleX
+                }) {
+                BasicSwipeToDismissBox(onDismissed = { page = backPage }, state = rememberWearDismissState()) { background ->
                     WearSurface {
                         if (background) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                            Text(if (page.backPage() == AssistantPage.SETTINGS) "Settings" else title)
+                            Text(if (backPage == AssistantPage.SETTINGS) "Settings" else title)
                         }
                         else when (page) {
                             AssistantPage.CHATS -> ChatsScreen(pagedChats, state, voice, actions, loadMoreChats) { page = AssistantPage.CHAT }
                              AssistantPage.SETTINGS -> SettingsScreen(state, voice, pairing, actions, preferences,
                                  { page = AssistantPage.CHAT }, { page = AssistantPage.CHATS },
-                                 { page = AssistantPage.CHAT; actions.edit() }, speechSelectionError, speechSelectionPending) { field ->
+                                  { page = AssistantPage.CHAT; actions.edit() }, speechSelectionError, speechSelectionPending,
+                                  { openModels(AssistantPage.SETTINGS) }) { field ->
                                      page = when (field) {
                                          AssistantSpeechField.LANGUAGE -> AssistantPage.SPEECH_LANGUAGE
                                          AssistantSpeechField.ENGINE -> AssistantPage.SPEECH_ENGINE
@@ -334,10 +388,32 @@ internal fun AssistantScreen(
                                  }
                                  SpeechSelectionScreen(state, voice, actions, field, speechSelectionError, speechSelectionPending) { page = AssistantPage.SETTINGS }
                              }
-                            AssistantPage.MISSING_SPEECH -> MissingSpeechScreen(voice, actions) { page = AssistantPage.CHAT }
+                             AssistantPage.MODEL -> ScreenList("Model", { page = modelOrigin },
+                                 if (modelOrigin == AssistantPage.SETTINGS) "Back to Settings" else "Back to chat") {
+                                 requestedModel?.let { item { Text("Waiting for model selection") } }
+                                 modelSelectionError?.let { error -> item { Text(error, color = MaterialTheme.colorScheme.error) } }
+                                 assistantRequestError(state)?.let { error -> item { Text(assistantErrorText(error)) } }
+                                 items(assistantSelectableModels(AssistantRuntime.optionalProviderReadiness(), state.model), key = { it }) { model ->
+                                     val label = AssistantModels.presentation[model]?.fullLabel ?: model
+                                     ActionButton((if (model == state.model) "✓ " else "") + label,
+                                         modelEnabled && requestedModel == null) {
+                                         if (!state.busy && !voice.active) {
+                                             if (model == state.model) page = modelOrigin
+                                             else {
+                                                 modelSelectionError = null
+                                                 modelRequestToken++
+                                                 requestedModel = model
+                                                 actions.selectModel(model)
+                                             }
+                                         }
+                                     }
+                                 }
+                             }
+                             AssistantPage.MISSING_SPEECH -> MissingSpeechScreen(voice, actions) { page = AssistantPage.CHAT }
                             AssistantPage.CHAT -> Unit
                         }
                     }
+                }
                 }
             }
         }
@@ -354,6 +430,7 @@ private fun ChatScreen(
     pagedBranches: AssistantPagedBranchesState = AssistantPagedBranchesState(heads = state.branchChoices, labels = branchLabels),
     onLoadMoreBranches: () -> Unit = {},
     onMissingSpeech: () -> Unit = {},
+    openModels: () -> Unit = {},
 ) {
     val list = rememberLazyListState()
     val reading = rememberSaveable(saver = AssistantReadingPosition.Saver) { AssistantReadingPosition() }
@@ -380,6 +457,35 @@ private fun ChatScreen(
     val replyPromptIndex = visiblePrompts.indexOfLast { it.key == reply?.requestKey?.let(::assistantPromptItemKey) }
     val promptsBeforeReply = if (replyPromptIndex < 0) visiblePrompts else visiblePrompts.take(replyPromptIndex + 1)
     val promptsAfterReply = if (replyPromptIndex < 0) emptyList() else visiblePrompts.drop(replyPromptIndex + 1)
+    val livePromptOwner = if (voice.listening) "pending-dictation:${voice.dictation.utterance}" else null
+    val livePrompt = visiblePrompts.lastOrNull { it.key == livePromptOwner }
+    reading.observeLivePrompt(livePromptOwner, livePrompt?.text?.isNotBlank() == true)
+    val followLivePrompt = reading.followsLivePrompt(livePromptOwner)
+    val currentLivePrompt by rememberUpdatedState(livePrompt)
+    LaunchedEffect(livePromptOwner, followLivePrompt, active) {
+        val owner = livePromptOwner ?: return@LaunchedEffect
+        if (!active || !followLivePrompt) return@LaunchedEffect
+        snapshotFlow {
+            val layout = list.layoutInfo
+            currentLivePrompt?.let { it.key == owner && it.text.isNotBlank() } == true &&
+                layout.viewportSize.height > 0 && layout.totalItemsCount > 0
+        }.first { it }
+        if (!reading.followsLivePrompt(owner)) return@LaunchedEffect
+        if (reading.beginLivePromptReveal(owner)) {
+            reading.jumpLatest({ list.canScrollForward }) { list.animateToEnd() }
+        }
+        // Stable utterance identity survives partial rewrites; manual input revokes eligibility.
+        snapshotFlow {
+            val layout = list.layoutInfo
+            Triple(list.canScrollForward, layout.totalItemsCount,
+                layout.visibleItemsInfo.lastOrNull()?.let { it.offset to it.size })
+        }.collect { (canForward, count, _) ->
+            if (canForward && count > 0 && reading.followsLivePrompt(owner) &&
+                currentLivePrompt?.let { it.key == owner && it.text.isNotBlank() } == true) reading.following {
+                list.scrollToEnd()
+            }
+        }
+    }
     LaunchedEffect(transition.scroll) {
         val scroll = transition.scroll ?: return@LaunchedEffect
         olderAnchor = null
@@ -387,8 +493,7 @@ private fun ChatScreen(
             if (scroll.index != null) list.scrollToItem(scroll.index + if (history.error != null) 1 else 0, scroll.offset)
             else if (scroll.fallbackToLatest) {
                 reading.latest()
-                val count = list.layoutInfo.totalItemsCount
-                if (count > 0) list.scrollToItem(count - 1)
+                list.scrollToEnd()
             }
         }
         continuity.scrolled(scroll)
@@ -466,20 +571,32 @@ private fun ChatScreen(
         snapshotFlow { list.layoutInfo }.first { it.viewportSize.height > 0 && it.totalItemsCount >= 1 + turns.size * 2 }
         if (!reading.followsLatest) return@LaunchedEffect
         initialHistoryPositioned = true
-        reading.following { list.scrollToItem(list.layoutInfo.totalItemsCount - 1) }
+        reading.following { list.scrollToEnd() }
     }
-    val showLatest = assistantShowsLatest(state, voice, reading.readingOlder)
+    val showLatest = assistantShowsLatest(state, voice,
+        readingOlder = !reading.followsLatest, measuredCanScrollForward = list.canScrollForward)
     val layoutDirection = LocalLayoutDirection.current
-    ScreenScaffold(scrollState = list, modifier = Modifier.fillMaxSize().settingsSwipe(active, settings)) { contentPadding ->
-        val readingPadding = PaddingValues(
-            start = contentPadding.calculateStartPadding(layoutDirection),
-            top = contentPadding.calculateTopPadding(),
-            end = contentPadding.calculateEndPadding(layoutDirection),
-            bottom = 0.dp,
+    var headerHeight by remember { mutableStateOf(56.dp) }
+    ScreenScaffold(scrollState = list, timeText = {
+        AssistantModelHeader(
+            model = AssistantModels.presentation[state.model],
+            enabled = !state.busy && !voice.active,
+            openModels = openModels,
+            onExclusionHeight = { headerHeight = it },
         )
-        Box(Modifier.fillMaxSize()) {
+    }, modifier = Modifier.fillMaxSize().settingsSwipe(active, settings)) { contentPadding ->
+        BoxWithConstraints(Modifier.fillMaxSize()) {
+            val inset = maxHeight * 0.10f
+            val readingPadding = PaddingValues(
+                start = contentPadding.calculateStartPadding(layoutDirection),
+                top = maxOf(0.dp, headerHeight - inset),
+                end = contentPadding.calculateEndPadding(layoutDirection),
+                bottom = maxOf(0.dp, maxOf(48.dp, CompactEdgeButtonDefaults.Height) + 3.dp - inset),
+            )
             LazyColumn(Modifier.fillMaxSize()
-                .padding(bottom = maxOf(48.dp, CompactEdgeButtonDefaults.Height) + 3.dp)
+                // Intentional project override: chrome may overlap middle history;
+                // end padding clears first/last text, bezel clipping reserves 10% each.
+                .padding(vertical = inset)
                 .listRotary(list, active) { delta ->
                     if (delta != 0f) reading.readOlder(list.canScrollForward || (delta < 0f && list.canScrollBackward))
                 }
@@ -595,7 +712,7 @@ private fun ChatScreen(
                 if (voice.launchConfirmationRequired) item(key = "voice-confirmation") {
                     Text("Tap ${if (voice.entryMode == AssistantVoiceEntryMode.TALK) "Talk" else "Ask"} to start voice.")
                 }
-                item(key = "tail") { Spacer(Modifier.height(0.dp)) }
+                item(key = "tail") { Spacer(Modifier.height(1.dp)) }
             }
             if (!showLatest) {
                 Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(maxOf(48.dp, CompactEdgeButtonDefaults.Height)),
@@ -606,10 +723,8 @@ private fun ChatScreen(
             if (showLatest) {
                 // Both dock controls share the same viewport clearance, so swapping preserves the readable end.
                 IconButton(onClick = {
-                    reading.latest()
-                    scope.launch { reading.following {
-                        val count = list.layoutInfo.totalItemsCount
-                        if (count > 0) list.scrollToItem(count - 1)
+                    scope.launch { reading.jumpLatest({ list.canScrollForward }) {
+                        list.scrollToEnd()
                     } }
                 }, modifier = Modifier.align(Alignment.BottomCenter)
                     .padding(bottom = 6.dp).size(48.dp).semantics { contentDescription = "Jump to latest" },
@@ -620,6 +735,20 @@ private fun ChatScreen(
             }
         }
     }
+}
+
+private suspend fun LazyListState.animateToEnd() {
+    val layout = layoutInfo
+    if (layout.totalItemsCount == 0 || layout.viewportSize.height <= 0) return
+    animateScrollToItem(layout.totalItemsCount - 1, layout.viewportSize.height)
+}
+
+private suspend fun LazyListState.scrollToEnd() {
+    val layout = layoutInfo
+    if (layout.totalItemsCount == 0 || layout.viewportSize.height <= 0) return
+    // Positive offsets move the tail up; one measured viewport lets end-clamping
+    // settle at the actual bottom rather than the start of the tail anchor.
+    scrollToItem(layout.totalItemsCount - 1, layout.viewportSize.height)
 }
 
 @Composable
@@ -681,7 +810,8 @@ private fun ChatsScreen(
 @Composable
 private fun SettingsScreen(state: AssistantState, voice: AssistantVoiceState, pairing: PeerPairingState, actions: AssistantActions,
     preferences: WearVoicePreferences, back: () -> Unit, chats: () -> Unit, edit: () -> Unit,
-    speechSelectionError: String?, speechSelectionPending: Boolean, openSpeech: (AssistantSpeechField) -> Unit) {
+    speechSelectionError: String?, speechSelectionPending: Boolean, openModels: () -> Unit,
+    openSpeech: (AssistantSpeechField) -> Unit) {
     val enabled = !state.busy && !voice.active
     val speechSettings = assistantSpeechSettings(voice, preferences)
     ScreenList("Settings", back) {
@@ -691,8 +821,7 @@ private fun SettingsScreen(state: AssistantState, voice: AssistantVoiceState, pa
         item { SwitchButton(checked = state.webEnabled, onCheckedChange = actions.setWebEnabled,
             label = { Text("Web research") }, secondaryLabel = { Text(if (state.webEnabled) "Allows web tools when supported by the selected model" else "Web tools will not be dispatched",
                 maxLines = Int.MAX_VALUE, overflow = TextOverflow.Clip) }, modifier = Modifier.fillMaxWidth()) }
-        item { Text("Model", style = wearTextStyle(MaterialTheme.typography.titleMedium)) }
-        items(assistantSelectableModels(AssistantRuntime.optionalProviderReadiness(), state.model)) { model -> ActionButton(if (model == state.model) "✓ $model" else model, enabled) { actions.selectModel(model) } }
+        item { ActionButton("Model: ${AssistantModels.presentation[state.model]?.fullLabel ?: state.model}", enabled, openModels) }
         item { SwitchButton(checked = preferences.readRepliesAloud, onCheckedChange = actions.tts, enabled = enabled,
             label = { Text("Speak replies") }, secondaryLabel = { Text("Local voice preferred") },
             modifier = Modifier.fillMaxWidth()) }
@@ -915,8 +1044,10 @@ internal fun assistantPrimaryControl(state: AssistantState, voice: AssistantVoic
         state.foreground && state.model in AssistantModels.aliases && state.branchChoices.isEmpty() && (voice.missingSpeechServices || (voice.admissionReady && voice.recognitionServiceAvailable)))
 }
 
-internal fun assistantShowsLatest(state: AssistantState, voice: AssistantVoiceState, readingOlder: Boolean): Boolean =
-    readingOlder && !state.busy && !voice.active && !voice.launchConfirmationRequired
+internal fun assistantShowsLatest(
+    state: AssistantState, voice: AssistantVoiceState, readingOlder: Boolean,
+    measuredCanScrollForward: Boolean = true,
+): Boolean = readingOlder && measuredCanScrollForward && !state.busy && !voice.active && !voice.launchConfirmationRequired
 
 internal fun assistantProvisionalAnswer(state: AssistantState): String? = state.provisional.takeIf { state.busy && it.isNotBlank() }
 

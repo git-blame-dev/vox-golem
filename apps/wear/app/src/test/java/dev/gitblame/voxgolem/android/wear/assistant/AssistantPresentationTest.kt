@@ -21,10 +21,191 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
+import kotlinx.coroutines.flow.collectLatest
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.snapshots.Snapshot
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class AssistantPresentationTest {
+    @Test fun suspendedRevealSurvivesSameOwnerBlankAndNonblankRewrites() = runBlocking {
+        val reading = AssistantReadingPosition(false)
+        val owner = "pending-dictation:101"
+        reading.observeLivePrompt(owner)
+        val started = CompletableDeferred<Unit>()
+        val finishScroll = CompletableDeferred<Unit>()
+        val finished = CompletableDeferred<Unit>()
+        var reveals = 0
+        val job = launch {
+            snapshotFlow { reading.followsLivePrompt(owner) }.collectLatest { eligible ->
+                if (eligible && reading.beginLivePromptReveal(owner)) {
+                    reveals++
+                    reading.jumpLatest({ false }) {
+                        started.complete(Unit)
+                        finishScroll.await()
+                    }
+                    finished.complete(Unit)
+                }
+            }
+        }
+        try {
+            withTimeout(5_000) { started.await() }
+            reading.observeLivePrompt(owner, hasText = false)
+            Snapshot.sendApplyNotifications()
+            yield()
+            assertTrue(reading.followsLivePrompt(owner))
+            assertTrue(reading.isFollowing)
+            assertFalse(finished.isCompleted)
+            reading.observeLivePrompt(owner)
+            Snapshot.sendApplyNotifications()
+            yield()
+            assertTrue(reading.isFollowing)
+            finishScroll.complete(Unit)
+            withTimeout(5_000) { finished.await() }
+            assertEquals(1, reveals)
+            assertFalse(reading.beginLivePromptReveal(owner))
+            reading.observeRequest("synthetic-after-completed-reveal", false)
+            assertTrue(reading.followsLatest)
+        } finally { job.cancelAndJoin() }
+    }
+
+    @Test fun manualInputCancelsSuspendedRevealWithoutRearmingSameOwnerOrNextRequest() = runBlocking {
+        val reading = AssistantReadingPosition(false)
+        val owner = "pending-dictation:102"
+        reading.observeLivePrompt(owner)
+        val started = CompletableDeferred<Unit>()
+        val cancelled = CompletableDeferred<Unit>()
+        val neverFinish = CompletableDeferred<Unit>()
+        val job = launch {
+            snapshotFlow { reading.followsLivePrompt(owner) }.collectLatest { eligible ->
+                if (eligible && reading.beginLivePromptReveal(owner)) {
+                    try {
+                        reading.jumpLatest({ false }) {
+                            started.complete(Unit)
+                            neverFinish.await()
+                        }
+                    } finally { cancelled.complete(Unit) }
+                }
+            }
+        }
+        try {
+            withTimeout(5_000) { started.await() }
+            reading.readOlder()
+            Snapshot.sendApplyNotifications()
+            withTimeout(5_000) { cancelled.await() }
+            assertFalse(reading.isFollowing)
+            assertEquals(AssistantReadingPhase.MANUAL, reading.phase)
+            reading.observeLivePrompt(owner, hasText = false)
+            reading.observeLivePrompt(owner)
+            assertFalse(reading.followsLivePrompt(owner))
+            assertFalse(reading.beginLivePromptReveal(owner))
+            reading.observeRequest("synthetic-after-cancelled-reveal", false)
+            assertFalse(reading.followsLatest)
+        } finally { job.cancelAndJoin() }
+    }
+
+    @Test fun blankPartialCannotForgetManualRevocationForTheSameUtterance() {
+        val reading = AssistantReadingPosition()
+        assertTrue(reading.observeLivePrompt("pending-dictation:70"))
+        reading.readOlder()
+        assertFalse(reading.observeLivePrompt("pending-dictation:70", hasText = false))
+        reading.scrolled(false, false)
+        assertFalse(reading.observeLivePrompt("pending-dictation:70"))
+        assertTrue(reading.observeLivePrompt("pending-dictation:71"))
+    }
+
+    @Test fun manualInputBeforeFirstPartialRemainsRevokedEvenAfterEndClamp() {
+        val reading = AssistantReadingPosition()
+        assertFalse(reading.observeLivePrompt("pending-dictation:80", hasText = false))
+        reading.readOlder()
+        reading.scrolled(false, false)
+        assertFalse(reading.observeLivePrompt("pending-dictation:80"))
+        assertTrue(reading.observeLivePrompt("pending-dictation:81"))
+    }
+    @Test fun confirmationTimeoutOnlyRetiresItsOwnActiveUnconfirmedRequest() {
+        assertTrue(assistantModelConfirmationExpired(1, 1, "synthetic-model", "synthetic-model", "synthetic-old", true))
+        assertFalse(assistantModelConfirmationExpired(1, 2, "synthetic-model", "synthetic-model", "synthetic-old", true))
+        assertFalse(assistantModelConfirmationExpired(1, 1, "synthetic-model", null, "synthetic-old", true))
+        assertFalse(assistantModelConfirmationExpired(1, 1, "synthetic-model", "synthetic-new", "synthetic-old", true))
+        assertFalse(assistantModelConfirmationExpired(1, 1, "synthetic-model", "synthetic-model", "synthetic-model", true))
+        assertFalse(assistantModelConfirmationExpired(1, 1, "synthetic-model", "synthetic-model", "synthetic-old", false))
+    }
+    @Test fun latestOperationRejectsStaleGeometryUntilActualCompletion() = runBlocking {
+        val reading = AssistantReadingPosition(false)
+        reading.jumpLatest({ reading.scrolled(false, true); false }) {
+            reading.scrolled(false, true)
+            assertTrue(reading.isFollowing)
+        }
+        assertFalse(reading.readingOlder)
+        assertFalse(reading.followsLatest)
+        reading.scrolled(true, true)
+        assertTrue(reading.readingOlder)
+    }
+
+    @Test fun listeningViewportKeepsStableIdentityAndHonorsManualReading() {
+        val reading = AssistantReadingPosition()
+        assertTrue(reading.observeLivePrompt("pending-dictation:7"))
+        reading.scrolled(false, true) // Overflow from the partial is not manual intent.
+        assertTrue(reading.observeLivePrompt("pending-dictation:7"))
+        reading.readOlder()
+        assertFalse(reading.observeLivePrompt("pending-dictation:7"))
+        // New speech is explicit new-input intent, unlike another partial of owner 7.
+        assertTrue(reading.observeLivePrompt("pending-dictation:8"))
+    }
+
+    @Test fun newUtteranceRevealsOnceFromOldManualHistoryWithoutReplayingBlankRewrites() {
+        val reading = AssistantReadingPosition(false)
+        assertFalse(reading.observeLivePrompt("pending-dictation:90", hasText = false))
+        assertTrue(reading.observeLivePrompt("pending-dictation:90"))
+        assertTrue(reading.beginLivePromptReveal("pending-dictation:90"))
+        assertFalse(reading.beginLivePromptReveal("pending-dictation:90"))
+        assertFalse(reading.observeLivePrompt("pending-dictation:90", hasText = false))
+        assertTrue(reading.observeLivePrompt("pending-dictation:90"))
+        assertFalse(reading.beginLivePromptReveal("pending-dictation:90"))
+        reading.readOlder()
+        assertFalse(reading.observeLivePrompt("pending-dictation:90"))
+        assertTrue(reading.beginLivePromptReveal("pending-dictation:91"))
+    }
+
+    @Test fun interruptedSpeechRevealCannotRearmSameOwnerOrNextRequest() = runBlocking {
+        val reading = AssistantReadingPosition(false)
+        assertTrue(reading.beginLivePromptReveal("pending-dictation:92"))
+        reading.jumpLatest({ false }) { reading.readOlder() }
+        assertEquals(AssistantReadingPhase.MANUAL, reading.phase)
+        assertFalse(reading.beginLivePromptReveal("pending-dictation:92"))
+        reading.observeRequest("synthetic-after-speech-interruption", false)
+        assertFalse(reading.followsLatest)
+    }
+
+    @Test fun longLivePartialRewritesProjectImmediatelyWithoutReplacingTheUtteranceRow() {
+        val presentation = AssistantPromptPresentation()
+        val initial = ready.copy(draft = "", selectedHead = turnId("30"))
+        val history = AssistantHistoryState(conversation, initial.selectedHead,
+            (1..30).map { turn(it.toString()) })
+        val first = presentation.project(initial, dictating(DictationPhase.LISTENING, "Synthetic initial words"), history).single()
+        val replacement = "Synthetic rewritten paragraph. ".repeat(300)
+        val next = presentation.project(initial, dictating(DictationPhase.LISTENING, replacement), history).single()
+        assertEquals(first.key, next.key)
+        assertEquals(replacement, next.text)
+        val reading = AssistantReadingPosition()
+        assertTrue(reading.observeLivePrompt(first.key))
+        assertTrue(reading.observeLivePrompt(next.key))
+        reading.readOlder()
+        assertFalse(reading.observeLivePrompt(next.key))
+    }
+
+    @Test fun interruptedLatestCannotOverrideNewManualIntent() = runBlocking {
+        val reading = AssistantReadingPosition(false)
+        reading.jumpLatest({ false }) { reading.readOlder() }
+        assertTrue(reading.readingOlder)
+        reading.observeRequest("synthetic-after-interruption", false)
+        assertFalse(reading.followsLatest)
+    }
     private val conversation = "{\"replica\":\"synthetic-chat\",\"sequence\":\"1\"}"
     private val ready = AssistantState(conversation = conversation, foreground = true, draft = "Synthetic draft")
 
@@ -195,6 +376,26 @@ class AssistantPresentationTest {
             assertFalse(assistantShowsLatest(ready, voice, true))
             assertEquals(AssistantPrimaryControl(AssistantPrimaryAction.STOP, true), assistantPrimaryControl(ready, voice, false))
         }
+    }
+
+    @Test fun measuredEndRestoresPrimaryWhileProgrammaticFollowingLeavesCachedOlderGeometry() = runBlocking {
+        val reading = AssistantReadingPosition()
+        reading.readOlder()
+        reading.following {
+            reading.scrolled(inProgress = true, canScrollForward = false)
+            assertTrue("Programmatic following leaves cached older geometry unchanged", reading.readingOlder)
+            assertFalse(assistantShowsLatest(ready, AssistantVoiceState(),
+                readingOlder = !reading.followsLatest, measuredCanScrollForward = false))
+        }
+        assertFalse("Measured end does not rearm follow intent", reading.followsLatest)
+        reading.scrolled(inProgress = true, canScrollForward = true)
+        reading.scrolled(inProgress = false, canScrollForward = true)
+        assertTrue("Actual manual movement away restores Latest", assistantShowsLatest(ready, AssistantVoiceState(),
+            readingOlder = !reading.followsLatest, measuredCanScrollForward = true))
+        reading.observeRequest("synthetic-measured-end:1", manuallyScrolling = false)
+        assertFalse("Dock visibility cannot manufacture next-request eligibility", reading.followsLatest)
+        assertFalse("Follow intent still suppresses Latest above the end", assistantShowsLatest(ready, AssistantVoiceState(),
+            readingOlder = !AssistantReadingPosition().followsLatest, measuredCanScrollForward = true))
     }
 
     @Test fun manuallyReachingBottomDoesNotRearmTheCurrentResponse() {

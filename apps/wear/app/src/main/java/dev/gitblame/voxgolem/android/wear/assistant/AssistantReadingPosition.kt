@@ -7,6 +7,10 @@ import androidx.compose.runtime.saveable.Saver
 import dev.gitblame.voxgolem.assistant.runtime.AssistantState
 import kotlin.math.abs
 
+internal fun assistantModelConfirmationExpired(
+    token: Long, currentToken: Long, requested: String, pending: String?, settled: String, pickerActive: Boolean,
+): Boolean = pickerActive && token == currentToken && pending == requested && settled != requested
+
 internal fun assistantRequestOwnerKey(state: AssistantState): String? =
     state.clientRequestToken?.takeIf(String::isNotBlank) ?: state.providerRequestId?.takeIf(String::isNotBlank)
 
@@ -82,6 +86,11 @@ internal class AssistantReadingPosition(followLatest: Boolean = true) {
     val followsLatest: Boolean get() = phase == AssistantReadingPhase.INITIAL || phase == AssistantReadingPhase.ARMED
     val readingOlder: Boolean get() = !followsLatest && !visualEnd
     private var following = 0
+    private var livePromptKey: String? = null
+    private var livePromptEligible by mutableStateOf(false)
+    private var livePromptCaptured = false
+    private var livePromptRevoked = false
+    private var livePromptRevealStarted = false
     var isFollowing by mutableStateOf(false)
         private set
 
@@ -129,6 +138,8 @@ internal class AssistantReadingPosition(followLatest: Boolean = true) {
     }
 
     fun readOlder(canScrollForward: Boolean = true) {
+        livePromptEligible = false
+        if (livePromptKey != null) livePromptRevoked = true
         phase = AssistantReadingPhase.MANUAL
         visualEnd = !canScrollForward
         eligibleNext = !canScrollForward
@@ -167,6 +178,48 @@ internal class AssistantReadingPosition(followLatest: Boolean = true) {
         following++
         isFollowing = true
         try { action() } finally { following--; isFollowing = following > 0 }
+    }
+
+    /** Capture intent before a partial's new geometry can obscure the previous end. */
+    fun observeLivePrompt(owner: String?, hasText: Boolean = true): Boolean {
+        if (owner != livePromptKey) {
+            livePromptKey = owner
+            livePromptEligible = false
+            livePromptCaptured = false
+            livePromptRevoked = false
+            livePromptRevealStarted = false
+        }
+        if (owner != null && hasText && !livePromptCaptured) {
+            livePromptCaptured = true
+            // A new utterance is explicit new-input intent, including from old history.
+            livePromptEligible = !livePromptRevoked
+        }
+        return owner != null && hasText && livePromptEligible
+    }
+
+    fun beginLivePromptReveal(owner: String): Boolean {
+        if (!observeLivePrompt(owner) || livePromptRevealStarted) return false
+        livePromptRevealStarted = true
+        return true
+    }
+
+    // Job lifetime follows utterance intent, not temporary presence of its text row.
+    fun followsLivePrompt(owner: String?): Boolean = owner != null && owner == livePromptKey && livePromptEligible
+
+    suspend fun jumpLatest(canScrollForward: () -> Boolean, scroll: suspend () -> Unit) {
+        following {
+            latest()
+            var completed = false
+            try {
+                scroll()
+                completed = true
+            } finally {
+                if (phase == AssistantReadingPhase.HELD) {
+                    visualEnd = !canScrollForward()
+                    eligibleNext = completed && visualEnd
+                }
+            }
+        }
     }
 
     companion object {
