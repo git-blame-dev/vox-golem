@@ -5,7 +5,14 @@ import type { AssistantCapabilities, AssistantOption, AssistantSettings } from '
 import type { AndroidAssistantProjection, ModelOption } from './lib/appSnapshot'
 import { isAndroidRuntime, isBrowserPreviewRuntime } from './lib/tauri'
 import type { UpdateState } from './lib/useAppUpdates'
-import type { CapabilityId, StartupState, UiTextSize, UiTheme } from './types/chat'
+import type { CapabilityId, StartupCapability, StartupState, UiTextSize, UiTheme } from './types/chat'
+
+/** Startup notices concern supported generation capabilities; speech has its own UI. */
+export function startupWarningRelevant(capability: StartupCapability, platform: 'android' | 'desktop'): boolean {
+  if (['wake_word', 'vad', 'parakeet', 'tts'].includes(capability.id)) return false
+  if (platform === 'android' && capability.id !== 'custom_provider') return false
+  return ['not_configured', 'unavailable', 'failed'].includes(capability.state)
+}
 
 export const UI_TEXT_SIZE_STEPS: readonly UiTextSize[] = ['small', 'medium', 'large', 'extra_large']
 export const DEFAULT_UI_TEXT_SIZE: UiTextSize = 'medium'

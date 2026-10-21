@@ -10,7 +10,7 @@ import { getBrowserPreviewInternals } from './browserRuntime'
 import { utf8ByteLength } from './wire'
 import { NEW_VOICE_SHORTCUT_COMMANDS } from './newVoiceShortcut'
 import { serializeAssistantSettings } from './assistantSettings'
-import { CAPABILITY_IDS } from './startupState'
+import { androidStartupWireState } from './startupProjection'
 const COMMAND_ERROR_CODES = ['invalid_input', 'not_found', 'busy', 'unavailable', 'internal'] as const
 type CommandErrorCode = typeof COMMAND_ERROR_CODES[number]
 
@@ -140,19 +140,7 @@ export function setCachedAndroidPreferences(preferences: ValidatedPreferences): 
 }
 
 export function buildAndroidStartupState(snapshot: AppSnapshot): Record<string, unknown> {
-  const capabilities = new Map(snapshot.capabilities.map((capability) => [capability.id, capability]))
-  return {
-    kind: 'ready', cue_asset_paths: { start_listening: 'resources/start-listening.wav', stop_listening: 'resources/stop-listening.wav' },
-    runtime_phase: snapshot.runtimePhase, voice_input_available: false, voice_input_error: 'Desktop audio input is unavailable on Android; native dictation has separate availability',
-    silence_timeout_ms: 1500, selected_response_profile: snapshot.preferences.responseProfile, supported_response_profiles: [],
-    prompt_cancellation_available: true, tts_enabled: snapshot.preferences.ttsEnabled, tts_output_gain_db: 3,
-    capabilities: CAPABILITY_IDS.map((id) => {
-      const capability = capabilities.get(id)
-      return capability === undefined
-        ? { id, state: 'not_configured', reason: 'Unavailable on Android zero-asset runtime', actual_provider: null }
-        : { id, state: capability.state, reason: capability.reason, actual_provider: capability.actualProvider }
-    }),
-  }
+  return androidStartupWireState(snapshot)
 }
 
 export async function invokeTauriCommand(command: string, args?: unknown): Promise<unknown> {

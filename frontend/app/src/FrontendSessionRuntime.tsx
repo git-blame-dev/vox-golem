@@ -15,6 +15,7 @@ import {
   parseUiTextSize,
   parseUiTheme,
   sameExternalView,
+  startupWarningRelevant,
   UI_TEXT_SIZE_STEPS,
   usePresentation,
   voiceInputReady,
@@ -649,13 +650,18 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         )
     startupStateRef.current = controlledState
     setStartupState(controlledState)
+    if (controlledState.kind === 'ready' && !controlledState.capabilities.some((capability) =>
+      startupWarningRelevant(capability, isAndroidRuntime ? 'android' : 'desktop'))) {
+      setNotices((current) => current.some((notice) => notice.title === 'Startup capabilities unavailable')
+        ? current.filter((notice) => notice.title !== 'Startup capabilities unavailable') : current)
+    }
     snapshotControlsFreshRef.current = true
     setSnapshotControlsFresh(true)
     snapshotControlsInvalidatedRef.current = false
     setSnapshotControlsInvalidated(false)
     if (isAndroidRuntime) queueMicrotask(() => drainAndroidVoiceRequestRef.current())
     return true
-  }, [adoptSnapshotPreferences, drainAndroidVoiceRequestRef, setSnapshotControlsFresh, setSnapshotControlsInvalidated, setSnapshotModelOptions, setStartupState, snapshotCapabilitiesRef, snapshotControlRequestRevisionRef, snapshotControlsFreshRef, snapshotControlsInvalidatedRef, snapshotHydrationRevisionRef, snapshotModelOptionsRef, snapshotResponseProfileRef, startupStateRef])
+  }, [adoptSnapshotPreferences, drainAndroidVoiceRequestRef, setNotices, setSnapshotControlsFresh, setSnapshotControlsInvalidated, setSnapshotModelOptions, setStartupState, snapshotCapabilitiesRef, snapshotControlRequestRevisionRef, snapshotControlsFreshRef, snapshotControlsInvalidatedRef, snapshotHydrationRevisionRef, snapshotModelOptionsRef, snapshotResponseProfileRef, startupStateRef])
 
   const adoptRecoveredAndroidSelection = useCallback((snapshot: AppSnapshot, recovery: NonNullable<typeof androidSelectionRecoveryRef.current>, controlRevision: number, preferenceRevision: number): boolean => {
     if (!appActiveRef.current || androidSelectionRecoveryRef.current !== recovery || transcriptRevisionRef.current !== recovery.transcriptRevision || snapshot.activeRequest !== null || snapshot.assistant === undefined) return false
@@ -1104,8 +1110,8 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     }
     startupStateRef.current = publishedState
     setStartupState(publishedState)
-    if (publishedState.kind === 'ready' && publishedState.capabilities.every(({ id, state }) =>
-      ['wake_word', 'vad', 'parakeet', 'tts'].includes(id) || !['not_configured', 'unavailable', 'failed'].includes(state))) {
+    if (publishedState.kind === 'ready' && !publishedState.capabilities.some((capability) =>
+      startupWarningRelevant(capability, isAndroidRuntime ? 'android' : 'desktop'))) {
       setNotices((current) => current.some((notice) => notice.title === 'Startup capabilities unavailable')
         ? current.filter((notice) => notice.title !== 'Startup capabilities unavailable') : current)
     }
@@ -1184,10 +1190,9 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         const publishedState = applyStartupState(nextState, syncRuntimeStatus, startupSnapshotRevision)
 
         if (publishedState.kind === 'ready' && !isBrowserPreviewRuntime()) {
-          const newlyUnavailableCapabilities = publishedState.capabilities.filter(({ id, state }) => {
-            if (isAndroidRuntime && ['opencode', 'local_quality', 'qwen_prediction', 'deep', 'review', 'wake_word', 'vad', 'parakeet', 'tts'].includes(id)) return false
-            if (['wake_word', 'vad', 'parakeet', 'tts'].includes(id)) return false
-            if (state !== 'not_configured' && state !== 'unavailable' && state !== 'failed') return false
+          const newlyUnavailableCapabilities = publishedState.capabilities.filter((capability) => {
+            const { id, state } = capability
+            if (!startupWarningRelevant(capability, isAndroidRuntime ? 'android' : 'desktop')) return false
             if (previousKind !== 'ready' || isFirstStartupPass) return true
             const previousCapability = previousState.capabilities.find((capability) => capability.id === id)
             return previousCapability !== undefined && previousCapability.state !== state

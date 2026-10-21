@@ -28,6 +28,25 @@ afterEach(() => {
 })
 
 describe('Android App lifecycle', () => {
+  it.each([false, true])('warns only for supported startup failures and clears recovered notices (provider failed: %s)', async (failedInitially) => {
+    vi.useFakeTimers()
+    let failed = failedInitially
+    const snapshot = () => ({ ...appSnapshot(), capabilities: capabilities().map((capability) => ({
+      ...capability,
+      ...(capability['id'] === 'local_fast' ? { state: 'failed', reason: 'Synthetic unsupported local failure' } : {}),
+      ...(capability['id'] === 'custom_provider' && failed ? { state: 'failed', reason: 'Synthetic supported provider failure' } : {}),
+    })) })
+    window.__TAURI_INTERNALS__ = { invoke: async (command) => command === 'get_app_snapshot' ? snapshot() : null }
+    container = document.createElement('div'); document.body.append(container); root = createRoot(container)
+    await act(async () => { root?.render(<App />) })
+    expect(container.querySelector('.notice-toast')?.textContent ?? '').not.toContain('Synthetic unsupported local failure')
+    if (failedInitially) expect(container.querySelector('.notice-toast')?.textContent).toContain('Synthetic supported provider failure')
+    else expect(container.querySelector('.notice-toast')).toBeNull()
+    failed = false
+    await act(async () => { window.dispatchEvent(new Event('focus')) })
+    expect(container.querySelector('.notice-toast')).toBeNull()
+  })
+
   it.each([false, true])('starts a pending cold Vox Ask entry once without a second tap (TTS ready: %s)', async (ttsAvailable) => {
     vi.useFakeTimers()
     const token = '12345678-1234-4234-8234-123456789abc'

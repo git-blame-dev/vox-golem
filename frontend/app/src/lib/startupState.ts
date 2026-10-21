@@ -1,6 +1,7 @@
 import { hasInjectedTauriInternals, invokeTauriCommand } from './tauri'
 import { isRecord, parseRuntimePhase } from './wire'
-import type { AppSnapshot } from './appSnapshot'
+import { CAPABILITY_IDS, DEFAULT_CUE_ASSET_PATHS, DEFAULT_INITIAL_SILENCE_TIMEOUT_MS, DEFAULT_SILENCE_TIMEOUT_MS, DEFAULT_TTS_OUTPUT_GAIN_DB } from './startupProjection'
+export { CAPABILITY_IDS, DEFAULT_CUE_ASSET_PATHS, DEFAULT_INITIAL_SILENCE_TIMEOUT_MS, DEFAULT_SILENCE_TIMEOUT_MS, DEFAULT_TTS_OUTPUT_GAIN_DB, startupStateFromSnapshot } from './startupProjection'
 import type {
   CueAssetPaths,
   ResponseProfile,
@@ -12,48 +13,10 @@ import type {
   SpeechServicesMetadata,
 } from '../types/chat'
 
-export const DEFAULT_INITIAL_SILENCE_TIMEOUT_MS = 2_500
-export const DEFAULT_SILENCE_TIMEOUT_MS = 750
-export const DEFAULT_TTS_OUTPUT_GAIN_DB = 3
-
-export const DEFAULT_CUE_ASSET_PATHS: CueAssetPaths = {
-  startListening: 'resources/start-listening.wav',
-  stopListening: 'resources/stop-listening.wav',
-}
-
 export const DEFAULT_SUPPORTED_RESPONSE_PROFILES: readonly ResponseProfile[] = ['fast']
 export const DEFAULT_SELECTED_RESPONSE_PROFILE: ResponseProfile = 'fast'
-export const CAPABILITY_IDS: readonly CapabilityId[] = [
-  'custom_provider', 'opencode', 'local_fast', 'local_quality', 'qwen_prediction',
-  'wake_word', 'vad', 'parakeet', 'tts', 'deep', 'review',
-]
 
 export type ReadyStartupState = Extract<StartupState, { kind: 'ready' }>
-
-export function startupStateFromSnapshot(snapshot: AppSnapshot): ReadyStartupState {
-  const byId = new Map(snapshot.capabilities.map((item) => [item.id, item]))
-  const capabilities: readonly StartupCapability[] = CAPABILITY_IDS.map((id) => {
-    const existing = byId.get(id)
-    return existing !== undefined
-      ? { id, state: existing.state, reason: existing.reason, actualProvider: existing.actualProvider }
-      : { id, state: 'not_configured' as const, reason: 'Unavailable on Android zero-asset runtime', actualProvider: null }
-  })
-  return {
-    kind: 'ready',
-    cueAssetPaths: DEFAULT_CUE_ASSET_PATHS,
-    runtimePhase: snapshot.runtimePhase,
-    voiceInputAvailable: false,
-    voiceInputError: 'Desktop audio input is unavailable on Android; native dictation has separate availability',
-    initialSilenceTimeoutMs: DEFAULT_INITIAL_SILENCE_TIMEOUT_MS,
-    silenceTimeoutMs: 1_500,
-    selectedResponseProfile: snapshot.preferences.responseProfile,
-    supportedResponseProfiles: [],
-    promptCancellationAvailable: true,
-    ttsEnabled: snapshot.preferences.ttsEnabled,
-    ttsOutputGainDb: DEFAULT_TTS_OUTPUT_GAIN_DB,
-    capabilities,
-  }
-}
 
 export function parseStartupState(payload: unknown): StartupState {
   if (!isRecord(payload)) {

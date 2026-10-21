@@ -5,6 +5,7 @@ import type { AppSnapshot, ValidatedPreferences } from './appSnapshot'
 import { appendCanonicalTurn, canonicalExecutionKey, isExpectedCanonicalTurn, parseAppSnapshot, parseCanonicalTurn, parseValidatedPreferences } from './appSnapshot'
 import { initialUpdateState } from './useAppUpdates'
 import type { AgentChoice } from './modelCatalog'
+import { parseStartupState, startupStateFromSnapshot } from './startupState'
 
 const preferences: ValidatedPreferences = {
   instant: 'local-fast', deep: 'opencode-sol-high' as AgentChoice, review: 'opencode-luna-low' as AgentChoice, deepEnabled: false, reviewEnabled: true,
@@ -20,6 +21,9 @@ afterEach(() => {
 })
 
 describe('Android runtime contract helpers', () => {
+  it('uses the same neutral projection for typed and wire startup consumers', () => {
+    expect(parseStartupState(buildAndroidStartupState(snapshot))).toEqual(startupStateFromSnapshot(snapshot))
+  })
   it('projects zero-asset startup truthfully across every legacy capability', () => {
     const startup = buildAndroidStartupState(snapshot)
     expect(startup['supported_response_profiles']).toEqual([])
