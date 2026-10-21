@@ -823,6 +823,47 @@ class AndroidLocalRecognizerFactoryTest {
         assertNull(GoogleSttSupportCache(context, versionCodeProvider = { 731L }).get("synthetic.provider", "en-AU", true))
     }
 
+    @Test fun directMicrophoneWaitsForPreRollRetirementAndCancelFencesLateCompletion() {
+        for (action in listOf("listen", "cancel", "stop")) {
+            registerGoogle()
+            val pipe = android.os.ParcelFileDescriptor.createPipe()
+            var recording = true
+            var completion: ((Boolean) -> Unit)? = null
+            val source = object : PreRollAudioSource {
+                override val readDescriptor = pipe[0]
+                override val isRecording get() = recording
+                override fun startStreaming() {}
+                override fun configureIntent(intent: Intent) = intent
+                override fun stopCapture() { recording = false }
+                override fun close() { recording = false }
+                override fun retire(completed: (Boolean) -> Unit) { completion = completed }
+            }
+            val session = AndroidLocalRecognizerFactory(RuntimeEnvironment.getApplication(),
+                preRollFactory = PreRollAudioSourceFactory { source }).create()
+            session.checkLanguage("en-AU") {}; drain()
+            val sdk = shadowOf(ShadowSpeechRecognizer.getLatestSpeechRecognizer())
+            sdk.triggerSupportResult(RecognitionSupport.Builder().setInstalledOnDeviceLanguages(listOf("en-AU")).build()); drain()
+            recording = false // The capture worker reached EOF during support validation.
+            session.start("en-AU", RecordingEvents()); drain()
+            assertNull(sdk.lastRecognizerIntent)
+            if (action == "cancel") session.cancel()
+            if (action == "stop") session.stop()
+            completion!!(true); drain()
+            if (action != "listen") assertNull(sdk.lastRecognizerIntent) else assertNotNull(sdk.lastRecognizerIntent)
+            var retired: Boolean? = null
+            session.retire { retired = it }
+            if (action == "cancel") {
+                assertNull(retired)
+                completion!!(false); drain()
+                assertEquals(false, retired)
+                session.retire { retired = it }
+                completion!!(true); drain()
+            }
+            assertEquals(true, retired)
+            pipe.forEach { it.close() }
+        }
+    }
+
     @Test fun preRollStartsDuringSupportAndStopsAtSpeechEndpoint() {
         registerGoogle()
         val pipe = android.os.ParcelFileDescriptor.createPipe()

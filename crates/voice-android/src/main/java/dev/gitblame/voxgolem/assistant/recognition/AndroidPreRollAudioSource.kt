@@ -26,6 +26,7 @@ interface PreRollAudioSource : AutoCloseable {
     fun configureIntent(intent: Intent): Intent
     fun stopCapture()
     override fun close()
+    fun retire(completed: (Boolean) -> Unit) { completed(runCatching { close() }.isSuccess) }
 }
 
 fun interface PreRollAudioSourceFactory {
@@ -72,11 +73,15 @@ class AndroidPreRollAudioSource private constructor(
     }
 
     override fun close() {
-        if (closed.get()) return
+        closed.set(true)
         // Closing the consumer first also unblocks a writer whose recognizer has retired.
         runCatching { readDescriptor.close() }
         pump.close()
-        closed.set(true)
+    }
+
+    override fun retire(completed: (Boolean) -> Unit) {
+        close()
+        pump.retire(completed)
     }
 
     companion object {

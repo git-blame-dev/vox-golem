@@ -4,7 +4,7 @@ import java.io.OutputStream
 import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicBoolean
 
-/** One capture worker owns buffering, ordered writes, EOF and native release. No UI-thread joins. */
+/** Capture worker owns PCM/EOF; one coalesced control drive serializes native stop and release. */
 internal class PreRollPcmPump(
     private val capture: Capture,
     private val output: OutputStream,
@@ -22,7 +22,11 @@ internal class PreRollPcmPump(
     private val cancelled = AtomicBoolean(false)
     private val ended = AtomicBoolean(false)
     private val outputClosed = AtomicBoolean(false)
-    private val captureLock = Any()
+    private val control = Any()
+    private var driving = false
+    private var driveRequested = false
+    private var failure = false
+    private var completion: ((Boolean) -> Unit)? = null
     private var captureStopped = false
     private var captureReleased = false
     val isRecording: Boolean get() = !stopping.get() && !ended.get()
@@ -61,12 +65,9 @@ internal class PreRollPcmPump(
                 // A retired consumer may have already closed the read end.
             } finally {
                 stopping.set(true)
-                synchronized(captureLock) {
-                    if (!captureStopped) runCatching { capture.stop(); captureStopped = true }
-                    runCatching { capture.release(); captureReleased = true }
-                }
                 ended.set(true)
                 closeOutput()
+                drive()
             }
         }
     }
@@ -75,18 +76,66 @@ internal class PreRollPcmPump(
 
     fun stopCapture() {
         stopping.set(true)
-        synchronized(captureLock) {
-            // Stop before releasing the lease. Failed stops remain retryable by SDK retirement.
-            if (!captureStopped && !captureReleased) {
-                capture.stop()
-                captureStopped = true
-            }
-        }
+        drive()
     }
 
     override fun close() {
         cancelled.set(true)
-        try { stopCapture() } finally { closeOutput() }
+        closeOutput()
+        stopCapture()
+    }
+
+    /** One explicit retry after failure; completion never means merely requested. */
+    fun retire(completed: (Boolean) -> Unit) {
+        val released = synchronized(control) {
+            if (captureReleased) true else {
+                completion = completed
+                failure = false
+                false
+            }
+        }
+        if (released) completed(true) else close()
+    }
+
+    private fun drive() {
+        val launch = synchronized(control) {
+            driveRequested = true
+            if (driving || failure || captureReleased ||
+                (!stopping.get() || (captureStopped && !ended.get()))) false
+            else { driving = true; true }
+        }
+        if (!launch) return
+        Thread({
+            while (true) {
+                val work = synchronized(control) {
+                    driveRequested = false
+                    when {
+                        failure || captureReleased -> 0
+                        stopping.get() && !captureStopped -> 1
+                        ended.get() && captureStopped -> 2
+                        else -> 0
+                    }
+                }
+                if (work != 0) {
+                    val success = runCatching {
+                        if (work == 1) capture.stop() else capture.release()
+                    }.isSuccess
+                    val callback = synchronized(control) {
+                        if (success) {
+                            if (work == 1) captureStopped = true else captureReleased = true
+                        } else failure = true
+                        if (!success || captureReleased) completion.also { completion = null } else null
+                    }
+                    runCatching { callback?.invoke(success) }
+                }
+                val again = synchronized(control) {
+                    if (!failure && !captureReleased && (driveRequested ||
+                            (stopping.get() && !captureStopped) || (ended.get() && captureStopped))) true
+                    else { driving = false; false }
+                }
+                if (!again) break
+            }
+        }, "voxgolem-preroll-retirement").apply { isDaemon = true; start() }
     }
 
     private fun closeOutput() {

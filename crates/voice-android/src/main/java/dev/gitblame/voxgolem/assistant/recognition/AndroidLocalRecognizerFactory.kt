@@ -197,8 +197,12 @@ class AndroidLocalRecognizerFactory(
         private var languageDeadline: Runnable? = null
         private var recognitionEpoch = 0L
         private var destroyed = false
+        private var sdkRetired = false
+        private var retirementAttempt = 0L
         private var admitted = false
         private var listeningStarted = false
+        private var sdkListeningRequested = false
+        private var finishRequested = false
         private var admissionFallbackReason: String? = null
         private var explicitLanguage = false
         private var preRoll: PreRollAudioSource? = null
@@ -468,24 +472,39 @@ class AndroidLocalRecognizerFactory(
                 closePreRoll()
                 false
             }
-            timing.mark(Stage.LISTENING_REQUESTED)
-            try {
-                sdk.startListening(listeningIntent)
-            } catch (error: RuntimeException) {
-                closePreRoll()
-                throw error
+            fun listen() {
+                if (!active()) return
+                if (finishRequested) { terminal = true; events.error("no_speech"); return }
+                timing.mark(Stage.LISTENING_REQUESTED)
+                sdkListeningRequested = true
+                try { sdk.startListening(listeningIntent) }
+                catch (error: RuntimeException) { closePreRoll(); throw error }
+                if (immediateReady && active() && !readyDelivered) {
+                    readyDelivered = true
+                    timing.mark(Stage.READY_CALLBACK)
+                    events.ready()
+                }
             }
-            if (immediateReady && active() && !readyDelivered) {
-                readyDelivered = true
-                timing.mark(Stage.READY_CALLBACK)
-                events.ready()
+            if (!immediateReady && activePreRoll != null) {
+                // Direct microphone admission must wait for the previous AudioRecord to retire.
+                activePreRoll.retire { success -> main.post {
+                    if (!active() || preRoll !== activePreRoll) return@post
+                    if (!success) { terminal = true; events.error("recognition_cleanup_failed") }
+                    else {
+                        preRoll = null
+                        try { listen() } catch (_: RuntimeException) { events.error("recognition_start_failed") }
+                    }
+                } }
+            } else {
+                listen()
             }
         }
         override fun stop() {
             requireMain()
             timing.mark(Stage.FINISH_REQUESTED)
+            finishRequested = true
             preRoll?.stopCapture()
-            sdk.stopListening()
+            if (sdkListeningRequested) sdk.stopListening()
         }
         override fun cancel() {
             requireMain()
@@ -495,17 +514,34 @@ class AndroidLocalRecognizerFactory(
             sdk.cancel()
         }
         override fun destroy() {
+            var completed: Boolean? = null
+            retire { completed = it }
+            check(completed == true) { "recognition_retirement_incomplete" }
+        }
+        override fun retire(completed: (Boolean) -> Unit) {
             requireMain()
             recognitionEpoch++
             invalidateLanguageCheck()
-            closePreRoll()
-            sdk.destroy()
             destroyed = true
+            val attempt = ++retirementAttempt
+            if (!sdkRetired) {
+                sdkRetired = runCatching { sdk.destroy() }.isSuccess
+            }
+            val source = preRoll
+            if (source == null) { completed(sdkRetired); return }
+            source.retire { success ->
+                fun deliver() {
+                    if (attempt != retirementAttempt || preRoll !== source) return
+                    if (success) preRoll = null
+                    completed(success && sdkRetired)
+                }
+                if (Looper.myLooper() == main.looper) deliver() else main.post { deliver() }
+            }
         }
         private fun closePreRoll() {
             val active = preRoll ?: return
             active.close()
-            preRoll = null
+            // Keep the exact source until full retirement is acknowledged, including failures.
         }
         private fun invalidateLanguageCheck(keepTiming: AssistantTiming? = null) {
             languageCheck++

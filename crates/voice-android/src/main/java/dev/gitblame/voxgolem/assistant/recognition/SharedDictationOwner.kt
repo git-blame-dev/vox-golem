@@ -29,6 +29,8 @@ interface LocalRecognizerSession {
     fun stop()
     fun cancel()
     fun destroy()
+    /** Completion acknowledges actual resource retirement, not just a teardown request. */
+    fun retire(completed: (Boolean) -> Unit) { completed(runCatching { destroy() }.isSuccess) }
 }
 interface LocalRecognizerFactory {
     fun available(): Boolean
@@ -71,7 +73,12 @@ class SharedDictationOwner(
     private var foreground = false
     private var closed = false
     private var session: LocalRecognizerSession? = null
+    private var sessionUtterance = 0L
     private var retired: LocalRecognizerSession? = null
+    private enum class Retirement { COMPLETE, PENDING, FAILED }
+    private var retirement = Retirement.COMPLETE
+    private var retirementAttempt = 0L
+    private var afterRetirement: ((Boolean) -> Unit)? = null
     private var lease: RecognitionResourceLease.Token? = null
     private var timeout: Runnable? = null
     private var prefix = ""
@@ -111,22 +118,27 @@ class SharedDictationOwner(
         val admission = admission@{
             if (ticket != epoch.get() || closed) { timing.finish(Stage.CANCELLED); return@admission }
             timing.mark(Stage.WORKER_STARTED)
-            if (!dispose(Stage.REPLACED)) { timing.finish(Stage.RETIREMENT_FAILED); publish(DictationState(phase = DictationPhase.ERROR, draft = draft, error = "recognition_cleanup_failed", utterance = ticket)); return@admission }
-            recognitionTiming = timing
-            prefix = draft.trim()
-            this.emptyNoMatchIsIdle = emptyNoMatchIsIdle && prefix.isEmpty()
-            recognizedWords = false
-            this.purpose = purpose
-            publish(DictationState(draft = draft, utterance = ticket))
-            if (ticket != epoch.get() || closed) return@admission
-            admittedConfiguration = configuration?.invoke()
-            admittedRecording = factory.recordingEnabled()
-            val locale = SpeechLocales.parse(admittedConfiguration?.selection?.language?.ifEmpty { language } ?: language)
-            when {
-                !foreground -> fail(ticket, "visible_activity_required")
-                !microphoneGranted() -> fail(ticket, "microphone_permission_required")
-                locale == null -> fail(ticket, "local_language_unavailable")
-                else -> admit(ticket, locale.toLanguageTag(), timing)
+            if (session != null || retired != null) publish(DictationState(phase = DictationPhase.CHECKING, draft = draft, utterance = ticket))
+            if (ticket != epoch.get() || closed) { timing.finish(Stage.CANCELLED); return@admission }
+            dispose(Stage.REPLACED) { cleaned ->
+                if (ticket != epoch.get() || closed) { timing.finish(Stage.CANCELLED); return@dispose }
+                if (!cleaned) { timing.finish(Stage.RETIREMENT_FAILED); publish(DictationState(phase = DictationPhase.ERROR, draft = draft, error = "recognition_cleanup_failed", utterance = ticket)); return@dispose }
+                recognitionTiming = timing
+                prefix = draft.trim()
+                this.emptyNoMatchIsIdle = emptyNoMatchIsIdle && prefix.isEmpty()
+                recognizedWords = false
+                this.purpose = purpose
+                publish(DictationState(draft = draft, utterance = ticket))
+                if (ticket != epoch.get() || closed) return@dispose
+                admittedConfiguration = configuration?.invoke()
+                admittedRecording = factory.recordingEnabled()
+                val locale = SpeechLocales.parse(admittedConfiguration?.selection?.language?.ifEmpty { language } ?: language)
+                when {
+                    !foreground -> fail(ticket, "visible_activity_required")
+                    !microphoneGranted() -> fail(ticket, "microphone_permission_required")
+                    locale == null -> fail(ticket, "local_language_unavailable")
+                    else -> admit(ticket, locale.toLanguageTag(), timing)
+                }
             }
         }
         // Ordinary dictation callers bind the returned utterance before receiving callbacks.
@@ -149,6 +161,7 @@ class SharedDictationOwner(
             val sdk = if (admitted != null) factory.createForEntry(purpose, language, admitted.networkFallback, timing, admittedRecording)
                 else factory.create(timing)
             session = sdk
+            sessionUtterance = ticket
             if (admittedRecording && !sdk.archiveExpected) { fail(ticket, "recorded_input_provider_unproven"); return }
             publish(state.copy(phase = DictationPhase.CHECKING, route = sdk.route, archiveExpected = sdk.archiveExpected))
             if (!current(ticket, sdk)) return
@@ -190,19 +203,23 @@ class SharedDictationOwner(
             val draft = joined(text)
             val recordedAudio = sdk.recordedAudio
             if (sdk.archiveExpected && recordedAudio == null) { fail(ticket, "recording_save_failed"); return@post }
-            val cleaned = dispose(Stage.SETTLED)
-            if (ticket != epoch.get() || closed) return@post
-            if (!cleaned) publish(state.copy(phase = DictationPhase.ERROR, draft = draft, error = "recognition_cleanup_failed", readyForSpeech = false))
-            else publish(DictationState(DictationPhase.FINAL, draft, utterance = ticket, route = state.route,
-                recordedAudio = recordedAudio, archiveExpected = sdk.archiveExpected))
+            publish(state.copy(phase = DictationPhase.FINISHING, readyForSpeech = false))
+            if (!current(ticket, sdk)) return@post
+            dispose(Stage.SETTLED) { cleaned ->
+                if (ticket != epoch.get() || closed) return@dispose
+                if (!cleaned) publish(state.copy(phase = DictationPhase.ERROR, draft = draft, error = "recognition_cleanup_failed", readyForSpeech = false))
+                else publish(DictationState(DictationPhase.FINAL, draft, utterance = ticket, route = state.route,
+                    recordedAudio = recordedAudio, archiveExpected = sdk.archiveExpected))
+            }
         } }
         override fun error(code: String) { main.post {
             if (!current(ticket, sdk)) return@post
             if (code == "recognition_error_7" && emptyNoMatchIsIdle && !recognizedWords) {
-                val cleaned = dispose(Stage.SETTLED)
-                if (ticket != epoch.get() || closed) return@post
-                publish(state.copy(phase = if (cleaned) DictationPhase.IDLE else DictationPhase.ERROR,
-                    error = if (cleaned) null else "recognition_cleanup_failed", diagnosticError = code, endedWithoutSpeech = cleaned, readyForSpeech = false))
+                dispose(Stage.SETTLED) { cleaned ->
+                    if (ticket != epoch.get() || closed) return@dispose
+                    publish(state.copy(phase = if (cleaned) DictationPhase.IDLE else DictationPhase.ERROR,
+                        error = if (cleaned) null else "recognition_cleanup_failed", diagnosticError = code, endedWithoutSpeech = cleaned, readyForSpeech = false))
+                }
             } else fail(ticket, code)
         } }
     }
@@ -222,44 +239,80 @@ class SharedDictationOwner(
     }
     private fun fail(ticket: Long, code: String) {
         if (ticket != epoch.get()) return
-        val cleaned = dispose(Stage.FAILED)
-        if (ticket != epoch.get() || closed) return
-        publish(state.copy(phase = DictationPhase.ERROR, error = if (cleaned) code else "recognition_cleanup_failed", diagnosticError = code, readyForSpeech = false))
+        dispose(Stage.FAILED) { cleaned ->
+            if (ticket != epoch.get() || closed) return@dispose
+            publish(state.copy(phase = DictationPhase.ERROR, error = if (cleaned) code else "recognition_cleanup_failed", diagnosticError = code, readyForSpeech = false))
+        }
     }
     private fun retireProjection() {
-        val cleaned = dispose()
-        publish(state.copy(phase = if (cleaned) DictationPhase.IDLE else DictationPhase.ERROR,
-            error = if (cleaned) null else "recognition_cleanup_failed", endedWithoutSpeech = false, readyForSpeech = false))
+        val ticket = epoch.get()
+        if (session != null || retired != null) publish(state.copy(phase = DictationPhase.FINISHING, readyForSpeech = false))
+        if (ticket != epoch.get()) return
+        dispose { cleaned ->
+            if (ticket != epoch.get()) return@dispose
+            publish(state.copy(phase = if (cleaned) DictationPhase.IDLE else DictationPhase.ERROR,
+                error = if (cleaned) null else "recognition_cleanup_failed", endedWithoutSpeech = false, readyForSpeech = false))
+        }
     }
-    private fun dispose(outcome: Stage = Stage.CANCELLED): Boolean {
-        val terminalOutcome = retirementOutcome ?: outcome
-        val timing = recognitionTiming; recognitionTiming = null
+    private fun dispose(outcome: Stage = Stage.CANCELLED, completed: (Boolean) -> Unit = {}) {
+        afterRetirement = completed
         timeout?.let(main::removeCallbacks); timeout = null
-        session?.let { state = state.copy(route = it.route, recordedAudio = it.recordedAudio ?: state.recordedAudio) }
-        val sdk = session ?: retired; session = null; retired = null
-        if (sdk != null) {
-            timing?.mark(Stage.RETIREMENT_STARTED)
-            runCatching { sdk.cancel() }
-            if (runCatching { sdk.destroy() }.isFailure) {
+        if (outcome != Stage.REPLACED && state.utterance == sessionUtterance) {
+            session?.let { state = state.copy(route = it.route, recordedAudio = it.recordedAudio ?: state.recordedAudio) }
+        }
+        if (retirement == Retirement.PENDING) return
+        val sdk = session ?: retired
+        session = null
+        retired = sdk
+        retirementOutcome = retirementOutcome ?: outcome
+        if (sdk == null) {
+            val owned = lease; lease = null
+            recognitionTiming?.finish(retirementOutcome!!); recognitionTiming = null
+            retirementOutcome = null
+            retirement = Retirement.COMPLETE
+            val continuation = afterRetirement; afterRetirement = null
+            owned?.close()
+            continuation?.invoke(true)
+            return
+        }
+        val timing = recognitionTiming
+        val owned = lease
+        retirement = Retirement.PENDING
+        val attempt = ++retirementAttempt
+        timing?.mark(Stage.RETIREMENT_STARTED)
+        publish(state.copy(phase = if (state.phase == DictationPhase.CHECKING) DictationPhase.CHECKING else DictationPhase.FINISHING,
+            readyForSpeech = false))
+        fun finish(success: Boolean) { onMain {
+            if (retired !== sdk || lease !== owned || retirementAttempt != attempt || retirement != Retirement.PENDING) return@onMain
+            val continuation = afterRetirement; afterRetirement = null
+            if (!success) {
+                retirement = Retirement.FAILED
                 timing?.mark(Stage.RETIREMENT_FAILED)
-                // The existing retained SDK/lease owns this span until retirement really succeeds.
-                recognitionTiming = timing
-                retirementOutcome = if (terminalOutcome == Stage.SETTLED) Stage.FAILED else terminalOutcome
-                retired = sdk
-                val owned = lease
+                if (retirementOutcome == Stage.SETTLED) retirementOutcome = Stage.FAILED
                 owned?.onRetirementRetry {
                     retryRetirementOnMain(main) {
-                        if (retired !== sdk || lease !== owned || session != null) false else dispose()
+                        if (retired !== sdk || lease !== owned || session != null || retirement == Retirement.PENDING) false else {
+                            dispose()
+                            retirement == Retirement.COMPLETE
+                        }
                     }
                 }
-                return false
+            } else {
+                retired = null
+                retirement = Retirement.COMPLETE
+                // Detach first: lease observers may synchronously admit a successor.
+                lease = null
+                recognitionTiming = null
+                val terminalOutcome = retirementOutcome ?: outcome
+                retirementOutcome = null
+                timing?.mark(Stage.SESSION_RETIRED)
+                timing?.finish(terminalOutcome)
+                owned?.close()
             }
-        }
-        lease?.close(); lease = null
-        retirementOutcome = null
-        if (sdk != null) timing?.mark(Stage.SESSION_RETIRED)
-        timing?.finish(terminalOutcome)
-        return true
+            continuation?.invoke(success)
+        } }
+        runCatching { sdk.cancel() }
+        try { sdk.retire(::finish) } catch (_: RuntimeException) { finish(false) }
     }
     private fun publish(value: DictationState) { state = value; observers.forEach { it(value) } }
     override fun close() {

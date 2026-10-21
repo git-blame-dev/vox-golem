@@ -20,6 +20,7 @@ import java.util.Locale
 class ConversationLoopControllerTest {
     private class Recognition : LocalRecognizerFactory {
         var delaySupport = false
+        var delayRetirement = false
         val sessions = mutableListOf<Session>()
         override fun available() = true
         override fun create() = Session().also { sessions += it }
@@ -29,6 +30,10 @@ class ConversationLoopControllerTest {
             var starts = 0
             var stops = 0
             var destroyed = false
+            var retirement: ((Boolean) -> Unit)? = null
+            override fun retire(completed: (Boolean) -> Unit) {
+                if (delayRetirement) retirement = completed else { destroy(); completed(true) }
+            }
             override fun checkLanguage(language: String, result: (Boolean) -> Unit) { support = result; if (!delaySupport) result(true) }
             override fun start(language: String, events: LocalRecognizerEvents) { this.events = events; starts++ }
             override fun stop() { stops++ }
@@ -44,8 +49,13 @@ class ConversationLoopControllerTest {
         var prewarms = 0
         var stops = 0
         var currentDraft = ""
-        override fun setDraft(text: String) { draftWrites += text; currentDraft = text }
-        override fun prewarm() { prewarms++ }
+        var selectedContext = "synthetic-context-a"
+        var capturedContext = ""
+        val contextualWrites = mutableListOf<Pair<String, String>>()
+        val contextualPrewarms = mutableListOf<String>()
+        override fun beginInput() { capturedContext = selectedContext }
+        override fun setDraft(text: String) { contextualWrites += capturedContext to text; draftWrites += text; currentDraft = text }
+        override fun prewarm() { contextualPrewarms += capturedContext; prewarms++ }
         override fun observeStreamText(listener: (String) -> Unit): AutoCloseable {
             streamListener = listener
             return AutoCloseable { if (streamListener === listener) streamListener = null }
@@ -85,6 +95,46 @@ class ConversationLoopControllerTest {
     private val loop = ConversationLoopController(dictation, output, engine)
     private fun drain() = shadowOf(Looper.getMainLooper()).idle()
     private fun start(ttsEnabled: Boolean = false) { loop.setForeground(true); output.setEnabled(ttsEnabled); loop.start("en-US"); drain() }
+
+    @Test fun pendingReplacementCannotProjectPersistOrPrewarmOldPartialInNewContextEvenOnStop() {
+        for (replacement in listOf("Distinct synthetic B draft", "")) {
+            val recognition = Recognition().apply { delayRetirement = true }
+            val leases = RecognitionResourceLease()
+            val dictation = SharedDictationOwner(recognition, { true }, leases)
+            val output = LocalSpeechOutput(Tts(), object : SpeechAudioFocus {
+                override fun acquire(onLoss: () -> Unit) = true
+                override fun release() {}
+            }, leases = leases)
+            val engine = Engine()
+            val loop = ConversationLoopController(dictation, output, engine)
+            val projections = mutableListOf<Pair<String, String>>()
+            val subscription = loop.subscribe { projections += engine.capturedContext to it.draft }
+            loop.setForeground(true); loop.start("en-US"); drain()
+            val old = recognition.sessions.single()
+            old.events.partial("Synthetic A partial"); drain()
+            assertEquals("Synthetic A partial", loop.snapshot().draft)
+            assertTrue(engine.contextualWrites.contains("synthetic-context-a" to "Synthetic A partial"))
+            engine.selectedContext = "synthetic-context-b"
+            engine.currentDraft = replacement
+            loop.start("en-US", replacement); drain()
+            assertEquals(1, recognition.sessions.size)
+            assertNotNull(leases.current())
+            assertEquals(replacement, loop.snapshot().draft)
+            assertTrue(engine.contextualWrites.none { it.first == "synthetic-context-b" })
+            assertFalse(engine.contextualPrewarms.contains("synthetic-context-b"))
+            assertTrue(projections.filter { it.first == "synthetic-context-b" }.all { it.second == replacement })
+            loop.stop(); drain()
+            old.events.final("Queued synthetic A final"); drain()
+            old.retirement!!(true); drain()
+            assertEquals(replacement, loop.snapshot().draft)
+            assertTrue(engine.contextualWrites.none { it.first == "synthetic-context-b" })
+            assertFalse(engine.contextualPrewarms.contains("synthetic-context-b"))
+            assertTrue(projections.filter { it.first == "synthetic-context-b" }.all { it.second == replacement })
+            assertTrue(engine.sent.isEmpty())
+            assertEquals(1, recognition.sessions.size)
+            subscription.close(); loop.close(); dictation.close(); output.close(); drain()
+        }
+    }
 
     @Test fun voiceFlowCorrelatesItsTurnAndRecognitionWithoutCouplingSpanRetirement() {
         val context = org.robolectric.RuntimeEnvironment.getApplication()

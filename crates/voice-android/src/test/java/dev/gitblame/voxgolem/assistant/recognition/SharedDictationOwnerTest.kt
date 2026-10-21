@@ -28,6 +28,8 @@ class SharedDictationOwnerTest {
         var supported = true
         var route: RecognitionRoute? = null
         var onCheck: (() -> Unit)? = null
+        var asynchronousRetirement = false
+        var audio: RecordedAudioResult? = null
         val policies = mutableListOf<Boolean>()
         val sessions = mutableListOf<Session>()
         val timings = mutableListOf<AssistantTiming>()
@@ -40,6 +42,8 @@ class SharedDictationOwnerTest {
         }
         inner class Session : LocalRecognizerSession {
             override val route: RecognitionRoute? get() = this@Factory.route
+            override val recordedAudio: RecordedAudioResult? get() = audio
+            override val archiveExpected: Boolean get() = audio != null
             lateinit var events: LocalRecognizerEvents
             var started = false
             var destroyed = false
@@ -48,6 +52,11 @@ class SharedDictationOwnerTest {
             var destroyCalls = 0
             var beforeDestroy: (() -> Unit)? = null
             var stops = 0
+            var retirement: ((Boolean) -> Unit)? = null
+            override fun retire(completed: (Boolean) -> Unit) {
+                if (asynchronousRetirement) retirement = completed
+                else completed(runCatching { destroy() }.isSuccess)
+            }
             var checkedLanguage = ""
             var startedLanguage = ""
             override fun checkLanguage(language: String, result: (Boolean) -> Unit) { checkedLanguage = language; onCheck?.invoke(); result(supported) }
@@ -67,6 +76,148 @@ class SharedDictationOwnerTest {
     private var permission = true
     private val owner = SharedDictationOwner(factory, { permission }, leases)
     private fun drain() = shadowOf(Looper.getMainLooper()).idle()
+
+    @Test fun pendingReplacementProjectsOnlyRequestedDraftAndNewIdentityBeforeRetirement() {
+        for (draft in listOf("Distinct synthetic B", "")) for (finishOld in listOf(false, true)) {
+            val factory = Factory().apply {
+                asynchronousRetirement = true
+                route = RecognitionRoute("synthetic.provider", "en-US")
+                audio = RecordedAudioResult("synthetic-capture-a", "synthetic-sha-a", 12L)
+            }
+            val leases = RecognitionResourceLease()
+            val owner = SharedDictationOwner(factory, { true }, leases)
+            owner.setForeground(true); owner.start("en-US"); drain()
+            val old = factory.sessions.single()
+            old.events.ready(); old.events.partial("Synthetic A words"); drain()
+            if (finishOld) { old.events.final("Queued synthetic A final"); drain() }
+            val token = leases.current()
+            val ticket = owner.start("en-US", draft); drain()
+            assertEquals(DictationState(phase = DictationPhase.CHECKING, draft = draft, utterance = ticket), owner.snapshot())
+            assertSame(token, leases.current())
+            assertEquals(1, factory.creates)
+            owner.stop(); drain()
+            old.events.final("Stale synthetic A final"); drain()
+            old.retirement!!(true); drain()
+            assertEquals(draft, owner.snapshot().draft)
+            assertNull(owner.snapshot().recordedAudio)
+            assertNull(owner.snapshot().route)
+            assertFalse(owner.snapshot().archiveExpected)
+            assertEquals(DictationPhase.IDLE, owner.snapshot().phase)
+            assertEquals(1, factory.creates)
+            owner.close(); drain()
+        }
+    }
+
+    @Test fun pendingReplacementClearsPreviousRetirementErrorBeforeRetryCompletes() {
+        factory.asynchronousRetirement = true
+        owner.setForeground(true); owner.start("en-US"); drain()
+        val old = factory.sessions.single()
+        old.events.error("synthetic_old_error"); drain()
+        old.retirement!!(false); drain()
+        assertEquals("recognition_cleanup_failed", owner.snapshot().error)
+        assertEquals("synthetic_old_error", owner.snapshot().diagnosticError)
+        val ticket = owner.start("en-US", "Synthetic new draft"); drain()
+        assertEquals(DictationState(phase = DictationPhase.CHECKING, draft = "Synthetic new draft", utterance = ticket), owner.snapshot())
+        owner.stop(); old.retirement!!(true); drain()
+        assertNull(owner.snapshot().error)
+        assertNull(owner.snapshot().diagnosticError)
+    }
+
+    @Test fun reentrantStopAtReplacementProjectionCannotRestoreOldSessionMetadata() {
+        factory.asynchronousRetirement = true
+        factory.route = RecognitionRoute("synthetic.provider", "en-US")
+        factory.audio = RecordedAudioResult("synthetic-old-capture", "synthetic-old-sha", 10L)
+        owner.setForeground(true); owner.start("en-US"); drain()
+        val old = factory.sessions.single()
+        val subscription = owner.subscribe {
+            if (it.phase == DictationPhase.CHECKING && it.draft == "Synthetic B") owner.stop()
+        }
+        drain()
+        val ticket = owner.start("en-US", "Synthetic B"); drain()
+        assertEquals(DictationState(phase = DictationPhase.FINISHING, draft = "Synthetic B", utterance = ticket), owner.snapshot())
+        old.retirement!!(true); drain()
+        assertNull(owner.snapshot().recordedAudio)
+        assertNull(owner.snapshot().route)
+        assertEquals("Synthetic B", owner.snapshot().draft)
+        subscription.close(); owner.close(); drain()
+    }
+
+    @Test fun finalWaitsForActualRetirementAndKeepsLease() {
+        factory.asynchronousRetirement = true
+        owner.setForeground(true); owner.start("en-US"); drain()
+        val sdk = factory.sessions.single()
+        sdk.events.final("Synthetic answer"); drain()
+        assertEquals(DictationPhase.FINISHING, owner.snapshot().phase)
+        assertNotNull(leases.current())
+        sdk.retirement!!(true); drain()
+        assertEquals(DictationPhase.FINAL, owner.snapshot().phase)
+        assertNull(leases.current())
+    }
+
+    @Test fun asynchronousFailureRetainsExactOwnerUntilExplicitRetryCompletes() {
+        factory.asynchronousRetirement = true
+        owner.setForeground(true); owner.start("en-US"); drain()
+        val sdk = factory.sessions.single()
+        owner.stop()
+        val token = leases.current()
+        sdk.retirement!!(false); drain()
+        assertEquals("recognition_cleanup_failed", owner.snapshot().error)
+        assertSame(token, leases.current())
+        assertFalse(leases.retryFailedRetirement())
+        assertSame(token, leases.current())
+        sdk.retirement!!(true); drain()
+        assertNull(leases.current())
+        assertEquals(1, factory.creates)
+    }
+
+    @Test fun externalRetryCannotDropExplicitPendingReplacementAndOldAttemptIsFenced() {
+        factory.asynchronousRetirement = true
+        owner.setForeground(true); owner.start("en-US"); drain()
+        val sdk = factory.sessions.single()
+        owner.stop()
+        val firstAttempt = sdk.retirement!!
+        firstAttempt(false); drain()
+        owner.start("en-US", "Latest synthetic draft"); drain()
+        val retry = sdk.retirement!!
+        assertFalse(leases.retryFailedRetirement())
+        firstAttempt(true); drain()
+        assertEquals(1, factory.creates)
+        assertNotNull(leases.current())
+        retry(true); drain()
+        assertEquals(2, factory.creates)
+        assertEquals("Latest synthetic draft", owner.snapshot().draft)
+    }
+
+    @Test fun replacementRechecksPermissionAfterPendingRetirement() {
+        factory.asynchronousRetirement = true
+        owner.setForeground(true); owner.start("en-US"); drain()
+        val sdk = factory.sessions.single()
+        owner.start("en-US"); drain()
+        permission = false
+        sdk.retirement!!(true); drain()
+        assertEquals(1, factory.creates)
+        assertEquals("microphone_permission_required", owner.snapshot().error)
+        assertNull(leases.current())
+    }
+
+    @Test fun explicitReplacementWaitsAndStaleCompletionCannotRetireNewOwner() {
+        factory.asynchronousRetirement = true
+        owner.setForeground(true); owner.start("en-US"); drain()
+        val old = factory.sessions.single()
+        old.events.final("Discard this synthetic final"); drain()
+        owner.stop()
+        owner.start("en-US", "Replacement"); drain()
+        assertEquals(1, factory.creates)
+        val complete = old.retirement!!
+        complete(true); drain()
+        assertEquals(2, factory.creates)
+        assertEquals(DictationPhase.LISTENING, owner.snapshot().phase)
+        assertEquals("Replacement", owner.snapshot().draft)
+        val token = leases.current()
+        complete(true); drain()
+        assertSame(token, leases.current())
+        assertFalse(factory.sessions.last().destroyed)
+    }
 
     @Test fun mainThreadStartAdmitsInlineAndStopCannotRetireTheReplacementLater() {
         owner.setForeground(true)
