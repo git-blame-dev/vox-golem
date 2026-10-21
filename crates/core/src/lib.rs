@@ -10,6 +10,7 @@ pub mod durable_conversation;
 pub mod external_correlation;
 pub mod ipc;
 pub mod model_catalog;
+pub mod reply_speech;
 pub mod response_style;
 pub mod runtime;
 pub mod search;
