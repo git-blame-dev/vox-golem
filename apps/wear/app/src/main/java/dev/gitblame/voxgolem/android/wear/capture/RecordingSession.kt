@@ -96,7 +96,8 @@ internal class RecordingSession(private val service: CaptureService, private val
                 return
             }
         bindCaptureLifetime(created.captureId)
-        val requiredBytes = sampleRate.toLong() * 2 * MAX_CAPTURE_MS / 1_000 + STORAGE_OVERHEAD_BYTES
+        val requiredBytes = dev.gitblame.voxgolem.capture.CaptureStoragePolicy.peakBytes(
+            dev.gitblame.voxgolem.capture.CaptureFormat(sampleRate), MAX_CAPTURE_MS)
         CaptureStartupTiming.bind(created.captureId)
         if (service.filesDir.usableSpace < requiredBytes) {
             failStart(created, "storage", "insufficient-space", "Insufficient free storage"); return
@@ -356,7 +357,6 @@ internal class RecordingSession(private val service: CaptureService, private val
         const val MAX_CAPTURE_MS = CaptureService.MAX_CAPTURE_MS
         private const val CHECKPOINT_MS = 1_000L
         private const val WARNING_BEFORE_LIMIT_MS = 60_000L
-        private const val STORAGE_OVERHEAD_BYTES = 4L * 1024 * 1024
         private const val CHANNEL = android.media.AudioFormat.CHANNEL_IN_MONO
         private const val ENCODING = android.media.AudioFormat.ENCODING_PCM_16BIT
     }

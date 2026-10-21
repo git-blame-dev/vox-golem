@@ -19,8 +19,10 @@ define the API. UTC timestamps use ISO-8601; `finishedLocalDate` is `yyyy-MM-dd`
 Public capture-history responses are not canonical persistence JSON: they include
 display duration, nullable transcript/audio/error fields and enum names, but omit
 private spool paths, audio hashes, recognition session IDs and export recovery data.
-No schema, database version, preference key or data migration changes accompany the
-phone ownership extraction.
+The capture record and wire schemas remain version1. The private repository database
+uses an additive version2 migration for indexed eligible-work projections and durable
+archive handoff. Existing records, legacy defaults and phone-local origin bindings are
+preserved; database version and capture-record schema version are separate contracts.
 
 ## Phone ownership
 
@@ -32,8 +34,9 @@ phone ownership extraction.
 - [PhoneCaptureDelivery](android/src/main/java/dev/gitblame/voxgolem/capture/PhoneCaptureDelivery.kt)
   owns wire encoding, transcript revision coalescing, separate live-message and
    receipt executors, and oversized exact-node receipt channels. Publishing follows coordinator
-  persistence. Empty or unsendable hypotheses do not suppress a deliverable preview;
-  final messages are not dropped by partial coalescing.
+  persistence. Replaceable live projections use bounded keyed/byte admission rather
+  than an unbounded runnable queue. Final authority remains persisted and recoverable
+  through authenticated receipts; transient queue admission is not delivery evidence.
 - [PhoneCaptureArchive](android/src/main/java/dev/gitblame/voxgolem/capture/PhoneCaptureArchive.kt)
   owns archive deduplication and the serial archive/export lane, using canonical
   repository rows rather than another record cache. Verified read-back is required
@@ -152,9 +155,10 @@ persistent oversized DataItem route is intentionally no longer emitted or consum
 updated phone and Wear builds are required together for oversized completions.
 Existing global DataItems created by older installations are not retroactively
 made private or deleted by this change. Ordinary status retry can request a fresh
-exact-node receipt only for an authorized bound origin. Canonical records and the
-database version remain unchanged; the private origin table is added lazily without
-backfilling older rows. No audio capability or credential transfer is introduced.
+exact-node receipt only for an authorized bound origin. Canonical record/wire schemas
+remain unchanged. The repository's additive database migration preserves the private
+origin table without guessing associations for older rows. No audio capability or
+credential transfer is introduced.
 
 Projected and peer-visible diagnostic codes use the shared fixed allowlist, not
 exception messages, URI/path values, or exception class names. Unknown historical
@@ -177,7 +181,9 @@ writes are acknowledged only after matching capture/destination/version/phase,
 provider tree membership, owned recovery images, lengths, entry and current
 postimage hash; acknowledgment is metadata-only. Unwritten preimages and unsafe
 or unknown outcomes remain held. Already-exported corrections do not rewrite or
-duplicate the exported entry; interrupted audio requires explicit finalization.
+duplicate the exported entry; recognition and written-note export of interrupted audio
+require explicit finalization. Verified interrupted Note audio can be archived and its
+archive retried independently, without promoting the recording to SAVED.
 
 ### Manual transcript correction
 

@@ -24,7 +24,8 @@ class CaptureTransferJobTest {
         val shared = CaptureRepository(context)
         val oldId = "123e4567-e89b-42d3-a456-426614174050"
         shared.save(CaptureRecord(captureId = oldId, createdAtUtc = "2026-01-01T00:00:00Z",
-            captureState = CaptureState.SAVED, transferState = TransferState.PENDING, localAudioPath = "/synthetic/audio.wav"))
+            captureState = CaptureState.SAVED, transferState = TransferState.PENDING, localAudioPath = "/synthetic/audio.wav",
+            finalizedByteLength = 48, durableFrames = 2, sha256 = "a".repeat(64)))
         repeat(501) { index -> shared.save(CaptureRecord(
             captureId = java.util.UUID.randomUUID().toString(),
             createdAtUtc = Instant.parse("2026-01-02T00:00:00Z").plusSeconds(index.toLong()).toString(),
@@ -33,6 +34,7 @@ class CaptureTransferJobTest {
         val watch = dev.gitblame.voxgolem.android.wear.capture.CaptureRepository(context)
         assertTrue(watch.records().none { it.captureId == oldId })
         assertTrue(watch.pendingTransfers().any { it.captureId == oldId })
+        assertEquals(listOf(oldId), watch.dueTransfers(Instant.now().toEpochMilli()).map { it.captureId })
         CaptureTransferJob.schedule(context)
         assertTrue(context.getSystemService(JobScheduler::class.java).allPendingJobs.isNotEmpty())
     }
@@ -65,6 +67,7 @@ class CaptureTransferJobTest {
             captureState = CaptureState.SAVED,
             transferState = TransferState.SENDING,
             localAudioPath = "/synthetic/audio.wav",
+            finalizedByteLength = 48, durableFrames = 2, sha256 = "a".repeat(64),
             nextRetryAtUtc = Instant.now().plusSeconds(30).toString(),
         ))
 
@@ -73,6 +76,8 @@ class CaptureTransferJobTest {
         val job = scheduler.allPendingJobs.single()
         assertTrue(job.isPersisted)
         assertTrue(job.minLatencyMillis in 25_000L..30_000L)
+        assertTrue(repository.dueNoteTransfers(System.currentTimeMillis()).isEmpty())
+        assertEquals(listOf(id), repository.dueNoteTransfers(Instant.now().plusSeconds(31).toEpochMilli()).map { it.captureId })
 
         repository.update(id) { it.copy(transferState = TransferState.PHONE_ARCHIVED, completionNotified = true) }
         CaptureTransferJob.schedule(context)
@@ -212,6 +217,7 @@ class CaptureTransferJobTest {
             captureId = UUID.randomUUID().toString(), createdAtUtc = at.plusSeconds(offset).toString(),
             captureState = CaptureState.SAVED, transferState = TransferState.PHONE_ARCHIVED,
             localAudioPath = "/synthetic/$offset/audio.wav",
+            finalizedByteLength = 48, durableFrames = 2, sha256 = "a".repeat(64),
         ))
         val completed = saved(0)
         val noSpeech = saved(1)
@@ -220,6 +226,7 @@ class CaptureTransferJobTest {
         shared.update(noSpeech.captureId) { it.copy(recognitionState = dev.gitblame.voxgolem.capture.RecognitionState.NO_SPEECH) }
         val watch = dev.gitblame.voxgolem.android.wear.capture.CaptureRepository(context)
         assertEquals(listOf(stillWaiting.captureId), watch.pendingTransfers().map { it.captureId })
+        assertEquals(listOf(stillWaiting.captureId), watch.dueTransfers(at.toEpochMilli()).map { it.captureId })
         CaptureTransferJob.schedule(context, immediate = true)
         assertEquals(0L, context.getSystemService(JobScheduler::class.java).allPendingJobs.single().minLatencyMillis)
         assertTrue(shared.get(completed.captureId)!!.completionNotified)

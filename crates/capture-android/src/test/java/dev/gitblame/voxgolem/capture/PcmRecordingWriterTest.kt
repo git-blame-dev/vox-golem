@@ -8,6 +8,30 @@ import java.nio.file.Files
 import java.security.MessageDigest
 
 class PcmRecordingWriterTest {
+    @Test fun failedWavCreationPreservesCheckpointedPcmForRetry() {
+        val directory = Files.createTempDirectory("capture-writer-test").toFile()
+        try {
+            val spool = File(directory, "audio.pcm.part")
+            val blockedParent = File(directory, "synthetic-blocked-parent").apply { writeText("synthetic") }
+            val pcm = byteArrayOf(1, 2, 3, 4)
+            PcmRecordingWriter(spool, CaptureFormat()).use { writer ->
+                writer.append(pcm)
+                assertEquals(PcmCheckpoint(4, 2), writer.checkpoint())
+                assertThrows(java.io.IOException::class.java) {
+                    writer.finish(File(blockedParent, "audio.wav"), "123e4567-e89b-42d3-a456-426614174000")
+                }
+            }
+            assertEquals(pcm.toList(), spool.readBytes().toList())
+            val wav = File(directory, "audio.wav")
+            val manifest = PcmRecordingWriter(spool, CaptureFormat()).use {
+                it.finish(wav, "123e4567-e89b-42d3-a456-426614174000")
+            }
+            assertEquals(48L, manifest.wavByteLength)
+            // WAV publication does not authorize retiring PCM before the caller's metadata commit.
+            assertEquals(pcm.toList(), spool.readBytes().toList())
+        } finally { directory.deleteRecursively() }
+    }
+
     @Test
     fun appendsCheckpointsAndFinalizesValidWavWithExactPcmAndHash() {
         val directory = Files.createTempDirectory("capture-writer-test").toFile()

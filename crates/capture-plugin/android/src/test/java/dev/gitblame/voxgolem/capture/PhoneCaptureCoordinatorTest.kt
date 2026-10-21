@@ -83,6 +83,107 @@ class PhoneCaptureCoordinatorTest {
         coordinator.shutdownForTests()
     }
 
+    @Test fun coalescedDiscoverySurvivesBlockedAdmissionFloodAndAdvancesPastMultipleFailingPages() {
+        val wav = writeWav(byteArrayOf(1, 2, 3, 4))
+        val failedIds = (0 until 40).map { "123e4567-e89b-42d3-a456-${it.toString().padStart(12, '0')}" }
+        failedIds.forEachIndexed { index, id ->
+            savePeerFixture(savedRecord(wav, CaptureState.SAVED, RecognitionState.QUEUED).copy(
+                captureId = id, localAudioPath = "/synthetic/missing-$index.wav"))
+        }
+        val validId = "123e4567-e89b-42d3-a456-999999999999"
+        savePeerFixture(savedRecord(wav, CaptureState.SAVED, RecognitionState.QUEUED).copy(captureId = validId))
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val started = CountDownLatch(1)
+        val validations = java.util.concurrent.atomic.AtomicInteger()
+        coordinator.beforeReplayValidation = {
+            if (validations.getAndIncrement() == 0) {
+                entered.countDown(); check(release.await(5, TimeUnit.SECONDS))
+            }
+        }
+        speech.onStart = { started.countDown() }
+        try {
+            coordinator.retryPendingCaptures()
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            repeat(1_000) { coordinator.retryPendingCaptures() }
+            assertEquals(1, validations.get())
+            assertEquals(0, speech.startCount)
+            release.countDown()
+            assertTrue("Older failing pages stranded later eligible work", started.await(5, TimeUnit.SECONDS))
+            assertEquals(1, speech.startCount)
+            assertEquals(RecognitionState.RUNNING, repository.get(validId)!!.recognitionState)
+            failedIds.forEach { id ->
+                val failed = repository.get(id)!!
+                assertEquals(RecognitionState.FAILED, failed.recognitionState)
+                assertEquals(0, failed.retryCount) // Preflight failures are not SDK attempts.
+                assertTrue(java.time.Instant.parse(failed.nextRetryAtUtc).isAfter(java.time.Instant.now()))
+            }
+        } finally { release.countDown() }
+    }
+
+    @Test fun asynchronousDiscoveryExceptionBacksOffInsteadOfSpinningAndRecoversValidWork() {
+        savePeerFixture(savedRecord(writeWav(byteArrayOf(1, 2, 3, 4)), CaptureState.SAVED, RecognitionState.QUEUED))
+        val first = CountDownLatch(1)
+        val retry = CountDownLatch(1)
+        val started = CountDownLatch(1)
+        val calls = java.util.concurrent.atomic.AtomicInteger()
+        coordinator.beforeRecognitionDiscovery = {
+            if (calls.incrementAndGet() == 1) { first.countDown(); throw IllegalStateException("synthetic discovery failure") }
+            retry.countDown()
+        }
+        speech.onStart = { started.countDown() }
+        coordinator.retryPendingCaptures()
+        assertTrue(first.await(2, TimeUnit.SECONDS))
+        assertFalse("Discovery retried without its failure floor", retry.await(200, TimeUnit.MILLISECONDS))
+        assertTrue(started.await(3, TimeUnit.SECONDS))
+        assertEquals(2, calls.get())
+        assertEquals(1, speech.startCount)
+    }
+
+    @Test fun malformedFirstEligibleBodyDoesNotSpinOrPreventValidRecognitionAdmission() {
+        val wav = writeWav(byteArrayOf(1, 2, 3, 4))
+        val badId = "123e4567-e89b-42d3-a456-000000000000"
+        savePeerFixture(savedRecord(wav, CaptureState.SAVED, RecognitionState.QUEUED).copy(captureId = badId))
+        savePeerFixture(savedRecord(wav, CaptureState.SAVED, RecognitionState.QUEUED))
+        context.openOrCreateDatabase("captures.db", 0, null).use {
+            it.execSQL("UPDATE captures SET body = ? WHERE capture_id = ?", arrayOf("{synthetic-malformed", badId))
+        }
+        val discovered = java.util.concurrent.atomic.AtomicInteger()
+        coordinator.beforeRecognitionDiscovery = { discovered.incrementAndGet() }
+        val started = CountDownLatch(1)
+        speech.onStart = { started.countDown() }
+        val before = System.currentTimeMillis()
+        coordinator.retryPendingCaptures()
+        assertTrue(started.await(3, TimeUnit.SECONDS))
+        assertTrue(coordinator.awaitIdle())
+        assertEquals(1, discovered.get())
+        assertEquals(1, speech.startCount)
+        context.openOrCreateDatabase("captures.db", 0, null).use { db ->
+            db.rawQuery("SELECT body, recognition_due FROM captures WHERE capture_id = ?", arrayOf(badId)).use {
+                assertTrue(it.moveToFirst())
+                assertEquals("{synthetic-malformed", it.getString(0))
+                assertTrue(it.getLong(1) >= before + 60_000L)
+            }
+        }
+    }
+
+    @Test fun identifiableValidationExceptionMovesAsideWithoutConsumingAttemptsOrStarvingNextRecord() {
+        val wav = writeWav(byteArrayOf(1, 2, 3, 4))
+        val badId = "123e4567-e89b-42d3-a456-000000000000"
+        savePeerFixture(savedRecord(wav, CaptureState.SAVED, RecognitionState.QUEUED).copy(captureId = badId))
+        savePeerFixture(savedRecord(wav, CaptureState.SAVED, RecognitionState.QUEUED))
+        val calls = java.util.concurrent.atomic.AtomicInteger()
+        val started = CountDownLatch(1)
+        coordinator.beforeReplayValidation = { if (calls.incrementAndGet() == 1) throw IllegalStateException("synthetic validation failure") }
+        speech.onStart = { started.countDown() }
+        coordinator.retryPendingCaptures()
+        assertTrue(started.await(3, TimeUnit.SECONDS))
+        assertEquals("recognition-work-discovery-failed", repository.get(badId)!!.lastErrorCode)
+        assertEquals(0, repository.get(badId)!!.retryCount)
+        assertTrue(java.time.Instant.parse(repository.get(badId)!!.nextRetryAtUtc).isAfter(java.time.Instant.now()))
+        assertEquals(RecognitionState.RUNNING, repository.get(captureId)!!.recognitionState)
+    }
+
     @Test
     fun foregroundRuntimeRequiresTheExplicitVisibleSetupAction() {
         assertEquals("setup-required", coordinator.start().state)
@@ -988,11 +1089,15 @@ class PhoneCaptureCoordinatorTest {
         coordinator.respondStatus(captureId, "synthetic-node")
         repeat(2) { assertTrue(coordinator.awaitIdle()) }
 
-        assertEquals(1, oversizedReceipts.size)
-        val receipt = JSONObject(String(oversizedReceipts.single(), Charsets.UTF_8))
-        assertEquals(text, receipt.getString("finalText"))
-        assertEquals("FINAL", receipt.getString("recognitionState"))
-        assertTrue(CaptureProtocol.validatePayloadSize(oversizedReceipts.single().size, channelResult = true))
+        assertEquals(2, oversizedReceipts.size)
+        val stages = oversizedReceipts.map { bytes ->
+            val receipt = JSONObject(String(bytes, Charsets.UTF_8))
+            assertEquals(text, receipt.getString("finalText"))
+            assertEquals("FINAL", receipt.getString("recognitionState"))
+            assertTrue(CaptureProtocol.validatePayloadSize(bytes.size, channelResult = true))
+            receipt.getString("stage")
+        }
+        assertEquals(setOf("PHONE_STAGED", "PHONE_ARCHIVED"), stages.toSet())
         assertTrue(receipts.none { it.optString("errorCode") == "transcript-not-sent-exceeds-message-limit" })
     }
 
@@ -1528,7 +1633,7 @@ class PhoneCaptureCoordinatorTest {
         assertEquals(RecognitionState.QUEUED, repository.get(captureId)?.recognitionState)
 
         ready = true
-        coordinator.retryPendingCaptures()
+        coordinator.onRuntimeStarted()
         repeat(2) { assertTrue(coordinator.awaitIdle()) }
         assertTrue(speech.finished)
     }
@@ -1553,10 +1658,82 @@ class PhoneCaptureCoordinatorTest {
         assertTrue(exports.isEmpty())
 
         folderAvailable = true
-        coordinator.retryPendingCaptures()
+        coordinator.retryArchivesAfterConfigurationChange()
         repeat(2) { assertTrue(coordinator.awaitIdle()) }
         assertEquals(ArchiveState.VERIFIED, repository.get(captureId)?.archiveState)
         assertEquals(listOf(captureId), exports)
+    }
+
+    @Test fun cancelledDistantWorkAndRearmedRecognitionTimersDoNotAccumulateQueueNodes() {
+        val futureId = "123e4567-e89b-42d3-a456-426614174088"
+        savePeerFixture(savedRecord(writeWav(byteArrayOf(1, 2, 3, 4)), CaptureState.SAVED, RecognitionState.FAILED).copy(
+            captureId = futureId, nextRetryAtUtc = "2099-01-02T03:04:05Z"))
+        val timer = PhoneCaptureCoordinator::class.java.getDeclaredField("timeoutExecutor").apply { isAccessible = true }
+            .get(coordinator) as java.util.concurrent.ScheduledThreadPoolExecutor
+        val schedule = PhoneCaptureCoordinator::class.java.getDeclaredMethod("schedulePendingWork", java.lang.Long.TYPE)
+            .apply { isAccessible = true }
+        repeat(1_000) { schedule.invoke(coordinator, 0L) }
+        assertTrue(timer.removeOnCancelPolicy)
+        assertEquals(1, timer.queue.size)
+
+        org.robolectric.Shadows.shadowOf(RuntimeEnvironment.getApplication()).grantPermissions(android.Manifest.permission.RECORD_AUDIO)
+        assertTrue(coordinator.beginLive(captureId, sessionId, "synthetic-node", CaptureFormat(), STAMP))
+        val owners = PhoneCaptureCoordinator::class.java.getDeclaredField("sessions").apply { isAccessible = true }
+            .get(coordinator) as Map<*, *>
+        val owner = checkNotNull(owners[sessionId])
+        val rearm = PhoneCaptureCoordinator::class.java.getDeclaredMethod("armRecognitionTimeout", owner.javaClass)
+            .apply { isAccessible = true }
+        repeat(1_000) { rearm.invoke(coordinator, owner) }
+        assertEquals(2, timer.queue.size) // One distant work wake and one active recognition timeout.
+        assertTrue(timer.queue.none { (it as java.util.concurrent.Future<*>).isCancelled })
+        assertEquals(1, speech.startCount)
+    }
+
+    @Test fun partialPersistenceChargesRetainedPreviewAcrossBlankFloodAndRejectedLargerDraft() {
+        org.robolectric.Shadows.shadowOf(RuntimeEnvironment.getApplication()).grantPermissions(android.Manifest.permission.RECORD_AUDIO)
+        assertTrue(coordinator.beginLive(captureId, sessionId, "synthetic-node", CaptureFormat(), STAMP))
+        val io = PhoneCaptureCoordinator::class.java.getDeclaredField("io").apply { isAccessible = true }
+            .get(coordinator) as java.util.concurrent.ExecutorService
+        val pump = PhoneCaptureCoordinator::class.java.getDeclaredField("livePersistence").apply { isAccessible = true }
+            .get(coordinator) as CaptureProjectionPump
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val hold = io.submit { entered.countDown(); check(release.await(5, TimeUnit.SECONDS)) }
+        val draft = "a".repeat(100_000)
+        val larger = "b".repeat(200_000)
+        val retainedBytes = (draft.length + sessionId.length) * 2
+        try {
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            speech.events!!.onHypothesis(draft, false)
+            assertEquals(1 to retainedBytes, pump.retained())
+            repeat(1_000) { speech.events!!.onHypothesis("", false) }
+            assertEquals(1 to retainedBytes, pump.retained()) // Blank text still owns the prior preview.
+            speech.events!!.onHypothesis(larger, false)
+            assertEquals(1 to retainedBytes, pump.retained()) // Oversized replacement cannot leave an uncharged old entry.
+            assertTrue(pump.retained().second <= 256 * 1024)
+            speech.events!!.onHypothesis("", true)
+            assertEquals(1 to retainedBytes, pump.retained()) // Non-evictable terminal work does not rewrite partial accounting.
+            release.countDown()
+            hold.get(2, TimeUnit.SECONDS)
+            assertTrue(coordinator.awaitIdle())
+            assertEquals(0 to 0, pump.retained())
+            assertEquals(larger, repository.get(captureId)!!.previewText)
+            assertEquals(RecognitionState.NO_SPEECH, repository.get(captureId)!!.recognitionState)
+            assertNull(repository.get(captureId)!!.finalText)
+        } finally { release.countDown() }
+    }
+
+    @Test fun hypothesisRetentionCountsDistinctStringObjectsButNotAliases() {
+        val text = "Synthetic draft"
+        val sameContents = String(text.toCharArray())
+        assertFalse(text === sameContents)
+        val identityBytes = sessionId.length * 2
+        assertEquals(text.length * 2 + identityBytes, PhoneCaptureCoordinator.hypothesisRetentionBytes(text,
+            TranscriptSnapshot(sessionId, 1, text, text)))
+        assertEquals(text.length * 4 + identityBytes, PhoneCaptureCoordinator.hypothesisRetentionBytes(text,
+            TranscriptSnapshot(sessionId, 1, sameContents, text)))
+        assertEquals(text.length * 2 + identityBytes, PhoneCaptureCoordinator.hypothesisRetentionBytes("",
+            TranscriptSnapshot(sessionId, 1, text, null)))
     }
 
     private fun savePeerFixture(record: CaptureRecord) {

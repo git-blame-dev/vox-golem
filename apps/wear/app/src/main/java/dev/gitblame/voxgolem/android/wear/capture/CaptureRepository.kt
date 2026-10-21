@@ -61,6 +61,9 @@ class CaptureRepository(context: Context) {
 
     fun pendingTransfers(): List<CaptureRecord> = shared.pendingNoteTransfers()
 
+    fun dueTransfers(nowMillis: Long, limit: Int = 16): List<CaptureRecord> = shared.dueNoteTransfers(nowMillis, limit)
+    fun earliestTransferDue(): Long? = shared.earliestNoteTransferDue()
+
     private fun recordPages(): Sequence<List<CaptureRecord>> = generateSequence(0) { it + 500 }
         .map { shared.list(it, 500) }.takeWhile { it.isNotEmpty() }
 

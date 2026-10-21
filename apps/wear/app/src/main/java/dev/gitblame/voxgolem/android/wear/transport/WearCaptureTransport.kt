@@ -46,10 +46,7 @@ class WearCaptureTransport internal constructor(private val context: Context, pr
     private fun isRetired() = synchronized(lock) { retired } || Thread.currentThread().isInterrupted
     internal fun transferPending(at: Instant = Instant.now()) {
         CaptureWearListenerService.retryReceiptRetirements()
-        for (record in repository.pendingTransfers().filter {
-            it.purpose == CapturePurpose.NOTE && (it.captureState == CaptureState.SAVED || it.captureState == CaptureState.INTERRUPTED) &&
-                it.finalizedByteLength != null && it.localAudioPath?.endsWith(".wav") == true
-        }) {
+        for (record in repository.dueTransfers(at.toEpochMilli())) {
             if (isRetired()) return
             val retryAt = record.nextRetryAtUtc?.let { runCatching { Instant.parse(it) }.getOrNull() }
             if (retryAt != null && retryAt.isAfter(at)) continue

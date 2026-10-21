@@ -30,7 +30,7 @@ class CaptureRepository(context: Context) {
     fun recent(purpose: CapturePurpose, limit: Int): List<CaptureRecord> = synchronized(monitor) {
         require(limit in 1..500) { "limit must be between 1 and 500" }
         helper.readableDatabase.rawQuery(
-            "SELECT body FROM captures ORDER BY created_at_utc DESC, capture_id DESC", null,
+            "SELECT body FROM captures WHERE purpose = ? ORDER BY created_at_utc DESC, capture_id DESC LIMIT ?", arrayOf(purpose.name, limit.toString()),
         ).use { cursor ->
             buildList {
                 while (size < limit && cursor.moveToNext()) {
@@ -39,6 +39,207 @@ class CaptureRepository(context: Context) {
                 }
             }
         }
+    }
+
+    /** Indexed durable archive work; a blocked writer holds no queue of capture bodies. */
+    fun dueNoteArchives(nowMillis: Long, limit: Int = 16): List<CaptureRecord> = dueWork("archive", nowMillis, limit)
+
+    fun earliestNoteArchiveDue(): Long? = synchronized(monitor) {
+        helper.readableDatabase.rawQuery(
+            "SELECT archive_due FROM captures WHERE archive_eligible = 1 ORDER BY archive_due LIMIT 1", null,
+        ).use { if (it.moveToFirst()) it.getLong(0) else null }
+    }
+
+    /** Archive retry accounting is deliberately independent of recognition's retryCount. */
+    fun deferNoteArchive(id: String, nowMillis: Long, waitingForFolder: Boolean) = synchronized(monitor) {
+        val db = helper.writableDatabase
+        db.beginTransaction()
+        try {
+            val attempts = db.rawQuery("SELECT archive_attempts FROM captures WHERE capture_id = ?", arrayOf(id)).use {
+                if (it.moveToFirst()) it.getInt(0) else return@synchronized
+            }
+            val nextAttempt = if (waitingForFolder) attempts else (attempts + 1).coerceAtMost(20)
+            val delay = (5_000L shl attempts.coerceAtMost(10)).coerceAtMost(3_600_000L)
+            db.execSQL("UPDATE captures SET archive_attempts = ?, archive_due = ? WHERE capture_id = ?",
+                arrayOf<Any>(nextAttempt, if (waitingForFolder) Long.MAX_VALUE else nowMillis + delay, id))
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
+    }
+
+    fun wakeNoteArchives() = synchronized(monitor) {
+        helper.writableDatabase.execSQL("UPDATE captures SET archive_due = 0 WHERE archive_eligible = 1")
+    }
+
+    fun dueNoteTransfers(nowMillis: Long, limit: Int = 16): List<CaptureRecord> = dueWork("transfer", nowMillis, limit)
+
+    fun earliestNoteTransferDue(): Long? = synchronized(monitor) {
+        helper.readableDatabase.rawQuery(
+            "SELECT transfer_due FROM captures WHERE transfer_eligible = 1 ORDER BY transfer_due LIMIT 1", null,
+        ).use { if (it.moveToFirst()) it.getLong(0) else null }
+    }
+
+    fun dueNoteRecognition(nowMillis: Long, limit: Int = 16): List<CaptureRecord> = dueWork("recognition", nowMillis, limit)
+    fun dueNoteOrg(nowMillis: Long, limit: Int = 16): List<CaptureRecord> = dueWork("org", nowMillis, limit)
+    fun earliestNoteRecognitionDue(): Long? = earliestWork("recognition")
+    fun earliestNoteOrgDue(): Long? = earliestWork("org")
+
+    fun requestNoteRecognition(id: String) = synchronized(monitor) {
+        val db = helper.writableDatabase
+        db.beginTransaction()
+        try {
+            val record = db.rawQuery("SELECT body FROM captures WHERE capture_id = ?", arrayOf(id.lowercase())).use {
+                if (it.moveToFirst()) decode(it.getString(0)) else return@synchronized
+            }
+            if (record.purpose == CapturePurpose.NOTE && record.captureState == CaptureState.SAVED &&
+                record.recognitionState !in setOf(RecognitionState.FINAL, RecognitionState.NO_SPEECH)) {
+                db.execSQL("UPDATE captures SET recognition_requested = 1, recognition_eligible = 1, recognition_due = 0 WHERE capture_id = ?", arrayOf(record.captureId))
+            }
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
+    }
+
+    fun noteRecognitionRequested(id: String): Boolean = synchronized(monitor) {
+        helper.readableDatabase.rawQuery("SELECT recognition_requested FROM captures WHERE capture_id = ?", arrayOf(id.lowercase())).use {
+            it.moveToFirst() && it.getInt(0) != 0
+        }
+    }
+
+    private fun dueWork(stage: String, nowMillis: Long, limit: Int): List<CaptureRecord> = synchronized(monitor) {
+        require(stage in setOf("archive", "transfer", "recognition", "org") && limit in 1..100)
+        val malformed = mutableListOf<Pair<String, String>>()
+        val records = helper.readableDatabase.rawQuery("SELECT capture_id, body FROM captures WHERE ${stage}_eligible = 1 AND ${stage}_due <= ? " +
+            "ORDER BY ${stage}_due, created_at_utc, capture_id LIMIT ?", arrayOf(nowMillis.toString(), limit.toString())).use {
+            buildList {
+                while (it.moveToNext()) {
+                    val record = runCatching { decode(it.getString(1)) }.getOrElse { _ ->
+                        malformed.add(it.getString(0) to it.getString(1)); null
+                    }
+                    if (record != null) add(record)
+                }
+            }
+        }
+        // Preserve malformed canonical metadata for repair. Only its indexed retry admission moves.
+        malformed.forEach { (id, body) -> helper.writableDatabase.execSQL(
+            "UPDATE captures SET ${stage}_due = ? WHERE capture_id = ? AND body = ?",
+            arrayOf<Any>(nowMillis.coerceAtMost(Long.MAX_VALUE - 60_000L) + 60_000L, id, body)) }
+        records
+    }
+
+    fun deferNoteRecognitionDiscovery(record: CaptureRecord, nowMillis: Long) = update(record.captureId) { current ->
+        val sameAttempt = current.recognitionSessionId == record.recognitionSessionId ||
+            (record.recognitionState == RecognitionState.RUNNING && current.recognitionState == RecognitionState.QUEUED && current.recognitionSessionId == null)
+        if (current.transcriptVersion != record.transcriptVersion || !sameAttempt ||
+            current.captureState != CaptureState.SAVED || current.recognitionState in setOf(RecognitionState.FINAL, RecognitionState.NO_SPEECH)) current
+        else current.copy(nextRetryAtUtc = CaptureUtcTime.formatMillis(nowMillis + 30_000L),
+            lastErrorStage = "recognition", lastErrorCode = "recognition-work-discovery-failed")
+    }
+
+    fun wakeRuntimeRecognition() = synchronized(monitor) {
+        helper.writableDatabase.execSQL("UPDATE captures SET recognition_due = 0 WHERE recognition_waiting_runtime = 1 AND recognition_eligible = 1")
+    }
+
+    private fun earliestWork(stage: String): Long? = synchronized(monitor) {
+        require(stage in setOf("recognition", "org"))
+        helper.readableDatabase.rawQuery("SELECT ${stage}_due FROM captures WHERE ${stage}_eligible = 1 ORDER BY ${stage}_due LIMIT 1", null).use {
+            if (it.moveToFirst()) it.getLong(0) else null
+        }
+    }
+
+    fun deferNoteOrg(id: String, transcriptVersion: Long, nowMillis: Long, waitingForConfiguration: Boolean) = synchronized(monitor) {
+        val db = helper.writableDatabase
+        db.beginTransaction()
+        try {
+            db.rawQuery("SELECT body, org_attempts FROM captures WHERE capture_id = ?", arrayOf(id)).use {
+                if (!it.moveToFirst() || decode(it.getString(0)).transcriptVersion != transcriptVersion) return@synchronized
+                val attempts = it.getInt(1)
+                val delay = (5_000L shl attempts.coerceIn(0, 10)).coerceAtMost(3_600_000L)
+                db.execSQL("UPDATE captures SET org_attempts = ?, org_due = ? WHERE capture_id = ?",
+                    arrayOf<Any>(if (waitingForConfiguration) attempts else (attempts + 1).coerceAtMost(20), if (waitingForConfiguration) Long.MAX_VALUE else nowMillis + delay, id))
+            }
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
+    }
+
+    fun wakeNoteOrg() = synchronized(monitor) {
+        helper.writableDatabase.execSQL("UPDATE captures SET org_due = 0 WHERE org_eligible = 1")
+    }
+
+    fun wakeNoteDelivery(id: String) = synchronized(monitor) {
+        helper.writableDatabase.execSQL("UPDATE captures SET archive_due = 0, org_due = 0 WHERE capture_id = ?", arrayOf(id.lowercase()))
+    }
+
+    /** Native verified archive handoff. Kept separate until live EOF so frame comparison is retained. */
+    fun stagePhoneArchive(record: CaptureRecord, nodeId: String) = synchronized(monitor) {
+        require(archiveEligible(record))
+        val normalized = record.copy(captureId = record.captureId.lowercase())
+        val db = helper.writableDatabase
+        db.beginTransaction()
+        try {
+            check(origin(db, normalized.captureId) == nodeId) { "capture-origin-not-authorized" }
+            val existing = db.rawQuery("SELECT body FROM phone_pending_archives WHERE capture_id = ?", arrayOf(normalized.captureId)).use {
+                if (it.moveToFirst()) {
+                    val prior = decode(it.getString(0))
+                    check(prior.sha256.equals(record.sha256, true) && prior.finalizedByteLength == record.finalizedByteLength) {
+                        "capture-id-content-conflict"
+                    }
+                    true
+                } else false
+            }
+            val values = ContentValues().apply {
+                put("capture_id", normalized.captureId); put("body", encode(normalized).toString())
+            }
+            if (existing) db.update("phone_pending_archives", values, "capture_id = ?", arrayOf(normalized.captureId))
+            else check(db.insertOrThrow("phone_pending_archives", null, values) != -1L) { "Cannot persist verified archive handoff" }
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
+    }
+
+    fun pendingPhoneArchives(limit: Int = 16): List<Pair<CaptureRecord, String>> = synchronized(monitor) {
+        require(limit in 1..100)
+        helper.readableDatabase.rawQuery("SELECT p.body, o.source_node_id FROM phone_pending_archives p " +
+            "JOIN phone_capture_origins o ON o.capture_id = p.capture_id ORDER BY p.capture_id LIMIT ?", arrayOf(limit.toString())).use {
+            buildList { while (it.moveToNext()) add(decode(it.getString(0)) to it.getString(1)) }
+        }
+    }
+
+    fun pendingPhoneArchive(id: String): Pair<CaptureRecord, String>? = synchronized(monitor) {
+        helper.readableDatabase.rawQuery("SELECT p.body, o.source_node_id FROM phone_pending_archives p " +
+            "JOIN phone_capture_origins o ON o.capture_id = p.capture_id WHERE p.capture_id = ?", arrayOf(id.lowercase())).use {
+            if (it.moveToFirst()) decode(it.getString(0)) to it.getString(1) else null
+        }
+    }
+
+    fun duePhoneArchives(nowMillis: Long, limit: Int = 16): List<Pair<CaptureRecord, String>> = synchronized(monitor) {
+        require(limit in 1..100)
+        helper.readableDatabase.rawQuery("SELECT p.body, o.source_node_id FROM phone_pending_archives p " +
+            "JOIN phone_capture_origins o ON o.capture_id = p.capture_id WHERE p.due <= ? ORDER BY p.due, p.capture_id LIMIT ?",
+            arrayOf(nowMillis.toString(), limit.toString())).use {
+            buildList { while (it.moveToNext()) add(decode(it.getString(0)) to it.getString(1)) }
+        }
+    }
+
+    fun earliestPhoneArchiveDue(): Long? = synchronized(monitor) {
+        helper.readableDatabase.rawQuery("SELECT p.due FROM phone_pending_archives p JOIN phone_capture_origins o " +
+            "ON o.capture_id = p.capture_id ORDER BY p.due LIMIT 1", null).use {
+            if (it.moveToFirst()) it.getLong(0) else null
+        }
+    }
+
+    fun wakePhoneArchives() = synchronized(monitor) {
+        helper.writableDatabase.execSQL("UPDATE phone_pending_archives SET due = 0")
+    }
+
+    fun wakePhoneArchive(id: String) = synchronized(monitor) {
+        helper.writableDatabase.execSQL("UPDATE phone_pending_archives SET due = 0 WHERE capture_id = ?", arrayOf(id.lowercase()))
+    }
+
+    fun deferPhoneArchive(id: String, waitingForLive: Boolean) = synchronized(monitor) {
+        helper.writableDatabase.execSQL("UPDATE phone_pending_archives SET due = ?, attempts = MIN(attempts + 1, 20) WHERE capture_id = ?",
+            arrayOf<Any>(if (waitingForLive) Long.MAX_VALUE else System.currentTimeMillis() + 30_000L, id.lowercase()))
+    }
+
+    fun completePhoneArchiveHandoff(id: String) = synchronized(monitor) {
+        helper.writableDatabase.delete("phone_pending_archives", "capture_id = ?", arrayOf(id.lowercase()))
     }
 
     fun get(id: String): CaptureRecord? {
@@ -178,16 +379,30 @@ class CaptureRepository(context: Context) {
         val db = helper.writableDatabase
         db.beginTransaction()
         try {
-            val current = db.rawQuery("SELECT body FROM captures WHERE capture_id = ?", arrayOf(id.lowercase())).use { cursor ->
-                if (cursor.moveToFirst()) decode(cursor.getString(0)) else null
+            val row = db.rawQuery("SELECT body, recognition_requested, recognition_due FROM captures WHERE capture_id = ?", arrayOf(id.lowercase())).use { cursor ->
+                if (cursor.moveToFirst()) Triple(decode(cursor.getString(0)), cursor.getInt(1) != 0, cursor.getLong(2)) else null
             } ?: return@synchronized null
+            val current = row.first
             val updated = transform(current)
             require(updated.captureId.equals(current.captureId, ignoreCase = true)) { "update cannot change capture identity" }
             require(updated.purpose == current.purpose && updated.requestedLanguage == current.requestedLanguage &&
                 updated.speechNetworkFallback == current.speechNetworkFallback) { "update cannot change captured speech policy or purpose" }
             validate(updated)
             val normalized = updated.copy(captureId = current.captureId)
-            db.update("captures", values(normalized), "capture_id = ?", arrayOf(current.captureId))
+            val persisted = values(normalized).apply {
+                val consumed = normalized.recognitionState == RecognitionState.FINAL || normalized.recognitionState == RecognitionState.NO_SPEECH ||
+                    (normalized.recognitionState == RecognitionState.RUNNING && normalized.recognitionSessionId != current.recognitionSessionId)
+                if (consumed) put("recognition_requested", 0)
+                else if (row.second && normalized.purpose == CapturePurpose.NOTE && normalized.captureState == CaptureState.SAVED) {
+                    put("recognition_eligible", 1)
+                    // Pre-admission failures retain the request, but must respect their durable backoff.
+                    if (normalized.nextRetryAtUtc == current.nextRetryAtUtc) put("recognition_due", row.third)
+                }
+                if (normalized.transcriptVersion != current.transcriptVersion) {
+                    put("org_due", 0L); put("org_attempts", 0)
+                }
+            }
+            db.update("captures", persisted, "capture_id = ?", arrayOf(current.captureId))
             db.setTransactionSuccessful()
             normalized
         } finally {
@@ -254,20 +469,100 @@ class CaptureRepository(context: Context) {
         put("capture_id", record.captureId)
         put("created_at_utc", record.createdAtUtc)
         put("capture_state", record.captureState.name)
+        put("purpose", record.purpose.name)
+        put("archive_eligible", if (archiveEligible(record)) 1 else 0)
+        putAll(transferProjection(record))
+        putAll(phoneProjection(record))
         put("body", encode(record).toString())
     }
 
-    private class Database(context: Context) : SQLiteOpenHelper(context, "captures.db", null, 1) {
+    private class Database(context: Context) : SQLiteOpenHelper(context, "captures.db", null, 2) {
         override fun onCreate(db: SQLiteDatabase) {
             db.execSQL("CREATE TABLE captures (capture_id TEXT PRIMARY KEY NOT NULL, created_at_utc TEXT NOT NULL, capture_state TEXT NOT NULL, body TEXT NOT NULL)")
             db.execSQL("CREATE INDEX captures_created ON captures(created_at_utc DESC, capture_id DESC)")
+            addWorkColumns(db)
         }
         override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-            throw IllegalStateException("No migration path from capture schema $oldVersion to $newVersion")
+            check(oldVersion == 1 && newVersion == 2)
+            addWorkColumns(db)
+            // Android API 24 does not guarantee SQLite JSON functions. Decode using legacy defaults.
+            db.rawQuery("SELECT capture_id, body FROM captures", null).use { cursor ->
+                while (cursor.moveToNext()) {
+                    val record = decode(cursor.getString(1))
+                    db.execSQL("UPDATE captures SET purpose = ?, archive_eligible = ? WHERE capture_id = ?",
+                        arrayOf(record.purpose.name, if (archiveEligible(record)) 1 else 0, cursor.getString(0)))
+                    db.update("captures", transferProjection(record), "capture_id = ?", arrayOf(record.captureId))
+                    db.update("captures", phoneProjection(record), "capture_id = ?", arrayOf(record.captureId))
+                }
+            }
+        }
+
+        private fun addWorkColumns(db: SQLiteDatabase) {
+            db.execSQL("CREATE TABLE IF NOT EXISTS phone_pending_archives (capture_id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL, due INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS phone_pending_archives_due ON phone_pending_archives(due, capture_id)")
+            db.execSQL("CREATE TABLE IF NOT EXISTS phone_capture_origins (capture_id TEXT PRIMARY KEY NOT NULL, source_node_id TEXT NOT NULL)")
+            db.execSQL("ALTER TABLE captures ADD COLUMN purpose TEXT NOT NULL DEFAULT 'NOTE'")
+            db.execSQL("ALTER TABLE captures ADD COLUMN archive_eligible INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE captures ADD COLUMN archive_due INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE captures ADD COLUMN archive_attempts INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE captures ADD COLUMN transfer_eligible INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE captures ADD COLUMN transfer_due INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE captures ADD COLUMN recognition_eligible INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE captures ADD COLUMN recognition_due INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE captures ADD COLUMN recognition_requested INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE captures ADD COLUMN recognition_waiting_runtime INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE captures ADD COLUMN org_eligible INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE captures ADD COLUMN org_due INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE captures ADD COLUMN org_attempts INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("CREATE INDEX captures_purpose_created ON captures(purpose, created_at_utc DESC, capture_id DESC)")
+            db.execSQL("CREATE INDEX captures_archive_due ON captures(archive_eligible, archive_due, created_at_utc, capture_id)")
+            db.execSQL("CREATE INDEX captures_transfer_due ON captures(transfer_eligible, transfer_due, created_at_utc, capture_id)")
+            db.execSQL("CREATE INDEX captures_recognition_due ON captures(recognition_eligible, recognition_due, created_at_utc, capture_id)")
+            db.execSQL("CREATE INDEX captures_recognition_runtime ON captures(recognition_waiting_runtime, recognition_eligible)")
+            db.execSQL("CREATE INDEX captures_org_due ON captures(org_eligible, org_due, created_at_utc, capture_id)")
         }
     }
 
     companion object {
+        private val finalizedStates = setOf(CaptureState.SAVED, CaptureState.INTERRUPTED)
+        private val retryableRecognitionStates = setOf(RecognitionState.QUEUED, RecognitionState.FAILED, RecognitionState.UNAVAILABLE)
+        private val sha256Pattern = Regex("(?i)^[0-9a-f]{64}$")
+
+        private fun phoneProjection(record: CaptureRecord) = ContentValues().apply {
+            val saved = record.purpose == CapturePurpose.NOTE && record.captureState == CaptureState.SAVED
+            val recognition = saved && (record.recognitionState == RecognitionState.RUNNING ||
+                (record.retryCount < CaptureWorkPolicy.MAX_AUTOMATIC_RECOGNITION_ATTEMPTS && record.recognitionState in retryableRecognitionStates))
+            put("recognition_eligible", if (recognition) 1 else 0)
+            put("recognition_waiting_runtime", if (saved && record.recognitionState == RecognitionState.QUEUED && record.lastErrorStage == "execution") 1 else 0)
+            put("recognition_due", if (record.recognitionState == RecognitionState.RUNNING) 0L else record.nextRetryAtUtc?.let {
+                CaptureUtcTime.parseMillis(it)
+            } ?: 0L)
+            val org = saved && record.recognitionState == RecognitionState.FINAL && !record.finalText.isNullOrBlank() &&
+                record.archiveState == ArchiveState.VERIFIED && record.archivedAudioUri != null && record.orgState != OrgState.EXPORTED
+            put("org_eligible", if (org) 1 else 0)
+        }
+
+        private fun transferProjection(record: CaptureRecord) = ContentValues().apply {
+            val eligible = record.purpose == CapturePurpose.NOTE &&
+                record.captureState in finalizedStates &&
+                record.localAudioPath?.endsWith(".wav") == true && record.finalizedByteLength != null &&
+                (record.transferState != TransferState.PHONE_ARCHIVED ||
+                    (record.captureState == CaptureState.SAVED && !record.completionNotified && record.recognitionState != RecognitionState.NO_SPEECH))
+            put("transfer_eligible", if (eligible) 1 else 0)
+            put("transfer_due", record.nextRetryAtUtc?.let {
+                CaptureUtcTime.parseMillis(it)
+            } ?: 0L)
+        }
+
+        private fun archiveEligible(record: CaptureRecord): Boolean =
+            record.purpose == CapturePurpose.NOTE &&
+                record.captureState in finalizedStates &&
+                record.localAudioPath?.endsWith(".wav") == true &&
+                record.finalizedByteLength?.let { it >= 44 } == true &&
+                record.sha256?.matches(sha256Pattern) == true &&
+                record.archiveState != ArchiveState.CONFLICT &&
+                !(record.archiveState == ArchiveState.VERIFIED && record.archivedAudioUri != null)
+
         private fun encode(record: CaptureRecord) = JSONObject().apply {
             put("captureId", record.captureId); put("schemaVersion", record.schemaVersion); put("sourceKind", record.sourceKind)
             put("createdAtUtc", record.createdAtUtc); putOpt("startedAtUtc", record.startedAtUtc); putOpt("finishedAtUtc", record.finishedAtUtc)

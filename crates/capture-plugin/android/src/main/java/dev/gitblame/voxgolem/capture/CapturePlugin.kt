@@ -111,6 +111,7 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
             val requiredFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
             require(flags and requiredFlags == requiredFlags) { "Notes folder requires read and write access" }
             destinationStore.select(uri)
+            phoneCoordinator.retryArchivesAfterConfigurationChange()
             phoneCoordinator.retryPendingCaptures()
             invoke.resolve(snapshotValue())
         } catch (error: Exception) {

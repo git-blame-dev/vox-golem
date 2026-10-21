@@ -15,6 +15,9 @@ provider, foreground service, GMS listener or SAF/Org export implementation.
 - [PcmRecordingWriter.kt](src/main/java/dev/gitblame/voxgolem/capture/PcmRecordingWriter.kt)
   and [WavPcmReader.kt](src/main/java/dev/gitblame/voxgolem/capture/WavPcmReader.kt):
   local recording finalization and validated supplied-audio reads.
+- [CaptureStoragePolicy.kt](src/main/java/dev/gitblame/voxgolem/capture/CaptureStoragePolicy.kt):
+  peak-space admission estimate for retained PCM plus temporary WAV and metadata.
+  It is not a disk reservation or a guarantee against concurrent storage consumption.
 - [RecognitionInputCompletion.kt](src/main/java/dev/gitblame/voxgolem/capture/RecognitionInputCompletion.kt),
   and [SegmentedTranscriptAssembler.kt](src/main/java/dev/gitblame/voxgolem/capture/SegmentedTranscriptAssembler.kt):
   capture recognition completion and transcript assembly. The shared Android SDK
@@ -43,7 +46,11 @@ facts. Finalized audio remains durable when preview, recognition or connectivity
 fails. Live-preview dropping never implies dropping the local WAV. Receipts require
 matching identity/hash after verified archival; channel completion alone is not success.
 Interrupted recordings and ambiguous export writes retain recovery state and need
-explicit action rather than being silently completed. Recording cleanup is not automatic.
+explicit finalization/review rather than being silently completed. Finalized interrupted
+Note audio remains eligible for verified archival without becoming recognition/export
+eligible. Indexed durable work selection survives restart without an authoritative
+in-memory task list; the additive private DB migration preserves records and origin
+bindings while the capture record schema remains version1. Recording cleanup is not automatic.
 Note capture never enters Assistant completion or conversation replication.
 
 ## Verification

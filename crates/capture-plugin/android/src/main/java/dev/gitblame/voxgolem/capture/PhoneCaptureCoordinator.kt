@@ -48,12 +48,12 @@ class PhoneCaptureCoordinator internal constructor(
     private val repository = CaptureRepository(appContext)
     private val prefs = appContext.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
     private val io: ExecutorService = Executors.newSingleThreadExecutor()
+    private val livePersistence = CaptureProjectionPump(io, maximumKeys = 8, maximumBytes = 256 * 1024)
     private val outgoing = PhoneCaptureDelivery(repository, sendMessage, sendOversizedReceipt)
     private val background: ExecutorService = Executors.newSingleThreadExecutor()
     private val archive = PhoneCaptureArchive(repository, archiveWav, exportOrg, outgoing)
-    private val timeoutExecutor = ScheduledThreadPoolExecutor(1)
+    private val timeoutExecutor = ScheduledThreadPoolExecutor(1).apply { removeOnCancelPolicy = true }
     private val sessions = ConcurrentHashMap<String, RecognitionSession>()
-    private val pendingLiveArchives = ConcurrentHashMap<String, PendingArchive>()
     private val terminalLiveSessions = ConcurrentHashMap.newKeySet<String>()
     private val liveInputs = ConcurrentHashMap<String, LiveInput>()
     private var probeSessionId: String? = null
@@ -68,12 +68,15 @@ class PhoneCaptureCoordinator internal constructor(
     internal var beforeDuplicateReady: () -> Unit = {}
     internal var beforeHypothesisPersistence: () -> Unit = {}
     internal var beforeReplayValidation: () -> Unit = {}
+    internal var beforeRecognitionDiscovery: () -> Unit = {}
     private val recovered = AtomicBoolean(false)
-    private val leaseSubscription = recognitionLeases.subscribeAvailable { kind ->
-        if (kind == RecognitionResourceLease.Kind.CHAT && !runtimeStopped && !io.isShutdown) retryPendingCaptures()
+    private val workQueued = AtomicBoolean(false)
+    private val workTimerLock = Any()
+    private var workTimer: ScheduledFuture<*>? = null
+    private val leaseSubscription = recognitionLeases.subscribeAvailable { _ ->
+        if (!runtimeStopped && !io.isShutdown) retryPendingCaptures()
     }
 
-    private data class PendingArchive(val record: CaptureRecord, val sourceNodeId: String)
     private data class LiveInput(val captureId: String, val sourceNodeId: String, val close: () -> Unit)
 
     internal interface ProbeRetirementObserver {
@@ -119,7 +122,11 @@ class PhoneCaptureCoordinator internal constructor(
         val missing = missingPermissions()
         if (missing.isNotEmpty()) return EnableResult("permission-required", missing.joinToString(","))
         retryFailedRetirements()
-        if (!recovered.getAndSet(true)) io.execute { repository.recoverInterrupted(CapturePurpose.NOTE) }
+        if (!recovered.getAndSet(true)) io.execute {
+            repository.recoverInterrupted(CapturePurpose.NOTE)
+            repository.wakePhoneArchives()
+            archive.wake(configurationChanged = true)
+        }
         prefs.edit().remove(KEY_RUNTIME_ERROR).apply()
         val intent = Intent(appContext, PhoneCaptureRuntimeService::class.java).setAction(PhoneCaptureRuntimeService.ACTION_START)
         try {
@@ -147,10 +154,51 @@ class PhoneCaptureCoordinator internal constructor(
     fun isEnabled(): Boolean = hasConsent() && missingPermissions().isEmpty()
 
     fun retryPendingCaptures() {
-        io.execute {
-            repository.savedNotes().forEach { retryAutomatically(it.captureId) }
+        archive.wake()
+        if (!workQueued.compareAndSet(false, true)) return
+        try { io.execute {
+            try {
+                repository.duePhoneArchives(System.currentTimeMillis()).forEach { (record, source) ->
+                    runCatching { onArchiveReceived(record, source) }.onFailure {
+                        repository.deferPhoneArchive(record.captureId, waitingForLive = false)
+                        markArchiveFailure(record.captureId, "pending-archive-processing-failed")
+                    }
+                }
+                background.execute {
+                    var minimumDelayMillis = 0L
+                    try {
+                        beforeRecognitionDiscovery()
+                        repository.dueNoteRecognition(System.currentTimeMillis()).forEach { record ->
+                            if (!hasBusyRecognizer()) try {
+                                replayWork(record.captureId, repository.phoneOrigin(record.captureId).orEmpty(),
+                                    automatic = !repository.noteRecognitionRequested(record.captureId)).run()
+                            } catch (_: Exception) {
+                                repository.deferNoteRecognitionDiscovery(record, System.currentTimeMillis())
+                            }
+                        }
+                    } catch (_: Exception) {
+                        minimumDelayMillis = 1_000L
+                    } finally { workQueued.set(false); schedulePendingWork(minimumDelayMillis) }
+                }
+            } catch (_: Exception) { workQueued.set(false); schedulePendingWork(minimumDelayMillis = 1_000) }
+        } } catch (_: java.util.concurrent.RejectedExecutionException) { workQueued.set(false) }
+    }
+
+    private fun schedulePendingWork(minimumDelayMillis: Long = 0) {
+        if (timeoutExecutor.isShutdown) return
+        val due = runCatching { listOfNotNull(repository.earliestPhoneArchiveDue(),
+            repository.earliestNoteRecognitionDue().takeUnless { hasBusyRecognizer() }).minOrNull()
+        }.getOrElse { System.currentTimeMillis() + 1_000L } ?: return
+        if (due == Long.MAX_VALUE) return
+        synchronized(workTimerLock) {
+            workTimer?.cancel(false)
+            runCatching { workTimer = timeoutExecutor.schedule({ retryPendingCaptures() },
+                (due - System.currentTimeMillis()).coerceAtLeast(minimumDelayMillis), TimeUnit.MILLISECONDS) }
         }
     }
+
+    /** Folder selection/permission repair wakes durable configuration-blocked audio independently of STT. */
+    fun retryArchivesAfterConfigurationChange() { archive.wake(configurationChanged = true) }
 
     fun finalizeCapture(captureId: String) {
         require(CaptureProtocol.isValidUuid(captureId)) { "Invalid capture ID" }
@@ -199,69 +247,66 @@ class PhoneCaptureCoordinator internal constructor(
         if (sourceNodeId.isNotBlank() && (!CaptureProtocol.isValidUuid(captureId) || !repository.isPhoneOrigin(captureId, sourceNodeId))) {
             outgoing.sendAuthorizationFailure(sourceNodeId, captureId); return
         }
+        repository.requestNoteRecognition(captureId)
+        repository.wakeNoteDelivery(captureId)
         drainPendingArchive(captureId)
-        scheduleReplay(captureId, sourceNodeId, automatic = false)
+        retryPendingCaptures()
     }
 
-    private fun retryAutomatically(captureId: String, sourceNodeId: String = "") = scheduleReplay(captureId, sourceNodeId, automatic = true)
-
-    private fun scheduleReplay(captureId: String, sourceNodeId: String, automatic: Boolean) {
-        if (!CaptureProtocol.isValidUuid(captureId)) return
-        background.execute {
+    private fun replayWork(captureId: String, sourceNodeId: String, automatic: Boolean) = Runnable {
             if (sourceNodeId.isNotBlank() && !repository.isPhoneOrigin(captureId, sourceNodeId)) {
-                outgoing.sendAuthorizationFailure(sourceNodeId, captureId); return@execute
+                outgoing.sendAuthorizationFailure(sourceNodeId, captureId); return@Runnable
             }
             if (!automatic) retryFailedRetirements()
-            val record = recoverStaleRecognition(captureId) ?: return@execute
-            if (record.purpose != CapturePurpose.NOTE || record.captureState != CaptureState.SAVED) return@execute
+            val record = recoverStaleRecognition(captureId) ?: return@Runnable
+            if (record.purpose != CapturePurpose.NOTE || record.captureState != CaptureState.SAVED) return@Runnable
 
             val alreadyArchived = record.archiveState == ArchiveState.VERIFIED
-            if (!alreadyArchived) archive.queue(record.captureId, sourceNodeId)
+            if (!alreadyArchived) archive.wake()
             if (record.recognitionState == RecognitionState.FINAL || record.recognitionState == RecognitionState.NO_SPEECH) {
                 if (alreadyArchived) archive.maybeExport(record)
-                return@execute
+                return@Runnable
             }
             beforeReplayValidation()
-            if (hasBusyRecognizer() || (automatic && !automaticRetryDue(record, Instant.now()))) return@execute
+            if (hasBusyRecognizer() || (automatic && !automaticRetryDue(record, Instant.now()))) return@Runnable
             val wav = record.localAudioPath?.let(::File)
             if (wav == null || !wav.isFile) {
                 failSavedRecognition(record, "saved-wav-unavailable")
-                return@execute
+                return@Runnable
             }
             if (!runtimeReady()) {
                 settleReplayFailure(record, RecognitionState.QUEUED, "execution", NativePhoneRequirements.runtimeUnavailableCode(appContext))
-                return@execute
+                return@Runnable
             }
             val capabilities = speech.capabilities()
             if (!capabilities.externalAudio || !runCatching { speech.supportsPolicy(record.speechNetworkFallback, capabilities) }.getOrDefault(false) || record.format !in capabilities.formats) {
                 settleReplayFailure(record, RecognitionState.UNAVAILABLE, "recognition", "external-audio-provider-unavailable")
-                return@execute
+                return@Runnable
             }
             val sessionId = UUID.randomUUID().toString()
             val session = newSession(record, sessionId, sourceNodeId)
-            if (!markRunning(record, session, automatic)) { session.timing.finish("attempt-not-admitted"); return@execute }
+            if (!markRunning(record, session, automatic)) { session.timing.finish("attempt-not-admitted"); return@Runnable }
             try {
-                if (!startOwnedRecognition(record, session)) return@execute
-                val events = session.adapterEvents ?: return@execute
+                if (!startOwnedRecognition(record, session)) return@Runnable
+                val events = session.adapterEvents ?: return@Runnable
                 WavPcmReader(wav, record.format).use { source ->
                     val expectedFrames = record.durableFrames.takeIf { it > 0 } ?: source.frameCount
                     check(source.frameCount == expectedFrames) { "saved-wav-frame-count-mismatch" }
                     while (true) {
-                        if (sessions[sessionId] !== session) return@execute
+                        if (sessions[sessionId] !== session) return@Runnable
                         val chunk = source.read(3_200) ?: break
-                        if (!speech.appendOwned(sessionId, events, chunk)) return@execute
+                        if (!speech.appendOwned(sessionId, events, chunk)) return@Runnable
                         armRecognitionTimeout(session)
                         val delayMillis = replayChunkDelayMillis(chunk.size, record.format, replayPacingMillis)
                         if (delayMillis > 0) Thread.sleep(delayMillis)
                     }
                 }
-                if (sessions[sessionId] !== session) return@execute
-                if (!speech.finishOwned(sessionId, events)) return@execute
+                if (sessions[sessionId] !== session) return@Runnable
+                if (!speech.finishOwned(sessionId, events)) return@Runnable
                 armRecognitionTimeout(session)
             } catch (_: Exception) {
                 failSession(session, "saved-audio-transcription-failed")
             }
-        }
     }
 
     internal fun beginLive(captureId: String, sessionId: String, sourceNodeId: String, format: CaptureFormat, startedAtUtc: String,
@@ -463,6 +508,8 @@ class PhoneCaptureCoordinator internal constructor(
     internal fun onRuntimeStarted() {
         synchronized(sessions) { runtimeStopped = false }
         retryFailedRetirements()
+        repository.wakeRuntimeRecognition()
+        retryPendingCaptures()
     }
 
     internal fun onRuntimeStopped() {
@@ -536,21 +583,17 @@ class PhoneCaptureCoordinator internal constructor(
         if (!canReceiveArchive(record.captureId, sourceNodeId)) throw CaptureOriginAuthorizationException()
         if (repository.admitPhoneCapture(record.copy(transferState = TransferState.PHONE_STAGED, archiveState = ArchiveState.STAGED),
                 sourceNodeId, verifiedNewArchive = true) == null) throw CaptureOriginAuthorizationException()
+        repository.stagePhoneArchive(record.copy(archiveState = ArchiveState.STAGED), sourceNodeId)
         val deferUntilLiveEof = synchronized(sessions) {
             val live = sessions.values.firstOrNull {
                 it.captureId == record.captureId && it.live && !it.inputEnded && !it.terminalClaimed.get()
             }
-            if (live == null) false else {
-                val previous = pendingLiveArchives[record.captureId]
-                check(previous == null || (previous.sourceNodeId == sourceNodeId &&
-                    previous.record.sha256 == record.sha256 && previous.record.finalizedByteLength == record.finalizedByteLength)) {
-                    "capture-id-content-conflict"
-                }
-                pendingLiveArchives[record.captureId] = PendingArchive(record, sourceNodeId)
-                true
-            }
+            live != null
         }
-        if (deferUntilLiveEof) return
+        if (deferUntilLiveEof) {
+            repository.deferPhoneArchive(record.captureId, waitingForLive = true)
+            return
+        }
         val stored = repository.get(record.captureId)
         require(stored == null || (stored.purpose == record.purpose && stored.requestedLanguage == record.requestedLanguage &&
             stored.speechNetworkFallback == record.speechNetworkFallback)) { "capture-policy-conflict" }
@@ -599,16 +642,17 @@ class PhoneCaptureCoordinator internal constructor(
             )
         }
         val merged = repository.get(record.captureId) ?: return
+        repository.completePhoneArchiveHandoff(record.captureId)
         if (merged.transferState == TransferState.PHONE_ARCHIVED && merged.archivedAudioUri != null) {
             outgoing.sendReceipt(sourceNodeId, merged, "PHONE_ARCHIVED", merged.exportDestinationId)
             archive.maybeExport(merged)
         } else {
             outgoing.sendReceipt(sourceNodeId, merged, "PHONE_STAGED")
-            archive.queue(record.captureId, sourceNodeId)
+            archive.wake()
         }
         if (merged.captureState == CaptureState.SAVED &&
             merged.recognitionState in RETRYABLE_RECOGNITION_STATES && !hasActiveSession(merged.captureId)) {
-            retryAutomatically(merged.captureId, sourceNodeId)
+            retryPendingCaptures()
         }
         stored?.recognitionSessionId?.let { terminalLiveSessions.remove(it) }
     }
@@ -619,13 +663,17 @@ class PhoneCaptureCoordinator internal constructor(
             if (!repository.isPhoneOrigin(captureId, sourceNodeId)) {
                 outgoing.sendAuthorizationFailure(sourceNodeId, captureId); return@execute
             }
+            repository.pendingPhoneArchive(captureId)?.let { (record, source) ->
+                runCatching { onArchiveReceived(record, source) }
+            }
             val record = repository.get(captureId) ?: return@execute
             if (record.purpose != CapturePurpose.NOTE) return@execute
             if (record.sha256 == null) return@execute
+            archive.wake()
             outgoing.sendReceipt(sourceNodeId, record, if (record.transferState == TransferState.PHONE_ARCHIVED) "PHONE_ARCHIVED" else "PHONE_STAGED")
             if (record.captureState == CaptureState.SAVED && record.recognitionState in RETRYABLE_RECOGNITION_STATES &&
                 !hasBusyRecognizer() && runtimeReady()) {
-                retryAutomatically(captureId, sourceNodeId)
+                retryPendingCaptures()
             }
         }
     }
@@ -640,24 +688,10 @@ class PhoneCaptureCoordinator internal constructor(
     internal fun rejectOrigin(captureId: String, sourceNodeId: String) = outgoing.sendAuthorizationFailure(sourceNodeId, captureId)
 
     private fun drainPendingArchive(captureId: String) {
-        val pending = synchronized(sessions) {
-            if (sessions.values.any { it.captureId == captureId && it.live && !it.inputEnded && !it.terminalClaimed.get() }) null
-            else pendingLiveArchives.remove(captureId)
-        } ?: return
-        fun retainForRetry() {
-            synchronized(sessions) { pendingLiveArchives.putIfAbsent(captureId, pending) }
-        }
-        try {
-            io.execute {
-                try { onArchiveReceived(pending.record, pending.sourceNodeId) }
-                catch (_: Exception) {
-                    retainForRetry()
-                    runCatching { markArchiveFailure(captureId, "pending-archive-processing-failed") }
-                }
-            }
-        } catch (_: java.util.concurrent.RejectedExecutionException) {
-            retainForRetry()
-        }
+        if (synchronized(sessions) { sessions.values.any { it.captureId == captureId && it.live && !it.inputEnded && !it.terminalClaimed.get() } }) return
+        if (repository.pendingPhoneArchive(captureId) == null) return
+        repository.wakePhoneArchive(captureId)
+        retryPendingCaptures()
     }
 
     private fun awaitLiveAdapter(session: RecognitionSession): Boolean {
@@ -694,8 +728,8 @@ class PhoneCaptureCoordinator internal constructor(
         liveInputs.values.forEach { runCatching { it.close() } }
         liveInputs.clear()
         terminalLiveSessions.clear()
-        pendingLiveArchives.clear()
         background.shutdownNow()
+        livePersistence.close()
         archive.shutdown()
         outgoing.shutdown()
         io.shutdownNow()
@@ -813,7 +847,8 @@ class PhoneCaptureCoordinator internal constructor(
 
     private fun automaticRetryDue(record: CaptureRecord, at: Instant): Boolean {
         val due = record.nextRetryAtUtc?.let { runCatching { Instant.parse(it) }.getOrNull() }
-        return record.retryCount < MAX_RECOGNITION_RETRIES && (due == null || !due.isAfter(at))
+        val resumedRuntime = record.recognitionState == RecognitionState.QUEUED && record.lastErrorStage == "execution" && runtimeReady()
+        return record.retryCount < CaptureWorkPolicy.MAX_AUTOMATIC_RECOGNITION_ATTEMPTS && (due == null || !due.isAfter(at) || resumedRuntime)
     }
 
     /** Recover a persisted RUNNING state only when this coordinator has no live session for it. */
@@ -875,14 +910,14 @@ class PhoneCaptureCoordinator internal constructor(
             if (isFinal) session.timing.mark("final-received")
             val becameAccepted = !session.accepted && text.isNotBlank()
             session.accepted = session.accepted || text.isNotBlank()
-            io.execute {
+            val persist = Runnable {
                 var persisted = false
                 try {
                     beforeHypothesisPersistence()
-                    if (!isFinal && !isCurrent()) return@execute
+                    if (!isFinal && !isCurrent()) return@Runnable
                     if (text.isNotBlank()) session.timing.mark("first-hypothesis-io-started")
                     val updated = try {
-                        if (repository.get(session.captureId)?.recognitionSessionId != session.sessionId) return@execute
+                        if (repository.get(session.captureId)?.recognitionSessionId != session.sessionId) return@Runnable
                         repository.update(session.captureId) { current ->
                             if (current.recognitionSessionId != session.sessionId || current.transcriptVersion != session.transcriptVersion || (!isFinal && !isCurrent())) current
                             else current.copy(
@@ -905,9 +940,9 @@ class PhoneCaptureCoordinator internal constructor(
                     } catch (failure: Exception) {
                         if (!isFinal) throw failure
                         markFinalPersistenceFailure(session)
-                        return@execute
+                        return@Runnable
                     }
-                    if (updated?.recognitionSessionId != session.sessionId || updated.lastRevision != snapshot.revision) return@execute
+                    if (updated?.recognitionSessionId != session.sessionId || updated.lastRevision != snapshot.revision) return@Runnable
                     persisted = true
                     if (text.isNotBlank()) session.timing.mark("first-hypothesis-persisted")
                     if (session.sourceNodeId.isNotBlank()) {
@@ -924,10 +959,13 @@ class PhoneCaptureCoordinator internal constructor(
                     if (isFinal) {
                         settleFinalSession(session)
                         session.timing.finish(if (persisted) "final-persisted" else "final-not-persisted")
-                        if (persisted) retryPendingCaptures()
+                        retryPendingCaptures()
                     }
                 }
             }
+            // Only replaceable partials coalesce. The single admitted owner's final commit is not evictable.
+            if (isFinal) io.execute(persist)
+            else livePersistence.offer(session.sessionId, hypothesisRetentionBytes(text, snapshot), persist)
         }
 
         override fun onFailure(code: String) = failSession(session, code)
@@ -952,7 +990,8 @@ class PhoneCaptureCoordinator internal constructor(
             val updated = repository.update(session.captureId) { current ->
                 if (current.recognitionSessionId != session.sessionId ||
                     current.recognitionState in setOf(RecognitionState.FINAL, RecognitionState.NO_SPEECH)) current
-                else current.copy(recognitionState = RecognitionState.FAILED, lastErrorStage = "recognition",
+                else current.copy(recognitionState = RecognitionState.FAILED,
+                    nextRetryAtUtc = Instant.now().plusSeconds(CaptureWorkPolicy.recognitionDelaySeconds(current.retryCount)).toString(), lastErrorStage = "recognition",
                     lastErrorCode = "final-transcript-persistence-failed")
             }
             if (updated?.recognitionSessionId == session.sessionId && updated.recognitionState == RecognitionState.FAILED &&
@@ -979,6 +1018,7 @@ class PhoneCaptureCoordinator internal constructor(
                     if (current.recognitionSessionId != session.sessionId || current.recognitionState == RecognitionState.FINAL) current
                     else current.copy(
                         recognitionState = RecognitionState.FAILED,
+                        nextRetryAtUtc = Instant.now().plusSeconds(CaptureWorkPolicy.recognitionDelaySeconds(current.retryCount)).toString(),
                         lastErrorStage = "recognition",
                         lastErrorCode = CaptureErrorCodes.safe(code, "transcription-unavailable"),
                     )
@@ -989,6 +1029,7 @@ class PhoneCaptureCoordinator internal constructor(
                 }
                 updated?.let(archive::maybeExport)
                 drainPendingArchive(session.captureId)
+                retryPendingCaptures()
             }
         }
     }
@@ -1051,6 +1092,7 @@ class PhoneCaptureCoordinator internal constructor(
                 current.recognitionState !in RETRYABLE_RECOGNITION_STATES) current
             else current.copy(
                 recognitionState = state,
+                nextRetryAtUtc = Instant.now().plusSeconds(CaptureWorkPolicy.recognitionDelaySeconds(current.retryCount)).toString(),
                 lastErrorStage = stage,
                 lastErrorCode = CaptureErrorCodes.safe(reason, "transcription-unavailable"),
             )
@@ -1067,17 +1109,28 @@ class PhoneCaptureCoordinator internal constructor(
     private fun isWatch(): Boolean = NativePhoneRequirements.isWatch(appContext)
 
     internal companion object {
+        /** UTF-16 hypothesis payload retained by the runnable; shared String references count once. */
+        internal fun hypothesisRetentionBytes(text: String, snapshot: TranscriptSnapshot): Int {
+            var characters = text.length.toLong()
+            val preview = snapshot.preview
+            if (preview != null && preview !== text) characters += preview.length
+            val final = snapshot.finalText
+            if (final != null && final !== text && final !== preview) characters += final.length
+            val id = snapshot.sessionId
+            if (id != null && id !== text && id !== preview && id !== final) characters += id.length
+            return (characters * 2).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+        }
+
         const val PREFERENCES = "capture_phone_runtime"
         const val KEY_OPTED_IN = "phone_capture_opted_in"
         const val KEY_RUNTIME_ERROR = "phone_capture_runtime_error"
         private const val MAX_CAPTURE_MILLIS = 10 * 60 * 1_000L
-        private const val MAX_RECOGNITION_RETRIES = 5
         internal fun replayChunkDelayMillis(bytes: Int, format: CaptureFormat, nominalChunkMillis: Long): Long =
             bytes.toLong() * nominalChunkMillis * 10 / (format.sampleRate.toLong() * format.channels * format.bitsPerSample / 8)
         private val RETRYABLE_RECOGNITION_STATES = setOf(RecognitionState.QUEUED, RecognitionState.FAILED, RecognitionState.UNAVAILABLE, RecognitionState.RUNNING)
 
         private fun recognitionRetryDelaySeconds(retryCount: Int): Long =
-            (30L shl retryCount.coerceIn(0, 4)).coerceAtMost(300L)
+            CaptureWorkPolicy.recognitionDelaySeconds(retryCount)
 
         @Volatile private var instance: PhoneCaptureCoordinator? = null
         private val probeRetirementOwners = ConcurrentHashMap<String, ProbeRetirementObserver>()

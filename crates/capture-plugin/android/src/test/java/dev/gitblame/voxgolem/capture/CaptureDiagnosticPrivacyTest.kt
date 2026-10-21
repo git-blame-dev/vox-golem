@@ -18,7 +18,7 @@ class CaptureDiagnosticPrivacyTest {
     private val secret = "Synthetic /storage/synthetic-person/private-note.wav content://synthetic.private/tree/private-document"
     private fun record() = CaptureRecord(id, createdAtUtc = "2026-10-01T00:00:00Z", captureState = CaptureState.SAVED,
         recognitionState = RecognitionState.FINAL, finalText = "Synthetic transcript", sha256 = "a".repeat(64),
-        archiveState = ArchiveState.STAGED)
+        archiveState = ArchiveState.STAGED, localAudioPath = "/synthetic/audio.wav", finalizedByteLength = 48, durableFrames = 2)
 
     @Test fun archiveExceptionPersistsFixedCodeAndProjectionAndReceiptDoNotLeakHistoricalExceptions() {
         val repository = CaptureRepository(context)
@@ -28,7 +28,7 @@ class CaptureDiagnosticPrivacyTest {
         val archive = PhoneCaptureArchive(repository, { throw java.io.IOException(secret) },
             { OrgExportResult(OrgState.EXPORTED, "synthetic-destination") }, delivery)
         try {
-            archive.queue(id, "synthetic-watch")
+            archive.wake()
             val done = CountDownLatch(1); archive.barrier { done.countDown() }
             assertTrue(done.await(5, TimeUnit.SECONDS))
             assertEquals(ArchiveState.RETRYABLE_ERROR, repository.get(id)!!.archiveState)

@@ -7,8 +7,6 @@ import android.app.job.JobService
 import android.content.ComponentName
 import android.content.Context
 import dev.gitblame.voxgolem.android.wear.capture.CaptureRepository
-import java.time.Duration
-import java.time.Instant
 import java.util.concurrent.Executors
 
 class CaptureTransferJob : JobService() {
@@ -77,16 +75,12 @@ class CaptureTransferJob : JobService() {
 
         fun schedule(context: Context, immediate: Boolean = false) {
             val scheduler = context.getSystemService(JobScheduler::class.java)
-            val pending = CaptureRepository(context).pendingTransfers()
-            if (pending.isEmpty()) {
+            val next = CaptureRepository(context).earliestTransferDue()
+            if (next == null) {
                 scheduler.cancel(JOB_ID)
                 return
             }
-            val next = pending.mapNotNull { record ->
-                record.nextRetryAtUtc?.let { runCatching { Instant.parse(it) }.getOrNull() }
-            }.minOrNull()
-            val delay = if (immediate) 0L else next?.let { Duration.between(Instant.now(), it).toMillis() }
-                ?.coerceIn(0L, 300_000L) ?: 30_000L
+            val delay = if (immediate) 0L else (next - System.currentTimeMillis()).coerceAtLeast(0L)
             scheduler.schedule(JobInfo.Builder(JOB_ID, ComponentName(context, CaptureTransferJob::class.java))
                 .setMinimumLatency(delay)
                 .setPersisted(true)

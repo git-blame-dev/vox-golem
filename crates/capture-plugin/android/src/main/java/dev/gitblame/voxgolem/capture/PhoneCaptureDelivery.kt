@@ -4,6 +4,7 @@ import android.content.Context
 import org.json.JSONObject
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.Executors
+import java.util.concurrent.Executor
 
 /** Publishes persisted capture results; live notifications never queue behind archive receipts. */
 internal class PhoneCaptureDelivery(
@@ -14,6 +15,7 @@ internal class PhoneCaptureDelivery(
     private val delivery = java.util.concurrent.ThreadPoolExecutor(1, 1, 0, java.util.concurrent.TimeUnit.MILLISECONDS,
         java.util.concurrent.ArrayBlockingQueue<Runnable>(8))
     private val liveDelivery = Executors.newSingleThreadExecutor()
+    private val livePump = CaptureProjectionPump(liveDelivery)
 
     class Transcript {
         @Volatile var deliverableRevision: Long = 0
@@ -57,9 +59,10 @@ internal class PhoneCaptureDelivery(
             .put("statusRevision", revision)
             .apply { updated.liveErrorCode?.let { put("errorCode", it) } }
             .toString().toByteArray(StandardCharsets.UTF_8)
-        enqueueMessage(nodeId, CaptureWire.READY, bytes) {
+        enqueueMessage(nodeId, CaptureWire.READY, bytes, liveKey = "$nodeId/$captureId/$sessionId/status") {
             repository.isPhoneOrigin(captureId, nodeId) && repository.get(captureId)?.let {
-                it.purpose == CapturePurpose.NOTE && it.recognitionSessionId == sessionId && it.liveStatusRevision == revision
+                it.purpose == CapturePurpose.NOTE && it.recognitionSessionId == sessionId && it.liveStatusRevision == revision &&
+                    it.liveTranscriptionState == status && it.finalText == null
             } == true
         }
     }
@@ -79,9 +82,15 @@ internal class PhoneCaptureDelivery(
         val bytes = body.toByteArray(StandardCharsets.UTF_8)
         if (CaptureProtocol.validatePayloadSize(bytes.size)) {
             if (text.isNotBlank()) transcript.deliverableRevision = revision
-            enqueueMessage(nodeId, path, bytes, timing.takeIf { text.isNotBlank() }) {
+            val family = when {
+                text.isNotBlank() -> "text"
+                final -> "empty-terminal"
+                else -> "empty-partial"
+            }
+            enqueueMessage(nodeId, path, bytes, timing.takeIf { text.isNotBlank() }, liveKey = "$nodeId/$captureId/$sessionId/$family") {
                 repository.isPhoneOrigin(captureId, nodeId) && repository.get(captureId)?.let {
-                    it.recognitionSessionId == sessionId && it.transcriptVersion == transcriptVersion
+                    it.recognitionSessionId == sessionId && it.transcriptVersion == transcriptVersion &&
+                        (final || it.finalText == null)
                 } == true && (final || revision >= transcript.deliverableRevision)
             }
         } else {
@@ -128,22 +137,26 @@ internal class PhoneCaptureDelivery(
         } == true
 
     private fun enqueueMessage(nodeId: String, path: String, bytes: ByteArray, timing: CaptureTiming? = null,
+                               liveKey: String? = null,
                                isCurrent: () -> Boolean = { true }) {
         if (bytes.size > CaptureProtocol.MAX_MESSAGE_BYTES) return
         timing?.mark("first-transcript-enqueued")
-        val sender = if (path in setOf(CaptureWire.READY, CaptureWire.PARTIAL, CaptureWire.FINAL)) liveDelivery else delivery
-        runCatching { sender.execute {
-            if (!isCurrent()) return@execute
+        val work = Runnable {
+            if (!isCurrent()) return@Runnable
             timing?.mark("first-transcript-send-started")
             runCatching { sendMessage(nodeId, path, bytes) }
                 .onSuccess { timing?.mark("first-transcript-send-completed") }
                 .onFailure { timing?.mark("transcript-send-failed") }
-        } }
+        }
+        if (path in setOf(CaptureWire.READY, CaptureWire.PARTIAL, CaptureWire.FINAL)) {
+            livePump.offer(checkNotNull(liveKey), bytes.size, work)
+        } else runCatching { delivery.execute(work) }
     }
 
     fun barrier(done: () -> Unit) { liveDelivery.execute { delivery.execute(done) } }
 
     fun shutdown() {
+        livePump.close()
         delivery.shutdownNow()
         liveDelivery.shutdownNow()
     }
@@ -152,4 +165,52 @@ internal class PhoneCaptureDelivery(
         fun wearReceiptSender(context: Context): (String, String, ByteArray) -> Unit =
             PhoneReceiptChannelSender.google(context)::send
     }
+}
+
+/** Latest-value, insertion-fair pump: one executor runnable, bounded retained keys and payload bytes.
+ * Eviction loses only a projection. Authoritative terminal text/status remain in CaptureRepository
+ * and are replayed through authenticated status receipts, including after process restart.
+ */
+internal class CaptureProjectionPump(
+    private val executor: Executor,
+    private val maximumKeys: Int = 32,
+    private val maximumBytes: Int = 256 * 1024,
+) {
+    init { require(maximumKeys > 0 && maximumBytes > 0) }
+    private data class Entry(val bytes: Int, val work: Runnable)
+    private val pending = LinkedHashMap<String, Entry>()
+    private var bytes = 0
+    private var scheduled = false
+    private var closed = false
+
+    fun offer(key: String, size: Int, work: Runnable) = synchronized(this) {
+        if (closed || size !in 0..maximumBytes) return@synchronized
+        pending.remove(key)?.let { bytes -= it.bytes }
+        while (pending.isNotEmpty() && (pending.size >= maximumKeys || bytes + size > maximumBytes)) {
+            val oldest = pending.entries.iterator()
+            bytes -= oldest.next().value.bytes
+            oldest.remove()
+        }
+        pending[key] = Entry(size, work)
+        bytes += size
+        if (!scheduled) {
+            scheduled = true
+            try { executor.execute { drain() } }
+            catch (_: java.util.concurrent.RejectedExecutionException) { scheduled = false }
+        }
+    }
+
+    private fun drain() {
+        while (true) {
+            val entry = synchronized(this) {
+                val first = pending.entries.iterator()
+                if (closed || !first.hasNext()) { scheduled = false; return }
+                first.next().value.also { bytes -= it.bytes; first.remove() }
+            }
+            runCatching { entry.work.run() }
+        }
+    }
+
+    @Synchronized internal fun retained(): Pair<Int, Int> = pending.size to bytes
+    @Synchronized fun close() { closed = true; pending.clear(); bytes = 0 }
 }
