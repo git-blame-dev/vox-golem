@@ -57,6 +57,18 @@ object AssistantRuntime {
     fun syntheticSession(context: Context, directory: File, model: String = "custom-luna-none",
         beginTiming: (AssistantTiming.Operation) -> AssistantTiming): SyntheticSession {
         validateSyntheticModel(model)
+        return isolatedSession(context, directory, model, model == "agy-flash-low", beginTiming)
+    }
+
+    /** Typed instrumentation uses real providers with test-owned policy, never user selections. */
+    fun typedBenchmarkSession(context: Context, directory: File, model: String, webEnabled: Boolean,
+        beginTiming: (AssistantTiming.Operation) -> AssistantTiming): SyntheticSession {
+        require(model == "custom-luna-none")
+        return isolatedSession(context, directory, model, webEnabled, beginTiming)
+    }
+
+    private fun isolatedSession(context: Context, directory: File, model: String, webEnabled: Boolean,
+        beginTiming: (AssistantTiming.Operation) -> AssistantTiming): SyntheticSession {
         require(directory.parentFile?.canonicalFile == context.cacheDir.canonicalFile &&
             directory.name.matches(Regex("synthetic-ask-[a-f0-9-]{36}")))
         check(directory.mkdir())
@@ -77,7 +89,7 @@ object AssistantRuntime {
         }
         val policies = object : AssistantPolicyStorage {
             // Agy cannot enforce tool denial; use its real supported policy, never pretend web is disabled.
-            private val value = AssistantPolicy(webEnabled = model == "agy-flash-low", speechNetworkFallback = false,
+            private val value = AssistantPolicy(webEnabled = webEnabled, speechNetworkFallback = false,
                 speechLanguage = "en-AU", speechTtsProvider = "com.google.android.tts")
             override fun read() = value
             override fun write(value: AssistantPolicy) { require(value == this.value) }

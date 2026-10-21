@@ -127,7 +127,7 @@ open class AssistantActivity : ComponentActivity() {
     }
 
     private fun startBackgroundSync() {
-        if (SyntheticAskBenchmark.active(client)) return
+        if (SyntheticAskBenchmark.active(client) || TypedAskBenchmark.active(client)) return
         if (client is AssistantEngine) {
             (client as AssistantEngine).prewarm()
             AssistantReplication.reconcileNow(applicationContext)
@@ -154,9 +154,19 @@ open class AssistantActivity : ComponentActivity() {
     }
 
     protected open fun assistantClient(): AssistantClient = SyntheticAskBenchmark.client(this)
+        ?: TypedAskBenchmark.client(this)
         ?: AssistantRuntime.get(applicationContext, startupTiming)
     protected open fun assistantVoice(client: AssistantClient): AssistantVoiceController = SyntheticAskBenchmark.voice(this, client)
+        ?: TypedAskBenchmark.voice(client)
         ?: WearAssistantVoice(this, client as AssistantEngine)
+    internal fun typedBenchmarkProjection(): AssistantHistoryState = historyState
+    internal fun typedBenchmarkProvisional(): String = state.provisional
+    internal fun typedBenchmarkDraft(): String = state.draft
+    internal fun typedBenchmarkPrimary(): Pair<String, Boolean> {
+        val presented = presentedVoiceState()
+        return assistantPrimaryControl(state, presented, assistantRepeatsAfterReply(presented, voicePreferences))
+            .let { it.action.name to it.enabled }
+    }
     internal open fun assistantVoiceSettings(): WearVoiceSettings = WearVoiceSettings.production(applicationContext)
     private fun admitLaunch(entry: Boolean?) {
         pendingVoiceLaunch = null
@@ -184,8 +194,8 @@ open class AssistantActivity : ComponentActivity() {
             } else WearVoiceIntentOrder.next()
         }
         client = assistantClient()
-        replyMetrics = AssistantReplyMetrics(SyntheticAskBenchmark.context(client) ?: applicationContext)
-        if (client is AssistantEngine && !SyntheticAskBenchmark.active(client)) AssistantRuntime.configureCaptureResourceAdmission(true)
+        replyMetrics = AssistantReplyMetrics(SyntheticAskBenchmark.context(client) ?: TypedAskBenchmark.context(client) ?: applicationContext)
+        if (client is AssistantEngine && !SyntheticAskBenchmark.active(client) && !TypedAskBenchmark.active(client)) AssistantRuntime.configureCaptureResourceAdmission(true)
         voice = assistantVoice(client)
         readVoicePreferences()
         state = client.snapshot()
@@ -381,7 +391,7 @@ open class AssistantActivity : ComponentActivity() {
         }?.draft ?: client.snapshot().draft
         pendingVoiceLaunch = null; permissionAction = null
         voice.stop()
-        if (!SyntheticAskBenchmark.active(client)) (client as? AssistantEngine)?.prewarm()
+        if (!SyntheticAskBenchmark.active(client) && !TypedAskBenchmark.active(client)) (client as? AssistantEngine)?.prewarm()
         editor.launch(Intent(this, AssistantTextEntryActivity::class.java).putExtra(AssistantTextInput.DRAFT, prefill))
     }
 
@@ -404,6 +414,7 @@ open class AssistantActivity : ComponentActivity() {
     internal fun sendManually() {
         if (!visible || !resumed || isFinishing || isDestroyed || client.snapshot().busy || voiceAdmissionPending) return
         if (client.snapshot().model !in AssistantModels.aliases) return
+        if (!TypedAskBenchmark.permitUiSend(client)) return
         permissionAction = null
         if (!voice.send()) client.send()
     }
@@ -528,6 +539,12 @@ open class AssistantActivity : ComponentActivity() {
         pendingSpeechSelection = null
     }
     private fun readVoicePreferences() {
+        if (TypedAskBenchmark.active(client)) {
+            voicePreferences = WearVoicePreferences(readRepliesAloud = false, conversationMode = false)
+            voiceSettingsReady = true
+            voiceSettingsLoadFinished = true
+            return
+        }
         if (SyntheticAskBenchmark.active(client)) {
             voicePreferences = WearVoicePreferences(readRepliesAloud = true, conversationMode = false)
             voiceSettingsReady = true
@@ -625,7 +642,7 @@ open class AssistantActivity : ComponentActivity() {
     }
 
     protected open fun readLinkStatus(result: (PeerPairingState) -> Unit) {
-        if (client is AssistantEngine && !SyntheticAskBenchmark.active(client)) AssistantReplication.pairingState(applicationContext, result)
+        if (client is AssistantEngine && !SyntheticAskBenchmark.active(client) && !TypedAskBenchmark.active(client)) AssistantReplication.pairingState(applicationContext, result)
         else result(PeerPairingState(PeerPairingReason.UNAVAILABLE))
     }
 
@@ -643,7 +660,7 @@ open class AssistantActivity : ComponentActivity() {
 
     internal fun recheck() {
         client.refresh()
-        if (SyntheticAskBenchmark.active(client)) return
+        if (SyntheticAskBenchmark.active(client) || TypedAskBenchmark.active(client)) return
         if (!voiceSettingsReady && voiceSettingsLoadFinished) readVoicePreferences()
         if (client !is AssistantEngine) return
         refreshLinkStatus()
