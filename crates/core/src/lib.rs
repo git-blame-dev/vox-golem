@@ -9,6 +9,7 @@ pub mod conversation_sync;
 pub mod durable_conversation;
 pub mod external_correlation;
 pub mod ipc;
+pub mod model_catalog;
 pub mod response_style;
 pub mod runtime;
 pub mod search;

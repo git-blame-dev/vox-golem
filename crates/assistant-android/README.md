@@ -211,6 +211,13 @@ preferences and unknown processing/model identities; no historical offline trial
 is asserted as proof of today's utterance. Microphone cues play once at SDK readiness
 and once at successful finish, with cancellation/background/close fencing.
 
+Static model labels/grouping/membership come from the shared Rust
+[`model_catalog`](../core/src/model_catalog.rs). From the checkout root,
+`make model-catalog` regenerates the checked-in Kotlin/TypeScript consumers and
+`make check-model-catalog` checks freshness. Platform display overrides and stable
+historical IDs are explicit; generated metadata does not expand provider support
+or override native readiness. The normal test gate checks the generated files.
+
 [RecognitionResourceLease](../voice-android/src/main/java/dev/gitblame/voxgolem/assistant/recognition/RecognitionResourceLease.kt)
 serializes Assistant speech/playback with Note/live/replay/probe owners, without
 preemption. Failed SDK teardown retains admission until retirement succeeds. The

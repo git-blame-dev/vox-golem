@@ -161,12 +161,20 @@ test:
 	bun run lint
 	bun run test
 	bun run build
+	$(MAKE) --no-print-directory check-model-catalog
 	$(MAKE) --no-print-directory test-release-tools
 	$(MAKE) --no-print-directory test-android-tools
 	$(MAKE) --no-print-directory test-local-runtime-tools
 	cargo fmt --all -- --check
 	cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 	cargo test --locked --workspace
+
+.PHONY: model-catalog check-model-catalog
+model-catalog:
+	python3 scripts/generate-model-catalog.py
+
+check-model-catalog:
+	python3 scripts/generate-model-catalog.py --check
 
 test-release-tools:
 	@command -v jq >/dev/null || { printf '%s\n' 'Missing jq.' >&2; exit 1; }
