@@ -13,7 +13,6 @@ import org.junit.Assert.*
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
-import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
@@ -21,7 +20,7 @@ import org.robolectric.annotation.LooperMode
 import org.robolectric.shadows.ShadowSpeechRecognizer
 import java.time.Duration
 
-@RunWith(RobolectricTestRunner::class)
+@RunWith(PhoneAssistantRunner::class)
 @Config(sdk = [35], manifest = Config.NONE)
 @LooperMode(LooperMode.Mode.PAUSED)
 class PhoneShortcutSessionTest {

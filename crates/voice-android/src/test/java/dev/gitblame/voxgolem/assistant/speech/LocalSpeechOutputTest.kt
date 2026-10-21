@@ -613,6 +613,27 @@ class LocalSpeechOutputTest {
         replacement.stop(); drain(); assertNull(leases.current())
     }
 
+    @Test fun disabledPreparationPublishesInventoryWithoutPrimingOrHoldingResources() {
+        val leases = RecognitionResourceLease()
+        val speech = LocalSpeechOutput(factory, focus, leases = leases)
+        speech.setForeground(true); speech.prepare("en-US"); drain()
+        factory.ready(true); drain()
+        val state = speech.snapshot()
+        assertFalse(state.enabled)
+        assertEquals(SpeechPhase.IDLE, state.phase)
+        assertNull(state.error)
+        assertTrue(state.localVoiceAvailable)
+        assertTrue(state.voiceAvailable)
+        assertEquals("synthetic-local", speech.options().ttsVoices.single().name)
+        assertTrue(factory.sdk.shutdown)
+        assertEquals(1, factory.sdk.shutdownCalls)
+        assertTrue(factory.sdk.spoken.isEmpty())
+        assertNull(leases.current())
+        assertEquals(0, focus.requests)
+        assertEquals(0, factory.sdk.warmups.size)
+        speech.close(); drain()
+    }
+
     @Test fun prepareTriggersWarmupOnReadySession() {
         enable()
         output.prepare("en-US"); drain()

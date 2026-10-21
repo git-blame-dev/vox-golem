@@ -7,14 +7,13 @@ import dev.gitblame.voxgolem.assistant.speech.*
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
-import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.LooperMode
 import java.time.Duration
 import java.util.Locale
 
-@RunWith(RobolectricTestRunner::class)
+@RunWith(WearAssistantRunner::class)
 @Config(sdk = [35], manifest = Config.NONE)
 @LooperMode(LooperMode.Mode.PAUSED)
 class AssistantManualReplySpeechTest {
@@ -86,6 +85,12 @@ class AssistantManualReplySpeechTest {
         }
     }
     private class Generation : EnginePort {
+        private val streamListeners = mutableListOf<(String) -> Unit>()
+        override fun observeStreamText(listener: (String) -> Unit): AutoCloseable {
+            streamListeners += listener
+            return AutoCloseable { streamListeners -= listener }
+        }
+        fun stream(text: String) { streamListeners.toList().forEach { it(text) } }
         val prompts = mutableListOf<String>()
         val callbacks = mutableListOf<(GenerationResult) -> Unit>()
         var stops = 0
@@ -755,6 +760,28 @@ class AssistantManualReplySpeechTest {
         Thread { generation.callbacks.single()(GenerationResult.Complete("Synthetic durable answer")) }.apply { start(); join() }
         drain(); complete("Synthetic duplicate terminal")
         assertEquals(listOf("Synthetic durable answer"), tts.spoken)
+        voice.close(); drain()
+    }
+
+    @Test fun abandonedShortManualRepliesReleaseNativePoliciesBeforeLateTerminals() {
+        start()
+        for (mode in listOf("failure", "stop", "background", "disable", "stop-emitted", "background-emitted")) {
+            repeat(70) {
+                voice.send(); drain()
+                generation.stream(if (mode.endsWith("emitted")) "One two three. " else "One two"); drain()
+                val terminal = generation.callbacks.last()
+                when (mode) {
+                    "stop", "stop-emitted" -> { voice.stop(); drain() }
+                    "background", "background-emitted" -> { voice.foreground(false); drain(); voice.foreground(true); drain() }
+                    "disable" -> { voice.tts(false); drain(); voice.tts(true); drain() }
+                }
+                terminal(GenerationResult.Failed("synthetic_failure")); drain()
+            }
+            voice.send(); drain(); ready()
+            complete("Synthetic recovered $mode reply")
+            assertTrue("fresh reply after $mode", tts.spoken.contains("Synthetic recovered $mode reply"))
+            voice.stop(); drain()
+        }
         voice.close(); drain()
     }
 

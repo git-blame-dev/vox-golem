@@ -4,6 +4,7 @@ mod domain;
 mod outcome;
 mod request;
 mod search;
+mod speech_bridge;
 mod store_bridge;
 
 #[cfg(test)]

@@ -197,13 +197,28 @@ the next playback admission. Native TTS splits long answers into sequential chun
 strictly below the platform UTF-16 input limit without splitting surrogate pairs;
 one playback epoch retains focus/resource admission until the final chunk or failure.
 Stop, shutdown, replacement and late SDK callbacks cannot advance an old chunk chain.
+
+Portable reply selection is owned by
+[`voxgolem-core::reply_speech`](../core/src/reply_speech.rs), shared with desktop.
+Android/Wear retain early clause release; desktop retains its first-line release.
+Both use the same first-paragraph normalization, 600 UTF-8 byte / 100 word limits,
+generation fences and canonical-final reconciliation. Issued early replacements
+also consume the admission budget. Already-spoken provisional audio cannot be
+retracted. The Assistant-layer JNI/effects adapter sends incremental text and
+uses a bounded two-chunk SDK window for next-clause read-ahead; the common voice/capture libraries remain
+JNI-independent. Stream closure is not generation completion or physical retirement.
+Phone voice discovery is silent and independent of the playback toggle, coalesced
+while foreground/idle and rechecked after a genuine foreground exit. It does not
+enable speech or retain disabled SDK sessions indefinitely. Provider restrictions
+still apply; discovery is not proof of an audible or offline runtime outcome.
+
 The explicitly started
 [ConversationLoopController](src/main/java/dev/gitblame/voxgolem/assistant/speech/ConversationLoopController.kt)
 allows one generation per final utterance, optional TTS and then a next-turn timer.
 Stop invalidates the epoch and retires recognition, generation, playback and timers;
 foregrounding or SDK errors do not restart the loop.
-Phone/Wear consume answer-only `speechText` when supplied, preserving sources in
-the canonical answer. Normal no-match (`recognition_error_7`) remains a failed
+Phone/Wear derive speech from the canonical answer/refusal; there is no parallel
+`speechText` result field. Normal no-match (`recognition_error_7`) remains a failed
 recognition, not a successful final or automatic Send. `recognitionUiError` hides
 only that warning; partial text, retirement and raw `diagnosticError` remain.
 Route metadata distinguishes requested/selected/reported/installed facts, engine

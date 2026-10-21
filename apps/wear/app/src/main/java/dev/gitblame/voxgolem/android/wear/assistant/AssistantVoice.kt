@@ -139,6 +139,8 @@ internal class WearAssistantVoice(
     private var publishedOptions: SpeechOptions? = null
     private val replyEpoch = AtomicLong()
     private var manualRequest: Long? = null
+    // Own the policy before its first clause and retain effects ownership through playback.
+    private var manualSpeechStreamer: ReplySpeechStreamer? = null
     private var manualStreamSubscription: AutoCloseable? = null
     private var foreground = false
     private var closed = false
@@ -322,13 +324,14 @@ internal class WearAssistantVoice(
     }
     override fun send(): Boolean {
         if (closed || !foreground || mode || snapshot().listening || engine.snapshot().busy || manualRequest != null) return true
+        retireManualReply()
         val ticket = replyEpoch.incrementAndGet()
         manualRequest = ticket
         val speakReply = repliesEnabled
         error = null
         if (output.snapshot().phase != SpeechPhase.PREPARING) output.stop()
         if (speakReply) output.prepare(language)
-        val speechStreamer = ReplySpeechStreamer(output.asController())
+        val speechStreamer = ReplySpeechStreamer(output.asController()).also { manualSpeechStreamer = it }
         manualStreamSubscription?.close()
         manualStreamSubscription = if (speakReply) {
             generation.observeStreamText { fullTextSoFar ->
@@ -348,13 +351,12 @@ internal class WearAssistantVoice(
                 manualStreamSubscription?.close()
                 manualStreamSubscription = null
                 if (!speakReply || !currentReply(ticket) || result !is GenerationResult.Complete || result.finalText.isBlank()) {
-                    if (speechStreamer.hasStreamedChunks) {
-                        speechStreamer.reset()
-                        output.stop()
-                    }
+                    if (manualSpeechStreamer === speechStreamer) manualSpeechStreamer = null
+                    speechStreamer.cancel()
                     return@post
                 }
                 speechStreamer.onComplete(result.finalText, language) { failure -> main.post {
+                    if (manualSpeechStreamer === speechStreamer) manualSpeechStreamer = null
                     if (currentReply(ticket)) { error = failure; publish() }
                 } }
             } }
@@ -369,6 +371,9 @@ internal class WearAssistantVoice(
         manualRequest = null
         manualStreamSubscription?.close()
         manualStreamSubscription = null
+        val retired = manualSpeechStreamer
+        manualSpeechStreamer = null
+        retired?.cancel()
     }
     override fun endUtterance() {
         microphoneCues?.finish(dictation.snapshot().utterance)
@@ -381,7 +386,7 @@ internal class WearAssistantVoice(
     override fun tts(enabled: Boolean) {
         if (closed) return
         repliesEnabled = enabled
-        if (!enabled) replyEpoch.incrementAndGet()
+        if (!enabled) retireManualReply()
         output.setEnabled(enabled)
         publish()
     }

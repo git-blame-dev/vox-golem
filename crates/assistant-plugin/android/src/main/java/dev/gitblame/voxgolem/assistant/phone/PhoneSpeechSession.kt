@@ -5,6 +5,7 @@ import android.os.Handler
 import android.os.Looper
 import dev.gitblame.voxgolem.assistant.recognition.AndroidLocalRecognizerFactory
 import dev.gitblame.voxgolem.assistant.recognition.DictationPhase
+import dev.gitblame.voxgolem.assistant.recognition.RecognitionResourceLease
 import dev.gitblame.voxgolem.assistant.recognition.SharedDictationOwner
 import dev.gitblame.voxgolem.assistant.recognition.RecordedAudioFactory
 import dev.gitblame.voxgolem.assistant.recognition.RecordedAudioResult
@@ -96,7 +97,7 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
                 main.post { synchronized(replyLock) { replyOwner?.streamer }?.cancel() }
             }
             output.setEnabled(enabled)
-            if (visible && enabled) output.prepare(language)
+            main.post { prepareInventory(preparePlayback = enabled) }
         }
     }
     private data class ReplyOwner(
@@ -104,6 +105,7 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
         val ticket: Long,
         val loopReply: Boolean,
         val streamer: ReplySpeechStreamer? = null,
+        var generationSettled: Boolean = false,
     )
     private val replyLock = Any()
     private var replySerial = 0L
@@ -131,6 +133,7 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
     private var sessionConversation: String? = null
     private var sessionHead: String? = null
     private var publishedOptions: SpeechOptions? = null
+    private var inventoryAdmission: SpeechAdmission? = null
     private val language = Locale.getDefault().toLanguageTag()
     private var inputAudio: RecordedAudioResult? = null
     private val loop = ConversationLoopController(dictation, output, object : EnginePort {
@@ -170,7 +173,6 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
                 backend.saveOwnedSpeechDraft(value.draft, draftConversation, draftHead)
                 if (value.phase in setOf(DictationPhase.FINAL, DictationPhase.ERROR)) draftUtterance = null
             }
-            if (visible && value.phase == DictationPhase.FINAL && output.snapshot().enabled) output.prepare(language)
             if (mode == "shortcut" && shortcut != null) {
                 shortcutAction = shortcut!!.state(value.phase.name.lowercase(), value.draft, value.error)
                 projectedDraft = shortcut!!.latest
@@ -201,6 +203,7 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
                     synchronized(replyLock) {
                         if (!closed && waitingInputContextChanged()) stop()
                     }
+                    prepareInventory()
                 }
             }
         },
@@ -298,6 +301,22 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
         val value = status()
         backend.speechStatus = value
         if (sessionId != null) emit(JSONObject(value.toString()))
+        main.removeCallbacks(inventoryPreparation)
+        if (!closed && visible) main.post(inventoryPreparation)
+    }
+
+    private val inventoryPreparation = Runnable { prepareInventory() }
+    // Discovery is independent of playback consent. Remember only the bounded request key,
+    // not an SDK: disabled output still disposes its session after publishing inventory.
+    // The key is scoped to a visible interval, not proof that platform voice data stays fresh.
+    private fun prepareInventory(preparePlayback: Boolean = false) {
+        if (closed || !visible || backend.busy() || active() ||
+            !AssistantRuntime.captureResourceAdmissionReady() ||
+            RecognitionResourceLease.process.current() != null) return
+        val admission = speechAdmission(backend.nativePreferences())
+        if (inventoryAdmission == admission && !preparePlayback) return
+        inventoryAdmission = admission
+        output.prepare(language)
     }
 
     fun foreground(visible: Boolean, retainGeneration: Boolean = false) {
@@ -305,6 +324,7 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
         val retiredStreamer = synchronized(replyLock) {
             if (closed) return
             generationEligible = visible || retainGeneration
+            if (this.visible && !visible) inventoryAdmission = null
             this.visible = visible
             if (!visible && (!retainVoice || replyOwner?.requestId != authorizedVoiceRequest())) {
                 replyOwner?.streamer.also { replyOwner = null }
@@ -320,7 +340,7 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
             if (!retainVoice) { waiting = null; waitingAudio = null; inputAudio = null }
         }
         loop.setForeground(visible, retireGeneration = !retainGeneration)
-        if (visible && output.snapshot().enabled) output.prepare(language)
+        if (visible) main.post { prepareInventory(preparePlayback = output.snapshot().enabled) }
         // The registered channel must see native lifecycle authority before it is retired.
         publishStatus()
         if (!visible && !retainVoice) { sessionId = null; sink = null }
@@ -501,9 +521,9 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
         }
         main.post {
             synchronized(replyLock) {
-                val owner = replyOwner?.takeIf { !closed && (visible || generationEligible) && it.requestId == requestId && it.ticket == replyTicket }
+                val owner = replyOwner?.takeIf { !closed && (visible || generationEligible) && !it.generationSettled && it.requestId == requestId && it.ticket == replyTicket }
                     ?: return@post
-                replyOwner = null
+                owner.generationSettled = true
                 if (shortcutRequest == requestId) { shortcutToken?.let(NewVoiceShortcutLauncher.actions::release); shortcutRequest = null }
                 val value = result.getOrNull() as? JSONObject
                 val turn = value?.optJSONObject("turn")
@@ -511,15 +531,29 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
                 if (pending == null) {
                     if (visible && !owner.loopReply && value != null && !value.has("warning") && turn != null && AssistantRuntime.captureResourceAdmissionReady() && output.snapshot().enabled && value.optString("kind") in setOf("completed", "refused") && loop.snapshot().phase !in setOf(LoopPhase.GENERATING, LoopPhase.SPEAKING, LoopPhase.LISTENING)) {
                         val fullText = turn.getJSONObject("answer").getJSONObject("content").let { it.getString(if (it.getString("kind") == "refusal") "reason" else "text") }
-                        owner.streamer?.onComplete(fullText, language) { publishStatus() }
-                    } else if (!owner.loopReply && owner.streamer?.hasStreamedChunks == true) {
-                        owner.streamer.reset()
-                        output.stop()
+                        // Generation settlement releases Rust policy, not outstanding SDK
+                        // ownership. Keep this exact owner until playback settles or a new
+                        // admission retires it before issuing successor output effects.
+                        owner.streamer?.onComplete(fullText, language) {
+                            synchronized(replyLock) {
+                                if (replyOwner === owner) {
+                                    replyOwner = null
+                                    publishStatus()
+                                }
+                            }
+                        }
+                    } else {
+                        // Policy admission can precede the first audible clause.
+                        // Retire the owner even when no SDK work was issued.
+                        if (replyOwner === owner) replyOwner = null
+                        owner.streamer?.cancel()
                     }
                     publishStatus()
                     if (!visible) { sessionId = null; sink = null }
                     return@post
                 }
+                // Loop replies have no per-request streamer: the loop owns playback.
+                if (replyOwner === owner) replyOwner = null
                 val audio = waitingAudio?.takeIf { it.first == requestId }?.second
                 waiting = null; waitingAudio = null
                 pending.second(if (value != null && value.has("warning")) GenerationResult.Failed(value.getString("warning"))
@@ -546,6 +580,7 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
             if (Looper.myLooper() == main.looper) streamer.cancel() else main.post { streamer.cancel() }
         }
         microphoneCues.close()
+        main.removeCallbacks(inventoryPreparation)
         stop(); subscriptions.forEach { it.close() }; loop.close(); dictation.close(); output.close()
         if (backend.onPreferencesChanged === preferenceObserver) backend.onPreferencesChanged = null
     }

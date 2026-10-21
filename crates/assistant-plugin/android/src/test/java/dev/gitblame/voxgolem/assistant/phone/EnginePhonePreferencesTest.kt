@@ -99,6 +99,71 @@ class EnginePhonePreferencesTest {
 
     @After fun resetAdmission() { AssistantRuntime.configureCaptureResourceAdmission(false) }
 
+    @Test @Config(shadows = [PhoneCueTtsShadow::class])
+    fun disabledDiscoveryRechecksInstalledVoiceDataOnlyAfterARealForegroundExit() {
+        AssistantRuntime.configureCaptureResourceAdmission(true)
+        fun drain() = org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+        Fixture(false).use { f ->
+            PhoneSpeechSession(f.context, f.backend).use { phone ->
+                phone.foreground(true); drain()
+                val first = org.robolectric.shadows.ShadowTextToSpeech.getLastTextToSpeechInstance()
+                val firstShadow = org.robolectric.shadow.api.Shadow.extract<PhoneCueTtsShadow>(first)
+                firstShadow.onInitListener.onInit(android.speech.tts.TextToSpeech.SUCCESS); drain()
+                assertFalse(f.backend.speechStatus!!.getBoolean("ttsAvailable"))
+                assertTrue(firstShadow.isShutdown)
+                org.robolectric.shadows.ShadowTextToSpeech.addVoice(android.speech.tts.Voice(
+                    "synthetic-newly-installed-voice", java.util.Locale.getDefault(), android.speech.tts.Voice.QUALITY_NORMAL,
+                    android.speech.tts.Voice.LATENCY_NORMAL, false, emptySet()))
+                repeat(3) { phone.foreground(true); phone.status(); drain() }
+                assertSame(first, org.robolectric.shadows.ShadowTextToSpeech.getLastTextToSpeechInstance())
+                phone.foreground(false); drain()
+                phone.foreground(false); drain()
+                phone.foreground(true); drain()
+                val second = org.robolectric.shadows.ShadowTextToSpeech.getLastTextToSpeechInstance()
+                assertNotSame("Returning from voice-data installation must requery the platform", first, second)
+                val secondShadow = org.robolectric.shadow.api.Shadow.extract<PhoneCueTtsShadow>(second)
+                secondShadow.onInitListener.onInit(android.speech.tts.TextToSpeech.SUCCESS); drain()
+                assertTrue(f.backend.speechStatus!!.getBoolean("ttsAvailable"))
+                assertFalse(phone.status().getBoolean("ttsEnabled"))
+                assertTrue(secondShadow.isShutdown)
+                assertTrue(firstShadow.spoken.isEmpty()); assertTrue(secondShadow.spoken.isEmpty())
+                repeat(3) { phone.foreground(true); phone.status(); drain() }
+                assertSame(second, org.robolectric.shadows.ShadowTextToSpeech.getLastTextToSpeechInstance())
+                assertTrue((f.update(f.backend.nativePreferences().put("tts_enabled", true)).getOrThrow() as JSONObject)
+                    .getBoolean("tts_enabled"))
+            }
+        }
+    }
+
+    @Test @Config(shadows = [PhoneCueTtsShadow::class])
+    fun coldDisabledPhonePublishesSilentInventoryAndCanEnableThroughTheRealGate() {
+        AssistantRuntime.configureCaptureResourceAdmission(true)
+        org.robolectric.shadows.ShadowTextToSpeech.addVoice(android.speech.tts.Voice(
+            "synthetic-local-voice", java.util.Locale.getDefault(), android.speech.tts.Voice.QUALITY_NORMAL,
+            android.speech.tts.Voice.LATENCY_NORMAL, false, emptySet()))
+        Fixture(false).use { f ->
+            PhoneSpeechSession(f.context, f.backend).use { phone ->
+                phone.foreground(true)
+                org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+                val sdk = org.robolectric.shadows.ShadowTextToSpeech.getLastTextToSpeechInstance()
+                assertNotNull("Disabled cold bootstrap must query native TTS inventory", sdk)
+                val shadow = org.robolectric.shadow.api.Shadow.extract<PhoneCueTtsShadow>(sdk)
+                shadow.onInitListener.onInit(android.speech.tts.TextToSpeech.SUCCESS)
+                org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+                assertTrue(f.backend.speechStatus!!.getBoolean("ttsAvailable"))
+                assertFalse(phone.status().getBoolean("ttsEnabled"))
+                assertTrue(shadow.spoken.isEmpty())
+                assertTrue("Disabled inventory must retire its SDK", shadow.isShutdown)
+                assertNull(dev.gitblame.voxgolem.assistant.recognition.RecognitionResourceLease.process.current())
+                repeat(3) { phone.status(); phone.foreground(true) }
+                org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+                assertSame(sdk, org.robolectric.shadows.ShadowTextToSpeech.getLastTextToSpeechInstance())
+                assertTrue((f.update(f.backend.nativePreferences().put("tts_enabled", true)).getOrThrow() as JSONObject)
+                    .getBoolean("tts_enabled"))
+            }
+        }
+    }
+
     @Test fun removedModeCommandsFailImmediatelyWithoutChangingStateOrPreferences() {
         Fixture(false).use { f ->
             f.engine.setWebEnabled(false); f.drain()

@@ -16,7 +16,6 @@ import org.junit.Assert.*
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
-import org.robolectric.RobolectricTestRunner
 import org.robolectric.Robolectric
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
@@ -30,7 +29,7 @@ import org.robolectric.shadows.ShadowTextToSpeech
 import java.util.Locale
 import java.time.Duration
 
-@RunWith(RobolectricTestRunner::class)
+@RunWith(PhoneAssistantRunner::class)
 @Config(sdk = [35], manifest = Config.NONE)
 @LooperMode(LooperMode.Mode.PAUSED)
 class PhoneFinishSessionTest {
@@ -733,10 +732,55 @@ class PhoneFinishSessionTest {
         val secondTicket = phone.onRequestSubmitted("synthetic-stream-request-2")
         backend.publishStream("synthetic-stream-request-2", "Second turn first clause. Second turn second clause.\n\nSecond paragraph details.")
         drain()
-        assertEquals(listOf("Second turn first clause.", "Second turn second clause."), reenabledTts.spoken)
+        assertEquals(listOf("Second turn first clause. Second turn second clause."), reenabledTts.spoken)
         phone.onRequestResult("synthetic-stream-request-2", answer("Second turn first clause. Second turn second clause."), secondTicket)
         drain()
-        assertEquals(listOf("Second turn first clause.", "Second turn second clause."), reenabledTts.spoken)
+        assertEquals(listOf("Second turn first clause. Second turn second clause."), reenabledTts.spoken)
+    }
+
+    @Test @Config(shadows = [PhoneCueTtsShadow::class]) fun successorAdmissionRetiresCompletedReplyBeforeReplacingItsOutstandingAudio() {
+        val firstTts = enableTts()
+        val firstTicket = phone.onRequestSubmitted("synthetic-playback-a")
+        phone.onRequestResult("synthetic-playback-a", answer("Synthetic first outstanding answer"), firstTicket); drain()
+        assertEquals(listOf("Synthetic first outstanding answer"), firstTts.spoken)
+        val oldListener = firstTts.utteranceProgressListener
+        val oldId = firstTts.utteranceIds.single()
+
+        val nextTicket = phone.onRequestSubmitted("synthetic-playback-b")
+        backend.publishStream("synthetic-playback-b", "Synthetic next streaming answer. "); drain()
+        val nextTts = readyTts()
+        phone.onRequestResult("synthetic-playback-b", answer("Synthetic next streaming answer."), nextTicket); drain()
+        oldListener.onDone(oldId); oldListener.onError(oldId, 8); drain()
+        phone.onRequestResult("synthetic-playback-a", answer("Synthetic stale replacement"), firstTicket); drain()
+        assertEquals(listOf("Synthetic next streaming answer."), nextTts.spoken)
+        assertEquals("speaking", phone.status().getString("ttsPhase"))
+        nextTts.utteranceProgressListener.onDone(nextTts.utteranceIds.single()); drain()
+        assertEquals("idle", phone.status().getString("ttsPhase"))
+        // A duplicate canonical terminal must not replay an already-settled owner.
+        phone.onRequestResult("synthetic-playback-b", answer("Synthetic duplicate"), nextTicket); drain()
+        assertEquals(1, nextTts.spoken.size)
+    }
+
+    @Test @Config(shadows = [PhoneCueTtsShadow::class]) fun abandonedShortProvisionalRepliesReleaseNativePolicies() {
+        enableTts()
+        for (mode in listOf("failure", "stop", "background")) {
+            repeat(70) { index ->
+                val id = "synthetic-abandoned-$mode-$index"
+                val ticket = phone.onRequestSubmitted(id)
+                backend.publishStream(id, "One two"); drain()
+                when (mode) {
+                    "stop" -> { phone.stop(); drain() }
+                    "background" -> { phone.foreground(false); drain(); phone.foreground(true); drain() }
+                }
+                phone.onRequestResult(id, Result.failure<Any?>(IllegalStateException("synthetic_failure")), ticket); drain()
+            }
+            val id = "synthetic-fresh-$mode"
+            val ticket = phone.onRequestSubmitted(id)
+            phone.onRequestResult(id, answer("Synthetic recovered $mode reply"), ticket); drain()
+            val tts = readyTts()
+            assertTrue("fresh reply after $mode", tts.spoken.contains("Synthetic recovered $mode reply"))
+            phone.stop(); drain()
+        }
     }
 
     @Test fun idleBackgroundAndCloseDoNotOverwriteNewerDraftOrResurrectSentFinal() {
@@ -794,8 +838,9 @@ class PhoneFinishSessionTest {
 @Implements(TextToSpeech::class)
 class PhoneCueTtsShadow : ShadowTextToSpeech() {
     val spoken = mutableListOf<String>()
+    val utteranceIds = mutableListOf<String>()
     var beforeSpeak: (() -> Unit)? = null
     @Implementation override fun speak(text: CharSequence?, queueMode: Int, params: Bundle?, utteranceId: String?): Int {
-        beforeSpeak?.invoke(); spoken += text.toString(); return TextToSpeech.SUCCESS
+        beforeSpeak?.invoke(); spoken += text.toString(); utteranceId?.let(utteranceIds::add); return TextToSpeech.SUCCESS
     }
 }

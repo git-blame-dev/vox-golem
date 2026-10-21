@@ -6,12 +6,11 @@ import dev.gitblame.voxgolem.assistant.recognition.*
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
-import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.LooperMode
 
-@RunWith(RobolectricTestRunner::class)
+@RunWith(dev.gitblame.voxgolem.assistant.AssistantStoreRunner::class)
 @Config(sdk = [35], manifest = Config.NONE)
 @LooperMode(LooperMode.Mode.PAUSED)
 class RecordedVoiceLoopTest {

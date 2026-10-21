@@ -8,14 +8,13 @@ import dev.gitblame.voxgolem.assistant.AssistantTiming.Kind
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
-import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.LooperMode
 import java.time.Duration
 import java.util.Locale
 
-@RunWith(RobolectricTestRunner::class)
+@RunWith(dev.gitblame.voxgolem.assistant.AssistantStoreRunner::class)
 @Config(sdk = [35], manifest = Config.NONE)
 @LooperMode(LooperMode.Mode.PAUSED)
 class ConversationLoopControllerTest {
@@ -121,7 +120,7 @@ class ConversationLoopControllerTest {
         loop.setForeground(true); output.setEnabled(true)
         loop.start("en-US", policy = VoiceSessionPolicy.SINGLE_TURN); drain()
         recognition.sessions.single().events.final("Synthetic test question"); drain()
-        engine.streamListener!!("Synthetic first sentence."); drain(); tts.ready(true); drain()
+        engine.streamListener!!("Synthetic first sentence. "); drain(); tts.ready(true); drain()
         assertEquals(listOf("Synthetic first sentence."), tts.spokenTexts)
         tts.doneCallbacks.removeFirst()(null); drain()
         assertEquals(LoopPhase.GENERATING, loop.snapshot().phase)
@@ -130,15 +129,17 @@ class ConversationLoopControllerTest {
         engine.result(GenerationResult.Complete(full)); drain()
         assertEquals(listOf("Synthetic first sentence.", "Synthetic second sentence.", "Synthetic third sentence."), tts.spokenTexts)
         while (tts.doneCallbacks.isNotEmpty()) { tts.doneCallbacks.removeFirst()(null); drain() }
+        assertEquals(listOf("Synthetic first sentence.", "Synthetic second sentence.", "Synthetic third sentence."), tts.spokenTexts)
         assertEquals(LoopPhase.IDLE, loop.snapshot().phase)
         assertEquals(SpeechPhase.IDLE, output.snapshot().phase)
         loop.close(); dictation.close(); output.close(); drain()
     }
 
     @Test fun appendedSourcesDoNotResetAlreadySpokenAnswerAtTrailingNewline() {
-        val accumulator = SentenceStreamAccumulator()
-        assertEquals(listOf("Synthetic first sentence."), accumulator.onDelta("Synthetic first sentence.\n"))
-        assertTrue(accumulator.flushRemainder("Synthetic first sentence.\nSources:\nsynthetic citation").isEmpty())
+        RustReplySpeech().use { policy ->
+            assertEquals("Synthetic first sentence.", policy.apply(0, "Synthetic first sentence.\n").chunk?.text)
+            assertEquals(null, policy.apply(2, "Synthetic first sentence.\nSources:\nsynthetic citation").chunk)
+        }
     }
 
     @Test fun disableQueuedBehindFinalButAheadOfStreamInitializationStillSettlesAsk() {

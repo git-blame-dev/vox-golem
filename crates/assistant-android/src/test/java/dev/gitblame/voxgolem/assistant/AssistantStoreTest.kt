@@ -550,6 +550,7 @@ class AssistantStoreRunner(testClass: Class<*>) : RobolectricTestRunner(testClas
         InstrumentationConfiguration.Builder(super.createClassLoaderConfig(method))
             .doNotAcquireClass("dev.gitblame.voxgolem.assistant.AssistantDomainNative")
             .doNotAcquireClass("dev.gitblame.voxgolem.assistant.AssistantStoreNative")
+            .doNotAcquireClass("dev.gitblame.voxgolem.assistant.speech.AssistantSpeechNative")
             .doNotAcquireClass("dev.gitblame.voxgolem.assistant.runtime.AssistantProviderNative")
             .doNotAcquireClass("dev.gitblame.voxgolem.assistant.runtime.ProviderNativeCalls")
             .doNotAcquireClass("dev.gitblame.voxgolem.assistant.runtime.ProviderDeltaCallback").build()

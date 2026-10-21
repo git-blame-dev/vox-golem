@@ -389,7 +389,7 @@ class LocalSpeechOutput(
             if (ticket != epoch.get() || closed) return
             val text = request.text
             if (text == null) {
-                runCatching { session.warmup(voice, requestTiming) }
+                if (state.enabled) runCatching { session.warmup(voice, requestTiming) }
                 finish(ticket, null)
                 return
             }
