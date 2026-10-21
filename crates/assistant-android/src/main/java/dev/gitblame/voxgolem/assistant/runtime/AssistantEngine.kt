@@ -54,6 +54,7 @@ interface AssistantModelStorage {
 }
 
 object AssistantModels {
+    val presentation: Map<String, AssistantModelPresentation> = AssistantModelCatalog.presentation
     val customLabels = AssistantModelCatalog.customLabels
     val optionalLabels = AssistantModelCatalog.optionalLabels
     val aliases = AssistantModelCatalog.aliases

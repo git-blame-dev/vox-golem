@@ -20,8 +20,26 @@ def outputs():
     ts += "export const MODEL_CATALOG = " + json.dumps(frontend, indent=2) + " as const satisfies readonly ModelCatalogEntry[]\n"
     ts += "export const DEFAULT_MODEL_CHOICES = " + json.dumps(data["defaults"], indent=2) + " as const\n"
     kotlin = HEADER + "package dev.gitblame.voxgolem.assistant.runtime\n\n"
+    kotlin += """/** Static presentation only; never provider readiness or admission. */
+data class AssistantModelPresentation(
+    val id: String,
+    val fullLabel: String,
+    val familyId: String,
+    val familyLabel: String,
+    val compactFamilyLabel: String,
+    val effort: String,
+    val effortLabel: String,
+)
+
+"""
     kotlin += "/** Static labels/membership only; readiness remains owned by native providers. */\ninternal object AssistantModelCatalog {\n"
     quote = json.dumps
+    kotlin += "    val presentation: Map<String, AssistantModelPresentation> = mapOf(\n"
+    fields = ("id", "label", "familyId", "familyLabel", "androidCompactFamilyLabel", "effort", "androidEffortLabel")
+    kotlin += ",\n".join(
+        f'        {quote(m["id"])} to AssistantModelPresentation(' +
+        ', '.join(quote(m[field]) for field in fields) + ')' for m in models)
+    kotlin += "\n    )\n"
     for group in ["custom", "optional"]:
         entries = [m for m in models if m["androidGroup"] == group]
         kotlin += f"    val {group}Labels = mapOf(\n"

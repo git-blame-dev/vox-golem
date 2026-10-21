@@ -19,6 +19,8 @@ pub struct ModelDescriptor {
     pub android_label: Option<String>,
     /// Optional descriptors do not expand InstantModelChoice/provider support.
     pub android_group: Option<&'static str>,
+    pub android_compact_family_label: &'static str,
+    pub android_effort_label: &'static str,
 }
 
 #[derive(Serialize)]
@@ -70,13 +72,16 @@ pub fn model_catalog() -> Vec<ModelDescriptor> {
             effort: "none",
             android_label: None,
             android_group: group,
+            android_compact_family_label: short,
+            android_effort_label: "No Reasoning",
         });
     }
-    for (family, provider, name, group, variants) in [
+    for (family, provider, name, compact, group, variants) in [
         (
             "custom-sol",
             "Custom",
             "GPT-6.1 Sol",
+            "6.1 Sol",
             Some("custom"),
             &[
                 ("custom-sol-low", "low"),
@@ -90,6 +95,7 @@ pub fn model_catalog() -> Vec<ModelDescriptor> {
             "custom-luna6",
             "Custom",
             "GPT-6 Luna",
+            "6 Luna",
             Some("custom"),
             &[
                 // Persisted historical IDs intentionally differ from the family ID.
@@ -105,6 +111,7 @@ pub fn model_catalog() -> Vec<ModelDescriptor> {
             "custom-luna56",
             "Custom",
             "GPT-5.6 Luna",
+            "5.6 Luna",
             Some("custom"),
             &[
                 ("custom-luna56-none", "none"),
@@ -119,6 +126,7 @@ pub fn model_catalog() -> Vec<ModelDescriptor> {
             "opencode-sol",
             "OpenCode",
             "GPT-6.1 Sol",
+            "6.1 Sol",
             None,
             &[
                 ("opencode-sol-low", "low"),
@@ -132,6 +140,7 @@ pub fn model_catalog() -> Vec<ModelDescriptor> {
             "opencode-luna",
             "OpenCode",
             "GPT-5.6 Luna",
+            "5.6 Luna",
             None,
             &[
                 ("opencode-luna-none", "none"),
@@ -146,6 +155,7 @@ pub fn model_catalog() -> Vec<ModelDescriptor> {
             "agy-argon",
             "Agy",
             "Gemini 4 Argon",
+            "4 Argon",
             Some("optional"),
             &[
                 ("agy-argon-low", "low"),
@@ -157,6 +167,7 @@ pub fn model_catalog() -> Vec<ModelDescriptor> {
             "agy-flash",
             "Agy",
             "Gemini 3.8 Flash",
+            "3.8 Flash",
             Some("optional"),
             &[
                 ("agy-flash-none", "none"),
@@ -169,6 +180,7 @@ pub fn model_catalog() -> Vec<ModelDescriptor> {
             "agy-opus",
             "Agy",
             "Claude Opus 5.5",
+            "Opus 5.5",
             Some("optional"),
             &[
                 ("agy-opus-low", "low"),
@@ -180,6 +192,7 @@ pub fn model_catalog() -> Vec<ModelDescriptor> {
             "agy-sonnet",
             "Agy",
             "Claude Sonnet 5.5",
+            "Sonnet 5.5",
             Some("optional"),
             &[
                 ("agy-sonnet-low", "low"),
@@ -227,8 +240,83 @@ pub fn model_catalog() -> Vec<ModelDescriptor> {
                 effort,
                 android_label,
                 android_group: group,
+                android_compact_family_label: compact,
+                android_effort_label: suffix,
             });
         }
     }
     models
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn android_presentation_is_complete_static_metadata_without_alias_changes() {
+        let models = model_catalog();
+        let mut ids = std::collections::HashSet::new();
+        for model in &models {
+            assert!(ids.insert(model.id));
+            assert!(!model.android_compact_family_label.is_empty());
+            assert!(!model.android_effort_label.is_empty());
+            assert!(!model.family_label.is_empty());
+            if model.family_id != model.id {
+                assert_eq!(
+                    model.label,
+                    format!("{} {}", model.family_label, model.android_effort_label)
+                );
+            }
+        }
+        for (id, compact) in [
+            ("agy-argon-high", "4 Argon"),
+            ("agy-flash-none", "3.8 Flash"),
+            ("agy-opus-high", "Opus 5.5"),
+            ("agy-sonnet-low", "Sonnet 5.5"),
+        ] {
+            assert_eq!(
+                models
+                    .iter()
+                    .find(|m| m.id == id)
+                    .unwrap()
+                    .android_compact_family_label,
+                compact
+            );
+        }
+        for (id, historical_label) in [
+            ("custom-sol-high", "Sol High"),
+            ("custom-luna-none", "Luna None"),
+            ("custom-luna-low", "Luna Low"),
+        ] {
+            let model = models.iter().find(|m| m.id == id).unwrap();
+            assert_eq!(model.android_label.as_deref(), Some(historical_label));
+            assert_eq!(model.android_group, Some("custom"));
+            assert_eq!(model.agent, model.effort != "none");
+        }
+    }
+
+    #[test]
+    fn android_presentation_preserves_version_provider_and_effort() {
+        let models = model_catalog();
+        for (id, compact, effort) in [
+            ("custom-sol-high", "6.1 Sol", "High"),
+            ("custom-luna-none", "6 Luna", "No Reasoning"),
+            ("custom-luna-low", "5.6 Luna", "Low"),
+            ("opencode-sol-xhigh", "6.1 Sol", "X-High"),
+        ] {
+            let model = models.iter().find(|m| m.id == id).unwrap();
+            let json = serde_json::to_value(model).unwrap();
+            assert_eq!(json["androidCompactFamilyLabel"], compact);
+            assert_eq!(json["androidEffortLabel"], effort);
+            assert!(model.label.starts_with(if id.starts_with("custom") {
+                "Custom: GPT-"
+            } else {
+                "OpenCode: GPT-"
+            }));
+            assert_eq!(
+                model.short_family_label,
+                model.family_label.split(": ").nth(1).unwrap()
+            );
+        }
+    }
 }
