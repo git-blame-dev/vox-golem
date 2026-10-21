@@ -300,6 +300,8 @@ class NativeSuiteDriver:
             raise Blocked('wear_native_rate_limited')
         if result.get('status') != 'complete' or result.get('submitted') is not True or result.get('execution_valid') is not True:
             self.failed = True
+            if result.get('ancestry_valid') is False:
+                raise Blocked('wear_native_canonical_ancestry_failed')
             raise Blocked('wear_native_turn_not_complete')
         request = result.get('request')
         if type(request) is not str or not re.fullmatch(r'turn-[1-9][0-9]?', request) or request in self.requests:
@@ -328,6 +330,7 @@ class NativeSuiteDriver:
             if key in checks:
                 checks[key] = 'unverified'
         checks['canonical_projection_equal'] = 'pass' if value['projected_answer'] == answer and value.get('projection_equal') is True else 'fail'
+        checks['canonical_ancestry'] = 'pass' if value.get('ancestry_valid') is True else 'fail'
         checks['canonical_execution'] = 'pass'
         checks['accessibility_visible_answer_equal'] = 'pass' if value.get('ui_visible_equal') is True and value.get('ui_visible_status') == 'pass' else 'unverified'
         checks['single_rendered_ui_row'] = 'unverified'

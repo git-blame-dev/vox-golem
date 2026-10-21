@@ -141,4 +141,33 @@ class TypedAskBenchmarkTest {
         assertTrue(runCatching { TypedAskBenchmark.setupCase(stranger, Bundle()) }.isFailure)
         assertTrue(runCatching { TypedAskBenchmark.close(stranger) }.isFailure)
     }
+
+    @Test fun canonicalAncestryDecisionRules() {
+        // first turn null parent -> valid
+        assertTrue(TypedAskBenchmark.ancestryValid(null, null))
+        // first turn non-null parent -> invalid
+        assertFalse(TypedAskBenchmark.ancestryValid(null, "some-parent-key"))
+
+        val prev = "prev-turn-key"
+        // follow-up parent == previous -> valid
+        assertTrue(TypedAskBenchmark.ancestryValid(prev, prev))
+        // follow-up parent != previous -> invalid
+        assertFalse(TypedAskBenchmark.ancestryValid(prev, "other-parent-key"))
+        // follow-up null parent -> invalid
+        assertFalse(TypedAskBenchmark.ancestryValid(prev, null))
+    }
+
+    @Test fun extractParentKeyFromResponseBody() {
+        assertNull(TypedAskBenchmark.extractParentKey(null))
+        assertTrue(runCatching { TypedAskBenchmark.extractParentKey(org.json.JSONObject()) }.isFailure)
+        assertTrue(runCatching { TypedAskBenchmark.extractParentKey(org.json.JSONObject().put("parent", "synthetic")) }.isFailure)
+        assertTrue(runCatching { TypedAskBenchmark.extractParentKey(org.json.JSONObject().put("parent", 7)) }.isFailure)
+
+        val bodyNoParent = org.json.JSONObject().put("parent", org.json.JSONObject.NULL)
+        assertNull(TypedAskBenchmark.extractParentKey(bodyNoParent))
+
+        val parentId = org.json.JSONObject().put("replica", "11111111-1111-4111-8111-111111111111").put("sequence", 1)
+        val bodyWithParent = org.json.JSONObject().put("parent", parentId)
+        assertEquals("11111111-1111-4111-8111-111111111111:1", TypedAskBenchmark.extractParentKey(bodyWithParent))
+    }
 }

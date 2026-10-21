@@ -86,7 +86,7 @@ class IdentityTests(unittest.TestCase):
 
 
 class NativeDriverTests(unittest.IsolatedAsyncioTestCase):
-    def mailbox(self, mismatch=False, uncertain=False):
+    def mailbox(self, mismatch=False, uncertain=False, ancestry=True):
         class FakeMailbox:
             model = 'custom-luna-none'
             cleaned = False
@@ -104,11 +104,15 @@ class NativeDriverTests(unittest.IsolatedAsyncioTestCase):
                     if uncertain:
                         raise common.Blocked('synthetic_transport_lost')
                     prompt = args['prompt']
+                    if not ancestry:
+                        # Device shape: native ancestry failure invalidates execution.
+                        return {'status':'blocked', 'submitted':True, 'execution_valid':False,
+                            'ancestry_valid':False, 'request':f'turn-{self.turn}'}
                     return {'status':'complete', 'submitted':True, 'execution_valid':True,
                         'request':f'turn-{self.turn}', 'first_answer_ms':10, 'completed_ms':20,
                         'canonical_prompt':prompt, 'projected_prompt':prompt,
                         'canonical_answer':'210', 'projected_answer':'wrong' if mismatch else '210',
-                        'projection_equal':not mismatch, 'ui_visible_equal':True, 'ui_visible_status':'pass'}
+                        'projection_equal':not mismatch, 'ancestry_valid':True, 'ui_visible_equal':True, 'ui_visible_status':'pass'}
                 raise AssertionError(operation)
             async def close(self):
                 self.cleaned = True
@@ -126,6 +130,7 @@ class NativeDriverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report['admissions']['observed'], 1)
         self.assertTrue(report['cases'][0]['workflow_completed'])
         self.assertEqual(report['cases'][0]['checks']['canonical_projection_equal'], 'pass')
+        self.assertEqual(report['cases'][0]['checks']['canonical_ancestry'], 'pass')
         self.assertEqual(report['cases'][0]['checks']['single_rendered_ui_row'], 'unverified')
         self.assertEqual(report['status'], 'unverified')
         self.assertTrue(mailbox.cleaned)
@@ -137,6 +142,15 @@ class NativeDriverTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(common.Blocked, 'scenario_validation_failed'):
             await common.run_suite(None, self.args(), report, driver=driver)
         self.assertEqual(report['cases'][0]['checks']['canonical_projection_equal'], 'fail')
+        self.assertTrue(mailbox.cleaned)
+        self.assertEqual(mailbox.turn, 1)
+
+    async def test_native_canonical_ancestry_failure_is_reported_and_retires_private_session(self):
+        mailbox = self.mailbox(ancestry=False)
+        report = {'cases':[], 'cleanup':{}, 'status':'fail'}
+        driver = wear.NativeSuiteDriver(mailbox, common, report)
+        with self.assertRaisesRegex(common.Blocked, 'wear_native_canonical_ancestry_failed'):
+            await common.run_suite(None, self.args(), report, driver=driver)
         self.assertTrue(mailbox.cleaned)
         self.assertEqual(mailbox.turn, 1)
 

@@ -171,6 +171,22 @@ object TypedAskBenchmark {
         }
     }
 
+    private var lastValidatedTurnKey: String? = null
+
+    internal fun ancestryValid(previousKey: String?, parentKey: String?): Boolean {
+        if (previousKey == null) {
+            return parentKey == null
+        }
+        return parentKey == previousKey
+    }
+
+    /** Canonical turns always carry an explicit `parent` (object or null); anything else is malformed. */
+    internal fun extractParentKey(body: JSONObject?): String? {
+        if (body == null) return null
+        check(body.has("parent"))
+        return if (body.isNull("parent")) null else assistantIdKey(body.getJSONObject("parent").toString())
+    }
+
     @JvmStatic fun validate(instrumentation: Instrumentation): Bundle {
         authorize(instrumentation)
         val result = canonical(instrumentation)
@@ -178,19 +194,31 @@ object TypedAskBenchmark {
         result.putAll(projection)
         val correct = result.getInt("turn_count") == baseline + 1 && result.getString("canonical_prompt") == prompt
         var sameTurn = false
+        var turnKey: String? = null
+        var parentKey: String? = null
         instrumentation.runOnMainSync {
             sameTurn = activity?.get()?.typedBenchmarkProjection()?.turns?.lastOrNull()?.id?.let(::assistantIdKey) == result.getString("turn_key")
         }
+        turnKey = result.getString("turn_key")
+        parentKey = result.getString("turn_parent_key")
         result.remove("turn_key")
-        val equal = correct && sameTurn && result.getBoolean("projection_ready") && result.getString("canonical_answer") == result.getString("projected_answer") &&
+        result.remove("turn_parent_key")
+
+        val ancestry = ancestryValid(lastValidatedTurnKey, parentKey)
+        val equal = correct && sameTurn && ancestry && result.getBoolean("projection_ready") && result.getString("canonical_answer") == result.getString("projected_answer") &&
             result.getString("canonical_prompt") == result.getString("projected_prompt")
         val valid = correct && equal && !result.getBoolean("busy") && !result.getBoolean("failed") && result.getBoolean("context_ready")
+        result.putBoolean("ancestry_valid", ancestry)
         result.putBoolean("projection_equal", equal)
         result.putBoolean("execution_valid", valid)
         result.putString("sources_status", "unsupported")
         result.putString("page_read_status", "unsupported")
         result.putString("request", "turn-$turns")
-        if (!valid) terminalFailure = true
+        if (valid) {
+            lastValidatedTurnKey = turnKey
+        } else {
+            terminalFailure = true
+        }
         return result
     }
 
@@ -200,16 +228,24 @@ object TypedAskBenchmark {
         var raw: String? = null
         requireNotNull(session).engine.history { page, _ -> raw = page; ready.countDown() }
         check(ready.await(5, TimeUnit.SECONDS))
-        val records = raw?.let { JSONObject(it).getJSONArray("turns") }
+        val page = raw?.let(::JSONObject)
+        val records = page?.getJSONArray("turns")
         val count = records?.length() ?: 0
         val operation = if (count > 0) records!!.getJSONObject(count - 1).getJSONObject("operation") else null
         val body = operation?.getJSONObject("body")
+        // Ancestry is only meaningful if the last record is the selected head of a head-anchored page.
+        if (page != null) check(page.isNull("head") == (count == 0))
+        if (operation != null) {
+            check(body!!.getString("kind") == "turn_completed")
+            check(assistantIdKey(page!!.getJSONObject("head").toString()) == assistantIdKey(operation.getJSONObject("id").toString()))
+        }
         val answer = body?.getJSONObject("answer")
         val text = answer?.let { it.getString(if (it.getString("kind") == "refusal") "reason" else "text") }
         check(text == null || text.length <= MAX_TEXT)
         return Bundle().apply {
             putInt("turn_count", count)
             putString("turn_key", operation?.getJSONObject("id")?.toString()?.let(::assistantIdKey))
+            putString("turn_parent_key", extractParentKey(body))
             putString("canonical_prompt", body?.getString("prompt"))
             putString("canonical_answer", text)
         }
@@ -241,6 +277,7 @@ object TypedAskBenchmark {
             { scoped?.cleanup() },
         ))
         session = null; activity = null; scoped = null
+        lastValidatedTurnKey = null
     }
 
 

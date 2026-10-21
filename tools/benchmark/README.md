@@ -62,6 +62,16 @@ That targeted run is partial coverage under different artifact conditions, so th
 two reports must not be combined into a six-case pass. Keep the adapter
 experimental until one unchanged six-case run completes.
 
+Each native turn also reports `canonical_ancestry`: the canonical head turn's
+explicit `parent` must equal the previous validated turn in the same isolated
+session (`null` for a session's first turn), so a history follow-up is
+structurally proven to extend its seed. A parent mismatch invalidates native
+execution and is reported as `wear_native_canonical_ancestry_failed`; a malformed
+parent or a canonical page whose last turn is not its head fails native canonical
+validation instead. The
+2026-10-21 targeted run above predates this check; its runtime acceptance is
+recorded separately in the outer benchmark history.
+
 The Python controller retains all six scenarios, ordering, answer validation,
 history-seed accounting, live budgets and report retention. The native driver
 prepares its synthetic draft through the existing validated native draft API,
