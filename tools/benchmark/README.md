@@ -54,10 +54,13 @@ must be recorded separately from offline adapter tests.
 
 Wear runtime acceptance remains partial: the initial six-case selection completed
 the first five workflows and its history seed, but the history follow-up failed
-Send readiness. Subsequent UI corrections have unit/build verification, not a
-fresh full-suite result. Keep the adapter experimental until that targeted history
-acceptance is completed under a separately approved live budget; do not treat the
-existing partial report as a six-case pass.
+Send readiness. After the subsequent UI corrections, a separately approved
+targeted `--cases history --max-live-calls 2` run (2026-10-21) completed the seed
+and follow-up with exact answers, canonical/projected equality, accessibility
+answer equality and native cleanup; rendered-row identity remains unverified.
+That targeted run is partial coverage under different artifact conditions, so the
+two reports must not be combined into a six-case pass. Keep the adapter
+experimental until one unchanged six-case run completes.
 
 The Python controller retains all six scenarios, ordering, answer validation,
 history-seed accounting, live budgets and report retention. The native driver
@@ -107,6 +110,16 @@ requires explicit device authorization and a matching installed artifact.
 Starting instrumentation can terminate an old process, so Wear refuses any
 existing target app process before startup; the controller never force-stops
 pre-existing work to get past that check.
+
+Android force-stops the target when instrumentation finishes. The process is then
+commonly restarted within seconds to host `AssistantReplicationListenerService`
+(the Wearable Data Layer listener; the triggering event and caller are not
+established), so a probe or run is commonly followed by a cached app process that
+blocks the next run's preflight. Confirm it is that process (event log
+`am_proc_start ... service ... AssistantReplicationListenerService`, cached state,
+no running services, so no phone-relay request is in flight) and retire it only
+with explicit approval, for example `am kill`, which affects background processes
+only. The controller does not do this automatically.
 
 This typed suite does not measure keyboard/IME navigation, microphone readiness,
 speech recognition, or spoken playback. Existing synthetic voice benchmarks remain
