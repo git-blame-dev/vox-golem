@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.system.Os
 import android.util.Log
 import dev.gitblame.voxgolem.assistant.replication.ChatGptAccessSync
 import org.json.JSONObject
@@ -20,7 +21,12 @@ object ChatGptAuth {
     private val worker = ThreadPoolExecutor(1, 1, 30, TimeUnit.SECONDS, ArrayBlockingQueue(4),
         { work -> Thread(work, "chatgpt-auth") }, ThreadPoolExecutor.AbortPolicy()).apply { allowCoreThreadTimeOut(true) }
     private var owner: Owner? = null
-    fun managedFile(context: Context) = File(context.applicationContext.noBackupFilesDir, "chatgpt-auth.json")
+    /** Rust requires a private (0700) parent; Android's app directories are 0771, so own a dedicated one. */
+    fun managedFile(context: Context): File {
+        val directory = File(context.applicationContext.noBackupFilesDir, "chatgpt")
+        runCatching { directory.mkdirs(); Os.chmod(directory.path, 0b111_000_000) }
+        return File(directory, "chatgpt-auth.json")
+    }
 
     fun command(context: Context, action: String, completed: (JSONObject) -> Unit) {
         require(action in setOf("start", "status", "cancel", "sign_out"))

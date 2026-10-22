@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.database.sqlite.SQLiteDatabase
 import dev.gitblame.voxgolem.assistant.AssistantStore
 import dev.gitblame.voxgolem.assistant.AssistantStoreRunner
+import dev.gitblame.voxgolem.assistant.runtime.ChatGptAuth
 import dev.gitblame.voxgolem.assistant.runtime.PhoneRelaySessionTest
 import org.json.JSONObject
 import org.junit.Assert.*
@@ -202,8 +203,8 @@ class AssistantPeerSetupTest {
 
     @Test fun accessOnlyMessagesUseCurrentPeerAndFenceSignoutReplayAndTransientExportFailures() = worker {
         val pair = PairFixture(); pair.link()
-        val phoneFile = File(pair.leftContext.noBackupFilesDir, "chatgpt-auth.json").apply { writeText("{}") }
-        val watchFile = File(pair.rightContext.noBackupFilesDir, "chatgpt-auth.json")
+        val phoneFile = ChatGptAuth.managedFile(pair.leftContext).apply { writeText("{}") }
+        val watchFile = ChatGptAuth.managedFile(pair.rightContext)
         val imported = File(pair.rightContext.noBackupFilesDir, "assistant-auth.json").apply { writeText("Synthetic imported credentials preserved") }
         var exported = JSONObject().put("voxgolemChatgpt", 1).put("openai", JSONObject().put("type", "oauth")
             .put("access", "synthetic-access-only").put("expires", System.currentTimeMillis() + 3_600_000)).toString()
@@ -258,7 +259,7 @@ class AssistantPeerSetupTest {
     @Test fun accessAssociationSurvivesOfflineDiscoveryButReplacementAndRevocationInvalidateLocally() = worker {
         val pair = PairFixture(); pair.link()
         val association = pair.right.credentialAssociation()
-        val file = File(pair.rightContext.noBackupFilesDir, "chatgpt-auth.json")
+        val file = ChatGptAuth.managedFile(pair.rightContext)
         ChatGptAccessProtocol.publish(file, JSONObject().put("openai", JSONObject().put("access", "synthetic-access-only")
             .put("expires", System.currentTimeMillis() + 3_600_000)).put(ChatGptAccessProtocol.META,
             JSONObject().put("association", association).put("generation", 7)))
@@ -607,8 +608,8 @@ class AssistantPeerSetupTest {
         var token = "synthetic-original-access"
         var expires = clock.now + 120_000
         var exportFailures = 0
-        val phoneFile = File(pair.leftContext.noBackupFilesDir, "chatgpt-auth.json").apply { writeText("{}") }
-        val watchFile = File(pair.rightContext.noBackupFilesDir, "chatgpt-auth.json")
+        val phoneFile = ChatGptAuth.managedFile(pair.leftContext).apply { writeText("{}") }
+        val watchFile = ChatGptAuth.managedFile(pair.rightContext)
         val phone: ChatGptAccessSync.Owner
         val watch: ChatGptAccessSync.Owner
         init {

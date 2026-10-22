@@ -18,7 +18,7 @@ internal class ProviderAuthSource(
 ) {
     constructor(context: Context) : this(File(context.applicationContext.noBackupFilesDir, "assistant-auth.json"),
         File(context.applicationContext.filesDir, "codex-auth.json"),
-        File(context.applicationContext.noBackupFilesDir, "chatgpt-auth.json"),
+        ChatGptAuth.managedFile(context),
         { dev.gitblame.voxgolem.assistant.replication.ChatGptAccessSync.managedAllowed(context) })
 
     private var rejected: Pair<String, ProviderAuthReason>? = null

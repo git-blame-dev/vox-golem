@@ -192,9 +192,26 @@ pub(super) fn try_lock(path: &Path) -> Result<Option<fs::File>, AuthError> {
         options.mode(0o600);
     }
     let file = options.open(path).map_err(|_| AuthError::Storage)?;
+    Ok(try_lock_exclusive(&file)?.then_some(file))
+}
+
+/// `Ok(true)` when acquired, `Ok(false)` when another owner holds it. std's `File::try_lock`
+/// is unsupported on Android, so Unix (including Android) uses `flock(2)` directly.
+#[cfg(unix)]
+fn try_lock_exclusive(file: &fs::File) -> Result<bool, AuthError> {
+    use rustix::fs::{flock, FlockOperation};
+    match flock(file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(true),
+        Err(rustix::io::Errno::WOULDBLOCK) => Ok(false),
+        Err(_) => Err(AuthError::Storage),
+    }
+}
+
+#[cfg(not(unix))]
+fn try_lock_exclusive(file: &fs::File) -> Result<bool, AuthError> {
     match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
-        Err(fs::TryLockError::WouldBlock) => Ok(None),
+        Ok(()) => Ok(true),
+        Err(fs::TryLockError::WouldBlock) => Ok(false),
         Err(fs::TryLockError::Error(_)) => Err(AuthError::Storage),
     }
 }
