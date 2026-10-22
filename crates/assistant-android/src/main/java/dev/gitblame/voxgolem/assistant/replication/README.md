@@ -125,8 +125,8 @@ already obtained by an offline peer. No operation triggers remote generation or 
 
 Conversation synchronization does not transfer credentials and does not depend on usable
 provider access. Android's device-code sign-in and paired access-only sharing use a
-separate transient credential channel; refresh tokens stay on the phone. Existing imported
-provider files remain read-only. Normal chat reports unavailable/expired/rejected access
+separate transient credential channel; refresh tokens stay on the phone. Copied or imported
+credential files are not read. Normal chat reports unavailable/expired/rejected access
 and retains drafts for deliberate retry. See the shared library's provider-access guidance.
 
 Use the maintained verification targets in the [shared library guide](../../../../../../../../README.md#verification).

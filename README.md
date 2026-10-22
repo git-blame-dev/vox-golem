@@ -52,7 +52,7 @@ On Linux/Windows desktop or Android, open **Settings → Model → Continue with
 
 Linux uses the `xdg-open` browser helper from `xdg-utils`. If browser launching is unavailable (for example, in a headless or WSL session), manually open the displayed device-code URL in an ordinary browser and enter the code there. Installing the helper does not establish that a browser opened, authentication succeeded, or a model request works; those require separate interactive acceptance.
 
-The native app owns token renewal and keeps credentials outside the WebView. Desktop stores `chatgpt/chatgpt-auth.json` under its configuration directory in a dedicated private subdirectory; Android uses its private, backup-excluded directory. Signing in explicitly selects this source for Custom models without modifying existing imported credential files or provider configuration. Signing out keeps an empty source-selection record, so the app does not silently fall back to imported credentials. Do not put runtime keys in prompts, logs, examples or project artifacts.
+The native app owns token renewal and keeps credentials outside the WebView. Desktop stores `chatgpt/chatgpt-auth.json` under its configuration directory in a dedicated private subdirectory; Android uses its private, backup-excluded directory. This is the only credential source for Custom models: copied or imported credential files are not read. Signing out keeps an empty source-selection record. Older `custom_openai.auth_path` and `auth_source` settings are still accepted so existing configuration files load, but they are ignored. Do not put runtime keys in prompts, logs, examples or project artifacts.
 
 Wear has no sign-in screen. The Android phone shares short-lived access only with its verified native-paired, matching-package/signature watch through a separate transient credential channel, never conversation replication. Refresh and ID tokens stay on the phone. An offline watch can use already-shared access until it expires; renewal requires the phone. Sign-out clearing reaches the watch when it reconnects; it cannot instantly erase an offline watch's cached access. Conversation sharing remains independent of provider access.
 
@@ -127,18 +127,14 @@ Windows configuration defaults to `%APPDATA%\VoxGolem\config.toml`. Relative pat
 
 ### Native Windows with WSL providers
 
-The native Windows app can use the default WSL distribution for OpenCode without adding OpenCode or WSL files to the installer. Install and log in to OpenCode inside that distribution first; the distribution must also provide `sh` and `setsid`, as Ubuntu does by default. The Custom provider reads the live WSL auth file but sends its HTTPS request directly from the Windows app; the OpenCode provider starts one authenticated WSL server at app startup and keeps it warm until app exit.
+The native Windows app can use the default WSL distribution for OpenCode without adding OpenCode or WSL files to the installer. Install and log in to OpenCode inside that distribution first; the distribution must also provide `sh` and `setsid`, as Ubuntu does by default. The OpenCode provider starts one authenticated WSL server at app startup and keeps it warm until app exit. The Custom provider does not use WSL credentials; sign in to it with the in-app ChatGPT device-code flow.
 
 ```toml
-[custom_openai]
-auth_source = "wsl"
-endpoint = "https://chatgpt.com/backend-api/codex/responses"
-
 [opencode]
 runtime = "wsl"
 ```
 
-The default locations are `$HOME/.local/share/opencode/auth.json` and `$HOME/.opencode/bin/opencode`, followed by WSL command lookup for the executable. On Windows, `wsl.exe` uses the default WSL distribution, and `$HOME` is that distribution's user home. Optional overrides must be absolute Linux paths. WSL selection is explicit per provider; omitted selectors retain native behavior, and Vox Golem never silently falls back to a different credential or executable source. Missing WSL, a default distribution, auth, or OpenCode disables only the affected capability. A failed Custom WSL auth lookup gets one bounded automatic startup retry; if it still fails, the app keeps the reason visible and offers **Retry Custom** without a restart.
+The default OpenCode location is `$HOME/.opencode/bin/opencode`, followed by WSL command lookup for the executable. On Windows, `wsl.exe` uses the default WSL distribution, and `$HOME` is that distribution's user home. An optional override must be an absolute Linux path. WSL selection is explicit per provider; omitted selectors retain native behavior. Missing WSL, a default distribution, or OpenCode disables only the OpenCode capability.
 
 ## WSL2/WSLg setup
 
@@ -193,7 +189,7 @@ cargo run --locked -p vox-golem --example search_bench -- --mode live
 cargo run --locked -p vox-golem --example search_bench -- --mode live --with-llm --model luna-none --repetitions 3
 ```
 
-Live mode without `--with-llm` exercises explicit anonymous WebService Search components and session prewarm only, not automatic model tool selection. Explicit model coverage uses the same managed-sign-in/configured-source selection as desktop; it never starts sign-in or silently imports another account's credentials. Imported WSL-only sources are explicitly skipped by this standalone native benchmark; desktop's existing Windows WSL adapter remains separate. Select `luna-none` or `sol-high`. One repetition is the default, with one to three repetitions supported: six arithmetic/coding/lookup/page-read/mixed/history prompts per repetition, at most 18 logical requests, using the same bounded automatic tool loop with Web permission and a 600-second matrix request budget. A logical request can contain multiple model rounds and search/page-read calls and consumes the selected provider's allowance.
+Live mode without `--with-llm` exercises explicit anonymous WebService Search components and session prewarm only, not automatic model tool selection. Explicit model coverage uses the same managed sign-in credential as desktop; it never starts sign-in or imports another account's credentials. Select `luna-none` or `sol-high`. One repetition is the default, with one to three repetitions supported: six arithmetic/coding/lookup/page-read/mixed/history prompts per repetition, at most 18 logical requests, using the same bounded automatic tool loop with Web permission and a 600-second matrix request budget. A logical request can contain multiple model rounds and search/page-read calls and consumes the selected provider's allowance.
 
 Requested coverage that fails or is skipped produces a nonzero exit instead of an all-green report. First-visible-text timing excludes whitespace; an unobserved callback has no invented time. Partial evidence and fallback remain explicit. These are native backend callback/completion measurements, not painted pixels, audible output, semantic/citation-quality validation, or physical Android/Wear/Windows acceptance. Synthetic fixture latency is not live search or model latency.
 

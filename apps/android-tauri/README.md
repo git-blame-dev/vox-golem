@@ -23,7 +23,7 @@ Ask/Talk are explicit exported launcher entry points, matching Wear's one-tap be
 Settings provides ChatGPT device-code sign-in through the shared native owner.
 The phone refreshes its own credentials and shares access-only snapshots with its
 verified paired watch through a separate transient channel. Tokens never enter
-JavaScript. Existing imported files remain read-only. See the
+JavaScript. Copied or imported credential files are not read. See the
 [root sign-in guidance](../../README.md#chatgpt-device-code-sign-in) for setup,
 sign-out and offline-watch limitations. Drafts survive access failures; prompts
 are never replayed automatically.

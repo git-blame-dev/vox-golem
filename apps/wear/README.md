@@ -104,8 +104,8 @@ access; missing or expired access does not disable conversation synchronization.
 Startup/resume, SDK events and bounded retry jobs drive conversation sharing.
 Wear has no login UI: sign in with a device code on the phone, which sends
 access-only snapshots over a separate verified paired-peer channel and owns
-renewal. Without the phone, cached access works only until expiry. Existing
-imported provider files and local histories/drafts are preserved. Normal chat
+renewal. Without the phone, cached access works only until expiry. Local
+histories/drafts are preserved. Normal chat
 retains drafts for deliberate retry after unavailable/expired/rejected access.
 See the [root sign-in guidance](../../README.md#chatgpt-device-code-sign-in).
 

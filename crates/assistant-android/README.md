@@ -161,9 +161,8 @@ encrypted traffic through Google servers; this is not a cloud-free guarantee.
 
 Android's settings expose only ChatGPT device-code authorization. Shared Rust owns
 the bounded attempt, token exchange and serialized refresh; JNI keeps credentials
-out of the WebView. `chatgpt-auth.json` in `noBackupFilesDir` takes precedence over
-legacy imported files once selected, including an explicit signed-out record.
-Existing imported provider files remain read-only and are not deleted or renewed.
+out of the WebView. `chatgpt/chatgpt-auth.json` in `noBackupFilesDir` (a dedicated
+0700 directory) is the only credential source; imported provider files are not read.
 
 The phone is the sole refresh owner. A separate transient paired-peer credential
 channel sends access-only snapshots to Wear; refresh and ID tokens never enter that

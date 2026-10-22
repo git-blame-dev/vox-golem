@@ -76,7 +76,7 @@ distinguish missing/expired access, 401 rejection and model/account 403 denial.
 Drafts remain available for deliberate retry, never automatic prompt replay.
 
 The phone owns refresh and sends only short-lived access to its verified paired
-watch. Existing imported files remain read-only. See the
+watch. Copied or imported credential files are not read. See the
 [root sign-in guidance](../../README.md#chatgpt-device-code-sign-in).
 
 Native Wear Data Layer pairing and matching package/signature isolation authorize
