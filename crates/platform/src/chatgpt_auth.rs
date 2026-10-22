@@ -1,9 +1,9 @@
 //! Native ChatGPT device-code ownership. Only the four public display fields in
 //! `AuthStatus` may cross a UI bridge. `export_access` is for trusted native peers.
 //!
-//! The caller supplies a dedicated application-owned path, never an imported
-//! OpenCode file. Unix storage uses 0600 atomic files in directories which are
-//! not writable by other users (new directories are 0700).
+//! The caller supplies a dedicated application-owned path. Unix storage uses 0600
+//! atomic files in directories which are not writable by other users (new
+//! directories are 0700).
 //! On Windows the shell must supply its user-private application-data directory
 //! (inherited per-user DACL); this module does not configure Windows ACLs.
 //! Polling and refresh run on one continuously driven native runtime, independent
@@ -226,7 +226,7 @@ pub(crate) fn marked_contents(contents: &[u8]) -> bool {
     storage::marked(contents)
 }
 
-/// Refresh only app-managed credentials. Legacy/imported files are never changed.
+/// Refresh only app-managed credentials; any other file at the path is never changed.
 /// Refresh is single-flight per normalized path; dropping one request's future
 /// cannot cancel refresh needed by another request or native peer.
 pub async fn ensure_fresh(path: &Path) -> Result<(), CustomOpenAiError> {
@@ -307,7 +307,7 @@ async fn refresh_snapshot(
 ) -> Result<Option<(u64, Vec<u8>, ManagedFile)>, AuthError> {
     disk(move || {
         let state = entry.state.lock().map_err(|_| AuthError::Storage)?;
-        let Some(bytes) = storage::refresh_file(&entry.path)? else {
+        let Some(bytes) = storage::read_file(&entry.path)? else {
             return Ok(None);
         };
         let Ok(file) = storage::parse(&bytes) else {

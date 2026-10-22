@@ -97,9 +97,6 @@ struct AppState {
     conversation: DesktopConversationRuntime,
     startup_state: Arc<Mutex<StartupStatePayload>>,
     runtime_config: Option<voxgolem_core::config::RuntimeConfig>,
-    custom_auth_source_path: Option<PathBuf>,
-    custom_auth_path: Mutex<Option<PathBuf>>,
-    custom_retry_lock: tokio::sync::Mutex<()>,
     selected_response_profile: Arc<Mutex<ResponseProfilePayload>>,
     ui_preferences: Arc<Mutex<UiPreferencesState>>,
     settings_operation_lock: Arc<tokio::sync::Mutex<()>>,
@@ -563,9 +560,6 @@ impl DesktopConversationRuntime {
 struct AppStateInit {
     startup_state: Arc<Mutex<StartupStatePayload>>,
     runtime_config: Option<voxgolem_core::config::RuntimeConfig>,
-    custom_auth_source_path: Option<PathBuf>,
-    custom_auth_path: Mutex<Option<PathBuf>>,
-    custom_retry_lock: tokio::sync::Mutex<()>,
     microphone_capture: Arc<voxgolem_audio::capture::AudioCaptureService>,
     selected_response_profile: Arc<Mutex<ResponseProfilePayload>>,
     supported_response_profiles: Vec<ResponseProfilePayload>,
@@ -2876,112 +2870,6 @@ fn get_startup_state_from_state(app_state: &AppState) -> StartupSettingsPayload 
         state,
         speech_services,
     }
-}
-
-#[tauri::command]
-async fn retry_custom_provider(
-    app_state: tauri::State<'_, AppState>,
-) -> Result<StartupStatePayload, String> {
-    let _retry_guard = app_state.custom_retry_lock.lock().await;
-    let config = app_state
-        .runtime_config
-        .as_ref()
-        .ok_or("startup config is not ready")?;
-    if !config.custom_openai.as_ref().is_some_and(|custom| {
-        custom.auth_source == voxgolem_core::config::CustomOpenAiAuthSource::Wsl
-    }) {
-        return Err(String::from("Custom WSL auth is not configured"));
-    }
-    let source = app_state.custom_auth_source_path.clone();
-    let resolved = spawn_runtime_blocking(move || {
-        voxgolem_platform::wsl::WslRunner::default()
-            .with_limits(Duration::from_secs(15), 4096)
-            .resolve_auth_path(source.as_deref())
-            .map_err(|error| error.to_string())
-    })
-    .await
-    .map_err(|_| String::from("Custom auth lookup worker failed"))?;
-    refresh_custom_auth_state(
-        config,
-        &app_state.custom_auth_path,
-        &app_state.startup_state,
-        resolved,
-    )?;
-    Ok(app_state
-        .startup_state
-        .lock()
-        .map_err(|_| String::from("startup state lock is poisoned"))?
-        .clone())
-}
-
-fn refresh_custom_auth_state(
-    config: &voxgolem_core::config::RuntimeConfig,
-    path_state: &Mutex<Option<PathBuf>>,
-    startup_state: &Arc<Mutex<StartupStatePayload>>,
-    resolved: Result<PathBuf, String>,
-) -> Result<(), String> {
-    let mut refreshed = config.clone();
-    apply_wsl_custom_auth_resolution(&mut refreshed, resolved);
-    let refreshed_capabilities = configured_capabilities(&refreshed);
-    let capability = refreshed_capabilities
-        .iter()
-        .find(|capability| capability.id == "custom_provider")
-        .cloned()
-        .ok_or("Custom capability is missing")?;
-    let path = (capability.state == CapabilityStatePayload::Available)
-        .then(|| {
-            refreshed
-                .custom_openai
-                .as_ref()
-                .map(|custom| custom.auth_path.clone())
-        })
-        .flatten();
-    let mut current_path = path_state
-        .lock()
-        .map_err(|_| "Custom auth state lock is poisoned")?;
-    let mut startup = startup_state
-        .lock()
-        .map_err(|_| "startup state lock is poisoned")?;
-    let capabilities = match &mut *startup {
-        StartupStatePayload::Ready { capabilities, .. }
-        | StartupStatePayload::WarmingModel { capabilities, .. } => capabilities,
-        StartupStatePayload::Error { .. } => return Err(String::from("startup is not ready")),
-    };
-    let existing = capabilities
-        .iter_mut()
-        .find(|item| item.id == "custom_provider")
-        .ok_or("Custom capability is missing")?;
-    *existing = capability;
-    for id in ["deep", "review"] {
-        if let (Some(current), Some(refreshed)) = (
-            capabilities.iter_mut().find(|item| item.id == id),
-            refreshed_capabilities.iter().find(|item| item.id == id),
-        ) {
-            if matches!(
-                current.state,
-                CapabilityStatePayload::Unavailable | CapabilityStatePayload::NotConfigured
-            ) {
-                *current = refreshed.clone();
-            }
-        }
-    }
-    *current_path = path;
-    Ok(())
-}
-
-fn custom_auth_path(
-    app_state: &AppState,
-    config: &voxgolem_core::config::CustomOpenAiConfig,
-) -> Result<PathBuf, String> {
-    if config.auth_source != voxgolem_core::config::CustomOpenAiAuthSource::Wsl {
-        return Ok(config.auth_path.clone());
-    }
-    app_state
-        .custom_auth_path
-        .lock()
-        .map_err(|_| String::from("Custom auth state lock is poisoned"))?
-        .clone()
-        .ok_or_else(|| String::from("Custom WSL auth is unavailable; retry Custom"))
 }
 
 fn effective_custom_config(
@@ -6490,21 +6378,7 @@ async fn submit_custom_prompt(
     let Some(model) = custom_openai_model_for_instant(assistant_request.instant_model) else {
         unreachable!("custom dispatch requires a Custom model");
     };
-    let auth_path = match custom_auth_path(app_state, &config) {
-        Ok(path) => path,
-        Err(error) => {
-            return fail_started_prompt(
-                app,
-                app_state,
-                request_id,
-                assistant_request.generation,
-                cancellation.control,
-                error,
-            );
-        }
-    };
-    #[cfg(feature = "app-benchmark")]
-    app_benchmark::mark("custom_auth_path_resolved");
+    let auth_path = config.auth_path.clone();
     let provider_config = voxgolem_platform::custom_openai::CustomOpenAiConfig {
         endpoint: config.endpoint.clone(),
         auth_path,
@@ -7995,7 +7869,7 @@ async fn run_agent_text(
             .search
             .client_for(voxgolem_platform::custom_openai::CustomOpenAiConfig {
                 endpoint: config.endpoint.clone(),
-                auth_path: custom_auth_path(app_state, &config)?,
+                auth_path: config.auth_path.clone(),
                 model,
                 ..Default::default()
             })
@@ -9762,7 +9636,7 @@ fn spawn_custom_and_web_prewarm(app: &tauri::AppHandle) {
         let custom_config =
             custom_openai_model_for_instant(policy.instant_model).and_then(|model| {
                 let config = effective_custom_config(&app_state)?;
-                let auth_path = custom_auth_path(&app_state, &config).ok()?;
+                let auth_path = config.auth_path.clone();
                 Some(voxgolem_platform::custom_openai::CustomOpenAiConfig {
                     endpoint: config.endpoint,
                     auth_path,
@@ -10175,7 +10049,7 @@ async fn run_assistant_prefetch(
                 .search
                 .client_for(voxgolem_platform::custom_openai::CustomOpenAiConfig {
                     endpoint: config.endpoint.clone(),
-                    auth_path: custom_auth_path(&app_state, &config)?,
+                    auth_path: config.auth_path.clone(),
                     model,
                     ..Default::default()
                 })
@@ -11446,88 +11320,6 @@ fn configured_capabilities(
     capabilities
 }
 
-fn apply_wsl_custom_auth_resolution(
-    config: &mut voxgolem_core::config::RuntimeConfig,
-    resolved: Result<PathBuf, String>,
-) {
-    let is_wsl = config.custom_openai.as_ref().is_some_and(|custom| {
-        custom.auth_source == voxgolem_core::config::CustomOpenAiAuthSource::Wsl
-    });
-    if !is_wsl {
-        return;
-    }
-    config.capability_issues.retain(|issue| {
-        issue.capability != "custom_provider"
-            || !(issue.reason.starts_with("WSL auth")
-                || issue
-                    .reason
-                    .starts_with("failed to resolve WSL OpenCode auth"))
-    });
-    if let Some(custom) = config.custom_openai.as_mut() {
-        custom.auth_path = PathBuf::new();
-    }
-    match resolved {
-        Ok(path) if path.is_file() => {
-            if let Some(custom) = config.custom_openai.as_mut() {
-                custom.auth_path = path;
-            }
-        }
-        Ok(_) => config
-            .capability_issues
-            .push(voxgolem_core::config::CapabilityConfigIssue {
-                capability: "custom_provider",
-                reason: String::from("WSL OpenCode auth file is unavailable"),
-            }),
-        Err(error) => config
-            .capability_issues
-            .push(voxgolem_core::config::CapabilityConfigIssue {
-                capability: "custom_provider",
-                reason: format!("failed to resolve WSL OpenCode auth: {error}"),
-            }),
-    }
-}
-
-#[cfg(any(target_os = "windows", test))]
-fn resolve_custom_wsl_auth_with_retry<F>(mut lookup: F) -> Result<PathBuf, String>
-where
-    F: FnMut(Duration) -> Result<PathBuf, String>,
-{
-    lookup(Duration::from_secs(5)).or_else(|_| lookup(Duration::from_secs(15)))
-}
-
-#[cfg(target_os = "windows")]
-fn resolve_platform_provider_paths(config: &mut voxgolem_core::config::RuntimeConfig) {
-    if chatgpt_auth::configuration(None).is_some() {
-        return;
-    }
-    let Some(custom) = config
-        .custom_openai
-        .as_ref()
-        .filter(|custom| custom.auth_source == voxgolem_core::config::CustomOpenAiAuthSource::Wsl)
-    else {
-        return;
-    };
-    let explicit = (!custom.auth_path.as_os_str().is_empty()).then_some(custom.auth_path.as_path());
-    let mut attempt = 0;
-    let resolved = resolve_custom_wsl_auth_with_retry(|timeout| {
-        attempt += 1;
-        let result = voxgolem_platform::wsl::WslRunner::default()
-            .with_limits(timeout, 4096)
-            .resolve_auth_path(explicit);
-        if let Err(error) = &result {
-            eprintln!("Custom WSL auth lookup attempt {attempt} failed: {error}");
-        }
-        result.map_err(|error| error.to_string())
-    });
-    if attempt == 2 && resolved.is_ok() {
-        eprintln!("Custom WSL auth lookup recovered on automatic retry");
-    }
-    apply_wsl_custom_auth_resolution(config, resolved);
-}
-
-#[cfg(not(target_os = "windows"))]
-fn resolve_platform_provider_paths(_config: &mut voxgolem_core::config::RuntimeConfig) {}
-
 fn opencode_server_config(
     config: &voxgolem_core::config::OpencodeConfig,
 ) -> Result<voxgolem_platform::opencode::OpencodeServerConfig, String> {
@@ -11823,9 +11615,6 @@ fn initialize_app_state(init: AppStateInit) -> AppState {
         network_preferences: Arc::new(Mutex::new(network_preferences)),
         startup_state: init.startup_state,
         runtime_config: init.runtime_config,
-        custom_auth_source_path: init.custom_auth_source_path,
-        custom_auth_path: init.custom_auth_path,
-        custom_retry_lock: init.custom_retry_lock,
         microphone_capture: init.microphone_capture,
         native_voice: Arc::new(desktop_voice::DesktopVoiceRuntime::new()),
         native_observation: Mutex::new(desktop_observation::DesktopObservation::new()),
@@ -11903,27 +11692,7 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
     #[cfg(not(test))]
     let config_path: Option<PathBuf> = None;
     match voxgolem_core::config::load_runtime_config(config_path.as_deref()) {
-        Ok(mut config) => {
-            let custom_auth_source_path = config
-                .custom_openai
-                .as_ref()
-                .filter(|custom| {
-                    custom.auth_source == voxgolem_core::config::CustomOpenAiAuthSource::Wsl
-                })
-                .and_then(|custom| {
-                    (!custom.auth_path.as_os_str().is_empty()).then(|| custom.auth_path.clone())
-                });
-            resolve_platform_provider_paths(&mut config);
-            let custom_auth_path = Mutex::new(
-                config
-                    .custom_openai
-                    .as_ref()
-                    .filter(|custom| {
-                        custom.auth_source == voxgolem_core::config::CustomOpenAiAuthSource::Wsl
-                            && custom.auth_path.is_file()
-                    })
-                    .map(|custom| custom.auth_path.clone()),
-            );
+        Ok(config) => {
             let telemetry_sink = new_telemetry_sink(config.telemetry);
             let mut capabilities = configured_capabilities(&config);
             let voice_pipeline_config = voice_pipeline_config_with_silence_timeouts(
@@ -12282,9 +12051,6 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
             initialize_app_state(AppStateInit {
                 startup_state,
                 runtime_config: Some(config),
-                custom_auth_source_path,
-                custom_auth_path,
-                custom_retry_lock: tokio::sync::Mutex::new(()),
                 selected_response_profile,
                 supported_response_profiles,
                 response_profile_switch_generation,
@@ -12386,9 +12152,6 @@ fn build_startup_error_app_state(
     initialize_app_state(AppStateInit {
         startup_state: Arc::new(Mutex::new(StartupStatePayload::Error { message })),
         runtime_config: None,
-        custom_auth_source_path: None,
-        custom_auth_path: Mutex::new(None),
-        custom_retry_lock: tokio::sync::Mutex::new(()),
         selected_response_profile: Arc::new(Mutex::new(default_response_profile())),
         supported_response_profiles: vec![default_response_profile()],
         response_profile_switch_generation: Arc::new(AtomicU64::new(0)),
@@ -12437,9 +12200,6 @@ fn build_nonfatal_config_error_app_state(
             capabilities: failed_capabilities(message),
         })),
         runtime_config: None,
-        custom_auth_source_path: None,
-        custom_auth_path: Mutex::new(None),
-        custom_retry_lock: tokio::sync::Mutex::new(()),
         selected_response_profile: Arc::new(Mutex::new(default_response_profile())),
         supported_response_profiles: Vec::new(),
         response_profile_switch_generation: Arc::new(AtomicU64::new(0)),
@@ -13722,7 +13482,6 @@ pub fn run() {
                 app_updates::get_update_snapshot,
                 app_updates::restart_for_update,
                 get_startup_state,
-                retry_custom_provider,
                 chatgpt_auth::chatgpt_auth,
                 chatgpt_auth::open_chatgpt_sign_in,
                 set_tts_enabled,
@@ -13923,17 +13682,16 @@ mod tests {
 
     use super::{
         agent_history, allows_user_media_from_uri, apply_opencode_startup_failure,
-        apply_optional_speech_activity, apply_wsl_custom_auth_resolution,
-        assistant_completion_enabled, atomic_replace_state_file, begin_exit_cleanup,
-        begin_native_microphone_operation, begin_update_installation,
+        apply_optional_speech_activity, assistant_completion_enabled, atomic_replace_state_file,
+        begin_exit_cleanup, begin_native_microphone_operation, begin_update_installation,
         begin_update_sensitive_operation, bounded_capability_reason, bounded_provider_history,
         build_ipc_app_snapshot, build_mark_silence_response, build_nonfatal_config_error_app_state,
         build_startup_error_app_state, cancel_current_tts_playback_state,
         cancel_tts_playback_state, claim_cancelled_prompt_publication,
         cleanup_orphan_state_temps_with, cleanup_sequential, clear_active_prompt,
-        clear_completion_request_state_locked, configured_capabilities,
-        current_runtime_phase_response, current_silence_deadline, default_response_profile,
-        default_voice_pipeline_config, ensure_app_running, ensure_assistant_settings_available,
+        clear_completion_request_state_locked, current_runtime_phase_response,
+        current_silence_deadline, default_response_profile, default_voice_pipeline_config,
+        ensure_app_running, ensure_assistant_settings_available,
         ensure_update_installation_is_idle, finish_tts_playback_state,
         fit_review_history_to_prompt_budget, get_app_snapshot_from_state,
         ingest_audio_frame_with_optional_wake_word_detection, initial_stage_sequence,
@@ -18740,168 +18498,6 @@ mod tests {
                 ResponseProfilePayload::Quality
             ]
         );
-    }
-
-    #[test]
-    fn resolved_wsl_auth_enables_only_the_custom_provider() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let config_path = temp.path().join("config.toml");
-        let auth_path = temp.path().join("auth.json");
-        std::fs::write(&auth_path, "{}").expect("auth fixture");
-        std::fs::write(
-            &config_path,
-            "response_backend = \"opencode\"\n[opencode]\nruntime = \"wsl\"\n[custom_openai]\nauth_source = \"wsl\"\n",
-        )
-        .expect("config fixture");
-        let mut config =
-            voxgolem_core::config::load_runtime_config(Some(&config_path)).expect("WSL config");
-
-        apply_wsl_custom_auth_resolution(&mut config, Ok(auth_path.clone()));
-
-        assert_eq!(
-            config
-                .custom_openai
-                .as_ref()
-                .expect("custom config")
-                .auth_path,
-            auth_path
-        );
-        let capabilities = configured_capabilities(&config);
-        let custom = capabilities
-            .iter()
-            .find(|capability| capability.id == "custom_provider")
-            .expect("custom capability");
-        assert_eq!(custom.state, CapabilityStatePayload::Available);
-    }
-
-    #[test]
-    fn failed_wsl_auth_resolution_isolated_to_custom_capability() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let config_path = temp.path().join("config.toml");
-        std::fs::write(
-            &config_path,
-            "response_backend = \"opencode\"\n[opencode]\nruntime = \"wsl\"\n[custom_openai]\nauth_source = \"wsl\"\n",
-        )
-        .expect("config fixture");
-        let mut config =
-            voxgolem_core::config::load_runtime_config(Some(&config_path)).expect("WSL config");
-
-        apply_wsl_custom_auth_resolution(&mut config, Err(String::from("WSL is unavailable")));
-
-        let capabilities = configured_capabilities(&config);
-        let custom = capabilities
-            .iter()
-            .find(|capability| capability.id == "custom_provider")
-            .expect("custom capability");
-        assert_eq!(custom.state, CapabilityStatePayload::Unavailable);
-        assert!(custom.reason.contains("WSL is unavailable"));
-        assert!(capabilities.iter().any(|capability| {
-            capability.id == "wake_word"
-                && capability.reason != "failed to resolve WSL OpenCode auth: WSL is unavailable"
-        }));
-    }
-
-    #[test]
-    fn custom_wsl_startup_recovers_after_one_failed_lookup_before_capability_selection() {
-        let auth_path = PathBuf::from("/synthetic/wsl-auth.json");
-        let mut attempts = Vec::new();
-        let resolved = super::resolve_custom_wsl_auth_with_retry(|timeout| {
-            attempts.push(timeout);
-            if attempts.len() == 1 {
-                Err(String::from("WSL command timed out"))
-            } else {
-                Ok(auth_path.clone())
-            }
-        });
-
-        assert_eq!(resolved, Ok(auth_path));
-        assert_eq!(attempts, [Duration::from_secs(5), Duration::from_secs(15)]);
-    }
-
-    #[test]
-    fn custom_wsl_startup_does_not_retry_a_successful_lookup() {
-        let mut attempts = Vec::new();
-        let resolved = super::resolve_custom_wsl_auth_with_retry(|timeout| {
-            attempts.push(timeout);
-            Ok(PathBuf::from("/synthetic/wsl-auth.json"))
-        });
-
-        assert!(resolved.is_ok());
-        assert_eq!(attempts, [Duration::from_secs(5)]);
-    }
-
-    #[test]
-    fn custom_wsl_startup_keeps_the_final_failure_reason_after_one_retry() {
-        let mut attempts = Vec::new();
-        let resolved = super::resolve_custom_wsl_auth_with_retry(|timeout| {
-            attempts.push(timeout);
-            Err(if attempts.len() == 1 {
-                String::from("WSL command timed out")
-            } else {
-                String::from("WSL default distribution is unavailable")
-            })
-        });
-
-        assert_eq!(
-            resolved,
-            Err(String::from("WSL default distribution is unavailable"))
-        );
-        assert_eq!(attempts, [Duration::from_secs(5), Duration::from_secs(15)]);
-    }
-
-    #[test]
-    fn retry_custom_auth_replaces_failed_capability_and_direct_transport_path() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let config_path = temp.path().join("config.toml");
-        let auth_path = temp.path().join("auth.json");
-        std::fs::write(&config_path, "[custom_openai]\nauth_source = \"wsl\"\n")
-            .expect("synthetic config");
-        let mut config =
-            voxgolem_core::config::load_runtime_config(Some(&config_path)).expect("config");
-        apply_wsl_custom_auth_resolution(&mut config, Err(String::from("WSL command timed out")));
-        let state = Arc::new(Mutex::new(StartupStatePayload::Ready {
-            cue_asset_paths: super::embedded_cue_asset_paths(),
-            runtime_phase: RuntimePhasePayload::Sleeping,
-            voice_input_available: false,
-            voice_input_error: None,
-            initial_silence_timeout_ms: DEFAULT_INITIAL_SILENCE_TIMEOUT_MS,
-            silence_timeout_ms: DEFAULT_SILENCE_TIMEOUT_MS,
-            selected_response_profile: ResponseProfilePayload::Fast,
-            supported_response_profiles: Vec::new(),
-            prompt_cancellation_available: true,
-            tts_enabled: false,
-            tts_output_gain_db: 0.0,
-            capabilities: configured_capabilities(&config),
-        }));
-        let path_state = Mutex::new(None);
-        assert_eq!(
-            configured_capabilities(&config)[0].state,
-            CapabilityStatePayload::Unavailable
-        );
-        std::fs::write(&auth_path, "{}").expect("synthetic auth file");
-        super::refresh_custom_auth_state(&config, &path_state, &state, Ok(auth_path.clone()))
-            .expect("retry");
-        assert_eq!(
-            path_state.lock().expect("path lock").as_ref(),
-            Some(&auth_path)
-        );
-        {
-            let guard = state.lock().expect("state lock");
-            let StartupStatePayload::Ready { capabilities, .. } = &*guard else {
-                panic!("ready");
-            };
-            assert_eq!(capabilities[0].state, CapabilityStatePayload::Available);
-        }
-        let custom = config.custom_openai.as_ref().expect("custom config");
-        assert_eq!(
-            path_state.lock().expect("path lock").clone(),
-            Some(auth_path.clone())
-        );
-        assert_ne!(custom.auth_path, auth_path);
-        drop(std::fs::remove_file(&auth_path));
-        super::refresh_custom_auth_state(&config, &path_state, &state, Ok(auth_path))
-            .expect("failed retry");
-        assert!(path_state.lock().expect("path lock").is_none());
     }
 
     #[test]

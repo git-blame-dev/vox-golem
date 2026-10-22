@@ -158,7 +158,7 @@ impl Default for CustomOpenAiConfig {
     fn default() -> Self {
         Self {
             endpoint: DEFAULT_ENDPOINT.to_string(),
-            auth_path: default_auth_path(),
+            auth_path: PathBuf::new(),
             model: CustomOpenAiModel::SolHigh,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             idle_timeout: Duration::from_secs(30),
@@ -217,7 +217,7 @@ pub struct CustomOpenAiAuthObservation {
 
 /// Inspect admission using the bounded credential reader and request parser.
 /// Expired managed access remains admissible when it can refresh at dispatch;
-/// expired imported/access-only credentials remain unavailable.
+/// expired access-only credentials remain unavailable.
 /// No HTTP client is constructed and no credentials or observations are retained.
 pub fn observe_custom_openai_auth(path: &Path) -> CustomOpenAiAuthObservation {
     match read_credential_file(path) {
@@ -804,13 +804,6 @@ fn terminal_suffix<'a>(streamed: &str, terminal: &'a str) -> &'a str {
             ""
         }
     })
-}
-
-fn default_auth_path() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default()
-        .join(".local/share/opencode/auth.json")
 }
 
 pub(crate) fn valid_endpoint(endpoint: &str) -> bool {

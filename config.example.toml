@@ -24,12 +24,7 @@ inference_provider = "auto" # auto, cuda, or cpu
 
 [custom_openai]
 endpoint = "https://chatgpt.com/backend-api/codex/responses"
-# Prefer Settings -> Model -> Continue with ChatGPT: app-owned credentials take
-# precedence, and signing out blocks fallback to legacy imported credentials.
-# No token or auth_path is needed for that managed sign-in.
-# For legacy imported credentials only, omitting auth_path uses the platform's
-# OpenCode data-directory default; set an absolute override only if needed.
-auth_source = "native" # Windows may use "wsl" and omit auth_path.
+# Sign-in is via the in-app device-code flow in Settings -> Model -> Continue with ChatGPT.
 
 [completion]
 server_path = "llama/bin/llama-server"

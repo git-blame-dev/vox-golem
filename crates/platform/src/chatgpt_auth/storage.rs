@@ -75,23 +75,6 @@ pub(super) fn marked(bytes: &[u8]) -> bool {
     serde_json::from_slice::<Marker>(bytes).is_ok_and(|marker| marker.version == MANAGED_VERSION)
 }
 
-/// Legacy imported symlinks remain readable by the original provider parser,
-/// but are never a candidate for managed refresh, locks, or publication.
-pub(super) fn refresh_file(path: &Path) -> Result<Option<Vec<u8>>, AuthError> {
-    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_symlink()) {
-        let metadata = fs::metadata(path).map_err(|_| AuthError::Storage)?;
-        if !metadata.is_file() || metadata.len() > MAX_BODY as u64 {
-            return Err(AuthError::Storage);
-        }
-        let bytes = read_contents(path)?;
-        if marked(&bytes) {
-            return Err(AuthError::Storage);
-        }
-        return Ok(None);
-    }
-    read_file(path)
-}
-
 pub(super) fn read_file(path: &Path) -> Result<Option<Vec<u8>>, AuthError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,

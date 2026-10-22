@@ -695,12 +695,8 @@ fn client_from_selection(
     fallback: Option<&voxgolem_core::config::CustomOpenAiConfig>,
     model: CustomOpenAiModel,
 ) -> Result<CustomOpenAiClient, &'static str> {
-    use voxgolem_core::config::{effective_custom_openai_config, CustomOpenAiAuthSource};
+    use voxgolem_core::config::effective_custom_openai_config;
     let config = effective_custom_openai_config(managed, fallback).ok_or("auth_unavailable")?;
-    // WSL paths cannot be opened as native files. Never guess an alternate account.
-    if config.auth_source != CustomOpenAiAuthSource::Native {
-        return Err("auth_source_unsupported");
-    }
     let client = CustomOpenAiClient::new(CustomOpenAiConfig {
         endpoint: config.endpoint,
         auth_path: config.auth_path,
@@ -1243,7 +1239,6 @@ mod tests {
         let fallback = voxgolem_core::config::CustomOpenAiConfig {
             endpoint: CustomOpenAiConfig::default().endpoint,
             auth_path: missing,
-            auth_source: voxgolem_core::config::CustomOpenAiAuthSource::Native,
         };
         let result = client_from_selection(None, Some(&fallback), CustomOpenAiModel::LunaNone);
         let reason = result

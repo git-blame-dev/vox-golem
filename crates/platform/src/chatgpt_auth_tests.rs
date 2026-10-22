@@ -149,18 +149,18 @@ fn path() -> (crate::test_support::TestDir, PathBuf) {
 }
 
 #[tokio::test]
-async fn imported_credentials_are_never_mutated_or_exported() {
+async fn foreign_file_at_the_managed_path_is_never_mutated_or_exported() {
     let (_dir, path) = path();
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let imported =
+    let foreign =
         br#"{"openai":{"access":"synthetic-import","refresh":"synthetic-refresh","expires":1}}"#;
-    std::fs::write(&path, imported).unwrap();
+    std::fs::write(&path, foreign).unwrap();
     assert!(!is_managed(&path));
     assert!(!can_refresh(&path));
     assert!(export_access(&path).await.unwrap().is_none());
     assert_eq!(command(&path, "sign_out").await, Err(AuthError::Conflict));
     assert_eq!(command(&path, "start").await, Err(AuthError::Conflict));
-    assert_eq!(std::fs::read(&path).unwrap(), imported);
+    assert_eq!(std::fs::read(&path).unwrap(), foreign);
 }
 
 #[tokio::test]
@@ -721,9 +721,9 @@ fn unsafe_storage_and_oversized_files_fail_closed() {
     {
         use std::os::unix::fs::{symlink, PermissionsExt};
         std::fs::remove_file(&path).unwrap();
-        let imported = dir.path().join("imported.json");
-        std::fs::write(&imported, "synthetic-import").unwrap();
-        symlink(&imported, &path).unwrap();
+        let target = dir.path().join("target.json");
+        std::fs::write(&target, "synthetic-import").unwrap();
+        symlink(&target, &path).unwrap();
         assert_eq!(read_file(&path), Err(AuthError::Storage));
         std::fs::remove_file(&path).unwrap();
         std::fs::set_permissions(
@@ -735,10 +735,7 @@ fn unsafe_storage_and_oversized_files_fail_closed() {
             write_file(&path, &managed("synthetic-access", "synthetic-refresh", 1)),
             Err(AuthError::Storage)
         );
-        assert_eq!(
-            std::fs::read_to_string(imported).unwrap(),
-            "synthetic-import"
-        );
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "synthetic-import");
     }
 }
 
@@ -834,59 +831,6 @@ fn credential_lock_excludes_an_actual_second_process() {
     probe(false);
     drop(lock);
     probe(true);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn imported_symlink_dispatches_unchanged_but_managed_symlink_is_rejected() {
-    use crate::custom_openai::CustomOpenAiPrompt;
-    use std::os::unix::fs::symlink;
-    let (dir, path) = path();
-    let imported = dir.path().join("synthetic-import.json");
-    let contents = json!({"openai":{"access":"synthetic-imported-access", "expires":now_ms().unwrap() + 3_600_000}}).to_string();
-    std::fs::write(&imported, &contents).unwrap();
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    symlink(&imported, &path).unwrap();
-    let mut reply = Reply::json(200, json!({}));
-    reply.content_type = "text/event-stream";
-    reply.body = concat!(
-        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Synthetic reply\"}\n\n",
-        "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
-    )
-    .into();
-    let mut mock = mock(vec![reply]).await;
-    let client = CustomOpenAiClient::new(CustomOpenAiConfig {
-        endpoint: mock.engine.issuer.clone(),
-        auth_path: path.clone(),
-        ..Default::default()
-    })
-    .unwrap();
-    let prompt = CustomOpenAiPrompt {
-        session_id: "synthetic-session".into(),
-        prompt: "Synthetic prompt".into(),
-        history: vec![],
-    };
-    assert_eq!(
-        client.respond(&prompt, |_| {}).await.unwrap().text,
-        "Synthetic reply"
-    );
-    let sent = request(&mut mock, "/").await;
-    assert!(sent.contains("Bearer synthetic-imported-access"));
-    assert_eq!(std::fs::read_to_string(&imported).unwrap(), contents);
-    assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink());
-    // A managed marker behind the same symlink is not a refresh/publication path.
-    write_file(
-        &imported,
-        &managed("synthetic-managed", "synthetic-refresh", 1),
-    )
-    .unwrap();
-    let before = std::fs::read(&imported).unwrap();
-    assert_eq!(
-        client.respond(&prompt, |_| {}).await,
-        Err(CustomOpenAiError::AuthUnavailable)
-    );
-    assert!(!can_refresh(&path));
-    assert_eq!(std::fs::read(imported).unwrap(), before);
 }
 
 #[tokio::test]

@@ -97,10 +97,14 @@ struct RawLlamaCppConfig {
 struct RawCustomOpenAiConfig {
     #[serde(default = "default_private_endpoint")]
     endpoint: String,
+    /// Accepted and ignored so existing config files keep loading; credentials now come
+    /// only from the in-app device-code sign-in.
     #[serde(default)]
-    auth_path: Option<PathBuf>,
+    #[allow(dead_code)]
+    auth_path: Option<serde::de::IgnoredAny>,
     #[serde(default)]
-    auth_source: CustomOpenAiAuthSource,
+    #[allow(dead_code)]
+    auth_source: Option<serde::de::IgnoredAny>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -187,8 +191,8 @@ pub struct LlamaCppConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CustomOpenAiConfig {
     pub endpoint: String,
+    /// The app-managed device-code credential file.
     pub auth_path: PathBuf,
-    pub auth_source: CustomOpenAiAuthSource,
 }
 
 pub fn managed_chatgpt_auth_path(config_path: &Path) -> PathBuf {
@@ -197,9 +201,9 @@ pub fn managed_chatgpt_auth_path(config_path: &Path) -> PathBuf {
         .join("chatgpt-auth.json")
 }
 
-/// Select the app-owned source without reading credentials or changing storage.
-/// Only an absent managed selection permits imported fallback; a signed-out,
-/// malformed, inaccessible or dangling selection must not switch accounts.
+/// Select the app-owned credential file without reading credentials or changing storage.
+/// An existing managed file (even signed out or malformed) yields the default endpoint;
+/// otherwise the configured section, which also points at the managed file, is used.
 pub fn effective_custom_openai_config(
     managed_auth_path: Option<&Path>,
     fallback: Option<&CustomOpenAiConfig>,
@@ -211,18 +215,9 @@ pub fn effective_custom_openai_config(
         return Some(CustomOpenAiConfig {
             endpoint: default_private_endpoint(),
             auth_path: path.into(),
-            auth_source: CustomOpenAiAuthSource::Native,
         });
     }
     fallback.cloned()
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum CustomOpenAiAuthSource {
-    #[default]
-    Native,
-    Wsl,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -501,22 +496,6 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
             ),
         });
     }
-    if let Some(path) = raw_config
-        .custom_openai
-        .as_ref()
-        .filter(|raw| raw.auth_source == CustomOpenAiAuthSource::Wsl)
-        .and_then(|raw| raw.auth_path.as_ref())
-        .filter(|path| !is_absolute_linux_path(path))
-    {
-        return Err(ConfigError::ParseConfigFailed {
-            path: config_path.clone(),
-            details: format!(
-                "custom_openai.auth_path must be an absolute Linux path for WSL auth: {}",
-                path.display()
-            ),
-        });
-    }
-
     let wake_word_configured = raw_config.wake_word_model_path.is_some();
     let parakeet_configured = raw_config.parakeet_model_dir.is_some();
     let vad_configured = raw_config.silero_vad_model.is_some();
@@ -807,17 +786,6 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
         }
     });
     let custom_openai = raw_config.custom_openai.as_ref().map(|raw| {
-        let auth_path = match raw.auth_source {
-            CustomOpenAiAuthSource::Wsl => raw.auth_path.clone().unwrap_or_default(),
-            CustomOpenAiAuthSource::Native => {
-                let path = raw.auth_path.clone().unwrap_or_else(default_auth_path);
-                if path.as_os_str().is_empty() {
-                    path
-                } else {
-                    resolve_config_path(&config_dir, path)
-                }
-            }
-        };
         let endpoint = raw.endpoint.trim().to_string();
         if !valid_custom_endpoint(&endpoint) {
             capability_issues.push(CapabilityConfigIssue {
@@ -825,16 +793,16 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
                 reason: String::from("custom_openai.endpoint is invalid"),
             });
         }
-        record_custom_auth_issue(
-            &mut capability_issues,
-            raw.auth_source,
-            &auth_path,
-            cfg!(windows),
-        );
+        let auth_path = managed_chatgpt_auth_path(&config_path);
+        if !auth_path.is_file() {
+            capability_issues.push(CapabilityConfigIssue {
+                capability: "custom_provider",
+                reason: String::from("Sign in with ChatGPT to enable Custom"),
+            });
+        }
         CustomOpenAiConfig {
             endpoint,
             auth_path,
-            auth_source: raw.auth_source,
         }
     });
     let completion = raw_config.completion.as_ref().map(|raw| {
@@ -1041,36 +1009,6 @@ fn record_path_issue(
     });
 }
 
-fn record_custom_auth_issue(
-    issues: &mut Vec<CapabilityConfigIssue>,
-    source: CustomOpenAiAuthSource,
-    auth_path: &Path,
-    windows: bool,
-) {
-    match source {
-        CustomOpenAiAuthSource::Wsl if !windows => issues.push(CapabilityConfigIssue {
-            capability: "custom_provider",
-            reason: String::from("WSL auth is only supported by the Windows application"),
-        }),
-        CustomOpenAiAuthSource::Wsl => {}
-        CustomOpenAiAuthSource::Native if auth_path.as_os_str().is_empty() => {
-            issues.push(CapabilityConfigIssue {
-                capability: "custom_provider",
-                reason: String::from(
-                    "auth path unavailable: HOME or absolute XDG_DATA_HOME is required",
-                ),
-            });
-        }
-        CustomOpenAiAuthSource::Native => record_path_issue(
-            issues,
-            "custom_provider",
-            true,
-            auth_path.is_file(),
-            auth_path,
-        ),
-    }
-}
-
 fn default_web_enabled() -> bool {
     true
 }
@@ -1167,32 +1105,6 @@ fn valid_custom_endpoint(endpoint: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
-fn default_auth_path() -> PathBuf {
-    default_auth_path_from_env(|name| std::env::var_os(name), cfg!(windows))
-}
-
-fn default_auth_path_from_env<F>(mut get: F, windows: bool) -> PathBuf
-where
-    F: FnMut(&str) -> Option<std::ffi::OsString>,
-{
-    if windows {
-        get("APPDATA")
-            .or_else(|| {
-                get("USERPROFILE")
-                    .map(|p| PathBuf::from(p).join("AppData/Roaming").into_os_string())
-            })
-            .map(|base| PathBuf::from(base).join("opencode/auth.json"))
-            .unwrap_or_default()
-    } else {
-        get("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .or_else(|| get("HOME").map(|p| PathBuf::from(p).join(".local/share")))
-            .map(|p| p.join("opencode/auth.json"))
-            .unwrap_or_default()
-    }
-}
-
 fn resolve_config_path(config_dir: &Path, path: PathBuf) -> PathBuf {
     if path.is_absolute() {
         path
@@ -1208,10 +1120,9 @@ fn is_absolute_linux_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_auth_path_from_env, default_private_endpoint, effective_custom_openai_config,
-        linux_app_dir_from_env, load_runtime_config, managed_chatgpt_auth_path,
-        platform_dirs_from_env, record_custom_auth_issue, soul_path_for_config,
-        valid_custom_endpoint, ConfigError, CustomOpenAiAuthSource, CustomOpenAiConfig,
+        default_private_endpoint, effective_custom_openai_config, linux_app_dir_from_env,
+        load_runtime_config, managed_chatgpt_auth_path, platform_dirs_from_env,
+        soul_path_for_config, valid_custom_endpoint, ConfigError, CustomOpenAiConfig,
         InferencePolicy, OpencodeRuntime, RawCompletionConfig, RawLlamaCppConfig,
         ResponseBackendConfig,
     };
@@ -1227,11 +1138,10 @@ mod tests {
         );
     }
 
-    fn imported_custom_config() -> CustomOpenAiConfig {
+    fn configured_custom_config() -> CustomOpenAiConfig {
         CustomOpenAiConfig {
             endpoint: "http://127.0.0.1:12345/responses".into(),
-            auth_path: "/synthetic/imported-auth.json".into(),
-            auth_source: CustomOpenAiAuthSource::Wsl,
+            auth_path: "/synthetic/managed-auth.json".into(),
         }
     }
 
@@ -1249,20 +1159,20 @@ mod tests {
     fn absent_managed_source_preserves_the_configured_provider() {
         let root = TempDir::new();
         let missing = root.path().join("absent-auth.json");
-        let imported = imported_custom_config();
+        let configured = configured_custom_config();
         assert_eq!(
-            effective_custom_openai_config(Some(&missing), Some(&imported)),
-            Some(imported.clone())
+            effective_custom_openai_config(Some(&missing), Some(&configured)),
+            Some(configured.clone())
         );
         assert_eq!(
-            effective_custom_openai_config(None, Some(&imported)),
-            Some(imported)
+            effective_custom_openai_config(None, Some(&configured)),
+            Some(configured)
         );
         assert!(effective_custom_openai_config(Some(&missing), None).is_none());
     }
 
     #[test]
-    fn managed_selection_fences_imported_fallback_even_when_signed_out_or_malformed() {
+    fn existing_managed_file_selects_the_default_endpoint_even_when_signed_out_or_malformed() {
         let root = TempDir::new();
         let managed = root.path().join("managed-auth.json");
         for contents in [
@@ -1271,10 +1181,9 @@ mod tests {
         ] {
             fs::write(&managed, contents).unwrap();
             let selected =
-                effective_custom_openai_config(Some(&managed), Some(&imported_custom_config()))
+                effective_custom_openai_config(Some(&managed), Some(&configured_custom_config()))
                     .unwrap();
             assert_eq!(selected.auth_path, managed);
-            assert_eq!(selected.auth_source, CustomOpenAiAuthSource::Native);
             assert_eq!(selected.endpoint, default_private_endpoint());
         }
     }
@@ -1294,7 +1203,7 @@ mod tests {
         );
         for managed in [&dangling, &inaccessible] {
             let selected =
-                effective_custom_openai_config(Some(managed), Some(&imported_custom_config()))
+                effective_custom_openai_config(Some(managed), Some(&configured_custom_config()))
                     .unwrap();
             assert_eq!(selected.auth_path, *managed);
             assert_eq!(selected.endpoint, default_private_endpoint());
@@ -1363,7 +1272,30 @@ mod tests {
     }
 
     #[test]
-    fn provider_modes_default_to_native_and_preserve_native_paths() {
+    fn configured_custom_provider_asks_for_sign_in_until_the_managed_credential_exists() {
+        let temp = TempDir::new();
+        let path = temp.path().join("config.toml");
+        fs::write(&path, "[custom_openai]\n").expect("config should be written");
+        let issue = |config: &super::RuntimeConfig| {
+            config
+                .capability_issues
+                .iter()
+                .find(|issue| issue.capability == "custom_provider")
+                .map(|issue| issue.reason.clone())
+        };
+        let config = load_runtime_config(Some(&path)).expect("config should load");
+        assert_eq!(
+            issue(&config).as_deref(),
+            Some("Sign in with ChatGPT to enable Custom")
+        );
+        let managed = managed_chatgpt_auth_path(&path);
+        fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        fs::write(&managed, "{}").unwrap();
+        assert_eq!(issue(&load_runtime_config(Some(&path)).unwrap()), None);
+    }
+
+    #[test]
+    fn legacy_auth_keys_are_ignored_and_credentials_use_the_managed_path() {
         let temp = TempDir::new();
         let auth = temp.path().join("auth.json");
         let opencode = temp.path().join("opencode");
@@ -1383,8 +1315,9 @@ mod tests {
         let config = load_runtime_config(Some(&path)).expect("native config should load");
         assert_eq!(config.opencode.unwrap().runtime, OpencodeRuntime::Native);
         assert_eq!(
-            config.custom_openai.unwrap().auth_source,
-            CustomOpenAiAuthSource::Native
+            config.custom_openai.unwrap().auth_path,
+            managed_chatgpt_auth_path(&path),
+            "legacy auth_path/auth_source keys must load but never select credentials"
         );
     }
 
@@ -1394,20 +1327,16 @@ mod tests {
         let path = temp.path().join("config.toml");
         fs::write(
             &path,
-            "response_backend = \"opencode\"\n[opencode]\nruntime = \"wsl\"\n[custom_openai]\nauth_source = \"wsl\"\n",
+            "response_backend = \"opencode\"\n[opencode]\nruntime = \"wsl\"\n",
         )
         .expect("config should be written");
 
         let config = load_runtime_config(Some(&path)).expect("WSL config should parse");
         assert_eq!(config.opencode.unwrap().path, PathBuf::new());
-        assert_eq!(config.custom_openai.unwrap().auth_path, PathBuf::new());
         #[cfg(not(target_os = "windows"))]
         {
             assert!(config.capability_issues.iter().any(|issue| {
                 issue.capability == "opencode" && issue.reason.contains("only supported")
-            }));
-            assert!(config.capability_issues.iter().any(|issue| {
-                issue.capability == "custom_provider" && issue.reason.contains("only supported")
             }));
         }
         assert!(matches!(
@@ -1417,20 +1346,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_relative_wsl_provider_paths() {
-        for config in [
+    fn rejects_relative_wsl_opencode_path() {
+        let temp = TempDir::new();
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
             "[opencode]\nruntime = \"wsl\"\npath = \"relative/opencode\"\n",
-            "[custom_openai]\nauth_source = \"wsl\"\nauth_path = \"relative/auth.json\"\n",
-        ] {
-            let temp = TempDir::new();
-            let path = temp.path().join("config.toml");
-            fs::write(&path, config).expect("config should be written");
-            assert!(matches!(
-                load_runtime_config(Some(&path)),
-                Err(ConfigError::ParseConfigFailed { details, .. })
-                    if details.contains("absolute Linux path")
-            ));
-        }
+        )
+        .expect("config should be written");
+        assert!(matches!(
+            load_runtime_config(Some(&path)),
+            Err(ConfigError::ParseConfigFailed { details, .. })
+                if details.contains("absolute Linux path")
+        ));
     }
 
     #[test]
@@ -1439,7 +1367,7 @@ mod tests {
         let path = temp.path().join("config.toml");
         fs::write(
             &path,
-            "[opencode]\nruntime = \"wsl\"\npath = \"/home/user/bin/opencode\"\n[custom_openai]\nauth_source = \"wsl\"\nauth_path = \"/home/user/auth.json\"\n",
+            "[opencode]\nruntime = \"wsl\"\npath = \"/home/user/bin/opencode\"\n",
         )
         .expect("config should be written");
 
@@ -1448,19 +1376,6 @@ mod tests {
             config.opencode.expect("OpenCode config").path,
             PathBuf::from("/home/user/bin/opencode")
         );
-        assert_eq!(
-            config.custom_openai.expect("Custom config").auth_path,
-            PathBuf::from("/home/user/auth.json")
-        );
-    }
-
-    #[test]
-    fn windows_defers_wsl_auth_file_validation_to_the_platform_resolver() {
-        for path in [Path::new(""), Path::new("/home/user/missing-auth.json")] {
-            let mut issues = Vec::new();
-            record_custom_auth_issue(&mut issues, CustomOpenAiAuthSource::Wsl, path, true);
-            assert!(issues.is_empty());
-        }
     }
 
     #[test]
@@ -1616,27 +1531,6 @@ mod tests {
     }
 
     #[test]
-    fn resolves_default_auth_paths_from_platform_data_directories() {
-        let linux = HashMap::from([("XDG_DATA_HOME", "/data")]);
-        assert_eq!(
-            default_auth_path_from_env(|name| linux.get(name).map(std::ffi::OsString::from), false),
-            PathBuf::from("/data/opencode/auth.json")
-        );
-        let windows = HashMap::from([("USERPROFILE", r"C:\Users\test")]);
-        assert_eq!(
-            default_auth_path_from_env(
-                |name| windows.get(name).map(std::ffi::OsString::from),
-                true
-            ),
-            PathBuf::from(r"C:\Users\test")
-                .join("AppData/Roaming")
-                .join("opencode/auth.json")
-        );
-        assert_eq!(default_auth_path_from_env(|_| None, false), PathBuf::new());
-        assert_eq!(default_auth_path_from_env(|_| None, true), PathBuf::new());
-    }
-
-    #[test]
     fn loads_repository_config_example_through_runtime_parser() {
         let config_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -1656,8 +1550,8 @@ mod tests {
                 .as_ref()
                 .expect("example Custom settings")
                 .auth_path,
-            super::default_auth_path(),
-            "the copied example should use the production platform auth default"
+            managed_chatgpt_auth_path(&config_path),
+            "the copied example should use the app-managed credential file"
         );
         let llama = config
             .llama_cpp

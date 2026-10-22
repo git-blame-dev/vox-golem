@@ -122,13 +122,11 @@ pub(super) async fn open_chatgpt_sign_in() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use voxgolem_core::config::CustomOpenAiAuthSource;
 
-    fn legacy() -> CustomOpenAiConfig {
+    fn configured() -> CustomOpenAiConfig {
         CustomOpenAiConfig {
             endpoint: "https://synthetic.invalid/responses".into(),
-            auth_path: "/synthetic/imported-auth.json".into(),
-            auth_source: CustomOpenAiAuthSource::Wsl,
+            auth_path: "/synthetic/managed-auth.json".into(),
         }
     }
 
@@ -137,9 +135,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("chatgpt-auth.json");
         std::fs::write(&path, "{}").unwrap();
-        let config = configuration_at(Some(&path), Some(&legacy())).unwrap();
+        let config = configuration_at(Some(&path), Some(&configured())).unwrap();
         assert_eq!(config.auth_path, path);
-        assert_eq!(config.auth_source, CustomOpenAiAuthSource::Native);
         assert_eq!(
             config.endpoint,
             "https://chatgpt.com/backend-api/codex/responses"
@@ -147,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn signed_out_record_does_not_fall_back_to_imported_credentials() {
+    fn signed_out_record_keeps_the_managed_path() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("chatgpt-auth.json");
         std::fs::write(&path, "{}").unwrap();
@@ -156,19 +153,18 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn dangling_managed_selection_never_falls_back_to_imported_credentials() {
+    fn dangling_managed_selection_stays_on_the_managed_path() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("chatgpt-auth.json");
         std::os::unix::fs::symlink(dir.path().join("absent-target.json"), &path).unwrap();
 
-        let selected = configuration_at(Some(&path), Some(&legacy())).unwrap();
+        let selected = configuration_at(Some(&path), Some(&configured())).unwrap();
         assert_eq!(selected.auth_path, path);
-        assert_eq!(selected.auth_source, CustomOpenAiAuthSource::Native);
     }
 
     #[test]
     fn untouched_installations_keep_existing_provider_configuration() {
-        let config = legacy();
+        let config = configured();
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
             configuration_at(Some(&dir.path().join("absent")), Some(&config)),
