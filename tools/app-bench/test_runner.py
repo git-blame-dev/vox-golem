@@ -1,4 +1,5 @@
 import json
+import stat
 import os
 import shutil
 import subprocess
@@ -315,20 +316,48 @@ assert.equal(release().restored,true);
             self.assertFalse(runner.answer_integrity(case, canonical, canonical, lost, True)['sources_preserved'])
             truncated = answer+'\n\nSources:\n'+'\n'.join(lost)+'\n'
             self.assertFalse(runner.answer_integrity(case, truncated, truncated, lost, True)['sources_preserved'])
-    def test_original_default_credential_location_survives_private_gui_home(self):
+    def test_live_credential_is_staged_privately_and_rotation_returns_to_the_source(self):
         with tempfile.TemporaryDirectory(dir='/tmp/opencode') as temp:
             root = Path(temp)
-            original = root/'original'
-            private = root/'private'
-            auth = original/'.local/share/opencode/auth.json'
-            auth.parent.mkdir(parents=True)
-            auth.write_text('{}')
-            private.mkdir()
-            with patch.dict(os.environ, {'HOME': str(private),
-                    'VOXGOLEM_BENCH_SOURCE_HOME': str(original),
-                    'VOXGOLEM_BENCH_SOURCE_DATA_HOME': ''}):
-                selected, _ = runner.selected_live_authority(root/'config.toml', {'custom_openai': {}})
-                self.assertEqual(selected, auth)
+            source_config = root/'config.toml'
+            source = runner.managed_credential(root)
+            source.parent.mkdir()
+            source.write_bytes(b'synthetic-original')
+            run = root/'run'; run.mkdir()
+            runner.stage_live_credential(run, source_config)
+            staged = runner.managed_credential(run/'config')
+            self.assertEqual(staged.read_bytes(), b'synthetic-original')
+            self.assertEqual(stat.S_IMODE(staged.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(staged.parent.stat().st_mode), 0o700)
+            staged.write_bytes(b'synthetic-rotated')
+            runner.finish_live_credential(run)
+            self.assertEqual(source.read_bytes(), b'synthetic-rotated')
+            runner.finish_live_credential(run)  # idempotent once returned
+
+    def test_rotation_never_overwrites_a_credential_changed_during_the_run(self):
+        with tempfile.TemporaryDirectory(dir='/tmp/opencode') as temp:
+            root = Path(temp)
+            source = runner.managed_credential(root)
+            source.parent.mkdir()
+            source.write_bytes(b'synthetic-original')
+            run = root/'run'; run.mkdir()
+            runner.stage_live_credential(run, root/'config.toml')
+            runner.managed_credential(run/'config').write_bytes(b'synthetic-rotated')
+            source.write_bytes(b'synthetic-newer-sign-in')
+            runner.finish_live_credential(run)
+            self.assertEqual(source.read_bytes(), b'synthetic-newer-sign-in')
+
+    def test_live_run_requires_a_regular_managed_sign_in_without_fallback(self):
+        with tempfile.TemporaryDirectory(dir='/tmp/opencode') as temp:
+            root = Path(temp)
+            run = root/'run'; run.mkdir()
+            with self.assertRaises(ValueError):
+                runner.stage_live_credential(run, root/'config.toml')
+            source = runner.managed_credential(root)
+            source.parent.mkdir()
+            source.symlink_to(root/'synthetic-missing')
+            with self.assertRaises(ValueError):
+                runner.stage_live_credential(run, root/'config.toml')
 
     def test_typed_control_can_only_prove_the_non_voice_path(self):
         stages = ['generation_dispatched']*3
@@ -379,26 +408,6 @@ assert.equal(release().restored,true);
             self.assertTrue((root/'latest'/'report.json').exists())
             self.assertEqual((foreign/'report.json').read_bytes(), b'preserved user artifact')
             self.assertEqual((root/'old'/'fixture.pcm').read_bytes(), b'synthetic fixture')
-
-    def test_live_authority_never_falls_back_from_a_broken_managed_selection(self):
-        with tempfile.TemporaryDirectory(dir='/tmp/opencode') as temp:
-            root = Path(temp)
-            source = root/'config.toml'
-            legacy = root/'synthetic-auth.json'
-            legacy.write_text('{}')
-            config = {'custom_openai': {'auth_path': str(legacy), 'auth_source': 'native'}}
-            self.assertEqual(runner.selected_live_authority(source, config)[0], legacy)
-            managed = root/'chatgpt'/'chatgpt-auth.json'
-            managed.parent.mkdir()
-            managed.symlink_to(root/'synthetic-missing')
-            with self.assertRaises(ValueError):
-                runner.selected_live_authority(source, config)
-            managed.unlink()
-            managed.write_text('{"synthetic":"signed-out marker"}')
-            self.assertEqual(runner.selected_live_authority(source, config)[0], managed)
-            managed.unlink()
-            with self.assertRaises(ValueError):
-                runner.selected_live_authority(source, {})
 
     def test_research_acceptance_requires_real_read_evidence_exact_calls_and_streaming(self):
         stages = ['source_samples_completed', 'wake_detected', 'final_asr_started',
@@ -548,7 +557,7 @@ assert.equal(release().restored,true);
                 self.assertTrue(Path(env[key]).is_relative_to(run))
                 self.assertNotEqual(env[key], os.environ.get(key))
             self.assertEqual(env['VOXGOLEM_BENCH_MODE'], 'offline')
-            self.assertEqual(json.loads((run/'synthetic-auth.json').read_text())['openai']['access'], 'synthetic-benchmark-access')
+            self.assertEqual(json.loads(runner.managed_credential(run/'config').read_text())['openai']['access'], 'synthetic-benchmark-access')
 
 
 if __name__ == '__main__':

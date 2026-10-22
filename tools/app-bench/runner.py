@@ -215,36 +215,49 @@ def speech_configuration_identity(source_config):
     return identity
 
 
-def selected_live_authority(source_config, original):
-    """Preserve managed selection (including a broken/signed-out selection).
+MANAGED_ENDPOINT = 'https://chatgpt.com/backend-api/codex/responses'
+_STAGED_LIVE_CREDENTIALS = {}
 
-    Credential contents/refresh/revision validation stay in the real Rust client.
-    An absent Custom configuration must not silently select another account.
+
+def managed_credential(config_dir):
+    return config_dir/'chatgpt'/'chatgpt-auth.json'
+
+
+def stage_live_credential(run, source_config):
+    """Copy the signed-in managed credential into the isolated config directory.
+
+    The app only reads credentials from `<config dir>/chatgpt/chatgpt-auth.json`, so a
+    live run needs its own private copy. Credential contents, refresh and revision
+    validation stay in the real Rust client; finish_live_credential returns any
+    refresh-token rotation to the original file. No other account is ever selected.
     """
-    managed = source_config.parent/'chatgpt'/'chatgpt-auth.json'
+    source = managed_credential(source_config.parent)
+    if source.is_symlink() or not source.is_file():
+        raise ValueError('Sign in with ChatGPT before a live benchmark; no fallback permitted')
+    original = source.read_bytes()
+    staged = managed_credential(run/'config')
+    staged.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with open(staged, 'xb', opener=lambda path, flags: os.open(path, flags, 0o600)) as stream:
+        stream.write(original)
+    _STAGED_LIVE_CREDENTIALS[run] = (source, original)
+
+
+def finish_live_credential(run):
+    """Persist a rotated refresh token unless the source changed during the run."""
+    staged = _STAGED_LIVE_CREDENTIALS.pop(run, None)
+    if staged is None:
+        return
+    source, original = staged
     try:
-        managed.lstat()
-        selected = managed
-        endpoint = 'https://chatgpt.com/backend-api/codex/responses'
-    except FileNotFoundError:
-        custom = original.get('custom_openai')
-        if not isinstance(custom, dict) or custom.get('auth_source', 'native') != 'native':
-            raise ValueError('Approved native credential configuration unavailable')
-        configured = custom.get('auth_path')
-        if configured is None:
-            source_home = os.environ.get('VOXGOLEM_BENCH_SOURCE_HOME', os.environ.get('HOME', ''))
-            source_data = os.environ.get('VOXGOLEM_BENCH_SOURCE_DATA_HOME', os.environ.get('XDG_DATA_HOME', ''))
-            if not source_home or not Path(source_home).is_absolute():
-                raise ValueError('Original native credential location unavailable')
-            default_data = Path(source_data) if source_data and Path(source_data).is_absolute() else Path(source_home)/'.local/share'
-            configured = str(default_data/'opencode'/'auth.json')
-        selected = Path(configured)
-        if not selected.is_absolute():
-            selected = source_config.parent/selected
-        endpoint = custom.get('endpoint', 'https://chatgpt.com/backend-api/codex/responses')
-    if not selected.is_file():
-        raise ValueError('Selected credential authority unavailable; no fallback permitted')
-    return selected, endpoint
+        current = managed_credential(run/'config').read_bytes()
+        unchanged = source.read_bytes() == original
+    except OSError:
+        return
+    if current != original and unchanged:
+        temporary = source.with_name('.benchmark-sync')
+        with open(temporary, 'wb', opener=lambda path, flags: os.open(path, flags, 0o600)) as stream:
+            stream.write(current)
+        os.replace(temporary, source)
 
 
 def isolated_environment(run, source_config, endpoint, live=False, reservation=None, entry='voice'):
@@ -280,15 +293,16 @@ def isolated_environment(run, source_config, endpoint, live=False, reservation=N
     # No OpenCode table means no unrelated server is started.
     config += ['web_enabled = true', 'response_backend = "opencode"', '[custom_openai]']
     if live:
-        auth, live_endpoint = selected_live_authority(source_config, original)
-        config += [f'endpoint = {json.dumps(live_endpoint)}',
-                   f'auth_path = {json.dumps(str(auth))}', 'auth_source = "native"']
+        stage_live_credential(run, source_config)
+        custom = original.get('custom_openai')
+        live_endpoint = custom.get('endpoint', MANAGED_ENDPOINT) if isinstance(custom, dict) else MANAGED_ENDPOINT
+        config += [f'endpoint = {json.dumps(live_endpoint)}']
     else:
-        auth = run / 'synthetic-auth.json'
-        private_json(auth, {'openai': {'access': 'synthetic-benchmark-access',
-                                     'expires': 4102444800000}})
-        config += [f'endpoint = {json.dumps(endpoint)}',
-                   f'auth_path = {json.dumps(str(auth))}', 'auth_source = "native"']
+        credential = managed_credential(run/'config')
+        credential.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        private_json(credential, {'voxgolemChatgpt': 1, 'openai': {'access': 'synthetic-benchmark-access',
+                                                                  'expires': 4102444800000}})
+        config += [f'endpoint = {json.dumps(endpoint)}']
     # Omit the optional TTS table: even a disabled table requires model_path.
     config += ['[telemetry]', 'enabled = false',
                '[logging]', 'enabled = false']
@@ -862,6 +876,7 @@ def execute_typed(args):
     finally:
         if driver or process: shutdown_owned(driver, process)
         if service: service.__exit__(None, None, None)
+        finish_live_credential(run)
 
 
 INSTALL_NATIVE_OBSERVER_HOLD = '''
@@ -1210,6 +1225,7 @@ def execute(args):
             shutdown_owned(driver, process)
         if services:
             services.__exit__(None, None, None)
+        finish_live_credential(run)
 
 
 def can_connect(port):
