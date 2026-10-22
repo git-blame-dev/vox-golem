@@ -145,7 +145,7 @@ describe('compact Android composer voice controls', () => {
     const icon = button.querySelector('svg')!
     const listening = label === 'Finish dictation'
     expect(icon.getAttribute('data-icon-kind')).toBe(listening ? 'stop' : 'mic')
-    expect(icon.getAttribute('data-icon-state')).toBe(listening ? null : state)
+    expect(icon.getAttribute('data-icon-state')).toBe(listening || state === 'ready' ? null : state)
     expect(button.title).toContain(description)
     if (label === 'Finishing dictation') {
       expect(button.disabled).toBe(true)
@@ -230,7 +230,9 @@ describe('compact Android composer voice controls', () => {
       await act(async () => { state.event({ ...wire, ...phase }) })
       const group = container!.querySelector('[aria-label="Android voice controls"]')!
       expect(group.querySelector('svg')?.getAttribute('data-icon-kind')).toBe(phase.dictation === 'listening' ? 'stop' : 'mic')
-      if (phase.dictation !== 'listening') expect(group.querySelector('[data-state-mark]')).not.toBeNull()
+      const isIdleReady = phase.loop === 'idle'
+      if (phase.dictation !== 'listening' && !isIdleReady) expect(group.querySelector('[data-state-mark]')).not.toBeNull()
+      if (isIdleReady) expect(group.querySelector('[data-state-mark]')).toBeNull()
       expectIconOnlyRow()
     }
   })

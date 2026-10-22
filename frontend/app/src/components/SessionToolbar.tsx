@@ -20,7 +20,6 @@ export const SessionToolbar = memo(function SessionToolbar({ session, view }: Se
   } = usePresentation(session, view, 'toolbar')
   const { settingsOpen, settingsButtonRef, openSettings } = view.navigation
   const {
-    resetSession,
     setVoiceNotesOpen, selectAndroidConversation, toggleTts,
   } = view.actions
   const notesControl = <button type="button" className="shell__control shell__icon-control" aria-label={voiceNotesOpen ? 'Chat' : 'Voice notes'} title={voiceNotesOpen ? 'Chat' : 'Voice notes'} aria-pressed={voiceNotesOpen} onClick={() => setVoiceNotesOpen((open) => !open)}>
@@ -34,9 +33,6 @@ export const SessionToolbar = memo(function SessionToolbar({ session, view }: Se
     </select>
   </label> : null
   const exportConversationControl = <CopyConversationButton session={session} disabled={shortcutStaging || resetPending || updateRuntimeBlocked} />
-  const newChatControl = <button type="button" className="shell__control shell__new-chat shell__icon-control" onClick={() => void resetSession()} aria-label="New Chat" aria-busy={resetPending} title={resetPending ? 'Starting new chat…' : 'New Chat'} disabled={resetPending || updateRuntimeBlocked}>
-    <ControlIcon kind="plus" />
-  </button>
   const settingsControl = <button ref={settingsButtonRef} type="button" className="shell__control shell__settings-button shell__icon-control" onClick={openSettings} aria-label="Settings" aria-haspopup="dialog" aria-controls={SETTINGS_DIALOG_ID} aria-expanded={settingsOpen} title="Settings">
     <ControlIcon kind="settings" />
   </button>
@@ -65,8 +61,8 @@ export const SessionToolbar = memo(function SessionToolbar({ session, view }: Se
         </div>
       </div>
       <div className="shell__header-actions" role={isAndroidRuntime ? 'group' : undefined} aria-label={isAndroidRuntime ? 'Android toolbar' : undefined} aria-describedby={isAndroidRuntime && shortcutStaging ? 'new-voice-draft-status' : undefined}>
-        {isAndroidRuntime ? <>{!voiceNotesOpen ? <AndroidVoiceSecondaryControls /> : null}{notesControl}{conversationControl}{exportConversationControl}{newChatControl}{settingsControl}</> : null}
-        {!isAndroidRuntime ? <>{desktopSpeakerControl}{exportConversationControl}{newChatControl}{settingsControl}</> : null}
+        {isAndroidRuntime ? <>{!voiceNotesOpen ? <AndroidVoiceSecondaryControls /> : null}{notesControl}{conversationControl}{exportConversationControl}{settingsControl}</> : null}
+        {!isAndroidRuntime ? <>{desktopSpeakerControl}{exportConversationControl}{settingsControl}</> : null}
       </div>
     </header>
   )

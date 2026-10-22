@@ -70,15 +70,13 @@ const TranscriptRow = memo(function TranscriptRow({ message, onAnswerDomCommitte
   const timings = message.customDirectTimings
   const timingLabel = timings === undefined
     ? null
-    : timings.completedMs > timings.firstTextMs
-      ? `${duration(timings.firstTextMs)} · ${duration(timings.completedMs)}`
-      : duration(timings.completedMs)
+    : duration(timings.firstTextMs)
   const canCopy = message.content.trim().length > 0
   return <div className="conversation__answer" {...turnObservationAttributes(message)}>
     <AnswerStage compact answer={message.content} {...(message.thinkingStatus === undefined ? {} : { thinkingStatus: message.thinkingStatus })} className="message message--assistant" {...(message.contentKind === undefined ? {} : { contentKind: message.contentKind })} {...message.answerStage} />
     {timingLabel !== null || canCopy ? (
       <div className="message__footer message__footer--assistant">
-        {timingLabel !== null ? <small className="conversation__timings message__status-pill" data-custom-direct-timings="true">{timingLabel}</small> : null}
+        {timingLabel !== null ? <small className="conversation__timings" data-custom-direct-timings="true">{timingLabel}</small> : null}
         {canCopy ? (
           <CopyMessageButton
             text={message.content}

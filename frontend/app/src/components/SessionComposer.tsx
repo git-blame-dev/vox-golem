@@ -15,7 +15,7 @@ export const SessionComposer = memo(function SessionComposer({ session, view }: 
     instantControlsDisabled, runtimeStatus, updateRuntimeBlocked,
     promptActivity, wakeConfidence } = usePresentation(session, view, 'composer')
   const { onSubmit, loadMoreAndroidConversations, loadMoreAndroidHeads, selectAndroidConversation, changeComposer,
-    onComposerKeyDown, acceptTypedCompletion, clearCompletion, toggleMic, changeInstant, cancelPrompt } = view.actions
+    onComposerKeyDown, acceptTypedCompletion, clearCompletion, toggleMic, changeInstant, cancelPrompt, resetSession } = view.actions
   const canStop = (promptState === 'executing' || promptState === 'stopping') && startupState.kind === 'ready' && startupState.promptCancellationAvailable
   const busy = promptState !== 'idle' || runtimeStatus === 'processing' || runtimeStatus === 'executing'
   const actionLabel = canStop ? promptState === 'stopping' ? 'Stopping…' : 'Stop' : busy ? 'Working…' : 'Send'
@@ -63,6 +63,9 @@ export const SessionComposer = memo(function SessionComposer({ session, view }: 
               <span className="composer__wake-primary">wake: {(wakeConfidence * 100).toFixed(2)}%</span>
             </div>
           ) : null}
+          <button type="button" className="shell__control shell__new-chat shell__icon-control" onClick={() => void resetSession()} aria-label="New Chat" aria-busy={resetPending} title={resetPending ? 'Starting new chat…' : 'New Chat'} disabled={resetPending || updateRuntimeBlocked}>
+            <ControlIcon kind="plus" />
+          </button>
           {isAndroidRuntime ? <AndroidComposerVoiceControl /> : voiceInputReady(startupState) ? <button type="button" className="shell__control shell__icon-control" onClick={toggleMic} disabled={!canToggleMic} aria-label={micStarting ? 'Starting mic…' : micActive ? 'Stop mic' : 'Start mic'} title={micActive ? 'Stop mic' : 'Start mic'}><ControlIcon kind={micActive ? 'stop' : 'mic'} /></button> : null}
           <button type={busy ? 'button' : 'submit'} className="composer__button shell__icon-control" aria-label={actionLabel} title={actionLabel}
             disabled={canStop ? promptState === 'stopping' || updateRuntimeBlocked : busy || !canSend} onClick={canStop ? cancelPrompt : undefined}>

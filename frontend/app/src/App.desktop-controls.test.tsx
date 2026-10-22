@@ -296,7 +296,7 @@ describe('desktop change-triggered canonical model controls', () => {
     const headerActions = container!.querySelector('.shell__header-actions')!
     expect(headerActions.querySelector('[aria-label="Speak replies"] [data-icon-kind="speaker"]')).not.toBeNull()
     expect(headerActions.querySelector('[aria-label="Copy conversation"] [data-icon-kind="copy"]')).not.toBeNull()
-    expect(headerActions.querySelector('[aria-label="New Chat"] [data-icon-kind="plus"]')).not.toBeNull()
+    expect(container!.querySelector('.composer__utility-actions [aria-label="New Chat"] [data-icon-kind="plus"]')).not.toBeNull()
     expect(headerActions.querySelector('[aria-label="Settings"] [data-icon-kind="settings"]')).not.toBeNull()
 
     const authority = sessionAuthority(state.session)

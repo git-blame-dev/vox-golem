@@ -17,11 +17,11 @@
   min-width: 48px;
   min-height: 48px;
   border-radius: 999px;
-  background: var(--surface-pill);
+  background: transparent;
 }
 
 .android-voice-controls--composer .shell__icon-control:hover:not(:disabled) {
-  background: var(--surface-pill-hover);
+  background: var(--surface-glass-hover);
 }
 
 .shell .android-voice-controls--composer [data-voice-mode='ask'] {

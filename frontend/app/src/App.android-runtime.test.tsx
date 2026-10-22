@@ -242,7 +242,7 @@ describe('production Android App runtime', () => {
     const input = container.querySelector<HTMLTextAreaElement>('#promptComposer')!
     await act(async () => { Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set?.call(input, 'Synthetic desktop question'); input.dispatchEvent(new Event('input', { bubbles: true })) })
     await act(async () => { container!.querySelector<HTMLButtonElement>('button[type="submit"]')!.click() })
-    expect(container.querySelector('.conversation__timings')?.textContent).toBe('450 ms · 1.25 s')
+    expect(container.querySelector('.conversation__timings')?.textContent).toBe('450 ms')
     const provider = log.mock.calls.filter(([label]) => label === '[frontend-timing]').map(([, value]) => JSON.parse(value as string) as Record<string, unknown>).filter((metadata) => metadata['scope'] === 'provider_request')
     expect(provider).toEqual([{ scope: 'provider_request', request: 1, stage: 'PROVIDER_DURATIONS', firstTextMs: 450, completedMs: 1250 }])
   })

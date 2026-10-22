@@ -132,9 +132,7 @@ export function ChatBubble({ message }: ChatBubbleProps): JSX.Element {
   const timings = message.role === 'assistant' ? message.customDirectTimings : undefined
   const timingLabel = timings === undefined
     ? null
-    : timings.completedMs > timings.firstTextMs
-      ? `${duration(timings.firstTextMs)} · ${duration(timings.completedMs)}`
-      : duration(timings.completedMs)
+    : duration(timings.firstTextMs)
   const canCopy = (message.role === 'user' || message.role === 'assistant') && message.content.trim().length > 0
   return (
     <article className={`message message--${message.role}`} {...turnObservationAttributes(message)}>
@@ -144,7 +142,7 @@ export function ChatBubble({ message }: ChatBubbleProps): JSX.Element {
       {timingLabel !== null || canCopy ? (
         <div className={`message__footer message__footer--${message.role}`}>
           {timingLabel !== null ? (
-            <small className="conversation__timings message__status-pill" data-custom-direct-timings="true">
+            <small className="conversation__timings" data-custom-direct-timings="true">
               {timingLabel}
             </small>
           ) : null}

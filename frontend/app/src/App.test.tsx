@@ -465,7 +465,7 @@ describe('App', () => {
     expect(header?.querySelector('[data-runtime-phase]')).toBeNull()
     expect(header?.querySelector('[aria-label="Theme"]')).toBeNull()
     expect(header?.querySelector('[aria-label="Settings"]')).not.toBeNull()
-    expect(header?.querySelector('[aria-label="New Chat"]')).not.toBeNull()
+    expect(container.querySelector('.composer__utility-actions [aria-label="New Chat"]')).not.toBeNull()
     expect(container.querySelectorAll('button[aria-label="New Chat"]')).toHaveLength(1)
     expect(getConversation(container).hasAttribute('aria-live')).toBe(false)
     expect(shell.querySelector('main.conversation')).not.toBeNull()

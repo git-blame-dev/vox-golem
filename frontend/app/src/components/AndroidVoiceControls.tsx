@@ -146,7 +146,7 @@ function VoiceIntentButton() {
       disabled={active ? recognitionFinishing || shortcutFinishing : startDisabled}
       onClick={activate}
       onContextMenu={(event) => { if (event.button !== 0) event.preventDefault() }}>
-      {recognitionListening || shortcutListening ? <ControlIcon kind="stop" /> : <ControlIcon kind="mic" state={voiceState} />}
+      {recognitionListening || shortcutListening ? <ControlIcon kind="stop" /> : <ControlIcon kind="mic" {...(voiceState === 'ready' ? {} : { state: voiceState })} />}
     </button>
     <span id={`${descriptionId}-mic`} className="sr-only">{voiceDescription}</span>
   </>
