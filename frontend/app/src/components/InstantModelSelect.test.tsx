@@ -13,12 +13,12 @@ afterEach(() => {
   container?.remove()
 })
 
-function renderSelect(options: readonly AssistantOption<InstantChoice>[], disabled = false, canRetry: (value: InstantChoice) => boolean = () => false, variant?: 'default' | 'pill' | 'icon', value: InstantChoice = 'custom-sol-high') {
+function renderSelect(options: readonly AssistantOption<InstantChoice>[], disabled = false, canRetry: (value: InstantChoice) => boolean = () => false, variant?: 'default' | 'pill' | 'icon', value: InstantChoice = 'custom-sol-high', fastMode = false, onFastModeChange?: (fastMode: boolean) => void) {
   const onChange = vi.fn()
   container = document.createElement('div')
   document.body.append(container)
   root = createRoot(container)
-  act(() => root?.render(<InstantModelSelect {...(variant ? { variant } : {})} id="syntheticInstant" label="Instant model" value={value} options={options} disabled={disabled} canRetry={canRetry} onChange={onChange} />))
+  act(() => root?.render(<InstantModelSelect {...(variant ? { variant } : {})} id="syntheticInstant" label="Instant model" value={value} options={options} disabled={disabled} canRetry={canRetry} onChange={onChange} fastMode={fastMode} {...(onFastModeChange ? { onFastModeChange } : {})} />))
   const select = container.querySelector('select')!
   return { select, onChange, container }
 }
@@ -26,12 +26,13 @@ function renderSelect(options: readonly AssistantOption<InstantChoice>[], disabl
 describe('InstantModelSelect', () => {
   it('exposes the full selected label in a pill with a single trigger button and opens the vertical model + horizontal effort popup', () => {
     const label = 'Synthetic model with a deliberately long descriptive label'
+    const onFastModeChange = vi.fn()
     const { select, container: rootEl, onChange } = renderSelect([
       { value: 'custom-sol-high', label, available: true },
       { value: 'custom-sol-low', label: 'Custom: GPT-6.1 Sol Low', available: true },
       { value: 'agy-argon-high', label: 'Agy: Gemini 4 Argon High', available: true },
       { value: 'agy-argon-low', label: 'Agy: Gemini 4 Argon Low', available: true },
-    ], false, undefined, 'pill')
+    ], false, undefined, 'pill', 'custom-sol-high', false, onFastModeChange)
     const pill = select.closest('.composer__model-pill')!
     expect(pill).not.toBeNull()
     expect(pill.querySelector('.composer__model-pill-label')?.textContent).toBe(label)
@@ -47,24 +48,73 @@ describe('InstantModelSelect', () => {
     const modelButtons = Array.from(popup.querySelectorAll<HTMLButtonElement>('.composer__model-popup-item'))
     expect(modelButtons.map((b) => b.textContent)).toEqual([label, 'Gemini 4 Argon'])
 
-    const effortButtons = Array.from(popup.querySelectorAll<HTMLButtonElement>('.composer__model-popup-effort-chip'))
+    const effortButtons = Array.from(popup.querySelectorAll<HTMLButtonElement>('.composer__model-popup-effort-row .composer__model-popup-effort-chip'))
     expect(effortButtons.map((b) => b.textContent)).toEqual(['High', 'Low'])
+
+    const fastChips = Array.from(popup.querySelectorAll<HTMLButtonElement>('.composer__model-popup-fast-chip'))
+    expect(fastChips.map((b) => b.textContent)).toEqual(['Off', 'On'])
+    expect(fastChips[0]?.getAttribute('aria-pressed')).toBe('true')
+    expect(fastChips[1]?.getAttribute('aria-pressed')).toBe('false')
 
     act(() => modelButtons[1]!.click())
     expect(onChange).toHaveBeenCalledWith('agy-argon-high')
-    expect(rootEl.querySelector('.composer__model-popup')).not.toBeNull()
+    expect(rootEl.querySelector('.composer__model-popup')).toBe(popup)
+    expect(rootEl.querySelector('.composer__model-popup')?.getAttribute('data-state')).toBe('open')
+
+    act(() => fastChips[1]!.click())
+    expect(onFastModeChange).toHaveBeenCalledWith(true)
+    expect(rootEl.querySelector('.composer__model-popup')?.getAttribute('data-state')).toBe('closing')
+
+    act(() => trigger.click())
+    expect(rootEl.querySelector('.composer__model-popup')?.getAttribute('data-state')).toBe('open')
 
     act(() => effortButtons[1]!.click())
     expect(onChange).toHaveBeenCalledWith('custom-sol-low')
     expect(rootEl.querySelector('.composer__model-popup')?.getAttribute('data-state')).toBe('closing')
   })
 
+  it('keeps an open popup mounted when disabled transiently flips during an in-flight model change', () => {
+    const options: readonly AssistantOption<InstantChoice>[] = [
+      { value: 'custom-sol-high', label: 'Custom: GPT-6.1 Sol High', available: true },
+      { value: 'custom-sol-low', label: 'Custom: GPT-6.1 Sol Low', available: true },
+      { value: 'custom-luna-high', label: 'Custom: GPT-6 Luna High', available: true },
+      { value: 'custom-luna-low', label: 'Custom: GPT-6 Luna Low', available: true },
+    ]
+    const onChange = vi.fn()
+    const { select, container: rootEl } = renderSelect(options, false, undefined, 'pill', 'custom-sol-high')
+    const trigger = select.closest('.composer__model-pill')!.querySelector<HTMLButtonElement>('.composer__model-pill-trigger')!
+    act(() => trigger.click())
+
+    const popupBefore = rootEl.querySelector('.composer__model-popup')!
+    expect(popupBefore).not.toBeNull()
+    expect(popupBefore.getAttribute('data-state')).toBe('open')
+
+    act(() => root?.render(<InstantModelSelect variant="pill" id="syntheticInstant" label="Instant model" value="custom-luna-high" options={options} disabled={true} canRetry={() => false} onChange={onChange} />))
+    expect(rootEl.querySelector('.composer__model-popup')).toBe(popupBefore)
+    expect(rootEl.querySelector('.composer__model-popup')?.getAttribute('data-state')).toBe('open')
+
+    act(() => root?.render(<InstantModelSelect variant="pill" id="syntheticInstant" label="Instant model" value="custom-luna-high" options={options} disabled={false} canRetry={() => false} onChange={onChange} />))
+    expect(rootEl.querySelector('.composer__model-popup')).toBe(popupBefore)
+    expect(rootEl.querySelector('.composer__model-popup')?.getAttribute('data-state')).toBe('open')
+  })
+
+  it('hides the fast toggle when the selected model family does not support fast mode', () => {
+    const onFastModeChange = vi.fn()
+    const { select, container: rootEl } = renderSelect([
+      { value: 'agy-argon-high', label: 'Agy: Gemini 4 Argon High', available: true },
+      { value: 'agy-argon-low', label: 'Agy: Gemini 4 Argon Low', available: true },
+    ], false, undefined, 'pill', 'agy-argon-high', true, onFastModeChange)
+    const trigger = select.closest('.composer__model-pill')!.querySelector<HTMLButtonElement>('.composer__model-pill-trigger')!
+    act(() => trigger.click())
+    expect(rootEl.querySelector('.composer__model-popup-fast-row')).toBeNull()
+  })
+
   it('displays concise model and effort in the single pill label for catalog models', () => {
     const { select } = renderSelect([
       { value: 'custom-sol-high', label: 'Custom: GPT-6.1 Sol High', available: true },
       { value: 'custom-sol-low', label: 'Custom: GPT-6.1 Sol Low', available: true },
-    ], false, undefined, 'pill')
-    expect(select.closest('.composer__model-pill')?.querySelector('.composer__model-pill-label')?.textContent).toBe('GPT-6.1 Sol High')
+    ], false, undefined, 'pill', 'custom-sol-high', true)
+    expect(select.closest('.composer__model-pill')?.querySelector('.composer__model-pill-label')?.textContent).toBe('GPT-6.1 Sol High · Fast')
   })
 
   it('keeps an absent selected value visibly unavailable without silently selecting another model', () => {

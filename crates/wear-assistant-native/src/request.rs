@@ -24,6 +24,8 @@ struct WireRequest {
     #[serde(default = "default_web_enabled")]
     web_enabled: bool,
     #[serde(default)]
+    fast_mode: bool,
+    #[serde(default)]
     external_session_id: Option<String>,
     #[serde(default, rename = "searchMode")]
     legacy_search_mode: Option<String>,
@@ -69,6 +71,7 @@ pub(crate) struct Request {
     pub prompt: CustomOpenAiPrompt,
     pub instructions: String,
     pub web_enabled: bool,
+    pub fast_mode: bool,
 }
 
 pub(crate) fn valid_request_id(id: &str) -> bool {
@@ -155,6 +158,7 @@ pub(crate) fn parse(input: &str) -> Result<Request, ErrorCode> {
         model,
         instructions: wire.instructions,
         web_enabled: wire.web_enabled,
+        fast_mode: wire.fast_mode,
     })
 }
 
@@ -301,12 +305,15 @@ mod tests {
     fn native_admission_captures_web_permission_and_opaque_external_lifetime() {
         let legacy = parse(&fixture().to_string()).unwrap();
         assert!(legacy.web_enabled);
+        assert!(!legacy.fast_mode);
         let mut value = fixture();
         value["webEnabled"] = json!(false);
+        value["fastMode"] = json!(true);
         value["externalSessionId"] = json!("synthetic-process-session-1");
         value["searchMode"] = json!("research");
         let first = parse(&value.to_string()).unwrap();
         assert!(!first.web_enabled);
+        assert!(first.fast_mode);
         value["requestId"] = json!("synthetic-request-2");
         let second = parse(&value.to_string()).unwrap();
         assert_eq!(first.prompt.session_id, second.prompt.session_id);

@@ -43,6 +43,7 @@ data class AssistantState(
     val speechLanguage: String = "",
     val speechTtsProvider: String = "",
     val speechTtsVoice: String = "",
+    val fastMode: Boolean = false,
     val speechOptions: dev.gitblame.voxgolem.assistant.speech.SpeechOptions = dev.gitblame.voxgolem.assistant.speech.SpeechOptions(),
     /** Persisted selection/draft and the initial canonical projection have settled successfully. */
     val contextReady: Boolean = true,
@@ -108,6 +109,7 @@ class AssistantEngine @JvmOverloads internal constructor(
         val prompt: String, val model: String, val ticket: Ticket,
         val authPath: String,
         val webEnabled: Boolean,
+        val fastMode: Boolean,
         val externalSessionId: String,
         val admittedAt: Long = android.os.SystemClock.elapsedRealtime(),
         var firstTextMs: Long? = null,
@@ -138,7 +140,7 @@ class AssistantEngine @JvmOverloads internal constructor(
     private data class ProjectionStamp(val revision: String, val conversation: String?, val head: String?, val busy: Boolean)
     private var projectionStamp: ProjectionStamp? = null
     private var state = policies.read().let { AssistantState(contextReady = false, webEnabled = it.webEnabled, speechNetworkFallback = it.speechNetworkFallback,
-        speechLanguage = it.speechLanguage, speechTtsProvider = it.speechTtsProvider, speechTtsVoice = it.speechTtsVoice) }
+        speechLanguage = it.speechLanguage, speechTtsProvider = it.speechTtsProvider, speechTtsVoice = it.speechTtsVoice, fastMode = it.fastMode) }
     @Volatile private var published = state
     @Volatile private var foregroundRequested = false
 
@@ -153,7 +155,8 @@ class AssistantEngine @JvmOverloads internal constructor(
             state = state.copy(conversation = local.objectOrNull("conversation")?.toString(),
                 selectedHead = local.objectOrNull("selected_head")?.toString(), model = models.read(),
                 webEnabled = policy.webEnabled, speechNetworkFallback = policy.speechNetworkFallback,
-                speechLanguage = policy.speechLanguage, speechTtsProvider = policy.speechTtsProvider, speechTtsVoice = policy.speechTtsVoice)
+                speechLanguage = policy.speechLanguage, speechTtsProvider = policy.speechTtsProvider, speechTtsVoice = policy.speechTtsVoice,
+                fastMode = policy.fastMode)
             loadDraft()
             startupTiming?.mark(Stage.DRAFT_LOADED)
             val prepared = refreshProjection(if (preparePhoneContext) AssistantProjectionRead.Context() else null)
@@ -354,8 +357,9 @@ class AssistantEngine @JvmOverloads internal constructor(
         }
     }
 
-    private fun currentPolicy() = AssistantPolicy(state.webEnabled, state.speechNetworkFallback, state.speechLanguage, state.speechTtsProvider, state.speechTtsVoice)
+    private fun currentPolicy() = AssistantPolicy(state.webEnabled, state.speechNetworkFallback, state.speechLanguage, state.speechTtsProvider, state.speechTtsVoice, state.fastMode)
     override fun setWebEnabled(enabled: Boolean) = dispatch { updatePolicy(currentPolicy().copy(webEnabled = enabled)) }
+    override fun setFastMode(enabled: Boolean) = dispatch { updatePolicy(currentPolicy().copy(fastMode = enabled)) }
     override fun setSpeechNetworkFallback(enabled: Boolean) = dispatch { updatePolicy(currentPolicy().copy(speechNetworkFallback = enabled)) }
     override fun setSpeechSelection(selection: dev.gitblame.voxgolem.assistant.speech.SpeechSelection) = dispatch { updateSpeechSelection(selection) }
     override fun setSpeechSelection(selection: dev.gitblame.voxgolem.assistant.speech.SpeechSelection, onSettled: (AssistantState) -> Unit) =
@@ -371,7 +375,8 @@ class AssistantEngine @JvmOverloads internal constructor(
         val previousWebEnabled = state.webEnabled
         policies.write(policy)
         state = state.copy(webEnabled = policy.webEnabled, speechNetworkFallback = policy.speechNetworkFallback,
-            speechLanguage = policy.speechLanguage, speechTtsProvider = policy.speechTtsProvider, speechTtsVoice = policy.speechTtsVoice, error = null)
+            speechLanguage = policy.speechLanguage, speechTtsProvider = policy.speechTtsProvider, speechTtsVoice = policy.speechTtsVoice,
+            fastMode = policy.fastMode, error = null)
         if (!previousWebEnabled && policy.webEnabled) {
             prewarmSelected(state.model, state.webEnabled, state.busy)
         }
@@ -393,7 +398,8 @@ class AssistantEngine @JvmOverloads internal constructor(
             throw error
         }
         state = state.copy(model = model, webEnabled = policy.webEnabled, speechNetworkFallback = policy.speechNetworkFallback,
-            speechLanguage = policy.speechLanguage, speechTtsProvider = policy.speechTtsProvider, speechTtsVoice = policy.speechTtsVoice, error = null)
+            speechLanguage = policy.speechLanguage, speechTtsProvider = policy.speechTtsProvider, speechTtsVoice = policy.speechTtsVoice,
+            fastMode = policy.fastMode, error = null)
         if (model != previousModel || (!previousPolicy.webEnabled && policy.webEnabled)) {
             prewarmSelected(state.model, state.webEnabled, state.busy)
         }
@@ -641,7 +647,7 @@ class AssistantEngine @JvmOverloads internal constructor(
              val externalSession = externalSessions.getOrPut(conversationKey) { UUID.randomUUID().toString() }
              while (externalSessions.size > 256) externalSessions.remove(externalSessions.keys.first())
              val turn = Active(ticket.epoch, id, request, context, prompt, state.model, ticket, selectedAuthPath,
-                 state.webEnabled, externalSession)
+                 state.webEnabled, state.fastMode, externalSession)
             ticket.timing.mark(Stage.ADMISSION_PERSISTED)
             val serializedRequest = providerRequest(turn)
             ticket.timing.mark(Stage.REQUEST_SERIALIZED)
@@ -930,7 +936,7 @@ class AssistantEngine @JvmOverloads internal constructor(
         val messages = JSONArray(turn.context.getJSONArray("provider_messages").toString())
         messages.put(JSONObject().put("role", "user").put("content", turn.prompt))
          return JSONObject().put("requestId", turn.id).put("externalSessionId", turn.externalSessionId)
-             .put("webEnabled", turn.webEnabled)
+             .put("webEnabled", turn.webEnabled).put("fastMode", turn.fastMode)
             .put("model", turn.model).put("instructions", INSTRUCTIONS).put("messages", messages).toString()
     }
 

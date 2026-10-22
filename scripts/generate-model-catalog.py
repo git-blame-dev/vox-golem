@@ -29,13 +29,14 @@ data class AssistantModelPresentation(
     val compactFamilyLabel: String,
     val effort: String,
     val effortLabel: String,
+    val supportsFast: Boolean = false,
 )
 
 """
     kotlin += "/** Static labels/membership only; readiness remains owned by native providers. */\ninternal object AssistantModelCatalog {\n"
     quote = json.dumps
     kotlin += "    val presentation: Map<String, AssistantModelPresentation> = mapOf(\n"
-    fields = ("id", "label", "familyId", "familyLabel", "androidCompactFamilyLabel", "effort", "androidEffortLabel")
+    fields = ("id", "label", "familyId", "familyLabel", "androidCompactFamilyLabel", "effort", "androidEffortLabel", "supportsFast")
     kotlin += ",\n".join(
         f'        {quote(m["id"])} to AssistantModelPresentation(' +
         ', '.join(quote(m[field]) for field in fields) + ')' for m in models)

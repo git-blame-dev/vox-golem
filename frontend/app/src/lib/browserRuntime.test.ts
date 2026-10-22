@@ -254,6 +254,7 @@ describe('browser preview runtime', () => {
       reviewEnabled: false,
       prefetch: true,
       completion: false,
+      fastMode: false,
       responseProfile: 'fast',
       ttsEnabled: false,
       uiTheme: theme,

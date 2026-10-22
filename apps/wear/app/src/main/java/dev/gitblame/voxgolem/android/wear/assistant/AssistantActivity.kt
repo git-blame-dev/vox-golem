@@ -223,7 +223,7 @@ open class AssistantActivity : ComponentActivity() {
                         ::selectConversation, ::selectHead, client::selectModel,
                         { requestVoice(false) }, { requestVoice(true) }, voice::endUtterance, ::setReadRepliesAloud, voice::speak,
                          ::recheck, history::older, history::retry, ::setConversationMode,
-                           ::setWebEnabled, ::setSpeechNetworkFallback, ::setSpeechLanguage, ::setSpeechTtsProvider,
+                           ::setWebEnabled, ::setSpeechNetworkFallback, ::setFastMode, ::setSpeechLanguage, ::setSpeechTtsProvider,
                               ::setSpeechTtsVoice, ::resetSpeechSelection, prepareSpeechOptions = ::prepareSpeechOptions, openSpeechStore = ::openSpeechStore,
                               replyLayout = { (client as? AssistantEngine)?.markReplyLayout(it) },
                               replyDrawSubmitted = { (client as? AssistantEngine)?.markReplyDrawSubmitted(it) },
@@ -488,6 +488,7 @@ open class AssistantActivity : ComponentActivity() {
     internal fun selectConversation(id: String) { if (canChangeVoiceContext()) client.selectConversation(id) }
     internal fun selectHead(id: String) { if (canChangeVoiceContext()) client.selectHead(id) }
     internal fun setWebEnabled(enabled: Boolean) { client.setWebEnabled(enabled) }
+    internal fun setFastMode(enabled: Boolean) { client.setFastMode(enabled) }
     internal fun setSpeechNetworkFallback(enabled: Boolean) {
         if (assistantCanChangeSpeechFallback(client.snapshot(), voice.snapshot())) {
             client.setSpeechNetworkFallback(enabled)

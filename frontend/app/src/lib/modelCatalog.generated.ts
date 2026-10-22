@@ -10,7 +10,8 @@ export const MODEL_CATALOG = [
     "id": "local-fast",
     "label": "Local: Llama 3.2 3B",
     "preview": true,
-    "shortFamilyLabel": "Llama 3.2 3B"
+    "shortFamilyLabel": "Llama 3.2 3B",
+    "supportsFast": false
   },
   {
     "agent": false,
@@ -20,7 +21,8 @@ export const MODEL_CATALOG = [
     "id": "local-quality",
     "label": "Local: Quality",
     "preview": false,
-    "shortFamilyLabel": "Quality"
+    "shortFamilyLabel": "Quality",
+    "supportsFast": false
   },
   {
     "agent": false,
@@ -30,7 +32,8 @@ export const MODEL_CATALOG = [
     "id": "gemini-nano",
     "label": "Local: Gemini Nano",
     "preview": false,
-    "shortFamilyLabel": "Gemini Nano"
+    "shortFamilyLabel": "Gemini Nano",
+    "supportsFast": false
   },
   {
     "agent": true,
@@ -40,7 +43,8 @@ export const MODEL_CATALOG = [
     "id": "custom-sol-low",
     "label": "Custom: GPT-6.1 Sol Low",
     "preview": false,
-    "shortFamilyLabel": "GPT-6.1 Sol"
+    "shortFamilyLabel": "GPT-6.1 Sol",
+    "supportsFast": true
   },
   {
     "agent": true,
@@ -50,7 +54,8 @@ export const MODEL_CATALOG = [
     "id": "custom-sol-medium",
     "label": "Custom: GPT-6.1 Sol Medium",
     "preview": false,
-    "shortFamilyLabel": "GPT-6.1 Sol"
+    "shortFamilyLabel": "GPT-6.1 Sol",
+    "supportsFast": true
   },
   {
     "agent": true,
@@ -60,7 +65,8 @@ export const MODEL_CATALOG = [
     "id": "custom-sol-high",
     "label": "Custom: GPT-6.1 Sol High",
     "preview": false,
-    "shortFamilyLabel": "GPT-6.1 Sol"
+    "shortFamilyLabel": "GPT-6.1 Sol",
+    "supportsFast": true
   },
   {
     "agent": true,
@@ -70,7 +76,8 @@ export const MODEL_CATALOG = [
     "id": "custom-sol-xhigh",
     "label": "Custom: GPT-6.1 Sol X-High",
     "preview": false,
-    "shortFamilyLabel": "GPT-6.1 Sol"
+    "shortFamilyLabel": "GPT-6.1 Sol",
+    "supportsFast": true
   },
   {
     "agent": true,
@@ -80,7 +87,8 @@ export const MODEL_CATALOG = [
     "id": "custom-sol-max",
     "label": "Custom: GPT-6.1 Sol Max",
     "preview": false,
-    "shortFamilyLabel": "GPT-6.1 Sol"
+    "shortFamilyLabel": "GPT-6.1 Sol",
+    "supportsFast": true
   },
   {
     "agent": false,
@@ -90,7 +98,8 @@ export const MODEL_CATALOG = [
     "id": "custom-luna-none",
     "label": "Custom: GPT-6 Luna No Reasoning",
     "preview": false,
-    "shortFamilyLabel": "GPT-6 Luna"
+    "shortFamilyLabel": "GPT-6 Luna",
+    "supportsFast": true
   },
   {
     "agent": true,
@@ -100,7 +109,8 @@ export const MODEL_CATALOG = [
     "id": "custom-luna6-low",
     "label": "Custom: GPT-6 Luna Low",
     "preview": false,
-    "shortFamilyLabel": "GPT-6 Luna"
+    "shortFamilyLabel": "GPT-6 Luna",
+    "supportsFast": true
   },
   {
     "agent": true,
@@ -110,7 +120,8 @@ export const MODEL_CATALOG = [
     "id": "custom-luna6-medium",
     "label": "Custom: GPT-6 Luna Medium",
     "preview": false,
-    "shortFamilyLabel": "GPT-6 Luna"
+    "shortFamilyLabel": "GPT-6 Luna",
+    "supportsFast": true
   },
   {
     "agent": true,
@@ -120,7 +131,8 @@ export const MODEL_CATALOG = [
     "id": "custom-luna6-high",
     "label": "Custom: GPT-6 Luna High",
     "preview": false,
-    "shortFamilyLabel": "GPT-6 Luna"
+    "shortFamilyLabel": "GPT-6 Luna",
+    "supportsFast": true
   },
   {
     "agent": true,
@@ -130,7 +142,8 @@ export const MODEL_CATALOG = [
     "id": "custom-luna6-xhigh",
     "label": "Custom: GPT-6 Luna X-High",
     "preview": false,
-    "shortFamilyLabel": "GPT-6 Luna"
+    "shortFamilyLabel": "GPT-6 Luna",
+    "supportsFast": true
   },
   {
     "agent": true,
@@ -140,7 +153,8 @@ export const MODEL_CATALOG = [
     "id": "custom-luna6-max",
     "label": "Custom: GPT-6 Luna Max",
     "preview": false,
-    "shortFamilyLabel": "GPT-6 Luna"
+    "shortFamilyLabel": "GPT-6 Luna",
+    "supportsFast": true
   },
   {
     "agent": false,
@@ -150,7 +164,8 @@ export const MODEL_CATALOG = [
     "id": "custom-luna56-none",
     "label": "Custom: GPT-5.6 Luna No Reasoning",
     "preview": false,
-    "shortFamilyLabel": "GPT-5.6 Luna"
+    "shortFamilyLabel": "GPT-5.6 Luna",
+    "supportsFast": true
   },
   {
     "agent": true,
@@ -160,7 +175,8 @@ export const MODEL_CATALOG = [
     "id": "custom-luna-low",
     "label": "Custom: GPT-5.6 Luna Low",
     "preview": false,
-    "shortFamilyLabel": "GPT-5.6 Luna"
+    "shortFamilyLabel": "GPT-5.6 Luna",
+    "supportsFast": true
   },
   {
     "agent": true,
@@ -170,7 +186,8 @@ export const MODEL_CATALOG = [
     "id": "custom-luna56-medium",
     "label": "Custom: GPT-5.6 Luna Medium",
     "preview": false,
-    "shortFamilyLabel": "GPT-5.6 Luna"
+    "shortFamilyLabel": "GPT-5.6 Luna",
+    "supportsFast": true
   },
   {
     "agent": true,
@@ -180,7 +197,8 @@ export const MODEL_CATALOG = [
     "id": "custom-luna56-high",
     "label": "Custom: GPT-5.6 Luna High",
     "preview": false,
-    "shortFamilyLabel": "GPT-5.6 Luna"
+    "shortFamilyLabel": "GPT-5.6 Luna",
+    "supportsFast": true
   },
   {
     "agent": true,
@@ -190,7 +208,8 @@ export const MODEL_CATALOG = [
     "id": "custom-luna56-xhigh",
     "label": "Custom: GPT-5.6 Luna X-High",
     "preview": false,
-    "shortFamilyLabel": "GPT-5.6 Luna"
+    "shortFamilyLabel": "GPT-5.6 Luna",
+    "supportsFast": true
   },
   {
     "agent": true,
@@ -200,7 +219,8 @@ export const MODEL_CATALOG = [
     "id": "custom-luna56-max",
     "label": "Custom: GPT-5.6 Luna Max",
     "preview": false,
-    "shortFamilyLabel": "GPT-5.6 Luna"
+    "shortFamilyLabel": "GPT-5.6 Luna",
+    "supportsFast": true
   },
   {
     "agent": true,
@@ -210,7 +230,8 @@ export const MODEL_CATALOG = [
     "id": "opencode-sol-low",
     "label": "OpenCode: GPT-6.1 Sol Low",
     "preview": false,
-    "shortFamilyLabel": "GPT-6.1 Sol"
+    "shortFamilyLabel": "GPT-6.1 Sol",
+    "supportsFast": false
   },
   {
     "agent": true,
@@ -220,7 +241,8 @@ export const MODEL_CATALOG = [
     "id": "opencode-sol-medium",
     "label": "OpenCode: GPT-6.1 Sol Medium",
     "preview": false,
-    "shortFamilyLabel": "GPT-6.1 Sol"
+    "shortFamilyLabel": "GPT-6.1 Sol",
+    "supportsFast": false
   },
   {
     "agent": true,
@@ -230,7 +252,8 @@ export const MODEL_CATALOG = [
     "id": "opencode-sol-high",
     "label": "OpenCode: GPT-6.1 Sol High",
     "preview": false,
-    "shortFamilyLabel": "GPT-6.1 Sol"
+    "shortFamilyLabel": "GPT-6.1 Sol",
+    "supportsFast": false
   },
   {
     "agent": true,
@@ -240,7 +263,8 @@ export const MODEL_CATALOG = [
     "id": "opencode-sol-xhigh",
     "label": "OpenCode: GPT-6.1 Sol X-High",
     "preview": false,
-    "shortFamilyLabel": "GPT-6.1 Sol"
+    "shortFamilyLabel": "GPT-6.1 Sol",
+    "supportsFast": false
   },
   {
     "agent": true,
@@ -250,7 +274,8 @@ export const MODEL_CATALOG = [
     "id": "opencode-sol-max",
     "label": "OpenCode: GPT-6.1 Sol Max",
     "preview": false,
-    "shortFamilyLabel": "GPT-6.1 Sol"
+    "shortFamilyLabel": "GPT-6.1 Sol",
+    "supportsFast": false
   },
   {
     "agent": false,
@@ -260,7 +285,8 @@ export const MODEL_CATALOG = [
     "id": "opencode-luna-none",
     "label": "OpenCode: GPT-5.6 Luna No Reasoning",
     "preview": false,
-    "shortFamilyLabel": "GPT-5.6 Luna"
+    "shortFamilyLabel": "GPT-5.6 Luna",
+    "supportsFast": false
   },
   {
     "agent": true,
@@ -270,7 +296,8 @@ export const MODEL_CATALOG = [
     "id": "opencode-luna-low",
     "label": "OpenCode: GPT-5.6 Luna Low",
     "preview": false,
-    "shortFamilyLabel": "GPT-5.6 Luna"
+    "shortFamilyLabel": "GPT-5.6 Luna",
+    "supportsFast": false
   },
   {
     "agent": true,
@@ -280,7 +307,8 @@ export const MODEL_CATALOG = [
     "id": "opencode-luna-medium",
     "label": "OpenCode: GPT-5.6 Luna Medium",
     "preview": false,
-    "shortFamilyLabel": "GPT-5.6 Luna"
+    "shortFamilyLabel": "GPT-5.6 Luna",
+    "supportsFast": false
   },
   {
     "agent": true,
@@ -290,7 +318,8 @@ export const MODEL_CATALOG = [
     "id": "opencode-luna-high",
     "label": "OpenCode: GPT-5.6 Luna High",
     "preview": false,
-    "shortFamilyLabel": "GPT-5.6 Luna"
+    "shortFamilyLabel": "GPT-5.6 Luna",
+    "supportsFast": false
   },
   {
     "agent": true,
@@ -300,7 +329,8 @@ export const MODEL_CATALOG = [
     "id": "opencode-luna-xhigh",
     "label": "OpenCode: GPT-5.6 Luna X-High",
     "preview": false,
-    "shortFamilyLabel": "GPT-5.6 Luna"
+    "shortFamilyLabel": "GPT-5.6 Luna",
+    "supportsFast": false
   },
   {
     "agent": true,
@@ -310,7 +340,8 @@ export const MODEL_CATALOG = [
     "id": "opencode-luna-max",
     "label": "OpenCode: GPT-5.6 Luna Max",
     "preview": false,
-    "shortFamilyLabel": "GPT-5.6 Luna"
+    "shortFamilyLabel": "GPT-5.6 Luna",
+    "supportsFast": false
   },
   {
     "agent": true,
@@ -320,7 +351,8 @@ export const MODEL_CATALOG = [
     "id": "agy-argon-low",
     "label": "Agy: Gemini 4 Argon Low",
     "preview": false,
-    "shortFamilyLabel": "Gemini 4 Argon"
+    "shortFamilyLabel": "Gemini 4 Argon",
+    "supportsFast": false
   },
   {
     "agent": true,
@@ -330,7 +362,8 @@ export const MODEL_CATALOG = [
     "id": "agy-argon-medium",
     "label": "Agy: Gemini 4 Argon Medium",
     "preview": false,
-    "shortFamilyLabel": "Gemini 4 Argon"
+    "shortFamilyLabel": "Gemini 4 Argon",
+    "supportsFast": false
   },
   {
     "agent": true,
@@ -340,7 +373,8 @@ export const MODEL_CATALOG = [
     "id": "agy-argon-high",
     "label": "Agy: Gemini 4 Argon High",
     "preview": false,
-    "shortFamilyLabel": "Gemini 4 Argon"
+    "shortFamilyLabel": "Gemini 4 Argon",
+    "supportsFast": false
   },
   {
     "agent": false,
@@ -350,7 +384,8 @@ export const MODEL_CATALOG = [
     "id": "agy-flash-none",
     "label": "Agy: Gemini 3.8 Flash None",
     "preview": false,
-    "shortFamilyLabel": "Gemini 3.8 Flash"
+    "shortFamilyLabel": "Gemini 3.8 Flash",
+    "supportsFast": false
   },
   {
     "agent": true,
@@ -360,7 +395,8 @@ export const MODEL_CATALOG = [
     "id": "agy-flash-low",
     "label": "Agy: Gemini 3.8 Flash Low",
     "preview": false,
-    "shortFamilyLabel": "Gemini 3.8 Flash"
+    "shortFamilyLabel": "Gemini 3.8 Flash",
+    "supportsFast": false
   },
   {
     "agent": true,
@@ -370,7 +406,8 @@ export const MODEL_CATALOG = [
     "id": "agy-flash-medium",
     "label": "Agy: Gemini 3.8 Flash Medium",
     "preview": false,
-    "shortFamilyLabel": "Gemini 3.8 Flash"
+    "shortFamilyLabel": "Gemini 3.8 Flash",
+    "supportsFast": false
   },
   {
     "agent": true,
@@ -380,7 +417,8 @@ export const MODEL_CATALOG = [
     "id": "agy-flash-high",
     "label": "Agy: Gemini 3.8 Flash High",
     "preview": false,
-    "shortFamilyLabel": "Gemini 3.8 Flash"
+    "shortFamilyLabel": "Gemini 3.8 Flash",
+    "supportsFast": false
   },
   {
     "agent": true,
@@ -390,7 +428,8 @@ export const MODEL_CATALOG = [
     "id": "agy-opus-low",
     "label": "Agy: Claude Opus 5.5 Low",
     "preview": false,
-    "shortFamilyLabel": "Claude Opus 5.5"
+    "shortFamilyLabel": "Claude Opus 5.5",
+    "supportsFast": false
   },
   {
     "agent": true,
@@ -400,7 +439,8 @@ export const MODEL_CATALOG = [
     "id": "agy-opus-medium",
     "label": "Agy: Claude Opus 5.5 Medium",
     "preview": false,
-    "shortFamilyLabel": "Claude Opus 5.5"
+    "shortFamilyLabel": "Claude Opus 5.5",
+    "supportsFast": false
   },
   {
     "agent": true,
@@ -410,7 +450,8 @@ export const MODEL_CATALOG = [
     "id": "agy-opus-high",
     "label": "Agy: Claude Opus 5.5 High",
     "preview": false,
-    "shortFamilyLabel": "Claude Opus 5.5"
+    "shortFamilyLabel": "Claude Opus 5.5",
+    "supportsFast": false
   },
   {
     "agent": true,
@@ -420,7 +461,8 @@ export const MODEL_CATALOG = [
     "id": "agy-sonnet-low",
     "label": "Agy: Claude Sonnet 5.5 Low",
     "preview": false,
-    "shortFamilyLabel": "Claude Sonnet 5.5"
+    "shortFamilyLabel": "Claude Sonnet 5.5",
+    "supportsFast": false
   },
   {
     "agent": true,
@@ -430,7 +472,8 @@ export const MODEL_CATALOG = [
     "id": "agy-sonnet-medium",
     "label": "Agy: Claude Sonnet 5.5 Medium",
     "preview": false,
-    "shortFamilyLabel": "Claude Sonnet 5.5"
+    "shortFamilyLabel": "Claude Sonnet 5.5",
+    "supportsFast": false
   },
   {
     "agent": true,
@@ -440,7 +483,8 @@ export const MODEL_CATALOG = [
     "id": "agy-sonnet-high",
     "label": "Agy: Claude Sonnet 5.5 High",
     "preview": false,
-    "shortFamilyLabel": "Claude Sonnet 5.5"
+    "shortFamilyLabel": "Claude Sonnet 5.5",
+    "supportsFast": false
   }
 ] as const satisfies readonly ModelCatalogEntry[]
 export const DEFAULT_MODEL_CHOICES = {

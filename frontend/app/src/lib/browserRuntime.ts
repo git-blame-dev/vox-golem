@@ -32,6 +32,7 @@ interface BrowserPreviewPreferences {
   readonly completion: boolean
   readonly web_enabled: boolean
   readonly speech_network_fallback: boolean
+  readonly fast_mode: boolean
   readonly speech_language: string
   readonly speech_tts_provider: string
   readonly speech_tts_voice: string
@@ -338,6 +339,7 @@ function setLegacyAssistantSettings(value: unknown): Record<string, unknown> {
     completion: settings['completion'],
     web_enabled: Object.prototype.hasOwnProperty.call(settings, 'web_enabled') ? settings['web_enabled'] : state.preferences.web_enabled,
     speech_network_fallback: Object.prototype.hasOwnProperty.call(settings, 'speech_network_fallback') ? settings['speech_network_fallback'] : state.preferences.speech_network_fallback,
+    fast_mode: Object.prototype.hasOwnProperty.call(settings, 'fast_mode') ? settings['fast_mode'] : state.preferences.fast_mode,
     speech_language: Object.prototype.hasOwnProperty.call(settings, 'speech_language') ? settings['speech_language'] : state.preferences.speech_language,
     speech_tts_provider: Object.prototype.hasOwnProperty.call(settings, 'speech_tts_provider') ? settings['speech_tts_provider'] : state.preferences.speech_tts_provider,
     speech_tts_voice: Object.prototype.hasOwnProperty.call(settings, 'speech_tts_voice') ? settings['speech_tts_voice'] : state.preferences.speech_tts_voice,
@@ -351,7 +353,7 @@ function parsePreferences(value: unknown): BrowserPreviewPreferences {
     'instant', 'deep', 'review', 'deep_enabled', 'review_enabled', 'prefetch', 'completion',
     'response_profile', 'tts_enabled', 'ui_theme', 'ui_text_size',
   ]
-  const policyFields = ['web_enabled', 'speech_network_fallback']
+  const policyFields = ['web_enabled', 'speech_network_fallback', 'fast_mode']
   const optionalFields = [...policyFields, 'speech_language', 'speech_tts_provider', 'speech_tts_voice']
   if (Object.keys(payload).some((field) => !exactFields.includes(field) && !optionalFields.includes(field)) || exactFields.some((field) => !Object.prototype.hasOwnProperty.call(payload, field))) {
     throw new BrowserPreviewCommandError('invalid_input', 'Preferences must include every supported field')
@@ -382,6 +384,7 @@ function parsePreferences(value: unknown): BrowserPreviewPreferences {
     completion: payload['completion'] as boolean,
     web_enabled: payload['web_enabled'] === undefined ? true : payload['web_enabled'] as boolean,
     speech_network_fallback: payload['speech_network_fallback'] === undefined ? true : payload['speech_network_fallback'] as boolean,
+    fast_mode: payload['fast_mode'] === undefined ? false : payload['fast_mode'] as boolean,
     speech_language: speechString('speech_language'), speech_tts_provider: speechString('speech_tts_provider'), speech_tts_voice: speechString('speech_tts_voice'),
     response_profile: payload['response_profile'] as string,
     tts_enabled: payload['tts_enabled'] as boolean,
@@ -445,6 +448,7 @@ function assistantSettingsPayload(): Record<string, unknown> {
     completion: preferences.completion,
     web_enabled: preferences.web_enabled,
     speech_network_fallback: preferences.speech_network_fallback,
+    fast_mode: preferences.fast_mode,
     speech_language: preferences.speech_language, speech_tts_provider: preferences.speech_tts_provider, speech_tts_voice: preferences.speech_tts_voice,
   }
 }
@@ -496,6 +500,7 @@ function createState(): BrowserPreviewState {
       completion: false,
       web_enabled: true,
       speech_network_fallback: true,
+      fast_mode: false,
       speech_language: '', speech_tts_provider: '', speech_tts_voice: '',
       response_profile: 'fast',
       tts_enabled: false,

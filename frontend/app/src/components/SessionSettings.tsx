@@ -13,6 +13,7 @@ import {
 import type { SessionViewProps } from '../sessionPolicy'
 import { ChatGptAuth } from './ChatGptAuth'
 import { InstantModelSelect } from './InstantModelSelect'
+import { MODEL_CATALOG } from '../lib/modelCatalog'
 import { SpeechSettings } from './SpeechSettings'
 import { UpdateSettings } from './UpdateSettings'
 import { WakeClipSettings } from './WakeClipSettings'
@@ -101,6 +102,17 @@ export const SessionSettings = memo(function SessionSettings({ session, view }: 
               <h3 id="model-settings-title">Model</h3>
               <ChatGptAuth onChanged={refreshChatGptAuth} />
               <label className="settings-panel__interactive"><strong>Model</strong><InstantModelSelect id="assistantInstantSelect" label="Model" value={assistantSettings.instant} options={instantAssistantOptions} disabled={instantControlsDisabled} canRetry={(value) => localInstantCanRetry(startupState, value)} onChange={(value) => void changeInstant(value)} /></label>
+              {MODEL_CATALOG.find((entry) => entry.id === assistantSettings.instant)?.supportsFast === true ? (
+                <label className="shell__toggle settings-panel__interactive">
+                  <input
+                    type="checkbox"
+                    aria-label="Fast mode"
+                    checked={assistantSettings.fastMode}
+                    disabled={instantControlsDisabled}
+                    onChange={(event) => patchAssistantSettings({ fastMode: event.target.checked })}
+                  /> Fast mode (priority processing)
+                </label>
+              ) : null}
               {startupState.kind === 'ready' && !assistantCapabilities.custom ? <div>
                 <p className="settings-panel__hint">Custom connection: {customFailure?.reason ?? 'unavailable'}</p>
               </div> : null}

@@ -7,6 +7,7 @@ export interface ModelCatalogEntry {
   readonly label: string
   readonly agent: boolean
   readonly preview?: boolean
+  readonly supportsFast: boolean
   readonly familyId: string
   readonly familyLabel: string
   readonly shortFamilyLabel: string

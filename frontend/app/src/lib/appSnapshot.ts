@@ -1,5 +1,5 @@
 import type { DeepChoice, InstantChoice, ReviewChoice, SpeechSelection } from './assistantSettings'
-import { parsePolicyBoolean, parseSpeechSelectionString } from './assistantSettings'
+import { parseFastModeBoolean, parsePolicyBoolean, parseSpeechSelectionString } from './assistantSettings'
 import { invokeTauriCommand, isAndroidRuntime } from './tauri'
 import { isRecord, parseRuntimePhase, utf8ByteLength } from './wire'
 import type { BackendRuntimePhase, ResponseProfile, UiTextSize, UiTheme } from '../types/chat'
@@ -74,6 +74,7 @@ export interface ValidatedPreferences extends SpeechSelection {
   readonly completion: boolean
   readonly webEnabled: boolean
   readonly speechNetworkFallback: boolean
+  readonly fastMode: boolean
   readonly responseProfile: ResponseProfile
   readonly ttsEnabled: boolean
   readonly uiTheme: UiTheme
@@ -303,7 +304,7 @@ export function parseValidatedPreferences(value: unknown): ValidatedPreferences 
     instant: instant as InstantChoice, deep: deep as DeepChoice, review: review as ReviewChoice,
     deepEnabled: value['deep_enabled'] as boolean, reviewEnabled: value['review_enabled'] as boolean,
     prefetch: value['prefetch'] as boolean, completion: value['completion'] as boolean,
-    webEnabled: parsePolicyBoolean(value, 'web_enabled'), speechNetworkFallback: parsePolicyBoolean(value, 'speech_network_fallback'),
+    webEnabled: parsePolicyBoolean(value, 'web_enabled'), speechNetworkFallback: parsePolicyBoolean(value, 'speech_network_fallback'), fastMode: parseFastModeBoolean(value),
     speechLanguage: parseSpeechSelectionString(value, 'speech_language'), speechTtsProvider: parseSpeechSelectionString(value, 'speech_tts_provider'), speechTtsVoice: parseSpeechSelectionString(value, 'speech_tts_voice'),
     responseProfile, ttsEnabled: value['tts_enabled'] as boolean, uiTheme, uiTextSize,
   }

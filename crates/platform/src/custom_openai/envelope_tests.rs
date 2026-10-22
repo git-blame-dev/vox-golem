@@ -51,6 +51,30 @@ fn unpaired_refusal_and_current_are_mandatory_and_preserve_utf8_controls() {
     let request: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(request["input"][0]["content"][0]["refusal"], orphan.text);
     assert_eq!(request["input"][1]["content"][0]["text"], prompt.prompt);
+    assert!(request.get("service_tier").is_none());
+    let fast_bytes = checked_request(
+        &CustomOpenAiConfig {
+            fast_mode: true,
+            ..CustomOpenAiConfig::default()
+        },
+        &prompt,
+        None,
+    )
+    .unwrap();
+    let fast_request: Value = serde_json::from_slice(&fast_bytes).unwrap();
+    assert_eq!(fast_request["service_tier"], "priority");
+    let local_fast_bytes = checked_request(
+        &CustomOpenAiConfig {
+            model: CustomOpenAiModel::LocalFast,
+            fast_mode: true,
+            ..CustomOpenAiConfig::default()
+        },
+        &prompt,
+        None,
+    )
+    .unwrap();
+    let local_fast_request: Value = serde_json::from_slice(&local_fast_bytes).unwrap();
+    assert!(local_fast_request.get("service_tier").is_none());
     prompt.history[0].text = "\"".repeat(MAX_REQUEST_BYTES);
     assert_eq!(
         checked_request(&CustomOpenAiConfig::default(), &prompt, None),

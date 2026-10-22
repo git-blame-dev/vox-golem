@@ -616,6 +616,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         completion: preferences.completion,
         webEnabled: preferences.webEnabled,
         speechNetworkFallback: preferences.speechNetworkFallback,
+        fastMode: preferences.fastMode,
         speechLanguage: preferences.speechLanguage,
         speechTtsProvider: preferences.speechTtsProvider,
         speechTtsVoice: preferences.speechTtsVoice,

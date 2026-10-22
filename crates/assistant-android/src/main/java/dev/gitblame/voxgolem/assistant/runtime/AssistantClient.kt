@@ -12,6 +12,7 @@ interface AssistantClient {
     fun setDraft(text: String)
     fun selectModel(model: String)
     fun setWebEnabled(enabled: Boolean) { throw UnsupportedOperationException("Web policy unavailable") }
+    fun setFastMode(enabled: Boolean) { throw UnsupportedOperationException("Fast mode policy unavailable") }
     fun setSpeechNetworkFallback(enabled: Boolean) { throw UnsupportedOperationException("Speech policy unavailable") }
     fun setSpeechSelection(selection: dev.gitblame.voxgolem.assistant.speech.SpeechSelection) { throw UnsupportedOperationException("Speech selections unavailable") }
     /** Completion is the actor's policy commit/reject, never an observer/snapshot acknowledgement. */

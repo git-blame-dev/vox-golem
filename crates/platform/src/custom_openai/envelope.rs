@@ -128,6 +128,8 @@ struct Envelope<'a> {
     instructions: &'a str,
     input: SelectedInput<'a>,
     reasoning: ReasoningView,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<&'static str>,
     stream: bool,
     store: bool,
     prompt_cache_key: &'a str,
@@ -318,6 +320,8 @@ fn envelope<'a>(
         reasoning: ReasoningView {
             effort: config.model.reasoning_effort(),
         },
+        service_tier: (config.fast_mode && config.model != CustomOpenAiModel::LocalFast)
+            .then_some("priority"),
         stream: true,
         store: false,
         prompt_cache_key: session_id,

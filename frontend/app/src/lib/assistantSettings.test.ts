@@ -12,7 +12,7 @@ describe('assistant settings contract', () => {
       for (const value of [null, undefined, true, 1, 'é'.repeat(257), 'x'.repeat(513)]) expect(() => parseAssistantSettings({ ...wire, [key]: value })).toThrow()
     }
   })
-  it('has safe defaults', () => expect(DEFAULT_ASSISTANT_SETTINGS).toEqual({ instant: 'local-fast', deep: 'opencode-sol-high', review: 'opencode-sol-high', deepEnabled: false, reviewEnabled: false, prefetch: false, completion: true, webEnabled: true, speechNetworkFallback: true, speechLanguage: '', speechTtsProvider: '', speechTtsVoice: '' }))
+  it('has safe defaults', () => expect(DEFAULT_ASSISTANT_SETTINGS).toEqual({ instant: 'local-fast', deep: 'opencode-sol-high', review: 'opencode-sol-high', deepEnabled: false, reviewEnabled: false, prefetch: false, completion: true, fastMode: false, webEnabled: true, speechNetworkFallback: true, speechLanguage: '', speechTtsProvider: '', speechTtsVoice: '' }))
   it('labels every choice with its provider', () => {
     expect(instantOptions(all)).toHaveLength(43); expect(deepOptions(all)).toHaveLength(37); expect(reviewOptions(all)).toHaveLength(37)
     expect(instantOptions(all).map((x) => x.value)).toContain('custom-luna-none')
@@ -20,7 +20,7 @@ describe('assistant settings contract', () => {
   it('reports unavailable providers', () => expect(deepOptions({ ...all, custom: false, openCode: false }).filter((x) => !x.available).every((x) => x.reason)).toBe(true))
   it('strictly parses and serializes backend payloads', () => {
     const value = parseAssistantSettings({ instant: 'local-fast', deep: 'opencode-sol-high', review: 'custom-luna-low', deep_enabled: true, review_enabled: false, prefetch: true, completion: false })
-    expect(serializeAssistantSettings(value)).toMatchObject({ deep_enabled: true, review_enabled: false })
+    expect(serializeAssistantSettings(value)).toMatchObject({ deep_enabled: true, review_enabled: false, fast_mode: false })
     expect(() => parseAssistantSettings({})).toThrow()
     expect(() => parseAssistantSettings({ instant: 'local-balanced', deep: 'opencode-sol-high', review: 'opencode-sol-high', deep_enabled: false, review_enabled: false, prefetch: false, completion: true })).toThrow()
     expect(() => parseAssistantSettings({ instant: 'local-fast', deep: 'opencode-sol-high', review: 'none', deep_enabled: false, review_enabled: false, prefetch: false, completion: true })).toThrow()
@@ -32,7 +32,7 @@ describe('assistant settings contract', () => {
       instant: 'custom-luna-none', deep: 'custom-sol-high', review: 'opencode-sol-high',
       deep_enabled: false, review_enabled: false, prefetch: false, completion: true,
     }
-    expect(serializeAssistantSettings(parseAssistantSettings(payload))).toEqual({ ...payload, web_enabled: true, speech_network_fallback: true, speech_language: '', speech_tts_provider: '', speech_tts_voice: '' })
+    expect(serializeAssistantSettings(parseAssistantSettings(payload))).toEqual({ ...payload, fast_mode: false, web_enabled: true, speech_network_fallback: true, speech_language: '', speech_tts_provider: '', speech_tts_voice: '' })
     expect(instantOptions(all).find((option) => option.value === 'custom-luna-none')).toMatchObject({
       available: true, description: 'Direct Custom connection; reasoning disabled',
     })
@@ -40,7 +40,7 @@ describe('assistant settings contract', () => {
   })
   it('round-trips direct GPT-6 Luna None and keeps it Instant-only', () => {
     const payload = { instant: 'custom-luna-none', deep: 'custom-sol-high', review: 'custom-luna-low', deep_enabled: false, review_enabled: false, prefetch: true, completion: true }
-    expect(serializeAssistantSettings(parseAssistantSettings(payload))).toEqual({ ...payload, web_enabled: true, speech_network_fallback: true, speech_language: '', speech_tts_provider: '', speech_tts_voice: '' })
+    expect(serializeAssistantSettings(parseAssistantSettings(payload))).toEqual({ ...payload, fast_mode: false, web_enabled: true, speech_network_fallback: true, speech_language: '', speech_tts_provider: '', speech_tts_voice: '' })
     expect(instantOptions(all).find((option) => option.value === payload.instant)).toMatchObject({ available: true, description: 'Direct Custom connection; reasoning disabled' })
     expect(instantOptions({ ...all, custom: false }).find((option) => option.value === payload.instant)?.available).toBe(false)
     expect(deepOptions(all).map((option) => option.value)).not.toContain(payload.instant)

@@ -19,7 +19,8 @@ class PhonePreferencesTest {
     @Test fun retainsAllLegacyKeysAndEnumSpellings() {
         val value = PhonePreferences.defaults().put("deep", "custom-luna-low").put("review", "custom-luna-low").put("ui_text_size", "extra_large")
         PhonePreferences.validate(value)
-        assertEquals(16, value.length())
+        assertEquals(17, value.length())
+        assertFalse(value.getBoolean("fast_mode"))
         assertTrue(value.getBoolean("web_enabled"))
         assertTrue(value.getBoolean("speech_network_fallback"))
         for (key in listOf("speech_language", "speech_tts_provider", "speech_tts_voice")) assertEquals("", value.getString(key))

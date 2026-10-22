@@ -1038,6 +1038,10 @@
 .composer__model-popup-effort-chip:active:not(:disabled) { transform: scale(0.93); }
 .composer__model-popup-effort-chip[data-active='true'] { background: var(--accent-primary); border-color: var(--accent-primary); color: var(--accent-primary-text); box-shadow: 0 3px 10px rgb(0 0 0 / 0.25); }
 .composer__model-popup-effort-chip:disabled { opacity: 0.42; cursor: not-allowed; }
+.composer__model-popup-fast-row { display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 0.6rem; width: 100%; margin-top: 0.42rem; padding-inline: 0.25rem; box-sizing: border-box; }
+.composer__model-popup-fast-label { color: var(--text-muted); font-size: 0.8em; font-weight: 600; white-space: nowrap; }
+.composer__model-popup-fast-chips { display: flex; flex-direction: row; align-items: center; gap: 0.3rem; flex: 0 0 auto; }
+.composer__model-popup-fast-chip { flex: 0 0 auto; min-width: 3.4rem; min-height: 36px; padding: 0.32rem 0.72rem; }
 @media (prefers-reduced-motion: reduce) {
   .composer__model-pill,
   .composer__model-pill .composer__model-pill-chevron,

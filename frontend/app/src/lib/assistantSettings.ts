@@ -22,6 +22,7 @@ export interface AssistantSettings extends SpeechSelection {
   completion: boolean
   webEnabled: boolean
   speechNetworkFallback: boolean
+  fastMode: boolean
 }
 
 export interface AssistantCapabilities {
@@ -47,7 +48,7 @@ export const DEFAULT_ASSISTANT_SETTINGS: Readonly<AssistantSettings> = {
   ...DEFAULT_MODEL_CHOICES,
   deep: 'opencode-sol-high' as AgentChoice,
   review: 'opencode-sol-high' as AgentChoice,
-  deepEnabled: false, reviewEnabled: false, prefetch: false, completion: true, webEnabled: true, speechNetworkFallback: true,
+  deepEnabled: false, reviewEnabled: false, prefetch: false, completion: true, webEnabled: true, speechNetworkFallback: true, fastMode: false,
 }
 
 const instantLabels = modelLabels('instant')
@@ -85,16 +86,21 @@ export function parseAssistantSettings(payload: unknown): AssistantSettings {
   const p = payload
   const instant = stringField(p, 'instant'); const deep = stringField(p, 'deep'); const review = stringField(p, 'review')
   if (!instantValues.has(instant) || !deepValues.has(deep) || !reviewValues.has(review) || typeof p['deep_enabled'] !== 'boolean' || typeof p['review_enabled'] !== 'boolean' || typeof p['prefetch'] !== 'boolean' || typeof p['completion'] !== 'boolean') throw new Error('Invalid assistant settings payload')
-  return { instant: instant as InstantChoice, deep: deep as DeepChoice, review: review as ReviewChoice, deepEnabled: p['deep_enabled'] as boolean, reviewEnabled: p['review_enabled'] as boolean, prefetch: p['prefetch'] as boolean, completion: p['completion'] as boolean, webEnabled: parsePolicyBoolean(p, 'web_enabled'), speechNetworkFallback: parsePolicyBoolean(p, 'speech_network_fallback'), speechLanguage: parseSpeechSelectionString(p, 'speech_language'), speechTtsProvider: parseSpeechSelectionString(p, 'speech_tts_provider'), speechTtsVoice: parseSpeechSelectionString(p, 'speech_tts_voice') }
+  return { instant: instant as InstantChoice, deep: deep as DeepChoice, review: review as ReviewChoice, deepEnabled: p['deep_enabled'] as boolean, reviewEnabled: p['review_enabled'] as boolean, prefetch: p['prefetch'] as boolean, completion: p['completion'] as boolean, webEnabled: parsePolicyBoolean(p, 'web_enabled'), speechNetworkFallback: parsePolicyBoolean(p, 'speech_network_fallback'), fastMode: parseFastModeBoolean(p), speechLanguage: parseSpeechSelectionString(p, 'speech_language'), speechTtsProvider: parseSpeechSelectionString(p, 'speech_tts_provider'), speechTtsVoice: parseSpeechSelectionString(p, 'speech_tts_voice') }
 }
 
 export function serializeAssistantSettings(settings: AssistantSettings): Record<string, unknown> {
-  return { instant: settings.instant, deep: settings.deep, review: settings.review, deep_enabled: settings.deepEnabled, review_enabled: settings.reviewEnabled, prefetch: settings.prefetch, completion: settings.completion, web_enabled: settings.webEnabled, speech_network_fallback: settings.speechNetworkFallback, speech_language: settings.speechLanguage, speech_tts_provider: settings.speechTtsProvider, speech_tts_voice: settings.speechTtsVoice }
+  return { instant: settings.instant, deep: settings.deep, review: settings.review, deep_enabled: settings.deepEnabled, review_enabled: settings.reviewEnabled, prefetch: settings.prefetch, completion: settings.completion, web_enabled: settings.webEnabled, speech_network_fallback: settings.speechNetworkFallback, fast_mode: settings.fastMode, speech_language: settings.speechLanguage, speech_tts_provider: settings.speechTtsProvider, speech_tts_voice: settings.speechTtsVoice }
 }
 export function parsePolicyBoolean(payload: Record<string, unknown>, key: 'web_enabled' | 'speech_network_fallback'): boolean {
   if (!Object.prototype.hasOwnProperty.call(payload, key)) return true
   if (typeof payload[key] !== 'boolean') throw new Error(`Preference ${key} must be boolean`)
   return payload[key]
+}
+export function parseFastModeBoolean(payload: Record<string, unknown>): boolean {
+  if (!Object.prototype.hasOwnProperty.call(payload, 'fast_mode')) return false
+  if (typeof payload['fast_mode'] !== 'boolean') throw new Error('Preference fast_mode must be boolean')
+  return payload['fast_mode']
 }
 export function parseSpeechSelectionString(payload: Record<string, unknown>, key: string): string {
   if (!Object.prototype.hasOwnProperty.call(payload, key)) return ''

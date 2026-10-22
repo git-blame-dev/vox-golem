@@ -82,6 +82,7 @@ fn provider_config(auth_path: &str, request: &request::Request) -> CustomOpenAiC
         endpoint,
         auth_path: auth_path.into(),
         model: request.model,
+        fast_mode: request.fast_mode,
         ..Default::default()
     }
 }

@@ -11,6 +11,7 @@ pub struct ModelDescriptor {
     pub native_label: String,
     pub agent: bool,
     pub preview: bool,
+    pub supports_fast: bool,
     pub family_id: &'static str,
     pub family_label: String,
     pub short_family_label: &'static str,
@@ -66,6 +67,7 @@ pub fn model_catalog() -> Vec<ModelDescriptor> {
             .into(),
             agent: false,
             preview,
+            supports_fast: false,
             family_id: id,
             family_label: name.into(),
             short_family_label: short,
@@ -234,6 +236,7 @@ pub fn model_catalog() -> Vec<ModelDescriptor> {
                 ),
                 agent: effort != "none",
                 preview: false,
+                supports_fast: provider == "Custom",
                 family_id: family,
                 family_label: format!("{provider}: {name}"),
                 short_family_label: name,
@@ -292,6 +295,18 @@ mod tests {
             assert_eq!(model.android_label.as_deref(), Some(historical_label));
             assert_eq!(model.android_group, Some("custom"));
             assert_eq!(model.agent, model.effort != "none");
+            assert!(model.supports_fast);
+        }
+        for id in [
+            "local-fast",
+            "local-quality",
+            "gemini-nano",
+            "agy-argon-high",
+            "agy-flash-none",
+            "opencode-sol-high",
+            "opencode-luna-low",
+        ] {
+            assert!(!models.iter().find(|m| m.id == id).unwrap().supports_fast);
         }
     }
 

@@ -32,6 +32,7 @@ class EnginePhoneBackend internal constructor(
     fun nativePreferences(): JSONObject = preferencesFor(engine.snapshot())
     private fun preferencesFor(state: AssistantState) = preferences.read(state.model)
         .put("web_enabled", state.webEnabled).put("speech_network_fallback", state.speechNetworkFallback)
+        .put("fast_mode", state.fastMode)
         .put("speech_language", state.speechLanguage).put("speech_tts_provider", state.speechTtsProvider).put("speech_tts_voice", state.speechTtsVoice)
     fun publishSpeechOptions(options: dev.gitblame.voxgolem.assistant.speech.SpeechOptions) { engine.publishSpeechOptions(options) }
     fun busy(): Boolean = engine.snapshot().busy || delivery.get() != null || preferencesPending.get()
@@ -238,7 +239,7 @@ class EnginePhoneBackend internal constructor(
         var previousModel: String? = null
         engine.updatePreferences(selectedModel, dev.gitblame.voxgolem.assistant.runtime.AssistantPolicy(
             value.getBoolean("web_enabled"), value.getBoolean("speech_network_fallback"), value.getString("speech_language"),
-            value.getString("speech_tts_provider"), value.getString("speech_tts_voice")), {
+            value.getString("speech_tts_provider"), value.getString("speech_tts_voice"), value.getBoolean("fast_mode")), {
             previousModel = engine.snapshot().model
             preferences.write(value)
         }) { selected ->

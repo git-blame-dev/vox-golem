@@ -9,7 +9,7 @@ import { parseStartupState, startupStateFromSnapshot } from './startupState'
 
 const preferences: ValidatedPreferences = {
   instant: 'local-fast', deep: 'opencode-sol-high' as AgentChoice, review: 'opencode-luna-low' as AgentChoice, deepEnabled: false, reviewEnabled: true,
-  prefetch: true, completion: false, responseProfile: 'quality', ttsEnabled: true, uiTheme: 'dark', uiTextSize: 'large',
+  prefetch: true, completion: false, fastMode: false, responseProfile: 'quality', ttsEnabled: true, uiTheme: 'dark', uiTextSize: 'large',
   webEnabled: false, speechNetworkFallback: false,
   speechLanguage: 'en-AU', speechTtsProvider: 'synthetic.tts.engine', speechTtsVoice: 'synthetic-local-voice',
 }
@@ -36,7 +36,7 @@ describe('Android runtime contract helpers', () => {
   it('preserves all fields while mapping snake_case assistant settings', () => {
     expect(androidPreferenceProposal('set_assistant_settings', { settings: { instant: 'local-quality', deep_enabled: true, review_enabled: false, prefetch: false, completion: true, deep: 'custom-sol-high', review: 'custom-luna-low' } }, preferences)).toEqual({
       instant: 'local-quality', deep: 'custom-sol-high', review: 'custom-luna-low', deep_enabled: true, review_enabled: false, prefetch: false, completion: true,
-      response_profile: 'quality', tts_enabled: true, ui_theme: 'dark', ui_text_size: 'large',
+      fast_mode: false, response_profile: 'quality', tts_enabled: true, ui_theme: 'dark', ui_text_size: 'large',
       web_enabled: false, speech_network_fallback: false,
       speech_language: 'en-AU', speech_tts_provider: 'synthetic.tts.engine', speech_tts_voice: 'synthetic-local-voice',
     })

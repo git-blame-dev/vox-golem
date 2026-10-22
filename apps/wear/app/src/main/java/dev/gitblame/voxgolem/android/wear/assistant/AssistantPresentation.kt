@@ -86,6 +86,7 @@ internal data class AssistantActions(
     val setConversationMode: (Boolean) -> Unit = {},
     val setWebEnabled: (Boolean) -> Unit,
     val setSpeechNetworkFallback: (Boolean) -> Unit,
+    val setFastMode: (Boolean) -> Unit = {},
     val selectSpeechLanguage: (String) -> Unit,
     val selectSpeechEngine: (String) -> Unit,
     val selectSpeechVoice: (String) -> Unit,
@@ -393,6 +394,18 @@ internal fun AssistantScreen(
                                  requestedModel?.let { item { Text("Waiting for model selection") } }
                                  modelSelectionError?.let { error -> item { Text(error, color = MaterialTheme.colorScheme.error) } }
                                  assistantRequestError(state)?.let { error -> item { Text(assistantErrorText(error)) } }
+                                 if (AssistantModels.presentation[state.model]?.supportsFast == true) {
+                                     item(key = "fast-mode") {
+                                         SwitchButton(
+                                             checked = state.fastMode,
+                                             onCheckedChange = actions.setFastMode,
+                                             enabled = modelEnabled && requestedModel == null,
+                                             label = { Text("Fast mode") },
+                                             secondaryLabel = { Text("Priority processing") },
+                                             modifier = Modifier.fillMaxWidth(),
+                                         )
+                                     }
+                                 }
                                  items(assistantSelectableModels(AssistantRuntime.optionalProviderReadiness(), state.model), key = { it }) { model ->
                                      val label = AssistantModels.presentation[model]?.fullLabel ?: model
                                      ActionButton((if (model == state.model) "✓ " else "") + label,
@@ -822,6 +835,11 @@ private fun SettingsScreen(state: AssistantState, voice: AssistantVoiceState, pa
             label = { Text("Web research") }, secondaryLabel = { Text(if (state.webEnabled) "Allows web tools when supported by the selected model" else "Web tools will not be dispatched",
                 maxLines = Int.MAX_VALUE, overflow = TextOverflow.Clip) }, modifier = Modifier.fillMaxWidth()) }
         item { ActionButton("Model: ${AssistantModels.presentation[state.model]?.fullLabel ?: state.model}", enabled, openModels) }
+        if (AssistantModels.presentation[state.model]?.supportsFast == true) {
+            item { SwitchButton(checked = state.fastMode, onCheckedChange = actions.setFastMode, enabled = enabled,
+                label = { Text("Fast mode") }, secondaryLabel = { Text("Priority processing") },
+                modifier = Modifier.fillMaxWidth()) }
+        }
         item { SwitchButton(checked = preferences.readRepliesAloud, onCheckedChange = actions.tts, enabled = enabled,
             label = { Text("Speak replies") }, secondaryLabel = { Text("Local voice preferred") },
             modifier = Modifier.fillMaxWidth()) }

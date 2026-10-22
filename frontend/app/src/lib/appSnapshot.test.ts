@@ -164,6 +164,7 @@ describe('app snapshot contract', () => {
     expect(snapshot.preferences).toEqual({
       instant: 'custom-sol-high', deep: 'opencode-sol-high', review: 'custom-luna-low',
       deepEnabled: true, reviewEnabled: false, prefetch: true, completion: false,
+      fastMode: false,
       responseProfile: 'quality', ttsEnabled: true, uiTheme: 'light', uiTextSize: 'extra_large',
       webEnabled: true, speechNetworkFallback: true,
       speechLanguage: '', speechTtsProvider: '', speechTtsVoice: '',

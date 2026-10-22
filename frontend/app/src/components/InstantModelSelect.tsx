@@ -13,6 +13,8 @@ interface InstantModelSelectProps {
   readonly canRetry: (value: InstantChoice) => boolean
   readonly onChange: (value: InstantChoice) => void
   readonly variant?: 'default' | 'pill' | 'icon'
+  readonly fastMode?: boolean
+  readonly onFastModeChange?: (enabled: boolean) => void
 }
 
 const catalogMap = new Map(MODEL_CATALOG.map((m) => [m.id, m]))
@@ -28,7 +30,7 @@ const effortShortLabels: Record<string, string> = {
 
 const EXIT_ANIMATION_MS = 160
 
-export function InstantModelSelect({ id, label, value, options, disabled, canRetry, onChange, variant = 'default' }: InstantModelSelectProps) {
+export function InstantModelSelect({ id, label, value, options, disabled, canRetry, onChange, variant = 'default', fastMode, onFastModeChange }: InstantModelSelectProps) {
   const [popupPhase, setPopupPhase] = useState<'closed' | 'open' | 'closing'>('closed')
   const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -73,6 +75,7 @@ export function InstantModelSelect({ id, label, value, options, disabled, canRet
   const selectedCatalog = catalogMap.get(value)
   const currentFamilyId = selectedCatalog?.familyId ?? value
   const currentEffort = selectedCatalog?.effort ?? 'none'
+  const supportsFast = selectedCatalog?.supportsFast === true
 
   const { families, selectedOption, selectedLabel, pillDisplayLabel, familyOptions, familyEfforts } = useMemo(() => {
     const famMap = new Map<string, { familyId: string; familyLabel: string; models: AssistantOption<InstantChoice>[] }>()
@@ -106,10 +109,11 @@ export function InstantModelSelect({ id, label, value, options, disabled, canRet
         : multiEfforts
           ? ' None'
           : ''
+      const fastSuffix = supportsFast && fastMode ? ' · Fast' : ''
       const previewSuffix = selOption.label.endsWith(' (browser preview)') && !selectedCatalog.shortFamilyLabel.endsWith(' (browser preview)')
         ? ' (browser preview)'
         : ''
-      pillLabel = `${selectedCatalog.shortFamilyLabel}${effortSuffix}${previewSuffix}`
+      pillLabel = `${selectedCatalog.shortFamilyLabel}${effortSuffix}${fastSuffix}${previewSuffix}`
     }
 
     const famOpts = famList.map((fam) => {
@@ -144,9 +148,9 @@ export function InstantModelSelect({ id, label, value, options, disabled, canRet
       familyOptions: famOpts,
       familyEfforts: efforts,
     }
-  }, [options, value, currentFamilyId, currentEffort, selectedCatalog, canRetry])
+  }, [options, value, currentFamilyId, currentEffort, selectedCatalog, canRetry, supportsFast, fastMode])
 
-  const effectivePhase = disabled || options.length === 0 ? 'closed' : popupPhase
+  const effectivePhase = options.length === 0 ? 'closed' : popupPhase
   const isPopupVisible = effectivePhase !== 'closed'
   const isPopupOpen = effectivePhase === 'open'
 
@@ -238,10 +242,10 @@ export function InstantModelSelect({ id, label, value, options, disabled, canRet
                     className="composer__model-popup-item"
                     data-selected={isCurrentFamily ? 'true' : undefined}
                     style={{ '--item-index': index } as CSSProperties}
-                    disabled={!available}
+                    disabled={disabled || !available}
                     title={repOption.reason}
                     onClick={() => {
-                      if (!available) return
+                      if (disabled || !available) return
                       if (repOption.value !== value) {
                         onChange(repOption.value)
                       }
@@ -274,10 +278,10 @@ export function InstantModelSelect({ id, label, value, options, disabled, canRet
                         className="composer__model-popup-effort-chip"
                         data-active={isCurrentEffort ? 'true' : undefined}
                         aria-pressed={isCurrentEffort}
-                        disabled={!effortAvailable}
+                        disabled={disabled || !effortAvailable}
                         title={option.reason}
                         onClick={() => {
-                          if (!effortAvailable) return
+                          if (disabled || !effortAvailable) return
                           if (option.value !== value) {
                             onChange(option.value)
                           }
@@ -289,6 +293,40 @@ export function InstantModelSelect({ id, label, value, options, disabled, canRet
                     )
                   })}
                 </div>
+                {supportsFast && onFastModeChange !== undefined ? (
+                  <div className="composer__model-popup-fast-row" role="group" aria-label="Fast mode">
+                    <span className="composer__model-popup-fast-label">Fast</span>
+                    <div className="composer__model-popup-fast-chips">
+                      {([
+                        { label: 'Off', nextFast: false },
+                        { label: 'On', nextFast: true },
+                      ] as const).map(({ label: optLabel, nextFast }) => {
+                        const isActive = Boolean(fastMode) === nextFast
+                        const isDisabled = disabled || (!selectedOption?.available && !canRetry(value))
+                        return (
+                          <button
+                            key={optLabel}
+                            type="button"
+                            className="composer__model-popup-effort-chip composer__model-popup-fast-chip"
+                            data-active={isActive ? 'true' : undefined}
+                            aria-pressed={isActive}
+                            aria-label={`Fast ${optLabel}`}
+                            disabled={isDisabled}
+                            onClick={() => {
+                              if (isDisabled) return
+                              if (Boolean(fastMode) !== nextFast) {
+                                onFastModeChange(nextFast)
+                              }
+                              closePopup()
+                            }}
+                          >
+                            {optLabel}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+                ) : null}
               </div>
             </div>
           </>

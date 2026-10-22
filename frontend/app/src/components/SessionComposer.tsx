@@ -15,7 +15,7 @@ export const SessionComposer = memo(function SessionComposer({ session, view }: 
     instantControlsDisabled, runtimeStatus, updateRuntimeBlocked,
     promptActivity, wakeConfidence } = usePresentation(session, view, 'composer')
   const { onSubmit, loadMoreAndroidConversations, loadMoreAndroidHeads, selectAndroidConversation, changeComposer,
-    onComposerKeyDown, acceptTypedCompletion, clearCompletion, toggleMic, changeInstant, cancelPrompt, resetSession } = view.actions
+    onComposerKeyDown, acceptTypedCompletion, clearCompletion, toggleMic, changeInstant, patchAssistantSettings, cancelPrompt, resetSession } = view.actions
   const canStop = (promptState === 'executing' || promptState === 'stopping') && startupState.kind === 'ready' && startupState.promptCancellationAvailable
   const busy = promptState !== 'idle' || runtimeStatus === 'processing' || runtimeStatus === 'executing'
   const actionLabel = canStop ? promptState === 'stopping' ? 'Stopping…' : 'Stop' : busy ? 'Working…' : 'Send'
@@ -56,7 +56,7 @@ export const SessionComposer = memo(function SessionComposer({ session, view }: 
         />
       </div>
       <div className="composer__utility-row">
-        <InstantModelSelect variant="pill" id="composerInstantSelect" label="Instant model" value={assistantSettings.instant} options={instantAssistantOptions} disabled={instantControlsDisabled} canRetry={(value) => localInstantCanRetry(startupState, value)} onChange={(value) => void changeInstant(value)} />
+        <InstantModelSelect variant="pill" id="composerInstantSelect" label="Instant model" value={assistantSettings.instant} options={instantAssistantOptions} disabled={instantControlsDisabled} canRetry={(value) => localInstantCanRetry(startupState, value)} onChange={(value) => void changeInstant(value)} fastMode={assistantSettings.fastMode} onFastModeChange={(fastMode) => patchAssistantSettings({ fastMode })} />
         <div className="composer__utility-actions">
           {!isAndroidRuntime && runtimeStatus === 'sleeping' && wakeConfidence !== null ? (
             <div className={wakeConfidence >= 0.7 ? 'composer__wake composer__wake--high' : wakeConfidence >= 0.4 ? 'composer__wake composer__wake--medium' : 'composer__wake composer__wake--low'}>

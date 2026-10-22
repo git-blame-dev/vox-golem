@@ -55,11 +55,12 @@ class PhonePreferences(context: Context) {
             .put("instant", "custom-sol-high").put("deep", "custom-sol-high").put("review", "custom-sol-high")
             .put("deep_enabled", false).put("review_enabled", false).put("prefetch", false).put("completion", false)
             .put("response_profile", "fast").put("tts_enabled", false).put("ui_theme", "dark").put("ui_text_size", "medium")
-            .put("web_enabled", true).put("speech_network_fallback", true)
+            .put("web_enabled", true).put("speech_network_fallback", true).put("fast_mode", false)
             .put("speech_language", "").put("speech_tts_provider", "").put("speech_tts_voice", "")
 
         fun normalize(value: JSONObject) = JSONObject(value.toString()).apply {
             for (key in listOf("web_enabled", "speech_network_fallback")) if (!has(key)) put(key, true)
+            if (!has("fast_mode")) put("fast_mode", false)
             for (key in listOf("speech_language", "speech_tts_provider", "speech_tts_voice")) if (!has(key)) put(key, "")
         }
         fun validate(input: JSONObject) {
@@ -80,7 +81,7 @@ class PhonePreferences(context: Context) {
             val strings = listOf("speech_language", "speech_tts_provider", "speech_tts_voice").map { value.opt(it) as? String ?: invalid() }
             try { dev.gitblame.voxgolem.assistant.speech.SpeechSelection(strings[0], strings[1], strings[2]).validateShape() }
             catch (_: IllegalArgumentException) { invalid() }
-            for (key in listOf("deep_enabled", "review_enabled", "prefetch", "completion", "tts_enabled", "web_enabled", "speech_network_fallback")) {
+            for (key in listOf("deep_enabled", "review_enabled", "prefetch", "completion", "tts_enabled", "web_enabled", "speech_network_fallback", "fast_mode")) {
                 if (value.opt(key) !is Boolean) invalid()
                 if (key in setOf("deep_enabled", "review_enabled", "prefetch", "completion") && value.getBoolean(key)) unavailable()
             }

@@ -1372,6 +1372,8 @@ struct AssistantSettingsCommandPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     speech_network_fallback: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    fast_mode: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     speech_language: Option<SpeechChoice>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     speech_tts_provider: Option<SpeechChoice>,
@@ -1398,6 +1400,9 @@ impl AssistantSettingsCommandPayload {
         if let Some(value) = self.speech_network_fallback {
             preferences.speech_network_fallback = value;
         }
+        if let Some(value) = self.fast_mode {
+            preferences.fast_mode = value;
+        }
         if let Some(value) = self.speech_language {
             preferences.speech_language = value;
         }
@@ -1417,6 +1422,7 @@ impl From<&voxgolem_core::ipc::ValidatedPreferences> for AssistantSettingsComman
             settings: AssistantSettingsPayload::from(preferences),
             web_enabled: Some(preferences.web_enabled),
             speech_network_fallback: Some(preferences.speech_network_fallback),
+            fast_mode: Some(preferences.fast_mode),
             speech_language: Some(preferences.speech_language.clone()),
             speech_tts_provider: Some(preferences.speech_tts_provider.clone()),
             speech_tts_voice: Some(preferences.speech_tts_voice.clone()),
@@ -1429,6 +1435,7 @@ struct NetworkPreferences {
     web_enabled: bool,
     // Pass-through only: desktop speech has no network fallback capability.
     speech_network_fallback: bool,
+    fast_mode: bool,
     // Requested choices only; they do not establish desktop SDK/provider support.
     speech_language: SpeechChoice,
     speech_tts_provider: SpeechChoice,
@@ -1440,6 +1447,7 @@ impl Default for NetworkPreferences {
         Self {
             web_enabled: true,
             speech_network_fallback: true,
+            fast_mode: false,
             speech_language: SpeechChoice::default(),
             speech_tts_provider: SpeechChoice::default(),
             speech_tts_voice: SpeechChoice::default(),
@@ -1454,6 +1462,7 @@ fn resolve_network_preferences(
     NetworkPreferences {
         web_enabled: persisted.web_enabled.unwrap_or(config_web_enabled),
         speech_network_fallback: persisted.speech_network_fallback.unwrap_or(true),
+        fast_mode: persisted.fast_mode.unwrap_or(false),
         speech_language: persisted.speech_language.clone(),
         speech_tts_provider: persisted.speech_tts_provider.clone(),
         speech_tts_voice: persisted.speech_tts_voice.clone(),
@@ -1662,6 +1671,7 @@ fn build_ipc_app_snapshot(
         preferences: ipc::ValidatedPreferences {
             web_enabled: network_preferences.web_enabled,
             speech_network_fallback: network_preferences.speech_network_fallback,
+            fast_mode: network_preferences.fast_mode,
             speech_language: network_preferences.speech_language,
             speech_tts_provider: network_preferences.speech_tts_provider,
             speech_tts_voice: network_preferences.speech_tts_voice,
@@ -1832,6 +1842,7 @@ fn publish_validated_preferences(
     *network_preferences = NetworkPreferences {
         web_enabled: preferences.web_enabled,
         speech_network_fallback: preferences.speech_network_fallback,
+        fast_mode: preferences.fast_mode,
         speech_language: preferences.speech_language.clone(),
         speech_tts_provider: preferences.speech_tts_provider.clone(),
         speech_tts_voice: preferences.speech_tts_voice.clone(),
@@ -4731,6 +4742,7 @@ fn ensure_agent_prerequisites(
 
 struct AssistantRequestContext {
     web_enabled: bool,
+    fast_mode: bool,
     generation: voxgolem_core::conversation::ExecutionId,
     instant_model: voxgolem_core::assistant::InstantModel,
     preferences: voxgolem_core::assistant::AssistantPolicy,
@@ -4846,11 +4858,13 @@ impl DesktopConversationRuntime {
         if is_opencode && opencode_client.is_none() {
             return Err(String::from("OpenCode server is not available"));
         }
-        let web_enabled = resources
-            .network_preferences
-            .lock()
-            .map_err(|_| String::from("network preferences lock is poisoned"))?
-            .web_enabled;
+        let (web_enabled, fast_mode) = {
+            let prefs = resources
+                .network_preferences
+                .lock()
+                .map_err(|_| String::from("network preferences lock is poisoned"))?;
+            (prefs.web_enabled, prefs.fast_mode)
+        };
         let snapshot = coordinator
             .admit(request_id, prompt)
             .map_err(|error| format!("assistant request could not start: {error:?}"))?;
@@ -4946,6 +4960,7 @@ impl DesktopConversationRuntime {
                 source,
                 prompt: snapshot.prompt,
                 web_enabled,
+                fast_mode,
             },
             physical_generation,
             cancelled,
@@ -6383,6 +6398,7 @@ async fn submit_custom_prompt(
         endpoint: config.endpoint.clone(),
         auth_path,
         model,
+        fast_mode: assistant_request.fast_mode,
         ..Default::default()
     };
     let client = app_state
@@ -10567,6 +10583,7 @@ fn log_tts_runtime_event(enabled: bool, message: &str) {
 struct PersistedState {
     web_enabled: Option<bool>,
     speech_network_fallback: Option<bool>,
+    fast_mode: Option<bool>,
     speech_language: SpeechChoice,
     speech_tts_provider: SpeechChoice,
     speech_tts_voice: SpeechChoice,
@@ -10585,6 +10602,11 @@ impl From<&voxgolem_core::ipc::ValidatedPreferences> for PersistedState {
         Self {
             web_enabled: Some(preferences.web_enabled),
             speech_network_fallback: Some(preferences.speech_network_fallback),
+            fast_mode: if preferences.fast_mode {
+                Some(true)
+            } else {
+                None
+            },
             speech_language: preferences.speech_language.clone(),
             speech_tts_provider: preferences.speech_tts_provider.clone(),
             speech_tts_voice: preferences.speech_tts_voice.clone(),
@@ -10616,6 +10638,7 @@ impl From<&voxgolem_core::ipc::ValidatedPreferences> for PersistedState {
 struct PersistedStateWire {
     web_enabled: Option<bool>,
     speech_network_fallback: Option<bool>,
+    fast_mode: Option<bool>,
     #[serde(default, skip_serializing_if = "speech_choice_is_empty")]
     speech_language: SpeechChoice,
     #[serde(default, skip_serializing_if = "speech_choice_is_empty")]
@@ -10643,6 +10666,7 @@ impl From<&PersistedState> for PersistedStateWire {
         Self {
             web_enabled: state.web_enabled,
             speech_network_fallback: state.speech_network_fallback,
+            fast_mode: state.fast_mode,
             speech_language: state.speech_language.clone(),
             speech_tts_provider: state.speech_tts_provider.clone(),
             speech_tts_voice: state.speech_tts_voice.clone(),
@@ -10711,6 +10735,7 @@ fn parse_persisted_state(contents: &str) -> Result<PersistedState, String> {
     Ok(PersistedState {
         web_enabled: wire.web_enabled,
         speech_network_fallback: wire.speech_network_fallback,
+        fast_mode: wire.fast_mode,
         speech_language: wire.speech_language,
         speech_tts_provider: wire.speech_tts_provider,
         speech_tts_voice: wire.speech_tts_voice,
@@ -14121,6 +14146,7 @@ mod tests {
             super::NetworkPreferences {
                 web_enabled: false,
                 speech_network_fallback: false,
+                fast_mode: false,
                 speech_language: super::validated_ipc_text("synthetic-language"),
                 speech_tts_provider: super::validated_ipc_text("synthetic-tts"),
                 speech_tts_voice: super::validated_ipc_text("synthetic-voice"),
@@ -18856,6 +18882,7 @@ mod tests {
         let previous = PersistedState {
             web_enabled: Some(true),
             speech_network_fallback: Some(true),
+            fast_mode: None,
             speech_language: super::validated_ipc_text("synthetic-old-language"),
             speech_tts_provider: super::validated_ipc_text("synthetic-old-tts"),
             speech_tts_voice: super::validated_ipc_text("synthetic-old-voice"),
@@ -18871,6 +18898,7 @@ mod tests {
         let preferences = voxgolem_core::ipc::ValidatedPreferences {
             web_enabled: false,
             speech_network_fallback: false,
+            fast_mode: false,
             speech_language: super::validated_ipc_text("synthetic-language"),
             speech_tts_provider: super::validated_ipc_text("synthetic-tts"),
             speech_tts_voice: super::validated_ipc_text("synthetic-voice"),
@@ -18897,6 +18925,7 @@ mod tests {
             PersistedState {
                 web_enabled: Some(false),
                 speech_network_fallback: Some(false),
+                fast_mode: None,
                 speech_language: preferences.speech_language.clone(),
                 speech_tts_provider: preferences.speech_tts_provider.clone(),
                 speech_tts_voice: preferences.speech_tts_voice.clone(),

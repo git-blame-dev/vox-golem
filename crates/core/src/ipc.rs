@@ -541,6 +541,8 @@ pub struct ValidatedPreferences {
     pub web_enabled: bool,
     #[serde(default = "default_enabled")]
     pub speech_network_fallback: bool,
+    #[serde(default)]
+    pub fast_mode: bool,
     pub ui_theme: UiTheme,
     pub ui_text_size: UiTextSize,
     /// Empty selects the system/automatic language rather than a fixed locale.
@@ -1331,6 +1333,7 @@ mod tests {
             tts_enabled: false,
             web_enabled: true,
             speech_network_fallback: true,
+            fast_mode: false,
             ui_theme: UiTheme::Dark,
             ui_text_size: UiTextSize::Large,
             speech_language: BoundedText::default(),

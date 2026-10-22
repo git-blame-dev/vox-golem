@@ -215,6 +215,7 @@ fn constructor_dispatch_child() {
             } else {
                 CustomOpenAiModel::SolHigh
             },
+            fast_mode: false,
         };
         let owner = CustomOpenAiClient::new(config.clone()).expect("accepted loopback spelling");
         // Trimming remains compatible; this fix must not broaden cross-origin pool reuse.

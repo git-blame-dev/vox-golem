@@ -6,7 +6,8 @@ import dev.gitblame.voxgolem.assistant.speech.SpeechAdmission
 import dev.gitblame.voxgolem.assistant.speech.SpeechSelection
 
 data class InstallationSettings(val webEnabled: Boolean = true, val speechNetworkFallback: Boolean = true,
-    val speechLanguage: String = "", val speechTtsProvider: String = "", val speechTtsVoice: String = "") {
+    val speechLanguage: String = "", val speechTtsProvider: String = "", val speechTtsVoice: String = "",
+    val fastMode: Boolean = false) {
     fun selection() = SpeechSelection(speechLanguage, speechTtsProvider, speechTtsVoice)
     fun speechAdmission() = SpeechAdmission(selection(), speechNetworkFallback)
 }
@@ -20,7 +21,8 @@ class InstallationPreferences internal constructor(private val preferences: Shar
     fun read(): InstallationSettings = synchronized(preferences) {
         InstallationSettings(preferences.getBoolean("web_enabled", true),
             preferences.getBoolean("speech_network_fallback", true), preferences.getString("speech_language", "") ?: "",
-            preferences.getString("speech_tts_provider", "") ?: "", preferences.getString("speech_tts_voice", "") ?: "")
+            preferences.getString("speech_tts_provider", "") ?: "", preferences.getString("speech_tts_voice", "") ?: "",
+            preferences.getBoolean("fast_mode", false))
     }
 
     /** Caller retains actor/context validation and publishes only after durable success. */
@@ -36,12 +38,12 @@ class InstallationPreferences internal constructor(private val preferences: Shar
     private fun commit(value: InstallationSettings) = preferences.edit().putBoolean("web_enabled", value.webEnabled)
         .putBoolean("speech_network_fallback", value.speechNetworkFallback)
         .putString("speech_language", value.speechLanguage).putString("speech_tts_provider", value.speechTtsProvider)
-        .putString("speech_tts_voice", value.speechTtsVoice).commit()
+        .putString("speech_tts_voice", value.speechTtsVoice).putBoolean("fast_mode", value.fastMode).commit()
 
     companion object {
         const val FILE = "assistant-policy"
         fun ownsKey(key: String): Boolean = when (key) {
-            "web_enabled", "speech_network_fallback", "speech_language", "speech_tts_provider", "speech_tts_voice" -> true
+            "web_enabled", "speech_network_fallback", "speech_language", "speech_tts_provider", "speech_tts_voice", "fast_mode" -> true
             else -> false
         }
     }
