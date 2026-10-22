@@ -19,14 +19,12 @@ use outcome::Outcome;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::future::Future;
-use std::io::Read;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Component, Path};
 use tokio::sync::watch;
 use voxgolem_platform::custom_openai::{
-    custom_openai_auth_revision, observe_custom_openai_auth, CustomOpenAiAuthObservation,
-    CustomOpenAiAuthRevision, CustomOpenAiClient, CustomOpenAiConfig, CustomOpenAiError,
-    CustomOpenAiModel, CustomOpenAiResponse, MAX_CUSTOM_OPENAI_AUTH_BYTES,
+    observe_custom_openai_auth, CustomOpenAiAuthRevision, CustomOpenAiClient, CustomOpenAiConfig,
+    CustomOpenAiError, CustomOpenAiModel, CustomOpenAiResponse,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
@@ -97,69 +95,6 @@ fn valid_auth_path(auth_path: &str) -> bool {
         && !path.components().any(|part| part == Component::ParentDir)
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyEmptyAuth {
-    #[serde(rename = "_assistant")]
-    metadata: LegacyEmptyMetadata,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyEmptyMetadata {
-    version: u32,
-    #[serde(rename = "installationId")]
-    installation_id: String,
-    generation: String,
-    #[serde(default, rename = "association")]
-    _association: Option<serde_json::Value>,
-    #[serde(default, rename = "pending")]
-    _pending: Option<serde_json::Value>,
-    #[serde(default, rename = "incoming")]
-    _incoming: Option<serde_json::Value>,
-}
-
-fn auth_source_kind(path: &Path, observation: &CustomOpenAiAuthObservation) -> &'static str {
-    if observation.status != Err(CustomOpenAiError::AuthUnavailable) {
-        return "provider";
-    }
-    let metadata = match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return "absent",
-        Ok(metadata) if metadata.is_file() => metadata,
-        _ => return "provider",
-    };
-    if metadata.len() > MAX_CUSTOM_OPENAI_AUTH_BYTES
-        || observation.revision.is_none()
-        || custom_openai_auth_revision(path) != observation.revision
-    {
-        return "provider";
-    }
-    let empty = (|| {
-        let file = std::fs::File::open(path).ok()?;
-        let mut bytes = Vec::new();
-        file.take(MAX_CUSTOM_OPENAI_AUTH_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .ok()?;
-        if bytes.len() as u64 > MAX_CUSTOM_OPENAI_AUTH_BYTES {
-            return None;
-        }
-        let legacy: LegacyEmptyAuth = serde_json::from_slice(&bytes).ok()?;
-        (legacy.metadata.version == 1
-            && legacy.metadata.generation == "0"
-            && voxgolem_core::durable_conversation::validate_replica(
-                &legacy.metadata.installation_id,
-            )
-            .is_ok()
-            && custom_openai_auth_revision(path) == observation.revision)
-            .then_some(())
-    })();
-    if empty.is_some() {
-        "legacy_empty"
-    } else {
-        "provider"
-    }
-}
-
 fn auth_revision_string(revision: CustomOpenAiAuthRevision) -> String {
     format!("{revision:?}")
 }
@@ -167,10 +102,6 @@ fn auth_revision_string(revision: CustomOpenAiAuthRevision) -> String {
 fn observe_auth_json(auth_path: &str) -> String {
     let path = Path::new(auth_path);
     let observation = valid_auth_path(auth_path).then(|| observe_custom_openai_auth(path));
-    let source_kind = observation
-        .as_ref()
-        .map(|observation| auth_source_kind(path, observation))
-        .unwrap_or("provider");
     let revision = observation
         .as_ref()
         .and_then(|value| value.revision)
@@ -180,7 +111,7 @@ fn observe_auth_json(auth_path: &str) -> String {
         .unwrap_or(Err(CustomOpenAiError::AuthUnavailable))
         .err()
         .map(ErrorCode::from);
-    serde_json::json!({ "revision": revision, "code": code, "sourceKind": source_kind }).to_string()
+    serde_json::json!({ "revision": revision, "code": code }).to_string()
 }
 
 #[allow(unsafe_code)]
@@ -688,8 +619,10 @@ pub extern "system" fn Java_dev_gitblame_voxgolem_assistant_runtime_AssistantPro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use voxgolem_platform::custom_openai::MAX_CUSTOM_OPENAI_AUTH_BYTES;
 
     #[test]
     fn auth_observation_is_bounded_and_uses_portable_provider_errors() {
@@ -702,7 +635,7 @@ mod tests {
                 serde_json::from_str(&observe_auth_json(path)).unwrap();
             assert_eq!(observation["code"], "auth_unavailable");
             assert!(observation["revision"].is_null());
-            assert_eq!(observation.as_object().unwrap().len(), 3);
+            assert_eq!(observation.as_object().unwrap().len(), 2);
         }
     }
 
@@ -723,7 +656,7 @@ mod tests {
         }
 
         fn path(&self) -> std::path::PathBuf {
-            self.0.join("assistant-auth.json")
+            self.0.join("chatgpt-auth.json")
         }
 
         fn replace(&self, access: &str) {
@@ -809,28 +742,21 @@ mod tests {
     }
 
     #[test]
-    fn source_kind_only_allows_absent_or_recognized_generation_zero_metadata() {
+    fn missing_and_malformed_auth_files_observe_as_unavailable_without_modification() {
         let fixture = AuthFixture::new();
         let path = fixture.path();
         let observe = || {
             serde_json::from_str::<serde_json::Value>(&observe_auth_json(path.to_str().unwrap()))
                 .unwrap()
         };
-        assert_eq!(observe()["sourceKind"], "absent");
-        std::fs::write(&path, r#"{"_assistant":{"version":1,"installationId":"00000000-0000-4000-8000-000000000001","generation":"0"}}"#).unwrap();
-        assert_eq!(observe()["sourceKind"], "legacy_empty");
+        assert_eq!(observe()["code"], "auth_unavailable");
         for bytes in [
-            br#"{"_assistant":{"version":1,"installationId":"00000000-0000-4000-8000-000000000001","generation":"1"}}"#.to_vec(),
-            br#"{"_assistant":{"version":1,"generation":"0"}}"#.to_vec(),
-            br#"{"_assistant":{"version":1,"installationId":"00000000-0000-4000-8000-000000000001","generation":"1","generation":"0"}}"#.to_vec(),
-            br#"{"_assistant":{"version":1,"installationId":"00000000-0000-4000-8000-000000000001","generation":"0"},"openai":null}"#.to_vec(),
+            br#"{"openai":null}"#.to_vec(),
             br#"{"openai":{"access":"bad\nheader","expires":4102444800000}}"#.to_vec(),
             vec![b'x'; MAX_CUSTOM_OPENAI_AUTH_BYTES as usize + 1],
         ] {
             std::fs::write(&path, &bytes).unwrap();
-            let observation = observe();
-            assert_eq!(observation["code"], "auth_unavailable");
-            assert_eq!(observation["sourceKind"], "provider");
+            assert_eq!(observe()["code"], "auth_unavailable");
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
         }
     }

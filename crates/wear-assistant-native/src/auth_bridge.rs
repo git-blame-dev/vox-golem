@@ -99,10 +99,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bridge_rejects_imported_or_relative_paths_and_unknown_actions() {
+    fn bridge_rejects_foreign_or_relative_paths_and_unknown_actions() {
         for path in [
             "relative/chatgpt-auth.json",
-            "/synthetic/assistant-auth.json",
+            "/synthetic/other-auth.json",
             "/synthetic/../chatgpt-auth.json",
         ] {
             assert_eq!(command(path, "start"), AUTH_FAILURE);

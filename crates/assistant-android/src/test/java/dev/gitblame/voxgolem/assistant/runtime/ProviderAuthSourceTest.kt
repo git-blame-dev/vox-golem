@@ -20,35 +20,43 @@ import org.json.JSONObject
 @Config(sdk = [24, 35], manifest = Config.NONE)
 class ProviderAuthSourceTest {
     @get:Rule val folder = TemporaryFolder()
-    private val primary get() = File(folder.root, "assistant-auth.json")
-    private val legacy get() = File(folder.root, "codex-auth.json")
     private val managed get() = File(folder.root, "chatgpt-auth.json")
-    private fun envelope(access: String = "synthetic-access", expiry: Long = System.currentTimeMillis() + 3_600_000,
-        metadata: Boolean = false) = """{${if (metadata) "\"_assistant\":{\"version\":1,\"installationId\":\"00000000-0000-4000-8000-000000000001\",\"generation\":\"7\"}," else ""}"openai":{"access":"$access","expires":$expiry}}"""
+    private fun envelope(access: String = "synthetic-access", expiry: Long = System.currentTimeMillis() + 3_600_000) =
+        """{"voxgolemChatgpt":1,"openai":{"access":"$access","expires":$expiry}}"""
 
-    @Test fun managedSelectionAndSignedOutTombstoneNeverFallBackOrMutateImportedFiles() {
-        primary.writeText(envelope("synthetic-import"))
-        legacy.writeText(envelope("synthetic-legacy"))
-        val before = primary.readBytes(); val legacyBefore = legacy.readBytes()
-        val source = ProviderAuthSource(primary, legacy, managed)
-        assertEquals(primary.path, source.selection().path)
-        managed.writeText(JSONObject(envelope("synthetic-managed")).put("voxgolemChatgpt", 1).toString())
+    @Test fun signedOutTombstoneAndInvalidManagedFilesAreNeverReadyOrMutated() {
+        val source = ProviderAuthSource(managed)
+        assertEquals(managed.path, source.selection().path)
+        managed.writeText(envelope("synthetic-managed"))
         assertEquals(ProviderAuthReason.READY, source.status().reason)
-        assertEquals(managed.path, source.pathForProvider())
-        for (contents in listOf("""{"voxgolemChatgpt":1,"signedOut":true}""", "{}", "not-json")) {
+        val invalid = listOf("""{"voxgolemChatgpt":1,"signedOut":true}""", "{}", "not-json", envelope(access = ""),
+            envelope(access = "synthetic\\nheader"), "x".repeat(65_537),
+            """{"voxgolemChatgpt":1,"openai":{"access":"synthetic-access","accountId":"synthetic\raccount","expires":4102444800000}}""")
+        for (contents in invalid) {
             managed.writeText(contents)
+            val before = managed.readBytes()
             assertNotEquals(ProviderAuthReason.READY, source.status().reason)
             assertEquals(managed.path, source.pathForProvider())
-            assertEquals(contents, managed.readText())
+            assertArrayEquals(before, managed.readBytes())
         }
-        assertArrayEquals(before, primary.readBytes()); assertArrayEquals(legacyBefore, legacy.readBytes())
     }
 
-    @Test fun watchAdmissionFailsClosedUntilAssociationValidationWithoutFallingBackToImports() {
-        primary.writeText(envelope("synthetic-import"))
-        managed.writeText(JSONObject(envelope("synthetic-watch-access")).put("voxgolemChatgpt", 1).toString())
+    @Test fun unreadableManagedFileIsInvalidWithoutChangingItsPermissions() {
+        managed.writeText(envelope())
+        val before = managed.readBytes()
+        val permissions = Files.getPosixFilePermissions(managed.toPath())
+        try {
+            Files.setPosixFilePermissions(managed.toPath(), emptySet())
+            assertEquals(ProviderAuthReason.INVALID, ProviderAuthSource(managed).status().reason)
+            assertTrue(Files.getPosixFilePermissions(managed.toPath()).isEmpty())
+        } finally { Files.setPosixFilePermissions(managed.toPath(), permissions) }
+        assertArrayEquals(before, managed.readBytes())
+    }
+
+    @Test fun watchAdmissionFailsClosedUntilAssociationValidation() {
+        managed.writeText(envelope("synthetic-watch-access"))
         var approved = false
-        val source = ProviderAuthSource(primary, legacy, managed, { approved })
+        val source = ProviderAuthSource(managed, { approved })
         assertNotEquals(ProviderAuthReason.READY, source.status().reason)
         assertEquals(managed.path, source.pathForProvider())
         approved = true
@@ -59,105 +67,16 @@ class ProviderAuthSourceTest {
     }
 
     @Test fun missingInvalidAndExpiredFilesUseTheRealRustParserWithoutMutation() {
-        val source = ProviderAuthSource(primary, legacy)
+        val source = ProviderAuthSource(managed)
         assertEquals(ProviderAuthReason.MISSING, source.status().reason)
-        assertFalse(primary.exists()); assertFalse(legacy.exists())
+        assertFalse(managed.exists())
         for ((contents, reason) in listOf("not-json" to ProviderAuthReason.INVALID,
             envelope(expiry = 1) to ProviderAuthReason.EXPIRED,
             envelope(access = "") to ProviderAuthReason.INVALID)) {
-            primary.writeText(contents)
-            val before = primary.readBytes(); val modified = primary.lastModified()
+            managed.writeText(contents)
+            val before = managed.readBytes(); val modified = managed.lastModified()
             repeat(5) { assertEquals(reason, source.status().reason) }
-            assertArrayEquals(before, primary.readBytes()); assertEquals(modified, primary.lastModified())
-        }
-    }
-
-    @Test fun validMetadataTakesPrecedenceAndMetadataOnlyStoreDoesNotMaskLegacyInjection() {
-        val source = ProviderAuthSource(primary, legacy)
-        legacy.writeText(envelope("synthetic-legacy"))
-        assertEquals(ProviderAuthReason.READY, source.status().reason)
-        assertEquals(legacy.path, source.pathForProvider())
-        primary.writeText("""{"_assistant":{"version":1,"installationId":"00000000-0000-4000-8000-000000000001","generation":"0"}}""")
-        assertEquals(ProviderAuthReason.READY, source.status().reason)
-        assertEquals(legacy.path, source.pathForProvider())
-        primary.writeText(envelope("synthetic-new", metadata = true))
-        val before = primary.readBytes(); val oldBefore = legacy.readBytes()
-        assertEquals(ProviderAuthReason.READY, source.status().reason)
-        assertEquals(primary.path, source.pathForProvider())
-        // Expiry on the selected modern file is not hidden by an older valid copy.
-        primary.writeText(envelope(expiry = 1, metadata = true))
-        assertEquals(ProviderAuthReason.EXPIRED, source.status().reason)
-        assertEquals(primary.path, source.pathForProvider())
-        primary.writeBytes(before)
-        repeat(5) { source.status() }
-        assertArrayEquals(before, primary.readBytes()); assertArrayEquals(oldBefore, legacy.readBytes())
-    }
-
-    @Test fun invalidRemovedOversizedAndUnreadablePrimaryNeverFallsBackToValidLegacy() {
-        legacy.writeText(envelope("synthetic-legacy"))
-        val legacyBefore = legacy.readBytes()
-        val source = ProviderAuthSource(primary, legacy)
-        val invalid = listOf("not-json", "{}", envelope(access = ""), envelope(access = "synthetic\\nheader"),
-            """{"openai":{"access":"synthetic-access","accountId":"synthetic\raccount","expires":4102444800000}}""",
-            "x".repeat(65_537),
-            """{"_assistant":{"version":1,"installationId":"00000000-0000-4000-8000-000000000001","generation":"1"}}""",
-            """{"_assistant":{"version":1,"generation":"0"}}""",
-            """{"_assistant":{"version":2,"installationId":"00000000-0000-4000-8000-000000000001","generation":"0"}}""",
-            """{"_assistant":{"version":1,"installationId":"not-an-id","generation":"0"}}""",
-            """{"_assistant":{"version":1,"installationId":"00000000-0000-4000-8000-000000000001","generation":"0"},"openai":null}""")
-        for (contents in invalid) {
-            primary.writeText(contents)
-            val before = primary.readBytes()
-            assertEquals(ProviderAuthReason.INVALID, source.status().reason)
-            assertEquals(primary.path, source.pathForProvider())
-            assertArrayEquals(before, primary.readBytes()); assertArrayEquals(legacyBefore, legacy.readBytes())
-        }
-        primary.writeText(envelope(metadata = true))
-        val before = primary.readBytes()
-        val permissions = Files.getPosixFilePermissions(primary.toPath())
-        try {
-            Files.setPosixFilePermissions(primary.toPath(), emptySet())
-            assertEquals(ProviderAuthReason.INVALID, source.status().reason)
-            assertEquals(primary.path, source.pathForProvider())
-            assertTrue(Files.getPosixFilePermissions(primary.toPath()).isEmpty())
-        } finally { Files.setPosixFilePermissions(primary.toPath(), permissions) }
-        assertArrayEquals(before, primary.readBytes()); assertArrayEquals(legacyBefore, legacy.readBytes())
-    }
-
-    @Test fun preflightPathAndStatusStayPinnedWhenLaterProjectionReselectsLegacy() {
-        primary.writeText(envelope("synthetic-primary", metadata = true))
-        legacy.writeText(envelope("synthetic-legacy"))
-        var switchAfterPreflight = false
-        val source = ProviderAuthSource(primary, legacy) { path ->
-            val result = AssistantProviderNative.observeAuth(path)
-            if (switchAfterPreflight && path == primary.path) {
-                switchAfterPreflight = false
-                primary.writeText("""{"_assistant":{"version":1,"installationId":"00000000-0000-4000-8000-000000000001","generation":"0"}}""")
-            }
-            result
-        }
-        var requestedPath: String? = null
-        val native = object : ProviderNativeCalls {
-            override fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String {
-                callback.onReady(); requestedPath = authPath
-                return """{"status":"error","code":"auth_unavailable"}"""
-            }
-            override fun cancel(requestId: String) = Unit
-        }
-        val models = object : AssistantModelStorage {
-            override fun read() = "custom-sol-high"
-            override fun write(value: String) = Unit
-        }
-        val immediate = Executor { it.run() }
-        AssistantStore(RuntimeEnvironment.getApplication()).use { store ->
-            val engine = AssistantEngine(store, immediate, AssistantRequestWorker(immediate, native), source::pathForProvider, models, source)
-            engine.resume(); engine.setDraft("Synthetic path pinning")
-            switchAfterPreflight = true
-            engine.send()
-            assertEquals(primary.path, requestedPath)
-            assertEquals(legacy.path, source.selection().path)
-            assertEquals("Synthetic path pinning", engine.snapshot().draft)
-            engine.background()
+            assertArrayEquals(before, managed.readBytes()); assertEquals(modified, managed.lastModified())
         }
     }
 
@@ -168,12 +87,12 @@ class ProviderAuthSourceTest {
             fun drain() { while (tasks.isNotEmpty()) tasks.removeFirst().run() }
         }
         fun replace(access: String) {
-            val replacement = File(folder.root, "synthetic-external-replacement").apply { writeText(envelope(access, metadata = true)) }
-            Files.move(replacement.toPath(), primary.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+            val replacement = File(folder.root, "synthetic-external-replacement").apply { writeText(envelope(access)) }
+            Files.move(replacement.toPath(), managed.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
         }
         for (replaceBeforeSettlement in listOf(false, true)) {
             replace("synthetic-admission-A")
-            val source = ProviderAuthSource(primary, legacy)
+            val source = ProviderAuthSource(managed)
             val io = Queue(); val provider = Queue()
             var usedRevision: String? = null
             var usedPath: String? = null
@@ -199,7 +118,7 @@ class ProviderAuthSourceTest {
                 val b = source.status().generation
                 assertNotEquals(admissionRevision, b)
                 provider.drain()
-                assertEquals(primary.path, usedPath)
+                assertEquals(managed.path, usedPath)
                 assertNotNull(usedRevision)
                 if (replaceBeforeSettlement) replace("synthetic-current-C")
                 io.drain()
@@ -217,13 +136,13 @@ class ProviderAuthSourceTest {
     }
 
     @Test fun replacedExternalRevisionClears401AndLateOldRejectionCannotPoisonIt() {
-        primary.writeText(envelope(metadata = true))
-        val source = ProviderAuthSource(primary, legacy)
+        managed.writeText(envelope())
+        val source = ProviderAuthSource(managed)
         val oldRevision = source.status().generation
         source.observeProviderResult(oldRevision, 401)
         assertEquals(ProviderAuthReason.UNAUTHORIZED, source.status().reason)
-        val replacement = File(folder.root, "synthetic-external-replacement").apply { writeText(envelope("synthetic-replaced", metadata = true)) }
-        Files.move(replacement.toPath(), primary.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        val replacement = File(folder.root, "synthetic-external-replacement").apply { writeText(envelope("synthetic-replaced")) }
+        Files.move(replacement.toPath(), managed.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
         val fresh = source.status()
         assertEquals(ProviderAuthReason.READY, fresh.reason); assertNotEquals(oldRevision, fresh.generation)
         source.observeProviderResult(oldRevision, 401)
@@ -235,15 +154,15 @@ class ProviderAuthSourceTest {
     }
 
     @Test fun startupAndRepeatedObservationsNeverRecoverRewriteOrDeleteCredentialSidecars() {
-        primary.writeText(envelope(metadata = true)); legacy.writeText(envelope("synthetic-legacy"))
-        val backup = File(primary.path + ".bak").apply { writeText("Synthetic retained obsolete backup") }
+        managed.writeText(envelope())
+        val backup = File(managed.path + ".bak").apply { writeText("Synthetic retained obsolete backup") }
         val staging = File(folder.root, ".assistant-auth.stage").apply { writeText("Synthetic retained obsolete staging") }
-        val files = listOf(primary, legacy, backup, staging)
+        val files = listOf(managed, backup, staging)
         val before = files.map { it.readBytes() }; val modified = files.map { it.lastModified() }
         val modes = files.map { Files.getPosixFilePermissions(it.toPath()) }
-        repeat(5) { assertEquals(ProviderAuthReason.READY, ProviderAuthSource(primary, legacy).status().reason) }
+        repeat(5) { assertEquals(ProviderAuthReason.READY, ProviderAuthSource(managed).status().reason) }
         val immediate = Executor { it.run() }
-        val source = ProviderAuthSource(primary, legacy)
+        val source = ProviderAuthSource(managed)
         AssistantStore(RuntimeEnvironment.getApplication()).use { store ->
             val native = object : ProviderNativeCalls {
                 override fun respond(requestId: String, authPath: String, requestJson: String, callback: ProviderDeltaCallback): String = error("Startup must not call provider")

@@ -8,49 +8,35 @@ enum class ProviderAuthReason { MISSING, READY, EXPIRED, INVALID, UNAUTHORIZED, 
 data class ProviderAuthStatus(val reason: ProviderAuthReason, val generation: String)
 internal data class ProviderAuthSelection(val path: String, val status: ProviderAuthStatus)
 
-/** Read-only selection. Managed native auth outranks externally published imported files. */
+/** Read-only view of the single credential source: the app-managed device-code file. */
 internal class ProviderAuthSource(
-    private val primary: File,
-    private val legacy: File,
-    private val managed: File? = null,
+    private val managed: File,
     private val managedAllowed: () -> Boolean = { true },
     private val observe: (String) -> String = AssistantProviderNative::observeAuth,
 ) {
-    constructor(context: Context) : this(File(context.applicationContext.noBackupFilesDir, "assistant-auth.json"),
-        File(context.applicationContext.filesDir, "codex-auth.json"),
-        ChatGptAuth.managedFile(context),
+    constructor(context: Context) : this(ChatGptAuth.managedFile(context),
         { dev.gitblame.voxgolem.assistant.replication.ChatGptAccessSync.managedAllowed(context) })
 
     private var rejected: Pair<String, ProviderAuthReason>? = null
-    private var selectedPath = primary.path
 
     @Synchronized fun selection(): ProviderAuthSelection {
-        // AtomicFile uses a backup/staging sibling on Android. A publication window must
-        // never make an explicit managed choice fall back to imported credentials.
-        val preferred = managed?.takeIf { it.exists() || File(it.path + ".bak").exists() || File(it.path + ".new").exists() } ?: primary
-        var observation = if (preferred == managed && !managedAllowed()) JSONObject().put("code", "auth_unavailable")
-            else JSONObject(observe(preferred.path))
-        selectedPath = preferred.path
-        // Old metadata-only stores must not mask an externally injected legacy provider file.
-        if (preferred == primary && observation.optString("sourceKind") in setOf("absent", "legacy_empty") && legacy.isFile) {
-            observation = JSONObject(observe(legacy.path))
-            selectedPath = legacy.path
-        }
+        val path = managed.path
+        val observation = if (!managedAllowed()) JSONObject().put("code", "auth_unavailable") else JSONObject(observe(path))
         val revision = observation.optString("revision").takeUnless { observation.isNull("revision") }
-        val generation = revision?.let { "$selectedPath:$it" } ?: ""
+        val generation = revision?.let { "$path:$it" } ?: ""
         val reason = when (observation.optString("code")) {
             "auth_expired" -> ProviderAuthReason.EXPIRED
-            "auth_unavailable" -> if (File(selectedPath).exists()) ProviderAuthReason.INVALID else ProviderAuthReason.MISSING
+            "auth_unavailable" -> if (managed.exists()) ProviderAuthReason.INVALID else ProviderAuthReason.MISSING
             "", "null" -> if (rejected?.first == generation) rejected!!.second else ProviderAuthReason.READY
             else -> ProviderAuthReason.INVALID
         }
         if (rejected?.first != generation) rejected = null
-        return ProviderAuthSelection(selectedPath, ProviderAuthStatus(reason, generation))
+        return ProviderAuthSelection(path, ProviderAuthStatus(reason, generation))
     }
 
     @Synchronized fun status(): ProviderAuthStatus = selection().status
 
-    @Synchronized fun pathForProvider(): String = selectedPath
+    fun pathForProvider(): String = managed.path
 
     @Synchronized fun observeProviderResult(path: String, revision: String, httpStatus: Int) {
         if (revision.isNotEmpty() && revision.length <= 512) observeProviderResult("$path:$revision", httpStatus)

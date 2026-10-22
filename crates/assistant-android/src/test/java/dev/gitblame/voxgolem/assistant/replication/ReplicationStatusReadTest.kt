@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.ContextWrapper
 import dev.gitblame.voxgolem.assistant.AssistantStoreRunner
 import dev.gitblame.voxgolem.assistant.AssistantStore
+import dev.gitblame.voxgolem.assistant.runtime.ChatGptAuth
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Rule
@@ -91,7 +92,7 @@ class ReplicationStatusReadTest {
         val owner = AssistantReplication.Owner(fixture.context, fixture.context.assistantPeerAssociationProvider,
             fixture::transport, { true }).also { testOwners += it }
         withOwner(owner) {
-            val credentialFile = File(fixture.root, "assistant-auth.json").apply { writeText("Synthetic externally owned bytes") }
+            val credentialFile = ChatGptAuth.managedFile(fixture.context).apply { writeText("Synthetic managed credential bytes") }
             val credentialBefore = credentialFile.readBytes()
             AssistantReplication.start(fixture.context, fixture.context.assistantPeerAssociationProvider)
             owner.submit {}!!.get(30, TimeUnit.SECONDS)
@@ -142,7 +143,6 @@ class ReplicationStatusReadTest {
             repeat(5) { assertEquals(PeerPairingReason.DISCOVERY_FAILED, readStatus(fixture.context).reason) }
             assertTrue(fixture.localSdk.calls.isEmpty())
             assertEquals(jobsBefore, fixture.scheduler.allPendingJobs)
-            assertFalse(File(fixture.root, "assistant-auth.json").exists())
         }
     }
 

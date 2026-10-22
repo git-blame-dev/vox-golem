@@ -219,10 +219,9 @@ class AssistantEngineTest {
         context.applicationInfo.flags = context.applicationInfo.flags or ApplicationInfo.FLAG_DEBUGGABLE
         for (authCode in listOf("auth_expired", "auth_unavailable")) {
             var observations = 0
-            val credentials = ProviderAuthSource(java.io.File("/synthetic/missing-primary.json"),
-                java.io.File("/synthetic/missing-legacy.json")) {
+            val credentials = ProviderAuthSource(java.io.File("/synthetic/missing-managed.json")) {
                 observations++
-                JSONObject().put("code", authCode).put("sourceKind", "absent").toString()
+                JSONObject().put("code", authCode).toString()
             }
             val restored = AssistantEngine(store, io, AssistantRequestWorker(providerQueue, provider),
                 { error("Unsupported model must not request an auth path") }, models, credentials,

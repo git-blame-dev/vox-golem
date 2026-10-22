@@ -131,7 +131,6 @@ class ApplicationAssistantInputPeersTest {
         val published = requireNotNull(state.selected())
         assertEquals(InputPeerSelection(installation, peer, replica, association, AssistantPeerRole.WATCH, published.approvalVersion), published)
         assertTrue(state.stillApproved(published))
-        assertFalse(File(root, "assistant-auth.json").exists())
         EnrolledPeerRegistry(context).use { it.revoke(replica) }
         assertFalse(state.stillApproved(published))
         assertNull(state.selected())

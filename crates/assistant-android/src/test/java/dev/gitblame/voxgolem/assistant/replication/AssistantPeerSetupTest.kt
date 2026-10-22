@@ -45,8 +45,6 @@ class AssistantPeerSetupTest {
         EnrolledPeerRegistry(pair.leftContext).use { assertEquals(setOf(b), it.replicas()) }
         EnrolledPeerRegistry(pair.rightContext).use { assertEquals(setOf(a), it.replicas()) }
         assertTrue(pair.mailbox.events.all { it.uri.path == ReplicationWire.IDENTITY_PATH })
-        assertFalse(File(pair.leftContext.noBackupFilesDir, "assistant-auth.json").exists())
-        assertFalse(File(pair.rightContext.noBackupFilesDir, "assistant-auth.json").exists())
     }
 
     @Test fun reconnectAndReopenPreserveAssociationButNeverUseSavedNodeRoutes() = worker {
@@ -100,9 +98,8 @@ class AssistantPeerSetupTest {
     @Test fun historyEpochResetsOnlySessionsAndPreservesCurrentTrustedBindingsAndProviderFiles() = worker {
         for (oldVersion in 1..3) {
             val context = isolated("synthetic-migration-$oldVersion")
-            val auth = File(context.noBackupFilesDir, "assistant-auth.json").apply { writeText("Synthetic externally owned metadata and access") }
-            val legacy = File(context.filesDir, "codex-auth.json").apply { writeText("Synthetic externally owned legacy access") }
-            val authBefore = auth.readBytes(); val legacyBefore = legacy.readBytes()
+            val auth = ChatGptAuth.managedFile(context).apply { writeText("Synthetic managed credential bytes") }
+            val authBefore = auth.readBytes()
             AssistantStore(context).use { history ->
                 history.createConversation("Synthetic retained migration history")
                 val historyBefore = history.snapshot().toString()
@@ -142,7 +139,6 @@ class AssistantPeerSetupTest {
                 assertEquals(publicationsBefore, history.publications(b, 128).toString())
             }
             assertArrayEquals(authBefore, auth.readBytes())
-            assertArrayEquals(legacyBefore, legacy.readBytes())
         }
     }
 
@@ -205,7 +201,6 @@ class AssistantPeerSetupTest {
         val pair = PairFixture(); pair.link()
         val phoneFile = ChatGptAuth.managedFile(pair.leftContext).apply { writeText("{}") }
         val watchFile = ChatGptAuth.managedFile(pair.rightContext)
-        val imported = File(pair.rightContext.noBackupFilesDir, "assistant-auth.json").apply { writeText("Synthetic imported credentials preserved") }
         var exported = JSONObject().put("voxgolemChatgpt", 1).put("openai", JSONObject().put("type", "oauth")
             .put("access", "synthetic-access-only").put("expires", System.currentTimeMillis() + 3_600_000)).toString()
         val requests = mutableListOf<ByteArray>()
@@ -252,7 +247,6 @@ class AssistantPeerSetupTest {
         try { watch.receive("synthetic-left-node", "state", first); fail("Expected stale response rejection") }
         catch (_: IllegalArgumentException) {}
         assertArrayEquals(signedOut, watchFile.readBytes())
-        assertEquals("Synthetic imported credentials preserved", imported.readText())
         assertTrue(JSONObject(phoneFile.readText()).getBoolean("signedOut"))
     }
 
