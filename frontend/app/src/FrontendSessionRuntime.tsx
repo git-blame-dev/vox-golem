@@ -192,7 +192,6 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   const [, setAssistantSettingsLoadError] = session.fieldState('assistantSettingsLoadError')
   const [, setAssistantSettingsWriteError] = session.fieldState('assistantSettingsWriteError')
   const [, setUiThemeWriteError] = session.fieldState('uiThemeWriteError')
-  const [customRetryPending, setCustomRetryPending] = session.fieldState('customRetryPending')
   const [assistantSettings, setAssistantSettings] = session.fieldState('assistantSettings')
   const [, setSnapshotModelOptions] = session.fieldState('snapshotModelOptions')
   const snapshotModelOptionsRef = session.fieldRef('snapshotModelOptions')
@@ -2793,23 +2792,6 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     } finally { setHeadPagePending(false) }
   }
 
-  const retryCustom = async (): Promise<void> => {
-    if (customRetryPending) return
-    setCustomRetryPending(true)
-    try {
-      await invokeTauriCommand('retry_custom_provider')
-      applyStartupState(await loadStartupState(), false)
-    } catch (error) {
-      addNotice({ tone: 'error', title: 'Custom retry failed', message: toDisplayErrorMessage(error) })
-      try {
-        const latest = await loadStartupState()
-        if (latest.kind === 'ready') applyStartupState(latest, false)
-      } catch { /* Retain the persistent capability reason until the next startup poll. */ }
-    } finally {
-      setCustomRetryPending(false)
-    }
-  }
-
   const changeComposer = (event: ChangeEvent<HTMLTextAreaElement>): void => {
     const nextValue = event.target.value
     composerEditRevisionRef.current += 1
@@ -2859,7 +2841,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       else applyStartupState(await loadStartupState(), false)
     },
     beginCurrentVoiceDraft, onAndroidVoiceActivity, onAndroidSpeechStatus, onAndroidVoiceInputCancelled,
-    changeInstant, resetSession, retryCustom, cancelPrompt,
+    changeInstant, resetSession, cancelPrompt,
     changeUiTheme, adjustUiTextSize, toggleTts, toggleMic, changeAudioInputDevice,
     setAutoStopOnSilence: changeAutoStopOnSilence, setVoiceNotesOpen, setNoticeInteraction,
     loadMoreAndroidConversations, loadMoreAndroidHeads, selectAndroidConversation,

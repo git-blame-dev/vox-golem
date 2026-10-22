@@ -24,10 +24,10 @@ export const SessionSettings = memo(function SessionSettings({ session, view }: 
     supportsDesktopRuntime, selectedAudioInputDevice, audioInputDeviceId, micStarting, updateRuntimeBlocked, audioInputDevices,
     autoStopOnSilence, startupState, voiceInputUnavailableReason, ttsEnabled, canToggleTts, androidVoiceStatus,
     androidSpeechStatusError, assistantSettings, instantControlsDisabled, instantAssistantOptions, assistantCapabilities,
-    selectedInstantRetryable, selectedInstantOption, appUpdates, updateInstallationDisabled, customFailure, customRetryPending } = usePresentation(session, view, 'settings')
+    selectedInstantRetryable, selectedInstantOption, appUpdates, updateInstallationDisabled, customFailure } = usePresentation(session, view, 'settings')
   const { settingsOpen, settingsPanelRef, settingsCloseButtonRef, closeSettings, onSettingsKeyDown } = view.navigation
   const { changeUiTheme, adjustUiTextSize, changeAudioInputDevice, setAutoStopOnSilence, toggleTts, patchAssistantSettings,
-    changeInstant, clearCompletion, retryCustom, refreshChatGptAuth } = view.actions
+    changeInstant, clearCompletion, refreshChatGptAuth } = view.actions
   return settingsOpen ? (
         <div
           className="settings-overlay"
@@ -104,7 +104,6 @@ export const SessionSettings = memo(function SessionSettings({ session, view }: 
               <label className="settings-panel__interactive"><strong>Model</strong><InstantModelSelect id="assistantInstantSelect" label="Model" value={assistantSettings.instant} options={instantAssistantOptions} disabled={instantControlsDisabled} canRetry={(value) => localInstantCanRetry(startupState, value)} onChange={(value) => void changeInstant(value)} /></label>
               {startupState.kind === 'ready' && !assistantCapabilities.custom ? <div>
                 <p className="settings-panel__hint">Custom connection: {customFailure?.reason ?? 'unavailable'}</p>
-                {customFailure && supportsDesktopRuntime ? <button type="button" className="shell__control" aria-label="Retry Custom" disabled={customRetryPending || updateRuntimeBlocked} onClick={() => void retryCustom()}>{customRetryPending ? 'Retrying…' : 'Retry Custom'}</button> : null}
               </div> : null}
               {selectedInstantRetryable && selectedInstantOption ? <button className="settings-panel__interactive" type="button" aria-label="Retry local profile" disabled={instantControlsDisabled} onClick={() => void changeInstant(assistantSettings.instant)}>Retry local profile</button> : null}
               {!isAndroidRuntime ? <details className="settings-panel__advanced">

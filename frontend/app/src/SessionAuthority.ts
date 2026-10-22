@@ -78,7 +78,6 @@ export interface ConversationInteraction {
   readonly micStarting: boolean
   readonly micActive: boolean
   readonly voiceNotesOpen: boolean
-  readonly customRetryPending: boolean
   readonly notices: readonly UserNotice[]
   readonly noticeInteraction: { readonly focused: boolean; readonly hovered: boolean }
   readonly messages: readonly ChatMessage[]
@@ -108,7 +107,7 @@ const VIEW_KEYS = {
     'audioInputDeviceId', 'audioInputDevices', 'shortcutStaging', 'androidAssistant',
     'androidConversationId', 'conversationPagePending', 'headPagePending', 'androidVoiceActive',
     'androidVoiceStatus', 'androidSpeechStatusError', 'ttsPlaying', 'pendingTtsCommands',
-    'isSwitchingResponseProfile', 'micStarting', 'micActive', 'voiceNotesOpen', 'customRetryPending',
+    'isSwitchingResponseProfile', 'micStarting', 'micActive', 'voiceNotesOpen',
     'notices', 'noticeInteraction', 'promptActivity', 'promptState', 'resetPending'],
   toolbar: ['startupState', 'runtimeStatus', 'assistantSettings', 'assistantSettingsPending',
     'snapshotHydrationState', 'snapshotControlsFresh', 'snapshotControlsInvalidated', 'snapshotModelOptions',
@@ -120,12 +119,12 @@ const VIEW_KEYS = {
     'composerValue', 'partialTranscript', 'typedCompletionSuffix', 'voiceCompletionSuffix',
     'androidAssistant', 'androidVoiceActive', 'conversationPagePending', 'headPagePending', 'voiceNotesOpen',
     'promptState', 'promptActivity', 'resetPending', 'micStarting', 'micActive', 'shortcutStaging',
-    'uiTextSize', 'wakeConfidence', 'isSwitchingResponseProfile', 'snapshotControlsInvalidated', 'customRetryPending'],
+    'uiTextSize', 'wakeConfidence', 'isSwitchingResponseProfile', 'snapshotControlsInvalidated'],
   settings: ['startupState', 'runtimeStatus', 'assistantSettings', 'assistantSettingsPending',
     'assistantSettingsLoadError', 'assistantSettingsWriteError', 'uiThemeWriteError', 'snapshotControlsFresh', 'snapshotModelOptions',
     'uiTextSize', 'uiTheme', 'ttsEnabled', 'autoStopOnSilence', 'audioInputDevices', 'audioInputDeviceId',
     'androidVoiceStatus', 'androidSpeechStatusError', 'androidVoiceActive', 'promptState', 'resetPending',
-    'isSwitchingResponseProfile', 'micStarting', 'ttsPlaying', 'pendingTtsCommands', 'androidAssistant', 'customRetryPending'],
+    'isSwitchingResponseProfile', 'micStarting', 'ttsPlaying', 'pendingTtsCommands', 'androidAssistant'],
 } as const satisfies Record<string, readonly (keyof ControlsSnapshot)[]>
 type ViewName = keyof typeof VIEW_KEYS
 type ViewSnapshot<N extends ViewName> = Pick<ControlsSnapshot, (typeof VIEW_KEYS)[N][number]>
@@ -180,7 +179,7 @@ export class SessionAuthority {
         androidVoiceStatus: null, androidSpeechStatusError: null, partialTranscript: '',
         typedCompletionSuffix: '', voiceCompletionSuffix: '', ttsPlaying: false, pendingTtsCommands: 0,
         wakeConfidence: null, isSwitchingResponseProfile: false, micStarting: false, micActive: false,
-        voiceNotesOpen: false, customRetryPending: false, notices: [],
+        voiceNotesOpen: false, notices: [],
         noticeInteraction: { focused: false, hovered: false }, messages: getInitialMessages(),
         responseAnnouncement: '', promptActivity: null, promptState: 'idle', resetPending: false,
       },

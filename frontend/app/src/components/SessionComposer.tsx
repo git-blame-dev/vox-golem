@@ -13,9 +13,9 @@ export const SessionComposer = memo(function SessionComposer({ session, view }: 
     typedCompletionSuffix, voiceCompletionSuffix, canSend, startupState, assistantSettingsLoadError, selectedInstantOption,
     selectedInstantProfileReady, canToggleMic, micStarting, micActive, assistantSettings, instantAssistantOptions,
     instantControlsDisabled, runtimeStatus, updateRuntimeBlocked,
-    promptActivity, wakeConfidence, customFailure, supportsDesktopRuntime, customRetryPending } = usePresentation(session, view, 'composer')
+    promptActivity, wakeConfidence } = usePresentation(session, view, 'composer')
   const { onSubmit, loadMoreAndroidConversations, loadMoreAndroidHeads, selectAndroidConversation, changeComposer,
-    onComposerKeyDown, acceptTypedCompletion, clearCompletion, toggleMic, changeInstant, cancelPrompt, retryCustom } = view.actions
+    onComposerKeyDown, acceptTypedCompletion, clearCompletion, toggleMic, changeInstant, cancelPrompt } = view.actions
   const canStop = (promptState === 'executing' || promptState === 'stopping') && startupState.kind === 'ready' && startupState.promptCancellationAvailable
   const busy = promptState !== 'idle' || runtimeStatus === 'processing' || runtimeStatus === 'executing'
   const actionLabel = canStop ? promptState === 'stopping' ? 'Stopping…' : 'Stop' : busy ? 'Working…' : 'Send'
@@ -82,7 +82,6 @@ export const SessionComposer = memo(function SessionComposer({ session, view }: 
             Sending disabled: {unavailableReason}
           </p>
         ) : null}
-        {selectedUnavailable && assistantSettings.instant.startsWith('custom-') && customFailure && supportsDesktopRuntime ? <button type="button" className="shell__control" aria-label="Retry Custom" disabled={customRetryPending || updateRuntimeBlocked} onClick={() => void retryCustom()}>{customRetryPending ? 'Retrying…' : 'Retry Custom'}</button> : null}
         {startupState.kind === 'warming_model' ? (
           <p className="shell__loading">Model loading: {startupState.message}</p>
         ) : null}

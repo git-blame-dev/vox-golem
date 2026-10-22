@@ -699,7 +699,7 @@ describe('App', () => {
     expect(availability?.textContent).toContain('Sending disabled: Detailed provider authentication failure')
     expect(container.querySelectorAll('.composer__availability')).toHaveLength(1)
     expect(Array.from(container.querySelectorAll('p')).filter((paragraph) => paragraph.textContent?.includes('Detailed provider authentication failure'))).toHaveLength(1)
-    expect(availability?.querySelector('[aria-label="Retry Custom"]')).not.toBeNull()
+    expect(availability?.querySelector('[aria-label="Retry Custom"]')).toBeNull()
     expect(getSendButton(container).disabled).toBe(true)
     await act(async () => {
       getButtonByLabel(container, 'Settings').click()
@@ -3661,31 +3661,22 @@ describe('App', () => {
     expect(select.querySelector<HTMLOptionElement>('option[value="custom-luna-none"]')?.disabled).toBe(true)
   })
 
-  it('keeps unused Custom failure in Settings, not global chat, and enables direct choices after an explicit retry', async () => {
-    let recovered = false
-    const calls: string[] = []
-    const state = () => readyStartupState({ capabilities: completeCapabilities(recovered ? {} : { custom_provider: 'unavailable' })
-      .map((capability) => capability['id'] === 'custom_provider' && !recovered
-        ? { ...capability, reason: 'failed to resolve WSL OpenCode auth: WSL command timed out' }
-        : capability) })
+  it('keeps unused Custom failure in Settings, not global chat', async () => {
+    const reason = 'Sign in with ChatGPT to restore access'
+    const state = () => readyStartupState({ capabilities: completeCapabilities({ custom_provider: 'unavailable' })
+      .map((capability) => capability['id'] === 'custom_provider' ? { ...capability, reason } : capability) })
     window.__TAURI_INTERNALS__ = { invoke: async (command) => {
-      calls.push(command)
       if (command === 'get_startup_state') return state()
       if (command === 'get_assistant_settings') return defaultAssistantSettings()
-      if (command === 'retry_custom_provider') { recovered = true; return state() }
       throw new Error(`unexpected command: ${command}`)
     } }
     const { container } = await renderApp()
-    expect(container.textContent).not.toContain('Custom connection: failed to resolve WSL OpenCode auth: WSL command timed out')
-    expect(container.querySelector('[aria-label="Retry Custom"]')).toBeNull()
+    expect(container.textContent).not.toContain(`Custom connection: ${reason}`)
     await act(async () => { getButtonByLabel(container, 'Settings').click(); await Promise.resolve() })
-    expect(container.querySelector('[role="dialog"]')?.textContent).toContain('Custom connection: failed to resolve WSL OpenCode auth: WSL command timed out')
+    expect(container.querySelector('[role="dialog"]')?.textContent).toContain(`Custom connection: ${reason}`)
+    expect(container.querySelector('[aria-label="Retry Custom"]')).toBeNull()
     const select = container.querySelector<HTMLSelectElement>('select[aria-label="Model"]')!
     expect(select.querySelector<HTMLOptionElement>('option[value="custom-luna-none"]')?.disabled).toBe(true)
-    await act(async () => { getButtonByLabel(container, 'Retry Custom').click(); await Promise.resolve() })
-    expect(calls).toContain('retry_custom_provider')
-    expect(select.querySelector<HTMLOptionElement>('option[value="custom-luna-none"]')?.disabled).toBe(false)
-    expect(container.textContent).not.toContain('failed to resolve WSL OpenCode auth')
   })
 
   it('shows preloaded and updated Instant choice to the right of the mic without claiming Deep or Review', async () => {
