@@ -239,23 +239,34 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    /// Tauri denies a WebView invoke unless the command is declared in `build.rs` and
+    /// granted by the main capability, so a newly registered command cannot be left out.
     #[test]
-    fn webview_commands_are_declared_and_granted() {
+    fn every_registered_command_is_declared_and_granted() {
         let capability: serde_json::Value =
             serde_json::from_str(include_str!("../capabilities/main.json"))
                 .expect("main capability should be valid JSON");
         let granted = capability["permissions"].as_array().expect("permissions");
         let build = include_str!("../build.rs");
-        for (command, permission) in [
-            ("chatgpt_auth", "allow-chatgpt-auth"),
-            ("open_chatgpt_sign_in", "allow-open-chatgpt-sign-in"),
-        ] {
+        let source = include_str!("lib.rs");
+        let handler = &source[source
+            .find("tauri::generate_handler![")
+            .expect("handler list")
+            + "tauri::generate_handler![".len()..];
+        let commands: Vec<&str> = handler[..handler.find(']').expect("handler end")]
+            .split(',')
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+            .collect();
+        assert!(commands.len() > 10, "handler list was not parsed");
+        for command in commands {
             assert!(
                 build.contains(&format!("\"{command}\"")),
                 "{command} missing from the app manifest"
             );
+            let permission = format!("allow-{}", command.replace('_', "-"));
             assert!(
-                granted.iter().any(|value| value == permission),
+                granted.iter().any(|value| *value == permission.as_str()),
                 "{permission} missing from the main capability"
             );
         }
