@@ -18,10 +18,8 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import androidx.wear.compose.foundation.CurvedAlignment
 import androidx.wear.compose.foundation.CurvedModifier
 import androidx.wear.compose.foundation.clearAndSetSemantics
-import androidx.wear.compose.foundation.curvedColumn
 import androidx.wear.compose.material3.MaterialTheme
 import androidx.wear.compose.material3.TimeSource
 import androidx.wear.compose.material3.TimeText
@@ -35,6 +33,13 @@ private object StaticHeaderTimeSource : TimeSource {
     @Composable override fun currentTime(): String = ""
 }
 
+/** Single-line header: compact family plus the full effort label after a middle dot; no mark when the model has no effort variant. */
+internal fun headerLabel(model: AssistantModelPresentation?): String {
+    val family = model?.compactFamilyLabel ?: "Model"
+    val effort = model?.takeIf { it.effort != "none" }?.effortLabel?.takeIf { it.isNotEmpty() }
+    return if (effort == null) family else "$family \u00B7 $effort"
+}
+
 @Composable
 internal fun AssistantModelHeader(
     model: AssistantModelPresentation?,
@@ -43,16 +48,14 @@ internal fun AssistantModelHeader(
     onExclusionHeight: (Dp) -> Unit,
 ) {
     val outerStyle = MaterialTheme.typography.arcSmall
-    val innerStyle = outerStyle.copy(fontSize = outerStyle.fontSize * 0.85f,
-        lineHeight = outerStyle.lineHeight * 0.85f)
     val foreground = MaterialTheme.colorScheme.onBackground
     val background = MaterialTheme.colorScheme.background.copy(alpha = 1f)
     val padding = TimeTextDefaults.ContentPadding
     val density = LocalDensity.current
     // CurvedLayoutInfo is internal in Wear 1.7.1; there is no public curved
-    // positioning callback. Use the native fixed line-height tokens and sweep
-    // to bound both rows, including the rounded arc caps, at the current font scale.
-    val thickness = with(density) { outerStyle.lineHeight.toDp() + innerStyle.lineHeight.toDp() }
+    // positioning callback. Use the native fixed line-height token and sweep
+    // to bound the single row, including the rounded arc caps, at the current font scale.
+    val thickness = with(density) { outerStyle.lineHeight.toDp() }
     BoxWithConstraints(Modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
         val radius = minOf(maxWidth, maxHeight) / 2
         val halfSweep = Math.toRadians(TimeTextDefaults.MaxSweepAngle.toDouble() / 2)
@@ -67,22 +70,13 @@ internal fun AssistantModelHeader(
             backgroundColor = background,
             contentPadding = padding,
         ) { _ ->
-            curvedColumn(angularAlignment = CurvedAlignment.Angular.Center) {
-                curvedText(
-                    model?.compactFamilyLabel ?: "Model",
-                    modifier = CurvedModifier.clearAndSetSemantics {},
-                    style = outerStyle,
-                    color = foreground,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                curvedText(
-                    model?.effortLabel ?: "—",
-                    modifier = CurvedModifier.clearAndSetSemantics {},
-                    style = innerStyle,
-                    color = foreground,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
+            curvedText(
+                headerLabel(model),
+                modifier = CurvedModifier.clearAndSetSemantics {},
+                style = outerStyle,
+                color = foreground,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
         // Only this bounded band handles input; the full-diameter native drawing
         // must not become a clickable overlay over conversation content.
