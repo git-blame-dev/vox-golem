@@ -154,8 +154,6 @@ async fn chatgpt_auth<R: Runtime>(
 ) -> Result<Value, StructuredPluginInvokeError> {
     tauri_plugin_assistant::forward(app, "chatgpt_auth", json!({"action": action})).await
 }
-native_command!(new_voice_shortcut_status);
-native_command!(pin_new_voice_shortcut);
 native_command!(consume_new_voice_shortcut);
 native_command!(stop_send_new_voice_shortcut);
 
@@ -226,8 +224,6 @@ pub fn run() {
             assistant_pairing_status,
             chatgpt_auth,
             open_chatgpt_sign_in,
-            new_voice_shortcut_status,
-            pin_new_voice_shortcut,
             consume_new_voice_shortcut,
             stop_send_new_voice_shortcut,
             release_new_voice_shortcut,

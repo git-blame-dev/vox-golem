@@ -18,11 +18,11 @@ describe('Android command boundary', () => {
 })
 
 describe('native shortcut adapter contract', () => {
-  it('forwards precisely the six shortcut commands with camelCase payloads and no global listener', async () => {
+  it('forwards precisely the four shortcut commands with camelCase payloads and no global listener', async () => {
     const native = vi.fn(async () => null)
     const listen = vi.fn()
     window.__TAURI_INTERNALS__ = withoutAndroidEventListener({ invoke: native, listen }, true)
-    expect(NEW_VOICE_SHORTCUT_COMMANDS).toHaveLength(6)
+    expect(NEW_VOICE_SHORTCUT_COMMANDS).toHaveLength(4)
     const androidSource = source('apps/android-tauri/src-tauri/src/lib.rs')
     const pluginSource = source('crates/assistant-plugin/android/src/main/java/dev/gitblame/voxgolem/assistant/phone/AssistantPlugin.kt')
     for (const name of NEW_VOICE_SHORTCUT_COMMANDS) {
@@ -33,7 +33,7 @@ describe('native shortcut adapter contract', () => {
       expect(native).toHaveBeenLastCalledWith(name, payload)
     }
     await expect(invokeAndroidCommand('unknown_shortcut_command')).rejects.toMatchObject({ code: 'unavailable' })
-    expect(native).toHaveBeenCalledTimes(6)
+    expect(native).toHaveBeenCalledTimes(4)
     expect(listen).not.toHaveBeenCalled()
   })
 

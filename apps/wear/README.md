@@ -301,8 +301,7 @@ Linux tests/builds alone do not establish ARM32 ART/JNI execution, installed spe
 support, gesture accuracy, foreground interruption or offline/reconnect sync.
 
 The phone's [voice chat shortcut](../../crates/assistant-plugin/README.md#new-voice-chat-shortcut-implemented-source)
-is implemented in source and requests launcher confirmation, but is not physically
-accepted. It is not a Wear shortcut or a bundled watch recognizer. The distinct
+is implemented in source but is not physically accepted. It is not a Wear shortcut or a bundled watch recognizer. The distinct
 watch-to-phone supplied-audio Assistant lane has production runtime constructors;
 its provider/device calibration gate still defaults false, so constructor availability
 does not establish an activated UI feature. Future bundled watch-local ASR remains

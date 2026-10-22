@@ -107,7 +107,7 @@ def phone_shortcut_layer(source):
 
 
 def render_entries(source, work, destination, purposes):
-    # Render each purpose once; the legacy pinned shortcut aliases Ask's bytes.
+    # Render each purpose once.
     layers = {purpose: entry_layer(source, purpose) for purpose in purposes}
     outputs = {}
     for purpose, layer in layers.items():
@@ -176,7 +176,7 @@ def main():
         "--phone-shortcut-res-output",
         type=Path,
         metavar="PATH",
-        help="Generate phone Chat/Ask/Talk entry icons and legacy Ask shortcut into PATH",
+        help="Generate phone Chat/Ask/Talk entry icons into PATH",
     )
     arguments = parser.parse_args()
     version = subprocess.check_output(
@@ -201,12 +201,10 @@ def main():
         work = Path(temporary)
         if arguments.phone_shortcut_res_output is not None:
             try:
-                outputs = render_entries(source, work, arguments.phone_shortcut_res_output, ("chat", "ask", "talk"))
+                render_entries(source, work, arguments.phone_shortcut_res_output, ("chat", "ask", "talk"))
             except ValueError as error:
                 parser.error(str(error))
-            output = arguments.phone_shortcut_res_output / "drawable-nodpi/voxgolem_new_voice_shortcut.png"
-            shutil.copyfile(outputs["ask"], output)
-            print(f"Generated phone shortcut resource {output} from icons/icon.svg")
+            print(f"Generated phone entry resources in {arguments.phone_shortcut_res_output} from icons/icon.svg")
             return
         foreground = work / "foreground.svg"
         monochrome = work / "monochrome.svg"

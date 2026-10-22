@@ -150,13 +150,9 @@ still require device validation.
 
 ### New voice chat shortcut: implemented source
 
-Settings mounts [NewVoiceShortcutSettings](../../frontend/app/src/components/NewVoiceShortcutSettings.tsx)
-with **Add Ask to Home screen**. On API26+ and a supporting launcher,
+The app offers no home-screen pinning or widgets. On load,
 [NewVoiceShortcutLauncher](android/src/main/java/dev/gitblame/voxgolem/assistant/phone/NewVoiceShortcutLauncher.kt)
-requests a pin with generated artwork. The launcher asks for confirmation; accepted
-request is not confirmed pinning, and installing the APK does not automatically pin it.
-
-A fresh legacy shortcut dispatch selects Ask; the phone launcher also exposes
+disables any Ask shortcut pinned by an earlier build; the phone launcher exposes
 Chat/Ask/Talk. Voice alias identity selects Ask or Talk without resetting the
 conversation or draft, accepting no incoming prompt or mode extras. These exported
 entries issue a one-time process-local launch token without caller confirmation:
@@ -175,8 +171,7 @@ support leaves typing available; busy/permission failure does not cancel unrelat
 work. Unavailable provider access retains input for deliberate retry, never automatic
 replay.
 
-Source availability does not establish physical acceptance of launcher pinning,
-provider callbacks or the complete flow. Deployment needs matching source/build
+Source availability does not establish physical acceptance of provider callbacks or the complete flow. Deployment needs matching source/build
 identity and APK SHA-256, not an older installed/archived APK's package name.
 Bundled watch-local transcription remains future backlog, not supplied here.
 

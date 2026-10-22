@@ -1,18 +1,14 @@
 import { describe, expect, it } from 'vitest'
-import { isConfirmedNewVoiceContext, parseNewVoicePinStatus, parsePendingNewVoiceAction } from './newVoiceShortcut'
+import { isConfirmedNewVoiceContext, parsePendingNewVoiceAction } from './newVoiceShortcut'
 import type { AppSnapshot } from './appSnapshot'
 
 describe('one-time native voice shortcut boundary', () => {
-  it('does not call a requested pin confirmed before launcher completion', () => {
-    expect(parseNewVoicePinStatus({ supported: true, pinned: false, requested: true }).pinned).toBe(false)
-    expect(parseNewVoicePinStatus({ supported: true, pinned: true, requested: false }).pinned).toBe(true)
-  })
   it('accepts only bounded native action identities and no incoming prompt payload', () => {
     expect(parsePendingNewVoiceAction({ token: '11111111-1111-4111-8111-111111111111', error: null, prompt: 'Ignored synthetic foreign prompt' })).toEqual({ token: '11111111-1111-4111-8111-111111111111', error: null, mode: 'ask' })
     for (const token of ['synthetic-prompt', '', '11111111-1111-4111-8111-111111111111/prompt']) expect(() => parsePendingNewVoiceAction({ token, error: null })).toThrow()
     expect(() => parsePendingNewVoiceAction({ token: null, error: 'é'.repeat(257) })).toThrow()
   })
-  it('delivers only Ask or Talk policies, defaulting legacy pinned shortcuts to Ask', () => {
+  it('delivers only Ask or Talk policies, defaulting an absent mode to Ask', () => {
     const token = '22222222-2222-4222-8222-222222222222'
     expect(parsePendingNewVoiceAction({ token, error: null, mode: 'talk' })).toEqual({ token, error: null, mode: 'talk' })
     expect(parsePendingNewVoiceAction({ token, error: null, mode: 'ask' }).mode).toBe('ask')

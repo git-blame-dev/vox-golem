@@ -23,8 +23,6 @@
     "allow-assistant-pairing-status",
     "allow-chatgpt-auth",
     "allow-open-chatgpt-sign-in",
-    "allow-new-voice-shortcut-status",
-    "allow-pin-new-voice-shortcut",
     "allow-consume-new-voice-shortcut",
     "allow-stop-send-new-voice-shortcut",
     "allow-release-new-voice-shortcut",

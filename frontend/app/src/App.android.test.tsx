@@ -1424,7 +1424,7 @@ describe('Android App lifecycle', () => {
     expect(container.textContent).toContain('Voice input')
     expect(container.textContent).toContain('Speech output')
     expect(container.querySelector('header button[aria-label="Voice notes"]')).not.toBeNull()
-    expect(container.textContent).toContain('Add Ask to Home screen')
+    expect(container.textContent).not.toContain('Add Ask to Home screen')
     expect(container.querySelector('[aria-label="Android access credentials"]')).toBeNull()
     expect(container.textContent).not.toMatch(/access credential|credential sharing|installation id|replica id|association id|automatic watch sharing/i)
     await act(async () => { await vi.advanceTimersByTimeAsync(5000) })

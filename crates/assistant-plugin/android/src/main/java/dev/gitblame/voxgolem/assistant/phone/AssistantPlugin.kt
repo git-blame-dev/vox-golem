@@ -97,6 +97,7 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
         val startupTiming = (activity as? PhoneStartupTimingOwner)?.startupTiming?.trace
         startupTiming?.mark(Stage.PLUGIN_LOAD_STARTED)
         AssistantRuntime.configureCaptureResourceAdmission(true)
+        NewVoiceShortcutLauncher.retirePinnedShortcut(activity)
         AssistantRuntime.get(activity, startupTiming, preparePhoneContext = true)
         webViewReference = WeakReference(webView)
         (activity as? LifecycleOwner)?.lifecycle?.addObserver(object : DefaultLifecycleObserver {
@@ -226,11 +227,6 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
         val opened = dev.gitblame.voxgolem.assistant.speech.SpeechServiceRequirement.openPlayStore(activity)
         if (opened) invoke.resolve()
         else reject(invoke, "unavailable", "Unable to open Play Store or browser")
-    }
-    @Command fun new_voice_shortcut_status(invoke: Invoke) { invoke.resolve(JSObject(NewVoiceShortcutLauncher.status(activity).toString())) }
-    @Command fun pin_new_voice_shortcut(invoke: Invoke) {
-        if (!visible.get()) { reject(invoke, "unavailable", "Pinning a shortcut requires the visible app"); return }
-        try { invoke.resolve(JSObject(NewVoiceShortcutLauncher.pin(activity).toString())) } catch (error: RuntimeException) { reply(invoke, Result.failure(error)) }
     }
     @Command fun consume_new_voice_shortcut(invoke: Invoke) {
         if (!visible.get()) { reportVoiceEntryStage(activity, Stage.ENTRY_FOREGROUND_REJECTED); invoke.resolve(JSObject().put("token", JSONObject.NULL).put("error", JSONObject.NULL)); return }

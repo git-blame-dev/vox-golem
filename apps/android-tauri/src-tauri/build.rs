@@ -20,8 +20,6 @@ fn main() {
             "assistant_pairing_status",
             "chatgpt_auth",
             "open_chatgpt_sign_in",
-            "new_voice_shortcut_status",
-            "pin_new_voice_shortcut",
             "consume_new_voice_shortcut",
             "stop_send_new_voice_shortcut",
             "release_new_voice_shortcut",

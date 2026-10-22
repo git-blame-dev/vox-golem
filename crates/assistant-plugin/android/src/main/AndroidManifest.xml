@@ -5,6 +5,5 @@
             android:label="Ask"
             android:exported="true" android:noHistory="true" android:excludeFromRecents="true"
             android:theme="@android:style/Theme.NoDisplay" />
-        <receiver android:name="dev.gitblame.voxgolem.assistant.phone.NewVoiceShortcutPinnedReceiver" android:exported="false" />
     </application>
 </manifest>

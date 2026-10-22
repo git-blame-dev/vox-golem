@@ -13,7 +13,6 @@ import {
 import type { SessionViewProps } from '../sessionPolicy'
 import { ChatGptAuth } from './ChatGptAuth'
 import { InstantModelSelect } from './InstantModelSelect'
-import { NewVoiceShortcutSettings } from './NewVoiceShortcutSettings'
 import { SpeechSettings } from './SpeechSettings'
 import { UpdateSettings } from './UpdateSettings'
 import { WakeClipSettings } from './WakeClipSettings'
@@ -181,7 +180,6 @@ export const SessionSettings = memo(function SessionSettings({ session, view }: 
               <p className="settings-panel__hint">{assistantSettings.webEnabled ? 'Native search may send question-derived queries and public-page requests to external providers: Exa is primary, with Parallel as fallback when needed. Delegated OpenCode routes may use their own search providers.' : 'Web is off: no web lookup or search fallback. Normal chat still uses the selected chat provider; answers are not web-verified.'}</p>
               <p className="settings-panel__hint">The selected model decides whether to use available web tools. Models without tool support can still chat but cannot browse automatically. Search activity appears in the response status when reported.</p>
             </section>
-            {isAndroidRuntime ? <NewVoiceShortcutSettings /> : null}
             <UpdateSettings updates={appUpdates} installationDisabled={updateInstallationDisabled} />
             {!isAndroidRuntime && !isBrowserPreviewRuntime() ? <>
               <WakeDiagnostics disabled={!voiceInputReady(startupState) || updateRuntimeBlocked} />

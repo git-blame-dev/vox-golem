@@ -253,7 +253,6 @@ class IconGenerationTests(unittest.TestCase):
 
         self.invoke(["--phone-shortcut-res-output", str(destination)], render_shortcut)
         self.assertEqual(file_bytes(destination), {
-            "drawable-nodpi/voxgolem_new_voice_shortcut.png": b"synthetic-shortcut-png",
             **{f"drawable-nodpi/voxgolem_entry_{purpose}.png": b"synthetic-shortcut-png"
                for purpose in ("chat", "ask", "talk")},
         })
@@ -371,10 +370,7 @@ class IconGenerationTests(unittest.TestCase):
         destination = self.root / "shortcut build/generated/res"
         self.invoke(["--phone-shortcut-res-output", str(destination)])
         files = file_bytes(destination)
-        self.assertEqual(set(files), {"drawable-nodpi/voxgolem_new_voice_shortcut.png"}
-                         | {f"drawable-nodpi/voxgolem_entry_{purpose}.png" for purpose in ("chat", "ask", "talk")})
-        self.assertEqual(files["drawable-nodpi/voxgolem_new_voice_shortcut.png"],
-                         files["drawable-nodpi/voxgolem_entry_ask.png"])
+        self.assertEqual(set(files), {f"drawable-nodpi/voxgolem_entry_{purpose}.png" for purpose in ("chat", "ask", "talk")})
         self.assertEqual(len({files[f"drawable-nodpi/voxgolem_entry_{purpose}.png"] for purpose in ("chat", "ask", "talk")}), 3)
         self.assertEqual({name: data for name, data in file_bytes(self.root).items()
                           if not name.startswith("shortcut build/")}, before)
@@ -388,10 +384,10 @@ class IconGenerationTests(unittest.TestCase):
             cwd=self.root, check=True, capture_output=True, text=True, timeout=120,
             env=dict(os.environ, TMPDIR=str(self.root)),
         )
-        self.assertIn("Generated phone shortcut resource", result.stdout)
+        self.assertIn("Generated phone entry resources", result.stdout)
         self.assertEqual(file_bytes(destination), files)
         self.assertEqual([file_bytes(directory) for directory in authored_directories], authored_before)
-        png = destination / "drawable-nodpi/voxgolem_new_voice_shortcut.png"
+        png = destination / "drawable-nodpi/voxgolem_entry_ask.png"
         width, height = struct.unpack(">II", png.read_bytes()[16:24])
         self.assertEqual((width, height), (512, 512))
         pixels = subprocess.check_output([
