@@ -18,6 +18,8 @@ fn main() {
             "finish_assistant_dictation",
             "stop_assistant_voice",
             "assistant_pairing_status",
+            "chatgpt_auth",
+            "open_chatgpt_sign_in",
             "new_voice_shortcut_status",
             "pin_new_voice_shortcut",
             "consume_new_voice_shortcut",

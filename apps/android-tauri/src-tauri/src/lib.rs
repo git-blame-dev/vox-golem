@@ -236,3 +236,28 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running Android shell");
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn webview_commands_are_declared_and_granted() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/main.json"))
+                .expect("main capability should be valid JSON");
+        let granted = capability["permissions"].as_array().expect("permissions");
+        let build = include_str!("../build.rs");
+        for (command, permission) in [
+            ("chatgpt_auth", "allow-chatgpt-auth"),
+            ("open_chatgpt_sign_in", "allow-open-chatgpt-sign-in"),
+        ] {
+            assert!(
+                build.contains(&format!("\"{command}\"")),
+                "{command} missing from the app manifest"
+            );
+            assert!(
+                granted.iter().any(|value| value == permission),
+                "{permission} missing from the main capability"
+            );
+        }
+    }
+}

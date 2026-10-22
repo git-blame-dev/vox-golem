@@ -21,6 +21,8 @@
     "allow-finish-assistant-dictation",
     "allow-stop-assistant-voice",
     "allow-assistant-pairing-status",
+    "allow-chatgpt-auth",
+    "allow-open-chatgpt-sign-in",
     "allow-new-voice-shortcut-status",
     "allow-pin-new-voice-shortcut",
     "allow-consume-new-voice-shortcut",
