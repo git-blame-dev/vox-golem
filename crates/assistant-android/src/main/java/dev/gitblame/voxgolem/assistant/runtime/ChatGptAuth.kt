@@ -181,7 +181,12 @@ object ChatGptAuth {
             safe.put("userCode", code).put("verificationUrl", VERIFICATION_URL)
         }
         // Native errors are deliberately not passed through: they are not a credential-safe API.
-        if (phase == "error") safe.put("error", "ChatGPT sign-in failed. Please try again.")
+        if (phase == "error") {
+            safe.put("error", "ChatGPT sign-in failed. Please try again.")
+            // Only the fixed categorical Rust messages are diagnosable; arbitrary text is never logged.
+            val cause = value.optString("error")
+            if (cause.matches(Regex("(Unknown )?ChatGPT [A-Za-z ,;-]{1,90}"))) Log.i("ChatGptAuth", "cause=$cause")
+        }
         return safe
     }
 
