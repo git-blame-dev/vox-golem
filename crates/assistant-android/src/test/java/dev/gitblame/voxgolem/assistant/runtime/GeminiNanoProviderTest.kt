@@ -105,6 +105,21 @@ class GeminiNanoProviderTest {
         assertEquals(capabilityNote + "Hello", GeminiNanoProvider.formatPrompt(JSONObject().put("prompt", "Hello")))
     }
 
+    @Test fun normalAppInstructionsCompactToExactlyPolicyAndCapabilityDisclosure() {
+        val instructions = "${AssistantEngine.BASE_INSTRUCTIONS}\n\n${AssistantEngine.PLAIN_TEXT_POLICY}"
+        val request = JSONObject().put("prompt", "Synthetic question.").put("instructions", instructions)
+        assertEquals(capabilityNote + "System Instructions:\n${AssistantEngine.PLAIN_TEXT_POLICY}\n\nSynthetic question.",
+            GeminiNanoProvider.formatPrompt(request))
+    }
+
+    @Test fun compactionPreservesCustomInstructionsAlongsideAppPolicy() {
+        val custom = "Preserve synthetic_id and return the requested JSON."
+        val instructions = "${AssistantEngine.BASE_INSTRUCTIONS}\n\n$custom\n\n${AssistantEngine.PLAIN_TEXT_POLICY}"
+        val request = JSONObject().put("prompt", "Synthetic question.").put("instructions", instructions)
+        assertEquals(capabilityNote + "System Instructions:\n$custom\n\n${AssistantEngine.PLAIN_TEXT_POLICY}\n\nSynthetic question.",
+            GeminiNanoProvider.formatPrompt(request))
+    }
+
     @Test fun boundedHistoryPreservesExactSuffixFallbackAndCharacterBudget() {
         val messages = JSONArray()
         repeat(100) { messages.put(JSONObject().put("role", "user").put("content", "Discarded $it")) }
