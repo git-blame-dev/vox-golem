@@ -40,6 +40,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
+thread_local! {
+    static READINESS_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub const SCHEMA_VERSION: u32 = 2;
 pub const MAX_BATCH_RECORDS: usize = 128;
 pub const MAX_PROMPT_BYTES: usize = 32 * 1024;
@@ -370,6 +375,81 @@ pub struct Store {
     quarantine: BTreeMap<OperationId, QuarantineReason>,
 }
 
+/// Borrowed, per-operation graph facts; never retained across a store mutation.
+struct Readiness<'a> {
+    store: &'a Store,
+    states: BTreeMap<&'a OperationId, ReadinessState<'a>>,
+}
+
+#[derive(Clone, Copy)]
+enum ReadinessState<'a> {
+    Visiting,
+    Done(Option<(&'a OperationId, usize)>),
+}
+
+impl<'a> Readiness<'a> {
+    fn new(store: &'a Store) -> Self {
+        Self {
+            store,
+            states: BTreeMap::new(),
+        }
+    }
+
+    fn ready(&mut self, id: &OperationId) -> bool {
+        let Some((head, _)) = self.store.records.get_key_value(id) else {
+            return false;
+        };
+        let mut current = head;
+        let mut chain = Vec::new();
+        let mut result = loop {
+            if let Some(state) = self.states.get(current) {
+                break match state {
+                    ReadinessState::Visiting => None,
+                    ReadinessState::Done(result) => *result,
+                };
+            }
+            #[cfg(test)]
+            READINESS_VISITS.with(|visits| visits.set(visits.get() + 1));
+            let record = &self.store.records[current];
+            let OperationBody::TurnCompleted {
+                conversation,
+                parent,
+                ..
+            } = &record.operation.body
+            else {
+                self.states.insert(current, ReadinessState::Done(None));
+                break None;
+            };
+            // Creation quarantine is deliberately not consulted: the original readiness
+            // predicate requires its retained type, not its disposition.
+            if self.store.quarantine.contains_key(current)
+                || !self.store.records.get(conversation).is_some_and(|r| {
+                    matches!(r.operation.body, OperationBody::ConversationCreated { .. })
+                })
+            {
+                self.states.insert(current, ReadinessState::Done(None));
+                break None;
+            }
+            self.states.insert(current, ReadinessState::Visiting);
+            chain.push((current, conversation));
+            let Some(parent) = parent else {
+                break Some((conversation, 0));
+            };
+            let Some((parent, _)) = self.store.records.get_key_value(parent) else {
+                break None;
+            };
+            current = parent;
+        };
+        for (node, owner) in chain.into_iter().rev() {
+            result = result.and_then(|(ancestor_owner, depth)| {
+                (owner == ancestor_owner && depth < MAX_ANCESTRY).then_some((owner, depth + 1))
+            });
+            self.states.insert(node, ReadinessState::Done(result));
+        }
+        matches!(self.states.get(head), Some(ReadinessState::Done(Some(_))))
+    }
+}
+
 impl Store {
     pub fn restore(snapshot: StoreSnapshot) -> Result<Self, DomainError> {
         if snapshot.version != SCHEMA_VERSION {
@@ -504,6 +584,7 @@ impl Store {
     }
 
     fn conversation_views(&self) -> (Vec<ConversationView>, Vec<OperationId>) {
+        let mut readiness = Readiness::new(self);
         let deleted = self.deleted();
         let mut conversations = BTreeMap::new();
         for record in self.records.values() {
@@ -541,7 +622,7 @@ impl Store {
                 let view = conversations
                     .get_mut(conversation)
                     .expect("inserted conversation");
-                if self.ready(&record.operation.id) {
+                if readiness.ready(&record.operation.id) {
                     view.heads.push(record.operation.id.clone());
                     if let Some(parent) = parent {
                         children.insert(parent.clone());
@@ -929,6 +1010,8 @@ impl Store {
         let mut current = Some(head.clone());
         let mut conversation = None;
         while let Some(id) = current {
+            #[cfg(test)]
+            READINESS_VISITS.with(|visits| visits.set(visits.get() + 1));
             if &id != head && self.quarantine.contains_key(&id) {
                 return Err(DomainError::InvalidReference { id });
             }
@@ -979,20 +1062,7 @@ impl Store {
     }
 
     fn ready(&self, id: &OperationId) -> bool {
-        if self.quarantine.contains_key(id) {
-            return false;
-        }
-        let Some(record) = self.records.get(id) else {
-            return false;
-        };
-        if !self
-            .records
-            .get(record.operation.conversation())
-            .is_some_and(|r| matches!(r.operation.body, OperationBody::ConversationCreated { .. }))
-        {
-            return false;
-        }
-        self.path(id).is_ok_and(|path| self.path_complete(&path))
+        Readiness::new(self).ready(id)
     }
 
     pub fn history(
