@@ -710,6 +710,34 @@ class AssistantActivityTest {
         controller.destroy()
     }
 
+    @org.robolectric.annotation.LooperMode(org.robolectric.annotation.LooperMode.Mode.PAUSED)
+    @Test fun pendingReadAloudAcknowledgementReachesAnAlreadyActiveVoiceConsumer() {
+        SyntheticAssistantActivity.preferenceName = "synthetic-pending-read-aloud"
+        val controller = Robolectric.buildActivity(SyntheticAssistantActivity::class.java).setup()
+        val activity = controller.get()
+        activity.setReadRepliesAloud(false)
+        // Finish persistence but deliberately leave its main-thread acknowledgement queued.
+        WearVoiceSettingsIo.executor.submit {}.get(5, java.util.concurrent.TimeUnit.SECONDS)
+        activity.synthetic.publish(activity.synthetic.state.copy(busy = true))
+        activity.audio.publish(activity.audio.state.copy(
+            loop = dev.gitblame.voxgolem.assistant.speech.ConversationLoopState(
+                dev.gitblame.voxgolem.assistant.speech.LoopPhase.GENERATING)))
+        assertTrue(activity.audio.snapshot().active)
+        val stops = activity.audio.stops
+        // Do not drain perpetual busy-state animation frames while generation is active.
+        repeat(20) {
+            if (activity.audio.speechChoices.last() != false)
+                Shadows.shadowOf(Looper.getMainLooper()).runOneTask()
+        }
+        assertEquals(false, activity.audio.speechChoices.last())
+        assertTrue(activity.audio.snapshot().active)
+        assertEquals(stops, activity.audio.stops)
+        activity.synthetic.publish(activity.synthetic.state.copy(busy = false))
+        activity.audio.publish(AssistantVoiceState(admissionReady = true))
+        controller.pause().stop().destroy()
+        SyntheticAssistantActivity.preferenceName = "synthetic-assistant-activity-defaults"
+    }
+
     @Test fun defaultsDoNotWriteOrStartRecognitionAndExplicitChoicesSurviveRestart() {
         SyntheticAssistantActivity.preferenceName = "synthetic-voice-preferences-${java.util.UUID.randomUUID()}"
         val first = Robolectric.buildActivity(SyntheticAssistantActivity::class.java).setup()

@@ -70,6 +70,7 @@ class ConversationLoopControllerTest {
         val doneCallbacks = ArrayDeque<(String?) -> Unit>()
         var spoken = 0
         var creates = 0
+        var failCleanup = false
         override fun create(onReady: (Boolean) -> Unit): LocalTtsSession { creates++; ready = onReady; return object : LocalTtsSession {
             override fun voices() = listOf(LocalVoice("synthetic-local", Locale.US, false, true))
             override fun speak(text: String, voice: LocalVoice, onTerminal: (String?) -> Unit): Boolean {
@@ -79,8 +80,8 @@ class ConversationLoopControllerTest {
                 doneCallbacks.addLast(onTerminal)
                 return true
             }
-            override fun stop() {}
-            override fun shutdown() {}
+            override fun stop() { if (failCleanup) throw IllegalStateException("Synthetic cleanup failure") }
+            override fun shutdown() { if (failCleanup) throw IllegalStateException("Synthetic cleanup failure") }
         } }
     }
     private val recognition = Recognition()
@@ -201,9 +202,9 @@ class ConversationLoopControllerTest {
         engine.result(GenerationResult.Complete(answer))
         android.os.Handler(Looper.getMainLooper()).post { output.setEnabled(false) }
         drain()
-        assertNotEquals(LoopPhase.SPEAKING, loop.snapshot().phase)
+        assertEquals(LoopPhase.IDLE, loop.snapshot().phase)
         tts.ready(true); drain()
-        assertNotEquals(LoopPhase.SPEAKING, loop.snapshot().phase)
+        assertEquals(LoopPhase.IDLE, loop.snapshot().phase)
         assertTrue(tts.spokenTexts.isEmpty())
         loop.close(); dictation.close(); output.close(); drain()
     }
@@ -217,10 +218,104 @@ class ConversationLoopControllerTest {
         engine.result(GenerationResult.Complete(answer)); drain()
         assertEquals(LoopPhase.SPEAKING, loop.snapshot().phase)
         output.setEnabled(false); drain()
-        assertNotEquals(LoopPhase.SPEAKING, loop.snapshot().phase)
+        assertEquals(LoopPhase.IDLE, loop.snapshot().phase)
         assertNotEquals(SpeechPhase.SPEAKING, output.snapshot().phase)
         tts.doneCallbacks.forEach { it(null) }; drain()
-        assertNotEquals(LoopPhase.SPEAKING, loop.snapshot().phase)
+        assertEquals(LoopPhase.IDLE, loop.snapshot().phase)
+        loop.close(); dictation.close(); output.close(); drain()
+    }
+
+    @Test fun queuedDisableAndReenableSettlesTalkWithoutReplayingOldReply() {
+        start(ttsEnabled = true)
+        recognition.sessions.single().events.final("Synthetic question"); drain()
+        val answer = "Synthetic first sentence. Synthetic second sentence."
+        engine.streamListener!!(answer)
+        engine.result(GenerationResult.Complete(answer))
+        android.os.Handler(Looper.getMainLooper()).post {
+            output.setEnabled(false)
+            output.setEnabled(true)
+        }
+        val stops = engine.stops
+        drain()
+        assertEquals(LoopPhase.BETWEEN_TURNS, loop.snapshot().phase)
+        assertEquals(stops, engine.stops)
+        tts.ready(true); drain()
+        assertTrue(tts.spokenTexts.isEmpty())
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(300))
+        assertEquals(LoopPhase.LISTENING, loop.snapshot().phase)
+        loop.close(); dictation.close(); output.close(); drain()
+    }
+
+    @Test fun queuedNonDisableCancellationStillFailsOwnedGeneration() {
+        start(ttsEnabled = true)
+        recognition.sessions.single().events.final("Synthetic question"); drain()
+        engine.streamListener!!("Synthetic first sentence. ")
+        android.os.Handler(Looper.getMainLooper()).post { output.stop() }
+        val stops = engine.stops
+        drain()
+        assertEquals(LoopPhase.ERROR, loop.snapshot().phase)
+        assertEquals("speech_cancelled", loop.snapshot().error)
+        assertTrue(engine.stops > stops)
+        engine.result(GenerationResult.Complete("Synthetic stale answer.")); drain()
+        assertEquals(LoopPhase.ERROR, loop.snapshot().phase)
+        loop.close(); dictation.close(); output.close(); drain()
+    }
+
+    @Test fun disablingOutstandingStreamPreservesCanonicalGenerationAndTalkConsent() {
+        for (policy in VoiceSessionPolicy.entries) {
+            val completed = mutableListOf<GenerationResult.Complete>()
+            val controller = ConversationLoopController(dictation, output, engine, onReplyCompleted = completed::add)
+            controller.setForeground(true); output.setEnabled(true)
+            controller.start("en-US", policy = policy); drain()
+            recognition.sessions.last().events.final("Synthetic question"); drain()
+            engine.streamListener!!("Synthetic first sentence. "); drain(); tts.ready(true); drain()
+            assertTrue(tts.doneCallbacks.isNotEmpty())
+            val stops = engine.stops
+            output.setEnabled(false); drain()
+            assertEquals(LoopPhase.GENERATING, controller.snapshot().phase)
+            assertEquals(stops, engine.stops)
+            assertEquals(SpeechPhase.IDLE, output.snapshot().phase)
+            assertNull(leases.current())
+            val answer = GenerationResult.Complete("Synthetic first sentence. Synthetic canonical remainder.")
+            engine.result(answer); drain()
+            assertEquals(listOf(answer), completed)
+            assertEquals(if (policy == VoiceSessionPolicy.SINGLE_TURN) LoopPhase.IDLE else LoopPhase.BETWEEN_TURNS,
+                controller.snapshot().phase)
+            val spoken = tts.spoken
+            tts.doneCallbacks.toList().forEach { it(null) }; drain()
+            assertEquals(spoken, tts.spoken)
+            if (policy == VoiceSessionPolicy.REPEAT_AFTER_REPLY) {
+                shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(300))
+                assertEquals(LoopPhase.LISTENING, controller.snapshot().phase)
+                assertFalse(output.snapshot().enabled)
+            }
+            controller.close(); drain()
+            tts.doneCallbacks.clear()
+        }
+        loop.close(); dictation.close(); output.close(); drain()
+    }
+
+    @Test fun disablingOutstandingStreamStillFailsWhenSdkCleanupFails() {
+        start(ttsEnabled = true)
+        recognition.sessions.single().events.final("Synthetic question"); drain()
+        engine.streamListener!!("Synthetic first sentence. "); drain(); tts.ready(true); drain()
+        tts.failCleanup = true
+        output.setEnabled(false); drain()
+        assertEquals(LoopPhase.ERROR, loop.snapshot().phase)
+        assertEquals("speech_cleanup_failed", loop.snapshot().error)
+        tts.failCleanup = false
+        loop.close(); dictation.close(); output.close(); drain()
+    }
+
+    @Test fun outstandingStreamSynthesisFailureStillRetiresGeneration() {
+        start(ttsEnabled = true)
+        recognition.sessions.single().events.final("Synthetic question"); drain()
+        engine.streamListener!!("Synthetic first sentence. "); drain(); tts.ready(true); drain()
+        val stops = engine.stops
+        tts.done("speech_failed"); drain()
+        assertEquals(LoopPhase.ERROR, loop.snapshot().phase)
+        assertEquals("speech_failed", loop.snapshot().error)
+        assertTrue(engine.stops > stops)
         loop.close(); dictation.close(); output.close(); drain()
     }
 

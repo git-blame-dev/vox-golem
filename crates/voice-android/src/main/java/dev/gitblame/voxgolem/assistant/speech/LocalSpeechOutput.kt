@@ -75,6 +75,11 @@ class LocalSpeechOutput(
     private data class ProviderAttempt(val provider: String?, val allowNetwork: Boolean)
     private data class PendingStreamChunk(val text: String, val onDone: (String?) -> Unit)
     private val epoch = AtomicLong()
+    private class DisableRetirement(val epoch: Long) {
+        var outcome = "speech_cancelled"
+    }
+    // One latest invalidation cause, not a history of requests or cancelled payloads.
+    private var disableRetirement: DisableRetirement? = null
     private val observers = CopyOnWriteArrayList<(SpeechState) -> Unit>()
     @Volatile private var state = SpeechState()
     private var foreground = false
@@ -130,17 +135,20 @@ class LocalSpeechOutput(
         return AutoCloseable { observers -= observer }
     }
     fun setEnabled(enabled: Boolean) {
-        if (!enabled) epoch.incrementAndGet()
-        main.post {
-            val cancelled = if (!enabled) terminal else null
-            val pendingStream = if (!enabled) drainStreamCallbacks() else emptyList()
-            val cleaned = enabled || dispose()
-            if (!enabled) endTiming(if (cleaned) Stage.CANCELLED else Stage.RETIREMENT_FAILED)
-            publish(state.copy(enabled = enabled, phase = if (!cleaned) SpeechPhase.ERROR else if (enabled) state.phase else SpeechPhase.IDLE,
-                error = if (cleaned) null else "speech_cleanup_failed"))
-            val code = if (cleaned) "speech_disabled" else "speech_cleanup_failed"
-            cancelled?.invoke(code)
-            pendingStream.forEach { it(code) }
+        synchronized(epoch) {
+            val retirement = if (!enabled) DisableRetirement(epoch.incrementAndGet()).also { disableRetirement = it } else null
+            main.post {
+                val cancelled = if (!enabled) terminal else null
+                val pendingStream = if (!enabled) drainStreamCallbacks() else emptyList()
+                val cleaned = enabled || dispose()
+                if (!enabled) endTiming(if (cleaned) Stage.CANCELLED else Stage.RETIREMENT_FAILED)
+                publish(state.copy(enabled = enabled, phase = if (!cleaned) SpeechPhase.ERROR else if (enabled) state.phase else SpeechPhase.IDLE,
+                    error = if (cleaned) null else "speech_cleanup_failed"))
+                val code = if (cleaned) "speech_disabled" else "speech_cleanup_failed"
+                retirement?.outcome = code
+                cancelled?.invoke(code)
+                pendingStream.forEach { it(code) }
+            }
         }
     }
     fun setForeground(visible: Boolean) {
@@ -185,8 +193,9 @@ class LocalSpeechOutput(
             initialize(effectiveLanguage, normalized, onDone, ticket, timing, streaming = true, keepStreamOpen = keepOpen)
             return
         }
+        val queuedTicket = epoch.get()
         main.post {
-            if (closed) { onDone("speech_cancelled"); return@post }
+            if (closed || queuedTicket != epoch.get()) { cancelQueuedStream(queuedTicket, onDone); return@post }
             val currentTicket = epoch.get()
             if (streamTicket == currentTicket && currentTicket > 0L) {
                 if (state.phase == SpeechPhase.SPEAKING && sessionReady && sdk != null && streamVoice != null) {
@@ -221,11 +230,24 @@ class LocalSpeechOutput(
         if (activeStreamChunks == 0 && pendingStreamChunks.isEmpty() && pendingRequest == null) finish(ticket, null)
     } }
 
+    private fun cancelQueuedStream(ticket: Long, callback: ((String?) -> Unit)?) {
+        val deferred = synchronized(epoch) {
+            val retirement = disableRetirement?.takeIf { it.epoch == epoch.get() && ticket < it.epoch && !closed }
+            if (retirement != null) {
+                // The disable publication is already queued under this lock. Report
+                // its actual retirement outcome, never a speculative disable success.
+                main.post { callback?.invoke(retirement.outcome) }
+            }
+            retirement != null
+        }
+        if (!deferred) callback?.invoke("speech_cancelled")
+    }
+
     private fun initialize(language: String, text: String?, callback: ((String?) -> Unit)?, ticket: Long, timing: AssistantTiming, streaming: Boolean,
         keepStreamOpen: Boolean = false) {
         fun cancelQueued() {
             timing.finish(Stage.CANCELLED)
-            if (streaming) callback?.invoke("speech_cancelled")
+            if (streaming) cancelQueuedStream(ticket, callback)
         }
         main.post {
             if (ticket != epoch.get() || closed) { cancelQueued(); return@post }
