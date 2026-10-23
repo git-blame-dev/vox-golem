@@ -11,6 +11,7 @@ let container: HTMLElement | null = null
 afterEach(() => {
   act(() => root?.unmount())
   container?.remove()
+  vi.useRealTimers()
 })
 
 function renderSelect(options: readonly AssistantOption<InstantChoice>[], disabled = false, canRetry: (value: InstantChoice) => boolean = () => false, variant?: 'default' | 'pill' | 'icon', value: InstantChoice = 'custom-sol-high', fastMode = false, onFastModeChange?: (fastMode: boolean) => void) {
@@ -24,6 +25,75 @@ function renderSelect(options: readonly AssistantOption<InstantChoice>[], disabl
 }
 
 describe('InstantModelSelect', () => {
+  it.each(['Escape', 'selection'] as const)('restores actual keyboard focus after %s and keeps closing controls disabled', (reason) => {
+    vi.useFakeTimers()
+    const { container: el } = renderSelect([{ value: 'local-fast', label: 'Synthetic model', available: true }], false, undefined, 'pill', 'local-fast')
+    const trigger = el.querySelector<HTMLButtonElement>('button')!
+    trigger.focus()
+    act(() => trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })))
+    const option = el.querySelector<HTMLButtonElement>('[role="option"]')!
+    expect(document.activeElement).toBe(option)
+    act(() => {
+      if (reason === 'Escape') option.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+      else option.click()
+    })
+    expect(document.activeElement).toBe(trigger)
+    expect(option.disabled).toBe(true)
+    act(() => vi.advanceTimersByTime(160))
+    expect(document.activeElement).toBe(trigger)
+    expect(el.querySelector('[role="dialog"]')).toBeNull()
+  })
+
+  it('does not steal outside focus and cancels an old close on reopen', () => {
+    vi.useFakeTimers()
+    const { container: el } = renderSelect([{ value: 'local-fast', label: 'Synthetic model', available: true }], false, undefined, 'pill', 'local-fast')
+    const trigger = el.querySelector<HTMLButtonElement>('button')!
+    act(() => trigger.click())
+    const outside = document.createElement('button')
+    el.append(outside)
+    act(() => outside.focus())
+    act(() => outside.dispatchEvent(new Event('pointerdown', { bubbles: true })))
+    expect(el.querySelector('[role="dialog"]')?.getAttribute('data-state')).toBe('closing')
+    expect(document.activeElement).toBe(outside)
+    act(() => trigger.click())
+    act(() => vi.advanceTimersByTime(160))
+    expect(el.querySelector('[role="dialog"]')?.getAttribute('data-state')).toBe('open')
+    expect(document.activeElement).toBe(outside)
+  })
+
+  it('does not restore an unavailable trigger', () => {
+    vi.useFakeTimers()
+    const options = [{ value: 'local-fast' as const, label: 'Synthetic model', available: true }]
+    const { container: el } = renderSelect(options, false, undefined, 'pill', 'local-fast')
+    const trigger = el.querySelector<HTMLButtonElement>('button')!
+    act(() => trigger.click())
+    const option = el.querySelector<HTMLButtonElement>('[role="option"]')!
+    option.focus()
+    act(() => root?.render(<InstantModelSelect variant="pill" id="syntheticInstant" label="Instant model" value="local-fast" options={options} disabled canRetry={() => false} onChange={vi.fn()} />))
+    act(() => option.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })))
+    act(() => vi.advanceTimersByTime(160))
+    expect(document.activeElement).not.toBe(trigger)
+  })
+
+  it('preserves navigation focus and clears a pending close on unmount', () => {
+    vi.useFakeTimers()
+    const { container: el } = renderSelect([{ value: 'local-fast', label: 'Synthetic model', available: true }], false, undefined, 'pill', 'local-fast')
+    const trigger = el.querySelector<HTMLButtonElement>('button')!
+    act(() => trigger.click())
+    const option = el.querySelector<HTMLButtonElement>('[role="option"]')!
+    option.focus()
+    const outside = document.createElement('button')
+    el.append(outside)
+    act(() => outside.focus())
+    expect(document.activeElement).toBe(outside)
+    expect(option.disabled).toBe(true)
+    act(() => root?.unmount())
+    root = null
+    expect(vi.getTimerCount()).toBe(0)
+    act(() => vi.advanceTimersByTime(160))
+    expect(document.activeElement).not.toBe(trigger)
+  })
+
   it('exposes the full selected label in a pill with a single trigger button and opens the vertical model + horizontal effort popup', () => {
     const label = 'Synthetic model with a deliberately long descriptive label'
     const onFastModeChange = vi.fn()
@@ -77,7 +147,7 @@ describe('InstantModelSelect', () => {
     const options: readonly AssistantOption<InstantChoice>[] = [
       { value: 'custom-sol-high', label: 'Custom: GPT-6.1 Sol High', available: true },
       { value: 'custom-sol-low', label: 'Custom: GPT-6.1 Sol Low', available: true },
-      { value: 'custom-luna-high', label: 'Custom: GPT-6 Luna High', available: true },
+      { value: 'custom-luna6-high', label: 'Custom: GPT-6 Luna High', available: true },
       { value: 'custom-luna-low', label: 'Custom: GPT-6 Luna Low', available: true },
     ]
     const onChange = vi.fn()
@@ -89,11 +159,11 @@ describe('InstantModelSelect', () => {
     expect(popupBefore).not.toBeNull()
     expect(popupBefore.getAttribute('data-state')).toBe('open')
 
-    act(() => root?.render(<InstantModelSelect variant="pill" id="syntheticInstant" label="Instant model" value="custom-luna-high" options={options} disabled={true} canRetry={() => false} onChange={onChange} />))
+    act(() => root?.render(<InstantModelSelect variant="pill" id="syntheticInstant" label="Instant model" value="custom-luna6-high" options={options} disabled={true} canRetry={() => false} onChange={onChange} />))
     expect(rootEl.querySelector('.composer__model-popup')).toBe(popupBefore)
     expect(rootEl.querySelector('.composer__model-popup')?.getAttribute('data-state')).toBe('open')
 
-    act(() => root?.render(<InstantModelSelect variant="pill" id="syntheticInstant" label="Instant model" value="custom-luna-high" options={options} disabled={false} canRetry={() => false} onChange={onChange} />))
+    act(() => root?.render(<InstantModelSelect variant="pill" id="syntheticInstant" label="Instant model" value="custom-luna6-high" options={options} disabled={false} canRetry={() => false} onChange={onChange} />))
     expect(rootEl.querySelector('.composer__model-popup')).toBe(popupBefore)
     expect(rootEl.querySelector('.composer__model-popup')?.getAttribute('data-state')).toBe('open')
   })
