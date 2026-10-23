@@ -12,7 +12,7 @@ const PAGE_SIZE = 100
 
 export function CaptureHistory({ onBack }: { onBack: () => void }): JSX.Element {
   const { snapshot, setSnapshot, playback, records, setRecords, offset, hasOlder, selectedId, selected, draft, draftVersion, conflict, offPage,
-    error, setError, setupMessage, setSetupMessage, mounted, refresh, selectRecord, setDraft, acceptSavedCorrection, markCorrectionConflict } = useCaptureHistory()
+    error, setError, setupMessage, setSetupMessage, mounted, refresh, selectRecord, setDraft, correctionRequest } = useCaptureHistory()
   const [busy, setBusy] = useState(false)
   const playingId = playback?.phase === 'preparing' || playback?.phase === 'playing' ? playback.captureId : null
   const [editedExportedIds, setEditedExportedIds] = useState<ReadonlySet<string>>(() => new Set())
@@ -91,16 +91,18 @@ export function CaptureHistory({ onBack }: { onBack: () => void }): JSX.Element 
     if (selected === null || selected.purpose !== 'NOTE' || conflict || offPage || draftVersion === undefined) return
     setBusy(true)
     setError(null)
+    const request = correctionRequest()
     try {
-      await updateCaptureTranscript(selected.captureId, draft, draftVersion)
-      acceptSavedCorrection(selected.captureId, draft)
+      const record = await updateCaptureTranscript(selected.captureId, draft, draftVersion)
+      if (!mounted.current) return
+      request.accept(record)
       if (isExported(selected.orgState)) setEditedExportedIds((current) => new Set(current).add(selected.captureId))
       await refresh(offset)
     }
     catch (reason) {
-      if (!mounted.current) return
+      if (!request.current()) return
       if (errorMessage(reason) === 'transcript-conflict') {
-        markCorrectionConflict(selected.captureId)
+        request.conflict()
         await refresh(offset)
       } else setError(errorMessage(reason))
     }

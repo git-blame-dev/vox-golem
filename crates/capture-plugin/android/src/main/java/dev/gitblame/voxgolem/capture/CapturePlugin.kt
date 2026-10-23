@@ -210,8 +210,8 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
     fun update_transcript(invoke: Invoke) {
         try {
             val args = UpdateTranscriptArgs.fromJson(invoke.getArgs())
-            phoneCoordinator.correctTranscript(args.captureId, args.text, args.expectedVersion)
-            invoke.resolve()
+            val record = phoneCoordinator.correctTranscript(args.captureId, args.text, args.expectedVersion)
+            invoke.resolve(recordValue(record))
         } catch (_: CaptureTranscriptConflictException) {
             invoke.reject("transcript-conflict")
         } catch (error: Exception) {

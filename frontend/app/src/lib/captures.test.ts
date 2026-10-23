@@ -72,7 +72,8 @@ describe('capture IPC adapter', () => {
         if (command === 'plugin:capture|snapshot') return { available: true, notesFolderUri: null, captures: [record()], error: null }
         if (command === 'plugin:capture|list_captures') return [record()]
         if (command === 'plugin:capture|enable_capture') return { available: true, setupRequired: false, notesFolderUri: null, captures: [record()], error: null }
-        if (command === 'plugin:capture|play_capture' || command === 'plugin:capture|update_transcript') return null
+        if (command === 'plugin:capture|play_capture') return null
+        if (command === 'plugin:capture|update_transcript') return { ...record(), finalText: 'Synthetic correction', transcriptVersion: 3 }
         throw new Error(`Unexpected capture fixture command: ${command}`)
       },
     }
@@ -81,7 +82,8 @@ describe('capture IPC adapter', () => {
     expect(await capture.listCaptures(100, 20)).toHaveLength(1)
     expect((await capture.enableCapture()).setupRequired).toBe(false)
     await capture.playCapture('synthetic-capture-1')
-    await capture.updateCaptureTranscript('synthetic-capture-1', 'Synthetic correction', 2)
+    expect(await capture.updateCaptureTranscript('synthetic-capture-1', 'Synthetic correction', 2)).toEqual(
+      parseCaptureRecord({ ...record(), finalText: 'Synthetic correction', transcriptVersion: 3 }))
     expect(calls).toEqual([
       ['plugin:capture|snapshot', undefined],
       ['plugin:capture|list_captures', { offset: 100, limit: 20 }],
@@ -101,6 +103,15 @@ describe('capture IPC adapter', () => {
     await expect(capture.loadCaptureSnapshot()).rejects.toThrow('Voice notes are available only in the Android app')
     await expect(capture.playCapture('synthetic-capture-1')).rejects.toThrow('Voice notes are available only in the Android app')
     expect(invoke).not.toHaveBeenCalled()
+  })
+
+  it('requires a canonical record acknowledgement instead of accepting a void save result', async () => {
+    vi.stubEnv('VITE_VOXGOLEM_RUNTIME', 'android')
+    vi.resetModules()
+    window.__TAURI_INTERNALS__ = { invoke: vi.fn().mockResolvedValue(null) }
+    const capture = await import('./captures')
+    await expect(capture.updateCaptureTranscript('synthetic-capture-1', 'Synthetic correction', 2))
+      .rejects.toThrow('Capture record is invalid')
   })
 })
 
