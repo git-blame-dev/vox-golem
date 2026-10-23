@@ -316,48 +316,46 @@ assert.equal(release().restored,true);
             self.assertFalse(runner.answer_integrity(case, canonical, canonical, lost, True)['sources_preserved'])
             truncated = answer+'\n\nSources:\n'+'\n'.join(lost)+'\n'
             self.assertFalse(runner.answer_integrity(case, truncated, truncated, lost, True)['sources_preserved'])
-    def test_live_credential_is_staged_privately_and_rotation_returns_to_the_source(self):
+    def test_live_uses_source_metadata_without_reading_or_copying_credentials(self):
         with tempfile.TemporaryDirectory(dir='/tmp/opencode') as temp:
             root = Path(temp)
-            source_config = root/'config.toml'
+            config = root/'config.toml'; config.write_text('')
             source = runner.managed_credential(root)
-            source.parent.mkdir()
-            source.write_bytes(b'synthetic-original')
+            source.parent.mkdir(); source.write_bytes(b'synthetic-original')
             run = root/'run'; run.mkdir()
-            runner.stage_live_credential(run, source_config)
-            staged = runner.managed_credential(run/'config')
-            self.assertEqual(staged.read_bytes(), b'synthetic-original')
-            self.assertEqual(stat.S_IMODE(staged.stat().st_mode), 0o600)
-            self.assertEqual(stat.S_IMODE(staged.parent.stat().st_mode), 0o700)
-            staged.write_bytes(b'synthetic-rotated')
-            runner.finish_live_credential(run)
-            self.assertEqual(source.read_bytes(), b'synthetic-rotated')
-            runner.finish_live_credential(run)  # idempotent once returned
+            with patch.object(Path, 'read_bytes', side_effect=AssertionError('credential read')):
+                env = runner.isolated_environment(run, config, None, live=True, entry='typed')
+            self.assertEqual(env['VOXGOLEM_BENCH_AUTH_SOURCE_CONFIG'], str(config.resolve()))
+            self.assertFalse(runner.managed_credential(run/'config').exists())
+            self.assertEqual(source.read_bytes(), b'synthetic-original')
+            self.assertTrue(Path(env['VOXGOLEM_CONFIG_PATH']).is_relative_to(run))
 
-    def test_rotation_never_overwrites_a_credential_changed_during_the_run(self):
+    def test_source_config_selection_fails_closed(self):
         with tempfile.TemporaryDirectory(dir='/tmp/opencode') as temp:
-            root = Path(temp)
-            source = runner.managed_credential(root)
-            source.parent.mkdir()
-            source.write_bytes(b'synthetic-original')
-            run = root/'run'; run.mkdir()
-            runner.stage_live_credential(run, root/'config.toml')
-            runner.managed_credential(run/'config').write_bytes(b'synthetic-rotated')
-            source.write_bytes(b'synthetic-newer-sign-in')
-            runner.finish_live_credential(run)
-            self.assertEqual(source.read_bytes(), b'synthetic-newer-sign-in')
+            root = Path(temp); run = root/'run'; run.mkdir()
+            config = root/'config.toml'; config.write_text('')
+            linked = root/'linked'; linked.symlink_to(config)
+            inside = run/'config.toml'; inside.write_text('')
+            for candidate in [Path('relative.toml'), root/'missing', root, linked, inside]:
+                with self.subTest(candidate=candidate), self.assertRaises(ValueError):
+                    runner.isolated_environment(run, candidate, None, live=True, entry='typed')
 
-    def test_live_run_requires_a_regular_managed_sign_in_without_fallback(self):
+    def test_offline_refuses_inherited_auth_source_override(self):
         with tempfile.TemporaryDirectory(dir='/tmp/opencode') as temp:
-            root = Path(temp)
-            run = root/'run'; run.mkdir()
+            root = Path(temp); run = root/'run'; run.mkdir()
+            config = root/'config.toml'; config.write_text('')
+            with patch.dict(os.environ, {'VOXGOLEM_BENCH_AUTH_SOURCE_CONFIG': str(config)}):
+                with self.assertRaises(ValueError):
+                    runner.isolated_environment(run, config, None, entry='typed')
+
+    def test_old_benchmark_binary_cannot_claim_canonical_auth_contract(self):
+        with tempfile.TemporaryDirectory(dir='/tmp/opencode') as temp:
+            binary = Path(temp)/'synthetic-binary'
+            binary.write_bytes(b'voxgolem:app-bench:synthetic-input-only:v1')
             with self.assertRaises(ValueError):
-                runner.stage_live_credential(run, root/'config.toml')
-            source = runner.managed_credential(root)
-            source.parent.mkdir()
-            source.symlink_to(root/'synthetic-missing')
-            with self.assertRaises(ValueError):
-                runner.stage_live_credential(run, root/'config.toml')
+                runner.validate_benchmark_binary(binary)
+            binary.write_bytes(runner.CAPABILITY)
+            runner.validate_benchmark_binary(binary)
 
     def test_typed_control_can_only_prove_the_non_voice_path(self):
         stages = ['generation_dispatched']*3

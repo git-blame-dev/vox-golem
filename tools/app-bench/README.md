@@ -161,8 +161,21 @@ target. Each continuation and failed/uncertain dispatch consumes a permit. Rust
 guards both generation HTTP send paths, disables benchmark retries and permits
 only Custom Luna Low for live mode. A reservation is atomically claimed once and
 never reused after a crash. No automatic repetitions or allowance expansion occur.
-Live credentials are not copied into fixture/report artifacts; ordinary authority
-and revision fences must remain intact.
+Live runs pass the explicit canonical absolute source config path to the
+benchmark-only native adapter (`VOXGOLEM_BENCH_AUTH_SOURCE_CONFIG`). The config
+must be a regular file outside the private run; ambiguous/symlink selections and
+missing or unsafe managed auth files fail startup validation. Offline mode rejects
+this override and keeps synthetic auth private. Shipping builds do not consume it.
+Native capability, request and authentication paths select the original canonical
+managed store through the existing auth owner and OS lock, including refresh and
+revision fencing. Sign-out, replacement or removal never falls back to isolated
+or custom credentials. Python handles config metadata, not credential bytes:
+there is no credential staging, copyback, import or rotation bookkeeping.
+Config, history and HOME/XDG state remain directed into the private run. The live
+bubblewrap wrapper binds the host root writable: this is not sandboxed filesystem
+isolation. The v2 canonical-managed-auth capability rejects old benchmark binaries;
+same-binary offline qualification and all existing budget/namespace/session gates
+still apply. No credential data belongs in fixture/report artifacts.
 
 The typed qualification profile explicitly defers capture, displayed source-list
 projection and desktop history restoration. Those failed/untested checks remain

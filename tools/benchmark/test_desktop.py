@@ -29,7 +29,7 @@ class DesktopTests(unittest.TestCase):
             root = Path(temporary)
             binary = root/'binary'
             binary.write_bytes(b'synthetic')
-            args = SimpleNamespace(binary=binary, config=root/'config', output=root,
+            args = SimpleNamespace(binary=binary, config=root/'unresolved'/'..'/'config', output=root,
                                    offline_evidence=root/'qualification', flow_timeout=10)
             events = []
             runner = Mock()
@@ -55,6 +55,8 @@ class DesktopTests(unittest.TestCase):
                 'reserve_live_budget', 'isolated_environment', 'start_typed_app', 'suite', 'shutdown_owned'])
             runner.validate_offline_evidence.assert_called_once_with(args.offline_evidence, binary, {}, {}, 'typed')
             runner.reserve_live_budget.assert_called_once_with(runner.ASSIGNMENT_LEDGER, root/'reservation.json')
+            runner.isolated_environment.assert_called_once_with(root, args.config, None, True,
+                                                               root/'reservation.json', entry='typed')
             self.assertNotIn('private payload', json.dumps(report))
             return result, report
 
@@ -89,6 +91,7 @@ class DesktopTests(unittest.TestCase):
             def launch(command, **kwargs):
                 self.assertIn('--shared-suite', command)
                 self.assertIn('--offline-evidence', command)
+                self.assertEqual(command[command.index('--config')+1], str(args.config))
                 self.assertNotIn('--inside-session', command)
                 self.assertEqual(command[1], str(root/'tools/app-bench/runner.py'))
                 self.assertTrue(kwargs['start_new_session'])

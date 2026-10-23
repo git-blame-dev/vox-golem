@@ -29,7 +29,7 @@ ASSIGNMENT_LEDGER = ROOT.parent / 'artifacts' / 'unified-app-bench-live-budget.j
 ARTIFACT_ROOT = ROOT.parent / 'artifacts'
 PHASE = 'preflight'
 APP_PID = None
-CAPABILITY = b'voxgolem:app-bench:synthetic-input-only:v1'
+CAPABILITY = b'voxgolem:app-bench:canonical-managed-auth:v2'
 CANCEL_POST_RELEASE_SECONDS = 0.5
 WORKFLOW_SAFETY_CHECKS = ('empty_admission', 'duplicate_ui_submission', 'cancellation_retirement',
     'warm_context', 'longer_history', 'relaunch_preferences', 'relaunch_without_generation')
@@ -216,51 +216,29 @@ def speech_configuration_identity(source_config):
 
 
 MANAGED_ENDPOINT = 'https://chatgpt.com/backend-api/codex/responses'
-_STAGED_LIVE_CREDENTIALS = {}
 
 
 def managed_credential(config_dir):
     return config_dir/'chatgpt'/'chatgpt-auth.json'
 
 
-def stage_live_credential(run, source_config):
-    """Copy the signed-in managed credential into the isolated config directory.
-
-    The app only reads credentials from `<config dir>/chatgpt/chatgpt-auth.json`, so a
-    live run needs its own private copy. Credential contents, refresh and revision
-    validation stay in the real Rust client; finish_live_credential returns any
-    refresh-token rotation to the original file. No other account is ever selected.
-    """
-    source = managed_credential(source_config.parent)
-    if source.is_symlink() or not source.is_file():
-        raise ValueError('Sign in with ChatGPT before a live benchmark; no fallback permitted')
-    original = source.read_bytes()
-    staged = managed_credential(run/'config')
-    staged.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with open(staged, 'xb', opener=lambda path, flags: os.open(path, flags, 0o600)) as stream:
-        stream.write(original)
-    _STAGED_LIVE_CREDENTIALS[run] = (source, original)
-
-
-def finish_live_credential(run):
-    """Persist a rotated refresh token unless the source changed during the run."""
-    staged = _STAGED_LIVE_CREDENTIALS.pop(run, None)
-    if staged is None:
-        return
-    source, original = staged
+def live_auth_source_config(run, source_config):
+    """Validate configuration metadata only; native code owns all credential access."""
     try:
-        current = managed_credential(run/'config').read_bytes()
-        unchanged = source.read_bytes() == original
-    except OSError:
-        return
-    if current != original and unchanged:
-        temporary = source.with_name('.benchmark-sync')
-        with open(temporary, 'wb', opener=lambda path, flags: os.open(path, flags, 0o600)) as stream:
-            stream.write(current)
-        os.replace(temporary, source)
+        resolved = source_config.resolve(strict=True)
+        if (not source_config.is_absolute() or source_config != resolved or
+                not source_config.is_file() or resolved.is_relative_to(run.resolve())):
+            raise ValueError('Live auth source must be a canonical regular config outside the run')
+    except OSError as error:
+        raise ValueError('Live auth source config unavailable') from error
+    return resolved
 
 
 def isolated_environment(run, source_config, endpoint, live=False, reservation=None, entry='voice'):
+    if not live and 'VOXGOLEM_BENCH_AUTH_SOURCE_CONFIG' in os.environ:
+        raise ValueError('Offline mode forbids an auth source override')
+    if live:
+        source_config = live_auth_source_config(run, source_config)
     original = tomllib.loads(source_config.read_text())
     env = os.environ.copy()
     if not env.get('XAUTHORITY') and (Path(env.get('HOME', ''))/'.Xauthority').is_file():
@@ -293,10 +271,8 @@ def isolated_environment(run, source_config, endpoint, live=False, reservation=N
     # No OpenCode table means no unrelated server is started.
     config += ['web_enabled = true', 'response_backend = "opencode"', '[custom_openai]']
     if live:
-        stage_live_credential(run, source_config)
-        custom = original.get('custom_openai')
-        live_endpoint = custom.get('endpoint', MANAGED_ENDPOINT) if isinstance(custom, dict) else MANAGED_ENDPOINT
-        config += [f'endpoint = {json.dumps(live_endpoint)}']
+        env['VOXGOLEM_BENCH_AUTH_SOURCE_CONFIG'] = str(source_config)
+        config += [f'endpoint = {json.dumps(MANAGED_ENDPOINT)}']
     else:
         credential = managed_credential(run/'config')
         credential.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -802,7 +778,7 @@ def execute_typed(args):
             reserved = reserve_live_budget(args.ledger, reservation)
         else:
             reserved = 0
-        env = isolated_environment(run, args.config.resolve(), service.generation_endpoint if service else None,
+        env = isolated_environment(run, args.config if args.live else args.config.resolve(), service.generation_endpoint if service else None,
                                     args.live, reservation, entry='typed')
         if service: env['VOXGOLEM_BENCH_MCP_ENDPOINT'] = service.mcp_endpoint
         driver, process, launch_ms = start_typed_app(args, env)
@@ -876,7 +852,6 @@ def execute_typed(args):
     finally:
         if driver or process: shutdown_owned(driver, process)
         if service: service.__exit__(None, None, None)
-        finish_live_credential(run)
 
 
 INSTALL_NATIVE_OBSERVER_HOLD = '''
@@ -1113,7 +1088,8 @@ def execute(args):
     fixtures = generate_fixtures(run / 'fixtures', voice=args.voice, wake_phrase=args.wake_phrase)
     if sum(fixture['byte_count'] for fixture in fixtures.values()) > 16*1024*1024:
         raise ValueError('Synthetic fixture bundle exceeds its byte budget')
-    speech_identity = speech_configuration_identity(args.config.resolve())
+    source_config = live_auth_source_config(run, args.config) if args.live else args.config.resolve()
+    speech_identity = speech_configuration_identity(source_config)
     services = FakeServices() if not args.live else None
     if services:
         services.__enter__()
@@ -1127,7 +1103,7 @@ def execute(args):
             reserved = reserve_live_budget(args.ledger, reservation)
         else:
             reserved = 0
-        env = isolated_environment(run, args.config.resolve(),
+        env = isolated_environment(run, source_config,
                                    services.generation_endpoint if services else None,
                                    args.live, reservation)
         if services:
@@ -1225,7 +1201,6 @@ def execute(args):
             shutdown_owned(driver, process)
         if services:
             services.__exit__(None, None, None)
-        finish_live_credential(run)
 
 
 def can_connect(port):

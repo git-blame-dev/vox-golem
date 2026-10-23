@@ -2,12 +2,20 @@ use std::path::{Path, PathBuf};
 use voxgolem_core::config::CustomOpenAiConfig;
 
 pub(super) fn path() -> Result<PathBuf, String> {
+    #[cfg(feature = "app-benchmark")]
+    if let Some(config) = super::app_benchmark::live_auth_configuration() {
+        return Ok(config.auth_path.clone());
+    }
     Ok(voxgolem_core::config::managed_chatgpt_auth_path(
         &super::application_config_path()?,
     ))
 }
 
 pub(super) fn configuration(fallback: Option<&CustomOpenAiConfig>) -> Option<CustomOpenAiConfig> {
+    #[cfg(feature = "app-benchmark")]
+    if let Some(config) = super::app_benchmark::live_auth_configuration() {
+        return Some(config.clone());
+    }
     configuration_at(path().ok().as_deref(), fallback)
 }
 
@@ -20,7 +28,7 @@ fn configuration_at(
 
 pub(super) fn apply_capabilities(capabilities: &mut [super::CapabilityPayload]) {
     let Ok(path) = path() else { return };
-    if configuration_at(Some(&path), None).is_none() {
+    if configuration(None).is_none() {
         return;
     }
     let ready = voxgolem_platform::custom_openai::observe_custom_openai_auth(&path)
@@ -128,6 +136,43 @@ mod tests {
             endpoint: "https://synthetic.invalid/responses".into(),
             auth_path: "/synthetic/managed-auth.json".into(),
         }
+    }
+
+    #[test]
+    fn canonical_selection_observes_replacement_and_signout_without_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(
+            &path,
+            r#"{"openai":{"type":"oauth","access":"synthetic-access","expires":4102444800000}}"#,
+        )
+        .unwrap();
+        let selected = configuration_at(Some(&path), None).unwrap();
+        assert_eq!(selected.auth_path, path);
+        assert_eq!(
+            selected.endpoint,
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert!(
+            voxgolem_platform::custom_openai::observe_custom_openai_auth(&selected.auth_path)
+                .status
+                .is_ok()
+        );
+        let replacement = dir.path().join("replacement.json");
+        std::fs::write(&replacement, "{}").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert!(
+            voxgolem_platform::custom_openai::observe_custom_openai_auth(&selected.auth_path)
+                .status
+                .is_err()
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(selected.auth_path, path);
+        assert!(
+            voxgolem_platform::custom_openai::observe_custom_openai_auth(&selected.auth_path)
+                .status
+                .is_err()
+        );
     }
 
     #[test]

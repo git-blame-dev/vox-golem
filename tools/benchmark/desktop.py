@@ -54,7 +54,7 @@ def execute_inside(args, runner, common=None):
         reservation = args.output.resolve() / 'reservation.json'
         reserved = runner.reserve_live_budget(runner.ASSIGNMENT_LEDGER, reservation)
         report['budget_debit'] = {'reserved': runner.LIVE_BATCH_ALLOWANCE, 'assignment_reserved': reserved}
-        env = runner.isolated_environment(args.output.resolve(), args.config.resolve(), None,
+        env = runner.isolated_environment(args.output.resolve(), args.config, None,
                                           True, reservation, entry='typed')
         driver, process, launch_ms = runner.start_typed_app(args, env)
         report['launch_to_typed_ready_observed_ms'] = launch_ms
@@ -99,7 +99,7 @@ async def run_desktop(args, report, common=None):
     output = parent / ('typed-shared-' + uuid.uuid4().hex)
     command = [str(Path(tools).resolve()/'venv/bin/python'), str(ROOT/'tools/app-bench/runner.py'),
                '--binary', str(Path(args.binary).resolve()), '--tools', str(Path(tools).resolve()),
-               '--config', str(Path(args.config).resolve()), '--output', str(output),
+               '--config', str(Path(args.config)), '--output', str(output),
                '--entry', 'typed', '--live', '--offline-evidence', str(Path(args.offline_evidence).resolve()),
                '--flow-timeout', str(args.turn_timeout), '--shared-suite']
     process = subprocess.Popen(command, start_new_session=True, stdout=subprocess.DEVNULL,

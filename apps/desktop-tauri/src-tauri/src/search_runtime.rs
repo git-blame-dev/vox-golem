@@ -386,6 +386,31 @@ pub(super) fn deep_request(prompt: &str, result: &RunResult) -> String {
 mod tests {
     use super::*;
 
+    // Benchmark mode is process-wide. Configure a fresh exact-test process,
+    // never the parallel parent harness, and never inherit a live allowance.
+    fn run_in_offline_fixture(test: &str) -> bool {
+        const CHILD: &str = "VOXGOLEM_SEARCH_RUNTIME_OFFLINE_TEST";
+        let test = format!("search_runtime::tests::{test}");
+        if std::env::var(CHILD).as_deref() == Ok(test.as_str()) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture"])
+            .env(CHILD, &test)
+            .env("VOXGOLEM_BENCH_MODE", "offline")
+            .env_remove("VOXGOLEM_BENCH_PERMITS")
+            .env_remove("VOXGOLEM_BENCH_MCP_ENDPOINT")
+            .output()
+            .expect("start isolated offline fixture");
+        assert!(
+            output.status.success(),
+            "{test} failed in offline fixture:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
     #[test]
     fn rate_limit_projects_the_shared_safe_status() {
         let info = voxgolem_platform::web::RateLimitInfo {
@@ -428,6 +453,11 @@ mod tests {
 
     #[tokio::test]
     async fn selected_model_admission_does_not_wait_for_busy_web_even_with_mixed_supplied_text() {
+        if run_in_offline_fixture(
+            "selected_model_admission_does_not_wait_for_busy_web_even_with_mixed_supplied_text",
+        ) {
+            return;
+        }
         let state = DesktopSearchState::new("synthetic-process".into());
         let _busy = state.service.lock().await;
         let control = active_prompt();
@@ -460,6 +490,7 @@ mod tests {
                 &state,
                 CustomOpenAiConfig {
                     auth_path: missing_auth,
+                    endpoint: "http://127.0.0.1:43210/responses".into(),
                     ..Default::default()
                 },
                 tokio::time::Instant::now(),
@@ -522,6 +553,11 @@ mod tests {
 
     #[test]
     fn desktop_client_owner_preserves_selected_model_effort_and_provider_configuration() {
+        if run_in_offline_fixture(
+            "desktop_client_owner_preserves_selected_model_effort_and_provider_configuration",
+        ) {
+            return;
+        }
         use voxgolem_platform::custom_openai::CustomOpenAiModel;
         let state = DesktopSearchState::new("synthetic-process".into());
         for model in [
