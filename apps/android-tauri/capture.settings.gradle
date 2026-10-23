@@ -7,3 +7,10 @@ project(':assistant-android').projectDir = new File(rootDir, '../../../../../cra
 gradle.ext.assistantNativeAbis = ['arm64-v8a']
 include ':tauri-plugin-assistant'
 project(':tauri-plugin-assistant').projectDir = new File(rootDir, '../../../../../crates/assistant-plugin/android')
+
+// Dependency sources may be shared, but their build outputs belong to this checkout.
+gradle.beforeProject { project ->
+    if (project.path == ':tauri-android') {
+        project.layout.buildDirectory.set(new File(rootDir, 'build/tauri-android'))
+    }
+}
