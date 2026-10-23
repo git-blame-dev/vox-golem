@@ -5,7 +5,6 @@ import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import android.net.Uri
-import android.os.Build
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import org.json.JSONObject
@@ -30,7 +29,15 @@ class OrgExportCoordinator(context: Context) {
     fun process(captureId: String): OrgExportResult = synchronized(lock) {
         val record = repository.get(captureId) ?: return@synchronized OrgExportResult(OrgState.RETRYABLE_ERROR, null, "capture-not-found")
         if (record.purpose != CapturePurpose.NOTE) return@synchronized OrgExportResult(OrgState.NONE, null, "not-a-note")
-        if (record.orgState == OrgState.EXPORTED) return@synchronized OrgExportResult(OrgState.EXPORTED, record.exportDestinationId)
+        if (record.orgState == OrgState.EXPORTED) {
+            val retired = runCatching {
+                record.exportDestinationId?.let { destinationId ->
+                    journalDatabase.get(captureId, destinationId)?.let { retireCommittedJournal(captureId, destinationId, it) }
+                } ?: true
+            }.getOrDefault(false)
+            return@synchronized OrgExportResult(OrgState.EXPORTED, record.exportDestinationId,
+                if (retired) null else "export-cleanup-pending")
+        }
         if (record.recognitionState == RecognitionState.FINAL && record.finalText.isNullOrBlank()) {
             repository.update(captureId) { it.copy(recognitionState = RecognitionState.NO_SPEECH, orgState = OrgState.WAITING_FOR_TRANSCRIPT) }
             return@synchronized OrgExportResult(OrgState.WAITING_FOR_TRANSCRIPT, record.exportDestinationId, "no-speech")
@@ -53,18 +60,18 @@ class OrgExportCoordinator(context: Context) {
             repository.update(captureId) { it.copy(orgState = OrgState.WRITING, exportDestinationId = destination.id) }
         }
         val journalKey = journalKey(captureId, destination.id)
-        val journal = journalDatabase.get(captureId, destination.id)
         try {
+            val journal = try {
+                journalDatabase.get(captureId, destination.id)
+            } catch (_: Exception) {
+                return@synchronized markReview(captureId, destination.id, "export-journal-unreadable")
+            }
             if (journal != null) {
-                if (!runCatching { journalTargetsCurrentInbox(journal) }.getOrDefault(false)) {
-                    if (runCatching { hasConfirmedLegacyPostimage(destination, journal, record) }.getOrDefault(false)) {
-                        return@synchronized try {
-                            commitExport(captureId, destination.id, record.transcriptVersion)
-                        } catch (_: Exception) {
-                            markReview(captureId, destination.id, "legacy-export-metadata-commit-failed")
-                        }
-                    }
+                if (journal.optString("targetName") != ORG_INBOX_NAME) {
                     return@synchronized markReview(captureId, destination.id, "export-journal-target-changed-requires-review")
+                }
+                if (!runCatching { validateJournal(journal, record, destination) }.getOrDefault(false)) {
+                    return@synchronized markReview(captureId, destination.id, "export-journal-invalid")
                 }
                 if (journal.getLong("transcriptVersion") != record.transcriptVersion) {
                     return@synchronized markReview(captureId, destination.id, "transcript-changed-during-export")
@@ -89,10 +96,17 @@ class OrgExportCoordinator(context: Context) {
                 }
             }
 
-            val target = findInbox(destination.treeUri)
-            if (target == null && journalDatabase.hasPendingDestination(destination.id, ::journalTargetsCurrentInbox)) {
-                return@synchronized markReview(captureId, destination.id, "pending-inbox-creation-requires-review")
+            when (runCatching { reconcileCommittedDestination(destination.id) }.getOrDefault(DestinationCleanup.REVIEW)) {
+                DestinationCleanup.REVIEW -> return@synchronized markReview(captureId, destination.id, "pending-inbox-export-requires-review")
+                DestinationCleanup.PROGRESS -> {
+                    repository.update(captureId) {
+                        it.copy(orgState = OrgState.RETRYABLE_ERROR, lastErrorStage = "org", lastErrorCode = "export-cleanup-pending")
+                    }
+                    return@synchronized OrgExportResult(OrgState.RETRYABLE_ERROR, destination.id, "export-cleanup-pending")
+                }
+                DestinationCleanup.CLEAR -> Unit
             }
+            val target = findInbox(destination.treeUri)
             val captureDirectory = File(File(appContext.filesDir, "capture-org"), journalKey)
             if (!captureDirectory.exists() && !captureDirectory.mkdirs()) throw IOException("Cannot create private Org recovery directory")
             val preimage = File(captureDirectory, "preimage.bin")
@@ -179,40 +193,36 @@ class OrgExportCoordinator(context: Context) {
             )
         } ?: return OrgExportResult(OrgState.RETRYABLE_ERROR, destinationId, "capture-disappeared")
         if (updated.orgState == OrgState.EXPORTED) {
-            val journal = journalDatabase.get(captureId, destinationId)
-            journal?.let { staged ->
-                listOf("preimage", "postimage", "entry").forEach { staged.optString(it).takeIf(String::isNotEmpty)?.let(::File)?.delete() }
-                journalDatabase.remove(captureId, destinationId)
-            }
-            return OrgExportResult(OrgState.EXPORTED, destinationId)
+            val retired = runCatching {
+                journalDatabase.get(captureId, destinationId)?.let { retireCommittedJournal(captureId, destinationId, it) } ?: true
+            }.getOrDefault(false)
+            return OrgExportResult(OrgState.EXPORTED, destinationId, if (retired) null else "export-cleanup-pending")
         }
         return OrgExportResult(OrgState.NEEDS_REVIEW, destinationId, "transcript-version-changed")
     }
 
     private fun journalHasStartedWriting(captureId: String, destinationId: String): Boolean =
-        journalDatabase.get(captureId, destinationId)?.optString("phase") in setOf("WRITING", "NEEDS_REVIEW")
+        runCatching { journalDatabase.get(captureId, destinationId)?.optString("phase") in setOf("WRITING", "NEEDS_REVIEW") }.getOrDefault(true)
 
     private class OrgReviewException(message: String) : IOException(message)
 
-    private fun journalTargetsCurrentInbox(journal: JSONObject): Boolean {
+    private fun journalTargetsCurrentInbox(destination: NotesDestination, journal: JSONObject): Boolean {
         if (journal.optString("targetName") != ORG_INBOX_NAME) return false
-        val target = journal.optString("targetUri").takeIf(String::isNotEmpty)?.let(Uri::parse) ?: return true
-        return queryDocumentName(target) !in setOf("inbox.org", "inbox.org.txt")
+        val target = journal.getString("targetUri").takeIf(String::isNotEmpty)?.let(Uri::parse)
+            ?: return journal.getBoolean("targetWasAbsent")
+        return isSelectedInbox(destination.treeUri, target)
     }
 
-    private fun hasConfirmedLegacyPostimage(destination: NotesDestination, journal: JSONObject, record: CaptureRecord): Boolean {
-        if (journal.getString("captureId") != record.captureId || journal.getString("destinationId") != destination.id) return false
-        if (journal.getLong("transcriptVersion") != record.transcriptVersion) return false
+    private fun validateJournal(journal: JSONObject, record: CaptureRecord, destination: NotesDestination): Boolean {
+        if (!journalTargetsCurrentInbox(destination, journal)) return false
+        val destinationId = destination.id
+        if (journal.getString("captureId") != record.captureId || journal.getString("destinationId") != destinationId) return false
         if (journal.getString("phase") !in setOf("PREPARED", "WRITING", "NEEDS_REVIEW")) return false
-        val target = journal.getString("targetUri").takeIf(String::isNotEmpty)?.let(Uri::parse) ?: return false
-        if (target.scheme != "content" || target.authority != destination.treeUri.authority) return false
-        if (DocumentsContract.getTreeDocumentId(target) != DocumentsContract.getTreeDocumentId(destination.treeUri)) return false
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return false
-        val root = DocumentsContract.buildDocumentUriUsingTree(destination.treeUri, DocumentsContract.getTreeDocumentId(destination.treeUri))
-        if (!DocumentsContract.isChildDocument(resolver, root, target)) return false
-        if (queryDocumentName(target) !in setOf("inbox.org", "inbox.org.txt")) return false
-
-        val directory = File(File(appContext.filesDir, "capture-org"), journalKey(record.captureId, destination.id))
+        journal.getLong("transcriptVersion")
+        val targetUri = journal.getString("targetUri")
+        val targetWasAbsent = journal.getBoolean("targetWasAbsent")
+        if (targetUri.isEmpty() && !targetWasAbsent) return false
+        val directory = File(File(appContext.filesDir, "capture-org"), journalKey(record.captureId, destinationId))
         val canonicalDirectory = File(File(appContext.filesDir.canonicalFile, "capture-org"), directory.name)
         if (directory.canonicalFile != canonicalDirectory) return false
         fun ownedStage(field: String, name: String): File? {
@@ -227,7 +237,7 @@ class OrgExportCoordinator(context: Context) {
         val preLength = journal.getLong("preLength")
         val postLength = journal.getLong("postLength")
         if (preLength < 0 || preimage.length() != preLength || postimage.length() != postLength) return false
-        if (journal.getBoolean("targetWasAbsent") && preLength != 0L) return false
+        if (targetWasAbsent && preLength != 0L) return false
         if (hashFile(preimage) != journal.getString("preHash") || hashFile(postimage) != journal.getString("postHash")) return false
         val expectedEntry = OrgExport.formatEntry(record.finalText ?: return false, record.finishedLocalDate ?: return false)
         if (entry.length() != expectedEntry.size.toLong() || !entry.readBytes().contentEquals(expectedEntry)) return false
@@ -238,8 +248,70 @@ class OrgExportCoordinator(context: Context) {
             override fun write(bytes: ByteArray, offset: Int, length: Int) = digest.update(bytes, offset, length)
         }
         FileInputStream(preimage).use { OrgExport.writePrepended(expectedEntry, it, hashOutput) }
-        if (digest.digest().hex() != journal.getString("postHash")) return false
-        return hashDocument(target) == journal.getString("postHash")
+        return digest.digest().hex() == journal.getString("postHash")
+    }
+
+    /** Only durable capture metadata authorizes retirement; recovery stages may already be gone. */
+    private fun retireCommittedJournal(captureId: String, destinationId: String, journal: JSONObject): Boolean {
+        if (!hasCommittedOwner(captureId, destinationId, journal)) return false
+        // Derive every cleanup path: journal paths are never deletion authority, even after commit.
+        val directory = File(File(appContext.filesDir, "capture-org"), journalKey(captureId, destinationId))
+        val canonicalDirectory = File(File(appContext.filesDir.canonicalFile, "capture-org"), directory.name)
+        if (directory.canonicalFile != canonicalDirectory) return false
+        val stages = listOf("preimage.bin", "postimage.bin", "entry.bin").map { File(directory, it) }
+        if (stages.any { it.canonicalFile != File(canonicalDirectory, it.name) }) return false
+        for (stage in stages) {
+            if (stage.exists() && (!stage.isFile || !stage.delete())) return false
+        }
+        journalDatabase.remove(captureId, destinationId)
+        return true
+    }
+
+    private fun hasCommittedOwner(captureId: String, destinationId: String, journal: JSONObject): Boolean {
+        if (journal.getString("captureId") != captureId || journal.getString("destinationId") != destinationId) return false
+        if (journal.getString("targetName") != ORG_INBOX_NAME) return false
+        if (journal.getString("phase") !in setOf("PREPARED", "WRITING", "NEEDS_REVIEW")) return false
+        val version = journal.getLong("transcriptVersion")
+        val target = Uri.parse(journal.getString("targetUri"))
+        if (target.scheme != "content" || target.authority.isNullOrEmpty() || !DocumentsContract.isTreeUri(target)) return false
+        DocumentsContract.getDocumentId(target)
+        journal.getBoolean("targetWasAbsent")
+        if (journal.getLong("preLength") < 0 || journal.getLong("postLength") < 0) return false
+        for (field in listOf("preHash", "postHash")) {
+            val hash = journal.getString(field)
+            if (hash.length != 64 || hash.any { it !in '0'..'9' && it !in 'a'..'f' }) return false
+        }
+        for (field in listOf("preimage", "postimage", "entry")) {
+            if (journal.getString(field).isEmpty()) return false
+        }
+        val owner = repository.get(captureId) ?: return false
+        if (owner.captureId != captureId || owner.purpose != CapturePurpose.NOTE || owner.orgState != OrgState.EXPORTED ||
+            owner.exportDestinationId != destinationId || owner.exportTranscriptVersion != version || owner.transcriptVersion < version) return false
+        return true
+    }
+
+    private enum class DestinationCleanup { CLEAR, PROGRESS, REVIEW }
+
+    /** Bounded lookahead proves the next row is committed before requesting scheduled continuation. */
+    private fun reconcileCommittedDestination(destinationId: String): DestinationCleanup {
+        val rows = journalDatabase.destinationJournals(destinationId, MAX_JOURNAL_RETIREMENTS + 1)
+        if (rows.any { (captureId, journal) -> !hasCommittedOwner(captureId, destinationId, journal) }) return DestinationCleanup.REVIEW
+        for ((captureId, journal) in rows.take(MAX_JOURNAL_RETIREMENTS)) {
+            if (!retireCommittedJournal(captureId, destinationId, journal)) return DestinationCleanup.REVIEW
+        }
+        return when {
+            rows.size > MAX_JOURNAL_RETIREMENTS -> DestinationCleanup.PROGRESS
+            journalDatabase.hasPendingDestination(destinationId) -> DestinationCleanup.REVIEW
+            else -> DestinationCleanup.CLEAR
+        }
+    }
+
+    private fun isSelectedInbox(treeUri: Uri, target: Uri): Boolean {
+        if (target.scheme != "content" || target.authority != treeUri.authority) return false
+        if (!DocumentsContract.isTreeUri(target)) return false
+        if (DocumentsContract.getTreeDocumentId(target) != DocumentsContract.getTreeDocumentId(treeUri)) return false
+        // Positive enumeration binds the exact document to this folder before any target query/read.
+        return findInbox(treeUri) == target
     }
 
     private fun findInbox(treeUri: Uri): Uri? {
@@ -278,8 +350,7 @@ class OrgExportCoordinator(context: Context) {
     }
 
     private fun ensureExactInboxName(treeUri: Uri, target: Uri, journal: JSONObject): Uri {
-        val selected = findInbox(treeUri)
-        if (selected != null && selected != target) throw OrgReviewException("journaled-inbox-is-not-the-unique-canonical-target")
+        if (!isSelectedInbox(treeUri, target)) throw OrgReviewException("journaled-inbox-is-not-the-unique-canonical-target")
         val name = queryDocumentName(target)
         if (isInboxDocumentName(name)) return target
         if (name != ORG_INBOX_TEXT_EXTENSION_NAME) throw OrgReviewException(EXACT_INBOX_NAME_ERROR)
@@ -294,8 +365,8 @@ class OrgExportCoordinator(context: Context) {
         } ?: throw OrgReviewException(EXACT_INBOX_NAME_ERROR)
         journal.put("targetUri", renamed.toString())
         journalDatabase.put(journal.getString("captureId"), journal.getString("destinationId"), journal)
+        if (!isSelectedInbox(treeUri, renamed)) throw OrgReviewException(EXACT_INBOX_NAME_ERROR)
         if (!isInboxDocumentName(queryDocumentName(renamed))) throw OrgReviewException(EXACT_INBOX_NAME_ERROR)
-        if (findInbox(treeUri) != renamed) throw OrgReviewException("journaled-inbox-is-not-the-unique-canonical-target")
         return renamed
     }
 
@@ -400,6 +471,7 @@ class OrgExportCoordinator(context: Context) {
     companion object {
         private const val COPY_BUFFER_BYTES = 64 * 1024
         private const val MAX_AUTOMATIC_RETRIES = 3
+        private const val MAX_JOURNAL_RETIREMENTS = 32
         private const val EXACT_INBOX_NAME_ERROR = "provider-cannot-name-inbox-exactly-rename-to-ai-inbox.org-or-choose-another-folder"
         private val processExportLock = Any()
         private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
@@ -428,14 +500,21 @@ private class OrgJournalDatabase(context: Context) : SQLiteOpenHelper(context, "
     ).use { cursor -> if (cursor.moveToFirst()) JSONObject(cursor.getString(0)) else null }
 
     @Synchronized
-    fun hasPendingDestination(destinationId: String, targetMatches: (JSONObject) -> Boolean): Boolean = readableDatabase.rawQuery(
-        "SELECT body FROM org_journal WHERE destination_id = ?",
+    fun destinationJournals(destinationId: String, limit: Int): List<Pair<String, JSONObject>> = readableDatabase.rawQuery(
+        "SELECT capture_id, body FROM org_journal WHERE destination_id = ? ORDER BY capture_id LIMIT ?",
+        arrayOf(destinationId, limit.toString()),
+    ).use { cursor ->
+        val rows = ArrayList<Pair<String, JSONObject>>()
+        while (cursor.moveToNext()) rows += cursor.getString(0) to JSONObject(cursor.getString(1))
+        rows
+    }
+
+    @Synchronized
+    fun hasPendingDestination(destinationId: String): Boolean = readableDatabase.rawQuery(
+        "SELECT 1 FROM org_journal WHERE destination_id = ? LIMIT 1",
         arrayOf(destinationId),
     ).use { cursor ->
-        while (cursor.moveToNext()) {
-            if (targetMatches(JSONObject(cursor.getString(0)))) return@use true
-        }
-        false
+        cursor.moveToFirst()
     }
 
     @Synchronized
