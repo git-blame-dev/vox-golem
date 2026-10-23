@@ -1304,15 +1304,7 @@ impl Record {
                     parent.validate()?;
                 }
                 request.validate()?;
-                bounded_text(prompt, "prompt", MAX_PROMPT_BYTES, true)?;
-                bounded_text(answer.text(), "answer", MAX_TURN_TEXT_BYTES, true)?;
-                crate::sources::validate_sources(sources).map_err(|_| limit("sources"))?;
-                if matches!(answer, Answer::Refusal { .. }) && !sources.is_empty() {
-                    return Err(limit("refusal_sources"));
-                }
-                if op.text_bytes() > MAX_TURN_TEXT_BYTES {
-                    return Err(limit("turn_text_bytes"));
-                }
+                validate_completed_content(prompt, answer, sources)?;
                 for (field, text) in [
                     ("requested_model", &provenance.requested_model),
                     ("policy_id", &provenance.policy_id),
@@ -1340,6 +1332,29 @@ impl Record {
     }
 }
 
+/// Validate the canonical persisted content, independently of graph and provenance metadata.
+pub fn validate_completed_content(
+    prompt: &str,
+    answer: &Answer,
+    sources: &[crate::sources::SourceLink],
+) -> Result<(), DomainError> {
+    bounded_text(prompt, "prompt", MAX_PROMPT_BYTES, true)?;
+    bounded_text(answer.text(), "answer", MAX_TURN_TEXT_BYTES, true)?;
+    crate::sources::validate_sources(sources).map_err(|_| limit("sources"))?;
+    if matches!(answer, Answer::Refusal { .. }) && !sources.is_empty() {
+        return Err(limit("refusal_sources"));
+    }
+    if prompt
+        .len()
+        .saturating_add(answer.text().len())
+        .saturating_add(crate::sources::source_bytes(sources))
+        > MAX_TURN_TEXT_BYTES
+    {
+        return Err(limit("turn_text_bytes"));
+    }
+    Ok(())
+}
+
 fn bounded_text(text: &str, field: &str, max: usize, nonempty: bool) -> Result<(), DomainError> {
     if text.len() > max {
         return Err(limit(field));
@@ -1353,6 +1368,56 @@ fn bounded_text(text: &str, field: &str, max: usize, nonempty: bool) -> Result<(
 }
 fn limit(name: &str) -> DomainError {
     DomainError::LimitExceeded { limit: name.into() }
+}
+
+#[cfg(test)]
+mod completed_content_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_content_checks_utf8_prompt_sources_and_refusals() {
+        let source = crate::sources::SourceLink {
+            url: "https://example.test/synthetic".into(),
+            title: "Synthetic source".into(),
+        };
+        for prompt in ["p".into(), "🧪".repeat(MAX_PROMPT_BYTES / 4)] {
+            let sources = vec![source.clone()];
+            let bytes = MAX_TURN_TEXT_BYTES - prompt.len() - crate::sources::source_bytes(&sources);
+            let text = format!("{}{}", "🧪".repeat(bytes / 4), "x".repeat(bytes % 4));
+            validate_completed_content(&prompt, &Answer::Text { text: text.clone() }, &sources)
+                .unwrap();
+            assert!(validate_completed_content(
+                &prompt,
+                &Answer::Text { text: text + "x" },
+                &sources
+            )
+            .is_err());
+        }
+        let answer = Answer::Refusal {
+            reason: "Synthetic refusal".into(),
+        };
+        validate_completed_content("p", &answer, &[]).unwrap();
+        assert_eq!(
+            validate_completed_content("p", &answer, std::slice::from_ref(&source)),
+            Err(limit("refusal_sources"))
+        );
+        assert!(validate_completed_content(" ", &answer, &[]).is_err());
+        assert!(
+            validate_completed_content(&"p".repeat(MAX_PROMPT_BYTES + 1), &answer, &[]).is_err()
+        );
+        assert!(validate_completed_content("p", &Answer::Text { text: " ".into() }, &[]).is_err());
+        assert!(validate_completed_content(
+            "p",
+            &Answer::Text {
+                text: "Synthetic answer".into()
+            },
+            &[crate::sources::SourceLink {
+                url: "not-a-url".into(),
+                ..source
+            }]
+        )
+        .is_err());
+    }
 }
 
 fn quarantine_reason(error: &DomainError) -> Result<QuarantineReason, DomainError> {

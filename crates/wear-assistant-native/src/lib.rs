@@ -138,6 +138,7 @@ async fn await_response(
     response: impl Future<Output = Result<CustomOpenAiResponse, CustomOpenAiError>>,
     mut cancelled: watch::Receiver<bool>,
     mut callback_failure: watch::Receiver<Option<ErrorCode>>,
+    prompt: &str,
 ) -> Outcome {
     tokio::select! {
         biased;
@@ -151,7 +152,7 @@ async fn await_response(
             } else if *cancelled.borrow() {
                 Outcome::Cancelled
             } else {
-                Outcome::from_response(result)
+                Outcome::from_response(result, prompt)
             }
         }
     }
@@ -162,8 +163,9 @@ async fn await_authenticated_response(
     revision: &Cell<Option<CustomOpenAiAuthRevision>>,
     cancelled: watch::Receiver<bool>,
     callback_failure: watch::Receiver<Option<ErrorCode>>,
+    prompt: &str,
 ) -> Outcome {
-    await_response(response, cancelled, callback_failure)
+    await_response(response, cancelled, callback_failure, prompt)
         .await
         .with_auth_revision(revision.get().map(auth_revision_string))
 }
@@ -279,7 +281,14 @@ async fn direct_response(
             }
         },
     );
-    await_authenticated_response(response, &auth_revision, cancelled, failure_rx).await
+    await_authenticated_response(
+        response,
+        &auth_revision,
+        cancelled,
+        failure_rx,
+        &request.prompt.prompt,
+    )
+    .await
 }
 
 fn deliver_bounded_delta(
@@ -809,7 +818,14 @@ mod tests {
             );
             let (_cancel_tx, cancel_rx) = watch::channel(false);
             let (_failure_tx, failure_rx) = watch::channel(None);
-            await_authenticated_response(response, &revision, cancel_rx, failure_rx).await
+            await_authenticated_response(
+                response,
+                &revision,
+                cancel_rx,
+                failure_rx,
+                &request.prompt.prompt,
+            )
+            .await
         });
         server.join().unwrap();
         let value: serde_json::Value = serde_json::from_str(&outcome.json()).unwrap();
@@ -854,7 +870,10 @@ mod tests {
                 tokio::task::yield_now().await;
                 cancel_tx.send(true).unwrap();
             };
-            let (outcome, ()) = tokio::join!(await_response(future, cancel_rx, failure_rx), signal);
+            let (outcome, ()) = tokio::join!(
+                await_response(future, cancel_rx, failure_rx, "Synthetic prompt"),
+                signal
+            );
             assert_eq!(outcome.json(), r#"{"status":"cancelled"}"#);
             assert!(dropped.load(Ordering::SeqCst));
         });
@@ -869,7 +888,7 @@ mod tests {
                 failure_tx.send(Some(ErrorCode::CallbackFailed)).unwrap();
                 Err(CustomOpenAiError::Transport)
             };
-            let result = await_response(response, cancel_rx, failure_rx).await;
+            let result = await_response(response, cancel_rx, failure_rx, "Synthetic prompt").await;
             assert_eq!(
                 result.json(),
                 r#"{"status":"error","code":"callback_failed"}"#
@@ -888,7 +907,12 @@ mod tests {
                 failure_tx.send(Some(ErrorCode::CallbackFailed)).unwrap();
             };
             let (outcome, ()) = tokio::join!(
-                await_response(PendingResponse(dropped.clone()), cancel_rx, failure_rx),
+                await_response(
+                    PendingResponse(dropped.clone()),
+                    cancel_rx,
+                    failure_rx,
+                    "Synthetic prompt"
+                ),
                 signal
             );
             assert_eq!(

@@ -270,7 +270,8 @@ pub(crate) async fn respond_with_web<W: voxgolem_platform::search::WebExecutor>(
                         title: source.title,
                     })
                     .collect();
-                let outcome = Outcome::from_search_response(result.response, sources);
+                let outcome =
+                    Outcome::from_search_response(result.response, sources, &request.prompt.prompt);
                 // Some search output is withheld until the final outcome, not streamed.
                 if let Outcome::Complete { text, .. } = &outcome {
                     if cancellation.is_cancelled() {
