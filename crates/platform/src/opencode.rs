@@ -1660,6 +1660,7 @@ impl OpencodeSseDecoder {
                                 if matches!(error, OpencodeServerError::FrameTooLarge) {
                                     self.poisoned = true;
                                     self.buffer.clear();
+                                    self.boundary = crate::sse::Boundary::default();
                                     self.stream_parts.clear();
                                 }
                                 events.push(Err(error));
@@ -1675,6 +1676,7 @@ impl OpencodeSseDecoder {
         }
         if self.buffer.len() > MAX_SSE_FRAME_BYTES {
             self.buffer.clear();
+            self.boundary = crate::sse::Boundary::default();
             events.push(Err(OpencodeServerError::FrameTooLarge));
         }
         events
@@ -2368,6 +2370,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn oversize_incomplete_frame_resets_framing_cursor() {
+        let mut decoder = OpencodeSseDecoder::new("ses_synthetic".into());
+        let oversized = vec![b'x'; super::MAX_SSE_FRAME_BYTES + 1];
+        assert!(matches!(
+            decoder.push(&oversized).as_slice(),
+            [Err(OpencodeServerError::FrameTooLarge)]
+        ));
+        let events = decoder.push(
+            b"data: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"ses_synthetic\"}}\n\n",
+        );
+        assert!(matches!(events.as_slice(), [Ok(OpencodeEvent::Completed)]));
     }
 
     #[test]
