@@ -120,7 +120,7 @@ test-router-head:
 	mkdir -p /tmp/opencode
 	python3 -m unittest discover -s tools/router-head -p 'test_*.py'
 
-.PHONY: help app-version icons test test-release-tools test-android-tools check-android-tools android-init android-build android-capture-test check-wear-tools wear-test wear-build wear-performance check-linux-tools app app-smoke packaged-smoke app-dev linux dist stage-linux-existing verify-dist prepare-appimage-tools update-bundle postprocess-update-bundle verify-update-bundle update-bundle-smoke check-pc-tools prepare-pc-bundle pc pc-dist verify-pc-dist pc-installer verify-pc-installer clean
+.PHONY: help app-version icons test test-release-tools test-android-tools check-android-tools android-init android-build android-release android-capture-test check-wear-tools wear-test wear-build wear-performance check-linux-tools app app-smoke packaged-smoke app-dev linux dist stage-linux-existing verify-dist prepare-appimage-tools update-bundle postprocess-update-bundle verify-update-bundle update-bundle-smoke check-pc-tools prepare-pc-bundle pc pc-dist verify-pc-dist pc-installer verify-pc-installer clean
 
 help:
 	@printf '%s\n' 'Targets:'
@@ -147,6 +147,7 @@ help:
 	@printf '%s\n' '  make pc-installer Build the lightweight Windows NSIS installer from Linux'
 	@printf '%s\n' '  make android-init Regenerate the pinned Android platform scaffold'
 	@printf '%s\n' '  make android-build Build the ARM64 Android debug APK'
+	@printf '%s\n' '  make android-release Build the optimized ARM64 Android release APK (unsigned without local signing configuration)'
 	@printf '%s\n' '  make android-capture-test Run native capture unit tests and lint after android-build'
 	@printf '%s\n' '  make android-voice-test Run SDK-only voice unit tests and lint without building JNI'
 	@printf '%s\n' '  make wear-test Run Wear capture unit tests and lint'
@@ -217,6 +218,10 @@ android-init: check-android-tools
 android-build: check-android-tools
 	python3 scripts/prepare-android-capture.py
 	cd apps/android-tauri/src-tauri && cargo tauri android build --debug --target aarch64 --apk --ci -- --locked
+
+android-release: check-android-tools
+	python3 scripts/prepare-android-capture.py
+	cd apps/android-tauri/src-tauri && cargo tauri android build --target aarch64 --apk --ci -- --locked
 
 android-capture-test: check-android-tools
 	python3 scripts/prepare-android-capture.py

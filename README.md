@@ -27,6 +27,7 @@ Run from this source checkout on Linux. Use JDK 21, Android SDK platform/build t
 
 ```bash
 make android-build           # ARM64 phone debug APK, including both native plugins
+make android-release         # optimized ARM64 phone release APK; unsigned without local signing config
 make android-assistant-test  # shared Assistant + phone bridge unit tests and lint
 make android-capture-test    # shared capture + phone plugin unit tests and lint
 make wear-test               # shared libraries + Wear unit tests and lint
@@ -35,6 +36,8 @@ make wear-performance        # optimized, non-debuggable, debug-signed local tri
 ```
 
 Phone output: `apps/android-tauri/src-tauri/gen/android/app/build/outputs/apk/universal/debug/`. Wear outputs: `apps/wear/app/build/outputs/apk/{debug,performance}/`. An optimized local trial is not a production-signed release. These commands build/check source; they do not install anything.
+
+Phone release output is `apps/android-tauri/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk` with the current unsigned release configuration. `android-release` uses Tauri's default release mode (optimized Rust and R8, no debug profile override). Linux CI retains the debug checks and additionally publishes `vox-golem-android-optimized-ci-arm64-debug-key`: an aligned, non-debuggable ARM64 release APK signed with that job's existing Android debug key, plus R8 mapping, signature/inspection evidence and APK SHA-256. This is a **CI trial, not production signing**, and its certificate is not guaranteed compatible with installed phone/Watch apps. It does not change local signing configuration or authorize installation. See the [phone build guide](apps/android-tauri/README.md#optimized-release-and-ci-trial) for checks and remaining device acceptance.
 
 `make android-init` is the only phone scaffold-regeneration command. Keep authored configuration, native libraries and UI sources outside generated output; launcher assets derive from the canonical [SVG](apps/desktop-tauri/src-tauri/icons/icon.svg). The [phone shell guide](apps/android-tauri/README.md) covers native setup, and the [Wear guide](apps/wear/README.md) covers launchers and device gates.
 

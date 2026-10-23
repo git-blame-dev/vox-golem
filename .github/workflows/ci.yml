@@ -26,7 +26,7 @@ jobs:
 
   android-artifact:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
@@ -53,6 +53,57 @@ jobs:
         run: make android-capture-test
       - name: Check shared and phone Assistant
         run: make android-assistant-test
+      - name: Build the optimized ARM64 release app
+        env:
+          ORG_GRADLE_PROJECT_voxgolemCaptureTiming: 'false'
+        run: make android-release
+      - name: Sign and verify the optimized phone CI trial
+        run: |
+          build=apps/android-tauri/src-tauri/gen/android/app/build
+          tools="$ANDROID_HOME/build-tools/36.0.0"
+          apk=android-optimized-ci/vox-golem-android-optimized-ci-arm64.apk
+          test -s "$build/outputs/apk/universal/release/app-universal-release-unsigned.apk"
+          test -s "$build/outputs/mapping/universalRelease/mapping.txt"
+          test -f "$HOME/.android/debug.keystore"
+          mkdir android-optimized-ci
+          "$tools/zipalign" -P 16 -f 4 \
+            "$build/outputs/apk/universal/release/app-universal-release-unsigned.apk" \
+            android-optimized-ci/aligned.apk
+          "$tools/apksigner" sign --ks "$HOME/.android/debug.keystore" \
+            --ks-key-alias androiddebugkey --ks-pass pass:android --key-pass pass:android \
+            --out "$apk" android-optimized-ci/aligned.apk
+          rm android-optimized-ci/aligned.apk
+          "$tools/zipalign" -c -P 16 4 "$apk"
+          "$tools/apksigner" verify --verbose --print-certs "$apk" | tee android-optimized-ci/signature.txt
+          "$tools/apksigner" verify --print-certs \
+            "$build/outputs/apk/universal/debug/app-universal-debug.apk" > android-optimized-ci/debug-signature.txt
+          grep '^Signer #1 certificate SHA-256 digest:' android-optimized-ci/signature.txt > android-optimized-ci/release-cert.txt
+          grep '^Signer #1 certificate SHA-256 digest:' android-optimized-ci/debug-signature.txt > android-optimized-ci/debug-cert.txt
+          cmp android-optimized-ci/release-cert.txt android-optimized-ci/debug-cert.txt
+          "$tools/aapt" dump badging "$apk" > android-optimized-ci/badging.txt
+          grep -q "^package: name='dev.gitblame.voxgolem.android' " android-optimized-ci/badging.txt
+          grep -Fx "native-code: 'arm64-v8a'" android-optimized-ci/badging.txt
+          if grep -q '^application-debuggable' android-optimized-ci/badging.txt; then
+            printf '%s\n' 'Optimized CI APK must not be debuggable.' >&2
+            exit 1
+          fi
+          unzip -Z1 "$apk" > android-optimized-ci/entries.txt
+          grep -Fx 'lib/arm64-v8a/libvox_golem_android_lib.so' android-optimized-ci/entries.txt
+          grep -Fx 'lib/arm64-v8a/libwear_assistant_native.so' android-optimized-ci/entries.txt
+          if grep -Eq '^lib/.*/(gdbserver|lldb-server|wrap\.sh)$' android-optimized-ci/entries.txt; then
+            printf '%s\n' 'Optimized CI APK contains native debug launch helpers.' >&2
+            exit 1
+          fi
+          native_dir="$(mktemp -d)"
+          trap 'rm -rf "$native_dir"' EXIT
+          unzip -j "$apk" 'lib/arm64-v8a/*.so' -d "$native_dir"
+          for library in "$native_dir/"*.so; do
+            header="android-optimized-ci/$(basename "$library").elf-header.txt"
+            "$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -h "$library" > "$header"
+            grep -Eq 'Machine: +AArch64$' "$header"
+          done
+          cp "$build/outputs/mapping/universalRelease/mapping.txt" android-optimized-ci/mapping.txt
+          (cd android-optimized-ci && sha256sum vox-golem-android-optimized-ci-arm64.apk > SHA256SUMS)
       - name: Check and build debug and optimized Wear companions
         run: make wear-test wear-build wear-performance
       - name: Verify the APK signature
@@ -67,6 +118,11 @@ jobs:
         with:
           name: vox-golem-android-debug-arm64
           path: apps/android-tauri/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: vox-golem-android-optimized-ci-arm64-debug-key
+          path: android-optimized-ci
+          if-no-files-found: error
       - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
         with:
           name: vox-golem-wear-debug
