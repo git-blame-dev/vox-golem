@@ -35,8 +35,8 @@ class GeminiNanoProvider(
             val rawInstructions = reqObj.optString("instructions", "").trim()
             // Keep local prompts compact without dropping requested-format qualifications.
             val cleanedInstructions = rawInstructions
-                .replace(DEFAULT_CLOUD_TOOL_INSTRUCTIONS, "")
                 .replace(AssistantEngine.BASE_INSTRUCTIONS, "")
+                .replace(DEFAULT_CLOUD_TOOL_INSTRUCTIONS, "")
                 .trim()
             val messages = reqObj.optJSONArray("messages")
             var promptText = reqObj.optString("prompt", "").takeIf { it.isNotBlank() }.orEmpty()
