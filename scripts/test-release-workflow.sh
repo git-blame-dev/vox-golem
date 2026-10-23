@@ -2,8 +2,86 @@
 set -eu -o pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-temp_dir="$(mktemp -d)"
+mkdir -p /tmp/opencode
+temp_dir="$(mktemp -d /tmp/opencode/release-workflow.XXXXXX)"
 trap 'rm -rf "$temp_dir"' EXIT
+
+# Execute the actual CI packaging recipes with a synthetic build boundary.
+# A second build or staging before the versioned build must fail even when the
+# workflow's archive label claims the expected version.
+mkdir -p "$temp_dir/native/bin" "$temp_dir/native/project"
+cat > "$temp_dir/native/bin/make" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+case "$*" in
+  dist|update-bundle)
+    test ! -e build-count || { printf '%s\n' 'Redundant native app build.' >&2; exit 1; }
+    printf '%s\n' 1 > build-count
+    mkdir -p target/release/bundle/appimage
+    version=unversioned
+    [ "$*" != update-bundle ] || version="$EXPECTED_VERSION"
+    printf '%s\n' "$version" > target/release/vox-golem
+    cp target/release/vox-golem target/release/bundle/appimage/VoxGolem.AppImage
+    if [ "$*" = dist ]; then
+      mkdir -p dist/VoxGolem
+      cp target/release/vox-golem dist/VoxGolem/vox-golem
+    fi
+    ;;
+  stage-linux-existing)
+    test "$(cat target/release/vox-golem)" = "$EXPECTED_VERSION"
+    mkdir -p dist/VoxGolem
+    cp target/release/vox-golem dist/VoxGolem/vox-golem
+    ;;
+  packaged-smoke)
+    test "$(cat dist/VoxGolem/vox-golem)" = "$EXPECTED_VERSION"
+    cmp target/release/vox-golem dist/VoxGolem/vox-golem
+    ;;
+  update-bundle-smoke)
+    cmp target/release/vox-golem target/release/bundle/appimage/VoxGolem.AppImage
+    ;;
+  *) printf 'Unexpected CI make invocation: %s\n' "$*" >&2; exit 1 ;;
+esac
+EOF
+cat > "$temp_dir/native/bin/xvfb-run" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+test "$1" = -a
+shift
+exec "$@"
+EOF
+chmod 0755 "$temp_dir/native/bin/"*
+native_command="$(bun -e '
+  import assert from "node:assert/strict";
+  const [root] = Bun.argv.slice(1);
+  const workflow = Bun.YAML.parse(await Bun.file(`${root}/.github/workflows/ci.yml`).text());
+  const steps = workflow.jobs["native-artifact"].steps;
+  const start = steps.findIndex((step) => step.name === "Determine application version");
+  const end = steps.findIndex((step) => step.name === "Archive Linux artifacts with executable modes");
+  assert.ok(start >= 0 && end > start);
+  for (const step of steps.slice(start + 1, end + 1)) {
+    assert.ok(step.run, "native packaging step must be executable");
+    console.log("(");
+    for (const [key, value] of Object.entries(step.env ?? {})) {
+      const resolved = value === "${{ steps.app_version.outputs.version }}" ? "2026.7.27-42" :
+        value === "${{ github.token }}" ? "synthetic-token" : value;
+      assert.match(key, /^[A-Z_]+$/);
+      console.log(`export ${key}=${JSON.stringify(resolved)}`);
+    }
+    console.log(step.run);
+    console.log(")");
+  }
+' "$root")"
+(
+  cd "$temp_dir/native/project"
+  PATH="$temp_dir/native/bin:$PATH" EXPECTED_VERSION='2026.7.27-42' \
+    bash -e -o pipefail -c "$native_command"
+  test "$(tar -xOzf vox-golem-linux.tar.gz VoxGolem/vox-golem)" = '2026.7.27-42'
+  test "$(tar -xOzf vox-golem-linux.tar.gz APP_VERSION)" = '2026.7.27-42'
+  test "$(cat build-count)" = 1
+)
+printf '%s\n' 'Native artifact workflow regression passed.'
+if [ "${1:-}" = --native-artifact-only ]; then exit 0; fi
+
 project="$temp_dir/project"
 mkdir -p "$project/scripts" "$project/apps/desktop-tauri/src-tauri" \
   "$project/target/release/bundle/appimage" \

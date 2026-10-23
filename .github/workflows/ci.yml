@@ -97,11 +97,12 @@ jobs:
           commit_timestamp="$(git show -s --format=%ct HEAD)"
           version="$(scripts/release-version.sh "$commit_timestamp" "$GITHUB_RUN_NUMBER")"
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
-      - run: make dist
       - name: Build updater AppImage
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: make update-bundle
+      - name: Stage the versioned Linux binary
+        run: make stage-linux-existing
       - name: Smoke test staged package
         run: xvfb-run -a make packaged-smoke
       - name: Smoke test updater AppImage

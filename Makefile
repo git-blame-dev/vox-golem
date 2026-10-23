@@ -84,7 +84,7 @@ LINUX_ORT_PROVIDER_LIBS := \
 
 .DEFAULT_GOAL := help
 
-.PHONY: benchmark test-benchmark wakeword-bench test-wakeword-bench search-bench encoder-bench test-search-bench test-router-head
+.PHONY: benchmark test-benchmark test-app-benchmark wakeword-bench test-wakeword-bench search-bench encoder-bench test-search-bench test-router-head
 
 benchmark:
 	@test -n '$(PLATFORM)' || { printf '%s\n' 'Set PLATFORM=android, desktop or wear; use BENCHMARK_FLAGS="--help" for options.' >&2; exit 1; }
@@ -92,6 +92,9 @@ benchmark:
 
 test-benchmark:
 	python3 -m unittest discover -s tools/benchmark -p 'test_*.py'
+
+test-app-benchmark:
+	python3 -m unittest discover -s tools/app-bench -p 'test_*.py'
 
 wakeword-bench:
 	@test -n '$(WAKE_WORD_MODEL)' || { printf '%s\n' 'Set WAKE_WORD_MODEL to a local classifier ONNX file.' >&2; exit 1; }
@@ -128,6 +131,7 @@ help:
 	@printf '%s\n' '  make test     Run deterministic Linux frontend and Rust checks'
 	@printf '%s\n' '  make benchmark PLATFORM=android|desktop [DEVICE=a17] BENCHMARK_FLAGS="..."  Run the shared typed-app suite (explicit runtime flags required)'
 	@printf '%s\n' '  make test-benchmark  Run shared benchmark controller and adapter unit tests without device access'
+	@printf '%s\n' '  make test-app-benchmark  Run isolated app benchmark runner and fixture unit tests offline'
 	@printf '%s\n' '  make search-bench [SEARCH_BENCH_FLAGS="--with-llm"]  Run the cross-codepath search benchmark'
 	@printf '%s\n' '  make encoder-bench ENCODER_SERVER=/path/llama-server ENCODER_MODEL=/path/bge.gguf  Run the isolated local encoder benchmark'
 	@printf '%s\n' '  make test-search-bench  Run deterministic offline search & router benchmark'
@@ -165,6 +169,8 @@ test:
 	$(MAKE) --no-print-directory test-release-tools
 	$(MAKE) --no-print-directory test-android-tools
 	$(MAKE) --no-print-directory test-local-runtime-tools
+	$(MAKE) --no-print-directory test-benchmark
+	$(MAKE) --no-print-directory test-app-benchmark
 	cargo fmt --all -- --check
 	cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 	cargo test --locked --workspace
