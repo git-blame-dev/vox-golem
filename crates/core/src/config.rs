@@ -25,6 +25,120 @@ const MIN_TTS_OUTPUT_GAIN_DB: f32 = -24.0;
 const MAX_TTS_OUTPUT_GAIN_DB: f32 = 24.0;
 const MAX_JS_SAFE_INTEGER_U64: u64 = 9_007_199_254_740_991;
 
+pub const MIN_TTS_WORKER_COUNT: usize = 1;
+pub const MAX_TTS_WORKER_COUNT: usize = 2;
+pub const MIN_TTS_MAX_QUEUE: usize = 1;
+pub const MAX_TTS_MAX_QUEUE: usize = 16;
+pub const MIN_TTS_MAX_DURATION_S: u64 = 1;
+pub const MAX_TTS_MAX_DURATION_S: u64 = 360;
+/// Maximum size in bytes of a single synthesized TTS audio buffer copied into Rust memory
+/// after ONNX inference. Native ONNX Runtime tensor allocation and total retained process
+/// memory are not bounded by this per-result post-inference copy check.
+pub const MAX_TTS_RESULT_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum number of `f32` PCM samples in a single synthesized TTS audio buffer copied into
+/// Rust memory after ONNX inference (`16,777,216` samples / `64 MiB`).
+pub const MAX_TTS_RESULT_SAMPLES: usize = MAX_TTS_RESULT_BYTES / std::mem::size_of::<f32>();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidatedTtsResourceLimits {
+    pub worker_count: usize,
+    pub max_queue: usize,
+    pub sample_rate_hz: u32,
+    pub max_duration_s: u64,
+    pub max_duration_ms: u64,
+    pub max_duration_samples: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TtsResourceValidationError {
+    WorkerCountZero,
+    WorkerCountOutOfRange { min: usize, max: usize },
+    MaxQueueZero,
+    MaxQueueOutOfRange { min: usize, max: usize },
+    SampleRateZero,
+    MaxDurationZero,
+    MaxDurationOutOfRange { min: u64, max: u64 },
+    DurationBudgetOverflow,
+}
+
+impl TtsResourceValidationError {
+    pub fn format_with_prefix(&self, prefix: &str) -> String {
+        match self {
+            Self::WorkerCountZero => format!("{prefix}worker_count must be greater than zero"),
+            Self::WorkerCountOutOfRange { min, max } => {
+                format!("{prefix}worker_count must be between {min} and {max} inclusive")
+            }
+            Self::MaxQueueZero => format!("{prefix}max_queue must be greater than zero"),
+            Self::MaxQueueOutOfRange { min, max } => {
+                format!("{prefix}max_queue must be between {min} and {max} inclusive")
+            }
+            Self::SampleRateZero => format!("{prefix}sample_rate_hz must be greater than zero"),
+            Self::MaxDurationZero => format!("{prefix}max_duration_s must be greater than zero"),
+            Self::MaxDurationOutOfRange { min, max } => {
+                format!("{prefix}max_duration_s must be between {min} and {max} inclusive")
+            }
+            Self::DurationBudgetOverflow => {
+                format!("{prefix}max_duration_s and sample_rate_hz exceed supported sample budget")
+            }
+        }
+    }
+}
+
+pub fn validate_tts_resource_limits(
+    worker_count: usize,
+    max_queue: usize,
+    sample_rate_hz: u32,
+    max_duration_s: u64,
+) -> Result<ValidatedTtsResourceLimits, TtsResourceValidationError> {
+    if worker_count == 0 {
+        return Err(TtsResourceValidationError::WorkerCountZero);
+    }
+    if worker_count > MAX_TTS_WORKER_COUNT {
+        return Err(TtsResourceValidationError::WorkerCountOutOfRange {
+            min: MIN_TTS_WORKER_COUNT,
+            max: MAX_TTS_WORKER_COUNT,
+        });
+    }
+    if max_queue == 0 {
+        return Err(TtsResourceValidationError::MaxQueueZero);
+    }
+    if max_queue > MAX_TTS_MAX_QUEUE {
+        return Err(TtsResourceValidationError::MaxQueueOutOfRange {
+            min: MIN_TTS_MAX_QUEUE,
+            max: MAX_TTS_MAX_QUEUE,
+        });
+    }
+    if sample_rate_hz == 0 {
+        return Err(TtsResourceValidationError::SampleRateZero);
+    }
+    if max_duration_s == 0 {
+        return Err(TtsResourceValidationError::MaxDurationZero);
+    }
+    if max_duration_s > MAX_TTS_MAX_DURATION_S {
+        return Err(TtsResourceValidationError::MaxDurationOutOfRange {
+            min: MIN_TTS_MAX_DURATION_S,
+            max: MAX_TTS_MAX_DURATION_S,
+        });
+    }
+    let max_duration_ms = max_duration_s
+        .checked_mul(1_000)
+        .ok_or(TtsResourceValidationError::DurationBudgetOverflow)?;
+    let max_duration_samples_u64 = u64::from(sample_rate_hz)
+        .checked_mul(max_duration_s)
+        .ok_or(TtsResourceValidationError::DurationBudgetOverflow)?;
+    let max_duration_samples = usize::try_from(max_duration_samples_u64)
+        .map_err(|_| TtsResourceValidationError::DurationBudgetOverflow)?;
+
+    Ok(ValidatedTtsResourceLimits {
+        worker_count,
+        max_queue,
+        sample_rate_hz,
+        max_duration_s,
+        max_duration_ms,
+        max_duration_samples,
+    })
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
@@ -590,33 +704,16 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
                 &model_path,
             );
 
-            if raw_tts.worker_count == 0 {
-                return Err(ConfigError::ParseConfigFailed {
-                    path: config_path.clone(),
-                    details: String::from("tts.worker_count must be greater than zero"),
-                });
-            }
-
-            if raw_tts.max_queue == 0 {
-                return Err(ConfigError::ParseConfigFailed {
-                    path: config_path.clone(),
-                    details: String::from("tts.max_queue must be greater than zero"),
-                });
-            }
-
-            if raw_tts.sample_rate_hz == 0 {
-                return Err(ConfigError::ParseConfigFailed {
-                    path: config_path.clone(),
-                    details: String::from("tts.sample_rate_hz must be greater than zero"),
-                });
-            }
-
-            if raw_tts.max_duration_s == 0 {
-                return Err(ConfigError::ParseConfigFailed {
-                    path: config_path.clone(),
-                    details: String::from("tts.max_duration_s must be greater than zero"),
-                });
-            }
+            validate_tts_resource_limits(
+                raw_tts.worker_count,
+                raw_tts.max_queue,
+                raw_tts.sample_rate_hz,
+                raw_tts.max_duration_s,
+            )
+            .map_err(|error| ConfigError::ParseConfigFailed {
+                path: config_path.clone(),
+                details: error.format_with_prefix("tts."),
+            })?;
 
             if !raw_tts.output_gain_db.is_finite() {
                 return Err(ConfigError::ParseConfigFailed {
@@ -2507,5 +2604,94 @@ mod tests {
 
     fn escape_path(path: &Path) -> String {
         path.to_string_lossy().replace('\\', "\\\\")
+    }
+
+    #[test]
+    fn validates_canonical_tts_resource_limits_and_high_sample_rate_models() {
+        for (worker_count, max_queue, sample_rate_hz, max_duration_s, expected_samples) in [
+            (1, 8, 22_050, 300, 6_615_000),
+            (2, 16, 24_000, 360, 8_640_000),
+            (1, 8, 44_100, 360, 15_876_000),
+            (2, 16, 48_000, 300, 14_400_000),
+            (2, 16, 48_000, 360, 17_280_000),
+        ] {
+            let validated = super::validate_tts_resource_limits(
+                worker_count,
+                max_queue,
+                sample_rate_hz,
+                max_duration_s,
+            )
+            .expect("valid TTS resource configuration should be accepted");
+            assert_eq!(validated.worker_count, worker_count);
+            assert_eq!(validated.max_queue, max_queue);
+            assert_eq!(validated.sample_rate_hz, sample_rate_hz);
+            assert_eq!(validated.max_duration_s, max_duration_s);
+            assert_eq!(validated.max_duration_ms, max_duration_s * 1_000);
+            assert_eq!(validated.max_duration_samples, expected_samples);
+        }
+
+        assert_eq!(super::MAX_TTS_RESULT_BYTES, 64 * 1024 * 1024);
+        assert_eq!(super::MAX_TTS_RESULT_SAMPLES, 16_777_216);
+
+        for (worker_count, max_queue, sample_rate_hz, max_duration_s, expected_error) in [
+            (
+                0,
+                8,
+                22_050,
+                300,
+                "tts.worker_count must be greater than zero",
+            ),
+            (
+                3,
+                8,
+                22_050,
+                300,
+                "tts.worker_count must be between 1 and 2 inclusive",
+            ),
+            (1, 0, 22_050, 300, "tts.max_queue must be greater than zero"),
+            (
+                1,
+                17,
+                22_050,
+                300,
+                "tts.max_queue must be between 1 and 16 inclusive",
+            ),
+            (1, 8, 0, 300, "tts.sample_rate_hz must be greater than zero"),
+            (
+                1,
+                8,
+                22_050,
+                0,
+                "tts.max_duration_s must be greater than zero",
+            ),
+            (
+                1,
+                8,
+                22_050,
+                361,
+                "tts.max_duration_s must be between 1 and 360 inclusive",
+            ),
+        ] {
+            let temp = TempDir::new();
+            let config_path = temp.path().join("config.toml");
+            let tts_model_path = temp.path().join("jarvis.onnx");
+            create_file(&tts_model_path);
+            fs::write(
+                &config_path,
+                format!(
+                    "[tts]\nenabled = true\nmodel_path = \"{}\"\nworker_count = {worker_count}\nmax_queue = {max_queue}\nsample_rate_hz = {sample_rate_hz}\nmax_duration_s = {max_duration_s}\n",
+                    escape_path(&tts_model_path),
+                ),
+            )
+            .expect("config fixture should be written");
+
+            assert_eq!(
+                load_runtime_config(Some(&config_path)),
+                Err(ConfigError::ParseConfigFailed {
+                    path: config_path,
+                    details: String::from(expected_error),
+                })
+            );
+        }
     }
 }
