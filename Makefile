@@ -409,10 +409,13 @@ packaged-smoke: verify-dist
 		done; \
 		printf 'Packaged Linux smoke timed out; output: %s\n' "$$smoke_log" >&2; exit 1
 
-check-pc-tools:
+.PHONY: check-pc-build-tools
+check-pc-tools: check-pc-build-tools
+	@bash scripts/verify-nsis-version.sh
+
+check-pc-build-tools:
 	@command -v cargo-xwin >/dev/null || { printf '%s\n' 'Missing cargo-xwin. Install with: cargo install cargo-xwin --locked' >&2; exit 1; }
 	@command -v cargo-tauri >/dev/null || { printf '%s\n' 'Missing Tauri CLI. Install with: cargo install tauri-cli --version 2.11.1 --locked' >&2; exit 1; }
-	@bash scripts/verify-nsis-version.sh
 	@command -v cmake >/dev/null || { printf '%s\n' 'Missing cmake. Install CMake before running make pc.' >&2; exit 1; }
 	@command -v ninja >/dev/null || { printf '%s\n' 'Missing ninja. cargo-xwin requires Ninja for CMake crates.' >&2; exit 1; }
 	@test -n '$(REAL_CLANG_CL)' || { printf '%s\n' 'Missing clang-cl or clang-19. Install LLVM/Clang 19 or newer before running make pc.' >&2; exit 1; }
@@ -443,6 +446,23 @@ pc: check-pc-tools $(ESPEAK_COMPAT_HEADER) $(STDCXX_IMPORT_LIB) $(DIRECTML_IMPOR
 	RUSTFLAGS="$${RUSTFLAGS:+$${RUSTFLAGS} }-L native=$(IMPORT_LIB_DIR)" \
 	cargo tauri build --runner cargo-xwin --target $(WINDOWS_TARGET) --no-bundle --config '{"bundle":{"resources":[]}}' -- --locked
 	@printf 'Windows app: %s\n' '$(WINDOWS_RELEASE_DIR)/vox-golem.exe'
+
+# Separate diagnostic artifact, never a shipping package or updater input. Reuse
+# the established Linux MSVC cross-build environment; provisioning is explicit.
+.PHONY: pc-benchmark
+pc-benchmark: check-pc-build-tools $(ESPEAK_COMPAT_HEADER) $(STDCXX_IMPORT_LIB) $(DIRECTML_IMPORT_LIB) $(PATHCCH_IMPORT_LIB)
+	cd apps/desktop-tauri/src-tauri && \
+	PATH='$(WINDOWS_CROSS_BIN)':"$$PATH" \
+	VOXGOLEM_REAL_CLANG_CL='$(REAL_CLANG_CL)' \
+	VOXGOLEM_ESPEAK_COMPAT_HEADER='$(ESPEAK_COMPAT_HEADER)' \
+	CMAKE_GENERATOR=Ninja \
+	VITE_VOXGOLEM_BENCHMARK=1 \
+	CARGO_NET_OFFLINE=true \
+	CARGO_TARGET_DIR='$(CURDIR)/target/app-benchmark-windows' \
+	RUSTFLAGS="$${RUSTFLAGS:+$${RUSTFLAGS} }-L native=$(IMPORT_LIB_DIR)" \
+	cargo tauri build --runner cargo-xwin --target $(WINDOWS_TARGET) --no-bundle \
+		--features app-benchmark --config '{"identifier":"dev.gitblame.voxgolem.benchmark","build":{"beforeBuildCommand":{"script":"bun $(CURDIR)/frontend/app/node_modules/vite/bin/vite.js build $(CURDIR)/frontend/app","cwd":"$(CURDIR)/frontend/app"}},"bundle":{"resources":[]}}' -- --locked
+	@printf 'Windows diagnostic app (stage/hash separately; do not publish): %s\n' '$(CURDIR)/target/app-benchmark-windows/$(WINDOWS_TARGET)/release/vox-golem.exe'
 
 pc-dist: pc
 	@rm -rf '$(WINDOWS_STAGED_RELEASE_DIR)'

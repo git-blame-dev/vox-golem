@@ -194,6 +194,8 @@ static ENTRY: OnceLock<&'static str> = OnceLock::new();
 fn parse_entry(entry: Option<&str>, automatic: bool) -> Result<&'static str, String> {
     match (entry.unwrap_or("voice"), automatic) {
         ("voice", _) => Ok("voice"),
+        ("voice-arithmetic", false) => Ok("voice-arithmetic"),
+        ("voice-arithmetic-windows", false) => Ok("voice-arithmetic-windows"),
         ("typed", false) => Ok("typed"),
         ("typed", true) => Err("Typed entry cannot queue automatic capture diagnostics".into()),
         _ => Err("Benchmark entry must be voice or typed".into()),
@@ -248,6 +250,14 @@ pub(crate) fn validate_environment() -> Result<(), String> {
         std::env::var_os("VOXGOLEM_BENCH_AUTO_DIAGNOSTIC_CASE").is_some(),
     )?;
     let _ = ENTRY.set(entry);
+    if cfg!(target_os = "windows") && entry != "voice-arithmetic-windows" {
+        return Err("Windows benchmark supports only the offline arithmetic diagnostic".into());
+    }
+    if matches!(entry, "voice-arithmetic" | "voice-arithmetic-windows")
+        && std::env::var("VOXGOLEM_BENCH_MODE").as_deref() != Ok("offline")
+    {
+        return Err("Arithmetic benchmark has no live allowance".into());
+    }
     if !matches!(
         std::env::var("VOXGOLEM_BENCH_MODE").as_deref(),
         Ok("offline" | "live")
@@ -255,6 +265,12 @@ pub(crate) fn validate_environment() -> Result<(), String> {
         return Err("Benchmark mode must be explicit".into());
     }
     let root = root()?;
+    if entry == "voice-arithmetic" {
+        validate_null_output(&root)?;
+    }
+    if entry == "voice-arithmetic-windows" {
+        validate_windows_storage(&root)?;
+    }
     if let Ok(case) = std::env::var("VOXGOLEM_BENCH_AUTO_DIAGNOSTIC_CASE") {
         if std::env::var("VOXGOLEM_BENCH_MODE").as_deref() != Ok("offline")
             || !matches!(case.as_str(), "quick" | "short_research" | "long_research")
@@ -317,6 +333,69 @@ fn root() -> Result<PathBuf, String> {
         }
     }
     Ok(resolved)
+}
+
+fn validate_null_output(root: &Path) -> Result<(), String> {
+    if !cfg!(target_os = "linux") || Path::new("/dev/snd").exists() {
+        return Err("Arithmetic output requires isolated Linux software ALSA".into());
+    }
+    let path = PathBuf::from(
+        std::env::var_os("ALSA_CONFIG_PATH").ok_or("Arithmetic ALSA configuration missing")?,
+    );
+    if path.is_symlink()
+        || path.canonicalize().ok().as_deref() != Some(root.join("alsa-null.conf").as_path())
+    {
+        return Err("Arithmetic ALSA configuration is not private".into());
+    }
+    if fs::metadata(&path)
+        .map_err(|_| "Arithmetic ALSA configuration unavailable")?
+        .len()
+        > 64
+        || fs::read(&path).map_err(|_| "Arithmetic ALSA configuration unavailable")?
+            != b"pcm.!default { type null }\n"
+        || std::env::vars_os().any(|(key, _)| {
+            let key = key.to_string_lossy().to_ascii_uppercase();
+            ["PULSE_", "PIPEWIRE_", "JACK_"]
+                .iter()
+                .any(|prefix| key.starts_with(prefix))
+        })
+    {
+        return Err("Arithmetic output route is not software-null only".into());
+    }
+    Ok(())
+}
+
+fn validate_windows_storage(root: &Path) -> Result<(), String> {
+    if !cfg!(target_os = "windows")
+        || std::env::var("VOXGOLEM_BENCH_OUTPUT_ROUTE").as_deref() != Ok("wasapi-render-diagnostic")
+    {
+        return Err("Windows arithmetic is diagnostic-only native render output".into());
+    }
+    for (key, folder) in [
+        ("APPDATA", "appdata"),
+        ("LOCALAPPDATA", "localappdata"),
+        ("USERPROFILE", "home"),
+        ("TEMP", "temp"),
+        ("TMP", "temp"),
+        ("WEBVIEW2_USER_DATA_FOLDER", "webview"),
+    ] {
+        let path = PathBuf::from(std::env::var_os(key).ok_or("Windows private storage missing")?);
+        let expected = root
+            .join(folder)
+            .canonicalize()
+            .map_err(|_| "Windows private storage unavailable")?;
+        if path.canonicalize().ok().as_ref() != Some(&expected) || !expected.starts_with(root) {
+            return Err("Windows storage escapes private run".into());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_application_id(identifier: &str) -> Result<(), String> {
+    if cfg!(target_os = "windows") && identifier != "dev.gitblame.voxgolem.benchmark" {
+        return Err("Windows benchmark requires a separate application identifier".into());
+    }
+    Ok(())
 }
 
 pub(crate) fn capture() -> Arc<voxgolem_audio::capture::AudioCaptureService> {
@@ -464,10 +543,7 @@ async fn queue_fixture(
     fixture: String,
     capture: Arc<voxgolem_audio::capture::AudioCaptureService>,
 ) -> Result<(), String> {
-    if !matches!(
-        fixture.as_str(),
-        "quick" | "short_research" | "long_research"
-    ) {
+    if !fixture_allowed(ENTRY.get().copied(), &fixture) {
         return Err("Unknown benchmark fixture".into());
     }
     // Bind before filesystem work; a stop/restart must not redirect this clip to
@@ -645,12 +721,180 @@ fn snapshot(app_state: &AppState) -> Result<serde_json::Value, String> {
         "native_frame_metadata": frame_metadata,
         "native_audio": native_audio,
         "handler_call_metadata": commands,
+        "reply_speech": speech_metadata(&events, speech_retired(app_state)),
+        "tts_actual_provider": app_state.local_tts_runtime.lock().ok()
+            .and_then(|runtime| runtime.as_ref().and_then(|runtime| runtime.actual_provider()))
+            .map(|provider| match provider {
+                tts::TtsActualProvider::Cpu => "cpu",
+                tts::TtsActualProvider::Cuda => "cuda",
+            }),
         "generation": voxgolem_platform::app_benchmark::get_counts(),
     }))
 }
 
+fn fixture_allowed(entry: Option<&str>, fixture: &str) -> bool {
+    match entry {
+        Some("voice-arithmetic" | "voice-arithmetic-windows") => fixture == "arithmetic",
+        Some("voice") => matches!(fixture, "quick" | "short_research" | "long_research"),
+        _ => false,
+    }
+}
+
+fn speech_retired(state: &AppState) -> bool {
+    // Worker remains owned through synthesis and synchronous play_owned completion.
+    // Do not infer retirement from renderer state or from cancellation receipts.
+    !state.native_speech_running.load(Ordering::Acquire)
+        && state.native_speech_worker.available_permits() == 1
+        && state
+            .native_speech_pending
+            .lock()
+            .is_ok_and(|pending| pending.is_none())
+        && state
+            .tts_playback
+            .lock()
+            .is_ok_and(|playback| playback.current_id.is_none())
+        && !tts::physical_work_pending()
+}
+
+fn speech_metadata(events: &[Observation], retired: bool) -> serde_json::Value {
+    let count = |stage| events.iter().filter(|event| event.stage == stage).count();
+    serde_json::json!({
+        "admitted": count("reply_speech_admitted"),
+        "synthesis_valid": count("reply_synthesis_valid"),
+        "output_submitted": count("reply_output_submitted"),
+        "output_completed": count("reply_output_completed"),
+        "failed": count("reply_speech_failed"),
+        "retired": retired,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn generated_arithmetic_environment_loads_real_model_readiness() {
+        if std::env::var("VOXGOLEM_BENCH_MODE").as_deref() != Ok("offline") {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .env("VOXGOLEM_BENCH_MODE", "offline")
+                .args(["--exact", "app_benchmark::tests::generated_arithmetic_environment_loads_real_model_readiness"])
+                .output().unwrap();
+            assert!(
+                child.status.success(),
+                "offline production-loader regression failed: {}",
+                String::from_utf8_lossy(&child.stdout)
+            );
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .unwrap();
+        let generated = std::process::Command::new("python3")
+            .args(["-B", "-c", r#"
+import pathlib,sys,shutil
+sys.path.insert(0,str(pathlib.Path(sys.argv[1])/'tools/app-bench'))
+import runner
+root=pathlib.Path(sys.argv[2]); source=root/'synthetic-source.toml'
+asset=root/'synthetic-model.onnx';asset.write_bytes(b'synthetic-not-initialized')
+asr=root/'synthetic-asr';asr.mkdir()
+source.write_text('\n'.join(f'{k} = "{p}"' for k,p in [('wake_word_model_path',asset),('silero_vad_model',asset),('parakeet_model_dir',asr)]))
+run=root/'run';run.mkdir()
+runner.isolated_environment(run,source,'http://127.0.0.1:32123/responses',entry='voice-arithmetic',tts_model=asset)
+shutil.copytree(run/'config',root/'VoxGolem')
+"#])
+            .arg(repo).arg(directory.path()).output().unwrap();
+        assert!(
+            generated.status.success(),
+            "synthetic environment generator failed"
+        );
+        let _scope = super::super::test_storage::ScopedRoot::new(directory.path().into());
+        let path = super::super::application_config_path().unwrap();
+        let config = voxgolem_core::config::load_runtime_config(Some(&path)).unwrap();
+        let capabilities = super::super::configured_capabilities(&config);
+        assert!(super::super::capability_available(
+            &capabilities,
+            "custom_provider"
+        ));
+        let settings = super::super::resolve_assistant_settings(
+            &config,
+            &capabilities,
+            super::super::ResponseProfilePayload::Fast,
+        );
+        assert_eq!(settings.instant.as_str(), "custom-luna-none");
+        let state = super::super::build_nonfatal_config_error_app_state(
+            super::super::default_voice_pipeline_config(),
+            super::super::embedded_cue_asset_paths(),
+            "synthetic parser state".into(),
+        );
+        let snapshot = super::super::get_app_snapshot_from_state(&state).unwrap();
+        let payload = serde_json::to_vec(&snapshot).unwrap();
+        use std::io::Write;
+        let mut parser = std::process::Command::new("bun")
+            .args(["-e", "import {parseAppSnapshot} from './frontend/app/src/lib/appSnapshot.ts';try{parseAppSnapshot(JSON.parse(await Bun.stdin.text()));}catch(e){console.error(e.message);process.exit(1)}"])
+            .current_dir(repo).stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+            .spawn().unwrap();
+        parser.stdin.take().unwrap().write_all(&payload).unwrap();
+        let parsed = parser.wait_with_output().unwrap();
+        assert!(
+            parsed.status.success(),
+            "native snapshot production frontend parser failed: {}",
+            String::from_utf8_lossy(&parsed.stderr)
+        );
+        let effective =
+            super::super::chatgpt_auth::configuration(config.custom_openai.as_ref()).unwrap();
+        assert_eq!(effective.endpoint, "http://127.0.0.1:32123/responses");
+        assert_eq!(effective.auth_path, config.custom_openai.unwrap().auth_path);
+        let credential: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&effective.auth_path).unwrap()).unwrap();
+        assert!(credential.get("voxgolemChatgpt").is_none());
+        assert!(
+            voxgolem_platform::custom_openai::observe_custom_openai_auth(&effective.auth_path)
+                .status
+                .is_ok()
+        );
+    }
+    #[test]
+    fn arithmetic_queue_cannot_borrow_legacy_cases_or_typed_admission() {
+        assert!(super::fixture_allowed(
+            Some("voice-arithmetic"),
+            "arithmetic"
+        ));
+        assert!(!super::fixture_allowed(Some("voice-arithmetic"), "quick"));
+        assert!(!super::fixture_allowed(Some("voice"), "arithmetic"));
+        assert!(super::fixture_allowed(
+            Some("voice-arithmetic-windows"),
+            "arithmetic"
+        ));
+        assert!(!super::fixture_allowed(
+            Some("voice-arithmetic-windows"),
+            "quick"
+        ));
+        assert!(!super::fixture_allowed(Some("typed"), "arithmetic"));
+        assert!(!super::fixture_allowed(
+            Some("voice-arithmetic"),
+            "../arithmetic"
+        ));
+    }
+
+    #[test]
+    fn speech_metadata_does_not_turn_error_or_retirement_into_output_success() {
+        let events = vec![super::Observation {
+            stage: "reply_speech_failed",
+            flow: 1,
+            round: 0,
+            elapsed_us: 1,
+        }];
+        let metadata = super::speech_metadata(&events, true);
+        assert_eq!(metadata["failed"], 1);
+        assert_eq!(metadata["output_completed"], 0);
+        assert_eq!(metadata["synthesis_valid"], 0);
+        assert_eq!(metadata["retired"], true);
+        let reset = super::speech_metadata(&[], false);
+        assert_eq!(reset["failed"], 0);
+        assert_eq!(reset["retired"], false);
+    }
     use super::*;
 
     #[test]
@@ -717,6 +961,14 @@ mod tests {
             (None, false, Some("voice")),
             (None, true, Some("voice")),
             (Some("voice"), true, Some("voice")),
+            (Some("voice-arithmetic"), false, Some("voice-arithmetic")),
+            (Some("voice-arithmetic"), true, None),
+            (
+                Some("voice-arithmetic-windows"),
+                false,
+                Some("voice-arithmetic-windows"),
+            ),
+            (Some("voice-arithmetic-windows"), true, None),
             (Some("typed"), false, Some("typed")),
             (Some("typed"), true, None),
             (Some(""), false, None),

@@ -557,7 +557,10 @@ assert.equal(release().restored,true);
                 self.assertTrue(Path(env[key]).is_relative_to(run))
                 self.assertNotEqual(env[key], os.environ.get(key))
             self.assertEqual(env['VOXGOLEM_BENCH_MODE'], 'offline')
-            self.assertEqual(json.loads(runner.managed_credential(run/'config').read_text())['openai']['access'], 'synthetic-benchmark-access')
+            credential = runner.managed_credential(run/'config')
+            self.assertEqual(json.loads(credential.read_text()), {'openai': {
+                'access': 'synthetic-benchmark-access', 'expires': 4102444800000}})
+            self.assertEqual(credential.stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == '__main__':

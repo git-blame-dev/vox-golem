@@ -1,5 +1,6 @@
 """Synthetic audio and bounded loopback Responses/MCP fixtures (stdlib only)."""
 import hashlib
+from dataclasses import dataclass
 import importlib.util
 import json
 from pathlib import Path
@@ -8,6 +9,8 @@ import struct
 import tempfile
 import threading
 import time
+import sys
+from types import MappingProxyType
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 RATE = 16000
@@ -20,6 +23,115 @@ CASES = {
     "short_research": "What Rust release introduced Once Lock? Read the official documentation and give a brief sourced answer.",
     "long_research": "Research Once Lock and Lazy Lock in Rust. Read the official documentation and compare their release versions, initialization timing, panic behavior, and ability to reset. Explain the important differences in several short paragraphs with sources.",
 }
+
+
+@dataclass(frozen=True)
+class ArithmeticProfile:
+    cases: object
+    answer: str
+    contract_sha256: str
+    contract: object
+    owner: object
+    implementation_sha256: str
+
+    def matches(self, case, text):
+        return (case in self.cases and isinstance(text, str) and
+                self.owner.fixture_matches(text, True, self.contract))
+
+
+def arithmetic_profile():
+    directory = Path(__file__).resolve().parents[1] / 'benchmark'
+    # The contract owner imports its neighboring controller; keep that established
+    # module directory available without copying scenario or normalization policy.
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
+    spec = importlib.util.spec_from_file_location('app_bench_voice_contract', directory/'voice_contract.py')
+    owner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(owner)
+    contract = owner.load_contract()
+    # Follow the modules actually imported by load_contract/load_scenarios, not
+    # guessed neighboring paths. Logical labels keep the digest host-independent.
+    sources = {
+        'matcher': owner.fixture_matches.__code__.co_filename,
+        'normalizer': owner.normalize_tokens.__code__.co_filename,
+        'parser': sys.modules['benchmark'].load_scenarios.__code__.co_filename,
+        'validator': sys.modules['voice_contract'].validate_voice.__code__.co_filename,
+    }
+    implementation = hashlib.sha256(json.dumps({
+        label: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        for label, path in sources.items()
+    }, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    immutable = dict(contract, token_aliases=MappingProxyType(dict(contract['token_aliases'])))
+    return ArithmeticProfile(MappingProxyType({contract['scenario_id']: contract['spoken_prompt']}),
+                              contract['expected_answer'], owner.contract_sha256(contract),
+                              MappingProxyType(immutable), owner, implementation)
+
+
+def rejection_diagnostics(body, profile):
+    """Counts/enums only; never persist extracted text or normalized tokens."""
+    limit, chars = 256, 4096
+    result = dict(input_kind='invalid', input_count=0, user_count=0,
+                  content_kind='missing', content_part_count=0, input_text_part_count=0,
+                  invalid_part_count=0, actual_token_count=0, expected_token_count=0,
+                  first_mismatch_index=-2, mismatch='shape', analysis='complete')
+    inputs = body.get('input') if isinstance(body, dict) else None
+    if not isinstance(inputs, list):
+        return result
+    result.update(input_kind='list', input_count=min(len(inputs), limit))
+    if len(inputs) > limit:
+        result.update(analysis='bounded', mismatch='unknown')
+        return result
+    users = [item for item in inputs if isinstance(item, dict) and item.get('role') == 'user']
+    result['user_count'] = len(users)
+    if not users or any(not isinstance(item, dict) for item in inputs):
+        return result
+    content = users[-1].get('content')
+    if isinstance(content, str):
+        result['content_kind'] = 'string'
+        text = content[:chars]
+        bounded = len(content) > chars
+    elif isinstance(content, list):
+        result.update(content_kind='list', content_part_count=min(len(content), limit))
+        if len(content) > limit:
+            result.update(analysis='bounded', mismatch='unknown')
+            return result
+        pieces, remaining, bounded = [], chars, False
+        for part in content:
+            if not isinstance(part, dict):
+                result['invalid_part_count'] += 1
+            elif part.get('type') == 'input_text':
+                result['input_text_part_count'] += 1
+                value = part.get('text', '')
+                if not isinstance(value, str):
+                    result['invalid_part_count'] += 1
+                    continue
+                # Account for the same inter-part spaces as production extraction.
+                cost = len(value) + bool(pieces)
+                bounded |= cost > remaining
+                pieces.append(value[:max(0, remaining - bool(pieces))])
+                remaining = max(0, remaining - cost)
+        if result['invalid_part_count']:
+            return result
+        text = ' '.join(pieces)[:chars]
+    else:
+        result['content_kind'] = 'invalid'
+        return result
+    actual = profile.owner.normalize_tokens(text, profile.contract)
+    expected = profile.owner.normalize_tokens(profile.contract['spoken_prompt'], profile.contract)
+    bounded |= len(actual) > limit or len(expected) > limit
+    result.update(actual_token_count=min(len(actual), limit),
+                  expected_token_count=min(len(expected), limit))
+    if bounded:
+        result.update(analysis='bounded', mismatch='unknown')
+        return result
+    result['first_mismatch_index'] = next((i for i, pair in enumerate(zip(actual, expected))
+                                           if pair[0] != pair[1]),
+                                          min(len(actual), len(expected)) if len(actual) != len(expected) else -1)
+    result['mismatch'] = ('length' if len(actual) != len(expected) else
+                          'same_length_difference' if actual != expected else 'match')
+    return result
+
+
 URLS = ["https://benchmark.example.test/once-lock", "https://benchmark.example.test/lazy-lock"]
 PAGES = [
     "Synthetic documentation fixture: OnceLock became stable in Rust 1.70. Initialization happens on an explicit get_or_init call. A panicking initializer leaves the cell uninitialized. take requires mutable access and resets the cell.",
@@ -61,7 +173,7 @@ def expected_answer(case):
     raise ValueError('Unknown synthetic case')
 
 
-def generate_fixtures(directory, voice="en-gb", speed=160, wake_phrase="hey livekit"):
+def generate_fixtures(directory, voice="en-gb", speed=160, wake_phrase="hey livekit", profile=None):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     source = Path(__file__).resolve().parents[1] / "wakeword-bench" / "bench.py"
@@ -85,7 +197,7 @@ def generate_fixtures(directory, voice="en-gb", speed=160, wake_phrase="hey live
     with tempfile.TemporaryDirectory(prefix="speech-", dir=directory) as temporary:
         temporary = Path(temporary)
         wake = spoken(wake_phrase, temporary)
-        for case, question in CASES.items():
+        for case, question in (profile.cases if profile else CASES).items():
             speech = spoken(question, temporary)
             wake_end = RATE * 2 + len(wake)
             start = wake_end + int(RATE * 0.35)
@@ -110,17 +222,18 @@ class _Server(ThreadingHTTPServer):
 class FakeServices:
     """One loopback server; select expected_case before each independent flow.
 
-    snapshot is per-flow and contains only numeric counters and boolean flags.
+    snapshot is per-flow and contains only counts, flags and fixed diagnostic enums.
     Endpoints are configuration only and deliberately excluded from snapshots.
     """
-    def __init__(self, gated_stream=False):
+    def __init__(self, gated_stream=False, profile=None):
+        self.profile = profile
         self._lock = threading.RLock()
         self._quiescent = threading.Condition(self._lock)
         self._active_generations = 0
         self._gated_stream = bool(gated_stream)
         self._server = None
         self._thread = None
-        self.expected_case = "quick"
+        self.expected_case = next(iter(profile.cases)) if profile else "quick"
 
     @property
     def expected_case(self):
@@ -128,7 +241,7 @@ class FakeServices:
 
     @expected_case.setter
     def expected_case(self, case):
-        if case not in CASES:
+        if case not in (self.profile.cases if self.profile else CASES):
             raise ValueError("unknown_case")
         with self._lock:
             if self._active_generations:
@@ -139,15 +252,15 @@ class FakeServices:
             self._stats = dict(generation_requests=0, model_rounds=0, searches=0, fetches=0,
                                readable_sources=0, initializations=0, discoveries=0, failures=0,
                                transcript_matches=False, model_matches=False, terminal=False,
-                               expected_model_rounds=1 if case == "quick" else 3,
-                               expected_searches=0 if case == "quick" else 1,
-                               expected_fetches=0 if case == "quick" else (1 if case == "short_research" else 2),
+                                expected_model_rounds=1 if self.profile or case == "quick" else 3,
+                                expected_searches=0 if self.profile or case == "quick" else 1,
+                                expected_fetches=0 if self.profile or case == "quick" else (1 if case == "short_research" else 2),
                                 stream_delay_ms=STREAM_DELAY_MS,
                                 stream_gate_enabled=self._gated_stream,
                                 stream_gate_wait_ms=0, stream_gate_timed_out=False,
                                 first_delta_sent=False, first_delta_sent_monotonic=0,
                                 history_matches=True, history_turns_expected=0, history_turns_observed=0,
-                                expected_readable_sources=0 if case == "quick" else (1 if case == "short_research" else 2))
+                                expected_readable_sources=0 if self.profile or case == "quick" else (1 if case == "short_research" else 2))
 
     def release_stream(self):
         with self._lock:
@@ -257,6 +370,7 @@ class FakeServices:
 
             def do_POST(self):
                 generation = self.path == "/responses"
+                body = None
                 if generation:
                     with owner._quiescent:
                         owner._active_generations += 1
@@ -277,6 +391,8 @@ class FakeServices:
                     with owner._lock:
                         if self.path == "/responses":
                             status, response = owner._generation(body)
+                            if status != 200 and owner.profile:
+                                owner._stats['rejection_diagnostics'] = rejection_diagnostics(body, owner.profile)
                             content_type = "text/event-stream" if status == 200 else "application/json"
                         elif self.path == "/mcp":
                             status, response = owner._mcp(body)
@@ -286,6 +402,9 @@ class FakeServices:
                     self.send(status, response, content_type)
                 except (ValueError, TypeError, KeyError, RecursionError):
                     owner._increment("failures")
+                    if generation and owner.profile:
+                        with owner._lock:
+                            owner._stats['rejection_diagnostics'] = rejection_diagnostics(body, owner.profile)
                     self.send(400, {"error": {"type": "fixture_invalid_request"}})
                 except (OSError, TimeoutError):
                     owner._increment("failures")
@@ -321,7 +440,7 @@ class FakeServices:
             raise ValueError()
         text = content if isinstance(content, str) else " ".join(
             part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "input_text")
-        valid_prompt = matches_transcript(self._case, text)
+        valid_prompt = self.profile.matches(self._case, text) if self.profile else matches_transcript(self._case, text)
         valid_model = body.get("model") == MODEL and body.get("reasoning", {}).get("effort") == "none"
         self._stats.update(transcript_matches=valid_prompt, model_matches=valid_model)
         if not valid_prompt or not valid_model:
@@ -360,13 +479,13 @@ class FakeServices:
         if (self._stats["failures"] or self._stats["terminal"]
                 or self._stats["model_rounds"] >= self._stats["expected_model_rounds"]
                 or round_number != self._stats["model_rounds"]
-                or (self._case == "quick" and outputs)):
+                or ((self.profile or self._case == "quick") and outputs)):
             raise ValueError()
         for index, output in enumerate(outputs):
             self._validate_evidence(output, "search_excerpt" if index == 0 else "page_read")
         self._increment("model_rounds")
         events = []
-        if self._case != "quick" and round_number < 2:
+        if not self.profile and self._case != "quick" and round_number < 2:
             search = round_number == 0
             name = "web_search" if search else "web_fetch"
             args = {"objective": "Synthetic Rust documentation comparison", "queries": ["Rust OnceLock LazyLock documentation"], "num_results": 2} if search else {"urls": URLS[:1 if self._case == "short_research" else 2], "focus": "Release, initialization, panic and reset semantics"}
@@ -374,8 +493,8 @@ class FakeServices:
             items = [{"type": "function_call", "id": "synthetic-item-" + call_id,
                       "call_id": call_id, "name": name, "arguments": json.dumps(args), "status": "completed"}]
         else:
-            text = expected_answer(self._case)
-            chunk_size = 1 if self._case == "quick" else 96
+            text = self.profile.answer if self.profile else expected_answer(self._case)
+            chunk_size = 1 if self.profile or self._case == "quick" else 96
             for start in range(0, len(text), chunk_size):
                 events.append({"type": "response.output_text.delta", "delta": text[start:start + chunk_size]})
             items = [{"type": "message", "id": "synthetic-answer", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": text}]}]

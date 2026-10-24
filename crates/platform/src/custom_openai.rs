@@ -1261,6 +1261,34 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[test]
+    fn synthetic_access_only_accepts_loopback_but_managed_credentials_remain_fixed_route() {
+        let dir = crate::test_support::TestDir::new("synthetic-endpoint-contract");
+        let path = dir.path().join("auth.json");
+        std::fs::write(
+            &path,
+            br#"{"openai":{"access":"synthetic-benchmark-access","expires":4102444800000}}"#,
+        )
+        .unwrap();
+        let credential = load_request_credential(&path).unwrap();
+        assert!(!credential.managed);
+        assert!(credential
+            .validate_endpoint("http://127.0.0.1:32123/responses")
+            .is_ok());
+        std::fs::write(&path, br#"{"voxgolemChatgpt":1,"openai":{"access":"synthetic-benchmark-access","expires":4102444800000}}"#).unwrap();
+        let credential = load_request_credential(&path).unwrap();
+        assert!(credential.managed);
+        assert!(matches!(
+            credential.validate_endpoint("http://127.0.0.1:32123/responses"),
+            Err(CustomOpenAiError::InvalidConfig)
+        ));
+        assert!(matches!(
+            credential.validate_endpoint("https://synthetic.invalid/responses"),
+            Err(CustomOpenAiError::InvalidConfig)
+        ));
+        assert!(credential.validate_endpoint(DEFAULT_ENDPOINT).is_ok());
+    }
+
+    #[test]
     fn managed_expired_access_remains_admissible_for_dispatch_refresh() {
         let dir = crate::test_support::TestDir::new("renewable-auth");
         let path = dir.path().join("auth.json");

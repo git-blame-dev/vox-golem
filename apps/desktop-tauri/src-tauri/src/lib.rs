@@ -3389,6 +3389,15 @@ async fn speak_local_tts_from_state(
         log_tts_runtime_event(runtime_file_logging_enabled, "synthesis superseded");
     })?;
     let duration_ms = audio.duration_ms;
+    #[cfg(feature = "app-benchmark")]
+    if speech_generation.is_some()
+        && !audio.pcm_f32.is_empty()
+        && audio.sample_rate_hz > 0
+        && audio.pcm_f32.iter().all(|sample| sample.is_finite())
+        && audio.pcm_f32.iter().any(|sample| *sample != 0.0)
+    {
+        app_benchmark::mark("reply_synthesis_valid");
+    }
     let output_gain_db = app_state
         .runtime_config
         .as_ref()
@@ -3404,12 +3413,21 @@ async fn speak_local_tts_from_state(
                 gain_db: output_gain_db,
             },
             voxgolem_audio::playback::PlaybackPurpose::Speech,
-            || {},
+            || {
+                #[cfg(feature = "app-benchmark")]
+                if speech_generation.is_some() {
+                    app_benchmark::mark("reply_output_submitted");
+                }
+            },
         )
     })
     .await;
     match playback_result {
         Ok(Ok(_)) => {
+            #[cfg(feature = "app-benchmark")]
+            if speech_generation.is_some() {
+                app_benchmark::mark("reply_output_completed");
+            }
             finish_tts_playback_state(&app_state.tts_playback, playback_id)?;
         }
         Ok(Err(error)) => {
@@ -13264,13 +13282,21 @@ fn store_llama_runtime_if_current(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let context = tauri::generate_context!();
+    #[cfg(feature = "app-benchmark")]
+    if let Err(error) = app_benchmark::validate_application_id(&context.config().identifier) {
+        eprintln!("{error}");
+        std::process::exit(2);
+    }
     #[cfg(feature = "app-benchmark")]
     if let Err(error) = app_benchmark::validate_environment() {
         eprintln!("{error}");
         std::process::exit(2);
     }
     let builder = tauri::Builder::default();
-    #[cfg(target_os = "windows")]
+    // Benchmark processes must never send the shipping single-instance activation
+    // message. The controller owns its diagnostic instance and Job Object instead.
+    #[cfg(all(target_os = "windows", not(feature = "app-benchmark")))]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _, _| {
         if let Some(window) = app.get_webview_window("main") {
             let _ = window.unminimize();
@@ -13565,7 +13591,7 @@ pub fn run() {
             }
         });
 
-    let app = match builder.build(tauri::generate_context!()) {
+    let app = match builder.build(context) {
         Ok(app) => app,
         Err(error) => {
             eprintln!("failed to build vox-golem tauri shell: {error}");

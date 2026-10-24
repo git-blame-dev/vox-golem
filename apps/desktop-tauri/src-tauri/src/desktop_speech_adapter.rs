@@ -118,6 +118,8 @@ fn apply(app: &tauri::AppHandle, state: &AppState, decision: Decision) {
         cancel_physical(state);
     }
     if let Some(request) = decision.speak {
+        #[cfg(feature = "app-benchmark")]
+        super::app_benchmark::mark("reply_speech_admitted");
         if let Ok(mut pending) = state.native_speech_pending.lock() {
             *pending = Some(request);
         }
@@ -284,6 +286,8 @@ fn start_worker(app: &tauri::AppHandle, state: &AppState) {
                 publish(&app, &state);
             }
             if result.is_err() {
+                #[cfg(feature = "app-benchmark")]
+                super::app_benchmark::mark("reply_speech_failed");
                 log_category(&state, "native reply speech did not complete");
             }
             // A cancelled helper result is not physical native-engine completion.

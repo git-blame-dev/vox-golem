@@ -8,6 +8,16 @@ pub(super) fn path() -> Result<PathBuf, String> {
 }
 
 pub(super) fn configuration(fallback: Option<&CustomOpenAiConfig>) -> Option<CustomOpenAiConfig> {
+    // Offline benchmark requests must keep the isolated loopback configuration.
+    // Managed sign-in normally selects the fixed remote route; that remains the
+    // shipping/live behavior. The shared benchmark send fence still validates
+    // every offline endpoint before dispatch, and credentials retain their owner.
+    #[cfg(feature = "app-benchmark")]
+    if std::env::var("VOXGOLEM_BENCH_MODE").as_deref() == Ok("offline") {
+        if let Some(config) = fallback {
+            return Some(config.clone());
+        }
+    }
     configuration_at(path().ok().as_deref(), fallback)
 }
 

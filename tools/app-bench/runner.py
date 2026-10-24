@@ -5,7 +5,10 @@ Run with the pinned benchmark-tools interpreter. Fixtures and reports never use
 personal audio/history. Live generation is additionally fenced inside Rust.
 """
 import argparse
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows diagnostic never accesses the Unix live ledger.
+    fcntl = None
 import hashlib
 import json
 import math
@@ -19,8 +22,9 @@ import subprocess
 import sys
 import time
 import tomllib
+from types import SimpleNamespace
 
-from fixtures import CASES, URLS, FakeServices, expected_answer, generate_fixtures
+from fixtures import CASES, URLS, FakeServices, expected_answer, generate_fixtures, arithmetic_profile
 
 ROOT = Path(__file__).resolve().parents[2]
 MAX_ASSIGNMENT_CALLS = 100
@@ -35,14 +39,113 @@ WORKFLOW_SAFETY_CHECKS = ('empty_admission', 'duplicate_ui_submission', 'cancell
     'warm_context', 'longer_history', 'relaunch_preferences', 'relaunch_without_generation')
 
 
+def validate_arithmetic_options(live, cases, tts_model):
+    if live or cases != ['arithmetic'] or tts_model is None:
+        raise ValueError('Arithmetic voice requires offline, one arithmetic case and explicit TTS model')
+
+
+def alsa_null_environment(run, source):
+    env = {key: value for key, value in source.items()
+           if not key.upper().startswith(('PULSE_', 'PIPEWIRE_', 'ALSA_', 'JACK_'))}
+    config = run/'alsa-null.conf'
+    with open(config, 'x', opener=lambda p, f: os.open(p, f, 0o600)) as stream:
+        stream.write('pcm.!default { type null }\n')
+    env['ALSA_CONFIG_PATH'] = str(config.resolve())
+    return env
+
+
+def audio_socket_masks(environment):
+    """Hide known host Unix audio transports, without mounting audio devices."""
+    paths = {Path('/mnt/wslg/PulseServer'), Path('/mnt/wslg/runtime-dir/pulse'),
+             Path('/run/pulse'), Path('/tmp/pulse')}
+    runtime = environment.get('XDG_RUNTIME_DIR')
+    if runtime:
+        base = Path(runtime)
+        paths.add(base/'pulse')
+        paths.update(base.glob('pipewire-*'))
+    paths.update(Path('/mnt/wslg').glob('Pulse*'))
+    for key in ('PULSE_SERVER', 'PIPEWIRE_REMOTE'):
+        value = environment.get(key, '')
+        if value.startswith('unix:'):
+            value = value[5:]
+        if value.startswith('/'):
+            paths.add(Path(value))
+    arguments = []
+    for path in sorted(paths):
+        if path.exists():
+            arguments += ['--tmpfs', str(path)] if path.is_dir() else ['--ro-bind', '/dev/null', str(path)]
+    return arguments
+
+
+def arithmetic_speech_passed(speech):
+    return (isinstance(speech, dict) and speech.get('retired') is True and
+            all(type(speech.get(key)) is int and speech[key] == 1 for key in
+                ('admitted', 'synthesis_valid', 'output_submitted', 'output_completed')) and
+            type(speech.get('failed')) is int and speech['failed'] == 0)
+
+
+def voice_model_readiness(driver, timeout=10):
+    """Observe canonical availability and normal UI selection before any fixture.
+
+    A selected DOM value alone is not readiness. Never force native capabilities
+    or submit a prompt to discover a missing model configuration.
+    """
+    model = 'custom-luna-none'
+    deadline = time.monotonic()+timeout
+    while True:
+        snapshot = invoke(driver, 'get_app_snapshot')
+        option = next((item for item in snapshot.get('model_options', []) if item.get('id') == model), {})
+        evidence = {'requested_model': model, 'canonical_model_available': option.get('available') is True,
+                    'canonical_selection_matches': snapshot.get('preferences', {}).get('instant') == model,
+                    'ui_selection_matches': False, 'ui_controls_enabled': False, 'ready': False}
+        if not evidence['canonical_model_available']:
+            evidence['failure'] = 'requested_model_not_configured'
+            return evidence
+        ui = driver.execute_script('''const field=document.getElementById('composerInstantSelect');
+const option=field&&Array.from(field.options).find(option=>option.value===arguments[0]);
+return {selected:field?.value===arguments[0],enabled:!!field&&!field.disabled&&!!option&&!option.disabled};''', model)
+        evidence.update(ui_selection_matches=ui.get('selected') is True, ui_controls_enabled=ui.get('enabled') is True)
+        if all(evidence[key] for key in ('canonical_selection_matches', 'ui_selection_matches', 'ui_controls_enabled')):
+            evidence['ready'] = True
+            return evidence
+        if evidence['ui_controls_enabled'] and not evidence['canonical_selection_matches']:
+            driver.execute_script('''const field=document.getElementById('composerInstantSelect');
+Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(field,arguments[0]);
+field.dispatchEvent(new Event('change',{bubbles:true}));''', model)
+        if time.monotonic() >= deadline:
+            evidence['failure'] = 'model_controls_not_ready'
+            return evidence
+        time.sleep(0.1)
+
+
+def arithmetic_identity(profile, model, speech_identity):
+    assets = {}
+    for key, path in [('model', model), ('config', Path(str(model)+'.json'))]:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError('Explicit TTS model and adjacent configuration required')
+        digest = hashlib.sha256()
+        with path.open('rb') as stream:
+            while block := stream.read(1024*1024):
+                digest.update(block)
+        assets[key] = digest.hexdigest()
+    return dict(profile='voice-arithmetic-v1', contract_sha256=profile.contract_sha256,
+                implementation_sha256=profile.implementation_sha256,
+                output_route='alsa-null-software', acoustic_verified=False,
+                tts_assets_sha256=assets, tts_provider_policy='auto',
+                web_enabled=False, tts_enabled=True, completion=False,
+                sample_rate_hz=22050, worker_count=1, max_queue=8,
+                max_duration_s=300, output_gain_db=0, stt=speech_identity)
+
+
 def private_json(path, value):
     with open(path, 'x', opener=lambda p, f: os.open(p, f, 0o600)) as stream:
         json.dump(value, stream, indent=2, sort_keys=True)
         stream.flush()
         os.fsync(stream.fileno())
-    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-    try: os.fsync(directory)
-    finally: os.close(directory)
+    if os.name != 'nt':
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try: os.fsync(directory)
+        finally: os.close(directory)
 
 
 def prune_owned_reports(parent, now=None, max_bytes=8*1024*1024, max_files=128):
@@ -76,6 +179,8 @@ def prune_owned_reports(parent, now=None, max_bytes=8*1024*1024, max_files=128):
 
 def reserve_live_budget(ledger, reservation):
     """Reservations survive disposable runs; uncertainty never refunds calls."""
+    if fcntl is None:
+        raise ValueError('Live ledger is supported only by the qualified Unix path')
     if ledger.is_symlink() or any(p.is_symlink() for p in ledger.parents):
         raise ValueError('Budget ledger must not be a symlink')
     ledger = ledger.resolve()
@@ -145,6 +250,8 @@ def validate_benchmark_binary(binary):
 
 
 def validate_offline_evidence(path, binary, fixtures, speech_identity, entry='voice'):
+    if entry not in ('voice', 'typed'):
+        raise ValueError('Only legacy voice and typed profiles have a live qualification policy')
     if path is None or path.stat().st_size > 128*1024:
         raise ValueError('A bounded successful offline report is required')
     evidence = json.loads(path.read_text())
@@ -260,9 +367,12 @@ def finish_live_credential(run):
         os.replace(temporary, source)
 
 
-def isolated_environment(run, source_config, endpoint, live=False, reservation=None, entry='voice'):
+def isolated_environment(run, source_config, endpoint, live=False, reservation=None, entry='voice', tts_model=None,
+                         output_route='alsa-null-software', base_environment=None):
+    if entry == 'voice-arithmetic':
+        validate_arithmetic_options(live, ['arithmetic'], tts_model)
     original = tomllib.loads(source_config.read_text())
-    env = os.environ.copy()
+    env = (os.environ if base_environment is None else base_environment).copy()
     if not env.get('XAUTHORITY') and (Path(env.get('HOME', ''))/'.Xauthority').is_file():
         env['XAUTHORITY'] = str(Path(env['HOME'])/'.Xauthority')
     wayland = env.get('WAYLAND_DISPLAY')
@@ -291,7 +401,8 @@ def isolated_environment(run, source_config, endpoint, live=False, reservation=N
         config.append(f'{key} = {original.get(key, default)}')
     # Custom is selected in assistant settings, not the legacy backend enum.
     # No OpenCode table means no unrelated server is started.
-    config += ['web_enabled = true', 'response_backend = "opencode"', '[custom_openai]']
+    arithmetic = entry == 'voice-arithmetic'
+    config += [f'web_enabled = {str(not arithmetic).lower()}', 'response_backend = "opencode"', '[custom_openai]']
     if live:
         stage_live_credential(run, source_config)
         custom = original.get('custom_openai')
@@ -300,14 +411,18 @@ def isolated_environment(run, source_config, endpoint, live=False, reservation=N
     else:
         credential = managed_credential(run/'config')
         credential.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        private_json(credential, {'voxgolemChatgpt': 1, 'openai': {'access': 'synthetic-benchmark-access',
-                                                                  'expires': 4102444800000}})
+        private_json(credential, {'openai': {'access': 'synthetic-benchmark-access',
+                                            'expires': 4102444800000}})
         config += [f'endpoint = {json.dumps(endpoint)}']
     # Omit the optional TTS table: even a disabled table requires model_path.
+    if arithmetic:
+        config += ['[tts]', 'enabled = true', f'model_path = {json.dumps(str(tts_model.resolve()))}',
+                   'worker_count = 1', 'max_queue = 8',
+                   'sample_rate_hz = 22050', 'max_duration_s = 300', 'output_gain_db = 0']
     config += ['[telemetry]', 'enabled = false',
                '[logging]', 'enabled = false']
     config_path.write_text('\n'.join(config) + '\n')
-    (config_path.parent / 'state.toml').write_text('''web_enabled = true
+    state = '''web_enabled = true
 tts_enabled = false
 auto_update_download = false
 auto_update_install = false
@@ -318,9 +433,19 @@ assistant_deep_enabled = false
 assistant_review_enabled = false
 assistant_prefetch = false
 assistant_completion = false
-''')
+'''
+    if arithmetic:
+        state = state.replace('web_enabled = true', 'web_enabled = false').replace('tts_enabled = false', 'tts_enabled = true')
+        if output_route == 'alsa-null-software':
+            env = alsa_null_environment(run, env)
+        elif output_route == 'windows-diagnostic':
+            env = {key: value for key, value in env.items()
+                   if not key.upper().startswith(('PULSE_', 'PIPEWIRE_', 'ALSA_', 'JACK_'))}
+        else:
+            raise ValueError('Unknown arithmetic output route')
+    (config_path.parent / 'state.toml').write_text(state)
     env.update(VOXGOLEM_BENCH_MODE='live' if live else 'offline',
-               VOXGOLEM_BENCH_ENTRY='typed' if entry == 'typed' else 'voice',
+               VOXGOLEM_BENCH_ENTRY=entry if entry in ('typed', 'voice-arithmetic') else 'voice',
                VOXGOLEM_BENCH_ROOT=str(run), VOXGOLEM_CONFIG_PATH=str(config_path),
                TAURI_AUTOMATION='true')
     env.pop('VOXGOLEM_BENCH_AUTO_DIAGNOSTIC_CASE', None)
@@ -464,7 +589,7 @@ def accepted_flow(case, final, native, canonical_added_once, sources_preserved,
         return False
     if not final.get('nonblank') or final.get('canonical_ui_match') is not True:
         return False
-    pages = 0 if case == 'quick' else (1 if case == 'short_research' else 2)
+    pages = 0 if case in ('quick', 'arithmetic') else (1 if case == 'short_research' else 2)
     if case == 'quick' and not final['quick_correct']:
         return False
     if pages and (native.get('readable_pages', 0) < pages or
@@ -486,7 +611,7 @@ def accepted_flow(case, final, native, canonical_added_once, sources_preserved,
     return True
 
 
-def answer_integrity(case, canonical, rendered, urls, offline, canonical_sources=None):
+def answer_integrity(case, canonical, rendered, urls, offline, canonical_sources=None, profile=None):
     parts = canonical.rsplit('\n\nSources:\n', 1)
     if isinstance(canonical_sources, list) and canonical_sources:
         plain_canonical = canonical
@@ -504,9 +629,9 @@ def answer_integrity(case, canonical, rendered, urls, offline, canonical_sources
         plain_canonical = parts[0]
         saved = []
         has_canonical_sources = False
-    expected_urls = [] if case == 'quick' else URLS
+    expected_urls = [] if profile or case == 'quick' else URLS
     sources_preserved = len(urls) == len(saved) and set(urls) == set(saved)
-    if case != 'quick': sources_preserved &= bool(urls)
+    if not profile and case != 'quick': sources_preserved &= bool(urls)
     if offline: sources_preserved &= set(urls) == set(expected_urls)
     return {'canonical_ui_match': bool(canonical.strip()) and (
                 canonical.strip() == rendered.strip() or plain_canonical.strip() == rendered.strip()),
@@ -514,7 +639,7 @@ def answer_integrity(case, canonical, rendered, urls, offline, canonical_sources
             'sources_preserved': sources_preserved,
             'canonical_source_count': len(saved), 'ui_source_count': len(urls),
             'expected_source_count': len(expected_urls) if offline else None,
-            'offline_fixture_match': offline and plain_canonical == expected_answer(case) and
+            'offline_fixture_match': offline and plain_canonical == (profile.answer if profile else expected_answer(case)) and
                 has_canonical_sources == bool(expected_urls)}
 
 
@@ -929,7 +1054,7 @@ def _exercise(driver, case, timeout, wake_diagnostics, services, poll_interval, 
     started = time.perf_counter()
     deadline = time.monotonic() + timeout
     try:
-        if entry == 'voice':
+        if entry in ('voice', 'voice-arithmetic'):
             invoke(driver, 'benchmark_queue', {'fixture': case})
         else:
             driver.find_element('css selector', '.composer button[type=submit]').click()
@@ -995,6 +1120,12 @@ def _exercise(driver, case, timeout, wake_diagnostics, services, poll_interval, 
                 'native': invoke(driver, 'benchmark_snapshot')}
     after = invoke(driver, 'get_app_snapshot')
     native = invoke(driver, 'benchmark_snapshot')
+    if entry == 'voice-arithmetic':
+        while not arithmetic_speech_passed(native.get('reply_speech')) and time.monotonic() < deadline:
+            if native.get('reply_speech', {}).get('failed', 0) > 0 and native['reply_speech'].get('retired'):
+                break
+            time.sleep(poll_interval)
+            native = invoke(driver, 'benchmark_snapshot')
     flow = max((e['flow'] for e in native['events']), default=0)
     events = [e for e in native['events'] if e['flow'] == flow]
     canonical_added_once = len(after['transcript']) == len(before['transcript'])+1
@@ -1008,13 +1139,17 @@ const rendered=rows[0].querySelector('.answer-stage__answer,.message__content')?
 const urls=Array.from(rows[0].querySelectorAll('.answer-stage__sources a')).map(a=>a.href);
 return {text:rendered,urls};''', request_id)
     integrity = answer_integrity(case, text, delivered['text'], delivered['urls'], services is not None,
-                                 after['transcript'][-1].get('sources') if canonical_added_once else None)
+                                 after['transcript'][-1].get('sources') if canonical_added_once else None,
+                                 services.profile if entry == 'voice-arithmetic' else None)
     final.update(integrity)
     final['quick_correct'] = quick_answer_correct(text)
     sources_preserved = integrity['sources_preserved']
     service_metadata = services.snapshot() if services else None
     passed = accepted_flow(case, final, native, canonical_added_once, sources_preserved,
-                           saw_inflight, service_metadata, entry == 'voice')
+                           saw_inflight, service_metadata, entry in ('voice', 'voice-arithmetic'))
+    if entry == 'voice-arithmetic':
+        passed = (passed and sources_preserved and integrity['canonical_sources_expected'] and
+                  arithmetic_speech_passed(native.get('reply_speech')))
     if hold is not None:
         hold['canonical_prefix_preserved'] = after['transcript'][:-1] == before['transcript']
         hold['canonical_ui_reconciled_once'] = canonical_added_once and final['canonical_ui_match'] and driver.execute_script('''const prior=arguments[0],id=arguments[1];return Array.from(document.querySelectorAll('[data-turn-role=user][data-request-id]')).filter(e=>!prior.includes(e.dataset.requestId)).length===1&&document.querySelectorAll('[data-turn-role=assistant][data-request-id]').length===prior.length+1&&Array.from(document.querySelectorAll('[data-turn-role=user][data-request-id]')).filter(e=>e.dataset.requestId===id).length===1;''', baseline, request_id)
@@ -1037,6 +1172,8 @@ return {text:rendered,urls};''', request_id)
             time.sleep(0.05)
         hold['post_release_observation_completed'] = time.monotonic() < deadline
     return {'case': case, 'passed': bool(passed) and not hold_native_observer,
+            'reply_speech': native.get('reply_speech') if entry == 'voice-arithmetic' else None,
+            'tts_actual_provider': native.get('tts_actual_provider') if entry == 'voice-arithmetic' else None,
             'native_observer_hold': hold,
             'diagnostic_success': hold is not None and all(value is True for key, value in hold.items() if key not in ('held_reads', 'extra_reads')) and hold['held_reads'] == 1 and hold['extra_reads'] == 0,
             'page_at_start': page_at_start,
@@ -1059,7 +1196,7 @@ return {text:rendered,urls};''', request_id)
             'source_links': final['source_links'], 'native_events': events,
             'native_audio': native.get('native_audio'),
             'handler_call_metadata': native.get('handler_call_metadata'),
-            'native_audio_owned': native_audio_owned(native) if entry == 'voice' else None,
+            'native_audio_owned': native_audio_owned(native) if entry in ('voice', 'voice-arithmetic') else None,
             'dropped': native['dropped']}
 
 
@@ -1087,12 +1224,13 @@ def observe_native_completion_held(driver, before, baseline, services, deadline)
     return result
 
 
-def execute(args):
-    global PHASE
+def execute(args, platform=None):
+    global PHASE, APP_PID
+    if args.entry == 'voice-arithmetic':
+        validate_arithmetic_options(args.live, args.cases, getattr(args, 'tts_model', None))
     validate_benchmark_binary(args.binary)
     if getattr(args, 'shared_suite', False):
         import importlib.util
-        from types import SimpleNamespace
         spec = importlib.util.spec_from_file_location('typed_benchmark_desktop', ROOT/'tools/benchmark/desktop.py')
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -1110,11 +1248,20 @@ def execute(args):
             return {'browserName': 'wry'}
 
     run = args.output.resolve()
-    fixtures = generate_fixtures(run / 'fixtures', voice=args.voice, wake_phrase=args.wake_phrase)
+    profile = arithmetic_profile() if args.entry == 'voice-arithmetic' else None
+    effects_api = SimpleNamespace(**globals()) if platform else None
+    if platform:
+        fixtures, speech_identity, identity = platform.prepare(profile, effects_api)
+    else:
+        fixtures = generate_fixtures(run / 'fixtures', voice=args.voice, wake_phrase=args.wake_phrase, profile=profile)
     if sum(fixture['byte_count'] for fixture in fixtures.values()) > 16*1024*1024:
         raise ValueError('Synthetic fixture bundle exceeds its byte budget')
-    speech_identity = speech_configuration_identity(args.config.resolve())
-    services = FakeServices() if not args.live else None
+    if not platform:
+        speech_identity = speech_configuration_identity(args.config.resolve())
+        if profile:
+            speech_identity.update(web_enabled=False, tts_enabled=True)
+        identity = arithmetic_identity(profile, args.tts_model.resolve(), speech_identity) if profile else None
+    services = FakeServices(profile=profile) if not args.live else None
     if services:
         services.__enter__()
     driver = None
@@ -1127,37 +1274,54 @@ def execute(args):
             reserved = reserve_live_budget(args.ledger, reservation)
         else:
             reserved = 0
-        env = isolated_environment(run, args.config.resolve(),
-                                   services.generation_endpoint if services else None,
-                                   args.live, reservation)
+        env = platform.environment(services.generation_endpoint, effects_api) if platform else isolated_environment(
+            run, args.config.resolve(), services.generation_endpoint if services else None,
+            args.live, reservation, entry=args.entry, tts_model=getattr(args, 'tts_model', None))
         if services:
             env['VOXGOLEM_BENCH_MCP_ENDPOINT'] = services.mcp_endpoint
         if args.driver_free_diagnostic:
             return driver_free_diagnostic(args, run, fixtures, env, services)
         port, native_port = free_port(), free_port()
         PHASE = 'webdriver_starting'
-        process = subprocess.Popen([str(args.tools/'bin/tauri-driver'), '--port', str(port),
-             '--native-port', str(native_port), '--native-driver',
-             str(args.tools/'webkit/extracted/usr/bin/WebKitWebDriver')],
-             env=env, start_new_session=True, stdout=subprocess.DEVNULL,
-             stderr=subprocess.DEVNULL)
+        if platform:
+            process = platform.start(env, port, native_port)
+        else:
+            process = subprocess.Popen([str(args.tools/'bin/tauri-driver'), '--port', str(port),
+                 '--native-port', str(native_port), '--native-driver',
+                 str(args.tools/'webkit/extracted/usr/bin/WebKitWebDriver')],
+                 env=env, start_new_session=True, stdout=subprocess.DEVNULL,
+                 stderr=subprocess.DEVNULL)
         wait_for(lambda: can_connect(port), 15, 'webdriver_startup')
         options = Options()
-        options.set_capability('tauri:options', {'application': str(args.binary.resolve())})
+        options.set_capability('tauri:options', platform.application_options() if platform else
+                               {'application': str(args.binary.resolve())})
         PHASE = 'app_launch'
         launch = time.perf_counter()
+        if platform:
+            APP_PID = None
         driver = webdriver.Remote(command_executor=f'http://127.0.0.1:{port}', options=options)
         driver.set_script_timeout(75)
+        if platform:
+            invoke(driver, 'benchmark_snapshot')
+            platform.observe_app(APP_PID)
         PHASE = 'automatic_capture_start'
         ready = wait_for(lambda: invoke(driver, 'benchmark_snapshot').get('capture_active'),
                          60, 'automatic_capture_start')
         launch_ms = (time.perf_counter()-launch)*1000
+        readiness = None
+        if profile:
+            PHASE = 'voice_model_readiness'
+            readiness = voice_model_readiness(driver)
         selected = driver.execute_script('return document.getElementById("composerInstantSelect")?.value')
         if selected != 'custom-luna-none':
             raise RuntimeError('Requested model was not selected')
         if args.event_loop_diagnostic:
             driver.execute_script('''const metrics={ticks:0,max_tick_gap_ms:0};window.__benchLoopDiagnostic=metrics;let previous=performance.now();setInterval(()=>{const now=performance.now();metrics.max_tick_gap_ms=Math.max(metrics.max_tick_gap_ms,now-previous);metrics.ticks++;previous=now;},50);''')
         for case in args.cases:
+            if readiness is not None and not readiness['ready']:
+                rows.append({'case': case, 'passed': False, 'failure': readiness['failure'],
+                             'model_readiness': readiness})
+                break
             PHASE = 'voice_flow'
             if services:
                 services.expected_case = case
@@ -1173,11 +1337,11 @@ def execute(args):
             rows.append(result)
             if not result.get('typed_control_passed', result['passed']):
                 break
-        summary = {'schema': 1, 'mode': 'live' if args.live else 'offline',
+        summary = {'schema': 3 if profile else 1, 'mode': 'live' if args.live else 'offline',
                    'requested_model': 'custom-luna-none', 'effort': 'none',
                    'entry': args.entry,
                    'software_input': True, 'physical_microphone_tested': False,
-                   'diagnostic_only': args.hold_native_observer or args.entry != 'voice' or args.wake_diagnostics or args.event_loop_diagnostic or args.poll_interval != 0.1,
+                   'diagnostic_only': getattr(args, 'readiness_diagnostic', False) or args.hold_native_observer or args.entry not in ('voice', 'voice-arithmetic') or args.wake_diagnostics or args.event_loop_diagnostic or args.poll_interval != 0.1,
                    'hold_native_observer': args.hold_native_observer,
                    'wake_score_diagnostics': args.wake_diagnostics,
                    'browser_call_probes': args.event_loop_diagnostic,
@@ -1192,19 +1356,34 @@ def execute(args):
                    'live_batch_reserved': LIVE_BATCH_ALLOWANCE if args.live else 0,
                    'assignment_reserved': reserved,
                    'nominal_observation_interval_ms': args.poll_interval*1000}
-        cleanup = shutdown_owned(driver, process)
+        cleanup = platform.shutdown(driver, process) if platform else shutdown_owned(driver, process)
         driver = None
         process = None
         summary['cleanup'] = cleanup
+        if profile:
+            summary['model_readiness'] = readiness
+            summary['profile_identity'] = identity
+            summary['isolated_config_sha256'] = hashlib.sha256((run/'config/config.toml').read_bytes()).hexdigest()
+            summary['qualified_for_live'] = False
+            summary['acoustic_output'] = 'unverified'
+            summary['output_route'] = 'alsa-null-software'
+            summary['offline_profile_qualified'] = (not summary['diagnostic_only'] and len(rows) == 1 and rows[0]['passed'] is True and
+                rows[0].get('tts_actual_provider') in ('cpu', 'cuda') and
+                cleanup['app_exit_before_group_termination_observed'] is True)
         summary['diagnostic_success'] = (args.hold_native_observer and len(rows) == 1 and
             rows[0].get('diagnostic_success') is True and cleanup['app_exit_before_group_termination_observed'])
         if args.hold_native_observer:
             summary['qualified_for_live'] = False
+        if platform:
+            platform.annotate(summary)
         private_json(run/'report.json', summary)
         prune_owned_reports(run.parent)
         passed = (not summary['diagnostic_only'] and len(rows)==len(args.cases) and
                   all(r['passed'] for r in rows) and cleanup['app_exit_before_group_termination_observed'])
+        if profile:
+            passed = passed and summary['offline_profile_qualified']
         print(json.dumps({'passed': passed,
+                          'workflow_completed': summary.get('workflow_completed'),
                           'diagnostic_success': summary['diagnostic_success'],
                           'mode': summary['mode'], 'completed_flows': len(rows)}))
         return 0 if passed else 1
@@ -1222,7 +1401,10 @@ def execute(args):
         raise
     finally:
         if driver or process:
-            shutdown_owned(driver, process)
+            if platform:
+                platform.shutdown(driver, process)
+            else:
+                shutdown_owned(driver, process)
         if services:
             services.__exit__(None, None, None)
         finish_live_credential(run)
@@ -1275,8 +1457,12 @@ def main():
     parser.add_argument('--config', type=Path, required=True)
     parser.add_argument('--wake-phrase', help='Required for voice, unused by typed-workflow')
     parser.add_argument('--voice', default='en-gb', choices=['en-gb', 'en-us', 'en-us+f3', 'en-gb+f2'])
-    parser.add_argument('--cases', nargs='+', choices=list(CASES), default=list(CASES))
-    parser.add_argument('--entry', choices=['voice', 'typed', 'typed-control'], default='voice', help='Typed is workflow coverage excluding capture; typed-control remains diagnostic')
+    parser.add_argument('--cases', nargs='+', choices=list(CASES)+['arithmetic'])
+    parser.add_argument('--entry', choices=['voice', 'voice-arithmetic', 'typed', 'typed-control'], default='voice', help='Arithmetic voice is offline real synthesis/software-null output only')
+    parser.add_argument('--tts-model', type=Path, help='Arithmetic only: explicit local Piper ONNX model with adjacent .json')
+    parser.add_argument('--desktop-platform', choices=['linux', 'windows'], default='linux')
+    parser.add_argument('--windows-manifest', type=Path, help='Windows-only staged PCM/assets/tools hash manifest')
+    parser.add_argument('--readiness-diagnostic', action='store_true', help='Offline Linux arithmetic investigation only; never qualifying, maximum 30-second flow')
     parser.add_argument('--extended', action='store_true', help='Offline typed context/history/cancellation/relaunch matrix')
     parser.add_argument('--flow-timeout', type=float, default=180)
     parser.add_argument('--poll-interval', type=float, default=0.1, help='Non-default intervals are observer-effect diagnostics, not qualifying evidence')
@@ -1291,6 +1477,20 @@ def main():
     parser.add_argument('--inside-offline', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--inside-session', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    arithmetic = args.entry == 'voice-arithmetic'
+    if args.readiness_diagnostic and (not arithmetic or args.live or args.desktop_platform != 'linux' or args.flow_timeout > 30):
+        parser.error('Readiness diagnostic requires offline Linux arithmetic and flow timeout at most 30 seconds')
+    if args.cases is None:
+        args.cases = ['arithmetic'] if arithmetic else list(CASES)
+    if arithmetic:
+        try:
+            validate_arithmetic_options(args.live, args.cases, args.tts_model)
+        except ValueError as error:
+            parser.error(str(error))
+        if args.wake_diagnostics or args.event_loop_diagnostic or args.driver_free_diagnostic or args.hold_native_observer or args.extended or args.poll_interval != 0.1:
+            parser.error('Arithmetic qualification cannot use diagnostic probes')
+    elif 'arithmetic' in args.cases or args.tts_model is not None:
+        parser.error('Arithmetic fixtures and TTS model require voice-arithmetic entry')
     args.tools = args.tools.resolve()
     if args.shared_suite and (not args.live or args.entry != 'typed' or args.extended or
             args.driver_free_diagnostic or args.hold_native_observer):
@@ -1326,6 +1526,30 @@ def main():
         parser.error('The final live batch runs each approved case once, in order')
     if args.ledger.resolve() != ASSIGNMENT_LEDGER.resolve():
         parser.error('Live allowance uses the fixed assignment-wide ledger')
+    if args.desktop_platform == 'windows':
+        import windows_effects
+        effects = None
+        try:
+            windows_effects.validate_options(args)
+            if args.inside_offline or args.inside_session or args.shared_suite:
+                raise ValueError('Windows cannot use Unix namespace continuations or live suites')
+            effects = windows_effects.WindowsEffects(args)
+            return execute(args, platform=effects)
+        except Exception as error:
+            report_persistence_failed = False
+            if effects:
+                try:
+                    effects.failure_report(SimpleNamespace(**globals()), PHASE, error)
+                except Exception:
+                    report_persistence_failed = True
+            print(json.dumps({'passed': False, 'overall_status': 'unverified',
+                              'stage': PHASE, 'failure_category': type(error).__name__,
+                              'platform_stage': getattr(effects, 'stage', None),
+                              'native_error_code': getattr(error, 'native_error_code', None),
+                              'report_persistence_failed': report_persistence_failed}))
+            return 1
+    if sys.platform != 'linux' or args.windows_manifest is not None:
+        parser.error('Linux namespace entry requires Linux and no Windows manifest')
     inside = args.inside_offline or args.inside_session
     if not inside:
         args.output = args.output.resolve()
@@ -1358,6 +1582,8 @@ def main():
                    '--dev', '/dev', '--tmpfs', '/dev/shm', '--proc', '/proc', '--tmpfs', '/tmp',
                    '--dir', '/tmp/opencode', '--bind', str(args.tools), str(args.tools),
                    '--bind', str(args.output), str(args.output)]
+        if arithmetic:
+            command += audio_socket_masks(os.environ)
         # Keep normal graphics resources without exposing any audio input device.
         for graphics in ['/dev/dri', '/dev/dxg']:
             if Path(graphics).exists(): command += ['--dev-bind', graphics, graphics]
