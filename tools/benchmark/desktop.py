@@ -15,6 +15,14 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def artifact_root(checkout):
+    spec = importlib.util.spec_from_file_location('app_bench_paths',
+        Path(__file__).resolve().parents[1] / 'app-bench/paths.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.artifact_root(checkout)
+
+
 def load_common():
     spec = importlib.util.spec_from_file_location('typed_benchmark_common', Path(__file__).with_name('benchmark.py'))
     module = importlib.util.module_from_spec(spec)
@@ -92,7 +100,10 @@ async def run_desktop(args, report, common=None):
             not (Path(tools)/'webkit/extracted/usr/bin/WebKitWebDriver').is_file() or
             any(shutil.which(tool) is None for tool in ('bwrap', 'dbus-run-session'))):
         raise common.Blocked('desktop_existing_tools_required')
-    parent = ROOT.parent / 'artifacts'
+    try:
+        parent = artifact_root(ROOT)
+    except ValueError:
+        raise common.Blocked('desktop_canonical_workspace_unavailable') from None
     if any(p.is_symlink() for p in (parent, *parent.parents)):
         raise common.Blocked('desktop_artifact_symlink_refused')
     parent.mkdir(mode=0o700, exist_ok=True)

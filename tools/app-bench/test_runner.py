@@ -69,7 +69,7 @@ assert.equal(release().restored,true);
 
     def test_hold_cli_rejects_non_offline_quick_voice_and_probe_combinations(self):
         base = ['runner', '--binary', '/synthetic/app', '--tools', '/synthetic/tools',
-                '--config', '/synthetic/config', '--output', str(runner.ARTIFACT_ROOT/'synthetic-hold'),
+                '--config', '/synthetic/config', '--output', '/synthetic/artifacts/synthetic-hold',
                 '--wake-phrase', 'synthetic wake', '--hold-native-observer']
         for flags in [[], ['--cases', 'quick', 'short_research'], ['--cases', 'short_research'],
                       ['--cases', 'quick', '--live'], ['--cases', 'quick', '--entry', 'typed'],

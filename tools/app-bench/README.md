@@ -1,5 +1,15 @@
 # Unified application benchmark
 
+Desktop controllers derive artifact storage from the primary Git checkout's
+outer workspace using Git common-directory metadata. Registered linked worktrees
+and checkout symlink aliases share that artifact tree and the fixed
+`unified-app-bench-live-budget.json` ledger; source paths remain checkout-local.
+Discovery is read-only and fails before artifact creation for non-Git, bare,
+separate-Git-directory or unsupported layouts. There is no fallback ledger or
+automatic ledger migration. Continuity across independent repository copies or
+relocation of the primary checkout is not guaranteed. Artifact/ledger symlinks
+remain refused.
+
 For the shared cross-platform **typed question suite**, start with
 `make benchmark PLATFORM=desktop BENCHMARK_FLAGS="--help"` and
 `tools/benchmark/README.md`. Its scenario/validation/report layer is shared with

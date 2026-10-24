@@ -21,12 +21,13 @@ import time
 import tomllib
 
 from fixtures import CASES, URLS, FakeServices, expected_answer, generate_fixtures
+from paths import artifact_root
 
 ROOT = Path(__file__).resolve().parents[2]
 MAX_ASSIGNMENT_CALLS = 100
 LIVE_BATCH_ALLOWANCE = 12
-ASSIGNMENT_LEDGER = ROOT.parent / 'artifacts' / 'unified-app-bench-live-budget.json'
-ARTIFACT_ROOT = ROOT.parent / 'artifacts'
+ASSIGNMENT_LEDGER = None
+ARTIFACT_ROOT = None
 PHASE = 'preflight'
 APP_PID = None
 CAPABILITY = b'voxgolem:app-bench:canonical-managed-auth:v2'
@@ -131,7 +132,7 @@ def free_port():
 
 def harness_identity():
     digest = hashlib.sha256()
-    for name in ['runner.py', 'fixtures.py']:
+    for name in ['runner.py', 'fixtures.py', 'paths.py']:
         digest.update(name.encode())
         digest.update(Path(__file__).with_name(name).read_bytes())
     return digest.hexdigest()
@@ -1262,10 +1263,20 @@ def main():
     parser.add_argument('--live', action='store_true')
     parser.add_argument('--shared-suite', action='store_true', help='Qualified live typed shared scenario suite')
     parser.add_argument('--offline-evidence', type=Path, help='Matching successful offline report, required before live reservation')
+    global ARTIFACT_ROOT, ASSIGNMENT_LEDGER
+    try:
+        if ARTIFACT_ROOT is None:
+            ARTIFACT_ROOT = artifact_root(ROOT)
+        if ASSIGNMENT_LEDGER is None:
+            ASSIGNMENT_LEDGER = ARTIFACT_ROOT / 'unified-app-bench-live-budget.json'
+    except ValueError as error:
+        parser.error(str(error))
     parser.add_argument('--ledger', type=Path, default=ASSIGNMENT_LEDGER)
     parser.add_argument('--inside-offline', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--inside-session', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if any(path.is_symlink() for path in (ARTIFACT_ROOT, *ARTIFACT_ROOT.parents)):
+        parser.error('Benchmark artifact storage must not use symlinks')
     args.tools = args.tools.resolve()
     if args.shared_suite and (not args.live or args.entry != 'typed' or args.extended or
             args.driver_free_diagnostic or args.hold_native_observer):
