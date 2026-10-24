@@ -97,6 +97,20 @@ export interface ModelsSnapshot {
   readonly instantAssistantOptions: readonly Readonly<AssistantOption<AssistantSettings['instant']>>[]
 }
 
+function sameModelProjectionInputs(
+  prior: ModelsSnapshot['assistantCapabilities'], next: AssistantCapabilities,
+  priorModels: readonly ModelOption[] | null, nextModels: readonly ModelOption[] | null,
+): boolean {
+  if (!(Object.keys(next) as (keyof AssistantCapabilities)[]).every((key) => prior[key] === next[key])) return false
+  if (priorModels === nextModels) return true
+  return priorModels !== null && nextModels !== null && priorModels.length === nextModels.length &&
+    priorModels.every((model, index) => {
+      const nextModel = nextModels[index]!
+      return model.id === nextModel.id && model.label === nextModel.label &&
+        model.available === nextModel.available && model.unavailableReason === nextModel.unavailableReason
+    })
+}
+
 const VIEW_KEYS = {
   shell: ['uiTextSize', 'uiTheme', 'runtimeStatus'],
   conversation: ['voiceNotesOpen', 'shortcutStaging', 'composerValue', 'uiTextSize', 'notices'],
@@ -325,13 +339,15 @@ export class SessionAuthority {
   getModelsSnapshot = () => {
     const { startupState: startup, snapshotModelOptions: models } = this.controls
     if (this.modelProjection?.startup === startup && this.modelProjection.models === models) return this.modelProjection.value
-    const value = this.projectModels(startup, models)
+    const capabilities = capabilityMap(startup)
+    const prior = this.modelProjection
+    const value = prior !== null && sameModelProjectionInputs(prior.value.assistantCapabilities, capabilities, prior.models, models)
+      ? prior.value : this.projectModels(capabilities, models)
     this.modelProjection = { startup, models, value }
     return value
   }
 
-  private projectModels(startup: StartupState, models: readonly ModelOption[] | null): ModelsSnapshot {
-    const assistantCapabilities = capabilityMap(startup)
+  private projectModels(assistantCapabilities: AssistantCapabilities, models: readonly ModelOption[] | null): ModelsSnapshot {
     return {
       assistantCapabilities,
       instantAssistantOptions: applySnapshotModelOptions(instantOptions(assistantCapabilities).filter((option) =>
