@@ -43,13 +43,18 @@ internal class PreRollPcmPump(
     }
 
     /** Resource slots must be final before this call; a failed start never creates another writer. */
-    fun startCapture() {
+    fun startCapture(): Boolean {
         synchronized(control) {
             check(!startupAttempted && !acquisitionSettled && !stopping.get())
             startupAttempted = true
         }
         var accepted = false
         try { startWriter(writer); accepted = true }
+        catch (_: Exception) { /* The preallocated owner retains all acquired resources. */ }
+        catch (_: OutOfMemoryError) {
+            // Thread.start can fail on native thread/resource limits, not only Java heap exhaustion.
+            // Handle this operation's failure without claiming recovery from arbitrary VM errors.
+        }
         finally {
             if (!accepted) {
                 cancelled.set(true); stopping.set(true)
@@ -59,6 +64,7 @@ internal class PreRollPcmPump(
             synchronized(control) { writerAccepted = accepted; acquisitionSettled = true }
             drive()
         }
+        return accepted
     }
 
     private fun run() {

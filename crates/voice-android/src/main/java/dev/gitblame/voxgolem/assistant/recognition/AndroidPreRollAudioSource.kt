@@ -71,7 +71,7 @@ class AndroidPreRollAudioSource private constructor(
         output: java.io.OutputStream, closeRead: (ParcelFileDescriptor) -> Unit = { it.close() }) :
         this(Resources(closeRead).apply {
             read = readDescriptor; this.capture = capture; this.output = output; startAttempted = true
-        }, { it.start() }) { pump.startCapture() }
+        }, { it.start() }) { if (!pump.startCapture()) close() }
 
     override val readDescriptor: ParcelFileDescriptor get() = checkNotNull(resources.read)
 
@@ -173,7 +173,7 @@ class AndroidPreRollAudioSource private constructor(
                 resources.output = acquisition.output(pipe.second)
                 resources.startAttempted = true
                 acquired.start(); check(acquired.recording)
-                source.pump.startCapture()
+                if (!source.pump.startCapture()) source.close()
             } catch (_: Exception) {
                 if (resources.read == null && resources.write == null) return null
                 // No slots change after cleanup is requested, including when Thread.start threw.

@@ -327,6 +327,42 @@ class AndroidPreRollRetirementTest {
         } finally { effects.close() }
     }
 
+    @Test fun nativeThreadStartResourceFailureBeforeStartupReturnsTheKnownCleanupOwner() {
+        val effects = PreRollAcquisitionFixture().apply { writerFailure = "oom-before"; failReadClose = true }
+        try {
+            val source = AndroidPreRollAudioSource.open(effects)
+            assertNotNull(source); assertFalse(source!!.isRecording)
+            assertFalse(retire(source)); assertTrue(effects.pipe.first.fileDescriptor.valid())
+            assertEquals(0, effects.reads.get()); assertEquals(1, effects.writerStarts.get())
+            effects.failReadClose = false
+            assertTrue(retire(source)); assertEquals(1, effects.releases.get())
+            assertFalse(effects.pipe.first.fileDescriptor.valid()); assertFalse(effects.pipe.second.fileDescriptor.valid())
+        } finally { effects.close() }
+    }
+
+    @Test fun nativeThreadStartResourceFailureAfterStartupStillWaitsForTheRealWriter() {
+        val effects = PreRollAcquisitionFixture(blockRead = true).apply { writerFailure = "oom-after" }
+        try {
+            val source = AndroidPreRollAudioSource.open(effects)
+            assertNotNull(source); assertFalse(source!!.isRecording)
+            assertTrue(effects.reading.await(2, TimeUnit.SECONDS))
+            val done = CountDownLatch(1)
+            source.retire { assertTrue(it); done.countDown() }
+            assertFalse(done.await(100, TimeUnit.MILLISECONDS)); assertEquals(0, effects.releases.get())
+            effects.allowRead.countDown(); assertTrue(done.await(2, TimeUnit.SECONDS))
+            assertEquals(1, effects.writerStarts.get()); assertEquals(1, effects.releases.get())
+            assertFalse(effects.pipe.first.fileDescriptor.valid()); assertFalse(effects.pipe.second.fileDescriptor.valid())
+        } finally { effects.close() }
+    }
+
+    @Test fun unrelatedWriterStartErrorsAreNotReclassifiedAsRecoverableResourceFailure() {
+        val effects = PreRollAcquisitionFixture().apply { writerFailure = "assert-before" }
+        try {
+            val failure = assertThrows(AssertionError::class.java) { AndroidPreRollAudioSource.open(effects) }
+            assertEquals("synthetic unrelated assertion", failure.message)
+        } finally { effects.close() }
+    }
+
     @Test fun blockedAcquisitionCleanupDoesNotBlockOpenOrLoseItsOwner() {
         val effects = PreRollAcquisitionFixture().apply { failCapture = true; blockReadClose = true }
         val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
@@ -445,10 +481,13 @@ internal class PreRollAcquisitionFixture(blockRead: Boolean = false) : AndroidPr
     }
     override fun startWriter(writer: Thread) {
         writerStarts.incrementAndGet()
+        if (writerFailure == "oom-before") throw OutOfMemoryError("synthetic native-thread resource failure")
+        if (writerFailure == "assert-before") throw AssertionError("synthetic unrelated assertion")
         if (writerFailure == "before") error("synthetic failure before writer start")
         writer.start()
-        if (writerFailure == "after") {
+        if (writerFailure == "after" || writerFailure == "oom-after") {
             check(reading.await(2, TimeUnit.SECONDS))
+            if (writerFailure == "oom-after") throw OutOfMemoryError("synthetic post-start resource failure")
             error("synthetic failure after actual writer start")
         }
     }
