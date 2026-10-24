@@ -6,6 +6,24 @@ import org.junit.Test
 @org.junit.runner.RunWith(PhoneAssistantRunner::class)
 @org.robolectric.annotation.Config(sdk = [35], manifest = org.robolectric.annotation.Config.NONE)
 class PhonePreferencesTest {
+    @Test fun synchronousReadsAreCacheOnlyAndInitializationIsExplicitAndIdempotent() {
+        val real = org.robolectric.RuntimeEnvironment.getApplication().getSharedPreferences("synthetic-bootstrap", 0)
+        real.edit().clear().putString("ui_theme", "slate").commit()
+        var reads = 0
+        val storage = object : android.content.SharedPreferences by real {
+            override fun getString(key: String?, default: String?): String? { reads++; return real.getString(key, default) }
+            override fun getBoolean(key: String?, default: Boolean): Boolean { reads++; return real.getBoolean(key, default) }
+        }
+        val preferences = PhonePreferences(storage)
+        assertThrows(AssistantPhoneFailure::class.java) { preferences.read("custom-sol-high") }
+        assertEquals(0, reads)
+        preferences.initialize()
+        val initializedReads = reads
+        assertTrue(initializedReads > 0)
+        preferences.initialize()
+        repeat(3) { assertEquals("slate", preferences.read("custom-sol-high").getString("ui_theme")) }
+        assertEquals(initializedReads, reads)
+    }
     @Test fun pendingCommitAndRollbackNeverBlockReadersOrPublishFailedValues() {
         for (succeed in listOf(true, false)) {
             val real = org.robolectric.RuntimeEnvironment.getApplication().getSharedPreferences("synthetic-presentation", 0)
@@ -30,6 +48,7 @@ class PhonePreferencesTest {
                 }
             }
             val preferences = PhonePreferences(storage)
+            preferences.initialize()
             assertEquals("dark", preferences.read("custom-sol-high").getString("ui_theme"))
             val executor = java.util.concurrent.Executors.newFixedThreadPool(2)
             try {

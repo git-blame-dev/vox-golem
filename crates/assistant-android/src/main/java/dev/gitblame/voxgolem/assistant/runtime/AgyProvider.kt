@@ -27,9 +27,10 @@ class AgyProviderRouter(
 ) : ProviderNativeCalls {
     private class Route(val provider: ProviderNativeCalls)
     private val requests = ConcurrentHashMap<String, Route>()
-    @Volatile private var selectedModel: String? = null
-    fun prewarmSelection(model: String, webEnabled: Boolean) {
-        selectedModel = model
+    private data class Selection(val model: String, val webEnabled: Boolean)
+    private var selection: Selection? = null
+    @Synchronized fun prewarmSelection(model: String, webEnabled: Boolean) {
+        selection = Selection(model, webEnabled)
         if (phoneRelay != null) return
         if (model == GeminiNanoProvider.MODEL_NAME) (geminiNanoNative as? GeminiNanoProvider)?.prewarm()
         val eligible = isAgyModel(model) && webEnabled
@@ -43,9 +44,13 @@ class AgyProviderRouter(
 
     override fun prewarm(model: String, authPath: String, webEnabled: Boolean) {
         if (phoneRelay != null) return
-        val current = selectedModel
-        if (current != null && current != model) return
-        prewarmSelection(model, webEnabled)
+        synchronized(this) {
+            val current = selection
+            if (current != null && current != Selection(model, webEnabled)) return
+            // An acknowledged actor selection already scheduled optional-provider warming.
+            // A delayed worker must never publish an older selection or policy over it.
+            if (current == null) prewarmSelection(model, webEnabled)
+        }
         if (!isAgyModel(model) && model != GeminiNanoProvider.MODEL_NAME) {
             defaultNative.prewarm(model, authPath, webEnabled)
         }

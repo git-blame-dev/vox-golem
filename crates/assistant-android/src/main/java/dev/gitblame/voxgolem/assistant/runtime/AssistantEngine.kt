@@ -91,6 +91,7 @@ class AssistantEngine @JvmOverloads internal constructor(
     private val beginTiming: (Operation) -> AssistantTiming = { AssistantTiming.begin(null, it) },
     private val startupTiming: AssistantTiming? = null,
     private val preparePhoneContext: Boolean = false,
+    private val prewarmOnBootstrap: Boolean = true,
 ) : AssistantClient {
     private class Ticket(
         val token: String, val epoch: Long,
@@ -139,21 +140,22 @@ class AssistantEngine @JvmOverloads internal constructor(
     private var startupContext: StartupContext? = null
     private data class ProjectionStamp(val revision: String, val conversation: String?, val head: String?, val busy: Boolean)
     private var projectionStamp: ProjectionStamp? = null
-    private var state = policies.read().let { AssistantState(contextReady = false, webEnabled = it.webEnabled, speechNetworkFallback = it.speechNetworkFallback,
-        speechLanguage = it.speechLanguage, speechTtsProvider = it.speechTtsProvider, speechTtsVoice = it.speechTtsVoice, fastMode = it.fastMode) }
+    private var state = AssistantState(contextReady = false)
+    private var bootstrapFailure: String? = null
     @Volatile private var published = state
     @Volatile private var foregroundRequested = false
 
     init {
         startupTiming?.mark(Stage.HYDRATION_QUEUED)
-        dispatch {
+        dispatch(bootstrap = true) {
             withStorageTiming(startupTiming) {
             startupTiming?.mark(Stage.HYDRATION_STARTED)
             val local = store.localState()
             val policy = policies.read()
+            val model = models.read()
             startupTiming?.mark(Stage.LOCAL_STATE_LOADED)
             state = state.copy(conversation = local.objectOrNull("conversation")?.toString(),
-                selectedHead = local.objectOrNull("selected_head")?.toString(), model = models.read(),
+                selectedHead = local.objectOrNull("selected_head")?.toString(), model = model,
                 webEnabled = policy.webEnabled, speechNetworkFallback = policy.speechNetworkFallback,
                 speechLanguage = policy.speechLanguage, speechTtsProvider = policy.speechTtsProvider, speechTtsVoice = policy.speechTtsVoice,
                 fastMode = policy.fastMode)
@@ -165,6 +167,7 @@ class AssistantEngine @JvmOverloads internal constructor(
             if (state.model !in AssistantModels.aliases) state = state.copy(error = "unsupported_model")
             state = state.copy(contextReady = true, foreground = foregroundRequested)
             startupTiming?.mark(Stage.HYDRATION_COMPLETED)
+            if (prewarmOnBootstrap) prewarmSelected(state.model, state.webEnabled, state.busy)
             }
         }
     }
@@ -229,18 +232,28 @@ class AssistantEngine @JvmOverloads internal constructor(
         }
     }
     override fun prewarm() {
-        val current = snapshot()
-        if (current.busy || !current.foreground || !current.contextReady || current.model !in AssistantModels.aliases) return
-        prewarmSelected(current.model, current.webEnabled, current.busy)
+        dispatch {
+            if (!state.busy && state.foreground && state.contextReady) prewarmSelected(state.model, state.webEnabled, state.busy)
+        }
     }
+
+    internal fun prewarmSelectionIfCurrent(model: String) = dispatch {
+        if (state.contextReady && state.model == model) prewarmSelected(state.model, state.webEnabled, state.busy)
+    }
+
+    /** Adapter IO is serialized after bootstrap; settlement follows publication, including failure. */
+    fun prepareAdapter(prepare: () -> Unit, onSettled: (AssistantState) -> Unit) = dispatch(onSettled) { prepare() }
 
     internal fun prewarmSelected(
         model: String,
-        webEnabled: Boolean = snapshot().webEnabled,
-        busy: Boolean = snapshot().busy,
+        webEnabled: Boolean,
+        busy: Boolean,
+        warm: Boolean = true,
     ) {
-        AssistantRuntime.prewarmRouter(model, webEnabled)
-        if (busy || model !in AssistantModels.aliases) return
+        if (!state.contextReady) return
+        worker.invalidatePrewarm()
+        runCatching { AssistantRuntime.prewarmRouter(model, webEnabled) }
+        if (!warm || busy || model !in AssistantModels.aliases) return
         worker.prewarm(model, webEnabled) { credentials?.selection()?.path ?: authPath() }
     }
 
@@ -313,8 +326,10 @@ class AssistantEngine @JvmOverloads internal constructor(
             epoch.incrementAndGet()
             cancellationOwner.get()?.let { owner -> owner.cancelled.set(true); owner.delivery?.cancel() }
             worker.cancel()
+            worker.invalidatePrewarm()
         }
-        dispatch {
+        dispatch(allowBootstrapFailure = true) {
+            worker.invalidatePrewarm()
             if (background) state = state.copy(foreground = false)
             if (active != null) {
                 state = state.copy(interrupted = true, provisional = "", toolStatus = null, error = "interrupted")
@@ -377,8 +392,8 @@ class AssistantEngine @JvmOverloads internal constructor(
         state = state.copy(webEnabled = policy.webEnabled, speechNetworkFallback = policy.speechNetworkFallback,
             speechLanguage = policy.speechLanguage, speechTtsProvider = policy.speechTtsProvider, speechTtsVoice = policy.speechTtsVoice,
             fastMode = policy.fastMode, error = null)
-        if (!previousWebEnabled && policy.webEnabled) {
-            prewarmSelected(state.model, state.webEnabled, state.busy)
+        if (previousWebEnabled != policy.webEnabled) {
+            prewarmSelected(state.model, state.webEnabled, state.busy, warm = policy.webEnabled)
         }
     }
     fun updatePreferences(model: String, policy: AssistantPolicy, persist: () -> Unit, onSettled: (AssistantState) -> Unit) = dispatch(onSettled) {
@@ -400,8 +415,8 @@ class AssistantEngine @JvmOverloads internal constructor(
         state = state.copy(model = model, webEnabled = policy.webEnabled, speechNetworkFallback = policy.speechNetworkFallback,
             speechLanguage = policy.speechLanguage, speechTtsProvider = policy.speechTtsProvider, speechTtsVoice = policy.speechTtsVoice,
             fastMode = policy.fastMode, error = null)
-        if (model != previousModel || (!previousPolicy.webEnabled && policy.webEnabled)) {
-            prewarmSelected(state.model, state.webEnabled, state.busy)
+        if (model != previousModel || previousPolicy.webEnabled != policy.webEnabled) {
+            prewarmSelected(state.model, state.webEnabled, state.busy, warm = model != previousModel || policy.webEnabled)
         }
     }
 
@@ -435,7 +450,7 @@ class AssistantEngine @JvmOverloads internal constructor(
             return
         }
         retire(false)
-        dispatch {
+        dispatch(onBootstrapFailure = { onSettled?.invoke(state) }) {
             val action = {
                 try {
                     if (draft == null) createNewConversation() else createNewWithDraft(draft)
@@ -529,7 +544,7 @@ class AssistantEngine @JvmOverloads internal constructor(
         ticket.timing.mark(Stage.REQUESTED)
         val duplicate = submitted.putIfAbsent(token, ticket) != null
         ticket.timing.mark(Stage.ADMISSION_QUEUED)
-        dispatch {
+        dispatch(onBootstrapFailure = { code -> finish(ticket, "error", code) }) {
             ticket.timing.mark(Stage.ADMISSION_STARTED)
             if (token.isEmpty() || token.toByteArray(Charsets.UTF_8).size > 128) { finish(ticket, "error", "invalid_request"); return@dispatch }
             if (duplicate || requests.containsKey(token)) { finish(ticket, "error", "duplicate_request"); return@dispatch }
@@ -997,11 +1012,21 @@ class AssistantEngine @JvmOverloads internal constructor(
         if (active != null) { state = state.copy(error = "busy"); return false }
         return true
     }
-    private fun dispatch(onSettled: ((AssistantState) -> Unit)? = null, action: () -> Unit) {
+    private fun dispatch(onSettled: ((AssistantState) -> Unit)? = null,
+        bootstrap: Boolean = false, allowBootstrapFailure: Boolean = false,
+        onBootstrapFailure: ((String) -> Unit)? = null, action: () -> Unit) {
         io.execute {
-            try { action() } catch (error: RuntimeException) {
+            try {
+                val failure = bootstrapFailure
+                if (failure != null && !allowBootstrapFailure) {
+                    state = state.copy(error = failure)
+                    onBootstrapFailure?.invoke(failure)
+                } else action()
+            } catch (error: RuntimeException) {
                 projectionStamp = null
-                state = state.copy(error = domainCode(error))
+                val code = domainCode(error)
+                if (bootstrap) bootstrapFailure = code
+                state = state.copy(error = code)
             }
             val changed = published != state
             published = state

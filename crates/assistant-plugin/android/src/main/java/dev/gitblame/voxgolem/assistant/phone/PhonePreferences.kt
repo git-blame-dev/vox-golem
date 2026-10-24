@@ -4,8 +4,10 @@ import android.content.Context
 import dev.gitblame.voxgolem.voice.InstallationPreferences
 import org.json.JSONObject
 
-class PhonePreferences internal constructor(private val storage: android.content.SharedPreferences) {
-    constructor(context: Context) : this(context.applicationContext.getSharedPreferences("assistant-phone-preferences", Context.MODE_PRIVATE))
+class PhonePreferences private constructor(private val openStorage: () -> android.content.SharedPreferences) {
+    internal constructor(storage: android.content.SharedPreferences) : this({ storage })
+    constructor(context: Context) : this({ context.applicationContext.getSharedPreferences("assistant-phone-preferences", Context.MODE_PRIVATE) })
+    private val storage by lazy(openStorage)
     internal data class Presentation(val instant: String, val deep: String, val review: String,
         val deepEnabled: Boolean, val reviewEnabled: Boolean, val prefetch: Boolean, val completion: Boolean,
         val responseProfile: String, val ttsEnabled: Boolean, val theme: String, val textSize: String) {
@@ -23,11 +25,11 @@ class PhonePreferences internal constructor(private val storage: android.content
     @Volatile private var published: Presentation? = null
     private val initialization = Any()
 
-    // The first reader still loads persisted values synchronously; moving that bootstrap
-    // to the engine actor requires its owner. Hot reads never share a lock with persistence.
-    private fun current(): Presentation = published ?: synchronized(initialization) {
-        published ?: Presentation.from(readStored()).also { published = it }
+    /** Called by the engine actor before accepting dependent phone work. */
+    internal fun initialize() = synchronized(initialization) {
+        if (published == null) published = Presentation.from(readStored())
     }
+    private fun current(): Presentation = published ?: throw AssistantPhoneFailure("unavailable", "Assistant preferences are not ready")
     fun read(model: String): JSONObject = current().json().put("instant", model)
 
     private fun readStored(): JSONObject {

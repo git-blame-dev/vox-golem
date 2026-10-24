@@ -79,10 +79,120 @@ class AssistantEngineTest {
         { "/synthetic/private/codex-auth.json" }, models,
         beginTiming = { AssistantTiming.begin(context, it, sink = AssistantTiming.Sink(timings::add)) })
     private var state = AssistantState()
-    init { engine.subscribe { state = it }; engine.resume(); io.drain() }
+    init {
+        engine.subscribe { state = it }; engine.resume(); io.drain()
+        providerQueue.drain()
+        provider.prewarmed.clear(); provider.prewarmedWeb.clear()
+    }
     @After fun closeStore() { engine.stop(); providerQueue.drain(); io.drain(); store.close() }
     private fun prepare() { engine.setDraft("Synthetic question"); io.drain(); engine.send(); io.drain() }
     private fun settle() { providerQueue.drain(); io.drain() }
+
+    @Test fun bootstrapReadsModelAndPolicyOnlyOnceOnActor() {
+        val actor = Queue()
+        val warm = Queue()
+        val native = Provider()
+        var modelReads = 0
+        var policyReads = 0
+        val instance = AssistantEngine(store, actor, AssistantRequestWorker(warm, native), { "" },
+            object : AssistantModelStorage {
+                override fun read(): String { modelReads++; return "custom-luna-none" }
+                override fun write(value: String) = Unit
+            }, policies = object : AssistantPolicyStorage {
+                override fun read(): AssistantPolicy { policyReads++; return AssistantPolicy(webEnabled = false) }
+                override fun write(value: AssistantPolicy) = Unit
+            })
+        assertEquals(0, modelReads)
+        assertEquals(0, policyReads)
+        assertFalse(instance.snapshot().contextReady)
+        warm.drain()
+        assertTrue(native.prewarmedWeb.isEmpty())
+        actor.drain()
+        assertEquals(1, modelReads)
+        assertEquals(1, policyReads)
+        assertTrue(instance.snapshot().contextReady)
+        assertEquals("custom-luna-none", instance.snapshot().model)
+        assertFalse(instance.snapshot().webEnabled)
+        warm.drain()
+        assertEquals(listOf(Triple("custom-luna-none", "", false)), native.prewarmedWeb)
+    }
+
+    @Test fun failedBootstrapCannotBeRevivedByQueuedCommands() {
+        val actor = Queue()
+        val warm = Queue()
+        val native = Provider()
+        var writes = 0
+        val instance = AssistantEngine(store, actor, AssistantRequestWorker(warm, native), { "" }, models,
+            policies = object : AssistantPolicyStorage {
+                override fun read(): AssistantPolicy = throw IllegalStateException("synthetic read failure")
+                override fun write(value: AssistantPolicy) { writes++ }
+            })
+        var result: AssistantRequestResult? = null
+        var resetResult: AssistantState? = null
+        instance.resume()
+        instance.setWebEnabled(true)
+        instance.submit("synthetic-bootstrap-request", "Synthetic question", resultListener = AssistantResultListener { value, _ -> result = value })
+        instance.reset { resetResult = it }
+        actor.drain(); warm.drain()
+        assertFalse(instance.snapshot().contextReady)
+        assertEquals("storage_error", instance.snapshot().error)
+        assertEquals("storage_error", result?.code)
+        assertEquals("storage_error", resetResult?.error)
+        assertEquals(0, writes)
+        assertTrue(native.requests.isEmpty())
+        assertTrue(native.prewarmedWeb.isEmpty())
+    }
+
+    @Test fun bootstrapCancellationAndUnsupportedSelectionNeverDispatchAProvider() {
+        for (selectedModel in listOf("custom-luna-none", "synthetic-unsupported")) {
+            val actor = Queue()
+            val warm = Queue()
+            val native = Provider()
+            val instance = AssistantEngine(store, actor, AssistantRequestWorker(warm, native), { "" },
+                object : AssistantModelStorage {
+                    override fun read() = selectedModel
+                    override fun write(value: String) = Unit
+                })
+            var result: AssistantRequestResult? = null
+            instance.resume()
+            instance.submit("synthetic-cancel-before-bootstrap", "Synthetic question", resultListener = AssistantResultListener { value, _ -> result = value })
+            instance.stop()
+            actor.drain(); warm.drain()
+            assertTrue(instance.snapshot().contextReady)
+            assertEquals(selectedModel, instance.snapshot().model)
+            assertEquals("interrupted", result?.code)
+            assertTrue(native.requests.isEmpty())
+            assertTrue(native.prewarmedWeb.isEmpty())
+        }
+    }
+
+    @Test fun queuedPrewarmCannotRestoreAnOlderWebPolicyOrModel() {
+        engine.prewarm(); io.drain()
+        engine.setWebEnabled(false); io.drain()
+        providerQueue.drain()
+        assertTrue(provider.prewarmedWeb.isEmpty())
+        engine.setWebEnabled(true); io.drain()
+        engine.selectModel("custom-luna-none"); io.drain()
+        providerQueue.drain()
+        assertEquals(listOf(Triple("custom-luna-none", "/synthetic/private/codex-auth.json", true)), provider.prewarmedWeb)
+        provider.prewarmedWeb.clear()
+        engine.prewarm(); io.drain()
+        engine.background(); io.drain(); providerQueue.drain()
+        assertTrue(provider.prewarmedWeb.isEmpty())
+    }
+
+    @Test fun prewarmRechecksGenerationAfterCredentialResolution() {
+        val queue = Queue()
+        val native = Provider()
+        val worker = AssistantRequestWorker(queue, native)
+        worker.prewarm("custom-sol-high", true) {
+            worker.invalidatePrewarm()
+            "/synthetic/private/provider.json"
+        }
+        queue.drain()
+        assertTrue(native.prewarmedWeb.isEmpty())
+        worker.close()
+    }
 
     @Test fun outcomeDiagnosticsUsePublicRequestedModelWithoutChangingCanonicalProvenance() {
         val privateModel = "synthetic_private\nmodel_payload"
@@ -1739,7 +1849,8 @@ class AssistantEngineTest {
 
         val ioTasksBeforePrewarm = io.tasks.size
         engine.prewarm()
-        assertEquals(ioTasksBeforePrewarm, io.tasks.size)
+        assertEquals(ioTasksBeforePrewarm + 1, io.tasks.size)
+        io.drain()
         providerQueue.drain()
         assertEquals(listOf("custom-sol-high" to "/synthetic/private/codex-auth.json"), provider.prewarmed)
 

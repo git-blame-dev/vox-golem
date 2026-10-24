@@ -17,7 +17,6 @@ class EnginePhoneBackend internal constructor(
     private val context: Context,
     private val engine: AssistantEngine,
     private val preferences: PhonePreferences = PhonePreferences(context),
-    private val prewarm: (String) -> Unit = AssistantRuntime::prewarm,
 ) : AssistantPhoneBackend {
     constructor(context: Context) : this(context, AssistantRuntime.get(context))
     private val delivery = AtomicReference<PhoneRequestDelivery?>(null)
@@ -29,7 +28,20 @@ class EnginePhoneBackend internal constructor(
     private val requestTokens = LinkedHashMap<String, String>()
     @Volatile var speechStatus: JSONObject? = null
     @Volatile var onPreferencesChanged: ((Boolean) -> Unit)? = null
-    fun nativePreferences(): JSONObject = preferencesFor(engine.snapshot())
+    @Volatile private var presentationReady = false
+    @Volatile private var preparationError: String? = null
+    init {
+        var initialized = false
+        engine.prepareAdapter({ preferences.initialize(); initialized = true }) { state ->
+            if (initialized && state.contextReady) presentationReady = true
+            else preparationError = state.error ?: "storage_error"
+        }
+    }
+    fun preferencesReady(): Boolean = presentationReady && engine.snapshot().contextReady
+    fun nativePreferences(): JSONObject {
+        if (!preferencesReady()) throw providerFailure(preparationError ?: "busy")
+        return preferencesFor(engine.snapshot())
+    }
     // Model/policy are engine-owned. Observers run before preference settlement, so this
     // projection is not an atomic cross-store snapshot; the successful command ACK is the fence.
     private fun preferencesFor(state: AssistantState) = preferences.read(state.model)
@@ -37,7 +49,7 @@ class EnginePhoneBackend internal constructor(
         .put("fast_mode", state.fastMode)
         .put("speech_language", state.speechLanguage).put("speech_tts_provider", state.speechTtsProvider).put("speech_tts_voice", state.speechTtsVoice)
     fun publishSpeechOptions(options: dev.gitblame.voxgolem.assistant.speech.SpeechOptions) { engine.publishSpeechOptions(options) }
-    fun busy(): Boolean = engine.snapshot().busy || delivery.get() != null || preferencesPending.get()
+    fun busy(): Boolean = !preferencesReady() || engine.snapshot().busy || delivery.get() != null || preferencesPending.get()
     fun saveSpeechDraft(text: String) { engine.setDraft(text) }
     fun speechConversation(): String? = engine.snapshot().conversation
     fun speechHead(): String? = engine.snapshot().selectedHead
@@ -54,6 +66,15 @@ class EnginePhoneBackend internal constructor(
     fun observeSpeechStream(listener: (String?, String) -> Unit): AutoCloseable = engine.observeProvisionalStream(listener)
 
     override fun command(name: String, arguments: JSONObject, reply: (Result<Any?>) -> Unit) {
+        if (name == "cancel_prompt" || preferencesReady()) { preparedCommand(name, arguments, reply); return }
+        val copied = JSONObject(arguments.toString())
+        engine.prepareAdapter({}) {
+            if (!preferencesReady()) reply(Result.failure(providerFailure(preparationError ?: it.error ?: "busy")))
+            else preparedCommand(name, copied, reply)
+        }
+    }
+
+    private fun preparedCommand(name: String, arguments: JSONObject, reply: (Result<Any?>) -> Unit) {
         if (name == "cancel_prompt") {
             val requestId = arguments.optString("requestId")
             if (requestId.isEmpty() || requestId.toByteArray(Charsets.UTF_8).size > 128) {
@@ -238,12 +259,10 @@ class EnginePhoneBackend internal constructor(
             if (!preferencesPending.compareAndSet(false, true)) { reply(Result.failure(providerFailure("busy"))); return }
         }
         val selectedModel = value.getString("instant")
-        var previousModel: String? = null
         var staged: PhonePreferences.Presentation? = null
         engine.updatePreferences(selectedModel, dev.gitblame.voxgolem.assistant.runtime.AssistantPolicy(
             value.getBoolean("web_enabled"), value.getBoolean("speech_network_fallback"), value.getString("speech_language"),
             value.getString("speech_tts_provider"), value.getString("speech_tts_voice"), value.getBoolean("fast_mode")), {
-            previousModel = engine.snapshot().model
             staged = preferences.persist(value)
         }) { selected ->
             // Persistence alone must not publish presentation ahead of actor settlement.
@@ -251,9 +270,6 @@ class EnginePhoneBackend internal constructor(
             preferencesPending.set(false)
             if (selected.error != null) reply(Result.failure(providerFailure(selected.error)))
             else {
-                if (previousModel != null && selected.model == selectedModel && selected.model != previousModel) {
-                    runCatching { prewarm(selected.model) }
-                }
                 // A view listener failure must not misclassify already persisted settings.
                 runCatching { onPreferencesChanged?.invoke(value.getBoolean("tts_enabled")) }
                 reply(Result.success(preferencesFor(selected)))
@@ -270,6 +286,9 @@ class EnginePhoneBackend internal constructor(
     }
     private fun submitForOwner(clientRequestId: String, prompt: String, update: (JSONObject) -> Unit, terminal: (Result<Any?>) -> Unit,
         owner: SpeechInputOwner?) {
+        if (!preferencesReady()) {
+            terminal(Result.failure(providerFailure(preparationError ?: "busy"))); return
+        }
         val current = PhoneRequestDelivery(clientRequestId, update, { engine.rejectDelivery(clientRequestId) })
         val admitted = synchronized(admission) { !preferencesPending.get() && !initializingConversation && delivery.compareAndSet(null, current) }
         if (!admitted) {

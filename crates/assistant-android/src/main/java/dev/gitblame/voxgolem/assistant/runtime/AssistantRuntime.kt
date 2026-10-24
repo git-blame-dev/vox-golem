@@ -26,7 +26,7 @@ object AssistantRuntime {
         val currentEngine = engine
         // Without a hydrated engine, wait for policy-aware worker prewarming.
         if (currentEngine != null) {
-            currentEngine.prewarmSelected(model)
+            currentEngine.prewarmSelectionIfCurrent(model)
         }
     }
 
@@ -95,7 +95,7 @@ object AssistantRuntime {
             override fun write(value: AssistantPolicy) { require(value == this.value) }
         }
         val isolatedEngine = AssistantEngine(store, io, worker, credentials::pathForProvider,
-            models, credentials, policies, beginTiming = beginTiming)
+            models, credentials, policies, beginTiming = beginTiming, prewarmOnBootstrap = false)
         var retirementRequested = false
         var storeClose: Future<*>? = null
         return SyntheticSession(isolatedEngine) {
@@ -152,15 +152,8 @@ object AssistantRuntime {
             override fun write(value: String) { check(preferences.edit().putString("model", value).commit()) }
         }
         val router = router(application)
-        val initialModel = modelStorage.read()
         val policyStorage = NativeAssistantPolicyStorage(application)
-        val initialPolicy = policyStorage.read()
         val worker = AssistantRequestWorker(provider, router)
-        if (initialModel in AssistantModels.aliases) {
-            worker.prewarm(initialModel, initialPolicy.webEnabled) { credentials.selection().path }
-        } else {
-            router.prewarmSelection(initialModel, initialPolicy.webEnabled)
-        }
 
         return AssistantEngine(AssistantStore(application), io, worker,
             credentials::pathForProvider, modelStorage, credentials, policyStorage,
