@@ -49,18 +49,7 @@ def arithmetic_profile():
     owner = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(owner)
     contract = owner.load_contract()
-    # Follow the modules actually imported by load_contract/load_scenarios, not
-    # guessed neighboring paths. Logical labels keep the digest host-independent.
-    sources = {
-        'matcher': owner.fixture_matches.__code__.co_filename,
-        'normalizer': owner.normalize_tokens.__code__.co_filename,
-        'parser': sys.modules['benchmark'].load_scenarios.__code__.co_filename,
-        'validator': sys.modules['voice_contract'].validate_voice.__code__.co_filename,
-    }
-    implementation = hashlib.sha256(json.dumps({
-        label: hashlib.sha256(Path(path).read_bytes()).hexdigest()
-        for label, path in sources.items()
-    }, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    implementation = owner.implementation_sha256()
     immutable = dict(contract, token_aliases=MappingProxyType(dict(contract['token_aliases'])))
     return ArithmeticProfile(MappingProxyType({contract['scenario_id']: contract['spoken_prompt']}),
                               contract['expected_answer'], owner.contract_sha256(contract),

@@ -44,6 +44,20 @@ def contract_sha256(contract=None):
     return hashlib.sha256(contract_bytes(contract)).hexdigest()
 
 
+def implementation_sha256():
+    import benchmark
+    sources = {
+        'matcher': fixture_matches.__code__.co_filename,
+        'normalizer': normalize_tokens.__code__.co_filename,
+        'parser': benchmark.load_scenarios.__code__.co_filename,
+        'validator': validate_voice.__code__.co_filename,
+    }
+    return hashlib.sha256(json.dumps({
+        label: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        for label, path in sources.items()
+    }, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
 def normalize_tokens(text, contract=None):
     aliases = (load_contract() if contract is None else contract)['token_aliases']
     return [aliases.get(token, token) for token in re.findall(r'[a-z]+|[0-9]+|[×*]', text.lower())]

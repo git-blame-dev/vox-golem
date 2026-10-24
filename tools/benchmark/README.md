@@ -159,8 +159,10 @@ native cleanup remains pending until fresh phase two additionally proves
 checks succeed. Missing or false phase-two proof preserves prior resource/process
 evidence without promoting combined cleanup. Phase two does not emit or require
 `native_cleanup_verified=true` and cannot substitute for prior SDK retirement proof.
-WebView-only cleanup receipts are rejected; only the current owned-storage registry
-format is supported, without old-format readers or migration. Failure diagnostics
+WebView-only cleanup receipts are rejected; only the source-defined phone-exclusive
+benchmark namespaces (`synthetic-phone-ask-<uuid>`, `app_webview_synthetic_phone_<hex32>`,
+`WebView_synthetic_phone_<hex32>`, `WebView/synthetic_phone_<hex32>` and three scoped
+`shared_prefs` files) under `no_backup/phone-benchmark.lock` are supported. Failure diagnostics
 retain only provided canonical bounded progress counts: `deleted_root_count` (0–3,
 WebView roots only), `deleted_owned_directory_count` (0–32),
 `deleted_preference_count` (0–24), and `deleted_session_count` (0–8).
@@ -182,12 +184,12 @@ creation in the device-monotonic clock, not painted-pixel or acoustic durations.
 
 If ordinary two-phase proof was lost, stop and obtain separate recovery approval.
 The benchmark-only fixed helper mode `cleanup-pending` admits **zero** model turns.
-The current session owner blocks new reservations while any ownership state is
-unresolved. Recovery validates the complete bounded set of current records and
-all producer exits before deletion; unsupported records, publication state,
-unknown entries or exceeded aggregate bounds fail closed. No records reports
-`not_started`, not successful cleanup. There is one current format and no
-previous-format reader or migration path.
+The current session owner blocks new reservations while any phone benchmark namespace
+entry is present or the process-lifetime `no_backup/phone-benchmark.lock` lease is held.
+Recovery acquires `phone-benchmark.lock`, validates the complete bounded set of
+phone-exclusive namespace entries before deletion, and fails closed on active producer
+locks, malformed namespace names, symlinks or exceeded aggregate bounds. Zero discovered
+tokens reports `not_started`, not successful cleanup.
 
 Cleanup failures can include `cleanup_failure_reason`, a fixed guard category,
 and optional established facts: `pending_count_class`, `producer_exit_verified`,
