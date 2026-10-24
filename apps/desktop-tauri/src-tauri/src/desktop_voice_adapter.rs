@@ -154,7 +154,7 @@ pub(super) async fn start_capture(
         .voice_autostart_available
         .store(false, Ordering::Release);
     ensure_app_running(&state.exit_cleanup_started)?;
-    ensure_startup_ready_for_prompt(&state.startup_state)?;
+    ensure_voice_input_ready(state)?;
     let frame_app = app.clone();
     let failure_app = app.clone();
     let ingress = state.native_voice.start(
@@ -514,7 +514,7 @@ fn process_frame(app: &tauri::AppHandle, frame: desktop_voice::VoiceFrame) -> Re
             state
                 .voice_input_reset_pending
                 .store(true, Ordering::Release);
-        } else if phase == RuntimePhasePayload::Listening && state.parakeet_runtime.is_some() {
+        } else if phase == RuntimePhasePayload::Listening && state.parakeet_runtime().is_some() {
             partial_action = request_partial_snapshot_after_detected_speech(
                 &pipeline,
                 &mut *state
@@ -572,11 +572,11 @@ fn process_frame(app: &tauri::AppHandle, frame: desktop_voice::VoiceFrame) -> Re
         }
         VoicePipelineAction::ExpiredWithoutSpeech => publish_voice(app, None),
         _ => {
-            if let Some(runtime) = state.parakeet_runtime.as_ref() {
+            if let Some(runtime) = state.parakeet_runtime() {
                 spawn_partial_transcription(
                     app.clone(),
                     partial_action,
-                    Arc::clone(runtime),
+                    runtime,
                     Arc::clone(&state.partial_transcription),
                     state.voice_pipeline_config.sample_rate_hz(),
                     update_guard,
@@ -736,7 +736,7 @@ fn spawn_final(
         fail_final(&state, token);
         return;
     };
-    let Some(runtime) = state.parakeet_runtime.as_ref().map(Arc::clone) else {
+    let Some(runtime) = state.parakeet_runtime() else {
         fail_final(&state, token);
         return;
     };

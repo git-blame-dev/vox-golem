@@ -105,8 +105,8 @@ struct AppState {
     response_backend_operation_lock: Mutex<()>,
     voice_pipeline_config: voxgolem_core::voice_pipeline::VoicePipelineConfig,
     voice_pipeline_state: Arc<Mutex<voxgolem_core::voice_pipeline::VoicePipelineState>>,
-    wake_word_runtime: Option<Mutex<wake_word::WakeWordRuntime>>,
-    voice_activity_runtime: Option<Mutex<voice_activity::VoiceActivityRuntime>>,
+    wake_word_runtime: WakeWordRuntimeSlot,
+    voice_activity_runtime: VoiceActivityRuntimeSlot,
     microphone_capture: Arc<voxgolem_audio::capture::AudioCaptureService>,
     native_voice: Arc<desktop_voice::DesktopVoiceRuntime>,
     native_observation: Mutex<desktop_observation::DesktopObservation>,
@@ -124,7 +124,7 @@ struct AppState {
     native_voice_cue: Mutex<Option<u64>>,
     native_cue_preparing: AtomicBool,
     voice_clock_origin: Instant,
-    parakeet_runtime: Option<Arc<Mutex<transcription::ParakeetRuntime>>>,
+    parakeet_runtime: ParakeetRuntimeSlot,
     partial_transcription: Arc<Mutex<partial_transcription::PartialTranscriptionScheduler>>,
     partial_voice_session: AtomicU64,
     native_partial_authority: Mutex<Option<desktop_voice_adapter::VoiceAdmissionToken>>,
@@ -156,6 +156,104 @@ struct AppState {
     shutdown_lock: tokio::sync::Mutex<()>,
     shutdown_complete: AtomicBool,
     exit_cleanup_started: Arc<AtomicBool>,
+}
+
+#[cfg_attr(test, allow(clippy::large_enum_variant))]
+pub(crate) enum VoiceActivityRuntimeSlotValue {
+    Real(voice_activity::VoiceActivityRuntime),
+    #[cfg(test)]
+    Synthetic,
+}
+
+impl VoiceActivityRuntimeSlotValue {
+    pub(crate) fn process_frame(
+        &mut self,
+        frame: &[f32],
+    ) -> Result<bool, voice_activity::VoiceActivityError> {
+        match self {
+            Self::Real(runtime) => runtime.process_frame(frame),
+            #[cfg(test)]
+            Self::Synthetic => Ok(false),
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        match self {
+            Self::Real(runtime) => runtime.reset(),
+            #[cfg(test)]
+            Self::Synthetic => {}
+        }
+    }
+}
+
+pub(crate) enum ParakeetRuntimeSlotValue {
+    Real(transcription::ParakeetRuntime),
+    #[cfg(test)]
+    Synthetic(Result<String, transcription::ParakeetRuntimeError>),
+}
+
+impl ParakeetRuntimeSlotValue {
+    pub(crate) fn transcribe(
+        &mut self,
+        input: &voxgolem_model::parakeet::ParakeetTranscriptionInput,
+    ) -> Result<voxgolem_model::parakeet::Transcript, transcription::ParakeetRuntimeError> {
+        match self {
+            Self::Real(runtime) => runtime.transcribe(input),
+            #[cfg(test)]
+            Self::Synthetic(result) => voxgolem_model::parakeet::Transcript::new(result.clone()?)
+                .map_err(transcription::ParakeetRuntimeError::InvalidTranscript),
+        }
+    }
+}
+
+type SharedWakeWordRuntime = Arc<Mutex<wake_word::WakeWordRuntime>>;
+type SharedVoiceActivityRuntime = Arc<Mutex<VoiceActivityRuntimeSlotValue>>;
+type SharedParakeetRuntime = Arc<Mutex<ParakeetRuntimeSlotValue>>;
+
+type WakeWordRuntimeSlot = Arc<Mutex<Option<SharedWakeWordRuntime>>>;
+type VoiceActivityRuntimeSlot = Arc<Mutex<Option<SharedVoiceActivityRuntime>>>;
+type ParakeetRuntimeSlot = Arc<Mutex<Option<SharedParakeetRuntime>>>;
+
+impl AppState {
+    pub(crate) fn wake_word_runtime(&self) -> Option<SharedWakeWordRuntime> {
+        self.wake_word_runtime
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(Arc::clone))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn voice_activity_runtime(&self) -> Option<SharedVoiceActivityRuntime> {
+        self.voice_activity_runtime
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(Arc::clone))
+    }
+
+    pub(crate) fn parakeet_runtime(&self) -> Option<SharedParakeetRuntime> {
+        self.parakeet_runtime
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(Arc::clone))
+    }
+
+    pub(crate) fn set_wake_word_runtime(&self, runtime: Option<SharedWakeWordRuntime>) {
+        if let Ok(mut slot) = self.wake_word_runtime.lock() {
+            *slot = runtime;
+        }
+    }
+
+    pub(crate) fn set_voice_activity_runtime(&self, runtime: Option<SharedVoiceActivityRuntime>) {
+        if let Ok(mut slot) = self.voice_activity_runtime.lock() {
+            *slot = runtime;
+        }
+    }
+
+    pub(crate) fn set_parakeet_runtime(&self, runtime: Option<SharedParakeetRuntime>) {
+        if let Ok(mut slot) = self.parakeet_runtime.lock() {
+            *slot = runtime;
+        }
+    }
 }
 
 /// Canonical/physical execution authority. No outer lock: the established gates
@@ -420,9 +518,9 @@ struct AppStateInit {
     response_profile_switch_generation: Arc<AtomicU64>,
     voice_pipeline_config: voxgolem_core::voice_pipeline::VoicePipelineConfig,
     voice_pipeline_state: voxgolem_core::voice_pipeline::VoicePipelineState,
-    wake_word_runtime: Option<Mutex<wake_word::WakeWordRuntime>>,
-    voice_activity_runtime: Option<Mutex<voice_activity::VoiceActivityRuntime>>,
-    parakeet_runtime: Option<Arc<Mutex<transcription::ParakeetRuntime>>>,
+    wake_word_runtime: WakeWordRuntimeSlot,
+    voice_activity_runtime: VoiceActivityRuntimeSlot,
+    parakeet_runtime: ParakeetRuntimeSlot,
     lifecycle_gate: Arc<Mutex<()>>,
     telemetry_sink: Arc<diagnostics::Diagnostics>,
     assistant_policy: voxgolem_core::assistant::AssistantPolicy,
@@ -3095,7 +3193,11 @@ fn get_startup_state_from_state(app_state: &AppState) -> StartupSettingsPayload 
                 configured_locale: None,
             };
         SpeechServicesMetadataPayload {
-            stt: metadata("parakeet", "Parakeet", app_state.parakeet_runtime.is_some()),
+            stt: metadata(
+                "parakeet",
+                "Parakeet",
+                app_state.parakeet_runtime().is_some(),
+            ),
             tts: metadata(
                 "tts",
                 "Piper ONNX",
@@ -3870,8 +3972,7 @@ fn update_wake_diagnostics(
         capturing,
     );
     let runtime = app_state
-        .wake_word_runtime
-        .as_ref()
+        .wake_word_runtime()
         .ok_or_else(|| String::from("Wake-word detection is unavailable"))?;
     let mut runtime = runtime
         .lock()
@@ -3942,8 +4043,7 @@ async fn save_wake_clip_from_state(
         .to_string_lossy()
         .into_owned();
     let model_revision = app_state
-        .wake_word_runtime
-        .as_ref()
+        .wake_word_runtime()
         .ok_or_else(|| String::from("active wake-word runtime is unavailable"))?
         .lock()
         .map_err(|_| String::from("wake-word runtime lock is poisoned"))?
@@ -4019,7 +4119,7 @@ fn wake_diagnostic_phase(
 }
 
 fn record_wake_diagnostics_phase(app_state: &AppState, phase: RuntimePhasePayload) {
-    if let Some(runtime) = &app_state.wake_word_runtime {
+    if let Some(runtime) = app_state.wake_word_runtime() {
         if let Ok(mut runtime) = runtime.lock() {
             runtime.record_diagnostics_phase(wake_diagnostic_phase(phase, true));
         }
@@ -4346,22 +4446,64 @@ fn begin_response_profile_switch_transition(
     let mut startup = startup_state
         .lock()
         .map_err(|_| String::from("startup state lock is poisoned"))?;
-    // A profile snapshot can precede asynchronous OpenCode settlement. This
-    // transition owns local-model warming, not those independently published caps.
+    // A profile snapshot can precede asynchronous OpenCode, TTS, or voice
+    // settlement. This transition owns local-model warming, not those
+    // independently published capabilities or voice readiness states.
     let live = match &*startup {
-        StartupStatePayload::Ready { capabilities, .. }
-        | StartupStatePayload::WarmingModel { capabilities, .. } => Some(capabilities),
+        StartupStatePayload::Ready {
+            voice_input_available,
+            voice_input_error,
+            tts_enabled,
+            capabilities,
+            ..
+        }
+        | StartupStatePayload::WarmingModel {
+            voice_input_available,
+            voice_input_error,
+            tts_enabled,
+            capabilities,
+            ..
+        } => Some((
+            *voice_input_available,
+            voice_input_error.clone(),
+            *tts_enabled,
+            capabilities,
+        )),
         StartupStatePayload::Error { .. } => None,
     };
     let pending = match &mut warming_state {
-        StartupStatePayload::Ready { capabilities, .. }
-        | StartupStatePayload::WarmingModel { capabilities, .. } => Some(capabilities),
+        StartupStatePayload::Ready {
+            voice_input_available,
+            voice_input_error,
+            tts_enabled,
+            capabilities,
+            ..
+        }
+        | StartupStatePayload::WarmingModel {
+            voice_input_available,
+            voice_input_error,
+            tts_enabled,
+            capabilities,
+            ..
+        } => Some((
+            voice_input_available,
+            voice_input_error,
+            tts_enabled,
+            capabilities,
+        )),
         StartupStatePayload::Error { .. } => None,
     };
-    if let (Some(live), Some(pending)) = (live, pending) {
+    if let (
+        Some((live_voice_available, live_voice_error, live_tts_enabled, live)),
+        Some((pending_voice_available, pending_voice_error, pending_tts_enabled, pending)),
+    ) = (live, pending)
+    {
+        *pending_voice_available = live_voice_available;
+        *pending_voice_error = live_voice_error;
+        *pending_tts_enabled = live_tts_enabled;
         for capability in live
             .iter()
-            .filter(|capability| matches!(capability.id, "opencode" | "deep" | "review"))
+            .filter(|capability| !matches!(capability.id, "local_fast" | "local_quality"))
         {
             if let Some(target) = pending.iter_mut().find(|target| target.id == capability.id) {
                 target.clone_from(capability);
@@ -9585,7 +9727,7 @@ fn ingest_audio_frame_from_state(
         to_runtime_phase_payload(guard.session().runtime().phase()),
     );
 
-    let partial_action = if app_state.parakeet_runtime.is_none() {
+    let partial_action = if app_state.parakeet_runtime().is_none() {
         partial_transcription::PartialTranscriptionAction::Ignore
     } else if wake_word_now_ms.is_some() {
         let session_id = app_state
@@ -9636,7 +9778,7 @@ fn ingest_audio_frame_from_state(
 fn spawn_partial_transcription(
     app: tauri::AppHandle,
     action: partial_transcription::PartialTranscriptionAction,
-    parakeet_runtime: Arc<Mutex<transcription::ParakeetRuntime>>,
+    parakeet_runtime: SharedParakeetRuntime,
     scheduler: Arc<Mutex<partial_transcription::PartialTranscriptionScheduler>>,
     sample_rate_hz: u32,
     update_guard: UpdateOperationLease,
@@ -12123,7 +12265,9 @@ fn configured_capabilities(
                 "deep" | "review" => custom_configured || opencode_configured,
                 _ => false,
             };
-            let state = if id == "qwen_prediction" && configured {
+            let state = if configured
+                && matches!(id, "qwen_prediction" | "wake_word" | "vad" | "parakeet")
+            {
                 CapabilityStatePayload::Warming
             } else if configured {
                 CapabilityStatePayload::Available
@@ -12135,25 +12279,490 @@ fn configured_capabilities(
             CapabilityPayload {
                 id,
                 state,
-                reason: if id == "qwen_prediction" && configured {
-                    String::from("completion model is loading")
-                } else if configured {
-                    String::from("ready")
+                reason: if configured {
+                    match id {
+                        "qwen_prediction" => String::from("completion model is loading"),
+                        "wake_word" => String::from("wake word runtime is loading"),
+                        "vad" => String::from("VAD runtime is loading"),
+                        "parakeet" => String::from("Parakeet runtime is loading"),
+                        _ => String::from("ready"),
+                    }
                 } else {
                     issue
                         .map(|issue| issue.reason.clone())
                         .unwrap_or_else(|| String::from("not configured"))
                 },
-                actual_provider: if configured && matches!(id, "wake_word" | "vad" | "parakeet") {
-                    Some("cpu")
-                } else {
-                    None
-                },
+                actual_provider: None,
             }
         })
         .collect::<Vec<_>>();
     chatgpt_auth::apply_capabilities(&mut capabilities);
     capabilities
+}
+
+fn derive_voice_input_readiness(
+    capabilities: &[CapabilityPayload],
+    wake_ready: bool,
+    parakeet_ready: bool,
+    vad_ready: bool,
+) -> (bool, Option<String>) {
+    let capability_available = |id: &str| {
+        capabilities.iter().any(|capability| {
+            capability.id == id && capability.state == CapabilityStatePayload::Available
+        })
+    };
+    let voice_input_available = wake_ready
+        && parakeet_ready
+        && vad_ready
+        && capability_available("wake_word")
+        && capability_available("parakeet")
+        && capability_available("vad");
+    if voice_input_available {
+        return (true, None);
+    }
+
+    let mut errors = Vec::new();
+    let mut warming_reasons = Vec::new();
+    for (id, slot_ready, unavailable_reason) in [
+        ("wake_word", wake_ready, "wake word runtime is unavailable"),
+        (
+            "parakeet",
+            parakeet_ready,
+            "Parakeet runtime is unavailable",
+        ),
+        ("vad", vad_ready, "VAD runtime is unavailable"),
+    ] {
+        match capabilities.iter().find(|capability| capability.id == id) {
+            Some(capability) => match capability.state {
+                CapabilityStatePayload::Failed
+                | CapabilityStatePayload::Unavailable
+                | CapabilityStatePayload::NotConfigured => {
+                    errors.push(capability.reason.clone());
+                }
+                CapabilityStatePayload::Warming => {
+                    warming_reasons.push(capability.reason.clone());
+                }
+                CapabilityStatePayload::Available if !slot_ready => {
+                    errors.push(String::from(unavailable_reason));
+                }
+                CapabilityStatePayload::Available => {}
+            },
+            None if !slot_ready => errors.push(String::from(unavailable_reason)),
+            None => {}
+        }
+    }
+    if !errors.is_empty() {
+        (false, Some(errors.join("; ")))
+    } else if !warming_reasons.is_empty() {
+        (false, Some(warming_reasons.join("; ")))
+    } else {
+        (false, Some(String::from("voice input is not ready")))
+    }
+}
+
+fn update_startup_voice_capability(
+    startup_state: &Mutex<StartupStatePayload>,
+    wake_slot: &WakeWordRuntimeSlot,
+    parakeet_slot: &ParakeetRuntimeSlot,
+    vad_slot: &VoiceActivityRuntimeSlot,
+    updated: CapabilityPayload,
+) {
+    let wake_ready = wake_slot.lock().is_ok_and(|slot| slot.is_some());
+    let parakeet_ready = parakeet_slot.lock().is_ok_and(|slot| slot.is_some());
+    let vad_ready = vad_slot.lock().is_ok_and(|slot| slot.is_some());
+    let Ok(mut startup) = startup_state.lock() else {
+        return;
+    };
+    let (capabilities, voice_input_available, voice_input_error) = match &mut *startup {
+        StartupStatePayload::WarmingModel {
+            capabilities,
+            voice_input_available,
+            voice_input_error,
+            ..
+        }
+        | StartupStatePayload::Ready {
+            capabilities,
+            voice_input_available,
+            voice_input_error,
+            ..
+        } => (capabilities, voice_input_available, voice_input_error),
+        StartupStatePayload::Error { .. } => return,
+    };
+    if let Some(capability) = capabilities.iter_mut().find(|item| item.id == updated.id) {
+        *capability = updated;
+    }
+    let (ready, error) =
+        derive_voice_input_readiness(capabilities, wake_ready, parakeet_ready, vad_ready);
+    *voice_input_available = ready;
+    *voice_input_error = error;
+}
+
+fn publish_initial_llama_startup_result(
+    startup_state: &Mutex<StartupStatePayload>,
+    wake_slot: &WakeWordRuntimeSlot,
+    parakeet_slot: &ParakeetRuntimeSlot,
+    vad_slot: &VoiceActivityRuntimeSlot,
+    selected_response_profile: ResponseProfilePayload,
+    supported_response_profiles: Vec<ResponseProfilePayload>,
+    local_start_result: Result<&'static str, String>,
+) {
+    let wake_ready = wake_slot.lock().is_ok_and(|slot| slot.is_some());
+    let parakeet_ready = parakeet_slot.lock().is_ok_and(|slot| slot.is_some());
+    let vad_ready = vad_slot.lock().is_ok_and(|slot| slot.is_some());
+    let Ok(mut guard) = startup_state.lock() else {
+        return;
+    };
+    let (
+        cue_asset_paths,
+        initial_silence_timeout_ms,
+        silence_timeout_ms,
+        current_tts_enabled,
+        tts_output_gain_db,
+        mut latest_capabilities,
+    ) = match &*guard {
+        StartupStatePayload::WarmingModel {
+            cue_asset_paths,
+            initial_silence_timeout_ms,
+            silence_timeout_ms,
+            tts_enabled,
+            tts_output_gain_db,
+            capabilities,
+            ..
+        }
+        | StartupStatePayload::Ready {
+            cue_asset_paths,
+            initial_silence_timeout_ms,
+            silence_timeout_ms,
+            tts_enabled,
+            tts_output_gain_db,
+            capabilities,
+            ..
+        } => (
+            cue_asset_paths.clone(),
+            *initial_silence_timeout_ms,
+            *silence_timeout_ms,
+            *tts_enabled,
+            *tts_output_gain_db,
+            capabilities.clone(),
+        ),
+        StartupStatePayload::Error { .. } => return,
+    };
+    let local_capability_id = if selected_response_profile == ResponseProfilePayload::Quality {
+        "local_quality"
+    } else {
+        "local_fast"
+    };
+    let local_ready = local_start_result.is_ok();
+    if let Some(capability) = latest_capabilities
+        .iter_mut()
+        .find(|item| item.id == local_capability_id)
+    {
+        match local_start_result {
+            Ok(actual_provider) => {
+                capability.state = CapabilityStatePayload::Available;
+                capability.reason = String::from("ready");
+                capability.actual_provider = Some(actual_provider);
+            }
+            Err(reason) => {
+                capability.state = CapabilityStatePayload::Failed;
+                capability.reason = reason;
+                capability.actual_provider = None;
+            }
+        }
+    }
+    let (voice_input_available, voice_input_error) =
+        derive_voice_input_readiness(&latest_capabilities, wake_ready, parakeet_ready, vad_ready);
+    *guard = StartupStatePayload::Ready {
+        cue_asset_paths,
+        runtime_phase: RuntimePhasePayload::Sleeping,
+        voice_input_available,
+        voice_input_error,
+        initial_silence_timeout_ms,
+        silence_timeout_ms,
+        selected_response_profile,
+        supported_response_profiles: if local_ready {
+            supported_response_profiles
+        } else {
+            Vec::new()
+        },
+        prompt_cancellation_available: true,
+        tts_enabled: current_tts_enabled,
+        tts_output_gain_db,
+        capabilities: latest_capabilities,
+    };
+}
+
+fn admit_voice_runtime_initialization(
+    state: &AppState,
+    id: &'static str,
+    warming_reason: &'static str,
+) -> Option<(PromptCleanupPermit, UpdateOperationLease)> {
+    let _lifecycle = state
+        .lifecycle_gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.exit_cleanup_started.load(Ordering::SeqCst) {
+        return None;
+    }
+    match begin_update_sensitive_operation(&state.update_installation_gate) {
+        Ok(update_lease) => {
+            update_startup_voice_capability(
+                &state.startup_state,
+                &state.wake_word_runtime,
+                &state.parakeet_runtime,
+                &state.voice_activity_runtime,
+                CapabilityPayload {
+                    id,
+                    state: CapabilityStatePayload::Warming,
+                    reason: String::from(warming_reason),
+                    actual_provider: None,
+                },
+            );
+            Some((state.native_voice_work.register(), update_lease))
+        }
+        Err(reason) => {
+            update_startup_voice_capability(
+                &state.startup_state,
+                &state.wake_word_runtime,
+                &state.parakeet_runtime,
+                &state.voice_activity_runtime,
+                CapabilityPayload {
+                    id,
+                    state: CapabilityStatePayload::Unavailable,
+                    reason,
+                    actual_provider: None,
+                },
+            );
+            None
+        }
+    }
+}
+
+fn start_voice_runtime_initialization_with<FWake, FParakeet, FVad, Spawn>(
+    state: &AppState,
+    wake_loader: FWake,
+    parakeet_loader: FParakeet,
+    vad_loader: FVad,
+    mut spawn_worker: Spawn,
+) where
+    FWake: FnOnce(&Path, f32) -> Result<wake_word::WakeWordRuntime, String> + Send + 'static,
+    FParakeet: FnOnce(&Path) -> Result<ParakeetRuntimeSlotValue, String> + Send + 'static,
+    FVad: FnOnce(&Path) -> Result<VoiceActivityRuntimeSlotValue, String> + Send + 'static,
+    Spawn: FnMut(Box<dyn FnOnce() + Send + 'static>),
+{
+    let Some(config) = state.runtime_config.as_ref() else {
+        return;
+    };
+
+    if config.wake_word_model_path.is_file() {
+        if let Some((physical_lease, update_lease)) =
+            admit_voice_runtime_initialization(state, "wake_word", "wake word runtime is loading")
+        {
+            let model_path = config.wake_word_model_path.clone();
+            let threshold = config.wake_word_detection_threshold;
+            let lifecycle_gate = Arc::clone(&state.lifecycle_gate);
+            let exit_cleanup_started = Arc::clone(&state.exit_cleanup_started);
+            let startup_state = Arc::clone(&state.startup_state);
+            let wake_slot = Arc::clone(&state.wake_word_runtime);
+            let parakeet_slot = Arc::clone(&state.parakeet_runtime);
+            let vad_slot = Arc::clone(&state.voice_activity_runtime);
+            spawn_worker(Box::new(move || {
+                let _physical_lease = physical_lease;
+                let _update_lease = update_lease;
+                if exit_cleanup_started.load(Ordering::SeqCst) {
+                    return;
+                }
+                let result = wake_loader(&model_path, threshold);
+                let _lifecycle = lifecycle_gate
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if exit_cleanup_started.load(Ordering::SeqCst) {
+                    return;
+                }
+                match result {
+                    Ok(runtime) => {
+                        *wake_slot
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(Arc::new(Mutex::new(runtime)));
+                        update_startup_voice_capability(
+                            &startup_state,
+                            &wake_slot,
+                            &parakeet_slot,
+                            &vad_slot,
+                            CapabilityPayload {
+                                id: "wake_word",
+                                state: CapabilityStatePayload::Available,
+                                reason: String::from("ready"),
+                                actual_provider: Some("cpu"),
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!("failed to initialize wake word detector: {error}");
+                        update_startup_voice_capability(
+                            &startup_state,
+                            &wake_slot,
+                            &parakeet_slot,
+                            &vad_slot,
+                            CapabilityPayload {
+                                id: "wake_word",
+                                state: CapabilityStatePayload::Failed,
+                                reason: String::from("wake word runtime failed to initialize"),
+                                actual_provider: None,
+                            },
+                        );
+                    }
+                }
+            }));
+        }
+    }
+
+    if config.parakeet_model_dir.is_dir() {
+        if let Some((physical_lease, update_lease)) =
+            admit_voice_runtime_initialization(state, "parakeet", "Parakeet runtime is loading")
+        {
+            let model_dir = config.parakeet_model_dir.clone();
+            let lifecycle_gate = Arc::clone(&state.lifecycle_gate);
+            let exit_cleanup_started = Arc::clone(&state.exit_cleanup_started);
+            let startup_state = Arc::clone(&state.startup_state);
+            let wake_slot = Arc::clone(&state.wake_word_runtime);
+            let parakeet_slot = Arc::clone(&state.parakeet_runtime);
+            let vad_slot = Arc::clone(&state.voice_activity_runtime);
+            spawn_worker(Box::new(move || {
+                let _physical_lease = physical_lease;
+                let _update_lease = update_lease;
+                if exit_cleanup_started.load(Ordering::SeqCst) {
+                    return;
+                }
+                let result = parakeet_loader(&model_dir);
+                let _lifecycle = lifecycle_gate
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if exit_cleanup_started.load(Ordering::SeqCst) {
+                    return;
+                }
+                match result {
+                    Ok(runtime) => {
+                        *parakeet_slot
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(Arc::new(Mutex::new(runtime)));
+                        update_startup_voice_capability(
+                            &startup_state,
+                            &wake_slot,
+                            &parakeet_slot,
+                            &vad_slot,
+                            CapabilityPayload {
+                                id: "parakeet",
+                                state: CapabilityStatePayload::Available,
+                                reason: String::from("ready"),
+                                actual_provider: Some("cpu"),
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!("{error}");
+                        update_startup_voice_capability(
+                            &startup_state,
+                            &wake_slot,
+                            &parakeet_slot,
+                            &vad_slot,
+                            CapabilityPayload {
+                                id: "parakeet",
+                                state: CapabilityStatePayload::Failed,
+                                reason: String::from("Parakeet runtime failed to initialize"),
+                                actual_provider: None,
+                            },
+                        );
+                    }
+                }
+            }));
+        }
+    }
+
+    if config.silero_vad_model.is_file() {
+        if let Some((physical_lease, update_lease)) =
+            admit_voice_runtime_initialization(state, "vad", "VAD runtime is loading")
+        {
+            let model_path = config.silero_vad_model.clone();
+            let lifecycle_gate = Arc::clone(&state.lifecycle_gate);
+            let exit_cleanup_started = Arc::clone(&state.exit_cleanup_started);
+            let startup_state = Arc::clone(&state.startup_state);
+            let wake_slot = Arc::clone(&state.wake_word_runtime);
+            let parakeet_slot = Arc::clone(&state.parakeet_runtime);
+            let vad_slot = Arc::clone(&state.voice_activity_runtime);
+            spawn_worker(Box::new(move || {
+                let _physical_lease = physical_lease;
+                let _update_lease = update_lease;
+                if exit_cleanup_started.load(Ordering::SeqCst) {
+                    return;
+                }
+                let result = vad_loader(&model_path);
+                let _lifecycle = lifecycle_gate
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if exit_cleanup_started.load(Ordering::SeqCst) {
+                    return;
+                }
+                match result {
+                    Ok(runtime) => {
+                        *vad_slot
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(Arc::new(Mutex::new(runtime)));
+                        update_startup_voice_capability(
+                            &startup_state,
+                            &wake_slot,
+                            &parakeet_slot,
+                            &vad_slot,
+                            CapabilityPayload {
+                                id: "vad",
+                                state: CapabilityStatePayload::Available,
+                                reason: String::from("ready"),
+                                actual_provider: Some("cpu"),
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!("{error}");
+                        update_startup_voice_capability(
+                            &startup_state,
+                            &wake_slot,
+                            &parakeet_slot,
+                            &vad_slot,
+                            CapabilityPayload {
+                                id: "vad",
+                                state: CapabilityStatePayload::Failed,
+                                reason: String::from("VAD runtime failed to initialize"),
+                                actual_provider: None,
+                            },
+                        );
+                    }
+                }
+            }));
+        }
+    }
+}
+
+fn start_voice_runtime_initialization(state: &AppState) {
+    start_voice_runtime_initialization_with(
+        state,
+        wake_word::WakeWordRuntime::new,
+        |path| {
+            transcription::ParakeetRuntime::load(path)
+                .map(ParakeetRuntimeSlotValue::Real)
+                .map_err(|error| format!("failed to initialize parakeet transcriber: {error:?}"))
+        },
+        |path| {
+            voice_activity::VoiceActivityRuntime::load(path)
+                .map(VoiceActivityRuntimeSlotValue::Real)
+                .map_err(|error| format!("failed to initialize voice activity detector: {error:?}"))
+        },
+        |job| {
+            let _ = spawn_runtime_worker(job);
+        },
+    );
 }
 
 fn opencode_server_config(
@@ -12560,25 +13169,9 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
             let exit_cleanup_started = Arc::new(AtomicBool::new(false));
             let response_profile_switch_generation = Arc::new(AtomicU64::new(0));
             let llama_startups = Arc::new(Mutex::new(Vec::new()));
-            let wake_word_runtime = if config.wake_word_model_path.is_file() {
-                wake_word::WakeWordRuntime::new(
-                    &config.wake_word_model_path,
-                    config.wake_word_detection_threshold,
-                )
-                .map(Mutex::new)
-                .map_err(|error| eprintln!("failed to initialize wake word detector: {error}"))
-                .ok()
-            } else {
-                None
-            };
-            if wake_word_runtime.is_none() && config.wake_word_model_path.is_file() {
-                mark_capability(
-                    &mut capabilities,
-                    "wake_word",
-                    CapabilityStatePayload::Failed,
-                    String::from("wake word runtime failed to initialize"),
-                );
-            }
+            let wake_word_runtime: WakeWordRuntimeSlot = Arc::new(Mutex::new(None));
+            let voice_activity_runtime: VoiceActivityRuntimeSlot = Arc::new(Mutex::new(None));
+            let parakeet_runtime: ParakeetRuntimeSlot = Arc::new(Mutex::new(None));
             let effective_tts_enabled = resolve_effective_tts_enabled(
                 config.local_tts.enabled,
                 config.local_tts.model_path.is_file(),
@@ -12597,62 +13190,8 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
                 );
             }
             let tts_output_gain_db = config.local_tts.output_gain_db;
-            let mut voice_input_errors = Vec::new();
-            let parakeet_runtime = if config.parakeet_model_dir.is_dir() {
-                match transcription::ParakeetRuntime::load(&config.parakeet_model_dir) {
-                    Ok(runtime) => Some(Arc::new(Mutex::new(runtime))),
-                    Err(error) => {
-                        let error_message =
-                            format!("failed to initialize parakeet transcriber: {error:?}");
-                        eprintln!("{error_message}");
-                        voice_input_errors.push(error_message);
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            let voice_activity_runtime = if config.silero_vad_model.is_file() {
-                match voice_activity::VoiceActivityRuntime::load(&config.silero_vad_model) {
-                    Ok(runtime) => Some(Mutex::new(runtime)),
-                    Err(error) => {
-                        let error_message =
-                            format!("failed to initialize voice activity detector: {error:?}");
-                        eprintln!("{error_message}");
-                        voice_input_errors.push(error_message);
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            if parakeet_runtime.is_none() && config.parakeet_model_dir.is_dir() {
-                mark_capability(
-                    &mut capabilities,
-                    "parakeet",
-                    CapabilityStatePayload::Failed,
-                    String::from("Parakeet runtime failed to initialize"),
-                );
-            }
-            if voice_activity_runtime.is_none() && config.silero_vad_model.is_file() {
-                mark_capability(
-                    &mut capabilities,
-                    "vad",
-                    CapabilityStatePayload::Failed,
-                    String::from("VAD runtime failed to initialize"),
-                );
-            }
-            let voice_input_available = wake_word_runtime.is_some()
-                && parakeet_runtime.is_some()
-                && voice_activity_runtime.is_some();
-            if wake_word_runtime.is_none() {
-                voice_input_errors.push(String::from("wake word runtime is unavailable"));
-            }
-            let voice_input_error = if voice_input_errors.is_empty() {
-                None
-            } else {
-                Some(voice_input_errors.join("\n"))
-            };
+            let (voice_input_available, voice_input_error) =
+                derive_voice_input_readiness(&capabilities, false, false, false);
             let llama_cpp_system_prompt = match &config.response_backend {
                 voxgolem_core::config::ResponseBackendConfig::LlamaCpp { .. } => {
                     match load_llama_cpp_system_prompt() {
@@ -12746,15 +13285,14 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
                     let startup_state = Arc::clone(&startup_state);
                     let lifecycle_gate = Arc::clone(&lifecycle_gate);
                     let llama_cpp_runtime = Arc::clone(&llama_cpp_runtime);
+                    let wake_slot = Arc::clone(&wake_word_runtime);
+                    let parakeet_slot = Arc::clone(&parakeet_runtime);
+                    let vad_slot = Arc::clone(&voice_activity_runtime);
                     let response_profile_switch_generation =
                         Arc::clone(&response_profile_switch_generation);
                     let startup_generation =
                         response_profile_switch_generation.load(Ordering::SeqCst);
                     let startup_exit_cleanup = Arc::clone(&exit_cleanup_started);
-                    let cue_asset_paths = cue_asset_paths.clone();
-                    let voice_input_error = voice_input_error.clone();
-                    let silence_timeout_ms = config.silence_timeout_ms;
-                    let initial_silence_timeout_ms = config.initial_silence_timeout_ms;
                     let selected_response_profile = selected_profile_at_startup;
                     let supported_response_profiles = supported_response_profiles.clone();
                     let inference_policy = config
@@ -12792,12 +13330,6 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
                             return;
                         }
 
-                        let local_capability_id =
-                            if selected_response_profile == ResponseProfilePayload::Quality {
-                                "local_quality"
-                            } else {
-                                "local_fast"
-                            };
                         let local_start_result = match start_result {
                             Ok(runtime) => {
                                 let actual_provider =
@@ -12820,64 +13352,22 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
                         let Ok(_lifecycle) = lifecycle_gate.lock() else {
                             return;
                         };
-                        if let Ok(mut guard) = startup_state.lock() {
-                            if !runtime_startup_is_current(
-                                &startup_exit_cleanup,
-                                &response_profile_switch_generation,
-                                startup_generation,
-                            ) {
-                                return;
-                            }
-                            let (mut latest_capabilities, current_tts_enabled) = match &*guard {
-                                StartupStatePayload::WarmingModel {
-                                    capabilities,
-                                    tts_enabled,
-                                    ..
-                                }
-                                | StartupStatePayload::Ready {
-                                    capabilities,
-                                    tts_enabled,
-                                    ..
-                                } => (capabilities.clone(), *tts_enabled),
-                                StartupStatePayload::Error { .. } => return,
-                            };
-                            let local_ready = local_start_result.is_ok();
-                            if let Some(capability) = latest_capabilities
-                                .iter_mut()
-                                .find(|item| item.id == local_capability_id)
-                            {
-                                match local_start_result {
-                                    Ok(actual_provider) => {
-                                        capability.state = CapabilityStatePayload::Available;
-                                        capability.reason = String::from("ready");
-                                        capability.actual_provider = Some(actual_provider);
-                                    }
-                                    Err(reason) => {
-                                        capability.state = CapabilityStatePayload::Failed;
-                                        capability.reason = reason;
-                                        capability.actual_provider = None;
-                                    }
-                                }
-                            }
-                            *guard = StartupStatePayload::Ready {
-                                cue_asset_paths,
-                                runtime_phase: RuntimePhasePayload::Sleeping,
-                                voice_input_available,
-                                voice_input_error,
-                                initial_silence_timeout_ms,
-                                silence_timeout_ms,
-                                selected_response_profile,
-                                supported_response_profiles: if local_ready {
-                                    supported_response_profiles
-                                } else {
-                                    Vec::new()
-                                },
-                                prompt_cancellation_available: true,
-                                tts_enabled: current_tts_enabled,
-                                tts_output_gain_db,
-                                capabilities: latest_capabilities,
-                            };
+                        if !runtime_startup_is_current(
+                            &startup_exit_cleanup,
+                            &response_profile_switch_generation,
+                            startup_generation,
+                        ) {
+                            return;
                         }
+                        publish_initial_llama_startup_result(
+                            &startup_state,
+                            &wake_slot,
+                            &parakeet_slot,
+                            &vad_slot,
+                            selected_response_profile,
+                            supported_response_profiles,
+                            local_start_result,
+                        );
                     });
                     register_llama_startup(
                         &llama_startups,
@@ -12997,10 +13487,10 @@ fn build_startup_error_app_state(
         response_profile_switch_generation: Arc::new(AtomicU64::new(0)),
         voice_pipeline_config,
         voice_pipeline_state,
-        wake_word_runtime: None,
-        voice_activity_runtime: None,
+        wake_word_runtime: Arc::new(Mutex::new(None)),
+        voice_activity_runtime: Arc::new(Mutex::new(None)),
         microphone_capture: create_microphone_capture(),
-        parakeet_runtime: None,
+        parakeet_runtime: Arc::new(Mutex::new(None)),
         lifecycle_gate: Arc::new(Mutex::new(())),
         telemetry_sink: default_telemetry_sink(),
         assistant_policy: AssistantSettingsPayload::default().into(),
@@ -13045,10 +13535,10 @@ fn build_nonfatal_config_error_app_state(
         response_profile_switch_generation: Arc::new(AtomicU64::new(0)),
         voice_pipeline_config,
         voice_pipeline_state,
-        wake_word_runtime: None,
-        voice_activity_runtime: None,
+        wake_word_runtime: Arc::new(Mutex::new(None)),
+        voice_activity_runtime: Arc::new(Mutex::new(None)),
         microphone_capture: create_microphone_capture(),
-        parakeet_runtime: None,
+        parakeet_runtime: Arc::new(Mutex::new(None)),
         lifecycle_gate: Arc::new(Mutex::new(())),
         telemetry_sink: default_telemetry_sink(),
         assistant_policy: AssistantSettingsPayload::default().into(),
@@ -13212,6 +13702,50 @@ fn ensure_startup_ready_for_prompt(
     }
 }
 
+fn ensure_voice_input_ready(state: &AppState) -> Result<(), String> {
+    ensure_startup_ready_for_prompt(&state.startup_state)?;
+    let (voice_input_available, voice_input_error) = {
+        let startup = state
+            .startup_state
+            .lock()
+            .map_err(|_| String::from("startup state lock should not be poisoned"))?;
+        match &*startup {
+            StartupStatePayload::Ready {
+                voice_input_available,
+                voice_input_error,
+                capabilities,
+                ..
+            } => {
+                let all_voice_caps_available =
+                    ["wake_word", "parakeet", "vad"].into_iter().all(|id| {
+                        capabilities.iter().any(|capability| {
+                            capability.id == id
+                                && capability.state == CapabilityStatePayload::Available
+                        })
+                    });
+                (
+                    *voice_input_available && all_voice_caps_available,
+                    voice_input_error.clone(),
+                )
+            }
+            StartupStatePayload::WarmingModel { .. } => {
+                return Err(String::from("local Gemma model is still warming up"));
+            }
+            StartupStatePayload::Error { message } => {
+                return Err(format!("startup error: {message}"));
+            }
+        }
+    };
+    let slots_ready = state.wake_word_runtime().is_some()
+        && state.parakeet_runtime().is_some()
+        && state.voice_activity_runtime().is_some();
+    if voice_input_available && slots_ready {
+        Ok(())
+    } else {
+        Err(voice_input_error.unwrap_or_else(|| String::from("voice input is not ready")))
+    }
+}
+
 fn ensure_startup_ready_for_profile_switch(
     startup_state: &Arc<Mutex<StartupStatePayload>>,
 ) -> Result<(), String> {
@@ -13299,11 +13833,19 @@ fn runtime_phase_response_from_state(
     }
 }
 
+fn clone_runtime_slot<T>(
+    slot: &Mutex<Option<Arc<Mutex<T>>>>,
+) -> Result<Option<Arc<Mutex<T>>>, String> {
+    slot.lock()
+        .map(|guard| guard.as_ref().map(Arc::clone))
+        .map_err(|_| String::from("voice runtime slot lock is poisoned"))
+}
+
 fn process_wake_word_frame(
-    wake_word_runtime: &Option<Mutex<wake_word::WakeWordRuntime>>,
+    wake_word_runtime: &Mutex<Option<SharedWakeWordRuntime>>,
     frame: &[f32],
 ) -> Result<(Option<wake_word::WakeWordDetection>, Option<f32>), String> {
-    let Some(wake_word_runtime) = wake_word_runtime else {
+    let Some(wake_word_runtime) = clone_runtime_slot(wake_word_runtime)? else {
         return Ok((None, None));
     };
 
@@ -13319,9 +13861,9 @@ fn process_wake_word_frame(
 }
 
 fn reset_wake_word_runtime(
-    wake_word_runtime: &Option<Mutex<wake_word::WakeWordRuntime>>,
+    wake_word_runtime: &Mutex<Option<SharedWakeWordRuntime>>,
 ) -> Result<(), String> {
-    let Some(wake_word_runtime) = wake_word_runtime else {
+    let Some(wake_word_runtime) = clone_runtime_slot(wake_word_runtime)? else {
         return Ok(());
     };
 
@@ -13333,10 +13875,10 @@ fn reset_wake_word_runtime(
 }
 
 fn process_voice_activity_frame(
-    voice_activity_runtime: &Option<Mutex<voice_activity::VoiceActivityRuntime>>,
+    voice_activity_runtime: &Mutex<Option<SharedVoiceActivityRuntime>>,
     frame: &[f32],
 ) -> Result<bool, String> {
-    let Some(voice_activity_runtime) = voice_activity_runtime else {
+    let Some(voice_activity_runtime) = clone_runtime_slot(voice_activity_runtime)? else {
         return Ok(false);
     };
 
@@ -13350,9 +13892,9 @@ fn process_voice_activity_frame(
 }
 
 fn reset_voice_activity_runtime(
-    voice_activity_runtime: &Option<Mutex<voice_activity::VoiceActivityRuntime>>,
+    voice_activity_runtime: &Mutex<Option<SharedVoiceActivityRuntime>>,
 ) -> Result<(), String> {
-    let Some(voice_activity_runtime) = voice_activity_runtime else {
+    let Some(voice_activity_runtime) = clone_runtime_slot(voice_activity_runtime)? else {
         return Ok(());
     };
 
@@ -13540,8 +14082,8 @@ fn apply_silence_check_with_input_reset(
 #[cfg(test)]
 fn apply_voice_pipeline_transition_with_input_runtime_reset(
     voice_pipeline_state: &Mutex<voxgolem_core::voice_pipeline::VoicePipelineState>,
-    wake_word_runtime: &Option<Mutex<wake_word::WakeWordRuntime>>,
-    voice_activity_runtime: &Option<Mutex<voice_activity::VoiceActivityRuntime>>,
+    wake_word_runtime: &Mutex<Option<SharedWakeWordRuntime>>,
+    voice_activity_runtime: &Mutex<Option<SharedVoiceActivityRuntime>>,
     voice_pipeline_config: voxgolem_core::voice_pipeline::VoicePipelineConfig,
     event: voxgolem_core::voice_pipeline::VoicePipelineEvent,
 ) -> Result<voxgolem_core::voice_pipeline::VoicePipelineAction, String> {
@@ -13735,7 +14277,7 @@ fn transcription_ready_samples(
 #[cfg(test)]
 fn transcribe_finished_utterance(
     action: &voxgolem_core::voice_pipeline::VoicePipelineAction,
-    parakeet_runtime: &Option<Arc<Mutex<transcription::ParakeetRuntime>>>,
+    parakeet_runtime: &Mutex<Option<SharedParakeetRuntime>>,
 ) -> Result<Option<String>, String> {
     let voxgolem_core::voice_pipeline::VoicePipelineAction::FinishedUtterance {
         transcription_input,
@@ -13744,8 +14286,7 @@ fn transcribe_finished_utterance(
         return Ok(None);
     };
 
-    let parakeet_runtime = parakeet_runtime
-        .as_ref()
+    let parakeet_runtime = clone_runtime_slot(parakeet_runtime)?
         .ok_or_else(|| String::from("parakeet runtime is not ready"))?;
     #[cfg(feature = "app-benchmark")]
     app_benchmark::mark("final_asr_started");
@@ -13783,8 +14324,8 @@ fn build_mark_silence_response(
 #[cfg(test)]
 fn reset_voice_pipeline_to_waiting(
     voice_pipeline_state: &Mutex<voxgolem_core::voice_pipeline::VoicePipelineState>,
-    wake_word_runtime: &Option<Mutex<wake_word::WakeWordRuntime>>,
-    voice_activity_runtime: &Option<Mutex<voice_activity::VoiceActivityRuntime>>,
+    wake_word_runtime: &Mutex<Option<SharedWakeWordRuntime>>,
+    voice_activity_runtime: &Mutex<Option<SharedVoiceActivityRuntime>>,
     voice_pipeline_config: voxgolem_core::voice_pipeline::VoicePipelineConfig,
 ) -> Result<(), String> {
     apply_voice_pipeline_transition_with_input_runtime_reset(
@@ -13915,6 +14456,12 @@ async fn shutdown_runtime(app_state: &AppState) {
                 // Native calls cannot be preempted safely. Retain their owners and
                 // report incomplete cleanup rather than authorizing an installer.
                 return false;
+            }
+            {
+                let _lifecycle = app_state.lifecycle_gate.lock().ok();
+                app_state.set_wake_word_runtime(None);
+                app_state.set_voice_activity_runtime(None);
+                app_state.set_parakeet_runtime(None);
             }
             shutdown_prefetch(app_state).await;
             app_state.conversation.retire_search().await;
@@ -14153,6 +14700,7 @@ pub fn run() {
                 .as_ref()
                 .and_then(|config| config.opencode.clone());
             app.manage(app_state);
+            start_voice_runtime_initialization(&app.state::<AppState>());
             if let Some(config) = opencode_config {
                 let publisher = app.handle().clone();
                 let queued = queue_opencode_startup(
@@ -21545,7 +22093,7 @@ mod tests {
         assert_eq!(
             transcribe_finished_utterance(
                 &voxgolem_core::voice_pipeline::VoicePipelineAction::None,
-                &None,
+                &Mutex::new(None),
             ),
             Ok(None)
         );
@@ -21621,7 +22169,10 @@ mod tests {
         );
         assert!(!sleeping.capture().capturing_utterance());
         assert_eq!(sleeping.capture().utterance_len(), 0);
-        assert_eq!(transcribe_finished_utterance(&action, &None), Ok(None));
+        assert_eq!(
+            transcribe_finished_utterance(&action, &Mutex::new(None)),
+            Ok(None)
+        );
         let response = build_mark_silence_response(&Mutex::new(sleeping), &action, None, None)
             .expect("silent expiry response");
         assert_eq!(response.runtime_phase, RuntimePhasePayload::Sleeping);
@@ -21908,8 +22459,13 @@ mod tests {
         .0;
         let locked_state = Mutex::new(processing_state);
 
-        reset_voice_pipeline_to_waiting(&locked_state, &None, &None, voice_pipeline_config)
-            .expect("reset to waiting should succeed");
+        reset_voice_pipeline_to_waiting(
+            &locked_state,
+            &Mutex::new(None),
+            &Mutex::new(None),
+            voice_pipeline_config,
+        )
+        .expect("reset to waiting should succeed");
         assert_eq!(
             current_runtime_phase_response(&locked_state, None, None)
                 .expect("runtime snapshot should succeed")
@@ -21949,14 +22505,16 @@ mod tests {
     #[test]
     fn process_wake_word_frame_is_a_no_op_without_runtime() {
         assert_eq!(
-            process_wake_word_frame(&None, &[0.1, 0.2]),
+            process_wake_word_frame(&Mutex::new(None), &[0.1, 0.2]),
             Ok((None, None))
         );
     }
 
     #[test]
     fn process_wake_word_frame_propagates_detector_errors() {
-        let runtime = Some(Mutex::new(WakeWordRuntime::new_failing_for_test()));
+        let runtime = Mutex::new(Some(Arc::new(Mutex::new(
+            WakeWordRuntime::new_failing_for_test(),
+        ))));
 
         assert_eq!(
             process_wake_word_frame(&runtime, &[0.0; 8]),
@@ -21966,7 +22524,7 @@ mod tests {
 
     #[test]
     fn reset_wake_word_runtime_is_a_no_op_without_runtime() {
-        assert_eq!(reset_wake_word_runtime(&None), Ok(()));
+        assert_eq!(reset_wake_word_runtime(&Mutex::new(None)), Ok(()));
     }
 
     #[test]
@@ -21984,7 +22542,7 @@ mod tests {
             super::StartupStatePayload::Error { .. }
         ));
         assert!(app_state.runtime_config.is_none());
-        assert!(app_state.wake_word_runtime.is_none());
+        assert!(app_state.wake_word_runtime().is_none());
         let snapshot = get_app_snapshot_from_state(&app_state).expect("snapshot should serialize");
         assert_eq!(snapshot.capabilities.len(), super::CAPABILITY_IDS.len());
         assert!(snapshot.capabilities.iter().all(|capability| {
@@ -22014,12 +22572,14 @@ mod tests {
 
     #[test]
     fn wake_diagnostics_bridge_marks_and_stops_without_requiring_a_microphone() {
-        let mut state = build_startup_error_app_state(
+        let state = build_startup_error_app_state(
             default_voice_pipeline_config(),
             String::from("synthetic startup"),
         );
         assert!(super::update_wake_diagnostics(&state, Some(true), None).is_err());
-        state.wake_word_runtime = Some(Mutex::new(WakeWordRuntime::new_failing_for_test()));
+        state.set_wake_word_runtime(Some(Arc::new(Mutex::new(
+            WakeWordRuntime::new_failing_for_test(),
+        ))));
         let enabled = super::update_wake_diagnostics(&state, Some(true), None).unwrap();
         assert!(enabled.enabled);
         assert_eq!(
@@ -22206,6 +22766,369 @@ mod tests {
                 StageResult::Deep(DeepOutcome::Failure("deep failed".into()))
             ),
             UpdateResult::Pending
+        );
+    }
+
+    fn configured_voice_test_state(root: &std::path::Path) -> super::AppState {
+        let state = missing_llama_app_state(root);
+        let wake_path = root.join("wake.onnx");
+        let parakeet_dir = root.join("parakeet");
+        let vad_path = root.join("vad.onnx");
+        std::fs::write(&wake_path, b"synthetic-wake").unwrap();
+        std::fs::create_dir_all(&parakeet_dir).unwrap();
+        std::fs::write(&vad_path, b"synthetic-vad").unwrap();
+        let config = state.runtime_config.as_ref().unwrap().clone();
+        let capabilities = super::configured_capabilities(&config);
+        let (voice_input_available, voice_input_error) =
+            super::derive_voice_input_readiness(&capabilities, false, false, false);
+        *state.startup_state.lock().unwrap() = StartupStatePayload::Ready {
+            cue_asset_paths: super::embedded_cue_asset_paths(),
+            runtime_phase: RuntimePhasePayload::Sleeping,
+            voice_input_available,
+            voice_input_error,
+            initial_silence_timeout_ms: DEFAULT_INITIAL_SILENCE_TIMEOUT_MS,
+            silence_timeout_ms: DEFAULT_SILENCE_TIMEOUT_MS,
+            selected_response_profile: ResponseProfilePayload::Fast,
+            supported_response_profiles: vec![ResponseProfilePayload::Fast],
+            prompt_cancellation_available: true,
+            tts_enabled: false,
+            tts_output_gain_db: 3.0,
+            capabilities,
+        };
+        state
+    }
+
+    #[test]
+    fn configured_voice_capabilities_start_warming_without_provider_until_initialized() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let unconfigured_state = missing_llama_app_state(temp_dir.path());
+        let unconfigured_caps =
+            super::configured_capabilities(unconfigured_state.runtime_config.as_ref().unwrap());
+        for id in ["wake_word", "vad", "parakeet"] {
+            let cap = unconfigured_caps.iter().find(|c| c.id == id).unwrap();
+            assert_eq!(cap.state, CapabilityStatePayload::NotConfigured);
+            assert_eq!(cap.actual_provider, None);
+        }
+
+        let configured_state = configured_voice_test_state(temp_dir.path());
+        let startup = configured_state.startup_state.lock().unwrap().clone();
+        let StartupStatePayload::Ready {
+            voice_input_available,
+            voice_input_error,
+            capabilities,
+            ..
+        } = startup
+        else {
+            panic!("expected ready startup state")
+        };
+        assert!(!voice_input_available);
+        assert_eq!(
+            voice_input_error.as_deref(),
+            Some(
+                "wake word runtime is loading; Parakeet runtime is loading; VAD runtime is loading"
+            )
+        );
+        for (id, expected_reason) in [
+            ("wake_word", "wake word runtime is loading"),
+            ("parakeet", "Parakeet runtime is loading"),
+            ("vad", "VAD runtime is loading"),
+        ] {
+            let cap = capabilities.iter().find(|c| c.id == id).unwrap();
+            assert_eq!(cap.state, CapabilityStatePayload::Warming);
+            assert_eq!(cap.reason, expected_reason);
+            assert_eq!(cap.actual_provider, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn async_voice_initialization_tracks_leases_and_only_enables_voice_when_all_three_succeed(
+    ) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = configured_voice_test_state(temp_dir.path());
+        let mut jobs = Vec::new();
+        super::start_voice_runtime_initialization_with(
+            &state,
+            |_, _| Ok(WakeWordRuntime::new_failing_for_test()),
+            |_| {
+                Ok(super::ParakeetRuntimeSlotValue::Synthetic(Ok(
+                    String::from("synthetic"),
+                )))
+            },
+            |_| Ok(super::VoiceActivityRuntimeSlotValue::Synthetic),
+            |job| jobs.push(job),
+        );
+        assert_eq!(jobs.len(), 3);
+
+        // While loaders are in flight, update installation is blocked and native_voice_work is active.
+        assert!(state.update_installation_gate.installation().is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), state.native_voice_work.wait())
+                .await
+                .is_err()
+        );
+
+        let mut iter = jobs.into_iter();
+        // 1. Wake word finishes: still not voice_input_available.
+        iter.next().unwrap()();
+        assert!(state.wake_word_runtime().is_some());
+        assert!(super::ensure_voice_input_ready(&state).is_err());
+        assert!(state.update_installation_gate.installation().is_err());
+
+        // 2. Parakeet finishes: still not voice_input_available until VAD finishes.
+        iter.next().unwrap()();
+        assert!(state.parakeet_runtime().is_some());
+        assert!(super::ensure_voice_input_ready(&state).is_err());
+        assert!(state.update_installation_gate.installation().is_err());
+
+        // 3. VAD finishes: all 3 slots and capabilities are Available -> voice_input_available = true.
+        iter.next().unwrap()();
+        assert!(state.voice_activity_runtime().is_some());
+        assert_eq!(super::ensure_voice_input_ready(&state), Ok(()));
+        tokio::time::timeout(Duration::from_secs(1), state.native_voice_work.wait())
+            .await
+            .unwrap();
+        assert!(state.update_installation_gate.installation().is_ok());
+
+        let startup = state.startup_state.lock().unwrap().clone();
+        let StartupStatePayload::Ready {
+            voice_input_available,
+            voice_input_error,
+            capabilities,
+            ..
+        } = startup
+        else {
+            panic!("expected ready startup state")
+        };
+        assert!(voice_input_available);
+        assert_eq!(voice_input_error, None);
+        for id in ["wake_word", "parakeet", "vad"] {
+            let cap = capabilities.iter().find(|c| c.id == id).unwrap();
+            assert_eq!(cap.state, CapabilityStatePayload::Available);
+            assert_eq!(cap.reason, "ready");
+            assert_eq!(cap.actual_provider, Some("cpu"));
+        }
+    }
+
+    #[test]
+    fn microphone_admission_rejects_partial_or_failed_voice_initialization() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = configured_voice_test_state(temp_dir.path());
+        assert_eq!(
+            super::ensure_voice_input_ready(&state),
+            Err(String::from(
+                "wake word runtime is loading; Parakeet runtime is loading; VAD runtime is loading"
+            ))
+        );
+
+        let mut jobs = Vec::new();
+        super::start_voice_runtime_initialization_with(
+            &state,
+            |_, _| Ok(WakeWordRuntime::new_failing_for_test()),
+            |_| Err(String::from("synthetic parakeet init error")),
+            |_| Ok(super::VoiceActivityRuntimeSlotValue::Synthetic),
+            |job| jobs.push(job),
+        );
+        for job in jobs {
+            job();
+        }
+        assert_eq!(
+            super::ensure_voice_input_ready(&state),
+            Err(String::from("Parakeet runtime failed to initialize"))
+        );
+        let startup = state.startup_state.lock().unwrap().clone();
+        let StartupStatePayload::Ready {
+            voice_input_available,
+            capabilities,
+            ..
+        } = startup
+        else {
+            panic!("expected ready startup state")
+        };
+        assert!(!voice_input_available);
+        let parakeet_cap = capabilities.iter().find(|c| c.id == "parakeet").unwrap();
+        assert_eq!(parakeet_cap.state, CapabilityStatePayload::Failed);
+        assert_eq!(parakeet_cap.actual_provider, None);
+    }
+
+    #[test]
+    fn llama_startup_and_profile_switch_transitions_preserve_settled_voice_readiness() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = configured_voice_test_state(temp_dir.path());
+        *state.startup_state.lock().unwrap() = StartupStatePayload::WarmingModel {
+            cue_asset_paths: super::embedded_cue_asset_paths(),
+            runtime_phase: RuntimePhasePayload::Initializing,
+            voice_input_available: false,
+            voice_input_error: Some(String::from("warming")),
+            initial_silence_timeout_ms: DEFAULT_INITIAL_SILENCE_TIMEOUT_MS,
+            silence_timeout_ms: DEFAULT_SILENCE_TIMEOUT_MS,
+            message: String::from("Loading local Gemma model..."),
+            selected_response_profile: ResponseProfilePayload::Fast,
+            supported_response_profiles: vec![
+                ResponseProfilePayload::Fast,
+                ResponseProfilePayload::Quality,
+            ],
+            prompt_cancellation_available: false,
+            tts_enabled: false,
+            tts_output_gain_db: 3.0,
+            capabilities: super::configured_capabilities(state.runtime_config.as_ref().unwrap()),
+        };
+
+        // Snapshot taken BEFORE voice initialization settles.
+        let older_snapshot = super::startup_snapshot_for_profile_switch(
+            &state.startup_state,
+            ResponseProfilePayload::Quality,
+            vec![
+                ResponseProfilePayload::Fast,
+                ResponseProfilePayload::Quality,
+            ],
+        )
+        .unwrap();
+        let older_warming = super::startup_warming_state_from_snapshot(
+            &older_snapshot,
+            ResponseProfilePayload::Quality,
+        );
+
+        // Voice initialization settles while local model is still warming.
+        let mut jobs = Vec::new();
+        super::start_voice_runtime_initialization_with(
+            &state,
+            |_, _| Ok(WakeWordRuntime::new_failing_for_test()),
+            |_| {
+                Ok(super::ParakeetRuntimeSlotValue::Synthetic(Ok(
+                    String::from("synthetic"),
+                )))
+            },
+            |_| Ok(super::VoiceActivityRuntimeSlotValue::Synthetic),
+            |job| jobs.push(job),
+        );
+        for job in jobs {
+            job();
+        }
+
+        // Initial llama.cpp startup finishes and must preserve settled voice readiness.
+        super::publish_initial_llama_startup_result(
+            &state.startup_state,
+            &state.wake_word_runtime,
+            &state.parakeet_runtime,
+            &state.voice_activity_runtime,
+            ResponseProfilePayload::Fast,
+            vec![
+                ResponseProfilePayload::Fast,
+                ResponseProfilePayload::Quality,
+            ],
+            Ok("cpu"),
+        );
+        assert_eq!(super::ensure_voice_input_ready(&state), Ok(()));
+
+        // Starting a profile switch with the older pre-settlement snapshot must also preserve settled voice state.
+        super::begin_response_profile_switch_transition(
+            &state.lifecycle_gate,
+            &state.exit_cleanup_started,
+            &state.conversation_session,
+            &state.voice_pipeline_state,
+            &state.startup_state,
+            older_warming,
+        )
+        .unwrap();
+        {
+            let startup = state.startup_state.lock().unwrap();
+            let StartupStatePayload::WarmingModel {
+                voice_input_available,
+                voice_input_error,
+                capabilities,
+                ..
+            } = &*startup
+            else {
+                panic!("expected warming model state")
+            };
+            assert!(*voice_input_available);
+            assert_eq!(*voice_input_error, None);
+            for id in ["wake_word", "parakeet", "vad"] {
+                let cap = capabilities.iter().find(|c| c.id == id).unwrap();
+                assert_eq!(cap.state, CapabilityStatePayload::Available);
+                assert_eq!(cap.actual_provider, Some("cpu"));
+            }
+        }
+
+        // Completing the profile switch with older_snapshot also preserves settled voice readiness.
+        let stale_ready = super::startup_ready_state_from_snapshot(
+            &older_snapshot,
+            ResponseProfilePayload::Quality,
+        );
+        super::merge_profile_startup_publication(
+            &mut state.startup_state.lock().unwrap(),
+            stale_ready,
+        );
+        assert_eq!(super::ensure_voice_input_ready(&state), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn shutdown_prevents_in_flight_voice_loader_publication_and_waits_for_physical_drain() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(configured_voice_test_state(temp_dir.path()));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut jobs = Vec::new();
+        super::start_voice_runtime_initialization_with(
+            &state,
+            move |_, _| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(WakeWordRuntime::new_failing_for_test())
+            },
+            |_| {
+                Ok(super::ParakeetRuntimeSlotValue::Synthetic(Ok(
+                    String::from("synthetic"),
+                )))
+            },
+            |_| Ok(super::VoiceActivityRuntimeSlotValue::Synthetic),
+            |job| jobs.push(job),
+        );
+        let mut iter = jobs.into_iter();
+        let wake_job = iter.next().unwrap();
+        for job in iter {
+            job();
+        }
+
+        let worker = std::thread::spawn(wake_job);
+        tokio::time::timeout(Duration::from_secs(3), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let shutdown_state = Arc::clone(&state);
+        let mut shutdown_task =
+            tokio::spawn(async move { super::shutdown_runtime(&shutdown_state).await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !state.exit_cleanup_started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!shutdown_task.is_finished());
+
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        tokio::time::timeout(Duration::from_secs(3), &mut shutdown_task)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(state.wake_word_runtime().is_none());
+        assert!(state.parakeet_runtime().is_none());
+        assert!(state.voice_activity_runtime().is_none());
+        let startup = state.startup_state.lock().unwrap();
+        let StartupStatePayload::Ready { capabilities, .. } = &*startup else {
+            panic!("expected ready state")
+        };
+        assert_eq!(
+            capabilities
+                .iter()
+                .find(|c| c.id == "wake_word")
+                .unwrap()
+                .state,
+            CapabilityStatePayload::Warming
         );
     }
 }
