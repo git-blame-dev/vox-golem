@@ -148,6 +148,7 @@ struct AppState {
     llama_cpp_runtime: Arc<Mutex<Option<voxgolem_platform::llama_cpp::LlamaCppRuntime>>>,
     llama_cpp_system_prompt: Option<String>,
     opencode_server: Arc<Mutex<Option<voxgolem_platform::opencode::OpencodeServer>>>,
+    opencode_startup: Arc<OpencodeStartup>,
     prefetch_generation: Arc<AtomicU64>,
     prefetch_cache: Arc<Mutex<Option<PrefetchEntry>>>,
     prefetch_task: Arc<Mutex<Option<ActivePrefetch>>>,
@@ -639,6 +640,247 @@ struct PromptCleanupTracker {
 
 struct PromptCleanupPermit {
     tracker: Arc<PromptCleanupTracker>,
+}
+
+#[derive(Default)]
+struct OpencodeStartup {
+    ticket: Mutex<Option<Arc<OpencodeStartupTicket>>>,
+    task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    persistence: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    physical: Arc<PromptCleanupTracker>,
+}
+
+struct OpencodeStartupTicket {
+    // Fallback permission only. User model/prefetch choices do not change this
+    // ticket's immutable server launch configuration or its lifecycle authority.
+    initial_policy_generation: u64,
+    cancelled: tokio::sync::watch::Sender<bool>,
+}
+
+struct OpencodeStartupGuard {
+    owner: Arc<OpencodeStartup>,
+    ticket: Arc<OpencodeStartupTicket>,
+    _update: UpdateOperationLease,
+    _physical: PromptCleanupPermit,
+}
+
+impl Drop for OpencodeStartupGuard {
+    fn drop(&mut self) {
+        let mut ticket = self
+            .owner
+            .ticket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if ticket
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &self.ticket))
+        {
+            *ticket = None;
+        }
+    }
+}
+
+impl OpencodeStartup {
+    fn cancel(&self) {
+        let ticket = self
+            .ticket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(ticket) = &ticket {
+            ticket.cancelled.send_replace(true);
+        }
+    }
+    async fn wait(&self, timeout: Duration) -> bool {
+        // The retained task is not an acknowledgement of physical completion.
+        // Both its scope and independently queued blocking work own permits.
+        tokio::time::timeout(timeout, self.physical.wait())
+            .await
+            .is_ok()
+    }
+}
+
+#[derive(Clone)]
+struct OpencodeStartupAuthority {
+    owner: Arc<OpencodeStartup>,
+    lifecycle: Arc<Mutex<()>>,
+    exit: Arc<AtomicBool>,
+    update: Arc<UpdateActivity>,
+}
+
+impl OpencodeStartupAuthority {
+    fn owns(&self, ticket: &Arc<OpencodeStartupTicket>) -> bool {
+        self.owner
+            .ticket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, ticket))
+    }
+    fn lifecycle_current(&self, ticket: &Arc<OpencodeStartupTicket>) -> bool {
+        // End the watch read before taking ticket authority. Cancellation also
+        // releases ticket authority before notifying the watch sender.
+        let cancelled = *ticket.cancelled.borrow();
+        !self.exit.load(Ordering::SeqCst) && !cancelled && self.owns(ticket)
+    }
+}
+
+/// OpenCode's single startup path. Callback seams keep native server creation
+/// out of ownership tests; they do not define another readiness/policy owner.
+fn queue_opencode_startup<C, S, D, Start, Started, Finish, Retire, Retiring>(
+    app_state: &AppState,
+    discover: D,
+    start: Start,
+    finish: Finish,
+    retire: Retire,
+) -> Result<(), String>
+where
+    C: Send + 'static,
+    S: Send + 'static,
+    D: FnOnce() -> Result<C, String> + Send + 'static,
+    Start: FnOnce(C) -> Started + Send + 'static,
+    Started: std::future::Future<Output = Result<S, String>> + Send + 'static,
+    Finish: FnOnce(Result<S, String>, u64) -> Option<S> + Send + 'static,
+    Retire: FnOnce(S) -> Retiring + Send + 'static,
+    Retiring: std::future::Future<Output = ()> + Send + 'static,
+{
+    #[cfg(test)]
+    let discover = {
+        let context = test_storage::current();
+        move || context.run(discover)
+    };
+    #[cfg(test)]
+    let finish = {
+        let context = test_storage::current();
+        move |result, initial_policy_generation| {
+            context.run(|| finish(result, initial_policy_generation))
+        }
+    };
+    let _lifecycle = app_state
+        .lifecycle_gate
+        .lock()
+        .map_err(|_| "startup authority unavailable")?;
+    ensure_app_running(&app_state.exit_cleanup_started)?;
+    let owner = Arc::clone(&app_state.opencode_startup);
+    let mut slot = owner
+        .ticket
+        .lock()
+        .map_err(|_| "OpenCode startup unavailable")?;
+    if slot.is_some()
+        || owner.physical.has_pending()
+        || owner
+            .task
+            .lock()
+            .map_err(|_| "OpenCode startup unavailable")?
+            .as_ref()
+            .is_some_and(|task| !task.inner().is_finished())
+    {
+        return Err("OpenCode startup is already owned".into());
+    }
+    let ticket = Arc::new(OpencodeStartupTicket {
+        initial_policy_generation: app_state
+            .assistant_settings_generation
+            .load(Ordering::SeqCst),
+        cancelled: tokio::sync::watch::channel(false).0,
+    });
+    let guard = OpencodeStartupGuard {
+        owner: Arc::clone(&owner),
+        ticket: Arc::clone(&ticket),
+        _update: begin_update_sensitive_operation(&app_state.update_installation_gate)?,
+        _physical: owner.physical.register(),
+    };
+    *slot = Some(Arc::clone(&ticket));
+    drop(slot);
+    project_opencode_startup(
+        app_state,
+        CapabilityStatePayload::Warming,
+        "OpenCode startup is pending",
+    );
+    let authority = OpencodeStartupAuthority {
+        owner: Arc::clone(&owner),
+        lifecycle: Arc::clone(&app_state.lifecycle_gate),
+        exit: Arc::clone(&app_state.exit_cleanup_started),
+        update: Arc::clone(&app_state.update_installation_gate),
+    };
+    let task = tauri::async_runtime::spawn(async move {
+        let _guard = guard;
+        let mut cancelled = ticket.cancelled.subscribe();
+        // Moving independent permits INTO the blocking closure is essential:
+        // dropping the async waiter cannot retire real WSL discovery early.
+        let physical = authority.owner.physical.register();
+        let update = match begin_update_sensitive_operation(&authority.update) {
+            Ok(update) => update,
+            Err(_) => return,
+        };
+        let blocking_authority = authority.clone();
+        let blocking_ticket = Arc::clone(&ticket);
+        let discovered = spawn_runtime_blocking(move || {
+            let _physical = physical;
+            let _update = update;
+            if !blocking_authority.lifecycle_current(&blocking_ticket) {
+                return Err("OpenCode startup cancelled".into());
+            }
+            discover()
+        })
+        .await
+        .unwrap_or_else(|_| Err("OpenCode discovery worker failed".into()));
+        let result = match discovered {
+            Ok(config) if authority.lifecycle_current(&ticket) => {
+                tokio::select! {
+                    biased;
+                    _ = async {
+                        loop {
+                            if *cancelled.borrow_and_update() { break; }
+                            if cancelled.changed().await.is_err() { break; }
+                        }
+                    } => return,
+                    result = start(config) => result,
+                }
+            }
+            Ok(_) => Err("OpenCode startup superseded".into()),
+            Err(error) => Err(error),
+        };
+        let physical = authority.owner.physical.register();
+        let update = match begin_update_sensitive_operation(&authority.update) {
+            Ok(update) => update,
+            Err(_) => return,
+        };
+        let finish_ticket = Arc::clone(&ticket);
+        let finish_authority = authority.clone();
+        let retired = spawn_runtime_blocking(move || {
+            let _physical = physical;
+            let _update = update;
+            let Ok(_lifecycle) = finish_authority.lifecycle.lock() else {
+                return result.ok();
+            };
+            let cancelled = *finish_ticket.cancelled.borrow();
+            if finish_authority.exit.load(Ordering::SeqCst)
+                || cancelled
+                || !finish_authority.owns(&finish_ticket)
+            {
+                return result.ok();
+            }
+            finish(result, finish_ticket.initial_policy_generation)
+        })
+        .await;
+        if let Ok(Some(server)) = retired {
+            retire(server).await;
+        }
+        let persistence = authority
+            .owner
+            .persistence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(persistence) = persistence {
+            let _ = persistence.await;
+        }
+    });
+    *owner
+        .task
+        .lock()
+        .map_err(|_| "OpenCode startup receipt unavailable")? = Some(task);
+    Ok(())
 }
 
 impl PromptCleanupTracker {
@@ -4085,7 +4327,7 @@ fn begin_response_profile_switch_transition(
     conversation_session: &Mutex<voxgolem_core::conversation::ConversationSession>,
     voice_pipeline_state: &Mutex<voxgolem_core::voice_pipeline::VoicePipelineState>,
     startup_state: &Mutex<StartupStatePayload>,
-    warming_state: StartupStatePayload,
+    mut warming_state: StartupStatePayload,
 ) -> Result<(), String> {
     let _lifecycle = lifecycle_gate
         .lock()
@@ -4101,9 +4343,32 @@ fn begin_response_profile_switch_transition(
             "response profile cannot change while a prompt is active",
         ));
     }
-    *startup_state
+    let mut startup = startup_state
         .lock()
-        .map_err(|_| String::from("startup state lock is poisoned"))? = warming_state;
+        .map_err(|_| String::from("startup state lock is poisoned"))?;
+    // A profile snapshot can precede asynchronous OpenCode settlement. This
+    // transition owns local-model warming, not those independently published caps.
+    let live = match &*startup {
+        StartupStatePayload::Ready { capabilities, .. }
+        | StartupStatePayload::WarmingModel { capabilities, .. } => Some(capabilities),
+        StartupStatePayload::Error { .. } => None,
+    };
+    let pending = match &mut warming_state {
+        StartupStatePayload::Ready { capabilities, .. }
+        | StartupStatePayload::WarmingModel { capabilities, .. } => Some(capabilities),
+        StartupStatePayload::Error { .. } => None,
+    };
+    if let (Some(live), Some(pending)) = (live, pending) {
+        for capability in live
+            .iter()
+            .filter(|capability| matches!(capability.id, "opencode" | "deep" | "review"))
+        {
+            if let Some(target) = pending.iter_mut().find(|target| target.id == capability.id) {
+                target.clone_from(capability);
+            }
+        }
+    }
+    *startup = warming_state;
     Ok(())
 }
 
@@ -11525,10 +11790,43 @@ fn apply_opencode_startup_failure(
     settings
 }
 
+#[cfg(test)]
 fn fail_opencode_startup(app_state: &AppState, reason: String) {
     let Ok(_lifecycle) = app_state.lifecycle_gate.lock() else {
         return;
     };
+    fail_opencode_startup_locked(
+        app_state,
+        reason,
+        app_state
+            .assistant_settings_generation
+            .load(Ordering::SeqCst),
+    );
+}
+
+// The startup publisher holds lifecycle authority, including its ticket check.
+fn fail_opencode_startup_locked(
+    app_state: &AppState,
+    reason: String,
+    initial_policy_generation: u64,
+) {
+    // A user preference/profile publication owns this same operation lock.
+    // Never wait behind it or reconcile against its not-yet-published policy.
+    let Ok(settings_operation) = Arc::clone(&app_state.settings_operation_lock).try_lock_owned()
+    else {
+        project_opencode_startup(app_state, CapabilityStatePayload::Failed, &reason);
+        return;
+    };
+    // Launch configuration is immutable, but fallback changes user policy.
+    // Only the unchanged initial policy may be reconciled automatically.
+    if app_state
+        .assistant_settings_generation
+        .load(Ordering::SeqCst)
+        != initial_policy_generation
+    {
+        project_opencode_startup(app_state, CapabilityStatePayload::Failed, &reason);
+        return;
+    }
     let settings = match app_state.conversation_session.lock() {
         Ok(coordinator) => AssistantSettingsPayload::from(coordinator.policy()),
         Err(_) => {
@@ -11547,6 +11845,26 @@ fn fail_opencode_startup(app_state: &AppState, reason: String) {
             return;
         }
     };
+    let occupied = app_state.reset_in_progress.load(Ordering::SeqCst)
+        || app_state
+            .settings_publication_in_progress
+            .load(Ordering::SeqCst)
+        || app_state
+            .conversation_session
+            .lock()
+            .map(|session| session.has_active_execution())
+            .unwrap_or(true)
+        || app_state
+            .preparing_prompt
+            .lock()
+            .map(|preparing| preparing.is_some())
+            .unwrap_or(true)
+        || app_state.native_voice_work.has_pending()
+        || ensure_response_profile_switch_runtime_is_idle(&app_state.voice_pipeline_state).is_err();
+    if occupied {
+        project_opencode_startup(app_state, CapabilityStatePayload::Failed, &reason);
+        return;
+    }
     let reconciled = match app_state.startup_state.lock() {
         Ok(mut startup) => {
             let capabilities = match &mut *startup {
@@ -11554,25 +11872,130 @@ fn fail_opencode_startup(app_state: &AppState, reason: String) {
                 | StartupStatePayload::Ready { capabilities, .. } => capabilities,
                 StartupStatePayload::Error { .. } => return,
             };
-            apply_opencode_startup_failure(capabilities, settings, reason)
+            apply_opencode_startup_failure(capabilities, settings, reason.clone())
         }
         Err(_) => return,
     };
-    if reconciled == settings {
-        return;
-    }
-    match app_state.conversation_session.lock() {
-        Ok(mut coordinator) => {
-            if coordinator.replace_policy(reconciled.into()).is_ok() {
+    let changed = reconciled != settings
+        && app_state
+            .conversation_session
+            .lock()
+            .map(|mut coordinator| {
                 app_state
                     .assistant_settings_generation
-                    .fetch_add(1, Ordering::SeqCst);
-                if let Err(error) = persist_assistant_settings(reconciled) {
-                    eprintln!("failed to persist reconciled assistant settings: {error}");
-                }
-            }
+                    .load(Ordering::SeqCst)
+                    == initial_policy_generation
+                    && coordinator.replace_policy(reconciled.into()).is_ok()
+            })
+            .unwrap_or(false);
+    if changed {
+        app_state
+            .assistant_settings_generation
+            .fetch_add(1, Ordering::SeqCst);
+        queue_opencode_fallback_persistence(app_state, reconciled, settings_operation);
+    }
+    project_opencode_startup(app_state, CapabilityStatePayload::Failed, &reason);
+}
+
+fn queue_opencode_fallback_persistence(
+    app_state: &AppState,
+    settings: AssistantSettingsPayload,
+    settings_operation: tokio::sync::OwnedMutexGuard<()>,
+) {
+    let Ok(update) = begin_update_sensitive_operation(&app_state.update_installation_gate) else {
+        eprintln!("OpenCode fallback persistence unavailable");
+        return;
+    };
+    let physical = app_state.opencode_startup.physical.register();
+    let task = spawn_runtime_blocking(move || {
+        // No lifecycle/session lock spans filesystem I/O. Keep the existing
+        // settings operation serialized and the actual I/O independently owned.
+        let _physical = physical;
+        let _update = update;
+        let _settings_operation = settings_operation;
+        if let Err(error) = persist_assistant_settings(settings) {
+            eprintln!("failed to persist reconciled assistant settings: {error}");
         }
-        Err(_) => eprintln!("failed to reconcile assistant settings after OpenCode startup"),
+    });
+    *app_state
+        .opencode_startup
+        .persistence
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task);
+}
+
+fn project_opencode_readiness(
+    startup: &mut StartupStatePayload,
+    state: CapabilityStatePayload,
+    reason: &str,
+) {
+    let capabilities = match startup {
+        StartupStatePayload::Ready { capabilities, .. }
+        | StartupStatePayload::WarmingModel { capabilities, .. } => capabilities,
+        StartupStatePayload::Error { .. } => return,
+    };
+    mark_capability(capabilities, "opencode", state, reason.into());
+    let custom_ready = capability_available(capabilities, "custom_provider");
+    // These are aggregate generation capabilities, as in configured_capabilities:
+    // Custom OR OpenCode. Selected-model admission checks its provider separately.
+    for id in ["deep", "review"] {
+        mark_capability(
+            capabilities,
+            id,
+            if custom_ready {
+                CapabilityStatePayload::Available
+            } else {
+                state
+            },
+            if custom_ready { "ready" } else { reason }.into(),
+        );
+    }
+}
+
+fn project_opencode_startup(app_state: &AppState, state: CapabilityStatePayload, reason: &str) {
+    let Ok(mut startup) = app_state.startup_state.lock() else {
+        return;
+    };
+    project_opencode_readiness(&mut startup, state, reason);
+}
+
+fn finish_opencode_startup(
+    app_state: &AppState,
+    result: Result<voxgolem_platform::opencode::OpencodeServer, String>,
+    initial_policy_generation: u64,
+) -> Option<voxgolem_platform::opencode::OpencodeServer> {
+    finish_opencode_startup_result(app_state, result, initial_policy_generation, |server| {
+        let Ok(mut slot) = app_state.opencode_server.lock() else {
+            return Some(server);
+        };
+        if slot.is_some() {
+            return Some(server);
+        }
+        *slot = Some(server);
+        None
+    })
+}
+
+fn finish_opencode_startup_result<S>(
+    app_state: &AppState,
+    result: Result<S, String>,
+    initial_policy_generation: u64,
+    publish: impl FnOnce(S) -> Option<S>,
+) -> Option<S> {
+    // The caller already holds lifecycle authority and has checked ticket,
+    // exit and cancellation. Policy generation is relevant ONLY on failure.
+    match result {
+        Ok(server) => {
+            if let Some(server) = publish(server) {
+                return Some(server);
+            }
+            project_opencode_startup(app_state, CapabilityStatePayload::Available, "ready");
+            None
+        }
+        Err(reason) => {
+            fail_opencode_startup_locked(app_state, reason, initial_policy_generation);
+            None
+        }
     }
 }
 
@@ -11664,7 +12087,9 @@ fn configured_capabilities(
                     .opencode
                     .as_ref()
                     .is_some_and(|opencode| match opencode.runtime {
-                        voxgolem_core::config::OpencodeRuntime::Native => opencode.path.is_file(),
+                        voxgolem_core::config::OpencodeRuntime::Native => {
+                            !opencode.path.as_os_str().is_empty()
+                        }
                         voxgolem_core::config::OpencodeRuntime::Wsl => cfg!(windows),
                     });
             let custom_configured = config
@@ -12017,6 +12442,21 @@ fn initialize_app_state(init: AppStateInit) -> AppState {
             .is_none_or(|config| config.web_enabled),
         &persisted,
     );
+    if init
+        .runtime_config
+        .as_ref()
+        .is_some_and(|config| config.opencode.is_some())
+    {
+        let mut startup = init
+            .startup_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        project_opencode_readiness(
+            &mut startup,
+            CapabilityStatePayload::Warming,
+            "OpenCode startup is pending",
+        );
+    }
     AppState {
         conversation: DesktopConversationRuntime::new(init.lifecycle_gate, init.assistant_policy),
         network_preferences: Arc::new(Mutex::new(network_preferences)),
@@ -12078,6 +12518,7 @@ fn initialize_app_state(init: AppStateInit) -> AppState {
         llama_cpp_runtime: init.llama_cpp_runtime,
         llama_cpp_system_prompt: init.llama_cpp_system_prompt,
         opencode_server: Arc::new(Mutex::new(None)),
+        opencode_startup: Arc::new(OpencodeStartup::default()),
         prefetch_generation: Arc::new(AtomicU64::new(0)),
         prefetch_cache: Arc::new(Mutex::new(None)),
         prefetch_task: Arc::new(Mutex::new(None)),
@@ -12707,6 +13148,7 @@ pub(crate) fn ensure_update_installation_is_idle(app_state: &AppState) -> Result
         || app_state.prompt_cleanup.has_pending()
         || app_state.prefetch_cleanup.has_pending()
         || app_state.native_voice_work.has_pending()
+        || app_state.opencode_startup.physical.has_pending()
         || tts::physical_work_pending()
         || app_state.native_speech_running.load(Ordering::Acquire)
         || (app_state.native_voice.current_capture_id().is_none()
@@ -13479,6 +13921,10 @@ async fn shutdown_runtime(app_state: &AppState) {
             app_state.prefetch_cleanup.wait().await;
             shutdown_llama_startups_for_exit(app_state);
             let process_deadline = Instant::now() + Duration::from_secs(8);
+            let opencode_startup_retired = app_state
+                .opencode_startup
+                .wait(process_deadline.saturating_duration_since(Instant::now()))
+                .await;
             let opencode_server = app_state
                 .opencode_server
                 .lock()
@@ -13522,7 +13968,7 @@ async fn shutdown_runtime(app_state: &AppState) {
             }
             // Optional local diagnostics cannot veto retired essential native
             // resources or updater eligibility. Its own status remains honest.
-            processes_retired
+            opencode_startup_retired && processes_retired
         },
     )
     .await;
@@ -13560,6 +14006,7 @@ fn begin_exit_cleanup(app_state: &AppState) -> bool {
     if app_state.exit_cleanup_started.swap(true, Ordering::SeqCst) {
         return false;
     }
+    app_state.opencode_startup.cancel();
     let _ = app_state.native_voice.request_stop(None);
     desktop_voice_adapter::cancel_voice_cue(app_state);
     cancel_active_tts_generation(app_state);
@@ -13701,31 +14148,43 @@ pub fn run() {
                 .runtime_config
                 .as_ref()
                 .and_then(|config| config.completion.clone());
-            if let Some(config) = app_state.runtime_config.as_ref() {
-                if let Some(opencode) = config.opencode.as_ref() {
-                    let server = opencode_server_config(opencode).and_then(|server_config| {
-                        tauri::async_runtime::block_on(
-                            voxgolem_platform::opencode::OpencodeServer::start(server_config),
+            let opencode_config = app_state
+                .runtime_config
+                .as_ref()
+                .and_then(|config| config.opencode.clone());
+            app.manage(app_state);
+            if let Some(config) = opencode_config {
+                let publisher = app.handle().clone();
+                let queued = queue_opencode_startup(
+                    &app.state::<AppState>(),
+                    move || opencode_server_config(&config),
+                    |config| async move {
+                        voxgolem_platform::opencode::OpencodeServer::start(config)
+                            .await
+                            .map_err(|error| error.to_string())
+                    },
+                    move |result, initial_policy_generation| {
+                        finish_opencode_startup(
+                            &publisher.state::<AppState>(),
+                            result,
+                            initial_policy_generation,
                         )
-                        .map_err(|error| error.to_string())
-                    });
-                    match server {
-                        Ok(server) => {
-                            *app_state
-                                .opencode_server
-                                .lock()
-                                .expect("opencode server lock") = Some(server)
-                        }
-                        Err(error) => {
-                            fail_opencode_startup(
-                                &app_state,
-                                format!("failed to start OpenCode server: {error}"),
-                            );
-                        }
-                    }
+                    },
+                    |server| async move {
+                        let _ = server.shutdown().await;
+                    },
+                );
+                if queued.is_err() {
+                    let state = app.state::<AppState>();
+                    if let Ok(_lifecycle) = state.lifecycle_gate.lock() {
+                        project_opencode_startup(
+                            &state,
+                            CapabilityStatePayload::Failed,
+                            "OpenCode startup unavailable",
+                        );
+                    };
                 }
             }
-            app.manage(app_state);
             if let Some(config) = app.state::<AppState>().runtime_config.as_ref() {
                 if resolve_effective_tts_enabled(
                     config.local_tts.enabled,
@@ -19127,6 +19586,764 @@ mod tests {
             String::from("OpenCode failed"),
         );
         assert_eq!(reconciled.instant, InstantChoicePayload::CustomLunaLow);
+    }
+
+    fn opencode_startup_test_state(settings: AssistantSettingsPayload) -> super::AppState {
+        let state = build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            super::embedded_cue_asset_paths(),
+            "synthetic startup".into(),
+        );
+        *state.conversation_session.lock().unwrap() =
+            voxgolem_core::conversation::ConversationSession::new(settings.into());
+        if let StartupStatePayload::Ready { capabilities, .. } =
+            &mut *state.startup_state.lock().unwrap()
+        {
+            *capabilities = ["custom_provider", "opencode", "deep", "review"]
+                .into_iter()
+                .map(|id| CapabilityPayload {
+                    id,
+                    state: if id == "custom_provider" {
+                        CapabilityStatePayload::Available
+                    } else {
+                        CapabilityStatePayload::Warming
+                    },
+                    reason: "OpenCode startup is pending".into(),
+                    actual_provider: None,
+                })
+                .collect();
+        }
+        state
+    }
+
+    #[test]
+    fn opencode_failure_while_active_preserves_policy_and_settles_warming_dependents() {
+        let settings = AssistantSettingsPayload {
+            instant: InstantChoicePayload::CustomSolHigh,
+            deep: AgentChoicePayload::OpenCodeSolHigh,
+            review: AgentChoicePayload::OpenCodeSolHigh,
+            deep_enabled: false,
+            review_enabled: false,
+            ..Default::default()
+        };
+        let state = opencode_startup_test_state(settings);
+        state
+            .conversation_session
+            .lock()
+            .unwrap()
+            .admit("synthetic-request", "synthetic prompt")
+            .unwrap();
+        super::fail_opencode_startup(&state, "synthetic failure".into());
+        assert_eq!(
+            AssistantSettingsPayload::from(state.conversation_session.lock().unwrap().policy()),
+            settings
+        );
+        assert!(state
+            .conversation_session
+            .lock()
+            .unwrap()
+            .has_active_execution());
+        assert_eq!(
+            state.assistant_settings_generation.load(Ordering::SeqCst),
+            0
+        );
+        let startup = state.startup_state.lock().unwrap();
+        let StartupStatePayload::Ready { capabilities, .. } = &*startup else {
+            panic!("shell stays ready")
+        };
+        for id in ["opencode", "deep", "review"] {
+            assert_eq!(
+                capabilities
+                    .iter()
+                    .find(|capability| capability.id == id)
+                    .unwrap()
+                    .state,
+                if id == "opencode" {
+                    CapabilityStatePayload::Failed
+                } else {
+                    CapabilityStatePayload::Available
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn opencode_failure_idle_fallback_restores_custom_generation_readiness() {
+        let settings = AssistantSettingsPayload {
+            instant: InstantChoicePayload::OpenCodeSolHigh,
+            deep: AgentChoicePayload::OpenCodeSolHigh,
+            review: AgentChoicePayload::OpenCodeSolHigh,
+            ..Default::default()
+        };
+        let state = opencode_startup_test_state(settings);
+        super::fail_opencode_startup(&state, "synthetic failure".into());
+        assert!(state.opencode_startup.wait(Duration::from_secs(3)).await);
+        assert_eq!(
+            AssistantSettingsPayload::from(state.conversation_session.lock().unwrap().policy())
+                .instant
+                .capability_id(),
+            "custom_provider"
+        );
+        let startup = state.startup_state.lock().unwrap();
+        let StartupStatePayload::Ready { capabilities, .. } = &*startup else {
+            panic!("shell stays ready")
+        };
+        for id in ["custom_provider", "deep", "review"] {
+            assert_eq!(
+                capabilities
+                    .iter()
+                    .find(|capability| capability.id == id)
+                    .unwrap()
+                    .state,
+                CapabilityStatePayload::Available
+            );
+        }
+    }
+
+    fn custom_startup_settings() -> AssistantSettingsPayload {
+        AssistantSettingsPayload {
+            instant: InstantChoicePayload::CustomSolHigh,
+            deep: AgentChoicePayload::CustomSolHigh,
+            review: AgentChoicePayload::CustomSolHigh,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn opencode_failure_preserves_policy_during_preparation_or_reset() {
+        for resetting in [false, true] {
+            let initial = AssistantSettingsPayload {
+                instant: InstantChoicePayload::OpenCodeSolHigh,
+                deep: AgentChoicePayload::OpenCodeSolHigh,
+                review: AgentChoicePayload::OpenCodeSolHigh,
+                ..Default::default()
+            };
+            let state = opencode_startup_test_state(initial);
+            let preparation = if resetting {
+                state.reset_in_progress.store(true, Ordering::SeqCst);
+                None
+            } else {
+                Some(
+                    state
+                        .conversation
+                        .reserve_preparation("synthetic-preparing-request")
+                        .unwrap(),
+                )
+            };
+            let persisted = super::load_assistant_settings().unwrap();
+            super::fail_opencode_startup(&state, "synthetic start failure".into());
+            assert_eq!(
+                AssistantSettingsPayload::from(state.conversation_session.lock().unwrap().policy()),
+                initial
+            );
+            assert_eq!(
+                state.assistant_settings_generation.load(Ordering::SeqCst),
+                0
+            );
+            assert_eq!(super::load_assistant_settings().unwrap(), persisted);
+            assert!(!state.opencode_startup.physical.has_pending());
+            drop(preparation);
+        }
+    }
+
+    #[test]
+    fn opencode_warming_only_gates_generation_when_it_is_the_only_ready_provider() {
+        let state = opencode_startup_test_state(custom_startup_settings());
+        {
+            let mut startup = state.startup_state.lock().unwrap();
+            let StartupStatePayload::Ready { capabilities, .. } = &mut *startup else {
+                panic!("ready shell")
+            };
+            super::mark_capability(
+                capabilities,
+                "custom_provider",
+                CapabilityStatePayload::Unavailable,
+                "synthetic unavailable".into(),
+            );
+        }
+        super::project_opencode_startup(
+            &state,
+            CapabilityStatePayload::Warming,
+            "OpenCode startup is pending",
+        );
+        super::ensure_startup_ready_for_prompt(&state.startup_state).unwrap();
+        let startup = state.startup_state.lock().unwrap();
+        let StartupStatePayload::Ready { capabilities, .. } = &*startup else {
+            panic!("ready shell")
+        };
+        for id in ["opencode", "deep", "review"] {
+            assert_eq!(
+                capabilities.iter().find(|cap| cap.id == id).unwrap().state,
+                CapabilityStatePayload::Warming
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_settlement_survives_an_older_profile_warming_snapshot() {
+        for settled in [
+            CapabilityStatePayload::Available,
+            CapabilityStatePayload::Failed,
+        ] {
+            let state = opencode_startup_test_state(custom_startup_settings());
+            let snapshot = super::startup_snapshot_for_profile_switch(
+                &state.startup_state,
+                ResponseProfilePayload::Fast,
+                vec![ResponseProfilePayload::Fast],
+            )
+            .unwrap();
+            let warming =
+                super::startup_warming_state_from_snapshot(&snapshot, ResponseProfilePayload::Fast);
+            super::project_opencode_startup(&state, settled, "synthetic settlement");
+            super::begin_response_profile_switch_transition(
+                &state.lifecycle_gate,
+                &state.exit_cleanup_started,
+                &state.conversation_session,
+                &state.voice_pipeline_state,
+                &state.startup_state,
+                warming,
+            )
+            .unwrap();
+            let startup = state.startup_state.lock().unwrap();
+            let StartupStatePayload::WarmingModel { capabilities, .. } = &*startup else {
+                panic!("local profile is warming")
+            };
+            assert_eq!(
+                capabilities
+                    .iter()
+                    .find(|cap| cap.id == "opencode")
+                    .unwrap()
+                    .state,
+                settled
+            );
+            for id in ["deep", "review"] {
+                assert_eq!(
+                    capabilities.iter().find(|cap| cap.id == id).unwrap().state,
+                    CapabilityStatePayload::Available
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn opencode_failure_does_not_reconcile_over_a_user_settings_operation() {
+        let settings = AssistantSettingsPayload {
+            instant: InstantChoicePayload::OpenCodeSolHigh,
+            deep: AgentChoicePayload::OpenCodeSolHigh,
+            review: AgentChoicePayload::OpenCodeSolHigh,
+            ..Default::default()
+        };
+        let state = opencode_startup_test_state(settings);
+        let _operation = Arc::clone(&state.settings_operation_lock)
+            .try_lock_owned()
+            .unwrap();
+        super::fail_opencode_startup(&state, "synthetic failure".into());
+        assert_eq!(
+            AssistantSettingsPayload::from(state.conversation_session.lock().unwrap().policy()),
+            settings
+        );
+        assert_eq!(
+            state.assistant_settings_generation.load(Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[test]
+    fn opencode_startup_rejected_before_queue_leaves_no_physical_obligation() {
+        for exiting in [false, true] {
+            let state = opencode_startup_test_state(custom_startup_settings());
+            state.exit_cleanup_started.store(exiting, Ordering::SeqCst);
+            let installation =
+                (!exiting).then(|| state.update_installation_gate.installation().unwrap());
+            assert!(super::queue_opencode_startup(
+                &state,
+                || panic!("rejected work must never discover"),
+                |_: ()| async { Ok::<_, String>(7_u8) },
+                |_, _| panic!("rejected work must never publish"),
+                |_| async {},
+            )
+            .is_err());
+            assert!(!state.opencode_startup.physical.has_pending());
+            assert!(state.opencode_startup.ticket.lock().unwrap().is_none());
+            assert!(state.opencode_startup.task.lock().unwrap().is_none());
+            drop(installation);
+            assert!(state.update_installation_gate.installation().is_ok());
+        }
+    }
+
+    #[test]
+    fn stale_opencode_startup_guard_cannot_unregister_a_successor() {
+        let owner = Arc::new(super::OpencodeStartup::default());
+        let update = Arc::new(super::UpdateActivity::default());
+        let ticket = || {
+            Arc::new(super::OpencodeStartupTicket {
+                initial_policy_generation: 0,
+                cancelled: tokio::sync::watch::channel(false).0,
+            })
+        };
+        let old = ticket();
+        let new = ticket();
+        let guard = |ticket| super::OpencodeStartupGuard {
+            owner: Arc::clone(&owner),
+            ticket,
+            _update: update.operation().unwrap(),
+            _physical: owner.physical.register(),
+        };
+        let old_guard = guard(Arc::clone(&old));
+        let new_guard = guard(Arc::clone(&new));
+        *owner.ticket.lock().unwrap() = Some(Arc::clone(&new));
+        drop(old_guard);
+        assert!(Arc::ptr_eq(
+            owner.ticket.lock().unwrap().as_ref().unwrap(),
+            &new
+        ));
+        assert!(owner.physical.has_pending());
+        assert!(update.installation().is_err());
+        drop(new_guard);
+        assert!(owner.ticket.lock().unwrap().is_none());
+        assert!(!owner.physical.has_pending());
+        assert!(update.installation().is_ok());
+    }
+
+    #[tokio::test]
+    async fn opencode_background_discovery_does_not_hold_setup_or_custom_readiness() {
+        let state = Arc::new(opencode_startup_test_state(custom_startup_settings()));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let publisher = Arc::clone(&state);
+        let published = Arc::new(AtomicBool::new(false));
+        let publication = Arc::clone(&published);
+        let caller = std::thread::current().id();
+        super::queue_opencode_startup(
+            &state,
+            move || {
+                entered_tx.send(std::thread::current().id()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            },
+            |_| async { Ok::<_, String>(7_u8) },
+            move |result, initial_policy_generation| {
+                assert_eq!(initial_policy_generation, 0);
+                assert_eq!(result.unwrap(), 7);
+                publication.store(true, Ordering::SeqCst);
+                super::project_opencode_startup(
+                    &publisher,
+                    CapabilityStatePayload::Available,
+                    "ready",
+                );
+                None
+            },
+            |_| async { panic!("accepted synthetic server must not retire") },
+        )
+        .unwrap();
+        let worker = tokio::time::timeout(Duration::from_secs(3), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(worker, caller);
+        assert!(!published.load(Ordering::SeqCst));
+        assert!(!state.opencode_startup.wait(Duration::ZERO).await);
+        assert!(state.update_installation_gate.installation().is_err());
+        super::ensure_startup_ready_for_prompt(&state.startup_state).unwrap();
+        {
+            let startup = state.startup_state.lock().unwrap();
+            let StartupStatePayload::Ready { capabilities, .. } = &*startup else {
+                panic!("optional warming is not a global barrier")
+            };
+            assert_eq!(
+                capabilities
+                    .iter()
+                    .find(|cap| cap.id == "opencode")
+                    .unwrap()
+                    .state,
+                CapabilityStatePayload::Warming
+            );
+            assert_eq!(
+                capabilities
+                    .iter()
+                    .find(|cap| cap.id == "custom_provider")
+                    .unwrap()
+                    .state,
+                CapabilityStatePayload::Available
+            );
+        }
+        release_tx.send(()).unwrap();
+        assert!(state.opencode_startup.wait(Duration::from_secs(3)).await);
+        assert!(published.load(Ordering::SeqCst));
+        assert!(state.update_installation_gate.installation().is_ok());
+    }
+
+    #[tokio::test]
+    async fn opencode_cancelled_waiter_keeps_blocking_discovery_and_update_lease_owned() {
+        let state = opencode_startup_test_state(custom_startup_settings());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        super::queue_opencode_startup(
+            &state,
+            move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            },
+            |_| async { Ok::<_, String>(7_u8) },
+            |_, _| panic!("abandoned startup must not publish"),
+            |_| async {},
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let task = state.opencode_startup.task.lock().unwrap().take().unwrap();
+        task.abort();
+        assert!(task.await.is_err());
+        assert!(!state.opencode_startup.wait(Duration::ZERO).await);
+        assert!(state.update_installation_gate.installation().is_err());
+        assert!(super::queue_opencode_startup(
+            &state,
+            || Ok(()),
+            |_| async { Ok::<_, String>(7_u8) },
+            |_, _| None,
+            |_| async {}
+        )
+        .is_err());
+        release_tx.send(()).unwrap();
+        assert!(state.opencode_startup.wait(Duration::from_secs(3)).await);
+        assert!(state.update_installation_gate.installation().is_ok());
+    }
+
+    #[tokio::test]
+    async fn opencode_late_success_after_exit_is_retired_before_physical_acknowledgement() {
+        let state = Arc::new(opencode_startup_test_state(custom_startup_settings()));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (retiring_tx, retiring_rx) = tokio::sync::oneshot::channel();
+        let (retired_tx, retired_rx) = tokio::sync::oneshot::channel();
+        let published = Arc::new(AtomicBool::new(false));
+        let publication = Arc::clone(&published);
+        super::queue_opencode_startup(
+            &state,
+            || Ok(()),
+            move |_| async move {
+                // Models a synchronous native start returning in the same poll
+                // after exit was requested; cancellation cannot preempt it.
+                started_tx.send(()).unwrap();
+                ready_rx.recv().unwrap();
+                Ok::<_, String>(7_u8)
+            },
+            move |_, _initial_policy_generation| {
+                publication.store(true, Ordering::SeqCst);
+                panic!("exited startup must never publish");
+            },
+            move |server| async move {
+                assert_eq!(server, 7);
+                retiring_tx.send(()).unwrap();
+                retired_rx.await.unwrap();
+            },
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        super::begin_exit_cleanup(&state);
+        assert!(!state.opencode_startup.wait(Duration::ZERO).await);
+        run_serialized_shutdown(
+            &state.shutdown_lock,
+            &state.exit_cleanup_started,
+            &state.shutdown_complete,
+            || async { state.opencode_startup.wait(Duration::ZERO).await },
+        )
+        .await;
+        assert!(
+            !state.shutdown_complete.load(Ordering::Acquire),
+            "queued/running startup cannot authorize an updater"
+        );
+        ready_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), retiring_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!published.load(Ordering::SeqCst));
+        assert!(!state.opencode_startup.wait(Duration::ZERO).await);
+        assert!(state.update_installation_gate.installation().is_err());
+        retired_tx.send(()).unwrap();
+        assert!(state.opencode_startup.wait(Duration::from_secs(3)).await);
+        assert!(state.update_installation_gate.installation().is_ok());
+        run_serialized_shutdown(
+            &state.shutdown_lock,
+            &state.exit_cleanup_started,
+            &state.shutdown_complete,
+            || async { state.opencode_startup.wait(Duration::ZERO).await },
+        )
+        .await;
+        assert!(state.shutdown_complete.load(Ordering::Acquire));
+    }
+
+    async fn write_opencode_test_settings(
+        state: &super::AppState,
+        settings: AssistantSettingsPayload,
+    ) -> AssistantSettingsPayload {
+        super::set_assistant_settings_from_state(
+            super::AssistantSettingsCommandPayload {
+                settings,
+                web_enabled: None,
+                speech_network_fallback: None,
+                fast_mode: None,
+                speech_language: None,
+                speech_tts_provider: None,
+                speech_tts_voice: None,
+            },
+            state,
+        )
+        .await
+        .expect("real preference writer accepts synthetic settings")
+        .settings
+    }
+
+    async fn assert_policy_write_preserves_opencode_startup(hold_discovery: bool) {
+        let state = Arc::new(opencode_startup_test_state(custom_startup_settings()));
+        let (discover_tx, discover_rx) = tokio::sync::oneshot::channel();
+        let (discovery_ready_tx, discovery_ready_rx) = std::sync::mpsc::channel();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let published = Arc::new(Mutex::new(None));
+        let publication = Arc::clone(&published);
+        let publisher = Arc::clone(&state);
+        let retired = Arc::new(AtomicBool::new(false));
+        let retirement = Arc::clone(&retired);
+        super::queue_opencode_startup(
+            &state,
+            move || {
+                let _ = discover_tx.send(());
+                if hold_discovery {
+                    discovery_ready_rx.recv().unwrap();
+                }
+                Ok(())
+            },
+            move |_| async move {
+                let _ = started_tx.send(());
+                if !hold_discovery {
+                    ready_rx.await.unwrap();
+                }
+                Ok::<_, String>(7_u8)
+            },
+            move |result, initial_policy_generation| {
+                super::finish_opencode_startup_result(
+                    &publisher,
+                    result,
+                    initial_policy_generation,
+                    |server| {
+                        *publication.lock().unwrap() = Some(server);
+                        None
+                    },
+                )
+            },
+            move |_| async move {
+                retirement.store(true, Ordering::SeqCst);
+            },
+        )
+        .unwrap();
+        if hold_discovery {
+            tokio::time::timeout(Duration::from_secs(3), discover_rx)
+                .await
+                .unwrap()
+                .unwrap();
+        } else {
+            tokio::time::timeout(Duration::from_secs(3), started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let initial_generation = state.assistant_settings_generation.load(Ordering::SeqCst);
+        let mut requested = custom_startup_settings();
+        if hold_discovery {
+            requested.prefetch = !requested.prefetch;
+        } else {
+            requested.instant = InstantChoicePayload::CustomSolMedium;
+        }
+        let acknowledged = write_opencode_test_settings(&state, requested).await;
+        assert!(state.assistant_settings_generation.load(Ordering::SeqCst) > initial_generation);
+        assert!(published.lock().unwrap().is_none());
+        if hold_discovery {
+            discovery_ready_tx.send(()).unwrap();
+        } else {
+            ready_tx.send(()).unwrap();
+        }
+        assert!(state.opencode_startup.wait(Duration::from_secs(3)).await);
+        assert_eq!(
+            *published.lock().unwrap(),
+            Some(7),
+            "valid immutable server configuration remains current"
+        );
+        assert!(!retired.load(Ordering::SeqCst));
+        assert_eq!(
+            AssistantSettingsPayload::from(state.conversation_session.lock().unwrap().policy()),
+            acknowledged
+        );
+        assert_eq!(
+            super::load_assistant_settings().unwrap(),
+            Some(acknowledged)
+        );
+        let startup = state.startup_state.lock().unwrap();
+        let StartupStatePayload::Ready { capabilities, .. } = &*startup else {
+            panic!("ready shell")
+        };
+        assert_eq!(
+            capabilities
+                .iter()
+                .find(|cap| cap.id == "opencode")
+                .unwrap()
+                .state,
+            CapabilityStatePayload::Available
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_policy_change_during_discovery_preserves_ready_server() {
+        assert_policy_write_preserves_opencode_startup(true).await;
+    }
+
+    #[tokio::test]
+    async fn opencode_policy_change_during_server_start_preserves_ready_server() {
+        assert_policy_write_preserves_opencode_startup(false).await;
+    }
+
+    #[tokio::test]
+    async fn opencode_failure_after_policy_change_preserves_acknowledged_policy_and_file() {
+        let initial = AssistantSettingsPayload {
+            instant: InstantChoicePayload::OpenCodeSolHigh,
+            deep: AgentChoicePayload::OpenCodeSolHigh,
+            review: AgentChoicePayload::OpenCodeSolHigh,
+            ..Default::default()
+        };
+        let state = Arc::new(opencode_startup_test_state(initial));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let publisher = Arc::clone(&state);
+        super::queue_opencode_startup(
+            &state,
+            || Ok(()),
+            move |_| async move {
+                started_tx.send(()).unwrap();
+                ready_rx.await.unwrap();
+                Err::<u8, _>("synthetic start failure".into())
+            },
+            move |result, initial_policy_generation| {
+                super::finish_opencode_startup_result(
+                    &publisher,
+                    result,
+                    initial_policy_generation,
+                    |_| panic!("failed server cannot publish"),
+                )
+            },
+            |_| async { panic!("failed start has no successful server") },
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let requested = AssistantSettingsPayload {
+            prefetch: !initial.prefetch,
+            ..initial
+        };
+        let acknowledged = write_opencode_test_settings(&state, requested).await;
+        let path = super::response_profile_state_path().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        ready_tx.send(()).unwrap();
+        assert!(state.opencode_startup.wait(Duration::from_secs(3)).await);
+        assert_eq!(
+            AssistantSettingsPayload::from(state.conversation_session.lock().unwrap().policy()),
+            acknowledged
+        );
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            bytes,
+            "startup must not overwrite a newer user acknowledgement"
+        );
+        let startup = state.startup_state.lock().unwrap();
+        let StartupStatePayload::Ready { capabilities, .. } = &*startup else {
+            panic!("ready shell")
+        };
+        let provider = capabilities
+            .iter()
+            .find(|cap| cap.id == "opencode")
+            .unwrap();
+        assert_eq!(provider.state, CapabilityStatePayload::Failed);
+        assert_eq!(provider.reason, "synthetic start failure");
+    }
+
+    #[tokio::test]
+    async fn opencode_discovery_failure_uses_current_failure_projection() {
+        let state = Arc::new(opencode_startup_test_state(custom_startup_settings()));
+        let publisher = Arc::clone(&state);
+        super::queue_opencode_startup(
+            &state,
+            || Err::<(), _>("synthetic discovery failure".into()),
+            |_| async {
+                Err::<voxgolem_platform::opencode::OpencodeServer, _>("must not start".into())
+            },
+            move |result, initial_policy_generation| {
+                super::finish_opencode_startup(&publisher, result, initial_policy_generation)
+            },
+            |server| async move {
+                let _ = server.shutdown().await;
+            },
+        )
+        .unwrap();
+        assert!(state.opencode_startup.wait(Duration::from_secs(3)).await);
+        let startup = state.startup_state.lock().unwrap();
+        let StartupStatePayload::Ready { capabilities, .. } = &*startup else {
+            panic!("shell stays ready")
+        };
+        assert_eq!(
+            capabilities
+                .iter()
+                .find(|cap| cap.id == "opencode")
+                .unwrap()
+                .state,
+            CapabilityStatePayload::Failed
+        );
+        assert_eq!(
+            capabilities
+                .iter()
+                .find(|cap| cap.id == "custom_provider")
+                .unwrap()
+                .state,
+            CapabilityStatePayload::Available
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_async_failure_persists_fallback_in_the_origin_scope() {
+        let settings = AssistantSettingsPayload {
+            instant: InstantChoicePayload::OpenCodeSolHigh,
+            deep: AgentChoicePayload::OpenCodeSolHigh,
+            review: AgentChoicePayload::OpenCodeSolHigh,
+            ..Default::default()
+        };
+        let state = Arc::new(opencode_startup_test_state(settings));
+        let publisher = Arc::clone(&state);
+        super::queue_opencode_startup(
+            &state,
+            || Err::<(), _>("synthetic discovery failure".into()),
+            |_| async {
+                Err::<voxgolem_platform::opencode::OpencodeServer, _>("must not start".into())
+            },
+            move |result, initial_policy_generation| {
+                super::finish_opencode_startup(&publisher, result, initial_policy_generation)
+            },
+            |server| async move {
+                let _ = server.shutdown().await;
+            },
+        )
+        .unwrap();
+        assert!(state.opencode_startup.wait(Duration::from_secs(3)).await);
+        let actual =
+            AssistantSettingsPayload::from(state.conversation_session.lock().unwrap().policy());
+        assert_eq!(actual.instant, InstantChoicePayload::CustomSolHigh);
+        assert_eq!(super::load_assistant_settings().unwrap(), Some(actual));
     }
 
     #[test]
