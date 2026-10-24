@@ -38,25 +38,57 @@ fun interface PreRollAudioSourceFactory {
  * buffering up to 4 seconds in a bounded ring buffer and streaming into an EXTRA_AUDIO_SOURCE
  * pipe. Graceful stop drains buffered audio before EOF; cancellation discards it.
  */
-class AndroidPreRollAudioSource internal constructor(
-    override val readDescriptor: ParcelFileDescriptor,
-    capture: PreRollPcmPump.Capture,
-    output: java.io.OutputStream,
-    closeRead: (ParcelFileDescriptor) -> Unit = { it.close() },
+class AndroidPreRollAudioSource private constructor(
+    private val resources: Resources,
+    startWriter: (Thread) -> Unit,
 ) : PreRollAudioSource {
     private val closed = AtomicBoolean(false)
-    private val pump = PreRollPcmPump(capture, output, FRAME_BYTES, MAX_PRE_ROLL_FRAMES) { closeRead(readDescriptor) }
+    private val pump = PreRollPcmPump(resources, object : java.io.OutputStream() {
+        override fun write(value: Int) = checkNotNull(resources.output).write(value)
+        override fun write(bytes: ByteArray, offset: Int, length: Int) = checkNotNull(resources.output).write(bytes, offset, length)
+        override fun close() {
+            val output = resources.output
+            if (output != null) output.close() else resources.write?.let(resources.closeWrite)
+        }
+    }, FRAME_BYTES, MAX_PRE_ROLL_FRAMES, { resources.read?.let(resources.closeRead) }, startWriter)
 
-    private constructor(audioRecord: AudioRecord, readDescriptor: ParcelFileDescriptor,
-        writeDescriptor: ParcelFileDescriptor) : this(readDescriptor,
-        object : PreRollPcmPump.Capture {
-            override fun read(buffer: ByteArray) = audioRecord.read(buffer, 0, buffer.size)
-            override fun stop() {
-                if (audioRecord.recordingState == AudioRecord.RECORDSTATE_RECORDING) audioRecord.stop()
-            }
-            override fun release() = audioRecord.release()
-        }, ParcelFileDescriptor.AutoCloseOutputStream(writeDescriptor),
-    )
+    /** Slots describe acquisition only; the pump alone records successful cleanup and retries. */
+    private class Resources(
+        val closeRead: (ParcelFileDescriptor) -> Unit,
+        val closeWrite: (ParcelFileDescriptor) -> Unit = { it.close() },
+    ) : PreRollPcmPump.Capture {
+        var read: ParcelFileDescriptor? = null
+        var write: ParcelFileDescriptor? = null
+        var capture: PreRollPcmPump.Capture? = null
+        var output: java.io.OutputStream? = null
+        var startAttempted = false
+        override fun read(buffer: ByteArray) = checkNotNull(capture).read(buffer)
+        override fun stop() { if (startAttempted) capture?.stop() }
+        override fun release() { capture?.release() }
+    }
+
+    internal constructor(readDescriptor: ParcelFileDescriptor, capture: PreRollPcmPump.Capture,
+        output: java.io.OutputStream, closeRead: (ParcelFileDescriptor) -> Unit = { it.close() }) :
+        this(Resources(closeRead).apply {
+            read = readDescriptor; this.capture = capture; this.output = output; startAttempted = true
+        }, { it.start() }) { pump.startCapture() }
+
+    override val readDescriptor: ParcelFileDescriptor get() = checkNotNull(resources.read)
+
+    internal interface AcquiredCapture : PreRollPcmPump.Capture {
+        val initialized: Boolean
+        val recording: Boolean
+        fun start()
+    }
+
+    internal interface Acquisition {
+        fun pipe(): Pair<ParcelFileDescriptor, ParcelFileDescriptor>
+        fun capture(): AcquiredCapture
+        fun output(write: ParcelFileDescriptor): java.io.OutputStream = ParcelFileDescriptor.AutoCloseOutputStream(write)
+        fun closeRead(read: ParcelFileDescriptor) = read.close()
+        fun closeWrite(write: ParcelFileDescriptor) = write.close()
+        fun startWriter(writer: Thread) = writer.start()
+    }
 
     override val isRecording: Boolean get() = pump.isRecording && !closed.get()
 
@@ -108,51 +140,46 @@ class AndroidPreRollAudioSource internal constructor(
             }.getOrDefault(-1)
             if (minBuffer <= 0) return null
             val bufferSize = maxOf(minBuffer * 2, FRAME_BYTES * 10)
-            val pipe = runCatching { ParcelFileDescriptor.createPipe() }.getOrNull() ?: return null
-            if (pipe.size < 2) return null
-            val readPfd = pipe[0]
-            val writePfd = pipe[1]
-            val record = try {
-                AudioRecord(
-                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                    SAMPLE_RATE,
-                    CHANNEL_CONFIG,
-                    AUDIO_FORMAT,
-                    bufferSize,
-                )
-            } catch (_: Throwable) {
-                runCatching { readPfd.close() }
-                runCatching { writePfd.close() }
-                return null
+            return open(object : Acquisition {
+                override fun pipe(): Pair<ParcelFileDescriptor, ParcelFileDescriptor> {
+                    val pipe = ParcelFileDescriptor.createPipe()
+                    return pipe[0] to pipe[1]
+                }
+                override fun capture(): AcquiredCapture {
+                    val record = AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                        SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT, bufferSize)
+                    return object : AcquiredCapture {
+                        override val initialized get() = record.state == AudioRecord.STATE_INITIALIZED
+                        override val recording get() = record.recordingState == AudioRecord.RECORDSTATE_RECORDING
+                        override fun start() = record.startRecording()
+                        override fun read(buffer: ByteArray) = record.read(buffer, 0, buffer.size)
+                        override fun stop() { if (recording) record.stop() }
+                        override fun release() = record.release()
+                    }
+                }
+            })
+        }
+
+        internal fun open(acquisition: Acquisition): AndroidPreRollAudioSource? {
+            // Construct the owner, adapters and retained dormant writer before acquiring handles.
+            val resources = Resources(acquisition::closeRead, acquisition::closeWrite)
+            val source = AndroidPreRollAudioSource(resources, acquisition::startWriter)
+            try {
+                val pipe = acquisition.pipe()
+                resources.read = pipe.first; resources.write = pipe.second
+                val acquired = acquisition.capture()
+                resources.capture = acquired
+                check(acquired.initialized)
+                resources.output = acquisition.output(pipe.second)
+                resources.startAttempted = true
+                acquired.start(); check(acquired.recording)
+                source.pump.startCapture()
+            } catch (_: Exception) {
+                if (resources.read == null && resources.write == null) return null
+                // No slots change after cleanup is requested, including when Thread.start threw.
+                source.close()
             }
-            if (record.state != AudioRecord.STATE_INITIALIZED) {
-                runCatching { record.release() }
-                runCatching { readPfd.close() }
-                runCatching { writePfd.close() }
-                return null
-            }
-            val started = runCatching {
-                record.startRecording()
-                record.recordingState == AudioRecord.RECORDSTATE_RECORDING
-            }.getOrDefault(false)
-            if (!started) {
-                runCatching { record.release() }
-                runCatching { readPfd.close() }
-                runCatching { writePfd.close() }
-                return null
-            }
-            return try {
-                AndroidPreRollAudioSource(record, readPfd, writePfd)
-            } catch (failure: Throwable) {
-                // Capture has already started; constructor/thread-start failure must not leak it
-                // into the direct-microphone fallback, which takes the same admission lease.
-                runCatching { record.stop() }
-                runCatching { record.release() }
-                runCatching { readPfd.close() }
-                runCatching { writePfd.close() }
-                if (failure !is RuntimeException) throw failure
-                null
-            }
+            return source
         }
 
         internal fun isRobolectricRuntime(): Boolean =

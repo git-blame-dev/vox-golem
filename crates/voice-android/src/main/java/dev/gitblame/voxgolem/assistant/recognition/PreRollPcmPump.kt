@@ -11,6 +11,7 @@ internal class PreRollPcmPump(
     private val frameBytes: Int,
     private val maxFrames: Int,
     private val closeInput: () -> Unit = {},
+    private val startWriter: (Thread) -> Unit = { it.start() },
 ) : AutoCloseable {
     interface Capture {
         fun read(buffer: ByteArray): Int
@@ -31,12 +32,33 @@ internal class PreRollPcmPump(
     private var completion: ((Boolean) -> Unit)? = null
     private var captureStopped = false
     private var captureReleased = false
+    private var startupAttempted = false
+    private var acquisitionSettled = false
+    @Volatile private var writerAccepted = false
     private val writer = Thread(::run, "voxgolem-preroll-audio").apply { isDaemon = true }
-    val isRecording: Boolean get() = !stopping.get() && !ended.get()
+    val isRecording: Boolean get() = writerAccepted && !stopping.get() && !ended.get()
 
     init {
         require(frameBytes > 0 && maxFrames > 0)
-        writer.start()
+    }
+
+    /** Resource slots must be final before this call; a failed start never creates another writer. */
+    fun startCapture() {
+        synchronized(control) {
+            check(!startupAttempted && !acquisitionSettled && !stopping.get())
+            startupAttempted = true
+        }
+        var accepted = false
+        try { startWriter(writer); accepted = true }
+        finally {
+            if (!accepted) {
+                cancelled.set(true); stopping.set(true)
+                // An injected/platform start failure may occur after the real Thread started.
+                if (writer.state == Thread.State.NEW) ended.set(true)
+            }
+            synchronized(control) { writerAccepted = accepted; acquisitionSettled = true }
+            drive()
+        }
     }
 
     private fun run() {
@@ -83,7 +105,12 @@ internal class PreRollPcmPump(
 
     override fun close() {
         cancelled.set(true)
+        synchronized(control) { settleUnstarted() }
         stopCapture()
+    }
+
+    private fun settleUnstarted() {
+        if (!startupAttempted) { acquisitionSettled = true; ended.set(true) }
     }
 
     /** One explicit retry after failure; completion never means merely requested. */
@@ -91,6 +118,7 @@ internal class PreRollPcmPump(
         cancelled.set(true)
         stopping.set(true)
         val released = synchronized(control) {
+            settleUnstarted()
             if (fullyRetired()) true else {
                 completion = completed
                 failure = false
@@ -104,7 +132,7 @@ internal class PreRollPcmPump(
 
     /** Called under control. All native work, descriptor closes and joins run on the control worker. */
     private fun nextWork(): Int = when {
-        failure || !stopping.get() -> 0
+        failure || !acquisitionSettled || !stopping.get() -> 0
         !captureStopped -> 1
         cancelled.get() && !inputClosed -> 3
         (cancelled.get() || ended.get()) && !outputClosed -> 4

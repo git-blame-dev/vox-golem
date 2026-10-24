@@ -864,6 +864,45 @@ class AndroidLocalRecognizerFactoryTest {
         }
     }
 
+    @Test fun actualFailedAcquisitionFencesDirectMicrophoneAndCancellationUntilCleanupRetrySucceeds() {
+        fun awaitMain(predicate: () -> Boolean) {
+            val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(2)
+            while (!predicate() && System.nanoTime() < deadline) { drain(); Thread.yield() }
+            assertTrue(predicate())
+        }
+        for (cancel in listOf(false, true)) {
+            registerGoogle()
+            val effects = PreRollAcquisitionFixture().apply { failStart = true; failStop = true }
+            var source: AndroidPreRollAudioSource? = null
+            val session = AndroidLocalRecognizerFactory(RuntimeEnvironment.getApplication(),
+                preRollFactory = PreRollAudioSourceFactory { AndroidPreRollAudioSource.open(effects).also { source = it } }).create()
+            try {
+                session.checkLanguage("en-AU") {}; drain()
+                assertNotNull("Factory must retain actual failed acquisition", source)
+                val sdk = shadowOf(ShadowSpeechRecognizer.getLatestSpeechRecognizer())
+                sdk.triggerSupportResult(RecognitionSupport.Builder().setInstalledOnDeviceLanguages(listOf("en-AU")).build()); drain()
+                var cleanupError = false
+                session.start("en-AU", object : LocalRecognizerEvents {
+                    override fun partial(text: String) {}
+                    override fun final(text: String) {}
+                    override fun error(code: String) { assertEquals("recognition_cleanup_failed", code); cleanupError = true }
+                })
+                awaitMain { cleanupError }
+                assertNull(sdk.lastRecognizerIntent); assertTrue(effects.recording)
+                if (cancel) session.cancel()
+                effects.failStop = false
+                // The same source is explicitly retried; no replacement capture is acquired.
+                val done = java.util.concurrent.CountDownLatch(1)
+                source!!.retire { assertTrue(it); done.countDown() }
+                assertTrue(done.await(2, java.util.concurrent.TimeUnit.SECONDS)); drain()
+                assertNull("Failed/cancelled admission cannot be resurrected by late cleanup", sdk.lastRecognizerIntent)
+                assertEquals(1, effects.captureCalls.get()); assertFalse(effects.recording)
+                var retired: Boolean? = null
+                session.retire { retired = it }; awaitMain { retired != null }; assertEquals(true, retired)
+            } finally { effects.close() }
+        }
+    }
+
     @Test fun preRollStartsDuringSupportAndStopsAtSpeechEndpoint() {
         registerGoogle()
         val pipe = android.os.ParcelFileDescriptor.createPipe()
