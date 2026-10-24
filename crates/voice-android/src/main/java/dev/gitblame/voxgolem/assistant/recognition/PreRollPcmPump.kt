@@ -4,12 +4,13 @@ import java.io.OutputStream
 import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicBoolean
 
-/** Capture worker owns PCM/EOF; one coalesced control drive serializes native stop and release. */
+/** One PCM writer; one coalesced control drive owns native teardown, EOF and writer retirement. */
 internal class PreRollPcmPump(
     private val capture: Capture,
     private val output: OutputStream,
     private val frameBytes: Int,
     private val maxFrames: Int,
+    private val closeInput: () -> Unit = {},
 ) : AutoCloseable {
     interface Capture {
         fun read(buffer: ByteArray): Int
@@ -21,19 +22,21 @@ internal class PreRollPcmPump(
     private val stopping = AtomicBoolean(false)
     private val cancelled = AtomicBoolean(false)
     private val ended = AtomicBoolean(false)
-    private val outputClosed = AtomicBoolean(false)
+    private var outputClosed = false
+    private var inputClosed = false
+    private var writerJoined = false
     private val control = Any()
     private var driving = false
-    private var driveRequested = false
     private var failure = false
     private var completion: ((Boolean) -> Unit)? = null
     private var captureStopped = false
     private var captureReleased = false
+    private val writer = Thread(::run, "voxgolem-preroll-audio").apply { isDaemon = true }
     val isRecording: Boolean get() = !stopping.get() && !ended.get()
 
     init {
         require(frameBytes > 0 && maxFrames > 0)
-        Thread(::run, "voxgolem-preroll-audio").apply { isDaemon = true; start() }
+        writer.start()
     }
 
     private fun run() {
@@ -66,7 +69,6 @@ internal class PreRollPcmPump(
             } finally {
                 stopping.set(true)
                 ended.set(true)
-                closeOutput()
                 drive()
             }
         }
@@ -81,64 +83,83 @@ internal class PreRollPcmPump(
 
     override fun close() {
         cancelled.set(true)
-        closeOutput()
         stopCapture()
     }
 
     /** One explicit retry after failure; completion never means merely requested. */
     fun retire(completed: (Boolean) -> Unit) {
+        cancelled.set(true)
+        stopping.set(true)
         val released = synchronized(control) {
-            if (captureReleased) true else {
+            if (fullyRetired()) true else {
                 completion = completed
                 failure = false
                 false
             }
         }
-        if (released) completed(true) else close()
+        if (released) completed(true) else drive()
+    }
+
+    private fun fullyRetired() = captureReleased && writerJoined && outputClosed && (!cancelled.get() || inputClosed)
+
+    /** Called under control. All native work, descriptor closes and joins run on the control worker. */
+    private fun nextWork(): Int = when {
+        failure || !stopping.get() -> 0
+        !captureStopped -> 1
+        cancelled.get() && !inputClosed -> 3
+        (cancelled.get() || ended.get()) && !outputClosed -> 4
+        ended.get() && !writerJoined -> 5
+        writerJoined && !captureReleased -> 2
+        else -> 0
     }
 
     private fun drive() {
         val launch = synchronized(control) {
-            driveRequested = true
-            if (driving || failure || captureReleased ||
-                (!stopping.get() || (captureStopped && !ended.get()))) false
+            if (driving || nextWork() == 0) false
             else { driving = true; true }
         }
         if (!launch) return
-        Thread({
+        try { Thread({
             while (true) {
                 val work = synchronized(control) {
-                    driveRequested = false
-                    when {
-                        failure || captureReleased -> 0
-                        stopping.get() && !captureStopped -> 1
-                        ended.get() && captureStopped -> 2
-                        else -> 0
-                    }
+                    nextWork()
                 }
                 if (work != 0) {
                     val success = runCatching {
-                        if (work == 1) capture.stop() else capture.release()
+                        when (work) {
+                            1 -> capture.stop()
+                            2 -> capture.release()
+                            3 -> closeInput()
+                            4 -> output.close()
+                            5 -> writer.join()
+                        }
                     }.isSuccess
                     val callback = synchronized(control) {
                         if (success) {
-                            if (work == 1) captureStopped = true else captureReleased = true
+                            when (work) {
+                                1 -> captureStopped = true
+                                2 -> captureReleased = true
+                                3 -> inputClosed = true
+                                4 -> outputClosed = true
+                                5 -> writerJoined = true
+                            }
                         } else failure = true
-                        if (!success || captureReleased) completion.also { completion = null } else null
+                        if (!success || fullyRetired()) completion.also { completion = null } else null
                     }
                     runCatching { callback?.invoke(success) }
                 }
                 val again = synchronized(control) {
-                    if (!failure && !captureReleased && (driveRequested ||
-                            (stopping.get() && !captureStopped) || (ended.get() && captureStopped))) true
+                    if (nextWork() != 0) true
                     else { driving = false; false }
                 }
                 if (!again) break
             }
-        }, "voxgolem-preroll-retirement").apply { isDaemon = true; start() }
-    }
-
-    private fun closeOutput() {
-        if (outputClosed.compareAndSet(false, true)) runCatching { output.close() }
+        }, "voxgolem-preroll-retirement").apply { isDaemon = true; start() } } catch (_: Throwable) {
+            val callback = synchronized(control) {
+                driving = false; failure = true
+                completion.also { completion = null }
+            }
+            runCatching { callback?.invoke(false) }
+        }
     }
 }

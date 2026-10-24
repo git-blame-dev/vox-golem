@@ -38,21 +38,24 @@ fun interface PreRollAudioSourceFactory {
  * buffering up to 4 seconds in a bounded ring buffer and streaming into an EXTRA_AUDIO_SOURCE
  * pipe. Graceful stop drains buffered audio before EOF; cancellation discards it.
  */
-class AndroidPreRollAudioSource private constructor(
-    private val audioRecord: AudioRecord,
+class AndroidPreRollAudioSource internal constructor(
     override val readDescriptor: ParcelFileDescriptor,
-    private val writeDescriptor: ParcelFileDescriptor,
+    capture: PreRollPcmPump.Capture,
+    output: java.io.OutputStream,
+    closeRead: (ParcelFileDescriptor) -> Unit = { it.close() },
 ) : PreRollAudioSource {
-    private val outputStream = ParcelFileDescriptor.AutoCloseOutputStream(writeDescriptor)
     private val closed = AtomicBoolean(false)
-    private val pump = PreRollPcmPump(
+    private val pump = PreRollPcmPump(capture, output, FRAME_BYTES, MAX_PRE_ROLL_FRAMES) { closeRead(readDescriptor) }
+
+    private constructor(audioRecord: AudioRecord, readDescriptor: ParcelFileDescriptor,
+        writeDescriptor: ParcelFileDescriptor) : this(readDescriptor,
         object : PreRollPcmPump.Capture {
             override fun read(buffer: ByteArray) = audioRecord.read(buffer, 0, buffer.size)
             override fun stop() {
                 if (audioRecord.recordingState == AudioRecord.RECORDSTATE_RECORDING) audioRecord.stop()
             }
             override fun release() = audioRecord.release()
-        }, outputStream, FRAME_BYTES, MAX_PRE_ROLL_FRAMES,
+        }, ParcelFileDescriptor.AutoCloseOutputStream(writeDescriptor),
     )
 
     override val isRecording: Boolean get() = pump.isRecording && !closed.get()
@@ -74,13 +77,12 @@ class AndroidPreRollAudioSource private constructor(
 
     override fun close() {
         closed.set(true)
-        // Closing the consumer first also unblocks a writer whose recognizer has retired.
-        runCatching { readDescriptor.close() }
+        // The pump's control worker closes the consumer before the output, off the main thread.
         pump.close()
     }
 
     override fun retire(completed: (Boolean) -> Unit) {
-        close()
+        closed.set(true)
         pump.retire(completed)
     }
 

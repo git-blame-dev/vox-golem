@@ -8,6 +8,66 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class PreRollPcmPumpTest {
+    @Test fun successfulOutputCloseDoesNotReleaseCaptureUntilBlockedWriterActuallyReturns() {
+        val capture = Capture(1)
+        val writing = CountDownLatch(1); val closed = CountDownLatch(1); val returnWrite = CountDownLatch(1)
+        val done = CountDownLatch(1)
+        val pump = PreRollPcmPump(capture, object : java.io.OutputStream() {
+            override fun write(value: Int) { writing.countDown(); check(returnWrite.await(5, TimeUnit.SECONDS)) }
+            override fun close() { closed.countDown() }
+        }, 1, 3)
+        try {
+            assertTrue(capture.waiting.await(2, TimeUnit.SECONDS))
+            pump.startStreaming(); pump.stopCapture()
+            assertTrue(writing.await(2, TimeUnit.SECONDS))
+            pump.retire { assertTrue(it); done.countDown() }
+            assertTrue(closed.await(2, TimeUnit.SECONDS))
+            assertFalse(done.await(100, TimeUnit.MILLISECONDS))
+            assertEquals(1L, capture.released.count)
+        } finally { returnWrite.countDown() }
+        assertTrue(done.await(2, TimeUnit.SECONDS))
+        assertEquals(0L, capture.released.count)
+    }
+    @Test fun blockedOutputCloseAfterEofCannotAcknowledgeRetirementOrBlockCaller() {
+        val closing = CountDownLatch(1); val allowClose = CountDownLatch(1)
+        val completed = CountDownLatch(1); val eof = CountDownLatch(1)
+        val pump = PreRollPcmPump(object : PreRollPcmPump.Capture {
+            override fun read(buffer: ByteArray): Int { check(eof.await(5, TimeUnit.SECONDS)); return 0 }
+            override fun stop() { eof.countDown() }
+            override fun release() {}
+        }, object : java.io.OutputStream() {
+            override fun write(value: Int) {}
+            override fun close() { closing.countDown(); check(allowClose.await(5, TimeUnit.SECONDS)) }
+        }, 1, 3)
+        try {
+            eof.countDown()
+            assertTrue(closing.await(2, TimeUnit.SECONDS))
+            val returned = CountDownLatch(1)
+            Thread { pump.retire { assertTrue(it); completed.countDown() }; returned.countDown() }.start()
+            assertTrue("Retirement request must not wait for close", returned.await(1, TimeUnit.SECONDS))
+            assertFalse("Blocked output close is still physically occupied", completed.await(100, TimeUnit.MILLISECONDS))
+        } finally { allowClose.countDown() }
+        assertTrue(completed.await(2, TimeUnit.SECONDS))
+    }
+
+    @Test fun outputCloseFailureIsRetainedUntilExplicitSuccessfulRetry() {
+        val reads = CountDownLatch(1); val closes = AtomicInteger()
+        val pump = PreRollPcmPump(object : PreRollPcmPump.Capture {
+            override fun read(buffer: ByteArray): Int { check(reads.await(5, TimeUnit.SECONDS)); return 0 }
+            override fun stop() { reads.countDown() }
+            override fun release() {}
+        }, object : java.io.OutputStream() {
+            override fun write(value: Int) {}
+            override fun close() { if (closes.incrementAndGet() == 1) error("synthetic output close failure") }
+        }, 1, 3)
+        val failed = CountDownLatch(1); var first = true
+        pump.retire { first = it; failed.countDown() }
+        assertTrue(failed.await(2, TimeUnit.SECONDS)); assertFalse(first)
+        assertEquals(1, closes.get())
+        val done = CountDownLatch(1)
+        pump.retire { assertTrue(it); done.countDown() }
+        assertTrue(done.await(2, TimeUnit.SECONDS)); assertEquals(2, closes.get())
+    }
     @Test fun blockedStopIsOffCallerAndCoalescesRepeatedRequestsBeforeWorkerEof() {
         val stopping = CountDownLatch(1)
         val unblock = CountDownLatch(1)
@@ -141,7 +201,7 @@ class PreRollPcmPumpTest {
         pump.stopCapture()
         assertTrue(writing.await(2, TimeUnit.SECONDS))
         pump.close()
-        assertEquals(0L, closed.count)
+        assertTrue(closed.await(2, TimeUnit.SECONDS))
         assertTrue(capture.released.await(2, TimeUnit.SECONDS))
     }
 
@@ -153,5 +213,55 @@ class PreRollPcmPumpTest {
         pump.close()
         assertTrue(capture.released.await(2, TimeUnit.SECONDS))
         assertArrayEquals(byteArrayOf(), output.toByteArray())
+    }
+}
+
+@org.junit.runner.RunWith(org.robolectric.RobolectricTestRunner::class)
+@org.robolectric.annotation.Config(sdk = [35], manifest = org.robolectric.annotation.Config.NONE)
+class AndroidPreRollRetirementTest {
+    @Test fun blockedReadDescriptorCloseIsOffCallerAndCannotAcknowledgeRetirement() {
+        val descriptors = android.os.ParcelFileDescriptor.createPipe()
+        val stopped = CountDownLatch(1); val closing = CountDownLatch(1); val allowClose = CountDownLatch(1)
+        val done = CountDownLatch(1)
+        val source = AndroidPreRollAudioSource(descriptors[0], object : PreRollPcmPump.Capture {
+            override fun read(buffer: ByteArray): Int { check(stopped.await(5, TimeUnit.SECONDS)); return 0 }
+            override fun stop() { stopped.countDown() }
+            override fun release() {}
+        }, ByteArrayOutputStream(), { descriptor ->
+            closing.countDown(); check(allowClose.await(5, TimeUnit.SECONDS)); descriptor.close()
+        })
+        try {
+            source.retire { assertTrue(it); done.countDown() }
+            assertTrue(closing.await(2, TimeUnit.SECONDS))
+            assertFalse(done.await(100, TimeUnit.MILLISECONDS))
+        } finally { allowClose.countDown() }
+        assertTrue(done.await(2, TimeUnit.SECONDS))
+        source.close(); descriptors.forEach { it.close() }
+    }
+    @Test fun sourceReadDescriptorCloseFailureRetainsOwnershipUntilExplicitRetryOffCaller() {
+        val descriptors = android.os.ParcelFileDescriptor.createPipe()
+        val stopped = CountDownLatch(1); val calls = AtomicInteger()
+        val caller = Thread.currentThread()
+        val closedOnCaller = java.util.concurrent.atomic.AtomicBoolean()
+        val source = AndroidPreRollAudioSource(descriptors[0], object : PreRollPcmPump.Capture {
+            override fun read(buffer: ByteArray): Int { check(stopped.await(5, TimeUnit.SECONDS)); return 0 }
+            override fun stop() { stopped.countDown() }
+            override fun release() {}
+        }, ByteArrayOutputStream(), { descriptor ->
+            if (caller === Thread.currentThread()) closedOnCaller.set(true)
+            if (calls.incrementAndGet() == 1) throw java.io.IOException("synthetic read close failure")
+            descriptor.close()
+        })
+        try {
+            val failed = CountDownLatch(1); var first = true
+            source.retire { first = it; failed.countDown() }
+            assertTrue(failed.await(2, TimeUnit.SECONDS)); assertFalse(first)
+            assertEquals(1, calls.get())
+            val done = CountDownLatch(1)
+            source.retire { assertTrue(it); done.countDown() }
+            assertTrue(done.await(2, TimeUnit.SECONDS)); assertEquals(2, calls.get())
+            assertFalse("Descriptor close must run off the requesting thread", closedOnCaller.get())
+            assertFalse(descriptors[0].fileDescriptor.valid())
+        } finally { source.close(); descriptors.forEach { it.close() } }
     }
 }
