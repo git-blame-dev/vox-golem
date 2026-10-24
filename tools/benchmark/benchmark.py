@@ -144,12 +144,17 @@ def load_scenarios():
     except (ValueError, UnicodeError):
         raise Blocked('scenario_json_invalid') from None
     allowed = {'id', 'prompt', 'web_enabled', 'allows_no_sources', 'expected',
-               'official_hosts', 'requires_page_read', 'seed', 'history_condition'}
+               'official_hosts', 'requires_page_read', 'seed', 'history_condition', 'voice'}
     if type(cases) is not list or len(cases) != 6:
         raise Blocked('scenario_set_invalid')
     for index, case in enumerate(cases):
         if type(case) is not dict or set(case) - allowed or case.get('id') != SCENARIO_IDS[index]:
             raise Blocked('scenario_contract_invalid')
+        from voice_contract import validate_voice
+        try:
+            validate_voice(case)
+        except (ValueError, TypeError, UnicodeError):
+            raise Blocked('scenario_voice_metadata_invalid') from None
         for key, maximum in (('prompt', 2048), ('seed', 1024), ('history_condition', 128), ('expected', 128)):
             if key in case:
                 if type(case[key]) is not str:
@@ -368,9 +373,20 @@ def owned_tunnel(host, port, cleanup):
         cleanup['tunnel'] = 'pass'
 
 
+class BenchmarkParser(argparse.ArgumentParser):
+    def parse_args(self, args=None, namespace=None):
+        argv = sys.argv[1:] if args is None else args
+        parsed = super().parse_args(argv, namespace)
+        parsed.explicit_options = {option for a in argv if a.startswith('--')
+                                   for option in self._option_string_actions
+                                   if option.startswith(a.split('=')[0])}
+        return parsed
+
+
 def parser():
-    p = argparse.ArgumentParser(description=__doc__)
+    p = BenchmarkParser(description=__doc__)
     p.add_argument('--platform', required=True, choices=['android', 'desktop', 'wear'])
+    p.add_argument('--workload', choices=['typed', 'synthetic-voice'], default='typed')
     p.add_argument('--list', action='store_true', help='List synthetic scenarios without transport access')
     p.add_argument('--cases', nargs='+', choices=SCENARIO_IDS, help='Android/Wear subset, executed in canonical suite order')
     p.add_argument('--live', action='store_true')
@@ -391,12 +407,27 @@ def parser():
     p.add_argument('--output', type=Path, default=ROOT.parent / 'artifacts/benchmarks/typed')
     p.add_argument('--build-variant', choices=['debug', 'release', 'profileable', 'performance', 'unspecified'], default='unspecified')
     p.add_argument('--apk', type=Path, help='Optional local APK; hash only, never installed')
+    p.add_argument('--helper-apk', type=Path, help='Synthetic voice only: matching installed helper APK; never installed')
     for name in ('binary', 'tools', 'config', 'offline-evidence'):
         p.add_argument('--' + name, type=Path, help='Desktop qualified lifecycle prerequisite')
+    p.add_argument('--desktop-platform', choices=['linux', 'windows'])
+    p.add_argument('--windows-manifest', type=Path)
+    p.add_argument('--tts-model', type=Path)
+    p.add_argument('--wake-phrase')
     return p
 
 
+def reject_desktop_voice_options(args):
+    names = ('desktop_platform', 'windows_manifest', 'tts_model', 'wake_phrase')
+    if (any(getattr(args, name, None) is not None for name in names) or
+            getattr(args, 'explicit_options', set()) & {'--' + name.replace('_', '-') for name in names}):
+        raise Blocked('desktop_voice_options_require_desktop_synthetic_voice')
+
+
 def authorize(args):
+    reject_desktop_voice_options(args)
+    if getattr(args, 'helper_apk', None) is not None:
+        raise Blocked('helper_apk_requires_synthetic_voice')
     if getattr(args, 'build_variant', None) == 'performance' and args.platform != 'wear':
         raise Blocked('performance_variant_requires_wear_platform')
     if getattr(args, 'wear_ui_probe', False) and args.platform != 'wear':
@@ -472,7 +503,9 @@ def write_report(directory, report):
     directory = preflight_output(directory)
     reports = []
     now = time.time()
-    for path in directory.glob('typed-benchmark-*.json'):
+    voice_suites = ('synthetic-voice-pipeline', 'synthetic-voice-arithmetic')
+    prefix = 'voice-benchmark' if report.get('suite') in voice_suites else 'typed-benchmark'
+    for path in directory.glob(prefix + '-*.json'):
         if path.is_symlink() or not path.is_file():
             continue
         if path.stat().st_size > MAX_REPORT_BYTES:
@@ -481,7 +514,7 @@ def write_report(directory, report):
             prior = json.loads(path.read_bytes())
         except (OSError, ValueError):
             continue
-        if not isinstance(prior, dict) or prior.get('suite') not in ('typed-model-matrix', 'wear-native-ui-probe') or prior.get('schema') != 1:
+        if not isinstance(prior, dict) or prior.get('suite') not in (voice_suites if prefix == 'voice-benchmark' else ('typed-model-matrix', 'wear-native-ui-probe')) or prior.get('schema') not in ((1, 2) if prefix == 'voice-benchmark' else (1,)):
             continue
         if now - path.stat().st_mtime > 90 * 86400:
             path.unlink()
@@ -496,7 +529,7 @@ def write_report(directory, report):
     payload = json.dumps(report, indent=2).encode()
     if len(payload) > MAX_REPORT_BYTES:
         raise Blocked('report_size_limit')
-    path = directory / f'typed-benchmark-{time.time_ns()}.json'
+    path = directory / f'{prefix}-{time.time_ns()}.json'
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, 'wb') as stream:
@@ -1232,6 +1265,21 @@ async def run_android(args, report):
 
 def main():
     args = parser().parse_args()
+    if not (args.platform == 'desktop' and args.workload == 'synthetic-voice'):
+        try:
+            reject_desktop_voice_options(args)
+        except Blocked as error:
+            print(str(error), file=sys.stderr)
+            return 1
+    if args.workload == 'synthetic-voice':
+        if args.platform == 'desktop':
+            import desktop_voice
+            return desktop_voice.main(args, sys.modules[__name__])
+        if args.platform == 'android':
+            import phone_voice
+            return phone_voice.main(args, sys.modules[__name__])
+        import wear_voice
+        return wear_voice.main(args, sys.modules[__name__])
     if args.list:
         for case in select_scenarios(args):
             print(f"{case['id']} web={'on' if case['web_enabled'] else 'off'}")
