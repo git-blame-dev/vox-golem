@@ -55,7 +55,7 @@ function fixture(options: { native?: boolean; active?: boolean; unavailable?: bo
       ...(active ? { active_request: { request_id: prompt?.request_id ?? (typedId || 'synthetic-typed-orphan'), execution_id: prompt?.execution_id ?? { session_id: sessionId, generation: rendererGeneration }, prompt: prompt?.prompt ?? 'Synthetic native question' } } : {}) }) }
     if (command === 'get_assistant_settings') { if (options.settingsFail) throw new Error('Synthetic settings unavailable'); return settings }
     if (command === 'set_assistant_settings') { settings = args!['settings'] as Record<string, unknown>; return settings }
-    if (command === 'switch_response_profile') { if (options.profileFail) throw new Error('Synthetic profile rollback'); profile = args!['profile'] as string; return { selected_response_profile: profile, supported_response_profiles: ['fast', 'quality'] } }
+    if (command === 'switch_response_profile') { if (options.profileFail) throw new Error('Synthetic secret=FAKE_TOKEN https://synthetic.invalid/private prompt=FAKE_PROMPT'); profile = args!['profile'] as string; return { selected_response_profile: profile, supported_response_profiles: ['fast', 'quality'] } }
     if (command === 'reserve_native_microphone_capture_id') { voice = { ...voice, auto_start_available: false }; return ++captureSequence }
     if (command === 'start_native_microphone') {
       if (options.startFail) { voice = { ...voice, state: 'error', capture_id: null, error: 'Synthetic capture failed', auto_start_available: false }; invalidate(); throw new Error('Synthetic capture failed') }
@@ -260,6 +260,18 @@ describe('autonomous desktop runtime presentation', () => {
       expect(app.session.getControlsSnapshot().promptState).toBe('idle')
       expect(app.session.getControlsSnapshot().runtimeStatus).toBe('sleeping')
       expect(native.invoke.mock.calls.filter(([command]) => command === 'cancel_prompt' || command === 'submit_prompt')).toEqual([])
+    } finally { await app.unmount() }
+  })
+  it('preserves a private profile error in the UI but sends only fixed diagnostic categories', async () => {
+    const native = fixture({ native: false, active: false, profileFail: true })
+    const app = await mount()
+    try {
+      await act(async () => { await app.session.intents.changeInstant('local-quality') })
+      expect(app.container.textContent).toContain('Synthetic secret=FAKE_TOKEN https://synthetic.invalid/private prompt=FAKE_PROMPT')
+      const diagnostics = native.invoke.mock.calls.filter(([command]) => command === 'record_frontend_runtime_diagnostic')
+      expect(diagnostics).toContainEqual(['record_frontend_runtime_diagnostic', { event: { kind: 'profile_switch_failed' } }])
+      expect(diagnostics).toContainEqual(['record_frontend_runtime_diagnostic', { event: { kind: 'frontend_notice' } }])
+      expect(JSON.stringify(diagnostics)).not.toMatch(/FAKE_TOKEN|synthetic\.invalid|FAKE_PROMPT|detail/)
     } finally { await app.unmount() }
   })
   it.each([

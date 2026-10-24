@@ -3,8 +3,8 @@
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::fs::{self, File};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,7 +32,10 @@ mod search_runtime;
 mod state_store;
 mod update_activity;
 use update_activity::{UpdateActivity, UpdateOperationLease};
+mod diagnostics;
 mod telemetry;
+#[cfg(feature = "app-benchmark")]
+use diagnostics::FrontendKind as FrontendRuntimeDiagnosticKind;
 mod transcription;
 #[allow(dead_code)]
 mod tts;
@@ -59,9 +62,6 @@ const LLAMA_CPP_CONTEXT_WINDOW_TOKENS: usize = 8_192;
 const LLAMA_CPP_CONTEXT_SAFETY_MARGIN_TOKENS: usize = 512;
 const LLAMA_CPP_CHAT_WRAPPER_TOKENS: usize = 64;
 const RESPONSE_PROFILE_STATE_FILE: &str = "state.toml";
-const RUNTIME_LOG_DIR: &str = "logs";
-const RUNTIME_LOG_FILE: &str = "runtime.log";
-const RUNTIME_LOG_MESSAGE_MAX_CHARS: usize = 16_384;
 const PROMPT_MAX_BYTES: usize = 64 * 1024;
 const PROVIDER_HISTORY_MAX_BYTES: usize = 512 * 1024;
 const WINDOWS_SOUL_FILE_NAME: &str = "SOUL.md";
@@ -69,7 +69,6 @@ const OPENCODE_PROMPT_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(300);
 const START_LISTENING_CUE_WAV: &[u8] = include_bytes!("../resources/start-listening.wav");
 const STOP_LISTENING_CUE_WAV: &[u8] = include_bytes!("../resources/stop-listening.wav");
 const STARTUP_READY_MARKER: &str = "VOXGOLEM_STARTUP_READY";
-static TELEMETRY_ERROR_REPORTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LlamaConversationTurn {
@@ -135,7 +134,7 @@ struct AppState {
     completion_update_guard: Arc<Mutex<Option<UpdateOperationLease>>>,
     completion_generation: AtomicU64,
     completion_lifecycle_lock: Arc<Mutex<()>>,
-    telemetry_sink: Option<Arc<Mutex<telemetry::TelemetrySink>>>,
+    telemetry_sink: Arc<diagnostics::Diagnostics>,
     update_installation_gate: Arc<UpdateActivity>,
     prefetch_cleanup: Arc<PromptCleanupTracker>,
     tts_operation_lock: tokio::sync::Mutex<()>,
@@ -570,7 +569,7 @@ struct AppStateInit {
     voice_activity_runtime: Option<Mutex<voice_activity::VoiceActivityRuntime>>,
     parakeet_runtime: Option<Arc<Mutex<transcription::ParakeetRuntime>>>,
     lifecycle_gate: Arc<Mutex<()>>,
-    telemetry_sink: Option<Arc<Mutex<telemetry::TelemetrySink>>>,
+    telemetry_sink: Arc<diagnostics::Diagnostics>,
     assistant_policy: voxgolem_core::assistant::AssistantPolicy,
     local_tts_runtime: Option<tts::LocalTtsRuntime>,
     llama_cpp_runtime: Arc<Mutex<Option<voxgolem_platform::llama_cpp::LlamaCppRuntime>>>,
@@ -1215,38 +1214,6 @@ struct CompletionEventPayload {
     revision: u64,
     voice_session_id: Option<partial_transcription::VoiceSessionId>,
     suffix: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum FrontendRuntimeDiagnosticKind {
-    FrontendNotice,
-    Cue,
-    RuntimeControl,
-    Execution,
-    Tts,
-    Audio,
-    Profile,
-}
-
-impl FrontendRuntimeDiagnosticKind {
-    fn as_log_subsystem(self) -> &'static str {
-        match self {
-            Self::FrontendNotice => "frontend",
-            Self::Cue => "cue",
-            Self::RuntimeControl => "runtime-control",
-            Self::Execution => "execution",
-            Self::Tts => "tts",
-            Self::Audio => "audio",
-            Self::Profile => "profile",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct FrontendRuntimeDiagnosticPayload {
-    kind: FrontendRuntimeDiagnosticKind,
-    detail: String,
 }
 
 struct PromptExecutionOutcome {
@@ -2224,7 +2191,7 @@ async fn update_preferences_from_state(
             true,
             current_runtime_present,
             &config.local_tts,
-            config.logging.enabled,
+            Arc::clone(&app_state.telemetry_sink),
             operation_generation,
             &app_state.tts_startup_generation,
         )
@@ -2908,7 +2875,6 @@ async fn set_tts_enabled(
         .ok_or_else(|| String::from("startup config is not ready"))?;
 
     let tts_config = config.local_tts.clone();
-    let runtime_file_logging_enabled = config.logging.enabled;
     let _operation_guard = app_state.tts_operation_lock.lock().await;
     ensure_app_running(&app_state.exit_cleanup_started)?;
     let operation_generation = app_state
@@ -2924,7 +2890,7 @@ async fn set_tts_enabled(
         enabled,
         current_runtime_present,
         &tts_config,
-        runtime_file_logging_enabled,
+        Arc::clone(&app_state.telemetry_sink),
         operation_generation,
         &app_state.tts_startup_generation,
     )
@@ -2944,7 +2910,7 @@ async fn set_tts_enabled(
     if enabled {
         if runtime_guard.is_none() {
             *runtime_guard = unused_proposed_runtime.take().map(Arc::new);
-            log_tts_runtime_event(config.logging.enabled, "runtime enabled");
+            log_tts_runtime_event(&app_state.telemetry_sink, diagnostics::TtsEvent::Enabled);
         }
         app_state
             .tts_audio_playback
@@ -2966,7 +2932,7 @@ async fn set_tts_enabled(
                 .map_err(|error| format!("failed to cancel local tts playback: {error}"))?;
         }
         old_runtime = runtime_guard.take();
-        log_tts_runtime_event(config.logging.enabled, "runtime disabled and unloaded");
+        log_tts_runtime_event(&app_state.telemetry_sink, diagnostics::TtsEvent::Disabled);
     }
     let sample_rate_hz = runtime_guard
         .as_ref()
@@ -3026,17 +2992,15 @@ async fn prepare_tts_runtime(
     enabled: bool,
     current_runtime_present: bool,
     config: &voxgolem_core::config::LocalTtsConfig,
-    runtime_file_logging_enabled: bool,
+    diagnostics: Arc<diagnostics::Diagnostics>,
     operation_generation: u64,
     generation: &AtomicU64,
 ) -> Result<Option<tts::LocalTtsRuntime>, String> {
     let proposed_runtime = if tts_runtime_needs_initialization(enabled, current_runtime_present) {
         let config = config.clone();
-        spawn_runtime_blocking(move || {
-            initialize_local_tts_runtime(&config, true, runtime_file_logging_enabled)
-        })
-        .await
-        .map_err(|error| format!("local tts initialization task failed: {error}"))??
+        spawn_runtime_blocking(move || initialize_local_tts_runtime(&config, true, &diagnostics))
+            .await
+            .map_err(|error| format!("local tts initialization task failed: {error}"))??
     } else {
         None
     };
@@ -3102,10 +3066,10 @@ async fn prepare_voice_cues_from_runtime(
                 return Err(String::from("local voice model is unavailable"));
             }
             let spec = config.local_tts.clone();
-            let logging_enabled = config.logging.enabled;
+            let diagnostics = Arc::clone(&app_state.telemetry_sink);
             spawn_runtime_blocking(move || {
                 let owned = if existing.is_none() {
-                    initialize_local_tts_runtime(&spec, true, logging_enabled)?.map(Arc::new)
+                    initialize_local_tts_runtime(&spec, true, &diagnostics)?.map(Arc::new)
                 } else {
                     None
                 };
@@ -3325,11 +3289,6 @@ async fn speak_local_tts_from_state(
     {
         return Err(String::from("local speech playback was superseded"));
     }
-    let runtime_file_logging_enabled = app_state
-        .runtime_config
-        .as_ref()
-        .map(|config| config.logging.enabled)
-        .unwrap_or(false);
     let (runtime, generation) = {
         let _operation_guard = app_state.tts_operation_lock.lock().await;
         let _reply_guard = if let Some(generation) = speech_generation {
@@ -3354,8 +3313,8 @@ async fn speak_local_tts_from_state(
                 voxgolem_audio::playback::PlaybackPurpose::Speech,
             );
             log_tts_runtime_event(
-                runtime_file_logging_enabled,
-                "synthesis rejected: runtime unavailable",
+                &app_state.telemetry_sink,
+                diagnostics::TtsEvent::RuntimeUnavailable,
             );
             String::from("local tts runtime is not available")
         })?);
@@ -3377,7 +3336,10 @@ async fn speak_local_tts_from_state(
         Ok(Ok(audio)) => audio,
         Ok(Err(error)) => {
             finish_tts_playback_state(&app_state.tts_playback, playback_id)?;
-            log_tts_runtime_event(runtime_file_logging_enabled, "synthesis failed");
+            log_tts_runtime_event(
+                &app_state.telemetry_sink,
+                diagnostics::TtsEvent::SynthesisFailed,
+            );
             return Err(error);
         }
         Err(error) => {
@@ -3386,7 +3348,10 @@ async fn speak_local_tts_from_state(
         }
     };
     ensure_tts_playback_current(&app_state.tts_playback, playback_id).inspect_err(|_error| {
-        log_tts_runtime_event(runtime_file_logging_enabled, "synthesis superseded");
+        log_tts_runtime_event(
+            &app_state.telemetry_sink,
+            diagnostics::TtsEvent::SynthesisSuperseded,
+        );
     })?;
     let duration_ms = audio.duration_ms;
     let output_gain_db = app_state
@@ -3414,7 +3379,10 @@ async fn speak_local_tts_from_state(
         }
         Ok(Err(error)) => {
             finish_tts_playback_state(&app_state.tts_playback, playback_id)?;
-            log_tts_runtime_event(runtime_file_logging_enabled, "playback failed");
+            log_tts_runtime_event(
+                &app_state.telemetry_sink,
+                diagnostics::TtsEvent::PlaybackFailed,
+            );
             return Err(format!("local tts playback failed: {error}"));
         }
         Err(error) => {
@@ -3798,22 +3766,21 @@ fn record_wake_diagnostics_phase(app_state: &AppState, phase: RuntimePhasePayloa
 
 #[tauri::command]
 fn record_frontend_runtime_diagnostic(
-    event: FrontendRuntimeDiagnosticPayload,
+    request: tauri::ipc::Request<'_>,
     app_state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<diagnostics::Status, &'static str> {
+    // Tauri normally selects named arguments and ignores other top-level keys.
+    // Validate the whole envelope as well as the event's closed vocabulary.
+    let tauri::ipc::InvokeBody::Json(value) = request.body() else {
+        return Err("Invalid runtime diagnostic category");
+    };
+    let event = diagnostics::frontend_event(value)?;
     #[cfg(feature = "app-benchmark")]
-    app_benchmark::frontend_diagnostic(event.kind, &event.detail);
-    let runtime_file_logging_enabled = app_state
-        .runtime_config
-        .as_ref()
-        .map(|config| config.logging.enabled)
-        .unwrap_or(false);
-
-    append_runtime_log_line(
-        runtime_file_logging_enabled,
-        event.kind.as_log_subsystem(),
-        &event.detail,
-    )
+    app_benchmark::frontend_diagnostic(event.kind);
+    app_state
+        .telemetry_sink
+        .record(diagnostics::Record::Frontend(event.kind));
+    Ok(app_state.telemetry_sink.status())
 }
 
 #[tauri::command]
@@ -7210,7 +7177,6 @@ async fn resolve_enabled_agents(
     )?;
     record_assistant_stage_telemetry(
         app_state,
-        request_id,
         request,
         telemetry::Stage::Generation,
         instant_telemetry_identity(request.instant_model),
@@ -7235,7 +7201,6 @@ async fn resolve_enabled_agents(
         }
         record_assistant_stage_telemetry(
             app_state,
-            request_id,
             request,
             telemetry::Stage::Deep,
             agent_telemetry_identity(result.model),
@@ -7470,7 +7435,6 @@ async fn resolve_enabled_agents(
     let review_succeeded = review.is_ok();
     record_assistant_stage_telemetry(
         app_state,
-        request_id,
         request,
         telemetry::Stage::Review,
         agent_telemetry_identity(request.preferences.review_model),
@@ -7594,19 +7558,19 @@ fn instant_telemetry_identity(
     model: voxgolem_core::assistant::InstantModel,
 ) -> (
     telemetry::Provider,
-    &'static str,
+    telemetry::Model,
     telemetry::InferenceProvider,
 ) {
     use voxgolem_core::assistant::InstantModel;
     match model {
         InstantModel::LocalFast => (
             telemetry::Provider::Local,
-            "gemma-fast",
+            telemetry::Model::GemmaFast,
             telemetry::InferenceProvider::AttachedUnknown,
         ),
         InstantModel::LocalQuality => (
             telemetry::Provider::Local,
-            "gemma-quality",
+            telemetry::Model::GemmaQuality,
             telemetry::InferenceProvider::AttachedUnknown,
         ),
         InstantModel::CustomSolLow
@@ -7615,7 +7579,7 @@ fn instant_telemetry_identity(
         | InstantModel::CustomSolXhigh
         | InstantModel::CustomSolMax => (
             telemetry::Provider::Custom,
-            "gpt-6.1-sol",
+            telemetry::Model::Sol,
             telemetry::InferenceProvider::Remote,
         ),
         InstantModel::CustomLunaNone
@@ -7625,7 +7589,7 @@ fn instant_telemetry_identity(
         | InstantModel::CustomLuna6Xhigh
         | InstantModel::CustomLuna6Max => (
             telemetry::Provider::Custom,
-            "gpt-6-luna",
+            telemetry::Model::Luna6,
             telemetry::InferenceProvider::Remote,
         ),
         InstantModel::CustomLuna56None
@@ -7635,7 +7599,7 @@ fn instant_telemetry_identity(
         | InstantModel::CustomLuna56Xhigh
         | InstantModel::CustomLuna56Max => (
             telemetry::Provider::Custom,
-            "gpt-5.6-luna",
+            telemetry::Model::Luna56,
             telemetry::InferenceProvider::Remote,
         ),
         InstantModel::OpenCodeSolLow
@@ -7644,7 +7608,7 @@ fn instant_telemetry_identity(
         | InstantModel::OpenCodeSolXhigh
         | InstantModel::OpenCodeSolMax => (
             telemetry::Provider::OpenCode,
-            "gpt-6.1-sol",
+            telemetry::Model::Sol,
             telemetry::InferenceProvider::Remote,
         ),
         InstantModel::OpenCodeLunaNone
@@ -7654,7 +7618,7 @@ fn instant_telemetry_identity(
         | InstantModel::OpenCodeLunaXhigh
         | InstantModel::OpenCodeLunaMax => (
             telemetry::Provider::OpenCode,
-            "gpt-5.6-luna",
+            telemetry::Model::Luna56,
             telemetry::InferenceProvider::Remote,
         ),
     }
@@ -7664,7 +7628,7 @@ fn agent_telemetry_identity(
     model: voxgolem_core::assistant::AgentModel,
 ) -> (
     telemetry::Provider,
-    &'static str,
+    telemetry::Model,
     telemetry::InferenceProvider,
 ) {
     use voxgolem_core::assistant::AgentModel;
@@ -7675,7 +7639,7 @@ fn agent_telemetry_identity(
         | AgentModel::CustomSolXhigh
         | AgentModel::CustomSolMax => (
             telemetry::Provider::Custom,
-            "gpt-6.1-sol",
+            telemetry::Model::Sol,
             telemetry::InferenceProvider::Remote,
         ),
         AgentModel::CustomLuna6Low
@@ -7684,7 +7648,7 @@ fn agent_telemetry_identity(
         | AgentModel::CustomLuna6Xhigh
         | AgentModel::CustomLuna6Max => (
             telemetry::Provider::Custom,
-            "gpt-6-luna",
+            telemetry::Model::Luna6,
             telemetry::InferenceProvider::Remote,
         ),
         AgentModel::CustomLunaLow
@@ -7693,7 +7657,7 @@ fn agent_telemetry_identity(
         | AgentModel::CustomLuna56Xhigh
         | AgentModel::CustomLuna56Max => (
             telemetry::Provider::Custom,
-            "gpt-5.6-luna",
+            telemetry::Model::Luna56,
             telemetry::InferenceProvider::Remote,
         ),
         AgentModel::OpenCodeSolLow
@@ -7702,7 +7666,7 @@ fn agent_telemetry_identity(
         | AgentModel::OpenCodeSolXhigh
         | AgentModel::OpenCodeSolMax => (
             telemetry::Provider::OpenCode,
-            "gpt-6.1-sol",
+            telemetry::Model::Sol,
             telemetry::InferenceProvider::Remote,
         ),
         AgentModel::OpenCodeLunaLow
@@ -7711,7 +7675,7 @@ fn agent_telemetry_identity(
         | AgentModel::OpenCodeLunaXhigh
         | AgentModel::OpenCodeLunaMax => (
             telemetry::Provider::OpenCode,
-            "gpt-5.6-luna",
+            telemetry::Model::Luna56,
             telemetry::InferenceProvider::Remote,
         ),
     }
@@ -7719,12 +7683,11 @@ fn agent_telemetry_identity(
 
 fn record_assistant_stage_telemetry(
     app_state: &AppState,
-    request_id: &str,
     request: &AssistantRequestContext,
     stage: telemetry::Stage,
     identity: (
         telemetry::Provider,
-        &'static str,
+        telemetry::Model,
         telemetry::InferenceProvider,
     ),
     duration_ms: u64,
@@ -7747,16 +7710,13 @@ fn record_assistant_stage_telemetry(
     append_telemetry(
         &app_state.telemetry_sink,
         telemetry::TelemetryMetadata {
-            schema_version: telemetry::SCHEMA_VERSION,
-            timestamp_ms: current_time_ms().unwrap_or_default(),
-            request_id: request_id.to_string(),
             generation: request.generation.generation.0,
             input_source: match request.source {
                 CompletionSource::Typed => telemetry::InputSource::Text,
                 CompletionSource::Voice => telemetry::InputSource::Voice,
             },
             provider: identity.0,
-            model: identity.1.to_string(),
+            model: identity.1,
             stage,
             transport: telemetry::Transport::Http,
             inference_provider,
@@ -8995,13 +8955,10 @@ fn spawn_partial_transcription(
                 append_telemetry(
                     &app_state.telemetry_sink,
                     telemetry::TelemetryMetadata {
-                        schema_version: telemetry::SCHEMA_VERSION,
-                        timestamp_ms: current_time_ms().unwrap_or_default(),
-                        request_id: format!("partial-{session_id}-{revision}"),
                         generation: revision,
                         input_source: telemetry::InputSource::Voice,
                         provider: telemetry::Provider::Local,
-                        model: String::from("parakeet-v2-int8"),
+                        model: telemetry::Model::Parakeet,
                         stage: telemetry::Stage::PartialTranscription,
                         transport: telemetry::Transport::InProcess,
                         inference_provider: telemetry::InferenceProvider::Cpu,
@@ -9253,16 +9210,13 @@ async fn emit_completion_predictions(
         append_telemetry(
             &app_state.telemetry_sink,
             telemetry::TelemetryMetadata {
-                schema_version: telemetry::SCHEMA_VERSION,
-                timestamp_ms: current_time_ms().unwrap_or_default(),
-                request_id: format!("completion-{}", request.backend_revision),
                 generation: request.backend_revision,
                 input_source: match request.source {
                     CompletionSource::Typed => telemetry::InputSource::Text,
                     CompletionSource::Voice => telemetry::InputSource::Voice,
                 },
                 provider: telemetry::Provider::Local,
-                model: String::from("qwen-completion"),
+                model: telemetry::Model::QwenCompletion,
                 stage: telemetry::Stage::CompletionPrediction,
                 transport: telemetry::Transport::Http,
                 inference_provider: app_state
@@ -9817,16 +9771,13 @@ fn queue_assistant_prefetch(
         append_telemetry(
             &app_state.telemetry_sink,
             telemetry::TelemetryMetadata {
-                schema_version: telemetry::SCHEMA_VERSION,
-                timestamp_ms: current_time_ms().unwrap_or_default(),
-                request_id: format!("prefetch-{generation}"),
                 generation,
                 input_source: match source {
                     CompletionSource::Typed => telemetry::InputSource::Text,
                     CompletionSource::Voice => telemetry::InputSource::Voice,
                 },
                 provider,
-                model: model.to_string(),
+                model,
                 stage: telemetry::Stage::Prefetch,
                 transport: telemetry::Transport::Http,
                 inference_provider,
@@ -10442,14 +10393,6 @@ fn response_profile_state_path() -> Result<PathBuf, String> {
     Ok(config_path.with_file_name(RESPONSE_PROFILE_STATE_FILE))
 }
 
-fn runtime_log_path() -> Result<PathBuf, String> {
-    let config_path = application_config_path()?;
-
-    Ok(config_path
-        .with_file_name(RUNTIME_LOG_DIR)
-        .join(RUNTIME_LOG_FILE))
-}
-
 #[cfg(test)]
 mod test_storage;
 
@@ -10491,91 +10434,6 @@ fn application_config_path() -> Result<PathBuf, String> {
     {
         voxgolem_core::config::default_config_path()
             .map_err(|error| format!("failed to resolve application config path: {error}"))
-    }
-}
-
-fn append_runtime_log_line(enabled: bool, subsystem: &str, message: &str) -> Result<(), String> {
-    if !enabled {
-        return Ok(());
-    }
-
-    let log_path = runtime_log_path()?;
-    if let Some(parent) = log_path.parent() {
-        fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "failed to create runtime log directory {}: {error}",
-                parent.display()
-            )
-        })?;
-    }
-
-    let timestamp_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0);
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .map_err(|error| format!("failed to open runtime log {}: {error}", log_path.display()))?;
-
-    writeln!(
-        file,
-        "{timestamp_ms} [{}] {}",
-        sanitize_log_subsystem(subsystem),
-        sanitize_log_message(message)
-    )
-    .map_err(|error| {
-        format!(
-            "failed to append runtime log {}: {error}",
-            log_path.display()
-        )
-    })
-}
-
-fn append_tts_runtime_log_line(enabled: bool, message: &str) -> Result<(), String> {
-    append_runtime_log_line(enabled, "tts", message)
-}
-
-fn sanitize_log_subsystem(subsystem: &str) -> String {
-    let sanitized: String = subsystem
-        .chars()
-        .filter(|character| {
-            character.is_ascii_alphanumeric() || *character == '_' || *character == '-'
-        })
-        .take(32)
-        .collect();
-
-    if sanitized.is_empty() {
-        return String::from("runtime");
-    }
-
-    sanitized
-}
-
-fn sanitize_log_message(message: &str) -> String {
-    let mut characters = message.chars();
-    let mut sanitized = String::new();
-
-    for character in characters.by_ref().take(RUNTIME_LOG_MESSAGE_MAX_CHARS) {
-        match character {
-            '\r' => sanitized.push_str("\\r"),
-            '\n' => sanitized.push_str("\\n"),
-            _ => sanitized.push(character),
-        }
-    }
-
-    if characters.next().is_some() {
-        sanitized.push_str("…[truncated]");
-    }
-
-    sanitized
-}
-
-fn log_tts_runtime_event(enabled: bool, message: &str) {
-    if let Err(error) = append_tts_runtime_log_line(enabled, message) {
-        eprintln!("failed to append tts runtime log: {error}");
     }
 }
 
@@ -11584,44 +11442,40 @@ fn telemetry_inference_provider(
 
 fn new_telemetry_sink(
     config: voxgolem_core::config::TelemetryConfig,
-) -> Option<Arc<Mutex<telemetry::TelemetrySink>>> {
+    runtime_enabled: bool,
+) -> Arc<diagnostics::Diagnostics> {
     #[cfg(not(test))]
-    let state_dir = voxgolem_core::config::default_state_dir().ok()?;
+    let state_dir = voxgolem_core::config::default_state_dir().ok();
     #[cfg(test)]
-    let state_dir = test_storage::state_directory();
-    Some(Arc::new(Mutex::new(telemetry::TelemetrySink::new(
-        state_dir,
-        telemetry::TelemetryConfig {
-            enabled: config.enabled,
+    let state_dir = Some(test_storage::state_directory());
+    diagnostics::Diagnostics::new(
+        state_dir.map(|path| path.join("diagnostics")),
+        diagnostics::Config {
+            model_enabled: config.enabled,
+            runtime_enabled,
             max_bytes: config.max_bytes as u64,
             backup_count: usize::from(config.backup_count),
         },
-    ))))
+    )
 }
 
-fn default_telemetry_sink() -> Option<Arc<Mutex<telemetry::TelemetrySink>>> {
-    new_telemetry_sink(voxgolem_core::config::TelemetryConfig {
-        enabled: true,
-        max_bytes: DEFAULT_TELEMETRY_MAX_BYTES,
-        backup_count: DEFAULT_TELEMETRY_BACKUP_COUNT,
-    })
+fn default_telemetry_sink() -> Arc<diagnostics::Diagnostics> {
+    new_telemetry_sink(
+        voxgolem_core::config::TelemetryConfig {
+            enabled: true,
+            max_bytes: DEFAULT_TELEMETRY_MAX_BYTES,
+            backup_count: DEFAULT_TELEMETRY_BACKUP_COUNT,
+        },
+        false,
+    )
 }
 
-fn append_telemetry(
-    sink: &Option<Arc<Mutex<telemetry::TelemetrySink>>>,
-    metadata: telemetry::TelemetryMetadata,
-) {
-    if let Some(sink) = sink {
-        let result = sink
-            .lock()
-            .map_err(|_| String::from("telemetry sink lock is poisoned"))
-            .and_then(|sink| sink.append(&metadata).map_err(|error| error.to_string()));
-        if let Err(error) = result {
-            if !TELEMETRY_ERROR_REPORTED.swap(true, Ordering::Relaxed) {
-                eprintln!("telemetry persistence failed: {error}");
-            }
-        }
-    }
+fn append_telemetry(sink: &diagnostics::Diagnostics, metadata: telemetry::TelemetryMetadata) {
+    sink.record(diagnostics::Record::Model(metadata));
+}
+
+fn log_tts_runtime_event(sink: &diagnostics::Diagnostics, event: diagnostics::TtsEvent) {
+    sink.record(diagnostics::Record::Tts(event));
 }
 
 fn initialize_app_state(init: AppStateInit) -> AppState {
@@ -11718,7 +11572,7 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
     let config_path: Option<PathBuf> = None;
     match voxgolem_core::config::load_runtime_config(config_path.as_deref()) {
         Ok(config) => {
-            let telemetry_sink = new_telemetry_sink(config.telemetry);
+            let telemetry_sink = new_telemetry_sink(config.telemetry, config.logging.enabled);
             let mut capabilities = configured_capabilities(&config);
             let voice_pipeline_config = voice_pipeline_config_with_silence_timeouts(
                 config.initial_silence_timeout_ms,
@@ -12106,26 +11960,22 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
 fn initialize_local_tts_runtime(
     config: &voxgolem_core::config::LocalTtsConfig,
     enabled: bool,
-    runtime_file_logging_enabled: bool,
+    diagnostics: &diagnostics::Diagnostics,
 ) -> Result<Option<tts::LocalTtsRuntime>, String> {
     if !enabled {
-        log_tts_runtime_event(
-            runtime_file_logging_enabled,
-            "runtime initialization skipped: disabled",
-        );
+        log_tts_runtime_event(diagnostics, diagnostics::TtsEvent::InitializationSkipped);
         return Ok(None);
     }
 
-    if let Some(strict_espeak_root) = tts::resolve_strict_windows_espeak_data_directory()
-        .map_err(|error| format!("failed to resolve strict eSpeak data root: {error}"))?
+    log_tts_runtime_event(diagnostics, diagnostics::TtsEvent::InitializationStarted);
+    if tts::resolve_strict_windows_espeak_data_directory()
+        .map_err(|error| {
+            log_tts_runtime_event(diagnostics, diagnostics::TtsEvent::InitializationFailed);
+            format!("failed to resolve strict eSpeak data root: {error}")
+        })?
+        .is_some()
     {
-        log_tts_runtime_event(
-            runtime_file_logging_enabled,
-            &format!(
-                "resolved strict eSpeak data root: {}",
-                strict_espeak_root.display()
-            ),
-        );
+        log_tts_runtime_event(diagnostics, diagnostics::TtsEvent::DataRootReady);
     }
 
     let spec = tts::LocalTtsRuntimeSpec {
@@ -12139,15 +11989,12 @@ fn initialize_local_tts_runtime(
 
     match tts::LocalTtsRuntime::new(spec) {
         Ok(runtime) => {
-            log_tts_runtime_event(
-                runtime_file_logging_enabled,
-                "runtime initialized successfully",
-            );
+            log_tts_runtime_event(diagnostics, diagnostics::TtsEvent::Ready);
             Ok(Some(runtime))
         }
         Err(error) => {
             let message = format!("failed to initialize local tts runtime: {error}");
-            log_tts_runtime_event(runtime_file_logging_enabled, &message);
+            log_tts_runtime_event(diagnostics, diagnostics::TtsEvent::InitializationFailed);
             Err(message)
         }
     }
@@ -13119,6 +12966,14 @@ async fn shutdown_runtime(app_state: &AppState) {
             if let Some(server) = opencode_server {
                 let _ = server.shutdown().await;
             }
+            app_state.telemetry_sink.request_shutdown();
+            // No unbounded join: a blocked filesystem worker remains unretired.
+            let deadline = Instant::now() + Duration::from_millis(250);
+            while !app_state.telemetry_sink.status().stopped && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // Optional local diagnostics cannot veto retired essential native
+            // resources or updater eligibility. Its own status remains honest.
             true
         },
     )
@@ -13329,7 +13184,6 @@ pub fn run() {
                     config.local_tts.model_path.is_file(),
                 ) {
                     let tts_config = config.local_tts.clone();
-                    let logging_enabled = config.logging.enabled;
                     let startup_generation = app
                         .state::<AppState>()
                         .tts_startup_generation
@@ -13355,7 +13209,7 @@ pub fn run() {
                             return;
                         }
                         let result =
-                            initialize_local_tts_runtime(&tts_config, true, logging_enabled);
+                            initialize_local_tts_runtime(&tts_config, true, &state.telemetry_sink);
                         if !runtime_startup_is_current(
                             &state.exit_cleanup_started,
                             &startup_generation_state,
@@ -13703,7 +13557,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::fs;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{
         agent_history, allows_user_media_from_uri, apply_opencode_startup_failure,
@@ -13734,8 +13588,8 @@ mod tests {
         register_active_prompt, register_owned_work, register_tts_playback,
         replace_owned_runtime_transaction, reset_conversation_execution, reset_runtime_session,
         reset_voice_pipeline_to_waiting, reset_wake_word_runtime, resolve_effective_tts_enabled,
-        response_profile_state_path, run_serialized_shutdown, runtime_log_path,
-        runtime_phase_response_from_state, runtime_startup_is_current, set_preferences_from_state,
+        response_profile_state_path, run_serialized_shutdown, runtime_phase_response_from_state,
+        runtime_startup_is_current, set_preferences_from_state,
         shutdown_llama_cpp_runtime_for_exit, shutdown_tts_runtime_for_exit,
         startup_warming_state_from_snapshot, supported_response_profiles,
         take_and_invalidate_prefetch, to_runtime_phase_payload, transcribe_finished_utterance,
@@ -15766,6 +15620,45 @@ mod tests {
         assert!(begin_update_installation(&app_state).is_ok());
     }
 
+    #[tokio::test]
+    async fn optional_blocked_diagnostics_do_not_veto_completed_native_shutdown() {
+        let root = tempfile::tempdir().unwrap();
+        let blocked = super::diagnostics::BlockedTestOwner::new(
+            root.path().join("diagnostics"),
+            || 1000,
+            || 1000,
+        );
+        let mut state = build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            super::embedded_cue_asset_paths(),
+            "synthetic".into(),
+        );
+        state.telemetry_sink = Arc::clone(&blocked.owner);
+        state
+            .telemetry_sink
+            .record(super::diagnostics::Record::Frontend(
+                super::diagnostics::FrontendKind::FrontendNotice,
+            ));
+        blocked.wait_blocked();
+        let shutdown =
+            tokio::time::timeout(Duration::from_secs(5), super::shutdown_runtime(&state)).await;
+        let essential_complete = state.shutdown_complete.load(Ordering::Acquire);
+        let diagnostics = state.telemetry_sink.status();
+        let installer_eligible = begin_update_installation(&state).is_ok();
+        blocked.finish();
+        shutdown.expect("optional diagnostics must not indefinitely delay cleanup");
+        assert!(
+            essential_complete,
+            "retired native resources must authorize update cleanup"
+        );
+        assert!(installer_eligible);
+        assert!(diagnostics.stopping);
+        assert!(
+            !diagnostics.stopped,
+            "a blocked writer was not physically retired"
+        );
+    }
+
     #[test]
     fn optional_runtime_startup_guards_close_both_spawn_races() {
         let app_state = build_startup_error_app_state(
@@ -16384,7 +16277,7 @@ mod tests {
                 voxgolem_core::assistant::InstantModel::CustomLunaNone
             )
             .1,
-            "gpt-6-luna"
+            crate::telemetry::Model::Luna6
         );
     }
 
@@ -16393,10 +16286,16 @@ mod tests {
         use voxgolem_core::assistant::{AgentModel, InstantModel};
 
         for model in [InstantModel::CustomSolHigh, InstantModel::OpenCodeSolHigh] {
-            assert_eq!(super::instant_telemetry_identity(model).1, "gpt-6.1-sol");
+            assert_eq!(
+                super::instant_telemetry_identity(model).1,
+                crate::telemetry::Model::Sol
+            );
         }
         for model in [AgentModel::CustomSolHigh, AgentModel::OpenCodeSolHigh] {
-            assert_eq!(super::agent_telemetry_identity(model).1, "gpt-6.1-sol");
+            assert_eq!(
+                super::agent_telemetry_identity(model).1,
+                crate::telemetry::Model::Sol
+            );
         }
     }
 
@@ -18436,18 +18335,32 @@ mod tests {
             assert_eq!(reported, succeeded);
             super::record_assistant_stage_telemetry(
                 &state,
-                &id,
                 &request.request,
                 super::telemetry::Stage::Generation,
                 super::instant_telemetry_identity(request.request.instant_model),
                 7,
                 reported,
             );
-            let bytes =
-                fs::read_to_string(directory.path().join("VoxGolem/telemetry.jsonl")).unwrap();
+            state.telemetry_sink.request_shutdown();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !state.telemetry_sink.status().stopped {
+                assert!(Instant::now() < deadline, "diagnostics did not retire");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(state.telemetry_sink.status().written, 1);
+            let bytes = fs::read_to_string(
+                directory
+                    .path()
+                    .join("VoxGolem/diagnostics/events-000.jsonl"),
+            )
+            .unwrap();
             let value: serde_json::Value = serde_json::from_str(bytes.trim()).unwrap();
-            assert_eq!(value["status"], if succeeded { "ok" } else { "error" });
-            assert_eq!(value["duration_ms"], 7);
+            assert_eq!(
+                value["record"]["event"]["status"],
+                if succeeded { "ok" } else { "error" }
+            );
+            assert_eq!(value["record"]["event"]["duration_ms"], 7);
+            assert!(value["record"]["event"].get("request_id").is_none());
             assert!(!bytes.contains("SYNTHETIC_PRIVATE_"));
             drop(request);
         }
@@ -19241,59 +19154,6 @@ mod tests {
             std::fs::read_to_string(directory.path().join("state.toml")).unwrap(),
             "latest"
         );
-    }
-
-    #[test]
-    fn runtime_log_path_resolves_in_appdata_logs_directory() {
-        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
-
-        let log_path = runtime_log_path().expect("runtime log path should resolve");
-
-        assert!(log_path
-            .to_string_lossy()
-            .replace('\\', "/")
-            .ends_with("VoxGolem/logs/runtime.log"));
-    }
-
-    #[test]
-    fn append_tts_runtime_log_line_writes_tts_tagged_entry() {
-        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
-
-        super::append_tts_runtime_log_line(true, "runtime initialized successfully")
-            .expect("runtime log write should succeed");
-        let log_path = runtime_log_path().expect("runtime log path should resolve");
-        let contents = std::fs::read_to_string(&log_path).expect("runtime log should be readable");
-
-        assert!(contents.contains("[tts] runtime initialized successfully"));
-    }
-
-    #[test]
-    fn append_tts_runtime_log_line_skips_file_when_disabled() {
-        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
-
-        super::append_tts_runtime_log_line(false, "runtime initialized successfully")
-            .expect("disabled runtime log write should be a no-op");
-        let log_path = runtime_log_path().expect("runtime log path should resolve");
-
-        assert!(!log_path.exists());
-    }
-
-    #[test]
-    fn runtime_log_message_escapes_line_breaks_and_caps_length() {
-        let message = format!(
-            "first\r\n{}",
-            "x".repeat(super::RUNTIME_LOG_MESSAGE_MAX_CHARS)
-        );
-
-        let sanitized = super::sanitize_log_message(&message);
-
-        assert!(sanitized.starts_with("first\\r\\n"));
-        assert!(sanitized.ends_with("…[truncated]"));
-        assert!(!sanitized.contains('\n'));
-        assert!(!sanitized.contains('\r'));
     }
 
     #[test]

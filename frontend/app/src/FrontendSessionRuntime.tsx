@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useLayoutEffect } from 'react'
 import { FrontendTiming, reportAppBenchmarkStage } from './lib/frontendTiming'
+import { recordRuntimeDiagnostic } from './lib/runtimeDiagnostics'
 import { useSessionView } from './FrontendSession'
 import type { FrontendSession } from './FrontendSession'
 import { SessionAuthority, cancelPromptProjectionFrame, sessionAuthority, useSessionIntents, useSessionView as useAuthorityView } from './SessionAuthority'
@@ -72,14 +73,6 @@ import './App.css'
 const NOTICE_AUTO_DISMISS_MS = 4_000
 const MAX_NOTICE_QUEUE_LENGTH = 3
 const ASSISTANT_SETTINGS_WRITE_FAILURE_TITLE = 'Assistant settings failed'
-
-type RuntimeDiagnosticKind =
-  | 'frontend_notice'
-  | 'runtime_control'
-  | 'execution'
-  | 'tts'
-  | 'audio'
-  | 'profile'
 
 type CaptureContinuation = {
   readonly lifetime: () => boolean
@@ -563,15 +556,6 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     return () => window.removeEventListener(NEW_VOICE_SHORTCUT_EVENT, openVoiceEntry)
   }, [closeSettings, setVoiceNotesOpen])
 
-  const recordRuntimeDiagnostic = useCallback((kind: RuntimeDiagnosticKind, detail: string): void => {
-    void invokeTauriCommand('record_frontend_runtime_diagnostic', {
-      event: {
-        kind,
-        detail,
-      },
-    }).catch(() => undefined)
-  }, [])
-
   const addNotice = useCallback((notice: Omit<UserNotice, 'id'>): void => {
     setNotices((currentNotices) => {
       const nextNotice = {
@@ -581,8 +565,8 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
 
       return [nextNotice, ...currentNotices].slice(0, MAX_NOTICE_QUEUE_LENGTH)
     })
-    recordRuntimeDiagnostic('frontend_notice', `${notice.title}: ${notice.message}`)
-  }, [recordRuntimeDiagnostic, setNotices])
+    recordRuntimeDiagnostic('frontend_notice')
+  }, [setNotices])
 
   const adoptSnapshotPreferences = useCallback((preferences: ValidatedPreferences): void => {
     setAssistantSettingsLoadError(null)
@@ -1609,7 +1593,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         outcome: 'error',
         errorMessage: message,
       }
-      recordRuntimeDiagnostic('execution', `Execution error: ${message}`)
+      recordRuntimeDiagnostic('execution_failed')
     }
 
     {
@@ -2037,7 +2021,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       ? ' Capture stopped; select Start mic to resume.'
       : ''
 
-    recordRuntimeDiagnostic('audio', `Live audio error: ${message}`)
+    recordRuntimeDiagnostic('audio_failed')
     addNotice({
       tone: 'error',
       title: 'Microphone unavailable',
@@ -2074,9 +2058,9 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
           if (liveAudioSessionId === liveAudioSessionIdRef.current) reportLiveAudioError(error)
           else void desktopObserverRef.current?.observer.refresh().catch(() => undefined)
         },
-        onStatus: (status) => {
+        onStatus: () => {
           if (!startLifetime() || liveAudioSessionId !== liveAudioSessionIdRef.current) return
-          recordRuntimeDiagnostic('audio', `Microphone startup: ${status}`)
+          recordRuntimeDiagnostic('microphone_status_changed')
         },
         onSelectedDeviceFallback: (attemptedDeviceId) => {
           if (
@@ -2298,7 +2282,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         (settled.selectedResponseProfile !== profile || requestedCapability?.state !== 'available')) {
         const message = requestedCapability?.reason ?? `The ${getResponseProfileLabel(profile)} profile could not be started.`
         addNotice({ tone: 'error', title: 'Profile switch failed', message })
-        recordRuntimeDiagnostic('profile', `Response profile switch error: ${message}`)
+        recordRuntimeDiagnostic('profile_switch_failed')
         await refreshSnapshotControlsAfterProfileTransition(settled.selectedResponseProfile)
         return false
       }
@@ -2339,7 +2323,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
           title: 'Profile switch failed',
           message,
         })
-        recordRuntimeDiagnostic('profile', `Response profile switch error: ${message}`)
+        recordRuntimeDiagnostic('profile_switch_failed')
         const restoredStartup = session.fieldRef('startupState').current
         if (restoredStartup.kind === 'ready') await refreshSnapshotControlsAfterProfileTransition(restoredStartup.selectedResponseProfile)
       }
@@ -2374,7 +2358,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
           title: 'TTS setting failed',
           message,
         })
-        recordRuntimeDiagnostic('tts', `TTS toggle error: ${message}`)
+        recordRuntimeDiagnostic('tts_toggle_failed')
       },
     })
   }

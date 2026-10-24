@@ -1,6 +1,8 @@
 //! Explicitly compiled, isolated software-input benchmark. Never a shipping IPC surface.
 use super::*;
 use std::collections::{BTreeMap, HashSet};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::sync::atomic::AtomicU64;
 use std::sync::{LazyLock, OnceLock};
 const CAPABILITY: &str = "voxgolem:app-bench:canonical-managed-auth:v2";
@@ -481,31 +483,22 @@ pub(crate) fn model_event(event: &RunEvent<'_>) {
     }
 }
 
-pub(crate) fn frontend_diagnostic(kind: FrontendRuntimeDiagnosticKind, detail: &str) {
-    let stage = match detail {
-        "benchmark_lifetime_retire" => "frontend_lifetime_retired",
-        "benchmark_controls_retire" => "frontend_controls_retired",
-        "benchmark_capability_retire" => "frontend_capability_retired",
-        "benchmark_audio_error" => "frontend_audio_error",
-        "benchmark_cue_error" => "frontend_cue_error",
-        _ if matches!(kind, FrontendRuntimeDiagnosticKind::Audio)
-            && detail.contains("fell behind") =>
-        {
-            "frontend_audio_backlog"
-        }
-        _ if matches!(kind, FrontendRuntimeDiagnosticKind::Audio)
-            && detail.contains("Runtime control payload") =>
-        {
-            "frontend_audio_invalid_status"
-        }
-        _ if matches!(kind, FrontendRuntimeDiagnosticKind::Audio)
-            && detail.starts_with("Live audio error:") =>
-        {
-            "frontend_audio_failed"
-        }
-        _ => return,
-    };
-    mark(stage);
+pub(crate) fn frontend_diagnostic(kind: FrontendRuntimeDiagnosticKind) {
+    if let Some(stage) = frontend_diagnostic_stage(kind) {
+        mark(stage);
+    }
+}
+
+fn frontend_diagnostic_stage(kind: FrontendRuntimeDiagnosticKind) -> Option<&'static str> {
+    Some(match kind {
+        FrontendRuntimeDiagnosticKind::BenchmarkLifetimeRetire => "frontend_lifetime_retired",
+        FrontendRuntimeDiagnosticKind::BenchmarkControlsRetire => "frontend_controls_retired",
+        FrontendRuntimeDiagnosticKind::BenchmarkCapabilityRetire => "frontend_capability_retired",
+        FrontendRuntimeDiagnosticKind::BenchmarkAudioError => "frontend_audio_error",
+        FrontendRuntimeDiagnosticKind::BenchmarkCueError => "frontend_cue_error",
+        FrontendRuntimeDiagnosticKind::AudioFailed => "frontend_audio_failed",
+        _ => return None,
+    })
 }
 
 #[tauri::command]
@@ -708,6 +701,30 @@ fn snapshot(app_state: &AppState) -> Result<serde_json::Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frontend_categories_preserve_retirement_stages_without_inventing_backlog_causes() {
+        use FrontendRuntimeDiagnosticKind::*;
+        for (kind, expected) in [
+            (BenchmarkLifetimeRetire, "frontend_lifetime_retired"),
+            (BenchmarkControlsRetire, "frontend_controls_retired"),
+            (BenchmarkCapabilityRetire, "frontend_capability_retired"),
+            (BenchmarkAudioError, "frontend_audio_error"),
+            (BenchmarkCueError, "frontend_cue_error"),
+            (AudioFailed, "frontend_audio_failed"),
+        ] {
+            assert_eq!(frontend_diagnostic_stage(kind), Some(expected));
+        }
+        for kind in [
+            FrontendNotice,
+            ExecutionFailed,
+            MicrophoneStatusChanged,
+            ProfileSwitchFailed,
+            TtsToggleFailed,
+        ] {
+            assert_eq!(frontend_diagnostic_stage(kind), None);
+        }
+    }
 
     #[test]
     fn native_audio_metadata_separates_audio_failures_from_trace_loss() {

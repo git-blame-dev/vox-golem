@@ -57,7 +57,7 @@ async function mount(initial: Availability = 'available', session = new Frontend
     }
     if (command === 'reset_session') { sessionId = '3'; transcript = []; return snapshot() }
     if (command === 'get_update_snapshot') return { revision: 1, phase: 'up_to_date', operation: null, current_version: 'synthetic-version', version: null, notes: null, progress_phase: null, downloaded_bytes: 0, total_bytes: null, error: null, reason: null, auto_download_enabled: false, auto_install_enabled: false }
-    if (['record_frontend_runtime_diagnostic', 'write_runtime_log', 'check_for_update', 'clear_completion'].includes(command)) return null
+    if (['record_frontend_runtime_diagnostic', 'check_for_update', 'clear_completion'].includes(command)) return null
     unexpected.push(command)
     throw new Error(`Unexpected desktop controls fixture command: ${command}`)
   })

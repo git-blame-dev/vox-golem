@@ -35,7 +35,7 @@ describe('prompt terminal presentation and speech', () => {
       if (command === 'get_wake_clip_settings') return { enabled: false, directory: '/tmp/synthetic-clips' }
       if (command === 'list_wake_clips') return []
       if (command === 'list_audio_input_devices') return []
-      if (['record_frontend_runtime_diagnostic', 'write_runtime_log', 'check_for_update'].includes(command)) return null
+      if (['record_frontend_runtime_diagnostic', 'check_for_update'].includes(command)) return null
       unexpected.push(command)
       throw new Error(`Unexpected fixture command: ${command}`)
     })
@@ -105,7 +105,7 @@ describe('prompt terminal presentation and speech', () => {
       if (command === 'get_wake_clip_settings') return { enabled: false, directory: '/tmp/synthetic-clips' }
       if (command === 'list_wake_clips') return []
       if (command === 'list_audio_input_devices') return []
-      if (['record_frontend_runtime_diagnostic', 'write_runtime_log', 'check_for_update'].includes(command)) return null
+      if (['record_frontend_runtime_diagnostic', 'check_for_update'].includes(command)) return null
       throw new Error(`Unexpected fixture command: ${command}`)
     })
     window.__TAURI_INTERNALS__ = { invoke, createChannel: <T,>(send: (value: T) => void) => ({ send }) }

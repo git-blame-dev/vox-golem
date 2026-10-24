@@ -412,7 +412,7 @@ describe('App', () => {
         if (command === 'submit_prompt') return new Promise(() => undefined)
         if (command === 'cancel_prompt') return null
         if (command === 'get_update_snapshot' || command === 'check_for_update') return updateSnapshot()
-        if (command === 'record_frontend_runtime_diagnostic' || command === 'write_runtime_log') return null
+        if (command === 'record_frontend_runtime_diagnostic') return null
         unexpected.push(command)
         throw new Error(`Unexpected scroll fixture command: ${command}`)
       },
@@ -5441,7 +5441,6 @@ function setSelectValue(select: HTMLSelectElement, value: string): void {
 function nonDiagnosticCommands(commands: readonly string[]): readonly string[] {
   return commands.filter(
     (command) =>
-      command !== 'write_runtime_log' &&
       command !== 'record_frontend_runtime_diagnostic' &&
       command !== 'get_ui_text_size' &&
       command !== 'set_ui_text_size' &&

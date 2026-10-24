@@ -52,7 +52,14 @@ impl NativeAdmissionFixture {
         let mut state =
             build_startup_error_app_state(config, "Synthetic fixture initialization".into());
         state.conversation = owner();
-        state.telemetry_sink = None;
+        state.telemetry_sink = new_telemetry_sink(
+            voxgolem_core::config::TelemetryConfig {
+                enabled: false,
+                max_bytes: 2048,
+                backup_count: 0,
+            },
+            false,
+        );
         *state.startup_state.lock().unwrap() = ready_startup();
         *state.voice_pipeline_state.lock().unwrap() =
             voxgolem_core::voice_pipeline::VoicePipelineState::new(config).unwrap();

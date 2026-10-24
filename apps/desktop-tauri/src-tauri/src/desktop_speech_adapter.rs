@@ -284,7 +284,7 @@ fn start_worker(app: &tauri::AppHandle, state: &AppState) {
                 publish(&app, &state);
             }
             if result.is_err() {
-                log_category(&state, "native reply speech did not complete");
+                log_category(&state, super::diagnostics::TtsEvent::NativeReplyIncomplete);
             }
             // A cancelled helper result is not physical native-engine completion.
             // Keep this worker's update/work leases until the real call retires.
@@ -301,7 +301,10 @@ fn await_physical_retirement(state: &AppState) -> bool {
         }
         let waited_full_bound = started.elapsed() >= RETIREMENT_WAIT;
         if !reported {
-            log_category(state, "native reply speech awaiting physical retirement");
+            log_category(
+                state,
+                super::diagnostics::TtsEvent::NativeReplyAwaitingRetirement,
+            );
             reported = true;
         }
         // Tracking poison fails closed immediately. Do not busy-spin on corruption;
@@ -352,12 +355,8 @@ fn publish(app: &tauri::AppHandle, state: &AppState) {
     super::desktop_voice_adapter::notify(app, revision);
 }
 
-fn log_category(state: &AppState, category: &'static str) {
-    let enabled = state
-        .runtime_config
-        .as_ref()
-        .is_some_and(|config| config.logging.enabled);
-    super::log_tts_runtime_event(enabled, category);
+fn log_category(state: &AppState, category: super::diagnostics::TtsEvent) {
+    super::log_tts_runtime_event(&state.telemetry_sink, category);
 }
 
 #[cfg(test)]
