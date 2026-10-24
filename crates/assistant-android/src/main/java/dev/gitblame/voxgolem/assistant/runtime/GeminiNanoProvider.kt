@@ -7,10 +7,15 @@ import com.google.ai.edge.aicore.GenerativeAIException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 
 interface GeminiNanoEngine : AutoCloseable {
     suspend fun prepareInferenceEngine()
@@ -19,8 +24,11 @@ interface GeminiNanoEngine : AutoCloseable {
 
 class GeminiNanoProvider(
     private val context: Context,
+    private val requestTimeoutMs: Long = 180_000,
     private val engineFactory: (Context) -> GeminiNanoEngine = { DefaultGeminiNanoEngine(it) }
 ) : ProviderNativeCalls {
+
+    init { require(requestTimeoutMs > 0) }
 
     companion object {
         private const val TAG = "GeminiNanoProvider"
@@ -162,6 +170,8 @@ class GeminiNanoProvider(
         requestJson: String,
         callback: ProviderDeltaCallback
     ): String {
+        val requestStartedNanos = System.nanoTime()
+        fun remainingMs() = requestTimeoutMs - TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - requestStartedNanos)
         if (isCancelled(requestId)) {
             cancelledRequests.remove(requestId)
             return cancelledResult()
@@ -187,9 +197,12 @@ class GeminiNanoProvider(
             var errorResult: String? = null
 
             val isEngineWarm = synchronized(lock) { engine != null && warmedEngine === engine }
+            if (remainingMs() <= 0) return timeoutResult(requestId)
             val eng = try {
                 getOrCreateModel()
             } catch (_: Throwable) {
+                if (isCancelled(requestId)) return cancelledResult()
+                if (remainingMs() <= 0) return timeoutResult(requestId)
                 Log.e(TAG, "stage=engine_initialization_failed")
                 return failedResult("aicore_unavailable", "Failed to initialize Gemini Nano.")
             }
@@ -207,22 +220,34 @@ class GeminiNanoProvider(
                     }
 
                     try {
-                        val stream = eng.generateContentStream(finalPrompt)
-                        stream.collect { delta ->
-                            if (isCancelled(requestId)) {
-                                errorResult = cancelledResult()
-                                currentJob?.cancel()
-                                return@collect
-                            }
-                            if (delta.isNotEmpty()) {
-                                timing.onForwardedText(delta)?.let { elapsed ->
-                                    Log.i(TAG, "stage=first_text elapsed_ms=$elapsed")
-                                    callback.onFirstText(elapsed)
+                        val remaining = remainingMs()
+                        if (remaining <= 0) {
+                            errorResult = timeoutResult(requestId)
+                            return@runBlocking
+                        }
+                        // One overall budget includes preparation/admission inside the engine flow.
+                        // Its owned NonCancellable cleanup may outlive this logical deadline.
+                        withTimeout(remaining) {
+                            val stream = eng.generateContentStream(finalPrompt)
+                            stream.collect { delta ->
+                                currentCoroutineContext().ensureActive()
+                                if (isCancelled(requestId)) {
+                                    errorResult = cancelledResult()
+                                    currentJob?.cancel()
+                                    return@collect
                                 }
-                                accumulated.append(delta)
-                                callback.onDelta(delta)
+                                if (delta.isNotEmpty()) {
+                                    timing.onForwardedText(delta)?.let { elapsed ->
+                                        Log.i(TAG, "stage=first_text elapsed_ms=$elapsed")
+                                        callback.onFirstText(elapsed)
+                                    }
+                                    accumulated.append(delta)
+                                    callback.onDelta(delta)
+                                }
                             }
                         }
+                    } catch (_: TimeoutCancellationException) {
+                        errorResult = timeoutResult(requestId)
                     } catch (_: CancellationException) {
                         Log.i(TAG, "stage=request_cancelled")
                         errorResult = cancelledResult()
@@ -262,8 +287,9 @@ class GeminiNanoProvider(
                 return failedResult("internal_error", "Gemini Nano execution failed.")
             }
 
-            errorResult?.let { return it }
             if (isCancelled(requestId)) return cancelledResult()
+            errorResult?.let { return it }
+            if (remainingMs() <= 0) return timeoutResult(requestId)
 
             val answerText = accumulated.toString()
             if (answerText.isBlank()) {
@@ -274,7 +300,7 @@ class GeminiNanoProvider(
             runCatching {
                 Log.i(
                     "VoxGolemWorkflowTiming",
-                    "provider=gemini_nano model=gemini-nano warm=$isEngineWarm first_text_ms=$firstTextMs completed_ms=$completedMs retire_ms=0"
+                    "provider=gemini_nano model=gemini-nano warm=$isEngineWarm first_text_ms=$firstTextMs completed_ms=$completedMs"
                 )
             }
             val responseJson = JSONObject()
@@ -285,7 +311,6 @@ class GeminiNanoProvider(
                 .put("firstTextMs", firstTextMs)
                 .put("completedMs", completedMs)
                 .put("warm", isEngineWarm)
-                .put("retireMs", 0L)
             return responseJson.toString()
         } finally {
             cancelledRequests.remove(requestId)
@@ -315,6 +340,12 @@ class GeminiNanoProvider(
 
     private fun failedResult(code: String, message: String): String = JSONObject()
         .put("status", "error").put("code", code).put("message", message).toString()
+
+    private fun timeoutResult(requestId: String): String {
+        if (isCancelled(requestId)) return cancelledResult()
+        Log.i(TAG, "stage=request_timed_out")
+        return failedResult("timeout", "Gemini Nano request timed out.")
+    }
 
     private fun cancelledResult(): String =
         JSONObject().put("status", "cancelled").toString()

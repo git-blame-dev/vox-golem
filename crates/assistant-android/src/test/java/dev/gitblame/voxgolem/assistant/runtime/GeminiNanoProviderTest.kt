@@ -2,6 +2,13 @@ package dev.gitblame.voxgolem.assistant.runtime
 
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import com.google.ai.edge.aicore.GenerativeAIException
 import org.json.JSONArray
 import org.json.JSONObject
@@ -23,6 +30,130 @@ class GeminiNanoProviderTest {
     private fun joinWarmup(thread: Thread?) {
         thread?.join(5_000)
         assertFalse("Warmup did not finish", thread?.isAlive == true)
+    }
+
+    private fun request(provider: GeminiNanoProvider, callback: RecordingCallback = RecordingCallback()): JSONObject {
+        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        try {
+            return JSONObject(executor.submit<String> {
+                provider.respond("synthetic-deadline", "", "{}", callback)
+            }.get(3, TimeUnit.SECONDS))
+        } finally {
+            provider.cancel("synthetic-deadline"); executor.shutdownNow()
+            assertTrue(executor.awaitTermination(3, TimeUnit.SECONDS)); provider.close()
+        }
+    }
+
+    private fun engine(stream: suspend kotlinx.coroutines.flow.FlowCollector<String>.() -> Unit) = object : GeminiNanoEngine {
+        override suspend fun prepareInferenceEngine() {}
+        override fun generateContentStream(prompt: String): Flow<String> = flow(stream)
+        override fun close() {}
+    }
+
+    @Test fun noFirstDeltaAndSteadyDeltasBothUseTheOverallDeadlineNotAnIdleBudget() {
+        for (steady in listOf(false, true)) {
+            val callback = RecordingCallback()
+            val provider = GeminiNanoProvider(RuntimeEnvironment.getApplication(), requestTimeoutMs = 500) {
+                engine {
+                    if (!steady) awaitCancellation()
+                    while (true) { emit("synthetic partial "); delay(20) }
+                }
+            }
+            val result = request(provider, callback)
+            assertEquals("error", result.getString("status")); assertEquals("timeout", result.getString("code"))
+            assertFalse(result.has("text")); assertEquals(steady, callback.deltas.isNotEmpty())
+        }
+    }
+
+    @Test fun preparationAndAdmissionSuspensionsInsideTheEngineFlowShareTheRequestBudget() {
+        for (preparing in listOf(false, true)) {
+            val admission = Mutex(locked = true)
+            val provider = GeminiNanoProvider(RuntimeEnvironment.getApplication(), requestTimeoutMs = 500) {
+                object : GeminiNanoEngine {
+                    override suspend fun prepareInferenceEngine() { if (preparing) awaitCancellation() }
+                    override fun generateContentStream(prompt: String): Flow<String> = flow {
+                        prepareInferenceEngine()
+                        admission.withLock { emit("Must not be admitted") }
+                    }
+                    override fun close() {}
+                }
+            }
+            val callback = RecordingCallback()
+            val result = request(provider, callback)
+            assertEquals("timeout", result.getString("code")); assertTrue(callback.deltas.isEmpty())
+        }
+    }
+
+    @Test fun timeoutWaitsForOwnedCleanupObservedUserCancelWinsAndFollowingRequestCanComplete() {
+        for (cancel in listOf(false, true)) {
+            val cleanup = CountDownLatch(1); val release = CompletableDeferred<Unit>()
+            val attempts = AtomicInteger()
+            val provider = GeminiNanoProvider(RuntimeEnvironment.getApplication(), requestTimeoutMs = 500) {
+                engine {
+                    if (attempts.incrementAndGet() == 1) {
+                        try { emit("synthetic partial"); awaitCancellation() }
+                        finally { withContext(NonCancellable) { cleanup.countDown(); release.await() } }
+                    } else emit("synthetic recovered answer")
+                }
+            }
+            val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+            try {
+                val pending = executor.submit<String> { provider.respond("synthetic-cleanup", "", "{}", RecordingCallback()) }
+                assertTrue(cleanup.await(2, TimeUnit.SECONDS))
+                assertThrows(java.util.concurrent.TimeoutException::class.java) { pending.get(100, TimeUnit.MILLISECONDS) }
+                if (cancel) provider.cancel("synthetic-cleanup")
+                release.complete(Unit)
+                val result = JSONObject(pending.get(2, TimeUnit.SECONDS))
+                if (cancel) assertEquals("cancelled", result.getString("status"))
+                else { assertEquals("error", result.getString("status")); assertEquals("timeout", result.getString("code")) }
+                assertFalse(result.has("text"))
+                assertEquals("complete", JSONObject(provider.respond("synthetic-following", "", "{}", RecordingCallback())).getString("status"))
+            } finally {
+                release.complete(Unit); provider.cancel("synthetic-cleanup"); executor.shutdownNow()
+                assertTrue(executor.awaitTermination(3, TimeUnit.SECONDS)); provider.close()
+            }
+        }
+    }
+
+    @Test fun explicitCancellationBeforeTheDeadlineRemainsCancellation() {
+        val entered = CountDownLatch(1)
+        val provider = GeminiNanoProvider(RuntimeEnvironment.getApplication(), requestTimeoutMs = 2_000) {
+            engine { entered.countDown(); awaitCancellation() }
+        }
+        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        try {
+            val pending = executor.submit<String> { provider.respond("synthetic-user-cancel", "", "{}", RecordingCallback()) }
+            assertTrue(entered.await(2, TimeUnit.SECONDS)); provider.cancel("synthetic-user-cancel")
+            assertEquals("cancelled", JSONObject(pending.get(2, TimeUnit.SECONDS)).getString("status"))
+        } finally {
+            provider.cancel("synthetic-user-cancel"); executor.shutdownNow()
+            assertTrue(executor.awaitTermination(3, TimeUnit.SECONDS)); provider.close()
+        }
+    }
+
+    @Test fun shortResponseCompletesBeforeBudgetWithoutInventedRetirementMeasurement() {
+        val provider = GeminiNanoProvider(RuntimeEnvironment.getApplication(), requestTimeoutMs = 2_000) { FakeEngine() }
+        val result = request(provider)
+        assertEquals("complete", result.getString("status")); assertFalse(result.has("retireMs"))
+        assertTrue(org.robolectric.shadows.ShadowLog.getLogsForTag("VoxGolemWorkflowTiming").none {
+            it.msg.contains("provider=gemini_nano") && it.msg.contains("retire_ms=")
+        })
+    }
+
+    @Test fun synchronousEngineConstructionConsumesBudgetWithoutClaimingPreemption() {
+        var streams = 0
+        val provider = GeminiNanoProvider(RuntimeEnvironment.getApplication(), requestTimeoutMs = 200) {
+            Thread.sleep(300)
+            engine { streams++; emit("late answer") }
+        }
+        val result = request(provider)
+        assertEquals("timeout", result.getString("code")); assertEquals(0, streams)
+    }
+
+    @Test fun requestBudgetMustBePositive() {
+        for (budget in listOf(0L, -1L)) assertThrows(IllegalArgumentException::class.java) {
+            GeminiNanoProvider(RuntimeEnvironment.getApplication(), requestTimeoutMs = budget)
+        }
     }
 
     @Test fun concurrentPrewarmsShareOneAttemptAndSuccessfulWarmth() {
