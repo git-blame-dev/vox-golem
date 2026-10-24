@@ -2,7 +2,7 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import type { FrontendSession } from './FrontendSession'
 import type { TranscriptMessage, UiTextSize } from './types/chat'
 import { isTranscriptMessage } from './types/chat'
-import { ChatBubble, CopyMessageButton } from './components/ChatBubble'
+import { ChatBubble, MessageFooter } from './components/ChatBubble'
 import { AnswerStage } from './components/AnswerStage'
 import { duration } from './lib/duration'
 import { frontendTimingEnabled } from './lib/frontendTiming'
@@ -72,20 +72,20 @@ const TranscriptRow = memo(function TranscriptRow({ message, onAnswerDomCommitte
     ? null
     : duration(timings.firstTextMs)
   const canCopy = message.content.trim().length > 0
+  const canRaise = timingLabel === null &&
+    (message.answerStage.sources === undefined || message.answerStage.sources.length === 0) &&
+    !message.answerStage.stages.some(({ stage, detail }) => stage !== 'instant' || (typeof detail === 'string' && detail.trim() !== '')) &&
+    (message.answerStage.priorVersions === undefined || message.answerStage.priorVersions.length === 0)
   return <div className="conversation__answer" {...turnObservationAttributes(message)}>
     <AnswerStage compact answer={message.content} {...(message.thinkingStatus === undefined ? {} : { thinkingStatus: message.thinkingStatus })} className="message message--assistant" {...(message.contentKind === undefined ? {} : { contentKind: message.contentKind })} {...message.answerStage} />
-    {timingLabel !== null || canCopy ? (
-      <div className="message__footer message__footer--assistant">
-        {timingLabel !== null ? <small className="conversation__timings" data-custom-direct-timings="true">{timingLabel}</small> : null}
-        {canCopy ? (
-          <CopyMessageButton
-            text={message.content}
-            label="Copy response"
-            {...(message.answerStage.sources === undefined ? {} : { sources: message.answerStage.sources })}
-          />
-        ) : null}
-      </div>
-    ) : null}
+    <MessageFooter
+      role="assistant"
+      text={message.content}
+      canCopy={canCopy}
+      timingLabel={timingLabel}
+      {...(message.answerStage.sources === undefined ? {} : { sources: message.answerStage.sources })}
+      canRaise={canRaise}
+    />
   </div>
 })
 

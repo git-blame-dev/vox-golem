@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react'
 import type { JSX } from 'react'
 import type { FrontendSession } from '../FrontendSession'
 import type { TranscriptMessage } from '../types/chat'
@@ -89,6 +89,98 @@ export function CopyMessageButton({
   )
 }
 
+export function MessageFooter({
+  role,
+  text,
+  canCopy,
+  timingLabel,
+  sources,
+  canRaise = true,
+}: {
+  readonly role: 'user' | 'assistant' | 'system'
+  readonly text: string
+  readonly canCopy: boolean
+  readonly timingLabel: string | null
+  readonly sources?: readonly { readonly url: string; readonly title: string }[]
+  readonly canRaise?: boolean
+}): JSX.Element | null {
+  const footerRef = useRef<HTMLElement | null>(null)
+  const [raised, setRaised] = useState(false)
+
+  const shouldEvaluateRaise = timingLabel === null && canRaise !== false && canCopy
+
+  useLayoutEffect(() => {
+    const footerEl = footerRef.current
+    if (footerEl === null || !shouldEvaluateRaise) {
+      setRaised(false)
+      return
+    }
+    const paragraph = footerEl.parentElement?.querySelector('.message__content, .answer-stage__answer')
+    if (!(paragraph instanceof HTMLElement)) {
+      setRaised(false)
+      return
+    }
+
+    const checkRaise = (): void => {
+      const pRect = paragraph.getBoundingClientRect()
+      if (pRect.width === 0 || pRect.height === 0) {
+        setRaised(false)
+        return
+      }
+      const range = document.createRange()
+      range.selectNodeContents(paragraph)
+      const rects = range.getClientRects()
+      const lastRect = rects.length > 0 ? rects[rects.length - 1] ?? null : null
+      const buttonClearance = 32
+
+      let isRoomAvailable = false
+      if (lastRect !== null) {
+        if (role === 'assistant') {
+          isRoomAvailable = pRect.right - lastRect.right >= buttonClearance
+        } else if (role === 'user') {
+          isRoomAvailable = lastRect.left - pRect.left >= buttonClearance
+        }
+      }
+      setRaised(isRoomAvailable)
+    }
+
+    checkRaise()
+
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => {
+      checkRaise()
+    })
+    observer?.observe(paragraph)
+    observer?.observe(footerEl)
+
+    return () => {
+      observer?.disconnect()
+    }
+  }, [role, text, shouldEvaluateRaise])
+
+  if (timingLabel === null && !canCopy) return null
+
+  return (
+    <footer
+      ref={footerRef as React.RefObject<HTMLElement>}
+      className={`message__footer message__footer--${role}`}
+      {...(raised ? { 'data-raised': 'true' } : {})}
+    >
+      {timingLabel !== null ? (
+        <small className="conversation__timings" data-custom-direct-timings="true">
+          {timingLabel}
+        </small>
+      ) : null}
+      {canCopy ? (
+        <CopyMessageButton
+          text={text}
+          label={role === 'user' ? 'Copy prompt' : 'Copy response'}
+          {...(sources === undefined ? {} : { sources })}
+        />
+      ) : null}
+    </footer>
+  )
+}
+
 export function CopyConversationButton({ session, disabled = false }: { readonly session: FrontendSession; readonly disabled?: boolean }): JSX.Element {
   const messages = useSyncExternalStore(session.subscribe, session.getMessagesSnapshot, session.getMessagesSnapshot)
   const [copied, setCopied] = useState(false)
@@ -139,22 +231,13 @@ export function ChatBubble({ message }: ChatBubbleProps): JSX.Element {
       <p className="message__content">
         {isAssistantWaiting ? <span className="message__thinking message__status-pill">{message.thinkingStatus ?? 'Thinking…'}</span> : message.content}
       </p>
-      {timingLabel !== null || canCopy ? (
-        <div className={`message__footer message__footer--${message.role}`}>
-          {timingLabel !== null ? (
-            <small className="conversation__timings" data-custom-direct-timings="true">
-              {timingLabel}
-            </small>
-          ) : null}
-          {canCopy ? (
-            <CopyMessageButton
-              text={message.content}
-              label={message.role === 'user' ? 'Copy prompt' : 'Copy response'}
-              {...(message.answerStage?.sources === undefined ? {} : { sources: message.answerStage.sources })}
-            />
-          ) : null}
-        </div>
-      ) : null}
+      <MessageFooter
+        role={message.role}
+        text={message.content}
+        canCopy={canCopy}
+        timingLabel={timingLabel}
+        {...(message.answerStage?.sources === undefined ? {} : { sources: message.answerStage.sources })}
+      />
     </article>
   )
 }

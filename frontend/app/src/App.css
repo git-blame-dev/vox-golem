@@ -1,3 +1,13 @@
+.shell__speaker-control[aria-pressed='false'] {
+  color: var(--text-muted);
+  opacity: var(--disabled-opacity);
+}
+
+.shell__speaker-control[aria-pressed='true'] {
+  color: var(--text-primary);
+  opacity: 1;
+}
+
 .shell {
   --app-font-scale: 1;
   --shell-bg: #000000;
@@ -918,16 +928,24 @@
   padding-bottom: 0;
 }
 
+.message__footer[data-raised='true'] {
+  margin-top: -0.8em;
+}
+
 .message__footer--user {
-  justify-content: flex-end;
+  justify-content: flex-start;
+}
+
+.message__footer--assistant .message__copy-button {
+  margin-inline-start: auto;
 }
 
 .message__copy-button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 22px;
-  height: 22px;
+  width: 25.3px;
+  height: 25.3px;
   padding: 0;
   border: 1px solid transparent;
   border-radius: 999px;
@@ -945,8 +963,8 @@
 }
 
 .message__copy-button svg {
-  width: 18px;
-  height: 18px;
+  width: 20.7px;
+  height: 20.7px;
   fill: none;
   stroke: currentColor;
   stroke-width: 1.8;
@@ -1074,16 +1092,7 @@
 .shell[data-platform='android'] .shell__control:hover:not(:disabled),
 .shell[data-platform='android'] .shell__control[aria-pressed='true'] { background: var(--surface-glass-hover); }
 .shell[data-platform='android'] .shell__icon-control { width: 48px; height: 48px; }
-.shell__overflow { position: relative; flex: 0 0 auto; }
-.shell__overflow > summary { display: flex; list-style: none; cursor: pointer; align-items: center; justify-content: center; box-sizing: border-box; }
-.shell__overflow > summary::-webkit-details-marker { display: none; }
-.shell__overflow > summary:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
-.shell__overflow-actions { position: absolute; z-index: 10; top: 100%; inset-inline-end: 0; display: grid; gap: .35rem; width: max-content; max-width: calc(100vw - 32px); max-height: calc(100dvh - 100px); overflow-y: auto; padding: .5rem; box-sizing: border-box; border: 1px solid var(--border-soft); border-radius: 20px; background: var(--surface-panel-strong); box-shadow: 0 .5rem 1.5rem #0004; }
-.shell__overflow-actions > * { min-width: 0; max-width: 100%; }
-.shell .shell__overflow .shell__overflow-actions .shell__control { display: grid; grid-template-columns: 24px minmax(0, 1fr); align-items: center; justify-content: start; gap: .75rem; width: 100%; height: auto; min-width: 48px; min-height: 48px; padding: .5rem .75rem; box-sizing: border-box; text-align: start; white-space: normal; overflow-wrap: anywhere; }
-.shell .shell__overflow .shell__overflow-actions .shell__control > svg { width: 24px; height: 24px; margin: 0; }
-.shell__overflow-label { display: none; }
-.shell__overflow-actions .shell__overflow-label { display: inline; }
+
 .shell[data-platform='android'] .composer { padding-top: .35rem; padding-bottom: calc(.5rem + env(safe-area-inset-bottom)); }
 .shell[data-platform='android'] .composer__button,
 .shell[data-platform='android'] .composer__model-pill,

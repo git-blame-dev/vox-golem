@@ -822,7 +822,7 @@ describe('Android App lifecycle', () => {
     await act(async () => { input({ sessionId, kind: 'dictation', phase: 'partial', draft: 'Synthetic voice draft', utterance: '1', error: null }) })
     expect(composer.value).toBe('Synthetic voice draft')
     await act(async () => {
-      if (outcome === 'stop') container!.querySelector<HTMLButtonElement>('[aria-label="Cancel voice"]')!.click()
+      if (outcome === 'stop') container!.querySelector<HTMLButtonElement>('[aria-label="Stop voice"]')!.click()
       if (outcome === 'new-chat') container!.querySelector<HTMLButtonElement>('[aria-label="New Chat"]')!.click()
       if (outcome === 'background') { vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden'); document.dispatchEvent(new Event('visibilitychange')) }
     })

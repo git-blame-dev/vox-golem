@@ -3,7 +3,6 @@ import { createRoot } from 'react-dom/client'
 import type { Root } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { AndroidVoiceControlsProvider, AndroidComposerVoiceControl, AndroidVoiceSecondaryControls } from './AndroidVoiceControls'
-import { PhoneActionOverflow } from './PhoneActionOverflow'
 import type { AndroidVoiceAdapterView } from '../lib/useAndroidVoiceAdapter'
 import { parseAndroidVoiceStatus } from '../lib/androidVoice'
 
@@ -19,7 +18,7 @@ function render(value = voice(), generationAvailable = true, disabled = false, i
   if (!root) { container = document.createElement('div'); document.body.append(container); root = createRoot(container) }
   act(() => root!.render(<AndroidVoiceControlsProvider voice={value} disabled={disabled} interactionBlocked={interactionBlocked} generationAvailable={generationAvailable}>
     <AndroidComposerVoiceControl />
-    <PhoneActionOverflow><AndroidVoiceSecondaryControls /></PhoneActionOverflow>
+    <AndroidVoiceSecondaryControls />
   </AndroidVoiceControlsProvider>))
   return value
 }
@@ -70,23 +69,15 @@ describe('composer voice intent', () => {
     act(() => finish.click())
     expect(value.finishDictation).toHaveBeenCalledOnce()
     expect(value.stop).not.toHaveBeenCalled()
-    expect(container.querySelector('.shell__overflow-actions [aria-label="Cancel voice"] svg')).toBeNull()
+    expect(container.querySelector('[aria-label="Cancel voice"]')).toBeNull()
   })
-  it('keeps checking and finishing non-square, with cancellation in composer overflow only', () => {
+  it('keeps checking and finishing non-square, with no overflow menu', () => {
     const value = voice({ dictation: 'checking' }); value.active = true
     render(value)
     expect(button('Stop voice').querySelector('svg')?.getAttribute('data-icon-kind')).toBe('mic')
     expect(button('Stop voice').querySelector('svg')?.getAttribute('data-icon-state')).toBe('busy')
-    expect(container.querySelectorAll('[aria-label="Cancel voice"]')).toHaveLength(1)
-    const disclosure = container.querySelector<HTMLElement>('summary[aria-label="More actions"]')!
-    expect(disclosure.getAttribute('role')).toBe('button')
-    const actions = document.getElementById(disclosure.getAttribute('aria-controls')!)!
-    expect(actions.querySelector('[aria-label="Cancel voice"]')).not.toBeNull()
-    act(() => disclosure.click())
-    expect(disclosure.closest('details')?.open).toBe(true)
-    act(() => actions.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })))
-    expect(disclosure.closest('details')?.open).toBe(false)
-    expect(document.activeElement).toBe(disclosure)
+    expect(container.querySelector('[aria-label="Cancel voice"]')).toBeNull()
+    expect(container.querySelector('[aria-label="More actions"]')).toBeNull()
   })
   it('waits for native speech readiness before showing the listening square', () => {
     const value = voice({ mode: 'ask', dictation: 'listening', loop: 'listening', readyForSpeech: false }); value.active = true
@@ -95,14 +86,13 @@ describe('composer voice intent', () => {
     expect(button('Stop voice').querySelector('svg')?.getAttribute('data-icon-state')).toBe('busy')
     expect(button('Finish dictation')).toBeNull()
   })
-  it('finishes manual listening, disables repeat finish and retains explicit cancellation', () => {
+  it('finishes manual listening, disables repeat finish and retains explicit cancellation via stop', () => {
     const value = voice({ mode: 'dictation', dictation: 'listening', readyForSpeech: true }); value.active = true
     render(value)
     act(() => button('Finish dictation').click())
     expect(value.finishDictation).toHaveBeenCalledOnce()
     render({ ...value, status: { ...value.status!, dictation: 'finishing' } })
     expect(button('Finishing dictation').disabled).toBe(true)
-    act(() => button('Cancel voice').click())
-    expect(value.stop).toHaveBeenCalledOnce()
+    expect(container.querySelector('[aria-label="Cancel voice"]')).toBeNull()
   })
 })

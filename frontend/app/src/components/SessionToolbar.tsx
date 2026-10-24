@@ -7,7 +7,7 @@ import type { SessionViewProps } from '../sessionPolicy'
 import { AndroidVoiceSecondaryControls } from './AndroidVoiceControls'
 import { CopyConversationButton } from './ChatBubble'
 import { ControlIcon } from './ControlIcon'
-import type { ControlIconState } from './ControlIcon'
+
 
 export const SessionToolbar = memo(function SessionToolbar({ session, view }: SessionViewProps) {
   const {
@@ -36,19 +36,18 @@ export const SessionToolbar = memo(function SessionToolbar({ session, view }: Se
   const settingsControl = <button ref={settingsButtonRef} type="button" className="shell__control shell__settings-button shell__icon-control" onClick={openSettings} aria-label="Settings" aria-haspopup="dialog" aria-controls={SETTINGS_DIALOG_ID} aria-expanded={settingsOpen} title="Settings">
     <ControlIcon kind="settings" />
   </button>
-  const desktopSpeakerState: ControlIconState = ttsPlaying ? 'speaking' : ttsEnabled ? 'ready' : canToggleTts ? 'off' : 'unavailable'
   const desktopSpeakerDescription = ttsPlaying ? 'Speaking…' : ttsEnabled ? 'Speak replies enabled' : canToggleTts ? 'Speak replies off' : 'Speech output is unavailable'
   const desktopSpeakerControl = supportsDesktopRuntime ? (
     <button
       type="button"
-      className="shell__control shell__icon-control"
+      className="shell__control shell__icon-control shell__speaker-control"
       aria-label="Speak replies"
       title={`Speak replies: ${desktopSpeakerDescription}`}
       aria-pressed={ttsEnabled}
       disabled={!canToggleTts && !ttsEnabled}
       onClick={() => void toggleTts(!ttsEnabled)}
     >
-      <ControlIcon kind="speaker" state={desktopSpeakerState} />
+      <ControlIcon kind="speaker" />
     </button>
   ) : null
 

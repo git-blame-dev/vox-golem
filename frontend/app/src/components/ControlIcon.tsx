@@ -1,4 +1,4 @@
-export type ControlIconState = 'ready' | 'busy' | 'listening' | 'finishing' | 'generating' | 'speaking' | 'between-turns' | 'unavailable' | 'error' | 'off'
+export type ControlIconState = 'busy' | 'listening' | 'finishing' | 'generating' | 'speaking' | 'between-turns' | 'unavailable' | 'error'
 
 export function ControlIcon({ kind, state }: { readonly kind: 'plus' | 'mic' | 'conversation' | 'notes' | 'speaker' | 'model' | 'send' | 'search' | 'settings' | 'finish' | 'stop' | 'stop-send' | 'copy' | 'check'; readonly state?: ControlIconState }) {
   const paths = {
@@ -18,7 +18,6 @@ export function ControlIcon({ kind, state }: { readonly kind: 'plus' | 'mic' | '
     check: 'M20 6L9 17l-5-5',
   }
   const marks: Record<ControlIconState, string> = {
-    ready: 'M22 26l3 3 5-7',
     busy: 'M26 21a5 5 0 1 0 0 10 5 5 0 0 0 0-10 M26 23v3l2 1',
     listening: 'M22 25v3 M26 22v9 M30 24v5',
     finishing: 'M22 22h8v8h-8z M24 26l2 2 2-4',
@@ -27,7 +26,6 @@ export function ControlIcon({ kind, state }: { readonly kind: 'plus' | 'mic' | '
     'between-turns': 'M23 22v8 M29 22v8',
     unavailable: 'M22 22l8 8 M30 22l-8 8',
     error: 'M26 21l5 10H21z M26 25v2 M26 29h.01',
-    off: 'M22 30l8-8',
   }
   return <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" data-icon-kind={kind} data-icon-state={state}>
     <path d={paths[kind]} />
