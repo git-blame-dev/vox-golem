@@ -78,12 +78,12 @@ rustix = { version = "1", default-features = false, features = ["fs", "std", "pr
 
 [target.'cfg(windows)'.dependencies]
 win32job = { version = "2.0.3", optional = true }
-windows = { version = "=0.61.3", optional = true, features = ["Win32_Foundation", "Win32_System_JobObjects"] }
+windows = { version = "=0.61.3", optional = true, features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 
-# Match workspace lints, except permit the single audited Windows binding call
+# Match workspace lints, except permit the audited Windows binding calls
 # in managed_process. All other unsafe code remains denied in this crate.
 [lints.rust]
 unsafe_code = "deny"

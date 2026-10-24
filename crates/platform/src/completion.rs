@@ -33,7 +33,7 @@ macro_rules! bail {
 use crate::inference::{ActualInferenceProvider, InferencePolicy};
 use crate::managed_process::ManagedTokioProcess as Child;
 use crate::managed_process::{
-    configure_owned_tokio, terminate_tokio, ProcessOwnership, ProcessRole,
+    configure_owned_tokio, terminate_tokio, LaunchGate, ProcessOwnership, ProcessRole,
 };
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -193,13 +193,20 @@ impl CompletionRuntime {
             .stderr(Stdio::null())
             .kill_on_drop(true);
         configure_owned_tokio(&mut command);
-        let mut child = Child::spawn_owned(&mut command, ProcessRole::Completion)
-            .with_context(|| format!("failed to start {}", server.display()))?;
+        let std_deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+        let mut child = Child::spawn_owned_with(
+            &mut command,
+            ProcessRole::Completion,
+            &LaunchGate::new().with_deadline(std_deadline),
+        )
+        .map_err(crate::managed_process::LaunchError::into_io_error)
+        .with_context(|| format!("failed to start {}", server.display()))?;
         // This server is owned by the runtime; descendants must share its
         // Unix process group (Windows keeps tokio's existing behavior).
         let base_url = format!("http://127.0.0.1:{port}");
 
-        if let Err(error) = wait_until_ready(&client, &base_url, &mut child).await {
+        if let Err(error) = wait_until_ready(&client, &base_url, &mut child, deadline).await {
             stop_server(&mut child)
                 .await
                 .map_err(|error| format!("failed to retire completion server: {error}"))?;
@@ -516,28 +523,36 @@ fn transient_api_key() -> Result<String> {
     Ok(api_key)
 }
 
-async fn wait_until_ready(client: &Client, base_url: &str, child: &mut Child) -> Result<()> {
+async fn wait_until_ready(
+    client: &Client,
+    base_url: &str,
+    child: &mut Child,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
     let health_url = format!("{base_url}/health");
-    timeout(STARTUP_TIMEOUT, async {
-        loop {
-            if let Some(status) = child
-                .try_wait()
-                .context("failed to inspect llama-server status")?
-            {
-                bail!("llama-server exited during startup with {status}");
+    timeout(
+        deadline.saturating_duration_since(tokio::time::Instant::now()),
+        async {
+            loop {
+                if let Some(status) = child
+                    .try_wait()
+                    .context("failed to inspect llama-server status")?
+                {
+                    bail!("llama-server exited during startup with {status}");
+                }
+                if client
+                    .get(&health_url)
+                    .timeout(Duration::from_millis(500))
+                    .send()
+                    .await
+                    .is_ok_and(|response| response.status().is_success())
+                {
+                    return Ok(());
+                }
+                sleep(Duration::from_millis(100)).await;
             }
-            if client
-                .get(&health_url)
-                .timeout(Duration::from_millis(500))
-                .send()
-                .await
-                .is_ok_and(|response| response.status().is_success())
-            {
-                return Ok(());
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-    })
+        },
+    )
     .await
     .context("llama-server did not become ready within 120 seconds")?
 }

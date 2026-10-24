@@ -738,7 +738,7 @@ where
     C: Send + 'static,
     S: Send + 'static,
     D: FnOnce() -> Result<C, String> + Send + 'static,
-    Start: FnOnce(C) -> Started + Send + 'static,
+    Start: FnOnce(C, tokio::sync::watch::Receiver<bool>) -> Started + Send + 'static,
     Started: std::future::Future<Output = Result<S, String>> + Send + 'static,
     Finish: FnOnce(Result<S, String>, u64) -> Option<S> + Send + 'static,
     Retire: FnOnce(S) -> Retiring + Send + 'static,
@@ -834,7 +834,7 @@ where
                             if cancelled.changed().await.is_err() { break; }
                         }
                     } => return,
-                    result = start(config) => result,
+                    result = start(config, ticket.cancelled.subscribe()) => result,
                 }
             }
             Ok(_) => Err("OpenCode startup superseded".into()),
@@ -14158,10 +14158,13 @@ pub fn run() {
                 let queued = queue_opencode_startup(
                     &app.state::<AppState>(),
                     move || opencode_server_config(&config),
-                    |config| async move {
-                        voxgolem_platform::opencode::OpencodeServer::start(config)
-                            .await
-                            .map_err(|error| error.to_string())
+                    |config, cancelled| async move {
+                        voxgolem_platform::opencode::OpencodeServer::start_with_cancellation(
+                            config,
+                            Some(cancelled),
+                        )
+                        .await
+                        .map_err(|error| error.to_string())
                     },
                     move |result, initial_policy_generation| {
                         finish_opencode_startup(
@@ -19858,7 +19861,7 @@ mod tests {
             assert!(super::queue_opencode_startup(
                 &state,
                 || panic!("rejected work must never discover"),
-                |_: ()| async { Ok::<_, String>(7_u8) },
+                |_: (), _cancelled| async { Ok::<_, String>(7_u8) },
                 |_, _| panic!("rejected work must never publish"),
                 |_| async {},
             )
@@ -19921,7 +19924,7 @@ mod tests {
                 release_rx.recv().unwrap();
                 Ok(())
             },
-            |_| async { Ok::<_, String>(7_u8) },
+            |_, _cancelled| async { Ok::<_, String>(7_u8) },
             move |result, initial_policy_generation| {
                 assert_eq!(initial_policy_generation, 0);
                 assert_eq!(result.unwrap(), 7);
@@ -19985,7 +19988,7 @@ mod tests {
                 release_rx.recv().unwrap();
                 Ok(())
             },
-            |_| async { Ok::<_, String>(7_u8) },
+            |_, _cancelled| async { Ok::<_, String>(7_u8) },
             |_, _| panic!("abandoned startup must not publish"),
             |_| async {},
         )
@@ -20002,7 +20005,7 @@ mod tests {
         assert!(super::queue_opencode_startup(
             &state,
             || Ok(()),
-            |_| async { Ok::<_, String>(7_u8) },
+            |_, _cancelled| async { Ok::<_, String>(7_u8) },
             |_, _| None,
             |_| async {}
         )
@@ -20024,7 +20027,7 @@ mod tests {
         super::queue_opencode_startup(
             &state,
             || Ok(()),
-            move |_| async move {
+            move |_, _cancelled| async move {
                 // Models a synchronous native start returning in the same poll
                 // after exit was requested; cancellation cannot preempt it.
                 started_tx.send(()).unwrap();
@@ -20121,7 +20124,7 @@ mod tests {
                 }
                 Ok(())
             },
-            move |_| async move {
+            move |_, _cancelled| async move {
                 let _ = started_tx.send(());
                 if !hold_discovery {
                     ready_rx.await.unwrap();
@@ -20224,7 +20227,7 @@ mod tests {
         super::queue_opencode_startup(
             &state,
             || Ok(()),
-            move |_| async move {
+            move |_, _cancelled| async move {
                 started_tx.send(()).unwrap();
                 ready_rx.await.unwrap();
                 Err::<u8, _>("synthetic start failure".into())
@@ -20281,7 +20284,7 @@ mod tests {
         super::queue_opencode_startup(
             &state,
             || Err::<(), _>("synthetic discovery failure".into()),
-            |_| async {
+            |_, _cancelled| async {
                 Err::<voxgolem_platform::opencode::OpencodeServer, _>("must not start".into())
             },
             move |result, initial_policy_generation| {
@@ -20328,7 +20331,7 @@ mod tests {
         super::queue_opencode_startup(
             &state,
             || Err::<(), _>("synthetic discovery failure".into()),
-            |_| async {
+            |_, _cancelled| async {
                 Err::<voxgolem_platform::opencode::OpencodeServer, _>("must not start".into())
             },
             move |result, initial_policy_generation| {

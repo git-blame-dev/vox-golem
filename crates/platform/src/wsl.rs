@@ -304,8 +304,15 @@ impl WslRunner {
             .reserve(crate::managed_process::ProcessRole::WslCommand)
             .map_err(|_| WslError::Unavailable)?;
         let mut child = reservation
-            .spawn_std_with(&mut command, spawn_command)
-            .map_err(|_| WslError::Failed("process ownership"))?;
+            .spawn_std_with(
+                &mut command,
+                &crate::managed_process::LaunchGate::new().with_deadline(deadline),
+                spawn_command,
+            )
+            .map_err(|error| match error {
+                crate::managed_process::LaunchError::TimedOut => WslError::Timeout,
+                _ => WslError::Failed("process ownership"),
+            })?;
         child.set_grace(Duration::from_millis(750));
         let stdout_pipe = child.take_stdout().ok_or(WslError::Failed("output"))?;
         let stderr_pipe = child.take_stderr().ok_or(WslError::Failed("output"))?;

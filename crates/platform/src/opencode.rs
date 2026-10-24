@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::managed_process::ManagedTokioProcess as Child;
 use crate::managed_process::{
-    configure_owned_tokio, terminate_tokio, ProcessOwnership, ProcessRole,
+    configure_owned_tokio, terminate_tokio, LaunchError, LaunchGate, ProcessOwnership, ProcessRole,
 };
 use futures_util::StreamExt;
 use reqwest::{StatusCode, Url};
@@ -556,34 +556,37 @@ pub struct OpencodeClient {
 
 impl OpencodeServer {
     pub async fn start(config: OpencodeServerConfig) -> Result<Self, OpencodeServerError> {
+        Self::start_with_cancellation(config, None).await
+    }
+
+    pub async fn start_with_cancellation(
+        config: OpencodeServerConfig,
+        cancelled: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<Self, OpencodeServerError> {
+        let std_deadline = std::time::Instant::now() + config.startup_timeout;
+        let deadline = tokio::time::Instant::now() + config.startup_timeout;
+        if cancelled.as_ref().is_some_and(|rx| *rx.borrow()) {
+            return Err(OpencodeServerError::Io(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "OpenCode server startup cancelled",
+            )));
+        }
         let password = format!("voxgolem-{:032x}", rand::random::<u128>());
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
         let port = listener.local_addr()?.port();
         drop(listener);
         let wsl_owned = matches!(&config.launch, OpencodeServerLaunch::Wsl(_));
-        let mut child = spawn_server_process(&config.launch, port, &password).await?;
+        let mut child = spawn_server_process(
+            &config.launch,
+            port,
+            &password,
+            std_deadline,
+            cancelled.as_ref(),
+        )
+        .await?;
         if wsl_owned {
             child.set_grace(Duration::from_secs(2));
         }
-        #[cfg(windows)]
-        let mut process = match create_process_job(&child) {
-            Ok(job) => {
-                child.set_job(job);
-                OwnedServerProcess {
-                    child: Some(child),
-                    wsl_owned,
-                }
-            }
-            Err(error) => {
-                let mut process = OwnedServerProcess {
-                    child: Some(child),
-                    wsl_owned,
-                };
-                let _ = process.terminate().await;
-                return Err(error);
-            }
-        };
-        #[cfg(not(windows))]
         let mut process = OwnedServerProcess {
             child: Some(child),
             wsl_owned,
@@ -599,8 +602,14 @@ impl OpencodeServer {
             }
         };
         let base_url = format!("http://127.0.0.1:{port}");
-        let deadline = tokio::time::Instant::now() + config.startup_timeout;
         loop {
+            if cancelled.as_ref().is_some_and(|rx| *rx.borrow()) {
+                let _ = process.terminate().await;
+                return Err(OpencodeServerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "OpenCode server startup cancelled",
+                )));
+            }
             if tokio::time::Instant::now() >= deadline {
                 let _ = process.terminate().await;
                 return Err(OpencodeServerError::StartupTimeout);
@@ -742,29 +751,73 @@ fn server_command(launch: &OpencodeServerLaunch, port: u16, password: &str) -> T
     command
 }
 
+fn map_server_launch_error(error: LaunchError) -> OpencodeServerError {
+    match error {
+        LaunchError::TimedOut => OpencodeServerError::StartupTimeout,
+        LaunchError::Cancelled => OpencodeServerError::Io(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "OpenCode server startup cancelled",
+        )),
+        LaunchError::ChildExited(code) => OpencodeServerError::InvalidResponse(match code {
+            Some(code) => format!("OpenCode exited during startup: exit code {code}"),
+            None => String::from("OpenCode exited during startup"),
+        }),
+        LaunchError::Supervision(details) => {
+            #[cfg(windows)]
+            {
+                OpencodeServerError::ProcessJobFailed { details }
+            }
+            #[cfg(not(windows))]
+            {
+                OpencodeServerError::Io(std::io::Error::other(details))
+            }
+        }
+        LaunchError::Spawn(error) => OpencodeServerError::Io(error),
+    }
+}
+
 async fn spawn_server_process(
     launch: &OpencodeServerLaunch,
     port: u16,
     password: &str,
-) -> std::io::Result<Child> {
+    deadline: std::time::Instant,
+    cancelled: Option<&tokio::sync::watch::Receiver<bool>>,
+) -> Result<Child, OpencodeServerError> {
+    let check_cancelled = || cancelled.is_some_and(|rx| *rx.borrow());
+    let mut gate = LaunchGate::new().with_deadline(deadline);
+    if cancelled.is_some() {
+        gate = gate.with_cancellation(&check_cancelled);
+    }
+
     #[cfg(unix)]
     for attempt in 0..ETXTBSY_RETRY_COUNT {
-        match Child::spawn_owned(
+        match Child::spawn_owned_with(
             &mut server_command(launch, port, password),
             ProcessRole::OpenCode,
+            &gate,
         ) {
-            Err(error) if is_executable_busy(&error) && attempt + 1 < ETXTBSY_RETRY_COUNT => {
+            Err(LaunchError::Spawn(error))
+                if is_executable_busy(&error) && attempt + 1 < ETXTBSY_RETRY_COUNT =>
+            {
+                if check_cancelled() {
+                    return Err(map_server_launch_error(LaunchError::Cancelled));
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(OpencodeServerError::StartupTimeout);
+                }
                 tokio::time::sleep(ETXTBSY_RETRY_DELAY).await;
             }
-            result => return result,
+            result => return result.map_err(map_server_launch_error),
         }
     }
 
     #[cfg(not(unix))]
-    return Child::spawn_owned(
+    return Child::spawn_owned_with(
         &mut server_command(launch, port, password),
         ProcessRole::OpenCode,
-    );
+        &gate,
+    )
+    .map_err(map_server_launch_error);
 
     #[cfg(unix)]
     unreachable!("the bounded server spawn retry loop always returns")
@@ -1111,27 +1164,6 @@ async fn terminate_child(child: &mut Child, wsl_owned: bool) -> std::io::Result<
         child.set_grace(Duration::from_secs(2));
     }
     terminate_tokio(child, ProcessOwnership::Owned, Duration::from_secs(2)).await
-}
-
-#[cfg(windows)]
-fn create_process_job(child: &Child) -> Result<win32job::Job, OpencodeServerError> {
-    let mut limits = win32job::ExtendedLimitInfo::new();
-    limits.limit_kill_on_job_close();
-    let job = win32job::Job::create_with_limit_info(&limits).map_err(|e| {
-        OpencodeServerError::ProcessJobFailed {
-            details: e.to_string(),
-        }
-    })?;
-    let raw_handle = child
-        .raw_handle()
-        .ok_or_else(|| OpencodeServerError::ProcessJobFailed {
-            details: String::from("OpenCode child process has no Windows handle"),
-        })?;
-    job.assign_process(raw_handle as isize)
-        .map_err(|e| OpencodeServerError::ProcessJobFailed {
-            details: e.to_string(),
-        })?;
-    Ok(job)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1817,6 +1849,21 @@ mod tests {
         })
         .await
         .expect("WSL drop fallback should close the control pipe and reap the child");
+    }
+
+    #[tokio::test]
+    async fn start_with_cancellation_rejects_pre_cancelled_receiver_without_spawning() {
+        let (_tx, rx) = tokio::sync::watch::channel(true);
+        let result = super::OpencodeServer::start_with_cancellation(
+            OpencodeServerConfig::new("definitely-missing-synthetic-opencode-binary"),
+            Some(rx),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(OpencodeServerError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::Interrupted
+        ));
     }
 
     #[test]

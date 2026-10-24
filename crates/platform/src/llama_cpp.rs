@@ -1,12 +1,14 @@
 use crate::inference::{ActualInferenceProvider, InferencePolicy};
-use crate::managed_process::{ensure_role_retired, ManagedProcess, ProcessRole};
+use crate::managed_process::{
+    ensure_role_retired, LaunchError, LaunchGate, ManagedProcess, ProcessRole,
+};
 use rand::random;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -16,11 +18,7 @@ thread_local! {
     static IN_CHAT_PUBLICATION_CALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[cfg(windows)]
-use std::os::windows::{io::AsRawHandle, process::CommandExt};
-
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
@@ -405,6 +403,7 @@ impl LlamaCppRuntime {
         mode: LlamaCppServerMode,
         cancellation: Option<&LlamaCppStartupCancellation>,
     ) -> Result<Self, LlamaCppRuntimeError> {
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
         if cancellation.is_some_and(|token| token.is_cancelled()) {
             return Err(LlamaCppRuntimeError::StartupCancelled);
         }
@@ -452,26 +451,30 @@ impl LlamaCppRuntime {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        configure_llama_server_command(&mut command);
-        let mut child =
-            ManagedProcess::spawn_owned(&mut command, ProcessRole::LlamaCpp).map_err(|error| {
-                LlamaCppRuntimeError::SpawnFailed {
-                    details: error.to_string(),
-                }
-            })?;
-
-        #[cfg(windows)]
-        let process_job = create_owned_process_job(child.child()).inspect_err(|_| {
-            let _ = child.terminate(Duration::from_secs(2));
-        })?;
-        #[cfg(windows)]
-        if let Some(job) = process_job {
-            child.set_job(job);
+        let check_cancelled = || cancellation.is_some_and(|token| token.is_cancelled());
+        let mut gate = LaunchGate::new()
+            .with_creation_flags(CREATE_NO_WINDOW)
+            .with_deadline(deadline);
+        if cancellation.is_some() {
+            gate = gate.with_cancellation(&check_cancelled);
         }
-        #[cfg(not(windows))]
-        create_owned_process_job(child.child()).inspect_err(|_| {
-            let _ = child.terminate(Duration::from_secs(2));
-        })?;
+        let child = ManagedProcess::spawn_owned_with(&mut command, ProcessRole::LlamaCpp, &gate)
+            .map_err(|error| match error {
+                LaunchError::Cancelled => LlamaCppRuntimeError::StartupCancelled,
+                LaunchError::TimedOut => LlamaCppRuntimeError::StartupTimedOut {
+                    host: spec.host().to_string(),
+                    port: spec.port(),
+                },
+                LaunchError::ChildExited(exit_code) => {
+                    LlamaCppRuntimeError::ServerExited { exit_code }
+                }
+                LaunchError::Supervision(details) => {
+                    LlamaCppRuntimeError::ProcessJobFailed { details }
+                }
+                LaunchError::Spawn(error) => LlamaCppRuntimeError::SpawnFailed {
+                    details: error.to_string(),
+                },
+            })?;
 
         let mut runtime = Self {
             spec,
@@ -482,7 +485,7 @@ impl LlamaCppRuntime {
                 ActualInferenceProvider::Cpu
             },
         };
-        if let Err(error) = runtime.wait_until_ready(cancellation) {
+        if let Err(error) = runtime.wait_until_ready(cancellation, deadline) {
             runtime
                 .shutdown_owned()
                 .map_err(|_| LlamaCppRuntimeError::SpawnFailed {
@@ -532,9 +535,8 @@ impl LlamaCppRuntime {
     fn wait_until_ready(
         &mut self,
         cancellation: Option<&LlamaCppStartupCancellation>,
+        deadline: Instant,
     ) -> Result<(), LlamaCppRuntimeError> {
-        let deadline = Instant::now() + STARTUP_TIMEOUT;
-
         loop {
             if cancellation.is_some_and(|token| token.is_cancelled()) {
                 return Err(LlamaCppRuntimeError::StartupCancelled);
@@ -969,38 +971,6 @@ impl Drop for LlamaCppRuntime {
     fn drop(&mut self) {
         self.child.take();
     }
-}
-
-fn configure_llama_server_command(command: &mut Command) {
-    #[cfg(windows)]
-    {
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    #[cfg(not(windows))]
-    let _ = command;
-}
-
-#[cfg(windows)]
-fn create_owned_process_job(child: &Child) -> Result<Option<win32job::Job>, LlamaCppRuntimeError> {
-    let mut limit_info = win32job::ExtendedLimitInfo::new();
-    limit_info.limit_kill_on_job_close();
-
-    let job = win32job::Job::create_with_limit_info(&limit_info).map_err(|error| {
-        LlamaCppRuntimeError::ProcessJobFailed {
-            details: error.to_string(),
-        }
-    })?;
-    job.assign_process(child.as_raw_handle() as isize)
-        .map_err(|error| LlamaCppRuntimeError::ProcessJobFailed {
-            details: error.to_string(),
-        })?;
-
-    Ok(Some(job))
-}
-
-#[cfg(not(windows))]
-fn create_owned_process_job(_child: &Child) -> Result<(), LlamaCppRuntimeError> {
-    Ok(())
 }
 
 #[derive(Debug)]
