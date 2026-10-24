@@ -33,10 +33,17 @@ class AgyProcessTest {
         val entered = CountDownLatch(1)
         val unblock = CountDownLatch(1)
         val input = ByteArrayOutputStream()
+        val closeBeforeDestroy = AtomicBoolean()
+        val destroyRequested = AtomicBoolean()
+        val closeCalls = AtomicInteger()
         @Volatile var exited = false
         private val source = ByteArrayInputStream(output.toByteArray())
         private fun block() { entered.countDown(); check(unblock.await(5, TimeUnit.SECONDS)) }
         override fun getOutputStream() = object : OutputStream() {
+            override fun close() {
+                closeCalls.incrementAndGet()
+                if (!destroyRequested.get()) closeBeforeDestroy.set(true)
+            }
             override fun write(value: Int) { input.write(value) }
             override fun write(bytes: ByteArray, offset: Int, length: Int) {
                 if (blockWrite) block()
@@ -53,7 +60,7 @@ class AgyProcessTest {
         override fun exitValue(): Int { if (!exited) throw IllegalThreadStateException(); return 0 }
         override fun waitFor(): Int { check(unblock.await(5, TimeUnit.SECONDS)); return 0 }
         override fun waitFor(timeout: Long, unit: TimeUnit): Boolean = exited
-        override fun destroy() { if (!ignoreDestroy) { exited = true; unblock.countDown() } }
+        override fun destroy() { destroyRequested.set(true); if (!ignoreDestroy) { exited = true; unblock.countDown() } }
         override fun destroyForcibly(): Process { destroy(); return this }
     }
     private class Callback : ProviderDeltaCallback {
@@ -134,9 +141,29 @@ class AgyProcessTest {
                     native.cancel("synthetic-blocked")
                     assertEquals("cancelled", JSONObject(result.get(1, TimeUnit.SECONDS)).getString("status"))
                     assertTrue(engine.exited)
+                    assertFalse("Stdin close must not precede destroy while a writer can hold its lock", engine.closeBeforeDestroy.get())
                 } finally { engine.unblock.countDown(); executor.shutdownNow(); assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS)) }
             }
         }
+    }
+    @Test fun retirementConfirmsExitBeforeClosingStdinAndLeavesAlreadyExitedProcessesAlone() {
+        val engine = Engine("", ignoreDestroy = true)
+        assertFalse(retireAgyProcess(engine, 1))
+        assertTrue(engine.destroyRequested.get())
+        assertEquals("An unconfirmed process can still hold the stdin writer lock", 0, engine.closeCalls.get())
+        engine.ignoreDestroy = false
+        assertTrue(retireAgyProcess(engine, 1))
+        assertEquals(1, engine.closeCalls.get())
+        assertFalse(engine.closeBeforeDestroy.get())
+        assertTrue(retireAgyProcess(engine, 1))
+        assertEquals(1, engine.closeCalls.get())
+    }
+    @Test @Config(sdk = [24, 25]) fun legacyRetirementRequestsDestroyBeforeClosingStdin() {
+        val engine = Engine("")
+        assertTrue(retireAgyProcess(engine, 1))
+        assertTrue(engine.destroyRequested.get())
+        assertFalse(engine.closeBeforeDestroy.get())
+        assertEquals(1, engine.closeCalls.get())
     }
     @Test fun workerRouterCancellationDuringStartupIsPromptButRetirementWaitsForItsLateProcess() {
         val entered = CountDownLatch(1); val release = CountDownLatch(1)
