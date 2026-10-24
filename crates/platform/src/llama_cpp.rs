@@ -1,5 +1,5 @@
 use crate::inference::{ActualInferenceProvider, InferencePolicy};
-use crate::managed_process::ManagedProcess;
+use crate::managed_process::{ensure_role_retired, ManagedProcess, ProcessRole};
 use rand::random;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
@@ -100,8 +100,6 @@ impl LlamaCppServerSpec {
 pub struct LlamaCppRuntime {
     spec: LlamaCppServerSpec,
     child: Option<ManagedProcess>,
-    #[cfg(windows)]
-    process_job: Option<win32job::Job>,
     provider: ActualInferenceProvider,
 }
 
@@ -276,6 +274,11 @@ enum LlamaCppServerMode {
 
 impl LlamaCppRuntime {
     pub fn start(spec: LlamaCppServerSpec) -> Result<Self, LlamaCppRuntimeError> {
+        ensure_role_retired(ProcessRole::LlamaCpp).map_err(|_| {
+            LlamaCppRuntimeError::SpawnFailed {
+                details: "managed_process_retirement_pending".into(),
+            }
+        })?;
         if !is_loopback_host(spec.host()) {
             return Err(LlamaCppRuntimeError::HttpFailed {
                 details: "llama.cpp host must be loopback".to_string(),
@@ -351,6 +354,11 @@ impl LlamaCppRuntime {
         mode: LlamaCppServerMode,
         cancellation: Option<&LlamaCppStartupCancellation>,
     ) -> Result<Self, LlamaCppRuntimeError> {
+        ensure_role_retired(ProcessRole::LlamaCpp).map_err(|_| {
+            LlamaCppRuntimeError::SpawnFailed {
+                details: "managed_process_retirement_pending".into(),
+            }
+        })?;
         if cancellation.is_some_and(LlamaCppStartupCancellation::is_cancelled) {
             return Err(LlamaCppRuntimeError::StartupCancelled);
         }
@@ -445,16 +453,21 @@ impl LlamaCppRuntime {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         configure_llama_server_command(&mut command);
-        let mut child = ManagedProcess::spawn_owned(&mut command).map_err(|error| {
-            LlamaCppRuntimeError::SpawnFailed {
-                details: error.to_string(),
-            }
-        })?;
+        let mut child =
+            ManagedProcess::spawn_owned(&mut command, ProcessRole::LlamaCpp).map_err(|error| {
+                LlamaCppRuntimeError::SpawnFailed {
+                    details: error.to_string(),
+                }
+            })?;
 
         #[cfg(windows)]
         let process_job = create_owned_process_job(child.child()).inspect_err(|_| {
             let _ = child.terminate(Duration::from_secs(2));
         })?;
+        #[cfg(windows)]
+        if let Some(job) = process_job {
+            child.set_job(job);
+        }
         #[cfg(not(windows))]
         create_owned_process_job(child.child()).inspect_err(|_| {
             let _ = child.terminate(Duration::from_secs(2));
@@ -463,8 +476,6 @@ impl LlamaCppRuntime {
         let mut runtime = Self {
             spec,
             child: Some(child),
-            #[cfg(windows)]
-            process_job,
             provider: if cuda {
                 ActualInferenceProvider::RequestedCuda
             } else {
@@ -472,7 +483,11 @@ impl LlamaCppRuntime {
             },
         };
         if let Err(error) = runtime.wait_until_ready(cancellation) {
-            runtime.shutdown_owned();
+            runtime
+                .shutdown_owned()
+                .map_err(|_| LlamaCppRuntimeError::SpawnFailed {
+                    details: "managed process retirement failed".into(),
+                })?;
             return Err(error);
         }
         Ok(runtime)
@@ -482,8 +497,6 @@ impl LlamaCppRuntime {
         Self {
             spec,
             child: None,
-            #[cfg(windows)]
-            process_job: None,
             provider: ActualInferenceProvider::AttachedUnknown,
         }
     }
@@ -508,15 +521,12 @@ impl LlamaCppRuntime {
         }
     }
 
-    pub fn shutdown_owned(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.terminate(Duration::from_secs(2));
+    pub fn shutdown_owned(&mut self) -> std::io::Result<()> {
+        if let Some(child) = self.child.as_mut() {
+            child.terminate(Duration::from_secs(2))?;
         }
-
-        #[cfg(windows)]
-        {
-            self.process_job = None;
-        }
+        self.child = None;
+        Ok(())
     }
 
     fn wait_until_ready(
@@ -957,7 +967,7 @@ fn checked_write(
 
 impl Drop for LlamaCppRuntime {
     fn drop(&mut self) {
-        self.shutdown_owned();
+        self.child.take();
     }
 }
 
@@ -1396,8 +1406,8 @@ mod tests {
     use super::{
         build_chat_completion_request, decode_chunked_body, http_host_authority, is_loopback_host,
         parse_http_response, send_http_request, send_http_request_with_timeout, ChunkedDecoder,
-        InferencePolicy, LlamaCppChatCancellation, LlamaCppPrompt, LlamaCppRuntime,
-        LlamaCppRuntimeError, LlamaCppServerSpec,
+        LlamaCppChatCancellation, LlamaCppPrompt, LlamaCppRuntime, LlamaCppRuntimeError,
+        LlamaCppServerSpec,
     };
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -2110,6 +2120,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn cancellable_startup_reaps_owned_child_when_cancelled_during_readiness() {
+        use super::InferencePolicy;
         use std::os::unix::fs::PermissionsExt;
         use std::path::Path;
         use std::time::Instant;

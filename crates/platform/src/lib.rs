@@ -1,4 +1,5 @@
-#![forbid(unsafe_code)]
+#![cfg_attr(not(all(windows, feature = "desktop")), forbid(unsafe_code))]
+#![cfg_attr(all(windows, feature = "desktop"), deny(unsafe_code))]
 #![deny(unused_must_use)]
 
 #[cfg(any(feature = "custom-openai", feature = "custom-openai-webpki"))]

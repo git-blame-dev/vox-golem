@@ -33,7 +33,7 @@ macro_rules! bail {
 use crate::inference::{ActualInferenceProvider, InferencePolicy};
 use crate::managed_process::ManagedTokioProcess as Child;
 use crate::managed_process::{
-    configure_owned_tokio, terminate_tokio, terminate_tokio_on_drop, ProcessOwnership,
+    configure_owned_tokio, terminate_tokio, ProcessOwnership, ProcessRole,
 };
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -129,6 +129,7 @@ impl CompletionRuntime {
             && result.as_ref().is_err_and(|error| {
                 let text = error.to_string();
                 !text.contains("failed to start")
+                    && !text.contains("failed to retire")
                     && !text.contains("was not found")
                     && !text.contains("path did not have")
                     && !text.contains("path is not valid")
@@ -192,16 +193,16 @@ impl CompletionRuntime {
             .stderr(Stdio::null())
             .kill_on_drop(true);
         configure_owned_tokio(&mut command);
-        let mut child = command
-            .spawn()
-            .and_then(Child::from_owned_child)
+        let mut child = Child::spawn_owned(&mut command, ProcessRole::Completion)
             .with_context(|| format!("failed to start {}", server.display()))?;
         // This server is owned by the runtime; descendants must share its
         // Unix process group (Windows keeps tokio's existing behavior).
         let base_url = format!("http://127.0.0.1:{port}");
 
         if let Err(error) = wait_until_ready(&client, &base_url, &mut child).await {
-            let _ = stop_server(&mut child).await;
+            stop_server(&mut child)
+                .await
+                .map_err(|error| format!("failed to retire completion server: {error}"))?;
             return Err(error);
         }
 
@@ -229,18 +230,18 @@ impl CompletionRuntime {
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
-        let Some(mut server) = self.server.take() else {
+        let Some(server) = self.server.as_mut() else {
             return Ok(());
         };
-        stop_server(&mut server).await
+        stop_server(server).await?;
+        self.server = None;
+        Ok(())
     }
 }
 
 impl Drop for CompletionRuntime {
     fn drop(&mut self) {
-        if let Some(server) = self.server.take() {
-            terminate_tokio_on_drop(server, ProcessOwnership::Owned);
-        }
+        self.server.take();
     }
 }
 
@@ -795,8 +796,7 @@ mod tests {
         let mut command = Command::new("sh");
         command.args(["-c", "exec sleep 30"]).kill_on_drop(true);
         configure_owned_tokio(&mut command);
-        let child =
-            Child::from_owned_child(command.spawn().expect("test child should start")).unwrap();
+        let child = Child::spawn_test(&mut command).unwrap();
         let pid = child.id().expect("test child should expose its pid");
         let runtime = CompletionRuntime {
             server: Some(child),

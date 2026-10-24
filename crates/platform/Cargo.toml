@@ -57,6 +57,7 @@ desktop = [
   "tokio/sync",
   "tokio/time",
   "dep:win32job",
+  "dep:windows",
 ]
 
 [dependencies]
@@ -73,13 +74,20 @@ rand = { version = "0.9", optional = true }
 webpki-roots = { version = "1", optional = true }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", default-features = false, features = ["fs", "std"] }
+rustix = { version = "1", default-features = false, features = ["fs", "std", "process"] }
 
 [target.'cfg(windows)'.dependencies]
 win32job = { version = "2.0.3", optional = true }
+windows = { version = "=0.61.3", optional = true, features = ["Win32_Foundation", "Win32_System_JobObjects"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 
-[lints]
-workspace = true
+# Match workspace lints, except permit the single audited Windows binding call
+# in managed_process. All other unsafe code remains denied in this crate.
+[lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+all = "deny"

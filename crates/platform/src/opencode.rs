@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::managed_process::ManagedTokioProcess as Child;
 use crate::managed_process::{
-    configure_owned_tokio, terminate_tokio, terminate_tokio_on_drop, ProcessOwnership,
+    configure_owned_tokio, terminate_tokio, ProcessOwnership, ProcessRole,
 };
 use futures_util::StreamExt;
 use reqwest::{StatusCode, Url};
@@ -543,8 +543,6 @@ pub struct OpencodeServer {
 struct OwnedServerProcess {
     child: Option<Child>,
     wsl_owned: bool,
-    #[cfg(windows)]
-    process_job: Option<win32job::Job>,
 }
 
 #[derive(Clone)]
@@ -563,21 +561,25 @@ impl OpencodeServer {
         let port = listener.local_addr()?.port();
         drop(listener);
         let wsl_owned = matches!(&config.launch, OpencodeServerLaunch::Wsl(_));
-        let child = spawn_server_process(&config.launch, port, &password).await?;
+        let mut child = spawn_server_process(&config.launch, port, &password).await?;
+        if wsl_owned {
+            child.set_grace(Duration::from_secs(2));
+        }
         #[cfg(windows)]
         let mut process = match create_process_job(&child) {
-            Ok(job) => OwnedServerProcess {
-                child: Some(child),
-                wsl_owned,
-                process_job: Some(job),
-            },
+            Ok(job) => {
+                child.set_job(job);
+                OwnedServerProcess {
+                    child: Some(child),
+                    wsl_owned,
+                }
+            }
             Err(error) => {
                 let mut process = OwnedServerProcess {
                     child: Some(child),
                     wsl_owned,
-                    process_job: None,
                 };
-                process.terminate().await;
+                let _ = process.terminate().await;
                 return Err(error);
             }
         };
@@ -592,7 +594,7 @@ impl OpencodeServer {
         {
             Ok(client) => client,
             Err(error) => {
-                process.terminate().await;
+                let _ = process.terminate().await;
                 return Err(error.into());
             }
         };
@@ -600,18 +602,18 @@ impl OpencodeServer {
         let deadline = tokio::time::Instant::now() + config.startup_timeout;
         loop {
             if tokio::time::Instant::now() >= deadline {
-                process.terminate().await;
+                let _ = process.terminate().await;
                 return Err(OpencodeServerError::StartupTimeout);
             }
             let child_status = match process.child_mut().try_wait() {
                 Ok(status) => status,
                 Err(error) => {
-                    process.terminate().await;
+                    let _ = process.terminate().await;
                     return Err(error.into());
                 }
             };
             if let Some(status) = child_status {
-                process.terminate().await;
+                let _ = process.terminate().await;
                 return Err(OpencodeServerError::InvalidResponse(format!(
                     "OpenCode exited during startup: {status}"
                 )));
@@ -647,7 +649,7 @@ impl OpencodeServer {
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            process.terminate().await;
+            process.terminate().await?;
             return Err(OpencodeServerError::StartupTimeout);
         }
         let session_id = match create_session_before_deadline(
@@ -661,7 +663,7 @@ impl OpencodeServer {
         {
             Ok(session_id) => session_id,
             Err(error) => {
-                process.terminate().await;
+                let _ = process.terminate().await;
                 return Err(error);
             }
         };
@@ -695,7 +697,7 @@ impl OpencodeServer {
         })
         .await;
         if let Some(mut process) = self.process.take() {
-            process.terminate().await;
+            process.terminate().await?;
         }
         Ok(())
     }
@@ -747,18 +749,22 @@ async fn spawn_server_process(
 ) -> std::io::Result<Child> {
     #[cfg(unix)]
     for attempt in 0..ETXTBSY_RETRY_COUNT {
-        match server_command(launch, port, password).spawn() {
+        match Child::spawn_owned(
+            &mut server_command(launch, port, password),
+            ProcessRole::OpenCode,
+        ) {
             Err(error) if is_executable_busy(&error) && attempt + 1 < ETXTBSY_RETRY_COUNT => {
                 tokio::time::sleep(ETXTBSY_RETRY_DELAY).await;
             }
-            result => return result.and_then(Child::from_owned_child),
+            result => return result,
         }
     }
 
     #[cfg(not(unix))]
-    return server_command(launch, port, password)
-        .spawn()
-        .and_then(Child::from_owned_child);
+    return Child::spawn_owned(
+        &mut server_command(launch, port, password),
+        ProcessRole::OpenCode,
+    );
 
     #[cfg(unix)]
     unreachable!("the bounded server spawn retry loop always returns")
@@ -957,29 +963,19 @@ impl OwnedServerProcess {
         self.child.as_mut().expect("owned server process")
     }
 
-    async fn terminate(&mut self) {
+    async fn terminate(&mut self) -> std::io::Result<()> {
         let wsl_owned = self.wsl_owned;
         if let Some(child) = self.child.as_mut() {
-            terminate_child(child, wsl_owned).await;
+            terminate_child(child, wsl_owned).await?;
         }
         self.child = None;
-        #[cfg(windows)]
-        {
-            self.process_job = None;
-        }
+        Ok(())
     }
 }
 
 impl Drop for OwnedServerProcess {
     fn drop(&mut self) {
-        let Some(child) = self.child.take() else {
-            return;
-        };
-        #[cfg(windows)]
-        let process_guard = self.process_job.take();
-        #[cfg(not(windows))]
-        let process_guard = ();
-        terminate_child_on_drop(child, self.wsl_owned, process_guard);
+        self.child.take();
     }
 }
 
@@ -987,41 +983,6 @@ impl Drop for OpencodeServer {
     fn drop(&mut self) {
         self.process = None;
     }
-}
-
-fn terminate_child_on_drop<G>(mut child: Child, wsl_owned: bool, process_guard: G)
-where
-    G: Send + 'static,
-{
-    if !wsl_owned {
-        drop(process_guard);
-        terminate_tokio_on_drop(child, ProcessOwnership::Owned);
-        return;
-    }
-    drop(child.take_stdin());
-    let _ = std::thread::Builder::new()
-        .name(String::from("wsl-opencode-reaper"))
-        .spawn(move || {
-            let _process_guard = process_guard;
-            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                let _ = child.start_kill();
-                return;
-            };
-            runtime.block_on(async move {
-                if matches!(
-                    tokio::time::timeout(Duration::from_secs(2), child.wait()).await,
-                    Ok(Ok(_))
-                ) {
-                    return;
-                }
-                let _ =
-                    terminate_tokio(&mut child, ProcessOwnership::Owned, Duration::from_secs(2))
-                        .await;
-            });
-        });
 }
 
 async fn send_with_timeout(
@@ -1145,17 +1106,11 @@ async fn read_json_response(
         .map_err(|error| OpencodeServerError::InvalidResponse(error.to_string()))
 }
 
-async fn terminate_child(child: &mut Child, wsl_owned: bool) {
+async fn terminate_child(child: &mut Child, wsl_owned: bool) -> std::io::Result<()> {
     if wsl_owned {
-        drop(child.take_stdin());
-        if matches!(
-            tokio::time::timeout(Duration::from_secs(2), child.wait()).await,
-            Ok(Ok(_))
-        ) {
-            return;
-        }
+        child.set_grace(Duration::from_secs(2));
     }
-    let _ = terminate_tokio(child, ProcessOwnership::Owned, Duration::from_secs(2)).await;
+    terminate_tokio(child, ProcessOwnership::Owned, Duration::from_secs(2)).await
 }
 
 #[cfg(windows)]
@@ -1805,8 +1760,6 @@ enum RawToolState {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "linux")]
-    use super::terminate_child_on_drop;
     use super::{
         prompt_body, run_opencode, run_opencode_json, server_command, startup_health_probe_timeout,
         OpencodeCommandSpec, OpencodeEvent, OpencodeJsonEvent, OpencodeJsonRunError, OpencodeModel,
@@ -1818,24 +1771,10 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
-    #[cfg(target_os = "linux")]
-    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::{AtomicU64, Ordering};
-    #[cfg(target_os = "linux")]
-    use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     static TEMP_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-    #[cfg(target_os = "linux")]
-    struct DropProbe(Arc<AtomicBool>);
-
-    #[cfg(target_os = "linux")]
-    impl Drop for DropProbe {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
@@ -1843,12 +1782,10 @@ mod tests {
         let mut command = tokio::process::Command::new("sh");
         command.args(["-c", "exec sleep 30"]).kill_on_drop(true);
         crate::managed_process::configure_owned_tokio(&mut command);
-        let child =
-            super::Child::from_owned_child(command.spawn().expect("test child should start"))
-                .unwrap();
+        let child = super::Child::spawn_test(&mut command).unwrap();
         let pid = child.id().expect("test child should expose its pid");
 
-        terminate_child_on_drop(child, false, ());
+        drop(child);
 
         tokio::time::timeout(Duration::from_secs(2), async {
             while Path::new(&format!("/proc/{pid}")).exists() {
@@ -1868,25 +1805,18 @@ mod tests {
             .stdin(std::process::Stdio::piped())
             .kill_on_drop(true);
         crate::managed_process::configure_owned_tokio(&mut command);
-        let child =
-            super::Child::from_owned_child(command.spawn().expect("test child should start"))
-                .unwrap();
+        let mut child = super::Child::spawn_test(&mut command).unwrap();
         let pid = child.id().expect("test child should expose its pid");
-        let guard_dropped = Arc::new(AtomicBool::new(false));
-
-        terminate_child_on_drop(child, true, DropProbe(Arc::clone(&guard_dropped)));
-        assert!(!guard_dropped.load(Ordering::SeqCst));
+        child.set_grace(Duration::from_secs(2));
+        drop(child);
 
         tokio::time::timeout(Duration::from_secs(2), async {
-            while Path::new(&format!("/proc/{pid}")).exists()
-                || !guard_dropped.load(Ordering::SeqCst)
-            {
+            while Path::new(&format!("/proc/{pid}")).exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .expect("WSL drop fallback should close the control pipe and reap the child");
-        assert!(guard_dropped.load(Ordering::SeqCst));
     }
 
     #[test]

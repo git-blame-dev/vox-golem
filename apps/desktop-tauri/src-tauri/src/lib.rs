@@ -3985,7 +3985,7 @@ fn replace_owned_runtime_transaction<R, S, V, E>(
     specs: (S, S),
     is_owned: impl Fn(&R) -> bool,
     is_current: impl Fn() -> bool,
-    mut shutdown: impl FnMut(&mut R),
+    mut shutdown: impl FnMut(&mut R) -> std::io::Result<()>,
     mut start: impl FnMut(S) -> Result<R, E>,
     prepare: impl FnOnce(&R) -> Result<V, String>,
 ) -> RuntimeReplacement<R, V>
@@ -3993,11 +3993,17 @@ where
     E: ToString,
 {
     let (requested_spec, previous_spec) = specs;
+    let retirement_failed = || RuntimeReplacement::RestoreFailed {
+        error: String::from("managed_process_retirement_failed"),
+        restore_error: String::from("replacement_not_started"),
+    };
     if let Some(mut runtime) = current_runtime {
         if !is_owned(&runtime) {
             return RuntimeReplacement::RejectedExistingExternal { runtime };
         }
-        shutdown(&mut runtime);
+        if shutdown(&mut runtime).is_err() {
+            return retirement_failed();
+        }
     }
 
     let mut requested_runtime = match start(requested_spec) {
@@ -4009,7 +4015,9 @@ where
             let error = error.to_string();
             return match start(previous_spec) {
                 Ok(mut runtime) if !is_current() => {
-                    shutdown(&mut runtime);
+                    if shutdown(&mut runtime).is_err() {
+                        return retirement_failed();
+                    }
                     RuntimeReplacement::Superseded
                 }
                 Ok(runtime) if !is_owned(&runtime) => RuntimeReplacement::RejectedStartedExternal,
@@ -4023,7 +4031,9 @@ where
         }
     };
     if !is_current() {
-        shutdown(&mut requested_runtime);
+        if shutdown(&mut requested_runtime).is_err() {
+            return retirement_failed();
+        }
         return RuntimeReplacement::Superseded;
     }
     if !is_owned(&requested_runtime) {
@@ -4032,7 +4042,9 @@ where
 
     match prepare(&requested_runtime) {
         Ok(_) if !is_current() => {
-            shutdown(&mut requested_runtime);
+            if shutdown(&mut requested_runtime).is_err() {
+                return retirement_failed();
+            }
             RuntimeReplacement::Superseded
         }
         Ok(value) => RuntimeReplacement::Applied {
@@ -4040,13 +4052,17 @@ where
             value,
         },
         Err(error) => {
-            shutdown(&mut requested_runtime);
+            if shutdown(&mut requested_runtime).is_err() {
+                return retirement_failed();
+            }
             if !is_current() {
                 return RuntimeReplacement::Superseded;
             }
             match start(previous_spec) {
                 Ok(mut runtime) if !is_current() => {
-                    shutdown(&mut runtime);
+                    if shutdown(&mut runtime).is_err() {
+                        return retirement_failed();
+                    }
                     RuntimeReplacement::Superseded
                 }
                 Ok(runtime) if !is_owned(&runtime) => {
@@ -4457,7 +4473,7 @@ async fn switch_response_profile(
         drop(session);
         drop(_lifecycle);
         if let Some(mut runtime) = previous_runtime {
-            runtime.shutdown_owned();
+            let _ = runtime.shutdown_owned();
         }
     });
     register_llama_startup(
@@ -13340,7 +13356,7 @@ fn reset_voice_pipeline_to_waiting(
     Ok(())
 }
 
-fn shutdown_llama_cpp_runtime_for_exit(app_state: &AppState) {
+async fn shutdown_llama_cpp_runtime_for_exit(app_state: &AppState) {
     let runtime = app_state
         .llama_cpp_runtime
         .lock()
@@ -13348,7 +13364,7 @@ fn shutdown_llama_cpp_runtime_for_exit(app_state: &AppState) {
         .unwrap_or(None);
 
     if let Some(mut runtime) = runtime {
-        runtime.shutdown_owned();
+        let _ = spawn_runtime_blocking(move || runtime.shutdown_owned()).await;
     }
 }
 
@@ -13462,8 +13478,29 @@ async fn shutdown_runtime(app_state: &AppState) {
             app_state.conversation.retire_search().await;
             app_state.prefetch_cleanup.wait().await;
             shutdown_llama_startups_for_exit(app_state);
-            shutdown_llama_cpp_runtime_for_exit(app_state);
-            shutdown_completion_runtime(app_state).await;
+            let process_deadline = Instant::now() + Duration::from_secs(8);
+            let opencode_server = app_state
+                .opencode_server
+                .lock()
+                .map(|mut server| server.take())
+                .unwrap_or(None);
+            // Request every shutdown even if a sibling fails. The supervisor's
+            // retained obligations, not individual request receipts, decide drain.
+            let _ = tokio::time::timeout(
+                process_deadline.saturating_duration_since(Instant::now()),
+                async {
+                    tokio::join!(
+                        shutdown_llama_cpp_runtime_for_exit(app_state),
+                        shutdown_completion_runtime(app_state),
+                        async move {
+                            if let Some(server) = opencode_server {
+                                let _ = server.shutdown().await;
+                            }
+                        },
+                    );
+                },
+            )
+            .await;
             app_state.microphone_capture.shutdown();
             let playback = Arc::clone(&app_state.tts_audio_playback);
             let _ = spawn_runtime_blocking(move || playback.shutdown()).await;
@@ -13471,14 +13508,12 @@ async fn shutdown_runtime(app_state: &AppState) {
                 let _tts_operation = app_state.tts_operation_lock.lock().await;
                 shutdown_tts_runtime(app_state);
             }
-            let opencode_server = app_state
-                .opencode_server
-                .lock()
-                .map(|mut server| server.take())
-                .unwrap_or(None);
-            if let Some(server) = opencode_server {
-                let _ = server.shutdown().await;
-            }
+            let processes_retired =
+                voxgolem_platform::managed_process::wait_for_process_retirement(
+                    process_deadline.saturating_duration_since(Instant::now()),
+                )
+                .await
+                .is_ok();
             app_state.telemetry_sink.request_shutdown();
             // No unbounded join: a blocked filesystem worker remains unretired.
             let deadline = Instant::now() + Duration::from_millis(250);
@@ -13487,7 +13522,7 @@ async fn shutdown_runtime(app_state: &AppState) {
             }
             // Optional local diagnostics cannot veto retired essential native
             // resources or updater eligibility. Its own status remains honest.
-            true
+            processes_retired
         },
     )
     .await;
@@ -13593,7 +13628,7 @@ fn shutdown_llama_start_result(
     >,
 ) {
     if let Ok(mut runtime) = start_result {
-        runtime.shutdown_owned();
+        let _ = runtime.shutdown_owned();
     }
 }
 
@@ -13604,17 +13639,17 @@ fn store_llama_runtime_if_current(
     expected_generation: u64,
 ) -> bool {
     if response_profile_switch_generation.load(Ordering::SeqCst) != expected_generation {
-        runtime.shutdown_owned();
+        let _ = runtime.shutdown_owned();
         return false;
     }
 
     let Ok(mut guard) = llama_cpp_runtime.lock() else {
-        runtime.shutdown_owned();
+        let _ = runtime.shutdown_owned();
         return false;
     };
 
     if response_profile_switch_generation.load(Ordering::SeqCst) != expected_generation {
-        runtime.shutdown_owned();
+        let _ = runtime.shutdown_owned();
         return false;
     }
 
@@ -13622,7 +13657,7 @@ fn store_llama_runtime_if_current(
 
     if response_profile_switch_generation.load(Ordering::SeqCst) != expected_generation {
         if let Some(mut stale_runtime) = guard.take() {
-            stale_runtime.shutdown_owned();
+            let _ = stale_runtime.shutdown_owned();
         }
         return false;
     }
@@ -14144,7 +14179,10 @@ mod tests {
             ("requested", "old"),
             |runtime| runtime.owned,
             is_current,
-            |runtime| events.borrow_mut().push(format!("stop:{}", runtime.name)),
+            |runtime| {
+                events.borrow_mut().push(format!("stop:{}", runtime.name));
+                Ok(())
+            },
             |spec| {
                 events.borrow_mut().push(format!("start:{spec}"));
                 starts.next().expect("fake startup result")
@@ -14175,6 +14213,50 @@ mod tests {
             }
         );
         assert_eq!(events, ["stop:old", "start:requested"]);
+    }
+
+    #[test]
+    fn failed_process_retirement_never_starts_replacement_or_restoration() {
+        let starts = Cell::new(0);
+        let result = replace_owned_runtime_transaction(
+            Some(fake_runtime("old", true)),
+            ("requested", "old"),
+            |runtime| runtime.owned,
+            || true,
+            |_| Err(std::io::Error::other("synthetic_wait_failure")),
+            |_| {
+                starts.set(starts.get() + 1);
+                Ok::<_, &'static str>(fake_runtime("unexpected", true))
+            },
+            |_| Ok(()),
+        );
+        assert_eq!(starts.get(), 0);
+        assert_eq!(
+            result,
+            RuntimeReplacement::RestoreFailed {
+                error: String::from("managed_process_retirement_failed"),
+                restore_error: String::from("replacement_not_started"),
+            }
+        );
+    }
+
+    #[test]
+    fn failed_retirement_after_preparation_error_does_not_restore() {
+        let starts = Cell::new(0);
+        let result = replace_owned_runtime_transaction(
+            None,
+            ("requested", "old"),
+            |runtime: &FakeRuntime| runtime.owned,
+            || true,
+            |_| Err(std::io::Error::other("synthetic_wait_failure")),
+            |_| {
+                starts.set(starts.get() + 1);
+                Ok::<_, &'static str>(fake_runtime("requested", true))
+            },
+            |_| Err::<(), _>(String::from("synthetic_prepare_failure")),
+        );
+        assert_eq!(starts.get(), 1);
+        assert!(matches!(result, RuntimeReplacement::RestoreFailed { .. }));
     }
 
     #[test]
@@ -17171,15 +17253,15 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn exit_invalidates_pending_runtime_startups_before_shutdown() {
+    #[tokio::test]
+    async fn exit_invalidates_pending_runtime_startups_before_shutdown() {
         let app_state = build_startup_error_app_state(
             default_voice_pipeline_config(),
             String::from("startup failed"),
         );
 
         invalidate_runtime_startups_for_exit(&app_state);
-        shutdown_llama_cpp_runtime_for_exit(&app_state);
+        shutdown_llama_cpp_runtime_for_exit(&app_state).await;
 
         assert_eq!(
             app_state

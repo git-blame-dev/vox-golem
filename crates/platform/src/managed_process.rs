@@ -1,104 +1,656 @@
-//! Small, dependency-free process ownership and shutdown primitives.
+//! Reserved process ownership. Drop only publishes into a preallocated mailbox.
 //!
-//! This module deliberately does not install Windows Job Object ownership.  A
-//! caller which needs that policy should continue to use the existing Win32
-//! job integration instead.
+//! One supervisor polls all four production ownership lanes. A lane counts the
+//! live child AND its cleanup, not just published runtimes. Linux additionally
+//! owns one private anchor per lane: never reap it before the final group signal.
+//! Thus production retains at most eight direct native children (four leaders
+//! plus four anchors), excluding server descendants and WSL guest processes.
+//! Exclusive child-wait ownership is required (no external waitpid(-1) reaper).
+//! Unavailable workers retain their mailboxes and reject further launches.
+//! Process abort/OOM/OS termination cannot provide an in-process wait guarantee.
 
 use std::io;
-use std::process::{Child, Command};
+use std::process::{Child, Command, ExitStatus};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
+
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessOwnership {
-    /// The child was placed in a process group owned by this helper.
     Owned,
-    /// The child was supplied by another owner; only the child itself may be killed.
     External,
 }
 
-#[derive(Debug)]
-pub struct ManagedProcess {
-    child: Child,
-    ownership: ProcessOwnership,
-    group: Option<OwnedGroup>,
+/// The production consumer slots, not a claimed maximum of the old public API.
+#[derive(Clone, Copy)]
+pub(crate) enum ProcessRole {
+    Completion,
+    OpenCode,
+    LlamaCpp,
+    WslCommand,
 }
 
-/// Retains the ownership boundary independently of Tokio's disappearing Child.id().
-/// Construct immediately after spawning with configure_owned_tokio, before wait
-/// or try_wait. Owned groups require exclusive child-wait ownership: no external
-/// waitpid(-1) reaper or SIGCHLD auto-reap policy may consume the private anchor.
-pub struct ManagedTokioProcess {
-    child: tokio::process::Child,
-    group: Option<OwnedGroup>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    Pending,
+    Retired,
+    WaitFailed,
+    Unavailable,
 }
 
-impl ManagedTokioProcess {
-    pub fn from_owned_child(mut child: tokio::process::Child) -> io::Result<Self> {
-        let pid = child
-            .id()
-            .ok_or_else(|| io::Error::other("spawned child has no PID"))?;
-        let group = match OwnedGroup::new(pid) {
-            Ok(group) => group,
-            Err(error) => {
-                // Fail closed: without the anchor, do not signal a numeric
-                // group. Only the retained child handle is retired here.
-                let _ = child.start_kill();
-                reap_tokio_child(child);
-                return Err(error);
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    // The bundle stays in its mailbox while native calls run. Unwinding never
+    // moves it out; recovering this known state does not declare it retired.
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+struct Mailbox {
+    bundle: OnceLock<Mutex<CleanupBundle>>,
+    outcome: watch::Sender<Outcome>,
+    changed: Condvar,
+    wait_lock: Mutex<()>,
+    #[cfg(test)]
+    fail_wait: AtomicBool,
+    #[cfg(test)]
+    panic_poll: AtomicBool,
+}
+
+impl Mailbox {
+    fn new() -> Self {
+        Self {
+            bundle: OnceLock::new(),
+            outcome: watch::channel(Outcome::Pending).0,
+            changed: Condvar::new(),
+            wait_lock: Mutex::new(()),
+            #[cfg(test)]
+            fail_wait: AtomicBool::new(false),
+            #[cfg(test)]
+            panic_poll: AtomicBool::new(false),
+        }
+    }
+    fn outcome(&self) -> Outcome {
+        *self.outcome.borrow()
+    }
+    fn publish_outcome(&self, outcome: Outcome) {
+        let _guard = lock(&self.wait_lock);
+        self.outcome.send_replace(outcome);
+        self.changed.notify_all();
+    }
+    fn result(&self) -> Option<io::Result<()>> {
+        match self.outcome() {
+            Outcome::Pending => None,
+            Outcome::Retired => Some(Ok(())),
+            Outcome::WaitFailed => Some(Err(io::Error::other("managed process wait failed"))),
+            Outcome::Unavailable => Some(Err(io::Error::other("process supervisor unavailable"))),
+        }
+    }
+    async fn wait_async(&self, timeout: Duration) -> io::Result<()> {
+        let mut receiver = self.outcome.subscribe();
+        tokio::time::timeout(timeout, async {
+            loop {
+                if let Some(result) = self.result() {
+                    return result;
+                }
+                receiver
+                    .changed()
+                    .await
+                    .map_err(|_| io::Error::other("process supervisor unavailable"))?;
             }
-        };
-        Ok(Self {
-            child,
-            group: Some(group),
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "managed process still retiring"))?
+    }
+    fn wait(&self, timeout: Duration) -> io::Result<()> {
+        let deadline = Instant::now() + timeout;
+        let mut guard = lock(&self.wait_lock);
+        loop {
+            if let Some(result) = self.result() {
+                return result;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "managed process still retiring",
+                ));
+            }
+            guard = self
+                .changed
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+    }
+}
+
+struct Supervisor {
+    slots: Mutex<Vec<Option<Arc<Mailbox>>>>,
+    wake: Condvar,
+    available: AtomicBool,
+    stop: AtomicBool,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    #[cfg(test)]
+    paused: AtomicBool,
+}
+
+impl Supervisor {
+    fn start(capacity: usize, fail_start: bool) -> io::Result<Arc<Self>> {
+        if fail_start {
+            return Err(io::Error::other("process supervisor startup failed"));
+        }
+        let supervisor = Arc::new(Self {
+            slots: Mutex::new(vec![None; capacity]),
+            wake: Condvar::new(),
+            available: AtomicBool::new(true),
+            stop: AtomicBool::new(false),
+            thread: Mutex::new(None),
+            #[cfg(test)]
+            paused: AtomicBool::new(false),
+        });
+        let worker = Arc::clone(&supervisor);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let thread = std::thread::Builder::new()
+            .name("process-supervisor".into())
+            .spawn(move || {
+                if ready_tx.send(()).is_err() {
+                    return;
+                }
+                let result = std::panic::catch_unwind(|| worker.run());
+                if result.is_err() {
+                    worker.fail();
+                }
+            })?;
+        ready_rx
+            .recv()
+            .map_err(|_| io::Error::other("process supervisor startup failed"))?;
+        *lock(&supervisor.thread) = Some(thread);
+        Ok(supervisor)
+    }
+    fn fail(&self) {
+        self.available.store(false, Ordering::Release);
+        for mailbox in lock(&self.slots).iter().flatten() {
+            if mailbox.outcome() != Outcome::Retired {
+                mailbox.publish_outcome(Outcome::Unavailable);
+            }
+        }
+    }
+    fn reserve(self: &Arc<Self>, slot: usize) -> io::Result<ProcessReservation> {
+        let mut slots = lock(&self.slots);
+        if !self.available.load(Ordering::Acquire) {
+            return Err(io::Error::other("process supervisor unavailable"));
+        }
+        let position = slots
+            .get_mut(slot)
+            .ok_or_else(|| io::Error::other("invalid process lane"))?;
+        if position
+            .as_ref()
+            .is_some_and(|mailbox| mailbox.outcome() != Outcome::Retired)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "managed process lane is occupied",
+            ));
+        }
+        let mailbox = Arc::new(Mailbox::new());
+        *position = Some(Arc::clone(&mailbox));
+        Ok(ProcessReservation {
+            supervisor: Arc::clone(self),
+            mailbox,
+            published: false,
         })
     }
-
-    pub fn attach_external(child: tokio::process::Child) -> Self {
-        Self { child, group: None }
+    fn run(self: &Arc<Self>) {
+        let capacity = lock(&self.slots).len();
+        while !self.stop.load(Ordering::Acquire) {
+            if Arc::strong_count(self) == 1
+                && lock(&self.slots)
+                    .iter()
+                    .flatten()
+                    .all(|mailbox| mailbox.outcome() == Outcome::Retired)
+            {
+                break;
+            }
+            for index in 0..capacity {
+                #[cfg(test)]
+                if self.paused.load(Ordering::Acquire) {
+                    continue;
+                }
+                let mailbox = lock(&self.slots)[index].clone();
+                let Some(mailbox) = mailbox else { continue };
+                if mailbox.outcome() == Outcome::Retired {
+                    continue;
+                }
+                if let Some(bundle) = mailbox.bundle.get() {
+                    #[cfg(test)]
+                    if mailbox.fail_wait.load(Ordering::Acquire) {
+                        mailbox.publish_outcome(Outcome::WaitFailed);
+                        continue;
+                    }
+                    let mut bundle = lock(bundle);
+                    #[cfg(any(windows, test))]
+                    if bundle.job.as_ref().is_some_and(|job| job.failure.is_some()) {
+                        // Job-effect failures stay visibly failed/owned. Do not
+                        // repeat OS calls or status publication every poll tick.
+                        continue;
+                    }
+                    #[cfg(test)]
+                    assert!(
+                        !mailbox.panic_poll.load(Ordering::Acquire),
+                        "synthetic worker panic with retained bundle"
+                    );
+                    match bundle.poll() {
+                        Ok(true) => mailbox.publish_outcome(Outcome::Retired),
+                        Ok(false) => {}
+                        Err(_) => mailbox.publish_outcome(Outcome::WaitFailed),
+                    }
+                }
+            }
+            let slots = lock(&self.slots);
+            drop(
+                self.wake
+                    .wait_timeout(slots, POLL_INTERVAL)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+        }
     }
-
-    pub fn take_stdin(&mut self) -> Option<tokio::process::ChildStdin> {
-        self.child.stdin.take()
-    }
-    pub fn start_kill(&mut self) -> io::Result<()> {
-        self.child.start_kill()
-    }
-
-    fn signal_group(&mut self, force: bool) -> io::Result<()> {
-        if let Some(group) = &mut self.group {
-            group.terminate(force)?;
+    async fn wait_for_retirement(&self, timeout: Duration) -> io::Result<()> {
+        let deadline = Instant::now() + timeout;
+        let mailboxes = lock(&self.slots).clone();
+        for mailbox in mailboxes.into_iter().flatten() {
+            mailbox
+                .wait_async(deadline.saturating_duration_since(Instant::now()))
+                .await?;
         }
         Ok(())
     }
+}
 
-    fn force_group_once(&mut self) -> io::Result<()> {
-        self.signal_group(true)?;
-        // Forced shutdown is the final group operation. Do not signal a stale
-        // numeric boundary a second time from Drop after all members retire.
-        self.group = None;
+static SUPERVISOR: OnceLock<io::Result<Arc<Supervisor>>> = OnceLock::new();
+fn supervisor() -> io::Result<&'static Arc<Supervisor>> {
+    SUPERVISOR
+        .get_or_init(|| Supervisor::start(4, false))
+        .as_ref()
+        .map_err(|_| io::Error::other("process supervisor startup failed"))
+}
+
+/// Do not mistake a server still owned by this process's cleanup lane for an
+/// independently managed external HTTP server during fallback/attachment.
+pub(crate) fn ensure_role_retired(role: ProcessRole) -> io::Result<()> {
+    if let Some(Ok(supervisor)) = SUPERVISOR.get() {
+        if lock(&supervisor.slots)[role as usize]
+            .as_ref()
+            .is_some_and(|mailbox| mailbox.outcome() != Outcome::Retired)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "managed process lane is occupied",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) struct ProcessReservation {
+    supervisor: Arc<Supervisor>,
+    mailbox: Arc<Mailbox>,
+    published: bool,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestProcessPool(Arc<Supervisor>);
+#[cfg(test)]
+impl std::fmt::Debug for TestProcessPool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TestProcessPool")
+            .finish_non_exhaustive()
+    }
+}
+#[cfg(test)]
+impl TestProcessPool {
+    pub(crate) fn new() -> Self {
+        Self(Supervisor::start(1, false).unwrap())
+    }
+    pub(crate) fn reserve(&self, _role: ProcessRole) -> io::Result<ProcessReservation> {
+        self.0.reserve(0)
+    }
+}
+
+impl ProcessReservation {
+    pub(crate) fn reserve(role: ProcessRole) -> io::Result<Self> {
+        supervisor()?.reserve(role as usize)
+    }
+    fn publish(&mut self, bundle: CleanupBundle) {
+        // Exactly one publication per reservation; allocated before real spawn.
+        // The persistent slot, not the worker stack, retains this obligation.
+        assert!(self.mailbox.bundle.set(Mutex::new(bundle)).is_ok());
+        self.published = true;
+        if !self.supervisor.available.load(Ordering::Acquire) {
+            self.mailbox.outcome.send_replace(Outcome::Unavailable);
+        }
+        self.supervisor.wake.notify_one();
+    }
+    pub(crate) fn spawn_std(self, command: &mut Command) -> io::Result<ManagedProcess> {
+        self.spawn_std_with(command, Command::spawn)
+    }
+    pub(crate) fn spawn_std_with(
+        mut self,
+        command: &mut Command,
+        spawn: impl FnOnce(&mut Command) -> io::Result<Child>,
+    ) -> io::Result<ManagedProcess> {
+        if !self.supervisor.available.load(Ordering::Acquire) {
+            return Err(io::Error::other("process supervisor unavailable"));
+        }
+        configure_owned(command);
+        let child = spawn(command)?;
+        let group = match OwnedGroup::new(child.id()) {
+            Ok(group) => group,
+            Err(error) => {
+                self.publish(CleanupBundle::new(
+                    ChildKind::Std(child),
+                    None,
+                    Duration::ZERO,
+                ));
+                return Err(error);
+            }
+        };
+        Ok(ManagedProcess {
+            child: Some(child),
+            group: Some(group),
+            reservation: self,
+            grace: Duration::ZERO,
+            #[cfg(windows)]
+            job: None,
+        })
+    }
+    pub(crate) fn spawn_tokio(
+        mut self,
+        command: &mut tokio::process::Command,
+    ) -> io::Result<ManagedTokioProcess> {
+        if !self.supervisor.available.load(Ordering::Acquire) {
+            return Err(io::Error::other("process supervisor unavailable"));
+        }
+        configure_owned_tokio(command);
+        let child = command.spawn()?;
+        let group = match child
+            .id()
+            .ok_or_else(|| io::Error::other("spawned child has no PID"))
+            .and_then(OwnedGroup::new)
+        {
+            Ok(group) => group,
+            Err(error) => {
+                self.publish(CleanupBundle::new(
+                    ChildKind::Tokio(child),
+                    None,
+                    Duration::ZERO,
+                ));
+                return Err(error);
+            }
+        };
+        Ok(ManagedTokioProcess {
+            child: Some(child),
+            group: Some(group),
+            reservation: self,
+            grace: Duration::ZERO,
+            #[cfg(windows)]
+            job: None,
+        })
+    }
+}
+
+impl Drop for ProcessReservation {
+    fn drop(&mut self) {
+        if !self.published {
+            self.mailbox.outcome.send_replace(Outcome::Retired);
+        }
+    }
+}
+
+/// Includes active reservations, failed adoption and dropped/abandoned waiters.
+pub async fn wait_for_process_retirement(timeout: Duration) -> io::Result<()> {
+    // Failed initialization returned no reservation, so no child was launched.
+    // That capability failure must not invent an outstanding cleanup obligation.
+    let Some(Ok(supervisor)) = SUPERVISOR.get() else {
+        return Ok(());
+    };
+    supervisor.wait_for_retirement(timeout).await
+}
+
+// Windows' Tokio Child is larger than std Child. There are only four reserved
+// payloads; retain them inline rather than add a per-child box/ownership move.
+#[cfg_attr(windows, allow(clippy::large_enum_variant))]
+enum ChildKind {
+    Std(Child),
+    Tokio(tokio::process::Child),
+}
+impl ChildKind {
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        match self {
+            Self::Std(child) => child.try_wait(),
+            Self::Tokio(child) => child.try_wait(),
+        }
+    }
+    fn kill(&mut self) -> io::Result<()> {
+        if self.try_wait()?.is_some() {
+            return Ok(());
+        }
+        match self {
+            Self::Std(child) => child.kill(),
+            Self::Tokio(child) => child.start_kill(),
+        }
+    }
+    fn close_stdin(&mut self) {
+        match self {
+            Self::Std(child) => {
+                child.stdin.take();
+            }
+            Self::Tokio(child) => {
+                child.stdin.take();
+            }
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+trait JobEffects {
+    fn terminate(&self) -> io::Result<()>;
+    fn is_empty(&self) -> io::Result<bool>;
+}
+
+/// Keep the effect and its termination/drain state under the same process owner.
+#[cfg(any(windows, test))]
+struct JobCleanup<J> {
+    job: J,
+    termination_requested: bool,
+    failure: Option<&'static str>,
+}
+
+#[cfg(any(windows, test))]
+impl<J: JobEffects> JobCleanup<J> {
+    fn new(job: J) -> Self {
+        Self {
+            job,
+            termination_requested: false,
+            failure: None,
+        }
+    }
+    fn request_termination(&mut self) -> io::Result<()> {
+        if let Some(failure) = self.failure {
+            return Err(io::Error::other(failure));
+        }
+        if !self.termination_requested {
+            if self.job.terminate().is_err() {
+                self.failure = Some("managed job termination failed");
+                return Err(io::Error::other("managed job termination failed"));
+            }
+            self.termination_requested = true;
+        }
         Ok(())
     }
-
-    pub fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
-        self.child.try_wait()
-    }
-
-    pub async fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
-        self.child.wait().await
+    fn drained(&mut self) -> io::Result<bool> {
+        if let Some(failure) = self.failure {
+            return Err(io::Error::other(failure));
+        }
+        match self.job.is_empty() {
+            Ok(empty) => Ok(empty),
+            Err(_) => {
+                // Native-effect failures are latched, not retried at the child
+                // polling cadence. The slot/handle remain owned and unavailable.
+                self.failure = Some("managed job drain query failed");
+                Err(io::Error::other("managed job drain query failed"))
+            }
+        }
     }
 }
 
-impl std::ops::Deref for ManagedTokioProcess {
-    type Target = tokio::process::Child;
-    fn deref(&self) -> &Self::Target {
-        &self.child
+#[cfg(windows)]
+impl JobEffects for win32job::Job {
+    fn terminate(&self) -> io::Result<()> {
+        terminate_job(self)
+    }
+    fn is_empty(&self) -> io::Result<bool> {
+        self.query_process_id_list()
+            .map(|processes| processes.is_empty())
+            .map_err(|_| io::Error::other("managed job drain query failed"))
     }
 }
 
-impl Drop for ManagedTokioProcess {
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn terminate_job(job: &win32job::Job) -> io::Result<()> {
+    use windows::Win32::{Foundation::HANDLE, System::JobObjects::TerminateJobObject};
+    // win32job documents handle() as a borrowed, still-owned job handle encoded
+    // as isize. HANDLE wraps the same pointer-sized value; no ownership transfer
+    // or dereference occurs. The borrowed Job stays alive throughout the call.
+    let handle = HANDLE(job.handle() as *mut std::ffi::c_void);
+    // SAFETY: the live Job owns this valid job-object handle, with termination
+    // access from its constructor. Code 1 categorically marks forced shutdown.
+    unsafe { TerminateJobObject(handle, 1) }
+        .map_err(|_| io::Error::other("managed job termination failed"))
+}
+
+#[cfg(all(test, not(windows)))]
+#[derive(Default)]
+struct FakeJobState {
+    terminate_calls: usize,
+    query_calls: usize,
+    drops: usize,
+    empty: bool,
+    terminate_fails: bool,
+    query_fails: bool,
+}
+#[cfg(all(test, not(windows)))]
+struct FakeJob(Arc<Mutex<FakeJobState>>);
+#[cfg(all(test, not(windows)))]
+impl JobEffects for FakeJob {
+    fn terminate(&self) -> io::Result<()> {
+        let mut state = lock(&self.0);
+        state.terminate_calls += 1;
+        if state.terminate_fails {
+            Err(io::Error::other("synthetic termination failure"))
+        } else {
+            Ok(())
+        }
+    }
+    fn is_empty(&self) -> io::Result<bool> {
+        let mut state = lock(&self.0);
+        state.query_calls += 1;
+        if state.query_fails {
+            Err(io::Error::other("synthetic query failure"))
+        } else {
+            Ok(state.empty)
+        }
+    }
+}
+#[cfg(all(test, not(windows)))]
+impl Drop for FakeJob {
     fn drop(&mut self) {
-        let _ = self.signal_group(true);
-        let _ = self.child.start_kill();
+        lock(&self.0).drops += 1;
+    }
+}
+
+struct CleanupBundle {
+    child: ChildKind,
+    group: Option<OwnedGroup>,
+    grace: Duration,
+    deadline: Option<Instant>,
+    forced: bool,
+    request_term: bool,
+    #[cfg(windows)]
+    job: Option<JobCleanup<win32job::Job>>,
+    #[cfg(all(test, not(windows)))]
+    job: Option<JobCleanup<FakeJob>>,
+}
+impl CleanupBundle {
+    fn new(child: ChildKind, group: Option<OwnedGroup>, grace: Duration) -> Self {
+        Self {
+            child,
+            group,
+            grace,
+            deadline: None,
+            forced: false,
+            request_term: false,
+            #[cfg(any(windows, test))]
+            job: None,
+        }
+    }
+    fn poll(&mut self) -> io::Result<bool> {
+        if self.deadline.is_none() {
+            self.child.close_stdin();
+            if self.request_term {
+                if let Some(group) = &self.group {
+                    terminate_group(group.pid, false)?;
+                }
+            }
+            self.deadline = Some(Instant::now() + self.grace);
+        }
+        // WSL stdin grace is not evidence of guest retirement. Even if its
+        // leader exits, finish the owned host boundary before acknowledging.
+        if !self.forced {
+            if Instant::now() < self.deadline.unwrap() && self.child.try_wait()?.is_none() {
+                return Ok(false);
+            }
+            if let Some(group) = &mut self.group {
+                group.signal_final()?;
+            }
+            #[cfg(any(windows, test))]
+            if let Some(job) = &mut self.job {
+                // A reaped leader can still have live job descendants. Never
+                // predicate this request on direct-child liveness.
+                job.request_termination()?;
+            }
+            self.child.kill()?;
+            self.forced = true;
+        }
+        let child_retired = self.child.try_wait()?.is_some();
+        let anchor_retired = match &mut self.group {
+            Some(group) => group.poll_anchor()?,
+            None => true,
+        };
+        #[cfg(any(windows, test))]
+        let job_retired = match &mut self.job {
+            Some(job) => job.drained()?,
+            None => true,
+        };
+        #[cfg(not(any(windows, test)))]
+        let job_retired = true;
+        // Termination acceptance is not drain. Retain the job until direct wait
+        // and a successful empty-job query both confirm retirement.
+        if child_retired && anchor_retired && job_retired {
+            #[cfg(any(windows, test))]
+            {
+                self.job = None;
+            }
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 }
 
@@ -107,643 +659,837 @@ struct OwnedGroup {
     pid: u32,
     final_signal_sent: bool,
     #[cfg(target_os = "linux")]
+    external: bool,
+    #[cfg(target_os = "linux")]
     anchor: Option<Child>,
 }
-
 impl OwnedGroup {
-    #[cfg(all(unix, not(target_os = "linux")))]
-    fn new(_pid: u32) -> io::Result<Self> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "unreaped group-anchor reservation is not verified on this Unix platform",
-        ))
-    }
-
-    #[cfg(any(target_os = "linux", windows))]
     fn new(pid: u32) -> io::Result<Self> {
+        #[cfg(all(unix, not(target_os = "linux")))]
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "owned group anchor is not verified on this platform",
+        ));
         #[cfg(target_os = "linux")]
         let anchor = {
             use std::os::unix::process::CommandExt;
             use std::process::Stdio;
-            let group = i32::try_from(pid)
-                .map_err(|_| io::Error::other("owned process group ID is out of range"))?;
-            // spawn completes setpgid/exec before returning. The leader is
-            // still unreaped here; never poll either Child before this join.
+            let pid = valid_group(pid)?;
             Command::new("/bin/sh")
                 .args(["-c", "trap '' TERM HUP INT; IFS= read -r _"])
-                .process_group(group)
+                .process_group(pid.as_raw_pid())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .spawn()
-                .map_err(|error| {
-                    io::Error::new(
-                        error.kind(),
-                        format!("could not establish owned process group anchor: {error}"),
-                    )
-                })?
+                .spawn()?
         };
+        #[cfg(any(target_os = "linux", windows))]
         Ok(Self {
             pid,
             final_signal_sent: false,
             #[cfg(target_os = "linux")]
+            external: false,
+            #[cfg(target_os = "linux")]
             anchor: Some(anchor),
         })
     }
-
-    fn terminate(&mut self, force: bool) -> io::Result<()> {
-        if !self.final_signal_sent {
-            // The private std Child is NEVER waited/try_waited before FINAL
-            // KILL. Even an unexpectedly dead anchor remains an unreaped group
-            // member: Linux detaches PIDTYPE_PGID in release_task, not exit.
-            // Unlike proc FDs, this reservation spans the signal syscall.
-            platform::terminate_group(self.pid, force)?;
-            if force {
-                self.final_signal_sent = true;
+    fn signal_final(&mut self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if self.external {
+            if let Some(anchor) = &mut self.anchor {
+                anchor.kill()?;
             }
         }
-        #[cfg(target_os = "linux")]
-        if force {
-            if let Some(anchor) = &mut self.anchor {
-                drop(anchor.stdin.take());
-                let deadline = Instant::now() + Duration::from_secs(2);
-                loop {
-                    if anchor.try_wait()?.is_some() {
-                        self.anchor = None;
-                        break;
-                    }
-                    if Instant::now() >= deadline {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "owned process group anchor did not retire after final signal",
-                        ));
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-            }
+        if !self.final_signal_sent {
+            terminate_group(self.pid, true)?;
+            self.final_signal_sent = true;
         }
         Ok(())
     }
-
-    fn abandon(&mut self) -> io::Result<()> {
-        // An explicit External override must not signal the former group.
-        // Retire only our private anchor and permanently disable group signals.
-        self.final_signal_sent = true;
+    fn poll_anchor(&mut self) -> io::Result<bool> {
         #[cfg(target_os = "linux")]
         if let Some(anchor) = &mut self.anchor {
-            anchor.kill()?;
-        }
-        self.terminate(true)
-    }
-}
-
-impl Drop for OwnedGroup {
-    fn drop(&mut self) {
-        if self.terminate(true).is_err() {
-            // This is the LAST group attempt. Permanently disable group signals
-            // before releasing its reservation, then retire only our private
-            // child. Descendant retirement is not claimed on signal failure.
-            let _ = self.abandon();
-        }
-    }
-}
-
-/// Configure a `tokio::process::Command` exactly like `spawn_owned` configures
-/// a standard command.  Kept here so all runtimes share the ownership rule.
-pub fn configure_owned_tokio(command: &mut tokio::process::Command) {
-    platform::configure_owned_tokio(command);
-}
-
-pub fn configure_owned(command: &mut Command) {
-    platform::configure_owned(command);
-}
-
-/// Low-level signalling only while an unreaped member reserves the PGID.
-/// Observing a numeric PID or a proc descriptor is not such a reservation.
-/// Prefer the managed wrappers when a child may already have been reaped.
-pub fn terminate_group(pid: u32, force: bool) -> io::Result<()> {
-    platform::terminate_group(pid, force)
-}
-
-/// Terminate and reap a tokio child, signalling its owned group on Unix.
-pub async fn terminate_tokio(
-    child: &mut ManagedTokioProcess,
-    ownership: ProcessOwnership,
-    timeout: Duration,
-) -> io::Result<()> {
-    if ownership == ProcessOwnership::External {
-        if let Some(mut group) = child.group.take() {
-            group.abandon()?;
-        }
-    }
-    if ownership == ProcessOwnership::Owned && child.group.is_some() {
-        if child.try_wait()?.is_some() {
-            return child.force_group_once();
-        }
-        child.signal_group(false)?;
-        platform::kill_tokio_child(&mut child.child)?;
-        let grace = tokio::time::timeout(timeout, child.wait()).await;
-        child.force_group_once()?;
-        platform::kill_tokio_child(&mut child.child)?;
-        if let Ok(status) = grace {
-            return status.map(|_| ());
-        }
-        return tokio::time::timeout(timeout, child.wait())
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "managed process did not exit"))?
-            .map(|_| ());
-    }
-    if child.try_wait()?.is_some() {
-        return Ok(());
-    }
-    child.start_kill()?;
-    if let Ok(status) = tokio::time::timeout(timeout, child.wait()).await {
-        return status.map(|_| ());
-    }
-    child.start_kill()?;
-    tokio::time::timeout(timeout, child.wait())
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "managed process did not exit"))?
-        .map(|_| ())
-}
-
-pub fn terminate_tokio_on_drop(mut child: ManagedTokioProcess, ownership: ProcessOwnership) {
-    if ownership == ProcessOwnership::External {
-        if let Some(mut group) = child.group.take() {
-            let _ = group.abandon();
-        }
-    }
-    if ownership == ProcessOwnership::Owned {
-        let _ = child.try_wait();
-        let _ = child.force_group_once();
-    }
-    let _ = child.start_kill();
-    let _ = std::thread::Builder::new()
-        .name(String::from("managed-process-reaper"))
-        .spawn(move || {
-            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                return;
-            };
-            let _ = runtime.block_on(child.wait());
-        });
-}
-
-fn reap_tokio_child(mut child: tokio::process::Child) {
-    let _ = std::thread::Builder::new()
-        .name(String::from("failed-owned-process-reaper"))
-        .spawn(move || {
-            if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                let _ = runtime.block_on(child.wait());
+            anchor.stdin.take();
+            if anchor.try_wait()?.is_none() {
+                return Ok(false);
             }
-        });
-}
-
-fn reap_std_child(mut child: Child) {
-    let _ = std::thread::Builder::new()
-        .name(String::from("failed-owned-process-reaper"))
-        .spawn(move || {
-            let _ = child.wait();
-        });
-}
-
-impl ManagedProcess {
-    /// Spawn a child in a new process group on Unix.
-    pub fn spawn_owned(command: &mut Command) -> io::Result<Self> {
-        platform::configure_owned(command);
-        Self::from_owned_child(command.spawn()?)
-    }
-
-    /// Adopt a freshly spawned, configured group before any wait/try_wait.
-    /// This shares the same anchor and exclusive child-wait contract as Tokio.
-    pub(crate) fn from_owned_child(mut child: Child) -> io::Result<Self> {
-        let group = match OwnedGroup::new(child.id()) {
-            Ok(group) => group,
-            Err(error) => {
-                let _ = child.kill();
-                reap_std_child(child);
-                return Err(error);
-            }
-        };
-        Ok(Self {
-            child,
-            ownership: ProcessOwnership::Owned,
-            group: Some(group),
-        })
-    }
-
-    /// Manage an already-created child without claiming its process group.
-    pub fn attach_external(child: Child) -> Self {
-        Self {
-            child,
-            ownership: ProcessOwnership::External,
-            group: None,
+            self.anchor = None;
         }
+        Ok(true)
     }
-
-    pub fn ownership(&self) -> ProcessOwnership {
-        self.ownership
-    }
-
-    pub fn id(&self) -> u32 {
-        self.child.id()
-    }
-
-    pub fn child(&self) -> &Child {
-        &self.child
-    }
-
-    pub(crate) fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
-        self.child.stdin.take()
-    }
-    pub(crate) fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
-        self.child.stdout.take()
-    }
-    pub(crate) fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
-        self.child.stderr.take()
-    }
-
-    /// Stop the child, escalating from a graceful request to a forced kill.
-    /// Owned children use group termination; externally attached children use
-    /// direct child termination only.
-    pub fn terminate(&mut self, timeout: Duration) -> io::Result<()> {
-        if self.ownership == ProcessOwnership::Owned && self.group.is_some() {
-            self.group.as_mut().unwrap().terminate(false)?;
-            platform::kill_child(&mut self.child)?;
-            // Keep the group as the ownership boundary even if its leader
-            // exits during the grace period.
-            let _ = self.wait_until_exited(timeout)?;
-            // The dedicated anchor remains unreaped while the original leader
-            // is waited, through this final signal, and across descendant handoff.
-            self.group.as_mut().unwrap().terminate(true)?;
-            self.group = None;
-            platform::kill_child(&mut self.child)?;
-            return self.wait_until_exited(timeout)?.map(|_| ()).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::TimedOut, "managed process did not exit")
-            });
-        }
-
-        self.child.kill()?;
-        if self.wait_until_exited(timeout)?.is_some() {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "managed process did not exit",
-            ))
-        }
-    }
-
-    pub fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
-        self.child.try_wait()
-    }
-
-    fn wait_until_exited(
-        &mut self,
-        timeout: Duration,
-    ) -> io::Result<Option<std::process::ExitStatus>> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(status) = self.try_wait()? {
-                return Ok(Some(status));
-            }
-            if Instant::now() >= deadline {
-                return Ok(None);
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-}
-
-impl Drop for ManagedProcess {
-    fn drop(&mut self) {
-        if self.ownership == ProcessOwnership::Owned && self.group.is_some() {
-            // Reaping the leader does not release descendants from its group.
-            // Signal the ownership boundary even when the leader is gone.
-            if self.group.as_mut().unwrap().terminate(true).is_ok() {
-                self.group = None;
-            }
-            if self.try_wait().ok().flatten().is_none() {
-                let _ = self.terminate(Duration::from_secs(2));
-            }
-        } else if self.try_wait().ok().flatten().is_none() {
-            let _ = self.terminate(Duration::from_secs(2));
+    fn external_override(&mut self) {
+        // Disable group signalling before killing/reaping only our anchor.
+        self.final_signal_sent = true;
+        #[cfg(target_os = "linux")]
+        {
+            self.external = true;
         }
     }
 }
 
 #[cfg(unix)]
-mod platform {
-    use super::*;
-    use std::os::unix::process::CommandExt;
-
-    pub fn configure_owned(command: &mut Command) {
-        command.process_group(0);
+fn valid_group(pid: u32) -> io::Result<rustix::process::Pid> {
+    let raw = i32::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid process group"))?;
+    if raw <= 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid process group",
+        ));
     }
-
-    pub fn configure_owned_tokio(command: &mut tokio::process::Command) {
-        command.process_group(0);
-    }
-
-    pub fn terminate_group(pid: u32, force: bool) -> io::Result<()> {
-        // `kill` is the safe, dependency-free std-process bridge to Unix
-        // signals; a negative PID targets the child's process group.
-        let group = format!("-{pid}");
-        let signal = if force { "-KILL" } else { "-TERM" };
-        let kill_path = if cfg!(target_os = "linux") {
-            "/usr/bin/kill"
-        } else {
-            "/bin/kill"
-        };
-        let output = Command::new(kill_path)
-            .args([signal, "--", &group])
-            .env("LC_ALL", "C")
-            .output()?;
-        // A child can exit between try_wait and this command.  Treat that
-        // race as successful cleanup; the subsequent wait is authoritative.
-        if output.status.success()
-            || String::from_utf8_lossy(&output.stderr)
-                .to_ascii_lowercase()
-                .contains("no such process")
-        {
-            Ok(())
-        } else {
-            Err(io::Error::other(
-                String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            ))
+    rustix::process::Pid::from_raw(raw)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid process group"))
+}
+fn terminate_group(pid: u32, force: bool) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use rustix::process::{kill_process_group, Signal};
+        match kill_process_group(
+            valid_group(pid)?,
+            if force { Signal::KILL } else { Signal::TERM },
+        ) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+            Err(error) => Err(error.into()),
         }
     }
-
-    pub fn kill_child(_child: &mut Child) -> io::Result<()> {
-        Ok(())
-    }
-
-    pub fn kill_tokio_child(_child: &mut tokio::process::Child) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        let _ = (pid, force);
         Ok(())
     }
 }
-
-#[cfg(windows)]
-mod platform {
-    use super::*;
-
-    pub fn configure_owned(_command: &mut Command) {}
-
-    pub fn configure_owned_tokio(_command: &mut tokio::process::Command) {}
-
-    pub fn terminate_group(_pid: u32, _force: bool) -> io::Result<()> {
-        // Job ownership remains with the existing Win32 integration.  The
-        // lifecycle helper falls back to Child::kill below.
-        Ok(())
+pub fn configure_owned(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
     }
-
-    pub fn kill_child(child: &mut Child) -> io::Result<()> {
-        if child.try_wait()?.is_none() {
-            child.kill()?
-        }
-        Ok(())
+    #[cfg(windows)]
+    let _ = command;
+}
+pub fn configure_owned_tokio(command: &mut tokio::process::Command) {
+    #[cfg(unix)]
+    {
+        command.process_group(0);
     }
+    #[cfg(windows)]
+    let _ = command;
+}
 
-    pub fn kill_tokio_child(child: &mut tokio::process::Child) -> io::Result<()> {
-        if child.try_wait()?.is_none() {
-            child.start_kill()?
+pub struct ManagedProcess {
+    child: Option<Child>,
+    group: Option<OwnedGroup>,
+    reservation: ProcessReservation,
+    grace: Duration,
+    #[cfg(windows)]
+    job: Option<win32job::Job>,
+}
+impl std::fmt::Debug for ManagedProcess {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedProcess")
+            .field("retirement", &self.reservation.mailbox.outcome())
+            .finish_non_exhaustive()
+    }
+}
+impl ManagedProcess {
+    pub(crate) fn spawn_owned(command: &mut Command, role: ProcessRole) -> io::Result<Self> {
+        ProcessReservation::reserve(role)?.spawn_std(command)
+    }
+    pub fn id(&self) -> u32 {
+        self.child().id()
+    }
+    pub fn child(&self) -> &Child {
+        self.child.as_ref().expect("active managed process")
+    }
+    pub(crate) fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
+        self.child.as_mut()?.stdin.take()
+    }
+    pub(crate) fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.as_mut()?.stdout.take()
+    }
+    pub(crate) fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.as_mut()?.stderr.take()
+    }
+    pub(crate) fn set_grace(&mut self, grace: Duration) {
+        self.grace = grace;
+    }
+    #[cfg(windows)]
+    pub(crate) fn set_job(&mut self, job: win32job::Job) {
+        self.job = Some(job);
+    }
+    fn publish(&mut self, graceful: Option<Duration>) {
+        if let Some(child) = self.child.take() {
+            #[allow(unused_mut)]
+            let mut bundle =
+                CleanupBundle::new(ChildKind::Std(child), self.group.take(), self.grace);
+            #[cfg(unix)]
+            if let Some(grace) = graceful.filter(|_| self.grace.is_zero()) {
+                bundle.grace = grace;
+                bundle.request_term = true;
+            }
+            #[cfg(windows)]
+            let _ = graceful;
+            #[cfg(windows)]
+            {
+                bundle.job = self.job.take().map(JobCleanup::new);
+            }
+            self.reservation.publish(bundle);
         }
-        Ok(())
+    }
+    pub fn terminate(&mut self, timeout: Duration) -> io::Result<()> {
+        self.publish(Some(timeout));
+        self.reservation.mailbox.wait(timeout.saturating_mul(2))
+    }
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| io::Error::other("managed process is retiring"))?
+            .try_wait()
+    }
+}
+impl Drop for ManagedProcess {
+    fn drop(&mut self) {
+        self.publish(None);
     }
 }
 
-#[cfg(test)]
+pub struct ManagedTokioProcess {
+    child: Option<tokio::process::Child>,
+    group: Option<OwnedGroup>,
+    reservation: ProcessReservation,
+    grace: Duration,
+    #[cfg(windows)]
+    job: Option<win32job::Job>,
+}
+impl ManagedTokioProcess {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn spawn_test(command: &mut tokio::process::Command) -> io::Result<Self> {
+        Supervisor::start(1, false)?
+            .reserve(0)?
+            .spawn_tokio(command)
+    }
+    pub(crate) fn spawn_owned(
+        command: &mut tokio::process::Command,
+        role: ProcessRole,
+    ) -> io::Result<Self> {
+        ProcessReservation::reserve(role)?.spawn_tokio(command)
+    }
+    pub fn take_stdin(&mut self) -> Option<tokio::process::ChildStdin> {
+        self.child.as_mut()?.stdin.take()
+    }
+    pub(crate) fn set_grace(&mut self, grace: Duration) {
+        self.grace = grace;
+    }
+    #[cfg(windows)]
+    pub(crate) fn set_job(&mut self, job: win32job::Job) {
+        self.job = Some(job);
+    }
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| io::Error::other("managed process is retiring"))?
+            .try_wait()
+    }
+    pub async fn wait(&mut self) -> io::Result<ExitStatus> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| io::Error::other("managed process is retiring"))?
+            .wait()
+            .await
+    }
+    fn publish(&mut self, ownership: ProcessOwnership, graceful: Option<Duration>) {
+        if let Some(child) = self.child.take() {
+            if ownership == ProcessOwnership::External {
+                if let Some(group) = &mut self.group {
+                    group.external_override();
+                }
+            }
+            #[allow(unused_mut)]
+            let mut bundle =
+                CleanupBundle::new(ChildKind::Tokio(child), self.group.take(), self.grace);
+            #[cfg(unix)]
+            if let Some(grace) =
+                graceful.filter(|_| self.grace.is_zero() && ownership == ProcessOwnership::Owned)
+            {
+                bundle.grace = grace;
+                bundle.request_term = true;
+            }
+            #[cfg(windows)]
+            let _ = graceful;
+            #[cfg(windows)]
+            {
+                bundle.job = self.job.take().map(JobCleanup::new);
+            }
+            self.reservation.publish(bundle);
+        }
+    }
+}
+impl std::ops::Deref for ManagedTokioProcess {
+    type Target = tokio::process::Child;
+    fn deref(&self) -> &Self::Target {
+        self.child.as_ref().expect("active managed process")
+    }
+}
+impl Drop for ManagedTokioProcess {
+    fn drop(&mut self) {
+        self.publish(ProcessOwnership::Owned, None);
+    }
+}
+pub async fn terminate_tokio(
+    child: &mut ManagedTokioProcess,
+    ownership: ProcessOwnership,
+    timeout: Duration,
+) -> io::Result<()> {
+    child.publish(ownership, Some(timeout));
+    child
+        .reservation
+        .mailbox
+        .wait_async(timeout.saturating_mul(2))
+        .await
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Stdio;
+
+    const ROLE: &str = "VOXGOLEM_SYNTHETIC_JOB_FIXTURE_ROLE";
+    const EXIT_LEADER: &str = "VOXGOLEM_SYNTHETIC_JOB_FIXTURE_EXIT";
+    const HELPER_TEST: &str = "managed_process::windows_tests::job_fixture_process";
+
+    #[test]
+    fn job_fixture_process() {
+        match std::env::var(ROLE).as_deref() {
+            Ok("leader") => {
+                // The parent assigns the job BEFORE allowing descendant spawn.
+                // This fixture handshake does not claim race-free app launch.
+                std::io::stdin().read_exact(&mut [0]).unwrap();
+                let _descendant = Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", HELPER_TEST, "--nocapture"])
+                    .env(ROLE, "descendant")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap();
+                println!("synthetic-descendant-ready");
+                std::io::stdout().flush().unwrap();
+                if std::env::var(EXIT_LEADER).as_deref() == Ok("yes") {
+                    std::process::exit(0);
+                }
+                std::thread::sleep(Duration::from_secs(60));
+            }
+            Ok("descendant") => std::thread::sleep(Duration::from_secs(60)),
+            _ => {}
+        }
+    }
+
+    struct Scope(Arc<Supervisor>);
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            let mailboxes = lock(&self.0.slots).clone();
+            for mailbox in mailboxes.iter().flatten() {
+                let _ = mailbox.wait(Duration::from_secs(6));
+            }
+            self.0.stop.store(true, Ordering::Release);
+            self.0.wake.notify_one();
+            if let Some(thread) = lock(&self.0.thread).take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn real_job_descendants_retire_on_explicit_shutdown_and_drop_even_after_leader_wait() {
+        for explicit in [false, true] {
+            for leader_exits in [false, true] {
+                let scope = Scope(Supervisor::start(1, false).unwrap());
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", HELPER_TEST, "--nocapture"])
+                    .env(ROLE, "leader")
+                    .env(EXIT_LEADER, if leader_exits { "yes" } else { "no" })
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null());
+                let mut process = scope.0.reserve(0).unwrap().spawn_std(&mut command).unwrap();
+                let mut limits = win32job::ExtendedLimitInfo::new();
+                limits.limit_kill_on_job_close();
+                let job = win32job::Job::create_with_limit_info(&limits).unwrap();
+                job.assign_process(process.child().as_raw_handle() as isize)
+                    .unwrap();
+                process.set_job(job);
+                let stdout = process.child.as_mut().unwrap().stdout.take().unwrap();
+                let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+                let reader = std::thread::spawn(move || {
+                    for line in BufReader::new(stdout).lines() {
+                        // The test harness can prefix its progress label on the
+                        // same line when --nocapture is selected.
+                        if line.unwrap().ends_with("synthetic-descendant-ready") {
+                            ready_tx.send(()).unwrap();
+                            return;
+                        }
+                    }
+                });
+                process.take_stdin().unwrap().write_all(b"x").unwrap();
+                ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                reader.join().unwrap();
+                if leader_exits {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while process.try_wait().unwrap().is_none() {
+                        assert!(Instant::now() < deadline);
+                        std::thread::sleep(POLL_INTERVAL);
+                    }
+                }
+                assert!(
+                    process
+                        .job
+                        .as_ref()
+                        .unwrap()
+                        .query_process_id_list()
+                        .unwrap()
+                        .len()
+                        >= if leader_exits { 1 } else { 2 },
+                    "the job must still own a long-lived descendant before shutdown"
+                );
+                let mailbox = Arc::clone(&process.reservation.mailbox);
+                if explicit {
+                    process.terminate(Duration::from_secs(3)).unwrap();
+                }
+                drop(process);
+                mailbox.wait(Duration::from_secs(6)).unwrap();
+                assert!(
+                    lock(mailbox.bundle.get().unwrap()).job.is_none(),
+                    "job released only after direct wait and successful empty query"
+                );
+                drop(scope.0.reserve(0).unwrap());
+            }
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
 
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn review_kernel_unreaped_anchor_preserves_group_even_after_anchor_death() {
-        use std::os::unix::process::{CommandExt, ExitStatusExt};
-        use std::process::Stdio;
-        let mut command = tokio::process::Command::new("/bin/sh");
-        command.args(["-c", "exit 0"]);
-        configure_owned_tokio(&mut command);
-        let mut leader = command.spawn().unwrap();
-        let group = leader.id().unwrap();
-        async fn zombie(pid: u32) {
-            tokio::time::timeout(Duration::from_secs(3), async {
-                loop {
-                    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-                    if stat
-                        .rsplit_once(')')
-                        .unwrap()
-                        .1
-                        .trim_start()
-                        .starts_with('Z')
-                    {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .expect("owned zombie acknowledgement without any wait/try_wait");
+    struct Scope(Arc<Supervisor>);
+    impl Scope {
+        fn new(capacity: usize) -> Self {
+            Self(Supervisor::start(capacity, false).unwrap())
         }
-        zombie(group).await;
-        // The live Tokio runtime has observed SIGCHLD but does not reap this
-        // retained, unpolled Child. Its group can still be joined before wait.
-        let mut anchor = Command::new("/bin/sh")
-            .args(["-c", "trap '' TERM HUP INT; IFS= read -r _"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(group as i32)
-            .spawn()
-            .expect("join before leader reap");
-        leader.wait().await.unwrap();
-        assert!(leader.id().is_none());
-        anchor.kill().unwrap(); // std Child::kill does NOT reap.
-        zombie(anchor.id()).await;
-        // This would fail with EPERM if the sole zombie group member released
-        // the PGID on exit instead of retaining it until its parent reaps it.
-        let mut probe = Command::new("/bin/sh")
-            .args(["-c", "exec sleep 30"])
-            .process_group(group as i32)
-            .spawn()
-            .expect("unreaped dead anchor must still reserve the group");
-        platform::terminate_group(group, true).unwrap();
-        let anchor_status = anchor.wait().unwrap(); // ONLY after final group signal.
-        assert_eq!(anchor_status.signal(), Some(9));
-        assert_eq!(probe.wait().unwrap().signal(), Some(9));
+        fn reserve(&self, slot: usize) -> ProcessReservation {
+            self.0.reserve(slot).unwrap()
+        }
+    }
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            let mailboxes = lock(&self.0.slots).clone();
+            for mailbox in mailboxes.into_iter().flatten() {
+                if mailbox.bundle.get().is_some() {
+                    let _ = mailbox.wait(Duration::from_secs(3));
+                }
+            }
+            self.0.stop.store(true, Ordering::Release);
+            self.0.wake.notify_one();
+            if let Some(thread) = lock(&self.0.thread).take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+    fn command(script: &str) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        command
+    }
+    fn wait_child(child: &mut Child) -> ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "synthetic child retirement deadline"
+            );
+            std::thread::sleep(POLL_INTERVAL);
+        }
     }
 
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn anchor_join_failure_is_reported_without_claiming_an_external_group() {
-        let mut sentinel = ManagedProcess::attach_external(
-            Command::new("/bin/sh")
-                .args(["-c", "exec sleep 30"])
-                .spawn()
-                .unwrap(),
+    #[test]
+    fn reaped_leader_still_requests_job_termination_and_requires_empty_job() {
+        let mut child = command("exit 0").spawn().unwrap();
+        wait_child(&mut child);
+        let state = Arc::new(Mutex::new(FakeJobState::default()));
+        let mut bundle = CleanupBundle::new(ChildKind::Std(child), None, Duration::ZERO);
+        bundle.job = Some(JobCleanup::new(FakeJob(Arc::clone(&state))));
+        assert!(!bundle.poll().unwrap());
+        assert_eq!(
+            lock(&state).terminate_calls,
+            1,
+            "leader wait must not skip job termination"
         );
-        let mut command = tokio::process::Command::new("/bin/sh");
-        command.args(["-c", "exec sleep 30"]).kill_on_drop(true);
-        // Deliberately NOT configure_owned: this child belongs to the external
-        // parent group, and no group with its numeric PID may be claimed.
-        let child = command.spawn().unwrap();
-        let pid = child.id().unwrap();
-        let error = match ManagedTokioProcess::from_owned_child(child) {
-            Ok(_) => panic!("constructor must reject an unjoinable owned group"),
-            Err(error) => error,
-        };
-        assert!(error
-            .to_string()
-            .contains("could not establish owned process group anchor"));
+        assert_eq!(lock(&state).drops, 0, "termination is not drain");
+        // Re-entering the force stage after a direct-child error must not send
+        // another job request whose acceptance was already confirmed.
+        bundle.job.as_mut().unwrap().request_termination().unwrap();
+        assert!(!bundle.poll().unwrap());
+        assert_eq!(
+            lock(&state).terminate_calls,
+            1,
+            "successful request is sent only once"
+        );
+        lock(&state).empty = true;
+        assert!(bundle.poll().unwrap());
+        assert_eq!(
+            lock(&state).drops,
+            1,
+            "only confirmed drain releases the job"
+        );
+    }
+
+    #[test]
+    fn job_effect_failures_retain_handles_and_capacity_without_poll_retries() {
+        for termination_failure in [true, false] {
+            let scope = Scope::new(1);
+            scope.0.paused.store(true, Ordering::Release);
+            let process = scope
+                .reserve(0)
+                .spawn_std(&mut command("exec sleep 30"))
+                .unwrap();
+            let mailbox = Arc::clone(&process.reservation.mailbox);
+            drop(process);
+            let state = Arc::new(Mutex::new(FakeJobState {
+                terminate_fails: termination_failure,
+                query_fails: !termination_failure,
+                ..Default::default()
+            }));
+            lock(mailbox.bundle.get().unwrap()).job =
+                Some(JobCleanup::new(FakeJob(Arc::clone(&state))));
+            scope.0.paused.store(false, Ordering::Release);
+            let error = mailbox.wait(Duration::from_secs(3)).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            assert_eq!(mailbox.outcome(), Outcome::WaitFailed);
+            assert!(scope.0.reserve(0).is_err());
+            for _ in 0..3 {
+                assert!(lock(mailbox.bundle.get().unwrap()).poll().is_err());
+            }
+            {
+                let state = lock(&state);
+                assert_eq!(state.terminate_calls, 1);
+                assert_eq!(state.query_calls, usize::from(!termination_failure));
+                assert_eq!(state.drops, 0);
+            }
+            // Explicit fixture recovery only: production does not automatically
+            // retry a failed native job effect or discard its ownership.
+            scope.0.paused.store(true, Ordering::Release);
+            {
+                let mut bundle = lock(mailbox.bundle.get().unwrap());
+                let mut state = lock(&state);
+                state.terminate_fails = false;
+                state.query_fails = false;
+                state.empty = true;
+                bundle.job.as_mut().unwrap().failure = None;
+                mailbox.publish_outcome(Outcome::Pending);
+            }
+            scope.0.paused.store(false, Ordering::Release);
+            mailbox.wait(Duration::from_secs(3)).unwrap();
+            assert_eq!(lock(&state).drops, 1);
+        }
+    }
+
+    #[test]
+    fn reservation_rejects_before_launch_and_drop_is_nonblocking() {
+        let scope = Scope::new(1);
+        let mut process = scope
+            .reserve(0)
+            .spawn_std(&mut command("exec sleep 30"))
+            .unwrap();
+        process.set_grace(Duration::from_millis(150));
+        let mailbox = Arc::clone(&process.reservation.mailbox);
         assert!(
-            sentinel.try_wait().unwrap().is_none(),
-            "unrelated child must remain running"
+            matches!(scope.0.reserve(0), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
         );
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while std::path::Path::new(&format!("/proc/{pid}")).exists() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("failed-constructor child retirement");
+        let mut launched = false;
+        let rejected = scope.0.reserve(0).and_then(|reservation| {
+            reservation.spawn_std_with(&mut command("exit 0"), |command| {
+                launched = true;
+                command.spawn()
+            })
+        });
+        assert!(rejected.is_err());
+        assert!(
+            !launched,
+            "capacity is checked before entering the real spawn path"
+        );
+        let start = Instant::now();
+        drop(process);
+        assert!(start.elapsed() < Duration::from_millis(100));
+        assert!(scope.0.reserve(0).is_err());
+        mailbox.wait(Duration::from_secs(3)).unwrap();
+        drop(scope.reserve(0));
     }
 
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn explicit_external_override_retires_only_its_anchor_and_child() {
-        struct FixtureGroup(OwnedGroup);
-        impl Drop for FixtureGroup {
-            fn drop(&mut self) {
-                let _ = self.0.terminate(true);
-            }
+    #[test]
+    fn startup_failure_has_no_launch_capacity() {
+        let mut launches = 0;
+        let result = Supervisor::start(1, true).and_then(|supervisor| {
+            supervisor
+                .reserve(0)?
+                .spawn_std_with(&mut command("exit 0"), |command| {
+                    launches += 1;
+                    command.spawn()
+                })
+        });
+        assert!(result.is_err());
+        assert_eq!(launches, 0);
+    }
+
+    #[test]
+    fn failed_adoption_retains_direct_child_until_wait() {
+        let scope = Scope::new(1);
+        scope.0.paused.store(true, Ordering::Release);
+        let reservation = scope.reserve(0);
+        let mailbox = Arc::clone(&reservation.mailbox);
+        let mut pid = 0;
+        // Production adoption path, with a deliberately unconfigured child.
+        let result = reservation.spawn_std_with(&mut command("exit 0"), |_| {
+            let child = command("exec sleep 30").spawn()?;
+            pid = child.id();
+            Ok(child)
+        });
+        assert!(result.is_err());
+        assert!(scope.0.reserve(0).is_err());
+        assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+        scope.0.paused.store(false, Ordering::Release);
+        mailbox.wait(Duration::from_secs(3)).unwrap();
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[test]
+    fn wait_failure_and_unavailable_worker_keep_the_bundle_and_capacity() {
+        let scope = Scope::new(1);
+        scope.0.paused.store(true, Ordering::Release);
+        let process = scope
+            .reserve(0)
+            .spawn_std(&mut command("exec sleep 30"))
+            .unwrap();
+        let mailbox = Arc::clone(&process.reservation.mailbox);
+        mailbox.fail_wait.store(true, Ordering::Release);
+        drop(process);
+        scope.0.paused.store(false, Ordering::Release);
+        assert!(mailbox.wait(Duration::from_secs(1)).is_err());
+        assert!(scope.0.reserve(0).is_err());
+        assert!(mailbox.bundle.get().is_some());
+        mailbox.panic_poll.store(true, Ordering::Release);
+        mailbox.fail_wait.store(false, Ordering::Release);
+        scope.0.wake.notify_one();
+        if let Some(thread) = lock(&scope.0.thread).take() {
+            thread.join().unwrap();
         }
-        let fixture = crate::test_support::TestDir::new("external-override");
-        let marker = fixture.path().join("descendant.pid");
+        assert_eq!(mailbox.outcome(), Outcome::Unavailable);
+        assert!(scope.0.reserve(0).is_err());
+        // Explicit fixture cleanup, not a production fallback/restarted worker.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !lock(mailbox.bundle.get().unwrap()).poll().unwrap() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        mailbox.publish_outcome(Outcome::Retired);
+        assert!(
+            scope.0.reserve(0).is_err(),
+            "failed supervisor never admits new work"
+        );
+    }
+
+    #[test]
+    fn pending_mailbox_does_not_starve_sibling() {
+        let scope = Scope::new(2);
+        let mut first = scope
+            .reserve(0)
+            .spawn_std(&mut command("exec sleep 30"))
+            .unwrap();
+        first.set_grace(Duration::from_secs(1));
+        let first_mailbox = Arc::clone(&first.reservation.mailbox);
+        let second = scope
+            .reserve(1)
+            .spawn_std(&mut command("exec sleep 30"))
+            .unwrap();
+        let second_mailbox = Arc::clone(&second.reservation.mailbox);
+        drop(first);
+        drop(second);
+        second_mailbox.wait(Duration::from_millis(500)).unwrap();
+        assert_ne!(first_mailbox.outcome(), Outcome::Retired);
+        first_mailbox.wait(Duration::from_secs(3)).unwrap();
+    }
+
+    #[test]
+    fn drop_after_worker_failure_still_publishes_into_the_reserved_root() {
+        let scope = Scope::new(1);
+        let process = scope
+            .reserve(0)
+            .spawn_std(&mut command("exec sleep 30"))
+            .unwrap();
+        let mailbox = Arc::clone(&process.reservation.mailbox);
+        scope.0.stop.store(true, Ordering::Release);
+        scope.0.wake.notify_one();
+        if let Some(thread) = lock(&scope.0.thread).take() {
+            thread.join().unwrap();
+        }
+        scope.0.fail();
+        drop(process);
+        assert_eq!(mailbox.outcome(), Outcome::Unavailable);
+        assert!(mailbox.bundle.get().is_some());
+        assert!(scope.0.reserve(0).is_err());
+        // Only the test fixture directly retires this unavailable worker's bundle.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !lock(mailbox.bundle.get().unwrap()).poll().unwrap() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        mailbox.publish_outcome(Outcome::Retired);
+    }
+
+    #[tokio::test]
+    async fn timeout_and_abandoned_waiter_do_not_abandon_cleanup() {
+        let scope = Scope::new(1);
         let mut command = tokio::process::Command::new("/bin/sh");
-        command.args([
-            "-c",
-            &format!("sleep 30 & echo $! > '{}'; wait", marker.display()),
-        ]);
-        configure_owned_tokio(&mut command);
-        let mut process = ManagedTokioProcess::from_owned_child(command.spawn().unwrap()).unwrap();
-        let mut cleanup = FixtureGroup(OwnedGroup::new(process.id().unwrap()).unwrap());
-        let descendant = tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if let Ok(bytes) = std::fs::read_to_string(&marker) {
-                    if let Ok(pid) = bytes.trim().parse::<u32>() {
-                        break pid;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
+        command.args(["-c", "exec sleep 30"]);
+        let mut process = scope.reserve(0).spawn_tokio(&mut command).unwrap();
+        process.set_grace(Duration::from_millis(150));
+        let mailbox = Arc::clone(&process.reservation.mailbox);
+        assert!(scope.0.wait_for_retirement(Duration::ZERO).await.is_err());
+        let error = terminate_tokio(&mut process, ProcessOwnership::Owned, Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        drop(process);
+        assert!(scope.0.reserve(0).is_err());
+        mailbox.wait_async(Duration::from_secs(3)).await.unwrap();
+        scope.0.wait_for_retirement(Duration::ZERO).await.unwrap();
+        let mut process = scope.reserve(0).spawn_tokio(&mut command).unwrap();
+        process.set_grace(Duration::from_millis(150));
+        let mailbox = Arc::clone(&process.reservation.mailbox);
+        assert!(tokio::time::timeout(
+            Duration::ZERO,
+            terminate_tokio(
+                &mut process,
+                ProcessOwnership::Owned,
+                Duration::from_secs(3)
+            )
+        )
         .await
-        .unwrap();
+        .is_err());
+        drop(process);
+        assert!(scope.0.reserve(0).is_err());
+        mailbox.wait_async(Duration::from_secs(3)).await.unwrap();
+    }
+
+    #[test]
+    fn dead_anchor_reserves_group_through_final_signal_after_leader_wait() {
+        let scope = Scope::new(1);
+        let mut process = scope.reserve(0).spawn_std(&mut command("exit 0")).unwrap();
+        while process.try_wait().unwrap().is_none() {
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        let group = process.id();
+        let anchor = process.group.as_mut().unwrap().anchor.as_mut().unwrap();
+        let anchor_pid = anchor.id();
+        anchor.kill().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while running(anchor_pid) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        assert!(
+            std::path::Path::new(&format!("/proc/{anchor_pid}")).exists(),
+            "dead anchor must remain unreaped"
+        );
+        let mut probe = command("exec sleep 30")
+            .process_group(group as i32)
+            .spawn()
+            .unwrap();
+        let mailbox = Arc::clone(&process.reservation.mailbox);
+        drop(process);
+        mailbox.wait(Duration::from_secs(3)).unwrap();
+        assert!(!std::path::Path::new(&format!("/proc/{anchor_pid}")).exists());
+        assert!(!wait_child(&mut probe).success());
+    }
+
+    #[tokio::test]
+    async fn external_override_never_signals_descendant_group() {
+        let scope = Scope::new(1);
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "IFS= read -r _"]).stdin(Stdio::piped());
+        let mut process = scope.reserve(0).spawn_tokio(&mut command).unwrap();
+        let group = process.id().unwrap();
+        let mut sentinel = super::tests::command("exec sleep 30")
+            .process_group(group as i32)
+            .spawn()
+            .unwrap();
         terminate_tokio(
             &mut process,
             ProcessOwnership::External,
-            Duration::from_secs(2),
+            Duration::from_secs(3),
         )
         .await
         .unwrap();
-        drop(process);
-        assert!(
-            linux_process_running(descendant),
-            "external override must not trigger a group signal from OwnedGroup Drop"
-        );
-        cleanup.0.terminate(true).unwrap();
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while linux_process_running(descendant) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
+        assert!(sentinel.try_wait().unwrap().is_none());
+        sentinel.kill().unwrap();
+        wait_child(&mut sentinel);
     }
 
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn review_successor_handoff_after_leader_and_known_member_reap() {
-        use std::io::Write;
-        use std::process::Stdio;
-        for on_drop in [false, true] {
-            let fixture = crate::test_support::TestDir::new("group-handoff");
-            let marker = fixture.path().join("successor.pid");
-            let mut command = tokio::process::Command::new("/bin/sh");
-            command.args(["-c", "IFS= read -r _"]).stdin(Stdio::piped());
-            configure_owned_tokio(&mut command);
-            let mut process =
-                ManagedTokioProcess::from_owned_child(command.spawn().unwrap()).unwrap();
-            let group = process.id().unwrap();
-            let mut initial = Command::new("/bin/sh");
-            use std::os::unix::process::CommandExt;
-            initial
-                .process_group(group as i32)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            initial.args(["-c", "exec 3<&0; IFS= read -r _; /bin/sh -c 'trap \"\" TERM HUP INT; printf %s \"$$\" > \"$1\"; IFS= read -r _' synthetic-successor \"$1\" <&3 &", "synthetic-initial"]).arg(&marker);
-            let mut initial = ManagedProcess::attach_external(initial.spawn().unwrap());
-            let mut control = initial.take_stdin().unwrap();
-            drop(process.take_stdin());
-            tokio::time::timeout(Duration::from_secs(3), process.wait())
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(process.id().is_none());
-            control.write_all(b"handoff\n").unwrap();
-            let successor = tokio::time::timeout(Duration::from_secs(3), async {
-                loop {
-                    if let Ok(bytes) = std::fs::read_to_string(&marker) {
-                        if let Ok(pid) = bytes.parse::<u32>() {
-                            break pid;
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
+    fn running(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(')')
+                    .map(|(_, fields)| !fields.trim_start().starts_with(['Z', 'X']))
             })
-            .await
-            .expect("successor acknowledgement");
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while initial.try_wait().unwrap().is_none() {
-                assert!(Instant::now() < deadline, "initial member reap deadline");
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            assert!(linux_process_running(successor));
-            if on_drop {
-                terminate_tokio_on_drop(process, ProcessOwnership::Owned);
-            } else {
-                terminate_tokio(
-                    &mut process,
-                    ProcessOwnership::Owned,
-                    Duration::from_millis(100),
-                )
-                .await
-                .unwrap();
-            }
-            tokio::time::timeout(Duration::from_secs(3), async {
-                while linux_process_running(successor) {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .expect("successor must retire before fixture control pipe closes");
-            drop(control);
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn rejects_unsafe_numeric_groups_without_signalling() {
+        for pid in [0, 1, u32::MAX] {
+            assert_eq!(
+                terminate_group(pid, true).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
         }
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn review_child_churn_does_not_retain_historical_proc_descriptors() {
+    fn explicit_shutdown_allows_graceful_exit_before_final_group_signal() {
+        let fixture = crate::test_support::TestDir::new("supervised-graceful");
+        let ready = fixture.path().join("synthetic-ready");
+        let retired = fixture.path().join("synthetic-retired");
+        let scope = Scope::new(1);
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "trap 'printf retired > \"$1\"; exit 0' TERM; printf ready > \"$2\"; while :; do sleep 1; done", "synthetic-graceful"]).arg(&retired).arg(&ready);
+        let mut process = scope.reserve(0).spawn_std(&mut command).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        process.terminate(Duration::from_secs(1)).unwrap();
+        assert_eq!(std::fs::read_to_string(retired).unwrap(), "retired");
+    }
+
+    #[test]
+    fn historical_group_members_do_not_accumulate_proc_descriptors() {
         use std::os::fd::AsRawFd;
-        use std::os::unix::process::CommandExt;
-        let mut process =
-            ManagedProcess::spawn_owned(Command::new("/bin/sh").args(["-c", "sleep 30"])).unwrap();
+        let scope = Scope::new(1);
+        let mut process = scope
+            .reserve(0)
+            .spawn_std(&mut command("exec sleep 30"))
+            .unwrap();
+        let group = process.id();
         let anchor = process.group.as_ref().unwrap().anchor.as_ref().unwrap();
         let pipe = std::fs::read_link(format!(
             "/proc/self/fd/{}",
@@ -752,325 +1498,106 @@ mod tests {
         .unwrap();
         let mut retired = Vec::new();
         for _ in 0..64 {
-            let mut command = Command::new("/bin/sh");
-            command
-                .args(["-c", "exit 0"])
-                .process_group(process.id() as i32);
-            let mut child = command.spawn().unwrap();
-            retired.push(child.id());
-            assert!(process.try_wait().unwrap().is_none());
-            child.wait().unwrap();
+            let mut member = command("exit 0")
+                .process_group(group as i32)
+                .spawn()
+                .unwrap();
+            retired.push(member.id());
+            wait_child(&mut member);
         }
-        let retained = std::fs::read_dir("/proc/self/fd")
+        let descriptors = std::fs::read_dir("/proc/self/fd")
             .unwrap()
             .filter_map(Result::ok)
             .filter_map(|entry| std::fs::read_link(entry.path()).ok())
-            .filter(|path| {
-                retired.iter().any(|pid| {
-                    path.to_string_lossy()
-                        .starts_with(&format!("/proc/{pid}/stat"))
-                })
-            })
-            .count();
-        assert_eq!(
-            retained, 0,
-            "ownership must not retain one FD per historical member"
-        );
-        let pipes = std::fs::read_dir("/proc/self/fd")
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
-            .filter(|path| path == &pipe)
-            .count();
-        assert_eq!(
-            pipes, 1,
-            "exactly one parent-owned anchor pipe remains after child churn"
-        );
-        let mut probe = Command::new("/bin/sh")
-            .args(["-c", "exec sleep 30"])
-            .process_group(process.id() as i32)
-            .spawn()
-            .unwrap();
-        process.terminate(Duration::from_millis(100)).unwrap();
+            .collect::<Vec<_>>();
+        assert_eq!(descriptors.iter().filter(|path| **path == pipe).count(), 1);
+        assert!(!descriptors.iter().any(|path| retired.iter().any(|pid| path
+            .to_string_lossy()
+            .starts_with(&format!("/proc/{pid}/stat")))));
+        process.terminate(Duration::from_secs(3)).unwrap();
+    }
+
+    #[test]
+    fn successor_handoff_survives_leader_and_known_member_wait() {
+        use std::io::Write;
+        let fixture = crate::test_support::TestDir::new("supervised-successor");
+        let marker = fixture.path().join("synthetic-successor.pid");
+        let scope = Scope::new(1);
+        let mut leader_command = command("IFS= read -r _");
+        leader_command.stdin(Stdio::piped());
+        let mut leader = scope.reserve(0).spawn_std(&mut leader_command).unwrap();
+        let group = leader.id();
+        let mut initial = Command::new("/bin/sh");
+        initial
+            .process_group(group as i32)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        initial.args(["-c", "exec 3<&0; IFS= read -r _; /bin/sh -c 'trap \"\" TERM HUP INT; printf %s \"$$\" > \"$1\"; IFS= read -r _' synthetic-successor \"$1\" <&3 &", "synthetic-initial"]).arg(&marker);
+        let mut initial = initial.spawn().unwrap();
+        let mut control = initial.stdin.take().unwrap();
+        drop(leader.take_stdin());
         let deadline = Instant::now() + Duration::from_secs(3);
-        while probe.try_wait().unwrap().is_none() {
-            assert!(
-                Instant::now() < deadline,
-                "group child must retire after churn"
-            );
-            std::thread::sleep(Duration::from_millis(5));
+        while leader.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(POLL_INTERVAL);
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn external_process_is_not_group_owned() {
-        let child = Command::new(if cfg!(windows) { "cmd" } else { "true" })
-            .spawn()
-            .expect("test command should spawn");
-        let process = ManagedProcess::attach_external(child);
-        assert_eq!(process.ownership(), ProcessOwnership::External);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn owned_process_group_is_terminated_and_child_is_reaped() {
-        let mut process =
-            ManagedProcess::spawn_owned(Command::new("sh").arg("-c").arg("sleep 30 & wait"))
-                .expect("test process should spawn");
-
-        process
-            .terminate(Duration::from_secs(2))
-            .expect("owned process group should terminate");
-        assert!(process
-            .try_wait()
-            .expect("child should be reapable")
-            .is_some());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn owned_group_kills_stubborn_descendant_after_leader_exits() {
-        let fixture = crate::test_support::TestDir::new("managed-descendant");
-        let marker = fixture.path().join("descendant.pid");
-        let script = format!(
-            "sh -c 'trap \"\" TERM; exec sleep 30' & echo $! > '{}'; exit 0",
-            marker.display()
-        );
-        let mut process = ManagedProcess::spawn_owned(Command::new("sh").arg("-c").arg(script))
-            .expect("test process should spawn");
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let descendant = loop {
-            if let Ok(pid) = std::fs::read_to_string(&marker) {
-                if let Ok(pid) = pid.trim().parse::<u32>() {
+        control.write_all(b"handoff\n").unwrap();
+        let successor = loop {
+            if let Ok(bytes) = std::fs::read_to_string(&marker) {
+                if let Ok(pid) = bytes.parse::<u32>() {
                     break pid;
                 }
             }
-            assert!(Instant::now() < deadline, "descendant pid was not written");
-            std::thread::sleep(Duration::from_millis(10));
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(POLL_INTERVAL);
         };
-
-        process
-            .terminate(Duration::from_millis(100))
-            .expect("owned process group should terminate");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while linux_process_running(descendant) {
-            assert!(Instant::now() < deadline, "owned descendant should retire");
-            std::thread::sleep(Duration::from_millis(20));
+        wait_child(&mut initial);
+        assert!(running(successor));
+        let mailbox = Arc::clone(&leader.reservation.mailbox);
+        drop(leader);
+        mailbox.wait(Duration::from_secs(3)).unwrap();
+        while running(successor) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(POLL_INTERVAL);
         }
+        drop(control);
     }
 
-    #[cfg(target_os = "linux")]
-    fn linux_process_running(pid: u32) -> bool {
-        std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .ok()
-            .and_then(|stat| {
-                stat.rsplit_once(')')
-                    .map(|(_, rest)| rest.trim_start().chars().next().unwrap())
-            })
-            .is_some_and(|state| !matches!(state, 'Z' | 'X'))
-    }
-
-    #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn tokio_owned_group_retires_descendant_after_leader_was_reaped() {
-        assert_tokio_descendant_retirement(false).await;
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn tokio_drop_retires_descendant_after_leader_was_reaped() {
-        assert_tokio_descendant_retirement(true).await;
-    }
-
-    #[cfg(target_os = "linux")]
-    async fn assert_tokio_descendant_retirement(on_drop: bool) {
-        let fixture = crate::test_support::TestDir::new("tokio-descendant");
-        let marker = fixture.path().join("descendant.pid");
-        let mut command = tokio::process::Command::new("sh");
-        command.args([
-            "-c",
-            &format!(
-                "sh -c 'trap \"\" TERM; exec sleep 30' & echo $! > '{}'; exit 0",
-                marker.display()
-            ),
-        ]);
-        configure_owned_tokio(&mut command);
-        let mut process = ManagedTokioProcess::from_owned_child(command.spawn().unwrap()).unwrap();
-        tokio::time::timeout(Duration::from_secs(3), process.wait())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(process.id().is_none(), "Tokio releases Child.id after reap");
-        let descendant: u32 = std::fs::read_to_string(marker)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        assert!(
-            linux_process_running(descendant),
-            "descendant must be alive before shutdown"
-        );
-        if on_drop {
-            terminate_tokio_on_drop(process, ProcessOwnership::Owned);
-        } else {
-            terminate_tokio(
-                &mut process,
-                ProcessOwnership::Owned,
-                Duration::from_millis(100),
-            )
-            .await
-            .unwrap();
-        }
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while linux_process_running(descendant) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("actual owned descendant retirement");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn owned_anchor_does_not_release_identity_before_final_group_signal() {
-        use std::os::unix::process::{CommandExt, ExitStatusExt};
-        for on_drop in [false, true] {
-            let mut process =
-                ManagedProcess::spawn_owned(Command::new("/bin/sh").args(["-c", "exit 0"]))
-                    .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while process.try_wait().unwrap().is_none() {
-                assert!(Instant::now() < deadline);
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            let anchor = process.group.as_mut().unwrap().anchor.as_mut().unwrap();
-            let anchor_pid = anchor.id();
-            anchor.kill().unwrap();
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while linux_process_running(anchor_pid) {
-                assert!(Instant::now() < deadline);
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            assert!(
-                std::path::Path::new(&format!("/proc/{anchor_pid}")).exists(),
-                "dead anchor must remain unreaped"
-            );
-            let fixture = crate::test_support::TestDir::new("dead-anchor-probe");
-            let ready = fixture.path().join("ready");
-            let mut probe = Command::new("/bin/sh")
+    async fn tokio_leader_wait_does_not_release_stubborn_descendants() {
+        for explicit in [false, true] {
+            let fixture = crate::test_support::TestDir::new("supervised-tokio-descendant");
+            let marker = fixture.path().join("synthetic-descendant.pid");
+            let scope = Scope::new(1);
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command
                 .args([
                     "-c",
-                    "trap '' TERM HUP INT; printf ready > \"$1\"; exec sleep 30",
-                    "synthetic-probe",
+                    "sh -c 'trap \"\" TERM HUP INT; exec sleep 30' & printf %s $! > \"$1\"; exit 0",
+                    "synthetic-leader",
                 ])
-                .arg(&ready)
-                .process_group(process.id() as i32)
-                .spawn()
-                .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while !ready.exists() {
-                assert!(Instant::now() < deadline, "probe trap acknowledgement");
-                std::thread::sleep(Duration::from_millis(5));
+                .arg(&marker);
+            let mut leader = scope.reserve(0).spawn_tokio(&mut command).unwrap();
+            leader.wait().await.unwrap();
+            assert!(leader.id().is_none());
+            let descendant = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+            assert!(running(descendant));
+            let mailbox = Arc::clone(&leader.reservation.mailbox);
+            if explicit {
+                terminate_tokio(&mut leader, ProcessOwnership::Owned, Duration::from_secs(3))
+                    .await
+                    .unwrap();
             }
-            if on_drop {
-                drop(process);
-            } else {
-                process.terminate(Duration::from_millis(100)).unwrap();
-            }
-            let deadline = Instant::now() + Duration::from_secs(3);
-            loop {
-                if let Some(status) = probe.try_wait().unwrap() {
-                    assert_eq!(status.signal(), Some(9));
-                    break;
+            drop(leader);
+            mailbox.wait_async(Duration::from_secs(3)).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while running(descendant) {
+                    tokio::time::sleep(POLL_INTERVAL).await;
                 }
-                assert!(
-                    Instant::now() < deadline,
-                    "final group signal must retire probe"
-                );
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            assert!(
-                !std::path::Path::new(&format!("/proc/{anchor_pid}")).exists(),
-                "anchor reaped after final group signal"
-            );
+            })
+            .await
+            .unwrap();
         }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn external_tokio_shutdown_reaps_only_the_child_not_its_group() {
-        struct FixtureGroup(OwnedGroup);
-        impl Drop for FixtureGroup {
-            fn drop(&mut self) {
-                let _ = self.0.terminate(true);
-            }
-        }
-        let fixture = crate::test_support::TestDir::new("external-descendant");
-        let marker = fixture.path().join("descendant.pid");
-        let mut command = tokio::process::Command::new("sh");
-        command.args([
-            "-c",
-            &format!("sleep 30 & echo $! > '{}'; wait", marker.display()),
-        ]);
-        // The fixture owns cleanup, not the externally attached runtime wrapper.
-        configure_owned_tokio(&mut command);
-        let child = command.spawn().unwrap();
-        let pid = child.id().unwrap();
-        let mut cleanup = FixtureGroup(OwnedGroup::new(pid).unwrap());
-        let mut process = ManagedTokioProcess::attach_external(child);
-        let descendant = tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if let Ok(bytes) = std::fs::read_to_string(&marker) {
-                    if let Ok(pid) = bytes.trim().parse::<u32>() {
-                        break pid;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("external fixture descendant acknowledgement");
-        terminate_tokio(
-            &mut process,
-            ProcessOwnership::External,
-            Duration::from_secs(2),
-        )
-        .await
-        .unwrap();
-        assert!(process.id().is_none(), "external child was reaped");
-        drop(process);
-        assert!(
-            linux_process_running(descendant),
-            "external descendant must not be group-killed by shutdown or drop"
-        );
-        cleanup.0.terminate(true).unwrap();
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while linux_process_running(descendant) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("fixture-owned descendant cleanup");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn external_process_is_directly_terminated_and_reaped() {
-        let child = Command::new("sh")
-            .arg("-c")
-            .arg("exec sleep 30")
-            .spawn()
-            .expect("test process should spawn");
-        let mut process = ManagedProcess::attach_external(child);
-
-        process
-            .terminate(Duration::from_secs(2))
-            .expect("external child should terminate");
-        assert!(process
-            .try_wait()
-            .expect("child should be reapable")
-            .is_some());
     }
 }
