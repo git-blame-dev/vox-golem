@@ -77,8 +77,8 @@ describe('InstantModelSelect', () => {
     const options: readonly AssistantOption<InstantChoice>[] = [
       { value: 'custom-sol-high', label: 'Custom: GPT-6.1 Sol High', available: true },
       { value: 'custom-sol-low', label: 'Custom: GPT-6.1 Sol Low', available: true },
-      { value: 'custom-luna-high', label: 'Custom: GPT-6 Luna High', available: true },
-      { value: 'custom-luna-low', label: 'Custom: GPT-6 Luna Low', available: true },
+      { value: 'custom-luna6-high', label: 'Custom: GPT-6 Luna High', available: true },
+      { value: 'custom-luna6-low', label: 'Custom: GPT-6 Luna Low', available: true },
     ]
     const onChange = vi.fn()
     const { select, container: rootEl } = renderSelect(options, false, undefined, 'pill', 'custom-sol-high')
@@ -89,11 +89,11 @@ describe('InstantModelSelect', () => {
     expect(popupBefore).not.toBeNull()
     expect(popupBefore.getAttribute('data-state')).toBe('open')
 
-    act(() => root?.render(<InstantModelSelect variant="pill" id="syntheticInstant" label="Instant model" value="custom-luna-high" options={options} disabled={true} canRetry={() => false} onChange={onChange} />))
+    act(() => root?.render(<InstantModelSelect variant="pill" id="syntheticInstant" label="Instant model" value="custom-luna6-high" options={options} disabled={true} canRetry={() => false} onChange={onChange} />))
     expect(rootEl.querySelector('.composer__model-popup')).toBe(popupBefore)
     expect(rootEl.querySelector('.composer__model-popup')?.getAttribute('data-state')).toBe('open')
 
-    act(() => root?.render(<InstantModelSelect variant="pill" id="syntheticInstant" label="Instant model" value="custom-luna-high" options={options} disabled={false} canRetry={() => false} onChange={onChange} />))
+    act(() => root?.render(<InstantModelSelect variant="pill" id="syntheticInstant" label="Instant model" value="custom-luna6-high" options={options} disabled={false} canRetry={() => false} onChange={onChange} />))
     expect(rootEl.querySelector('.composer__model-popup')).toBe(popupBefore)
     expect(rootEl.querySelector('.composer__model-popup')?.getAttribute('data-state')).toBe('open')
   })
