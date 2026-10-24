@@ -1,12 +1,119 @@
 import { describe, expect, it, vi } from 'vitest'
 import { FrontendSession } from './FrontendSession'
-import { SessionAuthority } from './SessionAuthority'
+import { SessionAuthority, useSessionView } from './SessionAuthority'
 import type { StartupState } from './types/chat'
 import type { ModelOption } from './lib/appSnapshot'
 import { act, createElement, useSyncExternalStore } from 'react'
 import { createRoot } from 'react-dom/client'
 
 describe('FrontendSession transition authority', () => {
+  it.each([false, true])('keeps named React views stable without coalescing accepted controls (android=%s)', async (android) => {
+    const session = new SessionAuthority({ android })
+    const names = ['runtime', 'toolbar', 'composer', 'settings'] as const
+    const renders = Object.fromEntries(names.map((name) => [name, 0]))
+    const startup: StartupState = {
+      kind: 'ready', cueAssetPaths: { startListening: 'synthetic-start.wav', stopListening: 'synthetic-stop.wav' },
+      runtimePhase: 'sleeping', voiceInputAvailable: false, voiceInputError: null, initialSilenceTimeoutMs: 2500,
+      silenceTimeoutMs: 750, selectedResponseProfile: 'fast', supportedResponseProfiles: ['fast', 'quality'],
+      promptCancellationAvailable: true, ttsEnabled: false, ttsOutputGainDb: 3,
+      capabilities: [{ id: 'local_fast', state: 'available', reason: 'Synthetic ready', actualProvider: null }],
+      speechServices: {
+        stt: { configuredEngine: null, runtimeEngine: null, configuredModel: null, configuredVoice: null, configuredLocale: null },
+        tts: { configuredEngine: 'synthetic-engine', runtimeEngine: null, configuredModel: null, configuredVoice: null, configuredLocale: null },
+      },
+    }
+    const models: ModelOption[] = [{ id: 'local-fast', label: 'Synthetic model', available: true, unavailableReason: null }]
+    const accept = (state: StartupState, inventory: ModelOption[] | null) => session.transaction(() => {
+      session.fieldState('startupState')[1](state)
+      session.fieldState('snapshotModelOptions')[1](inventory)
+    })
+    accept(startup, models)
+    function Subscriber({ name }: { name: typeof names[number] }) {
+      useSessionView(session, name)
+      renders[name]! += 1
+      return null
+    }
+    const root = createRoot(document.createElement('div'))
+    try {
+      await act(async () => { root.render(names.map((name) => createElement(Subscriber, { key: name, name }))) })
+      const initialRenders = { ...renders }
+      const snapshots = names.map((name) => session.getViewSnapshot(name))
+      for (let repeat = 0; repeat < 2; repeat += 1) {
+        const fresh = structuredClone(startup)
+        const freshModels = structuredClone(models)
+        await act(async () => { accept(fresh, freshModels) })
+        expect(session.fieldRef('startupState').current).toBe(fresh)
+        expect(session.fieldRef('snapshotModelOptions').current).toBe(freshModels)
+        expect(session.getControlsSnapshot().startupState).toBe(fresh)
+        expect(session.getControlsSnapshot().snapshotModelOptions).toBe(freshModels)
+        names.forEach((name, index) => expect(session.getViewSnapshot(name)).toBe(snapshots[index]))
+        expect(renders).toEqual(initialRenders)
+      }
+      await act(async () => { accept({ ...startup, capabilities: [{ ...startup.capabilities[0]!, reason: 'Synthetic changed reason' }] }, models) })
+      names.forEach((name) => expect(renders[name]).toBe(initialRenders[name]! + 1))
+    } finally {
+      await act(async () => { root.unmount() })
+    }
+  })
+
+  it('invalidates named views for meaningful startup metadata, variants and inventory boundaries', () => {
+    const session = new SessionAuthority()
+    const names = ['runtime', 'toolbar', 'composer', 'settings'] as const
+    const publish = (startup: StartupState) => {
+      const prior = names.map((name) => session.getViewSnapshot(name))
+      session.transaction(() => session.fieldState('startupState')[1](startup))
+      names.forEach((name, index) => expect(session.getViewSnapshot(name)).not.toBe(prior[index]))
+    }
+    const ready: Extract<StartupState, { kind: 'ready' }> = {
+      kind: 'ready', cueAssetPaths: { startListening: 'synthetic-start.wav', stopListening: 'synthetic-stop.wav' },
+      runtimePhase: 'sleeping', voiceInputAvailable: false, voiceInputError: null, initialSilenceTimeoutMs: 2500,
+      silenceTimeoutMs: 750, selectedResponseProfile: 'fast', supportedResponseProfiles: ['fast', 'quality'],
+      promptCancellationAvailable: true, ttsEnabled: false, ttsOutputGainDb: 3,
+      capabilities: [{ id: 'local_fast', state: 'available', reason: 'Synthetic ready', actualProvider: null }],
+    }
+    publish(ready)
+    const changes: Partial<typeof ready>[] = [
+      { capabilities: [{ ...ready.capabilities[0]!, actualProvider: 'synthetic-provider' }] },
+      { capabilities: [{ ...ready.capabilities[0]!, state: 'warming' }] },
+      { capabilities: [{ ...ready.capabilities[0]!, id: 'local_quality' }] },
+      { capabilities: [...ready.capabilities, { ...ready.capabilities[0]!, id: 'custom_provider' }] },
+      { cueAssetPaths: { ...ready.cueAssetPaths, stopListeningShort: 'synthetic-short.wav' } },
+      { initialSilenceTimeoutMs: 3000 }, { silenceTimeoutMs: 900 },
+      { selectedResponseProfile: 'quality' }, { supportedResponseProfiles: ['quality', 'fast'] },
+      { speechServices: {
+        stt: { configuredEngine: null, runtimeEngine: null, configuredModel: null, configuredVoice: null, configuredLocale: null },
+        tts: { configuredEngine: null, runtimeEngine: null, configuredModel: null, configuredVoice: null, configuredLocale: 'synthetic-locale' },
+      } },
+    ]
+    for (const change of changes) { publish({ ...ready, ...change }); publish(ready) }
+    const capabilities = [...ready.capabilities, { ...ready.capabilities[0]!, id: 'custom_provider' as const }]
+    publish({ ...ready, capabilities })
+    publish({ ...ready, capabilities: [...capabilities].reverse() })
+    const service = { configuredEngine: null, runtimeEngine: null, configuredModel: null, configuredVoice: null, configuredLocale: null }
+    const speechServices = { stt: service, tts: service }
+    publish({ ...ready, speechServices })
+    for (const update of [
+      { runtimeEngine: 'synthetic-runtime' }, { configuredEngine: 'synthetic-engine' },
+      { configuredModel: 'synthetic-model' }, { configuredVoice: 'synthetic-voice' }, { configuredLocale: 'synthetic-locale' },
+    ]) {
+      publish({ ...ready, speechServices: { stt: { ...service, ...update }, tts: service } })
+      publish({ ...ready, speechServices: { stt: service, tts: { ...service, ...update } } })
+    }
+    publish(ready)
+    publish({ ...ready, kind: 'warming_model', message: 'Synthetic warming' })
+    publish({ ...ready, kind: 'warming_model', message: 'Synthetic progress' })
+    publish({ kind: 'error', message: 'Synthetic error' })
+    publish({ kind: 'error', message: 'Synthetic other error' })
+    publish({ kind: 'loading' })
+    const model: ModelOption = { id: 'local-fast', label: 'Synthetic model', available: true, unavailableReason: null }
+    for (const inventory of [[], [model], [{ ...model, label: 'Synthetic renamed' }], [{ ...model, available: false }], [{ ...model, unavailableReason: 'Synthetic blocked' }],
+      [model, { ...model, id: 'local-quality' }], [{ ...model, id: 'local-quality' }, model], [], null] satisfies (ModelOption[] | null)[]) {
+      const prior = names.map((name) => session.getViewSnapshot(name))
+      session.transaction(() => session.fieldState('snapshotModelOptions')[1](inventory))
+      names.forEach((name, index) => expect(session.getViewSnapshot(name)).not.toBe(prior[index]))
+    }
+  })
+
   it.each([false, true])('retains model snapshots and subscriber renders for equivalent fresh accepted controls (android=%s)', async (android) => {
     const session = new SessionAuthority({ android })
     const models: ModelOption[] = [{ id: 'local-fast', label: 'Synthetic model', available: true, unavailableReason: null }]

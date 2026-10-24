@@ -5,7 +5,7 @@ import type { AssistantCapabilities, AssistantOption, AssistantSettings } from '
 import type { AndroidAssistantProjection, ModelOption } from './lib/appSnapshot'
 import type { AndroidVoiceStatus } from './lib/androidVoice'
 import type { AudioInputDevice } from './lib/liveAudioSource'
-import type { ChatMessage, RuntimeStatus, StartupState, UiTextSize, UiTheme, UserNotice } from './types/chat'
+import type { ChatMessage, RuntimeStatus, SpeechServiceMetadata, StartupState, UiTextSize, UiTheme, UserNotice } from './types/chat'
 import { getInitialMessages } from './state/appShell'
 import { applySnapshotModelOptions, capabilityMap, generationIneligibility } from './sessionPolicy'
 import { transitionRuntimeStatus } from './state/runtimeMachine'
@@ -102,13 +102,59 @@ function sameModelProjectionInputs(
   priorModels: readonly ModelOption[] | null, nextModels: readonly ModelOption[] | null,
 ): boolean {
   if (!(Object.keys(next) as (keyof AssistantCapabilities)[]).every((key) => prior[key] === next[key])) return false
-  if (priorModels === nextModels) return true
+  return sameModelInventory(priorModels, nextModels)
+}
+
+function sameModelInventory(priorModels: readonly ModelOption[] | null, nextModels: readonly ModelOption[] | null): boolean {
+  if (Object.is(priorModels, nextModels)) return true
   return priorModels !== null && nextModels !== null && priorModels.length === nextModels.length &&
     priorModels.every((model, index) => {
       const nextModel = nextModels[index]!
       return model.id === nextModel.id && model.label === nextModel.label &&
         model.available === nextModel.available && model.unavailableReason === nextModel.unavailableReason
     })
+}
+
+function sameSpeechService(prior: SpeechServiceMetadata, next: SpeechServiceMetadata): boolean {
+  return Object.is(prior, next) || (prior.configuredEngine === next.configuredEngine &&
+    prior.runtimeEngine === next.runtimeEngine && prior.configuredModel === next.configuredModel &&
+    prior.configuredVoice === next.configuredVoice && prior.configuredLocale === next.configuredLocale)
+}
+
+/** Presentation equality only: accepted controls and runtime accessors retain their input identities. */
+function sameStartupPresentation(prior: StartupState, next: StartupState): boolean {
+  if (Object.is(prior, next)) return true
+  switch (next.kind) {
+    case 'loading': return prior.kind === 'loading'
+    case 'error': return prior.kind === 'error' && prior.message === next.message
+    case 'ready':
+    case 'warming_model': {
+      if (prior.kind !== next.kind || (prior.kind !== 'ready' && prior.kind !== 'warming_model')) return false
+      if (next.kind === 'warming_model' && (prior.kind !== 'warming_model' || prior.message !== next.message)) return false
+      return prior.runtimePhase === next.runtimePhase && prior.voiceInputAvailable === next.voiceInputAvailable &&
+        prior.voiceInputError === next.voiceInputError && prior.initialSilenceTimeoutMs === next.initialSilenceTimeoutMs &&
+        prior.silenceTimeoutMs === next.silenceTimeoutMs && prior.selectedResponseProfile === next.selectedResponseProfile &&
+        prior.promptCancellationAvailable === next.promptCancellationAvailable && prior.ttsEnabled === next.ttsEnabled &&
+        Object.is(prior.ttsOutputGainDb, next.ttsOutputGainDb) &&
+        (Object.is(prior.cueAssetPaths, next.cueAssetPaths) || (
+          prior.cueAssetPaths.startListening === next.cueAssetPaths.startListening &&
+          prior.cueAssetPaths.stopListening === next.cueAssetPaths.stopListening &&
+          prior.cueAssetPaths.stopListeningShort === next.cueAssetPaths.stopListeningShort)) &&
+        (Object.is(prior.supportedResponseProfiles, next.supportedResponseProfiles) || (
+          prior.supportedResponseProfiles.length === next.supportedResponseProfiles.length &&
+          prior.supportedResponseProfiles.every((profile, index) => profile === next.supportedResponseProfiles[index]))) &&
+        (Object.is(prior.capabilities, next.capabilities) || (
+          prior.capabilities.length === next.capabilities.length && prior.capabilities.every((capability, index) => {
+            const other = next.capabilities[index]!
+            return capability.id === other.id && capability.state === other.state &&
+              capability.reason === other.reason && capability.actualProvider === other.actualProvider
+          }))) &&
+        (Object.is(prior.speechServices, next.speechServices) || (
+          prior.speechServices !== undefined && next.speechServices !== undefined &&
+          sameSpeechService(prior.speechServices.stt, next.speechServices.stt) &&
+          sameSpeechService(prior.speechServices.tts, next.speechServices.tts)))
+    }
+  }
 }
 
 const VIEW_KEYS = {
@@ -362,7 +408,16 @@ export class SessionAuthority {
       ? ([...VIEW_KEYS.runtime, 'composerValue'] as const)
       : VIEW_KEYS[name]
     const values = keys.map((key) => this.controls[key])
-    const unchanged = prior !== undefined && values.every((value, index) => Object.is(value, prior.values[index]))
+    const unchanged = prior !== undefined && keys.every((key, index) => {
+      if (Object.is(values[index], prior.values[index])) return true
+      if (key === 'startupState') return sameStartupPresentation(
+        prior.source.startupState, this.controls.startupState,
+      )
+      if (key === 'snapshotModelOptions') return sameModelInventory(
+        prior.source.snapshotModelOptions, this.controls.snapshotModelOptions,
+      )
+      return false
+    })
     const snapshot = unchanged ? prior.snapshot : Object.fromEntries(keys.map((key, index) => [key, values[index]]))
     this.views.set(name, { source: this.controls, values, snapshot })
     return snapshot as ViewSnapshot<N>
