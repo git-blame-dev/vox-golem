@@ -492,16 +492,12 @@ impl DesktopConversationRuntime {
             .lock()
             .map_err(|_| String::from("durable conversation store lock is poisoned"))?;
         let store = durable.ensure_store()?;
-        let selection = store.selection().map_err(|error| error.to_string())?;
         store
             .select(voxgolem_conversation_store::Selection {
                 conversation: None,
                 selected_head: None,
             })
             .map_err(|error| error.to_string())?;
-        if let Some(conversation) = selection.conversation {
-            let _ = store.delete_conversation(conversation);
-        }
         durable.hydrated = true;
         Ok(())
     }

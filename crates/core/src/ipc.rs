@@ -190,6 +190,138 @@ pub struct ActiveRequestSummary {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum UnsavedReason {
+    StorageError,
+    ContextUnavailable,
+}
+
+/// A validated process-owned result, never a canonical transcript turn. Its identity
+/// is the already prepared durable request; it has no invented operation/message IDs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "UnsavedResultWire")]
+pub struct UnsavedResult {
+    request_id: String,
+    execution_id: ExecutionId,
+    prompt: String,
+    answer: MessageContentKind,
+    sources: Vec<crate::sources::SourceLink>,
+    final_stage: Stage,
+    reason: UnsavedReason,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnsavedResultWire {
+    request_id: String,
+    execution_id: ExecutionId,
+    prompt: String,
+    answer: MessageContentKind,
+    sources: Vec<crate::sources::SourceLink>,
+    final_stage: Stage,
+    reason: UnsavedReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsavedResultValidationError {
+    InvalidRequestId,
+    ExpectedDurableIdentity,
+    InvalidContent,
+}
+
+impl fmt::Display for UnsavedResultValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::InvalidRequestId => "invalid unsaved request correlation",
+            Self::ExpectedDurableIdentity => "unsaved result requires prepared durable identity",
+            Self::InvalidContent => "invalid unsaved completed content",
+        })
+    }
+}
+
+impl UnsavedResult {
+    pub fn new(
+        request_id: String,
+        execution_id: ExecutionId,
+        prompt: String,
+        answer: crate::durable_conversation::Answer,
+        sources: Vec<crate::sources::SourceLink>,
+        final_stage: Stage,
+        reason: UnsavedReason,
+    ) -> Result<Self, UnsavedResultValidationError> {
+        if request_id.trim().is_empty() || request_id.len() > conversation::MAX_REQUEST_ID_BYTES {
+            return Err(UnsavedResultValidationError::InvalidRequestId);
+        }
+        // WireId already guarantees canonical syntax; only graph IDs contain ':'.
+        if !execution_id.session_id.as_str().contains(':')
+            || !execution_id.generation.as_str().contains(':')
+        {
+            return Err(UnsavedResultValidationError::ExpectedDurableIdentity);
+        }
+        crate::durable_conversation::validate_completed_content(&prompt, &answer, &sources)
+            .map_err(|_| UnsavedResultValidationError::InvalidContent)?;
+        let answer = match answer {
+            crate::durable_conversation::Answer::Text { text } => MessageContentKind::Text(text),
+            crate::durable_conversation::Answer::Refusal { reason } => {
+                MessageContentKind::Refusal(reason)
+            }
+        };
+        Ok(Self {
+            request_id,
+            execution_id,
+            prompt,
+            answer,
+            sources,
+            final_stage,
+            reason,
+        })
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+    pub fn execution_id(&self) -> &ExecutionId {
+        &self.execution_id
+    }
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+    pub fn answer(&self) -> &MessageContentKind {
+        &self.answer
+    }
+    pub fn sources(&self) -> &[crate::sources::SourceLink] {
+        &self.sources
+    }
+    pub fn final_stage(&self) -> Stage {
+        self.final_stage
+    }
+    pub fn reason(&self) -> UnsavedReason {
+        self.reason
+    }
+}
+
+impl TryFrom<UnsavedResultWire> for UnsavedResult {
+    type Error = UnsavedResultValidationError;
+    fn try_from(wire: UnsavedResultWire) -> Result<Self, Self::Error> {
+        let answer = match wire.answer {
+            MessageContentKind::Text(text) => crate::durable_conversation::Answer::Text { text },
+            MessageContentKind::Refusal(reason) => {
+                crate::durable_conversation::Answer::Refusal { reason }
+            }
+        };
+        Self::new(
+            wire.request_id,
+            wire.execution_id,
+            wire.prompt,
+            answer,
+            wire.sources,
+            wire.final_stage,
+            wire.reason,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CapabilityState {
     Available,
     Warming,
@@ -1020,6 +1152,115 @@ impl TryFrom<conversation::AppliedOutcome> for PromptOutcome {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unsaved_projection_is_bounded_strict_and_has_no_fabricated_turn_ids() {
+        use super::*;
+        use crate::durable_conversation::{Answer, OperationId};
+        let replica = "00000000-0000-4000-8000-000000000001";
+        let execution_id = ExecutionId {
+            session_id: WireId::from_operation_id(&OperationId {
+                replica: replica.into(),
+                sequence: "1".into(),
+            })
+            .unwrap(),
+            generation: WireId::from_operation_id(&OperationId {
+                replica: replica.into(),
+                sequence: "2".into(),
+            })
+            .unwrap(),
+        };
+        let result = UnsavedResult::new(
+            "synthetic-renderer-request".into(),
+            execution_id,
+            "Synthetic prompt".into(),
+            Answer::Text {
+                text: "Synthetic unsaved answer".into(),
+            },
+            vec![],
+            Stage::Review,
+            UnsavedReason::StorageError,
+        )
+        .unwrap();
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 7);
+        assert_eq!(
+            value["answer"],
+            serde_json::json!({"kind":"text", "text":"Synthetic unsaved answer"})
+        );
+        assert_eq!(value["reason"], "storage_error");
+        assert_eq!(
+            serde_json::from_value::<UnsavedResult>(value.clone()).unwrap(),
+            result
+        );
+        assert_eq!(result.request_id(), "synthetic-renderer-request");
+        assert_eq!(
+            result.execution_id().generation.as_str(),
+            format!("{replica}:2")
+        );
+        assert_eq!(result.prompt(), "Synthetic prompt");
+        assert_eq!(
+            result.answer(),
+            &MessageContentKind::Text("Synthetic unsaved answer".into())
+        );
+        assert!(result.sources().is_empty());
+        assert_eq!(result.final_stage(), Stage::Review);
+        assert_eq!(result.reason(), UnsavedReason::StorageError);
+        for key in [
+            "request_id",
+            "execution_id",
+            "prompt",
+            "answer",
+            "sources",
+            "final_stage",
+            "reason",
+        ] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(
+                serde_json::from_value::<UnsavedResult>(missing).is_err(),
+                "missing {key}"
+            );
+        }
+        for (key, replacement) in [
+            ("request_id", serde_json::json!("")),
+            (
+                "request_id",
+                serde_json::json!("x".repeat(conversation::MAX_REQUEST_ID_BYTES + 1)),
+            ),
+            (
+                "execution_id",
+                serde_json::json!({"session_id":"1","generation":"2"}),
+            ),
+            ("prompt", serde_json::json!(" ")),
+            (
+                "prompt",
+                serde_json::json!("😀".repeat(conversation::MAX_PROMPT_BYTES / 4 + 1)),
+            ),
+            (
+                "answer",
+                serde_json::json!({"kind":"text","text":"x".repeat(conversation::MAX_COMMITTED_TEXT_BYTES)}),
+            ),
+            (
+                "sources",
+                serde_json::json!([{"url":"not a source URL","title":"Synthetic"}]),
+            ),
+            ("reason", serde_json::json!("raw_storage_error")),
+            ("turn", serde_json::json!({})),
+        ] {
+            let mut invalid = value.clone();
+            invalid[key] = replacement;
+            assert!(
+                serde_json::from_value::<UnsavedResult>(invalid).is_err(),
+                "invalid {key}"
+            );
+        }
+        let mut refusal = value;
+        refusal["answer"] = serde_json::json!({"kind":"refusal","text":"Synthetic refusal"});
+        refusal["reason"] = serde_json::json!("context_unavailable");
+        assert!(serde_json::from_value::<UnsavedResult>(refusal.clone()).is_ok());
+        refusal["sources"] = serde_json::json!([{"url":"https://example.test/synthetic","title":"Synthetic source"}]);
+        assert!(serde_json::from_value::<UnsavedResult>(refusal).is_err());
+    }
     #[test]
     fn durable_turn_projection_keeps_canonical_sources_and_request_local_alias_separate() {
         use crate::durable_conversation::Record;

@@ -18,6 +18,39 @@ fn owner() -> DesktopConversationRuntime {
     )
 }
 
+#[test]
+fn new_chat_retains_saved_conversations_and_their_drafts() {
+    let runtime = owner();
+    let (conversation, before) = {
+        let mut durable = runtime.durable_store.lock().unwrap();
+        let store = durable.ensure_store().unwrap();
+        let conversation = store
+            .create_conversation("Synthetic retained chat".into())
+            .unwrap()
+            .operation
+            .id;
+        store
+            .select(voxgolem_conversation_store::Selection {
+                conversation: Some(conversation.clone()),
+                selected_head: None,
+            })
+            .unwrap();
+        store
+            .save_draft(Some(&conversation), "Synthetic retained draft", true)
+            .unwrap();
+        (conversation, store.snapshot().unwrap())
+    };
+    runtime.reset_durable_store().unwrap();
+    let mut durable = runtime.durable_store.lock().unwrap();
+    let store = durable.ensure_store().unwrap();
+    assert_eq!(store.snapshot().unwrap(), before);
+    assert!(store.selection().unwrap().conversation.is_none());
+    assert_eq!(
+        store.draft(Some(&conversation)).unwrap().text,
+        "Synthetic retained draft"
+    );
+}
+
 fn ready_startup() -> StartupStatePayload {
     StartupStatePayload::Ready {
         cue_asset_paths: CueAssetPathsPayload {

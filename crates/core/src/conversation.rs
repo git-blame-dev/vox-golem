@@ -51,6 +51,7 @@ pub enum AdmissionError {
     PromptTooLong,
     Busy,
     InvalidContext,
+    UnresolvedSave,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateResult {
@@ -88,6 +89,15 @@ pub enum SettlementResult {
 pub enum SettlementError {
     NotResolved,
     TranscriptTooLarge,
+    RetainedHistory,
+}
+
+/// Admission-blocking metadata only. The native owner retains one validated payload;
+/// this execution reducer never stores an unsaved answer as conversation history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedSave {
+    pub execution_id: ExecutionId,
+    pub request_id: RequestId,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResetResult {
@@ -120,11 +130,20 @@ pub struct ConversationSnapshot {
 #[derive(Debug, Clone)]
 struct Active {
     sources: Vec<SourceLink>,
-    snapshot: AdmissionSnapshot,
+    snapshot: ActiveAdmission,
     instant: Option<InstantOutcome>,
     deep: Option<DeepOutcome>,
     review: Option<crate::assistant::ReviewOutcome>,
     resolved: Option<(Content, Stage)>,
+}
+
+/// Provider context belongs to the caller's pinned request, not the execution reducer.
+#[derive(Debug, Clone)]
+struct ActiveAdmission {
+    execution_id: ExecutionId,
+    request_id: RequestId,
+    prompt: String,
+    policy: AssistantPolicy,
 }
 #[derive(Debug, Clone)]
 pub struct ConversationSession {
@@ -137,6 +156,7 @@ pub struct ConversationSession {
     next_generation: u64,
     next_message: u64,
     retain_committed_history: bool,
+    unresolved_save: Option<UnresolvedSave>,
 }
 
 impl ConversationSession {
@@ -151,6 +171,7 @@ impl ConversationSession {
             next_generation: 1,
             next_message: 1,
             retain_committed_history: true,
+            unresolved_save: None,
         }
     }
 
@@ -174,6 +195,9 @@ impl ConversationSession {
     }
     pub fn has_active_execution(&self) -> bool {
         self.active.is_some()
+    }
+    pub fn unresolved_save(&self) -> Option<&UnresolvedSave> {
+        self.unresolved_save.as_ref()
     }
     pub fn provider_history(&self) -> Vec<crate::assistant::ConversationTurn> {
         self.turns
@@ -310,6 +334,9 @@ impl ConversationSession {
         prompt: &str,
         history: Option<Vec<crate::assistant::ConversationTurn>>,
     ) -> Result<AdmissionSnapshot, AdmissionError> {
+        if self.unresolved_save.is_some() {
+            return Err(AdmissionError::UnresolvedSave);
+        }
         if request_id.is_empty() {
             return Err(AdmissionError::EmptyRequestId);
         }
@@ -343,7 +370,12 @@ impl ConversationSession {
             instant: None,
             deep: None,
             review: None,
-            snapshot: snapshot.clone(),
+            snapshot: ActiveAdmission {
+                execution_id: snapshot.execution_id,
+                request_id: snapshot.request_id.clone(),
+                prompt: snapshot.prompt.clone(),
+                policy: snapshot.policy.clone(),
+            },
             resolved: None,
         });
         Ok(snapshot)
@@ -484,6 +516,37 @@ impl ConversationSession {
             AppliedOutcome::Completed(turn)
         })
     }
+
+    /// Finish an execution whose validated answer could not become durable history.
+    /// Invoke under the same final authority as the failed/suppressed store completion.
+    /// The returned payload stays with the native caller, never in retained history.
+    pub fn settle_unsaved(&mut self, execution_id: ExecutionId) -> SettlementResult {
+        if self.retain_committed_history {
+            return SettlementResult::Rejected(SettlementError::RetainedHistory);
+        }
+        let result = self.settle(execution_id, SettlementIntent::Success);
+        if let SettlementResult::Applied(
+            AppliedOutcome::Completed(turn) | AppliedOutcome::Refused(turn),
+        ) = &result
+        {
+            self.unresolved_save = Some(UnresolvedSave {
+                execution_id: turn.execution_id,
+                request_id: turn.request_id.clone(),
+            });
+        }
+        result
+    }
+
+    /// Resolve only after the durable owner has selected a fresh conversation.
+    /// A failed selection changes neither execution state nor the unsaved block.
+    pub fn reset_after_selection<E>(&mut self, selection: Result<(), E>) -> Result<ResetResult, E> {
+        selection?;
+        self.unresolved_save = None;
+        Ok(self.reset())
+    }
+
+    /// Invalidate execution state. This alone does not discard an unsaved result;
+    /// that requires successful durable selection via `reset_after_selection`.
     pub fn reset(&mut self) -> ResetResult {
         let old = self.session_id;
         let invalidated = self.active.take().map(|a| a.snapshot.execution_id);
@@ -562,6 +625,86 @@ fn content_bytes(content: &Content) -> usize {
 mod tests {
     use super::*;
     #[test]
+    fn unsaved_settlement_blocks_admission_until_successful_fresh_selection() {
+        let mut session = ConversationSession::execution_only(policy());
+        let admitted = session
+            .admit("synthetic-unsaved", "Synthetic prompt")
+            .unwrap();
+        complete(
+            &mut session,
+            admitted.execution_id,
+            Content::Text("Synthetic unsaved answer".into()),
+        );
+        assert!(matches!(
+            session.settle_unsaved(admitted.execution_id),
+            SettlementResult::Applied(AppliedOutcome::Completed(_))
+        ));
+        assert_eq!(
+            session.unresolved_save().unwrap().execution_id,
+            admitted.execution_id
+        );
+        assert_eq!(
+            session.unresolved_save().unwrap().request_id,
+            admitted.request_id
+        );
+        assert!(session.turns().is_empty());
+        let counters = (session.next_generation, session.next_message);
+        assert_eq!(
+            session.admit("synthetic-next", "Synthetic follow-up"),
+            Err(AdmissionError::UnresolvedSave)
+        );
+        assert_eq!(
+            session.admit_with_context("synthetic-next", "Synthetic follow-up", vec![]),
+            Err(AdmissionError::UnresolvedSave)
+        );
+        assert_eq!((session.next_generation, session.next_message), counters);
+        let before = session.snapshot();
+        assert_eq!(
+            session.reset_after_selection(Err("synthetic selection failure")),
+            Err("synthetic selection failure")
+        );
+        assert_eq!(session.snapshot(), before);
+        assert!(session.unresolved_save().is_some());
+        session.reset();
+        assert_eq!(
+            session.admit("synthetic-next", "Synthetic follow-up"),
+            Err(AdmissionError::UnresolvedSave)
+        );
+        session.reset_after_selection(Ok::<_, ()>(())).unwrap();
+        assert!(session.unresolved_save().is_none());
+        assert!(session
+            .admit_with_context("synthetic-next", "Synthetic follow-up", vec![])
+            .is_ok());
+    }
+
+    #[test]
+    fn unsaved_settlement_is_execution_only_and_rejects_unresolved_or_stale_work() {
+        let mut retained = ConversationSession::new(policy());
+        let retained_admission = retained
+            .admit("synthetic-retained", "Synthetic prompt")
+            .unwrap();
+        assert_eq!(
+            retained.settle_unsaved(retained_admission.execution_id),
+            SettlementResult::Rejected(SettlementError::RetainedHistory)
+        );
+        assert!(retained.has_active_execution());
+        let mut session = ConversationSession::execution_only(policy());
+        let admitted = session
+            .admit("synthetic-unsaved", "Synthetic prompt")
+            .unwrap();
+        assert_eq!(
+            session.settle_unsaved(admitted.execution_id),
+            SettlementResult::Rejected(SettlementError::NotResolved)
+        );
+        assert!(session.unresolved_save().is_none());
+        session.settle(admitted.execution_id, SettlementIntent::Cancelled);
+        assert_eq!(
+            session.settle_unsaved(admitted.execution_id),
+            SettlementResult::IgnoredStale
+        );
+        assert!(session.unresolved_save().is_none());
+    }
+    #[test]
     fn external_context_is_validated_and_pinned() {
         use crate::assistant::ConversationTurn;
         let pair = vec![
@@ -604,9 +747,12 @@ mod tests {
             ),
             Err(AdmissionError::InvalidContext)
         );
+        let pinned = pair.clone();
+        let pinned_allocation = pinned.as_ptr();
         let admitted = session
-            .admit_with_context("synthetic", "prompt", pair.clone())
+            .admit_with_context("synthetic", "prompt", pinned)
             .unwrap();
+        assert_eq!(admitted.history.as_ptr(), pinned_allocation);
         assert_eq!(admitted.history, pair);
         assert_eq!(admitted.execution_id.generation, GenerationId(1));
         complete(
