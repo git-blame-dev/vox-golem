@@ -21,6 +21,7 @@ const MAX_METADATA_BYTES: usize = 4096;
 const MAX_SOURCE_URL_BYTES: usize = 2048;
 const MAX_SOURCE_TITLE_BYTES: usize = 512;
 const MAX_PROMPT_BYTES: usize = voxgolem_core::conversation::MAX_PROMPT_BYTES;
+#[cfg(test)]
 const MAX_REQUEST_ID_BYTES: usize = voxgolem_core::conversation::MAX_REQUEST_ID_BYTES;
 const SNAPSHOT_ENVELOPE_BYTES: usize = 128;
 
@@ -67,12 +68,20 @@ pub(crate) struct SpeechProjection {
     pub(crate) pending: bool,
 }
 
-/// Desktop observer identity uses the same decimal-string representation as the
-/// canonical IPC identity, without extending the shared/mobile IPC contract.
-#[derive(Clone, Debug, Serialize)]
+/// Prepared durable conversation/request identity, not numeric cancellation fences.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct ExecutionId {
     pub(crate) session_id: String,
     pub(crate) generation: String,
+}
+
+impl From<&voxgolem_core::ipc::ExecutionId> for ExecutionId {
+    fn from(id: &voxgolem_core::ipc::ExecutionId) -> Self {
+        Self {
+            session_id: id.session_id.as_str().into(),
+            generation: id.generation.as_str().into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -106,11 +115,13 @@ pub(crate) enum DesktopRuntimeEvent {
     PromptUpdate {
         revision: Revision,
         request_id: String,
+        execution_id: ExecutionId,
         update: PromptExecutionEventPayload,
     },
     PromptFinished {
         revision: Revision,
         request_id: String,
+        execution_id: ExecutionId,
         result: serde_json::Value,
     },
     Speech {
@@ -591,8 +602,7 @@ impl DesktopObservation {
         mut prompt: NativePromptProjection,
     ) -> Result<Option<Revision>, ObservationError> {
         let revision = self.next_revision()?;
-        if prompt.request_id.trim().is_empty()
-            || prompt.request_id.len() > MAX_REQUEST_ID_BYTES
+        if voxgolem_core::conversation::validate_request_id(&prompt.request_id).is_err()
             || prompt.prompt.trim().is_empty()
             || prompt.prompt.len() > MAX_PROMPT_BYTES
             || [
@@ -601,15 +611,18 @@ impl DesktopObservation {
             ]
             .iter()
             .any(|value| {
-                value.is_empty()
-                    || !value.bytes().all(|byte| byte.is_ascii_digit())
-                    || value.parse::<u64>().is_err()
+                !value.contains(':')
+                    || serde_json::from_value::<voxgolem_core::ipc::WireId>(serde_json::json!(
+                        value
+                    ))
+                    .is_err()
             })
         {
             return Err(ObservationError::InvalidProjection);
         }
         if let Some(result) = &prompt.result {
             validate_result(result)?;
+            validate_result_identity(&prompt, result)?;
         }
         if json_size(&prompt)? > MAX_PROJECTION_BYTES {
             return Err(ObservationError::ProjectionFull);
@@ -637,16 +650,17 @@ impl DesktopObservation {
         Ok(self.record(event, bytes))
     }
 
-    pub(crate) fn update_prompt(
+    pub(crate) fn update_prompt_for_execution(
         &mut self,
         request_id: &str,
+        execution_id: &ExecutionId,
         update: &PromptExecutionEventPayload,
     ) -> Result<Option<Revision>, ObservationError> {
-        let Some(prompt) = self
-            .prompt
-            .as_ref()
-            .filter(|prompt| prompt.request_id == request_id && prompt.result.is_none())
-        else {
+        let Some(prompt) = self.prompt.as_ref().filter(|prompt| {
+            prompt.request_id == request_id
+                && prompt.execution_id == *execution_id
+                && prompt.result.is_none()
+        }) else {
             return Ok(None);
         };
         let revision = self.next_revision()?;
@@ -672,6 +686,7 @@ impl DesktopObservation {
         let event = DesktopRuntimeEvent::PromptUpdate {
             revision,
             request_id: request_id.to_owned(),
+            execution_id: execution_id.clone(),
             update: event_update,
         };
         let bytes = json_size(&event)?;
@@ -683,31 +698,58 @@ impl DesktopObservation {
         Ok(self.record(event, bytes))
     }
 
-    pub(crate) fn finish_prompt(
+    pub(crate) fn finish_prompt_for_execution(
         &mut self,
         request_id: &str,
+        execution_id: &ExecutionId,
         result: serde_json::Value,
     ) -> Result<Option<Revision>, ObservationError> {
-        let Some(prompt) = self
-            .prompt
-            .as_ref()
-            .filter(|prompt| prompt.request_id == request_id && prompt.result.is_none())
-        else {
+        let Some(prompt) = self.prompt.as_ref().filter(|prompt| {
+            prompt.request_id == request_id
+                && prompt.execution_id == *execution_id
+                && prompt.result.is_none()
+        }) else {
             return Ok(None);
         };
         let revision = self.next_revision()?;
         let result_size = validate_result(&result)?;
+        validate_result_identity(prompt, &result)?;
         let size = self.prompt_bytes - 4 + result_size;
         self.check_budget(self.voice_bytes, self.speech_bytes, size, false)?;
         let event = DesktopRuntimeEvent::PromptFinished {
             revision,
             request_id: prompt.request_id.clone(),
+            execution_id: execution_id.clone(),
             result: result.clone(),
         };
         let bytes = json_size(&event)?;
         self.prompt.as_mut().expect("validated prompt").result = Some(result);
         self.prompt_bytes = size;
         Ok(self.record(event, bytes))
+    }
+
+    #[cfg(test)]
+    fn update_prompt(
+        &mut self,
+        request_id: &str,
+        update: &PromptExecutionEventPayload,
+    ) -> Result<Option<Revision>, ObservationError> {
+        let Some(id) = self.prompt.as_ref().map(|p| p.execution_id.clone()) else {
+            return Ok(None);
+        };
+        self.update_prompt_for_execution(request_id, &id, update)
+    }
+
+    #[cfg(test)]
+    fn finish_prompt(
+        &mut self,
+        request_id: &str,
+        result: serde_json::Value,
+    ) -> Result<Option<Revision>, ObservationError> {
+        let Some(id) = self.prompt.as_ref().map(|p| p.execution_id.clone()) else {
+            return Ok(None);
+        };
+        self.finish_prompt_for_execution(request_id, &id, result)
     }
 
     /// Reset/retirement has no invented wire event kind. It advances the cursor
@@ -787,6 +829,50 @@ fn validate_result(result: &serde_json::Value) -> Result<usize, ObservationError
         Ok(())
     }
     validate_numbers(result, 0)?;
+    let fields = result
+        .as_object()
+        .ok_or(ObservationError::InvalidProjection)?;
+    let request = fields
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .ok_or(ObservationError::InvalidProjection)?;
+    if voxgolem_core::conversation::validate_request_id(request).is_err()
+        || serde_json::from_value::<voxgolem_core::ipc::RuntimePhase>(
+            fields
+                .get("runtime_phase")
+                .cloned()
+                .ok_or(ObservationError::InvalidProjection)?,
+        )
+        .is_err()
+    {
+        return Err(ObservationError::InvalidProjection);
+    }
+    let valid = match fields.get("kind").and_then(|v| v.as_str()) {
+        Some("completed" | "refused") => {
+            fields.len() == 5
+                && fields.get("turn").is_some_and(|v| v.is_object())
+                && fields.get("save_disposition").and_then(|v| v.as_str()) == Some("saved")
+        }
+        Some("unsaved") => {
+            fields.len() == 5
+                && fields.get("unsaved_result").is_some_and(|v| v.is_object())
+                && fields.get("save_disposition").and_then(|v| v.as_str()) == Some("unsaved")
+        }
+        Some("cancelled") => fields.len() == 3,
+        Some("error") => {
+            fields.len() == 4
+                && fields
+                    .get("error_message")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|message| {
+                        !message.trim().is_empty() && message.len() <= MAX_METADATA_BYTES
+                    })
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(ObservationError::InvalidProjection);
+    }
     let size = json_size(result)?;
     if size > MAX_RESULT_BYTES {
         return Err(ObservationError::ProjectionFull);
@@ -794,17 +880,119 @@ fn validate_result(result: &serde_json::Value) -> Result<usize, ObservationError
     Ok(size)
 }
 
+fn validate_result_identity(
+    prompt: &NativePromptProjection,
+    result: &serde_json::Value,
+) -> Result<(), ObservationError> {
+    if result["request_id"].as_str() != Some(prompt.request_id.as_str()) {
+        return Err(ObservationError::InvalidProjection);
+    }
+    let body = match result["kind"].as_str() {
+        Some("completed" | "refused") => Some(&result["turn"]),
+        Some("unsaved") => Some(&result["unsaved_result"]),
+        _ => None,
+    };
+    if body.is_some_and(|body| {
+        body["request_id"].as_str() != Some(prompt.request_id.as_str())
+            || body["execution_id"]["session_id"].as_str()
+                != Some(prompt.execution_id.session_id.as_str())
+            || body["execution_id"]["generation"].as_str()
+                != Some(prompt.execution_id.generation.as_str())
+    }) {
+        return Err(ObservationError::InvalidProjection);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn prepared_identity() -> voxgolem_core::ipc::ExecutionId {
+        serde_json::from_value(serde_json::json!({"session_id":"00000000-0000-4000-8000-000000000001:17", "generation":"00000000-0000-4000-8000-000000000001:2"})).unwrap()
+    }
+
+    #[test]
+    fn observer_requires_both_alias_and_durable_identity_and_current_error_shape() {
+        let mut owner = DesktopObservation::new();
+        let current = prompt("synthetic-reused-alias");
+        let mut wrong = current.execution_id.clone();
+        wrong.generation = "00000000-0000-4000-8000-000000000001:99".into();
+        owner.start_prompt(current.clone()).unwrap();
+        assert_eq!(
+            owner.update_prompt_for_execution(
+                &current.request_id,
+                &wrong,
+                &text("Synthetic stale delta")
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            owner.finish_prompt_for_execution(
+                &current.request_id,
+                &wrong,
+                canonical_result(
+                    &current.request_id,
+                    "Synthetic question",
+                    "Synthetic stale answer"
+                )
+            ),
+            Ok(None)
+        );
+        assert_eq!(owner.revision, 1);
+        let mut mismatched = canonical_result(
+            &current.request_id,
+            "Synthetic question",
+            "Synthetic answer",
+        );
+        mismatched["turn"]["execution_id"]["generation"] = wrong.generation.into();
+        assert_eq!(
+            owner.finish_prompt_for_execution(
+                &current.request_id,
+                &current.execution_id,
+                mismatched
+            ),
+            Err(ObservationError::InvalidProjection)
+        );
+        assert_eq!(owner.revision, 1);
+        let error = serde_json::json!({"kind":"error","request_id":current.request_id,"runtime_phase":"sleeping","error_message":"Synthetic operation failed"});
+        for extra in ["turn", "save_disposition", "unsaved_result"] {
+            let mut invalid = error.clone();
+            invalid[extra] = serde_json::Value::Null;
+            assert_eq!(
+                validate_result(&invalid),
+                Err(ObservationError::InvalidProjection)
+            );
+        }
+        for message in ["".to_owned(), "x".repeat(MAX_METADATA_BYTES + 1)] {
+            let mut invalid = error.clone();
+            invalid["error_message"] = message.into();
+            assert_eq!(
+                validate_result(&invalid),
+                Err(ObservationError::InvalidProjection)
+            );
+        }
+        assert_eq!(
+            validate_result(
+                &serde_json::json!({"outcome":"error","request_id":"synthetic-reused-alias","runtime_phase":"sleeping","error_message":"Synthetic legacy shape"})
+            ),
+            Err(ObservationError::InvalidProjection)
+        );
+        owner
+            .finish_prompt_for_execution(&current.request_id, &current.execution_id, error)
+            .unwrap();
+        let read = serde_json::to_value(owner.read(Some(1))).unwrap();
+        assert_eq!(
+            read["events"][0]["execution_id"],
+            serde_json::to_value(prepared_identity()).unwrap()
+        );
+        assert_eq!(read["events"][0]["result"]["kind"], "error");
+    }
+
     fn prompt(id: &str) -> NativePromptProjection {
         NativePromptProjection {
             request_id: id.into(),
-            execution_id: ExecutionId {
-                session_id: "17".into(),
-                generation: "2".into(),
-            },
+            execution_id: ExecutionId::from(&prepared_identity()),
             prompt: "Synthetic question".into(),
             updates: Vec::new(),
             result: None,
@@ -831,10 +1019,7 @@ mod tests {
         let turn = ipc::Turn {
             sources: Vec::new(),
             request_id: request_id.into(),
-            execution_id: ipc::ExecutionId {
-                session_id: 17_u64.into(),
-                generation: 2_u64.into(),
-            },
+            execution_id: prepared_identity(),
             user: ipc::Message {
                 id: 1_u64.into(),
                 role: ipc::MessageRole::User,
@@ -847,7 +1032,10 @@ mod tests {
             },
             final_stage: ipc::Stage::Instant,
         };
-        serde_json::to_value(ipc::PromptOutcome::completed(turn).unwrap()).unwrap()
+        let mut value = serde_json::to_value(ipc::PromptOutcome::completed(turn).unwrap()).unwrap();
+        value["request_id"] = request_id.into();
+        value["runtime_phase"] = "sleeping".into();
+        value
     }
 
     fn active_budget_usage(owner: &DesktopObservation) -> usize {
@@ -1034,20 +1222,20 @@ mod tests {
             .unwrap();
         assert_eq!(owner.revision, 1);
         owner
-            .finish_prompt("synthetic-1", serde_json::json!({"outcome":"completed"}))
+            .finish_prompt(
+                "synthetic-1",
+                canonical_result("synthetic-1", "Synthetic question", "Synthetic answer"),
+            )
             .unwrap();
         assert_exact_prompt_cost(&owner);
         owner
             .update_prompt("synthetic-1", &text("ignored after terminal"))
             .unwrap();
         owner
-            .finish_prompt("synthetic-1", serde_json::json!({"outcome":"cancelled"}))
+            .finish_prompt("synthetic-1", serde_json::json!({"kind":"cancelled","request_id":"synthetic-1","runtime_phase":"sleeping"}))
             .unwrap();
         assert_eq!(owner.revision, 2);
-        assert_eq!(
-            owner.prompt.unwrap().result.unwrap()["outcome"],
-            "completed"
-        );
+        assert_eq!(owner.prompt.unwrap().result.unwrap()["kind"], "completed");
     }
 
     #[test]
@@ -1440,7 +1628,7 @@ mod tests {
     }
 
     #[test]
-    fn wire_uses_flat_tagged_events_and_decimal_string_identity() {
+    fn wire_uses_flat_tagged_events_and_prepared_durable_identity() {
         let mut owner = DesktopObservation::new();
         owner.start_prompt(prompt("synthetic-1")).unwrap();
         owner.update_prompt("synthetic-1", &text("delta")).unwrap();
@@ -1449,11 +1637,11 @@ mod tests {
         assert_eq!(read["events"][0]["kind"], "prompt_started");
         assert_eq!(
             read["events"][0]["prompt"]["execution_id"]["session_id"],
-            "17"
+            "00000000-0000-4000-8000-000000000001:17"
         );
         assert_eq!(
             read["events"][1],
-            serde_json::json!({"revision":2,"kind":"prompt_update","request_id":"synthetic-1","update":{"kind":"text","text":"delta"}})
+            serde_json::json!({"revision":2,"kind":"prompt_update","request_id":"synthetic-1","execution_id": prepared_identity(),"update":{"kind":"text","text":"delta"}})
         );
     }
 }

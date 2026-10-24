@@ -621,7 +621,29 @@ impl Store {
         acquire: impl FnOnce() -> (G, CompletionDecision),
         finish: impl FnOnce(&mut G, CompletionAttempt) -> R,
     ) -> R {
-        let staged = Self::stage_completion(&mut self.db, &mut self.core, body);
+        self.complete_body_guarded(body, false, acquire, finish)
+    }
+
+    /// Desktop local completion also advances its still-matching selected parent,
+    /// atomically with the turn. Other adapters retain explicit selection ownership.
+    /// A changed selection is never overwritten or used to reparent the completion.
+    pub fn complete_selected_body_with_authority<G, R>(
+        &mut self,
+        body: OperationBody,
+        acquire: impl FnOnce() -> (G, CompletionDecision),
+        finish: impl FnOnce(&mut G, CompletionAttempt) -> R,
+    ) -> R {
+        self.complete_body_guarded(body, true, acquire, finish)
+    }
+
+    fn complete_body_guarded<G, R>(
+        &mut self,
+        body: OperationBody,
+        advance_selection: bool,
+        acquire: impl FnOnce() -> (G, CompletionDecision),
+        finish: impl FnOnce(&mut G, CompletionAttempt) -> R,
+    ) -> R {
+        let staged = Self::stage_completion(&mut self.db, &mut self.core, body, advance_selection);
         let (mut guard, decision) = acquire();
         let attempt = match decision {
             CompletionDecision::Cancelled => {
@@ -647,6 +669,7 @@ impl Store {
         db: &'a mut Connection,
         core: &mut CoreStore,
         body: OperationBody,
+        advance_selection: bool,
     ) -> Result<StagedCompletion<'a>> {
         if !matches!(body, OperationBody::TurnCompleted { .. }) {
             return Err(invalid("completion_body").into());
@@ -668,119 +691,21 @@ impl Store {
         )?;
         let saved = !outcome.suppressed.contains(&record.operation.id)
             && !outcome.quarantined.contains(&record.operation.id);
+        if advance_selection && saved {
+            if let OperationBody::TurnCompleted {
+                conversation,
+                parent,
+                ..
+            } = &record.operation.body
+            {
+                tx.timed_execute("UPDATE history_local SET selected_head=? WHERE singleton=1 AND conversation=? AND selected_head IS ?", params![json_id(&record.operation.id)?, json_id(conversation)?, parent.as_ref().map(json_id).transpose()?])?;
+            }
+        }
         Ok(StagedCompletion {
             tx,
             next,
             completed: CompletedTurn { record, saved },
         })
-    }
-    pub fn persist_settled_turn(
-        &mut self,
-        max_text_bytes: usize,
-        prompt: String,
-        answer: voxgolem_core::durable_conversation::Answer,
-        sources: Vec<voxgolem_core::sources::SourceLink>,
-        terminal_stage: voxgolem_core::durable_conversation::TerminalStage,
-        provenance: voxgolem_core::durable_conversation::Provenance,
-    ) -> Result<CompletedTurn> {
-        let tx = self
-            .db
-            .timed_transaction_with_behavior(TransactionBehavior::Immediate)?;
-        refresh(&tx, &mut self.core)?;
-
-        let (selected_conversation, selected_head): (Option<String>, Option<String>) = tx
-            .timed_query_row(
-                "SELECT conversation,selected_head FROM history_local WHERE singleton=1",
-                [],
-                |r| Ok((optional_text(r, 0, 256)?, optional_text(r, 1, 256)?)),
-            )?;
-        let selected_conversation: Option<OperationId> = selected_conversation
-            .map(|s| serde_json::from_str(&s).map_err(|_| Error::Storage))
-            .transpose()?;
-        let selected_head: Option<OperationId> = selected_head
-            .map(|s| serde_json::from_str(&s).map_err(|_| Error::Storage))
-            .transpose()?;
-
-        let mut created_core = None;
-        let conversation = match selected_conversation {
-            Some(conversation) => conversation,
-            None => {
-                let id = allocate_id(&tx)?;
-                let create_record = codec::record(Operation {
-                    version: SCHEMA_VERSION,
-                    id: id.clone(),
-                    body: OperationBody::ConversationCreated {
-                        title: "Conversation".into(),
-                    },
-                })?;
-                let (plan, next_store) = timing::measure(timing::Phase::reducer, || {
-                    self.core.plan_with_store(Command::Import {
-                        expected_revision: self.core.revision().into(),
-                        records: vec![create_record],
-                    })
-                })?;
-                apply_plan(&tx, &self.core, &plan)?;
-                created_core = Some(next_store);
-                id
-            }
-        };
-
-        let working_core = created_core.as_mut().unwrap_or(&mut self.core);
-        let context = timing::measure(timing::Phase::projection, || {
-            working_core.select_context(ContextRequest {
-                expected_revision: working_core.revision().into(),
-                conversation: conversation.clone(),
-                selected_head,
-                max_turns: 20,
-                max_text_bytes,
-            })
-        })?;
-
-        let request = allocate_id(&tx)?;
-        let turn_id = allocate_id(&tx)?;
-        let mut prov = provenance;
-        prov.context = context.ancestor_ids;
-
-        let record = codec::record(Operation {
-            version: SCHEMA_VERSION,
-            id: turn_id.clone(),
-            body: OperationBody::TurnCompleted {
-                conversation: conversation.clone(),
-                parent: context.parent,
-                request,
-                prompt,
-                answer,
-                sources,
-                terminal_stage,
-                provenance: prov,
-            },
-        })?;
-
-        let (outcome, next_core) = Self::import_within_tx_with_hook(
-            working_core,
-            &tx,
-            vec![record.clone()],
-            false,
-            Some(&record.operation.id),
-            |_| Ok(()),
-        )?;
-
-        next_core.continuation(voxgolem_core::durable_conversation::ContinuationRequest {
-            expected_revision: next_core.revision().into(),
-            conversation: conversation.clone(),
-            selected_head: Some(turn_id.clone()),
-            local_work_in_flight: true,
-        })?;
-        tx.timed_execute(
-            "UPDATE history_local SET conversation=?,selected_head=? WHERE singleton=1",
-            params![json_id(&conversation)?, json_id(&turn_id)?],
-        )?;
-
-        tx.timed_commit()?;
-        self.core = next_core;
-        let saved = !outcome.suppressed.contains(&record.operation.id)
-            && !outcome.quarantined.contains(&record.operation.id);
-        Ok(CompletedTurn { record, saved })
     }
     /// Commit an immutable completion constructed from its pre-inference ContextSelection.
     /// The caller's cancellation/admission lock must cover this entire call, including COMMIT.

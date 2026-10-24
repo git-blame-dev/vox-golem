@@ -92,9 +92,11 @@ describe('shared plain-text transcript', () => {
         },
       },
     ]
+    const conversation = { unsavedResult: null }
     const session = {
       subscribe: () => () => undefined,
       getMessagesSnapshot: () => messages,
+      getViewSnapshot: () => conversation,
       intents: { onAnswerDomCommitted: () => undefined },
     } as unknown as FrontendSession
     const container = document.createElement('div')

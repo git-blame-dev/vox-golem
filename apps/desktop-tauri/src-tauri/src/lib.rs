@@ -146,7 +146,6 @@ struct AppState {
     wake_clip_writers: Arc<tokio::sync::Semaphore>,
     tts_audio_playback: Arc<voxgolem_audio::playback::AudioPlaybackService>,
     llama_cpp_runtime: Arc<Mutex<Option<voxgolem_platform::llama_cpp::LlamaCppRuntime>>>,
-    llama_cpp_conversation: Mutex<Vec<LlamaConversationTurn>>,
     llama_cpp_system_prompt: Option<String>,
     opencode_server: Arc<Mutex<Option<voxgolem_platform::opencode::OpencodeServer>>>,
     prefetch_generation: Arc<AtomicU64>,
@@ -163,7 +162,6 @@ struct AppState {
 /// borrowed only at the operations that need them.
 struct DesktopDurableStore {
     store: Option<voxgolem_conversation_store::Store>,
-    hydrated: bool,
     open_failed: bool,
     #[cfg(test)]
     test_path: PathBuf,
@@ -175,7 +173,6 @@ impl DesktopDurableStore {
         static NEXT_TEST_STORE_ID: AtomicU64 = AtomicU64::new(1);
         Self {
             store: None,
-            hydrated: false,
             open_failed: false,
             #[cfg(test)]
             test_path: if test_storage::has_explicit_scope() {
@@ -232,11 +229,19 @@ impl DesktopDurableStore {
 /// retain their ordering and publication semantics. Native resource adapters are
 /// borrowed only at the operations that need them.
 struct DesktopConversationRuntime {
-    // prompt_publication_gate -> lifecycle_gate -> active_prompt -> conversation_session.
-    // Never await or perform provider/process I/O while these gates are held.
+    // Reservation is made under lifecycle, before waiting on durable_store.
+    // Metadata is a leaf lock: never acquire lifecycle/store while holding it.
+    // Cancellation only marks the exact lease; retirement belongs to its worker.
+    preparing_prompt: Arc<Mutex<Option<Arc<PreparingPrompt>>>>,
+    // durable_store -> (prompt_publication_gate when needed) -> lifecycle_gate
+    // -> active_prompt -> conversation_session. Never acquire the store from a
+    // downstream gate. Stage SQLite work without gates; retain final synchronous
+    // authority only across COMMIT and winner bookkeeping. Never await or perform
+    // provider/process I/O while these gates are held.
     lifecycle_gate: Arc<Mutex<()>>,
     conversation_session: Arc<Mutex<voxgolem_core::conversation::ConversationSession>>,
     durable_store: Arc<Mutex<DesktopDurableStore>>,
+    unsaved_result: Arc<Mutex<Option<Arc<voxgolem_core::ipc::UnsavedResult>>>>,
     assistant_settings_generation: Arc<AtomicU64>,
     settings_publication_in_progress: Arc<AtomicBool>,
     reset_in_progress: Arc<AtomicBool>,
@@ -246,7 +251,47 @@ struct DesktopConversationRuntime {
     prompt_publication_epoch: Arc<AtomicU64>,
     active_prompt: Arc<Mutex<Option<ActivePrompt>>>,
     active_prompt_generation: AtomicU64,
+    #[cfg(test)]
+    preparation_probe: Mutex<Option<PreparationProbe>>,
     search: search_runtime::DesktopSearchState,
+}
+
+struct PreparingPrompt {
+    request_id: String,
+    cancelled: AtomicBool,
+}
+
+#[cfg(test)]
+type PreparationProbe = Arc<dyn Fn(&str) + Send + Sync>;
+
+struct PreparingPromptLease {
+    owner: Arc<Mutex<Option<Arc<PreparingPrompt>>>>,
+    ticket: Arc<PreparingPrompt>,
+}
+
+impl Drop for PreparingPromptLease {
+    fn drop(&mut self) {
+        self.retire();
+    }
+}
+
+impl PreparingPromptLease {
+    fn retire(&self) {
+        if let Ok(mut current) = self.owner.lock() {
+            if current
+                .as_ref()
+                .is_some_and(|ticket| Arc::ptr_eq(ticket, &self.ticket))
+            {
+                *current = None;
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum PreparationError {
+    Cancelled,
+    Failed(String),
 }
 
 // Native snapshot/settings/audio integration uses the same gates, never mirrors.
@@ -258,6 +303,7 @@ impl std::ops::Deref for AppState {
 }
 
 struct PromptAdmissionResources<'a> {
+    update_installation_gate: &'a Arc<UpdateActivity>,
     exit_cleanup_started: &'a AtomicBool,
     startup_state: &'a Arc<Mutex<StartupStatePayload>>,
     opencode_server: &'a Mutex<Option<voxgolem_platform::opencode::OpencodeServer>>,
@@ -274,6 +320,7 @@ struct PromptAdmissionResources<'a> {
 impl AppState {
     fn prompt_admission_resources(&self) -> PromptAdmissionResources<'_> {
         PromptAdmissionResources {
+            update_installation_gate: &self.update_installation_gate,
             exit_cleanup_started: &self.exit_cleanup_started,
             startup_state: &self.startup_state,
             opencode_server: &self.opencode_server,
@@ -292,10 +339,12 @@ impl DesktopConversationRuntime {
     ) -> Self {
         Self {
             lifecycle_gate,
+            preparing_prompt: Arc::new(Mutex::new(None)),
             conversation_session: Arc::new(Mutex::new(
-                voxgolem_core::conversation::ConversationSession::new(policy),
+                voxgolem_core::conversation::ConversationSession::execution_only(policy),
             )),
             durable_store: Arc::new(Mutex::new(DesktopDurableStore::new())),
+            unsaved_result: Arc::new(Mutex::new(None)),
             assistant_settings_generation: Arc::new(AtomicU64::new(0)),
             settings_publication_in_progress: Arc::new(AtomicBool::new(false)),
             reset_in_progress: Arc::new(AtomicBool::new(false)),
@@ -305,201 +354,10 @@ impl DesktopConversationRuntime {
             prompt_publication_epoch: Arc::new(AtomicU64::new(0)),
             active_prompt: Arc::new(Mutex::new(None)),
             active_prompt_generation: AtomicU64::new(0),
+            #[cfg(test)]
+            preparation_probe: Mutex::new(None),
             search: search_runtime::DesktopSearchState::default(),
         }
-    }
-
-    fn ensure_hydrated(&self) -> Result<(), String> {
-        let mut durable = self
-            .durable_store
-            .lock()
-            .map_err(|_| String::from("durable conversation store lock is poisoned"))?;
-        if durable.hydrated {
-            return Ok(());
-        }
-        let store = match durable.ensure_store() {
-            Ok(store) => store,
-            Err(error) => {
-                durable.hydrated = true;
-                return Err(error);
-            }
-        };
-        let selection = store.selection().map_err(|error| error.to_string())?;
-        let Some(conversation) = selection.conversation else {
-            durable.hydrated = true;
-            return Ok(());
-        };
-        let context = store
-            .context(
-                conversation,
-                selection.selected_head,
-                voxgolem_core::conversation::MAX_COMMITTED_TEXT_BYTES,
-            )
-            .map_err(|error| error.to_string())?;
-        let mut session = self
-            .conversation_session
-            .lock()
-            .map_err(|_| String::from("conversation session lock is poisoned"))?;
-        if session.has_active_execution() || !session.turns().is_empty() {
-            durable.hydrated = true;
-            return Ok(());
-        }
-        let mut restored_session_id = session.session_id();
-        let mut restored_turns = Vec::with_capacity(context.turns.len());
-        let mut next_fallback_gen = 1u64;
-        let mut next_fallback_msg = 1u64;
-        for record in context.turns {
-            if let voxgolem_core::durable_conversation::OperationBody::TurnCompleted {
-                prompt,
-                answer,
-                sources,
-                terminal_stage,
-                provenance,
-                ..
-            } = record.operation.body
-            {
-                let mut parts = provenance
-                    .instruction_profile_id
-                    .split(':')
-                    .filter_map(|part| part.parse::<u64>().ok());
-                let turn_session_id = parts
-                    .next()
-                    .map(voxgolem_core::conversation::SessionId)
-                    .unwrap_or(restored_session_id);
-                restored_session_id = turn_session_id;
-                let generation_id = parts.next().unwrap_or(next_fallback_gen);
-                let user_msg_id = parts.next().unwrap_or(next_fallback_msg);
-                let answer_msg_id = parts.next().unwrap_or(user_msg_id.saturating_add(1));
-                next_fallback_gen = generation_id.saturating_add(1);
-                next_fallback_msg = answer_msg_id.saturating_add(1);
-                let answer_content = match answer {
-                    voxgolem_core::durable_conversation::Answer::Text { text } => {
-                        voxgolem_core::assistant::Content::Text(text)
-                    }
-                    voxgolem_core::durable_conversation::Answer::Refusal { reason } => {
-                        voxgolem_core::assistant::Content::Refusal(reason)
-                    }
-                };
-                let final_stage = match terminal_stage {
-                    voxgolem_core::durable_conversation::TerminalStage::Instant => {
-                        voxgolem_core::assistant::Stage::Instant
-                    }
-                    voxgolem_core::durable_conversation::TerminalStage::Deep => {
-                        voxgolem_core::assistant::Stage::Deep
-                    }
-                    voxgolem_core::durable_conversation::TerminalStage::Review => {
-                        voxgolem_core::assistant::Stage::Review
-                    }
-                };
-                restored_turns.push(voxgolem_core::conversation::Turn {
-                    request_id: voxgolem_core::conversation::RequestId(provenance.policy_id),
-                    execution_id: voxgolem_core::conversation::ExecutionId {
-                        session_id: turn_session_id,
-                        generation: voxgolem_core::conversation::GenerationId(generation_id),
-                    },
-                    user: voxgolem_core::conversation::Message {
-                        id: voxgolem_core::conversation::MessageId(user_msg_id),
-                        role: voxgolem_core::assistant::Role::User,
-                        content: voxgolem_core::assistant::Content::Text(prompt),
-                    },
-                    answer: voxgolem_core::conversation::Message {
-                        id: voxgolem_core::conversation::MessageId(answer_msg_id),
-                        role: voxgolem_core::assistant::Role::Assistant,
-                        content: answer_content,
-                    },
-                    sources,
-                    final_stage,
-                });
-            }
-        }
-        let _ = session.hydrate_turns(restored_session_id, restored_turns);
-        durable.hydrated = true;
-        Ok(())
-    }
-
-    fn persist_settled_turn(&self, turn: &voxgolem_core::conversation::Turn) -> Result<(), String> {
-        let requested_model = self
-            .conversation_session
-            .lock()
-            .map(|session| format!("{:?}", session.policy().instant_model))
-            .unwrap_or_else(|_| String::from("desktop"));
-        let mut durable = self
-            .durable_store
-            .lock()
-            .map_err(|_| String::from("durable conversation store lock is poisoned"))?;
-        let store = durable.ensure_store()?;
-        let prompt = match &turn.user.content {
-            voxgolem_core::assistant::Content::Text(text)
-            | voxgolem_core::assistant::Content::Refusal(text) => text.clone(),
-        };
-        let answer = match &turn.answer.content {
-            voxgolem_core::assistant::Content::Text(text) => {
-                voxgolem_core::durable_conversation::Answer::Text { text: text.clone() }
-            }
-            voxgolem_core::assistant::Content::Refusal(reason) => {
-                voxgolem_core::durable_conversation::Answer::Refusal {
-                    reason: reason.clone(),
-                }
-            }
-        };
-        let terminal_stage = match turn.final_stage {
-            voxgolem_core::assistant::Stage::Instant => {
-                voxgolem_core::durable_conversation::TerminalStage::Instant
-            }
-            voxgolem_core::assistant::Stage::Deep => {
-                voxgolem_core::durable_conversation::TerminalStage::Deep
-            }
-            voxgolem_core::assistant::Stage::Review => {
-                voxgolem_core::durable_conversation::TerminalStage::Review
-            }
-        };
-        let policy_id = if turn.request_id.0.trim().is_empty() {
-            String::from("desktop-request")
-        } else {
-            turn.request_id.0.clone()
-        };
-        store
-            .persist_settled_turn(
-                voxgolem_core::conversation::MAX_COMMITTED_TEXT_BYTES,
-                prompt,
-                answer,
-                turn.sources.clone(),
-                terminal_stage,
-                voxgolem_core::durable_conversation::Provenance {
-                    requested_model,
-                    returned_model: None,
-                    policy_id,
-                    policy_version: String::from("1"),
-                    instruction_profile_id: format!(
-                        "{}:{}:{}:{}",
-                        turn.execution_id.session_id.0,
-                        turn.execution_id.generation.0,
-                        turn.user.id.0,
-                        turn.answer.id.0
-                    ),
-                    instruction_profile_version: String::from("1"),
-                    context: Vec::new(),
-                },
-            )
-            .map_err(|error| error.to_string())?;
-        durable.hydrated = true;
-        Ok(())
-    }
-
-    fn reset_durable_store(&self) -> Result<(), String> {
-        let mut durable = self
-            .durable_store
-            .lock()
-            .map_err(|_| String::from("durable conversation store lock is poisoned"))?;
-        let store = durable.ensure_store()?;
-        store
-            .select(voxgolem_conversation_store::Selection {
-                conversation: None,
-                selected_head: None,
-            })
-            .map_err(|error| error.to_string())?;
-        durable.hydrated = true;
-        Ok(())
     }
 
     fn observe_sources(
@@ -582,6 +440,8 @@ struct TtsPlaybackState {
 
 #[derive(Clone)]
 struct ActivePrompt {
+    pinned: Option<Arc<PinnedDesktopRequest>>,
+    terminal_payload: Arc<Mutex<Option<voxgolem_core::ipc::PromptOutcome>>>,
     request_id: String,
     generation: u64,
     assistant_generation: voxgolem_core::conversation::ExecutionId,
@@ -599,18 +459,29 @@ struct ActivePrompt {
     native_owned: Arc<AtomicBool>,
 }
 
+struct PinnedDesktopRequest {
+    context_revision: String,
+    conversation: voxgolem_core::durable_conversation::OperationId,
+    parent: Option<voxgolem_core::durable_conversation::OperationId>,
+    ancestors: Vec<voxgolem_core::durable_conversation::OperationId>,
+    request: voxgolem_core::durable_conversation::OperationId,
+    wire_execution: voxgolem_core::ipc::ExecutionId,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TerminalKind {
     Completed,
     Refused,
     Failed,
     Cancelled,
+    Unsaved,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CommitAssistantResult {
     Committed,
     Cancelled,
+    Unsaved,
 }
 
 fn record_terminal_kind(
@@ -737,6 +608,14 @@ struct ProfilePersistenceRollback {
 
 struct ResetConversationExecution {
     cleanup: Option<PromptPhysicalCleanup>,
+}
+
+impl Drop for ResetConversationExecution {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup.cancel_detached();
+        }
+    }
 }
 
 struct PromptAbortClaim {
@@ -988,9 +867,93 @@ impl Drop for ProfilePersistenceRollback {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PrefetchKey {
+    context: PrefetchContext,
     prompt: String,
     history: Vec<voxgolem_core::assistant::ConversationTurn>,
     model: voxgolem_core::assistant::InstantModel,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PrefetchContext {
+    revision: String,
+    conversation: Option<voxgolem_core::durable_conversation::OperationId>,
+    parent: Option<voxgolem_core::durable_conversation::OperationId>,
+}
+
+impl Default for PrefetchContext {
+    fn default() -> Self {
+        Self {
+            revision: "0".into(),
+            conversation: None,
+            parent: None,
+        }
+    }
+}
+
+fn provider_turns(
+    messages: Vec<voxgolem_conversation_store::ProviderMessage>,
+) -> Vec<voxgolem_core::assistant::ConversationTurn> {
+    messages
+        .into_iter()
+        .map(|message| voxgolem_core::assistant::ConversationTurn {
+            role: if message.role == "user" {
+                voxgolem_core::assistant::Role::User
+            } else {
+                voxgolem_core::assistant::Role::Assistant
+            },
+            content: if message.content_type == Some("refusal") {
+                voxgolem_core::assistant::Content::Refusal(message.content)
+            } else {
+                voxgolem_core::assistant::Content::Text(message.content)
+            },
+        })
+        .collect()
+}
+
+fn read_prefetch_context(
+    store: &mut voxgolem_conversation_store::Store,
+    prompt: &str,
+) -> Result<
+    (
+        PrefetchContext,
+        Vec<voxgolem_core::assistant::ConversationTurn>,
+    ),
+    String,
+> {
+    let selected = store
+        .selection()
+        .map_err(|_| String::from("conversation selection unavailable"))?;
+    if let Some(conversation) = selected.conversation {
+        let context = store
+            .context(
+                conversation,
+                selected.selected_head,
+                voxgolem_core::conversation::MAX_COMMITTED_TEXT_BYTES.saturating_sub(prompt.len()),
+            )
+            .map_err(|_| String::from("conversation context unavailable"))?;
+        let identity = PrefetchContext {
+            revision: context.revision.clone(),
+            conversation: Some(context.conversation.clone()),
+            parent: context.parent.clone(),
+        };
+        Ok((
+            identity,
+            provider_turns(
+                voxgolem_conversation_store::provider_context(context).provider_messages,
+            ),
+        ))
+    } else {
+        Ok((
+            PrefetchContext {
+                revision: store
+                    .revision()
+                    .map_err(|_| String::from("conversation revision unavailable"))?,
+                conversation: None,
+                parent: None,
+            },
+            Vec::new(),
+        ))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1629,6 +1592,7 @@ fn build_ipc_app_snapshot(
         runtime_phase: runtime_phase.into(),
         transcript: conversation.turns.iter().map(Into::into).collect(),
         active_request: conversation.active.as_ref().map(Into::into),
+        unsaved_result: None,
         model_options: ipc_model_options(&capabilities),
         capabilities,
         preferences: ipc::ValidatedPreferences {
@@ -1939,9 +1903,16 @@ async fn lock_live_settings_operation(
 
 #[tauri::command]
 async fn get_app_snapshot(
-    app_state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<voxgolem_core::ipc::AppSnapshot, voxgolem_core::ipc::CommandError> {
-    get_app_snapshot_from_state(&app_state)
+    spawn_runtime_blocking(move || {
+        let state = app.state::<AppState>();
+        let _lease = begin_update_sensitive_operation(&state.update_installation_gate)
+            .map_err(|_| ipc_command_error("snapshot unavailable during update"))?;
+        get_app_snapshot_from_state(&state)
+    })
+    .await
+    .map_err(|_| ipc_command_error("snapshot worker failed"))?
 }
 
 #[tauri::command]
@@ -1989,8 +1960,7 @@ fn get_desktop_request_owner_from_state(
     Ok(active
         .as_ref()
         .filter(|active| {
-            active.request_id == request_id
-                && ipc_execution_matches(active.assistant_generation, execution_id)
+            active.request_id == request_id && ipc_execution_matches(active, execution_id)
         })
         .map(|active| {
             if active.native_owned.load(Ordering::Acquire) {
@@ -2001,12 +1971,11 @@ fn get_desktop_request_owner_from_state(
         }))
 }
 
-fn ipc_execution_matches(
-    native: voxgolem_core::conversation::ExecutionId,
-    wire: &voxgolem_core::ipc::ExecutionId,
-) -> bool {
-    wire.session_id.as_str() == native.session_id.0.to_string()
-        && wire.generation.as_str() == native.generation.0.to_string()
+fn ipc_execution_matches(active: &ActivePrompt, wire: &voxgolem_core::ipc::ExecutionId) -> bool {
+    active
+        .pinned
+        .as_ref()
+        .is_some_and(|pinned| pinned.wire_execution == *wire)
 }
 
 #[tauri::command]
@@ -2032,11 +2001,45 @@ fn get_app_snapshot_from_state(
     app_state: &AppState,
 ) -> Result<voxgolem_core::ipc::AppSnapshot, voxgolem_core::ipc::CommandError> {
     chatgpt_auth::refresh(app_state);
+    let mut durable = app_state
+        .durable_store
+        .lock()
+        .map_err(|_| ipc_command_error("conversation storage unavailable"))?;
+    let store = durable
+        .ensure_store()
+        .map_err(|_| ipc_command_error("conversation storage unavailable"))?;
+    let selected = store
+        .selection()
+        .map_err(|_| ipc_command_error("conversation selection unavailable"))?;
+    let session_id = selected
+        .conversation
+        .as_ref()
+        .map(voxgolem_core::ipc::WireId::from_operation_id)
+        .transpose()
+        .map_err(|_| ipc_command_error("conversation identity unavailable"))?
+        .unwrap_or_else(|| 0.into());
+    let transcript = if let Some(conversation) = selected.conversation {
+        store
+            .context(
+                conversation,
+                selected.selected_head,
+                voxgolem_core::conversation::MAX_COMMITTED_TEXT_BYTES,
+            )
+            .map_err(|_| ipc_command_error("conversation projection unavailable"))?
+            .turns
+            .iter()
+            .map(|record| {
+                voxgolem_core::ipc::turn_from_record(record, None)
+                    .map_err(|_| ipc_command_error("conversation turn unavailable"))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
     let _lifecycle = app_state
         .lifecycle_gate
         .lock()
         .map_err(|_| ipc_command_error("lifecycle state is unavailable"))?;
-    let _ = app_state.conversation.ensure_hydrated();
     let runtime_phase = app_state
         .voice_pipeline_state
         .lock()
@@ -2057,11 +2060,15 @@ fn get_app_snapshot_from_state(
         .ui_preferences
         .lock()
         .map_err(|_| ipc_command_error("interface preferences are unavailable"))?;
+    let active = app_state
+        .active_prompt
+        .lock()
+        .map_err(|_| ipc_command_error("active request unavailable"))?;
     let session = app_state
         .conversation_session
         .lock()
         .map_err(|_| ipc_command_error("conversation state is unavailable"))?;
-    Ok(build_ipc_app_snapshot(
+    let mut snapshot = build_ipc_app_snapshot(
         session.snapshot(),
         session.policy(),
         runtime_phase,
@@ -2073,7 +2080,29 @@ fn get_app_snapshot_from_state(
             .lock()
             .map_err(|_| ipc_command_error("network preferences are unavailable"))?
             .clone(),
-    ))
+    );
+    snapshot.session_id = session_id;
+    snapshot.transcript = transcript;
+    snapshot.active_request = active.as_ref().and_then(|active| {
+        active
+            .pinned
+            .as_ref()
+            .map(|pinned| voxgolem_core::ipc::ActiveRequestSummary {
+                execution_id: pinned.wire_execution.clone(),
+                request_id: active.request_id.clone(),
+                prompt: session
+                    .snapshot()
+                    .active
+                    .map(|a| a.prompt)
+                    .unwrap_or_default(),
+            })
+    });
+    snapshot.unsaved_result = app_state
+        .unsaved_result
+        .lock()
+        .map_err(|_| ipc_command_error("unsaved result unavailable"))?
+        .clone();
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -2421,11 +2450,6 @@ async fn execute_llama_preference_change(
         .response_profile_switch_generation
         .fetch_add(1, Ordering::SeqCst)
         .saturating_add(1);
-    app_state
-        .llama_cpp_conversation
-        .lock()
-        .map_err(|_| ipc_command_error("local llama.cpp conversation is unavailable"))?
-        .clear();
     let previous_runtime = app_state
         .llama_cpp_runtime
         .lock()
@@ -4194,11 +4218,6 @@ async fn switch_response_profile(
         .response_profile_switch_generation
         .fetch_add(1, Ordering::SeqCst)
         .saturating_add(1);
-    app_state
-        .llama_cpp_conversation
-        .lock()
-        .map_err(|_| String::from("local llama.cpp conversation lock is poisoned"))?
-        .clear();
     let previous_runtime = app_state
         .llama_cpp_runtime
         .lock()
@@ -4455,8 +4474,37 @@ async fn switch_response_profile(
 struct PromptFinalPayload {
     request_id: String,
     runtime_phase: RuntimePhasePayload,
-    outcome: String,
-    error_message: Option<String>,
+    #[serde(flatten)]
+    outcome: voxgolem_core::ipc::PromptOutcome,
+}
+
+fn preparation_failure_payload(
+    request_id: &str,
+    error: PreparationError,
+    runtime_phase: Result<RuntimePhasePayload, String>,
+) -> Result<PromptFinalPayload, String> {
+    match error {
+        PreparationError::Cancelled => Ok(PromptFinalPayload {
+            request_id: request_id.to_owned(),
+            runtime_phase: runtime_phase?,
+            outcome: voxgolem_core::ipc::PromptOutcome::Cancelled,
+        }),
+        PreparationError::Failed(error) => Err(error),
+    }
+}
+
+fn settled_prompt_payload(
+    request_id: &str,
+    runtime_phase: RuntimePhasePayload,
+    control: &ActivePrompt,
+) -> Result<PromptFinalPayload, String> {
+    let outcome = take_once(&control.terminal_payload)
+        .ok_or_else(|| String::from("terminal result unavailable"))?;
+    Ok(PromptFinalPayload {
+        request_id: request_id.into(),
+        runtime_phase,
+        outcome,
+    })
 }
 
 enum OpencodePromptResult {
@@ -4749,6 +4797,46 @@ fn begin_registered_assistant_request(
 }
 
 impl DesktopConversationRuntime {
+    // Caller owns publication/lifecycle and has selected fresh durable context.
+    // Invoke only once no fallible reset effects remain. Keep the worker-owned
+    // slot occupied; cancellation must not let a successor overtake its lease.
+    fn cancel_preparing_for_reset(&self) -> Result<(), String> {
+        let preparing = self
+            .preparing_prompt
+            .lock()
+            .map_err(|_| String::from("preparation unavailable"))?;
+        if let Some(ticket) = preparing.as_ref() {
+            ticket.cancelled.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    fn reserve_preparation(&self, request_id: &str) -> Result<PreparingPromptLease, String> {
+        voxgolem_core::conversation::validate_request_id(request_id)
+            .map_err(|_| String::from("invalid request correlation"))?;
+        let _lifecycle = self
+            .lifecycle_gate
+            .lock()
+            .map_err(|_| String::from("lifecycle unavailable"))?;
+        let mut current = self
+            .preparing_prompt
+            .lock()
+            .map_err(|_| String::from("preparation unavailable"))?;
+        if current.is_some() {
+            return Err(String::from("conversation preparation is busy"));
+        }
+        let ticket = Arc::new(PreparingPrompt {
+            request_id: request_id.to_owned(),
+            cancelled: AtomicBool::new(false),
+        });
+        *current = Some(Arc::clone(&ticket));
+        Ok(PreparingPromptLease {
+            owner: Arc::clone(&self.preparing_prompt),
+            ticket,
+        })
+    }
+
+    #[cfg(test)]
     fn admit(
         &self,
         resources: PromptAdmissionResources<'_>,
@@ -4756,8 +4844,67 @@ impl DesktopConversationRuntime {
         prompt: &str,
         source: CompletionSource,
     ) -> Result<RegisteredAssistantRequest, String> {
+        let preparation = self.reserve_preparation(request_id)?;
+        self.admit_prepared(resources, prompt, source, preparation)
+            .map_err(|error| match error {
+                PreparationError::Cancelled => String::from("conversation admission was cancelled"),
+                PreparationError::Failed(error) => error,
+            })
+    }
+
+    fn admit_prepared(
+        &self,
+        resources: PromptAdmissionResources<'_>,
+        prompt: &str,
+        source: CompletionSource,
+        preparation: PreparingPromptLease,
+    ) -> Result<RegisteredAssistantRequest, PreparationError> {
+        let result = self.admit_prepared_inner(resources, prompt, source, &preparation);
+        match result {
+            Ok(registered) => Ok(registered),
+            Err(error) => {
+                // No store/publication guard survives the inner call. Serialize
+                // error retirement with Stop so an accepted cancellation wins,
+                // even if opening/selection/atomic preparation itself failed.
+                let _lifecycle = self
+                    .lifecycle_gate
+                    .lock()
+                    .map_err(|_| PreparationError::Failed(String::from("lifecycle unavailable")))?;
+                let cancelled = preparation.ticket.cancelled.load(Ordering::Acquire);
+                preparation.retire();
+                if cancelled {
+                    Err(PreparationError::Cancelled)
+                } else {
+                    Err(PreparationError::Failed(error))
+                }
+            }
+        }
+    }
+
+    fn admit_prepared_inner(
+        &self,
+        resources: PromptAdmissionResources<'_>,
+        prompt: &str,
+        source: CompletionSource,
+        preparation: &PreparingPromptLease,
+    ) -> Result<RegisteredAssistantRequest, String> {
+        let request_id = preparation.ticket.request_id.as_str();
         let app_state = self;
         let started = Instant::now();
+        let _update_lease = begin_update_sensitive_operation(resources.update_installation_gate)?;
+        #[cfg(test)]
+        {
+            let probe = self.preparation_probe.lock().unwrap().clone();
+            if let Some(probe) = probe {
+                probe("before_store");
+            }
+        }
+        // Store admission serializes selection/preparation. Never wait for this
+        // owner while holding publication, lifecycle or execution locks.
+        let mut durable = app_state
+            .durable_store
+            .lock()
+            .map_err(|_| String::from("durable conversation unavailable"))?;
         let _publication_admission = app_state
             .prompt_publication_gate
             .lock()
@@ -4767,6 +4914,12 @@ impl DesktopConversationRuntime {
             .lock()
             .map_err(|_| String::from("lifecycle gate is poisoned"))?;
         ensure_app_running(resources.exit_cleanup_started)?;
+        // A queued worker may resume after New Chat has already completed.
+        // Reject its retired context before opening/selecting/preparing storage,
+        // not only at the final admission check after draft persistence.
+        if preparation.ticket.cancelled.load(Ordering::Acquire) {
+            return Err(String::from("conversation admission was invalidated"));
+        }
         if let Some((runtime, utterance, token)) = resources.native_voice {
             if !runtime.is_current(token.capture_id, token.epoch)
                 || utterance.load(Ordering::Acquire) != token.utterance
@@ -4786,7 +4939,6 @@ impl DesktopConversationRuntime {
             return Err(String::from("assistant settings update is in progress"));
         }
         ensure_startup_ready_for_prompt(resources.startup_state)?;
-        let _ = app_state.ensure_hydrated();
         if current_runtime_phase(resources.voice_pipeline_state)? == RuntimePhasePayload::Error {
             apply_voice_pipeline_transition(
                 resources.voice_pipeline_state,
@@ -4800,10 +4952,17 @@ impl DesktopConversationRuntime {
             .map_err(|_| String::from("opencode server lock is poisoned"))?
             .as_ref()
             .map(voxgolem_platform::opencode::OpencodeServer::client);
-        let mut coordinator = app_state
+        let coordinator = app_state
             .conversation_session
             .lock()
             .map_err(|_| String::from("assistant coordinator lock is poisoned"))?;
+        if coordinator.has_active_execution() || coordinator.unresolved_save().is_some() {
+            return Err(String::from("conversation admission is blocked"));
+        }
+        let settings_ticket = app_state
+            .assistant_settings_generation
+            .load(Ordering::SeqCst);
+        let publication_ticket = app_state.prompt_publication_epoch.load(Ordering::SeqCst);
         let is_opencode = matches!(
             coordinator.policy().instant_model,
             voxgolem_core::assistant::InstantModel::OpenCodeSolLow
@@ -4828,17 +4987,83 @@ impl DesktopConversationRuntime {
                 .map_err(|_| String::from("network preferences lock is poisoned"))?;
             (prefs.web_enabled, prefs.fast_mode)
         };
+        drop(coordinator);
+        drop(_lifecycle);
+        drop(_publication_admission);
+        let store = durable.ensure_store()?;
+        let selected = store
+            .selection()
+            .map_err(|_| String::from("conversation selection unavailable"))?;
+        #[cfg(test)]
+        {
+            let probe = self.preparation_probe.lock().unwrap().clone();
+            if let Some(probe) = probe {
+                probe("before_prepare");
+            }
+        }
+        let prepared = store
+            .prepare_request(
+                selected,
+                prompt,
+                voxgolem_core::conversation::MAX_COMMITTED_TEXT_BYTES,
+                true,
+            )
+            .map_err(|_| String::from("conversation preparation failed"))?;
+        let selection = prepared.context.selection;
+        let pinned = Arc::new(PinnedDesktopRequest {
+            context_revision: selection.revision,
+            wire_execution: voxgolem_core::ipc::ExecutionId {
+                session_id: voxgolem_core::ipc::WireId::from_operation_id(&selection.conversation)
+                    .map_err(|_| String::from("invalid prepared conversation"))?,
+                generation: voxgolem_core::ipc::WireId::from_operation_id(&prepared.request)
+                    .map_err(|_| String::from("invalid prepared request"))?,
+            },
+            conversation: selection.conversation,
+            parent: selection.parent,
+            ancestors: selection.ancestor_ids,
+            request: prepared.request,
+        });
+        drop(selection.turns);
+        let history = provider_turns(prepared.context.provider_messages);
+        let _publication_admission = app_state
+            .prompt_publication_gate
+            .lock()
+            .map_err(|_| String::from("prompt publication unavailable"))?;
+        let _lifecycle = app_state
+            .lifecycle_gate
+            .lock()
+            .map_err(|_| String::from("lifecycle unavailable"))?;
+        ensure_app_running(resources.exit_cleanup_started)?;
+        if preparation.ticket.cancelled.load(Ordering::Acquire)
+            || app_state.reset_in_progress.load(Ordering::Acquire)
+            || app_state
+                .settings_publication_in_progress
+                .load(Ordering::Acquire)
+            || settings_ticket
+                != app_state
+                    .assistant_settings_generation
+                    .load(Ordering::SeqCst)
+            || publication_ticket != app_state.prompt_publication_epoch.load(Ordering::SeqCst)
+        {
+            return Err(String::from("conversation admission was invalidated"));
+        }
+        if let Some((runtime, utterance, token)) = resources.native_voice {
+            if !runtime.is_current(token.capture_id, token.epoch)
+                || utterance.load(Ordering::Acquire) != token.utterance
+                || current_runtime_phase(resources.voice_pipeline_state)?
+                    != RuntimePhasePayload::Processing
+            {
+                return Err(String::from("voice utterance was retired before admission"));
+            }
+        }
+        let mut coordinator = app_state
+            .conversation_session
+            .lock()
+            .map_err(|_| String::from("assistant coordinator unavailable"))?;
         let snapshot = coordinator
-            .admit(request_id, prompt)
+            .admit_with_context(request_id, prompt, history)
             .map_err(|error| format!("assistant request could not start: {error:?}"))?;
-        let history = snapshot
-            .history
-            .into_iter()
-            .map(|message| voxgolem_core::assistant::ConversationTurn {
-                role: message.role,
-                content: message.content,
-            })
-            .collect();
+        let history = snapshot.history;
         let preferences = snapshot.policy;
         let instant_model = preferences.instant_model;
         let execution_id = snapshot.execution_id;
@@ -4873,11 +5098,14 @@ impl DesktopConversationRuntime {
             .active_prompt
             .lock()
             .map_err(|_| String::from("active prompt lock is poisoned"))?
-            .as_ref()
+            .as_mut()
             .filter(|active| {
                 active.request_id == request_id && active.generation == physical_generation
             })
-            .cloned()
+            .map(|active| {
+                active.pinned = Some(pinned);
+                active.clone()
+            })
             .ok_or_else(|| String::from("active prompt registration disappeared"))?;
         control
             .native_owned
@@ -4913,6 +5141,9 @@ impl DesktopConversationRuntime {
             voice_pipeline_config: resources.voice_pipeline_config,
         };
 
+        // Publish Active and retire PREPARING under the same lifecycle guard.
+        // Stop can observe either owner, never a gap between the two.
+        preparation.retire();
         Ok(RegisteredAssistantRequest {
             request: AssistantRequestContext {
                 generation: execution_id,
@@ -5022,6 +5253,31 @@ fn commit_assistant_request_if_active(
     result
 }
 
+async fn commit_assistant_request_worker(
+    app: &tauri::AppHandle,
+    request_id: &str,
+    active_generation: u64,
+    generation: voxgolem_core::conversation::ExecutionId,
+    control: &ActivePrompt,
+) -> Result<CommitAssistantResult, String> {
+    let app = app.clone();
+    let request_id = request_id.to_owned();
+    let control = control.clone();
+    spawn_runtime_blocking(move || {
+        let state = app.state::<AppState>();
+        let _lease = begin_update_sensitive_operation(&state.update_installation_gate)?;
+        commit_assistant_request_if_active(
+            &state,
+            &request_id,
+            active_generation,
+            generation,
+            &control,
+        )
+    })
+    .await
+    .map_err(|_| String::from("completion worker failed"))?
+}
+
 impl DesktopConversationRuntime {
     fn commit(
         &self,
@@ -5031,98 +5287,224 @@ impl DesktopConversationRuntime {
         control: &ActivePrompt,
         on_completed: impl FnOnce(),
     ) -> Result<CommitAssistantResult, String> {
-        let app_state = self;
-        let _lifecycle = app_state
-            .lifecycle_gate
-            .lock()
-            .map_err(|_| String::from("lifecycle gate is poisoned"))?;
-        let removed = {
-            let mut active = app_state
+        use voxgolem_conversation_store::{CompletionAttempt, CompletionDecision};
+        use voxgolem_core::conversation::{AppliedOutcome, SettlementIntent, SettlementResult};
+        use voxgolem_core::durable_conversation::{OperationBody, Provenance, TerminalStage};
+        use voxgolem_core::ipc::{self, PromptOutcome};
+        let (completion, model) = {
+            let _lifecycle = self
+                .lifecycle_gate
+                .lock()
+                .map_err(|_| String::from("lifecycle unavailable"))?;
+            let active = self
                 .active_prompt
                 .lock()
-                .map_err(|_| String::from("active prompt lock is poisoned"))?;
-            let Some(current) = active.as_ref().filter(|active| {
-                active.request_id == request_id && active.generation == active_generation
-            }) else {
-                return if control
+                .map_err(|_| String::from("active request unavailable"))?;
+            if !active.as_ref().is_some_and(|a| {
+                a.request_id == request_id
+                    && a.generation == active_generation
+                    && !a.cancelled.load(Ordering::Acquire)
+            }) {
+                return match *control
                     .terminal_kind
                     .lock()
-                    .ok()
-                    .and_then(|terminal| *terminal)
-                    == Some(TerminalKind::Cancelled)
+                    .map_err(|_| String::from("completion authority unavailable"))?
                 {
-                    Ok(CommitAssistantResult::Cancelled)
-                } else {
-                    Err(String::from("assistant request is no longer active"))
+                    Some(TerminalKind::Completed | TerminalKind::Refused) => {
+                        Ok(CommitAssistantResult::Committed)
+                    }
+                    Some(TerminalKind::Unsaved) => Ok(CommitAssistantResult::Unsaved),
+                    Some(TerminalKind::Cancelled) => Ok(CommitAssistantResult::Cancelled),
+                    _ => Err(String::from("assistant request is no longer active")),
                 };
-            };
-            if current
-                .terminal_kind
-                .lock()
-                .ok()
-                .and_then(|terminal| *terminal)
-                == Some(TerminalKind::Cancelled)
-            {
-                return Ok(CommitAssistantResult::Cancelled);
             }
-            let result = app_state
+            let mut session = self
                 .conversation_session
                 .lock()
-                .map_err(|_| String::from("assistant coordinator lock is poisoned"))?
-                .settle(
-                    generation,
-                    voxgolem_core::conversation::SettlementIntent::Success,
-                );
-            match result {
-                voxgolem_core::conversation::SettlementResult::Applied(
-                    ref outcome @ (voxgolem_core::conversation::AppliedOutcome::Completed(ref turn)
-                    | voxgolem_core::conversation::AppliedOutcome::Refused(ref turn)),
-                ) => {
-                    let _ = app_state.persist_settled_turn(turn);
-                    record_terminal_kind(
-                        &current.terminal_kind,
-                        if matches!(
-                            outcome,
-                            voxgolem_core::conversation::AppliedOutcome::Refused(_)
-                        ) {
-                            TerminalKind::Refused
-                        } else {
-                            TerminalKind::Completed
-                        },
-                    );
-                    current.settled.store(true, Ordering::Release);
-                    on_completed();
-                    active.take()
-                }
-                voxgolem_core::conversation::SettlementResult::Applied(
-                    voxgolem_core::conversation::AppliedOutcome::Cancelled,
-                ) => return Ok(CommitAssistantResult::Cancelled),
-                voxgolem_core::conversation::SettlementResult::Applied(
-                    voxgolem_core::conversation::AppliedOutcome::Failed,
-                ) => return Err(String::from("assistant request failed")),
-                voxgolem_core::conversation::SettlementResult::IgnoredStale
-                    if control
-                        .terminal_kind
-                        .lock()
-                        .ok()
-                        .and_then(|terminal| *terminal)
-                        == Some(TerminalKind::Cancelled) =>
-                {
-                    return Ok(CommitAssistantResult::Cancelled);
-                }
-                voxgolem_core::conversation::SettlementResult::IgnoredStale => {
-                    return Err(String::from("assistant request is stale"));
-                }
-                voxgolem_core::conversation::SettlementResult::Rejected(_) => {
-                    return Err(String::from("assistant request did not resolve"));
-                }
-            }
+                .map_err(|_| String::from("coordinator unavailable"))?;
+            let model = format!("{:?}", session.policy().instant_model);
+            (
+                session
+                    .begin_settlement(generation)
+                    .map_err(|_| String::from("assistant result did not resolve"))?,
+                model,
+            )
         };
-        drop(_lifecycle);
-        if let Some(removed) = removed {
-            removed.completion_signal.notify_one();
+        let pinned = control
+            .pinned
+            .as_ref()
+            .ok_or_else(|| String::from("prepared request unavailable"))?;
+        let body = OperationBody::TurnCompleted {
+            conversation: pinned.conversation.clone(),
+            parent: pinned.parent.clone(),
+            request: pinned.request.clone(),
+            prompt: completion.prompt.clone(),
+            answer: completion.answer.clone(),
+            sources: completion.sources.clone(),
+            terminal_stage: match completion.final_stage {
+                voxgolem_core::assistant::Stage::Instant => TerminalStage::Instant,
+                voxgolem_core::assistant::Stage::Deep => TerminalStage::Deep,
+                voxgolem_core::assistant::Stage::Review => TerminalStage::Review,
+            },
+            provenance: Provenance {
+                requested_model: model,
+                returned_model: None,
+                policy_id: "desktop-assistant".into(),
+                policy_version: "1".into(),
+                instruction_profile_id: "desktop-assistant".into(),
+                instruction_profile_version: "1".into(),
+                context: pinned.ancestors.clone(),
+            },
+        };
+        let mut durable = self
+            .durable_store
+            .lock()
+            .map_err(|_| String::from("durable conversation unavailable"))?;
+        // Successful admission already opened this owner. Never reopen or choose
+        // new context after inference; storage operation failures arbitrate below.
+        let store = durable
+            .store
+            .as_mut()
+            .ok_or_else(|| String::from("prepared store unavailable"))?;
+        let (result, notification) = store.complete_selected_body_with_authority(
+            body,
+            || {
+                let authority = (|| {
+                    let lifecycle = self.lifecycle_gate.lock().map_err(|_| ())?;
+                    let active = self.active_prompt.lock().map_err(|_| ())?;
+                    let session = self.conversation_session.lock().map_err(|_| ())?;
+                    let unsaved = self.unsaved_result.lock().map_err(|_| ())?;
+                    let payload = control.terminal_payload.lock().map_err(|_| ())?;
+                    let terminal = control.terminal_kind.lock().map_err(|_| ())?;
+                    let current = active.as_ref().is_some_and(|a| {
+                        a.request_id == request_id
+                            && a.generation == active_generation
+                            && a.assistant_generation == generation
+                            && !a.cancelled.load(Ordering::Acquire)
+                    });
+                    let decision = if !current || *terminal == Some(TerminalKind::Cancelled) {
+                        CompletionDecision::Cancelled
+                    } else if terminal.is_none()
+                        && payload.is_none()
+                        && unsaved.is_none()
+                        && session.unresolved_save().is_none()
+                        && session.active_execution() == Some(generation)
+                    {
+                        CompletionDecision::Authorized
+                    } else {
+                        CompletionDecision::Unavailable
+                    };
+                    Ok::<_, ()>((
+                        (lifecycle, active, session, unsaved, payload, terminal),
+                        decision,
+                    ))
+                })();
+                match authority {
+                    Ok((guard, decision)) => (Some(guard), decision),
+                    Err(()) => (None, CompletionDecision::Unavailable),
+                }
+            },
+            |authority, attempt| {
+                let Some((_lifecycle, active, session, unsaved, payload, terminal_guard)) =
+                    authority.as_mut()
+                else {
+                    return (Err(String::from("completion authority unavailable")), None);
+                };
+                let (outcome, terminal, disposition) = match attempt {
+                    CompletionAttempt::Cancelled => {
+                        return (Ok(CommitAssistantResult::Cancelled), None)
+                    }
+                    CompletionAttempt::Unavailable => {
+                        return (Err(String::from("completion authority unavailable")), None)
+                    }
+                    CompletionAttempt::Finished(Ok(completed)) if completed.saved => {
+                        let turn = match ipc::turn_from_record(&completed.record, Some(request_id))
+                        {
+                            Ok(turn) => turn,
+                            Err(_) => {
+                                return (Err(String::from("saved turn projection failed")), None)
+                            }
+                        };
+                        let refusal =
+                            matches!(turn.answer.content, ipc::MessageContentKind::Refusal(_));
+                        let outcome = if refusal {
+                            PromptOutcome::refused(turn)
+                        } else {
+                            PromptOutcome::completed(turn)
+                        };
+                        let outcome = match outcome {
+                            Ok(outcome) => outcome,
+                            Err(_) => {
+                                return (Err(String::from("saved turn projection failed")), None)
+                            }
+                        };
+                        (
+                            outcome,
+                            if refusal {
+                                TerminalKind::Refused
+                            } else {
+                                TerminalKind::Completed
+                            },
+                            CommitAssistantResult::Committed,
+                        )
+                    }
+                    CompletionAttempt::Finished(result) => {
+                        let reason = if result.is_err() {
+                            ipc::UnsavedReason::StorageError
+                        } else {
+                            ipc::UnsavedReason::ContextUnavailable
+                        };
+                        let projection = match ipc::UnsavedResult::new(
+                            request_id.into(),
+                            pinned.wire_execution.clone(),
+                            completion.prompt,
+                            completion.answer,
+                            completion.sources,
+                            completion.final_stage.into(),
+                            reason,
+                        ) {
+                            Ok(value) => Arc::new(value),
+                            Err(_) => {
+                                return (
+                                    Err(String::from("unsaved result validation failed")),
+                                    None,
+                                )
+                            }
+                        };
+                        **unsaved = Some(Arc::clone(&projection));
+                        (
+                            PromptOutcome::unsaved(projection),
+                            TerminalKind::Unsaved,
+                            CommitAssistantResult::Unsaved,
+                        )
+                    }
+                };
+                let settled = if disposition == CommitAssistantResult::Unsaved {
+                    session.settle_unsaved(generation)
+                } else {
+                    session.settle(generation, SettlementIntent::Success)
+                };
+                if !matches!(
+                    settled,
+                    SettlementResult::Applied(
+                        AppliedOutcome::Completed(_) | AppliedOutcome::Refused(_)
+                    )
+                ) {
+                    return (Err(String::from("completion settlement failed")), None);
+                }
+                **payload = Some(outcome);
+                **terminal_guard = Some(terminal);
+                control.settled.store(true, Ordering::Release);
+                on_completed();
+                let notification = active.take().map(|a| a.completion_signal);
+                (Ok(disposition), notification)
+            },
+        );
+        drop(durable);
+        if let Some(notification) = notification {
+            notification.notify_one();
         }
-        Ok(CommitAssistantResult::Committed)
+        result
     }
 }
 
@@ -5517,11 +5899,16 @@ impl DesktopStageDispatcher<'_> {
                 Arc::clone(&execution),
             )
             .await;
-        if let Some(execution) = execution.lock().ok().and_then(|execution| *execution) {
+        if let Some((execution, wire_execution)) = execution
+            .lock()
+            .ok()
+            .and_then(|execution| execution.clone())
+        {
             desktop_voice_adapter::finish_reply(
                 &app,
                 &request_id,
                 execution,
+                &wire_execution,
                 voice.is_some(),
                 &result,
             );
@@ -5536,7 +5923,14 @@ impl DesktopStageDispatcher<'_> {
         source: Option<CompletionSource>,
         updates: Option<Channel<PromptExecutionEventPayload>>,
         voice: Option<desktop_voice_adapter::VoiceAdmissionToken>,
-        execution_receipt: Arc<Mutex<Option<voxgolem_core::conversation::ExecutionId>>>,
+        execution_receipt: Arc<
+            Mutex<
+                Option<(
+                    voxgolem_core::conversation::ExecutionId,
+                    voxgolem_core::ipc::ExecutionId,
+                )>,
+            >,
+        >,
     ) -> Result<PromptFinalPayload, String> {
         let app_state = self.app_state;
         let app = self.app;
@@ -5551,24 +5945,41 @@ impl DesktopStageDispatcher<'_> {
         } else {
             None
         };
-        let mut resources = app_state.prompt_admission_resources();
-        if let Some(token) = voice {
-            resources.native_voice = Some((
-                &app_state.native_voice,
-                &app_state.partial_voice_session,
-                token,
-            ));
-        }
         if updates.is_none() && voice.is_none() {
             return Err(String::from("prompt observation authority is unavailable"));
         }
-        let registered = app_state.conversation.admit(
-            resources,
-            &request_id,
-            &prompt,
-            source.unwrap_or(CompletionSource::Typed),
-        )?;
+        // Reserve before handing work to the blocking pool. The closure owns
+        // this lease even if its async waiter is dropped while queued/running.
+        let preparation = app_state.conversation.reserve_preparation(&request_id)?;
+        let worker_app = app.clone();
+        let worker_prompt = prompt.clone();
+        let registered = spawn_runtime_blocking(move || {
+            let state = worker_app.state::<AppState>();
+            let mut resources = state.prompt_admission_resources();
+            if let Some(token) = voice {
+                resources.native_voice =
+                    Some((&state.native_voice, &state.partial_voice_session, token));
+            }
+            state.conversation.admit_prepared(
+                resources,
+                &worker_prompt,
+                source.unwrap_or(CompletionSource::Typed),
+                preparation,
+            )
+        })
+        .await
+        .map_err(|_| String::from("admission worker failed"))?;
         drop(settings_admission);
+        let registered = match registered {
+            Ok(registered) => registered,
+            Err(error) => {
+                return preparation_failure_payload(
+                    &request_id,
+                    error,
+                    current_runtime_phase(&app_state.voice_pipeline_state),
+                )
+            }
+        };
         let RegisteredAssistantRequest {
             request: assistant_request,
             physical_generation: generation,
@@ -5580,8 +5991,15 @@ impl DesktopStageDispatcher<'_> {
         } = registered;
         *execution_receipt
             .lock()
-            .map_err(|_| String::from("execution receipt unavailable"))? =
-            Some(assistant_request.generation);
+            .map_err(|_| String::from("execution receipt unavailable"))? = Some((
+            assistant_request.generation,
+            active_prompt_control
+                .pinned
+                .as_ref()
+                .ok_or_else(|| String::from("prepared identity unavailable"))?
+                .wire_execution
+                .clone(),
+        ));
         #[cfg(feature = "app-benchmark")]
         app_benchmark::mark("prompt_admitted");
         *active_prompt_control
@@ -5703,6 +6121,15 @@ impl DesktopStageDispatcher<'_> {
             let prefetched_answer =
                 if search_runtime::consume_prefetch(&assistant_request.preferences) {
                     let prefetch_key = PrefetchKey {
+                        context: active_prompt_control
+                            .pinned
+                            .as_ref()
+                            .map(|pinned| PrefetchContext {
+                                revision: pinned.context_revision.clone(),
+                                conversation: Some(pinned.conversation.clone()),
+                                parent: pinned.parent.clone(),
+                            })
+                            .ok_or_else(|| String::from("prepared context unavailable"))?,
                         prompt: prompt.clone(),
                         history: assistant_request.history.clone(),
                         model: assistant_request.instant_model,
@@ -5795,13 +6222,15 @@ impl DesktopStageDispatcher<'_> {
                     &active_prompt_control,
                 );
             }
-            if commit_assistant_request_if_active(
-                &app_state,
+            if commit_assistant_request_worker(
+                &app,
                 &request_id,
                 generation,
                 assistant_request.generation,
                 &active_prompt_control,
-            )? == CommitAssistantResult::Cancelled
+            )
+            .await?
+                == CommitAssistantResult::Cancelled
             {
                 return finish_cancelled_prompt(
                     &app,
@@ -5820,12 +6249,7 @@ impl DesktopStageDispatcher<'_> {
                 },
             );
             active_prompt_guard.finish();
-            return Ok(PromptFinalPayload {
-                request_id,
-                runtime_phase,
-                outcome: String::from("completed"),
-                error_message: None,
-            });
+            return settled_prompt_payload(&request_id, runtime_phase, &active_prompt_control);
         }
         if custom_openai_model_for_instant(assistant_request.instant_model).is_some() {
             return submit_custom_prompt(
@@ -5865,7 +6289,6 @@ impl DesktopStageDispatcher<'_> {
                 );
                 return Err(String::from("selected local model is not loaded"));
             }
-            sync_llama_history(&app_state, &assistant_request.history)?;
             if cancelled.load(Ordering::SeqCst) {
                 return finish_cancelled_prompt(
                     &app,
@@ -5882,6 +6305,7 @@ impl DesktopStageDispatcher<'_> {
                 generation,
                 &prompt,
                 &cancelled,
+                &assistant_request.history,
             )
             .await
             {
@@ -6034,13 +6458,15 @@ impl DesktopStageDispatcher<'_> {
                     &active_prompt_control,
                 );
             }
-            if commit_assistant_request_if_active(
-                &app_state,
+            if commit_assistant_request_worker(
+                &app,
                 &request_id,
                 generation,
                 assistant_request.generation,
                 &active_prompt_control,
-            )? == CommitAssistantResult::Cancelled
+            )
+            .await?
+                == CommitAssistantResult::Cancelled
             {
                 return finish_cancelled_prompt(
                     &app,
@@ -6059,12 +6485,7 @@ impl DesktopStageDispatcher<'_> {
                 },
             );
             active_prompt_guard.finish();
-            return Ok(PromptFinalPayload {
-                request_id,
-                runtime_phase: phase,
-                outcome: "completed".into(),
-                error_message: None,
-            });
+            return settled_prompt_payload(&request_id, phase, &active_prompt_control);
         }
         let base_client =
             opencode_client.expect("OpenCode availability was checked before dispatch");
@@ -6250,13 +6671,15 @@ impl DesktopStageDispatcher<'_> {
                         &active_prompt_control,
                     );
                 }
-                if commit_assistant_request_if_active(
-                    &app_state,
+                if commit_assistant_request_worker(
+                    &app,
                     &request_id,
                     generation,
                     assistant_request.generation,
                     &active_prompt_control,
-                )? == CommitAssistantResult::Cancelled
+                )
+                .await?
+                    == CommitAssistantResult::Cancelled
                 {
                     return finish_cancelled_prompt(
                         &app,
@@ -6304,12 +6727,18 @@ impl DesktopStageDispatcher<'_> {
             emit_terminal_prompt_event_controlled(&app, &active_prompt_control, event)?;
         }
         active_prompt_guard.finish();
-        Ok(PromptFinalPayload {
-            request_id,
-            runtime_phase: phase,
-            outcome: outcome.to_string(),
-            error_message,
-        })
+        if let Some(error) = error_message {
+            return Err(error);
+        }
+        if outcome == "cancelled" {
+            Ok(PromptFinalPayload {
+                request_id,
+                runtime_phase: phase,
+                outcome: voxgolem_core::ipc::PromptOutcome::Cancelled,
+            })
+        } else {
+            settled_prompt_payload(&request_id, phase, &active_prompt_control)
+        }
     }
 }
 
@@ -6631,13 +7060,15 @@ async fn submit_custom_prompt(
             String::from("Custom provider authentication changed before search settlement"),
         );
     }
-    if commit_assistant_request_if_active(
-        app_state,
+    if commit_assistant_request_worker(
+        app,
         request_id,
         cancellation.active_generation,
         assistant_request.generation,
         cancellation.control,
-    )? == CommitAssistantResult::Cancelled
+    )
+    .await?
+        == CommitAssistantResult::Cancelled
     {
         return finish_cancelled_prompt(
             app,
@@ -6655,12 +7086,7 @@ async fn submit_custom_prompt(
             runtime_phase: runtime_phase.clone(),
         },
     );
-    Ok(PromptFinalPayload {
-        request_id: request_id.to_string(),
-        runtime_phase,
-        outcome: String::from("completed"),
-        error_message: None,
-    })
+    settled_prompt_payload(request_id, runtime_phase, cancellation.control)
 }
 
 fn fail_started_prompt(
@@ -6743,8 +7169,7 @@ fn finish_cancelled_prompt(
     Ok(PromptFinalPayload {
         request_id: request_id.to_string(),
         runtime_phase,
-        outcome: String::from("cancelled"),
-        error_message: None,
+        outcome: voxgolem_core::ipc::PromptOutcome::Cancelled,
     })
 }
 
@@ -6833,13 +7258,15 @@ async fn settle_instant_failure(
             Err(_) => return Err(failure_message),
         }
     }
-    if commit_assistant_request_if_active(
-        app_state,
+    if commit_assistant_request_worker(
+        app,
         request_id,
         active_generation,
         request.generation,
         cancellation.control,
-    )? == CommitAssistantResult::Cancelled
+    )
+    .await?
+        == CommitAssistantResult::Cancelled
     {
         return Ok(Some(finish_cancelled_prompt(
             app,
@@ -6857,12 +7284,7 @@ async fn settle_instant_failure(
             runtime_phase: runtime_phase.clone(),
         },
     );
-    Ok(Some(PromptFinalPayload {
-        request_id: request_id.to_string(),
-        runtime_phase,
-        outcome: String::from("completed"),
-        error_message: None,
-    }))
+    settled_prompt_payload(request_id, runtime_phase, cancellation.control).map(Some)
 }
 
 fn custom_history(
@@ -6921,32 +7343,6 @@ fn render_provider_prompt(
     rendered
 }
 
-fn sync_llama_history(
-    app_state: &AppState,
-    history: &[voxgolem_core::assistant::ConversationTurn],
-) -> Result<(), String> {
-    let mut pairs = Vec::new();
-    for turns in history.chunks_exact(2) {
-        let [user, assistant] = turns else {
-            unreachable!("chunks_exact always yields two turns")
-        };
-        if user.role != voxgolem_core::assistant::Role::User
-            || assistant.role != voxgolem_core::assistant::Role::Assistant
-        {
-            return Err(String::from("canonical conversation roles are invalid"));
-        }
-        pairs.push(LlamaConversationTurn {
-            user: assistant_content_text(&user.content).to_string(),
-            assistant: assistant_content_text(&assistant.content).to_string(),
-        });
-    }
-    *app_state
-        .llama_cpp_conversation
-        .lock()
-        .map_err(|_| String::from("local llama.cpp conversation lock is poisoned"))? = pairs;
-    Ok(())
-}
-
 fn prompt_execution_text(events: &[PromptExecutionEventPayload]) -> String {
     events
         .iter()
@@ -7001,18 +7397,17 @@ async fn stream_local_prompt(
     generation: u64,
     prompt: &str,
     cancelled: &Arc<AtomicBool>,
+    history: &[voxgolem_core::assistant::ConversationTurn],
 ) -> Result<PromptExecutionOutcome, PromptControlError> {
     let system_prompt = app_state
         .llama_cpp_system_prompt
         .as_deref()
         .ok_or_else(|| String::from("SOUL.md is not loaded"))?
         .to_string();
-    let conversation = app_state
-        .llama_cpp_conversation
-        .lock()
-        .map_err(|_| String::from("local llama.cpp conversation lock is poisoned"))?
-        .clone();
+    let conversation = assistant_history_as_llama(history)?;
+    let has_history = !conversation.is_empty();
     let input = build_llama_prompt_input(&system_prompt, prompt, &conversation);
+    drop(conversation);
     let prompt_for_retry = prompt.to_string();
     let client = app_state
         .llama_cpp_runtime
@@ -7047,7 +7442,7 @@ async fn stream_local_prompt(
             }
         });
         let mut text = String::new();
-        let can_retry_with_reset = !conversation.is_empty() && !input.rolled_over;
+        let can_retry_with_reset = has_history && !input.rolled_over;
         let mut rolled_over = input.rolled_over;
         let first_user_prompt = input.user_prompt.clone();
         let response = match client.chat_streaming(
@@ -8006,7 +8401,17 @@ fn emit_prompt_event_controlled(
                     .native_observation
                     .lock()
                     .map_err(|_| String::from("native observation unavailable"))?
-                    .update_prompt(request_id, event)
+                    .update_prompt_for_execution(
+                        request_id,
+                        &desktop_observation::ExecutionId::from(
+                            &current
+                                .pinned
+                                .as_ref()
+                                .ok_or_else(|| String::from("prepared identity unavailable"))?
+                                .wire_execution,
+                        ),
+                        event,
+                    )
                     .map_err(|error| error.to_string())?;
                 desktop_voice_adapter::notify(app, revision);
             }
@@ -8220,6 +8625,8 @@ fn register_active_prompt(
     let terminal_kind = Arc::new(Mutex::new(None));
     let abort_client = Arc::new(Mutex::new(client));
     *active = Some(ActivePrompt {
+        pinned: None,
+        terminal_payload: Arc::new(Mutex::new(None)),
         request_id: request_id.to_string(),
         generation,
         assistant_generation,
@@ -8264,6 +8671,9 @@ where
     let mut session = session
         .lock()
         .map_err(|_| String::from("conversation session lock is poisoned"))?;
+    if session.unresolved_save().is_some() {
+        return Err(String::from("unsaved response requires explicit discard"));
+    }
     reset_runtime()?;
     reset_in_progress.store(true, Ordering::Release);
     let reset = session.reset();
@@ -8484,17 +8894,9 @@ async fn cancel_prompt(
     app: tauri::AppHandle,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<bool, String> {
-    let expected = expected_execution_id.as_ref().map(|wire| {
-        app_state.active_prompt.lock().ok().and_then(|active| {
-            active
-                .as_ref()
-                .filter(|active| {
-                    active.request_id == request_id
-                        && ipc_execution_matches(active.assistant_generation, wire)
-                })
-                .map(|active| active.assistant_generation)
-        })
-    });
+    let expected = expected_execution_id
+        .as_ref()
+        .map(|wire| app_state.execution_for_cancel(&request_id, wire));
     if matches!(expected, Some(None)) {
         return Ok(false);
     }
@@ -8543,22 +8945,54 @@ fn cancel_prompt_if_active(app_state: &AppState, request_id: &str) -> Result<boo
 }
 
 impl DesktopConversationRuntime {
+    // A durable target never falls back to a correlation-only preparation.
+    // Return the canonical generation so replacement after lookup is harmless.
+    fn execution_for_cancel(
+        &self,
+        request_id: &str,
+        wire: &voxgolem_core::ipc::ExecutionId,
+    ) -> Option<voxgolem_core::conversation::ExecutionId> {
+        self.active_prompt.lock().ok().and_then(|active| {
+            active
+                .as_ref()
+                .filter(|active| {
+                    active.request_id == request_id && ipc_execution_matches(active, wire)
+                })
+                .map(|active| active.assistant_generation)
+        })
+    }
+
     fn cancel_if_active(
         &self,
         request_id: &str,
         repair: impl FnOnce(&ActivePrompt),
     ) -> Result<bool, String> {
         let app_state = self;
-        let Some(active) = app_state
+        let lifecycle = self
+            .lifecycle_gate
+            .lock()
+            .map_err(|_| String::from("lifecycle unavailable"))?;
+        let active = app_state
             .active_prompt
             .lock()
             .map_err(|_| String::from("active prompt lock is poisoned"))?
             .as_ref()
             .filter(|active| active.request_id == request_id)
-            .cloned()
-        else {
+            .cloned();
+        let Some(active) = active else {
+            let preparing = self
+                .preparing_prompt
+                .lock()
+                .map_err(|_| String::from("preparation unavailable"))?;
+            if let Some(ticket) = preparing
+                .as_ref()
+                .filter(|ticket| ticket.request_id == request_id)
+            {
+                return Ok(!ticket.cancelled.swap(true, Ordering::AcqRel));
+            }
             return Ok(false);
         };
+        drop(lifecycle);
         if !matches!(
             self.cancel(active.assistant_generation, repair),
             voxgolem_core::conversation::SettlementResult::Applied(
@@ -8582,24 +9016,122 @@ async fn reset_session(
     app_state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<RuntimePhaseResponsePayload, String> {
-    DesktopStageDispatcher { app_state, app }.reset().await
+    DesktopStageDispatcher { app_state, app }.reset(None).await
+}
+
+#[tauri::command]
+async fn discard_unsaved_and_new_chat(
+    execution_id: voxgolem_core::ipc::ExecutionId,
+    app_state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<RuntimePhaseResponsePayload, String> {
+    DesktopStageDispatcher { app_state, app }
+        .reset(Some(execution_id))
+        .await
 }
 
 impl DesktopConversationRuntime {
+    #[cfg(test)]
     fn begin_reset(
         &self,
         reset_voice: impl FnOnce() -> Result<(), String>,
     ) -> Result<(ResetConversationExecution, ResetAdmissionGuard), String> {
-        let execution = reset_conversation_execution(
-            &self.prompt_publication_gate,
-            &self.prompt_publication_epoch,
-            &self.lifecycle_gate,
-            (&self.reset_in_progress, &self.prompt_cleanup),
-            &self.active_prompt,
-            &self.conversation_session,
-            reset_voice,
-        )?;
-        let _ = self.reset_durable_store();
+        self.begin_reset_for(None, reset_voice)
+    }
+
+    fn begin_reset_for(
+        &self,
+        target: Option<&voxgolem_core::ipc::ExecutionId>,
+        reset_voice: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(ResetConversationExecution, ResetAdmissionGuard), String> {
+        let mut durable = self
+            .durable_store
+            .lock()
+            .map_err(|_| String::from("conversation storage unavailable"))?;
+        let mut reset_voice = Some(reset_voice);
+        {
+            let _publication = self
+                .prompt_publication_gate
+                .lock()
+                .map_err(|_| String::from("publication unavailable"))?;
+            let _lifecycle = self
+                .lifecycle_gate
+                .lock()
+                .map_err(|_| String::from("lifecycle unavailable"))?;
+            let session = self
+                .conversation_session
+                .lock()
+                .map_err(|_| String::from("coordinator unavailable"))?;
+            let unsaved = self
+                .unsaved_result
+                .lock()
+                .map_err(|_| String::from("unsaved response unavailable"))?;
+            match target {
+                Some(target)
+                    if session.unresolved_save().is_some()
+                        && unsaved
+                            .as_ref()
+                            .is_some_and(|value| value.execution_id() == target)
+                        && !session.has_active_execution() => {}
+                None if session.unresolved_save().is_none() && unsaved.is_none() => {}
+                _ => {
+                    return Err(String::from(
+                        "unsaved response requires matching explicit discard",
+                    ))
+                }
+            }
+            if target.is_none() {
+                reset_voice.take().expect("reset effect consumed once")()?;
+            }
+        }
+        durable
+            .ensure_store()?
+            .select(voxgolem_conversation_store::Selection {
+                conversation: None,
+                selected_head: None,
+            })
+            .map_err(|_| String::from("fresh conversation selection failed"))?;
+        let execution = if target.is_some() {
+            let _publication = self
+                .prompt_publication_gate
+                .lock()
+                .map_err(|_| String::from("publication unavailable"))?;
+            let _lifecycle = self
+                .lifecycle_gate
+                .lock()
+                .map_err(|_| String::from("lifecycle unavailable"))?;
+            let mut session = self
+                .conversation_session
+                .lock()
+                .map_err(|_| String::from("coordinator unavailable"))?;
+            let mut unsaved = self
+                .unsaved_result
+                .lock()
+                .map_err(|_| String::from("unsaved response unavailable"))?;
+            if !unsaved
+                .as_ref()
+                .is_some_and(|value| Some(value.execution_id()) == target)
+            {
+                return Err(String::from("unsaved response changed"));
+            }
+            reset_voice.take().expect("reset effect consumed once")()?;
+            self.cancel_preparing_for_reset()?;
+            session.reset_after_selection(Ok::<_, String>(()))?;
+            unsaved.take();
+            self.reset_in_progress.store(true, Ordering::Release);
+            self.prompt_publication_epoch.fetch_add(1, Ordering::SeqCst);
+            ResetConversationExecution { cleanup: None }
+        } else {
+            reset_conversation_execution(
+                &self.prompt_publication_gate,
+                &self.prompt_publication_epoch,
+                &self.lifecycle_gate,
+                (&self.reset_in_progress, &self.prompt_cleanup),
+                &self.active_prompt,
+                &self.conversation_session,
+                || self.cancel_preparing_for_reset(),
+            )?
+        };
         Ok((
             execution,
             ResetAdmissionGuard {
@@ -8616,38 +9148,42 @@ impl DesktopConversationRuntime {
 }
 
 impl DesktopStageDispatcher<'_> {
-    async fn reset(self) -> Result<RuntimePhaseResponsePayload, String> {
+    async fn reset(
+        self,
+        target: Option<voxgolem_core::ipc::ExecutionId>,
+    ) -> Result<RuntimePhaseResponsePayload, String> {
         let app_state = self.app_state;
         let _update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
         let _reset_guard = app_state.reset_operation_lock.lock().await;
         ensure_startup_ready_for_prompt(&app_state.startup_state)?;
-        let mut observation_revision = None;
-        let (reset_execution, _admission_guard) = app_state.conversation.begin_reset(|| {
-            reset_voice_runtime_session(&app_state)?;
-            observation_revision = app_state
-                .native_observation
-                .lock()
-                .map_err(|_| String::from("native observation unavailable"))?
-                .clear_prompt()
-                .map_err(|error| error.to_string())?;
-            Ok(())
-        })?;
+        let worker_app = self.app.clone();
+        let ((mut reset_execution, _admission_guard), observation_revision) =
+            spawn_runtime_blocking(move || {
+                let state = worker_app.state::<AppState>();
+                let _lease = begin_update_sensitive_operation(&state.update_installation_gate)?;
+                let mut observation_revision = None;
+                let reset = state.conversation.begin_reset_for(target.as_ref(), || {
+                    reset_voice_runtime_session(&state)?;
+                    observation_revision = state
+                        .native_observation
+                        .lock()
+                        .map_err(|_| String::from("native observation unavailable"))?
+                        .clear_prompt()
+                        .map_err(|error| error.to_string())?;
+                    Ok(())
+                })?;
+                Ok::<_, String>((reset, observation_revision))
+            })
+            .await
+            .map_err(|_| String::from("reset worker failed"))??;
         desktop_voice_adapter::notify(&self.app, observation_revision);
-        let cleanup = reset_execution.cleanup;
-        reset_llama_session(&app_state)?;
         reset_runtime_session(&app_state)?;
         abort_prefetch(&app_state)?;
-        if let Some(cleanup) = cleanup {
+        if let Some(cleanup) = reset_execution.cleanup.take() {
             cleanup.cancel_and_wait().await;
         }
-        let has_opencode = app_state
-            .opencode_server
-            .lock()
-            .map_err(|_| String::from("opencode server lock is poisoned"))?
-            .is_some();
-        if has_opencode {
-            reset_opencode_session(&app_state).await?;
-        }
+        // Main, agent and prefetch inference own fresh transient OpenCode sessions.
+        // New Chat selects durable context; the base connection is not history.
         spawn_custom_and_web_prewarm(&self.app);
 
         desktop_voice_adapter::publish_voice(&self.app, None);
@@ -8688,59 +9224,6 @@ fn reset_voice_runtime_session(app_state: &AppState) -> Result<(), String> {
         voxgolem_core::voice_pipeline::VoicePipelineEvent::ResetToIdle,
     )?;
     Ok(())
-}
-
-fn reset_llama_session(app_state: &AppState) -> Result<(), String> {
-    app_state
-        .llama_cpp_conversation
-        .lock()
-        .map_err(|_| String::from("local llama.cpp conversation lock is poisoned"))?
-        .clear();
-    Ok(())
-}
-
-struct OpencodeServerRestoreGuard {
-    server: Option<voxgolem_platform::opencode::OpencodeServer>,
-    slot: Arc<Mutex<Option<voxgolem_platform::opencode::OpencodeServer>>>,
-}
-
-impl Drop for OpencodeServerRestoreGuard {
-    fn drop(&mut self) {
-        let Some(server) = self.server.take() else {
-            return;
-        };
-        if let Ok(mut slot) = self.slot.lock() {
-            slot.replace(server);
-        }
-    }
-}
-
-async fn reset_opencode_session(app_state: &AppState) -> Result<(), String> {
-    let server = app_state
-        .opencode_server
-        .lock()
-        .map_err(|_| String::from("opencode server lock is poisoned"))?
-        .take()
-        .ok_or_else(|| String::from("OpenCode server is not available"))?;
-    let slot = Arc::clone(&app_state.opencode_server);
-    let task = tauri::async_runtime::spawn(async move {
-        let mut restore = OpencodeServerRestoreGuard {
-            server: Some(server),
-            slot,
-        };
-        restore
-            .server
-            .as_mut()
-            .expect("OpenCode reset guard should own server")
-            .reset_with_deadlines(
-                tokio::time::Instant::now() + Duration::from_secs(5),
-                Duration::from_secs(1),
-            )
-            .await
-            .map_err(|error| format!("failed to reset OpenCode session: {error}"))
-    });
-    task.await
-        .map_err(|error| format!("OpenCode reset task failed: {error}"))?
 }
 
 #[cfg(test)]
@@ -9238,17 +9721,11 @@ async fn emit_completion_predictions(
                 error_category: telemetry::ErrorCategory::None,
             },
         );
-        if let Some(suffix) = prediction
+        let prefetch_prompt = prediction
             .suffix
             .as_deref()
             .filter(|suffix| !suffix.is_empty())
-        {
-            let _ = queue_assistant_prefetch(
-                &app,
-                format!("{}{}", request.prompt, suffix),
-                request.source,
-            );
-        }
+            .map(|suffix| format!("{}{}", request.prompt, suffix));
         let _ = app.emit(
             "completion-event",
             CompletionEventPayload {
@@ -9261,6 +9738,14 @@ async fn emit_completion_predictions(
         if let Ok(mut guard) = app_state.completion_update_guard.lock() {
             guard.take();
         };
+        drop(_lifecycle);
+        if let Some(prompt) = prefetch_prompt {
+            let app = app.clone();
+            let _ = spawn_runtime_blocking(move || {
+                queue_assistant_prefetch(&app, prompt, request.source)
+            })
+            .await;
+        }
     }
 
     let app_state = app.state::<AppState>();
@@ -9405,13 +9890,27 @@ fn prefetch_result_is_current(
     settings_generation: u64,
     cancelled: &AtomicBool,
 ) -> bool {
+    let Ok(mut durable) = app_state.durable_store.lock() else {
+        return false;
+    };
+    let Ok(store) = durable.ensure_store() else {
+        return false;
+    };
+    let Ok((context, history)) = read_prefetch_context(store, &key.prompt) else {
+        return false;
+    };
+    let Ok(_lifecycle) = app_state.lifecycle_gate.lock() else {
+        return false;
+    };
     let policy_is_current = app_state
         .conversation_session
         .lock()
         .map(|session| {
             !session.has_active_execution()
+                && session.unresolved_save().is_none()
                 && session.policy().instant_model == key.model
-                && session.provider_history() == key.history
+                && context == key.context
+                && history == key.history
         })
         .unwrap_or(false);
     app_state.prefetch_generation.load(Ordering::SeqCst) == generation
@@ -9628,6 +10127,13 @@ fn queue_assistant_prefetch(
 ) -> Result<(), String> {
     let app_state = app.state::<AppState>();
     let update_guard = begin_update_sensitive_operation(&app_state.update_installation_gate)?;
+    ensure_app_running(&app_state.exit_cleanup_started)?;
+    let mut durable = app_state
+        .durable_store
+        .lock()
+        .map_err(|_| String::from("conversation storage unavailable"))?;
+    let store = durable.ensure_store()?;
+    let (context, history) = read_prefetch_context(store, &prompt)?;
     let _lifecycle = app_state
         .lifecycle_gate
         .lock()
@@ -9643,12 +10149,14 @@ fn queue_assistant_prefetch(
         return Ok(());
     }
     invalidate_prefetch(&app_state)?;
-    let _ = app_state.conversation.ensure_hydrated();
     let (key, settings_generation) = {
         let coordinator = app_state
             .conversation_session
             .lock()
             .map_err(|_| String::from("assistant coordinator lock is poisoned"))?;
+        if coordinator.unresolved_save().is_some() {
+            return Ok(());
+        }
         if !search_runtime::queue_prefetch_eligible(
             coordinator.policy(),
             coordinator.has_active_execution(),
@@ -9665,8 +10173,9 @@ fn queue_assistant_prefetch(
         }
         (
             PrefetchKey {
+                context,
                 prompt,
-                history: coordinator.provider_history(),
+                history,
                 model: coordinator.policy().instant_model,
             },
             app_state
@@ -9741,14 +10250,21 @@ fn queue_assistant_prefetch(
         )
         .await;
         let app_state = app.state::<AppState>();
+        let candidate_current = prefetch_result_is_current(
+            &app_state,
+            &key,
+            generation,
+            settings_generation,
+            &task_cancelled,
+        );
         let current = if let Ok(_lifecycle) = app_state.lifecycle_gate.lock() {
-            let current = prefetch_result_is_current(
-                &app_state,
-                &key,
-                generation,
-                settings_generation,
-                &task_cancelled,
-            );
+            let current = candidate_current
+                && app_state.prefetch_generation.load(Ordering::SeqCst) == generation
+                && app_state
+                    .assistant_settings_generation
+                    .load(Ordering::SeqCst)
+                    == settings_generation
+                && !app_state.reset_in_progress.load(Ordering::Acquire);
             if current {
                 if let (Ok(answer), Ok(mut cache)) = (&result, app_state.prefetch_cache.lock()) {
                     *cache = Some(PrefetchEntry {
@@ -11544,7 +12060,6 @@ fn initialize_app_state(init: AppStateInit) -> AppState {
         tts_startup_generation: Arc::new(AtomicU64::new(0)),
         local_tts_runtime: Arc::new(Mutex::new(init.local_tts_runtime.map(Arc::new))),
         llama_cpp_runtime: init.llama_cpp_runtime,
-        llama_cpp_conversation: Mutex::new(Vec::new()),
         llama_cpp_system_prompt: init.llama_cpp_system_prompt,
         opencode_server: Arc::new(Mutex::new(None)),
         prefetch_generation: Arc::new(AtomicU64::new(0)),
@@ -12643,6 +13158,8 @@ fn bounded_provider_history(
 }
 
 fn validate_prompt_request_id(request_id: &str) -> Result<(), String> {
+    voxgolem_core::conversation::validate_request_id(request_id)
+        .map_err(|_| String::from("invalid request correlation"))?;
     let Some((timestamp, nonce)) = request_id
         .strip_prefix("request-")
         .and_then(|value| value.split_once('-'))
@@ -13392,6 +13909,7 @@ pub fn run() {
                 submit_prompt,
                 cancel_prompt,
                 reset_session,
+                discard_unsaved_and_new_chat,
                 request_completion,
                 clear_completion
             ];
@@ -14110,7 +14628,7 @@ mod tests {
             .expect("snapshot should finish")
             .expect("snapshot should be valid");
         snapshot_thread.join().expect("snapshot thread");
-        assert_eq!(snapshot.session_id.as_str(), "2");
+        assert_eq!(snapshot.session_id.as_str(), "0");
         assert_eq!(
             snapshot.preferences.response_profile,
             voxgolem_core::ipc::ResponseProfile::Quality
@@ -14770,7 +15288,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let invalid_appdata = temp_dir.path().join("not-a-directory");
         fs::write(&invalid_appdata, b"file").expect("invalid APPDATA fixture");
-        let _storage_root = super::test_storage::ScopedRoot::new(invalid_appdata.clone());
+        let _storage_root = super::test_storage::ScopedRoot::new(temp_dir.path().to_path_buf());
         let state = build_nonfatal_config_error_app_state(
             default_voice_pipeline_config(),
             super::embedded_cue_asset_paths(),
@@ -14779,6 +15297,9 @@ mod tests {
         let previous = get_app_snapshot_from_state(&state)
             .expect("initial snapshot")
             .preferences;
+        // Keep the real conversation DB available while independently failing
+        // preferences persistence; the snapshot no longer hides storage failure.
+        let _invalid_preferences_root = super::test_storage::ScopedRoot::new(invalid_appdata);
         let mut requested = previous.clone();
         requested.ui_theme = voxgolem_core::ipc::UiTheme::Light;
 
@@ -16507,14 +17028,18 @@ mod tests {
         );
         {
             let mut session = state.conversation_session.lock().unwrap();
-            assert!(matches!(
-                session.settle(
-                    registered.request.generation,
-                    voxgolem_core::conversation::SettlementIntent::Success,
-                ),
-                voxgolem_core::conversation::SettlementResult::Applied(_)
-            ));
-            assert_eq!(session.turns().last().unwrap().answer.content, answer);
+            let settled = session.settle(
+                registered.request.generation,
+                voxgolem_core::conversation::SettlementIntent::Success,
+            );
+            match settled {
+                voxgolem_core::conversation::SettlementResult::Applied(
+                    voxgolem_core::conversation::AppliedOutcome::Completed(turn)
+                    | voxgolem_core::conversation::AppliedOutcome::Refused(turn),
+                ) => assert_eq!(turn.answer.content, answer),
+                other => panic!("unexpected settlement: {other:?}"),
+            }
+            assert!(session.turns().is_empty());
         }
         drop(registered);
     }
@@ -16525,6 +17050,7 @@ mod tests {
             prompt: String::from("explain ownership"),
             history: Vec::new(),
             model: voxgolem_core::assistant::InstantModel::LocalFast,
+            context: Default::default(),
         };
         let cache = Mutex::new(Some(PrefetchEntry {
             generation: 1,
@@ -16572,6 +17098,7 @@ mod tests {
             prompt: String::from("explain ownership"),
             history: Vec::new(),
             model: voxgolem_core::assistant::InstantModel::LocalFast,
+            context: Default::default(),
         };
         *app_state.prefetch_cache.lock().unwrap() = Some(PrefetchEntry {
             generation: 1,
@@ -16601,6 +17128,7 @@ mod tests {
             prompt: String::from("question"),
             history: Vec::new(),
             model: voxgolem_core::assistant::InstantModel::LocalFast,
+            context: Default::default(),
         };
         let cache = Mutex::new(Some(PrefetchEntry {
             generation: 1,
@@ -16627,6 +17155,7 @@ mod tests {
             prompt: String::from("question"),
             history: Vec::new(),
             model: voxgolem_core::assistant::InstantModel::LocalFast,
+            context: Default::default(),
         };
         let cancelled = AtomicBool::new(false);
         app_state.prefetch_generation.store(7, Ordering::SeqCst);
@@ -17094,6 +17623,7 @@ mod tests {
         )
         .unwrap()
         .cleanup
+        .take()
         .expect("active execution should be invalidated")
         .active;
         assert!(invalidated.cancelled.load(Ordering::Acquire));
@@ -17182,6 +17712,7 @@ mod tests {
         )
         .unwrap()
         .cleanup
+        .take()
         .expect("reset should claim the pre-reset physical prompt")
         .active;
         assert_eq!(*terminal.lock().unwrap(), Some(TerminalKind::Completed));
@@ -17234,6 +17765,7 @@ mod tests {
         )
         .unwrap()
         .cleanup
+        .take()
         .expect("reset should claim the pre-reset physical prompt")
         .active;
         assert_eq!(
@@ -18246,6 +18778,7 @@ mod tests {
             prompt: String::from("refuse"),
             history: Vec::new(),
             model: voxgolem_core::assistant::InstantModel::CustomLunaLow,
+            context: Default::default(),
         };
         let cache = Mutex::new(Some(PrefetchEntry {
             generation: 1,

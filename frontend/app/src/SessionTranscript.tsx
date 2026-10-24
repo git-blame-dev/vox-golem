@@ -1,4 +1,5 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import { useSessionView } from './FrontendSession'
 import type { FrontendSession } from './FrontendSession'
 import type { TranscriptMessage, UiTextSize } from './types/chat'
 import { isTranscriptMessage } from './types/chat'
@@ -16,7 +17,8 @@ export function SessionTranscript({ session, staging, composerValue, textSize, n
   readonly noticeId: string | undefined
 }) {
   const messages = useSyncExternalStore(session.subscribe, session.getMessagesSnapshot, session.getMessagesSnapshot)
-  const visibleMessages = useMemo(() => staging ? [] : messages.filter(isTranscriptMessage), [messages, staging])
+  const { unsavedResult } = useSessionView(session, 'conversation')
+  const visibleMessages = useMemo(() => staging ? [] : messages.filter(isTranscriptMessage).filter((message) => unsavedResult === null || message.observation?.requestId !== unsavedResult.requestId || message.observation.outcome !== 'pending'), [messages, staging, unsavedResult])
   const conversationRef = useRef<HTMLElement | null>(null)
   const followLatest = useRef(true)
   const jumping = useRef(false)
@@ -52,6 +54,13 @@ export function SessionTranscript({ session, staging, composerValue, textSize, n
       setShowJump(!nearLatest)
     }} onWheel={interrupt} onTouchStart={interrupt} onPointerDown={interrupt}>
       {visibleMessages.map((message) => <TranscriptRow key={message.id} message={message} onAnswerDomCommitted={onAnswerDomCommitted} />)}
+      {unsavedResult === null ? null : <section aria-label="Unsaved answer">
+        <article className="message message--user"><p className="message__content">{unsavedResult.prompt}</p></article>
+        <AnswerStage compact answer={unsavedResult.answer.text} stages={[{ stage: unsavedResult.finalStage, status: 'completed' }]} contentKind={unsavedResult.answer.kind} sources={unsavedResult.sources} className="message message--assistant" />
+        <div role="status" aria-label="Answer not saved">Answer not saved. Copy this answer or use New Chat to discard it before continuing.</div>
+        <CopyMessageButton text={unsavedResult.answer.text} label="Copy unsaved response" sources={unsavedResult.sources} />
+        <button type="button" onClick={() => { void session.intents.resetSession() }}>New Chat and discard unsaved answer</button>
+      </section>}
     </main>
     {showJump ? <button type="button" className="conversation__jump" aria-label="Jump to latest" onClick={() => {
       followLatest.current = true

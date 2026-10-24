@@ -1,4 +1,4 @@
-import { isRecord, utf8ByteLength } from './wire'
+import { isCoreWhitespaceOnly, isRecord, utf8ByteLength } from './wire'
 
 export interface SourceLink { readonly url: string; readonly title: string }
 
@@ -8,8 +8,8 @@ export const MAX_ANSWER_SOURCES = 32
 /** Link validation is not permission to fetch the endpoint. */
 export function isSourceLink(value: unknown): value is SourceLink {
   if (!isRecord(value) || typeof value['url'] !== 'string' || typeof value['title'] !== 'string' ||
-      value['title'].trim() === '' || utf8ByteLength(value['title']) > 512 ||
-      utf8ByteLength(value['url']) > 2048 || /\s/u.test(value['url'])) return false
+      isCoreWhitespaceOnly(value['title']) || utf8ByteLength(value['title']) > 512 ||
+      utf8ByteLength(value['url']) > 2048 || /[\p{White_Space}\p{Cc}]/u.test(value['url'])) return false
   try {
     const url = new URL(value['url'])
     return (url.protocol === 'http:' || url.protocol === 'https:') && !url.username && !url.password

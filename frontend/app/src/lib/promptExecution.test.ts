@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it } from 'vitest'
+import { savedOutcome } from '../test/sessionFixtures'
 import {
   executePrompt,
   parsePromptExecutionEvent,
-  parsePromptExecutionResult,
+  parseCanonicalPromptOutcome,
 } from './promptExecution'
 import type { PromptExecutionEvent } from '../types/chat'
 import { getTauriInternals } from './tauri'
@@ -26,7 +27,7 @@ describe('prompt payload parsing', () => {
       sources: [{ url: 'https://example.test/document', title: 'Synthetic observed document' }], final_stage: 'instant' }
     window.__TAURI_INTERNALS__ = { createChannel: () => ({}), invoke: async (command) => {
       expect(command).toBe('submit_prompt')
-      return { kind: 'completed', turn }
+      return { kind: 'completed', save_disposition: 'saved', turn }
     } }
     const result = await executePrompt('synthetic-desktop-request', 'Synthetic question', () => undefined)
     expect(result.canonicalTurn?.sources).toEqual(turn.sources)
@@ -37,12 +38,8 @@ describe('prompt payload parsing', () => {
 
   it('parses a valid final result', () => {
     expect(
-      parsePromptExecutionResult({
-        request_id: 'request-1',
-        runtime_phase: 'sleeping',
-        outcome: 'completed',
-      }),
-    ).toEqual({
+      parseCanonicalPromptOutcome(savedOutcome('request-1'), 'request-1'),
+    ).toMatchObject({
       requestId: 'request-1',
       runtimePhase: 'sleeping',
       outcome: 'completed',
@@ -52,12 +49,12 @@ describe('prompt payload parsing', () => {
 
   it('parses an authoritative final error message', () => {
     expect(
-      parsePromptExecutionResult({
+      parseCanonicalPromptOutcome({
+        kind: 'error',
         request_id: 'request-1',
         runtime_phase: 'error',
-        outcome: 'error',
         error_message: 'OpenCode provider authentication failed',
-      }),
+      }, 'request-1'),
     ).toEqual({
       requestId: 'request-1',
       runtimePhase: 'error',
@@ -149,7 +146,7 @@ describe('prompt payload parsing', () => {
   })
 
   it('rejects invalid result and event payloads', () => {
-    expect(() => parsePromptExecutionResult({ outcome: 'completed' })).toThrow()
+    expect(() => parseCanonicalPromptOutcome({ outcome: 'completed' }, 'request-1')).toThrow()
     expect(() =>
       parsePromptExecutionEvent({
         request_id: 'request-1',
@@ -186,7 +183,7 @@ describe('executePrompt', () => {
       invoke: async (command, args) => {
         expect(command).toBe('submit_prompt')
         expect(args).toEqual({ requestId: 'synthetic-request', prompt: 'Synthetic question', source: 'voice', updates: 'synthetic-channel' })
-        return { request_id: 'synthetic-request', runtime_phase: 'sleeping', outcome: 'completed' }
+        return savedOutcome('synthetic-request')
       },
     }
     await executePrompt('synthetic-request', 'Synthetic question', () => undefined, 'voice')
@@ -244,17 +241,13 @@ describe('executePrompt', () => {
         expect(args).toEqual({ requestId: 'request-1', prompt: 'Draft release notes', source: 'typed', updates: 'channel' })
         send?.({ request_id: 'stale', kind: 'text', text: 'Ignore me' })
         send?.({ kind: 'text', text: 'OpenCode response' })
-        return {
-          request_id: 'request-1',
-          runtime_phase: 'sleeping',
-          outcome: 'completed',
-        }
+        return savedOutcome('request-1')
       },
     }
 
     await expect(
       executePrompt('request-1', 'Draft release notes', (event) => events.push(event)),
-    ).resolves.toEqual({
+    ).resolves.toMatchObject({
       requestId: 'request-1',
       runtimePhase: 'sleeping',
       outcome: 'completed',
@@ -283,7 +276,7 @@ describe('executePrompt', () => {
         expect(args).toMatchObject({ requestId: 'request-1', prompt: 'Draft release notes', source: 'typed', updates: 'channel' })
         update?.({ kind: 'text', text: 'OpenCode response' })
         update?.({ kind: 'text' })
-        return { request_id: 'request-1', runtime_phase: 'sleeping', outcome: 'completed' }
+        return savedOutcome('request-1')
       },
     }
 
@@ -320,8 +313,8 @@ describe('executePrompt', () => {
     channels[1]?.({ kind: 'stage', stage: 'instant', status: 'running', detail: null })
     channels[0]?.({ kind: 'text', text: 'First answer' })
     channels[1]?.({ kind: 'text', text: 'Second answer' })
-    settle.get('second')?.({ request_id: 'second', runtime_phase: 'sleeping', outcome: 'completed' })
-    settle.get('first')?.({ request_id: 'first', runtime_phase: 'sleeping', outcome: 'completed' })
+    settle.get('second')?.(savedOutcome('second'))
+    settle.get('first')?.(savedOutcome('first'))
     await Promise.all([first, second])
     expect(firstEvents).toEqual([{ requestId: 'first', kind: 'text', text: 'First answer' }])
     expect(secondEvents).toEqual([
@@ -341,16 +334,11 @@ describe('executePrompt', () => {
   it('rejects a final result correlated to another request', async () => {
     window.__TAURI_INTERNALS__ = {
       createChannel: () => 'channel',
-      invoke: async () => ({
-        request_id: 'request-other',
-        runtime_phase: 'sleeping',
-        outcome: 'completed',
-        error_message: null,
-      }),
+      invoke: async () => savedOutcome('request-other'),
     }
 
     await expect(executePrompt('request-1', 'Hello', () => undefined)).rejects.toThrow(
-      'Prompt response request ID did not match the active request',
+      'prompt outcome request ID did not match the active request',
     )
   })
 })

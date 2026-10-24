@@ -750,62 +750,54 @@ fn failed_mobile_preparation_rolls_back_identity_selection_and_preserves_input_d
 }
 
 #[test]
-fn timing_admission_and_settlement_count_context_projection_attempts() {
+fn timing_projects_context_at_admission_not_after_inference() {
     let fixture = Fixture::new();
     let mut store = fixture.open();
     let (prepared, summary) = timing::capture(true, || {
-        store.prepare_context(
+        store.prepare_request(
             Selection {
                 conversation: None,
                 selected_head: None,
             },
             "Synthetic prompt",
             4096,
+            true,
         )
     });
     let prepared = prepared.unwrap();
     assert_eq!(summary.unwrap().metrics.projection.count, 1);
-    let record = turn(&mut store, &prepared.context, "Synthetic prompt");
-    let OperationBody::TurnCompleted { provenance, .. } = record.operation.body else {
-        unreachable!()
-    };
+    let mut body = turn(&mut store, &prepared.context.selection, "Synthetic prompt")
+        .operation
+        .body;
+    if let OperationBody::TurnCompleted { request, .. } = &mut body {
+        *request = prepared.request;
+    }
     let revision = store.revision().unwrap();
     let selection = store.selection().unwrap();
     let (failed, summary) = timing::capture(true, || {
-        store.persist_settled_turn(
-            usize::MAX,
-            "Synthetic prompt".into(),
-            Answer::Text {
-                text: "Synthetic answer".into(),
-            },
-            vec![],
-            TerminalStage::Instant,
-            provenance.clone(),
-        )
+        store.prepare_request(selection.clone(), "Synthetic prompt", usize::MAX, true)
     });
     assert!(matches!(
         failed,
         Err(Error::Domain(DomainError::LimitExceeded { .. }))
     ));
     let metrics = summary.unwrap().metrics;
-    assert_eq!(metrics.projection.count, 1);
+    assert_eq!(metrics.projection.count, 0);
     assert_eq!(metrics.sqlite_commit.count, 0);
     assert_eq!(store.revision().unwrap(), revision);
     assert_eq!(store.selection().unwrap(), selection);
     let (settled, summary) = timing::capture(true, || {
-        store.persist_settled_turn(
-            4096,
-            "Synthetic prompt".into(),
-            Answer::Text {
-                text: "Synthetic answer".into(),
+        store.complete_selected_body_with_authority(
+            body,
+            || ((), CompletionDecision::Authorized),
+            |_, attempt| match attempt {
+                CompletionAttempt::Finished(result) => result,
+                _ => unreachable!(),
             },
-            vec![],
-            TerminalStage::Instant,
-            provenance,
         )
     });
     assert!(settled.unwrap().saved);
-    assert_eq!(summary.unwrap().metrics.projection.count, 1);
+    assert_eq!(summary.unwrap().metrics.projection.count, 0);
 }
 
 #[test]
@@ -1796,65 +1788,66 @@ fn compact_projection_excludes_large_turn_bodies_and_preserves_bounded_previews_
 }
 
 #[test]
-fn test_persist_settled_turn_single_transaction_and_atomic_rollback() {
+fn selected_completion_advances_only_its_matching_owner_atomically() {
     let fixture = Fixture::new();
     let mut store = fixture.open();
-
-    use voxgolem_core::durable_conversation::{Answer, Provenance, TerminalStage};
-    let provenance = Provenance {
-        requested_model: "test-model".into(),
-        returned_model: None,
-        policy_id: "bench-1-quick".into(),
-        policy_version: "1".into(),
-        instruction_profile_id: "test-instructions".into(),
-        instruction_profile_version: "1".into(),
-        context: Vec::new(),
-    };
-
-    let settled = store
-        .persist_settled_turn(
-            1024,
-            "Test prompt".into(),
-            Answer::Text {
-                text: "Test answer".into(),
+    let prepared = store
+        .prepare_request(
+            Selection {
+                conversation: None,
+                selected_head: None,
             },
-            Vec::new(),
-            TerminalStage::Instant,
-            provenance.clone(),
+            "Synthetic prompt",
+            4096,
+            true,
         )
         .unwrap();
-
-    assert!(settled.saved);
-    let selection = store.selection().unwrap();
-    assert!(selection.conversation.is_some());
-    assert_eq!(
-        selection.selected_head,
-        Some(settled.record.operation.id.clone())
+    let mut body = turn(&mut store, &prepared.context.selection, "Synthetic prompt")
+        .operation
+        .body;
+    if let OperationBody::TurnCompleted { request, .. } = &mut body {
+        *request = prepared.request;
+    }
+    let selected = store.selection().unwrap();
+    store.complete_selected_body_with_authority(
+        body.clone(),
+        || ((), CompletionDecision::Cancelled),
+        |_, attempt| assert!(matches!(attempt, CompletionAttempt::Cancelled)),
     );
-
-    // Verify atomic rollback on failure when an invalid prompt is passed on a fresh store
-    // (where ConversationCreated is planned first inside the transaction, then TurnCompleted fails):
-    let mut fresh_store = Fixture::new().open();
-    let revision_before = fresh_store.revision().unwrap();
-    let res = fresh_store.persist_settled_turn(
-        1024,
-        "   ".into(),
-        Answer::Text {
-            text: "Another answer".into(),
+    assert_eq!(store.selection().unwrap(), selected);
+    assert_eq!(
+        store.draft(selected.conversation.as_ref()).unwrap().text,
+        "Synthetic prompt"
+    );
+    let saved = store.complete_selected_body_with_authority(
+        body.clone(),
+        || ((), CompletionDecision::Authorized),
+        |_, attempt| match attempt {
+            CompletionAttempt::Finished(result) => result.unwrap(),
+            _ => unreachable!(),
         },
-        Vec::new(),
-        TerminalStage::Instant,
-        provenance,
     );
-    assert!(res.is_err());
-    assert_eq!(fresh_store.revision().unwrap(), revision_before);
+    assert!(saved.saved);
     assert_eq!(
-        fresh_store
-            .conversations(0, 10)
-            .unwrap()
-            .conversations
-            .len(),
-        0
+        store.selection().unwrap().selected_head,
+        Some(saved.record.operation.id)
     );
-    assert_eq!(fresh_store.allocate_id().unwrap().sequence, "1");
+    let other = store
+        .create_conversation("Synthetic other owner".into())
+        .unwrap()
+        .operation
+        .id;
+    let other_selected = Selection {
+        conversation: Some(other),
+        selected_head: None,
+    };
+    store.select(other_selected.clone()).unwrap();
+    store.complete_selected_body_with_authority(
+        body,
+        || ((), CompletionDecision::Authorized),
+        |_, attempt| {
+            assert!(matches!(attempt, CompletionAttempt::Finished(Ok(_))));
+        },
+    );
+    assert_eq!(store.selection().unwrap(), other_selected);
 }

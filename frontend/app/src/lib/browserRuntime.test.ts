@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { parseAppSnapshot, parseValidatedPreferences } from './appSnapshot'
+import { parseCanonicalPromptOutcome } from './promptExecution'
 import {
   configureBrowserPreviewFixture,
   getBrowserPreviewInternals,
@@ -66,12 +67,15 @@ describe('browser preview runtime', () => {
 
     await expect(result).resolves.toMatchObject({
       kind: 'completed',
+      save_disposition: 'saved',
       turn: {
         request_id: 'request-1',
         execution_id: { session_id: '1', generation: '1' },
       },
     })
+    expect(parseCanonicalPromptOutcome(await result, 'request-1').saveDisposition).toBe('saved')
     const snapshot = parseAppSnapshot(await runtime.invoke('get_app_snapshot'))
+    expect(snapshot.unsavedResult).toBeNull()
     expect(snapshot.activeRequest).toBeNull()
     expect(snapshot.transcript).toHaveLength(1)
     expect(snapshot.transcript[0]).toMatchObject({

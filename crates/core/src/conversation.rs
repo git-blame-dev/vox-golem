@@ -53,6 +53,19 @@ pub enum AdmissionError {
     InvalidContext,
     UnresolvedSave,
 }
+
+/// Validate renderer/native request correlation before any admission work. Keep
+/// accepted identifiers unchanged so every admitted request remains representable
+/// in both saved and unsaved terminal projections.
+pub fn validate_request_id(request_id: &str) -> Result<(), AdmissionError> {
+    if request_id.len() > MAX_REQUEST_ID_BYTES {
+        return Err(AdmissionError::RequestIdTooLong);
+    }
+    if request_id.trim().is_empty() {
+        return Err(AdmissionError::EmptyRequestId);
+    }
+    Ok(())
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateResult {
     Pending,
@@ -135,6 +148,16 @@ struct Active {
     deep: Option<DeepOutcome>,
     review: Option<crate::assistant::ReviewOutcome>,
     resolved: Option<(Content, Stage)>,
+    finalizing: bool,
+}
+
+/// One bounded completion capture for durable planning. Once captured, only final
+/// settlement/cancellation may change the execution; late provider updates are stale.
+pub struct ResolvedCompletion {
+    pub prompt: String,
+    pub answer: crate::durable_conversation::Answer,
+    pub sources: Vec<SourceLink>,
+    pub final_stage: Stage,
 }
 
 /// Provider context belongs to the caller's pinned request, not the execution reducer.
@@ -250,44 +273,6 @@ impl ConversationSession {
             }),
         }
     }
-    pub fn hydrate_turns(
-        &mut self,
-        session_id: SessionId,
-        turns: Vec<Turn>,
-    ) -> Result<(), SettlementError> {
-        if self.active.is_some() {
-            return Err(SettlementError::NotResolved);
-        }
-        self.session_id = session_id;
-        self.next_session = self.next_session.max(session_id.0.saturating_add(1));
-        self.turns.clear();
-        self.text_bytes = 0;
-        for turn in turns {
-            let text = content_bytes(&turn.user.content)
-                + content_bytes(&turn.answer.content)
-                + source_bytes(&turn.sources);
-            let context_text = match &turn.answer.content {
-                Content::Text(text) => {
-                    text.len() + crate::sources::source_footer_bytes(&turn.sources)
-                }
-                Content::Refusal(text) => text.len(),
-            } + content_bytes(&turn.user.content);
-            if text > MAX_COMMITTED_TEXT_BYTES || context_text > MAX_COMMITTED_TEXT_BYTES {
-                return Err(SettlementError::TranscriptTooLarge);
-            }
-            self.next_generation = self
-                .next_generation
-                .max(turn.execution_id.generation.0.saturating_add(1));
-            self.next_message = self
-                .next_message
-                .max(turn.user.id.0.saturating_add(1))
-                .max(turn.answer.id.0.saturating_add(1));
-            self.text_bytes += text;
-            self.turns.push(turn);
-            self.trim();
-        }
-        Ok(())
-    }
     pub fn admit(
         &mut self,
         request_id: &str,
@@ -337,12 +322,7 @@ impl ConversationSession {
         if self.unresolved_save.is_some() {
             return Err(AdmissionError::UnresolvedSave);
         }
-        if request_id.is_empty() {
-            return Err(AdmissionError::EmptyRequestId);
-        }
-        if request_id.len() > MAX_REQUEST_ID_BYTES {
-            return Err(AdmissionError::RequestIdTooLong);
-        }
+        validate_request_id(request_id)?;
         if prompt.trim().is_empty() {
             return Err(AdmissionError::EmptyPrompt);
         }
@@ -377,6 +357,7 @@ impl ConversationSession {
                 policy: snapshot.policy.clone(),
             },
             resolved: None,
+            finalizing: false,
         });
         Ok(snapshot)
     }
@@ -388,7 +369,7 @@ impl ConversationSession {
         let Some(active) = self
             .active
             .as_mut()
-            .filter(|active| active.snapshot.execution_id == execution_id)
+            .filter(|active| active.snapshot.execution_id == execution_id && !active.finalizing)
         else {
             return Ok(false);
         };
@@ -405,7 +386,7 @@ impl ConversationSession {
         let Some(active) = self.active.as_mut() else {
             return UpdateResult::IgnoredStale;
         };
-        if active.snapshot.execution_id != execution_id {
+        if active.snapshot.execution_id != execution_id || active.finalizing {
             return UpdateResult::IgnoredStale;
         }
         let seen = match (&stage, &result) {
@@ -450,6 +431,61 @@ impl ConversationSession {
             _ => UpdateResult::Pending,
         }
     }
+    pub fn begin_settlement(
+        &mut self,
+        execution_id: ExecutionId,
+    ) -> Result<ResolvedCompletion, SettlementError> {
+        let active = self
+            .active
+            .as_mut()
+            .filter(|a| a.snapshot.execution_id == execution_id && !a.finalizing)
+            .ok_or(SettlementError::NotResolved)?;
+        let (content, final_stage) = active
+            .resolved
+            .as_ref()
+            .ok_or(SettlementError::NotResolved)?;
+        let answer = match content {
+            Content::Text(text) => crate::durable_conversation::Answer::Text { text: text.clone() },
+            Content::Refusal(reason) => crate::durable_conversation::Answer::Refusal {
+                reason: reason.clone(),
+            },
+        };
+        let sources = if matches!(content, Content::Refusal(_)) {
+            &[][..]
+        } else {
+            active.sources.as_slice()
+        };
+        crate::durable_conversation::validate_completed_content(
+            &active.snapshot.prompt,
+            &answer,
+            sources,
+        )
+        .map_err(|_| SettlementError::TranscriptTooLarge)?;
+        let rendered_bytes = active
+            .snapshot
+            .prompt
+            .len()
+            .saturating_add(answer.text().len())
+            .saturating_add(
+                if matches!(answer, crate::durable_conversation::Answer::Text { .. }) {
+                    crate::sources::source_footer_bytes(sources)
+                } else {
+                    0
+                },
+            );
+        if rendered_bytes > MAX_COMMITTED_TEXT_BYTES {
+            return Err(SettlementError::TranscriptTooLarge);
+        }
+        let completion = ResolvedCompletion {
+            prompt: active.snapshot.prompt.clone(),
+            answer,
+            sources: sources.to_vec(),
+            final_stage: *final_stage,
+        };
+        active.finalizing = true;
+        Ok(completion)
+    }
+
     pub fn settle(
         &mut self,
         execution_id: ExecutionId,
@@ -624,6 +660,88 @@ fn content_bytes(content: &Content) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn request_correlation_validation_rejects_blank_and_counts_utf8_before_mutation() {
+        for invalid in ["", " ", "\t\r\n", "\u{2003}"] {
+            let mut session = ConversationSession::execution_only(policy());
+            assert_eq!(
+                validate_request_id(invalid),
+                Err(AdmissionError::EmptyRequestId)
+            );
+            assert_eq!(
+                session.admit(invalid, "Synthetic prompt"),
+                Err(AdmissionError::EmptyRequestId)
+            );
+            assert_eq!((session.next_generation, session.next_message), (1, 1));
+            assert!(!session.has_active_execution());
+        }
+        for too_long in [
+            "x".repeat(MAX_REQUEST_ID_BYTES + 1),
+            "😀".repeat(MAX_REQUEST_ID_BYTES / 4 + 1),
+        ] {
+            assert_eq!(
+                validate_request_id(&too_long),
+                Err(AdmissionError::RequestIdTooLong)
+            );
+        }
+        for accepted in [
+            "synthetic-correlation".to_owned(),
+            " synthetic preserved correlation ".to_owned(),
+            "😀".repeat(MAX_REQUEST_ID_BYTES / 4),
+        ] {
+            let mut session = ConversationSession::execution_only(policy());
+            assert_eq!(validate_request_id(&accepted), Ok(()));
+            assert_eq!(
+                session
+                    .admit(&accepted, "Synthetic prompt")
+                    .unwrap()
+                    .request_id
+                    .0,
+                accepted
+            );
+        }
+    }
+    #[test]
+    fn durable_completion_capture_freezes_stage_and_sources_but_not_cancellation() {
+        let mut session = ConversationSession::execution_only(policy());
+        let admitted = session
+            .admit("synthetic-finalizing", "Synthetic prompt")
+            .unwrap();
+        complete(
+            &mut session,
+            admitted.execution_id,
+            Content::Text("Synthetic captured answer".into()),
+        );
+        let completion = session.begin_settlement(admitted.execution_id).unwrap();
+        assert_eq!(completion.answer.text(), "Synthetic captured answer");
+        assert!(completion.sources.is_empty());
+        assert!(!session
+            .observe_sources(
+                admitted.execution_id,
+                &[SourceLink {
+                    url: "https://example.test/synthetic-late".into(),
+                    title: "Synthetic late".into()
+                }]
+            )
+            .unwrap());
+        assert_eq!(
+            session.update(
+                admitted.execution_id,
+                Stage::Instant,
+                StageResult::Instant(InstantOutcome::Complete(Content::Text(
+                    "Synthetic late answer".into()
+                )))
+            ),
+            UpdateResult::IgnoredStale
+        );
+        assert!(session.begin_settlement(admitted.execution_id).is_err());
+        assert_eq!(
+            session.settle(admitted.execution_id, SettlementIntent::Cancelled),
+            SettlementResult::Applied(AppliedOutcome::Cancelled)
+        );
+        assert!(session.unresolved_save().is_none());
+        assert!(session.turns().is_empty());
+    }
     #[test]
     fn unsaved_settlement_blocks_admission_until_successful_fresh_selection() {
         let mut session = ConversationSession::execution_only(policy());

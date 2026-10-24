@@ -1,5 +1,6 @@
 import type { PromptProjection } from '../SessionAuthority'
-import type { AppSnapshot } from '../lib/appSnapshot'
+import type { AppSnapshot, ExecutionId } from '../lib/appSnapshot'
+import { sameExecution } from '../lib/desktopRuntime'
 import type { NativePromptProjection } from '../lib/desktopRuntime'
 import type { PromptExecutionEvent, PromptExecutionResult } from '../types/chat'
 
@@ -7,29 +8,34 @@ import type { PromptExecutionEvent, PromptExecutionResult } from '../types/chat'
 export class SessionPromptController {
   readonly active = { current: null as PromptProjection | null }
   readonly revision = { current: 0 }
-  private native: { readonly requestId: string; readonly update: (event: PromptExecutionEvent) => void; readonly finish: (result: PromptExecutionResult) => void; readonly replace: () => void } | null = null
+  private retiredNative: { readonly requestId: string; readonly executionId: ExecutionId } | null = null
+  private native: { readonly requestId: string; readonly executionId: ExecutionId; readonly update: (event: PromptExecutionEvent) => void; readonly finish: (result: PromptExecutionResult) => void; readonly replace: () => void } | null = null
 
   observeNative(prompt: NativePromptProjection, update: (event: PromptExecutionEvent) => void, replace: () => void): Promise<PromptExecutionResult> {
     this.detachNative()
     return new Promise((finish) => {
-      this.native = { requestId: prompt.requestId, update, finish, replace }
+      this.native = { requestId: prompt.requestId, executionId: prompt.executionId, update, finish, replace }
       this.replaceNative(prompt)
     })
   }
   replaceNative(prompt: NativePromptProjection): void {
     const native = this.native
-    if (native?.requestId !== prompt.requestId) return
+    if (native?.requestId !== prompt.requestId || !sameExecution(native.executionId, prompt.executionId)) return
     native.replace()
     for (const update of prompt.updates) native.update(update)
-    if (prompt.result !== null) this.finishNative(prompt.requestId, prompt.result)
+    if (prompt.result !== null) this.finishNative(prompt.requestId, prompt.executionId, prompt.result)
   }
-  updateNative(requestId: string, update: PromptExecutionEvent): void {
-    if (this.native?.requestId === requestId) this.native.update(update)
+  isNativeRetired(prompt: NativePromptProjection): boolean {
+    return this.retiredNative?.requestId === prompt.requestId && sameExecution(this.retiredNative.executionId, prompt.executionId)
   }
-  finishNative(requestId: string, result: PromptExecutionResult): void {
-    if (this.native?.requestId !== requestId) return
+  updateNative(requestId: string, executionId: ExecutionId, update: PromptExecutionEvent): void {
+    if (this.native?.requestId === requestId && sameExecution(this.native.executionId, executionId)) this.native.update(update)
+  }
+  finishNative(requestId: string, executionId: ExecutionId, result: PromptExecutionResult): void {
+    if (this.native?.requestId !== requestId || !sameExecution(this.native.executionId, executionId)) return
     const native = this.native
     this.native = null
+    this.retiredNative = { requestId, executionId }
     native.finish(result)
   }
   detachNative(): void {

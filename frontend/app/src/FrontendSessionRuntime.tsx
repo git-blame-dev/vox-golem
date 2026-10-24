@@ -38,9 +38,9 @@ import { shouldSubmitComposer } from './lib/composer'
 import { listAudioInputDevices, startLiveAudioSource } from './lib/liveAudioSource'
 import { executePrompt } from './lib/promptExecution'
 import { mergeAnswerSources } from './lib/answerSources'
-import { appendCanonicalTurn, canonicalExecutionKey, isExpectedCanonicalTurn, loadAppSnapshot, parseAppSnapshot, parseAndroidConversationPage, parseAndroidHeadPage } from './lib/appSnapshot'
+import { appendCanonicalTurn, canonicalExecutionKey, isExpectedCanonicalTurn, loadAppSnapshot as loadNativeAppSnapshot, parseAppSnapshot, parseAndroidConversationPage, parseAndroidHeadPage } from './lib/appSnapshot'
 import type { AppSnapshot, Capability, Turn, ValidatedPreferences } from './lib/appSnapshot'
-import { DesktopRuntimeObserver } from './lib/desktopRuntime'
+import { DesktopRuntimeObserver, sameExecution } from './lib/desktopRuntime'
 import type { DesktopRuntimeEvent, DesktopRuntimeSnapshot, NativePromptProjection, VoiceProjection, SpeechProjection } from './lib/desktopRuntime'
 import {
   CAPABILITY_IDS,
@@ -108,6 +108,26 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   const [, setShortcutStaging] = session.fieldState('shortcutStaging')
   const androidSelectionRecoveryRef = session.selection.recovery
   const [androidAssistant, setAndroidAssistant] = session.fieldState('androidAssistant')
+  const [, setUnsavedResult] = session.fieldState('unsavedResult')
+  const unsavedResultRef = session.fieldRef('unsavedResult')
+  const dispositionRevisionRef = session.operationRef('dispositionRevision', () => 0)
+  const snapshotDispositionRef = session.operationRef('snapshotDispositions', () => new WeakMap<AppSnapshot, number>())
+  const publishUnsavedResult = useCallback((next: AppSnapshot['unsavedResult'], terminal = true): void => {
+    const prior = unsavedResultRef.current
+    if (terminal || (prior === null) !== (next === null) || (prior !== null && next !== null && !sameExecution(prior.executionId, next.executionId))) dispositionRevisionRef.current += 1
+    setUnsavedResult(next)
+  }, [dispositionRevisionRef, setUnsavedResult, unsavedResultRef])
+  const readCanonicalSnapshot = useCallback(async (read: () => Promise<AppSnapshot>): Promise<AppSnapshot> => {
+    // Freshness belongs to read admission, not response arrival or controls publication.
+    const revision = dispositionRevisionRef.current
+    const snapshot = await read()
+    snapshotDispositionRef.current.set(snapshot, revision)
+    return snapshot
+  }, [dispositionRevisionRef, snapshotDispositionRef])
+  const loadAppSnapshot = useCallback(() => readCanonicalSnapshot(loadNativeAppSnapshot), [readCanonicalSnapshot])
+  const adoptUnsavedSnapshot = useCallback((snapshot: AppSnapshot): void => {
+    if (snapshotDispositionRef.current.get(snapshot) === dispositionRevisionRef.current) publishUnsavedResult(snapshot.unsavedResult, false)
+  }, [dispositionRevisionRef, publishUnsavedResult, snapshotDispositionRef])
   const [, setAndroidConversationId] = session.fieldState('androidConversationId')
   const [conversationPagePending, setConversationPagePending] = session.fieldState('conversationPagePending')
   const [headPagePending, setHeadPagePending] = session.fieldState('headPagePending')
@@ -207,6 +227,9 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   const desktopSnapshotRef = session.operationRef<(snapshot: DesktopRuntimeSnapshot) => void>('desktopSnapshot', () => () => undefined)
   const desktopEventRef = session.operationRef<(event: DesktopRuntimeEvent) => void>('desktopEvent', () => () => undefined)
   const desktopCanonicalReadRef = session.operationRef('desktopCanonicalRead', () => 0)
+  // One bounded start projection and terminal; intervening deltas only request a fresh native root.
+  const pendingNativeAdmissionRef = session.operationRef<{ prompt: NativePromptProjection; result: PromptExecutionResult | null; dirty: boolean } | null>('pendingNativeAdmission', () => null)
+  const nativeAdmissionReadOwnerRef = session.operationRef<object | null>('nativeAdmissionReadOwner', () => null)
   const promptProjectionRevisionRef = session.prompt.revision
   const liveAudioSourceRef = session.audio.liveSource
   const liveAudioStartAbortRef = session.audio.startAbort
@@ -276,10 +299,11 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         timingRef.current.retireRequest()
       }
       canonicalTranscriptRef.current = snapshot.transcript
+      adoptUnsavedSnapshot(snapshot)
       snapshotSessionIdRef.current = snapshot.sessionId
       setMessages((current) => replaceCommittedTranscript(current, snapshot.transcript))
     }
-  }, [androidAssistantRef, canonicalTranscriptRef, composerEditRevisionRef, restoredDraftAnnouncementRef, setAndroidAssistant, setAndroidConversationId, setComposerValue, setMessages, setResponseAnnouncement, shortcutDraftRef, snapshotSessionIdRef, timingRef])
+  }, [adoptUnsavedSnapshot, androidAssistantRef, canonicalTranscriptRef, composerEditRevisionRef, restoredDraftAnnouncementRef, setAndroidAssistant, setAndroidConversationId, setComposerValue, setMessages, setResponseAnnouncement, shortcutDraftRef, snapshotSessionIdRef, timingRef])
   const ttsPersistedRevisionRef = session.preferences.tts.persistedRevision
   const ttsPersistedValueRef = session.preferences.tts.persisted
   const ttsPersistedInitializedRef = session.preferences.tts.initialized
@@ -339,18 +363,20 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
             // in flight. Reconcile A; a successor is never a new cancel target.
             const turn = canonical.transcript.find((item) => item.requestId === queriedRequest.requestId &&
               item.executionId.sessionId === executionId.sessionId && item.executionId.generation === executionId.generation)
+            const unsaved = canonical.unsavedResult?.requestId === queriedRequest.requestId && canonical.unsavedResult.executionId.sessionId === executionId.sessionId && canonical.unsavedResult.executionId.generation === executionId.generation ? canonical.unsavedResult : undefined
             const projection = promptRef.current
             if (projection?.nativeOwned && projection.id === queriedRequest.requestId &&
               projection.executionId?.sessionId === executionId.sessionId && projection.executionId.generation === executionId.generation) {
-              session.prompt.finishNative(projection.id, { requestId: projection.id, runtimePhase: canonical.runtimePhase,
-                outcome: turn === undefined ? 'cancelled' : 'completed', errorMessage: null,
-                ...(turn === undefined ? {} : { canonicalTurn: turn }) })
+              session.prompt.finishNative(projection.id, executionId, { requestId: projection.id, runtimePhase: canonical.runtimePhase,
+                outcome: turn === undefined && unsaved === undefined ? 'cancelled' : 'completed', errorMessage: null,
+                ...(turn === undefined ? {} : { canonicalTurn: turn }), ...(unsaved === undefined ? {} : { unsavedResult: unsaved, saveDisposition: 'unsaved' }) })
               return
             }
             if (projection !== null && canonical.sessionId !== selectedSession) return
             // B already attached through its native receipt: add only A's
             // committed turn and preserve B's existing presentation resources.
             const transcript = projection === null ? canonical.transcript : appendCanonicalTurn(history, turn)
+            if (projection === null) adoptUnsavedSnapshot(canonical)
             canonicalTranscriptRef.current = transcript
             if (projection === null) snapshotSessionIdRef.current = canonical.sessionId
             setMessages((messages) => [
@@ -405,6 +431,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       return
     }
     canonicalTranscriptRef.current = latest.transcript
+    adoptUnsavedSnapshot(latest)
     snapshotSessionIdRef.current = latest.sessionId
     if (androidDraftPendingRef.current !== null) persistAndroidDraftRef.current(composerValueRef.current)
     setMessages((current) => replaceCommittedTranscript(current, latest.transcript))
@@ -414,7 +441,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     }
     setPromptActivity(null)
     setPromptState('idle')
-  }, [androidDraftPendingRef, appActiveRef, canonicalTranscriptRef, composerValueRef, desktopObserverRef, desktopSnapshotRef, persistAndroidDraftRef, promptRef, publishRuntimeStatus, runtimeActivityRevisionRef, session, setMessages, setPromptActivity, setPromptState, snapshotRuntimeHydratedRef, snapshotSessionIdRef, supportsDesktopRuntime, transcriptRevisionRef])
+  }, [adoptUnsavedSnapshot, loadAppSnapshot, androidDraftPendingRef, appActiveRef, canonicalTranscriptRef, composerValueRef, desktopObserverRef, desktopSnapshotRef, persistAndroidDraftRef, promptRef, publishRuntimeStatus, runtimeActivityRevisionRef, session, setMessages, setPromptActivity, setPromptState, snapshotRuntimeHydratedRef, snapshotSessionIdRef, supportsDesktopRuntime, transcriptRevisionRef])
 
   const resetWakeConfidence = (): void => {
     setWakeConfidence(null)
@@ -454,7 +481,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     let active = true
     let unlisten: (() => void) | undefined
     void tauri.listen('completion-event', (event) => {
-      if (!active) return
+      if (!active || unsavedResultRef.current !== null) return
       try {
         const parsed = parseCompletionEvent(event.payload)
         if (parsed.source === 'typed') {
@@ -483,7 +510,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       } catch { return }
     }).then((cleanup) => active ? (unlisten = cleanup) : cleanup()).catch(() => undefined)
     return () => { active = false; unlisten?.() }
-  }, [completionLifecycleRef, latestTypedCompletionRef, partialTranscriptionRef, pendingVoiceCompletionRef, resetPendingRef, setTypedCompletionSuffix, setVoiceCompletionSuffix, supportsDesktopRuntime, transcriptRevisionRef])
+  }, [completionLifecycleRef, latestTypedCompletionRef, partialTranscriptionRef, pendingVoiceCompletionRef, resetPendingRef, setTypedCompletionSuffix, setVoiceCompletionSuffix, supportsDesktopRuntime, transcriptRevisionRef, unsavedResultRef])
 
   const clearPartialTranscript = useCallback((): void => {
     partialTranscriptionAllowedRef.current = false
@@ -614,6 +641,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   }, [assistantSettingsPendingRef, assistantSettingsRef, assistantSettingsWriteRevisionRef, initialSnapshotPreferencesRef, persistedAssistantSettingsRef, setAssistantSettings, setAssistantSettingsLoadError, setAssistantSettingsPending, setTtsEnabled, setUiTextSize, setUiTheme, ttsEnabledRef, ttsPendingRevisionRef, ttsPersistedInitializedRef, ttsPersistedRevisionRef, ttsPersistedValueRef, uiTextSizePendingRevisionRef, uiTextSizePersistedInitializedRef, uiTextSizePersistedRevisionRef, uiTextSizePersistedValueRef, uiThemePendingRevisionRef, uiThemePersistedInitializedRef, uiThemePersistedRevisionRef, uiThemePersistedValueRef])
 
   const adoptSnapshotControls = useCallback((snapshot: AppSnapshot, revision: number, preferenceRevision: number): boolean => {
+    // Availability/preferences reads never own canonical conversation or unsaved output.
     if (revision !== snapshotControlRequestRevisionRef.current) return false
     const acceptedSnapshot = isAndroidRuntime
       ? cacheAndroidSnapshot(snapshot, preferenceRevision)
@@ -715,6 +743,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         }
 
         canonicalTranscriptRef.current = snapshot.transcript
+        adoptUnsavedSnapshot(snapshot)
         const coldDraftPending = isAndroidRuntime && androidAssistantRef.current === null && androidDraftPendingRef.current !== null
         adoptAndroidConversation(snapshot, coldDraftPending ? -1 : composerRevision, false)
         const activeRequestMessage: ChatMessage[] = snapshot.activeRequest === null || supportsDesktopRuntime ? [] : [{
@@ -783,7 +812,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       active = false
       if (retryTimer !== null) window.clearTimeout(retryTimer)
     }
-  }, [adoptAndroidConversation, adoptSnapshotControls, androidAssistantRef, androidDraftPendingRef, canonicalTranscriptRef, composerEditRevisionRef, composerValueRef, desktopObserverRef, persistAndroidDraftRef, promptRef, recoverOrphanedRequest, resetPendingRef, runtimeActivityRevisionRef, setMessages, setPromptActivity, setPromptState, setSnapshotControlsFresh, setSnapshotControlsInvalidated, setSnapshotHydrationState, setTtsEnabled, snapshotControlRequestRevisionRef, snapshotControlsFreshRef, snapshotControlsInvalidatedRef, snapshotHydrationStateRef, snapshotRuntimeHydratedRef, snapshotSessionIdRef, startupStateRef, supportsDesktopRuntime, synchronizeHydratedRuntimeStatus, timingRef, transcriptRevisionRef, ttsEnabledRef, ttsPersistedInitializedRef, ttsPersistedValueRef, ttsWriteRevisionRef])
+  }, [adoptUnsavedSnapshot, loadAppSnapshot, adoptAndroidConversation, adoptSnapshotControls, androidAssistantRef, androidDraftPendingRef, canonicalTranscriptRef, composerEditRevisionRef, composerValueRef, desktopObserverRef, persistAndroidDraftRef, promptRef, recoverOrphanedRequest, resetPendingRef, runtimeActivityRevisionRef, setMessages, setPromptActivity, setPromptState, setSnapshotControlsFresh, setSnapshotControlsInvalidated, setSnapshotHydrationState, setTtsEnabled, snapshotControlRequestRevisionRef, snapshotControlsFreshRef, snapshotControlsInvalidatedRef, snapshotHydrationStateRef, snapshotRuntimeHydratedRef, snapshotSessionIdRef, startupStateRef, supportsDesktopRuntime, synchronizeHydratedRuntimeStatus, timingRef, transcriptRevisionRef, ttsEnabledRef, ttsPersistedInitializedRef, ttsPersistedValueRef, ttsWriteRevisionRef])
 
   useEffect(() => {
     if (!isAndroidRuntime) return undefined
@@ -841,7 +870,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       window.removeEventListener('focus', refreshControls)
       window.removeEventListener('pageshow', refreshControls)
     }
-  }, [adoptAndroidConversation, adoptRecoveredAndroidSelection, adoptSnapshotControls, androidDraftPendingRef, androidSelectionRecoveryRef, composerEditRevisionRef, composerValueRef, persistAndroidDraftRef, promptRef, refreshAndroidSnapshotControlsRef, resetPendingRef, setSnapshotControlsFresh, shortcutDraftRef, snapshotControlRequestRevisionRef, snapshotControlsFreshRef, snapshotHydrationStateRef, transcriptRevisionRef])
+  }, [loadAppSnapshot, adoptAndroidConversation, adoptRecoveredAndroidSelection, adoptSnapshotControls, androidDraftPendingRef, androidSelectionRecoveryRef, composerEditRevisionRef, composerValueRef, persistAndroidDraftRef, promptRef, refreshAndroidSnapshotControlsRef, resetPendingRef, setSnapshotControlsFresh, shortcutDraftRef, snapshotControlRequestRevisionRef, snapshotControlsFreshRef, snapshotHydrationStateRef, transcriptRevisionRef])
 
   useEffect(() => {
     if (isAndroidRuntime || isBrowserPreviewRuntime()) return undefined
@@ -916,7 +945,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       window.removeEventListener('pageshow', resumeStaleControls)
       document.removeEventListener('visibilitychange', resumeStaleControls)
     }
-  }, [adoptSnapshotControls, isSwitchingResponseProfileRef, observeDesktopStartupRef, promptRef, resetPendingRef,
+  }, [loadAppSnapshot, adoptSnapshotControls, isSwitchingResponseProfileRef, observeDesktopStartupRef, promptRef, resetPendingRef,
     runtimeActivityRevisionRef, runtimeStatusRef, session, setSnapshotControlsFresh, setSnapshotControlsInvalidated,
     snapshotCapabilitiesRef, snapshotControlRequestRevisionRef, snapshotControlsFreshRef, snapshotControlsInvalidatedRef,
     snapshotHydrationStateRef, snapshotResponseProfileRef, startupStateRef, synchronizeHydratedRuntimeStatus, transcriptRevisionRef])
@@ -1218,6 +1247,8 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     session.activate(() => {
       if (import.meta.env.VITE_VOXGOLEM_BENCHMARK === '1') reportAppBenchmarkStage('benchmark_lifetime_retire')
       timingRef.current.retireRequest()
+      pendingNativeAdmissionRef.current = null
+      nativeAdmissionReadOwnerRef.current = null
       const activePrompt = promptRef.current
       if (activePrompt !== null) {
         if (activePrompt.renderFrameId !== null) window.cancelAnimationFrame(activePrompt.renderFrameId)
@@ -1243,7 +1274,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       if (isBrowserPreviewRuntime()) teardownBrowserPreviewRuntime()
     })
     return () => session.dispose()
-  }, [completionLifecycleRef, latestTypedCompletionRef, liveAudioSessionIdRef, liveAudioSourceRef, liveAudioStartAbortRef, micAutoStartedRef, micStartInFlightRef, partialTranscriptionAllowedRef, partialTranscriptionRef, pendingVoiceCompletionRef, promptRef, session, supportsDesktopRuntime, timingRef])
+  }, [completionLifecycleRef, latestTypedCompletionRef, liveAudioSessionIdRef, liveAudioSourceRef, liveAudioStartAbortRef, micAutoStartedRef, micStartInFlightRef, nativeAdmissionReadOwnerRef, pendingNativeAdmissionRef, partialTranscriptionAllowedRef, partialTranscriptionRef, pendingVoiceCompletionRef, promptRef, session, supportsDesktopRuntime, timingRef])
 
   useEffect(() => {
     if (!supportsDesktopRuntime) return
@@ -1416,6 +1447,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     nativeRequestId?: string,
     nativeProjection?: NativePromptProjection,
   ): Promise<void> => {
+    if (unsavedResultRef.current !== null) return
     const admission = nativeProjection === undefined
       ? session.admitPrompt(prompt, source, nativeRequestId, updateRuntimeBlocked)
       : session.attachNativePrompt()
@@ -1619,15 +1651,40 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
           }
         }
       }
+      if (result.unsavedResult !== undefined) {
+        const unsaved = result.unsavedResult
+        if (unsaved.requestId !== requestId ||
+          (expectedCanonicalSessionId !== '0' && unsaved.executionId.sessionId !== expectedCanonicalSessionId) ||
+          (nativeProjection !== undefined && unsaved.executionId.generation !== nativeProjection.executionId.generation)) {
+          result = { requestId, runtimePhase: result.runtimePhase, outcome: 'error', errorMessage: 'The unsaved response did not match the active execution.' }
+        } else {
+          cancelPromptProjectionFrame(active)
+          active.terminal = true
+          setMessages((current) => current.filter((message) => message.id !== active.userId && message.id !== active.assistantId))
+          publishUnsavedResult(unsaved)
+          clearPartialTranscript()
+          clearCompletion()
+          promptRef.current = null
+          session.settlePromptAdmission(admission)
+          setPromptState('idle')
+          setPromptActivity(null)
+          setResponseAnnouncement('Answer not saved. Copy the answer or use New Chat before continuing.')
+          requestTiming.settle()
+          timingRef.current.retireRequest()
+          publishRuntimeStatus('sleeping', false)
+          return
+        }
+      }
       const acceptedCanonicalTurn = result.canonicalTurn !== undefined &&
         (nativeProjection === undefined || result.canonicalTurn.executionId.generation === nativeProjection.executionId.generation) && isExpectedCanonicalTurn(
         result.canonicalTurn,
         requestId,
         expectedCanonicalSessionId,
         priorCanonicalExecutions,
-        isAndroidRuntime,
+        true,
       ) ? result.canonicalTurn : undefined
       if (acceptedCanonicalTurn !== undefined) {
+        if (unsavedResultRef.current === null) publishUnsavedResult(null)
         requestTiming.canonicalAnswer(canonicalMessageId(acceptedCanonicalTurn.answer))
         const timings = requestTiming.received(acceptedCanonicalTurn.answer.content.text)
         if (isAndroidRuntime && timings !== undefined) active.customDirectTimings = timings
@@ -1695,7 +1752,10 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
           promptComposerRevision === composerEditRevisionRef.current &&
           inlineAssistant === androidAssistantRef.current && !resetPendingRef.current
         const snapshotControlRevision = acceptInline ? inlineControlRevision : ++snapshotControlRequestRevisionRef.current
-        if (acceptInline) requestTiming.reconciliation('inline')
+        if (acceptInline) {
+          requestTiming.reconciliation('inline')
+          snapshotDispositionRef.current.set(inline!, dispositionRevisionRef.current)
+        }
         const snapshotPreferenceRevision = acceptInline ? inlinePreferenceRevision : getAndroidPreferencePublicationRevision()
         let snapshot: Awaited<ReturnType<typeof loadAppSnapshot>> | null = acceptInline ? inline! : null
         if (acceptInline) reconciledRuntimeActivityRevision = inlineRuntimeRevision
@@ -1753,6 +1813,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
           setMessages((current) => replaceCommittedTranscript(current, transcript))
           canonicalTranscriptRef.current = transcript
           snapshotSessionIdRef.current = snapshot.sessionId
+          adoptUnsavedSnapshot(snapshot)
           reconciledRuntimePhase = snapshot.runtimePhase
         }
       }
@@ -1790,7 +1851,9 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
           ? 'error'
           : result.outcome
       const terminalText = reconciledTurn?.answer.content.text ?? active.text
-      setMessages((current) => current.map((message) => message.observation?.requestId === requestId ? {
+      const settledMessageIds = new Set([active.userId, active.assistantId,
+        ...(reconciledTurn === undefined ? [] : [canonicalMessageId(reconciledTurn.user), canonicalMessageId(reconciledTurn.answer)])])
+      setMessages((current) => current.map((message) => settledMessageIds.has(message.id) && message.observation?.requestId === requestId ? {
         ...message,
         observation: { requestId, outcome: effectiveOutcome, stageStatus: effectiveOutcome === 'completed' ? 'completed' : effectiveOutcome === 'error' ? 'failed' : 'cancelled',
           contentKind: message.role === 'assistant' ? effectiveOutcome === 'error' || terminalText.trim().length === 0 ? 'error' : message.contentKind ?? 'text' : 'text' },
@@ -1912,11 +1975,60 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     setPendingTtsCommands(speech.pending ? 1 : 0)
   }
   const projectNativePrompt = (prompt: NativePromptProjection): void => {
-    if (!appActiveRef.current || resetPendingRef.current || snapshotHydrationStateRef.current !== 'succeeded' || prompt.executionId.sessionId !== snapshotSessionIdRef.current) return
+    if (!appActiveRef.current || unsavedResultRef.current !== null || session.prompt.isNativeRetired(prompt) || resetPendingRef.current || snapshotHydrationStateRef.current !== 'succeeded') return
+    if (prompt.executionId.sessionId !== snapshotSessionIdRef.current) {
+      if (snapshotSessionIdRef.current !== '0' || promptRef.current !== null) return
+      const existing = pendingNativeAdmissionRef.current
+      if (existing !== null && existing.prompt.requestId === prompt.requestId && sameExecution(existing.prompt.executionId, prompt.executionId)) {
+        if (existing.prompt !== prompt) {
+          existing.prompt = prompt
+          existing.result = prompt.result ?? existing.result
+          existing.dirty = false
+        }
+      } else {
+        pendingNativeAdmissionRef.current = { prompt, result: prompt.result, dirty: false }
+      }
+      if (nativeAdmissionReadOwnerRef.current !== null) return
+      const pending = pendingNativeAdmissionRef.current!
+      const readOwner = {}
+      nativeAdmissionReadOwnerRef.current = readOwner
+      // Native preparation, not the observer hint, chooses the first durable
+      // conversation. Verify that admission through canonical state before attaching.
+      const lifetime = session.captureLifetime()
+      const context = transcriptRevisionRef.current
+      const readRevision = ++desktopCanonicalReadRef.current
+      void loadAppSnapshot().then((canonical) => {
+        if (!lifetime() || nativeAdmissionReadOwnerRef.current !== readOwner || pendingNativeAdmissionRef.current !== pending || readRevision !== desktopCanonicalReadRef.current || context !== transcriptRevisionRef.current || resetPendingRef.current || snapshotSessionIdRef.current !== '0' || promptRef.current !== null || canonical.sessionId !== prompt.executionId.sessionId) return
+        const active = canonical.activeRequest
+        const unsaved = canonical.unsavedResult
+        const admitted = active?.requestId === prompt.requestId && sameExecution(active.executionId, prompt.executionId)
+        // A correlated native terminal may already have retired admission (errors
+        // and cancellation have no canonical answer). Its newly read context must still match.
+        const retired = pending.result !== null || (unsaved?.requestId === prompt.requestId && sameExecution(unsaved.executionId, prompt.executionId)) || canonical.transcript.some((turn) => turn.requestId === prompt.requestId && sameExecution(turn.executionId, prompt.executionId))
+        if (!admitted && !retired) { pendingNativeAdmissionRef.current = null; return }
+        snapshotSessionIdRef.current = canonical.sessionId
+        canonicalTranscriptRef.current = canonical.transcript
+        setMessages((current) => replaceCommittedTranscript(current, canonical.transcript))
+        adoptUnsavedSnapshot(canonical)
+        pendingNativeAdmissionRef.current = null
+        if (pending.result !== null) projectNativePrompt({ ...pending.prompt, result: pending.result })
+        else if (pending.dirty) void desktopObserverRef.current?.observer.refresh().catch(() => undefined)
+        else if (admitted) projectNativePrompt(pending.prompt)
+      }).catch(() => {
+        if (lifetime() && nativeAdmissionReadOwnerRef.current === readOwner && pendingNativeAdmissionRef.current === pending) pendingNativeAdmissionRef.current = null
+      }).finally(() => {
+        if (nativeAdmissionReadOwnerRef.current !== readOwner) return
+        nativeAdmissionReadOwnerRef.current = null
+        if (!lifetime()) return
+        const successor = pendingNativeAdmissionRef.current
+        if (successor !== null && successor !== pending) projectNativePrompt(successor.prompt)
+      })
+      return
+    }
     if (canonicalTranscriptRef.current.some((turn) => turn.executionId.sessionId === prompt.executionId.sessionId && turn.executionId.generation === prompt.executionId.generation)) return
     const active = promptRef.current
     if (active !== null) {
-      if (!active.nativeOwned || active.id !== prompt.requestId || active.terminal) return
+      if (!active.nativeOwned || active.id !== prompt.requestId || active.executionId?.sessionId !== prompt.executionId.sessionId || active.executionId.generation !== prompt.executionId.generation || active.terminal) return
       session.prompt.replaceNative(prompt)
       session.flushPromptProjection(active)
     } else {
@@ -1930,7 +2042,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     if (resetPendingRef.current || snapshotHydrationStateRef.current !== 'succeeded') return
     if (snapshot.prompt !== null) {
       projectNativePrompt(snapshot.prompt)
-      if (promptRef.current === null || promptRef.current.id === snapshot.prompt.requestId) return
+      if (promptRef.current === null || (promptRef.current.id === snapshot.prompt.requestId && promptRef.current.executionId?.sessionId === snapshot.prompt.executionId.sessionId && promptRef.current.executionId.generation === snapshot.prompt.executionId.generation)) return
     }
     // The bounded native projection may already have retired while detached.
     // Recover committed history through its existing canonical parser/owner.
@@ -1945,9 +2057,11 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       if (!lifetime() || readRevision !== desktopCanonicalReadRef.current || history !== canonicalTranscriptRef.current || resetPendingRef.current || context !== transcriptRevisionRef.current || promptRef.current !== active || canonical.sessionId !== snapshotSessionIdRef.current) return
       if (active !== null) {
         const turn = canonical.transcript.find((turn) => turn.requestId === active.id && turn.executionId.sessionId === active.executionId?.sessionId && turn.executionId.generation === active.executionId.generation)
-        if (canonical.activeRequest?.requestId === active.id) return
-        session.prompt.finishNative(active.id, { requestId: active.id, outcome: turn === undefined ? 'cancelled' : 'completed', errorMessage: null, runtimePhase: canonical.runtimePhase, ...(turn === undefined ? {} : { canonicalTurn: turn }) })
+        const unsaved = canonical.unsavedResult?.requestId === active.id && canonical.unsavedResult.executionId.sessionId === active.executionId?.sessionId && canonical.unsavedResult.executionId.generation === active.executionId.generation ? canonical.unsavedResult : undefined
+        if (canonical.activeRequest?.requestId === active.id && canonical.activeRequest.executionId.sessionId === active.executionId?.sessionId && canonical.activeRequest.executionId.generation === active.executionId.generation) return
+        if (active.executionId !== undefined) session.prompt.finishNative(active.id, active.executionId, { requestId: active.id, outcome: turn === undefined && unsaved === undefined ? 'cancelled' : 'completed', errorMessage: null, runtimePhase: canonical.runtimePhase, ...(turn === undefined ? {} : { canonicalTurn: turn }), ...(unsaved === undefined ? {} : { unsavedResult: unsaved, saveDisposition: 'unsaved' }) })
       } else if (canonical.activeRequest === null) {
+        adoptUnsavedSnapshot(canonical)
         canonicalTranscriptRef.current = canonical.transcript
         setMessages((current) => replaceCommittedTranscript(current, canonical.transcript))
       }
@@ -1959,8 +2073,18 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       case 'voice': projectDesktopVoice(event.voice, event.revision); break
       case 'speech': projectDesktopSpeech(event.speech); break
       case 'prompt_started': projectNativePrompt(event.prompt); break
-      case 'prompt_update': session.prompt.updateNative(event.requestId, event.update); break
-      case 'prompt_finished': session.prompt.finishNative(event.requestId, event.result); break
+      case 'prompt_update': {
+        const pending = pendingNativeAdmissionRef.current
+        if (pending?.prompt.requestId === event.requestId && sameExecution(pending.prompt.executionId, event.executionId)) pending.dirty = true
+        session.prompt.updateNative(event.requestId, event.executionId, event.update)
+        break
+      }
+      case 'prompt_finished': {
+        const pending = pendingNativeAdmissionRef.current
+        if (pending?.prompt.requestId === event.requestId && sameExecution(pending.prompt.executionId, event.executionId)) pending.result = event.result
+        session.prompt.finishNative(event.requestId, event.executionId, event.result)
+        break
+      }
     }
   }
 
@@ -2447,8 +2571,13 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     const lifetime = session.captureLifetime()
     const appActiveRef = { get current() { return lifetime() } }
     if (resetPendingRef.current) return
+    const unresolvedBeforeReset = unsavedResultRef.current
+    pendingNativeAdmissionRef.current = null
+    nativeAdmissionReadOwnerRef.current = null
+    // User consent targets this execution, not whatever exists after draft writes settle.
+    const discardTarget = unresolvedBeforeReset === null ? null : { ...unresolvedBeforeReset.executionId }
     if (isAndroidRuntime) androidVoiceStopRef.current?.()
-    if (shortcutDraftRef.current?.needsNew === true && composerValueRef.current.trim() !== '' && androidSelectionRecoveryRef.current === null) {
+    if (unresolvedBeforeReset === null && shortcutDraftRef.current?.needsNew === true && composerValueRef.current.trim() !== '' && androidSelectionRecoveryRef.current === null) {
       try { await prepareShortcutConversation(shortcutDraftRef.current.oldDraft, () => appActiveRef.current) }
       catch (error) { addNotice({ tone: 'error', title: 'Voice draft preservation failed', message: toDisplayErrorMessage(error) }); return }
     }
@@ -2464,6 +2593,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     const resetRuntimeActivityRevision = runtimeActivityRevisionRef.current
     const activePrompt = promptRef.current
     let resetDraftRevision = composerEditRevisionRef.current
+    let freshContextSelected = false
     clearPartialTranscript()
     clearCompletion()
     setResponseAnnouncement('')
@@ -2502,7 +2632,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       try {
         await invokeTauriCommand('cancel_prompt', { requestId: activePrompt.id })
       } catch {
-        // reset_session remains authoritative for backend prompt settlement.
+        // The selected native command remains authoritative for prompt settlement.
       }
       if (!appActiveRef.current) return
     }
@@ -2513,9 +2643,23 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       await androidDraftWriteChainRef.current
       resetDraftRevision = composerEditRevisionRef.current
       if (androidSelectionRecoveryRef.current !== null) androidSelectionRecoveryRef.current = { transcriptRevision, composerRevision: resetDraftRevision }
-      await invokeTauriCommand('reset_session', isAndroidRuntime ? { draft: composerValueRef.current } : undefined)
-      if (appActiveRef.current) timingRef.current.retireRequest()
+      if (discardTarget === null) {
+        await invokeTauriCommand('reset_session', isAndroidRuntime ? { draft: composerValueRef.current } : undefined)
+      } else {
+        await invokeTauriCommand('discard_unsaved_and_new_chat', {
+          executionId: { session_id: discardTarget.sessionId, generation: discardTarget.generation },
+        })
+      }
+      freshContextSelected = true
       if (!appActiveRef.current) return
+      const unresolvedNow = unsavedResultRef.current
+      if (unresolvedNow !== null && (discardTarget === null || !sameExecution(unresolvedNow.executionId, discardTarget))) {
+        setPromptActivity(null)
+        setPromptState('idle')
+        return
+      }
+      timingRef.current.retireRequest()
+      if (discardTarget !== null) publishUnsavedResult(null)
       if (isAndroidRuntime && composerEditRevisionRef.current === resetDraftRevision) {
         androidDraftPendingRef.current = null
         androidDraftWriteFailureRef.current = null
@@ -2547,6 +2691,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         snapshotHydrationStateRef.current = 'succeeded'
         setSnapshotHydrationState('succeeded')
         canonicalTranscriptRef.current = resetSnapshot.transcript
+        adoptUnsavedSnapshot(resetSnapshot)
         snapshotSessionIdRef.current = resetSnapshot.sessionId
         adoptSnapshotControls(resetSnapshot, snapshotControlRevision, snapshotPreferenceRevision)
         adoptAndroidConversation(resetSnapshot, resetDraftRevision, false)
@@ -2561,6 +2706,13 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       }
     } catch (error) {
       addNotice({ tone: 'error', title: 'New chat failed', message: toDisplayErrorMessage(error) })
+      if (unresolvedBeforeReset !== null && !freshContextSelected) {
+        // Only a successful native fresh-context selection resolves this output.
+        // Recovery reads must not reinterpret a failed reset as a discard.
+        setPromptActivity(null)
+        setPromptState('idle')
+        return
+      }
       setPromptActivity({ text: 'Recovering session state…', compact: true })
       let snapshot: AppSnapshot | null = null
       let recoveryRuntimeActivityRevision: number | null = null
@@ -2586,6 +2738,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         snapshotHydrationStateRef.current = 'succeeded'
         setSnapshotHydrationState('succeeded')
         canonicalTranscriptRef.current = snapshot.transcript
+        adoptUnsavedSnapshot(snapshot)
         snapshotSessionIdRef.current = snapshot.sessionId
         adoptSnapshotControls(snapshot, snapshotControlRevision, snapshotPreferenceRevision)
         adoptAndroidConversation(snapshot, -1, false)
@@ -2623,6 +2776,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
   }
 
   const selectAndroidConversation = async (command: 'select_conversation' | 'select_conversation_head', id: string): Promise<void> => {
+    if (unsavedResultRef.current !== null) return
     const lifetime = session.captureLifetime()
     const appActiveRef = { get current() { return lifetime() } }
     if (!isAndroidRuntime || shortcutDraftRef.current?.needsNew === true || resetPendingRef.current || androidSelectionRecoveryRef.current !== null || promptRef.current !== null || androidVoiceActive || headPagePending || !snapshotControlsFreshRef.current) return
@@ -2635,8 +2789,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     try {
       await androidDraftWriteChainRef.current
       if (androidDraftWriteFailureRef.current !== null) throw androidDraftWriteFailureRef.current
-      const result = await invokeTauriCommand(command, command === 'select_conversation' ? { conversationId: id } : { headId: id })
-      const snapshot = parseAppSnapshot(result)
+      const snapshot = await readCanonicalSnapshot(async () => parseAppSnapshot(await invokeTauriCommand(command, command === 'select_conversation' ? { conversationId: id } : { headId: id })))
       if (!appActiveRef.current || transcriptRevision !== transcriptRevisionRef.current) return
       adoptSnapshotControls(snapshot, controlRevision, preferenceRevision)
       adoptAndroidConversation(snapshot, composerRevision, true)
@@ -2696,7 +2849,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         (androidAssistantRef.current?.branchChoices.length ?? 0) === 0 &&
         !['saved_local_state_failed', 'draft_not_saved', 'storage_error'].includes(androidAssistantRef.current?.error ?? '')
     }
-    const captureAvailable = (): boolean => !['saved_local_state_failed', 'draft_not_saved', 'storage_error', 'corrupt_store'].includes(androidAssistantRef.current?.error ?? '') &&
+    const captureAvailable = (): boolean => unsavedResultRef.current === null && !['saved_local_state_failed', 'draft_not_saved', 'storage_error', 'corrupt_store'].includes(androidAssistantRef.current?.error ?? '') &&
       (androidAssistantRef.current?.branchChoices.length ?? 0) === 0 &&
       (completionPolicy === 'manual' || generationAvailable())
     if (!isAndroidRuntime || !captureAvailable() || updateRuntimeBlocked || resetPendingRef.current || promptRef.current !== null || androidVoiceActiveRef.current || androidSelectionRecoveryRef.current !== null || !snapshotControlsFreshRef.current || assistantSettingsPendingRef.current || shortcutDraftRef.current?.needsNew === true) throw new Error('Voice chat is busy; existing work was preserved')
@@ -2710,6 +2863,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     return composerValueRef.current
   }
   async function prepareShortcutConversation(oldDraft: string, isCurrent: () => boolean): Promise<void> {
+    if (unsavedResultRef.current !== null) throw new Error('Answer not saved. Copy the answer or use New Chat before continuing.')
     const shortcut = shortcutDraftRef.current
     if (shortcut === null || !shortcut.needsNew) return
     if (shortcut.prepare !== null) return shortcut.prepare
@@ -2720,7 +2874,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
       const controlRevision = ++snapshotControlRequestRevisionRef.current
       const preferenceRevision = getAndroidPreferencePublicationRevision()
       try {
-        const snapshot = parseAppSnapshot(await invokeTauriCommand('reset_session', { draft: oldDraft }))
+        const snapshot = await readCanonicalSnapshot(async () => parseAppSnapshot(await invokeTauriCommand('reset_session', { draft: oldDraft })))
         if (!appActiveRef.current || !isCurrent() || shortcutDraftRef.current !== shortcut || transcriptRevision !== transcriptRevisionRef.current || controlRevision !== snapshotControlRequestRevisionRef.current) throw new Error('Voice draft interrupted; canonical recovery is required before sending')
         if (!isConfirmedNewVoiceContext(snapshot, shortcut.oldSession)) throw new Error('New voice chat context was not confirmed empty')
         if (!adoptSnapshotControls(snapshot, controlRevision, preferenceRevision)) throw new Error('New voice chat context became stale')
@@ -2789,7 +2943,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     if (nextValue.length === 0) {
       latestTypedCompletionRef.current = null
       void invokeTauriCommand('clear_completion').catch(() => undefined)
-    } else if (assistantSettingsRef.current.completion && !assistantSettingsPendingRef.current &&
+    } else if (unsavedResultRef.current === null && assistantSettingsRef.current.completion && !assistantSettingsPendingRef.current &&
       startupStateRef.current.kind === 'ready' && capabilityIsAvailable(startupStateRef.current, 'qwen_prediction')) {
       const pending = { revision, lifecycle: completionLifecycleRef.current }
       latestTypedCompletionRef.current = pending
@@ -2981,7 +3135,7 @@ function findNewTurnForRequest(
   for (let index = transcript.length - 1; index >= 0; index -= 1) {
     const turn = transcript[index]
     if (
-      turn !== undefined && isExpectedCanonicalTurn(turn, requestId, expectedSessionId, priorExecutions, isAndroidRuntime)
+      turn !== undefined && isExpectedCanonicalTurn(turn, requestId, expectedSessionId, priorExecutions, true)
     ) {
       return turn
     }

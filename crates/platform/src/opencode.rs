@@ -686,41 +686,6 @@ impl OpencodeServer {
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
-    pub async fn reset(&mut self) -> Result<(), OpencodeServerError> {
-        self.reset_with_deadlines(
-            tokio::time::Instant::now() + self.request_timeout,
-            self.request_timeout,
-        )
-        .await
-    }
-
-    pub async fn reset_with_deadlines(
-        &mut self,
-        deadline: tokio::time::Instant,
-        cleanup_timeout: Duration,
-    ) -> Result<(), OpencodeServerError> {
-        let old_client = self.client();
-        let new_session_id = create_session_before_deadline(
-            &self.client,
-            &self.base_url,
-            &self.password,
-            self.request_timeout,
-            deadline,
-        )
-        .await?;
-        self.session_id = new_session_id;
-
-        let abort_result = tokio::time::timeout(cleanup_timeout, old_client.abort()).await;
-        let delete_result = tokio::time::timeout(cleanup_timeout, old_client.delete()).await;
-
-        match abort_result {
-            Ok(Ok(())) => delete_result
-                .unwrap_or(Err(OpencodeServerError::RequestTimeout))
-                .map(|_| ()),
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err(OpencodeServerError::RequestTimeout),
-        }
-    }
     pub async fn shutdown(mut self) -> Result<(), OpencodeServerError> {
         let client = self.client();
         let _ = tokio::time::timeout(Duration::from_secs(3), async {
@@ -1845,9 +1810,9 @@ mod tests {
     use super::{
         prompt_body, run_opencode, run_opencode_json, server_command, startup_health_probe_timeout,
         OpencodeCommandSpec, OpencodeEvent, OpencodeJsonEvent, OpencodeJsonRunError, OpencodeModel,
-        OpencodeOutputFormat, OpencodePrompt, OpencodePromptError, OpencodeServer,
-        OpencodeServerConfig, OpencodeServerError, OpencodeSseDecoder, OpencodeToolPolicy,
-        OpencodeToolStatus, OpencodeToolUseStatus, MAX_TRACKED_PART_BYTES,
+        OpencodeOutputFormat, OpencodePrompt, OpencodePromptError, OpencodeServerConfig,
+        OpencodeServerError, OpencodeSseDecoder, OpencodeToolPolicy, OpencodeToolStatus,
+        OpencodeToolUseStatus, MAX_TRACKED_PART_BYTES,
     };
     use std::ffi::OsStr;
     use std::fs;
@@ -1859,8 +1824,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
 
     static TEMP_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -2422,125 +2385,6 @@ mod tests {
             b"data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"type\":\"text\",\"sessionID\":\"ses_other\"},\"delta\":\"wrong\"}}\n\n",
         );
         assert!(events.is_empty());
-    }
-
-    async fn fake_reset_server(
-        abort_delay: Duration,
-        delete_delay: Duration,
-    ) -> (
-        String,
-        tokio::sync::oneshot::Receiver<()>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("fake server should bind");
-        let address = listener
-            .local_addr()
-            .expect("fake server should expose its address");
-        let (abort_tx, abort_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            tokio::time::timeout(Duration::from_secs(5), async move {
-                let mut abort_tx = Some(abort_tx);
-                for _ in 0..3 {
-                    let (mut stream, _) = listener.accept().await.expect("request should connect");
-                    let mut request = Vec::new();
-                    let mut chunk = [0; 1024];
-                    loop {
-                        let count =
-                            tokio::time::timeout(Duration::from_secs(2), stream.read(&mut chunk))
-                                .await
-                                .expect("reset fixture read deadline")
-                                .expect("request should be readable");
-                        if count == 0 {
-                            panic!("EOF before reset request headers");
-                        }
-                        request.extend_from_slice(&chunk[..count]);
-                        assert!(request.len() < 16 * 1024);
-                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                            break;
-                        }
-                    }
-                    let request = String::from_utf8_lossy(&request);
-                    let (delay, body) = if request.contains("POST /session/") {
-                        if let Some(tx) = abort_tx.take() {
-                            let _ = tx.send(());
-                        }
-                        (abort_delay, "true")
-                    } else if request.contains("DELETE /session/") {
-                        (delete_delay, "true")
-                    } else {
-                        (Duration::ZERO, "{\"id\":\"ses_new\"}")
-                    };
-                    tokio::time::sleep(delay).await;
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                }
-            })
-            .await
-            .expect("reset fixture accept/response deadline");
-        });
-        (format!("http://{address}"), abort_rx, server)
-    }
-
-    #[tokio::test]
-    async fn reset_installs_replacement_before_independently_bounded_cleanup() {
-        let (base_url, _abort_seen, server) =
-            fake_reset_server(Duration::from_millis(100), Duration::from_millis(100)).await;
-        let mut client = OpencodeServer {
-            client: reqwest::Client::new(),
-            base_url,
-            session_id: "ses_old".into(),
-            password: "password".into(),
-            request_timeout: Duration::from_secs(1),
-            process: None,
-        };
-
-        let result = client
-            .reset_with_deadlines(
-                tokio::time::Instant::now() + Duration::from_secs(1),
-                Duration::from_millis(10),
-            )
-            .await;
-
-        assert_eq!(client.session_id(), "ses_new");
-        assert!(matches!(result, Err(OpencodeServerError::RequestTimeout)));
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[tokio::test]
-    async fn reset_cancellation_after_installation_retains_replacement() {
-        let (base_url, abort_seen, server) =
-            fake_reset_server(Duration::from_secs(10), Duration::ZERO).await;
-        let mut client = OpencodeServer {
-            client: reqwest::Client::new(),
-            base_url,
-            session_id: "ses_old".into(),
-            password: "password".into(),
-            request_timeout: Duration::from_secs(1),
-            process: None,
-        };
-
-        {
-            let reset = client.reset_with_deadlines(
-                tokio::time::Instant::now() + Duration::from_secs(1),
-                Duration::from_secs(1),
-            );
-            tokio::pin!(reset);
-            tokio::select! {
-                _ = &mut reset => panic!("cleanup should still be stalled"),
-                ack = tokio::time::timeout(Duration::from_secs(3), abort_seen) => { ack.expect("abort phase deadline").expect("abort phase acknowledgement"); }
-            }
-        }
-
-        assert_eq!(client.session_id(), "ses_new");
-        server.abort();
-        let _ = server.await;
     }
 
     #[test]

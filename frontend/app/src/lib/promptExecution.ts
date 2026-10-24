@@ -1,5 +1,5 @@
 import { TauriCommandError, getTauriInternals, isAndroidRuntime, isBrowserPreviewRuntime, normalizeTauriError } from './tauri'
-import { parseAppSnapshot, parseCanonicalTurn } from './appSnapshot'
+import { parseAppSnapshot, parseCanonicalTurn, parseUnsavedResult } from './appSnapshot'
 import { isRecord, parseRuntimePhase, utf8ByteLength } from './wire'
 import { MAX_ANSWER_SOURCES, isSourceLink } from './answerSources'
 import type {
@@ -55,12 +55,27 @@ export function parseAndroidPromptUpdate(payload: unknown, requestId: string): P
 }
 
 export function parseAndroidPromptOutcome(payload: unknown, requestId: string): PromptExecutionResult {
-  if (!isRecord(payload) || (payload['kind'] !== 'completed' && payload['kind'] !== 'refused' && payload['kind'] !== 'cancelled')) throw new Error('Android prompt outcome is invalid')
+  if (requestId.length === 0 || utf8ByteLength(requestId) > 128) throw new Error('Prompt request ID must be bounded')
+  if (!isRecord(payload) || !['completed', 'refused', 'cancelled', 'unsaved', 'error'].includes(payload['kind'] as string)) throw new Error('Canonical prompt outcome is invalid')
+  if (payload['kind'] === 'error') {
+    if (['turn', 'save_disposition', 'unsaved_result'].some((key) => Object.hasOwn(payload, key))) throw new Error('Error prompt outcome must be content-free')
+    if (payload['request_id'] !== requestId) throw new Error('Error prompt outcome request ID did not match the active request')
+    const message = payload['error_message']
+    if (typeof message !== 'string' || message.trim().length === 0 || utf8ByteLength(message) > 4096) throw new Error('Error prompt outcome must contain a bounded error message')
+    return { requestId, runtimePhase: parseRuntimePhase(payload['runtime_phase'], 'Prompt runtime_phase'), outcome: 'error', errorMessage: message }
+  }
   if (payload['kind'] === 'cancelled') {
-    if (Object.prototype.hasOwnProperty.call(payload, 'turn')) throw new Error('Cancelled Android prompt outcome must not include a turn')
+    if (['turn', 'save_disposition', 'unsaved_result'].some((key) => Object.hasOwn(payload, key))) throw new Error('Cancelled prompt outcome must be content-free')
     return { requestId, runtimePhase: 'sleeping', outcome: 'cancelled', errorMessage: null, canonicalOutcome: 'cancelled' }
   }
-  const turn = parseCanonicalTurn(payload['turn'], true)
+  if (payload['kind'] === 'unsaved') {
+    if (payload['save_disposition'] !== 'unsaved' || Object.hasOwn(payload, 'turn')) throw new Error('Unsaved outcome must have unsaved disposition and no turn')
+    const unsavedResult = parseUnsavedResult(payload['unsaved_result'])
+    if (unsavedResult.requestId !== requestId) throw new Error('Unsaved outcome request ID did not match the active request')
+    return { requestId, runtimePhase: 'sleeping', outcome: 'completed', errorMessage: null, canonicalOutcome: 'unsaved', saveDisposition: 'unsaved', unsavedResult }
+  }
+  if (payload['save_disposition'] !== 'saved' || Object.hasOwn(payload, 'unsaved_result')) throw new Error('Saved outcome must have saved disposition and no unsaved result')
+  const turn = parseCanonicalTurn(payload['turn'])
   if (turn.requestId !== requestId) throw new Error('Android prompt outcome request ID did not match the active request')
   if (payload['kind'] === 'completed' && turn.answer.content.kind !== 'text') throw new Error('Completed Android prompt outcome must contain a text answer')
   if (payload['kind'] === 'refused' && turn.answer.content.kind !== 'refusal') throw new Error('Refused Android prompt outcome must contain a refusal answer')
@@ -77,11 +92,11 @@ export function parseAndroidPromptOutcome(payload: unknown, requestId: string): 
   }
   let terminalSnapshot: import('./appSnapshot').AppSnapshot | undefined
   if (payload['app_snapshot'] !== undefined && payload['app_snapshot'] !== null) {
-    try { terminalSnapshot = parseAppSnapshot(payload['app_snapshot'], true) } catch {
+    try { terminalSnapshot = parseAppSnapshot(payload['app_snapshot']) } catch {
       // Optional projection evidence cannot invalidate an otherwise committed turn.
     }
   }
-  return { requestId, runtimePhase: 'sleeping', outcome: 'completed', errorMessage: null, canonicalOutcome: payload['kind'], canonicalTurn: turn, ...(terminalSnapshot === undefined ? {} : { terminalSnapshot }), ...(customDirectTimings === undefined ? {} : { customDirectTimings }) }
+  return { requestId, runtimePhase: 'sleeping', outcome: 'completed', errorMessage: null, canonicalOutcome: payload['kind'] as 'completed' | 'refused', saveDisposition: 'saved', canonicalTurn: turn, ...(terminalSnapshot === undefined ? {} : { terminalSnapshot }), ...(customDirectTimings === undefined ? {} : { customDirectTimings }) }
 }
 
 export const parseCanonicalPromptOutcome = parseAndroidPromptOutcome
@@ -103,7 +118,7 @@ export function parsePromptExecutionEvent(payload: unknown): PromptExecutionEven
 
   const requestId = payload['request_id']
   const kind = payload['kind']
-  if (typeof requestId !== 'string' || requestId.length === 0 || utf8ByteLength(requestId) > 512 || typeof kind !== 'string') {
+  if (typeof requestId !== 'string' || requestId.length === 0 || utf8ByteLength(requestId) > 128 || typeof kind !== 'string') {
     throw new Error('Prompt execution event must include request_id and kind')
   }
   for (const key of ['text', 'correction', 'message', 'detail', 'tool']) {
@@ -190,28 +205,6 @@ export function parsePromptExecutionEvent(payload: unknown): PromptExecutionEven
   throw new Error('Prompt execution event contains an unsupported kind')
 }
 
-export function parsePromptExecutionResult(payload: unknown): PromptExecutionResult {
-  if (!isRecord(payload)) {
-    throw new Error('Prompt execution result must be an object')
-  }
-  const requestId = payload['request_id']
-  const outcome = payload['outcome']
-  const errorMessage = payload['error_message']
-  if (
-    typeof requestId !== 'string' ||
-    (outcome !== 'completed' && outcome !== 'cancelled' && outcome !== 'error') ||
-    (errorMessage !== undefined && errorMessage !== null && typeof errorMessage !== 'string')
-  ) {
-    throw new Error('Prompt execution result must include request_id and outcome')
-  }
-  return {
-    requestId,
-    runtimePhase: parseRuntimePhase(payload['runtime_phase'], 'Prompt runtime_phase'),
-    outcome,
-    errorMessage: typeof errorMessage === 'string' ? errorMessage : null,
-  }
-}
-
 export async function executePrompt(
   requestId: string,
   prompt: string,
@@ -247,10 +240,8 @@ export async function executePrompt(
     let result: PromptExecutionResult
     if (canonicalRuntime) {
       result = parseAndroidPromptOutcomeForExecution(payload, requestId)
-    } else if (isRecord(payload) && typeof payload['kind'] === 'string' && ['completed', 'refused', 'cancelled'].includes(payload['kind'])) {
-      result = parseCanonicalPromptOutcome(payload, requestId)
     } else {
-      result = parsePromptExecutionResult(payload)
+      result = parseCanonicalPromptOutcome(payload, requestId)
     }
     if (result.requestId !== requestId) {
       throw new Error('Prompt response request ID did not match the active request')

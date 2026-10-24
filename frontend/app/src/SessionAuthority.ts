@@ -59,6 +59,7 @@ export interface RuntimeProjection {
 }
 
 export interface ConversationInteraction {
+  readonly unsavedResult: import('./lib/appSnapshot').UnsavedResult | null
   readonly composerValue: string
   readonly shortcutStaging: boolean
   readonly androidAssistant: AndroidAssistantProjection | null
@@ -159,7 +160,7 @@ function sameStartupPresentation(prior: StartupState, next: StartupState): boole
 
 const VIEW_KEYS = {
   shell: ['uiTextSize', 'uiTheme', 'runtimeStatus'],
-  conversation: ['voiceNotesOpen', 'shortcutStaging', 'composerValue', 'uiTextSize', 'notices'],
+  conversation: ['voiceNotesOpen', 'shortcutStaging', 'composerValue', 'uiTextSize', 'notices', 'unsavedResult'],
   runtime: ['desktopRuntimeReady', 'startupState', 'runtimeStatus', 'assistantSettings', 'assistantSettingsPending',
     'assistantSettingsLoadError', 'assistantSettingsWriteError', 'uiThemeWriteError',
     'snapshotHydrationState', 'snapshotControlsFresh', 'snapshotControlsInvalidated', 'snapshotModelOptions',
@@ -168,15 +169,15 @@ const VIEW_KEYS = {
     'androidConversationId', 'conversationPagePending', 'headPagePending', 'androidVoiceActive',
     'androidVoiceStatus', 'androidSpeechStatusError', 'ttsPlaying', 'pendingTtsCommands',
     'isSwitchingResponseProfile', 'micStarting', 'micActive', 'voiceNotesOpen',
-    'notices', 'noticeInteraction', 'promptActivity', 'promptState', 'resetPending'],
+    'notices', 'noticeInteraction', 'promptActivity', 'promptState', 'resetPending', 'unsavedResult'],
   toolbar: ['startupState', 'runtimeStatus', 'assistantSettings', 'assistantSettingsPending',
     'snapshotHydrationState', 'snapshotControlsFresh', 'snapshotControlsInvalidated', 'snapshotModelOptions',
     'androidAssistant', 'androidConversationId', 'androidVoiceActive',
-    'voiceNotesOpen', 'promptState', 'promptActivity', 'resetPending', 'isSwitchingResponseProfile',
+    'voiceNotesOpen', 'promptState', 'promptActivity', 'resetPending', 'unsavedResult', 'isSwitchingResponseProfile',
     'micStarting', 'micActive', 'headPagePending', 'shortcutStaging', 'uiTheme', 'ttsEnabled', 'ttsPlaying'],
   composer: ['startupState', 'runtimeStatus', 'assistantSettings', 'assistantSettingsPending',
     'assistantSettingsLoadError', 'snapshotControlsFresh', 'snapshotModelOptions',
-    'composerValue', 'partialTranscript', 'typedCompletionSuffix', 'voiceCompletionSuffix',
+    'composerValue', 'partialTranscript', 'typedCompletionSuffix', 'voiceCompletionSuffix', 'unsavedResult',
     'androidAssistant', 'androidVoiceActive', 'conversationPagePending', 'headPagePending', 'voiceNotesOpen',
     'promptState', 'promptActivity', 'resetPending', 'micStarting', 'micActive', 'shortcutStaging',
     'uiTextSize', 'wakeConfidence', 'isSwitchingResponseProfile', 'snapshotControlsInvalidated'],
@@ -234,7 +235,7 @@ export class SessionAuthority {
         audioInputDeviceId, audioInputDevices: [],
       },
       conversationInteraction: {
-        composerValue: '', shortcutStaging: false, androidAssistant: null, androidConversationId: '0',
+        composerValue: '', shortcutStaging: false, androidAssistant: null, androidConversationId: '0', unsavedResult: null,
         conversationPagePending: false, headPagePending: false, androidVoiceActive: false,
         androidVoiceStatus: null, androidSpeechStatusError: null, partialTranscript: '',
         typedCompletionSuffix: '', voiceCompletionSuffix: '', ttsPlaying: false, pendingTtsCommands: 0,

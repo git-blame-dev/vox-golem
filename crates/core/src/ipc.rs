@@ -248,9 +248,8 @@ impl UnsavedResult {
         final_stage: Stage,
         reason: UnsavedReason,
     ) -> Result<Self, UnsavedResultValidationError> {
-        if request_id.trim().is_empty() || request_id.len() > conversation::MAX_REQUEST_ID_BYTES {
-            return Err(UnsavedResultValidationError::InvalidRequestId);
-        }
+        conversation::validate_request_id(&request_id)
+            .map_err(|_| UnsavedResultValidationError::InvalidRequestId)?;
         // WireId already guarantees canonical syntax; only graph IDs contain ':'.
         if !execution_id.session_id.as_str().contains(':')
             || !execution_id.generation.as_str().contains(':')
@@ -698,9 +697,27 @@ pub struct AppSnapshot {
     pub runtime_phase: RuntimePhase,
     pub transcript: Vec<Turn>,
     pub active_request: Option<ActiveRequestSummary>,
+    #[serde(
+        deserialize_with = "required_unsaved_option",
+        serialize_with = "serialize_unsaved_option"
+    )]
+    pub unsaved_result: Option<std::sync::Arc<UnsavedResult>>,
     pub capabilities: Vec<Capability>,
     pub model_options: Vec<ModelOption>,
     pub preferences: ValidatedPreferences,
+}
+
+fn required_unsaved_option<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<std::sync::Arc<UnsavedResult>>, D::Error> {
+    Option::<UnsavedResult>::deserialize(deserializer).map(|value| value.map(std::sync::Arc::new))
+}
+
+fn serialize_unsaved_option<S: Serializer>(
+    value: &Option<std::sync::Arc<UnsavedResult>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    value.as_deref().serialize(serializer)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -727,9 +744,31 @@ pub enum PromptUpdate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PromptOutcome {
-    Completed { turn: CompletedTurn },
-    Refused { turn: RefusedTurn },
+    Completed {
+        turn: CompletedTurn,
+        save_disposition: SavedDisposition,
+    },
+    Refused {
+        turn: RefusedTurn,
+        save_disposition: SavedDisposition,
+    },
+    Unsaved {
+        #[serde(serialize_with = "serialize_unsaved_arc")]
+        unsaved_result: std::sync::Arc<UnsavedResult>,
+        save_disposition: UnsavedDisposition,
+    },
     Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SavedDisposition {
+    Saved,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnsavedDisposition {
+    Unsaved,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -769,6 +808,7 @@ impl PromptOutcome {
         }
         Ok(Self::Completed {
             turn: CompletedTurn(turn),
+            save_disposition: SavedDisposition::Saved,
         })
     }
 
@@ -781,8 +821,23 @@ impl PromptOutcome {
         }
         Ok(Self::Refused {
             turn: RefusedTurn(turn),
+            save_disposition: SavedDisposition::Saved,
         })
     }
+
+    pub fn unsaved(unsaved_result: std::sync::Arc<UnsavedResult>) -> Self {
+        Self::Unsaved {
+            unsaved_result,
+            save_disposition: UnsavedDisposition::Unsaved,
+        }
+    }
+}
+
+fn serialize_unsaved_arc<S: Serializer>(
+    value: &std::sync::Arc<UnsavedResult>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    value.as_ref().serialize(serializer)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1093,7 +1148,7 @@ pub fn turn_from_record(
     let turn_id = WireId::from_operation_id(&record.operation.id)?;
     let request_id = WireId::from_operation_id(request)?;
     let alias = client_request_alias.unwrap_or(request_id.as_str());
-    if alias.is_empty() || alias.len() > conversation::MAX_REQUEST_ID_BYTES {
+    if conversation::validate_request_id(alias).is_err() {
         return Err(DomainError::Invalid {
             field: "client_request_id".into(),
         });
@@ -1183,6 +1238,35 @@ mod tests {
         .unwrap();
         let value = serde_json::to_value(&result).unwrap();
         assert_eq!(value.as_object().unwrap().len(), 7);
+        for (text, accepted) in [("\u{feff}", true), (" \u{feff}\t", true), ("\u{85}", false)] {
+            for field in ["prompt", "text", "refusal", "source_title"] {
+                let mut candidate = value.clone();
+                match field {
+                    "prompt" => candidate["prompt"] = serde_json::json!(text),
+                    "text" | "refusal" => {
+                        candidate["answer"] = serde_json::json!({"kind": field, "text": text});
+                    }
+                    "source_title" => {
+                        candidate["sources"] = serde_json::json!([{"url": "https://example.test/synthetic", "title": text}]);
+                    }
+                    _ => unreachable!(),
+                }
+                let parsed = serde_json::from_value::<UnsavedResult>(candidate.clone());
+                assert_eq!(parsed.is_ok(), accepted, "{field}: {text:?}");
+                if let Ok(parsed) = parsed {
+                    assert_eq!(serde_json::to_value(parsed).unwrap(), candidate);
+                }
+            }
+        }
+        for (suffix, accepted) in [("\u{feff}", true), ("\u{85}", false), ("\0", false)] {
+            let mut candidate = value.clone();
+            candidate["sources"] = serde_json::json!([{"url": format!("https://example.test/{suffix}"), "title": "Synthetic source"}]);
+            let parsed = serde_json::from_value::<UnsavedResult>(candidate.clone());
+            assert_eq!(parsed.is_ok(), accepted, "source URL: {suffix:?}");
+            if let Ok(parsed) = parsed {
+                assert_eq!(serde_json::to_value(parsed).unwrap(), candidate);
+            }
+        }
         assert_eq!(
             value["answer"],
             serde_json::json!({"kind":"text", "text":"Synthetic unsaved answer"})
@@ -1223,6 +1307,11 @@ mod tests {
         }
         for (key, replacement) in [
             ("request_id", serde_json::json!("")),
+            ("request_id", serde_json::json!(" \t\r\n")),
+            (
+                "request_id",
+                serde_json::json!("😀".repeat(conversation::MAX_REQUEST_ID_BYTES / 4 + 1)),
+            ),
             (
                 "request_id",
                 serde_json::json!("x".repeat(conversation::MAX_REQUEST_ID_BYTES + 1)),
@@ -1295,7 +1384,39 @@ mod tests {
         assert_eq!(record, original);
         let cold = super::turn_from_record(&record, None).unwrap();
         assert_eq!(cold.request_id, "11111111-1111-4111-8111-111111111111:2");
-        assert!(super::turn_from_record(&record, Some("")).is_err());
+        for invalid in [
+            "".to_owned(),
+            " \t\r\n".to_owned(),
+            "\u{2003}".to_owned(),
+            "😀".repeat(crate::conversation::MAX_REQUEST_ID_BYTES / 4 + 1),
+        ] {
+            assert!(super::turn_from_record(&record, Some(&invalid)).is_err());
+        }
+        for alias in [
+            "synthetic-renderer-correlation".to_owned(),
+            " synthetic preserved correlation ".to_owned(),
+            "😀".repeat(crate::conversation::MAX_REQUEST_ID_BYTES / 4),
+        ] {
+            let mut session = crate::conversation::ConversationSession::execution_only(
+                crate::assistant::AssistantPolicy::default(),
+            );
+            assert!(session.admit(&alias, "Synthetic prompt").is_ok());
+            let turn = super::turn_from_record(&record, Some(&alias)).unwrap();
+            assert_eq!(turn.request_id, alias);
+            let unsaved = super::UnsavedResult::new(
+                alias.clone(),
+                turn.execution_id,
+                "Synthetic prompt".into(),
+                crate::durable_conversation::Answer::Text {
+                    text: "Synthetic answer".into(),
+                },
+                vec![],
+                super::Stage::Instant,
+                super::UnsavedReason::StorageError,
+            )
+            .unwrap();
+            assert_eq!(unsaved.request_id(), alias);
+        }
     }
 
     #[test]
@@ -1846,12 +1967,12 @@ mod tests {
         let completed_turn = Turn::from(text_turn());
         assert_eq!(
             serde_json::to_value(PromptOutcome::refused(refused_turn.clone()).unwrap()).unwrap(),
-            serde_json::json!({ "kind": "refused", "turn": refused_turn })
+            serde_json::json!({ "kind": "refused", "save_disposition": "saved", "turn": refused_turn })
         );
         assert_eq!(
             serde_json::to_value(PromptOutcome::completed(completed_turn.clone()).unwrap())
                 .unwrap(),
-            serde_json::json!({ "kind": "completed", "turn": completed_turn })
+            serde_json::json!({ "kind": "completed", "save_disposition": "saved", "turn": completed_turn })
         );
         assert_eq!(
             serde_json::to_value(PromptOutcome::Cancelled).unwrap(),
@@ -1878,6 +1999,7 @@ mod tests {
     #[test]
     fn app_snapshot_serializes_one_canonical_state() {
         let snapshot = AppSnapshot {
+            unsaved_result: None,
             session_id: 4.into(),
             runtime_phase: RuntimePhase::Executing,
             transcript: vec![Turn::from(refusal_turn())],
@@ -1903,7 +2025,7 @@ mod tests {
             }],
             preferences: preferences(),
         };
-        let value = serde_json::to_value(snapshot).unwrap();
+        let mut value = serde_json::to_value(snapshot).unwrap();
         assert_eq!(value["session_id"], "4");
         assert_eq!(value["runtime_phase"], "executing");
         assert_eq!(
@@ -1913,6 +2035,10 @@ mod tests {
         assert_eq!(value["active_request"]["execution_id"]["generation"], "10");
         assert_eq!(value["preferences"]["instant"], "opencode-sol-high");
         assert_eq!(value["model_options"][0]["available"], true);
+        assert_eq!(value["unsaved_result"], serde_json::Value::Null);
+        assert!(serde_json::from_value::<AppSnapshot>(value.clone()).is_ok());
+        value.as_object_mut().unwrap().remove("unsaved_result");
+        assert!(serde_json::from_value::<AppSnapshot>(value).is_err());
     }
 
     #[test]

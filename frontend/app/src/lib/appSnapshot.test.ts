@@ -3,6 +3,7 @@ import { isExpectedCanonicalTurn, loadAppSnapshot, parseAppSnapshot } from './ap
 
 function validSnapshot(): Record<string, unknown> {
   return {
+    unsaved_result: null,
     session_id: '18446744073709551615',
     runtime_phase: 'executing',
     transcript: [{
@@ -108,7 +109,7 @@ describe('app snapshot contract', () => {
     delete (wire['preferences'] as Record<string, unknown>)['completion']
     expect(() => parseAppSnapshot(wire)).toThrow(/completion/)
   })
-  it('accepts distributed Android identities without relaxing desktop decimal IDs', () => {
+  it('accepts distributed identities on every platform without losing u64 precision', () => {
     const id = '11111111-1111-4111-8111-111111111111:18446744073709551615'
     const wire = validSnapshot()
     wire['session_id'] = id
@@ -117,14 +118,13 @@ describe('app snapshot contract', () => {
     turn['execution_id'] = { session_id: id, generation: id }
     ;(turn['user'] as Record<string, unknown>)['id'] = id
     ;(turn['answer'] as Record<string, unknown>)['id'] = id
-    expect(() => parseAppSnapshot(wire)).toThrow(/canonical unsigned decimal/)
-    expect(parseAppSnapshot(wire, true).transcript[0]?.executionId.generation).toBe(id)
-    const canonical = parseAppSnapshot(wire, true).transcript[0]!
+    expect(parseAppSnapshot(wire).transcript[0]?.executionId.generation).toBe(id)
+    const canonical = parseAppSnapshot(wire).transcript[0]!
     expect(isExpectedCanonicalTurn(canonical, canonical.requestId, '0', new Set())).toBe(false)
     expect(isExpectedCanonicalTurn(canonical, canonical.requestId, '0', new Set(), true)).toBe(true)
-    expect(() => parseAppSnapshot({ ...wire, session_id: id.replace(':184', ':0184') }, true)).toThrow(/session_id/)
+    expect(() => parseAppSnapshot({ ...wire, session_id: id.replace(':184', ':0184') })).toThrow(/session_id/)
   })
-  it('accepts distributed identities on desktop only with a validated canonical graph projection', () => {
+  it('accepts distributed identities on desktop independently of graph projection presence', () => {
     const wire = validSnapshot()
     const id = '11111111-1111-4111-8111-111111111111:3'
     wire['session_id'] = id
@@ -133,13 +133,13 @@ describe('app snapshot contract', () => {
     turn['execution_id'] = { session_id: id, generation: id }
     ;(turn['user'] as Record<string, unknown>)['id'] = id
     ;(turn['answer'] as Record<string, unknown>)['id'] = id
-    expect(() => parseAppSnapshot(wire, false)).toThrow(/decimal/)
+    expect(parseAppSnapshot(wire).sessionId).toBe(id)
     wire['assistant'] = { revision: '1', conversations: [{ id, title: 'Synthetic desktop conversation' }],
       selected_head: id, branch_choices: [], draft: '', interrupted: false, error: null }
-    expect(parseAppSnapshot(wire, false).assistant?.selectedHead).toBe(id)
-    expect(parseAppSnapshot(wire, false).transcript[0]?.answer.id).toBe(id)
+    expect(parseAppSnapshot(wire).assistant?.selectedHead).toBe(id)
+    expect(parseAppSnapshot(wire).transcript[0]?.answer.id).toBe(id)
     wire['assistant'] = { interrupted: false }
-    expect(() => parseAppSnapshot(wire, false)).toThrow(/assistant/)
+    expect(() => parseAppSnapshot(wire)).toThrow(/assistant/)
   })
   it.each(['custom-sol-high', 'custom-sol-low', 'custom-luna-none', 'custom-luna-low'] as const)(
     'accepts the current Custom Instant selection %s in canonical preferences',

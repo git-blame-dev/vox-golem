@@ -12,7 +12,7 @@ import { useSettingsNavigation } from './lib/useSettingsNavigation'
 import App from './App'
 import { FrontendSession } from './FrontendSession'
 import { sessionAuthority } from './SessionAuthority'
-import { appSnapshot, canonicalTurn, completeCapabilities, defaultAssistantSettings, readyStartupState } from './test/sessionFixtures'
+import { appSnapshot, canonicalTurn, completeCapabilities, defaultAssistantSettings, readyStartupState, savedOutcome } from './test/sessionFixtures'
 import headerIcon from '../../../apps/desktop-tauri/src-tauri/icons/icon.svg?url'
 
 const startLiveAudioSourceMock = vi.spyOn(liveAudioSourceModule, 'startLiveAudioSource')
@@ -201,7 +201,7 @@ describe('App', () => {
             send({ kind: 'stage', stage: 'review', status: 'failed', detail: 'Synthetic Review provider failed' })
             committed.push(canonicalTurn('401', '402', request.prompt, 'Synthetic corrected fallback answer', request.requestId, 'text', 'deep'))
           } else committed.push(canonicalTurn('403', '404', request.prompt, 'Synthetic next answer', request.requestId))
-          return { request_id: request.requestId, runtime_phase: 'sleeping', outcome: 'completed' }
+          return { kind: 'completed', save_disposition: 'saved', turn: committed.at(-1)! }
         }
         return null
       },
@@ -333,7 +333,7 @@ describe('App', () => {
     expect(calls.filter((command) => command === 'submit_prompt')).toHaveLength(1)
     await act(async () => {
       finishStop({ cancelled: true })
-      finishPrompt({ outcome: 'cancelled', runtime_phase: 'sleeping', request_id: 'synthetic-request' })
+      finishPrompt({ kind: 'cancelled' })
       await Promise.resolve()
       await Promise.resolve()
     })
@@ -361,7 +361,7 @@ describe('App', () => {
           expect(request.updates).toBe('desktop-channel')
           if (committed.length > 0) {
             committed.push(canonicalTurn('303', '304', 'Second synthetic question', 'Second canonical answer', request.requestId))
-            return { request_id: request.requestId, runtime_phase: 'sleeping', outcome: 'completed' }
+            return { kind: 'completed', save_disposition: 'saved', turn: committed.at(-1)! }
           }
           send?.({ kind: 'stage', stage: 'instant', status: 'running', detail: null })
           send?.({ kind: 'text', text: 'Provisional answer' })
@@ -369,7 +369,7 @@ describe('App', () => {
           send?.({ kind: 'sources', sources: [{ url: 'https://example.com/evidence', title: 'Synthetic evidence' }] })
           committed.push({ ...canonicalTurn('301', '302', 'Synthetic question', 'Canonical answer', request.requestId),
             sources: [{ url: 'https://example.com/evidence', title: 'Synthetic evidence' }] })
-          return { request_id: request.requestId, runtime_phase: 'sleeping', outcome: 'completed', error_message: null }
+          return { kind: 'completed', save_disposition: 'saved', turn: committed.at(-1)! }
         }
         return null
       },
@@ -836,7 +836,7 @@ describe('App', () => {
         if (command === 'get_startup_state') return readyStartupState()
         if (command === 'submit_prompt') {
           committed = true
-          return { request_id: requestId, runtime_phase: 'sleeping', outcome: 'completed' }
+          return { kind: 'refused', save_disposition: 'saved', turn: canonicalTurn('85', '86', 'New reused prompt', 'New reused refusal', requestId, 'refusal') }
         }
         return null
       },
@@ -857,10 +857,9 @@ describe('App', () => {
     vi.useFakeTimers()
     let finishPrompt: ((value: unknown) => void) | undefined
     let snapshotCalls = 0
-    let requestId = ''
     window.__TAURI_INTERNALS__ = {
       listen: async () => () => undefined,
-      invoke: async (command, args) => {
+      invoke: async (command) => {
         if (command === 'get_app_snapshot') {
           snapshotCalls += 1
           if (snapshotCalls === 1) {
@@ -870,7 +869,6 @@ describe('App', () => {
         }
         if (command === 'get_startup_state') return readyStartupState()
         if (command === 'submit_prompt') {
-          requestId = (args as { requestId: string }).requestId
           return new Promise((resolve) => { finishPrompt = resolve })
         }
         return null
@@ -882,7 +880,7 @@ describe('App', () => {
       setTextAreaValue(getComposer(container), 'Cancelled pending question')
       getSendButton(container).click()
       await Promise.resolve()
-      finishPrompt?.({ request_id: requestId, runtime_phase: 'sleeping', outcome: 'cancelled' })
+      finishPrompt?.({ kind: 'cancelled' })
       await Promise.resolve()
     })
     await act(async () => {
@@ -929,7 +927,7 @@ describe('App', () => {
       setTextAreaValue(getComposer(container), 'Reconcile during profile switch')
       getSendButton(container).click()
       await Promise.resolve()
-      finishPrompt?.({ request_id: requestId, runtime_phase: 'sleeping', outcome: 'completed' })
+      finishPrompt?.(savedOutcome(requestId, 'Reconcile during profile switch', 'Canonical answer', '1', '80'))
       await Promise.resolve()
       await Promise.resolve()
       getButtonByLabel(container, 'Settings').click()
@@ -1021,7 +1019,7 @@ describe('App', () => {
     expect(rendererAudioCalls).toEqual([])
   })
 
-  it.each(['cancelled', 'error', 'completed'] as const)('does not speak an uncommitted correction after %s settlement', async (outcome) => {
+  it.each(['cancelled', 'error'] as const)('does not speak an uncommitted correction after %s settlement', async (outcome) => {
     let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
     let finishPrompt: (value: unknown) => void = () => undefined
     let requestId = ''
@@ -1056,12 +1054,7 @@ describe('App', () => {
           correction: 'Correction: provisional',
         },
       })
-      finishPrompt({
-        request_id: requestId,
-        runtime_phase: 'sleeping',
-        outcome,
-        ...(outcome === 'error' ? { error_message: 'explicit failure' } : {}),
-      })
+      finishPrompt(outcome === 'error' ? { kind: 'error', request_id: requestId, runtime_phase: 'sleeping', error_message: 'explicit failure' } : { kind: 'cancelled' })
     })
 
     expect(snapshotCalls).toBe(2)
@@ -1096,7 +1089,7 @@ describe('App', () => {
               correction: 'Correction: provisional',
             },
           })
-          return { request_id: requestId, runtime_phase: 'sleeping', outcome: 'completed' }
+          return savedOutcome(requestId, 'Corrected canonical prompt', 'Canonical corrected answer', '1', '232')
         }
         return null
       },
@@ -1129,12 +1122,7 @@ describe('App', () => {
         if (command === 'get_startup_state') return readyStartupState({ tts_enabled: true })
         if (command === 'submit_prompt') {
           requestId = (args as { requestId: string }).requestId
-          return {
-            request_id: requestId,
-            runtime_phase: 'sleeping',
-            outcome,
-            ...(outcome === 'error' ? { error_message: 'authoritative failure' } : {}),
-          }
+          return outcome === 'error' ? { kind: 'error', request_id: requestId, runtime_phase: 'sleeping', error_message: 'authoritative failure' } : { kind: 'cancelled' }
         }
         return null
       },
@@ -1189,7 +1177,7 @@ describe('App', () => {
 
     await act(async () => {
       committed = true
-      finishPrompt?.({ request_id: activeRequestId, runtime_phase: 'sleeping', outcome: 'completed' })
+      finishPrompt?.(savedOutcome(activeRequestId, 'Canonical question', 'Canonical answer', '1', '12'))
       await Promise.resolve()
       await Promise.resolve()
     })
@@ -1263,7 +1251,7 @@ describe('App', () => {
         if (command === 'set_tts_enabled') return { enabled: true }
         if (command === 'submit_prompt') {
           requestId = (args as { requestId: string }).requestId
-          return { request_id: requestId, runtime_phase: 'sleeping', outcome: 'completed' }
+          return savedOutcome(requestId, 'Session two prompt', 'Session two answer', '2', '212')
         }
         return null
       },
@@ -1320,7 +1308,7 @@ describe('App', () => {
         if (command === 'reset_session') return null
         if (command === 'submit_prompt') {
           requestId = (args as { requestId: string }).requestId
-          return { request_id: requestId, runtime_phase: 'sleeping', outcome: 'completed' }
+          return savedOutcome(requestId, 'Prompt after reset retry', 'Answer after reset retry', '2', '252')
         }
         return null
       },
@@ -1415,7 +1403,7 @@ describe('App', () => {
       setTextAreaValue(getComposer(container), 'First prompt')
       getSendButton(container).click()
       await Promise.resolve()
-      finishPrompt?.({ request_id: requestId, runtime_phase: 'sleeping', outcome: 'completed' })
+      finishPrompt?.(savedOutcome(requestId, 'First prompt', 'Committed answer', '1', '32'))
       await Promise.resolve()
       await Promise.resolve()
     })
@@ -1777,7 +1765,7 @@ describe('App', () => {
     expect(cancelFrame).toHaveBeenCalledWith(73)
     await act(async () => {
       scheduledFrame?.(16)
-      finishPrompt?.({ request_id: requestId, runtime_phase: 'sleeping', outcome: 'completed' })
+      finishPrompt?.(savedOutcome(requestId, 'Unmount prompt', 'Visible first outputQueued output'))
       await Promise.resolve()
     })
 
@@ -1811,7 +1799,7 @@ describe('App', () => {
       getSendButton(container).click()
       await Promise.resolve()
       committed = true
-      finishPrompt?.({ request_id: requestId, runtime_phase: 'sleeping', outcome: 'completed' })
+      finishPrompt?.(savedOutcome(requestId, 'Strict prompt', 'Strict answer', '1', '42'))
       await Promise.resolve()
       await Promise.resolve()
     })
@@ -2001,7 +1989,7 @@ describe('App', () => {
         if (command === 'submit_prompt') {
           requestId = (args as { requestId: string }).requestId
           committed = true
-          return { request_id: requestId, runtime_phase: 'sleeping', outcome: 'completed' }
+          return { kind: kind === 'refusal' ? 'refused' : 'completed', save_disposition: 'saved', turn: canonicalTurn('51', '52', 'Canonical terminal prompt', answer, requestId, kind, finalStage) }
         }
         return null
       },
@@ -3730,18 +3718,14 @@ describe('App', () => {
 
         if (command === 'get_assistant_settings') return defaultAssistantSettings('local-quality')
 
+        if (command === 'get_app_snapshot') return appSnapshot([], { instant: 'local-quality', response_profile: 'quality' })
         expect(command).toBe('submit_prompt')
           expect(args).toMatchObject({ requestId: expect.any(String), prompt: 'Draft release notes' })
         promptEventHandler?.({
           payload: { request_id: args && (args as { requestId: string }).requestId, kind: 'text', text: 'OpenCode response' },
         })
 
-        return {
-          request_id: (args as { requestId: string }).requestId,
-          outcome: 'completed',
-          error_message: null,
-          runtime_phase: 'sleeping',
-        }
+        return savedOutcome((args as { requestId: string }).requestId, 'Draft release notes', 'OpenCode response')
       },
     }
 
@@ -3769,14 +3753,10 @@ describe('App', () => {
       invoke: async (command, args) => {
         if (command === 'get_startup_state') return readyStartupState({ selected_response_profile: 'fast' })
         if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
+        if (command === 'get_app_snapshot') return appSnapshot()
         expect(command).toBe('submit_prompt')
         submittedPrompt = (args as { prompt: string }).prompt
-        return {
-          request_id: (args as { requestId: string }).requestId,
-          outcome: 'completed',
-          error_message: null,
-          runtime_phase: 'sleeping',
-        }
+        return savedOutcome((args as { requestId: string }).requestId, submittedPrompt, 'Synthetic answer')
       },
     }
 
@@ -3792,7 +3772,7 @@ describe('App', () => {
     expect(container.querySelector('.message--user .message__content')?.textContent).toBe(prompt)
   })
 
-  it('does not render no-output execution fallback as an assistant message', async () => {
+  it('rejects a saved receipt with no answer instead of inventing an assistant fallback', async () => {
     window.__TAURI_INTERNALS__ = {
       listen: async () => () => undefined,
       invoke: async (command, args) => {
@@ -3815,12 +3795,7 @@ describe('App', () => {
 
         if (command === 'get_assistant_settings') return defaultAssistantSettings('local-quality')
 
-        return {
-          request_id: (args as { requestId: string }).requestId,
-          outcome: 'completed',
-          error_message: null,
-          runtime_phase: 'sleeping',
-        }
+        return { kind: 'completed', save_disposition: 'saved', turn: null, request_id: (args as { requestId: string }).requestId }
       },
     }
 
@@ -3837,10 +3812,8 @@ describe('App', () => {
       await Promise.resolve()
     })
 
-    expect(container.textContent).toContain('No output prompt')
     expect(container.textContent).not.toContain('OpenCode backend returned no output.')
-    expect(container.textContent).toContain('No response')
-    expect(container.textContent).toContain('No response was returned. Try again.')
+    expect(container.textContent).toContain('Response failed')
     expect(container.querySelector('.message__thinking')).toBeNull()
     expect(container.querySelectorAll('.message--assistant')).toHaveLength(0)
   })
@@ -3873,6 +3846,7 @@ describe('App', () => {
           }
         }
         if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
+        if (command === 'get_app_snapshot') return appSnapshot()
         if (command === 'submit_prompt') {
           if (
             typeof args === 'object' &&
@@ -3933,11 +3907,7 @@ describe('App', () => {
     expect(container.textContent).not.toContain('Wrong')
 
     await act(async () => {
-      finishPrompt?.({
-        request_id: activeRequestId,
-        runtime_phase: 'sleeping',
-        outcome: 'completed',
-      })
+      finishPrompt?.(savedOutcome(activeRequestId, 'Stream this', 'Hello world'))
       await Promise.resolve()
     })
     expect(container.textContent).not.toContain('Executing prompt')
@@ -3989,7 +3959,7 @@ describe('App', () => {
     expect(invoke.mock.calls.filter(([command]) => command === 'submit_prompt')).toHaveLength(1)
     await act(async () => {
       stop?.(true)
-      finish?.({ request_id: requestId, runtime_phase: 'sleeping', outcome: 'cancelled' })
+      finish?.({ kind: 'cancelled' })
     })
     expect(getConversation(container).textContent).not.toContain('Synthetic queued answer')
   })
@@ -4065,7 +4035,7 @@ describe('App', () => {
     layout.mockRestore()
     await act(async () => {
       committed = canonicalTurn('33', '34', 'Synthetic current question', 'Synthetic canonical answer', requestId)
-      finish({ request_id: requestId, runtime_phase: 'sleeping', outcome: 'completed' })
+      finish({ kind: 'completed', save_disposition: 'saved', turn: committed })
     })
     expect(getConversation(container).textContent).toContain('Synthetic canonical answer')
     expect(native.mock.calls.filter(([command]) => command === 'get_app_snapshot')).toHaveLength(2)
@@ -4093,6 +4063,7 @@ describe('App', () => {
       invoke: async (command, args) => {
         if (command === 'get_startup_state') return readyStartupState()
         if (command === 'get_assistant_settings') return defaultAssistantSettings()
+        if (command === 'get_app_snapshot') return appSnapshot()
         if (command === 'submit_prompt') {
           requestId = (args as { requestId: string }).requestId
           return new Promise((resolve) => { finishPrompt = resolve })
@@ -4132,7 +4103,7 @@ describe('App', () => {
 
     await act(async () => {
       promptEventHandler?.({ payload: { request_id: requestId, kind: 'text', text: ' terminal' } })
-      finishPrompt?.({ request_id: requestId, runtime_phase: 'sleeping', outcome: 'completed' })
+      finishPrompt?.(savedOutcome(requestId, 'Batch this stream', 'Corrected complete terminal'))
       await Promise.resolve()
     })
 
@@ -4144,18 +4115,22 @@ describe('App', () => {
   it('shows measured Custom direct request timing with its response, never from another request', async () => {
     let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
     let submissions = 0
+    const committed: Record<string, unknown>[] = []
     window.__TAURI_INTERNALS__ = {
       listen: async (_event, handler) => { promptEventHandler = handler; return () => undefined },
       invoke: async (command, args) => {
         if (command === 'get_startup_state') return readyStartupState()
         if (command === 'get_assistant_settings') return { ...defaultAssistantSettings(), instant: 'custom-luna-none' }
+        if (command === 'get_app_snapshot') return appSnapshot(committed, { instant: 'custom-luna-none' })
         expect(command).toBe('submit_prompt')
         const requestId = (args as { requestId: string }).requestId
         submissions += 1
         promptEventHandler?.({ payload: { request_id: 'unrelated', kind: 'custom_direct_timings', first_text_ms: 1, completed_ms: 2 } })
         promptEventHandler?.({ payload: { request_id: requestId, kind: 'text', text: `Response ${submissions}` } })
         if (submissions === 1) promptEventHandler?.({ payload: { request_id: requestId, kind: 'custom_direct_timings', first_text_ms: 450, completed_ms: 1250 } })
-        return { request_id: requestId, outcome: 'completed', runtime_phase: 'sleeping' }
+        const receipt = savedOutcome(requestId, (args as { prompt: string }).prompt, `Response ${submissions}`, '1', String(2 * submissions))
+        committed.push(receipt['turn'] as Record<string, unknown>)
+        return receipt
       },
     }
     const { container } = await renderApp()
@@ -4281,9 +4256,9 @@ describe('App', () => {
           typeof args.requestId === 'string'
         ) {
           return {
+            kind: 'error',
             request_id: args.requestId,
             runtime_phase: 'error',
-            outcome: 'error',
             error_message: 'OpenCode provider authentication failed',
           }
         }
@@ -4382,11 +4357,7 @@ describe('App', () => {
           runtime_phase: 'sleeping',
         },
       })
-      finishPrompt?.({
-        request_id: activeRequestId,
-        runtime_phase: 'sleeping',
-        outcome: 'cancelled',
-      })
+      finishPrompt?.({ kind: 'cancelled' })
       await Promise.resolve()
     })
 
@@ -4398,14 +4369,12 @@ describe('App', () => {
 
   it('stops from the Stop button and returns to sleeping after cancellation settlement', async () => {
     let finishPrompt: ((value: unknown) => void) | undefined
-    let requestId = ''
     window.__TAURI_INTERNALS__ = {
       listen: async () => () => undefined,
-      invoke: async (command, args) => {
+      invoke: async (command) => {
         if (command === 'get_startup_state') return readyStartupState({ prompt_cancellation_available: true })
         if (command === 'get_assistant_settings') return defaultAssistantSettings()
         if (command === 'submit_prompt') {
-          requestId = (args as { requestId: string }).requestId
           return new Promise((resolve) => { finishPrompt = resolve })
         }
         if (command === 'cancel_prompt') return null
@@ -4418,7 +4387,7 @@ describe('App', () => {
     expect(stopButton).toBeDefined()
     await act(async () => { stopButton?.click(); await Promise.resolve() })
     expect(getButtonByLabel(container, 'Stopping…').disabled).toBe(true)
-    await act(async () => { finishPrompt?.({ request_id: requestId, runtime_phase: 'sleeping', outcome: 'cancelled' }); await Promise.resolve() })
+    await act(async () => { finishPrompt?.({ kind: 'cancelled' }); await Promise.resolve() })
     expect(container.textContent).not.toContain('Stopping')
     await act(async () => { await Promise.resolve(); await Promise.resolve(); })
     await act(async () => { setTextAreaValue(getComposer(container), 'another prompt'); await Promise.resolve(); await Promise.resolve(); })
@@ -4433,6 +4402,7 @@ describe('App', () => {
       invoke: async (command, args) => {
         if (command === 'get_startup_state') return readyStartupState({ prompt_cancellation_available: true })
         if (command === 'get_assistant_settings') return defaultAssistantSettings()
+        if (command === 'get_app_snapshot') return appSnapshot()
         if (command === 'submit_prompt') {
           requestId = (args as { requestId: string }).requestId
           return new Promise((resolve) => { finishPrompt = resolve })
@@ -4447,7 +4417,7 @@ describe('App', () => {
     await act(async () => { stopButton?.click(); await Promise.resolve() })
     await act(async () => { await Promise.resolve(); await Promise.resolve() })
     expect(container.textContent).toContain('Executing prompt')
-    await act(async () => { finishPrompt?.({ request_id: requestId, runtime_phase: 'sleeping', outcome: 'completed' }); await Promise.resolve() })
+    await act(async () => { finishPrompt?.(savedOutcome(requestId, 'finish me', 'Synthetic completed answer')); await Promise.resolve() })
     expect(container.textContent).not.toContain('Executing prompt')
     await act(async () => { setTextAreaValue(getComposer(container), 'another prompt'); await Promise.resolve(); await Promise.resolve() })
     expect(getSendButton(container).disabled).toBe(false)
@@ -4492,14 +4462,14 @@ describe('App', () => {
     expect(getSendButton(container).getAttribute('aria-label')).toBe('Stop')
     await act(async () => {
       committed = canonicalTurn('41', '42', 'Synthetic cancelled presentation', 'Synthetic trusted canonical completion', requestId)
-      finish({ request_id: requestId, runtime_phase: 'sleeping', outcome: 'completed' })
+      finish({ kind: 'completed', save_disposition: 'saved', turn: committed })
     })
     expect(getConversation(container).textContent).toContain('Synthetic trusted canonical completion')
     await act(async () => { setTextAreaValue(getComposer(container), 'Synthetic next prompt') })
     expect(getSendButton(container).disabled).toBe(false)
   })
 
-  it('uses a correlated stream error when the final result has no message', async () => {
+  it('uses the bounded authoritative error message rather than an earlier stream error', async () => {
     let promptEventHandler: ((event: { payload: unknown }) => void) | undefined
     window.__TAURI_INTERNALS__ = {
       listen: async (_event, handler) => {
@@ -4532,14 +4502,14 @@ describe('App', () => {
           payload: {
             request_id: requestId,
             kind: 'error',
-            message: 'Provider failed',
+            message: 'Synthetic obsolete stream error',
           },
         })
         return {
+          kind: 'error',
           request_id: requestId,
           runtime_phase: 'error',
-          outcome: 'error',
-          error_message: null,
+          error_message: 'Provider failed',
         }
       },
     }
@@ -4560,6 +4530,7 @@ describe('App', () => {
     expect(container.textContent).not.toContain('Bad prompt')
     expect(container.textContent).toContain('Response failed')
     expect(container.textContent).toContain('Provider failed')
+    expect(container.textContent).not.toContain('Synthetic obsolete stream error')
   })
 
   it('polls startup state while the local model is warming and becomes ready later', async () => {
@@ -4763,6 +4734,7 @@ describe('App', () => {
           return readyStartupState({ voice_input_available: false })
         }
         if (command === 'get_assistant_settings') return defaultAssistantSettings('local-fast')
+        if (command === 'get_app_snapshot') return appSnapshot()
         if (command === 'submit_prompt') {
           submitCalls += 1
           requestId = (args as { requestId: string }).requestId
@@ -4800,11 +4772,7 @@ describe('App', () => {
       promptEventHandler?.({
         payload: { request_id: requestId, kind: 'text', text: 'Original response' },
       })
-      finishPrompt?.({
-        request_id: requestId,
-        runtime_phase: 'sleeping',
-        outcome: 'completed',
-      })
+      finishPrompt?.(savedOutcome(requestId, 'Long-running prompt', 'Original response'))
       await Promise.resolve()
     })
 
@@ -5023,6 +4991,7 @@ describe('App', () => {
       invoke: async (command, args) => {
         invocations.push({ command, args })
         if (command === 'get_startup_state') return readyStartupState()
+        if (command === 'get_app_snapshot') return appSnapshot([], { prefetch: true, completion: true })
         if (command === 'get_assistant_settings') {
           return {
             instant: 'local-fast', deep: 'opencode-sol-high', review: 'opencode-sol-high',
@@ -5031,10 +5000,7 @@ describe('App', () => {
         }
         if (command === 'request_completion' || command === 'clear_completion') return null
         if (command === 'submit_prompt') {
-          return {
-            request_id: (args as { requestId: string }).requestId,
-            outcome: 'completed', error_message: null, runtime_phase: 'sleeping',
-          }
+          return savedOutcome((args as { requestId: string }).requestId, (args as { prompt: string }).prompt)
         }
         throw new Error(`unexpected command: ${command}`)
       },
@@ -5083,6 +5049,7 @@ describe('App', () => {
       },
       invoke: async (command, args) => {
         if (command === 'get_startup_state') return readyStartupState()
+        if (command === 'get_app_snapshot') return appSnapshot([], { completion: true })
         if (command === 'get_assistant_settings') {
           return {
             instant: 'local-fast', deep: 'opencode-sol-high', review: 'opencode-sol-high',
@@ -5091,10 +5058,7 @@ describe('App', () => {
         }
         if (command === 'request_completion' || command === 'clear_completion') return null
         if (command === 'submit_prompt') {
-          return {
-            request_id: (args as { requestId: string }).requestId,
-            outcome: 'completed', error_message: null, runtime_phase: 'sleeping',
-          }
+          return savedOutcome((args as { requestId: string }).requestId, (args as { prompt: string }).prompt)
         }
         throw new Error(`unexpected command: ${command}`)
       },
@@ -5172,7 +5136,7 @@ describe('App', () => {
     expect(container.querySelector('[aria-label="Review status: corrected"]')).toBeNull()
     expect(container.querySelector('a[href="https://example.com/deep"]')).not.toBeNull()
     await act(async () => {
-      finishPrompt?.({ request_id: requestId, outcome: 'cancelled', runtime_phase: 'sleeping' })
+      finishPrompt?.({ kind: 'cancelled' })
       await Promise.resolve()
     })
   })

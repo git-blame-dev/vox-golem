@@ -141,7 +141,9 @@ export interface PromptExecutionResult {
   readonly runtimePhase: BackendRuntimePhase | null
   readonly outcome: 'completed' | 'cancelled' | 'error'
   readonly errorMessage: string | null
-  readonly canonicalOutcome?: 'completed' | 'refused' | 'cancelled'
+  readonly canonicalOutcome?: 'completed' | 'refused' | 'cancelled' | 'unsaved'
+  readonly saveDisposition?: 'saved' | 'unsaved'
+  readonly unsavedResult?: import('../lib/appSnapshot').UnsavedResult
   readonly canonicalTurn?: import('../lib/appSnapshot').Turn
   readonly terminalSnapshot?: import('../lib/appSnapshot').AppSnapshot
   readonly customDirectTimings?: CustomDirectTimings

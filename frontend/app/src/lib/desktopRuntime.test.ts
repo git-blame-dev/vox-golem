@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { DesktopRuntimeObserver, parseDesktopRuntimeRead } from './desktopRuntime'
 import type { DesktopRuntimeSnapshot } from './desktopRuntime'
+import { durableId } from '../test/sessionFixtures'
 
 const voice = { auto_stop_on_silence: true, auto_start_available: false, capture_id: 7, state: 'active', runtime_phase: 'listening', wake_confidence: 0.75,
   partial_transcript: { session_id: 41, revision: 9, text: 'Synthetic partial' }, error: null }
@@ -15,12 +16,41 @@ function deferred<T>() {
 }
 
 describe('desktop runtime wire boundary', () => {
+  it.each([
+    ['\uFEFF', true], [' \uFEFF\t', true], ['\u0085', false], [' \u0085\n', false],
+  ] as const)('uses native correlation whitespace rules in roots and events: %j', (requestId, accepted) => {
+    const execution = { session_id: durableId(1), generation: durableId(2) }
+    const snapshot = { ...root(1), snapshot: { revision: 1, voice, speech, prompt: { ...prompt, request_id: requestId, execution_id: execution } } }
+    const events = { revision: 2, snapshot: null, events: [
+      { revision: 1, kind: 'prompt_update', request_id: requestId, execution_id: execution, update: { kind: 'text', text: 'Synthetic update' } },
+      { revision: 2, kind: 'prompt_finished', request_id: requestId, execution_id: execution, result: { kind: 'error', request_id: requestId, runtime_phase: 'sleeping', error_message: 'Synthetic failure' } },
+    ] }
+    if (accepted) {
+      expect(parseDesktopRuntimeRead(snapshot).snapshot?.prompt?.requestId).toBe(requestId)
+      expect(parseDesktopRuntimeRead(events).events).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: 'prompt_update', requestId }), expect.objectContaining({ kind: 'prompt_finished', requestId }),
+      ]))
+    } else {
+      expect(() => parseDesktopRuntimeRead(snapshot)).toThrow()
+      expect(() => parseDesktopRuntimeRead(events)).toThrow()
+    }
+  })
+  it('requires outer durable execution identity and rejects an inner terminal for another execution', () => {
+    const execution = { session_id: durableId(1), generation: durableId(2) }
+    const result = { kind: 'unsaved', save_disposition: 'unsaved', unsaved_result: { request_id: prompt.request_id, execution_id: execution, prompt: prompt.prompt, answer: { kind: 'text', text: 'Synthetic unsaved answer' }, sources: [], final_stage: 'instant', reason: 'storage_error' } }
+    const event = { revision: 1, kind: 'prompt_finished', request_id: prompt.request_id, execution_id: execution, result }
+    const read = (item: unknown) => ({ revision: 1, snapshot: null, events: [item] })
+    expect(parseDesktopRuntimeRead(read(event)).events[0]).toMatchObject({ executionId: { sessionId: durableId(1), generation: durableId(2) }, result: { saveDisposition: 'unsaved' } })
+    expect(() => parseDesktopRuntimeRead(read({ ...event, execution_id: undefined }))).toThrow()
+    expect(() => parseDesktopRuntimeRead(read({ ...event, execution_id: { session_id: '1', generation: '3' } }))).toThrow()
+    expect(() => parseDesktopRuntimeRead(read({ revision: 1, kind: 'prompt_update', request_id: prompt.request_id, update: { kind: 'text', text: 'Synthetic update' } }))).toThrow()
+  })
   it('accepts valid escaped accumulated text plus canonical result within the expanded native projection budget', () => {
     const answer = '\u0001'.repeat(200 * 1024)
     const turn = { request_id: prompt.request_id, execution_id: prompt.execution_id,
       user: { id: '3', role: 'user', content: { kind: 'text', text: prompt.prompt } },
       answer: { id: '4', role: 'assistant', content: { kind: 'text', text: answer } }, sources: [], final_stage: 'instant' }
-    const payload = { revision: 1, snapshot: { revision: 1, voice, speech, prompt: { ...prompt, updates: [{ kind: 'text', text: answer }], result: { kind: 'completed', turn } } }, events: [] }
+    const payload = { revision: 1, snapshot: { revision: 1, voice, speech, prompt: { ...prompt, updates: [{ kind: 'text', text: answer }], result: { kind: 'completed', save_disposition: 'saved', turn } } }, events: [] }
     expect(JSON.stringify(payload).length).toBeGreaterThan(2 * 1024 * 1024)
     expect(parseDesktopRuntimeRead(payload).snapshot?.prompt?.result?.canonicalTurn?.answer.content.text).toBe(answer)
   })
@@ -53,10 +83,10 @@ describe('desktop runtime wire boundary', () => {
     const turn = { request_id: 'synthetic-native', execution_id: prompt.execution_id,
       user: { id: '3', role: 'user', content: { kind: 'text', text: prompt.prompt } },
       answer: { id: '4', role: 'assistant', content: { kind: 'refusal', text: 'Synthetic refusal' } }, sources: [], final_stage: 'instant' }
-    const read = { revision: 1, snapshot: null, events: [{ revision: 1, kind: 'prompt_finished', request_id: prompt.request_id, result: { kind: 'refused', turn } }] }
+    const read = { revision: 1, snapshot: null, events: [{ revision: 1, kind: 'prompt_finished', request_id: prompt.request_id, execution_id: prompt.execution_id, result: { kind: 'refused', save_disposition: 'saved', turn } }] }
     expect(parseDesktopRuntimeRead(read).events[0]).toMatchObject({ result: { canonicalOutcome: 'refused', canonicalTurn: { answer: { content: { kind: 'refusal' } } } } })
     expect(() => parseDesktopRuntimeRead({ ...read, events: [{ ...read.events[0], request_id: 'synthetic-other' }] })).toThrow()
-    expect(() => parseDesktopRuntimeRead({ ...read, events: [{ ...read.events[0], result: { kind: 'refused', turn: { ...turn, sources: [{ url: 'https://example.test', title: 'Synthetic' }] } } }] })).toThrow()
+    expect(() => parseDesktopRuntimeRead({ ...read, events: [{ ...read.events[0], result: { kind: 'refused', save_disposition: 'saved', turn: { ...turn, sources: [{ url: 'https://example.test', title: 'Synthetic' }] } } }] })).toThrow()
   })
 })
 

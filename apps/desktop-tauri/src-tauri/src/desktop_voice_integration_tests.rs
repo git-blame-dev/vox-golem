@@ -40,9 +40,26 @@ fn recovery_owner_query_requires_exact_request_and_canonical_execution() {
         session_id: voxgolem_core::conversation::SessionId(17),
         generation: voxgolem_core::conversation::GenerationId(2),
     };
+    let prepared = state
+        .durable_store
+        .lock()
+        .unwrap()
+        .ensure_store()
+        .unwrap()
+        .prepare_request(
+            voxgolem_conversation_store::Selection {
+                conversation: None,
+                selected_head: None,
+            },
+            "Synthetic owner prompt",
+            4096,
+            true,
+        )
+        .unwrap();
+    let selection = prepared.context.selection;
     let wire = voxgolem_core::ipc::ExecutionId {
-        session_id: 17_u64.into(),
-        generation: 2_u64.into(),
+        session_id: voxgolem_core::ipc::WireId::from_operation_id(&selection.conversation).unwrap(),
+        generation: voxgolem_core::ipc::WireId::from_operation_id(&prepared.request).unwrap(),
     };
     assert_eq!(
         get_desktop_request_owner_from_state(&state, "synthetic-owner", &wire).unwrap(),
@@ -57,6 +74,15 @@ fn recovery_owner_query_requires_exact_request_and_canonical_execution() {
         0,
     )
     .unwrap();
+    state.active_prompt.lock().unwrap().as_mut().unwrap().pinned =
+        Some(Arc::new(PinnedDesktopRequest {
+            context_revision: selection.revision,
+            conversation: selection.conversation,
+            parent: selection.parent,
+            ancestors: selection.ancestor_ids,
+            request: prepared.request,
+            wire_execution: wire.clone(),
+        }));
     assert_eq!(
         get_desktop_request_owner_from_state(&state, "synthetic-owner", &wire).unwrap(),
         Some("renderer")

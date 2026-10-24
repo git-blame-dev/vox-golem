@@ -131,6 +131,7 @@ class PhoneFinishSessionTest {
     }
     private fun answer(text: String = "Synthetic answer-only speech") = Result.success<Any?>(JSONObject()
         .put("kind", "completed")
+        .put("save_disposition", "saved")
         .put("turn", JSONObject().put("answer", JSONObject().put("content", JSONObject()
             .put("kind", "text").put("text", "$text\n\nSources:\nhttps://example.invalid")))))
 
@@ -613,6 +614,7 @@ class PhoneFinishSessionTest {
         val stops = cue.stops
         tts.beforeSpeak = { assertNull(cue.active); assertTrue(cue.stops > stops) }
         val value = JSONObject().put("kind", "completed")
+            .put("save_disposition", "saved")
             .put("turn", JSONObject().put("answer", JSONObject().put("content", JSONObject().put("kind", "text").put("text", "Synthetic answer-only speech\n\nSources:\nhttps://example.invalid"))))
         val replyTicket = phone.onRequestSubmitted("synthetic-typed-answer")
         phone.onRequestResult("synthetic-typed-answer", Result.success(value), replyTicket); drain()

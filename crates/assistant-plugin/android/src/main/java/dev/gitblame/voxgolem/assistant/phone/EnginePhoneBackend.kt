@@ -288,7 +288,8 @@ class EnginePhoneBackend internal constructor(
                         }
                         val turn = PhoneSnapshotEncoder.turn(record, mapOf(requestId to result.clientRequestToken))
                         val refused = turn.getJSONObject("answer").getJSONObject("content").getString("kind") == "refusal"
-                        val outcome = JSONObject().put("kind", if (refused) "refused" else "completed").put("turn", turn)
+                        val outcome = JSONObject().put("kind", if (refused) "refused" else "completed")
+                            .put("save_disposition", "saved").put("turn", turn)
                         if (result.firstTextMs != null && result.completedMs != null) {
                             outcome.put("first_text_ms", result.firstTextMs)
                             outcome.put("completed_ms", result.completedMs)

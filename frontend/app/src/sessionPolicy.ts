@@ -44,7 +44,9 @@ export function generationIneligibility(state: {
   readonly resetPending: boolean
   readonly isSwitchingResponseProfile: boolean
   readonly androidAssistant: AndroidAssistantProjection | null
+  readonly unsavedResult?: import('./lib/appSnapshot').UnsavedResult | null
 }, selectedAvailable: boolean, updateBlocked: boolean): string | null {
+  if (state.unsavedResult != null) return 'answer-not-saved'
   if (state.startupState.kind !== 'ready') return 'startup-not-ready'
   if (!selectedAvailable) return 'provider-unavailable'
   if (!instantMatchesResponseProfile(state.startupState, state.assistantSettings.instant)) return 'profile-mismatch'

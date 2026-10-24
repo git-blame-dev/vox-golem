@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
 import { FrontendSession } from './FrontendSession'
 import { sessionAuthority } from './SessionAuthority'
-import { appSnapshot, canonicalTurn, completeCapabilities, readyStartupState } from './test/sessionFixtures'
+import { appSnapshot, canonicalTurn, completeCapabilities, readyStartupState, durableId } from './test/sessionFixtures'
 
 type Availability = 'warming' | 'available' | 'failed'
 let root: Root | null = null
@@ -27,10 +27,10 @@ function deferred<T>() {
   return { promise, resolve }
 }
 
-async function mount(initial: Availability = 'available', session = new FrontendSession()) {
+async function mount(initial: Availability = 'available', session = new FrontendSession(), durable = false) {
   vi.useFakeTimers()
   let availability = initial
-  let sessionId = '1'
+  let sessionId = durable ? durableId(1) : '1'
   let transcript: Record<string, unknown>[] = []
   let snapshotResponse: (() => Promise<unknown>) | null = null
   let startupResponse: (() => Promise<unknown>) | null = null
@@ -53,7 +53,7 @@ async function mount(initial: Availability = 'available', session = new Frontend
       const request = args as { requestId: string; prompt: string }
       const turn = canonicalTurn('1', '2', request.prompt, 'Synthetic admitted answer', request.requestId, 'text', 'instant', sessionId)
       transcript = [turn]
-      return { request_id: request.requestId, runtime_phase: 'sleeping', outcome: 'completed', turn }
+      return { kind: 'completed', save_disposition: 'saved', turn }
     }
     if (command === 'reset_session') { sessionId = '3'; transcript = []; return snapshot() }
     if (command === 'get_update_snapshot') return { revision: 1, phase: 'up_to_date', operation: null, current_version: 'synthetic-version', version: null, notes: null, progress_phase: null, downloaded_bytes: 0, total_bytes: null, error: null, reason: null, auto_download_enabled: false, auto_install_enabled: false }
@@ -84,6 +84,51 @@ const sendButton = () => container!.querySelector<HTMLButtonElement>('button[typ
 const poll = async (milliseconds = 1_000) => { await act(async () => { await vi.advanceTimersByTimeAsync(milliseconds) }) }
 
 describe('desktop change-triggered canonical model controls', () => {
+  it('applies held control updates without allowing their pre-settlement null disposition to erase an unsaved answer', async () => {
+    const session = new FrontendSession()
+    const state = await mount('available', session, true)
+    const authority = sessionAuthority(session)
+    const pending = deferred<unknown>()
+    const held = deferred<unknown>()
+    const original = state.invoke.getMockImplementation()!
+    let requestId = ''
+    let discarded = false
+    state.invoke.mockImplementation(async (command, args) => {
+      if (command === 'submit_prompt') { requestId = (args as { requestId: string }).requestId; return pending.promise }
+      if (command === 'discard_unsaved_and_new_chat') {
+        if (JSON.stringify(args) !== JSON.stringify({ executionId: { session_id: durableId(1), generation: durableId(20) } })) throw new Error('Synthetic stale discard target')
+        discarded = true; return null
+      }
+      if (command === 'get_app_snapshot' && discarded) return appSnapshot([], {}, { session_id: '2' })
+      return original(command, args)
+    })
+    await typeQuestion()
+    await act(async () => { sendButton().click() })
+    const before = state.snapshots()
+    const controls = { ...state.snapshot(), capabilities: completeCapabilities({ deep: 'failed' }), preferences: { ...(state.snapshot()['preferences'] as Record<string, unknown>), completion: true, ui_theme: 'light' } }
+    state.setSnapshotResponse(() => held.promise)
+    state.setStartupResponse(async () => ({ ...state.startup(), capabilities: completeCapabilities({ deep: 'failed' }) }))
+    await poll()
+    expect(state.snapshots()).toBeGreaterThan(before)
+    const unsaved = { request_id: requestId, execution_id: { session_id: durableId(1), generation: durableId(20) }, prompt: 'Synthetic controls question', answer: { kind: 'text', text: 'Synthetic retained unsaved answer' }, sources: [], final_stage: 'instant', reason: 'storage_error' }
+    await act(async () => { pending.resolve({ kind: 'unsaved', save_disposition: 'unsaved', unsaved_result: unsaved }) })
+    expect(container!.querySelector('[aria-label="Unsaved answer"]')).not.toBeNull()
+    await act(async () => { held.resolve(controls) })
+    expect(container!.querySelector('[aria-label="Unsaved answer"]')?.textContent).toContain('Synthetic retained unsaved answer')
+    expect(authority.fieldRef('uiTheme').current).toBe('light')
+    expect(authority.fieldRef('assistantSettings').current.completion).toBe(true)
+    expect(authority.fieldRef('startupState').current).toMatchObject({ capabilities: expect.arrayContaining([expect.objectContaining({ id: 'deep', state: 'failed' })]) })
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
+    await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="Copy unsaved response"]')!.click() })
+    expect(writeText).toHaveBeenCalledWith('Synthetic retained unsaved answer')
+    await typeQuestion()
+    expect(sendButton().disabled).toBe(true)
+    expect(state.invoke.mock.calls.some(([command]) => command === 'request_completion')).toBe(false)
+    await act(async () => { container!.querySelector<HTMLButtonElement>('[aria-label="New Chat"]')!.click() })
+    expect(container!.querySelector('[aria-label="Unsaved answer"]')).toBeNull()
+    expect(state.invoke.mock.calls.filter(([command]) => command === 'discard_unsaved_and_new_chat')).toEqual([['discard_unsaved_and_new_chat', { executionId: { session_id: durableId(1), generation: durableId(20) } }]])
+  })
   it('does not suppress autonomous native audio on hide or renderer detach, and admits no typed-control cues', async () => {
     const state = await mount()
     expect(state.invoke.mock.calls.filter(([command]) => command === 'set_native_audio_active')).toEqual([])
