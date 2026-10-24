@@ -292,7 +292,7 @@ fn execute(store: &mut Store, raw: &str) -> Result<String, Error> {
                 strict_parent: bool,
             }
             let input: Preparation = parse(&request.request)?;
-            success(store.prepare_mobile(
+            success(store.prepare_request(
                 input.selection,
                 &input.prompt,
                 input.total_text_bytes,

@@ -50,6 +50,7 @@ pub enum AdmissionError {
     RequestIdTooLong,
     PromptTooLong,
     Busy,
+    InvalidContext,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateResult {
@@ -100,7 +101,7 @@ pub struct AdmissionSnapshot {
     pub execution_id: ExecutionId,
     pub request_id: RequestId,
     pub prompt: String,
-    pub history: Vec<Message>,
+    pub history: Vec<crate::assistant::ConversationTurn>,
     pub policy: AssistantPolicy,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -268,6 +269,47 @@ impl ConversationSession {
         request_id: &str,
         prompt: &str,
     ) -> Result<AdmissionSnapshot, AdmissionError> {
+        self.admit_inner(request_id, prompt, None)
+    }
+
+    /// Admit an immutable provider context owned by the durable history authority.
+    /// Retained sessions cannot combine external and independently retained history.
+    pub fn admit_with_context(
+        &mut self,
+        request_id: &str,
+        prompt: &str,
+        history: Vec<crate::assistant::ConversationTurn>,
+    ) -> Result<AdmissionSnapshot, AdmissionError> {
+        if self.retain_committed_history
+            || history.len() > MAX_COMMITTED_MESSAGES
+            || !history.len().is_multiple_of(2)
+            || history.iter().enumerate().any(|(index, turn)| {
+                turn.role
+                    != if index % 2 == 0 {
+                        Role::User
+                    } else {
+                        Role::Assistant
+                    }
+                    || (index % 2 == 0 && !matches!(turn.content, Content::Text(_)))
+            })
+            || history
+                .iter()
+                .try_fold(prompt.len(), |bytes, turn| {
+                    bytes.checked_add(content_bytes(&turn.content))
+                })
+                .is_none_or(|bytes| bytes > MAX_COMMITTED_TEXT_BYTES)
+        {
+            return Err(AdmissionError::InvalidContext);
+        }
+        self.admit_inner(request_id, prompt, Some(history))
+    }
+
+    fn admit_inner(
+        &mut self,
+        request_id: &str,
+        prompt: &str,
+        history: Option<Vec<crate::assistant::ConversationTurn>>,
+    ) -> Result<AdmissionSnapshot, AdmissionError> {
         if request_id.is_empty() {
             return Err(AdmissionError::EmptyRequestId);
         }
@@ -288,15 +330,7 @@ impl ConversationSession {
             generation: GenerationId(self.next_generation),
         };
         self.next_generation += 1;
-        let history = self
-            .turns
-            .iter()
-            .flat_map(|t| {
-                let mut answer = t.answer.clone();
-                answer.content = context_answer(t);
-                [t.user.clone(), answer]
-            })
-            .collect();
+        let history = history.unwrap_or_else(|| self.provider_history());
         let snapshot = AdmissionSnapshot {
             execution_id,
             request_id: RequestId(request_id.into()),
@@ -527,6 +561,94 @@ fn content_bytes(content: &Content) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn external_context_is_validated_and_pinned() {
+        use crate::assistant::ConversationTurn;
+        let pair = vec![
+            ConversationTurn {
+                role: Role::User,
+                content: Content::Text("Synthetic prior".into()),
+            },
+            ConversationTurn {
+                role: Role::Assistant,
+                content: Content::Refusal("Synthetic refusal".into()),
+            },
+        ];
+        let mut session = ConversationSession::execution_only(policy());
+        let mut oversized = pair.clone();
+        oversized[0].content = Content::Text("😀".repeat(MAX_COMMITTED_TEXT_BYTES / 4));
+        let mut reversed = pair.clone();
+        reversed.swap(0, 1);
+        let mut refused_user = pair.clone();
+        refused_user[0].content = Content::Refusal("Synthetic invalid user".into());
+        for invalid in [
+            vec![pair[0].clone()],
+            vec![pair.clone(); 21].concat(),
+            oversized,
+            reversed,
+            refused_user,
+        ] {
+            assert_eq!(
+                session.admit_with_context("synthetic", "prompt", invalid),
+                Err(AdmissionError::InvalidContext)
+            );
+            assert_eq!((session.next_generation, session.next_message), (1, 1));
+            assert!(!session.has_active_execution());
+            assert!(session.turns().is_empty());
+        }
+        assert_eq!(
+            ConversationSession::new(policy()).admit_with_context(
+                "synthetic",
+                "prompt",
+                pair.clone()
+            ),
+            Err(AdmissionError::InvalidContext)
+        );
+        let admitted = session
+            .admit_with_context("synthetic", "prompt", pair.clone())
+            .unwrap();
+        assert_eq!(admitted.history, pair);
+        assert_eq!(admitted.execution_id.generation, GenerationId(1));
+        complete(
+            &mut session,
+            admitted.execution_id,
+            Content::Text("Synthetic answer".into()),
+        );
+        assert!(matches!(
+            session.settle(admitted.execution_id, SettlementIntent::Success),
+            SettlementResult::Applied(AppliedOutcome::Completed(_))
+        ));
+        assert!(session.turns().is_empty());
+        assert!(session.provider_history().is_empty());
+        let next = session
+            .admit_with_context("synthetic-next", "prompt", Vec::new())
+            .unwrap();
+        assert!(next.history.is_empty());
+    }
+
+    #[test]
+    fn external_context_budget_counts_utf8_prompt_exactly_once() {
+        use crate::assistant::ConversationTurn;
+        let mut session = ConversationSession::execution_only(policy());
+        let history = vec![
+            ConversationTurn {
+                role: Role::User,
+                content: Content::Text("😀".into()),
+            },
+            ConversationTurn {
+                role: Role::Assistant,
+                content: Content::Text("a".repeat(MAX_COMMITTED_TEXT_BYTES - 5)),
+            },
+        ];
+        assert_eq!(
+            session.admit_with_context("synthetic", "ab", history.clone()),
+            Err(AdmissionError::InvalidContext)
+        );
+        assert_eq!(session.next_generation, 1);
+        assert!(session
+            .admit_with_context("synthetic", "a", history)
+            .is_ok());
+    }
     fn policy() -> AssistantPolicy {
         AssistantPolicy::default()
     }

@@ -93,13 +93,35 @@ pub struct CompletedTurn {
     pub record: Record,
     pub saved: bool,
 }
+
+/// Final execution authority, resolved after staging and before durable publication.
+pub enum CompletionDecision {
+    Authorized,
+    Cancelled,
+    Unavailable,
+}
+
+// A single synchronous callback value, never queued/retained in a collection.
+// Keep the completed record inline rather than allocate solely for empty variants.
+#[allow(clippy::large_enum_variant)]
+pub enum CompletionAttempt {
+    Cancelled,
+    Unavailable,
+    Finished(Result<CompletedTurn>),
+}
+
+struct StagedCompletion<'a> {
+    tx: Transaction<'a>,
+    next: CoreStore,
+    completed: CompletedTurn,
+}
 pub struct PreparedContext {
     pub context: ContextSelection,
     pub created: Option<Record>,
 }
 
 #[derive(Serialize)]
-pub struct MobilePreparedContext {
+pub struct PreparedRequestContext {
     pub context: ProviderContext,
     pub request: OperationId,
 }
@@ -309,17 +331,17 @@ impl Store {
             .map(|(prepared, _)| prepared)
     }
 
-    /// Mobile actor reconciles typed selection and persists its input draft first.
-    /// SQLite runs outside its admission monitor; a short final ticket check decides
+    /// Atomically pin context, allocate request identity and persist the admitted draft.
+    /// SQLite runs outside the shell admission monitor; its final ticket check decides
     /// whether to execute. A successful late-cancel preparation remains durable.
     /// `total_text_bytes` includes the prompt exactly once, not a remaining budget.
-    pub fn prepare_mobile(
+    pub fn prepare_request(
         &mut self,
         expected: Selection,
         prompt: &str,
         total_text_bytes: usize,
         strict_parent: bool,
-    ) -> Result<MobilePreparedContext> {
+    ) -> Result<PreparedRequestContext> {
         if total_text_bytes > 256 * 1024 || prompt.len() > total_text_bytes {
             return Err(limit("provider_context").into());
         }
@@ -330,7 +352,7 @@ impl Store {
             strict_parent,
             true,
         )?;
-        Ok(MobilePreparedContext {
+        Ok(PreparedRequestContext {
             context: provider_context(prepared.context),
             request: request.ok_or(Error::Storage)?,
         })
@@ -579,12 +601,57 @@ impl Store {
     /// Trusted thin adapters may supply the same immutable pinned body directly, avoiding
     /// an extra hash/record JNI round-trip. Only the shared codec/reducer validate it.
     pub fn complete_body(&mut self, body: OperationBody) -> Result<CompletedTurn> {
+        self.complete_body_with_authority(
+            body,
+            || ((), CompletionDecision::Authorized),
+            |_, attempt| match attempt {
+                CompletionAttempt::Finished(result) => result,
+                _ => unreachable!("unit authority always authorizes"),
+            },
+        )
+    }
+
+    /// Stage first, then retain final authority across SQLite COMMIT, core publication
+    /// and terminal winner bookkeeping, all on this synchronous worker. Neither callback
+    /// may call the store or acquire a lock whose owner waits for this store. Do not move
+    /// guards across async boundaries. Unavailable authority never permits a commit.
+    pub fn complete_body_with_authority<G, R>(
+        &mut self,
+        body: OperationBody,
+        acquire: impl FnOnce() -> (G, CompletionDecision),
+        finish: impl FnOnce(&mut G, CompletionAttempt) -> R,
+    ) -> R {
+        let staged = Self::stage_completion(&mut self.db, &mut self.core, body);
+        let (mut guard, decision) = acquire();
+        let attempt = match decision {
+            CompletionDecision::Cancelled => {
+                drop(staged);
+                CompletionAttempt::Cancelled
+            }
+            CompletionDecision::Unavailable => {
+                drop(staged);
+                CompletionAttempt::Unavailable
+            }
+            CompletionDecision::Authorized => {
+                CompletionAttempt::Finished(staged.and_then(|staged| {
+                    staged.tx.timed_commit()?;
+                    self.core = staged.next;
+                    Ok(staged.completed)
+                }))
+            }
+        };
+        finish(&mut guard, attempt)
+    }
+
+    fn stage_completion<'a>(
+        db: &'a mut Connection,
+        core: &mut CoreStore,
+        body: OperationBody,
+    ) -> Result<StagedCompletion<'a>> {
         if !matches!(body, OperationBody::TurnCompleted { .. }) {
             return Err(invalid("completion_body").into());
         }
-        let tx = self
-            .db
-            .timed_transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = db.timed_transaction_with_behavior(TransactionBehavior::Immediate)?;
         let id = allocate_id(&tx)?;
         let record = codec::record(Operation {
             version: SCHEMA_VERSION,
@@ -592,18 +659,20 @@ impl Store {
             body,
         })?;
         let (outcome, next) = Self::import_within_tx_with_hook(
-            &mut self.core,
+            core,
             &tx,
             vec![record.clone()],
             false,
             Some(&record.operation.id),
             |_| Ok(()),
         )?;
-        tx.timed_commit()?;
-        self.core = next;
         let saved = !outcome.suppressed.contains(&record.operation.id)
             && !outcome.quarantined.contains(&record.operation.id);
-        Ok(CompletedTurn { record, saved })
+        Ok(StagedCompletion {
+            tx,
+            next,
+            completed: CompletedTurn { record, saved },
+        })
     }
     pub fn persist_settled_turn(
         &mut self,

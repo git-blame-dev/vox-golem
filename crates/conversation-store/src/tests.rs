@@ -1,5 +1,204 @@
 use super::*;
 
+#[test]
+fn actual_sqlite_commit_observes_retained_final_authority() {
+    use std::sync::Mutex;
+    static AUTHORITY: Mutex<()> = Mutex::new(());
+    static COMMIT_OBSERVED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    fn commit_busy(_: i32) -> bool {
+        // The reader permits BEGIN IMMEDIATE and every staged write, but prevents
+        // COMMIT's exclusive lock. This callback is SQLite's real COMMIT path.
+        assert!(AUTHORITY.try_lock().is_err());
+        COMMIT_OBSERVED.store(true, Ordering::SeqCst);
+        false
+    }
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let prepared = store
+        .prepare_request(
+            Selection {
+                conversation: None,
+                selected_head: None,
+            },
+            "Synthetic prompt",
+            4096,
+            true,
+        )
+        .unwrap();
+    let context = prepared.context.selection;
+    let body = turn(&mut store, &context, "Synthetic prompt")
+        .operation
+        .body;
+    let before = store.snapshot().unwrap();
+    store
+        .db
+        .execute_batch("PRAGMA journal_mode=DELETE")
+        .unwrap();
+    let reader = Connection::open(fixture.path()).unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT * FROM history_state;")
+        .unwrap();
+    store.db.busy_handler(Some(commit_busy)).unwrap();
+    store.complete_body_with_authority(
+        body,
+        || {
+            assert!(!COMMIT_OBSERVED.load(Ordering::SeqCst));
+            (AUTHORITY.lock().unwrap(), CompletionDecision::Authorized)
+        },
+        |_, attempt| {
+            assert!(AUTHORITY.try_lock().is_err());
+            assert!(COMMIT_OBSERVED.load(Ordering::SeqCst));
+            assert!(matches!(
+                attempt,
+                CompletionAttempt::Finished(Err(Error::Database(
+                    rusqlite::ErrorCode::DatabaseBusy
+                )))
+            ));
+        },
+    );
+    reader.execute_batch("ROLLBACK").unwrap();
+    drop(reader);
+    assert_eq!(store.snapshot().unwrap(), before);
+    assert_eq!(
+        store.draft(Some(&context.conversation)).unwrap().text,
+        "Synthetic prompt"
+    );
+}
+
+#[test]
+fn final_authority_controls_commit_and_retains_guard_through_winner() {
+    use std::sync::Mutex;
+    for decision in [
+        CompletionDecision::Cancelled,
+        CompletionDecision::Unavailable,
+        CompletionDecision::Authorized,
+    ] {
+        let fixture = Fixture::new();
+        let mut store = fixture.open();
+        let prepared = store
+            .prepare_request(
+                Selection {
+                    conversation: None,
+                    selected_head: None,
+                },
+                "Synthetic prompt",
+                4096,
+                true,
+            )
+            .unwrap();
+        let context = prepared.context.selection;
+        let body = turn(&mut store, &context, "Synthetic prompt")
+            .operation
+            .body;
+        let before = store.snapshot().unwrap();
+        let authority = Mutex::new(false);
+        let saved = store.complete_body_with_authority(
+            body,
+            || (authority.lock().unwrap(), decision),
+            |guard, attempt| {
+                assert!(
+                    authority.try_lock().is_err(),
+                    "authority retained during winner bookkeeping"
+                );
+                **guard = true;
+                match attempt {
+                    CompletionAttempt::Finished(result) => {
+                        assert!(result.unwrap().saved);
+                        true
+                    }
+                    CompletionAttempt::Cancelled | CompletionAttempt::Unavailable => false,
+                }
+            },
+        );
+        assert!(*authority.lock().unwrap());
+        assert_eq!(store.snapshot().unwrap() != before, saved);
+        assert_eq!(
+            fixture.open().snapshot().unwrap(),
+            store.snapshot().unwrap()
+        );
+        assert_eq!(
+            store
+                .draft(Some(&context.conversation))
+                .unwrap()
+                .text
+                .is_empty(),
+            saved
+        );
+    }
+}
+
+#[test]
+fn staging_and_real_commit_errors_still_arbitrate_under_authority() {
+    use std::sync::Mutex;
+    for staging_failure in [false, true] {
+        for cancel in [false, true] {
+            let fixture = Fixture::new();
+            let mut store = fixture.open();
+            let prepared = store
+                .prepare_request(
+                    Selection {
+                        conversation: None,
+                        selected_head: None,
+                    },
+                    "Synthetic prompt",
+                    4096,
+                    true,
+                )
+                .unwrap();
+            let context = prepared.context.selection;
+            let mut body = turn(&mut store, &context, "Synthetic prompt")
+                .operation
+                .body;
+            let before = store.snapshot().unwrap();
+            if staging_failure {
+                body = OperationBody::ConversationCreated {
+                    title: "Synthetic invalid completion".into(),
+                };
+            } else {
+                // An AFTER trigger succeeds at staging but fails the actual COMMIT:
+                // the missing parent is checked only at transaction completion.
+                store.db.execute_batch("CREATE TABLE synthetic_parent(id INTEGER PRIMARY KEY); CREATE TABLE synthetic_child(id INTEGER REFERENCES synthetic_parent(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER synthetic_commit_failure AFTER DELETE ON history_drafts BEGIN INSERT INTO synthetic_child VALUES(1); END;").unwrap();
+            }
+            let authority = Mutex::new(());
+            store.complete_body_with_authority(
+                body,
+                || {
+                    (
+                        authority.lock().unwrap(),
+                        if cancel {
+                            CompletionDecision::Cancelled
+                        } else {
+                            CompletionDecision::Authorized
+                        },
+                    )
+                },
+                |_, attempt| {
+                    assert!(authority.try_lock().is_err());
+                    if cancel {
+                        assert!(matches!(attempt, CompletionAttempt::Cancelled));
+                    } else if !staging_failure {
+                        assert!(matches!(
+                            attempt,
+                            CompletionAttempt::Finished(Err(Error::Database(
+                                rusqlite::ErrorCode::ConstraintViolation
+                            )))
+                        ));
+                    } else {
+                        assert!(matches!(attempt, CompletionAttempt::Finished(Err(_))));
+                    }
+                },
+            );
+            assert_eq!(store.snapshot().unwrap(), before);
+            assert_eq!(fixture.open().snapshot().unwrap(), before);
+            assert_eq!(
+                store.draft(Some(&context.conversation)).unwrap().text,
+                "Synthetic prompt"
+            );
+        }
+    }
+}
+
 fn sync_read(store: &mut Store, request: serde_json::Value) -> serde_json::Value {
     store
         .replication(serde_json::from_value(request).unwrap())
@@ -449,7 +648,7 @@ fn mobile_preparation_allocates_atomically_keeps_late_cancel_state_and_obeys_tot
     };
     store.save_draft(None, "Synthetic prompt", true).unwrap();
     let prepared = store
-        .prepare_mobile(empty.clone(), "Synthetic prompt", 256 * 1024, false)
+        .prepare_request(empty.clone(), "Synthetic prompt", 256 * 1024, false)
         .unwrap();
     let conversation = prepared.context.selection.conversation.clone();
     assert_eq!(prepared.request.sequence, "2");
@@ -481,7 +680,7 @@ fn mobile_preparation_allocates_atomically_keeps_late_cancel_state_and_obeys_tot
     let null_parent_owner = store.selection().unwrap();
     assert!(null_parent_owner.selected_head.is_none());
     assert!(store
-        .prepare_mobile(null_parent_owner, "Synthetic stale voice", 256 * 1024, true)
+        .prepare_request(null_parent_owner, "Synthetic stale voice", 256 * 1024, true)
         .is_err());
     assert_eq!(
         store.draft(Some(&conversation)).unwrap().text,
@@ -498,16 +697,36 @@ fn mobile_preparation_allocates_atomically_keeps_late_cancel_state_and_obeys_tot
     let prompt = "Synthetic next prompt";
     let history_bytes = first.operation.context_bytes();
     let exact = store
-        .prepare_mobile(selected_head, prompt, history_bytes + prompt.len(), true)
+        .prepare_request(selected_head, prompt, history_bytes + prompt.len(), true)
         .unwrap();
+    assert_eq!(exact.context.selection.turns.len(), 1);
+    assert_eq!(
+        exact.context.selection.parent,
+        Some(first.operation.id.clone())
+    );
+    let pinned_request = exact.request.clone();
+    // Later owner changes cannot rewrite the admitted context or request identity.
+    store
+        .select(Selection {
+            conversation: None,
+            selected_head: None,
+        })
+        .unwrap();
+    let later_selection = store.selection().unwrap();
+    let later = store
+        .prepare_request(later_selection, "Synthetic later prompt", 4096, true)
+        .unwrap();
+    assert_ne!(later.request, pinned_request);
+    assert_eq!(exact.request, pinned_request);
+    assert_eq!(exact.context.selection.parent, Some(first.operation.id));
     assert_eq!(exact.context.selection.turns.len(), 1);
     let before = store.snapshot().unwrap();
     assert!(store
-        .prepare_mobile(selected, prompt, 256 * 1024, true)
+        .prepare_request(selected, prompt, 256 * 1024, true)
         .is_err());
     assert_eq!(store.snapshot().unwrap(), before);
     assert!(store
-        .prepare_mobile(empty, prompt, 256 * 1024, false)
+        .prepare_request(empty, prompt, 256 * 1024, false)
         .is_err());
 }
 
@@ -522,7 +741,7 @@ fn failed_mobile_preparation_rolls_back_identity_selection_and_preserves_input_d
         selected_head: None,
     };
     assert!(store
-        .prepare_mobile(empty.clone(), "Synthetic rollback", 256 * 1024, true)
+        .prepare_request(empty.clone(), "Synthetic rollback", 256 * 1024, true)
         .is_err());
     assert_eq!(store.selection().unwrap(), empty);
     assert_eq!(store.snapshot().unwrap(), StoreSnapshot::empty());
