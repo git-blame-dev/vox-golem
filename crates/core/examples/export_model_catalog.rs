@@ -1,4 +1,4 @@
-use voxgolem_core::model_catalog;
+use voxgolem_core::{model_catalog, response_style};
 
 fn main() {
     println!(
@@ -6,6 +6,7 @@ fn main() {
         serde_json::json!({
             "models": model_catalog::model_catalog(),
             "defaults": model_catalog::DEFAULT_MODEL_CHOICES,
+            "responsePolicy": { "plainTextPolicy": response_style::PLAIN_TEXT_POLICY },
         })
     );
 }
