@@ -24,6 +24,10 @@ class AssistantReplicationListenerService : WearableListenerService() {
         }
     }
     override fun onChannelOpened(channel: ChannelClient.Channel) {
+        if (!dev.gitblame.voxgolem.voice.backgroundServicesAdmitted(this)) {
+            com.google.android.gms.wearable.Wearable.getChannelClient(this).close(channel)
+            return
+        }
         if (PhoneRelayWire.validPath(channel.path)) {
             PhoneRelayBridge.onChannelOpened(applicationContext, channel)
         }

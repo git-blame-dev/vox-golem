@@ -19,17 +19,29 @@ import java.util.concurrent.Executor
 class EnginePhoneSnapshotTest {
     private class Queue : Executor {
         private val tasks = ConcurrentLinkedQueue<Runnable>()
-        override fun execute(command: Runnable) { tasks.add(command) }
+        var closed = false
+        var rejected = 0
+        var accepted = 0
+        override fun execute(command: Runnable) {
+            if (closed) { rejected++; throw java.util.concurrent.RejectedExecutionException("Synthetic retired actor") }
+            accepted++; tasks.add(command)
+        }
         fun drain() { while (true) (tasks.poll() ?: return).run() }
+        fun runNext() { checkNotNull(tasks.poll()).run() }
     }
 
-    private class Fixture(val choose: Boolean = false, val rejectContext: Boolean = false) : AutoCloseable {
+    private class Fixture(val choose: Boolean = false, val rejectContext: Boolean = false,
+        initiallyEmpty: Boolean = false) : AutoCloseable {
         private val context = RuntimeEnvironment.getApplication()
         private val io = Queue()
         val calls = mutableListOf<String>()
         lateinit var conversation: JSONObject
         private lateinit var head: JSONObject
         private val store = AssistantStore(context).apply {
+            if (initiallyEmpty) {
+                selectConversation(null, null)
+                saveDraft(null, "Synthetic unassigned draft")
+            } else {
             conversation = createConversation("Synthetic conversation").getJSONObject("operation").getJSONObject("id")
             val ctx = context(conversation, null)
             head = completeTurn(
@@ -52,6 +64,7 @@ class EnginePhoneSnapshotTest {
             }
             selectConversation(conversation, if (choose) null else head)
             saveDraft(conversation, "Synthetic retained draft")
+            }
         }
         private val models = object : AssistantModelStorage {
             override fun read() = "custom-sol-high"
@@ -123,11 +136,149 @@ class EnginePhoneSnapshotTest {
             assertEquals(voiceContext.toString(), outcome.getJSONObject("voiceContext").toString())
             return outcome
         }
-        override fun close() { engine.stop(); io.drain(); worker.close(); store.close() }
+        fun closeDispatchForTest() { io.closed = true }
+        fun rejectedDispatches() = io.rejected
+        fun acceptedDispatches() = io.accepted
+        @Suppress("UNCHECKED_CAST") fun installDeliveryForTest() {
+            val field = EnginePhoneBackend::class.java.getDeclaredField("delivery").apply { isAccessible = true }
+            val sink = field.get(backend) as java.util.concurrent.atomic.AtomicReference<PhoneRequestDelivery?>
+            sink.set(PhoneRequestDelivery("synthetic-owned-request", {}, {}))
+        }
+        fun drain() = io.drain()
+        fun runNext() = io.runNext()
+        fun conversationCount() = store.view().getJSONArray("conversations").length()
+        fun selectedDraft() = engine.snapshot().draft
+        override fun close() { io.closed = false; engine.stop(); io.drain(); worker.close(); store.close() }
         companion object {
             private fun provenance() = JSONObject().put("requested_model", "synthetic-model")
                 .put("returned_model", JSONObject.NULL).put("policy_id", "synthetic-policy").put("policy_version", "1")
                 .put("instruction_profile_id", "synthetic-instructions").put("instruction_profile_version", "1")
+        }
+    }
+
+    @Test fun retiredTransportRejectsLateCommandsAndLifecycleWithoutTouchingClosedActor() {
+        Fixture().use { f ->
+            f.backend.retireIngress()
+            f.closeDispatchForTest()
+            f.backend.foreground(false)
+            f.backend.foreground(true)
+            f.backend.prewarm()
+            f.backend.saveSpeechDraft("Synthetic late draft")
+            f.backend.saveOwnedSpeechDraft("Synthetic late draft", null, null)
+            f.backend.publishSpeechOptions(dev.gitblame.voxgolem.assistant.speech.SpeechOptions())
+            f.backend.cancelDelivery("synthetic-late-request")
+            f.backend.observeSpeechContext { fail("Retired observer") }.close()
+            f.backend.observeSpeechStream { _, _ -> fail("Retired stream") }.close()
+            assertFalse(f.backend.acknowledge("synthetic-late-request", "synthetic-provider", "1", false))
+            var commands = 0
+            f.backend.command("get_app_snapshot", JSONObject()) { result ->
+                commands++; assertEquals("unavailable", (result.exceptionOrNull() as AssistantPhoneFailure).code)
+            }
+            var terminals = 0
+            f.backend.submit("synthetic-late-request", "Synthetic input", { fail("Retired delta") }) { result ->
+                terminals++; assertEquals("unavailable", (result.exceptionOrNull() as AssistantPhoneFailure).code)
+            }
+            assertEquals(1, commands); assertEquals(1, terminals)
+            assertEquals(0, f.rejectedDispatches())
+        }
+    }
+
+    @Test fun queuedContextPublicationCannotReenterRetiredTransport() {
+        Fixture().use { f ->
+            var contexts = 0
+            val observer = f.backend.observeSpeechContext { contexts++ }
+            f.backend.retireIngress()
+            f.drain()
+            assertEquals(0, contexts)
+            observer.close()
+        }
+    }
+
+    @Test fun retirementSignalsOwnedCancellationBeforeActorCloseAndNeverReschedulesIt() {
+        Fixture().use { f ->
+            f.installDeliveryForTest()
+            val before = f.acceptedDispatches()
+            f.backend.retireIngress()
+            assertEquals(before + 1, f.acceptedDispatches())
+            f.closeDispatchForTest()
+            f.backend.retireIngress()
+            assertEquals(0, f.rejectedDispatches())
+            assertEquals(before + 1, f.acceptedDispatches())
+        }
+    }
+
+    @Test fun queuedEmptySnapshotCannotScheduleConversationAfterRetirement() {
+        NewVoiceShortcutLauncher.cancelEntries()
+        Fixture(initiallyEmpty = true).use { f ->
+            val beforeCount = f.conversationCount()
+            val beforeDispatch = f.acceptedDispatches()
+            var replies = 0
+            var outcome: Result<Any?>? = null
+            f.backend.command("get_app_snapshot", JSONObject()) { replies++; outcome = it }
+            f.backend.retireIngress()
+            f.drain()
+            assertEquals(beforeDispatch + 1, f.acceptedDispatches())
+            assertEquals(beforeCount, f.conversationCount())
+            assertEquals(1, replies)
+            assertEquals("unavailable", (outcome!!.exceptionOrNull() as AssistantPhoneFailure).code)
+        }
+    }
+
+    @Test fun alreadyQueuedConversationCannotScheduleDraftContinuationAfterRetirement() {
+        NewVoiceShortcutLauncher.cancelEntries()
+        Fixture(initiallyEmpty = true).use { f ->
+            var replies = 0
+            var outcome: Result<Any?>? = null
+            f.backend.command("get_app_snapshot", JSONObject()) { replies++; outcome = it }
+            f.runNext() // selectedContext has queued the pre-retirement conversation operation.
+            val beforeRetireDispatch = f.acceptedDispatches()
+            f.backend.retireIngress()
+            f.drain()
+            assertEquals(beforeRetireDispatch, f.acceptedDispatches())
+            assertEquals(1, replies)
+            assertEquals("unavailable", (outcome!!.exceptionOrNull() as AssistantPhoneFailure).code)
+            assertEquals("", f.selectedDraft())
+        }
+    }
+
+    @Test fun frozenLatePluginBindingLoadsAndRejectsVoiceWithoutConstructingSpeechOrUsingActor() {
+        Fixture().use { f ->
+            f.backend.retireIngress()
+            f.closeDispatchForTest()
+            val controller = org.robolectric.Robolectric.buildActivity(androidx.activity.ComponentActivity::class.java).create().start()
+            val activity = controller.get()
+            var speechReads = 0
+            val binding = object : PhoneActivityBinding {
+                override val backend = f.backend
+                override val speech: PhoneSpeechSession get() { speechReads++; error("No speech owner was ever constructed") }
+                override fun webViewCreated(webView: android.webkit.WebView) = Unit
+                override fun admitVoice(policy: String, draft: String, loop: Boolean, shortcut: String?) = error("Retired voice")
+                override fun admitPrompt(requestId: String, prompt: String) = error("Retired prompt")
+                override fun terminal(requestId: String, result: Result<Any?>) = Unit
+            }
+            val plugin = AssistantPlugin(activity, binding)
+            val view = android.webkit.WebView(activity)
+            plugin.load(view)
+            controller.resume()
+            val commands = listOf<(app.tauri.plugin.Invoke) -> Unit>(plugin::assistant_voice_status,
+                plugin::get_app_snapshot, plugin::set_preferences, plugin::cancel_prompt,
+                plugin::start_assistant_voice, plugin::finish_assistant_dictation, plugin::stop_assistant_voice,
+                plugin::prepare_new_voice_shortcut, plugin::stop_send_new_voice_shortcut,
+                plugin::submit_prompt, plugin::new_conversation, plugin::select_conversation, plugin::select_conversation_head)
+            val mapper = Class.forName("com.fasterxml.jackson.databind.ObjectMapper").getConstructor().newInstance()
+            for (command in commands) {
+                val replies = mutableListOf<Pair<Long, String>>()
+                val sender: (Long, String) -> Unit = { callback, value -> replies += callback to value }
+                val invoke = app.tauri.plugin.Invoke::class.java.constructors.single()
+                    .newInstance(1L, "synthetic", 10L, 11L, sender, "{}", mapper) as app.tauri.plugin.Invoke
+                command(invoke)
+                assertEquals(11L, replies.single().first)
+                assertEquals("unavailable", JSONObject(replies.single().second).getString("code"))
+            }
+            controller.pause().stop().destroy()
+            view.destroy()
+            assertEquals(0, speechReads)
+            assertEquals(0, f.rejectedDispatches())
         }
     }
 

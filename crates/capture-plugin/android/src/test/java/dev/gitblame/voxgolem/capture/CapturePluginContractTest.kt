@@ -20,6 +20,26 @@ import org.robolectric.Shadows.shadowOf
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class CapturePluginContractTest {
+    class IsolatedActivity : Activity(), CaptureAdmissionOwner {
+        override val captureAdmissionEnabled = false
+        override fun getSharedPreferences(name: String, mode: Int): android.content.SharedPreferences =
+            error("Isolated capture commands must not inspect user preferences")
+    }
+
+    @Test fun isolatedShellRejectsCaptureCommandsBeforeReadingUserState() {
+        val activity = Robolectric.buildActivity(IsolatedActivity::class.java).get()
+        val plugin = CapturePlugin(activity)
+        val commands = listOf<(Invoke) -> Unit>(plugin::snapshot, plugin::enable_capture, plugin::list_captures,
+            plugin::select_notes_folder, plugin::play_capture, plugin::stop_playback, plugin::retry_capture,
+            plugin::finalize_capture, plugin::update_transcript)
+        commands.forEach { command ->
+            val responses = mutableListOf<Pair<Long, String>>()
+            command(invoke("synthetic", "{}") { callback, value -> responses += callback to value })
+            assertEquals(11L, responses.single().first)
+            assertEquals("capture-unavailable", JSONObject(responses.single().second).getString("message"))
+        }
+    }
+
     @Test fun updateTranscriptCommandRejectsEveryNonNotePurposeWithoutChangingAnyRecordFields() {
         val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
         val repository = CaptureRepository(activity)

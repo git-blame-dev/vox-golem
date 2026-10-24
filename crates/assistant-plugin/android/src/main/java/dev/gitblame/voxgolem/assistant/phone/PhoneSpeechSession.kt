@@ -60,12 +60,17 @@ data class SpeechAdmissionSnapshot(val owner: SpeechInputOwner, val draft: Strin
 /** Lifecycle/input adapter only. Shared native owners control recognition, playback and loop epochs. */
 class PhoneSpeechSession internal constructor(private val context: Context, private val backend: PhoneSpeechBackend,
     private val dictation: SharedDictationOwner = SharedDictationOwner.configured(context) { speechAdmission(backend.nativePreferences()) },
-    listeningCue: ListeningCue = AndroidListeningCue(context.applicationContext)) : AutoCloseable {
+    listeningCue: ListeningCue = AndroidListeningCue(context.applicationContext),
+    private val output: LocalSpeechOutput = LocalSpeechOutput.configured(context) { speechAdmission(backend.nativePreferences()) },
+    private val beginFlow: () -> dev.gitblame.voxgolem.assistant.AssistantTiming? = { null }) : AutoCloseable {
     constructor(context: Context, backend: EnginePhoneBackend,
         audio: RecordedAudioFactory? = null,
         providerGate: dev.gitblame.voxgolem.assistant.inputtransport.SuppliedAudioProviderGate =
             dev.gitblame.voxgolem.assistant.inputtransport.SuppliedAudioProviderGate.UNPROVEN,
-        recordingEnabled: () -> Boolean = { false }) : this(context, object : PhoneSpeechBackend {
+        recordingEnabled: () -> Boolean = { false },
+        suppliedDictation: SharedDictationOwner? = null,
+        suppliedOutput: LocalSpeechOutput = LocalSpeechOutput.configured(context) { speechAdmission(backend.nativePreferences()) },
+        beginFlow: () -> dev.gitblame.voxgolem.assistant.AssistantTiming? = { null }) : this(context, object : PhoneSpeechBackend {
         override fun busy() = backend.busy()
         override fun saveSpeechDraft(text: String) = backend.saveSpeechDraft(text)
         override fun speechConversation() = backend.speechConversation()
@@ -85,11 +90,10 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
         override var onPreferencesChanged: ((Boolean) -> Unit)?
             get() = backend.onPreferencesChanged
             set(value) { backend.onPreferencesChanged = value }
-    }, dictation = SharedDictationOwner.configuredWithAudio(context,
+    }, dictation = suppliedDictation ?: SharedDictationOwner.configuredWithAudio(context,
         { speechAdmission(backend.nativePreferences()) }, audio = audio,
-        providerGate = providerGate, recordingEnabled = recordingEnabled))
+         providerGate = providerGate, recordingEnabled = recordingEnabled), output = suppliedOutput, beginFlow = beginFlow)
     private val main = Handler(Looper.getMainLooper())
-    private val output = LocalSpeechOutput.configured(context) { speechAdmission(backend.nativePreferences()) }
     private val microphoneCues = MicrophoneCueController(listeningCue)
     private val preferenceObserver: (Boolean) -> Unit = { enabled ->
         if (!closed) {
@@ -369,7 +373,7 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
             backend.prewarm()
             shortcut = StopSendNewPolicy(); shortcutToken = shortcutLaunch; shortcutPrepared = false; shortcutReady = false; shortcutPhase = "listening"
             shortcutUtterance = dictation.start(language, "", purpose = VoiceCapturePurpose.ASK)
-        } else if (singleTurn || repeat) loop.start(language, draft, if (singleTurn) VoiceSessionPolicy.SINGLE_TURN else VoiceSessionPolicy.REPEAT_AFTER_REPLY) else {
+        } else if (singleTurn || repeat) loop.start(language, draft, if (singleTurn) VoiceSessionPolicy.SINGLE_TURN else VoiceSessionPolicy.REPEAT_AFTER_REPLY, beginFlow()) else {
             backend.prewarm()
             draftConversation = owner.conversation; draftHead = owner.selectedHead
             draftUtterance = dictation.start(language, draft)

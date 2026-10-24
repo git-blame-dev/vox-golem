@@ -27,6 +27,7 @@ object AssistantReplication {
         private set
 
     @Synchronized fun start(context: Context, peerAssociationProvider: PeerAssociationProvider, onCommitted: () -> Unit = {}) {
+        if (!dev.gitblame.voxgolem.voice.backgroundServicesAdmitted(context)) return
         val application = context.applicationContext
         val current = owner ?: Owner(application, peerAssociationProvider).also { owner = it }
         current.association = peerAssociationProvider
@@ -89,6 +90,7 @@ object AssistantReplication {
     }
 
     @Synchronized private fun resolve(context: Context, schedulePeriodic: Boolean = true): Owner? {
+        if (!dev.gitblame.voxgolem.voice.backgroundServicesAdmitted(context)) return null
         owner?.let { return it }
         val application = context.applicationContext
         val association = (application as? AssistantPeerAssociationOwner)?.assistantPeerAssociationProvider

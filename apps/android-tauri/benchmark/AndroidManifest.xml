@@ -1,0 +1,15 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
+    <application android:name="dev.gitblame.voxgolem.assistant.phone.PhoneBenchmarkApplication" tools:replace="android:name">
+        <profileable android:shell="true" />
+        <meta-data android:name="dev.gitblame.voxgolem.assistant.TIMING_ENABLED" android:value="true" />
+        <provider android:name="androidx.startup.InitializationProvider" android:authorities="${applicationId}.androidx-startup" tools:node="merge">
+            <meta-data android:name="androidx.profileinstaller.ProfileInstallerInitializer" tools:node="remove" />
+        </provider>
+        <service android:name="dev.gitblame.voxgolem.capture.CaptureListenerService" android:enabled="false" />
+        <service android:name="dev.gitblame.voxgolem.capture.PhoneCaptureRuntimeService" android:enabled="false" />
+        <service android:name="dev.gitblame.voxgolem.assistant.runtime.PhoneRelayExecutionService" android:enabled="false" />
+        <service android:name="dev.gitblame.voxgolem.assistant.replication.AssistantReplicationListenerService" android:enabled="false" />
+        <service android:name="dev.gitblame.voxgolem.assistant.replication.AssistantReplicationJobService" android:enabled="false" />
+        <receiver android:name="androidx.profileinstaller.ProfileInstallReceiver" android:enabled="false" tools:replace="android:enabled" />
+    </application>
+</manifest>

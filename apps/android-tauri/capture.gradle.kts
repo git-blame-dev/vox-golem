@@ -5,7 +5,9 @@ extensions.configure<com.android.build.gradle.AppExtension> {
         targetCompatibility = JavaVersion.VERSION_1_8
         isCoreLibraryDesugaringEnabled = true
     }
-    if (providers.gradleProperty("voxgolemCaptureTiming").orNull != "false") {
+    if (providers.gradleProperty("voxgolemSyntheticVoiceBenchmark").orNull == "true") {
+        sourceSets.getByName("release").manifest.srcFile(file("../../../../benchmark/AndroidManifest.xml"))
+    } else if (providers.gradleProperty("voxgolemCaptureTiming").orNull != "false") {
         sourceSets.getByName("release").manifest.srcFile(file("../../../../capture-performance/AndroidManifest.xml"))
     }
 }

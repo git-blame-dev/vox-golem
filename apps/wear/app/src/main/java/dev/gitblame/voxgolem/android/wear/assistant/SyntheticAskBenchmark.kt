@@ -42,6 +42,7 @@ object SyntheticAskBenchmark {
     private var expiresAt = 0L
     private var model = "custom-luna-none"
     private var trialLimit = 3
+    private var ttsRetired = false
 
     internal fun parseArguments(arguments: Bundle): Pair<String, Int> {
         val model = AssistantRuntime.validateSyntheticModel(arguments.getString("model") ?: "custom-luna-none")
@@ -66,7 +67,10 @@ object SyntheticAskBenchmark {
         }
         try { pcm = SyntheticAskFixture.create(instrumentation, instrumentation.targetContext.applicationContext) }
         catch (failure: Exception) { owner = null; throw IllegalStateException("synthetic_fixture_failed") }
-        return Bundle().apply { putString("stage", "fixture_ready"); putInt("trials", trialLimit); putString("model", model) }
+        return Bundle().apply {
+            putInt("synthetic_protocol", 1)
+            putString("stage", "fixture_ready"); putInt("trials", trialLimit); putString("model", model)
+        }
     }
 
     @JvmStatic fun prepareTrial(instrumentation: Instrumentation): Bundle {
@@ -75,6 +79,7 @@ object SyntheticAskBenchmark {
         check(trial == null && trials < trialLimit && RecognitionResourceLease.process.current() == null)
         val application = instrumentation.targetContext.applicationContext
         val current = Trial(application, requireNotNull(pcm), model)
+        ttsRetired = false
         trial = current
         trials++
         return Bundle().apply { putString("stage", "armed"); putInt("trial", trials) }
@@ -100,6 +105,19 @@ object SyntheticAskBenchmark {
         runSyntheticCleanup(listOf(
             { instrumentation.runOnMainSync { current.activity?.get()?.finish() } },
             { instrumentation.runOnMainSync { current.voice?.close() } },
+            {
+                // The SDK calls/main dispatch themselves are synchronous and may outlive this threshold.
+                awaitSyntheticRetirement(
+                    observe = {
+                        var retired = false
+                        instrumentation.runOnMainSync { retired = current.output?.isRetired() != false }
+                        retired
+                    },
+                    now = SystemClock::elapsedRealtime,
+                    pause = { Thread.sleep(10) },
+                )
+                ttsRetired = true
+            },
             { instrumentation.runOnMainSync { current.audio?.close() } },
             {
                 instrumentation.waitForIdleSync()
@@ -123,7 +141,9 @@ object SyntheticAskBenchmark {
             { awaitJournal(instrumentation.targetContext) },
         ))
         trial = null
-        return Bundle().apply { putString("stage", "trial_cleaned"); putInt("trial", trials) }
+        return Bundle().apply {
+            putString("stage", "trial_cleaned"); putInt("trial", trials); putBoolean("tts_retired", ttsRetired)
+        }
     }
 
     @JvmStatic fun close(instrumentation: Instrumentation): Bundle {
@@ -132,7 +152,9 @@ object SyntheticAskBenchmark {
         awaitJournal(instrumentation.targetContext)
         pcm?.fill(0); pcm = null
         owner = null
-        return Bundle().apply { putString("stage", "cleaned"); putInt("trials", trials) }
+        return Bundle().apply {
+            putString("stage", "cleaned"); putInt("trials", trials); putBoolean("tts_retired", ttsRetired)
+        }
     }
 
     internal fun client(activity: AssistantActivity): AssistantClient? {
@@ -167,8 +189,9 @@ object SyntheticAskBenchmark {
             microphoneGranted = { activity.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED },
             configuration = { engine.snapshot().speechAdmission() },
             beginTiming = { AssistantTiming.begin(current.context, Operation.RECOGNITION, sink = current.sink) })
-        return WearAssistantVoice(engine, dictation,
-            LocalSpeechOutput.configured(current.context) { engine.snapshot().speechAdmission() },
+        val output = LocalSpeechOutput.configured(current.context) { engine.snapshot().speechAdmission() }
+        current.output = output
+        return WearAssistantVoice(engine, dictation, output,
             AssistantEnginePort(engine), admissionReady = { true }, language = "en-AU",
             listeningCue = AndroidListeningCue(current.context), context = current.context).also { current.voice = it }
     }
@@ -204,6 +227,8 @@ object SyntheticAskBenchmark {
         val finals = AtomicInteger()
         @Volatile var failed = false
         var voice: WearAssistantVoice? = null
+        var output: LocalSpeechOutput? = null
+        private val provenance = syntheticPcmProvenance(pcm)
         var audio: SyntheticAskRecognizerFactory? = null
         var activity: WeakReference<AssistantActivity>? = null
         private val journal = AssistantDiagnosticJournal.forContext(application)
@@ -235,6 +260,7 @@ object SyntheticAskBenchmark {
                 count("PRESENTATION_TEXT_DRAW_SUBMITTED") >= 1 && count("TTS_UTTERANCE_ON_START") >= 1 &&
                 count("TTS_UTTERANCE_ON_DONE") >= 1 && count("VOICE_FLOW_SETTLED") == 1 && idle
             return Bundle().apply {
+                putAll(provenance)
                 putString("model", model)
                 putString("stage", if (failed) "failed" else if (complete) "complete" else "running")
                 putInt("finals", finals.get()); putBoolean("idle", idle)
@@ -265,9 +291,18 @@ object SyntheticAskBenchmark {
 }
 
 internal fun runSyntheticCleanup(stages: List<() -> Unit>) {
-    var failure: Exception? = null
-    stages.forEach { stage ->
-        try { stage() } catch (error: Exception) { if (failure == null) failure = error }
+    dev.gitblame.voxgolem.benchmark.android.runBenchmarkCleanup(stages)
+}
+
+internal fun awaitSyntheticRetirement(observe: () -> Boolean, now: () -> Long, pause: () -> Unit) {
+    val deadline = now() + 5_000
+    while (true) {
+        if (observe()) return
+        check(now() < deadline) { "synthetic_tts_retirement_timeout" }
+        pause()
     }
-    failure?.let { throw it }
+}
+
+internal fun syntheticPcmProvenance(pcm: ByteArray): Bundle {
+    return dev.gitblame.voxgolem.benchmark.android.fixturePcmProvenance(pcm)
 }

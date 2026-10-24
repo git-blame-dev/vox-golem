@@ -17,6 +17,62 @@ import java.util.UUID
 @RunWith(AssistantStoreRunner::class)
 @Config(sdk = [35], manifest = Config.NONE)
 class SyntheticSessionRetirementTest {
+    @Test fun registeredPhoneDirectoryIsExplicitAndCannotAdoptExistingStore() {
+        val context = RuntimeEnvironment.getApplication()
+        val directory = File(context.cacheDir, "synthetic-phone-ask-${UUID.randomUUID()}").apply { mkdir() }
+        val sentinel = directory.resolve("assistant.db").apply { writeText("synthetic") }
+        try {
+            assertThrows(IllegalStateException::class.java) {
+                AssistantRuntime.registeredSyntheticSession(context, directory) { AssistantTiming.begin(context, it) }
+            }
+            assertEquals("synthetic", sentinel.readText())
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test fun registeredPhoneSessionUsesOwnedStoreButOrdinaryCredentialContext() {
+        val app = RuntimeEnvironment.getApplication()
+        val directory = File(app.cacheDir, "synthetic-phone-ask-${UUID.randomUUID()}").apply { mkdir() }
+        val requested = mutableListOf<String>()
+        val context = object : android.content.ContextWrapper(app) {
+            override fun getApplicationContext(): android.content.Context = this
+            override fun getNoBackupFilesDir(): File { requested += "ordinary-no-backup"; return app.noBackupFilesDir }
+        }
+        val session = AssistantRuntime.registeredSyntheticSession(context, directory) { AssistantTiming.begin(context, it) }
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val hydrated = CountDownLatch(1)
+            val subscription = session.engine.subscribe { if (it.contextReady) hydrated.countDown() }
+            try { assertTrue(hydrated.await(3, TimeUnit.SECONDS)) } finally { subscription.close() }
+            assertTrue(directory.resolve("assistant.db").isFile)
+            // ProviderAuthSource constructs credential owners from the ordinary application context.
+            assertTrue(requested.contains("ordinary-no-backup"))
+        } finally {
+            try { executor.submit { session.close() }.get(3, TimeUnit.SECONDS) }
+            finally { executor.shutdownNow() }
+        }
+        assertTrue(directory.resolve("assistant.db").isFile)
+        directory.deleteRecursively()
+    }
+
+    @Test fun failedCredentialConstructionRetainsOwnedDirectoryWithoutPublishingAHandle() {
+        val app = RuntimeEnvironment.getApplication()
+        val directory = File(app.cacheDir, "synthetic-phone-ask-${UUID.randomUUID()}").apply { mkdir() }
+        val context = object : android.content.ContextWrapper(app) {
+            override fun getApplicationContext(): android.content.Context = this
+            override fun getNoBackupFilesDir(): File = error("synthetic-construction-failure")
+        }
+        try {
+            val failure = assertThrows(IllegalStateException::class.java) {
+                AssistantRuntime.registeredSyntheticSession(context, directory) { AssistantTiming.begin(context, it) }
+            }
+            assertEquals("synthetic-construction-failure", failure.message)
+            // Store opens lazily; failure precedes engine hydration, so only directory ownership exists.
+            assertTrue(directory.isDirectory)
+            assertFalse(directory.resolve("assistant.db").exists())
+            assertEquals(0, failure.suppressed.size)
+        } finally { directory.deleteRecursively() }
+    }
+
     private fun exercise(timeoutFirst: Boolean) {
         val context = RuntimeEnvironment.getApplication()
         val store = AssistantStore(context)

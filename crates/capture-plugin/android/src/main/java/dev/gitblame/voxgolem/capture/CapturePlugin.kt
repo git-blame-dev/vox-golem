@@ -29,6 +29,14 @@ import java.io.File
     ],
 )
 class CapturePlugin(private val activity: Activity) : Plugin(activity) {
+    private fun captureAdmitted(): Boolean = dev.gitblame.voxgolem.voice.backgroundServicesAdmitted(activity) &&
+        (activity as? CaptureAdmissionOwner)?.captureAdmissionEnabled != false
+
+    private fun admitted(invoke: Invoke): Boolean {
+        if (captureAdmitted()) return true
+        invoke.reject("capture-unavailable")
+        return false
+    }
     private val repository by lazy { CaptureRepository(activity) }
     private val destinationStore by lazy { SafNotesStore(activity) }
     private val phoneCoordinator by lazy { PhoneCaptureCoordinator.shared(activity.applicationContext) }
@@ -37,6 +45,7 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
     private val enableRequest = CaptureEnableRequest<Invoke> { it.reject("capture-enable-cancelled") }
 
     override fun load(webView: android.webkit.WebView) {
+        if (!captureAdmitted()) return
         (activity as? LifecycleOwner)?.lifecycle?.addObserver(object : DefaultLifecycleObserver {
             override fun onResume(owner: LifecycleOwner) {
                 settleEnable()
@@ -57,6 +66,7 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun snapshot(invoke: Invoke) {
+        if (!admitted(invoke)) return
         try {
             invoke.resolve(snapshotValue())
         } catch (error: Exception) {
@@ -67,6 +77,7 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
     /** Explicit user action. Runtime permissions are requested only from this visible onboarding command. */
     @Command
     fun enable_capture(invoke: Invoke) {
+        if (!admitted(invoke)) return
         if (isWatch()) {
             invoke.reject("Phone capture setup is unavailable on Wear OS")
             return
@@ -102,6 +113,7 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun list_captures(invoke: Invoke) {
+        if (!admitted(invoke)) return
         try {
             val args = invoke.parseArgs(ListCapturesArgs::class.java)
             require(args.offset >= 0 && args.limit in 1..100) { "Invalid capture page" }
@@ -113,6 +125,7 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun select_notes_folder(invoke: Invoke) {
+        if (!admitted(invoke)) return
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
             if (android.os.Build.VERSION.SDK_INT >= 26) putExtra(DocumentsContract.EXTRA_INITIAL_URI, destinationStore.selected()?.treeUri)
@@ -146,6 +159,7 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun play_capture(invoke: Invoke) {
+        if (!admitted(invoke)) return
         try {
             val args = invoke.parseArgs(CaptureIdArgs::class.java)
             require(CaptureProtocol.isValidUuid(args.captureId)) { "Invalid capture ID" }
@@ -178,11 +192,13 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun stop_playback(invoke: Invoke) {
+        if (!admitted(invoke)) return
         if (playback.stop()) invoke.resolve() else invoke.reject("recording-playback-cleanup-failed")
     }
 
     @Command
     fun retry_capture(invoke: Invoke) {
+        if (!admitted(invoke)) return
         try {
             check(!isWatch()) { "Phone capture retry is unavailable on Wear OS" }
             val args = invoke.parseArgs(CaptureIdArgs::class.java)
@@ -197,6 +213,7 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun finalize_capture(invoke: Invoke) {
+        if (!admitted(invoke)) return
         try {
             val args = invoke.parseArgs(CaptureIdArgs::class.java)
             phoneCoordinator.finalizeCapture(args.captureId)
@@ -208,6 +225,7 @@ class CapturePlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun update_transcript(invoke: Invoke) {
+        if (!admitted(invoke)) return
         try {
             val args = UpdateTranscriptArgs.fromJson(invoke.getArgs())
             phoneCoordinator.correctTranscript(args.captureId, args.text, args.expectedVersion)

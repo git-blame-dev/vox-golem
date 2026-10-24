@@ -111,6 +111,15 @@ class LocalSpeechOutput(
     private val activeStreamCallbacks = LinkedHashMap<Long, (String?) -> Unit>()
     private val pendingStreamChunks = ArrayList<PendingStreamChunk>()
     fun snapshot(): SpeechState = state
+    /** Read only on main: close admission alone is not SDK/resource retirement. */
+    fun isRetired(): Boolean {
+        check(Looper.myLooper() == main.looper)
+        return closed && sdk == null && retired == null && lease == null && !focused &&
+            pendingRequest == null && terminal == null && timeout == null && providerTimeout == null &&
+            providerAttempts.isEmpty() && activeProvider == null && !streamOpen && streamTicket == 0L &&
+            streamVoice == null && activeStreamChunks == 0 && pendingStreamChunks.isEmpty() &&
+            activeStreamCallbacks.isEmpty() && requestTiming == null
+    }
     fun options(): SpeechOptions = state.options
     private fun rebuildCatalogueOptions() {
         catalogueOptions = SpeechOptions(knownProviders, knownVoices.values.flatten()).bounded()

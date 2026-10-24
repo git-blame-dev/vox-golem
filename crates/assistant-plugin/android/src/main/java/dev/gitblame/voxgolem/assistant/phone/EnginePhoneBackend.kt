@@ -16,10 +16,28 @@ import java.util.concurrent.atomic.AtomicReference
 class EnginePhoneBackend internal constructor(
     private val context: Context,
     private val engine: AssistantEngine,
+    private val reconcile: () -> Unit = { AssistantReplication.reconcileNow(context) },
+    private val commandAdmission: (String) -> Unit = {},
+    private val enginePrewarm: () -> Unit = { engine.prewarm() },
     private val prewarm: (String) -> Unit = AssistantRuntime::prewarm,
 ) : AssistantPhoneBackend {
     constructor(context: Context) : this(context, AssistantRuntime.get(context))
     private val delivery = AtomicReference<PhoneRequestDelivery?>(null)
+    private val ingressRetired = AtomicBoolean(false)
+    internal fun isIngressRetired() = ingressRetired.get()
+    /** Seal scheduling first; the owning session still verifies provider/actor retirement separately. */
+    @Synchronized internal fun retireIngress() {
+        if (!ingressRetired.compareAndSet(false, true)) return
+        delivery.get()?.let { current ->
+            current.cancel()
+            engine.cancel(current.clientRequestId)
+        }
+        val pending = synchronized(admission) {
+            initializingConversation = false
+            startupWaiters.toList().also { startupWaiters.clear() }
+        }
+        pending.forEach { it(Result.failure(retiredFailure())) }
+    }
     private val preferences = PhonePreferences(context)
     private val preferencesPending = AtomicBoolean(false)
     private val admission = Any()
@@ -34,24 +52,36 @@ class EnginePhoneBackend internal constructor(
         .put("web_enabled", state.webEnabled).put("speech_network_fallback", state.speechNetworkFallback)
         .put("fast_mode", state.fastMode)
         .put("speech_language", state.speechLanguage).put("speech_tts_provider", state.speechTtsProvider).put("speech_tts_voice", state.speechTtsVoice)
-    fun publishSpeechOptions(options: dev.gitblame.voxgolem.assistant.speech.SpeechOptions) { engine.publishSpeechOptions(options) }
+    @Synchronized fun publishSpeechOptions(options: dev.gitblame.voxgolem.assistant.speech.SpeechOptions) {
+        if (!ingressRetired.get()) engine.publishSpeechOptions(options)
+    }
     fun busy(): Boolean = engine.snapshot().busy || delivery.get() != null || preferencesPending.get()
-    fun saveSpeechDraft(text: String) { engine.setDraft(text) }
+    @Synchronized fun saveSpeechDraft(text: String) { if (!ingressRetired.get()) engine.setDraft(text) }
     fun speechConversation(): String? = engine.snapshot().conversation
     fun speechHead(): String? = engine.snapshot().selectedHead
     fun speechAdmissionSnapshot(): SpeechAdmissionSnapshot = engine.snapshot().let {
         SpeechAdmissionSnapshot(SpeechInputOwner(it.conversation, it.selectedHead), it.draft)
     }
-    fun observeSpeechContext(observer: () -> Unit): AutoCloseable = engine.subscribe { observer() }
-    fun saveOwnedSpeechDraft(text: String, conversation: String?) { engine.setSpeechDraft(text, conversation) }
-    fun saveOwnedSpeechDraft(text: String, conversation: String?, head: String?) {
-        engine.setSpeechDraft(text, conversation, expectedHead = head, requireHeadOwner = true)
+    @Synchronized fun observeSpeechContext(observer: () -> Unit): AutoCloseable {
+        if (ingressRetired.get()) return AutoCloseable {}
+        return engine.subscribe { synchronized(this) { if (!ingressRetired.get()) observer() } }
+    }
+    @Synchronized fun saveOwnedSpeechDraft(text: String, conversation: String?) {
+        if (!ingressRetired.get()) engine.setSpeechDraft(text, conversation)
+    }
+    @Synchronized fun saveOwnedSpeechDraft(text: String, conversation: String?, head: String?) {
+        if (!ingressRetired.get()) engine.setSpeechDraft(text, conversation, expectedHead = head, requireHeadOwner = true)
     }
     fun stopSpeechRequest(requestId: String) { cancelDelivery(requestId) }
-    fun prewarm() { runCatching { engine.prewarm() } }
-    fun observeSpeechStream(listener: (String?, String) -> Unit): AutoCloseable = engine.observeProvisionalStream(listener)
+    @Synchronized fun prewarm() { if (!ingressRetired.get()) runCatching { enginePrewarm() } }
+    @Synchronized fun observeSpeechStream(listener: (String?, String) -> Unit): AutoCloseable {
+        if (ingressRetired.get()) return AutoCloseable {}
+        return engine.observeProvisionalStream { id, text -> synchronized(this) { if (!ingressRetired.get()) listener(id, text) } }
+    }
 
-    override fun command(name: String, arguments: JSONObject, reply: (Result<Any?>) -> Unit) {
+    @Synchronized override fun command(name: String, arguments: JSONObject, reply: (Result<Any?>) -> Unit) {
+        if (ingressRetired.get()) { reply(Result.failure(retiredFailure())); return }
+        try { commandAdmission(name) } catch (error: RuntimeException) { reply(Result.failure(error)); return }
         if (name == "cancel_prompt") {
             val requestId = arguments.optString("requestId")
             if (requestId.isEmpty() || requestId.toByteArray(Charsets.UTF_8).size > 128) {
@@ -63,19 +93,27 @@ class EnginePhoneBackend internal constructor(
             return
         }
         fun settled(state: AssistantState) {
-            try {
-                requireSettled(state)
-                AssistantReplication.reconcileNow(context)
-                publishSnapshot(reply)
-            } catch (error: RuntimeException) { reply(Result.failure(error)) }
+            synchronized(this) {
+                if (ingressRetired.get()) reply(Result.failure(retiredFailure()))
+                else try {
+                    requireSettled(state)
+                    reconcile()
+                    publishSnapshot(reply)
+                } catch (error: RuntimeException) { reply(Result.failure(error)) }
+            }
         }
         try {
             when (name) {
                 "get_app_snapshot" -> engine.selectedContext { raw, state ->
-                    if (state.conversation == null && NewVoiceShortcutLauncher.actions.hasAction()) deferEmptyShortcutConversation = true
-                    if (state.conversation == null && !state.busy && !deferEmptyShortcutConversation) {
-                        ensureConversation(state, reply)
-                    } else replySnapshot(reply, state, raw)
+                    synchronized(this) {
+                        if (ingressRetired.get()) reply(Result.failure(retiredFailure()))
+                        else {
+                            if (state.conversation == null && NewVoiceShortcutLauncher.actions.hasAction()) deferEmptyShortcutConversation = true
+                            if (state.conversation == null && !state.busy && !deferEmptyShortcutConversation) {
+                                ensureConversation(state, reply)
+                            } else replySnapshot(reply, state, raw)
+                        }
+                    }
                 }
                 "new_conversation" -> {
                     val draft = newConversationDraft(arguments)
@@ -88,8 +126,13 @@ class EnginePhoneBackend internal constructor(
                     val text = arguments.getString("text")
                     val wasBlank = engine.snapshot().draft.isBlank()
                     engine.setDraft(text) { state ->
-                        if (wasBlank && text.isNotBlank() && state.error == null) runCatching { engine.prewarm() }
-                        reply(runCatching { requireSettled(state); null })
+                        synchronized(this) {
+                            if (ingressRetired.get()) reply(Result.failure(retiredFailure()))
+                            else {
+                                if (wasBlank && text.isNotBlank() && state.error == null) runCatching { enginePrewarm() }
+                                reply(runCatching { requireSettled(state); null })
+                            }
+                        }
                     }
                 }
                 "set_preferences" -> updatePreferences(arguments.getJSONObject("preferences"), reply)
@@ -151,7 +194,8 @@ class EnginePhoneBackend internal constructor(
             .put("replica", state.peerReplica ?: JSONObject.NULL).put("credentialsAllowed", state.credentialsAllowed)
     }
 
-    private fun ensureConversation(before: AssistantState, reply: (Result<Any?>) -> Unit) {
+    @Synchronized private fun ensureConversation(before: AssistantState, reply: (Result<Any?>) -> Unit) {
+        if (ingressRetired.get()) { reply(Result.failure(retiredFailure())); return }
         synchronized(admission) {
             if (startupWaiters.size >= 16) { reply(Result.failure(providerFailure("busy"))); return }
             startupWaiters += reply
@@ -159,24 +203,31 @@ class EnginePhoneBackend internal constructor(
             initializingConversation = true
         }
         fun finish(state: AssistantState) {
-            if (state.error == null) AssistantReplication.reconcileNow(context)
-            val waiters = synchronized(admission) { initializingConversation = false; startupWaiters.toList().also { startupWaiters.clear() } }
-            for (waiting in waiters) {
-                if (state.error != null) waiting(Result.failure(providerFailure(state.error)))
-                else publishSnapshot(waiting)
+            synchronized(this) {
+                if (state.error == null && !ingressRetired.get()) reconcile()
+                val waiters = synchronized(admission) { initializingConversation = false; startupWaiters.toList().also { startupWaiters.clear() } }
+                for (waiting in waiters) {
+                    if (ingressRetired.get()) waiting(Result.failure(retiredFailure()))
+                    else if (state.error != null) waiting(Result.failure(providerFailure(state.error)))
+                    else publishSnapshot(waiting)
+                }
             }
         }
         engine.newConversation { created ->
-            if (created.error == null && before.draft.isNotEmpty()) engine.setDraft(before.draft, ::finish)
-            else finish(created)
+            synchronized(this) {
+                if (!ingressRetired.get() && created.error == null && before.draft.isNotEmpty()) engine.setDraft(before.draft, ::finish)
+                else finish(created)
+            }
         }
     }
 
-    private fun publishSnapshot(reply: (Result<Any?>) -> Unit) {
+    @Synchronized private fun publishSnapshot(reply: (Result<Any?>) -> Unit) {
+        if (ingressRetired.get()) { reply(Result.failure(retiredFailure())); return }
         engine.selectedContext { raw, state -> replySnapshot(reply, state, raw) }
     }
 
-    private fun replySnapshot(reply: (Result<Any?>) -> Unit, state: AssistantState, raw: String?) {
+    @Synchronized private fun replySnapshot(reply: (Result<Any?>) -> Unit, state: AssistantState, raw: String?) {
+        if (ingressRetired.get()) { reply(Result.failure(retiredFailure())); return }
         reply(runCatching {
             val unresolved = state.branchChoices.isNotEmpty() && state.selectedHead == null
             if (raw == null && state.conversation != null && !unresolved) {
@@ -243,15 +294,18 @@ class EnginePhoneBackend internal constructor(
             previousModel = engine.snapshot().model
             preferences.write(value)
         }) { selected ->
-            preferencesPending.set(false)
-            if (selected.error != null) reply(Result.failure(providerFailure(selected.error)))
-            else {
-                if (previousModel != null && selected.model == selectedModel && selected.model != previousModel) {
-                    runCatching { prewarm(selected.model) }
+            synchronized(this) {
+                preferencesPending.set(false)
+                if (ingressRetired.get()) reply(Result.failure(retiredFailure()))
+                else if (selected.error != null) reply(Result.failure(providerFailure(selected.error)))
+                else {
+                    if (previousModel != null && selected.model == selectedModel && selected.model != previousModel) {
+                        runCatching { prewarm(selected.model) }
+                    }
+                    // A view listener failure must not misclassify already persisted settings.
+                    runCatching { onPreferencesChanged?.invoke(value.getBoolean("tts_enabled")) }
+                    reply(Result.success(preferencesFor(selected)))
                 }
-                // A view listener failure must not misclassify already persisted settings.
-                runCatching { onPreferencesChanged?.invoke(value.getBoolean("tts_enabled")) }
-                reply(Result.success(preferencesFor(selected)))
             }
         }
     }
@@ -263,9 +317,12 @@ class EnginePhoneBackend internal constructor(
         owner: SpeechInputOwner) {
         submitForOwner(clientRequestId, prompt, update, terminal, owner)
     }
-    private fun submitForOwner(clientRequestId: String, prompt: String, update: (JSONObject) -> Unit, terminal: (Result<Any?>) -> Unit,
+    @Synchronized private fun submitForOwner(clientRequestId: String, prompt: String, update: (JSONObject) -> Unit, terminal: (Result<Any?>) -> Unit,
         owner: SpeechInputOwner?) {
-        val current = PhoneRequestDelivery(clientRequestId, update, { engine.rejectDelivery(clientRequestId) })
+        if (ingressRetired.get()) { terminal(Result.failure(retiredFailure())); return }
+        val current = PhoneRequestDelivery(clientRequestId,
+            { value -> synchronized(this) { if (!ingressRetired.get()) update(value) } },
+            { synchronized(this) { if (!ingressRetired.get()) engine.rejectDelivery(clientRequestId) } })
         val admitted = synchronized(admission) { !preferencesPending.get() && !initializingConversation && delivery.compareAndSet(null, current) }
         if (!admitted) {
             terminal(Result.failure(AssistantPhoneFailure("busy", "A request is already active"))); return
@@ -292,10 +349,10 @@ class EnginePhoneBackend internal constructor(
                             outcome.put("voiceContext", JSONObject().put("conversation", committed.conversation)
                                 .put("selectedHead", committed.selectedHead))
                         }
-                        val reconciliationFailed = runCatching { AssistantReplication.reconcileNow(context) }.isFailure
+                        val reconciliationFailed = !ingressRetired.get() && runCatching { reconcile() }.isFailure
                         if (result.code == "saved_local_state_failed" || reconciliationFailed) {
                             outcome.put("warning", providerFailure("saved_local_state_failed").boundedMessage)
-                        } else {
+                        } else if (!ingressRetired.get()) {
                             attachTerminalSnapshot(outcome, result, resultState)
                         }
                         terminal(Result.success(outcome))
@@ -312,11 +369,12 @@ class EnginePhoneBackend internal constructor(
             expectedHead = owner.selectedHead, delivery = current.gate, terminalContext = true)
     }
 
-    override fun acknowledge(clientRequestId: String, providerRequestId: String, revision: String, accepted: Boolean): Boolean =
-        delivery.get()?.takeIf { it.clientRequestId == clientRequestId }?.acknowledge(providerRequestId, revision, accepted) ?: false
+    @Synchronized override fun acknowledge(clientRequestId: String, providerRequestId: String, revision: String, accepted: Boolean): Boolean =
+        if (ingressRetired.get()) false else delivery.get()?.takeIf { it.clientRequestId == clientRequestId }?.acknowledge(providerRequestId, revision, accepted) ?: false
 
     internal fun attachTerminalSnapshot(outcome: JSONObject,
         result: dev.gitblame.voxgolem.assistant.runtime.AssistantRequestResult, resultState: AssistantState) {
+        if (ingressRetired.get()) return
         val raw = result.terminalContextJson ?: return
         // Encode first; the transactional fence then observes any already-committed mutation,
         // including imports committed while encoding or while reconcileNow was being queued.
@@ -325,21 +383,24 @@ class EnginePhoneBackend internal constructor(
         }
     }
 
-    override fun cancelDelivery(clientRequestId: String) {
+    @Synchronized override fun cancelDelivery(clientRequestId: String) {
         delivery.get()?.takeIf { it.clientRequestId == clientRequestId }?.cancel()
-        engine.cancel(clientRequestId)
+        if (!ingressRetired.get()) engine.cancel(clientRequestId)
     }
 
-    override fun foreground(visible: Boolean) {
+    @Synchronized override fun foreground(visible: Boolean) {
+        if (ingressRetired.get()) return
         if (visible) {
             engine.resume()
-            runCatching { engine.prewarm() }
-            AssistantReplication.reconcileNow(context)
+            runCatching { enginePrewarm() }
+            reconcile()
         } else {
             delivery.get()?.cancel()
             engine.background()
         }
     }
+
+    private fun retiredFailure() = AssistantPhoneFailure("unavailable", "This phone request owner has retired")
 
     companion object {
         internal fun newConversationDraft(arguments: JSONObject): String =

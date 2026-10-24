@@ -7,14 +7,21 @@ import com.google.android.gms.wearable.WearableListenerService
 
 /** GMS may destroy this dispatch service while accepted channel streams are still active. */
 class CaptureListenerService : WearableListenerService() {
-    override fun onDataChanged(events: DataEventBuffer) =
-        CaptureChannelReceiver.shared(applicationContext).onDataChanged(events)
+    override fun onDataChanged(events: DataEventBuffer) {
+        if (dev.gitblame.voxgolem.voice.backgroundServicesAdmitted(this)) CaptureChannelReceiver.shared(applicationContext).onDataChanged(events)
+    }
 
-    override fun onMessageReceived(event: MessageEvent) =
-        CaptureChannelReceiver.shared(applicationContext).onMessageReceived(event)
+    override fun onMessageReceived(event: MessageEvent) {
+        if (dev.gitblame.voxgolem.voice.backgroundServicesAdmitted(this)) CaptureChannelReceiver.shared(applicationContext).onMessageReceived(event)
+    }
 
-    override fun onChannelOpened(channel: ChannelClient.Channel) =
+    override fun onChannelOpened(channel: ChannelClient.Channel) {
+        if (!dev.gitblame.voxgolem.voice.backgroundServicesAdmitted(this)) {
+            com.google.android.gms.wearable.Wearable.getChannelClient(this).close(channel)
+            return
+        }
         CaptureChannelReceiver.shared(applicationContext).onChannelOpened(channel)
+    }
 
     override fun onChannelClosed(channel: ChannelClient.Channel, closeReason: Int, appSpecificErrorCode: Int) {
         PhoneReceiptChannelSender.confirmNativeRetired(channel)

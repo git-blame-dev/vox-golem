@@ -52,11 +52,14 @@ class VoiceArgs {
 @TauriPlugin(permissions = [Permission(alias = "assistantMic", strings = [Manifest.permission.RECORD_AUDIO])])
 class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
     internal constructor(activity: Activity, speech: PhoneSpeechSession) : this(activity) { suppliedSpeech = speech }
+    internal constructor(activity: Activity, binding: PhoneActivityBinding) : this(activity) { suppliedBinding = binding }
     private val lock = Any()
     private var request: String? = null
-    private val backend by lazy { AssistantPhoneBindings.get(activity) }
+    private var suppliedBinding: PhoneActivityBinding? = null
+    private val activityBinding by lazy { suppliedBinding ?: PhoneActivityBindings.get(activity) }
+    private val backend by lazy { activityBinding?.backend ?: AssistantPhoneBindings.get(activity) }
     private var suppliedSpeech: PhoneSpeechSession? = null
-    private val speechOwner = lazy { suppliedSpeech ?: PhoneSpeechSession(activity.applicationContext, backend) }
+    private val speechOwner = lazy { activityBinding?.speech ?: suppliedSpeech ?: PhoneSpeechSession(activity.applicationContext, backend) }
     private val speech get() = speechOwner.value
     private val main = Handler(Looper.getMainLooper())
     private val uiThemePublication = (activity as? PhoneUiThemeOwner)?.let(::PhoneUiThemePublication)
@@ -96,9 +99,16 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
     override fun load(webView: WebView) {
         val startupTiming = (activity as? PhoneStartupTimingOwner)?.startupTiming?.trace
         startupTiming?.mark(Stage.PLUGIN_LOAD_STARTED)
+        if (activityBinding?.backend?.isIngressRetired() == true) {
+            webViewReference = WeakReference(webView)
+            startupTiming?.mark(Stage.PLUGIN_LOAD_COMPLETED)
+            return
+        }
         AssistantRuntime.configureCaptureResourceAdmission(true)
-        NewVoiceShortcutLauncher.retirePinnedShortcut(activity)
-        AssistantRuntime.get(activity, startupTiming, preparePhoneContext = true)
+        if (activityBinding == null) {
+            NewVoiceShortcutLauncher.retirePinnedShortcut(activity)
+            AssistantRuntime.get(activity, startupTiming, preparePhoneContext = true)
+        }
         webViewReference = WeakReference(webView)
         (activity as? LifecycleOwner)?.lifecycle?.addObserver(object : DefaultLifecycleObserver {
             override fun onResume(owner: LifecycleOwner) = setForeground(true)
@@ -119,6 +129,7 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     override fun onNewIntent(intent: Intent) {
+        if (activityBinding != null) return
         val token = intent.getStringExtra(NewVoiceShortcutLauncher.TOKEN_EXTRA)
         if (intent.action == NewVoiceShortcutLauncher.MAIN_ACTION && intent.data == null &&
             intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY == 0 &&
@@ -132,21 +143,28 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
     } }
 
     private fun setForeground(visible: Boolean, llmEligible: Boolean = visible) {
+        if (activityBinding?.backend?.isIngressRetired() == true) return
         val wasVisible = this.visible.get()
         this.visible.set(visible)
         if (!visible) { inputEpoch.incrementAndGet(); pendingVoice = null }
-        if (!visible && wasVisible) {
+        if (activityBinding == null && !visible && wasVisible) {
             if (NewVoiceShortcutLauncher.actions.hasAction()) reportVoiceEntryStage(activity, Stage.ENTRY_BACKGROUND_RETIRED)
             NewVoiceShortcutLauncher.cancelEntries()
         }
         try { backend.foreground(llmEligible) } catch (_: AssistantPhoneFailure) { /* Commands report the unavailable binding. */ }
         speech.foreground(visible, retainGeneration = llmEligible)
-        if (visible && NewVoiceShortcutLauncher.actions.hasPending()) notifyShortcut()
+        if (activityBinding == null && visible && NewVoiceShortcutLauncher.actions.hasPending()) notifyShortcut()
     }
 
     private fun execute(invoke: Invoke, name: String = invoke.command) {
         try { backend.command(name, JSONObject(invoke.getRawArgs())) { result -> reply(invoke, result) } }
         catch (error: RuntimeException) { reply(invoke, Result.failure(error)) }
+    }
+
+    private fun rejectRetiredVoice(invoke: Invoke): Boolean {
+        if (activityBinding?.backend?.isIngressRetired() != true) return false
+        reject(invoke, "unavailable", "This isolated phone operation has retired")
+        return true
     }
 
     private fun publishUiTheme(result: Result<Any?>, preferences: Boolean) {
@@ -184,6 +202,7 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve()
     }
     @Command fun new_conversation(invoke: Invoke) {
+        if (rejectRetiredVoice(invoke)) return
         if (pendingVoice != null || speech.active() && speech.status().optString("mode") != "shortcut") reject(invoke, "busy", "Stop voice before changing conversations") else execute(invoke)
     }
     @Command fun set_preferences(invoke: Invoke) {
@@ -193,9 +212,11 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
         } } catch (error: RuntimeException) { reply(invoke, Result.failure(error)) }
     }
     @Command fun select_conversation(invoke: Invoke) {
+        if (rejectRetiredVoice(invoke)) return
         if (speech.active() || pendingVoice != null) reject(invoke, "busy", "Stop voice before changing conversations") else execute(invoke)
     }
     @Command fun select_conversation_head(invoke: Invoke) {
+        if (rejectRetiredVoice(invoke)) return
         if (speech.active() || pendingVoice != null) reject(invoke, "busy", "Stop voice before changing continuation") else execute(invoke)
     }
     @Command fun save_assistant_draft(invoke: Invoke) = execute(invoke)
@@ -204,6 +225,7 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
     @Command fun assistant_pairing_status(invoke: Invoke) = execute(invoke)
 
     @Command fun chatgpt_auth(invoke: Invoke) {
+        if (activityBinding != null) { reject(invoke, "unavailable", "Command is unavailable in the isolated trial"); return }
         val action = invoke.getArgs().optString("action")
         if (action !in setOf("start", "status", "cancel", "sign_out")) {
             reject(invoke, "invalid_input", "Unknown authentication action"); return
@@ -214,6 +236,7 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Command fun open_chatgpt_sign_in(invoke: Invoke) {
+        if (activityBinding != null) { reject(invoke, "unavailable", "Command is unavailable in the isolated trial"); return }
         main.post {
             try {
                 activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(ChatGptAuth.VERIFICATION_URL)))
@@ -222,13 +245,17 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
-    @Command fun assistant_voice_status(invoke: Invoke) { invoke.resolve(JSObject(speech.status().toString())) }
+    @Command fun assistant_voice_status(invoke: Invoke) {
+        if (!rejectRetiredVoice(invoke)) invoke.resolve(JSObject(speech.status().toString()))
+    }
     @Command fun open_speech_services_store(invoke: Invoke) {
+        if (activityBinding != null) { reject(invoke, "unavailable", "Command is unavailable in the isolated trial"); return }
         val opened = dev.gitblame.voxgolem.assistant.speech.SpeechServiceRequirement.openPlayStore(activity)
         if (opened) invoke.resolve()
         else reject(invoke, "unavailable", "Unable to open Play Store or browser")
     }
     @Command fun consume_new_voice_shortcut(invoke: Invoke) {
+        if (activityBinding != null) { invoke.resolve(JSObject().put("token", JSONObject.NULL).put("error", JSONObject.NULL)); return }
         if (!visible.get()) { reportVoiceEntryStage(activity, Stage.ENTRY_FOREGROUND_REJECTED); invoke.resolve(JSObject().put("token", JSONObject.NULL).put("error", JSONObject.NULL)); return }
         val token = NewVoiceShortcutLauncher.actions.consume()
         val mode = token?.let(NewVoiceShortcutLauncher.actions::mode) ?: VoiceEntryMode.ASK
@@ -238,6 +265,7 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve(JSObject().put("token", if (busy) JSONObject.NULL else token ?: JSONObject.NULL).put("mode", mode.wireValue).put("error", if (busy) "Voice chat is busy; existing work was not cancelled" else JSONObject.NULL))
     }
     @Command fun release_new_voice_shortcut(invoke: Invoke) {
+        if (activityBinding != null) { invoke.resolve(); return }
         val token = invoke.getArgs().optString("token")
         if (ShortcutActionGate.valid(token)) {
             if (NewVoiceShortcutLauncher.actions.active(token)) reportVoiceEntryStage(activity, Stage.ENTRY_RELEASED)
@@ -246,17 +274,21 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve()
     }
     @Command fun prepare_new_voice_shortcut(invoke: Invoke) {
+        if (rejectRetiredVoice(invoke)) return
         try { speech.shortcutPrepared(invoke.getArgs().getString("sessionId")); invoke.resolve() } catch (error: RuntimeException) { reply(invoke, Result.failure(error)) }
     }
     @Command fun stop_send_new_voice_shortcut(invoke: Invoke) {
+        if (rejectRetiredVoice(invoke)) return
         try { speech.stopAndSendShortcut(); invoke.resolve() } catch (error: RuntimeException) { reply(invoke, Result.failure(error)) }
     }
     @Command fun start_assistant_voice(invoke: Invoke) {
+        if (rejectRetiredVoice(invoke)) return
         reportVoiceEntryStage(activity, Stage.ENTRY_START_REQUESTED)
         try {
             val args = invoke.parseArgs(VoiceArgs::class.java)
             require(args.sessionId.isNotBlank() && args.sessionId.toByteArray(Charsets.UTF_8).size <= 128 && AssistantDraftBudget.accepts(args.draft))
             require(args.completionPolicy in setOf("manual", "stop_send_new", "single_turn", "repeat_after_reply"))
+            activityBinding?.admitVoice(args.completionPolicy, args.draft, args.loopMode, args.launchToken)
             if (args.completionPolicy == "stop_send_new" && (args.loopMode || args.launchToken == null || !NewVoiceShortcutLauncher.actions.active(args.launchToken!!))) {
                 reportVoiceEntryStage(activity, Stage.ENTRY_POLICY_REJECTED)
                 reject(invoke, "invalid_input", "A deliberate voice shortcut launch is required"); return
@@ -304,6 +336,7 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
         } catch (error: RuntimeException) { reportVoiceEntryStage(activity, Stage.ENTRY_NATIVE_REJECTED); pending.args.launchToken?.let(NewVoiceShortcutLauncher.actions::release); reply(invoke, Result.failure(error)) }
     }
     @Command fun finish_assistant_dictation(invoke: Invoke) {
+        if (rejectRetiredVoice(invoke)) return
         if (Looper.myLooper() != Looper.getMainLooper()) { main.post { finish_assistant_dictation(invoke) }; return }
         val args = invoke.getArgs()
         if (!args.has("sessionId")) { speech.finish(); invoke.resolve(); return }
@@ -317,12 +350,14 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve()
     }
     @Command fun stop_assistant_voice(invoke: Invoke) {
+        if (rejectRetiredVoice(invoke)) return
         if (Looper.myLooper() != Looper.getMainLooper()) { main.post { stop_assistant_voice(invoke) }; return }
         val args = invoke.getArgs()
         if (!args.has("sessionId")) {
             // Deliberate legacy Stop, unlike observer-owned cleanup, retires current input consent.
             inputEpoch.incrementAndGet(); pendingVoice = null
-            NewVoiceShortcutLauncher.cancelEntries(); speech.stop(); invoke.resolve(); return
+            if (activityBinding == null) NewVoiceShortcutLauncher.cancelEntries()
+            speech.stop(); invoke.resolve(); return
         }
         val id = args.opt("sessionId") as? String
         if (id == null || id.isBlank() || id.toByteArray(Charsets.UTF_8).size > 128) {
@@ -357,6 +392,7 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Command fun submit_prompt(invoke: Invoke) {
+        if (rejectRetiredVoice(invoke)) return
         val args = try { invoke.parseArgs(SubmitArgs::class.java) }
         catch (_: RuntimeException) { reject(invoke, "invalid_input", "Invalid prompt request"); return }
         if (args.requestId.isEmpty() || args.requestId.toByteArray(Charsets.UTF_8).size > 128 || args.prompt.isBlank() || !AssistantDraftBudget.accepts(args.prompt)) {
@@ -372,6 +408,8 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
         if (nativeVoice && speechOwner == null) {
             reject(invoke, "unavailable", "Voice submission was cancelled or its conversation changed"); return
         }
+        try { activityBinding?.admitPrompt(args.requestId, args.prompt) }
+        catch (error: RuntimeException) { reply(invoke, Result.failure(error)); return }
         synchronized(lock) {
             if (request != null) { reject(invoke, "busy", "A request is already active"); return }
             request = args.requestId
@@ -388,6 +426,7 @@ class AssistantPlugin(private val activity: Activity) : Plugin(activity) {
                 promptProtection.retired(args.requestId)
                 synchronized(lock) { if (request == args.requestId) request = null }
                 speech.onRequestResult(args.requestId, result, replyTicket)
+                activityBinding?.terminal(args.requestId, result)
                 reply(invoke, result)
             }
         }

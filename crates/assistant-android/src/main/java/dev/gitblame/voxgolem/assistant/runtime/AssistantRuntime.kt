@@ -46,6 +46,7 @@ object AssistantRuntime {
     /** Explicit logout retires this request, not the foreground/lifecycle owner. */
     internal fun cancelActiveForSignOut() { engine?.stop() }
     fun idleForSyntheticSession(): Boolean = engine?.snapshot()?.let { !it.busy && !it.foreground } ?: true
+    fun uninitializedForSyntheticSession(): Boolean = engine == null
 
     /** Fixed synthetic routes only; validate before allocating storage or provider resources. */
     fun validateSyntheticModel(model: String = "custom-luna-none"): String {
@@ -60,6 +61,11 @@ object AssistantRuntime {
         return isolatedSession(context, directory, model, model == "agy-flash-low", beginTiming)
     }
 
+    /** Phone owner has durably reserved and prepared this exact directory before fixture creation. */
+    fun registeredSyntheticSession(context: Context, directory: File,
+        beginTiming: (AssistantTiming.Operation) -> AssistantTiming): SyntheticSession =
+        isolatedSession(context, directory, "custom-luna-none", false, beginTiming, preparedDirectory = true)
+
     /** Typed instrumentation uses real providers with test-owned policy, never user selections. */
     fun typedBenchmarkSession(context: Context, directory: File, model: String, webEnabled: Boolean,
         beginTiming: (AssistantTiming.Operation) -> AssistantTiming): SyntheticSession {
@@ -68,51 +74,73 @@ object AssistantRuntime {
     }
 
     private fun isolatedSession(context: Context, directory: File, model: String, webEnabled: Boolean,
-        beginTiming: (AssistantTiming.Operation) -> AssistantTiming): SyntheticSession {
+        beginTiming: (AssistantTiming.Operation) -> AssistantTiming, preparedDirectory: Boolean = false): SyntheticSession {
+        val pattern = if (preparedDirectory) Regex("synthetic-phone-ask-[a-f0-9-]{36}") else Regex("synthetic-ask-[a-f0-9-]{36}")
         require(directory.parentFile?.canonicalFile == context.cacheDir.canonicalFile &&
-            directory.name.matches(Regex("synthetic-ask-[a-f0-9-]{36}")))
-        check(directory.mkdir())
+            directory.name.matches(pattern))
+        check(!directory.exists() || !android.system.OsConstants.S_ISLNK(android.system.Os.lstat(directory.path).st_mode))
+        if (preparedDirectory) check(directory.isDirectory && directory.listFiles()?.isEmpty() == true)
+        else check(directory.mkdir())
         val isolated = object : ContextWrapper(context.applicationContext) {
             override fun getApplicationContext(): Context = this
             override fun getNoBackupFilesDir(): File = directory
         }
-        val store = AssistantStore(isolated)
-        val io = Executors.newSingleThreadExecutor { Thread(it, "synthetic-assistant-store") }
-        val provider = Executors.newSingleThreadExecutor { Thread(it, "synthetic-assistant-provider") }
-        // Optional providers must use the same process router as real Wear requests (phone relay).
-        val worker = if (model == "custom-luna-none") AssistantRequestWorker(provider)
-            else AssistantRequestWorker(provider, router(context.applicationContext))
-        val credentials = ProviderAuthSource(context.applicationContext)
-        val models = object : AssistantModelStorage {
-            override fun read() = model
-            override fun write(value: String) { require(value == read()) }
-        }
-        val policies = object : AssistantPolicyStorage {
-            // Agy cannot enforce tool denial; use its real supported policy, never pretend web is disabled.
-            private val value = AssistantPolicy(webEnabled = webEnabled, speechNetworkFallback = false,
-                speechLanguage = "en-AU", speechTtsProvider = "com.google.android.tts")
-            override fun read() = value
-            override fun write(value: AssistantPolicy) { require(value == this.value) }
-        }
-        val isolatedEngine = AssistantEngine(store, io, worker, credentials::pathForProvider,
-            models, credentials, policies, beginTiming = beginTiming)
-        var retirementRequested = false
-        var storeClose: Future<*>? = null
-        return SyntheticSession(isolatedEngine) {
-            check(Looper.myLooper() != Looper.getMainLooper())
-            if (!retirementRequested) { isolatedEngine.background(); retirementRequested = true }
-            worker.close()
-            provider.shutdown()
-            check(provider.awaitTermination(15, TimeUnit.SECONDS)) { "synthetic_provider_retirement_timeout" }
-            if (storeClose == null) {
-                awaitSyntheticRetirement(isolatedEngine, io, 15, TimeUnit.SECONDS)
-                // Retirement publication follows final actor/store work; serialize close behind it.
-                storeClose = io.submit { store.close() }
+        val retireOnFailure = mutableListOf<() -> Unit>()
+        var constructionIo: ExecutorService? = null
+        try {
+            val store = AssistantStore(isolated).also { store -> retireOnFailure += {
+                check(constructionIo?.isTerminated != false)
+                store.close()
+            } }
+            val io = Executors.newSingleThreadExecutor { Thread(it, "synthetic-assistant-store") }
+            constructionIo = io
+            retireOnFailure += { io.shutdown(); check(io.awaitTermination(15, TimeUnit.SECONDS)) }
+            val provider = Executors.newSingleThreadExecutor { Thread(it, "synthetic-assistant-provider") }
+            retireOnFailure += { provider.shutdown(); check(provider.awaitTermination(15, TimeUnit.SECONDS)) }
+            // Optional providers must use the same process router as real Wear requests (phone relay).
+            val worker = if (model == "custom-luna-none") AssistantRequestWorker(provider)
+                else AssistantRequestWorker(provider, router(context.applicationContext))
+            retireOnFailure += { worker.close() }
+            val credentials = ProviderAuthSource(context.applicationContext)
+            val models = object : AssistantModelStorage {
+                override fun read() = model
+                override fun write(value: String) { require(value == read()) }
             }
-            storeClose!!.get(15, TimeUnit.SECONDS)
-            io.shutdown()
-            check(io.awaitTermination(15, TimeUnit.SECONDS)) { "synthetic_store_retirement_timeout" }
-            check(directory.deleteRecursively()) { "synthetic_store_cleanup_failed" }
+            val policies = object : AssistantPolicyStorage {
+                // Agy cannot enforce tool denial; use its real supported policy, never pretend web is disabled.
+                private val value = AssistantPolicy(webEnabled = webEnabled, speechNetworkFallback = false,
+                    speechLanguage = "en-AU", speechTtsProvider = "com.google.android.tts")
+                override fun read() = value
+                override fun write(value: AssistantPolicy) { require(value == this.value) }
+            }
+            val isolatedEngine = AssistantEngine(store, io, worker, credentials::pathForProvider,
+                models, credentials, policies, beginTiming = beginTiming)
+            var retirementRequested = false
+            var storeClose: Future<*>? = null
+            return SyntheticSession(isolatedEngine) {
+                check(Looper.myLooper() != Looper.getMainLooper())
+                if (!retirementRequested) { isolatedEngine.background(); retirementRequested = true }
+                worker.close()
+                provider.shutdown()
+                check(provider.awaitTermination(15, TimeUnit.SECONDS)) { "synthetic_provider_retirement_timeout" }
+                if (storeClose == null) {
+                    awaitSyntheticRetirement(isolatedEngine, io, 15, TimeUnit.SECONDS)
+                    // Retirement publication follows final actor/store work; serialize close behind it.
+                    storeClose = io.submit { store.close() }
+                }
+                storeClose!!.get(15, TimeUnit.SECONDS)
+                io.shutdown()
+                check(io.awaitTermination(15, TimeUnit.SECONDS)) { "synthetic_store_retirement_timeout" }
+                // Registered phone storage belongs to its durable owner and is removed after producer exit.
+                if (!preparedDirectory) check(directory.deleteRecursively()) { "synthetic_store_cleanup_failed" }
+            }
+        } catch (failure: Exception) {
+            // No success receipt and no data deletion: the durable owner must recover after exit.
+            // Best effort only; a constructor that throws before returning cannot prove retirement.
+            retireOnFailure.asReversed().forEach { retire ->
+                try { retire() } catch (cleanup: Exception) { failure.addSuppressed(cleanup) }
+            }
+            throw failure
         }
     }
 
@@ -139,6 +167,7 @@ object AssistantRuntime {
     }
 
     @Synchronized fun get(context: Context, startupTiming: AssistantTiming? = null, preparePhoneContext: Boolean = false): AssistantEngine {
+        check(dev.gitblame.voxgolem.voice.backgroundServicesAdmitted(context))
         engine?.let { startupTiming?.mark(AssistantTiming.Stage.RUNTIME_REUSED); return it }
         startupTiming?.mark(AssistantTiming.Stage.RUNTIME_CREATE_STARTED)
         val application = context.applicationContext

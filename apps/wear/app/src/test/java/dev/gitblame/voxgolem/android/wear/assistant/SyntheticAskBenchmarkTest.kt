@@ -13,6 +13,42 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class SyntheticAskBenchmarkTest {
+    @Test fun retirementPollingRequiresObservationAndTimesOutWithoutSkippingLaterCleanup() {
+        var time = 0L
+        var observations = 0
+        awaitSyntheticRetirement({ ++observations == 3 }, { time }, { time += 10 })
+        assertEquals(20L, time)
+        val visited = mutableListOf<String>()
+        val failure = runCatching {
+            runSyntheticCleanup(listOf(
+                { awaitSyntheticRetirement({ false }, { time }, { time += 10 }) },
+                { visited += "audio" }, { visited += "provider" }, { visited += "store" },
+            ))
+        }.exceptionOrNull()
+        assertEquals("synthetic_tts_retirement_timeout", failure?.message)
+        assertEquals(5_020L, time)
+        assertEquals(listOf("audio", "provider", "store"), visited)
+    }
+
+    @Test fun pcmProvenanceUsesActualBytesAndRejectsInvalidFormatOrBudget() {
+        val pcm = ByteArray(32_000)
+        val proof = syntheticPcmProvenance(pcm)
+        assertEquals(32_000, proof.getInt("fixture_bytes"))
+        assertEquals(1_000, proof.getInt("fixture_duration_ms"))
+        assertEquals(16_000, proof.getInt("fixture_sample_rate_hz"))
+        assertEquals(1, proof.getInt("fixture_channels"))
+        assertEquals(16, proof.getInt("fixture_bits_per_sample"))
+        val hash = proof.getString("fixture_pcm_sha256")!!
+        assertTrue(hash.matches(Regex("[0-9a-f]{64}")))
+        assertEquals("0c92bddb4e96f3ea9ec9f0f64a668255a6c15527ac09f6f119cafde60c7c4a39", hash)
+        pcm[0] = 1
+        assertNotEquals(hash, syntheticPcmProvenance(pcm).getString("fixture_pcm_sha256"))
+        assertEquals(10_500, syntheticPcmProvenance(ByteArray(336_000)).getInt("fixture_duration_ms"))
+        for (size in listOf(0, 1, 336_002)) {
+            assertTrue(runCatching { syntheticPcmProvenance(ByteArray(size)) }.exceptionOrNull() is IllegalArgumentException)
+        }
+    }
+
     @Test fun syntheticArgumentsDefaultToCustomAndThreeTrialsAndAllowOnlyCheapRoutes() {
         assertEquals("custom-luna-none" to 3, SyntheticAskBenchmark.parseArguments(android.os.Bundle()))
         for (model in listOf("custom-luna-none", "gemini-nano", "agy-flash-low")) {

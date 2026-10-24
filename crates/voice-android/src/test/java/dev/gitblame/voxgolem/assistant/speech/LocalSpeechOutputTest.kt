@@ -95,6 +95,42 @@ class LocalSpeechOutputTest {
     private fun drain() = shadowOf(Looper.getMainLooper()).idle()
     private fun enable() { output.setForeground(true); output.setEnabled(true); drain() }
 
+    private fun retired() = output.isRetired()
+
+    @Test fun warmSdkRequiresCompletedCloseEvenWithoutPlaybackLease() {
+        enable(); output.speak("Synthetic reply", "en-US") {}; drain()
+        factory.ready(true); drain(); factory.sdk.finished(null); drain()
+        assertFalse(factory.sdk.shutdown)
+        assertNull(RecognitionResourceLease.process.current())
+        assertFalse(retired())
+        output.close()
+        assertFalse(retired())
+        drain()
+        assertTrue(factory.sdk.shutdown)
+        assertTrue(retired())
+    }
+
+    @Test fun failedWarmShutdownWithoutLeaseRemainsUnretiredUntilExplicitRetry() {
+        enable(); output.speak("Synthetic reply", "en-US") {}; drain()
+        factory.ready(true); drain(); factory.sdk.finished(null); drain()
+        assertNull(RecognitionResourceLease.process.current())
+        factory.sdk.shutdownFailures = 1
+        output.close(); drain()
+        assertFalse(factory.sdk.shutdown)
+        assertNull(RecognitionResourceLease.process.current())
+        assertFalse(retired())
+        output.close(); drain()
+        assertTrue(factory.sdk.shutdown)
+        assertTrue(retired())
+    }
+
+    @Test fun retirementEvidenceRejectsReadsOffTheMainLooper() {
+        var failure: Throwable? = null
+        Thread { failure = runCatching { output.isRetired() }.exceptionOrNull() }.apply { start(); join() }
+        assertTrue(failure is IllegalStateException)
+        output.close(); drain()
+    }
+
     private fun timedOutput(events: MutableList<AssistantTiming.Event>, leases: RecognitionResourceLease): LocalSpeechOutput {
         val context = RuntimeEnvironment.getApplication()
         context.applicationInfo.flags = context.applicationInfo.flags or ApplicationInfo.FLAG_DEBUGGABLE
@@ -568,8 +604,10 @@ class LocalSpeechOutputTest {
         speech.setForeground(true); speech.setEnabled(true); speech.speak("Synthetic final", "en-US") {}
         drain(); factory.ready(true); drain(); factory.sdk.rejectShutdown = true
         speech.close(); drain(); assertNotNull(leases.current())
+        assertFalse(speech.isRetired())
         assertEquals("speech_cleanup_failed", speech.snapshot().error)
         factory.sdk.rejectShutdown = false; speech.stop(); drain(); assertNull(leases.current())
+        assertTrue(speech.isRetired())
         factory.sdk.finished(null); speech.speak("Synthetic stale request", "en-US") {}; drain()
         assertEquals(1, factory.creates); assertEquals(listOf("Synthetic final"), factory.sdk.spoken)
     }

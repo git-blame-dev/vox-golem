@@ -13,6 +13,7 @@ import android.os.IBinder
 class PhoneCaptureRuntimeService : Service() {
     override fun onCreate() {
         super.onCreate()
+        if (!dev.gitblame.voxgolem.voice.backgroundServicesAdmitted(this)) return
         val manager = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= 26) {
             manager.createNotificationChannel(NotificationChannel(CHANNEL_ID, "Watch dictation", NotificationManager.IMPORTANCE_LOW))
@@ -20,6 +21,7 @@ class PhoneCaptureRuntimeService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (!dev.gitblame.voxgolem.voice.backgroundServicesAdmitted(this)) { stopSelfResult(startId); return START_NOT_STICKY }
         foregroundReady = false
         if (NativePhoneRequirements.isWatch(this)) {
             stopSelfResult(startId)
@@ -71,6 +73,7 @@ class PhoneCaptureRuntimeService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        if (!dev.gitblame.voxgolem.voice.backgroundServicesAdmitted(this)) { super.onDestroy(); return }
         foregroundReady = false
         CaptureChannelReceiver.stopShared()
         PhoneCaptureCoordinator.shared(this).onRuntimeStopped()

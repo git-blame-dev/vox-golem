@@ -27,6 +27,7 @@ import java.util.concurrent.atomic.AtomicReference
 object ChatGptAccessSync {
     @Volatile private var owner: Owner? = null
     @Synchronized fun start(context: Context) {
+        if (!dev.gitblame.voxgolem.voice.backgroundServicesAdmitted(context)) return
         if (owner != null) return
         val app = context.applicationContext
         val setup = (app as? AssistantPeerSetupOwner)?.assistantPeerSetup ?: return

@@ -8,6 +8,7 @@ plugins {
 }
 
 android {
+    sourceSets.getByName("main").java.srcDir(rootProject.file("../../tools/benchmark/android/src/main/java"))
     namespace = "dev.gitblame.voxgolem.android.wear"
     compileSdk {
         version = release(37) {

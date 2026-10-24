@@ -28,6 +28,8 @@ public final class SyntheticAskInstrumentation extends Instrumentation {
     @Override public void onStart() {
         boolean installed = false;
         Throwable failure = null;
+        boolean cleanupVerified = false;
+        boolean ttsRetired = false;
         boolean startupOnly = "startup".equals(arguments.getString("mode"));
         try {
             require(TARGET.equals(getTargetContext().getPackageName()));
@@ -39,6 +41,7 @@ public final class SyntheticAskInstrumentation extends Instrumentation {
                 Bundle ready = (Bundle) facade.getMethod("install", Instrumentation.class, Bundle.class)
                     .invoke(null, this, arguments);
                 installed = true;
+                require(ready.getInt("synthetic_protocol") == 1);
                 require("fixture_ready".equals(ready.getString("stage")));
                 model = ready.getString("model");
                 require("custom-luna-none".equals(model) || "gemini-nano".equals(model) || "agy-flash-low".equals(model));
@@ -72,7 +75,8 @@ public final class SyntheticAskInstrumentation extends Instrumentation {
                         require(status.getInt("TTS_UTTERANCE_ON_DONE") >= 1 && status.getBoolean("idle"));
                         completed++;
                     } finally {
-                        call("finishTrial");
+                        Bundle cleaned = call("finishTrial");
+                        require("trial_cleaned".equals(cleaned.getString("stage")) && cleaned.getBoolean("tts_retired"));
                     }
                 }
             }
@@ -80,7 +84,12 @@ public final class SyntheticAskInstrumentation extends Instrumentation {
             failure = error;
         } finally {
             try {
-                if (installed) call("close");
+                if (installed) {
+                    Bundle cleaned = call("close");
+                    ttsRetired = "cleaned".equals(cleaned.getString("stage")) && cleaned.getBoolean("tts_retired");
+                    require(ttsRetired);
+                    cleanupVerified = true;
+                }
             } catch (Throwable error) {
                 if (failure == null) failure = error;
             } finally {
@@ -96,6 +105,9 @@ public final class SyntheticAskInstrumentation extends Instrumentation {
             }
         }
         Bundle result = new Bundle();
+        result.putInt("synthetic_protocol", 1);
+        result.putBoolean("cleanup_verified", cleanupVerified && failure == null && !startupOnly);
+        result.putBoolean("tts_retired", ttsRetired && cleanupVerified && failure == null && !startupOnly);
         result.putString("benchmark_result", failure == null ? (startupOnly ? "ready" : "complete") : "failed");
         result.putInt("completed_trials", completed);
         if (model != null) result.putString("model", model);

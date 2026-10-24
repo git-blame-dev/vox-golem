@@ -14,7 +14,10 @@ import dev.gitblame.voxgolem.assistant.phone.PhoneStartupTiming
 import dev.gitblame.voxgolem.assistant.phone.PhoneStartupTimingOwner
 import dev.gitblame.voxgolem.assistant.phone.PhoneUiThemeOwner
 
-class MainActivity : TauriActivity(), PhoneStartupTimingOwner, PhoneUiThemeOwner {
+class MainActivity : TauriActivity(), PhoneStartupTimingOwner, PhoneUiThemeOwner,
+    dev.gitblame.voxgolem.capture.CaptureAdmissionOwner {
+  override val captureAdmissionEnabled: Boolean
+    get() = !dev.gitblame.voxgolem.assistant.phone.PhoneActivityBindings.isIsolated(this)
   private var activeWebView: WebView? = null
   private var lastUiTheme: String? = null
   override val startupTiming by lazy { PhoneStartupTiming(this) }
@@ -31,13 +34,16 @@ class MainActivity : TauriActivity(), PhoneStartupTimingOwner, PhoneUiThemeOwner
   override fun onWebViewCreate(webView: WebView) {
     super.onWebViewCreate(webView)
     activeWebView = webView
+    dev.gitblame.voxgolem.assistant.phone.PhoneActivityBindings.webViewCreated(this, webView)
     startupTiming.webViewCreated()
   }
 
   override fun onCreate(savedInstanceState: Bundle?) {
+    dev.gitblame.voxgolem.assistant.phone.PhoneActivityBindings.beforeCreate(this)
     startupTiming.activityCreated()
     enableEdgeToEdge()
-    super.onCreate(savedInstanceState)
+    // The isolated WebView must not restore an ordinary task's renderer state.
+    super.onCreate(if (dev.gitblame.voxgolem.assistant.phone.PhoneActivityBindings.isIsolated(this)) null else savedInstanceState)
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
       setShowWhenLocked(true)
       setTurnScreenOn(true)
