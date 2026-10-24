@@ -44,6 +44,8 @@ class AndroidSuppliedAudioInputTest {
         private val ends = ParcelFileDescriptor.createPipe()
         override val readEnd = ends[0]
         override var sourceClosed = false
+        var state: InputEofState? = null
+        override val eofState get() = state ?: if (sourceClosed) InputEofState.CLOSED else InputEofState.OPEN
         var finishing = false
         var closed = false
         var sourceEnd: ((Boolean) -> Unit)? = null
@@ -64,6 +66,79 @@ class AndroidSuppliedAudioInputTest {
         override fun error(code: String) { errors += code }
     }
     private fun result(text: String) = Bundle().apply { putStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION, arrayListOf(text)) }
+    @Test fun oversizedPartialAndCumulativeDraftsFailBeforePublication() {
+        for (kind in listOf("partial", "segment", "cumulativePartial", "cumulativeSegment")) {
+            val sdk = FakeSdk(); val pipe = FakePipe(); val events = Events()
+            val session = AndroidSuppliedAudioSession("en-US", sdk, pipe) { true }
+            try {
+                session.checkSupport {}; session.start(events)
+                if (kind.startsWith("cumulative")) sdk.callback.onSegmentResults(result("a".repeat(4096)))
+                val text = if (kind.startsWith("cumulative")) "b".repeat(4096) else "界".repeat(2731)
+                if (kind.endsWith("Segment") || kind == "segment") sdk.callback.onSegmentResults(result(text))
+                else sdk.callback.onPartialResults(result(text))
+                assertEquals(kind, listOf("transcript_limit"), events.errors)
+                assertEquals(if (kind.startsWith("cumulative")) 1 else 0, events.partials.size)
+                pipe.sourceClosed = true; sdk.callback.onEndOfSegmentedSession()
+                assertTrue(events.finals.isEmpty())
+            } finally { session.close() }
+        }
+    }
+    @Test fun finalUtf8BudgetAppliesBeforeRetentionInEverySuccessfulEofState() {
+        for (state in listOf(InputEofState.OPEN, InputEofState.CLOSING, InputEofState.CLOSED)) {
+            for (text in listOf("a".repeat(8193), "界".repeat(2731), " ".repeat(8193))) {
+                val sdk = FakeSdk(); val pipe = FakePipe().apply { this.state = state }; val events = Events()
+                val session = AndroidSuppliedAudioSession("en-US", sdk, pipe, SuppliedAudioMode.UTTERANCE) { true }
+                try {
+                    session.checkSupport {}; session.start(events)
+                    sdk.callback.onResults(result(text))
+                    assertEquals(state.toString(), listOf("transcript_limit"), events.errors)
+                    assertEquals(0, events.ends)
+                    pipe.state = InputEofState.CLOSED; pipe.sourceEnd!!.invoke(true)
+                    sdk.callback.onResults(result("synthetic late final"))
+                    assertTrue(events.finals.isEmpty())
+                    val pending = session.javaClass.getDeclaredField("pendingFinal").apply { isAccessible = true }
+                    assertNull(pending.get(session))
+                } finally { session.close() }
+            }
+        }
+    }
+    @Test fun exactAsciiAndMultibyteBudgetsPreserveBlankJoinAndNormalEofCompletion() {
+        for (text in listOf("a".repeat(8192), "界".repeat(2730) + "ab", "😀".repeat(2048))) {
+            val sdk = FakeSdk(); val pipe = FakePipe(); val events = Events()
+            val session = AndroidSuppliedAudioSession("en-US", sdk, pipe) { true }
+            try {
+                session.checkSupport {}; session.start(events)
+                sdk.callback.onSegmentResults(result("  "))
+                sdk.callback.onSegmentResults(result(text))
+                sdk.callback.onPartialResults(result("\t"))
+                assertEquals(text, events.partials.last())
+                session.finish(); pipe.sourceClosed = true; sdk.callback.onEndOfSegmentedSession()
+                assertEquals(listOf(text), events.finals); assertTrue(events.errors.isEmpty())
+            } finally { session.close() }
+        }
+    }
+    @Test fun oversizedCallbacksRespectApprovalCloseAndFailedPipeGuards() {
+        for (guard in listOf("approval", "close", "pipe")) {
+            var approved = true
+            val sdk = FakeSdk(); val pipe = FakePipe(); val events = Events()
+            val session = AndroidSuppliedAudioSession("en-US", sdk, pipe, SuppliedAudioMode.UTTERANCE) { approved }
+            try {
+                session.checkSupport {}; session.start(events)
+                when (guard) {
+                    "approval" -> approved = false
+                    "close" -> session.close()
+                    "pipe" -> pipe.state = InputEofState.FAILED
+                }
+                sdk.callback.onResults(result("a".repeat(8193)))
+                assertEquals(when (guard) {
+                    "approval" -> listOf("supplied_audio_approval_lost")
+                    "pipe" -> listOf("audio_pipe_failed")
+                    else -> emptyList<String>()
+                }, events.errors)
+                assertTrue(events.finals.isEmpty()); assertTrue(events.partials.isEmpty())
+            } finally { session.close() }
+        }
+    }
     @Test fun localUtteranceIntentAndFinalUseTheSameSourceAndWaitForActualEof() {
         val sdk = FakeSdk(); val pipe = FakePipe(); val events = Events()
         val session = AndroidSuppliedAudioSession("en-US", sdk, pipe, SuppliedAudioMode.UTTERANCE) { true }
