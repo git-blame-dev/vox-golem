@@ -149,6 +149,10 @@ impl InstallExitCoordinator {
         }
     }
 
+    fn commit_exit(&mut self) {
+        self.phase = InstallExitPhase::ExitCommitted;
+    }
+
     fn handle_exit_request(&mut self) -> bool {
         match self.phase {
             InstallExitPhase::InstallationReserved => true,
@@ -167,7 +171,6 @@ struct UpdaterSession<U> {
     next_operation_id: u64,
     active_operation_id: Option<u64>,
     install_exit: InstallExitCoordinator,
-    #[cfg(target_os = "windows")]
     installation_guard: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
 }
 
@@ -198,7 +201,6 @@ impl<U> UpdaterSession<U> {
             next_operation_id: 0,
             active_operation_id: None,
             install_exit: InstallExitCoordinator::default(),
-            #[cfg(target_os = "windows")]
             installation_guard: None,
         }
     }
@@ -407,14 +409,12 @@ impl<U> UpdaterSession<U> {
         self.finish_failure(id, error);
     }
 
-    #[cfg(any(not(target_os = "windows"), test))]
     fn finish_unrecoverable_install_failure(&mut self, id: u64, error: String) {
         self.install_exit.release_installation();
         self.resource = None;
         self.finish_failure(id, error);
     }
 
-    #[cfg(target_os = "windows")]
     fn finish_restart_required(
         &mut self,
         id: u64,
@@ -422,14 +422,27 @@ impl<U> UpdaterSession<U> {
         message: String,
     ) {
         if self.finish(id) {
-            retain_recovery_state(
-                &mut self.snapshot,
-                &mut self.resource,
-                &mut self.installation_guard,
-                guard,
-                message,
-            );
+            self.resource = None;
+            self.snapshot.phase = UpdatePhase::RestartRequired;
+            self.snapshot.progress_phase = None;
+            self.snapshot.error = Some(message);
+            self.snapshot.reason =
+                Some("The installer could not be started. Restart VoxGolem before using it again.");
+            self.installation_guard = Some(guard);
         }
+    }
+
+    fn accept_installer_handoff(
+        &mut self,
+        id: u64,
+        guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+    ) -> bool {
+        if self.active_operation_id != Some(id) {
+            return false;
+        }
+        self.install_exit.commit_exit();
+        self.installation_guard = Some(guard);
+        true
     }
 
     fn finish(&mut self, id: u64) -> bool {
@@ -462,23 +475,6 @@ impl<U> UpdaterSession<U> {
     fn bump(&mut self) {
         self.snapshot.revision = self.snapshot.revision.saturating_add(1);
     }
-}
-
-#[cfg(any(target_os = "windows", test))]
-fn retain_recovery_state<U, G>(
-    snapshot: &mut UpdateSnapshot,
-    resource: &mut Option<UpdateResource<U>>,
-    retained_guard: &mut Option<G>,
-    guard: G,
-    message: String,
-) {
-    *resource = None;
-    snapshot.phase = UpdatePhase::RestartRequired;
-    snapshot.progress_phase = None;
-    snapshot.error = Some(message);
-    snapshot.reason =
-        Some("The installer could not be started. Restart VoxGolem before using it again.");
-    *retained_guard = Some(guard);
 }
 
 pub(crate) struct PendingUpdate {
@@ -672,92 +668,266 @@ async fn perform_install_reserved(
         return Err(error);
     }
 
-    if let Err(error) = crate::desktop_voice_adapter::stop_for_update(app, app_state).await {
-        drop(installation_guard);
-        restore_install(pending, id, update, bytes, metadata, error.clone())?;
-        emit_current_snapshot(app, pending)?;
-        return Err(error);
+    let stop_app = app.clone();
+    let cleanup_app = app.clone();
+    supervise_admitted_install(
+        app.clone(),
+        AdmittedInstall {
+            id,
+            update,
+            bytes,
+            metadata,
+            installation_guard,
+            destructive_cleanup: cfg!(target_os = "windows"),
+        },
+        move || async move {
+            let app_state = stop_app.state::<crate::AppState>();
+            crate::desktop_voice_adapter::stop_for_update(&stop_app, &app_state).await
+        },
+        move || async move {
+            #[cfg(target_os = "windows")]
+            {
+                tauri::async_runtime::spawn(async move {
+                    crate::shutdown_runtime_for_update(&cleanup_app.state::<crate::AppState>())
+                        .await
+                })
+                .await
+                .map_err(|error| format!("update cleanup task failed: {error}"))
+                .and_then(|result| result)
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = cleanup_app;
+                Ok(())
+            }
+        },
+        |update, bytes| update.install(bytes).map_err(updater_error),
+    )
+    .wait()
+    .await
+}
+
+trait SessionAccess<U>: Clone + Send + Sync + 'static {
+    fn with_session<R>(&self, f: impl FnOnce(&mut UpdaterSession<U>) -> R) -> Result<R, String>;
+    fn publish_snapshot(&self, snapshot: &UpdateSnapshot);
+    fn on_install_accepted(&self);
+}
+
+impl SessionAccess<Update> for AppHandle {
+    fn with_session<R>(
+        &self,
+        f: impl FnOnce(&mut UpdaterSession<Update>) -> R,
+    ) -> Result<R, String> {
+        let pending = self.state::<PendingUpdate>();
+        let mut session = lock_session(&pending)?;
+        Ok(f(&mut session))
     }
 
-    #[cfg(target_os = "windows")]
-    let cleanup_result = {
-        let cleanup_app = app.clone();
-        tauri::async_runtime::spawn(async move {
-            crate::shutdown_runtime_for_update(&cleanup_app.state::<crate::AppState>()).await
+    fn publish_snapshot(&self, snapshot: &UpdateSnapshot) {
+        emit_snapshot(self, snapshot);
+    }
+
+    fn on_install_accepted(&self) {
+        #[cfg(target_os = "linux")]
+        self.restart();
+    }
+}
+
+struct AdmittedInstall<U> {
+    id: u64,
+    update: U,
+    bytes: Vec<u8>,
+    metadata: UpdateMetadata,
+    installation_guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+    destructive_cleanup: bool,
+}
+
+struct SupervisedInstallHandle {
+    result_rx: tokio::sync::oneshot::Receiver<Result<UpdateSnapshot, String>>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    task: tauri::async_runtime::JoinHandle<()>,
+}
+
+impl SupervisedInstallHandle {
+    async fn wait(self) -> Result<UpdateSnapshot, String> {
+        self.result_rx
+            .await
+            .map_err(|_| String::from("supervised update installation task terminated"))?
+    }
+}
+
+struct AdmittedInstallGuard<U, A: SessionAccess<U>> {
+    access: A,
+    id: u64,
+    resources: Option<(U, Vec<u8>, UpdateMetadata)>,
+    installation_guard: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+    destructive_cleanup: bool,
+    destructive_cleanup_started: bool,
+    settled: bool,
+}
+
+impl<U, A: SessionAccess<U>> AdmittedInstallGuard<U, A> {
+    fn new(access: A, admitted: AdmittedInstall<U>) -> Self {
+        Self {
+            access,
+            id: admitted.id,
+            resources: Some((admitted.update, admitted.bytes, admitted.metadata)),
+            installation_guard: Some(admitted.installation_guard),
+            destructive_cleanup: admitted.destructive_cleanup,
+            destructive_cleanup_started: false,
+            settled: false,
+        }
+    }
+
+    fn settle_pre_cleanup_error(&mut self, error: String) -> Result<UpdateSnapshot, String> {
+        self.settled = true;
+        drop(self.installation_guard.take());
+        let Some((update, bytes, metadata)) = self.resources.take() else {
+            return Err(String::from("verified update resources are unavailable"));
+        };
+        let snapshot = self.access.with_session(|session| {
+            session.install_exit.release_installation();
+            session.restore_ready(self.id, update, bytes, metadata, error.clone());
+            session.snapshot.clone()
+        })?;
+        self.access.publish_snapshot(&snapshot);
+        Err(error)
+    }
+
+    fn settle_handoff(
+        &mut self,
+        result: Result<(), String>,
+        update: U,
+        bytes: Vec<u8>,
+        metadata: UpdateMetadata,
+    ) -> Result<UpdateSnapshot, String> {
+        self.settled = true;
+        match result {
+            Ok(()) => {
+                drop((update, bytes, metadata));
+                let Some(guard) = self.installation_guard.take() else {
+                    return Err(String::from("update installation guard is unavailable"));
+                };
+                let snapshot = self.access.with_session(|session| {
+                    session.accept_installer_handoff(self.id, guard);
+                    session.snapshot.clone()
+                })?;
+                self.access.on_install_accepted();
+                Ok(snapshot)
+            }
+            Err(error) => {
+                let message = format!("failed to install update: {error}");
+                let snapshot = if self.destructive_cleanup_started {
+                    drop((update, bytes, metadata));
+                    let Some(guard) = self.installation_guard.take() else {
+                        return Err(String::from("update installation guard is unavailable"));
+                    };
+                    self.access.with_session(|session| {
+                        session.install_exit.release_installation();
+                        session.finish_restart_required(self.id, guard, message);
+                        session.snapshot.clone()
+                    })?
+                } else {
+                    drop(self.installation_guard.take());
+                    self.access.with_session(|session| {
+                        session.install_exit.release_installation();
+                        session.restore_ready(self.id, update, bytes, metadata, message);
+                        session.snapshot.clone()
+                    })?
+                };
+                self.access.publish_snapshot(&snapshot);
+                Ok(snapshot)
+            }
+        }
+    }
+}
+
+impl<U, A: SessionAccess<U>> Drop for AdmittedInstallGuard<U, A> {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let message = String::from("update installation task was cancelled");
+        if self.destructive_cleanup_started {
+            let Some(guard) = self.installation_guard.take() else {
+                return;
+            };
+            self.resources = None;
+            if let Ok(snapshot) = self.access.with_session(|session| {
+                session.install_exit.release_installation();
+                session.finish_restart_required(self.id, guard, message);
+                session.snapshot.clone()
+            }) {
+                self.access.publish_snapshot(&snapshot);
+            }
+            return;
+        }
+        drop(self.installation_guard.take());
+        if let Some((update, bytes, metadata)) = self.resources.take() {
+            if let Ok(snapshot) = self.access.with_session(|session| {
+                session.install_exit.release_installation();
+                session.restore_ready(self.id, update, bytes, metadata, message);
+                session.snapshot.clone()
+            }) {
+                self.access.publish_snapshot(&snapshot);
+            }
+        } else if let Ok(snapshot) = self.access.with_session(|session| {
+            session.finish_unrecoverable_install_failure(self.id, message);
+            session.snapshot.clone()
+        }) {
+            self.access.publish_snapshot(&snapshot);
+        }
+    }
+}
+
+fn supervise_admitted_install<U, A, Stop, StopFut, Cleanup, CleanupFut, Install>(
+    access: A,
+    admitted: AdmittedInstall<U>,
+    stop_for_update: Stop,
+    cleanup_for_update: Cleanup,
+    install_update: Install,
+) -> SupervisedInstallHandle
+where
+    U: Send + 'static,
+    A: SessionAccess<U>,
+    Stop: FnOnce() -> StopFut + Send + 'static,
+    StopFut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    Cleanup: FnOnce() -> CleanupFut + Send + 'static,
+    CleanupFut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    Install: FnOnce(&mut U, &[u8]) -> Result<(), String> + Send + 'static,
+{
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let task = tauri::async_runtime::spawn(async move {
+        let mut guard = AdmittedInstallGuard::new(access, admitted);
+        if let Err(error) = stop_for_update().await {
+            let outcome = guard.settle_pre_cleanup_error(error);
+            let _ = result_tx.send(outcome);
+            return;
+        }
+        let cleanup_result = if guard.destructive_cleanup {
+            guard.destructive_cleanup_started = true;
+            cleanup_for_update().await
+        } else {
+            cleanup_for_update().await
+        };
+        let install_task = tauri::async_runtime::spawn_blocking(move || {
+            let Some((mut update, bytes, metadata)) = guard.resources.take() else {
+                return Err(String::from("verified update resources are unavailable"));
+            };
+            let result = run_cleanup_install_handoff(
+                || cleanup_result,
+                || install_update(&mut update, &bytes),
+            );
+            guard.settle_handoff(result, update, bytes, metadata)
         })
-        .await
-        .map_err(|error| format!("update cleanup task failed: {error}"))
-        .and_then(|result| result)
-    };
-    #[cfg(not(target_os = "windows"))]
-    let cleanup_result = Ok(());
-
-    let install_task = tauri::async_runtime::spawn_blocking(move || {
-        let result = run_cleanup_install_handoff(
-            || cleanup_result,
-            || update.install(&bytes).map_err(updater_error),
-        );
-        (result, update, bytes)
-    })
-    .await;
-    let install_result = match install_task {
-        Ok(result) => result,
-        Err(error) => {
-            let message = format!("update installer task failed: {error}");
-            let snapshot = {
-                let mut session = lock_session(pending)?;
-                #[cfg(target_os = "windows")]
-                {
-                    session.install_exit.release_installation();
-                    session.finish_restart_required(id, installation_guard, message);
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    drop(installation_guard);
-                    session.finish_unrecoverable_install_failure(id, message);
-                }
-                session.snapshot.clone()
-            };
-            emit_snapshot(app, &snapshot);
-            return Ok(snapshot);
-        }
-    };
-
-    match install_result {
-        (Ok(()), _, _) => {
-            drop(installation_guard);
-            let _snapshot = {
-                let mut session = lock_session(pending)?;
-                session.install_exit.release_installation();
-                session.finish(id);
-                session.snapshot.clone()
-            };
-            #[cfg(target_os = "linux")]
-            app.restart();
-            #[allow(unreachable_code)]
-            Ok(_snapshot)
-        }
-        (Err(error), update, bytes) => {
-            let message = format!("failed to install update: {error}");
-            let snapshot = {
-                let mut session = lock_session(pending)?;
-                session.install_exit.release_installation();
-                #[cfg(target_os = "windows")]
-                {
-                    drop((update, bytes));
-                    session.finish_restart_required(id, installation_guard, message);
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    drop(installation_guard);
-                    session.restore_ready(id, update, bytes, metadata, message);
-                }
-                session.snapshot.clone()
-            };
-            emit_snapshot(app, &snapshot);
-            Ok(snapshot)
-        }
-    }
+        .await;
+        let outcome = match install_task {
+            Ok(outcome) => outcome,
+            Err(error) => Err(format!("update installer task failed: {error}")),
+        };
+        let _ = result_tx.send(outcome);
+    });
+    SupervisedInstallHandle { result_rx, task }
 }
 
 fn restore_install(
@@ -899,6 +1069,12 @@ async fn perform_check(
         }
     };
 
+    let mut check_guard = CheckOperationGuard {
+        app: Some(app),
+        session: &pending.session,
+        id,
+        completed: false,
+    };
     let checked = match app
         .updater_builder()
         .timeout(UPDATE_CHECK_TIMEOUT)
@@ -910,6 +1086,7 @@ async fn perform_check(
     };
     let snapshot = {
         let mut session = lock_session(pending)?;
+        check_guard.completed = true;
         match checked {
             Ok(Some(mut update)) => {
                 update.timeout = Some(UPDATE_DOWNLOAD_TIMEOUT);
@@ -924,6 +1101,29 @@ async fn perform_check(
     };
     emit_snapshot(app, &snapshot);
     Ok(snapshot)
+}
+
+struct CheckOperationGuard<'a, U> {
+    app: Option<&'a AppHandle>,
+    session: &'a Mutex<UpdaterSession<U>>,
+    id: u64,
+    completed: bool,
+}
+
+impl<U> Drop for CheckOperationGuard<'_, U> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        if let Ok(mut session) = self.session.lock() {
+            session.finish_failure(self.id, String::from("update check was cancelled"));
+            let snapshot = session.snapshot.clone();
+            drop(session);
+            if let Some(app) = self.app {
+                emit_snapshot(app, &snapshot);
+            }
+        }
+    }
 }
 
 fn attempt_automatic_install<'a>(
@@ -1103,6 +1303,7 @@ async fn perform_download(
         let id = session.reserve(UpdateOperation::Download, true)?;
         let snapshot = session.snapshot.clone();
         let Some(UpdateResource::Available { update, metadata }) = session.resource.take() else {
+            session.finish_failure(id, String::from("update resource is unavailable"));
             return Err(String::from("update resource is unavailable"));
         };
         drop(session);
@@ -1110,9 +1311,16 @@ async fn perform_download(
         (id, update, metadata)
     };
 
+    let mut download_guard = DownloadOperationGuard {
+        app: Some(app),
+        session: &pending.session,
+        id,
+        resource: Some((update, metadata)),
+    };
     let progress_app = app.clone();
     let finish_app = app.clone();
-    let downloaded = update
+    let downloaded = download_guard
+        .update()?
         .download(
             move |chunk, total| {
                 if let Ok(mut session) = progress_app.state::<PendingUpdate>().session.lock() {
@@ -1133,6 +1341,9 @@ async fn perform_download(
 
     let snapshot = {
         let mut session = lock_session(pending)?;
+        let Some((update, metadata)) = download_guard.resource.take() else {
+            return Err(String::from("update resource is unavailable"));
+        };
         session.resource = Some(UpdateResource::Available { update, metadata });
         match downloaded {
             Ok(bytes) => session.finish_download(id, bytes),
@@ -1149,6 +1360,39 @@ async fn perform_download(
     emit_snapshot(app, &snapshot);
     attempt_automatic_install(app, pending).await;
     Ok(lock_session(pending)?.snapshot.clone())
+}
+
+struct DownloadOperationGuard<'a, U> {
+    app: Option<&'a AppHandle>,
+    session: &'a Mutex<UpdaterSession<U>>,
+    id: u64,
+    resource: Option<(U, UpdateMetadata)>,
+}
+
+impl<U> DownloadOperationGuard<'_, U> {
+    fn update(&self) -> Result<&U, String> {
+        self.resource
+            .as_ref()
+            .map(|(update, _)| update)
+            .ok_or_else(|| String::from("update resource is unavailable"))
+    }
+}
+
+impl<U> Drop for DownloadOperationGuard<'_, U> {
+    fn drop(&mut self) {
+        let Some((update, metadata)) = self.resource.take() else {
+            return;
+        };
+        if let Ok(mut session) = self.session.lock() {
+            session.resource = Some(UpdateResource::Available { update, metadata });
+            session.finish_failure(self.id, String::from("update download was cancelled"));
+            let snapshot = session.snapshot.clone();
+            drop(session);
+            if let Some(app) = self.app {
+                emit_snapshot(app, &snapshot);
+            }
+        }
+    }
 }
 
 fn current_bundle_type() -> Option<BundleType> {
@@ -1592,6 +1836,12 @@ mod tests {
         assert!(session.snapshot.reason.is_some());
     }
 
+    fn write_guard() -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        std::sync::Arc::new(tokio::sync::RwLock::new(()))
+            .try_write_owned()
+            .expect("synthetic write guard")
+    }
+
     #[test]
     fn recovery_state_rejects_all_update_operations_without_changing_the_snapshot() {
         let mut session = session();
@@ -1600,14 +1850,8 @@ mod tests {
             bytes: vec![1, 2, 3],
             metadata: metadata(),
         });
-        let mut retained_guard = None;
-        retain_recovery_state(
-            &mut session.snapshot,
-            &mut session.resource,
-            &mut retained_guard,
-            "synthetic write guard",
-            String::from("installer launch failed"),
-        );
+        let id = session.reserve(UpdateOperation::Install, true).unwrap();
+        session.finish_restart_required(id, write_guard(), String::from("installer launch failed"));
         let before = session.snapshot.clone();
 
         assert!(session.reserve(UpdateOperation::Check, true).is_err());
@@ -1615,7 +1859,7 @@ mod tests {
         assert!(session.reserve(UpdateOperation::Download, true).is_err());
         assert!(session.reserve(UpdateOperation::Install, true).is_err());
         assert_eq!(session.snapshot, before);
-        assert_eq!(retained_guard, Some("synthetic write guard"));
+        assert!(session.installation_guard.is_some());
         assert!(session.resource.is_none());
     }
 
@@ -1649,16 +1893,10 @@ mod tests {
         assert_eq!(select_background_work(&ready, true), BackgroundWork::None);
         assert!(matches!(ready.resource, Some(UpdateResource::Ready { .. })));
 
-        let mut retained_guard = None;
-        retain_recovery_state(
-            &mut ready.snapshot,
-            &mut ready.resource,
-            &mut retained_guard,
-            "guard",
-            String::from("install failed"),
-        );
+        let install = ready.reserve(UpdateOperation::Install, true).unwrap();
+        ready.finish_restart_required(install, write_guard(), String::from("install failed"));
         assert_eq!(select_background_work(&ready, true), BackgroundWork::None);
-        assert_eq!(retained_guard, Some("guard"));
+        assert!(ready.installation_guard.is_some());
     }
 
     #[test]
@@ -1768,5 +2006,417 @@ mod tests {
         );
         assert_eq!(result, Err(String::from("cleanup failed")));
         assert!(!started.load(Ordering::SeqCst));
+    }
+
+    #[derive(Clone)]
+    struct TestInstallAccess {
+        session: std::sync::Arc<Mutex<UpdaterSession<()>>>,
+        emitted: std::sync::Arc<Mutex<Vec<UpdateSnapshot>>>,
+        accepted: std::sync::Arc<AtomicBool>,
+    }
+
+    impl TestInstallAccess {
+        fn new() -> Self {
+            Self {
+                session: std::sync::Arc::new(ready_session()),
+                emitted: std::sync::Arc::new(Mutex::new(Vec::new())),
+                accepted: std::sync::Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn admit(
+            &self,
+            gate: &std::sync::Arc<crate::UpdateActivity>,
+            destructive_cleanup: bool,
+        ) -> AdmittedInstall<()> {
+            let mut session = self.session.lock().unwrap();
+            session.install_exit.reserve_installation().unwrap();
+            let id = session.reserve(UpdateOperation::Install, true).unwrap();
+            let (update, bytes, metadata) = session.take_ready(id).unwrap();
+            AdmittedInstall {
+                id,
+                update,
+                bytes,
+                metadata,
+                installation_guard: gate.installation().unwrap(),
+                destructive_cleanup,
+            }
+        }
+    }
+
+    impl SessionAccess<()> for TestInstallAccess {
+        fn with_session<R>(
+            &self,
+            f: impl FnOnce(&mut UpdaterSession<()>) -> R,
+        ) -> Result<R, String> {
+            let mut guard = self.session.lock().unwrap();
+            Ok(f(&mut guard))
+        }
+
+        fn publish_snapshot(&self, snapshot: &UpdateSnapshot) {
+            self.emitted.lock().unwrap().push(snapshot.clone());
+        }
+
+        fn on_install_accepted(&self) {
+            self.accepted.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn supervised_install_completes_across_caller_disappearance_at_every_stage() {
+        for stage in ["stop", "cleanup", "install"] {
+            let state = idle_runtime();
+            let access = TestInstallAccess::new();
+            let admitted = access.admit(&state.update_installation_gate, true);
+            let id = admitted.id;
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+
+            let stop_stage = stage == "stop";
+            let cleanup_stage = stage == "cleanup";
+            let install_stage = stage == "install";
+            let (stop_enter, cleanup_enter, install_enter) = if stop_stage {
+                (Some(entered_tx), None, None)
+            } else if cleanup_stage {
+                (None, Some(entered_tx), None)
+            } else {
+                (None, None, Some(entered_tx))
+            };
+            let (stop_release, cleanup_release, install_release) = if stop_stage {
+                (Some(release_rx), None, None)
+            } else if cleanup_stage {
+                (None, Some(release_rx), None)
+            } else {
+                (None, None, Some(release_rx))
+            };
+
+            let handle = supervise_admitted_install(
+                access.clone(),
+                admitted,
+                move || async move {
+                    if let Some(entered) = stop_enter {
+                        entered.send(()).unwrap();
+                    }
+                    if let Some(release) = stop_release {
+                        tokio::task::spawn_blocking(move || release.recv().unwrap())
+                            .await
+                            .unwrap();
+                    }
+                    Ok(())
+                },
+                move || async move {
+                    if let Some(entered) = cleanup_enter {
+                        entered.send(()).unwrap();
+                    }
+                    if let Some(release) = cleanup_release {
+                        tokio::task::spawn_blocking(move || release.recv().unwrap())
+                            .await
+                            .unwrap();
+                    }
+                    Ok(())
+                },
+                move |_, bytes| {
+                    assert_eq!(bytes, &[1]);
+                    if let Some(entered) = install_enter {
+                        entered.send(()).unwrap();
+                    }
+                    if let Some(release) = install_release {
+                        release.recv().unwrap();
+                    }
+                    let _ = done_tx.send(());
+                    Err(String::from("synthetic installer failure"))
+                },
+            );
+
+            // Simulate the caller awaiting the install and then disappearing mid-stage.
+            let SupervisedInstallHandle {
+                mut result_rx,
+                task,
+            } = handle;
+            tokio::time::timeout(Duration::from_secs(3), entered_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(result_rx.try_recv().is_err());
+            drop(result_rx);
+            drop(task);
+
+            assert!(
+                state.update_installation_gate.operation().is_err(),
+                "caller disappearance during {stage} must not drop installation_guard early"
+            );
+            assert_eq!(
+                access.session.lock().unwrap().active_operation_id,
+                Some(id),
+                "session must stay active while supervised {stage} is in flight"
+            );
+
+            release_tx.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(3), done_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while access.session.lock().unwrap().active_operation_id.is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+
+            let session = access.session.lock().unwrap();
+            assert_eq!(session.snapshot.phase, UpdatePhase::RestartRequired);
+            assert!(session.installation_guard.is_some());
+            assert!(state.update_installation_gate.operation().is_err());
+            assert_eq!(access.emitted.lock().unwrap().len(), 1);
+            let _ = install_stage;
+        }
+    }
+
+    #[tokio::test]
+    async fn aborting_supervised_task_during_blocking_install_retains_guard_until_installer_returns(
+    ) {
+        let state = idle_runtime();
+        let access = TestInstallAccess::new();
+        let admitted = access.admit(&state.update_installation_gate, false);
+        let id = admitted.id;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let handle = supervise_admitted_install(
+            access.clone(),
+            admitted,
+            || async { Ok(()) },
+            || async { Ok(()) },
+            move |_, _| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Err(String::from("synthetic installer failure"))
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(3), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        handle.task.abort();
+        assert!(handle.task.await.is_err());
+
+        assert!(
+            state.update_installation_gate.operation().is_err(),
+            "installation_guard must remain owned on the blocking worker until the installer returns"
+        );
+        assert_eq!(access.session.lock().unwrap().active_operation_id, Some(id));
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while access.session.lock().unwrap().active_operation_id.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let mut session = access.session.lock().unwrap();
+        assert_eq!(session.snapshot.phase, UpdatePhase::Ready);
+        assert!(matches!(
+            session.resource,
+            Some(UpdateResource::Ready { .. })
+        ));
+        assert!(session.installation_guard.is_none());
+        assert!(state.update_installation_gate.operation().is_ok());
+        assert!(session.install_exit.reserve_installation().is_ok());
+    }
+
+    #[tokio::test]
+    async fn aborting_supervised_task_before_or_after_destructive_cleanup_settles_according_to_stage(
+    ) {
+        // 1. Aborted before destructive cleanup starts (during stop_for_update): restores Ready.
+        let state = idle_runtime();
+        let access = TestInstallAccess::new();
+        let admitted = access.admit(&state.update_installation_gate, true);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let handle = supervise_admitted_install(
+            access.clone(),
+            admitted,
+            move || async move {
+                entered_tx.send(()).unwrap();
+                std::future::pending::<Result<(), String>>().await
+            },
+            || async { panic!("must not enter destructive cleanup") },
+            |_, _| panic!("must not enter installer"),
+        );
+        tokio::time::timeout(Duration::from_secs(3), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        handle.task.abort();
+        assert!(handle.task.await.is_err());
+        {
+            let mut session = access.session.lock().unwrap();
+            assert_eq!(session.snapshot.phase, UpdatePhase::Ready);
+            assert!(matches!(
+                session.resource,
+                Some(UpdateResource::Ready { .. })
+            ));
+            assert!(session.active_operation_id.is_none());
+            assert!(session.installation_guard.is_none());
+            assert!(state.update_installation_gate.operation().is_ok());
+            assert!(session.install_exit.reserve_installation().is_ok());
+        }
+
+        // 2. Aborted after destructive cleanup starts: enters RestartRequired and retains guard.
+        let state = idle_runtime();
+        let access = TestInstallAccess::new();
+        let admitted = access.admit(&state.update_installation_gate, true);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let handle = supervise_admitted_install(
+            access.clone(),
+            admitted,
+            || async { Ok(()) },
+            move || async move {
+                entered_tx.send(()).unwrap();
+                std::future::pending::<Result<(), String>>().await
+            },
+            |_, _| panic!("must not enter installer"),
+        );
+        tokio::time::timeout(Duration::from_secs(3), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        handle.task.abort();
+        assert!(handle.task.await.is_err());
+        {
+            let mut session = access.session.lock().unwrap();
+            assert_eq!(session.snapshot.phase, UpdatePhase::RestartRequired);
+            assert!(session.resource.is_none());
+            assert!(session.active_operation_id.is_none());
+            assert!(session.installation_guard.is_some());
+            assert!(state.update_installation_gate.operation().is_err());
+            assert!(session.install_exit.reserve_installation().is_ok());
+        }
+
+        // 3. Dropped after non-destructive resource consumption: settles unrecoverable failure.
+        let state = idle_runtime();
+        let access = TestInstallAccess::new();
+        let admitted = access.admit(&state.update_installation_gate, false);
+        let mut guard = AdmittedInstallGuard::new(access.clone(), admitted);
+        let _consumed = guard.resources.take().unwrap();
+        drop(guard);
+        {
+            let mut session = access.session.lock().unwrap();
+            assert_eq!(session.snapshot.phase, UpdatePhase::Idle);
+            assert!(session.resource.is_none());
+            assert!(session.active_operation_id.is_none());
+            assert!(session.installation_guard.is_none());
+            assert!(state.update_installation_gate.operation().is_ok());
+            assert!(session.install_exit.reserve_installation().is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn installer_launch_acceptance_retains_guard_commits_exit_and_keeps_installing_phase() {
+        let state = idle_runtime();
+        let access = TestInstallAccess::new();
+        let admitted = access.admit(&state.update_installation_gate, true);
+        let id = admitted.id;
+
+        let snapshot = supervise_admitted_install(
+            access.clone(),
+            admitted,
+            || async { Ok(()) },
+            || async { Ok(()) },
+            |_, bytes| {
+                assert_eq!(bytes, &[1]);
+                Ok(())
+            },
+        )
+        .wait()
+        .await
+        .unwrap();
+
+        assert_eq!(snapshot.phase, UpdatePhase::Installing);
+        assert_eq!(snapshot.operation, Some(UpdateOperation::Install));
+        assert_eq!(
+            snapshot.progress_phase,
+            Some(UpdateProgressPhase::Installing)
+        );
+        assert!(access.accepted.load(Ordering::SeqCst));
+        assert!(
+            state.update_installation_gate.operation().is_err(),
+            "launch acceptance must retain installation_guard until process exit"
+        );
+
+        let mut session = access.session.lock().unwrap();
+        assert_eq!(session.active_operation_id, Some(id));
+        assert!(session.installation_guard.is_some());
+        assert!(!should_automatically_install(&session, true, true));
+        assert_eq!(
+            session.install_exit.reserve_installation().unwrap_err(),
+            "application exit is already committed"
+        );
+        assert!(!session.install_exit.handle_exit_request());
+    }
+
+    #[test]
+    fn dropping_check_or_download_operation_guard_settles_active_operation_and_restores_available_update(
+    ) {
+        let session_mutex = Mutex::new(session());
+        let check_id = session_mutex
+            .lock()
+            .unwrap()
+            .reserve(UpdateOperation::Check, true)
+            .unwrap();
+        drop(CheckOperationGuard {
+            app: None,
+            session: &session_mutex,
+            id: check_id,
+            completed: false,
+        });
+        {
+            let session = session_mutex.lock().unwrap();
+            assert!(session.active_operation_id.is_none());
+            assert_eq!(session.snapshot.phase, UpdatePhase::Idle);
+            assert_eq!(
+                session.snapshot.error.as_deref(),
+                Some("update check was cancelled")
+            );
+        }
+
+        {
+            let mut session = session_mutex.lock().unwrap();
+            session.resource = Some(UpdateResource::Available {
+                update: (),
+                metadata: metadata(),
+            });
+            session.snapshot.phase = UpdatePhase::Available;
+        }
+        let (download_id, update, meta) = {
+            let mut session = session_mutex.lock().unwrap();
+            let id = session.reserve(UpdateOperation::Download, true).unwrap();
+            let Some(UpdateResource::Available { update, metadata }) = session.resource.take()
+            else {
+                panic!("available update expected")
+            };
+            (id, update, metadata)
+        };
+        drop(DownloadOperationGuard {
+            app: None,
+            session: &session_mutex,
+            id: download_id,
+            resource: Some((update, meta)),
+        });
+        let session = session_mutex.lock().unwrap();
+        assert!(session.active_operation_id.is_none());
+        assert_eq!(session.snapshot.phase, UpdatePhase::Available);
+        assert!(matches!(
+            session.resource,
+            Some(UpdateResource::Available { .. })
+        ));
+        assert_eq!(
+            session.snapshot.error.as_deref(),
+            Some("update download was cancelled")
+        );
     }
 }
