@@ -16,11 +16,11 @@ import java.util.concurrent.atomic.AtomicReference
 class EnginePhoneBackend internal constructor(
     private val context: Context,
     private val engine: AssistantEngine,
+    private val preferences: PhonePreferences = PhonePreferences(context),
     private val prewarm: (String) -> Unit = AssistantRuntime::prewarm,
 ) : AssistantPhoneBackend {
     constructor(context: Context) : this(context, AssistantRuntime.get(context))
     private val delivery = AtomicReference<PhoneRequestDelivery?>(null)
-    private val preferences = PhonePreferences(context)
     private val preferencesPending = AtomicBoolean(false)
     private val admission = Any()
     private var initializingConversation = false
@@ -30,6 +30,8 @@ class EnginePhoneBackend internal constructor(
     @Volatile var speechStatus: JSONObject? = null
     @Volatile var onPreferencesChanged: ((Boolean) -> Unit)? = null
     fun nativePreferences(): JSONObject = preferencesFor(engine.snapshot())
+    // Model/policy are engine-owned. Observers run before preference settlement, so this
+    // projection is not an atomic cross-store snapshot; the successful command ACK is the fence.
     private fun preferencesFor(state: AssistantState) = preferences.read(state.model)
         .put("web_enabled", state.webEnabled).put("speech_network_fallback", state.speechNetworkFallback)
         .put("fast_mode", state.fastMode)
@@ -226,7 +228,7 @@ class EnginePhoneBackend internal constructor(
     }
 
     private fun updatePreferences(input: JSONObject, reply: (Result<Any?>) -> Unit) {
-        val value = PhonePreferences.normalize(input)
+        val value = PhonePreferences.copyInput(input)
         PhonePreferences.validate(value)
         if (value.getBoolean("tts_enabled") && !nativePreferences().getBoolean("tts_enabled") &&
             (!AssistantRuntime.captureResourceAdmissionReady() || speechStatus?.optBoolean("ttsAvailable") != true)) {
@@ -237,12 +239,15 @@ class EnginePhoneBackend internal constructor(
         }
         val selectedModel = value.getString("instant")
         var previousModel: String? = null
+        var staged: PhonePreferences.Presentation? = null
         engine.updatePreferences(selectedModel, dev.gitblame.voxgolem.assistant.runtime.AssistantPolicy(
             value.getBoolean("web_enabled"), value.getBoolean("speech_network_fallback"), value.getString("speech_language"),
             value.getString("speech_tts_provider"), value.getString("speech_tts_voice"), value.getBoolean("fast_mode")), {
             previousModel = engine.snapshot().model
-            preferences.write(value)
+            staged = preferences.persist(value)
         }) { selected ->
+            // Persistence alone must not publish presentation ahead of actor settlement.
+            if (selected.error == null) staged?.let(preferences::publish)
             preferencesPending.set(false)
             if (selected.error != null) reply(Result.failure(providerFailure(selected.error)))
             else {

@@ -3,7 +3,55 @@ package dev.gitblame.voxgolem.assistant.phone
 import org.junit.Assert.*
 import org.junit.Test
 
+@org.junit.runner.RunWith(PhoneAssistantRunner::class)
+@org.robolectric.annotation.Config(sdk = [35], manifest = org.robolectric.annotation.Config.NONE)
 class PhonePreferencesTest {
+    @Test fun pendingCommitAndRollbackNeverBlockReadersOrPublishFailedValues() {
+        for (succeed in listOf(true, false)) {
+            val real = org.robolectric.RuntimeEnvironment.getApplication().getSharedPreferences("synthetic-presentation", 0)
+            real.edit().clear().commit()
+            val entered = java.util.concurrent.CountDownLatch(1)
+            val release = java.util.concurrent.CountDownLatch(1)
+            val rollbackEntered = java.util.concurrent.CountDownLatch(1)
+            val rollbackRelease = java.util.concurrent.CountDownLatch(1)
+            val commits = java.util.concurrent.atomic.AtomicInteger()
+            val storage = object : android.content.SharedPreferences by real {
+                override fun edit(): android.content.SharedPreferences.Editor {
+                    val editor = real.edit()
+                    return object : android.content.SharedPreferences.Editor by editor {
+                        override fun commit(): Boolean {
+                            val rollback = commits.incrementAndGet() > 1
+                            (if (rollback) rollbackEntered else entered).countDown()
+                            check((if (rollback) rollbackRelease else release).await(5, java.util.concurrent.TimeUnit.SECONDS))
+                            editor.commit()
+                            return succeed
+                        }
+                    }
+                }
+            }
+            val preferences = PhonePreferences(storage)
+            assertEquals("dark", preferences.read("custom-sol-high").getString("ui_theme"))
+            val executor = java.util.concurrent.Executors.newFixedThreadPool(2)
+            try {
+                val write = executor.submit<Unit> { preferences.write(PhonePreferences.defaults().put("ui_theme", "slate")) }
+                assertTrue(entered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                val read = executor.submit<String> { preferences.read("custom-sol-high").getString("ui_theme") }
+                try { assertEquals("dark", read.get(1, java.util.concurrent.TimeUnit.SECONDS)) }
+                finally { release.countDown() }
+                if (succeed) write.get(5, java.util.concurrent.TimeUnit.SECONDS)
+                else {
+                    assertTrue(rollbackEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                    val rollbackRead = executor.submit<String> { preferences.read("custom-sol-high").getString("ui_theme") }
+                    try { assertEquals("dark", rollbackRead.get(1, java.util.concurrent.TimeUnit.SECONDS)) }
+                    finally { rollbackRelease.countDown() }
+                    assertTrue(assertThrows(java.util.concurrent.ExecutionException::class.java) {
+                        write.get(5, java.util.concurrent.TimeUnit.SECONDS)
+                    }.cause is AssistantPhoneFailure)
+                }
+                assertEquals(if (succeed) "slate" else "dark", preferences.read("custom-sol-high").getString("ui_theme"))
+            } finally { release.countDown(); rollbackRelease.countDown(); executor.shutdownNow() }
+        }
+    }
     @Test fun acceptsAllThemesAndKeepsDarkDefaultWithoutAcceptingAliases() {
         assertEquals("dark", PhonePreferences.defaults().getString("ui_theme"))
         for (theme in listOf("dark", "slate", "light")) {
@@ -41,18 +89,11 @@ class PhonePreferencesTest {
             catch (error: AssistantPhoneFailure) { assertEquals("invalid_input", error.code) }
         }
     }
-    @Test fun olderPayloadGetsOnlyTheDocumentedNewBooleanAndStringDefaults() {
-        val legacy = PhonePreferences.defaults().apply {
-            remove("web_enabled"); remove("speech_network_fallback")
-            remove("speech_language"); remove("speech_tts_provider"); remove("speech_tts_voice")
+    @Test fun currentPayloadRequiresAllSeventeenFieldsRatherThanFillingLegacyOmissions() {
+        for (key in PhonePreferences.defaults().keys()) {
+            val incomplete = PhonePreferences.defaults().apply { remove(key) }
+            assertThrows("Missing $key", AssistantPhoneFailure::class.java) { PhonePreferences.validate(incomplete) }
         }
-        PhonePreferences.validate(legacy)
-        val normalized = PhonePreferences.normalize(legacy)
-        assertTrue(normalized.getBoolean("web_enabled")); assertTrue(normalized.getBoolean("speech_network_fallback"))
-        for (key in listOf("speech_language", "speech_tts_provider", "speech_tts_voice")) assertEquals("", normalized.getString(key))
-        assertFalse(legacy.has("web_enabled"))
-        legacy.remove("tts_enabled")
-        assertThrows(AssistantPhoneFailure::class.java) { PhonePreferences.validate(legacy) }
     }
     @Test fun unknownKeysAndBooleanCoercionAreRejected() {
         for (value in listOf(PhonePreferences.defaults().put("extra", false), PhonePreferences.defaults().put("completion", "false"))) {

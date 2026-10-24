@@ -37,6 +37,19 @@ class EnginePhonePreferencesTest {
         val prewarmed = mutableListOf<String>()
         val workerPrewarmed = mutableListOf<Triple<String, String, Boolean>>()
         var prewarmFails = false
+        var phoneCommit: (() -> Boolean)? = null
+        private val phoneStorage = context.getSharedPreferences("assistant-phone-preferences", android.content.Context.MODE_PRIVATE)
+        private val controlledPhoneStorage = object : android.content.SharedPreferences by phoneStorage {
+            override fun edit(): android.content.SharedPreferences.Editor {
+                val editor = phoneStorage.edit()
+                return object : android.content.SharedPreferences.Editor by editor {
+                    override fun commit(): Boolean {
+                        val accepted = phoneCommit?.invoke() ?: true
+                        return editor.commit() && accepted
+                    }
+                }
+            }
+        }
         private val models = object : AssistantModelStorage {
             private var value = "custom-sol-high"
             override fun read() = value
@@ -66,7 +79,7 @@ class EnginePhonePreferencesTest {
             io.drain()
             PhonePreferences(context).write(PhonePreferences.defaults().put("tts_enabled", enabled)
                 .put("speech_language", selection.language).put("speech_tts_provider", selection.ttsProvider).put("speech_tts_voice", selection.ttsVoice))
-            backend = EnginePhoneBackend(context, engine) { model ->
+            backend = EnginePhoneBackend(context, engine, PhonePreferences(controlledPhoneStorage)) { model ->
                 assertEquals(model, engine.snapshot().model)
                 assertEquals(model, models.read())
                 assertEquals(model, persisted().getString("instant"))
@@ -98,6 +111,70 @@ class EnginePhonePreferencesTest {
     }
 
     @After fun resetAdmission() { AssistantRuntime.configureCaptureResourceAdmission(false) }
+
+    @Test fun backendReadsOldPresentationDuringCommitAndPublishesOnlyBeforeSuccessfulAcknowledgement() {
+        for (succeed in listOf(true, false)) Fixture(false).use { f ->
+            val entered = java.util.concurrent.CountDownLatch(1)
+            val release = java.util.concurrent.CountDownLatch(1)
+            f.phoneCommit = {
+                entered.countDown()
+                check(release.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                succeed
+            }
+            var terminal: Result<Any?>? = null
+            val input = f.backend.nativePreferences().put("ui_theme", "slate").put("web_enabled", false)
+            var observerTheme: String? = null
+            val observer = f.engine.subscribe { state ->
+                if (!state.webEnabled) observerTheme = f.backend.nativePreferences().getString("ui_theme")
+            }
+            f.queueUpdate(input) {
+                assertEquals(if (succeed) "slate" else "dark", f.backend.nativePreferences().getString("ui_theme"))
+                terminal = it
+            }
+            val executor = java.util.concurrent.Executors.newFixedThreadPool(2)
+            try {
+                val writer = executor.submit { f.drain() }
+                assertTrue(entered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                val read = executor.submit<String> { f.backend.nativePreferences().getString("ui_theme") }
+                try {
+                    assertEquals("dark", read.get(1, java.util.concurrent.TimeUnit.SECONDS))
+                    assertNull(terminal)
+                } finally { release.countDown() }
+                writer.get(5, java.util.concurrent.TimeUnit.SECONDS)
+                assertEquals(succeed, terminal!!.isSuccess)
+                assertEquals(succeed, !f.engine.snapshot().webEnabled)
+                if (succeed) {
+                    // Engine observers run before the settlement callback: this is deliberately not
+                    // an aggregate cross-file atomic snapshot. The command ACK is the fence.
+                    assertEquals("dark", observerTheme)
+                } else {
+                    assertTrue(terminal!!.exceptionOrNull() is AssistantPhoneFailure)
+                    assertEquals("dark", f.persisted().getString("ui_theme"))
+                    assertTrue(f.persistedPolicy().webEnabled)
+                }
+            } finally { release.countDown(); executor.shutdownNow(); observer.close() }
+        }
+    }
+
+    @Test fun enqueuedInputAndReturnedOutputCannotMutateAcknowledgedPublication() {
+        Fixture(false).use { f ->
+            val input = f.backend.nativePreferences().put("ui_theme", "slate")
+            var replies = 0
+            f.queueUpdate(input) { result ->
+                val output = result.getOrThrow() as JSONObject
+                assertEquals("slate", f.backend.nativePreferences().getString("ui_theme"))
+                assertFalse(f.backend.busy())
+                output.put("ui_theme", "light")
+                replies++
+            }
+            input.put("ui_theme", "light")
+            assertEquals("dark", f.backend.nativePreferences().getString("ui_theme"))
+            assertEquals(0, replies)
+            f.drain()
+            assertEquals(1, replies)
+            assertEquals("slate", f.backend.nativePreferences().getString("ui_theme"))
+        }
+    }
 
     @Test @Config(shadows = [PhoneCueTtsShadow::class])
     fun disabledDiscoveryRechecksInstalledVoiceDataOnlyAfterARealForegroundExit() {
