@@ -7,6 +7,8 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import java.io.EOFException
+import java.util.ArrayDeque
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [24, 35], manifest = Config.NONE)
@@ -14,19 +16,75 @@ class ReplicationControllerTest {
     private val a = "00000000-0000-4000-8000-000000000001"
     private val b = "00000000-0000-4000-8000-000000000002"
 
-    @Test fun discoveryNeverEnrollsAndWrongNodeVersionOrTargetCannotImport() {
+    @Test fun discoveryNeverEnrollsAndWrongNodeVersionTargetOrSessionCannotImportOrAccept() {
         val pair = PairHarness(a, b)
         pair.left.reconcile()
-        assertTrue(pair.queue.isEmpty())
+        assertEquals(0, pair.openedSessions)
+        assertTrue(pair.hints.isEmpty())
+
         pair.enroll()
-        pair.left.reconcile()
-        val request = pair.queue.removeAt(0)
-        assertFalse(pair.right.onData("wrong-node", request.path, request.bytes, request.assets))
-        assertFalse(pair.right.onData("node-a", request.path, JSONObject(String(request.bytes))
-            .put("version", 1).toString().toByteArray(), request.assets))
-        assertFalse(pair.right.onData("node-a", request.path, JSONObject(String(request.bytes))
-            .put("target", a).toString().toByteArray(), request.assets))
-        assertTrue(pair.rightStore.imports.isEmpty())
+        assertFalse(pair.right.connect("wrong-node"))
+        assertFalse(pair.right.connect("node-a", expectedPeer = b))
+
+        // Invalid node, invalid session UUID, or mismatched session path must reject in accept() and always close connection.
+        val validSession = "00000000-0000-4000-8000-000000000099"
+        for ((nodeId, sessionId, path) in listOf(
+            Triple("wrong-node", validSession, ReplicationWire.sessionPath(validSession)),
+            Triple("node-a", "not-a-uuid", "/voxgolem/assistant/v2/session/not-a-uuid"),
+            Triple("node-a", validSession, ReplicationWire.sessionPath(b)),
+        )) {
+            val pipe = InMemorySessionPipe(validSession)
+            val endpoint = pipe.endpoint("node-b", nodeId, sessionId = sessionId, sessionPath = path)
+            assertFalse(pair.right.accept(endpoint))
+            assertTrue(endpoint.closedEndpoint)
+        }
+
+        // Invalid hints (wrong node, wrong version, wrong target, oversized) must reject.
+        val validHint = ReplicationWire.encodeHint(a, b)
+        assertFalse(pair.right.onHint("wrong-node", validHint))
+        assertFalse(
+            pair.right.onHint(
+                "node-a",
+                JSONObject().put("version", 2).put("kind", "reconcile_hint").put("sender", a).put("target", b).toString().toByteArray(),
+            )
+        )
+        assertFalse(
+            pair.right.onHint(
+                "node-a",
+                JSONObject().put("version", 3).put("kind", "reconcile_hint").put("sender", a).put("target", a).toString().toByteArray(),
+            )
+        )
+        assertFalse(pair.right.onHint("node-a", ByteArray(ReplicationWire.MAX_HINT_BYTES + 1)))
+
+        // Tampered session frames (wrong version, wrong target, wrong session) must reject without importing.
+        pair.leftStore.add(record(a, "1"))
+        for (tamper in listOf<(JSONObject) -> Unit>(
+            { it.put("version", 1) },
+            { it.put("target", a) },
+            { it.put("session", b) },
+        )) {
+            pair.tamperNextFrame = tamper
+            assertFalse(pair.right.connect("node-a", a))
+            assertTrue(pair.rightStore.imports.isEmpty())
+        }
+        pair.tamperNextFrame = null
+
+        // Watch role sends a <= 256-byte coalesced hint rather than opening a channel; Phone onHint opens session and converges both ways.
+        val watchPhone = PairHarness(a, b, leftRole = AssistantPeerRole.PHONE, rightRole = AssistantPeerRole.WATCH)
+        watchPhone.enroll()
+        watchPhone.leftStore.add(record(a, "1"))
+        watchPhone.rightStore.add(record(b, "1"))
+        watchPhone.right.reconcile()
+        assertEquals(0, watchPhone.openedSessions)
+        assertEquals(1, watchPhone.hints.size)
+        val hint = watchPhone.hints.removeAt(0)
+        assertTrue(hint.bytes.size <= ReplicationWire.MAX_HINT_BYTES)
+        assertTrue(watchPhone.left.onHint("node-b", hint.bytes))
+        assertEquals(1, watchPhone.openedSessions)
+        assertEquals(setOf("$a/1", "$b/1"), watchPhone.leftStore.records.keys)
+        assertEquals(setOf("$a/1", "$b/1"), watchPhone.rightStore.records.keys)
+        assertEquals(setOf("$a/1", "$b/1"), watchPhone.leftStore.acknowledged[b])
+        assertEquals(setOf("$a/1", "$b/1"), watchPhone.rightStore.acknowledged[a])
     }
 
     @Test fun exactGapsDuplicateAndReorderedFramesConvergeWithoutProviderExecution() {
@@ -39,6 +97,8 @@ class ReplicationControllerTest {
         assertEquals(setOf("$a/1", "$a/9"), pair.rightStore.records.keys)
         assertEquals(setOf("$a/1", "$a/9"), pair.leftStore.acknowledged[b])
         assertEquals(2, pair.rightStore.records.size)
+        assertNull(pair.leftState.load(b))
+        assertNull(pair.rightState.load(a))
     }
 
     @Test fun tombstonesAcrossPagesAreCommittedBeforeAnyContentRequest() {
@@ -66,31 +126,55 @@ class ReplicationControllerTest {
         pair.right.reconcile()
         pair.drain()
         assertEquals(setOf("$a/1"), pair.leftStore.acknowledged[b])
+        assertEquals(setOf("$a/1"), pair.rightStore.records.keys)
     }
 
     @Test fun crashAfterCommitBeforeAckAndThirtyMinuteDisconnectRecoverFromCommittedTruth() {
         val pair = PairHarness(a, b)
         pair.enroll()
         pair.leftStore.add(record(a, "1"))
+        // Synthetic disconnect after durable SQLite commit before ACK frame reaches sender.
+        pair.dropNextFrameKind = "ack"
         pair.right.reconcile()
-        pair.deliverUntil { pair.rightStore.records.isNotEmpty() }
-        pair.queue.clear() // Synthetic process death between durable import and ACK delivery.
+        pair.drain()
+        assertEquals(setOf("$a/1"), pair.rightStore.records.keys)
+        assertTrue(pair.leftStore.acknowledged.isEmpty())
+        assertNull(pair.leftState.load(b))
+        assertNull(pair.rightState.load(a))
+
+        // Synthetic disconnect after sender processes ACK before ack_confirmed reaches receiver.
+        pair.dropNextFrameKind = "ack_confirmed"
+        pair.restartRight()
+        pair.right.reconcile()
+        pair.drain()
+        assertNull(pair.leftState.load(b))
+        assertNull(pair.rightState.load(a))
+
+        // Next connected session recovers strictly from canonical store truth.
         pair.restartRight()
         pair.right.reconcile()
         pair.drain()
         assertEquals(setOf("$a/1"), pair.leftStore.acknowledged[b])
+        assertEquals(setOf("$a/1"), pair.rightStore.acknowledged[a])
+
         pair.online = false
         pair.leftStore.add(record(a, "3"))
         pair.rightStore.add(record(b, "7"))
+        val sessionsBeforeOffline = pair.openedSessions
         pair.left.reconcile()
         pair.right.reconcile()
-        assertTrue(pair.queue.isEmpty())
+        assertEquals(sessionsBeforeOffline, pair.openedSessions)
+
         // No wall-clock TTL: the next reachable/resume trigger works after any interval.
         pair.online = true
         pair.left.reconcile()
         pair.right.reconcile()
         pair.drain(duplicate = true)
         assertEquals(pair.leftStore.records.keys, pair.rightStore.records.keys)
+        assertEquals(pair.leftStore.records.keys, pair.leftStore.acknowledged[b])
+        assertEquals(pair.rightStore.records.keys, pair.rightStore.acknowledged[a])
+        assertNull(pair.leftState.load(b))
+        assertNull(pair.rightState.load(a))
     }
 
     @Test fun forgedBodyAssetOversizeAndQuarantinedServingAreRejected() {
@@ -98,15 +182,33 @@ class ReplicationControllerTest {
         pair.enroll()
         val original = record(a, "1")
         pair.leftStore.add(original)
-        pair.right.reconcile()
-        pair.deliverUntil { pair.queue.any { JSONObject(String(it.bytes)).getString("kind") == "records" } }
-        val transfer = pair.queue.removeAt(pair.queue.indexOfFirst { JSONObject(String(it.bytes)).getString("kind") == "records" })
-        val bad = JSONObject(original.toString()).put("body_key", "f".repeat(64)).toString().toByteArray()
-        assertFalse(pair.right.onData("node-a", transfer.path, transfer.bytes, mapOf("body_0" to bad)))
+
+        // 1. Forged body chunk (altered body_key inside record JSON) rejects without import or ack.
+        pair.forgeNextBodyChunk = true
+        assertFalse(pair.right.connect("node-a", a))
         assertTrue(pair.rightStore.records.isEmpty())
-        assertFalse(pair.right.onData("node-a", transfer.path, ByteArray(ReplicationWire.MAX_CONTROL_BYTES + 1), emptyMap()))
+        assertTrue(pair.leftStore.acknowledged.isEmpty())
+
+        // 2. Truncated stream before batch_end rejects without import or ack.
+        pair.dropNextFrameKind = "batch_end"
+        assertFalse(pair.right.connect("node-a", a))
+        assertTrue(pair.rightStore.records.isEmpty())
+        assertTrue(pair.leftStore.acknowledged.isEmpty())
+
+        // 3. Oversized body_chunk declaration (> 64 KiB) rejects without import or ack.
+        pair.tamperNextFrame = { frame ->
+            if (frame.getString("kind") == "body_chunk") {
+                frame.getJSONObject("payload").put("bytes", ReplicationWire.MAX_CHUNK_BYTES + 1)
+            }
+        }
+        assertFalse(pair.right.connect("node-a", a))
+        pair.tamperNextFrame = null
+        assertTrue(pair.rightStore.records.isEmpty())
+        assertTrue(pair.leftStore.acknowledged.isEmpty())
+
+        // 4. Quarantined records are never served or imported.
         pair.leftStore.quarantined.add("$a/1")
-        pair.leftStore.filterPublicationsByQuarantine = false // Old Store index still has the staged body.
+        pair.leftStore.filterPublicationsByQuarantine = false
         assertEquals(1, pair.leftStore.publications(b, null, 128).length())
         pair.left.reconcile()
         pair.right.reconcile()
@@ -118,32 +220,56 @@ class ReplicationControllerTest {
         val replicas = listOf(a, b, "00000000-0000-4000-8000-000000000003")
         val stores = replicas.associateWith { FakeReplicationStore(it).apply { add(record(it, "1")); add(record(it, "9")) } }
         val states = replicas.associateWith { replica -> MemoryReplicationState().apply { enrolled.addAll(replicas.filter { it != replica }) } }
-        val queue = mutableListOf<PairHarness.Packet>()
         var online = replicas.take(2).toSet()
-        val controllers = replicas.associateWith { replica -> ReplicationController(stores.getValue(replica), FakeReplicationDomain(2), states.getValue(replica),
-            object : ReplicationTransport {
-                override fun reachable() = if (replica !in online) emptyList() else online.filter { it != replica }.map { PeerNode("synthetic-$it", "Synthetic peer") }
-                override fun publish(path: String, bytes: ByteArray, assets: Map<String, ByteArray>) { queue.add(PairHarness.Packet(replica, path, bytes, assets)) }
-            }, { node -> replicas.firstOrNull { node == "synthetic-$it" } }) }
         val random = kotlin.random.Random(7123)
-        repeat(12) { round ->
+        var currentRound = 0
+        val controllers = mutableMapOf<String, ReplicationController>()
+        for (replica in replicas) {
+            controllers[replica] = ReplicationController(
+                stores.getValue(replica),
+                FakeReplicationDomain(2),
+                states.getValue(replica),
+                object : ReplicationTransport {
+                    override fun reachable() = if (replica !in online) emptyList() else online.filter { it != replica }.map { PeerNode("synthetic-$it", "Synthetic peer") }
+                    override fun publish(path: String, bytes: ByteArray, assets: Map<String, ByteArray>) = Unit
+                    override fun openSession(nodeId: String, session: String): ReplicationSessionConnection {
+                        val targetReplica = replicas.first { nodeId == "synthetic-$it" }
+                        check(replica in online && targetReplica in online) { "Offline peer cannot open session" }
+                        val pipe = InMemorySessionPipe(
+                            session = session,
+                            onFrame = { _, frame ->
+                                if (currentRound < 5 && frame.getString("kind") in setOf("records", "ack") && random.nextInt(5) == 0) {
+                                    throw EOFException("Synthetic seeded mid-session disconnect")
+                                }
+                            },
+                        )
+                        val responderConn = pipe.endpoint("synthetic-$targetReplica", "synthetic-$replica")
+                        val responderThread = Thread {
+                            controllers.getValue(targetReplica).accept(responderConn)
+                        }.apply { isDaemon = true; start() }
+                        return pipe.endpoint("synthetic-$replica", "synthetic-$targetReplica") {
+                            responderThread.join(5_000)
+                        }
+                    }
+                },
+                { node -> replicas.firstOrNull { node == "synthetic-$it" } },
+            )
+        }
+        repeat(10) { round ->
+            currentRound = round
             if (round == 3) online = replicas.toSet()
-            controllers.values.forEach { it.reconcile() }
-            var count = 0
-            while (queue.isNotEmpty()) {
-                check(count++ < 5000)
-                val packet = queue.removeAt(random.nextInt(queue.size))
-                val frame = JSONObject(String(packet.bytes))
-                val target = frame.getString("target")
-                if (target !in online || packet.sender !in online || (round < 8 && random.nextInt(10) == 0)) continue
-                controllers.getValue(target).onData("synthetic-${packet.sender}", packet.path, packet.bytes, packet.assets)
-                if (random.nextBoolean()) controllers.getValue(target).onData("synthetic-${packet.sender}", packet.path, packet.bytes, packet.assets)
+            for (replica in replicas.shuffled(random)) {
+                if (replica in online) {
+                    controllers.getValue(replica).reconcile()
+                    if (random.nextBoolean()) controllers.getValue(replica).reconcile()
+                }
             }
         }
         assertTrue(stores.values.all { it.records.keys == stores.getValue(a).records.keys })
         assertEquals(6, stores.getValue(a).records.size)
         for (source in stores.values) for (peer in replicas.filter { it != source.replica }) {
             assertEquals(source.records.keys, source.acknowledged[peer])
+            assertNull(states.getValue(source.replica).load(peer))
         }
     }
 
@@ -154,6 +280,127 @@ class ReplicationControllerTest {
                 else JSONObject().put("kind", "conversation_created").put("title", "Synthetic conversation")))
 
     private fun id(replica: String, sequence: String) = JSONObject().put("replica", replica).put("sequence", sequence)
+}
+
+internal class InMemorySessionPipe(
+    val session: String,
+    private val onFrame: (senderNode: String, frame: JSONObject) -> Unit = { _, _ -> },
+    private val transformChunk: (senderNode: String, bytes: ByteArray) -> ByteArray = { _, bytes -> bytes },
+) {
+    private val lock = Object()
+    private val aToBFrames = ArrayDeque<JSONObject>()
+    private val bToAFrames = ArrayDeque<JSONObject>()
+    private val aToBChunks = ArrayDeque<ByteArray>()
+    private val bToAChunks = ArrayDeque<ByteArray>()
+    private var closed = false
+
+    fun endpoint(
+        localNode: String,
+        peerNode: String,
+        sessionId: String = session,
+        sessionPath: String = ReplicationWire.sessionPath(session),
+        onClose: () -> Unit = {},
+    ): ConnectedEndpoint {
+        val first = localNode < peerNode
+        return ConnectedEndpoint(
+            nodeId = peerNode,
+            path = sessionPath,
+            session = sessionId,
+            localNode = localNode,
+            outboundFrames = if (first) aToBFrames else bToAFrames,
+            inboundFrames = if (first) bToAFrames else aToBFrames,
+            outboundChunks = if (first) aToBChunks else bToAChunks,
+            inboundChunks = if (first) bToAChunks else aToBChunks,
+            onClose = onClose,
+        )
+    }
+
+    fun closePipe() {
+        synchronized(lock) {
+            closed = true
+            lock.notifyAll()
+        }
+    }
+
+    inner class ConnectedEndpoint(
+        override val nodeId: String,
+        override val path: String,
+        override val session: String,
+        private val localNode: String,
+        private val outboundFrames: ArrayDeque<JSONObject>,
+        private val inboundFrames: ArrayDeque<JSONObject>,
+        private val outboundChunks: ArrayDeque<ByteArray>,
+        private val inboundChunks: ArrayDeque<ByteArray>,
+        private val onClose: () -> Unit,
+    ) : ReplicationSessionConnection {
+        var closedEndpoint = false
+            private set
+
+        override fun readFrame(): JSONObject {
+            synchronized(lock) {
+                while (inboundFrames.isEmpty() && !closed) {
+                    lock.wait(5_000)
+                    if (inboundFrames.isEmpty() && !closed) break
+                }
+                if (inboundFrames.isEmpty()) throw EOFException("Replication session closed")
+                return inboundFrames.removeFirst()
+            }
+        }
+
+        override fun writeFrame(frame: JSONObject) {
+            val decoded = ReplicationWire.decode(ReplicationWire.encode(frame))
+            synchronized(lock) {
+                if (closed) throw EOFException("Replication session closed")
+                try {
+                    onFrame(localNode, decoded)
+                } catch (error: Exception) {
+                    closed = true
+                    lock.notifyAll()
+                    throw error
+                }
+                outboundFrames.addLast(decoded)
+                lock.notifyAll()
+            }
+        }
+
+        override fun readBytes(length: Int): ByteArray {
+            require(length in 1..ReplicationWire.MAX_CHUNK_BYTES)
+            synchronized(lock) {
+                while (inboundChunks.isEmpty() && !closed) {
+                    lock.wait(5_000)
+                    if (inboundChunks.isEmpty() && !closed) break
+                }
+                if (inboundChunks.isEmpty()) throw EOFException("Replication session closed")
+                val chunk = inboundChunks.removeFirst()
+                require(chunk.size == length)
+                return chunk
+            }
+        }
+
+        override fun writeBytes(bytes: ByteArray, offset: Int, length: Int) {
+            require(length in 1..ReplicationWire.MAX_CHUNK_BYTES)
+            val slice = bytes.copyOfRange(offset, offset + length)
+            synchronized(lock) {
+                if (closed) throw EOFException("Replication session closed")
+                val transformed = try {
+                    transformChunk(localNode, slice)
+                } catch (error: Exception) {
+                    closed = true
+                    lock.notifyAll()
+                    throw error
+                }
+                require(transformed.size in 1..ReplicationWire.MAX_CHUNK_BYTES)
+                outboundChunks.addLast(transformed)
+                lock.notifyAll()
+            }
+        }
+
+        override fun close() {
+            closedEndpoint = true
+            closePipe()
+            onClose()
+        }
+    }
 }
 
 internal class MemoryReplicationState : ReplicationState {
@@ -243,40 +490,97 @@ internal class FakeReplicationDomain(private val pageSize: Int) : ReplicationDom
     }
 }
 
-internal class PairHarness(private val a: String, private val b: String, private val pageSize: Int = 63) {
-    data class Packet(val sender: String, val path: String, val bytes: ByteArray, val assets: Map<String, ByteArray>)
-    val queue = mutableListOf<Packet>()
+internal class PairHarness(
+    private val a: String,
+    private val b: String,
+    private val pageSize: Int = 63,
+    private val leftRole: AssistantPeerRole = AssistantPeerRole.PHONE,
+    private val rightRole: AssistantPeerRole = AssistantPeerRole.PHONE,
+) {
+    data class HintPacket(val senderNode: String, val targetNode: String, val bytes: ByteArray)
+    val hints = mutableListOf<HintPacket>()
     val leftState = MemoryReplicationState()
     val rightState = MemoryReplicationState()
     val leftStore = FakeReplicationStore(a)
     val rightStore = FakeReplicationStore(b)
     var online = true
-    val left = controller(a, leftStore, leftState)
-    var right = controller(b, rightStore, rightState)
+    var openedSessions = 0
+    var dropNextFrameKind: String? = null
+    var forgeNextBodyChunk = false
+    var tamperNextFrame: ((JSONObject) -> Unit)? = null
+    val left: ReplicationController = controller(a, leftStore, leftState, leftRole)
+    var right: ReplicationController = controller(b, rightStore, rightState, rightRole)
     fun enroll() { leftState.enrolled.add(b); rightState.enrolled.add(a) }
-    fun restartRight() { right = controller(b, rightStore, rightState) }
-    private fun controller(replica: String, store: FakeReplicationStore, state: MemoryReplicationState) = ReplicationController(
-        store, FakeReplicationDomain(pageSize), state, object : ReplicationTransport {
+    fun restartRight() { right = controller(b, rightStore, rightState, rightRole) }
+    private fun controller(
+        replica: String,
+        store: FakeReplicationStore,
+        state: MemoryReplicationState,
+        role: AssistantPeerRole,
+    ): ReplicationController = ReplicationController(
+        store,
+        FakeReplicationDomain(pageSize),
+        state,
+        object : ReplicationTransport {
             override fun reachable() = if (!online) emptyList() else listOf(PeerNode(if (replica == a) "node-b" else "node-a", "Synthetic peer"))
-            override fun publish(path: String, bytes: ByteArray, assets: Map<String, ByteArray>) { queue.add(Packet(replica, path, bytes, assets)) }
-        }, { node -> when (node) { "node-a" -> a; "node-b" -> b; else -> null } }, { UUIDs.next() },
+            override fun publish(path: String, bytes: ByteArray, assets: Map<String, ByteArray>) = Unit
+            override fun sendHint(nodeId: String, sender: String, target: String) {
+                val senderNode = if (replica == a) "node-a" else "node-b"
+                hints.add(HintPacket(senderNode, nodeId, ReplicationWire.encodeHint(sender, target)))
+            }
+            override fun openSession(nodeId: String, session: String): ReplicationSessionConnection {
+                check(online) { "Offline transport cannot open session" }
+                openedSessions++
+                val senderNode = if (replica == a) "node-a" else "node-b"
+                val responderController: ReplicationController = if (nodeId == "node-a") left else right
+                val pipe = InMemorySessionPipe(
+                    session = session,
+                    onFrame = { _, frame ->
+                        tamperNextFrame?.invoke(frame)
+                        if (dropNextFrameKind != null && frame.getString("kind") == dropNextFrameKind) {
+                            val dropped = dropNextFrameKind
+                            dropNextFrameKind = null
+                            throw EOFException("Synthetic dropped frame: $dropped")
+                        }
+                    },
+                    transformChunk = { _, chunk ->
+                        if (forgeNextBodyChunk) {
+                            forgeNextBodyChunk = false
+                            JSONObject(String(chunk, Charsets.UTF_8))
+                                .put("body_key", "f".repeat(64))
+                                .toString()
+                                .toByteArray(Charsets.UTF_8)
+                        } else {
+                            chunk
+                        }
+                    },
+                )
+                val responderConn = pipe.endpoint(nodeId, senderNode)
+                val responderThread = Thread {
+                    responderController.accept(responderConn)
+                }.apply { isDaemon = true; start() }
+                return pipe.endpoint(senderNode, nodeId) {
+                    responderThread.join(5_000)
+                }
+            }
+        },
+        { node -> when (node) { "node-a" -> a; "node-b" -> b; else -> null } },
+        { UUIDs.next() },
+        role = role,
     )
-    fun deliverOne(reverse: Boolean = false, duplicate: Boolean = false) {
-        check(queue.isNotEmpty()) { "Replication queue exhausted before expected progress" }
-        val packet = queue.removeAt(if (reverse) queue.lastIndex else 0)
-        val target = if (packet.sender == a) right else left
-        val node = if (packet.sender == a) "node-a" else "node-b"
-        target.onData(node, packet.path, packet.bytes, packet.assets)
-        if (duplicate) target.onData(node, packet.path, packet.bytes, packet.assets)
-    }
-    fun deliverUntil(done: () -> Boolean) {
-        var deliveries = 0
-        while (!done()) { check(deliveries++ < 1000) { "Replication did not reach expected phase" }; deliverOne() }
-    }
+
     fun drain(duplicate: Boolean = false, reverse: Boolean = false) {
-        var count = 0
-        while (queue.isNotEmpty()) { check(count++ < 1000) { "Replication did not settle" }; deliverOne(reverse, duplicate) }
+        while (hints.isNotEmpty()) {
+            val hint = hints.removeAt(if (reverse) hints.lastIndex else 0)
+            val target: ReplicationController = if (hint.targetNode == "node-a") left else right
+            target.onHint(hint.senderNode, hint.bytes)
+            if (duplicate) target.onHint(hint.senderNode, hint.bytes)
+        }
+        if (duplicate && online && dropNextFrameKind == null && !forgeNextBodyChunk) {
+            if (reverse) right.reconcile() else left.reconcile()
+        }
     }
+
     private object UUIDs {
         private var counter = 100L
         fun next() = java.util.UUID(0, counter++).toString()

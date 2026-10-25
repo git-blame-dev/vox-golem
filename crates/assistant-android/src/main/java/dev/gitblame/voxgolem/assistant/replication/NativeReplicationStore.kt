@@ -14,9 +14,10 @@ internal class NativeReplicationStore(private val store: AssistantStore, private
         val plan = store.importRecords(input)
         if (plan.getString("base_revision") != plan.getString("revision")) runCatching { onCommitted() }
     }
-    override fun importVerified(input: JSONArray, entries: JSONArray) {
+    override fun importVerified(input: JSONArray, entries: JSONArray): JSONArray {
         val plan = store.replication(JSONObject().put("kind", "import").put("records", input).put("entries", entries)) as JSONObject
         if (plan.getString("base_revision") != plan.getString("revision")) runCatching { onCommitted() }
+        return plan.getJSONArray("receipts")
     }
     override fun acknowledge(peer: String, receipts: JSONArray) = store.acknowledge(peer, receipts)
     override fun nativeRead(request: JSONObject): Any = store.replication(request)

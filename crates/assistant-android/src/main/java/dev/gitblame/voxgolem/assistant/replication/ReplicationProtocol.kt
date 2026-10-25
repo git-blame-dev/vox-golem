@@ -53,7 +53,7 @@ internal interface ReplicationStore {
     fun snapshot(): JSONObject
     fun publications(peer: String, after: JSONObject?, limit: Int): JSONArray
     fun importRecords(input: JSONArray)
-    fun importVerified(input: JSONArray, entries: JSONArray) = importRecords(input)
+    fun importVerified(input: JSONArray, entries: JSONArray): JSONArray? = run { importRecords(input); null }
     fun acknowledge(peer: String, receipts: JSONArray)
     fun durableReceipts(ids: JSONArray, checkBudget: () -> Unit): JSONArray? = null
     /** Stateful native owner; null is the legacy in-memory test adapter only. */
