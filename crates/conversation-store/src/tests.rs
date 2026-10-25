@@ -543,9 +543,32 @@ fn native_replication_rejects_body_metadata_and_hash_conflicts_without_committin
         .is_err());
     assert_eq!(target.snapshot().unwrap(), StoreSnapshot::empty());
     assert!(target.receipts_to_publish(128, None).unwrap().is_empty());
-    sync_read(
+    let imported = sync_read(
         &mut target,
-        serde_json::json!({"kind":"import","records":[record],"entries":page["entries"]}),
+        serde_json::json!({"kind":"import","records":[record.clone()],"entries":page["entries"]}),
+    );
+    let target_replica = target.replica().unwrap();
+    let expected_receipts = target
+        .read(|core| {
+            receipts_after_commit(
+                core,
+                &target_replica,
+                std::slice::from_ref(&record.operation.id),
+            )
+        })
+        .unwrap();
+    assert_eq!(imported["base_revision"], "0");
+    assert_eq!(imported["revision"], "1");
+    assert_eq!(
+        imported["accepted"],
+        serde_json::json!([record.operation.id.clone()])
+    );
+    assert_eq!(imported["duplicates"], serde_json::json!([]));
+    assert_eq!(imported["suppressed"], serde_json::json!([]));
+    assert_eq!(imported["quarantined"], serde_json::json!([]));
+    assert_eq!(
+        imported["receipts"],
+        serde_json::to_value(&expected_receipts).unwrap()
     );
     assert_eq!(target.snapshot().unwrap().records, vec![record]);
 }
@@ -1850,4 +1873,271 @@ fn selected_completion_advances_only_its_matching_owner_atomically() {
         },
     );
     assert_eq!(store.selection().unwrap(), other_selected);
+}
+
+#[test]
+fn coarse_replication_import_returns_commit_outcome_and_exact_receipts_atomically() {
+    let source_fixture = Fixture::new();
+    let mut source = source_fixture.open();
+    let created = source
+        .create_conversation("Synthetic coarse import".into())
+        .unwrap();
+    let context = source
+        .context(created.operation.id.clone(), None, 256 * 1024)
+        .unwrap();
+    let turn_record = turn(&mut source, &context, "Synthetic coarse turn");
+    source
+        .import_records(vec![turn_record.clone()], false, None)
+        .unwrap();
+    let page = sync_read(
+        &mut source,
+        serde_json::json!({"kind":"inventory","cursor":null}),
+    );
+    let entries = page["entries"].as_array().unwrap().clone();
+    assert_eq!(entries.len(), 2);
+
+    let target_fixture = Fixture::new();
+    let mut target = target_fixture.open();
+    let ids = vec![
+        created.operation.id.clone(),
+        turn_record.operation.id.clone(),
+    ];
+
+    // Conflicting/rejected imports do not commit or produce receipts.
+    let mut bad_entries = entries.clone();
+    bad_entries[1]["body_key"] = "0".repeat(64).into();
+    assert!(target
+        .replication(
+            serde_json::from_value(serde_json::json!({
+                "kind": "import",
+                "records": [created.clone(), turn_record.clone()],
+                "entries": bad_entries,
+            }))
+            .unwrap()
+        )
+        .is_err());
+    assert!(target
+        .replication(
+            serde_json::from_value(serde_json::json!({
+                "kind": "import",
+                "records": vec![created.clone(); 9],
+                "entries": vec![entries[0].clone(); 9],
+            }))
+            .unwrap()
+        )
+        .is_err());
+    assert_eq!(target.revision().unwrap(), "0");
+    assert!(target.receipts_to_publish(128, None).unwrap().is_empty());
+
+    let committed = sync_read(
+        &mut target,
+        serde_json::json!({
+            "kind": "import",
+            "records": [created.clone(), turn_record.clone()],
+            "entries": entries,
+        }),
+    );
+    let target_replica = target.replica().unwrap();
+    let expected_receipts = target
+        .read(|core| receipts_after_commit(core, &target_replica, &ids))
+        .unwrap();
+    assert_eq!(committed["base_revision"], "0");
+    assert_eq!(committed["revision"], target.revision().unwrap());
+    assert_eq!(committed["accepted"], serde_json::to_value(&ids).unwrap());
+    assert_eq!(committed["duplicates"], serde_json::json!([]));
+    assert_eq!(committed["suppressed"], serde_json::json!([]));
+    assert_eq!(committed["quarantined"], serde_json::json!([]));
+    assert_eq!(
+        committed["receipts"],
+        serde_json::to_value(&expected_receipts).unwrap()
+    );
+    assert_eq!(
+        target.receipts_to_publish(128, None).unwrap(),
+        expected_receipts
+    );
+
+    // Duplicate import preserves revision and still returns exact durable receipts in one call.
+    let duplicate = sync_read(
+        &mut target,
+        serde_json::json!({
+            "kind": "import",
+            "records": [created, turn_record],
+            "entries": entries,
+        }),
+    );
+    assert_eq!(duplicate["base_revision"], committed["revision"]);
+    assert_eq!(duplicate["revision"], committed["revision"]);
+    assert_eq!(duplicate["accepted"], serde_json::json!([]));
+    assert_eq!(duplicate["duplicates"], serde_json::to_value(&ids).unwrap());
+    assert_eq!(
+        duplicate["receipts"],
+        serde_json::to_value(&expected_receipts).unwrap()
+    );
+}
+
+#[test]
+fn prepared_replication_bodies_enforce_batch_and_gateway_caps_and_release_read_lock() {
+    use voxgolem_core::conversation_sync::{MAX_BATCH_BYTES, MAX_BATCH_RECORDS, MAX_RECORD_BYTES};
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+
+    let created = store.create_conversation("Synthetic batch".into()).unwrap();
+    let conversation = created.operation.id.clone();
+    let context = store
+        .context(conversation.clone(), None, 256 * 1024)
+        .unwrap();
+
+    // Heavy JSON-escaping characters (quotes, backslashes, newlines, control chars) stay within
+    // the 2 MiB record cap, 4 MiB batch cap, and 16 MiB gateway envelope.
+    // Control chars like \x01 serialize as 6-byte "\u0001" in JSON, so ~200 KiB of "\x01"
+    // plus quotes/backslashes/newlines produces ~1.3 MiB per encoded record while keeping raw
+    // turn text <= 256 KiB. Three such records fit in a 3.9 MiB store snapshot, and requesting
+    // additional large records exercises the 4 MiB aggregate batch cap (`unavailable`).
+    let mut heavy_records = Vec::new();
+    for _ in 0..3 {
+        let mut r = turn(&mut store, &context, &"\\\"\n\x01".repeat(6000));
+        if let OperationBody::TurnCompleted {
+            answer, sources, ..
+        } = &mut r.operation.body
+        {
+            sources.clear();
+            *answer = Answer::Text {
+                text: format!("{}{}", "\\\"\n\r\t".repeat(4000), "\x01".repeat(200 * 1024)),
+            };
+        }
+        let rec = codec::record(r.operation).unwrap();
+        let encoded = codec::encode(&rec, MAX_RECORD_BYTES, "replication_record_bytes").unwrap();
+        assert!(encoded.len() > 1200 * 1024 && encoded.len() <= MAX_RECORD_BYTES);
+        heavy_records.push(rec);
+    }
+    store
+        .import_records(heavy_records.clone(), false, None)
+        .unwrap();
+
+    let page = sync_read(
+        &mut store,
+        serde_json::json!({"kind":"inventory","cursor":null}),
+    );
+    let all_entries = page["entries"].as_array().unwrap().clone();
+    assert_eq!(all_entries.len(), 4);
+    assert!(all_entries.len() <= MAX_BATCH_RECORDS);
+
+    let prepared = sync_read(
+        &mut store,
+        serde_json::json!({
+            "kind": "bodies",
+            "revision": page["revision"],
+            "entries": all_entries,
+            "tombstones": false,
+        }),
+    );
+    assert_eq!(prepared["restart"], false);
+    assert_eq!(prepared["bodies"].as_array().unwrap().len(), 4);
+    assert_eq!(prepared["unavailable"], serde_json::json!([]));
+    assert!(codec::encode(
+        &prepared,
+        16 * 1024 * 1024 - 4096,
+        "replication_gateway_bytes"
+    )
+    .is_ok());
+
+    // Verify that the SQLite read lock is released upon return so another Store connection on
+    // the same database can immediately commit a write without DatabaseBusy even in DELETE mode.
+    store
+        .db
+        .execute_batch("PRAGMA journal_mode=DELETE")
+        .unwrap();
+    let rev = store.revision().unwrap();
+    let delete_mode_batch = sync_read(
+        &mut store,
+        serde_json::json!({
+            "kind": "bodies",
+            "revision": rev,
+            "entries": &all_entries[..2],
+            "tombstones": false,
+        }),
+    );
+    assert_eq!(delete_mode_batch["restart"], false);
+    let mut writer = fixture.open();
+    writer.db.busy_timeout(std::time::Duration::ZERO).unwrap();
+    writer
+        .db
+        .execute_batch("PRAGMA journal_mode=DELETE")
+        .unwrap();
+    writer
+        .create_conversation("Synthetic immediate writer commit".into())
+        .unwrap();
+    drop(writer);
+    store.db.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+    let _ = store.revision().unwrap();
+
+    // Add a 4th heavy record into the store core so the 5 records exceed the
+    // 4 MiB aggregate batch cap (`MAX_BATCH_BYTES`) while each record is <= 2 MiB (`MAX_RECORD_BYTES`).
+    let mut fourth_op = turn(&mut store, &context, &"\\\"\n\x01".repeat(6000)).operation;
+    if let OperationBody::TurnCompleted {
+        answer, sources, ..
+    } = &mut fourth_op.body
+    {
+        sources.clear();
+        *answer = Answer::Text {
+            text: format!("{}{}", "\\\"\n\r\t".repeat(4000), "\x01".repeat(200 * 1024)),
+        };
+    }
+    let fourth_rec = codec::record(fourth_op).unwrap();
+    let fourth_entry = serde_json::json!({
+        "id": fourth_rec.operation.id,
+        "conversation": fourth_rec.operation.conversation(),
+        "body_key": fourth_rec.body_key,
+        "tombstone": false,
+    });
+    let mut snap = store.core.export();
+    snap.records.push(fourth_rec.clone());
+    snap.records
+        .sort_by(|a, b| a.operation.id.cmp(&b.operation.id));
+    store.core = CoreStore::restore(snap).unwrap();
+
+    let mut five_entries = all_entries.clone();
+    five_entries.push(fourth_entry);
+    assert_eq!(five_entries.len(), 5);
+    assert!(five_entries.len() <= MAX_BATCH_RECORDS);
+
+    let current_rev = store.core.revision().to_string();
+    let capped = sync_read(
+        &mut store,
+        serde_json::json!({
+            "kind": "bodies",
+            "revision": current_rev,
+            "entries": five_entries,
+            "tombstones": false,
+        }),
+    );
+    assert_eq!(capped["restart"], false);
+    let bodies = capped["bodies"].as_array().unwrap();
+    assert_eq!(bodies.len(), 4);
+    assert!(bodies.len() <= MAX_BATCH_RECORDS);
+    let mut aggregate_bytes = 0usize;
+    for body in bodies {
+        let raw = body["body"].as_str().unwrap();
+        assert!(raw.len() <= MAX_RECORD_BYTES);
+        aggregate_bytes += raw.len();
+        let parsed = codec::parse_record(raw).unwrap();
+        assert_eq!(
+            body["entry"]["id"],
+            serde_json::to_value(&parsed.operation.id).unwrap()
+        );
+    }
+    assert!(aggregate_bytes <= MAX_BATCH_BYTES);
+    let fourth_raw =
+        codec::encode(&fourth_rec, MAX_RECORD_BYTES, "replication_record_bytes").unwrap();
+    assert!(aggregate_bytes + fourth_raw.len() > MAX_BATCH_BYTES);
+    assert_eq!(
+        capped["unavailable"],
+        serde_json::json!([fourth_rec.operation.id])
+    );
+    assert!(codec::encode(
+        &capped,
+        16 * 1024 * 1024 - 4096,
+        "replication_gateway_bytes"
+    )
+    .is_ok());
 }

@@ -726,10 +726,29 @@ impl Store {
         completion: Option<&OperationId>,
         before_commit: impl FnOnce() -> Result<()>,
     ) -> Result<CommitOutcome> {
+        let (outcome, _) =
+            self.import_with_hook_and_receipts(records, receive, completion, before_commit)?;
+        Ok(outcome)
+    }
+
+    pub(crate) fn import_received(
+        &mut self,
+        records: Vec<Record>,
+    ) -> Result<(CommitOutcome, Vec<Receipt>)> {
+        self.import_with_hook_and_receipts(records, true, None, || Ok(()))
+    }
+
+    fn import_with_hook_and_receipts(
+        &mut self,
+        records: Vec<Record>,
+        receive: bool,
+        completion: Option<&OperationId>,
+        before_commit: impl FnOnce() -> Result<()>,
+    ) -> Result<(CommitOutcome, Vec<Receipt>)> {
         let tx = self
             .db
             .timed_transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (outcome, next) = Self::import_within_tx_with_hook(
+        let (outcome, next, receipts) = Self::import_within_tx_with_receipts(
             &mut self.core,
             &tx,
             records,
@@ -739,7 +758,7 @@ impl Store {
         )?;
         tx.timed_commit()?;
         self.core = next; // Only advance the pinned reducer after SQLite COMMIT succeeds.
-        Ok(outcome)
+        Ok((outcome, receipts))
     }
 
     pub(crate) fn import_within_tx_with_hook(
@@ -750,6 +769,25 @@ impl Store {
         completion: Option<&OperationId>,
         before_commit: impl FnOnce(&Transaction<'_>) -> Result<()>,
     ) -> Result<(CommitOutcome, CoreStore)> {
+        let (outcome, next, _) = Self::import_within_tx_with_receipts(
+            core,
+            tx,
+            records,
+            receive,
+            completion,
+            before_commit,
+        )?;
+        Ok((outcome, next))
+    }
+
+    fn import_within_tx_with_receipts(
+        core: &mut CoreStore,
+        tx: &Transaction<'_>,
+        records: Vec<Record>,
+        receive: bool,
+        completion: Option<&OperationId>,
+        before_commit: impl FnOnce(&Transaction<'_>) -> Result<()>,
+    ) -> Result<(CommitOutcome, CoreStore, Vec<Receipt>)> {
         if records.len() > 128 {
             return Err(limit("batch_records").into());
         }
@@ -789,16 +827,20 @@ impl Store {
             })
         })?;
         apply_plan(tx, core, &plan)?;
-        if receive {
+        let receipts = if receive {
             let replica: String = tx.timed_query_row(
                 "SELECT replica FROM history_state WHERE singleton=1",
                 [],
                 |r| bounded_text(r, 0, 36),
             )?;
-            for receipt in receipts_after_commit(&next, &replica, &ids)? {
-                tx.timed_prepare_cached("INSERT OR IGNORE INTO history_receipt_outbox(operation_key,body_key,payload) VALUES(?,?,?)")?.timed_execute(params![key(&receipt.operation),receipt.body_key,encode(&receipt, 32*1024,"receipt_bytes")?])?;
+            let computed = receipts_after_commit(&next, &replica, &ids)?;
+            for receipt in &computed {
+                tx.timed_prepare_cached("INSERT OR IGNORE INTO history_receipt_outbox(operation_key,body_key,payload) VALUES(?,?,?)")?.timed_execute(params![key(&receipt.operation),receipt.body_key,encode(receipt, 32*1024,"receipt_bytes")?])?;
             }
-        }
+            computed
+        } else {
+            Vec::new()
+        };
         if let (
             Some(id),
             Some(OperationBody::TurnCompleted {
@@ -827,6 +869,7 @@ impl Store {
                 quarantined: plan.quarantined,
             },
             next,
+            receipts,
         ))
     }
 
