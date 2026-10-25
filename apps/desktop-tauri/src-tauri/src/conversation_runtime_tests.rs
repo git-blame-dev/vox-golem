@@ -779,8 +779,6 @@ impl NativeAdmissionFixture {
         assert!(self.state.active_prompt.lock().unwrap().is_none());
         let session = self.state.conversation_session.lock().unwrap();
         assert!(!session.has_active_execution());
-        assert!(session.turns().is_empty());
-        assert!(session.provider_history().is_empty());
     }
 }
 
@@ -969,13 +967,12 @@ fn durable_completion_pins_wire_identity_and_admits_a_followup_from_the_saved_he
         serialized["turn"]["execution_id"]["generation"],
         pinned.wire_execution.generation.as_str()
     );
-    assert!(fixture
+    assert!(!fixture
         .state
         .conversation_session
         .lock()
         .unwrap()
-        .turns()
-        .is_empty());
+        .has_active_execution());
     let followup = fixture.state.admit(
         fixture.state.prompt_admission_resources(),
         "synthetic-durable-next",
@@ -1046,13 +1043,12 @@ fn suppressed_completion_is_unsaved_blocks_all_admission_and_requires_targeted_s
     assert_eq!(value["kind"], "unsaved");
     assert_eq!(value["unsaved_result"]["reason"], "context_unavailable");
     assert!(value.get("turn").is_none());
-    assert!(fixture
+    assert!(!fixture
         .state
         .conversation_session
         .lock()
         .unwrap()
-        .turns()
-        .is_empty());
+        .has_active_execution());
     assert!(fixture.state.begin_reset(|| Ok(())).is_err());
     let (context, history) = {
         let mut durable = fixture.state.durable_store.lock().unwrap();
@@ -1351,13 +1347,12 @@ fn real_store_quota_failure_preserves_canonical_history_and_installs_one_unsaved
             .unwrap(),
         before
     );
-    assert!(fixture
+    assert!(!fixture
         .state
         .conversation_session
         .lock()
         .unwrap()
-        .turns()
-        .is_empty());
+        .has_active_execution());
     assert!(fixture
         .state
         .admit(
@@ -1372,27 +1367,60 @@ fn real_store_quota_failure_preserves_canonical_history_and_installs_one_unsaved
 
 #[test]
 fn valid_native_voice_admission_preserves_policy_history_source_and_native_ownership() {
+    use voxgolem_core::durable_conversation::{Answer, OperationBody, Provenance, TerminalStage};
     let temp = tempfile::tempdir().unwrap();
     let _scope = test_storage::ScopedRoot::new(temp.path().to_path_buf());
     let fixture = NativeAdmissionFixture::new();
     let history = {
-        let mut session = fixture.state.conversation_session.lock().unwrap();
-        let execution = session
-            .admit("synthetic-prior-turn", "Synthetic prior question")
-            .unwrap()
-            .execution_id;
-        session.update(
-            execution,
-            Stage::Instant,
-            StageResult::Instant(InstantOutcome::Complete(Content::Text(
-                "Synthetic prior answer".into(),
-            ))),
+        let mut durable = fixture.state.durable_store.lock().unwrap();
+        let store = durable.ensure_store().unwrap();
+        let selected = store.selection().unwrap();
+        let prepared = store
+            .prepare_request(
+                selected,
+                "Synthetic prior question",
+                voxgolem_core::conversation::MAX_COMMITTED_TEXT_BYTES,
+                true,
+            )
+            .unwrap();
+        assert!(
+            store
+                .complete_selected_body_with_authority(
+                    OperationBody::TurnCompleted {
+                        conversation: prepared.context.selection.conversation,
+                        parent: prepared.context.selection.parent,
+                        request: prepared.request,
+                        prompt: "Synthetic prior question".into(),
+                        answer: Answer::Text {
+                            text: "Synthetic prior answer".into(),
+                        },
+                        sources: vec![],
+                        terminal_stage: TerminalStage::Instant,
+                        provenance: Provenance {
+                            requested_model: "synthetic-model".into(),
+                            returned_model: None,
+                            policy_id: "synthetic-policy".into(),
+                            policy_version: "1".into(),
+                            instruction_profile_id: "synthetic-instructions".into(),
+                            instruction_profile_version: "1".into(),
+                            context: prepared.context.selection.ancestor_ids,
+                        },
+                    },
+                    || (
+                        (),
+                        voxgolem_conversation_store::CompletionDecision::Authorized
+                    ),
+                    |_, attempt| match attempt {
+                        voxgolem_conversation_store::CompletionAttempt::Finished(result) => result,
+                        _ => unreachable!(),
+                    },
+                )
+                .unwrap()
+                .saved
         );
-        assert!(matches!(
-            session.settle(execution, SettlementIntent::Success),
-            SettlementResult::Applied(AppliedOutcome::Completed(_))
-        ));
-        session.provider_history()
+        read_prefetch_context(store, "Synthetic voice question")
+            .unwrap()
+            .1
     };
     let admitted = fixture
         .state
@@ -1553,17 +1581,33 @@ fn owner_admission_captures_permission_policy_and_mode_without_root_state() {
 
 #[test]
 fn canonical_quote_heavy_answers_fit_retention_and_the_checked_desktop_request() {
-    // Retained consumers remain supported; desktop itself is execution-only.
-    let mut session = voxgolem_core::conversation::ConversationSession::new(AssistantPolicy {
-        deep_enabled: false,
-        review_enabled: false,
-        ..Default::default()
-    });
+    use voxgolem_core::durable_conversation::{Answer, OperationBody, Provenance, TerminalStage};
+    let temp = tempfile::tempdir().unwrap();
+    let mut store =
+        voxgolem_conversation_store::Store::open(&temp.path().join("conversations.sqlite"))
+            .unwrap();
+    let mut session =
+        voxgolem_core::conversation::ConversationSession::execution_only(AssistantPolicy {
+            deep_enabled: false,
+            review_enabled: false,
+            ..Default::default()
+        });
     for index in 0..2 {
+        let prompt = format!("Synthetic question {index}");
+        let selected = store.selection().unwrap();
+        let prepared = store
+            .prepare_request(
+                selected,
+                &prompt,
+                voxgolem_core::conversation::MAX_COMMITTED_TEXT_BYTES,
+                true,
+            )
+            .unwrap();
         let admission = session
-            .admit(
+            .admit_with_context(
                 &format!("synthetic-answer-{index}"),
-                &format!("Synthetic question {index}"),
+                &prompt,
+                provider_turns(prepared.context.provider_messages),
             )
             .unwrap();
         assert!(matches!(
@@ -1580,13 +1624,64 @@ fn canonical_quote_heavy_answers_fit_retention_and_the_checked_desktop_request()
             session.settle(admission.execution_id, SettlementIntent::Success),
             SettlementResult::Applied(AppliedOutcome::Completed(_))
         ));
+        assert!(
+            store
+                .complete_selected_body_with_authority(
+                    OperationBody::TurnCompleted {
+                        conversation: prepared.context.selection.conversation,
+                        parent: prepared.context.selection.parent,
+                        request: prepared.request,
+                        prompt,
+                        answer: Answer::Text {
+                            text: "\"".repeat(100 * 1024),
+                        },
+                        sources: vec![],
+                        terminal_stage: TerminalStage::Instant,
+                        provenance: Provenance {
+                            requested_model: "synthetic-model".into(),
+                            returned_model: None,
+                            policy_id: "synthetic-policy".into(),
+                            policy_version: "1".into(),
+                            instruction_profile_id: "synthetic-instructions".into(),
+                            instruction_profile_version: "1".into(),
+                            context: prepared.context.selection.ancestor_ids,
+                        },
+                    },
+                    || (
+                        (),
+                        voxgolem_conversation_store::CompletionDecision::Authorized
+                    ),
+                    |_, attempt| match attempt {
+                        voxgolem_conversation_store::CompletionAttempt::Finished(result) => result,
+                        _ => unreachable!(),
+                    },
+                )
+                .unwrap()
+                .saved
+        );
     }
-    assert_eq!(session.turns().len(), 2);
-    let history = session.provider_history();
+    let selected = store.selection().unwrap();
+    let prepared = store
+        .prepare_request(
+            selected,
+            "Synthetic next question",
+            voxgolem_core::conversation::MAX_COMMITTED_TEXT_BYTES,
+            true,
+        )
+        .unwrap();
+    assert_eq!(prepared.context.selection.turns.len(), 2);
+    let history = provider_turns(prepared.context.provider_messages);
+    let admitted = session
+        .admit_with_context(
+            "synthetic-answer-2",
+            "Synthetic next question",
+            history.clone(),
+        )
+        .unwrap();
     let prompt = voxgolem_platform::custom_openai::CustomOpenAiPrompt {
         session_id: "synthetic-desktop-wire".into(),
-        prompt: "Synthetic next question".into(),
-        history: custom_history(&history),
+        prompt: admitted.prompt,
+        history: custom_history(&admitted.history),
     };
     let bytes =
         voxgolem_platform::custom_openai::checked_request(&Default::default(), &prompt, None)
@@ -1598,7 +1693,7 @@ fn canonical_quote_heavy_answers_fit_retention_and_the_checked_desktop_request()
         wire["input"][0]["content"][0]["text"],
         "Synthetic question 1"
     );
-    assert_eq!(session.provider_history(), history);
+    assert_eq!(admitted.history, history);
 }
 
 #[test]
@@ -1608,7 +1703,7 @@ fn owner_cancel_reset_and_late_stage_preserve_physical_and_canonical_fences() {
         .conversation_session
         .lock()
         .unwrap()
-        .admit("synthetic-owner", "Synthetic current")
+        .admit_with_context("synthetic-owner", "Synthetic current", Vec::new())
         .unwrap()
         .execution_id;
     let (generation, cancelled, signal, _) = register_active_prompt(
@@ -1659,12 +1754,11 @@ fn owner_cancel_reset_and_late_stage_preserve_physical_and_canonical_fences() {
     ));
     drop(guard);
     assert!(!runtime.reset_in_progress.load(Ordering::Acquire));
-    assert!(runtime
+    assert!(!runtime
         .conversation_session
         .lock()
         .unwrap()
-        .turns()
-        .is_empty());
+        .has_active_execution());
 }
 
 #[test]
@@ -1761,13 +1855,12 @@ fn desktop_durable_store_projects_sources_on_restart_without_hydration_and_retai
     );
     assert_eq!(restored.transcript[0].answer, first_turns[0].answer);
     assert_eq!(restored.transcript[0].sources, sources);
-    assert!(restarted
+    assert!(!restarted
         .state
         .conversation_session
         .lock()
         .unwrap()
-        .turns()
-        .is_empty());
+        .has_active_execution());
     assert!(restarted
         .state
         .begin_reset(|| Err(String::from("voice reset failed")))

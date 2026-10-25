@@ -1909,8 +1909,12 @@ fn ipc_model_options(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_ipc_app_snapshot(
-    conversation: voxgolem_core::conversation::ConversationSnapshot,
+    session_id: voxgolem_core::ipc::WireId,
+    transcript: Vec<voxgolem_core::ipc::Turn>,
+    active_request: Option<voxgolem_core::ipc::ActiveRequestSummary>,
+    unsaved_result: Option<Arc<voxgolem_core::ipc::UnsavedResult>>,
     policy: &voxgolem_core::assistant::AssistantPolicy,
     runtime_phase: voxgolem_core::runtime::RuntimePhase,
     startup_state: &StartupStatePayload,
@@ -1928,11 +1932,11 @@ fn build_ipc_app_snapshot(
         StartupStatePayload::Error { .. } => false,
     };
     ipc::AppSnapshot {
-        session_id: conversation.session_id.0.into(),
+        session_id,
         runtime_phase: runtime_phase.into(),
-        transcript: conversation.turns.iter().map(Into::into).collect(),
-        active_request: conversation.active.as_ref().map(Into::into),
-        unsaved_result: None,
+        transcript,
+        active_request,
+        unsaved_result,
         model_options: ipc_model_options(&capabilities),
         capabilities,
         preferences: ipc::ValidatedPreferences {
@@ -2408,8 +2412,26 @@ fn get_app_snapshot_from_state(
         .conversation_session
         .lock()
         .map_err(|_| ipc_command_error("conversation state is unavailable"))?;
-    let mut snapshot = build_ipc_app_snapshot(
-        session.snapshot(),
+    let active_request = active.as_ref().and_then(|active| {
+        active
+            .pinned
+            .as_ref()
+            .map(|pinned| voxgolem_core::ipc::ActiveRequestSummary {
+                execution_id: pinned.wire_execution.clone(),
+                request_id: active.request_id.clone(),
+                prompt: session.active_prompt().unwrap_or_default().into(),
+            })
+    });
+    let unsaved_result = app_state
+        .unsaved_result
+        .lock()
+        .map_err(|_| ipc_command_error("unsaved result unavailable"))?
+        .clone();
+    Ok(build_ipc_app_snapshot(
+        session_id,
+        transcript,
+        active_request,
+        unsaved_result,
         session.policy(),
         runtime_phase,
         &startup_state,
@@ -2420,29 +2442,7 @@ fn get_app_snapshot_from_state(
             .lock()
             .map_err(|_| ipc_command_error("network preferences are unavailable"))?
             .clone(),
-    );
-    snapshot.session_id = session_id;
-    snapshot.transcript = transcript;
-    snapshot.active_request = active.as_ref().and_then(|active| {
-        active
-            .pinned
-            .as_ref()
-            .map(|pinned| voxgolem_core::ipc::ActiveRequestSummary {
-                execution_id: pinned.wire_execution.clone(),
-                request_id: active.request_id.clone(),
-                prompt: session
-                    .snapshot()
-                    .active
-                    .map(|a| a.prompt)
-                    .unwrap_or_default(),
-            })
-    });
-    snapshot.unsaved_result = app_state
-        .unsaved_result
-        .lock()
-        .map_err(|_| ipc_command_error("unsaved result unavailable"))?
-        .clone();
-    Ok(snapshot)
+    ))
 }
 
 #[tauri::command]
@@ -15547,7 +15547,7 @@ mod tests {
 
     #[test]
     fn ipc_app_snapshot_maps_one_reachable_desktop_state() {
-        let mut session = voxgolem_core::conversation::ConversationSession::new(
+        let mut session = voxgolem_core::conversation::ConversationSession::execution_only(
             AssistantSettingsPayload {
                 instant: InstantChoicePayload::CustomSolHigh,
                 deep: AgentChoicePayload::OpenCodeSolHigh,
@@ -15560,7 +15560,7 @@ mod tests {
             .into(),
         );
         let execution = session
-            .admit("request-1", "hello")
+            .admit_with_context("request-1", "hello", Vec::new())
             .expect("prompt should be admitted");
         let startup = StartupStatePayload::Ready {
             cue_asset_paths: super::embedded_cue_asset_paths(),
@@ -15594,7 +15594,10 @@ mod tests {
         };
 
         let snapshot = build_ipc_app_snapshot(
-            session.snapshot(),
+            session.session_id().0.into(),
+            Vec::new(),
+            session.active_summary().as_ref().map(Into::into),
+            None,
             session.policy(),
             voxgolem_core::runtime::RuntimePhase::Executing,
             &startup,
@@ -16807,7 +16810,7 @@ mod tests {
         };
         let warming =
             startup_warming_state_from_snapshot(&startup_snapshot, ResponseProfilePayload::Quality);
-        let session = voxgolem_core::conversation::ConversationSession::new(
+        let session = voxgolem_core::conversation::ConversationSession::execution_only(
             AssistantSettingsPayload {
                 instant: InstantChoicePayload::LocalQuality,
                 ..AssistantSettingsPayload::default()
@@ -16815,7 +16818,10 @@ mod tests {
             .into(),
         );
         let snapshot = build_ipc_app_snapshot(
-            session.snapshot(),
+            session.session_id().0.into(),
+            Vec::new(),
+            session.active_summary().as_ref().map(Into::into),
+            None,
             session.policy(),
             voxgolem_core::runtime::RuntimePhase::Sleeping,
             &warming,
@@ -17500,7 +17506,7 @@ mod tests {
             ..AssistantSettingsPayload::default()
         };
         let coordinator = std::sync::Mutex::new(
-            voxgolem_core::conversation::ConversationSession::new(disabled.into()),
+            voxgolem_core::conversation::ConversationSession::execution_only(disabled.into()),
         );
         let settings_generation = std::sync::atomic::AtomicU64::new(0);
         let lifecycle = std::sync::Mutex::new(());
@@ -17542,10 +17548,11 @@ mod tests {
 
     #[test]
     fn profile_persistence_failure_does_not_commit_preferences_or_generation() {
-        let coordinator =
-            std::sync::Mutex::new(voxgolem_core::conversation::ConversationSession::new(
+        let coordinator = std::sync::Mutex::new(
+            voxgolem_core::conversation::ConversationSession::execution_only(
                 AssistantSettingsPayload::default().into(),
-            ));
+            ),
+        );
         let generation = std::sync::atomic::AtomicU64::new(4);
         let lifecycle = std::sync::Mutex::new(());
         let prepared = prepare_local_instant_model_with(
@@ -17573,10 +17580,11 @@ mod tests {
 
     #[test]
     fn profile_persistence_does_not_hold_the_conversation_session_lock() {
-        let coordinator =
-            std::sync::Mutex::new(voxgolem_core::conversation::ConversationSession::new(
+        let coordinator = std::sync::Mutex::new(
+            voxgolem_core::conversation::ConversationSession::execution_only(
                 AssistantSettingsPayload::default().into(),
-            ));
+            ),
+        );
         let generation = std::sync::atomic::AtomicU64::new(0);
         let lifecycle = std::sync::Mutex::new(());
 
@@ -17598,11 +17606,11 @@ mod tests {
 
     #[test]
     fn profile_candidate_derivation_rejects_an_active_prompt() {
-        let mut session = voxgolem_core::conversation::ConversationSession::new(
+        let mut session = voxgolem_core::conversation::ConversationSession::execution_only(
             AssistantSettingsPayload::default().into(),
         );
         session
-            .admit("request", "prompt")
+            .admit_with_context("request", "prompt", Vec::new())
             .expect("prompt should start");
         let coordinator = std::sync::Mutex::new(session);
         let generation = std::sync::atomic::AtomicU64::new(0);
@@ -18131,7 +18139,7 @@ mod tests {
                 ) => assert_eq!(turn.answer.content, answer),
                 other => panic!("unexpected settlement: {other:?}"),
             }
-            assert!(session.turns().is_empty());
+            assert!(!session.has_active_execution());
         }
         drop(registered);
     }
@@ -18466,14 +18474,14 @@ mod tests {
         let active = Arc::new(Mutex::new(None));
         let lifecycle = Arc::new(Mutex::new(()));
         let session = Arc::new(Mutex::new(
-            voxgolem_core::conversation::ConversationSession::new(
+            voxgolem_core::conversation::ConversationSession::execution_only(
                 voxgolem_core::assistant::AssistantPolicy::default(),
             ),
         ));
         let execution_id = session
             .lock()
             .unwrap()
-            .admit("request", "prompt")
+            .admit_with_context("request", "prompt", Vec::new())
             .unwrap()
             .execution_id;
         let generations = AtomicU64::new(0);
@@ -18524,7 +18532,7 @@ mod tests {
     fn active_prompt_guard_finish_disarms_terminal_cleanup() {
         let active = Arc::new(Mutex::new(None));
         let session = Arc::new(Mutex::new(
-            voxgolem_core::conversation::ConversationSession::new(
+            voxgolem_core::conversation::ConversationSession::execution_only(
                 voxgolem_core::assistant::AssistantPolicy::default(),
             ),
         ));
@@ -18694,11 +18702,13 @@ mod tests {
         let prompt_cleanup = Arc::new(super::PromptCleanupTracker::default());
         let active = Mutex::new(None);
         let generations = AtomicU64::new(0);
-        let session = Mutex::new(ConversationSession::new(AssistantPolicy::default()));
+        let session = Mutex::new(ConversationSession::execution_only(
+            AssistantPolicy::default(),
+        ));
         let execution = session
             .lock()
             .unwrap()
-            .admit("request", "prompt")
+            .admit_with_context("request", "prompt", Vec::new())
             .unwrap()
             .execution_id;
         let registration =
@@ -18735,7 +18745,7 @@ mod tests {
         let next = session
             .lock()
             .unwrap()
-            .admit("next", "prompt")
+            .admit_with_context("next", "prompt", Vec::new())
             .unwrap()
             .execution_id;
         assert!(register_active_prompt(&active, &generations, "next", next, None, 0).is_ok());
@@ -18765,11 +18775,13 @@ mod tests {
         let prompt_cleanup = Arc::new(super::PromptCleanupTracker::default());
         let active = Mutex::new(None);
         let generations = AtomicU64::new(0);
-        let session = Mutex::new(ConversationSession::new(AssistantPolicy::default()));
+        let session = Mutex::new(ConversationSession::execution_only(
+            AssistantPolicy::default(),
+        ));
         let execution = session
             .lock()
             .unwrap()
-            .admit("request", "prompt")
+            .admit_with_context("request", "prompt", Vec::new())
             .unwrap()
             .execution_id;
         register_active_prompt(&active, &generations, "request", execution, None, 0).unwrap();
@@ -18823,11 +18835,13 @@ mod tests {
         let prompt_cleanup = Arc::new(super::PromptCleanupTracker::default());
         let active = Mutex::new(None);
         let generations = AtomicU64::new(0);
-        let session = Mutex::new(ConversationSession::new(AssistantPolicy::default()));
+        let session = Mutex::new(ConversationSession::execution_only(
+            AssistantPolicy::default(),
+        ));
         let execution = session
             .lock()
             .unwrap()
-            .admit("request", "prompt")
+            .admit_with_context("request", "prompt", Vec::new())
             .unwrap()
             .execution_id;
         register_active_prompt(&active, &generations, "request", execution, None, 0).unwrap();
@@ -18869,9 +18883,11 @@ mod tests {
     #[test]
     fn active_execution_rejects_profile_transition_without_changing_startup_state() {
         let lifecycle = Mutex::new(());
-        let session = Mutex::new(voxgolem_core::conversation::ConversationSession::new(
-            voxgolem_core::assistant::AssistantPolicy::default(),
-        ));
+        let session = Mutex::new(
+            voxgolem_core::conversation::ConversationSession::execution_only(
+                voxgolem_core::assistant::AssistantPolicy::default(),
+            ),
+        );
         let voice_pipeline_config = default_voice_pipeline_config();
         let voice = Mutex::new(
             voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
@@ -18883,7 +18899,11 @@ mod tests {
             .unwrap()
             .0,
         );
-        session.lock().unwrap().admit("request", "prompt").unwrap();
+        session
+            .lock()
+            .unwrap()
+            .admit_with_context("request", "prompt", Vec::new())
+            .unwrap();
         let startup = Mutex::new(StartupStatePayload::Ready {
             cue_asset_paths: CueAssetPathsPayload {
                 start_listening: String::from("start"),
@@ -18945,9 +18965,11 @@ mod tests {
     #[test]
     fn profile_transition_rechecks_voice_runtime_after_waiting_for_lifecycle() {
         let lifecycle = Mutex::new(());
-        let session = Mutex::new(voxgolem_core::conversation::ConversationSession::new(
-            voxgolem_core::assistant::AssistantPolicy::default(),
-        ));
+        let session = Mutex::new(
+            voxgolem_core::conversation::ConversationSession::execution_only(
+                voxgolem_core::assistant::AssistantPolicy::default(),
+            ),
+        );
         let voice_pipeline_config = default_voice_pipeline_config();
         let voice = Mutex::new(
             voxgolem_core::voice_pipeline::apply_voice_pipeline_event(
@@ -19120,7 +19142,7 @@ mod tests {
             .conversation_session
             .lock()
             .unwrap()
-            .admit("request", "prompt")
+            .admit_with_context("request", "prompt", Vec::new())
             .unwrap()
             .execution_id;
         let (physical_generation, ..) = register_active_prompt(
@@ -20146,7 +20168,7 @@ mod tests {
             "synthetic startup".into(),
         );
         *state.conversation_session.lock().unwrap() =
-            voxgolem_core::conversation::ConversationSession::new(settings.into());
+            voxgolem_core::conversation::ConversationSession::execution_only(settings.into());
         if let StartupStatePayload::Ready { capabilities, .. } =
             &mut *state.startup_state.lock().unwrap()
         {
@@ -20182,7 +20204,7 @@ mod tests {
             .conversation_session
             .lock()
             .unwrap()
-            .admit("synthetic-request", "synthetic prompt")
+            .admit_with_context("synthetic-request", "synthetic prompt", Vec::new())
             .unwrap();
         super::fail_opencode_startup(&state, "synthetic failure".into());
         assert_eq!(
@@ -22703,8 +22725,11 @@ mod tests {
             deep_enabled: true,
             ..Default::default()
         };
-        let mut session = ConversationSession::new(preferences);
-        let generation = session.admit("request", "prompt").unwrap().execution_id;
+        let mut session = ConversationSession::execution_only(preferences);
+        let generation = session
+            .admit_with_context("request", "prompt", Vec::new())
+            .unwrap()
+            .execution_id;
         assert_eq!(
             session.update(
                 generation,
@@ -22733,8 +22758,11 @@ mod tests {
             deep_enabled: true,
             ..Default::default()
         };
-        let mut session = ConversationSession::new(preferences.clone());
-        let generation = session.admit("request", "prompt").unwrap().execution_id;
+        let mut session = ConversationSession::execution_only(preferences.clone());
+        let generation = session
+            .admit_with_context("request", "prompt", Vec::new())
+            .unwrap()
+            .execution_id;
         assert!(matches!(
             session.update(
                 generation,
@@ -22752,8 +22780,11 @@ mod tests {
             UpdateResult::Resolved { content: Content::Text(answer), .. } if answer == "instant"
         ));
 
-        let mut session = ConversationSession::new(preferences);
-        let generation = session.admit("request", "prompt").unwrap().execution_id;
+        let mut session = ConversationSession::execution_only(preferences);
+        let generation = session
+            .admit_with_context("request", "prompt", Vec::new())
+            .unwrap()
+            .execution_id;
         session.update(
             generation,
             Stage::Instant,

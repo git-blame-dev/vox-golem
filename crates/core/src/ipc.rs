@@ -1400,7 +1400,9 @@ mod tests {
             let mut session = crate::conversation::ConversationSession::execution_only(
                 crate::assistant::AssistantPolicy::default(),
             );
-            assert!(session.admit(&alias, "Synthetic prompt").is_ok());
+            assert!(session
+                .admit_with_context(&alias, "Synthetic prompt", Vec::new())
+                .is_ok());
             let turn = super::turn_from_record(&record, Some(&alias)).unwrap();
             assert_eq!(turn.request_id, alias);
             let unsaved = super::UnsavedResult::new(
