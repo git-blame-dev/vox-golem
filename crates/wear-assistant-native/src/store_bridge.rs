@@ -692,7 +692,7 @@ mod tests {
         assert_eq!(view["value"]["conversations"].as_array().unwrap().len(), 1);
         assert_eq!(view["value"]["conversation_count"], 1);
         for input in [
-            r#"{"kind":"replication","request":{"kind":"retained_descriptors","revision":"1","entries":[]}}"#,
+            r#"{"kind":"replication","request":{"kind":"revision"}}"#,
             r#"{"kind":"replication","request":{"kind":"inventory","cursor":null}}"#,
             r#"{"kind":"read","request":{"kind":"view"}}"#,
             r#"{"kind":"read","request":{"kind":"projection","request":{"conversation":null,"selected_head":null,"local_work_in_flight":false,"read":null}}}"#,

@@ -384,16 +384,15 @@ class ReplicationBoundaryTest {
         }
         DurableReplicationState(context).use { state ->
             assertEquals(setOf(peer), state.enrolledReplicas())
-            state.save(peer, JSONObject().put("session", "Synthetic session metadata"))
             val delays = (0..20).map { state.failed(1_000_000, Random(it)) }
             assertTrue(delays.all { it in 30_000..DurableReplicationState.MAX_BACKOFF })
         }
         DurableReplicationState(context).use { state ->
-            assertEquals("Synthetic session metadata", state.load(peer)!!.getString("session"))
+            assertEquals(setOf(peer), state.enrolledReplicas())
             assertTrue(state.retryDelay(1_000_000) in 30_000..DurableReplicationState.MAX_BACKOFF)
         }
         EnrolledPeerRegistry(context).use { it.revoke(peer) }
-        DurableReplicationState(context).use { assertNull(it.load(peer)); assertTrue(it.enrolledReplicas().isEmpty()) }
+        DurableReplicationState(context).use { assertTrue(it.enrolledReplicas().isEmpty()) }
     }
 
     @Test fun taskTimeoutDoesNotLeakLateResourcesAndNeverBecomesUnboundedAwait() {
@@ -415,16 +414,25 @@ class ReplicationBoundaryTest {
 
     @Test fun repeatedOfflineRevocationCannotCreateUnboundedDataItemCleanupBacklog() {
         val context = RuntimeEnvironment.getApplication()
-        val identities = (1..9).map { UUID(0, it.toLong()).toString() }
+        val identities = (1..10).map { UUID(0, it.toLong()).toString() }
         EnrolledPeerRegistry(context).use { registry ->
-            for (replica in identities.take(8)) { registry.enroll(replica); registry.revoke(replica) }
+            for (replica in identities) {
+                registry.enroll(replica)
+                registry.revoke(replica)
+            }
+            assertTrue(registry.replicas().isEmpty())
+            for (replica in identities.take(ReplicationWire.MAX_PEERS)) {
+                registry.enroll(replica)
+            }
+            assertEquals(identities.take(ReplicationWire.MAX_PEERS).toSet(), registry.replicas())
             assertThrows(IllegalArgumentException::class.java) { registry.enroll(identities.last()) }
+            registry.revoke(identities.first())
+            registry.enroll(identities[ReplicationWire.MAX_PEERS])
         }
         DurableReplicationState(context).use { state ->
-            assertEquals(identities.take(8).toSet(), state.cleanupReplicas())
-            state.cleanupComplete(identities.first())
+            assertEquals(ReplicationWire.MAX_PEERS, state.enrolledReplicas().size)
+            assertTrue(identities[ReplicationWire.MAX_PEERS] in state.enrolledReplicas())
         }
-        EnrolledPeerRegistry(context).use { it.enroll(identities.last()) }
     }
 
     private fun syntheticRecord(sequence: Int, title: String): JSONObject =

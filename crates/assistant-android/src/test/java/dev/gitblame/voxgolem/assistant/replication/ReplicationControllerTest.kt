@@ -97,8 +97,6 @@ class ReplicationControllerTest {
         assertEquals(setOf("$a/1", "$a/9"), pair.rightStore.records.keys)
         assertEquals(setOf("$a/1", "$a/9"), pair.leftStore.acknowledged[b])
         assertEquals(2, pair.rightStore.records.size)
-        assertNull(pair.leftState.load(b))
-        assertNull(pair.rightState.load(a))
     }
 
     @Test fun tombstonesAcrossPagesAreCommittedBeforeAnyContentRequest() {
@@ -139,16 +137,12 @@ class ReplicationControllerTest {
         pair.drain()
         assertEquals(setOf("$a/1"), pair.rightStore.records.keys)
         assertTrue(pair.leftStore.acknowledged.isEmpty())
-        assertNull(pair.leftState.load(b))
-        assertNull(pair.rightState.load(a))
 
         // Synthetic disconnect after sender processes ACK before ack_confirmed reaches receiver.
         pair.dropNextFrameKind = "ack_confirmed"
         pair.restartRight()
         pair.right.reconcile()
         pair.drain()
-        assertNull(pair.leftState.load(b))
-        assertNull(pair.rightState.load(a))
 
         // Next connected session recovers strictly from canonical store truth.
         pair.restartRight()
@@ -173,8 +167,6 @@ class ReplicationControllerTest {
         assertEquals(pair.leftStore.records.keys, pair.rightStore.records.keys)
         assertEquals(pair.leftStore.records.keys, pair.leftStore.acknowledged[b])
         assertEquals(pair.rightStore.records.keys, pair.rightStore.acknowledged[a])
-        assertNull(pair.leftState.load(b))
-        assertNull(pair.rightState.load(a))
     }
 
     @Test fun forgedBodyAssetOversizeAndQuarantinedServingAreRejected() {
@@ -231,7 +223,6 @@ class ReplicationControllerTest {
                 states.getValue(replica),
                 object : ReplicationTransport {
                     override fun reachable() = if (replica !in online) emptyList() else online.filter { it != replica }.map { PeerNode("synthetic-$it", "Synthetic peer") }
-                    override fun publish(path: String, bytes: ByteArray, assets: Map<String, ByteArray>) = Unit
                     override fun openSession(nodeId: String, session: String): ReplicationSessionConnection {
                         val targetReplica = replicas.first { nodeId == "synthetic-$it" }
                         check(replica in online && targetReplica in online) { "Offline peer cannot open session" }
@@ -269,7 +260,6 @@ class ReplicationControllerTest {
         assertEquals(6, stores.getValue(a).records.size)
         for (source in stores.values) for (peer in replicas.filter { it != source.replica }) {
             assertEquals(source.records.keys, source.acknowledged[peer])
-            assertNull(states.getValue(source.replica).load(peer))
         }
     }
 
@@ -405,10 +395,7 @@ internal class InMemorySessionPipe(
 
 internal class MemoryReplicationState : ReplicationState {
     val enrolled = mutableSetOf<String>()
-    private val sessions = mutableMapOf<String, String>()
     override fun enrolledReplicas() = enrolled.toSet()
-    override fun load(peer: String) = sessions[peer]?.let(::JSONObject)
-    override fun save(peer: String, state: JSONObject?) { if (state == null) sessions.remove(peer) else sessions[peer] = state.toString() }
 }
 
 internal class FakeReplicationStore(override val replica: String) : ReplicationStore {
@@ -523,7 +510,6 @@ internal class PairHarness(
         state,
         object : ReplicationTransport {
             override fun reachable() = if (!online) emptyList() else listOf(PeerNode(if (replica == a) "node-b" else "node-a", "Synthetic peer"))
-            override fun publish(path: String, bytes: ByteArray, assets: Map<String, ByteArray>) = Unit
             override fun sendHint(nodeId: String, sender: String, target: String) {
                 val senderNode = if (replica == a) "node-a" else "node-b"
                 hints.add(HintPacket(senderNode, nodeId, ReplicationWire.encodeHint(sender, target)))

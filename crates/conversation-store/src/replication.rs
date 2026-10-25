@@ -10,10 +10,6 @@ use voxgolem_core::durable_conversation::{OperationId, Record};
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     Revision,
-    RetainedDescriptors {
-        revision: Option<String>,
-        entries: Vec<InventoryEntry>,
-    },
     Inventory {
         cursor: Option<InventoryCursor>,
     },
@@ -115,15 +111,6 @@ impl Store {
         self.read(|core| {
             match request {
                 Request::Revision => encode(core.revision()),
-                Request::RetainedDescriptors { revision, entries } => {
-                    if entries.len() > sync::MAX_CONTROL_ITEMS {
-                        return Err(codec::limit("retained_descriptor_items"));
-                    }
-                    // Bound the encoded control request independently of the larger
-                    // JNI envelope limit; never serialize retained bodies here.
-                    codec::encode(&entries, sync::MAX_CONTROL_BYTES, "retained_descriptor_bytes")?;
-                    encode(sync::retained_descriptors(core, revision, entries)?)
-                }
                 Request::Import { .. } => unreachable!("handled before read transaction"),
                 Request::Inventory { cursor } => {
                     if cursor.as_ref().is_some_and(|cursor| cursor.revision != core.revision()) {

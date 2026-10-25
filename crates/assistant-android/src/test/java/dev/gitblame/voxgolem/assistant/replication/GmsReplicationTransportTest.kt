@@ -2,7 +2,6 @@ package dev.gitblame.voxgolem.assistant.replication
 
 import android.net.Uri
 import android.os.Parcel
-import android.os.ParcelFileDescriptor
 import com.google.android.gms.tasks.Task
 import com.google.android.gms.tasks.TaskCompletionSource
 import com.google.android.gms.tasks.Tasks
@@ -17,8 +16,6 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.io.File
-import java.io.FileDescriptor
-import java.io.FileInputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
@@ -184,93 +181,17 @@ class GmsReplicationTransportTest {
         }
     }
 
-    @Test fun actualSdkSerializationAssetsExactAckAndDeletionCleanupConverge() = worker {
-        val mailbox = FakeGmsMailbox(folder.root)
-        val leftSdk = mailbox.sdk("synthetic-left-node")
-        val rightSdk = mailbox.sdk("synthetic-right-node")
-        val left = FakeReplicationStore(a)
-        val right = FakeReplicationStore(b)
-        val original = record()
-        left.add(original)
-        val leftState = MemoryReplicationState().apply { enrolled.add(b) }
-        val rightState = MemoryReplicationState().apply { enrolled.add(a) }
-        val leftTransport = GmsReplicationTransport(leftSdk, budget(), regularFileIo())
-        val rightTransport = GmsReplicationTransport(rightSdk, budget(), regularFileIo())
-        val association: (String) -> String? = { node -> when (node) { "synthetic-left-node" -> a; "synthetic-right-node" -> b; else -> null } }
-        val leftController = ReplicationController(left, FakeReplicationDomain(1), leftState, leftTransport, association, onRejected = { throw AssertionError(it) })
-        val rightController = ReplicationController(right, FakeReplicationDomain(1), rightState, rightTransport, association, onRejected = { throw AssertionError(it) })
-        rightController.reconcile()
-        var count = 0
-        while (mailbox.events.isNotEmpty()) {
-            check(count++ < 200)
-            val item = mailbox.events.removeAt(0)
-            val sourceIsLeft = item.uri.host == "synthetic-left-node"
-            val transport = if (sourceIsLeft) rightTransport else leftTransport
-            val controller = if (sourceIsLeft) rightController else leftController
-            assertTrue(transport.receive(item, controller))
-            assertTrue(transport.receive(item, controller)) // Duplicate SDK delivery is harmless.
-        }
-        assertEquals(left.records.keys, right.records.keys)
-        assertEquals(left.records.keys, left.acknowledged[b])
-        assertTrue(mailbox.releasedAssets > 0)
-        assertEquals(mailbox.openedAssets, mailbox.releasedAssets)
-        assertTrue(mailbox.slots.size <= ReplicationWire.kinds.size * 2)
-
-        // The DB no longer retains the body. Even a previously staged Asset must be removed.
-        left.quarantined.add("$a/1")
-        left.revision++
-        leftTransport.cleanup(a, left, leftState)
-        assertFalse(mailbox.slots.values.any { it.uri.host == "synthetic-left-node" && it.uri.lastPathSegment == "records" })
-        assertEquals(1, left.records.size)
-    }
-
-    @Test fun timedOutPutIsCleanedWhenSdkCompletesLateAndRetriesUseDistinctDeliveryNonce() = worker {
-        val mailbox = FakeGmsMailbox(folder.root)
-        val sdk = mailbox.sdk("synthetic-left-node")
-        val path = ReplicationWire.path(a, b, "hint")
-        val frame = ReplicationWire.encode(ReplicationWire.frame(a, b, a, b, "hint", JSONObject()))
-        sdk.deferPut = true
-        assertThrows(TimeoutException::class.java) { GmsReplicationTransport(sdk, budget(10)).publish(path, frame, emptyMap()) }
-        sdk.completePut()
-        assertTrue(mailbox.slots.isEmpty())
-        sdk.deferPut = false
-        val transport = GmsReplicationTransport(sdk, budget())
-        transport.publish(path, frame, emptyMap())
-        val first = DataMapItem.fromDataItem(mailbox.events.last()).dataMap.getString("delivery")
-        transport.publish(path, frame, emptyMap())
-        val second = DataMapItem.fromDataItem(mailbox.events.last()).dataMap.getString("delivery")
-        assertNotEquals(first, second)
-        assertEquals(1, mailbox.slots.size)
-    }
-
-    @Test fun lateAssetResultReleasesDescriptorAfterTimeout() = worker {
-        val mailbox = FakeGmsMailbox(folder.root)
-        val sdk = mailbox.sdk("synthetic-left-node")
-        val task = TaskCompletionSource<DataClient.GetFdForAssetResponse>()
-        assertThrows(TimeoutException::class.java) { budget(10).await(task.task) { it.release() } }
-        val response = mailbox.response("Synthetic late Asset".toByteArray())
-        task.setResult(response)
-        assertEquals(1, mailbox.releasedAssets)
-        assertEquals(1, mailbox.openedAssets)
-        assertEquals("synthetic-left-node", Tasks.await(sdk.localNode()).id)
-    }
-
-    @Test fun pollingUsesOnlyCanonicalExactSlotsNotUnboundedSdkPrefixQueries() = worker {
-        val mailbox = FakeGmsMailbox(folder.root)
-        val sdk = mailbox.sdk("synthetic-right-node")
-        mailbox.sdk("synthetic-left-node")
-        val state = MemoryReplicationState().apply { enrolled.add(a) }
-        val transport = GmsReplicationTransport(sdk, budget())
-        val controller = ReplicationController(FakeReplicationStore(b), FakeReplicationDomain(1), state, transport, { a })
-        assertTrue(transport.poll(b, state, PeerAssociationProvider { a }, controller))
-        assertEquals(ReplicationWire.kinds.map { ReplicationWire.path(a, b, it) }.toSet(), sdk.lookups.map { it.path }.toSet())
-    }
-
     @Test fun publicIdentityMetadataDoesNotEnrollAndLegacyOrUnknownVersionsAreNotCompatible() = worker {
         val mailbox = FakeGmsMailbox(folder.root)
-        val sender = GmsReplicationTransport(mailbox.sdk("synthetic-left-node"), budget())
+        val senderSdk = mailbox.sdk("synthetic-left-node")
+        val sender = GmsReplicationTransport(senderSdk, budget())
         val receiver = GmsReplicationTransport(mailbox.sdk("synthetic-right-node"), budget())
-        sender.publish(ReplicationWire.IDENTITY_PATH, JSONObject().put("version", 1).put("replica", a).toString().toByteArray(), emptyMap())
+        fun putRawIdentity(payload: JSONObject) {
+            val request = PutDataMapRequest.create(ReplicationWire.IDENTITY_PATH)
+            request.dataMap.putByteArray("frame", payload.toString().toByteArray(Charsets.UTF_8))
+            senderSdk.putItem(request.asPutDataRequest().setUrgent())
+        }
+        putRawIdentity(JSONObject().put("version", 1).put("replica", a))
         assertEquals(a, receiver.identityFor("synthetic-left-node"))
         assertFalse(receiver.helloFor("synthetic-left-node")!!.compatible)
         assertNull(receiver.identityFor("synthetic-unavailable-node"))
@@ -281,8 +202,7 @@ class GmsReplicationTransportTest {
         val hello = JSONObject(String(DataMapItem.fromDataItem(mailbox.events.last()).dataMap.getByteArray("frame")!!))
         assertEquals(setOf("version", "replica", "role"), hello.keys().asSequence().toSet())
         assertEquals(3, hello.getInt("version"))
-        sender.publish(ReplicationWire.IDENTITY_PATH, JSONObject().put("version", 2).put("replica", a).put("installation", b)
-            .put("role", "phone").toString().toByteArray(), emptyMap())
+        putRawIdentity(JSONObject().put("version", 2).put("replica", a).put("installation", b).put("role", "phone"))
         assertFalse(receiver.helloFor("synthetic-left-node")!!.compatible)
     }
 
@@ -296,56 +216,14 @@ class GmsReplicationTransportTest {
         assertEquals(setOf("frame"), DataMapItem.fromDataItem(mailbox.events.last()).dataMap.keySet())
     }
 
-    @Test fun oversizedAssetAndLateSdkAssetAreReleasedWithoutImportOrAck() = worker {
-        val mailbox = FakeGmsMailbox(folder.root)
-        val senderSdk = mailbox.sdk("synthetic-left-node")
-        val receiverSdk = mailbox.sdk("synthetic-right-node")
-        val record = record()
-        val id = record.getJSONObject("operation").getJSONObject("id")
-        val entry = JSONObject().put("id", id).put("conversation", id).put("tombstone", false).put("body_key", record.getString("body_key"))
-        val state = MemoryReplicationState().apply { enrolled.add(a) }
-        val request = ReplicationWire.frame(b, a, a, b, "record_request", JSONObject().put("entries", JSONArray().put(entry)).put("phase", "records").put("revision", "1"))
-        state.save(a, JSONObject().put("session", a).put("phase", "records").put("revision", "1").put("pages", 1)
-            .put("remaining", JSONArray()).put("next", JSONObject.NULL).put("pending", request))
-        val target = FakeReplicationStore(b)
-        val receiver = GmsReplicationTransport(receiverSdk, budget(10), regularFileIo())
-        val controller = ReplicationController(target, FakeReplicationDomain(1), state, receiver, { a })
-        val transfers = JSONArray().put(JSONObject().put("entry", entry).put("asset", "body_0").put("bytes", record.toString().toByteArray().size))
-        val frame = ReplicationWire.frame(a, b, a, b, "records", JSONObject().put("records", transfers).put("unavailable", JSONArray()))
-        val sender = GmsReplicationTransport(senderSdk, budget())
-        val path = ReplicationWire.path(a, b, "records")
-        sender.publish(path, ReplicationWire.encode(frame), mapOf("body_0" to ByteArray(4096)))
-        assertFalse(receiver.receive(mailbox.events.last(), controller))
-        assertEquals(1, mailbox.openedAssets); assertEquals(1, mailbox.releasedAssets)
-        assertTrue(target.records.isEmpty())
-        receiverSdk.deferAsset = true
-        sender.publish(path, ReplicationWire.encode(frame), mapOf("body_0" to record.toString().toByteArray()))
-        assertFalse(receiver.receive(mailbox.events.last(), controller))
-        receiverSdk.completeAsset()
-        assertEquals(2, mailbox.openedAssets); assertEquals(2, mailbox.releasedAssets)
-        assertTrue(target.records.isEmpty())
-        assertFalse(mailbox.slots.values.any { it.uri.lastPathSegment == "ack" })
-    }
-
     private fun budget(timeout: Long = 5_000) = BoundedGmsWait(System.nanoTime() + TimeUnit.SECONDS.toNanos(30), timeout)
-    private fun record() = JSONObject().put("body_key", "1".repeat(64)).put("operation", JSONObject().put("version", 2)
-        .put("id", JSONObject().put("replica", a).put("sequence", "1"))
-        .put("body", JSONObject().put("kind", "conversation_created").put("title", "Synthetic SDK conversation")))
     private fun worker(block: () -> Unit) {
         val executor = Executors.newSingleThreadExecutor()
         try { executor.submit(block).get(60, TimeUnit.SECONDS) } finally { executor.shutdownNow() }
     }
-    private fun regularFileIo() = object : AssetDescriptorIo {
-        private val streams = mutableMapOf<FileDescriptor, FileInputStream>()
-        // Robolectric Os.poll is a no-op. Synthetic regular files are always read-ready;
-        // the production bounded read loop and SDK-owned descriptor release still execute.
-        override fun poll(descriptor: FileDescriptor, timeoutMillis: Int) = 1
-        override fun read(descriptor: FileDescriptor, buffer: ByteArray, length: Int): Int =
-            streams.getOrPut(descriptor) { FileInputStream(descriptor) }.read(buffer, 0, length).coerceAtLeast(0)
-    }
 }
 
-internal class FakeGmsMailbox(private val directory: File) {
+internal class FakeGmsMailbox(@Suppress("UNUSED_PARAMETER") directory: File = File(".")) {
     internal data class FakeMessage(val sourceNodeId: String, val targetNodeId: String, val path: String, val bytes: ByteArray)
 
     internal class InMemoryPipe(private val mailbox: FakeGmsMailbox) {
@@ -465,9 +343,6 @@ internal class FakeGmsMailbox(private val directory: File) {
     val incomingChannels = ArrayDeque<FakeChannel>()
     val nodes = linkedMapOf<String, Node>()
     val unreachableNodes = mutableSetOf<String>()
-    val assets = linkedMapOf<String, ByteArray>()
-    var openedAssets = 0
-    var releasedAssets = 0
     var openedChannels = 0
     var closedChannels = 0
     var openedStreams = 0
@@ -475,30 +350,18 @@ internal class FakeGmsMailbox(private val directory: File) {
     var onChannelOpened: ((String, FakeChannel) -> Unit)? = null
 
     fun sdk(node: String) = FakeSdk(node).also { nodes[node] = fakeNode(node) }
-    fun response(bytes: ByteArray): DataClient.GetFdForAssetResponse {
-        val file = File(directory, "synthetic-asset-${openedAssets++}")
-        file.writeBytes(bytes)
-        val descriptor = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
-        return object : DataClient.GetFdForAssetResponse() {
-            override fun getFdForAsset() = descriptor
-            override fun getInputStream(): InputStream = ParcelFileDescriptor.AutoCloseInputStream(descriptor)
-            override fun release() { releasedAssets++; descriptor.close() }
-        }
-    }
+
     inner class FakeSdk(private val node: String) : GmsReplicationSdk {
         var capabilityError: Exception? = null
-        var deleteError: Exception? = null
         var sendMessageError: Exception? = null
         var openChannelError: Exception? = null
         var inputStreamError: Exception? = null
         var outputStreamError: Exception? = null
         var deferPut = false
-        var deferAsset = false
         var deferOpenChannel = false
         var deferInputStream = false
         var deferOutputStream = false
         private var pending: Pair<TaskCompletionSource<DataItem>, DataItem>? = null
-        private var pendingAsset: Pair<TaskCompletionSource<DataClient.GetFdForAssetResponse>, ByteArray>? = null
         private var pendingOpenChannel: Pair<TaskCompletionSource<ChannelClient.Channel>, FakeChannel>? = null
         private var pendingInputStream: Pair<TaskCompletionSource<InputStream>, FakeChannel>? = null
         private var pendingOutputStream: Pair<TaskCompletionSource<OutputStream>, FakeChannel>? = null
@@ -522,22 +385,12 @@ internal class FakeGmsMailbox(private val directory: File) {
         override fun putItem(request: PutDataRequest): Task<DataItem> {
             calls.add("putItem")
             val uri = request.uri.buildUpon().authority(node).build()
-            val itemAssets = request.assets.mapValues { (key, asset) ->
-                val id = "synthetic-asset-${assets.size}"
-                assets[id] = asset.zza() ?: error("Synthetic Asset lacks bytes")
-                object : DataItemAsset {
-                    override fun getId() = id
-                    override fun getDataItemKey() = key
-                    override fun isDataValid() = true
-                    override fun freeze(): DataItemAsset = this
-                }
-            }
             val item = object : DataItem {
                 private var bytes = request.data
                 override fun getUri() = uri
                 override fun getData() = bytes
                 override fun setData(data: ByteArray?): DataItem { bytes = data; return this }
-                override fun getAssets() = itemAssets
+                override fun getAssets(): Map<String, DataItemAsset> = emptyMap()
                 override fun isDataValid() = true
                 override fun freeze(): DataItem = this
             }
@@ -547,20 +400,6 @@ internal class FakeGmsMailbox(private val directory: File) {
         }
         fun completePut() { val (task, item) = pending!!; stage(item); task.setResult(item); pending = null }
         private fun stage(item: DataItem) { slots[item.uri] = item; events.add(item) }
-        override fun deleteItems(uri: Uri, filter: Int): Task<Int> {
-            calls.add("deleteItems")
-            deleteError?.let { return Tasks.forException(it) }
-            val removed = slots.keys.filter { it == uri || (filter == DataClient.FILTER_PREFIX && it.host == uri.host && it.path!!.startsWith(uri.path!!)) }
-            removed.forEach(slots::remove)
-            return Tasks.forResult(removed.size)
-        }
-        override fun asset(asset: Asset): Task<DataClient.GetFdForAssetResponse> {
-            calls.add("asset")
-            val bytes = assets.getValue(asset.digest!!)
-            if (deferAsset) return TaskCompletionSource<DataClient.GetFdForAssetResponse>().also { pendingAsset = it to bytes }.task
-            return Tasks.forResult(response(bytes))
-        }
-        fun completeAsset() { val (task, bytes) = pendingAsset!!; task.setResult(response(bytes)); pendingAsset = null }
 
         override fun sendMessage(nodeId: String, path: String, bytes: ByteArray): Task<Int> {
             calls.add("sendMessage")

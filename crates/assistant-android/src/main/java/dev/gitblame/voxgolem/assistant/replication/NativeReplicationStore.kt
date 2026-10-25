@@ -21,9 +21,6 @@ internal class NativeReplicationStore(private val store: AssistantStore, private
     }
     override fun acknowledge(peer: String, receipts: JSONArray) = store.acknowledge(peer, receipts)
     override fun nativeRead(request: JSONObject): Any = store.replication(request)
-    override fun retainedDescriptors(entries: JSONArray, revision: String?): JSONObject =
-        store.replication(JSONObject().put("kind", "retained_descriptors").put("revision", revision ?: JSONObject.NULL)
-            .put("entries", entries)) as JSONObject
     override fun durableReceipts(ids: JSONArray, checkBudget: () -> Unit): JSONArray {
         checkBudget()
         return store.replication(JSONObject().put("kind", "receipts").put("ids", ids)) as JSONArray

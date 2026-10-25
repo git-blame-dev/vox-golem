@@ -303,8 +303,7 @@ object AssistantReplication {
         }
 
         private fun finishSync(store: NativeReplicationStore, sessionCompleted: Boolean) {
-            val pendingPublications = state.enrolledReplicas().any { store.publications(it, null, 1).length() > 0 } ||
-                state.enrolledReplicas().any { state.load(it) != null }
+            val pendingPublications = state.enrolledReplicas().any { store.publications(it, null, 1).length() > 0 }
             if (!sessionCompleted || pendingPublications) {
                 if (scheduler().getPendingJob(RETRY_JOB) == null) retry()
                 status = AssistantReplicationStatus.SYNCING
@@ -335,9 +334,7 @@ object AssistantReplication {
                 checkBudget = transport::checkBudget,
                 role = setup?.role ?: AssistantPeerRole.PHONE,
             )
-            // Cleanup must progress even when a full retirement backlog blocks peer setup.
             try {
-                transport.cleanup(store.replica, store, state)
                 work(transport, store, controller)
             } finally { operationAssociation = null }
             return true
@@ -351,11 +348,6 @@ object AssistantReplication {
                 .setBackoffCriteria(30_000, JobInfo.BACKOFF_POLICY_EXPONENTIAL).build())
         }
 
-        private fun hasPending() = state.enrolledReplicas().any { state.load(it) != null }
-        fun ensurePendingRetry() {
-            if (!hasPending()) { state.succeeded(); scheduler().cancel(RETRY_JOB); return }
-            if (scheduler().getPendingJob(RETRY_JOB) == null) retry()
-        }
         fun schedulePeriodic() {
             periodicRequested.set(true)
             submit {}

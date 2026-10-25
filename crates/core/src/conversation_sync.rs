@@ -114,60 +114,6 @@ pub struct TransferDescriptor {
     pub bytes: usize,
 }
 
-#[derive(Debug, Serialize)]
-pub struct RetainedDescriptorDisposition {
-    pub revision: String,
-    pub revision_matches: bool,
-    pub retained: Vec<bool>,
-}
-
-/// Exact outgoing eligibility for a bounded set, never bodies or receipt evidence.
-/// The native owner bounds encoded bytes and pins this read to its current revision.
-pub fn retained_descriptors(
-    store: &Store,
-    revision: Option<String>,
-    entries: Vec<InventoryEntry>,
-) -> Result<RetainedDescriptorDisposition, DomainError> {
-    if let Some(revision) = &revision {
-        decimal(revision, true)?;
-    }
-    if entries.len() > MAX_CONTROL_ITEMS {
-        return Err(DomainError::LimitExceeded {
-            limit: "retained_descriptor_items".into(),
-        });
-    }
-    let mut wanted = BTreeSet::new();
-    for entry in &entries {
-        validate_entry(entry)?;
-        if !wanted.insert(&entry.id) {
-            return Err(DomainError::Invalid {
-                field: "retained_descriptor_duplicate".into(),
-            });
-        }
-    }
-    let retained = entries
-        .iter()
-        .map(|entry| {
-            store.retained_record(&entry.id).is_some_and(|record| {
-                !store.is_quarantined(&entry.id)
-                    && record.body_key == entry.body_key
-                    && record.operation.conversation() == &entry.conversation
-                    && matches!(
-                        &record.operation.body,
-                        OperationBody::ConversationDeleted { .. }
-                    ) == entry.tombstone
-            })
-        })
-        .collect();
-    Ok(RetainedDescriptorDisposition {
-        revision: store.revision().into(),
-        revision_matches: revision
-            .as_ref()
-            .is_none_or(|revision| revision == store.revision()),
-        retained,
-    })
-}
-
 pub fn validate_transfer_batch(
     requested: &[RequestedRecord],
     phase: SyncPhase,
@@ -414,18 +360,6 @@ pub fn reconcile_page(store: &Store, page: InventoryPage) -> Result<ReconcilePla
     validate_page(&page)?;
     let local = inventory(store);
     let keys = body_keys(store);
-    let retained_metadata: BTreeMap<_, _> = store
-        .retained_records()
-        .map(|r| {
-            (
-                r.operation.id.clone(),
-                (
-                    r.operation.conversation().clone(),
-                    matches!(r.operation.body, OperationBody::ConversationDeleted { .. }),
-                ),
-            )
-        })
-        .collect();
     let retired: BTreeMap<_, _> = store.retired_records().map(|r| (r.id.clone(), r)).collect();
     let locally_deleted: BTreeSet<_> = local
         .values()
@@ -446,10 +380,14 @@ pub fn reconcile_page(store: &Store, page: InventoryPage) -> Result<ReconcilePla
             if key != &entry.body_key {
                 return Err(DomainError::IdConflict { id: entry.id });
             }
-            if retained_metadata
-                .get(&entry.id)
-                .is_some_and(|(conversation, tombstone)| {
-                    conversation != &entry.conversation || tombstone != &entry.tombstone
+            if store
+                .retained_record(&entry.id)
+                .is_some_and(|record| {
+                    record.operation.conversation() != &entry.conversation
+                        || matches!(
+                            record.operation.body,
+                            OperationBody::ConversationDeleted { .. }
+                        ) != entry.tombstone
                 })
             {
                 return Err(DomainError::Invalid {
@@ -1000,33 +938,6 @@ mod tests {
             validate_confirmed_receipts(B, &[r1], &[r2]),
             Err(DomainError::Missing { .. })
         ));
-    }
-    #[test]
-    fn retained_descriptor_predicate_matches_snapshot_inventory_without_requiring_page_order() {
-        let store = store(128);
-        let mut entries: Vec<_> = inventory_entries(&store).collect();
-        entries.reverse();
-        let result =
-            retained_descriptors(&store, Some(store.revision().into()), entries.clone()).unwrap();
-        assert_eq!(result.retained, vec![true; 128]);
-        assert!(result.revision_matches);
-        let restored = Store::restore(store.export()).unwrap();
-        assert_eq!(
-            retained_descriptors(&restored, None, entries.clone())
-                .unwrap()
-                .retained,
-            result.retained
-        );
-        entries[0].tombstone = true;
-        let disposition =
-            retained_descriptors(&store, Some("999".into()), entries.clone()).unwrap();
-        assert!(!disposition.retained[0]);
-        assert!(disposition.retained[1..].iter().all(|retained| *retained));
-        assert!(!disposition.revision_matches);
-        assert_eq!(disposition.revision, store.revision());
-        entries[0].body_key = "invalid".into();
-        assert!(retained_descriptors(&store, None, entries).is_err());
-        assert!(retained_descriptors(&store, Some("01".into()), vec![]).is_err());
     }
     fn store(count: u64) -> Store {
         let records = (1..=count)

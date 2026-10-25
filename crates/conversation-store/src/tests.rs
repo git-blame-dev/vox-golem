@@ -206,90 +206,6 @@ fn sync_read(store: &mut Store, request: serde_json::Value) -> serde_json::Value
 }
 
 #[test]
-fn retained_descriptor_read_is_exact_revision_bound_and_contains_no_bodies() {
-    let fixture = Fixture::new();
-    let mut store = fixture.open();
-    for index in 0..5 {
-        store
-            .create_conversation(format!("Synthetic private body {index}"))
-            .unwrap();
-    }
-    let page = sync_read(
-        &mut store,
-        serde_json::json!({"kind":"inventory","cursor":null}),
-    );
-    let mut entries = page["entries"].as_array().unwrap().clone();
-    entries[1]["body_key"] = "0".repeat(64).into();
-    entries[2]["conversation"] = entries[0]["id"].clone();
-    entries[3]["tombstone"] = true.into();
-    entries[4]["id"]["sequence"] = "999".into();
-    entries.reverse(); // Slot descriptors need not use inventory-page order.
-    let read = sync_read(
-        &mut store,
-        serde_json::json!({"kind":"retained_descriptors","revision":page["revision"],"entries":entries}),
-    );
-    assert_eq!(read["revision"], page["revision"]);
-    assert_eq!(read["revision_matches"], true);
-    assert_eq!(
-        read["retained"],
-        serde_json::json!([false, false, false, false, true])
-    );
-    assert!(!read.to_string().contains("Synthetic private body"));
-    assert!(serde_json::to_vec(&read).unwrap().len() < 256);
-    fixture
-        .open()
-        .create_conversation("Synthetic newer revision".into())
-        .unwrap();
-    let stale = sync_read(
-        &mut store,
-        serde_json::json!({"kind":"retained_descriptors","revision":page["revision"],"entries":[]}),
-    );
-    assert_eq!(stale["revision_matches"], false);
-    assert_eq!(stale["revision"], store.revision().unwrap());
-    let duplicate = vec![page["entries"][0].clone(); 2];
-    assert!(store.replication(serde_json::from_value(serde_json::json!({"kind":"retained_descriptors","revision":null,"entries":duplicate})).unwrap()).is_err());
-}
-
-#[test]
-fn retained_descriptor_requests_enforce_item_and_encoded_byte_bounds() {
-    let fixture = Fixture::new();
-    let mut store = fixture.open();
-    let replica = "00000000-0000-4000-8000-000000000001";
-    let entries: Vec<_> = (1..=128).map(|sequence| {
-        let id = OperationId { replica: replica.into(), sequence: sequence.to_string() };
-        serde_json::json!({"id":id,"conversation":id,"body_key":"0".repeat(64),"tombstone":false})
-    }).collect();
-    assert!(serde_json::to_vec(&entries).unwrap().len() <= 32 * 1024);
-    let result = sync_read(
-        &mut store,
-        serde_json::json!({"kind":"retained_descriptors","revision":null,"entries":entries}),
-    );
-    assert_eq!(result["retained"].as_array().unwrap().len(), 128);
-    assert!(result["retained"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|value| value == false));
-    assert!(serde_json::to_vec(&result).unwrap().len() < 1024);
-    let mut too_many = entries.clone();
-    too_many.push(entries[0].clone());
-    assert!(store.replication(serde_json::from_value(serde_json::json!({"kind":"retained_descriptors","revision":null,"entries":too_many})).unwrap()).is_err());
-    let large: Vec<_> = (0..128).map(|index| {
-        let id = OperationId { replica: replica.into(), sequence: (u64::MAX-index).to_string() };
-        serde_json::json!({"id":id,"conversation":id,"body_key":"0".repeat(64),"tombstone":false})
-    }).collect();
-    assert!(serde_json::to_vec(&large).unwrap().len() > 32 * 1024);
-    assert!(store
-        .replication(
-            serde_json::from_value(
-                serde_json::json!({"kind":"retained_descriptors","revision":null,"entries":large})
-            )
-            .unwrap()
-        )
-        .is_err());
-}
-
-#[test]
 fn native_replication_pages_have_bounded_items_bytes_and_lexical_cursors() {
     let fixture = Fixture::new();
     let mut store = fixture.open();
@@ -616,11 +532,6 @@ fn native_replication_omits_quarantine_bodies_but_keeps_exact_known_receipts() {
         .clone();
     store.import_records(vec![authentic], true, None).unwrap();
     assert_eq!(store.snapshot().unwrap().quarantine.len(), 1);
-    let disposition = sync_read(
-        &mut store,
-        serde_json::json!({"kind":"retained_descriptors","revision":null,"entries":[poison_entry]}),
-    );
-    assert_eq!(disposition["retained"], serde_json::json!([false]));
     let current = sync_read(
         &mut store,
         serde_json::json!({"kind":"inventory","cursor":null}),
@@ -649,11 +560,6 @@ fn native_replication_omits_quarantine_bodies_but_keeps_exact_known_receipts() {
         .iter()
         .any(|receipt| receipt["body_key"] == poison.body_key));
     store.delete_conversation(conversation).unwrap();
-    let retired = sync_read(
-        &mut store,
-        serde_json::json!({"kind":"retained_descriptors","revision":null,"entries":[poison_entry]}),
-    );
-    assert_eq!(retired["retained"], serde_json::json!([false]));
     let receipts = sync_read(
         &mut store,
         serde_json::json!({"kind":"receipts","ids":[poison.operation.id]}),

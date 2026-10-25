@@ -88,7 +88,7 @@ class ReplicationLifecycleTest {
         assertTrue(AssistantReplication.acceptsData(validIdentity))
         val oversizedIdentity = fakeDataItem("wear://synthetic-node${ReplicationWire.IDENTITY_PATH}", ByteArray(2049))
         assertFalse(AssistantReplication.acceptsData(oversizedIdentity))
-        val v2HistoryItem = fakeDataItem("wear://synthetic-node${ReplicationWire.path(a, b, "hint")}", ByteArray(32))
+        val v2HistoryItem = fakeDataItem("wear://synthetic-node${ReplicationWire.PREFIX}$a/$b/hint", ByteArray(32))
         assertFalse(AssistantReplication.acceptsData(v2HistoryItem))
         val v1HistoryItem = fakeDataItem("wear://synthetic-node/voxgolem/assistant/v1/$a/$b/records", ByteArray(32))
         assertFalse(AssistantReplication.acceptsData(v1HistoryItem))
