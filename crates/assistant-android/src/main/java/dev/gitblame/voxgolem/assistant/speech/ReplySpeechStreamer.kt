@@ -94,10 +94,20 @@ class ReplySpeechStreamer(private val output: SpeechOutputController) : AutoClos
 
     private fun observeEnabled() {
         if (admissionEnabled && !output.enabled) {
-            admissionEnabled = false
-            retire(true)
-            started = false
+            disableAdmission()
         }
+    }
+
+    private fun disableAdmission() {
+        admissionEnabled = false
+        // LocalSpeechOutput has already retired disabled SDK resources. Fence all
+        // remaining callbacks without cancelling the independently owned generation.
+        val callback = terminal
+        terminal = null
+        started = false
+        retire(false)
+        terminal = callback
+        finishIfIdle()
     }
 
     private fun apply(decision: SpeechDecision, onStarted: () -> Unit) {
@@ -131,7 +141,8 @@ class ReplySpeechStreamer(private val output: SpeechOutputController) : AutoClos
             output.speakStreamChunk(chunk.text, language, flush, true, if (flush) timing else null) { failure ->
                 synchronized(this) {
                     if (epoch != fence || generation != chunk.generation || chunk.id > lastChunk || !inFlight.remove(chunk.id)) return@synchronized
-                    if (failure != null) fail(failure) else pump()
+                    if (failure == "speech_disabled") disableAdmission()
+                    else if (failure != null) fail(failure) else pump()
                 }
             }
         }

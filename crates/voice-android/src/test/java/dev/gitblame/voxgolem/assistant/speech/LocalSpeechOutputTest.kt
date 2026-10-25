@@ -131,6 +131,58 @@ class LocalSpeechOutputTest {
         output.close(); drain()
     }
 
+    @Test fun queuedFlushAndAppendReportDisableAfterRetirementEvenWhenImmediatelyReenabled() {
+        enable()
+        val results = mutableListOf<String?>()
+        output.speakStreamChunk("Synthetic first.", "en-US", true, onDone = results::add)
+        output.speakStreamChunk("Synthetic second.", "en-US", false, onDone = results::add)
+        output.setEnabled(false)
+        output.setEnabled(true)
+        drain()
+        assertEquals(listOf("speech_disabled", "speech_disabled"), results)
+        assertTrue(output.snapshot().enabled)
+        assertEquals(0, factory.creates)
+        assertTrue(factory.sdk.spoken.isEmpty())
+        output.speakStreamChunk("Synthetic fresh.", "en-US", true) {}; drain()
+        factory.ready(true); drain()
+        assertEquals(listOf("Synthetic fresh."), factory.sdk.spoken)
+        output.close(); drain()
+    }
+
+    @Test fun queuedDisableReportsActualCleanupFailureRatherThanSuccess() {
+        enable(); output.prepare("en-US"); drain(); factory.ready(true); drain()
+        factory.sdk.rejectShutdown = true
+        val results = mutableListOf<String?>()
+        output.speakStreamChunk("Synthetic queued.", "en-US", true, onDone = results::add)
+        output.setEnabled(false); drain()
+        assertEquals(listOf("speech_cleanup_failed"), results)
+        assertEquals(SpeechPhase.ERROR, output.snapshot().phase)
+        assertFalse(factory.sdk.shutdown)
+        assertTrue(factory.sdk.spoken.isEmpty())
+        factory.sdk.rejectShutdown = false
+        output.close(); drain()
+    }
+
+    @Test fun queuedStopReplacementBackgroundAndCloseRemainCancellation() {
+        for (cause in listOf("stop", "replacement", "background", "close")) {
+            val factory = Factory()
+            val output = LocalSpeechOutput(factory, Focus())
+            output.setForeground(true); output.setEnabled(true); drain()
+            val results = mutableListOf<String?>()
+            output.speakStreamChunk("Synthetic stale.", "en-US", true, onDone = results::add)
+            when (cause) {
+                "stop" -> output.stop()
+                "replacement" -> output.speakStreamChunk("Synthetic replacement.", "en-US", true) {}
+                "background" -> output.setForeground(false)
+                "close" -> output.close()
+            }
+            drain()
+            assertEquals(cause, listOf("speech_cancelled"), results)
+            assertFalse(factory.sdk.spoken.contains("Synthetic stale."))
+            output.close(); drain()
+        }
+    }
+
     private fun timedOutput(events: MutableList<AssistantTiming.Event>, leases: RecognitionResourceLease): LocalSpeechOutput {
         val context = RuntimeEnvironment.getApplication()
         context.applicationInfo.flags = context.applicationInfo.flags or ApplicationInfo.FLAG_DEBUGGABLE
@@ -715,7 +767,7 @@ class LocalSpeechOutputTest {
         output.speakStreamChunk("Synthetic first sentence.", "en-US", flush = true, keepOpen = true, onDone = done::add)
         output.setEnabled(false)
         drain()
-        assertEquals(listOf("speech_cancelled"), done)
+        assertEquals(listOf("speech_disabled"), done)
         assertEquals(0, factory.creates)
         output.close(); drain()
         assertEquals(1, done.size)
