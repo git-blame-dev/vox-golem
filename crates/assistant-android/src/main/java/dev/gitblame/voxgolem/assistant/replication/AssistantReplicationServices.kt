@@ -15,7 +15,13 @@ import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicBoolean
 
 class AssistantReplicationListenerService : WearableListenerService() {
-    override fun onMessageReceived(message: MessageEvent) { ChatGptAccessSync.onMessage(applicationContext, message) }
+    override fun onMessageReceived(message: MessageEvent) {
+        if (message.path == ReplicationWire.HINT_PATH) {
+            AssistantReplication.onMessage(applicationContext, message)
+        } else {
+            ChatGptAccessSync.onMessage(applicationContext, message)
+        }
+    }
     override fun onDataChanged(events: DataEventBuffer) {
         var count = 0
         for (event in events) {
@@ -26,6 +32,8 @@ class AssistantReplicationListenerService : WearableListenerService() {
     override fun onChannelOpened(channel: ChannelClient.Channel) {
         if (PhoneRelayWire.validPath(channel.path)) {
             PhoneRelayBridge.onChannelOpened(applicationContext, channel)
+        } else if (ReplicationWire.validSessionPath(channel.path)) {
+            AssistantReplication.onChannelOpened(applicationContext, channel)
         }
     }
     override fun onPeerConnected(node: Node) {

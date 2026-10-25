@@ -200,6 +200,10 @@ internal class GmsReplicationTransport(private val sdk: GmsReplicationSdk, priva
         return attachStreams(channel, session)
     }
 
+    fun closeChannel(channel: ChannelClient.Channel) {
+        runCatching { sdk.closeChannel(channel) }
+    }
+
     private fun attachStreams(channel: ChannelClient.Channel, session: String): ReplicationSessionConnection {
         var inputStream: InputStream? = null
         var outputStream: OutputStream? = null

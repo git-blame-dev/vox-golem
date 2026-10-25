@@ -562,6 +562,8 @@ class AssistantPeerSetupTest {
             pair.leftIo.publish("/voxgolem/assistant/v1/pair/$kind", "{}".toByteArray(), emptyMap())
             assertFalse(AssistantReplication.acceptsData(pair.mailbox.events.last()))
         }
+        pair.leftIo.publish(ReplicationWire.path(a, b, "hint"), "{}".toByteArray(), emptyMap())
+        assertFalse(AssistantReplication.acceptsData(pair.mailbox.events.last()))
     }
 
     @Test fun persistedInitialBackoffIsBoundedWithoutAnyEnrolledPeer() {

@@ -17,7 +17,8 @@ internal class ReplicationController(
     private val onRejected: (Exception) -> Unit = {},
     private val role: AssistantPeerRole = AssistantPeerRole.PHONE,
 ) {
-    fun reconcile() {
+    fun reconcile(): Boolean {
+        var accepted = true
         val peers = linkedMapOf<String, String>()
         val enrolled = state.enrolledReplicas()
         for (node in transport.reachable().take(64)) {
@@ -36,13 +37,15 @@ internal class ReplicationController(
                     transport.sendHint(nodeId, store.replica, peer)
                 } catch (error: Exception) {
                     onRejected(error)
+                    accepted = false
                 }
             } else if (transport is GmsReplicationTransport && store.nativeRead(JSONObject().put("kind", "revision")) == null) {
                 reconcileLegacy(peer)
             } else {
-                connect(nodeId, peer)
+                if (!connect(nodeId, peer)) accepted = false
             }
         }
+        return accepted
     }
 
     fun onHint(node: String, bytes: ByteArray): Boolean {
