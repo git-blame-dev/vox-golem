@@ -154,7 +154,7 @@ pub(super) async fn start_capture(
         .voice_autostart_available
         .store(false, Ordering::Release);
     ensure_app_running(&state.exit_cleanup_started)?;
-    ensure_startup_ready_for_prompt(&state.startup_state)?;
+    ensure_voice_input_ready(state)?;
     let frame_app = app.clone();
     let failure_app = app.clone();
     let ingress = state.native_voice.start(
@@ -514,7 +514,7 @@ fn process_frame(app: &tauri::AppHandle, frame: desktop_voice::VoiceFrame) -> Re
             state
                 .voice_input_reset_pending
                 .store(true, Ordering::Release);
-        } else if phase == RuntimePhasePayload::Listening && state.parakeet_runtime.is_some() {
+        } else if phase == RuntimePhasePayload::Listening && state.parakeet_runtime().is_some() {
             partial_action = request_partial_snapshot_after_detected_speech(
                 &pipeline,
                 &mut *state
@@ -572,11 +572,11 @@ fn process_frame(app: &tauri::AppHandle, frame: desktop_voice::VoiceFrame) -> Re
         }
         VoicePipelineAction::ExpiredWithoutSpeech => publish_voice(app, None),
         _ => {
-            if let Some(runtime) = state.parakeet_runtime.as_ref() {
+            if let Some(runtime) = state.parakeet_runtime() {
                 spawn_partial_transcription(
                     app.clone(),
                     partial_action,
-                    Arc::clone(runtime),
+                    runtime,
                     Arc::clone(&state.partial_transcription),
                     state.voice_pipeline_config.sample_rate_hz(),
                     update_guard,
@@ -736,7 +736,7 @@ fn spawn_final(
         fail_final(&state, token);
         return;
     };
-    let Some(runtime) = state.parakeet_runtime.as_ref().map(Arc::clone) else {
+    let Some(runtime) = state.parakeet_runtime() else {
         fail_final(&state, token);
         return;
     };
@@ -918,10 +918,13 @@ pub(super) fn begin_reply(
             .map_err(|_| String::from("native observation unavailable"))?
             .start_prompt(desktop_observation::NativePromptProjection {
                 request_id: request_id.to_owned(),
-                execution_id: desktop_observation::ExecutionId {
-                    session_id: control.assistant_generation.session_id.0.to_string(),
-                    generation: control.assistant_generation.generation.0.to_string(),
-                },
+                execution_id: desktop_observation::ExecutionId::from(
+                    &control
+                        .pinned
+                        .as_ref()
+                        .ok_or_else(|| String::from("prepared identity unavailable"))?
+                        .wire_execution,
+                ),
                 prompt: prompt.to_owned(),
                 updates: Vec::new(),
                 result: None,
@@ -936,6 +939,7 @@ pub(super) fn finish_reply(
     app: &tauri::AppHandle,
     request_id: &str,
     execution: voxgolem_core::conversation::ExecutionId,
+    wire_execution: &voxgolem_core::ipc::ExecutionId,
     native_owned: bool,
     result: &Result<PromptFinalPayload, String>,
 ) {
@@ -968,45 +972,36 @@ pub(super) fn finish_reply(
     let turn = result
         .as_ref()
         .ok()
-        .filter(|result| result.outcome == "completed")
-        .and_then(|_| get_app_snapshot_from_state(&state).ok())
-        .and_then(|snapshot| {
-            snapshot.transcript.into_iter().find(|turn| {
-                turn.request_id == request_id
-                    && turn.execution_id.session_id.as_str() == execution.session_id.0.to_string()
-                    && turn.execution_id.generation.as_str() == execution.generation.0.to_string()
-            })
+        .and_then(|result| match &result.outcome {
+            voxgolem_core::ipc::PromptOutcome::Completed { turn, .. } => Some(turn.turn()),
+            voxgolem_core::ipc::PromptOutcome::Refused { turn, .. } => Some(turn.turn()),
+            _ => None,
         });
-    let canonical = turn.as_ref().map(|turn| match &turn.answer.content {
+    let canonical = turn.map(|turn| match &turn.answer.content {
         voxgolem_core::ipc::MessageContentKind::Text(text)
         | voxgolem_core::ipc::MessageContentKind::Refusal(text) => text.as_str(),
     });
     desktop_speech_adapter::finish(app, request_id, execution, canonical);
-    let payload = if let Some(turn) = turn {
-        let kind = if matches!(
-            turn.answer.content,
-            voxgolem_core::ipc::MessageContentKind::Refusal(_)
-        ) {
-            "refused"
-        } else {
-            "completed"
-        };
-        serde_json::json!({ "kind": kind, "turn": turn })
-    } else {
-        match result {
-            Ok(result) if result.outcome == "cancelled" => serde_json::json!({"kind":"cancelled"}),
-            Ok(result) if result.outcome != "completed" => {
-                serde_json::to_value(result).unwrap_or_default()
-            }
-            _ => serde_json::json!({"request_id":request_id,"runtime_phase":"sleeping",
-                "outcome":"error","error_message":"The native response could not be synchronized"}),
+    let payload = match result {
+        Ok(result) => serde_json::to_value(result).unwrap_or_default(),
+        Err(_) => {
+            serde_json::json!({"kind":"error","request_id":request_id,"runtime_phase":"sleeping", "error_message":"The native response could not be synchronized"})
         }
     };
     let revision = state
         .native_observation
         .lock()
         .ok()
-        .and_then(|mut observer| observer.finish_prompt(request_id, payload).ok().flatten());
+        .and_then(|mut observer| {
+            observer
+                .finish_prompt_for_execution(
+                    request_id,
+                    &desktop_observation::ExecutionId::from(wire_execution),
+                    payload,
+                )
+                .ok()
+                .flatten()
+        });
     notify(app, revision);
 }
 

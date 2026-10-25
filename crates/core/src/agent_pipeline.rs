@@ -695,12 +695,15 @@ content = "I cannot provide that."
             Content::Refusal("I cannot provide that.".into())
         );
 
-        let mut session =
-            crate::conversation::ConversationSession::new(crate::assistant::AssistantPolicy {
+        let mut session = crate::conversation::ConversationSession::execution_only(
+            crate::assistant::AssistantPolicy {
                 review_enabled: true,
                 ..Default::default()
-            });
-        let execution = session.admit("request", "question").expect("admission");
+            },
+        );
+        let execution = session
+            .admit_with_context("request", "question", Vec::new())
+            .expect("admission");
         session.update(
             execution.execution_id,
             crate::assistant::Stage::Instant,

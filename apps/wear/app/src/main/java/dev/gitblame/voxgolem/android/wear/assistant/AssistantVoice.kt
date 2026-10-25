@@ -133,7 +133,11 @@ internal class WearAssistantVoice(
     private var localOnlyRecognitionAvailable = false
     private var missingSpeechServices = false
     private var speechRequirementMessage: String? = null
-    private var lastAdmission = engine.snapshot().speechAdmission()
+    private var foreground = false
+    private var closed = false
+    private var contextAcknowledged = engine.snapshot().contextReady
+    private var lastAdmission = engine.snapshot().takeIf { it.contextReady }?.speechAdmission()
+    private val unavailableOptions = SpeechOptions()
     private var optionsSource = optionsInput().frozenLanguages()
     private var speechOptions = optionsSource.bounded()
     private var publishedOptions: SpeechOptions? = null
@@ -142,8 +146,6 @@ internal class WearAssistantVoice(
     // Own the policy before its first clause and retain effects ownership through playback.
     private var manualSpeechStreamer: ReplySpeechStreamer? = null
     private var manualStreamSubscription: AutoCloseable? = null
-    private var foreground = false
-    private var closed = false
     private var repliesEnabled = false
     private class SelectionSettlement(consumer: (Boolean) -> Unit) {
         val consumer = AtomicReference<((Boolean) -> Unit)?>(consumer)
@@ -158,18 +160,24 @@ internal class WearAssistantVoice(
                 lastFinal = value.utterance
                 saveOwnedDraft(value.draft, interrupted = value.phase == DictationPhase.ERROR)
                 draftUtterance = null
-                if (value.phase == DictationPhase.FINAL && output.snapshot().enabled) output.prepare(language)
+                if (value.phase == DictationPhase.FINAL && inventoryReady() && output.snapshot().enabled) output.prepare(language)
             }
             publish()
         },
         output.subscribe { value -> microphoneCues?.onSpeech(value); updateOptions(); publish() },
-        engine.subscribe { value -> main.post {
+        engine.subscribe { main.post {
             if (closed) return@post
             this.loop.reconcileInputOwner()
-            val admission = value.speechAdmission()
-            if (admission != lastAdmission) {
+            // Read the latest acknowledged projection, not a stale callback queued before hydration.
+            val current = engine.snapshot()
+            val becameReady = current.contextReady && !contextAcknowledged
+            val admission = current.takeIf { it.contextReady }?.speechAdmission()
+            if (current.contextReady != contextAcknowledged || admission != lastAdmission) {
+                contextAcknowledged = current.contextReady
                 lastAdmission = admission
-                recognitionServiceAvailable = foreground && runCatching { dictation.serviceAvailable() }.getOrDefault(false)
+                refreshRecognitionInventory()
+                updateOptions()
+                if (becameReady && foreground) prepareSpeechOptions()
                 publish()
             }
         } },
@@ -179,12 +187,15 @@ internal class WearAssistantVoice(
         },
     )
     override fun snapshot(): AssistantVoiceState {
-        val recordingEnabled = dictation.recordingEnabled()
-        val recordingAvailable = foreground && runCatching { dictation.recordingAvailable() }.getOrDefault(false)
-        return AssistantVoiceState(dictation.snapshot(), output.snapshot(), loop.snapshot(), admissionReady(), error,
-            recognitionServiceAvailable = recognitionServiceAvailable,
-            localOnlyRecognitionAvailable = localOnlyRecognitionAvailable, speechOptions = options(),
-            speechSelection = engine.snapshot().speechAdmission().selection, entryMode = entryMode,
+        val current = engine.snapshot()
+        val ready = inventoryReady()
+        val recordingEnabled = ready && foreground && dictation.recordingEnabled()
+        val recordingAvailable = ready && foreground && runCatching { dictation.recordingAvailable() }.getOrDefault(false)
+        return AssistantVoiceState(dictation.snapshot(), output.snapshot(), loop.snapshot(), ready,
+            if (current.contextReady) error else current.error ?: "context_not_ready",
+            recognitionServiceAvailable = ready && recognitionServiceAvailable,
+            localOnlyRecognitionAvailable = ready && localOnlyRecognitionAvailable, speechOptions = if (ready) options() else unavailableOptions,
+            speechSelection = current.takeIf { it.contextReady }?.speechAdmission()?.selection ?: SpeechSelection(), entryMode = entryMode,
             recordingEnabled = recordingEnabled, recordingAvailable = recordingAvailable,
             recordingStatus = if (!recordingEnabled) "provider-proof-required" else if (!recordingAvailable)
                 "recorded-input-unavailable" else "recorded-input-selected",
@@ -199,7 +210,9 @@ internal class WearAssistantVoice(
             error != null || input.error != null || speech.error != null || conversation.error != null)
     }
     private fun options() = speechOptions
+    private fun inventoryReady() = !closed && engine.snapshot().contextReady && admissionReady()
     private fun optionsInput(): SpeechOptions {
+        if (!inventoryReady()) return unavailableOptions
         val route = dictation.snapshot().route
         return output.options().copy(recognitionInstalledLanguages = route?.installedLanguages,
             recognitionSupportedLanguages = route?.supportedLanguages, localOnlyRecognitionAvailable = localOnlyRecognitionAvailable)
@@ -207,13 +220,14 @@ internal class WearAssistantVoice(
     private fun SpeechOptions.frozenLanguages() = copy(recognitionInstalledLanguages = recognitionInstalledLanguages?.toList(),
         recognitionSupportedLanguages = recognitionSupportedLanguages?.toList())
     private fun updateOptions() {
+        if (closed) return
         val source = optionsInput()
         if (source != optionsSource) {
             optionsSource = source.frozenLanguages()
             speechOptions = optionsSource.bounded()
         }
         val value = options()
-        if (value != publishedOptions) { publishedOptions = value; engine.publishSpeechOptions(value) }
+        if (engine.snapshot().contextReady && value != publishedOptions) { publishedOptions = value; engine.publishSpeechOptions(value) }
     }
     override fun configureSpeech(selection: SpeechSelection): Boolean {
         if (!admitSpeechSelection(selection)) return false
@@ -221,7 +235,7 @@ internal class WearAssistantVoice(
         error = null; return true
     }
     private fun admitSpeechSelection(selection: SpeechSelection): Boolean {
-        if (closed || !foreground || snapshot().active || engine.snapshot().busy || selectionSettlement.get() != null) return false
+        if (!inventoryReady() || !foreground || snapshot().active || engine.snapshot().busy || selectionSettlement.get() != null) return false
         try { options().validate(selection, engine.snapshot().speechNetworkFallback) }
         catch (failure: IllegalArgumentException) { error = failure.message; publish(); return false }
         return true
@@ -268,18 +282,27 @@ internal class WearAssistantVoice(
         foreground = visible
         microphoneCues?.foreground(visible)
         if (!visible) retireManualReply()
-        recognitionServiceAvailable = visible && runCatching { dictation.serviceAvailable() }.getOrDefault(false)
-        localOnlyRecognitionAvailable = visible && runCatching { dictation.localOnlyServiceAvailable() }.getOrDefault(false)
-        missingSpeechServices = context?.let { ctx -> runCatching { SpeechServiceRequirement.isMissing(ctx) }.getOrDefault(false) } ?: false
-        speechRequirementMessage = if (missingSpeechServices) context?.let { ctx -> runCatching { SpeechServiceRequirement.missingRequirementDescription(ctx) }.getOrNull() } else null
+        val current = engine.snapshot()
+        val becameReady = current.contextReady && !contextAcknowledged
+        contextAcknowledged = current.contextReady
+        lastAdmission = current.takeIf { it.contextReady }?.speechAdmission()
+        refreshRecognitionInventory()
         updateOptions()
         if (!visible) preservePartial()
         loop.setForeground(visible)
         if (!visible) mode = false
+        if (becameReady && visible) prepareSpeechOptions()
         publish()
     }
+    private fun refreshRecognitionInventory() {
+        val ready = foreground && inventoryReady()
+        recognitionServiceAvailable = ready && runCatching { dictation.serviceAvailable() }.getOrDefault(false)
+        localOnlyRecognitionAvailable = ready && runCatching { dictation.localOnlyServiceAvailable() }.getOrDefault(false)
+        missingSpeechServices = ready && (context?.let { ctx -> runCatching { SpeechServiceRequirement.isMissing(ctx) }.getOrDefault(false) } ?: false)
+        speechRequirementMessage = if (missingSpeechServices) context?.let { ctx -> runCatching { SpeechServiceRequirement.missingRequirementDescription(ctx) }.getOrNull() } else null
+    }
     override fun prepareSpeechOptions() {
-        if (closed || !foreground || snapshot().active || engine.snapshot().busy) return
+        if (!inventoryReady() || !foreground || snapshot().active || engine.snapshot().busy) return
         output.refreshProviders()
         output.prepare(language)
     }
@@ -324,9 +347,11 @@ internal class WearAssistantVoice(
     }
     override fun send(): Boolean {
         if (closed || !foreground || mode || snapshot().listening || engine.snapshot().busy || manualRequest != null) return true
+        if (!engine.snapshot().contextReady) { error = "context_not_ready"; publish(); return true }
         retireManualReply()
         val ticket = replyEpoch.incrementAndGet()
         manualRequest = ticket
+        // Typed Send does not require microphone admission; playback keeps its own resource lease.
         val speakReply = repliesEnabled
         error = null
         if (output.snapshot().phase != SpeechPhase.PREPARING) output.stop()
@@ -365,7 +390,7 @@ internal class WearAssistantVoice(
         }
         return true
     }
-    private fun currentReply(ticket: Long) = ticket == replyEpoch.get() && foreground && repliesEnabled && !closed && !mode
+    private fun currentReply(ticket: Long) = ticket == replyEpoch.get() && foreground && repliesEnabled && !closed && engine.snapshot().contextReady && !mode
     private fun retireManualReply() {
         replyEpoch.incrementAndGet()
         manualRequest = null

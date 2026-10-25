@@ -35,7 +35,7 @@ describe('prompt terminal presentation and speech', () => {
       if (command === 'get_wake_clip_settings') return { enabled: false, directory: '/tmp/synthetic-clips' }
       if (command === 'list_wake_clips') return []
       if (command === 'list_audio_input_devices') return []
-      if (['record_frontend_runtime_diagnostic', 'write_runtime_log', 'check_for_update'].includes(command)) return null
+      if (['record_frontend_runtime_diagnostic', 'check_for_update'].includes(command)) return null
       unexpected.push(command)
       throw new Error(`Unexpected fixture command: ${command}`)
     })
@@ -65,7 +65,7 @@ describe('prompt terminal presentation and speech', () => {
         expect(invoke.mock.calls.filter(([command]) => command === 'cancel_prompt')).toHaveLength(1)
       }
       transcript = [canonicalTurn('1', '2', 'Synthetic pending question', 'Synthetic completed answer.', requestId)]
-      await act(async () => { finish({ request_id: requestId, outcome: 'completed', runtime_phase: 'sleeping' }) })
+      await act(async () => { finish({ kind: 'completed', save_disposition: 'saved', turn: transcript[0] }) })
       expect(container.querySelector('.answer-stage__answer')?.textContent).toBe('Synthetic completed answer.')
       expect(container.querySelector('.message__thinking')).toBeNull()
       expect(observe(window, document)).toEqual({ admitted: true, request: requestId, outcome: 'completed', stage: 'completed', kind: 'text', runtimeStatus: 'sleeping', nonblank: true })
@@ -105,7 +105,7 @@ describe('prompt terminal presentation and speech', () => {
       if (command === 'get_wake_clip_settings') return { enabled: false, directory: '/tmp/synthetic-clips' }
       if (command === 'list_wake_clips') return []
       if (command === 'list_audio_input_devices') return []
-      if (['record_frontend_runtime_diagnostic', 'write_runtime_log', 'check_for_update'].includes(command)) return null
+      if (['record_frontend_runtime_diagnostic', 'check_for_update'].includes(command)) return null
       throw new Error(`Unexpected fixture command: ${command}`)
     })
     window.__TAURI_INTERNALS__ = { invoke, createChannel: <T,>(send: (value: T) => void) => ({ send }) }
@@ -133,7 +133,7 @@ describe('prompt terminal presentation and speech', () => {
       expect(invoke.mock.calls.filter(([command]) => command === 'speak_local_tts')).toEqual([])
 
       transcript = [canonicalTurn('1', '2', 'Synthetic streaming question', 'First paragraph spoken lead.\n\nSecond paragraph detailed context.', requestId)]
-      await act(async () => { finish({ request_id: requestId, outcome: 'completed', runtime_phase: 'sleeping' }) })
+      await act(async () => { finish({ kind: 'completed', save_disposition: 'saved', turn: transcript[0] }) })
       expect(invoke.mock.calls.filter(([command]) => command === 'speak_local_tts')).toEqual([])
     } finally {
       await act(async () => { root.unmount() }); container.remove()

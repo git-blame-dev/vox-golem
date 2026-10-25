@@ -2,6 +2,7 @@ package dev.gitblame.voxgolem.assistant.replication
 
 import android.content.Context
 import android.content.ContextWrapper
+import android.content.pm.PackageManager
 import dev.gitblame.voxgolem.assistant.AssistantDomainNative
 import dev.gitblame.voxgolem.assistant.AssistantStore
 import dev.gitblame.voxgolem.assistant.AssistantStoreRunner
@@ -12,7 +13,9 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import org.junit.runner.RunWith
 import org.robolectric.RuntimeEnvironment
+import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import java.io.EOFException
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.Executors
@@ -23,53 +26,120 @@ import java.util.concurrent.TimeUnit
 class ReplicationCleanupRecoveryTest {
     @get:Rule val folder = TemporaryFolder()
 
-    @Test fun runtimeRetryDrainsFullCleanupBacklogAfterSdkRecoveryThenEnrollsWithoutDeletingHistory() {
+    @Test fun connectedSessionRevocationAndReEnrollmentConvergeCleanlyWithoutStaleSessionState() {
         assertNotNull("The focused Gradle task supplies the actual host JNI library", System.getProperty("assistant.native.library"))
-        val root = folder.newFolder("synthetic-cleanup-recovery")
-        val mailbox = FakeGmsMailbox(folder.root)
-        val localSdk = mailbox.sdk("synthetic-recovery-phone")
-        val remoteSdk = mailbox.sdk("synthetic-recovery-watch")
-        fun transport() = GmsReplicationTransport(localSdk, budget())
-        val context = object : ContextWrapper(RuntimeEnvironment.getApplication()), AssistantPeerSetupOwner {
-            override fun getApplicationContext(): Context = this
-            override fun getNoBackupFilesDir(): File = root
-            override val assistantPeerSetup = AssistantPeerSetup(this, { AssistantStore(this).use { it.replica() } }, ::transport)
-        }
-        val peerReplica = UUID(0, 901).toString()
+        val gateway = DomainGateway(AssistantDomainNative::apply)
+        val phoneContext = isolated("synthetic-revocation-phone", watch = false)
+        val watchContext = isolated("synthetic-revocation-watch", watch = true)
         val worker = Executors.newSingleThreadExecutor()
         try {
             worker.submit {
-                val io = transport()
-                GmsReplicationTransport(remoteSdk, budget()).publishIdentity(peerReplica, AssistantPeerRole.WATCH)
-                AssistantStore(context, DomainGateway(AssistantDomainNative::apply)).use { history ->
-                    history.createConversation("Synthetic history survives cleanup")
-                    val before = history.snapshot().toString()
-                    val localReplica = history.allocateId().getString("replica")
-                    val retiredPeers = (0 until ReplicationWire.MAX_PEERS).map { UUID(0, 1000L + it).toString() }
-                    EnrolledPeerRegistry(context).use { registry ->
-                        for (retired in retiredPeers) {
-                            registry.enroll(retired)
-                            registry.revoke(retired)
-                            io.publish(ReplicationWire.path(localReplica, retired, "hint"), "{}".toByteArray(), emptyMap())
+                AssistantStore(phoneContext, gateway).use { phoneStore ->
+                    AssistantStore(watchContext, gateway).use { watchStore ->
+                        val phoneReplica = phoneStore.replica()
+                        val watchReplica = watchStore.replica()
+                        phoneStore.createConversation("Synthetic conversation before mid-sync revocation")
+
+                        val phoneRegistry = EnrolledPeerRegistry(phoneContext)
+                        val watchRegistry = EnrolledPeerRegistry(watchContext)
+                        val phoneState = DurableReplicationState(phoneContext)
+                        val watchState = DurableReplicationState(watchContext)
+                        try {
+                            // Repeated offline revocation and re-enrollment across > MAX_PEERS never blocks enrollment.
+                            for (idx in 1..10) {
+                                val retired = UUID(0, 1000L + idx).toString()
+                                phoneRegistry.enroll(retired)
+                                phoneRegistry.revoke(retired)
+                            }
+                            phoneRegistry.enroll(watchReplica)
+                            watchRegistry.enroll(phoneReplica)
+                            assertEquals(setOf(watchReplica), phoneState.enrolledReplicas())
+                            assertEquals(setOf(phoneReplica), watchState.enrolledReplicas())
+
+                            var dropOnRecordRequest = true
+                            lateinit var watchController: ReplicationController
+                            val phoneController = ReplicationController(
+                                NativeReplicationStore(phoneStore),
+                                NativeReplicationDomain(gateway),
+                                phoneState,
+                                object : ReplicationTransport {
+                                    override fun reachable() = listOf(PeerNode("synthetic-watch-node", "Synthetic watch"))
+                                    override fun openSession(nodeId: String, session: String): ReplicationSessionConnection {
+                                        val pipe = InMemorySessionPipe(
+                                            session = session,
+                                            onFrame = { _, frame ->
+                                                if (dropOnRecordRequest && frame.getString("kind") == "record_request") {
+                                                    dropOnRecordRequest = false
+                                                    // Revoke peer mid-sync and abort the connected session.
+                                                    phoneRegistry.revoke(watchReplica)
+                                                    throw EOFException("Synthetic mid-session revocation")
+                                                }
+                                            },
+                                        )
+                                        val responderConn = pipe.endpoint("synthetic-watch-node", "synthetic-phone-node")
+                                        val responderThread = Thread {
+                                            watchController.accept(responderConn)
+                                        }.apply { isDaemon = true; start() }
+                                        return pipe.endpoint("synthetic-phone-node", "synthetic-watch-node") {
+                                            responderThread.join(5_000)
+                                        }
+                                    }
+                                },
+                                { node -> if (node == "synthetic-watch-node") watchReplica else null },
+                                role = AssistantPeerRole.PHONE,
+                            )
+                            watchController = ReplicationController(
+                                NativeReplicationStore(watchStore),
+                                NativeReplicationDomain(gateway),
+                                watchState,
+                                object : ReplicationTransport {
+                                    override fun reachable() = listOf(PeerNode("synthetic-phone-node", "Synthetic phone"))
+                                },
+                                { node -> if (node == "synthetic-phone-node") phoneReplica else null },
+                                role = AssistantPeerRole.WATCH,
+                            )
+
+                            // 1. Mid-session revocation aborts sync without importing or acknowledging.
+                            assertFalse(phoneController.reconcile())
+                            assertTrue(phoneState.enrolledReplicas().isEmpty())
+                            assertEquals(0, watchStore.snapshot().getJSONArray("records").length())
+                            assertEquals(1, phoneStore.publications(watchReplica).length())
+
+                            // 2. While revoked, reconcile does nothing.
+                            assertTrue(phoneController.reconcile())
+                            assertEquals(0, watchStore.snapshot().getJSONArray("records").length())
+
+                            // 3. Re-enrolling the peer reconciles cleanly over a fresh connected session.
+                            watchStore.createConversation("Synthetic watch conversation after re-enrollment")
+                            phoneRegistry.enroll(watchReplica)
+                            assertEquals(setOf(watchReplica), phoneState.enrolledReplicas())
+                            assertTrue(phoneController.reconcile())
+                            assertEquals(2, phoneStore.snapshot().getJSONArray("records").length())
+                            assertEquals(2, watchStore.snapshot().getJSONArray("records").length())
+                            assertEquals(0, phoneStore.publications(watchReplica).length())
+                            assertEquals(0, watchStore.publications(phoneReplica).length())
+                        } finally {
+                            phoneState.close()
+                            watchState.close()
+                            phoneRegistry.close()
+                            watchRegistry.close()
                         }
                     }
-                    val owner = AssistantReplication.Owner(context, PeerAssociationProvider(context.assistantPeerSetup::replicaForNode), ::transport, { true })
-                    assertEquals(ReplicationWire.MAX_PEERS, owner.state.cleanupReplicas().size)
-                    localSdk.deleteError = IllegalStateException("Synthetic SDK deletion unavailable")
-                    owner.submit { owner.reconcileBlocking() }!!.get(30, TimeUnit.SECONDS)
-                    assertEquals(ReplicationWire.MAX_PEERS, owner.state.cleanupReplicas().size)
-                    assertTrue(owner.state.enrolledReplicas().isEmpty())
-                    localSdk.deleteError = null
-                    owner.submit { owner.reconcileBlocking() }!!.get(30, TimeUnit.SECONDS)
-                    assertTrue("Runtime retries must drain cleanup even before peer setup succeeds", owner.state.cleanupReplicas().isEmpty())
-                    assertEquals(setOf(peerReplica), owner.state.enrolledReplicas())
-                    assertEquals(PeerPairingReason.ENROLLED, context.assistantPeerSetup.state().reason)
-                    assertEquals(before, history.snapshot().toString())
-                    assertTrue(mailbox.slots.keys.none { uri -> retiredPeers.any { uri.path!!.startsWith("${ReplicationWire.PREFIX}$localReplica/$it/") } })
                 }
-            }.get(90, TimeUnit.SECONDS)
-        } finally { worker.shutdownNow() }
+            }.get(60, TimeUnit.SECONDS)
+        } finally {
+            worker.shutdownNow()
+        }
     }
 
-    private fun budget() = BoundedGmsWait(System.nanoTime() + TimeUnit.SECONDS.toNanos(30))
+    private fun isolated(name: String, watch: Boolean): Context {
+        val root = folder.newFolder(name)
+        return object : ContextWrapper(RuntimeEnvironment.getApplication()) {
+            init {
+                shadowOf(packageManager).setSystemFeature(PackageManager.FEATURE_WATCH, watch)
+            }
+            override fun getApplicationContext(): Context = this
+            override fun getNoBackupFilesDir(): File = root
+        }
+    }
 }

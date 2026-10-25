@@ -21,12 +21,23 @@ Desktop and phone share the responsive React UI. Wear uses native Kotlin/Compose
 
 Linux builds and tests do not establish Windows, Android or Wear runtime readiness. Real microphone, speech provider, gestures, lifecycle, GMS transport and optimized JNI paths require device acceptance.
 
+## Desktop local diagnostics
+
+`[telemetry].enabled` controls categorical model metadata; `[logging].enabled` controls categorical frontend/TTS events. Neither accepts prompt/answer/error text, paths, endpoints or request IDs. Model identifiers come from a closed public vocabulary. These desktop settings do not change Android/Wear diagnostics.
+
+The single background writer stores **schema 2 JSONL** in the state directory's `diagnostics/`: Linux `${XDG_STATE_HOME:-$HOME/.local/state}/voxgolem/diagnostics/`, Windows `%LOCALAPPDATA%/VoxGolem/diagnostics/`. Read `events-000.jsonl` through the configured final slot. `timestamp_ms` is the native observation time captured at nonblocking admission; `persisted_ms` is the separate writer wall-clock observation, not a duration or durability receipt. Numeric `process_id` and process-local `event_sequence` help correlate a run; the persisted `rotation_sequence` orders file eviction even when timestamps tie or the process restarts. These are not globally unique durable IDs. Each row contains only a categorical `record`. The empty `writer.lock` sidecar is stable and must not be removed while an app is running. Only one process writes this directory; another process reports an unavailable writer without interrupting chat. Unix directories/files use owner-only permissions.
+
+Both streams share `[telemetry].max_bytes` per file and `backup_count + 1` file slots (so the example caps JSONL storage at 40 MiB across four files, plus one empty lock file). Files roll at observation UTC-day boundaries or the size limit. Maximum retention is 90 days, conservatively measured from the observation day's start, not file modification time; startup, pre-write and at-most-60-second periodic maintenance prune expired files while a writer is running. An already-expired or future-dated queued observation is discarded visibly rather than given a fresh timestamp. Files can therefore expire up to one day early, and byte/file budgets may evict them sooner. No process can perform maintenance while the app is stopped; expired files are pruned on the next successful writer startup. Legacy `telemetry.jsonl*` and `logs/runtime.log` are neither read, migrated nor managed by this owner.
+
+Admission uses a bounded 128-record nonblocking queue. The existing `record_frontend_runtime_diagnostic` command accepts only `{event: {kind: <fixed category>}}`, rejecting extra envelope/event fields, and returns atomic counters: `enabled`, `admitted`, `dropped`, `written`, `failures`, `unavailable`, `stopping`, `stopped`. These observations remain available if disk I/O blocks; they are not a transactional snapshot. Queue overflow, unavailable storage, expiry and shutdown can drop records. `written` means a complete write call, **not fsync or durable storage**. Shutdown requests a bounded drain and waits at most 250 ms in the existing async cleanup. A blocked worker remains truthfully `stopped: false`, but optional diagnostics cannot veto completed essential native cleanup or updater eligibility. With both streams disabled there is no diagnostics thread or filesystem access. No diagnostic data is exported automatically.
+
 ## Android and Wear builds
 
 Run from this source checkout on Linux. Use JDK 21, Android SDK platform/build tools 36, NDK 28.2.13676358 and Tauri CLI 2.11.1. Set `JAVA_HOME`, `ANDROID_HOME`, and `NDK_HOME`; put the JDK's `bin` on `PATH`. Rust targets are `aarch64-linux-android` for the phone and `armv7-linux-androideabi` for the current Wear APK. JNI builds use cached Cargo dependencies (`--offline --locked`).
 
 ```bash
 make android-build           # ARM64 phone debug APK, including both native plugins
+make android-release         # optimized ARM64 phone release APK; unsigned without local signing config
 make android-assistant-test  # shared Assistant + phone bridge unit tests and lint
 make android-capture-test    # shared capture + phone plugin unit tests and lint
 make wear-test               # shared libraries + Wear unit tests and lint
@@ -35,6 +46,8 @@ make wear-performance        # optimized, non-debuggable, debug-signed local tri
 ```
 
 Phone output: `apps/android-tauri/src-tauri/gen/android/app/build/outputs/apk/universal/debug/`. Wear outputs: `apps/wear/app/build/outputs/apk/{debug,performance}/`. An optimized local trial is not a production-signed release. These commands build/check source; they do not install anything.
+
+Phone release output is `apps/android-tauri/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk` with the current unsigned release configuration. `android-release` uses Tauri's default release mode (optimized Rust and R8, no debug profile override). Linux CI retains the debug checks and additionally publishes `vox-golem-android-optimized-ci-arm64-debug-key`: an aligned, non-debuggable ARM64 release APK signed with that job's existing Android debug key, plus R8 mapping, signature/inspection evidence and APK SHA-256. This is a **CI trial, not production signing**, and its certificate is not guaranteed compatible with installed phone/Watch apps. It does not change local signing configuration or authorize installation. See the [phone build guide](apps/android-tauri/README.md#optimized-release-and-ci-trial) for checks and remaining device acceptance.
 
 `make android-init` is the only phone scaffold-regeneration command. Keep authored configuration, native libraries and UI sources outside generated output; launcher assets derive from the canonical [SVG](apps/desktop-tauri/src-tauri/icons/icon.svg). The [phone shell guide](apps/android-tauri/README.md) covers native setup, and the [Wear guide](apps/wear/README.md) covers launchers and device gates.
 

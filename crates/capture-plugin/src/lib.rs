@@ -132,11 +132,23 @@ async fn finalize_capture<R: Runtime>(
 async fn update_transcript<R: Runtime>(
     app: tauri::AppHandle<R>,
     request: tauri::ipc::Request<'_>,
-) -> Result<(), CaptureError> {
-    let arguments = transcript_arguments(request.body())?;
-    run_command(app, "update_transcript", arguments)
-        .await
-        .map(|_| ())
+) -> Result<serde_json::Value, CaptureError> {
+    dispatch_transcript_update(request.body(), |arguments| {
+        run_command(app, "update_transcript", arguments)
+    })
+    .await
+}
+
+async fn dispatch_transcript_update<F, Fut>(
+    body: &tauri::ipc::InvokeBody,
+    native: F,
+) -> Result<serde_json::Value, CaptureError>
+where
+    F: FnOnce(serde_json::Value) -> Fut,
+    Fut: std::future::Future<Output = Result<serde_json::Value, CaptureError>>,
+{
+    let arguments = transcript_arguments(body)?;
+    native(arguments).await
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -210,6 +222,62 @@ mod transcript_bridge_tests {
     use serde_json::json;
 
     const ID: &str = "123e4567-e89b-42d3-a456-426614174094";
+
+    #[test]
+    fn command_composition_returns_committed_record_without_discarding_version() {
+        let body = tauri::ipc::InvokeBody::Json(json!({
+            "captureId": ID, "text": "Synthetic committed correction", "expectedVersion": 4
+        }));
+        let committed = json!({
+            "captureId": ID, "finalText": "Synthetic committed correction", "transcriptVersion": 5
+        });
+        let result = tauri::async_runtime::block_on(dispatch_transcript_update(&body, |arguments| {
+            assert_eq!(arguments, json!({
+                "captureId": ID, "text": "Synthetic committed correction", "expectedVersion": 4
+            }));
+            std::future::ready(Ok(committed.clone()))
+        }))
+        .unwrap();
+        assert_eq!(serde_json::to_value(result).unwrap(), committed);
+    }
+
+    #[test]
+    fn command_composition_does_not_call_native_for_invalid_arguments() {
+        let invalid = [
+            tauri::ipc::InvokeBody::Raw(vec![1, 2, 3]),
+            tauri::ipc::InvokeBody::Json(
+                json!({"captureId": ID, "text": "Synthetic correction", "expectedVersion": null}),
+            ),
+            tauri::ipc::InvokeBody::Json(
+                json!({"captureId": ID, "text": "Synthetic correction", "expectedVersion": -1}),
+            ),
+            tauri::ipc::InvokeBody::Json(json!({"captureId": ID, "expectedVersion": 4})),
+        ];
+        for body in invalid {
+            let called = std::cell::Cell::new(false);
+            let error = tauri::async_runtime::block_on(dispatch_transcript_update(&body, |_| {
+                called.set(true);
+                std::future::ready(Ok(json!({})))
+            }))
+            .unwrap_err();
+            assert!(!called.get());
+            assert_eq!(error.message, "transcript-update-unavailable");
+        }
+    }
+
+    #[test]
+    fn command_composition_preserves_native_failure() {
+        let body = tauri::ipc::InvokeBody::Json(json!({
+            "captureId": ID, "text": "Synthetic rejected correction", "expectedVersion": 4
+        }));
+        let error = tauri::async_runtime::block_on(dispatch_transcript_update(&body, |_| {
+            std::future::ready(Err(CaptureError {
+                message: "transcript-conflict".to_owned(),
+            }))
+        }))
+        .unwrap_err();
+        assert_eq!(error.message, "transcript-conflict");
+    }
 
     #[test]
     fn actual_invoke_body_forwards_selected_version_and_preserves_legacy_omission() {

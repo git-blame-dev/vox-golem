@@ -278,6 +278,7 @@ function settleExecution(execution: BrowserPreviewExecution, response: string): 
   trimTranscript()
   execution.resolve({
     kind: execution.outcome,
+    save_disposition: 'saved',
     turn: clone(turn),
   })
 }
@@ -405,6 +406,7 @@ function snapshotPayload(): Record<string, unknown> {
     session_id: state.sessionId.toString(),
     runtime_phase: state.runtimePhase,
     transcript: state.transcript,
+    unsaved_result: null,
     active_request: active === null ? null : {
       execution_id: { session_id: active.sessionId, generation: active.generation },
       request_id: active.requestId,

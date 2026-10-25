@@ -40,16 +40,20 @@ internal class AgyLines(private val input: InputStream, private val maxLineBytes
 /** Retain the Process until exit is confirmed; destroy() alone is only a request. */
 internal fun retireAgyProcess(process: Process, budgetMs: Long = 1000): Boolean {
     if (!agyAlive(process)) return true
-    runCatching { process.outputStream.close() }
     // Bounded wait and forced retirement are supported Process APIs only from Android 26.
-    if (Build.VERSION.SDK_INT < 26) {
+    val retired = if (Build.VERSION.SDK_INT < 26) {
         process.destroy()
-        return !agyAlive(process)
+        !agyAlive(process)
+    } else {
+        // Single-use Agy CLI processes discard implicit history after every turn; terminate forcibly
+        // with SIGKILL so retirement does not stall 700-800ms on SIGTERM trajectory flush.
+        process.destroyForcibly()
+        process.waitFor(budgetMs, TimeUnit.MILLISECONDS)
     }
-    // Single-use Agy CLI processes discard implicit history after every turn; terminate forcibly
-    // with SIGKILL so retirement does not stall 700-800ms on SIGTERM trajectory flush.
-    process.destroyForcibly()
-    return process.waitFor(budgetMs, TimeUnit.MILLISECONDS)
+    // A blocked writer can hold stdin's close lock until the child exits. Never close before kill
+    // or after an unconfirmed wait: the retained process must remain available for another attempt.
+    if (retired) runCatching { process.outputStream.close() }
+    return retired
 }
 
 internal fun agyAlive(process: Process?): Boolean = process != null && try {

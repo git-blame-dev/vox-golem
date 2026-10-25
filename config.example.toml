@@ -41,9 +41,13 @@ max_duration_s = 300
 output_gain_db = 3
 
 [telemetry]
+# Categorical native model diagnostics. Both streams share one bounded writer.
 enabled = true
+# Shared diagnostics file size and backup-slot budget (also applies to logging).
+# Total JSONL bytes <= max_bytes * (backup_count + 1); max age 90 days.
 max_bytes = 10485760
 backup_count = 3
 
 [logging]
+# Categorical frontend/TTS diagnostics; never freeform text or raw errors.
 enabled = false

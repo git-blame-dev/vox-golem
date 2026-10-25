@@ -97,6 +97,8 @@ struct Generation {
     failure: Mutex<Option<String>>,
     retired: Mutex<bool>,
     retirement: Condvar,
+    #[cfg(test)]
+    after_join_notification: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     producer: Mutex<ProducerProgress>,
 }
 
@@ -124,10 +126,12 @@ struct Worker {
 
 impl Worker {
     fn is_finished(&self) -> bool {
-        self.handle
-            .as_ref()
-            .or(self.joiner.as_ref())
-            .is_some_and(JoinHandle::is_finished)
+        if let Some(handle) = &self.handle {
+            handle.is_finished()
+        } else {
+            self.joiner.as_ref().is_some_and(JoinHandle::is_finished)
+                && self.generation.retired.lock().is_ok_and(|done| *done)
+        }
     }
 
     fn join(self) {
@@ -353,6 +357,8 @@ impl DesktopVoiceRuntime {
             failure: Mutex::new(None),
             retired: Mutex::new(false),
             retirement: Condvar::new(),
+            #[cfg(test)]
+            after_join_notification: Mutex::new(None),
             producer: Mutex::new(ProducerProgress {
                 started_at: (self.inner.now)(),
                 last_arrival: None,
@@ -471,8 +477,8 @@ impl DesktopVoiceRuntime {
         Ok((Some(generation), closed))
     }
 
-    /// Wait after closing admission. A notification proves actual worker join,
-    /// not merely the end of its callback. Timeout leaves ownership tracked.
+    /// Wait after closing admission for actual worker join and replacement
+    /// readiness, including join-owner exit. Timeout leaves ownership tracked.
     pub fn wait_for_retirement(&self, timeout: Duration) -> bool {
         let generation = match self.inner.control.lock() {
             Ok(control) => control
@@ -490,6 +496,7 @@ impl DesktopVoiceRuntime {
         generation: &Arc<Generation>,
         timeout: Duration,
     ) -> bool {
+        let started = Instant::now();
         {
             let Ok(mut control) = self.inner.control.lock() else {
                 return false;
@@ -529,6 +536,12 @@ impl DesktopVoiceRuntime {
                                 *done = true;
                                 retired.retirement.notify_all();
                             }
+                            #[cfg(test)]
+                            if let Some(hook) =
+                                retired.after_join_notification.lock().unwrap().take()
+                            {
+                                hook();
+                            }
                         }
                     });
                 match joiner {
@@ -543,13 +556,48 @@ impl DesktopVoiceRuntime {
         let Ok(done) = generation.retired.lock() else {
             return false;
         };
-        let Ok((done, _)) = generation
-            .retirement
-            .wait_timeout_while(done, timeout, |done| !*done)
-        else {
+        let Ok((done, _)) = generation.retirement.wait_timeout_while(
+            done,
+            timeout.saturating_sub(started.elapsed()),
+            |done| !*done,
+        ) else {
             return false;
         };
-        *done
+        let joined = *done;
+        // start holds control before inspecting retired; never invert that order.
+        drop(done);
+        if !joined {
+            return false;
+        }
+        loop {
+            {
+                let Ok(mut control) = self.inner.control.lock() else {
+                    return false;
+                };
+                let Some(worker) = control.worker.as_ref() else {
+                    return true;
+                };
+                if !Arc::ptr_eq(&worker.generation, generation) {
+                    return true;
+                }
+                if worker.is_finished() {
+                    control
+                        .worker
+                        .take()
+                        .expect("finished worker checked")
+                        .join();
+                    return true;
+                }
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return false;
+            }
+            // The original worker is joined; only the join owner's short exit
+            // tail remains. Rust has no timed join, so yield without busy-waiting
+            // and retain the same bounded budget as the notification wait.
+            thread::sleep(remaining.min(Duration::from_millis(1)));
+        }
     }
 }
 
@@ -673,6 +721,67 @@ mod tests {
 
     fn ignore_failure() -> FailureCallback {
         Arc::new(|_, _| {})
+    }
+
+    #[test]
+    fn retirement_wait_requires_joiner_exit_before_replacement() {
+        let runtime = Arc::new(DesktopVoiceRuntime::new());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_worker_tx, release_worker_rx) = mpsc::channel();
+        let release_worker_rx = Mutex::new(release_worker_rx);
+        let ingress = runtime
+            .start(
+                1,
+                Arc::new(move |_| {
+                    entered_tx.send(()).unwrap();
+                    release_worker_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(TEST_TIMEOUT)
+                        .unwrap();
+                    Ok(())
+                }),
+                ignore_failure(),
+            )
+            .unwrap();
+        ingress.try_push(vec![0.0; 480]).unwrap();
+        entered_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+        let generation = Arc::clone(&ingress.generation);
+        let (tail_tx, tail_rx) = mpsc::channel();
+        let (release_tail_tx, release_tail_rx) = mpsc::channel();
+        *generation.after_join_notification.lock().unwrap() = Some(Box::new(move || {
+            tail_tx.send(()).unwrap();
+            let _ = release_tail_rx.recv_timeout(TEST_TIMEOUT);
+        }));
+        runtime.request_stop(Some(1)).unwrap();
+        assert!(!runtime.wait_for_retirement(Duration::ZERO));
+        release_worker_tx.send(()).unwrap();
+        tail_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+        assert!(*generation.retired.lock().unwrap());
+        assert!(
+            matches!(runtime.start(2, Arc::new(|_| Ok(())), ignore_failure()), Err(error) if error == PENDING_RETIREMENT)
+        );
+        let waiting = Arc::clone(&runtime);
+        let started = Instant::now();
+        let waiter = thread::spawn(move || waiting.wait_for_retirement(Duration::from_millis(50)));
+        let result = waiter.join().unwrap();
+        let elapsed = started.elapsed();
+        release_tail_tx.send(()).unwrap();
+        assert!(
+            !result,
+            "notification must not promise replacement readiness while the joiner is blocked"
+        );
+        assert!(
+            elapsed < TEST_TIMEOUT,
+            "retirement timeout must remain bounded"
+        );
+        assert!(runtime.wait_for_retirement(TEST_TIMEOUT));
+        assert!(runtime.inner.control.lock().unwrap().worker.is_none());
+        let _replacement = runtime
+            .start(2, Arc::new(|_| Ok(())), ignore_failure())
+            .unwrap();
+        assert!(runtime.wait_for_generation_retirement(&generation, Duration::ZERO));
+        assert_eq!(runtime.current_capture_id(), Some(2));
     }
 
     #[test]

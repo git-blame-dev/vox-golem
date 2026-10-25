@@ -205,16 +205,17 @@ internal class AndroidSuppliedAudioSession(
             }
             override fun onPartialResults(partialResults: Bundle?) { callback {
                 if (pendingFinal != null) return@callback
-                hypothesis = join(completed, text(partialResults)); events?.partial(hypothesis)
+                val draft = boundedJoin(completed, text(partialResults)) ?: return@callback
+                hypothesis = draft; events?.partial(hypothesis)
             } }
             override fun segment(segmentResults: Bundle?) { callback {
                 if (pendingFinal != null) return@callback
-                completed = join(completed, text(segmentResults)); hypothesis = completed; events?.partial(completed)
+                val draft = boundedJoin(completed, text(segmentResults)) ?: return@callback
+                completed = draft; hypothesis = completed; events?.partial(completed)
             } }
             override fun segmentedEnd() { callback { final(completed) } }
             override fun onResults(results: Bundle?) { callback {
-                val result = text(results)
-                final(if (result.isBlank()) completed else result)
+                final(text(results))
             } }
         })
     }
@@ -272,12 +273,15 @@ internal class AndroidSuppliedAudioSession(
     private fun fail(code: String) { clearPending(); terminal = true; events?.error(code) }
     private fun final(value: String) {
         // One atomic pipe-state snapshot avoids racing separate closing/closed flag reads.
-        when (pipe.eofState) {
+        val eof = pipe.eofState
+        if (eof == InputEofState.FAILED) { fail("audio_pipe_failed"); return }
+        if (!withinTextBudget(value)) { fail("transcript_limit"); return }
+        val candidate = if (value.isBlank()) completed else value
+        when (eof) {
             InputEofState.OPEN -> {
                 if (mode != SuppliedAudioMode.UTTERANCE) { fail("provider_ended_before_source"); return }
                 if (pendingFinal != null) return
-                if (value.toByteArray(Charsets.UTF_8).size > VoiceAudioContract.MAX_TEXT_BYTES) { fail("transcript_limit"); return }
-                pendingFinal = value
+                pendingFinal = candidate
                 events?.endOfSpeech()
                 pendingTimeout = Runnable { if (!closed && !terminal && pendingFinal != null) fail("source_eof_timeout") }
                     .also { main.postDelayed(it, 3_000) }
@@ -286,8 +290,7 @@ internal class AndroidSuppliedAudioSession(
             InputEofState.FAILED -> { fail("audio_pipe_failed"); return }
             InputEofState.CLOSING -> {
                 if (pendingFinal != null) return
-                if (value.toByteArray(Charsets.UTF_8).size > VoiceAudioContract.MAX_TEXT_BYTES) { fail("transcript_limit"); return }
-                pendingFinal = value
+                pendingFinal = candidate
                 pendingTimeout = Runnable {
                     if (!closed && !terminal && pendingFinal != null) fail("source_eof_timeout")
                 }.also { main.postDelayed(it, 250) }
@@ -295,11 +298,22 @@ internal class AndroidSuppliedAudioSession(
             }
             InputEofState.CLOSED -> Unit
         }
-        val finalValue = pendingFinal ?: value
+        val finalValue = pendingFinal ?: candidate
         if (finalValue.isBlank()) { fail("recognition_empty_final"); return }
         clearPending(); terminal = true; events?.final(finalValue)
     }
-    private fun join(left: String, right: String) = listOf(left, right).filter(String::isNotBlank).joinToString(" ")
+    // The UTF-16 precheck bounds the temporary UTF-8 allocation even for hostile SDK results.
+    private fun withinTextBudget(value: String) = value.length <= VoiceAudioContract.MAX_TEXT_BYTES &&
+        value.toByteArray(Charsets.UTF_8).size <= VoiceAudioContract.MAX_TEXT_BYTES
+    private fun boundedJoin(left: String, right: String): String? {
+        if (!withinTextBudget(right)) { fail("transcript_limit"); return null }
+        if (right.isBlank()) return left
+        if (left.isBlank()) return right
+        if (left.toByteArray(Charsets.UTF_8).size + 1 + right.toByteArray(Charsets.UTF_8).size > VoiceAudioContract.MAX_TEXT_BYTES) {
+            fail("transcript_limit"); return null
+        }
+        return "$left $right"
+    }
     private fun text(bundle: Bundle?) = bundle?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull().orEmpty()
 }
 

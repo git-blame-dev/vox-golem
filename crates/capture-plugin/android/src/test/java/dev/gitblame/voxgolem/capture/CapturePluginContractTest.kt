@@ -82,6 +82,10 @@ class CapturePluginContractTest {
         assertEquals(corrected.finalText, corrected.previewText)
         assertEquals(RecognitionState.FINAL, corrected.recognitionState)
         assertEquals(4L, corrected.transcriptVersion)
+        val acknowledged = JSONObject(responses.single().second)
+        assertEquals(corrected.captureId, acknowledged.getString("captureId"))
+        assertEquals(corrected.finalText, acknowledged.getString("finalText"))
+        assertEquals(corrected.transcriptVersion, acknowledged.getLong("transcriptVersion"))
         assertEquals(OrgState.READY, corrected.orgState)
         responses.clear()
         plugin.update_transcript(invoke("update_transcript", JSONObject().put("captureId", original.captureId)
@@ -92,6 +96,8 @@ class CapturePluginContractTest {
         assertEquals("", empty.previewText)
         assertEquals(RecognitionState.NO_SPEECH, empty.recognitionState)
         assertEquals(5L, empty.transcriptVersion)
+        assertEquals("", JSONObject(responses.single().second).getString("finalText"))
+        assertEquals(empty.transcriptVersion, JSONObject(responses.single().second).getLong("transcriptVersion"))
         assertEquals(OrgState.WAITING_FOR_TRANSCRIPT, empty.orgState)
     }
 

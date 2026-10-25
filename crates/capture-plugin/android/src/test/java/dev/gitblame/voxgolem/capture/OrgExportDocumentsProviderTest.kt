@@ -2,13 +2,10 @@ package dev.gitblame.voxgolem.capture
 
 import android.content.Context
 import android.content.ContentValues
-import android.content.ContentResolver
 import android.database.Cursor
 import android.database.MatrixCursor
 import android.database.sqlite.SQLiteDatabase
 import android.os.CancellationSignal
-import android.os.Bundle
-import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.provider.DocumentsProvider
@@ -26,9 +23,6 @@ import org.json.JSONObject
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
-import org.robolectric.annotation.Implementation
-import org.robolectric.annotation.Implements
-import org.robolectric.annotation.RealObject
 import org.robolectric.shadows.ShadowContentResolver
 import java.io.File
 import java.security.MessageDigest
@@ -70,6 +64,359 @@ class OrgExportDocumentsProviderTest {
     @After
     fun tearDown() {
         ShadowContentResolver.reset()
+    }
+
+    @Test
+    fun syntheticProviderHonorsGrantedTreeDocumentAccessWithoutCoordinator() {
+        provider.addExistingDocument("ai-inbox.org", "Synthetic provider contract".toByteArray())
+        val target = DocumentsContract.buildDocumentUriUsingTree(treeUri, provider.inboxDocuments().single().id)
+        context.contentResolver.query(target, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)!!.use {
+            assertTrue(it.moveToFirst())
+            assertEquals("ai-inbox.org", it.getString(0))
+        }
+        assertEquals("Synthetic provider contract", context.contentResolver.openInputStream(target)!!.bufferedReader().use { it.readText() })
+    }
+
+    @Test
+    fun currentJournalCannotReadWriteOrAcknowledgeTargetsOutsideSelectedInbox() {
+        val original = "* Synthetic outside note\n".toByteArray()
+        provider.addExistingDocument("ai-inbox.org", original)
+        provider.hideChildren = true
+        val targetId = provider.allDocuments().single().id
+        val otherProvider = SyntheticDocumentsProvider(context.cacheDir).apply {
+            addExistingDocument("ai-inbox.org", original)
+        }
+        otherProvider.attachInfo(context, android.content.pm.ProviderInfo().apply {
+            authority = "synthetic.other.provider"
+            exported = true
+            grantUriPermissions = true
+            readPermission = "android.permission.MANAGE_DOCUMENTS"
+            writePermission = "android.permission.MANAGE_DOCUMENTS"
+        })
+        ShadowContentResolver.registerProviderInternal("synthetic.other.provider", otherProvider)
+        val otherTree = DocumentsContract.buildTreeDocumentUri(authority, "synthetic-other-root")
+        val otherProviderTree = DocumentsContract.buildTreeDocumentUri("synthetic.other.provider", SyntheticDocumentsProvider.ROOT_ID)
+        val targets = listOf(
+            DocumentsContract.buildDocumentUriUsingTree(otherTree, targetId),
+            DocumentsContract.buildDocumentUriUsingTree(otherProviderTree, targetId),
+            DocumentsContract.buildDocumentUri(authority, targetId),
+            DocumentsContract.buildDocumentUriUsingTree(treeUri, targetId),
+            android.net.Uri.parse("file:///synthetic/ai-inbox.org"),
+        )
+        for (target in targets) for (postimage in listOf(false, true)) {
+            val id = saveCapture("synthetic outside recovery", "2026-10-03")
+            writeJournal(id, targetId, original, "WRITING", targetWasAbsent = false)
+            val journal = readJournal(id).put("targetUri", target.toString())
+            storeJournal(id, journal)
+            val bytes = if (postimage) File(journal.getString("postimage")).readBytes() else original
+            provider.replaceBytes(targetId, bytes)
+            otherProvider.replaceBytes(targetId, bytes)
+            val queries = provider.documentQueryCount
+            val otherQueries = otherProvider.documentQueryCount
+            assertRecoveryHeld(id)
+            assertEquals(queries, provider.documentQueryCount)
+            assertEquals(otherQueries, otherProvider.documentQueryCount)
+            assertEquals(0, otherProvider.writeCount)
+            assertTrue(otherProvider.bytesAtRename.isEmpty())
+            assertArrayEquals(bytes, otherProvider.bytes(targetId))
+        }
+    }
+
+    @Test
+    fun committedResidualJournalsAreRetiredAtNewAdmissionAcrossCrashBoundaries() {
+        for (deletedStages in 0..3) {
+            val first = saveCapture("synthetic committed owner $deletedStages", "2026-10-03")
+            val existing = provider.inboxDocuments().singleOrNull()
+            val original = existing?.let { provider.bytes(it.id) } ?: byteArrayOf()
+            if (existing == null) provider.addExistingDocument("ai-inbox.org", original)
+            val targetId = provider.inboxDocuments().single().id
+            writeJournal(first, targetId, original, "WRITING", targetWasAbsent = false)
+            val journal = readJournal(first)
+            val stages = listOf("preimage", "postimage", "entry").map { File(journal.getString(it)) }
+            provider.replaceBytes(targetId, stages[1].readBytes())
+            val destinationId = checkNotNull(SafNotesStore(context).selected()).id
+            repository.update(first) { it.copy(orgState = OrgState.EXPORTED, exportDestinationId = destinationId, exportTranscriptVersion = it.transcriptVersion) }
+            val corrected = repository.correctTranscript(first, "synthetic corrected after export $deletedStages", expectedVersion = 1)
+            assertEquals(OrgState.EXPORTED, corrected.orgState)
+            assertEquals(2L, corrected.transcriptVersion)
+            assertEquals(1L, corrected.exportTranscriptVersion)
+            stages.take(deletedStages).forEach { assertTrue(it.delete()) }
+            val before = provider.onlyInboxBytes()
+            val second = saveCapture("synthetic admitted after crash $deletedStages", "2026-10-04")
+
+            assertEquals(OrgState.EXPORTED, coordinator().process(second).state)
+            assertEquals(0, journalCount(first))
+            stages.forEach { assertFalse(it.exists()) }
+            assertArrayEquals(OrgExport.prepend(OrgExport.formatEntry("synthetic admitted after crash $deletedStages", "2026-10-04"), before), provider.onlyInboxBytes())
+            assertEquals(1, countOccurrences(String(provider.onlyInboxBytes()), "* TODO synthetic committed owner $deletedStages\n"))
+            assertFalse(String(provider.onlyInboxBytes()).contains("synthetic corrected after export"))
+        }
+    }
+
+    @Test
+    fun committedCleanupUsesOnlyDerivedPrivatePathsAndNeedsNoProviderReadOrStages() {
+        val (id, _) = prepareCommittedJournal()
+        val journal = readJournal(id)
+        val stages = listOf("preimage", "postimage", "entry").map { File(journal.getString(it)) }
+        val outside = File(context.cacheDir, "synthetic-org-not-a-stage-${UUID.randomUUID()}").apply {
+            writeBytes("Synthetic unrelated file".toByteArray())
+        }
+        for (field in listOf("preimage", "postimage", "entry")) journal.put(field, outside.absolutePath)
+        storeJournal(id, journal)
+        markCommitted(id)
+        repository.correctTranscript(id, "synthetic corrected but not reexported", expectedVersion = 1)
+        stages.forEach { assertTrue(it.delete()) }
+        provider.hideChildren = true
+        provider.failReads = true
+        val before = provider.onlyInboxBytes()
+        val queries = provider.documentQueryCount
+
+        assertEquals(OrgState.EXPORTED, coordinator().process(id).state)
+        assertEquals(0, journalCount(id))
+        stages.forEach { assertFalse(it.exists()) }
+        assertEquals("Synthetic unrelated file", outside.readText())
+        assertArrayEquals(before, provider.onlyInboxBytes())
+        assertEquals(queries, provider.documentQueryCount)
+        assertEquals(0, provider.writeCount)
+        assertTrue(provider.bytesAtRename.isEmpty())
+    }
+
+    @Test
+    fun committedCleanupDoesNotFollowPrivateStageSymlinks() {
+        val (id, _) = prepareCommittedJournal()
+        markCommitted(id)
+        val stage = File(readJournal(id).getString("postimage"))
+        val outside = File(context.cacheDir, "synthetic-org-cleanup-outside-${UUID.randomUUID()}").apply {
+            writeBytes(stage.readBytes())
+        }
+        val outsideBytes = outside.readBytes()
+        assertTrue(stage.delete())
+        java.nio.file.Files.createSymbolicLink(stage.toPath(), outside.toPath())
+        val journalBefore = readJournal(id).toString()
+        val second = saveCapture("synthetic blocked unsafe cleanup", "2026-10-04")
+
+        assertEquals(OrgState.NEEDS_REVIEW, coordinator().process(second).state)
+        assertEquals(journalBefore, readJournal(id).toString())
+        assertTrue(java.nio.file.Files.isSymbolicLink(stage.toPath()))
+        assertArrayEquals(outsideBytes, outside.readBytes())
+        assertEquals(0, journalCount(second))
+        assertFalse(recoveryDirectory(second).exists())
+        assertEquals(0, provider.writeCount)
+    }
+
+    @Test
+    fun residualJournalRetirementRequiresExactDurableOwnerIdentityAndVersion() {
+        val changes: List<(String, JSONObject) -> Unit> = listOf(
+            { id, _ -> repository.update(id) { it.copy(orgState = OrgState.NEEDS_REVIEW) } },
+            { id, _ -> repository.update(id) { it.copy(exportDestinationId = "synthetic-other-destination") } },
+            { id, _ -> repository.update(id) { it.copy(exportTranscriptVersion = 2) } },
+            { id, _ -> repository.update(id) { it.copy(transcriptVersion = 0) } },
+            { id, journal -> storeJournal(id, journal.put("captureId", "synthetic-other-owner")) },
+            { id, journal -> storeJournal(id, journal.put("destinationId", "synthetic-other-destination")) },
+            { id, journal -> storeJournal(id, journal.put("targetName", "inbox.org")) },
+            { id, journal -> storeJournal(id, journal.also { it.remove("postHash") }) },
+        )
+        for (change in changes) {
+            val (id, _) = prepareCommittedJournal()
+            markCommitted(id)
+            change(id, readJournal(id))
+            val journalBefore = readJournal(id).toString()
+            val stages = listOf("preimage.bin", "postimage.bin", "entry.bin").map { File(recoveryDirectory(id), it) }
+            val stageBytes = stages.map { it.readBytes().toList() }
+            val before = provider.allDocuments().associate { it.id to provider.bytes(it.id).toList() }
+            val second = saveCapture("synthetic blocked unproven commit", "2026-10-04")
+            repeat(2) { assertEquals(OrgState.NEEDS_REVIEW, coordinator().process(second).state) }
+            assertEquals(journalBefore, readJournal(id).toString())
+            assertEquals(stageBytes, stages.map { it.readBytes().toList() })
+            assertEquals(before, provider.allDocuments().associate { it.id to provider.bytes(it.id).toList() })
+            assertEquals(0, journalCount(second))
+            assertFalse(recoveryDirectory(second).exists())
+            assertEquals(0, provider.writeCount)
+        }
+    }
+
+    @Test
+    fun admissionRetiresOnlyABoundedBatchAndLeavesExcessRowsFenced() {
+        provider.addExistingDocument("ai-inbox.org", "* Synthetic retained\n".toByteArray())
+        val target = provider.inboxDocuments().single().id
+        val owners = (0..32).map {
+            saveCapture("synthetic committed batch $it", "2026-10-03").also { id ->
+                writeJournal(id, target, provider.bytes(target), "WRITING", targetWasAbsent = false)
+                provider.replaceBytes(target, File(readJournal(id).getString("postimage")).readBytes())
+                markCommitted(id)
+            }
+        }
+        val second = saveCapture("synthetic bounded admission", "2026-10-04")
+        val result = coordinator().process(second)
+        assertEquals(OrgState.RETRYABLE_ERROR, result.state)
+        assertEquals("export-cleanup-pending", result.reason)
+        assertEquals(1, owners.sumOf { journalCount(it) })
+        assertEquals(0, journalCount(second))
+        assertFalse(recoveryDirectory(second).exists())
+        assertEquals(0, provider.writeCount)
+    }
+
+    private fun markCommitted(id: String) {
+        val destinationId = checkNotNull(SafNotesStore(context).selected()).id
+        repository.update(id) { it.copy(orgState = OrgState.EXPORTED, exportDestinationId = destinationId, exportTranscriptVersion = it.transcriptVersion) }
+    }
+
+    @Test
+    fun currentRecoveryRejectsMissingCorruptAndUnownedStages() {
+        for (field in listOf("preimage", "postimage", "entry")) {
+            for (damage in listOf("missing", "corrupt", "unowned", "symlink", "alias")) {
+                val (id, _) = prepareCommittedJournal()
+                val journal = readJournal(id)
+                val stage = File(journal.getString(field))
+                val outside = File(context.cacheDir, "synthetic-org-outside-${UUID.randomUUID()}").apply { writeBytes(stage.readBytes()) }
+                when (damage) {
+                    "missing" -> assertTrue(stage.delete())
+                    "corrupt" -> stage.writeBytes("Synthetic corrupt stage".toByteArray())
+                    "unowned" -> storeJournal(id, journal.put(field, outside.absolutePath))
+                    "symlink" -> {
+                        assertTrue(stage.delete())
+                        java.nio.file.Files.createSymbolicLink(stage.toPath(), outside.toPath())
+                    }
+                    "alias" -> storeJournal(id, journal.put(field, "${stage.parent}/../${checkNotNull(stage.parentFile).name}/${stage.name}"))
+                }
+                val outsideBytes = outside.readBytes()
+                assertRecoveryHeld(id)
+                assertArrayEquals(outsideBytes, outside.readBytes())
+            }
+        }
+    }
+
+    @Test
+    fun currentRecoveryRejectsInvalidHashesLengthsIdentityAndPostimageComposition() {
+        val changes: List<(JSONObject) -> Unit> = listOf(
+            { it.put("captureId", "synthetic-different-owner") },
+            { it.put("destinationId", "synthetic-other-destination") },
+            { it.put("transcriptVersion", 2) },
+            { it.put("phase", "UNKNOWN") },
+            { it.put("targetWasAbsent", true) },
+            { it.put("preLength", it.getLong("preLength") + 1) },
+            { it.put("postLength", it.getLong("postLength") + 1) },
+            { it.put("preHash", "synthetic-invalid-hash") },
+            { it.put("postHash", "synthetic-invalid-hash") },
+        )
+        changes.forEach { change ->
+            val (id, _) = prepareCommittedJournal()
+            storeJournal(id, readJournal(id).also(change))
+            assertRecoveryHeld(id)
+        }
+        val (id, targetId) = prepareCommittedJournal()
+        val journal = readJournal(id)
+        val wrongPostimage = File(journal.getString("postimage")).readBytes().also { it[it.lastIndex] = '!'.code.toByte() }
+        File(journal.getString("postimage")).writeBytes(wrongPostimage)
+        storeJournal(id, journal.put("postHash", sha256(wrongPostimage)))
+        provider.replaceBytes(targetId, wrongPostimage)
+        assertRecoveryHeld(id)
+    }
+
+    @Test
+    fun partialExistingWriteFencesLaterCaptureWithoutCreatingItsJournalOrStages() {
+        provider.addExistingDocument("ai-inbox.org", "* Synthetic retained\n".toByteArray())
+        val first = saveCapture("synthetic interrupted task", "2026-10-03")
+        provider.partialWrite = true
+        assertEquals(OrgState.NEEDS_REVIEW, coordinator().process(first).state)
+        provider.partialWrite = false
+        val partial = provider.onlyInboxBytes()
+        val writes = provider.writeCount
+        assertEquals(OrgState.NEEDS_REVIEW, coordinator().process(first).state)
+        assertArrayEquals(partial, provider.onlyInboxBytes())
+        val second = saveCapture("synthetic blocked task", "2026-10-04")
+
+        repeat(2) { assertEquals(OrgState.NEEDS_REVIEW, coordinator().process(second).state) }
+        assertArrayEquals(partial, provider.onlyInboxBytes())
+        assertEquals(writes, provider.writeCount)
+        assertEquals(0, journalCount(second))
+        assertFalse(recoveryDirectory(second).exists())
+        assertTrue(provider.createdMimeTypes.isEmpty())
+        assertTrue(provider.bytesAtRename.isEmpty())
+    }
+
+    @Test
+    fun missingInboxPendingJournalBlocksPreparationButOwnJournalCanCreateAndRecover() {
+        val first = saveCapture("synthetic pending creation", "2026-10-03")
+        writeJournal(first, null, byteArrayOf(), "PREPARED", targetWasAbsent = true)
+        val second = saveCapture("synthetic blocked creation", "2026-10-04")
+        repeat(2) { assertEquals(OrgState.NEEDS_REVIEW, coordinator().process(second).state) }
+        assertTrue(provider.allDocuments().isEmpty())
+        assertEquals(0, journalCount(second))
+        assertFalse(recoveryDirectory(second).exists())
+        assertEquals(OrgState.EXPORTED, coordinator().process(first).state)
+        assertEquals(OrgState.EXPORTED, coordinator().process(second).state)
+        assertEquals(1, provider.createdMimeTypes.size)
+    }
+
+    @Test
+    fun textExtensionPendingJournalBlocksRenameAndPreparationForOtherCapture() {
+        provider.addExistingDocument("ai-inbox.org.txt", "* Synthetic retained\n".toByteArray())
+        val target = provider.inboxDocuments().single().id
+        val first = saveCapture("synthetic owner", "2026-10-03")
+        writeJournal(first, target, provider.bytes(target), "PREPARED", targetWasAbsent = false)
+        val second = saveCapture("synthetic blocked rename", "2026-10-04")
+        assertEquals(OrgState.NEEDS_REVIEW, coordinator().process(second).state)
+        assertEquals(0, journalCount(second))
+        assertFalse(recoveryDirectory(second).exists())
+        assertTrue(provider.bytesAtRename.isEmpty())
+        assertEquals(0, provider.writeCount)
+        assertEquals(OrgState.EXPORTED, coordinator().process(first).state)
+        assertEquals(OrgState.EXPORTED, coordinator().process(second).state)
+        assertEquals(1, provider.bytesAtRename.size)
+    }
+
+    @Test
+    fun malformedJournalBlocksItsOwnerAndOtherCapturesWithOrWithoutInbox() {
+        for (existing in listOf(false, true)) {
+            if (existing) provider.addExistingDocument("ai-inbox.org", "* Synthetic retained\n".toByteArray())
+            val first = saveCapture("synthetic malformed journal", "2026-10-03")
+            storeJournal(first, JSONObject())
+            context.openOrCreateDatabase("capture_org_journal.db", Context.MODE_PRIVATE, null).use {
+                it.execSQL("UPDATE org_journal SET body = ? WHERE capture_id = ?", arrayOf("{invalid", first))
+            }
+            val documents = provider.allDocuments().associate { it.id to provider.bytes(it.id).toList() }
+            val second = saveCapture("synthetic blocked malformed", "2026-10-04")
+            repeat(2) {
+                assertEquals(OrgState.NEEDS_REVIEW, coordinator().process(first).state)
+                assertEquals(OrgState.NEEDS_REVIEW, coordinator().process(second).state)
+            }
+            assertEquals(0, journalCount(second))
+            assertFalse(recoveryDirectory(second).exists())
+            assertEquals(documents, provider.allDocuments().associate { it.id to provider.bytes(it.id).toList() })
+            assertEquals(0, provider.writeCount)
+            assertTrue(provider.createdMimeTypes.isEmpty())
+            assertTrue(provider.bytesAtRename.isEmpty())
+        }
+    }
+
+    @Test
+    fun missingCurrentJournalFieldsFailClosedWithoutChangingRecoveryEvidence() {
+        for (field in listOf("targetName", "captureId", "destinationId", "phase", "transcriptVersion", "targetUri",
+            "targetWasAbsent", "preimage", "postimage", "entry", "preHash", "postHash", "preLength", "postLength")) {
+            val (id, _) = prepareCommittedJournal()
+            storeJournal(id, readJournal(id).also { it.remove(field) })
+            assertRecoveryHeld(id)
+            val blocked = saveCapture("synthetic blocked missing field", "2026-10-04")
+            assertEquals(OrgState.NEEDS_REVIEW, coordinator().process(blocked).state)
+            assertEquals(0, journalCount(blocked))
+            assertFalse(recoveryDirectory(blocked).exists())
+        }
+    }
+
+    @Test
+    fun unreadableJournalTableFailsClosedWithoutProviderMutations() {
+        provider.addExistingDocument("ai-inbox.org", "* Synthetic retained\n".toByteArray())
+        val id = saveCapture("synthetic query failure", "2026-10-03")
+        storeJournal(id, JSONObject())
+        context.openOrCreateDatabase("capture_org_journal.db", Context.MODE_PRIVATE, null).use {
+            it.execSQL("ALTER TABLE org_journal RENAME TO synthetic_unreadable_journal")
+        }
+        repeat(2) { assertEquals(OrgState.NEEDS_REVIEW, coordinator().process(id).state) }
+        assertFalse(recoveryDirectory(id).exists())
+        assertEquals(0, provider.writeCount)
+        assertTrue(provider.createdMimeTypes.isEmpty())
+        assertTrue(provider.bytesAtRename.isEmpty())
     }
 
     @Test
@@ -320,7 +667,7 @@ class OrgExportDocumentsProviderTest {
     }
 
     @Test
-    fun journalWithoutTargetNameCannotReplayOrBlockNewAiInboxCreation() {
+    fun journalWithoutTargetNameCannotReplayAndBlocksNewAiInboxCreation() {
         assertLegacyJournalHeld(targetName = null, documentName = "inbox.org", phase = "PREPARED")
     }
 
@@ -362,7 +709,7 @@ class OrgExportDocumentsProviderTest {
         val result = coordinator().process(id)
 
         assertEquals(OrgState.NEEDS_REVIEW, result.state)
-        assertEquals("provider-cannot-name-inbox-exactly-rename-to-ai-inbox.org-or-choose-another-folder", result.reason)
+        assertEquals("export-journal-invalid", result.reason)
         assertEquals("synthetic-user-notes.org", provider.allDocuments().single().displayName)
         assertArrayEquals(original, provider.bytes(targetId))
         assertTrue(provider.bytesAtRename.isEmpty())
@@ -371,199 +718,71 @@ class OrgExportDocumentsProviderTest {
     }
 
     @Test
-    @Config(sdk = [35], shadows = [DocumentsProviderQueryBridge::class])
-    fun committedLegacyWritesAreAcknowledgedAcrossPhasesWithoutProviderMutationOrDuplicates() {
-        provider.addExistingDocument("ai-inbox.org", "* Synthetic independent AI inbox\n".toByteArray())
-        for (phase in listOf("PREPARED", "WRITING", "NEEDS_REVIEW")) {
-            for (targetName in listOf(null, "inbox.org", "ai-inbox.org")) {
-                for (documentName in listOf("inbox.org", "inbox.org.txt")) {
-                    val (id, _) = prepareCommittedLegacyJournal(phase, targetName, documentName)
-                    val journal = readJournal(id)
-                    val stages = listOf("preimage", "postimage", "entry").map { File(journal.getString(it)) }
-                    val documentsBefore = provider.allDocuments().associate { it.id to provider.bytes(it.id).toList() }
-
-                    repeat(2) {
-                        assertEquals(OrgState.EXPORTED, coordinator().process(id).state)
-                        val record = checkNotNull(repository.get(id))
-                        assertEquals(record.transcriptVersion, record.exportTranscriptVersion)
-                        assertEquals(sha256(treeUri.toString().toByteArray()), record.exportDestinationId)
-                        assertEquals(documentsBefore, provider.allDocuments().associate { it.id to provider.bytes(it.id).toList() })
-                        assertTrue(provider.createdMimeTypes.isEmpty())
-                        assertTrue(provider.bytesAtRename.isEmpty())
-                        assertEquals(0, provider.writeCount)
-                    }
-                    stages.forEach { assertFalse(it.exists()) }
-                    assertEquals(0, journalCount(id))
-                }
-            }
+    fun obsoleteJournalPostimageIsNotAcknowledgedOrSkipped() {
+        for (targetName in listOf(null, "inbox.org", "ai-inbox.org")) {
+            val (id, _) = prepareCommittedJournal(targetName = targetName, documentName = "inbox.org")
+            assertRecoveryHeld(id)
+            val blocked = saveCapture("synthetic blocked obsolete journal", "2026-10-04")
+            assertEquals(OrgState.NEEDS_REVIEW, coordinator().process(blocked).state)
+            assertEquals(0, journalCount(blocked))
+            assertFalse(recoveryDirectory(blocked).exists())
+            assertTrue(provider.inboxDocuments().isEmpty())
         }
     }
 
     @Test
-    @Config(sdk = [35], shadows = [DocumentsProviderQueryBridge::class])
-    fun legacyPreimagesAndUnknownProviderContentsRemainHeldAcrossPhases() {
-        for (phase in listOf("PREPARED", "WRITING", "NEEDS_REVIEW")) {
-            for (usePreimage in listOf(true, false)) {
-                val (id, targetId) = prepareCommittedLegacyJournal(phase)
-                val bytes = if (usePreimage) File(readJournal(id).getString("preimage")).readBytes()
-                    else "* Synthetic externally changed inbox\n".toByteArray()
-                provider.replaceBytes(targetId, bytes)
-                assertLegacyRecoveryHeld(id)
-            }
-        }
-    }
-
-    @Test
-    @Config(sdk = [35], shadows = [DocumentsProviderQueryBridge::class])
-    fun legacyPostHashRequiresMatchingIdentityVersionPhaseAndLengths() {
-        val changes: List<(JSONObject) -> Unit> = listOf(
-            { it.put("captureId", UUID.randomUUID().toString()) },
-            { it.put("destinationId", "synthetic-other-destination") },
-            { it.put("transcriptVersion", 2) },
-            { it.remove("transcriptVersion") },
-            { it.put("phase", "UNKNOWN") },
-            { it.remove("phase") },
-            { it.remove("targetWasAbsent") },
-            { it.put("targetWasAbsent", true) },
-            { it.put("preLength", it.getLong("preLength") + 1) },
-            { it.put("postLength", it.getLong("postLength") + 1) },
-            { it.put("preHash", "synthetic-invalid-hash") },
-            { it.remove("postHash") },
-            { it.put("targetUri", "") },
-            { it.put("targetUri", "content://synthetic.other/tree/root/document/other") },
-        )
-        changes.forEach { change ->
-            val (id, _) = prepareCommittedLegacyJournal()
-            val journal = readJournal(id).also(change)
-            storeJournal(id, journal)
-            assertLegacyRecoveryHeld(id)
-        }
-    }
-
-    @Test
-    @Config(sdk = [35], shadows = [DocumentsProviderQueryBridge::class])
-    fun legacyPostHashRejectsMissingCorruptOrUnownedRecoveryStages() {
-        for (field in listOf("preimage", "postimage", "entry")) {
-            for (damage in listOf("missing", "corrupt", "unowned", "symlink", "alias")) {
-                val (id, _) = prepareCommittedLegacyJournal()
-                val journal = readJournal(id)
-                val stage = File(journal.getString(field))
-                when (damage) {
-                    "missing" -> assertTrue(stage.delete())
-                    "corrupt" -> stage.writeBytes("Synthetic corrupt stage".toByteArray())
-                    "unowned", "symlink" -> {
-                        val other = File(context.cacheDir, "synthetic-org-unowned-${UUID.randomUUID()}").apply { writeBytes(stage.readBytes()) }
-                        if (damage == "symlink") {
-                            assertTrue(stage.delete())
-                            java.nio.file.Files.createSymbolicLink(stage.toPath(), other.toPath())
-                        } else {
-                            journal.put(field, other.absolutePath)
-                            storeJournal(id, journal)
-                        }
-                    }
-                    "alias" -> storeJournal(id, journal.put(field, "${stage.parent}/../${checkNotNull(stage.parentFile).name}/${stage.name}"))
-                }
-                assertLegacyRecoveryHeld(id)
-            }
-        }
-    }
-
-    @Test
-    @Config(sdk = [35], shadows = [DocumentsProviderQueryBridge::class])
-    fun legacyPostHashMustRepresentTheCurrentEntryPrependedToItsPreimage() {
-        val (id, targetId) = prepareCommittedLegacyJournal()
-        val journal = readJournal(id)
-        val wrongPostimage = File(journal.getString("postimage")).readBytes().also { it[it.lastIndex] = '!'.code.toByte() }
-        File(journal.getString("postimage")).writeBytes(wrongPostimage)
-        journal.put("postLength", wrongPostimage.size).put("postHash", sha256(wrongPostimage))
-        storeJournal(id, journal)
-        provider.replaceBytes(targetId, wrongPostimage)
-        assertLegacyRecoveryHeld(id)
-
-        val (changedId, _) = prepareCommittedLegacyJournal()
-        repository.update(changedId) { it.copy(finalText = "Synthetic different current task") }
-        assertLegacyRecoveryHeld(changedId)
-    }
-
-    @Test
-    @Config(sdk = [35], shadows = [DocumentsProviderQueryBridge::class])
-    fun legacyPostHashWithUnknownOrUnreadableTargetRemainsHeld() {
-        val (unknownId, _) = prepareCommittedLegacyJournal(documentName = "synthetic-unrelated.org")
-        assertLegacyRecoveryHeld(unknownId)
-        for (phase in listOf("PREPARED", "WRITING", "NEEDS_REVIEW")) {
-            val (id, _) = prepareCommittedLegacyJournal(phase, targetName = "ai-inbox.org")
-            provider.denyReads = true
-            assertLegacyRecoveryHeld(id)
-            provider.denyReads = false
-            provider.hideDocumentNames = true
-            assertLegacyRecoveryHeld(id)
-            provider.hideDocumentNames = false
-        }
-    }
-
-    @Test
-    @Config(sdk = [35], shadows = [DocumentsProviderQueryBridge::class])
-    fun transcriptVersionChangeDuringLegacyReadbackRetainsRecoveryEvidence() {
-        val (id, _) = prepareCommittedLegacyJournal()
-        provider.onRead = { repository.update(id) { it.copy(transcriptVersion = it.transcriptVersion + 1) } }
-        assertLegacyRecoveryHeld(id)
-        assertEquals(2L, repository.get(id)?.transcriptVersion)
-    }
-
-    @Test
-    @Config(sdk = [35], shadows = [DocumentsProviderQueryBridge::class])
-    fun failedLegacyMetadataCommitRetainsStagesAndCanBeAcknowledgedLater() {
-        val (id, _) = prepareCommittedLegacyJournal(phase = "PREPARED")
+    fun failedCurrentMetadataCommitFencesLaterCaptureUntilOwnPostimageRecovery() {
+        provider.addExistingDocument("ai-inbox.org", "* Synthetic retained\n".toByteArray())
+        val id = saveCapture("synthetic metadata failure", "2026-10-03")
         context.openOrCreateDatabase("captures.db", Context.MODE_PRIVATE, null).use { database ->
             database.execSQL("CREATE TRIGGER synthetic_org_commit_failure BEFORE UPDATE ON captures " +
                 "WHEN NEW.body LIKE '%\"orgState\":\"EXPORTED\"%' " +
                 "BEGIN SELECT RAISE(ABORT, 'Synthetic metadata commit failure'); END")
         }
-        assertLegacyRecoveryHeld(id)
+        assertEquals(OrgState.NEEDS_REVIEW, coordinator().process(id).state)
+        val stages = listOf("preimage", "postimage", "entry").map { File(readJournal(id).getString(it)) }
+        val postimage = provider.onlyInboxBytes()
+        assertEquals(1, provider.writeCount)
+        stages.forEach { assertTrue(it.isFile) }
+        val second = saveCapture("synthetic later task", "2026-10-04")
+        assertEquals(OrgState.NEEDS_REVIEW, coordinator().process(second).state)
+        assertEquals(0, journalCount(second))
+        assertFalse(recoveryDirectory(second).exists())
+        assertArrayEquals(postimage, provider.onlyInboxBytes())
+        assertEquals(1, provider.writeCount)
         context.openOrCreateDatabase("captures.db", Context.MODE_PRIVATE, null).use { database ->
             database.execSQL("DROP TRIGGER synthetic_org_commit_failure")
         }
         assertEquals(OrgState.EXPORTED, coordinator().process(id).state)
-        assertEquals(0, provider.writeCount)
+        assertEquals(1, provider.writeCount)
         assertTrue(provider.createdMimeTypes.isEmpty())
         assertTrue(provider.bytesAtRename.isEmpty())
+        assertEquals(0, journalCount(id))
+        stages.forEach { assertFalse(it.exists()) }
+        assertEquals(OrgState.EXPORTED, coordinator().process(second).state)
     }
 
-    @Test
-    fun legacyPostHashRemainsHeldWhenTreeMembershipApiIsUnavailable() {
-        val (id, _) = prepareCommittedLegacyJournal()
-        assertLegacyRecoveryHeld(id)
-    }
-
-    @Test
-    @Config(sdk = [35], shadows = [DocumentsProviderQueryBridge::class])
-    fun legacyPostHashRemainsHeldWhenProviderDeniesTreeMembership() {
-        val (id, _) = prepareCommittedLegacyJournal()
-        provider.denyChildMembership = true
-        assertLegacyRecoveryHeld(id)
-    }
-
-    private fun prepareCommittedLegacyJournal(
+    private fun prepareCommittedJournal(
         phase: String = "WRITING",
-        targetName: String? = null,
-        documentName: String = "inbox.org",
+        targetName: String? = "ai-inbox.org",
+        documentName: String = "ai-inbox.org",
     ): Pair<String, String> {
         val original = if (phase == "NEEDS_REVIEW") byteArrayOf()
             else byteArrayOf(0xef.toByte(), 0xbb.toByte(), 0xbf.toByte()) + "* Synthetic old inbox\r\n☃".toByteArray()
-        provider.addExistingDocument(documentName, original)
-        val targetId = provider.allDocuments().last().id
-        val id = saveCapture("synthetic committed legacy task", "2026-10-03")
+        val existing = provider.allDocuments().singleOrNull { it.displayName == documentName }
+        if (existing == null) provider.addExistingDocument(documentName, original)
+        val targetId = existing?.id ?: provider.allDocuments().last().id
+        provider.replaceBytes(targetId, original)
+        val id = saveCapture("synthetic committed task", "2026-10-03")
         writeJournal(id, targetId, original, phase, targetWasAbsent = original.isEmpty(), targetName = targetName)
         provider.replaceBytes(targetId, File(readJournal(id).getString("postimage")).readBytes())
         return id to targetId
     }
 
-    private fun assertLegacyRecoveryHeld(id: String) {
+    private fun assertRecoveryHeld(id: String) {
         val journalBefore = readJournal(id).toString()
         val documentsBefore = provider.allDocuments().associate { it.id to provider.bytes(it.id).toList() }
-        val journal = readJournal(id)
-        val stages = listOf("preimage", "postimage", "entry").map { File(journal.getString(it)) } +
-            listOf("preimage.bin", "postimage.bin", "entry.bin").map { File(recoveryDirectory(id), it) }
+        val stages = listOf("preimage.bin", "postimage.bin", "entry.bin").map { File(recoveryDirectory(id), it) }
         val stageBytes = stages.associateWith { if (it.isFile) it.readBytes().toList() else null }
         repeat(2) {
             assertEquals(OrgState.NEEDS_REVIEW, coordinator().process(id).state)
@@ -604,7 +823,7 @@ class OrgExportDocumentsProviderTest {
         repeat(2) {
             val result = coordinator().process(id)
             assertEquals(OrgState.NEEDS_REVIEW, result.state)
-            assertEquals("export-journal-target-changed-requires-review", result.reason)
+            assertEquals(if (targetName == ORG_INBOX_NAME) "export-journal-invalid" else "export-journal-target-changed-requires-review", result.reason)
             assertEquals(OrgState.NEEDS_REVIEW, repository.get(id)?.orgState)
             assertEquals(journalBefore, readJournal(id).toString())
             assertArrayEquals(original, provider.bytes(targetId))
@@ -614,14 +833,16 @@ class OrgExportDocumentsProviderTest {
             assertEquals(0, provider.writeCount)
         }
 
-        assertEquals(OrgState.EXPORTED, coordinator().process(saveCapture("synthetic independent new task", "2026-10-04")).state)
+        val blocked = saveCapture("synthetic blocked new task", "2026-10-04")
+        assertEquals(OrgState.NEEDS_REVIEW, coordinator().process(blocked).state)
+        assertEquals(0, journalCount(blocked))
+        assertFalse(recoveryDirectory(blocked).exists())
         assertArrayEquals(original, provider.bytes(targetId))
-        assertEquals("ai-inbox.org", provider.inboxDocuments().single().displayName)
-        assertArrayEquals(OrgExport.formatEntry("synthetic independent new task", "2026-10-04"), provider.onlyInboxBytes())
+        assertTrue(provider.inboxDocuments().isEmpty())
         assertEquals(journalBefore, readJournal(id).toString())
         assertEquals(recoveryFiles, recoveryFiles.keys.associateWith { File(it).readBytes().toList() })
         assertTrue(provider.bytesAtRename.isEmpty())
-        assertEquals(1, provider.writeCount)
+        assertEquals(0, provider.writeCount)
     }
 
     private fun saveCapture(text: String, date: String): String {
@@ -703,23 +924,6 @@ class OrgExportDocumentsProviderTest {
 
     data class SyntheticDocument(val id: String, val displayName: String, val mimeType: String)
 
-    @Implements(value = DocumentsProvider::class, minSdk = 26)
-    class DocumentsProviderQueryBridge {
-        @RealObject
-        private lateinit var provider: DocumentsProvider
-
-        // ShadowContentResolver bypasses Android's legacy-query to Bundle-query conversion.
-        @Implementation(minSdk = 26)
-        fun query(uri: Uri, projection: Array<out String>?, selection: String?, selectionArgs: Array<out String>?, sortOrder: String?): Cursor? {
-            val arguments = Bundle().apply {
-                putString(ContentResolver.QUERY_ARG_SQL_SELECTION, selection)
-                putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, selectionArgs)
-                putString(ContentResolver.QUERY_ARG_SQL_SORT_ORDER, sortOrder)
-            }
-            return provider.query(uri, projection, arguments, null)
-        }
-    }
-
     class SyntheticDocumentsProvider(private val storageDirectory: File) : DocumentsProvider() {
         private val documents = linkedMapOf<String, SyntheticDocument>()
         private val storage = mutableMapOf<String, File>()
@@ -729,13 +933,14 @@ class OrgExportDocumentsProviderTest {
         var denyRename = false
         var returnWrongRenameName = false
         var failReadAfterRename = false
-        var denyReads = false
-        var hideDocumentNames = false
-        var denyChildMembership = false
-        var onRead: (() -> Unit)? = null
         private var failNextRead = false
         val bytesAtRename = mutableListOf<ByteArray>()
         var writeCount = 0
+            private set
+        var partialWrite = false
+        var hideChildren = false
+        var failReads = false
+        var documentQueryCount = 0
             private set
 
         override fun onCreate() = true
@@ -745,13 +950,17 @@ class OrgExportDocumentsProviderTest {
         }
 
         override fun queryDocument(documentId: String, projection: Array<out String>): Cursor = MatrixCursor(projection).apply {
+            documentQueryCount++
             val document = if (documentId == ROOT_ID) SyntheticDocument(ROOT_ID, "Synthetic notes", DocumentsContract.Document.MIME_TYPE_DIR) else documents[documentId]
-            if (document != null && !hideDocumentNames) addDocumentRow(this, projection, document)
+            if (document != null) addDocumentRow(this, projection, document)
         }
 
         override fun queryChildDocuments(parentDocumentId: String, projection: Array<out String>, sortOrder: String?): Cursor = MatrixCursor(projection).apply {
-            documents.values.filter { it.id != ROOT_ID }.forEach { addDocumentRow(this, projection, it) }
+            if (!hideChildren) documents.values.filter { it.id != ROOT_ID }.forEach { addDocumentRow(this, projection, it) }
         }
+
+        override fun isChildDocument(parentDocumentId: String, documentId: String): Boolean =
+            parentDocumentId == ROOT_ID && documents.containsKey(documentId)
 
         override fun createDocument(parentDocumentId: String, mimeType: String, displayName: String): String {
             createdMimeTypes += mimeType
@@ -763,15 +972,9 @@ class OrgExportDocumentsProviderTest {
             return id
         }
 
-        override fun isChildDocument(parentDocumentId: String, documentId: String): Boolean =
-            !denyChildMembership && parentDocumentId == ROOT_ID && documents.containsKey(documentId)
-
         override fun openDocument(documentId: String, mode: String, signal: CancellationSignal?): ParcelFileDescriptor {
             check(documents.containsKey(documentId)) { "Unknown document ID $documentId" }
-            if (!mode.contains("w")) {
-                if (denyReads) throw java.io.FileNotFoundException("Synthetic read denial")
-                onRead?.also { onRead = null }?.invoke()
-            }
+            if (!mode.contains("w") && failReads) throw java.io.FileNotFoundException("Synthetic read denial")
             if (!mode.contains("w") && failNextRead) {
                 failNextRead = false
                 throw java.io.FileNotFoundException("Synthetic transient read failure")
@@ -784,6 +987,10 @@ class OrgExportDocumentsProviderTest {
                 ParcelFileDescriptor.MODE_WRITE_ONLY or ParcelFileDescriptor.MODE_CREATE or ParcelFileDescriptor.MODE_TRUNCATE
             } else {
                 ParcelFileDescriptor.MODE_READ_ONLY
+            }
+            if (mode.contains("w") && partialWrite) {
+                file.writeBytes("Synthetic partial write".toByteArray())
+                throw java.io.IOException("Synthetic interrupted replacement")
             }
             return ParcelFileDescriptor.open(file, flags)
         }

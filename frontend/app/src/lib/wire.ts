@@ -12,3 +12,8 @@ export function parseRuntimePhase(value: unknown, field: string): BackendRuntime
 export function utf8ByteLength(value: string): number {
   return new TextEncoder().encode(value).length
 }
+
+/** Rust str::trim uses Unicode White_Space: NEL is whitespace, BOM is content. */
+export function isCoreWhitespaceOnly(value: string): boolean {
+  return /^\p{White_Space}*$/u.test(value)
+}

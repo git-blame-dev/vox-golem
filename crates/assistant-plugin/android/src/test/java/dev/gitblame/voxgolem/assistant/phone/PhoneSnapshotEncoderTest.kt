@@ -7,6 +7,18 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class PhoneSnapshotEncoderTest {
+    @Test fun everyPhoneSnapshotExplicitlyDeclaresNoUnsavedResult() {
+        val conversation = id("1").toString()
+        for (state in listOf(
+            AssistantState(),
+            AssistantState(conversation = conversation, branchChoices = listOf(id("3").toString(), id("5").toString())),
+            AssistantState(conversation = conversation, busy = true, clientRequestToken = "synthetic-client", providerRequestId = PhoneSnapshotEncoder.wireId(id("2"))),
+        )) {
+            val snapshot = PhoneSnapshotEncoder.encode(state, null, PhonePreferences.defaults(), emptyMap())
+            assertTrue("unsaved_result is required, not an omitted optional field", snapshot.has("unsaved_result"))
+            assertSame(JSONObject.NULL, snapshot.get("unsaved_result"))
+        }
+    }
     private fun id(sequence: String) = JSONObject().put("replica", "11111111-1111-4111-8111-111111111111").put("sequence", sequence)
     private fun record(sequence: String, request: String, answer: String) = JSONObject().put("operation", JSONObject()
         .put("id", id(sequence)).put("body", JSONObject().put("kind", "turn_completed").put("conversation", id("1"))

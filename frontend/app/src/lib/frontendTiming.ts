@@ -1,5 +1,6 @@
 import type { CustomDirectTimings } from '../types/chat'
 import { invokeTauriCommand, isAndroidRuntime } from './tauri'
+import { recordRuntimeDiagnostic, type RuntimeDiagnosticKind } from './runtimeDiagnostics'
 
 type StartupStage = 'SHELL_DOM_COMMITTED' | 'INITIAL_SNAPSHOT_REQUESTED' | 'INITIAL_SNAPSHOT_RECEIVED' | 'INITIAL_SNAPSHOT_APPLIED' | 'STATE_READY'
 type RequestStage = 'ADMITTED' | 'IPC_DISPATCH' | 'FIRST_NONBLANK_RECEIVED' | 'FIRST_TEXT_DOM_COMMITTED' | 'INLINE_SNAPSHOT_ACCEPTED' | 'TERMINAL_SNAPSHOT_RPC_REQUESTED' | 'SETTLED'
@@ -26,17 +27,12 @@ export function reportVoiceEntryStage(stage: VoiceEntryStage): void {
   catch { /* Optional diagnostics cannot change entry admission. */ }
 }
 
-type AppBenchmarkStage = 'benchmark_lifetime_retire' | 'benchmark_controls_retire' |
-  'benchmark_capability_retire' | 'benchmark_audio_error' | 'benchmark_cue_error'
+type AppBenchmarkStage = Extract<RuntimeDiagnosticKind, `benchmark_${string}`>
 
 /** Compiled out of ordinary frontend builds; fixed categories, no payloads. */
 export function reportAppBenchmarkStage(stage: AppBenchmarkStage): void {
   if (import.meta.env.VITE_VOXGOLEM_BENCHMARK !== '1') return
-  try {
-    void invokeTauriCommand('record_frontend_runtime_diagnostic', {
-      event: { kind: 'audio', detail: stage },
-    }).catch(() => undefined)
-  } catch { /* Benchmark evidence cannot retire the operation. */ }
+  recordRuntimeDiagnostic(stage)
 }
 
 function emit(metadata: Record<string, string | number>): void {

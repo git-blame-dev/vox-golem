@@ -18,8 +18,9 @@ import java.util.Locale
 @LooperMode(LooperMode.Mode.PAUSED)
 class AssistantManualReplySpeechTest {
     private open class Client : AssistantClient {
-        var state = AssistantState(foreground = true, draft = "Synthetic manual draft")
+        var state = AssistantState(foreground = true, contextReady = true, draft = "Synthetic manual draft")
         var sends = 0
+        val publishedOptions = mutableListOf<SpeechOptions>()
         val selections = mutableListOf<SpeechSelection>()
         private val observers = mutableListOf<(AssistantState) -> Unit>()
         override fun snapshot() = state
@@ -41,6 +42,7 @@ class AssistantManualReplySpeechTest {
         override fun selectConversation(id: String) {}
         override fun selectHead(id: String) {}
         override fun send() { sends++ }
+        override fun publishSpeechOptions(options: SpeechOptions) { publishedOptions += options }
     }
     private class QueuedSelectionClient : Client() {
         data class Request(val selection: SpeechSelection, val result: (AssistantState) -> Unit)
@@ -113,12 +115,13 @@ class AssistantManualReplySpeechTest {
         override fun close() { closed = true; active = null }
     }
     private class Tts : LocalTtsFactory {
+        var providerReads = 0
         val spoken = mutableListOf<String>()
         val terminals = mutableListOf<(String?) -> Unit>()
         var offered = listOf(LocalVoice("synthetic-local", Locale.US, false, true))
         val ready = mutableListOf<(Boolean) -> Unit>()
         var beforeSpeak: (() -> Unit)? = null
-        override fun providers(): List<String?> = listOf(null, "synthetic.tts")
+        override fun providers(): List<String?> { providerReads++; return listOf(null, "synthetic.tts") }
         override fun create(onReady: (Boolean) -> Unit): LocalTtsSession {
             ready += onReady
             return object : LocalTtsSession {
@@ -151,6 +154,132 @@ class AssistantManualReplySpeechTest {
     private fun ready() { tts.ready.last()(true); drain() }
     private fun complete(text: String = "Synthetic durable answer") {
         generation.callbacks.last()(GenerationResult.Complete(text)); drain()
+    }
+
+    private class BootstrapFixture(selection: SpeechSelection = SpeechSelection(), networkFallback: Boolean = true) : AutoCloseable {
+        val client = Client().apply { state = state.copy(contextReady = false, webEnabled = false,
+            speechLanguage = selection.language, speechTtsProvider = selection.ttsProvider, speechTtsVoice = selection.ttsVoice,
+            speechNetworkFallback = networkFallback) }
+        val admissions = mutableListOf<SpeechAdmission>()
+        var discovery = 0
+        var serviceChecks = 0
+        var captureReady = true
+        val recognizer = object : LocalRecognizerFactory {
+            override fun available(): Boolean { discovery++; serviceChecks++; return true }
+            override fun availableForEntry(language: String, networkFallback: Boolean, recording: Boolean): Boolean {
+                discovery++; serviceChecks++; return true
+            }
+            override fun localOnlyAvailable(): Boolean { discovery++; return true }
+            override fun recordingEnabled(): Boolean { discovery++; return false }
+            override fun recordingAvailable(language: String, networkFallback: Boolean): Boolean { discovery++; return true }
+            override fun create(): LocalRecognizerSession = error("No recognition expected")
+        }
+        val leases = RecognitionResourceLease()
+        private fun admission(): SpeechAdmission {
+            check(client.state.contextReady) { "Synthetic placeholder policy consumed" }
+            return client.state.speechAdmission().also(admissions::add)
+        }
+        val input = SharedDictationOwner(recognizer, { true }, leases, configuration = ::admission)
+        val tts = Tts()
+        val speech = LocalSpeechOutput(tts, object : SpeechAudioFocus {
+            override fun acquire(onLoss: () -> Unit) = true
+            override fun release() = Unit
+        }, leases = leases, configuration = ::admission)
+        val generation = Generation()
+        val voice = WearAssistantVoice(client, input, speech, generation, admissionReady = { captureReady }, language = "en-US")
+        override fun close() { voice.close(); shadowOf(Looper.getMainLooper()).idle() }
+    }
+
+    @Test fun bootstrapPendingAndFailurePublishUnavailableWithoutDiscoveryOrAdmission() {
+        BootstrapFixture().use { f ->
+            f.voice.foreground(true); f.voice.tts(true); f.voice.prepareSpeechOptions(); drain()
+            repeat(3) {
+                val state = f.voice.snapshot()
+                assertFalse(state.admissionReady)
+                assertFalse(state.recognitionServiceAvailable)
+                assertFalse(state.localOnlyRecognitionAvailable)
+                assertFalse(state.recordingAvailable)
+                assertEquals(SpeechOptions(), state.speechOptions)
+            }
+            assertFalse(f.voice.configureSpeech(SpeechSelection()))
+            assertFalse(f.voice.configureSpeech(SpeechSelection()) { fail("Unadmitted selection cannot settle") })
+            assertTrue(f.voice.send())
+            f.client.publish(f.client.state.copy(error = "storage_error")); drain()
+            assertFalse(f.voice.snapshot().admissionReady)
+            assertEquals(0, f.discovery)
+            assertEquals(0, f.tts.providerReads)
+            assertTrue(f.tts.ready.isEmpty())
+            assertTrue(f.admissions.isEmpty())
+            assertTrue(f.client.selections.isEmpty())
+            assertTrue(f.client.publishedOptions.isEmpty())
+            assertTrue(f.generation.prompts.isEmpty())
+        }
+    }
+
+    @Test fun bootstrapAcknowledgementRefreshesVisibleInventoryOnceEvenForUnchangedPolicy() {
+        for (selection in listOf(SpeechSelection(), SpeechSelection(language = "en-AU", ttsProvider = "synthetic.tts"))) {
+            BootstrapFixture(selection, networkFallback = false).use { f ->
+                // Persisted speech policy can equal the placeholder; readiness itself is a transition.
+                f.voice.foreground(true); f.voice.prepareSpeechOptions(); drain()
+                f.client.publish(f.client.state.copy(contextReady = true)); drain()
+                assertTrue(f.voice.snapshot().admissionReady)
+                assertTrue(f.voice.snapshot().recognitionServiceAvailable)
+                assertTrue(f.voice.snapshot().localOnlyRecognitionAvailable)
+                assertEquals(selection, f.voice.snapshot().speechSelection)
+                assertEquals(1, f.tts.ready.size)
+                assertEquals(1, f.serviceChecks)
+                assertTrue(f.admissions.isNotEmpty())
+                assertTrue(f.admissions.all { it.selection == selection && !it.networkFallback })
+                assertFalse(f.client.state.webEnabled)
+                assertTrue(f.client.publishedOptions.isNotEmpty())
+                val providers = f.tts.providerReads
+                val discovery = f.discovery
+                repeat(3) { f.client.publish(f.client.state) }; drain()
+                assertEquals(providers, f.tts.providerReads)
+                assertEquals(discovery, f.discovery)
+                assertEquals(1, f.tts.ready.size)
+            }
+        }
+    }
+
+    @Test fun backgroundOrCloseBeforeBootstrapAcknowledgementNeverInitializesLateInventory() {
+        for (queuedAcknowledgement in listOf(false, true)) for (close in listOf(false, true)) BootstrapFixture().use { f ->
+            f.voice.foreground(true); f.voice.prepareSpeechOptions(); drain()
+            if (queuedAcknowledgement) f.client.publish(f.client.state.copy(contextReady = true))
+            if (close) f.voice.close() else f.voice.foreground(false)
+            if (!queuedAcknowledgement) f.client.publish(f.client.state.copy(contextReady = true))
+            drain()
+            assertEquals(0, f.discovery)
+            assertEquals(0, f.tts.providerReads)
+            assertTrue(f.tts.ready.isEmpty())
+            assertTrue(f.admissions.isEmpty())
+        }
+    }
+
+    @Test fun foregroundCanConsumeReadyAcknowledgementBeforeObserverWithoutDuplicateDiscovery() {
+        BootstrapFixture().use { f ->
+            f.voice.foreground(true); drain()
+            f.client.publish(f.client.state.copy(contextReady = true))
+            f.voice.foreground(true)
+            drain()
+            assertEquals(1, f.serviceChecks)
+            assertEquals(1, f.tts.ready.size)
+        }
+    }
+
+    @Test fun bootstrapAcknowledgementDoesNotBypassCaptureInventoryAdmission() {
+        BootstrapFixture().use { f ->
+            f.captureReady = false
+            f.voice.foreground(true); drain()
+            f.client.publish(f.client.state.copy(contextReady = true)); drain()
+            f.voice.prepareSpeechOptions(); drain()
+            assertFalse(f.voice.snapshot().admissionReady)
+            assertFalse(f.voice.snapshot().recognitionServiceAvailable)
+            assertEquals(SpeechOptions(), f.voice.snapshot().speechOptions)
+            assertEquals(0, f.discovery)
+            assertEquals(0, f.tts.providerReads)
+            assertTrue(f.tts.ready.isEmpty())
+        }
     }
 
     private fun voiceStartupDefersTtsUntilFinal(conversation: Boolean) {

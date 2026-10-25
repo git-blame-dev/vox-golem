@@ -6,7 +6,7 @@ const id = (sequence: number): string => `11111111-1111-4111-8111-111111111111:$
 function encoderTurn(sequence: number) {
   return parseCanonicalTurn({ request_id: `synthetic-request-${sequence}`, execution_id: { session_id: id(1), generation: id(sequence - 1) },
     user: { id: id(sequence), role: 'user', content: { kind: 'text', text: `Synthetic prompt ${sequence}` } },
-    answer: { id: id(sequence), role: 'assistant', content: { kind: 'text', text: `Synthetic answer ${sequence}` } }, final_stage: 'instant' }, true)
+    answer: { id: id(sequence), role: 'assistant', content: { kind: 'text', text: `Synthetic answer ${sequence}` } }, final_stage: 'instant' })
 }
 
 describe('actual Android encoder-shaped transcript projection', () => {

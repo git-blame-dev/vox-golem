@@ -1,9 +1,52 @@
 //! Explicitly compiled, isolated software-input benchmark. Never a shipping IPC surface.
 use super::*;
 use std::collections::{BTreeMap, HashSet};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::sync::atomic::AtomicU64;
 use std::sync::{LazyLock, OnceLock};
-const CAPABILITY: &str = "voxgolem:app-bench:synthetic-input-only:v1";
+const CAPABILITY: &str = "voxgolem:app-bench:canonical-managed-auth:v2";
+static LIVE_AUTH_CONFIG: OnceLock<Option<voxgolem_core::config::CustomOpenAiConfig>> =
+    OnceLock::new();
+
+pub(crate) fn live_auth_configuration() -> Option<&'static voxgolem_core::config::CustomOpenAiConfig>
+{
+    LIVE_AUTH_CONFIG.get().and_then(|config| config.as_ref())
+}
+
+fn resolve_live_auth_source(
+    mode: &str,
+    source: Option<&Path>,
+    root: &Path,
+) -> Result<Option<PathBuf>, String> {
+    if mode == "offline" {
+        return if source.is_none() {
+            Ok(None)
+        } else {
+            Err("Offline mode forbids an auth source override".into())
+        };
+    }
+    if mode != "live" {
+        return Err("Benchmark mode must be explicit".into());
+    }
+    let source = source.ok_or("Live auth source config missing")?;
+    let resolved = source
+        .canonicalize()
+        .map_err(|_| "Live auth source unavailable")?;
+    if !source.is_absolute()
+        || source != resolved
+        || !source.is_file()
+        || resolved.starts_with(root)
+    {
+        return Err("Live auth source must be a canonical regular config outside the run".into());
+    }
+    let auth = voxgolem_core::config::managed_chatgpt_auth_path(&resolved);
+    if auth.starts_with(root) || !auth.is_file() || auth.canonicalize().ok().as_ref() != Some(&auth)
+    {
+        return Err("Live managed auth must be a canonical regular file".into());
+    }
+    Ok(Some(auth))
+}
 #[cfg(not(test))]
 use voxgolem_platform::search::RunEvent;
 
@@ -271,6 +314,21 @@ pub(crate) fn validate_environment() -> Result<(), String> {
     if entry == "voice-arithmetic-windows" {
         validate_windows_storage(&root)?;
     }
+    let source = std::env::var_os("VOXGOLEM_BENCH_AUTH_SOURCE_CONFIG").map(PathBuf::from);
+    let auth = resolve_live_auth_source(
+        &std::env::var("VOXGOLEM_BENCH_MODE").map_err(|_| "Benchmark mode missing")?,
+        source.as_deref(),
+        &root,
+    )?;
+    let auth = auth
+        .map(|path| {
+            voxgolem_core::config::effective_custom_openai_config(Some(&path), None)
+                .ok_or("Live managed auth disappeared during selection")
+        })
+        .transpose()?;
+    LIVE_AUTH_CONFIG
+        .set(auth)
+        .map_err(|_| "Benchmark auth already selected")?;
     if let Ok(case) = std::env::var("VOXGOLEM_BENCH_AUTO_DIAGNOSTIC_CASE") {
         if std::env::var("VOXGOLEM_BENCH_MODE").as_deref() != Ok("offline")
             || !matches!(case.as_str(), "quick" | "short_research" | "long_research")
@@ -504,31 +562,22 @@ pub(crate) fn model_event(event: &RunEvent<'_>) {
     }
 }
 
-pub(crate) fn frontend_diagnostic(kind: FrontendRuntimeDiagnosticKind, detail: &str) {
-    let stage = match detail {
-        "benchmark_lifetime_retire" => "frontend_lifetime_retired",
-        "benchmark_controls_retire" => "frontend_controls_retired",
-        "benchmark_capability_retire" => "frontend_capability_retired",
-        "benchmark_audio_error" => "frontend_audio_error",
-        "benchmark_cue_error" => "frontend_cue_error",
-        _ if matches!(kind, FrontendRuntimeDiagnosticKind::Audio)
-            && detail.contains("fell behind") =>
-        {
-            "frontend_audio_backlog"
-        }
-        _ if matches!(kind, FrontendRuntimeDiagnosticKind::Audio)
-            && detail.contains("Runtime control payload") =>
-        {
-            "frontend_audio_invalid_status"
-        }
-        _ if matches!(kind, FrontendRuntimeDiagnosticKind::Audio)
-            && detail.starts_with("Live audio error:") =>
-        {
-            "frontend_audio_failed"
-        }
-        _ => return,
-    };
-    mark(stage);
+pub(crate) fn frontend_diagnostic(kind: FrontendRuntimeDiagnosticKind) {
+    if let Some(stage) = frontend_diagnostic_stage(kind) {
+        mark(stage);
+    }
+}
+
+fn frontend_diagnostic_stage(kind: FrontendRuntimeDiagnosticKind) -> Option<&'static str> {
+    Some(match kind {
+        FrontendRuntimeDiagnosticKind::BenchmarkLifetimeRetire => "frontend_lifetime_retired",
+        FrontendRuntimeDiagnosticKind::BenchmarkControlsRetire => "frontend_controls_retired",
+        FrontendRuntimeDiagnosticKind::BenchmarkCapabilityRetire => "frontend_capability_retired",
+        FrontendRuntimeDiagnosticKind::BenchmarkAudioError => "frontend_audio_error",
+        FrontendRuntimeDiagnosticKind::BenchmarkCueError => "frontend_cue_error",
+        FrontendRuntimeDiagnosticKind::AudioFailed => "frontend_audio_failed",
+        _ => return None,
+    })
 }
 
 #[tauri::command]
@@ -898,6 +947,30 @@ shutil.copytree(run/'config',root/'VoxGolem')
     use super::*;
 
     #[test]
+    fn frontend_categories_preserve_retirement_stages_without_inventing_backlog_causes() {
+        use FrontendRuntimeDiagnosticKind::*;
+        for (kind, expected) in [
+            (BenchmarkLifetimeRetire, "frontend_lifetime_retired"),
+            (BenchmarkControlsRetire, "frontend_controls_retired"),
+            (BenchmarkCapabilityRetire, "frontend_capability_retired"),
+            (BenchmarkAudioError, "frontend_audio_error"),
+            (BenchmarkCueError, "frontend_cue_error"),
+            (AudioFailed, "frontend_audio_failed"),
+        ] {
+            assert_eq!(frontend_diagnostic_stage(kind), Some(expected));
+        }
+        for kind in [
+            FrontendNotice,
+            ExecutionFailed,
+            MicrophoneStatusChanged,
+            ProfileSwitchFailed,
+            TtsToggleFailed,
+        ] {
+            assert_eq!(frontend_diagnostic_stage(kind), None);
+        }
+    }
+
+    #[test]
     fn native_audio_metadata_separates_audio_failures_from_trace_loss() {
         let trace = Trace {
             dropped: 7,
@@ -1035,6 +1108,54 @@ shutil.copytree(run/'config',root/'VoxGolem')
             "processing_failures",
         ] {
             assert_eq!(metadata[name], 0, "flow reset must retire {name}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod canonical_auth_tests {
+    use super::*;
+
+    #[test]
+    fn source_selection_is_explicit_canonical_and_live_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let root = base.join("run");
+        fs::create_dir(&root).unwrap();
+        let source = base.join("config.toml");
+        fs::write(&source, "").unwrap();
+        let auth = voxgolem_core::config::managed_chatgpt_auth_path(&source);
+        fs::create_dir_all(auth.parent().unwrap()).unwrap();
+        fs::write(&auth, "{}").unwrap();
+        assert_eq!(
+            resolve_live_auth_source("live", Some(&source), &root).unwrap(),
+            Some(auth.clone())
+        );
+        assert!(resolve_live_auth_source("live", None, &root).is_err());
+        assert!(resolve_live_auth_source("offline", Some(&source), &root).is_err());
+        assert_eq!(
+            resolve_live_auth_source("offline", None, &root).unwrap(),
+            None
+        );
+        for invalid in [
+            base.clone(),
+            base.join("missing"),
+            PathBuf::from("config.toml"),
+        ] {
+            assert!(resolve_live_auth_source("live", Some(&invalid), &root).is_err());
+        }
+        let isolated = root.join("config.toml");
+        fs::write(&isolated, "").unwrap();
+        assert!(resolve_live_auth_source("live", Some(&isolated), &root).is_err());
+        fs::remove_file(&auth).unwrap();
+        assert!(resolve_live_auth_source("live", Some(&source), &root).is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&source, &auth).unwrap();
+            assert!(resolve_live_auth_source("live", Some(&source), &root).is_err());
+            let linked = base.join("linked.toml");
+            std::os::unix::fs::symlink(&source, &linked).unwrap();
+            assert!(resolve_live_auth_source("live", Some(&linked), &root).is_err());
         }
     }
 }

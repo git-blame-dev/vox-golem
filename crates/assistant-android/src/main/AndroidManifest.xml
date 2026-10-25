@@ -17,15 +17,16 @@
             <intent-filter>
                 <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
                 <data android:scheme="wear" android:host="*" android:pathPrefix="/voxgolem/chatgpt-access/v1/" />
+                <data android:scheme="wear" android:host="*" android:pathPrefix="/voxgolem/assistant/v2/reconcile-hint" />
             </intent-filter>
             <intent-filter>
                 <action android:name="com.google.android.gms.wearable.DATA_CHANGED" />
                 <data android:scheme="wear" android:host="*" android:pathPrefix="/voxgolem/assistant/v1/" />
-                <data android:scheme="wear" android:host="*" android:pathPrefix="/voxgolem/assistant/v2/" />
             </intent-filter>
             <intent-filter>
                 <action android:name="com.google.android.gms.wearable.CHANNEL_EVENT" />
                 <data android:scheme="wear" android:host="*" android:pathPrefix="/voxgolem/assistant/v2/phone-relay/" />
+                <data android:scheme="wear" android:host="*" android:pathPrefix="/voxgolem/assistant/v2/session/" />
             </intent-filter>
             <intent-filter>
                 <action android:name="com.google.android.gms.wearable.CAPABILITY_CHANGED" />

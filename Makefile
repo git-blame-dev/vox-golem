@@ -84,7 +84,7 @@ LINUX_ORT_PROVIDER_LIBS := \
 
 .DEFAULT_GOAL := help
 
-.PHONY: benchmark test-benchmark wakeword-bench test-wakeword-bench search-bench encoder-bench test-search-bench test-router-head
+.PHONY: benchmark test-benchmark test-app-benchmark wakeword-bench test-wakeword-bench search-bench encoder-bench test-search-bench test-router-head
 
 benchmark:
 	@test -n '$(PLATFORM)' || { printf '%s\n' 'Set PLATFORM=android, desktop or wear; use BENCHMARK_FLAGS="--help" for options.' >&2; exit 1; }
@@ -92,6 +92,9 @@ benchmark:
 
 test-benchmark:
 	python3 -m unittest discover -s tools/benchmark -p 'test_*.py'
+
+test-app-benchmark:
+	python3 -m unittest discover -s tools/app-bench -p 'test_*.py'
 
 wakeword-bench:
 	@test -n '$(WAKE_WORD_MODEL)' || { printf '%s\n' 'Set WAKE_WORD_MODEL to a local classifier ONNX file.' >&2; exit 1; }
@@ -117,7 +120,7 @@ test-router-head:
 	mkdir -p /tmp/opencode
 	python3 -m unittest discover -s tools/router-head -p 'test_*.py'
 
-.PHONY: help app-version icons test test-release-tools test-android-tools check-android-tools android-init android-build android-capture-test check-wear-tools wear-test wear-build wear-performance check-linux-tools app app-smoke packaged-smoke app-dev linux dist stage-linux-existing verify-dist prepare-appimage-tools update-bundle postprocess-update-bundle verify-update-bundle update-bundle-smoke check-pc-tools prepare-pc-bundle pc pc-dist verify-pc-dist pc-installer verify-pc-installer clean
+.PHONY: help app-version icons test test-release-tools test-android-tools check-android-tools android-init android-build android-release android-capture-test check-wear-tools wear-test wear-build wear-performance check-linux-tools app app-smoke packaged-smoke app-dev linux dist stage-linux-existing verify-dist prepare-appimage-tools update-bundle postprocess-update-bundle verify-update-bundle update-bundle-smoke check-pc-tools prepare-pc-bundle pc pc-dist verify-pc-dist pc-installer verify-pc-installer clean
 
 help:
 	@printf '%s\n' 'Targets:'
@@ -128,6 +131,7 @@ help:
 	@printf '%s\n' '  make test     Run deterministic Linux frontend and Rust checks'
 	@printf '%s\n' '  make benchmark PLATFORM=android|desktop [DEVICE=a17] BENCHMARK_FLAGS="..."  Run the shared typed-app suite (explicit runtime flags required)'
 	@printf '%s\n' '  make test-benchmark  Run shared benchmark controller and adapter unit tests without device access'
+	@printf '%s\n' '  make test-app-benchmark  Run isolated app benchmark runner and fixture unit tests offline'
 	@printf '%s\n' '  make search-bench [SEARCH_BENCH_FLAGS="--with-llm"]  Run the cross-codepath search benchmark'
 	@printf '%s\n' '  make encoder-bench ENCODER_SERVER=/path/llama-server ENCODER_MODEL=/path/bge.gguf  Run the isolated local encoder benchmark'
 	@printf '%s\n' '  make test-search-bench  Run deterministic offline search & router benchmark'
@@ -143,6 +147,7 @@ help:
 	@printf '%s\n' '  make pc-installer Build the lightweight Windows NSIS installer from Linux'
 	@printf '%s\n' '  make android-init Regenerate the pinned Android platform scaffold'
 	@printf '%s\n' '  make android-build Build the ARM64 Android debug APK'
+	@printf '%s\n' '  make android-release Build the optimized ARM64 Android release APK (unsigned without local signing configuration)'
 	@printf '%s\n' '  make android-capture-test Run native capture unit tests and lint after android-build'
 	@printf '%s\n' '  make android-voice-test Run SDK-only voice unit tests and lint without building JNI'
 	@printf '%s\n' '  make wear-test Run Wear capture unit tests and lint'
@@ -165,6 +170,8 @@ test:
 	$(MAKE) --no-print-directory test-release-tools
 	$(MAKE) --no-print-directory test-android-tools
 	$(MAKE) --no-print-directory test-local-runtime-tools
+	$(MAKE) --no-print-directory test-benchmark
+	$(MAKE) --no-print-directory test-app-benchmark
 	cargo fmt --all -- --check
 	cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 	cargo test --locked --workspace
@@ -211,6 +218,10 @@ android-init: check-android-tools
 android-build: check-android-tools
 	python3 scripts/prepare-android-capture.py
 	cd apps/android-tauri/src-tauri && cargo tauri android build --debug --target aarch64 --apk --ci -- --locked
+
+android-release: check-android-tools
+	python3 scripts/prepare-android-capture.py
+	cd apps/android-tauri/src-tauri && cargo tauri android build --target aarch64 --apk --ci -- --locked
 
 android-capture-test: check-android-tools
 	python3 scripts/prepare-android-capture.py

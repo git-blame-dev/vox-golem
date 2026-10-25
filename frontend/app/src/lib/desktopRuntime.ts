@@ -1,7 +1,7 @@
-import { parseExecutionId } from './appSnapshot'
+import { parseCoreRequestCorrelation, parseExecutionId } from './appSnapshot'
 import type { ExecutionId } from './appSnapshot'
-import { parseCanonicalPromptOutcome, parsePromptExecutionEvent, parsePromptExecutionResult } from './promptExecution'
-import { isRecord, parseRuntimePhase, utf8ByteLength } from './wire'
+import { parseCanonicalPromptOutcome, parsePromptExecutionEvent } from './promptExecution'
+import { isCoreWhitespaceOnly, isRecord, parseRuntimePhase, utf8ByteLength } from './wire'
 import type { BackendRuntimePhase, PromptExecutionEvent, PromptExecutionResult } from '../types/chat'
 
 export interface VoiceProjection {
@@ -32,8 +32,8 @@ export type DesktopRuntimeEvent = { readonly revision: number } & (
   | { readonly kind: 'voice'; readonly voice: VoiceProjection }
   | { readonly kind: 'speech'; readonly speech: SpeechProjection }
   | { readonly kind: 'prompt_started'; readonly prompt: NativePromptProjection }
-  | { readonly kind: 'prompt_update'; readonly requestId: string; readonly update: PromptExecutionEvent }
-  | { readonly kind: 'prompt_finished'; readonly requestId: string; readonly result: PromptExecutionResult }
+  | { readonly kind: 'prompt_update'; readonly requestId: string; readonly executionId: ExecutionId; readonly update: PromptExecutionEvent }
+  | { readonly kind: 'prompt_finished'; readonly requestId: string; readonly executionId: ExecutionId; readonly result: PromptExecutionResult }
 )
 export interface DesktopRuntimeRead { readonly revision: number; readonly snapshot: DesktopRuntimeSnapshot | null; readonly events: readonly DesktopRuntimeEvent[] }
 
@@ -47,7 +47,7 @@ function sequence(value: unknown): number {
 }
 function nullableId(value: unknown): number | null { return value === null ? null : sequence(value) }
 function text(value: unknown, max: number, nonempty = false): string {
-  if (typeof value !== 'string' || value.length > max || utf8ByteLength(value) > max || (nonempty && value.trim().length === 0)) throw new Error('Invalid desktop runtime text')
+  if (typeof value !== 'string' || value.length > max || utf8ByteLength(value) > max || (nonempty && isCoreWhitespaceOnly(value))) throw new Error('Invalid desktop runtime text')
   return value
 }
 function parseVoice(value: unknown): VoiceProjection {
@@ -72,23 +72,26 @@ function parseUpdate(value: unknown, requestId: string): PromptExecutionEvent {
   if ('request_id' in v) throw new Error('Desktop update must use enclosing request identity')
   return parsePromptExecutionEvent({ ...v, request_id: requestId })
 }
-function parseResult(value: unknown, requestId: string): PromptExecutionResult {
+export function sameExecution(left: ExecutionId, right: ExecutionId): boolean {
+  return left.sessionId === right.sessionId && left.generation === right.generation
+}
+function parseResult(value: unknown, requestId: string, executionId: ExecutionId): PromptExecutionResult {
   const v = record(value)
-  const result = typeof v['kind'] === 'string' ? parseCanonicalPromptOutcome(v, requestId) : parsePromptExecutionResult(v)
+  const result = parseCanonicalPromptOutcome(v, requestId)
   if (result.requestId !== requestId || (result.errorMessage !== null && result.errorMessage !== undefined && utf8ByteLength(result.errorMessage) > 4096)) throw new Error('Invalid desktop prompt result')
+  const innerExecution = result.canonicalTurn?.executionId ?? result.unsavedResult?.executionId
+  if (innerExecution !== undefined && !sameExecution(innerExecution, executionId)) throw new Error('Desktop prompt result execution identity mismatch')
   return result
 }
 function parsePrompt(value: unknown): NativePromptProjection {
   const v = record(value)
-  const requestId = text(v['request_id'], 128, true)
-  const execution = record(v['execution_id'])
-  text(execution['session_id'], 64, true)
-  text(execution['generation'], 64, true)
+  const requestId = parseCoreRequestCorrelation(v['request_id'])
+  const executionId = parseExecutionId(v['execution_id'])
   const updates = v['updates']
   if (!Array.isArray(updates) || updates.length > 32) throw new Error('Invalid desktop prompt projection budget')
   const parsed = updates.map((update) => parseUpdate(update, requestId))
   if (parsed.reduce((sum, update) => sum + ('text' in update ? utf8ByteLength(update.text) : 0), 0) > 512 * 1024) throw new Error('Desktop prompt projection exceeds text budget')
-  return { requestId, executionId: parseExecutionId(execution, true), prompt: text(v['prompt'], 32 * 1024, true), updates: parsed, result: v['result'] === null ? null : parseResult(v['result'], requestId) }
+  return { requestId, executionId, prompt: text(v['prompt'], 32 * 1024, true), updates: parsed, result: v['result'] === null ? null : parseResult(v['result'], requestId, executionId) }
 }
 function parseSnapshot(value: unknown): DesktopRuntimeSnapshot {
   const v = record(value)
@@ -102,12 +105,14 @@ function parseEvent(value: unknown): DesktopRuntimeEvent {
     case 'speech': return { revision, kind: 'speech', speech: parseSpeech(v['speech']) }
     case 'prompt_started': return { revision, kind: 'prompt_started', prompt: parsePrompt(v['prompt']) }
     case 'prompt_update': {
-      const requestId = text(v['request_id'], 128, true)
-      return { revision, kind: 'prompt_update', requestId, update: parseUpdate(v['update'], requestId) }
+      const requestId = parseCoreRequestCorrelation(v['request_id'])
+      const executionId = parseExecutionId(v['execution_id'])
+      return { revision, kind: 'prompt_update', requestId, executionId, update: parseUpdate(v['update'], requestId) }
     }
     case 'prompt_finished': {
-      const requestId = text(v['request_id'], 128, true)
-      return { revision, kind: 'prompt_finished', requestId, result: parseResult(v['result'], requestId) }
+      const requestId = parseCoreRequestCorrelation(v['request_id'])
+      const executionId = parseExecutionId(v['execution_id'])
+      return { revision, kind: 'prompt_finished', requestId, executionId, result: parseResult(v['result'], requestId, executionId) }
     }
     default: throw new Error('Invalid desktop runtime event kind')
   }

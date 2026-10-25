@@ -132,11 +132,15 @@ class AssistantRequestWorker(
                 val stillCurrent = synchronized(lock) { !closed && active == null && prewarmSequence == sequence }
                 if (!stillCurrent) return@execute
                 try {
-                    native.prewarm(model, authPath(), webEnabled)
+                    val path = authPath()
+                    if (synchronized(lock) { closed || active != null || prewarmSequence != sequence }) return@execute
+                    native.prewarm(model, path, webEnabled)
                 } catch (_: RuntimeException) {}
             }
         } catch (_: RuntimeException) {}
     }
+
+    fun invalidatePrewarm(): Unit = synchronized(lock) { ++prewarmSequence; Unit }
 
     fun cancel(): Unit = synchronized(lock) {
         active?.let { request ->

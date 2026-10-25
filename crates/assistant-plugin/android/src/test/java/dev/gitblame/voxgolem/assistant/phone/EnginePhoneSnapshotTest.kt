@@ -125,7 +125,8 @@ class EnginePhoneSnapshotTest {
                 recordJson = "{\"syntheticDurableRecord\":true}", terminalContextJson = raw)
             val durableTurn = JSONObject().put("id", "synthetic-durable-turn")
             val voiceContext = JSONObject().put("conversation", "synthetic-committed-conversation").put("selectedHead", "synthetic-committed-head")
-            val outcome = JSONObject().put("kind", "completed").put("turn", durableTurn).put("voiceContext", voiceContext)
+            val outcome = JSONObject().put("kind", "completed").put("save_disposition", "saved")
+                .put("turn", durableTurn).put("voiceContext", voiceContext)
             backend.attachTerminalSnapshot(outcome, result, captured)
             check(outcome.has("app_snapshot"))
             outcome.remove("app_snapshot")
@@ -133,6 +134,7 @@ class EnginePhoneSnapshotTest {
             else store.createConversation("Synthetic concurrent")
             backend.attachTerminalSnapshot(outcome, result, captured)
             assertEquals(durableTurn.toString(), outcome.getJSONObject("turn").toString())
+            assertEquals("saved", outcome.getString("save_disposition"))
             assertEquals(voiceContext.toString(), outcome.getJSONObject("voiceContext").toString())
             return outcome
         }
@@ -285,6 +287,8 @@ class EnginePhoneSnapshotTest {
     @Test fun snapshotUsesOneFreshProjectionForSelectionAndCanonicalContextAndRetainsDraft() {
         Fixture().use { f ->
             val value = f.snapshot().getOrThrow() as JSONObject
+            assertTrue(value.has("unsaved_result"))
+            assertSame(JSONObject.NULL, value.get("unsaved_result"))
             assertEquals(listOf("projection"), f.calls)
             assertEquals(PhoneSnapshotEncoder.wireId(f.conversation), value.getString("session_id"))
             assertEquals("Synthetic retained draft", value.getJSONObject("assistant").getString("draft"))

@@ -1,4 +1,5 @@
-//! Exact inventory and per-peer durable receipts; transport and retry IO are native-owned.
+//! Exact inventory and per-peer durable receipts; transient connected-session catch-up
+//! and transport IO are native-owned.
 //!
 //! Inventory advertises retained bodies only, never purged content. Walk revision-pinned
 //! pages to completion; restart if the sender revision changes. A missing ID in one page
@@ -7,8 +8,12 @@
 //! keys in the trusted bridge, independently recomputing keys as documented by the domain.
 //! `reconcile_page` does not infer convergence from one page or from a sequence watermark.
 //! `missing_ancestors` is bounded work, not an instruction to execute a provider request.
+//! Connected-session transfer batches must account for every requested record via validated
+//! descriptors or unavailable IDs, respecting phase, byte, and record count limits.
 //! Generate receipts from the committed revision only. Store receipts and retry/outbox
 //! changes transactionally with a revision check; publishing or GMS success is not an ACK.
+//! Reciprocal receipt confirmation requires exact matching operation and body-key sets
+//! before retiring per-peer delivery work.
 //! Receipt `recipient_replica` names the installation that persisted data, not a node route.
 //! Unknown/conflicting receipts are rejected rather than suppressing delivery.
 //! Quarantined bodies remain durable evidence and exact receipt targets, but are omitted
@@ -24,6 +29,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_CONTROL_ITEMS: usize = 128;
 pub const MAX_CONTROL_BYTES: usize = 32 * 1024;
+pub const MAX_HINT_BYTES: usize = 256;
+pub const MAX_CHUNK_BYTES: usize = 64 * 1024;
+pub const MAX_BATCH_RECORDS: usize = 8;
+pub const MAX_RECORD_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_SESSION_PAGES: usize = 4096;
 pub const MAX_RECEIPTS: usize = 65_536;
 // IDs/keys are validated ASCII, so 512 covers each encoded entry including field names.
 const ENTRY_BYTES_UPPER_BOUND: usize = 512;
@@ -82,58 +93,194 @@ pub struct Receipt {
     pub body_key: String,
 }
 
-#[derive(Debug, Serialize)]
-pub struct RetainedDescriptorDisposition {
-    pub revision: String,
-    pub revision_matches: bool,
-    pub retained: Vec<bool>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncPhase {
+    Tombstones,
+    Records,
 }
 
-/// Exact outgoing eligibility for a bounded set, never bodies or receipt evidence.
-/// The native owner bounds encoded bytes and pins this read to its current revision.
-pub fn retained_descriptors(
-    store: &Store,
-    revision: Option<String>,
-    entries: Vec<InventoryEntry>,
-) -> Result<RetainedDescriptorDisposition, DomainError> {
-    if let Some(revision) = &revision {
-        decimal(revision, true)?;
-    }
-    if entries.len() > MAX_CONTROL_ITEMS {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestedRecord {
+    pub id: OperationId,
+    pub expected: Option<InventoryEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransferDescriptor {
+    pub entry: InventoryEntry,
+    pub bytes: usize,
+}
+
+pub fn validate_transfer_batch(
+    requested: &[RequestedRecord],
+    phase: SyncPhase,
+    descriptors: &[TransferDescriptor],
+    unavailable: &[OperationId],
+) -> Result<(), DomainError> {
+    if requested.is_empty() || requested.len() > MAX_BATCH_RECORDS {
         return Err(DomainError::LimitExceeded {
-            limit: "retained_descriptor_items".into(),
+            limit: "transfer_batch_records".into(),
         });
     }
-    let mut wanted = BTreeSet::new();
-    for entry in &entries {
-        validate_entry(entry)?;
-        if !wanted.insert(&entry.id) {
+    let mut requested_by_id = BTreeMap::new();
+    for req in requested {
+        req.id.validate()?;
+        if let Some(expected) = &req.expected {
+            validate_entry(expected)?;
+            if expected.id != req.id {
+                return Err(DomainError::Invalid {
+                    field: "requested_record_id".into(),
+                });
+            }
+        }
+        if requested_by_id
+            .insert(&req.id, req.expected.as_ref())
+            .is_some()
+        {
             return Err(DomainError::Invalid {
-                field: "retained_descriptor_duplicate".into(),
+                field: "requested_record_duplicate".into(),
             });
         }
     }
-    let retained = entries
-        .iter()
-        .map(|entry| {
-            store.retained_record(&entry.id).is_some_and(|record| {
-                !store.is_quarantined(&entry.id)
-                    && record.body_key == entry.body_key
-                    && record.operation.conversation() == &entry.conversation
-                    && matches!(
-                        &record.operation.body,
-                        OperationBody::ConversationDeleted { .. }
-                    ) == entry.tombstone
-            })
-        })
-        .collect();
-    Ok(RetainedDescriptorDisposition {
-        revision: store.revision().into(),
-        revision_matches: revision
-            .as_ref()
-            .is_none_or(|revision| revision == store.revision()),
-        retained,
-    })
+    if descriptors.len() > MAX_BATCH_RECORDS {
+        return Err(DomainError::LimitExceeded {
+            limit: "transfer_batch_records".into(),
+        });
+    }
+    let mut answered = BTreeSet::new();
+    let mut total_bytes = 0usize;
+    for descriptor in descriptors {
+        validate_entry(&descriptor.entry)?;
+        if !(2..=MAX_RECORD_BYTES).contains(&descriptor.bytes) {
+            return Err(DomainError::LimitExceeded {
+                limit: "transfer_record_bytes".into(),
+            });
+        }
+        total_bytes = total_bytes.checked_add(descriptor.bytes).ok_or_else(|| {
+            DomainError::LimitExceeded {
+                limit: "transfer_batch_bytes".into(),
+            }
+        })?;
+        if total_bytes > MAX_BATCH_BYTES {
+            return Err(DomainError::LimitExceeded {
+                limit: "transfer_batch_bytes".into(),
+            });
+        }
+        if phase == SyncPhase::Tombstones && !descriptor.entry.tombstone {
+            return Err(DomainError::Invalid {
+                field: "transfer_phase_tombstone".into(),
+            });
+        }
+        let expected =
+            requested_by_id
+                .get(&descriptor.entry.id)
+                .ok_or_else(|| DomainError::Invalid {
+                    field: "transfer_unrequested_id".into(),
+                })?;
+        if !answered.insert(&descriptor.entry.id) {
+            return Err(DomainError::Invalid {
+                field: "transfer_duplicate_id".into(),
+            });
+        }
+        if let Some(exp) = expected {
+            if &descriptor.entry != *exp {
+                return Err(DomainError::Invalid {
+                    field: "transfer_entry_mismatch".into(),
+                });
+            }
+        }
+    }
+    for id in unavailable {
+        id.validate()?;
+        if !requested_by_id.contains_key(id) {
+            return Err(DomainError::Invalid {
+                field: "transfer_unrequested_id".into(),
+            });
+        }
+        if !answered.insert(id) {
+            return Err(DomainError::Invalid {
+                field: "transfer_duplicate_id".into(),
+            });
+        }
+    }
+    if descriptors.len() + unavailable.len() != requested.len() {
+        return Err(DomainError::Invalid {
+            field: "transfer_unanswered_request".into(),
+        });
+    }
+    Ok(())
+}
+
+pub fn validate_confirmed_receipts(
+    peer_replica: &str,
+    expected: &[Receipt],
+    confirmed: &[Receipt],
+) -> Result<(), DomainError> {
+    validate_replica(peer_replica)?;
+    if expected.is_empty() || expected.len() > MAX_CONTROL_ITEMS {
+        return Err(DomainError::LimitExceeded {
+            limit: "confirmed_receipt_items".into(),
+        });
+    }
+    if confirmed.len() != expected.len() {
+        return Err(DomainError::Invalid {
+            field: "confirmed_receipt_count".into(),
+        });
+    }
+    let mut expected_by_op = BTreeMap::new();
+    for receipt in expected {
+        if receipt.version != SCHEMA_VERSION {
+            return Err(DomainError::UnsupportedVersion {
+                version: receipt.version,
+            });
+        }
+        validate_replica(&receipt.recipient_replica)?;
+        receipt.operation.validate()?;
+        validate_body_key(&receipt.body_key)?;
+        if expected_by_op
+            .insert(&receipt.operation, &receipt.body_key)
+            .is_some()
+        {
+            return Err(DomainError::Invalid {
+                field: "expected_receipt_duplicate".into(),
+            });
+        }
+    }
+    let mut confirmed_ops = BTreeSet::new();
+    for receipt in confirmed {
+        if receipt.version != SCHEMA_VERSION {
+            return Err(DomainError::UnsupportedVersion {
+                version: receipt.version,
+            });
+        }
+        if receipt.recipient_replica != peer_replica {
+            return Err(DomainError::Invalid {
+                field: "receipt_peer".into(),
+            });
+        }
+        receipt.operation.validate()?;
+        validate_body_key(&receipt.body_key)?;
+        if !confirmed_ops.insert(&receipt.operation) {
+            return Err(DomainError::Invalid {
+                field: "confirmed_receipt_duplicate".into(),
+            });
+        }
+        let expected_key =
+            expected_by_op
+                .get(&receipt.operation)
+                .ok_or_else(|| DomainError::Missing {
+                    id: receipt.operation.clone(),
+                })?;
+        if *expected_key != &receipt.body_key {
+            return Err(DomainError::IdConflict {
+                id: receipt.operation.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn inventory(store: &Store) -> BTreeMap<OperationId, InventoryEntry> {
@@ -213,18 +360,6 @@ pub fn reconcile_page(store: &Store, page: InventoryPage) -> Result<ReconcilePla
     validate_page(&page)?;
     let local = inventory(store);
     let keys = body_keys(store);
-    let retained_metadata: BTreeMap<_, _> = store
-        .retained_records()
-        .map(|r| {
-            (
-                r.operation.id.clone(),
-                (
-                    r.operation.conversation().clone(),
-                    matches!(r.operation.body, OperationBody::ConversationDeleted { .. }),
-                ),
-            )
-        })
-        .collect();
     let retired: BTreeMap<_, _> = store.retired_records().map(|r| (r.id.clone(), r)).collect();
     let locally_deleted: BTreeSet<_> = local
         .values()
@@ -245,12 +380,13 @@ pub fn reconcile_page(store: &Store, page: InventoryPage) -> Result<ReconcilePla
             if key != &entry.body_key {
                 return Err(DomainError::IdConflict { id: entry.id });
             }
-            if retained_metadata
-                .get(&entry.id)
-                .is_some_and(|(conversation, tombstone)| {
-                    conversation != &entry.conversation || tombstone != &entry.tombstone
-                })
-            {
+            if store.retained_record(&entry.id).is_some_and(|record| {
+                record.operation.conversation() != &entry.conversation
+                    || matches!(
+                        record.operation.body,
+                        OperationBody::ConversationDeleted { .. }
+                    ) != entry.tombstone
+            }) {
                 return Err(DomainError::Invalid {
                     field: "inventory_metadata".into(),
                 });
@@ -496,6 +632,7 @@ fn validate_entry(entry: &InventoryEntry) -> Result<(), DomainError> {
 mod tests {
     use super::*;
     use crate::durable_conversation::{Command, Operation, Record, StoreSnapshot};
+    use std::slice::from_ref;
     const A: &str = "00000000-0000-4000-8000-000000000001";
     const B: &str = "00000000-0000-4000-8000-000000000002";
     const C: &str = "00000000-0000-4000-8000-000000000003";
@@ -505,32 +642,299 @@ mod tests {
             sequence: n.to_string(),
         }
     }
+    fn entry(n: u64, tombstone: bool) -> InventoryEntry {
+        InventoryEntry {
+            id: id(n),
+            conversation: id(1),
+            body_key: format!("{n:064x}"),
+            tombstone,
+        }
+    }
+    fn receipt(recipient: &str, n: u64) -> Receipt {
+        Receipt {
+            version: SCHEMA_VERSION,
+            recipient_replica: recipient.into(),
+            operation: id(n),
+            body_key: format!("{n:064x}"),
+        }
+    }
     #[test]
-    fn retained_descriptor_predicate_matches_snapshot_inventory_without_requiring_page_order() {
-        let store = store(128);
-        let mut entries: Vec<_> = inventory_entries(&store).collect();
-        entries.reverse();
-        let result =
-            retained_descriptors(&store, Some(store.revision().into()), entries.clone()).unwrap();
-        assert_eq!(result.retained, vec![true; 128]);
-        assert!(result.revision_matches);
-        let restored = Store::restore(store.export()).unwrap();
+    fn session_bounds_constants_match_specification() {
+        assert_eq!(MAX_CONTROL_ITEMS, 128);
+        assert_eq!(MAX_CONTROL_BYTES, 32 * 1024);
+        assert_eq!(MAX_HINT_BYTES, 256);
+        assert_eq!(MAX_CHUNK_BYTES, 64 * 1024);
+        assert_eq!(MAX_BATCH_RECORDS, 8);
+        assert_eq!(MAX_RECORD_BYTES, 2 * 1024 * 1024);
+        assert_eq!(MAX_BATCH_BYTES, 4 * 1024 * 1024);
+        assert_eq!(MAX_SESSION_PAGES, 4096);
+        assert_eq!(MAX_RECEIPTS, 65_536);
+    }
+    #[test]
+    fn validate_transfer_batch_accepts_exact_and_ancestor_requests_and_enforces_invariants() {
+        let req_exact = RequestedRecord {
+            id: id(1),
+            expected: Some(entry(1, false)),
+        };
+        let req_ancestor = RequestedRecord {
+            id: id(2),
+            expected: None,
+        };
+        let req_unavailable = RequestedRecord {
+            id: id(3),
+            expected: Some(entry(3, false)),
+        };
+        let desc1 = TransferDescriptor {
+            entry: entry(1, false),
+            bytes: 128,
+        };
+        let desc2 = TransferDescriptor {
+            entry: entry(2, false),
+            bytes: 256,
+        };
         assert_eq!(
-            retained_descriptors(&restored, None, entries.clone())
-                .unwrap()
-                .retained,
-            result.retained
+            validate_transfer_batch(
+                &[req_exact.clone(), req_ancestor.clone(), req_unavailable],
+                SyncPhase::Records,
+                &[desc1.clone(), desc2.clone()],
+                &[id(3)],
+            ),
+            Ok(())
         );
-        entries[0].tombstone = true;
-        let disposition =
-            retained_descriptors(&store, Some("999".into()), entries.clone()).unwrap();
-        assert!(!disposition.retained[0]);
-        assert!(disposition.retained[1..].iter().all(|retained| *retained));
-        assert!(!disposition.revision_matches);
-        assert_eq!(disposition.revision, store.revision());
-        entries[0].body_key = "invalid".into();
-        assert!(retained_descriptors(&store, None, entries).is_err());
-        assert!(retained_descriptors(&store, Some("01".into()), vec![]).is_err());
+
+        let tomb_req = RequestedRecord {
+            id: id(10),
+            expected: Some(entry(10, true)),
+        };
+        let tomb_desc = TransferDescriptor {
+            entry: entry(10, true),
+            bytes: 64,
+        };
+        assert_eq!(
+            validate_transfer_batch(
+                from_ref(&tomb_req),
+                SyncPhase::Tombstones,
+                &[tomb_desc],
+                &[]
+            ),
+            Ok(())
+        );
+        assert!(matches!(
+            validate_transfer_batch(
+                from_ref(&req_exact),
+                SyncPhase::Tombstones,
+                from_ref(&desc1),
+                &[]
+            ),
+            Err(DomainError::Invalid { .. })
+        ));
+
+        assert!(matches!(
+            validate_transfer_batch(&[], SyncPhase::Records, &[], &[]),
+            Err(DomainError::LimitExceeded { .. })
+        ));
+        let too_many_reqs: Vec<_> = (1..=9)
+            .map(|n| RequestedRecord {
+                id: id(n),
+                expected: None,
+            })
+            .collect();
+        assert!(matches!(
+            validate_transfer_batch(&too_many_reqs, SyncPhase::Records, &[], &[]),
+            Err(DomainError::LimitExceeded { .. })
+        ));
+
+        let mismatched_expected = RequestedRecord {
+            id: id(1),
+            expected: Some(entry(2, false)),
+        };
+        assert!(matches!(
+            validate_transfer_batch(
+                &[mismatched_expected],
+                SyncPhase::Records,
+                from_ref(&desc1),
+                &[]
+            ),
+            Err(DomainError::Invalid { .. })
+        ));
+
+        assert!(matches!(
+            validate_transfer_batch(
+                &[req_exact.clone(), req_exact.clone()],
+                SyncPhase::Records,
+                from_ref(&desc1),
+                &[id(1)]
+            ),
+            Err(DomainError::Invalid { .. })
+        ));
+
+        let too_small = TransferDescriptor {
+            entry: entry(1, false),
+            bytes: 1,
+        };
+        assert!(matches!(
+            validate_transfer_batch(from_ref(&req_exact), SyncPhase::Records, &[too_small], &[]),
+            Err(DomainError::LimitExceeded { .. })
+        ));
+        let too_large_record = TransferDescriptor {
+            entry: entry(1, false),
+            bytes: MAX_RECORD_BYTES + 1,
+        };
+        assert!(matches!(
+            validate_transfer_batch(
+                from_ref(&req_exact),
+                SyncPhase::Records,
+                &[too_large_record],
+                &[]
+            ),
+            Err(DomainError::LimitExceeded { .. })
+        ));
+
+        let batch_reqs: Vec<_> = (1..=3)
+            .map(|n| RequestedRecord {
+                id: id(n),
+                expected: None,
+            })
+            .collect();
+        let batch_descs = vec![
+            TransferDescriptor {
+                entry: entry(1, false),
+                bytes: MAX_RECORD_BYTES,
+            },
+            TransferDescriptor {
+                entry: entry(2, false),
+                bytes: MAX_RECORD_BYTES,
+            },
+            TransferDescriptor {
+                entry: entry(3, false),
+                bytes: 2,
+            },
+        ];
+        assert!(matches!(
+            validate_transfer_batch(&batch_reqs, SyncPhase::Records, &batch_descs, &[]),
+            Err(DomainError::LimitExceeded { .. })
+        ));
+
+        let mut wrong_meta = desc1.clone();
+        wrong_meta.entry.body_key = format!("{:064x}", 999);
+        assert!(matches!(
+            validate_transfer_batch(from_ref(&req_exact), SyncPhase::Records, &[wrong_meta], &[]),
+            Err(DomainError::Invalid { .. })
+        ));
+
+        assert!(matches!(
+            validate_transfer_batch(
+                from_ref(&req_exact),
+                SyncPhase::Records,
+                from_ref(&desc2),
+                &[]
+            ),
+            Err(DomainError::Invalid { .. })
+        ));
+        assert!(matches!(
+            validate_transfer_batch(from_ref(&req_exact), SyncPhase::Records, &[], &[id(2)]),
+            Err(DomainError::Invalid { .. })
+        ));
+        assert!(matches!(
+            validate_transfer_batch(
+                &[req_exact.clone(), req_ancestor.clone()],
+                SyncPhase::Records,
+                &[desc1.clone(), desc1.clone()],
+                &[]
+            ),
+            Err(DomainError::Invalid { .. })
+        ));
+        assert!(matches!(
+            validate_transfer_batch(
+                &[req_exact.clone(), req_ancestor.clone()],
+                SyncPhase::Records,
+                from_ref(&desc1),
+                &[id(1)]
+            ),
+            Err(DomainError::Invalid { .. })
+        ));
+        assert!(matches!(
+            validate_transfer_batch(
+                &[req_exact.clone(), req_ancestor.clone()],
+                SyncPhase::Records,
+                &[],
+                &[id(1), id(1)]
+            ),
+            Err(DomainError::Invalid { .. })
+        ));
+        assert!(matches!(
+            validate_transfer_batch(
+                &[req_exact, req_ancestor],
+                SyncPhase::Records,
+                &[desc1],
+                &[]
+            ),
+            Err(DomainError::Invalid { .. })
+        ));
+    }
+    #[test]
+    fn validate_confirmed_receipts_enforces_exact_reciprocal_set() {
+        let r1 = receipt(B, 1);
+        let r2 = receipt(B, 2);
+        assert_eq!(
+            validate_confirmed_receipts(B, &[r1.clone(), r2.clone()], &[r2.clone(), r1.clone()]),
+            Ok(())
+        );
+
+        assert!(matches!(
+            validate_confirmed_receipts("invalid", from_ref(&r1), from_ref(&r1)),
+            Err(DomainError::Invalid { .. })
+        ));
+        assert!(matches!(
+            validate_confirmed_receipts(B, &[], &[]),
+            Err(DomainError::LimitExceeded { .. })
+        ));
+        let too_many: Vec<_> = (1..=129).map(|n| receipt(B, n)).collect();
+        assert!(matches!(
+            validate_confirmed_receipts(B, &too_many, &too_many),
+            Err(DomainError::LimitExceeded { .. })
+        ));
+        assert!(matches!(
+            validate_confirmed_receipts(B, &[r1.clone(), r2.clone()], from_ref(&r1)),
+            Err(DomainError::Invalid { .. })
+        ));
+
+        let mut wrong_version = r1.clone();
+        wrong_version.version = 1;
+        assert!(matches!(
+            validate_confirmed_receipts(B, from_ref(&wrong_version), from_ref(&r1)),
+            Err(DomainError::UnsupportedVersion { version: 1 })
+        ));
+        assert!(matches!(
+            validate_confirmed_receipts(B, from_ref(&r1), &[wrong_version]),
+            Err(DomainError::UnsupportedVersion { version: 1 })
+        ));
+
+        let wrong_peer = receipt(C, 1);
+        assert!(matches!(
+            validate_confirmed_receipts(B, from_ref(&r1), &[wrong_peer]),
+            Err(DomainError::Invalid { .. })
+        ));
+
+        let mut wrong_key = r1.clone();
+        wrong_key.body_key = format!("{:064x}", 999);
+        assert!(matches!(
+            validate_confirmed_receipts(B, from_ref(&r1), &[wrong_key]),
+            Err(DomainError::IdConflict { .. })
+        ));
+
+        assert!(matches!(
+            validate_confirmed_receipts(B, &[r1.clone(), r1.clone()], &[r1.clone(), r2.clone()]),
+            Err(DomainError::Invalid { .. })
+        ));
+        assert!(matches!(
+            validate_confirmed_receipts(B, &[r1.clone(), r2.clone()], &[r1.clone(), r1.clone()]),
+            Err(DomainError::Invalid { .. })
+        ));
+        assert!(matches!(
+            validate_confirmed_receipts(B, &[r1], &[r2]),
+            Err(DomainError::Missing { .. })
+        ));
     }
     fn store(count: u64) -> Store {
         let records = (1..=count)

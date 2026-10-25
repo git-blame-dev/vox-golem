@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::managed_process::ManagedTokioProcess as Child;
 use crate::managed_process::{
-    configure_owned_tokio, terminate_tokio, terminate_tokio_on_drop, ProcessOwnership,
+    configure_owned_tokio, terminate_tokio, LaunchError, LaunchGate, ProcessOwnership, ProcessRole,
 };
 use futures_util::StreamExt;
 use reqwest::{StatusCode, Url};
@@ -543,8 +543,6 @@ pub struct OpencodeServer {
 struct OwnedServerProcess {
     child: Option<Child>,
     wsl_owned: bool,
-    #[cfg(windows)]
-    process_job: Option<win32job::Job>,
 }
 
 #[derive(Clone)]
@@ -558,30 +556,37 @@ pub struct OpencodeClient {
 
 impl OpencodeServer {
     pub async fn start(config: OpencodeServerConfig) -> Result<Self, OpencodeServerError> {
+        Self::start_with_cancellation(config, None).await
+    }
+
+    pub async fn start_with_cancellation(
+        config: OpencodeServerConfig,
+        cancelled: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<Self, OpencodeServerError> {
+        let std_deadline = std::time::Instant::now() + config.startup_timeout;
+        let deadline = tokio::time::Instant::now() + config.startup_timeout;
+        if cancelled.as_ref().is_some_and(|rx| *rx.borrow()) {
+            return Err(OpencodeServerError::Io(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "OpenCode server startup cancelled",
+            )));
+        }
         let password = format!("voxgolem-{:032x}", rand::random::<u128>());
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
         let port = listener.local_addr()?.port();
         drop(listener);
         let wsl_owned = matches!(&config.launch, OpencodeServerLaunch::Wsl(_));
-        let child = spawn_server_process(&config.launch, port, &password).await?;
-        #[cfg(windows)]
-        let mut process = match create_process_job(&child) {
-            Ok(job) => OwnedServerProcess {
-                child: Some(child),
-                wsl_owned,
-                process_job: Some(job),
-            },
-            Err(error) => {
-                let mut process = OwnedServerProcess {
-                    child: Some(child),
-                    wsl_owned,
-                    process_job: None,
-                };
-                process.terminate().await;
-                return Err(error);
-            }
-        };
-        #[cfg(not(windows))]
+        let mut child = spawn_server_process(
+            &config.launch,
+            port,
+            &password,
+            std_deadline,
+            cancelled.as_ref(),
+        )
+        .await?;
+        if wsl_owned {
+            child.set_grace(Duration::from_secs(2));
+        }
         let mut process = OwnedServerProcess {
             child: Some(child),
             wsl_owned,
@@ -592,26 +597,32 @@ impl OpencodeServer {
         {
             Ok(client) => client,
             Err(error) => {
-                process.terminate().await;
+                let _ = process.terminate().await;
                 return Err(error.into());
             }
         };
         let base_url = format!("http://127.0.0.1:{port}");
-        let deadline = tokio::time::Instant::now() + config.startup_timeout;
         loop {
+            if cancelled.as_ref().is_some_and(|rx| *rx.borrow()) {
+                let _ = process.terminate().await;
+                return Err(OpencodeServerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "OpenCode server startup cancelled",
+                )));
+            }
             if tokio::time::Instant::now() >= deadline {
-                process.terminate().await;
+                let _ = process.terminate().await;
                 return Err(OpencodeServerError::StartupTimeout);
             }
             let child_status = match process.child_mut().try_wait() {
                 Ok(status) => status,
                 Err(error) => {
-                    process.terminate().await;
+                    let _ = process.terminate().await;
                     return Err(error.into());
                 }
             };
             if let Some(status) = child_status {
-                process.terminate().await;
+                let _ = process.terminate().await;
                 return Err(OpencodeServerError::InvalidResponse(format!(
                     "OpenCode exited during startup: {status}"
                 )));
@@ -647,7 +658,7 @@ impl OpencodeServer {
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            process.terminate().await;
+            process.terminate().await?;
             return Err(OpencodeServerError::StartupTimeout);
         }
         let session_id = match create_session_before_deadline(
@@ -661,7 +672,7 @@ impl OpencodeServer {
         {
             Ok(session_id) => session_id,
             Err(error) => {
-                process.terminate().await;
+                let _ = process.terminate().await;
                 return Err(error);
             }
         };
@@ -686,41 +697,6 @@ impl OpencodeServer {
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
-    pub async fn reset(&mut self) -> Result<(), OpencodeServerError> {
-        self.reset_with_deadlines(
-            tokio::time::Instant::now() + self.request_timeout,
-            self.request_timeout,
-        )
-        .await
-    }
-
-    pub async fn reset_with_deadlines(
-        &mut self,
-        deadline: tokio::time::Instant,
-        cleanup_timeout: Duration,
-    ) -> Result<(), OpencodeServerError> {
-        let old_client = self.client();
-        let new_session_id = create_session_before_deadline(
-            &self.client,
-            &self.base_url,
-            &self.password,
-            self.request_timeout,
-            deadline,
-        )
-        .await?;
-        self.session_id = new_session_id;
-
-        let abort_result = tokio::time::timeout(cleanup_timeout, old_client.abort()).await;
-        let delete_result = tokio::time::timeout(cleanup_timeout, old_client.delete()).await;
-
-        match abort_result {
-            Ok(Ok(())) => delete_result
-                .unwrap_or(Err(OpencodeServerError::RequestTimeout))
-                .map(|_| ()),
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err(OpencodeServerError::RequestTimeout),
-        }
-    }
     pub async fn shutdown(mut self) -> Result<(), OpencodeServerError> {
         let client = self.client();
         let _ = tokio::time::timeout(Duration::from_secs(3), async {
@@ -730,7 +706,7 @@ impl OpencodeServer {
         })
         .await;
         if let Some(mut process) = self.process.take() {
-            process.terminate().await;
+            process.terminate().await?;
         }
         Ok(())
     }
@@ -775,25 +751,73 @@ fn server_command(launch: &OpencodeServerLaunch, port: u16, password: &str) -> T
     command
 }
 
+fn map_server_launch_error(error: LaunchError) -> OpencodeServerError {
+    match error {
+        LaunchError::TimedOut => OpencodeServerError::StartupTimeout,
+        LaunchError::Cancelled => OpencodeServerError::Io(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "OpenCode server startup cancelled",
+        )),
+        LaunchError::ChildExited(code) => OpencodeServerError::InvalidResponse(match code {
+            Some(code) => format!("OpenCode exited during startup: exit code {code}"),
+            None => String::from("OpenCode exited during startup"),
+        }),
+        LaunchError::Supervision(details) => {
+            #[cfg(windows)]
+            {
+                OpencodeServerError::ProcessJobFailed { details }
+            }
+            #[cfg(not(windows))]
+            {
+                OpencodeServerError::Io(std::io::Error::other(details))
+            }
+        }
+        LaunchError::Spawn(error) => OpencodeServerError::Io(error),
+    }
+}
+
 async fn spawn_server_process(
     launch: &OpencodeServerLaunch,
     port: u16,
     password: &str,
-) -> std::io::Result<Child> {
+    deadline: std::time::Instant,
+    cancelled: Option<&tokio::sync::watch::Receiver<bool>>,
+) -> Result<Child, OpencodeServerError> {
+    let check_cancelled = || cancelled.is_some_and(|rx| *rx.borrow());
+    let mut gate = LaunchGate::new().with_deadline(deadline);
+    if cancelled.is_some() {
+        gate = gate.with_cancellation(&check_cancelled);
+    }
+
     #[cfg(unix)]
     for attempt in 0..ETXTBSY_RETRY_COUNT {
-        match server_command(launch, port, password).spawn() {
-            Err(error) if is_executable_busy(&error) && attempt + 1 < ETXTBSY_RETRY_COUNT => {
+        match Child::spawn_owned_with(
+            &mut server_command(launch, port, password),
+            ProcessRole::OpenCode,
+            &gate,
+        ) {
+            Err(LaunchError::Spawn(error))
+                if is_executable_busy(&error) && attempt + 1 < ETXTBSY_RETRY_COUNT =>
+            {
+                if check_cancelled() {
+                    return Err(map_server_launch_error(LaunchError::Cancelled));
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(OpencodeServerError::StartupTimeout);
+                }
                 tokio::time::sleep(ETXTBSY_RETRY_DELAY).await;
             }
-            result => return result.and_then(Child::from_owned_child),
+            result => return result.map_err(map_server_launch_error),
         }
     }
 
     #[cfg(not(unix))]
-    return server_command(launch, port, password)
-        .spawn()
-        .and_then(Child::from_owned_child);
+    return Child::spawn_owned_with(
+        &mut server_command(launch, port, password),
+        ProcessRole::OpenCode,
+        &gate,
+    )
+    .map_err(map_server_launch_error);
 
     #[cfg(unix)]
     unreachable!("the bounded server spawn retry loop always returns")
@@ -992,29 +1016,19 @@ impl OwnedServerProcess {
         self.child.as_mut().expect("owned server process")
     }
 
-    async fn terminate(&mut self) {
+    async fn terminate(&mut self) -> std::io::Result<()> {
         let wsl_owned = self.wsl_owned;
         if let Some(child) = self.child.as_mut() {
-            terminate_child(child, wsl_owned).await;
+            terminate_child(child, wsl_owned).await?;
         }
         self.child = None;
-        #[cfg(windows)]
-        {
-            self.process_job = None;
-        }
+        Ok(())
     }
 }
 
 impl Drop for OwnedServerProcess {
     fn drop(&mut self) {
-        let Some(child) = self.child.take() else {
-            return;
-        };
-        #[cfg(windows)]
-        let process_guard = self.process_job.take();
-        #[cfg(not(windows))]
-        let process_guard = ();
-        terminate_child_on_drop(child, self.wsl_owned, process_guard);
+        self.child.take();
     }
 }
 
@@ -1022,41 +1036,6 @@ impl Drop for OpencodeServer {
     fn drop(&mut self) {
         self.process = None;
     }
-}
-
-fn terminate_child_on_drop<G>(mut child: Child, wsl_owned: bool, process_guard: G)
-where
-    G: Send + 'static,
-{
-    if !wsl_owned {
-        drop(process_guard);
-        terminate_tokio_on_drop(child, ProcessOwnership::Owned);
-        return;
-    }
-    drop(child.take_stdin());
-    let _ = std::thread::Builder::new()
-        .name(String::from("wsl-opencode-reaper"))
-        .spawn(move || {
-            let _process_guard = process_guard;
-            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                let _ = child.start_kill();
-                return;
-            };
-            runtime.block_on(async move {
-                if matches!(
-                    tokio::time::timeout(Duration::from_secs(2), child.wait()).await,
-                    Ok(Ok(_))
-                ) {
-                    return;
-                }
-                let _ =
-                    terminate_tokio(&mut child, ProcessOwnership::Owned, Duration::from_secs(2))
-                        .await;
-            });
-        });
 }
 
 async fn send_with_timeout(
@@ -1180,38 +1159,11 @@ async fn read_json_response(
         .map_err(|error| OpencodeServerError::InvalidResponse(error.to_string()))
 }
 
-async fn terminate_child(child: &mut Child, wsl_owned: bool) {
+async fn terminate_child(child: &mut Child, wsl_owned: bool) -> std::io::Result<()> {
     if wsl_owned {
-        drop(child.take_stdin());
-        if matches!(
-            tokio::time::timeout(Duration::from_secs(2), child.wait()).await,
-            Ok(Ok(_))
-        ) {
-            return;
-        }
+        child.set_grace(Duration::from_secs(2));
     }
-    let _ = terminate_tokio(child, ProcessOwnership::Owned, Duration::from_secs(2)).await;
-}
-
-#[cfg(windows)]
-fn create_process_job(child: &Child) -> Result<win32job::Job, OpencodeServerError> {
-    let mut limits = win32job::ExtendedLimitInfo::new();
-    limits.limit_kill_on_job_close();
-    let job = win32job::Job::create_with_limit_info(&limits).map_err(|e| {
-        OpencodeServerError::ProcessJobFailed {
-            details: e.to_string(),
-        }
-    })?;
-    let raw_handle = child
-        .raw_handle()
-        .ok_or_else(|| OpencodeServerError::ProcessJobFailed {
-            details: String::from("OpenCode child process has no Windows handle"),
-        })?;
-    job.assign_process(raw_handle as isize)
-        .map_err(|e| OpencodeServerError::ProcessJobFailed {
-            details: e.to_string(),
-        })?;
-    Ok(job)
+    terminate_tokio(child, ProcessOwnership::Owned, Duration::from_secs(2)).await
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1660,6 +1612,7 @@ impl OpencodeSseDecoder {
                                 if matches!(error, OpencodeServerError::FrameTooLarge) {
                                     self.poisoned = true;
                                     self.buffer.clear();
+                                    self.boundary = crate::sse::Boundary::default();
                                     self.stream_parts.clear();
                                 }
                                 events.push(Err(error));
@@ -1675,6 +1628,7 @@ impl OpencodeSseDecoder {
         }
         if self.buffer.len() > MAX_SSE_FRAME_BYTES {
             self.buffer.clear();
+            self.boundary = crate::sse::Boundary::default();
             events.push(Err(OpencodeServerError::FrameTooLarge));
         }
         events
@@ -1838,39 +1792,21 @@ enum RawToolState {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "linux")]
-    use super::terminate_child_on_drop;
     use super::{
         prompt_body, run_opencode, run_opencode_json, server_command, startup_health_probe_timeout,
         OpencodeCommandSpec, OpencodeEvent, OpencodeJsonEvent, OpencodeJsonRunError, OpencodeModel,
-        OpencodeOutputFormat, OpencodePrompt, OpencodePromptError, OpencodeServer,
-        OpencodeServerConfig, OpencodeServerError, OpencodeSseDecoder, OpencodeToolPolicy,
-        OpencodeToolStatus, OpencodeToolUseStatus, MAX_TRACKED_PART_BYTES,
+        OpencodeOutputFormat, OpencodePrompt, OpencodePromptError, OpencodeServerConfig,
+        OpencodeServerError, OpencodeSseDecoder, OpencodeToolPolicy, OpencodeToolStatus,
+        OpencodeToolUseStatus, MAX_TRACKED_PART_BYTES,
     };
     use std::ffi::OsStr;
     use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
-    #[cfg(target_os = "linux")]
-    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::{AtomicU64, Ordering};
-    #[cfg(target_os = "linux")]
-    use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
 
     static TEMP_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-    #[cfg(target_os = "linux")]
-    struct DropProbe(Arc<AtomicBool>);
-
-    #[cfg(target_os = "linux")]
-    impl Drop for DropProbe {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
@@ -1878,12 +1814,10 @@ mod tests {
         let mut command = tokio::process::Command::new("sh");
         command.args(["-c", "exec sleep 30"]).kill_on_drop(true);
         crate::managed_process::configure_owned_tokio(&mut command);
-        let child =
-            super::Child::from_owned_child(command.spawn().expect("test child should start"))
-                .unwrap();
+        let child = super::Child::spawn_test(&mut command).unwrap();
         let pid = child.id().expect("test child should expose its pid");
 
-        terminate_child_on_drop(child, false, ());
+        drop(child);
 
         tokio::time::timeout(Duration::from_secs(2), async {
             while Path::new(&format!("/proc/{pid}")).exists() {
@@ -1903,25 +1837,33 @@ mod tests {
             .stdin(std::process::Stdio::piped())
             .kill_on_drop(true);
         crate::managed_process::configure_owned_tokio(&mut command);
-        let child =
-            super::Child::from_owned_child(command.spawn().expect("test child should start"))
-                .unwrap();
+        let mut child = super::Child::spawn_test(&mut command).unwrap();
         let pid = child.id().expect("test child should expose its pid");
-        let guard_dropped = Arc::new(AtomicBool::new(false));
-
-        terminate_child_on_drop(child, true, DropProbe(Arc::clone(&guard_dropped)));
-        assert!(!guard_dropped.load(Ordering::SeqCst));
+        child.set_grace(Duration::from_secs(2));
+        drop(child);
 
         tokio::time::timeout(Duration::from_secs(2), async {
-            while Path::new(&format!("/proc/{pid}")).exists()
-                || !guard_dropped.load(Ordering::SeqCst)
-            {
+            while Path::new(&format!("/proc/{pid}")).exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .expect("WSL drop fallback should close the control pipe and reap the child");
-        assert!(guard_dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn start_with_cancellation_rejects_pre_cancelled_receiver_without_spawning() {
+        let (_tx, rx) = tokio::sync::watch::channel(true);
+        let result = super::OpencodeServer::start_with_cancellation(
+            OpencodeServerConfig::new("definitely-missing-synthetic-opencode-binary"),
+            Some(rx),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(OpencodeServerError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::Interrupted
+        ));
     }
 
     #[test]
@@ -2371,6 +2313,20 @@ mod tests {
     }
 
     #[test]
+    fn oversize_incomplete_frame_resets_framing_cursor() {
+        let mut decoder = OpencodeSseDecoder::new("ses_synthetic".into());
+        let oversized = vec![b'x'; super::MAX_SSE_FRAME_BYTES + 1];
+        assert!(matches!(
+            decoder.push(&oversized).as_slice(),
+            [Err(OpencodeServerError::FrameTooLarge)]
+        ));
+        let events = decoder.push(
+            b"data: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"ses_synthetic\"}}\n\n",
+        );
+        assert!(matches!(events.as_slice(), [Ok(OpencodeEvent::Completed)]));
+    }
+
+    #[test]
     fn incrementally_frames_sse_across_network_chunks() {
         let mut decoder = OpencodeSseDecoder::new("ses_1".into());
         assert!(decoder
@@ -2406,125 +2362,6 @@ mod tests {
             b"data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"type\":\"text\",\"sessionID\":\"ses_other\"},\"delta\":\"wrong\"}}\n\n",
         );
         assert!(events.is_empty());
-    }
-
-    async fn fake_reset_server(
-        abort_delay: Duration,
-        delete_delay: Duration,
-    ) -> (
-        String,
-        tokio::sync::oneshot::Receiver<()>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("fake server should bind");
-        let address = listener
-            .local_addr()
-            .expect("fake server should expose its address");
-        let (abort_tx, abort_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            tokio::time::timeout(Duration::from_secs(5), async move {
-                let mut abort_tx = Some(abort_tx);
-                for _ in 0..3 {
-                    let (mut stream, _) = listener.accept().await.expect("request should connect");
-                    let mut request = Vec::new();
-                    let mut chunk = [0; 1024];
-                    loop {
-                        let count =
-                            tokio::time::timeout(Duration::from_secs(2), stream.read(&mut chunk))
-                                .await
-                                .expect("reset fixture read deadline")
-                                .expect("request should be readable");
-                        if count == 0 {
-                            panic!("EOF before reset request headers");
-                        }
-                        request.extend_from_slice(&chunk[..count]);
-                        assert!(request.len() < 16 * 1024);
-                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                            break;
-                        }
-                    }
-                    let request = String::from_utf8_lossy(&request);
-                    let (delay, body) = if request.contains("POST /session/") {
-                        if let Some(tx) = abort_tx.take() {
-                            let _ = tx.send(());
-                        }
-                        (abort_delay, "true")
-                    } else if request.contains("DELETE /session/") {
-                        (delete_delay, "true")
-                    } else {
-                        (Duration::ZERO, "{\"id\":\"ses_new\"}")
-                    };
-                    tokio::time::sleep(delay).await;
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                }
-            })
-            .await
-            .expect("reset fixture accept/response deadline");
-        });
-        (format!("http://{address}"), abort_rx, server)
-    }
-
-    #[tokio::test]
-    async fn reset_installs_replacement_before_independently_bounded_cleanup() {
-        let (base_url, _abort_seen, server) =
-            fake_reset_server(Duration::from_millis(100), Duration::from_millis(100)).await;
-        let mut client = OpencodeServer {
-            client: reqwest::Client::new(),
-            base_url,
-            session_id: "ses_old".into(),
-            password: "password".into(),
-            request_timeout: Duration::from_secs(1),
-            process: None,
-        };
-
-        let result = client
-            .reset_with_deadlines(
-                tokio::time::Instant::now() + Duration::from_secs(1),
-                Duration::from_millis(10),
-            )
-            .await;
-
-        assert_eq!(client.session_id(), "ses_new");
-        assert!(matches!(result, Err(OpencodeServerError::RequestTimeout)));
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[tokio::test]
-    async fn reset_cancellation_after_installation_retains_replacement() {
-        let (base_url, abort_seen, server) =
-            fake_reset_server(Duration::from_secs(10), Duration::ZERO).await;
-        let mut client = OpencodeServer {
-            client: reqwest::Client::new(),
-            base_url,
-            session_id: "ses_old".into(),
-            password: "password".into(),
-            request_timeout: Duration::from_secs(1),
-            process: None,
-        };
-
-        {
-            let reset = client.reset_with_deadlines(
-                tokio::time::Instant::now() + Duration::from_secs(1),
-                Duration::from_secs(1),
-            );
-            tokio::pin!(reset);
-            tokio::select! {
-                _ = &mut reset => panic!("cleanup should still be stalled"),
-                ack = tokio::time::timeout(Duration::from_secs(3), abort_seen) => { ack.expect("abort phase deadline").expect("abort phase acknowledgement"); }
-            }
-        }
-
-        assert_eq!(client.session_id(), "ses_new");
-        server.abort();
-        let _ = server.await;
     }
 
     #[test]

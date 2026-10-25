@@ -199,7 +199,7 @@ export async function finalizeCapture(captureId: string): Promise<void> {
   await captureInvoke('finalize_capture', { captureId })
 }
 
-export async function updateCaptureTranscript(captureId: string, text: string, expectedVersion: number): Promise<void> {
+export async function updateCaptureTranscript(captureId: string, text: string, expectedVersion: number): Promise<CaptureRecord> {
   if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 0) throw new Error('Capture correction version is invalid')
-  await captureInvoke('update_transcript', { captureId, text, expectedVersion })
+  return parseCaptureRecord(await captureInvoke('update_transcript', { captureId, text, expectedVersion }))
 }

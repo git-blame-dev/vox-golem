@@ -24,7 +24,8 @@ class EnginePhonePreferencesTest {
         override fun execute(command: Runnable) { tasks.add(command) }
         fun drain() { while (true) (tasks.poll() ?: return).run() }
     }
-    private class Fixture(enabled: Boolean, selection: SpeechSelection = SpeechSelection()) : AutoCloseable {
+    private class Fixture(enabled: Boolean, selection: SpeechSelection = SpeechSelection(),
+        prepareBackend: Boolean = true, failPresentationRead: Boolean = false) : AutoCloseable {
         val context = RuntimeEnvironment.getApplication()
         private val io = Queue()
         // Preferences do not use conversation decisions. Only the initial empty-view projection is simulated.
@@ -37,6 +38,30 @@ class EnginePhonePreferencesTest {
         val prewarmed = mutableListOf<String>()
         val workerPrewarmed = mutableListOf<Triple<String, String, Boolean>>()
         var prewarmFails = false
+        var phoneCommit: (() -> Boolean)? = null
+        var presentationReads = 0
+        private val phoneStorage = context.getSharedPreferences("assistant-phone-preferences", android.content.Context.MODE_PRIVATE)
+        private val controlledPhoneStorage = object : android.content.SharedPreferences by phoneStorage {
+            override fun getString(key: String?, default: String?): String? {
+                presentationReads++
+                check(!failPresentationRead) { "Synthetic presentation read failure" }
+                return phoneStorage.getString(key, default)
+            }
+            override fun getBoolean(key: String?, default: Boolean): Boolean {
+                presentationReads++
+                check(!failPresentationRead) { "Synthetic presentation read failure" }
+                return phoneStorage.getBoolean(key, default)
+            }
+            override fun edit(): android.content.SharedPreferences.Editor {
+                val editor = phoneStorage.edit()
+                return object : android.content.SharedPreferences.Editor by editor {
+                    override fun commit(): Boolean {
+                        val accepted = phoneCommit?.invoke() ?: true
+                        return editor.commit() && accepted
+                    }
+                }
+            }
+        }
         private val models = object : AssistantModelStorage {
             private var value = "custom-sol-high"
             override fun read() = value
@@ -54,6 +79,8 @@ class EnginePhonePreferencesTest {
             override fun cancel(requestId: String) {}
             override fun prewarm(model: String, authPath: String, webEnabled: Boolean) {
                 workerPrewarmed += Triple(model, authPath, webEnabled)
+                prewarmed += model
+                if (prewarmFails) error("Synthetic prewarm failure")
             }
         })
         private val authPath: () -> String = { "/synthetic/private/provider.json" }
@@ -64,19 +91,11 @@ class EnginePhonePreferencesTest {
         val backend: EnginePhoneBackend
         init {
             io.drain()
-            PhonePreferences(context).write(PhonePreferences.defaults().put("tts_enabled", enabled)
+            PhonePreferences(context).apply { initialize() }.write(PhonePreferences.defaults().put("tts_enabled", enabled)
                 .put("speech_language", selection.language).put("speech_tts_provider", selection.ttsProvider).put("speech_tts_voice", selection.ttsVoice))
-            backend = EnginePhoneBackend(context, engine) { model ->
-                assertEquals(model, engine.snapshot().model)
-                assertEquals(model, models.read())
-                assertEquals(model, persisted().getString("instant"))
-                assertEquals(model, context.getSharedPreferences("assistant-phone-preferences", android.content.Context.MODE_PRIVATE)
-                    .getString("instant", null))
-                assertEquals(engine.snapshot().webEnabled, persistedPolicy().webEnabled)
-                assertFalse(engine.snapshot().busy)
-                prewarmed += model
-                if (prewarmFails) error("Synthetic prewarm failure")
-            }
+            backend = EnginePhoneBackend(context, engine, PhonePreferences(controlledPhoneStorage))
+            if (prepareBackend) io.drain()
+            prewarmed.clear(); workerPrewarmed.clear()
             backend.speechStatus = JSONObject().put("ttsAvailable", false)
         }
         fun update(input: JSONObject): Result<Any?> {
@@ -85,7 +104,7 @@ class EnginePhonePreferencesTest {
             io.drain()
             return terminal ?: error("Preference update did not settle")
         }
-        fun persisted() = PhonePreferences(context).read(engine.snapshot().model)
+        fun persisted() = PhonePreferences(context).apply { initialize() }.read(engine.snapshot().model)
         fun persistedPolicy() = NativeAssistantPolicyStorage(context).read()
         fun duplicatePolicyKeys() = context.getSharedPreferences("assistant-phone-preferences", android.content.Context.MODE_PRIVATE)
             .all.keys.filter(dev.gitblame.voxgolem.voice.InstallationPreferences::ownsKey)
@@ -98,6 +117,112 @@ class EnginePhonePreferencesTest {
     }
 
     @After fun resetAdmission() { AssistantRuntime.configureCaptureResourceAdmission(false) }
+
+    @Test fun phoneSpeechWaitsForActorPresentationAcknowledgementWithoutColdReads() {
+        Fixture(true, prepareBackend = false).use { f ->
+            assertFalse(f.backend.preferencesReady())
+            assertThrows(AssistantPhoneFailure::class.java) { f.backend.nativePreferences() }
+            PhoneSpeechSession(f.context, f.backend).use { phone ->
+                phone.foreground(true)
+                org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+                assertFalse(phone.status().getBoolean("available"))
+                assertFalse(phone.status().getBoolean("ttsAvailable"))
+                assertFalse(phone.status().getBoolean("speechNetworkFallback"))
+                val pending = phone.status()
+                assertEquals("dictation", pending.getString("mode"))
+                for (key in listOf("dictation", "loop", "ttsPhase")) assertTrue(pending.getString(key).isNotEmpty())
+                assertTrue(pending.has("error")); assertTrue(pending.isNull("error"))
+                assertEquals(0, f.presentationReads)
+                assertThrows(AssistantPhoneFailure::class.java) { phone.start("synthetic-unready", false, "", {}) }
+                assertEquals(0, f.presentationReads)
+                f.drain()
+                org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+                assertTrue(f.backend.preferencesReady())
+                assertTrue(phone.status().getBoolean("ttsEnabled"))
+                val reads = f.presentationReads
+                repeat(3) { phone.status(); f.backend.nativePreferences() }
+                assertEquals(reads, f.presentationReads)
+            }
+        }
+    }
+
+    @Test fun failedPresentationInitializationSettlesQueuedCommandsAndNeverReadsDefaults() {
+        Fixture(false, prepareBackend = false, failPresentationRead = true).use { f ->
+            var result: Result<Any?>? = null
+            f.backend.command("set_preferences", JSONObject().put("preferences", PhonePreferences.defaults())) { result = it }
+            assertNull(result)
+            assertEquals(0, f.presentationReads)
+            f.drain()
+            assertFalse(f.backend.preferencesReady())
+            assertEquals("internal", (result!!.exceptionOrNull() as AssistantPhoneFailure).code)
+            assertThrows(AssistantPhoneFailure::class.java) { f.backend.nativePreferences() }
+            assertTrue(f.prewarmed.isEmpty())
+        }
+    }
+
+    @Test fun backendReadsOldPresentationDuringCommitAndPublishesOnlyBeforeSuccessfulAcknowledgement() {
+        for (succeed in listOf(true, false)) Fixture(false).use { f ->
+            val entered = java.util.concurrent.CountDownLatch(1)
+            val release = java.util.concurrent.CountDownLatch(1)
+            f.phoneCommit = {
+                entered.countDown()
+                check(release.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                succeed
+            }
+            var terminal: Result<Any?>? = null
+            val input = f.backend.nativePreferences().put("ui_theme", "slate").put("web_enabled", false)
+            var observerTheme: String? = null
+            val observer = f.engine.subscribe { state ->
+                if (!state.webEnabled) observerTheme = f.backend.nativePreferences().getString("ui_theme")
+            }
+            f.queueUpdate(input) {
+                assertEquals(if (succeed) "slate" else "dark", f.backend.nativePreferences().getString("ui_theme"))
+                terminal = it
+            }
+            val executor = java.util.concurrent.Executors.newFixedThreadPool(2)
+            try {
+                val writer = executor.submit { f.drain() }
+                assertTrue(entered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                val read = executor.submit<String> { f.backend.nativePreferences().getString("ui_theme") }
+                try {
+                    assertEquals("dark", read.get(1, java.util.concurrent.TimeUnit.SECONDS))
+                    assertNull(terminal)
+                } finally { release.countDown() }
+                writer.get(5, java.util.concurrent.TimeUnit.SECONDS)
+                assertEquals(succeed, terminal!!.isSuccess)
+                assertEquals(succeed, !f.engine.snapshot().webEnabled)
+                if (succeed) {
+                    // Engine observers run before the settlement callback: this is deliberately not
+                    // an aggregate cross-file atomic snapshot. The command ACK is the fence.
+                    assertEquals("dark", observerTheme)
+                } else {
+                    assertTrue(terminal!!.exceptionOrNull() is AssistantPhoneFailure)
+                    assertEquals("dark", f.persisted().getString("ui_theme"))
+                    assertTrue(f.persistedPolicy().webEnabled)
+                }
+            } finally { release.countDown(); executor.shutdownNow(); observer.close() }
+        }
+    }
+
+    @Test fun enqueuedInputAndReturnedOutputCannotMutateAcknowledgedPublication() {
+        Fixture(false).use { f ->
+            val input = f.backend.nativePreferences().put("ui_theme", "slate")
+            var replies = 0
+            f.queueUpdate(input) { result ->
+                val output = result.getOrThrow() as JSONObject
+                assertEquals("slate", f.backend.nativePreferences().getString("ui_theme"))
+                assertFalse(f.backend.busy())
+                output.put("ui_theme", "light")
+                replies++
+            }
+            input.put("ui_theme", "light")
+            assertEquals("dark", f.backend.nativePreferences().getString("ui_theme"))
+            assertEquals(0, replies)
+            f.drain()
+            assertEquals(1, replies)
+            assertEquals("slate", f.backend.nativePreferences().getString("ui_theme"))
+        }
+    }
 
     @Test @Config(shadows = [PhoneCueTtsShadow::class])
     fun disabledDiscoveryRechecksInstalledVoiceDataOnlyAfterARealForegroundExit() {
@@ -195,7 +320,7 @@ class EnginePhonePreferencesTest {
             val input = f.backend.nativePreferences().put("instant", "agy-sonnet-low")
                 .put("deep", "agy-sonnet-low").put("review", "agy-sonnet-low").put("ui_theme", "slate")
             val result = f.update(input).getOrThrow() as JSONObject
-            val restored = PhonePreferences(f.context).read("agy-sonnet-low")
+            val restored = PhonePreferences(f.context).apply { initialize() }.read("agy-sonnet-low")
             for (value in listOf(result, f.backend.nativePreferences(), restored)) {
                 for (key in listOf("instant", "deep", "review")) assertEquals("agy-sonnet-low", value.getString(key))
                 assertEquals("slate", value.getString("ui_theme"))
@@ -240,16 +365,16 @@ class EnginePhonePreferencesTest {
             f.backend.speechStatus = JSONObject().put("ttsAvailable", true)
             f.update(f.backend.nativePreferences().put("instant", "agy-flash-high").put("web_enabled", false)).getOrThrow()
             assertEquals(listOf("agy-flash-high"), f.prewarmed)
-            for (input in listOf(
+            for ((index, input) in listOf(
                 f.backend.nativePreferences().put("ui_theme", "light"),
                 f.backend.nativePreferences().put("tts_enabled", true),
                 f.backend.nativePreferences().put("web_enabled", true),
-            )) {
+            ).withIndex()) {
                 f.update(input).getOrThrow()
-                assertEquals(listOf("agy-flash-high"), f.prewarmed)
+                assertEquals(List(if (index == 2) 2 else 1) { "agy-flash-high" }, f.prewarmed)
             }
             f.update(f.backend.nativePreferences().put("instant", "custom-luna-none")).getOrThrow()
-            assertEquals(listOf("agy-flash-high", "custom-luna-none"), f.prewarmed)
+            assertEquals(listOf("agy-flash-high", "agy-flash-high", "custom-luna-none"), f.prewarmed)
         }
     }
 

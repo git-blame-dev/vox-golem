@@ -15,6 +15,14 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def artifact_root(checkout):
+    spec = importlib.util.spec_from_file_location('app_bench_paths',
+        Path(__file__).resolve().parents[1] / 'app-bench/paths.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.artifact_root(checkout)
+
+
 def load_common():
     spec = importlib.util.spec_from_file_location('typed_benchmark_common', Path(__file__).with_name('benchmark.py'))
     module = importlib.util.module_from_spec(spec)
@@ -54,7 +62,7 @@ def execute_inside(args, runner, common=None):
         reservation = args.output.resolve() / 'reservation.json'
         reserved = runner.reserve_live_budget(runner.ASSIGNMENT_LEDGER, reservation)
         report['budget_debit'] = {'reserved': runner.LIVE_BATCH_ALLOWANCE, 'assignment_reserved': reserved}
-        env = runner.isolated_environment(args.output.resolve(), args.config.resolve(), None,
+        env = runner.isolated_environment(args.output.resolve(), args.config, None,
                                           True, reservation, entry='typed')
         driver, process, launch_ms = runner.start_typed_app(args, env)
         report['launch_to_typed_ready_observed_ms'] = launch_ms
@@ -92,14 +100,17 @@ async def run_desktop(args, report, common=None):
             not (Path(tools)/'webkit/extracted/usr/bin/WebKitWebDriver').is_file() or
             any(shutil.which(tool) is None for tool in ('bwrap', 'dbus-run-session'))):
         raise common.Blocked('desktop_existing_tools_required')
-    parent = ROOT.parent / 'artifacts'
+    try:
+        parent = artifact_root(ROOT)
+    except ValueError:
+        raise common.Blocked('desktop_canonical_workspace_unavailable') from None
     if any(p.is_symlink() for p in (parent, *parent.parents)):
         raise common.Blocked('desktop_artifact_symlink_refused')
     parent.mkdir(mode=0o700, exist_ok=True)
     output = parent / ('typed-shared-' + uuid.uuid4().hex)
     command = [str(Path(tools).resolve()/'venv/bin/python'), str(ROOT/'tools/app-bench/runner.py'),
                '--binary', str(Path(args.binary).resolve()), '--tools', str(Path(tools).resolve()),
-               '--config', str(Path(args.config).resolve()), '--output', str(output),
+               '--config', str(Path(args.config)), '--output', str(output),
                '--entry', 'typed', '--live', '--offline-evidence', str(Path(args.offline_evidence).resolve()),
                '--flow-timeout', str(args.turn_timeout), '--shared-suite']
     process = subprocess.Popen(command, start_new_session=True, stdout=subprocess.DEVNULL,

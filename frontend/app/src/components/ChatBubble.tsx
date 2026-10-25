@@ -6,6 +6,7 @@ import { isTranscriptMessage } from '../types/chat'
 import { duration } from '../lib/duration'
 import { turnObservationAttributes } from '../turnObservation'
 import { ControlIcon } from './ControlIcon'
+import { isCoreWhitespaceOnly } from '../lib/wire'
 
 interface ChatBubbleProps {
   readonly message: TranscriptMessage
@@ -67,7 +68,7 @@ export function CopyMessageButton({
   useEffect(() => () => {
     if (timerRef.current !== null) clearTimeout(timerRef.current)
   }, [])
-  if (text.trim().length === 0) return null
+  if (isCoreWhitespaceOnly(text)) return null
   return (
     <button
       type="button"

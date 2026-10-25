@@ -1,93 +1,208 @@
 use super::*;
 
+#[test]
+fn actual_sqlite_commit_observes_retained_final_authority() {
+    use std::sync::Mutex;
+    static AUTHORITY: Mutex<()> = Mutex::new(());
+    static COMMIT_OBSERVED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    fn commit_busy(_: i32) -> bool {
+        // The reader permits BEGIN IMMEDIATE and every staged write, but prevents
+        // COMMIT's exclusive lock. This callback is SQLite's real COMMIT path.
+        assert!(AUTHORITY.try_lock().is_err());
+        COMMIT_OBSERVED.store(true, Ordering::SeqCst);
+        false
+    }
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let prepared = store
+        .prepare_request(
+            Selection {
+                conversation: None,
+                selected_head: None,
+            },
+            "Synthetic prompt",
+            4096,
+            true,
+        )
+        .unwrap();
+    let context = prepared.context.selection;
+    let body = turn(&mut store, &context, "Synthetic prompt")
+        .operation
+        .body;
+    let before = store.snapshot().unwrap();
+    store
+        .db
+        .execute_batch("PRAGMA journal_mode=DELETE")
+        .unwrap();
+    let reader = Connection::open(fixture.path()).unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT * FROM history_state;")
+        .unwrap();
+    store.db.busy_handler(Some(commit_busy)).unwrap();
+    store.complete_body_with_authority(
+        body,
+        || {
+            assert!(!COMMIT_OBSERVED.load(Ordering::SeqCst));
+            (AUTHORITY.lock().unwrap(), CompletionDecision::Authorized)
+        },
+        |_, attempt| {
+            assert!(AUTHORITY.try_lock().is_err());
+            assert!(COMMIT_OBSERVED.load(Ordering::SeqCst));
+            assert!(matches!(
+                attempt,
+                CompletionAttempt::Finished(Err(Error::Database(
+                    rusqlite::ErrorCode::DatabaseBusy
+                )))
+            ));
+        },
+    );
+    reader.execute_batch("ROLLBACK").unwrap();
+    drop(reader);
+    assert_eq!(store.snapshot().unwrap(), before);
+    assert_eq!(
+        store.draft(Some(&context.conversation)).unwrap().text,
+        "Synthetic prompt"
+    );
+}
+
+#[test]
+fn final_authority_controls_commit_and_retains_guard_through_winner() {
+    use std::sync::Mutex;
+    for decision in [
+        CompletionDecision::Cancelled,
+        CompletionDecision::Unavailable,
+        CompletionDecision::Authorized,
+    ] {
+        let fixture = Fixture::new();
+        let mut store = fixture.open();
+        let prepared = store
+            .prepare_request(
+                Selection {
+                    conversation: None,
+                    selected_head: None,
+                },
+                "Synthetic prompt",
+                4096,
+                true,
+            )
+            .unwrap();
+        let context = prepared.context.selection;
+        let body = turn(&mut store, &context, "Synthetic prompt")
+            .operation
+            .body;
+        let before = store.snapshot().unwrap();
+        let authority = Mutex::new(false);
+        let saved = store.complete_body_with_authority(
+            body,
+            || (authority.lock().unwrap(), decision),
+            |guard, attempt| {
+                assert!(
+                    authority.try_lock().is_err(),
+                    "authority retained during winner bookkeeping"
+                );
+                **guard = true;
+                match attempt {
+                    CompletionAttempt::Finished(result) => {
+                        assert!(result.unwrap().saved);
+                        true
+                    }
+                    CompletionAttempt::Cancelled | CompletionAttempt::Unavailable => false,
+                }
+            },
+        );
+        assert!(*authority.lock().unwrap());
+        assert_eq!(store.snapshot().unwrap() != before, saved);
+        assert_eq!(
+            fixture.open().snapshot().unwrap(),
+            store.snapshot().unwrap()
+        );
+        assert_eq!(
+            store
+                .draft(Some(&context.conversation))
+                .unwrap()
+                .text
+                .is_empty(),
+            saved
+        );
+    }
+}
+
+#[test]
+fn staging_and_real_commit_errors_still_arbitrate_under_authority() {
+    use std::sync::Mutex;
+    for staging_failure in [false, true] {
+        for cancel in [false, true] {
+            let fixture = Fixture::new();
+            let mut store = fixture.open();
+            let prepared = store
+                .prepare_request(
+                    Selection {
+                        conversation: None,
+                        selected_head: None,
+                    },
+                    "Synthetic prompt",
+                    4096,
+                    true,
+                )
+                .unwrap();
+            let context = prepared.context.selection;
+            let mut body = turn(&mut store, &context, "Synthetic prompt")
+                .operation
+                .body;
+            let before = store.snapshot().unwrap();
+            if staging_failure {
+                body = OperationBody::ConversationCreated {
+                    title: "Synthetic invalid completion".into(),
+                };
+            } else {
+                // An AFTER trigger succeeds at staging but fails the actual COMMIT:
+                // the missing parent is checked only at transaction completion.
+                store.db.execute_batch("CREATE TABLE synthetic_parent(id INTEGER PRIMARY KEY); CREATE TABLE synthetic_child(id INTEGER REFERENCES synthetic_parent(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER synthetic_commit_failure AFTER DELETE ON history_drafts BEGIN INSERT INTO synthetic_child VALUES(1); END;").unwrap();
+            }
+            let authority = Mutex::new(());
+            store.complete_body_with_authority(
+                body,
+                || {
+                    (
+                        authority.lock().unwrap(),
+                        if cancel {
+                            CompletionDecision::Cancelled
+                        } else {
+                            CompletionDecision::Authorized
+                        },
+                    )
+                },
+                |_, attempt| {
+                    assert!(authority.try_lock().is_err());
+                    if cancel {
+                        assert!(matches!(attempt, CompletionAttempt::Cancelled));
+                    } else if !staging_failure {
+                        assert!(matches!(
+                            attempt,
+                            CompletionAttempt::Finished(Err(Error::Database(
+                                rusqlite::ErrorCode::ConstraintViolation
+                            )))
+                        ));
+                    } else {
+                        assert!(matches!(attempt, CompletionAttempt::Finished(Err(_))));
+                    }
+                },
+            );
+            assert_eq!(store.snapshot().unwrap(), before);
+            assert_eq!(fixture.open().snapshot().unwrap(), before);
+            assert_eq!(
+                store.draft(Some(&context.conversation)).unwrap().text,
+                "Synthetic prompt"
+            );
+        }
+    }
+}
+
 fn sync_read(store: &mut Store, request: serde_json::Value) -> serde_json::Value {
     store
         .replication(serde_json::from_value(request).unwrap())
         .unwrap()
-}
-
-#[test]
-fn retained_descriptor_read_is_exact_revision_bound_and_contains_no_bodies() {
-    let fixture = Fixture::new();
-    let mut store = fixture.open();
-    for index in 0..5 {
-        store
-            .create_conversation(format!("Synthetic private body {index}"))
-            .unwrap();
-    }
-    let page = sync_read(
-        &mut store,
-        serde_json::json!({"kind":"inventory","cursor":null}),
-    );
-    let mut entries = page["entries"].as_array().unwrap().clone();
-    entries[1]["body_key"] = "0".repeat(64).into();
-    entries[2]["conversation"] = entries[0]["id"].clone();
-    entries[3]["tombstone"] = true.into();
-    entries[4]["id"]["sequence"] = "999".into();
-    entries.reverse(); // Slot descriptors need not use inventory-page order.
-    let read = sync_read(
-        &mut store,
-        serde_json::json!({"kind":"retained_descriptors","revision":page["revision"],"entries":entries}),
-    );
-    assert_eq!(read["revision"], page["revision"]);
-    assert_eq!(read["revision_matches"], true);
-    assert_eq!(
-        read["retained"],
-        serde_json::json!([false, false, false, false, true])
-    );
-    assert!(!read.to_string().contains("Synthetic private body"));
-    assert!(serde_json::to_vec(&read).unwrap().len() < 256);
-    fixture
-        .open()
-        .create_conversation("Synthetic newer revision".into())
-        .unwrap();
-    let stale = sync_read(
-        &mut store,
-        serde_json::json!({"kind":"retained_descriptors","revision":page["revision"],"entries":[]}),
-    );
-    assert_eq!(stale["revision_matches"], false);
-    assert_eq!(stale["revision"], store.revision().unwrap());
-    let duplicate = vec![page["entries"][0].clone(); 2];
-    assert!(store.replication(serde_json::from_value(serde_json::json!({"kind":"retained_descriptors","revision":null,"entries":duplicate})).unwrap()).is_err());
-}
-
-#[test]
-fn retained_descriptor_requests_enforce_item_and_encoded_byte_bounds() {
-    let fixture = Fixture::new();
-    let mut store = fixture.open();
-    let replica = "00000000-0000-4000-8000-000000000001";
-    let entries: Vec<_> = (1..=128).map(|sequence| {
-        let id = OperationId { replica: replica.into(), sequence: sequence.to_string() };
-        serde_json::json!({"id":id,"conversation":id,"body_key":"0".repeat(64),"tombstone":false})
-    }).collect();
-    assert!(serde_json::to_vec(&entries).unwrap().len() <= 32 * 1024);
-    let result = sync_read(
-        &mut store,
-        serde_json::json!({"kind":"retained_descriptors","revision":null,"entries":entries}),
-    );
-    assert_eq!(result["retained"].as_array().unwrap().len(), 128);
-    assert!(result["retained"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|value| value == false));
-    assert!(serde_json::to_vec(&result).unwrap().len() < 1024);
-    let mut too_many = entries.clone();
-    too_many.push(entries[0].clone());
-    assert!(store.replication(serde_json::from_value(serde_json::json!({"kind":"retained_descriptors","revision":null,"entries":too_many})).unwrap()).is_err());
-    let large: Vec<_> = (0..128).map(|index| {
-        let id = OperationId { replica: replica.into(), sequence: (u64::MAX-index).to_string() };
-        serde_json::json!({"id":id,"conversation":id,"body_key":"0".repeat(64),"tombstone":false})
-    }).collect();
-    assert!(serde_json::to_vec(&large).unwrap().len() > 32 * 1024);
-    assert!(store
-        .replication(
-            serde_json::from_value(
-                serde_json::json!({"kind":"retained_descriptors","revision":null,"entries":large})
-            )
-            .unwrap()
-        )
-        .is_err());
 }
 
 #[test]
@@ -344,9 +459,32 @@ fn native_replication_rejects_body_metadata_and_hash_conflicts_without_committin
         .is_err());
     assert_eq!(target.snapshot().unwrap(), StoreSnapshot::empty());
     assert!(target.receipts_to_publish(128, None).unwrap().is_empty());
-    sync_read(
+    let imported = sync_read(
         &mut target,
-        serde_json::json!({"kind":"import","records":[record],"entries":page["entries"]}),
+        serde_json::json!({"kind":"import","records":[record.clone()],"entries":page["entries"]}),
+    );
+    let target_replica = target.replica().unwrap();
+    let expected_receipts = target
+        .read(|core| {
+            receipts_after_commit(
+                core,
+                &target_replica,
+                std::slice::from_ref(&record.operation.id),
+            )
+        })
+        .unwrap();
+    assert_eq!(imported["base_revision"], "0");
+    assert_eq!(imported["revision"], "1");
+    assert_eq!(
+        imported["accepted"],
+        serde_json::json!([record.operation.id.clone()])
+    );
+    assert_eq!(imported["duplicates"], serde_json::json!([]));
+    assert_eq!(imported["suppressed"], serde_json::json!([]));
+    assert_eq!(imported["quarantined"], serde_json::json!([]));
+    assert_eq!(
+        imported["receipts"],
+        serde_json::to_value(&expected_receipts).unwrap()
     );
     assert_eq!(target.snapshot().unwrap().records, vec![record]);
 }
@@ -394,11 +532,6 @@ fn native_replication_omits_quarantine_bodies_but_keeps_exact_known_receipts() {
         .clone();
     store.import_records(vec![authentic], true, None).unwrap();
     assert_eq!(store.snapshot().unwrap().quarantine.len(), 1);
-    let disposition = sync_read(
-        &mut store,
-        serde_json::json!({"kind":"retained_descriptors","revision":null,"entries":[poison_entry]}),
-    );
-    assert_eq!(disposition["retained"], serde_json::json!([false]));
     let current = sync_read(
         &mut store,
         serde_json::json!({"kind":"inventory","cursor":null}),
@@ -427,11 +560,6 @@ fn native_replication_omits_quarantine_bodies_but_keeps_exact_known_receipts() {
         .iter()
         .any(|receipt| receipt["body_key"] == poison.body_key));
     store.delete_conversation(conversation).unwrap();
-    let retired = sync_read(
-        &mut store,
-        serde_json::json!({"kind":"retained_descriptors","revision":null,"entries":[poison_entry]}),
-    );
-    assert_eq!(retired["retained"], serde_json::json!([false]));
     let receipts = sync_read(
         &mut store,
         serde_json::json!({"kind":"receipts","ids":[poison.operation.id]}),
@@ -449,7 +577,7 @@ fn mobile_preparation_allocates_atomically_keeps_late_cancel_state_and_obeys_tot
     };
     store.save_draft(None, "Synthetic prompt", true).unwrap();
     let prepared = store
-        .prepare_mobile(empty.clone(), "Synthetic prompt", 256 * 1024, false)
+        .prepare_request(empty.clone(), "Synthetic prompt", 256 * 1024, false)
         .unwrap();
     let conversation = prepared.context.selection.conversation.clone();
     assert_eq!(prepared.request.sequence, "2");
@@ -481,7 +609,7 @@ fn mobile_preparation_allocates_atomically_keeps_late_cancel_state_and_obeys_tot
     let null_parent_owner = store.selection().unwrap();
     assert!(null_parent_owner.selected_head.is_none());
     assert!(store
-        .prepare_mobile(null_parent_owner, "Synthetic stale voice", 256 * 1024, true)
+        .prepare_request(null_parent_owner, "Synthetic stale voice", 256 * 1024, true)
         .is_err());
     assert_eq!(
         store.draft(Some(&conversation)).unwrap().text,
@@ -498,16 +626,36 @@ fn mobile_preparation_allocates_atomically_keeps_late_cancel_state_and_obeys_tot
     let prompt = "Synthetic next prompt";
     let history_bytes = first.operation.context_bytes();
     let exact = store
-        .prepare_mobile(selected_head, prompt, history_bytes + prompt.len(), true)
+        .prepare_request(selected_head, prompt, history_bytes + prompt.len(), true)
         .unwrap();
+    assert_eq!(exact.context.selection.turns.len(), 1);
+    assert_eq!(
+        exact.context.selection.parent,
+        Some(first.operation.id.clone())
+    );
+    let pinned_request = exact.request.clone();
+    // Later owner changes cannot rewrite the admitted context or request identity.
+    store
+        .select(Selection {
+            conversation: None,
+            selected_head: None,
+        })
+        .unwrap();
+    let later_selection = store.selection().unwrap();
+    let later = store
+        .prepare_request(later_selection, "Synthetic later prompt", 4096, true)
+        .unwrap();
+    assert_ne!(later.request, pinned_request);
+    assert_eq!(exact.request, pinned_request);
+    assert_eq!(exact.context.selection.parent, Some(first.operation.id));
     assert_eq!(exact.context.selection.turns.len(), 1);
     let before = store.snapshot().unwrap();
     assert!(store
-        .prepare_mobile(selected, prompt, 256 * 1024, true)
+        .prepare_request(selected, prompt, 256 * 1024, true)
         .is_err());
     assert_eq!(store.snapshot().unwrap(), before);
     assert!(store
-        .prepare_mobile(empty, prompt, 256 * 1024, false)
+        .prepare_request(empty, prompt, 256 * 1024, false)
         .is_err());
 }
 
@@ -522,7 +670,7 @@ fn failed_mobile_preparation_rolls_back_identity_selection_and_preserves_input_d
         selected_head: None,
     };
     assert!(store
-        .prepare_mobile(empty.clone(), "Synthetic rollback", 256 * 1024, true)
+        .prepare_request(empty.clone(), "Synthetic rollback", 256 * 1024, true)
         .is_err());
     assert_eq!(store.selection().unwrap(), empty);
     assert_eq!(store.snapshot().unwrap(), StoreSnapshot::empty());
@@ -531,62 +679,54 @@ fn failed_mobile_preparation_rolls_back_identity_selection_and_preserves_input_d
 }
 
 #[test]
-fn timing_admission_and_settlement_count_context_projection_attempts() {
+fn timing_projects_context_at_admission_not_after_inference() {
     let fixture = Fixture::new();
     let mut store = fixture.open();
     let (prepared, summary) = timing::capture(true, || {
-        store.prepare_context(
+        store.prepare_request(
             Selection {
                 conversation: None,
                 selected_head: None,
             },
             "Synthetic prompt",
             4096,
+            true,
         )
     });
     let prepared = prepared.unwrap();
     assert_eq!(summary.unwrap().metrics.projection.count, 1);
-    let record = turn(&mut store, &prepared.context, "Synthetic prompt");
-    let OperationBody::TurnCompleted { provenance, .. } = record.operation.body else {
-        unreachable!()
-    };
+    let mut body = turn(&mut store, &prepared.context.selection, "Synthetic prompt")
+        .operation
+        .body;
+    if let OperationBody::TurnCompleted { request, .. } = &mut body {
+        *request = prepared.request;
+    }
     let revision = store.revision().unwrap();
     let selection = store.selection().unwrap();
     let (failed, summary) = timing::capture(true, || {
-        store.persist_settled_turn(
-            usize::MAX,
-            "Synthetic prompt".into(),
-            Answer::Text {
-                text: "Synthetic answer".into(),
-            },
-            vec![],
-            TerminalStage::Instant,
-            provenance.clone(),
-        )
+        store.prepare_request(selection.clone(), "Synthetic prompt", usize::MAX, true)
     });
     assert!(matches!(
         failed,
         Err(Error::Domain(DomainError::LimitExceeded { .. }))
     ));
     let metrics = summary.unwrap().metrics;
-    assert_eq!(metrics.projection.count, 1);
+    assert_eq!(metrics.projection.count, 0);
     assert_eq!(metrics.sqlite_commit.count, 0);
     assert_eq!(store.revision().unwrap(), revision);
     assert_eq!(store.selection().unwrap(), selection);
     let (settled, summary) = timing::capture(true, || {
-        store.persist_settled_turn(
-            4096,
-            "Synthetic prompt".into(),
-            Answer::Text {
-                text: "Synthetic answer".into(),
+        store.complete_selected_body_with_authority(
+            body,
+            || ((), CompletionDecision::Authorized),
+            |_, attempt| match attempt {
+                CompletionAttempt::Finished(result) => result,
+                _ => unreachable!(),
             },
-            vec![],
-            TerminalStage::Instant,
-            provenance,
         )
     });
     assert!(settled.unwrap().saved);
-    assert_eq!(summary.unwrap().metrics.projection.count, 1);
+    assert_eq!(summary.unwrap().metrics.projection.count, 0);
 }
 
 #[test]
@@ -1577,65 +1717,333 @@ fn compact_projection_excludes_large_turn_bodies_and_preserves_bounded_previews_
 }
 
 #[test]
-fn test_persist_settled_turn_single_transaction_and_atomic_rollback() {
+fn selected_completion_advances_only_its_matching_owner_atomically() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let prepared = store
+        .prepare_request(
+            Selection {
+                conversation: None,
+                selected_head: None,
+            },
+            "Synthetic prompt",
+            4096,
+            true,
+        )
+        .unwrap();
+    let mut body = turn(&mut store, &prepared.context.selection, "Synthetic prompt")
+        .operation
+        .body;
+    if let OperationBody::TurnCompleted { request, .. } = &mut body {
+        *request = prepared.request;
+    }
+    let selected = store.selection().unwrap();
+    store.complete_selected_body_with_authority(
+        body.clone(),
+        || ((), CompletionDecision::Cancelled),
+        |_, attempt| assert!(matches!(attempt, CompletionAttempt::Cancelled)),
+    );
+    assert_eq!(store.selection().unwrap(), selected);
+    assert_eq!(
+        store.draft(selected.conversation.as_ref()).unwrap().text,
+        "Synthetic prompt"
+    );
+    let saved = store.complete_selected_body_with_authority(
+        body.clone(),
+        || ((), CompletionDecision::Authorized),
+        |_, attempt| match attempt {
+            CompletionAttempt::Finished(result) => result.unwrap(),
+            _ => unreachable!(),
+        },
+    );
+    assert!(saved.saved);
+    assert_eq!(
+        store.selection().unwrap().selected_head,
+        Some(saved.record.operation.id)
+    );
+    let other = store
+        .create_conversation("Synthetic other owner".into())
+        .unwrap()
+        .operation
+        .id;
+    let other_selected = Selection {
+        conversation: Some(other),
+        selected_head: None,
+    };
+    store.select(other_selected.clone()).unwrap();
+    store.complete_selected_body_with_authority(
+        body,
+        || ((), CompletionDecision::Authorized),
+        |_, attempt| {
+            assert!(matches!(attempt, CompletionAttempt::Finished(Ok(_))));
+        },
+    );
+    assert_eq!(store.selection().unwrap(), other_selected);
+}
+
+#[test]
+fn coarse_replication_import_returns_commit_outcome_and_exact_receipts_atomically() {
+    let source_fixture = Fixture::new();
+    let mut source = source_fixture.open();
+    let created = source
+        .create_conversation("Synthetic coarse import".into())
+        .unwrap();
+    let context = source
+        .context(created.operation.id.clone(), None, 256 * 1024)
+        .unwrap();
+    let turn_record = turn(&mut source, &context, "Synthetic coarse turn");
+    source
+        .import_records(vec![turn_record.clone()], false, None)
+        .unwrap();
+    let page = sync_read(
+        &mut source,
+        serde_json::json!({"kind":"inventory","cursor":null}),
+    );
+    let entries = page["entries"].as_array().unwrap().clone();
+    assert_eq!(entries.len(), 2);
+
+    let target_fixture = Fixture::new();
+    let mut target = target_fixture.open();
+    let ids = vec![
+        created.operation.id.clone(),
+        turn_record.operation.id.clone(),
+    ];
+
+    // Conflicting/rejected imports do not commit or produce receipts.
+    let mut bad_entries = entries.clone();
+    bad_entries[1]["body_key"] = "0".repeat(64).into();
+    assert!(target
+        .replication(
+            serde_json::from_value(serde_json::json!({
+                "kind": "import",
+                "records": [created.clone(), turn_record.clone()],
+                "entries": bad_entries,
+            }))
+            .unwrap()
+        )
+        .is_err());
+    assert!(target
+        .replication(
+            serde_json::from_value(serde_json::json!({
+                "kind": "import",
+                "records": vec![created.clone(); 9],
+                "entries": vec![entries[0].clone(); 9],
+            }))
+            .unwrap()
+        )
+        .is_err());
+    assert_eq!(target.revision().unwrap(), "0");
+    assert!(target.receipts_to_publish(128, None).unwrap().is_empty());
+
+    let committed = sync_read(
+        &mut target,
+        serde_json::json!({
+            "kind": "import",
+            "records": [created.clone(), turn_record.clone()],
+            "entries": entries,
+        }),
+    );
+    let target_replica = target.replica().unwrap();
+    let expected_receipts = target
+        .read(|core| receipts_after_commit(core, &target_replica, &ids))
+        .unwrap();
+    assert_eq!(committed["base_revision"], "0");
+    assert_eq!(committed["revision"], target.revision().unwrap());
+    assert_eq!(committed["accepted"], serde_json::to_value(&ids).unwrap());
+    assert_eq!(committed["duplicates"], serde_json::json!([]));
+    assert_eq!(committed["suppressed"], serde_json::json!([]));
+    assert_eq!(committed["quarantined"], serde_json::json!([]));
+    assert_eq!(
+        committed["receipts"],
+        serde_json::to_value(&expected_receipts).unwrap()
+    );
+    assert_eq!(
+        target.receipts_to_publish(128, None).unwrap(),
+        expected_receipts
+    );
+
+    // Duplicate import preserves revision and still returns exact durable receipts in one call.
+    let duplicate = sync_read(
+        &mut target,
+        serde_json::json!({
+            "kind": "import",
+            "records": [created, turn_record],
+            "entries": entries,
+        }),
+    );
+    assert_eq!(duplicate["base_revision"], committed["revision"]);
+    assert_eq!(duplicate["revision"], committed["revision"]);
+    assert_eq!(duplicate["accepted"], serde_json::json!([]));
+    assert_eq!(duplicate["duplicates"], serde_json::to_value(&ids).unwrap());
+    assert_eq!(
+        duplicate["receipts"],
+        serde_json::to_value(&expected_receipts).unwrap()
+    );
+}
+
+#[test]
+fn prepared_replication_bodies_enforce_batch_and_gateway_caps_and_release_read_lock() {
+    use voxgolem_core::conversation_sync::{MAX_BATCH_BYTES, MAX_BATCH_RECORDS, MAX_RECORD_BYTES};
     let fixture = Fixture::new();
     let mut store = fixture.open();
 
-    use voxgolem_core::durable_conversation::{Answer, Provenance, TerminalStage};
-    let provenance = Provenance {
-        requested_model: "test-model".into(),
-        returned_model: None,
-        policy_id: "bench-1-quick".into(),
-        policy_version: "1".into(),
-        instruction_profile_id: "test-instructions".into(),
-        instruction_profile_version: "1".into(),
-        context: Vec::new(),
-    };
-
-    let settled = store
-        .persist_settled_turn(
-            1024,
-            "Test prompt".into(),
-            Answer::Text {
-                text: "Test answer".into(),
-            },
-            Vec::new(),
-            TerminalStage::Instant,
-            provenance.clone(),
-        )
+    let created = store.create_conversation("Synthetic batch".into()).unwrap();
+    let conversation = created.operation.id.clone();
+    let context = store
+        .context(conversation.clone(), None, 256 * 1024)
         .unwrap();
 
-    assert!(settled.saved);
-    let selection = store.selection().unwrap();
-    assert!(selection.conversation.is_some());
-    assert_eq!(
-        selection.selected_head,
-        Some(settled.record.operation.id.clone())
-    );
+    // Heavy JSON-escaping characters (quotes, backslashes, newlines, control chars) stay within
+    // the 2 MiB record cap, 4 MiB batch cap, and 16 MiB gateway envelope.
+    // Control chars like \x01 serialize as 6-byte "\u0001" in JSON, so ~200 KiB of "\x01"
+    // plus quotes/backslashes/newlines produces ~1.3 MiB per encoded record while keeping raw
+    // turn text <= 256 KiB. Three such records fit in a 3.9 MiB store snapshot, and requesting
+    // additional large records exercises the 4 MiB aggregate batch cap (`unavailable`).
+    let mut heavy_records = Vec::new();
+    for _ in 0..3 {
+        let mut r = turn(&mut store, &context, &"\\\"\n\x01".repeat(6000));
+        if let OperationBody::TurnCompleted {
+            answer, sources, ..
+        } = &mut r.operation.body
+        {
+            sources.clear();
+            *answer = Answer::Text {
+                text: format!("{}{}", "\\\"\n\r\t".repeat(4000), "\x01".repeat(200 * 1024)),
+            };
+        }
+        let rec = codec::record(r.operation).unwrap();
+        let encoded = codec::encode(&rec, MAX_RECORD_BYTES, "replication_record_bytes").unwrap();
+        assert!(encoded.len() > 1200 * 1024 && encoded.len() <= MAX_RECORD_BYTES);
+        heavy_records.push(rec);
+    }
+    store
+        .import_records(heavy_records.clone(), false, None)
+        .unwrap();
 
-    // Verify atomic rollback on failure when an invalid prompt is passed on a fresh store
-    // (where ConversationCreated is planned first inside the transaction, then TurnCompleted fails):
-    let mut fresh_store = Fixture::new().open();
-    let revision_before = fresh_store.revision().unwrap();
-    let res = fresh_store.persist_settled_turn(
-        1024,
-        "   ".into(),
-        Answer::Text {
-            text: "Another answer".into(),
-        },
-        Vec::new(),
-        TerminalStage::Instant,
-        provenance,
+    let page = sync_read(
+        &mut store,
+        serde_json::json!({"kind":"inventory","cursor":null}),
     );
-    assert!(res.is_err());
-    assert_eq!(fresh_store.revision().unwrap(), revision_before);
+    let all_entries = page["entries"].as_array().unwrap().clone();
+    assert_eq!(all_entries.len(), 4);
+    assert!(all_entries.len() <= MAX_BATCH_RECORDS);
+
+    let prepared = sync_read(
+        &mut store,
+        serde_json::json!({
+            "kind": "bodies",
+            "revision": page["revision"],
+            "entries": all_entries,
+            "tombstones": false,
+        }),
+    );
+    assert_eq!(prepared["restart"], false);
+    assert_eq!(prepared["bodies"].as_array().unwrap().len(), 4);
+    assert_eq!(prepared["unavailable"], serde_json::json!([]));
+    assert!(codec::encode(
+        &prepared,
+        16 * 1024 * 1024 - 4096,
+        "replication_gateway_bytes"
+    )
+    .is_ok());
+
+    // Verify that the SQLite read lock is released upon return so another Store connection on
+    // the same database can immediately commit a write without DatabaseBusy even in DELETE mode.
+    store
+        .db
+        .execute_batch("PRAGMA journal_mode=DELETE")
+        .unwrap();
+    let rev = store.revision().unwrap();
+    let delete_mode_batch = sync_read(
+        &mut store,
+        serde_json::json!({
+            "kind": "bodies",
+            "revision": rev,
+            "entries": &all_entries[..2],
+            "tombstones": false,
+        }),
+    );
+    assert_eq!(delete_mode_batch["restart"], false);
+    let mut writer = fixture.open();
+    writer.db.busy_timeout(std::time::Duration::ZERO).unwrap();
+    writer
+        .db
+        .execute_batch("PRAGMA journal_mode=DELETE")
+        .unwrap();
+    writer
+        .create_conversation("Synthetic immediate writer commit".into())
+        .unwrap();
+    drop(writer);
+    store.db.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+    let _ = store.revision().unwrap();
+
+    // Add a 4th heavy record into the store core so the 5 records exceed the
+    // 4 MiB aggregate batch cap (`MAX_BATCH_BYTES`) while each record is <= 2 MiB (`MAX_RECORD_BYTES`).
+    let mut fourth_op = turn(&mut store, &context, &"\\\"\n\x01".repeat(6000)).operation;
+    if let OperationBody::TurnCompleted {
+        answer, sources, ..
+    } = &mut fourth_op.body
+    {
+        sources.clear();
+        *answer = Answer::Text {
+            text: format!("{}{}", "\\\"\n\r\t".repeat(4000), "\x01".repeat(200 * 1024)),
+        };
+    }
+    let fourth_rec = codec::record(fourth_op).unwrap();
+    let fourth_entry = serde_json::json!({
+        "id": fourth_rec.operation.id,
+        "conversation": fourth_rec.operation.conversation(),
+        "body_key": fourth_rec.body_key,
+        "tombstone": false,
+    });
+    let mut snap = store.core.export();
+    snap.records.push(fourth_rec.clone());
+    snap.records
+        .sort_by(|a, b| a.operation.id.cmp(&b.operation.id));
+    store.core = CoreStore::restore(snap).unwrap();
+
+    let mut five_entries = all_entries.clone();
+    five_entries.push(fourth_entry);
+    assert_eq!(five_entries.len(), 5);
+    assert!(five_entries.len() <= MAX_BATCH_RECORDS);
+
+    let current_rev = store.core.revision().to_string();
+    let capped = sync_read(
+        &mut store,
+        serde_json::json!({
+            "kind": "bodies",
+            "revision": current_rev,
+            "entries": five_entries,
+            "tombstones": false,
+        }),
+    );
+    assert_eq!(capped["restart"], false);
+    let bodies = capped["bodies"].as_array().unwrap();
+    assert_eq!(bodies.len(), 4);
+    assert!(bodies.len() <= MAX_BATCH_RECORDS);
+    let mut aggregate_bytes = 0usize;
+    for body in bodies {
+        let raw = body["body"].as_str().unwrap();
+        assert!(raw.len() <= MAX_RECORD_BYTES);
+        aggregate_bytes += raw.len();
+        let parsed = codec::parse_record(raw).unwrap();
+        assert_eq!(
+            body["entry"]["id"],
+            serde_json::to_value(&parsed.operation.id).unwrap()
+        );
+    }
+    assert!(aggregate_bytes <= MAX_BATCH_BYTES);
+    let fourth_raw =
+        codec::encode(&fourth_rec, MAX_RECORD_BYTES, "replication_record_bytes").unwrap();
+    assert!(aggregate_bytes + fourth_raw.len() > MAX_BATCH_BYTES);
     assert_eq!(
-        fresh_store
-            .conversations(0, 10)
-            .unwrap()
-            .conversations
-            .len(),
-        0
+        capped["unavailable"],
+        serde_json::json!([fourth_rec.operation.id])
     );
-    assert_eq!(fresh_store.allocate_id().unwrap().sequence, "1");
+    assert!(codec::encode(
+        &capped,
+        16 * 1024 * 1024 - 4096,
+        "replication_gateway_bytes"
+    )
+    .is_ok());
 }

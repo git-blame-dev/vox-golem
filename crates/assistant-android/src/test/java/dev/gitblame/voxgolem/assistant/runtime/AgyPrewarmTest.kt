@@ -211,6 +211,23 @@ class AgyPrewarmTest {
         }
     }
 
+    @Test fun staleSameModelWorkerPrewarmCannotRestoreDisabledWebPolicy() {
+        AgyProviderNative(context(), { null }).use { provider ->
+            val unusedNative = object : ProviderNativeCalls {
+                override fun respond(requestId: String, authPath: String, requestJson: String,
+                    callback: ProviderDeltaCallback) = error("No response expected")
+                override fun cancel(requestId: String) = Unit
+                override fun prewarm(model: String, authPath: String, webEnabled: Boolean) = error("No default prewarm expected")
+            }
+            val router = AgyProviderRouter(RuntimeEnvironment.getApplication(), unusedNative, provider)
+            router.prewarmSelection("agy-sonnet-high", false)
+            val generation = provider.get("prewarmGeneration")
+            router.prewarm("agy-sonnet-high", "", true)
+            assertEquals(generation, provider.get("prewarmGeneration"))
+            assertNull(provider.get("prewarmTargetModel"))
+        }
+    }
+
     @Test fun consumedPrewarmProcessAutomaticallyReprewarmsAfterRetirement() {
         val started = java.util.concurrent.CopyOnWriteArrayList<LiveProcess>()
         val executable = folder.newFile("libagy-reprewarm.so").apply { setExecutable(true) }

@@ -61,18 +61,18 @@ describe('Android runtime contract helpers', () => {
     expect(parseAndroidPromptUpdate({ kind: 'status', message: 'waiting' }, 'r')).toMatchObject({ kind: 'status', message: 'waiting' })
     expect(parseAndroidPromptUpdate({ kind: 'custom_direct_timings', first_text_ms: 450, completed_ms: 1250 }, 'r')).toEqual({ requestId: 'r', kind: 'custom_direct_timings', timings: { firstTextMs: 450, completedMs: 1250 } })
     const turn = { request_id: 'r', execution_id: { session_id: '1', generation: '1' }, user: { id: '1', role: 'user', content: { kind: 'text', text: 'question' } }, answer: { id: '2', role: 'assistant', content: { kind: 'refusal', text: 'cannot help' } }, final_stage: 'instant' }
-    expect(parseAndroidPromptOutcome({ kind: 'refused', turn }, 'r')).toMatchObject({ outcome: 'completed', runtimePhase: 'sleeping', canonicalOutcome: 'refused' })
+    expect(parseAndroidPromptOutcome({ kind: 'refused', save_disposition: 'saved', turn }, 'r')).toMatchObject({ outcome: 'completed', runtimePhase: 'sleeping', canonicalOutcome: 'refused' })
     const textTurn = { ...turn, answer: { ...turn.answer, content: { kind: 'text', text: 'answer' } } }
-    expect(parseAndroidPromptOutcome({ kind: 'completed', turn: textTurn }, 'r')).toMatchObject({ outcome: 'completed', canonicalOutcome: 'completed' })
-    expect(parseAndroidPromptOutcome({ kind: 'completed', turn: textTurn, first_text_ms: 450, completed_ms: 1250 }, 'r')).toMatchObject({ outcome: 'completed', canonicalOutcome: 'completed', customDirectTimings: { firstTextMs: 450, completedMs: 1250 } })
+    expect(parseAndroidPromptOutcome({ kind: 'completed', save_disposition: 'saved', turn: textTurn }, 'r')).toMatchObject({ outcome: 'completed', canonicalOutcome: 'completed' })
+    expect(parseAndroidPromptOutcome({ kind: 'completed', save_disposition: 'saved', turn: textTurn, first_text_ms: 450, completed_ms: 1250 }, 'r')).toMatchObject({ outcome: 'completed', canonicalOutcome: 'completed', customDirectTimings: { firstTextMs: 450, completedMs: 1250 } })
     expect(parseAndroidPromptOutcome({ kind: 'cancelled' }, 'r')).toMatchObject({ outcome: 'cancelled' })
     expect(() => parseAndroidPromptUpdate({ kind: 'delta', delta: 'wrong' }, 'r')).toThrow()
-    expect(() => parseAndroidPromptOutcome({ kind: 'completed', turn: {} }, 'r')).toThrow()
-    expect(() => parseAndroidPromptOutcome({ kind: 'completed', turn: { ...turn, request_id: 'other' } }, 'r')).toThrow()
-    expect(() => parseAndroidPromptOutcome({ kind: 'completed', turn }, 'r')).toThrow()
-    expect(() => parseAndroidPromptOutcome({ kind: 'refused', turn: { ...turn, answer: { ...turn.answer, content: { kind: 'text', text: 'answer' } } } }, 'r')).toThrow()
+    expect(() => parseAndroidPromptOutcome({ kind: 'completed', save_disposition: 'saved', turn: {} }, 'r')).toThrow()
+    expect(() => parseAndroidPromptOutcome({ kind: 'completed', save_disposition: 'saved', turn: { ...turn, request_id: 'other' } }, 'r')).toThrow()
+    expect(() => parseAndroidPromptOutcome({ kind: 'completed', save_disposition: 'saved', turn }, 'r')).toThrow()
+    expect(() => parseAndroidPromptOutcome({ kind: 'refused', save_disposition: 'saved', turn: { ...turn, answer: { ...turn.answer, content: { kind: 'text', text: 'answer' } } } }, 'r')).toThrow()
     expect(() => parseAndroidPromptOutcome({ kind: 'cancelled', turn }, 'r')).toThrow()
-    expect(() => parseAndroidPromptOutcomeForExecution({ kind: 'completed', turn: {} }, 'r')).toThrow(TauriCommandError)
+    expect(() => parseAndroidPromptOutcomeForExecution({ kind: 'completed', save_disposition: 'saved', turn: {} }, 'r')).toThrow(TauriCommandError)
     expect(missingPromptStreamingSupportError(true)).toMatchObject({ code: 'internal', message: 'Prompt execution requires Channel support' })
     const parsedTurn = parseCanonicalTurn(turn)
     expect(appendCanonicalTurn([], parsedTurn)).toEqual([parsedTurn])
@@ -223,5 +223,5 @@ function turnFixture(requestId = 'r', text = 'question'): Record<string, unknown
 }
 
 function wireSnapshot(): Record<string, unknown> {
-  return { session_id: '1', runtime_phase: 'sleeping', transcript: [], active_request: null, capabilities: [], model_options: [], preferences: { instant: 'local-fast', deep: 'opencode-sol-high', review: 'opencode-sol-high', deep_enabled: false, review_enabled: false, prefetch: false, completion: false, response_profile: 'fast', tts_enabled: false, ui_theme: 'dark', ui_text_size: 'medium' } }
+  return { session_id: '1', runtime_phase: 'sleeping', transcript: [], active_request: null, unsaved_result: null, capabilities: [], model_options: [], preferences: { instant: 'local-fast', deep: 'opencode-sol-high', review: 'opencode-sol-high', deep_enabled: false, review_enabled: false, prefetch: false, completion: false, response_profile: 'fast', tts_enabled: false, ui_theme: 'dark', ui_text_size: 'medium' } }
 }

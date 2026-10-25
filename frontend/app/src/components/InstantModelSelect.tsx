@@ -33,6 +33,9 @@ const EXIT_ANIMATION_MS = 160
 export function InstantModelSelect({ id, label, value, options, disabled, canRetry, onChange, variant = 'default', fastMode, onFastModeChange }: InstantModelSelectProps) {
   const [popupPhase, setPopupPhase] = useState<'closed' | 'open' | 'closing'>('closed')
   const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  const popupRef = useRef<HTMLDivElement>(null)
+  const keyboardEntryRef = useRef(false)
 
   const clearCloseTimer = useCallback(() => {
     if (closeTimerRef.current !== null) {
@@ -41,7 +44,13 @@ export function InstantModelSelect({ id, label, value, options, disabled, canRet
     }
   }, [])
 
-  const closePopup = useCallback(() => {
+  const closePopup = useCallback((reason: 'restore' | 'outside' = 'outside') => {
+    const trigger = triggerRef.current
+    const active = document.activeElement
+    if (reason === 'restore' && trigger?.isConnected && !trigger.disabled
+      && (active === trigger || (active !== null && popupRef.current?.contains(active)))) {
+      trigger.focus()
+    }
     clearCloseTimer()
     setPopupPhase((prev) => {
       if (prev === 'closed') return 'closed'
@@ -53,8 +62,9 @@ export function InstantModelSelect({ id, label, value, options, disabled, canRet
     }, EXIT_ANIMATION_MS)
   }, [clearCloseTimer])
 
-  const openPopup = useCallback(() => {
+  const openPopup = useCallback((keyboard = false) => {
     clearCloseTimer()
+    keyboardEntryRef.current = keyboard
     setPopupPhase('open')
   }, [clearCloseTimer])
 
@@ -63,13 +73,30 @@ export function InstantModelSelect({ id, label, value, options, disabled, canRet
   useEffect(() => {
     if (popupPhase !== 'open') return
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
+      const target = event.target
+      const owned = target instanceof Node && (triggerRef.current?.contains(target) || popupRef.current?.contains(target))
+      if (event.key === 'Escape' && owned) {
+        event.preventDefault()
         event.stopPropagation()
-        closePopup()
+        closePopup('restore')
       }
     }
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target
+      if (target instanceof Node && !triggerRef.current?.contains(target) && !popupRef.current?.contains(target)) closePopup('outside')
+    }
+    const handleFocusIn = (event: FocusEvent) => {
+      const target = event.target
+      if (target instanceof Node && !triggerRef.current?.contains(target) && !popupRef.current?.contains(target)) closePopup('outside')
+    }
     window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
+    window.addEventListener('pointerdown', handlePointerDown)
+    window.addEventListener('focusin', handleFocusIn)
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown)
+      window.removeEventListener('pointerdown', handlePointerDown)
+      window.removeEventListener('focusin', handleFocusIn)
+    }
   }, [popupPhase, closePopup])
 
   const selectedCatalog = catalogMap.get(value)
@@ -154,6 +181,16 @@ export function InstantModelSelect({ id, label, value, options, disabled, canRet
   const isPopupVisible = effectivePhase !== 'closed'
   const isPopupOpen = effectivePhase === 'open'
 
+  useEffect(() => {
+    if (!isPopupOpen || !keyboardEntryRef.current) return
+    keyboardEntryRef.current = false
+    if (disabled || document.activeElement !== triggerRef.current) return
+    const popup = popupRef.current
+    const option = popup?.querySelector<HTMLButtonElement>('[role="option"][aria-selected="true"]:not(:disabled)')
+      ?? popup?.querySelector<HTMLButtonElement>('[role="option"]:not(:disabled)')
+    option?.focus()
+  }, [isPopupOpen, disabled])
+
   const renderNativeSelect = (extraClassName?: string, nonInteractive = false) => (
     <select
       id={id}
@@ -200,15 +237,22 @@ export function InstantModelSelect({ id, label, value, options, disabled, canRet
       <div className="composer__model-selectors">
         <div className="composer__model-pill native-icon-select" title={selectedLabel}>
           <button
+            ref={triggerRef}
             type="button"
             className="composer__model-pill-trigger"
             aria-haspopup="dialog"
             aria-expanded={isPopupOpen}
             disabled={disabled || options.length === 0}
-            onClick={() => {
+            onKeyDown={(event) => {
+              if (['ArrowDown', 'Enter', ' '].includes(event.key) && !disabled && options.length > 0) {
+                event.preventDefault()
+                openPopup(true)
+              }
+            }}
+            onClick={(event) => {
               if (disabled || options.length === 0) return
               if (isPopupOpen) closePopup()
-              else openPopup()
+              else openPopup(event.detail === 0 && document.activeElement === event.currentTarget)
             }}
           >
             <span className="composer__model-pill-label">{pillDisplayLabel}</span>
@@ -227,7 +271,9 @@ export function InstantModelSelect({ id, label, value, options, disabled, canRet
               onClick={() => closePopup()}
             />
             <div
+              ref={popupRef}
               className="composer__model-popup"
+              inert={!isPopupOpen}
               data-state={effectivePhase}
               role="dialog"
               aria-label="Select model and reasoning effort"
@@ -242,15 +288,15 @@ export function InstantModelSelect({ id, label, value, options, disabled, canRet
                     className="composer__model-popup-item"
                     data-selected={isCurrentFamily ? 'true' : undefined}
                     style={{ '--item-index': index } as CSSProperties}
-                    disabled={disabled || !available}
+                    disabled={!isPopupOpen || disabled || !available}
                     title={repOption.reason}
                     onClick={() => {
-                      if (disabled || !available) return
+                      if (!isPopupOpen || disabled || !available) return
                       if (repOption.value !== value) {
                         onChange(repOption.value)
                       }
                       if (isCurrentFamily || modelCount <= 1) {
-                        closePopup()
+                        closePopup('restore')
                       }
                     }}
                   >
@@ -278,14 +324,14 @@ export function InstantModelSelect({ id, label, value, options, disabled, canRet
                         className="composer__model-popup-effort-chip"
                         data-active={isCurrentEffort ? 'true' : undefined}
                         aria-pressed={isCurrentEffort}
-                        disabled={disabled || !effortAvailable}
+                        disabled={!isPopupOpen || disabled || !effortAvailable}
                         title={option.reason}
                         onClick={() => {
-                          if (disabled || !effortAvailable) return
+                          if (!isPopupOpen || disabled || !effortAvailable) return
                           if (option.value !== value) {
                             onChange(option.value)
                           }
-                          closePopup()
+                          closePopup('restore')
                         }}
                       >
                         {chipLabel}
@@ -302,7 +348,7 @@ export function InstantModelSelect({ id, label, value, options, disabled, canRet
                         { label: 'On', nextFast: true },
                       ] as const).map(({ label: optLabel, nextFast }) => {
                         const isActive = Boolean(fastMode) === nextFast
-                        const isDisabled = disabled || (!selectedOption?.available && !canRetry(value))
+                        const isDisabled = !isPopupOpen || disabled || (!selectedOption?.available && !canRetry(value))
                         return (
                           <button
                             key={optLabel}
@@ -317,7 +363,7 @@ export function InstantModelSelect({ id, label, value, options, disabled, canRet
                               if (Boolean(fastMode) !== nextFast) {
                                 onFastModeChange(nextFast)
                               }
-                              closePopup()
+                              closePopup('restore')
                             }}
                           >
                             {optLabel}

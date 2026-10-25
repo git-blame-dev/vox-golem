@@ -93,13 +93,35 @@ pub struct CompletedTurn {
     pub record: Record,
     pub saved: bool,
 }
+
+/// Final execution authority, resolved after staging and before durable publication.
+pub enum CompletionDecision {
+    Authorized,
+    Cancelled,
+    Unavailable,
+}
+
+// A single synchronous callback value, never queued/retained in a collection.
+// Keep the completed record inline rather than allocate solely for empty variants.
+#[allow(clippy::large_enum_variant)]
+pub enum CompletionAttempt {
+    Cancelled,
+    Unavailable,
+    Finished(Result<CompletedTurn>),
+}
+
+struct StagedCompletion<'a> {
+    tx: Transaction<'a>,
+    next: CoreStore,
+    completed: CompletedTurn,
+}
 pub struct PreparedContext {
     pub context: ContextSelection,
     pub created: Option<Record>,
 }
 
 #[derive(Serialize)]
-pub struct MobilePreparedContext {
+pub struct PreparedRequestContext {
     pub context: ProviderContext,
     pub request: OperationId,
 }
@@ -309,17 +331,17 @@ impl Store {
             .map(|(prepared, _)| prepared)
     }
 
-    /// Mobile actor reconciles typed selection and persists its input draft first.
-    /// SQLite runs outside its admission monitor; a short final ticket check decides
+    /// Atomically pin context, allocate request identity and persist the admitted draft.
+    /// SQLite runs outside the shell admission monitor; its final ticket check decides
     /// whether to execute. A successful late-cancel preparation remains durable.
     /// `total_text_bytes` includes the prompt exactly once, not a remaining budget.
-    pub fn prepare_mobile(
+    pub fn prepare_request(
         &mut self,
         expected: Selection,
         prompt: &str,
         total_text_bytes: usize,
         strict_parent: bool,
-    ) -> Result<MobilePreparedContext> {
+    ) -> Result<PreparedRequestContext> {
         if total_text_bytes > 256 * 1024 || prompt.len() > total_text_bytes {
             return Err(limit("provider_context").into());
         }
@@ -330,7 +352,7 @@ impl Store {
             strict_parent,
             true,
         )?;
-        Ok(MobilePreparedContext {
+        Ok(PreparedRequestContext {
             context: provider_context(prepared.context),
             request: request.ok_or(Error::Storage)?,
         })
@@ -579,12 +601,80 @@ impl Store {
     /// Trusted thin adapters may supply the same immutable pinned body directly, avoiding
     /// an extra hash/record JNI round-trip. Only the shared codec/reducer validate it.
     pub fn complete_body(&mut self, body: OperationBody) -> Result<CompletedTurn> {
+        self.complete_body_with_authority(
+            body,
+            || ((), CompletionDecision::Authorized),
+            |_, attempt| match attempt {
+                CompletionAttempt::Finished(result) => result,
+                _ => unreachable!("unit authority always authorizes"),
+            },
+        )
+    }
+
+    /// Stage first, then retain final authority across SQLite COMMIT, core publication
+    /// and terminal winner bookkeeping, all on this synchronous worker. Neither callback
+    /// may call the store or acquire a lock whose owner waits for this store. Do not move
+    /// guards across async boundaries. Unavailable authority never permits a commit.
+    pub fn complete_body_with_authority<G, R>(
+        &mut self,
+        body: OperationBody,
+        acquire: impl FnOnce() -> (G, CompletionDecision),
+        finish: impl FnOnce(&mut G, CompletionAttempt) -> R,
+    ) -> R {
+        self.complete_body_guarded(body, false, acquire, finish)
+    }
+
+    /// Desktop local completion also advances its still-matching selected parent,
+    /// atomically with the turn. Other adapters retain explicit selection ownership.
+    /// A changed selection is never overwritten or used to reparent the completion.
+    pub fn complete_selected_body_with_authority<G, R>(
+        &mut self,
+        body: OperationBody,
+        acquire: impl FnOnce() -> (G, CompletionDecision),
+        finish: impl FnOnce(&mut G, CompletionAttempt) -> R,
+    ) -> R {
+        self.complete_body_guarded(body, true, acquire, finish)
+    }
+
+    fn complete_body_guarded<G, R>(
+        &mut self,
+        body: OperationBody,
+        advance_selection: bool,
+        acquire: impl FnOnce() -> (G, CompletionDecision),
+        finish: impl FnOnce(&mut G, CompletionAttempt) -> R,
+    ) -> R {
+        let staged = Self::stage_completion(&mut self.db, &mut self.core, body, advance_selection);
+        let (mut guard, decision) = acquire();
+        let attempt = match decision {
+            CompletionDecision::Cancelled => {
+                drop(staged);
+                CompletionAttempt::Cancelled
+            }
+            CompletionDecision::Unavailable => {
+                drop(staged);
+                CompletionAttempt::Unavailable
+            }
+            CompletionDecision::Authorized => {
+                CompletionAttempt::Finished(staged.and_then(|staged| {
+                    staged.tx.timed_commit()?;
+                    self.core = staged.next;
+                    Ok(staged.completed)
+                }))
+            }
+        };
+        finish(&mut guard, attempt)
+    }
+
+    fn stage_completion<'a>(
+        db: &'a mut Connection,
+        core: &mut CoreStore,
+        body: OperationBody,
+        advance_selection: bool,
+    ) -> Result<StagedCompletion<'a>> {
         if !matches!(body, OperationBody::TurnCompleted { .. }) {
             return Err(invalid("completion_body").into());
         }
-        let tx = self
-            .db
-            .timed_transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = db.timed_transaction_with_behavior(TransactionBehavior::Immediate)?;
         let id = allocate_id(&tx)?;
         let record = codec::record(Operation {
             version: SCHEMA_VERSION,
@@ -592,126 +682,30 @@ impl Store {
             body,
         })?;
         let (outcome, next) = Self::import_within_tx_with_hook(
-            &mut self.core,
+            core,
             &tx,
             vec![record.clone()],
             false,
             Some(&record.operation.id),
             |_| Ok(()),
         )?;
-        tx.timed_commit()?;
-        self.core = next;
         let saved = !outcome.suppressed.contains(&record.operation.id)
             && !outcome.quarantined.contains(&record.operation.id);
-        Ok(CompletedTurn { record, saved })
-    }
-    pub fn persist_settled_turn(
-        &mut self,
-        max_text_bytes: usize,
-        prompt: String,
-        answer: voxgolem_core::durable_conversation::Answer,
-        sources: Vec<voxgolem_core::sources::SourceLink>,
-        terminal_stage: voxgolem_core::durable_conversation::TerminalStage,
-        provenance: voxgolem_core::durable_conversation::Provenance,
-    ) -> Result<CompletedTurn> {
-        let tx = self
-            .db
-            .timed_transaction_with_behavior(TransactionBehavior::Immediate)?;
-        refresh(&tx, &mut self.core)?;
-
-        let (selected_conversation, selected_head): (Option<String>, Option<String>) = tx
-            .timed_query_row(
-                "SELECT conversation,selected_head FROM history_local WHERE singleton=1",
-                [],
-                |r| Ok((optional_text(r, 0, 256)?, optional_text(r, 1, 256)?)),
-            )?;
-        let selected_conversation: Option<OperationId> = selected_conversation
-            .map(|s| serde_json::from_str(&s).map_err(|_| Error::Storage))
-            .transpose()?;
-        let selected_head: Option<OperationId> = selected_head
-            .map(|s| serde_json::from_str(&s).map_err(|_| Error::Storage))
-            .transpose()?;
-
-        let mut created_core = None;
-        let conversation = match selected_conversation {
-            Some(conversation) => conversation,
-            None => {
-                let id = allocate_id(&tx)?;
-                let create_record = codec::record(Operation {
-                    version: SCHEMA_VERSION,
-                    id: id.clone(),
-                    body: OperationBody::ConversationCreated {
-                        title: "Conversation".into(),
-                    },
-                })?;
-                let (plan, next_store) = timing::measure(timing::Phase::reducer, || {
-                    self.core.plan_with_store(Command::Import {
-                        expected_revision: self.core.revision().into(),
-                        records: vec![create_record],
-                    })
-                })?;
-                apply_plan(&tx, &self.core, &plan)?;
-                created_core = Some(next_store);
-                id
+        if advance_selection && saved {
+            if let OperationBody::TurnCompleted {
+                conversation,
+                parent,
+                ..
+            } = &record.operation.body
+            {
+                tx.timed_execute("UPDATE history_local SET selected_head=? WHERE singleton=1 AND conversation=? AND selected_head IS ?", params![json_id(&record.operation.id)?, json_id(conversation)?, parent.as_ref().map(json_id).transpose()?])?;
             }
-        };
-
-        let working_core = created_core.as_mut().unwrap_or(&mut self.core);
-        let context = timing::measure(timing::Phase::projection, || {
-            working_core.select_context(ContextRequest {
-                expected_revision: working_core.revision().into(),
-                conversation: conversation.clone(),
-                selected_head,
-                max_turns: 20,
-                max_text_bytes,
-            })
-        })?;
-
-        let request = allocate_id(&tx)?;
-        let turn_id = allocate_id(&tx)?;
-        let mut prov = provenance;
-        prov.context = context.ancestor_ids;
-
-        let record = codec::record(Operation {
-            version: SCHEMA_VERSION,
-            id: turn_id.clone(),
-            body: OperationBody::TurnCompleted {
-                conversation: conversation.clone(),
-                parent: context.parent,
-                request,
-                prompt,
-                answer,
-                sources,
-                terminal_stage,
-                provenance: prov,
-            },
-        })?;
-
-        let (outcome, next_core) = Self::import_within_tx_with_hook(
-            working_core,
-            &tx,
-            vec![record.clone()],
-            false,
-            Some(&record.operation.id),
-            |_| Ok(()),
-        )?;
-
-        next_core.continuation(voxgolem_core::durable_conversation::ContinuationRequest {
-            expected_revision: next_core.revision().into(),
-            conversation: conversation.clone(),
-            selected_head: Some(turn_id.clone()),
-            local_work_in_flight: true,
-        })?;
-        tx.timed_execute(
-            "UPDATE history_local SET conversation=?,selected_head=? WHERE singleton=1",
-            params![json_id(&conversation)?, json_id(&turn_id)?],
-        )?;
-
-        tx.timed_commit()?;
-        self.core = next_core;
-        let saved = !outcome.suppressed.contains(&record.operation.id)
-            && !outcome.quarantined.contains(&record.operation.id);
-        Ok(CompletedTurn { record, saved })
+        }
+        Ok(StagedCompletion {
+            tx,
+            next,
+            completed: CompletedTurn { record, saved },
+        })
     }
     /// Commit an immutable completion constructed from its pre-inference ContextSelection.
     /// The caller's cancellation/admission lock must cover this entire call, including COMMIT.
@@ -732,10 +726,29 @@ impl Store {
         completion: Option<&OperationId>,
         before_commit: impl FnOnce() -> Result<()>,
     ) -> Result<CommitOutcome> {
+        let (outcome, _) =
+            self.import_with_hook_and_receipts(records, receive, completion, before_commit)?;
+        Ok(outcome)
+    }
+
+    pub(crate) fn import_received(
+        &mut self,
+        records: Vec<Record>,
+    ) -> Result<(CommitOutcome, Vec<Receipt>)> {
+        self.import_with_hook_and_receipts(records, true, None, || Ok(()))
+    }
+
+    fn import_with_hook_and_receipts(
+        &mut self,
+        records: Vec<Record>,
+        receive: bool,
+        completion: Option<&OperationId>,
+        before_commit: impl FnOnce() -> Result<()>,
+    ) -> Result<(CommitOutcome, Vec<Receipt>)> {
         let tx = self
             .db
             .timed_transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (outcome, next) = Self::import_within_tx_with_hook(
+        let (outcome, next, receipts) = Self::import_within_tx_with_receipts(
             &mut self.core,
             &tx,
             records,
@@ -745,7 +758,7 @@ impl Store {
         )?;
         tx.timed_commit()?;
         self.core = next; // Only advance the pinned reducer after SQLite COMMIT succeeds.
-        Ok(outcome)
+        Ok((outcome, receipts))
     }
 
     pub(crate) fn import_within_tx_with_hook(
@@ -756,6 +769,25 @@ impl Store {
         completion: Option<&OperationId>,
         before_commit: impl FnOnce(&Transaction<'_>) -> Result<()>,
     ) -> Result<(CommitOutcome, CoreStore)> {
+        let (outcome, next, _) = Self::import_within_tx_with_receipts(
+            core,
+            tx,
+            records,
+            receive,
+            completion,
+            before_commit,
+        )?;
+        Ok((outcome, next))
+    }
+
+    fn import_within_tx_with_receipts(
+        core: &mut CoreStore,
+        tx: &Transaction<'_>,
+        records: Vec<Record>,
+        receive: bool,
+        completion: Option<&OperationId>,
+        before_commit: impl FnOnce(&Transaction<'_>) -> Result<()>,
+    ) -> Result<(CommitOutcome, CoreStore, Vec<Receipt>)> {
         if records.len() > 128 {
             return Err(limit("batch_records").into());
         }
@@ -795,16 +827,20 @@ impl Store {
             })
         })?;
         apply_plan(tx, core, &plan)?;
-        if receive {
+        let receipts = if receive {
             let replica: String = tx.timed_query_row(
                 "SELECT replica FROM history_state WHERE singleton=1",
                 [],
                 |r| bounded_text(r, 0, 36),
             )?;
-            for receipt in receipts_after_commit(&next, &replica, &ids)? {
-                tx.timed_prepare_cached("INSERT OR IGNORE INTO history_receipt_outbox(operation_key,body_key,payload) VALUES(?,?,?)")?.timed_execute(params![key(&receipt.operation),receipt.body_key,encode(&receipt, 32*1024,"receipt_bytes")?])?;
+            let computed = receipts_after_commit(&next, &replica, &ids)?;
+            for receipt in &computed {
+                tx.timed_prepare_cached("INSERT OR IGNORE INTO history_receipt_outbox(operation_key,body_key,payload) VALUES(?,?,?)")?.timed_execute(params![key(&receipt.operation),receipt.body_key,encode(receipt, 32*1024,"receipt_bytes")?])?;
             }
-        }
+            computed
+        } else {
+            Vec::new()
+        };
         if let (
             Some(id),
             Some(OperationBody::TurnCompleted {
@@ -833,6 +869,7 @@ impl Store {
                 quarantined: plan.quarantined,
             },
             next,
+            receipts,
         ))
     }
 

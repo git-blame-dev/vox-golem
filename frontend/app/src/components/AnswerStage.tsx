@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react'
+import { isCoreWhitespaceOnly } from '../lib/wire'
 import type { SourceLink as AnswerSource } from '../lib/answerSources'
 export type { SourceLink as AnswerSource } from '../lib/answerSources'
 
@@ -67,7 +68,7 @@ export function AnswerStage({ answer, contentKind = 'text', stages, priorVersion
   return (
     <section className={rootClassName} aria-label={contentKind === 'refusal' ? 'Assistant refusal' : compact ? 'Assistant answer' : 'Current answer'} data-content-kind={contentKind}>
       {!compact || contentKind === 'refusal' ? <h2>{contentKind === 'refusal' ? 'Assistant refusal' : 'Current answer'}</h2> : null}
-      <p className="answer-stage__answer">{answer.trim().length === 0 ? pending ? <span className="message__thinking message__status-pill">{thinkingStatus ?? 'Thinking…'}</span> : 'No response was returned.' : <PlainText>{answer}</PlainText>}</p>
+      <p className="answer-stage__answer">{isCoreWhitespaceOnly(answer) ? pending ? <span className="message__thinking message__status-pill">{thinkingStatus ?? 'Thinking…'}</span> : 'No response was returned.' : <PlainText>{answer}</PlainText>}</p>
       {!compact || visibleStages.length > 0 ? <ul className="answer-stage__statuses" aria-label="Answer stage status">
          {visibleStages.map(({ stage, status }, index) => (
           <li key={`${stage}-${status}-${index}`} data-stage={stage} data-status={status}>

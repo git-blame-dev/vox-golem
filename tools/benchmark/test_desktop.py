@@ -1,5 +1,6 @@
 import asyncio
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -29,7 +30,7 @@ class DesktopTests(unittest.TestCase):
             root = Path(temporary)
             binary = root/'binary'
             binary.write_bytes(b'synthetic')
-            args = SimpleNamespace(binary=binary, config=root/'config', output=root,
+            args = SimpleNamespace(binary=binary, config=root/'unresolved'/'..'/'config', output=root,
                                    offline_evidence=root/'qualification', flow_timeout=10)
             events = []
             runner = Mock()
@@ -55,6 +56,8 @@ class DesktopTests(unittest.TestCase):
                 'reserve_live_budget', 'isolated_environment', 'start_typed_app', 'suite', 'shutdown_owned'])
             runner.validate_offline_evidence.assert_called_once_with(args.offline_evidence, binary, {}, {}, 'typed')
             runner.reserve_live_budget.assert_called_once_with(runner.ASSIGNMENT_LEDGER, root/'reservation.json')
+            runner.isolated_environment.assert_called_once_with(root, args.config, None, True,
+                                                               root/'reservation.json', entry='typed')
             self.assertNotIn('private payload', json.dumps(report))
             return result, report
 
@@ -73,7 +76,7 @@ class DesktopTests(unittest.TestCase):
         self.assertEqual(result, 3)
         self.assertEqual(report['status'], 'blocked')
 
-    def run_parent(self, status='unverified', code=2):
+    def run_parent(self, status='unverified', code=2, invalid_workspace=False):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)/'repo'
             root.mkdir()
@@ -89,6 +92,7 @@ class DesktopTests(unittest.TestCase):
             def launch(command, **kwargs):
                 self.assertIn('--shared-suite', command)
                 self.assertIn('--offline-evidence', command)
+                self.assertEqual(command[command.index('--config')+1], str(args.config))
                 self.assertNotIn('--inside-session', command)
                 self.assertEqual(command[1], str(root/'tools/app-bench/runner.py'))
                 self.assertTrue(kwargs['start_new_session'])
@@ -100,7 +104,17 @@ class DesktopTests(unittest.TestCase):
                     'cases':[], 'cleanup':{'desktop':{'app_exit_before_group_termination_observed':True}}}))
                 return process
             report = {'cleanup':{}, 'source':{'revision':'synthetic'}, 'measurement':{'poll_interval_ms':100}}
-            with patch.object(desktop, 'ROOT', root), patch.object(desktop.shutil, 'which', return_value='/synthetic/tool'), patch.object(desktop.subprocess, 'Popen', side_effect=launch):
+            resolver = desktop.artifact_root if invalid_workspace else lambda _: root.parent/'artifacts'
+            launcher = Mock(side_effect=launch)
+            transport = SimpleNamespace(Popen=launcher, DEVNULL=subprocess.DEVNULL,
+                                        TimeoutExpired=subprocess.TimeoutExpired)
+            with patch.object(desktop, 'ROOT', root), patch.object(desktop, 'artifact_root', side_effect=resolver), patch.object(desktop.shutil, 'which', return_value='/synthetic/tool'), patch.object(desktop, 'subprocess', transport):
+                if invalid_workspace:
+                    with self.assertRaisesRegex(Exception, 'desktop_canonical_workspace_unavailable'):
+                        asyncio.run(desktop.run_desktop(args, report))
+                    launcher.assert_not_called()
+                    self.assertFalse((root.parent/'artifacts').exists())
+                    return
                 asyncio.run(desktop.run_desktop(args, report))
             self.assertEqual(report['status'], status)
             self.assertEqual(report['coverage'], 'full')
@@ -114,6 +128,9 @@ class DesktopTests(unittest.TestCase):
 
     def test_parent_preserves_blocked_status_and_selection(self):
         self.run_parent('blocked', 3)
+
+    def test_non_git_parent_fails_before_artifact_creation_or_child_launch(self):
+        self.run_parent(invalid_workspace=True)
 
 
 if __name__ == '__main__':

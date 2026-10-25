@@ -1,5 +1,167 @@
 use super::*;
 
+fn original_ready(store: &Store, id: &OperationId) -> bool {
+    !store.quarantine.contains_key(id)
+        && store.records.get(id).is_some_and(|record| {
+            store
+                .records
+                .get(record.operation.conversation())
+                .is_some_and(|r| {
+                    matches!(r.operation.body, OperationBody::ConversationCreated { .. })
+                })
+        })
+        && store.path(id).is_ok_and(|path| store.path_complete(&path))
+}
+
+fn readiness_chain(count: usize, branched: bool) -> Store {
+    fn sequence(n: usize) -> u64 {
+        if n.is_multiple_of(2) {
+            10_000 + n as u64
+        } else {
+            100_000 + n as u64
+        }
+    }
+    let mut snapshot = StoreSnapshot::empty();
+    snapshot.records.push(create());
+    for n in 0..count {
+        let parent = if n == 0 {
+            None
+        } else {
+            Some(id(A, sequence(if branched { (n - 1) / 2 } else { n - 1 })))
+        };
+        let mut r = turn(A, sequence(n), parent, vec![]);
+        if let OperationBody::TurnCompleted { request, .. } = &mut r.operation.body {
+            *request = id(B, 100_000 + n as u64);
+        }
+        snapshot.records.push(r);
+    }
+    Store::restore(snapshot).unwrap()
+}
+
+fn assert_readiness_equivalent(store: &Store) {
+    for reverse in [false, true] {
+        let mut ids: Vec<_> = store.records.keys().collect();
+        if reverse {
+            ids.reverse();
+        }
+        let mut analysis = Readiness::new(store);
+        for id in ids {
+            assert_eq!(analysis.ready(id), original_ready(store, id), "{id:?}");
+            assert_eq!(store.ready(id), original_ready(store, id), "single {id:?}");
+        }
+        assert!(!analysis.ready(&id(B, 999_999)));
+    }
+}
+
+#[test]
+fn readiness_matches_path_oracle_for_restored_and_adversarial_graphs() {
+    let base = readiness_chain(24, true);
+    assert_readiness_equivalent(&base);
+    let pending = import(&empty(), vec![turn(A, 2, Some(id(A, 3)), vec![])]);
+    assert_readiness_equivalent(&pending);
+    let resolved = import(&pending, vec![create(), turn(A, 3, None, vec![])]);
+    assert_readiness_equivalent(&resolved);
+    assert_readiness_equivalent(&import(&resolved, vec![delete()]));
+
+    // Explicit private adversarial predicate fixtures, not valid restore fixtures:
+    // exercise impossible retained cycles, foreign owners, quarantine and retired tails.
+    for case in 0..8 {
+        let mut store = base.clone();
+        let root = id(A, 10_000);
+        match case {
+            0 => {
+                store.records.remove(&id(A, 1));
+            }
+            1 => {
+                store
+                    .quarantine
+                    .insert(id(A, 1), QuarantineReason::InvalidReference);
+            }
+            2 => {
+                store
+                    .quarantine
+                    .insert(root.clone(), QuarantineReason::InvalidReference);
+            }
+            3..=5 => {
+                let OperationBody::TurnCompleted { parent, .. } =
+                    &mut store.records.get_mut(&root).unwrap().operation.body
+                else {
+                    unreachable!()
+                };
+                *parent = Some(if case == 3 {
+                    id(A, 100_001)
+                } else if case == 4 {
+                    id(A, 1)
+                } else {
+                    id(B, 42)
+                });
+                if case == 5 {
+                    store.retired.insert(
+                        id(B, 42),
+                        RetiredRecord {
+                            id: id(B, 42),
+                            conversation: id(A, 1),
+                            body_key: key(42),
+                        },
+                    );
+                }
+            }
+            6 | 7 => {
+                let mut other = create();
+                other.operation.id = id(B, 1);
+                store.records.insert(id(B, 1), other);
+                let OperationBody::TurnCompleted { conversation, .. } = &mut store
+                    .records
+                    .get_mut(&id(A, 100_001))
+                    .unwrap()
+                    .operation
+                    .body
+                else {
+                    unreachable!()
+                };
+                *conversation = if case == 6 { id(B, 1) } else { id(B, 2) };
+            }
+            _ => unreachable!(),
+        }
+        assert_readiness_equivalent(&store);
+    }
+}
+
+#[test]
+fn readiness_cached_depth_does_not_admit_over_limit_descendant() {
+    let mut store = readiness_chain(MAX_ANCESTRY, false);
+    // Valid maximum-depth history restored through production validation above.
+    let mut analysis = Readiness::new(&store);
+    assert!(analysis.ready(&id(A, 10_000)));
+    let last = id(A, 100_000 + (MAX_ANCESTRY - 1) as u64);
+    assert!(analysis.ready(&last));
+    drop(analysis);
+    // Explicit adversarial over-depth fixture: production restore must reject it.
+    let extra = turn(A, 999_999, Some(last), vec![]);
+    store.records.insert(extra.operation.id.clone(), extra);
+    assert!(Store::restore(store.export()).is_err());
+    let mut analysis = Readiness::new(&store);
+    assert!(analysis.ready(&id(A, 100_000 + (MAX_ANCESTRY - 1) as u64)));
+    assert!(!analysis.ready(&id(A, 999_999)));
+    assert!(!original_ready(&store, &id(A, 999_999)));
+}
+
+#[test]
+fn summary_readiness_visits_are_linear_in_lexically_unsorted_histories() {
+    for branched in [false, true] {
+        let store = readiness_chain(1200, branched);
+        READINESS_VISITS.with(|v| v.set(0));
+        let summary = store.summary();
+        let visits = READINESS_VISITS.with(|v| v.get());
+        assert_eq!(visits, 1200, "ancestry visits, branched={branched}");
+        assert!(summary.pending.is_empty());
+        assert_eq!(
+            summary.conversations[0].heads.len(),
+            if branched { 600 } else { 1 }
+        );
+    }
+}
+
 const A: &str = "00000000-0000-4000-8000-000000000001";
 const B: &str = "00000000-0000-4000-8000-000000000002";
 fn id(replica: &str, sequence: u64) -> OperationId {

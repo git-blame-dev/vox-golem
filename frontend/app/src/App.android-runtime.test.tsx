@@ -176,7 +176,7 @@ describe('production Android App runtime', () => {
     now = 400
     const turn = { request_id: requestId, execution_id: { session_id: '1', generation: '2' }, user: { id: '3', role: 'user', content: { kind: 'text', text: 'Synthetic timing question' } }, answer: { id: '4', role: 'assistant', content: { kind: 'text', text: 'Synthetic answer' } }, final_stage: 'instant' }
     transcript = [...transcript, turn]
-    await act(async () => { finish({ kind: 'completed', turn, first_text_ms: 7, completed_ms: 900_009 }) })
+    await act(async () => { finish({ kind: 'completed', save_disposition: 'saved', turn, first_text_ms: 7, completed_ms: 900_009 }) })
     const answer = session.getMessagesSnapshot().find((message) => message.id === '4')
     const settledRow = Array.from(container.querySelectorAll<HTMLElement>('[data-turn-role="assistant"]')).find((row) => row.dataset['requestId'] === requestId)!
     expect(settledRow.dataset).toMatchObject({ requestId, turnOutcome: 'completed', stageStatus: 'completed', contentKind: 'text' })
@@ -231,7 +231,7 @@ describe('production Android App runtime', () => {
           updates.send({ kind: 'text', text: 'Synthetic desktop answer' })
           updates.send({ kind: 'custom_direct_timings', first_text_ms: 450, completed_ms: 1250 })
           transcript = [{ request_id: requestId, execution_id: { session_id: '1', generation: '1' }, user: { id: '1', role: 'user', content: { kind: 'text', text: 'Synthetic desktop question' } }, answer: { id: '2', role: 'assistant', content: { kind: 'text', text: 'Synthetic desktop answer' } }, final_stage: 'instant' }]
-          return { request_id: requestId, outcome: 'completed', runtime_phase: 'sleeping' }
+          return { kind: 'completed', save_disposition: 'saved', turn: transcript[0] }
         }
         return null
       },
@@ -280,7 +280,7 @@ describe('production Android App runtime', () => {
         }
         now = 900
         freshTurn = turn(requestId, true)
-        return { kind: 'completed', turn: freshTurn }
+        return { kind: 'completed', save_disposition: 'saved', turn: freshTurn }
       }
       if (command === 'reset_session') {
         if (rejected) throw { code: 'internal', message: 'Synthetic reset rejected without changing context' }
@@ -302,7 +302,7 @@ describe('production Android App runtime', () => {
     }
     await submit()
     now = 200
-    await act(async () => { finishFirst({ kind: 'completed', turn: firstTurn }) })
+    await act(async () => { finishFirst({ kind: 'completed', save_disposition: 'saved', turn: firstTurn }) })
     expect(session.getControlsSnapshot().promptState).toBe('reconciling')
     expect(container.querySelector('.answer-stage__answer')?.textContent).not.toBe('Synthetic old answer')
     now = 300
@@ -832,6 +832,7 @@ function wireSnapshot(): Record<string, unknown> {
   const capabilityIds = ['custom_provider', 'opencode', 'local_fast', 'local_quality', 'qwen_prediction', 'wake_word', 'vad', 'parakeet', 'tts', 'deep', 'review']
   return {
     session_id: '1',
+    unsaved_result: null,
     runtime_phase: 'sleeping',
     transcript: [],
     active_request: null,

@@ -8,6 +8,42 @@ The generated baseline is intentionally kept separate from authored behavior. Au
 
 Prerequisites are Bun, Rust/Cargo, Android SDK/NDK tooling supported by Tauri, and the pinned `tauri-cli 2.11.1`. Run `make android-init` from the repository root after those prerequisites are installed.
 
+## Optimized release and CI trial
+
+Run `make android-release` from the repository root with the same pinned toolchain
+as `make android-build`. It invokes `cargo tauri android build --target aarch64
+--apk --ci -- --locked`: release is the CLI default, without `--debug` or a custom
+Rust profile. The generated release build type already enables R8 with optimized
+ProGuard rules; Android's release defaults leave app/JNI debugging disabled. The
+shared Assistant JNI release task separately uses Cargo `--release`. No scaffold
+edits, resource-shrinking override or local signing-identity change are required.
+
+With the current unsigned release configuration, the APK is
+`src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk`.
+R8 mapping is under `app/build/outputs/mapping/universalRelease/mapping.txt`.
+Build output alone is not a signed delivery or runtime acceptance.
+
+Linux CI keeps debug builds/tests and adds this release build. It aligns and signs
+the APK with the **existing job debug keystore**, not a production credential, and
+uploads `vox-golem-android-optimized-ci-arm64-debug-key`. CI checks:
+
+- SDK `apksigner` verification and matching signer digest against the job's debug APK;
+- SDK `zipalign` validation, application ID `dev.gitblame.voxgolem.android`, exactly
+  ARM64 native code and no manifest debuggability using SDK `aapt`;
+- nonempty R8 mapping, both Tauri and Assistant JNI libraries, no native debugger
+  launch helpers, and AArch64 ELF headers for packaged native libraries using NDK
+  `llvm-readelf`.
+
+The artifact includes the signed APK, mapping, inspection evidence and APK
+`SHA256SUMS`. CI disables capture timing/profileability opt-in for this trial.
+The Android job budget is 90 minutes to accommodate both Rust profiles and R8;
+this is a timeout allowance, not a measured build-time or runtime-speed claim.
+The job-local debug certificate is **not guaranteed install-compatible with user
+devices or their paired Watch**. Local signing configuration is unchanged. These
+checks do not prove optimized JNI retention, speech, lifecycle, provider access,
+phone/Watch pairing or performance on a physical device; those still require
+separately authorized acceptance with matching certificates and preserved data.
+
 ## Launcher entries
 
 - **Vox Chat** (chat-bubble badge) opens the normal chat UI without starting a new microphone session.

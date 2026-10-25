@@ -4,19 +4,38 @@ import android.content.Context
 import dev.gitblame.voxgolem.voice.InstallationPreferences
 import org.json.JSONObject
 
-class PhonePreferences(context: Context) {
-    private val storage = context.applicationContext.getSharedPreferences("assistant-phone-preferences", Context.MODE_PRIVATE)
-    private var published: JSONObject? = null
-
-    @Synchronized fun read(model: String): JSONObject {
-        val value = published ?: readStored().also { published = it }
-        return JSONObject(value.toString()).put("instant", model)
+class PhonePreferences private constructor(private val openStorage: () -> android.content.SharedPreferences) {
+    internal constructor(storage: android.content.SharedPreferences) : this({ storage })
+    constructor(context: Context) : this({ context.applicationContext.getSharedPreferences("assistant-phone-preferences", Context.MODE_PRIVATE) })
+    private val storage by lazy(openStorage)
+    internal data class Presentation(val instant: String, val deep: String, val review: String,
+        val deepEnabled: Boolean, val reviewEnabled: Boolean, val prefetch: Boolean, val completion: Boolean,
+        val responseProfile: String, val ttsEnabled: Boolean, val theme: String, val textSize: String) {
+        fun json(): JSONObject = defaults().put("instant", instant).put("deep", deep).put("review", review)
+            .put("deep_enabled", deepEnabled).put("review_enabled", reviewEnabled).put("prefetch", prefetch)
+            .put("completion", completion).put("response_profile", responseProfile).put("tts_enabled", ttsEnabled)
+            .put("ui_theme", theme).put("ui_text_size", textSize)
+        companion object {
+            fun from(value: JSONObject) = Presentation(value.getString("instant"), value.getString("deep"), value.getString("review"),
+                value.getBoolean("deep_enabled"), value.getBoolean("review_enabled"), value.getBoolean("prefetch"),
+                value.getBoolean("completion"), value.getString("response_profile"), value.getBoolean("tts_enabled"),
+                value.getString("ui_theme"), value.getString("ui_text_size"))
+        }
     }
+    @Volatile private var published: Presentation? = null
+    private val initialization = Any()
+
+    /** Called by the engine actor before accepting dependent phone work. */
+    internal fun initialize() = synchronized(initialization) {
+        if (published == null) published = Presentation.from(readStored())
+    }
+    private fun current(): Presentation = published ?: throw AssistantPhoneFailure("unavailable", "Assistant preferences are not ready")
+    fun read(model: String): JSONObject = current().json().put("instant", model)
 
     private fun readStored(): JSONObject {
         val defaults = defaults()
         val value = JSONObject()
-        for (key in defaults.keys()) {
+        for (key in defaults.keys()) if (!InstallationPreferences.ownsKey(key)) {
             value.put(key, when (val fallback = defaults.get(key)) {
                 is Boolean -> storage.getBoolean(key, fallback)
                 else -> storage.getString(key, fallback as String)
@@ -26,23 +45,26 @@ class PhonePreferences(context: Context) {
     }
 
     /** Invoke on the shared actor alongside model selection; disk commit precedes publication. */
-    @Synchronized fun write(input: JSONObject) {
-        val value = normalize(input)
+    fun write(input: JSONObject) { publish(persist(input)) }
+
+    internal fun persist(input: JSONObject): Presentation {
+        val value = copyInput(input)
         validate(value)
-        val before = published ?: readStored()
-        if (!commit(value)) {
+        val before = current()
+        val candidate = Presentation.from(value)
+        if (!commit(candidate.json())) {
             // SharedPreferences may update its memory cache even when disk commit fails.
-            commit(before)
-            published = before
+            commit(before.json())
             throw AssistantPhoneFailure("internal", "Assistant preferences were not saved")
         }
-        published = JSONObject(value.toString())
+        return candidate
     }
+
+    internal fun publish(value: Presentation) { published = value }
 
     private fun commit(value: JSONObject): Boolean {
         val editor = storage.edit()
-        // Actor policy is persisted once in InstallationPreferences and overlaid by EnginePhoneBackend.
-        // Leave old duplicate keys untouched for compatibility, but never write a second policy record.
+        // Actor policy belongs to InstallationPreferences; only presentation fields are persisted here.
         for (key in value.keys()) if (!InstallationPreferences.ownsKey(key)) when (val field = value.get(key)) {
             is Boolean -> editor.putBoolean(key, field)
             is String -> editor.putString(key, field)
@@ -58,13 +80,8 @@ class PhonePreferences(context: Context) {
             .put("web_enabled", true).put("speech_network_fallback", true).put("fast_mode", false)
             .put("speech_language", "").put("speech_tts_provider", "").put("speech_tts_voice", "")
 
-        fun normalize(value: JSONObject) = JSONObject(value.toString()).apply {
-            for (key in listOf("web_enabled", "speech_network_fallback")) if (!has(key)) put(key, true)
-            if (!has("fast_mode")) put("fast_mode", false)
-            for (key in listOf("speech_language", "speech_tts_provider", "speech_tts_voice")) if (!has(key)) put(key, "")
-        }
-        fun validate(input: JSONObject) {
-            val value = normalize(input)
+        internal fun copyInput(value: JSONObject) = JSONObject(value.toString())
+        fun validate(value: JSONObject) {
             val defaults = defaults()
             if (value.keys().asSequence().toSet() != defaults.keys().asSequence().toSet()) invalid()
             val enums = mapOf(

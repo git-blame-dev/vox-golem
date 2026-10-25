@@ -48,18 +48,13 @@ class EnrolledPeerRegistry(context: Context) : Closeable {
         var mutation = false
         try {
             val existing = replicas()
-            val backlog = db.rawQuery("SELECT replica FROM cleanup_peers", null).use { cursor ->
-                buildSet { while (cursor.moveToNext()) add(cursor.getString(0)) }
-            }
-            if (replica in existing && replica !in backlog) {
+            if (replica in existing) {
                 db.setTransactionSuccessful()
                 return
             }
             beginApprovalMutation(); mutation = true
-            require(replica in existing || existing.size < ReplicationWire.MAX_PEERS) { "Assistant peer limit reached" }
-            require(replica in existing || replica in backlog || backlog.size < ReplicationWire.MAX_PEERS) { "Assistant peer cleanup pending" }
+            require(existing.size < ReplicationWire.MAX_PEERS) { "Assistant peer limit reached" }
             db.insertWithOnConflict("peers", null, ContentValues().apply { put("replica", replica) }, SQLiteDatabase.CONFLICT_IGNORE)
-            db.delete("cleanup_peers", "replica = ?", arrayOf(replica))
             db.setTransactionSuccessful()
         } finally { try { db.endTransaction() } finally { if (mutation) endApprovalMutation() } }
     }
@@ -70,13 +65,15 @@ class EnrolledPeerRegistry(context: Context) : Closeable {
         db.beginTransaction()
         beginApprovalMutation()
         try {
-            if (db.delete("peers", "replica = ?", arrayOf(replica)) != 0) {
-                db.insertWithOnConflict("cleanup_peers", null, ContentValues().apply { put("replica", replica) }, SQLiteDatabase.CONFLICT_IGNORE)
-            }
+            db.delete("peers", "replica = ?", arrayOf(replica))
             db.setTransactionSuccessful()
         } finally {
             try { db.endTransaction() } finally { endApprovalMutation(); ChatGptAccessSync.changed(application) }
         }
+    }
+
+    internal fun resetConversationReplicationState() {
+        database.writableDatabase.execSQL("UPDATE retry SET attempts = 0, due = 0 WHERE singleton = 1")
     }
 
     internal fun setupValue(key: String): JSONObject? = database.readableDatabase.rawQuery("SELECT value FROM setup WHERE key = ?", arrayOf(key)).use {
@@ -127,9 +124,8 @@ class EnrolledPeerRegistry(context: Context) : Closeable {
             val bindings = db.rawQuery("SELECT replica, association FROM native_bindings", null).use { cursor ->
                 buildList { while (cursor.moveToNext()) add(ApprovedPeerBinding(cursor.getString(0), cursor.getString(1))) }
             }
-            val cleanupPending = db.rawQuery("SELECT 1 FROM cleanup_peers WHERE replica = ?", arrayOf(binding.replica)).use { it.moveToFirst() }
             // Reconciliation must not revoke a live route when every approval input is unchanged.
-            if (replicas() == setOf(binding.replica) && bindings == listOf(binding) && !cleanupPending) {
+            if (replicas() == setOf(binding.replica) && bindings == listOf(binding)) {
                 db.setTransactionSuccessful()
                 return
             }
@@ -152,19 +148,6 @@ internal class DurableReplicationState(context: Context) : ReplicationState, Clo
     override fun enrolledReplicas(): Set<String> = database.readableDatabase.rawQuery("SELECT replica FROM peers", null).use { cursor ->
         buildSet { while (cursor.moveToNext()) add(cursor.getString(0)) }
     }
-    override fun load(peer: String): JSONObject? = database.readableDatabase.rawQuery("SELECT session FROM peers WHERE replica = ?", arrayOf(peer)).use {
-        if (it.moveToFirst() && !it.isNull(0)) JSONObject(it.getString(0)) else null
-    }
-    override fun save(peer: String, state: JSONObject?) {
-        ReplicationWire.uuid(peer)
-        val raw = state?.toString()
-        require(raw == null || raw.toByteArray(Charsets.UTF_8).size <= 64 * 1024)
-        require(database.writableDatabase.update("peers", ContentValues().apply { put("session", raw) }, "replica = ?", arrayOf(peer)) == 1)
-    }
-    override fun cleanupReplicas(): Set<String> = database.readableDatabase.rawQuery("SELECT replica FROM cleanup_peers", null).use { cursor ->
-        buildSet { while (cursor.moveToNext()) add(cursor.getString(0)) }
-    }
-    override fun cleanupComplete(peer: String) { database.writableDatabase.delete("cleanup_peers", "replica = ?", arrayOf(peer)) }
     fun retryDelay(now: Long): Long = database.readableDatabase.rawQuery("SELECT due FROM retry WHERE singleton = 1", null).use {
         check(it.moveToFirst()); (it.getLong(0) - now).coerceIn(0, MAX_BACKOFF)
     }
@@ -187,21 +170,21 @@ internal class DurableReplicationState(context: Context) : ReplicationState, Clo
 }
 
 private class ReplicationDatabase(context: Context) : SQLiteOpenHelper(context,
-    File(context.noBackupFilesDir, "assistant-replication.db").absolutePath, null, 4) {
+    File(context.noBackupFilesDir, "assistant-replication.db").absolutePath, null, 5) {
     override fun onConfigure(db: SQLiteDatabase) {
         db.execSQL("PRAGMA foreign_keys = ON")
         db.rawQuery("PRAGMA secure_delete = ON", null).use { check(it.moveToFirst()) }
     }
     override fun onCreate(db: SQLiteDatabase) {
-        db.execSQL("CREATE TABLE peers (replica TEXT PRIMARY KEY, session TEXT)")
-        db.execSQL("CREATE TABLE cleanup_peers (replica TEXT PRIMARY KEY)")
+        db.execSQL("CREATE TABLE peers (replica TEXT PRIMARY KEY)")
         db.execSQL("CREATE TABLE setup (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         db.execSQL("CREATE TABLE native_bindings (replica TEXT PRIMARY KEY, association TEXT NOT NULL)")
         db.execSQL("CREATE TABLE retry (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), attempts INTEGER NOT NULL, due INTEGER NOT NULL)")
         db.execSQL("INSERT INTO retry VALUES (1, 0, 0)")
     }
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        check(oldVersion in 1..3 && newVersion == 4)
+        check(oldVersion in 1..4 && newVersion == 5)
+        db.execSQL("CREATE TABLE IF NOT EXISTS setup (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         if (oldVersion < 3) {
             // Existing authorization-format upgrade, unchanged by the history epoch.
             db.delete("setup", null, null)
@@ -210,8 +193,13 @@ private class ReplicationDatabase(context: Context) : SQLiteOpenHelper(context,
         }
         // New history epoch only: preserve setup, enrolled identities and trusted bindings.
         db.execSQL("CREATE TABLE IF NOT EXISTS native_bindings (replica TEXT PRIMARY KEY, association TEXT NOT NULL)")
-        db.execSQL("UPDATE peers SET session = NULL")
-        db.execSQL("UPDATE retry SET attempts = 0, due = 0 WHERE singleton = 1")
+        db.execSQL("DROP TABLE IF EXISTS cleanup_peers")
+        db.execSQL("CREATE TABLE peers_new (replica TEXT PRIMARY KEY)")
+        db.execSQL("INSERT OR IGNORE INTO peers_new (replica) SELECT replica FROM peers")
+        db.execSQL("DROP TABLE peers")
+        db.execSQL("ALTER TABLE peers_new RENAME TO peers")
+        db.execSQL("CREATE TABLE IF NOT EXISTS retry (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), attempts INTEGER NOT NULL, due INTEGER NOT NULL)")
+        db.execSQL("INSERT OR REPLACE INTO retry VALUES (1, 0, 0)")
     }
 }
 

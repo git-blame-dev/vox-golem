@@ -45,6 +45,7 @@ pub struct LocalTtsRuntime {
     generation: Arc<AtomicU64>,
     sample_rate_hz: u32,
     max_duration_ms: u64,
+    max_duration_samples: usize,
     sender: Option<mpsc::SyncSender<SynthesisJob>>,
     _workers: Vec<thread::JoinHandle<()>>,
     actual_provider: Option<TtsActualProvider>,
@@ -64,6 +65,19 @@ type SynthesisEngineFactory = Arc<
         + Send
         + Sync,
 >;
+
+type ThreadSpawner = Arc<
+    dyn Fn(String, Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<thread::JoinHandle<()>>
+        + Send
+        + Sync,
+>;
+
+fn default_thread_spawner(
+    name: String,
+    work: Box<dyn FnOnce() + Send + 'static>,
+) -> std::io::Result<thread::JoinHandle<()>> {
+    thread::Builder::new().name(name).spawn(work)
+}
 
 type AbandonedSynthesis = (
     thread::JoinHandle<()>,
@@ -156,9 +170,9 @@ impl Drop for SynthesisPermit {
 
 fn reap_abandoned_synthesis() -> bool {
     let pending = ABANDONED_SYNTHESIS.get_or_init(|| Mutex::new(Vec::new()));
-    let Ok(mut pending) = pending.lock() else {
-        return true;
-    };
+    let mut pending = pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut active = Vec::with_capacity(pending.len());
     for runner in pending.drain(..) {
         if runner.is_finished() {
@@ -174,16 +188,17 @@ fn reap_abandoned_synthesis() -> bool {
 
 fn retain_abandoned_synthesis(runner: thread::JoinHandle<()>) {
     let pending = ABANDONED_SYNTHESIS.get_or_init(|| Mutex::new(Vec::new()));
-    if let Ok(mut pending) = pending.lock() {
-        pending.push(runner);
-    }
+    let mut pending = pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    pending.push(runner);
 }
 
 fn reap_pending_initializations() -> bool {
     let pending = PENDING_INITIALIZATIONS.get_or_init(|| Mutex::new(Vec::new()));
-    let Ok(mut pending) = pending.lock() else {
-        return false;
-    };
+    let mut pending = pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut active = Vec::with_capacity(pending.len());
     for worker in pending.drain(..) {
         if worker.is_finished() {
@@ -199,9 +214,10 @@ fn reap_pending_initializations() -> bool {
 
 fn retain_pending_initializations(workers: Vec<thread::JoinHandle<()>>) {
     let pending = PENDING_INITIALIZATIONS.get_or_init(|| Mutex::new(Vec::new()));
-    if let Ok(mut pending) = pending.lock() {
-        pending.extend(workers);
-    }
+    let mut pending = pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    pending.extend(workers);
 }
 
 trait SynthesisEngine: Send {
@@ -212,7 +228,7 @@ struct PiperOnnxEngine {
     session: ort::session::Session,
     config: PiperVoiceConfig,
     contract: PiperModelContract,
-    sample_rate_hz: u32,
+    limits: voxgolem_core::config::ValidatedTtsResourceLimits,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -263,13 +279,32 @@ const SYNTHESIS_CANCELLED: &str = "local tts synthesis request was cancelled or 
 
 impl LocalTtsRuntime {
     pub fn new(spec: LocalTtsRuntimeSpec) -> Result<Self, String> {
-        let engine_factory: SynthesisEngineFactory = Arc::new(default_engine_factory);
+        let max_duration_s = spec.max_duration_s;
+        let engine_factory: SynthesisEngineFactory =
+            Arc::new(move |model_path, sample_rate_hz, policy| {
+                default_engine_factory(model_path, sample_rate_hz, max_duration_s, policy)
+            });
         Self::new_with_engine_factory(spec, engine_factory)
     }
 
     fn new_with_engine_factory(
         spec: LocalTtsRuntimeSpec,
         engine_factory: SynthesisEngineFactory,
+    ) -> Result<Self, String> {
+        let spawner: ThreadSpawner = Arc::new(default_thread_spawner);
+        Self::new_with_engine_factory_and_spawners(
+            spec,
+            engine_factory,
+            Arc::clone(&spawner),
+            spawner,
+        )
+    }
+
+    fn new_with_engine_factory_and_spawners(
+        spec: LocalTtsRuntimeSpec,
+        engine_factory: SynthesisEngineFactory,
+        worker_spawner: ThreadSpawner,
+        runner_spawner: ThreadSpawner,
     ) -> Result<Self, String> {
         let _construction_work = PhysicalWork::begin();
         if reap_pending_initializations() {
@@ -282,23 +317,13 @@ impl LocalTtsRuntime {
                 "local tts abandoned synthesis budget is still occupied",
             ));
         }
-        if spec.worker_count == 0 {
-            return Err(String::from("tts worker_count must be greater than zero"));
-        }
-
-        if spec.max_queue == 0 {
-            return Err(String::from("tts max_queue must be greater than zero"));
-        }
-
-        if spec.sample_rate_hz == 0 {
-            return Err(String::from("tts sample_rate_hz must be greater than zero"));
-        }
-
-        if spec.max_duration_s == 0 {
-            return Err(String::from("tts max_duration_s must be greater than zero"));
-        }
-
-        let max_duration_ms = spec.max_duration_s.saturating_mul(1_000);
+        let limits = voxgolem_core::config::validate_tts_resource_limits(
+            spec.worker_count,
+            spec.max_queue,
+            spec.sample_rate_hz,
+            spec.max_duration_s,
+        )
+        .map_err(|error| error.format_with_prefix("tts "))?;
 
         let model_path = spec
             .model_path
@@ -311,185 +336,227 @@ impl LocalTtsRuntime {
             ));
         }
 
-        let (sender, receiver) = mpsc::sync_channel::<SynthesisJob>(spec.max_queue);
+        let (sender, receiver) = mpsc::sync_channel::<SynthesisJob>(limits.max_queue);
         let generation = Arc::new(AtomicU64::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
         let shared_receiver = Arc::new(Mutex::new(receiver));
-        let mut workers = Vec::with_capacity(spec.worker_count);
+        let mut workers = Vec::with_capacity(limits.worker_count);
         let (init_tx, init_rx) = mpsc::channel::<Result<TtsActualProvider, String>>();
         let provider_policy = spec.provider_policy;
-        for _ in 0..spec.worker_count {
+        for index in 0..limits.worker_count {
             let worker_receiver = Arc::clone(&shared_receiver);
-            let sample_rate_hz = spec.sample_rate_hz;
+            let sample_rate_hz = limits.sample_rate_hz;
             let worker_model_path = model_path.clone();
             let worker_engine_factory = Arc::clone(&engine_factory);
+            let worker_runner_spawner = Arc::clone(&runner_spawner);
             let worker_generation = Arc::clone(&generation);
             let worker_init_tx = init_tx.clone();
             let worker_shutdown = Arc::clone(&shutdown);
             let initialization_work = PhysicalWork::begin();
-            workers.push(thread::spawn(move || {
-                let mut initialization_work = Some(initialization_work);
-                match worker_engine_factory(
-                    worker_model_path.clone(),
-                    sample_rate_hz,
-                    provider_policy,
-                ) {
-                    Ok((engine, provider)) => {
-                        let _ = worker_init_tx.send(Ok(provider));
+            let worker_name = format!("voxgolem-tts-worker-{index}");
+            let worker_handle = match worker_spawner(
+                worker_name,
+                Box::new(move || {
+                    let mut initialization_work = Some(initialization_work);
+                    match worker_engine_factory(
+                        worker_model_path.clone(),
+                        sample_rate_hz,
+                        provider_policy,
+                    ) {
+                        Ok((engine, provider)) => {
+                            let _ = worker_init_tx.send(Ok(provider));
 
-                        // The engine is retained for ordinary sequential requests. A cancelled
-                        // native call may take ownership of it until the runner finishes.
-                        let mut available_engine = Some(engine);
+                            // The engine is retained for ordinary sequential requests. A cancelled
+                            // native call may take ownership of it until the runner finishes.
+                            let mut available_engine = Some(engine);
 
-                        // A native inference call cannot be forcibly stopped portably. Keep at
-                        // most one abandoned invocation per worker while its replacement runs.
-                        let mut abandoned: Option<AbandonedSynthesis> = None;
+                            // A native inference call cannot be forcibly stopped portably. Keep at
+                            // most one abandoned invocation per worker while its replacement runs.
+                            let mut abandoned: Option<AbandonedSynthesis> = None;
 
-                        loop {
-                            if worker_shutdown.load(Ordering::Acquire) {
-                                if let Some((runner, _)) = abandoned.take() {
-                                    retain_abandoned_synthesis(runner);
+                            loop {
+                                if worker_shutdown.load(Ordering::Acquire) {
+                                    if let Some((runner, _)) = abandoned.take() {
+                                        retain_abandoned_synthesis(runner);
+                                    }
+                                    return;
                                 }
-                                return;
-                            }
-                            // An initializer that outlived its constructor remains
-                            // tracked through shutdown cleanup, not just factory return.
-                            // Ordinary idle, engine-owning workers do not count as work.
-                            drop(initialization_work.take());
-                            let next_job = {
-                                let guard = match worker_receiver.lock() {
-                                    Ok(guard) => guard,
-                                    Err(_) => return,
+                                // An initializer that outlived its constructor remains
+                                // tracked through shutdown cleanup, not just factory return.
+                                // Ordinary idle, engine-owning workers do not count as work.
+                                drop(initialization_work.take());
+                                let next_job = {
+                                    let guard = match worker_receiver.lock() {
+                                        Ok(guard) => guard,
+                                        Err(_) => return,
+                                    };
+                                    guard.recv()
                                 };
-                                guard.recv()
-                            };
 
-                            let Ok(job) = next_job else {
-                                if let Some((runner, _)) = abandoned.take() {
-                                    retain_abandoned_synthesis(runner);
-                                }
-                                return;
-                            };
+                                let Ok(job) = next_job else {
+                                    if let Some((runner, _)) = abandoned.take() {
+                                        retain_abandoned_synthesis(runner);
+                                    }
+                                    return;
+                                };
 
-                            // Completed abandoned work no longer consumes the budget. Reclaim
-                            // its engine before deciding whether another runner may start.
-                            if let Some((runner, result_rx)) = abandoned.take() {
-                                match result_rx.try_recv() {
-                                    Ok(Ok((engine, _))) => {
-                                        available_engine = Some(engine);
-                                        let _ = runner.join();
-                                    }
-                                    Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
-                                        let _ = runner.join();
-                                    }
-                                    Err(mpsc::TryRecvError::Empty) => {
-                                        abandoned = Some((runner, result_rx));
-                                    }
-                                }
-                            }
-                            if abandoned.is_some() {
-                                let _ = job.response.send(Err(String::from(
-                                    "local tts abandoned synthesis budget exhausted",
-                                )));
-                                continue;
-                            }
-                            if job.cancelled.load(Ordering::Relaxed)
-                                || job.generation != worker_generation.load(Ordering::Acquire)
-                            {
-                                let _ = job.response.send(Err(String::from(SYNTHESIS_CANCELLED)));
-                                continue;
-                            }
-
-                            let engine = if let Some(engine) = available_engine.take() {
-                                engine
-                            } else {
-                                match worker_engine_factory(
-                                    worker_model_path.clone(),
-                                    sample_rate_hz,
-                                    provider_policy,
-                                ) {
-                                    Ok((engine, _)) => engine,
-                                    Err(error) => {
-                                        let _ = job.response.send(Err(error));
-                                        continue;
-                                    }
-                                }
-                            };
-                            let Some(permit) = SynthesisPermit::acquire() else {
-                                available_engine = Some(engine);
-                                let _ = job.response.send(Err(String::from(
-                                    "local tts abandoned synthesis budget exhausted",
-                                )));
-                                continue;
-                            };
-                            let (result_tx, result_rx) = mpsc::channel();
-                            let child_text = job.text.clone();
-                            let child = thread::spawn(move || {
-                                let _permit = permit;
-                                let mut engine = engine;
-                                let result =
-                                    engine.synthesize(&child_text).map(|audio| (engine, audio));
-                                let _ = result_tx.send(result);
-                            });
-
-                            let mut cancelled = false;
-                            let result = loop {
-                                match result_rx.recv_timeout(Duration::from_millis(10)) {
-                                    Ok(result) => break result,
-                                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                                        if job.cancelled.load(Ordering::Relaxed)
-                                            || job.generation
-                                                != worker_generation.load(Ordering::Acquire)
-                                        {
-                                            cancelled = true;
-                                            break Err(String::from(SYNTHESIS_CANCELLED));
+                                // Completed abandoned work no longer consumes the budget. Reclaim
+                                // its engine before deciding whether another runner may start.
+                                if let Some((runner, result_rx)) = abandoned.take() {
+                                    match result_rx.try_recv() {
+                                        Ok(Ok((engine, _))) => {
+                                            available_engine = Some(engine);
+                                            let _ = runner.join();
+                                        }
+                                        Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
+                                            let _ = runner.join();
+                                        }
+                                        Err(mpsc::TryRecvError::Empty) => {
+                                            abandoned = Some((runner, result_rx));
                                         }
                                     }
-                                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                                        break Err(String::from(
-                                            "local tts synthesis worker exited unexpectedly",
-                                        ))
-                                    }
                                 }
-                            };
+                                if abandoned.is_some() {
+                                    let _ = job.response.send(Err(String::from(
+                                        "local tts abandoned synthesis budget exhausted",
+                                    )));
+                                    continue;
+                                }
+                                if job.cancelled.load(Ordering::Relaxed)
+                                    || job.generation != worker_generation.load(Ordering::Acquire)
+                                {
+                                    let _ =
+                                        job.response.send(Err(String::from(SYNTHESIS_CANCELLED)));
+                                    continue;
+                                }
 
-                            if cancelled {
-                                let _ = job.response.send(Err(result
-                                    .err()
-                                    .unwrap_or_else(|| String::from(SYNTHESIS_CANCELLED))));
-                                abandoned = Some((child, result_rx));
-                            } else {
-                                let _ = child.join();
-                                match result {
-                                    Ok((engine, audio)) => {
-                                        available_engine = Some(engine);
-                                        let result = if job.cancelled.load(Ordering::Relaxed)
-                                            || job.generation
-                                                != worker_generation.load(Ordering::Acquire)
-                                        {
-                                            Err(String::from(SYNTHESIS_CANCELLED))
-                                        } else {
-                                            Ok(audio)
-                                        };
-                                        let _ = job.response.send(result);
+                                let engine = if let Some(engine) = available_engine.take() {
+                                    engine
+                                } else {
+                                    match worker_engine_factory(
+                                        worker_model_path.clone(),
+                                        sample_rate_hz,
+                                        provider_policy,
+                                    ) {
+                                        Ok((engine, _)) => engine,
+                                        Err(error) => {
+                                            let _ = job.response.send(Err(error));
+                                            continue;
+                                        }
                                     }
+                                };
+                                let Some(permit) = SynthesisPermit::acquire() else {
+                                    available_engine = Some(engine);
+                                    let _ = job.response.send(Err(String::from(
+                                        "local tts abandoned synthesis budget exhausted",
+                                    )));
+                                    continue;
+                                };
+                                let handoff = Arc::new(Mutex::new(Some((engine, permit))));
+                                let child_handoff = Arc::clone(&handoff);
+                                let (result_tx, result_rx) = mpsc::channel();
+                                let child_text = job.text.clone();
+                                let child = match worker_runner_spawner(
+                                    String::from("voxgolem-tts-synth"),
+                                    Box::new(move || {
+                                        let Some((mut engine, _permit)) = child_handoff
+                                            .lock()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                            .take()
+                                        else {
+                                            return;
+                                        };
+                                        let result = engine
+                                            .synthesize(&child_text)
+                                            .map(|audio| (engine, audio));
+                                        let _ = result_tx.send(result);
+                                    }),
+                                ) {
+                                    Ok(child) => child,
                                     Err(error) => {
-                                        let _ = job.response.send(Err(error));
+                                        if let Some((recovered_engine, recovered_permit)) = handoff
+                                            .lock()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                            .take()
+                                        {
+                                            available_engine = Some(recovered_engine);
+                                            drop(recovered_permit);
+                                        }
+                                        let _ = job.response.send(Err(format!(
+                                            "failed to spawn local tts synthesis runner: {error}"
+                                        )));
+                                        continue;
+                                    }
+                                };
+
+                                let mut cancelled = false;
+                                let result = loop {
+                                    match result_rx.recv_timeout(Duration::from_millis(10)) {
+                                        Ok(result) => break result,
+                                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                                            if job.cancelled.load(Ordering::Relaxed)
+                                                || job.generation
+                                                    != worker_generation.load(Ordering::Acquire)
+                                            {
+                                                cancelled = true;
+                                                break Err(String::from(SYNTHESIS_CANCELLED));
+                                            }
+                                        }
+                                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                            break Err(String::from(
+                                                "local tts synthesis worker exited unexpectedly",
+                                            ))
+                                        }
+                                    }
+                                };
+
+                                if cancelled {
+                                    let _ = job.response.send(Err(result
+                                        .err()
+                                        .unwrap_or_else(|| String::from(SYNTHESIS_CANCELLED))));
+                                    abandoned = Some((child, result_rx));
+                                } else {
+                                    let _ = child.join();
+                                    match result {
+                                        Ok((engine, audio)) => {
+                                            available_engine = Some(engine);
+                                            let result = if job.cancelled.load(Ordering::Relaxed)
+                                                || job.generation
+                                                    != worker_generation.load(Ordering::Acquire)
+                                            {
+                                                Err(String::from(SYNTHESIS_CANCELLED))
+                                            } else {
+                                                Ok(audio)
+                                            };
+                                            let _ = job.response.send(result);
+                                        }
+                                        Err(error) => {
+                                            let _ = job.response.send(Err(error));
+                                        }
                                     }
                                 }
                             }
                         }
+                        Err(error) => {
+                            let _ = worker_init_tx.send(Err(error));
+                        }
                     }
-                    Err(error) => {
-                        let _ = worker_init_tx.send(Err(error));
-                    }
+                }),
+            ) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    shutdown.store(true, Ordering::Release);
+                    drop(sender);
+                    retain_pending_initializations(workers);
+                    return Err(format!("failed to spawn local tts worker thread: {error}"));
                 }
-            }));
+            };
+            workers.push(worker_handle);
         }
 
         drop(init_tx);
         let mut actual_provider = None;
-        for _ in 0..spec.worker_count {
+        for _ in 0..limits.worker_count {
             let init_result =
                 init_rx
                     .recv_timeout(WORKER_INITIALIZATION_TIMEOUT)
@@ -531,8 +598,9 @@ impl LocalTtsRuntime {
 
         Ok(Self {
             generation,
-            sample_rate_hz: spec.sample_rate_hz,
-            max_duration_ms,
+            sample_rate_hz: limits.sample_rate_hz,
+            max_duration_ms: limits.max_duration_ms,
+            max_duration_samples: limits.max_duration_samples,
             sender: Some(sender),
             _workers: workers,
             actual_provider,
@@ -634,7 +702,17 @@ impl LocalTtsRuntime {
             }
         };
 
-        if audio.duration_ms > self.max_duration_ms {
+        if audio.pcm_f32.len() > voxgolem_core::config::MAX_TTS_RESULT_SAMPLES {
+            return Err(format!(
+                "tts synthesized audio buffer of {} samples exceeds max copy limit of {} samples",
+                audio.pcm_f32.len(),
+                voxgolem_core::config::MAX_TTS_RESULT_SAMPLES
+            ));
+        }
+
+        if audio.duration_ms > self.max_duration_ms
+            || audio.pcm_f32.len() > self.max_duration_samples
+        {
             return Err(format!(
                 "tts synthesized duration {}ms exceeds configured max {}ms",
                 audio.duration_ms, self.max_duration_ms
@@ -658,14 +736,14 @@ impl Drop for LocalTtsRuntime {
 impl PiperOnnxEngine {
     fn new(
         model_path: &Path,
-        sample_rate_hz: u32,
+        limits: voxgolem_core::config::ValidatedTtsResourceLimits,
         policy: TtsProviderPolicy,
     ) -> Result<(Self, TtsActualProvider), String> {
         let config = load_piper_voice_config(model_path)?;
-        if config.audio.sample_rate != sample_rate_hz {
+        if config.audio.sample_rate != limits.sample_rate_hz {
             return Err(format!(
                 "tts sample_rate_hz {} does not match Piper model config sample rate {}",
-                sample_rate_hz, config.audio.sample_rate
+                limits.sample_rate_hz, config.audio.sample_rate
             ));
         }
 
@@ -695,7 +773,7 @@ impl PiperOnnxEngine {
                 session,
                 config,
                 contract,
-                sample_rate_hz,
+                limits,
             },
             actual_provider,
         ))
@@ -907,18 +985,21 @@ impl SynthesisEngine for PiperOnnxEngine {
                 .map_err(|error| format!("local tts ONNX inference failed: {error}"))?
         };
 
-        decode_audio_from_outputs(
-            outputs,
-            self.contract.output_name.as_str(),
-            self.sample_rate_hz,
-        )
+        decode_audio_from_outputs(outputs, self.contract.output_name.as_str(), self.limits)
     }
 }
 
+/// Extracts, validates, and copies a synthesized ONNX output tensor into a `LocalTtsAudio` buffer.
+///
+/// The 64 MiB (`MAX_TTS_RESULT_SAMPLES` = `16,777,216` `f32` samples) bound and the
+/// configured duration bound (`max_duration_samples` / `max_duration_ms`) are checked on
+/// the borrowed ONNX slice before allocating or copying into a Rust `Vec<f32>`.
+/// Native ONNX Runtime tensor allocation and total retained process memory are not bounded
+/// by this per-result post-inference copy check.
 fn decode_audio_from_outputs(
     outputs: ort::session::SessionOutputs<'_>,
     output_name: &str,
-    sample_rate_hz: u32,
+    limits: voxgolem_core::config::ValidatedTtsResourceLimits,
 ) -> Result<LocalTtsAudio, String> {
     let output = outputs.get(output_name).ok_or_else(|| {
         format!(
@@ -929,21 +1010,58 @@ fn decode_audio_from_outputs(
     let audio_tensor = output
         .try_extract_tensor::<f32>()
         .map_err(|error| format!("failed to extract local tts audio tensor: {error}"))?;
-    let mut pcm_f32 = audio_tensor.1.to_vec();
+    decode_audio_from_samples(audio_tensor.1, limits)
+}
 
-    if pcm_f32.is_empty() {
+fn validate_synthesized_sample_bounds(
+    sample_count: usize,
+    limits: voxgolem_core::config::ValidatedTtsResourceLimits,
+) -> Result<u64, String> {
+    if sample_count > voxgolem_core::config::MAX_TTS_RESULT_SAMPLES {
+        return Err(format!(
+            "tts synthesized audio buffer of {} samples ({} bytes) exceeds max copy limit of {} samples ({} bytes)",
+            sample_count,
+            sample_count.saturating_mul(std::mem::size_of::<f32>()),
+            voxgolem_core::config::MAX_TTS_RESULT_SAMPLES,
+            voxgolem_core::config::MAX_TTS_RESULT_BYTES,
+        ));
+    }
+    let scaled_ms = u64::try_from(sample_count)
+        .ok()
+        .and_then(|count| count.checked_mul(1_000))
+        .ok_or_else(|| {
+            String::from("tts synthesized sample count overflowed duration calculation")
+        })?;
+    let duration_ms = (scaled_ms / u64::from(limits.sample_rate_hz)).max(1);
+    if sample_count > limits.max_duration_samples || duration_ms > limits.max_duration_ms {
+        return Err(format!(
+            "tts synthesized duration {}ms ({} samples) exceeds configured max {}ms ({} samples)",
+            duration_ms, sample_count, limits.max_duration_ms, limits.max_duration_samples
+        ));
+    }
+    Ok(duration_ms)
+}
+
+fn decode_audio_from_samples(
+    samples: &[f32],
+    limits: voxgolem_core::config::ValidatedTtsResourceLimits,
+) -> Result<LocalTtsAudio, String> {
+    if samples.is_empty() {
         return Err(String::from(
             "local tts model produced an empty audio buffer",
         ));
     }
+    let duration_ms = validate_synthesized_sample_bounds(samples.len(), limits)?;
+    let mut pcm_f32 = Vec::new();
+    pcm_f32
+        .try_reserve_exact(samples.len())
+        .map_err(|error| format!("failed to allocate local tts audio buffer: {error}"))?;
+    pcm_f32.extend_from_slice(samples);
     normalize_pcm_samples(&mut pcm_f32)?;
-
-    let duration_ms =
-        ((pcm_f32.len() as u64).saturating_mul(1_000) / u64::from(sample_rate_hz)).max(1);
 
     Ok(LocalTtsAudio {
         pcm_f32,
-        sample_rate_hz,
+        sample_rate_hz: limits.sample_rate_hz,
         duration_ms,
     })
 }
@@ -1114,10 +1232,14 @@ fn text_to_phoneme_ids(text: &str, config: &PiperVoiceConfig) -> Result<Vec<i64>
 fn default_engine_factory(
     model_path: PathBuf,
     sample_rate_hz: u32,
+    max_duration_s: u64,
     policy: TtsProviderPolicy,
 ) -> Result<(Box<dyn SynthesisEngine>, TtsActualProvider), String> {
+    let limits =
+        voxgolem_core::config::validate_tts_resource_limits(1, 1, sample_rate_hz, max_duration_s)
+            .map_err(|error| error.format_with_prefix("tts "))?;
     ensure_espeak_data_directory_env(&model_path)?;
-    let (engine, provider) = PiperOnnxEngine::new(&model_path, sample_rate_hz, policy)?;
+    let (engine, provider) = PiperOnnxEngine::new(&model_path, limits, policy)?;
     Ok((Box::new(engine), provider))
 }
 
@@ -2033,5 +2155,314 @@ mod tests {
         )
         .expect("local voice initialization should tolerate a short slow start");
         runtime.synthesize("Yes?").expect("voice should synthesize");
+    }
+
+    #[test]
+    fn runtime_validates_canonical_tts_resource_limits() {
+        let _test_runtime_guard = test_runtime_guard();
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let model_path = temp_dir.path().join("jarvis.onnx");
+        fs::write(&model_path, b"fixture").expect("model fixture should be written");
+
+        for (worker_count, max_queue, sample_rate_hz, max_duration_s, expected_error) in [
+            (
+                0,
+                8,
+                22_050,
+                300,
+                "tts worker_count must be greater than zero",
+            ),
+            (
+                3,
+                8,
+                22_050,
+                300,
+                "tts worker_count must be between 1 and 2 inclusive",
+            ),
+            (1, 0, 22_050, 300, "tts max_queue must be greater than zero"),
+            (
+                1,
+                17,
+                22_050,
+                300,
+                "tts max_queue must be between 1 and 16 inclusive",
+            ),
+            (1, 8, 0, 300, "tts sample_rate_hz must be greater than zero"),
+            (
+                1,
+                8,
+                22_050,
+                0,
+                "tts max_duration_s must be greater than zero",
+            ),
+            (
+                1,
+                8,
+                22_050,
+                361,
+                "tts max_duration_s must be between 1 and 360 inclusive",
+            ),
+        ] {
+            let error = LocalTtsRuntime::new_with_engine_factory(
+                LocalTtsRuntimeSpec {
+                    model_path: Some(model_path.clone()),
+                    worker_count,
+                    max_queue,
+                    sample_rate_hz,
+                    max_duration_s,
+                    provider_policy: super::TtsProviderPolicy::Cpu,
+                },
+                Arc::new(fake_engine_factory),
+            )
+            .expect_err("invalid TTS resource configuration must be rejected");
+            assert_eq!(error, expected_error);
+        }
+
+        for (worker_count, max_queue, sample_rate_hz, max_duration_s) in [
+            (2, 16, 24_000, 360),
+            (1, 8, 44_100, 360),
+            (2, 16, 48_000, 300),
+            (2, 16, 48_000, 360),
+        ] {
+            let runtime = LocalTtsRuntime::new_with_engine_factory(
+                LocalTtsRuntimeSpec {
+                    model_path: Some(model_path.clone()),
+                    worker_count,
+                    max_queue,
+                    sample_rate_hz,
+                    max_duration_s,
+                    provider_policy: super::TtsProviderPolicy::Cpu,
+                },
+                Arc::new(fake_engine_factory),
+            )
+            .expect("valid high-rate TTS resource configuration should initialize");
+            assert_eq!(runtime.sample_rate_hz(), sample_rate_hz);
+        }
+    }
+
+    #[test]
+    fn pre_copy_output_bounds_reject_empty_over_copy_limit_and_over_duration_before_allocation() {
+        let limits_1s =
+            voxgolem_core::config::validate_tts_resource_limits(1, 8, 22_050, 1).unwrap();
+        assert_eq!(
+            super::decode_audio_from_samples(&[], limits_1s),
+            Err(String::from(
+                "local tts model produced an empty audio buffer"
+            ))
+        );
+
+        // Exceeds configured 1s duration (22_051 > 22_050 samples) before copy.
+        let over_duration = vec![0.25_f32; 22_051];
+        let error = super::decode_audio_from_samples(&over_duration, limits_1s)
+            .expect_err("samples exceeding configured duration must be rejected");
+        assert!(error.contains("exceeds configured max"));
+
+        // 48kHz * 360s = 17_280_000 samples is within configured duration, but exceeds
+        // the independent 64 MiB (16_777_216 f32 samples) per-result Rust copy limit.
+        let limits_48k_360s =
+            voxgolem_core::config::validate_tts_resource_limits(2, 16, 48_000, 360).unwrap();
+        let copy_limit_error =
+            super::validate_synthesized_sample_bounds(17_280_000, limits_48k_360s).expect_err(
+                "samples exceeding 64 MiB per-result copy limit must be rejected before copy",
+            );
+        assert!(copy_limit_error.contains("exceeds max copy limit"));
+
+        let valid = super::decode_audio_from_samples(&[-1.5, 0.25, 1.5], limits_1s)
+            .expect("bounded slice should copy and normalize");
+        assert_eq!(valid.pcm_f32, vec![-1.0, 0.25, 1.0]);
+        assert_eq!(valid.sample_rate_hz, 22_050);
+    }
+
+    #[test]
+    fn partial_worker_spawn_failure_retains_started_initializer_and_blocks_retry_until_retired() {
+        let _test_runtime_guard = test_runtime_guard();
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let model_path = temp_dir.path().join("jarvis.onnx");
+        fs::write(&model_path, b"fixture").expect("model fixture should be written");
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_on_drop = ReleaseOnDrop(Arc::clone(&release));
+        let engine_release = Arc::clone(&release);
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let factory_call_count = Arc::clone(&factory_calls);
+        let factory: super::SynthesisEngineFactory = Arc::new(move |_, sample_rate_hz, _| {
+            if factory_call_count.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 0 {
+                let _ = started_tx.send(());
+                wait_for_release(&engine_release)?;
+            }
+            Ok((
+                Box::new(FakeSynthesisEngine { sample_rate_hz }),
+                super::TtsActualProvider::Cpu,
+            ))
+        });
+
+        let spawn_attempts = Arc::new(AtomicUsize::new(0));
+        let worker_attempts = Arc::clone(&spawn_attempts);
+        let failing_second_worker_spawner: super::ThreadSpawner = Arc::new(move |name, work| {
+            if worker_attempts.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 0 {
+                super::default_thread_spawner(name, work)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "synthetic worker thread spawn failure",
+                ))
+            }
+        });
+
+        let spec = || LocalTtsRuntimeSpec {
+            model_path: Some(model_path.clone()),
+            worker_count: 2,
+            max_queue: 2,
+            sample_rate_hz: 22_050,
+            max_duration_s: 300,
+            provider_policy: super::TtsProviderPolicy::Cpu,
+        };
+
+        let error = LocalTtsRuntime::new_with_engine_factory_and_spawners(
+            spec(),
+            Arc::clone(&factory),
+            failing_second_worker_spawner,
+            Arc::new(super::default_thread_spawner),
+        )
+        .expect_err("partial worker spawn failure must fail runtime construction");
+        assert!(error.contains("failed to spawn local tts worker thread"));
+
+        started_rx
+            .recv_timeout(TEST_WAIT_BOUND)
+            .expect("worker 0 should have started engine initialization");
+        assert!(
+            super::physical_work_pending(),
+            "started worker 0 must keep physical initialization work pending"
+        );
+        let retry_while_pending =
+            LocalTtsRuntime::new_with_engine_factory(spec(), Arc::clone(&factory))
+                .expect_err("retained worker 0 must block retry while still initializing");
+        assert!(retry_while_pending.contains("still pending"));
+
+        release_on_drop.release();
+        assert!(super::wait_for_physical_retirement(TEST_WAIT_BOUND));
+        let deadline = Instant::now() + TEST_WAIT_BOUND;
+        let recovered = loop {
+            match LocalTtsRuntime::new_with_engine_factory(spec(), Arc::clone(&factory)) {
+                Ok(runtime) => break runtime,
+                Err(error) if error.contains("still pending") => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "retained worker 0 was not reaped within the bound"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("retry after worker 0 retirement should succeed: {error}"),
+            }
+        };
+        recovered
+            .synthesize("recovered")
+            .expect("recovered runtime should synthesize");
+    }
+
+    #[test]
+    fn synthesis_runner_spawn_failure_recovers_engine_and_permit_for_subsequent_request() {
+        let _test_runtime_guard = test_runtime_guard();
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let model_path = temp_dir.path().join("jarvis.onnx");
+        fs::write(&model_path, b"fixture").expect("model fixture should be written");
+
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let factory_call_count = Arc::clone(&factory_calls);
+        let factory: super::SynthesisEngineFactory = Arc::new(move |_, sample_rate_hz, _| {
+            factory_call_count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Ok((
+                Box::new(FakeSynthesisEngine { sample_rate_hz }),
+                super::TtsActualProvider::Cpu,
+            ))
+        });
+
+        let runner_attempts = Arc::new(AtomicUsize::new(0));
+        let runner_attempt_count = Arc::clone(&runner_attempts);
+        let flaky_runner_spawner: super::ThreadSpawner = Arc::new(move |name, work| {
+            if runner_attempt_count.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 0 {
+                drop(work);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "synthetic runner spawn failure",
+                ))
+            } else {
+                super::default_thread_spawner(name, work)
+            }
+        });
+
+        let runtime = LocalTtsRuntime::new_with_engine_factory_and_spawners(
+            LocalTtsRuntimeSpec {
+                model_path: Some(model_path),
+                worker_count: 1,
+                max_queue: 2,
+                sample_rate_hz: 22_050,
+                max_duration_s: 300,
+                provider_policy: super::TtsProviderPolicy::Cpu,
+            },
+            factory,
+            Arc::new(super::default_thread_spawner),
+            flaky_runner_spawner,
+        )
+        .expect("runtime should initialize");
+
+        let error = runtime
+            .synthesize("first")
+            .expect_err("failed runner spawn must report an error");
+        assert!(error.contains("failed to spawn local tts synthesis runner"));
+        assert!(!super::SYNTHESIS_PERMIT_OCCUPIED.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!super::physical_work_pending());
+
+        let audio = runtime
+            .synthesize("second")
+            .expect("second synthesis should reuse the recovered engine");
+        assert!(!audio.pcm_f32.is_empty());
+        assert_eq!(
+            factory_calls.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "engine must be recovered from handoff slot without calling factory again"
+        );
+    }
+
+    #[test]
+    fn poisoned_registries_still_retain_and_reap_handles() {
+        let _test_runtime_guard = test_runtime_guard();
+        let pending_init = super::PENDING_INITIALIZATIONS.get_or_init(|| Mutex::new(Vec::new()));
+        let abandoned_synth = super::ABANDONED_SYNTHESIS.get_or_init(|| Mutex::new(Vec::new()));
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = pending_init.lock().unwrap();
+            panic!("synthetic poison for PENDING_INITIALIZATIONS");
+        });
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = abandoned_synth.lock().unwrap();
+            panic!("synthetic poison for ABANDONED_SYNTHESIS");
+        });
+
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_on_drop = ReleaseOnDrop(Arc::clone(&release));
+        let init_release = Arc::clone(&release);
+        let synth_release = Arc::clone(&release);
+        let init_handle = thread::spawn(move || {
+            let _ = wait_for_release(&init_release);
+        });
+        let synth_handle = thread::spawn(move || {
+            let _ = wait_for_release(&synth_release);
+        });
+
+        super::retain_pending_initializations(vec![init_handle]);
+        super::retain_abandoned_synthesis(synth_handle);
+        assert!(super::reap_pending_initializations());
+        assert!(super::reap_abandoned_synthesis());
+
+        release_on_drop.release();
+        let deadline = Instant::now() + TEST_WAIT_BOUND;
+        while super::reap_pending_initializations() || super::reap_abandoned_synthesis() {
+            assert!(
+                Instant::now() < deadline,
+                "poisoned registries did not reap finished handles within bound"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }

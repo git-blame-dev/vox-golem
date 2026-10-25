@@ -5,7 +5,10 @@ import android.app.job.JobScheduler
 import android.content.ComponentName
 import android.content.Context
 import android.os.Build
+import com.google.android.gms.wearable.ChannelClient
 import com.google.android.gms.wearable.DataItem
+import com.google.android.gms.wearable.MessageEvent
+import com.google.android.gms.wearable.Wearable
 import dev.gitblame.voxgolem.assistant.AssistantDomainNative
 import dev.gitblame.voxgolem.assistant.AssistantStore
 import dev.gitblame.voxgolem.assistant.DomainGateway
@@ -49,39 +52,59 @@ object AssistantReplication {
         if (!acceptsData(item)) {
             // Old queued history is inert after the alpha epoch reset; pairing/identity
             // retain their independent v1 namespace and are not classified as history.
-            val old = item.uri.path?.removePrefix("/voxgolem/assistant/v1/")?.split('/')
-            if (item.uri.path?.startsWith("/voxgolem/assistant/v1/") == true &&
-                old?.size == 3 && old[2] in ReplicationWire.kinds) status = AssistantReplicationStatus.REJECTED
+            val path = item.uri.path
+            val oldV1 = path?.removePrefix("/voxgolem/assistant/v1/")?.split('/')
+            val oldV2 = path?.removePrefix(ReplicationWire.PREFIX)?.split('/')
+            if ((path?.startsWith("/voxgolem/assistant/v1/") == true && oldV1?.size == 3 && oldV1[2] in ReplicationWire.kinds) ||
+                (path?.startsWith(ReplicationWire.PREFIX) == true && oldV2?.size == 3 && oldV2[2] in ReplicationWire.kinds)
+            ) {
+                status = AssistantReplicationStatus.REJECTED
+            }
             return
         }
         val current = resolve(context) ?: return
-        if (item.uri.path == ReplicationWire.IDENTITY_PATH) {
-            // The event is a hint only. Re-query capability and exact host-scoped SDK identity.
-            current.reconcile()
-            return
-        }
-        val frozen = item.freeze()
-        current.submit {
-            current.withController { transport, store, controller ->
-                val linked = current.setup?.retry(store.replica, transport)
-                if (linked != null && linked.reason != PeerPairingReason.ENROLLED) { current.retry(); return@withController }
-                if (!transport.receive(frozen, controller)) { status = AssistantReplicationStatus.REJECTED; current.retry() }
-                transport.cleanup(store.replica, store, current.state)
-                current.ensurePendingRetry()
-            }
-        }
+        // The identity DataItem event is a hint only. Re-query capability and exact host-scoped SDK identity.
+        current.reconcile()
     }
 
-    internal fun acceptsData(item: DataItem): Boolean {
-        if (item.uri.host == null || item.assets.size > ReplicationWire.MAX_ASSETS) return false
-        val path = item.uri.path ?: return false
-        if (path == ReplicationWire.IDENTITY_PATH) return (item.data?.size ?: 0) <= 2048 && item.assets.isEmpty()
-        if (!path.startsWith(ReplicationWire.PREFIX) || (item.data?.size ?: 0) > ReplicationWire.MAX_CONTROL_BYTES + 16 * 1024) return false
-        val parts = path.removePrefix(ReplicationWire.PREFIX).split('/')
-        // Cheap queue bounds only. Source authorization and fresh native routes run on IO.
-        return parts.size == 3 && parts[2] in ReplicationWire.kinds && runCatching {
-            ReplicationWire.uuid(parts[0]); ReplicationWire.uuid(parts[1]); true
-        }.getOrDefault(false)
+    internal fun acceptsData(item: DataItem): Boolean =
+        item.uri.host != null &&
+            item.uri.path == ReplicationWire.IDENTITY_PATH &&
+            (item.data?.size ?: 0) <= 2048 &&
+            item.assets.isEmpty()
+
+    internal fun acceptsMessage(message: MessageEvent): Boolean =
+        message.sourceNodeId.isNotEmpty() &&
+            message.path == ReplicationWire.HINT_PATH &&
+            message.data.size in 2..ReplicationWire.MAX_HINT_BYTES
+
+    fun onMessage(context: Context, message: MessageEvent) {
+        if (message.path != ReplicationWire.HINT_PATH) return
+        if (!acceptsMessage(message)) {
+            status = AssistantReplicationStatus.REJECTED
+            return
+        }
+        val current = resolve(context) ?: return
+        current.onHint(message.sourceNodeId, message.data.copyOf())
+    }
+
+    internal fun acceptsChannel(channel: ChannelClient.Channel): Boolean =
+        channel.nodeId.isNotEmpty() && ReplicationWire.validSessionPath(channel.path)
+
+    fun onChannelOpened(context: Context, channel: ChannelClient.Channel) {
+        if (!channel.path.startsWith(ReplicationWire.SESSION_PREFIX)) return
+        if (!acceptsChannel(channel)) {
+            owner?.let { runCatching { it.transport().closeChannel(channel) } }
+                ?: runCatching { Wearable.getChannelClient(context.applicationContext).close(channel) }
+            status = AssistantReplicationStatus.REJECTED
+            return
+        }
+        val current = resolve(context)
+        if (current == null) {
+            runCatching { Wearable.getChannelClient(context.applicationContext).close(channel) }
+            return
+        }
+        current.onChannelOpened(channel)
     }
 
     internal fun runJob(context: Context, finished: () -> Unit): Future<*>? {
@@ -110,6 +133,8 @@ object AssistantReplication {
         private var nativeStore: NativeReplicationStore? = null
         private var nativeDomain: NativeReplicationDomain? = null
         @Volatile private var reconcileQueued = false
+        private val pendingHints = LinkedHashMap<String, ByteArray>()
+        private var hintQueued = false
         private val periodicRequested = AtomicBoolean(false)
         private val retryRequested = AtomicBoolean(false)
         private val scheduling = Any()
@@ -143,6 +168,87 @@ object AssistantReplication {
             if (reconcileQueued) return
             reconcileQueued = true
             if (submit { try { reconcileBlocking() } finally { reconcileQueued = false } } == null) reconcileQueued = false
+        }
+
+        fun onHint(nodeId: String, bytes: ByteArray) {
+            synchronized(scheduling) {
+                if (nodeId !in pendingHints && pendingHints.size >= ReplicationWire.MAX_PEERS) {
+                    status = AssistantReplicationStatus.REJECTED
+                    return
+                }
+                pendingHints[nodeId] = bytes
+                if (hintQueued) return
+                hintQueued = true
+            }
+            if (submit { drainHints() } == null) {
+                synchronized(scheduling) {
+                    hintQueued = false
+                    pendingHints.clear()
+                }
+            }
+        }
+
+        private fun drainHints() {
+            while (true) {
+                val (nodeId, bytes) = synchronized(scheduling) {
+                    val entry = pendingHints.entries.firstOrNull()
+                    if (entry == null) {
+                        hintQueued = false
+                        return
+                    }
+                    pendingHints.remove(entry.key)
+                    entry.key to entry.value
+                }
+                withController { transport, store, controller ->
+                    val linked = link(transport, store.replica)
+                    if (linked.reason != PeerPairingReason.ENROLLED || state.enrolledReplicas().isEmpty()) {
+                        status = AssistantReplicationStatus.WAITING_FOR_PEER
+                        retry()
+                        return@withController
+                    }
+                    status = AssistantReplicationStatus.SYNCING
+                    val role = setup?.role ?: AssistantPeerRole.PHONE
+                    if (controller.onHint(nodeId, bytes)) {
+                        finishSync(store, sessionCompleted = role == AssistantPeerRole.PHONE)
+                    } else {
+                        status = AssistantReplicationStatus.REJECTED
+                        retry()
+                    }
+                }
+            }
+        }
+
+        fun onChannelOpened(channel: ChannelClient.Channel) {
+            if (submit { acceptChannelBlocking(channel) } == null) {
+                runCatching { transport().closeChannel(channel) }
+            }
+        }
+
+        private fun acceptChannelBlocking(channel: ChannelClient.Channel) {
+            var sessionOpened = false
+            try {
+                val ran = withController { transport, store, controller ->
+                    val linked = link(transport, store.replica)
+                    if (linked.reason != PeerPairingReason.ENROLLED || state.enrolledReplicas().isEmpty()) {
+                        transport.closeChannel(channel)
+                        status = AssistantReplicationStatus.WAITING_FOR_PEER
+                        retry()
+                        return@withController
+                    }
+                    status = AssistantReplicationStatus.SYNCING
+                    val session = transport.acceptSession(channel)
+                    sessionOpened = true
+                    if (controller.accept(session)) {
+                        finishSync(store, sessionCompleted = true)
+                    } else {
+                        status = AssistantReplicationStatus.REJECTED
+                        retry()
+                    }
+                }
+                if (!ran) runCatching { transport().closeChannel(channel) }
+            } finally {
+                if (!sessionOpened) runCatching { transport().closeChannel(channel) }
+            }
         }
 
         fun readPairingState(result: (PeerPairingState) -> Unit) {
@@ -179,13 +285,35 @@ object AssistantReplication {
                     retry(); return@withController
                 }
                 status = AssistantReplicationStatus.SYNCING
-                controller.reconcile()
-                val accepted = transport.poll(store.replica, state, operationAssociation ?: association, controller)
-                transport.cleanup(store.replica, store, state)
-                if (accepted) {
-                    ensurePendingRetry()
-                    status = if (hasPending()) AssistantReplicationStatus.SYNCING else AssistantReplicationStatus.IDLE
-                } else { status = AssistantReplicationStatus.REJECTED; retry() }
+                val role = setup?.role ?: AssistantPeerRole.PHONE
+                val routes = operationAssociation ?: association
+                val reached = transport.reachable().take(64)
+                    .mapNotNull { routes.replicaForNode(it.nodeId) }
+                    .filter { it != store.replica && it in state.enrolledReplicas() }
+                    .toSet()
+                if (reached.isEmpty()) {
+                    status = AssistantReplicationStatus.WAITING_FOR_PEER
+                    retry()
+                    return@withController
+                }
+                if (controller.reconcile()) {
+                    finishSync(store, sessionCompleted = role == AssistantPeerRole.PHONE && reached.containsAll(state.enrolledReplicas()))
+                } else {
+                    status = AssistantReplicationStatus.REJECTED
+                    retry()
+                }
+            }
+        }
+
+        private fun finishSync(store: NativeReplicationStore, sessionCompleted: Boolean) {
+            val pendingPublications = state.enrolledReplicas().any { store.publications(it, null, 1).length() > 0 }
+            if (!sessionCompleted || pendingPublications) {
+                if (scheduler().getPendingJob(RETRY_JOB) == null) retry()
+                status = AssistantReplicationStatus.SYNCING
+            } else {
+                state.succeeded()
+                scheduler().cancel(RETRY_JOB)
+                status = AssistantReplicationStatus.IDLE
             }
         }
 
@@ -200,10 +328,16 @@ object AssistantReplication {
             val transport = transport()
             val routes = setup?.operationAssociation(transport) ?: association
             operationAssociation = routes
-            val controller = ReplicationController(store, domain, state, transport, { routes.replicaForNode(it) }, checkBudget = transport::checkBudget)
-            // Cleanup must progress even when a full retirement backlog blocks peer setup.
+            val controller = ReplicationController(
+                store,
+                domain,
+                state,
+                transport,
+                { routes.replicaForNode(it) },
+                checkBudget = transport::checkBudget,
+                role = setup?.role ?: AssistantPeerRole.PHONE,
+            )
             try {
-                transport.cleanup(store.replica, store, state)
                 work(transport, store, controller)
             } finally { operationAssociation = null }
             return true
@@ -217,11 +351,6 @@ object AssistantReplication {
                 .setBackoffCriteria(30_000, JobInfo.BACKOFF_POLICY_EXPONENTIAL).build())
         }
 
-        private fun hasPending() = state.enrolledReplicas().any { state.load(it) != null }
-        fun ensurePendingRetry() {
-            if (!hasPending()) { state.succeeded(); scheduler().cancel(RETRY_JOB); return }
-            if (scheduler().getPendingJob(RETRY_JOB) == null) retry()
-        }
         fun schedulePeriodic() {
             periodicRequested.set(true)
             submit {}

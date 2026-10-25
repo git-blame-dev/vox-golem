@@ -2,8 +2,9 @@ import { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
-import { appSnapshot, canonicalTurn, completeCapabilities, defaultAssistantSettings, readyStartupState } from './test/sessionFixtures'
+import { appSnapshot, canonicalTurn, completeCapabilities, defaultAssistantSettings, readyStartupState, durableId } from './test/sessionFixtures'
 import { FrontendSession } from './FrontendSession'
+import { sessionAuthority } from './SessionAuthority'
 import type { StartLiveAudioSourceOptions } from './lib/liveAudioSource'
 import * as captureModule from './lib/liveAudioSource'
 import { loadAudioInputDeviceId } from './lib/audioInputPreference'
@@ -16,10 +17,13 @@ const stoppedVoice = { auto_stop_on_silence: true, auto_start_available: false, 
 function fixture(options: { native?: boolean; active?: boolean; unavailable?: boolean; holdRead?: Promise<unknown>; voiceAvailable?: boolean; autoStart?: boolean; autoStop?: boolean; captureId?: number; modelAvailable?: boolean; settingsFail?: boolean; snapshotFail?: boolean; resetSnapshotFail?: boolean; resetHold?: Promise<unknown>; stopHold?: Promise<unknown>; startFail?: boolean; fallback?: boolean; updateReady?: boolean; autoStopSave?: (enabled: boolean) => Promise<boolean>; withholdPrompt?: boolean; owner?: 'native_voice' | 'renderer' | null; resetReject?: boolean; cancelReject?: boolean; profileFail?: boolean } = {}) {
   let prompt: ReturnType<typeof nativePrompt> | null = options.native === false ? null : nativePrompt()
   let transcript: Record<string, unknown>[] = []
+  let unsaved: Record<string, unknown> | null = null
   let revision = 1
   let active = options.active ?? true
   let speech = { playback_id: null as number | null, playing: false, pending: false }
   let sessionId = '1'
+  let durable = false
+  const executionId = (sequence: number): string => durable ? durableId(sequence) : String(sequence)
   let reset = false
   let withheld = options.withholdPrompt ?? false
   let profile = 'fast'
@@ -50,12 +54,12 @@ function fixture(options: { native?: boolean; active?: boolean; unavailable?: bo
       return options.owner === undefined ? options.native === false ? 'renderer' : 'native_voice' : options.owner
     }
     if (command === 'get_startup_state') return readyStartupState({ selected_response_profile: profile, voice_input_available: options.voiceAvailable ?? false, prompt_cancellation_available: true })
-    if (command === 'get_app_snapshot') { if (options.snapshotFail || (reset && options.resetSnapshotFail)) throw new Error('Synthetic snapshot unavailable'); return appSnapshot(transcript, { ...settings, response_profile: profile }, { session_id: sessionId, runtime_phase: canonicalPhase,
+    if (command === 'get_app_snapshot') { if (options.snapshotFail || (reset && options.resetSnapshotFail)) throw new Error('Synthetic snapshot unavailable'); return appSnapshot(transcript, { ...settings, response_profile: profile }, { session_id: sessionId, runtime_phase: canonicalPhase, unsaved_result: unsaved,
       ...(options.modelAvailable === false ? { capabilities: completeCapabilities({ local_fast: 'unavailable' }), model_options: [{ id: 'local-fast', label: 'Synthetic unavailable model', available: false, unavailable_reason: 'Synthetic unavailable model' }] } : {}),
       ...(active ? { active_request: { request_id: prompt?.request_id ?? (typedId || 'synthetic-typed-orphan'), execution_id: prompt?.execution_id ?? { session_id: sessionId, generation: rendererGeneration }, prompt: prompt?.prompt ?? 'Synthetic native question' } } : {}) }) }
     if (command === 'get_assistant_settings') { if (options.settingsFail) throw new Error('Synthetic settings unavailable'); return settings }
     if (command === 'set_assistant_settings') { settings = args!['settings'] as Record<string, unknown>; return settings }
-    if (command === 'switch_response_profile') { if (options.profileFail) throw new Error('Synthetic profile rollback'); profile = args!['profile'] as string; return { selected_response_profile: profile, supported_response_profiles: ['fast', 'quality'] } }
+    if (command === 'switch_response_profile') { if (options.profileFail) throw new Error('Synthetic secret=FAKE_TOKEN https://synthetic.invalid/private prompt=FAKE_PROMPT'); profile = args!['profile'] as string; return { selected_response_profile: profile, supported_response_profiles: ['fast', 'quality'] } }
     if (command === 'reserve_native_microphone_capture_id') { voice = { ...voice, auto_start_available: false }; return ++captureSequence }
     if (command === 'start_native_microphone') {
       if (options.startFail) { voice = { ...voice, state: 'error', capture_id: null, error: 'Synthetic capture failed', auto_start_available: false }; invalidate(); throw new Error('Synthetic capture failed') }
@@ -68,11 +72,18 @@ function fixture(options: { native?: boolean; active?: boolean; unavailable?: bo
       voice = { ...voice, auto_stop_on_silence: enabled }; invalidate(); return enabled
     }
     if (command === 'reset_session') {
+      if (unsaved !== null) throw new Error('Synthetic unresolved output blocks generic reset')
       if (options.resetHold !== undefined) await options.resetHold
       if (options.resetReject) throw new Error('Synthetic reset rejected')
       reset = true
-      sessionId = '2'; transcript = []; prompt = null; active = false
+      sessionId = '2'; transcript = []; prompt = null; active = false; unsaved = null
       voice = { ...voice, runtime_phase: 'sleeping', partial_transcript: null, auto_start_available: false }; invalidate()
+      return null
+    }
+    if (command === 'discard_unsaved_and_new_chat') {
+      if (unsaved === null || JSON.stringify(args!['executionId']) !== JSON.stringify(unsaved['execution_id'])) throw new Error('Synthetic stale discard target')
+      sessionId = executionId(3); transcript = []; prompt = null; active = false; unsaved = null
+      invalidate()
       return null
     }
     if (command === 'submit_prompt') {
@@ -95,7 +106,7 @@ function fixture(options: { native?: boolean; active?: boolean; unavailable?: bo
     if (command === 'get_wake_clip_settings') return { enabled: false, directory: '/tmp/synthetic-clips' }
     if (command === 'chatgpt_auth') return { phase: 'signed_out' }
     if (command === 'set_tts_enabled') return { enabled: args!['enabled'] }
-    if (command === 'record_frontend_runtime_diagnostic' || command === 'check_for_update') return null
+    if (command === 'record_frontend_runtime_diagnostic' || command === 'check_for_update' || command === 'clear_completion') return null
     throw new Error(`Unexpected synthetic command: ${command}`)
   })
   if (options.unavailable) invoke.mockImplementation(async (command) => {
@@ -111,12 +122,77 @@ function fixture(options: { native?: boolean; active?: boolean; unavailable?: bo
     createChannel: <T,>(send: (value: T) => void) => ({ send }),
   }
   return { invoke, invalidate,
+    finishSavedAndNext: () => {
+      if (prompt === null) throw new Error('Synthetic prompt missing')
+      const turn = { ...canonicalTurn('1', '2', prompt.prompt, 'Synthetic saved A answer', prompt.request_id, 'text', 'instant', sessionId), execution_id: prompt.execution_id }
+      transcript = [turn]
+      const finished = { revision: ++revision, kind: 'prompt_finished', request_id: prompt.request_id, execution_id: prompt.execution_id, result: { kind: 'completed', save_disposition: 'saved', turn } }
+      prompt = { request_id: 'synthetic-native-B', execution_id: { session_id: sessionId, generation: executionId(4) }, prompt: 'Synthetic B question', updates: [{ kind: 'text', text: 'Synthetic accumulated B answer' }], result: null }
+      active = true; canonicalPhase = 'executing'
+      pendingEvents = [finished, { revision: ++revision, kind: 'prompt_started', prompt }, { revision: ++revision, kind: 'prompt_update', request_id: prompt.request_id, execution_id: prompt.execution_id, update: { kind: 'text', text: 'Synthetic B delta' } }]
+      prompt = { ...prompt, updates: [{ kind: 'text', text: 'Synthetic accumulated B answerSynthetic B delta' }] }
+      listeners.get('desktop-runtime-changed')?.({ payload: { revision } })
+    },
+    forgetProcessOutput: () => { unsaved = null; active = false; prompt = null; invalidate() },
+    typedUnsaved: () => {
+      unsaved = { request_id: typedId, execution_id: { session_id: sessionId, generation: executionId(2) }, prompt: 'Synthetic typed question', answer: { kind: 'text', text: 'Synthetic typed unsaved answer' }, sources: [], final_stage: 'instant', reason: 'storage_error' }
+      active = false
+      typedFinish?.({ kind: 'unsaved', save_disposition: 'unsaved', unsaved_result: unsaved })
+    },
+    useDurableContext: () => { durable = true; sessionId = durableId(1); if (prompt !== null) prompt = { ...prompt, execution_id: { session_id: sessionId, generation: durableId(2) } } },
+    finishPrepared: (outcome: 'saved' | 'unsaved' | 'cancelled' | 'error') => {
+      if (prompt === null) throw new Error('Synthetic prompt missing')
+      const execution = prompt.execution_id
+      const requestId = prompt.request_id
+      let result: Record<string, unknown>
+      if (outcome === 'unsaved') {
+        unsaved = { request_id: requestId, execution_id: execution, prompt: prompt.prompt, answer: { kind: 'text', text: 'Synthetic prepared unsaved answer' }, sources: [], final_stage: 'instant', reason: 'storage_error' }
+        result = { kind: 'unsaved', save_disposition: 'unsaved', unsaved_result: unsaved }
+      } else if (outcome === 'saved') {
+        const turn = { ...canonicalTurn('3', '4', prompt.prompt, 'Synthetic prepared saved answer', requestId), execution_id: execution }
+        transcript = [turn]; result = { kind: 'completed', save_disposition: 'saved', turn }
+      } else result = outcome === 'error' ? { kind: 'error', request_id: requestId, runtime_phase: 'sleeping', error_message: 'Synthetic prepared provider failure' } : { kind: 'cancelled' }
+      active = false
+      prompt = { ...prompt, result }
+      pendingEvents = [
+        { revision: ++revision, kind: 'prompt_update', request_id: requestId, execution_id: execution, update: { kind: 'text', text: 'Synthetic pending delta' } },
+        { revision: ++revision, kind: 'prompt_finished', request_id: requestId, execution_id: execution, result },
+      ]
+      listeners.get('desktop-runtime-changed')?.({ payload: { revision } })
+    },
+    emptyContext: () => { sessionId = '0'; prompt = null; active = false },
+    startPreparedNative: (mode: 'snapshot' | 'event') => {
+      sessionId = executionId(1); prompt = { ...nativePrompt(), execution_id: { session_id: sessionId, generation: executionId(2) } }; active = true
+      if (mode === 'snapshot') invalidate()
+      else {
+        pendingEvents = [{ revision: ++revision, kind: 'prompt_started', prompt }]
+        listeners.get('desktop-runtime-changed')?.({ payload: { revision } })
+      }
+    },
+    reuseNativePrompt: () => { active = true; prompt = { ...nativePrompt(), execution_id: { session_id: sessionId, generation: executionId(4) }, prompt: 'Synthetic reused native question', updates: [{ kind: 'text', text: 'Synthetic current native answer' }] }; invalidate() },
+    delayedEvents: (events: Record<string, unknown>[]) => {
+      pendingEvents = events.map((event) => ({ ...event, revision: ++revision }))
+      listeners.get('desktop-runtime-changed')?.({ payload: { revision } })
+    },
+    finishUnsaved: (mode: 'snapshot' | 'event' | 'retired') => {
+      if (prompt === null) throw new Error('Synthetic native prompt is missing')
+      unsaved = { request_id: prompt.request_id, execution_id: prompt.execution_id, prompt: prompt.prompt, answer: { kind: 'text', text: 'Synthetic unsaved native answer' }, sources: [{ url: 'https://example.test/native-source', title: 'Synthetic native source' }], final_stage: 'deep', reason: 'storage_error' }
+      const result = { kind: 'unsaved', save_disposition: 'unsaved', unsaved_result: unsaved }
+      active = false; canonicalPhase = 'sleeping'
+      if (mode === 'snapshot') prompt = { ...prompt, result }
+      else {
+        if (mode === 'event') pendingEvents = [{ revision: ++revision, kind: 'prompt_finished', request_id: prompt.request_id, execution_id: prompt.execution_id, result }]
+        prompt = null
+      }
+      if (mode === 'event') listeners.get('desktop-runtime-changed')?.({ payload: { revision } })
+      else invalidate()
+    },
     reuseOrphanRequestId: () => { typedId = 'synthetic-typed-orphan' },
     finishSuccessor: () => {
       if (prompt === null) throw new Error('Synthetic native successor is missing')
       const turn = canonicalTurn('3', '4', prompt.prompt, 'Synthetic successor committed answer', prompt.request_id)
       transcript = [...transcript, turn]; active = false; canonicalPhase = 'sleeping'
-      prompt = { ...prompt, result: { kind: 'completed', turn } }
+      prompt = { ...prompt, result: { kind: 'completed', save_disposition: 'saved', turn } }
       voice = { ...voice, runtime_phase: 'sleeping' }; invalidate()
     },
     retireOrphan: (outcome: 'completed' | 'cancelled', successor: 'none' | 'renderer' | 'native' = 'none') => {
@@ -128,26 +204,26 @@ function fixture(options: { native?: boolean; active?: boolean; unavailable?: bo
       canonicalPhase = active ? 'executing' : 'sleeping'
       voice = { ...voice, runtime_phase: canonicalPhase }
     },
-    seedHistory: () => { transcript = [canonicalTurn('19', '20', 'Synthetic retained question', 'Synthetic retained answer', 'synthetic-retained')] },
+    seedHistory: () => { transcript = [{ ...canonicalTurn('19', '20', 'Synthetic retained question', 'Synthetic retained answer', 'synthetic-retained', 'text', 'instant', sessionId), execution_id: { session_id: sessionId, generation: executionId(20) } }] },
     reveal: () => { withheld = false; invalidate() },
     holdRead: (hold: Promise<unknown>) => { readHold = hold },
     root: () => structuredClone({ revision, snapshot: { revision, voice, prompt, speech }, events: [] }),
     voice: (patch: Record<string, unknown>) => { voice = { ...voice, ...patch } },
     event: (payload: unknown) => listeners.get('completion-event')?.({ payload }),
-    replace: (text: string) => { prompt = { ...nativePrompt(), updates: [{ kind: 'text', text }] } },
-    updates: (updates: Record<string, unknown>[]) => { prompt = { ...nativePrompt(), updates } },
+    replace: (text: string) => { prompt = { ...(prompt ?? nativePrompt()), updates: [{ kind: 'text', text }] } },
+    updates: (updates: Record<string, unknown>[]) => { prompt = { ...(prompt ?? nativePrompt()), updates } },
     partial: () => { voice = { ...stoppedVoice, capture_id: 12, state: 'active', runtime_phase: 'listening', partial_transcript: { session_id: 73, revision: 9, text: 'Synthetic partial text' } } },
     speech: (playing: boolean, pending: boolean) => { speech = { playback_id: playing ? 21 : null, playing, pending } },
     finish: (refused = false, sources: { url: string; title: string }[] = [], stage: 'instant' | 'deep' | 'review' = 'instant') => {
-      const turn = { ...canonicalTurn('1', '2', 'Synthetic native question', 'Synthetic canonical answer', 'synthetic-native-prompt', refused ? 'refusal' : 'text', stage), sources }
+      const turn = { ...canonicalTurn('1', '2', 'Synthetic native question', 'Synthetic canonical answer', 'synthetic-native-prompt', refused ? 'refusal' : 'text', stage, sessionId), execution_id: { session_id: sessionId, generation: executionId(2) }, sources }
       transcript = [turn]; active = false
-      prompt = { ...(prompt ?? nativePrompt()), result: { kind: refused ? 'refused' : 'completed', turn } }
+      prompt = { ...(prompt ?? nativePrompt()), result: { kind: refused ? 'refused' : 'completed', save_disposition: 'saved', turn } }
     },
     retire: () => { prompt = null },
     next: () => { active = true; prompt = { request_id: 'synthetic-native-next', execution_id: { session_id: '1', generation: '4' }, prompt: 'Synthetic next native question', updates: [{ kind: 'text', text: 'Synthetic next native answer' }], result: null } },
     terminalAndNext: (outcome: 'cancelled' | 'error') => {
-      const result = outcome === 'cancelled' ? { kind: 'cancelled' } : { request_id: 'synthetic-native-prompt', runtime_phase: 'sleeping', outcome, error_message: 'Synthetic native failure' }
-      pendingEvents = [{ revision: ++revision, kind: 'prompt_finished', request_id: 'synthetic-native-prompt', result }]
+      const result = outcome === 'cancelled' ? { kind: 'cancelled' } : { kind: 'error', request_id: 'synthetic-native-prompt', runtime_phase: 'sleeping', error_message: 'Synthetic native failure' }
+      pendingEvents = [{ revision: ++revision, kind: 'prompt_finished', request_id: 'synthetic-native-prompt', execution_id: { session_id: '1', generation: '2' }, result }]
       active = true
       prompt = { request_id: 'synthetic-native-next', execution_id: { session_id: '1', generation: '4' }, prompt: 'Synthetic next native question', updates: [{ kind: 'text', text: 'Synthetic next native answer' }], result: null }
       pendingEvents.push({ revision: ++revision, kind: 'prompt_started', prompt })
@@ -158,7 +234,8 @@ function fixture(options: { native?: boolean; active?: boolean; unavailable?: bo
       const turn = canonicalTurn('1', '2', 'Synthetic typed question', 'Synthetic typed answer', typedId)
       transcript = outcome === 'completed' ? [turn] : []; active = false
       if (outcome === 'rejected') typedReject?.(new Error('Synthetic transport rejection'))
-      else typedFinish?.(outcome === 'completed' ? { kind: 'completed', turn } : { request_id: typedId, runtime_phase: 'sleeping', outcome, error_message: outcome === 'error' ? 'Synthetic execution error' : null })
+      else if (outcome === 'error') typedReject?.(new Error('Synthetic execution error'))
+      else typedFinish?.(outcome === 'completed' ? { kind: 'completed', save_disposition: 'saved', turn } : { kind: 'cancelled' })
     },
   }
 }
@@ -190,6 +267,279 @@ function autoStopToggle(container: HTMLElement): HTMLInputElement {
 function deferred<T>() { let resolve!: (value: T) => void; let reject!: (error: Error) => void; const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no }); return { promise, resolve, reject } }
 
 describe('autonomous desktop runtime presentation', () => {
+  it.each(['active', 'terminal'] as const)('retires first-admission read ownership on same-session remount with a matching %s execution', async (mode) => {
+    const native = fixture({ native: false, active: false })
+    native.useDurableContext(); native.emptyContext()
+    const session = new FrontendSession()
+    let app = await mount(session)
+    const original = native.invoke.getMockImplementation()!
+    const gates: ReturnType<typeof deferred<void>>[] = []
+    native.invoke.mockImplementation(async (command, args) => {
+      const value = await original(command, args)
+      if (command === 'get_app_snapshot' && gates.length < 2) { const gate = deferred<void>(); gates.push(gate); await gate.promise }
+      return value
+    })
+    try {
+      await act(async () => { native.startPreparedNative('event') })
+      await vi.waitFor(() => expect(gates).toHaveLength(1))
+      await app.unmount()
+      if (mode === 'terminal') native.finishUnsaved('snapshot')
+      app = await mount(session)
+      await vi.waitFor(() => expect(gates).toHaveLength(2))
+      await act(async () => { gates[0]!.resolve() })
+      expect(sessionAuthority(session).selection.canonicalSession.current).toBe('0')
+      const reads = native.invoke.mock.calls.filter(([command]) => command === 'get_app_snapshot').length
+      await act(async () => { native.delayedEvents([{ kind: 'prompt_started', prompt: native.root().snapshot.prompt }]) })
+      expect(native.invoke.mock.calls.filter(([command]) => command === 'get_app_snapshot')).toHaveLength(reads)
+      await act(async () => { gates[1]!.resolve() })
+      if (mode === 'active') {
+        await vi.waitFor(() => expect(app.container.textContent).toContain('Synthetic accumulated answer'))
+        await act(async () => { native.finishPrepared('error') })
+        await vi.waitFor(() => expect(app.container.textContent).toContain('Synthetic prepared provider failure'))
+      } else await vi.waitFor(() => expect(app.container.querySelector('[aria-label="Unsaved answer"]')).not.toBeNull())
+      expect(session.getControlsSnapshot().promptState).toBe('idle')
+      expect(sessionAuthority(session).selection.canonicalSession.current).toBe(durableId(1))
+    } finally { gates.forEach((gate) => gate.resolve()); await app.unmount() }
+  })
+
+  it.each(['unsaved', 'error'] as const)('reattaches B from the existing observer after a synchronous saved-A/start-B/update-B batch, then consumes B %s incrementally', async (outcome) => {
+    const native = fixture()
+    native.useDurableContext()
+    const app = await mount()
+    const original = native.invoke.getMockImplementation()!
+    const release = deferred<void>()
+    let captured = false
+    native.invoke.mockImplementation(async (command, args) => {
+      const value = await original(command, args)
+      if (command === 'get_app_snapshot' && !captured) { captured = true; await release.promise }
+      return value
+    })
+    try {
+      await act(async () => { native.finishSavedAndNext() })
+      await vi.waitFor(() => expect(captured).toBe(true))
+      await act(async () => { release.resolve() })
+      await vi.waitFor(() => expect(app.container.textContent).toContain('Synthetic accumulated B answer'))
+      expect(app.container.textContent?.match(/Synthetic B delta/g)).toHaveLength(1)
+      expect(app.session.getControlsSnapshot().promptState).toBe('executing')
+      expect(app.container.textContent).toContain('Synthetic saved A answer')
+      await act(async () => { native.finishPrepared(outcome) })
+      await vi.waitFor(() => expect(app.session.getControlsSnapshot().promptState).toBe('idle'))
+      if (outcome === 'unsaved') expect(app.container.querySelector('[aria-label="Unsaved answer"]')?.textContent).toContain('Synthetic prepared unsaved answer')
+      else expect(app.container.textContent).toContain('Synthetic prepared provider failure')
+      expect(app.container.textContent).toContain('Synthetic saved A answer')
+    } finally { release.resolve(); await app.unmount() }
+  })
+  it.each(['cancelled', 'error'] as const)('validates the successor context afresh when its %s receipt arrives before the coalesced admission read can start', async (outcome) => {
+    const native = fixture({ native: false, active: false })
+    native.useDurableContext(); native.emptyContext()
+    const app = await mount()
+    const original = native.invoke.getMockImplementation()!
+    const release = deferred<void>()
+    let reads = 0
+    native.invoke.mockImplementation(async (command, args) => {
+      const value = await original(command, args)
+      if (command === 'get_app_snapshot' && ++reads === 1) await release.promise
+      return value
+    })
+    try {
+      await act(async () => { native.startPreparedNative('event') })
+      await vi.waitFor(() => expect(reads).toBe(1))
+      await act(async () => { native.reuseNativePrompt() })
+      await act(async () => { native.finishPrepared(outcome) })
+      await act(async () => { release.resolve() })
+      await vi.waitFor(() => expect(app.container.textContent).toContain(outcome === 'error' ? 'Synthetic prepared provider failure' : 'Response cancelled'))
+      expect(app.session.getControlsSnapshot().promptState).toBe('idle')
+      expect(sessionAuthority(app.session).selection.canonicalSession.current).toBe(durableId(1))
+    } finally { await app.unmount() }
+  })
+  it('accepts a genuinely fresh canonical null after native process-owned output is no longer available', async () => {
+    const native = fixture({ native: false, active: false })
+    native.useDurableContext()
+    const app = await mount()
+    try {
+      await sendTyped(app.container)
+      await act(async () => { native.typedUnsaved() })
+      expect(app.container.querySelector('[aria-label="Unsaved answer"]')).not.toBeNull()
+      await act(async () => { native.forgetProcessOutput() })
+      await vi.waitFor(() => expect(app.container.querySelector('[aria-label="Unsaved answer"]')).toBeNull())
+      expect(native.invoke.mock.calls.some(([command]) => command === 'discard_unsaved_and_new_chat')).toBe(false)
+    } finally { await app.unmount() }
+  })
+  it('fences delayed canonical null and non-null recovery reads across unsaved settlement and explicit discard', async () => {
+    const native = fixture({ native: false, active: false })
+    native.useDurableContext()
+    const app = await mount()
+    const original = native.invoke.getMockImplementation()!
+    let gate: ReturnType<typeof deferred<void>> | null = null
+    let captured = false
+    native.invoke.mockImplementation(async (command, args) => {
+      const value = await original(command, args)
+      if (command === 'get_app_snapshot' && gate !== null && !captured) { captured = true; await gate.promise }
+      return value
+    })
+    try {
+      gate = deferred<void>()
+      await act(async () => { native.invalidate() })
+      await vi.waitFor(() => expect(captured).toBe(true))
+      await sendTyped(app.container)
+      await act(async () => { native.typedUnsaved() })
+      expect(app.container.querySelector('[aria-label="Unsaved answer"]')).not.toBeNull()
+      await act(async () => { gate!.resolve() })
+      expect(app.container.querySelector('[aria-label="Unsaved answer"]')).not.toBeNull()
+      gate = deferred<void>(); captured = false
+      await act(async () => { native.invalidate() })
+      await vi.waitFor(() => expect(captured).toBe(true))
+      await click(app.container, 'New Chat')
+      expect(app.container.querySelector('[aria-label="Unsaved answer"]')).toBeNull()
+      await act(async () => { gate!.resolve() })
+      expect(app.container.querySelector('[aria-label="Unsaved answer"]')).toBeNull()
+      expect(sessionAuthority(app.session).selection.canonicalSession.current).toBe(durableId(3))
+    } finally { await app.unmount() }
+  })
+  it('requires a separate admission validation for a successor received while the first validation is pending', async () => {
+    const native = fixture({ native: false, active: false })
+    native.useDurableContext(); native.emptyContext()
+    const app = await mount()
+    const original = native.invoke.getMockImplementation()!
+    const reads: ReturnType<typeof deferred<void>>[] = []
+    native.invoke.mockImplementation(async (command, args) => {
+      const value = await original(command, args)
+      if (command === 'get_app_snapshot' && reads.length < 2) { const gate = deferred<void>(); reads.push(gate); await gate.promise }
+      return value
+    })
+    try {
+      await act(async () => { native.startPreparedNative('event') })
+      await vi.waitFor(() => expect(reads).toHaveLength(1))
+      await act(async () => { native.reuseNativePrompt() })
+      await act(async () => {
+        native.replace('Synthetic newest successor answer')
+        native.delayedEvents([{ kind: 'prompt_update', request_id: 'synthetic-native-prompt', execution_id: { session_id: durableId(1), generation: durableId(4) }, update: { kind: 'text', text: 'Synthetic pending successor delta' } }])
+      })
+      expect(reads).toHaveLength(1)
+      await act(async () => { reads[0]!.resolve() })
+      await vi.waitFor(() => expect(reads).toHaveLength(2))
+      expect(app.container.textContent).not.toContain('Synthetic current native answer')
+      expect(sessionAuthority(app.session).selection.canonicalSession.current).toBe('0')
+      await act(async () => { reads[1]!.resolve() })
+      await vi.waitFor(() => expect(app.container.textContent).toContain('Synthetic newest successor answer'))
+      await act(async () => { native.finishUnsaved('event') })
+      await vi.waitFor(() => expect(app.session.getControlsSnapshot().promptState).toBe('idle'))
+    } finally { await app.unmount() }
+  })
+
+  it('uses a fresh bounded native root instead of accumulating deltas during delayed first-admission validation', async () => {
+    const native = fixture({ native: false, active: false })
+    native.useDurableContext(); native.emptyContext()
+    const app = await mount()
+    const original = native.invoke.getMockImplementation()!
+    const release = deferred<void>()
+    let captured = false
+    native.invoke.mockImplementation(async (command, args) => {
+      const value = await original(command, args)
+      if (command === 'get_app_snapshot' && !captured) { captured = true; await release.promise }
+      return value
+    })
+    try {
+      await act(async () => { native.startPreparedNative('event') })
+      await vi.waitFor(() => expect(captured).toBe(true))
+      await act(async () => {
+        native.replace('Synthetic latest accumulated answer')
+        native.delayedEvents([{ kind: 'prompt_update', request_id: 'synthetic-native-prompt', execution_id: { session_id: durableId(1), generation: durableId(2) }, update: { kind: 'text', text: 'Synthetic intervening delta' } }])
+      })
+      await act(async () => { release.resolve() })
+      await vi.waitFor(() => expect(app.container.textContent).toContain('Synthetic latest accumulated answer'))
+      expect(app.container.textContent).not.toContain('Synthetic intervening delta')
+      expect(app.session.getControlsSnapshot().promptState).toBe('executing')
+    } finally { await app.unmount() }
+  })
+  it.each(['saved', 'unsaved', 'cancelled', 'error'] as const)('retains matching %s terminal events while first-admission validation is already captured and delayed', async (outcome) => {
+    const native = fixture({ native: false, active: false })
+    native.useDurableContext()
+    native.emptyContext()
+    const app = await mount()
+    const original = native.invoke.getMockImplementation()!
+    const release = deferred<void>()
+    let captured = false
+    native.invoke.mockImplementation(async (command, args) => {
+      const value = await original(command, args)
+      if (command === 'get_app_snapshot' && !captured) { captured = true; await release.promise }
+      return value
+    })
+    try {
+      await act(async () => { native.startPreparedNative('event') })
+      await vi.waitFor(() => expect(captured).toBe(true))
+      await act(async () => { native.finishPrepared(outcome) })
+      await act(async () => { release.resolve() })
+      await vi.waitFor(() => expect(app.session.getControlsSnapshot().promptState).toBe('idle'))
+      if (outcome === 'saved') expect(app.container.textContent).toContain('Synthetic prepared saved answer')
+      if (outcome === 'unsaved') expect(app.container.querySelector('[aria-label="Unsaved answer"]')?.textContent).toContain('Synthetic prepared unsaved answer')
+      if (outcome === 'error') expect(app.container.textContent).toContain('Synthetic prepared provider failure')
+      if (outcome === 'cancelled') expect(app.container.textContent).toContain('Response cancelled')
+      expect(app.container.textContent).not.toContain('Synthetic pending delta')
+    } finally { await app.unmount() }
+  })
+  it.each(['snapshot', 'event'] as const)('attaches a first native durable preparation from an empty selection via %s', async (mode) => {
+    const native = fixture({ native: false, active: false })
+    native.useDurableContext()
+    native.emptyContext()
+    const app = await mount()
+    try {
+      await act(async () => { native.startPreparedNative(mode) })
+      await vi.waitFor(() => expect(app.container.textContent).toContain('Synthetic accumulated answer'))
+      expect(sessionAuthority(app.session).selection.canonicalSession.current).toBe(durableId(1))
+      expect(native.invoke.mock.calls.some(([command]) => command === 'submit_prompt')).toBe(false)
+      await act(async () => { native.finishUnsaved('event') })
+      await vi.waitFor(() => expect(app.container.querySelector('[aria-label="Unsaved answer"]')).not.toBeNull())
+      expect(sessionAuthority(app.session).selection.transcript.current).toHaveLength(0)
+    } finally { await app.unmount() }
+  })
+  it.each(['snapshot', 'event', 'retired'] as const)('presents native voice save failure via %s separately from saved history and blocks follow-up', async (mode) => {
+    const native = fixture()
+    native.useDurableContext()
+    native.seedHistory()
+    const app = await mount()
+    try {
+      await act(async () => { native.finishUnsaved(mode) })
+      await vi.waitFor(() => expect(app.container.querySelector('[aria-label="Unsaved answer"]')?.textContent).toContain('Synthetic unsaved native answer'))
+      expect(app.container.querySelectorAll('[aria-label="Unsaved answer"]')).toHaveLength(1)
+      expect(app.container.textContent).not.toContain('Synthetic accumulated answer')
+      expect(app.container.textContent).toContain('Synthetic retained answer')
+      expect(app.container.querySelector('[aria-label="Answer not saved"]')).not.toBeNull()
+      expect(sessionAuthority(app.session).selection.transcript.current).toHaveLength(1)
+      expect(sessionAuthority(app.session).selection.transcript.current[0]?.requestId).toBe('synthetic-retained')
+      await sendTyped(app.container)
+      expect(native.invoke.mock.calls.some(([command]) => command === 'submit_prompt')).toBe(false)
+    } finally { await app.unmount() }
+    const reloaded = await mount()
+    try {
+      expect(reloaded.container.querySelectorAll('[aria-label="Unsaved answer"]')).toHaveLength(1)
+      expect(reloaded.container.querySelectorAll('.message--user')).toHaveLength(2)
+      expect(sessionAuthority(reloaded.session).selection.transcript.current).toHaveLength(1)
+    } finally { await reloaded.unmount() }
+  })
+
+  it('ignores delayed native update and finish envelopes for a reused correlation with a different execution', async () => {
+    const native = fixture()
+    native.useDurableContext()
+    const app = await mount()
+    try {
+      await act(async () => { native.finish(); native.invalidate() })
+      await vi.waitFor(() => expect(app.container.textContent).toContain('Synthetic canonical answer'))
+      await act(async () => { native.reuseNativePrompt() })
+      await vi.waitFor(() => expect(app.container.textContent).toContain('Synthetic current native answer'))
+      await act(async () => { native.delayedEvents([
+        { kind: 'prompt_update', request_id: 'synthetic-native-prompt', execution_id: { session_id: durableId(1), generation: durableId(2) }, update: { kind: 'text', text: 'Synthetic stale native text' } },
+        { kind: 'prompt_finished', request_id: 'synthetic-native-prompt', execution_id: { session_id: durableId(1), generation: durableId(2) }, result: { kind: 'cancelled' } },
+      ]) })
+      expect(app.container.textContent).not.toContain('Synthetic stale native text')
+      expect(app.container.textContent).toContain('Synthetic current native answer')
+      expect(button(app.container, 'Stop')).toBeDefined()
+      await act(async () => { native.finishUnsaved('event') })
+      await vi.waitFor(() => expect(app.container.querySelector('[aria-label="Unsaved answer"]')?.textContent).toContain('Synthetic unsaved native answer'))
+      expect(app.container.textContent).toContain('Synthetic canonical answer')
+      expect(sessionAuthority(app.session).selection.transcript.current).toHaveLength(1)
+    } finally { await app.unmount() }
+  })
   it('null-owner retirement race: recognizes a successor with the same request ID but a different execution', async () => {
     const native = fixture({ native: false, active: true })
     const original = native.invoke.getMockImplementation()!
@@ -260,6 +610,18 @@ describe('autonomous desktop runtime presentation', () => {
       expect(app.session.getControlsSnapshot().promptState).toBe('idle')
       expect(app.session.getControlsSnapshot().runtimeStatus).toBe('sleeping')
       expect(native.invoke.mock.calls.filter(([command]) => command === 'cancel_prompt' || command === 'submit_prompt')).toEqual([])
+    } finally { await app.unmount() }
+  })
+  it('preserves a private profile error in the UI but sends only fixed diagnostic categories', async () => {
+    const native = fixture({ native: false, active: false, profileFail: true })
+    const app = await mount()
+    try {
+      await act(async () => { await app.session.intents.changeInstant('local-quality') })
+      expect(app.container.textContent).toContain('Synthetic secret=FAKE_TOKEN https://synthetic.invalid/private prompt=FAKE_PROMPT')
+      const diagnostics = native.invoke.mock.calls.filter(([command]) => command === 'record_frontend_runtime_diagnostic')
+      expect(diagnostics).toContainEqual(['record_frontend_runtime_diagnostic', { event: { kind: 'profile_switch_failed' } }])
+      expect(diagnostics).toContainEqual(['record_frontend_runtime_diagnostic', { event: { kind: 'frontend_notice' } }])
+      expect(JSON.stringify(diagnostics)).not.toMatch(/FAKE_TOKEN|synthetic\.invalid|FAKE_PROMPT|detail/)
     } finally { await app.unmount() }
   })
   it.each([

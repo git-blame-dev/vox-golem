@@ -1,12 +1,14 @@
 use crate::inference::{ActualInferenceProvider, InferencePolicy};
-use crate::managed_process::ManagedProcess;
+use crate::managed_process::{
+    ensure_role_retired, LaunchError, LaunchGate, ManagedProcess, ProcessRole,
+};
 use rand::random;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -16,11 +18,7 @@ thread_local! {
     static IN_CHAT_PUBLICATION_CALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[cfg(windows)]
-use std::os::windows::{io::AsRawHandle, process::CommandExt};
-
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
@@ -100,8 +98,6 @@ impl LlamaCppServerSpec {
 pub struct LlamaCppRuntime {
     spec: LlamaCppServerSpec,
     child: Option<ManagedProcess>,
-    #[cfg(windows)]
-    process_job: Option<win32job::Job>,
     provider: ActualInferenceProvider,
 }
 
@@ -276,18 +272,6 @@ enum LlamaCppServerMode {
 
 impl LlamaCppRuntime {
     pub fn start(spec: LlamaCppServerSpec) -> Result<Self, LlamaCppRuntimeError> {
-        if !is_loopback_host(spec.host()) {
-            return Err(LlamaCppRuntimeError::HttpFailed {
-                details: "llama.cpp host must be loopback".to_string(),
-            });
-        }
-        if matches!(
-            send_http_request_with_timeout(&spec, "GET", "/health", None, HEALTH_TIMEOUT),
-            Ok(response) if response.status_code == 200
-        ) {
-            return Ok(Self::attach(spec));
-        }
-
         Self::start_with_policy(spec, InferencePolicy::Auto)
     }
 
@@ -351,6 +335,11 @@ impl LlamaCppRuntime {
         mode: LlamaCppServerMode,
         cancellation: Option<&LlamaCppStartupCancellation>,
     ) -> Result<Self, LlamaCppRuntimeError> {
+        ensure_role_retired(ProcessRole::LlamaCpp).map_err(|_| {
+            LlamaCppRuntimeError::SpawnFailed {
+                details: "managed_process_retirement_pending".into(),
+            }
+        })?;
         if cancellation.is_some_and(LlamaCppStartupCancellation::is_cancelled) {
             return Err(LlamaCppRuntimeError::StartupCancelled);
         }
@@ -359,10 +348,18 @@ impl LlamaCppRuntime {
                 details: "llama.cpp host must be loopback".to_string(),
             });
         }
-        if matches!(
-            send_http_request_with_timeout(&spec, "GET", "/health", None, HEALTH_TIMEOUT),
-            Ok(response) if response.status_code == 200
-        ) {
+        if let Ok(response) =
+            send_http_request_with_timeout(&spec, "GET", "/health", None, HEALTH_TIMEOUT)
+        {
+            if response.status_code != 200 {
+                return Err(LlamaCppRuntimeError::InvalidResponsePayload {
+                    details: format!(
+                        "external llama.cpp /health returned unexpected status {}",
+                        response.status_code
+                    ),
+                });
+            }
+            verify_server_compatibility(&spec, mode, HEALTH_TIMEOUT)?;
             return Ok(Self::attach(spec));
         }
         let attempts = match policy {
@@ -397,6 +394,7 @@ impl LlamaCppRuntime {
         mode: LlamaCppServerMode,
         cancellation: Option<&LlamaCppStartupCancellation>,
     ) -> Result<Self, LlamaCppRuntimeError> {
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
         if cancellation.is_some_and(|token| token.is_cancelled()) {
             return Err(LlamaCppRuntimeError::StartupCancelled);
         }
@@ -444,35 +442,46 @@ impl LlamaCppRuntime {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        configure_llama_server_command(&mut command);
-        let mut child = ManagedProcess::spawn_owned(&mut command).map_err(|error| {
-            LlamaCppRuntimeError::SpawnFailed {
-                details: error.to_string(),
-            }
-        })?;
-
-        #[cfg(windows)]
-        let process_job = create_owned_process_job(child.child()).inspect_err(|_| {
-            let _ = child.terminate(Duration::from_secs(2));
-        })?;
-        #[cfg(not(windows))]
-        create_owned_process_job(child.child()).inspect_err(|_| {
-            let _ = child.terminate(Duration::from_secs(2));
-        })?;
+        let check_cancelled = || cancellation.is_some_and(|token| token.is_cancelled());
+        let mut gate = LaunchGate::new()
+            .with_creation_flags(CREATE_NO_WINDOW)
+            .with_deadline(deadline);
+        if cancellation.is_some() {
+            gate = gate.with_cancellation(&check_cancelled);
+        }
+        let child = ManagedProcess::spawn_owned_with(&mut command, ProcessRole::LlamaCpp, &gate)
+            .map_err(|error| match error {
+                LaunchError::Cancelled => LlamaCppRuntimeError::StartupCancelled,
+                LaunchError::TimedOut => LlamaCppRuntimeError::StartupTimedOut {
+                    host: spec.host().to_string(),
+                    port: spec.port(),
+                },
+                LaunchError::ChildExited(exit_code) => {
+                    LlamaCppRuntimeError::ServerExited { exit_code }
+                }
+                LaunchError::Supervision(details) => {
+                    LlamaCppRuntimeError::ProcessJobFailed { details }
+                }
+                LaunchError::Spawn(error) => LlamaCppRuntimeError::SpawnFailed {
+                    details: error.to_string(),
+                },
+            })?;
 
         let mut runtime = Self {
             spec,
             child: Some(child),
-            #[cfg(windows)]
-            process_job,
             provider: if cuda {
                 ActualInferenceProvider::RequestedCuda
             } else {
                 ActualInferenceProvider::Cpu
             },
         };
-        if let Err(error) = runtime.wait_until_ready(cancellation) {
-            runtime.shutdown_owned();
+        if let Err(error) = runtime.wait_until_ready(mode, cancellation, deadline) {
+            runtime
+                .shutdown_owned()
+                .map_err(|_| LlamaCppRuntimeError::SpawnFailed {
+                    details: "managed process retirement failed".into(),
+                })?;
             return Err(error);
         }
         Ok(runtime)
@@ -482,8 +491,6 @@ impl LlamaCppRuntime {
         Self {
             spec,
             child: None,
-            #[cfg(windows)]
-            process_job: None,
             provider: ActualInferenceProvider::AttachedUnknown,
         }
     }
@@ -508,23 +515,20 @@ impl LlamaCppRuntime {
         }
     }
 
-    pub fn shutdown_owned(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.terminate(Duration::from_secs(2));
+    pub fn shutdown_owned(&mut self) -> std::io::Result<()> {
+        if let Some(child) = self.child.as_mut() {
+            child.terminate(Duration::from_secs(2))?;
         }
-
-        #[cfg(windows)]
-        {
-            self.process_job = None;
-        }
+        self.child = None;
+        Ok(())
     }
 
     fn wait_until_ready(
         &mut self,
+        mode: LlamaCppServerMode,
         cancellation: Option<&LlamaCppStartupCancellation>,
+        deadline: Instant,
     ) -> Result<(), LlamaCppRuntimeError> {
-        let deadline = Instant::now() + STARTUP_TIMEOUT;
-
         loop {
             if cancellation.is_some_and(|token| token.is_cancelled()) {
                 return Err(LlamaCppRuntimeError::StartupCancelled);
@@ -545,7 +549,17 @@ impl LlamaCppRuntime {
 
             match send_http_request_with_timeout(&self.spec, "GET", "/health", None, HEALTH_TIMEOUT)
             {
-                Ok(response) if response.status_code == 200 => return Ok(()),
+                Ok(response) if response.status_code == 200 => {
+                    let probe_timeout =
+                        HEALTH_TIMEOUT.min(remaining_http_timeout(deadline).map_err(|_| {
+                            LlamaCppRuntimeError::StartupTimedOut {
+                                host: self.spec.host().to_string(),
+                                port: self.spec.port(),
+                            }
+                        })?);
+                    verify_server_compatibility(&self.spec, mode, probe_timeout)?;
+                    return Ok(());
+                }
                 Ok(_) | Err(_) if Instant::now() >= deadline => {
                     return Err(LlamaCppRuntimeError::StartupTimedOut {
                         host: self.spec.host().to_string(),
@@ -556,6 +570,111 @@ impl LlamaCppRuntime {
             }
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct LlamaCppPropsResponse {
+    model_alias: String,
+    model_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlamaCppErrorEnvelope {
+    error: LlamaCppErrorBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlamaCppErrorBody {
+    #[serde(default)]
+    code: Option<u16>,
+    message: String,
+    #[serde(rename = "type")]
+    error_type: String,
+}
+
+fn verify_server_compatibility(
+    spec: &LlamaCppServerSpec,
+    expected_mode: LlamaCppServerMode,
+    timeout: Duration,
+) -> Result<(), LlamaCppRuntimeError> {
+    let props_response = send_http_request_with_timeout(spec, "GET", "/props", None, timeout)?;
+    if props_response.status_code != 200 {
+        return Err(LlamaCppRuntimeError::InvalidResponsePayload {
+            details: format!(
+                "llama.cpp /props compatibility check failed with status {}",
+                props_response.status_code
+            ),
+        });
+    }
+    let props: LlamaCppPropsResponse =
+        serde_json::from_slice(&props_response.body).map_err(|error| {
+            LlamaCppRuntimeError::InvalidResponsePayload {
+                details: format!("failed to parse llama.cpp /props response: {error}"),
+            }
+        })?;
+    if props.model_alias != spec.alias() {
+        return Err(LlamaCppRuntimeError::InvalidResponsePayload {
+            details: format!(
+                "llama.cpp model_alias mismatch: expected '{}', got '{}'",
+                spec.alias(),
+                props.model_alias
+            ),
+        });
+    }
+    if Path::new(&props.model_path) != spec.model_path() {
+        return Err(LlamaCppRuntimeError::InvalidResponsePayload {
+            details: format!(
+                "llama.cpp model_path mismatch: expected '{}', got '{}'",
+                spec.model_path().display(),
+                props.model_path
+            ),
+        });
+    }
+
+    let mode_probe = send_http_request_with_timeout(
+        spec,
+        "POST",
+        "/v1/embeddings",
+        Some(("application/json", b"{}")),
+        timeout,
+    )?;
+    let envelope: LlamaCppErrorEnvelope =
+        serde_json::from_slice(&mode_probe.body).map_err(|error| {
+            LlamaCppRuntimeError::InvalidResponsePayload {
+                details: format!("failed to parse llama.cpp mode probe response: {error}"),
+            }
+        })?;
+    let observed_mode = if mode_probe.status_code == 501
+        && envelope.error.code.is_none_or(|code| code == 501)
+        && envelope.error.error_type == "not_supported_error"
+        && envelope
+            .error
+            .message
+            .contains("This server does not support embeddings")
+    {
+        LlamaCppServerMode::Chat
+    } else if mode_probe.status_code == 400
+        && envelope.error.code.is_none_or(|code| code == 400)
+        && envelope.error.error_type == "invalid_request_error"
+        && envelope.error.message.contains("\"input\"")
+    {
+        LlamaCppServerMode::Embedding
+    } else {
+        return Err(LlamaCppRuntimeError::InvalidResponsePayload {
+            details: format!(
+                "unrecognized llama.cpp mode probe response (status {}, type '{}', message '{}')",
+                mode_probe.status_code, envelope.error.error_type, envelope.error.message
+            ),
+        });
+    };
+    if observed_mode != expected_mode {
+        return Err(LlamaCppRuntimeError::InvalidResponsePayload {
+            details: format!(
+                "llama.cpp server mode mismatch: expected {expected_mode:?}, got {observed_mode:?}"
+            ),
+        });
+    }
+    Ok(())
 }
 
 impl LlamaCppClient {
@@ -957,40 +1076,8 @@ fn checked_write(
 
 impl Drop for LlamaCppRuntime {
     fn drop(&mut self) {
-        self.shutdown_owned();
+        self.child.take();
     }
-}
-
-fn configure_llama_server_command(command: &mut Command) {
-    #[cfg(windows)]
-    {
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    #[cfg(not(windows))]
-    let _ = command;
-}
-
-#[cfg(windows)]
-fn create_owned_process_job(child: &Child) -> Result<Option<win32job::Job>, LlamaCppRuntimeError> {
-    let mut limit_info = win32job::ExtendedLimitInfo::new();
-    limit_info.limit_kill_on_job_close();
-
-    let job = win32job::Job::create_with_limit_info(&limit_info).map_err(|error| {
-        LlamaCppRuntimeError::ProcessJobFailed {
-            details: error.to_string(),
-        }
-    })?;
-    job.assign_process(child.as_raw_handle() as isize)
-        .map_err(|error| LlamaCppRuntimeError::ProcessJobFailed {
-            details: error.to_string(),
-        })?;
-
-    Ok(Some(job))
-}
-
-#[cfg(not(windows))]
-fn create_owned_process_job(_child: &Child) -> Result<(), LlamaCppRuntimeError> {
-    Ok(())
 }
 
 #[derive(Debug)]
@@ -1396,8 +1483,8 @@ mod tests {
     use super::{
         build_chat_completion_request, decode_chunked_body, http_host_authority, is_loopback_host,
         parse_http_response, send_http_request, send_http_request_with_timeout, ChunkedDecoder,
-        InferencePolicy, LlamaCppChatCancellation, LlamaCppPrompt, LlamaCppRuntime,
-        LlamaCppRuntimeError, LlamaCppServerSpec,
+        LlamaCppChatCancellation, LlamaCppPrompt, LlamaCppRuntime, LlamaCppRuntimeError,
+        LlamaCppServerSpec,
     };
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -1856,6 +1943,53 @@ mod tests {
         assert_eq!(deltas, ["first"]);
     }
 
+    fn read_http_request_any(stream: &mut std::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut expected_len = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "complete fixture request deadline");
+            stream.set_read_timeout(Some(remaining)).unwrap();
+            let mut chunk = [0_u8; 1024];
+            let read = stream.read(&mut chunk).expect("test request should read");
+            assert!(read > 0, "test request ended before headers/body");
+            request.extend_from_slice(&chunk[..read]);
+            assert!(request.len() <= 16 * 1024, "test request exceeded limit");
+
+            if expected_len.is_none() {
+                if let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let body_start = header_end + 4;
+                    let headers =
+                        std::str::from_utf8(&request[..header_end]).expect("request headers");
+                    let content_len = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.split_once(':').and_then(|(name, value)| {
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().expect("content length"))
+                            })
+                        })
+                        .unwrap_or(0);
+                    assert!(content_len <= 16 * 1024 - body_start);
+                    expected_len = Some(body_start + content_len);
+                }
+            }
+            if expected_len.is_some_and(|expected| request.len() >= expected) {
+                return String::from_utf8(request).expect("UTF-8 request");
+            }
+        }
+    }
+
+    fn write_json_response(stream: &mut std::net::TcpStream, status: &str, body: &str) {
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
+
     #[test]
     fn start_reuses_running_server_and_does_not_stop_external_server_behavior() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
@@ -1866,6 +2000,17 @@ mod tests {
         listener
             .set_nonblocking(true)
             .expect("listener should allow nonblocking mode");
+
+        let spec = LlamaCppServerSpec::new(
+            "llama-server.exe",
+            "model.gguf",
+            "127.0.0.1",
+            port,
+            "default",
+        );
+        let expected_auth = format!("Authorization: Bearer {}", spec.api_key);
+        let expected_alias = spec.alias().to_string();
+        let expected_model_path = spec.model_path().to_string_lossy().into_owned();
 
         let shutdown = Arc::new(AtomicBool::new(false));
         struct StopOnDrop(Arc<AtomicBool>);
@@ -1886,12 +2031,37 @@ mod tests {
                         stream
                             .set_write_timeout(Some(Duration::from_secs(2)))
                             .unwrap();
-                        let mut request_buffer = [0_u8; 1024];
-                        let _ = stream.read(&mut request_buffer);
-                        let _ = stream.write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
-                        );
-                        let _ = stream.flush();
+                        let request = read_http_request_any(&mut stream);
+                        if request.starts_with("GET /health HTTP/1.1") {
+                            write_json_response(&mut stream, "200 OK", r#"{"status":"ok"}"#);
+                        } else if request.starts_with("GET /props HTTP/1.1") {
+                            if request.lines().any(|line| line.trim() == expected_auth) {
+                                let body = serde_json::json!({
+                                    "model_alias": expected_alias,
+                                    "model_path": expected_model_path,
+                                })
+                                .to_string();
+                                write_json_response(&mut stream, "200 OK", &body);
+                            } else {
+                                write_json_response(
+                                    &mut stream,
+                                    "401 Unauthorized",
+                                    r#"{"error":{"code":401,"message":"Invalid API Key","type":"authentication_error"}}"#,
+                                );
+                            }
+                        } else if request.starts_with("POST /v1/embeddings HTTP/1.1") {
+                            assert!(
+                                request.ends_with("\r\n\r\n{}"),
+                                "compatibility probe must send empty JSON object"
+                            );
+                            write_json_response(
+                                &mut stream,
+                                "501 Not Implemented",
+                                r#"{"error":{"code":501,"message":"This server does not support embeddings. Start it with `--embedding`","type":"not_supported_error"}}"#,
+                            );
+                        } else {
+                            write_json_response(&mut stream, "404 Not Found", "{}");
+                        }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
@@ -1900,14 +2070,6 @@ mod tests {
                 }
             }
         });
-
-        let spec = LlamaCppServerSpec::new(
-            "llama-server.exe",
-            "model.gguf",
-            "127.0.0.1",
-            port,
-            "default",
-        );
 
         let runtime =
             LlamaCppRuntime::start(spec).expect("runtime should attach to running server");
@@ -1923,6 +2085,236 @@ mod tests {
         server_thread
             .join()
             .expect("server thread should exit cleanly");
+    }
+
+    #[test]
+    fn start_embedding_attaches_to_compatible_external_embedding_server() {
+        use super::{InferencePolicy, LlamaCppStartupCancellation};
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let port = listener.local_addr().expect("listener addr").port();
+        listener.set_nonblocking(true).unwrap();
+
+        let spec = LlamaCppServerSpec::new(
+            "missing-executable-that-must-not-spawn",
+            "embed-model.gguf",
+            "127.0.0.1",
+            port,
+            "embed-alias",
+        );
+        let expected_auth = format!("Authorization: Bearer {}", spec.api_key);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_for_thread = Arc::clone(&shutdown);
+        let server_thread = thread::spawn(move || {
+            while !shutdown_for_thread.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let request = read_http_request_any(&mut stream);
+                        if request.starts_with("GET /health HTTP/1.1") {
+                            write_json_response(&mut stream, "200 OK", r#"{"status":"ok"}"#);
+                        } else if request.starts_with("GET /props HTTP/1.1") {
+                            assert!(request.lines().any(|line| line.trim() == expected_auth));
+                            write_json_response(
+                                &mut stream,
+                                "200 OK",
+                                r#"{"model_alias":"embed-alias","model_path":"embed-model.gguf"}"#,
+                            );
+                        } else if request.starts_with("POST /v1/embeddings HTTP/1.1") {
+                            assert!(request.ends_with("\r\n\r\n{}"));
+                            write_json_response(
+                                &mut stream,
+                                "400 Bad Request",
+                                r#"{"error":{"code":400,"message":"\"input\" field is required","type":"invalid_request_error"}}"#,
+                            );
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("test server accept failed: {error}"),
+                }
+            }
+        });
+
+        let runtime = LlamaCppRuntime::start_embedding_with_policy_cancellation(
+            spec.clone(),
+            InferencePolicy::Cpu,
+            LlamaCppStartupCancellation::default(),
+        )
+        .expect("compatible embedding server should attach");
+        assert!(!runtime.is_owned());
+        drop(runtime);
+
+        let response = send_http_request(&spec, "GET", "/health", None)
+            .expect("external embedding server must remain running");
+        assert_eq!(response.status_code, 200);
+        shutdown.store(true, Ordering::SeqCst);
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn external_server_identity_or_auth_mismatch_is_rejected_without_spawning_or_stopping() {
+        for (props_status, props_body, expected_substring) in [
+            (
+                "401 Unauthorized",
+                r#"{"error":{"code":401,"message":"Invalid API Key","type":"authentication_error"}}"#,
+                "/props compatibility check failed with status 401",
+            ),
+            (
+                "200 OK",
+                r#"{"model_alias":"wrong-alias","model_path":"model.gguf"}"#,
+                "model_alias mismatch",
+            ),
+            (
+                "200 OK",
+                r#"{"model_alias":"default","model_path":"other-model.gguf"}"#,
+                "model_path mismatch",
+            ),
+        ] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+            let port = listener.local_addr().expect("listener addr").port();
+            listener.set_nonblocking(true).unwrap();
+
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown_for_thread = Arc::clone(&shutdown);
+            let server_thread = thread::spawn(move || {
+                while !shutdown_for_thread.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let request = read_http_request_any(&mut stream);
+                            if request.starts_with("GET /health HTTP/1.1") {
+                                write_json_response(&mut stream, "200 OK", r#"{"status":"ok"}"#);
+                            } else if request.starts_with("GET /props HTTP/1.1") {
+                                write_json_response(&mut stream, props_status, props_body);
+                            } else {
+                                panic!("unexpected request after /props failure: {request}");
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("test server accept failed: {error}"),
+                    }
+                }
+            });
+
+            // Use a nonexistent executable path: if start tried to spawn an owned child,
+            // it would fail with SpawnFailed instead of InvalidResponsePayload.
+            let spec = LlamaCppServerSpec::new(
+                "nonexistent-dir/missing-llama-server",
+                "model.gguf",
+                "127.0.0.1",
+                port,
+                "default",
+            );
+            let result = LlamaCppRuntime::start(spec.clone());
+            assert!(
+                matches!(
+                    &result,
+                    Err(LlamaCppRuntimeError::InvalidResponsePayload { details })
+                        if details.contains(expected_substring)
+                ),
+                "expected {expected_substring}, got {result:?}"
+            );
+
+            let health = send_http_request(&spec, "GET", "/health", None)
+                .expect("external server must remain alive after rejection");
+            assert_eq!(health.status_code, 200);
+            shutdown.store(true, Ordering::SeqCst);
+            server_thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn external_server_mode_mismatch_or_arbitrary_400_is_rejected_without_spawning_or_stopping() {
+        use super::{InferencePolicy, LlamaCppStartupCancellation};
+        for (start_embedding, mode_status, mode_body, expected_substring) in [
+            (
+                false,
+                "400 Bad Request",
+                r#"{"error":{"code":400,"message":"\"input\" field is required","type":"invalid_request_error"}}"#,
+                "server mode mismatch: expected Chat, got Embedding",
+            ),
+            (
+                true,
+                "501 Not Implemented",
+                r#"{"error":{"code":501,"message":"This server does not support embeddings. Start it with `--embedding`","type":"not_supported_error"}}"#,
+                "server mode mismatch: expected Embedding, got Chat",
+            ),
+            (
+                true,
+                "400 Bad Request",
+                r#"{"error":{"code":400,"message":"arbitrary bad request without input field","type":"invalid_request_error"}}"#,
+                "unrecognized llama.cpp mode probe response",
+            ),
+            (
+                true,
+                "400 Bad Request",
+                "not json at all",
+                "failed to parse llama.cpp mode probe response",
+            ),
+        ] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+            let port = listener.local_addr().expect("listener addr").port();
+            listener.set_nonblocking(true).unwrap();
+
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown_for_thread = Arc::clone(&shutdown);
+            let server_thread = thread::spawn(move || {
+                while !shutdown_for_thread.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let request = read_http_request_any(&mut stream);
+                            if request.starts_with("GET /health HTTP/1.1") {
+                                write_json_response(&mut stream, "200 OK", r#"{"status":"ok"}"#);
+                            } else if request.starts_with("GET /props HTTP/1.1") {
+                                write_json_response(
+                                    &mut stream,
+                                    "200 OK",
+                                    r#"{"model_alias":"default","model_path":"model.gguf"}"#,
+                                );
+                            } else if request.starts_with("POST /v1/embeddings HTTP/1.1") {
+                                write_json_response(&mut stream, mode_status, mode_body);
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("test server accept failed: {error}"),
+                    }
+                }
+            });
+
+            let spec = LlamaCppServerSpec::new(
+                "nonexistent-dir/missing-llama-server",
+                "model.gguf",
+                "127.0.0.1",
+                port,
+                "default",
+            );
+            let result = if start_embedding {
+                LlamaCppRuntime::start_embedding_with_policy_cancellation(
+                    spec.clone(),
+                    InferencePolicy::Cpu,
+                    LlamaCppStartupCancellation::default(),
+                )
+            } else {
+                LlamaCppRuntime::start(spec.clone())
+            };
+            assert!(
+                matches!(
+                    &result,
+                    Err(LlamaCppRuntimeError::InvalidResponsePayload { details })
+                        if details.contains(expected_substring)
+                ),
+                "expected {expected_substring}, got {result:?}"
+            );
+
+            let health = send_http_request(&spec, "GET", "/health", None)
+                .expect("external server must remain alive after mode rejection");
+            assert_eq!(health.status_code, 200);
+            shutdown.store(true, Ordering::SeqCst);
+            server_thread.join().unwrap();
+        }
     }
 
     #[test]
@@ -2110,6 +2502,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn cancellable_startup_reaps_owned_child_when_cancelled_during_readiness() {
+        use super::InferencePolicy;
         use std::os::unix::fs::PermissionsExt;
         use std::path::Path;
         use std::time::Instant;

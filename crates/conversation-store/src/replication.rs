@@ -10,10 +10,6 @@ use voxgolem_core::durable_conversation::{OperationId, Record};
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     Revision,
-    RetainedDescriptors {
-        revision: Option<String>,
-        entries: Vec<InventoryEntry>,
-    },
     Inventory {
         cursor: Option<InventoryCursor>,
     },
@@ -70,7 +66,10 @@ fn entry(record: &Record) -> InventoryEntry {
 impl Store {
     pub fn replication(&mut self, request: Request) -> crate::Result<serde_json::Value> {
         if let Request::Import { records, entries } = request {
-            if records.is_empty() || records.len() > 8 || records.len() != entries.len() {
+            if records.is_empty()
+                || records.len() > sync::MAX_BATCH_RECORDS
+                || records.len() != entries.len()
+            {
                 return Err(codec::limit("replication_import").into());
             }
             let mut bytes = 0usize;
@@ -78,15 +77,28 @@ impl Store {
                 if entry(record) != expected {
                     return Err(codec::invalid("replication_body_descriptor").into());
                 }
-                bytes += codec::encode(record, 2 * 1024 * 1024, "replication_record_bytes")?.len();
-                if bytes > 4 * 1024 * 1024 {
+                let record_bytes =
+                    codec::encode(record, sync::MAX_RECORD_BYTES, "replication_record_bytes")?
+                        .len();
+                bytes = bytes
+                    .checked_add(record_bytes)
+                    .ok_or_else(|| codec::limit("replication_asset_bytes"))?;
+                if bytes > sync::MAX_BATCH_BYTES {
                     return Err(codec::limit("replication_asset_bytes").into());
                 }
             }
             // The canonical import owner independently recomputes body keys and commits
             // durable receipts; advertised metadata never becomes identity authority.
-            return serde_json::to_value(self.import_records(records, true, None)?)
-                .map_err(|_| crate::Error::Storage);
+            let (outcome, receipts) = self.import_received(records)?;
+            return Ok(serde_json::json!({
+                "base_revision": outcome.base_revision,
+                "revision": outcome.revision,
+                "accepted": outcome.accepted,
+                "duplicates": outcome.duplicates,
+                "suppressed": outcome.suppressed,
+                "quarantined": outcome.quarantined,
+                "receipts": receipts,
+            }));
         }
         let replica = if matches!(
             &request,
@@ -99,15 +111,6 @@ impl Store {
         self.read(|core| {
             match request {
                 Request::Revision => encode(core.revision()),
-                Request::RetainedDescriptors { revision, entries } => {
-                    if entries.len() > sync::MAX_CONTROL_ITEMS {
-                        return Err(codec::limit("retained_descriptor_items"));
-                    }
-                    // Bound the encoded control request independently of the larger
-                    // JNI envelope limit; never serialize retained bodies here.
-                    codec::encode(&entries, sync::MAX_CONTROL_BYTES, "retained_descriptor_bytes")?;
-                    encode(sync::retained_descriptors(core, revision, entries)?)
-                }
                 Request::Import { .. } => unreachable!("handled before read transaction"),
                 Request::Inventory { cursor } => {
                     if cursor.as_ref().is_some_and(|cursor| cursor.revision != core.revision()) {
@@ -126,7 +129,7 @@ impl Store {
                 Request::Receipts { ids } => encode(sync::receipts_after_commit(core, &replica, &ids)?),
                 Request::Bodies { revision, entries, tombstones } => {
                     if revision != core.revision() { return Ok(serde_json::json!({"restart": true})); }
-                    if entries.is_empty() || entries.len() > 8 { return Err(codec::limit("replication_bodies")); }
+                    if entries.is_empty() || entries.len() > sync::MAX_BATCH_RECORDS { return Err(codec::limit("replication_bodies")); }
                     let mut seen = std::collections::BTreeSet::new();
                     let mut bodies = Vec::new();
                     let mut unavailable = Vec::new();
@@ -145,13 +148,16 @@ impl Store {
                             if expected != actual { return Err(codec::invalid("replication_body_descriptor")); }
                         }
                         if tombstones && !actual.tombstone { return Err(codec::invalid("replication_body_phase")); }
-                        let body = codec::encode(record, 2 * 1024 * 1024, "replication_record_bytes")?;
-                        if body.len() > 2 * 1024 * 1024 { return Err(codec::limit("replication_record_bytes")); }
-                        if bytes + body.len() > 4 * 1024 * 1024 { unavailable.push(actual.id); continue; }
-                        bytes += body.len();
+                        let body = codec::encode(record, sync::MAX_RECORD_BYTES, "replication_record_bytes")?;
+                        if body.len() > sync::MAX_RECORD_BYTES { return Err(codec::limit("replication_record_bytes")); }
+                        let Some(next_bytes) = bytes.checked_add(body.len()) else { unavailable.push(actual.id); continue; };
+                        if next_bytes > sync::MAX_BATCH_BYTES { unavailable.push(actual.id); continue; }
+                        bytes = next_bytes;
                         bodies.push(Body { entry: actual, body });
                     }
-                    Ok(serde_json::json!({"restart": false, "bodies": bodies, "unavailable": unavailable}))
+                    let response = serde_json::json!({"restart": false, "bodies": bodies, "unavailable": unavailable});
+                    codec::encode(&response, 16 * 1024 * 1024 - 4096, "replication_gateway_bytes")?;
+                    Ok(response)
                 }
             }
         })

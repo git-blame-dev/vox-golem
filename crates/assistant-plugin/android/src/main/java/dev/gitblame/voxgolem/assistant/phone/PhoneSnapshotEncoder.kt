@@ -95,6 +95,7 @@ object PhoneSnapshotEncoder {
         return JSONObject().put("session_id", state.conversation?.let { wireId(JSONObject(it)) } ?: "0")
             .put("runtime_phase", if (state.busy) "executing" else "sleeping")
             .put("transcript", transcript).put("active_request", active ?: JSONObject.NULL)
+            .put("unsaved_result", JSONObject.NULL)
             .put("capabilities", capabilities).put("model_options", options).put("preferences", preferences)
             .put("assistant", JSONObject().put("revision", view.getString("revision")).put("conversations", conversations)
                 .put("conversation_count", totalConversations)

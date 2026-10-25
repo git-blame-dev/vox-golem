@@ -13,7 +13,7 @@ describe('frontend timing boundaries', () => {
     vi.stubEnv('VITE_VOXGOLEM_BENCHMARK', '1')
     reportAppBenchmarkStage('benchmark_controls_retire')
     expect(invokeTauriCommand).toHaveBeenCalledExactlyOnceWith('record_frontend_runtime_diagnostic', {
-      event: { kind: 'audio', detail: 'benchmark_controls_retire' },
+      event: { kind: 'benchmark_controls_retire' },
     })
   })
 
@@ -24,6 +24,12 @@ describe('frontend timing boundaries', () => {
     expect(invokeTauriCommand).toHaveBeenCalledExactlyOnceWith('report_startup_stage', { stage: 'entry_draft_requested' })
     vi.mocked(invokeTauriCommand).mockImplementationOnce(() => { throw new Error('Synthetic bridge throw') })
     expect(() => reportVoiceEntryStage('entry_dispatched')).not.toThrow()
+  })
+
+  it.each(['benchmark_lifetime_retire', 'benchmark_controls_retire', 'benchmark_capability_retire', 'benchmark_audio_error', 'benchmark_cue_error'] as const)('sends the benchmark kind without details: %s', (stage) => {
+    vi.stubEnv('VITE_VOXGOLEM_BENCHMARK', '1')
+    reportAppBenchmarkStage(stage)
+    expect(invokeTauriCommand).toHaveBeenCalledExactlyOnceWith('record_frontend_runtime_diagnostic', { event: { kind: stage } })
   })
 
   it('requires exact explicit opt-in', () => {

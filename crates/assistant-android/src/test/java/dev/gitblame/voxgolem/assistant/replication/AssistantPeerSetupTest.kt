@@ -96,7 +96,7 @@ class AssistantPeerSetupTest {
     }
 
     @Test fun historyEpochResetsOnlySessionsAndPreservesCurrentTrustedBindingsAndProviderFiles() = worker {
-        for (oldVersion in 1..3) {
+        for (oldVersion in 1..4) {
             val context = isolated("synthetic-migration-$oldVersion")
             val auth = ChatGptAuth.managedFile(context).apply { writeText("Synthetic managed credential bytes") }
             val authBefore = auth.readBytes()
@@ -131,9 +131,31 @@ class AssistantPeerSetupTest {
                     else assertEquals(a, registry.bindingFor(b, b)!!.association)
                 }
                 DurableReplicationState(context).use { state ->
-                    assertNull(state.load(b))
-                    assertEquals(setOf(c), state.cleanupReplicas())
+                    assertEquals(setOf(b), state.enrolledReplicas())
                     assertEquals(0L, state.retryDelay(1_800_000_000_000L))
+                    assertTrue(state.failed(1_800_000_000_000L) >= 30_000L)
+                }
+                EnrolledPeerRegistry(context).use { registry ->
+                    registry.resetConversationReplicationState()
+                    assertEquals(setOf(b), registry.replicas())
+                    if (oldVersion >= 3) {
+                        assertEquals("INVITATION_PENDING", registry.setupValue("status")!!.getString("reason"))
+                        assertEquals(a, registry.bindingFor(b, b)!!.association)
+                    }
+                }
+                DurableReplicationState(context).use { state ->
+                    assertEquals(0L, state.retryDelay(1_800_000_000_000L))
+                }
+                SQLiteDatabase.openDatabase(File(context.noBackupFilesDir, "assistant-replication.db").absolutePath, null, SQLiteDatabase.OPEN_READONLY).use { db ->
+                    assertEquals(5, db.version)
+                    db.rawQuery("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cleanup_peers'", null).use { cursor ->
+                        assertFalse(cursor.moveToFirst())
+                    }
+                    db.rawQuery("PRAGMA table_info(peers)", null).use { cursor ->
+                        val columns = mutableListOf<String>()
+                        while (cursor.moveToNext()) columns.add(cursor.getString(1))
+                        assertEquals(listOf("replica"), columns)
+                    }
                 }
                 assertEquals(historyBefore, history.snapshot().toString())
                 assertEquals(publicationsBefore, history.publications(b, 128).toString())
@@ -558,10 +580,17 @@ class AssistantPeerSetupTest {
     @Test fun identityHintsBootstrapAndOldInvitationPathsAreNeverQueued() = worker {
         val pair = PairFixture()
         assertTrue(AssistantReplication.acceptsData(pair.mailbox.events.last()))
+        fun putRawItem(path: String) {
+            val request = com.google.android.gms.wearable.PutDataMapRequest.create(path)
+            request.dataMap.putByteArray("frame", "{}".toByteArray())
+            pair.leftSdk.putItem(request.asPutDataRequest().setUrgent())
+        }
         for (kind in listOf("request", "ack")) {
-            pair.leftIo.publish("/voxgolem/assistant/v1/pair/$kind", "{}".toByteArray(), emptyMap())
+            putRawItem("/voxgolem/assistant/v1/pair/$kind")
             assertFalse(AssistantReplication.acceptsData(pair.mailbox.events.last()))
         }
+        putRawItem("${ReplicationWire.PREFIX}$a/$b/hint")
+        assertFalse(AssistantReplication.acceptsData(pair.mailbox.events.last()))
     }
 
     @Test fun persistedInitialBackoffIsBoundedWithoutAnyEnrolledPeer() {
@@ -659,7 +688,9 @@ class AssistantPeerSetupTest {
             val hello = JSONObject().put("version", version).put("replica", replica)
             if (version == 2) hello.put("installation", c)
             if (role != null) hello.put("role", role)
-            io.publish(ReplicationWire.IDENTITY_PATH, hello.toString().toByteArray(), emptyMap())
+            val request = com.google.android.gms.wearable.PutDataMapRequest.create(ReplicationWire.IDENTITY_PATH)
+            request.dataMap.putByteArray("frame", hello.toString().toByteArray(Charsets.UTF_8))
+            io.sdk.putItem(request.asPutDataRequest().setUrgent())
         }
         init { publish(leftIo, a, "phone"); publish(rightIo, b, "watch") }
     }

@@ -118,7 +118,8 @@ class ReplicationStatusReadTest {
             assertTrue(fixture.localSdk.calls.size > callsBefore.size)
             val enrolledCalls = fixture.localSdk.calls.toList()
             val enrolledJobs = fixture.scheduler.allPendingJobs.toList()
-            val pendingSync = owner.state.load(UUID(0, 501).toString())!!.toString()
+            val enrolledReplicas = owner.state.enrolledReplicas()
+            assertEquals(setOf(UUID(0, 501).toString()), enrolledReplicas)
             repeat(20) {
                 val cached = readStatus(fixture.context)
                 assertEquals(PeerPairingReason.ENROLLED, cached.reason)
@@ -129,7 +130,7 @@ class ReplicationStatusReadTest {
             assertEquals(enrolledCalls, fixture.localSdk.calls)
             assertEquals(enrolledJobs, fixture.scheduler.allPendingJobs)
             assertArrayEquals(credentialBefore, credentialFile.readBytes())
-            assertEquals(pendingSync, owner.state.load(UUID(0, 501).toString())!!.toString())
+            assertEquals(enrolledReplicas, owner.state.enrolledReplicas())
         }
     }
 
@@ -213,7 +214,9 @@ class ReplicationStatusReadTest {
     private inner class Fixture(name: String) {
         val root = folder.newFolder(name)
         val mailbox = FakeGmsMailbox(folder.root)
-        val localSdk = mailbox.sdk("synthetic-status-phone")
+        val localSdk = mailbox.sdk("synthetic-status-phone").apply {
+            openChannelError = java.io.IOException("Synthetic remote channel listener idle in status test")
+        }
         val remoteSdk = mailbox.sdk("synthetic-status-watch")
         fun transport() = GmsReplicationTransport(localSdk, budget())
         val context = StatusContext(root, ::transport)
@@ -243,5 +246,5 @@ class ReplicationStatusReadTest {
             if (installed != null && installed !== previous) testOwners += installed
         }
     }
-    private fun budget() = BoundedGmsWait(System.nanoTime() + TimeUnit.SECONDS.toNanos(30))
+    private fun budget() = BoundedGmsWait(System.nanoTime() + TimeUnit.SECONDS.toNanos(30), 50)
 }

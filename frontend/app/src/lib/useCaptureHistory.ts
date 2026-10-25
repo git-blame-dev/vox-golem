@@ -21,6 +21,7 @@ export function useCaptureHistory() {
   const [setupMessage, setSetupMessage] = useState<string | null>(null)
   const mounted = useRef(false)
   const lifetime = useRef(0)
+  const selection = useRef(0)
   const requestedPage = useRef(0)
   const pendingPage = useRef<number | null>(null)
   const inFlight = useRef<Promise<void> | null>(null)
@@ -43,7 +44,13 @@ export function useCaptureHistory() {
           nextRecords = [...nextRecords].sort((left, right) => Date.parse(right.createdAtUtc) - Date.parse(left.createdAtUtc))
           setSnapshot(nextSnapshot)
           if (nextSnapshot.playback !== undefined) projectPlayback(nextSnapshot.playback)
-          setRecords(nextRecords)
+          setRecords((previous) => {
+            const knownRecords = new Map(previous.map((record) => [record.captureId, record]))
+            return nextRecords.map((record) => {
+              const known = knownRecords.get(record.captureId)
+              return known !== undefined && known.transcriptVersion > record.transcriptVersion ? known : record
+            })
+          })
           setOffset(nextPage)
           setHasOlder(more)
           setError(nextSnapshot.error ?? nextSnapshot.onboardingError ?? null)
@@ -53,6 +60,7 @@ export function useCaptureHistory() {
             if (previous === null) return null
             const record = nextRecords.find(({ captureId }) => captureId === previous.captureId)
             if (record === undefined) return previous.text !== previous.baselineText || previous.conflicted ? previous : null
+            if (record.transcriptVersion < previous.record.transcriptVersion) return previous
             if (previous.text !== previous.baselineText) return { ...previous, record }
             return { captureId: record.captureId, text: transcript(record), baselineText: transcript(record), version: record.transcriptVersion, conflicted: false, record }
           })
@@ -106,16 +114,37 @@ export function useCaptureHistory() {
   }, [refresh, projectPlayback])
 
   const pageRecord = records.find(({ captureId }) => captureId === correction?.captureId)
-  const selected = pageRecord ?? correction?.record ?? null
+  const selected = correction !== null && (pageRecord === undefined || correction.record.transcriptVersion > pageRecord.transcriptVersion)
+    ? correction.record : pageRecord ?? null
   const offPage = correction !== null && pageRecord === undefined
   const conflict = selected !== null && correction !== null && (correction.conflicted || selected.transcriptVersion !== correction.version)
-  const selectRecord = (record: CaptureRecord): void => setCorrection({ captureId: record.captureId, text: transcript(record), baselineText: transcript(record), version: record.transcriptVersion, conflicted: false, record })
-  const markCorrectionConflict = (captureId: string): void => setCorrection((previous) => previous?.captureId === captureId ? { ...previous, conflicted: true } : previous)
+  const selectRecord = (record: CaptureRecord): void => {
+    selection.current += 1
+    setCorrection({ captureId: record.captureId, text: transcript(record), baselineText: transcript(record), version: record.transcriptVersion, conflicted: false, record })
+  }
+  const correctionRequest = () => {
+    const epoch = lifetime.current
+    const editor = selection.current
+    const captureId = correction?.captureId
+    const version = correction?.version
+    const current = () => mounted.current && epoch === lifetime.current && editor === selection.current
+    return {
+      current,
+      conflict: () => {
+        if (current()) setCorrection((previous) => previous !== null && previous.captureId === captureId && previous.version === version ? { ...previous, conflicted: true } : previous)
+      },
+      accept: (record: CaptureRecord) => {
+        if (!current() || record.captureId !== captureId || version === undefined || record.transcriptVersion !== version + 1) return
+        setRecords((previous) => previous.map((known) => known.captureId === captureId && known.transcriptVersion <= record.transcriptVersion ? record : known))
+        setCorrection((previous) => previous?.captureId === captureId && previous.version === version
+          ? { ...previous, baselineText: transcript(record), version: record.transcriptVersion,
+            record: previous.record.transcriptVersion > record.transcriptVersion ? previous.record : record } : previous)
+      },
+    }
+  }
   const setDraft = (text: string): void => setCorrection((previous) => previous === null ? null : { ...previous, text })
-  const acceptSavedCorrection = (captureId: string, text: string): void => setCorrection((previous) =>
-    previous?.captureId === captureId && previous.text === text ? { ...previous, baselineText: text } : previous)
   return { snapshot, setSnapshot, playback, records, setRecords, offset, hasOlder, selected, selectedId: correction?.captureId ?? null,
-    draft: correction?.text ?? '', draftVersion: correction?.version, conflict, offPage, selectRecord, setDraft, acceptSavedCorrection, markCorrectionConflict,
+    draft: correction?.text ?? '', draftVersion: correction?.version, conflict, offPage, selectRecord, setDraft, correctionRequest,
     error, setError, setupMessage, setSetupMessage, mounted, refresh }
 }
 

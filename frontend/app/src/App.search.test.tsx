@@ -15,7 +15,7 @@ const capabilities = ['custom_provider', 'opencode', 'local_fast', 'local_qualit
 function fixture(deepEnabled = false, webEnabled = true, writeSettings?: () => Promise<void>) {
   const settings = { instant: 'custom-sol-high', deep: 'opencode-sol-high', review: 'custom-sol-high', deep_enabled: deepEnabled, review_enabled: false, prefetch: false, completion: false, web_enabled: webEnabled, speech_network_fallback: false, speech_language: 'en-AU', speech_tts_provider: 'synthetic.tts.engine', speech_tts_voice: 'synthetic-installed-voice' }
   const snapshot = () => ({
-    session_id: '1', runtime_phase: 'sleeping', transcript: [], active_request: null, capabilities,
+    session_id: '1', runtime_phase: 'sleeping', transcript: [], active_request: null, unsaved_result: null, capabilities,
     model_options: ['custom-sol-high', 'custom-luna-none', 'custom-luna-low', 'opencode-sol-high', 'local-fast'].map((id) => ({ id, label: id, available: true, unavailable_reason: null })),
     preferences: { ...settings, response_profile: 'fast', tts_enabled: false, ui_theme: 'dark', ui_text_size: 'medium' },
   })
@@ -35,7 +35,7 @@ function fixture(deepEnabled = false, webEnabled = true, writeSettings?: () => P
       if (command === 'set_assistant_settings') { await writeSettings?.(); Object.assign(settings, (args as { settings: unknown }).settings); return settings }
       if (command === 'submit_prompt') return new Promise((resolve) => {
         const request = args as typeof requests[number]
-        requests.push({ ...request, finish: () => resolve({ request_id: request.requestId, runtime_phase: 'sleeping', outcome: 'cancelled' }) })
+        requests.push({ ...request, finish: () => resolve({ kind: 'cancelled' }) })
       })
       return null
     },

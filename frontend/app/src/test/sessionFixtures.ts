@@ -1,4 +1,5 @@
 /** Synthetic wire fixtures consumed by the production parsers, not parser replicas. */
+export const durableId = (sequence: number | string): string => `00000000-0000-4000-8000-000000000001:${sequence}`
 export function completeCapabilities(overrides: Record<string, string> = {}): Array<Record<string, unknown>> {
   return ['custom_provider', 'opencode', 'local_fast', 'local_quality', 'qwen_prediction', 'wake_word', 'vad', 'parakeet', 'tts', 'deep', 'review']
     .map((id) => ({ id, state: overrides[id] ?? 'available', reason: 'Synthetic fixture', actual_provider: null }))
@@ -16,7 +17,7 @@ export function defaultAssistantSettings(instant: 'local-fast' | 'local-quality'
 }
 
 export function appSnapshot(transcript: readonly Record<string, unknown>[] = [], preferenceOverrides: Record<string, unknown> = {}, snapshotOverrides: Record<string, unknown> = {}): Record<string, unknown> {
-  return { session_id: '1', runtime_phase: 'sleeping', transcript, active_request: null, capabilities: completeCapabilities(),
+  return { session_id: '1', runtime_phase: 'sleeping', transcript, active_request: null, unsaved_result: null, capabilities: completeCapabilities(),
     model_options: [
       ['local-fast', 'Local: Fast'], ['local-quality', 'Local: Quality'],
       ['custom-luna-none', 'Custom: GPT-6 Luna No Reasoning'], ['custom-sol-high', 'Custom: GPT-5.6 Sol High'],
@@ -30,4 +31,9 @@ export function canonicalTurn(userId: string, answerId: string, prompt: string, 
   return { request_id: requestId, execution_id: { session_id: sessionId, generation: answerId },
     user: { id: userId, role: 'user', content: { kind: 'text', text: prompt } },
     answer: { id: answerId, role: 'assistant', content: { kind: contentKind, text: answer } }, final_stage: finalStage }
+}
+
+export function savedOutcome(requestId: string, prompt = 'Synthetic question', answer = 'Synthetic answer', sessionId = '1', generation = '2'): Record<string, unknown> {
+  const turn = canonicalTurn(String(BigInt(generation) - 1n), generation, prompt, answer, requestId, 'text', 'instant', sessionId)
+  return { kind: 'completed', save_disposition: 'saved', turn }
 }

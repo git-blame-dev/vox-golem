@@ -27,6 +27,7 @@ object CaptureErrorCodes {
         "live-stream-failed", "live-queue-overflow", "live-finish-timeout", "live-input-ownership-rejected",
         "export-destination-changed-during-pending-write", "legacy-export-metadata-commit-failed",
         "export-journal-target-changed-requires-review", "transcript-changed-during-export", "inbox-creation-requires-review",
+        "export-journal-invalid", "export-journal-unreadable", "export-cleanup-pending", "pending-inbox-export-requires-review",
         "created-inbox-identity-is-ambiguous", "inbox-changed-after-export-preparation", "pending-inbox-creation-requires-review",
         "inbox-changed-before-write", "saf-permission-revoked-during-write", "saf-permission-revoked", "provider-failure-during-write",
         "provider-failure-before-write", "capture-disappeared", "capture-changed-before-inbox-write",

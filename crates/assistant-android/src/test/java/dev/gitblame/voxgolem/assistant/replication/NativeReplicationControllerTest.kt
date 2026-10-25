@@ -16,6 +16,7 @@ import org.junit.rules.TemporaryFolder
 import org.junit.runner.RunWith
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
+import java.io.EOFException
 import java.io.File
 
 /** Exercises the production controller, SQLite and actual Rust hash/import/reconcile gateway. */
@@ -24,76 +25,6 @@ import java.io.File
 class NativeReplicationControllerTest {
     @get:Rule val directories = TemporaryFolder()
     private val gateway by lazy { DomainGateway(AssistantDomainNative::apply) }
-
-    @Test fun productionCleanupUsesBoundedNativeDescriptorsAndNeverExportsSnapshot() {
-        assumeTrue("Parent supplies the host JNI library", System.getProperty("assistant.native.library") != null)
-        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
-        try { executor.submit {
-            AssistantStore(isolated("synthetic-cleanup-native"), gateway).use { owned ->
-                val native = NativeReplicationStore(owned)
-                var queries = 0
-                var canonicalUnavailable = false
-                var invalidNativeResponse = false
-                val store = object : ReplicationStore by native {
-                    override fun snapshot(): JSONObject = error("Production cleanup exported whole history")
-                    override fun retainedDescriptors(entries: JSONArray, revision: String?): JSONObject {
-                        queries++
-                        check(!canonicalUnavailable) { "Synthetic canonical lookup unavailable" }
-                        val result = native.retainedDescriptors(entries, revision)
-                        return if (invalidNativeResponse) result.put("retained", JSONArray().put("false")) else result
-                    }
-                }
-                val peer = "00000000-0000-4000-8000-000000000002"
-                val record = owned.createConversation("Synthetic cleanup body").getJSONObject("operation").getJSONObject("id")
-                val page = owned.replication(JSONObject().put("kind", "inventory").put("cursor", JSONObject.NULL)) as JSONObject
-                val entry = page.getJSONArray("entries").getJSONObject(0)
-                val mailbox = FakeGmsMailbox(directories.newFolder("synthetic-cleanup-mailbox"))
-                val sdk = mailbox.sdk("synthetic-cleanup-node")
-                val transport = GmsReplicationTransport(sdk,
-                    BoundedGmsWait(System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(30)))
-                val state = MemoryReplicationState().apply { enrolled.add(peer) }
-                fun publish(kind: String, payload: JSONObject) {
-                    transport.publish(ReplicationWire.path(store.replica, peer, kind), ReplicationWire.encode(
-                        ReplicationWire.frame(store.replica, peer, peer, peer, kind, payload)), emptyMap())
-                }
-                fun present(kind: String) = mailbox.slots.values.any { it.uri.lastPathSegment == kind }
-                publish("inventory", JSONObject().put("page", page))
-                publish("hint", JSONObject().put("revision", page.getString("revision")).put("offers", JSONArray().put(entry)))
-                publish("records", JSONObject().put("records", JSONArray().put(JSONObject().put("entry", entry)
-                    .put("asset", "body_0").put("bytes", 2))).put("unavailable", JSONArray()))
-                canonicalUnavailable = true
-                val unavailable = assertThrows(IllegalStateException::class.java) { transport.cleanup(store.replica, store, state) }
-                assertEquals("Synthetic canonical lookup unavailable", unavailable.message)
-                assertEquals(3, mailbox.slots.size)
-                assertTrue(sdk.calls.none { it == "deleteItems" })
-                canonicalUnavailable = false
-                invalidNativeResponse = true
-                assertThrows(IllegalArgumentException::class.java) { transport.cleanup(store.replica, store, state) }
-                assertEquals(3, mailbox.slots.size)
-                assertTrue(sdk.calls.none { it == "deleteItems" })
-                invalidNativeResponse = false
-                queries = 0
-                transport.cleanup(store.replica, store, state)
-                assertEquals(3, queries)
-                assertTrue(present("inventory") && present("hint") && present("records"))
-                val wrongMetadata = JSONObject(entry.toString()).put("tombstone", true)
-                publish("hint", JSONObject().put("offers", JSONArray().put(wrongMetadata)))
-                transport.cleanup(store.replica, store, state)
-                assertFalse(present("hint")); assertTrue(present("records"))
-                owned.createConversation("Synthetic unrelated revision change")
-                transport.cleanup(store.replica, store, state)
-                assertFalse(present("inventory")); assertTrue(present("records"))
-                val tombstone = canonical(JSONObject().put("version", 2).put("id", owned.allocateId()).put("body",
-                    JSONObject().put("kind", "conversation_deleted").put("conversation", record)))
-                owned.importRecords(JSONArray().put(tombstone))
-                transport.cleanup(store.replica, store, state)
-                assertFalse(present("records"))
-                transport.publish(ReplicationWire.path(store.replica, peer, "hint"), "{}".toByteArray(), emptyMap())
-                transport.cleanup(store.replica, store, state)
-                assertFalse(present("hint")) // Malformed frames retain conservative cleanup.
-            }
-        }.get(60, java.util.concurrent.TimeUnit.SECONDS) } finally { executor.shutdownNow() }
-    }
 
     @Test fun paginatedTwoWayNativeHistoryConvergesWithGapsDuplicatesLostAckAndTombstones() {
         assumeTrue("Parent supplies the host JNI library", System.getProperty("assistant.native.library") != null)
@@ -234,29 +165,70 @@ class NativeReplicationControllerTest {
                 left.importRecords(JSONArray(listOf("1", "10", "2").map { sequence -> canonical(JSONObject().put("version", 2)
                     .put("id", id(operationReplica, sequence)).put("body", JSONObject().put("kind", "conversation_created").put("title", "Synthetic lexical page"))) }))
                 val snapshot = left.snapshot()
-                val cursor = JSONObject().put("revision", snapshot.getString("revision")).put("after", id(operationReplica, "10"))
-                val page = JSONObject(gateway.apply(JSONObject().put("kind", "inventory").put("snapshot", snapshot)
-                    .put("request", JSONObject().put("cursor", cursor).put("max_items", 1)).toString())).getJSONObject("value")
-                assertEquals("2", page.getJSONArray("entries").getJSONObject(0).getJSONObject("id").getString("sequence"))
-                val source = NativeReplicationStore(left)
+                val revision = snapshot.getString("revision")
+                val initialCursor = JSONObject().put("revision", revision).put("after", JSONObject.NULL)
+                val page1 = JSONObject(gateway.apply(JSONObject().put("kind", "inventory").put("snapshot", snapshot)
+                    .put("request", JSONObject().put("cursor", initialCursor).put("max_items", 2)).toString())).getJSONObject("value")
+                val cursorAfter10 = page1.getJSONObject("next")
+                assertEquals("10", cursorAfter10.getJSONObject("after").getString("sequence"))
+                val page2 = JSONObject(gateway.apply(JSONObject().put("kind", "inventory").put("snapshot", snapshot)
+                    .put("request", JSONObject().put("cursor", cursorAfter10).put("max_items", 1)).toString())).getJSONObject("value")
+                assertEquals("2", page2.getJSONArray("entries").getJSONObject(0).getJSONObject("id").getString("sequence"))
+
+                val source = object : ReplicationStore by NativeReplicationStore(left) {
+                    override fun nativeRead(request: JSONObject): Any? {
+                        if (request.getString("kind") == "inventory") {
+                            return if (request.isNull("cursor") || request.getJSONObject("cursor").isNull("after")) page1 else page2
+                        }
+                        return NativeReplicationStore(left).nativeRead(request)
+                    }
+                }
                 val target = NativeReplicationStore(right)
-                val state = MemoryReplicationState().apply { enrolled.add(source.replica) }
-                val session = "00000000-0000-4000-8000-000000000010"
-                val token = "00000000-0000-4000-8000-000000000020"
-                val request = ReplicationWire.frame(target.replica, source.replica, session, token, "inventory_request",
-                    JSONObject().put("phase", "records").put("cursor", cursor))
-                state.save(source.replica, JSONObject().put("session", session).put("phase", "records")
-                    .put("revision", snapshot.getString("revision")).put("pages", 0).put("pending", request))
-                val sent = mutableListOf<JSONObject>()
-                val controller = ReplicationController(target, NativeReplicationDomain(gateway), state, object : ReplicationTransport {
-                    override fun reachable() = listOf(PeerNode("synthetic-source-node", "Synthetic lexical source"))
-                    override fun publish(path: String, bytes: ByteArray, assets: Map<String, ByteArray>) { sent.add(JSONObject(String(bytes))) }
-                }, { source.replica })
-                val response = ReplicationWire.frame(source.replica, target.replica, session, token, "inventory", JSONObject().put("page", page))
-                assertTrue(controller.onData("synthetic-source-node", ReplicationWire.path(source.replica, target.replica, "inventory"),
-                    ReplicationWire.encode(response), emptyMap()))
-                val fetch = sent.single { it.getString("kind") == "record_request" }
-                assertEquals("2", fetch.getJSONObject("payload").getJSONArray("entries").getJSONObject(0).getJSONObject("id").getString("sequence"))
+                val sourceState = MemoryReplicationState().apply { enrolled.add(target.replica) }
+                val targetState = MemoryReplicationState().apply { enrolled.add(source.replica) }
+                val requestedSequences = mutableListOf<String>()
+                lateinit var sourceController: ReplicationController
+                val targetController = ReplicationController(
+                    target,
+                    NativeReplicationDomain(gateway),
+                    targetState,
+                    object : ReplicationTransport {
+                        override fun reachable() = listOf(PeerNode("synthetic-source-node", "Synthetic lexical source"))
+                        override fun openSession(nodeId: String, session: String): ReplicationSessionConnection {
+                            val pipe = InMemorySessionPipe(
+                                session = session,
+                                onFrame = { _, frame ->
+                                    if (frame.getString("kind") == "record_request") {
+                                        requestedSequences.addAll(
+                                            frame.getJSONObject("payload").getJSONArray("entries").objects()
+                                                .map { it.getJSONObject("id").getString("sequence") }
+                                        )
+                                    }
+                                },
+                            )
+                            val responderConn = pipe.endpoint("synthetic-source-node", "synthetic-target-node")
+                            val responderThread = Thread {
+                                sourceController.accept(responderConn)
+                            }.apply { isDaemon = true; start() }
+                            return pipe.endpoint("synthetic-target-node", "synthetic-source-node") {
+                                responderThread.join(5_000)
+                            }
+                        }
+                    },
+                    { source.replica },
+                )
+                sourceController = ReplicationController(
+                    source,
+                    NativeReplicationDomain(gateway),
+                    sourceState,
+                    object : ReplicationTransport {
+                        override fun reachable() = listOf(PeerNode("synthetic-target-node", "Synthetic lexical target"))
+                    },
+                    { target.replica },
+                )
+                assertTrue(targetController.connect("synthetic-source-node", source.replica))
+                assertEquals(listOf("1", "10", "2"), requestedSequences)
+                assertEquals(keys(left), keys(right))
             }
         }
     }
@@ -268,11 +240,15 @@ class NativeReplicationControllerTest {
                 val operationReplica = "00000000-0000-4000-8000-000000000001"
                 left.importRecords(JSONArray(listOf("2", "10").map { sequence -> canonical(JSONObject().put("version", 2)
                     .put("id", id(operationReplica, sequence)).put("body", JSONObject().put("kind", "conversation_created").put("title", "Synthetic lexical hint"))) }))
-                val harness = NativeHarness(left, right, gateway)
-                harness.begin(); harness.drain(duplicate = true)
+                val harness = NativeHarness(left, right, gateway, leftRole = AssistantPeerRole.WATCH, rightRole = AssistantPeerRole.PHONE)
+                harness.begin()
+                assertEquals(1, harness.hints.size)
+                assertTrue(harness.hints.single().bytes.size <= ReplicationWire.MAX_HINT_BYTES)
+                harness.drain(duplicate = true)
                 assertTrue(harness.rejections.toString(), harness.rejections.isEmpty())
-                val offers = harness.hintOffers.first { it.length() > 0 }
-                assertEquals(listOf("10", "2"), offers.objects().map { it.getJSONObject("id").getString("sequence") })
+                val inventorySequences = harness.inventoryPages.first { it.length() > 0 }
+                    .objects().map { it.getJSONObject("id").getString("sequence") }
+                assertEquals(listOf("10", "2"), inventorySequences)
                 assertEquals(keys(left), keys(right))
             }
         }
@@ -294,11 +270,19 @@ class NativeReplicationControllerTest {
         .put("instruction_profile_version", "1")
 }
 
-internal class NativeHarness(left: AssistantStore, right: AssistantStore, private val gateway: DomainGateway) {
-    // Every native protocol scenario must use only bounded stateful reads. Legacy
-    // in-memory adapters still exercise the stateless compatibility path elsewhere.
+internal class NativeHarness(
+    left: AssistantStore,
+    right: AssistantStore,
+    private val gateway: DomainGateway,
+    private val leftRole: AssistantPeerRole = AssistantPeerRole.PHONE,
+    private val rightRole: AssistantPeerRole = AssistantPeerRole.WATCH,
+) {
+    // Every native protocol scenario must use only bounded stateful reads and coarse
+    // single-transaction importVerified receipts (never snapshot() or post-import durableReceipts()).
     private fun snapshotFree(store: AssistantStore): ReplicationStore = object : ReplicationStore by NativeReplicationStore(store) {
         override fun snapshot(): JSONObject = error("Production replication crossed whole history")
+        override fun durableReceipts(ids: JSONArray, checkBudget: () -> Unit): JSONArray =
+            error("Production importVerified must return receipts atomically without calling durableReceipts")
     }
     private val leftStore = snapshotFree(left)
     private val rightStore = snapshotFree(right)
@@ -306,49 +290,128 @@ internal class NativeHarness(left: AssistantStore, right: AssistantStore, privat
     val rightReplica = rightStore.replica
     private val leftState = MemoryReplicationState().apply { enrolled.add(rightReplica) }
     private val rightState = MemoryReplicationState().apply { enrolled.add(leftReplica) }
-    private val packets = mutableListOf<PairHarness.Packet>()
+    val hints = mutableListOf<PairHarness.HintPacket>()
     val wireBodyIds = mutableListOf<String>()
-    val hintOffers = mutableListOf<JSONArray>()
+    val inventoryPages = mutableListOf<JSONArray>()
     val rejections = mutableListOf<Exception>()
-    private var leftController = controller(leftStore, leftState)
-    private var rightController = controller(rightStore, rightState)
+    private var dropNextAck = false
+    private var forgeNextRecord = false
+    private var deferSessions = false
+    private var pendingPhoneReconcile = false
+    private var leftController: ReplicationController = controller(leftStore, leftState, leftRole)
+    private var rightController: ReplicationController = controller(rightStore, rightState, rightRole)
     var requestedUnknownAncestor = false
         private set
-    fun restartControllers() { leftController = controller(leftStore, leftState); rightController = controller(rightStore, rightState) }
-    fun begin() { leftController.reconcile(); rightController.reconcile() }
-    private fun controller(store: ReplicationStore, state: MemoryReplicationState) = ReplicationController(store, NativeReplicationDomain(gateway), state,
+
+    fun restartControllers() {
+        leftController = controller(leftStore, leftState, leftRole)
+        rightController = controller(rightStore, rightState, rightRole)
+    }
+
+    fun begin() {
+        deferSessions = true
+        try {
+            leftController.reconcile()
+            rightController.reconcile()
+        } finally {
+            deferSessions = false
+        }
+    }
+
+    private fun controller(
+        store: ReplicationStore,
+        state: MemoryReplicationState,
+        role: AssistantPeerRole,
+    ): ReplicationController = ReplicationController(
+        store,
+        NativeReplicationDomain(gateway),
+        state,
         object : ReplicationTransport {
-            override fun reachable() = listOf(PeerNode(if (store.replica == leftReplica) "synthetic-right-node" else "synthetic-left-node", "Synthetic native peer"))
-            override fun publish(path: String, bytes: ByteArray, assets: Map<String, ByteArray>) {
-                val frame = JSONObject(String(bytes))
-                if (frame.getString("kind") == "hint" && frame.getJSONObject("payload").has("offers"))
-                    hintOffers.add(JSONArray(frame.getJSONObject("payload").getJSONArray("offers").toString()))
-                if (frame.getString("kind") == "record_request" && frame.getJSONObject("payload").getJSONArray("entries").objects().any { it.isNull("body_key") }) requestedUnknownAncestor = true
-                if (frame.getString("kind") == "records") wireBodyIds.addAll(frame.getJSONObject("payload").getJSONArray("records").objects()
-                    .map { ReplicationWire.idKey(it.getJSONObject("entry").getJSONObject("id")) })
-                packets.add(PairHarness.Packet(store.replica, path, bytes, assets))
+            override fun reachable() = listOf(
+                PeerNode(if (store.replica == leftReplica) "synthetic-right-node" else "synthetic-left-node", "Synthetic native peer")
+            )
+            override fun sendHint(nodeId: String, sender: String, target: String) {
+                val senderNode = if (store.replica == leftReplica) "synthetic-left-node" else "synthetic-right-node"
+                hints.add(PairHarness.HintPacket(senderNode, nodeId, ReplicationWire.encodeHint(sender, target)))
             }
-        }, { node -> when (node) { "synthetic-left-node" -> leftReplica; "synthetic-right-node" -> rightReplica; else -> null } }, onRejected = rejections::add)
+            override fun openSession(nodeId: String, session: String): ReplicationSessionConnection {
+                if (deferSessions) {
+                    pendingPhoneReconcile = true
+                    throw EOFException("Deferred to drain")
+                }
+                val senderNode = if (store.replica == leftReplica) "synthetic-left-node" else "synthetic-right-node"
+                val responder: ReplicationController = if (nodeId == "synthetic-left-node") leftController else rightController
+                val pipe = InMemorySessionPipe(
+                    session = session,
+                    onFrame = { _, frame ->
+                        when (frame.getString("kind")) {
+                            "inventory" -> {
+                                val entries = frame.getJSONObject("payload").getJSONObject("page").getJSONArray("entries")
+                                if (entries.length() > 0) inventoryPages.add(JSONArray(entries.toString()))
+                            }
+                            "record_request" -> {
+                                if (frame.getJSONObject("payload").getJSONArray("entries").objects().any { it.isNull("body_key") }) {
+                                    requestedUnknownAncestor = true
+                                }
+                            }
+                            "records" -> {
+                                wireBodyIds.addAll(
+                                    frame.getJSONObject("payload").getJSONArray("records").objects()
+                                        .map { ReplicationWire.idKey(it.getJSONObject("entry").getJSONObject("id")) }
+                                )
+                            }
+                            "ack" -> {
+                                if (dropNextAck) {
+                                    dropNextAck = false
+                                    throw EOFException("Synthetic lost ack")
+                                }
+                            }
+                        }
+                    },
+                    transformChunk = { _, chunk ->
+                        if (forgeNextRecord) {
+                            forgeNextRecord = false
+                            val original = JSONObject(String(chunk, Charsets.UTF_8))
+                            val altered = JSONObject(original.toString())
+                            val originalTitle = original.getJSONObject("operation").getJSONObject("body").getString("title")
+                            altered.getJSONObject("operation").getJSONObject("body").put("title", "x".repeat(originalTitle.length))
+                            altered.toString().toByteArray(Charsets.UTF_8)
+                        } else {
+                            chunk
+                        }
+                    },
+                )
+                val responderConn = pipe.endpoint(nodeId, senderNode)
+                val responderThread = Thread {
+                    responder.accept(responderConn)
+                }.apply { isDaemon = true; start() }
+                return pipe.endpoint(senderNode, nodeId) {
+                    responderThread.join(5_000)
+                }
+            }
+        },
+        { node -> when (node) { "synthetic-left-node" -> leftReplica; "synthetic-right-node" -> rightReplica; else -> null } },
+        onRejected = { error -> if (!deferSessions) rejections.add(error) },
+        role = role,
+    )
+
     fun drain(dropFirstAck: Boolean = false, duplicate: Boolean = false, forgeFirstRecord: Boolean = false) {
-        var dropped = !dropFirstAck
-        var forged = !forgeFirstRecord
-        var count = 0
-        while (packets.isNotEmpty()) {
-            check(count++ < 10_000) { "Native replication did not settle" }
-            val packet = packets.removeAt(0)
-            if (!dropped && JSONObject(String(packet.bytes)).getString("kind") == "ack") { dropped = true; continue }
-            val controller = if (packet.sender == leftReplica) rightController else leftController
-            val node = if (packet.sender == leftReplica) "synthetic-left-node" else "synthetic-right-node"
-            val assets = if (!forged && JSONObject(String(packet.bytes)).getString("kind") == "records" && packet.assets.isNotEmpty()) {
-                forged = true
-                val altered = JSONObject(String(packet.assets.getValue("body_0")))
-                // Keep encoded byte length consistent so only Rust's canonical hash rejects it.
-                val originalTitle = JSONObject(String(packet.assets.getValue("body_0"))).getJSONObject("operation").getJSONObject("body").getString("title")
-                altered.getJSONObject("operation").getJSONObject("body").put("title", "x".repeat(originalTitle.length))
-                packet.assets + ("body_0" to altered.toString().toByteArray())
-            } else packet.assets
-            controller.onData(node, packet.path, packet.bytes, assets)
-            if (duplicate) controller.onData(node, packet.path, packet.bytes, assets)
+        dropNextAck = dropFirstAck
+        forgeNextRecord = forgeFirstRecord
+        val runPhoneReconcile = pendingPhoneReconcile
+        pendingPhoneReconcile = false
+        val hadHints = hints.isNotEmpty()
+        while (hints.isNotEmpty()) {
+            val hint = hints.removeAt(0)
+            val target: ReplicationController = if (hint.targetNode == "synthetic-left-node") leftController else rightController
+            target.onHint(hint.senderNode, hint.bytes)
+            if (duplicate && !dropFirstAck && !forgeFirstRecord) {
+                target.onHint(hint.senderNode, hint.bytes)
+            }
+        }
+        if (!hadHints && runPhoneReconcile && !dropFirstAck && !forgeFirstRecord) {
+            if (leftRole == AssistantPeerRole.PHONE) leftController.reconcile()
+            if (rightRole == AssistantPeerRole.PHONE) rightController.reconcile()
         }
     }
 }

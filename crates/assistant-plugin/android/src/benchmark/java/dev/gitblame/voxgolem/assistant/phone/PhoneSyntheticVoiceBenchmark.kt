@@ -283,7 +283,7 @@ object PhoneSyntheticVoiceBenchmark {
 
         fun prepare() {
             check(!::preparedBackend.isInitialized)
-            PhonePreferences(context).write(PhonePreferences.defaults().put("instant", "custom-luna-none").put("tts_enabled", !diagnostic))
+            PhonePreferences(context).apply { initialize() }.write(PhonePreferences.defaults().put("instant", "custom-luna-none").put("tts_enabled", !diagnostic))
             preparedBackend = EnginePhoneBackend(context, handle.engine, prewarm = {}, enginePrewarm = {}, reconcile = {}, commandAdmission = { name ->
                 check(name in setOf("get_app_snapshot", "save_assistant_draft", "cancel_prompt"))
             })

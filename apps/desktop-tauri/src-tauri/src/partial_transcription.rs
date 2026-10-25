@@ -26,18 +26,24 @@ pub struct PartialTranscriptionConfig {
     pub maximum_copied_samples: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Snapshot {
     session_id: VoiceSessionId,
     revision: u64,
     samples: Vec<f32>,
 }
 
+#[derive(Debug)]
+struct InFlight {
+    session_id: VoiceSessionId,
+    revision: u64,
+}
+
 pub struct PartialTranscriptionScheduler {
     config: PartialTranscriptionConfig,
     session_id: Option<VoiceSessionId>,
     next_revision: u64,
-    in_flight: Option<Snapshot>,
+    in_flight: Option<InFlight>,
     pending: Option<Snapshot>,
     pending_updated_ms: Option<u64>,
     last_started_ms: Option<u64>,
@@ -151,12 +157,11 @@ impl PartialTranscriptionScheduler {
             revision,
             text,
         };
-        if let Some(pending) = self.pending.as_ref() {
+        if self.pending.is_some() {
             if now_ms.saturating_sub(self.last_started_ms.unwrap_or(0))
                 >= self.config.throttle.as_millis() as u64
             {
-                let pending = pending.clone();
-                self.pending.take();
+                let pending = self.pending.take().expect("pending snapshot exists");
                 self.pending_updated_ms = None;
                 let action = self.start(pending, now_ms);
                 return match action {
@@ -174,9 +179,12 @@ impl PartialTranscriptionScheduler {
         let action = PartialTranscriptionAction::StartSnapshot {
             session_id: snapshot.session_id,
             revision: snapshot.revision,
-            samples: snapshot.samples.clone(),
+            samples: snapshot.samples,
         };
-        self.in_flight = Some(snapshot);
+        self.in_flight = Some(InFlight {
+            session_id: snapshot.session_id,
+            revision: snapshot.revision,
+        });
         self.pending_updated_ms = None;
         self.last_started_ms = Some(now_ms);
         action
@@ -193,6 +201,53 @@ mod tests {
             throttle: Duration::from_millis(100),
             maximum_copied_samples: 4,
         })
+    }
+
+    #[test]
+    fn direct_start_transfers_sample_allocation() {
+        let mut s = scheduler();
+        let samples = vec![1., 2., 3.];
+        let allocation = samples.as_ptr();
+        let action = s.start(
+            Snapshot {
+                session_id: 1,
+                revision: 1,
+                samples,
+            },
+            0,
+        );
+        let PartialTranscriptionAction::StartSnapshot { samples, .. } = action else {
+            panic!("expected snapshot start");
+        };
+        assert_eq!(samples.as_ptr(), allocation);
+        assert_eq!(samples, vec![1., 2., 3.]);
+    }
+
+    #[test]
+    fn pending_completion_transfers_sample_allocation() {
+        let mut s = scheduler();
+        s.start_session(1);
+        let _ = s.request_snapshot(0, &[1., 2., 3.]);
+        let _ = s.request_snapshot(10, &[4., 5., 6.]);
+        // Spare capacity distinguishes a transfer even if the allocator reuses
+        // the original address after an intermediate clone is dropped.
+        s.pending.as_mut().unwrap().samples.reserve_exact(64);
+        let allocation = s.pending.as_ref().unwrap().samples.as_ptr();
+        let capacity = s.pending.as_ref().unwrap().samples.capacity();
+        let action = s.complete(100, 1, 1, "old".into());
+        let PartialTranscriptionAction::StartSnapshot {
+            session_id,
+            revision,
+            samples,
+        } = action
+        else {
+            panic!("expected pending snapshot start");
+        };
+        assert_eq!(samples.as_ptr(), allocation);
+        assert_eq!(samples.capacity(), capacity);
+        assert_eq!((session_id, revision), (1, 2));
+        assert_eq!(samples, vec![4., 5., 6.]);
+        assert!(s.pending.is_none());
     }
 
     #[test]

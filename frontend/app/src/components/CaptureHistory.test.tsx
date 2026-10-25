@@ -27,10 +27,68 @@ afterEach(() => {
 beforeEach(() => {
   captureMocks.listenCapturePlayback.mockRejectedValue(new Error('Synthetic unavailable listener'))
   captureMocks.stopCapturePlayback.mockResolvedValue(undefined)
-  captureMocks.updateCaptureTranscript.mockResolvedValue(undefined)
+  captureMocks.updateCaptureTranscript.mockImplementation(async (captureId: string, text: string, version: number) =>
+    ({ ...capture(), captureId, finalText: text, previewText: text, transcriptVersion: version + 1 }))
 })
 
 describe('CaptureHistory', () => {
+  it.each(['own', 'stale', 'external', 'external-before', 'reselect', 'unmount', 'reject', 'wrong-capture', 'wrong-version'])('fences a deferred correction acknowledgement: %s', async (outcome) => {
+    const initial = { ...capture(), finalText: 'Synthetic A', transcriptVersion: 4 }
+    const saved = { ...initial, finalText: 'Synthetic B', previewText: 'Synthetic B', transcriptVersion: 5 }
+    const snapshot = (record: CaptureRecord) => ({ available: true, notesFolderUri: null,
+      captures: [record, { ...initial, captureId: 'synthetic-other-capture' }], error: null })
+    captureMocks.loadCaptureSnapshot.mockResolvedValue(snapshot(initial))
+    let resolve!: (record: CaptureRecord) => void
+    let reject!: (error: Error) => void
+    captureMocks.updateCaptureTranscript.mockImplementationOnce(() => new Promise((yes, no) => { resolve = yes; reject = no }))
+    await mount()
+    const select = () => container!.querySelector<HTMLButtonElement>('.capture-history__record')!.click()
+    const button = (label: string) => Array.from(container!.querySelectorAll('button')).find((item) => item.textContent === label)!
+    const edit = (text: string) => {
+      const editor = container!.querySelector<HTMLTextAreaElement>('textarea')!
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(editor, text)
+      editor.dispatchEvent(new Event('input', { bubbles: true }))
+    }
+    await act(async () => { select(); })
+    await act(async () => { edit('Synthetic B') })
+    await act(async () => { button('Save correction').click() })
+    await act(async () => { edit('Synthetic C') })
+    if (outcome === 'reselect') {
+      await act(async () => { container!.querySelectorAll<HTMLButtonElement>('.capture-history__record')[1]!.click() })
+      await act(async () => { select() })
+      await act(async () => { edit('Synthetic B') })
+    }
+    if (outcome === 'unmount') { act(() => root!.unmount()); root = null }
+    const external = outcome === 'external' || outcome === 'external-before'
+    const unacknowledged = outcome === 'reject' || outcome === 'wrong-capture' || outcome === 'wrong-version'
+    const refreshed = external ? { ...saved, finalText: 'Synthetic D', transcriptVersion: 6 }
+      : outcome === 'stale' || unacknowledged ? initial : saved
+    captureMocks.loadCaptureSnapshot.mockResolvedValue(snapshot(refreshed))
+    if (outcome === 'external-before') await act(async () => { window.dispatchEvent(new Event('focus')) })
+    const calls = captureMocks.loadCaptureSnapshot.mock.calls.length
+    await act(async () => {
+      if (outcome === 'reject') reject(new Error('Synthetic save failed'))
+      else resolve(outcome === 'wrong-capture' ? { ...saved, captureId: 'synthetic-other-capture' }
+        : outcome === 'wrong-version' ? { ...saved, transcriptVersion: 6 } : saved)
+    })
+    if (outcome === 'unmount') {
+      expect(captureMocks.loadCaptureSnapshot).toHaveBeenCalledTimes(calls)
+      return
+    }
+    if (outcome === 'reselect') {
+      expect(container!.querySelector<HTMLTextAreaElement>('textarea')!.value).toBe('Synthetic B')
+      expect(container!.textContent).toContain('Transcript changed while you were editing')
+      expect(button('Save correction').disabled).toBe(true)
+      return
+    }
+    expect(container!.querySelector<HTMLTextAreaElement>('textarea')!.value).toBe('Synthetic C')
+    expect(container!.textContent!.includes('Transcript changed while you were editing')).toBe(external)
+    if (external) { expect(button('Save correction').disabled).toBe(true); return }
+    if (outcome === 'reject') expect(container!.textContent).toContain('Synthetic save failed')
+    captureMocks.updateCaptureTranscript.mockResolvedValueOnce({ ...saved, finalText: 'Synthetic C', transcriptVersion: 6 })
+    await act(async () => { button('Save correction').click() })
+    expect(captureMocks.updateCaptureTranscript).toHaveBeenLastCalledWith(initial.captureId, 'Synthetic C', unacknowledged ? 4 : 5)
+  })
   it('projects preparation and terminals from native revisions, not play acknowledgement', async () => {
     const record = capture()
     let changed!: (value: CapturePlayback) => void
@@ -277,6 +335,7 @@ describe('CaptureHistory', () => {
 
   it('updates an already-exported history transcript without implying inbox rewrite', async () => {
     const archived = { ...capture(), recognitionState: 'FINAL', finalText: 'Original task', orgState: 'EXPORTED' }
+    captureMocks.updateCaptureTranscript.mockResolvedValueOnce({ ...archived, finalText: 'Corrected task', previewText: 'Corrected task', transcriptVersion: archived.transcriptVersion + 1 })
     captureMocks.loadCaptureSnapshot.mockResolvedValue({ available: true, notesFolderUri: 'content://synthetic/tree', captures: [archived], error: null })
     captureMocks.listCaptures.mockResolvedValue([])
     await mount()

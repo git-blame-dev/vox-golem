@@ -10,6 +10,10 @@ vi.hoisted(() => { vi.stubEnv('VITE_VOXGOLEM_RUNTIME', 'android') })
 
 import App from './App'
 import { SessionAuthority } from './SessionAuthority'
+import { sessionAuthority } from './SessionAuthority'
+import { FrontendSession } from './FrontendSession'
+import { parseUnsavedResult } from './lib/appSnapshot'
+import { durableId } from './test/sessionFixtures'
 import { getCachedAndroidPreferences, setCachedAndroidPreferences } from './lib/tauri'
 
 let root: Root | null = null
@@ -28,6 +32,26 @@ afterEach(() => {
 })
 
 describe('Android App lifecycle', () => {
+  it('blocks automatic voice-shortcut fresh-context preparation while unsaved output exists without invoking discard or generic reset', async () => {
+    const invoke = vi.fn(async (command: string) => command === 'get_app_snapshot' ? appSnapshot() : null)
+    window.__TAURI_INTERNALS__ = { invoke }
+    const session = new FrontendSession()
+    container = document.createElement('div'); document.body.append(container); root = createRoot(container)
+    await act(async () => { root?.render(<App session={session} />) })
+    const authority = sessionAuthority(session)
+    const unsaved = parseUnsavedResult({ request_id: 'synthetic-unsaved', execution_id: { session_id: durableId(1), generation: durableId(20) }, prompt: 'Synthetic pending prompt', answer: { kind: 'text', text: 'Synthetic retained output' }, sources: [], final_stage: 'instant', reason: 'storage_error' })
+    // Model an unresolved native projection at the automatic shortcut boundary;
+    // current phone producers ordinarily report null here.
+    await act(async () => {
+      authority.fieldState('unsavedResult')[1](unsaved)
+      authority.fieldState('composerValue')[1]('Synthetic shortcut draft')
+      authority.selection.shortcutDraft.current = { oldDraft: 'Synthetic previous draft', oldSession: '1', revision: authority.selection.composerRevision.current, needsNew: true, prepare: null }
+      container!.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    })
+    expect(invoke.mock.calls.some(([command]) => command === 'reset_session' || command === 'discard_unsaved_and_new_chat' || command === 'submit_prompt')).toBe(false)
+    expect(authority.fieldRef('unsavedResult').current).toBe(unsaved)
+    expect(authority.fieldRef('composerValue').current).toBe('Synthetic shortcut draft')
+  })
   it.each([false, true])('warns only for supported startup failures and clears recovered notices (provider failed: %s)', async (failedInitially) => {
     vi.useFakeTimers()
     let failed = failedInitially
@@ -484,7 +508,7 @@ describe('Android App lifecycle', () => {
     expect(logo.getAttribute('data-busy')).toBe('true')
     await act(async () => {
       if (outcome === 'error') fail({ code: 'internal', message: 'Synthetic generation failed' })
-      else if (outcome === 'completed') { turn = canonicalTurn('2', '3', 'Synthetic pending question', 'Synthetic saved answer', requestId); finish({ kind: 'completed', turn }) }
+      else if (outcome === 'completed') { turn = canonicalTurn('2', '3', 'Synthetic pending question', 'Synthetic saved answer', requestId); finish({ kind: 'completed', save_disposition: 'saved', turn }) }
       else finish({ kind: 'cancelled' })
     })
     expect(logo.getAttribute('data-busy')).toBe('false')
@@ -509,7 +533,7 @@ describe('Android App lifecycle', () => {
             Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set?.call(composer, 'Synthetic newer draft')
             composer.dispatchEvent(new Event('input', { bubbles: true }))
           }
-          return { kind: mode === 'refused' ? 'refused' : 'completed', turn,
+          return { kind: mode === 'refused' ? 'refused' : 'completed', save_disposition: 'saved', turn,
             ...(mode === 'missing' ? {} : { app_snapshot: mode === 'poisoned' ? { transcript: 'invalid' } : mode === 'executing' ? { ...snapshot(), runtime_phase: 'executing' } : snapshot() }) }
         }
         return null
@@ -599,7 +623,7 @@ describe('Android App lifecycle', () => {
       resultReleased = true
       if (race === 'lost-result') fail(new Error('Synthetic result transport lost after commit'))
       else if (race === 'cancelled') finish({ kind: 'cancelled', app_snapshot: captured })
-      else finish({ kind: 'completed', turn, ...(race === 'bounded-retry' ? {} : { app_snapshot: captured }) })
+      else finish({ kind: 'completed', save_disposition: 'saved', turn, ...(race === 'bounded-retry' ? {} : { app_snapshot: captured }) })
       if (race === 'bounded-retry') await vi.advanceTimersByTimeAsync(1000)
     })
     const rpcMarkers = timingLog.mock.calls.filter(([label, value]) => label === '[frontend-timing]' && typeof value === 'string' && JSON.parse(value)['stage'] === 'TERMINAL_SNAPSHOT_RPC_REQUESTED')
@@ -1710,7 +1734,7 @@ describe('Android App lifecycle', () => {
 
     const turn = canonicalTurn('2', '3', 'First prompt', 'First answer', requestId)
     await act(async () => {
-      finishPrompt({ kind: 'completed', turn })
+      finishPrompt({ kind: 'completed', save_disposition: 'saved', turn })
       await Promise.resolve()
       await Promise.resolve()
       await Promise.resolve()
@@ -1786,7 +1810,7 @@ describe('Android App lifecycle', () => {
 
     const turn = canonicalTurn('4', '5', 'Fallback prompt', 'Fallback answer', requestId)
     await act(async () => {
-      finishPrompt({ kind: 'completed', turn })
+      finishPrompt({ kind: 'completed', save_disposition: 'saved', turn })
       await Promise.resolve()
       await vi.advanceTimersByTimeAsync(750)
     })
@@ -1822,6 +1846,7 @@ function capabilities(): Array<Record<string, unknown>> {
 function appSnapshot(transcript: readonly Record<string, unknown>[] = []): Record<string, unknown> {
   return {
     session_id: '1',
+    unsaved_result: null,
     runtime_phase: 'sleeping',
     transcript,
     active_request: null,

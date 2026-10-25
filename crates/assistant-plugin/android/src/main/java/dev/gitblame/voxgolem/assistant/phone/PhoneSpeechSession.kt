@@ -35,6 +35,7 @@ import java.util.Locale
 import java.util.UUID
 
 internal interface PhoneSpeechBackend {
+    fun preferencesReady(): Boolean = true
     fun busy(): Boolean
     fun saveSpeechDraft(text: String)
     fun speechConversation(): String? = null
@@ -72,6 +73,7 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
         suppliedOutput: LocalSpeechOutput = LocalSpeechOutput.configured(context) { speechAdmission(backend.nativePreferences()) },
         beginFlow: () -> dev.gitblame.voxgolem.assistant.AssistantTiming? = { null }) : this(context, object : PhoneSpeechBackend {
         override fun busy() = backend.busy()
+        override fun preferencesReady() = backend.preferencesReady()
         override fun saveSpeechDraft(text: String) = backend.saveSpeechDraft(text)
         override fun speechConversation() = backend.speechConversation()
         override fun speechHead() = backend.speechHead()
@@ -138,6 +140,13 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
     private var sessionHead: String? = null
     private var publishedOptions: SpeechOptions? = null
     private var inventoryAdmission: SpeechAdmission? = null
+    private var initialPreferencesApplied = false
+    private fun applyInitialPreferences() {
+        if (!closed && !initialPreferencesApplied && backend.preferencesReady()) {
+            initialPreferencesApplied = true
+            output.setEnabled(backend.nativePreferences().getBoolean("tts_enabled"))
+        }
+    }
     private val language = Locale.getDefault().toLanguageTag()
     private var inputAudio: RecordedAudioResult? = null
     private val loop = ConversationLoopController(dictation, output, object : EnginePort {
@@ -204,6 +213,7 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
                 // Engine publications may arrive on its actor; voice consent
                 // and session fields are inspected only on their main owner.
                 main.post {
+                    applyInitialPreferences()
                     synchronized(replyLock) {
                         if (!closed && waitingInputContextChanged()) stop()
                     }
@@ -233,10 +243,18 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
 
     init {
         backend.onPreferencesChanged = preferenceObserver
-        output.setEnabled(backend.nativePreferences().getBoolean("tts_enabled"))
+        applyInitialPreferences()
     }
 
     fun status(): JSONObject {
+        if (!backend.preferencesReady()) return JSONObject().put("kind", "voice_status")
+            .put("available", false).put("ttsAvailable", false).put("ttsEnabled", false)
+            .put("inputForeground", visible).put("readyForSpeech", false)
+            .put("speechNetworkFallback", false).put("reason", "Assistant preferences are not ready")
+            .put("mode", mode).put("dictation", dictation.snapshot().phase.name.lowercase())
+            .put("loop", loop.snapshot().phase.name.lowercase()).put("ttsPhase", output.snapshot().phase.name.lowercase())
+            .put("error", JSONObject.NULL)
+            .put("speechOptions", SpeechOptions().json())
         val admissionReady = AssistantRuntime.captureResourceAdmissionReady()
         val available = admissionReady && runCatching { dictation.serviceAvailable() }.getOrDefault(false)
         val missingSpeech = SpeechServiceRequirement.isMissing(context)
@@ -300,6 +318,12 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
         recognitionSupportedLanguages = dictation.options().recognitionSupportedLanguages,
         localOnlyRecognitionAvailable = dictation.localOnlyServiceAvailable())
     private fun publishStatus() {
+        if (!backend.preferencesReady()) {
+            val value = status()
+            backend.speechStatus = value
+            if (sessionId != null) emit(JSONObject(value.toString()))
+            return
+        }
         val choices = options()
         if (choices != publishedOptions) { publishedOptions = choices; backend.publishSpeechOptions(choices) }
         val value = status()
@@ -314,7 +338,7 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
     // not an SDK: disabled output still disposes its session after publishing inventory.
     // The key is scoped to a visible interval, not proof that platform voice data stays fresh.
     private fun prepareInventory(preparePlayback: Boolean = false) {
-        if (closed || !visible || backend.busy() || active() ||
+        if (closed || !visible || !backend.preferencesReady() || backend.busy() || active() ||
             !AssistantRuntime.captureResourceAdmissionReady() ||
             RecognitionResourceLease.process.current() != null) return
         val admission = speechAdmission(backend.nativePreferences())
