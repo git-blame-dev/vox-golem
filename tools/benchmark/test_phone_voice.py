@@ -234,6 +234,7 @@ class PhoneTest(unittest.TestCase):
             'crates/assistant-plugin/android/src/main/java/PhoneActivityBindings.kt',
             'crates/assistant-plugin/android/src/benchmark/java/PhoneSyntheticVoiceBenchmark.kt',
             'crates/assistant-plugin/android/build.gradle.kts',
+            'crates/assistant-plugin/android/benchmark-rules.pro',
             'apps/android-tauri/src-tauri/gen/android/app/build.gradle.kts',
             'apps/android-tauri/src-tauri/gen/android/app/src/main/java/MainActivity.kt',
             'apps/android-tauri/src-tauri/gen/android/app/src/main/AndroidManifest.xml',
@@ -258,6 +259,24 @@ class PhoneTest(unittest.TestCase):
             legacy = wear_voice.harness_digest('synthetic-seed', root)
             transport.write_bytes(b'synthetic-v2')
             self.assertNotEqual(legacy, wear_voice.harness_digest('synthetic-seed', root))
+
+    def test_phone_benchmark_proguard_rules_keep_all_reflected_facade_methods(self):
+        rules = (benchmark.ROOT / 'crates/assistant-plugin/android/benchmark-rules.pro').read_text(encoding='utf-8')
+        runner = (benchmark.ROOT /
+            'apps/wear/voice-benchmark/src/main/java/dev/gitblame/voxgolem/android/speechtest/PhoneSyntheticVoiceInstrumentation.java'
+        ).read_text(encoding='utf-8')
+        self.assertIn('getMethod("reserveProcess", Instrumentation.class, String.class)', runner)
+        for signature in (
+            'public static void reserveProcess(android.app.Instrumentation);',
+            'public static void reserveProcess(android.app.Instrumentation, java.lang.String);',
+            'public static android.os.Bundle install(android.app.Instrumentation, android.os.Bundle);',
+            'public static android.os.Bundle prepareTrial(android.app.Instrumentation);',
+            'public static android.os.Bundle status(android.app.Instrumentation);',
+            'public static android.os.Bundle close(android.app.Instrumentation);',
+            'public static android.os.Bundle cleanup(android.app.Instrumentation, android.os.Bundle);',
+        ):
+            with self.subTest(signature=signature):
+                self.assertIn(signature, rules)
 
     def test_version_hash_duplicate_order_and_counters(self):
         for raw in (output().replace(b'INSTRUMENTATION_RESULT: synthetic_protocol=2', b'INSTRUMENTATION_RESULT: synthetic_protocol=1'),

@@ -177,7 +177,8 @@ def harness_digest(seed, root, *, phone=False):
                           'apps/android-tauri/voice-benchmark',
                           'apps/android-tauri/src-tauri/gen/android/voice-benchmark',
                           'crates/assistant-plugin/android', 'tools/benchmark/android'):
-            for name in ('build.gradle', 'build.gradle.kts', 'settings.gradle', 'settings.gradle.kts'):
+            for name in ('build.gradle', 'build.gradle.kts', 'settings.gradle',
+                         'settings.gradle.kts', 'benchmark-rules.pro'):
                 files.add(root / directory / name)
     source_roots.append(root / 'crates/voice-android/src/main')
     for directory in source_roots:
