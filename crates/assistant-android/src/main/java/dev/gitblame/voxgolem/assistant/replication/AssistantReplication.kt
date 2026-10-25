@@ -91,10 +91,11 @@ object AssistantReplication {
         channel.nodeId.isNotEmpty() && ReplicationWire.validSessionPath(channel.path)
 
     fun onChannelOpened(context: Context, channel: ChannelClient.Channel) {
-        if (!ReplicationWire.validSessionPath(channel.path)) return
+        if (!channel.path.startsWith(ReplicationWire.SESSION_PREFIX)) return
         if (!acceptsChannel(channel)) {
+            owner?.let { runCatching { it.transport().closeChannel(channel) } }
+                ?: runCatching { Wearable.getChannelClient(context.applicationContext).close(channel) }
             status = AssistantReplicationStatus.REJECTED
-            runCatching { Wearable.getChannelClient(context.applicationContext).close(channel) }
             return
         }
         val current = resolve(context)

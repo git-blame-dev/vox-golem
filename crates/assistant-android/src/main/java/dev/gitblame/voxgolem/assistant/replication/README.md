@@ -27,7 +27,7 @@ confirmation checkbox or manual enrollment is required.
 - The replication database migration clears legacy setup metadata, including pending
   invitations. It does not erase conversation history, drafts, credentials, backups or
   upstream access sources. Reassociation replaces bookkeeping, not personal content.
-- History epoch 2 resets conversation sessions/retries, not current trusted bindings or
+- History epoch 2 resets conversation retries, not current trusted bindings or
   setup metadata. Its one-time conversation-database reset drops only owned history tables,
   preserving the replica UUID/counter and leaving credential/settings/capture storage alone.
   Legacy history bodies are discarded, never migrated or rehashed.
@@ -38,10 +38,11 @@ confirmation checkbox or manual enrollment is required.
   `AssistantReplication.start` before framework services need it. It does not configure
   credential bindings, call `AssistantRuntime.get`, create a provider engine or start generation.
   A custom shell Application must preserve those shared owners and startup hooks.
-- Startup, foreground resume, SDK identity/capability/peer events and bounded jobs drive
-  setup and reconciliation. Call `AssistantReplication.reconcileNow(context)` on resume
-  and after settled local mutations. Identity events are hints: capability and exact
-  host-scoped identity are queried again rather than trusting event metadata.
+- Startup, foreground resume, SDK identity/capability/peer events, coalesced reconcile
+  hints, connected session channels and bounded jobs drive setup and reconciliation. Call
+  `AssistantReplication.reconcileNow(context)` on resume and after settled local mutations.
+  Identity events are hints: capability and exact host-scoped identity are queried again
+  rather than trusting event metadata.
 - Setup and reconciliation remain native lifecycle work, not credential-settings polling.
   No sync callback imports access or starts provider/microphone work. Marshal native
   presentation callbacks to the UI thread.
@@ -53,11 +54,14 @@ confirmation checkbox or manual enrollment is required.
 ## Build and source ownership
 
 The common [manifest](../../../../../../AndroidManifest.xml) owns the Application,
-DataItem/capability listener and persisted replication jobs.
+GMS listener (`DATA_CHANGED` for `/voxgolem/assistant/v1/`, `MESSAGE_RECEIVED` for
+`/voxgolem/chatgpt-access/v1/` and `/voxgolem/assistant/v2/reconcile-hint`, `CHANNEL_EVENT`
+for `/voxgolem/assistant/v2/phone-relay/` and `/voxgolem/assistant/v2/session/`, and
+`CAPABILITY_CHANGED`) and persisted replication jobs.
 `RECEIVE_BOOT_COMPLETED` supports persisted JobScheduler work; no custom boot receiver or
 invented `PEER_CONNECTED` manifest action is needed. Credential `/transfer` and `/ack`
 Message handlers are removed; credentials never enter the conversation queue,
-database, DataItems, Assets or setup metadata.
+database, setup metadata or conversation replication sessions.
 
 The shared library uses the already pinned Wearable 19.0.0 APIs. Each shell's effective
 `android_wear_capabilities` resource array must contain `voxgolem_assistant_v1` while
@@ -65,61 +69,99 @@ preserving its capture/input entries. Shell/common Gradle integration owns ABI s
 JNI packaging and shrink rules. Source types and the merged manifest are authoritative;
 do not maintain a second wire schema or copied registration block here.
 
-## Wire, durability and bounds
+## Transport split, session ownership, framing and canonical SQLite authority
 
-- One public metadata-only `/voxgolem/assistant/v1/identity` Hello carries v3 setup identity.
-   Conversation operations, inventory, receipts and history envelopes use schema 2 in a
-   separate v2 namespace. Old queued history cannot repopulate the reset graph; identity
-   and pairing retain their independent protocol. Old `/pair/request` and `/pair/ack` invitation slots no longer
-  enroll a peer. No credential envelope or user content is staged in identity metadata.
-- Eight fixed slots per enrolled peer live at
-  `/voxgolem/assistant/v2/<sender-replica>/<target-replica>/<kind>`: `hint`,
-  `inventory_request`, `inventory`, `record_request`, `records`, `ack`, `ack_confirmed`,
-  `restart`. Envelope sender/target/session/token and SDK URI/source must agree.
-- A revision-pinned inventory walk commits **all pages' tombstones first**, then walks body
-  pages at that same sender revision. Revision changes restart the finite session.
-- Offers originate from Store publications but filter the current quarantine ledger even
-  when an old outbox index still has a payload. Rust inventory omits quarantined bodies;
-  explicit body-serving and staged-item cleanup independently exclude them. Exact receipts
-  for committed quarantined evidence remain valid, but that evidence cannot form context.
-- Newly discovered missing ancestors are requested after imports as well as on inventory
-  pages. A session attempts at most 128 distinct unknown ancestors, preventing unavailable
-  or poisoned dependencies from creating a hot request loop.
-- Assets carry records; the control page carries exact ID/body/conversation/tombstone and
-  byte declarations. Import recomputes canonical body hashes through Rust. Store commit and
-  durable receipt retrieval precede ACK; the peer commits exact ACK state before confirming.
-  ACK confirmation includes reciprocal exact receipts derived from the confirming Store's
-  committed snapshot; this acknowledges relayed publications without guessing that a record
-  or SDK submission proves persistence, and avoids ACK ping-pong. Session metadata is durable
-  before publication. Duplicate/reordered/lost frames resume
-  from that metadata and committed Store outboxes, not sequence watermarks.
-- Controls are at most 32 KiB/128 items. A body is at most 2 MiB; at most eight Assets and
-  4 MiB aggregate are read per response. JSON rejects duplicate keys, bad UTF-8 and depth
-  over 32. Polling uses exact SDK slots, not an unbounded DataItem prefix buffer.
+### Transport split
+
+- `/voxgolem/assistant/v1/identity` `DataItem` (`<= 2 KiB`, no assets) remains strictly for
+  non-enrolling v3 `Hello` discovery. Old `/pair/request` and `/pair/ack` invitation slots
+  and legacy `/voxgolem/assistant/v1/<sender>/<target>/<kind>` or
+  `/voxgolem/assistant/v2/<sender>/<target>/<kind>` `DataItem` conversation mailbox paths are
+  rejected and inert; no conversation payloads or `Asset` attachments use `DataClient`.
+- `/voxgolem/assistant/v2/reconcile-hint` `MessageClient` messages (`<= 256` bytes) carry
+  v3 coalesced reconcile hints (latest payload per `sourceNodeId`, capped at `MAX_PEERS = 8`,
+  with at most one queued drain runnable on the replication executor).
+- `/voxgolem/assistant/v2/session/<uuid>` `ChannelClient` streams carry connected
+  bidirectional v2 replication sessions.
+- `/voxgolem/chatgpt-access/v1/` (`ChatGptAccessSync`) and
+  `/voxgolem/assistant/v2/phone-relay/` (`PhoneRelay`) remain separate and unchanged.
+
+### Deterministic session ownership
+
+- In `ReplicationController.reconcile`, Phone (`role == AssistantPeerRole.PHONE`) opens
+  canonical `ChannelClient` sessions when the peer is reachable and paired, both during
+  `reconcile()` and upon validating an incoming `/voxgolem/assistant/v2/reconcile-hint` in
+  `ReplicationController.onHint`.
+- In `ReplicationController.reconcile`, Watch (`role == AssistantPeerRole.WATCH`) sends
+  coalesced `/voxgolem/assistant/v2/reconcile-hint` messages when Phone is paired and accepts
+  incoming `ChannelClient` sessions opened by Phone via `ReplicationController.accept`.
+- Within a connected session, the initiator pulls from the peer first and then serves local
+  inventory/records/ACKs (`pullFromPeer` -> `serveToPeer`), while the responder serves first
+  and then pulls (`serveToPeer` -> `pullFromPeer`), completing bidirectional catch-up over
+  one channel.
+
+### Connected session framing and bounds
+
+- Session streams use 4-byte big-endian length-prefixed UTF-8 JSON control frames
+  (`2..=32 KiB`, `MAX_CONTROL_BYTES = 32 KiB`, `ReplicationWire.MAX_ITEMS = 128`,
+  `MAX_SESSION_PAGES = 4096`, `ReplicationWire.MAX_ITEMS = 128` `ancestorAttempts` cap in
+  `ReplicationController.appendMissingAncestors`). JSON decoding rejects duplicate keys,
+  malformed UTF-8 and nesting depth over 32.
+- Control frames (`version = 2`) validate `sender`, `target`, `session`, `token`, and
+  `kind` (`inventory_request`, `inventory`, `record_request`, `records`, `body_chunk`,
+  `batch_end`, `ack`, `ack_confirmed`, `restart`, `done`) against the authenticated route.
+- A revision-pinned inventory walk requests and commits **all pages' tombstones first**
+  (`phase = "tombstones"`), then walks record pages (`phase = "records"`) at that same
+  sender revision. Any sender revision change emits `restart` and restarts the walk from
+  tombstones.
+- Prepared batch streaming enforces `MAX_BATCH_RECORDS = 8`, `MAX_RECORD_BYTES = 2 MiB`,
+  `MAX_BATCH_BYTES = 4 MiB`, and `MAX_CHUNK_BYTES = 64 KiB`:
+  - The sender writes a `records` control frame declaring `transfer` UUID, ordered
+    `{ "entry", "bytes" }` transfer descriptors (`record_begin` metadata), and `unavailable`
+    IDs accounting for every requested entry, followed by `body_chunk` frames and raw UTF-8
+    byte chunks (`<= 64 KiB` each), and finishes with an explicit `batch_end` frame
+    verifying total record count and byte length.
+  - The receiver validates transfer declarations against requested entries and phase, and
+    reassembles chunks in bounded memory (`ReplicationWire.readRecordBatch`)
+    verifying exact byte counts, UTF-8 JSON structure, and descriptor equality before
+    passing the batch to native import.
+
+### Native Store and canonical SQLite authority
+
+- Native [`Store::replication`](../../../../../../../../../conversation-store/src/replication.rs)
+  prepares bounded body batches (`Request::Bodies`) in a short read transaction and releases
+  the store read lock before socket writes; `ReplicationController` re-verifies `revision`
+  before streaming the batch over the channel.
+- `Request::Import` validates batch size, byte budgets, and descriptor equality, then
+  executes `import_received` to recompute canonical body hashes, commit accepted/duplicate/
+  suppressed/quarantined records, and return `{ "outcome": ..., "receipts": [...] }`
+  (flattened `CommitOutcome` fields plus durable `receipts`) atomically from the same
+  single SQLite write transaction.
+- Offers originate from Store publications while filtering the quarantine ledger; quarantined
+  records remain valid exact receipt targets when committed, but are never advertised or
+  served as bodies and cannot form prompt context.
+- After importing a batch or reconciling known inventory entries, the receiver sends `ack`
+  with exact committed `Receipt`s (`recipient_replica`, `operation`, `body_key`) and waits
+  for `ack_confirmed` carrying reciprocal exact receipts derived from the peer's committed
+  snapshot before recording peer acknowledgements (`store.acknowledge`).
+- Canonical SQLite receipts and outboxes in `assistant.db` are the sole convergence
+  authority across disconnects. `ReplicationDatabase` (`assistant-replication.db`, schema
+  v5) stores only `peers(replica)`, `setup`, `native_bindings`, and `retry` — there are no
+  durable `peers.session` columns or `cleanup_peers` tables.
 - Canonical history including retired/quarantine ledgers is capped at 4 MiB encoded;
   drafts at 4 MiB aggregate, each draft at 32 KiB; each outgoing/receipt outbox at 8 MiB
   and 65,536 rows; peer receipts at 65,536 rows. SQLite has a 64 MiB page budget and a
   16 MiB retained WAL budget with automatic checkpoints. Explicit truncating checkpoints
-  are idle maintenance, not admission/stream/cancellation work. WAL may grow transiently
-  while a transaction or reader is active; these are storage budgets, not forensic-erasure claims.
-- There are at most eight enrolled peers. Enrollment is blocked when deferred revocation
-  cleanup would accumulate unbounded old slots. Revoked-peer cleanup metadata persists
-  until the SDK delete succeeds.
-- Automatic setup retains one counterpart binding. The protocol's eight-peer bound is a
-  transport ceiling, not support for automatic multi-device setup. Replacing
-  a counterpart queues old conversation-slot cleanup without deleting local history.
-- SDK Tasks wait at most five seconds; a work unit has a 50-second cooperative budget.
-  Asset descriptors are poll/read bounded and released on every path; late Task resources
-  are released and late publications are conservatively deleted. Workers idle out, the
-  queue is capped at 16, and no custom background daemon runs.
-- Persisted retry jobs use 30-second to 30-minute capped exponential backoff plus jitter.
-  A separate 30-minute periodic job, startup/resume and capability reachability triggers
-  reconcile. OS deferral is possible; thirty minutes disconnected is not a TTL or a
-  promised delivery deadline. Physical offline/reconnect acceptance remains necessary.
+  are idle maintenance, not admission/stream/cancellation work.
+- Automatic setup retains one counterpart binding (`MAX_PEERS = 8` is a protocol ceiling,
+  not automatic multi-device setup). SDK Tasks wait at most 5 seconds inside a 50-second
+  cooperative operation budget; late `Channel` or stream results arriving after timeout are
+  closed immediately. The single-thread replication executor idles out after 30 seconds with
+  a queue cap of 16, backed by persisted 30-second to 30-minute exponential-backoff retry
+  jobs and a 30-minute periodic job.
 
 Target fields are routing metadata, **not selective encryption** among installations with
-the same package/signature. Cleanup is best effort and cannot immediately erase an Asset
-already obtained by an offline peer. No operation triggers remote generation or capture.
+the same package/signature. No replication operation triggers remote generation or capture.
 
 ## Provider access and verification boundary
 

@@ -131,7 +131,9 @@ immutable turns and their version `1` provenance/body hashes are not migrated or
 
 [Replication implementation](src/main/java/dev/gitblame/voxgolem/assistant/replication/AssistantReplication.kt)
 and [transport](src/main/java/dev/gitblame/voxgolem/assistant/replication/GmsReplicationTransport.kt)
-use finite, bounded GMS DataItem control slots and Assets for immutable records.
+use connected GMS `ChannelClient` sessions (`/voxgolem/assistant/v2/session/<uuid>`) and
+coalesced `MessageClient` reconcile hints (`/voxgolem/assistant/v2/reconcile-hint`), keeping
+`/voxgolem/assistant/v1/identity` `DataItem` strictly for non-enrolling `Hello` discovery.
 Conversation creates, completed turns and deletion evidence reconcile, not drafts,
 provisional deltas, running requests, whole snapshots or retired ledgers. Receiver
 validation/SQLite commit precedes exact ID/body ACK; the sender durably records each

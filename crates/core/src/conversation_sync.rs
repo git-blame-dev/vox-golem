@@ -380,16 +380,13 @@ pub fn reconcile_page(store: &Store, page: InventoryPage) -> Result<ReconcilePla
             if key != &entry.body_key {
                 return Err(DomainError::IdConflict { id: entry.id });
             }
-            if store
-                .retained_record(&entry.id)
-                .is_some_and(|record| {
-                    record.operation.conversation() != &entry.conversation
-                        || matches!(
-                            record.operation.body,
-                            OperationBody::ConversationDeleted { .. }
-                        ) != entry.tombstone
-                })
-            {
+            if store.retained_record(&entry.id).is_some_and(|record| {
+                record.operation.conversation() != &entry.conversation
+                    || matches!(
+                        record.operation.body,
+                        OperationBody::ConversationDeleted { .. }
+                    ) != entry.tombstone
+            }) {
                 return Err(DomainError::Invalid {
                     field: "inventory_metadata".into(),
                 });

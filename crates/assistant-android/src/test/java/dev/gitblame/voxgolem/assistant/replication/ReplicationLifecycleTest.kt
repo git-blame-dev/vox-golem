@@ -168,11 +168,28 @@ class ReplicationLifecycleTest {
                 fixture.mailbox,
             )
             assertFalse(AssistantReplication.acceptsChannel(emptyNodeSessionChannel))
+            val malformedSessionChannel = FakeGmsMailbox.FakeChannel(
+                "synthetic-watch-node",
+                "${ReplicationWire.SESSION_PREFIX}not-a-uuid",
+                FakeGmsMailbox.InMemoryPipe(fixture.mailbox),
+                FakeGmsMailbox.InMemoryPipe(fixture.mailbox),
+                fixture.mailbox,
+            )
+            assertFalse(AssistantReplication.acceptsChannel(malformedSessionChannel))
 
-            // Invalid empty-node session channel is rejected.
+            // Invalid empty-node session channel is closed and marked REJECTED.
+            val closedBeforeEmptyNode = fixture.mailbox.closedChannels
             ReflectionHelpers.setStaticField(AssistantReplication::class.java, "status", AssistantReplicationStatus.IDLE)
             service.onChannelOpened(emptyNodeSessionChannel)
             assertEquals(AssistantReplicationStatus.REJECTED, AssistantReplication.status)
+            assertEquals(closedBeforeEmptyNode + 1, fixture.mailbox.closedChannels)
+
+            // Malformed session channel matching SESSION_PREFIX is closed and marked REJECTED.
+            val closedBeforeMalformed = fixture.mailbox.closedChannels
+            ReflectionHelpers.setStaticField(AssistantReplication::class.java, "status", AssistantReplicationStatus.IDLE)
+            service.onChannelOpened(malformedSessionChannel)
+            assertEquals(AssistantReplicationStatus.REJECTED, AssistantReplication.status)
+            assertEquals(closedBeforeMalformed + 1, fixture.mailbox.closedChannels)
 
             // Valid session channel when nativeAvailable=false or waiting for peer is closed without leaking.
             val closedBefore = fixture.mailbox.closedChannels

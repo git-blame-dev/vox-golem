@@ -32,7 +32,7 @@ class AssistantReplicationListenerService : WearableListenerService() {
     override fun onChannelOpened(channel: ChannelClient.Channel) {
         if (PhoneRelayWire.validPath(channel.path)) {
             PhoneRelayBridge.onChannelOpened(applicationContext, channel)
-        } else if (ReplicationWire.validSessionPath(channel.path)) {
+        } else if (channel.path.startsWith(ReplicationWire.SESSION_PREFIX)) {
             AssistantReplication.onChannelOpened(applicationContext, channel)
         }
     }
