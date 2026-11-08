@@ -30,6 +30,7 @@ import java.util.Locale
 @Config(sdk = [35], manifest = Config.NONE, shadows = [CueRetirementRecognizerShadow::class, CueOrderingTtsShadow::class])
 @LooperMode(LooperMode.Mode.PAUSED)
 class MicrophoneCueAdapterTest {
+    private val selector = ScriptedVoiceSelector()
     private fun drain() = shadowOf(Looper.getMainLooper()).idle()
     private fun result(text: String) = Bundle().apply {
         putStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION, arrayListOf(text))
@@ -185,7 +186,7 @@ class MicrophoneCueAdapterTest {
             assertEquals(2, f.pool.stream)
             ShadowTextToSpeech.addVoice(Voice("synthetic-au-local", Locale.forLanguageTag("en-AU"),
                 Voice.QUALITY_NORMAL, Voice.LATENCY_NORMAL, false, emptySet()))
-            val output = LocalSpeechOutput(AndroidLocalTtsFactory(f.context), object : SpeechAudioFocus {
+            val output = LocalSpeechOutput(selector, AndroidLocalTtsFactory(f.context), object : SpeechAudioFocus {
                 override fun acquire(onLoss: () -> Unit) = true
                 override fun release() {}
             }, leases = f.leases)

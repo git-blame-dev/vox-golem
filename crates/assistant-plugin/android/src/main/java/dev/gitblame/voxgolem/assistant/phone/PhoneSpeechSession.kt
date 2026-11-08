@@ -1,5 +1,7 @@
 package dev.gitblame.voxgolem.assistant.phone
 
+import dev.gitblame.voxgolem.assistant.speech.RustObservedVoiceSelector
+
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
@@ -62,7 +64,7 @@ data class SpeechAdmissionSnapshot(val owner: SpeechInputOwner, val draft: Strin
 class PhoneSpeechSession internal constructor(private val context: Context, private val backend: PhoneSpeechBackend,
     private val dictation: SharedDictationOwner = SharedDictationOwner.configured(context) { speechAdmission(backend.nativePreferences()) },
     listeningCue: ListeningCue = AndroidListeningCue(context.applicationContext),
-    private val output: LocalSpeechOutput = LocalSpeechOutput.configured(context) { speechAdmission(backend.nativePreferences()) },
+    private val output: LocalSpeechOutput = LocalSpeechOutput.configured(context, RustObservedVoiceSelector()) { speechAdmission(backend.nativePreferences()) },
     private val beginFlow: () -> dev.gitblame.voxgolem.assistant.AssistantTiming? = { null }) : AutoCloseable {
     constructor(context: Context, backend: EnginePhoneBackend,
         audio: RecordedAudioFactory? = null,
@@ -70,7 +72,7 @@ class PhoneSpeechSession internal constructor(private val context: Context, priv
             dev.gitblame.voxgolem.assistant.inputtransport.SuppliedAudioProviderGate.UNPROVEN,
         recordingEnabled: () -> Boolean = { false },
         suppliedDictation: SharedDictationOwner? = null,
-        suppliedOutput: LocalSpeechOutput = LocalSpeechOutput.configured(context) { speechAdmission(backend.nativePreferences()) },
+        suppliedOutput: LocalSpeechOutput = LocalSpeechOutput.configured(context, RustObservedVoiceSelector()) { speechAdmission(backend.nativePreferences()) },
         beginFlow: () -> dev.gitblame.voxgolem.assistant.AssistantTiming? = { null }) : this(context, object : PhoneSpeechBackend {
         override fun busy() = backend.busy()
         override fun preferencesReady() = backend.preferencesReady()

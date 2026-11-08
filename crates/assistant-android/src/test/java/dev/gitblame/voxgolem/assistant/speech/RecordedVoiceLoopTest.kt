@@ -50,7 +50,7 @@ class RecordedVoiceLoopTest {
             val dictation = SharedDictationOwner(factory, { true }, RecognitionResourceLease(), configuration = {
                 SpeechAdmission(SpeechSelection(language = "en-US"), false)
             })
-            val output = LocalSpeechOutput(object : LocalTtsFactory {
+            val output = LocalSpeechOutput(RustObservedVoiceSelector(), object : LocalTtsFactory {
                 override fun create(onReady: (Boolean) -> Unit): LocalTtsSession = error("Disabled output must not initialize TTS")
             }, object : SpeechAudioFocus {
                 override fun acquire(onLoss: () -> Unit) = true

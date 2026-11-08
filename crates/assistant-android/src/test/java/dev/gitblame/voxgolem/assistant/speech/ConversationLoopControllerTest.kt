@@ -88,7 +88,7 @@ class ConversationLoopControllerTest {
     private val leases = RecognitionResourceLease()
     private val dictation = SharedDictationOwner(recognition, { true }, leases)
     private val tts = Tts()
-    private val output = LocalSpeechOutput(tts, object : SpeechAudioFocus {
+    private val output = LocalSpeechOutput(RustObservedVoiceSelector(), tts, object : SpeechAudioFocus {
         override fun acquire(onLoss: () -> Unit) = true
         override fun release() {}
     }, leases = leases)
@@ -102,7 +102,7 @@ class ConversationLoopControllerTest {
             val recognition = Recognition().apply { delayRetirement = true }
             val leases = RecognitionResourceLease()
             val dictation = SharedDictationOwner(recognition, { true }, leases)
-            val output = LocalSpeechOutput(Tts(), object : SpeechAudioFocus {
+            val output = LocalSpeechOutput(RustObservedVoiceSelector(), Tts(), object : SpeechAudioFocus {
                 override fun acquire(onLoss: () -> Unit) = true
                 override fun release() {}
             }, leases = leases)
@@ -188,8 +188,8 @@ class ConversationLoopControllerTest {
 
     @Test fun appendedSourcesDoNotResetAlreadySpokenAnswerAtTrailingNewline() {
         RustReplySpeech().use { policy ->
-            assertEquals("Synthetic first sentence.", policy.apply(0, "Synthetic first sentence.\n").chunk?.text)
-            assertEquals(null, policy.apply(2, "Synthetic first sentence.\nSources:\nsynthetic citation").chunk)
+            assertEquals("Synthetic first sentence.", policy.apply(0, "Synthetic first sentence.\n").chunks.single().text)
+            assertTrue(policy.apply(2, "Synthetic first sentence.\nSources:\nsynthetic citation").chunks.isEmpty())
         }
     }
 

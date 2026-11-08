@@ -25,6 +25,19 @@ describe('parseStartupState', () => {
     capabilities: COMPLETE_CAPABILITIES,
   }
 
+  it('accepts bounded Neural voice inventory and rejects malformed identities', () => {
+    const service = { configured_engine: 'Neural TTS', runtime_engine: 'Neural TTS', configured_model: 'Qwen', configured_voice: null, configured_locale: null }
+    const payload = (available_voices: unknown, incremental_audio: unknown = false) => ({
+      ...speechStartupPayload, speech_services: { stt: service, tts: { ...service, available_voices, incremental_audio } },
+    })
+    const voice = { id: 'synthetic-a', name: 'Synthetic A', aliases: [], default: true }
+    expect(parseStartupState(payload([voice]))).toMatchObject({ speechServices: { tts: { availableVoices: [voice], incrementalAudio: false } } })
+    for (const invalid of [null, {}, [null], [{ ...voice, id: '' }], [{ ...voice, aliases: [null] }], Array(33).fill(voice)]) {
+      expect(() => parseStartupState(payload(invalid))).toThrow('available_voices')
+    }
+    expect(() => parseStartupState(payload([voice], 'true'))).toThrow('incremental_audio')
+  })
+
   it.each(['ready', 'warming_model'])('parses speech identity separately from execution providers in %s', (kind) => {
     const state = parseStartupState({
       ...speechStartupPayload,

@@ -15,6 +15,8 @@ pub mod response_style;
 pub mod runtime;
 pub mod search;
 pub mod session;
+pub mod speech_delivery;
+pub mod speech_selection;
 #[cfg(feature = "voice-pipeline")]
 pub mod turn_capture;
 #[cfg(feature = "voice-pipeline")]

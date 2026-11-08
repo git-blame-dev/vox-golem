@@ -1,7 +1,6 @@
 package dev.gitblame.voxgolem.assistant.speech
 
 import dev.gitblame.voxgolem.assistant.AssistantTiming
-import java.util.ArrayDeque
 
 /** Rust selects text; this serialized adapter owns only SDK scheduling and callback fences. */
 class ReplySpeechStreamer(private val output: SpeechOutputController) : AutoCloseable {
@@ -10,18 +9,16 @@ class ReplySpeechStreamer(private val output: SpeechOutputController) : AutoClos
     private var sentOffset = 0
     private var awaitingCanonical = false
     private var epoch = 0L
-    private var generation = 0L
-    private var lastChunk = 0L
-    private val pending = ArrayDeque<SpeechChunk>()
-    private var pendingBytes = 0
-    // Preserve QUEUE_ADD read-ahead without admitting an unbounded SDK backlog.
-    private val inFlight = HashSet<Long>(2)
+    private var deliveryIdle = true
+    private var dispatching = false
+    private val deferredCallbacks = LinkedHashMap<Pair<Long, Long>, () -> Unit>(2)
     private var completed = false
     private var settled = false
     private var started = false
     private var sdkStarted = false
     private var selectionClosed = false
     private var finishPosted = false
+    private var finishCompleted = false
     private var language = ""
     private var timing: AssistantTiming? = null
     private var terminal: ((String?) -> Unit)? = null
@@ -42,13 +39,13 @@ class ReplySpeechStreamer(private val output: SpeechOutputController) : AutoClos
     private fun retire(notify: Boolean) {
         epoch++
         policy?.close(); policy = null
-        pending.clear(); pendingBytes = 0; inFlight.clear()
+        deliveryIdle = true; deferredCallbacks.clear()
         val hadOutput = started && !settled
         val callback = terminal; terminal = null
         if (hadOutput) output.stop()
         if (notify) callback?.invoke("speech_cancelled")
         sdkStarted = false
-        selectionClosed = false; finishPosted = false
+        selectionClosed = false; finishPosted = false; finishCompleted = false
     }
 
     // Caller supplies cumulative append-only text, not deltas. Keep only its UTF-16
@@ -85,7 +82,6 @@ class ReplySpeechStreamer(private val output: SpeechOutputController) : AutoClos
         try {
             val owner = policy ?: RustReplySpeech(admissionEnabled).also { policy = it }
             val decision = owner.apply(2, finalText)
-            policy = null // Final decision is detached; callbacks use epoch + generation + chunk fences.
             completed = true
             apply(decision, onSpeakingStarted)
             finishIfIdle()
@@ -113,38 +109,52 @@ class ReplySpeechStreamer(private val output: SpeechOutputController) : AutoClos
     private fun apply(decision: SpeechDecision, onStarted: () -> Unit) {
         if (decision.cancel) {
             epoch++
-            pending.clear(); pendingBytes = 0; inFlight.clear()
+            deliveryIdle = true; deferredCallbacks.clear()
             if (started) output.stop()
             started = false; sdkStarted = false
-            selectionClosed = false; finishPosted = false
+            selectionClosed = false; finishPosted = false; finishCompleted = false
         }
         selectionClosed = selectionClosed || decision.closed
-        decision.chunk?.let { chunk ->
-            if (pending.size >= 100 || pendingBytes + chunk.text.toByteArray(Charsets.UTF_8).size > 600) {
-                fail("Speech output capacity exceeded"); return
-            }
-            generation = chunk.generation; lastChunk = chunk.id
-            pending.add(chunk); pendingBytes += chunk.text.toByteArray(Charsets.UTF_8).size
-            if (!started) { started = true; onStarted() }
+        deliveryIdle = decision.idle
+        if (decision.chunks.isNotEmpty() && finishPosted) {
+            // All old chunks acknowledged before close was posted. Canonical
+            // settlement can still append a suffix; reopen without prefix replay
+            // and fence any old, asynchronously posted cleanup callback.
+            epoch++
+            sdkStarted = false; finishPosted = false; finishCompleted = false
         }
-        pump()
-    }
-
-    private fun pump() {
         val fence = epoch
-        while (!settled && epoch == fence && inFlight.size < 2) {
-            val chunk = pending.pollFirst() ?: break
-            pendingBytes -= chunk.text.toByteArray(Charsets.UTF_8).size
-            inFlight.add(chunk.id)
-            val flush = !sdkStarted
-            sdkStarted = true
-            output.speakStreamChunk(chunk.text, language, flush, true, if (flush) timing else null) { failure ->
-                synchronized(this) {
-                    if (epoch != fence || generation != chunk.generation || chunk.id > lastChunk || !inFlight.remove(chunk.id)) return@synchronized
-                    if (failure == "speech_disabled") disableAdmission()
-                    else if (failure != null) fail(failure) else pump()
+        dispatching = true
+        try {
+            for (chunk in decision.chunks) {
+                if (epoch != fence || settled) break
+                if (!started) { started = true; onStarted() }
+                if (epoch != fence || settled) break
+                val flush = !sdkStarted
+                sdkStarted = true
+                output.speakStreamChunk(chunk.text, language, flush, true, if (flush) timing else null) { failure ->
+                    synchronized(this) {
+                        val callback = callback@{
+                            if (epoch != fence || settled) return@callback
+                            try {
+                                val next = policy?.complete(chunk) ?: return@callback
+                                if (!next.accepted) return@callback
+                                if (failure == "speech_disabled") disableAdmission()
+                                else if (failure != null) fail(failure) else apply(next, {})
+                            } catch (_: SpeechPolicyUnavailable) { fail("speech_policy_unavailable") }
+                        }
+                        // SDK test doubles may callback inline. Dispatch the entire
+                        // ordered batch before acknowledging and asking Rust for more.
+                        if (dispatching) deferredCallbacks.putIfAbsent(chunk.generation to chunk.id, callback) else callback()
+                    }
                 }
             }
+        } finally { dispatching = false }
+        while (deferredCallbacks.isNotEmpty()) {
+            val first = deferredCallbacks.entries.first()
+            val callback = first.value
+            deferredCallbacks.remove(first.key)
+            callback()
         }
         if (epoch == fence) finishIfIdle()
     }
@@ -157,13 +167,23 @@ class ReplySpeechStreamer(private val output: SpeechOutputController) : AutoClos
     }
 
     private fun finishIfIdle() {
-        if (settled || inFlight.isNotEmpty() || pending.isNotEmpty()) return
+        if (settled || !deliveryIdle) return
         if ((completed || selectionClosed) && started && !finishPosted) {
             finishPosted = true
-            output.finishStream()
+            val fence = epoch
+            output.finishStream { failure -> synchronized(this) {
+                if (epoch == fence && !settled) {
+                    if (failure != null) fail(failure) else {
+                        finishCompleted = true
+                        finishIfIdle()
+                    }
+                }
+            } }
+            return
         }
-        if (!completed) return
+        if (!completed || (started && !finishCompleted)) return
         settled = true
+        policy?.close(); policy = null
         val callback = terminal; terminal = null
         val fence = epoch
         val after = afterGeneration

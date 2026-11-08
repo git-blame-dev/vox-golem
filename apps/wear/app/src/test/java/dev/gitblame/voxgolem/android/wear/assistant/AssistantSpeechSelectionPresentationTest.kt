@@ -8,7 +8,11 @@ import dev.gitblame.voxgolem.assistant.speech.SpeechSelection
 import dev.gitblame.voxgolem.assistant.speech.SpeechVoiceOption
 import org.junit.Assert.*
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.annotation.Config
 
+@RunWith(WearAssistantRunner::class)
+@Config(sdk = [35], manifest = Config.NONE)
 class AssistantSpeechSelectionPresentationTest {
     private val ready = AssistantState(foreground = true)
     private val inventory = SpeechOptions(ttsProviders = listOf("", "synthetic.engine.one", "synthetic.engine.two"),

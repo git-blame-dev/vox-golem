@@ -1,5 +1,7 @@
 package dev.gitblame.voxgolem.assistant.phone
 
+import dev.gitblame.voxgolem.assistant.speech.RustObservedVoiceSelector
+
 import android.Manifest
 import android.app.Activity
 import android.app.ActivityManager
@@ -334,7 +336,7 @@ object PhoneSyntheticVoiceBenchmark {
             val dictation = SharedDictationOwner(factory, { context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED },
                 configuration = { handle.engine.snapshot().speechAdmission() }, beginTiming = { timing(AssistantTiming.Operation.RECOGNITION) })
             dictationOwner = dictation
-            val playback = LocalSpeechOutput(AndroidLocalTtsFactory(context), AndroidSpeechAudioFocus(context),
+            val playback = LocalSpeechOutput(RustObservedVoiceSelector(), AndroidLocalTtsFactory(context), AndroidSpeechAudioFocus(context),
                 configuration = { handle.engine.snapshot().speechAdmission() }, beginTiming = { timing(it) })
             output = playback
             voice = PhoneSpeechSession(context, backend, suppliedDictation = dictation, suppliedOutput = playback,

@@ -1,4 +1,5 @@
 use std::io::Cursor;
+use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 
@@ -8,6 +9,73 @@ pub(crate) const START_ACKNOWLEDGMENT: &str = "Yes?";
 pub(crate) const STOP_ACKNOWLEDGMENT: &str = "Understood, sir. Working on that now for you.";
 pub(crate) const SHORT_STOP_ACKNOWLEDGMENT: &str = "Understood, sir. Working on that now.";
 const MAX_CUE_DURATION_SECONDS: usize = 8;
+
+/// One fixed cue set; preparation is serialized away from microphone admission.
+/// Old voice preparation cannot masquerade as the selected voice's ready audio.
+#[derive(Default)]
+pub(crate) struct CueCache {
+    current: Mutex<CachedCues>,
+    preparation: tokio::sync::Mutex<()>,
+}
+#[derive(Default)]
+struct CachedCues {
+    revision: u64,
+    value: Option<(String, Arc<PreparedCues>)>,
+}
+impl CueCache {
+    pub(crate) fn latest(&self) -> Option<Arc<PreparedCues>> {
+        self.current
+            .lock()
+            .ok()?
+            .value
+            .as_ref()
+            .map(|(_, cues)| Arc::clone(cues))
+    }
+    pub(crate) fn invalidate(&self) {
+        if let Ok(mut current) = self.current.lock() {
+            current.revision = current.revision.wrapping_add(1);
+            current.value.take();
+        }
+    }
+    pub(crate) fn get(&self, key: &str) -> Option<Arc<PreparedCues>> {
+        self.current
+            .lock()
+            .ok()?
+            .value
+            .as_ref()
+            .filter(|(current, _)| current == key)
+            .map(|(_, cues)| Arc::clone(cues))
+    }
+    pub(crate) async fn prepare<F, Fut>(
+        &self,
+        key: String,
+        prepare: F,
+    ) -> Result<Arc<PreparedCues>, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Arc<PreparedCues>, String>>,
+    {
+        let _preparation = self.preparation.lock().await;
+        if let Some(cues) = self.get(&key) {
+            return Ok(cues);
+        }
+        let revision = self
+            .current
+            .lock()
+            .map_err(|_| String::from("voice cue cache unavailable"))?
+            .revision;
+        let cues = prepare().await?;
+        let mut current = self
+            .current
+            .lock()
+            .map_err(|_| String::from("voice cue cache unavailable"))?;
+        if current.revision != revision {
+            return Err(String::from("voice cue preparation was superseded"));
+        }
+        current.value = Some((key, Arc::clone(&cues)));
+        Ok(cues)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -106,6 +174,33 @@ mod tests {
             sample_rate_hz: 22_050,
             duration_ms: 100,
         }
+    }
+
+    #[tokio::test]
+    async fn invalidation_during_preparation_cannot_restore_stale_voice() {
+        let cache = CueCache::default();
+        let result = cache
+            .prepare("old-voice".into(), || async {
+                cache.invalidate();
+                prepare_cues(|_| Ok(sample_audio(vec![0.5])), 0.0).map(Arc::new)
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(cache.latest().is_none());
+        let first = cache
+            .prepare("new-voice".into(), || async {
+                prepare_cues(|_| Ok(sample_audio(vec![0.25])), 0.0).map(Arc::new)
+            })
+            .await
+            .unwrap();
+        let reused = cache
+            .prepare("new-voice".into(), || async {
+                panic!("matching prepared cue must be reused")
+            })
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &reused));
+        assert!(cache.get("old-voice").is_none());
     }
 
     #[test]

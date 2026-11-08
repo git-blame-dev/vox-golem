@@ -5,6 +5,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import org.junit.Assert.*
+import org.robolectric.RobolectricTestRunner
 import org.junit.Test
 
 class PreRollPcmPumpTest {

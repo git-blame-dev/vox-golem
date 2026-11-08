@@ -2460,7 +2460,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
     }
   }
 
-  const toggleTts = async (enabled: boolean): Promise<void> => {
+  const toggleTts = async (enabled: boolean, reconnect = false): Promise<void> => {
     const previousEnabled = ttsEnabledRef.current
     await session.preferences.tts.mutate({
       next: enabled,
@@ -2470,7 +2470,7 @@ function useFrontendSessionRuntime(session: SessionAuthority) {
         setTtsEnabled(value)
       },
       save: async () => {
-        const payload = await invokeTauriCommand('set_tts_enabled', { enabled })
+        const payload = await invokeTauriCommand('set_tts_enabled', { enabled, ...(reconnect ? { reconnect: true } : {}) })
         return typeof payload === 'object' && payload !== null && 'enabled' in payload && typeof payload.enabled === 'boolean'
           ? payload.enabled
           : enabled

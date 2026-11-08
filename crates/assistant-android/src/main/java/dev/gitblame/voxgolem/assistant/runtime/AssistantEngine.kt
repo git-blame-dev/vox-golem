@@ -1,5 +1,7 @@
 package dev.gitblame.voxgolem.assistant.runtime
 
+import dev.gitblame.voxgolem.assistant.speech.RustObservedVoiceSelector
+
 import dev.gitblame.voxgolem.assistant.AssistantDomain
 import dev.gitblame.voxgolem.assistant.AssistantDraftBudget
 import dev.gitblame.voxgolem.assistant.AssistantDomainException
@@ -380,13 +382,13 @@ class AssistantEngine @JvmOverloads internal constructor(
     override fun setSpeechSelection(selection: dev.gitblame.voxgolem.assistant.speech.SpeechSelection, onSettled: (AssistantState) -> Unit) =
         dispatch(onSettled) { updateSpeechSelection(selection) }
     private fun updateSpeechSelection(selection: dev.gitblame.voxgolem.assistant.speech.SpeechSelection) {
-        if (selection != currentPolicy().selection()) state.speechOptions.validate(selection, state.speechNetworkFallback)
+        if (selection != currentPolicy().selection()) state.speechOptions.validate(selection, state.speechNetworkFallback, RustObservedVoiceSelector())
         updatePolicy(currentPolicy().copy(speechLanguage = selection.language, speechTtsProvider = selection.ttsProvider, speechTtsVoice = selection.ttsVoice))
     }
     override fun publishSpeechOptions(options: dev.gitblame.voxgolem.assistant.speech.SpeechOptions) = dispatch { state = state.copy(speechOptions = options.bounded()) }
     fun updatePolicy(policy: AssistantPolicy, onSettled: (AssistantState) -> Unit) = dispatch(onSettled) { updatePolicy(policy) }
     private fun updatePolicy(policy: AssistantPolicy) {
-        if (policy.selection() != currentPolicy().selection()) state.speechOptions.validate(policy.selection(), policy.speechNetworkFallback)
+        if (policy.selection() != currentPolicy().selection()) state.speechOptions.validate(policy.selection(), policy.speechNetworkFallback, RustObservedVoiceSelector())
         val previousWebEnabled = state.webEnabled
         policies.write(policy)
         state = state.copy(webEnabled = policy.webEnabled, speechNetworkFallback = policy.speechNetworkFallback,
@@ -399,7 +401,7 @@ class AssistantEngine @JvmOverloads internal constructor(
     fun updatePreferences(model: String, policy: AssistantPolicy, persist: () -> Unit, onSettled: (AssistantState) -> Unit) = dispatch(onSettled) {
         if (!idle()) return@dispatch
         if (model !in AssistantModels.aliases) { state = state.copy(error = "unsupported_model"); return@dispatch }
-        if (policy.selection() != currentPolicy().selection()) state.speechOptions.validate(policy.selection(), policy.speechNetworkFallback)
+        if (policy.selection() != currentPolicy().selection()) state.speechOptions.validate(policy.selection(), policy.speechNetworkFallback, RustObservedVoiceSelector())
         else policy.selection().validateShape()
         val previousModel = state.model
         val previousPolicy = currentPolicy()

@@ -100,6 +100,8 @@ export interface SpeechServiceMetadata {
   readonly configuredModel: string | null
   readonly configuredVoice: string | null
   readonly configuredLocale: string | null
+  readonly availableVoices?: readonly { readonly id: string; readonly name: string; readonly aliases: readonly string[]; readonly default: boolean }[]
+  readonly incrementalAudio?: boolean
 }
 
 export interface SpeechServicesMetadata {

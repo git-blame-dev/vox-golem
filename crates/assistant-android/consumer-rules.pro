@@ -10,3 +10,5 @@
     public void onStatus(java.lang.String);
     public void onFirstText(long);
 }
+
+-keep class dev.gitblame.voxgolem.assistant.speech.SpeechSelectionNative { *; }

@@ -1,6 +1,6 @@
 import { act } from 'react'
 import { createRoot } from 'react-dom/client'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { parseStartupState, CAPABILITY_IDS } from '../lib/startupState'
 import { parseAndroidVoiceStatus } from '../lib/androidVoice'
 import { SpeechSettings } from './SpeechSettings'
@@ -50,6 +50,43 @@ function renderSpeech(props: Parameters<typeof SpeechSettings>[0]) {
 }
 
 describe('SpeechSettings', () => {
+  it('allows clearing an unavailable saved voice even when service startup has no catalog', () => {
+    const changed = vi.fn()
+    const { container, dispose } = renderSpeech({
+      android: false, androidStatus: null, statusError: null,
+      startupState: startup({ ...identity, tts: { ...identity.tts, configured_engine: 'Neural TTS', runtime_engine: null, available_voices: [] } }, null),
+      speechSelection: { speechLanguage: '', speechTtsProvider: 'neural', speechTtsVoice: 'synthetic-removed' },
+      onSpeechSelectionChange: changed,
+    })
+    try {
+      const select = container.querySelector<HTMLSelectElement>('[aria-label="Desktop TTS voice"]')!
+      expect(select.disabled).toBe(false)
+      expect(container.textContent).toContain('Selected voice unavailable')
+      act(() => { select.value = ''; select.dispatchEvent(new Event('change', { bubbles: true })) })
+      expect(changed).toHaveBeenCalledWith({ speechLanguage: '', speechTtsProvider: 'neural', speechTtsVoice: '' })
+    } finally { dispose() }
+  })
+
+  it('uses reported Neural voices, persists an explicit choice and offers reconnect', () => {
+    const changed = vi.fn()
+    const reconnected = vi.fn()
+    const voices = [{ id: 'synthetic-a', name: 'Synthetic A', aliases: ['synthetic-alias'], default: true }, { id: 'synthetic-b', name: 'Synthetic B', aliases: [], default: false }]
+    const { container, dispose } = renderSpeech({
+      android: false, androidStatus: null, statusError: null,
+      startupState: startup({ ...identity, tts: { ...identity.tts, configured_engine: 'Neural TTS', runtime_engine: 'Neural TTS', available_voices: voices, incremental_audio: false } }, null),
+      speechSelection: { speechLanguage: '', speechTtsProvider: 'neural', speechTtsVoice: 'synthetic-alias' },
+      onSpeechSelectionChange: changed, onSpeechReconnect: reconnected,
+    })
+    try {
+      const select = container.querySelector<HTMLSelectElement>('[aria-label="Desktop TTS voice"]')!
+      expect(select.value).toBe('synthetic-a')
+      act(() => { select.value = 'synthetic-b'; select.dispatchEvent(new Event('change', { bubbles: true })) })
+      expect(changed).toHaveBeenCalledWith({ speechLanguage: '', speechTtsProvider: 'neural', speechTtsVoice: 'synthetic-b' })
+      act(() => Array.from(container.querySelectorAll('button')).find((button) => button.textContent === 'Reconnect speech service')!.click())
+      expect(reconnected).toHaveBeenCalledOnce()
+      expect(container.textContent).toContain('complete utterances')
+    } finally { dispose() }
+  })
   it.each(['preparing', 'checking'])('reports %s output discovery as checking until native voices are ready', (ttsPhase) => {
     const props = { android: true, androidStatus: voiceStatus({ ttsEnabled: false, ttsAvailable: false, ttsPhase, speechOptions: { ...speechOptions, ttsProviders: [], ttsVoices: [] } }), statusError: null, startupState: startup(), onSpeechSelectionChange: () => undefined }
     const { container, rerender, dispose } = renderSpeech(props)

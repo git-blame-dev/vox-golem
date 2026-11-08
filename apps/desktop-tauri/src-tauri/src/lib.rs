@@ -8,7 +8,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::ipc::Channel;
 use tauri::{Emitter, Manager};
@@ -36,6 +36,7 @@ mod diagnostics;
 mod telemetry;
 #[cfg(feature = "app-benchmark")]
 use diagnostics::FrontendKind as FrontendRuntimeDiagnosticKind;
+mod neural_speech;
 mod transcription;
 #[allow(dead_code)]
 mod tts;
@@ -111,7 +112,8 @@ struct AppState {
     native_voice: Arc<desktop_voice::DesktopVoiceRuntime>,
     native_observation: Mutex<desktop_observation::DesktopObservation>,
     native_reply: Arc<Mutex<reply_speech::ReplySpeech>>,
-    native_speech_pending: Mutex<Option<reply_speech::SpeechRequest>>,
+    native_speech_delivery: Arc<Mutex<voxgolem_core::speech_delivery::SpeechDelivery>>,
+    native_speech_notify: Arc<Condvar>,
     native_speech_running: AtomicBool,
     native_reply_execution: Mutex<Option<voxgolem_core::conversation::ExecutionId>>,
     native_speech_worker: Arc<tokio::sync::Semaphore>,
@@ -141,7 +143,7 @@ struct AppState {
     tts_playback: Arc<Mutex<TtsPlaybackState>>,
     tts_startup_generation: Arc<AtomicU64>,
     local_tts_runtime: Arc<Mutex<Option<Arc<tts::LocalTtsRuntime>>>>,
-    voice_cue_cache: tokio::sync::OnceCell<Arc<voice_cues::PreparedCues>>,
+    voice_cue_cache: Arc<voice_cues::CueCache>,
     cue_playback_workers: Arc<tokio::sync::Semaphore>,
     wake_clip_writers: Arc<tokio::sync::Semaphore>,
     tts_audio_playback: Arc<voxgolem_audio::playback::AudioPlaybackService>,
@@ -660,6 +662,9 @@ struct SettingsPublicationGuard {
 
 #[derive(Clone)]
 struct PreferencePublicationState {
+    voice_cue_cache: Arc<voice_cues::CueCache>,
+    native_speech_delivery: Arc<Mutex<voxgolem_core::speech_delivery::SpeechDelivery>>,
+    native_speech_notify: Arc<Condvar>,
     native_reply: Arc<Mutex<reply_speech::ReplySpeech>>,
     network_preferences: Arc<Mutex<NetworkPreferences>>,
     lifecycle_gate: Arc<Mutex<()>>,
@@ -1155,6 +1160,9 @@ impl Drop for SettingsPublicationGuard {
 impl PreferencePublicationState {
     fn new(app_state: &AppState) -> Self {
         Self {
+            native_speech_delivery: Arc::clone(&app_state.native_speech_delivery),
+            native_speech_notify: Arc::clone(&app_state.native_speech_notify),
+            voice_cue_cache: Arc::clone(&app_state.voice_cue_cache),
             native_reply: Arc::clone(&app_state.native_reply),
             network_preferences: Arc::clone(&app_state.network_preferences),
             lifecycle_gate: Arc::clone(&app_state.lifecycle_gate),
@@ -1823,8 +1831,12 @@ struct SpeechServiceMetadataPayload {
     configured_engine: Option<&'static str>,
     runtime_engine: Option<&'static str>,
     configured_model: Option<&'static str>,
-    configured_voice: Option<&'static str>,
+    configured_voice: Option<String>,
     configured_locale: Option<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    available_voices: Vec<voxgolem_platform::neural_tts::Voice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    incremental_audio: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2074,6 +2086,12 @@ fn publish_validated_preferences(
     }
     if tts_changed {
         let _ = native_reply.set_enabled(preferences.tts_enabled);
+        if !preferences.tts_enabled {
+            if let Ok(mut delivery) = state.native_speech_delivery.lock() {
+                delivery.cancel();
+            }
+            state.native_speech_notify.notify_all();
+        }
         if preferences.tts_enabled {
             state
                 .tts_audio_playback
@@ -2110,6 +2128,18 @@ fn publish_validated_preferences(
     }
     *selected_profile = requested_profile;
     *ui_preferences = requested_ui;
+    let speech_voice_changed = network_preferences.speech_tts_voice != preferences.speech_tts_voice;
+    if let Some(runtime) = tts_runtime.as_ref() {
+        if runtime.neural_client().is_some() {
+            // Validation already ran before persistence; publication cannot substitute an unknown voice.
+            runtime
+                .set_neural_voice(preferences.speech_tts_voice.as_str(), "")
+                .map_err(|_| ipc_command_error("selected Neural TTS voice is unavailable"))?;
+        }
+    }
+    if speech_voice_changed {
+        state.voice_cue_cache.invalidate();
+    }
     *network_preferences = NetworkPreferences {
         web_enabled: preferences.web_enabled,
         speech_network_fallback: preferences.speech_network_fallback,
@@ -2482,6 +2512,26 @@ async fn update_preferences_from_state(
         .map_err(|error| preference_command_error(CommandErrorCode::Unavailable, error))?;
     let previous = get_app_snapshot_from_state(app_state)?.preferences;
     let preferences = proposal(previous.clone());
+    if let Some(runtime) = app_state
+        .local_tts_runtime
+        .lock()
+        .map_err(|_| ipc_command_error("speech runtime unavailable"))?
+        .as_ref()
+    {
+        if let Some(client) = runtime.neural_client() {
+            let provider = preferences.speech_tts_provider.as_str();
+            if (!provider.is_empty() && provider != "neural")
+                || client
+                    .capabilities()
+                    .resolve_voice(preferences.speech_tts_voice.as_str())
+                    .is_none()
+            {
+                return Err(ipc_command_error(
+                    "selected Neural TTS voice is unavailable",
+                ));
+            }
+        }
+    }
     let requested_persisted = PersistedState::from(&preferences);
     let requested_settings = requested_persisted
         .assistant_settings
@@ -2565,6 +2615,12 @@ async fn update_preferences_from_state(
     } else {
         None
     };
+
+    if let Some(runtime) = proposed_tts_runtime.as_ref() {
+        runtime
+            .set_neural_voice(preferences.speech_tts_voice.as_str(), "")
+            .map_err(|error| preference_command_error(CommandErrorCode::Unavailable, error))?;
+    }
 
     let previous_settings = AssistantSettingsPayload::from(&previous);
     let assistant_changed = requested_settings != previous_settings;
@@ -3191,21 +3247,37 @@ fn get_startup_state_from_state(app_state: &AppState) -> StartupSettingsPayload 
                 configured_model: None,
                 configured_voice: None,
                 configured_locale: None,
+                available_voices: Vec::new(),
+                incremental_audio: None,
             };
+        let neural = config.local_tts.provider == voxgolem_core::config::TtsProvider::Neural;
+        let runtime = app_state.local_tts_runtime.lock().ok();
+        let runtime = runtime.as_ref().and_then(|runtime| runtime.as_deref());
+        let mut tts_metadata = metadata(
+            "tts",
+            if neural { "Neural TTS" } else { "Piper ONNX" },
+            runtime.is_some(),
+        );
+        if let Some(runtime) = runtime {
+            if let Some(client) = runtime.neural_client() {
+                let capabilities = client.capabilities();
+                tts_metadata.configured_model = match capabilities.backend.as_str() {
+                    "qwen" => Some("Qwen"),
+                    "breeze" => Some("Breeze"),
+                    _ => None,
+                };
+                tts_metadata.configured_voice = runtime.selected_neural_voice();
+                tts_metadata.available_voices = capabilities.voices.clone();
+                tts_metadata.incremental_audio = Some(capabilities.incremental_audio);
+            }
+        }
         SpeechServicesMetadataPayload {
             stt: metadata(
                 "parakeet",
                 "Parakeet",
                 app_state.parakeet_runtime().is_some(),
             ),
-            tts: metadata(
-                "tts",
-                "Piper ONNX",
-                app_state
-                    .local_tts_runtime
-                    .lock()
-                    .is_ok_and(|runtime| runtime.is_some()),
-            ),
+            tts: tts_metadata,
         }
     });
     StartupSettingsPayload {
@@ -3228,6 +3300,7 @@ fn effective_custom_config(
 #[tauri::command]
 async fn set_tts_enabled(
     enabled: bool,
+    reconnect: Option<bool>,
     app: tauri::AppHandle,
     app_state: tauri::State<'_, AppState>,
 ) -> Result<SetTtsEnabledPayload, String> {
@@ -3241,15 +3314,31 @@ async fn set_tts_enabled(
     let tts_config = config.local_tts.clone();
     let _operation_guard = app_state.tts_operation_lock.lock().await;
     ensure_app_running(&app_state.exit_cleanup_started)?;
+    let reconnect = reconnect.unwrap_or(false);
+    if reconnect
+        && (tts_config.provider != voxgolem_core::config::TtsProvider::Neural
+            || tts::physical_work_pending()
+            || app_state
+                .tts_playback
+                .lock()
+                .map_err(|_| "speech state unavailable")?
+                .current_id
+                .is_some())
+    {
+        return Err(String::from(
+            "speech service can reconnect only while speech is idle",
+        ));
+    }
     let operation_generation = app_state
         .tts_startup_generation
         .fetch_add(1, Ordering::SeqCst)
         .saturating_add(1);
-    let current_runtime_present = app_state
-        .local_tts_runtime
-        .lock()
-        .map_err(|_| String::from("local tts runtime lock is poisoned"))?
-        .is_some();
+    let current_runtime_present = !reconnect
+        && app_state
+            .local_tts_runtime
+            .lock()
+            .map_err(|_| String::from("local tts runtime lock is poisoned"))?
+            .is_some();
     let proposed_runtime = prepare_tts_runtime(
         enabled,
         current_runtime_present,
@@ -3259,12 +3348,25 @@ async fn set_tts_enabled(
         &app_state.tts_startup_generation,
     )
     .await?;
+    if let Some(runtime) = proposed_runtime.as_ref() {
+        let preferences = app_state
+            .network_preferences
+            .lock()
+            .map_err(|_| String::from("speech preferences unavailable"))?;
+        runtime.set_neural_voice(preferences.speech_tts_voice.as_str(), "")?;
+    }
     let proposed_runtime = persist_tts_preference(enabled, proposed_runtime)?;
     let mut native_reply = app_state
         .native_reply
         .lock()
         .map_err(|_| String::from("native speech owner unavailable"))?;
     let _ = native_reply.set_enabled(enabled);
+    if !enabled {
+        if let Ok(mut delivery) = app_state.native_speech_delivery.lock() {
+            delivery.cancel();
+        }
+        app_state.native_speech_notify.notify_all();
+    }
     let mut runtime_guard = app_state
         .local_tts_runtime
         .lock()
@@ -3272,8 +3374,10 @@ async fn set_tts_enabled(
     let mut unused_proposed_runtime = proposed_runtime;
     let mut old_runtime = None;
     if enabled {
-        if runtime_guard.is_none() {
+        if runtime_guard.is_none() || reconnect {
+            old_runtime = runtime_guard.take();
             *runtime_guard = unused_proposed_runtime.take().map(Arc::new);
+            app_state.voice_cue_cache.invalidate();
             log_tts_runtime_event(&app_state.telemetry_sink, diagnostics::TtsEvent::Enabled);
         }
         app_state
@@ -3419,33 +3523,66 @@ async fn prepare_voice_cues_from_runtime(
     app_state: &AppState,
     existing: Option<Arc<tts::LocalTtsRuntime>>,
 ) -> Result<PreparedVoiceCuesPayload, String> {
+    let config = app_state
+        .runtime_config
+        .as_ref()
+        .ok_or_else(|| String::from("voice configuration unavailable"))?
+        .local_tts
+        .clone();
+    // Fixed embedded cues remain immediately usable with reply speech disabled.
+    // Do not start a neural model solely to populate optional spoken acknowledgements.
+    if existing.is_none() && config.provider == voxgolem_core::config::TtsProvider::Neural {
+        return Err(String::from(
+            "Neural cue preparation deferred until speech service is ready",
+        ));
+    }
+    let runtime = if let Some(runtime) = existing {
+        runtime
+    } else {
+        let diagnostics = Arc::clone(&app_state.telemetry_sink);
+        let spec = config.clone();
+        spawn_runtime_blocking(move || initialize_local_tts_runtime(&spec, true, &diagnostics))
+            .await
+            .map_err(|_| String::from("cue preparation worker failed"))??
+            .map(Arc::new)
+            .ok_or_else(|| String::from("cue runtime unavailable"))?
+    };
+    // Reply admission and this snapshot share the gate: optional preparation
+    // cannot join a newly admitted reply's generation after its preemption.
+    let (voice, generation) = {
+        let _reply = app_state
+            .native_reply
+            .lock()
+            .map_err(|_| String::from("native speech owner unavailable"))?;
+        if runtime.neural_client().is_some()
+            && app_state.native_speech_running.load(Ordering::Acquire)
+        {
+            return Err(String::from(
+                "Neural cue preparation deferred during reply speech",
+            ));
+        }
+        (
+            runtime.selected_neural_voice().unwrap_or_default(),
+            runtime.current_generation(),
+        )
+    };
+    let key = runtime.cue_key_for_voice(&voice);
+    let prepared_key = key.clone();
     app_state
         .voice_cue_cache
-        .get_or_try_init(|| async {
-            let config = app_state
-                .runtime_config
-                .as_ref()
-                .ok_or_else(|| String::from("local voice configuration is unavailable"))?;
-            if !config.local_tts.model_path.is_file() {
-                return Err(String::from("local voice model is unavailable"));
-            }
-            let spec = config.local_tts.clone();
-            let diagnostics = Arc::clone(&app_state.telemetry_sink);
+        .prepare(key, || async move {
             spawn_runtime_blocking(move || {
-                let owned = if existing.is_none() {
-                    initialize_local_tts_runtime(&spec, true, &diagnostics)?.map(Arc::new)
-                } else {
-                    None
-                };
-                let runtime = existing
-                    .as_deref()
-                    .or(owned.as_deref())
-                    .ok_or_else(|| String::from("local voice runtime is unavailable"))?;
-                voice_cues::prepare_cues(|text| runtime.synthesize(text), spec.output_gain_db)
-                    .map(Arc::new)
+                let cues = voice_cues::prepare_cues(
+                    |text| runtime.synthesize_cue(text, &voice, generation),
+                    config.output_gain_db,
+                )?;
+                if runtime.cue_key() != prepared_key {
+                    return Err(String::from("voice cue preparation was superseded"));
+                }
+                Ok(Arc::new(cues))
             })
             .await
-            .map_err(|_| String::from("local voice cue worker failed"))?
+            .map_err(|_| String::from("cue preparation worker failed"))?
         })
         .await
         .map(|_| PreparedVoiceCuesPayload { native_ready: true })
@@ -3507,7 +3644,15 @@ async fn activate_voice_cue_from_state(
         .clone()
         .try_acquire_owned()
         .map_err(|_| String::from("native cue admission is full"))?;
-    let prepared = app_state.voice_cue_cache.get().cloned();
+    let runtime_key = app_state
+        .local_tts_runtime
+        .lock()
+        .ok()
+        .and_then(|runtime| runtime.as_ref().map(|runtime| runtime.cue_key()));
+    let prepared = match runtime_key {
+        Some(key) => app_state.voice_cue_cache.get(&key),
+        None => app_state.voice_cue_cache.latest(),
+    };
     let playback = Arc::clone(&app_state.tts_audio_playback);
     let logging_enabled = app_state
         .runtime_config
@@ -3694,6 +3839,21 @@ async fn speak_local_tts_from_state(
         playback: Arc::clone(&app_state.tts_audio_playback),
         playback_id,
     };
+    if runtime.neural_client().is_some() {
+        return neural_speech::speak(
+            app_state,
+            runtime,
+            text,
+            playback_id,
+            speech_generation.is_some(),
+            generation,
+        )
+        .await;
+    }
+    #[cfg(feature = "app-benchmark")]
+    if speech_generation.is_some() {
+        app_benchmark::mark_once("reply_synthesis_requested");
+    }
     let result =
         spawn_runtime_blocking(move || runtime.synthesize_for_generation(&text, generation)).await;
     let audio = match result {
@@ -3746,6 +3906,7 @@ async fn speak_local_tts_from_state(
                 #[cfg(feature = "app-benchmark")]
                 if speech_generation.is_some() {
                     app_benchmark::mark("reply_output_submitted");
+                    app_benchmark::mark_once("reply_output_activated");
                 }
             },
         )
@@ -4244,6 +4405,7 @@ async fn set_assistant_settings(
 ) -> Result<AssistantSettingsCommandPayload, voxgolem_core::ipc::CommandError> {
     let result = set_assistant_settings_from_state(settings, &app_state).await?;
     spawn_custom_and_web_prewarm(&app);
+    desktop_voice_adapter::prepare_cues(&app);
     Ok(result)
 }
 
@@ -5853,17 +6015,17 @@ impl DesktopConversationRuntime {
                 };
                 let (outcome, terminal, disposition) = match attempt {
                     CompletionAttempt::Cancelled => {
-                        return (Ok(CommitAssistantResult::Cancelled), None)
+                        return (Ok(CommitAssistantResult::Cancelled), None);
                     }
                     CompletionAttempt::Unavailable => {
-                        return (Err(String::from("completion authority unavailable")), None)
+                        return (Err(String::from("completion authority unavailable")), None);
                     }
                     CompletionAttempt::Finished(Ok(completed)) if completed.saved => {
                         let turn = match ipc::turn_from_record(&completed.record, Some(request_id))
                         {
                             Ok(turn) => turn,
                             Err(_) => {
-                                return (Err(String::from("saved turn projection failed")), None)
+                                return (Err(String::from("saved turn projection failed")), None);
                             }
                         };
                         let refusal =
@@ -5876,7 +6038,7 @@ impl DesktopConversationRuntime {
                         let outcome = match outcome {
                             Ok(outcome) => outcome,
                             Err(_) => {
-                                return (Err(String::from("saved turn projection failed")), None)
+                                return (Err(String::from("saved turn projection failed")), None);
                             }
                         };
                         (
@@ -5909,7 +6071,7 @@ impl DesktopConversationRuntime {
                                 return (
                                     Err(String::from("unsaved result validation failed")),
                                     None,
-                                )
+                                );
                             }
                         };
                         **unsaved = Some(Arc::clone(&projection));
@@ -6418,7 +6580,7 @@ impl DesktopStageDispatcher<'_> {
                     &request_id,
                     error,
                     current_runtime_phase(&app_state.voice_pipeline_state),
-                )
+                );
             }
         };
         let RegisteredAssistantRequest {
@@ -6758,7 +6920,7 @@ impl DesktopStageDispatcher<'_> {
                         &request_id,
                         assistant_request.generation,
                         &active_prompt_control,
-                    )
+                    );
                 }
                 Err(PromptControlError::Error(error)) => {
                     if let Err(publication) = emit_prompt_event_controlled(
@@ -6777,7 +6939,7 @@ impl DesktopStageDispatcher<'_> {
                                     &request_id,
                                     assistant_request.generation,
                                     &active_prompt_control,
-                                )
+                                );
                             }
                             PromptControlError::Error(error) => return Err(error),
                         }
@@ -6999,7 +7161,7 @@ impl DesktopStageDispatcher<'_> {
                             &request_id,
                             assistant_request.generation,
                             &active_prompt_control,
-                        )
+                        );
                     }
                     PromptControlError::Error(error) => return Err(error),
                 }
@@ -7342,13 +7504,16 @@ async fn submit_custom_prompt(
                             request_id,
                             assistant_request.generation,
                             cancellation.control,
-                        )
+                        );
                     }
                     PromptControlError::Error(error) => return Err(error),
                 }
             }
             if native_search && assistant_request.preferences.deep_enabled {
-                let unavailable = format!("{}\n\nNative web retrieval failed: {}. Do not claim source verification or browse independently.", prompt, message);
+                let unavailable = format!(
+                    "{}\n\nNative web retrieval failed: {}. Do not claim source verification or browse independently.",
+                    prompt, message
+                );
                 deep_task = start_deep_task(
                     app,
                     request_id,
@@ -7566,7 +7731,7 @@ fn fail_started_prompt(
     ) {
         match publication {
             PromptControlError::Cancelled => {
-                return finish_cancelled_prompt(app, app_state, request_id, generation, control)
+                return finish_cancelled_prompt(app, app_state, request_id, generation, control);
             }
             PromptControlError::Error(error) => return Err(error),
         }
@@ -7798,9 +7963,10 @@ fn cancel_active_tts_generation(app_state: &AppState) {
     if let Ok(mut reply) = app_state.native_reply.lock() {
         let _ = reply.reset();
     }
-    if let Ok(mut pending) = app_state.native_speech_pending.lock() {
-        pending.take();
+    if let Ok(mut pending) = app_state.native_speech_delivery.lock() {
+        pending.cancel();
     }
+    app_state.native_speech_notify.notify_all();
     let playback_id = app_state
         .tts_playback
         .lock()
@@ -7958,7 +8124,7 @@ async fn stream_local_prompt(
     let (answer, _rolled_over) = match result {
         Ok(result) => result,
         Err(_error) if cancelled.load(Ordering::Acquire) => {
-            return Err(PromptControlError::Cancelled)
+            return Err(PromptControlError::Cancelled);
         }
         Err(error) => return Err(PromptControlError::Error(error)),
     };
@@ -9518,7 +9684,7 @@ impl DesktopConversationRuntime {
                 _ => {
                     return Err(String::from(
                         "unsaved response requires matching explicit discard",
-                    ))
+                    ));
                 }
             }
             if target.is_none() {
@@ -12279,7 +12445,7 @@ fn configured_capabilities(
                 "wake_word" => config.wake_word_model_path.is_file(),
                 "vad" => config.silero_vad_model.is_file(),
                 "parakeet" => config.parakeet_model_dir.is_dir(),
-                "tts" => config.local_tts.model_path.is_file(),
+                "tts" => config.local_tts.assets_configured(),
                 "deep" | "review" => custom_configured || opencode_configured,
                 _ => false,
             };
@@ -13084,6 +13250,9 @@ fn initialize_app_state(init: AppStateInit) -> AppState {
             "OpenCode startup is pending",
         );
     }
+    let early_neural = init.runtime_config.as_ref().is_some_and(|config| {
+        config.local_tts.provider == voxgolem_core::config::TtsProvider::Neural
+    });
     AppState {
         conversation: DesktopConversationRuntime::new(init.lifecycle_gate, init.assistant_policy),
         network_preferences: Arc::new(Mutex::new(network_preferences)),
@@ -13092,8 +13261,15 @@ fn initialize_app_state(init: AppStateInit) -> AppState {
         microphone_capture: init.microphone_capture,
         native_voice: Arc::new(desktop_voice::DesktopVoiceRuntime::new()),
         native_observation: Mutex::new(desktop_observation::DesktopObservation::new()),
-        native_reply: Arc::new(Mutex::new(reply_speech::ReplySpeech::default())),
-        native_speech_pending: Mutex::new(None),
+        native_reply: Arc::new(Mutex::new(if early_neural {
+            reply_speech::ReplySpeech::early_clauses()
+        } else {
+            reply_speech::ReplySpeech::default()
+        })),
+        native_speech_delivery: Arc::new(Mutex::new(
+            voxgolem_core::speech_delivery::SpeechDelivery::new(1),
+        )),
+        native_speech_notify: Arc::new(Condvar::new()),
         native_speech_running: AtomicBool::new(false),
         native_reply_execution: Mutex::new(None),
         native_speech_worker: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -13109,7 +13285,7 @@ fn initialize_app_state(init: AppStateInit) -> AppState {
         completion_update_guard: Arc::new(Mutex::new(None)),
         update_installation_gate: Arc::new(UpdateActivity::default()),
         tts_playback: Arc::new(Mutex::new(TtsPlaybackState::default())),
-        voice_cue_cache: tokio::sync::OnceCell::new(),
+        voice_cue_cache: Arc::new(voice_cues::CueCache::default()),
         cue_playback_workers: Arc::new(tokio::sync::Semaphore::new(2)),
         wake_clip_writers: Arc::new(tokio::sync::Semaphore::new(
             WAKE_CLIP_WRITER_PERMITS as usize,
@@ -13192,7 +13368,7 @@ fn build_app_state<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> AppState {
             let parakeet_runtime: ParakeetRuntimeSlot = Arc::new(Mutex::new(None));
             let effective_tts_enabled = resolve_effective_tts_enabled(
                 config.local_tts.enabled,
-                config.local_tts.model_path.is_file(),
+                config.local_tts.assets_configured(),
             );
             // TTS is optional and native provider construction can be slow or stuck. It is
             // warmed after the shell state exists so it cannot delay unrelated startup.
@@ -13444,17 +13620,27 @@ fn initialize_local_tts_runtime(
     }
 
     log_tts_runtime_event(diagnostics, diagnostics::TtsEvent::InitializationStarted);
-    if tts::resolve_strict_windows_espeak_data_directory()
-        .map_err(|error| {
-            log_tts_runtime_event(diagnostics, diagnostics::TtsEvent::InitializationFailed);
-            format!("failed to resolve strict eSpeak data root: {error}")
-        })?
-        .is_some()
+    if config.provider == voxgolem_core::config::TtsProvider::Piper
+        && tts::resolve_strict_windows_espeak_data_directory()
+            .map_err(|error| {
+                log_tts_runtime_event(diagnostics, diagnostics::TtsEvent::InitializationFailed);
+                format!("failed to resolve strict eSpeak data root: {error}")
+            })?
+            .is_some()
     {
         log_tts_runtime_event(diagnostics, diagnostics::TtsEvent::DataRootReady);
     }
 
     let spec = tts::LocalTtsRuntimeSpec {
+        neural: (config.provider == voxgolem_core::config::TtsProvider::Neural).then(|| {
+            tts::NeuralTtsRuntimeSpec {
+                options: voxgolem_platform::neural_tts::NeuralTtsOptions {
+                    endpoint: config.endpoint.clone(),
+                    start_command: config.start_command.clone(),
+                },
+                voice: config.voice.clone(),
+            }
+        }),
         model_path: Some(config.model_path.clone()),
         worker_count: config.worker_count,
         max_queue: config.max_queue,
@@ -13578,7 +13764,9 @@ fn load_llama_cpp_system_prompt() -> Result<String, String> {
         return Err(format!("{} is empty", soul_path.display()));
     }
 
-    Ok(format!("{trimmed}\n\nNo tools or web lookup are available on this local model route. Answer from the conversation and existing knowledge; explain when current information cannot be verified. Never claim a lookup or invent retrieved evidence."))
+    Ok(format!(
+        "{trimmed}\n\nNo tools or web lookup are available on this local model route. Answer from the conversation and existing knowledge; explain when current information cannot be verified. Never claim a lookup or invent retrieved evidence."
+    ))
 }
 
 fn current_runtime_phase(
@@ -14765,7 +14953,7 @@ pub fn run() {
             if let Some(config) = app.state::<AppState>().runtime_config.as_ref() {
                 if resolve_effective_tts_enabled(
                     config.local_tts.enabled,
-                    config.local_tts.model_path.is_file(),
+                    config.local_tts.assets_configured(),
                 ) {
                     let tts_config = config.local_tts.clone();
                     let startup_generation = app
@@ -14793,7 +14981,20 @@ pub fn run() {
                             return;
                         }
                         let result =
-                            initialize_local_tts_runtime(&tts_config, true, &state.telemetry_sink);
+                            initialize_local_tts_runtime(&tts_config, true, &state.telemetry_sink)
+                                .and_then(|runtime| {
+                                    if let Some(runtime) = runtime.as_ref() {
+                                        let preferences =
+                                            state.network_preferences.lock().map_err(|_| {
+                                                String::from("speech preferences unavailable")
+                                            })?;
+                                        runtime.set_neural_voice(
+                                            preferences.speech_tts_voice.as_str(),
+                                            "",
+                                        )?;
+                                    }
+                                    Ok(runtime)
+                                });
                         if !runtime_startup_is_current(
                             &state.exit_cleanup_started,
                             &startup_generation_state,
@@ -16497,6 +16698,10 @@ mod tests {
             silence_timeout_ms: DEFAULT_SILENCE_TIMEOUT_MS,
             wake_word_detection_threshold: 0.68,
             local_tts: voxgolem_core::config::LocalTtsConfig {
+                provider: voxgolem_core::config::TtsProvider::Piper,
+                endpoint: String::from("http://127.0.0.1:8765"),
+                voice: String::new(),
+                start_command: Vec::new(),
                 enabled: false,
                 model_path: root.join("tts.onnx"),
                 worker_count: 1,

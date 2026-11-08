@@ -1,5 +1,7 @@
 package dev.gitblame.voxgolem.android.wear.assistant
 
+import dev.gitblame.voxgolem.assistant.speech.RustObservedVoiceSelector
+
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
@@ -108,7 +110,7 @@ internal class WearAssistantVoice(
         recordingEnabled: () -> Boolean = { false }) :
         this(engine, SharedDictationOwner.configuredWithAudio(context, { engine.snapshot().speechAdmission() },
                 audio = recordedVoiceCapture(context), providerGate = providerGate, recordingEnabled = recordingEnabled),
-            LocalSpeechOutput.configured(context) { engine.snapshot().speechAdmission() }, AssistantEnginePort(engine),
+            LocalSpeechOutput.configured(context, RustObservedVoiceSelector()) { engine.snapshot().speechAdmission() }, AssistantEnginePort(engine),
             listeningCue = AndroidListeningCue(context.applicationContext),
             context = context.applicationContext)
     private val observers = mutableListOf<(AssistantVoiceState) -> Unit>()
@@ -236,7 +238,7 @@ internal class WearAssistantVoice(
     }
     private fun admitSpeechSelection(selection: SpeechSelection): Boolean {
         if (!inventoryReady() || !foreground || snapshot().active || engine.snapshot().busy || selectionSettlement.get() != null) return false
-        try { options().validate(selection, engine.snapshot().speechNetworkFallback) }
+        try { options().validate(selection, engine.snapshot().speechNetworkFallback, RustObservedVoiceSelector()) }
         catch (failure: IllegalArgumentException) { error = failure.message; publish(); return false }
         return true
     }

@@ -11,9 +11,9 @@ import dev.gitblame.voxgolem.assistant.AssistantTiming.Operation
 import dev.gitblame.voxgolem.assistant.AssistantTiming.Stage
 import dev.gitblame.voxgolem.assistant.recognition.RecognitionResourceLease
 import org.junit.Assert.*
+import org.robolectric.RobolectricTestRunner
 import org.junit.Test
 import org.junit.runner.RunWith
-import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
@@ -30,6 +30,7 @@ import java.time.Duration
 @Config(sdk = [35], manifest = Config.NONE)
 @LooperMode(LooperMode.Mode.PAUSED)
 class AndroidLocalTtsFactoryTest {
+    private val selector = ScriptedVoiceSelector()
     @Test @Config(shadows = [RecordingTtsShadow::class]) fun nativeTimingSeparatesInitDispatchAndAttributesOnlyMatchingUtteranceCallbacks() {
         val context = RuntimeEnvironment.getApplication()
         context.applicationInfo.flags = context.applicationInfo.flags or ApplicationInfo.FLAG_DEBUGGABLE
@@ -169,7 +170,7 @@ class AndroidLocalTtsFactoryTest {
         ShadowTextToSpeech.addVoice(Voice("synthetic-local", Locale.US, Voice.QUALITY_NORMAL, Voice.LATENCY_NORMAL, false, emptySet()))
         val leases = RecognitionResourceLease()
         var requests = 0; var releases = 0
-        val output = LocalSpeechOutput(AndroidLocalTtsFactory(RuntimeEnvironment.getApplication()), object : SpeechAudioFocus {
+        val output = LocalSpeechOutput(selector, AndroidLocalTtsFactory(RuntimeEnvironment.getApplication()), object : SpeechAudioFocus {
             override fun acquire(onLoss: () -> Unit): Boolean { requests++; return true }
             override fun release() { releases++ }
         }, leases = leases)
@@ -252,7 +253,7 @@ class AndroidLocalTtsFactoryTest {
                 override fun acquire(onLoss: () -> Unit): Boolean { focusRequests++; return true }
                 override fun release() {}
             }
-            fun prepare() = LocalSpeechOutput(factory, focus, leases = RecognitionResourceLease()).also {
+            fun prepare() = LocalSpeechOutput(selector, factory, focus, leases = RecognitionResourceLease()).also {
                 it.setForeground(true); it.setEnabled(true); it.prepare("en-US")
                 shadowOf(Looper.getMainLooper()).idle()
             }
@@ -349,6 +350,7 @@ class AndroidLocalTtsFactoryTest {
         session.shutdown()
     }
     @Test fun strictGoogleVoiceInventoryCannotOfferARejectedNetworkSelection() {
+        selector.answer = { _, _, _, _, _ -> -1 }
         ShadowTextToSpeech.addVoice(Voice("synthetic-offline", Locale.US,
             Voice.QUALITY_NORMAL, Voice.LATENCY_NORMAL, false, emptySet()))
         ShadowTextToSpeech.addVoice(Voice("synthetic-online", Locale.US,
@@ -360,7 +362,7 @@ class AndroidLocalTtsFactoryTest {
             SpeechServiceRequirement.GOOGLE_SPEECH_PACKAGE, it.name, it.locale.toLanguageTag(), it.networkRequired) })
         assertThrows(IllegalArgumentException::class.java) {
             options.validate(SpeechSelection(ttsProvider = SpeechServiceRequirement.GOOGLE_SPEECH_PACKAGE,
-                ttsVoice = "synthetic-online"), networkFallback = true)
+                ttsVoice = "synthetic-online"), networkFallback = true, selector = selector)
         }
         assertTrue(session.speak("Synthetic offline reply", voices.single()) {})
         session.shutdown()
@@ -379,7 +381,7 @@ class AndroidLocalTtsFactoryTest {
         ShadowTextToSpeech.addVoice(Voice("synthetic-network-only", Locale.US,
             Voice.QUALITY_NORMAL, Voice.LATENCY_NORMAL, true, emptySet()))
         val terminals = mutableListOf<String?>()
-        val output = LocalSpeechOutput(AndroidLocalTtsFactory(context, strictGoogleOnly = true), object : SpeechAudioFocus {
+        val output = LocalSpeechOutput(selector, AndroidLocalTtsFactory(context, strictGoogleOnly = true), object : SpeechAudioFocus {
             override fun acquire(onLoss: () -> Unit) = true
             override fun release() {}
         }, leases = RecognitionResourceLease(), allowNetworkFallback = true)
@@ -393,13 +395,18 @@ class AndroidLocalTtsFactoryTest {
         output.close(); shadowOf(Looper.getMainLooper()).idle()
     }
 
-    @Test fun actualSdkSelectsInstalledLocalVoiceAndNeverNetworkOrMissingVoice() {
+    @Test fun actualSdkReceivesThePolicySelectedVoice() {
+        selector.answer = { _, _, _, _, voices ->
+            assertTrue(voices.any { it.name == "synthetic-missing" && !it.installed })
+            assertTrue(voices.any { it.name == "synthetic-network" && it.networkRequired })
+            voices.indexOfFirst { it.name == "synthetic-local" }
+        }
         ShadowTextToSpeech.addVoice(Voice("synthetic-network", Locale.US, Voice.QUALITY_NORMAL, Voice.LATENCY_NORMAL, true, emptySet()))
         ShadowTextToSpeech.addVoice(Voice("synthetic-missing", Locale.US, Voice.QUALITY_NORMAL, Voice.LATENCY_NORMAL, false,
             setOf(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED)))
         ShadowTextToSpeech.addVoice(Voice("synthetic-local", Locale.US, Voice.QUALITY_NORMAL, Voice.LATENCY_NORMAL, false, emptySet()))
         val leases = RecognitionResourceLease()
-        val output = LocalSpeechOutput(AndroidLocalTtsFactory(RuntimeEnvironment.getApplication()), object : SpeechAudioFocus {
+        val output = LocalSpeechOutput(selector, AndroidLocalTtsFactory(RuntimeEnvironment.getApplication()), object : SpeechAudioFocus {
             override fun acquire(onLoss: () -> Unit) = true
             override fun release() {}
         }, leases = leases)
@@ -414,6 +421,7 @@ class AndroidLocalTtsFactoryTest {
     }
 
     @Test @Config(shadows = [RecordingTtsShadow::class]) fun preparationWarmsResolvedRegionalVoiceOnMainBeforePlaybackWithoutAcquiringFocus() {
+        selector.answer = { _, _, _, _, voices -> voices.indexOfFirst { it.name == "synthetic-au-local" } }
         val context = RuntimeEnvironment.getApplication()
         AndroidLocalTtsFactory.clearVoiceCache(context)
         val australian = Voice("synthetic-au-local", Locale.forLanguageTag("en-AU"), Voice.QUALITY_NORMAL, Voice.LATENCY_NORMAL, false, emptySet())
@@ -422,7 +430,7 @@ class AndroidLocalTtsFactoryTest {
         AndroidLocalTtsFactory.cacheVoiceName(context, "en-AU", american.name)
         val leases = RecognitionResourceLease()
         var focusRequests = 0
-        val output = LocalSpeechOutput(AndroidLocalTtsFactory(context), object : SpeechAudioFocus {
+        val output = LocalSpeechOutput(selector, AndroidLocalTtsFactory(context), object : SpeechAudioFocus {
             override fun acquire(onLoss: () -> Unit): Boolean { focusRequests++; return true }
             override fun release() {}
         }, leases = leases)

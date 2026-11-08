@@ -52,16 +52,54 @@ class ReplySpeechStreamerTest {
         assertEquals(1, settled)
         assertEquals(1, output.finishes)
     }
+    @Test fun postedFinishCannotCertifyRetirementAndCleanupFailurePropagates() {
+        for (failure in listOf(null, "speech_cleanup_failed")) {
+            val output = Output().also { it.deferFinish = true }
+            val streamer = ReplySpeechStreamer(output)
+            var settlements = 0; var outcome: String? = "pending"
+            streamer.onComplete("Synthetic final answer.", "en") { settlements++; outcome = it }
+            output.callbacks.single()(null)
+            output.callbacks.single()(null) // Duplicate after Rust released the handle.
+            assertEquals(0, settlements)
+            assertEquals(1, output.finishes)
+            output.deferredFinish!!(failure)
+            output.deferredFinish!!(failure)
+            assertEquals(1, settlements)
+            assertEquals(failure, outcome)
+        }
+    }
+
+    @Test fun disableThenEnableDoesNotReplayPendingClauses() {
+        val output = Output(); val streamer = ReplySpeechStreamer(output)
+        streamer.onDelta("One two three. ", "en")
+        streamer.onDelta("One two three. Four five six. ", "en")
+        output.enabled = false
+        streamer.onDelta("One two three. Four five six. Seven eight nine. ", "en")
+        output.enabled = true
+        var settlements = 0
+        streamer.onComplete("One two three. Four five six. Seven eight nine.", "en") { settlements++ }
+        output.callbacks.forEach { it(null) }
+        assertEquals(2, output.texts.size)
+        assertEquals(1, settlements)
+    }
+
     private class Output : SpeechOutputController {
         override var enabled = true
         val texts = mutableListOf<String>()
+        val flushes = mutableListOf<Boolean>()
         val callbacks = mutableListOf<(String?) -> Unit>()
         var stops = 0
         var finishes = 0
+        var deferredFinish: ((String?) -> Unit)? = null
+        var deferFinish = false
         override fun speakStreamChunk(text: String, language: String?, flush: Boolean, keepOpen: Boolean, timingParent: AssistantTiming?, onDone: (String?) -> Unit) {
-            texts += text; callbacks += onDone
+            texts += text; flushes += flush; callbacks += onDone
         }
         override fun finishStream() { finishes++ }
+        override fun finishStream(onDone: (String?) -> Unit) {
+            finishes++
+            if (deferFinish) deferredFinish = onDone else onDone(null)
+        }
         override fun speak(finalText: String, language: String, timingParent: AssistantTiming?, onTerminal: (String?) -> Unit) { error("Unexpected unbounded speech path") }
         override fun stop() { stops++ }
     }
@@ -132,7 +170,20 @@ class ReplySpeechStreamerTest {
         assertTrue(FirstParagraphSpeech.extract(List(110) { "word" }.joinToString(" ")).split(' ').size <= 100)
     }
 
-    @Test fun nativeAdmissionsReleaseOnSettleResetAndClose() {
+    @Test fun nativeSettledHandlesRemainBoundedUntilPlaybackAcknowledges() {
+        val owners = List(64) { RustReplySpeech() }
+        try {
+            val chunks = owners.map { it.apply(2, "Synthetic final answer.").chunks.single() }
+            assertThrows(SpeechPolicyUnavailable::class.java) { RustReplySpeech() }
+            owners.zip(chunks).forEach { (owner, chunk) ->
+                assertTrue(owner.complete(chunk)!!.idle)
+                assertNull(owner.complete(chunk))
+            }
+            RustReplySpeech().close()
+        } finally { owners.forEach { it.close() } }
+    }
+
+    @Test fun nativeAdmissionsReleaseOnExplicitClose() {
         repeat(200) { RustReplySpeech().use { it.apply(2, "Synthetic final answer.") } }
         repeat(200) { RustReplySpeech().close() }
     }
@@ -200,6 +251,20 @@ class ReplySpeechStreamerTest {
         val owners = List(64) { RustReplySpeech() }
         try { assertEquals("Synthetic answer.", FirstParagraphSpeech.extract("Synthetic answer.\nignored")) }
         finally { owners.forEach { it.close() } }
+    }
+
+    @Test fun canonicalSuffixAfterDrainedParagraphStartsANewSdkStreamWithoutReplay() {
+        val output = Output(); val streamer = ReplySpeechStreamer(output)
+        streamer.onDelta("One two three.\n", "en")
+        output.callbacks[0](null)
+        assertEquals(1, output.finishes)
+        var settled = 0
+        streamer.onComplete("One two three. Four five six.", "en") { settled++ }
+        assertEquals(listOf("One two three.", "Four five six."), output.texts)
+        assertEquals(listOf(true, true), output.flushes)
+        output.callbacks[1](null)
+        assertEquals(1, settled)
+        assertEquals(2, output.finishes)
     }
 
     @Test fun closedParagraphReleasesStreamButWaitsForPlaybackAndCanonicalSettlement() {

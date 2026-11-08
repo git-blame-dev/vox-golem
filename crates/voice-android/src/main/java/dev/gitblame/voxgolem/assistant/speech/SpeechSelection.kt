@@ -35,7 +35,7 @@ data class SpeechOptions(
         recognitionInstalledLanguages = recognitionInstalledLanguages?.filter { it.length <= 64 }?.mapNotNull { SpeechLocales.parse(it)?.toLanguageTag() }?.distinct()?.take(128),
         recognitionSupportedLanguages = recognitionSupportedLanguages?.filter { it.length <= 64 }?.mapNotNull { SpeechLocales.parse(it)?.toLanguageTag() }?.distinct()?.take(128))
 
-    fun validate(selection: SpeechSelection, networkFallback: Boolean) {
+    fun validate(selection: SpeechSelection, networkFallback: Boolean, selector: ObservedVoiceSelector) {
         selection.validateShape()
         if (selection.language.isNotEmpty()) {
             val languages = if (networkFallback) recognitionSupportedLanguages else recognitionInstalledLanguages
@@ -46,10 +46,11 @@ data class SpeechOptions(
         if (selection.ttsVoice.isNotEmpty()) {
             val requested = SpeechLocales.parse(selection.language.ifEmpty { Locale.getDefault().toLanguageTag() })
                 ?: throw IllegalArgumentException("unsupported_speech_language")
-            require(ttsVoices.any { it.provider == selection.ttsProvider && it.name == selection.ttsVoice &&
-                (networkFallback || !it.networkRequired) && SpeechLocales.parse(it.language)?.let { locale ->
-                    locale.language == requested.language && (requested.script.isEmpty() || locale.script.isEmpty() || locale.script == requested.script)
-                } == true }) { "unsupported_tts_voice" }
+            // Validate only the requested opaque ID against observed SDK metadata.
+            val observed = ttsVoices.filter { it.provider == selection.ttsProvider && it.name == selection.ttsVoice }.mapNotNull {
+                SpeechLocales.parse(it.language)?.let { locale -> LocalVoice(it.name, locale, it.networkRequired, true) }
+            }
+            require(selector.select(requested, networkFallback, selection.ttsVoice, null, observed) in observed.indices) { "unsupported_tts_voice" }
         }
     }
 
@@ -63,4 +64,10 @@ data class SpeechOptions(
             .put("localOnlyRecognitionAvailable", value.localOnlyRecognitionAvailable)
             .put("modelSelectionAvailable", false).put("modelIdentifiers", JSONObject.NULL)
     }
+}
+
+/** SDK-normalized observations in; selected index (or -1) out. The caller owns policy. */
+fun interface ObservedVoiceSelector {
+    fun select(requested: Locale, networkAllowed: Boolean, explicitVoice: String,
+        defaultVoice: String?, voices: List<LocalVoice>): Int
 }

@@ -21,6 +21,25 @@ Desktop and phone share the responsive React UI. Wear uses native Kotlin/Compose
 
 Linux builds and tests do not establish Windows, Android or Wear runtime readiness. Real microphone, speech provider, gestures, lifecycle, GMS transport and optimized JNI paths require device acceptance.
 
+## Desktop speech
+
+Desktop can select `provider = "neural"` under `[tts]` in the runtime config.
+Neural TTS supplies synthesis and its installed voice catalog over loopback;
+Vox owns bounded native playback, Stop, cues and output drain. Settings exposes
+voice selection and an explicit service reconnect. Android and Wear continue to
+use their native TTS SDKs, with portable delivery and voice eligibility in Rust.
+
+`endpoint` defaults to `http://127.0.0.1:8765`. Leave `start_command = []` for an
+externally managed service, or configure a trusted executable and literal argument
+array to start it on demand. No shell expansion is performed. The service and its
+models are installed separately; model/reference paths belong to its local config.
+Vox releases only its own session when exiting and never terminates another client's
+service. Service startup and inference can delay the first reply. Current Qwen
+produces complete utterances; framed PCM transport does not imply incremental model
+audio. Fixed spoken cues prepare outside microphone admission, with embedded cues
+available immediately. Piper remains the transitional default until Windows Neural
+acceptance; `provider = "piper"` keeps the existing model configuration usable.
+
 ## Desktop local diagnostics
 
 `[telemetry].enabled` controls categorical model metadata; `[logging].enabled` controls categorical frontend/TTS events. Neither accepts prompt/answer/error text, paths, endpoints or request IDs. Model identifiers come from a closed public vocabulary. These desktop settings do not change Android/Wear diagnostics.

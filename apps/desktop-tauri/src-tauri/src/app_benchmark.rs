@@ -795,9 +795,9 @@ fn speech_retired(state: &AppState) -> bool {
     !state.native_speech_running.load(Ordering::Acquire)
         && state.native_speech_worker.available_permits() == 1
         && state
-            .native_speech_pending
+            .native_speech_delivery
             .lock()
-            .is_ok_and(|pending| pending.is_none())
+            .is_ok_and(|pending| pending.is_idle())
         && state
             .tts_playback
             .lock()

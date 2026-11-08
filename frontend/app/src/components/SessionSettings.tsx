@@ -184,6 +184,7 @@ export const SessionSettings = memo(function SessionSettings({ session, view }: 
             {isAndroidRuntime || supportsDesktopRuntime ? <SpeechSettings android={isAndroidRuntime} androidStatus={androidVoiceStatus} statusError={androidSpeechStatusError} startupState={startupState}
               speechNetworkFallback={assistantSettings.speechNetworkFallback} speechSelection={assistantSettings} disabled={instantControlsDisabled}
               onSpeechSelectionChange={patchAssistantSettings}
+              {...(supportsDesktopRuntime ? { onSpeechReconnect: () => { void toggleTts(true, true) } } : {})}
               onSpeechNetworkFallbackChange={(enabled) => patchAssistantSettings({ speechNetworkFallback: enabled })} /> : null}
             <section className="settings-panel__web" aria-labelledby="web-settings-title">
               <h3 id="web-settings-title">Web access</h3>

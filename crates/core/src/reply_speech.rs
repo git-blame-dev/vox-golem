@@ -374,8 +374,8 @@ mod tests {
     }
 }
 
-const MAX_BYTES: usize = 600;
-const MAX_WORDS: usize = 100;
+pub(crate) const MAX_BYTES: usize = 600;
+pub(crate) const MAX_WORDS: usize = 100;
 
 // ECMAScript trim / \s, deliberately not Rust's Unicode White_Space (U+0085 differs).
 fn whitespace(c: char) -> bool {
@@ -511,8 +511,8 @@ pub struct SpeechRequest {
 /// Apply `cancel` BEFORE `speak`: retire obsolete pending/output work. Invalidation is
 /// not physical retirement. Parent must retain physical work until it actually returns,
 /// and fence reserve/start/finish/error using `valid` under its admission synchronization
-/// (not a check-then-start race). Desktop keeps at most one replaceable pending
-/// synthesis; early-mode adapters own a bounded effect queue for ordered chunks.
+/// (not a check-then-start race). Feed these decisions to `SpeechDelivery` for
+/// bounded ordered pending work and exact playback acknowledgements.
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct Decision {
     pub cancel: bool,

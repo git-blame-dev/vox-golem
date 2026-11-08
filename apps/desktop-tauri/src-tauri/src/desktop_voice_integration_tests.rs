@@ -133,7 +133,15 @@ fn root_cancellation_retires_streaming_policy_pending_and_unstarted_ticket() {
             .unwrap()
     };
     let generation = speech.generation;
-    *state.native_speech_pending.lock().unwrap() = Some(speech);
+    state
+        .native_speech_delivery
+        .lock()
+        .unwrap()
+        .apply(reply_speech::Decision {
+            speak: Some(speech),
+            ..Default::default()
+        })
+        .unwrap();
     let ticket = reserve_speech(&state);
     assert!(state.native_reply.lock().unwrap().valid(generation));
     assert!(owns_speech(&state, ticket));
@@ -143,7 +151,7 @@ fn root_cancellation_retires_streaming_policy_pending_and_unstarted_ticket() {
     cancel_active_tts_generation(&state);
 
     assert!(!state.native_reply.lock().unwrap().valid(generation));
-    assert!(state.native_speech_pending.lock().unwrap().is_none());
+    assert!(state.native_speech_delivery.lock().unwrap().is_idle());
     assert!(state.tts_playback.lock().unwrap().current_id.is_none());
     assert!(!owns_speech(&state, ticket));
     assert!(state

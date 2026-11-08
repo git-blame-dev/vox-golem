@@ -17,6 +17,8 @@ pub mod llama_cpp;
 #[cfg(feature = "desktop")]
 pub mod managed_process;
 #[cfg(feature = "desktop")]
+pub mod neural_tts;
+#[cfg(feature = "desktop")]
 pub mod opencode;
 #[cfg(any(
     feature = "desktop",

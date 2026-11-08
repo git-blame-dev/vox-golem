@@ -1,5 +1,7 @@
 package dev.gitblame.voxgolem.android.wear.assistant
 
+import dev.gitblame.voxgolem.assistant.speech.RustObservedVoiceSelector
+
 import android.os.Looper
 import dev.gitblame.voxgolem.assistant.recognition.*
 import dev.gitblame.voxgolem.assistant.runtime.*
@@ -139,7 +141,7 @@ class AssistantManualReplySpeechTest {
     private val leases = RecognitionResourceLease()
     private val dictation = SharedDictationOwner(recognition, { true }, leases)
     private val tts = Tts()
-    private val output = LocalSpeechOutput(tts, object : SpeechAudioFocus {
+    private val output = LocalSpeechOutput(RustObservedVoiceSelector(), tts, object : SpeechAudioFocus {
         override fun acquire(onLoss: () -> Unit) = true
         override fun release() {}
     }, leases = leases)
@@ -181,7 +183,7 @@ class AssistantManualReplySpeechTest {
         }
         val input = SharedDictationOwner(recognizer, { true }, leases, configuration = ::admission)
         val tts = Tts()
-        val speech = LocalSpeechOutput(tts, object : SpeechAudioFocus {
+        val speech = LocalSpeechOutput(RustObservedVoiceSelector(), tts, object : SpeechAudioFocus {
             override fun acquire(onLoss: () -> Unit) = true
             override fun release() = Unit
         }, leases = leases, configuration = ::admission)
@@ -513,7 +515,7 @@ class AssistantManualReplySpeechTest {
         private val leases = RecognitionResourceLease()
         private val input = SharedDictationOwner(recognition, { true }, leases)
         val tts = Tts()
-        private val speech = LocalSpeechOutput(tts, object : SpeechAudioFocus {
+        private val speech = LocalSpeechOutput(RustObservedVoiceSelector(), tts, object : SpeechAudioFocus {
             override fun acquire(onLoss: () -> Unit) = true
             override fun release() {}
         }, leases = leases)
@@ -959,7 +961,7 @@ class AssistantManualReplySpeechTest {
             val localGeneration = Generation()
             val localTts = Tts()
             val localDictation = SharedDictationOwner(Recognition(), { true }, RecognitionResourceLease())
-            val localOutput = LocalSpeechOutput(localTts, object : SpeechAudioFocus {
+            val localOutput = LocalSpeechOutput(RustObservedVoiceSelector(), localTts, object : SpeechAudioFocus {
                 override fun acquire(onLoss: () -> Unit) = true
                 override fun release() {}
             }, leases = RecognitionResourceLease())

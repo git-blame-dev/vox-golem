@@ -12,12 +12,19 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct LocalTtsRuntimeSpec {
+    pub neural: Option<NeuralTtsRuntimeSpec>,
     pub model_path: Option<PathBuf>,
     pub worker_count: usize,
     pub max_queue: usize,
     pub sample_rate_hz: u32,
     pub max_duration_s: u64,
     pub provider_policy: TtsProviderPolicy,
+}
+
+#[derive(Debug, Clone)]
+pub struct NeuralTtsRuntimeSpec {
+    pub options: voxgolem_platform::neural_tts::NeuralTtsOptions,
+    pub voice: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +49,11 @@ pub struct LocalTtsAudio {
 
 #[derive(Debug)]
 pub struct LocalTtsRuntime {
+    neural: Option<Arc<voxgolem_platform::neural_tts::NeuralTtsClient>>,
+    neural_voice: Mutex<String>,
+    neural_default_voice: String,
+    cue_epoch: u64,
+    neural_cancellations: Mutex<Vec<std::sync::Weak<voxgolem_platform::neural_tts::Cancellation>>>,
     generation: Arc<AtomicU64>,
     sample_rate_hz: u32,
     max_duration_ms: u64,
@@ -52,6 +64,7 @@ pub struct LocalTtsRuntime {
     shutdown: Arc<AtomicBool>,
 }
 
+static NEXT_NEURAL_RUNTIME: AtomicU64 = AtomicU64::new(1);
 const MAX_TTS_INPUT_BYTES: usize = 4096;
 const MAX_SYNTHESIS_WAIT_MS: u64 = 10 * 60 * 1_000;
 const WORKER_INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(8);
@@ -120,7 +133,7 @@ pub(crate) fn wait_for_physical_retirement(timeout: Duration) -> bool {
 /// Reserved before publishing work to another thread, so startup and queue handoffs
 /// cannot temporarily appear idle. The native permit takes over cancelled synthesis.
 #[derive(Debug)]
-struct PhysicalWork;
+pub(crate) struct PhysicalWork;
 
 impl PhysicalWork {
     fn begin() -> Self {
@@ -279,6 +292,41 @@ const SYNTHESIS_CANCELLED: &str = "local tts synthesis request was cancelled or 
 
 impl LocalTtsRuntime {
     pub fn new(spec: LocalTtsRuntimeSpec) -> Result<Self, String> {
+        if let Some(neural) = spec.neural.clone() {
+            let client = tauri::async_runtime::block_on(
+                voxgolem_platform::neural_tts::NeuralTtsClient::connect(&neural.options),
+            )
+            .map_err(|error| error.to_string())?;
+            let rate = client.capabilities().sample_rate_hz;
+            let voice = client
+                .capabilities()
+                .resolve_voice(&neural.voice)
+                .ok_or_else(|| String::from("configured Neural TTS voice is unavailable"))?
+                .id
+                .clone();
+            let limits = voxgolem_core::config::validate_tts_resource_limits(
+                1,
+                spec.max_queue,
+                rate,
+                spec.max_duration_s,
+            )
+            .map_err(|error| error.format_with_prefix("tts "))?;
+            return Ok(Self {
+                neural: Some(Arc::new(client)),
+                neural_default_voice: voice.clone(),
+                neural_voice: Mutex::new(voice),
+                cue_epoch: NEXT_NEURAL_RUNTIME.fetch_add(1, Ordering::Relaxed),
+                neural_cancellations: Mutex::new(Vec::new()),
+                generation: Arc::new(AtomicU64::new(0)),
+                sample_rate_hz: rate,
+                max_duration_ms: limits.max_duration_ms,
+                max_duration_samples: limits.max_duration_samples,
+                sender: None,
+                _workers: Vec::new(),
+                actual_provider: None,
+                shutdown: Arc::new(AtomicBool::new(false)),
+            });
+        }
         let max_duration_s = spec.max_duration_s;
         let engine_factory: SynthesisEngineFactory =
             Arc::new(move |model_path, sample_rate_hz, policy| {
@@ -505,7 +553,7 @@ impl LocalTtsRuntime {
                                         Err(mpsc::RecvTimeoutError::Disconnected) => {
                                             break Err(String::from(
                                                 "local tts synthesis worker exited unexpectedly",
-                                            ))
+                                            ));
                                         }
                                     }
                                 };
@@ -597,6 +645,11 @@ impl LocalTtsRuntime {
         }
 
         Ok(Self {
+            neural: None,
+            neural_voice: Mutex::new(String::new()),
+            neural_default_voice: String::new(),
+            cue_epoch: 0,
+            neural_cancellations: Mutex::new(Vec::new()),
             generation,
             sample_rate_hz: limits.sample_rate_hz,
             max_duration_ms: limits.max_duration_ms,
@@ -617,16 +670,40 @@ impl LocalTtsRuntime {
     }
 
     pub fn start_generation(&self) -> u64 {
-        self.generation
+        self.advance_generation()
+    }
+
+    fn advance_generation(&self) -> u64 {
+        // Admission and cancellation share this lock: a stale token can neither
+        // register after Stop nor escape the cancellation already in progress.
+        let mut tokens = self
+            .neural_cancellations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let generation = self
+            .generation
             .fetch_add(1, Ordering::AcqRel)
-            .saturating_add(1)
+            .saturating_add(1);
+        tokens.retain(|token| {
+            if let Some(token) = token.upgrade() {
+                token.cancel();
+                true
+            } else {
+                false
+            }
+        });
+        generation
     }
 
     pub fn cancel_generation(&self) {
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.advance_generation();
     }
 
     pub fn shutdown_bounded(&mut self) {
+        self.cancel_generation();
+        if let Some(client) = &self.neural {
+            client.close();
+        }
         self.shutdown.store(true, Ordering::Release);
         self.sender.take();
         let mut running_workers = Vec::new();
@@ -651,14 +728,32 @@ impl LocalTtsRuntime {
         text: &str,
         generation: u64,
     ) -> Result<LocalTtsAudio, String> {
-        self.synthesize_inner(text, generation)
+        self.synthesize_inner(text, generation, None)
     }
 
     pub fn synthesize(&self, text: &str) -> Result<LocalTtsAudio, String> {
-        self.synthesize_inner(text, self.generation.load(Ordering::Acquire))
+        self.synthesize_inner(text, self.generation.load(Ordering::Acquire), None)
     }
 
-    fn synthesize_inner(&self, text: &str, generation: u64) -> Result<LocalTtsAudio, String> {
+    pub(crate) fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn synthesize_cue(
+        &self,
+        text: &str,
+        voice: &str,
+        generation: u64,
+    ) -> Result<LocalTtsAudio, String> {
+        self.synthesize_inner(text, generation, Some(voice))
+    }
+
+    fn synthesize_inner(
+        &self,
+        text: &str,
+        generation: u64,
+        voice_override: Option<&str>,
+    ) -> Result<LocalTtsAudio, String> {
         let text = text.trim();
         if text.is_empty() {
             return Err(String::from("tts text must not be empty"));
@@ -667,6 +762,35 @@ impl LocalTtsRuntime {
             return Err(format!(
                 "tts text exceeds maximum of {MAX_TTS_INPUT_BYTES} bytes"
             ));
+        }
+
+        if generation != self.generation.load(Ordering::Acquire) {
+            return Err(String::from(SYNTHESIS_CANCELLED));
+        }
+        if let Some(client) = &self.neural {
+            let _work = PhysicalWork::begin();
+            let (cancellation, voice) = self.neural_request(generation)?;
+            let audio = tauri::async_runtime::block_on(async {
+                if let Some(voice) = voice_override {
+                    client.collect_background(text, voice, cancellation).await
+                } else {
+                    client.collect(text, &voice, cancellation).await
+                }
+            })
+            .map_err(|error| error.to_string())?;
+            if generation != self.generation.load(Ordering::Acquire) {
+                return Err(String::from(SYNTHESIS_CANCELLED));
+            }
+            let duration_ms = audio.samples.len() as u64 * 1000 / u64::from(audio.sample_rate_hz);
+            if audio.samples.len() > self.max_duration_samples || duration_ms > self.max_duration_ms
+            {
+                return Err(String::from("Neural TTS audio exceeds configured duration"));
+            }
+            return Ok(LocalTtsAudio {
+                pcm_f32: audio.samples,
+                sample_rate_hz: audio.sample_rate_hz,
+                duration_ms,
+            });
         }
 
         let Some(sender) = self.sender.as_ref() else {
@@ -724,6 +848,82 @@ impl LocalTtsRuntime {
         }
 
         Ok(audio)
+    }
+
+    pub(crate) fn neural_client(
+        &self,
+    ) -> Option<Arc<voxgolem_platform::neural_tts::NeuralTtsClient>> {
+        self.neural.clone()
+    }
+
+    pub(crate) fn selected_neural_voice(&self) -> Option<String> {
+        self.neural.as_ref()?;
+        self.neural_voice.lock().ok().map(|voice| voice.clone())
+    }
+
+    pub(crate) fn neural_request(
+        &self,
+        expected_generation: u64,
+    ) -> Result<(Arc<voxgolem_platform::neural_tts::Cancellation>, String), String> {
+        let token = Arc::new(voxgolem_platform::neural_tts::Cancellation::default());
+        let mut tokens = self
+            .neural_cancellations
+            .lock()
+            .map_err(|_| String::from("Neural TTS cancellation state unavailable"))?;
+        tokens.retain(|token| token.strong_count() != 0);
+        if self.generation.load(Ordering::Acquire) != expected_generation {
+            return Err(String::from(SYNTHESIS_CANCELLED));
+        }
+        if tokens.len() >= 16 || self.shutdown.load(Ordering::Acquire) {
+            return Err(String::from("Neural TTS admission unavailable"));
+        }
+        tokens.push(Arc::downgrade(&token));
+        let voice = self
+            .neural_voice
+            .lock()
+            .map_err(|_| String::from("Neural TTS voice state unavailable"))?
+            .clone();
+        Ok((token, voice))
+    }
+
+    pub(crate) fn set_neural_voice(&self, requested: &str, configured: &str) -> Result<(), String> {
+        if let Some(client) = &self.neural {
+            let requested = if requested.is_empty() {
+                if configured.is_empty() {
+                    &self.neural_default_voice
+                } else {
+                    configured
+                }
+            } else {
+                requested
+            };
+            let voice = client
+                .capabilities()
+                .resolve_voice(requested)
+                .ok_or_else(|| String::from("selected Neural TTS voice is unavailable"))?;
+            *self
+                .neural_voice
+                .lock()
+                .map_err(|_| String::from("Neural TTS voice state unavailable"))? =
+                voice.id.clone();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cue_key(&self) -> String {
+        self.cue_key_for_voice(&self.selected_neural_voice().unwrap_or_default())
+    }
+
+    pub(crate) fn cue_key_for_voice(&self, voice: &str) -> String {
+        if self.neural.is_some() {
+            format!("neural:{}:{}", self.cue_epoch, voice)
+        } else {
+            String::from("piper")
+        }
+    }
+
+    pub(crate) fn track_neural_work(&self) -> PhysicalWork {
+        PhysicalWork::begin()
     }
 }
 
@@ -1586,6 +1786,51 @@ mod tests {
     }
 
     #[test]
+    fn stop_between_generation_check_and_token_registration_rejects_stale_admission() {
+        let runtime = Arc::new(LocalTtsRuntime {
+            neural: None,
+            neural_voice: Mutex::new(String::new()),
+            neural_default_voice: String::new(),
+            cue_epoch: 0,
+            neural_cancellations: Mutex::new(Vec::new()),
+            generation: Arc::new(super::AtomicU64::new(0)),
+            sample_rate_hz: 24000,
+            max_duration_ms: 1000,
+            max_duration_samples: 24000,
+            sender: None,
+            _workers: Vec::new(),
+            actual_provider: None,
+            shutdown: Arc::new(super::AtomicBool::new(false)),
+        });
+        let old_generation = runtime.start_generation();
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let delayed_runtime = Arc::clone(&runtime);
+        let delayed_gate = Arc::clone(&gate);
+        let delayed = thread::spawn(move || {
+            delayed_gate.wait();
+            delayed_runtime.neural_request(old_generation)
+        });
+        runtime.cancel_generation();
+        gate.wait();
+        assert!(
+            delayed.join().unwrap().is_err(),
+            "obsolete inference must not be admitted"
+        );
+        assert_eq!(
+            runtime.synthesize_cue("Synthetic remaining cue.", "synthetic", old_generation),
+            Err(String::from(super::SYNTHESIS_CANCELLED)),
+            "remaining fixed cues cannot join the replacement generation",
+        );
+        let next_generation = runtime.start_generation();
+        let (token, _) = runtime.neural_request(next_generation).unwrap();
+        runtime.cancel_generation();
+        assert!(
+            token.is_cancelled(),
+            "already registered work must observe Stop"
+        );
+    }
+
+    #[test]
     fn enabled_runtime_generates_audio() {
         let _test_runtime_guard = test_runtime_guard();
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
@@ -1594,6 +1839,7 @@ mod tests {
 
         let runtime = LocalTtsRuntime::new_with_engine_factory(
             LocalTtsRuntimeSpec {
+                neural: None,
                 model_path: Some(model_path),
                 worker_count: 2,
                 max_queue: 8,
@@ -1630,6 +1876,7 @@ mod tests {
         });
         let runtime = LocalTtsRuntime::new_with_engine_factory(
             LocalTtsRuntimeSpec {
+                neural: None,
                 model_path: Some(model_path),
                 worker_count: 1,
                 max_queue: 2,
@@ -1657,6 +1904,7 @@ mod tests {
         fs::write(&model_path, b"fixture").expect("model fixture should be written");
         let runtime = LocalTtsRuntime::new_with_engine_factory(
             LocalTtsRuntimeSpec {
+                neural: None,
                 model_path: Some(model_path),
                 worker_count: 1,
                 max_queue: 1,
@@ -1688,6 +1936,7 @@ mod tests {
         let runtime = Arc::new(
             LocalTtsRuntime::new_with_engine_factory(
                 LocalTtsRuntimeSpec {
+                    neural: None,
                     model_path: Some(model_path),
                     worker_count: 1,
                     max_queue: 1,
@@ -1747,6 +1996,7 @@ mod tests {
         let runtime = Arc::new(
             LocalTtsRuntime::new_with_engine_factory(
                 LocalTtsRuntimeSpec {
+                    neural: None,
                     model_path: Some(model_path),
                     worker_count: 1,
                     max_queue: 1,
@@ -1820,6 +2070,7 @@ mod tests {
         let runtime = Arc::new(
             LocalTtsRuntime::new_with_engine_factory(
                 LocalTtsRuntimeSpec {
+                    neural: None,
                     model_path: Some(model_path),
                     worker_count: 1,
                     max_queue: 2,
@@ -1860,6 +2111,7 @@ mod tests {
         let runtime = Arc::new(
             LocalTtsRuntime::new_with_engine_factory(
                 LocalTtsRuntimeSpec {
+                    neural: None,
                     model_path: Some(model_path),
                     worker_count: 1,
                     max_queue: 2,
@@ -1922,6 +2174,7 @@ mod tests {
 
         let runtime_result = LocalTtsRuntime::new_with_engine_factory(
             LocalTtsRuntimeSpec {
+                neural: None,
                 model_path: Some(model_path),
                 worker_count: 1,
                 max_queue: 4,
@@ -1952,6 +2205,7 @@ mod tests {
 
         let runtime = LocalTtsRuntime::new_with_engine_factory(
             LocalTtsRuntimeSpec {
+                neural: None,
                 model_path: Some(model_path),
                 worker_count: 1,
                 max_queue: 4,
@@ -1991,6 +2245,7 @@ mod tests {
         let runtime = Arc::new(
             LocalTtsRuntime::new_with_engine_factory(
                 LocalTtsRuntimeSpec {
+                    neural: None,
                     model_path: Some(model_path),
                     worker_count: 1,
                     max_queue: 1,
@@ -2036,6 +2291,7 @@ mod tests {
         let result = spawn_test_worker(move || {
             LocalTtsRuntime::new_with_engine_factory(
                 LocalTtsRuntimeSpec {
+                    neural: None,
                     model_path: Some(model_path),
                     worker_count: 1,
                     max_queue: 1,
@@ -2086,6 +2342,7 @@ mod tests {
             ))
         });
         let spec = || LocalTtsRuntimeSpec {
+            neural: None,
             model_path: Some(model_path.clone()),
             worker_count: 1,
             max_queue: 1,
@@ -2137,6 +2394,7 @@ mod tests {
         fs::write(&model_path, b"fixture").expect("model fixture should be written");
         let runtime = LocalTtsRuntime::new_with_engine_factory(
             LocalTtsRuntimeSpec {
+                neural: None,
                 model_path: Some(model_path),
                 worker_count: 1,
                 max_queue: 1,
@@ -2205,6 +2463,7 @@ mod tests {
         ] {
             let error = LocalTtsRuntime::new_with_engine_factory(
                 LocalTtsRuntimeSpec {
+                    neural: None,
                     model_path: Some(model_path.clone()),
                     worker_count,
                     max_queue,
@@ -2226,6 +2485,7 @@ mod tests {
         ] {
             let runtime = LocalTtsRuntime::new_with_engine_factory(
                 LocalTtsRuntimeSpec {
+                    neural: None,
                     model_path: Some(model_path.clone()),
                     worker_count,
                     max_queue,
@@ -2311,6 +2571,7 @@ mod tests {
         });
 
         let spec = || LocalTtsRuntimeSpec {
+            neural: None,
             model_path: Some(model_path.clone()),
             worker_count: 2,
             max_queue: 2,
@@ -2394,6 +2655,7 @@ mod tests {
 
         let runtime = LocalTtsRuntime::new_with_engine_factory_and_spawners(
             LocalTtsRuntimeSpec {
+                neural: None,
                 model_path: Some(model_path),
                 worker_count: 1,
                 max_queue: 2,
@@ -2411,6 +2673,9 @@ mod tests {
             .synthesize("first")
             .expect_err("failed runner spawn must report an error");
         assert!(error.contains("failed to spawn local tts synthesis runner"));
+        // The error response may arrive just before the worker drops its job lease.
+        // Caller completion does not certify physical retirement.
+        assert!(super::wait_for_physical_retirement(TEST_WAIT_BOUND));
         assert!(!super::SYNTHESIS_PERMIT_OCCUPIED.load(std::sync::atomic::Ordering::Acquire));
         assert!(!super::physical_work_pending());
 

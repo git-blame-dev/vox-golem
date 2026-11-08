@@ -257,12 +257,19 @@ function parseSpeechServices(payload: unknown): { readonly speechServices?: Spee
       }
       return value
     }
+    const available = service['available_voices']
+    const safeVoiceText = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && value.length <= 256 && ![...value].some((c) => c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127)
+    if (available !== undefined && (!Array.isArray(available) || available.length > 32 || available.some((voice: unknown) => !isRecord(voice) || !safeVoiceText(voice['id']) || !safeVoiceText(voice['name']) || typeof voice['default'] !== 'boolean' || !Array.isArray(voice['aliases']) || voice['aliases'].length > 32 || !voice['aliases'].every(safeVoiceText)))) throw new Error('Startup speech_services has invalid available_voices')
+    const incremental = service['incremental_audio']
+    if (incremental !== undefined && typeof incremental !== 'boolean') throw new Error('Startup speech_services has invalid incremental_audio')
     return {
       configuredEngine: parseText('configured_engine'),
       runtimeEngine: parseText('runtime_engine'),
       configuredModel: parseText('configured_model'),
       configuredVoice: parseText('configured_voice'),
       configuredLocale: parseText('configured_locale'),
+      ...(available === undefined ? {} : { availableVoices: available as { id: string; name: string; aliases: string[]; default: boolean }[] }),
+      ...(incremental === undefined ? {} : { incrementalAudio: incremental as boolean }),
     }
   }
   return { speechServices: { stt: parseService(payload['stt']), tts: parseService(payload['tts']) } }

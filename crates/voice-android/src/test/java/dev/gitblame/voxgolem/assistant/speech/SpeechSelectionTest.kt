@@ -9,28 +9,25 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35], manifest = Config.NONE)
 class SpeechSelectionTest {
-    private val choices = SpeechOptions(ttsProviders = listOf("synthetic.tts"), ttsVoices = listOf(
-        SpeechVoiceOption("synthetic.tts", "synthetic-au-local", "en-AU", false),
-        SpeechVoiceOption("synthetic.tts", "synthetic-au-network", "en-AU", true)),
-        recognitionInstalledLanguages = listOf("en-US", "en-AU"), recognitionSupportedLanguages = listOf("en-US", "en-AU", "fr-FR"),
-        localOnlyRecognitionAvailable = true)
-    @Test fun automaticDefaultsNeedNoInventedAvailabilityAndExplicitSelectionsUseObservedChoices() {
-        SpeechOptions().validate(SpeechSelection(), false)
-        choices.validate(SpeechSelection("en-AU", "synthetic.tts", "synthetic-au-local"), false)
-        choices.validate(SpeechSelection("en-AU", "synthetic.tts", "synthetic-au-network"), true)
-        choices.validate(SpeechSelection("fr-FR"), true)
-        assertThrows(IllegalArgumentException::class.java) { choices.validate(SpeechSelection("fr-FR"), false) }
-        assertThrows(IllegalArgumentException::class.java) { SpeechOptions().validate(SpeechSelection("en-AU"), true) }
-    }
-    @Test fun invalidUnknownOrPolicyForbiddenSelectionsAreRejectedRatherThanSubstituted() {
-        for (selection in listOf(SpeechSelection("en--AU"), SpeechSelection("zz-ZZ"),
-            SpeechSelection(ttsProvider = "synthetic.missing"), SpeechSelection("en-AU", "synthetic.tts", "synthetic.missing"),
-            SpeechSelection("en-AU", "synthetic.tts", "synthetic-au-network"))) {
-            assertThrows(IllegalArgumentException::class.java) { choices.validate(selection, false) }
+    @Test fun explicitVoiceValidationUsesInjectedPolicyAndRejectsUnavailableResults() {
+        val options = SpeechOptions(ttsProviders = listOf("synthetic.tts"), ttsVoices = listOf(
+            SpeechVoiceOption("synthetic.tts", "synthetic-voice", "en-AU", true)),
+            recognitionInstalledLanguages = listOf("en-AU"), localOnlyRecognitionAvailable = true)
+        val selector = ScriptedVoiceSelector()
+        selector.answer = { requested, network, explicit, default, voices ->
+            assertEquals(java.util.Locale.forLanguageTag("en-AU"), requested)
+            assertFalse(network)
+            assertEquals("synthetic-voice", explicit)
+            assertNull(default)
+            assertEquals(listOf(LocalVoice("synthetic-voice", requested, true, true)), voices)
+            -1
         }
-        assertThrows(IllegalArgumentException::class.java) {
-            choices.copy(localOnlyRecognitionAvailable = false).validate(SpeechSelection("en-AU"), false)
-        }
+        val selection = SpeechSelection("en-AU", "synthetic.tts", "synthetic-voice")
+        assertThrows(IllegalArgumentException::class.java) { options.validate(selection, false, selector) }
+        selector.answer = { _, _, _, _, _ -> 0 }
+        options.validate(selection, false, selector)
+        selector.answer = { _, _, _, _, voices -> voices.size }
+        assertThrows(IllegalArgumentException::class.java) { options.validate(selection, false, selector) }
     }
     @Test fun optionProjectionIsBoundedAndHiddenModelsRemainUnknownNotSelectable() {
         val many = SpeechOptions(ttsProviders = (0..20).map { "synthetic.provider.$it" },

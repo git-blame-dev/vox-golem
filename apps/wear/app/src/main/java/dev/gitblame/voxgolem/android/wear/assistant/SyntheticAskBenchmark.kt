@@ -1,5 +1,7 @@
 package dev.gitblame.voxgolem.android.wear.assistant
 
+import dev.gitblame.voxgolem.assistant.speech.RustObservedVoiceSelector
+
 import android.Manifest
 import android.app.Instrumentation
 import android.content.Context
@@ -189,7 +191,7 @@ object SyntheticAskBenchmark {
             microphoneGranted = { activity.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED },
             configuration = { engine.snapshot().speechAdmission() },
             beginTiming = { AssistantTiming.begin(current.context, Operation.RECOGNITION, sink = current.sink) })
-        val output = LocalSpeechOutput.configured(current.context) { engine.snapshot().speechAdmission() }
+        val output = LocalSpeechOutput.configured(current.context, RustObservedVoiceSelector()) { engine.snapshot().speechAdmission() }
         current.output = output
         return WearAssistantVoice(engine, dictation, output,
             AssistantEnginePort(engine), admissionReady = { true }, language = "en-AU",

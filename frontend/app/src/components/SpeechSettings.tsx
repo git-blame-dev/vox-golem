@@ -16,9 +16,10 @@ interface Props {
   readonly onSpeechNetworkFallbackChange?: (enabled: boolean) => void
   readonly speechSelection?: SpeechSelection
   readonly onSpeechSelectionChange?: (selection: SpeechSelection) => void
+  readonly onSpeechReconnect?: () => void
 }
 
-export function SpeechSettings({ android, androidStatus, statusError, startupState, speechNetworkFallback = true, disabled = false, onSpeechNetworkFallbackChange, speechSelection = DEFAULT_SPEECH_SELECTION, onSpeechSelectionChange }: Props) {
+export function SpeechSettings({ android, androidStatus, statusError, startupState, speechNetworkFallback = true, disabled = false, onSpeechNetworkFallbackChange, speechSelection = DEFAULT_SPEECH_SELECTION, onSpeechSelectionChange, onSpeechReconnect }: Props) {
   const fallbackHelpId = useId()
   const modelId = useId()
   const capabilities = startupState.kind === 'ready' || startupState.kind === 'warming_model'
@@ -63,6 +64,15 @@ export function SpeechSettings({ android, androidStatus, statusError, startupSta
       <AndroidSpeechIdentity metadata={androidStatus?.ttsMetadata} />
       </details>
     </> : <>
+      {speechServices?.tts.configuredEngine === 'Neural TTS' ? <div>
+        {capabilities.find((capability) => capability.id === 'tts')?.state === 'failed' ? <p role="status">{capabilities.find((capability) => capability.id === 'tts')?.reason}</p> : null}
+        <label>Voice <select aria-label="Desktop TTS voice" disabled={disabled} value={speechServices.tts.availableVoices?.find((voice) => voice.id === speechSelection.speechTtsVoice || voice.aliases.includes(speechSelection.speechTtsVoice))?.id ?? speechSelection.speechTtsVoice} onChange={(event) => onSpeechSelectionChange?.({ ...speechSelection, speechTtsProvider: 'neural', speechTtsVoice: event.target.value })}>
+          <option value="">Configured default</option>
+          {speechSelection.speechTtsVoice && !speechServices.tts.availableVoices?.some((voice) => voice.id === speechSelection.speechTtsVoice || voice.aliases.includes(speechSelection.speechTtsVoice)) ? <option value={speechSelection.speechTtsVoice} disabled>Selected voice unavailable</option> : null}
+          {speechServices.tts.availableVoices?.map((voice) => <option key={voice.id} value={voice.id}>{voice.name}{voice.default ? ' · service default' : ''}</option>)}
+        </select></label>
+        {onSpeechReconnect ? <button type="button" disabled={disabled} onClick={onSpeechReconnect}>Reconnect speech service</button> : null}
+      </div> : null}
       {(['parakeet', 'tts', 'wake_word', 'vad'] as const).map((id) => {
         const capability = capabilities.find((item) => item.id === id)
         const label = { parakeet: 'Voice input (STT)', tts: 'Speech output (TTS)', wake_word: 'Wake word', vad: 'Voice activity detection' }[id]
@@ -80,6 +90,7 @@ export function SpeechSettings({ android, androidStatus, statusError, startupSta
           {capability?.actualProvider ? <p>Reported execution provider: {capability.actualProvider.toUpperCase()}</p> : null}
           {capability?.state === 'available' ? <p>Local processing</p> : null}
           {id === 'parakeet' || id === 'tts' ? <SpeechIdentity metadata={id === 'parakeet' ? speechServices?.stt : speechServices?.tts} output={id === 'tts'} /> : null}
+          {id === 'tts' && speechServices?.tts.incrementalAudio !== undefined ? <p>Audio generation: {speechServices.tts.incrementalAudio ? 'incremental' : 'complete utterances'}</p> : null}
         </div>
       })}
       </details>

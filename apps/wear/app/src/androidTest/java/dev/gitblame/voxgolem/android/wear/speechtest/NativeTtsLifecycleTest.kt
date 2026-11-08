@@ -1,5 +1,7 @@
 package dev.gitblame.voxgolem.android.wear.speechtest
 
+import dev.gitblame.voxgolem.assistant.speech.RustObservedVoiceSelector
+
 import android.os.SystemClock
 import android.net.Uri
 import androidx.test.core.app.ActivityScenario
@@ -75,7 +77,7 @@ class NativeTtsLifecycleTest {
                             }
                         }
                     }
-                    output = LocalSpeechOutput(factory, AndroidSpeechAudioFocus(activity), leases = leases)
+                    output = LocalSpeechOutput(RustObservedVoiceSelector(), factory, AndroidSpeechAudioFocus(activity), leases = leases)
                     output.setForeground(true); output.setEnabled(true); output.prepare("en-AU")
                 }
                 await { output.snapshot().voiceAvailable && output.snapshot().phase == SpeechPhase.IDLE }

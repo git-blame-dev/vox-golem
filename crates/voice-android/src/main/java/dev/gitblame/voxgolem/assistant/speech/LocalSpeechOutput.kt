@@ -58,6 +58,7 @@ data class SpeechState(val phase: SpeechPhase = SpeechPhase.IDLE, val enabled: B
 
 /** Final-text and multi-utterance streamed playback with a foreground ready-session cache and explicit network-voice policy. */
 class LocalSpeechOutput(
+    private val selector: ObservedVoiceSelector,
     private val factory: LocalTtsFactory,
     private val focus: SpeechAudioFocus,
     private val main: Handler = Handler(Looper.getMainLooper()),
@@ -68,7 +69,7 @@ class LocalSpeechOutput(
     private val configuration: (() -> SpeechAdmission)? = null,
     private val beginTiming: (Operation) -> AssistantTiming = { AssistantTiming.begin(null, it) },
 ) : AutoCloseable {
-    constructor(context: Context, networkFallback: () -> Boolean = { true }) : this(AndroidLocalTtsFactory(context.applicationContext), AndroidSpeechAudioFocus(context.applicationContext),
+    constructor(selector: ObservedVoiceSelector, context: Context, networkFallback: () -> Boolean = { true }) : this(selector, AndroidLocalTtsFactory(context.applicationContext), AndroidSpeechAudioFocus(context.applicationContext),
         allowNetworkFallback = true, networkFallbackPolicy = networkFallback,
         beginTiming = { AssistantTiming.begin(context.applicationContext, it) })
     private data class Request(val ticket: Long, val language: Locale, val text: String?, val selection: SpeechSelection, val streaming: Boolean = false)
@@ -232,9 +233,24 @@ class LocalSpeechOutput(
     }
 
     /** Generation has submitted its last clause. A starved queue retains focus until this close. */
-    fun finishStream() { main.post {
+    fun finishStream() = closeStream(null)
+
+    /** Delivery calls this only after every admitted chunk callback has returned. */
+    fun finishStream(onDone: (String?) -> Unit) = closeStream(onDone)
+
+    private fun closeStream(onDone: ((String?) -> Unit)?) { main.post {
         val ticket = streamTicket
-        if (ticket == 0L || ticket != epoch.get()) return@post
+        if (ticket == 0L || ticket != epoch.get()) {
+            onDone?.invoke(state.error ?: if (lease == null) null else "speech_cleanup_failed")
+            return@post
+        }
+        if (onDone != null) {
+            if (activeStreamChunks != 0 || pendingStreamChunks.isNotEmpty() || pendingRequest != null) {
+                onDone("speech_not_drained")
+                return@post
+            }
+            terminal = onDone
+        }
         streamOpen = false
         if (activeStreamChunks == 0 && pendingStreamChunks.isEmpty() && pendingRequest == null) finish(ticket, null)
     } }
@@ -377,15 +393,10 @@ class LocalSpeechOutput(
     private fun selectVoice(requested: Locale, networkAllowed: Boolean, explicitVoice: String): LocalVoice? {
         val cacheKey = "${requested.toLanguageTag()}|$networkAllowed|$explicitVoice"
         selectedVoiceCache[cacheKey]?.let { cachedName ->
-            sessionVoicesByName[cachedName]?.takeIf { it.installed && (!it.networkRequired || networkAllowed) }?.let { return it }
+            sessionVoicesByName[cachedName]?.let { return it }
         }
-        val selected = sessionVoices.filter { it.installed && (!it.networkRequired || networkAllowed) &&
-            (explicitVoice.isEmpty() || it.name == explicitVoice) &&
-            it.locale.language == requested.language &&
-            (requested.script.isEmpty() || it.locale.script.isEmpty() || it.locale.script == requested.script) }
-            .sortedWith(compareBy<LocalVoice> { it.networkRequired }
-                .thenBy { it.locale.country != requested.country }
-                .thenBy { it.name != sessionDefaultVoice }.thenBy { it.name }).firstOrNull()
+        val selected = sessionVoices.getOrNull(selector.select(requested, networkAllowed,
+            explicitVoice, sessionDefaultVoice, sessionVoices))
         if (selected != null) {
             selectedVoiceCache[cacheKey] = selected.name
         }
@@ -575,8 +586,8 @@ class LocalSpeechOutput(
         main.post { closed = true; retireProjection(); observers.clear() }
     }
     companion object {
-        fun configured(context: Context, admission: () -> SpeechAdmission) = LocalSpeechOutput(
-            AndroidLocalTtsFactory(context.applicationContext), AndroidSpeechAudioFocus(context.applicationContext), configuration = admission,
+        fun configured(context: Context, selector: ObservedVoiceSelector, admission: () -> SpeechAdmission) = LocalSpeechOutput(
+            selector, AndroidLocalTtsFactory(context.applicationContext), AndroidSpeechAudioFocus(context.applicationContext), configuration = admission,
             beginTiming = { AssistantTiming.begin(context.applicationContext, it) })
     }
 }

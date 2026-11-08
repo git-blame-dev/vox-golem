@@ -22,6 +22,7 @@ import java.time.Duration
 @Config(sdk = [35], manifest = Config.NONE)
 @LooperMode(LooperMode.Mode.PAUSED)
 class LocalSpeechOutputTest {
+    private val selector = ScriptedVoiceSelector()
     private class Factory : LocalTtsFactory {
         var creates = 0
         lateinit var ready: (Boolean) -> Unit
@@ -91,7 +92,7 @@ class LocalSpeechOutputTest {
     }
     private val factory = Factory()
     private val focus = Focus()
-    private val output = LocalSpeechOutput(factory, focus)
+    private val output = LocalSpeechOutput(selector, factory, focus)
     private fun drain() = shadowOf(Looper.getMainLooper()).idle()
     private fun enable() { output.setForeground(true); output.setEnabled(true); drain() }
 
@@ -166,7 +167,7 @@ class LocalSpeechOutputTest {
     @Test fun queuedStopReplacementBackgroundAndCloseRemainCancellation() {
         for (cause in listOf("stop", "replacement", "background", "close")) {
             val factory = Factory()
-            val output = LocalSpeechOutput(factory, Focus())
+            val output = LocalSpeechOutput(selector, factory, Focus())
             output.setForeground(true); output.setEnabled(true); drain()
             val results = mutableListOf<String?>()
             output.speakStreamChunk("Synthetic stale.", "en-US", true, onDone = results::add)
@@ -186,7 +187,7 @@ class LocalSpeechOutputTest {
     private fun timedOutput(events: MutableList<AssistantTiming.Event>, leases: RecognitionResourceLease): LocalSpeechOutput {
         val context = RuntimeEnvironment.getApplication()
         context.applicationInfo.flags = context.applicationInfo.flags or ApplicationInfo.FLAG_DEBUGGABLE
-        return LocalSpeechOutput(factory, focus, leases = leases,
+        return LocalSpeechOutput(selector, factory, focus, leases = leases,
             beginTiming = { AssistantTiming.begin(context, it, sink = AssistantTiming.Sink { event -> events += event }) })
     }
 
@@ -213,7 +214,7 @@ class LocalSpeechOutputTest {
             override fun providers() = providers
             override fun create(onReady: (Boolean) -> Unit): LocalTtsSession = error("No SDK needed")
         }
-        val speech = LocalSpeechOutput(catalog, focus)
+        val speech = LocalSpeechOutput(selector, catalog, focus)
         speech.refreshProviders(); drain()
         val first = speech.options()
         speech.refreshProviders(); drain(); assertSame(first, speech.options())
@@ -240,7 +241,7 @@ class LocalSpeechOutputTest {
                 return session
             }
         }
-        val speech = LocalSpeechOutput(catalog, focus,
+        val speech = LocalSpeechOutput(selector, catalog, focus,
             configuration = { SpeechAdmission(SpeechSelection(ttsProvider = selected), false) })
         fun prepare() {
             speech.setForeground(false); drain()
@@ -377,7 +378,8 @@ class LocalSpeechOutputTest {
         enable(); output.speak("Synthetic final", "en-US") {}; output.stop(); drain()
         assertEquals(0, factory.creates)
     }
-    @Test fun networkAndUninstalledVoicesNeverSpeakOrRequestFocus() {
+    @Test fun rejectedPolicyResultNeverSpeaksOrRequestsFocus() {
+        selector.answer = { _, _, _, _, _ -> -1 }
         enable(); factory.sdk.offered = listOf(LocalVoice("synthetic-network", Locale.US, true, true),
             LocalVoice("synthetic-missing", Locale.US, false, false))
         var result: String? = null
@@ -394,7 +396,7 @@ class LocalSpeechOutputTest {
             override fun providers() = listOf(null, oversized, exact)
             override fun create(onReady: (Boolean) -> Unit): LocalTtsSession { ready = onReady; return offered }
         }
-        val speech = LocalSpeechOutput(catalog, focus)
+        val speech = LocalSpeechOutput(selector, catalog, focus)
         speech.setForeground(true); speech.prepare("en-US"); drain(); ready(true); drain()
         val value = speech.options().json()
         assertEquals(listOf(exact), speech.options().ttsProviders)
@@ -405,11 +407,12 @@ class LocalSpeechOutputTest {
         speech.close(); drain()
     }
     @Test fun explicitProviderVoiceAndLanguageAreCapturedAndMissingVoiceNeverUsesAnotherChoice() {
+        selector.answer = { _, _, explicit, _, _ -> if (explicit == "synthetic-missing") -1 else 0 }
         val providers = ProviderFactory()
         providers.alternate.offered = listOf(LocalVoice("synthetic-au-local", Locale.forLanguageTag("en-AU"), false, true),
             LocalVoice("synthetic-au-other", Locale.forLanguageTag("en-AU"), false, true))
         var configuration = SpeechAdmission(SpeechSelection("en-AU", "synthetic-alternate", "synthetic-au-local"), false)
-        val speech = LocalSpeechOutput(providers, focus, configuration = { configuration })
+        val speech = LocalSpeechOutput(selector, providers, focus, configuration = { configuration })
         speech.setForeground(true); speech.setEnabled(true)
         speech.speak("Synthetic admitted answer", "en-US") {}; drain()
         configuration = configuration.copy(selection = configuration.selection.copy(ttsVoice = "synthetic-missing"))
@@ -430,7 +433,7 @@ class LocalSpeechOutputTest {
     @Test fun explicitMissingOrFailedProviderCannotFallBackToSystemOrAnotherInstalledEngine() {
         for (missing in listOf(true, false)) {
             val providers = ProviderFactory()
-            val speech = LocalSpeechOutput(providers, focus, configuration = {
+            val speech = LocalSpeechOutput(selector, providers, focus, configuration = {
                 SpeechAdmission(SpeechSelection(ttsProvider = if (missing) "synthetic-missing" else "synthetic-alternate"), true)
             })
             val results = mutableListOf<String?>()
@@ -445,7 +448,7 @@ class LocalSpeechOutputTest {
     @Test fun changingProviderDuringIdlePreparationRetiresOldInitializationAndPublishesOnlyTheNewInventory() {
         val providers = ProviderFactory()
         var configuration = SpeechAdmission()
-        val speech = LocalSpeechOutput(providers, focus, configuration = { configuration })
+        val speech = LocalSpeechOutput(selector, providers, focus, configuration = { configuration })
         speech.setForeground(true); speech.prepare("en-US"); drain()
         assertEquals(listOf<String?>(null), providers.opened)
         configuration = configuration.copy(selection = SpeechSelection(ttsProvider = "synthetic-alternate"))
@@ -462,9 +465,10 @@ class LocalSpeechOutputTest {
         speech.close(); drain()
     }
     @Test fun disablingFallbackRejectsCachedNetworkVoiceOnTheNextPlaybackAdmission() {
+        selector.answer = { _, network, _, _, _ -> if (network) 0 else -1 }
         var allowed = true
         factory.sdk.offered = listOf(LocalVoice("synthetic-network", Locale.US, true, true))
-        val speech = LocalSpeechOutput(factory, focus, networkFallbackPolicy = { allowed })
+        val speech = LocalSpeechOutput(selector, factory, focus, networkFallbackPolicy = { allowed })
         speech.setForeground(true); speech.setEnabled(true)
         speech.speak("Synthetic first", "en-US") {}; drain(); factory.ready(true); drain()
         assertEquals(listOf("Synthetic first"), factory.sdk.spoken)
@@ -496,7 +500,7 @@ class LocalSpeechOutputTest {
     }
     @Test fun playbackHoldsSharedAdmissionUntilActualTerminalAndDisablingSettlesOnce() {
         val leases = RecognitionResourceLease()
-        val speech = LocalSpeechOutput(factory, focus, leases = leases)
+        val speech = LocalSpeechOutput(selector, factory, focus, leases = leases)
         speech.setForeground(true); speech.setEnabled(true); var error: String? = null
         speech.speak("Synthetic final", "en-US") { error = it }; drain(); factory.ready(true); drain()
         assertNull(leases.tryAcquire(RecognitionResourceLease.Kind.CHAT))
@@ -506,7 +510,7 @@ class LocalSpeechOutputTest {
     }
     @Test fun failedShutdownDoesNotReleasePlaybackLeaseUntilExactOwnerTerminates() {
         val leases = RecognitionResourceLease()
-        val speech = LocalSpeechOutput(factory, focus, leases = leases)
+        val speech = LocalSpeechOutput(selector, factory, focus, leases = leases)
         speech.setForeground(true); speech.setEnabled(true); speech.speak("Synthetic final", "en-US") {}
         drain(); factory.ready(true); drain(); factory.sdk.rejectShutdown = true
         speech.stop(); drain()
@@ -539,7 +543,7 @@ class LocalSpeechOutputTest {
     }
     @Test fun preparedForegroundVoiceRemainsWarmWithoutHoldingAudioAdmission() {
         val leases = RecognitionResourceLease()
-        val speech = LocalSpeechOutput(factory, focus, leases = leases)
+        val speech = LocalSpeechOutput(selector, factory, focus, leases = leases)
         speech.setForeground(true); speech.setEnabled(true); speech.prepare("en-US")
         drain(); factory.ready(true); drain()
         assertEquals(SpeechPhase.IDLE, speech.snapshot().phase)
@@ -553,7 +557,7 @@ class LocalSpeechOutputTest {
     }
     @Test fun consecutiveRepliesReuseReadySessionAndReleaseFocusBetweenUtterances() {
         val leases = RecognitionResourceLease()
-        val speech = LocalSpeechOutput(factory, focus, leases = leases)
+        val speech = LocalSpeechOutput(selector, factory, focus, leases = leases)
         speech.setForeground(true); speech.setEnabled(true)
         speech.speak("Synthetic first reply", "en-US") {}; drain(); factory.ready(true); drain()
         val oldTerminal = factory.sdk.finished
@@ -587,10 +591,11 @@ class LocalSpeechOutputTest {
         output.setForeground(true); drain()
         assertTrue(factory.sdk.spoken.isEmpty())
     }
-    @Test fun localAccentFallbackWinsOverExactRegionNetworkVoice() {
+    @Test fun policySelectedVoiceFlowsThroughRouteAndPlayback() {
+        selector.answer = { _, _, _, _, _ -> 1 }
         factory.sdk.offered = listOf(LocalVoice("synthetic-network-au", Locale.forLanguageTag("en-AU"), true, true),
             LocalVoice("synthetic-local-us", Locale.US, false, true))
-        val speech = LocalSpeechOutput(factory, focus, allowNetworkFallback = true)
+        val speech = LocalSpeechOutput(selector, factory, focus, allowNetworkFallback = true)
         speech.setForeground(true); speech.setEnabled(true); speech.prepare("en-AU")
         drain(); factory.ready(true); drain()
         assertEquals("en-US", speech.snapshot().route?.selectedLanguage)
@@ -600,9 +605,10 @@ class LocalSpeechOutputTest {
         speech.close(); drain()
     }
     @Test fun permittedNetworkVoiceIsAvailableButNeverAdvertisedAsLocal() {
+        selector.answer = { _, network, _, _, _ -> if (network) 0 else -1 }
         factory.sdk.offered = listOf(LocalVoice("synthetic-network", Locale.US, true, true),
             LocalVoice("synthetic-uninstalled", Locale.US, false, false))
-        val speech = LocalSpeechOutput(factory, focus, allowNetworkFallback = true)
+        val speech = LocalSpeechOutput(selector, factory, focus, allowNetworkFallback = true)
         speech.setForeground(true); speech.setEnabled(true); speech.speak("Synthetic reply", "en-US") {}
         drain(); factory.ready(true); drain()
         assertEquals(SpeechPhase.SPEAKING, speech.snapshot().phase)
@@ -612,9 +618,10 @@ class LocalSpeechOutputTest {
         assertEquals("no_installed_local_voice", speech.snapshot().route?.fallbackReason)
         speech.close(); drain()
     }
-    @Test fun networkPermissionNeverMakesUninstalledVoiceEligible() {
+    @Test fun rejectedPolicyResultDoesNotAcquireFocus() {
+        selector.answer = { _, _, _, _, _ -> -1 }
         factory.sdk.offered = listOf(LocalVoice("synthetic-uninstalled", Locale.US, true, false))
-        val speech = LocalSpeechOutput(factory, focus, allowNetworkFallback = true)
+        val speech = LocalSpeechOutput(selector, factory, focus, allowNetworkFallback = true)
         speech.setForeground(true); speech.setEnabled(true); speech.prepare("en-US")
         drain(); factory.ready(true); drain()
         assertEquals("local_voice_unavailable", speech.snapshot().error)
@@ -623,9 +630,10 @@ class LocalSpeechOutputTest {
         speech.close(); drain()
     }
     @Test fun alternateInstalledLocalEngineWinsBeforeNetworkFallback() {
+        selector.answer = { _, _, _, _, voices -> if (voices.firstOrNull()?.name == "synthetic-network-au") -1 else 0 }
         val providers = ProviderFactory()
         providers.initial.offered = listOf(LocalVoice("synthetic-network-au", Locale.forLanguageTag("en-AU"), true, true))
-        val speech = LocalSpeechOutput(providers, focus, allowNetworkFallback = true)
+        val speech = LocalSpeechOutput(selector, providers, focus, allowNetworkFallback = true)
         speech.setForeground(true); speech.setEnabled(true); speech.speak("Synthetic reply", "en-AU") {}
         drain(); providers.callbacks[0](true); drain()
         assertEquals(listOf(null, "synthetic-alternate"), providers.opened)
@@ -638,7 +646,7 @@ class LocalSpeechOutputTest {
     }
     @Test fun providerTimeoutRetiresOnlyItsSessionAndIgnoresItsLateInitialization() {
         val providers = ProviderFactory()
-        val speech = LocalSpeechOutput(providers, focus)
+        val speech = LocalSpeechOutput(selector, providers, focus)
         speech.setForeground(true); speech.setEnabled(true); speech.speak("Synthetic reply", "en-US") {}
         drain(); shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(10))
         assertEquals(listOf(null, "synthetic-alternate"), providers.opened)
@@ -652,7 +660,7 @@ class LocalSpeechOutputTest {
     }
     @Test fun stopAfterCloseRetriesRetainedTtsWithoutPlayingOrReopeningClosedOwner() {
         val leases = RecognitionResourceLease()
-        val speech = LocalSpeechOutput(factory, focus, leases = leases)
+        val speech = LocalSpeechOutput(selector, factory, focus, leases = leases)
         speech.setForeground(true); speech.setEnabled(true); speech.speak("Synthetic final", "en-US") {}
         drain(); factory.ready(true); drain(); factory.sdk.rejectShutdown = true
         speech.close(); drain(); assertNotNull(leases.current())
@@ -674,7 +682,7 @@ class LocalSpeechOutputTest {
         val leases = RecognitionResourceLease()
         var oldCompletions = 0
         fun discardOutput() {
-            val discarded = LocalSpeechOutput(factory, focus, leases = leases)
+            val discarded = LocalSpeechOutput(selector, factory, focus, leases = leases)
             discarded.setForeground(true); discarded.setEnabled(true)
             discarded.speak("Synthetic old final", "en-US") { oldCompletions++ }; drain(); factory.ready(true); drain()
             factory.sdk.shutdownFailures = 1
@@ -690,7 +698,7 @@ class LocalSpeechOutputTest {
         }
         val nextFactory = Factory()
         val nextFocus = Focus()
-        val replacement = LocalSpeechOutput(nextFactory, nextFocus, leases = leases)
+        val replacement = LocalSpeechOutput(selector, nextFactory, nextFocus, leases = leases)
         replacement.setForeground(true); replacement.setEnabled(true)
         replacement.speak("Synthetic replacement final", "en-US") {}; drain(); nextFactory.ready(true); drain()
         assertTrue(factory.sdk.shutdown); assertEquals(2, factory.sdk.shutdownCalls)
@@ -705,7 +713,7 @@ class LocalSpeechOutputTest {
 
     @Test fun disabledPreparationPublishesInventoryWithoutPrimingOrHoldingResources() {
         val leases = RecognitionResourceLease()
-        val speech = LocalSpeechOutput(factory, focus, leases = leases)
+        val speech = LocalSpeechOutput(selector, factory, focus, leases = leases)
         speech.setForeground(true); speech.prepare("en-US"); drain()
         factory.ready(true); drain()
         val state = speech.snapshot()
@@ -733,10 +741,17 @@ class LocalSpeechOutputTest {
     }
 
     @Test fun preparationPassesExplicitResolvedVoiceAndPlaybackDoesNotPrimeAgain() {
+        selector.answer = { requested, network, explicit, _, voices ->
+            assertEquals(Locale.forLanguageTag("en-AU"), requested)
+            assertFalse(network)
+            assertEquals("synthetic-au-selected", explicit)
+            assertEquals(3, voices.size)
+            2
+        }
         val australian = LocalVoice("synthetic-au-selected", Locale.forLanguageTag("en-AU"), false, true)
         factory.sdk.offered = listOf(LocalVoice("synthetic-us-first", Locale.US, false, true),
             australian.copy(name = "synthetic-au-other"), australian)
-        val speech = LocalSpeechOutput(factory, focus, configuration = {
+        val speech = LocalSpeechOutput(selector, factory, focus, configuration = {
             SpeechAdmission(SpeechSelection(language = "en-AU", ttsVoice = australian.name), false)
         })
         speech.setForeground(true); speech.setEnabled(true); speech.prepare("en-US"); drain()
@@ -773,9 +788,32 @@ class LocalSpeechOutputTest {
         assertEquals(1, done.size)
     }
 
+    @Test fun finishAcknowledgesMainThreadLeaseReleaseAndReportsFailedShutdown() {
+        val leases = RecognitionResourceLease()
+        val speech = LocalSpeechOutput(selector, factory, focus, leases = leases)
+        speech.setForeground(true); speech.setEnabled(true); drain()
+        speech.speakStreamChunk("Synthetic first sentence.", "en-US", flush = true, keepOpen = true)
+        drain(); factory.ready(true); drain()
+        factory.sdk.terminals.single()(null); drain()
+        factory.sdk.rejectShutdown = true
+        speech.setForeground(false)
+        var calls = 0; var outcome: String? = null
+        speech.finishStream { calls++; outcome = it }
+        assertEquals(0, calls)
+        assertNotNull(leases.current())
+        drain()
+        assertEquals(1, calls)
+        assertEquals("speech_cleanup_failed", outcome)
+        assertNotNull(leases.current())
+        assertFalse(factory.sdk.shutdown)
+        factory.sdk.rejectShutdown = false
+        speech.close(); drain()
+        assertNull(leases.current())
+    }
+
     @Test fun openStreamRetainsLeaseAcrossStarvationAndQueuesLaterBurstExactlyOnce() {
         val leases = RecognitionResourceLease()
-        val speech = LocalSpeechOutput(factory, focus, leases = leases)
+        val speech = LocalSpeechOutput(selector, factory, focus, leases = leases)
         speech.setForeground(true); speech.setEnabled(true); drain()
         val done = mutableListOf<String?>()
         speech.speakStreamChunk("Synthetic first sentence.", "en-US", flush = true, keepOpen = true, onDone = done::add)
@@ -802,7 +840,7 @@ class LocalSpeechOutputTest {
             val localFactory = Factory()
             val localFocus = Focus()
             val leases = RecognitionResourceLease()
-            val speech = LocalSpeechOutput(localFactory, localFocus, timeoutMillis = 50, leases = leases)
+            val speech = LocalSpeechOutput(selector, localFactory, localFocus, timeoutMillis = 50, leases = leases)
             speech.setForeground(true); speech.setEnabled(true); drain()
             val done = mutableListOf<String?>()
             speech.speakStreamChunk("Synthetic active first.", "en-US", flush = true, keepOpen = true, onDone = done::add)
@@ -825,7 +863,7 @@ class LocalSpeechOutputTest {
 
     @Test fun speakStreamChunkHoldsSingleLeaseAndFocusAcrossFlushAndQueuedAddChunks() {
         val leases = RecognitionResourceLease()
-        val speech = LocalSpeechOutput(factory, focus, leases = leases)
+        val speech = LocalSpeechOutput(selector, factory, focus, leases = leases)
         speech.setForeground(true); speech.setEnabled(true); drain()
         val done = mutableListOf<String?>()
         speech.speakStreamChunk("First sentence.", "en-US", flush = true, onDone = done::add)

@@ -1,5 +1,7 @@
 package dev.gitblame.voxgolem.android.wear.assistant
 
+import dev.gitblame.voxgolem.assistant.speech.RustObservedVoiceSelector
+
 import dev.gitblame.voxgolem.assistant.runtime.AssistantState
 import dev.gitblame.voxgolem.assistant.runtime.speechAdmission
 import dev.gitblame.voxgolem.assistant.speech.SpeechSelection
@@ -48,7 +50,7 @@ internal fun assistantSpeechCatalog(state: AssistantState, voice: AssistantVoice
     val choices = listOf(AssistantSpeechChoice("", "Automatic", true)) + reported.orEmpty().filter(String::isNotEmpty).distinct().map { candidate ->
         val selection = assistantSpeechCandidate(saved, field, candidate)
         val entries = voiceEntries[candidate].orEmpty()
-        val enabled = runCatching { options.validate(selection, state.speechNetworkFallback) }.isSuccess &&
+        val enabled = runCatching { options.validate(selection, state.speechNetworkFallback, RustObservedVoiceSelector()) }.isSuccess &&
             (field != AssistantSpeechField.VOICE || entries.size == 1)
         val label = if (field == AssistantSpeechField.VOICE) {
             val entry = entries.first()
@@ -57,7 +59,7 @@ internal fun assistantSpeechCatalog(state: AssistantState, voice: AssistantVoice
         } else candidate
         AssistantSpeechChoice(candidate, label, enabled)
     }
-    val available = runCatching { options.validate(saved, state.speechNetworkFallback) }.isSuccess &&
+    val available = runCatching { options.validate(saved, state.speechNetworkFallback, RustObservedVoiceSelector()) }.isSuccess &&
         (field != AssistantSpeechField.VOICE || value.isEmpty() || choices.singleOrNull { it.value == value }?.enabled == true)
     val savedReported = value.isEmpty() || reported.orEmpty().any { candidate ->
         candidate.equals(value, ignoreCase = field == AssistantSpeechField.LANGUAGE)

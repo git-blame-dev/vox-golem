@@ -640,7 +640,7 @@ pub(super) fn prepare_cues(app: &tauri::AppHandle) {
         return;
     };
     if state.native_voice.current_capture_id().is_none()
-        || state.voice_cue_cache.get().is_some()
+        || state.voice_cue_cache.get(&existing.cue_key()).is_some()
         || state
             .native_cue_preparing
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)

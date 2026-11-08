@@ -235,6 +235,15 @@ struct RawCompletionConfig {
 struct RawTtsConfig {
     #[serde(default)]
     enabled: bool,
+    #[serde(default)]
+    provider: TtsProvider,
+    #[serde(default = "default_neural_tts_endpoint")]
+    endpoint: String,
+    #[serde(default)]
+    voice: String,
+    #[serde(default)]
+    start_command: Vec<String>,
+    #[serde(default = "default_piper_model_path")]
     model_path: PathBuf,
     #[serde(default = "default_tts_worker_count")]
     worker_count: usize,
@@ -379,12 +388,30 @@ pub struct TelemetryConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalTtsConfig {
     pub enabled: bool,
+    pub provider: TtsProvider,
+    pub endpoint: String,
+    pub voice: String,
+    pub start_command: Vec<String>,
     pub model_path: PathBuf,
     pub worker_count: usize,
     pub max_queue: usize,
     pub sample_rate_hz: u32,
     pub max_duration_s: u64,
     pub output_gain_db: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TtsProvider {
+    #[default]
+    Piper,
+    Neural,
+}
+
+impl LocalTtsConfig {
+    pub fn assets_configured(&self) -> bool {
+        self.provider == TtsProvider::Neural || self.model_path.is_file()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -696,13 +723,28 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
     let local_tts = match raw_config.tts {
         Some(raw_tts) => {
             let model_path = resolve_config_path(&config_dir, raw_tts.model_path);
-            record_path_issue(
-                &mut capability_issues,
-                "tts",
-                true,
-                model_path.is_file(),
-                &model_path,
-            );
+            if raw_tts.provider == TtsProvider::Piper {
+                record_path_issue(
+                    &mut capability_issues,
+                    "tts",
+                    true,
+                    model_path.is_file(),
+                    &model_path,
+                );
+            }
+            if raw_tts.endpoint.len() > 2048
+                || raw_tts.voice.len() > 256
+                || raw_tts.voice.chars().any(char::is_control)
+                || raw_tts.start_command.len() > 32
+                || raw_tts.start_command.iter().any(|argument| {
+                    argument.is_empty() || argument.len() > 4096 || argument.contains('\0')
+                })
+            {
+                return Err(ConfigError::ParseConfigFailed {
+                    path: config_path.clone(),
+                    details: String::from("tts service configuration exceeds its bounds"),
+                });
+            }
 
             validate_tts_resource_limits(
                 raw_tts.worker_count,
@@ -734,6 +776,10 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
 
             LocalTtsConfig {
                 enabled: raw_tts.enabled,
+                provider: raw_tts.provider,
+                endpoint: raw_tts.endpoint,
+                voice: raw_tts.voice,
+                start_command: raw_tts.start_command,
                 model_path,
                 worker_count: raw_tts.worker_count,
                 max_queue: raw_tts.max_queue,
@@ -748,6 +794,10 @@ pub fn load_runtime_config(path_override: Option<&Path>) -> Result<RuntimeConfig
 
             LocalTtsConfig {
                 enabled: false,
+                provider: TtsProvider::Piper,
+                endpoint: default_neural_tts_endpoint(),
+                voice: String::new(),
+                start_command: Vec::new(),
                 model_path,
                 worker_count: DEFAULT_TTS_WORKER_COUNT,
                 max_queue: DEFAULT_TTS_MAX_QUEUE,
@@ -1064,6 +1114,10 @@ fn default_runtime_config(config_dir: &Path, config_reason: Option<String>) -> R
         wake_word_detection_threshold: DEFAULT_WAKE_WORD_DETECTION_THRESHOLD,
         local_tts: LocalTtsConfig {
             enabled: false,
+            provider: TtsProvider::Piper,
+            endpoint: default_neural_tts_endpoint(),
+            voice: String::new(),
+            start_command: Vec::new(),
             model_path: resolve_config_path(config_dir, PathBuf::from("models/tts/jarvis.onnx")),
             worker_count: DEFAULT_TTS_WORKER_COUNT,
             max_queue: DEFAULT_TTS_MAX_QUEUE,
@@ -1124,6 +1178,14 @@ fn default_wake_word_detection_threshold() -> f32 {
 
 fn default_tts_worker_count() -> usize {
     DEFAULT_TTS_WORKER_COUNT
+}
+
+fn default_piper_model_path() -> PathBuf {
+    PathBuf::from("models/tts/jarvis.onnx")
+}
+
+fn default_neural_tts_endpoint() -> String {
+    String::from("http://127.0.0.1:8765")
 }
 
 fn default_tts_max_queue() -> usize {
@@ -2324,6 +2386,19 @@ mod tests {
                     .reason
                     .contains(&missing_tts_model_path.display().to_string())
         }));
+    }
+
+    #[test]
+    fn neural_tts_configuration_does_not_require_a_piper_model() {
+        let temp = TempDir::new();
+        let path = temp.path().join("config.toml");
+        fs::write(&path, "[tts]\nenabled = true\nprovider = \"neural\"\nendpoint = \"http://127.0.0.1:8765\"\nvoice = \"synthetic-voice\"\n").unwrap();
+        let config = load_runtime_config(Some(&path)).expect("Neural TTS uses service assets");
+        assert!(config.local_tts.enabled);
+        assert!(!config
+            .capability_issues
+            .iter()
+            .any(|issue| issue.capability == "tts"));
     }
 
     #[test]

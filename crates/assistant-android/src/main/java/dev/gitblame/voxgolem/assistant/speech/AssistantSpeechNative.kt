@@ -10,9 +10,9 @@ internal object AssistantSpeechNative {
 }
 
 internal data class SpeechChunk(val generation: Long, val id: Long, val text: String)
-internal data class SpeechDecision(val cancel: Boolean, val closed: Boolean, val chunk: SpeechChunk?)
+internal data class SpeechDecision(val cancel: Boolean, val closed: Boolean, val chunks: List<SpeechChunk>, val idle: Boolean, val accepted: Boolean)
 
-/** Each admission owns one bounded Rust policy; settlement releases it before playback ends. */
+/** Each admission retains its Rust delivery owner through the final playback acknowledgement. */
 internal class SpeechPolicyUnavailable : RuntimeException("speech_policy_unavailable")
 
 internal class RustReplySpeech(enabled: Boolean = true) : AutoCloseable {
@@ -21,15 +21,20 @@ internal class RustReplySpeech(enabled: Boolean = true) : AutoCloseable {
         if (handle == 0L) throw SpeechPolicyUnavailable()
         try {
             val raw = AssistantSpeechNative.apply(handle, operation, text) ?: throw SpeechPolicyUnavailable()
-            if (operation >= 2) handle = 0
             val json = JSONObject(raw)
-            val chunk = json.optJSONObject("speak")?.let { SpeechChunk(it.getLong("generation"), it.getLong("chunk"), it.getString("text")) }
-            return SpeechDecision(json.getBoolean("cancel"), json.getBoolean("closed"), chunk)
+            val ready = json.getJSONArray("ready")
+            val chunks = List(ready.length()) { index -> ready.getJSONObject(index).let {
+                SpeechChunk(it.getLong("generation"), it.getLong("chunk"), it.getString("text"))
+            } }
+            if (json.getBoolean("released")) handle = 0
+            return SpeechDecision(json.getBoolean("cancel"), json.getBoolean("closed"), chunks,
+                json.getBoolean("idle"), json.getBoolean("accepted"))
         } catch (_: Exception) {
             close()
             throw SpeechPolicyUnavailable()
         }
     }
+    fun complete(chunk: SpeechChunk): SpeechDecision? = if (handle == 0L) null else apply(4, "${chunk.generation}:${chunk.id}")
     override fun close() {
         val retired = handle; handle = 0
         if (retired != 0L) AssistantSpeechNative.apply(retired, 3, null)
