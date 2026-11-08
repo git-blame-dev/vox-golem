@@ -75,7 +75,7 @@ describe('app snapshot contract', () => {
   it.each(['dark', 'slate', 'light'])('preserves the native %s theme', (theme) => {
     const wire = validSnapshot()
     ;(wire['preferences'] as Record<string, unknown>)['ui_theme'] = theme
-    expect(parseAppSnapshot(wire).preferences.uiTheme).toBe(theme)
+    expect(parseAppSnapshot(wire).preferences.uiTheme).toBe(theme === 'slate' ? 'dark' : theme)
   })
   it.each(['sepia', 'dim', 'sleek-dark', null, undefined, 0])('rejects invalid theme %j', (theme) => {
     const wire = validSnapshot()

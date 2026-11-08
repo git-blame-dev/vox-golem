@@ -258,9 +258,14 @@ function button(container: HTMLElement, label: string): HTMLButtonElement {
   if (found === undefined || found === null) throw new Error(`Missing synthetic control ${label}`)
   return found
 }
+async function navigateSettings(container: HTMLElement, page: 'voice' | 'updates'): Promise<void> {
+  const row = container.querySelector<HTMLButtonElement>(`[data-settings-page="${page}"]`)
+  expect(row).not.toBeNull()
+  await act(async () => { row!.click() })
+}
 async function click(container: HTMLElement, label: string): Promise<void> { await act(async () => { button(container, label).click() }) }
 function autoStopToggle(container: HTMLElement): HTMLInputElement {
-  const label = Array.from(container.querySelectorAll('label')).find((item) => item.textContent?.includes('Auto Stop'))
+  const label = Array.from(container.querySelectorAll('label')).find((item) => item.textContent?.includes('Stop listening after silence'))
   if (label?.querySelector('input') == null) throw new Error('Missing Auto Stop control')
   return label.querySelector('input')!
 }
@@ -981,6 +986,7 @@ describe('autonomous desktop runtime presentation', () => {
     const app = await mount()
     try {
       await click(app.container, 'Settings')
+      await navigateSettings(app.container, 'voice')
       await act(async () => { autoStopToggle(app.container).click() })
       await act(async () => { app.session.intents.setAutoStopOnSilence(true) })
       expect(native.invoke.mock.calls.filter(([command]) => command === 'set_voice_auto_stop')).toHaveLength(1)
@@ -1177,6 +1183,7 @@ describe('autonomous desktop runtime presentation', () => {
     const app = await mount()
     try {
       await click(app.container, 'Settings')
+      await navigateSettings(app.container, 'updates')
       expect(button(app.container, 'Restart and update').disabled).toBe(false)
       for (const [playing, pending] of [[false, true], [true, false], [false, false]]) {
         await act(async () => { native.speech(playing!, pending!); native.invalidate() })
@@ -1191,6 +1198,7 @@ describe('autonomous desktop runtime presentation', () => {
     const app = await mount()
     try {
       await click(app.container, 'Settings')
+      await navigateSettings(app.container, 'voice')
       expect(autoStopToggle(app.container).checked).toBe(false)
       await act(async () => { autoStopToggle(app.container).click() })
       expect(autoStopToggle(app.container).checked).toBe(true)
@@ -1211,6 +1219,7 @@ describe('autonomous desktop runtime presentation', () => {
     const read = deferred<unknown>()
     try {
       await click(app.container, 'Settings')
+      await navigateSettings(app.container, 'voice')
       native.holdRead(read.promise)
       await act(async () => { native.invalidate() })
       await act(async () => { autoStopToggle(app.container).click() })

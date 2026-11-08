@@ -19,7 +19,7 @@ class PhonePreferences private constructor(private val openStorage: () -> androi
             fun from(value: JSONObject) = Presentation(value.getString("instant"), value.getString("deep"), value.getString("review"),
                 value.getBoolean("deep_enabled"), value.getBoolean("review_enabled"), value.getBoolean("prefetch"),
                 value.getBoolean("completion"), value.getString("response_profile"), value.getBoolean("tts_enabled"),
-                value.getString("ui_theme"), value.getString("ui_text_size"))
+                normalizeUiTheme(value.getString("ui_theme")) ?: invalid(), value.getString("ui_text_size"))
         }
     }
     @Volatile private var published: Presentation? = null
@@ -80,6 +80,12 @@ class PhonePreferences private constructor(private val openStorage: () -> androi
             .put("web_enabled", true).put("speech_network_fallback", true).put("fast_mode", false)
             .put("speech_language", "").put("speech_tts_provider", "").put("speech_tts_voice", "")
 
+        fun normalizeUiTheme(theme: String): String? = when (theme) {
+            "dark", "slate" -> "dark"
+            "light" -> "light"
+            else -> null
+        }
+
         internal fun copyInput(value: JSONObject) = JSONObject(value.toString())
         fun validate(value: JSONObject) {
             val defaults = defaults()
@@ -88,13 +94,15 @@ class PhonePreferences private constructor(private val openStorage: () -> androi
                 "instant" to dev.gitblame.voxgolem.assistant.runtime.AssistantModels.aliases.toSet(),
                 "deep" to dev.gitblame.voxgolem.assistant.runtime.AssistantModels.agentAliases,
                 "review" to dev.gitblame.voxgolem.assistant.runtime.AssistantModels.agentAliases,
-                "response_profile" to setOf("fast", "quality"), "ui_theme" to setOf("light", "dark", "slate"),
+                "response_profile" to setOf("fast", "quality"),
                 "ui_text_size" to setOf("small", "medium", "large", "extra_large"),
             )
             for ((key, options) in enums) {
                 val selected = value.opt(key) as? String ?: invalid()
                 if (selected !in options) invalid()
             }
+            val theme = value.opt("ui_theme") as? String ?: invalid()
+            if (normalizeUiTheme(theme) == null) invalid()
             val strings = listOf("speech_language", "speech_tts_provider", "speech_tts_voice").map { value.opt(it) as? String ?: invalid() }
             try { dev.gitblame.voxgolem.assistant.speech.SpeechSelection(strings[0], strings[1], strings[2]).validateShape() }
             catch (_: IllegalArgumentException) { invalid() }

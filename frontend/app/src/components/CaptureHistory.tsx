@@ -1,3 +1,4 @@
+import { Button } from '../ui/controls'
 import { useEffect, useState } from 'react'
 import type { JSX } from 'react'
 import {
@@ -6,14 +7,21 @@ import {
 } from '../lib/captures'
 import type { CaptureRecord } from '../lib/captures'
 import { visibleSpeechError } from '../lib/androidVoice'
-import { captureErrorMessage as errorMessage, useCaptureHistory } from '../lib/useCaptureHistory'
+import { CAPTURE_PAGE_SIZE, captureErrorMessage as errorMessage, useCaptureHistory } from '../lib/useCaptureHistory'
+import type { CaptureDraftMemory } from '../lib/useCaptureHistory'
+import { Disclosure } from '../ui/controls'
 
-const PAGE_SIZE = 100
-
-export function CaptureHistory({ onBack }: { onBack: () => void }): JSX.Element {
+export function CaptureHistory({ onBack, draftMemory }: { onBack: () => void; draftMemory?: CaptureDraftMemory }): JSX.Element {
   const { snapshot, setSnapshot, playback, records, setRecords, offset, hasOlder, selectedId, selected, draft, draftVersion, conflict, offPage,
-    error, setError, setupMessage, setSetupMessage, mounted, refresh, selectRecord, setDraft, correctionRequest } = useCaptureHistory()
-  const [busy, setBusy] = useState(false)
+    error, setError, correctionSaving, setupMessage, setSetupMessage, mounted, refresh, selectRecord, setDraft, correctionRequest } = useCaptureHistory(draftMemory)
+  const [operationBusy, setBusy] = useState(false)
+  const busy = operationBusy || correctionSaving
+  const [pendingSelection, setPendingSelection] = useState<CaptureRecord | null>(null)
+  const selectCapture = (record: CaptureRecord) => {
+    if (selected !== null && draft !== (selected.finalText ?? selected.previewText ?? '')) {
+      setPendingSelection(record)
+    } else selectRecord(record)
+  }
   const playingId = playback?.phase === 'preparing' || playback?.phase === 'playing' ? playback.captureId : null
   const [editedExportedIds, setEditedExportedIds] = useState<ReadonlySet<string>>(() => new Set())
   useEffect(() => () => { void stopCapturePlayback().catch(() => undefined) }, [])
@@ -94,65 +102,67 @@ export function CaptureHistory({ onBack }: { onBack: () => void }): JSX.Element 
     const request = correctionRequest()
     try {
       const record = await updateCaptureTranscript(selected.captureId, draft, draftVersion)
-      if (!mounted.current) return
       request.accept(record)
+      if (!mounted.current) return
       if (isExported(selected.orgState)) setEditedExportedIds((current) => new Set(current).add(selected.captureId))
       await refresh(offset)
     }
     catch (reason) {
-      if (!request.current()) return
       if (errorMessage(reason) === 'transcript-conflict') {
         request.conflict()
-        await refresh(offset)
-      } else setError(errorMessage(reason))
+        if (request.current()) await refresh(offset)
+      } else request.fail(errorMessage(reason))
     }
-    finally { if (mounted.current) setBusy(false) }
+    finally { request.finish(); if (mounted.current) setBusy(false) }
   }
 
   const displayedError = visibleSpeechError(error) ?? visibleSpeechError(snapshot?.onboardingError)
   return <main className="capture-history" aria-label="Voice notes">
     <header className="capture-history__header">
       <div><h1>Voice notes</h1><p>Capture history and notes-folder settings</p></div>
-      <button type="button" className="shell__control" onClick={onBack}>Back to chat</button>
+      <Button type="button" className="ui-button--utility" onClick={onBack}>Back to chat</Button>
     </header>
     {snapshot?.setupRequired ? <section className="capture-folder" aria-label="Enable watch dictation">
       <div>
         <strong>Enable watch dictation</strong>
         <p>Setup requests RECORD_AUDIO for watch-provided audio, BLUETOOTH_CONNECT, and the required connected-device foreground service access. For Watch Notes, the app supplies Watch audio to the recognizer. Provider input-source isolation is not yet verified.</p>
       </div>
-       <button type="button" className="shell__control" aria-label="Enable watch dictation" onClick={() => void enableWatchDictation()} disabled={busy || snapshot.onboardingState === 'starting'}>Enable watch dictation</button>
+       <Button type="button" className="ui-button--utility" aria-label="Enable watch dictation" onClick={() => void enableWatchDictation()} disabled={busy || snapshot.onboardingState === 'starting'}>Enable watch dictation</Button>
     </section> : null}
     {setupMessage !== null ? <p role="status">{setupMessage}</p> : null}
     <section className="capture-folder" aria-label="Notes folder">
       <div><strong>Notes folder</strong><p>{snapshot?.notesFolderUri ? 'A notes folder is selected' : 'Choose notes folder to archive/export'}</p></div>
-      <button type="button" className="shell__control" onClick={() => void chooseFolder()} disabled={busy || snapshot?.available === false}>Choose folder</button>
+      <Button type="button" className="ui-button--utility" onClick={() => void chooseFolder()} disabled={busy || snapshot?.available === false}>Choose folder</Button>
     </section>
     {snapshot?.available === false ? <p role="status">Voice capture service is unavailable on this device.</p> : null}
     {displayedError !== null ? <p className="capture-history__error" role="alert">{displayedError}</p> : null}
+    {pendingSelection ? <section className="capture-history__selection-warning" aria-label="Unsaved correction">
+      <p role="status">Your correction has not been saved. Keep editing, or discard it before opening this capture.</p>
+      <div className="capture-history__actions">
+        <Button onClick={() => setPendingSelection(null)}>Keep editing</Button>
+        <Button onClick={() => { selectRecord(pendingSelection); setPendingSelection(null) }}>Discard correction and open capture</Button>
+      </div>
+    </section> : null}
     <div className="capture-history__layout">
       <section className="capture-history__list" aria-label="Capture history">
-        <div className="capture-history__list-heading"><h2>History</h2><button type="button" className="shell__control" onClick={() => void refresh(offset)} disabled={busy}>Refresh</button></div>
+        <div className="capture-history__list-heading"><h2>History</h2><Button type="button" className="ui-button--utility" onClick={() => void refresh(offset)} disabled={busy}>Refresh</Button></div>
         {snapshot === null && error === null ? <p>Loading captures…</p> : null}
         {records.length === 0 && snapshot !== null ? <p>No saved captures yet.</p> : null}
         <ul>{records.map((record) => <li key={record.captureId}>
-          <button type="button" className="capture-history__record" aria-current={selectedId === record.captureId ? 'true' : undefined} onClick={() => selectRecord(record)}>
-            <strong><span aria-label="Recorded audio" title="Recorded audio">🎙</span>{' '}{record.finalText ?? record.previewText ?? 'Capture without transcript'}</strong>
+          <Button type="button" className="capture-history__record" aria-current={selectedId === record.captureId ? 'true' : undefined} onClick={() => selectCapture(record)}>
+            <strong>{record.finalText ?? record.previewText ?? 'Capture without transcript'}</strong>
             <span>{formatDate(record.finishedAtUtc ?? record.createdAtUtc)} · {formatDuration(record.durationMs)}</span>
             <span className="capture-history__badges">
               <StatusBadge label="Capture" value={record.captureState} />
               <StatusBadge label="Purpose" value={record.purpose} />
               <StatusBadge label="Recognition" value={record.recognitionState} />
-              {record.liveTranscriptionState !== 'NOT_REQUESTED' ? <StatusBadge label="Live" value={record.liveTranscriptionState} /> : null}
-              <StatusBadge label="Transfer" value={record.transferState} />
-              {record.purpose === 'NOTE' ? <><StatusBadge label="Archive" value={record.archiveState} />
-                <StatusBadge label="Org" value={record.orgState} /></> : null}
             </span>
-          </button>
+          </Button>
         </li>)}</ul>
         <div className="capture-history__pagination">
-          <button type="button" className="shell__control" disabled={offset === 0 || busy} onClick={() => void refresh(Math.max(0, offset - PAGE_SIZE))}>Newer</button>
+          <Button type="button" className="ui-button--utility" disabled={offset === 0 || busy} onClick={() => void refresh(Math.max(0, offset - CAPTURE_PAGE_SIZE))}>Newer</Button>
           <span>{offset + 1}–{offset + records.length}</span>
-          <button type="button" className="shell__control" disabled={!hasOlder || busy} onClick={() => void refresh(offset + PAGE_SIZE)}>Older</button>
+          <Button type="button" className="ui-button--utility" disabled={!hasOlder || busy} onClick={() => void refresh(offset + CAPTURE_PAGE_SIZE)}>Older</Button>
         </div>
       </section>
       <section className="capture-history__detail" aria-label="Capture details">
@@ -161,6 +171,11 @@ export function CaptureHistory({ onBack }: { onBack: () => void }): JSX.Element 
           <p>{formatDate(selected.finishedAtUtc ?? selected.createdAtUtc)} · {formatDuration(selected.durationMs)}</p>
           <p>Input language: {selected.requestedLanguage ?? 'Phone default (legacy)'}</p>
           <p>Speech policy: {selected.speechNetworkFallback ? 'Network fallback allowed' : 'dedicated on-device only'}</p>
+          <Disclosure title="Processing and transfer details" className="capture-history__processing">
+            <StatusBadge label="Transfer" value={selected.transferState} />
+            <StatusBadge label="Live" value={selected.liveTranscriptionState} />
+            {selected.purpose === 'NOTE' ? <><StatusBadge label="Archive" value={selected.archiveState} /><StatusBadge label="Org" value={selected.orgState} /></> : null}
+          </Disclosure>
           {liveStatusMessage(selected) !== null ? <p role="status">{liveStatusMessage(selected)}</p> : null}
           {visibleSpeechError(selected.liveErrorCode) !== null ? <p className="capture-history__error">{visibleSpeechError(selected.liveErrorCode)}</p> : null}
           {selected.finalText !== null
@@ -171,16 +186,16 @@ export function CaptureHistory({ onBack }: { onBack: () => void }): JSX.Element 
           {visibleSpeechError(selected.error) !== null ? <p className="capture-history__error">{visibleSpeechError(selected.error)}</p> : null}
           <div className="capture-history__actions">
             {playback?.captureId === selected.captureId ? <p role="status">{playback.phase === 'preparing' ? 'Preparing playback…' : playback.phase === 'playing' ? 'Playing recording' : playback.phase === 'completed' ? 'Playback completed' : playback.phase === 'failed' ? 'Playback failed' : 'Playback stopped'}</p> : null}
-            {selected.purpose === 'NOTE' && selected.captureState === 'INTERRUPTED' ? <button type="button" className="shell__control" disabled={busy} onClick={() => void finalize(selected)}>Finalize interrupted capture</button> : null}
-            <button type="button" className="shell__control" disabled={busy} onClick={() => void play(selected)}>{playingId === selected.captureId ? 'Stop playback' : 'Play recording'}</button>
-            <button type="button" className="shell__control" disabled={busy || !canRetry(selected)} onClick={() => void retry(selected)}>Retry processing</button>
+            {selected.purpose === 'NOTE' && selected.captureState === 'INTERRUPTED' ? <Button type="button" className="ui-button--utility" disabled={busy} onClick={() => void finalize(selected)}>Finalize interrupted capture</Button> : null}
+            <Button type="button" className="ui-button--utility" disabled={busy} onClick={() => void play(selected)}>{playingId === selected.captureId ? 'Stop playback' : 'Play recording'}</Button>
+            <Button type="button" className="ui-button--utility" disabled={busy || !canRetry(selected)} onClick={() => void retry(selected)}>Retry processing</Button>
           </div>
           <label className="capture-history__edit">Correct transcript
             <textarea value={draft} onChange={(event) => setDraft(event.target.value)} rows={6} disabled={selected.captureState !== 'SAVED' || selected.purpose !== 'NOTE'} />
           </label>
           {conflict ? <p role="alert">Transcript changed while you were editing. Your correction was preserved. Select the capture again to reload the latest transcript before correcting it.</p> : null}
           {offPage ? <p role="alert">This capture is no longer in this history page. Your correction was preserved. Return to its history page to review the latest transcript before saving.</p> : null}
-          <button type="button" className="shell__control" disabled={busy || conflict || offPage || selected.captureState !== 'SAVED' || selected.purpose !== 'NOTE' || draft === (selected.finalText ?? selected.previewText ?? '')} onClick={() => void saveTranscript()}>Save correction</button>
+          <Button type="button" className="ui-button--utility" disabled={busy || conflict || offPage || selected.captureState !== 'SAVED' || selected.purpose !== 'NOTE' || draft === (selected.finalText ?? selected.previewText ?? '')} onClick={() => void saveTranscript()}>Save correction</Button>
           {selected.purpose !== 'NOTE' ? <p className="capture-history__note">Audio retained for this voice session. Notes export and note corrections do not modify its conversation.</p>
             : isExported(selected.orgState) && editedExportedIds.has(selected.captureId)
             ? <p className="capture-history__note">History edited; inbox entry unchanged.</p>

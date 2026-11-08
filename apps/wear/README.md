@@ -56,11 +56,10 @@ AGP 10 rather than treated as permanent configuration.
 
 Assistant and Note share one Material 3 theme/AppScaffold. Normal paragraphs use
 native rectangular wrapping and ordinary lazy-list reading, not a custom circular
-text engine. ScreenScaffold supplies responsive content padding and the bottom
-ExtraSmall edge action. The shared compact control renders at80% of its original
-footprint. Assistant keeps primary/Stop clearance while idle/active work needs it;
-when reading older idle content, Latest floats transparently over text with one48dp
-target rather than an opaque footer. The final line remains reachable. Note follows
+text engine. ScreenScaffold supplies responsive content padding. The shared persistent
+action uses a native 48×48dp target with a 6dp bottom inset. Both primary actions and
+Latest reserve at least 57dp below the reading viewport, keeping the touch target
+and a 3dp gap clear of text at every scroll position. Note follows
 new transcript content without rearming solely on viewport/padding changes.
 Rotary, large-font and round-bezel painting remain target-device acceptance checks.
 

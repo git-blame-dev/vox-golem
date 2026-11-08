@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest'
-import { applySnapshotModelOptions, startupWarningRelevant } from './sessionPolicy'
+import { applySnapshotModelOptions, parseUiTheme, startupWarningRelevant } from './sessionPolicy'
+
+describe('two-theme migration', () => {
+  it('normalizes the retired slate preference without changing light or dark', () => {
+    expect(parseUiTheme('slate')).toBe('dark')
+    expect(parseUiTheme('dark')).toBe('dark')
+    expect(parseUiTheme('light')).toBe('light')
+  })
+})
 
 describe('canonical native model availability', () => {
   it('ignores unsupported Android local-fast startup failures, not supported provider failures', () => {

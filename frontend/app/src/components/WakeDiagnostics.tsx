@@ -1,3 +1,4 @@
+import { Button, Disclosure } from '../ui/controls'
 import { useEffect, useRef, useState } from 'react'
 import type { JSX } from 'react'
 import { invokeTauriCommand } from '../lib/tauri'
@@ -185,18 +186,17 @@ export function WakeDiagnostics({ disabled = false }: WakeDiagnosticsProps): JSX
   const displayNumber = (value: unknown, suffix = ''): string => typeof value === 'number' && Number.isFinite(value) ? `${value}${suffix}` : '—'
 
   return (
-    <details className="wake-diagnostics" onToggle={(event) => { if (event.currentTarget.open) setError(null) }}>
-      <summary>Wake diagnostics</summary>
+    <Disclosure title="Wake diagnostics" className="wake-diagnostics" onToggle={(event) => { if (event.currentTarget.open) setError(null) }}>
       <div className="wake-diagnostics__body">
         <p>This diagnostics panel keeps numeric data only and does not upload audio. Wake clips may separately save local audio on detection; manage them in Settings. Keep this panel open during the test and export the marked snapshot before closing; snapshots are session-local.</p>
         <div className="wake-diagnostics__actions">
           {collecting
-            ? <button type="button" className="shell__control" disabled={pending} onClick={() => void stop()}>Stop collection</button>
-            : <button type="button" className="shell__control" disabled={disabled || pending} onClick={() => void start()}>Start collection</button>}
-          <button type="button" className="shell__control" disabled={disabled || !collecting || pending} onClick={() => void mark('wake_attempt')}>Mark wake attempt</button>
-          <button type="button" className="shell__control" disabled={disabled || !collecting || pending} onClick={() => void mark('false_wake')}>Mark false wake</button>
-          <button type="button" className="shell__control" disabled={snapshot === null} onClick={() => snapshot && exportSnapshot(snapshot, 'wake-diagnostics.json')}>Export current snapshot</button>
-          <button type="button" className="shell__control" disabled={markedSnapshot === null} onClick={() => markedSnapshot && exportSnapshot(markedSnapshot, 'wake-diagnostics-marked.json')}>Export marked snapshot</button>
+            ? <Button type="button" className="ui-button--utility" disabled={pending} onClick={() => void stop()}>Stop collection</Button>
+            : <Button type="button" className="ui-button--utility" disabled={disabled || pending} onClick={() => void start()}>Start collection</Button>}
+          <Button type="button" className="ui-button--utility" disabled={disabled || !collecting || pending} onClick={() => void mark('wake_attempt')}>Mark wake attempt</Button>
+          <Button type="button" className="ui-button--utility" disabled={disabled || !collecting || pending} onClick={() => void mark('false_wake')}>Mark false wake</Button>
+          <Button type="button" className="ui-button--utility" disabled={snapshot === null} onClick={() => snapshot && exportSnapshot(snapshot, 'wake-diagnostics.json')}>Export current snapshot</Button>
+          <Button type="button" className="ui-button--utility" disabled={markedSnapshot === null} onClick={() => markedSnapshot && exportSnapshot(markedSnapshot, 'wake-diagnostics-marked.json')}>Export marked snapshot</Button>
         </div>
         {error !== null ? <p className="wake-diagnostics__error" role="alert">Wake diagnostics error: {error}</p> : null}
         {snapshot !== null ? (
@@ -212,7 +212,7 @@ export function WakeDiagnostics({ disabled = false }: WakeDiagnosticsProps): JSX
           </dl>
         ) : null}
       </div>
-    </details>
+    </Disclosure>
   )
 }
 

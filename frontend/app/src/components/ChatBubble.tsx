@@ -1,4 +1,6 @@
-import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { IconButton } from '../ui/controls'
+import { useSyncExternalStore } from 'react'
+import { useClipboardFeedback } from '../lib/useClipboardFeedback'
 import type { JSX } from 'react'
 import type { FrontendSession } from '../FrontendSession'
 import type { TranscriptMessage } from '../types/chat'
@@ -10,32 +12,6 @@ import { isCoreWhitespaceOnly } from '../lib/wire'
 
 interface ChatBubbleProps {
   readonly message: TranscriptMessage
-}
-
-async function copyTextToClipboard(text: string): Promise<boolean> {
-  try {
-    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text)
-      return true
-    }
-  } catch {
-    // Fall back to execCommand('copy') in restricted WebViews
-  }
-  try {
-    const textarea = document.createElement('textarea')
-    textarea.value = text
-    textarea.setAttribute('readonly', '')
-    textarea.style.position = 'fixed'
-    textarea.style.opacity = '0'
-    textarea.style.pointerEvents = 'none'
-    document.body.appendChild(textarea)
-    textarea.select()
-    const copied = typeof document.execCommand === 'function' && document.execCommand('copy')
-    document.body.removeChild(textarea)
-    return copied
-  } catch {
-    return false
-  }
 }
 
 function formatTextWithSources(
@@ -63,132 +39,39 @@ export function CopyMessageButton({
   readonly label: string
   readonly sources?: readonly { readonly url: string; readonly title: string }[]
 }): JSX.Element | null {
-  const [copied, setCopied] = useState(false)
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  useEffect(() => () => {
-    if (timerRef.current !== null) clearTimeout(timerRef.current)
-  }, [])
+  const { copied, copy } = useClipboardFeedback()
   if (isCoreWhitespaceOnly(text)) return null
   return (
-    <button
-      type="button"
+    <IconButton
       className="message__copy-button"
-      aria-label={copied ? 'Copied' : label}
+      label={copied ? 'Copied' : label}
       title={copied ? 'Copied' : label}
       data-copied={copied ? 'true' : undefined}
-      onClick={() => {
-        void copyTextToClipboard(formatTextWithSources(text, sources)).then((ok) => {
-          if (!ok) return
-          setCopied(true)
-          if (timerRef.current !== null) clearTimeout(timerRef.current)
-          timerRef.current = setTimeout(() => setCopied(false), 1500)
-        })
-      }}
+      onClick={() => { void copy(formatTextWithSources(text, sources)) }}
     >
       <ControlIcon kind={copied ? 'check' : 'copy'} />
-    </button>
+    </IconButton>
   )
 }
 
-export function MessageFooter({
-  role,
-  text,
-  canCopy,
-  timingLabel,
-  sources,
-  canRaise = true,
-}: {
+export function MessageFooter({ role, text, canCopy, timingLabel, sources, copyLabel }: {
   readonly role: 'user' | 'assistant' | 'system'
   readonly text: string
   readonly canCopy: boolean
   readonly timingLabel: string | null
+  readonly copyLabel?: string
   readonly sources?: readonly { readonly url: string; readonly title: string }[]
-  readonly canRaise?: boolean
 }): JSX.Element | null {
-  const footerRef = useRef<HTMLElement | null>(null)
-  const [raised, setRaised] = useState(false)
-
-  const shouldEvaluateRaise = timingLabel === null && canRaise !== false && canCopy
-
-  useLayoutEffect(() => {
-    const footerEl = footerRef.current
-    if (footerEl === null || !shouldEvaluateRaise) {
-      setRaised(false)
-      return
-    }
-    const paragraph = footerEl.parentElement?.querySelector('.message__content, .answer-stage__answer')
-    if (!(paragraph instanceof HTMLElement)) {
-      setRaised(false)
-      return
-    }
-
-    const checkRaise = (): void => {
-      const pRect = paragraph.getBoundingClientRect()
-      if (pRect.width === 0 || pRect.height === 0) {
-        setRaised(false)
-        return
-      }
-      const range = document.createRange()
-      range.selectNodeContents(paragraph)
-      const rects = range.getClientRects()
-      const lastRect = rects.length > 0 ? rects[rects.length - 1] ?? null : null
-      const buttonClearance = 32
-
-      let isRoomAvailable = false
-      if (lastRect !== null) {
-        if (role === 'assistant') {
-          isRoomAvailable = pRect.right - lastRect.right >= buttonClearance
-        } else if (role === 'user') {
-          isRoomAvailable = lastRect.left - pRect.left >= buttonClearance
-        }
-      }
-      setRaised(isRoomAvailable)
-    }
-
-    checkRaise()
-
-    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => {
-      checkRaise()
-    })
-    observer?.observe(paragraph)
-    observer?.observe(footerEl)
-
-    return () => {
-      observer?.disconnect()
-    }
-  }, [role, text, shouldEvaluateRaise])
-
   if (timingLabel === null && !canCopy) return null
-
-  return (
-    <footer
-      ref={footerRef as React.RefObject<HTMLElement>}
-      className={`message__footer message__footer--${role}`}
-      {...(raised ? { 'data-raised': 'true' } : {})}
-    >
-      {timingLabel !== null ? (
-        <small className="conversation__timings" data-custom-direct-timings="true">
-          {timingLabel}
-        </small>
-      ) : null}
-      {canCopy ? (
-        <CopyMessageButton
-          text={text}
-          label={role === 'user' ? 'Copy prompt' : 'Copy response'}
-          {...(sources === undefined ? {} : { sources })}
-        />
-      ) : null}
-    </footer>
-  )
+  return <footer className="message__footer" data-has-copy={canCopy || undefined}>
+    {timingLabel !== null ? <small className="conversation__timings" data-custom-direct-timings="true">{timingLabel}</small> : null}
+    {canCopy ? <CopyMessageButton text={text} label={copyLabel ?? (role === 'user' ? 'Copy prompt' : 'Copy response')} {...(sources === undefined ? {} : { sources })} /> : null}
+  </footer>
 }
 
 export function CopyConversationButton({ session, disabled = false }: { readonly session: FrontendSession; readonly disabled?: boolean }): JSX.Element {
   const messages = useSyncExternalStore(session.subscribe, session.getMessagesSnapshot, session.getMessagesSnapshot)
-  const [copied, setCopied] = useState(false)
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  useEffect(() => () => {
-    if (timerRef.current !== null) clearTimeout(timerRef.current)
-  }, [])
+  const { copied, copy } = useClipboardFeedback()
   const exportable = messages.filter(
     (m) => isTranscriptMessage(m) && (m.role === 'user' || m.role === 'assistant') && m.content.trim().length > 0,
   )
@@ -207,12 +90,7 @@ export function CopyConversationButton({ session, disabled = false }: { readonly
         const formatted = exportable
           .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}:\n${formatTextWithSources(m.content, m.answerStage?.sources, true)}`)
           .join('\n\n')
-        void copyTextToClipboard(formatted).then((ok) => {
-          if (!ok) return
-          setCopied(true)
-          if (timerRef.current !== null) clearTimeout(timerRef.current)
-          timerRef.current = setTimeout(() => setCopied(false), 1500)
-        })
+        void copy(formatted)
       }}
     >
       <ControlIcon kind={copied ? 'check' : 'copy'} />

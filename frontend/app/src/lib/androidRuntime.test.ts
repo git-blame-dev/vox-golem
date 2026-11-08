@@ -91,7 +91,7 @@ describe('Android runtime contract helpers', () => {
     })
     window.__TAURI_INTERNALS__ = { invoke }
 
-    await expect(invokeAndroidCommand('set_ui_theme', { theme })).resolves.toBe(theme)
+    await expect(invokeAndroidCommand('set_ui_theme', { theme })).resolves.toBe(theme === 'slate' ? 'dark' : theme)
     expect(invoke).toHaveBeenCalledTimes(1)
     expect(invoke.mock.calls[0]?.[1]).toMatchObject({ preferences: { ui_theme: theme, response_profile: 'quality' } })
 
@@ -146,7 +146,7 @@ describe('Android runtime contract helpers', () => {
     expect(updated.capabilities.find((item) => item['id'] === 'custom_provider')?.['state']).toBe('unavailable')
   })
 
-  it.each(['dark', 'slate', 'light'] as const)('preserves %s preferences changed after a snapshot request started', (theme) => {
+  it.each(['dark', 'light'] as const)('preserves %s preferences changed after a snapshot request started', (theme) => {
     cacheAndroidSnapshot(snapshot)
     const snapshotPreferenceRevision = getAndroidPreferencePublicationRevision()
     const updatedPreferences = { ...preferences, uiTheme: theme }

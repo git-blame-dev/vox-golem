@@ -35,6 +35,7 @@ import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.text.style.TextOverflow
@@ -401,7 +402,7 @@ internal fun AssistantScreen(
                                              onCheckedChange = actions.setFastMode,
                                              enabled = modelEnabled && requestedModel == null,
                                              label = { Text("Fast mode") },
-                                             secondaryLabel = { Text("Priority processing") },
+                                             secondaryLabel = { Text(if (state.fastMode) "On · priority requested" else "Off · standard processing requested") },
                                              modifier = Modifier.fillMaxWidth(),
                                          )
                                      }
@@ -604,12 +605,11 @@ private fun ChatScreen(
                 start = contentPadding.calculateStartPadding(layoutDirection),
                 top = maxOf(0.dp, headerHeight - inset),
                 end = contentPadding.calculateEndPadding(layoutDirection),
-                bottom = maxOf(0.dp, maxOf(48.dp, CompactEdgeButtonDefaults.Height) + 3.dp - inset),
+                bottom = 0.dp,
             )
             LazyColumn(Modifier.fillMaxSize()
-                // Intentional project override: chrome may overlap middle history;
-                // end padding clears first/last text, bezel clipping reserves 10% each.
-                .padding(vertical = inset)
+                // Exclude the persistent action from the entire viewport, including middle history.
+                .padding(top = inset, bottom = CompactEdgeButtonDefaults.readingBottomInset(maxHeight))
                 .listRotary(list, active) { delta ->
                     if (delta != 0f) reading.readOlder(list.canScrollForward || (delta < 0f && list.canScrollBackward))
                 }
@@ -728,7 +728,7 @@ private fun ChatScreen(
                 item(key = "tail") { Spacer(Modifier.height(1.dp)) }
             }
             if (!showLatest) {
-                Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(maxOf(48.dp, CompactEdgeButtonDefaults.Height)),
+                Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(CompactEdgeButtonDefaults.OccupiedHeight),
                     contentAlignment = Alignment.BottomCenter) {
                     PrimaryEdgeButton(state, voice, actions.copy(stop = { continuity.stopReply(); actions.stop() }), conversationMode, onMissingSpeech)
                 }
@@ -740,7 +740,7 @@ private fun ChatScreen(
                         list.scrollToEnd()
                     } }
                 }, modifier = Modifier.align(Alignment.BottomCenter)
-                    .padding(bottom = 6.dp).size(48.dp).semantics { contentDescription = "Jump to latest" },
+                    .padding(bottom = CompactEdgeButtonDefaults.BottomInset).size(CompactEdgeButtonDefaults.Height).semantics { contentDescription = "Jump to latest" },
                     colors = IconButtonDefaults.iconButtonColors(containerColor = Color.Transparent,
                         disabledContainerColor = Color.Transparent, contentColor = MaterialTheme.colorScheme.onBackground)) {
                     LatestGlyph()
@@ -828,6 +828,7 @@ private fun SettingsScreen(state: AssistantState, voice: AssistantVoiceState, pa
     val enabled = !state.busy && !voice.active
     val speechSettings = assistantSpeechSettings(voice, preferences)
     ScreenList("Settings", back) {
+        item { SettingsSectionTitle("Chat") }
         item { ActionButton("New chat", state.foreground && enabled) { actions.new(); back() } }
         item { ActionButton("Chats", state.foreground && enabled, chats) }
         item { ActionButton("Keyboard", state.foreground && !state.busy, edit) }
@@ -837,11 +838,13 @@ private fun SettingsScreen(state: AssistantState, voice: AssistantVoiceState, pa
         item { ActionButton("Model: ${AssistantModels.presentation[state.model]?.fullLabel ?: state.model}", enabled, openModels) }
         if (AssistantModels.presentation[state.model]?.supportsFast == true) {
             item { SwitchButton(checked = state.fastMode, onCheckedChange = actions.setFastMode, enabled = enabled,
-                label = { Text("Fast mode") }, secondaryLabel = { Text("Priority processing") },
+                label = { Text("Fast mode") }, secondaryLabel = { Text(if (state.fastMode) "On · priority requested" else "Off · standard processing requested") },
                 modifier = Modifier.fillMaxWidth()) }
         }
+        item { SettingsSectionTitle("Voice interaction") }
         item { SwitchButton(checked = preferences.readRepliesAloud, onCheckedChange = actions.tts, enabled = enabled,
-            label = { Text("Speak replies") }, secondaryLabel = { Text("Local voice preferred") },
+            label = { Text("Speak replies") }, secondaryLabel = { Text(if (preferences.readRepliesAloud) "On · local voice preferred" else "Off · automatic playback disabled",
+                maxLines = Int.MAX_VALUE, overflow = TextOverflow.Clip) },
             modifier = Modifier.fillMaxWidth()) }
         item { SwitchButton(checked = state.speechNetworkFallback, onCheckedChange = actions.setSpeechNetworkFallback,
             enabled = assistantCanChangeSpeechFallback(state, voice),
@@ -851,19 +854,19 @@ private fun SettingsScreen(state: AssistantState, voice: AssistantVoiceState, pa
         item { SwitchButton(checked = preferences.conversationMode, onCheckedChange = actions.setConversationMode, enabled = enabled,
             label = { Text("Talk by default") }, secondaryLabel = { Text(if (preferences.conversationMode) "Reopen mic after reply" else "Ask once, then stop",
                 maxLines = Int.MAX_VALUE, overflow = TextOverflow.Clip) }, modifier = Modifier.fillMaxWidth()) }
-        item { Text("Ask sends one finalized voice turn. Talk listens again after replying. Square Stop cancels listening, response and playback; it never sends. Backgrounding stops voice; restart deliberately.") }
-        item { Text("Saved speech requests", style = wearTextStyle(MaterialTheme.typography.titleMedium)) }
-        item { Text("Language, engine and voice are persisted requests, not proof of the active processing route. Labels change only when native state reports the choice.") }
+        item { SettingsSupportingText("Ask sends one finalized voice turn. Talk listens again after replying. Square Stop cancels listening, response and playback; it never sends. Backgrounding stops voice; restart deliberately.") }
+        item { SettingsSectionTitle("Saved speech requests") }
+        item { SettingsSupportingText("Language, engine and voice are persisted requests, not proof of the active processing route. Labels change only when native state reports the choice.") }
         if (speechSelectionPending) item { Text("Waiting for native speech-settings settlement") }
         speechSelectionError?.let { error -> item { Text(assistantSpeechSelectionErrorText(error), color = MaterialTheme.colorScheme.error) } }
         assistantRequestError(state)?.let { error -> item { Text(assistantErrorText(error), color = MaterialTheme.colorScheme.error) } }
         item { ActionButton("Speech language: ${state.speechLanguage.ifEmpty { "Automatic" }}", true) { openSpeech(AssistantSpeechField.LANGUAGE) } }
-        item { Text("Changing engine explicitly clears the old voice to Automatic. No other engine or voice is substituted.") }
+        item { SettingsSupportingText("Changing engine explicitly clears the old voice to Automatic. No other engine or voice is substituted.") }
         item { ActionButton("Reply voice engine: ${state.speechTtsProvider.ifEmpty { "Automatic" }}", true) { openSpeech(AssistantSpeechField.ENGINE) } }
         item { ActionButton("Speech voice: ${state.speechTtsVoice.ifEmpty { "Automatic" }}", true) { openSpeech(AssistantSpeechField.VOICE) } }
-        item { Text("Speech model selection unavailable · model identifiers not reported") }
+        item { SettingsSupportingText("Speech model selection unavailable · model identifiers not reported") }
         item { ActionButton("Reset all speech to Automatic", assistantCanSelectSpeech(state, voice, speechSelectionPending), actions.resetSpeechSelection) }
-        item { Text("Speech routes", style = wearTextStyle(MaterialTheme.typography.titleMedium)) }
+        item { SettingsSectionTitle("Speech routes") }
         if (voice.missingSpeechServices) {
             item {
                 Text(voice.speechRequirementMessage ?: "Speech Recognition & Synthesis by Google is required for local STT or TTS.", color = MaterialTheme.colorScheme.error)
@@ -874,19 +877,33 @@ private fun SettingsScreen(state: AssistantState, voice: AssistantVoiceState, pa
         }
         item { Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(speechSettings.dictationStatus, style = wearTextStyle(MaterialTheme.typography.labelMedium))
-            speechSettings.dictationDetails?.let { Text(it) }
+            speechSettings.dictationDetails?.let { SettingsSupportingText(it) }
         } }
         item { Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(speechSettings.replyStatus, style = wearTextStyle(MaterialTheme.typography.labelMedium))
-            speechSettings.replyDetails?.let { Text(it) }
+            speechSettings.replyDetails?.let { SettingsSupportingText(it) }
         } }
-        item { Text("Requested languages and engine preferences are configuration, not route proof. Actual processing and hidden speech model identities: not reported. Installed languages and offline verification are unknown unless supplied by the native provider.") }
-         item { Text(assistantDictationAvailabilityDescription(state, voice)) }
-        item { Text("Keyboard microphone follows your IME; it is not guaranteed offline.") }
-        item { Text("Conversation sync", style = wearTextStyle(MaterialTheme.typography.titleMedium)) }
+        item { SettingsSupportingText("Requested languages and engine preferences are configuration, not route proof. Actual processing and hidden speech model identities: not reported. Installed languages and offline verification are unknown unless supplied by the native provider.") }
+        item { SettingsSupportingText(assistantDictationAvailabilityDescription(state, voice)) }
+        item { SettingsSupportingText("Keyboard microphone follows your IME; it is not guaranteed offline.") }
+        item { SettingsSectionTitle("Conversation sync") }
         item { Text(assistantLinkStatusText(pairing.reason)) }
         item { ActionButton("Recheck connection", true) { actions.recheck(); actions.prepareSpeechOptions() } }
     }
+}
+
+@Composable
+private fun SettingsSectionTitle(title: String) {
+    Text(title, style = wearTextStyle(MaterialTheme.typography.titleSmall),
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.padding(top = 8.dp).semantics { heading() })
+}
+
+@Composable
+private fun SettingsSupportingText(text: String) {
+    Text(text, style = wearTextStyle(MaterialTheme.typography.bodySmall),
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        maxLines = Int.MAX_VALUE, overflow = TextOverflow.Clip)
 }
 
 @Composable

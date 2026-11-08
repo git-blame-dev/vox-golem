@@ -1,7 +1,8 @@
 export type ControlIconState = 'busy' | 'listening' | 'finishing' | 'generating' | 'speaking' | 'between-turns' | 'unavailable' | 'error'
 
-export function ControlIcon({ kind, state }: { readonly kind: 'plus' | 'mic' | 'conversation' | 'notes' | 'speaker' | 'model' | 'send' | 'search' | 'settings' | 'finish' | 'stop' | 'stop-send' | 'copy' | 'check'; readonly state?: ControlIconState }) {
+export function ControlIcon({ kind, state }: { readonly kind: 'plus' | 'mic' | 'conversation' | 'notes' | 'speaker' | 'model' | 'send' | 'search' | 'settings' | 'finish' | 'stop' | 'stop-send' | 'copy' | 'check' | 'more'; readonly state?: ControlIconState }) {
   const paths = {
+    more: 'M5 12h.01 M12 12h.01 M19 12h.01',
     plus: 'M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z',
     mic: 'M9 5a3 3 0 0 1 6 0v7a3 3 0 0 1-6 0z M5 10v2a7 7 0 0 0 14 0v-2 M12 19v3 M8 22h8',
     conversation: 'M4 4h16v12H9l-5 4z M8 8h8 M8 12h6',

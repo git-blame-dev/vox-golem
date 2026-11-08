@@ -1974,17 +1974,8 @@ fn build_ipc_app_snapshot(
                 },
             },
             tts_enabled,
-            ui_theme: match ui_preferences.theme {
-                UiThemePayload::Light => ipc::UiTheme::Light,
-                UiThemePayload::Dark => ipc::UiTheme::Dark,
-                UiThemePayload::Slate => ipc::UiTheme::Slate,
-            },
-            ui_text_size: match ui_preferences.text_size {
-                UiTextSizePayload::Small => ipc::UiTextSize::Small,
-                UiTextSizePayload::Medium => ipc::UiTextSize::Medium,
-                UiTextSizePayload::Large => ipc::UiTextSize::Large,
-                UiTextSizePayload::ExtraLarge => ipc::UiTextSize::ExtraLarge,
-            },
+            ui_theme: ui_preferences.theme,
+            ui_text_size: ui_preferences.text_size,
         },
     }
 }
@@ -11443,7 +11434,7 @@ struct PersistedState {
 
 impl From<&voxgolem_core::ipc::ValidatedPreferences> for PersistedState {
     fn from(preferences: &voxgolem_core::ipc::ValidatedPreferences) -> Self {
-        use voxgolem_core::ipc::{ResponseProfile, UiTextSize, UiTheme};
+        use voxgolem_core::ipc::ResponseProfile;
         Self {
             web_enabled: Some(preferences.web_enabled),
             speech_network_fallback: Some(preferences.speech_network_fallback),
@@ -11460,17 +11451,8 @@ impl From<&voxgolem_core::ipc::ValidatedPreferences> for PersistedState {
                 ResponseProfile::Quality => ResponseProfilePayload::Quality,
             }),
             tts_enabled: Some(preferences.tts_enabled),
-            ui_text_size: Some(match preferences.ui_text_size {
-                UiTextSize::Small => UiTextSizePayload::Small,
-                UiTextSize::Medium => UiTextSizePayload::Medium,
-                UiTextSize::Large => UiTextSizePayload::Large,
-                UiTextSize::ExtraLarge => UiTextSizePayload::ExtraLarge,
-            }),
-            ui_theme: Some(match preferences.ui_theme {
-                UiTheme::Light => UiThemePayload::Light,
-                UiTheme::Dark => UiThemePayload::Dark,
-                UiTheme::Slate => UiThemePayload::Slate,
-            }),
+            ui_text_size: Some(preferences.ui_text_size),
+            ui_theme: Some(preferences.ui_theme),
             assistant_settings: Some(preferences.into()),
             auto_update_download: None,
             auto_update_install: None,
@@ -15854,7 +15836,7 @@ mod tests {
         );
         let mut requested = get_app_snapshot_from_state(&state).unwrap().preferences;
         assert_eq!(requested.ui_theme, UiTheme::Dark);
-        for theme in [UiTheme::Slate, UiTheme::Light, UiTheme::Dark] {
+        for theme in [UiTheme::Light, UiTheme::Dark] {
             requested.ui_theme = theme;
             let accepted = tauri::async_runtime::block_on(set_preferences_from_state(
                 requested.clone(),
@@ -16496,7 +16478,6 @@ mod tests {
             requested.ui_theme = match requested.ui_theme {
                 voxgolem_core::ipc::UiTheme::Light => voxgolem_core::ipc::UiTheme::Dark,
                 voxgolem_core::ipc::UiTheme::Dark => voxgolem_core::ipc::UiTheme::Light,
-                voxgolem_core::ipc::UiTheme::Slate => voxgolem_core::ipc::UiTheme::Light,
             };
 
             let result =
@@ -21150,6 +21131,37 @@ mod tests {
     }
 
     #[test]
+    fn legacy_slate_theme_publishes_and_persists_dark_on_next_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let _root = super::test_storage::ScopedRoot::new(directory.path().to_path_buf());
+        let legacy = parse_persisted_state("ui_theme = \"slate\"\n").unwrap();
+        assert_eq!(legacy.ui_theme, Some(UiThemePayload::Dark));
+        let path = super::response_profile_state_path().unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "ui_theme = \"slate\"\n").unwrap();
+        let state = build_nonfatal_config_error_app_state(
+            default_voice_pipeline_config(),
+            super::embedded_cue_asset_paths(),
+            "synthetic".into(),
+        );
+        let mut wire =
+            serde_json::to_value(get_app_snapshot_from_state(&state).unwrap().preferences).unwrap();
+        assert_eq!(wire["ui_theme"], "dark");
+        wire["ui_theme"] = "slate".into();
+        let requested = serde_json::from_value(wire).unwrap();
+        let accepted =
+            tauri::async_runtime::block_on(set_preferences_from_state(requested, &state)).unwrap();
+        assert_eq!(accepted.ui_theme, UiThemePayload::Dark);
+        assert_eq!(
+            load_persisted_ui_theme().unwrap(),
+            Some(UiThemePayload::Dark)
+        );
+        let persisted = fs::read_to_string(path).unwrap();
+        assert!(persisted.contains("ui_theme = \"dark\""));
+        assert!(!persisted.contains("slate"));
+    }
+
+    #[test]
     fn parse_persisted_state_reads_assistant_settings() {
         let state = parse_persisted_state(
             "assistant_instant = \"custom-luna-low\"\nassistant_deep = \"opencode-sol-high\"\nassistant_review = \"custom-sol-high\"\nassistant_deep_enabled = true\nassistant_review_enabled = false\nassistant_prefetch = true\nassistant_completion = false\n",
@@ -21333,7 +21345,7 @@ mod tests {
         let initial = get_app_snapshot_from_state(&state).unwrap().preferences;
         persist_state(PersistedState::from(&initial)).unwrap();
         let mut proposed = initial.clone();
-        proposed.ui_theme = voxgolem_core::ipc::UiTheme::Slate;
+        proposed.ui_theme = voxgolem_core::ipc::UiTheme::Light;
         let previous = persist_validated_preferences(&proposed).unwrap();
         super::persist_auto_update_install(false).unwrap();
         super::restore_persisted_state(previous, &proposed).unwrap();

@@ -12,6 +12,7 @@ import android.view.inputmethod.EditorInfo
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import dev.gitblame.voxgolem.android.wear.WearAppColors
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -27,20 +28,37 @@ class AssistantTextInputTest {
     private fun editorIntent() = Intent(RuntimeEnvironment.getApplication(), AssistantTextEntryActivity::class.java)
         .putExtra(AssistantTextInput.DRAFT, "Synthetic old draft")
 
-    @Test fun nativeKeyboardEditorPrefillsDraftUsesResizeAndKeepsWhiteOnBlackConfirmation() {
+    @Test fun nativeEditorKeepsBlackBackgroundAndReadableThemeRolePairs() {
+        assertEquals(Color.BLACK, WearAppColors.background)
+        for ((foreground, background) in listOf(
+            WearAppColors.onBackground to WearAppColors.background,
+            WearAppColors.onSurfaceVariant to WearAppColors.background,
+            WearAppColors.onPrimary to WearAppColors.primary,
+        )) {
+            val a = Color.luminance(foreground)
+            val b = Color.luminance(background)
+            val contrast = (maxOf(a, b) + 0.05f) / (minOf(a, b) + 0.05f)
+            assertTrue("Native editor text contrast is $contrast", contrast >= 4.5f)
+        }
+    }
+
+    @Test fun nativeKeyboardEditorPrefillsDraftUsesResizeAndWearThemeRoles() {
         val controller = Robolectric.buildActivity(AssistantTextEntryActivity::class.java, editorIntent()).setup()
         val activity = controller.get()
         val input = activity.findViewById<EditText>(android.R.id.edit)
         val button = activity.findViewById<Button>(android.R.id.button1)
         assertEquals("Synthetic old draft", input.text.toString())
         assertEquals(input.text.length, input.selectionStart)
-        assertEquals(Color.WHITE, input.currentTextColor)
+        assertEquals(WearAppColors.onBackground, input.currentTextColor)
+        assertEquals(WearAppColors.onSurfaceVariant, input.currentHintTextColor)
+        assertEquals(WearAppColors.primary, input.backgroundTintList!!.defaultColor)
         assertEquals("Use text", button.text.toString())
         assertTrue(button.isShown)
-        assertEquals(Color.BLACK, button.currentTextColor)
+        assertEquals(WearAppColors.onPrimary, button.currentTextColor)
+        assertEquals(WearAppColors.primary, button.backgroundTintList!!.defaultColor)
         assertTrue(button.minHeight >= (48 * activity.resources.displayMetrics.density).toInt())
         val root = activity.findViewById<ViewGroup>(android.R.id.content).getChildAt(0) as LinearLayout
-        assertEquals(Color.BLACK, (root.background as ColorDrawable).color)
+        assertEquals(WearAppColors.background, (root.background as ColorDrawable).color)
         assertEquals(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE,
             activity.window.attributes.softInputMode and WindowManager.LayoutParams.SOFT_INPUT_MASK_ADJUST)
         assertEquals(EditorInfo.IME_FLAG_NO_EXTRACT_UI, input.imeOptions and EditorInfo.IME_FLAG_NO_EXTRACT_UI)

@@ -1,13 +1,63 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { listCaptures, loadCaptureSnapshot, listenCapturePlayback } from './captures'
 import type { CaptureRecord, CaptureSnapshot, CapturePlayback } from './captures'
 
-const PAGE_SIZE = 100
+export const CAPTURE_PAGE_SIZE = 100
 interface Correction { captureId: string; text: string; baselineText: string; version: number; conflicted: boolean; record: CaptureRecord }
+interface CaptureDraftSnapshot { correction: Correction | null; saveError: string | null; saving: boolean }
 const transcript = (record: CaptureRecord): string => record.finalText ?? record.previewText ?? ''
 
-/** The history screen owns its polling lifetime, page requests and correction baseline. */
-export function useCaptureHistory() {
+/** Session-local editor and save ownership; screen polling has an independent lifetime. */
+export class CaptureDraftMemory {
+  #snapshot: CaptureDraftSnapshot = { correction: null, saveError: null, saving: false }
+  #selection = 0
+  #request = 0
+  #listeners = new Set<() => void>()
+  getSnapshot = () => this.#snapshot
+  subscribe = (listener: () => void) => { this.#listeners.add(listener); return () => { this.#listeners.delete(listener) } }
+  #publish(next: CaptureDraftSnapshot) {
+    this.#snapshot = next
+    this.#listeners.forEach((listener) => listener())
+  }
+  update = (updater: (previous: Correction | null) => Correction | null) => {
+    const correction = updater(this.#snapshot.correction)
+    if (correction !== this.#snapshot.correction) this.#publish({ ...this.#snapshot, correction })
+  }
+  select(record: CaptureRecord) {
+    this.#selection += 1
+    this.#publish({ ...this.#snapshot, saveError: null, correction: {
+      captureId: record.captureId, text: transcript(record), baselineText: transcript(record),
+      version: record.transcriptVersion, conflicted: false, record,
+    } })
+  }
+  beginSave() {
+    const correction = this.#snapshot.correction
+    const selection = this.#selection
+    const request = ++this.#request
+    const current = () => selection === this.#selection && request === this.#request
+    this.#publish({ ...this.#snapshot, saving: true, saveError: null })
+    return {
+      current,
+      conflict: () => {
+        if (current()) this.update((previous) => previous !== null && correction !== null && previous.captureId === correction.captureId && previous.version === correction.version
+          ? { ...previous, conflicted: true } : previous)
+      },
+      fail: (message: string) => { if (current()) this.#publish({ ...this.#snapshot, saveError: message }) },
+      accept: (record: CaptureRecord) => {
+        if (!current() || correction == null || record.captureId !== correction.captureId || record.transcriptVersion !== correction.version + 1) return false
+        this.update((previous) => previous?.captureId === correction.captureId && previous.version === correction.version
+          ? { ...previous, baselineText: transcript(record), version: record.transcriptVersion,
+            record: previous.record.transcriptVersion > record.transcriptVersion ? previous.record : record } : previous)
+        return true
+      },
+      finish: () => { if (request === this.#request) this.#publish({ ...this.#snapshot, saving: false }) },
+    }
+  }
+}
+export const createCaptureDraftMemory = (): CaptureDraftMemory => new CaptureDraftMemory()
+
+/** The mounted screen owns observation only; edit/save state survives navigation. */
+export function useCaptureHistory(draftMemory?: CaptureDraftMemory) {
   const [snapshot, setSnapshot] = useState<CaptureSnapshot | null>(null)
   const [playback, setPlayback] = useState<CapturePlayback | null>(null)
   const projectPlayback = useCallback((next: CapturePlayback): void => {
@@ -16,12 +66,14 @@ export function useCaptureHistory() {
   const [records, setRecords] = useState<CaptureRecord[]>([])
   const [offset, setOffset] = useState(0)
   const [hasOlder, setHasOlder] = useState(false)
-  const [correction, setCorrection] = useState<Correction | null>(null)
+  const [localDraftMemory] = useState(createCaptureDraftMemory)
+  const owner = draftMemory ?? localDraftMemory
+  const { correction, saveError, saving: correctionSaving } = useSyncExternalStore(owner.subscribe, owner.getSnapshot, owner.getSnapshot)
+  const setCorrection = owner.update
   const [error, setError] = useState<string | null>(null)
   const [setupMessage, setSetupMessage] = useState<string | null>(null)
   const mounted = useRef(false)
   const lifetime = useRef(0)
-  const selection = useRef(0)
   const requestedPage = useRef(0)
   const pendingPage = useRef<number | null>(null)
   const inFlight = useRef<Promise<void> | null>(null)
@@ -38,8 +90,8 @@ export function useCaptureHistory() {
         pendingPage.current = null
         try {
           const nextSnapshot = await loadCaptureSnapshot()
-          let nextRecords = nextPage === 0 ? nextSnapshot.captures : await listCaptures(nextPage, PAGE_SIZE)
-          const more = nextRecords.length === PAGE_SIZE && (await listCaptures(nextPage + PAGE_SIZE, 1)).length > 0
+          let nextRecords = nextPage === 0 ? nextSnapshot.captures : await listCaptures(nextPage, CAPTURE_PAGE_SIZE)
+          const more = nextRecords.length === CAPTURE_PAGE_SIZE && (await listCaptures(nextPage + CAPTURE_PAGE_SIZE, 1)).length > 0
           if (!current() || nextPage !== requestedPage.current) continue
           nextRecords = [...nextRecords].sort((left, right) => Date.parse(right.createdAtUtc) - Date.parse(left.createdAtUtc))
           setSnapshot(nextSnapshot)
@@ -75,7 +127,7 @@ export function useCaptureHistory() {
     })
     inFlight.current = promise
     return promise
-  }, [projectPlayback])
+  }, [projectPlayback, setCorrection])
 
   useEffect(() => {
     mounted.current = true
@@ -118,34 +170,24 @@ export function useCaptureHistory() {
     ? correction.record : pageRecord ?? null
   const offPage = correction !== null && pageRecord === undefined
   const conflict = selected !== null && correction !== null && (correction.conflicted || selected.transcriptVersion !== correction.version)
-  const selectRecord = (record: CaptureRecord): void => {
-    selection.current += 1
-    setCorrection({ captureId: record.captureId, text: transcript(record), baselineText: transcript(record), version: record.transcriptVersion, conflicted: false, record })
-  }
+  const selectRecord = (record: CaptureRecord): void => owner.select(record)
   const correctionRequest = () => {
     const epoch = lifetime.current
-    const editor = selection.current
-    const captureId = correction?.captureId
-    const version = correction?.version
-    const current = () => mounted.current && epoch === lifetime.current && editor === selection.current
+    const request = owner.beginSave()
+    const current = () => mounted.current && epoch === lifetime.current && request.current()
     return {
+      ...request,
       current,
-      conflict: () => {
-        if (current()) setCorrection((previous) => previous !== null && previous.captureId === captureId && previous.version === version ? { ...previous, conflicted: true } : previous)
-      },
       accept: (record: CaptureRecord) => {
-        if (!current() || record.captureId !== captureId || version === undefined || record.transcriptVersion !== version + 1) return
-        setRecords((previous) => previous.map((known) => known.captureId === captureId && known.transcriptVersion <= record.transcriptVersion ? record : known))
-        setCorrection((previous) => previous?.captureId === captureId && previous.version === version
-          ? { ...previous, baselineText: transcript(record), version: record.transcriptVersion,
-            record: previous.record.transcriptVersion > record.transcriptVersion ? previous.record : record } : previous)
+        const accepted = request.accept(record)
+        if (accepted && current()) setRecords((previous) => previous.map((known) => known.captureId === record.captureId && known.transcriptVersion <= record.transcriptVersion ? record : known))
       },
     }
   }
   const setDraft = (text: string): void => setCorrection((previous) => previous === null ? null : { ...previous, text })
   return { snapshot, setSnapshot, playback, records, setRecords, offset, hasOlder, selected, selectedId: correction?.captureId ?? null,
     draft: correction?.text ?? '', draftVersion: correction?.version, conflict, offPage, selectRecord, setDraft, correctionRequest,
-    error, setError, setupMessage, setSetupMessage, mounted, refresh }
+    error: error ?? saveError, setError, correctionSaving, setupMessage, setSetupMessage, mounted, refresh }
 }
 
 export function captureErrorMessage(error: unknown): string {

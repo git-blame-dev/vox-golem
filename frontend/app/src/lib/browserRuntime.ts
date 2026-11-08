@@ -1,3 +1,4 @@
+import { readUiTheme } from '../ui/theme'
 import { utf8ByteLength } from './wire'
 import { parseSpeechSelectionString } from './assistantSettings'
 import { INSTANT_CHOICES, AGENT_CHOICES, DEFAULT_MODEL_CHOICES, browserModelOptions } from './modelCatalog'
@@ -373,7 +374,8 @@ function parsePreferences(value: unknown): BrowserPreviewPreferences {
     catch { throw new BrowserPreviewCommandError('invalid_input', `Preference ${key} must be a string within 512 UTF-8 bytes`) }
   }
   if (payload['response_profile'] !== 'fast' && payload['response_profile'] !== 'quality') throw new BrowserPreviewCommandError('invalid_input', 'Response profile is unsupported')
-  if (payload['ui_theme'] !== 'light' && payload['ui_theme'] !== 'dark' && payload['ui_theme'] !== 'slate') throw new BrowserPreviewCommandError('invalid_input', 'UI theme is unsupported')
+  const uiTheme = readUiTheme(payload['ui_theme'])
+  if (uiTheme === null) throw new BrowserPreviewCommandError('invalid_input', 'UI theme is unsupported')
   if (!['small', 'medium', 'large', 'extra_large'].includes(payload['ui_text_size'] as string)) throw new BrowserPreviewCommandError('invalid_input', 'UI text size is unsupported')
   return {
     instant: payload['instant'] as string,
@@ -389,7 +391,7 @@ function parsePreferences(value: unknown): BrowserPreviewPreferences {
     speech_language: speechString('speech_language'), speech_tts_provider: speechString('speech_tts_provider'), speech_tts_voice: speechString('speech_tts_voice'),
     response_profile: payload['response_profile'] as string,
     tts_enabled: payload['tts_enabled'] as boolean,
-    ui_theme: payload['ui_theme'] as string,
+    ui_theme: uiTheme,
     ui_text_size: payload['ui_text_size'] as string,
   }
 }

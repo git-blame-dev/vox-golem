@@ -3,9 +3,10 @@ import { useSessionView } from './FrontendSession'
 import type { FrontendSession } from './FrontendSession'
 import type { TranscriptMessage, UiTextSize } from './types/chat'
 import { isTranscriptMessage } from './types/chat'
-import { ChatBubble, CopyMessageButton, MessageFooter } from './components/ChatBubble'
+import { ChatBubble, MessageFooter } from './components/ChatBubble'
 import { AnswerStage } from './components/AnswerStage'
 import { duration } from './lib/duration'
+import { isCoreWhitespaceOnly } from './lib/wire'
 import { frontendTimingEnabled } from './lib/frontendTiming'
 import { turnObservationAttributes } from './turnObservation'
 
@@ -53,12 +54,16 @@ export function SessionTranscript({ session, staging, composerValue, textSize, n
       followLatest.current = nearLatest
       setShowJump(!nearLatest)
     }} onWheel={interrupt} onTouchStart={interrupt} onPointerDown={interrupt}>
+      {visibleMessages.length === 0 && unsavedResult === null ? <section className="conversation__empty" aria-label="New conversation">
+        <h1>What would you like to ask?</h1>
+        <p>Write a message below to start a conversation.</p>
+      </section> : null}
       {visibleMessages.map((message) => <TranscriptRow key={message.id} message={message} onAnswerDomCommitted={onAnswerDomCommitted} />)}
       {unsavedResult === null ? null : <section aria-label="Unsaved answer">
         <article className="message message--user"><p className="message__content">{unsavedResult.prompt}</p></article>
-        <AnswerStage compact answer={unsavedResult.answer.text} stages={[{ stage: unsavedResult.finalStage, status: 'completed' }]} contentKind={unsavedResult.answer.kind} sources={unsavedResult.sources} className="message message--assistant" />
+        <AnswerStage compact answer={unsavedResult.answer.text} stages={[{ stage: unsavedResult.finalStage, status: 'completed' }]} contentKind={unsavedResult.answer.kind} sources={unsavedResult.sources} className="message message--assistant"
+          footer={<MessageFooter role="assistant" text={unsavedResult.answer.text} canCopy={!isCoreWhitespaceOnly(unsavedResult.answer.text)} timingLabel={null} copyLabel="Copy unsaved response" sources={unsavedResult.sources} />} />
         <div role="status" aria-label="Answer not saved">Answer not saved. Copy this answer or use New Chat to discard it before continuing.</div>
-        <CopyMessageButton text={unsavedResult.answer.text} label="Copy unsaved response" sources={unsavedResult.sources} />
         <button type="button" onClick={() => { void session.intents.resetSession() }}>New Chat and discard unsaved answer</button>
       </section>}
     </main>
@@ -81,20 +86,14 @@ const TranscriptRow = memo(function TranscriptRow({ message, onAnswerDomCommitte
     ? null
     : duration(timings.firstTextMs)
   const canCopy = message.content.trim().length > 0
-  const canRaise = timingLabel === null &&
-    (message.answerStage.sources === undefined || message.answerStage.sources.length === 0) &&
-    !message.answerStage.stages.some(({ stage, detail }) => stage !== 'instant' || (typeof detail === 'string' && detail.trim() !== '')) &&
-    (message.answerStage.priorVersions === undefined || message.answerStage.priorVersions.length === 0)
   return <div className="conversation__answer" {...turnObservationAttributes(message)}>
-    <AnswerStage compact answer={message.content} {...(message.thinkingStatus === undefined ? {} : { thinkingStatus: message.thinkingStatus })} className="message message--assistant" {...(message.contentKind === undefined ? {} : { contentKind: message.contentKind })} {...message.answerStage} />
-    <MessageFooter
+    <AnswerStage compact answer={message.content} {...(message.thinkingStatus === undefined ? {} : { thinkingStatus: message.thinkingStatus })} className="message message--assistant" {...(message.contentKind === undefined ? {} : { contentKind: message.contentKind })} {...message.answerStage} footer={<MessageFooter
       role="assistant"
       text={message.content}
       canCopy={canCopy}
       timingLabel={timingLabel}
       {...(message.answerStage.sources === undefined ? {} : { sources: message.answerStage.sources })}
-      canRaise={canRaise}
-    />
+    />} />
   </div>
 })
 

@@ -1,3 +1,5 @@
+import { Button } from '../ui/controls'
+import { openConversationNavigation } from '../lib/conversationNavigation'
 import { memo } from 'react'
 import { isAndroidRuntime } from '../lib/tauri'
 import { localInstantCanRetry, sameExternalView, usePresentation, voiceInputReady } from '../sessionPolicy'
@@ -8,13 +10,13 @@ import { InstantModelSelect } from './InstantModelSelect'
 import { PromptComposer } from './PromptComposer'
 
 export const SessionComposer = memo(function SessionComposer({ session, view }: SessionViewProps) {
-  const { voiceNotesOpen, shortcutStaging, androidAssistant, conversationPagePending, resetPending, promptState,
-    androidVoiceActive, headPagePending, snapshotControlsFresh, composerValue, uiTextSize, partialTranscript,
+  const { voiceNotesOpen, shortcutStaging, androidAssistant, resetPending, promptState,
+    composerValue, uiTextSize, partialTranscript,
     typedCompletionSuffix, voiceCompletionSuffix, canSend, startupState, assistantSettingsLoadError, selectedInstantOption,
     selectedInstantProfileReady, canToggleMic, micStarting, micActive, assistantSettings, instantAssistantOptions,
     instantControlsDisabled, runtimeStatus, updateRuntimeBlocked,
     promptActivity, wakeConfidence } = usePresentation(session, view, 'composer')
-  const { onSubmit, loadMoreAndroidConversations, loadMoreAndroidHeads, selectAndroidConversation, changeComposer,
+  const { onSubmit, changeComposer,
     onComposerKeyDown, acceptTypedCompletion, clearCompletion, toggleMic, changeInstant, patchAssistantSettings, cancelPrompt, resetSession } = view.actions
   const canStop = (promptState === 'executing' || promptState === 'stopping') && startupState.kind === 'ready' && startupState.promptCancellationAvailable
   const busy = promptState !== 'idle' || runtimeStatus === 'processing' || runtimeStatus === 'executing'
@@ -27,12 +29,7 @@ export const SessionComposer = memo(function SessionComposer({ session, view }: 
   return !voiceNotesOpen ? <form className="composer" onSubmit={onSubmit}>
     {shortcutStaging ? <p id="new-voice-draft-status" className={isAndroidRuntime ? 'sr-only' : undefined} role="status">New voice draft — Stop &amp; send starts a new conversation. Previous history and draft are preserved.</p> : null}
     {isAndroidRuntime && androidAssistant !== null ? <div className="composer__actions">
-      {androidAssistant.conversationOffset < androidAssistant.conversationCount ? <button type="button" disabled={conversationPagePending || resetPending || promptState !== 'idle' || androidVoiceActive} onClick={() => void loadMoreAndroidConversations()}>{conversationPagePending ? 'Loading conversations…' : 'More conversations'}</button> : null}
-      {androidAssistant.branchChoices.length > 0 ? <label>Choose continuation <select aria-label="Choose continuation" value="" disabled={shortcutStaging || resetPending || promptState !== 'idle' || androidVoiceActive || headPagePending || !snapshotControlsFresh} onChange={(event) => void selectAndroidConversation('select_conversation_head', event.target.value)}>
-        <option value="" disabled>Choose continuation</option>
-        {androidAssistant.branchChoices.map((head, index) => <option key={head} value={head}>Continuation {index + 1}</option>)}
-      </select></label> : null}
-      {androidAssistant.branchOffset < androidAssistant.branchCount ? <button type="button" disabled={headPagePending || resetPending || promptState !== 'idle' || androidVoiceActive} onClick={() => void loadMoreAndroidHeads()}>{headPagePending ? 'Loading continuations…' : 'More continuations'}</button> : null}
+      {androidAssistant.branchChoices.length > 0 ? <Button variant="text" onClick={openConversationNavigation}>Choose continuation in Chats</Button> : null}
       {androidAssistant.error !== null && androidAssistant.error !== 'interrupted' ? <span role="status">Native conversation status: {androidAssistant.error.replaceAll('_', ' ')}</span> : null}
     </div> : null}
     <div className="composer__surface">
@@ -56,7 +53,7 @@ export const SessionComposer = memo(function SessionComposer({ session, view }: 
         />
       </div>
       <div className="composer__utility-row">
-        <InstantModelSelect variant="pill" id="composerInstantSelect" label="Instant model" value={assistantSettings.instant} options={instantAssistantOptions} disabled={instantControlsDisabled} canRetry={(value) => localInstantCanRetry(startupState, value)} onChange={(value) => void changeInstant(value)} fastMode={assistantSettings.fastMode} onFastModeChange={(fastMode) => patchAssistantSettings({ fastMode })} />
+        <InstantModelSelect id="composerInstantSelect" label="Instant model" value={assistantSettings.instant} options={instantAssistantOptions} disabled={instantControlsDisabled} canRetry={(value) => localInstantCanRetry(startupState, value)} onChange={(value) => void changeInstant(value)} fastMode={assistantSettings.fastMode} onFastModeChange={(fastMode) => patchAssistantSettings({ fastMode })} />
         <div className="composer__utility-actions">
           {!isAndroidRuntime && runtimeStatus === 'sleeping' && wakeConfidence !== null ? (
             <div className={wakeConfidence >= 0.7 ? 'composer__wake composer__wake--high' : wakeConfidence >= 0.4 ? 'composer__wake composer__wake--medium' : 'composer__wake composer__wake--low'}>

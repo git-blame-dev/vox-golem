@@ -1,4 +1,5 @@
-import { memo } from 'react'
+import { memo, useState } from 'react'
+import { createCaptureDraftMemory } from '../lib/useCaptureHistory'
 import { ResponseAnnouncements, SessionTranscript } from '../SessionTranscript'
 import { sameExternalView, usePresentation } from '../sessionPolicy'
 import type { SessionViewProps } from '../sessionPolicy'
@@ -6,10 +7,11 @@ import { CaptureHistory } from './CaptureHistory'
 import { UserNoticeToast } from './UserNoticeToast'
 
 export const SessionConversation = memo(function SessionConversation({ session, view }: SessionViewProps) {
+  const [captureDraftMemory] = useState(createCaptureDraftMemory)
   const { voiceNotesOpen,
     shortcutStaging, composerValue, uiTextSize, notices } = usePresentation(session, view, 'conversation')
   const { setVoiceNotesOpen, setNoticeInteraction } = view.actions
-  return voiceNotesOpen ? <CaptureHistory onBack={() => setVoiceNotesOpen(false)} /> : <>
+  return voiceNotesOpen ? <CaptureHistory draftMemory={captureDraftMemory} onBack={() => setVoiceNotesOpen(false)} /> : <>
       <div className="conversation-region">
         <SessionTranscript session={session} staging={shortcutStaging} composerValue={composerValue} textSize={uiTextSize} noticeId={notices[0]?.id} />
 

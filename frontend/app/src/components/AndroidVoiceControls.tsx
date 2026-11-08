@@ -10,7 +10,7 @@ export function SpeechServicesInstallPrompt({ message = 'Google Speech Services 
   return (
     <div className="settings-panel__missing-speech" role="alert">
       <p><strong>Speech services required:</strong> {message}</p>
-      <button type="button" className="shell__control settings-panel__interactive" onClick={() => void openSpeechServicesStore()}>Open Play Store</button>
+      <button type="button" className="shell__control" onClick={() => void openSpeechServicesStore()}>Open Play Store</button>
     </div>
   )
 }
@@ -80,7 +80,7 @@ function useVoiceControls({ voice, disabled, generationAvailable, interactionBlo
   const speakerDescription = compactError ?? (pending ? 'Voice controls busy' : status === null || outputChecking ? 'Checking speech availability…' : (status?.ttsPhase === 'speaking' || status?.loop === 'speaking') ? 'Speaking…' : status?.ttsEnabled ? 'Speak replies enabled' : status?.ttsAvailable ? 'Speak replies off' : 'Native speech output is unavailable')
   const closeMissingSpeechPrompt = useCallback(() => setShowMissingSpeechPrompt(false), [])
   const dialog = useMemo(() => showMissingSpeechPrompt ? (
-    <dialog ref={speechDialogRef} className="speech-prompt-dialog" aria-labelledby={`${descriptionId}-missing-title`} aria-describedby={`${descriptionId}-missing-description`}
+    <dialog id={`${descriptionId}-missing-dialog`} ref={speechDialogRef} className="speech-prompt-dialog" aria-labelledby={`${descriptionId}-missing-title`} aria-describedby={`${descriptionId}-missing-description`}
       onCancel={(event) => { event.preventDefault(); closeMissingSpeechPrompt() }}
       onClick={(event) => { if (event.target === event.currentTarget) closeMissingSpeechPrompt() }}>
       <div className="speech-prompt-dialog__content">
@@ -94,10 +94,10 @@ function useVoiceControls({ voice, disabled, generationAvailable, interactionBlo
   ) : null, [closeMissingSpeechPrompt, descriptionId, missingRequirementText, showMissingSpeechPrompt])
   return useMemo(() => ({
     voice, descriptionId, start, startDisabled, compactError, sessionError, intentNotice, progress, voiceDescription, voiceState,
-    speechDisabled, speakerDescription, withSpeechServices, dialog, isMissingSpeech,
+    speechDisabled, speakerDescription, withSpeechServices, dialog, isMissingSpeech, missingSpeechDialogOpen: showMissingSpeechPrompt,
   }), [
     voice, descriptionId, start, startDisabled, compactError, sessionError, intentNotice, progress, voiceDescription, voiceState,
-    speechDisabled, speakerDescription, withSpeechServices, dialog, isMissingSpeech,
+    speechDisabled, speakerDescription, withSpeechServices, dialog, isMissingSpeech, showMissingSpeechPrompt,
   ])
 }
 const VoiceControlsContext = createContext<ReturnType<typeof useVoiceControls> | null>(null)
@@ -120,7 +120,7 @@ export function AndroidVoiceControlsProvider({ children, ...props }: VoiceProps 
 }
 
 function VoiceIntentButton() {
-  const { voice, descriptionId, start, startDisabled, voiceDescription, voiceState } = useControls()
+  const { voice, descriptionId, start, startDisabled, voiceDescription, voiceState, isMissingSpeech, missingSpeechDialogOpen } = useControls()
   const { status, pending, active, stop, finishDictation, finishShortcut } = voice
   const recognitionListening = !pending && status?.readyForSpeech === true && status.mode !== 'shortcut' && status.dictation === 'listening'
   const recognitionFinishing = !pending && status?.mode !== 'shortcut' && status?.dictation === 'finishing'
@@ -141,6 +141,9 @@ function VoiceIntentButton() {
   return <>
     <button type="button" className="shell__control shell__icon-control" aria-label={label} title={`${label}: ${voiceDescription}`} aria-describedby={`${descriptionId}-mic`}
       data-voice-mode={voiceMode}
+      aria-haspopup={isMissingSpeech ? 'dialog' : undefined}
+      aria-expanded={isMissingSpeech ? missingSpeechDialogOpen : undefined}
+      aria-controls={isMissingSpeech ? `${descriptionId}-missing-dialog` : undefined}
       disabled={active ? recognitionFinishing || shortcutFinishing : startDisabled}
       onClick={activate}
       onContextMenu={(event) => { if (event.button !== 0) event.preventDefault() }}>
@@ -157,9 +160,12 @@ export function AndroidComposerVoiceControl() {
 }
 
 export function AndroidVoiceSecondaryControls() {
-  const { descriptionId, speechDisabled, speakerDescription, withSpeechServices, voice } = useControls()
+  const { descriptionId, speechDisabled, speakerDescription, withSpeechServices, voice, isMissingSpeech, missingSpeechDialogOpen } = useControls()
   return <>
     <button type="button" className="shell__control shell__icon-control shell__speaker-control" aria-label="Speak replies" title={`Speak replies: ${speakerDescription}`} aria-describedby={`${descriptionId}-speaker`} aria-pressed={voice.status?.ttsEnabled ?? false} disabled={speechDisabled}
+      aria-haspopup={isMissingSpeech ? 'dialog' : undefined}
+      aria-expanded={isMissingSpeech ? missingSpeechDialogOpen : undefined}
+      aria-controls={isMissingSpeech ? `${descriptionId}-missing-dialog` : undefined}
       onClick={(event) => withSpeechServices(voice.toggleSpeech, event.currentTarget)}><ControlIcon kind="speaker" /></button>
     <span className="sr-only" id={`${descriptionId}-speaker`}>{speakerDescription}</span>
   </>

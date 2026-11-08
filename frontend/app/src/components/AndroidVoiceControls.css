@@ -21,7 +21,7 @@
 }
 
 .android-voice-controls--composer .shell__icon-control:hover:not(:disabled) {
-  background: var(--surface-glass-hover);
+  background: var(--surface-control-hover);
 }
 
 .shell .android-voice-controls--composer [data-voice-mode='ask'] {
@@ -32,31 +32,6 @@
 .android-voice-controls--composer [data-voice-mode='dictate'] {
   outline: 2px solid var(--accent-primary);
   outline-offset: -3px;
-}
-
-.android-voice-controls__mode {
-  flex: 1 1 100%;
-  text-align: end;
-  color: var(--text-muted);
-  font-size: .8em;
-  line-height: 1.4;
-  overflow-wrap: anywhere;
-  max-width: 18em;
-}
-
-.android-voice-controls__armed {
-  position: absolute;
-  inset-inline-end: 0;
-  bottom: calc(100% + .25rem);
-  z-index: 1;
-  width: max-content;
-  max-width: min(18em, 70vw);
-  padding: .35rem .6rem;
-  border-radius: .75rem;
-  background: var(--surface-panel-strong);
-  color: var(--text-primary);
-  font-size: .85em;
-  pointer-events: none;
 }
 
 .android-voice-controls--composer .shell__icon-control:focus-visible {
